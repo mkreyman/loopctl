@@ -31,6 +31,8 @@ defmodule Loopctl.ObanConfig do
   interval is a load/latency knob only — it can never produce a wrong STH.
   """
 
+  alias Oban.Cron.Expression
+
   # Default widths are a literal, hand-maintained mirror of config/config.exs's
   # compile-time `config :loopctl, Oban, queues: [...]` (AC-32.2.3). Sum = 38
   # (10+5+2+3+2+5+5+3+3). Keep the two lists in sync when adding/removing/resizing
@@ -110,9 +112,15 @@ defmodule Loopctl.ObanConfig do
   interval is a load/latency knob only — worst case it delays (never corrupts) an STH
   for a tenant the event path also missed, by up to one sweep interval.
 
-  Raises `ArgumentError` (like `queue_size/2`) when the env var is present but not a
-  well-formed 5-field cron string — a malformed non-nil value must fail loud at boot,
-  not silently fall back to the default.
+  Raises `ArgumentError` (like `queue_size/2`) when the env var is present but not an
+  expression Oban itself accepts — a malformed non-nil value must fail loud at boot,
+  not silently fall back to the default. Validation delegates to Oban's own parser
+  (`Oban.Cron.Expression.parse/1`), so any form Oban's Cron plugin would accept is
+  accepted here: a standard 5-field expression (`*/30 * * * *`), the extended
+  step/range syntax, OR an `@`-nickname (`@hourly`, `@daily`, `@weekly`, `@monthly`,
+  `@yearly`, `@annually`, `@midnight`, `@reboot`). Semantically-invalid values that
+  happen to have 5 fields (e.g. `99 99 99 99 99`) are rejected too, because the parser
+  range-checks each field. The validator can never be stricter than its consumer.
   """
   @spec sth_sweep_cron() :: String.t()
   def sth_sweep_cron do
@@ -122,13 +130,14 @@ defmodule Loopctl.ObanConfig do
   defp validate_cron(nil, default), do: default
 
   defp validate_cron(value, _default) when is_binary(value) do
-    fields = value |> String.trim() |> String.split(~r/\s+/, trim: true)
+    case Expression.parse(String.trim(value)) do
+      {:ok, _expression} ->
+        value
 
-    if length(fields) == 5 do
-      value
-    else
-      raise ArgumentError,
-            "STH_SWEEP_CRON must be a 5-field cron expression, got: #{inspect(value)}"
+      {:error, %{message: message}} ->
+        raise ArgumentError,
+              "STH_SWEEP_CRON must be a cron expression Oban accepts " <>
+                "(5-field or @nickname), got: #{inspect(value)} (#{message})"
     end
   end
 

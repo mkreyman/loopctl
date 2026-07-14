@@ -4,8 +4,13 @@ defmodule Loopctl.ObanPluginsConfigTest do
   pre-existing Lifeline/Pruner plugins are unchanged.
 
   Pure config read — no DB, no running Oban needed (`config/test.exs` sets
-  `testing: :inline`, under which plugins are not started, but the KEYWORD LIST
-  configured in `config/config.exs` still merges into `Application.get_env/2`).
+  `testing: :inline`, under which plugins are not started). As of US-35.3 the
+  `:plugins` list is owned exclusively by `Loopctl.ObanConfig.plugins/0` and set at
+  RUNTIME in `config/runtime.exs` (`config :loopctl, Oban, plugins:
+  Loopctl.ObanConfig.plugins()`); `config/config.exs` no longer sets `plugins:`.
+  `runtime.exs` runs in every environment (test included), so the crontab / Lifeline /
+  Pruner / Reindexer this module asserts on are read straight from that runtime-set
+  value via `Application.get_env/2`.
   """
   use ExUnit.Case, async: true
 
