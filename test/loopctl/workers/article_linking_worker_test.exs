@@ -91,7 +91,15 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
 
   # Attach an in-test handler for the corpus-size telemetry event; returns a ref the worker's
   # emission is tagged with so `assert_received` / `refute_received` can key on it.
-  defp attach_corpus_telemetry do
+  #
+  # SCOPED to `source_id` (US-36.4 review): telemetry handlers fire in the EMITTING process
+  # across the whole VM, so under `async: true` a CONCURRENT test that publishes an embedded
+  # article runs `ArticleLinkingWorker.perform` inline and — at the test `sample_rate` — emits
+  # its OWN corpus_size event. Without a filter this global handler would forward that stray
+  # emission to THIS test's pid, false-failing `refute_received` and letting `assert_received`
+  # match another tenant's numbers (the exact flake class fixed in commit c86c36d). Filtering
+  # on `metadata.article_id == source_id` keeps each test scoped to its own source.
+  defp attach_corpus_telemetry(source_id) do
     ref = make_ref()
     test_pid = self()
     handler_id = "corpus-size-#{inspect(ref)}"
@@ -99,14 +107,54 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
     :telemetry.attach(
       handler_id,
       [:loopctl, :knowledge, :article_linking, :corpus_size],
-      fn _event, measurements, metadata, _cfg ->
-        send(test_pid, {ref, :corpus_size, measurements, metadata})
+      fn _event, measurements, %{article_id: article_id} = metadata, _cfg ->
+        if article_id == source_id do
+          send(test_pid, {ref, :corpus_size, measurements, metadata})
+        end
       end,
       nil
     )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
     ref
+  end
+
+  # Counts the worker's `article_links` `insert_all` invocations for a SPECIFIC source, via
+  # the AdminRepo Ecto query telemetry. Scoped to `source_id` (its dumped UUID appears in the
+  # `insert_all` params of every chunk, since all of this source's rows share it) so a
+  # concurrent async test's inserts can never inflate the count. Lets the chunking test
+  # ASSERT the batch boundary (N chunks) rather than only the final row count — which a
+  # single un-chunked insert would satisfy identically, failing to guard the AC-36.4.4
+  # bind-parameter chunking safeguard.
+  defp attach_insert_all_counter(source_id) do
+    ref = make_ref()
+    test_pid = self()
+    handler_id = "insert-all-#{inspect(ref)}"
+    {:ok, dumped_source_id} = Ecto.UUID.dump(source_id)
+
+    :telemetry.attach(
+      handler_id,
+      [:loopctl, :admin_repo, :query],
+      fn _event, _measurements, metadata, _cfg ->
+        if metadata[:source] == "article_links" and is_binary(metadata[:query]) and
+             String.starts_with?(metadata[:query], "INSERT") and
+             is_list(metadata[:params]) and dumped_source_id in metadata[:params] do
+          send(test_pid, {ref, :insert_all})
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    ref
+  end
+
+  defp received_count(ref, tag) do
+    receive do
+      {^ref, ^tag} -> 1 + received_count(ref, tag)
+    after
+      0 -> 0
+    end
   end
 
   describe "potential conflict detection (#4)" do
@@ -416,7 +464,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       source = create_article_in_bucket(tenant.id, false)
       target = create_published_article(tenant.id)
 
-      ref = attach_corpus_telemetry()
+      ref = attach_corpus_telemetry(source.id)
 
       stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
         [candidate(target, 0.88)]
@@ -442,7 +490,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       others = for _i <- 1..3, do: create_published_article(tenant.id)
       target = hd(others)
 
-      ref = attach_corpus_telemetry()
+      ref = attach_corpus_telemetry(source.id)
 
       stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
         [candidate(target, 0.88)]
@@ -500,7 +548,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
                ])
     end
 
-    test "inserts every link across multiple insert_all chunks" do
+    test "inserts every link across multiple insert_all chunks (and actually chunks)" do
       %{tenant: tenant} = setup_tenant()
       source = create_published_article(tenant.id)
       targets = for _i <- 1..5, do: create_published_article(tenant.id)
@@ -509,6 +557,8 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
         Enum.map(targets, &candidate(&1, 0.80))
       end)
+
+      insert_ref = attach_insert_all_counter(source.id)
 
       assert :ok =
                ArticleLinkingWorker.perform(%Oban.Job{
@@ -524,6 +574,129 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
         |> AdminRepo.aggregate(:count)
 
       assert count == 5
+
+      # GUARD the chunking itself (not just the row total): 5 rows at chunk size 2 must span
+      # ceil(5/2) = 3 separate insert_all calls. A regression that dropped `Enum.chunk_every`
+      # would issue ONE insert of 5 and fail this — the row count above would still pass.
+      assert received_count(insert_ref, :insert_all) == 3
+    end
+  end
+
+  describe "vanished-target resilience (AC-36.4.3 — behavior parity)" do
+    test "skips a candidate whose target no longer exists and still links the rest, no crash" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      valid = create_published_article(tenant.id)
+      # A candidate id with no backing article: the old row-by-row path skipped this as an FK
+      # `{:error, changeset}`; the batched insert_all would raise + abort the whole batch. The
+      # pre-filter drops it before the insert, reproducing "skip the vanished target, link the
+      # rest, succeed" without an aborted transaction.
+      vanished_id = Ecto.UUID.generate()
+
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [
+          %{id: vanished_id, title: "gone", category: :pattern, similarity_score: 0.80},
+          candidate(valid, 0.80)
+        ]
+      end)
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      # The surviving candidate linked...
+      assert [_] = links_of_type(tenant.id, source.id, valid.id, :relates_to)
+
+      # ...and the vanished target produced no link.
+      vanished_links =
+        from(l in ArticleLink,
+          where: l.source_article_id == ^source.id,
+          where: l.target_article_id == ^vanished_id
+        )
+        |> AdminRepo.all()
+
+      assert vanished_links == []
+    end
+  end
+
+  describe "self-link guard (US-36.4 review — defense-in-depth)" do
+    test "never inserts a self-link even if the lookup returns the source as a candidate" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+
+      # A misbehaving lookup returns the SOURCE itself as a candidate. `build_links/5` must
+      # reject source == target — the batched insert_all path bypasses
+      # `ArticleLink.changeset/2`'s `validate_no_self_link`, so the guard lives in the worker.
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(source, 0.99)]
+      end)
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      links =
+        from(l in ArticleLink, where: l.source_article_id == ^source.id)
+        |> AdminRepo.all()
+
+      assert links == []
+    end
+  end
+
+  # --- AC-36.4.3 / TC-36.4.4: two-tenant isolation of the count + inserts ---
+
+  describe "tenant isolation of corpus count and inserts (AC-36.4.3 / TC-36.4.4)" do
+    test "only tenant A's corpus is counted and only A's links are inserted; B untouched" do
+      %{tenant: tenant_a} = setup_tenant()
+      %{tenant: tenant_b} = setup_tenant()
+
+      # Source in A, forced into the sample bucket so the corpus count actually runs.
+      source = create_article_in_bucket(tenant_a.id, true)
+
+      # A's corpus: exactly two other published+embedded articles the count should see.
+      a1 = create_published_article(tenant_a.id)
+      a2 = create_published_article(tenant_a.id)
+
+      # B's corpus: three published+embedded articles that must be excluded from BOTH the
+      # count and the inserts (different tenant → filtered by `a.tenant_id == ^tenant_id`).
+      for _i <- 1..3, do: create_published_article(tenant_b.id)
+
+      ref = attach_corpus_telemetry(source.id)
+
+      # The lookup returns only A's in-tenant candidates; the worker asserts it passes A's
+      # tenant, then links them. (VectorSearch enforces the real cross-tenant read exclusion;
+      # here we assert the COUNT and INSERT scoping the worker owns around it.)
+      expect(MockArticleSimilaritySearch, :nearest, fn tenant_id, _emb, _k, _opts ->
+        assert tenant_id == tenant_a.id
+        [candidate(a1, 0.80), candidate(a2, 0.80)]
+      end)
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant_a.id}
+               })
+
+      # The corpus count saw ONLY A's two other articles — B's three are excluded by scoping.
+      assert_received {^ref, :corpus_size, measurements, metadata}
+      assert measurements.total == 2
+      assert metadata.tenant_id == tenant_a.id
+
+      # Inserts landed under tenant A only.
+      a_links =
+        from(l in ArticleLink, where: l.source_article_id == ^source.id)
+        |> AdminRepo.all()
+
+      assert length(a_links) == 2
+      assert Enum.all?(a_links, &(&1.tenant_id == tenant_a.id))
+
+      # Tenant B has NO links at all — nothing leaked across the tenant boundary.
+      b_link_count =
+        from(l in ArticleLink, where: l.tenant_id == ^tenant_b.id)
+        |> AdminRepo.aggregate(:count)
+
+      assert b_link_count == 0
     end
   end
 

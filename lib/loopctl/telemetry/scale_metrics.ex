@@ -31,9 +31,11 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   exported ANY Oban queue/state metric), an `:executing`-older-than-N-min orphan
   gauge, and a poll-failure counter so a frozen gauge is distinguishable from a
   genuinely stable one — see "Oban queue/state gauges + `:executing` orphan gauge
-  (US-34.1)" below. `scale_metrics/0` now returns 20 metrics total.
+  (US-34.1)" below. US-36.3 added the ingestion backlog-gate fail-open counter and
+  US-36.4 adds the article-linking corpus-size gauge (metric 22 below), so
+  `scale_metrics/0` now returns 22 metrics total.
 
-  ## The metrics (20 total)
+  ## The metrics (22 total)
 
     1. **Timeout / DB-error counter** — `loopctl.db.error.count`, keyed by
        `[:endpoint, :mapped_code]` (+ a cap-gated `:tenant_id`). `mapped_code`
@@ -393,13 +395,15 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   @oban_terminal_states [:completed, :discarded, :cancelled]
 
   @doc """
-  All 20 scale metrics: the original US-27.15 trio, #297's semantic-fallback
+  All 22 scale metrics: the original US-27.15 trio, #297's semantic-fallback
   counter, US-31.2's hybrid-provenance counter, US-33.1's two per-pool checkout
   `queue_time` distributions, US-34.4's ten emitted-but-dead-event counters
   (LLM/embedding-blocked, index-health, secrets/witness/memory-promotion
-  degradation signals), and US-34.1's three Oban metrics (per-{state, queue}
+  degradation signals), US-34.1's three Oban metrics (per-{state, queue}
   gauge over the non-terminal states, the `:executing` orphan gauge, and a
-  poll-failure counter). Appended to `LoopctlWeb.Telemetry.metrics/0`.
+  poll-failure counter), US-36.3's ingestion backlog-gate fail-open counter, and
+  US-36.4's article-linking corpus-size gauge. Appended to
+  `LoopctlWeb.Telemetry.metrics/0`.
   """
   @spec scale_metrics() :: [Telemetry.Metrics.t()]
   def scale_metrics do
@@ -679,8 +683,37 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         description: "Oban metrics poll failures, by poller and classified error class.",
         tags: [:poller, :error_class],
         tag_values: &oban_poll_error_tags/1
+      ),
+
+      # 22. Article-linking corpus-size gauge (US-36.4, AC-36.4.1). Consumes the
+      #     sampled `[:loopctl, :knowledge, :article_linking, :corpus_size]` event
+      #     `Loopctl.Workers.ArticleLinkingWorker` emits on a deterministic ~1/N sample
+      #     of linking jobs — previously an emitted-but-dead signal (no metric, no
+      #     handler) whose "sampled telemetry path" delivered nothing to Prometheus. A
+      #     `last_value/2` GAUGE of the corpus `:total` (the candidate count the
+      #     over-limit warning compares against `article_link_max_comparisons`), tagged
+      #     by a cap-gated `tenant_id` ONLY — the unbounded `article_id`/`project_id`
+      #     in the event metadata are NEVER labels (AC-27.15.3).
+      last_value("loopctl.knowledge.article_linking.corpus_size",
+        event_name: [:loopctl, :knowledge, :article_linking, :corpus_size],
+        measurement: :total,
+        description:
+          "Sampled article-linking candidate-corpus size (vs the comparison limit), by tenant.",
+        tags: [:tenant_id],
+        tag_values: &article_linking_corpus_size_tags/1
       )
     ]
+  end
+
+  @doc """
+  `tag_values` for the article-linking corpus-size gauge (US-36.4). Emits ONLY a
+  cap-gated `tenant_id` (reusing the same `gated_tenant_id/1` sentinel-collapse as the
+  other scale counters, so its cardinality is bounded identically) — the unbounded
+  `article_id`/`project_id` carried in the event metadata are never tagged.
+  """
+  @spec article_linking_corpus_size_tags(map()) :: map()
+  def article_linking_corpus_size_tags(metadata) do
+    %{tenant_id: gated_tenant_id(metadata)}
   end
 
   @doc """

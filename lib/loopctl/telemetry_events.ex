@@ -224,6 +224,27 @@ defmodule Loopctl.TelemetryEvents do
   def ingestion_backlog_gate_failed_open,
     do: [:loopctl, :ingestion, :backlog_gate, :failed_open]
 
+  @doc """
+  The article-linking corpus-size sample (US-36.4, AC-36.4.1). The
+  corpus-size-vs-limit warning that `Loopctl.Workers.ArticleLinkingWorker` used to
+  compute on EVERY linking job (a full `count(*)` over the tenant/project corpus,
+  purely to feed a `Logger.warning`) now runs on a deterministic ~1/N sample of jobs
+  and emits THIS event alongside the retained warning, so the signal stays observable
+  on a dashboard without the per-job count cost. Purely observational — never a gate
+  on linking.
+
+  ## Payload (id-only — never an article body or a vector literal)
+
+    * `measurements`: `%{total, limit}` where `total` is the sampled candidate-corpus
+      size (self-excluded, published, embedded, project-scoped) and `limit` is the
+      configured `article_link_max_comparisons` ceiling the warning compares against.
+    * `metadata`: `%{tenant_id, project_id, article_id}` — all ids, never content.
+
+  Aggregated by `Loopctl.Telemetry.ScaleMetrics` as a `last_value` gauge of `total`,
+  tagged by a cap-gated `tenant_id` ONLY (`article_id`/`project_id` are never labels).
+  """
+  def article_linking_corpus_size, do: [:loopctl, :knowledge, :article_linking, :corpus_size]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -240,7 +261,8 @@ defmodule Loopctl.TelemetryEvents do
       knowledge_semantic_fallback(),
       knowledge_hybrid_provenance(),
       llm_provider_error(),
-      ingestion_backlog_gate_failed_open()
+      ingestion_backlog_gate_failed_open(),
+      article_linking_corpus_size()
     ]
   end
 end

@@ -37,9 +37,14 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   A warning fires when the corpus size exceeds the limit. Since US-36.4 that
   corpus-size count is no longer paid on every job: it runs on a deterministic
   ~1/N sample (`:erlang.phash2(article_id, N) == 0`,
-  `:article_link_corpus_sample_rate`) and emits a
-  `[:loopctl, :knowledge, :article_linking, :corpus_size]` telemetry event
-  alongside the warning. It is purely observational — never a gate on linking.
+  `:article_link_corpus_sample_rate`) and emits the
+  `Loopctl.TelemetryEvents.article_linking_corpus_size/0` event
+  (`[:loopctl, :knowledge, :article_linking, :corpus_size]`) alongside the warning.
+  The event is registered in `Loopctl.TelemetryEvents.all_events/0` and consumed in
+  prod by `Loopctl.Telemetry.ScaleMetrics` as a `last_value` corpus-size gauge tagged
+  by a cap-gated `tenant_id`, so the sampled signal reaches Prometheus/dashboards
+  rather than terminating in a handler-less no-op. It is purely observational — never a
+  gate on linking.
   Since US-27.7a the lookup
   runs through `VectorSearch.nearest/4`, whose `k` is clamped to
   `VectorSearch.max_k/0` (default 100), so a configured value above that ceiling is
@@ -76,6 +81,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Oban.FairShare
+  alias Loopctl.TelemetryEvents
 
   # Compile-time DI for the similarity lookup. The worker uses this to fetch
   # nearest-neighbour candidates; in tests it resolves to a Mox mock, in prod to VectorSearch.
@@ -182,8 +188,15 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
     candidates
     |> Enum.filter(fn %{similarity: sim} -> keep?.(sim) end)
+    # Reject self-links AND already-linked pairs (both directions) in one pass. The
+    # `cid == article_id` guard is defense-in-depth (US-36.4 review): the batched
+    # `insert_all` path bypasses `ArticleLink.changeset/2`'s `validate_no_self_link`.
+    # UNREACHABLE in prod — `find_similar_articles/4` always passes `exclude_id: article.id`
+    # so the source can never be its own candidate — but a future caller/mock yielding a
+    # self-referential candidate would otherwise insert an invalid self-link unvalidated.
     |> Enum.reject(fn %{id: cid} ->
-      MapSet.member?(existing, {article_id, cid}) or MapSet.member?(existing, {cid, article_id})
+      cid == article_id or MapSet.member?(existing, {article_id, cid}) or
+        MapSet.member?(existing, {cid, article_id})
     end)
     |> Enum.map(fn %{id: target_id, similarity: score} ->
       %{
@@ -254,7 +267,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
       total = corpus_count(article, tenant_id)
 
       :telemetry.execute(
-        [:loopctl, :knowledge, :article_linking, :corpus_size],
+        TelemetryEvents.article_linking_corpus_size(),
         %{total: total, limit: max_comparisons},
         %{tenant_id: tenant_id, project_id: article.project_id, article_id: article.id}
       )
@@ -339,13 +352,32 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   # `insert_all` from the schema. Rows are chunked to stay well under Postgres's 65535
   # bind-parameter ceiling (~6 params/row), and the whole batch runs inside a `SET LOCAL
   # statement_timeout` transaction.
+  #
+  # FK-violation parity with the pre-US-36.4 row-by-row path (US-36.4 review): the old
+  # `create_links/2` inserted each row via `AdminRepo.insert(changeset)` and SKIPPED any
+  # `{:error, changeset}` — so if a target article was HARD-deleted (soft deletes retain the
+  # row → FK stays valid; only a hard delete removes it) between the VectorSearch read and
+  # the insert, that one row was dropped and the job still succeeded. A batched `insert_all`
+  # would instead RAISE a `Postgrex.Error` (`:foreign_key_violation`, FK is `on_delete:
+  # :restrict`) that aborts the ENTIRE transaction — a strictly worse failure mode. Rescuing
+  # is not an option: once a statement errors inside a transaction Postgres aborts it, so any
+  # follow-up insert on that connection fails with "current transaction is aborted" (and under
+  # the test Sandbox the transaction is nested, poisoning the outer one too). Instead we
+  # PRE-FILTER to targets that still exist (`reject_vanished_targets/2`) right before the
+  # insert, reproducing the old "skip the vanished target, link the rest, no crash" behavior
+  # without an aborted transaction. This costs one cheap indexed `id = ANY(...)` lookup, and
+  # only when there is actual linking work. The residual window (a target hard-deleted between
+  # this pre-filter and the insert, same transaction) is far narrower than the original read→
+  # insert window; if it is ever hit the job crashes and Oban retries, and the retry's
+  # VectorSearch read no longer surfaces the deleted target, so it converges.
   defp create_links([], _tenant_id), do: 0
 
   defp create_links(links, tenant_id) do
     now = DateTime.utc_now()
 
     rows =
-      Enum.map(links, fn attrs ->
+      links
+      |> Enum.map(fn attrs ->
         %{
           tenant_id: tenant_id,
           source_article_id: attrs.source_article_id,
@@ -355,6 +387,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
           inserted_at: now
         }
       end)
+      |> reject_vanished_targets(tenant_id)
 
     {:ok, created} =
       AdminRepo.transaction(fn ->
@@ -362,23 +395,47 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
         rows
         |> Enum.chunk_every(insert_chunk_size())
-        |> Enum.reduce(0, fn chunk, acc ->
-          {inserted, _} =
-            AdminRepo.insert_all(ArticleLink, chunk,
-              on_conflict: :nothing,
-              conflict_target: [
-                :tenant_id,
-                :source_article_id,
-                :target_article_id,
-                :relationship_type
-              ]
-            )
-
-          acc + inserted
-        end)
+        |> Enum.reduce(0, fn chunk, acc -> acc + insert_chunk(chunk) end)
       end)
 
     created
+  end
+
+  # Drop any row whose TARGET article no longer exists — the pre-US-36.4 row-by-row path
+  # skipped these as `{:error, changeset}` FK failures and still succeeded; the batched
+  # `insert_all` would raise and abort the whole batch instead (see `create_links/2`). Scoped
+  # by `tenant_id` (all link targets are same-tenant candidates from `VectorSearch`). Returns
+  # the input untouched when nothing was filtered.
+  defp reject_vanished_targets([], _tenant_id), do: []
+
+  defp reject_vanished_targets(rows, tenant_id) do
+    target_ids = rows |> Enum.map(& &1.target_article_id) |> Enum.uniq()
+
+    live =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.id in ^target_ids,
+        select: a.id
+      )
+      |> AdminRepo.all()
+      |> MapSet.new()
+
+    Enum.filter(rows, fn row -> MapSet.member?(live, row.target_article_id) end)
+  end
+
+  defp insert_chunk(chunk) do
+    {inserted, _} =
+      AdminRepo.insert_all(ArticleLink, chunk,
+        on_conflict: :nothing,
+        conflict_target: [
+          :tenant_id,
+          :source_article_id,
+          :target_article_id,
+          :relationship_type
+        ]
+      )
+
+    inserted
   end
 
   defp statement_timeout_ms,
