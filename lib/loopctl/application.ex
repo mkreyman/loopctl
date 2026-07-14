@@ -39,6 +39,17 @@ defmodule Loopctl.Application do
       # US-27.16: owns the ETS table tracking in-flight streaming-export slots so a
       # crashed exporter's slot is reclaimed (concurrency cap, AC-27.16.6).
       Loopctl.Knowledge.ExportConcurrency,
+      # US-37.2: owns the ETS counter bounding concurrent OUTBOUND embedding calls
+      # per node so a crashed acquirer's slot is reclaimed. Gates EVERY
+      # generate_embedding entry point (interactive query path AND both Oban
+      # embedding workers) via run_embedding_task/3, making the per-node ceiling
+      # real (GH #352). Node-local; distributed coordination is Epic 38.
+      Loopctl.Knowledge.EmbeddingConcurrency,
+      # US-37.2: dedicated supervisor for the query-embedding tasks spawned by
+      # run_embedding_task/3 (Task.Supervisor.async_nolink), so an embedding task
+      # crash is isolated from the request/worker process (AC-37.2.5) with cleaner
+      # isolation/telemetry than sharing the general Loopctl.TaskSupervisor.
+      {Task.Supervisor, name: Loopctl.Knowledge.EmbeddingTaskSupervisor},
       # Owns the per-tenant embedding circuit-breaker ETS table so it has a STABLE,
       # long-lived owner (it would otherwise be created by a transient request/job/Task
       # and vanish when that process died — silently resetting the breaker).

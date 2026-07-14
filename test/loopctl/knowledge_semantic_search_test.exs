@@ -415,6 +415,139 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     end
   end
 
+  # --- US-37.2: per-node embedding concurrency cap gates the interactive path ---
+  #
+  # The cap is enforced inside `run_embedding_task/3` (the single guarded entry
+  # point). In :test the gate is the config-DI mock (`Loopctl.MockEmbeddingConcurrency`,
+  # default-stubbed to grant every slot) so we can force saturation deterministically
+  # WITHOUT holding the real, VM-wide global counter saturated (which would starve
+  # unrelated async searches). The real GenServer's cap/reclaim behavior is unit-tested
+  # in `Loopctl.Knowledge.EmbeddingConcurrencyTest`.
+  describe "search_combined/3 - per-node embedding concurrency cap (US-37.2)" do
+    # TC-37.2.2 / AC-37.2.3: at the cap, the interactive path degrades to keyword
+    # search (same fallback as :circuit_open / :rate_limited_local) — never a 500,
+    # never an unbounded wait. AC-37.2.2: the acquire gates the query path, so the
+    # embedding CLIENT is never reached when the cap is saturated.
+    test "saturated cap → keyword-only fallback (never a 500), client never called" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Testing Guide",
+        body: "Unit test patterns for testing Elixir applications.",
+        status: :published
+      })
+
+      # Saturate the gate: every acquire is refused.
+      Mox.stub(Loopctl.MockEmbeddingConcurrency, :acquire, fn ->
+        {:error, :rate_limited_local}
+      end)
+
+      # The interactive path never reaches the paid client when the cap is full
+      # (acquire fails first) — proving the query path is genuinely gated (AC-37.2.2).
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _tenant_id, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.search_combined(tenant.id, "testing")
+
+      assert meta.fallback == true
+      assert meta.search_mode == "keyword_only"
+      # Reuses the US-37.1 breaker-exempt reason → the existing stable fallback tag.
+      assert meta.fallback_reason == "embedding_rate_limited_local"
+
+      # Keyword search still returns results — the request survived and degraded.
+      assert results != []
+      assert Enum.any?(results, &(&1.title == "Testing Guide"))
+    end
+
+    # TC-37.2.3 / AC-37.2.5: an embedding task crash is isolated — the request
+    # process survives and returns a keyword fallback, not a caller crash. The inner
+    # rescue turns the raise into {:error, {:embedding_crash, ...}}.
+    @tag :capture_log
+    test "embedding task raise is isolated → request survives with keyword fallback" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Testing Guide",
+        body: "Unit test patterns for testing Elixir applications.",
+        status: :published
+      })
+
+      # Under the cap (default :ok), but the embedding client raises inside the
+      # supervised task. `Mox.stub` (not expect) because the call runs OFF the test
+      # process in the async_nolink task.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        raise "boom"
+      end)
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.search_combined(tenant.id, "testing")
+
+      assert meta.fallback == true
+      assert meta.search_mode == "keyword_only"
+      assert meta.fallback_reason == "embedding_crash"
+      assert Enum.any?(results, &(&1.title == "Testing Guide"))
+    end
+
+    # AC-37.2.5: an embedding task EXIT (which the inner rescue cannot catch) is
+    # isolated by Task.Supervisor.async_nolink — it surfaces as a yield {:exit, _}
+    # → {:error, :timeout}, NOT a crash of the request process.
+    @tag :capture_log
+    test "embedding task exit is isolated by async_nolink → request survives" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Testing Guide",
+        body: "Unit test patterns for testing Elixir applications.",
+        status: :published
+      })
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        exit(:boom)
+      end)
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.search_combined(tenant.id, "testing")
+
+      assert meta.fallback == true
+      assert meta.search_mode == "keyword_only"
+      assert meta.fallback_reason == "embedding_timeout"
+      assert Enum.any?(results, &(&1.title == "Testing Guide"))
+    end
+
+    # TC-37.2.4 / AC-37.2.5: happy path under the cap is UNCHANGED — a normal search
+    # still returns merged semantic results (no fallback), adding only slot-acquire.
+    test "under the cap, a combined search returns semantic results as today" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      both_match =
+        create_article_with_embedding(
+          tenant.id,
+          %{title: "Error Handling Patterns", body: "Try rescue patterns for error handling."},
+          :close
+        )
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        make_embedding(:query) |> then(&{:ok, &1})
+      end)
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.search_combined(tenant.id, "error")
+
+      assert meta.search_mode == "combined"
+      refute Map.get(meta, :fallback)
+      assert Enum.any?(results, &(&1.id == both_match.id))
+    end
+  end
+
   # --- #297: fallback_reason + telemetry observability for the silent semantic→
   # keyword degradation. Each fallback CAUSE must map to the right stable tag,
   # NEVER leak the api key / provider body, fire the telemetry event, and the

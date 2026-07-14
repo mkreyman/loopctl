@@ -309,6 +309,16 @@ config :loopctl, Oban,
     verification: 1
   ]
 
+# US-37.2 (GH #352): per-node ceiling on concurrent OUTBOUND embedding calls
+# (`Loopctl.Knowledge.EmbeddingConcurrency`). This is the in-code default used on a
+# `SystemConfig` cache miss; operators retune it live (no deploy) via the
+# `"embedding_max_concurrent"` SystemConfig key. Because BOTH the interactive query
+# path and the two Oban embedding workers acquire the SAME slot, this is the TOTAL
+# node ceiling — sized to ~2x the background `embeddings` queue (5) so a normal
+# search never waits on a slot while a runaway interactive burst is still shed well
+# below the provider's hard ceiling. Node-local (distributed coordination is Epic 38).
+config :loopctl, :embedding_max_concurrent, 10
+
 # US-35.3: the Oban `:plugins` list (Cron crontab + Lifeline + Pruner + Reindexer)
 # moved to `Loopctl.ObanConfig.plugins/0` and is set at RUNTIME in `config/runtime.exs`
 # (`config :loopctl, Oban, plugins: Loopctl.ObanConfig.plugins()`). It lives there —

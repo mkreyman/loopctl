@@ -4,6 +4,18 @@ Mox.defmock(Loopctl.MockClock, for: Loopctl.Clock.Behaviour)
 Mox.defmock(Loopctl.MockCostRollup, for: Loopctl.TokenUsage.RollupBehaviour)
 Mox.defmock(Loopctl.MockTokenArchival, for: Loopctl.TokenUsage.ArchivalBehaviour)
 Mox.defmock(Loopctl.MockEmbeddingClient, for: Loopctl.Knowledge.EmbeddingBehaviour)
+
+# US-37.2: DI seam for the per-node outbound-embedding concurrency gate. The
+# DataCase default stub returns :ok/:ok (permissive) so every existing search test
+# is unaffected; the saturation test overrides acquire/0 with Mox.stub/3 to return
+# {:error, :rate_limited_local}, deterministically driving the interactive
+# keyword-only fallback WITHOUT holding the real, VM-wide global counter saturated
+# (which would starve unrelated async searches). Production uses the real
+# Loopctl.Knowledge.EmbeddingConcurrency GenServer, unit-tested directly.
+Mox.defmock(Loopctl.MockEmbeddingConcurrency,
+  for: Loopctl.Knowledge.EmbeddingConcurrency.Behaviour
+)
+
 Mox.defmock(Loopctl.MockExtractor, for: Loopctl.Knowledge.ExtractorBehaviour)
 Mox.defmock(Loopctl.MockContentExtractor, for: Loopctl.Knowledge.ContentExtractorBehaviour)
 Mox.defmock(Loopctl.MockPromoterLLM, for: Loopctl.Memory.Promoter.LLMBehaviour)

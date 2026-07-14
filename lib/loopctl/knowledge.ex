@@ -7300,7 +7300,13 @@ defmodule Loopctl.Knowledge do
   - A tenant-scoped circuit breaker (opens for a tenant after #{@failure_threshold}
     COUNTABLE failures within #{@failure_window_seconds}s — so a failing tenant only
     degrades ITSELF, never other tenants; review #1).
-  - A `#{@embedding_yield_ms}`ms `Task.async` timeout (review #10).
+  - A per-node concurrency cap (US-37.2): `run_embedding_task/3` `acquire`s a slot
+    from `Loopctl.Knowledge.EmbeddingConcurrency` before spawning the task and
+    releases it after, so this SINGLE entry point bounds concurrent outbound embeds
+    across the interactive path AND both Oban embedding workers. Over the cap it
+    fast-fails with `{:error, :rate_limited_local}` (keyword fallback / worker snooze).
+  - A `#{@embedding_yield_ms}`ms `Task.Supervisor.async_nolink` yield budget (review
+    #10; US-37.2 supervises the task so its crash never crashes the caller).
   - A crash rescue handler.
 
   Returns `{:ok, embedding}` or `{:error, reason}`. Two error classes are EXEMPT
@@ -7340,9 +7346,39 @@ defmodule Loopctl.Knowledge do
     end
   end
 
+  # US-37.2: gate EVERY outbound embedding on a per-node concurrency cap BEFORE
+  # spawning the task, so the interactive query path AND both Oban embedding workers
+  # (which route through here via generate_embedding/3) share ONE real node ceiling
+  # (GH #352). The acquire is charged to THIS (request/worker) process and released
+  # in an `after` so a yield-timeout shutdown or an in-task crash still frees the
+  # slot; a crash of THIS process is reclaimed by the gate's monitor. Over the cap,
+  # acquire fast-fails with {:error, :rate_limited_local} — the breaker-exempt reason
+  # (see breaker_countable?/1) the combined-search branch turns into a keyword-only
+  # fallback and the workers snooze on — so the interactive path degrades gracefully
+  # instead of blocking, and NO circuit-breaker / provider-error signal is recorded
+  # (self-imposed backpressure is not a provider failure).
   defp run_embedding_task(tenant_id, query_string, timeout) do
+    case embedding_concurrency().acquire() do
+      :ok ->
+        try do
+          run_capped_embedding_task(tenant_id, query_string, timeout)
+        after
+          embedding_concurrency().release()
+        end
+
+      {:error, :rate_limited_local} = err ->
+        err
+    end
+  end
+
+  defp run_capped_embedding_task(tenant_id, query_string, timeout) do
+    # Task.Supervisor.async_nolink so an embedding task crash surfaces as
+    # {:exit, reason} from Task.yield (the `_ ->` clause -> {:error, :timeout})
+    # rather than crashing THIS process (AC-37.2.5). The inner rescue still catches
+    # embedding-client exceptions and returns {:error, {:embedding_crash, ...}};
+    # async_nolink additionally protects against exits the rescue can't catch.
     task =
-      Task.async(fn ->
+      Task.Supervisor.async_nolink(Loopctl.Knowledge.EmbeddingTaskSupervisor, fn ->
         try do
           embedding_client().generate_embedding(tenant_id, query_string)
         rescue
@@ -7366,7 +7402,8 @@ defmodule Loopctl.Knowledge do
         err
 
       _ ->
-        # nil (yield timeout) or an abnormal task exit — a provider/infra failure.
+        # nil (yield timeout), an abnormal task exit, or an async_nolink task crash
+        # surfacing as {:exit, reason} — a provider/infra failure.
         record_failure(tenant_id)
         maybe_record_provider_error(:timeout)
         {:error, :timeout}
@@ -7505,6 +7542,19 @@ defmodule Loopctl.Knowledge do
 
   defp embedding_client do
     Application.get_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient)
+  end
+
+  # US-37.2: the per-node embedding-concurrency gate, resolved via config-based DI
+  # (like embedding_client/0 above) so config/test.exs can swap in
+  # Loopctl.MockEmbeddingConcurrency — letting a saturation test force
+  # {:error, :rate_limited_local} deterministically without holding the real,
+  # VM-wide global counter saturated (which would starve unrelated async searches).
+  defp embedding_concurrency do
+    Application.get_env(
+      :loopctl,
+      :embedding_concurrency,
+      Loopctl.Knowledge.EmbeddingConcurrency
+    )
   end
 
   # --- Embedding helpers ---
