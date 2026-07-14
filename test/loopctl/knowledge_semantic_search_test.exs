@@ -991,8 +991,17 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       :telemetry.attach(
         handler_id,
         [:loopctl, :llm, :provider_error],
-        fn _event, measurements, metadata, _config ->
-          send(test_pid, {:provider_error_emitted, measurements, metadata})
+        fn
+          # Forward ONLY embedding-provider events. `[:loopctl, :llm, :provider_error]`
+          # is a VM-GLOBAL telemetry event, so under `async: true` a concurrent
+          # Anthropic-path test emitting it with provider="anthropic" would otherwise
+          # leak into this test's mailbox — failing the `assert_received`/
+          # `refute_received` assertions below non-deterministically.
+          _event, measurements, %{provider: "embedding"} = metadata, _config ->
+            send(test_pid, {:provider_error_emitted, measurements, metadata})
+
+          _event, _measurements, _metadata, _config ->
+            :ok
         end,
         nil
       )

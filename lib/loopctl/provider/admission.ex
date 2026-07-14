@@ -75,8 +75,21 @@ defmodule Loopctl.Provider.Admission do
 
   ## Fail-OPEN (AC-37.1.6)
 
-  The `check_rate/3` call is wrapped in `try/rescue`: on ANY limiter error (a
-  Hammer/ETS fault) the gate LOGS a warning and returns `:ok` (allows the call).
+  The `check_rate/3` call is wrapped in `try/rescue/catch`: on ANY limiter error
+  the gate LOGS a warning and returns `:ok` (allows the call). "ANY" is
+  deliberate and covers every failure mode Hammer can surface:
+
+    * a raised exception (Hammer/ETS fault) — caught by `rescue`;
+    * Hammer's documented `{:error, reason}` soft-error return — matched by an
+      explicit `case` clause;
+    * an `exit` — Hammer reaches its backend via `:poolboy.transaction/3`, a
+      `gen_server:call` that EXITS (does not raise) with `:noproc` when the pool
+      is down/unstarted and `{:timeout, _}` on checkout timeout; caught by
+      `catch :exit`. `rescue` alone would MISS this and let the exit crash the
+      calling worker (and, on the embedding path, the linked `Task.async`
+      caller), defeating fail-open.
+    * a `throw` — caught by `catch :throw` for completeness.
+
   A monitoring fault must never block ALL provider traffic — the gate degrades to
   "no gate", never to "deny everything".
   """
@@ -121,17 +134,24 @@ defmodule Loopctl.Provider.Admission do
     case rate_limiter().check_rate(bucket, @window_ms, limit) do
       {:allow, _count} -> :ok
       {:deny, _limit} -> {:error, :rate_limited_local}
+      # Hammer's documented soft-error shape ({:error, reason}, e.g. its ETS
+      # count_hit failing). Handle it deliberately rather than letting it fall
+      # through to a CaseClauseError caught by `rescue`. AC-37.1.6: fail open.
+      {:error, reason} -> fail_open(provider, "limiter returned {:error, #{inspect(reason)}}")
     end
   rescue
-    e ->
-      # AC-37.1.6: a Hammer/ETS fault must ALLOW the call, never block all
-      # provider traffic. Log and fail open.
-      Logger.warning(
-        "Loopctl.Provider.Admission: limiter error for provider=#{provider}; " <>
-          "failing OPEN (allowing call): #{Exception.message(e)}"
-      )
-
-      :ok
+    # A raised exception (Hammer/ETS fault, or the CaseClauseError from an
+    # undocumented return shape). AC-37.1.6: fail open.
+    e -> fail_open(provider, Exception.message(e))
+  catch
+    # A raised exception is NOT the only failure mode. Hammer reaches its backend
+    # via :poolboy.transaction/3 -> gen_server:call, which EXITS (not raises) with
+    # :noproc when the pool is down/unstarted or {:timeout, _} on checkout timeout.
+    # `rescue` only catches exceptions, so without this the exit would propagate
+    # out and crash the calling worker (and, in the embedding path, the linked
+    # Task.async caller) — defeating fail-open. Catch exits (and throws) too.
+    :exit, reason -> fail_open(provider, "limiter exit: #{inspect(reason)}")
+    :throw, value -> fail_open(provider, "limiter throw: #{inspect(value)}")
   end
 
   @doc """
@@ -146,7 +166,24 @@ defmodule Loopctl.Provider.Admission do
   @spec snooze_seconds() :: pos_integer()
   def snooze_seconds do
     base = SystemConfig.get_int("provider_admission_snooze_seconds", @default_snooze_seconds)
-    base + :rand.uniform(6) - 1
+    # Clamp the (live-tunable, possibly misconfigured) base to >= 1 BEFORE adding
+    # jitter. `:rand.uniform(6) - 1` is 0..5, so an unclamped base of 0 (or a
+    # negative knob) could yield 0/negative — a {:snooze, 0} is an immediate
+    # re-run against a still-shut gate (a tight snooze/re-check loop) and violates
+    # the pos_integer() @spec. max(1, base) guarantees a result of >= 1.
+    max(1, base) + :rand.uniform(6) - 1
+  end
+
+  # AC-37.1.6: a limiter fault (raised exception, {:error, reason}, exit, or
+  # throw) must ALLOW the call, never block all provider traffic. Log and fail
+  # open. Single sink so every failure mode logs and degrades identically.
+  defp fail_open(provider, detail) do
+    Logger.warning(
+      "Loopctl.Provider.Admission: limiter error for provider=#{provider}; " <>
+        "failing OPEN (allowing call): #{detail}"
+    )
+
+    :ok
   end
 
   defp bucket_key(tenant_id, provider), do: "provider_admission:#{provider}:#{tenant_id}"
