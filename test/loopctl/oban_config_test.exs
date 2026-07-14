@@ -306,9 +306,23 @@ defmodule Loopctl.ObanConfigTest do
       assert result == 3
     end
 
-    test "TC-36.3.3: a malformed value fails LOUD (raises) rather than silently defaulting" do
-      # ingest_backlog_max/0 delegates to queue_size/2, so a present-but-malformed
-      # OBAN_INGEST_BACKLOG_MAX raises at read time exactly like OBAN_QUEUE_*.
+    @tag :tmp_dir
+    test "TC-36.3.3: a malformed OBAN_INGEST_BACKLOG_MAX aborts boot (fail-loud, like OBAN_QUEUE_*)",
+         %{tmp_dir: tmp_dir} do
+      # config/runtime.exs evaluates `ObanConfig.ingest_backlog_max()` at the top level
+      # (via `config :loopctl, :ingest_backlog_max, ...`), so a fat-fingered live-tuning
+      # value fails LOUD at boot (non-zero exit) instead of surviving to the batch
+      # endpoint's call time, where an unhandled raise would surface as per-request 500s.
+      # This drives the REAL env-read path (System.get_env -> ingest_backlog_max/0 ->
+      # queue_size/2), not just the shared queue_size/2 delegate.
+      {output, exit_code} = run_boot(tmp_dir, [{"OBAN_INGEST_BACKLOG_MAX", "abc"}])
+
+      assert exit_code != 0
+      assert output =~ "positive integer"
+    end
+
+    test "TC-36.3.3: ingest_backlog_max/0 delegates to queue_size/2, which fails LOUD on a malformed value" do
+      # Direct unit-level assertion on the shared parser the env-read path uses.
       assert_raise ArgumentError, ~r/positive integer/, fn -> ObanConfig.queue_size("0", 500) end
       assert_raise ArgumentError, ~r/positive integer/, fn -> ObanConfig.queue_size("-1", 500) end
 

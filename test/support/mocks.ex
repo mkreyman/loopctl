@@ -65,6 +65,13 @@ Mox.defmock(Loopctl.MockObanOrphanCountChecker,
   for: Loopctl.Telemetry.ScaleMetrics.OrphanCountBehaviour
 )
 
+# US-36.3: DI seam for the batch-ingest backlog admission gate's in-flight count.
+# The DataCase default stub delegates to the real `Loopctl.Oban.FairShare.in_flight_count/2`
+# (so the existing backlog tests exercise the real, sandboxed count unchanged);
+# the fail-open test overrides it with Mox.expect/3 to RAISE, deterministically
+# driving the controller's fail-open path (count error -> admit, never 500).
+Mox.defmock(Loopctl.MockBacklogCounter, for: Loopctl.Oban.BacklogCounterBehaviour)
+
 # US-27.3: the DBErrorBackstop test seam is a REAL plug (Loopctl.Test.BackstopRouter,
 # wired via config/test.exs), NOT a Mox mock — so the production router stays on
 # the hot path for every request and the catch/log/sanitize path is exercised by

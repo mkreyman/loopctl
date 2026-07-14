@@ -773,6 +773,34 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert length(body["data"]) == 1
       assert Enum.all?(body["data"], fn r -> r["status"] == "queued" end)
     end
+
+    test "TC-36.3.5: the admission gate FAILS OPEN when the backlog count raises (no 500)",
+         %{conn: conn} do
+      # The count runs under a 2s statement_timeout on a fleet-wide (state,queue) index
+      # scan, so during the deep-queue flood this feature targets it can time out and
+      # RAISE. Mirroring the US-36.2 fair-share gate, an unmeasurable count must ADMIT
+      # the batch (an innocent tenant must never get a generic HTTP 500), not block it.
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # Simulate a statement_timeout / transient DB error from the backlog count via the
+      # DI seam (overrides the DataCase default that delegates to the real count).
+      expect(Loopctl.MockBacklogCounter, :in_flight_count, fn _tenant_id, _queue ->
+        raise DBConnection.ConnectionError, "simulated statement_timeout"
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "Fail-open batch item", source_type: "newsletter"}]
+        })
+
+      # Fail OPEN: the batch is admitted (200) and the item enqueues, rather than 500.
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 1
+      assert Enum.all?(body["data"], fn r -> r["status"] == "queued" end)
+    end
   end
 
   # --- GET /api/v1/knowledge/ingestion-jobs ---

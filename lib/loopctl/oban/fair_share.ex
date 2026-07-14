@@ -72,8 +72,9 @@ defmodule Loopctl.Oban.FairShare do
       lowest-id executing job for a tenant always has rank 0 → runs → completes, then
       the next, so every job drains in id (≈ FIFO) order and none starves.
 
-  The public `executing_count/2` / `in_flight_count/2` helpers (reused by US-36.3's
-  `/queue-health` endpoint) are UNSCOPED counts — they intentionally do NOT apply the
+  The public `executing_count/2` / `in_flight_count/2` helpers (`in_flight_count/2`
+  is reused by US-36.3's batch-ingest backlog admission gate — see below) are
+  UNSCOPED counts — they intentionally do NOT apply the
   rank predicate; `id < job_id` belongs only to the gate's decision path. `job_id`
   may be `nil` (a bare `perform/1` struct in a test, off the real dispatch path) —
   then the gate falls back to the plain unscoped executing count `>= cap`.
@@ -88,7 +89,8 @@ defmodule Loopctl.Oban.FairShare do
 
     * `in_flight_count/2` — the broad 4-state set
       (`available`/`scheduled`/`executing`/`retryable`), the GENERAL helper reused by
-      US-36.3's `/queue-health` endpoint.
+      US-36.3's batch-ingest backlog admission gate (the 429 backpressure check in
+      `LoopctlWeb.KnowledgeIngestionController.create_batch/2`).
     * `executing_count/2` — only `executing`, the slot-occupancy the fair-share gate
       decides on (AC-36.2.2).
 
@@ -118,9 +120,11 @@ defmodule Loopctl.Oban.FairShare do
       depth, but stays low-single-digit-ms at the flood sizes this feature contends
       with and is HARD-BOUNDED by the 2 s `SET LOCAL statement_timeout` below — it can
       never pin a connection. This bound makes it safe for US-36.3's synchronous
-      `/queue-health` per-request use; if that endpoint ever needs a flood-independent
-      cost it should cap the count (e.g. `LIMIT`-bounded existence probe), not add an
-      index (see next).
+      per-request admission-gate use; that gate additionally FAILS OPEN if this count
+      raises/times out (an unmeasurable backlog admits the batch, never 500 — see
+      `LoopctlWeb.KnowledgeIngestionController`), and if it ever needs a flood-
+      independent cost it should cap the count (e.g. `LIMIT`-bounded existence probe),
+      not add an index (see next).
 
   NO new index is warranted. A count of N matching rows is inherently O(N) index
   entries even with a perfect covering index, so no index makes a single-tenant flood
@@ -138,8 +142,13 @@ defmodule Loopctl.Oban.FairShare do
   alias Loopctl.AdminRepo
   alias Loopctl.ObanConfig
 
+  # `in_flight_count/2` is the broad non-terminal count US-36.3's batch-ingest
+  # admission gate consults; declaring the behaviour makes FairShare the default
+  # (production) implementation of that config-swappable DI seam.
+  @behaviour Loopctl.Oban.BacklogCounterBehaviour
+
   # The four non-terminal Oban states — the GENERAL in-flight set (AC-36.2.1),
-  # shared with US-36.3's queue-health endpoint.
+  # shared with US-36.3's batch-ingest backlog admission gate.
   @non_terminal_states ~w(available scheduled executing retryable)
 
   # Bound the read on the hot, Oban-owned oban_jobs table. Generous vs the measured
@@ -211,7 +220,8 @@ defmodule Loopctl.Oban.FairShare do
   @doc """
   Broad in-flight count for `tenant_id` on `queue` across the four non-terminal
   states (`available`/`scheduled`/`executing`/`retryable`) — AC-36.2.1. This is the
-  GENERAL helper US-36.3's endpoint reuses.
+  GENERAL helper US-36.3's batch-ingest backlog admission gate reuses (the 429
+  backpressure check in `LoopctlWeb.KnowledgeIngestionController.create_batch/2`).
   """
   @spec in_flight_count(binary(), atom() | binary()) :: non_neg_integer()
   def in_flight_count(tenant_id, queue) do
@@ -221,8 +231,9 @@ defmodule Loopctl.Oban.FairShare do
   @doc """
   Count of `tenant_id`'s currently-EXECUTING jobs on `queue` (AC-36.2.2) — the
   UNSCOPED slot-occupancy (counts every executing job, including any running caller).
-  US-36.3's `/queue-health` endpoint reuses this. The gate's decision path uses the
-  self-excluding count instead (see `over_fair_share?/3`).
+  Used only by the fair-share gate's fallback (a `nil` `job_id`); the gate's normal
+  decision path uses the self-excluding rank count instead (see `over_fair_share?/3`).
+  Not currently reused outside this module (US-36.3 reuses `in_flight_count/2` only).
   """
   @spec executing_count(binary(), atom() | binary()) :: non_neg_integer()
   def executing_count(tenant_id, queue) do

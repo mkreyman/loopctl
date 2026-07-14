@@ -203,8 +203,15 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 =>
-        {"Ingestion backlog backpressure OR request-rate limit", "application/json",
-         Schemas.IngestionBacklogError}
+        {"Too Many Requests — one of two DISTINCT 429s this route can return: (1) " <>
+           "US-36.3 ingestion-backlog backpressure (`error.code: " <>
+           "\"ingestion_backlog_exceeded\"`, sets `Retry-After`), or (2) the generic " <>
+           "shared Hammer request-rate limiter (NO `error.code`; `error.message: " <>
+           "\"Rate limit exceeded\"`). Branch on the presence of `error.code`.",
+         "application/json",
+         %OpenApiSpex.Schema{
+           oneOf: [Schemas.IngestionBacklogError, Schemas.RateLimitError]
+         }}
     }
   )
 
@@ -235,11 +242,37 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   defp check_ingestion_backlog(tenant_id) do
     max = ObanConfig.ingest_backlog_max()
 
-    if FairShare.in_flight_count(tenant_id, :ingestion) >= max do
+    if in_flight_ingestion_backlog(tenant_id) >= max do
       {:error, :ingestion_backlog_exceeded, backlog_retry_after_seconds()}
     else
       :ok
     end
+  end
+
+  # FAIL OPEN, mirroring the US-36.2 fair-share gate (`Loopctl.Oban.FairShare.over_cap?/4`):
+  # an unmeasurable backlog count must NEVER block work. The reused count runs under a 2s
+  # `SET LOCAL statement_timeout` and — per FairShare's cost model — scans every
+  # non-terminal `:ingestion` row FLEET-WIDE (tenant is a post-Filter), so during the
+  # deep-queue flood this feature targets it is MOST likely to hit that bound. A raised
+  # statement_timeout / transient Postgrex/DBConnection error must therefore not escape
+  # here as a generic HTTP 500 that rejects an innocent, under-threshold tenant's batch;
+  # instead we log and admit (return 0 → below any positive threshold). The count is
+  # resolved through a config-swappable DI seam (`Loopctl.Oban.FairShare` in prod, a Mox
+  # mock in test) so this fail-open path is deterministically covered.
+  defp in_flight_ingestion_backlog(tenant_id) do
+    backlog_counter().in_flight_count(tenant_id, :ingestion)
+  rescue
+    e ->
+      Logger.warning(
+        "ingestion backlog gate failed open for tenant=#{tenant_id}: " <>
+          Exception.message(e)
+      )
+
+      0
+  end
+
+  defp backlog_counter do
+    Application.get_env(:loopctl, :ingestion_backlog_counter, FairShare)
   end
 
   # Retry-After hint (seconds) for a backlog-429. Tied to the fair-share snooze base so

@@ -17,6 +17,7 @@ defmodule Loopctl.DataCase do
   use ExUnit.CaseTemplate
 
   alias Ecto.Adapters.SQL.Sandbox
+  alias Loopctl.Oban.FairShare
   alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Telemetry.ScaleMetrics
   alias Loopctl.Webhooks.ReqDelivery
@@ -93,6 +94,15 @@ defmodule Loopctl.DataCase do
     # tests. The degraded-branch test overrides this with Mox.expect/3.
     Mox.stub(Loopctl.MockObanOrphanCountChecker, :cached_executing_orphan_count, fn ->
       {:ok, ScaleMetrics.count_oban_executing_orphans()}
+    end)
+
+    # US-36.3: default delegates to the real FairShare.in_flight_count/2 — a fresh,
+    # per-call count scoped to THIS test's own sandboxed transaction — so every
+    # existing batch-ingest backlog test (seeded oban_jobs rows) exercises the real
+    # count unchanged. The fail-open test overrides this with Mox.expect/3 to raise,
+    # deterministically driving the controller's fail-open (count error -> admit) path.
+    Mox.stub(Loopctl.MockBacklogCounter, :in_flight_count, fn tenant_id, queue ->
+      FairShare.in_flight_count(tenant_id, queue)
     end)
 
     Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->

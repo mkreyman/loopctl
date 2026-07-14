@@ -258,8 +258,13 @@ defmodule Loopctl.ObanConfig do
   Max in-flight `:ingestion` backlog (non-terminal jobs) a single tenant may have
   before the batch-ingest endpoint rejects a new batch with 429 (US-36.3).
 
-  From `OBAN_INGEST_BACKLOG_MAX` (positive integer, else raises `ArgumentError` at
-  read time like `queue_size/2`), default #{@default_ingest_backlog_max}.
+  From `OBAN_INGEST_BACKLOG_MAX` (positive integer, else raises `ArgumentError` like
+  `queue_size/2`), default #{@default_ingest_backlog_max}.
+
+  Validated at BOOT: `config/runtime.exs` evaluates this function (via
+  `config :loopctl, :ingest_backlog_max, ...`), so a malformed value aborts the node
+  LOUD at startup — like `OBAN_QUEUE_*` / `OBAN_TENANT_FAIRSHARE_*` — instead of
+  surfacing only at call time as per-request 500s on the batch endpoint.
 
   Config-based DI: read via `System.get_env/1` at call time (NEVER
   `Application.compile_env`, which would record a boot-aborting compile-env
