@@ -1,0 +1,51 @@
+{
+  "id": "US-36.4",
+  "title": "Linking hot-path efficiency: batched insert_all + on_conflict; replace per-job count(*) with a sampled telemetry count",
+  "epic": { "id": "epic_36", "name": "Per-Tenant Oban Fairness & Queue Topology" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "The linking worker is the highest-frequency :knowledge job (one per embedded article, plus it's re-triggered by the embeddings→knowledge coupling). Two per-job inefficiencies — a full count(*) and row-by-row link inserts — multiply directly with fan-out, so trimming them relieves the shared queue and the DB under exactly the bulk-ingest bursts this epic targets.",
+  "background": {
+    "reference": "GH #351. ArticleLinkingWorker (article_linking_worker.ex) runs once per embedded article on :knowledge. log_if_exceeds_limit/3 (:225-242) runs AdminRepo.aggregate(:count) over all published+embedded tenant/project articles on EVERY job — a full count(*) that grows with the tenant's corpus, feeding only a warning log (:236-241). Link creation is not batched. A bulk ingest of N items triggers N such jobs, each paying the count.",
+    "includes": "The count(*) is observability-only (a soft warning); it does not gate linking. It can be replaced by a sampled/periodic telemetry count (e.g. emit on a fraction of jobs, or move to the existing periodic Oban/knowledge metrics poller) without losing the signal. Link inserts should use insert_all + on_conflict to collapse per-row round-trips."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "stop running a full count(*) on every linking job and insert discovered links in a single batched insert_all with on_conflict, moving the corpus-size signal to a sampled telemetry path",
+    "so_that": "each linking job does bounded, near-constant DB work regardless of corpus size, so a bulk-ingest burst of linking jobs no longer amplifies into a burst of expensive full-table counts and row-by-row inserts on the shared queue"
+  },
+  "rationale": "The per-job count(*) is pure overhead on the hot path — it only powers a warning log, so it belongs on a sampled/periodic telemetry path, not every job. Batching link inserts with insert_all + on_conflict collapses many single-row writes into one statement. Both changes are transparent to link CORRECTNESS (same links created) and shrink the per-job cost that fan-out multiplies, complementing the fairness gate (US-36.2) and the queue split (US-36.1).",
+  "acceptance_criteria": [
+    { "id": "AC-36.4.1", "description": "The per-job full count(*) in log_if_exceeds_limit/3 is removed from the hot path. The corpus-size-vs-limit signal is preserved via a SAMPLED or PERIODIC telemetry path (e.g. only compute on a small fraction of jobs, or emit from the existing periodic knowledge/Oban metrics poller) so the warning is still observable but not paid per job. A test asserts the linking job no longer issues the full count on every run.", "status": "pending" },
+    { "id": "AC-36.4.2", "description": "Discovered links are persisted with a single insert_all (+ on_conflict to stay idempotent on the existing unique constraint), not row-by-row inserts. The SAME links are created as before (correctness-preserving) — a test compares the resulting link set for a fixed input against the prior behavior and asserts equality, and asserts idempotency on re-run (on_conflict, no duplicates).", "status": "pending" },
+    { "id": "AC-36.4.3", "description": "No change to WHICH links are created or the kNN/threshold logic (VectorSearch.nearest and the linking decision are untouched) — this story is purely the count and the insert mechanics. Tenant/project scoping of the count and inserts is preserved (tenant-isolation test).", "status": "pending" },
+    { "id": "AC-36.4.4", "description": "Reads/writes run on the appropriate path with a per-query statement_timeout; the batched insert stays within Postgres bind-parameter limits (chunk if a single article can produce very many links). Purely an efficiency change — no job semantics, args, or queue change.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-36.4.1", "name": "no full count(*) per linking job", "type": "integration",
+      "preconditions": ["a tenant with a sizable published+embedded corpus"],
+      "steps": ["run a linking job (unsampled)"],
+      "expected_results": ["no full-table count(*) is issued on the hot path; the corpus-size warning still reachable via the sampled/periodic path"], "status": "pending" },
+    { "id": "TC-36.4.2", "name": "links persisted via idempotent insert_all", "type": "integration",
+      "preconditions": ["an article with several qualifying neighbors"],
+      "steps": ["run linking once, then again"],
+      "expected_results": ["same link set as the prior row-by-row behavior; second run creates no duplicates (on_conflict)"], "status": "pending" },
+    { "id": "TC-36.4.3", "name": "linking decisions unchanged", "type": "integration",
+      "preconditions": ["fixed embeddings/neighbors"],
+      "steps": ["run linking"],
+      "expected_results": ["identical set of links vs the pre-change implementation for the same input"], "status": "pending" },
+    { "id": "TC-36.4.4", "name": "tenant isolation preserved", "type": "integration",
+      "preconditions": ["tenant A and B corpora"],
+      "steps": ["run linking for A"],
+      "expected_results": ["only A's articles considered/linked; B untouched"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/workers/article_linking_worker.ex (log_if_exceeds_limit/3 + the link-insert path), possibly lib/loopctl/knowledge.ex (link creation helper), the periodic metrics poller (config.exs oban_metrics_poll_* / telemetry) if moving the count there.",
+    "The count(*) powers only a warning log (:236-241) — safe to sample. Simplest: compute it on ~1/N jobs (deterministic by article id hash) or fold it into the daily knowledge metrics worker. Do NOT gate linking on it.",
+    "insert_all with on_conflict: {:nothing} or replace on the existing links unique index; chunk to stay under the 65535 bind-parameter ceiling if an article yields many links.",
+    "Correctness gate: a test asserting the produced link set is identical to the current implementation for a fixed input is the safety net — this is an efficiency refactor, not a behavior change.",
+    "Per-query SET LOCAL statement_timeout on the reads/writes; no startup :parameter (pgbouncer-safe)."
+  ],
+  "dependencies": ["US-36.1"],
+  "estimated_tokens": 300000
+}
