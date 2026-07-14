@@ -196,6 +196,34 @@ defmodule Loopctl.TelemetryEvents do
   """
   def llm_provider_error, do: [:loopctl, :llm, :provider_error]
 
+  @doc """
+  The US-36.3 batch/single ingest backlog admission gate FAILED OPEN — it could not
+  measure the calling tenant's in-flight `:ingestion` backlog (the count raised a
+  `Postgrex.Error` statement_timeout or a `DBConnection.ConnectionError` pool-checkout
+  timeout) and therefore ADMITTED the request rather than 429-ing it. While this fires,
+  the backpressure valve is effectively OFF for that request: a genuine flood deep
+  enough to time the count out will admit instead of shed.
+
+  Turns an otherwise silent `:warning` log line into an alertable signal so operators
+  can see "the ingestion backpressure valve is currently admitting because it can't
+  measure" on a dashboard. Distinct from a valve that is simply BELOW threshold (that
+  path emits nothing). Fires once per failed-open admission check.
+
+  ## Payload (id/atom only — never a query, key, or PG message body)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{tenant_id, error_class}` where `error_class` is a BOUNDED 2-value
+      tag (`"timeout"` for the `Postgrex.Error` statement_timeout, `"connection"` for the
+      `DBConnection.ConnectionError` pool-checkout timeout). `tenant_id` is an id, and is
+      cap-gated to a sentinel in the metric's `tag_values` so label cardinality stays
+      bounded (same convention as the other scale counters).
+
+  Aggregated by `Loopctl.Telemetry.ScaleMetrics` as a counter tagged by
+  `[:error_class, :tenant_id]`.
+  """
+  def ingestion_backlog_gate_failed_open,
+    do: [:loopctl, :ingestion, :backlog_gate, :failed_open]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -211,7 +239,8 @@ defmodule Loopctl.TelemetryEvents do
       db_error(),
       knowledge_semantic_fallback(),
       knowledge_hybrid_provenance(),
-      llm_provider_error()
+      llm_provider_error(),
+      ingestion_backlog_gate_failed_open()
     ]
   end
 end

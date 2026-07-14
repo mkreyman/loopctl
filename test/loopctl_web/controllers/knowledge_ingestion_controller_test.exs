@@ -717,13 +717,42 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert body["error"]["status"] == 429
       assert body["error"]["message"] =~ "No items from this batch were enqueued"
 
-      # Retry-After header is a positive integer string.
+      # Retry-After header is a positive integer string, tied to the ingestion drain
+      # cadence (NOT the sub-second fair-share snooze base) so a compliant client does
+      # not hot-loop retry->429.
       assert [retry_after] = get_resp_header(conn, "retry-after")
       assert {n, ""} = Integer.parse(retry_after)
       assert n > 0
       assert body["error"]["retry_after_seconds"] == n
+      assert n == ObanConfig.ingest_backlog_retry_after_seconds()
 
       # All-or-nothing: NO new ContentIngestionWorker job was enqueued for the tenant.
+      assert FairShare.in_flight_count(tenant.id, :ingestion) == before_count
+    end
+
+    test "TC-36.3.6: the SINGLE-item ingest path is gated too (no bypass of the valve)",
+         %{conn: conn} do
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      max = ObanConfig.ingest_backlog_max()
+      :ok = seed_ingestion_backlog(tenant.id, max)
+      before_count = FairShare.in_flight_count(tenant.id, :ingestion)
+
+      # Looping the single-item endpoint must NOT bypass the batch backpressure valve.
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          content: "Over-threshold single item",
+          source_type: "newsletter"
+        })
+
+      body = json_response(conn, 429)
+      assert body["error"]["code"] == "ingestion_backlog_exceeded"
+      assert [_retry_after] = get_resp_header(conn, "retry-after")
+
+      # No new job enqueued — the single-item path shed the request like the batch path.
       assert FairShare.in_flight_count(tenant.id, :ingestion) == before_count
     end
 
@@ -783,9 +812,29 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
+      # The fail-open path emits an alertable telemetry counter so "the valve is currently
+      # admitting because it can't measure" is observable, not just a warning log.
+      test_pid = self()
+      handler_id = "backlog-failopen-#{System.unique_integer([:positive])}"
+      event = [:loopctl, :ingestion, :backlog_gate, :failed_open]
+
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn ^event, measurements, metadata, _ ->
+          if metadata.tenant_id == tenant.id,
+            do: send(test_pid, {:backlog_failed_open, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
       # Simulate a statement_timeout / transient DB error from the backlog count via the
-      # DI seam (overrides the DataCase default that delegates to the real count).
-      expect(Loopctl.MockBacklogCounter, :in_flight_count, fn _tenant_id, _queue ->
+      # DI seam (overrides the DataCase default that delegates to the real count). The
+      # controller now rescues ONLY DB timeout/connection classes, so this must raise one
+      # of them (a bare error would propagate and 500 by design).
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
         raise DBConnection.ConnectionError, "simulated statement_timeout"
       end)
 
@@ -800,6 +849,31 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       body = json_response(conn, 200)
       assert length(body["data"]) == 1
       assert Enum.all?(body["data"], fn r -> r["status"] == "queued" end)
+
+      # ...and the fail-open telemetry fired with the bounded error_class tag.
+      assert_receive {:backlog_failed_open, %{count: 1}, metadata}
+      assert metadata.error_class == "connection"
+    end
+
+    test "TC-36.3.7: a NON-DB error in the backlog count propagates (500), not fail-open",
+         %{conn: conn} do
+      # A programming error in the count path must NOT be silently swallowed into a
+      # fleet-wide disabling of backpressure — it must surface (rescue is narrowed to DB
+      # timeout/connection classes only).
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        raise ArgumentError, "simulated bug in count path"
+      end)
+
+      assert_raise ArgumentError, fn ->
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "Bug batch item", source_type: "newsletter"}]
+        })
+      end
     end
   end
 

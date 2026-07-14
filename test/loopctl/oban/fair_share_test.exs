@@ -54,6 +54,48 @@ defmodule Loopctl.Oban.FairShareTest do
     end
   end
 
+  describe "in_flight_ingestion_backlog/1 (US-36.3 — worker-scoped, index-backed)" do
+    test "counts the tenant's non-terminal ContentIngestionWorker jobs; excludes terminal" do
+      tenant = Ecto.UUID.generate()
+      w = "Loopctl.Workers.ContentIngestionWorker"
+
+      seed_job(tenant, :ingestion, "available", worker: w)
+      seed_job(tenant, :ingestion, "scheduled", worker: w)
+      seed_job(tenant, :ingestion, "executing", worker: w)
+      seed_job(tenant, :ingestion, "retryable", worker: w)
+      # Terminal states must NOT be counted.
+      seed_job(tenant, :ingestion, "completed", worker: w)
+      seed_job(tenant, :ingestion, "discarded", worker: w)
+
+      assert FairShare.in_flight_ingestion_backlog(tenant) == 4
+    end
+
+    test "is scoped to the ingestion worker, not merely the queue — other workers excluded" do
+      tenant = Ecto.UUID.generate()
+      w = "Loopctl.Workers.ContentIngestionWorker"
+
+      seed_job(tenant, :ingestion, "available", worker: w)
+      # A different worker (even on the same queue string) must not be counted by the
+      # worker-scoped backlog — the count keys on `worker`, so it rides the partial index.
+      seed_job(tenant, :ingestion, "available", worker: "Loopctl.Workers.SomeOtherWorker")
+      seed_job(tenant, :embeddings, "available", worker: "Loopctl.Workers.ArticleEmbeddingWorker")
+
+      assert FairShare.in_flight_ingestion_backlog(tenant) == 1
+    end
+
+    test "is tenant-scoped — A's ingestion backlog never includes B's" do
+      tenant_a = Ecto.UUID.generate()
+      tenant_b = Ecto.UUID.generate()
+      w = "Loopctl.Workers.ContentIngestionWorker"
+
+      seed_job(tenant_a, :ingestion, "available", worker: w)
+      for _ <- 1..3, do: seed_job(tenant_b, :ingestion, "available", worker: w)
+
+      assert FairShare.in_flight_ingestion_backlog(tenant_a) == 1
+      assert FairShare.in_flight_ingestion_backlog(tenant_b) == 3
+    end
+  end
+
   describe "tenant isolation (AC-36.2.6)" do
     test "tenant A's count never includes tenant B's jobs" do
       tenant_a = Ecto.UUID.generate()

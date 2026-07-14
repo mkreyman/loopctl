@@ -469,6 +469,22 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         tag_values: &hybrid_provenance_tags/1
       ),
 
+      # US-36.3 (review): the batch/single ingest backlog admission gate FAILED OPEN —
+      # it could not measure the tenant's in-flight :ingestion backlog (count timed out /
+      # lost its connection) and ADMITTED the request rather than shedding it. Makes "the
+      # ingestion backpressure valve is currently admitting because it can't measure" an
+      # alertable signal instead of a silent warning log. `error_class` is a bounded
+      # 2-value tag; `tenant_id` is cap-gated to a sentinel (same convention as the other
+      # scale counters).
+      counter("loopctl.ingestion.backlog_gate.failed_open.count",
+        event_name: [:loopctl, :ingestion, :backlog_gate, :failed_open],
+        measurement: :count,
+        description:
+          "Ingestion backlog admission gate failed open (unmeasurable backlog count), by error_class and tenant.",
+        tags: [:error_class, :tenant_id],
+        tag_values: &ingestion_backlog_failed_open_tags/1
+      ),
+
       # 6. Per-pool checkout queue_time (US-33.1): the RLS `Loopctl.Repo` pool (size
       #    10). Sourced from Ecto's default query event for that repo module
       #    (`[:loopctl, :repo, :query]`). `repo` is a STATIC single-value tag (not
@@ -689,6 +705,20 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
     %{
       provenance: Map.get(metadata, :provenance, "unknown"),
       hit: Map.get(metadata, :hit, false),
+      tenant_id: gated_tenant_id(metadata)
+    }
+  end
+
+  @doc """
+  `tag_values` for the ingestion backlog gate fail-open counter (US-36.3 review).
+  `error_class` is a small fixed-cardinality tag (`"timeout"` | `"connection"`, default
+  `"unknown"`); `tenant_id` reuses the same cap-gated sentinel collapse as the other
+  scale counters to keep cardinality bounded.
+  """
+  @spec ingestion_backlog_failed_open_tags(map()) :: map()
+  def ingestion_backlog_failed_open_tags(metadata) do
+    %{
+      error_class: Map.get(metadata, :error_class, "unknown"),
       tenant_id: gated_tenant_id(metadata)
     }
   end

@@ -96,13 +96,13 @@ defmodule Loopctl.DataCase do
       {:ok, ScaleMetrics.count_oban_executing_orphans()}
     end)
 
-    # US-36.3: default delegates to the real FairShare.in_flight_count/2 — a fresh,
-    # per-call count scoped to THIS test's own sandboxed transaction — so every
+    # US-36.3: default delegates to the real FairShare.in_flight_ingestion_backlog/1 — a
+    # fresh, per-call count scoped to THIS test's own sandboxed transaction — so every
     # existing batch-ingest backlog test (seeded oban_jobs rows) exercises the real
     # count unchanged. The fail-open test overrides this with Mox.expect/3 to raise,
     # deterministically driving the controller's fail-open (count error -> admit) path.
-    Mox.stub(Loopctl.MockBacklogCounter, :in_flight_count, fn tenant_id, queue ->
-      FairShare.in_flight_count(tenant_id, queue)
+    Mox.stub(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn tenant_id ->
+      FairShare.in_flight_ingestion_backlog(tenant_id)
     end)
 
     Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->

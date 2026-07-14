@@ -240,9 +240,10 @@ defmodule Loopctl.ObanConfig do
   # --- US-36.3: batch-ingest backlog backpressure (429) ---
   #
   # Max in-flight :ingestion backlog (the broad non-terminal set —
-  # available/scheduled/executing/retryable, via `Loopctl.Oban.FairShare.in_flight_count/2`)
-  # a SINGLE tenant may have accumulated before the batch-ingest endpoint
-  # (POST /api/v1/knowledge/ingest/batch) rejects a NEW batch all-or-nothing with 429.
+  # available/scheduled/executing/retryable, via the worker-scoped, index-backed
+  # `Loopctl.Oban.FairShare.in_flight_ingestion_backlog/1`) a SINGLE tenant may have
+  # accumulated before the ingest endpoints (POST /api/v1/knowledge/ingest and
+  # /ingest/batch) reject a NEW request with 429.
   #
   # This bounds ACCUMULATION, complementing US-36.2's fair-share gate (which bounds
   # per-tenant CONCURRENCY of executing slots). A 50-item batch fans each item out to
@@ -255,8 +256,15 @@ defmodule Loopctl.ObanConfig do
   @default_ingest_backlog_max 500
 
   @doc """
-  Max in-flight `:ingestion` backlog (non-terminal jobs) a single tenant may have
-  before the batch-ingest endpoint rejects a new batch with 429 (US-36.3).
+  In-flight `:ingestion` backlog (non-terminal jobs) at/above which a single tenant's
+  ingest requests start being rejected with 429 (US-36.3).
+
+  SOFT admission FLOOR, not a hard cap. The gate is a lock-free read-then-enqueue, so
+  concurrent same-tenant requests can each pass the check and overshoot this value by up
+  to the in-flight request concurrency (a benign TOCTOU). Read it as "start shedding
+  around here", not "the backlog can never exceed this" — it is a backpressure valve to
+  stop runaway monopolization, not an enforced ceiling. Gated on BOTH the batch and the
+  single-item ingest paths so neither can be looped to bypass the other.
 
   From `OBAN_INGEST_BACKLOG_MAX` (positive integer, else raises `ArgumentError` like
   `queue_size/2`), default #{@default_ingest_backlog_max}.
@@ -275,6 +283,35 @@ defmodule Loopctl.ObanConfig do
   @spec ingest_backlog_max() :: pos_integer()
   def ingest_backlog_max do
     queue_size(System.get_env("OBAN_INGEST_BACKLOG_MAX"), @default_ingest_backlog_max)
+  end
+
+  # Retry-After hint (seconds) advised to a client 429'd by the ingest backlog gate.
+  # Deliberately tied to the :ingestion queue's DRAIN cadence, NOT the sub-second
+  # fair-share snooze base: ContentIngestionWorker jobs are ~6-min LLM calls on a
+  # width-2 queue, so a backlog drains over minutes-to-hours. A 5s hint would hot-loop a
+  # compliant client into a steady stream of 429s (each re-running the admission count);
+  # a ~1-min default keeps a Retry-After-honoring client off the endpoint between real
+  # drains while staying a bounded, sensible "back off for a while" value.
+  @default_ingest_backlog_retry_after_seconds 60
+
+  @doc """
+  Retry-After (seconds) advised to a client rejected by the batch/single-item ingest
+  backlog gate (US-36.3). Scaled to the `:ingestion` queue's drain cadence rather than
+  the fair-share snooze base, so a compliant client does not hot-loop retry->429.
+
+  From `OBAN_INGEST_BACKLOG_RETRY_AFTER` (positive integer, else raises `ArgumentError`
+  like `queue_size/2`), default #{@default_ingest_backlog_retry_after_seconds}.
+
+  Validated at BOOT (via `config/runtime.exs`), so a malformed value aborts the node
+  LOUD at startup instead of surfacing only at call time. Config-based DI: read via
+  `System.get_env/1` at call time so ops can retune live with no deploy.
+  """
+  @spec ingest_backlog_retry_after_seconds() :: pos_integer()
+  def ingest_backlog_retry_after_seconds do
+    queue_size(
+      System.get_env("OBAN_INGEST_BACKLOG_RETRY_AFTER"),
+      @default_ingest_backlog_retry_after_seconds
+    )
   end
 
   # Like `queue_size/2` but admits 0 (a valid "no jitter" value). Still fails loud on

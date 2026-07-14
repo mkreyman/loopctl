@@ -72,9 +72,9 @@ defmodule Loopctl.Oban.FairShare do
       lowest-id executing job for a tenant always has rank 0 → runs → completes, then
       the next, so every job drains in id (≈ FIFO) order and none starves.
 
-  The public `executing_count/2` / `in_flight_count/2` helpers (`in_flight_count/2`
-  is reused by US-36.3's batch-ingest backlog admission gate — see below) are
-  UNSCOPED counts — they intentionally do NOT apply the
+  The public `executing_count/2` / `in_flight_count/2` / `in_flight_ingestion_backlog/1`
+  helpers (the last is consulted by US-36.3's batch-ingest backlog admission gate — see
+  below) are UNSCOPED counts — they intentionally do NOT apply the
   rank predicate; `id < job_id` belongs only to the gate's decision path. `job_id`
   may be `nil` (a bare `perform/1` struct in a test, off the real dispatch path) —
   then the gate falls back to the plain unscoped executing count `>= cap`.
@@ -88,51 +88,64 @@ defmodule Loopctl.Oban.FairShare do
   text compare. Two counts are exposed:
 
     * `in_flight_count/2` — the broad 4-state set
-      (`available`/`scheduled`/`executing`/`retryable`), the GENERAL helper reused by
-      US-36.3's batch-ingest backlog admission gate (the 429 backpressure check in
-      `LoopctlWeb.KnowledgeIngestionController.create_batch/2`).
+      (`available`/`scheduled`/`executing`/`retryable`) scoped by `queue` — the
+      GENERAL fair-share helper (AC-36.2.1).
+    * `in_flight_ingestion_backlog/1` — the SAME broad 4-state set but scoped by
+      `worker = ContentIngestionWorker` (the sole worker on the `:ingestion` queue),
+      the count US-36.3's batch-ingest backlog admission gate consults (the 429
+      backpressure check in `LoopctlWeb.KnowledgeIngestionController`). Filtering by
+      `worker` rather than `queue` lets the count ride the partial index
+      `oban_jobs_ingestion_tenant_idx` — see "Cost / index justification".
     * `executing_count/2` — only `executing`, the slot-occupancy the fair-share gate
       decides on (AC-36.2.2).
 
   ### Cost / index justification
 
-  The query filters `queue = $1 AND state (= or IN) ... AND args->>'tenant_id' = $2`.
-  Oban's own default index `oban_jobs_state_queue_priority_scheduled_at_id_index`
-  leads with `(state, queue)`, so the planner Index-Scans exactly the NON-TERMINAL
-  population for that `(state, queue)` and applies `args->>'tenant_id'` as a filter
-  over it — the enormous `completed`/`discarded` backlog (pruned after 7 days, but
-  still the bulk of the table) is never touched because `state` is the leading column.
+  Two count SHAPES with two DIFFERENT cost profiles, because US-36.2 and US-36.3 scope
+  the count differently:
 
-  The cost is therefore O(non-terminal rows on that `(state, queue)`), NOT sub-ms
-  unconditionally. Two regimes, both measured on the dev DB:
+  **QUEUE-scoped (`in_flight_count/2`, `executing_count/2` — the fair-share gate).**
+  Filters `queue = $1 AND state (= or IN) ... AND args->>'tenant_id' = $2`. Oban's own
+  default index `oban_jobs_state_queue_priority_scheduled_at_id_index` leads with
+  `(state, queue)`, so the planner Index-Scans exactly the NON-TERMINAL population for
+  that `(state, queue)` and applies `args->>'tenant_id'` as a filter over it. The cost
+  is O(non-terminal rows on that `(state, queue)`) — NOT reduced by the tenant filter
+  under a single-tenant flood — but HARD-BOUNDED by the 2 s statement_timeout. Measured:
+  ~0.05 ms benign (~18k terminal/pruned jobs); ~3.5 ms at a synthesised 10k-non-terminal
+  `:embeddings` flood (`Index Scan … Index Cond ((state,queue))`, tenant a post-Filter,
+  `shared hit≈5591`). This is the gate-internal cost; the gate is off the request path
+  (it runs inside `perform/1`) and already FAILS OPEN on the count, so O(queue-depth)
+  here is acceptable. No new index is warranted for it (a count of N matching rows is
+  inherently O(N) index entries; a `(tenant, queue, state)` index would lead with the
+  high-cardinality tenant expression and fold the whole completed backlog under each
+  tenant — strictly worse for the common case).
 
-    * BENIGN (~18k jobs, all terminal/pruned): the `executing` count is
-      `Index Scan … Index Cond ((state,queue)) … shared hit≈3`, ~0.05 ms; the 4-state
-      count `shared hit≈12`, ~0.05 ms.
-    * ONE-TENANT FLOOD (the scenario this story targets — a 50-item ingest fanning
-      out thousands of contiguous `available` rows): synthesised 5k `available`
-      `:embeddings` rows for one tenant (10k non-terminal on the queue in total) and
-      EXPLAIN-ANALYZEd the 4-state `in_flight_count`. Result: still an
-      `Index Scan using …_state_queue_… (Index Cond ((state,queue)))` with the tenant
-      as a post-Filter — `shared hit≈5591`, **~3.5 ms** at 10k scanned rows. It scans
-      every non-terminal row on the queue (the tenant filter does NOT reduce a
-      single-tenant flood), so the count grows LINEARLY with the queue's non-terminal
-      depth, but stays low-single-digit-ms at the flood sizes this feature contends
-      with and is HARD-BOUNDED by the 2 s `SET LOCAL statement_timeout` below — it can
-      never pin a connection. This bound makes it safe for US-36.3's synchronous
-      per-request admission-gate use; that gate additionally FAILS OPEN if this count
-      raises/times out (an unmeasurable backlog admits the batch, never 500 — see
-      `LoopctlWeb.KnowledgeIngestionController`), and if it ever needs a flood-
-      independent cost it should cap the count (e.g. `LIMIT`-bounded existence probe),
-      not add an index (see next).
+  **WORKER-scoped (`in_flight_ingestion_backlog/1` — US-36.3's SYNCHRONOUS request-path
+  admission gate).** This one runs on `POST /knowledge/ingest[/batch]`, so its cost must
+  be bounded by the CALLER's own backlog, not the fleet-wide `:ingestion` depth. It
+  therefore filters `worker = 'Loopctl.Workers.ContentIngestionWorker' AND state IN ...
+  AND args->>'tenant_id' = $1` — `worker` instead of `queue` (equivalent, since
+  ContentIngestionWorker is the SOLE worker on the `:ingestion` queue). That predicate
+  matches the partial COMPOSITE index `oban_jobs_ingestion_tenant_idx`
+  (`((args->>'tenant_id'), inserted_at DESC, id DESC) WHERE worker = ContentIngestionWorker`,
+  migration 20260713020000): the planner does a Bitmap/Index Scan with
+  `Index Cond ((args->>'tenant_id') = $1)` — seeking straight to the caller's own
+  ingestion rows and folding `state` as a cheap recheck. Cost is therefore O(the CALLER's
+  own ingestion rows in the partial index — its recent history, since the index carries
+  no `state` predicate but Oban prunes terminal `:ingestion` jobs after 7 days), NOT
+  O(fleet-wide non-terminal on the `:ingestion` queue). A noisy tenant's flood inflates
+  only its OWN scan. This is what makes AC-36.3.4's "cheap (single bounded count)" TRUE in cost, not
+  merely in wall-clock: a noisy tenant's flood inflates only that tenant's own count, and
+  the query no longer scans other tenants' rows — materially shrinking both the per-query
+  cost AND the time it holds one of AdminRepo's 3 connections (the auth-hot-path pool), so
+  the cross-tenant noisy-neighbor amplification of a fleet-wide scan is removed. Still
+  HARD-BOUNDED by the 2 s statement_timeout and the gate still FAILS OPEN on
+  raise/timeout (see `LoopctlWeb.KnowledgeIngestionController`), so the timeout is now
+  only reachable at a per-tenant backlog far larger than the threshold the gate enforces.
 
-  NO new index is warranted. A count of N matching rows is inherently O(N) index
-  entries even with a perfect covering index, so no index makes a single-tenant flood
-  count sub-linear; and a `(args->>'tenant_id', queue, state)` index would be strictly
-  WORSE for the common case, leading with the high-cardinality tenant expression and
-  folding the whole completed backlog under each tenant. Each count runs under a
-  per-query `SET LOCAL statement_timeout` (pgbouncer-safe — a startup `:parameters`
-  timeout is rejected by Fly's pgbouncer with 08P01; see `Loopctl.HeavyRead`).
+  Each count runs under a per-query `SET LOCAL statement_timeout` (pgbouncer-safe — a
+  startup `:parameters` timeout is rejected by Fly's pgbouncer with 08P01; see
+  `Loopctl.HeavyRead`).
   """
 
   import Ecto.Query, only: [from: 2]
@@ -142,14 +155,21 @@ defmodule Loopctl.Oban.FairShare do
   alias Loopctl.AdminRepo
   alias Loopctl.ObanConfig
 
-  # `in_flight_count/2` is the broad non-terminal count US-36.3's batch-ingest
-  # admission gate consults; declaring the behaviour makes FairShare the default
-  # (production) implementation of that config-swappable DI seam.
+  # `in_flight_ingestion_backlog/1` is the worker-scoped, index-backed backlog count
+  # US-36.3's batch-ingest admission gate consults; declaring the behaviour makes
+  # FairShare the default (production) implementation of that config-swappable DI seam.
   @behaviour Loopctl.Oban.BacklogCounterBehaviour
 
   # The four non-terminal Oban states — the GENERAL in-flight set (AC-36.2.1),
   # shared with US-36.3's batch-ingest backlog admission gate.
   @non_terminal_states ~w(available scheduled executing retryable)
+
+  # The sole worker on the `:ingestion` queue. US-36.3's admission-gate count scopes
+  # by this worker (not by queue) so the count rides the partial index
+  # `oban_jobs_ingestion_tenant_idx` (WHERE worker = this) — see the moduledoc's
+  # "Cost / index justification" (WORKER-scoped). Kept in sync with
+  # `Loopctl.Workers.ContentIngestionWorker`'s `queue: :ingestion`.
+  @ingestion_worker "Loopctl.Workers.ContentIngestionWorker"
 
   # Bound the read on the hot, Oban-owned oban_jobs table. Generous vs the measured
   # sub-ms cost, but a hard ceiling so a pathological plan can never pin a slot on
@@ -219,13 +239,30 @@ defmodule Loopctl.Oban.FairShare do
 
   @doc """
   Broad in-flight count for `tenant_id` on `queue` across the four non-terminal
-  states (`available`/`scheduled`/`executing`/`retryable`) — AC-36.2.1. This is the
-  GENERAL helper US-36.3's batch-ingest backlog admission gate reuses (the 429
-  backpressure check in `LoopctlWeb.KnowledgeIngestionController.create_batch/2`).
+  states (`available`/`scheduled`/`executing`/`retryable`) — AC-36.2.1. QUEUE-scoped
+  (the fair-share cost regime; see the moduledoc). US-36.3's admission gate uses the
+  WORKER-scoped `in_flight_ingestion_backlog/1` instead.
   """
   @spec in_flight_count(binary(), atom() | binary()) :: non_neg_integer()
   def in_flight_count(tenant_id, queue) do
-    count(tenant_id, queue, @non_terminal_states, :all)
+    count(tenant_id, {:queue, to_string(queue)}, @non_terminal_states, :all)
+  end
+
+  @doc """
+  Broad in-flight `:ingestion` backlog for `tenant_id` across the four non-terminal
+  states — the count US-36.3's SYNCHRONOUS batch-ingest admission gate consults (the
+  429 backpressure check in `LoopctlWeb.KnowledgeIngestionController`).
+
+  Scoped by `worker = ContentIngestionWorker` (the sole `:ingestion` worker) rather
+  than by queue, so it rides the partial index `oban_jobs_ingestion_tenant_idx` and
+  costs O(the caller's OWN ingestion backlog), not O(fleet-wide non-terminal on the
+  `:ingestion` queue) — see the moduledoc's "Cost / index justification" (WORKER-scoped).
+  This is the production implementation of `Loopctl.Oban.BacklogCounterBehaviour`.
+  """
+  @impl Loopctl.Oban.BacklogCounterBehaviour
+  @spec in_flight_ingestion_backlog(binary()) :: non_neg_integer()
+  def in_flight_ingestion_backlog(tenant_id) do
+    count(tenant_id, {:worker, @ingestion_worker}, @non_terminal_states, :all)
   end
 
   @doc """
@@ -233,11 +270,11 @@ defmodule Loopctl.Oban.FairShare do
   UNSCOPED slot-occupancy (counts every executing job, including any running caller).
   Used only by the fair-share gate's fallback (a `nil` `job_id`); the gate's normal
   decision path uses the self-excluding rank count instead (see `over_fair_share?/3`).
-  Not currently reused outside this module (US-36.3 reuses `in_flight_count/2` only).
+  Not currently reused outside this module (US-36.3 uses `in_flight_ingestion_backlog/1`).
   """
   @spec executing_count(binary(), atom() | binary()) :: non_neg_integer()
   def executing_count(tenant_id, queue) do
-    count(tenant_id, queue, ["executing"], :all)
+    count(tenant_id, {:queue, to_string(queue)}, ["executing"], :all)
   end
 
   # The gate's rank input: how many of the tenant's OTHER executing jobs on `queue`
@@ -247,11 +284,11 @@ defmodule Loopctl.Oban.FairShare do
   # dispatch path) has no rank, so we fall back to the plain unscoped executing count
   # (counts every executing job, including the caller).
   defp lower_ranked_executing_count(tenant_id, queue, job_id) when is_integer(job_id) do
-    count(tenant_id, queue, ["executing"], {:lower_than, job_id})
+    count(tenant_id, {:queue, to_string(queue)}, ["executing"], {:lower_than, job_id})
   end
 
   defp lower_ranked_executing_count(tenant_id, queue, nil) do
-    count(tenant_id, queue, ["executing"], :all)
+    count(tenant_id, {:queue, to_string(queue)}, ["executing"], :all)
   end
 
   @doc """
@@ -270,26 +307,32 @@ defmodule Loopctl.Oban.FairShare do
 
   # Tenant-scoped, bounded count over the Oban-owned oban_jobs table via AdminRepo
   # (BYPASSRLS — the table has no RLS), run under a per-query SET LOCAL
-  # statement_timeout inside a transaction (pgbouncer-safe). `queue` may be an atom
-  # (worker config) or string (raw); oban_jobs.queue is text, so it's stringified.
+  # statement_timeout inside a transaction (pgbouncer-safe).
+  #
+  # `scope` selects which population the count leads on, and thus which index backs it
+  # (see the moduledoc's "Cost / index justification"):
+  #   * `{:queue, queue_str}`  — the fair-share regime; rides Oban's (state,queue) index.
+  #   * `{:worker, worker_str}` — US-36.3's admission gate; rides the partial
+  #     `oban_jobs_ingestion_tenant_idx` (WHERE worker = ContentIngestionWorker),
+  #     bounding cost to the CALLER's own ingestion backlog.
+  # Both `oban_jobs.queue` and `oban_jobs.worker` are text columns.
   #
   # `id_predicate` narrows the count: `:all` (public helpers — no id filter) or
   # `{:lower_than, job_id}` (the gate's rank input — only executing jobs with a
   # strictly lower id, which both self-excludes the caller and gives the deterministic
   # co-fetch tie-break; see the moduledoc).
-  defp count(tenant_id, queue, states, id_predicate) do
-    queue_str = to_string(queue)
+  defp count(tenant_id, scope, states, id_predicate) do
     tenant_id_str = to_string(tenant_id)
 
     base =
       from(j in "oban_jobs",
         where:
-          j.queue == ^queue_str and j.state in ^states and
+          j.state in ^states and
             fragment("? ->> 'tenant_id' = ?", j.args, ^tenant_id_str),
         select: count(j.id)
       )
 
-    query = apply_id_predicate(base, id_predicate)
+    query = base |> apply_scope(scope) |> apply_id_predicate(id_predicate)
 
     {:ok, result} =
       AdminRepo.transaction(fn ->
@@ -298,6 +341,14 @@ defmodule Loopctl.Oban.FairShare do
       end)
 
     result || 0
+  end
+
+  defp apply_scope(query, {:queue, queue_str}) do
+    from(j in query, where: j.queue == ^queue_str)
+  end
+
+  defp apply_scope(query, {:worker, worker_str}) do
+    from(j in query, where: j.worker == ^worker_str)
   end
 
   defp apply_id_predicate(query, :all), do: query

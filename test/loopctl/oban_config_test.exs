@@ -332,6 +332,39 @@ defmodule Loopctl.ObanConfigTest do
     end
   end
 
+  describe "ingest_backlog_retry_after_seconds/0 (US-36.3 review, env OBAN_INGEST_BACKLOG_RETRY_AFTER)" do
+    test "defaults to 60 (drain-cadence-scaled, not the sub-second snooze base) when unset" do
+      assert ObanConfig.ingest_backlog_retry_after_seconds() == 60
+      # Decoupled from the fair-share snooze base — a compliant client must not hot-loop.
+      assert ObanConfig.ingest_backlog_retry_after_seconds() >
+               ObanConfig.fair_share_snooze_base_seconds()
+    end
+
+    @tag :tmp_dir
+    test "a valid OBAN_INGEST_BACKLOG_RETRY_AFTER override is read at runtime", %{
+      tmp_dir: tmp_dir
+    } do
+      result =
+        run_elixir_script(
+          tmp_dir,
+          "result = Loopctl.ObanConfig.ingest_backlog_retry_after_seconds()",
+          [{"OBAN_INGEST_BACKLOG_RETRY_AFTER", "180"}]
+        )
+
+      assert result == 180
+    end
+
+    @tag :tmp_dir
+    test "a malformed OBAN_INGEST_BACKLOG_RETRY_AFTER aborts boot (fail-loud)", %{
+      tmp_dir: tmp_dir
+    } do
+      {output, exit_code} = run_boot(tmp_dir, [{"OBAN_INGEST_BACKLOG_RETRY_AFTER", "abc"}])
+
+      assert exit_code != 0
+      assert output =~ "positive integer"
+    end
+  end
+
   # Runs `script` (must bind a `result` variable) in a fresh `mix run --no-start`
   # subprocess with `env` applied ONLY to that child process, then reads back the
   # term `script` wrote to `result_path` via :erlang.term_to_binary/1. Keeps this

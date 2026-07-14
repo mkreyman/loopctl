@@ -73,6 +73,15 @@ config :loopctl, :fair_share_config, Loopctl.ObanConfig.fair_share_config()
 # (config-based DI).
 config :loopctl, :ingest_backlog_max, Loopctl.ObanConfig.ingest_backlog_max()
 
+# US-36.3 (review): validate the backlog-429 Retry-After knob
+# (OBAN_INGEST_BACKLOG_RETRY_AFTER) at BOOT too, same rationale as the threshold above —
+# a fat-fingered value aborts the node LOUD here instead of surfacing as per-request 500s
+# on the ingest endpoints. Stored so the resolved boot value is introspectable; the gate
+# re-reads env at call time (config-based DI).
+config :loopctl,
+       :ingest_backlog_retry_after_seconds,
+       Loopctl.ObanConfig.ingest_backlog_retry_after_seconds()
+
 # Cloak Vault — key from environment in all environments where CLOAK_KEY is set.
 # In production, CLOAK_KEY is required — startup fails if it is missing.
 if config_env() == :prod do
