@@ -151,6 +151,44 @@ defmodule Loopctl.AuditChain.SthCheckpointTest do
       end
     end
 
+    # AC-35.1.2 requires the byte-identity gate to run over "a wide range INCLUDING
+    # ... 2^k boundaries (e.g. 1..40 plus a few large values)." The sweep above caps
+    # at 40 and exercises EVERY split point; large N exercises more lift_carry
+    # iterations and multi-peak bagging, and is where the O(delta) vs O(n) win the
+    # story exists for actually matters — but sweeping every p there would be slow, so
+    # here we take a single arbitrary interior split point per large N.
+    @large_ns [128, 1000]
+
+    test "matches the oracle at a large N for a single interior split point (AC-35.1.2)" do
+      for n <- @large_ns do
+        tenant =
+          fixture(:tenant, %{slug: "sth-prop-lg-#{n}-#{System.unique_integer([:positive])}"})
+
+        :ok = build_chain(tenant.id, n)
+
+        hashes = entry_hashes(tenant.id)
+        expected = oracle_root(hashes)
+
+        assert {:ok, ^expected} = AuditChain.compute_merkle_root(tenant.id)
+
+        # An interior split that is neither a power of two nor n itself, so the
+        # checkpoint carries multiple peaks and there is a real tail to fold.
+        p = div(n, 3) * 2
+        {prefix, _tail} = Enum.split(hashes, p)
+        put_checkpoint(tenant.id, p - 1, expected_peaks(prefix, p))
+
+        assert {:ok, root, %{chain_position: pos, peaks: _}} =
+                 AuditChain.compute_merkle_root_incremental(tenant.id)
+
+        assert pos == n - 1
+
+        assert root == expected,
+               "large N=#{n}, split p=#{p}: incremental root diverged from oracle"
+
+        assert byte_size(root) == 32
+      end
+    end
+
     test "folds the empty tail (checkpoint already at head) to the same root" do
       n = 33
       tenant = fixture(:tenant)

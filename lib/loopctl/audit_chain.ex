@@ -174,8 +174,25 @@ defmodule Loopctl.AuditChain do
   Falls back to a correct FULL rebuild — over `compute_merkle_root/1`'s oracle
   construction — whenever there is no checkpoint, or the checkpoint is stale /
   structurally inconsistent with the actual chain (AC-35.1.1 / AC-35.1.5). The
-  checkpoint is a pure performance cache: an inconsistency degrades to a correct
+  checkpoint is a pure performance cache: a STRUCTURAL inconsistency (position
+  ahead of the head, wrong peak count, non-32-byte peak) degrades to a correct
   root, never a wrong one.
+
+  ## Trust boundary — the cache has no content-integrity check
+
+  Validation (`valid_checkpoint?/2`) is STRUCTURAL only. Unlike `entry_hash`
+  values — which are hash-CHAINED to `prev_entry_hash` and therefore
+  self-verifying against the source of truth — the cached peak VALUES link to
+  nothing verifiable and are NOT re-derived from `entry_hashes`. A checkpoint
+  with the right peak count and 32-byte peaks but WRONG bytes (bit-rot, a bad
+  write, or a tampered `audit_sth_checkpoints` row) passes validation and would
+  be folded into the signed root; the next incremental sign folds those corrupt
+  peaks into new peaks, so the taint could propagate forward. The cache's
+  integrity therefore rests on the invariant that its row is only ever written by
+  the trusted, same-transaction `sign_and_store_tree_head/1` path and never
+  silently corrupted at rest — NOT on a self-check here. A divergent-STH signal
+  (an incremental root that disagrees with an independent full recompute) is the
+  L6 byzantine/custody-halt condition, detected out-of-band, not by this fold.
 
   ## Returns
 
@@ -222,17 +239,27 @@ defmodule Loopctl.AuditChain do
   # Fallback: rebuild from the whole chain. `root` is the oracle
   # `merkle_tree/2` construction (byte-identical guarantee); the peaks are folded
   # from the same load so a fresh checkpoint can be persisted for next time.
+  #
+  # This is the O(n) whole-chain read that fires for EVERY tenant on its first STH
+  # after deploy (no checkpoint yet) and on any checkpoint loss/corruption — the
+  # heaviest read on this path. It is routed through `HeavyRead` for the SAME
+  # per-query `SET LOCAL statement_timeout` protection the incremental tail read
+  # gets (AC-35.1.6: "Reads run on a read path with a per-query statement_timeout"),
+  # so the fleet-wide unbounded read GH #350 / epic 35 exist to guard can never run
+  # untimed on the BYPASSRLS admin pool. Its `where` is conjunctively tenant-scoped,
+  # so it passes the HeavyRead structural guard.
   defp full_rebuild_root(tenant_id, latest_pos) do
     # Bounded by `latest_pos` (the head read a moment ago) so a concurrent append
     # can't pull leaves beyond the position we're about to sign — the loaded set
     # is a consistent snapshot of [0..latest_pos].
-    hashes =
+    query =
       from(e in Entry,
         where: e.tenant_id == ^tenant_id and e.chain_position <= ^latest_pos,
         order_by: [asc: e.chain_position],
         select: e.entry_hash
       )
-      |> AdminRepo.all()
+
+    hashes = HeavyRead.all(tenant_id, query, HeavyRead.opts(:sth_incremental))
 
     root = merkle_tree(hashes)
     peaks = mmr_append_all([], hashes)
