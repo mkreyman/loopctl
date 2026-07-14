@@ -1,6 +1,6 @@
 defmodule Loopctl.Provider.AdmissionTest do
   @moduledoc """
-  Per-(tenant, provider) node-local token-bucket admission gate (US-37.1, #352).
+  Per-(tenant, provider) node-local fixed-window admission gate (US-37.1, #352).
 
   The limiter is swapped for `Loopctl.MockRateLimiter` via config/test.exs; the
   permissive default stub (`{:allow, 1}`) is overridden per-test to simulate an
@@ -80,5 +80,14 @@ defmodule Loopctl.Provider.AdmissionTest do
       end)
 
     assert log =~ "failing OPEN"
+  end
+
+  test "snooze_seconds/0 returns a jittered, positive duration (single source for all workers)" do
+    # Default base is 5s with a 0..5s jitter, so every result is in 5..10.
+    results = for _ <- 1..50, do: Admission.snooze_seconds()
+
+    assert Enum.all?(results, &(is_integer(&1) and &1 >= 5 and &1 <= 10))
+    # Jitter means we should see more than one distinct value across 50 draws.
+    assert results |> Enum.uniq() |> length() > 1
   end
 end

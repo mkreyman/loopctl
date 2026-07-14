@@ -445,6 +445,33 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       refute message =~ masked
       refute inspect(result) =~ masked
     end
+
+    test "US-37.1 (AC-37.1.4): a node-local admission rate-limit SNOOZES (never burns an attempt/discards)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # The provider admission gate is shut for this tenant -> the extractor returns
+      # the new {:error, :rate_limited_local}. This is loss-free backpressure, NOT a
+      # failure: the job must snooze (no attempt consumed) rather than retry/discard.
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
+        {:error, :rate_limited_local}
+      end)
+
+      result =
+        ContentIngestionWorker.perform(%Oban.Job{
+          id: 107,
+          args: %{
+            "tenant_id" => tenant.id,
+            "content" => "Rate limited content",
+            "content_hash" => "rate_limited_local_test",
+            "source_type" => "ingestion"
+          }
+        })
+
+      assert {:snooze, seconds} = result
+      assert is_integer(seconds) and seconds > 0
+    end
   end
 
   # --- Project scoping ---

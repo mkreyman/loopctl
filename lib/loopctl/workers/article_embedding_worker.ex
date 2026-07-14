@@ -51,6 +51,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Oban.FairShare
+  alias Loopctl.Provider.Admission
   alias Loopctl.Workers.ArticleLinkingWorker
 
   # Longer Task.yield budget than the interactive query path: a background embed can
@@ -115,7 +116,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
         # loss-free backpressure, NOT a failure. Snooze the slot (no attempt
         # consumed, never a discard) — mirrors the FairShare.gate snooze pattern —
         # so the embed is retried once local demand subsides.
-        {:snooze, admission_snooze_seconds()}
+        {:snooze, Admission.snooze_seconds()}
 
       {:error, reason} ->
         # Classify on the raw reason, but the term that becomes an Oban discard/error
@@ -181,14 +182,6 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
     )
 
     {:discard, {:no_embedding_key, article_id}}
-  end
-
-  # US-37.1: small jittered snooze for a node-local provider admission rate-limit.
-  # Jitter avoids a thundering-herd of snoozed embeds re-checking in lockstep. The
-  # base is live-tunable via SystemConfig (no deploy), default 5s.
-  defp admission_snooze_seconds do
-    base = Loopctl.SystemConfig.get_int("provider_admission_snooze_seconds", 5)
-    base + :rand.uniform(6) - 1
   end
 
   defp enqueue_linking(article_id, tenant_id) do

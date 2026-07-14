@@ -27,6 +27,9 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
 
     * `{:error, :embeddings_degraded}` (recall fell back) → `{:snooze, n}`; NO
       watermark advance, so a later healthy run re-attempts (AC-29.2.4).
+    * `{:error, :rate_limited_local}` (node-local provider admission gate shut,
+      US-37.1) → `{:snooze, n}`; loss-free backpressure, NO attempt consumed and NO
+      watermark advance, so the compile re-runs once local demand subsides.
     * `{:error, :quota_exceeded, _}` (subject at its memory cap) → `{:discard, _}`;
       TERMINAL — do NOT retry-loop the LLM. Watermark IS advanced so an unchanged
       session is not re-compiled just to hit the cap again. Because the cap halts the
@@ -63,6 +66,7 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
   alias Loopctl.Memory.Promoter
   alias Loopctl.Memory.PromotionTelemetry
   alias Loopctl.Memory.Scope
+  alias Loopctl.Provider.Admission
 
   @snooze_seconds 300
 
@@ -163,6 +167,14 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
         )
 
         persist(scope, session_id, fingerprint, candidates)
+
+      {:error, :rate_limited_local} ->
+        # US-37.1 (AC-37.1.4): node-local provider admission backpressure. Snooze
+        # loss-free (no attempt consumed, no watermark advance) rather than routing
+        # through compile_failure_result/2, which would TERMINALLY discard after only
+        # @max_compile_attempts under sustained provider backpressure. This is not a
+        # compile FAILURE, so it is not counted/logged as one.
+        {:snooze, Admission.snooze_seconds()}
 
       {:error, reason} ->
         PromotionTelemetry.emit(

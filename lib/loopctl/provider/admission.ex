@@ -1,6 +1,6 @@
 defmodule Loopctl.Provider.Admission do
   @moduledoc """
-  Per-`(tenant_id, provider)` token-bucket admission gate that sits IMMEDIATELY
+  Per-`(tenant_id, provider)` fixed-window admission gate that sits IMMEDIATELY
   before every outbound provider `Req.post` (US-37.1, GH #352).
 
   ## Why
@@ -25,13 +25,30 @@ defmodule Loopctl.Provider.Admission do
   user-supplied value — so the key is bounded and no `String.to_atom/1` on input
   is involved.
 
-  ## Capacity / refill (env-driven, live-tunable, no deploy)
+  ## Algorithm — Hammer FIXED-WINDOW counter (not a leaky/token bucket)
 
-  A Hammer sliding window: a fixed 60s window with a per-provider request limit
-  (RPM). Limits are read via `Loopctl.SystemConfig.get_int/2` (DB-backed,
-  hot-path-safe, returns the in-code default on a cache miss), so an operator can
-  retune per environment — and per tenant tier, by seeding a different row — with
-  no deploy (AC-37.1.2). Keys and per-node defaults:
+  This gate is backed by Hammer's `check_rate/3`, which is a FIXED-WINDOW
+  counter: a fresh 60s window opens on the first request for a bucket and the
+  count resets to zero when it rolls over. It is NOT a token/leaky bucket and
+  NOT a sliding window. The practical consequence operators must size for: a
+  fixed window admits up to ~2x the limit across a boundary (up to `limit`
+  requests just before a window rolls at t≈59s, then up to `limit` more just
+  after at t≈61s). That is a weaker burst guarantee than a true bucket, but the
+  gate's job is to shed a runaway burst below the provider's hard ceiling, and
+  the generous defaults absorb the 2x boundary overshoot — so reusing
+  `check_rate/3` is a deliberate, accepted tradeoff (technical-notes sanctioned).
+
+  ## Capacity (env-driven, live-tunable, no deploy)
+
+  A fixed 60s window with a per-provider request limit (RPM). Limits are read via
+  `Loopctl.SystemConfig.get_int/2` (DB-backed, hot-path-safe, returns the in-code
+  default on a cache miss), so an operator can retune per environment with no
+  deploy (AC-37.1.2). The limit is a SINGLE global value per provider — there is
+  currently no per-tenant / per-tier dimension (the `SystemConfig` store is
+  global, keyed only by the config name), so every tenant on a node shares the
+  same ceiling; the per-tenant BUCKET KEY still isolates each tenant's *count*.
+  Per-tenant-tier limits are explicitly optional in AC-37.1.2 and deferred. Keys
+  and per-node defaults:
 
     * `"provider_admission_embedding_rpm"` — default 600 req/node/min
     * `"provider_admission_anthropic_rpm"` — default 300 req/node/min
@@ -39,6 +56,16 @@ defmodule Loopctl.Provider.Admission do
   Defaults are deliberately generous: the gate is a defensive ceiling against a
   runaway burst, NOT a business quota. TPM is intentionally out of scope — the AC
   is satisfied by RPM alone ("RPM and/or TPM").
+
+  ## Snooze duration for loss-free backpressure (AC-37.1.4)
+
+  When a background worker receives `{:error, :rate_limited_local}` it should
+  yield loss-free rather than consume an Oban attempt. `snooze_seconds/0` is the
+  single source of that jittered snooze duration for ALL admission-backed workers
+  (both embedding workers and the Anthropic-backed ingestion/review/promotion
+  workers) so every `provider_admission_*` knob and default lives in one place.
+  Live-tunable via `"provider_admission_snooze_seconds"` (default 5s); the jitter
+  avoids a thundering-herd of snoozed jobs re-checking in lockstep.
 
   ## Node-local by design (AC-37.1.6)
 
@@ -60,13 +87,17 @@ defmodule Loopctl.Provider.Admission do
 
   @providers [:embedding, :anthropic]
 
-  # 60s sliding window; the limit is the requests-per-minute ceiling per node.
+  # Fixed 60s window; the limit is the requests-per-minute ceiling per node.
   @window_ms 60_000
 
   # Generous per-node defaults — a defensive ceiling against a runaway burst, not
   # a business quota. Tunable live via SystemConfig with no deploy.
   @default_embedding_rpm 600
   @default_anthropic_rpm 300
+
+  # Base snooze (seconds) a worker waits after {:error, :rate_limited_local}
+  # before Oban re-runs it loss-free. Live-tunable; jitter added in snooze_seconds/0.
+  @default_snooze_seconds 5
 
   @type provider :: :embedding | :anthropic
 
@@ -101,6 +132,21 @@ defmodule Loopctl.Provider.Admission do
       )
 
       :ok
+  end
+
+  @doc """
+  Jittered snooze duration (seconds) for a background worker that received
+  `{:error, :rate_limited_local}` from this gate (AC-37.1.4).
+
+  Single source of truth for the admission snooze across ALL admission-backed
+  workers. The base is live-tunable via the `"provider_admission_snooze_seconds"`
+  `SystemConfig` key (default #{@default_snooze_seconds}s); a small `0..5s` jitter
+  is added so a burst of snoozed jobs does not re-check the gate in lockstep.
+  """
+  @spec snooze_seconds() :: pos_integer()
+  def snooze_seconds do
+    base = SystemConfig.get_int("provider_admission_snooze_seconds", @default_snooze_seconds)
+    base + :rand.uniform(6) - 1
   end
 
   defp bucket_key(tenant_id, provider), do: "provider_admission:#{provider}:#{tenant_id}"

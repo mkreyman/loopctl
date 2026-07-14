@@ -81,6 +81,26 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
                  args: %{"review_record_id" => review.id, "tenant_id" => tenant.id}
                })
     end
+
+    test "US-37.1 (AC-37.1.4): a node-local admission rate-limit SNOOZES (never burns an attempt/discards)" do
+      %{tenant: tenant} = setup_tenant()
+      review = create_review_record(tenant.id)
+
+      # The provider admission gate is shut -> the extractor returns the new
+      # {:error, :rate_limited_local}. Loss-free backpressure: snooze (no attempt
+      # consumed) rather than burning a retry against the tenant's paid Anthropic call.
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
+        {:error, :rate_limited_local}
+      end)
+
+      result =
+        ReviewKnowledgeWorker.perform(%Oban.Job{
+          args: %{"review_record_id" => review.id, "tenant_id" => tenant.id}
+        })
+
+      assert {:snooze, seconds} = result
+      assert is_integer(seconds) and seconds > 0
+    end
   end
 
   # --- TC-21.1.1: Worker extracts articles from review successfully ---

@@ -55,6 +55,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Memory
   alias Loopctl.Oban.FairShare
+  alias Loopctl.Provider.Admission
 
   @worker_yield_ms 8_000
 
@@ -115,7 +116,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
         # US-37.1 (AC-37.1.4): a node-local provider admission rate-limit is
         # loss-free backpressure, NOT a failure. Snooze (no attempt consumed, never
         # a discard) so the embed retries once local demand subsides.
-        {:snooze, admission_snooze_seconds()}
+        {:snooze, Admission.snooze_seconds()}
 
       {:error, reason} ->
         # US-34.3 (review MED #1): the `[:loopctl, :llm, :provider_error]` telemetry
@@ -182,13 +183,5 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
 
   defp build_embedding_text(memory) do
     Memory.Memory.embedding_input(memory.text)
-  end
-
-  # US-37.1: small jittered snooze for a node-local provider admission rate-limit.
-  # Jitter avoids a thundering-herd of snoozed embeds re-checking in lockstep. The
-  # base is live-tunable via SystemConfig (no deploy), default 5s.
-  defp admission_snooze_seconds do
-    base = Loopctl.SystemConfig.get_int("provider_admission_snooze_seconds", 5)
-    base + :rand.uniform(6) - 1
   end
 end
