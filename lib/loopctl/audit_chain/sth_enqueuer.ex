@@ -35,8 +35,17 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   ## Resilience (fire-and-forget)
 
   The append path broadcasts to the firehose fire-and-forget, so this process can
-  never crash an append. In turn, an enqueue failure (Oban error or a malformed/
-  unknown message) is caught, LOGGED, and ignored — the process stays alive.
+  never crash an append. In turn, `handle_info/2` classifies every message so the
+  process stays alive across all of them:
+
+    * a genuine enqueue fault on a well-formed entry — an Oban `{:error, _}` tuple
+      (WARNING), a RAISE (rescued, ERROR "crashed"), or an :exit/throw (caught,
+      ERROR) — is logged and swallowed;
+    * a correctly-shaped but MALFORMED entry (no binary `tenant_id`) is logged at
+      WARNING and ignored (never the ERROR/"crashed" path, which is reserved for
+      real faults);
+    * any unknown-shape message is logged at DEBUG and ignored.
+
   Correctness is preserved even if this enqueuer is down or misses events,
   because the per-minute cron poll (unchanged by this story) still runs and the
   per-tenant `ComputeSthWorker.perform/1` clause is idempotent
@@ -130,10 +139,15 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   end
 
   @impl true
-  def handle_info({:audit_chain_entry, entry}, state) do
-    # Enqueue is wrapped so neither an Oban error tuple NOR a raise (malformed
-    # entry, transient DB/pool fault, serialization error) can crash the
-    # subscriber. Correctness is backstopped by the idempotent cron poll.
+  def handle_info({:audit_chain_entry, %{tenant_id: tenant_id} = entry}, state)
+      when is_binary(tenant_id) do
+    # Well-formed entry. The enqueue is wrapped so NO failure mode can crash the
+    # subscriber (AC-35.2.5): an Oban `{:error, _}` tuple is logged at WARNING; a
+    # RAISE (transient DB/pool fault, serialization error) is rescued; and an
+    # :exit or throw surfacing from the enqueue path (e.g. a checkout/GenServer
+    # timeout raised as an exit) is caught. Correctness is backstopped by the
+    # idempotent per-minute cron poll, so swallowing here only trades a missed
+    # activity-driven enqueue for a slightly later cron-driven one.
     try do
       case enqueue_sth_job(entry) do
         {:ok, _job} ->
@@ -148,12 +162,34 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
           "SthEnqueuer: crashed while enqueuing ComputeSthWorker (ignored): " <>
             Exception.message(error)
         )
+    catch
+      kind, reason ->
+        # :exit / throw from the enqueue path — never let it kill the singleton.
+        Logger.error(
+          "SthEnqueuer: caught #{kind} while enqueuing ComputeSthWorker (ignored): " <>
+            inspect(reason)
+        )
     end
 
     {:noreply, state}
   end
 
-  # Malformed/unknown messages are logged-and-ignored, never a crash (AC-35.2.5).
+  # A correctly-shaped firehose message whose entry carries no binary tenant_id is
+  # MALFORMED but benign (AC-35.2.5). Audit entries always carry a binary
+  # tenant_id in practice, so this indicates upstream corruption — not an enqueue
+  # fault. Log at WARNING (never ERROR/"crashed", which is reserved for genuine
+  # enqueue faults in the clause above) and ignore. Never raise/crash.
+  @impl true
+  def handle_info({:audit_chain_entry, malformed}, state) do
+    Logger.warning(
+      "SthEnqueuer: ignoring malformed audit_chain_entry (no binary tenant_id): " <>
+        inspect(malformed)
+    )
+
+    {:noreply, state}
+  end
+
+  # Any other (unknown-shape) message is logged at DEBUG and ignored (AC-35.2.5).
   @impl true
   def handle_info(msg, state) do
     Logger.debug("SthEnqueuer: ignoring unexpected message: #{inspect(msg)}")

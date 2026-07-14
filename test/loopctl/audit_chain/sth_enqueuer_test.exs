@@ -92,6 +92,20 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
       # Select this entry by id to ignore concurrent tests' firehose traffic.
       assert_receive {:audit_chain_entry, %{id: ^entry_id} = firehose_entry}, 1_000
       assert firehose_entry.tenant_id == tenant.id
+
+      # AC-35.2.1 also names {:sth_updated,…} and external (witness-cache)
+      # subscribers as UNCHANGED. broadcast_sth/2 is untouched by this story, so
+      # an STH broadcast must still reach the per-tenant subscriber and must NOT
+      # leak onto the firehose (which carries only {:audit_chain_entry,…}). Prove
+      # both from the one process subscribed to BOTH topics: consume the
+      # per-tenant {:sth_updated}, then refute any further {:sth_updated} (i.e.
+      # the firehose did not also deliver one).
+      sth = %{id: entry_id, tenant_id: tenant.id, chain_position: entry.chain_position}
+      :ok = ChainPubSub.broadcast_sth(tenant.id, sth)
+
+      assert_receive {:sth_updated, %{id: ^entry_id, tenant_id: sth_tid}}, 1_000
+      assert sth_tid == tenant.id
+      refute_receive {:sth_updated, _}, 200
     end
 
     test "TC-35.2.1b: the firehose topic is a single fixed cross-tenant topic (not per-tenant)" do
@@ -159,36 +173,105 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
       [job] = all_enqueued(worker: ComputeSthWorker)
       assert job.args == %{"tenant_id" => tenant.id}
     end
+
+    test "TC-35.2.2c: a burst of REAL appends for one tenant, through the LIVE subscribed enqueuer, coalesces to exactly one scheduled job" do
+      # AC-35.2.3 verbatim: append several entries for one tenant in quick
+      # succession and assert exactly one ComputeSthWorker job is scheduled — but
+      # driven through the WHOLE real path (append/1 -> firehose broadcast -> the
+      # live GenServer's handle_info -> enqueue_sth_job -> Oban.insert), not five
+      # direct enqueue calls. This catches a regression that mangled handle_info's
+      # call into enqueue_sth_job (e.g. dropping the unique/schedule_in opts),
+      # which the direct-call TC-35.2.2 cannot see.
+      tenant = fixture(:tenant)
+      other = fixture(:tenant)
+
+      name = :"sth_enqueuer_coalesce_#{System.unique_integer([:positive])}"
+
+      pid =
+        start_supervised!(
+          Supervisor.child_spec({SthEnqueuer, [name: name, subscribe: true]}, id: name)
+        )
+
+      # Grant the live enqueuer this test's sandbox so its Oban.insert lands in
+      # our transaction and is visible to all_enqueued below. append/1 writes via
+      # AdminRepo; the enqueue writes oban_jobs via Loopctl.Repo — distinct repos,
+      # so the two never contend on one connection.
+      Sandbox.allow(Loopctl.Repo, self(), pid)
+      Sandbox.allow(Loopctl.AdminRepo, self(), pid)
+
+      # The app-wide Oban testing mode is :inline, which EXECUTES each insert
+      # immediately and so bypasses both `unique` and `schedule_in` — the very
+      # DB-level coalescing under test. Oban resolves the engine from the
+      # INSERTING process's dictionary, so seed the LIVE enqueuer's own dictionary
+      # to :manual (Basic engine) via :sys.replace_state/2, which runs the fun
+      # inside that process. No production knob — the seam is test-only.
+      :sys.replace_state(pid, fn state ->
+        Process.put(:oban_testing, :manual)
+        state
+      end)
+
+      # Five real appends for ONE tenant in quick succession (within the debounce
+      # window). Local PubSub delivery is a synchronous send, so each firehose
+      # message is in the enqueuer's mailbox before append/1 returns; :sys.get_state
+      # then drains that handle_info (and its insert) before the next append, so
+      # the enqueuer never processes our message while we run the next append.
+      for _ <- 1..5 do
+        {:ok, _entry} = AuditChain.append(tenant.id, append_attrs())
+        :sys.get_state(pid)
+      end
+
+      # A different tenant's real append produces its OWN independent job.
+      {:ok, _entry} = AuditChain.append(other.id, append_attrs())
+      :sys.get_state(pid)
+
+      jobs = all_enqueued(worker: ComputeSthWorker)
+      tenant_jobs = Enum.filter(jobs, &(&1.args["tenant_id"] == tenant.id))
+      other_jobs = Enum.filter(jobs, &(&1.args["tenant_id"] == other.id))
+
+      # Exactly one scheduled ComputeSthWorker job for the bursting tenant
+      # (coalesced by Oban `unique`), not five — proving the real handle_info path
+      # forwards the unique/schedule_in opts.
+      assert length(tenant_jobs) == 1
+      # Tenant isolation: the burst never merged the other tenant's job away.
+      assert length(other_jobs) == 1
+
+      [job] = tenant_jobs
+      assert job.state in ["scheduled", "available"]
+    end
   end
 
   describe "live enqueuer end-to-end (AC-35.2.2 / AC-35.2.4)" do
-    test "TC-35.2.3: a firehose entry drives the enqueuer to compute an STH at the new position" do
+    test "TC-35.2.3: a REAL append, through the live firehose subscription, drives the enqueuer to compute an STH at the new position" do
       tenant = setup_keyed_tenant()
-
-      # An entry must exist on the chain for there to be something to sign.
-      {:ok, entry} = AuditChain.append(tenant.id, append_attrs())
 
       name = :"sth_enqueuer_e2e_#{System.unique_integer([:positive])}"
 
-      # subscribe: false so this test drives handle_info/2 with EXACTLY its own
-      # message (the shared firehose would otherwise flood the enqueuer with
-      # concurrent tests' appends and force it to share this test's single
-      # sandbox connection while we query). We grant it the sandbox so its inline
-      # Oban run (ComputeSthWorker.perform → sign_and_store_tree_head via
-      # AdminRepo, reading the pre-primed TenantKeys cache) is visible here.
+      # A LIVE, subscribe: true enqueuer — this exercises the FULL join AC-35.2.4
+      # names (real append -> firehose broadcast -> on-start subscription ->
+      # handle_info -> STH computed), not a hand-delivered send. Granted the
+      # sandbox so its inline Oban run (ComputeSthWorker.perform ->
+      # sign_and_store_tree_head via AdminRepo, reading the pre-primed TenantKeys
+      # cache) is visible here. start_supervised! returns only after init/1 (and
+      # its subscribe_firehose) has completed, so the subscription is live before
+      # the append below.
       pid =
         start_supervised!(
-          Supervisor.child_spec({SthEnqueuer, [name: name, subscribe: false]}, id: name)
+          Supervisor.child_spec({SthEnqueuer, [name: name, subscribe: true]}, id: name)
         )
 
       Sandbox.allow(Loopctl.Repo, self(), pid)
       Sandbox.allow(Loopctl.AdminRepo, self(), pid)
 
-      # Deliver the firehose message shape directly, then synchronize on the
-      # GenServer: :sys.get_state is handled AFTER the queued handle_info, so the
-      # inline STH computation is complete (and this process was NOT querying the
-      # shared connection during it) before we read the result.
-      send(pid, {:audit_chain_entry, entry})
+      # Real append: broadcasts {:audit_chain_entry, entry} to the fixed firehose
+      # the live enqueuer subscribed to in init. Local PubSub delivery is a
+      # synchronous send, so the message is in pid's mailbox before append/1
+      # returns; :sys.get_state is then handled AFTER that queued handle_info, so
+      # the inline STH computation is complete (and this process was NOT querying
+      # the shared connection during it) before we read the result. Concurrent
+      # tests' firehose entries also reach this subscriber, but each is a fast
+      # no-op perform (their tenant's rows are invisible in our sandbox), so they
+      # only add serialized latency, never a wrong result.
+      {:ok, entry} = AuditChain.append(tenant.id, append_attrs())
       :sys.get_state(pid)
 
       sth = AuditChain.get_latest_sth(tenant.id)
@@ -258,15 +341,24 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
           Supervisor.child_spec({SthEnqueuer, [name: name, subscribe: false]}, id: name)
         )
 
-      capture_log(fn ->
-        # No tenant_id key at all.
-        send(pid, {:audit_chain_entry, %{}})
-        # Non-binary tenant_id.
-        send(pid, {:audit_chain_entry, %{tenant_id: make_ref()}})
-        :sys.get_state(pid)
-      end)
+      log =
+        capture_log(fn ->
+          # No tenant_id key at all.
+          send(pid, {:audit_chain_entry, %{}})
+          # Non-binary tenant_id.
+          send(pid, {:audit_chain_entry, %{tenant_id: make_ref()}})
+          :sys.get_state(pid)
+        end)
 
       assert Process.alive?(pid)
+
+      # A malformed-but-correctly-shaped entry is a benign, expected case: it is
+      # logged as MALFORMED (at warning), NOT via the ERROR/"crashed" path that is
+      # reserved for a genuine enqueue fault. This pins that distinction so a
+      # regression that routed malformed entries through enqueue_sth_job's raising
+      # guard (logging "crashed") would fail here.
+      assert log =~ "malformed audit_chain_entry"
+      refute log =~ "crashed while enqueuing"
     end
 
     test "TC-35.2.4c: an unknown message is ignored and never crashes the enqueuer" do
