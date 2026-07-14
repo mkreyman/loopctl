@@ -1,0 +1,52 @@
+{
+  "id": "US-37.5",
+  "title": "Per-tenant in-flight concurrency cap + cost-weighted limiter on the HeavyRead pool",
+  "epic": { "id": "epic_37", "name": "Outbound Provider Admission Control & Backpressure" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "Epic 33 gave HeavyRead its own isolated pool + statement_timeout, but the pool (size 8) has NO per-tenant slice: one tenant's heavy read burst can hold all 8 connections and effectively 503 every other tenant. The limiter that exists counts inbound REQUESTS (rate), not in-flight CONCURRENCY on this pool.",
+  "background": {
+    "reference": "GH #352. Loopctl.HeavyRead (lib/loopctl/heavy_read.ex) is a tenant-scoping GUARD (guard!/2 :263 proves tenant_id predicate) + per-read SET LOCAL statement_timeout (opts/1 :89, default 10s), NOT a limiter. Concurrency is bounded only by the pool size HEAVY_READ_POOL_SIZE (default 8, config/runtime.exs:301, modeled in Loopctl.DbCapacity). That is a GLOBAL pool with no per-tenant slice — one tenant can hold all 8 slots. grep in_flight|semaphore|per_tenant.*concurren over heavy_read.ex/db_capacity.ex/vector_search.ex finds nothing. The only per-tenant fairness (US-36.2 Loopctl.Oban.FairShare) applies to Oban queue slots, not this synchronous pool.",
+    "includes": "Add a per-tenant in-flight concurrency cap (semaphore) so no single tenant can hold more than K of the N HeavyRead slots, plus a cost-weighted limiter (heavier queries count for more of the tenant's budget). Over-cap requests fail fast / degrade rather than exhausting the pool and 503-ing everyone. Node-local (per-node pool); a cluster-wide budget is deferred to Epic 38."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "cap how many HeavyRead connections a single tenant can hold in flight at once (a per-tenant slice of the pool), weighted by query cost, and fast-fail/degrade over-cap requests",
+    "so_that": "one tenant's burst of heavy vector/analytic reads cannot occupy the whole HeavyRead pool and cause every other tenant's heavy reads to time out or 503"
+  },
+  "rationale": "Isolating the pool (Epic 33) stopped heavy reads from starving the MAIN pool, but did nothing for fairness WITHIN the heavy pool — a single tenant can still monopolize all 8 slots. A per-tenant in-flight semaphore (with cost weighting so a few very heavy queries count like many light ones) gives each tenant a bounded share and converts monopolization into a fast, per-tenant-local shed, keeping the pool available to everyone. This mirrors US-36.2's fair-share idea on the synchronous read path.",
+  "acceptance_criteria": [
+    { "id": "AC-37.5.1", "description": "A per-tenant in-flight concurrency cap gates HeavyRead pool checkouts: a tenant may hold at most K of the N pool slots at once (K config-driven, K < N so no tenant can take the whole pool). Enforced via a semaphore/counter acquired before the checkout and released after. A test asserts tenant A holding K slots cannot acquire a K+1th while tenant B can still acquire.", "status": "pending" },
+    { "id": "AC-37.5.2", "description": "The limiter is cost-WEIGHTED: heavier reads (e.g. vector/kNN or large scans) consume more of the tenant's in-flight budget than light ones, via a per-query weight (config/heuristic). A test asserts a heavy query consumes more budget than a light one (fewer concurrent heavy queries allowed than light).", "status": "pending" },
+    { "id": "AC-37.5.3", "description": "Over-cap behavior fails fast / degrades rather than exhausting the pool: an over-budget tenant request returns a clear {:error, :heavy_read_overloaded} (or bounded-wait-then-shed), and callers map it to a graceful response (e.g. keyword fallback for search, or a 429/503 with the app error envelope for API reads) — never a pool-exhaustion crash for OTHER tenants. Test asserts an over-cap tenant is shed while other tenants still get service.", "status": "pending" },
+    { "id": "AC-37.5.4", "description": "Isolation + fairness OUTCOME (the invariant): with tenant A saturating its HeavyRead cap, tenant B's heavy read still completes within a bounded time (B is not starved). Assert the OUTCOME class (B makes progress while A is capped), NOT exact instantaneous slot counts (async-suite flake lesson). Tenant isolation of the counter is preserved (A's count never includes B).", "status": "pending" },
+    { "id": "AC-37.5.5", "description": "Caps/weights are env-driven (SystemConfig/config-based DI: per-tenant slice K, weights) with documented defaults; K defaults < HEAVY_READ_POOL_SIZE. Node-local (per-node pool + per-node semaphore) — cluster-wide budget deferred to Epic 38. The guard is defensive: a limiter fault fails OPEN (allows the read) rather than blocking all heavy reads, and logs. No Application.put_env in tests.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-37.5.1", "name": "per-tenant slice caps in-flight", "type": "integration",
+      "preconditions": ["K=2, pool N=8; slow heavy-read stub"],
+      "steps": ["tenant A starts 3 concurrent heavy reads"],
+      "expected_results": ["A holds at most 2 concurrently; the 3rd waits/sheds; tenant B can still acquire"], "status": "pending" },
+    { "id": "TC-37.5.2", "name": "cost weighting", "type": "integration",
+      "preconditions": ["heavy vs light query weights configured"],
+      "steps": ["run heavy vs light reads for a tenant"],
+      "expected_results": ["fewer concurrent heavy than light allowed within the same budget"], "status": "pending" },
+    { "id": "TC-37.5.3", "name": "over-cap sheds, others unaffected", "type": "integration",
+      "preconditions": ["tenant A over its cap"],
+      "steps": ["A issues another heavy read while B issues one"],
+      "expected_results": ["A gets :heavy_read_overloaded / graceful degrade; B succeeds; pool not exhausted"], "status": "pending" },
+    { "id": "TC-37.5.4", "name": "fairness outcome — B not starved by A", "type": "integration",
+      "preconditions": ["A saturating its cap continuously"],
+      "steps": ["B issues a heavy read"],
+      "expected_results": ["B completes within bounded time (outcome class), not stuck behind A"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/heavy_read.ex (acquire/release around the pool checkout in the read path), a new per-tenant semaphore/limiter module (e.g. lib/loopctl/heavy_read/tenant_gate.ex), lib/loopctl/db_capacity.ex (budget model), callers of HeavyRead (knowledge search / analytics / vector_search.ex) to handle :heavy_read_overloaded, SystemConfig for K/weights.",
+    "K MUST be < HEAVY_READ_POOL_SIZE (default 8) so the pool can serve multiple tenants; pick a default like ceil(N/2) or a small fixed K and document. Weight heavy (vector/kNN, large scans) higher.",
+    "Fail-open on limiter fault (a monitoring bug must not block all heavy reads). Release the slot in an after/ensure so a crashing query never leaks budget.",
+    "Mirror US-36.2 FairShare semantics but for the SYNCHRONOUS HeavyRead pool (not Oban). Node-local; cluster-wide deferred to Epic 38.",
+    "Assert OUTCOME class not exact concurrency (async-suite flake lesson). Config-based DI; no Application.put_env in tests."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 400000
+}

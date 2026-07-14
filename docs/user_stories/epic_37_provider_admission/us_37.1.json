@@ -1,0 +1,57 @@
+{
+  "id": "US-37.1",
+  "title": "Per-(tenant, provider) token-bucket admission gate before every provider Req.post",
+  "epic": { "id": "epic_37", "name": "Outbound Provider Admission Control & Backpressure" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "The core admission control #352 asks for: today NOTHING sits between agent demand and the provider socket, so a burst fires unbounded provider calls and triggers the 429/:transport_error storm. A per-(tenant,provider) token bucket in front of Req.post is the direct fix.",
+  "background": {
+    "reference": "GH #352. Both provider clients fire Req.post directly after resolving the key, with no admission gate: EmbeddingClient (lib/loopctl/knowledge/embedding_client.ex:74 Req.post(\"#{base_url}/embeddings\", ...)) and Anthropic (lib/loopctl/llm/anthropic.ex:113 Req.post(\"#{@base_url}/messages\", ...)). Hammer IS a dep but is used INBOUND-only (LoopctlWeb.Plugs.RateLimiter and a few controllers via Loopctl.RateLimiter.Behaviour / lib/loopctl/rate_limiter/hammer.ex) — never in front of an outbound provider call.",
+    "includes": "US-32.3's SettingsCache already gives cheap per-tenant settings; this story adds admission ON TOP. Empty bucket must FAST-FAIL locally so callers degrade (interactive search → keyword fallback) rather than queue forever. The local rejection must be breaker-EXEMPT (it is not a provider failure) — this is the same exemption US-37.3 relies on."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "require every outbound embedding and Anthropic call to first take a token from a per-(tenant, provider) bucket sized to that tenant's known RPM/TPM, and fast-fail locally when the bucket is empty",
+    "so_that": "one tenant's burst cannot fire unbounded provider requests and trigger a provider-side 429 storm — excess demand is shed locally and cheaply instead of hammering the provider"
+  },
+  "rationale": "A token bucket (Hammer, already a dep) in front of Req.post converts an unbounded outbound firehose into a bounded, per-tenant-fair stream sized to what the provider will actually accept. Fast-failing on an empty bucket with a distinct {:error, :rate_limited_local} lets the interactive path fall back to keyword search and lets background jobs snooze/retry, all WITHOUT counting against the circuit breaker (a local admission decision is not a provider outage).",
+  "acceptance_criteria": [
+    { "id": "AC-37.1.1", "description": "A per-(tenant, provider) token-bucket admission check (Hammer-based) is invoked immediately BEFORE the Req.post in both EmbeddingClient (embedding_client.ex) and the Anthropic client (anthropic.ex). On an empty bucket the call returns {:error, :rate_limited_local} WITHOUT issuing the HTTP request. Bucket key is scoped by tenant_id AND provider so one tenant/provider cannot consume another's allowance.", "status": "pending" },
+    { "id": "AC-37.1.2", "description": "Bucket capacity/refill (RPM and/or TPM) is env-driven via SystemConfig/config-based DI with sensible defaults, tunable per environment (and ideally per tenant tier) with no deploy. Defaults documented. No Application.put_env in tests.", "status": "pending" },
+    { "id": "AC-37.1.3", "description": "{:error, :rate_limited_local} is breaker-EXEMPT: it never counts toward the circuit breaker's failure tally (breaker_countable?/maybe_record_provider_error must treat it as non-countable). A test asserts repeated local rate-limits do NOT trip the breaker.", "status": "pending" },
+    { "id": "AC-37.1.4", "description": "Graceful degradation: the interactive search path, on {:error, :rate_limited_local}, falls back to keyword search (the SAME fallback path as :circuit_open) — never a 500. Background embedding jobs treat it as a retryable/snooze condition (no discard). Tests assert both: interactive → keyword fallback result; worker → retry/snooze not discard.", "status": "pending" },
+    { "id": "AC-37.1.5", "description": "Happy path unchanged: when the bucket has tokens, the provider request is issued exactly as today (same body/headers). A single call under normal load takes a token and proceeds with no behavior change (test).", "status": "pending" },
+    { "id": "AC-37.1.6", "description": "Node-local by design (Hammer node-local buckets) — a cluster-wide shared bucket is explicitly OUT OF SCOPE (deferred to Epic 38). Size defaults per node. The gate is defensive: a Hammer/limiter error fails OPEN (allows the call) rather than blocking all provider traffic, and logs.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-37.1.1", "name": "empty bucket fast-fails without HTTP", "type": "integration",
+      "preconditions": ["tenant bucket exhausted"],
+      "steps": ["call generate_embedding / Anthropic completion"],
+      "expected_results": ["{:error, :rate_limited_local}; no Req.post issued (mock asserts zero provider calls)"], "status": "pending" },
+    { "id": "TC-37.1.2", "name": "local rate-limit is breaker-exempt", "type": "unit",
+      "preconditions": ["repeatedly exhaust the bucket"],
+      "steps": ["trigger many :rate_limited_local in the window"],
+      "expected_results": ["breaker stays closed (not tripped)"], "status": "pending" },
+    { "id": "TC-37.1.3", "name": "interactive path degrades to keyword", "type": "integration",
+      "preconditions": ["bucket empty for the tenant"],
+      "steps": ["run default combined knowledge search"],
+      "expected_results": ["keyword-search results returned (same shape as circuit-open fallback); no 500"], "status": "pending" },
+    { "id": "TC-37.1.4", "name": "token available → provider called normally", "type": "integration",
+      "preconditions": ["bucket has tokens"],
+      "steps": ["call the provider client"],
+      "expected_results": ["Req.post issued with unchanged body; success path unchanged"], "status": "pending" },
+    { "id": "TC-37.1.5", "name": "per-(tenant,provider) isolation", "type": "unit",
+      "preconditions": ["tenant A bucket empty; tenant B full"],
+      "steps": ["A and B each call"],
+      "expected_results": ["A rate-limited, B proceeds; embedding vs anthropic buckets independent"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/knowledge/embedding_client.ex (before :74 Req.post), lib/loopctl/llm/anthropic.ex (before :113 Req.post), a new admission helper (e.g. lib/loopctl/provider/admission.ex wrapping Loopctl.RateLimiter.Behaviour/Hammer), lib/loopctl/knowledge.ex (breaker exemption + interactive fallback), SystemConfig for limits.",
+    "Reuse the existing Loopctl.RateLimiter.Behaviour + Hammer wrapper (rate_limiter/hammer.ex) rather than a new limiter dep; it already supports check_rate/3. Key: {tenant_id, :embedding|:anthropic}.",
+    "The breaker-exempt classification lives in knowledge.ex breaker_countable?/maybe_record_provider_error (~:7406) — US-37.3 refactors that; keep :rate_limited_local exempt in both stories (note the dependency: US-37.3 depends on US-37.1).",
+    "Fail-open on limiter error (rule: a monitoring/limiter fault must not take down provider traffic). Config-based DI; document RPM/TPM defaults.",
+    "Node-local only; cluster-wide shared bucket deferred to Epic 38 (#353)."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 350000
+}

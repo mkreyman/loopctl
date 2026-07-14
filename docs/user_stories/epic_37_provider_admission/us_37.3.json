@@ -1,0 +1,55 @@
+{
+  "id": "US-37.3",
+  "title": "Throttle-aware circuit breaker + honor provider Retry-After",
+  "epic": { "id": "epic_37", "name": "Outbound Provider Admission Control & Backpressure" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "Today the breaker deliberately IGNORES 429 (all 4xx exempt), so a provider rate-limit storm never triggers backoff, and retry backoff is a blind attempt^4 that DISCARDS the provider's Retry-After. The system fights a 429 storm by immediately retrying into it. This story makes throttling actually back off.",
+  "background": {
+    "reference": "GH #352. Breaker classification breaker_countable?/1 (knowledge.ex:7406-7420): status>=500 -> true; any 4xx -> false (so 429/408 EXEMPT); request_failed/crash/timeout -> true. Docstring (:7304-7308) states 4xx are intentionally exempt. maybe_record_provider_error/1 (:7393) reuses the same gate. Retry-After is NOT read anywhere (grep retry.after finds only the INBOUND US-36.3 header loopctl SENDS). Oban backoff is blind polynomial: article_embedding_worker.ex:87-89 trunc(:math.pow(attempt,4)+15+:rand.uniform(30)*attempt), memory_embedding_worker.ex:89-91 identical. The {:snooze,n} in those workers is the US-36.2 FairShare gate, NOT a provider Retry-After.",
+    "includes": "Split the blanket 4xx exemption into CRED errors (401/403 — a bad/forbidden key, still exempt: retrying or backing off won't help and it's not an outage) vs THROTTLE errors (429/408 — count toward the breaker AND back off). Extract provider Retry-After (seconds or HTTP-date) from the 429/503 response and use it for (a) the breaker cooldown and (b) the Oban worker backoff/snooze in place of the blind attempt^4. Add a latency-based trip for slow-but-alive providers. Depends on US-37.1 so :rate_limited_local stays exempt in the refactored classifier."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "count provider throttle responses (429/408) toward the circuit breaker, keep credential errors (401/403) exempt, and honor the provider's Retry-After for both the breaker cooldown and Oban retry backoff",
+    "so_that": "a provider rate-limit storm actually trips the breaker and backs off for the interval the provider asked for, instead of being ignored and hammered with immediate blind retries"
+  },
+  "rationale": "The current breaker is blind to the exact failure mode #352 is about. Distinguishing throttle from credential errors lets 429/408 drive backoff while 401/403 (unfixable by retry) stay exempt. Honoring Retry-After aligns loopctl's backoff with what the provider will actually accept — the single most effective way to end a 429 storm — and a latency trip catches degraded-but-200 providers before they cascade.",
+  "acceptance_criteria": [
+    { "id": "AC-37.3.1", "description": "breaker_countable?/maybe_record_provider_error is refactored to split 4xx: 429 and 408 COUNT toward the breaker (throttle); 401 and 403 remain EXEMPT (credential). Other 4xx keep today's behavior (document the choice). US-37.1's {:error, :rate_limited_local} stays EXEMPT. 5xx/transport/timeout/crash still count. Unit tests cover each status class.", "status": "pending" },
+    { "id": "AC-37.3.2", "description": "The provider Retry-After header (delta-seconds OR HTTP-date) is parsed from 429/503 responses in both provider clients into a normalized seconds value (defensive: missing/garbage header -> nil, fall back to existing backoff). A parser unit test covers seconds, HTTP-date, absent, and malformed.", "status": "pending" },
+    { "id": "AC-37.3.3", "description": "When Retry-After is present, the breaker cooldown for that (tenant,provider) is set to at least the Retry-After interval (bounded by a sane max), and the Oban embedding/ingestion worker backoff (article_embedding_worker.ex / memory_embedding_worker.ex / content_ingestion_worker.ex) uses it — via {:snooze, retry_after} or backoff/1 — INSTEAD of the blind attempt^4, when a throttle error carried one. Absent Retry-After keeps the existing polynomial backoff. Tests assert a 429-with-Retry-After yields a snooze/backoff of ~that interval.", "status": "pending" },
+    { "id": "AC-37.3.4", "description": "A latency-based trip is added: if provider calls for a (tenant,provider) exceed a config latency threshold for a config number of consecutive/window calls, the breaker trips (slow-but-alive protection). Config-driven; documented default; disabled-safe (a 0/unset threshold means no latency trip). Test asserts the latency trip fires and recovers.", "status": "pending" },
+    { "id": "AC-37.3.5", "description": "Fail-safe: when the breaker is open (from throttle or latency), the interactive path falls back to keyword search and workers snooze/retry — never a 500, never a hot retry loop into a throttling provider. Existing :circuit_open fallback is preserved. Thresholds/cooldowns are env-driven (SystemConfig); no Application.put_env in tests. Assert outcome classes, not exact timing.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-37.3.1", "name": "429/408 count, 401/403 exempt", "type": "unit",
+      "preconditions": [],
+      "steps": ["classify each status via breaker_countable?"],
+      "expected_results": ["429 & 408 countable=true; 401 & 403 countable=false; :rate_limited_local false; 500 true"], "status": "pending" },
+    { "id": "TC-37.3.2", "name": "Retry-After parser", "type": "unit",
+      "preconditions": [],
+      "steps": ["parse '30', an HTTP-date ~30s out, '', 'garbage'"],
+      "expected_results": ["~30, ~30, nil, nil"], "status": "pending" },
+    { "id": "TC-37.3.3", "name": "429 storm trips breaker and backs off by Retry-After", "type": "integration",
+      "preconditions": ["provider stub returns 429 + Retry-After: 30 repeatedly"],
+      "steps": ["drive embedding calls past the threshold"],
+      "expected_results": ["breaker trips; worker snoozes/backs off ~30s (not attempt^4); interactive path falls back to keyword"], "status": "pending" },
+    { "id": "TC-37.3.4", "name": "latency trip", "type": "integration",
+      "preconditions": ["provider stub returns 200 but slow, over the latency threshold"],
+      "steps": ["make repeated calls"],
+      "expected_results": ["breaker trips on latency; recovers after cooldown"], "status": "pending" },
+    { "id": "TC-37.3.5", "name": "bad key does not trip breaker", "type": "integration",
+      "preconditions": ["provider stub returns 401"],
+      "steps": ["make repeated calls"],
+      "expected_results": ["breaker stays closed (credential error exempt); error surfaced to caller as today"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/knowledge.ex (breaker_countable?/maybe_record_provider_error ~:7393-7420, breaker cooldown ~:7241-7266), lib/loopctl/knowledge/embedding_circuit_breaker.ex, lib/loopctl/knowledge/embedding_client.ex + lib/loopctl/llm/anthropic.ex (extract Retry-After from the response), the Oban workers' backoff/1 (article_embedding_worker.ex:87, memory_embedding_worker.ex:89, content_ingestion_worker.ex:229), SystemConfig for thresholds.",
+    "Retry-After: RFC 7231 — either delta-seconds or an HTTP-date. Parse both with stdlib (no new dep); clamp to a sane max cooldown so a hostile/huge header can't wedge a queue.",
+    "Keep 401/403 exempt: retrying a forbidden key wastes calls and a bad key is not a provider outage. Note the Anthropic client has no breaker today (only telemetry via Llm.permanent_provider_error?/1 :170) — decide whether to extend the breaker to it or keep embedding-only; document.",
+    "Depends on US-37.1 (the refactored classifier must keep :rate_limited_local exempt). Config-based DI; no Application.put_env in tests. Assert outcome class, not exact timing (async-suite flake lesson)."
+  ],
+  "dependencies": ["US-37.1"],
+  "estimated_tokens": 400000
+}
