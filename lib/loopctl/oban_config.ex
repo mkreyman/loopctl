@@ -41,13 +41,34 @@ defmodule Loopctl.ObanConfig do
   # US-36.1: `:knowledge`'s width of 5 was split into `knowledge: 2, ingestion: 2,
   # verification: 1` (a REBALANCE, not new capacity — the pool sum stays 38). The
   # long (~6-min) LLM `ContentIngestionWorker` moved to its own `:ingestion` queue so
-  # a burst of ingests can no longer head-of-line-block the six sub-second `:knowledge`
-  # workers (linking/lint/MOC/metrics/reclassify/review) — GH #351. `:verification` is
+  # a burst of ingests can no longer head-of-line-block the sub-second linking/lint/
+  # MOC/metrics/reclassify/review `:knowledge` workers — GH #351. `:verification` is
   # registered (env-driven width) because it is a LIVE feature:
   # `Loopctl.Verification.create_run_and_enqueue/3` enqueues `VerificationRunnerWorker`
   # jobs on `queue: :verification`; leaving it unregistered meant those jobs enqueued
   # but never ran. Widths stay env-tunable via `OBAN_QUEUE_INGESTION` /
   # `OBAN_QUEUE_VERIFICATION` (auto-derived from the atom name — no extra code).
+  #
+  # `:knowledge` inventory (accurate count): SEVEN workers target `:knowledge` after
+  # the split — six genuinely sub-second (ArticleLinking, KnowledgeLint, KnowledgeMoc,
+  # RetrievalMetrics, KnowledgeReclassify, ReviewKnowledge) PLUS the daily
+  # `PromotionEvalWorker`, an `all_tenants` extraction-LLM promotion-quality eval that
+  # is explicitly NOT sub-second. The head-of-line concern the split removes is the
+  # long ~6-min ingestion job blocking those sub-second workers; `PromotionEvalWorker`
+  # is a once-daily cron, not part of the hot fast lane.
+  #
+  # Steady-state tradeoff (deliberate, not a mechanical 5=2+2+1 split): dropping
+  # `:knowledge` 5 -> 2 is a >60% fast-lane parallelism cut that applies in the common
+  # NO-ingestion-burst case too, not just during bursts. Several of the six remaining
+  # non-ingestion knowledge workers are `all_tenants` whole-corpus cron passes that are
+  # not necessarily short (KnowledgeMoc, KnowledgeLint, RetrievalMetrics, and the daily
+  # PromotionEval — see `plugins/0`'s crontab), so a couple of them can occupy both
+  # slots and briefly delay the genuinely sub-second `ArticleLinkingWorker` — a milder
+  # form of the exact head-of-line blocking this story removes for ingestion. This is
+  # an accepted default, retunable at any time via `OBAN_QUEUE_KNOWLEDGE` (bump to 3+
+  # without a deploy). Alternatives if the fast lane proves too tight: a 3/1/1
+  # knowledge/ingestion/verification split, or moving `PromotionEvalWorker` onto a
+  # slower cron queue so the two `:knowledge` slots serve only short jobs.
   #
   # MUST NOT be `Application.compile_env(:loopctl, Oban)[:queues]`. That recorded a
   # compile-time consistency dependency on the WHOLE `[:loopctl, Oban]` app-env key,

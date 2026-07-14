@@ -2,8 +2,12 @@ defmodule Loopctl.ObanQueueTopologyTest do
   @moduledoc """
   US-36.1: queue topology — a dedicated `:ingestion` queue for the long (~6-min) LLM
   `ContentIngestionWorker` so a burst of ingests can no longer head-of-line-block the
-  six sub-second `:knowledge` workers (GH #351), plus registration of the previously
-  dead `:verification` queue that `VerificationRunnerWorker` targets.
+  sub-second `:knowledge` workers (GH #351), plus registration of the previously dead
+  `:verification` queue that `VerificationRunnerWorker` targets.
+
+  (`:knowledge` hosts SEVEN workers: six sub-second — linking/lint/MOC/metrics/
+  reclassify/review — plus the daily `PromotionEvalWorker` LLM eval, which is a
+  once-daily cron rather than part of the sub-second hot lane the split protects.)
 
   Needs the DB (Oban.insert / drain_queue), so it uses DataCase. The suite's default
   Oban testing mode is `:inline`; enqueue assertions run under
@@ -17,7 +21,27 @@ defmodule Loopctl.ObanQueueTopologyTest do
   alias Loopctl.ObanConfig
   alias Loopctl.Workers.ArticleLinkingWorker
   alias Loopctl.Workers.ContentIngestionWorker
+  alias Loopctl.Workers.KnowledgeLintWorker
+  alias Loopctl.Workers.KnowledgeMocWorker
+  alias Loopctl.Workers.KnowledgeReclassifyWorker
+  alias Loopctl.Workers.PromotionEvalWorker
+  alias Loopctl.Workers.RetrievalMetricsWorker
+  alias Loopctl.Workers.ReviewKnowledgeWorker
   alias Loopctl.Workers.VerificationRunnerWorker
+
+  # The six workers AC-36.1.3 requires to REMAIN on :knowledge, plus PromotionEvalWorker
+  # (the daily LLM eval that also targets :knowledge). Locking the full set means an
+  # accidental future queue change on ANY of them fails this suite — not just on
+  # ArticleLinkingWorker.
+  @knowledge_workers [
+    ArticleLinkingWorker,
+    KnowledgeLintWorker,
+    KnowledgeMocWorker,
+    RetrievalMetricsWorker,
+    KnowledgeReclassifyWorker,
+    ReviewKnowledgeWorker,
+    PromotionEvalWorker
+  ]
 
   describe "TC-36.1.1: queue widths / pool budget (rebalance, not new capacity)" do
     test "`:ingestion` and `:verification` are registered with env-driven default widths" do
@@ -37,11 +61,25 @@ defmodule Loopctl.ObanQueueTopologyTest do
     end
 
     test "AC-36.1.5: the config.exs compile-time mirror matches the ObanConfig defaults" do
-      # runtime.exs sources `queues:` from `ObanConfig.queues()`, so the running Oban
-      # config must equal it exactly — the cardinality/consistency guard (TC-32.2.1 style)
-      # that catches a config.exs mirror drifting from the ObanConfig source of truth.
-      running = Application.get_env(:loopctl, Oban)[:queues]
-      assert running == ObanConfig.queues()
+      # The genuine mirror-drift guard. Comparing the RUNNING Oban config to
+      # `ObanConfig.queues()` would be tautological: `config/runtime.exs` sets
+      # `queues: ObanConfig.queues()` in every env and `Config` deep-merges the
+      # keyword list, so the running value equals `ObanConfig.queues()` by
+      # construction regardless of what config.exs contains — a config.exs edit that
+      # drifts from ObanConfig could never fail it.
+      #
+      # Instead, read config.exs in ISOLATION (via `Config.Reader.read!/2`, WITHOUT
+      # runtime.exs's override applied) to recover the raw compile-time literal, then
+      # assert it equals the ObanConfig default (`ObanConfig.queues()` with no
+      # OBAN_QUEUE_* env override, which the CI env guarantees). Now an edit to either
+      # list that isn't mirrored in the other fails this test.
+      config_exs_literal =
+        "config/config.exs"
+        |> Path.expand(File.cwd!())
+        |> Config.Reader.read!(env: :test)
+        |> get_in([:loopctl, Oban, :queues])
+
+      assert config_exs_literal == ObanConfig.queues()
     end
   end
 
@@ -67,13 +105,24 @@ defmodule Loopctl.ObanQueueTopologyTest do
   end
 
   describe "TC-36.1.3: head-of-line fix — :knowledge drains independently of :ingestion" do
-    test "with :ingestion saturated by long jobs, a :knowledge linking job still executes" do
+    # SCOPE OF THIS TEST: it proves queue SEPARATION structurally, not real under-load
+    # blocking. Running in :manual mode, the ingestion jobs are enqueued but never
+    # execute, so :ingestion is not actually saturated with running work and no
+    # scheduler contention exists. What it asserts is that draining ONLY :knowledge
+    # runs the linking job while leaving the ingestion jobs enqueued — which would FAIL
+    # under the old single-:knowledge topology (the :knowledge drain would also pick up
+    # the ingestion jobs). That structural separation is the mechanism behind the
+    # head-of-line fix: because they are distinct queues/consumers, a saturated
+    # :ingestion cannot occupy :knowledge slots. Truly saturating a queue with running
+    # work requires live concurrency that Oban's testing modes don't model; for a
+    # config-only topology change the separation guarantee is the load-bearing property.
+    test "draining :knowledge runs the linking job while enqueued :ingestion jobs are left untouched (queue separation)" do
       tenant = fixture(:tenant)
 
       Oban.Testing.with_testing_mode(:manual, fn ->
-        # Saturate :ingestion with several long ContentIngestionWorker jobs. In the old
-        # single-queue topology these would occupy the shared :knowledge slots and block
-        # the fast linking job behind them.
+        # Enqueue several long ContentIngestionWorker jobs on :ingestion. In the old
+        # single-queue topology these shared the :knowledge slots, so draining
+        # :knowledge would also consume them; here they must stay put.
         for _ <- 1..3 do
           {:ok, _} =
             %{
@@ -95,7 +144,7 @@ defmodule Loopctl.ObanQueueTopologyTest do
         assert_enqueued(worker: ArticleLinkingWorker, queue: :knowledge)
 
         # Draining ONLY :knowledge runs the linking job — it is not stuck behind the
-        # saturated :ingestion queue, because they are now separate queues/consumers.
+        # enqueued :ingestion jobs, because they are now separate queues/consumers.
         assert %{success: 1} = Oban.drain_queue(queue: :knowledge)
 
         # The linking job ran (no longer enqueued)...
@@ -127,6 +176,23 @@ defmodule Loopctl.ObanQueueTopologyTest do
       # The short jobs stay on :knowledge (AC-36.1.3).
       assert ArticleLinkingWorker.__opts__()[:queue] == :knowledge
       assert MapSet.member?(registered, :knowledge)
+    end
+
+    test "AC-36.1.3: EVERY knowledge worker stays on :knowledge, and ContentIngestionWorker is the only one that moved" do
+      registered = ObanConfig.queues() |> Keyword.keys() |> MapSet.new()
+      assert MapSet.member?(registered, :knowledge)
+
+      # All six AC-enumerated workers (plus the daily PromotionEvalWorker) must remain
+      # on :knowledge — locks the topology so an accidental queue change on any of them
+      # (not just ArticleLinkingWorker) fails here.
+      for worker <- @knowledge_workers do
+        assert worker.__opts__()[:queue] == :knowledge,
+               "#{inspect(worker)} must stay on :knowledge (AC-36.1.3)"
+      end
+
+      # ContentIngestionWorker is the ONLY worker this story moved off :knowledge.
+      assert ContentIngestionWorker.__opts__()[:queue] == :ingestion
+      refute ContentIngestionWorker in @knowledge_workers
     end
   end
 end
