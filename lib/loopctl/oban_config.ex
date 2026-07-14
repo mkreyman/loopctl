@@ -35,8 +35,19 @@ defmodule Loopctl.ObanConfig do
 
   # Default widths are a literal, hand-maintained mirror of config/config.exs's
   # compile-time `config :loopctl, Oban, queues: [...]` (AC-32.2.3). Sum = 38
-  # (10+5+2+3+2+5+5+3+3). Keep the two lists in sync when adding/removing/resizing
+  # (10+5+2+3+2+5+2+2+3+3+1). Keep the two lists in sync when adding/removing/resizing
   # a queue (`TC-32.2.1` in oban_config_test.exs asserts they match).
+  #
+  # US-36.1: `:knowledge`'s width of 5 was split into `knowledge: 2, ingestion: 2,
+  # verification: 1` (a REBALANCE, not new capacity — the pool sum stays 38). The
+  # long (~6-min) LLM `ContentIngestionWorker` moved to its own `:ingestion` queue so
+  # a burst of ingests can no longer head-of-line-block the six sub-second `:knowledge`
+  # workers (linking/lint/MOC/metrics/reclassify/review) — GH #351. `:verification` is
+  # registered (env-driven width) because it is a LIVE feature:
+  # `Loopctl.Verification.create_run_and_enqueue/3` enqueues `VerificationRunnerWorker`
+  # jobs on `queue: :verification`; leaving it unregistered meant those jobs enqueued
+  # but never ran. Widths stay env-tunable via `OBAN_QUEUE_INGESTION` /
+  # `OBAN_QUEUE_VERIFICATION` (auto-derived from the atom name — no extra code).
   #
   # MUST NOT be `Application.compile_env(:loopctl, Oban)[:queues]`. That recorded a
   # compile-time consistency dependency on the WHOLE `[:loopctl, Oban]` app-env key,
@@ -56,9 +67,11 @@ defmodule Loopctl.ObanConfig do
     analytics: 3,
     maintenance: 2,
     embeddings: 5,
-    knowledge: 5,
+    knowledge: 2,
+    ingestion: 2,
     memory: 3,
-    audit: 3
+    audit: 3,
+    verification: 1
   ]
 
   @doc """

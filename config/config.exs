@@ -297,9 +297,11 @@ config :loopctl, Oban,
     analytics: 3,
     maintenance: 2,
     embeddings: 5,
-    knowledge: 5,
+    knowledge: 2,
+    ingestion: 2,
     memory: 3,
-    audit: 3
+    audit: 3,
+    verification: 1
   ]
 
 # US-35.3: the Oban `:plugins` list (Cron crontab + Lifeline + Pruner + Reindexer)

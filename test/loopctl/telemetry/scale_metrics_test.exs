@@ -877,7 +877,8 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
         |> Keyword.keys()
 
       assert ScaleMetrics.oban_queues() == configured
-      assert length(ScaleMetrics.oban_queues()) == 9
+      # US-36.1 added `:ingestion` and `:verification`, taking the queue count 9 -> 11.
+      assert length(ScaleMetrics.oban_queues()) == 11
     end
 
     test "queues_from_config/1 resolves to [] instead of raising on the documented `queues: false` shape (review finding — unit-tested directly, never mutating global config)" do
