@@ -7309,6 +7309,15 @@ defmodule Loopctl.Knowledge do
   the proposal gate route through it too (review #4) so circuit-open is both
   respected AND contributed to.
 
+  It is ALSO the single choke point for the `[:loopctl, :llm, :provider_error]`
+  telemetry signal's embedding half (US-34.3 AC-34.3.3, review MED #1): both Oban
+  workers (`ArticleEmbeddingWorker`/`MemoryEmbeddingWorker`) AND every query-time
+  caller (combined/semantic search, novelty scoring, `Memory.recall/2`, promotion
+  near-dup lookup) funnel through here, so recording the signal in
+  `run_embedding_task/3` — rather than per-worker after this function returns —
+  covers every embedding path exactly once, with the same breaker-countable gate
+  (a per-tenant 4xx never contributes) and no double-count.
+
   `opts`:
     * `:timeout` — Task.yield budget in ms (default `#{@embedding_yield_ms}`).
   """
@@ -7351,17 +7360,42 @@ defmodule Loopctl.Knowledge do
 
       {:ok, {:error, reason} = err} ->
         maybe_record_failure(tenant_id, reason)
+        maybe_record_provider_error(reason)
         err
 
       _ ->
         # nil (yield timeout) or an abnormal task exit — a provider/infra failure.
         record_failure(tenant_id)
+        maybe_record_provider_error(:timeout)
         {:error, :timeout}
     end
   end
 
   defp maybe_record_failure(tenant_id, reason) do
     if breaker_countable?(reason), do: record_failure(tenant_id)
+    :ok
+  end
+
+  # US-34.3 (AC-34.3.3) fix (review MED #1): the SINGLE choke point for the
+  # embedding half of the `[:loopctl, :llm, :provider_error]` signal. Both Oban
+  # workers (`ArticleEmbeddingWorker`/`MemoryEmbeddingWorker`) AND every query-time
+  # caller (combined/semantic search, novelty scoring, `Memory.recall/2`, promotion
+  # near-dup lookup) funnel through `run_embedding_task/3`, so recording here —
+  # instead of per-worker after `generate_embedding/3` returns — covers every
+  # embedding path exactly once with no double-count.
+  #
+  # Gated by the SAME `breaker_countable?/1` classification the circuit breaker
+  # uses: a per-tenant credential/quota 4xx (401/403/429) is never a systemic
+  # provider incident, so it must never inflate this fleet-wide storm signal —
+  # exactly like it must never trip the breaker. `:no_api_key` and `:circuit_open`
+  # never reach this function (handled by earlier `case` clauses in
+  # `run_embedding_task/3`), so no explicit exclusion clause is needed here.
+  defp maybe_record_provider_error(reason) do
+    if breaker_countable?(reason) do
+      class = if Loopctl.Llm.permanent_provider_error?(reason), do: :permanent, else: :transient
+      Loopctl.Llm.record_provider_error("embedding", class)
+    end
+
     :ok
   end
 

@@ -101,6 +101,10 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
       {:error, reason} ->
         # Classify on the raw reason, but the term that becomes an Oban discard/error
         # reason (-> oban_jobs.errors) is SANITIZED (review #5/#6) — never a raw body.
+        # US-34.3 (review MED #1): the `[:loopctl, :llm, :provider_error]` telemetry
+        # signal is now recorded ONCE, upstream, in
+        # `Loopctl.Knowledge.run_embedding_task/3` — the single choke point shared by
+        # this worker AND every query-time embedding caller. Do NOT re-record here.
         sanitized = ProviderError.sanitize(reason)
 
         if Llm.permanent_provider_error?(reason) do

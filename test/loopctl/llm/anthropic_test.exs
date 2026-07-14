@@ -100,4 +100,123 @@ defmodule Loopctl.Llm.AnthropicTest do
     log = capture_log(fn -> assert {:error, {:request_failed, _}} = run(tenant) end)
     refute log =~ @secret
   end
+
+  describe "US-34.3 review fix (AC-34.3.3): wires [:loopctl, :llm, :provider_error]" do
+    # Prior to this fix, a real 429/5xx/transport storm on the primary Anthropic
+    # surface (content extraction/classification/merge/memory-promotion — every one
+    # funnels through this shared client) was invisible to the provider-error-rate
+    # ScaleAlerts signal: only the embedding worker path recorded it. Attaching a
+    # listener here proves the client itself is now the single choke point for
+    # every Anthropic call site.
+    defp attach_provider_error_listener(test_pid) do
+      handler_id = {:anthropic_provider_error_test, System.unique_integer([:positive])}
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :llm, :provider_error],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:provider_error_emitted, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+    end
+
+    test "a permanent 4xx API error (e.g. revoked key) is recorded provider=anthropic class=:permanent" do
+      tenant = tenant_with_key()
+      attach_provider_error_listener(self())
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{"error" => "bad key"})
+      end)
+
+      assert {:error, {:api_error, 401, :provider_error}} = run(tenant)
+
+      assert_received {:provider_error_emitted, %{count: 1}, metadata}
+      assert metadata == %{provider: "anthropic", class: :permanent}
+    end
+
+    test "a 5xx API error is recorded provider=anthropic class=:transient" do
+      tenant = tenant_with_key()
+      attach_provider_error_listener(self())
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        conn |> Plug.Conn.put_status(500) |> Req.Test.json(%{"error" => "boom"})
+      end)
+
+      assert {:error, {:api_error, 500, :provider_error}} = run(tenant)
+
+      assert_received {:provider_error_emitted, %{count: 1}, metadata}
+      assert metadata == %{provider: "anthropic", class: :transient}
+    end
+
+    test "a 429 rate-limit is classified :transient (not permanent — it can succeed on retry)" do
+      tenant = tenant_with_key()
+      attach_provider_error_listener(self())
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        conn |> Plug.Conn.put_status(429) |> Req.Test.json(%{"error" => "rate limited"})
+      end)
+
+      assert {:error, {:api_error, 429, :provider_error}} = run(tenant)
+
+      assert_received {:provider_error_emitted, %{count: 1}, metadata}
+      assert metadata == %{provider: "anthropic", class: :transient}
+    end
+
+    test "a transport error is recorded provider=anthropic class=:transient" do
+      tenant = tenant_with_key()
+      attach_provider_error_listener(self())
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        Req.Test.transport_error(conn, :econnrefused)
+      end)
+
+      assert {:error, {:request_failed, _}} = run(tenant)
+
+      assert_received {:provider_error_emitted, %{count: 1}, metadata}
+      assert metadata == %{provider: "anthropic", class: :transient}
+    end
+
+    test "a 200-with-unexpected-shape response is NEVER recorded (review fix LOW: a 200 is a provider SUCCESS, not an outage)" do
+      tenant = tenant_with_key()
+      attach_provider_error_listener(self())
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        Req.Test.json(conn, %{"error" => %{"message" => "unexpected"}})
+      end)
+
+      assert {:error, {:api_error, 200, :provider_error}} = run(tenant)
+
+      refute_received {:provider_error_emitted, _measurements, _metadata}
+    end
+
+    test "a successful 200 call never emits provider_error" do
+      tenant = tenant_with_key()
+      test_pid = self()
+      handler_id = {:anthropic_provider_error_success_test, System.unique_integer([:positive])}
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :llm, :provider_error],
+        fn _event, _measurements, _metadata, _config ->
+          send(test_pid, :unexpected_provider_error)
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        Req.Test.json(conn, %{
+          "content" => [%{"type" => "text", "text" => "ok"}],
+          "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+        })
+      end)
+
+      assert {:ok, "ok"} = run(tenant)
+      refute_received :unexpected_provider_error
+    end
+  end
 end

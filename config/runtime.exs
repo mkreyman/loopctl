@@ -243,6 +243,22 @@ if config_env() == :prod do
          :scale_alert_renotify_interval_ms,
          String.to_integer(System.get_env("SCALE_ALERT_RENOTIFY_INTERVAL_MS") || "900000")
 
+  # US-34.3: three additional ScaleAlerts signals — Repo checkout queue_time p95
+  # (ms), fleet-wide Oban discard/retry rate (events/min), and LLM/embedding
+  # provider-error rate (events/min). Same tunable-per-environment pattern as the
+  # original three thresholds above.
+  config :loopctl,
+         :scale_alert_queue_time_p95_ms,
+         String.to_integer(System.get_env("SCALE_ALERT_QUEUE_TIME_P95_MS") || "500")
+
+  config :loopctl,
+         :scale_alert_oban_discard_rate_per_min,
+         String.to_integer(System.get_env("SCALE_ALERT_OBAN_DISCARD_RATE_PER_MIN") || "10")
+
+  config :loopctl,
+         :scale_alert_provider_error_rate_per_min,
+         String.to_integer(System.get_env("SCALE_ALERT_PROVIDER_ERROR_RATE_PER_MIN") || "10")
+
   config :loopctl, Loopctl.HeavyReadRepo,
     url: admin_database_url,
     pool_size: String.to_integer(System.get_env("HEAVY_READ_POOL_SIZE") || "8"),

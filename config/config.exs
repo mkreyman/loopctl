@@ -132,7 +132,13 @@ config :loopctl,
   scale_alert_timeout_rate_per_min: 5,
   scale_alert_p95_latency_ms: 2_000,
   scale_alert_under_fill_rate_per_min: 30,
-  scale_alert_renotify_interval_ms: 15 * 60_000
+  scale_alert_renotify_interval_ms: 15 * 60_000,
+  # US-34.3: three additional signals (documented defaults) — Repo checkout
+  # queue_time p95 (ms), fleet-wide Oban discard/retry rate (events/min), and
+  # LLM/embedding provider-error rate (events/min).
+  scale_alert_queue_time_p95_ms: 500,
+  scale_alert_oban_discard_rate_per_min: 10,
+  scale_alert_provider_error_rate_per_min: 10
 
 # US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
 # defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/
