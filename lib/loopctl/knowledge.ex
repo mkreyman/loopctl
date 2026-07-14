@@ -7349,21 +7349,24 @@ defmodule Loopctl.Knowledge do
   # US-37.2: gate EVERY outbound embedding on a per-node concurrency cap BEFORE
   # spawning the task, so the interactive query path AND both Oban embedding workers
   # (which route through here via generate_embedding/3) share ONE real node ceiling
-  # (GH #352). The acquire is charged to THIS (request/worker) process and released
-  # in an `after` so a yield-timeout shutdown or an in-task crash still frees the
-  # slot; a crash of THIS process is reclaimed by the gate's monitor. Over the cap,
-  # acquire fast-fails with {:error, :rate_limited_local} — the breaker-exempt reason
+  # (GH #352) — a GLOBAL cap plus a per-tenant sub-cap so one tenant's burst can't
+  # starve every other tenant's semantic search. The acquire is charged to THIS
+  # (request/worker) process for the request's tenant and released in an `after` so a
+  # yield-timeout shutdown or an in-task crash still frees the slot; a crash of THIS
+  # process is reclaimed by the gate's monitor. Over EITHER cap (or if the gate
+  # GenServer is down), acquire fast-fails with {:error, :rate_limited_local} — the
+  # breaker-exempt reason
   # (see breaker_countable?/1) the combined-search branch turns into a keyword-only
   # fallback and the workers snooze on — so the interactive path degrades gracefully
   # instead of blocking, and NO circuit-breaker / provider-error signal is recorded
   # (self-imposed backpressure is not a provider failure).
   defp run_embedding_task(tenant_id, query_string, timeout) do
-    case embedding_concurrency().acquire() do
+    case embedding_concurrency().acquire(tenant_id) do
       :ok ->
         try do
           run_capped_embedding_task(tenant_id, query_string, timeout)
         after
-          embedding_concurrency().release()
+          embedding_concurrency().release(tenant_id)
         end
 
       {:error, :rate_limited_local} = err ->

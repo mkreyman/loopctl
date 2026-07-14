@@ -4,6 +4,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
   setup :verify_on_exit!
 
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.EmbeddingConcurrency
 
   # Embedding dimensions configured as 1536.
   # We use small deterministic vectors for predictable cosine distances.
@@ -440,7 +441,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       })
 
       # Saturate the gate: every acquire is refused.
-      Mox.stub(Loopctl.MockEmbeddingConcurrency, :acquire, fn ->
+      Mox.stub(Loopctl.MockEmbeddingConcurrency, :acquire, fn _tenant_id ->
         {:error, :rate_limited_local}
       end)
 
@@ -545,6 +546,56 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       assert meta.search_mode == "combined"
       refute Map.get(meta, :fallback)
       assert Enum.any?(results, &(&1.id == both_match.id))
+    end
+
+    # AC-37.2.2 wiring: prove search_combined -> run_embedding_task actually routes
+    # through the REAL Loopctl.Knowledge.EmbeddingConcurrency GenServer's counter, not
+    # just the permissive DI mock. Every OTHER search test resolves the gate to the
+    # mock, so a production wiring regression (run_embedding_task not calling acquire,
+    # threading the wrong tenant, or the real gate mishandling the search path) could
+    # pass unseen. Here the DI mock DELEGATES to the real gate — Mox.expect verifies
+    # acquire/1 + release/1 each fire exactly once with the request's tenant — and we
+    # assert the real PER-TENANT counter round-trips back to 0. The tenant is unique
+    # (fixture), so the per-tenant counter never collides with any other test.
+    test "search_combined routes through the REAL concurrency gate (acquire+release wired)" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      both_match =
+        create_article_with_embedding(
+          tenant.id,
+          %{title: "Error Handling Patterns", body: "Try rescue patterns for error handling."},
+          :close
+        )
+
+      # Delegate the DI mock to the REAL gate for THIS tenant and verify each callback
+      # fires exactly once with the right tenant. acquire/release run in the test
+      # process (before/after the async_nolink task), so no $callers allowance is needed.
+      Mox.expect(Loopctl.MockEmbeddingConcurrency, :acquire, fn tid ->
+        assert tid == tenant.id
+        EmbeddingConcurrency.acquire(tid)
+      end)
+
+      Mox.expect(Loopctl.MockEmbeddingConcurrency, :release, fn tid ->
+        assert tid == tenant.id
+        EmbeddingConcurrency.release(tid)
+      end)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.search_combined(tenant.id, "error")
+
+      # Happy path preserved through the REAL gate...
+      assert meta.search_mode == "combined"
+      refute Map.get(meta, :fallback)
+      assert Enum.any?(results, &(&1.id == both_match.id))
+
+      # ...and the real gate's per-tenant slot was acquired AND released (the round-trip
+      # is wired end-to-end): the counter is back to 0 for this tenant.
+      assert EmbeddingConcurrency.tenant_count(tenant.id) == 0
     end
   end
 

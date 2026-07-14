@@ -303,10 +303,16 @@ config :loopctl, :embedding_concurrency, Loopctl.MockEmbeddingConcurrency
 # US-37.2: high suite-wide default for the embedding concurrency cap so incidental
 # parallel interactive searches in the async suite never collide on the shared,
 # VM-wide global counter (the export-cap precedent at :export_max_concurrent_global).
-# The gate's OWN unit test sets an explicit LOW cap via acquire/1, independent of
-# this value; the search-path saturation test uses the DI mock above, not the real
+# The gate's OWN unit test sets explicit LOW caps via acquire/3, independent of
+# these values; the search-path saturation test uses the DI mock above, not the real
 # counter. Production uses the config.exs default (10), live-tunable via SystemConfig.
 config :loopctl, :embedding_max_concurrent, 64
+
+# US-37.2 per-tenant sub-cap: high suite-wide default for the SAME reason as the
+# global cap above — incidental parallel searches (per tenant) must not collide on
+# the shared, VM-wide per-tenant counters. The gate's unit test passes an explicit
+# LOW per-tenant cap via acquire/3. Production uses the config.exs default (6).
+config :loopctl, :embedding_max_concurrent_per_tenant, 64
 
 # US-28.2: a small per-(tenant, subject) long-term memory cap so the quota path
 # (`{:error, :quota_exceeded}`) is testable without inserting tens of thousands of

@@ -153,7 +153,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       # {:error, :rate_limited_local} BEFORE the paid embedding client is ever
       # reached. Asserting the client is NOT called (0 expectations) proves the cap
       # really gates the worker path, not just the query path (AC-37.2.2).
-      Mox.stub(Loopctl.MockEmbeddingConcurrency, :acquire, fn ->
+      Mox.stub(Loopctl.MockEmbeddingConcurrency, :acquire, fn _tenant_id ->
         {:error, :rate_limited_local}
       end)
 
