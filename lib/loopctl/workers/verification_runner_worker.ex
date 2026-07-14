@@ -19,14 +19,31 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   SHA (`Loopctl.Verification.TestRunner`), writing pass/fail completions for
   long-idle runs. That work is pointless for a run enqueued days ago.
 
-  `perform/1` therefore age-gates on the run's `inserted_at`: a run older than
-  `verification_max_run_age_seconds` (default 24h, config-tunable) is completed as
-  a terminal `"error"` with `reason: "stale_run_skipped"` and the job is `:cancel`led
-  WITHOUT any CI call or repo clone. This bounds the one-time drain to cheap DB
-  writes: a genuinely fresh run (enqueued moments ago by the live
+  `perform/1` therefore age-gates on the run's `inserted_at`, but ONLY for a run that
+  has not yet started (`started_at == nil`): a not-yet-started run older than
+  `verification_max_run_age_seconds` (default 24h, config-tunable) is completed with
+  the terminal `"skipped"` disposition (`reason: "stale_run_skipped"`) and the job is
+  `:cancel`led WITHOUT any CI call or repo clone. This bounds the one-time drain to
+  cheap DB writes: a genuinely fresh run (enqueued moments ago by the live
   `POST /stories/:id/verifications` action) is always inside the window and runs
   normally; a stale accumulated backlog job is retired without side effects. The
   window is retunable via `config :loopctl, :verification_max_run_age_seconds`.
+
+  ### Why `"skipped"`, not `"error"`, and why the `started_at == nil` guard
+
+  A stale-skipped run carries NO verification signal and NO fault — retiring it as
+  `"error"` would conflate a deliberate skip with a genuine failure, so it gets the
+  dedicated `"skipped"` disposition (see `Loopctl.Verification.complete_run/3`).
+  Restricting the gate to not-yet-started runs keeps it a pure backlog-drain bound: it
+  can never complete an in-flight run mid-execution. In particular a run that has
+  begun and is snoozing on `in_progress` CI (`{:snooze, 60}`) is `status: "running"`
+  with `started_at` set, so even if its `inserted_at` ages past the window across
+  snoozes it is NOT killed mid-flight — it stays on the normal path until CI resolves.
+
+  Neither `"skipped"` nor `"error"` ever touches `stories.verified_status` — the run
+  status is observational only; the chain-of-custody verify action is entirely
+  separate (`LoopctlWeb.StoryVerificationController`). This gate is therefore fail-safe
+  for L3 custody: it cannot cause a run to falsely PASS, nor mark a story verified.
   """
 
   use Oban.Worker, queue: :verification, max_attempts: 3
@@ -69,9 +86,14 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
     end
   end
 
-  # A run is stale when it was inserted more than `max_run_age_seconds/0` ago. Uses
-  # `inserted_at` (set atomically with the Oban job in `create_run_and_enqueue/3`),
-  # so age reflects enqueue time regardless of how long the job sat unconsumed.
+  # A run is stale when it has NOT yet started (`started_at == nil`) AND was inserted
+  # more than `max_run_age_seconds/0` ago. Uses `inserted_at` (set atomically with the
+  # Oban job in `create_run_and_enqueue/3`), so age reflects enqueue time regardless of
+  # how long the job sat unconsumed. The `started_at == nil` guard scopes the gate to
+  # the un-started backlog it exists to drain: an already-started run (e.g. one snoozing
+  # on in_progress CI) is never killed mid-flight even if it ages past the window.
+  defp stale_run?(%{started_at: started_at}) when not is_nil(started_at), do: false
+
   defp stale_run?(%{inserted_at: inserted_at}) when not is_nil(inserted_at) do
     DateTime.diff(DateTime.utc_now(), inserted_at, :second) > max_run_age_seconds()
   end
@@ -86,8 +108,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
         "(age #{age_seconds}s > #{max_run_age_seconds()}s) — no CI call / repo clone"
     )
 
+    # `"skipped"`, NOT `"error"`: a deliberate non-execution carries no fault and no
+    # verification signal (see the moduledoc + Verification.complete_run/3).
     {:ok, _} =
-      Verification.complete_run(run, "error", %{
+      Verification.complete_run(run, "skipped", %{
         "reason" => "stale_run_skipped",
         "age_seconds" => age_seconds
       })

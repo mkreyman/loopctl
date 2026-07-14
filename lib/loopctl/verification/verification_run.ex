@@ -10,7 +10,13 @@ defmodule Loopctl.Verification.VerificationRun do
 
   @type t :: %__MODULE__{}
 
-  @statuses ~w(pending running pass fail error)
+  # `skipped` (US-36.1) is a deliberate non-error disposition for a run retired
+  # WITHOUT executing — e.g. a stale backlog job the VerificationRunnerWorker age-gates
+  # before any CI call / repo clone. It is terminal like pass/fail/error but must NOT
+  # be conflated with `error` (a genuine failure): a skip carries no verification
+  # signal and no fault. Kept separate so operators/metrics can tell "we chose not to
+  # run this" apart from "this run failed".
+  @statuses ~w(pending running pass fail error skipped)
 
   # A git object id: lowercase hex only, 7–64 chars (covers an abbreviated SHA,
   # a full SHA-1 (40), and a full SHA-256 (64)). A hex-only value cannot contain

@@ -290,14 +290,19 @@ config :hammer,
 # Oban background jobs
 config :loopctl, Oban,
   repo: Loopctl.Repo,
+  # NB: hand-maintained mirror of Loopctl.ObanConfig.@default_queues — keep in sync
+  # (oban_config_test.exs TC-32.2.1 + oban_queue_topology_test.exs AC-36.1.5 assert it).
+  # US-36.1: `:knowledge` 5 -> 3 + `:default` 10 -> 9 fund `:ingestion` 2 + `:verification`
+  # 1 (rebalance, pool sum stays 38). See ObanConfig's @default_queues comment for the
+  # fast-lane (knowledge=3) rationale.
   queues: [
-    default: 10,
+    default: 9,
     webhooks: 5,
     cleanup: 2,
     analytics: 3,
     maintenance: 2,
     embeddings: 5,
-    knowledge: 2,
+    knowledge: 3,
     ingestion: 2,
     memory: 3,
     audit: 3,

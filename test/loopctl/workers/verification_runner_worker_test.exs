@@ -64,13 +64,43 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       assert {:cancel, :stale_run} = VerificationRunnerWorker.perform(job)
 
       {:ok, reloaded} = Verification.get_run(tenant.id, run.id)
-      assert reloaded.status == "error"
+      # A deliberate skip, NOT an "error" — a stale-skipped run carries no fault and no
+      # verification signal, so it gets the dedicated non-error disposition.
+      assert reloaded.status == "skipped"
+      refute reloaded.status == "error"
       assert reloaded.ac_results["reason"] == "stale_run_skipped"
       assert is_integer(reloaded.ac_results["age_seconds"])
 
       # started_at stays nil — proof the gate short-circuited before start_run and
       # therefore before any CI adapter call or repo clone.
       assert reloaded.started_at == nil
+    end
+
+    test "an already-STARTED run past the window is NOT stale-skipped (gate is un-started-only)" do
+      %{tenant: tenant, story: story} = setup_ctx()
+
+      # A run that has already begun (e.g. one snoozing on in_progress CI): started_at
+      # is set. Even if it ages past the window, the gate must NOT retire it mid-flight
+      # — the age gate exists only to drain the never-started backlog. No commit_sha so
+      # the normal path resolves hermetically (no CI call), a proxy for "it ran".
+      {:ok, run} = Verification.create_run(tenant.id, story.id)
+
+      {:ok, _} = Verification.start_run(run)
+      backdate!(run, 25 * 60 * 60)
+
+      {:ok, started} = Verification.get_run(tenant.id, run.id)
+      assert started.started_at
+
+      job = %Oban.Job{args: %{"run_id" => run.id, "tenant_id" => tenant.id}}
+
+      # It does NOT short-circuit as {:cancel, :stale_run}; it re-enters the normal
+      # path (which, with no commit_sha, completes as error `no_commit_sha` — the point
+      # is that it was NOT retired as a stale skip).
+      refute match?({:cancel, :stale_run}, VerificationRunnerWorker.perform(job))
+
+      {:ok, reloaded} = Verification.get_run(tenant.id, run.id)
+      refute reloaded.status == "skipped"
+      refute reloaded.ac_results["reason"] == "stale_run_skipped"
     end
   end
 

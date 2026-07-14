@@ -49,8 +49,14 @@ defmodule Loopctl.ObanQueueTopologyTest do
 
       assert Keyword.get(queues, :ingestion) == 2
       assert Keyword.get(queues, :verification) == 1
-      # `:knowledge` was rebalanced 5 -> 2 to fund the two new queues (5 = 2+2+1).
-      assert Keyword.get(queues, :knowledge) == 2
+      # `:knowledge` 5 -> 3 + `:default` 10 -> 9 fund the two new lanes (ingestion:2 +
+      # verification:1 = 3 slots, drawn 2 from :knowledge + 1 from over-provisioned
+      # :default). :knowledge keeps a 3-slot fast lane (review: guards the sub-second
+      # ArticleLinkingWorker against a milder head-of-line block from the heavy
+      # per-tenant all_tenants cron passes that also run on :knowledge).
+      assert Keyword.get(queues, :knowledge) == 3
+      # :default gave up one slot to keep the pool budget flat at 38.
+      assert Keyword.get(queues, :default) == 9
     end
 
     test "the total pool budget stays at 38 across 11 queues (no blind capacity add)" do
@@ -105,25 +111,52 @@ defmodule Loopctl.ObanQueueTopologyTest do
   end
 
   describe "TC-36.1.3: head-of-line fix — :knowledge drains independently of :ingestion" do
-    # SCOPE OF THIS TEST: it proves queue SEPARATION structurally, not real under-load
-    # blocking. Running in :manual mode, the ingestion jobs are enqueued but never
-    # execute, so :ingestion is not actually saturated with running work and no
-    # scheduler contention exists. What it asserts is that draining ONLY :knowledge
-    # runs the linking job while leaving the ingestion jobs enqueued — which would FAIL
-    # under the old single-:knowledge topology (the :knowledge drain would also pick up
-    # the ingestion jobs). That structural separation is the mechanism behind the
-    # head-of-line fix: because they are distinct queues/consumers, a saturated
-    # :ingestion cannot occupy :knowledge slots. Truly saturating a queue with running
-    # work requires live concurrency that Oban's testing modes don't model; for a
-    # config-only topology change the separation guarantee is the load-bearing property.
-    test "draining :knowledge runs the linking job while enqueued :ingestion jobs are left untouched (queue separation)" do
+    # WHAT THE NON-BLOCKING GUARANTEE ACTUALLY RESTS ON (review, low — AC-36.1.3 says
+    # "with :ingestion saturated ... a :knowledge job still executes"): for a STATIC
+    # topology change the load-bearing property is not a live race but a structural
+    # invariant — :knowledge and :ingestion are DISTINCT queues with DISJOINT,
+    # independently-sized slot pools, so no amount of :ingestion backlog can ever
+    # consume a :knowledge slot. `saturation cannot cross the boundary` is guaranteed
+    # by construction, not by luck of scheduling. Truly saturating a queue with RUNNING
+    # work needs live concurrency across processes that Oban's testing modes + the ecto
+    # SQL sandbox (async: true) deliberately don't model — so we prove the invariant two
+    # ways: (1) the queues are separate with independent positive widths [the mechanism],
+    # and (2) a :knowledge drain makes progress while an OVER-CAPACITY :ingestion
+    # backlog (more jobs enqueued than :ingestion's width — i.e. saturated-and-queued)
+    # is left entirely untouched [the observable consequence]. Both would FAIL under the
+    # old single-:knowledge topology, where the :knowledge drain also swept up the
+    # ingestion jobs.
+    test "the mechanism: :knowledge and :ingestion are separate queues with disjoint, independently-sized slot pools" do
+      queues = ObanConfig.queues()
+
+      knowledge_width = Keyword.get(queues, :knowledge)
+      ingestion_width = Keyword.get(queues, :ingestion)
+
+      # Distinct queue keys => distinct producers => disjoint slot pools. A job on one
+      # can never occupy a slot on the other, so a saturated :ingestion cannot starve
+      # :knowledge regardless of how deep the ingestion backlog grows.
+      assert :knowledge in Keyword.keys(queues)
+      assert :ingestion in Keyword.keys(queues)
+      assert knowledge_width > 0
+      assert ingestion_width > 0
+      # The workers physically target different queues (module-default), so their jobs
+      # are dispatched by different Oban producers bounded by their own widths.
+      assert ArticleLinkingWorker.__opts__()[:queue] == :knowledge
+      assert ContentIngestionWorker.__opts__()[:queue] == :ingestion
+    end
+
+    test "the consequence: draining :knowledge runs the linking job while an over-capacity :ingestion backlog is left untouched" do
       tenant = fixture(:tenant)
+      ingestion_width = Keyword.get(ObanConfig.queues(), :ingestion)
 
       Oban.Testing.with_testing_mode(:manual, fn ->
-        # Enqueue several long ContentIngestionWorker jobs on :ingestion. In the old
-        # single-queue topology these shared the :knowledge slots, so draining
-        # :knowledge would also consume them; here they must stay put.
-        for _ <- 1..3 do
+        # Enqueue MORE long ContentIngestionWorker jobs than :ingestion has slots — a
+        # saturated-and-backlogged :ingestion queue (every slot would be busy with more
+        # still queued). In the old single-queue topology these shared the :knowledge
+        # slots, so draining :knowledge would also consume them; here they must stay put.
+        ingestion_backlog = ingestion_width + 2
+
+        for _ <- 1..ingestion_backlog do
           {:ok, _} =
             %{
               "tenant_id" => tenant.id,
@@ -144,13 +177,15 @@ defmodule Loopctl.ObanQueueTopologyTest do
         assert_enqueued(worker: ArticleLinkingWorker, queue: :knowledge)
 
         # Draining ONLY :knowledge runs the linking job — it is not stuck behind the
-        # enqueued :ingestion jobs, because they are now separate queues/consumers.
+        # over-capacity :ingestion backlog, because they are now separate queues/consumers.
         assert %{success: 1} = Oban.drain_queue(queue: :knowledge)
 
         # The linking job ran (no longer enqueued)...
         refute_enqueued(worker: ArticleLinkingWorker)
-        # ...while the long ingestion jobs are untouched by the :knowledge drain.
-        assert_enqueued(worker: ContentIngestionWorker, queue: :ingestion)
+        # ...while ALL the long ingestion jobs are untouched by the :knowledge drain
+        # (the whole over-capacity backlog is still queued on :ingestion).
+        assert ingestion_backlog ==
+                 Enum.count(all_enqueued(worker: ContentIngestionWorker, queue: :ingestion))
       end)
     end
   end
