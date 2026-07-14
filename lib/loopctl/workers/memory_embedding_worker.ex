@@ -6,7 +6,13 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   Runs in the `:embeddings` queue. Enqueued by `Loopctl.Memory.remember/2` when a
   long-term memory is written (the row's `embedding` starts NULL). Mirrors
   `Loopctl.Workers.ArticleEmbeddingWorker` — same guarded embed path, content-hash
-  idempotency, and BYO-key / permanent-error discard semantics.
+  idempotency, BYO-key / permanent-error discard semantics, AND the US-36.2 per-tenant
+  fair-share gate at the top of `perform/1`. The gate is load-bearing here, not
+  cosmetic: `:embeddings` is shared by TWO tenant-scoped per-item fan-out producers
+  (this worker and `ArticleEmbeddingWorker`), and the gate counts executing slots by
+  `(queue, state, tenant)` regardless of worker — so an ungated memory-embed burst
+  would monopolize the queue against BOTH producers. Both must gate for fairness to
+  hold (see `Loopctl.Oban.FairShare`).
 
   ## Flow
 
@@ -48,18 +54,34 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Memory
+  alias Loopctl.Oban.FairShare
 
   @worker_yield_ms 8_000
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"memory_id" => memory_id, "tenant_id" => tenant_id}}) do
-    case Memory.get_memory_for_embedding(tenant_id, memory_id) do
-      {:error, :not_found} ->
-        # Memory deleted -- no-op.
-        :ok
+  def perform(%Oban.Job{id: id, args: %{"memory_id" => memory_id, "tenant_id" => tenant_id}}) do
+    # US-36.2: per-tenant fair-share gate. `:embeddings` is a CONTENDED queue with TWO
+    # tenant-scoped per-item fan-out producers — this worker (one job per long-term
+    # memory, Memory.remember/2) AND ArticleEmbeddingWorker. Gating only the article
+    # worker would leave this producer free to monopolize all executing slots with one
+    # tenant's memory-embed burst (a bulk `memory_remember` or a MemoryPromotionSweep
+    # promoting many session memories), starving other tenants — the exact
+    # monopolization the story exists to stop. Yield the slot (loss-free {:snooze, n},
+    # no attempt consumed) when this tenant already holds at/above its fair share.
+    # `id` excludes THIS (already-executing) job from its own count — see FairShare.
+    case FairShare.gate(tenant_id, :embeddings, id) do
+      {:snooze, _n} = snooze ->
+        snooze
 
-      {:ok, memory} ->
-        generate_and_store(memory, tenant_id, memory_id)
+      :ok ->
+        case Memory.get_memory_for_embedding(tenant_id, memory_id) do
+          {:error, :not_found} ->
+            # Memory deleted -- no-op.
+            :ok
+
+          {:ok, memory} ->
+            generate_and_store(memory, tenant_id, memory_id)
+        end
     end
   end
 

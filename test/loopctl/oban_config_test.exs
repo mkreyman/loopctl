@@ -236,6 +236,57 @@ defmodule Loopctl.ObanConfigTest do
     end
   end
 
+  describe "tenant_fair_share_cap/1 + fair_share_config/0 (US-36.2)" do
+    test "derives ceil(width/2) floored at 1 from the queue width when unset" do
+      assert ObanConfig.tenant_fair_share_cap(:embeddings) == 3
+      assert ObanConfig.tenant_fair_share_cap(:knowledge) == 2
+      assert ObanConfig.tenant_fair_share_cap(:ingestion) == 1
+      assert ObanConfig.tenant_fair_share_cap(:verification) == 1
+    end
+
+    test "a malformed cap fails LOUD (raises) rather than silently defaulting" do
+      # Called at gate time, but the crash surfaces there rather than fail-open — and
+      # fair_share_config/0 (below) forces this same parse at BOOT so it never gets
+      # that far in a running node.
+      assert_raise ArgumentError, ~r/positive integer/, fn ->
+        ObanConfig.queue_size("bogus", 3)
+      end
+    end
+
+    test "fair_share_config/0 resolves every cap + the snooze base/jitter (CI defaults)" do
+      config = ObanConfig.fair_share_config()
+
+      # One cap per configured queue, all >= 1 (the never-wedge invariant).
+      assert Keyword.keys(config.caps) == Keyword.keys(ObanConfig.queues())
+      assert Enum.all?(config.caps, fn {_q, cap} -> cap >= 1 end)
+      assert Keyword.get(config.caps, :embeddings) == 3
+      assert config.snooze_base_seconds == 5
+      assert config.snooze_jitter_seconds == 5
+    end
+
+    @tag :tmp_dir
+    test "a malformed OBAN_TENANT_FAIRSHARE_<QUEUE> cap aborts boot (fail-loud, like OBAN_QUEUE_*)",
+         %{tmp_dir: tmp_dir} do
+      # config/runtime.exs evaluates `ObanConfig.fair_share_config()` at the top level,
+      # so a fat-fingered cap fails LOUD at boot (non-zero exit) instead of surviving to
+      # gate call-time where the count path fails OPEN and would SILENTLY disable
+      # fairness on that queue. This is the US-36.2 medium finding's fix.
+      {output, exit_code} = run_boot(tmp_dir, [{"OBAN_TENANT_FAIRSHARE_EMBEDDINGS", "lots"}])
+
+      assert exit_code != 0
+      assert output =~ "positive integer"
+    end
+
+    @tag :tmp_dir
+    test "a malformed OBAN_TENANT_FAIRSHARE_SNOOZE_JITTER aborts boot too",
+         %{tmp_dir: tmp_dir} do
+      {output, exit_code} = run_boot(tmp_dir, [{"OBAN_TENANT_FAIRSHARE_SNOOZE_JITTER", "-1"}])
+
+      assert exit_code != 0
+      assert output =~ "non-negative integer"
+    end
+  end
+
   # Runs `script` (must bind a `result` variable) in a fresh `mix run --no-start`
   # subprocess with `env` applied ONLY to that child process, then reads back the
   # term `script` wrote to `result_path` via :erlang.term_to_binary/1. Keeps this

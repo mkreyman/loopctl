@@ -4,12 +4,24 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorkerTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
   alias Loopctl.Memory
+  alias Loopctl.ObanConfig
   alias Loopctl.Workers.MemoryEmbeddingWorker
 
   defp job(memory_id, tenant_id) do
     %Oban.Job{args: %{"memory_id" => memory_id, "tenant_id" => tenant_id}}
+  end
+
+  # Seed a raw executing oban_jobs row (no RLS on oban_jobs → AdminRepo) to occupy a
+  # tenant's :embeddings slot, exactly as FairShare counts it. Direct insert does NOT
+  # run the job (unlike Oban.insert under :inline).
+  defp seed_executing_embedding(tenant_id, worker) do
+    %{"tenant_id" => tenant_id}
+    |> Oban.Job.new(worker: worker, queue: "embeddings")
+    |> Ecto.Changeset.put_change(:state, "executing")
+    |> AdminRepo.insert!()
   end
 
   describe "perform/1 success" do
@@ -31,6 +43,58 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorkerTest do
       {:ok, reloaded} = Memory.get_memory_for_embedding(tenant.id, memory.id)
       refute is_nil(reloaded.embedding)
       assert is_binary(reloaded.embedding_content_hash)
+    end
+  end
+
+  # --- US-36.2: per-tenant fair-share gate on the contended :embeddings queue ---
+  #
+  # :embeddings has TWO tenant-scoped per-item fan-out producers — this worker AND
+  # ArticleEmbeddingWorker — and the gate counts executing slots by (queue, state,
+  # tenant) regardless of worker. So this worker MUST gate too, else a one-tenant
+  # memory-embed burst monopolizes the queue against BOTH producers.
+  describe "perform/1 fair-share gate (US-36.2)" do
+    test "snoozes (loss-free) when the tenant is at/above its :embeddings fair share" do
+      tenant = fixture(:tenant)
+      cap = ObanConfig.tenant_fair_share_cap(:embeddings)
+
+      # `cap` of the tenant's embedding jobs are already executing (lower ids)...
+      for _ <- 1..cap do
+        seed_executing_embedding(tenant.id, "Loopctl.Workers.ArticleEmbeddingWorker")
+      end
+
+      # ...so THIS memory-embed job (higher id → rank cap >= cap) is over its fair share.
+      # It must snooze at the TOP of perform/1 — no provider call, no memory fetch.
+      this_job = seed_executing_embedding(tenant.id, "Loopctl.Workers.MemoryEmbeddingWorker")
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _t, _text ->
+        flunk("provider must not be called when the fair-share gate snoozes")
+      end)
+
+      assert {:snooze, _n} =
+               MemoryEmbeddingWorker.perform(%Oban.Job{
+                 id: this_job.id,
+                 args: %{"memory_id" => Ecto.UUID.generate(), "tenant_id" => tenant.id}
+               })
+    end
+
+    test "runs (embeds) when the tenant is under its :embeddings fair share" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      memory = fixture(:memory, %{tenant_id: tenant.id, subject_id: "s", text: "under cap"})
+
+      # No other executing embedding jobs for this tenant → rank 0 < cap → gate passes.
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, List.duplicate(0.2, 1536)}
+      end)
+
+      assert :ok =
+               MemoryEmbeddingWorker.perform(%Oban.Job{
+                 id: 1,
+                 args: %{"memory_id" => memory.id, "tenant_id" => tenant.id}
+               })
+
+      {:ok, reloaded} = Memory.get_memory_for_embedding(tenant.id, memory.id)
+      refute is_nil(reloaded.embedding)
     end
   end
 

@@ -69,6 +69,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.VectorSearch
+  alias Loopctl.Oban.FairShare
 
   # Compile-time DI for the similarity lookup. The worker uses this to fetch
   # nearest-neighbour candidates; in tests it resolves to a Mox mock, in prod to VectorSearch.
@@ -79,7 +80,21 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
                      )
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"article_id" => article_id, "tenant_id" => tenant_id} = args}) do
+  def perform(%Oban.Job{
+        id: id,
+        args: %{"article_id" => article_id, "tenant_id" => tenant_id} = args
+      }) do
+    # US-36.2: per-tenant fair-share gate on the hot :knowledge queue (this worker
+    # fires on every knowledge_create). Yield loss-free ({:snooze, n}, no attempt
+    # consumed) when this tenant is at/above its fair share of executing slots.
+    # `id` excludes THIS (already-executing) job from its own count — see FairShare.
+    case FairShare.gate(tenant_id, :knowledge, id) do
+      {:snooze, _n} = snooze -> snooze
+      :ok -> link(article_id, tenant_id, args)
+    end
+  end
+
+  defp link(article_id, tenant_id, args) do
     case Knowledge.get_article_with_embedding(tenant_id, article_id) do
       {:error, :not_found} ->
         # Article deleted -- no-op

@@ -19,6 +19,7 @@ defmodule Loopctl.Workers.RetrievalMetricsWorker do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge.RetrievalMetrics
+  alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
 
   @impl Oban.Worker
@@ -32,7 +33,17 @@ defmodule Loopctl.Workers.RetrievalMetricsWorker do
     :ok
   end
 
-  def perform(%Oban.Job{args: %{"tenant_id" => tenant_id} = args}) do
+  def perform(%Oban.Job{id: id, args: %{"tenant_id" => tenant_id} = args}) do
+    # US-36.2: fair-share gate on the shared :knowledge queue (the all_tenants
+    # dispatcher clause above is NOT gated — it has no tenant_id). `id` excludes THIS
+    # (already-executing) job from its own count — see FairShare.
+    case FairShare.gate(tenant_id, :knowledge, id) do
+      {:snooze, _n} = snooze -> snooze
+      :ok -> snapshot_tenant(tenant_id, args)
+    end
+  end
+
+  defp snapshot_tenant(tenant_id, args) do
     day = day_arg(args)
 
     case RetrievalMetrics.snapshot(tenant_id, day) do
