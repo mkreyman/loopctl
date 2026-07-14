@@ -1,0 +1,52 @@
+{
+  "id": "US-37.2",
+  "title": "Bound the interactive embedding path with a supervised, per-node concurrency cap",
+  "epic": { "id": "epic_37", "name": "Outbound Provider Admission Control & Backpressure" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "The default `combined` search embeds the query SYNCHRONOUSLY in the web/MCP request process via a bare Task.async with no pool or cap — so the Oban embeddings:5 limit that appears to bound outbound embedding load is ILLUSORY for interactive traffic. A traffic spike spawns unbounded concurrent outbound embedding calls, directly feeding the 429 storm.",
+  "background": {
+    "reference": "GH #352. Interactive path: knowledge.ex search_combined/3 (:6186) -> do_combined_search/5 -> try_generate_embedding -> generate_embedding/3 (:7326) -> run_embedding_task/3 (:7341), call site knowledge.ex:7343 Task.async(fn -> embedding_client().generate_embedding(...) end) with Task.yield||Task.shutdown at :7351 (5s budget). One UNBOUNDED Task per request; no Task.Supervisor, no semaphore. hybrid_search/3 (:6636) reuses search_combined so it inherits this. The Oban embeddings:5 cap (config/config.exs:304) bounds ONLY background jobs (ArticleEmbeddingWorker/MemoryEmbeddingWorker), not interactive web/MCP embeddings.",
+    "includes": "The fix is a per-node bound on concurrent outbound embedding calls that gates EVERY generate_embedding entry (web AND Oban), e.g. a supervised Task.Supervisor + a counting semaphore (or a small pool). When the cap is reached, the interactive path degrades to keyword search (same as :circuit_open / US-37.1's :rate_limited_local), never blocking the request indefinitely."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "cap the number of concurrent outbound embedding calls per node and run them under a supervisor, gating both the interactive query path and the Oban workers through the same bound",
+    "so_that": "a spike of interactive searches can't spawn unbounded concurrent provider embedding requests — outbound embedding concurrency is bounded everywhere, not just in background jobs"
+  },
+  "rationale": "Bounding interactive embedding concurrency closes the biggest hole in outbound load control: the query path currently bypasses every limit. A supervised, capped mechanism (Task.Supervisor + semaphore) that both web and Oban call gives one real ceiling on concurrent provider embedding calls per node, and lets the interactive path shed load to keyword search when saturated instead of piling on the provider or blocking the request.",
+  "acceptance_criteria": [
+    { "id": "AC-37.2.1", "description": "Concurrent outbound embedding calls are bounded per node by a config-driven cap. The bare Task.async at knowledge.ex:7343 is replaced with a supervised task (Task.Supervisor) whose concurrency is gated by a semaphore/pool so at most N embedding calls run at once across the node. The interactive request keeps its bounded wait (existing ~5s yield budget) and does not block indefinitely.", "status": "pending" },
+    { "id": "AC-37.2.2", "description": "The SAME bound gates every generate_embedding entry point — both the interactive path AND the Oban embedding workers (ArticleEmbeddingWorker/MemoryEmbeddingWorker) go through it — so the per-node ceiling is real, not bypassable by the query path. A test asserts interactive embedding calls are subject to the cap.", "status": "pending" },
+    { "id": "AC-37.2.3", "description": "Saturation degrades gracefully: when the cap is reached (or the acquire times out within the request budget), the interactive search falls back to keyword search (same path as :circuit_open / :rate_limited_local) — never a 500 and never an unbounded wait. Test asserts the fallback under saturation.", "status": "pending" },
+    { "id": "AC-37.2.4", "description": "The cap is env-driven (SystemConfig/config-based DI) with a sensible default sized against the pool/provider budget; no Application.put_env in tests. Node-local (a supervisor + semaphore per node) — distributed coordination is out of scope (Epic 38).", "status": "pending" },
+    { "id": "AC-37.2.5", "description": "Resilience: an embedding task crash never crashes the request process or the supervisor (isolated under Task.Supervisor; failures surface as the existing embedding-error/fallback, not a caller crash). Happy path (under the cap) is unchanged — a normal search still returns semantic results with no added latency beyond acquiring an available slot. Assert OUTCOME class (capped/fell-back), not exact concurrency at an instant.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-37.2.1", "name": "interactive embedding is bounded", "type": "integration",
+      "preconditions": ["cap set low (e.g. 1); a slow embedding stub"],
+      "steps": ["fire several concurrent combined searches"],
+      "expected_results": ["no more than the cap run concurrently; excess either wait briefly or fall back — never unbounded fan-out"], "status": "pending" },
+    { "id": "TC-37.2.2", "name": "saturation → keyword fallback", "type": "integration",
+      "preconditions": ["cap saturated"],
+      "steps": ["issue another combined search"],
+      "expected_results": ["keyword-search results returned; no 500; no indefinite block"], "status": "pending" },
+    { "id": "TC-37.2.3", "name": "embedding task crash is isolated", "type": "integration",
+      "preconditions": ["embedding stub raises"],
+      "steps": ["run a combined search"],
+      "expected_results": ["request survives; returns fallback/empty-semantic, not a caller crash"], "status": "pending" },
+    { "id": "TC-37.2.4", "name": "happy path unchanged", "type": "integration",
+      "preconditions": ["cap ample; embedding stub returns a vector"],
+      "steps": ["run a combined search"],
+      "expected_results": ["semantic results returned as today"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/knowledge.ex (run_embedding_task/3 ~:7341-7351 — replace Task.async with Task.Supervisor.async_nolink under a semaphore), a new supervised concurrency limiter (semaphore/pool) added to the app supervision tree, the Oban embedding workers to route through the same acquire, SystemConfig for the cap.",
+    "A DynamicSupervisor/Task.Supervisor needs a name: in its child spec (Elixir guideline). Keep the existing yield/shutdown timeout so the request budget is preserved.",
+    "Gate acquire must be non-blocking-with-timeout for the interactive path (fall back on timeout) but may block briefly for background workers (or they snooze). Reuse US-36.2 FairShare-style outcome-class testing; do NOT assert exact instantaneous concurrency (async-suite flake lesson).",
+    "Config-based DI for the cap; document default. Node-local; cluster-wide coordination deferred to Epic 38.",
+    "Careful with Task.Supervisor.async_stream_nolink + Mox $callers under the parallel suite (known flake) — assert outcome class, allow stub via set_mox_from_context."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 350000
+}

@@ -1,0 +1,51 @@
+{
+  "id": "US-37.4",
+  "title": "Batch background embeddings into arrays (~100), map results back by index",
+  "epic": { "id": "epic_37", "name": "Outbound Provider Admission Control & Backpressure" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "Embeddings go out one text per request even though the endpoint accepts arrays of ~100. Under a bulk ingest that is 100x the request count against the provider — pure amplification of the outbound load this epic is trying to bound. Batching collapses it.",
+  "background": {
+    "reference": "GH #352. embedding_client.ex:65 json: %{input: text, model: model} — a SINGLE string per request; generate_embedding/2 takes one text (:42). No array/batch path. Background embedding workers (ArticleEmbeddingWorker, MemoryEmbeddingWorker) each embed one record's text per job, so N ingested items = N separate provider round-trips.",
+    "includes": "OpenAI-compatible embedding endpoints accept `input` as an ARRAY and return data entries with an `index` field. Batching background embeddings into arrays of ~100 (config) and mapping each returned vector back to its source record BY INDEX cuts provider round-trips ~100x for bulk work. This composes with US-37.1 (each batch takes one token) and US-37.2 (fewer concurrent calls). Interactive single-query embedding stays single (latency-sensitive)."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "send background embedding requests as arrays of up to ~100 texts and map each returned vector back to its source record by the response index",
+    "so_that": "a bulk ingest makes ~1 provider request per 100 items instead of one per item, drastically cutting outbound request volume (and the 429 pressure) without changing which vectors each record gets"
+  },
+  "rationale": "The endpoint already supports array input; issuing one text per request is the single biggest multiplier on background provider request count. Batching is a well-bounded, correctness-preserving change (same model, same per-text vector, just fewer HTTP calls) that directly reduces the outbound storm surface and pairs with the admission/concurrency controls in this epic.",
+  "acceptance_criteria": [
+    { "id": "AC-37.4.1", "description": "EmbeddingClient gains a batch path that sends `input` as an array of up to a config-driven max (~100) texts in one Req.post and returns vectors mapped to inputs BY the response `index` field (never by array position assumption — use the returned index), preserving input order. A test with a multi-item batch asserts each input gets its correct vector.", "status": "pending" },
+    { "id": "AC-37.4.2", "description": "Background embedding generation uses the batch path: the embedding worker(s) accumulate/receive multiple records and embed them in array batches (chunked to the max). The interactive single-query path is UNCHANGED (still single-text, latency-sensitive). A test asserts background embedding of M records issues ceil(M/batch_max) provider calls, not M.", "status": "pending" },
+    { "id": "AC-37.4.3", "description": "Correctness preserved: each record receives the same vector it would have from a single-text call (same model/dimensions). A test compares single-vs-batch vectors for identical inputs (with a deterministic stub) and asserts equality per index. Partial failure handling: if the provider errors, the batch fails/retries as a unit (no silent half-write of vectors).", "status": "pending" },
+    { "id": "AC-37.4.4", "description": "Batch size is env-driven (SystemConfig) with a documented default (~100); chunking respects both the size cap and any provider/token limits. Each batch takes ONE token from the US-37.1 bucket. Tenant isolation preserved (a batch only contains one tenant's texts). No Application.put_env in tests.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-37.4.1", "name": "array request maps vectors by index", "type": "integration",
+      "preconditions": ["embedding stub returns data entries with index + vector for an array input"],
+      "steps": ["embed a batch of 3 distinct texts"],
+      "expected_results": ["each text gets its corresponding vector by response index; order preserved"], "status": "pending" },
+    { "id": "TC-37.4.2", "name": "M records => ceil(M/batch) calls", "type": "integration",
+      "preconditions": ["batch_max e.g. 100; 250 records"],
+      "steps": ["run background embedding"],
+      "expected_results": ["3 provider calls, not 250"], "status": "pending" },
+    { "id": "TC-37.4.3", "name": "batch vector == single vector", "type": "integration",
+      "preconditions": ["deterministic embedding stub"],
+      "steps": ["embed the same texts single vs batched"],
+      "expected_results": ["identical vector per input"], "status": "pending" },
+    { "id": "TC-37.4.4", "name": "batch failure retries as a unit", "type": "integration",
+      "preconditions": ["provider errors mid-batch"],
+      "steps": ["run the batch"],
+      "expected_results": ["no partial vector writes; batch retried/failed as a whole"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/knowledge/embedding_client.ex (:42/:65 — add generate_embeddings/2 array path alongside the single generate_embedding/2), the background embedding worker(s) (article_embedding_worker.ex / memory_embedding_worker.ex — batch accumulation or a batch worker), SystemConfig for batch_max.",
+    "Map by the response `index` field, not by position — OpenAI-compatible responses include it and order is not guaranteed. Chunk_every(batch_max); watch provider token limits per request.",
+    "Keep the single-text interactive path for latency. Background batching should compose with US-37.1 (one token per batch) and US-37.2 (one concurrency slot per batch).",
+    "Partial-failure: treat a batch atomically (retry/fail whole) so no record is left with a wrong/missing vector. Config-based DI; document default; no Application.put_env in tests.",
+    "Correctness test (single==batch per index) is the safety net — this is an efficiency change, not a semantic one."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 350000
+}
