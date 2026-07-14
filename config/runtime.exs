@@ -43,7 +43,16 @@ config :loopctl, LoopctlWeb.Endpoint,
 # with the compile-time one (a queue key present in config.exs but omitted here would
 # be preserved, not dropped), but `Loopctl.ObanConfig.queues/0` always re-lists every
 # default queue anyway so the env-tunability guarantee holds unconditionally.
-config :loopctl, Oban, queues: Loopctl.ObanConfig.queues()
+#
+# US-35.3: the Oban `:plugins` list (Cron crontab + Lifeline + Pruner + Reindexer) is
+# ALSO owned here, via `Loopctl.ObanConfig.plugins/0`, so the all-tenants
+# ComputeSthWorker safety-sweep schedule is driven by `STH_SWEEP_CRON` and is
+# tunable/revertible per environment without a deploy. Unlike `queues:` (a keyword list
+# `Config` deep-merges), `:plugins` is a plain list `Config` REPLACES wholesale — so it
+# must be set from a single owner (here). `config/config.exs` no longer sets `plugins:`.
+config :loopctl, Oban,
+  queues: Loopctl.ObanConfig.queues(),
+  plugins: Loopctl.ObanConfig.plugins()
 
 # Cloak Vault — key from environment in all environments where CLOAK_KEY is set.
 # In production, CLOAK_KEY is required — startup fails if it is missing.
