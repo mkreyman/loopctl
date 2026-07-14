@@ -59,6 +59,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Workers.ArticleEmbeddingWorker
   alias Loopctl.Workers.ArticleLinkingWorker
@@ -89,7 +90,18 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     :ok
   end
 
-  def perform(%Oban.Job{args: %{"tenant_id" => tenant_id}}) do
+  def perform(%Oban.Job{id: id, args: %{"tenant_id" => tenant_id}}) do
+    # US-36.2: fair-share gate on the shared :knowledge queue (do NOT gate the
+    # all_tenants dispatcher clause above — it carries no tenant_id). Yield loss-free
+    # when this tenant is at/above its fair share of executing slots. `id` excludes
+    # THIS (already-executing) job from its own count — see FairShare.
+    case FairShare.gate(tenant_id, :knowledge, id) do
+      {:snooze, _n} = snooze -> snooze
+      :ok -> lint_tenant(tenant_id)
+    end
+  end
+
+  defp lint_tenant(tenant_id) do
     {:ok, report} = Knowledge.lint(tenant_id, max_per_category: @lint_max_per_category)
 
     action = act_on_orphans(tenant_id, report)

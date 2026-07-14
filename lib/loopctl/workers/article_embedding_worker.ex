@@ -50,6 +50,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
+  alias Loopctl.Oban.FairShare
   alias Loopctl.Workers.ArticleLinkingWorker
 
   # Longer Task.yield budget than the interactive query path: a background embed can
@@ -60,7 +61,18 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   @max_text_length 32_000
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"article_id" => article_id, "tenant_id" => tenant_id}}) do
+  def perform(%Oban.Job{id: id, args: %{"article_id" => article_id, "tenant_id" => tenant_id}}) do
+    # US-36.2: per-tenant fair-share gate. Yield the :embeddings slot (loss-free
+    # {:snooze, n}, no attempt consumed) when this tenant already holds at/above its
+    # fair share of executing slots, so one tenant's bulk burst can't monopolize.
+    # `id` excludes THIS (already-executing) job from its own count — see FairShare.
+    case FairShare.gate(tenant_id, :embeddings, id) do
+      {:snooze, _n} = snooze -> snooze
+      :ok -> embed(tenant_id, article_id)
+    end
+  end
+
+  defp embed(tenant_id, article_id) do
     case Knowledge.get_article_with_embedding(tenant_id, article_id) do
       {:error, :not_found} ->
         # Article deleted -- no-op

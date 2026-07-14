@@ -35,6 +35,7 @@ defmodule Loopctl.Workers.PromotionEvalWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Memory.PromotionEval
+  alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
 
   @impl Oban.Worker
@@ -58,7 +59,21 @@ defmodule Loopctl.Workers.PromotionEvalWorker do
     :ok
   end
 
-  def perform(%Oban.Job{args: %{"tenant_id" => tenant_id}}) do
+  def perform(%Oban.Job{id: id, args: %{"tenant_id" => tenant_id}}) do
+    # US-36.2: fair-share gate on the shared :knowledge queue — this is the SEVENTH
+    # tenant-scoped :knowledge worker (oban_config.ex enumerates it as a reason to
+    # size the lane at width 3), a not-sub-second per-tenant extraction LLM call fanned
+    # out over all keyed tenants daily. Gate it consistently with the other six so a
+    # tenant's promotion-eval can't exceed its fair share of executing :knowledge slots
+    # (the all_tenants dispatcher clause above stays UNGATED — it has no tenant_id).
+    # `id` excludes THIS (already-executing) job from its own count — see FairShare.
+    case FairShare.gate(tenant_id, :knowledge, id) do
+      {:snooze, _n} = snooze -> snooze
+      :ok -> run_eval(tenant_id)
+    end
+  end
+
+  defp run_eval(tenant_id) do
     case PromotionEval.run(tenant_id: tenant_id) do
       {:ok, snap} ->
         Logger.info(

@@ -45,6 +45,7 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Knowledge
+  alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
 
   @default_min_tag_count 25
@@ -96,7 +97,17 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
     :ok
   end
 
-  def perform(%Oban.Job{args: %{"tenant_id" => tenant_id}}) do
+  def perform(%Oban.Job{id: id, args: %{"tenant_id" => tenant_id}}) do
+    # US-36.2: fair-share gate on the shared :knowledge queue (the all_tenants
+    # dispatcher clause above is NOT gated — it has no tenant_id). `id` excludes THIS
+    # (already-executing) job from its own count — see FairShare.
+    case FairShare.gate(tenant_id, :knowledge, id) do
+      {:snooze, _n} = snooze -> snooze
+      :ok -> build_moc(tenant_id)
+    end
+  end
+
+  defp build_moc(tenant_id) do
     min_count =
       Application.get_env(:loopctl, :knowledge_moc_min_tag_count, @default_min_tag_count)
 

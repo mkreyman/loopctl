@@ -131,6 +131,93 @@ defmodule Loopctl.ObanConfig do
     end
   end
 
+  # --- US-36.2: per-tenant in-flight fair-share caps + snooze backoff ---
+  #
+  # The contended-queue workers (ArticleEmbeddingWorker on :embeddings,
+  # ContentIngestionWorker on :ingestion, the :knowledge relationship/cron-child
+  # workers) yield `{:snooze, n}` at the top of their tenant-scoped perform/1 when
+  # the tenant already occupies at/above its fair share of that queue's EXECUTING
+  # slots (see `Loopctl.Oban.FairShare`). Cap K is DERIVED from the queue width so it
+  # scales automatically when a width is retuned via `OBAN_QUEUE_<NAME>`.
+  #
+  # Default cap = `ceil(width / 2)`, floored at 1 — a single tenant may hold at most
+  # ~half a contended queue's concurrency, leaving the rest for other tenants, e.g.
+  # embeddings(5)->3, knowledge(3)->2, ingestion(2)->1. The floor of 1 is CRITICAL:
+  # the cap must ALWAYS admit at least one slot per tenant so the gate can never wedge
+  # a queue (all jobs snoozing forever) — see the US-36.2 SECURITY note.
+  #
+  # Live-tunable per queue via `OBAN_TENANT_FAIRSHARE_<NAME>` (e.g. loosen fairness
+  # during an incident with `fly secrets set OBAN_TENANT_FAIRSHARE_EMBEDDINGS=5` +
+  # restart — no deploy). Snooze backoff (default 5s base + 0..5s jitter → 5–10s) is
+  # tunable via `OBAN_TENANT_FAIRSHARE_SNOOZE_SECONDS` / `_SNOOZE_JITTER`. Config-based
+  # DI (read via `System.get_env/1` at call time), same as `queues/0` — NEVER
+  # `Application.compile_env`, which would record a boot-aborting compile-env
+  # dependency (see the @default_queues note above).
+  @default_fair_share_snooze_base_seconds 5
+  @default_fair_share_snooze_jitter_seconds 5
+
+  @doc """
+  The per-tenant fair-share cap (K) for `queue`: the number of that queue's EXECUTING
+  slots one tenant may occupy before its next job snoozes (US-36.2).
+
+  Resolves `OBAN_TENANT_FAIRSHARE_<QUEUE>` if set (positive integer, else raises like
+  `queue_size/2`), otherwise DERIVES `ceil(width / 2)` from the current queue width,
+  floored at 1. Always `>= 1` so the gate can never wedge the queue.
+  """
+  @spec tenant_fair_share_cap(atom()) :: pos_integer()
+  def tenant_fair_share_cap(queue) when is_atom(queue) do
+    width = Keyword.get(queues(), queue, 1)
+    # div(width + 1, 2) == ceil(width / 2) for positive widths; max(_, 1) is defensive
+    # (a width of 1 already yields 1) and encodes the "always >= 1 slot" invariant.
+    derived = max(div(width + 1, 2), 1)
+    env_var = "OBAN_TENANT_FAIRSHARE_" <> String.upcase(Atom.to_string(queue))
+    queue_size(System.get_env(env_var), derived)
+  end
+
+  @doc """
+  The base (minimum) fair-share snooze interval in seconds (US-36.2), from
+  `OBAN_TENANT_FAIRSHARE_SNOOZE_SECONDS` (positive integer, else raises), default
+  #{@default_fair_share_snooze_base_seconds}.
+  """
+  @spec fair_share_snooze_base_seconds() :: pos_integer()
+  def fair_share_snooze_base_seconds do
+    queue_size(
+      System.get_env("OBAN_TENANT_FAIRSHARE_SNOOZE_SECONDS"),
+      @default_fair_share_snooze_base_seconds
+    )
+  end
+
+  @doc """
+  The fair-share snooze JITTER span in seconds (US-36.2): the snooze is
+  `base + rand(0..jitter)`. From `OBAN_TENANT_FAIRSHARE_SNOOZE_JITTER` (NON-negative
+  integer — 0 disables jitter — else raises), default
+  #{@default_fair_share_snooze_jitter_seconds}.
+  """
+  @spec fair_share_snooze_jitter_seconds() :: non_neg_integer()
+  def fair_share_snooze_jitter_seconds do
+    non_neg_size(
+      System.get_env("OBAN_TENANT_FAIRSHARE_SNOOZE_JITTER"),
+      @default_fair_share_snooze_jitter_seconds
+    )
+  end
+
+  # Like `queue_size/2` but admits 0 (a valid "no jitter" value). Still fails loud on
+  # a present-but-malformed / negative value rather than silently defaulting.
+  @spec non_neg_size(String.t() | nil, non_neg_integer()) :: non_neg_integer()
+  defp non_neg_size(nil, default) when is_integer(default) and default >= 0, do: default
+
+  defp non_neg_size(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {size, ""} when size >= 0 ->
+        size
+
+      _ ->
+        raise ArgumentError,
+              "OBAN_TENANT_FAIRSHARE_SNOOZE_JITTER must be a non-negative integer, " <>
+                "got: #{inspect(value)} (default: #{default})"
+    end
+  end
+
   # US-35.3: default safety-sweep interval for the all-tenants ComputeSthWorker cron.
   # Every 5 minutes — a low-frequency backstop that only catches appends the
   # event-driven enqueuer (US-35.2) missed. Down from the old `"* * * * *"` per-minute

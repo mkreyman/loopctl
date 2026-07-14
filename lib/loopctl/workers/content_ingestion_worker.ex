@@ -58,6 +58,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Net.UrlGuard
+  alias Loopctl.Oban.FairShare
   alias Loopctl.SystemConfig
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
@@ -134,6 +135,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   @impl Oban.Worker
   def perform(%Oban.Job{
+        id: id,
         args:
           %{
             "tenant_id" => tenant_id,
@@ -141,6 +143,21 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
             "content_hash" => content_hash
           } = args
       }) do
+    # US-36.2: per-tenant fair-share gate on the :ingestion queue. These are long
+    # (~6-min) LLM jobs, so one tenant's bulk ingest can otherwise hold both slots
+    # for many minutes. Yield loss-free ({:snooze, n}, no attempt consumed) BEFORE
+    # any fetch/LLM work when this tenant is at/above its fair share of executing
+    # slots; the deterministic content_hash uniqueness means the snoozed job resumes
+    # the same work later. `id` excludes THIS (already-executing) job from its own
+    # count — CRITICAL on :ingestion (cap=1), where self-counting would wedge the
+    # queue permanently (every lone job would snooze forever). See FairShare.
+    case FairShare.gate(tenant_id, :ingestion, id) do
+      {:snooze, _n} = snooze -> snooze
+      :ok -> ingest(tenant_id, source_type, content_hash, args)
+    end
+  end
+
+  defp ingest(tenant_id, source_type, content_hash, args) do
     url = args["url"]
     raw_content = args["content"]
     # Normalize "" -> nil (a blank project_id is "tenant-wide", not a value to dump
