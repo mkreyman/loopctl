@@ -77,8 +77,10 @@ defmodule Loopctl.AuditChain do
       {:ok, %{insert_entry: entry}} ->
         # US-26.5.1: broadcast new entry to the tenant's per-tenant subscribers.
         ChainPubSub.broadcast_entry(tenant_id, entry)
-        # US-35.2: ALSO broadcast to the fixed cross-tenant firehose so the
-        # supervised SthEnqueuer can activity-gate STH computation. Additive and
+        # US-35.2: ALSO broadcast a MINIMAL tenant-scoped notification to the
+        # fixed cross-tenant firehose so the supervised SthEnqueuer can
+        # activity-gate STH computation. Only entry.tenant_id crosses this shared
+        # topic (never the entry payload/actor_lineage). Additive and
         # fire-and-forget — it never changes or gates the existing per-tenant
         # broadcast, and a firehose delivery fault never affects the append.
         ChainPubSub.broadcast_entry_firehose(entry)

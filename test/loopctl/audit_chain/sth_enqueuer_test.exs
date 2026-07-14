@@ -87,11 +87,19 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
       assert per_tenant_entry.tenant_id == tenant.id
       assert per_tenant_entry.chain_position == entry.chain_position
 
-      # New: the SAME message shape ALSO lands on the fixed firehose topic,
-      # carrying entry.tenant_id (the subscriber's only tenant-scoping input).
-      # Select this entry by id to ignore concurrent tests' firehose traffic.
-      assert_receive {:audit_chain_entry, %{id: ^entry_id} = firehose_entry}, 1_000
-      assert firehose_entry.tenant_id == tenant.id
+      # New: a MINIMAL tenant-scoped notification ALSO lands on the fixed firehose
+      # topic — same {:audit_chain_entry, _} tuple tag, but the payload is
+      # minimized to %{tenant_id: ...} (the subscriber's only tenant-scoping
+      # input). Select by this test's unique tenant_id to ignore concurrent tests'
+      # firehose traffic.
+      firehose_tid = tenant.id
+      assert_receive {:audit_chain_entry, %{tenant_id: ^firehose_tid} = firehose_msg}, 1_000
+
+      # The full entry — its :id, arbitrary :payload map, and :actor_lineage —
+      # is NEVER placed on the shared cross-tenant firehose (only tenant_id is).
+      refute Map.has_key?(firehose_msg, :id)
+      refute Map.has_key?(firehose_msg, :payload)
+      refute Map.has_key?(firehose_msg, :actor_lineage)
 
       # AC-35.2.1 also names {:sth_updated,…} and external (witness-cache)
       # subscribers as UNCHANGED. broadcast_sth/2 is untouched by this story, so
@@ -114,19 +122,18 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
 
       :ok = ChainPubSub.subscribe_firehose()
 
-      {:ok, entry_a} = AuditChain.append(tenant_a.id, append_attrs())
-      {:ok, entry_b} = AuditChain.append(tenant_b.id, append_attrs())
+      {:ok, _entry_a} = AuditChain.append(tenant_a.id, append_attrs())
+      {:ok, _entry_b} = AuditChain.append(tenant_b.id, append_attrs())
 
-      a_id = entry_a.id
-      b_id = entry_b.id
+      a_tid = tenant_a.id
+      b_tid = tenant_b.id
 
-      # One firehose subscription observes appends from EVERY tenant. Select by
-      # entry id (unique) to tolerate other async tests broadcasting concurrently.
-      assert_receive {:audit_chain_entry, %{id: ^a_id, tenant_id: a_tid}}, 1_000
-      assert_receive {:audit_chain_entry, %{id: ^b_id, tenant_id: b_tid}}, 1_000
-
-      assert a_tid == tenant_a.id
-      assert b_tid == tenant_b.id
+      # One firehose subscription observes appends from EVERY tenant. The firehose
+      # payload is minimized to %{tenant_id: ...}, so select by each test-unique
+      # tenant_id (not entry id) to tolerate other async tests broadcasting
+      # concurrently.
+      assert_receive {:audit_chain_entry, %{tenant_id: ^a_tid}}, 1_000
+      assert_receive {:audit_chain_entry, %{tenant_id: ^b_tid}}, 1_000
     end
   end
 

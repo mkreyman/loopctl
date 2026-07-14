@@ -7,7 +7,9 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   each `{:audit_chain_entry, entry}` message, debounce-enqueues one
   `Loopctl.Workers.ComputeSthWorker` job for `entry.tenant_id`. This makes STH
   computation react to real append activity instead of relying solely on the
-  per-minute `all_tenants` cron.
+  per-minute `all_tenants` cron. The firehose message is a MINIMAL
+  `%{tenant_id: _}` map (not the full `%Entry{}`) — `tenant_id` is the only field
+  this subscriber reads, so nothing else needs to cross the shared topic.
 
   ## Why a GenServer (OTP Iron Law)
 
