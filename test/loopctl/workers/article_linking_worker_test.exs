@@ -61,6 +61,54 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
     |> AdminRepo.all()
   end
 
+  # The (source_id, target_id, type) set of every link out of `source_id` — the correctness
+  # fingerprint the US-36.4 insert_all refactor must keep identical to the row-by-row path.
+  defp link_set(tenant_id, source_id) do
+    from(l in ArticleLink,
+      where: l.tenant_id == ^tenant_id,
+      where: l.source_article_id == ^source_id,
+      select: {l.source_article_id, l.target_article_id, l.relationship_type}
+    )
+    |> AdminRepo.all()
+    |> MapSet.new()
+  end
+
+  defp sample_rate, do: Application.get_env(:loopctl, :article_link_corpus_sample_rate)
+
+  # A published article whose id DOES / DOES NOT fall in the corpus-count sample bucket
+  # (`:erlang.phash2(id, rate) == 0`), so the sampling assertions are zero-flake. Non-matching
+  # articles are deleted (no links reference them yet) so they don't pollute the corpus count.
+  defp create_article_in_bucket(tenant_id, sampled?) do
+    article = create_published_article(tenant_id)
+
+    if :erlang.phash2(article.id, sample_rate()) == 0 == sampled? do
+      article
+    else
+      AdminRepo.delete!(article)
+      create_article_in_bucket(tenant_id, sampled?)
+    end
+  end
+
+  # Attach an in-test handler for the corpus-size telemetry event; returns a ref the worker's
+  # emission is tagged with so `assert_received` / `refute_received` can key on it.
+  defp attach_corpus_telemetry do
+    ref = make_ref()
+    test_pid = self()
+    handler_id = "corpus-size-#{inspect(ref)}"
+
+    :telemetry.attach(
+      handler_id,
+      [:loopctl, :knowledge, :article_linking, :corpus_size],
+      fn _event, measurements, metadata, _cfg ->
+        send(test_pid, {ref, :corpus_size, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    ref
+  end
+
   describe "potential conflict detection (#4)" do
     test "flags a near-identical pair with a :potential_conflict link" do
       %{tenant: tenant} = setup_tenant()
@@ -357,6 +405,125 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
         |> AdminRepo.aggregate(:count)
 
       assert link_count == 3
+    end
+  end
+
+  # --- US-36.4: hot-path efficiency (sampled corpus count + batched insert_all) ---
+
+  describe "corpus-size sampling (AC-36.4.1)" do
+    test "does NOT compute the corpus count on an unsampled job, and does not gate linking" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_article_in_bucket(tenant.id, false)
+      target = create_published_article(tenant.id)
+
+      ref = attach_corpus_telemetry()
+
+      stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(target, 0.88)]
+      end)
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      # Unsampled: the corpus-size count was skipped, so the signal did not fire — proving the
+      # full count(*) is no longer paid on every run.
+      refute_received {^ref, :corpus_size, _measurements, _metadata}
+
+      # ...yet linking still happened. The count was never a gate (correctness preserved).
+      assert [_] = links_of_type(tenant.id, source.id, target.id, :relates_to)
+    end
+
+    test "emits the corpus_size telemetry on a sampled job (signal preserved)" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_article_in_bucket(tenant.id, true)
+      # Three other published, embedded articles form the corpus the count measures.
+      others = for _i <- 1..3, do: create_published_article(tenant.id)
+      target = hd(others)
+
+      ref = attach_corpus_telemetry()
+
+      stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(target, 0.88)]
+      end)
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      assert_received {^ref, :corpus_size, measurements, metadata}
+      # Self excluded; three other published+embedded articles in the tenant.
+      assert measurements.total == 3
+      assert measurements.limit == 50
+      assert metadata.tenant_id == tenant.id
+      assert metadata.article_id == source.id
+    end
+  end
+
+  describe "batched insert_all (AC-36.4.2 / AC-36.4.3)" do
+    test "persists the identical link set for a fixed input and is idempotent on re-run" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      dup = create_published_article(tenant.id)
+      related = create_published_article(tenant.id)
+
+      # Fixed candidate list: dup >= conflict threshold (relates_to + potential_conflict),
+      # related merely-related (relates_to only). Stub (called on both runs).
+      stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(dup, 0.99), candidate(related, 0.70)]
+      end)
+
+      run = fn ->
+        assert :ok =
+                 ArticleLinkingWorker.perform(%Oban.Job{
+                   args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+                 })
+      end
+
+      run.()
+      first = link_set(tenant.id, source.id)
+      run.()
+      second = link_set(tenant.id, source.id)
+
+      # on_conflict: re-run creates no duplicates — the link set is stable.
+      assert first == second
+
+      # Correctness safety net: the exact produced set is what the linking logic decided,
+      # unchanged by the insert mechanics.
+      assert first ==
+               MapSet.new([
+                 {source.id, dup.id, :relates_to},
+                 {source.id, dup.id, :potential_conflict},
+                 {source.id, related.id, :relates_to}
+               ])
+    end
+
+    test "inserts every link across multiple insert_all chunks" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      targets = for _i <- 1..5, do: create_published_article(tenant.id)
+
+      # Test config sets a chunk size of 2, so five relates_to links span multiple chunks.
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        Enum.map(targets, &candidate(&1, 0.80))
+      end)
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      count =
+        from(l in ArticleLink,
+          where: l.tenant_id == ^tenant.id,
+          where: l.source_article_id == ^source.id,
+          where: l.relationship_type == :relates_to
+        )
+        |> AdminRepo.aggregate(:count)
+
+      assert count == 5
     end
   end
 

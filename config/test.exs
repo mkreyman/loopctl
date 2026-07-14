@@ -515,3 +515,9 @@ config :loopctl, :batch_item_validation_timeout_ms, 200
 # tests (and the inline-Oban cascade) see no candidates; tests that assert linking set
 # Mox expectations. The real VectorSearch.nearest path keeps a dedicated integration test.
 config :loopctl, :article_similarity_search, Loopctl.MockArticleSimilaritySearch
+
+# US-36.4: a small corpus-count sample rate so the sampling assertions can pick a
+# deterministically sampled/unsampled article by id hash, and a tiny insert chunk size so
+# a handful of links exercises the multi-chunk insert_all path without thousands of rows.
+config :loopctl, :article_link_corpus_sample_rate, 5
+config :loopctl, :article_link_insert_chunk_size, 2

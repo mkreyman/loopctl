@@ -34,7 +34,13 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
   Configurable max comparisons via
   `Application.get_env(:loopctl, :article_link_max_comparisons, 50)`.
-  Logs a warning when candidate count exceeds the limit. Since US-27.7a the lookup
+  A warning fires when the corpus size exceeds the limit. Since US-36.4 that
+  corpus-size count is no longer paid on every job: it runs on a deterministic
+  ~1/N sample (`:erlang.phash2(article_id, N) == 0`,
+  `:article_link_corpus_sample_rate`) and emits a
+  `[:loopctl, :knowledge, :article_linking, :corpus_size]` telemetry event
+  alongside the warning. It is purely observational — never a gate on linking.
+  Since US-27.7a the lookup
   runs through `VectorSearch.nearest/4`, whose `k` is clamped to
   `VectorSearch.max_k/0` (default 100), so a configured value above that ceiling is
   capped (a documented kNN cost bound); the default 50 is unaffected, and a clamp is
@@ -149,7 +155,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   # --- Private ---
 
   defp find_and_link_similar(article, tenant_id, threshold, max_comparisons) do
-    log_if_exceeds_limit(article, tenant_id, max_comparisons)
+    maybe_emit_corpus_size(article, tenant_id, max_comparisons)
 
     candidates = find_similar_articles(article, tenant_id, threshold, max_comparisons)
     conflict_threshold = conflict_threshold()
@@ -237,23 +243,61 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     |> Enum.filter(fn %{similarity: sim} -> sim >= threshold end)
   end
 
-  defp log_if_exceeds_limit(article, tenant_id, max_comparisons) do
-    total =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id,
-        where: a.id != ^article.id,
-        where: not is_nil(a.embedding),
-        where: a.status == :published
-      )
-      |> scope_by_project(article.project_id)
-      |> AdminRepo.aggregate(:count)
+  # US-36.4 (AC-36.4.1): the corpus-size-vs-limit warning used to run a full `count(*)`
+  # over the tenant/project corpus on EVERY linking job — the hottest `:knowledge` job (one
+  # per embedded article) — purely to feed a warning log. It now runs on a deterministic
+  # ~1/N sample of jobs and emits a telemetry event alongside the warning, so the signal
+  # stays observable without the per-job cost. It is NOT a gate: linking proceeds whether or
+  # not this samples, so correctness is untouched (AC-36.4.3).
+  defp maybe_emit_corpus_size(article, tenant_id, max_comparisons) do
+    if sample_corpus_count?(article.id) do
+      total = corpus_count(article, tenant_id)
 
-    if total > max_comparisons do
-      Logger.warning(
-        "Article linking: #{total} candidate articles exceeds limit of #{max_comparisons} " <>
-          "for article #{article.id}"
+      :telemetry.execute(
+        [:loopctl, :knowledge, :article_linking, :corpus_size],
+        %{total: total, limit: max_comparisons},
+        %{tenant_id: tenant_id, project_id: article.project_id, article_id: article.id}
       )
+
+      if total > max_comparisons do
+        Logger.warning(
+          "Article linking: #{total} candidate articles exceeds limit of #{max_comparisons} " <>
+            "for article #{article.id}"
+        )
+      end
     end
+
+    :ok
+  end
+
+  # Deterministic-by-id sampling so the same article always makes the same decision (stable
+  # across a job's retries). `phash2(id, 1) == 0` always, so a rate of 1 samples every job;
+  # a rate <= 0 disables the count entirely.
+  defp sample_corpus_count?(article_id) do
+    rate = Application.get_env(:loopctl, :article_link_corpus_sample_rate, 100)
+    rate > 0 and :erlang.phash2(article_id, rate) == 0
+  end
+
+  # The corpus-size count itself: scope UNCHANGED from the pre-US-36.4 hot-path count
+  # (self-excluded, published, embedded, project-scoped via `scope_by_project/2`), now wrapped
+  # in a per-query `SET LOCAL statement_timeout` transaction (AC-36.4.4) so a slow count on a
+  # large corpus can never hold an AdminRepo connection indefinitely.
+  defp corpus_count(article, tenant_id) do
+    {:ok, total} =
+      AdminRepo.transaction(fn ->
+        AdminRepo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
+
+        from(a in Article,
+          where: a.tenant_id == ^tenant_id,
+          where: a.id != ^article.id,
+          where: not is_nil(a.embedding),
+          where: a.status == :published
+        )
+        |> scope_by_project(article.project_id)
+        |> AdminRepo.aggregate(:count)
+      end)
+
+    total
   end
 
   # Candidate-COUNT scoping for the over-limit warning only (a plain `count(*)`, NOT the
@@ -277,21 +321,71 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     |> MapSet.new()
   end
 
+  # US-36.4 (AC-36.4.2/.4): persist discovered links with a single batched `insert_all` +
+  # `on_conflict: :nothing` instead of row-by-row `AdminRepo.insert/1` in a loop. Correctness
+  # is preserved — the SAME links are created:
+  #
+  #   * The reverse-direction (application-level) dedup still runs in `build_links/5` BEFORE
+  #     we get here; the directional unique index can't cover it, so `on_conflict` doesn't
+  #     replace it. `on_conflict: :nothing` on that index only guards same-direction
+  #     idempotency / concurrent races, exactly what the old per-row constraint-skip did.
+  #   * With `on_conflict: :nothing` a conflicting row is NOT counted, so the returned count
+  #     still means "links actually created" — matching the prior `create_links/2` semantics
+  #     that feeds `new_link_count` in the audit event.
+  #
+  # `tenant_id` and `inserted_at` are set explicitly on every row map: `tenant_id` is
+  # programmatic (never cast — Multi-Tenant Rule 4), and `insert_all` does NOT populate the
+  # schema's `timestamps(updated_at: false)`. The `:id` binary_id PK IS autogenerated by
+  # `insert_all` from the schema. Rows are chunked to stay well under Postgres's 65535
+  # bind-parameter ceiling (~6 params/row), and the whole batch runs inside a `SET LOCAL
+  # statement_timeout` transaction.
   defp create_links([], _tenant_id), do: 0
 
   defp create_links(links, tenant_id) do
-    Enum.reduce(links, 0, fn attrs, count ->
-      changeset =
-        %ArticleLink{tenant_id: tenant_id}
-        |> ArticleLink.changeset(attrs)
+    now = DateTime.utc_now()
 
-      case AdminRepo.insert(changeset) do
-        {:ok, _link} -> count + 1
-        # Skip on constraint violation (duplicate link)
-        {:error, _changeset} -> count
-      end
-    end)
+    rows =
+      Enum.map(links, fn attrs ->
+        %{
+          tenant_id: tenant_id,
+          source_article_id: attrs.source_article_id,
+          target_article_id: attrs.target_article_id,
+          relationship_type: attrs.relationship_type,
+          metadata: attrs.metadata,
+          inserted_at: now
+        }
+      end)
+
+    {:ok, created} =
+      AdminRepo.transaction(fn ->
+        AdminRepo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
+
+        rows
+        |> Enum.chunk_every(insert_chunk_size())
+        |> Enum.reduce(0, fn chunk, acc ->
+          {inserted, _} =
+            AdminRepo.insert_all(ArticleLink, chunk,
+              on_conflict: :nothing,
+              conflict_target: [
+                :tenant_id,
+                :source_article_id,
+                :target_article_id,
+                :relationship_type
+              ]
+            )
+
+          acc + inserted
+        end)
+      end)
+
+    created
   end
+
+  defp statement_timeout_ms,
+    do: Application.get_env(:loopctl, :article_link_statement_timeout_ms, 3_000)
+
+  defp insert_chunk_size,
+    do: Application.get_env(:loopctl, :article_link_insert_chunk_size, 1_000)
 
   defp log_audit_event(article_id, tenant_id, created_count) do
     Audit.create_log_entry(tenant_id, %{
