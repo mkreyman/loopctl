@@ -79,6 +79,44 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   URL is `nil` alerting is OFF (opt-in): the breach is logged at `:warning` synchronously
   and nothing is enqueued or POSTed — this path is unchanged by US-34.5.
 
+  ## Three additional signals (US-34.3) — same machinery, no changes to the above
+
+  US-34.3 is purely additive plumbing on top of the same windowed-ETS-counter →
+  periodic `:evaluate` → edge-fire → bounded re-notify → Oban delivery pipeline. It
+  does NOT change the three signals documented above.
+
+    * **(a) primary Repo checkout `queue_time` p95** — sourced from Ecto's own query
+      event for `Loopctl.Repo`, `[:loopctl, :repo, :query]`, measurement `:queue_time`
+      (native units, the SAME metric US-33.1's `loopctl.repo.checkout.queue_time`
+      distribution reads). Bucketed exactly like the heavy-read p95 (SAME `@buckets`,
+      `bucket_index/1`), but into a SEPARATE counter set (`{:qt_bucket, idx}` /
+      `:qt_total`) so it never collides with the heavy-read histogram.
+    * **(b) fleet-wide Oban job discard/retry rate** — sourced from
+      `[:oban, :job, :exception]`, which Oban's own `Executor` emits for BOTH a
+      retryable failure (`meta.state == :failure`) AND an exhausted job that just
+      converted to a terminal discard (`meta.state == :discard`, normalized from
+      `:exhausted`) — so a single unconditional counter (`:oban_discard_count`)
+      already captures both halves of "discard/retry rate" without any metadata
+      filtering. `oban_jobs` has no tenant dimension on this event (only bounded
+      `worker`/`queue`/`state` labels, none of which we tag — the counter is a pure
+      increment, mirroring `:under_fill_count`).
+    * **(c) LLM/embedding provider-error rate** — sourced from the NEW
+      `[:loopctl, :llm, :provider_error]` event (`Loopctl.TelemetryEvents.llm_provider_error/0`),
+      emitted from EXACTLY ONE choke point, `Loopctl.Llm.record_provider_error/2`,
+      by `ArticleEmbeddingWorker`/`MemoryEmbeddingWorker` on a genuine provider
+      failure. **Deliberately NOT `[:loopctl, :llm, :blocked]`**: that event fires
+      when a tenant has no BYO key configured (a config state checked BEFORE any
+      provider call), so windowing it as a provider-error proxy would false-page on
+      keyless tenants while missing a real 429/5xx/transport storm entirely (see
+      `Loopctl.Telemetry.ScaleMetrics`'s "AC-34.4.3 coordination" note). A single
+      unconditional counter (`:provider_error_count`) mirrors `:under_fill_count`;
+      the emit site alone decides transient vs permanent (`:class` metadata, unused
+      by this counter, which windows total volume).
+
+  All three plug into the exact same `step/8` / `step_p95/8` edge-fire helpers and
+  `notify/7` delivery path — no new delivery code, no change to the existing three
+  signals' behavior.
+
   ## Operator / system scope — NOT tenant-scoped
 
   This component is operator/system-scoped: it observes fleet-wide degradation, not a
@@ -110,6 +148,11 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   @under_fill_event [:loopctl, :knowledge, :vector_search, :under_fill]
   @heavy_read_event [:loopctl, :heavy_read_repo, :query]
 
+  # US-34.3: the three additional signals.
+  @repo_query_event [:loopctl, :repo, :query]
+  @oban_exception_event [:oban, :job, :exception]
+  @provider_error_event [:loopctl, :llm, :provider_error]
+
   # The latency buckets — the SAME bounded set as the ScaleMetrics histogram so the
   # bucket-based p95 here matches what Prometheus' histogram_quantile would report. A
   # value above the last bound lands in the implicit `+Inf` overflow bucket (index 9),
@@ -133,10 +176,18 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   @default_renotify_interval_ms 15 * 60_000
   @renotify_interval_floor_ms 60_000
 
+  # US-34.3: documented DEFAULTS for the three additional signals.
+  @default_queue_time_p95_ms 500
+  @default_oban_discard_rate_per_min 10
+  @default_provider_error_rate_per_min 10
+
   @metrics %{
     timeout: "db_statement_timeout_rate",
     p95: "heavy_read_p95_latency_ms",
-    under_fill: "under_fill_rate"
+    under_fill: "under_fill_rate",
+    queue_time_p95: "repo_queue_time_p95_ms",
+    oban_discard_rate: "oban_discard_rate",
+    provider_error_rate: "provider_error_rate"
   }
 
   # --- Client API ---
@@ -212,6 +263,45 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
         :loopctl,
         :scale_alert_under_fill_rate_per_min,
         @default_under_fill_rate_per_min
+      )
+
+  @doc """
+  Repo checkout `queue_time` p95 threshold (ms, `:scale_alert_queue_time_p95_ms`,
+  US-34.3 AC-34.3.1).
+  """
+  @spec queue_time_p95_threshold() :: number()
+  def queue_time_p95_threshold,
+    do:
+      Application.get_env(
+        :loopctl,
+        :scale_alert_queue_time_p95_ms,
+        @default_queue_time_p95_ms
+      )
+
+  @doc """
+  Fleet-wide Oban job discard/retry-exception rate threshold (events/min,
+  `:scale_alert_oban_discard_rate_per_min`, US-34.3 AC-34.3.2).
+  """
+  @spec oban_discard_rate_threshold() :: number()
+  def oban_discard_rate_threshold,
+    do:
+      Application.get_env(
+        :loopctl,
+        :scale_alert_oban_discard_rate_per_min,
+        @default_oban_discard_rate_per_min
+      )
+
+  @doc """
+  LLM/embedding provider-error rate threshold (events/min,
+  `:scale_alert_provider_error_rate_per_min`, US-34.3 AC-34.3.3).
+  """
+  @spec provider_error_rate_threshold() :: number()
+  def provider_error_rate_threshold,
+    do:
+      Application.get_env(
+        :loopctl,
+        :scale_alert_provider_error_rate_per_min,
+        @default_provider_error_rate_per_min
       )
 
   @doc "The operator webhook URL (`:scale_alert_webhook_url`), or `nil` (alerting off)."
@@ -325,7 +415,10 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
        breaching: %{
          timeout: %{breaching?: false, last_notified_at: nil},
          p95: %{breaching?: false, last_notified_at: nil},
-         under_fill: %{breaching?: false, last_notified_at: nil}
+         under_fill: %{breaching?: false, last_notified_at: nil},
+         queue_time_p95: %{breaching?: false, last_notified_at: nil},
+         oban_discard_rate: %{breaching?: false, last_notified_at: nil},
+         provider_error_rate: %{breaching?: false, last_notified_at: nil}
        }
      }}
   end
@@ -354,7 +447,14 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # --- Telemetry attach (idempotent, per-table handler id) ---
 
   defp attach_handlers(table) do
-    events = [@db_error_event, @under_fill_event, @heavy_read_event]
+    events = [
+      @db_error_event,
+      @under_fill_event,
+      @heavy_read_event,
+      @repo_query_event,
+      @oban_exception_event,
+      @provider_error_event
+    ]
 
     case :telemetry.attach_many(handler_id(table), events, &__MODULE__.handle_event/4, %{
            table: table
@@ -407,6 +507,51 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       :ok
   end
 
+  # US-34.3 (AC-34.3.1): mirrors the `@heavy_read_event` clause EXACTLY, but reads
+  # `measurements.queue_time` (Ecto's per-query connection-checkout wait, native
+  # units) and writes to a SEPARATE bucket set (`{:qt_bucket, idx}` / `:qt_total`) so
+  # it never collides with the heavy-read histogram.
+  def handle_event(@repo_query_event, measurements, _metadata, %{table: table}) do
+    total_native = Map.get(measurements, :queue_time, 0)
+    duration_ms = System.convert_time_unit(total_native, :native, :millisecond)
+    idx = bucket_index(duration_ms)
+
+    :ets.update_counter(table, {:qt_bucket, idx}, 1)
+    :ets.update_counter(table, :qt_total, 1)
+    :ok
+  rescue
+    e ->
+      Logger.error("ScaleAlerts repo_query handler error: #{Exception.message(e)}")
+      :ok
+  end
+
+  # US-34.3 (AC-34.3.2): fleet-wide Oban job discard/retry rate. Oban's own Executor
+  # emits `[:oban, :job, :exception]` for BOTH a retryable failure and an exhausted
+  # job converting to a terminal discard, so a single unconditional counter already
+  # covers "discard/retry rate" — no metadata filtering, mirrors `:under_fill_count`.
+  def handle_event(@oban_exception_event, _measurements, _metadata, %{table: table}) do
+    :ets.update_counter(table, :oban_discard_count, 1)
+    :ok
+  rescue
+    e ->
+      Logger.error("ScaleAlerts oban_exception handler error: #{Exception.message(e)}")
+      :ok
+  end
+
+  # US-34.3 (AC-34.3.3): genuine LLM/embedding provider-error rate, sourced from the
+  # NEW `[:loopctl, :llm, :provider_error]` event (emitted from exactly one choke
+  # point, `Loopctl.Llm.record_provider_error/2`) — deliberately NOT
+  # `[:loopctl, :llm, :blocked]` (a missing-key config signal, not a provider-error
+  # one; see the moduledoc). A single unconditional counter mirrors `:under_fill_count`.
+  def handle_event(@provider_error_event, _measurements, _metadata, %{table: table}) do
+    :ets.update_counter(table, :provider_error_count, 1)
+    :ok
+  rescue
+    e ->
+      Logger.error("ScaleAlerts provider_error handler error: #{Exception.message(e)}")
+      :ok
+  end
+
   def handle_event(_event, _measurements, _metadata, _config), do: :ok
 
   # --- Window evaluation + edge-triggered firing + bounded re-notify (US-34.5) ---
@@ -426,7 +571,12 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
 
     timeout_rate = window.timeout_count / window_min
     under_fill_rate = window.under_fill_count / window_min
-    p95 = p95_from_buckets(window)
+    p95 = p95_from_buckets(window.lat_total, window.buckets)
+
+    # US-34.3: the three additional signals, computed the SAME way as their siblings.
+    queue_time_p95 = p95_from_buckets(window.qt_total, window.qt_buckets)
+    oban_discard_rate = window.oban_discard_count / window_min
+    provider_error_rate = window.provider_error_count / window_min
 
     # A single clock read per evaluate: every metric in this tick is judged against the
     # SAME "now", so two metrics breaching in the same window re-notify in lockstep.
@@ -452,7 +602,34 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
         renotify_interval,
         insert_fn
       )
-      |> step_p95(p95, p95_latency_threshold(), url, now, renotify_interval, insert_fn)
+      |> step_p95(:p95, p95, p95_latency_threshold(), url, now, renotify_interval, insert_fn)
+      |> step(
+        :oban_discard_rate,
+        oban_discard_rate,
+        oban_discard_rate_threshold(),
+        url,
+        now,
+        renotify_interval,
+        insert_fn
+      )
+      |> step(
+        :provider_error_rate,
+        provider_error_rate,
+        provider_error_rate_threshold(),
+        url,
+        now,
+        renotify_interval,
+        insert_fn
+      )
+      |> step_p95(
+        :queue_time_p95,
+        queue_time_p95,
+        queue_time_p95_threshold(),
+        url,
+        now,
+        renotify_interval,
+        insert_fn
+      )
 
     %{state | breaching: breaching}
   end
@@ -504,12 +681,14 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
     do: now - last_notified_at >= renotify_interval
 
   # p95 is `nil` when below the sample floor — treat as "not breaching" and re-arm so a
-  # quiet window clears the breach state (a later busy window can fire again).
-  defp step_p95(breaching, nil, _threshold, _url, _now, _renotify_interval, _insert_fn),
-    do: Map.put(breaching, :p95, %{breaching?: false, last_notified_at: nil})
+  # quiet window clears the breach state (a later busy window can fire again). Takes
+  # `metric` as an explicit arg (US-34.3) so the SAME helper serves both the
+  # heavy-read p95 (`:p95`) and the repo checkout queue_time p95 (`:queue_time_p95`).
+  defp step_p95(breaching, metric, nil, _threshold, _url, _now, _renotify_interval, _insert_fn),
+    do: Map.put(breaching, metric, %{breaching?: false, last_notified_at: nil})
 
-  defp step_p95(breaching, p95, threshold, url, now, renotify_interval, insert_fn),
-    do: step(breaching, :p95, p95, threshold, url, now, renotify_interval, insert_fn)
+  defp step_p95(breaching, metric, p95, threshold, url, now, renotify_interval, insert_fn),
+    do: step(breaching, metric, p95, threshold, url, now, renotify_interval, insert_fn)
 
   # Fires the alert and stamps `last_notified_at` to `now` ONLY on a genuine successful
   # delivery/enqueue; otherwise keeps `fallback` (either `nil` for a never-notified edge
@@ -607,9 +786,22 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # --- Counter table helpers ---
 
   defp reset_counters(table) do
-    :ets.insert(table, [{:timeout_count, 0}, {:under_fill_count, 0}, {:lat_total, 0}])
+    :ets.insert(table, [
+      {:timeout_count, 0},
+      {:under_fill_count, 0},
+      {:lat_total, 0},
+      # US-34.3: the three additional signals' scalar counters.
+      {:qt_total, 0},
+      {:oban_discard_count, 0},
+      {:provider_error_count, 0}
+    ])
 
-    for idx <- 0..@bucket_count, do: :ets.insert(table, {{:lat_bucket, idx}, 0})
+    for idx <- 0..@bucket_count do
+      :ets.insert(table, {{:lat_bucket, idx}, 0})
+      # US-34.3: a SEPARATE bucket set for the repo checkout queue_time p95, so it
+      # never collides with the heavy-read latency histogram above.
+      :ets.insert(table, {{:qt_bucket, idx}, 0})
+    end
 
     :ok
   end
@@ -625,11 +817,21 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
     lat_total = read_zero(table, :lat_total)
     buckets = for idx <- 0..@bucket_count, do: read_zero(table, {:lat_bucket, idx})
 
+    # US-34.3: the three additional signals.
+    qt_total = read_zero(table, :qt_total)
+    qt_buckets = for idx <- 0..@bucket_count, do: read_zero(table, {:qt_bucket, idx})
+    oban_discard_count = read_zero(table, :oban_discard_count)
+    provider_error_count = read_zero(table, :provider_error_count)
+
     %Window{
       timeout_count: timeout_count,
       under_fill_count: under_fill_count,
       lat_total: lat_total,
-      buckets: buckets
+      buckets: buckets,
+      qt_total: qt_total,
+      qt_buckets: qt_buckets,
+      oban_discard_count: oban_discard_count,
+      provider_error_count: provider_error_count
     }
   end
 
@@ -651,10 +853,13 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
 
   # --- p95 from buckets (cumulative crossing of the 95th percentile) ---
 
-  defp p95_from_buckets(%Window{lat_total: lat_total}) when lat_total < @p95_min_samples, do: nil
+  # Takes the total sample count + bucket list as explicit args (US-34.3) so the SAME
+  # helper serves both the heavy-read latency histogram and the repo checkout
+  # queue_time histogram (a separate counter set, same layout).
+  defp p95_from_buckets(total, _buckets) when total < @p95_min_samples, do: nil
 
-  defp p95_from_buckets(%Window{lat_total: lat_total, buckets: buckets}) do
-    target = lat_total * 0.95
+  defp p95_from_buckets(total, buckets) do
+    target = total * 0.95
     cumulative_cross(buckets, target, 0, 0)
   end
 

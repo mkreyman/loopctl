@@ -284,6 +284,46 @@ defmodule Loopctl.Llm do
       :ok
   end
 
+  @doc """
+  Records a GENUINE provider failure — a real 4xx/5xx/transport/timeout error
+  returned by a provider call that WAS ACTUALLY ATTEMPTED (a key was configured and
+  present). US-34.3 (AC-34.3.3)'s provider-error-rate `Loopctl.Telemetry.ScaleAlerts`
+  signal windows this event.
+
+  Distinct from `record_blocked/2`, which fires for a MISSING-key config state
+  checked BEFORE any provider call — conflating the two would both false-page (a
+  keyless tenant looks like a provider incident) and mask the real incident class
+  (a genuine 429/5xx/transport storm on a tenant WITH a key never touches
+  `record_blocked/2` at all). See `Loopctl.Telemetry.ScaleMetrics`'s "AC-34.4.3
+  coordination" moduledoc note.
+
+  Call this from EXACTLY ONE choke point per failure at each call site (currently
+  `ArticleEmbeddingWorker`/`MemoryEmbeddingWorker`'s embedding-provider branch, never
+  for the circuit breaker's own `:circuit_open` skip) so the emitted count matches
+  the actual failure count 1:1 — no double-counting.
+
+  Emits `[:loopctl, :llm, :provider_error]` with BOUNDED metadata ONLY: `provider`
+  (`"anthropic"` | `"embedding"`) and `class` (`:transient` | `:permanent`, per
+  `permanent_provider_error?/1`) — NEVER `tenant_id`, an article/memory id, or any
+  provider response body (the caller has already run the reason through
+  `Loopctl.Llm.ProviderError.sanitize/1` before classifying it). Best-effort: a
+  telemetry failure never propagates to the caller (mirrors `record_blocked/2`).
+  """
+  @spec record_provider_error(String.t(), :transient | :permanent) :: :ok
+  def record_provider_error(provider, class)
+      when provider in ["anthropic", "embedding"] and class in [:transient, :permanent] do
+    :telemetry.execute([:loopctl, :llm, :provider_error], %{count: 1}, %{
+      provider: provider,
+      class: class
+    })
+
+    :ok
+  rescue
+    e ->
+      Logger.error("Loopctl.Llm.record_provider_error failed: #{Exception.message(e)}")
+      :ok
+  end
+
   # The two BYO credentials are SEPARATE — name the right one in the block log so an
   # operator isn't misled into checking the Anthropic key for an embedding block
   # (review MED #3). The structured audit already carries the exact operation.

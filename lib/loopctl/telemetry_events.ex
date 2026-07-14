@@ -157,6 +157,37 @@ defmodule Loopctl.TelemetryEvents do
   """
   def knowledge_hybrid_provenance, do: [:loopctl, :knowledge, :hybrid_provenance]
 
+  @doc """
+  A genuine LLM/embedding PROVIDER failure (a REAL 4xx/5xx/transport/timeout error
+  returned by a provider call that WAS ACTUALLY ATTEMPTED — a key was configured and
+  present). Introduced by US-34.3 (AC-34.3.3) as the provider-error-rate ScaleAlerts
+  signal. Emitted from EXACTLY ONE choke point, `Loopctl.Llm.record_provider_error/2`,
+  called by `Loopctl.Workers.ArticleEmbeddingWorker` / `Loopctl.Workers.MemoryEmbeddingWorker`
+  once per genuine provider failure — never for the circuit breaker's own
+  `:circuit_open` skip (a DERIVED consequence of prior failures already counted when
+  they happened, not a fresh one).
+
+  Distinct from `[:loopctl, :llm, :blocked]` (`Loopctl.Llm.record_blocked/2`), which
+  fires when NO key is configured — a missing-credential CONFIG state checked BEFORE
+  any provider call is attempted. Conflating the two would both false-page (a keyless
+  tenant looks like a provider incident) and mask the real incident class (a genuine
+  429/5xx/transport storm on a tenant WITH a key never touches `record_blocked/2` at
+  all). See `Loopctl.Telemetry.ScaleMetrics`'s "AC-34.4.3 coordination" moduledoc note.
+
+  ## Payload (id-free — never a tenant id, article/memory id, or provider body)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{provider, class}` where `provider` is `"anthropic"` |
+      `"embedding"` (a BOUNDED 2-value set, the same credential/vendor split
+      `Loopctl.Llm.blocked_credential_provider/1` already uses) and `class` is
+      `:transient` | `:permanent` (per `Loopctl.Llm.permanent_provider_error?/1`).
+      The reason feeding classification has already been run through
+      `Loopctl.Llm.ProviderError.sanitize/1`, so no key/body ever reaches this event.
+
+  Windowed by `Loopctl.Telemetry.ScaleAlerts` as a per-minute rate.
+  """
+  def llm_provider_error, do: [:loopctl, :llm, :provider_error]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -171,7 +202,8 @@ defmodule Loopctl.TelemetryEvents do
       vector_search_under_fill(),
       db_error(),
       knowledge_semantic_fallback(),
-      knowledge_hybrid_provenance()
+      knowledge_hybrid_provenance(),
+      llm_provider_error()
     ]
   end
 end

@@ -91,6 +91,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
 
       {:error, reason} ->
         sanitized = ProviderError.sanitize(reason)
+        record_provider_error(reason)
 
         if Llm.permanent_provider_error?(reason) do
           Logger.debug(
@@ -103,6 +104,17 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
           {:error, sanitized}
         end
     end
+  end
+
+  # US-34.3 (AC-34.3.3): a genuine provider failure — never the circuit breaker's
+  # own `:circuit_open` skip (a DERIVED consequence of prior failures already
+  # counted when they happened, not a fresh one; counting it too would inflate the
+  # rate every retry while the breaker stays open on a single underlying incident).
+  defp record_provider_error(:circuit_open), do: :ok
+
+  defp record_provider_error(reason) do
+    class = if Llm.permanent_provider_error?(reason), do: :permanent, else: :transient
+    Llm.record_provider_error("embedding", class)
   end
 
   defp store(tenant_id, memory_id, embedding, content_hash) do

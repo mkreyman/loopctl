@@ -105,6 +105,37 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     end
   end
 
+  # US-34.3: mirror helpers for the three additional signals.
+
+  # Repo checkout queue_time in ms → native units the real `[:loopctl, :repo, :query]`
+  # event carries.
+  defp emit_queue_time(ms, n) do
+    native = System.convert_time_unit(ms, :millisecond, :native)
+
+    for _ <- 1..n do
+      :telemetry.execute([:loopctl, :repo, :query], %{queue_time: native}, %{repo: Loopctl.Repo})
+    end
+  end
+
+  defp emit_oban_exception(n) do
+    for _ <- 1..n do
+      :telemetry.execute([:oban, :job, :exception], %{duration: 1}, %{
+        worker: "Loopctl.Workers.SomeWorker",
+        queue: "default",
+        state: :failure
+      })
+    end
+  end
+
+  defp emit_provider_error(n) do
+    for _ <- 1..n do
+      :telemetry.execute([:loopctl, :llm, :provider_error], %{count: 1}, %{
+        provider: "embedding",
+        class: :transient
+      })
+    end
+  end
+
   defp expect_delivery(test_pid) do
     expect(Loopctl.MockDelivery, :deliver, fn url, body, headers ->
       send(test_pid, {:alert_delivered, url, body, headers})
@@ -186,6 +217,157 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
 
       keys = body |> Jason.decode!() |> Map.keys() |> Enum.sort()
       assert keys == ["alert", "at", "metric", "threshold", "value", "window_seconds"]
+    end
+  end
+
+  describe "US-34.3: three additional signals" do
+    test "TC-34.3.1: repo queue_time p95 breach fires", %{server: server} do
+      test_pid = self()
+      expect_delivery(test_pid)
+
+      # 30 samples (> @p95_min_samples = 20) at 1000ms: well above the 500ms default
+      # threshold. 1000ms lands exactly in the 1000 bucket -> p95 estimate 1000 > 500.
+      emit_queue_time(1_000, 30)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      assert_received {:alert_delivered, _url, body, _headers}
+      payload = Jason.decode!(body)
+      assert payload["metric"] == "repo_queue_time_p95_ms"
+      assert payload["value"] == 1_000
+      assert payload["threshold"] == 500
+    end
+
+    test "TC-34.3.2: Oban discard/retry rate breach fires", %{server: server} do
+      test_pid = self()
+      expect_delivery(test_pid)
+
+      # 11 > the 10/min default threshold.
+      emit_oban_exception(11)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      assert_received {:alert_delivered, _url, body, _headers}
+      payload = Jason.decode!(body)
+      assert payload["metric"] == "oban_discard_rate"
+      assert payload["value"] == 11.0
+      assert payload["threshold"] == 10
+    end
+
+    test "TC-34.3.3: provider-error rate breach fires", %{server: server} do
+      test_pid = self()
+      expect_delivery(test_pid)
+
+      # 11 > the 10/min default threshold.
+      emit_provider_error(11)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      assert_received {:alert_delivered, _url, body, _headers}
+      payload = Jason.decode!(body)
+      assert payload["metric"] == "provider_error_rate"
+      assert payload["value"] == 11.0
+      assert payload["threshold"] == 10
+    end
+
+    test "TC-34.3.4: no false fire under threshold for all three new signals", %{server: server} do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+        send(test_pid, :unexpected_delivery)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      # At threshold (strict `>` check, so exactly-threshold does NOT breach).
+      emit_queue_time(100, 30)
+      emit_oban_exception(10)
+      emit_provider_error(10)
+
+      assert :ok = ScaleAlerts.evaluate(server)
+      refute_received :unexpected_delivery
+    end
+
+    test "queue_time p95 below the sample floor is skipped (no noise alert)", %{server: server} do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h ->
+        send(test_pid, :unexpected_delivery)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      # Only 5 samples (< @p95_min_samples = 20), even though each is 9000ms.
+      emit_queue_time(9_000, 5)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      refute_received :unexpected_delivery
+    end
+
+    test "the provider-error alert payload carries NO tenant/vector/SQL content", %{
+      server: server
+    } do
+      test_pid = self()
+      expect_delivery(test_pid)
+
+      emit_provider_error(11)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      assert_received {:alert_delivered, _url, body, _headers}
+      refute body =~ "tenant"
+      refute body =~ "vector"
+      refute body =~ "SELECT"
+
+      keys = body |> Jason.decode!() |> Map.keys() |> Enum.sort()
+      assert keys == ["alert", "at", "metric", "threshold", "value", "window_seconds"]
+    end
+  end
+
+  describe "US-34.3: Loopctl.TelemetryEvents.llm_provider_error/0" do
+    test "returns the bounded event name" do
+      assert TelemetryEvents.llm_provider_error() == [:loopctl, :llm, :provider_error]
+    end
+
+    test "is included in all_events/0" do
+      assert [:loopctl, :llm, :provider_error] in TelemetryEvents.all_events()
+    end
+  end
+
+  describe "US-34.3: Loopctl.Llm.record_provider_error/2 (AC-34.3.3, AC-34.3.5)" do
+    test "emits [:loopctl, :llm, :provider_error] with ONLY bounded provider/class metadata" do
+      test_pid = self()
+      handler_id = {:record_provider_error_test, System.unique_integer([:positive])}
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :llm, :provider_error],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:emitted, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assert :ok = Loopctl.Llm.record_provider_error("embedding", :transient)
+
+      assert_received {:emitted, measurements, metadata}
+      assert measurements == %{count: 1}
+      assert metadata == %{provider: "embedding", class: :transient}
+      # Bounded cardinality guard: no tenant/id dimension ever reaches this event.
+      refute Map.has_key?(metadata, :tenant_id)
+      refute Map.has_key?(metadata, :article_id)
+      refute Map.has_key?(metadata, :memory_id)
+    end
+
+    test "is best-effort: a raising downstream handler never propagates to the caller" do
+      handler_id = {:record_provider_error_raising, System.unique_integer([:positive])}
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :llm, :provider_error],
+        fn _event, _measurements, _metadata, _config -> raise "boom" end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assert :ok = Loopctl.Llm.record_provider_error("embedding", :permanent)
     end
   end
 
