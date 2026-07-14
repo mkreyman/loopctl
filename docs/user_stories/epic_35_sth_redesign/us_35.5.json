@@ -1,0 +1,124 @@
+{
+  "id": "US-35.5",
+  "title": "Performance verification: STH computation time reduction",
+  "epic": {
+    "id": "epic_35",
+    "name": "STH & cron fleet-cost redesign"
+  },
+  "priority": "high",
+  "phase": "validation",
+  "story": {
+    "as_a": "platform operator",
+    "i_want_to": "measure and verify that the incremental STH computation (US-35.2) and event-driven trigger (US-35.3) have reduced STH computation time and database load per minute",
+    "so_that": "we can confirm the performance improvements before merging epic_35 and identify any unexpected regressions"
+  },
+  "rationale": "Refactoring critical performance paths requires verification against real workloads. We need to confirm that incremental computation is actually faster, that the frontier is stable, and that witness API latency (which depends on STH queries) has not regressed.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-35.5.1",
+      "description": "A benchmark test exists that simulates 100 tenants each with 10,000+ entries and measures the time to compute STH for all of them (simulating one all_tenants sweep or event-driven fanout)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.5.2",
+      "description": "STH computation time per tenant is measured before (full recompute) and after (incremental) and shows a measurable reduction (target: 50%+ reduction for large chains)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.5.3",
+      "description": "Database query count during ComputeSthWorker execution is reduced or stable; the worker does not issue additional queries as a side effect of frontier handling",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.5.4",
+      "description": "Witness API endpoints (GET /witness/sth) show no regression in latency; fetching an STH from the database is not slower after frontier addition",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.5.5",
+      "description": "Event-driven enqueuing (US-35.3) reduces the number of jobs per minute compared to all-tenants polling: idle tenants no longer generate jobs",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-35.5.1",
+      "name": "Benchmark: incremental STH vs. full recompute",
+      "type": "performance",
+      "preconditions": [
+        "All US-35.1 and US-35.2 changes are implemented",
+        "A test tenant exists with 50,000+ entries"
+      ],
+      "steps": [
+        "Measure time for sign_and_store_tree_head(tenant_id) using incremental computation",
+        "Measure time for the equivalent full-recompute path (force it for comparison)",
+        "Record both times and the reduction percentage"
+      ],
+      "expected_results": [
+        "Incremental time < full-recompute time",
+        "Reduction is >30% (target 50%+)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.5.2",
+      "name": "Database query reduction during STH computation",
+      "type": "integration",
+      "preconditions": [
+        "US-35.2 is implemented",
+        "A test tenant exists with 10,000+ entries and a previous STH"
+      ],
+      "steps": [
+        "Enable query logging (Ecto.LogEntry or Postgres slow log)",
+        "Call sign_and_store_tree_head(tenant_id)",
+        "Count SELECT queries issued"
+      ],
+      "expected_results": [
+        "Query count is constant O(1) per STH, not O(chain_size)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.5.3",
+      "name": "Witness API latency: STH fetch is fast",
+      "type": "integration",
+      "preconditions": [
+        "US-35.1 and US-35.2 are implemented",
+        "A test tenant has 100,000+ entries and recent STHs"
+      ],
+      "steps": [
+        "Call AuditChain.get_latest_sth(tenant_id) 1000 times",
+        "Measure p50 and p99 latencies",
+        "Compare to pre-change baseline (if available)"
+      ],
+      "expected_results": [
+        "p50 < 10ms, p99 < 50ms (database dependent, but should be sub-100ms)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.5.4",
+      "name": "Event-driven job count reduction",
+      "type": "integration",
+      "preconditions": [
+        "US-35.3 is implemented",
+        "100 tenants exist, 10 with active writes, 90 idle",
+        "SubscriberWorker and all-tenants cron are running"
+      ],
+      "steps": [
+        "Let the system run for 15 minutes",
+        "Count on_demand jobs enqueued for each tenant",
+        "Count total jobs vs. the old all-tenants fanout baseline (100 jobs per minute)"
+      ],
+      "expected_results": [
+        "Total jobs < 100 per minute (only active tenants enqueued, plus one all-tenants sweep at 15m)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "dependencies": [
+    "US-35.2",
+    "US-35.3"
+  ],
+  "notes": "Performance testing may be run manually in a staging environment or as a benchmarking test suite. Use Benchee or simple Erlang :timer functions for precise measurements. If CI runs these benchmarks, set reasonable thresholds to warn if performance regresses. Include both micro-benchmarks (merkle_tree/1 computation) and macro-benchmarks (full STH worker execution)."
+}

@@ -1,0 +1,126 @@
+{
+  "id": "US-35.3",
+  "title": "Make STH computation event-driven via ChainPubSub",
+  "epic": {
+    "id": "epic_35",
+    "name": "STH & cron fleet-cost redesign"
+  },
+  "priority": "critical",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "wire ComputeSthWorker to listen to AuditChain.PubSub (ChainPubSub) broadcasts when new entries are appended, and enqueue per-tenant STH jobs on-demand with bounded debouncing instead of running an all-tenants poll every minute",
+    "so_that": "idle tenants with no new activity do not cost a job and two database queries per minute, and active tenants see faster STH computation (event-driven, no 60s latency waiting for the next cron tick)"
+  },
+  "rationale": "The current all-tenants cron polls every 60s and fans out N single-row inserts (now chunked). This wastes ~N jobs/min on idle tenants and causes a thundering herd at each `:00` tick. ChainPubSub already broadcasts whenever an entry is appended (US-26.5.1); subscribing to that broadcast and enqueueing on-demand is event-driven with no polling waste. A low-frequency safety sweep (e.g., every 15 min) remains as a backstop for edge cases (broadcast miss, subscriber crash).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-35.3.1",
+      "description": "ComputeSthWorker adds a new perform/1 clause: perform(%Oban.Job{args: %{\"mode\" => \"on_demand\", \"tenant_id\" => tenant_id}}) that computes STH for a single tenant",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.3.2",
+      "description": "ComputeSthWorker retains the all_tenants mode (args: %{\"mode\" => \"all_tenants\"}) but reduces its frequency from every 60 seconds to every 900 seconds (15 minutes), as a safety sweep only",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.3.3",
+      "description": "A new Loopctl.AuditChain.PubSub.SubscriberWorker subscribes to ChainPubSub entry broadcasts and enqueues a uniquely-debounced ComputeSthWorker job (mode: on_demand) for each tenant",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.3.4",
+      "description": "On-demand jobs use unique: [fields: [:worker, :args], period: 10] to debounce multiple entries appended within 10 seconds for the same tenant to a single STH computation",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.3.5",
+      "description": "The SubscriberWorker is started as a named, supervised process (or LiveView subscription, if using Loopctl's web layer) on application startup",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.3.6",
+      "description": "Tests verify that appending an entry triggers an on_demand STH job and that the job computes the STH correctly",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-35.3.1",
+      "name": "Appending an entry enqueues an on_demand STH job",
+      "type": "integration",
+      "preconditions": [
+        "SubscriberWorker is running",
+        "A tenant exists"
+      ],
+      "steps": [
+        "Append a new entry to the tenant's chain",
+        "Wait briefly for the PubSub broadcast and subscriber processing",
+        "Check Oban.Job table for a ComputeSthWorker job with mode=on_demand and tenant_id"
+      ],
+      "expected_results": [
+        "Job is enqueued",
+        "Job has correct tenant_id and mode"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.3.2",
+      "name": "Multiple entries within 10 seconds debounce to one STH job",
+      "type": "integration",
+      "preconditions": [
+        "SubscriberWorker is running",
+        "A tenant exists"
+      ],
+      "steps": [
+        "Append 5 entries to the tenant's chain in rapid succession (within 5 seconds)",
+        "Wait for PubSub broadcasts and subscriber processing",
+        "Count the on_demand STH jobs enqueued for that tenant"
+      ],
+      "expected_results": [
+        "Only 1 job is enqueued (debounced), not 5"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.3.3",
+      "name": "All-tenants sweep still works every 15 minutes",
+      "type": "integration",
+      "preconditions": [
+        "A tenant exists",
+        "SubscriberWorker is running",
+        "Oban cron is running"
+      ],
+      "steps": [
+        "Advance time by 15 minutes (mock time or real wait if acceptable)",
+        "Check for all_tenants mode job in Oban"
+      ],
+      "expected_results": [
+        "all_tenants job is enqueued at the 15-minute mark"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.3.4",
+      "name": "on_demand mode performs correctly",
+      "type": "integration",
+      "preconditions": [
+        "A tenant exists with an entry"
+      ],
+      "steps": [
+        "Create an on_demand Oban.Job manually with correct args",
+        "Call ComputeSthWorker.perform/1 on it",
+        "Fetch the STH for that tenant"
+      ],
+      "expected_results": [
+        "STH is computed and stored correctly"
+      ],
+      "status": "pending"
+    }
+  ],
+  "dependencies": [
+    "US-35.2"
+  ],
+  "notes": "The SubscriberWorker needs to be kept alive across application restarts; use a supervised GenServer or Phoenix.PubSub subscription. If using a GenServer, keep it simple: just listen and enqueue jobs. No business logic in the subscriber, to minimize crash surface. Test with both real PubSub broadcasts and mocked broadcasts (Mox)."
+}

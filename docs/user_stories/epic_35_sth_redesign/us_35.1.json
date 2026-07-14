@@ -1,0 +1,99 @@
+{
+  "id": "US-35.1",
+  "title": "Add merkle_frontier field to audit_signed_tree_heads table",
+  "epic": {
+    "id": "epic_35",
+    "name": "STH & cron fleet-cost redesign"
+  },
+  "priority": "critical",
+  "phase": "foundation",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "persist the merkle frontier (path needed for incremental computation) alongside each STH, so that future STH computations can fold only new entries instead of recomputing the entire chain",
+    "so_that": "STH computation becomes O(new entries) instead of O(total history), reducing per-minute CPU and database load quadratically as the audit chain grows"
+  },
+  "rationale": "Currently, ComputeSthWorker recomputes the entire merkle tree for a tenant every minute by fetching all entry hashes from genesis and rebuilding the tree top-to-bottom. This is O(total_chain_size) per minute per tenant. Merkle-tree incremental computation requires persisting the frontier (the set of hashes needed to attach new entries to the previous root). The frontier is derivable from the tree structure and is ~log(chain_size) in size, so storing it enables O(new_entries) computation on the next cycle.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-35.1.1",
+      "description": "A new migration (timestamp, create_add_merkle_frontier_to_sth) adds a nullable :binary column `merkle_frontier` to the `audit_signed_tree_heads` table",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.1.2",
+      "description": "The `Loopctl.AuditChain.SignedTreeHead` schema includes the new `merkle_frontier` field with type :binary",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.1.3",
+      "description": "The SignedTreeHead changeset casts `merkle_frontier` as optional (not required)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.1.4",
+      "description": "Existing STH queries and tests pass without modification (merkle_frontier defaults to nil for existing rows)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.1.5",
+      "description": "New STHs created during this task do not yet populate merkle_frontier (left as nil); this field will be populated by US-35.2",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-35.1.1",
+      "name": "SignedTreeHead schema accepts merkle_frontier",
+      "type": "unit",
+      "preconditions": [
+        "Migration has run",
+        "SignedTreeHead schema is compiled"
+      ],
+      "steps": [
+        "Create a SignedTreeHead changeset with merkle_frontier = <<...some binary...>>",
+        "Validate the changeset"
+      ],
+      "expected_results": [
+        "Changeset is valid",
+        "merkle_frontier is present in the changes"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.1.2",
+      "name": "SignedTreeHead stores and retrieves merkle_frontier",
+      "type": "integration",
+      "preconditions": [
+        "Migration has run",
+        "A tenant exists"
+      ],
+      "steps": [
+        "Insert a SignedTreeHead with merkle_frontier = some_binary",
+        "Fetch it by (tenant_id, chain_position)",
+        "Assert merkle_frontier matches"
+      ],
+      "expected_results": [
+        "merkle_frontier is persisted and retrieved correctly"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.1.3",
+      "name": "Existing STHs have nil merkle_frontier after migration",
+      "type": "integration",
+      "preconditions": [
+        "An STH exists from pre-migration",
+        "Migration has run"
+      ],
+      "steps": [
+        "Query the STH from the database",
+        "Check the merkle_frontier field"
+      ],
+      "expected_results": [
+        "merkle_frontier is nil"
+      ],
+      "status": "pending"
+    }
+  ],
+  "notes": "This is a foundational schema change; US-35.2 depends on it. Keep the changeset backward-compatible (merkle_frontier optional) so existing code paths don't break during the migration window."
+}

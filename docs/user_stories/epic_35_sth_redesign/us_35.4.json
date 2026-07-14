@@ -1,0 +1,92 @@
+{
+  "id": "US-35.4",
+  "title": "Add partial index on dispatches(expires_at) WHERE revoked_at IS NULL",
+  "epic": {
+    "id": "epic_35",
+    "name": "STH & cron fleet-cost redesign"
+  },
+  "priority": "high",
+  "phase": "optimization",
+  "story": {
+    "as_a": "platform operator",
+    "i_want_to": "add a partial index on the dispatches table to speed up the RevokeExpiredDispatchesWorker query",
+    "so_that": "the worker's 60-second scan of expired dispatches uses an index instead of a full table scan, reducing database load by a constant factor per tenant"
+  },
+  "rationale": "RevokeExpiredDispatchesWorker runs every 60 seconds and queries `SELECT id, api_key_id FROM dispatches WHERE revoked_at IS NULL AND expires_at < now()`. The existing index [:tenant_id, :expires_at] is not selective (many dispatches are not revoked), so the query often devolves to a table scan. A partial index (WHERE revoked_at IS NULL) filters the index itself to only non-revoked rows, allowing the query planner to use the index on a much smaller keyspace. This is a quick win: migration only, no code change.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-35.4.1",
+      "description": "A new migration adds a partial index: CREATE INDEX dispatches_expires_at_unrevoked_idx ON dispatches(expires_at) WHERE revoked_at IS NULL",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.4.2",
+      "description": "The migration is reversible (DROP INDEX IF EXISTS dispatches_expires_at_unrevoked_idx)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.4.3",
+      "description": "After migration, EXPLAIN ANALYZE on the RevokeExpiredDispatchesWorker query shows the index is used (Index Scan instead of Seq Scan)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.4.4",
+      "description": "Query latency for RevokeExpiredDispatchesWorker is reduced or stable; no regression",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-35.4.1",
+      "name": "Partial index is created and present in database",
+      "type": "integration",
+      "preconditions": [
+        "Migration has run"
+      ],
+      "steps": [
+        "Query pg_indexes for an index named dispatches_expires_at_unrevoked_idx",
+        "Verify the index definition includes WHERE revoked_at IS NULL"
+      ],
+      "expected_results": [
+        "Index exists and is correctly defined"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.4.2",
+      "name": "Index is used by the revoke worker query",
+      "type": "integration",
+      "preconditions": [
+        "Migration has run",
+        "dispatches table has 1000+ rows with mixed revoked_at status"
+      ],
+      "steps": [
+        "Run EXPLAIN ANALYZE on: SELECT id, api_key_id FROM dispatches WHERE revoked_at IS NULL AND expires_at < now()",
+        "Check the query plan"
+      ],
+      "expected_results": [
+        "Plan includes Index Scan or Index Only Scan on dispatches_expires_at_unrevoked_idx",
+        "No Seq Scan on dispatches"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.4.3",
+      "name": "Migration is reversible",
+      "type": "integration",
+      "preconditions": [
+        "Migration has run forward"
+      ],
+      "steps": [
+        "Run migration rollback",
+        "Query pg_indexes for the index"
+      ],
+      "expected_results": [
+        "Index is dropped after rollback",
+        "Forward migration can be rerun without conflict"
+      ],
+      "status": "pending"
+    }
+  ],
+  "notes": "This is a low-risk change (index only, no table/code changes). It can be deployed independently and is safe to add/drop on a live system with low contention risk. If the table is very large (millions of rows) and mostly non-revoked, this index could improve the worker's latency significantly (10s to 100s of ms)."
+}

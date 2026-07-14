@@ -1,0 +1,129 @@
+{
+  "id": "US-35.2",
+  "title": "Implement incremental merkle tree computation using frontier",
+  "epic": {
+    "id": "epic_35",
+    "name": "STH & cron fleet-cost redesign"
+  },
+  "priority": "critical",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "refactor AuditChain.sign_and_store_tree_head/1 to compute merkle tree incrementally: fetch only entries above the previous STH's chain_position, compute the tree for only those entries, and fold the result into the previous merkle root using the stored frontier",
+    "so_that": "STH computation becomes O(new entries) instead of O(total history), reducing database load during peak activity when many tenants are active"
+  },
+  "rationale": "The current compute_merkle_root/1 fetches all entry hashes from genesis and rebuilds the entire tree every minute. With the frontier persisted (from US-35.1), we can compute only on the delta. The frontier stores the sibling hashes needed to attach a new subtree to the root; folding is just hash(prev_root, new_subtree_root), replacing O(n) work with O(log n) work.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-35.2.1",
+      "description": "A new function AuditChain.compute_merkle_frontier/2 (tenant_id, last_position) returns {frontier_path, merkle_root} for entries above last_position",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.2.2",
+      "description": "AuditChain.compute_merkle_root/1 is unchanged in signature but internally checks for a previous STH; if one exists and frontier is present, it calls compute_merkle_frontier; if not, it falls back to the current full-recompute path",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.2.3",
+      "description": "sign_and_store_tree_head/1 extracts the frontier from compute_merkle_frontier and stores it in the merkle_frontier field of the new STH",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.2.4",
+      "description": "Incremental computation works correctly for tenant chains from 0 entries (genesis) to millions of entries (incremental path taken)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.2.5",
+      "description": "The merkle_frontier field is populated on every new STH insert via sign_and_store_tree_head/1",
+      "status": "pending"
+    },
+    {
+      "id": "AC-35.2.6",
+      "description": "The final merkle_root computed incrementally matches the root that would have been computed by re-scanning the entire chain (deterministic correctness)",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-35.2.1",
+      "name": "compute_merkle_frontier returns correct frontier and root for delta entries",
+      "type": "unit",
+      "preconditions": [
+        "A tenant exists",
+        "The tenant's chain has 1000+ entries",
+        "An STH exists at position 500 with frontier"
+      ],
+      "steps": [
+        "Call compute_merkle_frontier(tenant_id, 500)",
+        "Verify the returned frontier is a list of hashes",
+        "Verify the returned merkle_root is a 32-byte binary"
+      ],
+      "expected_results": [
+        "compute_merkle_frontier succeeds",
+        "frontier length is O(log(chain_size)), not O(new_entries)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.2.2",
+      "name": "Incremental merkle_root matches full recompute",
+      "type": "integration",
+      "preconditions": [
+        "A tenant exists",
+        "The chain has 100 entries"
+      ],
+      "steps": [
+        "Compute merkle_root via full recompute (current path)",
+        "Compute merkle_root via incremental path",
+        "Compare the two roots"
+      ],
+      "expected_results": [
+        "Both roots are identical"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.2.3",
+      "name": "sign_and_store_tree_head populates merkle_frontier",
+      "type": "integration",
+      "preconditions": [
+        "A tenant exists with an existing STH",
+        "A new entry has been appended"
+      ],
+      "steps": [
+        "Call sign_and_store_tree_head(tenant_id)",
+        "Fetch the new STH",
+        "Assert merkle_frontier is not nil"
+      ],
+      "expected_results": [
+        "merkle_frontier is populated and is a binary"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-35.2.4",
+      "name": "Genesis STH (first entry) uses full recompute fallback",
+      "type": "integration",
+      "preconditions": [
+        "A new tenant exists with no STHs",
+        "One entry has been appended"
+      ],
+      "steps": [
+        "Call sign_and_store_tree_head(tenant_id)",
+        "Fetch the resulting STH",
+        "Assert chain_position is 1"
+      ],
+      "expected_results": [
+        "STH is created successfully",
+        "Fallback to full recompute works (no previous STH to fold against)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "dependencies": [
+    "US-35.1"
+  ],
+  "notes": "The frontier is a serialized list of hashes; use the same merkle_tree/1 helper but capture the intermediate hashes during recursion. Consider a helper like merkle_tree_with_frontier/1 that returns both the root and the frontier path (a list of hashes at each level of the tree). Binary encoding (e.g., frame by length or just concatenate) is fine for storage; decode it on retrieval."
+}
