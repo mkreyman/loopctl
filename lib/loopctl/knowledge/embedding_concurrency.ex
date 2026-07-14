@@ -272,16 +272,26 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   end
 
   @impl GenServer
-  def handle_call({:release, pid, tenant_id}, _from, state) do
+  def handle_call({:release, pid, _tenant_id}, _from, state) do
     # EXACTLY-ONCE decrement, gated on the pid still being tracked. Demonitor with
     # [:flush] to purge any already-queued :DOWN for this pid so the :DOWN handler
     # can't ALSO decrement. If the pid is NOT tracked (a :DOWN already reclaimed it,
     # or a double-release), this is a no-op — the counters are never over-decremented.
+    #
+    # The tenant charged is the AUTHORITATIVE tenant_id stored at acquire time
+    # (state.monitors[ref]), NOT the caller-supplied argument — symmetric with the
+    # :DOWN handler, which has no argument to trust. This keeps the accounting robust
+    # even if a caller ever released with a different tenant_id than it acquired: the
+    # acquired tenant's counter would otherwise leak permanently while a different
+    # tenant's counter is floored. The invariant `pids[pid] = ref` ⇒
+    # `monitors[ref] = {pid, tenant_id}` is maintained atomically by track/3 + untrack/3,
+    # so the fetch! never fails.
     case Map.get(state.pids, pid) do
       nil ->
         {:reply, :ok, state}
 
       ref ->
+        {^pid, tenant_id} = Map.fetch!(state.monitors, ref)
         Process.demonitor(ref, [:flush])
         decrement(tenant_id)
         {:reply, :ok, untrack(state, ref, pid)}
@@ -361,12 +371,26 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   # ONLY from the GenServer process (release/DOWN), so decrements are serialized.
   defp decrement(tenant_id) do
     dec_floor(@global_key)
-    dec_floor(tenant_key(tenant_id))
+    dec_tenant(tenant_key(tenant_id))
     :ok
   end
 
   defp dec_floor(key) do
     :ets.update_counter(@table, key, {2, -1, 0, 0}, {key, 0})
+  end
+
+  # Per-tenant rows are REAPED once they reach zero, so the table doesn't accumulate a
+  # permanent zero-valued row per distinct tenant that ever embedded (unbounded-by-
+  # tenant-count growth otherwise). Safe because EVERY counter mutation
+  # (acquire/release/DOWN) runs in this single serialized GenServer process: no
+  # concurrent acquire can interleave to observe a transiently-absent row, and a fresh
+  # acquire re-creates the row via `update_counter`'s `{key, 0}` default. The global row
+  # is deliberately kept (single, always-present, hot).
+  defp dec_tenant(key) do
+    case :ets.update_counter(@table, key, {2, -1, 0, 0}, {key, 0}) do
+      0 -> :ets.delete(@table, key)
+      _ -> :ok
+    end
   end
 
   defp counter(key) do

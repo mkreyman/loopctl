@@ -53,6 +53,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
+  alias Loopctl.Knowledge.EmbeddingConcurrency
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.OKF
   alias Loopctl.Knowledge.VectorSearch
@@ -173,8 +174,13 @@ defmodule Loopctl.Knowledge do
   @max_pair_offset 10_000
   @default_walk_length 4
   @max_walk_length 25
-  # Novelty scoring embeds each idea concurrently (bounded) so a 50-idea batch
-  # doesn't serialize 50 embedding round-trips.
+  # Novelty scoring embeds each idea concurrently (bounded) so a 50-idea batch doesn't
+  # serialize 50 embedding round-trips. This is a STATIC CEILING; the effective width is
+  # computed by novelty_concurrency/0, which caps it further to leave guaranteed headroom
+  # below the per-tenant embedding budget (US-37.2 review): the fan-out and the SAME
+  # tenant's interactive combined searches share EmbeddingConcurrency's per-tenant cap,
+  # so an uncapped fan-out (5) could hold nearly the whole per-tenant budget (default 6)
+  # and starve that tenant's concurrent interactive searches down to keyword fallback.
   @novelty_concurrency 5
 
   # Maximum text length for a novelty idea to prevent unbounded embedding input.
@@ -5301,7 +5307,8 @@ defmodule Loopctl.Knowledge do
   Novelty scoring (#152 A2): for each idea, the **cosine distance** to its nearest
   prior proposal — `0` = identical to existing work, higher = more novel (up to `2.0`
   for an opposite embedding). Embeds each idea's text on the fly, concurrently (bounded
-  at #{@novelty_concurrency}). Priors default to published articles tagged `proposal`;
+  at #{@novelty_concurrency}, and further capped to leave headroom below the per-tenant
+  embedding cap). Priors default to published articles tagged `proposal`;
   pass `:prior_tag` to use a different family.
 
   ## Parameters
@@ -5332,7 +5339,7 @@ defmodule Loopctl.Knowledge do
       else
         ideas
         |> Task.async_stream(&score_idea(tenant_id, &1, prior_tag, vis),
-          max_concurrency: @novelty_concurrency,
+          max_concurrency: novelty_concurrency(),
           timeout: :infinity,
           ordered: true
         )
@@ -5348,6 +5355,23 @@ defmodule Loopctl.Knowledge do
       end
 
     {:ok, scored, prior_count}
+  end
+
+  # Effective novelty fan-out width. Bounded by the static @novelty_concurrency ceiling
+  # AND capped to leave headroom below EmbeddingConcurrency's per-tenant embedding cap,
+  # so a single novelty batch can't consume the whole per-tenant budget and starve the
+  # SAME tenant's concurrent interactive searches to keyword fallback (US-37.2 review).
+  # Reserve at least ~1/3 of the per-tenant budget (min 1 slot) for other embedding
+  # traffic; never exceed the static ceiling; never below 1. Reading max_per_tenant/0
+  # directly (not via the acquire/release DI seam) is fine — it is a cached SystemConfig
+  # read, and this runs once per novelty_scores/3 call, not per idea.
+  defp novelty_concurrency do
+    per_tenant = EmbeddingConcurrency.max_per_tenant()
+    reserved = max(1, div(per_tenant, 3))
+
+    (per_tenant - reserved)
+    |> min(@novelty_concurrency)
+    |> max(1)
   end
 
   # Count of embedded prior proposals visible to the caller — the set actually
