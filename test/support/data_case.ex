@@ -137,6 +137,12 @@ defmodule Loopctl.DataCase do
       {:ok, List.duplicate(0.1, 1536)}
     end)
 
+    # US-37.4: default stub for the BATCH embedding path -- returns one 1536-dim
+    # vector of 0.1 per input text, in input order (matching the single-text stub).
+    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _tenant_id, texts ->
+      {:ok, Enum.map(texts, fn _ -> List.duplicate(0.1, 1536) end)}
+    end)
+
     # US-37.2: permissive default for the per-node embedding concurrency gate --
     # acquire/1 always grants a slot, release/1 is a no-op -- so every existing
     # embedding/search test runs under the cap unchanged. The saturation test

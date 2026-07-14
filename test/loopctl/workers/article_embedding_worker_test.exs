@@ -232,9 +232,11 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       %{tenant: tenant} = setup_tenant()
       article = create_published_article(tenant.id)
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
+      # US-37.4: the create/update enqueue now routes through the per-tenant
+      # BatchEmbeddingWorker, which calls the plural `generate_embeddings/2`.
+      expect(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _tenant_id, [text] ->
         assert text =~ "Updated Title"
-        {:ok, List.duplicate(0.2, 1536)}
+        {:ok, [List.duplicate(0.2, 1536)]}
       end)
 
       assert {:ok, updated} =
@@ -247,9 +249,9 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       %{tenant: tenant} = setup_tenant()
       article = create_published_article(tenant.id)
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _tenant_id, [text] ->
         assert text =~ "Updated body content"
-        {:ok, List.duplicate(0.3, 1536)}
+        {:ok, [List.duplicate(0.3, 1536)]}
       end)
 
       assert {:ok, _updated} =
@@ -270,9 +272,9 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
 
       assert draft.embedding == nil
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _tenant_id, [text] ->
         assert text =~ "Draft to Publish"
-        {:ok, List.duplicate(0.4, 1536)}
+        {:ok, [List.duplicate(0.4, 1536)]}
       end)
 
       assert {:ok, published} =

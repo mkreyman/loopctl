@@ -61,7 +61,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Oban.FairShare
   alias Loopctl.Provider.Admission
   alias Loopctl.SystemConfig
-  alias Loopctl.Workers.ArticleEmbeddingWorker
+  alias Loopctl.Workers.BatchEmbeddingWorker
 
   @content_extractor Application.compile_env(
                        :loopctl,
@@ -926,12 +926,16 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # Enqueue an embedding job for each just-inserted (published) article. Runs
   # post-commit and is best-effort: a transient enqueue failure is logged, never
   # raised, so it can't fail/retry the whole ingestion job.
-  defp enqueue_embeddings(tenant_id, returned) do
-    Enum.each(returned, fn article ->
-      %{article_id: article.id, tenant_id: tenant_id}
-      |> ArticleEmbeddingWorker.new()
-      |> Oban.insert()
-    end)
+  defp enqueue_embeddings(_tenant_id, []), do: :ok
+
+  defp enqueue_embeddings(tenant_id, _returned) do
+    # US-37.4: the just-inserted published rows all have embedding=NULL, so a
+    # single per-tenant batch worker drains them in array batches (~100/call)
+    # instead of one provider round-trip per ingested article.
+    BatchEmbeddingWorker.new(%{tenant_id: tenant_id, kind: "article"})
+    |> Oban.insert()
+
+    :ok
   rescue
     e ->
       Logger.error("ContentIngestionWorker: embedding enqueue failed: #{Exception.message(e)}")

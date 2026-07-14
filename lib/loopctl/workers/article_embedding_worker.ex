@@ -1,6 +1,14 @@
 defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   @moduledoc """
-  Oban worker that generates and stores vector embeddings for articles.
+  Oban worker that generates and stores the vector embedding for a SINGLE article.
+
+  > **US-37.4:** background embedding is now driven by the per-tenant
+  > `Loopctl.Workers.BatchEmbeddingWorker`, which drains a tenant's pending
+  > articles in array batches (~100/provider call). The create/update/publish/
+  > ingestion enqueue sites route through that batch worker; this single-item
+  > worker is retained as the one-record embedding primitive (and is exercised
+  > directly by the fair-share gate tests). Both share the same guarded embed
+  > path, content-hash idempotency, and BYO/permanent-error semantics.
 
   Runs in the `:embeddings` queue with concurrency 5. When an article is
   created or updated with content changes (title/body) and is in `:published`

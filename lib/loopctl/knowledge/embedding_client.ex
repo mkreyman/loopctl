@@ -51,6 +51,84 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
     end
   end
 
+  @impl true
+  def generate_embeddings(_tenant_id, []), do: {:ok, []}
+
+  def generate_embeddings(tenant_id, texts) when is_binary(tenant_id) and is_list(texts) do
+    case Llm.resolve(tenant_id, :embedding) do
+      {:error, :no_api_key} ->
+        # Mandatory BYO: no tenant key => no provider call, no operator spend.
+        {:error, :no_api_key}
+
+      {:ok, %{api_key: api_key, model: model}} ->
+        post_batch(tenant_id, api_key, model, texts)
+    end
+  end
+
+  # US-37.4: one admission token for the WHOLE array call (AC-37.4.4) — the batch
+  # is a single provider round-trip, so it takes exactly one token from the US-37.1
+  # bucket, exactly like the single-text path.
+  defp post_batch(tenant_id, api_key, model, texts) do
+    with :ok <- Admission.admit(tenant_id, :embedding) do
+      do_post_batch(tenant_id, api_key, model, texts)
+    end
+  end
+
+  defp do_post_batch(tenant_id, api_key, model, texts) do
+    base_url = provider_config()[:base_url] || @default_base_url
+
+    # The array call is a single HTTP request carrying up to ~100 texts, so it
+    # needs a longer receive budget than the single-text path (kept behind its own
+    # live-tunable SystemConfig key; the in-code default applies on a cache miss).
+    opts =
+      [
+        json: %{input: texts, model: model},
+        headers: [{"authorization", "Bearer #{api_key}"}],
+        retry: :transient,
+        max_retries: SystemConfig.get_int("embedding_max_retries", 0),
+        receive_timeout: SystemConfig.get_int("embedding_batch_receive_timeout_ms", 30_000)
+      ]
+      |> maybe_put_plug()
+
+    case Req.post("#{base_url}/embeddings", opts) do
+      {:ok, %{status: 200, body: %{"data" => data} = resp}} when is_list(data) ->
+        record_usage_safe(tenant_id, model, resp["usage"])
+        map_embeddings_by_index(data, length(texts))
+
+      {:ok, %{status: status, body: body}} ->
+        Logger.warning("Loopctl.Knowledge.EmbeddingClient: batch API error (status=#{status})")
+        {:error, ProviderError.sanitize({:api_error, status, body})}
+
+      {:error, reason} ->
+        Logger.warning(
+          "Loopctl.Knowledge.EmbeddingClient: batch request failed (#{ProviderError.log_tag({:request_failed, reason})})"
+        )
+
+        {:error, {:request_failed, reason}}
+    end
+  end
+
+  # AC-37.4.1: map each returned vector back to its input BY the response `index`
+  # field — never by array position — since OpenAI-compatible endpoints do NOT
+  # guarantee `data` is index-ordered. Reassemble in input order (0..n-1). A
+  # missing index means the provider returned an incomplete batch: fail as a unit
+  # so the caller never writes a partial/misaligned set of vectors.
+  defp map_embeddings_by_index(data, count) do
+    by_index =
+      Enum.reduce(data, %{}, fn
+        %{"index" => i, "embedding" => vec}, acc when is_integer(i) -> Map.put(acc, i, vec)
+        _entry, acc -> acc
+      end)
+
+    vectors = Enum.map(0..(count - 1), &Map.get(by_index, &1))
+
+    if Enum.any?(vectors, &is_nil/1) do
+      {:error, {:embedding_batch_incomplete, count}}
+    else
+      {:ok, vectors}
+    end
+  end
+
   defp post(tenant_id, api_key, model, text) do
     # US-37.1: per-(tenant, provider) token-bucket admission gate. On an empty
     # node-local bucket, fast-fail WITHOUT building/sending the request so the

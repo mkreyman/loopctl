@@ -3,8 +3,14 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   Oban worker that generates and stores the vector embedding for a long-term
   agent memory (`Loopctl.Memory.Memory`), Epic 28 / US-28.2.
 
-  Runs in the `:embeddings` queue. Enqueued by `Loopctl.Memory.remember/2` when a
-  long-term memory is written (the row's `embedding` starts NULL). Mirrors
+  > **US-37.4:** background memory embedding is now driven by the per-tenant
+  > `Loopctl.Workers.BatchEmbeddingWorker` (array batches, ~100/provider call);
+  > `Loopctl.Memory.remember/2` enqueues that batch worker. This single-item
+  > worker is retained as the one-record embedding primitive and still shares the
+  > guarded embed path, content-hash idempotency, and BYO/permanent-error
+  > semantics described below.
+
+  Runs in the `:embeddings` queue. Mirrors
   `Loopctl.Workers.ArticleEmbeddingWorker` — same guarded embed path, content-hash
   idempotency, BYO-key / permanent-error discard semantics, AND the US-36.2 per-tenant
   fair-share gate at the top of `perform/1`. The gate is load-bearing here, not

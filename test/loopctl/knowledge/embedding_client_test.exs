@@ -154,4 +154,103 @@ defmodule Loopctl.Knowledge.EmbeddingClientTest do
     refute log =~ secret
     refute log =~ masked
   end
+
+  describe "generate_embeddings/2 (US-37.4 batch path)" do
+    test "TC-37.4.1: sends `input` as an ARRAY and maps each vector back BY response index" do
+      tenant = fixture(:tenant)
+      test_pid = self()
+      set_embedding_key(tenant, "test-openai-key-BATCH-1")
+
+      va = [0.1, 0.1, 0.1]
+      vb = [0.2, 0.2, 0.2]
+      vc = [0.3, 0.3, 0.3]
+
+      Req.Test.stub(EmbeddingClient, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:body, JSON.decode!(body)})
+
+        # Return data DELIBERATELY out of order — the client must reassemble by the
+        # `index` field, not by array position.
+        Req.Test.json(conn, %{
+          "data" => [
+            %{"index" => 2, "embedding" => vc},
+            %{"index" => 0, "embedding" => va},
+            %{"index" => 1, "embedding" => vb}
+          ],
+          "usage" => %{"prompt_tokens" => 9, "total_tokens" => 9}
+        })
+      end)
+
+      assert {:ok, [^va, ^vb, ^vc]} =
+               EmbeddingClient.generate_embeddings(tenant.id, ["alpha", "beta", "gamma"])
+
+      # The request body carried `input` as a JSON ARRAY, in input order.
+      assert_received {:body, %{"input" => ["alpha", "beta", "gamma"]}}
+    end
+
+    test "empty list short-circuits to {:ok, []} with NO provider call" do
+      tenant = fixture(:tenant)
+      test_pid = self()
+      set_embedding_key(tenant, "test-openai-key-BATCH-EMPTY")
+
+      Req.Test.stub(EmbeddingClient, fn conn ->
+        send(test_pid, :unexpected_http_call)
+        Req.Test.json(conn, %{"data" => []})
+      end)
+
+      assert {:ok, []} = EmbeddingClient.generate_embeddings(tenant.id, [])
+      refute_received :unexpected_http_call
+    end
+
+    test "mandatory BYO: a keyless tenant gets {:error, :no_api_key} with NO provider call" do
+      tenant = fixture(:tenant)
+      test_pid = self()
+
+      Req.Test.stub(EmbeddingClient, fn conn ->
+        send(test_pid, :unexpected_http_call)
+        Req.Test.json(conn, %{"data" => [%{"index" => 0, "embedding" => [0.0]}]})
+      end)
+
+      assert {:error, :no_api_key} =
+               EmbeddingClient.generate_embeddings(tenant.id, ["a", "b"])
+
+      refute_received :unexpected_http_call
+    end
+
+    test "a provider error fails the WHOLE batch as a unit (no partial vectors)" do
+      tenant = fixture(:tenant)
+      set_embedding_key(tenant, "test-openai-key-BATCH-500")
+
+      Req.Test.stub(EmbeddingClient, fn conn ->
+        conn
+        |> Plug.Conn.put_status(500)
+        |> Req.Test.json(%{"error" => %{"message" => "upstream boom"}})
+      end)
+
+      assert {:error, {:api_error, 500, :provider_error}} =
+               EmbeddingClient.generate_embeddings(tenant.id, ["a", "b", "c"])
+    end
+
+    test "cross-tenant: tenant A's batch uses A's key, never B's" do
+      a = fixture(:tenant)
+      b = fixture(:tenant)
+      test_pid = self()
+
+      set_embedding_key(a, "test-openai-key-AAAA")
+      set_embedding_key(b, "test-openai-key-BBBB")
+
+      Req.Test.stub(EmbeddingClient, fn conn ->
+        send(test_pid, {:auth, Plug.Conn.get_req_header(conn, "authorization")})
+
+        Req.Test.json(conn, %{
+          "data" => [%{"index" => 0, "embedding" => [1.0]}],
+          "usage" => %{"prompt_tokens" => 1}
+        })
+      end)
+
+      assert {:ok, [[1.0]]} = EmbeddingClient.generate_embeddings(a.id, ["x"])
+      assert_received {:auth, ["Bearer test-openai-key-AAAA"]}
+      refute_received {:auth, ["Bearer test-openai-key-BBBB"]}
+    end
+  end
 end

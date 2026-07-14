@@ -60,7 +60,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Projects.Project
   alias Loopctl.Webhooks.EventGenerator
-  alias Loopctl.Workers.ArticleEmbeddingWorker
+  alias Loopctl.Workers.BatchEmbeddingWorker
 
   # Maximum page size for the article list endpoint (`list_articles/2`). Larger
   # limits are HONORED up to this cap so callers can paginate to exhaustion at
@@ -792,6 +792,37 @@ defmodule Loopctl.Knowledge do
       nil -> {:error, :not_found}
       article -> {:ok, article}
     end
+  end
+
+  @doc """
+  US-37.4: lists up to `limit` PUBLISHED articles for `tenant_id` that still need
+  an embedding — those with `embedding IS NULL`. A brand-new published article
+  starts NULL; a content change re-nulls the vector at the enqueue site (see
+  `maybe_enqueue_embedding/3`) so the article re-enters this pending set and the
+  batch drainer re-embeds it.
+
+  `embedding IS NULL` (NOT `embedding_content_hash IS NULL`) is the deliberate
+  signal: `update_embedding/3` legitimately sets a vector with a nil hash, so a
+  hash-based predicate would loop-re-embed those rows forever.
+
+  Returns lightweight `%{id, title, body}` rows (tenant-scoped by the explicit
+  predicate — AC-37.4.4 isolation) for `Loopctl.Workers.BatchEmbeddingWorker` to
+  batch into one array call. Uses `AdminRepo` like the other embedding-worker
+  readers; the WHERE `tenant_id` keeps a batch to exactly one tenant's texts.
+  """
+  @spec list_articles_pending_embedding(Ecto.UUID.t(), pos_integer()) :: [
+          %{id: Ecto.UUID.t(), title: String.t(), body: String.t()}
+        ]
+  def list_articles_pending_embedding(tenant_id, limit)
+      when is_binary(tenant_id) and is_integer(limit) and limit > 0 do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id and a.status == :published,
+      where: is_nil(a.embedding),
+      order_by: [asc: a.updated_at, asc: a.id],
+      limit: ^limit,
+      select: %{id: a.id, title: a.title, body: a.body}
+    )
+    |> AdminRepo.all()
   end
 
   @doc """
@@ -3420,12 +3451,13 @@ defmodule Loopctl.Knowledge do
   # chunk.
   defp enqueue_bulk_embeddings(_tenant_id, []), do: :ok
 
-  defp enqueue_bulk_embeddings(tenant_id, published) do
-    Enum.each(published, fn article ->
-      %{article_id: article.id, tenant_id: tenant_id}
-      |> ArticleEmbeddingWorker.new()
-      |> Oban.insert()
-    end)
+  defp enqueue_bulk_embeddings(tenant_id, _published) do
+    # US-37.4: the just-published rows all have embedding=NULL, so a single
+    # per-tenant batch worker drains them in array batches — no per-row fan-out.
+    BatchEmbeddingWorker.new(%{tenant_id: tenant_id, kind: "article"})
+    |> Oban.insert()
+
+    :ok
   rescue
     e ->
       Logger.error("bulk_publish: embedding enqueue failed: #{Exception.message(e)}")
@@ -7370,6 +7402,92 @@ defmodule Loopctl.Knowledge do
     end
   end
 
+  @doc """
+  US-37.4: guarded BATCH embedding entry — the plural sibling of
+  `generate_embedding/3`. Embeds a LIST of texts in ONE provider array call and
+  returns the vectors in input order (`{:ok, [vector]}`), or `{:error, reason}`
+  for the WHOLE batch (atomicity: the caller writes nothing on error).
+
+  Routes through the SAME guard as the single-text path so background batching
+  never bypasses the breaker or the concurrency ceiling:
+
+    * per-tenant circuit breaker (fast `{:error, :circuit_open}` when tripped);
+    * ONE US-37.2 per-node concurrency slot for the whole batch (not one per text);
+    * the `[:loopctl, :llm, :provider_error]` telemetry signal recorded ONCE for
+      the batch via the same `breaker_countable?/1` gate.
+
+  An empty list short-circuits to `{:ok, []}` (no slot, no breaker, no call). The
+  interactive single-text callers are UNCHANGED — this is a background-only path.
+
+  `opts`:
+    * `:timeout` — Task.yield budget in ms (default `#{@embedding_yield_ms}`).
+  """
+  @spec generate_embeddings(Ecto.UUID.t(), [String.t()], keyword()) ::
+          {:ok, [[float()]]} | {:error, term()}
+  def generate_embeddings(tenant_id, texts, opts \\ [])
+      when is_binary(tenant_id) and is_list(texts) do
+    try_generate_embeddings(tenant_id, texts, opts)
+  end
+
+  defp try_generate_embeddings(_tenant_id, [], _opts), do: {:ok, []}
+
+  defp try_generate_embeddings(tenant_id, texts, opts) do
+    ensure_circuit_breaker_table()
+
+    if circuit_open?(tenant_id) do
+      {:error, :circuit_open}
+    else
+      timeout = Keyword.get(opts, :timeout, @embedding_yield_ms)
+      run_embedding_batch_task(tenant_id, texts, timeout)
+    end
+  end
+
+  # Mirrors run_embedding_task/3: acquire ONE concurrency slot for the whole array
+  # call (AC-37.4.4), release in `after` so a yield-timeout or in-task crash frees it.
+  defp run_embedding_batch_task(tenant_id, texts, timeout) do
+    case embedding_concurrency().acquire(tenant_id) do
+      :ok ->
+        try do
+          run_capped_embedding_batch_task(tenant_id, texts, timeout)
+        after
+          embedding_concurrency().release(tenant_id)
+        end
+
+      {:error, :rate_limited_local} = err ->
+        err
+    end
+  end
+
+  defp run_capped_embedding_batch_task(tenant_id, texts, timeout) do
+    task =
+      Task.Supervisor.async_nolink(Loopctl.Knowledge.EmbeddingTaskSupervisor, fn ->
+        try do
+          embedding_client().generate_embeddings(tenant_id, texts)
+        rescue
+          e -> {:error, {:embedding_crash, Exception.message(e)}}
+        end
+      end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task) do
+      {:ok, {:ok, embeddings}} ->
+        record_success(tenant_id)
+        {:ok, embeddings}
+
+      {:ok, {:error, :no_api_key}} ->
+        {:error, :no_api_key}
+
+      {:ok, {:error, reason} = err} ->
+        maybe_record_failure(tenant_id, reason)
+        maybe_record_provider_error(reason)
+        err
+
+      _ ->
+        record_failure(tenant_id)
+        maybe_record_provider_error(:timeout)
+        {:error, :timeout}
+    end
+  end
+
   # US-37.2: gate EVERY outbound embedding on a per-node concurrency cap BEFORE
   # spawning the task, so the interactive query path AND both Oban embedding workers
   # (which route through here via generate_embedding/3) share ONE real node ceiling
@@ -7601,9 +7719,20 @@ defmodule Loopctl.Knowledge do
   defp maybe_enqueue_embedding(multi, _tenant_id, false), do: multi
 
   defp maybe_enqueue_embedding(multi, tenant_id, true) do
-    Multi.run(multi, :embedding_job, fn _repo, %{article: article} ->
+    Multi.run(multi, :embedding_job, fn repo, %{article: article} ->
       if article.status == :published do
-        ArticleEmbeddingWorker.new(%{article_id: article.id, tenant_id: tenant_id})
+        # US-37.4: re-null an ALREADY-embedded article's vector (+hash) after a
+        # content change so it re-enters the `embedding IS NULL` pending set and the
+        # per-tenant batch drainer re-embeds it. A brand-new article already has
+        # embedding=NULL, so restrict the update to embedded rows. Then enqueue ONE
+        # per-tenant batch worker (unique per tenant+kind) instead of a per-article
+        # job, so many near-simultaneous writes coalesce into a single array call.
+        repo.update_all(
+          from(a in Article, where: a.id == ^article.id and not is_nil(a.embedding)),
+          set: [embedding: nil, embedding_content_hash: nil]
+        )
+
+        BatchEmbeddingWorker.new(%{tenant_id: tenant_id, kind: "article"})
         |> Oban.insert()
       else
         {:ok, :skipped}

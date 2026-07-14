@@ -56,7 +56,7 @@ defmodule Loopctl.Memory do
   alias Loopctl.Memory.Scope
   alias Loopctl.Memory.SessionMemory
   alias Loopctl.Memory.SessionPromotion
-  alias Loopctl.Workers.MemoryEmbeddingWorker
+  alias Loopctl.Workers.BatchEmbeddingWorker
   alias Loopctl.Workers.MemoryPromotionWorker
 
   @default_near_dup_threshold 0.92
@@ -283,7 +283,10 @@ defmodule Loopctl.Memory do
     end)
     |> Multi.insert(:memory, long_term_changeset(scope, attrs))
     |> Oban.insert(:embedding_job, fn %{memory: memory} ->
-      MemoryEmbeddingWorker.new(%{memory_id: memory.id, tenant_id: memory.tenant_id})
+      # US-37.4: enqueue ONE per-tenant batch drainer (unique per tenant+kind)
+      # instead of a per-memory job, so a bulk `remember` burst coalesces into
+      # array batches (~100/call) rather than one provider round-trip per memory.
+      BatchEmbeddingWorker.new(%{tenant_id: memory.tenant_id, kind: "memory"})
     end)
     |> AdminRepo.transaction()
     |> case do
@@ -1494,6 +1497,27 @@ defmodule Loopctl.Memory do
       nil -> {:error, :not_found}
       memory -> {:ok, memory}
     end
+  end
+
+  @doc """
+  US-37.4: lists up to `limit` long-term memories for `tenant_id` that still need
+  an embedding (`embedding IS NULL`). Returns lightweight `%{id, text}` rows for
+  `Loopctl.Workers.BatchEmbeddingWorker` to batch into one array call. Tenant-scoped
+  by the explicit predicate (AC-37.4.4 isolation) via `AdminRepo`, mirroring
+  `get_memory_for_embedding/2`.
+  """
+  @spec list_memories_pending_embedding(String.t(), pos_integer()) :: [
+          %{id: String.t(), text: String.t()}
+        ]
+  def list_memories_pending_embedding(tenant_id, limit)
+      when is_binary(tenant_id) and is_integer(limit) and limit > 0 do
+    from(m in MemorySchema,
+      where: m.tenant_id == ^tenant_id and is_nil(m.embedding),
+      order_by: [asc: m.inserted_at, asc: m.id],
+      limit: ^limit,
+      select: %{id: m.id, text: m.text}
+    )
+    |> Loopctl.AdminRepo.all()
   end
 
   @doc """
