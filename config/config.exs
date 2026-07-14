@@ -342,6 +342,22 @@ config :loopctl, Oban,
 config :loopctl, :oban_metrics_poll_statement_timeout_ms, 2_000
 config :loopctl, :oban_metrics_orphan_threshold_minutes, 45
 
+# US-36.4: ArticleLinkingWorker hot-path efficiency tunables. This is the highest-frequency
+# :knowledge job (one per embedded article), so per-job waste multiplies under bulk ingest.
+# - article_link_statement_timeout_ms: per-query SET LOCAL statement_timeout wrapping the
+#   batched link insert_all and the sampled corpus-size count, so neither can hold an
+#   AdminRepo connection indefinitely. SET LOCAL is pgbouncer-safe (no startup parameter).
+# - article_link_corpus_sample_rate: the corpus-size-vs-limit warning was a full count(*)
+#   on EVERY job, paid only to feed a warning log. It now runs on ~1/N jobs, chosen
+#   deterministically by article-id hash (`:erlang.phash2(article_id, N) == 0`), and emits a
+#   [:loopctl, :knowledge, :article_linking, :corpus_size] telemetry event alongside the
+#   over-limit warning. N=1 samples every job; N<=0 disables it; a larger N samples less.
+# - article_link_insert_chunk_size: rows per insert_all batch, keeping a dense article's
+#   link fan-out well under Postgres's 65535 bind-parameter ceiling (~6 params/row).
+config :loopctl, :article_link_statement_timeout_ms, 3_000
+config :loopctl, :article_link_corpus_sample_rate, 100
+config :loopctl, :article_link_insert_chunk_size, 1_000
+
 # US-34.2: the COUNT threshold that trips `Loopctl.HealthCheck.Default`'s
 # `oban_orphans` readiness sub-check into "error" — distinct from the AGE
 # threshold above (`oban_metrics_orphan_threshold_minutes`: WHICH jobs count as

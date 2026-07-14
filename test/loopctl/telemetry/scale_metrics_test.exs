@@ -64,7 +64,8 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.oban.jobs.count",
     "loopctl.oban.jobs.executing_orphan.count",
     "loopctl.oban.poll.error.count",
-    "loopctl.ingestion.backlog_gate.failed_open.count"
+    "loopctl.ingestion.backlog_gate.failed_open.count",
+    "loopctl.knowledge.article_linking.corpus_size"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this
@@ -176,6 +177,26 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert ScaleMetrics.semantic_fallback_tags(%{}) == %{reason: "unknown"}
     end
 
+    test "the article-linking corpus-size gauge (US-36.4) is a last_value tagged by tenant_id ONLY" do
+      gauge = metric("loopctl.knowledge.article_linking.corpus_size")
+
+      assert %Telemetry.Metrics.LastValue{} = gauge
+      assert gauge.tags == [:tenant_id]
+      assert gauge.measurement == :total
+      # The unbounded per-article/project ids in the event metadata are NEVER labels.
+      refute :article_id in gauge.tags
+      refute :project_id in gauge.tags
+
+      # tenant_id reuses the SAME cap-gated sentinel collapse as the other scale counters
+      # (exercised under a controlled gate in the "tenant-label cap gate" describe below).
+      assert ScaleMetrics.article_linking_corpus_size_tags(%{
+               tenant_id: "t-1",
+               article_id: "a-1",
+               project_id: "p-1"
+             })
+             |> Map.keys() == [:tenant_id]
+    end
+
     test "the hybrid-provenance counter (US-31.2) is tagged by provenance, hit, and tenant_id" do
       counter = metric("loopctl.knowledge.hybrid_provenance.count")
 
@@ -274,6 +295,24 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                hit: false,
                tenant_id: "t-123"
              }) == %{provenance: "retrieved", hit: false, tenant_id: "t-123"}
+    end
+
+    test "article_linking_corpus_size_tags/1 reuses the SAME cap-gated tenant_id collapse" do
+      gate_off()
+
+      assert ScaleMetrics.article_linking_corpus_size_tags(%{
+               tenant_id: "t-123",
+               article_id: "a-1",
+               project_id: "p-1"
+             }) == %{tenant_id: :_aggregated}
+
+      gate_on()
+
+      assert ScaleMetrics.article_linking_corpus_size_tags(%{
+               tenant_id: "t-123",
+               article_id: "a-1",
+               project_id: "p-1"
+             }) == %{tenant_id: "t-123"}
     end
 
     test "tenant_id over the cap is bounded to cardinality 1 across many distinct tenants" do
