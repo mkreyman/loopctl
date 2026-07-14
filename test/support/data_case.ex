@@ -137,6 +137,13 @@ defmodule Loopctl.DataCase do
       {:ok, List.duplicate(0.1, 1536)}
     end)
 
+    # US-37.2: permissive default for the per-node embedding concurrency gate --
+    # acquire/1 always grants a slot, release/1 is a no-op -- so every existing
+    # embedding/search test runs under the cap unchanged. The saturation test
+    # overrides acquire/1 to return {:error, :rate_limited_local}.
+    Mox.stub(Loopctl.MockEmbeddingConcurrency, :acquire, fn _tenant_id -> :ok end)
+    Mox.stub(Loopctl.MockEmbeddingConcurrency, :release, fn _tenant_id -> :ok end)
+
     # Default stub for knowledge extractor -- returns empty list (no articles).
     # tenant_id is threaded first (Epic 28 BYO, review #1).
     Mox.stub(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->

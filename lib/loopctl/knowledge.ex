@@ -53,6 +53,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
+  alias Loopctl.Knowledge.EmbeddingConcurrency
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.OKF
   alias Loopctl.Knowledge.VectorSearch
@@ -173,8 +174,13 @@ defmodule Loopctl.Knowledge do
   @max_pair_offset 10_000
   @default_walk_length 4
   @max_walk_length 25
-  # Novelty scoring embeds each idea concurrently (bounded) so a 50-idea batch
-  # doesn't serialize 50 embedding round-trips.
+  # Novelty scoring embeds each idea concurrently (bounded) so a 50-idea batch doesn't
+  # serialize 50 embedding round-trips. This is a STATIC CEILING; the effective width is
+  # computed by novelty_concurrency/0, which caps it further to leave guaranteed headroom
+  # below the per-tenant embedding budget (US-37.2 review): the fan-out and the SAME
+  # tenant's interactive combined searches share EmbeddingConcurrency's per-tenant cap,
+  # so an uncapped fan-out (5) could hold nearly the whole per-tenant budget (default 6)
+  # and starve that tenant's concurrent interactive searches down to keyword fallback.
   @novelty_concurrency 5
 
   # Maximum text length for a novelty idea to prevent unbounded embedding input.
@@ -5301,7 +5307,8 @@ defmodule Loopctl.Knowledge do
   Novelty scoring (#152 A2): for each idea, the **cosine distance** to its nearest
   prior proposal — `0` = identical to existing work, higher = more novel (up to `2.0`
   for an opposite embedding). Embeds each idea's text on the fly, concurrently (bounded
-  at #{@novelty_concurrency}). Priors default to published articles tagged `proposal`;
+  at #{@novelty_concurrency}, and further capped to leave headroom below the per-tenant
+  embedding cap). Priors default to published articles tagged `proposal`;
   pass `:prior_tag` to use a different family.
 
   ## Parameters
@@ -5332,7 +5339,7 @@ defmodule Loopctl.Knowledge do
       else
         ideas
         |> Task.async_stream(&score_idea(tenant_id, &1, prior_tag, vis),
-          max_concurrency: @novelty_concurrency,
+          max_concurrency: novelty_concurrency(),
           timeout: :infinity,
           ordered: true
         )
@@ -5348,6 +5355,23 @@ defmodule Loopctl.Knowledge do
       end
 
     {:ok, scored, prior_count}
+  end
+
+  # Effective novelty fan-out width. Bounded by the static @novelty_concurrency ceiling
+  # AND capped to leave headroom below EmbeddingConcurrency's per-tenant embedding cap,
+  # so a single novelty batch can't consume the whole per-tenant budget and starve the
+  # SAME tenant's concurrent interactive searches to keyword fallback (US-37.2 review).
+  # Reserve at least ~1/3 of the per-tenant budget (min 1 slot) for other embedding
+  # traffic; never exceed the static ceiling; never below 1. Reading max_per_tenant/0
+  # directly (not via the acquire/release DI seam) is fine — it is a cached SystemConfig
+  # read, and this runs once per novelty_scores/3 call, not per idea.
+  defp novelty_concurrency do
+    per_tenant = EmbeddingConcurrency.max_per_tenant()
+    reserved = max(1, div(per_tenant, 3))
+
+    (per_tenant - reserved)
+    |> min(@novelty_concurrency)
+    |> max(1)
   end
 
   # Count of embedded prior proposals visible to the caller — the set actually
@@ -7300,7 +7324,13 @@ defmodule Loopctl.Knowledge do
   - A tenant-scoped circuit breaker (opens for a tenant after #{@failure_threshold}
     COUNTABLE failures within #{@failure_window_seconds}s — so a failing tenant only
     degrades ITSELF, never other tenants; review #1).
-  - A `#{@embedding_yield_ms}`ms `Task.async` timeout (review #10).
+  - A per-node concurrency cap (US-37.2): `run_embedding_task/3` `acquire`s a slot
+    from `Loopctl.Knowledge.EmbeddingConcurrency` before spawning the task and
+    releases it after, so this SINGLE entry point bounds concurrent outbound embeds
+    across the interactive path AND both Oban embedding workers. Over the cap it
+    fast-fails with `{:error, :rate_limited_local}` (keyword fallback / worker snooze).
+  - A `#{@embedding_yield_ms}`ms `Task.Supervisor.async_nolink` yield budget (review
+    #10; US-37.2 supervises the task so its crash never crashes the caller).
   - A crash rescue handler.
 
   Returns `{:ok, embedding}` or `{:error, reason}`. Two error classes are EXEMPT
@@ -7340,9 +7370,42 @@ defmodule Loopctl.Knowledge do
     end
   end
 
+  # US-37.2: gate EVERY outbound embedding on a per-node concurrency cap BEFORE
+  # spawning the task, so the interactive query path AND both Oban embedding workers
+  # (which route through here via generate_embedding/3) share ONE real node ceiling
+  # (GH #352) — a GLOBAL cap plus a per-tenant sub-cap so one tenant's burst can't
+  # starve every other tenant's semantic search. The acquire is charged to THIS
+  # (request/worker) process for the request's tenant and released in an `after` so a
+  # yield-timeout shutdown or an in-task crash still frees the slot; a crash of THIS
+  # process is reclaimed by the gate's monitor. Over EITHER cap (or if the gate
+  # GenServer is down), acquire fast-fails with {:error, :rate_limited_local} — the
+  # breaker-exempt reason
+  # (see breaker_countable?/1) the combined-search branch turns into a keyword-only
+  # fallback and the workers snooze on — so the interactive path degrades gracefully
+  # instead of blocking, and NO circuit-breaker / provider-error signal is recorded
+  # (self-imposed backpressure is not a provider failure).
   defp run_embedding_task(tenant_id, query_string, timeout) do
+    case embedding_concurrency().acquire(tenant_id) do
+      :ok ->
+        try do
+          run_capped_embedding_task(tenant_id, query_string, timeout)
+        after
+          embedding_concurrency().release(tenant_id)
+        end
+
+      {:error, :rate_limited_local} = err ->
+        err
+    end
+  end
+
+  defp run_capped_embedding_task(tenant_id, query_string, timeout) do
+    # Task.Supervisor.async_nolink so an embedding task crash surfaces as
+    # {:exit, reason} from Task.yield (the `_ ->` clause -> {:error, :timeout})
+    # rather than crashing THIS process (AC-37.2.5). The inner rescue still catches
+    # embedding-client exceptions and returns {:error, {:embedding_crash, ...}};
+    # async_nolink additionally protects against exits the rescue can't catch.
     task =
-      Task.async(fn ->
+      Task.Supervisor.async_nolink(Loopctl.Knowledge.EmbeddingTaskSupervisor, fn ->
         try do
           embedding_client().generate_embedding(tenant_id, query_string)
         rescue
@@ -7366,7 +7429,8 @@ defmodule Loopctl.Knowledge do
         err
 
       _ ->
-        # nil (yield timeout) or an abnormal task exit — a provider/infra failure.
+        # nil (yield timeout), an abnormal task exit, or an async_nolink task crash
+        # surfacing as {:exit, reason} — a provider/infra failure.
         record_failure(tenant_id)
         maybe_record_provider_error(:timeout)
         {:error, :timeout}
@@ -7505,6 +7569,19 @@ defmodule Loopctl.Knowledge do
 
   defp embedding_client do
     Application.get_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient)
+  end
+
+  # US-37.2: the per-node embedding-concurrency gate, resolved via config-based DI
+  # (like embedding_client/0 above) so config/test.exs can swap in
+  # Loopctl.MockEmbeddingConcurrency — letting a saturation test force
+  # {:error, :rate_limited_local} deterministically without holding the real,
+  # VM-wide global counter saturated (which would starve unrelated async searches).
+  defp embedding_concurrency do
+    Application.get_env(
+      :loopctl,
+      :embedding_concurrency,
+      Loopctl.Knowledge.EmbeddingConcurrency
+    )
   end
 
   # --- Embedding helpers ---

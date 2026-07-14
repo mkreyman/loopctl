@@ -180,5 +180,31 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorkerTest do
       assert {:snooze, seconds} = MemoryEmbeddingWorker.perform(job(memory.id, tenant.id))
       assert is_integer(seconds) and seconds > 0
     end
+
+    test "US-37.2 (AC-37.2.2): the SAME per-node concurrency cap gates the worker (snooze, client never called)" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      memory =
+        fixture(:memory, %{tenant_id: tenant.id, subject_id: "s", text: "concurrency capped"})
+
+      # The concurrency gate (SAME one the interactive path AND ArticleEmbeddingWorker
+      # use) is saturated: this worker's generate_embedding -> run_embedding_task ->
+      # acquire returns {:error, :rate_limited_local} BEFORE the paid embedding client
+      # is ever reached. Asserting the client is NOT called (0 expectations) proves the
+      # cap really gates the memory-worker path too, not just the query path — closing
+      # AC-37.2.2's "both workers" coverage (mirrors the ArticleEmbeddingWorker test).
+      Mox.stub(Loopctl.MockEmbeddingConcurrency, :acquire, fn _tenant_id ->
+        {:error, :rate_limited_local}
+      end)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _t, _text ->
+        {:ok, List.duplicate(0.1, 1536)}
+      end)
+
+      # Loss-free backpressure: snooze (no attempt consumed), NEVER a discard.
+      assert {:snooze, seconds} = MemoryEmbeddingWorker.perform(job(memory.id, tenant.id))
+      assert is_integer(seconds) and seconds > 0
+    end
   end
 end

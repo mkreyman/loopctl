@@ -21,13 +21,19 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
 
   ## Design (mirrors `Loopctl.RateLimiter.Server`)
 
-  A single GenServer owns a public, named ETS table of in-flight counters; callers
-  read/write it directly with `:ets.update_counter` (atomic, lock-free) so the
-  GenServer is never a throughput bottleneck. The GenServer exists only to OWN the
-  table (so it survives the request process that incremented it) and to monitor
-  acquirers: an acquirer that crashes WITHOUT calling `release/1` would otherwise
-  leak its slot forever. `acquire/1` therefore registers the calling process for
-  monitoring; a `:DOWN` decrements the leaked counters.
+  A single GenServer owns a public, named ETS table of in-flight counters. WRITES
+  (acquire/release) are SERIALIZED through the GenServer's `handle_call`, so each
+  check-caps → increment → register-monitor (and the symmetric demonitor → decrement)
+  is ONE atomic step and a concurrent acquire can never interleave between the
+  increment and the monitor (no unmonitored leaked slot). Only the counter READS
+  (`global_count/0`, `tenant_count/1`) bypass the GenServer with a direct, lock-free
+  `:ets.lookup`. At these small caps the serialized writes are not a throughput
+  bottleneck — the GenServer's job is correctness (atomic reservation) and
+  crash-safety, not raw write throughput. It also OWNS the table (so it survives the
+  request process that incremented it) and MONITORS acquirers: an acquirer that
+  crashes WITHOUT calling `release/1` would otherwise leak its slot forever, so
+  `acquire/1` registers the calling process for monitoring and a `:DOWN` decrements
+  the leaked counters.
 
   ## Why not the HeavyRead pool's own queueing
 
@@ -167,29 +173,47 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
 
   @impl true
   def handle_call({:acquire, pid, tenant_id, global_max, tenant_max}, _from, state) do
-    # Atomic slot reservation (#4): check the caps AND increment the counters AND
-    # register the monitor all in ONE serialized GenServer operation, so a caller
-    # crash can never interleave between the increment and the monitor (no
-    # unmonitored leaked slot). `reserve_slots/4` does the increment-check-undo;
-    # `track/3` registers the crash-safe monitor.
-    case reserve_slots(state.table, tenant_id, global_max, tenant_max) do
-      :ok -> {:reply, :ok, track(state, pid, tenant_id)}
-      {:error, :too_many_exports} = err -> {:reply, err, state}
+    # Re-entrant guard: if this pid is ALREADY tracked it holds a slot, so a second
+    # acquire must NOT increment again — that would over-count the semaphore and
+    # permanently leak a slot on the single release/:DOWN. Currently unreachable (one
+    # export per request process, acquired → held → released), but gated BEFORE
+    # reserve_slots so the counters and the monitor map can never diverge under future
+    # re-entrant reuse.
+    if Map.has_key?(state.pids, pid) do
+      {:reply, :ok, state}
+    else
+      # Atomic slot reservation (#4): check the caps AND increment the counters AND
+      # register the monitor all in ONE serialized GenServer operation, so a caller
+      # crash can never interleave between the increment and the monitor (no
+      # unmonitored leaked slot). `reserve_slots/4` does the increment-check-undo;
+      # `track/3` registers the crash-safe monitor.
+      case reserve_slots(state.table, tenant_id, global_max, tenant_max) do
+        :ok -> {:reply, :ok, track(state, pid, tenant_id)}
+        {:error, :too_many_exports} = err -> {:reply, err, state}
+      end
     end
   end
 
   @impl true
-  def handle_call({:release, pid, tenant_id}, _from, state) do
+  def handle_call({:release, pid, _tenant_id}, _from, state) do
     # EXACTLY-ONCE decrement, gated on the pid still being tracked. If it is, this
     # release owns the decrement; we demonitor with [:flush] to purge any already-
     # queued :DOWN for this pid so the :DOWN handler can't ALSO decrement. If the
     # pid is NOT tracked (a :DOWN already reclaimed it, or a double-release), this
     # is a no-op — the global counter is never decremented twice.
+    #
+    # The tenant charged is the AUTHORITATIVE tenant_id stored at acquire time
+    # (state.monitors[ref]), NOT the caller-supplied argument — symmetric with the
+    # :DOWN handler. Robust even if a caller ever released with a different tenant_id
+    # than it acquired: the acquired tenant's counter would otherwise leak while a
+    # different tenant's counter is floored. `pids[pid] = ref` ⇒
+    # `monitors[ref] = {pid, tenant_id}` is maintained atomically, so the fetch! holds.
     case Map.get(state.pids, pid) do
       nil ->
         {:reply, :ok, state}
 
       ref ->
+        {^pid, tenant_id} = Map.fetch!(state.monitors, ref)
         Process.demonitor(ref, [:flush])
         decrement(tenant_id)
         {:reply, :ok, untrack(state, ref, pid)}
@@ -274,13 +298,26 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
   # two decrements are serialized — never a concurrent double-decrement.
   defp decrement(tenant_id) do
     dec_floor(@global_key)
-    dec_floor(tenant_key(tenant_id))
+    dec_tenant(tenant_key(tenant_id))
     :ok
   end
 
   defp dec_floor(key) do
     # update_counter with a threshold/setvalue: if (count - 1) < 0, set to 0.
     :ets.update_counter(@table, key, {2, -1, 0, 0}, {key, 0})
+  end
+
+  # Per-tenant rows are REAPED once they reach zero, so the table doesn't accumulate a
+  # permanent zero-valued row per distinct tenant that ever exported. Safe because EVERY
+  # counter mutation (acquire/release/DOWN) runs in this single serialized GenServer
+  # process, and a fresh acquire re-creates the row via `update_counter`'s `{key, 0}`
+  # default. The global row is deliberately kept (single, always-present). Symmetric
+  # with `Loopctl.Knowledge.EmbeddingConcurrency`.
+  defp dec_tenant(key) do
+    case :ets.update_counter(@table, key, {2, -1, 0, 0}, {key, 0}) do
+      0 -> :ets.delete(@table, key)
+      _ -> :ok
+    end
   end
 
   defp counter(key) do

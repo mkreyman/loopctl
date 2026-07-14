@@ -131,6 +131,45 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       assert {:snooze, seconds} = result
       assert is_integer(seconds) and seconds > 0
     end
+
+    test "US-37.2 (AC-37.2.2): the SAME per-node concurrency cap gates the worker (snooze, client never called)" do
+      %{tenant: tenant} = setup_tenant()
+
+      {:ok, article} =
+        Knowledge.create_article(tenant.id, %{
+          title: "Concurrency Capped Article",
+          body: "Will be shed by the per-node embedding concurrency cap.",
+          category: :pattern,
+          status: :draft
+        })
+
+      article =
+        %{article | status: :published}
+        |> Ecto.Changeset.change(%{status: :published})
+        |> Loopctl.AdminRepo.update!()
+
+      # The concurrency gate (SAME one the interactive path uses) is saturated: the
+      # worker's generate_embedding -> run_embedding_task -> acquire returns
+      # {:error, :rate_limited_local} BEFORE the paid embedding client is ever
+      # reached. Asserting the client is NOT called (0 expectations) proves the cap
+      # really gates the worker path, not just the query path (AC-37.2.2).
+      Mox.stub(Loopctl.MockEmbeddingConcurrency, :acquire, fn _tenant_id ->
+        {:error, :rate_limited_local}
+      end)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _tenant_id, _text ->
+        {:ok, List.duplicate(0.1, 1536)}
+      end)
+
+      result =
+        ArticleEmbeddingWorker.perform(%Oban.Job{
+          args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+        })
+
+      # Loss-free backpressure: snooze (no attempt consumed), NEVER a discard.
+      assert {:snooze, seconds} = result
+      assert is_integer(seconds) and seconds > 0
+    end
   end
 
   # --- TC-20.3.3: Worker handles deleted article (returns :ok) ---
