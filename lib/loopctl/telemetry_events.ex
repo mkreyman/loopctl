@@ -161,11 +161,14 @@ defmodule Loopctl.TelemetryEvents do
   A genuine LLM/embedding PROVIDER failure (a REAL 4xx/5xx/transport/timeout error
   returned by a provider call that WAS ACTUALLY ATTEMPTED — a key was configured and
   present). Introduced by US-34.3 (AC-34.3.3) as the provider-error-rate ScaleAlerts
-  signal. Emitted from EXACTLY ONE choke point, `Loopctl.Llm.record_provider_error/2`,
-  called by `Loopctl.Workers.ArticleEmbeddingWorker` / `Loopctl.Workers.MemoryEmbeddingWorker`
-  once per genuine provider failure — never for the circuit breaker's own
-  `:circuit_open` skip (a DERIVED consequence of prior failures already counted when
-  they happened, not a fresh one).
+  signal. Emitted via `Loopctl.Llm.record_provider_error/2` from TWO choke points,
+  each the ONE call site for its provider: `Loopctl.Llm.Anthropic`'s shared HTTP
+  client (`provider: "anthropic"` — every Anthropic call site, content extraction/
+  classification/merge/memory-promotion, funnels through it) and
+  `Loopctl.Workers.ArticleEmbeddingWorker` / `Loopctl.Workers.MemoryEmbeddingWorker`
+  (`provider: "embedding"`) once per genuine provider failure — never for the
+  circuit breaker's own `:circuit_open` skip (a DERIVED consequence of prior
+  failures already counted when they happened, not a fresh one).
 
   Distinct from `[:loopctl, :llm, :blocked]` (`Loopctl.Llm.record_blocked/2`), which
   fires when NO key is configured — a missing-credential CONFIG state checked BEFORE

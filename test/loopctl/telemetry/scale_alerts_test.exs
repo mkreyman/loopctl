@@ -117,12 +117,35 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     end
   end
 
+  # Review fix regression coverage: the REAL reused-connection/in-transaction case,
+  # where Ecto's own `log_measurements/3` DROPS the `:queue_time` key entirely
+  # (never `nil` — absent). Mirrors an actual `[:loopctl, :repo, :query]` event fired
+  # for a statement inside a transaction after the first checkout.
+  defp emit_queue_time_absent(n) do
+    for _ <- 1..n do
+      :telemetry.execute([:loopctl, :repo, :query], %{}, %{repo: Loopctl.Repo})
+    end
+  end
+
   defp emit_oban_exception(n) do
     for _ <- 1..n do
       :telemetry.execute([:oban, :job, :exception], %{duration: 1}, %{
         worker: "Loopctl.Workers.SomeWorker",
         queue: "default",
         state: :failure
+      })
+    end
+  end
+
+  # Review fix regression coverage: a deliberate `{:discard, _}` / bare `:discard` or
+  # `{:cancel, _}` job return — the terminal, non-retryable path Oban's own Executor
+  # emits as `[:oban, :job, :stop]` (never `:exception`).
+  defp emit_oban_stop(state, n) do
+    for _ <- 1..n do
+      :telemetry.execute([:oban, :job, :stop], %{duration: 1}, %{
+        worker: "Loopctl.Workers.SomeWorker",
+        queue: "embeddings",
+        state: state
       })
     end
   end
@@ -237,6 +260,45 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
       assert payload["threshold"] == 500
     end
 
+    test "TC-34.3.5 (review fix, HIGH): ABSENT queue_time samples are skipped, not counted " <>
+           "as phantom 0ms — no p95 dilution",
+         %{server: server} do
+      test_pid = self()
+      expect_delivery(test_pid)
+
+      # 30 REAL samples at 1000ms (same as TC-34.3.1) breach the 500ms threshold on
+      # their own. A large volume of events with queue_time ABSENT (the realistic
+      # reused-connection/in-transaction case) is mixed in — under the prior bug
+      # (`Map.get(measurements, :queue_time, 0)`), these would be counted as
+      # synthetic 0ms samples, dominating the histogram and dragging the p95 well
+      # under the 500ms threshold, masking the breach entirely.
+      emit_queue_time(1_000, 30)
+      emit_queue_time_absent(500)
+
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      assert_received {:alert_delivered, _url, body, _headers}
+      payload = Jason.decode!(body)
+      assert payload["metric"] == "repo_queue_time_p95_ms"
+      assert payload["value"] == 1_000
+      assert payload["threshold"] == 500
+    end
+
+    test "queue_time samples that are ALL absent are never counted (no false fire, no crash)",
+         %{server: server} do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h ->
+        send(test_pid, :unexpected_delivery)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      emit_queue_time_absent(1_000)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      refute_received :unexpected_delivery
+    end
+
     test "TC-34.3.2: Oban discard/retry rate breach fires", %{server: server} do
       test_pid = self()
       expect_delivery(test_pid)
@@ -250,6 +312,57 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
       assert payload["metric"] == "oban_discard_rate"
       assert payload["value"] == 11.0
       assert payload["threshold"] == 10
+    end
+
+    test "TC-34.3.6 (review fix, MEDIUM): a deliberate {:discard,_} job return " <>
+           "([:oban, :job, :stop] state: :discard) counts toward the discard rate",
+         %{server: server} do
+      test_pid = self()
+      expect_delivery(test_pid)
+
+      # 11 > the 10/min default threshold — via the STOP event (never :exception),
+      # the path a job takes when it deliberately returns {:discard, reason} on its
+      # FIRST attempt (e.g. ArticleEmbeddingWorker's permanent-provider-error
+      # discard) — the prior bug counted NOTHING for this path.
+      emit_oban_stop(:discard, 11)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      assert_received {:alert_delivered, _url, body, _headers}
+      payload = Jason.decode!(body)
+      assert payload["metric"] == "oban_discard_rate"
+      assert payload["value"] == 11.0
+      assert payload["threshold"] == 10
+    end
+
+    test "a deliberate {:cancel,_} job return ([:oban, :job, :stop] state: :cancelled) also counts",
+         %{server: server} do
+      test_pid = self()
+      expect_delivery(test_pid)
+
+      emit_oban_stop(:cancelled, 11)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      assert_received {:alert_delivered, _url, body, _headers}
+      payload = Jason.decode!(body)
+      assert payload["metric"] == "oban_discard_rate"
+      assert payload["value"] == 11.0
+      assert payload["threshold"] == 10
+    end
+
+    test "[:oban, :job, :stop] :success / :snoozed states do NOT count toward the discard rate",
+         %{server: server} do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+        send(test_pid, :unexpected_delivery)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      emit_oban_stop(:success, 50)
+      emit_oban_stop(:snoozed, 50)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      refute_received :unexpected_delivery
     end
 
     test "TC-34.3.3: provider-error rate breach fires", %{server: server} do

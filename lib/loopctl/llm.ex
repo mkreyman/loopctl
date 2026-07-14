@@ -297,10 +297,13 @@ defmodule Loopctl.Llm do
   `record_blocked/2` at all). See `Loopctl.Telemetry.ScaleMetrics`'s "AC-34.4.3
   coordination" moduledoc note.
 
-  Call this from EXACTLY ONE choke point per failure at each call site (currently
-  `ArticleEmbeddingWorker`/`MemoryEmbeddingWorker`'s embedding-provider branch, never
-  for the circuit breaker's own `:circuit_open` skip) so the emitted count matches
-  the actual failure count 1:1 — no double-counting.
+  Call this from EXACTLY ONE choke point per failure at each call site — currently
+  `ArticleEmbeddingWorker`/`MemoryEmbeddingWorker`'s embedding-provider branch
+  (`provider: "embedding"`, never for the circuit breaker's own `:circuit_open`
+  skip) and `Loopctl.Llm.Anthropic`'s shared HTTP client (`provider: "anthropic"`,
+  the ONE choke point for every Anthropic call site — content extraction/
+  classification/merge/memory-promotion) — so the emitted count matches the actual
+  failure count 1:1 — no double-counting.
 
   Emits `[:loopctl, :llm, :provider_error]` with BOUNDED metadata ONLY: `provider`
   (`"anthropic"` | `"embedding"`) and `class` (`:transient` | `:permanent`, per

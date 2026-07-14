@@ -120,14 +120,18 @@ defmodule Loopctl.Llm.Anthropic do
         # A 200 with the wrong shape can STILL be a misconfigured/compromised
         # endpoint echoing a masked key fragment in an error-shaped body (review
         # CRIT #1). Sanitize it exactly like a non-200 — never return the raw body.
-        {:error, ProviderError.sanitize({:api_error, 200, body})}
+        reason = {:api_error, 200, body}
+        record_provider_error(reason)
+        {:error, ProviderError.sanitize(reason)}
 
       {:ok, %{status: status, body: body}} ->
         Logger.warning("Loopctl.Llm.Anthropic: API error (op=#{operation}, status=#{status})")
         # SANITIZE the provider error body (review #11): it can echo a masked key
         # fragment, and callers surface it as an Oban `{:error, reason}` persisted
         # into oban_jobs.errors. Drop the body; keep only the status.
-        {:error, ProviderError.sanitize({:api_error, status, body})}
+        reason = {:api_error, status, body}
+        record_provider_error(reason)
+        {:error, ProviderError.sanitize(reason)}
 
       {:error, reason} ->
         # Never inspect the raw transport reason (review MED #4) — log a value-free
@@ -137,8 +141,24 @@ defmodule Loopctl.Llm.Anthropic do
             "#{ProviderError.log_tag({:request_failed, reason})})"
         )
 
+        record_provider_error({:request_failed, reason})
         {:error, {:request_failed, reason}}
     end
+  end
+
+  # Review fix (MEDIUM, AC-34.3.3): this is the ONE choke point for EVERY Anthropic
+  # call site (content extraction/classification/merge/memory-promotion all funnel
+  # through `message/5` -> `call/7` -> `post/7`), so wiring the genuine-provider-error
+  # signal HERE — rather than duplicating it across each of the 4+ call sites —
+  # guarantees a real 429/5xx/transport storm on the primary Anthropic surface (the
+  # incident class US-34.3's story background names) is never invisible to
+  # `[:loopctl, :llm, :provider_error]`. Classifies on the RAW (pre-sanitize) reason,
+  # mirroring `ArticleEmbeddingWorker`/`MemoryEmbeddingWorker`'s own
+  # `record_provider_error/1` helper — `Llm.record_provider_error/2` itself only
+  # windows bounded `provider`/`class` metadata, never the reason term.
+  defp record_provider_error(reason) do
+    class = if Llm.permanent_provider_error?(reason), do: :permanent, else: :transient
+    Llm.record_provider_error("anthropic", class)
   end
 
   # BEST-EFFORT usage recording (review #3). The Anthropic call has already

@@ -90,28 +90,45 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       (native units, the SAME metric US-33.1's `loopctl.repo.checkout.queue_time`
       distribution reads). Bucketed exactly like the heavy-read p95 (SAME `@buckets`,
       `bucket_index/1`), but into a SEPARATE counter set (`{:qt_bucket, idx}` /
-      `:qt_total`) so it never collides with the heavy-read histogram.
-    * **(b) fleet-wide Oban job discard/retry rate** — sourced from
-      `[:oban, :job, :exception]`, which Oban's own `Executor` emits for BOTH a
-      retryable failure (`meta.state == :failure`) AND an exhausted job that just
-      converted to a terminal discard (`meta.state == :discard`, normalized from
-      `:exhausted`) — so a single unconditional counter (`:oban_discard_count`)
-      already captures both halves of "discard/retry rate" without any metadata
-      filtering. `oban_jobs` has no tenant dimension on this event (only bounded
-      `worker`/`queue`/`state` labels, none of which we tag — the counter is a pure
-      increment, mirroring `:under_fill_count`).
+      `:qt_total`) so it never collides with the heavy-read histogram. **`:queue_time`
+      is SKIPPED (not defaulted to 0) when absent from `measurements`** (review fix,
+      HIGH): Ecto's `log_measurements/3` drops a measurement key entirely when its
+      value is `nil`, which happens whenever the connection was already checked out
+      (e.g. every statement after the first inside a transaction — the common case
+      under loopctl's per-request RLS `SET LOCAL` transactions). Counting that absent
+      case as a synthetic 0ms sample would flood the histogram and dilute the p95
+      downward, masking the exact checkout-contention storm this signal exists to
+      catch. Mirrors the `Telemetry.Metrics` distribution in `ScaleMetrics`, which
+      likewise skips a datapoint when the measurement is absent.
+    * **(b) fleet-wide Oban job discard/retry rate** — sourced from BOTH
+      `[:oban, :job, :exception]` (Oban's own `Executor` emits this for a retryable
+      failure, `meta.state == :failure`, AND an exhausted job that just converted to
+      a terminal discard, `meta.state == :discard`, normalized from `:exhausted`) AND
+      `[:oban, :job, :stop]` filtered to `meta.state in [:discard, :cancelled]`
+      (review fix, MEDIUM): a DELIBERATE `{:discard, reason}` / bare `:discard` or
+      `{:cancel, reason}` return — e.g. `ArticleEmbeddingWorker`/
+      `MemoryEmbeddingWorker`'s own permanent-provider-error discard path — is
+      terminal from its FIRST attempt and never touches `:exception` at all; only the
+      `:stop` event covers it. Together the two attachments genuinely cover both
+      halves of "discard/retry rate": every retryable failure/exhaustion (`:exception`)
+      and every deliberate discard/cancel (`:stop`). `:success`/`:snoozed` `:stop`
+      states are excluded. `oban_jobs` has no tenant dimension on either event (only
+      bounded `worker`/`queue`/`state` labels, none of which we tag — the counter is a
+      pure increment, mirroring `:under_fill_count`).
     * **(c) LLM/embedding provider-error rate** — sourced from the NEW
       `[:loopctl, :llm, :provider_error]` event (`Loopctl.TelemetryEvents.llm_provider_error/0`),
-      emitted from EXACTLY ONE choke point, `Loopctl.Llm.record_provider_error/2`,
-      by `ArticleEmbeddingWorker`/`MemoryEmbeddingWorker` on a genuine provider
-      failure. **Deliberately NOT `[:loopctl, :llm, :blocked]`**: that event fires
-      when a tenant has no BYO key configured (a config state checked BEFORE any
-      provider call), so windowing it as a provider-error proxy would false-page on
-      keyless tenants while missing a real 429/5xx/transport storm entirely (see
-      `Loopctl.Telemetry.ScaleMetrics`'s "AC-34.4.3 coordination" note). A single
-      unconditional counter (`:provider_error_count`) mirrors `:under_fill_count`;
-      the emit site alone decides transient vs permanent (`:class` metadata, unused
-      by this counter, which windows total volume).
+      emitted from the shared `Loopctl.Llm.Anthropic` HTTP client (every Anthropic
+      call site — content extraction/classification/merge/memory-promotion — funnels
+      through it) AND from `ArticleEmbeddingWorker`/`MemoryEmbeddingWorker`'s
+      embedding-provider branch, both via `Loopctl.Llm.record_provider_error/2`, on a
+      genuine provider failure. **Deliberately NOT `[:loopctl, :llm, :blocked]`**: that
+      event fires when a tenant has no BYO key configured (a config state checked
+      BEFORE any provider call), so windowing it as a provider-error proxy would
+      false-page on keyless tenants while missing a real 429/5xx/transport storm
+      entirely (see `Loopctl.Telemetry.ScaleMetrics`'s "AC-34.4.3 coordination" note).
+      A single unconditional counter (`:provider_error_count`) mirrors
+      `:under_fill_count`; the emit site alone decides transient vs permanent
+      (`:class` metadata, unused by this counter, which windows total volume).
 
   All three plug into the exact same `step/8` / `step_p95/8` edge-fire helpers and
   `notify/7` delivery path — no new delivery code, no change to the existing three
@@ -151,6 +168,14 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # US-34.3: the three additional signals.
   @repo_query_event [:loopctl, :repo, :query]
   @oban_exception_event [:oban, :job, :exception]
+  # Review fix (MEDIUM): a deliberate `{:discard, reason}` / bare `:discard` return
+  # (loopctl's OWN permanent-failure path, e.g. `ArticleEmbeddingWorker`/
+  # `MemoryEmbeddingWorker` on a revoked key) — and an explicit `{:cancel, reason}` —
+  # is emitted by Oban's Executor as `[:oban, :job, :stop]` with `state: :discard` /
+  # `:cancelled`, NEVER `[:oban, :job, :exception]` (that event is reserved for
+  # `:failure`/`:exhausted`). Without this, a mass permanent-discard storm (e.g. a
+  # revoked/invalid provider key) increments NOTHING on this "discard rate" signal.
+  @oban_stop_event [:oban, :job, :stop]
   @provider_error_event [:loopctl, :llm, :provider_error]
 
   # The latency buckets — the SAME bounded set as the ScaleMetrics histogram so the
@@ -453,6 +478,7 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       @heavy_read_event,
       @repo_query_event,
       @oban_exception_event,
+      @oban_stop_event,
       @provider_error_event
     ]
 
@@ -507,34 +533,70 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       :ok
   end
 
-  # US-34.3 (AC-34.3.1): mirrors the `@heavy_read_event` clause EXACTLY, but reads
+  # US-34.3 (AC-34.3.1): mirrors the `@heavy_read_event` clause, but reads
   # `measurements.queue_time` (Ecto's per-query connection-checkout wait, native
   # units) and writes to a SEPARATE bucket set (`{:qt_bucket, idx}` / `:qt_total`) so
   # it never collides with the heavy-read histogram.
+  #
+  # Review fix (HIGH): `queue_time` is DROPPED by Ecto's own `log_measurements/3`
+  # (`deps/ecto_sql/lib/ecto/adapters/sql.ex`) whenever the connection was already
+  # checked out — i.e. every statement inside a transaction after the first checkout.
+  # loopctl runs virtually every tenant query inside a transaction (RLS `SET LOCAL`
+  # per CLAUDE.md), so the majority of these events carry NO `:queue_time` key at
+  # all (absent, not `nil`). Defaulting the absent case to `0` (the prior behavior)
+  # floods the histogram with synthetic 0ms samples and biases the bucketed p95
+  # sharply downward — during a real checkout-contention storm (the leading
+  # indicator AC-34.3.1 exists to surface), genuinely-high-queue_time samples can be
+  # a small minority, so the diluted p95 may never cross the threshold. Skip the
+  # sample entirely when `:queue_time` is absent — mirroring `Loopctl.Telemetry.
+  # ScaleMetrics`'s `Telemetry.Metrics` distribution, which silently skips a
+  # datapoint when its measurement key is absent — instead of counting a phantom 0ms
+  # checkout.
   def handle_event(@repo_query_event, measurements, _metadata, %{table: table}) do
-    total_native = Map.get(measurements, :queue_time, 0)
-    duration_ms = System.convert_time_unit(total_native, :native, :millisecond)
-    idx = bucket_index(duration_ms)
+    case Map.fetch(measurements, :queue_time) do
+      :error ->
+        :ok
 
-    :ets.update_counter(table, {:qt_bucket, idx}, 1)
-    :ets.update_counter(table, :qt_total, 1)
-    :ok
+      {:ok, total_native} ->
+        duration_ms = System.convert_time_unit(total_native, :native, :millisecond)
+        idx = bucket_index(duration_ms)
+
+        :ets.update_counter(table, {:qt_bucket, idx}, 1)
+        :ets.update_counter(table, :qt_total, 1)
+        :ok
+    end
   rescue
     e ->
       Logger.error("ScaleAlerts repo_query handler error: #{Exception.message(e)}")
       :ok
   end
 
-  # US-34.3 (AC-34.3.2): fleet-wide Oban job discard/retry rate. Oban's own Executor
-  # emits `[:oban, :job, :exception]` for BOTH a retryable failure and an exhausted
-  # job converting to a terminal discard, so a single unconditional counter already
-  # covers "discard/retry rate" — no metadata filtering, mirrors `:under_fill_count`.
+  # US-34.3 (AC-34.3.2): fleet-wide Oban job discard/retry rate, half (a). Oban's own
+  # Executor emits `[:oban, :job, :exception]` for a retryable failure AND an
+  # exhausted job converting to a terminal discard — no metadata filtering, mirrors
+  # `:under_fill_count`. See the `@oban_stop_event` clause below for half (b): a
+  # DELIBERATE discard/cancel, which this event never observes.
   def handle_event(@oban_exception_event, _measurements, _metadata, %{table: table}) do
     :ets.update_counter(table, :oban_discard_count, 1)
     :ok
   rescue
     e ->
       Logger.error("ScaleAlerts oban_exception handler error: #{Exception.message(e)}")
+      :ok
+  end
+
+  # Review fix (MEDIUM, AC-34.3.2): the sibling half of the discard signal — a
+  # deliberate `{:discard, _}`/bare `:discard` or `{:cancel, _}` job return emits
+  # `[:oban, :job, :stop]` (`meta.state` `:discard` / `:cancelled`), never the
+  # `:exception` event above. Only these two terminal, non-retryable states count;
+  # `:success` and `:snoozed` (the OTHER `:stop` states) are explicitly excluded.
+  def handle_event(@oban_stop_event, _measurements, %{state: state}, %{table: table})
+      when state in [:discard, :cancelled] do
+    :ets.update_counter(table, :oban_discard_count, 1)
+    :ok
+  rescue
+    e ->
+      Logger.error("ScaleAlerts oban_stop handler error: #{Exception.message(e)}")
       :ok
   end
 
