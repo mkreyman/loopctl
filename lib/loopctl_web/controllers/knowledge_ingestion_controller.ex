@@ -15,6 +15,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   alias Loopctl.HeavyRead
   alias Loopctl.Llm
   alias Loopctl.Net.UrlGuard
+  alias Loopctl.Oban.FairShare
+  alias Loopctl.ObanConfig
   alias Loopctl.Workers.ContentIngestionWorker
 
   # Mandatory BYO (Epic 28, #179): extraction runs on the tenant's OWN Anthropic
@@ -162,7 +164,13 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     description:
       "Submit multiple URLs or raw content items for knowledge extraction in a single " <>
         "request. Each item is validated and enqueued independently. " <>
-        "Max 50 items per batch. Role: orchestrator+.",
+        "Max 50 items per batch. Role: orchestrator+.\n\n" <>
+        "**Backpressure (429):** before enqueuing anything, the endpoint checks the " <>
+        "calling tenant's in-flight `:ingestion` backlog. If it is at/over the " <>
+        "`OBAN_INGEST_BACKLOG_MAX` threshold, the WHOLE request is rejected " <>
+        "all-or-nothing with 429 + `Retry-After` and `error.code: " <>
+        "\"ingestion_backlog_exceeded\"` — zero jobs are enqueued. This is distinct " <>
+        "from the generic Hammer request-rate 429 (which has no `error.code`).",
     request_body:
       {"Batch ingestion request", "application/json",
        %OpenApiSpex.Schema{
@@ -194,7 +202,9 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
          }},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 =>
+        {"Ingestion backlog backpressure OR request-rate limit", "application/json",
+         Schemas.IngestionBacklogError}
     }
   )
 
@@ -203,11 +213,42 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     items = params["items"]
 
+    # The backlog gate runs AFTER validate_batch_items/1 (so a malformed request still
+    # 422s first) but BEFORE process_batch_items/3 (so when the tenant is over its
+    # in-flight :ingestion backlog threshold, ZERO jobs from this request are enqueued —
+    # all-or-nothing, no partial pile-up). US-36.3.
     with :ok <- require_llm_key(tenant_id),
-         :ok <- validate_batch_items(items) do
+         :ok <- validate_batch_items(items),
+         :ok <- check_ingestion_backlog(tenant_id) do
       results = process_batch_items(tenant_id, items)
       json(conn, LoopctlWeb.KnowledgeIngestionJSON.batch(results))
     end
+  end
+
+  # US-36.3 admission gate: reject the WHOLE batch with 429 when the calling tenant's
+  # in-flight :ingestion backlog is at/over the env-driven threshold, BEFORE enqueuing
+  # anything. Reuses the US-36.2 broad non-terminal count helper (tenant-scoped by
+  # args->>'tenant_id', bounded by a per-query statement_timeout via AdminRepo) — cheap
+  # and scoped to the caller ONLY, so one tenant's backlog never affects another. The
+  # error tuple is rendered by LoopctlWeb.FallbackController (structured 429 + Retry-After,
+  # code "ingestion_backlog_exceeded" — distinct from the Hammer request-rate 429).
+  defp check_ingestion_backlog(tenant_id) do
+    max = ObanConfig.ingest_backlog_max()
+
+    if FairShare.in_flight_count(tenant_id, :ingestion) >= max do
+      {:error, :ingestion_backlog_exceeded, backlog_retry_after_seconds()}
+    else
+      :ok
+    end
+  end
+
+  # Retry-After hint (seconds) for a backlog-429. Tied to the fair-share snooze base so
+  # it tracks the drain cadence of the :ingestion queue: a snoozed/backlogged job
+  # re-checks on roughly this horizon, so advising the client to wait the same amount
+  # before retrying is a sensible, bounded, deploy-free-tunable value. Bounded to a
+  # small positive integer of seconds.
+  defp backlog_retry_after_seconds do
+    ObanConfig.fair_share_snooze_base_seconds()
   end
 
   # Mandatory BYO gate shared by single + batch ingest. On a miss, record the block

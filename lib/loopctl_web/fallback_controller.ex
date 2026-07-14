@@ -19,6 +19,9 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :self_review_blocked}` -> 409 (implementer tries to review their own work)
   - `{:error, :missing_assigned_agent}` -> 409 (reported_done story has no assigned agent/dispatch lineage; custody chain broken)
   - `{:error, :rate_limited}` -> 429 with retry_after_seconds from header
+  - `{:error, :ingestion_backlog_exceeded, retry_after}` -> 429 with `Retry-After` header and
+    a machine-readable `code: "ingestion_backlog_exceeded"` (US-36.3 batch-ingest backpressure —
+    distinct from the generic Hammer request-rate 429, which has no `code`)
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message
   - `{:error, :unprocessable_entity, message}` -> 422 with custom message
@@ -277,6 +280,29 @@ defmodule LoopctlWeb.FallbackController do
         status: 429,
         message: "Too many requests. Retry after #{retry_after} seconds.",
         retry_after_seconds: String.to_integer(retry_after)
+      }
+    })
+  end
+
+  # US-36.3: batch-ingest backlog backpressure. The calling tenant's in-flight
+  # :ingestion backlog is at/over the OBAN_INGEST_BACKLOG_MAX threshold, so the whole
+  # batch was rejected all-or-nothing (ZERO jobs enqueued). A distinct `code` and the
+  # `Retry-After` header make this unambiguously distinguishable from the Hammer
+  # request-rate 429 (`message: "Rate limit exceeded"`, no `code`).
+  def call(conn, {:error, :ingestion_backlog_exceeded, retry_after})
+      when is_integer(retry_after) and retry_after > 0 do
+    conn
+    |> put_resp_header("retry-after", Integer.to_string(retry_after))
+    |> put_status(:too_many_requests)
+    |> json(%{
+      error: %{
+        status: 429,
+        code: "ingestion_backlog_exceeded",
+        message:
+          "This tenant already has too many in-flight ingestion jobs queued. " <>
+            "No items from this batch were enqueued. Retry after #{retry_after} seconds " <>
+            "once the backlog drains.",
+        retry_after_seconds: retry_after
       }
     })
   end

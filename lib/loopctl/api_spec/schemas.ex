@@ -125,6 +125,61 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule IngestionBacklogError do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "IngestionBacklogError",
+      description:
+        "Batch-ingest backlog backpressure (HTTP 429). Distinct from the generic " <>
+          "request RateLimitError: this is triggered BEFORE any item is enqueued when " <>
+          "the calling tenant's in-flight `:ingestion` backlog (non-terminal Oban jobs) " <>
+          "is at/over the `OBAN_INGEST_BACKLOG_MAX` threshold. The rejection is " <>
+          "all-or-nothing — NO jobs from the request are enqueued (no partial pile-up). " <>
+          "The check is tenant-scoped: only the caller's own backlog counts. Unlike the " <>
+          "Hammer request-rate limiter, this response carries a machine-readable " <>
+          "`error.code` of `ingestion_backlog_exceeded`, so dashboards/clients can tell " <>
+          "backlog backpressure apart from the request-rate 429. It DOES set " <>
+          "`Retry-After` (seconds) — back off and retry once the backlog drains.",
+      type: :object,
+      required: [:error],
+      properties: %{
+        error: %Schema{
+          type: :object,
+          required: [:status, :code, :message],
+          properties: %{
+            status: %Schema{type: :integer, example: 429},
+            code: %Schema{
+              type: :string,
+              enum: ["ingestion_backlog_exceeded"],
+              example: "ingestion_backlog_exceeded"
+            },
+            message: %Schema{
+              type: :string,
+              example:
+                "This tenant already has too many in-flight ingestion jobs queued. " <>
+                  "No items from this batch were enqueued. Retry after 5 seconds " <>
+                  "once the backlog drains."
+            },
+            retry_after_seconds: %Schema{type: :integer, example: 5}
+          }
+        }
+      },
+      example: %{
+        error: %{
+          status: 429,
+          code: "ingestion_backlog_exceeded",
+          message:
+            "This tenant already has too many in-flight ingestion jobs queued. " <>
+              "No items from this batch were enqueued. Retry after 5 seconds " <>
+              "once the backlog drains.",
+          retry_after_seconds: 5
+        }
+      }
+    })
+  end
+
   defmodule PaginationMeta do
     @moduledoc false
     require OpenApiSpex

@@ -287,6 +287,37 @@ defmodule Loopctl.ObanConfigTest do
     end
   end
 
+  describe "ingest_backlog_max/0 (US-36.3, env-tunable via OBAN_INGEST_BACKLOG_MAX)" do
+    test "TC-36.3.3: defaults to 500 when OBAN_INGEST_BACKLOG_MAX is unset" do
+      # OBAN_INGEST_BACKLOG_MAX is not set in the test environment, so the default applies.
+      assert ObanConfig.ingest_backlog_max() == 500
+    end
+
+    @tag :tmp_dir
+    test "TC-36.3.3: a valid OBAN_INGEST_BACKLOG_MAX override is read at runtime (subprocess-scoped env)",
+         %{tmp_dir: tmp_dir} do
+      result =
+        run_elixir_script(
+          tmp_dir,
+          "result = Loopctl.ObanConfig.ingest_backlog_max()",
+          [{"OBAN_INGEST_BACKLOG_MAX", "3"}]
+        )
+
+      assert result == 3
+    end
+
+    test "TC-36.3.3: a malformed value fails LOUD (raises) rather than silently defaulting" do
+      # ingest_backlog_max/0 delegates to queue_size/2, so a present-but-malformed
+      # OBAN_INGEST_BACKLOG_MAX raises at read time exactly like OBAN_QUEUE_*.
+      assert_raise ArgumentError, ~r/positive integer/, fn -> ObanConfig.queue_size("0", 500) end
+      assert_raise ArgumentError, ~r/positive integer/, fn -> ObanConfig.queue_size("-1", 500) end
+
+      assert_raise ArgumentError, ~r/positive integer/, fn ->
+        ObanConfig.queue_size("abc", 500)
+      end
+    end
+  end
+
   # Runs `script` (must bind a `result` variable) in a fresh `mix run --no-start`
   # subprocess with `env` applied ONLY to that child process, then reads back the
   # term `script` wrote to `result_path` via :erlang.term_to_binary/1. Keeps this

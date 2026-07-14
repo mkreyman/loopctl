@@ -237,6 +237,41 @@ defmodule Loopctl.ObanConfig do
     )
   end
 
+  # --- US-36.3: batch-ingest backlog backpressure (429) ---
+  #
+  # Max in-flight :ingestion backlog (the broad non-terminal set —
+  # available/scheduled/executing/retryable, via `Loopctl.Oban.FairShare.in_flight_count/2`)
+  # a SINGLE tenant may have accumulated before the batch-ingest endpoint
+  # (POST /api/v1/knowledge/ingest/batch) rejects a NEW batch all-or-nothing with 429.
+  #
+  # This bounds ACCUMULATION, complementing US-36.2's fair-share gate (which bounds
+  # per-tenant CONCURRENCY of executing slots). A 50-item batch fans each item out to
+  # a ~6-min LLM ContentIngestionWorker job on the `:ingestion` queue (default width 2,
+  # env OBAN_QUEUE_INGESTION). Default 500 lets a normal caller loop the 50-item
+  # endpoint ~10 times before backpressure kicks in — generous headroom for legitimate
+  # bulk work, while still stopping a runaway loop from piling up an unbounded backlog
+  # that would starve the queue's drain and inflate memory/DB footprint. Ops retune
+  # live via OBAN_INGEST_BACKLOG_MAX (no deploy) to loosen/tighten during an incident.
+  @default_ingest_backlog_max 500
+
+  @doc """
+  Max in-flight `:ingestion` backlog (non-terminal jobs) a single tenant may have
+  before the batch-ingest endpoint rejects a new batch with 429 (US-36.3).
+
+  From `OBAN_INGEST_BACKLOG_MAX` (positive integer, else raises `ArgumentError` at
+  read time like `queue_size/2`), default #{@default_ingest_backlog_max}.
+
+  Config-based DI: read via `System.get_env/1` at call time (NEVER
+  `Application.compile_env`, which would record a boot-aborting compile-env
+  dependency — see the `@default_queues` note above), so an operator can loosen/tighten
+  the threshold during an incident with `fly secrets set OBAN_INGEST_BACKLOG_MAX=... &&
+  restart`, no deploy.
+  """
+  @spec ingest_backlog_max() :: pos_integer()
+  def ingest_backlog_max do
+    queue_size(System.get_env("OBAN_INGEST_BACKLOG_MAX"), @default_ingest_backlog_max)
+  end
+
   # Like `queue_size/2` but admits 0 (a valid "no jitter" value). Still fails loud on
   # a present-but-malformed / negative value rather than silently defaulting.
   @spec non_neg_size(String.t() | nil, non_neg_integer()) :: non_neg_integer()
