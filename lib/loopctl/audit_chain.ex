@@ -18,6 +18,7 @@ defmodule Loopctl.AuditChain do
       })
   """
 
+  import Bitwise
   import Ecto.Query
 
   alias Ecto.Multi
@@ -25,6 +26,8 @@ defmodule Loopctl.AuditChain do
   alias Loopctl.AuditChain.Entry
   alias Loopctl.AuditChain.PubSub, as: ChainPubSub
   alias Loopctl.AuditChain.SignedTreeHead
+  alias Loopctl.AuditChain.SthCheckpoint
+  alias Loopctl.HeavyRead
   alias Loopctl.TenantKeys
 
   @zero_hash :binary.copy(<<0>>, 32)
@@ -159,6 +162,132 @@ defmodule Loopctl.AuditChain do
   end
 
   @doc """
+  US-35.1 — Incremental Merkle root: byte-identical to `compute_merkle_root/1`.
+
+  Computes the tenant's current Merkle root using the persisted checkpoint of
+  stable peaks, loading ONLY entries with `chain_position` above the checkpoint
+  (a bounded, tenant-scoped, statement-timeout-guarded read via
+  `Loopctl.HeavyRead`) and folding them into those peaks. Returns the root AND
+  the refreshed checkpoint data (`%{chain_position, peaks}`) so the caller can
+  persist it atomically with the STH it signs.
+
+  Falls back to a correct FULL rebuild — over `compute_merkle_root/1`'s oracle
+  construction — whenever there is no checkpoint, or the checkpoint is stale /
+  structurally inconsistent with the actual chain (AC-35.1.1 / AC-35.1.5). The
+  checkpoint is a pure performance cache: an inconsistency degrades to a correct
+  root, never a wrong one.
+
+  ## Returns
+
+  - `{:ok, root_bytes, %{chain_position: pos, peaks: [binary]}}` for a non-empty chain
+  - `{:ok, nil, nil}` for an empty chain
+  """
+  @spec compute_merkle_root_incremental(Ecto.UUID.t()) ::
+          {:ok, binary(), %{chain_position: non_neg_integer(), peaks: [binary()]}}
+          | {:ok, nil, nil}
+  def compute_merkle_root_incremental(tenant_id) when is_binary(tenant_id) do
+    case latest_entry(tenant_id) do
+      nil ->
+        {:ok, nil, nil}
+
+      %Entry{chain_position: latest_pos} ->
+        case load_valid_checkpoint(tenant_id, latest_pos) do
+          {:ok, %SthCheckpoint{chain_position: cp_pos, peaks: cp_peaks}} ->
+            incremental_root(tenant_id, latest_pos, cp_pos, cp_peaks)
+
+          :fallback ->
+            full_rebuild_root(tenant_id, latest_pos)
+        end
+    end
+  end
+
+  # Incremental path: fold ONLY the tail (positions above the checkpoint) into
+  # the checkpoint's stable peaks. When the checkpoint is already at the head
+  # (no tail) the peaks are bagged directly.
+  defp incremental_root(tenant_id, latest_pos, cp_pos, cp_peaks) do
+    peaks0 = peaks_with_heights(cp_peaks, cp_pos + 1)
+
+    tail_hashes =
+      if latest_pos > cp_pos do
+        load_tail_hashes(tenant_id, cp_pos, latest_pos)
+      else
+        []
+      end
+
+    peaks = mmr_append_all(peaks0, tail_hashes)
+    root = bag_peaks(peaks)
+    {:ok, root, %{chain_position: latest_pos, peaks: peak_hashes(peaks)}}
+  end
+
+  # Fallback: rebuild from the whole chain. `root` is the oracle
+  # `merkle_tree/2` construction (byte-identical guarantee); the peaks are folded
+  # from the same load so a fresh checkpoint can be persisted for next time.
+  defp full_rebuild_root(tenant_id, latest_pos) do
+    # Bounded by `latest_pos` (the head read a moment ago) so a concurrent append
+    # can't pull leaves beyond the position we're about to sign — the loaded set
+    # is a consistent snapshot of [0..latest_pos].
+    hashes =
+      from(e in Entry,
+        where: e.tenant_id == ^tenant_id and e.chain_position <= ^latest_pos,
+        order_by: [asc: e.chain_position],
+        select: e.entry_hash
+      )
+      |> AdminRepo.all()
+
+    root = merkle_tree(hashes)
+    peaks = mmr_append_all([], hashes)
+    {:ok, root, %{chain_position: latest_pos, peaks: peak_hashes(peaks)}}
+  end
+
+  # Bounded, tenant-scoped tail read: entries strictly above the checkpoint
+  # position, up to and INCLUDING the chain head read a moment ago (`latest_pos`)
+  # so a concurrent append can't fold in leaves beyond the position we sign.
+  # Ordered ascending. Routed through `HeavyRead` so it runs under a per-query
+  # `SET LOCAL statement_timeout` (pgbouncer-safe) and its structural guard proves
+  # the `tenant_id` predicate is present (AC-35.1.6). In test env
+  # `:heavy_read_repo` is aliased to `AdminRepo`, so this shares the sandbox.
+  defp load_tail_hashes(tenant_id, cp_pos, latest_pos) do
+    query =
+      from(e in Entry,
+        where:
+          e.tenant_id == ^tenant_id and e.chain_position > ^cp_pos and
+            e.chain_position <= ^latest_pos,
+        order_by: [asc: e.chain_position],
+        select: e.entry_hash
+      )
+
+    HeavyRead.all(tenant_id, query, HeavyRead.opts(:sth_incremental))
+  end
+
+  # Loads the tenant's checkpoint and validates it against the actual chain
+  # head. Returns `{:ok, checkpoint}` only when it is safe to fold onto;
+  # otherwise `:fallback` so the caller does a full recompute (AC-35.1.5).
+  defp load_valid_checkpoint(tenant_id, latest_pos) do
+    checkpoint =
+      from(c in SthCheckpoint, where: c.tenant_id == ^tenant_id)
+      |> AdminRepo.one()
+
+    if valid_checkpoint?(checkpoint, latest_pos), do: {:ok, checkpoint}, else: :fallback
+  end
+
+  # A checkpoint is usable iff:
+  #   * it exists with a non-negative position that is NOT ahead of the chain
+  #     head (a position ahead signals a stale/partial write), and
+  #   * every stored peak is a 32-byte hash, and
+  #   * the number of peaks equals the popcount of the covered leaf count
+  #     (`chain_position + 1`) — the structural invariant of the peak set.
+  # Anything else is treated as corrupt and ignored in favour of a full rebuild.
+  defp valid_checkpoint?(nil, _latest_pos), do: false
+
+  defp valid_checkpoint?(%SthCheckpoint{chain_position: cp_pos, peaks: peaks}, latest_pos)
+       when is_integer(cp_pos) and cp_pos >= 0 and cp_pos <= latest_pos and is_list(peaks) do
+    Enum.all?(peaks, &(is_binary(&1) and byte_size(&1) == 32)) and
+      length(peaks) == popcount(cp_pos + 1)
+  end
+
+  defp valid_checkpoint?(_checkpoint, _latest_pos), do: false
+
+  @doc """
   Signs a tree head for a tenant using the tenant's audit-signing key.
   Stores the result in `audit_signed_tree_heads`.
 
@@ -166,15 +295,20 @@ defmodule Loopctl.AuditChain do
   """
   @spec sign_and_store_tree_head(Ecto.UUID.t()) :: {:ok, SignedTreeHead.t()} | {:error, term()}
   def sign_and_store_tree_head(tenant_id) do
-    with {:ok, merkle_root} when not is_nil(merkle_root) <- compute_merkle_root(tenant_id),
-         %Entry{chain_position: position} <- latest_entry(tenant_id),
+    with {:ok, merkle_root, %{chain_position: position, peaks: peaks}}
+         when not is_nil(merkle_root) <- compute_merkle_root_incremental(tenant_id),
          {:ok, private_key} <- TenantKeys.get_private_key(tenant_id) do
       now = DateTime.utc_now()
 
+      # US-35.1: sign the SAME position the incremental root was computed at (both
+      # derived from one `latest_entry` read), so the checkpoint we persist is
+      # consistent with the position just signed. The signed message and ed25519
+      # signing are UNCHANGED — a verifier that recomputes the root the old way
+      # still validates (AC-35.1.4).
       message = build_sth_message(tenant_id, position, merkle_root, now)
       signature = :crypto.sign(:eddsa, :sha512, message, [private_key, :ed25519])
 
-      sth =
+      sth_changeset =
         %SignedTreeHead{tenant_id: tenant_id}
         |> SignedTreeHead.changeset(%{
           chain_position: position,
@@ -182,23 +316,35 @@ defmodule Loopctl.AuditChain do
           signed_at: now,
           signature: signature
         })
-        |> AdminRepo.insert(
+
+      checkpoint_changeset =
+        %SthCheckpoint{tenant_id: tenant_id}
+        |> SthCheckpoint.changeset(%{chain_position: position, peaks: peaks})
+
+      # US-35.1: the STH insert and the checkpoint upsert happen in ONE logical
+      # operation, so the persisted peaks are always consistent with a signed STH.
+      multi =
+        Multi.new()
+        |> Multi.insert(:sth, sth_changeset,
           on_conflict: {:replace, [:merkle_root, :signed_at, :signature]},
           conflict_target: [:tenant_id, :chain_position]
         )
+        |> Multi.insert(:checkpoint, checkpoint_changeset,
+          on_conflict: {:replace, [:chain_position, :peaks, :updated_at]},
+          conflict_target: [:tenant_id]
+        )
 
-      # US-26.5.1: broadcast STH to PubSub subscribers
-      case sth do
-        {:ok, stored_sth} ->
+      case AdminRepo.transaction(multi) do
+        {:ok, %{sth: stored_sth}} ->
+          # US-26.5.1: broadcast STH to PubSub subscribers
           ChainPubSub.broadcast_sth(tenant_id, stored_sth)
           {:ok, stored_sth}
 
-        error ->
-          error
+        {:error, _step, reason, _changes} ->
+          {:error, reason}
       end
     else
-      {:ok, nil} -> {:error, :empty_chain}
-      nil -> {:error, :empty_chain}
+      {:ok, nil, nil} -> {:error, :empty_chain}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -283,6 +429,80 @@ defmodule Loopctl.AuditChain do
 
     merkle_tree(next_level)
   end
+
+  # --- US-35.1 incremental Merkle peaks ---
+  #
+  # A peak is `{height, hash}`: the root of a complete left-aligned 2^height
+  # block. Peaks are kept left-to-right by DESCENDING height (an MMR frontier);
+  # the heights are exactly the set-bit positions of the leaf count.
+  #
+  # `mmr_append_all/2` appends leaves to the frontier — pairwise-merging equal
+  # height neighbours — producing peaks whose values are byte-identical to the
+  # corresponding complete-subtree roots of `merkle_tree/2`. `bag_peaks/1` folds
+  # the frontier into the final root, replicating `merkle_tree/2`'s EXACT
+  # Bitcoin-style per-level pad-and-hash order (verified byte-for-byte by the
+  # property test, TC-35.1.1). `merkle_tree/2` remains the reference oracle and
+  # is NOT modified.
+
+  # Rehydrate `{height, hash}` peaks from stored hashes + covered leaf count.
+  # Heights are the set-bit positions of `count`, descending — the same order
+  # `mmr_append_all/2` maintains. Caller has already checked the count matches.
+  defp peaks_with_heights(hashes, count) do
+    Enum.zip(heights_from_count(count), hashes)
+  end
+
+  defp peak_hashes(peaks), do: Enum.map(peaks, fn {_height, hash} -> hash end)
+
+  defp mmr_append_all(peaks, leaves) do
+    Enum.reduce(leaves, peaks, fn leaf, acc -> mmr_append(acc, leaf) end)
+  end
+
+  # Push a height-0 leaf onto the frontier and merge equal-height neighbours
+  # from the right (left element first in the hash: left <> right).
+  defp mmr_append(peaks, leaf), do: mmr_merge(peaks ++ [{0, leaf}])
+
+  defp mmr_merge(peaks) do
+    case Enum.reverse(peaks) do
+      [{height, right}, {height, left} | rest] ->
+        merged = {height + 1, :crypto.hash(:sha256, left <> right)}
+        mmr_merge(Enum.reverse([merged | rest]))
+
+      _ ->
+        peaks
+    end
+  end
+
+  # Fold a descending-height frontier into the single Bitcoin-style root.
+  # Starting from the rightmost (lowest) peak as the carry, each peak to the left
+  # is combined after lifting the carry up to that peak's height by repeated
+  # self-pairing (replicating merkle_tree's "duplicate the last element" pad).
+  defp bag_peaks([{_height, hash}]), do: hash
+
+  defp bag_peaks(peaks) do
+    [{low_h, low_v} | rest_right_to_left] = Enum.reverse(peaks)
+
+    {_height, root} =
+      Enum.reduce(rest_right_to_left, {low_h, low_v}, fn {peak_h, peak_v}, {carry_h, carry_v} ->
+        lifted = lift_carry(carry_h, carry_v, peak_h)
+        {peak_h + 1, :crypto.hash(:sha256, peak_v <> lifted)}
+      end)
+
+    root
+  end
+
+  defp lift_carry(height, value, target) when height < target do
+    lift_carry(height + 1, :crypto.hash(:sha256, value <> value), target)
+  end
+
+  defp lift_carry(_height, value, _target), do: value
+
+  defp heights_from_count(count) do
+    0..63
+    |> Enum.filter(fn bit -> (count >>> bit &&& 1) == 1 end)
+    |> Enum.reverse()
+  end
+
+  defp popcount(count), do: count |> heights_from_count() |> length()
 
   # --- Private ---
 

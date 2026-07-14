@@ -81,7 +81,9 @@ defmodule Loopctl.HeavyRead do
   `:change_feed`, `:vector_search` (the shared kNN helper path), `:memory_recall`
   (the US-28.2 agent-memory HNSW recall via `all_memory/4`), `:ingestion_jobs`
   (the US-34.6 `GET /knowledge/ingestion-jobs` COUNT + list over the Oban-owned
-  `oban_jobs` table, bounded by a partial expression index).
+  `oban_jobs` table, bounded by a partial expression index), `:sth_incremental`
+  (the US-35.1 bounded "entries above the STH checkpoint" tail read over
+  `audit_chain`, folded into the persisted Merkle peaks).
   """
   @spec opts(atom()) :: keyword()
   def opts(endpoint) when is_atom(endpoint) do
