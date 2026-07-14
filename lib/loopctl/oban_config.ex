@@ -133,9 +133,11 @@ defmodule Loopctl.ObanConfig do
 
   # --- US-36.2: per-tenant in-flight fair-share caps + snooze backoff ---
   #
-  # The contended-queue workers (ArticleEmbeddingWorker on :embeddings,
-  # ContentIngestionWorker on :ingestion, the :knowledge relationship/cron-child
-  # workers) yield `{:snooze, n}` at the top of their tenant-scoped perform/1 when
+  # The contended-queue workers (ArticleEmbeddingWorker AND MemoryEmbeddingWorker on
+  # :embeddings — BOTH tenant-scoped per-item fan-out producers must gate or one can
+  # still monopolize the shared queue — ContentIngestionWorker on :ingestion, the
+  # :knowledge relationship/cron-child workers) yield `{:snooze, n}` at the top of
+  # their tenant-scoped perform/1 when
   # the tenant already occupies at/above its fair share of that queue's EXECUTING
   # slots (see `Loopctl.Oban.FairShare`). Cap K is DERIVED from the queue width so it
   # scales automatically when a width is retuned via `OBAN_QUEUE_<NAME>`.
@@ -172,6 +174,40 @@ defmodule Loopctl.ObanConfig do
     derived = max(div(width + 1, 2), 1)
     env_var = "OBAN_TENANT_FAIRSHARE_" <> String.upcase(Atom.to_string(queue))
     queue_size(System.get_env(env_var), derived)
+  end
+
+  @doc """
+  Force-validates EVERY fair-share knob at BOOT and returns their resolved values.
+
+  Invoked from `config/runtime.exs` (which runs before the system starts, in every
+  env) alongside `queues/0`, so a malformed `OBAN_TENANT_FAIRSHARE_<QUEUE>` cap,
+  `OBAN_TENANT_FAIRSHARE_SNOOZE_SECONDS`, or `OBAN_TENANT_FAIRSHARE_SNOOZE_JITTER`
+  aborts the node LOUD at boot — exactly like a malformed `OBAN_QUEUE_*` (which
+  `queues/0` already validates at boot). Without this, a fat-fingered cap var would
+  only surface at CALL time inside `Loopctl.Oban.FairShare.over_cap?/4`, whose count
+  path FAILS OPEN and would SILENTLY disable fairness on that queue — during the exact
+  incident an operator is trying to tune. Reading each knob here calls its parser
+  (`queue_size/2` / `non_neg_size/2`), which raises `ArgumentError` on a
+  present-but-malformed value, so evaluating this function IS the validation.
+
+  Returns a map of the resolved caps (one per configured queue) plus the snooze
+  base/jitter, purely so the boot config is introspectable; the gate re-reads env at
+  call time (config-based DI), so the returned values are a boot-time snapshot, not a
+  cache the gate consults.
+  """
+  @spec fair_share_config() :: %{
+          caps: keyword(pos_integer()),
+          snooze_base_seconds: pos_integer(),
+          snooze_jitter_seconds: non_neg_integer()
+        }
+  def fair_share_config do
+    caps = Enum.map(queues(), fn {queue, _width} -> {queue, tenant_fair_share_cap(queue)} end)
+
+    %{
+      caps: caps,
+      snooze_base_seconds: fair_share_snooze_base_seconds(),
+      snooze_jitter_seconds: fair_share_snooze_jitter_seconds()
+    }
   end
 
   @doc """

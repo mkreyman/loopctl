@@ -135,12 +135,14 @@ defmodule Loopctl.Oban.FairShareTest do
   end
 
   # Under Oban's Basic engine the fetched job is committed to state="executing" BEFORE
-  # perform/1 runs, so a job reads its OWN row when it counts executing slots. Without
-  # self-exclusion the running job counts itself: cap=1 (:ingestion) wedges forever and
-  # every gated queue silently loses one slot (effective cap-1). gate/3 threads the
-  # job_id so the running job is excluded. These tests seed the job-under-test's own
-  # executing row — the real executing-state semantics the bare-perform tests miss.
-  describe "self-exclusion: the running job never counts itself (US-36.2 wedge fix)" do
+  # perform/1 runs, so a job reads its OWN row when it counts executing slots. The gate
+  # decides by RANK: a job snoozes only if `cap` or more of the tenant's OTHER executing
+  # jobs have a strictly LOWER id (`id < job_id`). That self-excludes the running job
+  # for free (cap=1 :ingestion never wedges; a gated queue gives the full cap, not
+  # cap-1) AND deterministically breaks the co-fetch symmetry (see the next describe).
+  # These tests seed the job-under-test's own executing row — the real executing-state
+  # semantics the bare-perform tests miss.
+  describe "rank self-exclusion: the running job never counts itself (US-36.2 wedge fix)" do
     test "a lone executing :ingestion job (cap=1) is NOT gated once it excludes itself" do
       tenant = Ecto.UUID.generate()
 
@@ -151,47 +153,101 @@ defmodule Loopctl.Oban.FairShareTest do
 
       # cap for :ingestion is 1. The UNSCOPED count includes the running job...
       assert FairShare.executing_count(tenant, :ingestion) == 1
-      # ...so a naive `>= cap` (no exclusion) WEDGES: 1 >= 1 → over → snooze forever.
+      # ...so a naive `>= cap` (nil job_id, no rank) WEDGES: 1 >= 1 → over → snooze forever.
       assert FairShare.over_fair_share?(tenant, :ingestion, nil)
-      # Excluding the job itself: 0 >= 1 → false → the lone job RUNS immediately.
+      # Rank of the lone job: 0 lower-id peers >= 1 → false → the lone job RUNS immediately.
       refute FairShare.over_fair_share?(tenant, :ingestion, job.id)
       assert FairShare.gate(tenant, :ingestion, job.id) == :ok
     end
 
-    test "a SECOND concurrent executing job for the same tenant on cap=1 IS still gated" do
+    test "of two concurrent same-tenant jobs on cap=1, the LOWER-id runs and the HIGHER-id snoozes" do
       tenant = Ecto.UUID.generate()
 
-      running =
+      first =
         seed_job(tenant, :ingestion, "executing",
           worker: "Loopctl.Workers.ContentIngestionWorker"
         )
 
-      # Another of the tenant's jobs is genuinely executing concurrently.
-      seed_job(tenant, :ingestion, "executing", worker: "Loopctl.Workers.ContentIngestionWorker")
+      second =
+        seed_job(tenant, :ingestion, "executing",
+          worker: "Loopctl.Workers.ContentIngestionWorker"
+        )
 
-      # Excluding self still leaves 1 real peer >= cap(1) → snooze. Contention detected,
-      # queue not wedged: the self-exclusion narrows the count, it doesn't disable it.
-      assert {:snooze, _n} = FairShare.gate(tenant, :ingestion, running.id)
+      # `first` (lowest id) has 0 lower-id peers >= cap(1) → false → RUNS.
+      assert FairShare.gate(tenant, :ingestion, first.id) == :ok
+      # `second` has 1 lower-id peer (`first`) >= cap(1) → snoozes. Exactly ONE of the
+      # two concurrent jobs is gated — contention detected, queue not wedged, and the
+      # older job (not an arbitrary one) keeps its slot.
+      assert {:snooze, _n} = FairShare.gate(tenant, :ingestion, second.id)
     end
 
-    test "self-exclusion gives a tenant its FULL cap (embeddings 3), not cap-1" do
+    test "rank gives a tenant its FULL cap (embeddings 3), not cap-1; a NEWER job snoozes" do
       tenant = Ecto.UUID.generate()
       cap = ObanConfig.tenant_fair_share_cap(:embeddings)
 
-      # cap-1 OTHER executing jobs plus THIS running job = cap rows in the table.
+      # cap-1 OTHER executing jobs (lower ids) plus THIS running job = cap rows.
       for _ <- 1..(cap - 1), do: seed_job(tenant, :embeddings, "executing")
       running = seed_job(tenant, :embeddings, "executing")
 
       # Unscoped count = cap; a naive `cap >= cap` would snooze — the silent
       # under-utilization (effective cap-1) the medium finding describes.
       assert FairShare.executing_count(tenant, :embeddings) == cap
-      # Excluding self = cap-1 < cap → the tenant's cap-th job RUNS: it gets all `cap`
-      # concurrent slots, exactly as documented.
+      # Rank of `running` = cap-1 lower-id peers < cap → the tenant's cap-th job RUNS:
+      # it gets all `cap` concurrent slots, exactly as documented.
       refute FairShare.over_fair_share?(tenant, :embeddings, running.id)
 
-      # One genuinely-additional concurrent job (cap peers + self) → cap >= cap → snooze.
-      seed_job(tenant, :embeddings, "executing")
-      assert FairShare.over_fair_share?(tenant, :embeddings, running.id)
+      # One genuinely-additional, NEWER concurrent job (higher id). The rank decision
+      # gates the NEWER arrival (rank cap >= cap → snooze), NOT the already-running
+      # `running` (still rank cap-1 → runs): an executing job is never retroactively
+      # pushed to snooze by a later arrival.
+      newer = seed_job(tenant, :embeddings, "executing")
+      assert FairShare.over_fair_share?(tenant, :embeddings, newer.id)
+      refute FairShare.over_fair_share?(tenant, :embeddings, running.id)
+    end
+  end
+
+  # The Basic engine commits a whole width-sized fetch to state="executing" in ONE txn
+  # BEFORE dispatch, so under a one-tenant burst ALL co-fetched jobs are executing when
+  # each runs its gate. A naive "count OTHER peers >= cap" would make every co-fetched
+  # job see the others and snooze together — both slots idle. Under the default jitter
+  # that desyncs and self-heals, but at the PERMITTED jitter=0 the jobs stay lockstep,
+  # are co-fetched every cycle, and NEVER complete: a permanent livelock. The rank
+  # decision admits exactly the lowest `cap` by id, DETERMINISTICALLY — independent of
+  # read order AND of jitter — so "all snooze" is impossible and jitter=0 is safe.
+  describe "co-fetch determinism: exactly the lowest-cap proceed, the rest snooze (US-36.2 livelock fix)" do
+    test "cap=1 (:ingestion): of a co-fetched batch exactly ONE proceeds — never all-snooze" do
+      tenant = Ecto.UUID.generate()
+
+      jobs =
+        for _ <- 1..4 do
+          seed_job(tenant, :ingestion, "executing",
+            worker: "Loopctl.Workers.ContentIngestionWorker"
+          )
+        end
+
+      results = Enum.map(jobs, &FairShare.gate(tenant, :ingestion, &1.id))
+      proceeded = Enum.count(results, &(&1 == :ok))
+      snoozed = Enum.count(results, &match?({:snooze, _}, &1))
+
+      # cap=1 → exactly one proceeds, three snooze. Crucially NOT zero proceeding (the
+      # all-snooze livelock the medium finding describes).
+      assert proceeded == 1
+      assert snoozed == 3
+      # And it is deterministically the LOWEST-id job that proceeds.
+      lowest = Enum.min_by(jobs, & &1.id)
+      assert FairShare.gate(tenant, :ingestion, lowest.id) == :ok
+    end
+
+    test "cap=3 (:embeddings): exactly the lowest 3 of a co-fetched batch of 5 proceed" do
+      tenant = Ecto.UUID.generate()
+      cap = ObanConfig.tenant_fair_share_cap(:embeddings)
+      assert cap == 3
+
+      jobs = for _ <- 1..5, do: seed_job(tenant, :embeddings, "executing")
+      {lowest_cap, rest} = jobs |> Enum.sort_by(& &1.id) |> Enum.split(cap)
+
+      assert Enum.all?(lowest_cap, &(FairShare.gate(tenant, :embeddings, &1.id) == :ok))
+      assert Enum.all?(rest, &match?({:snooze, _}, FairShare.gate(tenant, :embeddings, &1.id)))
     end
   end
 end

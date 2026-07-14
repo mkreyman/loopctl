@@ -54,6 +54,15 @@ config :loopctl, Oban,
   queues: Loopctl.ObanConfig.queues(),
   plugins: Loopctl.ObanConfig.plugins()
 
+# US-36.2: validate the per-tenant fair-share knobs (OBAN_TENANT_FAIRSHARE_<QUEUE> caps
+# + SNOOZE base/jitter) at BOOT, alongside the queue widths above. Evaluating
+# `fair_share_config/0` calls each knob's parser, which RAISES on a present-but-malformed
+# value — so a fat-fingered cap aborts the node LOUD here (like a bad OBAN_QUEUE_*),
+# instead of surfacing only at gate call-time where the count path fails OPEN and would
+# silently disable fairness on that queue. Stored so the resolved boot config is
+# introspectable; the gate itself re-reads env at call time (config-based DI).
+config :loopctl, :fair_share_config, Loopctl.ObanConfig.fair_share_config()
+
 # Cloak Vault — key from environment in all environments where CLOAK_KEY is set.
 # In production, CLOAK_KEY is required — startup fails if it is missing.
 if config_env() == :prod do
