@@ -4,8 +4,13 @@ defmodule Loopctl.ObanPluginsConfigTest do
   pre-existing Lifeline/Pruner plugins are unchanged.
 
   Pure config read — no DB, no running Oban needed (`config/test.exs` sets
-  `testing: :inline`, under which plugins are not started, but the KEYWORD LIST
-  configured in `config/config.exs` still merges into `Application.get_env/2`).
+  `testing: :inline`, under which plugins are not started). As of US-35.3 the
+  `:plugins` list is owned exclusively by `Loopctl.ObanConfig.plugins/0` and set at
+  RUNTIME in `config/runtime.exs` (`config :loopctl, Oban, plugins:
+  Loopctl.ObanConfig.plugins()`); `config/config.exs` no longer sets `plugins:`.
+  `runtime.exs` runs in every environment (test included), so the crontab / Lifeline /
+  Pruner / Reindexer this module asserts on are read straight from that runtime-set
+  value via `Application.get_env/2`.
   """
   use ExUnit.Case, async: true
 
@@ -36,6 +41,47 @@ defmodule Loopctl.ObanPluginsConfigTest do
 
     test "Cron is still present (unchanged by this story)", %{plugins: plugins} do
       assert Enum.any?(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+    end
+  end
+
+  describe "US-35.3: all-tenants ComputeSthWorker safety-sweep cron (AC-35.3.1, TC-35.3.1)" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.ComputeSthWorker, opts} ->
+            Keyword.get(opts, :args) == %{"mode" => "all_tenants"}
+
+          _ ->
+            false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the all_tenants ComputeSthWorker entry exists in the crontab", %{entry: entry} do
+      assert entry, "expected an all_tenants ComputeSthWorker crontab entry"
+    end
+
+    test "its schedule is no longer the per-minute poll", %{entry: entry} do
+      {schedule, _worker, _opts} = entry
+      refute schedule == "* * * * *"
+    end
+
+    test "its schedule is config-driven (equals ObanConfig.sth_sweep_cron/0)", %{entry: entry} do
+      {schedule, _worker, _opts} = entry
+      assert schedule == Loopctl.ObanConfig.sth_sweep_cron()
+    end
+  end
+
+  describe "US-35.3: sth_sweep_cron/0 (config-based DI, runtime-tunable)" do
+    test "defaults to a 5-minute sweep when STH_SWEEP_CRON is unset" do
+      # STH_SWEEP_CRON is not set in the test environment, so the default applies.
+      assert Loopctl.ObanConfig.sth_sweep_cron() == "*/5 * * * *"
     end
   end
 

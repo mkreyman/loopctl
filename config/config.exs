@@ -300,54 +300,17 @@ config :loopctl, Oban,
     knowledge: 5,
     memory: 3,
     audit: 3
-  ],
-  plugins: [
-    {Oban.Plugins.Cron,
-     crontab: [
-       {"0 * * * *", Loopctl.Workers.IdempotencyCleanupWorker},
-       {"0 * * * *", Loopctl.Workers.BulkDeleteTokenCleanupWorker},
-       {"0 * * * *", Loopctl.Workers.ReauthChallengeCleanupWorker},
-       {"0 2 * * *", Loopctl.Workers.AuditPartitionWorker},
-       {"0 2 * * *", Loopctl.Workers.CostRollupWorker},
-       {"0 3 * * *", Loopctl.Workers.WebhookCleanupWorker},
-       {"0 3 * * 0", Loopctl.Workers.TokenDataArchivalWorker},
-       {"0 4 * * *", Loopctl.Workers.KnowledgeLintWorker, args: %{"mode" => "all_tenants"}},
-       {"0 5 * * 0", Loopctl.Workers.KnowledgeMocWorker, args: %{"mode" => "all_tenants"}},
-       {"30 4 * * *", Loopctl.Workers.RetrievalMetricsWorker, args: %{"mode" => "all_tenants"}},
-       # Daily promotion-compile-quality eval (Epic 29 / US-29.5): precision/recall of
-       # Loopctl.Memory.Promoter against the committed labeled dataset. Calibration/
-       # observability only — never gates promotion.
-       {"45 4 * * *", Loopctl.Workers.PromotionEvalWorker, args: %{"mode" => "all_tenants"}},
-       {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
-       {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
-       # Cross-tenant memory-promotion sweep (Epic 29 / US-29.2). Runs every 10 min —
-       # KEEP this in sync with :memory_promotion_sweep_interval_seconds (600) below,
-       # which is the data form of this schedule that the boot invariant reasons over.
-       # The expiry floor MUST exceed this interval and stay shorter than
-       # :session_memory_ttl_seconds (both asserted at boot) so session turns are
-       # promoted before SessionMemoryPruneWorker can delete them (no silent
-       # golden-nugget loss).
-       {"*/10 * * * *", Loopctl.Workers.MemoryPromotionSweepWorker},
-       {"* * * * *", Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}},
-       {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker},
-       {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker}
-     ]},
-    # Rescue jobs orphaned in :executing when a node dies mid-run (e.g. a deploy).
-    # Without Lifeline these rows stay `executing` forever — 110 such orphans (from
-    # 2026-06-22) were found still clogging the queues on 2026-07-10. Reset a stuck
-    # job back to `available` (or discard if attempts are exhausted) after 30 min so
-    # the slot frees and it re-runs instead of leaking.
-    {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(30)},
-    # Prune terminal (completed/discarded/cancelled) jobs older than 7 days so the
-    # oban_jobs table doesn't grow unbounded.
-    {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
-    # US-34.1 (AC-34.1.4): periodically REINDEX CONCURRENTLY the oban_jobs indexes
-    # (default: oban_jobs_args_index + oban_jobs_meta_index, once daily at midnight
-    # UTC) so index bloat from this table's high churn (state transitions on every
-    # job) doesn't silently degrade the queries the new US-34.1 gauges themselves
-    # depend on. Purely additive — no job semantics change.
-    Oban.Plugins.Reindexer
   ]
+
+# US-35.3: the Oban `:plugins` list (Cron crontab + Lifeline + Pruner + Reindexer)
+# moved to `Loopctl.ObanConfig.plugins/0` and is set at RUNTIME in `config/runtime.exs`
+# (`config :loopctl, Oban, plugins: Loopctl.ObanConfig.plugins()`). It lives there —
+# not here — so the all-tenants ComputeSthWorker safety-sweep schedule is driven by
+# `STH_SWEEP_CRON` (`Loopctl.ObanConfig.sth_sweep_cron/0`, default `*/5 * * * *`) and is
+# tunable/revertible per environment without a deploy. NB: unlike `queues:` (a keyword
+# list that `Config` deep-merges), `:plugins` is a plain list that `Config` REPLACES
+# wholesale, so it must be owned entirely by whichever layer sets it last (runtime.exs).
+# Do NOT re-add a compile-time `plugins:` here — it would be overwritten at boot.
 
 # US-34.1 (AC-34.1.4): Stager is NOT a `plugins:` entry in this Oban version
 # (2.21) — it was absorbed into Oban's core engine and is now configured via the
@@ -389,8 +352,19 @@ config :loopctl, :oban_orphan_health_threshold, 10
 # `unique` `period`, so a burst of appends for one tenant within this window
 # collapses to a single scheduled job (Basic-Engine-safe dedup). Short by design:
 # it only delays the activity-driven STH sign by a few seconds while coalescing
-# bursts; the per-minute cron poll remains the correctness backstop.
+# bursts; the low-frequency cron sweep (US-35.3, below) remains the correctness backstop.
 config :loopctl, :sth_enqueuer_debounce_seconds, 5
+
+# US-35.3: all-tenants ComputeSthWorker safety-sweep cron. Reduced from `"* * * * *"`
+# (every minute) to a low-frequency, config-driven backstop (default `*/5 * * * *`) that
+# only catches audit appends the event-driven enqueuer (US-35.2, above) missed. The
+# expression is NOT set here — it is read from the `STH_SWEEP_CRON` env var at runtime by
+# `Loopctl.ObanConfig.sth_sweep_cron/0` and installed into the Oban crontab via
+# `Loopctl.ObanConfig.plugins/0` in `config/runtime.exs`, so an operator can slow or
+# revert the sweep with `fly secrets set STH_SWEEP_CRON=... && restart` — no deploy.
+# Correctness is interval-independent: every fanned-out per-tenant job still self-gates on
+# `Loopctl.AuditChain.sth_needed?/1`, so a slower poll can only delay (never corrupt) an
+# STH, and only for a tenant the event path also missed, by up to one sweep interval.
 
 # Cloak Vault — key configured per environment
 # Generate a key: :crypto.strong_rand_bytes(32) |> Base.encode64()

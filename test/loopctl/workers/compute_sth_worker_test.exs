@@ -142,4 +142,102 @@ defmodule Loopctl.Workers.ComputeSthWorkerTest do
       assert sth.chain_position == 0
     end
   end
+
+  # US-35.3: the reduced-frequency cron is only a SCHEDULING change; the
+  # all-tenants fanout + per-tenant self-gating is unchanged. These tests prove
+  # the bounded-lag safety net: with the event-driven enqueuer (US-35.2) OFF
+  # (config/test.exs sets :sth_enqueuer_subscribe = false, so the event path is
+  # already disabled here — no runtime toggling), running ONE sweep still signs
+  # an STH at the latest chain position for any tenant that appended between
+  # sweeps, and never produces a spurious STH when nothing changed.
+  describe "US-35.3: reduced-frequency safety sweep (AC-35.3.2/.3, TC-35.3.2/.3)" do
+    test "TC-35.3.2: a tenant that appended between sweeps gets an STH by the next sweep" do
+      {tenant, _priv} = signing_tenant()
+
+      # Two appends -> latest chain_position is 1.
+      {:ok, _} = AuditChain.append(tenant.id, append_attrs())
+      {:ok, _} = AuditChain.append(tenant.id, append_attrs())
+
+      # No STH yet: the event path is off and no sweep has run.
+      assert AuditChain.get_latest_sth(tenant.id) == nil
+
+      # Run exactly ONE all-tenants safety sweep and drain the fanned-out
+      # per-tenant jobs (persist under :manual, then execute via drain).
+      run_one_sweep()
+
+      sth = AuditChain.get_latest_sth(tenant.id)
+      assert %AuditChain.SignedTreeHead{} = sth
+      # Bounded-lag guarantee: STH lands at the LATEST appended position.
+      assert sth.chain_position == 1
+      assert sth_count(tenant.id) == 1
+    end
+
+    test "TC-35.3.3: a tenant already at head gets no new STH from a sweep (self-gated)" do
+      {tenant, _priv} = signing_tenant()
+
+      {:ok, _} = AuditChain.append(tenant.id, append_attrs())
+
+      # Sign an STH at head first (via the per-tenant path).
+      assert :ok = ComputeSthWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      sth_before = AuditChain.get_latest_sth(tenant.id)
+      assert %AuditChain.SignedTreeHead{chain_position: 0} = sth_before
+      assert sth_count(tenant.id) == 1
+      refute AuditChain.sth_needed?(tenant.id)
+
+      # A subsequent sweep with no new entries must be a no-op (self-gated).
+      run_one_sweep()
+
+      sth_after = AuditChain.get_latest_sth(tenant.id)
+      assert sth_after.chain_position == 0
+      assert sth_count(tenant.id) == 1
+    end
+  end
+
+  # Sets up an active tenant whose stored audit_signing_public_key matches the
+  # private key returned by MockSecrets, so `sign_and_store_tree_head/1`
+  # succeeds. `append/3` does not touch the signing key, so a single key set is
+  # sufficient (unlike the two-step dance TC-32.5.3 uses for illustration).
+  defp signing_tenant do
+    tenant = fixture(:tenant, %{slug: "sth-sweep-#{System.unique_integer([:positive])}"})
+    {_pub, priv} = :crypto.generate_key(:eddsa, :ed25519)
+    {matching_pub, _} = :crypto.generate_key(:eddsa, :ed25519, priv)
+
+    tenant =
+      tenant
+      |> Ecto.Changeset.change(audit_signing_public_key: matching_pub)
+      |> AdminRepo.update!()
+
+    # Stub (not expect) so any number of sign calls resolve the same key.
+    Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:ok, priv} end)
+    Loopctl.TenantKeys.init_cache()
+
+    {tenant, priv}
+  end
+
+  defp append_attrs do
+    %{
+      action: "test_event",
+      actor_lineage: ["test"],
+      entity_type: "test",
+      payload: %{"k" => "v"}
+    }
+  end
+
+  # Runs one all-tenants sweep and drains the fanned-out per-tenant :audit jobs.
+  # Under :manual the fanout persists jobs (instead of executing inline), then
+  # `drain_queue(with_scheduled: true)` executes them past their jitter delay --
+  # the deterministic analogue of the cron sweep + queue draining in production.
+  defp run_one_sweep do
+    Oban.Testing.with_testing_mode(:manual, fn ->
+      assert :ok = ComputeSthWorker.perform(%Oban.Job{args: %{"mode" => "all_tenants"}})
+      Oban.drain_queue(queue: :audit, with_scheduled: true)
+    end)
+  end
+
+  defp sth_count(tenant_id) do
+    AdminRepo.aggregate(
+      from(s in AuditChain.SignedTreeHead, where: s.tenant_id == ^tenant_id),
+      :count
+    )
+  end
 end

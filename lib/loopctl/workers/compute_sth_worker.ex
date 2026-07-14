@@ -7,11 +7,16 @@ defmodule Loopctl.Workers.ComputeSthWorker do
 
   ## Scheduling
 
-  Configured via Oban Cron to run every minute in `all_tenants` mode,
-  which fans out individual per-tenant jobs via a single `Oban.insert_all/1`
-  batch. Each per-tenant job is scheduled with a small deterministic jitter
-  (see `jitter/1`) so the fanout doesn't thundering-herd the `:audit` queue
-  and the primary DB at the exact `:00` instant of the cron tick.
+  Configured via Oban Cron to run in `all_tenants` mode on a low-frequency,
+  config-driven safety-sweep interval (US-35.3, default every 5 minutes via
+  `STH_SWEEP_CRON` / `Loopctl.ObanConfig.sth_sweep_cron/0`) — reduced from the
+  former per-minute poll now that US-35.2's event-driven enqueuer signs STHs on
+  real audit appends. The sweep fans out individual per-tenant jobs via a single
+  `Oban.insert_all/1` batch. Each per-tenant job is scheduled with a small
+  deterministic jitter (see `jitter/1`) so the fanout doesn't thundering-herd the
+  `:audit` queue and the primary DB at the exact `:00` instant of the cron tick,
+  and self-gates on `AuditChain.sth_needed?/1` so a slower sweep can only delay
+  (never corrupt) an STH.
 
   ## `unique` does NOT apply to this fanout
 

@@ -146,6 +146,94 @@ defmodule Loopctl.ObanConfigTest do
     end
   end
 
+  describe "sth_sweep_cron/0 (US-35.3, runtime-tunable via STH_SWEEP_CRON)" do
+    test "TC-35.3.2: defaults to the 5-minute sweep when STH_SWEEP_CRON is unset" do
+      # STH_SWEEP_CRON is not set in the test environment, so the default applies.
+      assert ObanConfig.sth_sweep_cron() == "*/5 * * * *"
+    end
+
+    @tag :tmp_dir
+    test "TC-35.3.3: a valid 5-field STH_SWEEP_CRON override is read at runtime and returned",
+         %{tmp_dir: tmp_dir} do
+      result =
+        run_elixir_script(
+          tmp_dir,
+          "result = Loopctl.ObanConfig.sth_sweep_cron()",
+          [{"STH_SWEEP_CRON", "0 * * * *"}]
+        )
+
+      assert result == "0 * * * *"
+    end
+
+    @tag :tmp_dir
+    test "TC-35.3.4: an @nickname STH_SWEEP_CRON override is accepted (Oban parses nicknames)",
+         %{tmp_dir: tmp_dir} do
+      # Regression: validate_cron/2 previously counted fields and false-rejected the
+      # single-field @nickname forms that Oban's own Cron parser accepts.
+      result =
+        run_elixir_script(
+          tmp_dir,
+          "result = Loopctl.ObanConfig.sth_sweep_cron()",
+          [{"STH_SWEEP_CRON", "@hourly"}]
+        )
+
+      assert result == "@hourly"
+    end
+
+    @tag :tmp_dir
+    test "TC-35.3.7: a STH_SWEEP_CRON padded with trailing whitespace/newline is trimmed to a value Oban accepts",
+         %{tmp_dir: tmp_dir} do
+      # Regression: validate_cron/2 validated `String.trim(value)` but previously
+      # returned the RAW `value`. Oban's Cron plugin re-parses whatever it's handed and
+      # REJECTS trailing whitespace/newlines, so a padded STH_SWEEP_CRON (common from
+      # $(cat file), piped secrets, YAML quoting, copy-paste) passed boot validation
+      # then crashed the Cron plugin fleet-wide with an unattributed "unrecognized cron
+      # expression" error. sth_sweep_cron/0 must return the TRIMMED value, and that
+      # value must be one Oban's own parser accepts.
+      result =
+        run_elixir_script(
+          tmp_dir,
+          """
+          returned = Loopctl.ObanConfig.sth_sweep_cron()
+
+          result = %{
+            returned: returned,
+            oban_accepts?: match?({:ok, _}, Oban.Cron.Expression.parse(returned))
+          }
+          """,
+          [{"STH_SWEEP_CRON", "*/5 * * * *\n"}]
+        )
+
+      assert result.returned == "*/5 * * * *"
+
+      assert result.oban_accepts?,
+             "the value handed to Oban's Cron plugin must parse cleanly — a trailing " <>
+               "newline would crash the plugin at boot"
+    end
+
+    @tag :tmp_dir
+    test "TC-35.3.5: a malformed 5-field STH_SWEEP_CRON (out-of-range) aborts boot with ArgumentError",
+         %{tmp_dir: tmp_dir} do
+      # `config/runtime.exs` calls plugins/0 -> sth_sweep_cron/0 while loading config,
+      # so a malformed value fails LOUD at boot (non-zero exit) rather than silently
+      # falling back to the default — even under `mix run --no-start`.
+      {output, exit_code} = run_boot(tmp_dir, [{"STH_SWEEP_CRON", "99 99 99 99 99"}])
+
+      assert exit_code != 0
+      assert output =~ "STH_SWEEP_CRON"
+      assert output =~ "out of range"
+    end
+
+    @tag :tmp_dir
+    test "TC-35.3.6: a non-cron STH_SWEEP_CRON string aborts boot with ArgumentError",
+         %{tmp_dir: tmp_dir} do
+      {output, exit_code} = run_boot(tmp_dir, [{"STH_SWEEP_CRON", "not a cron"}])
+
+      assert exit_code != 0
+      assert output =~ "STH_SWEEP_CRON"
+    end
+  end
+
   # Runs `script` (must bind a `result` variable) in a fresh `mix run --no-start`
   # subprocess with `env` applied ONLY to that child process, then reads back the
   # term `script` wrote to `result_path` via :erlang.term_to_binary/1. Keeps this
@@ -168,5 +256,21 @@ defmodule Loopctl.ObanConfigTest do
     assert exit_code == 0, "subprocess script failed (exit #{exit_code}):\n#{output}"
 
     result_path |> File.read!() |> :erlang.binary_to_term()
+  end
+
+  # Boots a fresh `mix run --no-start` subprocess (which still evaluates
+  # `config/runtime.exs`, and thus `ObanConfig.plugins/0 -> sth_sweep_cron/0`) with
+  # `env` applied ONLY to that child process, and returns `{output, exit_code}` WITHOUT
+  # asserting success — for tests that assert a malformed env value aborts boot. Keeps
+  # this async: true file free of any global env mutation.
+  defp run_boot(tmp_dir, env) do
+    result_path = Path.join(tmp_dir, "booted.bin")
+
+    System.cmd(
+      "mix",
+      ["run", "--no-start", "-e", "File.write!(#{inspect(result_path)}, <<>>)"],
+      env: [{"MIX_ENV", "test"} | env],
+      stderr_to_stdout: true
+    )
   end
 end
