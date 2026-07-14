@@ -114,21 +114,34 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       and every deliberate discard/cancel (`:stop`). `:success`/`:snoozed` `:stop`
       states are excluded. `oban_jobs` has no tenant dimension on either event (only
       bounded `worker`/`queue`/`state` labels, none of which we tag — the counter is a
-      pure increment, mirroring `:under_fill_count`).
+      pure increment, mirroring `:under_fill_count`). BOTH handlers additionally
+      exclude `meta.worker == "Loopctl.Workers.ScaleAlertDeliveryWorker"` (review fix,
+      LOW): without this, a degraded operator webhook — exactly the condition under
+      which alerts fire — would inflate the very "fleet-wide Oban discard rate" this
+      signal watches, self-referentially coupling the alerter's own delivery health
+      into the application signal it feeds. `worker` is the same bounded label
+      already named above (no new unbounded dimension).
     * **(c) LLM/embedding provider-error rate** — sourced from the NEW
       `[:loopctl, :llm, :provider_error]` event (`Loopctl.TelemetryEvents.llm_provider_error/0`),
       emitted from the shared `Loopctl.Llm.Anthropic` HTTP client (every Anthropic
       call site — content extraction/classification/merge/memory-promotion — funnels
-      through it) AND from `ArticleEmbeddingWorker`/`MemoryEmbeddingWorker`'s
-      embedding-provider branch, both via `Loopctl.Llm.record_provider_error/2`, on a
-      genuine provider failure. **Deliberately NOT `[:loopctl, :llm, :blocked]`**: that
+      through it) AND from `Loopctl.Knowledge.run_embedding_task/3` (review fix,
+      MEDIUM: the single guarded entry point shared by BOTH embedding Oban workers
+      — `ArticleEmbeddingWorker`/`MemoryEmbeddingWorker` — AND every query-time
+      embedding caller — combined/semantic search, novelty scoring,
+      `Memory.recall/2`, promotion near-dup lookup — so a real provider-error storm
+      hitting query-time paths is no longer under-counted), both via
+      `Loopctl.Llm.record_provider_error/2`, on a genuine provider failure.
+      **Deliberately NOT `[:loopctl, :llm, :blocked]`**: that
       event fires when a tenant has no BYO key configured (a config state checked
       BEFORE any provider call), so windowing it as a provider-error proxy would
       false-page on keyless tenants while missing a real 429/5xx/transport storm
       entirely (see `Loopctl.Telemetry.ScaleMetrics`'s "AC-34.4.3 coordination" note).
       A single unconditional counter (`:provider_error_count`) mirrors
       `:under_fill_count`; the emit site alone decides transient vs permanent
-      (`:class` metadata, unused by this counter, which windows total volume).
+      (`:class` metadata, unused by this counter, which windows total volume) —
+      gated by the same breaker-countable classification as the circuit breaker, so
+      a per-tenant 4xx credential/quota problem never contributes.
 
   All three plug into the exact same `step/8` / `step_p95/8` edge-fire helpers and
   `notify/7` delivery path — no new delivery code, no change to the existing three
@@ -177,6 +190,17 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # revoked/invalid provider key) increments NOTHING on this "discard rate" signal.
   @oban_stop_event [:oban, :job, :stop]
   @provider_error_event [:loopctl, :llm, :provider_error]
+
+  # Review fix (LOW): exclude ScaleAlerts' OWN delivery worker from the discard-rate
+  # signal it feeds. Without this, a degraded operator webhook — exactly the
+  # condition under which alerts fire — inflates the very "fleet-wide Oban discard
+  # rate" this signal watches, self-referentially coupling the alerter's own
+  # observability health into an application signal. `meta.job.worker` is a bounded
+  # label (mirrors the existing `state`-only filtering already applied to these two
+  # events), so filtering on it stays AC-34.3.5-compliant (no unbounded tenant/id
+  # dimension is added). `Oban.Worker.to_string/1` strips the "Elixir." prefix Oban
+  # persists on `oban_jobs.worker`.
+  @scale_alert_delivery_worker Oban.Worker.to_string(ScaleAlertDeliveryWorker)
 
   # The latency buckets — the SAME bounded set as the ScaleMetrics histogram so the
   # bucket-based p95 here matches what Prometheus' histogram_quantile would report. A
@@ -576,7 +600,8 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # exhausted job converting to a terminal discard — no metadata filtering, mirrors
   # `:under_fill_count`. See the `@oban_stop_event` clause below for half (b): a
   # DELIBERATE discard/cancel, which this event never observes.
-  def handle_event(@oban_exception_event, _measurements, _metadata, %{table: table}) do
+  def handle_event(@oban_exception_event, _measurements, %{worker: worker}, %{table: table})
+      when worker != @scale_alert_delivery_worker do
     :ets.update_counter(table, :oban_discard_count, 1)
     :ok
   rescue
@@ -585,13 +610,20 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       :ok
   end
 
+  # Review fix (LOW): the alerter's OWN delivery worker — excluded above so a
+  # degraded operator webhook (exactly when alerts are firing) never inflates the
+  # discard-rate signal it feeds. See `@scale_alert_delivery_worker`.
+  def handle_event(@oban_exception_event, _measurements, _metadata, _config), do: :ok
+
   # Review fix (MEDIUM, AC-34.3.2): the sibling half of the discard signal — a
   # deliberate `{:discard, _}`/bare `:discard` or `{:cancel, _}` job return emits
   # `[:oban, :job, :stop]` (`meta.state` `:discard` / `:cancelled`), never the
   # `:exception` event above. Only these two terminal, non-retryable states count;
   # `:success` and `:snoozed` (the OTHER `:stop` states) are explicitly excluded.
-  def handle_event(@oban_stop_event, _measurements, %{state: state}, %{table: table})
-      when state in [:discard, :cancelled] do
+  def handle_event(@oban_stop_event, _measurements, %{state: state, worker: worker}, %{
+        table: table
+      })
+      when state in [:discard, :cancelled] and worker != @scale_alert_delivery_worker do
     :ets.update_counter(table, :oban_discard_count, 1)
     :ok
   rescue
@@ -599,6 +631,10 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       Logger.error("ScaleAlerts oban_stop handler error: #{Exception.message(e)}")
       :ok
   end
+
+  # Review fix (LOW): mirrors the `@oban_exception_event` exclusion above — the
+  # alerter's own delivery worker never inflates the discard-rate signal it feeds.
+  def handle_event(@oban_stop_event, _measurements, _metadata, _config), do: :ok
 
   # US-34.3 (AC-34.3.3): genuine LLM/embedding provider-error rate, sourced from the
   # NEW `[:loopctl, :llm, :provider_error]` event (emitted from exactly one choke

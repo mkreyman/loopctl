@@ -365,6 +365,37 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
       refute_received :unexpected_delivery
     end
 
+    test "review fix (LOW): ScaleAlertDeliveryWorker's OWN discards/exceptions do NOT " <>
+           "inflate the discard rate it feeds (self-referential coupling)",
+         %{server: server} do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+        send(test_pid, :unexpected_delivery)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      worker = Oban.Worker.to_string(ScaleAlertDeliveryWorker)
+
+      for _ <- 1..11 do
+        :telemetry.execute([:oban, :job, :exception], %{duration: 1}, %{
+          worker: worker,
+          queue: "webhooks",
+          state: :failure
+        })
+
+        :telemetry.execute([:oban, :job, :stop], %{duration: 1}, %{
+          worker: worker,
+          queue: "webhooks",
+          state: :discard
+        })
+      end
+
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      refute_received :unexpected_delivery
+    end
+
     test "TC-34.3.3: provider-error rate breach fires", %{server: server} do
       test_pid = self()
       expect_delivery(test_pid)

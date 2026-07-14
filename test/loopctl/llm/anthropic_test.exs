@@ -179,7 +179,7 @@ defmodule Loopctl.Llm.AnthropicTest do
       assert metadata == %{provider: "anthropic", class: :transient}
     end
 
-    test "a 200-with-unexpected-shape response is ALSO recorded (a genuine anomaly)" do
+    test "a 200-with-unexpected-shape response is NEVER recorded (review fix LOW: a 200 is a provider SUCCESS, not an outage)" do
       tenant = tenant_with_key()
       attach_provider_error_listener(self())
 
@@ -189,8 +189,7 @@ defmodule Loopctl.Llm.AnthropicTest do
 
       assert {:error, {:api_error, 200, :provider_error}} = run(tenant)
 
-      assert_received {:provider_error_emitted, %{count: 1}, metadata}
-      assert metadata == %{provider: "anthropic", class: :transient}
+      refute_received {:provider_error_emitted, _measurements, _metadata}
     end
 
     test "a successful 200 call never emits provider_error" do

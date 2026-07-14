@@ -298,12 +298,16 @@ defmodule Loopctl.Llm do
   coordination" moduledoc note.
 
   Call this from EXACTLY ONE choke point per failure at each call site — currently
-  `ArticleEmbeddingWorker`/`MemoryEmbeddingWorker`'s embedding-provider branch
-  (`provider: "embedding"`, never for the circuit breaker's own `:circuit_open`
-  skip) and `Loopctl.Llm.Anthropic`'s shared HTTP client (`provider: "anthropic"`,
-  the ONE choke point for every Anthropic call site — content extraction/
-  classification/merge/memory-promotion) — so the emitted count matches the actual
-  failure count 1:1 — no double-counting.
+  `Loopctl.Knowledge.run_embedding_task/3` (`provider: "embedding"`) — the SINGLE
+  guarded entry point shared by both Oban workers (`ArticleEmbeddingWorker`/
+  `MemoryEmbeddingWorker`) AND every query-time embedding caller (combined/semantic
+  search, novelty scoring, `Memory.recall/2`, promotion near-dup lookup), gated by
+  the same `breaker_countable?/1` classification the circuit breaker uses so a
+  per-tenant 4xx never contributes, and never for the circuit breaker's own
+  `:circuit_open` skip — and `Loopctl.Llm.Anthropic`'s shared HTTP client
+  (`provider: "anthropic"`, the ONE choke point for every Anthropic call site —
+  content extraction/classification/merge/memory-promotion) — so the emitted count
+  matches the actual failure count 1:1 — no double-counting.
 
   Emits `[:loopctl, :llm, :provider_error]` with BOUNDED metadata ONLY: `provider`
   (`"anthropic"` | `"embedding"`) and `class` (`:transient` | `:permanent`, per

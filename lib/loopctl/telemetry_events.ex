@@ -165,8 +165,13 @@ defmodule Loopctl.TelemetryEvents do
   each the ONE call site for its provider: `Loopctl.Llm.Anthropic`'s shared HTTP
   client (`provider: "anthropic"` — every Anthropic call site, content extraction/
   classification/merge/memory-promotion, funnels through it) and
-  `Loopctl.Workers.ArticleEmbeddingWorker` / `Loopctl.Workers.MemoryEmbeddingWorker`
-  (`provider: "embedding"`) once per genuine provider failure — never for the
+  `Loopctl.Knowledge.run_embedding_task/3` (`provider: "embedding"`) — the SINGLE
+  guarded entry point shared by both embedding Oban workers
+  (`Loopctl.Workers.ArticleEmbeddingWorker` / `Loopctl.Workers.MemoryEmbeddingWorker`)
+  AND every query-time embedding caller (combined/semantic search, novelty scoring,
+  `Memory.recall/2`, promotion near-dup lookup) — once per genuine provider failure,
+  gated by the same breaker-countable classification the circuit breaker uses
+  (a per-tenant 4xx credential/quota problem never contributes), and never for the
   circuit breaker's own `:circuit_open` skip (a DERIVED consequence of prior
   failures already counted when they happened, not a fresh one).
 

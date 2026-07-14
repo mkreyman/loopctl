@@ -90,8 +90,11 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
         skip_no_embedding_key(tenant_id, memory_id)
 
       {:error, reason} ->
+        # US-34.3 (review MED #1): the `[:loopctl, :llm, :provider_error]` telemetry
+        # signal is now recorded ONCE, upstream, in
+        # `Loopctl.Knowledge.run_embedding_task/3` — the single choke point shared by
+        # this worker AND every query-time embedding caller. Do NOT re-record here.
         sanitized = ProviderError.sanitize(reason)
-        record_provider_error(reason)
 
         if Llm.permanent_provider_error?(reason) do
           Logger.debug(
@@ -104,17 +107,6 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
           {:error, sanitized}
         end
     end
-  end
-
-  # US-34.3 (AC-34.3.3): a genuine provider failure — never the circuit breaker's
-  # own `:circuit_open` skip (a DERIVED consequence of prior failures already
-  # counted when they happened, not a fresh one; counting it too would inflate the
-  # rate every retry while the breaker stays open on a single underlying incident).
-  defp record_provider_error(:circuit_open), do: :ok
-
-  defp record_provider_error(reason) do
-    class = if Llm.permanent_provider_error?(reason), do: :permanent, else: :transient
-    Llm.record_provider_error("embedding", class)
   end
 
   defp store(tenant_id, memory_id, embedding, content_hash) do

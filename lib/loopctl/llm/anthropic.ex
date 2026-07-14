@@ -121,7 +121,17 @@ defmodule Loopctl.Llm.Anthropic do
         # endpoint echoing a masked key fragment in an error-shaped body (review
         # CRIT #1). Sanitize it exactly like a non-200 — never return the raw body.
         reason = {:api_error, 200, body}
-        record_provider_error(reason)
+        # Review fix (LOW): deliberately do NOT `record_provider_error/1` here. A 200
+        # is, semantically, a provider SUCCESS — `permanent_provider_error?/1` has no
+        # 4xx/5xx clause for it, so it would fall through and window into
+        # `provider_error_rate` (AC-34.3.3's genuine-OUTAGE storm signal) as
+        # `:transient`. A legitimate-but-unexpected response shape (a non-text first
+        # content block, or empty content on a refusal/max_tokens stop) is not a
+        # 429/5xx/transport incident, so counting it would over-count the storm
+        # signal on a real provider-SUCCESS path. The `Logger.warning` above plus the
+        # sanitized `{:error, _}` return (still routed through the same
+        # possible-compromised-endpoint handling as review CRIT #1) already keep this
+        # anomaly observable/actionable without polluting the outage counter.
         {:error, ProviderError.sanitize(reason)}
 
       {:ok, %{status: status, body: body}} ->
