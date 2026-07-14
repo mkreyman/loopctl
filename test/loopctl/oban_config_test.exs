@@ -181,6 +181,37 @@ defmodule Loopctl.ObanConfigTest do
     end
 
     @tag :tmp_dir
+    test "TC-35.3.7: a STH_SWEEP_CRON padded with trailing whitespace/newline is trimmed to a value Oban accepts",
+         %{tmp_dir: tmp_dir} do
+      # Regression: validate_cron/2 validated `String.trim(value)` but previously
+      # returned the RAW `value`. Oban's Cron plugin re-parses whatever it's handed and
+      # REJECTS trailing whitespace/newlines, so a padded STH_SWEEP_CRON (common from
+      # $(cat file), piped secrets, YAML quoting, copy-paste) passed boot validation
+      # then crashed the Cron plugin fleet-wide with an unattributed "unrecognized cron
+      # expression" error. sth_sweep_cron/0 must return the TRIMMED value, and that
+      # value must be one Oban's own parser accepts.
+      result =
+        run_elixir_script(
+          tmp_dir,
+          """
+          returned = Loopctl.ObanConfig.sth_sweep_cron()
+
+          result = %{
+            returned: returned,
+            oban_accepts?: match?({:ok, _}, Oban.Cron.Expression.parse(returned))
+          }
+          """,
+          [{"STH_SWEEP_CRON", "*/5 * * * *\n"}]
+        )
+
+      assert result.returned == "*/5 * * * *"
+
+      assert result.oban_accepts?,
+             "the value handed to Oban's Cron plugin must parse cleanly — a trailing " <>
+               "newline would crash the plugin at boot"
+    end
+
+    @tag :tmp_dir
     test "TC-35.3.5: a malformed 5-field STH_SWEEP_CRON (out-of-range) aborts boot with ArgumentError",
          %{tmp_dir: tmp_dir} do
       # `config/runtime.exs` calls plugins/0 -> sth_sweep_cron/0 while loading config,

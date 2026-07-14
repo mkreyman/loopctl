@@ -414,8 +414,10 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeaderTest do
     @zero_prefix Base.url_encode64(:binary.copy(<<0>>, 16), padding: false)
 
     test "echoing the zero-STH placeholder PASSES when the tenant has no sealed STH" do
-      # A new tenant has a ~60s window (before ComputeSthWorker seals its first
-      # STH) where the bootstrap hands out `0:<zero_prefix>`. A subsequent request
+      # A new tenant has a bootstrap-grace window (before its first STH is sealed —
+      # via the US-35.2 event path on first append, or at worst one configurable
+      # all-tenants sweep interval, default `*/5 * * * *`, of the ComputeSthWorker)
+      # where the bootstrap hands out `0:<zero_prefix>`. A subsequent request
       # echoing exactly that must NOT 409 — there is nothing to diverge from, and
       # the 412-only client retry could never recover from a 409 here.
       {_raw, api_key} = fixture(:api_key, %{role: :agent})

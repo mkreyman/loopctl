@@ -130,9 +130,15 @@ defmodule Loopctl.ObanConfig do
   defp validate_cron(nil, default), do: default
 
   defp validate_cron(value, _default) when is_binary(value) do
-    case Expression.parse(String.trim(value)) do
+    trimmed = String.trim(value)
+
+    case Expression.parse(trimmed) do
       {:ok, _expression} ->
-        value
+        # Return the TRIMMED value — Oban's Cron plugin re-parses whatever we hand it,
+        # and it rejects trailing whitespace/newlines. Returning the raw `value` would
+        # pass validation here but crash the plugin at boot with an unattributed
+        # "unrecognized cron expression" error. Hand Oban exactly what we validated.
+        trimmed
 
       {:error, %{message: message}} ->
         raise ArgumentError,
