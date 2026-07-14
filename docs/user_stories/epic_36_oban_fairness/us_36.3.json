@@ -1,0 +1,51 @@
+{
+  "id": "US-36.3",
+  "title": "Batch-ingest backpressure: 429 when a tenant's in-flight ingestion backlog is too large",
+  "epic": { "id": "epic_36", "name": "Per-Tenant Oban Fairness & Queue Topology" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "Closes the loop on fan-out: the fair-share gate (US-36.2) keeps a bulk burst from monopolizing slots, but the batch endpoint still lets a single tenant pile up an unbounded backlog. Rejecting new batches with a 429 while a tenant is already deeply backed up turns silent unbounded growth into an explicit, retryable signal.",
+  "background": {
+    "reference": "GH #351. knowledge_ingestion_controller.ex create_batch/2 (:202-211) enqueues every item unconditionally via ContentIngestionWorker.new |> Oban.insert() (:395). Existing gates are BYO-LLM-key (:215), a 50-item size cap (:340-343), and per-item DNS/wall-clock validation — NONE consider the tenant's existing in-flight Oban backlog. The 429s already declared in the OpenApiSpex operations are the generic Hammer HTTP rate-limiter, NOT queue-backlog backpressure.",
+    "includes": "This reuses the tenant in-flight count helper from US-36.2. When tenant T already has >= a configured threshold of in-flight ingestion jobs (queue :ingestion after US-36.1), a new batch request is rejected with 429 + Retry-After instead of adding hundreds more jobs. Under the threshold, behavior is unchanged."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "return 429 (with Retry-After) from the batch-ingest endpoint when the calling tenant already has a large in-flight ingestion backlog",
+    "so_that": "a single tenant cannot pile an unbounded number of ingestion jobs onto the shared queue faster than the fleet drains them — backpressure is explicit and retryable, not silent queue growth"
+  },
+  "rationale": "The fair-share gate bounds concurrency but not accumulation; a client looping on the 50-item batch endpoint can still enqueue tens of thousands of jobs. A backlog-aware 429 at admission is the standard backpressure valve: it protects the shared queue and the DB, gives the client a clear, retryable signal, and leaves well-behaved (under-threshold) callers completely unaffected.",
+  "acceptance_criteria": [
+    { "id": "AC-36.3.1", "description": "create_batch/2 checks the calling tenant's in-flight ingestion backlog (via the US-36.2 helper, on the :ingestion queue) BEFORE enqueuing. If it is >= a configured threshold, the request is rejected with HTTP 429 and a Retry-After header; no jobs from that request are enqueued (all-or-nothing — no partial pile-up).", "status": "pending" },
+    { "id": "AC-36.3.2", "description": "Under the threshold, behavior is byte-for-byte unchanged: all items enqueue as today, same response shape/status. An existing-behavior test (a normal batch under the threshold) passes unchanged, so existing clients are not broken.", "status": "pending" },
+    { "id": "AC-36.3.3", "description": "The threshold is env-driven (Loopctl.ObanConfig, config-based DI; e.g. OBAN_INGEST_BACKLOG_MAX) with a sensible default, so ops can loosen/tighten during an incident with no deploy. The 429 body is a structured error (consistent with the app's error envelope) identifying it as backlog backpressure, distinct from the Hammer HTTP rate-limit 429.", "status": "pending" },
+    { "id": "AC-36.3.4", "description": "The check is tenant-scoped (only the caller's backlog counts, never other tenants') and cheap (single bounded count, per-query statement_timeout). The OpenApiSpex operation documents the backlog-429 case. A test asserts: tenant over threshold → 429 + Retry-After + zero jobs enqueued; tenant under threshold → normal enqueue.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-36.3.1", "name": "over-threshold batch is 429'd with Retry-After and enqueues nothing", "type": "integration",
+      "preconditions": ["tenant T seeded with >= threshold in-flight :ingestion jobs"],
+      "steps": ["POST a valid batch as T"],
+      "expected_results": ["429 + Retry-After header; structured backlog-backpressure error; no new ContentIngestionWorker jobs created"], "status": "pending" },
+    { "id": "TC-36.3.2", "name": "under-threshold batch unchanged", "type": "integration",
+      "preconditions": ["tenant T with little/no in-flight backlog"],
+      "steps": ["POST a valid batch as T"],
+      "expected_results": ["normal success response; all items enqueued exactly as before"], "status": "pending" },
+    { "id": "TC-36.3.3", "name": "threshold is env-tunable", "type": "unit",
+      "preconditions": [],
+      "steps": ["set OBAN_INGEST_BACKLOG_MAX and read the resolved threshold"],
+      "expected_results": ["reflects the env value; sensible default when unset"], "status": "pending" },
+    { "id": "TC-36.3.4", "name": "backlog check is tenant-scoped", "type": "integration",
+      "preconditions": ["tenant A over threshold; tenant B empty"],
+      "steps": ["B posts a batch"],
+      "expected_results": ["B succeeds (A's backlog does not affect B)"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl_web/controllers/knowledge_ingestion_controller.ex (create_batch + the OpenApiSpex operation), lib/loopctl/oban/fair_share.ex (reuse in-flight count), lib/loopctl/oban_config.ex (threshold), fallback/error rendering for the structured 429.",
+    "Return the 429 via the app's normal error path (FallbackController / error envelope) so it's consistent; set Retry-After (seconds) to a bounded value (e.g. tied to the snooze backoff / expected drain time).",
+    "All-or-nothing: do the backlog check before enqueuing ANY item so a rejected request leaves zero partial jobs.",
+    "Distinguish this 429 from the Hammer HTTP rate-limit 429 in the body (error code/type) so clients + dashboards can tell backlog-backpressure from request-rate limiting.",
+    "Env-driven threshold via ObanConfig; document default; no Application.put_env in tests. Do NOT set the secret to a placeholder (epic_35 lesson)."
+  ],
+  "dependencies": ["US-36.2"],
+  "estimated_tokens": 300000
+}

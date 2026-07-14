@@ -1,0 +1,54 @@
+{
+  "id": "US-36.2",
+  "title": "Per-tenant in-flight fair-share gate on the contended queues (Basic-engine snooze/defer)",
+  "epic": { "id": "epic_36", "name": "Per-Tenant Oban Fairness & Queue Topology" },
+  "priority": "critical",
+  "phase": "scalability",
+  "priority_note": "The core of #351: the per-tenant fairness mechanism that stock Oban Basic has zero of today. Without it, one tenant's 50-item bulk ingest (→ hundreds of embedding + linking jobs, all one tenant_id, inserted contiguously) sits at the head of the contended queues and starves every other tenant indefinitely.",
+  "background": {
+    "reference": "GH #351. Basic engine = plain FIFO per queue, no partitioning, no per-args limits (those are Oban Pro Smart-engine only — deferred to Epic 38 per Mark's decision). One tenant can hold all N slots of :embeddings (5) / :knowledge (5) / :ingestion (US-36.1). Grounding confirmed NO in-flight cap, token gate, or fairness anywhere (oban_config.ex:7 calls itself the substrate for this).",
+    "includes": "Basic-engine idiomatic fairness = cooperative yielding: a worker returns {:snooze, seconds} (reschedules WITHOUT consuming an attempt, never drops the job) when its tenant already occupies >= its fair share of that queue's running slots, freeing the slot for another tenant. Fair share K is derived from the queue width and a config cap (e.g. a tenant may hold at most ceil(width/2) or a fixed K of N slots). This is a TARGET, not a hard invariant (the count is racy) — that is acceptable for fairness."
+  },
+  "story": {
+    "as_a": "loopctl operator running many tenants on shared embedding/knowledge/ingestion queues",
+    "i_want_to": "have each contended-queue worker yield its slot (snooze) when its tenant is already over its fair share of that queue's concurrency, and softly defer at enqueue time when a tenant is far over budget",
+    "so_that": "one tenant's bulk burst cannot monopolize a shared queue — other tenants' jobs keep making progress during the burst — without ever dropping or losing a job"
+  },
+  "rationale": "On the Basic engine the robust, loss-free way to get per-tenant fairness is cooperative snoozing: when a job starts, it checks how many of its queue's slots its own tenant currently occupies; if that's at or above the per-tenant cap, it snoozes a bounded interval so a waiting tenant runs instead. Because snooze reschedules (no attempt consumed, no loss), fairness degrades gracefully to latency, never to correctness. A bounded enqueue-time check adds coarse backpressure for pathological bursts. Caps are env-driven so ops can retune live.",
+  "acceptance_criteria": [
+    { "id": "AC-36.2.1", "description": "A shared helper computes a tenant's current in-flight job count on a given queue (states available/scheduled/executing/retryable, args->>'tenant_id' = tenant), reused by the workers and by US-36.3's endpoint. The query is bounded, runs on a read path with a per-query SET LOCAL statement_timeout (pgbouncer-safe), and its cost is measured; if an index on oban_jobs is required it is created CONCURRENTLY (@disable_ddl_transaction) as a partial/expression index and justified.", "status": "pending" },
+    { "id": "AC-36.2.2", "description": "The contended-queue workers (ArticleEmbeddingWorker on :embeddings, ContentIngestionWorker on :ingestion, and the :knowledge relationship workers) yield via {:snooze, n} at the START of perform/1 when the caller's tenant already occupies at or above its fair share (config cap K, derived from queue width) of that queue's EXECUTING slots. Snooze reschedules without consuming an attempt — a test asserts the job is NOT failed/discarded and eventually runs.", "status": "pending" },
+    { "id": "AC-36.2.3", "description": "FAIRNESS OUTCOME (the invariant that matters): with tenant A flooding a contended queue (e.g. a 50-item batch fanned out), a tenant B job enqueued afterward still executes within a bounded time rather than waiting for all of A's jobs. The test asserts the OUTCOME CLASS (B makes progress while A is still draining) — NOT an exact slot count at an instant — to avoid parallel-suite races (per the Mox/async-supervisor flake lesson).", "status": "pending" },
+    { "id": "AC-36.2.4", "description": "Per-tenant caps and the snooze backoff are env-driven (extend Loopctl.ObanConfig, config-based DI; e.g. OBAN_TENANT_FAIRSHARE_* or per-queue caps) so an operator can loosen/tighten fairness during an incident with fly secrets set + restart, no deploy. Sensible defaults documented. No Application.put_env in tests.", "status": "pending" },
+    { "id": "AC-36.2.5", "description": "Loss-free + progress guarantees: snoozing never drops a job (no attempt consumed, no discard); a single-tenant workload (no contention) sees NO added latency (the gate is a no-op when the tenant is under its cap) — a test asserts an uncontended job runs immediately without snoozing. Snooze intervals are bounded/jittered so a snoozed job can't starve or thundering-herd on re-check.", "status": "pending" },
+    { "id": "AC-36.2.6", "description": "Tenant isolation: the in-flight count for tenant A never includes tenant B's jobs (args-scoped by tenant_id); the fair-share decision for A's job reads only A's count. Purely additive scheduling behavior; no change to what a job DOES once it runs.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-36.2.1", "name": "in-flight count helper is tenant-scoped and bounded", "type": "unit",
+      "preconditions": ["oban_jobs rows for tenant A and B on the same queue in various states"],
+      "steps": ["call the helper for tenant A on that queue"],
+      "expected_results": ["counts only A's non-terminal jobs; excludes B; excludes completed/discarded"], "status": "pending" },
+    { "id": "TC-36.2.2", "name": "worker snoozes when tenant over fair share, then runs", "type": "integration",
+      "preconditions": ["tenant A already at its cap of executing slots on the queue"],
+      "steps": ["run another A job"],
+      "expected_results": ["returns {:snooze, n}; job stays scheduled (not failed/discarded); runs on a later drain when A is under cap"], "status": "pending" },
+    { "id": "TC-36.2.3", "name": "flooding tenant does not starve another (outcome class)", "type": "integration",
+      "preconditions": ["tenant A floods a contended queue; tenant B enqueues one job after"],
+      "steps": ["drain the queue with realistic concurrency"],
+      "expected_results": ["B's job completes while A still has jobs pending — B is not stuck behind all of A"], "status": "pending" },
+    { "id": "TC-36.2.4", "name": "no snooze / no latency when uncontended", "type": "integration",
+      "preconditions": ["only tenant A, well under its cap"],
+      "steps": ["run an A job"],
+      "expected_results": ["executes immediately, no snooze"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: new lib/loopctl/oban/fair_share.ex (in-flight count + over-cap? decision), the contended-queue workers (article_embedding_worker.ex, content_ingestion_worker.ex, article_linking_worker.ex + the other :knowledge workers), lib/loopctl/oban_config.ex (caps), possibly a migration for an oban_jobs expression index.",
+    "Prefer the {:snooze, n} worker-level yield as the primary mechanism (loss-free, self-correcting) over a hard pre-enqueue reject; keep the enqueue-time check coarse (US-36.3 uses it for the sync endpoint's 429).",
+    "Count query: SELECT count(*) FROM oban_jobs WHERE queue = $1 AND state = ANY('{available,scheduled,executing,retryable}') AND args->>'tenant_id' = $2. Measure cost; add CREATE INDEX CONCURRENTLY ... ON oban_jobs ((args->>'tenant_id'), queue, state) only if needed. Migration online (@disable_ddl_transaction).",
+    "Assert OUTCOME CLASS, never exact instantaneous slot counts — the suite runs async and Oban draining is nondeterministic (see [[feedback-mox-async-supervisor-flake]]).",
+    "Config-based DI for caps/backoff; document defaults; env vars via ObanConfig so ops can tune live (do NOT set a secret to a doc placeholder — epic_35 STH_SWEEP_CRON lesson).",
+    "SECURITY/RESILIENCE note: fairness is a target not a guarantee; a byzantine tenant can still get service, just not monopolize. Reviewer should confirm the gate can't itself wedge a queue (all jobs snoozing forever) — the cap must always allow at least 1 slot per tenant to make progress."
+  ],
+  "dependencies": ["US-36.1"],
+  "estimated_tokens": 450000
+}

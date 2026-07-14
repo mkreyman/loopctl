@@ -1,0 +1,52 @@
+{
+  "id": "US-36.1",
+  "title": "Queue topology: dedicated :ingestion queue for long LLM jobs + register the dead :verification queue",
+  "epic": { "id": "epic_36", "name": "Per-Tenant Oban Fairness & Queue Topology" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "Foundational queue-topology change that directly kills head-of-line blocking (6-min LLM ingestion no longer shares slots with sub-second linking/lint/MOC jobs) and is the substrate the fairness gate (US-36.2) and backpressure (US-36.3) build on. Also fixes a latent bug where :verification jobs never run.",
+  "background": {
+    "reference": "GH #351. ContentIngestionWorker (lib/loopctl/workers/content_ingestion_worker.ex:36) declares queue: :knowledge (width 5) and can run ~6 minutes; it shares that 5-slot queue with sub-second ArticleLinkingWorker (article_linking_worker.ex:58), KnowledgeLintWorker, KnowledgeMocWorker, RetrievalMetricsWorker, KnowledgeReclassifyWorker, ReviewKnowledgeWorker (all queue: :knowledge). A handful of concurrent ingests starve the fast jobs. Queue widths already live in Loopctl.ObanConfig.@default_queues (oban_config.ex:52-62), env-driven via OBAN_QUEUE_* (US-32.2).",
+    "includes": "Grounding also surfaced a latent bug: VerificationRunnerWorker (verification_runner_worker.ex:10) declares queue: :verification, but :verification is NOT in @default_queues / the running queues list, so those jobs are enqueued but NEVER executed (no queue consumer). This story registers that queue (or, if verification is intentionally disabled, removes the stray declaration — implementer confirms which)."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "run long-running LLM ingestion jobs on their own :ingestion queue, separate from the short :knowledge relationship jobs, and ensure every queue a worker targets actually has a consumer",
+    "so_that": "a burst of multi-minute ingestion jobs can no longer occupy all the slots that fast linking/lint/MOC/metrics jobs need (head-of-line blocking is gone), and no worker silently enqueues onto a queue that never runs"
+  },
+  "rationale": "Sizing long and short work into separate queues is the cheapest, highest-leverage fairness fix and needs no engine change: ContentIngestionWorker moves to :ingestion (sized independently against the pool budget), while linking/lint/MOC/metrics keep :knowledge. Registering (or removing) the :verification queue closes a correctness gap found during grounding. All widths stay env-tunable via ObanConfig so ops can retune during an incident with no deploy.",
+  "acceptance_criteria": [
+    { "id": "AC-36.1.1", "description": "A new :ingestion queue is added to Loopctl.ObanConfig.@default_queues with an env-driven width (OBAN_QUEUE_INGESTION), sized so the TOTAL pool budget is not exceeded (rebalance from :knowledge rather than blindly adding capacity; document the new sum and keep the config.exs mirror in sync — the existing oban_config_test sum/sync assertion must still pass).", "status": "pending" },
+    { "id": "AC-36.1.2", "description": "ContentIngestionWorker moves from queue: :knowledge to queue: :ingestion. No change to its job logic, args, uniqueness, or retry config — only the queue. A test asserts a ContentIngestionWorker job is enqueued on :ingestion and that :knowledge no longer receives ingestion jobs.", "status": "pending" },
+    { "id": "AC-36.1.3", "description": "The short :knowledge jobs (ArticleLinkingWorker, KnowledgeLintWorker, KnowledgeMocWorker, RetrievalMetricsWorker, KnowledgeReclassifyWorker, ReviewKnowledgeWorker) remain on :knowledge. A test demonstrates the head-of-line fix: with the :ingestion queue saturated by long jobs, a :knowledge linking job still executes (no longer blocked behind ingestion).", "status": "pending" },
+    { "id": "AC-36.1.4", "description": "The dead :verification queue is resolved: either add :verification to @default_queues (env-driven width) so VerificationRunnerWorker jobs actually run, OR remove the stray queue declaration if verification is intentionally inert. The implementer states which and why; a test asserts a VerificationRunnerWorker job either runs on a registered queue OR the worker no longer targets a phantom queue.", "status": "pending" },
+    { "id": "AC-36.1.5", "description": "Purely a topology/config change — widths remain env-driven via ObanConfig; no per-job semantics change. runtime.exs continues to source queues from ObanConfig.queues(). A cardinality/consistency test confirms the config.exs compile-time mirror and the ObanConfig defaults still match (TC-32.2.1 style).", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-36.1.1", "name": "ingestion queue registered + env-tunable", "type": "unit",
+      "preconditions": [],
+      "steps": ["read ObanConfig.queues()", "set OBAN_QUEUE_INGESTION and re-read"],
+      "expected_results": [":ingestion present with default width; env var overrides it; total sum documented and config.exs mirror matches"], "status": "pending" },
+    { "id": "TC-36.1.2", "name": "ingestion worker enqueues on :ingestion", "type": "integration",
+      "preconditions": ["a tenant + ingestible content"],
+      "steps": ["enqueue ContentIngestionWorker"],
+      "expected_results": ["job.queue == \"ingestion\"; no ingestion job lands on :knowledge"], "status": "pending" },
+    { "id": "TC-36.1.3", "name": "head-of-line blocking removed", "type": "integration",
+      "preconditions": [":ingestion saturated with long-running jobs"],
+      "steps": ["enqueue an ArticleLinkingWorker on :knowledge", "drain :knowledge"],
+      "expected_results": ["the linking job runs without waiting on ingestion completion"], "status": "pending" },
+    { "id": "TC-36.1.4", "name": "verification queue no longer dead", "type": "unit",
+      "preconditions": [],
+      "steps": ["inspect the queues list vs VerificationRunnerWorker.queue"],
+      "expected_results": ["either :verification is a registered queue OR the worker declares a registered queue; no worker targets an unregistered queue"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/oban_config.ex (@default_queues + queues/0), config/config.exs (compile-time mirror), lib/loopctl/workers/content_ingestion_worker.ex (queue), lib/loopctl/workers/verification_runner_worker.ex (queue).",
+    "Pool budget: current sum = 38 across 9 queues. Rebalance — e.g. take :ingestion width from :knowledge's 5 (split into :knowledge + :ingestion) rather than adding a 10th queue at full width; measure against the DB connection budget (see Epic 33 pool work). Document the new sum.",
+    "Confirm the :verification path: grep for VerificationRunnerWorker enqueues to see if verification is a live feature; if inert, removing the queue: :verification (or the worker) is cleaner than registering a queue nothing needs.",
+    "Env-driven via ObanConfig (config-based DI); no Application.put_env in tests. runtime.exs already sets queues: ObanConfig.queues().",
+    "No migration needed for this story."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 300000
+}
