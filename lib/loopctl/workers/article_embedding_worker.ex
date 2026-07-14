@@ -110,6 +110,13 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
       {:error, :no_api_key} ->
         skip_no_embedding_key(tenant_id, article_id)
 
+      {:error, :rate_limited_local} ->
+        # US-37.1 (AC-37.1.4): a node-local provider admission rate-limit is
+        # loss-free backpressure, NOT a failure. Snooze the slot (no attempt
+        # consumed, never a discard) — mirrors the FairShare.gate snooze pattern —
+        # so the embed is retried once local demand subsides.
+        {:snooze, admission_snooze_seconds()}
+
       {:error, reason} ->
         # Classify on the raw reason, but the term that becomes an Oban discard/error
         # reason (-> oban_jobs.errors) is SANITIZED (review #5/#6) — never a raw body.
@@ -174,6 +181,14 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
     )
 
     {:discard, {:no_embedding_key, article_id}}
+  end
+
+  # US-37.1: small jittered snooze for a node-local provider admission rate-limit.
+  # Jitter avoids a thundering-herd of snoozed embeds re-checking in lockstep. The
+  # base is live-tunable via SystemConfig (no deploy), default 5s.
+  defp admission_snooze_seconds do
+    base = Loopctl.SystemConfig.get_int("provider_admission_snooze_seconds", 5)
+    base + :rand.uniform(6) - 1
   end
 
   defp enqueue_linking(article_id, tenant_id) do

@@ -101,6 +101,36 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       assert {:error, {:api_error, 500, :provider_error}} = result
       refute inspect(result) =~ "LEAK"
     end
+
+    test "US-37.1 (AC-37.1.4): a node-local rate-limit snoozes (never discards)" do
+      %{tenant: tenant} = setup_tenant()
+
+      {:ok, article} =
+        Knowledge.create_article(tenant.id, %{
+          title: "Rate Limited Article",
+          body: "Will be node-local rate-limited.",
+          category: :pattern,
+          status: :draft
+        })
+
+      article =
+        %{article | status: :published}
+        |> Ecto.Changeset.change(%{status: :published})
+        |> Loopctl.AdminRepo.update!()
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :rate_limited_local}
+      end)
+
+      result =
+        ArticleEmbeddingWorker.perform(%Oban.Job{
+          args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+        })
+
+      # Loss-free backpressure: snooze (no attempt consumed), NEVER a discard.
+      assert {:snooze, seconds} = result
+      assert is_integer(seconds) and seconds > 0
+    end
   end
 
   # --- TC-20.3.3: Worker handles deleted article (returns :ok) ---

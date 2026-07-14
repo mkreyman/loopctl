@@ -219,4 +219,54 @@ defmodule Loopctl.Llm.AnthropicTest do
       refute_received :unexpected_provider_error
     end
   end
+
+  describe "US-37.1: per-(tenant, provider) admission gate (#352)" do
+    test "empty bucket → {:error, :rate_limited_local}, NO provider call, NO record_provider_error" do
+      tenant = tenant_with_key()
+      test_pid = self()
+
+      # Empty node-local bucket for the anthropic provider.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit -> {:deny, 0} end)
+
+      # A provider_error emission or an HTTP call would signal the short-circuit ran
+      # too late (after building/sending the request or after the error branches).
+      handler_id = {:anthropic_admission_test, System.unique_integer([:positive])}
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :llm, :provider_error],
+        fn _event, _measurements, _metadata, _config ->
+          send(test_pid, :unexpected_provider_error)
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        send(test_pid, :unexpected_http_call)
+        Req.Test.json(conn, %{"content" => [%{"type" => "text", "text" => "ok"}]})
+      end)
+
+      assert {:error, :rate_limited_local} = run(tenant)
+      refute_received :unexpected_http_call
+      refute_received :unexpected_provider_error
+    end
+
+    test "token available → the request is issued and the success path is unchanged" do
+      tenant = tenant_with_key()
+
+      # Default permissive stub already allows, but assert explicitly for clarity.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit -> {:allow, 1} end)
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        Req.Test.json(conn, %{
+          "content" => [%{"type" => "text", "text" => "ok"}],
+          "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+        })
+      end)
+
+      assert {:ok, "ok"} = run(tenant)
+    end
+  end
 end

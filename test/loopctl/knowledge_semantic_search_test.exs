@@ -519,6 +519,51 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       refute inspect(metadata) =~ "Incorrect API key"
     end
 
+    test "US-37.1: :rate_limited_local -> \"embedding_rate_limited_local\", keyword fallback, no 500" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      keyword_article(tenant.id)
+      attach_fallback_handler(tenant.id)
+
+      # An empty node-local admission bucket surfaces as {:error, :rate_limited_local}
+      # from the embedding client — the SAME keyword-fallback path as :circuit_open.
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :rate_limited_local}
+      end)
+
+      assert {:ok, %{meta: meta}} = Knowledge.search_combined(tenant.id, "testing")
+      assert meta.fallback == true
+      assert meta.search_mode == "keyword_only"
+      assert meta.fallback_reason == "embedding_rate_limited_local"
+
+      assert_receive {:semantic_fallback, _m, %{reason: "embedding_rate_limited_local"}}
+    end
+
+    test "US-37.1 (AC-37.1.3): repeated :rate_limited_local does NOT trip the circuit breaker" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      keyword_article(tenant.id)
+
+      # Far more than the breaker threshold (3): every call returns a node-local
+      # admission rate-limit.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :rate_limited_local}
+      end)
+
+      for _ <- 1..10, do: Knowledge.search_combined(tenant.id, "testing")
+
+      attach_fallback_handler(tenant.id)
+
+      # If the breaker had tripped, generate_embedding would short-circuit to
+      # :circuit_open WITHOUT calling the client, tagging "embedding_circuit_open".
+      # Because :rate_limited_local is breaker-exempt, the client is still consulted
+      # and the tag stays "embedding_rate_limited_local".
+      assert {:ok, %{meta: meta}} = Knowledge.search_combined(tenant.id, "testing")
+      assert meta.fallback_reason == "embedding_rate_limited_local"
+
+      assert_receive {:semantic_fallback, _m, %{reason: "embedding_rate_limited_local"}}
+    end
+
     test "a genuinely OPEN circuit breaker surfaces \"embedding_circuit_open\"" do
       %{tenant: tenant} = setup_tenant()
       Knowledge.reset_circuit_breaker(tenant.id)
