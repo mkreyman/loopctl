@@ -63,6 +63,25 @@ config :loopctl, Oban,
 # introspectable; the gate itself re-reads env at call time (config-based DI).
 config :loopctl, :fair_share_config, Loopctl.ObanConfig.fair_share_config()
 
+# US-36.3: validate the batch-ingest backlog knob (OBAN_INGEST_BACKLOG_MAX) at BOOT,
+# alongside the fair-share knobs above and the queue widths. `ingest_backlog_max/0`
+# calls `queue_size/2`, which RAISES on a present-but-malformed value — so a
+# fat-fingered live-tuning typo aborts the node LOUD here (like a bad OBAN_QUEUE_* or
+# OBAN_TENANT_FAIRSHARE_*), instead of surfacing only at CALL time as a stream of
+# per-request 500s on the batch-ingest endpoint at the worst possible moment. Stored so
+# the resolved boot value is introspectable; the gate re-reads env at call time
+# (config-based DI).
+config :loopctl, :ingest_backlog_max, Loopctl.ObanConfig.ingest_backlog_max()
+
+# US-36.3 (review): validate the backlog-429 Retry-After knob
+# (OBAN_INGEST_BACKLOG_RETRY_AFTER) at BOOT too, same rationale as the threshold above —
+# a fat-fingered value aborts the node LOUD here instead of surfacing as per-request 500s
+# on the ingest endpoints. Stored so the resolved boot value is introspectable; the gate
+# re-reads env at call time (config-based DI).
+config :loopctl,
+       :ingest_backlog_retry_after_seconds,
+       Loopctl.ObanConfig.ingest_backlog_retry_after_seconds()
+
 # Cloak Vault — key from environment in all environments where CLOAK_KEY is set.
 # In production, CLOAK_KEY is required — startup fails if it is missing.
 if config_env() == :prod do

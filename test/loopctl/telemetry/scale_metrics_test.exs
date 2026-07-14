@@ -63,7 +63,8 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.memory_promotion.budget_exceeded.count",
     "loopctl.oban.jobs.count",
     "loopctl.oban.jobs.executing_orphan.count",
-    "loopctl.oban.poll.error.count"
+    "loopctl.oban.poll.error.count",
+    "loopctl.ingestion.backlog_gate.failed_open.count"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this

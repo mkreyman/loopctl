@@ -15,6 +15,9 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   alias Loopctl.HeavyRead
   alias Loopctl.Llm
   alias Loopctl.Net.UrlGuard
+  alias Loopctl.Oban.FairShare
+  alias Loopctl.ObanConfig
+  alias Loopctl.TelemetryEvents
   alias Loopctl.Workers.ContentIngestionWorker
 
   # Mandatory BYO (Epic 28, #179): extraction runs on the tenant's OWN Anthropic
@@ -111,7 +114,17 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
          }},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 =>
+        {"Too Many Requests — one of two DISTINCT 429s this route can return: (1) " <>
+           "US-36.3 ingestion-backlog backpressure (`error.code: " <>
+           "\"ingestion_backlog_exceeded\"`, sets `Retry-After`) — the single-item path " <>
+           "is gated on the SAME per-tenant backlog threshold as /ingest/batch so it " <>
+           "cannot be looped to bypass the valve — or (2) the generic shared Hammer " <>
+           "request-rate limiter (NO `error.code`). Branch on the presence of `error.code`.",
+         "application/json",
+         %OpenApiSpex.Schema{
+           oneOf: [Schemas.IngestionBacklogError, Schemas.RateLimitError]
+         }}
     }
   )
 
@@ -119,7 +132,14 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   def create(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    with :ok <- require_llm_key(tenant_id) do
+    # Gate the SINGLE-item path on the same backlog valve as the batch path (US-36.3):
+    # otherwise a tenant that 429s on /ingest/batch could keep piling :ingestion jobs
+    # one-at-a-time by looping this endpoint, defeating the backpressure valve. Both
+    # routes now consult the same threshold, so accumulation is bounded regardless of
+    # which endpoint the flood comes through. Checked AFTER require_llm_key so a keyless
+    # tenant still gets the clearer 422 first.
+    with :ok <- require_llm_key(tenant_id),
+         :ok <- check_ingestion_backlog(tenant_id) do
       handle_create(conn, tenant_id, params)
     end
   end
@@ -162,7 +182,13 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     description:
       "Submit multiple URLs or raw content items for knowledge extraction in a single " <>
         "request. Each item is validated and enqueued independently. " <>
-        "Max 50 items per batch. Role: orchestrator+.",
+        "Max 50 items per batch. Role: orchestrator+.\n\n" <>
+        "**Backpressure (429):** before enqueuing anything, the endpoint checks the " <>
+        "calling tenant's in-flight `:ingestion` backlog. If it is at/over the " <>
+        "`OBAN_INGEST_BACKLOG_MAX` threshold, the WHOLE request is rejected " <>
+        "all-or-nothing with 429 + `Retry-After` and `error.code: " <>
+        "\"ingestion_backlog_exceeded\"` — zero jobs are enqueued. This is distinct " <>
+        "from the generic Hammer request-rate 429 (which has no `error.code`).",
     request_body:
       {"Batch ingestion request", "application/json",
        %OpenApiSpex.Schema{
@@ -194,7 +220,16 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
          }},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 =>
+        {"Too Many Requests — one of two DISTINCT 429s this route can return: (1) " <>
+           "US-36.3 ingestion-backlog backpressure (`error.code: " <>
+           "\"ingestion_backlog_exceeded\"`, sets `Retry-After`), or (2) the generic " <>
+           "shared Hammer request-rate limiter (NO `error.code`; `error.message: " <>
+           "\"Rate limit exceeded\"`). Branch on the presence of `error.code`.",
+         "application/json",
+         %OpenApiSpex.Schema{
+           oneOf: [Schemas.IngestionBacklogError, Schemas.RateLimitError]
+         }}
     }
   )
 
@@ -203,11 +238,96 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     items = params["items"]
 
+    # The backlog gate runs AFTER validate_batch_items/1 (so a malformed request still
+    # 422s first) but BEFORE process_batch_items/3 (so when the tenant is over its
+    # in-flight :ingestion backlog threshold, ZERO jobs from this request are enqueued —
+    # all-or-nothing, no partial pile-up). US-36.3.
     with :ok <- require_llm_key(tenant_id),
-         :ok <- validate_batch_items(items) do
+         :ok <- validate_batch_items(items),
+         :ok <- check_ingestion_backlog(tenant_id) do
       results = process_batch_items(tenant_id, items)
       json(conn, LoopctlWeb.KnowledgeIngestionJSON.batch(results))
     end
+  end
+
+  # US-36.3 admission gate: reject with 429 when the calling tenant's in-flight
+  # :ingestion backlog is at/over the env-driven threshold, BEFORE enqueuing anything.
+  # Consults the WORKER-scoped, index-backed count (`in_flight_ingestion_backlog/1` —
+  # tenant-scoped by args->>'tenant_id', backed by the partial index
+  # oban_jobs_ingestion_tenant_idx, bounded by a per-query statement_timeout via
+  # AdminRepo) — cheap and scoped to the CALLER's own backlog ONLY, so one tenant's
+  # backlog never affects another's admission NOR the query cost. Used by BOTH the batch
+  # (create_batch/2) and single-item (create/2) ingest paths. The error tuple is rendered
+  # by LoopctlWeb.FallbackController (structured 429 + Retry-After, code
+  # "ingestion_backlog_exceeded" — distinct from the Hammer request-rate 429).
+  #
+  # SOFT ADMISSION HINT, not a hard cap. This is a plain read-then-enqueue with no lock
+  # or atomic reservation, so it bounds ACCUMULATION probabilistically, not exactly: N
+  # concurrent same-tenant requests can each observe count < max and each pass (a benign
+  # TOCTOU), overshooting the threshold by up to the in-flight request concurrency. That
+  # is by design — this is a backpressure VALVE to stop runaway monopolization, not a
+  # guaranteed ceiling. Operators tuning OBAN_INGEST_BACKLOG_MAX should read it as a
+  # "start shedding around here" floor, not an enforced maximum.
+  defp check_ingestion_backlog(tenant_id) do
+    max = ObanConfig.ingest_backlog_max()
+
+    if in_flight_ingestion_backlog(tenant_id) >= max do
+      {:error, :ingestion_backlog_exceeded, backlog_retry_after_seconds()}
+    else
+      :ok
+    end
+  end
+
+  # FAIL OPEN on an UNMEASURABLE count only: an unreachable/timed-out backlog count must
+  # never block work (an innocent, under-threshold tenant must never eat a generic 500
+  # because the count path is momentarily degraded). The count runs under a 2s
+  # `SET LOCAL statement_timeout`; a raised statement_timeout surfaces as `Postgrex.Error`
+  # (57014 query_canceled) and a pool-checkout timeout as `DBConnection.ConnectionError`,
+  # so we rescue ONLY those two classes — NOT a bare `rescue e ->`. A programming error
+  # in the count path (e.g. a bad query change) must therefore propagate and 500, LOUD,
+  # rather than be silently swallowed into a fleet-wide disabling of backpressure that
+  # looks healthy. On the fail-open path we ALSO emit a telemetry counter
+  # (`[:loopctl, :ingestion, :backlog_gate, :failed_open]`) so "the backpressure valve is
+  # currently admitting because it can't measure" is an alertable signal, not just a
+  # warning-log line, and a sustained per-request timeout under a real flood is visible on
+  # a dashboard instead of only as log spam. The count is resolved through a
+  # config-swappable DI seam (`Loopctl.Oban.FairShare` in prod, a Mox mock in test) so
+  # this fail-open path is deterministically covered.
+  defp in_flight_ingestion_backlog(tenant_id) do
+    backlog_counter().in_flight_ingestion_backlog(tenant_id)
+  rescue
+    e in [DBConnection.ConnectionError, Postgrex.Error] ->
+      Logger.warning(
+        "ingestion backlog gate failed open for tenant=#{tenant_id}: " <>
+          Exception.message(e)
+      )
+
+      :telemetry.execute(
+        TelemetryEvents.ingestion_backlog_gate_failed_open(),
+        %{count: 1},
+        %{tenant_id: tenant_id, error_class: fail_open_class(e)}
+      )
+
+      0
+  end
+
+  defp fail_open_class(%DBConnection.ConnectionError{}), do: "connection"
+  defp fail_open_class(%Postgrex.Error{}), do: "timeout"
+
+  defp backlog_counter do
+    Application.get_env(:loopctl, :ingestion_backlog_counter, FairShare)
+  end
+
+  # Retry-After hint (seconds) for a backlog-429. Tied to the :ingestion queue's DRAIN
+  # cadence — NOT the sub-second fair-share snooze base. ContentIngestionWorker jobs are
+  # ~6-min LLM calls on a width-2 queue, so a backlog drains on the order of minutes-to-
+  # hours; advising a compliant client to retry in ~5s would just hot-loop it into a
+  # steady stream of 429s (each re-running the admission count). A drain-cadence-scaled
+  # value (env OBAN_INGEST_BACKLOG_RETRY_AFTER, default 60s, boot-validated) is an honest
+  # "back off for a while" hint that keeps a Retry-After-honoring client off the endpoint
+  # between real drains. Deploy-free-tunable like the threshold itself.
+  defp backlog_retry_after_seconds do
+    ObanConfig.ingest_backlog_retry_after_seconds()
   end
 
   # Mandatory BYO gate shared by single + batch ingest. On a miss, record the block

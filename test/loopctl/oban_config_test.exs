@@ -287,6 +287,84 @@ defmodule Loopctl.ObanConfigTest do
     end
   end
 
+  describe "ingest_backlog_max/0 (US-36.3, env-tunable via OBAN_INGEST_BACKLOG_MAX)" do
+    test "TC-36.3.3: defaults to 500 when OBAN_INGEST_BACKLOG_MAX is unset" do
+      # OBAN_INGEST_BACKLOG_MAX is not set in the test environment, so the default applies.
+      assert ObanConfig.ingest_backlog_max() == 500
+    end
+
+    @tag :tmp_dir
+    test "TC-36.3.3: a valid OBAN_INGEST_BACKLOG_MAX override is read at runtime (subprocess-scoped env)",
+         %{tmp_dir: tmp_dir} do
+      result =
+        run_elixir_script(
+          tmp_dir,
+          "result = Loopctl.ObanConfig.ingest_backlog_max()",
+          [{"OBAN_INGEST_BACKLOG_MAX", "3"}]
+        )
+
+      assert result == 3
+    end
+
+    @tag :tmp_dir
+    test "TC-36.3.3: a malformed OBAN_INGEST_BACKLOG_MAX aborts boot (fail-loud, like OBAN_QUEUE_*)",
+         %{tmp_dir: tmp_dir} do
+      # config/runtime.exs evaluates `ObanConfig.ingest_backlog_max()` at the top level
+      # (via `config :loopctl, :ingest_backlog_max, ...`), so a fat-fingered live-tuning
+      # value fails LOUD at boot (non-zero exit) instead of surviving to the batch
+      # endpoint's call time, where an unhandled raise would surface as per-request 500s.
+      # This drives the REAL env-read path (System.get_env -> ingest_backlog_max/0 ->
+      # queue_size/2), not just the shared queue_size/2 delegate.
+      {output, exit_code} = run_boot(tmp_dir, [{"OBAN_INGEST_BACKLOG_MAX", "abc"}])
+
+      assert exit_code != 0
+      assert output =~ "positive integer"
+    end
+
+    test "TC-36.3.3: ingest_backlog_max/0 delegates to queue_size/2, which fails LOUD on a malformed value" do
+      # Direct unit-level assertion on the shared parser the env-read path uses.
+      assert_raise ArgumentError, ~r/positive integer/, fn -> ObanConfig.queue_size("0", 500) end
+      assert_raise ArgumentError, ~r/positive integer/, fn -> ObanConfig.queue_size("-1", 500) end
+
+      assert_raise ArgumentError, ~r/positive integer/, fn ->
+        ObanConfig.queue_size("abc", 500)
+      end
+    end
+  end
+
+  describe "ingest_backlog_retry_after_seconds/0 (US-36.3 review, env OBAN_INGEST_BACKLOG_RETRY_AFTER)" do
+    test "defaults to 60 (drain-cadence-scaled, not the sub-second snooze base) when unset" do
+      assert ObanConfig.ingest_backlog_retry_after_seconds() == 60
+      # Decoupled from the fair-share snooze base — a compliant client must not hot-loop.
+      assert ObanConfig.ingest_backlog_retry_after_seconds() >
+               ObanConfig.fair_share_snooze_base_seconds()
+    end
+
+    @tag :tmp_dir
+    test "a valid OBAN_INGEST_BACKLOG_RETRY_AFTER override is read at runtime", %{
+      tmp_dir: tmp_dir
+    } do
+      result =
+        run_elixir_script(
+          tmp_dir,
+          "result = Loopctl.ObanConfig.ingest_backlog_retry_after_seconds()",
+          [{"OBAN_INGEST_BACKLOG_RETRY_AFTER", "180"}]
+        )
+
+      assert result == 180
+    end
+
+    @tag :tmp_dir
+    test "a malformed OBAN_INGEST_BACKLOG_RETRY_AFTER aborts boot (fail-loud)", %{
+      tmp_dir: tmp_dir
+    } do
+      {output, exit_code} = run_boot(tmp_dir, [{"OBAN_INGEST_BACKLOG_RETRY_AFTER", "abc"}])
+
+      assert exit_code != 0
+      assert output =~ "positive integer"
+    end
+  end
+
   # Runs `script` (must bind a `result` variable) in a fresh `mix run --no-start`
   # subprocess with `env` applied ONLY to that child process, then reads back the
   # term `script` wrote to `result_path` via :erlang.term_to_binary/1. Keeps this
