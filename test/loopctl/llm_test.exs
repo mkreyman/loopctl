@@ -477,8 +477,12 @@ defmodule Loopctl.LlmTest do
 
       log = capture_log(fn -> assert :ok = Llm.record_blocked(tenant.id, :embedding) end)
 
-      assert log =~ "no embedding API key configured"
-      refute log =~ "no Anthropic API key configured"
+      # Scope to THIS tenant's log line(s): capture_log in the async suite can also capture a
+      # CONCURRENT test's record_blocked output for a different tenant (log bleed), which would
+      # false-fail a bare `refute` on the message text. record_blocked logs `tenant=<id> ... — <msg>`.
+      mine = log |> String.split("\n") |> Enum.filter(&(&1 =~ "tenant=#{tenant.id}"))
+      assert Enum.any?(mine, &(&1 =~ "no embedding API key configured"))
+      refute Enum.any?(mine, &(&1 =~ "no Anthropic API key configured"))
     end
 
     test "an Anthropic operation names the Anthropic key" do
@@ -486,8 +490,11 @@ defmodule Loopctl.LlmTest do
 
       log = capture_log(fn -> assert :ok = Llm.record_blocked(tenant.id, :extraction) end)
 
-      assert log =~ "no Anthropic API key configured"
-      refute log =~ "no embedding API key configured"
+      # Scope to THIS tenant's line(s) — see the sibling test: a concurrent test's log can bleed
+      # into capture_log in the async suite, false-failing a bare `refute` on the message text.
+      mine = log |> String.split("\n") |> Enum.filter(&(&1 =~ "tenant=#{tenant.id}"))
+      assert Enum.any?(mine, &(&1 =~ "no Anthropic API key configured"))
+      refute Enum.any?(mine, &(&1 =~ "no embedding API key configured"))
     end
   end
 end
