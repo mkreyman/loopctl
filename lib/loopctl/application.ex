@@ -29,6 +29,12 @@ defmodule Loopctl.Application do
       {Phoenix.PubSub, name: Loopctl.PubSub},
       {Task.Supervisor, name: Loopctl.TaskSupervisor},
       {Oban, Application.fetch_env!(:loopctl, Oban)},
+      # US-35.2: supervised, node-local singleton that subscribes to the fixed
+      # audit-chain firehose topic and debounce-enqueues one ComputeSthWorker job
+      # per tenant that appends, making STH computation event-driven and
+      # activity-gated. After PubSub (it subscribes in init) and Oban (it inserts
+      # jobs). Purely additive — the per-minute cron is unchanged.
+      Loopctl.AuditChain.SthEnqueuer,
       Loopctl.RateLimiter.Server,
       # US-27.16: owns the ETS table tracking in-flight streaming-export slots so a
       # crashed exporter's slot is reclaimed (concurrency cap, AC-27.16.6).

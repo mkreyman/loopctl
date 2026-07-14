@@ -383,6 +383,15 @@ config :loopctl, :oban_metrics_orphan_threshold_minutes, 45
 # 110-orphan stall this story addresses trips it immediately.
 config :loopctl, :oban_orphan_health_threshold, 10
 
+# US-35.2: debounce window (seconds) for the event-driven STH enqueuer
+# (`Loopctl.AuditChain.SthEnqueuer`). Read at runtime via Application.get_env/3.
+# Drives BOTH the enqueued ComputeSthWorker job's `schedule_in` AND its Oban
+# `unique` `period`, so a burst of appends for one tenant within this window
+# collapses to a single scheduled job (Basic-Engine-safe dedup). Short by design:
+# it only delays the activity-driven STH sign by a few seconds while coalescing
+# bursts; the per-minute cron poll remains the correctness backstop.
+config :loopctl, :sth_enqueuer_debounce_seconds, 5
+
 # Cloak Vault — key configured per environment
 # Generate a key: :crypto.strong_rand_bytes(32) |> Base.encode64()
 # The actual cipher is set in config/runtime.exs (prod) or config/test.exs (test).
