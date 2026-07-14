@@ -2,7 +2,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   @moduledoc """
   Oban worker that ingests external content and extracts knowledge articles.
 
-  Runs in the `:knowledge` queue with concurrency 5. When content is submitted
+  Runs in its own dedicated `:ingestion` queue (US-36.1). These are long (~6-min)
+  LLM jobs, so they get a separate queue/consumer from the sub-second `:knowledge`
+  workers — a burst of ingests can no longer head-of-line-block linking/lint/MOC/
+  metrics/reclassify/review (GH #351). (`:knowledge` also hosts the daily
+  `PromotionEvalWorker` LLM eval, but that is a once-daily cron, not part of the
+  sub-second hot lane this split protects.) When content is submitted
   via the ingestion API, this worker fetches the content (if a URL was provided),
   extracts knowledge articles via the content extractor, validates them, and
   inserts them as draft articles.
@@ -33,7 +38,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # idempotent (deterministic idempotency_key + on_conflict), so a resubmission of
   # already-captured content re-runs safely without creating duplicate rows.
   use Oban.Worker,
-    queue: :knowledge,
+    queue: :ingestion,
     max_attempts: 3,
     unique: [
       keys: [:content_hash, :tenant_id],

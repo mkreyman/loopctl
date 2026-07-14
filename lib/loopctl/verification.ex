@@ -111,10 +111,16 @@ defmodule Loopctl.Verification do
     update_run(run, %{status: "running", started_at: DateTime.utc_now()})
   end
 
-  @doc "Marks a run as completed with results."
+  @doc """
+  Marks a run as completed with results.
+
+  `"skipped"` (US-36.1) is a deliberate non-error terminal disposition for a run
+  retired without executing (e.g. a stale backlog job age-gated before any CI call);
+  it is distinct from `"error"`, which denotes a genuine failure.
+  """
   @spec complete_run(VerificationRun.t(), String.t(), map()) ::
           {:ok, VerificationRun.t()} | {:error, term()}
-  def complete_run(run, status, ac_results) when status in ["pass", "fail", "error"] do
+  def complete_run(run, status, ac_results) when status in ["pass", "fail", "error", "skipped"] do
     update_run(run, %{
       status: status,
       completed_at: DateTime.utc_now(),

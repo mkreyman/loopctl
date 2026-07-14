@@ -35,8 +35,43 @@ defmodule Loopctl.ObanConfig do
 
   # Default widths are a literal, hand-maintained mirror of config/config.exs's
   # compile-time `config :loopctl, Oban, queues: [...]` (AC-32.2.3). Sum = 38
-  # (10+5+2+3+2+5+5+3+3). Keep the two lists in sync when adding/removing/resizing
+  # (9+5+2+3+2+5+3+2+3+3+1). Keep the two lists in sync when adding/removing/resizing
   # a queue (`TC-32.2.1` in oban_config_test.exs asserts they match).
+  #
+  # US-36.1: the long (~6-min) LLM `ContentIngestionWorker` moved to its own
+  # `:ingestion` queue so a burst of ingests can no longer head-of-line-block the
+  # sub-second linking/lint/MOC/metrics/reclassify/review `:knowledge` workers
+  # (GH #351). `:verification` is registered (env-driven width) because it is a LIVE
+  # feature: `Loopctl.Verification.create_run_and_enqueue/3` enqueues
+  # `VerificationRunnerWorker` on `queue: :verification`; leaving it unregistered meant
+  # those jobs enqueued but never ran. Widths stay env-tunable via
+  # `OBAN_QUEUE_INGESTION` / `OBAN_QUEUE_VERIFICATION` (auto-derived from the atom name
+  # — no extra code).
+  #
+  # Funding the two new lanes (a REBALANCE, NOT new capacity — the pool sum stays 38):
+  # the `ingestion: 2` + `verification: 1` = 3 new-lane slots come from `:knowledge`
+  # 5 -> 3 (2 slots) PLUS `:default` 10 -> 9 (1 slot). `:default` is a generously-
+  # sized catch-all for periodic cleanup crons (Idempotency/BulkDeleteToken/Reauth/
+  # AuditPartition/CostRollup/Webhook/TokenArchival/PendingEnrollment/Revoke/
+  # SystemConfigRefresh/MemoryPromotionSweep — see `plugins/0`), none latency-
+  # sensitive, so it absorbs the 1-slot draw without harm.
+  #
+  # Why keep `:knowledge` at 3 (not the mechanical 2) — review, medium: SEVEN workers
+  # target `:knowledge` (ArticleLinking, KnowledgeLint, KnowledgeMoc, RetrievalMetrics,
+  # KnowledgeReclassify, ReviewKnowledge, PromotionEval). Several of the nominally
+  # "sub-second" workers ALSO have a heavy `all_tenants` cron variant that FANS OUT one
+  # per-tenant job each (KnowledgeLint 4:00, RetrievalMetrics 4:30, PromotionEval 4:45
+  # UTC daily; KnowledgeMoc weekly — see `plugins/0`'s crontab). Each per-tenant child
+  # is wall-clock-bounded (~10 min timeout), NOT sub-second. At width 2, a mere TWO
+  # overlapping per-tenant passes could occupy both slots and briefly delay the
+  # genuinely sub-second `ArticleLinkingWorker` (fires on every knowledge_create) — a
+  # milder re-run of the exact head-of-line blocking this story removes for ingestion.
+  # Restoring `:knowledge` to 3 (funded from over-provisioned `:default`, budget-
+  # neutral) means it now takes THREE concurrent heavy per-tenant passes to saturate
+  # the fast lane, and the cron schedules are staggered so a 3-way overlap is far less
+  # likely than a 2-way one. Still env-retunable UP via `OBAN_QUEUE_KNOWLEDGE` with no
+  # deploy if the fast lane ever proves tight; the AC-36.1.3 workers stay ON
+  # `:knowledge` (per-event invocations are short), so no worker moved off the lane.
   #
   # MUST NOT be `Application.compile_env(:loopctl, Oban)[:queues]`. That recorded a
   # compile-time consistency dependency on the WHOLE `[:loopctl, Oban]` app-env key,
@@ -50,15 +85,17 @@ defmodule Loopctl.ObanConfig do
   # (or reading via `Application.get_env/2` at call time) avoids recording that
   # dependency in the first place.
   @default_queues [
-    default: 10,
+    default: 9,
     webhooks: 5,
     cleanup: 2,
     analytics: 3,
     maintenance: 2,
     embeddings: 5,
-    knowledge: 5,
+    knowledge: 3,
+    ingestion: 2,
     memory: 3,
-    audit: 3
+    audit: 3,
+    verification: 1
   ]
 
   @doc """

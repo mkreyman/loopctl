@@ -16,15 +16,17 @@ defmodule Loopctl.ObanConfigTest do
   describe "queues/0" do
     test "TC-32.2.1: defaults preserved when OBAN_QUEUE_* env vars are unset (CI default)" do
       assert ObanConfig.queues() == [
-               default: 10,
+               default: 9,
                webhooks: 5,
                cleanup: 2,
                analytics: 3,
                maintenance: 2,
                embeddings: 5,
-               knowledge: 5,
+               knowledge: 3,
+               ingestion: 2,
                memory: 3,
-               audit: 3
+               audit: 3,
+               verification: 1
              ]
     end
 
@@ -47,7 +49,7 @@ defmodule Loopctl.ObanConfigTest do
         )
 
       assert result.webhooks == 99
-      assert result.default == 10
+      assert result.default == 9
       assert result.audit == 3
     end
   end

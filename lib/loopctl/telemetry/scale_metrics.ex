@@ -304,7 +304,7 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
     18. **Oban queue/state gauge** (US-34.1, AC-34.1.1) —
         `loopctl.oban.jobs.count`, a `last_value/2` GAUGE keyed by `[:state, :queue]`
         — BOTH bounded, fixed sets (`oban_active_states/0`'s 5 non-terminal states;
-        the 9 queues declared in `config :loopctl, Oban, queues: [...]`, resolved at
+        the 11 queues declared in `config :loopctl, Oban, queues: [...]`, resolved at
         call time via `Application.get_env/2`) — NEVER tenant/args-derived.
         `poll_oban_queue_state/0` runs
         `SELECT state, queue, count(*) FROM oban_jobs WHERE state = ANY($1) GROUP BY state, queue`
