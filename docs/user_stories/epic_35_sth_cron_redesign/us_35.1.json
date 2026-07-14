@@ -1,0 +1,59 @@
+{
+  "id": "US-35.1",
+  "title": "Incremental STH: checkpointed Merkle peaks, root byte-identical to the current construction",
+  "epic": { "id": "epic_35", "name": "STH & Cron Fleet-Cost Redesign" },
+  "priority": "critical",
+  "phase": "scalability",
+  "priority_note": "The self-inflicted critical of #350. Every STH recompute re-reads and re-hashes a tenant's ENTIRE audit chain; cost grows with chain length, so a long-lived active tenant pays O(chain) per append forever. This is the one change that removes the quadratic. Highest-risk story in the roadmap — a wrong root breaks STH verification and can trip the L6 byzantine halt.",
+  "background": {
+    "reference": "GH #350. AuditChain.compute_merkle_root/1 (lib/loopctl/audit_chain.ex:145-159) loads EVERY entry_hash for the tenant (ORDER BY chain_position) and rebuilds the whole tree via merkle_tree/2 (audit_chain.ex:273-285). sign_and_store_tree_head/1 (:167-204) calls it on each run. ComputeSthWorker per-tenant clause (lib/loopctl/workers/compute_sth_worker.ex:73-93) guards with AuditChain.sth_needed?/1 (audit_chain.ex:254-264) so IDLE tenants are a cheap 2-lookup no-op — but any tenant that appended even one entry pays a full O(chain) rebuild.",
+    "includes": "CRITICAL CONSTRAINT: merkle_tree/2 is Bitcoin-style — on an odd-length level it duplicates the LAST element (audit_chain.ex:276-277), then hashes pairs with SHA-256, recursing to a single root. This is NOT RFC-6962. A standard Merkle-Mountain-Range frontier yields a DIFFERENT root. Historical STHs (audit_signed_tree_heads) were signed over roots from THIS construction; the public verifier (Loopctl.AuditChain.Verifier / audit_sth_controller) and external witness caches verify against it. The incremental result MUST be byte-identical for every chain length or prior STHs stop verifying and divergent STHs can trip custody halt.",
+    "already_done": "insert_all + jitter fanout (US-32.5) and the dispatches partial index (US-32.1) are EXCLUDED — see epic README scope-reconciliation table. This story is ONLY the incremental compute."
+  },
+  "story": {
+    "as_a": "loopctl operator running tenants with long, actively-growing audit chains",
+    "i_want_to": "compute each new Signed Tree Head by folding only the entries added since the last STH into a persisted checkpoint of stable Merkle sub-tree peaks, instead of re-reading and re-hashing the whole chain",
+    "so_that": "STH cost scales with new-entry count (O(Δ)) rather than total chain length (O(n)), removing the per-append quadratic — while every signed root stays byte-identical to today's construction so no historical STH or external witness breaks"
+  },
+  "rationale": "In the Bitcoin-style tree, a complete left-aligned subtree of 2^k leaves has a root that never changes as more leaves are appended. Persisting those stable 'peaks' plus the last chain_position lets a recompute load only entries above the checkpoint, fold them into the peaks using the SAME pad-and-hash rules, and combine peaks into the final root identically to merkle_tree/2. The existing full recompute stays as the reference oracle (property-tested equality) and as the fallback when no checkpoint exists, so the change is a pure performance cache with zero semantic drift.",
+  "acceptance_criteria": [
+    { "id": "AC-35.1.1", "description": "A new incremental path computes the tenant's current Merkle root by loading ONLY entries with chain_position > the checkpoint's position (not the whole chain) and folding them into the persisted peak set. For a tenant with no checkpoint it falls back to the existing full compute_merkle_root/1 — backward compatible on first run and after any checkpoint loss.", "status": "pending" },
+    { "id": "AC-35.1.2", "description": "BYTE-IDENTICAL ROOT (the safety invariant): a property/generative test builds a chain of N entries for N across a wide range INCLUDING 1, 2, 3, odd counts, even counts, and 2^k boundaries (e.g. 1..40 plus a few large values), computes the root both incrementally (with checkpoints taken at arbitrary intermediate positions) and via the current merkle_tree/2 full rebuild, and asserts the two roots are equal for every N and every checkpoint split point. merkle_tree/2 is the reference oracle and is NOT modified.", "status": "pending" },
+    { "id": "AC-35.1.3", "description": "The checkpoint (per tenant: last chain_position + serialized stable peaks) is persisted in a NEW additive table (e.g. audit_sth_checkpoints) created by an online CREATE TABLE migration that does not touch or lock audit_log_entries / audit_signed_tree_heads. Checkpoint writes happen in the same logical operation as signing/storing the STH (consistent with the position just signed). The peaks are stored as raw binary hashes; no plaintext leakage of entry contents.", "status": "pending" },
+    { "id": "AC-35.1.4", "description": "sign_and_store_tree_head/1 uses the incremental root; the signed message (build_sth_message/4: tenant_id <> position <> merkle_root <> unix_ts) and the ed25519 signing are UNCHANGED, so a verifier that recomputes the root the old way still validates the signature. An end-to-end test signs an STH via the incremental path and verifies it with the existing Verifier.verify_sth (or the public /audit/sth endpoint) successfully.", "status": "pending" },
+    { "id": "AC-35.1.5", "description": "Correctness under concurrency and drift: the append path serializes per tenant via SELECT…FOR UPDATE (audit_chain.ex:60-61) so positions are gap-free. If the checkpoint's position is ever ahead of or inconsistent with the latest entry (e.g. partial write), the code detects the mismatch and safely falls back to a full recompute for that run rather than emitting a wrong root. A test simulates a stale/corrupt checkpoint and asserts the correct (full-rebuild) root is still produced.", "status": "pending" },
+    { "id": "AC-35.1.6", "description": "Reads run on a read path with a per-query SET LOCAL statement_timeout (never a startup :parameter — pgbouncer-safe). Tenant isolation is preserved: checkpoints are per tenant_id and an incremental compute for tenant A can never read tenant B's entries or peaks (tenant-isolation test). No change to job semantics, queues, or the fanout.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-35.1.1", "name": "incremental root == full-rebuild root for all chain lengths and split points", "type": "unit",
+      "preconditions": ["deterministic entry_hash fixtures for a synthetic chain of length N"],
+      "steps": ["for N in {1,2,3,4,5,7,8,9,15,16,17,31,32,33,40}: build chain, take a checkpoint at an arbitrary position p<N, compute root incrementally from p, compute root via merkle_tree/2 over all N"],
+      "expected_results": ["the two roots are byte-identical for every N and every p"], "status": "pending" },
+    { "id": "TC-35.1.2", "name": "signed STH from incremental path verifies", "type": "integration",
+      "preconditions": ["a tenant with an audit key and a non-empty chain"],
+      "steps": ["append entries", "sign_and_store_tree_head/1 (incremental)", "fetch the STH and verify via Verifier.verify_sth / the public endpoint"],
+      "expected_results": ["signature verifies; merkle_root equals the full-rebuild root at that position"], "status": "pending" },
+    { "id": "TC-35.1.3", "name": "no checkpoint → full-compute fallback", "type": "unit",
+      "preconditions": ["a chain with no checkpoint row"],
+      "steps": ["compute the root"],
+      "expected_results": ["equals merkle_tree/2 output; a checkpoint is then persisted for next time"], "status": "pending" },
+    { "id": "TC-35.1.4", "name": "stale/corrupt checkpoint → safe full recompute", "type": "unit",
+      "preconditions": ["a checkpoint whose position/peaks are inconsistent with the actual chain"],
+      "steps": ["compute the root"],
+      "expected_results": ["mismatch detected; correct full-rebuild root returned; no wrong root emitted"], "status": "pending" },
+    { "id": "TC-35.1.5", "name": "tenant isolation on checkpoints", "type": "integration",
+      "preconditions": ["tenant A and tenant B each with chains + checkpoints"],
+      "steps": ["incremental compute for tenant A"],
+      "expected_results": ["uses only A's entries and A's peaks; B's data never read; A's root correct"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/audit_chain.ex (compute_merkle_root/1, merkle_tree/2, sign_and_store_tree_head/1 — add incremental helper + checkpoint read/write); new schema lib/loopctl/audit_chain/sth_checkpoint.ex; new migration priv/repo/migrations/*_create_audit_sth_checkpoints.exs (additive CREATE TABLE, per-tenant unique on tenant_id).",
+    "Approach: keep a list of stable subtree peaks (roots of complete left-aligned 2^k blocks). merkle_tree/2's odd-level last-element duplication means the peak-combination step must replicate that EXACT fold order — implement it against the oracle, do not assume RFC-6962. The property test (AC-35.1.2) is the gate; write it first.",
+    "Do NOT modify merkle_tree/2 — it is the reference oracle and the on-disk history depends on it. The checkpoint is a cache; a bug must degrade to a correct full recompute, never a wrong root.",
+    "AdminRepo (BYPASSRLS) is used by the existing STH path; keep it, but add a per-query SET LOCAL statement_timeout on the bounded incremental read. Checkpoint table uses ENABLE (not FORCE) ROW LEVEL SECURITY per project RLS rule; but since STH runs via AdminRepo, scope explicitly by tenant_id in every query.",
+    "SECURITY REVIEW REQUIRED: this story's review must include the security-adversary lens on root divergence, replay, and byzantine/custody-halt (docs/chain-of-custody-v2.md L2/L3/L6). Config-based DI for the statement_timeout; no Application.put_env in tests.",
+    "Reference: KB article 397cf0d4 'Append-only audit log with hash chaining and Signed Tree Heads — loopctl'."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 450000
+}

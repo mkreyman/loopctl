@@ -1,0 +1,47 @@
+{
+  "id": "US-35.3",
+  "title": "Reduce the all-tenants STH cron from every-minute to a low-frequency safety sweep",
+  "epic": { "id": "epic_35", "name": "STH & Cron Fleet-Cost Redesign" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "The fleet-cost payoff. Once US-35.2 makes STH event-driven, the per-minute all-tenants poll is redundant for the common case and only needs to exist as a safety net for events the enqueuer missed. Lowering its frequency cuts idle-tenant no-op job churn dramatically. Config-only behavior change; independently revertible.",
+  "background": {
+    "reference": "GH #350. config/config.exs:331 schedules {\"* * * * *\", ComputeSthWorker, args: %{\"mode\" => \"all_tenants\"}} — every minute, fanning out one per-tenant job for EVERY active tenant (compute_sth_worker.ex:51-53), each a no-op via sth_needed?/1 unless the chain grew. With US-35.2 handling the fast path, this poll's only remaining job is to catch tenants whose broadcast was missed (enqueuer restart, delivery gap).",
+    "includes": "Because every per-tenant job self-gates on sth_needed?/1, slowing the poll cannot produce a WRONG STH — it can only, in the worst case, delay an STH for a tenant the event path also missed, bounded by the new sweep interval. The :audit queue is concurrency 3; fewer enqueued no-ops also relieves that queue and the primary DB."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "run the all-tenants ComputeSthWorker cron on a low, configurable interval (a safety sweep) instead of every minute",
+    "so_that": "the fleet stops enqueuing N idle-tenant no-op jobs every single minute, while a bounded-lag safety net still guarantees eventual STH for any activity the event-driven path missed"
+  },
+  "rationale": "US-35.2 provides the primary, activity-gated STH path; the blanket per-minute poll then contributes almost only no-op churn. Reducing its cadence to a config-driven interval (e.g. every 5 minutes) is a minimal, reversible change that captures most of the fleet-cost win from #350's cron findings, with the sth_needed?/1 gate guaranteeing correctness regardless of interval.",
+  "acceptance_criteria": [
+    { "id": "AC-35.3.1", "description": "The all-tenants ComputeSthWorker cron entry runs on a reduced, configurable interval (default e.g. every 5 minutes) rather than \"* * * * *\". The interval/cron expression is driven by config (config-based DI) so it can be tuned per environment and reverted without code changes.", "status": "pending" },
+    { "id": "AC-35.3.2", "description": "The safety-sweep semantics are unchanged from today's fanout: it still enqueues per-tenant jobs for active tenants via the existing insert_all+jitter path (US-32.5), and each job still self-gates via sth_needed?/1. No change to the per-tenant compute. A test asserts a tenant that appended between sweeps still gets an STH by the next sweep even if the event path is disabled.", "status": "pending" },
+    { "id": "AC-35.3.3", "description": "Correctness is interval-independent: a test with the event-driven enqueuer (US-35.2) OFF and the reduced cron ON asserts that after appends, running one safety sweep produces an STH at the latest position for each affected tenant (bounded-lag guarantee). Slowing the poll never yields a wrong or missing-forever STH.", "status": "pending" },
+    { "id": "AC-35.3.4", "description": "Purely a scheduling/config change — no change to worker logic, queues, or the fanout mechanics. The jitter window (US-32.5) and insert_all chunking remain intact and still apply to each sweep.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-35.3.1", "name": "cron interval comes from config", "type": "unit",
+      "preconditions": [],
+      "steps": ["read the Oban cron config for the all_tenants ComputeSthWorker entry"],
+      "expected_results": ["the schedule reflects the configured low-frequency interval, not \"* * * * *\"; value is config-driven"], "status": "pending" },
+    { "id": "TC-35.3.2", "name": "safety sweep still produces STH with event path off", "type": "integration",
+      "preconditions": ["event-driven enqueuer disabled/not firing", "tenant appended new entries"],
+      "steps": ["run one all_tenants sweep", "drain the :audit queue"],
+      "expected_results": ["an STH exists at the latest chain_position for the tenant"], "status": "pending" },
+    { "id": "TC-35.3.3", "name": "idle tenant sweep is a no-op", "type": "integration",
+      "preconditions": ["tenant with an existing STH at head, no new entries"],
+      "steps": ["run one sweep, drain queue"],
+      "expected_results": ["no new STH row created (sth_needed?/1 false)"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: config/config.exs (the Oban Cron plugin entry at ~:331) and/or config/runtime.exs so the interval is a runtime env var (consistent with US-32.2 moving Oban concurrencies to runtime.exs). Keep args: %{\"mode\" => \"all_tenants\"}.",
+    "Prefer a runtime-configurable cron expression / interval (env var with a safe default) so ops can tune or revert without a deploy; document the default.",
+    "Do not touch ComputeSthWorker.perform/1, the jitter, or the insert_all chunking — only the schedule.",
+    "This story DEPENDS on US-35.2 (the event path must exist and be proven before the poll is slowed). Sequence it after 35.2 in implement-plan.",
+    "Smoke-gate: after merge, confirm STHs still advance for an active tenant within the new interval; knowledge_count / STH endpoint health either side."
+  ],
+  "dependencies": ["US-35.2"],
+  "estimated_tokens": 250000
+}

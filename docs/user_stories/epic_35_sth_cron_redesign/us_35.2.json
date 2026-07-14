@@ -1,0 +1,54 @@
+{
+  "id": "US-35.2",
+  "title": "Event-driven STH: audit-append firehose topic + supervised debounce-enqueuer",
+  "epic": { "id": "epic_35", "name": "STH & Cron Fleet-Cost Redesign" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "Turns STH from a per-minute all-tenants poll into an event-driven, activity-gated path. Absorbs #350's 'poll-based rather than event-driven' finding AND the remaining 'gate to tenants with new activity' part of the fanout finding. Additive — the existing cron keeps running unchanged until US-35.3 slows it.",
+  "background": {
+    "reference": "GH #350. AuditChain.append/1 already broadcasts on chain growth: ChainPubSub.broadcast_entry(tenant_id, entry) (audit_chain.ex:74) → Phoenix.PubSub topic \"audit_chain:<tenant_id>\", message {:audit_chain_entry, entry} (lib/loopctl/audit_chain/pubsub.ex:11-19). NOTHING consumes it to enqueue STH — the only subscribers are external agent witness caches. ComputeSthWorker is enqueued ONLY by the per-minute cron (config/config.exs:331). So every minute N per-tenant jobs are enqueued for ALL active tenants (compute_sth_worker.ex:51-53), each self-gating via sth_needed?/1 — N idle-tenant no-op jobs/min.",
+    "includes": "Design wrinkle: today's broadcast is PER-TENANT topic, so a singleton subscriber would have to know and subscribe to every tenant's topic. Cleanest fix: broadcast ALSO to a single fixed firehose topic carrying the entry (which already includes tenant_id), and subscribe one supervised GenServer to that. Debounce must be Basic-Engine-safe: enqueue via single Oban.insert/2 (where `unique` IS honored) with a short schedule_in so an append burst coalesces to one compute per tenant."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "enqueue a debounced per-tenant ComputeSthWorker job in response to the audit-append broadcast, instead of relying on the blanket per-minute poll",
+    "so_that": "an STH is computed promptly after real activity, only tenants that actually appended get a job, and the fleet stops enqueuing N idle-tenant no-op jobs every minute"
+  },
+  "rationale": "The append path already fires a PubSub event on chain growth; wiring a supervised subscriber that debounce-enqueues the existing worker makes STH event-driven and activity-gated with no change to the compute itself. Doing it additively (new firehose topic alongside the per-tenant topic, cron left intact) means this story carries no latency risk on its own — US-35.3 later reduces the poll once this path is proven.",
+  "acceptance_criteria": [
+    { "id": "AC-35.2.1", "description": "AuditChain.append/1 broadcasts the new entry to a single fixed firehose topic (e.g. \"audit_chain:events\") IN ADDITION to the existing per-tenant \"audit_chain:<tenant_id>\" topic. The existing per-tenant topic, its {:audit_chain_entry, …} and {:sth_updated, …} messages, and external subscribers are UNCHANGED (verified by an existing-behavior test).", "status": "pending" },
+    { "id": "AC-35.2.2", "description": "A new supervised singleton GenServer (e.g. Loopctl.AuditChain.SthEnqueuer) subscribes to the firehose topic on start and, on each {:audit_chain_entry, entry}, enqueues ComputeSthWorker for entry.tenant_id via a single Oban.insert/2 (NOT insert_all) with a short config-driven schedule_in debounce. It is added to the application supervision tree.", "status": "pending" },
+    { "id": "AC-35.2.3", "description": "Debounce/coalescing is Basic-Engine-safe: the insert uses `unique: [fields: [:worker, :args], period: …, states: [:available, :scheduled]]` so a burst of appends for one tenant within the window collapses to a single scheduled job. A test appends several entries for one tenant in quick succession and asserts exactly one ComputeSthWorker job is scheduled for that tenant (not one per append).", "status": "pending" },
+    { "id": "AC-35.2.4", "description": "Correctness: after the debounced job runs, the tenant's STH reflects the latest chain_position (the enqueued per-tenant job path is the existing idempotent perform/1 clause — unchanged). An integration test appends, lets the enqueuer fire, drains the queue, and asserts an STH exists at the new position.", "status": "pending" },
+    { "id": "AC-35.2.5", "description": "Resilience: the enqueuer never crashes the append path (broadcast is fire-and-forget) and never crashes itself on a malformed/unknown message (logs + ignores). If the enqueuer is down or misses an event, correctness is preserved because the existing cron poll still runs (this story does NOT touch the cron) — a test asserts the enqueuer tolerates an enqueue error without dying.", "status": "pending" },
+    { "id": "AC-35.2.6", "description": "Multi-node safe: with the firehose delivered to every node, each node's enqueuer may insert, but Oban `unique` dedups at the DB so at most one job per tenant per window survives. No tenant-scoped tags or unbounded state in the GenServer (it holds no per-tenant map that grows without bound). Purely additive; no job semantics change.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-35.2.1", "name": "append broadcasts to both per-tenant and firehose topics", "type": "integration",
+      "preconditions": ["subscribe a test process to both \"audit_chain:<id>\" and \"audit_chain:events\""],
+      "steps": ["AuditChain.append/1"],
+      "expected_results": ["both topics receive {:audit_chain_entry, entry}; per-tenant message shape unchanged"], "status": "pending" },
+    { "id": "TC-35.2.2", "name": "burst of appends coalesces to one scheduled job", "type": "integration",
+      "preconditions": ["enqueuer running; Oban in manual/testing mode"],
+      "steps": ["append 5 entries for tenant A within the debounce window"],
+      "expected_results": ["exactly one ComputeSthWorker job scheduled with args tenant_id=A"], "status": "pending" },
+    { "id": "TC-35.2.3", "name": "event-driven STH reaches latest position", "type": "integration",
+      "preconditions": ["tenant with audit key"],
+      "steps": ["append", "allow enqueuer to fire", "drain :audit queue"],
+      "expected_results": ["an STH exists at the appended chain_position"], "status": "pending" },
+    { "id": "TC-35.2.4", "name": "enqueuer survives an enqueue error", "type": "unit",
+      "preconditions": ["stub the enqueue to raise/return error"],
+      "steps": ["deliver a firehose message"],
+      "expected_results": ["error logged; GenServer stays alive; append path unaffected"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/audit_chain/pubsub.ex (add firehose topic + broadcast), lib/loopctl/audit_chain.ex:74 (also broadcast to firehose), new lib/loopctl/audit_chain/sth_enqueuer.ex (supervised GenServer), lib/loopctl/application.ex (add to tree).",
+    "Basic Engine: `unique` IS honored by Oban.insert/2 (single insert) — that's exactly this path, unlike the insert_all fanout in compute_sth_worker.ex where it's inert. Rely on it for cross-node dedup.",
+    "schedule_in debounce + unique period should be aligned (e.g. a few seconds) so coalescing and dedup agree; make both config-driven (config-based DI, no Application.put_env in tests).",
+    "Do NOT change ComputeSthWorker.perform/1's per-tenant clause or the cron — this story only adds the event path. US-35.3 (depends on this) reduces the cron.",
+    "GenServer must be a singleton child with a name; per Elixir guidelines a named process in the child spec. Hold no unbounded per-tenant state — dedup lives in Oban, not the GenServer.",
+    "Tenant isolation: the firehose carries entry.tenant_id and the enqueued job is per-tenant; no cross-tenant read occurs here."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 350000
+}
