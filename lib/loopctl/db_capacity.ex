@@ -85,6 +85,21 @@ defmodule Loopctl.DbCapacity do
   @verified_live_max_connections 100
   @verified_on ~D[2026-06-24]
 
+  @doc """
+  Resolve the HeavyReadRepo read DSN (US-38.1): `REPLICA_DATABASE_URL` when an operator
+  sets it, else the primary `admin_database_url`.
+
+  Pure and side-effect-free so `config/runtime.exs` (prod-only, never reflected by
+  `Application.get_env` under `mix test`) can call it AND it can be unit-tested with args —
+  no `Application.put_env`. When the replica env var is `nil` (unset) the result is
+  `admin_url`, byte-identical to today's HeavyReadRepo DSN.
+  """
+  @spec resolve_replica_url(String.t() | nil, String.t()) :: String.t()
+  def resolve_replica_url(replica_env, admin_url)
+  def resolve_replica_url(nil, admin_url), do: admin_url
+  def resolve_replica_url("", admin_url), do: admin_url
+  def resolve_replica_url(replica_env, _admin_url) when is_binary(replica_env), do: replica_env
+
   @doc "Production default pool sizes per node (matches config/runtime.exs env-var defaults)."
   @spec prod_pool_sizes() :: %{atom() => pos_integer()}
   def prod_pool_sizes, do: @prod_pool_sizes
@@ -127,6 +142,73 @@ defmodule Loopctl.DbCapacity do
   """
   @spec heavy_read_tenant_slice() :: pos_integer()
   def heavy_read_tenant_slice, do: @heavy_read_tenant_slice
+
+  # ── Replica connection dimension (US-38.1) ────────────────────────────────────────────
+  #
+  # Today HeavyReadRepo's BYPASSRLS pool shares the PRIMARY database's `max_connections`
+  # with Repo + AdminRepo. When an operator sets REPLICA_DATABASE_URL (a future gated infra
+  # op) HeavyReadRepo targets a SEPARATE read replica, so its 8 connections stop counting
+  # against the primary's budget and count against the replica's instead — raising the
+  # primary's effective headroom (more app nodes fit before a rolling deploy exhausts the
+  # primary). This is a PURE model parameterised by a `replica?` boolean; when
+  # `replica? == false` (the default, and today's reality) every existing number is
+  # UNCHANGED. Config-only — no pool size actually changes.
+
+  @doc """
+  Is a DISTINCT read replica configured for HeavyReadRepo? Reads the
+  `:replica_database_url_configured` flag set in `config/runtime.exs` (true only when
+  `REPLICA_DATABASE_URL` is set to a value different from the primary). Defaults to `false`
+  (dev/test and prod-without-replica), so the budget model matches today.
+  """
+  @spec replica_configured?() :: boolean()
+  def replica_configured? do
+    Application.get_env(:loopctl, :replica_database_url_configured, false)
+  end
+
+  @doc """
+  PRIMARY-database pool sizes per node. With no replica (`false`) this is the full prod
+  set (repo + admin_repo + heavy_read_repo) — identical to `prod_pool_sizes/0`. With a
+  replica (`true`) HeavyReadRepo moves off the primary, leaving only `repo` + `admin_repo`.
+  """
+  @spec primary_pool_sizes(boolean()) :: %{atom() => pos_integer()}
+  def primary_pool_sizes(replica? \\ false)
+  def primary_pool_sizes(false), do: @prod_pool_sizes
+  def primary_pool_sizes(true), do: Map.take(@prod_pool_sizes, [:repo, :admin_repo])
+
+  @doc """
+  REPLICA-database pool sizes per node: `%{heavy_read_repo: 8}` when a replica is modeled
+  (`true`), or an EMPTY map when not (`false`) — because with no replica the heavy-read
+  pool lives on the primary (counted by `primary_pool_sizes/1`).
+  """
+  @spec replica_pool_sizes(boolean()) :: %{atom() => pos_integer()}
+  def replica_pool_sizes(replica? \\ false)
+  def replica_pool_sizes(false), do: %{}
+  def replica_pool_sizes(true), do: Map.take(@prod_pool_sizes, [:heavy_read_repo])
+
+  @doc """
+  Sum of the PRIMARY pools on a single node. `false` → 21 (unchanged from
+  `per_node_total/0`); `true` → 13 (repo 10 + admin_repo 3; heavy-read offloaded to the
+  replica).
+  """
+  @spec primary_per_node_total(boolean()) :: pos_integer()
+  def primary_per_node_total(replica? \\ false),
+    do: replica? |> primary_pool_sizes() |> Map.values() |> Enum.sum()
+
+  @doc """
+  The largest node count whose peak PRIMARY-database budget still fits `max_connections`.
+  With no replica (`false`) this equals `max_supported_nodes/1` (the heavy-read pool is on
+  the primary). With a replica (`true`) the 8-conn heavy-read pool is offloaded, so the
+  primary per-node cost drops (21 → 13) and MORE nodes fit — the primary headroom rises.
+  """
+  @spec primary_max_supported_nodes(pos_integer(), boolean()) :: non_neg_integer()
+  def primary_max_supported_nodes(
+        max_connections \\ @verified_live_max_connections,
+        replica? \\ false
+      ) do
+    per = primary_per_node_total(replica?)
+    n = div(max_connections - @fixed_ops - per, per + @notifier_per_node)
+    max(n, 0)
+  end
 
   @doc "The last fly-mpg `SHOW max_connections` value verified by a human (see moduledoc)."
   @spec verified_live_max_connections() :: pos_integer()

@@ -49,7 +49,16 @@ defmodule Loopctl.HeavyReadRepo do
   other than `Loopctl.HeavyRead` does.
 
   In dev/test it connects with the same credentials as `Repo`/`AdminRepo`; in
-  production it uses the BYPASSRLS role (`ADMIN_DATABASE_URL`).
+  production it targets `REPLICA_DATABASE_URL` when an operator sets it (a future gated
+  infra op), else falls back to the primary's BYPASSRLS role (`ADMIN_DATABASE_URL`) —
+  see `Loopctl.DbCapacity.resolve_replica_url/2`. When `REPLICA_DATABASE_URL` is UNSET the
+  resolved DSN is byte-identical to today, so heavy reads still hit the primary. A
+  configured replica DSN MUST have the SAME BYPASSRLS read-role capabilities as today's
+  admin role (role parity), and MUST only ever back reads through `Loopctl.HeavyRead`
+  (never a write). `prepare: :unnamed` below and the per-read `SET LOCAL statement_timeout`
+  are pgbouncer-safety and apply to the replica path unchanged. If a configured replica DSN
+  is unreachable this pool fails LOUD at boot (it never establishes a connection) rather
+  than silently falling back to the primary.
   """
 
   use Ecto.Repo,

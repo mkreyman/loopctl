@@ -93,4 +93,54 @@ defmodule Loopctl.DbCapacityTest do
   test "the verified live value carries a verification date (operator re-check anchor)" do
     assert %Date{} = DbCapacity.verified_on()
   end
+
+  describe "US-38.1 replica read DSN resolution (resolve_replica_url/2)" do
+    test "TC-38.1.1: unset REPLICA_DATABASE_URL resolves to admin_database_url (byte-identical)" do
+      admin = "ecto://user:pass@primary/loopctl"
+      assert DbCapacity.resolve_replica_url(nil, admin) == admin
+      # An empty string (env var present but blank) also falls back to the primary.
+      assert DbCapacity.resolve_replica_url("", admin) == admin
+    end
+
+    test "TC-38.1.2: a distinct REPLICA_DATABASE_URL resolves to the replica DSN" do
+      admin = "ecto://user:pass@primary/loopctl"
+      replica = "ecto://reader:pass@replica/loopctl"
+      assert replica != admin
+      assert DbCapacity.resolve_replica_url(replica, admin) == replica
+    end
+  end
+
+  describe "US-38.1 replica connection dimension (AC-38.1.3)" do
+    test "no replica: primary budget + node math are UNCHANGED from today (regression)" do
+      # replica? defaults to false — identical to the existing model.
+      assert DbCapacity.primary_pool_sizes() == %{repo: 10, admin_repo: 3, heavy_read_repo: 8}
+      assert DbCapacity.primary_pool_sizes(false) == DbCapacity.prod_pool_sizes()
+      assert DbCapacity.replica_pool_sizes(false) == %{}
+      assert DbCapacity.primary_per_node_total(false) == 21
+      assert DbCapacity.primary_per_node_total(false) == DbCapacity.per_node_total()
+      # With no replica, primary max nodes equals the existing max_supported_nodes (=3).
+      assert DbCapacity.primary_max_supported_nodes(100, false) == 3
+
+      assert DbCapacity.primary_max_supported_nodes(100, false) ==
+               DbCapacity.max_supported_nodes(100)
+    end
+
+    test "with a replica: heavy-read pool offloads to the replica, primary headroom rises" do
+      # HeavyReadRepo's 8 conns move to the replica budget; primary keeps repo + admin_repo.
+      assert DbCapacity.primary_pool_sizes(true) == %{repo: 10, admin_repo: 3}
+      assert DbCapacity.replica_pool_sizes(true) == %{heavy_read_repo: 8}
+      # Primary per-node drops 21 -> 13 (10 + 3).
+      assert DbCapacity.primary_per_node_total(true) == 13
+      # The offloaded 8 conns raise primary headroom: max nodes rises above 3.
+      with_replica = DbCapacity.primary_max_supported_nodes(100, true)
+      assert with_replica > 3
+      assert with_replica == 6
+    end
+
+    test "replica_configured? defaults to false (dev/test and prod-without-replica)" do
+      # No REPLICA_DATABASE_URL in test env, so the runtime flag is unset -> false, and the
+      # budget model stays at today's numbers.
+      refute DbCapacity.replica_configured?()
+    end
+  end
 end

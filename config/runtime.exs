@@ -134,6 +134,31 @@ if config_env() == :prod do
   admin_database_url =
     System.get_env("ADMIN_DATABASE_URL") || database_url
 
+  # REPLICA_DATABASE_URL (US-38.1) — read DSN for the HeavyReadRepo pool. DEFAULTS OFF:
+  # when UNSET it falls back to `admin_database_url`, mirroring the ADMIN_DATABASE_URL
+  # fallback pattern above EXACTLY, so today's behaviour is byte-for-byte identical
+  # (heavy reads still hit the primary's BYPASSRLS role). Resolved through the pure
+  # `Loopctl.DbCapacity.resolve_replica_url/2` so the resolution is unit-testable
+  # (runtime.exs is prod-only and never reflected by Application.get_env under `mix test`).
+  #
+  # FUTURE GATED INFRA OP: setting REPLICA_DATABASE_URL is a deliberate, gated operation —
+  # it MUST point at a BYPASSRLS read-role DSN with the SAME capabilities as today's admin
+  # role (role parity), on a real read replica. No infra is provisioned by this config; if
+  # the DSN is unreachable the HeavyReadRepo pool fails LOUD at boot (it never establishes a
+  # connection) rather than silently falling back to the primary — that is intentional.
+  replica_database_url =
+    Loopctl.DbCapacity.resolve_replica_url(
+      System.get_env("REPLICA_DATABASE_URL"),
+      admin_database_url
+    )
+
+  # DbCapacity models a replica connection dimension only when a DISTINCT replica DSN is
+  # configured. Unset (or set equal to the primary) → false → the connection budget math is
+  # unchanged from today.
+  config :loopctl,
+         :replica_database_url_configured,
+         replica_database_url != admin_database_url
+
   config :loopctl, Loopctl.AdminRepo,
     url: admin_database_url,
     pool_size: String.to_integer(System.get_env("ADMIN_POOL_SIZE") || "3"),
@@ -296,8 +321,14 @@ if config_env() == :prod do
          :scale_alert_provider_error_rate_per_min,
          String.to_integer(System.get_env("SCALE_ALERT_PROVIDER_ERROR_RATE_PER_MIN") || "10")
 
+  # `url:` resolves to REPLICA_DATABASE_URL when set, else admin_database_url (US-38.1).
+  # When REPLICA_DATABASE_URL is UNSET this is byte-identical to `admin_database_url` —
+  # the exact value HeavyReadRepo used before this story. `prepare: :unnamed` (on the repo
+  # module) and the per-read SET LOCAL statement_timeout (Loopctl.HeavyRead.opts/1) are the
+  # pgbouncer-safe mechanisms and are PRESERVED on the replica path — do NOT add a
+  # `:parameters` startup param here (see the pgbouncer note below).
   config :loopctl, Loopctl.HeavyReadRepo,
-    url: admin_database_url,
+    url: replica_database_url,
     pool_size: String.to_integer(System.get_env("HEAVY_READ_POOL_SIZE") || "8"),
     socket_options: maybe_ipv6,
     connect_timeout: 15_000,
