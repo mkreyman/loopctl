@@ -1,0 +1,52 @@
+{
+  "id": "US-38.2",
+  "title": "Cluster-global rate limiter: shared Postgres-backed RateLimiter behind the existing behaviour (default node-local ETS)",
+  "epic": { "id": "epic_38", "name": "Horizontal Scaling Readiness (code-only)" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "The single biggest correctness gap on scale-out: the rate limiter is per-node ETS, so any global limit becomes limit×N across nodes — defeating the DB-pool and provider-429 protection the limiter exists to provide. A shared store makes limits cluster-global. Flag-gated: default stays node-local ETS (today's behavior) until an operator opts in.",
+  "background": {
+    "reference": "GH #353. Hammer backend is per-node ETS (config/config.exs:286-288 Hammer.Backend.ETS). The web limiter (lib/loopctl/rate_limiter/hammer.ex) AND US-37.1's outbound token bucket (lib/loopctl/provider/admission.ex:134 rate_limiter().check_rate) both resolve through Loopctl.RateLimiter.Behaviour → the node-local Hammer. admission.ex:70-74 explicitly documents the fleet ceiling is rpm×node_count and defers cluster-global to Epic 38. No Redis in the stack (avoid adding one — Postgres is already there).",
+    "includes": "The Behaviour abstraction already exists (check_rate/3), so this is a clean config-based-DI swap: add a Postgres-backed RateLimiter implementation (a windowed counter table with atomic upsert/increment, tenant+key+window scoped) selectable via config, defaulting to the current ETS/Hammer impl. Both the web limiter and Provider.Admission get cluster-global limits when the Postgres impl is selected, with zero change when it isn't."
+  },
+  "story": {
+    "as_a": "loopctl operator preparing to scale out",
+    "i_want_to": "optionally back the rate limiter with a shared Postgres store so a tenant's limit is enforced across the whole fleet, selectable via config and defaulting to the current per-node ETS",
+    "so_that": "when I run more than one node, a global limit (inbound RPM, or the US-37.1 outbound provider token bucket) stays global instead of multiplying by node count — without adding Redis and without changing single-node behavior today"
+  },
+  "rationale": "Because both limiter call sites already go through Loopctl.RateLimiter.Behaviour, adding a Postgres-backed implementation and selecting it via config gives cluster-global limits with no call-site changes and a trivially safe default (keep ETS). Postgres is already in the stack, so no new infra/dep (no Redis). This closes the limit×N gap that would otherwise silently defeat the DB-pool and provider-429 protections the moment loopctl scales past one node.",
+  "acceptance_criteria": [
+    { "id": "AC-38.2.1", "description": "A new Postgres-backed RateLimiter implements Loopctl.RateLimiter.Behaviour (check_rate/3 + any other callbacks): a windowed counter (tenant/key/window bucket) with an ATOMIC increment-and-check (single upsert or INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING) so concurrent nodes cannot exceed the limit (no read-modify-write race). Old windows are pruned/expired cheaply (partial index / periodic cleanup).", "status": "pending" },
+    { "id": "AC-38.2.2", "description": "The limiter implementation is selected via config (config-based DI, e.g. Application.get_env :loopctl, :rate_limiter, defaulting to the existing ETS/Hammer impl). BOTH the web plug limiter (rate_limiter/hammer.ex callers) AND Provider.Admission (admission.ex) resolve through the behaviour, so BOTH become cluster-global when the Postgres impl is selected — no call-site changes. Default config = ETS (today).", "status": "pending" },
+    { "id": "AC-38.2.3", "description": "DEFAULT-OFF safety: with default config (ETS), behavior is byte-for-byte today's — a test asserts the resolved limiter is the ETS impl by default and single-node results are identical. Fail-OPEN parity: like the ETS/Hammer path and US-37.1, a Postgres-limiter fault (DB error) fails OPEN (allows the request) and logs, never blocking all traffic on a limiter outage.", "status": "pending" },
+    { "id": "AC-38.2.4", "description": "Cluster-global correctness (the point): a test simulates two callers/processes sharing the Postgres store and asserts the COMBINED count is limited to the global budget (not 2×). Window semantics (fixed or sliding) match the existing Hammer contract closely enough that a limit configured today means the same thing. Tenant/key isolation preserved.", "status": "pending" },
+    { "id": "AC-38.2.5", "description": "Bounded cost: the limiter query is a single indexed atomic op per check on a small counter table (not a scan); a migration creates the table + index ONLINE (CONCURRENTLY where needed). No hot-path N+1. The counter table is app-owned (RLS per project rules; but limiter runs cross-tenant via a scoped key — document the access path). No Application.put_env in tests.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-38.2.1", "name": "default is ETS / unchanged", "type": "unit",
+      "preconditions": ["default config"],
+      "steps": ["resolve the rate limiter impl; run a single-node check"],
+      "expected_results": ["ETS/Hammer impl; results identical to today"], "status": "pending" },
+    { "id": "TC-38.2.2", "name": "postgres limiter is atomic / cluster-global", "type": "integration",
+      "preconditions": ["Postgres impl selected; limit=N"],
+      "steps": ["two concurrent processes issue N+ checks against the same tenant/key"],
+      "expected_results": ["combined allowed count == N (not 2N); the rest are limited"], "status": "pending" },
+    { "id": "TC-38.2.3", "name": "both web + admission use the selected impl", "type": "integration",
+      "preconditions": ["Postgres impl selected"],
+      "steps": ["exercise the web plug limiter and Provider.Admission"],
+      "expected_results": ["both go through the Postgres limiter (cluster-global)"], "status": "pending" },
+    { "id": "TC-38.2.4", "name": "fail-open on limiter DB error", "type": "unit",
+      "preconditions": ["Postgres impl; simulate a DB/limiter error"],
+      "steps": ["issue a check"],
+      "expected_results": ["request allowed (fail-open) + logged; not blocked"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: new lib/loopctl/rate_limiter/postgres.ex (impl of Loopctl.RateLimiter.Behaviour), config wiring (config/config.exs + config/runtime.exs) to select the impl, a migration for the counter table + index, lib/loopctl/provider/admission.ex + lib/loopctl/rate_limiter/hammer.ex callers already resolve via the behaviour (confirm the resolution point).",
+    "Atomic increment: INSERT INTO rate_limit_counters (key, window_start, count) VALUES (...) ON CONFLICT (key, window_start) DO UPDATE SET count = rate_limit_counters.count + 1 RETURNING count — then compare to the limit. No SELECT-then-UPDATE race.",
+    "Do NOT add Redis — Postgres is in-stack. Keep the ETS/Hammer impl as the DEFAULT; the Postgres impl is opt-in via config for when clustered.",
+    "Match the Hammer window contract (fixed-window is fine and matches Hammer.Backend.ETS) so an existing configured limit keeps its meaning. Prune old windows (periodic cleanup worker or partial-index + TTL).",
+    "Fail-OPEN on limiter error (consistency with US-37.1 admission + the ETS path). config-based DI; no Application.put_env in tests; assert outcome class not exact timing."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 450000
+}
