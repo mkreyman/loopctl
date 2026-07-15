@@ -47,6 +47,41 @@ defmodule Loopctl.MemoryContextTest do
       assert is_binary(reloaded.embedding_content_hash)
     end
 
+    test "US-37.4 (AC-37.4.5): a just-written memory is embedded + recallable in the same run, never left NULL" do
+      # The batch-embedding story (US-37.4) batches ONLY the bulk article-ingest path
+      # and deliberately keeps the interactive `remember` path PER-RECORD/synchronous
+      # (no coalescing drainer that could drop a just-written row). This guards that
+      # invariant: a memory written now — and a SECOND one written immediately after,
+      # as if a background ingest were already in flight — are BOTH embedded within
+      # the run and immediately recallable, with non-null embeddings (no bounded
+      # staleness, no wait for a periodic sweep).
+      scope = fixture(:memory_scope)
+      Knowledge.reset_circuit_breaker(scope.tenant_id)
+
+      {:ok, first} =
+        Memory.remember(scope, %{tier: :long_term, text: "batch drainer in flight one"})
+
+      {:ok, second} =
+        Memory.remember(scope, %{tier: :long_term, text: "written during a drain two"})
+
+      # Both rows carry a non-null embedding + content hash RIGHT AWAY.
+      for id <- [first.id, second.id] do
+        {:ok, reloaded} = Memory.get_memory_for_embedding(scope.tenant_id, id)
+        refute is_nil(reloaded.embedding), "memory #{id} left embedding IS NULL"
+        assert is_binary(reloaded.embedding_content_hash)
+      end
+
+      # And both are recallable (found, not []).
+      recalled_ids =
+        scope
+        |> Memory.recall(query: "drain", limit: 10)
+        |> Map.fetch!(:results)
+        |> Enum.map(fn {m, _score} -> m.id end)
+
+      assert first.id in recalled_ids
+      assert second.id in recalled_ids
+    end
+
     test "a legitimately empty scope on the healthy path returns [] with fallback: false" do
       scope = fixture(:memory_scope)
       Knowledge.reset_circuit_breaker(scope.tenant_id)

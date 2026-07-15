@@ -207,4 +207,119 @@ defmodule Loopctl.Knowledge.EmbeddingClientTest do
 
     assert is_integer(seconds) and seconds >= 25 and seconds <= 30
   end
+
+  # --- US-37.4 (AC-37.4.1): batch path — array in, map back BY response index ---
+
+  test "TC-37.4.1: batch sends input as an array and maps each vector BY response index" do
+    tenant = fixture(:tenant)
+    test_pid = self()
+    set_embedding_key(tenant, "test-openai-key-BATCH")
+
+    texts = ["alpha", "beta", "gamma"]
+
+    # SHUFFLED indices + DISTINCT vectors so a by-POSITION assumption would fail:
+    # index 0 -> [1.0], 1 -> [2.0], 2 -> [3.0], returned out of order.
+    Req.Test.stub(EmbeddingClient, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      send(test_pid, {:req_body, JSON.decode!(body)})
+
+      Req.Test.json(conn, %{
+        "data" => [
+          %{"index" => 2, "embedding" => [3.0]},
+          %{"index" => 0, "embedding" => [1.0]},
+          %{"index" => 1, "embedding" => [2.0]}
+        ],
+        "usage" => %{"prompt_tokens" => 9, "total_tokens" => 9}
+      })
+    end)
+
+    assert {:ok, [[1.0], [2.0], [3.0]]} = EmbeddingClient.generate_embeddings(tenant.id, texts)
+
+    # The request body carried `input` as an ARRAY of all three texts (not one call each).
+    assert_received {:req_body, %{"input" => ^texts}}
+  end
+
+  test "batch: empty input list returns {:ok, []} with NO provider call" do
+    tenant = fixture(:tenant)
+    test_pid = self()
+    set_embedding_key(tenant, "test-openai-key-EMPTY")
+
+    Req.Test.stub(EmbeddingClient, fn conn ->
+      send(test_pid, :unexpected_http_call)
+      Req.Test.json(conn, %{"data" => []})
+    end)
+
+    assert {:ok, []} = EmbeddingClient.generate_embeddings(tenant.id, [])
+    refute_received :unexpected_http_call
+  end
+
+  test "batch: mandatory BYO keyless tenant → {:error, :no_api_key}, NO provider call" do
+    tenant = fixture(:tenant)
+    test_pid = self()
+
+    Req.Test.stub(EmbeddingClient, fn conn ->
+      send(test_pid, :unexpected_http_call)
+      Req.Test.json(conn, %{"data" => [%{"index" => 0, "embedding" => [0.0]}]})
+    end)
+
+    assert {:error, :no_api_key} = EmbeddingClient.generate_embeddings(tenant.id, ["a", "b"])
+    refute_received :unexpected_http_call
+  end
+
+  test "TC-37.4.4: a SHORT data array (missing an index) fails the WHOLE batch, no partial" do
+    tenant = fixture(:tenant)
+    set_embedding_key(tenant, "test-openai-key-SHORT")
+
+    # 3 inputs, but the provider returns only 2 vectors (index 2 missing).
+    Req.Test.stub(EmbeddingClient, fn conn ->
+      Req.Test.json(conn, %{
+        "data" => [
+          %{"index" => 0, "embedding" => [1.0]},
+          %{"index" => 1, "embedding" => [2.0]}
+        ]
+      })
+    end)
+
+    assert {:error, {:embedding_index_mismatch, 3, 2}} =
+             EmbeddingClient.generate_embeddings(tenant.id, ["a", "b", "c"])
+  end
+
+  test "batch: one admission token per batch — an empty bucket fast-fails :rate_limited_local" do
+    tenant = fixture(:tenant)
+    test_pid = self()
+    set_embedding_key(tenant, "test-openai-key-BATCH-GATED")
+
+    stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit -> {:deny, 0} end)
+
+    Req.Test.stub(EmbeddingClient, fn conn ->
+      send(test_pid, :unexpected_http_call)
+      Req.Test.json(conn, %{"data" => [%{"index" => 0, "embedding" => [0.0]}]})
+    end)
+
+    assert {:error, :rate_limited_local} =
+             EmbeddingClient.generate_embeddings(tenant.id, ["a", "b"])
+
+    refute_received :unexpected_http_call
+  end
+
+  test "batch: records a single :embedding usage event for the whole array" do
+    tenant = fixture(:tenant)
+    set_embedding_key(tenant, "test-openai-key-BATCH-USAGE")
+
+    Req.Test.stub(EmbeddingClient, fn conn ->
+      Req.Test.json(conn, %{
+        "data" => [
+          %{"index" => 0, "embedding" => [0.1]},
+          %{"index" => 1, "embedding" => [0.2]}
+        ],
+        "usage" => %{"prompt_tokens" => 20, "total_tokens" => 20}
+      })
+    end)
+
+    assert {:ok, [[0.1], [0.2]]} = EmbeddingClient.generate_embeddings(tenant.id, ["a", "b"])
+
+    %{data: rows} = Llm.usage_summary(tenant.id, [])
+    embedding = Enum.find(rows, &(&1.operation == :embedding))
+    assert embedding.input_tokens == 20
+  end
 end

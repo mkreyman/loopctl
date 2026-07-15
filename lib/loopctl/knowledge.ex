@@ -63,6 +63,23 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.SystemConfig
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Workers.ArticleEmbeddingWorker
+  alias Loopctl.Workers.BatchArticleEmbeddingWorker
+
+  # US-37.4: default texts-per-array-batch for background embedding (`embedding_batch_max/0`).
+  # Env-driven via SystemConfig (`"embedding_batch_max"`); this in-code default doubles
+  # as the documented default and applies on a cache miss.
+  @default_embedding_batch_max 100
+
+  # US-37.4 (AC-37.4.4 review): CUMULATIVE per-request character budget for a single
+  # provider array call (`embedding_batch_max_chars/0`). The count cap
+  # (`embedding_batch_max/0`) alone does not bound aggregate tokens — 100 inputs each
+  # sliced to ~32K chars is ~3.2M chars (~800k tokens), which can exceed an
+  # OpenAI-compatible per-request token ceiling (~300k tokens) and return a permanent
+  # HTTP 400. The worker sub-splits each count-chunk so no single array call exceeds
+  # this many characters. Default ~1,000,000 chars (~250k tokens at ~4 chars/token)
+  # keeps every request comfortably under the ceiling. Env-driven via SystemConfig
+  # (`"embedding_batch_max_chars"`).
+  @default_embedding_batch_max_chars 1_000_000
 
   # Maximum page size for the article list endpoint (`list_articles/2`). Larger
   # limits are HONORED up to this cap so callers can paginate to exhaustion at
@@ -794,6 +811,29 @@ defmodule Loopctl.Knowledge do
       nil -> {:error, :not_found}
       article -> {:ok, article}
     end
+  end
+
+  @doc """
+  Batch presence-check variant for the bulk-embedding path (US-37.4): fetches every
+  article in `article_ids` for the tenant with the virtual `has_embedding` boolean
+  set to `not is_nil(embedding)` — WITHOUT transferring the 1536-dim vector itself.
+  The batch worker only needs to know whether a row is already embedded (and compare
+  the separate `embedding_content_hash`); loading up to `embedding_batch_max` (~100)
+  full pgvectors per job just to null-check them is avoidable I/O on this hot
+  bulk-ingest path. Silently drops ids that don't resolve (deleted / wrong tenant).
+  Order is NOT guaranteed — the caller keys by `id`. Scoped to ONE tenant (RLS +
+  explicit predicate).
+  """
+  @spec get_articles_with_embedding_status(Ecto.UUID.t(), [Ecto.UUID.t()]) :: [Article.t()]
+  def get_articles_with_embedding_status(tenant_id, article_ids)
+      when is_binary(tenant_id) and is_list(article_ids) do
+    query =
+      from(a in Article,
+        where: a.id in ^article_ids and a.tenant_id == ^tenant_id,
+        select_merge: %{has_embedding: not is_nil(a.embedding)}
+      )
+
+    AdminRepo.all(query)
   end
 
   @doc """
@@ -3416,22 +3456,87 @@ defmodule Loopctl.Knowledge do
   # transaction has committed. Best-effort and crash-proof: the publish is
   # already durable, so a transient enqueue failure must never 500 the request or
   # abort the remaining chunks — we log and move on (the embedding is
-  # re-derivable). Per-row `Oban.insert/1` (NOT `insert_all`) so the worker's
-  # `unique: [keys: [:article_id], period: 300]` window is honored — the basic
-  # Oban engine ignores `unique:` for `insert_all`. Bounded to <= 100 inserts per
-  # chunk.
+  # re-derivable).
+  #
+  # US-37.4: this is the truly-bulk background ingest path, so it BATCHES —
+  # chunk the published rows into groups of `embedding_batch_max/0` (~100) and
+  # enqueue ONE `BatchArticleEmbeddingWorker` per chunk. That worker embeds the
+  # whole chunk in a single provider array call (one admission token + one
+  # concurrency slot per batch), cutting provider round-trips ~100x vs. the old
+  # per-article fan-out. Per-chunk `Oban.insert/1` (NOT `insert_all`) so the
+  # worker's `unique:` window is honored — the basic Oban engine ignores `unique:`
+  # for `insert_all`.
+  #
+  # NB: the INTERACTIVE single-article publish path (`maybe_enqueue_embedding/2`)
+  # stays on the per-record `ArticleEmbeddingWorker` — batching is only for bulk.
   defp enqueue_bulk_embeddings(_tenant_id, []), do: :ok
 
   defp enqueue_bulk_embeddings(tenant_id, published) do
-    Enum.each(published, fn article ->
-      %{article_id: article.id, tenant_id: tenant_id}
-      |> ArticleEmbeddingWorker.new()
+    published
+    |> Enum.chunk_every(embedding_batch_max())
+    |> Enum.each(fn chunk ->
+      %{article_ids: Enum.map(chunk, & &1.id), tenant_id: tenant_id}
+      |> BatchArticleEmbeddingWorker.new()
       |> Oban.insert()
     end)
   rescue
     e ->
       Logger.error("bulk_publish: embedding enqueue failed: #{Exception.message(e)}")
       :ok
+  end
+
+  @doc """
+  Max number of texts per background embedding array batch (US-37.4).
+
+  DB-backed + live-tunable via `Loopctl.SystemConfig` (`"embedding_batch_max"`); the
+  in-code default (#{@default_embedding_batch_max}) matches the seeded row and
+  applies on a cache miss. Floored at 1 (a non-positive tuned value can't wedge into
+  an empty chunk).
+
+  Respects both provider limits (AC-37.4.4) via TWO caps applied together — the
+  worker chunks by the smaller of them, so neither the array size NOR the aggregate
+  per-request tokens can overflow:
+
+    * **Per-input token limit** — each text is sliced to 32K chars (~8k tokens) in
+      the worker's `build_embedding_text/1`, at/under the embedder's ~8191-token
+      per-input window, so no single array element overflows.
+    * **Array-size limit (this knob)** — OpenAI-compatible `/embeddings` accepts up
+      to ~2048 inputs per request; ~100 keeps each request small and bounds the
+      per-batch blast radius on a provider error. Operators can lower this knob live
+      (no redeploy).
+    * **Cumulative per-request token limit** — `embedding_batch_max_chars/0` bounds
+      the SUM of characters across a single array call, so a chunk of many
+      large-text articles is sub-split before it can exceed the provider's
+      per-request token ceiling. The count cap alone does NOT bound aggregate tokens
+      (100 × ~8k tokens ≈ 800k > a ~300k ceiling), which is why this second cap
+      exists.
+  """
+  @spec embedding_batch_max() :: pos_integer()
+  def embedding_batch_max do
+    "embedding_batch_max"
+    |> SystemConfig.get_int(@default_embedding_batch_max)
+    |> max(1)
+  end
+
+  @doc """
+  Cumulative CHARACTER budget for a single background embedding array call (US-37.4,
+  AC-37.4.4).
+
+  Bounds the SUM of input characters per provider request, in addition to the
+  `embedding_batch_max/0` count cap. `BatchArticleEmbeddingWorker` sub-splits each
+  count-chunk so no single array call exceeds this many characters, keeping aggregate
+  per-request tokens under an OpenAI-compatible ceiling (~300k tokens) that the count
+  cap alone cannot guarantee. DB-backed + live-tunable via `Loopctl.SystemConfig`
+  (`"embedding_batch_max_chars"`); the in-code default
+  (#{@default_embedding_batch_max_chars}) applies on a cache miss. Floored at
+  `@max_text_length` in the worker so a single oversized (already-sliced) input still
+  forms its own chunk rather than wedging into an empty one.
+  """
+  @spec embedding_batch_max_chars() :: pos_integer()
+  def embedding_batch_max_chars do
+    "embedding_batch_max_chars"
+    |> SystemConfig.get_int(@default_embedding_batch_max_chars)
+    |> max(1)
   end
 
   defp add_bulk_audit_entries(
@@ -7557,6 +7662,108 @@ defmodule Loopctl.Knowledge do
       _ ->
         # nil (yield timeout), an abnormal task exit, or an async_nolink task crash
         # surfacing as {:exit, reason} — a provider/infra failure.
+        record_failure(tenant_id)
+        maybe_record_provider_error(:timeout)
+        {:error, :timeout}
+    end
+  end
+
+  @doc """
+  US-37.4: batch variant of `generate_embedding/3` — embeds a LIST of texts in ONE
+  provider round-trip, reusing the SAME per-tenant circuit breaker, per-node
+  concurrency gate, latency telemetry, and error classification as the single-text
+  path (ONE slot + ONE breaker signal per batch, not per text).
+
+  Used ONLY by the truly-bulk background ingest path (`BatchArticleEmbeddingWorker`).
+  The interactive single-query path stays on `generate_embedding/3` (latency-sensitive).
+
+  Returns `{:ok, vectors}` with vectors in the SAME order as `texts`, or
+  `{:error, reason}` (the whole batch fails/retries as a unit — never a partial
+  half-write of vectors). An empty list returns `{:ok, []}` WITHOUT acquiring a slot
+  or hitting the breaker.
+
+  `opts`:
+    * `:timeout` — Task.yield budget in ms (default `#{@embedding_yield_ms}`).
+  """
+  @spec generate_embeddings(Ecto.UUID.t(), [String.t()], keyword()) ::
+          {:ok, [[float()]]} | {:error, term()}
+  def generate_embeddings(tenant_id, texts, opts \\ [])
+      when is_binary(tenant_id) and is_list(texts) do
+    if texts == [] do
+      {:ok, []}
+    else
+      try_generate_embeddings(tenant_id, texts, opts)
+    end
+  end
+
+  defp try_generate_embeddings(tenant_id, texts, opts) do
+    ensure_circuit_breaker_table()
+
+    if circuit_open?(tenant_id) do
+      {:error, :circuit_open}
+    else
+      timeout = Keyword.get(opts, :timeout, @embedding_yield_ms)
+      run_embeddings_task(tenant_id, texts, timeout)
+    end
+  end
+
+  # Mirrors `run_embedding_task/3`: ONE concurrency slot for the WHOLE batch
+  # (US-37.2 — a batch is one outbound call, so it charges one slot), released in an
+  # `after`. Over the cap → `{:error, :rate_limited_local}` (worker snoozes).
+  defp run_embeddings_task(tenant_id, texts, timeout) do
+    case embedding_concurrency().acquire(tenant_id) do
+      :ok ->
+        try do
+          run_capped_embeddings_task(tenant_id, texts, timeout)
+        after
+          embedding_concurrency().release(tenant_id)
+        end
+
+      {:error, :rate_limited_local} = err ->
+        err
+    end
+  end
+
+  # Mirrors `run_capped_embedding_task/3` (supervised async_nolink, breaker/
+  # provider-error recording) but calls the client's BATCH callback. ONE breaker
+  # signal per batch — a batch failure counts once, not per text. UNLIKE the single
+  # path it is EXEMPT from latency-based tripping (a batch's wall-clock is inherently
+  # larger than one text; see the success clause below).
+  defp run_capped_embeddings_task(tenant_id, texts, timeout) do
+    started_ms = System.monotonic_time(:millisecond)
+
+    task =
+      Task.Supervisor.async_nolink(Loopctl.Knowledge.EmbeddingTaskSupervisor, fn ->
+        try do
+          embedding_client().generate_embeddings(tenant_id, texts)
+        rescue
+          e -> {:error, {:embedding_crash, Exception.message(e)}}
+        end
+      end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task) do
+      {:ok, {:ok, vectors}} ->
+        # Review (LOW #5): the batch path is EXEMPT from latency-based breaker
+        # tripping. `started_ms` here is the WHOLE-batch wall-clock (~100 texts),
+        # inherently far larger than one interactive text; scoring it against the
+        # single-call `embedding_breaker_latency_threshold_ms` would treat normal
+        # batch latency as a "slow call" and could falsely trip the per-tenant
+        # breaker (degrading that tenant to keyword search). A successful batch is
+        # full health → just clear the tenant's breaker state (no slow-call count).
+        # (Failure/timeout still counts below, exactly like the single path.)
+        _elapsed_ms = System.monotonic_time(:millisecond) - started_ms
+        record_success(tenant_id)
+        {:ok, vectors}
+
+      {:ok, {:error, :no_api_key}} ->
+        {:error, :no_api_key}
+
+      {:ok, {:error, reason} = err} ->
+        maybe_record_failure(tenant_id, reason)
+        maybe_record_provider_error(reason)
+        err
+
+      _ ->
         record_failure(tenant_id)
         maybe_record_provider_error(:timeout)
         {:error, :timeout}

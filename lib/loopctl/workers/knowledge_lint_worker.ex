@@ -61,8 +61,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
-  alias Loopctl.Workers.ArticleEmbeddingWorker
   alias Loopctl.Workers.ArticleLinkingWorker
+  alias Loopctl.Workers.BatchArticleEmbeddingWorker
 
   # Ask lint for the ceiling so we act on as many orphans per run as the engine
   # will return; the true (pre-cap) totals still come back in the summary.
@@ -167,9 +167,17 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       |> Oban.insert()
     end)
 
-    Enum.each(without_embedding, fn id ->
-      %{"article_id" => id, "tenant_id" => tenant_id}
-      |> ArticleEmbeddingWorker.new()
+    # US-37.4 (LOW review): batch the orphan-embedding backfill instead of fanning
+    # out one single-text `ArticleEmbeddingWorker` per orphan. A corpus backfill can
+    # otherwise issue N per-record provider round-trips — the exact background
+    # amplification US-37.4 collapses. Chunk into groups of
+    # `Knowledge.embedding_batch_max/0` and enqueue ONE `BatchArticleEmbeddingWorker`
+    # per chunk (one provider array call, one admission token + one slot per batch).
+    without_embedding
+    |> Enum.chunk_every(Knowledge.embedding_batch_max())
+    |> Enum.each(fn chunk ->
+      %{article_ids: chunk, tenant_id: tenant_id}
+      |> BatchArticleEmbeddingWorker.new()
       |> Oban.insert()
     end)
 

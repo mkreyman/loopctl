@@ -61,6 +61,11 @@ defmodule Loopctl.Knowledge.Article do
     field :metadata, :map, default: %{}
 
     field :embedding, Pgvector.Ecto.Vector, load_in_query: false
+    # Virtual boolean projection of `not is_nil(embedding)` — lets the bulk-embedding
+    # path (US-37.4) null-check presence WITHOUT transferring the 1536-dim vector for
+    # every article in a ~100-record chunk. Populated by
+    # `Knowledge.get_articles_with_embedding_status/2`.
+    field :has_embedding, :boolean, virtual: true
     # SHA-256 hex of the exact text that produced `embedding` — the idempotency key
     # that lets ArticleEmbeddingWorker skip re-calling the paid provider on retry.
     field :embedding_content_hash, :string
