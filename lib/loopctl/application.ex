@@ -101,6 +101,19 @@ defmodule Loopctl.Application do
     # log-only, never blocks boot.
     if Application.get_env(:loopctl, :env) == :prod, do: Loopctl.DbCapacity.warn_if_over_budget()
 
+    # US-38.1 (AC-38.1.2): when a DISTINCT read replica is configured, FAIL LOUD at boot if it
+    # is unreachable — a supervised Ecto pool otherwise boots green and 500s every heavy read
+    # at query time. No-op unless REPLICA_DATABASE_URL points at a distinct DSN. Prod only;
+    # RAISES (aborts boot) on an unreachable replica, by design.
+    if Application.get_env(:loopctl, :env) == :prod,
+      do: Loopctl.ReplicaReadiness.assert_reachable!()
+
+    # US-38.1: replica half of the connection-budget check — when a distinct replica is
+    # configured, warn (log only) if the offloaded heavy-read pool would exhaust the REPLICA's
+    # own max_connections. No-op without a replica. Prod only, never blocks boot.
+    if Application.get_env(:loopctl, :env) == :prod,
+      do: Loopctl.DbCapacity.warn_if_replica_over_budget()
+
     # US-27.9a: warn if a CONCURRENTLY-built critical index (e.g. the article keyset
     # index) is missing/INVALID after an interrupted build — silent Seq-Scan degradation
     # otherwise. Prod only, log + telemetry, never blocks boot.

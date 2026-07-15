@@ -281,7 +281,9 @@ defmodule Loopctl.AuditChain do
   # Reads entry_hashes for [0..latest_pos] ascending in bounded keyset pages, each a
   # single `HeavyRead` statement (tenant-scoped, timeout-guarded). Bounded by
   # `latest_pos` (the head read a moment ago) so a concurrent append can't pull
-  # leaves beyond the position we're about to sign.
+  # leaves beyond the position we're about to sign. Like the tail read, the
+  # `:sth_incremental` endpoint is PRIMARY-PINNED (US-38.1), so every page reads the
+  # PRIMARY — never a lagging replica that could truncate the rebuilt prefix.
   defp load_all_hashes_paged(tenant_id, latest_pos) do
     load_all_hashes_paged(tenant_id, latest_pos, -1, [])
   end
@@ -318,8 +320,16 @@ defmodule Loopctl.AuditChain do
   # so a concurrent append can't fold in leaves beyond the position we sign.
   # Ordered ascending. Routed through `HeavyRead` so it runs under a per-query
   # `SET LOCAL statement_timeout` (pgbouncer-safe) and its structural guard proves
-  # the `tenant_id` predicate is present (AC-35.1.6). In test env
-  # `:heavy_read_repo` is aliased to `AdminRepo`, so this shares the sandbox.
+  # the `tenant_id` predicate is present (AC-35.1.6).
+  #
+  # US-38.1 CONSISTENCY: the `:sth_incremental` endpoint is PRIMARY-PINNED
+  # (`HeavyRead.primary_pinned_endpoints/0`), so this tail read runs on the PRIMARY pool
+  # (AdminRepo) — the SAME source as `latest_entry/1` (head) and `load_valid_checkpoint/2`
+  # (checkpoint) — even when `REPLICA_DATABASE_URL` routes other heavy reads to a replica. A
+  # replica lagging by k entries would return only up to `latest_pos - k` for this tail and
+  # the signer would fold an INCOMPLETE tail into a WRONG root labeled at `latest_pos`; pinning
+  # to the primary keeps head/checkpoint/tail on one consistent snapshot. In test env both
+  # pools resolve to `AdminRepo`, so this shares the sandbox.
   defp load_tail_hashes(tenant_id, cp_pos, latest_pos) do
     query =
       from(e in Entry,

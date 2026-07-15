@@ -143,4 +143,71 @@ defmodule Loopctl.DbCapacityTest do
       refute DbCapacity.replica_configured?()
     end
   end
+
+  describe "US-38.1 replica-side connection budget (heavy-read pool vs the REPLICA's own max_connections)" do
+    test "no replica: the replica dimension contributes zero connections" do
+      assert DbCapacity.replica_per_node_total(false) == 0
+      assert DbCapacity.replica_per_node_total() == 0
+    end
+
+    test "with a replica: only the offloaded heavy-read pool counts, no notifier/ops on the replica" do
+      assert DbCapacity.replica_per_node_total(true) == 8
+      # Peak = 8·(nodes+1): steady + one deploy-overlap node, NO Oban notifier, NO fixed ops
+      # (those connect to the primary, never the read replica).
+      assert DbCapacity.replica_peak_total(2) == 24
+      assert DbCapacity.replica_peak_total(1) == 16
+    end
+
+    test "replica_max_supported_nodes: honest headroom on the replica's own max_connections" do
+      # peak(n) = 8·(n+1) <= 100 → n = 11 (peak 96 fits; 12 → 104 exhausts).
+      assert DbCapacity.replica_max_supported_nodes(100) == 11
+      assert DbCapacity.replica_peak_total(11) <= 100
+      assert DbCapacity.replica_peak_total(12) > 100
+    end
+
+    test "replica_budget_status flags a small replica the heavy-read pool would exhaust" do
+      # A 20-conn replica can't hold the 8-conn heavy-read pool across 2 nodes + overlap (24).
+      assert {:over, msg} = DbCapacity.replica_budget_status(20, 2)
+      assert msg =~ "REPLICA"
+      assert msg =~ "EXCEEDED"
+      # A 100-conn replica has ample headroom for 2 nodes.
+      assert :ok = DbCapacity.replica_budget_status(100, 2)
+    end
+
+    test "warn_if_replica_over_budget is a NO-OP when no replica is configured (test/default env)" do
+      # No REPLICA_DATABASE_URL in test env → replica_configured? false → never touches the
+      # heavy-read pool, returns :ok.
+      refute DbCapacity.replica_configured?()
+      assert DbCapacity.warn_if_replica_over_budget() == :ok
+    end
+  end
+
+  describe "US-38.1 live boot check honors the replica dimension (primary_budget_sizes/2)" do
+    @runtime_sizes %{repo: 10, admin_repo: 3, heavy_read_repo: 8}
+
+    test "no replica: the boot check budgets ALL pools (unchanged from today)" do
+      assert DbCapacity.primary_budget_sizes(@runtime_sizes, false) == @runtime_sizes
+    end
+
+    test "with a replica: the offloaded heavy-read pool is EXCLUDED from the primary budget" do
+      assert DbCapacity.primary_budget_sizes(@runtime_sizes, true) == %{repo: 10, admin_repo: 3}
+    end
+
+    test "regression: at the replica-advertised headroom the boot check no longer FALSE-flags over-budget" do
+      # The bug: warn_if_over_budget/0 counted heavy_read_repo's 8 conns against the primary
+      # even with a replica, so at primary_max_supported_nodes(100, true) == 6 the peak
+      # (155 > 100) spuriously logged "budget EXCEEDED". Fixed: budgeting primary-only sizes,
+      # 6 nodes fits (99 <= 100), consistent with the model's advertised max.
+      nodes = DbCapacity.primary_max_supported_nodes(100, true)
+      assert nodes == 6
+
+      full_sizes = @runtime_sizes
+      primary_only = DbCapacity.primary_budget_sizes(full_sizes, true)
+
+      # Old (buggy) behavior: full pools over budget at the advertised headroom.
+      assert {:over, _} = DbCapacity.budget_status(100, nodes, full_sizes)
+      # New behavior: primary-only pools fit at the advertised headroom.
+      assert :ok = DbCapacity.budget_status(100, nodes, primary_only)
+    end
+  end
 end

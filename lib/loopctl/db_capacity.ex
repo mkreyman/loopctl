@@ -195,6 +195,61 @@ defmodule Loopctl.DbCapacity do
     do: replica? |> primary_pool_sizes() |> Map.values() |> Enum.sum()
 
   @doc """
+  Sum of the REPLICA-side pools on a single node (US-38.1): `0` with no replica (`false`), or
+  the offloaded heavy-read pool (`8`) when a replica is modeled (`true`).
+  """
+  @spec replica_per_node_total(boolean()) :: non_neg_integer()
+  def replica_per_node_total(replica? \\ false),
+    do: replica? |> replica_pool_sizes() |> Map.values() |> Enum.sum()
+
+  @doc """
+  Peak REPLICA-side connections during a rolling deploy: steady heavy-read pools across `nodes`
+  nodes + one transient deploy-overlap node's pool. Unlike the PRIMARY peak there is NO Oban
+  notifier and NO fixed ops reserve on the replica — the LISTEN notifier connects to the primary,
+  and migrations/remote-console target the primary, never the read replica. So peak = 8·(nodes+1).
+  """
+  @spec replica_peak_total(pos_integer()) :: non_neg_integer()
+  def replica_peak_total(nodes) when is_integer(nodes) and nodes > 0 do
+    per = replica_per_node_total(true)
+    per * nodes + per
+  end
+
+  @doc """
+  The largest node count whose peak REPLICA-side budget still fits the REPLICA's own
+  `max_connections` (US-38.1). Guards against pointing `REPLICA_DATABASE_URL` at a small
+  replica instance whose `max_connections` the heavy-read pool would exhaust — the replica
+  half of the connection-budget model. Beyond it, a deploy exhausts the replica's connections.
+  """
+  @spec replica_max_supported_nodes(pos_integer()) :: non_neg_integer()
+  def replica_max_supported_nodes(max_connections) when is_integer(max_connections) do
+    per = replica_per_node_total(true)
+    # peak(n) = per*(n+1) <= max
+    n = div(max_connections - per, per)
+    max(n, 0)
+  end
+
+  @doc """
+  Replica-side budget status for `nodes` nodes vs the REPLICA's `max_connections` (US-38.1).
+  Returns `:ok` or `{:over, message}` — never raises. Mirrors `budget_status/3` for the
+  replica dimension.
+  """
+  @spec replica_budget_status(pos_integer(), pos_integer()) :: :ok | {:over, String.t()}
+  def replica_budget_status(max_connections, nodes)
+      when is_integer(max_connections) and is_integer(nodes) and nodes > 0 do
+    peak = replica_peak_total(nodes)
+
+    if peak <= max_connections do
+      :ok
+    else
+      {:over,
+       "REPLICA DB connection budget EXCEEDED: peak #{peak} (heavy_read_repo pool " <>
+         "#{replica_per_node_total(true)} × #{nodes} nodes + deploy overlap) > replica " <>
+         "max_connections #{max_connections}. Provision a larger read replica, lower the node " <>
+         "count, or reduce HEAVY_READ_POOL_SIZE."}
+    end
+  end
+
+  @doc """
   The largest node count whose peak PRIMARY-database budget still fits `max_connections`.
   With no replica (`false`) this equals `max_supported_nodes/1` (the heavy-read pool is on
   the primary). With a replica (`true`) the 8-conn heavy-read pool is offloaded, so the
@@ -274,15 +329,35 @@ defmodule Loopctl.DbCapacity do
   end
 
   @doc """
+  The PRIMARY-database pool sizes the live boot check budgets, given the actual runtime
+  `sizes` and whether a distinct replica is configured (US-38.1).
+
+  With no replica the primary carries every pool (unchanged). With a replica, `heavy_read_repo`
+  is offloaded to the replica, so it must NOT be counted against the primary's
+  `max_connections` — otherwise the boot check emits a false "budget EXCEEDED" at exactly the
+  node count `primary_max_supported_nodes/2` advertises as safe. Pure so both branches are
+  unit-testable without `Application.put_env`.
+  """
+  @spec primary_budget_sizes(map(), boolean()) :: map()
+  def primary_budget_sizes(sizes, replica?)
+  def primary_budget_sizes(sizes, false), do: sizes
+  def primary_budget_sizes(sizes, true), do: Map.delete(sizes, :heavy_read_repo)
+
+  @doc """
   Boot-time check (call in prod after repos start): reads the LIVE `max_connections`
   and warns if the ACTUAL configured pools, at `nodes` (env `EXPECTED_APP_NODES`,
   default 2), would exceed it. Logs only — never raises, never blocks boot.
+
+  US-38.1: when a distinct read replica is configured, the offloaded `heavy_read_repo` pool
+  counts against the REPLICA's budget, not the primary's — so it is excluded here
+  (`primary_budget_sizes/2`) and the check reflects the raised primary headroom
+  (`primary_max_supported_nodes/2`) instead of a spurious over-budget warning.
   """
   @spec warn_if_over_budget(pos_integer()) :: :ok
   def warn_if_over_budget(nodes \\ expected_app_nodes()) do
     %{rows: [[raw]]} = Loopctl.Repo.query!("SHOW max_connections")
     live_max = String.to_integer(raw)
-    sizes = runtime_pool_sizes()
+    sizes = primary_budget_sizes(runtime_pool_sizes(), replica_configured?())
 
     case budget_status(live_max, nodes, sizes) do
       :ok ->
@@ -298,6 +373,43 @@ defmodule Loopctl.DbCapacity do
   rescue
     e -> Logger.warning("DbCapacity boot check skipped: #{Exception.message(e)}")
   end
+
+  @doc """
+  Boot-time REPLICA-side budget check (US-38.1): when a distinct read replica is configured,
+  reads the REPLICA's own live `max_connections` (via `Loopctl.HeavyRead.replica_max_connections/0`,
+  the sole sanctioned toucher of the heavy-read pool) and warns if the heavy-read pool at
+  `nodes` would exhaust it. A NO-OP when no replica is configured (the default). Logs only —
+  never raises, never blocks boot.
+
+  This is the replica half of the connection-budget model: `warn_if_over_budget/1` guards the
+  PRIMARY, this guards the replica so a small replica instance can't be silently exhausted by
+  the offloaded 8-conn heavy-read pool.
+  """
+  @spec warn_if_replica_over_budget(pos_integer()) :: :ok
+  def warn_if_replica_over_budget(nodes \\ expected_app_nodes()) do
+    if replica_configured?() do
+      case Loopctl.HeavyRead.replica_max_connections() do
+        {:ok, live_max} ->
+          log_replica_budget(replica_budget_status(live_max, nodes), live_max, nodes)
+
+        {:error, reason} ->
+          Logger.warning(
+            "DbCapacity replica boot check skipped (replica unreachable): #{inspect(reason)}"
+          )
+      end
+    end
+
+    :ok
+  end
+
+  defp log_replica_budget(:ok, live_max, nodes) do
+    Logger.info(
+      "REPLICA connection budget OK: peak #{replica_peak_total(nodes)} <= replica " <>
+        "max_connections #{live_max} (#{nodes} nodes)"
+    )
+  end
+
+  defp log_replica_budget({:over, message}, _live_max, _nodes), do: Logger.warning(message)
 
   @doc """
   The expected app node count (env `EXPECTED_APP_NODES`, default 2) used as the
