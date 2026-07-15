@@ -179,9 +179,15 @@ defmodule Loopctl.HeavyRead do
   server-side statement_timeout. Also passes the endpoint key via `telemetry_options` so
   slow-query logs can trace which endpoint triggered the query.
 
+  For a pgvector-ANN endpoint (`ann_endpoints/0`) it ALSO carries `:hnsw_ef_search`
+  (US-38.4) — the per-query recall breadth applied via `SET LOCAL hnsw.ef_search` inside
+  the same heavy-read transaction. `all/3`/`one/3`/`all_memory/4` pop it (like
+  `:statement_timeout`) before handing the remaining opts to the repo.
+
   This is the SINGLE source of truth for heavy-read opts — every consumer
   (`Loopctl.Knowledge`, `Loopctl.Audit`) builds opts via this function so the
-  `[timeout, telemetry_options, statement_timeout]` shape can't drift between callers.
+  `[timeout, telemetry_options, statement_timeout, hnsw_ef_search]` shape can't drift
+  between callers.
   Known endpoints are enumerated in `known_endpoints/0`: `:suggested_links`,
   `:semantic_search`, `:distant_pairs`, `:distant_pairs_bridge` (the slower
   `bridge_path=true` branch — its own key so its statement_timeout/slow-query
@@ -198,10 +204,47 @@ defmodule Loopctl.HeavyRead do
   `:llm_usage` (the customer-facing LLM-usage aggregate over `llm_usage_events`, a
   bounded indexed COUNT/GROUP BY — classified LIGHT by the gate).
   """
+  # US-38.4: the pgvector-ANN (kNN) endpoints whose reads order by cosine distance
+  # against the HNSW index and are therefore governed by `hnsw.ef_search`. ONLY these get a per-read
+  # `SET LOCAL hnsw.ef_search` (see `maybe_put_ef_search/2`) — the non-ANN heavy reads
+  # (enumeration/change_feed/ingestion_jobs/sth_incremental/export/llm_usage) never touch
+  # the HNSW index, so setting the GUC on them would be dead work. A subset of
+  # `@known_endpoints` (asserted by the ann-endpoints test).
+  @ann_endpoints ~w(
+    suggested_links
+    semantic_search
+    distant_pairs
+    distant_pairs_bridge
+    novelty
+    vector_search
+    memory_recall
+  )a
+
+  # pgvector's default `hnsw.ef_search` (the per-query search breadth / recall ceiling).
+  @default_hnsw_ef_search 40
+
   @spec opts(atom()) :: keyword()
   def opts(endpoint) when is_atom(endpoint) do
     base = [timeout: 15_000, telemetry_options: [endpoint: endpoint]]
-    Keyword.put(base, :statement_timeout, statement_timeout_for(endpoint))
+
+    base
+    |> Keyword.put(:statement_timeout, statement_timeout_for(endpoint))
+    |> maybe_put_ef_search(endpoint)
+  end
+
+  # US-38.4: attach the per-QUERY `hnsw.ef_search` recall breadth ONLY to the
+  # pgvector-ANN endpoints (`ann_endpoints/0`) — a `SET LOCAL hnsw.ef_search = N`
+  # then piggybacks on the SAME short `SET LOCAL statement_timeout` transaction every
+  # heavy read already runs in (US-27.13), so it adds NO new pool-starvation risk (the
+  # historical objection that per-request `SET LOCAL` "needs a transaction" is stale —
+  # the transaction is already there). Non-ANN endpoints (audit/enumeration/export) get
+  # no ef_search key, so an unused GUC is never set on their connections.
+  defp maybe_put_ef_search(opts, endpoint) do
+    if endpoint in @ann_endpoints do
+      Keyword.put(opts, :hnsw_ef_search, hnsw_ef_search())
+    else
+      opts
+    end
   end
 
   # Every endpoint atom a caller passes to `opts/1` / stamps into `telemetry_options`.
@@ -236,6 +279,31 @@ defmodule Loopctl.HeavyRead do
   """
   @spec known_endpoints() :: [atom()]
   def known_endpoints, do: @known_endpoints
+
+  @doc """
+  The pgvector-ANN endpoints that carry a per-read `hnsw.ef_search` (subset of
+  `known_endpoints/0`).
+  """
+  @spec ann_endpoints() :: [atom()]
+  def ann_endpoints, do: @ann_endpoints
+
+  @doc """
+  The configured per-query `hnsw.ef_search` recall breadth (US-38.4).
+
+  Read from the live-tunable `SystemConfig` key `"hnsw_ef_search"` (a missing row →
+  the pgvector default #{@default_hnsw_ef_search}), so an operator can raise recall
+  fleet-wide with a single `UPDATE` — no redeploy, no per-role `ALTER ROLE`. Clamped to
+  pgvector's accepted `[1, 1000]` range so a bad config value can never make the
+  `SET LOCAL hnsw.ef_search` raise and roll back the read; a value outside the range is
+  pulled to the nearest bound. Applied per-read via `SET LOCAL` inside the heavy-read
+  transaction (`run_timed_transaction/4`).
+  """
+  @spec hnsw_ef_search() :: pos_integer()
+  def hnsw_ef_search do
+    Loopctl.SystemConfig.get_int("hnsw_ef_search", @default_hnsw_ef_search)
+    |> max(1)
+    |> min(1000)
+  end
 
   # The per-endpoint override if a positive int, else the pool-wide default. Always a
   # positive int → every heavy read runs under a SET LOCAL statement_timeout (the
@@ -281,12 +349,13 @@ defmodule Loopctl.HeavyRead do
     # which would silently treat an explicit `0` as truthy and an explicit `nil` as "use
     # default", muddying the always-timed contract.
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
+    {ef, opts} = Keyword.pop(opts, :hnsw_ef_search, nil)
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard!(tenant_id, queryable)
     read_repo = repo_for(endpoint(opts))
 
     gated(tenant_id, opts, on_overload, fn ->
-      with_statement_timeout(read_repo, st, fn -> read_repo.all(query, opts) end)
+      with_statement_timeout(read_repo, st, ef, fn -> read_repo.all(query, opts) end)
     end)
   end
 
@@ -295,12 +364,13 @@ defmodule Loopctl.HeavyRead do
           term() | nil | {:error, :heavy_read_overloaded}
   def one(tenant_id, queryable, opts \\ []) do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
+    {ef, opts} = Keyword.pop(opts, :hnsw_ef_search, nil)
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard!(tenant_id, queryable)
     read_repo = repo_for(endpoint(opts))
 
     gated(tenant_id, opts, on_overload, fn ->
-      with_statement_timeout(read_repo, st, fn -> read_repo.one(query, opts) end)
+      with_statement_timeout(read_repo, st, ef, fn -> read_repo.one(query, opts) end)
     end)
   end
 
@@ -329,12 +399,13 @@ defmodule Loopctl.HeavyRead do
           [term()] | {:error, :heavy_read_overloaded}
   def all_memory(tenant_id, subject_id, queryable, opts \\ []) do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
+    {ef, opts} = Keyword.pop(opts, :hnsw_ef_search, nil)
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard_memory!(tenant_id, subject_id, queryable)
     read_repo = repo_for(endpoint(opts))
 
     gated(tenant_id, opts, on_overload, fn ->
-      with_statement_timeout(read_repo, st, fn -> read_repo.all(query, opts) end)
+      with_statement_timeout(read_repo, st, ef, fn -> read_repo.all(query, opts) end)
     end)
   end
 
@@ -390,8 +461,8 @@ defmodule Loopctl.HeavyRead do
   # positive default, and a non-positive/`nil` value (an explicit mis-call) raises rather than
   # silently running un-timed (US-27.13: every heavy read MUST carry a server-side timeout
   # since the pgbouncer-rejected startup `:parameters` lever is gone).
-  defp with_statement_timeout(read_repo, ms, fun) when is_integer(ms) and ms > 0 do
-    case run_timed_transaction(read_repo, ms, fun) do
+  defp with_statement_timeout(read_repo, ms, ef, fun) when is_integer(ms) and ms > 0 do
+    case run_timed_transaction(read_repo, ms, ef, fun) do
       {:ok, result} ->
         result
 
@@ -404,20 +475,36 @@ defmodule Loopctl.HeavyRead do
     end
   end
 
-  defp with_statement_timeout(_read_repo, ms, _fun) do
+  defp with_statement_timeout(_read_repo, ms, _ef, _fun) do
     raise ArgumentError,
           ":statement_timeout (got #{inspect(ms)}) must be a positive integer (ms)"
   end
 
   # A transaction on `read_repo` that first scopes `SET LOCAL statement_timeout` to THIS
-  # transaction (pgbouncer-safe, US-27.13), then runs `fun`. Mirrors the public
-  # `transaction/2` SET LOCAL, but pinned to the caller-resolved read repo so a
+  # transaction (pgbouncer-safe, US-27.13), then — for a pgvector-ANN read (US-38.4) —
+  # `SET LOCAL hnsw.ef_search` in the SAME transaction, then runs `fun`. Mirrors the
+  # public `transaction/2` SET LOCAL, but pinned to the caller-resolved read repo so a
   # primary-pinned read (US-38.1) both times AND executes on the primary.
-  defp run_timed_transaction(read_repo, ms, fun) do
+  defp run_timed_transaction(read_repo, ms, ef, fun) do
     read_repo.transaction(fn ->
       read_repo.query!("SET LOCAL statement_timeout = #{ms}")
+      maybe_set_ef_search(read_repo, ef)
       fun.()
     end)
+  end
+
+  # `SET LOCAL hnsw.ef_search = N` for an ANN read (US-38.4). Only fired when the caller
+  # (via `HeavyRead.opts/1` for an `ann_endpoints/0` endpoint) supplies a positive integer
+  # — non-ANN reads pass `nil` and set nothing. The value is pre-clamped to pgvector's
+  # accepted `[1, 1000]` by `hnsw_ef_search/0`, and is an integer (not user text), so the
+  # interpolation is injection-safe. Transaction-scoped, so it resets at COMMIT and never
+  # leaks across pooled checkouts. pgvector accepts setting this GUC before the vector
+  # module has loaded in the backend (namespaced placeholder), and the value applies when
+  # the cosine-distance operator in `fun` loads it — the pgvector-documented order.
+  defp maybe_set_ef_search(_read_repo, nil), do: :ok
+
+  defp maybe_set_ef_search(read_repo, ef) when is_integer(ef) and ef > 0 do
+    read_repo.query!("SET LOCAL hnsw.ef_search = #{ef}")
   end
 
   @doc """

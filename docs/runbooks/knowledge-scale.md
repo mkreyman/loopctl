@@ -376,18 +376,38 @@ frees the connection rather than holding it.
 
 `hnsw.ef_search` is a pgvector **custom** GUC that does not exist until the
 extension loads per-session, so it is **NOT** settable via Postgrex `:parameters`
-on managed PG (fly mpg/RDS reject it: *"unrecognized configuration parameter"*).
-It currently stays at the pgvector **default (40)**; recall is handled by
-over-fetch + the US-27.6b under-fill signal.
+on managed PG (fly mpg/RDS reject it: *"unrecognized configuration parameter"* —
+still guarded by `config_pgbouncer_safe_parameters_test.exs`).
 
-If recall must be raised, set it on the **role** (applies per-session after the
-extension loads), NOT via `:parameters`:
+**Primary lever (US-38.4): the live-tunable SystemConfig `hnsw_ef_search` key.**
+It is applied per-ANN-read via `SET LOCAL hnsw.ef_search = <value>` inside the
+SAME short heavy-read transaction that already scopes `SET LOCAL statement_timeout`
+(`Loopctl.HeavyRead.run_timed_transaction/4`) — so there is **no** new
+pool-starvation risk (the pre-US-27.13 "SET LOCAL needs a transaction → #172
+starvation" objection is stale; the transaction is already there). It defaults to
+the pgvector default **40**; recall is handled by over-fetch + the US-27.6b
+under-fill signal + this knob. To raise recall fleet-wide with **no redeploy**:
+
+```sql
+UPDATE system_configs SET value = 100, updated_at = now() WHERE key = 'hnsw_ef_search';
+```
+
+The change is live on this node on write and on every other node within a minute
+(the `SystemConfigRefreshWorker` cron). The value is clamped to pgvector's accepted
+`[1, 1000]` by `Loopctl.HeavyRead.hnsw_ef_search/0`, so a bad value can never make
+the `SET LOCAL` raise. Only the pgvector-ANN endpoints
+(`Loopctl.HeavyRead.ann_endpoints/0`) carry it; non-ANN heavy reads never set the GUC.
+
+**Alternative lever: role-level `ALTER ROLE`** (applies per-session after the
+extension loads) — still works, e.g. for a change that must persist independent of
+the app config table:
 
 ```sql
 ALTER ROLE <heavy_read_role> SET hnsw.ef_search = 100;
 ```
 
-Then confirm through the pool:
+Then confirm a per-ANN-read value through the pool (inside a transaction, since the
+value is `SET LOCAL`):
 
 ```sh
 fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.HeavyReadRepo.query!(\"SHOW hnsw.ef_search\").rows)'"
@@ -431,10 +451,13 @@ dedicated heavy-read pool. It is an ANN-class read (same plan shape as the main 
 connectivity/timeout fault on this advisory probe is fail-soft: the suggestions are still
 returned with no truncation signal rather than failing the request.
 
-**Raising recall** is the `ALTER ROLE … SET hnsw.ef_search` lever above (US-27.11), never a
-per-request `:parameters` or `SET LOCAL` (the latter needs a transaction and re-introduces
-the #172 small-pool starvation). Until ef_search is raised (and verified on fly mpg),
-recall stays at the default and is handled by over-fetch + this under-fill signal.
+**Raising recall** (US-38.4) is the live `SystemConfig hnsw_ef_search` knob (or the
+`ALTER ROLE … SET hnsw.ef_search` lever) documented above — applied per-ANN-read via
+`SET LOCAL hnsw.ef_search` inside the heavy read's EXISTING short transaction, so it no
+longer re-introduces the #172 small-pool starvation (that objection predated US-27.13's
+per-read transaction). It is still never a startup `:parameters` value (pgbouncer rejects
+that). Until an operator raises it, recall stays at the default 40 and is handled by
+over-fetch + this under-fill signal.
 
 ## Metrics & alerting (US-27.15)
 
