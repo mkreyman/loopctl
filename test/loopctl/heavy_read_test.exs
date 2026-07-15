@@ -406,58 +406,11 @@ defmodule Loopctl.HeavyReadTest do
     end
   end
 
-  describe "per-query hnsw.ef_search (US-38.4, TC-38.4.1 query side)" do
-    test "opts/1 attaches :hnsw_ef_search only for pgvector-ANN endpoints" do
-      # Every ANN endpoint carries the configured recall breadth (default 40)...
-      for endpoint <- HeavyRead.ann_endpoints() do
-        assert Keyword.get(HeavyRead.opts(endpoint), :hnsw_ef_search) ==
-                 HeavyRead.hnsw_ef_search(),
-               "expected #{endpoint} opts to carry :hnsw_ef_search"
-      end
-
-      # ...and non-ANN heavy reads never set the GUC.
-      for endpoint <- HeavyRead.known_endpoints() -- HeavyRead.ann_endpoints() do
-        refute Keyword.has_key?(HeavyRead.opts(endpoint), :hnsw_ef_search),
-               "expected non-ANN #{endpoint} opts to NOT carry :hnsw_ef_search"
-      end
-    end
-
-    test "ann_endpoints/0 is a subset of known_endpoints/0 (no drift)" do
-      assert HeavyRead.ann_endpoints() -- HeavyRead.known_endpoints() == []
-    end
-
-    test "hnsw_ef_search/0 reads the SystemConfig default (40) and is clamped to [1, 1000]" do
-      assert HeavyRead.hnsw_ef_search() == 40
-    end
-
-    test "an ANN heavy read issues SET LOCAL hnsw.ef_search inside its transaction" do
-      tenant = fixture(:tenant)
-      q = from(a in Article, where: a.tenant_id == ^tenant.id, select: %{id: a.id})
-
-      captured =
-        Loopctl.PlanAssertions.capture_repo_queries(fn ->
-          HeavyRead.all(tenant.id, q, HeavyRead.opts(:vector_search))
-        end)
-
-      sqls = Enum.map(captured, fn {sql, _params} -> sql end)
-
-      assert Enum.any?(sqls, &(&1 =~ ~r/SET LOCAL hnsw\.ef_search = 40/)),
-             "expected the ANN read to issue SET LOCAL hnsw.ef_search = 40, got: #{inspect(sqls)}"
-    end
-
-    test "a non-ANN heavy read does NOT issue SET LOCAL hnsw.ef_search" do
-      tenant = fixture(:tenant)
-      q = from(a in Article, where: a.tenant_id == ^tenant.id, select: %{id: a.id})
-
-      captured =
-        Loopctl.PlanAssertions.capture_repo_queries(fn ->
-          HeavyRead.all(tenant.id, q, HeavyRead.opts(:change_feed))
-        end)
-
-      sqls = Enum.map(captured, fn {sql, _params} -> sql end)
-
-      refute Enum.any?(sqls, &(&1 =~ ~r/hnsw\.ef_search/)),
-             "expected a non-ANN read to NOT touch hnsw.ef_search, got: #{inspect(sqls)}"
-    end
-  end
+  # NOTE (US-38.4): the per-query `hnsw.ef_search` tests that PRIME the VM-global
+  # `SystemConfig "hnsw_ef_search"` persistent_term key live in the sibling `async: false`
+  # `Loopctl.HeavyReadHnswEfSearchTest` (test/loopctl/heavy_read_hnsw_ef_search_test.exs).
+  # They were split out because that key is also read by real ANN reads in other `async: true`
+  # files (dual_index_recall_test, vector_search_test), so priming it from an async module
+  # would let a concurrent cross-file reader observe the primed value. This file stays
+  # `async: true` — it mutates no global state.
 end

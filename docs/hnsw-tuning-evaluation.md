@@ -11,7 +11,7 @@ technical notes (do not churn indexes without evidence).
 |------|--------|-------|-------------------------|
 | `m` (graph connectivity) | implicit default 16 | **explicit** `config :loopctl, :hnsw_m` = 16 | none (value unchanged) |
 | `ef_construction` (build breadth) | implicit default 64 | **explicit** `config :loopctl, :hnsw_ef_construction` = 64 | none (value unchanged) |
-| `hnsw.ef_search` (query recall breadth) | implicit default 40, only raisable via `ALTER ROLE` | **live-tunable** `SystemConfig "hnsw_ef_search"` = 40, applied per-ANN-read via `SET LOCAL` | none (value unchanged) |
+| `hnsw.ef_search` (query recall breadth) | implicit default 40, only raisable via `ALTER ROLE` | **live-tunable** `SystemConfig "hnsw_ef_search"` = 40, applied per-ANN-read via `SET LOCAL` **only when non-default** (`ALTER ROLE` still honored at the default) | none (value unchanged) |
 | `memories.embedding` dual HNSW index | full + partial | **keep both** (both serve distinct live paths) | none |
 
 Because every chosen value EQUALS today's implicit default, **no reindex DDL is
@@ -37,7 +37,64 @@ from now on (a fresh `mix ecto.reset` or a future table). This keeps the hot
   (default 40), read by `Loopctl.HeavyRead.hnsw_ef_search/0` and applied per-read
   via `SET LOCAL hnsw.ef_search = N` **inside the heavy read's existing
   `SET LOCAL statement_timeout` transaction** (`run_timed_transaction/4`), for the
-  pgvector-ANN endpoints only (`HeavyRead.ann_endpoints/0`).
+  pgvector-ANN endpoints only (`HeavyRead.ann_endpoints/0` — `suggested_links`,
+  `semantic_search`, `novelty`, `vector_search`, `memory_recall`). The `distant_pairs` /
+  `distant_pairs_bridge` self-joins are **excluded**: they are column-to-column
+  (`a.embedding <=> b.embedding`) with no `$const` target, so pgvector's HNSW index — and
+  thus `hnsw.ef_search` — cannot apply (the `Loopctl.Knowledge.CosineLintExceptions`
+  registry records this "no $const target, HNSW N/A" invariant for `do_distant_pairs/7`).
+  The `SET LOCAL` is emitted **only when the configured value differs from the pgvector
+  default** (see the precedence contract below), so at the default no ANN GUC round-trip
+  occurs at all.
+
+### `SystemConfig` vs `ALTER ROLE` precedence (US-38.4 review fix)
+
+An unconditional per-read `SET LOCAL hnsw.ef_search = 40` would silently **shadow** a
+role-level `ALTER ROLE <role> SET hnsw.ef_search = N` — `SET LOCAL` overrides any
+role/session default for its transaction — regressing recall for an operator who raised
+it via the historically-documented (US-27.11/27.13) `ALTER ROLE` lever. The emission is
+therefore gated: `maybe_put_ef_search/2` attaches `:hnsw_ef_search` (→ the `SET LOCAL`)
+**only when `hnsw_ef_search/0` differs from the pgvector default 40**. Resulting contract:
+
+| `SystemConfig hnsw_ef_search` | Per-read `SET LOCAL`? | Effective `ef_search` on an ANN read |
+|-------------------------------|-----------------------|--------------------------------------|
+| 40 (default)                  | no                    | the session/role default → `ALTER ROLE` value if set, else 40 |
+| non-default (e.g. 100)        | `SET LOCAL … = 100`   | 100 (SET LOCAL wins over any role default) |
+
+So `SystemConfig` is the live, no-redeploy **fleet-wide** override; `ALTER ROLE` is a
+role-scoped default that is honored whenever `SystemConfig` is left at 40. (Edge case: to
+force ANN reads to exactly 40 while a higher `ALTER ROLE` default exists, lower the role
+default — `SystemConfig = 40` is treated as "no override".)
+
+### Live-pool verification of `SET LOCAL hnsw.ef_search` (US-38.4 review fix)
+
+The `statement_timeout` `SET LOCAL` was recorded as "verified to enforce against the live
+pool"; the same evidence is now recorded for the `hnsw.ef_search` `SET LOCAL`:
+
+- **Mechanism equivalence (structural).** `hnsw.ef_search` is set by the **same in-transaction
+  `SET LOCAL`** path as `statement_timeout` (`run_timed_transaction/4`: `BEGIN; SET LOCAL
+  statement_timeout; SET LOCAL hnsw.ef_search; SELECT; COMMIT`). pgbouncer's startup-parameter
+  allowlist — the US-27.13 outage's root cause — applies ONLY to connection **startup**
+  parameters, NOT to in-transaction `SET` commands, which pass through transparently under both
+  transaction and session pooling. So the US-27.13 failure mode (a rejected startup parameter
+  crash-looping the pool) is **structurally out of scope** for a `SET LOCAL`, exactly as it is
+  for the already-live-verified `statement_timeout` `SET LOCAL`.
+- **Round-trip evidence (real Postgres + pgvector, through the pooled heavy-read repo).**
+  Confirmed via `Loopctl.HeavyRead.repo()` (the pooled repo): inside a transaction,
+  `SET LOCAL hnsw.ef_search = 123` succeeds and `SHOW hnsw.ef_search` returns `"123"`; after
+  `COMMIT` the value resets (a fresh checkout does not carry it). This holds even though
+  `hnsw.ef_search` is a **namespaced (dotted) placeholder** GUC that Postgres accepts a `SET`
+  for before the extension's shared library has registered it in the backend — the
+  pgvector-documented order the code relies on. The heavy-read test suite exercises the same
+  path (`heavy_read_test.exs` — an ANN read issues `SET LOCAL hnsw.ef_search` against real
+  Postgres; the pin asserts the emitted value).
+- **Live fly-mpg confirmation (operator step, tied to the runbook).** Under the precedence
+  contract above, prod at the default 40 issues **no** `SET LOCAL hnsw.ef_search` — the
+  managed-PG assumption is only exercised once an operator raises the knob. The recall-lever
+  section of `docs/runbooks/knowledge-scale.md` makes that raise step include the live
+  `SET LOCAL … ; SHOW hnsw.ef_search` confirmation through the fly-mpg heavy-read pool (inside
+  a transaction), so the first non-default use IS the recorded live round-trip check before
+  reliance.
 
 ### Why per-request `SET LOCAL hnsw.ef_search` is now safe (the stale objection)
 
@@ -81,8 +138,10 @@ the default graph under-recalling at a materially larger corpus.
 `m`/`ef_construction`/`ef_search` are all unchanged, so recall is unchanged by
 construction. The recall gate (`test/loopctl/memory/scale_recall_test.exs`,
 `test/loopctl/knowledge/vector_search_test.exs`) continues to pass; the builder unit
-test asserts the emitted DDL carries the configured `WITH (...)` and that the ANN
-read path issues `SET LOCAL hnsw.ef_search`.
+test asserts the emitted DDL carries the configured `WITH (...)`, and `heavy_read_test.exs`
+asserts the ANN read path issues `SET LOCAL hnsw.ef_search = N` for a NON-default
+`SystemConfig` value, issues NONE at the default (so a role-level `ALTER ROLE` default is
+not shadowed), and that `hnsw_ef_search/0` clamps an out-of-range value into `[1, 1000]`.
 
 ---
 

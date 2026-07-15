@@ -210,8 +210,11 @@ if config_env() == :prod do
   # pgvector custom GUC `hnsw.ef_search` is NOT settable via :parameters on managed PG — it
   # is applied per-ANN-read via `SET LOCAL hnsw.ef_search` inside that SAME heavy-read
   # transaction (US-38.4), configured live via the SystemConfig `hnsw_ef_search` key
-  # (default 40). The role-level `ALTER ROLE` lever also still works; see
-  # docs/runbooks/knowledge-scale.md.
+  # (default 40) — emitted ONLY when that value differs from the pgvector default. Because a
+  # `SET LOCAL` overrides any role/session default for its transaction, a role-level
+  # `ALTER ROLE <role> SET hnsw.ef_search` lever still works AND is honored whenever
+  # SystemConfig is left at the default (the per-read SET LOCAL never shadows it); a
+  # non-default SystemConfig value wins per-read. See docs/runbooks/knowledge-scale.md.
   #
   # Pool sizes here MUST stay in lockstep with `Loopctl.DbCapacity` (which models the
   # connection budget and is asserted in db_capacity_test.exs). Sizing (AC-27.11.1/.5),

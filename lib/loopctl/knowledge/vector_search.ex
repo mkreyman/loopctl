@@ -83,9 +83,16 @@ defmodule Loopctl.Knowledge.VectorSearch do
   piggybacks on that EXISTING bounded, self-draining transaction with **no new
   starvation risk**. `Loopctl.HeavyRead.opts/1` therefore attaches `:hnsw_ef_search`
   (config `SystemConfig "hnsw_ef_search"`, default 40 = pgvector's default) to every
-  ANN endpoint, applied per-read. An operator raises recall fleet-wide with a single
-  `UPDATE system_configs` — no redeploy, no per-role `ALTER ROLE` (that lever still
-  works too, see `docs/runbooks/knowledge-scale.md`). Recall is thus handled by
+  ANN endpoint **whenever that value differs from the default**, applied per-read. An
+  operator raises recall fleet-wide with a single
+  `UPDATE system_configs` — no redeploy. A role-level
+  `ALTER ROLE <role> SET hnsw.ef_search = N` still works as a role-scoped default and is
+  honored whenever `SystemConfig` is left at the default: the per-read `SET LOCAL` is emitted
+  ONLY for a NON-default `SystemConfig` value, so it never silently shadows the role override
+  (an unconditional `SET LOCAL` at the default would override that role default per-read —
+  the bug this guard avoids). When both are set to non-default values the per-read
+  `SystemConfig` `SET LOCAL` wins for that ANN read; see `docs/runbooks/knowledge-scale.md`.
+  Recall is thus handled by
   **over-fetch + the under-fill signal + the ef_search knob**; the current value stays
   at the default until an operator raises it.
 

@@ -181,8 +181,10 @@ defmodule Loopctl.HeavyRead do
 
   For a pgvector-ANN endpoint (`ann_endpoints/0`) it ALSO carries `:hnsw_ef_search`
   (US-38.4) — the per-query recall breadth applied via `SET LOCAL hnsw.ef_search` inside
-  the same heavy-read transaction. `all/3`/`one/3`/`all_memory/4` pop it (like
-  `:statement_timeout`) before handing the remaining opts to the repo.
+  the same heavy-read transaction — but ONLY when the live `SystemConfig` value differs
+  from pgvector's default (at the default no key is attached, so a role-level `ALTER ROLE`
+  override is not shadowed; see `hnsw_ef_search/0`). `all/3`/`one/3`/`all_memory/4` pop it
+  (like `:statement_timeout`) before handing the remaining opts to the repo.
 
   This is the SINGLE source of truth for heavy-read opts — every consumer
   (`Loopctl.Knowledge`, `Loopctl.Audit`) builds opts via this function so the
@@ -204,17 +206,25 @@ defmodule Loopctl.HeavyRead do
   `:llm_usage` (the customer-facing LLM-usage aggregate over `llm_usage_events`, a
   bounded indexed COUNT/GROUP BY — classified LIGHT by the gate).
   """
-  # US-38.4: the pgvector-ANN (kNN) endpoints whose reads order by cosine distance
-  # against the HNSW index and are therefore governed by `hnsw.ef_search`. ONLY these get a per-read
-  # `SET LOCAL hnsw.ef_search` (see `maybe_put_ef_search/2`) — the non-ANN heavy reads
+  # US-38.4: the pgvector-ANN (kNN) endpoints whose reads run an index-ordered
+  # `ORDER BY (embedding cosine-distance $const) LIMIT k` scan against the HNSW index and are
+  # therefore governed by `hnsw.ef_search`. ONLY these get a per-read `SET LOCAL hnsw.ef_search`
+  # (see `maybe_put_ef_search/2`), and only when the configured value differs from the
+  # pgvector default. The non-ANN heavy reads
   # (enumeration/change_feed/ingestion_jobs/sth_incremental/export/llm_usage) never touch
-  # the HNSW index, so setting the GUC on them would be dead work. A subset of
-  # `@known_endpoints` (asserted by the ann-endpoints test).
+  # the HNSW index, so setting the GUC on them would be dead work.
+  #
+  # `distant_pairs`/`distant_pairs_bridge` are DELIBERATELY EXCLUDED even though they read
+  # `articles.embedding`: they are column-to-column (embedding-to-embedding) cosine-distance
+  # self-joins with NO `$const` target vector, so pgvector's HNSW index cannot apply to them
+  # by nature — the codebase's own `Loopctl.Knowledge.CosineLintExceptions` registers
+  # `do_distant_pairs/7` with exactly that rationale ("no $const target, HNSW N/A").
+  # `hnsw.ef_search` only affects index-ordered `ORDER BY <distance> LIMIT k` kNN scans, so a
+  # `SET LOCAL hnsw.ef_search` on those self-joins would be a no-op round-trip with zero
+  # recall/latency effect. A subset of `@known_endpoints` (asserted by the ann-endpoints test).
   @ann_endpoints ~w(
     suggested_links
     semantic_search
-    distant_pairs
-    distant_pairs_bridge
     novelty
     vector_search
     memory_recall
@@ -233,17 +243,41 @@ defmodule Loopctl.HeavyRead do
   end
 
   # US-38.4: attach the per-QUERY `hnsw.ef_search` recall breadth ONLY to the
-  # pgvector-ANN endpoints (`ann_endpoints/0`) — a `SET LOCAL hnsw.ef_search = N`
-  # then piggybacks on the SAME short `SET LOCAL statement_timeout` transaction every
-  # heavy read already runs in (US-27.13), so it adds NO new pool-starvation risk (the
-  # historical objection that per-request `SET LOCAL` "needs a transaction" is stale —
-  # the transaction is already there). Non-ANN endpoints (audit/enumeration/export) get
-  # no ef_search key, so an unused GUC is never set on their connections.
+  # pgvector-ANN endpoints (`ann_endpoints/0`), and ONLY when the live SystemConfig value
+  # DIFFERS from pgvector's built-in default. A `SET LOCAL hnsw.ef_search = N` then
+  # piggybacks on the SAME short `SET LOCAL statement_timeout` transaction every heavy read
+  # already runs in (US-27.13), so it adds NO new pool-starvation risk (the historical
+  # objection that per-request `SET LOCAL` "needs a transaction" is stale — the transaction
+  # is already there). Non-ANN endpoints (audit/enumeration/export) get no ef_search key, so
+  # an unused GUC is never set on their connections.
+  #
+  # Emitting SET LOCAL ONLY for a NON-default value is deliberate (US-38.4 review fix): a
+  # `SET LOCAL` overrides any role/session default for the duration of its transaction, so
+  # unconditionally setting the pgvector default would silently SHADOW a role-level
+  # `ALTER ROLE <role> SET hnsw.ef_search = N` on every ANN read. Skipping the emission at
+  # the default keeps `SystemConfig` the fleet-wide lever (a non-default value wins per-read)
+  # WITHOUT clobbering a role-level override when `SystemConfig` is left at the default — and
+  # it means the common (default) path issues no ANN GUC round-trip at all.
   defp maybe_put_ef_search(opts, endpoint) do
     if endpoint in @ann_endpoints do
-      Keyword.put(opts, :hnsw_ef_search, hnsw_ef_search())
+      case ef_search_override() do
+        nil -> opts
+        ef -> Keyword.put(opts, :hnsw_ef_search, ef)
+      end
     else
       opts
+    end
+  end
+
+  # The per-read `hnsw.ef_search` value to APPLY via `SET LOCAL`, or `nil` to leave the
+  # session/role default untouched. `nil` exactly when the configured (clamped) value equals
+  # pgvector's built-in default — so a role-level `ALTER ROLE ... SET hnsw.ef_search` override
+  # is honored rather than shadowed by an identical-to-default per-read `SET LOCAL`.
+  @spec ef_search_override() :: pos_integer() | nil
+  defp ef_search_override do
+    case hnsw_ef_search() do
+      @default_hnsw_ef_search -> nil
+      ef -> ef
     end
   end
 
@@ -288,15 +322,21 @@ defmodule Loopctl.HeavyRead do
   def ann_endpoints, do: @ann_endpoints
 
   @doc """
-  The configured per-query `hnsw.ef_search` recall breadth (US-38.4).
+  The configured per-query `hnsw.ef_search` recall breadth (US-38.4), clamped to
+  pgvector's accepted `[1, 1000]` range.
 
   Read from the live-tunable `SystemConfig` key `"hnsw_ef_search"` (a missing row →
   the pgvector default #{@default_hnsw_ef_search}), so an operator can raise recall
-  fleet-wide with a single `UPDATE` — no redeploy, no per-role `ALTER ROLE`. Clamped to
-  pgvector's accepted `[1, 1000]` range so a bad config value can never make the
-  `SET LOCAL hnsw.ef_search` raise and roll back the read; a value outside the range is
-  pulled to the nearest bound. Applied per-read via `SET LOCAL` inside the heavy-read
-  transaction (`run_timed_transaction/4`).
+  fleet-wide with a single `UPDATE` — no redeploy. Clamped so a bad config value can
+  never make the `SET LOCAL hnsw.ef_search` raise and roll back the read; a value outside
+  the range is pulled to the nearest bound.
+
+  NB: this returns the configured value even when it EQUALS the default. Whether a per-read
+  `SET LOCAL` is actually issued is decided by `maybe_put_ef_search/2`: at the default NO
+  `SET LOCAL` fires (so a role-level `ALTER ROLE <role> SET hnsw.ef_search` is honored,
+  never shadowed); a NON-default value is applied per-read via `SET LOCAL` inside the
+  heavy-read transaction (`run_timed_transaction/4`), taking precedence over any role/session
+  default for that ANN read.
   """
   @spec hnsw_ef_search() :: pos_integer()
   def hnsw_ef_search do
