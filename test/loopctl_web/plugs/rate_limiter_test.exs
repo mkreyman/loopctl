@@ -10,8 +10,31 @@ defmodule LoopctlWeb.Plugs.RateLimiterTest do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
   end
 
+  # US-38.2: the plug now resolves the limiter through the `:rate_limiter`
+  # behaviour DI (config/test.exs -> Loopctl.MockRateLimiter), the SAME seam
+  # Provider.Admission uses, so it becomes cluster-global when the Postgres impl
+  # is selected. This stateful stub reproduces the fixed-window counter contract
+  # (post-increment count per bucket, allow while count <= limit) so the plug's
+  # allow/deny/header behaviour is byte-for-byte what the ETS impl produced.
+  defp stub_counting_limiter do
+    {:ok, counts} = Agent.start_link(fn -> %{} end)
+
+    stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window_ms, limit ->
+      count =
+        Agent.get_and_update(counts, fn m ->
+          c = Map.get(m, bucket, 0) + 1
+          {c, Map.put(m, bucket, c)}
+        end)
+
+      if count <= limit, do: {:allow, count}, else: {:deny, limit}
+    end)
+
+    counts
+  end
+
   describe "rate limiting" do
     test "request within limit succeeds with headers", %{conn: conn} do
+      stub_counting_limiter()
       tenant = fixture(:tenant)
       {raw_key, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
@@ -24,6 +47,7 @@ defmodule LoopctlWeb.Plugs.RateLimiterTest do
     end
 
     test "request exceeding limit returns 429", %{conn: _conn} do
+      stub_counting_limiter()
       tenant = fixture(:tenant, %{settings: %{"rate_limit_requests_per_minute" => 3}})
       {raw_key, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
@@ -42,6 +66,7 @@ defmodule LoopctlWeb.Plugs.RateLimiterTest do
     end
 
     test "tenant-level custom rate limit is respected", %{conn: conn} do
+      stub_counting_limiter()
       tenant = fixture(:tenant, %{settings: %{"rate_limit_requests_per_minute" => 5}})
       {raw_key, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
@@ -68,6 +93,55 @@ defmodule LoopctlWeb.Plugs.RateLimiterTest do
       refute conn.halted
       # No rate limit headers for superadmin
       assert get_resp_header(conn, "x-ratelimit-limit") == []
+    end
+  end
+
+  describe "cluster-global DI seam (US-38.2)" do
+    test "the plug resolves the limiter through the :rate_limiter behaviour DI (TC-38.2.3)" do
+      # Proof the plug routes through the SAME config-selected behaviour as
+      # Provider.Admission: when we swap the DI-resolved impl (here the mock,
+      # standing in for the Postgres impl), the plug invokes it. Selecting the
+      # Postgres impl therefore makes this plug cluster-global with no call-site
+      # change. We assert on the bucket keys the plug hands the limiter.
+      test_pid = self()
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, window_ms, _limit ->
+        send(test_pid, {:checked, bucket, window_ms})
+        {:allow, 1}
+      end)
+
+      tenant = fixture(:tenant)
+      {raw_key, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      resp = build_conn() |> auth_conn(raw_key) |> get(~p"/api/v1/tenants/me")
+      assert resp.status == 200
+
+      # Both the per-key and per-tenant checks go through the resolved behaviour,
+      # each with the fixed 60s window.
+      assert_received {:checked, "key:" <> key_id, 60_000}
+      assert_received {:checked, "tenant:" <> tenant_id, 60_000}
+      assert key_id == key.id
+      assert tenant_id == tenant.id
+    end
+
+    test "the plug FAILS OPEN when the limiter raises (limiter outage never blocks all traffic)" do
+      import ExUnit.CaptureLog
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window_ms, _limit ->
+        raise "limiter store is down"
+      end)
+
+      tenant = fixture(:tenant)
+      {raw_key, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      log =
+        capture_log(fn ->
+          resp = build_conn() |> auth_conn(raw_key) |> get(~p"/api/v1/tenants/me")
+          # Fail-open: the request is allowed through, not 429'd.
+          assert resp.status == 200
+        end)
+
+      assert log =~ "failing OPEN"
     end
   end
 end

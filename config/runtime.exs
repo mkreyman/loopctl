@@ -20,6 +20,22 @@ if System.get_env("PHX_SERVER") do
   config :loopctl, LoopctlWeb.Endpoint, server: true
 end
 
+# US-38.2 (Epic 38, GH #353): OPT-IN cluster-global rate limiter.
+#
+# The `:rate_limiter` behaviour impl defaults to node-local ETS
+# (`Loopctl.RateLimiter.Hammer`) — set nowhere, so callers fall back to it —
+# which means any global limit becomes `limit × node_count` across a cluster.
+# Setting `RATE_LIMITER=postgres` selects the shared Postgres-backed impl so the
+# web RPM plug, `Loopctl.Provider.Admission`, and the signup/enroll/retrieve
+# gates all enforce ONE cluster-wide budget with no code change. UNSET (or any
+# other value) leaves today's exact node-local ETS behaviour untouched. This
+# provisions NOTHING — the counter table already ships in a migration; the env
+# var only flips which behaviour impl the DI resolves. Never set to a
+# placeholder value (epic_35 STH_SWEEP_CRON lesson).
+if System.get_env("RATE_LIMITER") == "postgres" do
+  config :loopctl, :rate_limiter, Loopctl.RateLimiter.Postgres
+end
+
 config :loopctl, LoopctlWeb.Endpoint,
   http: [
     port: String.to_integer(System.get_env("PORT", "4000")),
