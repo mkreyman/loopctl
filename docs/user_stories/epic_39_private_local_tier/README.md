@@ -1,6 +1,10 @@
 # Epic 39 — Private / Local-Only Knowledge & Memory (data sovereignty)
 
-**Status: DRAFT / proposal — pending Mark's scope sign-off. NOT yet scheduled for implementation.**
+**Status: DRAFT — PARKED 2026-07-15. Scope confirmed (single-tenant / deployment-level).
+NOT scheduled. Every story MUST go through the enhanced-review workflow (against the
+story text AND the diff) before/at implementation — these are un-reviewed drafts.
+Resume breadcrumbs: GH issue #409 (problem), PR #410 (this draft), and the
+`project_epic_39_private_tier` memory. Pick up on any session/machine.**
 
 Make loopctl a genuine home for **private** data (health, DNA, financial) by letting a
 **self-hosted** instance run the entire knowledge + memory pipeline against **local,
@@ -56,9 +60,9 @@ harvesting sensitive data.
 
 ## Constraints / decisions to confirm with Mark
 
-- **Scope of "configurable dimension":** deployment-level (one dim per self-hosted instance —
-  sufficient for a single-org private deploy) vs per-tenant (needs dim-partitioned tables —
-  much larger). **Draft assumes deployment-level**; per-tenant deferred.
+- **Scope of "configurable dimension": DECIDED (Mark, 2026-07-15) — deployment-level /
+  single-tenant** ("hosted local should mean single tenant, for now"). One dimension per
+  self-hosted instance. Per-tenant (dim-partitioned tables) is explicitly deferred.
 - **Everything agent-native, no UI** (design principle above) — the egress-posture surface is
   an MCP tool + endpoint, not a dashboard.
 - **Embedding-inversion caveat:** stored vectors can partially leak content, so the private
