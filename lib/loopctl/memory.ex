@@ -1104,7 +1104,10 @@ defmodule Loopctl.Memory do
        scoped to prior `:promoted` rows (`nearest_live/2`). If embedding generation is
        unavailable (circuit open / no key / provider error), NO near-dup answer is
        authoritative, so the whole run aborts with `{:error, :embeddings_degraded}` (the
-       worker snoozes/retries rather than risk inserting a duplicate). On a genuine
+       worker snoozes/retries rather than risk inserting a duplicate). Likewise, if the
+       per-tenant HeavyRead gate SHEDS the recall (tenant over its slice), the run aborts
+       with `{:error, :heavy_read_overloaded}` (the recall requests `on_overload: :tag`,
+       so it never raises on this write path) for the same loss-free snooze. On a genuine
        near-match (score ≥ `:memory_promotion_near_dup_threshold`) the new row is inserted
        and the prior memory is `supersede/3`d.
     3. Otherwise the candidate is inserted fresh (`promoted`).
@@ -1120,6 +1123,8 @@ defmodule Loopctl.Memory do
   contract).
 
   Returns `{:ok, summary}` on full success, `{:error, :embeddings_degraded}`,
+  `{:error, :heavy_read_overloaded}` (the per-tenant HeavyRead gate shed the near-dup
+  recall — a loss-free snooze for the worker, treated like `:embeddings_degraded`),
   `{:error, :quota_exceeded, summary}`, or `{:error, other}` (a bad write —
   retryable). `summary` is `%{promoted, superseded, deduped}` (promoted = fresh
   inserts; superseded = insert-and-supersede pairs; deduped = exact-dup skips).
@@ -1127,6 +1132,7 @@ defmodule Loopctl.Memory do
   @spec persist_promotion(Scope.t(), [map()]) ::
           {:ok, map()}
           | {:error, :embeddings_degraded}
+          | {:error, :heavy_read_overloaded}
           | {:error, :quota_exceeded, map()}
           | {:error, term()}
   def persist_promotion(%Scope{subject_id: @eval_subject_id}, _candidates) do
@@ -1147,6 +1153,7 @@ defmodule Loopctl.Memory do
         {:ok, :promoted} -> {:cont, {:ok, %{acc | promoted: acc.promoted + 1}}}
         {:ok, :superseded} -> {:cont, {:ok, %{acc | superseded: acc.superseded + 1}}}
         {:error, :embeddings_degraded} -> {:halt, {:error, :embeddings_degraded}}
+        {:error, :heavy_read_overloaded} -> {:halt, {:error, :heavy_read_overloaded}}
         {:error, :quota_exceeded} -> {:halt, {:error, :quota_exceeded, acc}}
         {:error, other} -> {:halt, {:error, other}}
       end
@@ -1162,6 +1169,9 @@ defmodule Loopctl.Memory do
       case nearest_live(scope, candidate.text) do
         {:error, :embeddings_degraded} ->
           {:error, :embeddings_degraded}
+
+        {:error, :heavy_read_overloaded} = err ->
+          err
 
         {:ok, near_dup_id, embedding} ->
           insert_promoted(scope, candidate, hash, near_dup_id, embedding)
@@ -1197,7 +1207,15 @@ defmodule Loopctl.Memory do
         {:error, :embeddings_degraded}
 
       {:ok, embedding} ->
-        {:ok, find_promoted_near_dup(scope, embedding), embedding}
+        # The near-dup HNSW recall runs on the shared HeavyRead pool behind the
+        # per-tenant TenantGate. Over the tenant's slice the read is SHED
+        # (`on_overload: :tag`) and surfaces as `{:error, :heavy_read_overloaded}` —
+        # propagate it up so the worker snoozes LOSS-FREE rather than raising (which
+        # would burn an Oban attempt on the promotion WRITE path, US-37.5).
+        case find_promoted_near_dup(scope, embedding) do
+          {:error, :heavy_read_overloaded} = err -> err
+          near_dup_id -> {:ok, near_dup_id, embedding}
+        end
     end
   end
 
@@ -1207,10 +1225,22 @@ defmodule Loopctl.Memory do
   # cannot drift from ordinary recall.
   defp find_promoted_near_dup(scope, embedding) do
     query = memory_candidate_query(scope, embedding, @near_dup_recall_pool, false)
+    # `on_overload: :tag` so an over-cap TenantGate shed returns
+    # `{:error, :heavy_read_overloaded}` (mapped to a loss-free snooze upstream)
+    # instead of RAISING an OverloadedError on the promotion write path (US-37.5).
+    opts = Keyword.put(HeavyRead.opts(:memory_recall), :on_overload, :tag)
 
-    scope.tenant_id
-    |> HeavyRead.all_memory(scope.subject_id, query, HeavyRead.opts(:memory_recall))
-    |> Enum.find_value(fn row ->
+    case HeavyRead.all_memory(scope.tenant_id, scope.subject_id, query, opts) do
+      {:error, :heavy_read_overloaded} = err -> err
+      rows when is_list(rows) -> first_promoted_near_dup(rows)
+    end
+  end
+
+  # The id of the nearest `:promoted` row at/above the near-dup threshold (rows are
+  # distance-ordered, nearest first), or nil. An explicit-source near-dup is skipped —
+  # auto-promotion never supersedes a human-authored row (AC-29.2.4).
+  defp first_promoted_near_dup(rows) do
+    Enum.find_value(rows, fn row ->
       score = max(0.0, 1.0 - row.distance)
       if score >= near_dup_threshold() and row.source == :promoted, do: row.id
     end)

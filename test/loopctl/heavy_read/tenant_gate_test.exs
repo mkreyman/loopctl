@@ -249,6 +249,28 @@ defmodule Loopctl.HeavyRead.TenantGateTest do
       assert TenantGate.cap() >= TenantGate.heavy_weight()
       assert TenantGate.cap() > 0
     end
+
+    # US-37.5 review finding: the CAP got clamp_cap/1 hardening, but the sibling WEIGHT
+    # knobs were unvalidated — a non-positive `:heavy_read_weight_heavy|_light` would flow
+    # through weight_for/1 into acquire/4's `weight > 0` guard, miss every clause, and raise
+    # a FunctionClauseError OUTSIDE the acquire rescue (not an OverloadedError → the 429
+    # handler never fires) → a node-wide 500 on every heavy read of that class. The
+    # accessors are now FLOORED at 1, so no weight_for/1 output can ever miss the guard.
+    test "weight accessors are always positive and every endpoint weight satisfies acquire's guard" do
+      assert TenantGate.heavy_weight() >= 1
+      assert TenantGate.light_weight() >= 1
+
+      cap = TenantGate.cap()
+      tenant = Ecto.UUID.generate()
+
+      for ep <- HeavyRead.known_endpoints() do
+        w = TenantGate.weight_for(ep)
+        assert is_integer(w) and w > 0, "endpoint #{inspect(ep)} yielded a non-positive weight"
+        # A positive weight the `weight > 0` guard accepts — no uncaught FunctionClauseError.
+        assert TenantGate.acquire(tenant, w, cap) == :ok
+        TenantGate.release(tenant, w)
+      end
+    end
   end
 
   # Finding #6 (US-37.5 review): weight_for/1's heavy-endpoint list is hand-maintained;
@@ -270,7 +292,8 @@ defmodule Loopctl.HeavyRead.TenantGateTest do
       enumeration: :light,
       change_feed: :light,
       ingestion_jobs: :light,
-      sth_incremental: :light
+      sth_incremental: :light,
+      llm_usage: :light
     }
 
     test "every @heavy_endpoints atom is a known HeavyRead endpoint (no orphan/typo)" do

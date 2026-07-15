@@ -43,4 +43,46 @@ defmodule Loopctl.HeavyReadGuardTest do
         String.contains?(line, "alias Loopctl.HeavyReadRepo")
     end)
   end
+
+  # US-37.5 review finding #5: `@known_endpoints` is documented as the SOURCE OF TRUTH the
+  # TenantGate weight-drift guard partitions into heavy/light. That guard
+  # (`tenant_gate_test.exs`) only checks endpoints ALREADY in `known_endpoints/0`, so an
+  # endpoint introduced the `:llm_usage` way — a literal `HeavyRead.opts(:new_endpoint)`
+  # call added WITHOUT registering it — escaped the guard and silently got LIGHT weight,
+  # under-charging a potentially heavy read. This static scan closes that hole: every
+  # literal atom passed to `HeavyRead.opts/1` (directly or via the `heavy_read_opts/1`
+  # delegate) across `lib/` MUST be a `known_endpoints/0` member, so registering a new
+  # endpoint (and thus making a deliberate heavy/light decision) is unskippable.
+  @opts_call_regex ~r/(?:HeavyRead\.opts|heavy_read_opts)\(:([a-z_]+)\)/
+
+  test "every literal HeavyRead.opts(:endpoint) atom in lib/ is a known endpoint" do
+    known = MapSet.new(Loopctl.HeavyRead.known_endpoints())
+
+    unregistered =
+      @lib_root
+      |> Path.join("**/*.ex")
+      |> Path.wildcard()
+      |> Enum.flat_map(&opts_endpoint_atoms/1)
+      |> Enum.uniq()
+      |> Enum.reject(&MapSet.member?(known, &1))
+
+    assert unregistered == [],
+           "These endpoint atoms are passed to HeavyRead.opts/1 in lib/ but are NOT in " <>
+             "Loopctl.HeavyRead.known_endpoints/0 — register them (with a deliberate " <>
+             "heavy/light weight decision in TenantGate) so the drift guard can see them: " <>
+             inspect(unregistered)
+  end
+
+  # Literal endpoint atoms passed to `opts/1` on non-comment lines of a source file.
+  defp opts_endpoint_atoms(path) do
+    path
+    |> File.read!()
+    |> String.split("\n")
+    |> Enum.reject(&(String.trim_leading(&1) |> String.starts_with?("#")))
+    |> Enum.flat_map(fn line ->
+      @opts_call_regex
+      |> Regex.scan(line, capture: :all_but_first)
+      |> Enum.map(fn [atom] -> String.to_atom(atom) end)
+    end)
+  end
 end

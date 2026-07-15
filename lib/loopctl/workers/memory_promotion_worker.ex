@@ -27,6 +27,10 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
 
     * `{:error, :embeddings_degraded}` (recall fell back) → `{:snooze, n}`; NO
       watermark advance, so a later healthy run re-attempts (AC-29.2.4).
+    * `{:error, :heavy_read_overloaded}` (the per-tenant HeavyRead gate shed the
+      near-dup recall, US-37.5) → `{:snooze, n}`; loss-free backpressure, NO attempt
+      consumed and NO watermark advance, so the promotion re-runs once the tenant's
+      heavy-read burst subsides. Treated exactly like `:embeddings_degraded`.
     * `{:error, :rate_limited_local}` (node-local provider admission gate shut,
       US-37.1) → `{:snooze, n}`; loss-free backpressure, NO attempt consumed and NO
       watermark advance, so the compile re-runs once local demand subsides.
@@ -218,6 +222,15 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
       {:error, :embeddings_degraded} ->
         PromotionTelemetry.emit(:degraded, %{count: 1}, meta(scope, session_id))
         # No watermark advance — retry when embeddings recover.
+        {:snooze, @snooze_seconds}
+
+      {:error, :heavy_read_overloaded} ->
+        # US-37.5: the tenant is over its per-tenant HeavyRead slice, so the near-dup
+        # recall was SHED (`on_overload: :tag`). Snooze LOSS-FREE (no attempt consumed,
+        # no watermark advance) exactly like `:embeddings_degraded` — a raised
+        # OverloadedError would burn an Oban attempt toward max_attempts on the
+        # promotion WRITE path. Retried when the tenant's heavy-read load subsides.
+        PromotionTelemetry.emit(:degraded, %{count: 1}, meta(scope, session_id))
         {:snooze, @snooze_seconds}
 
       {:error, :quota_exceeded, summary} ->

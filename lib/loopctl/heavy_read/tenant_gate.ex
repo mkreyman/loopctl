@@ -87,6 +87,15 @@ defmodule Loopctl.HeavyRead.TenantGate do
   itself never raises (returns the default on miss); the clamp turns any out-of-range
   operator knob into a safe, logged value rather than a node-wide outage.
 
+  The COST WEIGHTS get the same defense: `heavy_weight/0` and `light_weight/0` are FLOORED
+  at 1, so a non-positive `:heavy_read_weight_heavy`/`:heavy_read_weight_light` app-env
+  misconfiguration can never flow through `weight_for/1` into `acquire/4`'s `weight > 0`
+  guard, miss every clause, and raise a `FunctionClauseError` OUTSIDE the acquire rescue
+  (the same node-wide-500 fail-open violation the cap clamp guards against). `clamp_cap/1`
+  additionally caps `heavy_weight/0` at the `pool - 1` ceiling when deriving its floor, so a
+  `heavy_weight >= pool` can't push the cap floor to/above `pool` and silently re-enable
+  monopolization (AC-37.5.5 bundles caps AND weights into the fail-open guarantee).
+
   ## Config — env-driven, live-tunable, node-local (AC-37.5.5)
 
     * `cap/0` (K) — the per-tenant slice. Read via the `"heavy_read_tenant_cap"`
@@ -286,14 +295,21 @@ defmodule Loopctl.HeavyRead.TenantGate do
   """
   @spec clamp_cap(integer()) :: pos_integer()
   def clamp_cap(configured) when is_integer(configured) do
-    lower = heavy_weight()
-    upper = max(lower, pool_size() - 1)
-    clamped = configured |> max(lower) |> min(upper)
+    # The `pool - 1` ceiling ALWAYS wins: it guarantees `N - K >= 1` slots remain for a
+    # tenant's neighbours (no single-tenant monopolization). `heavy_weight/0` is floored at
+    # 1 (weight accessors) AND capped at that ceiling here, so a misconfigured
+    # `heavy_weight >= pool` can't push the clamp FLOOR to/above `pool` and silently yield a
+    # `cap >= pool` (which would re-enable the monopolization the ceiling exists to prevent).
+    # Result: `clamped` always lands in `[1, pool - 1]`, a positive int satisfying
+    # `acquire/4`'s `cap > 0` guard (AC-37.5.5).
+    ceiling = max(1, pool_size() - 1)
+    lower = min(heavy_weight(), ceiling)
+    clamped = configured |> max(lower) |> min(ceiling)
 
     if clamped != configured do
       Logger.warning(
         "HeavyRead.TenantGate: configured cap #{inspect(configured)} out of range " <>
-          "[#{lower}, #{upper}] (heavy_weight..pool-1); clamped to #{clamped}"
+          "[#{lower}, #{ceiling}] (heavy_weight..pool-1); clamped to #{clamped}"
       )
     end
 
@@ -316,13 +332,29 @@ defmodule Loopctl.HeavyRead.TenantGate do
   @spec heavy_endpoints() :: [atom()]
   def heavy_endpoints, do: @heavy_endpoints
 
-  @doc "The in-flight budget a HEAVY endpoint's read consumes (env `:heavy_read_weight_heavy`, default #{@default_heavy_weight})."
-  @spec heavy_weight() :: pos_integer()
-  def heavy_weight, do: Application.get_env(:loopctl, @heavy_weight_env, @default_heavy_weight)
+  @doc """
+  The in-flight budget a HEAVY endpoint's read consumes (env `:heavy_read_weight_heavy`,
+  default #{@default_heavy_weight}).
 
-  @doc "The in-flight budget a LIGHT endpoint's read consumes (env `:heavy_read_weight_light`, default #{@default_light_weight})."
+  FLOORED at 1 (AC-37.5.5): a non-positive operator misconfiguration would otherwise flow
+  through `weight_for/1` into `acquire/4`'s `weight > 0` guard, matching NO clause and
+  raising a `FunctionClauseError` OUTSIDE the acquire rescue — a node-wide 500 on every
+  heavy read of that class (the exact fail-open violation the cap's `clamp_cap/1` was added
+  to prevent). A bad knob degrades to weight 1, not an outage.
+  """
+  @spec heavy_weight() :: pos_integer()
+  def heavy_weight,
+    do: max(1, Application.get_env(:loopctl, @heavy_weight_env, @default_heavy_weight))
+
+  @doc """
+  The in-flight budget a LIGHT endpoint's read consumes (env `:heavy_read_weight_light`,
+  default #{@default_light_weight}). FLOORED at 1 for the same fail-open reason as
+  `heavy_weight/0` — a non-positive knob can never make `acquire/4`'s `weight > 0` guard
+  miss (AC-37.5.5).
+  """
   @spec light_weight() :: pos_integer()
-  def light_weight, do: Application.get_env(:loopctl, @light_weight_env, @default_light_weight)
+  def light_weight,
+    do: max(1, Application.get_env(:loopctl, @light_weight_env, @default_light_weight))
 
   @doc false
   def table_name, do: @table

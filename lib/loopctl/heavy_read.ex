@@ -86,7 +86,9 @@ defmodule Loopctl.HeavyRead do
   `GET /knowledge/ingestion-jobs` COUNT + list over the Oban-owned `oban_jobs` table,
   bounded by a partial expression index), `:sth_incremental` (the US-35.1 bounded
   "entries above the STH checkpoint" tail read over `audit_chain`, folded into the
-  persisted Merkle peaks), and `:export` (the US-27.16 long streamed-export scans).
+  persisted Merkle peaks), `:export` (the US-27.16 long streamed-export scans), and
+  `:llm_usage` (the customer-facing LLM-usage aggregate over `llm_usage_events`, a
+  bounded indexed COUNT/GROUP BY — classified LIGHT by the gate).
   """
   @spec opts(atom()) :: keyword()
   def opts(endpoint) when is_atom(endpoint) do
@@ -114,6 +116,7 @@ defmodule Loopctl.HeavyRead do
     ingestion_jobs
     sth_incremental
     export
+    llm_usage
   )a
 
   @doc """
@@ -309,6 +312,21 @@ defmodule Loopctl.HeavyRead do
   precisely to AVOID holding one transaction (and `xmin`) for the whole client-paced
   download. `stream/3` + `transaction/2` are reserved for a future async/Oban export
   job that builds to object storage off the request path.
+
+  ## GATE EXEMPTION (US-37.5) — deliberate, and the future caller's responsibility
+
+  Unlike `all/3` / `one/3` / `all_memory/4`, `stream/3` is NOT wrapped in the per-tenant
+  `TenantGate` in-flight limiter. Wrapping it correctly is not a simple acquire→run→release
+  `after`: a stream returns a LAZY `Enumerable` enumerated later inside an enclosing
+  `transaction/2`, so the pool connection is held for the whole (client-paced) enumeration,
+  not for this call — a synchronous acquire/release around this function would release the
+  budget BEFORE the read actually runs. It is left ungated ON PURPOSE because there is no
+  production request-path caller today (see the moduledoc: reserved for a future off-request
+  async/Oban export job). That future caller MUST acquire the gate itself for the duration of
+  the enumeration — `TenantGate.acquire(tenant_id, weight, TenantGate.cap())` before opening
+  the transaction and `release/2` in an `after` around the whole stream — or route the read
+  through `all/3` keyset paging (which IS gated) as the current export does. Do NOT add a
+  request-path `stream/3` caller without one of those.
   """
   @spec stream(binary(), Ecto.Queryable.t(), keyword()) :: Enumerable.t()
   def stream(tenant_id, queryable, opts \\ []) do
@@ -325,6 +343,13 @@ defmodule Loopctl.HeavyRead do
   relaxing it for everyone else. `0`/unlimited is intentionally NOT allowed (an
   unbounded hold on the small heavy pool is a DoS surface — set an explicit upper
   bound). Only supported with a 0- or 1-arity function (not an `Ecto.Multi`).
+
+  GATE EXEMPTION (US-37.5): this bare `transaction/2` lever is NOT wrapped in the
+  per-tenant `TenantGate` limiter (it has no `tenant_id` argument and holds the connection
+  for the whole caller-supplied body). Like `stream/3`, it is reserved for a future
+  off-request export job; that caller MUST acquire/release the gate around the transaction
+  itself (see `stream/3`'s "GATE EXEMPTION" note) so a `stream/3` read taken through it is
+  still bounded by the per-tenant slice. Do NOT add a request-path caller without it.
   """
   @spec transaction((-> any()) | (module() -> any()) | Ecto.Multi.t(), keyword()) ::
           {:ok, any()} | {:error, any()}

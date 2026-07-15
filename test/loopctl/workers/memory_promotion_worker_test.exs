@@ -358,6 +358,37 @@ defmodule Loopctl.Workers.MemoryPromotionWorkerTest do
   end
 
   # ---------------------------------------------------------------------------
+  # US-37.5 — HeavyRead per-tenant gate shed on the promotion WRITE path
+  # ---------------------------------------------------------------------------
+
+  describe "perform/1 — HeavyRead gate shed (US-37.5)" do
+    alias Loopctl.HeavyRead.TenantGate
+
+    test "an over-cap near-dup recall SNOOZES loss-free (no attempt burned, no watermark, no rows)" do
+      scope = fixture(:memory_scope, subject_id: "A")
+      stub_embeddings(& &1)
+
+      seed_turns(scope, "s1", ["one", "two"])
+      stub_llm([%{text: "would-be fact", confidence: 0.9}])
+
+      # Saturate THIS (fresh, isolated) tenant's per-tenant HeavyRead in-flight budget so
+      # the near-dup HNSW recall is SHED. Because `find_promoted_near_dup/2` passes
+      # `on_overload: :tag`, the shed returns `{:error, :heavy_read_overloaded}` and
+      # propagates to a loss-free `{:snooze, n}` — NOT a raised OverloadedError that would
+      # burn an Oban attempt toward max_attempts on the write path.
+      cap = TenantGate.cap()
+      assert :ok = TenantGate.acquire(scope.tenant_id, cap, cap)
+      on_exit(fn -> TenantGate.release(scope.tenant_id, cap) end)
+
+      assert {:snooze, _} = run(scope, "s1")
+      # Loss-free: nothing persisted and no watermark advance, so a later run (once the
+      # tenant's heavy-read burst subsides) re-attempts the promotion.
+      assert all_promoted(scope) == []
+      assert watermark(scope, "s1") == nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # TC-29.2.6 — scope isolation
   # ---------------------------------------------------------------------------
 

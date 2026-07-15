@@ -5445,10 +5445,20 @@ defmodule Loopctl.Knowledge do
   # (`a.tenant_id == ^tenant_id`) and is bounded by prior-tag selectivity — NEVER a
   # full-corpus read (the verified plan shape is documented on novelty_distance_query/4).
   defp nearest_prior_distance(tenant_id, embedding, prior_tag, vis) do
-    tenant_id
-    |> novelty_distance_query(embedding, prior_tag, vis)
+    query = novelty_distance_query(tenant_id, embedding, prior_tag, vis)
     # Heavy vector aggregate — dedicated pool via Loopctl.HeavyRead (US-27.11).
-    |> then(&HeavyRead.one(tenant_id, &1, heavy_read_opts(:novelty)))
+    # `on_overload: :tag` (US-37.5): over the tenant's HeavyRead slice the read is SHED
+    # and returns `{:error, :heavy_read_overloaded}` — mapped to a DELIBERATE `nil` novelty
+    # score here (the same graceful degrade a genuinely unscorable idea gets), rather than
+    # RAISING an OverloadedError that the `Task.async_stream` in `novelty_scores/3` would
+    # catch as an incidental `{:exit, _}` and log as a scary task crash. Non-destructive:
+    # nil already means "not scored".
+    opts = Keyword.put(heavy_read_opts(:novelty), :on_overload, :tag)
+
+    case HeavyRead.one(tenant_id, query, opts) do
+      {:error, :heavy_read_overloaded} -> nil
+      distance -> distance
+    end
   end
 
   # The `MIN(embedding <=> $const::vector)` aggregate query, scoped to the prior-tag set.
