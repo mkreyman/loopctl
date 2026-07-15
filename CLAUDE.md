@@ -19,22 +19,26 @@ Refer to `docs/design-system.md` for full specifications. Key points:
 
 ---
 
-## CRITICAL: Load Orchestration State on Every Session Start
+## Agents, workflow, and domain routing
 
-**YOU MUST** load the orchestration protocol and build status from memory-keeper at the start of every conversation:
+This is a **thin, repo-specific** layer. The Elixir engineering roster, thinking/pattern skills, and
+review/ship pipelines live in the machine-global `~/.claude` and are used by name — this file does not
+re-declare them:
 
-```
-mcp__memory-keeper__context_get({ key: "CRITICAL_ALWAYS_READ_FIRST_PRINCIPLES", channel: "loopctl" })
-mcp__memory-keeper__context_get({ key: "build_status", channel: "loopctl" })
-```
+- **Agents:** `elixir-engineer` (implement/fix), `elixir-systems-architect` (design/OTP review),
+  `elixir-test-writer` (ExUnit/TDD), `security-adversary` (custody/security pass), `business-analyst`.
+- **Workflow:** `/review:enhanced-review-workflow` (stack-aware review gate), `implement-plan`
+  (epic → implement → review → merge). Pattern skills: `patterns-ecto`, `patterns-elixir-otp`,
+  `patterns-phoenix-web`, and the `elixir:*-thinking` skills.
 
-These contain:
-- The orchestration loop rules (you are READ-ONLY on code, you dispatch agents)
-- Current build progress (which epics/stories are done)
-- Architectural decisions made during implementation
-- The DI, fixture, and mock patterns to enforce
+Repo-specific domain skills (grounded at `file:line` in the code) — load the matching one before working
+in that area:
 
-**Do NOT proceed with any implementation work until you have loaded and read both keys.**
+| When you touch… | Skill |
+|-----------------|-------|
+| tenant scoping, RLS, migrations, repo choice, heavy/vector reads | `.claude/skills/tenancy-rls` |
+| roles, auth pipeline, story lifecycle, capabilities, dispatch lineage, WebAuthn | `.claude/skills/chain-of-custody` |
+| the wiki, agent memory, context retriever, hybrid search, novelty, curation | `.claude/skills/knowledge-wiki` |
 
 ---
 
@@ -56,8 +60,17 @@ lib/loopctl/
 ├── skills/            # Skill versioning and performance
 ├── quality_assurance/ # UI test runs and findings (project-level QA)
 ├── token_usage/       # Token consumption tracking, budgets, cost anomalies
+├── knowledge/         # Knowledge Wiki: articles, embeddings, novelty gate, hybrid search, curation
+├── memory/            # Agent Memory: private per-agent long_term + session memory
+├── context_retriever/ # Governed structured access to live rows (retrieve_* / entities)
+├── capabilities/      # Signed, single-use capability tokens (custody L1)
+├── dispatches/        # Per-dispatch ephemeral keys + lineage (custody L4)
+├── audit_chain/       # Hash-chained append-only audit log
+├── llm/               # LLM provider clients + config
+├── verification/      # Independent re-execution (custody L3)
 ├── schema.ex          # Base schema macro
-└── repo.ex            # Ecto Repo
+├── repo.ex            # RLS-enforced Ecto Repo (also admin_repo.ex, heavy_read_repo.ex)
+└── heavy_read.ex      # Heavy/vector read path on the dedicated HeavyReadRepo pool
 
 lib/loopctl_web/
 ├── controllers/       # JSON API controllers
@@ -83,7 +96,7 @@ lib/loopctl_web/
 3. **EVERY** query is scoped by RLS policies (SET LOCAL per transaction)
 4. `tenant_id` is **NEVER** in changeset `cast` — always set programmatically
 5. **EVERY** test includes a tenant isolation test case
-6. Two Repos: `Loopctl.Repo` (RLS enforced) and `Loopctl.AdminRepo` (BYPASSRLS for superadmin)
+6. Three Repos: `Loopctl.Repo` (RLS enforced) and `Loopctl.AdminRepo` (BYPASSRLS for superadmin), plus `Loopctl.HeavyReadRepo` (BYPASSRLS, dedicated pool for heavy analytical/vector reads via `Loopctl.HeavyRead` — US-27.11). RLS mechanics and the `with_tenant/2` transaction-owner invariant: `.claude/skills/tenancy-rls`.
 
 ## Security & Trust Model — Mandatory Review Checklist
 
@@ -102,12 +115,14 @@ Higher roles can access lower-role endpoints. The hierarchy is enforced by `Requ
 
 ### Chain-of-Custody Enforcement
 
-The API enforces that nobody marks their own work as done:
-- `POST /stories/:id/report` — `409 self_report_blocked` if caller == assigned_agent_id
-- `POST /stories/:id/review-complete` — `409 self_review_blocked` if caller == assigned_agent_id
-- `POST /stories/:id/verify` — `409 self_verify_blocked` if caller == assigned_agent_id
+The API enforces that nobody marks their own work as done. The check is **dispatch-lineage first**
+(shared lineage prefix between implementer and actor ⇒ blocked), with `assigned_agent_id` equality as the
+pre-dispatch fallback, and it fails closed on a `nil` identity (`lib/loopctl/progress.ex`):
+- `POST /stories/:id/report` — `409 self_report_blocked`
+- `POST /stories/:id/review-complete` — `409 self_review_blocked`
+- `POST /stories/:id/verify` — `409 self_verify_blocked`
 
-**The MCP server must NEVER hold both implementer and reviewer keys in the same process.** The 409 errors are the system working correctly — do not add workarounds.
+**The MCP server must NEVER hold both implementer and reviewer keys in the same process.** The 409 errors are the system working correctly — do not add workarounds. Full model: `.claude/skills/chain-of-custody`.
 
 ### Before Changing Any Role Requirement
 
@@ -184,7 +199,8 @@ Opts are for query parameters (limit, offset, filters) only.
 ## Run Commands
 
 ```bash
-mix precommit          # Full quality gate (compile, format, credo --strict, dialyzer, test)
+mix precommit          # Full quality gate: compile --warnings-as-errors, deps.unlock --check-unused,
+                       # format --check-formatted, credo --strict, deps.audit, dialyzer, test
 mix test               # Run all tests
 mix test --failed      # Re-run failed tests
 mix ecto.reset         # Drop, create, migrate
@@ -199,11 +215,10 @@ mix ecto.reset         # Drop, create, migrate
 ## Key Documents
 
 - **PRD**: `docs/prd.md` — full product requirements
-- **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — 60 stories across 15 epics
+- **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — 200+ stories across 36 epics
 - **Skills**: `skills/loopctl-*.md` — 6 orchestration skills
 - **Orchestration Guide**: `docs/orchestration-guide.md` — methodology: loop, trust model, checkpointing
-- **MCP Server**: `mcp-server/` — 84 typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
-- **Build Status**: memory-keeper key `build_status`, channel `loopctl`
+- **MCP Server**: `mcp-server/` — 87 typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
 
 ## MCP Server
 
@@ -213,11 +228,11 @@ Claude Code agents should use the loopctl MCP tools instead of curl. Install via
 {"mcpServers": {"loopctl": {"command": "npx", "args": ["loopctl-mcp-server"], "env": {"LOOPCTL_SERVER": "https://loopctl.com", "LOOPCTL_ORCH_KEY": "...", "LOOPCTL_AGENT_KEY": "..."}}}}
 ```
 
-Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (84 total). See `mcp-server/README.md` for the full list.
+Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (87 total). See `mcp-server/README.md` for the full list.
 
 ---
 
-## Epic 17: Orchestrator Observability
+## Orchestrator Observability
 
 loopctl supports external observability tooling through its API and data model:
 
@@ -234,81 +249,15 @@ loopctl supports external observability tooling through its API and data model:
   start/end, rule violations, review outcomes) and query them back via the audit API. This allows
   post-run analysis of orchestrator behavior without coupling to any specific AI tool's log format.
 
-## Epic 28: Agent Memory — `memory_*` vs `knowledge_*`
+## Agent information surfaces (three) — memory vs knowledge vs retrieve
 
-loopctl gives agents a **private per-agent memory** subsystem (`Loopctl.Memory`,
-tables `memories` / `session_memories`) that is DISTINCT from the shared Knowledge
-Wiki. Full reference: [`docs/agent-memory.md`](docs/agent-memory.md). Pick the
-right surface:
-
-- **`memory_*` (Agent Memory)** — PRIVATE to the caller's `(tenant, subject_id)`
-  scope. Use for facts/preferences/observations THIS agent learned about ITS task
-  or user and needs to recall later — not worth curating for others. `long_term`
-  facts are vector-embedded + semantically recalled; `session` turns are
-  chronological + TTL-pruned. Tools: `memory_remember`, `memory_recall`,
-  `memory_list`, `memory_forget`.
-- **`knowledge_*` (Knowledge Wiki)** — SHARED, curated tenant knowledge (patterns,
-  decisions, findings, references), deduped by the novelty gate, linked and
-  conflict-resolved. Use when the insight is worth ANOTHER agent reading. Tools:
-  `knowledge_create`, `knowledge_search`, etc.
-
-Rule of thumb: *"worth another agent reading?"* → `knowledge_create`. *"a fact only
-I need to recall about my own work?"* → `memory_remember`. Scope is derived from
-your key server-side — you never pass `tenant_id`/`subject_id`. loopctl is
-agent-native (no memory UI); operator oversight is the superadmin API path.
-
-## Epic 30: Context Retriever — three surfaces (`retrieve_*` vs `knowledge_*` vs `memory_*`)
-
-Epic 30 adds a THIRD agent information surface (`Loopctl.ContextRetriever`, tables
-`entity_definitions`) alongside the Knowledge Wiki and Agent Memory. Full
-reference: [`docs/context-retriever.md`](docs/context-retriever.md). Pick by what
-the data IS:
-
-- **`retrieve_*` (Context Retriever)** — GOVERNED, structured access to loopctl's
-  own live rows (`projects`/`stories`/`epics`). A tenant admin declares an
-  **entity** (typed, server-allowlisted fields) over `/api/v1/entities`; the
-  generator emits per-entity `cr_filter_*`/`cr_search_*` tools (dynamic,
-  per-tenant, appended to ListTools from `GET /api/v1/retrieve/tools`); a `cr_*`
-  call dispatches to `POST /api/v1/retrieve/:entity`. Every query is
-  parameterized (no model SQL), dual tenant-scoped (RLS `loopctl_app` role +
-  explicit predicate), execute-time allowlist-rechecked, shaped to declared
-  columns only, audited (fail-closed), and rate-limited. Use when you'd query
-  live operational state by a structured filter or full-text search.
-- **`knowledge_*` (Knowledge Wiki)** — SHARED, curated tenant DOCUMENTS. Use when
-  the insight is worth another agent reading.
-- **`memory_*` (Agent Memory)** — PRIVATE `(tenant, subject_id)` working memory.
-  Use for facts only THIS agent needs to recall about its own work.
-
-Rule of thumb: *live structured business row?* → `retrieve_*`. *worth another
-agent reading?* → `knowledge_create`. *a fact only I need?* → `memory_remember`.
-Defining an entity is a security root (role ≥ `user` + human-anchor); querying is
-authenticated-only. You never pass `tenant_id` — scope is key-derived.
-
-## Epic 31: Hybrid (curated + RAG) Knowledge Retrieval
-
-Epic 31 adds a **capability of the Knowledge Wiki layer** — not a fourth agent
-surface — that resolves a query to EITHER a governed **curated** answer OR a
-semantic/keyword **retrieval** result, on one uniform shape carrying
-`meta.provenance` (`:curated`/`:retrieved`). Full reference:
-[`docs/knowledge-hybrid-retrieval.md`](docs/knowledge-hybrid-retrieval.md).
-
-- **`Loopctl.Knowledge.hybrid_search/3`** (`knowledge_hybrid_search` tool /
-  `POST /api/v1/knowledge/hybrid_search`) — `:curated` wins ONLY when a governed
-  curated source's ABSOLUTE (never pool-relative) confidence score clears a
-  scale-matched threshold AND beats the best retrieved candidate by a margin AND
-  is authoritative (not superseded/conflicted). Otherwise `:retrieved` — a
-  near-but-wrong curated doc NEVER wins by default just because a pool is
-  sparse. Both branches share identical `results`/`meta` key sets — callers
-  branch on `meta.provenance` alone, never on which subsystem answered.
-- **Progressive disclosure** (`knowledge_progressive_index` /
-  `knowledge_progressive_drill`, `GET /api/v1/knowledge/progressive_index` /
-  `GET /api/v1/knowledge/progressive/:id`) — a cheap, top-K-capped, curated-
-  preferred topic browse (compact stubs, no bodies) with one hop of `:relates_to`
-  hub enrichment, then a full-body drill into a chosen stub. A fuzzy/paraphrased
-  topic can miss a lexically-dissimilar curated article — use `hybrid_search/3`
-  when you need the governed provenance decision instead.
-- **#305/#306 are the same feature** (this epic implements both) — recommend
-  closing one as a duplicate of the other rather than tracking them separately.
+loopctl exposes three distinct agent-facing information surfaces plus a hybrid retrieval capability.
+Pick by **what the data is**: a private fact only this agent needs (`memory_*`), a shared document worth
+another agent reading (`knowledge_*`), or a governed query over loopctl's own live rows (`retrieve_*`).
+The routing rules, the novelty/dedup gate, hybrid-search provenance, and the KB-content curation
+carve-out are grounded and cited in **`.claude/skills/knowledge-wiki`**; AGENTS.md carries the same
+quick-reference routing. Full references: `docs/agent-memory.md`, `docs/context-retriever.md`,
+`docs/knowledge-hybrid-retrieval.md`.
 
 ## Elixir / Phoenix guidelines
 

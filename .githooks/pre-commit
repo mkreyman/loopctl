@@ -1,0 +1,39 @@
+#!/bin/bash
+# Repo-local pre-commit — DOC-AWARE quality gate.
+#
+# Replaces the machine-global mix-precommit hook for THIS repo's checkout
+# (activate with: git config core.hooksPath .githooks). It keeps the FULL gate
+# for code, but for a docs/harness-only commit (CLAUDE.md, .claude/**, *.md) it
+# runs a light leak scan instead of the whole Elixir toolchain + Dialyzer + a
+# test DB. It NEVER bypasses: any staged Elixir source runs the real
+# `mix precommit`, exactly as CI does.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+if [ -n "${GIT_COMMIT_NO_VERIFY:-}" ]; then
+  echo "❌ Pre-commit bypass detected — fix the issues instead."; exit 1
+fi
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$STAGED" ] && exit 0
+
+# --- Code staged? -> full mix precommit (the same gate CI runs) ---------------
+if echo "$STAGED" | grep -qE '\.(ex|exs|heex|eex)$'; then
+  echo "🔍 code change detected — running full mix precommit"
+  if [ -f "/usr/local/opt/asdf/libexec/asdf.sh" ]; then source /usr/local/opt/asdf/libexec/asdf.sh
+  elif [ -f "$HOME/.asdf/asdf.sh" ]; then source "$HOME/.asdf/asdf.sh"; fi
+  exec mix precommit
+fi
+
+# --- Docs/harness-only -> light gate: secret/leak scan on ADDED lines ---------
+echo "🔍 docs-only commit — skipping mix precommit; leak-scanning staged additions"
+LEAK_RE='(AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[baprs]-[0-9A-Za-z-]{10,}|gh[pousr]_[0-9A-Za-z]{20,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})'
+ADDED=$(git diff --cached --unified=0 -- $STAGED | grep '^+' | grep -v '^+++' || true)
+if printf '%s\n' "$ADDED" | grep -InE "$LEAK_RE" >/dev/null 2>&1; then
+  echo "❌ leak scan: a possible secret was added — remove it before committing:"
+  printf '%s\n' "$ADDED" | grep -InE "$LEAK_RE" | head -5
+  exit 1
+fi
+
+echo "✅ docs-only pre-commit passed (leak scan clean)"
+exit 0
