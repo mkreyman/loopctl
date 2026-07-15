@@ -26,9 +26,10 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      reason a nightly pass is valuable rather than a no-op: an article orphaned
      in January (no neighbor cleared the similarity threshold at the time) can
      find neighbors that were ingested months later. Re-linking is deterministic,
-     cheap, and makes **no** embedding-API calls (orphans missing an embedding
-     simply no-op in the linking worker — backfilling those is a separate
-     concern, out of scope here).
+     cheap, and makes **no** embedding-API calls. Orphans missing an embedding
+     can't link until they have one, so they are routed to the per-tenant BATCH
+     drainer (`Loopctl.Workers.BatchEmbeddingWorker`, one job per tenant — review
+     MED #3) rather than one embedding job per article.
   3. **Surfaces all findings** via an immutable audit event
      (`knowledge.lint_completed`) carrying the full lint summary, so
      contradictions / coverage gaps / broken sources / stale counts are
@@ -61,8 +62,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
-  alias Loopctl.Workers.ArticleEmbeddingWorker
   alias Loopctl.Workers.ArticleLinkingWorker
+  alias Loopctl.Workers.BatchEmbeddingWorker
 
   # Ask lint for the ceiling so we act on as many orphans per run as the engine
   # will return; the true (pre-cap) totals still come back in the summary.
@@ -132,9 +133,10 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # Orphans split two ways:
   #   * has an embedding -> re-link at the lenient orphan threshold (its nearest
   #     neighbor is usually a near-miss of the default 0.6 cutoff).
-  #   * no embedding -> it can NEVER link until it has one, so enqueue the
-  #     embedding worker (which chains to linking on success). These are the
-  #     articles a plain re-link silently no-ops on.
+  #   * no embedding -> it can NEVER link until it has one, so route it through the
+  #     per-tenant BATCH drainer (a SINGLE job coalesces the whole orphan backlog
+  #     into array calls — review MED #3; the drainer chains linking on store).
+  #     These are the articles a plain re-link silently no-ops on.
   defp act_on_orphans(tenant_id, report) do
     max_relink =
       Application.get_env(:loopctl, :knowledge_lint_max_orphan_relink, @default_max_orphan_relink)
@@ -167,11 +169,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       |> Oban.insert()
     end)
 
-    Enum.each(without_embedding, fn id ->
-      %{"article_id" => id, "tenant_id" => tenant_id}
-      |> ArticleEmbeddingWorker.new()
+    # review MED #3 (AC-37.4.2): route orphans that still need an embedding through
+    # the BATCH path, NOT one ArticleEmbeddingWorker per article. These orphans are
+    # published with `embedding IS NULL`, so they are already in the per-tenant
+    # pending set — a single batch drainer (unique per tenant+kind) coalesces the
+    # whole orphan backlog into array calls instead of re-introducing the per-item,
+    # N-provider-round-trip fan-out this story exists to eliminate.
+    if without_embedding != [] do
+      BatchEmbeddingWorker.new(%{tenant_id: tenant_id, kind: "article"})
       |> Oban.insert()
-    end)
+    end
 
     %{relinked: length(with_embedding), embedding_enqueued: length(without_embedding)}
   end

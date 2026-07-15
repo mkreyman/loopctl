@@ -133,6 +133,63 @@ defmodule Loopctl.KnowledgeEmbeddingTest do
       assert length(Pgvector.to_list(reloaded.embedding)) == 1536
     end
 
+    test "review MED #2: a published content update marks the vector STALE without destroying it" do
+      %{tenant: tenant} = setup_tenant()
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      embedding = List.duplicate(0.1, 1536)
+
+      assert {:ok, _} = Knowledge.update_embedding(tenant.id, article.id, embedding, "old-hash")
+
+      # Manual Oban mode: the content-change enqueues the batch drainer but does NOT
+      # run it, so we can observe the intermediate state — the OLD vector must still
+      # be present (searchable) with a staleness marker, not nulled.
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, _updated} =
+                 Knowledge.update_article(tenant.id, article.id, %{body: "brand new body"})
+      end)
+
+      assert {:ok, reloaded} = Knowledge.get_article_with_embedding(tenant.id, article.id)
+      # Old vector SURVIVES the async gap (does not drop out of vector search).
+      assert reloaded.embedding != nil
+      assert length(Pgvector.to_list(reloaded.embedding)) == 1536
+      # But it is flagged stale so the drainer re-embeds it.
+      assert reloaded.embedding_stale_at != nil
+
+      # And it re-enters the pending set on that stale marker (vector still present).
+      pending_ids = Knowledge.list_articles_pending_embedding(tenant.id, 50) |> Enum.map(& &1.id)
+      assert article.id in pending_ids
+    end
+
+    test "review MED #2: storing a fresh vector clears the staleness marker" do
+      %{tenant: tenant} = setup_tenant()
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      assert {:ok, _} =
+               Knowledge.update_embedding(
+                 tenant.id,
+                 article.id,
+                 List.duplicate(0.1, 1536),
+                 "hash"
+               )
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, _} = Knowledge.update_article(tenant.id, article.id, %{body: "changed"})
+      end)
+
+      # The drainer's store path re-embeds and must clear the stale flag.
+      assert {:ok, _} =
+               Knowledge.update_embedding(
+                 tenant.id,
+                 article.id,
+                 List.duplicate(0.2, 1536),
+                 "new-hash"
+               )
+
+      assert {:ok, reloaded} = Knowledge.get_article_with_embedding(tenant.id, article.id)
+      assert reloaded.embedding_stale_at == nil
+      assert Knowledge.list_articles_pending_embedding(tenant.id, 50) == []
+    end
+
     test "create_changeset does not include embedding in cast fields" do
       # Verify :embedding is not in @cast_fields by attempting to cast it
       changeset =

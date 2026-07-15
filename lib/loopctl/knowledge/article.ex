@@ -64,6 +64,11 @@ defmodule Loopctl.Knowledge.Article do
     # SHA-256 hex of the exact text that produced `embedding` — the idempotency key
     # that lets ArticleEmbeddingWorker skip re-calling the paid provider on retry.
     field :embedding_content_hash, :string
+    # US-37.4 (review MED #2): non-destructive staleness marker. A content edit of
+    # an already-embedded article sets this instead of nulling `embedding`, so the
+    # CURRENT vector stays searchable until the batch drainer computes the new one.
+    # Storing a fresh vector CLEARS it (`embedding_changeset/3`).
+    field :embedding_stale_at, :utc_datetime_usec
 
     # GOVERNED curated (authoritative) marker (US-31.1). Deliberately EXCLUDED from
     # `@cast_fields` and `update_changeset/2` — writable ONLY via `curation_changeset/3`
@@ -278,8 +283,14 @@ defmodule Loopctl.Knowledge.Article do
   @spec embedding_changeset(%__MODULE__{}, list(number()) | nil, String.t() | nil) ::
           Ecto.Changeset.t()
   def embedding_changeset(article, embedding, content_hash \\ nil) do
+    # Writing a fresh vector clears the staleness marker (review MED #2): the new
+    # vector is, by definition, current — so the row leaves the pending set.
     article
-    |> change(%{embedding: embedding, embedding_content_hash: content_hash})
+    |> change(%{
+      embedding: embedding,
+      embedding_content_hash: content_hash,
+      embedding_stale_at: nil
+    })
     |> validate_embedding_dimensions()
   end
 

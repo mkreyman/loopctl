@@ -53,6 +53,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
+  alias Loopctl.Knowledge.EmbeddingClient
   alias Loopctl.Knowledge.EmbeddingConcurrency
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.OKF
@@ -796,14 +797,18 @@ defmodule Loopctl.Knowledge do
 
   @doc """
   US-37.4: lists up to `limit` PUBLISHED articles for `tenant_id` that still need
-  an embedding — those with `embedding IS NULL`. A brand-new published article
-  starts NULL; a content change re-nulls the vector at the enqueue site (see
-  `maybe_enqueue_embedding/3`) so the article re-enters this pending set and the
-  batch drainer re-embeds it.
+  an embedding — those with `embedding IS NULL` (never embedded) OR
+  `embedding_stale_at IS NOT NULL` (embedded, but content changed since — the
+  vector is present-but-stale). A brand-new published article starts NULL; a
+  content change sets `embedding_stale_at` at the enqueue site (see
+  `maybe_enqueue_embedding/3`) WITHOUT destroying the current vector (review MED
+  #2), so the article stays searchable until the batch drainer re-embeds it and
+  clears the flag.
 
-  `embedding IS NULL` (NOT `embedding_content_hash IS NULL`) is the deliberate
-  signal: `update_embedding/3` legitimately sets a vector with a nil hash, so a
-  hash-based predicate would loop-re-embed those rows forever.
+  The predicate deliberately keys on `embedding IS NULL`/`embedding_stale_at`
+  (NOT `embedding_content_hash IS NULL`): `update_embedding/3` legitimately sets a
+  vector with a nil hash, so a hash-based predicate would loop-re-embed those rows
+  forever.
 
   Returns lightweight `%{id, title, body}` rows (tenant-scoped by the explicit
   predicate — AC-37.4.4 isolation) for `Loopctl.Workers.BatchEmbeddingWorker` to
@@ -817,10 +822,31 @@ defmodule Loopctl.Knowledge do
       when is_binary(tenant_id) and is_integer(limit) and limit > 0 do
     from(a in Article,
       where: a.tenant_id == ^tenant_id and a.status == :published,
-      where: is_nil(a.embedding),
+      where: is_nil(a.embedding) or not is_nil(a.embedding_stale_at),
       order_by: [asc: a.updated_at, asc: a.id],
       limit: ^limit,
       select: %{id: a.id, title: a.title, body: a.body}
+    )
+    |> AdminRepo.all()
+  end
+
+  @doc """
+  US-37.4 (review HIGH #1): the DISTINCT set of tenant_ids that still have at
+  least one PUBLISHED article needing an embedding (`embedding IS NULL` or
+  `embedding_stale_at IS NOT NULL`). Drives the periodic
+  `Loopctl.Workers.PendingEmbeddingSweepWorker` backstop, which re-enqueues a
+  per-tenant batch drainer — the real safety net against a coalesced drainer
+  never being re-inserted (Oban uniqueness dedup) after a post-drain write.
+
+  Cross-tenant read via `AdminRepo`; backed by `articles_pending_embedding_idx`.
+  """
+  @spec tenant_ids_with_pending_article_embeddings() :: [Ecto.UUID.t()]
+  def tenant_ids_with_pending_article_embeddings do
+    from(a in Article,
+      where: a.status == :published,
+      where: is_nil(a.embedding) or not is_nil(a.embedding_stale_at),
+      distinct: true,
+      select: a.tenant_id
     )
     |> AdminRepo.all()
   end
@@ -7347,6 +7373,17 @@ defmodule Loopctl.Knowledge do
   # never killed-then-miscounted as a breaker failure (review #10).
   @embedding_yield_ms 5_000
 
+  # Task.yield budget for a BATCH (array) embedding call is DERIVED at call time
+  # from `EmbeddingClient.batch_yield_budget_ms/0` (review MED #1) — never a fixed
+  # constant. That budget is computed from the SAME live-tunable SystemConfig knobs
+  # the batch request uses (`embedding_batch_receive_timeout_ms` *
+  # (`embedding_max_retries` + 1) + backoff + slack), so an operator raising either
+  # knob raises the yield in lockstep and a slow-but-valid array response always
+  # returns before the guard kills the task (which would mis-record a breaker /
+  # provider-error failure — review LOW #7). The single-text `@embedding_yield_ms`
+  # (5s) would wrongly shut a legitimate 30s+ array call down.
+  defp batch_embedding_yield_ms, do: EmbeddingClient.batch_yield_budget_ms()
+
   @doc """
   Generate an embedding for the given text with a PER-TENANT circuit breaker and
   timeout protection.
@@ -7420,7 +7457,10 @@ defmodule Loopctl.Knowledge do
   interactive single-text callers are UNCHANGED — this is a background-only path.
 
   `opts`:
-    * `:timeout` — Task.yield budget in ms (default `#{@embedding_yield_ms}`).
+    * `:timeout` — Task.yield budget in ms. Defaults to
+      `EmbeddingClient.batch_yield_budget_ms/0`, DERIVED from the batch client's
+      live-tunable receive-timeout and retry knobs so it always stays above the
+      client's worst case (review MED #1 / LOW #7).
   """
   @spec generate_embeddings(Ecto.UUID.t(), [String.t()], keyword()) ::
           {:ok, [[float()]]} | {:error, term()}
@@ -7437,7 +7477,10 @@ defmodule Loopctl.Knowledge do
     if circuit_open?(tenant_id) do
       {:error, :circuit_open}
     else
-      timeout = Keyword.get(opts, :timeout, @embedding_yield_ms)
+      # Default DERIVED from the batch client's live-tunable receive_timeout/retry
+      # knobs (review MED #1) — never the single-text 5s budget, which would kill a
+      # valid in-flight array request.
+      timeout = Keyword.get(opts, :timeout, batch_embedding_yield_ms())
       run_embedding_batch_task(tenant_id, texts, timeout)
     end
   end
@@ -7686,7 +7729,7 @@ defmodule Loopctl.Knowledge do
   end
 
   defp embedding_client do
-    Application.get_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient)
+    Application.get_env(:loopctl, :embedding_client, EmbeddingClient)
   end
 
   # US-37.2: the per-node embedding-concurrency gate, resolved via config-based DI
@@ -7721,15 +7764,18 @@ defmodule Loopctl.Knowledge do
   defp maybe_enqueue_embedding(multi, tenant_id, true) do
     Multi.run(multi, :embedding_job, fn repo, %{article: article} ->
       if article.status == :published do
-        # US-37.4: re-null an ALREADY-embedded article's vector (+hash) after a
-        # content change so it re-enters the `embedding IS NULL` pending set and the
-        # per-tenant batch drainer re-embeds it. A brand-new article already has
-        # embedding=NULL, so restrict the update to embedded rows. Then enqueue ONE
-        # per-tenant batch worker (unique per tenant+kind) instead of a per-article
-        # job, so many near-simultaneous writes coalesce into a single array call.
+        # US-37.4 (review MED #2): mark an ALREADY-embedded article's vector STALE
+        # (non-destructively) after a content change so it re-enters the pending set
+        # WITHOUT dropping out of vector search / novelty scoring during the async
+        # gap. The CURRENT vector stays searchable until the batch drainer computes
+        # and overwrites it (which clears `embedding_stale_at`). A brand-new article
+        # already has embedding=NULL, so restrict the mark to embedded rows. Then
+        # enqueue ONE per-tenant batch worker (unique per tenant+kind) instead of a
+        # per-article job, so many near-simultaneous writes coalesce into a single
+        # array call.
         repo.update_all(
           from(a in Article, where: a.id == ^article.id and not is_nil(a.embedding)),
-          set: [embedding: nil, embedding_content_hash: nil]
+          set: [embedding_stale_at: DateTime.utc_now()]
         )
 
         BatchEmbeddingWorker.new(%{tenant_id: tenant_id, kind: "article"})

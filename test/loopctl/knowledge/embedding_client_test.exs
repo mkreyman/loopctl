@@ -253,4 +253,48 @@ defmodule Loopctl.Knowledge.EmbeddingClientTest do
       refute_received {:auth, ["Bearer test-openai-key-BBBB"]}
     end
   end
+
+  describe "review MED #1: batch_yield_budget_ms/0 is DERIVED from the live client knobs" do
+    # We set the persistent_term cache directly (the documented SystemConfig key
+    # format) and erase it on exit — same pattern as admission_test.exs. Intra-file
+    # tests run serially so the default is restored before the next test; the only
+    # cross-file reader of these keys is this derivation and the (mocked) client, so
+    # a transient value can never flake another test.
+    defp put_config(key, value) do
+      pt_key = {Loopctl.SystemConfig, key}
+      :persistent_term.put(pt_key, value)
+      on_exit(fn -> :persistent_term.erase(pt_key) end)
+    end
+
+    test "the default budget stays strictly ABOVE the client's default receive window" do
+      # Defaults: 30_000 * (0 + 1) + 4_000*0 + 2_000 = 32_000 (the old hard-coded yield).
+      assert EmbeddingClient.batch_max_retries() == 0
+      assert EmbeddingClient.batch_receive_timeout_ms() == 30_000
+      assert EmbeddingClient.batch_yield_budget_ms() == 32_000
+      assert EmbeddingClient.batch_yield_budget_ms() > EmbeddingClient.batch_receive_timeout_ms()
+    end
+
+    test "raising receive_timeout raises the yield in lockstep (no longer a 32s constant)" do
+      # The exact regression: an operator raising the receive timeout above the old
+      # 32s constant would have made the guard's Task.yield fire FIRST, killing a
+      # valid slow response. The derived budget must track it and stay above.
+      put_config("embedding_batch_receive_timeout_ms", 60_000)
+
+      budget = EmbeddingClient.batch_yield_budget_ms()
+      assert budget == 62_000
+      assert budget > EmbeddingClient.batch_receive_timeout_ms()
+    end
+
+    test "each client-side retry widens the yield by another receive window + backoff" do
+      put_config("embedding_batch_receive_timeout_ms", 30_000)
+      put_config("embedding_max_retries", 2)
+
+      # 30_000 * (2 + 1) + 4_000 * 2 + 2_000 = 100_000, comfortably above the
+      # worst-case HTTP window of receive_timeout * attempts = 90_000.
+      assert EmbeddingClient.batch_yield_budget_ms() == 100_000
+
+      worst_case_http = EmbeddingClient.batch_receive_timeout_ms() * (2 + 1)
+      assert EmbeddingClient.batch_yield_budget_ms() > worst_case_http
+    end
+  end
 end

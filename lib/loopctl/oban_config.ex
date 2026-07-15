@@ -415,6 +415,13 @@ defmodule Loopctl.ObanConfig do
          {"45 4 * * *", Loopctl.Workers.PromotionEvalWorker, args: %{"mode" => "all_tenants"}},
          {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
          {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
+         # US-37.4 (review HIGH #1): periodic backstop that re-enqueues a per-tenant
+         # BatchEmbeddingWorker drainer for any tenant with pending/stale embeddings —
+         # the real safety net for records a coalesced drainer's Oban-uniqueness
+         # deduped away after a post-drain write (indefinite stranding for memories,
+         # which have no other re-embed path). Enqueues are unique-deduped, so a tick
+         # overlapping a live drainer is a cheap no-op.
+         {"*/5 * * * *", Loopctl.Workers.PendingEmbeddingSweepWorker},
          # Cross-tenant memory-promotion sweep (Epic 29 / US-29.2). Runs every 10 min —
          # KEEP this in sync with :memory_promotion_sweep_interval_seconds (600) below,
          # which is the data form of this schedule that the boot invariant reasons over.

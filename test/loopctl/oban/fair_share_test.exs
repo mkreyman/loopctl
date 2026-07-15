@@ -16,8 +16,15 @@ defmodule Loopctl.Oban.FairShareTest do
   # Oban-owned and has no RLS, so we insert through AdminRepo (as FairShare reads).
   # Direct struct/changeset insert does NOT run the job (unlike Oban.insert under
   # :inline), which is exactly what we need to simulate occupied slots.
+  # FairShare counts by (queue, state, tenant) regardless of worker, so the seeded
+  # worker string is arbitrary. Use a synthetic placeholder (NOT a real worker
+  # module) so these fixtures don't couple to any specific worker's lifecycle — e.g.
+  # a future removal of the now-batch-superseded single-item ArticleEmbeddingWorker
+  # (US-37.4 review LOW) can't silently break them.
+  @seed_worker "Loopctl.Test.FairShareSeedWorker"
+
   defp seed_job(tenant_id, queue, state, opts \\ []) do
-    worker = Keyword.get(opts, :worker, "Loopctl.Workers.ArticleEmbeddingWorker")
+    worker = Keyword.get(opts, :worker, @seed_worker)
 
     %{"tenant_id" => tenant_id}
     |> Oban.Job.new(worker: worker, queue: to_string(queue))
@@ -78,7 +85,7 @@ defmodule Loopctl.Oban.FairShareTest do
       # A different worker (even on the same queue string) must not be counted by the
       # worker-scoped backlog — the count keys on `worker`, so it rides the partial index.
       seed_job(tenant, :ingestion, "available", worker: "Loopctl.Workers.SomeOtherWorker")
-      seed_job(tenant, :embeddings, "available", worker: "Loopctl.Workers.ArticleEmbeddingWorker")
+      seed_job(tenant, :embeddings, "available", worker: @seed_worker)
 
       assert FairShare.in_flight_ingestion_backlog(tenant) == 1
     end

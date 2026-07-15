@@ -39,6 +39,60 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
 
   @default_base_url "https://api.openai.com/v1"
 
+  # Default batch HTTP knobs — a literal mirror of the seeded SystemConfig rows;
+  # these in-code defaults apply on a cache miss (safe degrade). Kept here (not in
+  # the guard) so the guard's Task.yield budget can be DERIVED from the SAME
+  # numbers the request actually uses (review MED #1).
+  @default_batch_receive_timeout_ms 30_000
+  @default_batch_max_retries 0
+  # Per-retry backoff allowance: `retry: :transient` sleeps between attempts
+  # (Req's exponential backoff), so each extra retry adds a receive window PLUS a
+  # backoff sleep. Budget generously for the sleep so a retrying-but-valid call
+  # still returns before the guard fires.
+  @batch_retry_backoff_ms 4_000
+  # Fixed slack above the worst-case HTTP budget for task scheduling / DB overhead.
+  @batch_yield_slack_ms 2_000
+
+  @doc """
+  The live-tunable per-request receive timeout (ms) the batch array call uses
+  (`embedding_batch_receive_timeout_ms`, default #{@default_batch_receive_timeout_ms}).
+  """
+  @spec batch_receive_timeout_ms() :: pos_integer()
+  def batch_receive_timeout_ms do
+    SystemConfig.get_int("embedding_batch_receive_timeout_ms", @default_batch_receive_timeout_ms)
+  end
+
+  @doc """
+  The live-tunable client-side retry count for a batch array call
+  (`embedding_max_retries`, default #{@default_batch_max_retries}). Floored at 0.
+  """
+  @spec batch_max_retries() :: non_neg_integer()
+  def batch_max_retries do
+    max(SystemConfig.get_int("embedding_max_retries", @default_batch_max_retries), 0)
+  end
+
+  @doc """
+  Worst-case wall-clock budget (ms) for a batch array call, DERIVED from the same
+  live-tunable SystemConfig knobs `do_post_batch/4` actually reads:
+  `receive_timeout * (max_retries + 1)` plus a per-retry backoff allowance and a
+  fixed slack.
+
+  The guarded batch path (`Loopctl.Knowledge.generate_embeddings/3`) uses this as
+  its `Task.yield` budget, so raising `embedding_batch_receive_timeout_ms` or
+  `embedding_max_retries` can NEVER make the yield fire BEFORE a valid in-flight
+  response returns (review MED #1). Previously the yield was a compile-time 32s
+  constant while these knobs were operator-tunable with no coupling — an operator
+  raising either defeated the guard, killing valid slow responses and
+  mis-counting them as breaker / provider-error failures.
+  """
+  @spec batch_yield_budget_ms() :: pos_integer()
+  def batch_yield_budget_ms do
+    retries = batch_max_retries()
+
+    batch_receive_timeout_ms() * (retries + 1) + @batch_retry_backoff_ms * retries +
+      @batch_yield_slack_ms
+  end
+
   @impl true
   def generate_embedding(tenant_id, text) when is_binary(tenant_id) do
     case Llm.resolve(tenant_id, :embedding) do
@@ -85,8 +139,8 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
         json: %{input: texts, model: model},
         headers: [{"authorization", "Bearer #{api_key}"}],
         retry: :transient,
-        max_retries: SystemConfig.get_int("embedding_max_retries", 0),
-        receive_timeout: SystemConfig.get_int("embedding_batch_receive_timeout_ms", 30_000)
+        max_retries: batch_max_retries(),
+        receive_timeout: batch_receive_timeout_ms()
       ]
       |> maybe_put_plug()
 

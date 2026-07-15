@@ -286,6 +286,16 @@ defmodule Loopctl.Memory do
       # US-37.4: enqueue ONE per-tenant batch drainer (unique per tenant+kind)
       # instead of a per-memory job, so a bulk `remember` burst coalesces into
       # array batches (~100/call) rather than one provider round-trip per memory.
+      #
+      # ACCEPTED BOUNDED-STALENESS TRADEOFF (review LOW #3): the drainer's Oban
+      # uniqueness spans non-terminal states, so a memory written just after an
+      # EXECUTING drainer's final fetch (but before it finishes) dedupes against that
+      # still-running job and isn't embedded by it. Until re-embedded the row is
+      # `embedding IS NULL` and invisible to semantic `Memory.recall/2`. This is
+      # SELF-HEALING and time-bounded: `PendingEmbeddingSweepWorker` (cron `*/5`)
+      # re-enqueues a drainer for any tenant with pending memories, so recall
+      # staleness is capped at ~one sweep interval — not a correctness loss. (The
+      # narrower snooze-continuation window is even shorter; see BatchEmbeddingWorker.)
       BatchEmbeddingWorker.new(%{tenant_id: memory.tenant_id, kind: "memory"})
     end)
     |> AdminRepo.transaction()
@@ -1516,6 +1526,26 @@ defmodule Loopctl.Memory do
       order_by: [asc: m.inserted_at, asc: m.id],
       limit: ^limit,
       select: %{id: m.id, text: m.text}
+    )
+    |> Loopctl.AdminRepo.all()
+  end
+
+  @doc """
+  US-37.4 (review HIGH #1): the DISTINCT set of tenant_ids with at least one
+  long-term memory still needing an embedding (`embedding IS NULL`). Drives the
+  periodic `Loopctl.Workers.PendingEmbeddingSweepWorker` backstop — the real
+  safety net for MEMORIES, which (unlike articles) had NO nightly re-embed path,
+  so a coalesced drainer deduped away by Oban uniqueness after a post-drain write
+  would otherwise strand `embedding IS NULL` memories indefinitely.
+
+  Cross-tenant read via `AdminRepo`; backed by `memories_pending_embedding_idx`.
+  """
+  @spec tenant_ids_with_pending_embeddings() :: [String.t()]
+  def tenant_ids_with_pending_embeddings do
+    from(m in MemorySchema,
+      where: is_nil(m.embedding),
+      distinct: true,
+      select: m.tenant_id
     )
     |> Loopctl.AdminRepo.all()
   end
