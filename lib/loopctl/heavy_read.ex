@@ -60,6 +60,111 @@ defmodule Loopctl.HeavyRead do
   @spec repo() :: module()
   def repo, do: Application.get_env(:loopctl, :heavy_read_repo, Loopctl.HeavyReadRepo)
 
+  # US-38.1: endpoints whose reads are CONSISTENCY-COUPLED to a primary read and therefore
+  # MUST run on the primary pool even when a read replica is configured
+  # (`REPLICA_DATABASE_URL`). `:sth_incremental` reads `audit_chain` entry hashes that are
+  # folded together with the chain HEAD (`latest_entry/1`, AdminRepo) and the STH CHECKPOINT
+  # (`load_valid_checkpoint/2`, AdminRepo) read from the PRIMARY in the SAME
+  # `Loopctl.AuditChain.sign_and_store_tree_head/1` operation. An async replica lagging by k
+  # entries would return only `[0..N-k]` for a tail bounded at the primary head N, so the
+  # signer would fold an INCOMPLETE tail and emit a WRONG signed Merkle root LABELED at
+  # position N — violating the audit chain's "never emit a wrong signed root" invariant and
+  # poisoning the next incremental checkpoint. Pinning the pool keeps ALL of HeavyRead's
+  # protections (per-read `SET LOCAL statement_timeout`, tenant guard, TenantGate); only the
+  # backing pool changes. The pin is GATED on a distinct replica actually being configured
+  # (`Loopctl.DbCapacity.replica_configured?/0`): with NO replica it is INERT — `repo_for/1`
+  # keeps EVERY endpoint (pinned ones included) on the heavy-read pool (`repo/0`), byte-identical
+  # to pre-US-38.1 (STH reads never move onto AdminRepo's tight write pool just because
+  # `primary_repo/0` defaults to AdminRepo != HeavyReadRepo). Only once `REPLICA_DATABASE_URL`
+  # routes other heavy reads to a lagging replica do the pinned endpoints divert to
+  # `primary_repo/0` to stay on the same snapshot as the head/checkpoint reads.
+  @primary_pinned_endpoints ~w(sth_incremental)a
+
+  @doc """
+  Heavy-read endpoints PINNED to the primary pool (never the read replica) — US-38.1.
+
+  A read tagged with one of these endpoints is consistency-coupled to a primary read and
+  runs on `primary_repo/0` even when `REPLICA_DATABASE_URL` is configured. See the
+  `@primary_pinned_endpoints` note for why `:sth_incremental` cannot tolerate replica lag.
+  """
+  @spec primary_pinned_endpoints() :: [atom()]
+  def primary_pinned_endpoints, do: @primary_pinned_endpoints
+
+  @doc """
+  The PRIMARY BYPASSRLS repo — the pool backing consistency-coupled heavy reads
+  (`primary_pinned_endpoints/0`) once a distinct read replica is configured.
+
+  Resolved via config DI (defaults to `Loopctl.AdminRepo`, which is the primary BYPASSRLS
+  pool in prod and the sandbox repo in test). It is only CONSULTED by `repo_for/1` when a
+  distinct replica is configured (`Loopctl.DbCapacity.replica_configured?/0`); with NO replica
+  `repo_for/1` never routes here, so routing stays byte-identical to `repo/0` even though
+  `primary_repo/0` (AdminRepo) is NOT the same module as `repo/0` (HeavyReadRepo) in prod.
+  """
+  @spec primary_repo() :: module()
+  def primary_repo, do: Application.get_env(:loopctl, :heavy_read_primary_repo, Loopctl.AdminRepo)
+
+  @doc false
+  # Which repo backs a read for `endpoint`: the PRIMARY pool for a consistency-coupled
+  # endpoint (`primary_pinned_endpoints/0`) ONLY when a distinct replica is configured, else the
+  # resolved heavy-read pool (`repo/0`, which targets the replica when `REPLICA_DATABASE_URL`
+  # is set). Delegates the pure decision to `route_repo/4` (the DI seam). Public (arity-1 atom)
+  # so the pinning invariant is unit-testable.
+  @spec repo_for(atom() | nil) :: module()
+  def repo_for(endpoint) do
+    route_repo(endpoint, Loopctl.DbCapacity.replica_configured?(), repo(), primary_repo())
+  end
+
+  @doc false
+  # Pure routing decision (DI seam). Under `mix test` `repo() == primary_repo() == AdminRepo`,
+  # so a `repo_for/1` equality assertion is tautological and cannot catch the prod
+  # AdminRepo/HeavyReadRepo divergence; this arity-4 form takes the resolved repos as arguments
+  # so the pin is testable with DISTINCT sentinel modules WITHOUT `Application.put_env`.
+  #
+  # A consistency-coupled endpoint is pinned to the PRIMARY pool ONLY when a distinct read
+  # replica is actually configured. With NO replica, every endpoint (pinned ones included) stays
+  # on the heavy-read pool (`repo`), keeping routing byte-identical to pre-US-38.1 — no STH read
+  # is diverted onto AdminRepo's tight write pool.
+  @spec route_repo(atom() | nil, boolean(), module(), module()) :: module()
+  def route_repo(endpoint, replica_configured?, repo, primary_repo) do
+    if replica_configured? and endpoint in @primary_pinned_endpoints do
+      primary_repo
+    else
+      repo
+    end
+  end
+
+  @doc false
+  # US-38.1 boot readiness probe (AC-38.1.2): a trivial round-trip on the resolved heavy-read
+  # pool (the REPLICA when `REPLICA_DATABASE_URL` is configured). Lives here — the sole
+  # sanctioned toucher of the heavy-read pool — so `Loopctl.ReplicaReadiness` can fail loud at
+  # boot on an unreachable replica WITHOUT itself referencing `Loopctl.HeavyReadRepo` (which
+  # the build guard forbids). Returns `:ok` or `{:error, reason}`; never raises.
+  @spec probe() :: :ok | {:error, term()}
+  def probe do
+    case repo().query("SELECT 1", [], timeout: 5_000) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    e -> {:error, e}
+  end
+
+  @doc false
+  # US-38.1: the REPLICA pool's live `max_connections`, read through the sole sanctioned
+  # toucher of the heavy-read pool so `Loopctl.DbCapacity` can budget the replica-side pool at
+  # boot WITHOUT referencing `Loopctl.HeavyReadRepo` directly (the build guard forbids it —
+  # same reason `probe/0` lives here). Returns `{:ok, n}` or `{:error, reason}`; never raises.
+  @spec replica_max_connections() :: {:ok, pos_integer()} | {:error, term()}
+  def replica_max_connections do
+    case repo().query("SHOW max_connections", [], timeout: 5_000) do
+      {:ok, %{rows: [[raw]]}} -> {:ok, String.to_integer(raw)}
+      {:ok, other} -> {:error, {:unexpected_result, other}}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    e -> {:error, e}
+  end
+
   @doc """
   Per-read options for a heavy endpoint (US-27.4): the 15s CLIENT timeout backstop plus
   the SERVER-SIDE `:statement_timeout` — the per-endpoint override (config
@@ -86,7 +191,10 @@ defmodule Loopctl.HeavyRead do
   `GET /knowledge/ingestion-jobs` COUNT + list over the Oban-owned `oban_jobs` table,
   bounded by a partial expression index), `:sth_incremental` (the US-35.1 bounded
   "entries above the STH checkpoint" tail read over `audit_chain`, folded into the
-  persisted Merkle peaks), `:export` (the US-27.16 long streamed-export scans), and
+  persisted Merkle peaks — PRIMARY-PINNED per `primary_pinned_endpoints/0`: it is
+  consistency-coupled to the chain head/checkpoint read from the primary in the same STH
+  sign, so it never runs on a lagging read replica), `:export` (the US-27.16 long
+  streamed-export scans), and
   `:llm_usage` (the customer-facing LLM-usage aggregate over `llm_usage_events`, a
   bounded indexed COUNT/GROUP BY — classified LIGHT by the gate).
   """
@@ -175,9 +283,10 @@ defmodule Loopctl.HeavyRead do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard!(tenant_id, queryable)
+    read_repo = repo_for(endpoint(opts))
 
     gated(tenant_id, opts, on_overload, fn ->
-      with_statement_timeout(st, fn -> repo().all(query, opts) end)
+      with_statement_timeout(read_repo, st, fn -> read_repo.all(query, opts) end)
     end)
   end
 
@@ -188,9 +297,10 @@ defmodule Loopctl.HeavyRead do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard!(tenant_id, queryable)
+    read_repo = repo_for(endpoint(opts))
 
     gated(tenant_id, opts, on_overload, fn ->
-      with_statement_timeout(st, fn -> repo().one(query, opts) end)
+      with_statement_timeout(read_repo, st, fn -> read_repo.one(query, opts) end)
     end)
   end
 
@@ -221,9 +331,10 @@ defmodule Loopctl.HeavyRead do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard_memory!(tenant_id, subject_id, queryable)
+    read_repo = repo_for(endpoint(opts))
 
     gated(tenant_id, opts, on_overload, fn ->
-      with_statement_timeout(st, fn -> repo().all(query, opts) end)
+      with_statement_timeout(read_repo, st, fn -> read_repo.all(query, opts) end)
     end)
   end
 
@@ -273,12 +384,14 @@ defmodule Loopctl.HeavyRead do
     |> Keyword.get(:endpoint)
   end
 
-  # Run `fun` under a per-read SET LOCAL statement_timeout. There is NO un-timed path:
-  # `all/one` always resolve a positive default, and a non-positive/`nil` value (an explicit
-  # mis-call) raises rather than silently running un-timed (US-27.13: every heavy read MUST
-  # carry a server-side timeout since the pgbouncer-rejected startup `:parameters` lever is gone).
-  defp with_statement_timeout(ms, fun) when is_integer(ms) and ms > 0 do
-    case transaction(fun, statement_timeout: ms) do
+  # Run `fun` under a per-read SET LOCAL statement_timeout on `read_repo` (US-38.1: the
+  # caller-resolved pool — the primary for consistency-coupled endpoints, else the
+  # replica-capable heavy-read pool). There is NO un-timed path: `all/one` always resolve a
+  # positive default, and a non-positive/`nil` value (an explicit mis-call) raises rather than
+  # silently running un-timed (US-27.13: every heavy read MUST carry a server-side timeout
+  # since the pgbouncer-rejected startup `:parameters` lever is gone).
+  defp with_statement_timeout(read_repo, ms, fun) when is_integer(ms) and ms > 0 do
+    case run_timed_transaction(read_repo, ms, fun) do
       {:ok, result} ->
         result
 
@@ -291,9 +404,20 @@ defmodule Loopctl.HeavyRead do
     end
   end
 
-  defp with_statement_timeout(ms, _fun) do
+  defp with_statement_timeout(_read_repo, ms, _fun) do
     raise ArgumentError,
           ":statement_timeout (got #{inspect(ms)}) must be a positive integer (ms)"
+  end
+
+  # A transaction on `read_repo` that first scopes `SET LOCAL statement_timeout` to THIS
+  # transaction (pgbouncer-safe, US-27.13), then runs `fun`. Mirrors the public
+  # `transaction/2` SET LOCAL, but pinned to the caller-resolved read repo so a
+  # primary-pinned read (US-38.1) both times AND executes on the primary.
+  defp run_timed_transaction(read_repo, ms, fun) do
+    read_repo.transaction(fn ->
+      read_repo.query!("SET LOCAL statement_timeout = #{ms}")
+      fun.()
+    end)
   end
 
   @doc """
@@ -350,6 +474,13 @@ defmodule Loopctl.HeavyRead do
   off-request export job; that caller MUST acquire/release the gate around the transaction
   itself (see `stream/3`'s "GATE EXEMPTION" note) so a `stream/3` read taken through it is
   still bounded by the per-tenant slice. Do NOT add a request-path caller without it.
+
+  REPLICA WRITE-SAFETY (US-38.1): unlike `all/3`/`one/3`, this lever hands the caller-supplied
+  body the resolved repo (`invoke/1` → `fun.(repo())`), which — when `REPLICA_DATABASE_URL` is
+  configured — is the read replica. A body is READ-ONLY BY CONTRACT: it must never call a
+  write (`repo.insert!/1` etc.). This is upheld by two layers — no such writing caller exists
+  in `lib/` (there is no request-path `transaction/2` caller at all), AND a real read replica
+  is physically read-only and rejects writes. Keep both true: any future body stays reads-only.
   """
   @spec transaction((-> any()) | (module() -> any()) | Ecto.Multi.t(), keyword()) ::
           {:ok, any()} | {:error, any()}

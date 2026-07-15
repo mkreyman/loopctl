@@ -49,7 +49,33 @@ defmodule Loopctl.HeavyReadRepo do
   other than `Loopctl.HeavyRead` does.
 
   In dev/test it connects with the same credentials as `Repo`/`AdminRepo`; in
-  production it uses the BYPASSRLS role (`ADMIN_DATABASE_URL`).
+  production it targets `REPLICA_DATABASE_URL` when an operator sets it (a future gated
+  infra op), else falls back to the primary's BYPASSRLS role (`ADMIN_DATABASE_URL`) —
+  see `Loopctl.DbCapacity.resolve_replica_url/2`. When `REPLICA_DATABASE_URL` is UNSET the
+  resolved DSN is byte-identical to today, so heavy reads still hit the primary. A
+  configured replica DSN MUST have the SAME BYPASSRLS read-role capabilities as today's
+  admin role (role parity), and MUST only ever back reads through `Loopctl.HeavyRead`
+  (never a write). It MUST also be a PHYSICALLY read-only replica (writes rejected) — the
+  second layer of the replica write-safety guarantee (see `Loopctl.HeavyRead.transaction/2`).
+  `prepare: :unnamed` below and the per-read `SET LOCAL statement_timeout` are pgbouncer-safety
+  and apply to the replica path unchanged.
+
+  ## Fail loud at boot on an unreachable replica (US-38.1, AC-38.1.2)
+
+  A default Ecto/Postgrex pool connects ASYNCHRONOUSLY and retries in the background, so this
+  pool does NOT fail on its own against an unreachable DSN — `start_link` returns `{:ok, _}`
+  and the app boots. To honour "fail loud at boot" rather than degrade silently to query-time
+  500s, `Loopctl.ReplicaReadiness.assert_reachable!/0` runs a boot-time `SELECT 1` probe (prod
+  only, ONLY when a distinct replica is configured) and RAISES if the replica stays
+  unreachable, aborting boot. See that module.
+
+  ## Consistency-coupled reads stay on the primary (US-38.1)
+
+  Not every heavy read may run on a lagging async replica: reads tagged with a
+  `Loopctl.HeavyRead.primary_pinned_endpoints/0` endpoint (today `:sth_incremental`, the
+  audit-chain STH Merkle read) are consistency-coupled to primary reads and run on the primary
+  pool regardless of `REPLICA_DATABASE_URL` — routing them to a replica lagging by k entries
+  would sign a WRONG audit root. All OTHER heavy reads use this replica-capable pool.
   """
 
   use Ecto.Repo,
