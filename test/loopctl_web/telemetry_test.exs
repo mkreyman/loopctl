@@ -26,5 +26,9 @@ defmodule LoopctlWeb.TelemetryTest do
     test "also still includes the pre-existing tenant-label gate refresh (regression guard)" do
       assert {ScaleMetrics, :refresh_tenant_label_gate, []} in LoopctlWeb.Telemetry.periodic_measurements()
     end
+
+    test "includes poll_cluster_readiness/0 (US-38.3, AC-38.3.2)" do
+      assert {ScaleMetrics, :poll_cluster_readiness, []} in LoopctlWeb.Telemetry.periodic_measurements()
+    end
   end
 end

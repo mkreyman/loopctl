@@ -65,7 +65,8 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.oban.jobs.executing_orphan.count",
     "loopctl.oban.poll.error.count",
     "loopctl.ingestion.backlog_gate.failed_open.count",
-    "loopctl.knowledge.article_linking.corpus_size"
+    "loopctl.knowledge.article_linking.corpus_size",
+    "loopctl.cluster.peers.count"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this
@@ -102,7 +103,10 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                   :state,
                   :queue,
                   :poller,
-                  :error_class
+                  :error_class,
+                  # US-38.3: clustering-readiness peer gauge — bounded 3-value status
+                  # (`:single_node`/`:clustered`/`:expected_peers_missing`), never a node name.
+                  :status
                 ])
 
   defp scale_metrics, do: ScaleMetrics.scale_metrics()
@@ -1056,6 +1060,47 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       # The default ScaleAlerts ETS table is not owned by anyone in :test.
       assert :ets.info(:loopctl_scale_alerts) == :undefined
+    end
+  end
+
+  describe "cluster-readiness peer gauge (US-38.3, AC-38.3.2)" do
+    test "the gauge is a last_value tagged by :status ONLY (bounded, no node names)" do
+      gauge = metric("loopctl.cluster.peers.count")
+
+      assert %Telemetry.Metrics.LastValue{} = gauge
+      assert gauge.tags == [:status]
+      refute :tenant_id in gauge.tags
+    end
+
+    test "cluster_peers_tags/1 emits ONLY the bounded status (defaults missing to \"unknown\")" do
+      assert ScaleMetrics.cluster_peers_tags(%{status: :single_node}) == %{status: :single_node}
+      assert ScaleMetrics.cluster_peers_tags(%{status: :clustered}) == %{status: :clustered}
+      assert ScaleMetrics.cluster_peers_tags(%{}) == %{status: "unknown"}
+    end
+
+    test "poll_cluster_readiness/0 emits the peer-count gauge with the readiness status and returns :ok" do
+      ref = make_ref()
+      handler_id = {:cluster_peers_test, ref}
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :cluster, :peers],
+        fn _event, measurements, metadata, _cfg ->
+          send(parent, {:cluster_peers, ref, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assert :ok == ScaleMetrics.poll_cluster_readiness()
+
+      assert_receive {:cluster_peers, ^ref, %{count: count}, %{status: status}}
+      # On the (single) test node this is the 'clustering not required' state — a
+      # peer COUNT (never a node-name list) and a bounded status.
+      assert is_integer(count)
+      assert status in [:single_node, :clustered, :expected_peers_missing]
     end
   end
 end
