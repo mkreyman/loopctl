@@ -812,6 +812,33 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       assert_receive {:semantic_fallback, _m, %{reason: "embedding_circuit_open"}}
     end
 
+    test "US-37.3 (AC-37.3.5): a 429 throttle storm trips the breaker → keyword fallback, never a 500" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      keyword_article(tenant.id)
+
+      # US-37.3: 429 is now a COUNTABLE (throttle) failure — three trip the breaker.
+      # Before the split it was breaker-exempt, so a 429 storm never opened it.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 429, :provider_error, 30}}
+      end)
+
+      # Each call degrades to keyword-only (never a 500) — tagged by the provider
+      # status while the breaker is still closed.
+      for _ <- 1..3 do
+        assert {:ok, %{meta: _}} = Knowledge.search_combined(tenant.id, "testing")
+      end
+
+      attach_fallback_handler(tenant.id)
+
+      # Breaker now open: generate_embedding short-circuits to :circuit_open (no
+      # client call, no hot retry into the throttling provider) and combined search
+      # still returns {:ok, ...} keyword results — the fail-safe.
+      assert {:ok, %{meta: meta}} = Knowledge.search_combined(tenant.id, "testing")
+      assert meta.fallback_reason == "embedding_circuit_open"
+      assert_receive {:semantic_fallback, _m, %{reason: "embedding_circuit_open"}}
+    end
+
     test "embedding OK but semantic EMPTY -> semantic_result_count: 0, no fallback, distinct telemetry" do
       %{tenant: tenant} = setup_tenant()
       Knowledge.reset_circuit_breaker(tenant.id)

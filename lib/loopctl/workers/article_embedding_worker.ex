@@ -24,13 +24,25 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
      vector-searchable until the tenant configures a key.
   7. On a PERMANENT provider error (a 4xx other than 408/429 — bad/revoked key),
      `{:discard, {:embedding_permanent_error, _}}` (review #5): retrying a revoked
-     key 3× is pointless. Transient errors (5xx / network / timeout / circuit-open)
-     return `{:error, reason}` for Oban retry.
+     key 3× is pointless. Transient errors (5xx / network / timeout) return
+     `{:error, reason}` for Oban retry.
+  8. On `{:error, :circuit_open}` (the tenant breaker is OPEN — a throttle/latency
+     storm) the worker `{:snooze, remaining_cooldown}`s (US-37.3, AC-37.3.5): a
+     loss-free reschedule that consumes NO attempt. This is deliberately NOT the
+     `{:error, reason}` retry path — a honored Retry-After can hold the breaker open
+     up to 300s, exceeding a job's 4-attempt window, so `{:error, ...}` would discard
+     the job and leave the article permanently un-embedded (no embedding backfill).
 
   ## Retry Strategy
 
   Uses a custom polynomial backoff: `attempt^4 + 15 + rand(0..30*attempt)`.
   With `max_attempts: 4`, approximate delays are ~16s, ~31s, ~96s, ~271s.
+
+  US-37.3: when a throttle error (429/503) carries a provider `Retry-After`, the
+  worker instead `{:snooze, retry_after}`s (loss-free, no Oban attempt consumed)
+  for ~that interval rather than the blind polynomial backoff — so it never
+  hot-retries into a throttling provider. A throttle WITHOUT a Retry-After keeps
+  the polynomial backoff.
 
   ## Uniqueness
 
@@ -52,6 +64,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Oban.FairShare
   alias Loopctl.Provider.Admission
+  alias Loopctl.Provider.RetryAfter
   alias Loopctl.Workers.ArticleLinkingWorker
 
   # Longer Task.yield budget than the interactive query path: a background embed can
@@ -118,6 +131,30 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
         # so the embed is retried once local demand subsides.
         {:snooze, Admission.snooze_seconds()}
 
+      {:error, :circuit_open} ->
+        # US-37.3 (AC-37.3.5): the tenant's embedding breaker is OPEN (a throttle /
+        # latency storm short-circuited the guarded call before any provider hit).
+        # Snooze loss-free for ~the remaining open window (no Oban attempt consumed)
+        # rather than returning {:error, ...}: since this story makes 429/408 COUNT
+        # toward the breaker AND lets a honored Retry-After raise the open cooldown up
+        # to 300s — which can exceed a job's whole 4-attempt window — an {:error, ...}
+        # here would burn every attempt against the still-open breaker and DISCARD the
+        # job, leaving the article permanently un-embedded (there is no embedding
+        # backfill). The snooze is floored positive by cooldown-remaining's caller.
+        {:snooze, circuit_open_snooze_seconds(tenant_id)}
+
+      {:error, {:api_error, _status, :provider_error, retry_after}}
+      when is_integer(retry_after) ->
+        # US-37.3 (AC-37.3.3): the provider signalled a throttle (429/503) with a
+        # Retry-After. Snooze loss-free for ~that interval (no Oban attempt consumed)
+        # INSTEAD of the blind `attempt^4` backoff, so we don't hot-retry into a
+        # throttling provider. The value is already clamped to the SystemConfig max
+        # at parse time; `RetryAfter.snooze_seconds/1` floors it POSITIVE so a
+        # provider `Retry-After: 0` can't produce a `{:snooze, 0}` hot-reschedule. A
+        # throttle WITHOUT a Retry-After falls through to the generic branch below and
+        # keeps the polynomial backoff.
+        {:snooze, RetryAfter.snooze_seconds(retry_after)}
+
       {:error, reason} ->
         # Classify on the raw reason, but the term that becomes an Oban discard/error
         # reason (-> oban_jobs.errors) is SANITIZED (review #5/#6) — never a raw body.
@@ -147,6 +184,14 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
       enqueue_linking(article_id, tenant_id)
       :ok
     end
+  end
+
+  # Snooze interval (seconds) for the OPEN-breaker path: ~the remaining cooldown so
+  # the job wakes right as the breaker closes. Floored at `Admission.snooze_seconds/0`
+  # (always >= 1) so a just-expired/raced window still yields a positive snooze — a
+  # short re-snooze is loss-free (no attempt consumed), never a `{:snooze, 0}` loop.
+  defp circuit_open_snooze_seconds(tenant_id) do
+    max(Knowledge.circuit_breaker_cooldown_remaining(tenant_id), Admission.snooze_seconds())
   end
 
   defp already_embedded?(%{embedding: embedding, embedding_content_hash: hash}, content_hash)

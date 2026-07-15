@@ -562,13 +562,24 @@ defmodule Loopctl.Memory do
       :no_api_key -> "no_embedding_key"
       :circuit_open -> "embedding_circuit_open"
       :timeout -> "embedding_timeout"
-      {:api_error, status, _} when is_integer(status) -> "embedding_provider_error_#{status}"
-      {:api_error, status} when is_integer(status) -> "embedding_provider_error_#{status}"
       {:request_failed, _} -> "embedding_request_failed"
       {:embedding_crash, _} -> "embedding_crash"
-      _ -> "embedding_error"
+      other -> api_error_tag(other)
     end
   end
+
+  # US-37.3: an `{:api_error, ...}` (3-tuple, or the throttle 4-tuple carrying a
+  # Retry-After) tags by status only; anything else is the generic tag.
+  defp api_error_tag({:api_error, status, _, _}) when is_integer(status),
+    do: "embedding_provider_error_#{status}"
+
+  defp api_error_tag({:api_error, status, _}) when is_integer(status),
+    do: "embedding_provider_error_#{status}"
+
+  defp api_error_tag({:api_error, status}) when is_integer(status),
+    do: "embedding_provider_error_#{status}"
+
+  defp api_error_tag(_other), do: "embedding_error"
 
   # ===========================================================================
   # forget / list / session_history / supersede (RLS OLTP path)

@@ -33,8 +33,14 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
      a clean skip: no crash, no retry, no operator-key fallback. The memory stays
      stored; it is simply not vector-recallable until the tenant configures a key.
   7. On a PERMANENT provider error (a 4xx other than 408/429), `{:discard,
-     {:embedding_permanent_error, _}}`. Transient errors (5xx / network / timeout /
-     circuit-open) return `{:error, reason}` for retry.
+     {:embedding_permanent_error, _}}`. Transient errors (5xx / network / timeout)
+     return `{:error, reason}` for retry.
+  8. On `{:error, :circuit_open}` (the tenant breaker is OPEN) the worker
+     `{:snooze, remaining_cooldown}`s (US-37.3, AC-37.3.5) — a loss-free reschedule
+     consuming NO attempt. NOT the `{:error, reason}` retry path: a honored
+     Retry-After can hold the breaker open up to 300s (beyond the 4-attempt window),
+     so `{:error, ...}` would discard the job and leave the memory permanently
+     un-embedded (no embedding backfill).
 
   ## Uniqueness
 
@@ -56,6 +62,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   alias Loopctl.Memory
   alias Loopctl.Oban.FairShare
   alias Loopctl.Provider.Admission
+  alias Loopctl.Provider.RetryAfter
 
   @worker_yield_ms 8_000
 
@@ -118,6 +125,24 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
         # a discard) so the embed retries once local demand subsides.
         {:snooze, Admission.snooze_seconds()}
 
+      {:error, :circuit_open} ->
+        # US-37.3 (AC-37.3.5): the tenant's embedding breaker is OPEN. Snooze
+        # loss-free for ~the remaining open window (no Oban attempt consumed) rather
+        # than {:error, ...}: with 429/408 now counting toward the breaker and a
+        # honored Retry-After raising the open cooldown up to 300s (able to exceed a
+        # job's 4-attempt window), {:error, ...} would burn every attempt and DISCARD
+        # the job, leaving the memory permanently un-embedded (no embedding backfill).
+        {:snooze, circuit_open_snooze_seconds(tenant_id)}
+
+      {:error, {:api_error, _status, :provider_error, retry_after}}
+      when is_integer(retry_after) ->
+        # US-37.3 (AC-37.3.3): provider throttle (429/503) with a Retry-After —
+        # snooze loss-free for ~that interval (no attempt consumed) instead of the
+        # blind `attempt^4` backoff. Already clamped to the SystemConfig max at parse;
+        # `RetryAfter.snooze_seconds/1` floors it POSITIVE so a `Retry-After: 0` can't
+        # produce a `{:snooze, 0}` hot-reschedule.
+        {:snooze, RetryAfter.snooze_seconds(retry_after)}
+
       {:error, reason} ->
         # US-34.3 (review MED #1): the `[:loopctl, :llm, :provider_error]` telemetry
         # signal is now recorded ONCE, upstream, in
@@ -144,6 +169,14 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
       {:error, :not_found} -> :ok
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  # Snooze interval (seconds) for the OPEN-breaker path: ~the remaining cooldown so
+  # the job wakes right as the breaker closes. Floored at `Admission.snooze_seconds/0`
+  # (always >= 1) so a just-expired/raced window still yields a positive snooze — a
+  # short re-snooze is loss-free (no attempt consumed), never a `{:snooze, 0}` loop.
+  defp circuit_open_snooze_seconds(tenant_id) do
+    max(Knowledge.circuit_breaker_cooldown_remaining(tenant_id), Admission.snooze_seconds())
   end
 
   defp already_embedded?(%{embedding: embedding, embedding_content_hash: hash}, content_hash)

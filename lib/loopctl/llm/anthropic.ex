@@ -32,6 +32,7 @@ defmodule Loopctl.Llm.Anthropic do
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Provider.Admission
+  alias Loopctl.Provider.RetryAfter
 
   @base_url "https://api.anthropic.com/v1"
   @anthropic_version "2023-06-01"
@@ -52,15 +53,20 @@ defmodule Loopctl.Llm.Anthropic do
   Returns:
     * `{:ok, text}` on a 200 (usage recorded best-effort)
     * `{:error, :no_api_key}` when the tenant has no key (mandatory BYO)
-    * `{:error, {:api_error, status, body}}` on a non-200
+    * `{:error, :rate_limited_local}` when the local admission bucket is empty
+    * `{:error, {:api_error, status, :provider_error}}` on a non-200 (sanitized)
+    * `{:error, {:api_error, status, :provider_error, retry_after}}` on a throttle
+      response (429/503) carrying a parsed provider Retry-After (US-37.3)
     * `{:error, {:request_failed, reason}}` on a transport error
+
+  All returned error terms are sanitized via `Loopctl.Llm.ProviderError` and never
+  carry a raw provider body — the error union below is `ProviderError.t()`.
   """
   @spec message(Ecto.UUID.t(), Llm.operation(), (String.t() -> map()), usage_meta(), keyword()) ::
           {:ok, String.t()}
           | {:error, :no_api_key}
           | {:error, :rate_limited_local}
-          | {:error, {:api_error, integer(), term()}}
-          | {:error, {:request_failed, term()}}
+          | {:error, ProviderError.t()}
   def message(tenant_id, operation, body_fun, usage_meta \\ %{}, req_opts \\ [])
       when is_function(body_fun, 1) do
     case Llm.resolve(tenant_id, operation) do
@@ -77,6 +83,12 @@ defmodule Loopctl.Llm.Anthropic do
   per-call `Loopctl.Llm.resolve/2` DB read. Used to resolve ONCE per batch and
   thread the resolved credentials through many calls (review #19). The caller is
   responsible for having resolved the tenant's credentials.
+
+  Returns the same shapes as `message/5` (minus `{:error, :no_api_key}`, which is
+  resolved by the caller). On a throttle response (429/503) the error is the
+  sanitized 4-tuple `{:error, {:api_error, status, :provider_error, retry_after}}`
+  carrying a parsed provider Retry-After (US-37.3). The error union is
+  `ProviderError.t()` — every returned error term is sanitized and body-free.
   """
   @spec call(
           Ecto.UUID.t(),
@@ -89,8 +101,7 @@ defmodule Loopctl.Llm.Anthropic do
         ) ::
           {:ok, String.t()}
           | {:error, :rate_limited_local}
-          | {:error, {:api_error, integer(), term()}}
-          | {:error, {:request_failed, term()}}
+          | {:error, ProviderError.t()}
   def call(tenant_id, operation, api_key, model, body_fun, usage_meta \\ %{}, req_opts \\ [])
       when is_binary(api_key) and is_binary(model) and is_function(body_fun, 1) do
     body = model |> body_fun.() |> Map.put(:model, model)
@@ -149,14 +160,25 @@ defmodule Loopctl.Llm.Anthropic do
         # anomaly observable/actionable without polluting the outage counter.
         {:error, ProviderError.sanitize(reason)}
 
-      {:ok, %{status: status, body: body}} ->
+      {:ok, %{status: status, body: body} = resp} ->
         Logger.warning("Loopctl.Llm.Anthropic: API error (op=#{operation}, status=#{status})")
         # SANITIZE the provider error body (review #11): it can echo a masked key
         # fragment, and callers surface it as an Oban `{:error, reason}` persisted
         # into oban_jobs.errors. Drop the body; keep only the status.
+        #
+        # US-37.3: on a throttle response (429/503) parse the provider Retry-After and
+        # thread it (clamped, value-free) into the sanitized error so a snooze-capable
+        # worker (ContentIngestionWorker) yields loss-free for ~that interval instead
+        # of the blind `attempt^4` backoff. The breaker itself stays embedding-only
+        # (it lives in `Knowledge` and only guards `generate_embedding/3`); the
+        # Anthropic path has never had a breaker and this story does not add one —
+        # `record_provider_error/1` still feeds the fleet-wide provider-error storm
+        # signal, and honoring Retry-After on the worker snooze is the win here.
+        # `record_provider_error/1` classifies on the RAW 3-tuple reason (429 →
+        # transient), unchanged; only the RETURNED term widens to the 4-tuple.
         reason = {:api_error, status, body}
         record_provider_error(reason)
-        {:error, ProviderError.sanitize(reason)}
+        {:error, ProviderError.sanitize(reason, RetryAfter.from_response(status, resp))}
 
       {:error, reason} ->
         # Never inspect the raw transport reason (review MED #4) — log a value-free

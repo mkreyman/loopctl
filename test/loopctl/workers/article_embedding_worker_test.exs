@@ -511,6 +511,94 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
     end
   end
 
+  # --- US-37.3 (AC-37.3.3): honor a provider Retry-After via loss-free snooze ---
+
+  describe "throttle Retry-After (US-37.3)" do
+    test "a 429 carrying a Retry-After snoozes ~that interval instead of attempt^4" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      article =
+        create_draft_then_publish(tenant.id, %{
+          title: "Throttled Article",
+          body: "The provider is rate-limiting and asked us to back off."
+        })
+
+      # The client surfaces the throttle 4-tuple (429 + parsed, clamped Retry-After).
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 429, :provider_error, 30}}
+      end)
+
+      # Snooze (loss-free — no Oban attempt consumed), NOT the polynomial backoff /
+      # {:error, _} retry. The snooze is the parsed Retry-After.
+      assert {:snooze, 30} =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+    end
+
+    test "a 429 WITHOUT a Retry-After keeps the transient {:error, _} retry path" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      article =
+        create_draft_then_publish(tenant.id, %{
+          title: "Throttled No Header Article",
+          body: "Rate-limited but no Retry-After header present."
+        })
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 429, :provider_error}}
+      end)
+
+      # No Retry-After → falls through to the generic transient branch (429 is
+      # transient per Llm.permanent_provider_error?/1) → {:error, _} for Oban's
+      # polynomial backoff, NOT a discard and NOT a snooze.
+      assert {:error, {:api_error, 429, :provider_error}} =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+    end
+  end
+
+  # --- US-37.3 (AC-37.3.5): OPEN breaker → loss-free snooze, never an attempt-consuming discard ---
+
+  describe "open breaker (US-37.3)" do
+    test "snoozes (loss-free) when the tenant breaker is OPEN, without calling the provider" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      article =
+        create_draft_then_publish(tenant.id, %{
+          title: "Breaker Open Article",
+          body: "The tenant breaker is open from a throttle storm."
+        })
+
+      # Trip the tenant breaker with @failure_threshold (3) countable 429 failures.
+      # `stub` (not an exact `expect`) deliberately avoids the Mox async-supervisor
+      # $callers exact-count race — the embed runs in a Task under async_nolink.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:error, {:api_error, 429, :provider_error}}
+      end)
+
+      for _ <- 1..3, do: Knowledge.generate_embedding(tenant.id, "x")
+      assert {:error, :circuit_open} = Knowledge.generate_embedding(tenant.id, "x")
+
+      # Breaker OPEN → the worker snoozes loss-free (no Oban attempt consumed), NOT
+      # {:error, ...} — which would consume an attempt and, under a long honored
+      # cooldown exceeding the 4-attempt window, DISCARD the job and leave the article
+      # permanently un-embedded. The provider is never hit here: generate_embedding
+      # short-circuits on the OPEN breaker (deterministic ETS state) BEFORE spawning
+      # the embed task, so the snooze is reached without a client call.
+      assert {:snooze, seconds} =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+
+      assert is_integer(seconds) and seconds > 0
+    end
+  end
+
   # --- Idempotency: a retry with unchanged content never re-calls the provider (#12) ---
 
   describe "idempotent re-runs" do
