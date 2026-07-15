@@ -2,7 +2,7 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   @moduledoc """
   US-35.2 — Event-driven, activity-gated STH enqueuer.
 
-  A supervised, node-local singleton GenServer that subscribes to the fixed
+  A supervised, CLUSTER-WIDE singleton GenServer that subscribes to the fixed
   cross-tenant audit-chain firehose topic (`Loopctl.AuditChain.PubSub`) and, on
   each `{:audit_chain_entry, entry}` message, debounce-enqueues one
   `Loopctl.Workers.ComputeSthWorker` job for `entry.tenant_id`. This makes STH
@@ -10,6 +10,39 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   per-minute `all_tenants` cron. The firehose message is a MINIMAL
   `%{tenant_id: _}` map (not the full `%Entry{}`) — `tenant_id` is the only field
   this subscriber reads, so nothing else needs to cross the shared topic.
+
+  ## Cluster singleton (US-38.3, AC-38.3.1) — why `:global`, and single-node behavior
+
+  The app-boot instance registers under `name: {:global, __MODULE__}` so that
+  across N clustered nodes EXACTLY ONE instance actually subscribes to and drains
+  the firehose. Before this change every node subscribed and enqueued, so an
+  append fanned out to all N nodes did N redundant `Oban.insert/2` calls (safe —
+  Oban `unique` dedups them — but N× wasteful work on the DB); with a single
+  cluster-wide drainer the firehose is consumed once. On a SINGLE node behavior is
+  byte-for-byte unchanged: that one node wins the global registration and is the
+  singleton, subscribing and enqueuing exactly as before.
+
+  `start_link/1` pattern-matches the `GenServer.start_link` result: on
+  `{:error, {:already_started, _pid}}` — another node already holds the global
+  name — it returns `:ignore` so the local supervisor treats the child as started
+  (NOT a crash). A naive `name: {:global, __MODULE__}` WITHOUT this handling would
+  crash every node after the first (CrashLoopBackOff), so it is mandatory.
+
+  Failover: if the owning process crashes, ITS node's supervisor restarts it and
+  it re-registers the (now-free) global name. `:global` de-registers the name when
+  the owning node goes down, so the name becomes claimable again by a surviving
+  node's (re)starting instance — the cluster is never left permanently without a
+  drainer, and correctness is backstopped regardless by the idempotent per-minute
+  cron (below) while any gap is open.
+
+  ## Test seam — explicit `:name` opt yields a plain LOCAL name
+
+  Only the DEFAULT (app-boot) instance is globally registered. Passing an explicit
+  `name:` (a per-test unique atom) yields an ordinary node-local registration, so
+  the async suite can start many isolated instances via `start_supervised!` without
+  colliding on the one global name. Tests SIMULATE a multi-node collision by
+  starting a second instance under the SAME `{:global, ...}` name and asserting it
+  returns `:ignore` (one active enqueuer).
 
   ## Why a GenServer (OTP Iron Law)
 
@@ -70,8 +103,25 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    name = Keyword.get(opts, :name, __MODULE__)
-    GenServer.start_link(__MODULE__, opts, name: name)
+    # DEFAULT to the cluster-wide global name so exactly one instance across the
+    # cluster drains the firehose (US-38.3). An explicit `name:` opt (per-test
+    # unique atom) yields an ordinary LOCAL name, preserving the async-test seam.
+    name = Keyword.get(opts, :name, {:global, __MODULE__})
+
+    case GenServer.start_link(__MODULE__, opts, name: name) do
+      {:ok, pid} ->
+        {:ok, pid}
+
+      {:error, {:already_started, _pid}} ->
+        # Another node already runs the cluster singleton under this global name.
+        # Treat the collision as success (`:ignore`) so THIS node's supervisor
+        # considers the child started rather than crash-looping. Mandatory with
+        # `{:global, _}` — see the moduledoc "Cluster singleton" section.
+        :ignore
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   @doc """

@@ -176,7 +176,12 @@ defmodule LoopctlWeb.Telemetry do
       # US-34.1 (AC-34.1.2/.3): the `:executing`-older-than-N-min orphan poll,
       # feeding the `loopctl.oban.jobs.executing_orphan.count` gauge. Same
       # self-rescuing contract.
-      {ScaleMetrics, :poll_oban_executing_orphans, []}
+      {ScaleMetrics, :poll_oban_executing_orphans, []},
+
+      # US-38.3 (AC-38.3.2): the clustering-readiness peer poll, feeding the
+      # `loopctl.cluster.peers.count` gauge from `Loopctl.ClusterReadiness.readiness/0`
+      # (peer COUNT + bounded `status`, never node names). Self-rescuing, same contract.
+      {ScaleMetrics, :poll_cluster_readiness, []}
     ]
   end
 end

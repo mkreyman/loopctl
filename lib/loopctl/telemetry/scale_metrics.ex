@@ -32,10 +32,13 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   gauge, and a poll-failure counter so a frozen gauge is distinguishable from a
   genuinely stable one — see "Oban queue/state gauges + `:executing` orphan gauge
   (US-34.1)" below. US-36.3 added the ingestion backlog-gate fail-open counter and
-  US-36.4 adds the article-linking corpus-size gauge (metric 22 below), so
-  `scale_metrics/0` now returns 22 metrics total.
+  US-36.4 adds the article-linking corpus-size gauge (metric 22 below). US-38.3 adds
+  the clustering-readiness peer gauge (metric 23 below — `loopctl.cluster.peers.count`,
+  a `last_value/2` gauge of `length(Node.list/0)` tagged by the bounded readiness
+  `status`, fed by `poll_cluster_readiness/0`), so `scale_metrics/0` now returns 23
+  metrics total.
 
-  ## The metrics (22 total)
+  ## The metrics (23 total)
 
     1. **Timeout / DB-error counter** — `loopctl.db.error.count`, keyed by
        `[:endpoint, :mapped_code]` (+ a cap-gated `:tenant_id`). `mapped_code`
@@ -395,15 +398,15 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   @oban_terminal_states [:completed, :discarded, :cancelled]
 
   @doc """
-  All 22 scale metrics: the original US-27.15 trio, #297's semantic-fallback
+  All 23 scale metrics: the original US-27.15 trio, #297's semantic-fallback
   counter, US-31.2's hybrid-provenance counter, US-33.1's two per-pool checkout
   `queue_time` distributions, US-34.4's ten emitted-but-dead-event counters
   (LLM/embedding-blocked, index-health, secrets/witness/memory-promotion
   degradation signals), US-34.1's three Oban metrics (per-{state, queue}
   gauge over the non-terminal states, the `:executing` orphan gauge, and a
-  poll-failure counter), US-36.3's ingestion backlog-gate fail-open counter, and
-  US-36.4's article-linking corpus-size gauge. Appended to
-  `LoopctlWeb.Telemetry.metrics/0`.
+  poll-failure counter), US-36.3's ingestion backlog-gate fail-open counter,
+  US-36.4's article-linking corpus-size gauge, and US-38.3's clustering-readiness
+  peer gauge. Appended to `LoopctlWeb.Telemetry.metrics/0`.
   """
   @spec scale_metrics() :: [Telemetry.Metrics.t()]
   def scale_metrics do
@@ -701,8 +704,38 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
           "Sampled article-linking candidate-corpus size (vs the comparison limit), by tenant.",
         tags: [:tenant_id],
         tag_values: &article_linking_corpus_size_tags/1
+      ),
+
+      # 23. Clustering-readiness peer gauge (US-38.3, AC-38.3.2). Fed by
+      #     `poll_cluster_readiness/0` (a periodic measurement wired into
+      #     `LoopctlWeb.Telemetry.periodic_measurements/0`) from
+      #     `Loopctl.ClusterReadiness.readiness/0`. The measurement is the connected
+      #     BEAM peer COUNT (`length(Node.list/0)`); the ONLY tag is the bounded 3-value
+      #     `status` set (`:single_node`/`:clustered`/`:expected_peers_missing`) — NEVER
+      #     a node NAME or the DNS query string (both endpoints/ports are non-public,
+      #     but the no-sensitive-data + bounded-cardinality contract AC-27.15.3 holds
+      #     regardless). On a single node this reads `{status="single_node", count=0}`,
+      #     the correct "clustering not required" signal rather than an error.
+      last_value("loopctl.cluster.peers.count",
+        event_name: [:loopctl, :cluster, :peers],
+        measurement: :count,
+        description:
+          "Connected BEAM cluster peers (Node.list/0 length), by clustering-readiness status.",
+        tags: [:status],
+        tag_values: &cluster_peers_tags/1
       )
     ]
+  end
+
+  @doc """
+  `tag_values` for the clustering-readiness peer gauge (US-38.3). Emits ONLY the
+  bounded `status` label (`:single_node`/`:clustered`/`:expected_peers_missing`) —
+  NEVER a node name or the DNS query string. Defaults a missing status to `"unknown"`
+  so a direct `:telemetry.execute/3` with a partial map never raises or emits blank.
+  """
+  @spec cluster_peers_tags(map()) :: map()
+  def cluster_peers_tags(metadata) do
+    %{status: Map.get(metadata, :status, "unknown")}
   end
 
   @doc """
@@ -1185,6 +1218,36 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       )
 
       emit_oban_poll_error(:executing_orphans, e)
+
+      :ok
+  end
+
+  @doc """
+  Periodic measurement (US-38.3, AC-38.3.2) feeding the `loopctl.cluster.peers.count`
+  gauge (metric 23). Reads `Loopctl.ClusterReadiness.readiness/0` and emits the
+  connected BEAM peer COUNT with the bounded readiness `status` as the sole tag —
+  NEVER a node name or the DNS query string. Wired into
+  `LoopctlWeb.Telemetry.periodic_measurements/0` (the same 10s poller as the Oban
+  gauges). Self-rescuing (catch-all, per the periodic-measurements invariant): a
+  raise here must never let `telemetry_poller` permanently drop this MFA — the gauge
+  simply keeps its last value for one cycle. On a single node it reads
+  `{status="single_node", count=0}`.
+  """
+  @spec poll_cluster_readiness() :: :ok
+  def poll_cluster_readiness do
+    readiness = Loopctl.ClusterReadiness.readiness()
+
+    :telemetry.execute([:loopctl, :cluster, :peers], %{count: readiness.peers}, %{
+      status: readiness.status
+    })
+
+    :ok
+  rescue
+    e ->
+      Logger.warning(
+        "Clustering-readiness poll failed (#{inspect(e.__struct__)}); skipping this cycle — " <>
+          "the cluster.peers gauge keeps its last-recorded value until the next successful poll"
+      )
 
       :ok
   end

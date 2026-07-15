@@ -68,3 +68,47 @@ The **genuinely-remaining CODE-ONLY** work:
 - Env-driven knobs via `SystemConfig`/config-based DI; assert outcome classes,
   not timing (async-suite flake lesson); watch master **Deploy + Post-deploy
   Smoke** to green (runtime.exs env changes only fail at release boot).
+
+## Runbook: verify clustering before scaling (US-38.3)
+
+`fly scale count > 1` MUST be preceded by verifying BEAM clustering is GREEN.
+Without clustering, PubSub is node-local: cross-node cache invalidation still works
+(TTL-backstopped, cluster-correct by design — see the scope table above), but the
+`SthEnqueuer` cluster singleton and the shared rate limiter only behave correctly
+once the nodes actually form a cluster. Running multiple machines UN-clustered is a
+silent split-brain, not a hard failure — hence this documented gate + boot WARN
+(loopctl never crash-enforces it; a single node must always boot).
+
+**The signal.** `Loopctl.ClusterReadiness.readiness/0` returns a bounded, no-node-name
+map: `%{dns_cluster_query_configured, peers, expected_nodes, status}` where `status`
+is `:single_node` (clustering not required — `EXPECTED_APP_NODES <= 1` or
+`DNS_CLUSTER_QUERY` unset), `:clustered` (configured + expected peers connected), or
+`:expected_peers_missing` (configured + `EXPECTED_APP_NODES > 1` but too few peers).
+It is also exported as the `loopctl.cluster.peers.count` Prometheus gauge (tagged by
+`status`, on the internal `:9568/metrics` port — no node names, no query string).
+
+**Boot WARN.** On prod boot, `Loopctl.ClusterReadiness.warn_if_expected_peers_missing/0`
+logs a WARNING when `EXPECTED_APP_NODES > 1` but `Node.list/0` is empty (running
+un-clustered). It is a WARN + this runbook, NOT a crash.
+
+**Steps to scale past 1 machine (gated, infra — Mark's hands, out of Epic 38's code scope):**
+
+1. Set the `DNS_CLUSTER_QUERY` Fly secret (the `<app>.internal` 6PN query) — the code
+   is already wired (`application.ex`, `runtime.exs`); this story does NOT set it.
+2. Set `EXPECTED_APP_NODES` to the target machine count so the readiness signal and
+   the `DbCapacity` connection-budget check reflect it.
+3. Deploy, then confirm clustering is GREEN: `readiness/0.status == :clustered` (or
+   the `loopctl.cluster.peers.count{status="clustered"}` gauge shows the expected
+   peers) and NO `expected_peers_missing` boot WARN in the logs.
+4. Only then raise `fly scale count`. If the readiness signal is
+   `:expected_peers_missing`, clustering is not formed — fix DNS clustering before
+   scaling, or you are running node-local PubSub across N machines.
+
+### DNSCluster wiring (verified by test)
+
+`DNSCluster` is a child in `Loopctl.Application`'s supervision tree
+(`{DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore}`),
+and `:dns_cluster_query` resolves from the `DNS_CLUSTER_QUERY` env in `runtime.exs`
+(unset → `nil` → `:ignore`, so `DNSCluster` runs inert with no process started). This
+is asserted by `test/loopctl/cluster_readiness_test.exs` so the wiring can't silently
+regress. `DNS_CLUSTER_QUERY` is NOT set by this story.

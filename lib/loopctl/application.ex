@@ -125,6 +125,14 @@ defmodule Loopctl.Application do
     if Application.get_env(:loopctl, :env) == :prod,
       do: Loopctl.IndexHealth.warn_if_invalid_indexes()
 
+    # US-38.3 (AC-38.3.3): clustering-readiness gate. When the app is told to expect
+    # peers (EXPECTED_APP_NODES > 1) but Node.list/0 is empty, WARN that this node is
+    # running un-clustered (node-local PubSub) so a machine-count bump can't silently
+    # run un-clustered. WARN + runbook, NEVER a crash — a single node always boots.
+    # Prod only, rescue-wrapped, mirroring DbCapacity.warn_if_over_budget/0.
+    if Application.get_env(:loopctl, :env) == :prod,
+      do: Loopctl.ClusterReadiness.warn_if_expected_peers_missing()
+
     result
   end
 

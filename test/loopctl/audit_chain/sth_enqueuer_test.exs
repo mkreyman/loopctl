@@ -383,4 +383,69 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
       assert Process.alive?(pid)
     end
   end
+
+  describe "cluster singleton (US-38.3, AC-38.3.1)" do
+    test "TC-38.3.1: a single node still enqueues — an explicit local name starts and enqueues" do
+      # Single-node behavior is unchanged: an explicit `name:` yields an ordinary
+      # LOCAL registration (the async-test seam) and the enqueue path works exactly
+      # as before the cluster-singleton change.
+      tenant = fixture(:tenant)
+      name = :"sth_local_#{System.unique_integer([:positive])}"
+
+      pid =
+        start_supervised!(
+          Supervisor.child_spec({SthEnqueuer, [name: name, subscribe: false]}, id: name)
+        )
+
+      assert is_pid(pid)
+      # Plain local registration — NOT globally registered (only the default app-boot
+      # instance claims the {:global, _} name).
+      assert Process.whereis(name) == pid
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, _job} = SthEnqueuer.enqueue_sth_job(%{tenant_id: tenant.id})
+      end)
+
+      assert [%{args: %{"tenant_id" => enqueued_tid}}] = all_enqueued(worker: ComputeSthWorker)
+      assert enqueued_tid == tenant.id
+    end
+
+    test "TC-38.3.1: a second instance under the SAME {:global, _} name yields :ignore (one active enqueuer)" do
+      # Simulate a multi-node collision on the cluster-global name: the first instance
+      # wins the {:global, _} registration; a second start under the SAME global name
+      # collides and start_link/1 maps the {:already_started, _} to :ignore, so the
+      # local supervisor treats the child as started rather than crash-looping. Net:
+      # exactly ONE active enqueuer across the (simulated) cluster.
+      global_atom = :"sth_singleton_#{System.unique_integer([:positive])}"
+      global_name = {:global, global_atom}
+
+      first =
+        start_supervised!(
+          Supervisor.child_spec({SthEnqueuer, [name: global_name, subscribe: false]},
+            id: :sth_global_singleton
+          )
+        )
+
+      assert is_pid(first)
+      assert :global.whereis_name(global_atom) == first
+
+      # Second registration under the same global name → :ignore (NOT a crash, NOT a
+      # second process).
+      assert :ignore == SthEnqueuer.start_link(name: global_name, subscribe: false)
+
+      # The original remains the one and only globally-registered, alive instance.
+      assert :global.whereis_name(global_atom) == first
+      assert Process.alive?(first)
+    end
+
+    test "TC-38.3.1: the DEFAULT (unnamed) start is the cluster-global singleton the app already holds" do
+      # The app-boot instance started with default opts, so it registered under
+      # {:global, SthEnqueuer}. A fresh DEFAULT start therefore collides and returns
+      # :ignore — proving the default name IS the cluster-wide global singleton
+      # (exactly one active across the cluster), and that a redundant node start is a
+      # graceful no-op rather than a crash.
+      assert is_pid(:global.whereis_name(SthEnqueuer))
+      assert :ignore == SthEnqueuer.start_link(subscribe: false)
+    end
+  end
 end
