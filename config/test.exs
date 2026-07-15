@@ -538,10 +538,20 @@ config :loopctl, :dns_resolver, Loopctl.MockDnsResolver
 # lookup can't hang the suite.
 config :loopctl, :dns_resolve_timeout_ms, 2_000
 
-# Batch ingestion per-item validation deadline (FIX 2). Short in tests so the
-# validation_timeout path (a stubbed slow/failing resolver) is exercised in
-# ~200ms instead of the 5s production default. Config-based DI — no put_env.
-config :loopctl, :batch_item_validation_timeout_ms, 200
+# Batch ingestion per-item validation deadline (FIX 2). Shorter than the 5s
+# production default so the validation_timeout path (a resolver stubbed to
+# `Process.sleep(:infinity)`) is exercised without a 5s wait — the hung item does
+# UNBOUNDED work, so it deterministically hits ANY finite deadline. But it must
+# NOT sit inside the range of normal load jitter for the HAPPY path: a batch's
+# items run 10-way concurrent through `async_stream_nolink`, each doing real
+# inline-Oban work (serialized on this test's single sandboxed DB connection), so
+# the aggregate can spike past a tight deadline under full-suite load and flip an
+# innocent "queued" item to a spurious validation_timeout. 200ms was inside that
+# jitter band (reproducibly all-timeout at 1ms; observed flaking at 200ms under
+# load). 2s gives the bounded fast path ~10x headroom over the observed failure
+# point while keeping the (sleep-:infinity) timeout tests fast. Config-based DI —
+# no put_env.
+config :loopctl, :batch_item_validation_timeout_ms, 2_000
 
 # DI: swap ArticleLinkingWorker's similarity lookup for a Mox mock so the worker's
 # linking logic (relates_to / potential_conflict thresholds, dedup, audit, idempotency)

@@ -105,7 +105,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   end
 
   defp embed_batch(tenant_id, article_ids) do
-    articles = Knowledge.get_articles_with_embedding(tenant_id, article_ids)
+    articles = Knowledge.get_articles_with_embedding_status(tenant_id, article_ids)
 
     # Split into (a) already-embedded (idempotent skip — re-ensure linking) and
     # (b) to-embed `{article, text, content_hash}` tuples. The paid provider only
@@ -269,8 +269,8 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     {:discard, {:no_embedding_key, Enum.map(to_embed, fn {a, _t, _h} -> a.id end)}}
   end
 
-  defp already_embedded?(%{embedding: embedding, embedding_content_hash: hash}, content_hash)
-       when not is_nil(embedding) and is_binary(hash),
+  defp already_embedded?(%{has_embedding: true, embedding_content_hash: hash}, content_hash)
+       when is_binary(hash),
        do: hash == content_hash
 
   defp already_embedded?(_article, _content_hash), do: false

@@ -1,5 +1,16 @@
 defmodule Loopctl.Workers.ContentIngestionWorkerTest do
-  use Loopctl.DataCase, async: true
+  @moduledoc """
+  `async: false` ON PURPOSE. The US-37.4 batching test seeds the NODE-GLOBAL
+  `{Loopctl.SystemConfig, "embedding_batch_max"}` `:persistent_term` knob (the
+  documented key format, erased on exit) to drive the batch-size math. That key
+  is VM-global — NOT ExUnit-sandbox/transaction scoped — and is read globally by
+  `Knowledge.embedding_batch_max/0`, so mutating it while an async peer (e.g.
+  `KnowledgeLintWorkerTest`, which relies on the default batch_max) runs
+  concurrently would cross-contaminate the peer's chunk math. A sync test never
+  runs concurrently with any other test, so the seed can't leak — mirrors
+  `Loopctl.KnowledgeBreakerLatencyTest`.
+  """
+  use Loopctl.DataCase, async: false
   use Oban.Testing, repo: Loopctl.Repo
 
   setup :verify_on_exit!

@@ -4,8 +4,18 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
   provider array call, maps vectors back by index, and mirrors the single-article
   worker's error taxonomy — while keeping the interactive memory/promotion path
   per-record (that write-then-recall guarantee is covered by the memory suite).
+
+  `async: false` ON PURPOSE. The `TC-37.4.2` test seeds the NODE-GLOBAL
+  `{Loopctl.SystemConfig, "embedding_batch_max"}` `:persistent_term` knob (the
+  documented key format, erased on exit) to drive the batch-size math. That key
+  is VM-global — NOT ExUnit-sandbox/transaction scoped — and is read globally by
+  `Knowledge.embedding_batch_max/0`, so mutating it while an async peer (e.g.
+  `KnowledgeLintWorkerTest`, which relies on the default batch_max) runs
+  concurrently would cross-contaminate the peer's chunk math. A sync test never
+  runs concurrently with any other test, so the seed can't leak — mirrors
+  `Loopctl.KnowledgeBreakerLatencyTest`.
   """
-  use Loopctl.DataCase, async: true
+  use Loopctl.DataCase, async: false
   use Oban.Testing, repo: Loopctl.Repo
 
   setup :verify_on_exit!

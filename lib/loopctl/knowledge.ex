@@ -814,19 +814,23 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
-  Batch variant of `get_article_with_embedding/2` (US-37.4): fetches every article
-  in `article_ids` for the tenant, WITH its `embedding` column select-merged (the
-  default query excludes the vector for cost — #4f356938). Silently drops ids that
-  don't resolve (deleted / wrong tenant). Order is NOT guaranteed — the caller keys
-  by `id`. Scoped to ONE tenant (RLS + explicit predicate).
+  Batch presence-check variant for the bulk-embedding path (US-37.4): fetches every
+  article in `article_ids` for the tenant with the virtual `has_embedding` boolean
+  set to `not is_nil(embedding)` — WITHOUT transferring the 1536-dim vector itself.
+  The batch worker only needs to know whether a row is already embedded (and compare
+  the separate `embedding_content_hash`); loading up to `embedding_batch_max` (~100)
+  full pgvectors per job just to null-check them is avoidable I/O on this hot
+  bulk-ingest path. Silently drops ids that don't resolve (deleted / wrong tenant).
+  Order is NOT guaranteed — the caller keys by `id`. Scoped to ONE tenant (RLS +
+  explicit predicate).
   """
-  @spec get_articles_with_embedding(Ecto.UUID.t(), [Ecto.UUID.t()]) :: [Article.t()]
-  def get_articles_with_embedding(tenant_id, article_ids)
+  @spec get_articles_with_embedding_status(Ecto.UUID.t(), [Ecto.UUID.t()]) :: [Article.t()]
+  def get_articles_with_embedding_status(tenant_id, article_ids)
       when is_binary(tenant_id) and is_list(article_ids) do
     query =
       from(a in Article,
         where: a.id in ^article_ids and a.tenant_id == ^tenant_id,
-        select_merge: %{embedding: a.embedding}
+        select_merge: %{has_embedding: not is_nil(a.embedding)}
       )
 
     AdminRepo.all(query)
