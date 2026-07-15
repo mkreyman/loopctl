@@ -1,0 +1,18 @@
+{
+  "number": "38.1",
+  "title": "Model primary vs replica database capacity separately in DbCapacity",
+  "description": "Add replica-aware capacity modeling to DbCapacity so it can represent both primary (write-capable, RLS enforced) and replica (read-only, eventual consistency) separately. Enables config-driven DSN switching for HeavyReadRepo without code duplication.",
+  "acceptance_criteria": [
+    "DbCapacity.t() is extended with replica fields (connection pool size, latency assumptions, read-only flag, DSN source)",
+    "DbCapacity.load/1 queries both primary and (optional) replica pools to derive capacity",
+    "Config :db_primary and :db_replica are distinct; :db_replica is optional (defaults to nil, falls back to primary DSN)",
+    "BYPASSRLS role (for AdminRepo/HeavyReadRepo) maintains parity; schema_admin user pool is modeled same way on both",
+    "Tests verify that capacity model reflects separate pool budgets; primary=30conn, replica=30conn on same cluster instance yields 60 total",
+    "Documentation clarifies eventual consistency implications for HeavyReadRepo reads"
+  ],
+  "story_type": "feature",
+  "effort": "medium",
+  "depends_on": [],
+  "epic": 38,
+  "tags": ["database", "scale", "config"]
+}
