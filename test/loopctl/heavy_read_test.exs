@@ -405,4 +405,12 @@ defmodule Loopctl.HeavyReadTest do
       end
     end
   end
+
+  # NOTE (US-38.4): the per-query `hnsw.ef_search` tests that PRIME the VM-global
+  # `SystemConfig "hnsw_ef_search"` persistent_term key live in the sibling `async: false`
+  # `Loopctl.HeavyReadHnswEfSearchTest` (test/loopctl/heavy_read_hnsw_ef_search_test.exs).
+  # They were split out because that key is also read by real ANN reads in other `async: true`
+  # files (dual_index_recall_test, vector_search_test), so priming it from an async module
+  # would let a concurrent cross-file reader observe the primed value. This file stays
+  # `async: true` — it mutates no global state.
 end

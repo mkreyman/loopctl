@@ -206,9 +206,15 @@ if config_env() == :prod do
   # `:parameters` crash-loops EVERY HeavyReadRepo connection (the pool never establishes
   # one) and 503/504s every heavy endpoint (suggested_links, semantic search,
   # distant_pairs, novelty, heavy enumeration). `SET LOCAL` inside a transaction is the
-  # pgbouncer-safe path and is verified to enforce against the live pool. Likewise
-  # `ef_search` is NOT settable via :parameters on managed PG (a pgvector custom GUC);
-  # see docs/runbooks/knowledge-scale.md for the ALTER ROLE mechanism if it must change.
+  # pgbouncer-safe path and is verified to enforce against the live pool. Likewise the
+  # pgvector custom GUC `hnsw.ef_search` is NOT settable via :parameters on managed PG — it
+  # is applied per-ANN-read via `SET LOCAL hnsw.ef_search` inside that SAME heavy-read
+  # transaction (US-38.4), configured live via the SystemConfig `hnsw_ef_search` key
+  # (default 40) — emitted ONLY when that value differs from the pgvector default. Because a
+  # `SET LOCAL` overrides any role/session default for its transaction, a role-level
+  # `ALTER ROLE <role> SET hnsw.ef_search` lever still works AND is honored whenever
+  # SystemConfig is left at the default (the per-read SET LOCAL never shadows it); a
+  # non-default SystemConfig value wins per-read. See docs/runbooks/knowledge-scale.md.
   #
   # Pool sizes here MUST stay in lockstep with `Loopctl.DbCapacity` (which models the
   # connection budget and is asserted in db_capacity_test.exs). Sizing (AC-27.11.1/.5),

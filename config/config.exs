@@ -14,6 +14,17 @@ config :loopctl,
   env: config_env(),
   generators: [timestamp_type: :utc_datetime, binary_id: true],
   embedding_dimensions: 1536,
+  # US-38.4: EXPLICIT pgvector HNSW build parameters for every `CREATE INDEX ... USING
+  # hnsw` (`Loopctl.Repo.HnswIndex`). These EQUAL pgvector's implicit defaults (m=16,
+  # ef_construction=64) — a deliberate, documented "keep the defaults" tuning outcome
+  # (docs/hnsw-tuning-evaluation.md) — but making them config-driven means the choice is
+  # intentional and single-sourced. m = graph connectivity (recall/size/build-cost up
+  # with m); ef_construction = build-time candidate breadth (recall/build-cost up with
+  # it). BUILD-time only: changing either requires an ONLINE reindex migration (CREATE
+  # INDEX CONCURRENTLY new, drop old), never an in-place ALTER. The per-QUERY recall knob
+  # is `hnsw.ef_search` (SystemConfig `hnsw_ef_search`, applied per-read by HeavyRead).
+  hnsw_m: 16,
+  hnsw_ef_construction: 64,
   # Cosine similarity threshold for auto-linking articles.
   # 0.6 is calibrated for relationship discovery (related topics).
   # 0.8+ is only useful for near-duplicate detection.

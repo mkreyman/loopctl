@@ -30,7 +30,66 @@ defmodule Loopctl.Repo.HnswIndex do
   Index names are derived from the table: `\#{table}_embedding_idx` (the old
   migration's create name) and `\#{table}_embedding_hnsw_idx` (the canonical
   reconciled name).
+
+  ## Build-time HNSW parameters (`m` / `ef_construction`) — US-38.4
+
+  Every `CREATE INDEX ... USING hnsw` this module emits now carries an EXPLICIT
+  `WITH (m = .., ef_construction = ..)` storage clause instead of relying on
+  pgvector's implicit defaults. The chosen values EQUAL pgvector's defaults
+  (`m = 16`, `ef_construction = 64`) — a deliberate, documented "keep the
+  defaults" outcome (see `docs/hnsw-tuning-evaluation.md`) — but making them
+  explicit means they are now an intentional, single-sourced, operator-tunable
+  decision rather than an implicit accident. Because the values are unchanged, no
+  reindex of the live `articles` / `memories` indexes is needed: they were built
+  with these exact defaults, so re-emitting them here only affects indexes created
+  FROM NOW ON (a fresh `mix ecto.reset`, or a future table). To change them, set
+  `config :loopctl, :hnsw_m` / `:hnsw_ef_construction` AND ship an ONLINE reindex
+  migration (`CREATE INDEX CONCURRENTLY` a new index with the new params, then drop
+  the old) — `m`/`ef_construction` are BUILD-time and cannot be `ALTER`ed in place.
+
+  `ef_search` (the per-QUERY recall breadth) is a separate, query-time knob and
+  lives on the read path (`Loopctl.HeavyRead`), NOT here.
   """
+
+  # pgvector's own defaults. Kept explicit + configurable (US-38.4) — see the
+  # moduledoc and docs/hnsw-tuning-evaluation.md for the keep-the-defaults rationale.
+  @default_hnsw_m 16
+  @default_hnsw_ef_construction 64
+
+  @doc """
+  The configured HNSW `m` build parameter (config `:hnsw_m`, default
+  #{@default_hnsw_m} = pgvector's default). Integer-validated.
+  """
+  @spec hnsw_m() :: pos_integer()
+  def hnsw_m,
+    do: validate_build_param!(:m, Application.get_env(:loopctl, :hnsw_m, @default_hnsw_m))
+
+  @doc """
+  The configured HNSW `ef_construction` build parameter (config
+  `:hnsw_ef_construction`, default #{@default_hnsw_ef_construction} = pgvector's
+  default). Integer-validated.
+  """
+  @spec hnsw_ef_construction() :: pos_integer()
+  def hnsw_ef_construction do
+    validate_build_param!(
+      :ef_construction,
+      Application.get_env(:loopctl, :hnsw_ef_construction, @default_hnsw_ef_construction)
+    )
+  end
+
+  @doc """
+  The `WITH (m = .., ef_construction = ..)` storage-parameter clause appended to
+  every `CREATE INDEX ... USING hnsw` this module (and the partial-index migration)
+  emits.
+
+  Both values are integer-validated (`validate_build_param!/2`) before
+  interpolation — mirroring the `validate!/1` SQL-identifier guard, they can NEVER
+  carry anything but a positive integer, so this is not an injection surface even
+  though the values flow from application config.
+  """
+  @spec with_params_clause() :: String.t()
+  def with_params_clause,
+    do: "WITH (m = #{hnsw_m()}, ef_construction = #{hnsw_ef_construction()})"
 
   @doc "The canonical (reconciled) HNSW index name for `table`."
   @spec canonical_index_name(String.t()) :: String.t()
@@ -63,7 +122,7 @@ defmodule Loopctl.Repo.HnswIndex do
           JOIN pg_am    am ON am.oid = i.relam
           WHERE t.relname = '#{table}' AND n.nspname = 'public' AND am.amname = 'hnsw'
         ) THEN
-          CREATE INDEX #{table}_embedding_idx ON #{table} USING hnsw (embedding vector_cosine_ops);
+          CREATE INDEX #{table}_embedding_idx ON #{table} USING hnsw (embedding vector_cosine_ops) #{with_params_clause()};
         END IF;
       END IF;
     END $$;
@@ -155,5 +214,19 @@ defmodule Loopctl.Repo.HnswIndex do
     else
       raise ArgumentError, "invalid table identifier: #{inspect(table)}"
     end
+  end
+
+  # HNSW build params (`m` / `ef_construction`) are interpolated into a CREATE INDEX
+  # storage clause, so — like the table identifier — they are validated to be a plain
+  # positive integer before ever reaching SQL. They come from application config (an
+  # operator knob), never user input, but a mistyped config value fails LOUDLY here
+  # rather than emitting malformed DDL. (pgvector further bounds them at build time:
+  # m ∈ [2,100], ef_construction ∈ [4,1000] with ef_construction ≥ 2*m; an out-of-range
+  # positive integer surfaces as a clear CREATE INDEX error, not an injection.)
+  defp validate_build_param!(_name, value) when is_integer(value) and value > 0, do: value
+
+  defp validate_build_param!(name, value) do
+    raise ArgumentError,
+          "HNSW #{name} must be a positive integer (config), got: #{inspect(value)}"
   end
 end

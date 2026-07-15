@@ -72,16 +72,29 @@ defmodule Loopctl.Knowledge.VectorSearch do
   count of above-threshold neighbors the anti-join removed — the recall-loss metric
   US-27.15 aggregates, computed from the single bounded under-fill probe.
 
-  **Raising recall is deliberately NOT done per-request here.** `hnsw.ef_search` is
-  a pgvector **custom GUC** that does not exist until the extension loads per
-  session, so it **cannot** be set via a Postgrex startup `:parameters` entry
-  (managed PG rejects it: *"unrecognized configuration parameter"* — see
-  `docs/runbooks/knowledge-scale.md`). Setting it per-request would require a
-  `SET LOCAL` inside a transaction, re-introducing the #172 pool-starvation
-  anti-pattern on the small heavy-read pool. The only safe non-transaction lever is
-  `ALTER ROLE <heavy_read_role> SET hnsw.ef_search = N` (US-27.11), and only if
-  verified to apply on fly mpg. Until then recall stays at the default and is
-  handled by **over-fetch + the under-fill signal**.
+  **Raising recall (US-38.4): `hnsw.ef_search` is now a per-query, live-tunable knob.**
+  `hnsw.ef_search` is a pgvector **custom GUC** that still **cannot** be set via a
+  Postgrex startup `:parameters` entry (managed PG/pgbouncer rejects it — the US-27.13
+  outage class, guarded by `config_pgbouncer_safe_parameters_test.exs`). The historical
+  objection that setting it per-request via `SET LOCAL` "needs a transaction and so
+  re-introduces the #172 pool-starvation anti-pattern" is now **stale**: since US-27.13
+  every heavy read ALREADY runs inside a short `SET LOCAL statement_timeout` transaction
+  (`Loopctl.HeavyRead.run_timed_transaction/4`), so a `SET LOCAL hnsw.ef_search = N`
+  piggybacks on that EXISTING bounded, self-draining transaction with **no new
+  starvation risk**. `Loopctl.HeavyRead.opts/1` therefore attaches `:hnsw_ef_search`
+  (config `SystemConfig "hnsw_ef_search"`, default 40 = pgvector's default) to every
+  ANN endpoint **whenever that value differs from the default**, applied per-read. An
+  operator raises recall fleet-wide with a single
+  `UPDATE system_configs` — no redeploy. A role-level
+  `ALTER ROLE <role> SET hnsw.ef_search = N` still works as a role-scoped default and is
+  honored whenever `SystemConfig` is left at the default: the per-read `SET LOCAL` is emitted
+  ONLY for a NON-default `SystemConfig` value, so it never silently shadows the role override
+  (an unconditional `SET LOCAL` at the default would override that role default per-read —
+  the bug this guard avoids). When both are set to non-default values the per-read
+  `SystemConfig` `SET LOCAL` wins for that ANN read; see `docs/runbooks/knowledge-scale.md`.
+  Recall is thus handled by
+  **over-fetch + the under-fill signal + the ef_search knob**; the current value stays
+  at the default until an operator raises it.
 
   ## Caller-cost bounds (AC-27.6a.4 — OWASP A06, insecure design)
 

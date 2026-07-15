@@ -25,6 +25,12 @@ defmodule Loopctl.Repo.Migrations.AddMemoriesLiveEmbeddingPartialHnswIndex do
   # Detected by EXACT NAME (not by `amname = 'hnsw'` capability, which the sibling
   # full-index migration uses) because there are now intentionally TWO HNSW indexes on
   # `memories.embedding` — a capability check would see the full index and skip this.
+  #
+  # US-38.4: the CREATE now carries the EXPLICIT `WITH (m = .., ef_construction = ..)`
+  # storage clause from `Loopctl.Repo.HnswIndex.with_params_clause/0` (values == pgvector
+  # defaults, so on the prod DB where this migration already ran it is a pure no-op — the
+  # existing index is unchanged; only a fresh `mix ecto.reset` builds with the explicit,
+  # identical params). See docs/hnsw-tuning-evaluation.md.
 
   @index "memories_live_embedding_hnsw_idx"
 
@@ -43,6 +49,7 @@ defmodule Loopctl.Repo.Migrations.AddMemoriesLiveEmbeddingPartialHnswIndex do
         ) THEN
           CREATE INDEX #{@index} ON memories
             USING hnsw (embedding vector_cosine_ops)
+            #{Loopctl.Repo.HnswIndex.with_params_clause()}
             WHERE superseded_by IS NULL;
         END IF;
       END IF;

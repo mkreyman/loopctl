@@ -100,7 +100,9 @@ pool self-drains within `statement_timeout`.
 > Postgres, which is why CI didn't catch it; `config_pgbouncer_safe_parameters_test.exs` +
 > the `pgbouncer-e2e` CI job now guard this.) `SET LOCAL` inside a transaction is the only
 > pgbouncer-safe way to set a server GUC; a GUC that must persist at connect goes via
-> `ALTER ROLE` (the `hnsw.ef_search` lever), never `:parameters`.
+> `ALTER ROLE` (e.g. a role-scoped `hnsw.ef_search` default — the live per-read recall
+> override is `SystemConfig` via `SET LOCAL`, see the recall-lever section), never
+> `:parameters`.
 
 Verify the per-read timeout live (it is NOT a session/pool GUC, so a bare `SHOW` reads the
 server default — read it INSIDE the SET LOCAL transaction):
@@ -167,7 +169,8 @@ param). Hard-won rules for anything touching the DB layer behind pgbouncer:
 
 - **No GUC via connection `:parameters`.** A server GUC is applied per-read via `SET LOCAL`
   inside a transaction (`Loopctl.HeavyRead`); a GUC that must persist at connect goes via
-  `ALTER ROLE` (the `hnsw.ef_search` lever). The config-lint
+  `ALTER ROLE` (e.g. a role-scoped `hnsw.ef_search` default; the live per-read recall
+  override is `SystemConfig` via `SET LOCAL` — see the recall-lever section). The config-lint
   (`config_pgbouncer_safe_parameters_test.exs`) blocks a re-added startup `:parameters` GUC —
   but that is ONLY the startup-parameter member of the class. It does NOT guard the other
   pgbouncer-sensitive paths below; those depend on the **pool mode**.
@@ -376,21 +379,60 @@ frees the connection rather than holding it.
 
 `hnsw.ef_search` is a pgvector **custom** GUC that does not exist until the
 extension loads per-session, so it is **NOT** settable via Postgrex `:parameters`
-on managed PG (fly mpg/RDS reject it: *"unrecognized configuration parameter"*).
-It currently stays at the pgvector **default (40)**; recall is handled by
-over-fetch + the US-27.6b under-fill signal.
+on managed PG (fly mpg/RDS reject it: *"unrecognized configuration parameter"* —
+still guarded by `config_pgbouncer_safe_parameters_test.exs`).
 
-If recall must be raised, set it on the **role** (applies per-session after the
-extension loads), NOT via `:parameters`:
+**Primary lever (US-38.4): the live-tunable SystemConfig `hnsw_ef_search` key.**
+It is applied per-ANN-read via `SET LOCAL hnsw.ef_search = <value>` inside the
+SAME short heavy-read transaction that already scopes `SET LOCAL statement_timeout`
+(`Loopctl.HeavyRead.run_timed_transaction/4`) — so there is **no** new
+pool-starvation risk (the pre-US-27.13 "SET LOCAL needs a transaction → #172
+starvation" objection is stale; the transaction is already there). It defaults to
+the pgvector default **40**; recall is handled by over-fetch + the US-27.6b
+under-fill signal + this knob. To raise recall fleet-wide with **no redeploy**:
+
+```sql
+UPDATE system_configs SET value = 100, updated_at = now() WHERE key = 'hnsw_ef_search';
+```
+
+The change is live on this node on write and on every other node within a minute
+(the `SystemConfigRefreshWorker` cron). The value is clamped to pgvector's accepted
+`[1, 1000]` by `Loopctl.HeavyRead.hnsw_ef_search/0`, so a bad value can never make
+the `SET LOCAL` raise. Only the pgvector-ANN endpoints
+(`Loopctl.HeavyRead.ann_endpoints/0` — `suggested_links`, `semantic_search`, `novelty`,
+`vector_search`, `memory_recall`; the `distant_pairs*` self-joins are NOT ANN and never
+carry it) get it, and only when the value **differs from the pgvector default 40** — at
+the default no per-read `SET LOCAL` is issued at all (see the precedence note below).
+
+**Alternative lever: role-level `ALTER ROLE`** (a role-scoped default that applies
+per-session after the extension loads) — still works, and is HONORED because the
+`SystemConfig` per-read `SET LOCAL` is emitted **only for a non-default value**. This is a
+real precedence contract, not two competing levers:
+
+- `SystemConfig = 40` (default) → **no** per-read `SET LOCAL` → the session/role default
+  governs, so `ALTER ROLE ... SET hnsw.ef_search = N` is honored fleet-wide.
+- `SystemConfig = <non-default>` → a per-read `SET LOCAL hnsw.ef_search = <value>` is issued
+  and, because `SET LOCAL` overrides any role/session default for its transaction, that
+  value wins for the ANN read.
+
+So use `ALTER ROLE` for a role-scoped default that must persist independent of the app
+config table (leaving `SystemConfig` at 40); use `SystemConfig` for a live, no-redeploy
+fleet-wide override. NB: to pin ANN reads to exactly 40 while a higher `ALTER ROLE` default
+exists, lower the role default — setting `SystemConfig = 40` is treated as "no override" and
+will NOT force the reads back down (that is the whole point of not shadowing the role lever).
 
 ```sql
 ALTER ROLE <heavy_read_role> SET hnsw.ef_search = 100;
 ```
 
-Then confirm through the pool:
+Then confirm the value through the pool. A role default shows on a plain `SHOW`; a
+`SystemConfig` per-read value is `SET LOCAL`, so confirm it inside a transaction:
 
 ```sh
+# Role default (ALTER ROLE) — plain SHOW on a fresh checkout:
 fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.HeavyReadRepo.query!(\"SHOW hnsw.ef_search\").rows)'"
+# SystemConfig per-read value — inside a transaction (as the ANN read runs it):
+fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'Loopctl.HeavyReadRepo.transaction(fn r -> r.query!(\"SET LOCAL hnsw.ef_search = #{Loopctl.HeavyRead.hnsw_ef_search()}\"); IO.inspect(r.query!(\"SHOW hnsw.ef_search\").rows) end)'"
 ```
 
 ### Recall ceiling + the under-fill signal (US-27.6b)
@@ -431,10 +473,14 @@ dedicated heavy-read pool. It is an ANN-class read (same plan shape as the main 
 connectivity/timeout fault on this advisory probe is fail-soft: the suggestions are still
 returned with no truncation signal rather than failing the request.
 
-**Raising recall** is the `ALTER ROLE … SET hnsw.ef_search` lever above (US-27.11), never a
-per-request `:parameters` or `SET LOCAL` (the latter needs a transaction and re-introduces
-the #172 small-pool starvation). Until ef_search is raised (and verified on fly mpg),
-recall stays at the default and is handled by over-fetch + this under-fill signal.
+**Raising recall** (US-38.4) is the live `SystemConfig hnsw_ef_search` knob (or the
+`ALTER ROLE … SET hnsw.ef_search` role default, honored while `SystemConfig` sits at 40 —
+see the precedence contract above) documented above. A non-default `SystemConfig` value is
+applied per-ANN-read via `SET LOCAL hnsw.ef_search` inside the heavy read's EXISTING short
+transaction, so it no longer re-introduces the #172 small-pool starvation (that objection
+predated US-27.13's per-read transaction). It is still never a startup `:parameters` value
+(pgbouncer rejects that). Until an operator raises it, recall stays at the default 40, NO
+per-read `SET LOCAL` is issued, and recall is handled by over-fetch + this under-fill signal.
 
 ## Metrics & alerting (US-27.15)
 
@@ -702,6 +748,7 @@ and `semantic` search:
   `@prod_article_floor` in `Loopctl.Knowledge.ScaleSeed` (a documented step).
 - **`hnsw.ef_search` parity.** The under-fill gate asserts the EFFECTIVE `ef_search`
   (`SHOW hnsw.ef_search`) is identical on the gate connection and a prod-shaped one; the
-  calibration test proves the FAILURE direction (a divergent value RAISES). When US-27.11's
-  `ALTER ROLE … SET hnsw.ef_search = N` lands a non-default value, update the `== "40"` pin
-  in `vector_search_under_fill_scale_test.exs` to the new value.
+  calibration test proves the FAILURE direction (a divergent value RAISES). When EITHER
+  recall lever lands a non-default value — a role-scoped `ALTER ROLE … SET hnsw.ef_search = N`
+  default, OR the live `SystemConfig hnsw_ef_search` per-read `SET LOCAL` (US-38.4) — update
+  the `== "40"` pin in `vector_search_under_fill_scale_test.exs` to the new effective value.
