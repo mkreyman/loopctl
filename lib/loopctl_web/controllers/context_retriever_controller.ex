@@ -382,14 +382,14 @@ defmodule LoopctlWeb.ContextRetrieverController do
   defp check_retrieve_rate(tenant_id) do
     bucket = "cr_retrieve:tenant:#{tenant_id}"
 
-    case rate_limiter().check_rate(bucket, retrieve_rate_window_ms(), retrieve_rate_limit()) do
+    case Loopctl.RateLimiter.impl().check_rate(
+           bucket,
+           retrieve_rate_window_ms(),
+           retrieve_rate_limit()
+         ) do
       {:allow, _count} -> :ok
       {:deny, _limit} -> {:error, :rate_limited}
     end
-  end
-
-  defp rate_limiter do
-    Application.get_env(:loopctl, :rate_limiter, Loopctl.RateLimiter.Hammer)
   end
 
   defp retrieve_rate_window_ms do

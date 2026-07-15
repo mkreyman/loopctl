@@ -11,14 +11,14 @@ defmodule LoopctlWeb.Plugs.RateLimiter do
   ## Cluster-global capability (US-38.2)
 
   The per-key/per-tenant RPM check resolves through the `:rate_limiter`
-  behaviour (`Loopctl.RateLimiter.Behaviour`) via config-based DI — the SAME
-  seam `Loopctl.Provider.Admission` and the signup/enroll gates use — instead of
-  calling the node-local ETS `Loopctl.RateLimiter.Server` directly. With the
-  DEFAULT config (`Loopctl.RateLimiter.Hammer`, node-local ETS) this behaves
-  exactly as before: a fixed 60s window `{:allow, count}` / `{:deny, limit}`
-  counter. When an operator selects `Loopctl.RateLimiter.Postgres`, this plug
-  becomes cluster-global with NO further change — the shared counter store
-  enforces one global budget instead of `limit × node_count`.
+  behaviour (`Loopctl.RateLimiter.Behaviour`) via `Loopctl.RateLimiter.impl/0`
+  (config-based DI) — the SAME seam `Loopctl.Provider.Admission` and the
+  signup/enroll gates use. With the DEFAULT config
+  (`Loopctl.RateLimiter.Hammer`, node-local ETS) this behaves as a fixed 60s
+  window `{:allow, count}` / `{:deny, limit}` counter. When an operator selects
+  `Loopctl.RateLimiter.Postgres`, this plug becomes cluster-global with NO
+  further change — the shared counter store enforces one global budget instead
+  of `limit × node_count`.
 
   ## Headers
 
@@ -84,7 +84,7 @@ defmodule LoopctlWeb.Plugs.RateLimiter do
   # outage must never block ALL API traffic, only degrade to "no gate". An
   # unexpected `{:error, _}` (or any non allow/deny shape) is also treated as allow.
   defp check_rate(identifier, limit) do
-    case rate_limiter().check_rate(identifier, @window_ms, limit) do
+    case Loopctl.RateLimiter.impl().check_rate(identifier, @window_ms, limit) do
       {:allow, count} when is_integer(count) -> {:allow, count}
       {:deny, denied_limit} when is_integer(denied_limit) -> {:deny, denied_limit}
       other -> fail_open(identifier, "limiter returned #{inspect(other)}")
@@ -104,12 +104,6 @@ defmodule LoopctlWeb.Plugs.RateLimiter do
 
     {:allow, 0}
   end
-
-  # Config-based DI (project convention): resolve at call time so config/test.exs
-  # can swap in Loopctl.MockRateLimiter. NEVER passed as an opt. Default is the
-  # node-local ETS impl (today's behaviour).
-  defp rate_limiter,
-    do: Application.get_env(:loopctl, :rate_limiter, Loopctl.RateLimiter.Hammer)
 
   # Unix timestamp (seconds) when the current fixed 60s window rolls over.
   # Computed purely from the wall clock — window boundaries align to unix-minute

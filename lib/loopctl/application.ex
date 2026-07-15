@@ -35,7 +35,6 @@ defmodule Loopctl.Application do
       # activity-gated. After PubSub (it subscribes in init) and Oban (it inserts
       # jobs). Purely additive — the per-minute cron is unchanged.
       Loopctl.AuditChain.SthEnqueuer,
-      Loopctl.RateLimiter.Server,
       # US-37.5: owns the public ETS table holding the per-tenant in-flight HeavyRead
       # counters so a stable, long-lived owner survives the transient request/worker
       # process that incremented one. acquire/release BYPASS this owner (lock-free

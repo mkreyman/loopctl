@@ -11,7 +11,9 @@ defmodule Loopctl.Provider.AdmissionTest do
   import ExUnit.CaptureLog
   import Mox
 
+  alias Loopctl.AdminRepo
   alias Loopctl.Provider.Admission
+  alias Loopctl.RateLimiter.Postgres
 
   @tenant_a Ecto.UUID.generate()
   @tenant_b Ecto.UUID.generate()
@@ -183,5 +185,36 @@ defmodule Loopctl.Provider.AdmissionTest do
 
     # max(1, -100) + (0..5) => 1..6.
     assert Enum.all?(results, &(is_integer(&1) and &1 >= 1 and &1 <= 6))
+  end
+
+  describe "TC-38.2.3: admission goes cluster-global through the SELECTED Postgres impl" do
+    test "two admits for the same (tenant, provider) share ONE Postgres counter row" do
+      # TC-38.2.3 / AC-38.2.2 name Provider.Admission as a site that MUST become
+      # cluster-global through the SAME `Loopctl.RateLimiter` behaviour seam the
+      # web plug uses. Route the DI-resolved limiter to the REAL Postgres impl
+      # (standing in for RATE_LIMITER=postgres) and prove admission's checks land
+      # on the SHARED Postgres counter: two admits for the same (tenant, provider)
+      # increment ONE row to 2. Under the node-local ETS default each node would
+      # instead keep its own bucket (the limit×N gap this story closes); here the
+      # shared store means N nodes would share a single global budget.
+      tenant = Ecto.UUID.generate()
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, window_ms, limit ->
+        Postgres.check_rate(bucket, window_ms, limit)
+      end)
+
+      assert :ok = Admission.admit(tenant, :embedding)
+      assert :ok = Admission.admit(tenant, :embedding)
+
+      %{rows: [[total]]} =
+        AdminRepo.query!(
+          "SELECT COALESCE(SUM(count), 0)::int FROM rate_limit_counters WHERE bucket = $1",
+          ["provider_admission:embedding:#{tenant}"]
+        )
+
+      # Both admits hit the SAME shared counter (cluster-global), not two
+      # independent per-node stores.
+      assert total == 2
+    end
   end
 end

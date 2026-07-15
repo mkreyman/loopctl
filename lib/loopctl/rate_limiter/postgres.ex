@@ -12,11 +12,15 @@ defmodule Loopctl.RateLimiter.Postgres do
   so a limit configured today means the same thing on 1 node or 10.
 
   It is selected via config-based DI (`:rate_limiter`); when UNSELECTED — the
-  DEFAULT — this module is never invoked and behaviour is byte-for-byte today's
-  node-local ETS. Every behaviour-based caller (the web RPM plug,
-  `Loopctl.Provider.Admission`, the signup/enroll/retrieve rate gates) becomes
-  cluster-global with NO call-site change the moment the Postgres impl is
-  selected — they all resolve `rate_limiter().check_rate/3`.
+  DEFAULT — this module is never invoked and the limiter is the node-local ETS
+  `Loopctl.RateLimiter.Hammer`. Single-node results are OBSERVABLY IDENTICAL
+  across the two (both are fixed-60s-window `count <= limit` counters aligned to
+  unix-minute boundaries); it is a different in-memory store, not literally the
+  same bytes, so the guarantee is behavioural parity, not a byte-for-byte store.
+  Every behaviour-based caller (the web RPM plug, `Loopctl.Provider.Admission`,
+  the signup/enroll/retrieve rate gates) becomes cluster-global with NO call-site
+  change the moment the Postgres impl is selected — they all resolve the active
+  impl via `Loopctl.RateLimiter.impl/0` and call `check_rate/3`.
 
   ## Algorithm — atomic FIXED-WINDOW counter (no read-modify-write race)
 
@@ -85,8 +89,10 @@ defmodule Loopctl.RateLimiter.Postgres do
       when is_binary(bucket) and is_integer(window_ms) and is_integer(limit) do
     # Align the window to the wall clock so every node buckets an event to the
     # SAME window_start (cluster-global correctness) and windows reset on shared
-    # boundaries — the same fixed-window shape Hammer/`RateLimiter.Server` use.
-    window_start = div(System.system_time(:millisecond), window_ms) * window_ms
+    # boundaries — the same fixed-window shape Hammer uses. The clock is resolved
+    # via config-based DI (`:clock`, default `Loopctl.Clock.Default`) so a test
+    # can pin/advance the wall clock and assert window rollover deterministically.
+    window_start = div(now_ms(), window_ms) * window_ms
 
     %{rows: [[count]]} = AdminRepo.query!(@upsert, [bucket, window_start])
 
@@ -108,4 +114,11 @@ defmodule Loopctl.RateLimiter.Postgres do
 
     {:allow, 0}
   end
+
+  # Current wall-clock milliseconds via the DI-injected clock (default real
+  # system time). Mirrors the injectable clock the other windowed limiters use so
+  # window boundaries are deterministically testable.
+  defp now_ms, do: DateTime.to_unix(clock().utc_now(), :millisecond)
+
+  defp clock, do: Application.get_env(:loopctl, :clock, Loopctl.Clock.Default)
 end

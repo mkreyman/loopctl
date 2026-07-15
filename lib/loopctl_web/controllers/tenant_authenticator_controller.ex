@@ -529,14 +529,14 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
   defp check_rate_limit(tenant_id) do
     bucket = "enroll:actions:#{tenant_id}"
 
-    case rate_limiter().check_rate(bucket, @enroll_rate_window_ms, @max_enroll_actions_per_window) do
+    case Loopctl.RateLimiter.impl().check_rate(
+           bucket,
+           @enroll_rate_window_ms,
+           @max_enroll_actions_per_window
+         ) do
       {:allow, _count} -> :ok
       {:deny, _limit} -> {:error, :rate_limited}
     end
-  end
-
-  defp rate_limiter do
-    Application.get_env(:loopctl, :rate_limiter, Loopctl.RateLimiter.Hammer)
   end
 
   # Ownership check: the caller's user-role key must belong to the target

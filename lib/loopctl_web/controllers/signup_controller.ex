@@ -59,7 +59,7 @@ defmodule LoopctlWeb.SignupController do
     # payloads would 422 without ever counting against the cap, defeating it.
     bucket = "api_signup:ip:#{client_ip(conn)}"
 
-    case rate_limiter().check_rate(bucket, @rate_window_ms, @max_signups_per_ip) do
+    case Loopctl.RateLimiter.impl().check_rate(bucket, @rate_window_ms, @max_signups_per_ip) do
       {:allow, _count} -> validate_and_signup(conn, params)
       {:deny, _limit} -> rate_limited(conn)
     end
@@ -156,10 +156,6 @@ defmodule LoopctlWeb.SignupController do
       RemoteIp.proxy?(ip) -> "req:#{System.unique_integer([:positive])}"
       true -> RemoteIp.to_string_ip(ip) || "req:#{System.unique_integer([:positive])}"
     end
-  end
-
-  defp rate_limiter do
-    Application.get_env(:loopctl, :rate_limiter, Loopctl.RateLimiter.Hammer)
   end
 
   defp unprocessable(conn, message, details \\ nil) do

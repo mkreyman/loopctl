@@ -138,17 +138,13 @@ defmodule LoopctlWeb.SignupLive do
     end
   end
 
-  defp rate_limiter do
-    Application.get_env(:loopctl, :rate_limiter, Loopctl.RateLimiter.Hammer)
-  end
-
   # Shared per-connection action budget. Every abusable handler draws from this
   # single bucket so the TOTAL rate of expensive/logging/echoing events is
   # bounded (no single handler is an unrated amplifier).
   defp ensure_action_budget(socket) do
     bucket = "signup:actions:#{socket.assigns.rate_key}"
 
-    case rate_limiter().check_rate(bucket, @rate_window_ms, @max_actions_per_window) do
+    case Loopctl.RateLimiter.impl().check_rate(bucket, @rate_window_ms, @max_actions_per_window) do
       {:allow, _count} -> :ok
       {:deny, _limit} -> {:error, "Too many attempts. Please slow down and try again later."}
     end
@@ -350,7 +346,7 @@ defmodule LoopctlWeb.SignupLive do
         with :ok <- ensure_action_budget(socket),
              :ok <- ensure_tenant_field_sizes(params),
              {:allow, _count} <-
-               rate_limiter().check_rate(
+               Loopctl.RateLimiter.impl().check_rate(
                  socket.assigns.rate_key,
                  @rate_window_ms,
                  @max_signups_per_ip
@@ -397,7 +393,11 @@ defmodule LoopctlWeb.SignupLive do
   defp ensure_verification_budget(socket) do
     bucket = "signup:webauthn:#{socket.assigns.rate_key}"
 
-    case rate_limiter().check_rate(bucket, @rate_window_ms, @max_webauthn_verifications) do
+    case Loopctl.RateLimiter.impl().check_rate(
+           bucket,
+           @rate_window_ms,
+           @max_webauthn_verifications
+         ) do
       {:allow, _count} -> :ok
       {:deny, _limit} -> {:error, "Too many verification attempts. Please try again later."}
     end

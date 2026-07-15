@@ -7,12 +7,19 @@ defmodule Loopctl.RateLimiter.PostgresTest do
   `:rate_limiter` DI key — the impl's own correctness is proven at the source,
   not through a mock. Every bucket key is uniquified per test so async runs
   never collide on a shared `(bucket, window_start)` counter row.
+
+  The genuine cross-CONNECTION atomicity property (two independent DB
+  connections racing the same counter row — the one thing this shared store
+  exists to guarantee) is proven in `Loopctl.RateLimiter.PostgresConcurrencyTest`,
+  which must run `async: false` against COMMITTED rows: a single sandbox
+  connection serializes all statements and so cannot distinguish an atomic upsert
+  from a racy read-modify-write.
   """
   use Loopctl.DataCase, async: true
 
   import ExUnit.CaptureLog
+  import Mox
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.RateLimiter.Postgres
 
   @window_ms 60_000
@@ -60,38 +67,36 @@ defmodule Loopctl.RateLimiter.PostgresTest do
     end
   end
 
-  describe "TC-38.2.2: cluster-global atomicity (combined budget, not N×)" do
-    test "two concurrent callers sharing the store are capped at the GLOBAL budget" do
-      # This is the point of the story: the same bucket hit by two independent
-      # callers (standing in for two nodes) must admit AT MOST `limit` in total —
-      # never 2×limit — because the increment-and-check is a single atomic upsert
-      # (no read-modify-write race). Both tasks share this test's sandboxed
-      # AdminRepo connection via explicit allowances.
-      b = bucket("cluster")
-      limit = 20
-      per_caller = 30
-      parent = self()
+  describe "fixed-window rollover (Hammer-equivalent reset at the boundary)" do
+    test "the counter resets to zero when the window rolls over" do
+      # AC-38.2.4: window semantics must match the Hammer fixed-window contract
+      # "closely enough that a limit configured today means the same thing" — i.e.
+      # the counter RESETS at the window boundary. The impl derives window_start
+      # from the DI-injected clock, so we PIN the wall clock to one window, exhaust
+      # the limit, then ADVANCE it into the next 60s window and assert the count
+      # starts over from 1 (a fresh window opens) — the property that cannot be
+      # asserted from inside a single real-time window.
+      b = bucket("rollover")
+      limit = 3
 
-      tasks =
-        for _ <- 1..2 do
-          Task.async(fn ->
-            Sandbox.allow(Loopctl.AdminRepo, parent, self())
-            for _ <- 1..per_caller, do: Postgres.check_rate(b, @window_ms, limit)
-          end)
-        end
+      # An Agent holds the "current" instant so a SINGLE stub deterministically
+      # advances the clock across the boundary.
+      w1 = ~U[2026-07-15 10:00:30Z]
+      # +60s → the next unix-minute-aligned 60_000ms window.
+      w2 = ~U[2026-07-15 10:01:30Z]
+      {:ok, now} = Agent.start_link(fn -> w1 end)
+      stub(Loopctl.MockClock, :utc_now, fn -> Agent.get(now, & &1) end)
 
-      results = tasks |> Enum.flat_map(&Task.await(&1, 10_000))
+      # Window 1: allow up to the limit, then deny.
+      assert {:allow, 1} = Postgres.check_rate(b, @window_ms, limit)
+      assert {:allow, 2} = Postgres.check_rate(b, @window_ms, limit)
+      assert {:allow, 3} = Postgres.check_rate(b, @window_ms, limit)
+      assert {:deny, ^limit} = Postgres.check_rate(b, @window_ms, limit)
 
-      allowed = Enum.count(results, &match?({:allow, _}, &1))
-
-      # COMBINED allowed count is exactly the global budget — not 2×limit.
-      assert allowed == limit
-      assert Enum.count(results, &match?({:deny, _}, &1)) == 2 * per_caller - limit
-      # No allowed count ever exceeds the limit (atomic increment guarantee).
-      assert Enum.all?(results, fn
-               {:allow, c} -> c <= limit
-               {:deny, ^limit} -> true
-             end)
+      # Advance into window 2 → a fresh counter row; the budget resets to full.
+      Agent.update(now, fn _ -> w2 end)
+      assert {:allow, 1} = Postgres.check_rate(b, @window_ms, limit)
+      assert {:allow, 2} = Postgres.check_rate(b, @window_ms, limit)
     end
   end
 
@@ -126,27 +131,51 @@ defmodule Loopctl.RateLimiter.PostgresTest do
     end
   end
 
-  describe "TC-38.2.1: default DI resolves to the node-local ETS impl" do
-    test "an unset :rate_limiter config falls back to Loopctl.RateLimiter.Hammer (ETS)" do
-      # In prod/dev the :rate_limiter key is unset, so every caller falls back to
-      # the ETS/Hammer default. config/test.exs deliberately overrides it to
-      # Loopctl.MockRateLimiter, so we assert the FALLBACK constant an unset
-      # config yields (via a deliberately-unset probe key), not the test override.
-      assert Loopctl.RateLimiter.Hammer ==
-               Application.get_env(
-                 :loopctl,
-                 :__rate_limiter_default_probe__,
-                 Loopctl.RateLimiter.Hammer
-               )
+  describe "TC-38.2.1: default-off safety (ETS by default + single-node parity)" do
+    test "the PRODUCTION default resolver yields the node-local ETS Hammer impl" do
+      # AC-38.2.3 default-safety: with `:rate_limiter` unset (prod/dev), every
+      # caller falls back to the node-local ETS impl. Assert against the REAL
+      # production constant `Loopctl.RateLimiter.default_impl/0` — the exact value
+      # `impl/0` returns when the key is absent — NOT a hardcoded literal. If the
+      # default were changed to Postgres (or the fallback deleted) this fails, so
+      # it is not tautological: it exercises the shipped resolver.
+      assert Loopctl.RateLimiter.default_impl() == Loopctl.RateLimiter.Hammer
 
-      # Both impls satisfy the shared behaviour, so the DI seam is swap-safe.
+      # The resolver reads the config key: `config/test.exs` sets the mock, so
+      # `impl/0` returns it — proving the seam both the web plug and admission use
+      # is config-driven (swap the key → swap the impl fleet-wide, no call-site
+      # edit).
+      assert Loopctl.RateLimiter.impl() == Loopctl.MockRateLimiter
+
+      # Both concrete impls satisfy the shared behaviour, so the DI seam is
+      # swap-safe in either direction.
       Code.ensure_loaded!(Loopctl.RateLimiter.Hammer)
       Code.ensure_loaded!(Loopctl.RateLimiter.Postgres)
       assert function_exported?(Loopctl.RateLimiter.Hammer, :check_rate, 3)
       assert function_exported?(Loopctl.RateLimiter.Postgres, :check_rate, 3)
+    end
 
-      # And the test-env override is active so integration tests use the mock.
-      assert Loopctl.MockRateLimiter == Application.get_env(:loopctl, :rate_limiter)
+    test "single-node results are IDENTICAL to the fixed-window contract the ETS impl honors" do
+      # AC-38.2.3: "single-node results are identical." The node-local ETS
+      # (Hammer) contract is a fixed-window post-increment counter that allows
+      # while `count <= limit`. Assert the Postgres impl reproduces that EXACT
+      # allow/deny sequence single-node — so selecting it changes only the STORE
+      # (per-node → shared), never the per-request decision a limit yields. This
+      # runs the real `Postgres.check_rate/3`, so deleting it fails the test.
+      b = bucket("parity")
+      limit = 4
+
+      results = for _ <- 1..7, do: Postgres.check_rate(b, @window_ms, limit)
+
+      assert results == [
+               {:allow, 1},
+               {:allow, 2},
+               {:allow, 3},
+               {:allow, 4},
+               {:deny, 4},
+               {:deny, 4},
+               {:deny, 4}
+             ]
     end
   end
 end
