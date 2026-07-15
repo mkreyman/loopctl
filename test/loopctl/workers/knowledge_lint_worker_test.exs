@@ -148,6 +148,40 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert entry.new_state["orphans_embedding_enqueued"] == 1
     end
 
+    test "US-37.4: BATCHES the orphan-embedding backfill — N orphans => one array call, not N" do
+      tenant = fixture(:tenant)
+      test_pid = self()
+
+      orphans = for _ <- 1..3, do: published_without_embedding(tenant.id)
+
+      # Count provider round-trips via a message per BATCH call.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _t, texts ->
+        send(test_pid, {:batch_call, length(texts)})
+        {:ok, Enum.map(texts, fn _ -> List.duplicate(0.1, 1536) end)}
+      end)
+
+      # The per-article path must NOT be used for the bulk backfill.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        flunk("orphan backfill must batch, not use per-article generate_embedding/2")
+      end)
+
+      assert :ok =
+               KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      # ONE array call covered all 3 orphans (batch_max default ~100), not 3 calls.
+      assert drain_batch_calls([]) == [3]
+
+      for o <- orphans do
+        assert {:ok, %{embedding: emb}} =
+                 Loopctl.Knowledge.get_article_with_embedding(tenant.id, o.id)
+
+        refute is_nil(emb)
+      end
+
+      assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["orphans_embedding_enqueued"] == 3
+    end
+
     test "handles a tenant with no published articles" do
       tenant = fixture(:tenant)
 
@@ -325,6 +359,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert [_only_one] = conflict_links(tenant.id, a.id, b.id)
       assert [_, second] = lint_audit_entries(tenant.id) |> Enum.sort_by(& &1.inserted_at)
       assert second.new_state["conflicts_promoted"] == 0
+    end
+  end
+
+  # Collect all {:batch_call, n} messages currently in the mailbox (batch workers ran
+  # inline before perform/1 returned, so they're all already delivered).
+  defp drain_batch_calls(acc) do
+    receive do
+      {:batch_call, n} -> drain_batch_calls([n | acc])
+    after
+      0 -> acc
     end
   end
 end

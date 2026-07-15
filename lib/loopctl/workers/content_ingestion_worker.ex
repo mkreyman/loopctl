@@ -53,6 +53,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ContentChunker
   alias Loopctl.Llm
@@ -62,7 +63,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Provider.Admission
   alias Loopctl.Provider.RetryAfter
   alias Loopctl.SystemConfig
-  alias Loopctl.Workers.ArticleEmbeddingWorker
+  alias Loopctl.Workers.BatchArticleEmbeddingWorker
 
   @content_extractor Application.compile_env(
                        :loopctl,
@@ -944,13 +945,26 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     }
   end
 
-  # Enqueue an embedding job for each just-inserted (published) article. Runs
+  # Enqueue embedding jobs for the just-inserted (published) articles. Runs
   # post-commit and is best-effort: a transient enqueue failure is logged, never
   # raised, so it can't fail/retry the whole ingestion job.
+  #
+  # US-37.4 (HIGH review): this is the PRIMARY automated bulk article-ingest path
+  # (up to ~60 articles per job), so it BATCHES — chunk the inserted rows into groups
+  # of `Knowledge.embedding_batch_max/0` (~100) and enqueue ONE
+  # `BatchArticleEmbeddingWorker` per chunk, which embeds the whole chunk in a single
+  # provider array call (one admission token + one concurrency slot per batch). This
+  # collapses the old per-article `ArticleEmbeddingWorker` fan-out that issued one
+  # provider round-trip per ingested article — the exact amplification US-37.4
+  # targets. Per-chunk `Oban.insert/1` (NOT `insert_all`) so the batch worker's
+  # `unique:` window is honored (the basic Oban engine ignores `unique:` for
+  # `insert_all`). The interactive single-article publish path stays per-record.
   defp enqueue_embeddings(tenant_id, returned) do
-    Enum.each(returned, fn article ->
-      %{article_id: article.id, tenant_id: tenant_id}
-      |> ArticleEmbeddingWorker.new()
+    returned
+    |> Enum.chunk_every(Knowledge.embedding_batch_max())
+    |> Enum.each(fn chunk ->
+      %{article_ids: Enum.map(chunk, & &1.id), tenant_id: tenant_id}
+      |> BatchArticleEmbeddingWorker.new()
       |> Oban.insert()
     end)
   rescue

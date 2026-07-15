@@ -40,6 +40,18 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
 
   @default_base_url "https://api.openai.com/v1"
 
+  # Single (interactive) path receive_timeout default — kept tight (latency-sensitive).
+  @default_receive_timeout_ms 4_000
+
+  # Batch path receive_timeout defaults (review MED #3). The batch path gets its OWN,
+  # count-SCALED receive_timeout instead of reusing the single-text-tuned
+  # `embedding_receive_timeout_ms` (raising that would also loosen the latency-sensitive
+  # interactive path). base + per-item mirrors the worker's yield shape; the base is
+  # kept strictly BELOW the worker's yield base so the HTTP call fails cleanly before
+  # the worker's Task.yield shuts the task down. Live-tunable via SystemConfig.
+  @default_batch_receive_base_ms 6_000
+  @default_batch_receive_per_item_ms 100
+
   @impl true
   def generate_embedding(tenant_id, text) when is_binary(tenant_id) do
     case Llm.resolve(tenant_id, :embedding) do
@@ -49,6 +61,24 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
 
       {:ok, %{api_key: api_key, model: model}} ->
         post(tenant_id, api_key, model, text)
+    end
+  end
+
+  @impl true
+  def generate_embeddings(tenant_id, texts)
+      when is_binary(tenant_id) and is_list(texts) do
+    # An empty batch never touches the provider (no admission token spent).
+    if texts == [] do
+      {:ok, []}
+    else
+      case Llm.resolve(tenant_id, :embedding) do
+        {:error, :no_api_key} ->
+          # Mandatory BYO: no tenant key => no provider call, no operator spend.
+          {:error, :no_api_key}
+
+        {:ok, %{api_key: api_key, model: model}} ->
+          post_batch(tenant_id, api_key, model, texts)
+      end
     end
   end
 
@@ -63,51 +93,156 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
     end
   end
 
+  # US-37.4: batch variant. ONE admission token is taken for the WHOLE array
+  # (AC-37.4.4) — the same single gate as the single-text path — so a ~100-text
+  # batch is one bucket draw, not 100. Same breaker-exempt fast-fail on an empty
+  # bucket.
+  defp post_batch(tenant_id, api_key, model, texts) do
+    with :ok <- Admission.admit(tenant_id, :embedding) do
+      do_post_batch(tenant_id, api_key, model, texts)
+    end
+  end
+
   defp do_post(tenant_id, api_key, model, text) do
-    base_url = provider_config()[:base_url] || @default_base_url
+    opts = request_opts(api_key, %{input: text, model: model}, single_receive_timeout_ms())
 
-    # Kept STRICTLY BELOW `Knowledge`'s Task.yield budget (review #10): a single
-    # attempt, no client-side retries by default. The embedding endpoint is fast;
-    # job-level retry is Oban's responsibility for the worker, and the query path
-    # fast-fails to keyword search. This guarantees a valid embed returns before
-    # the guard kills it. Both knobs are DB-backed and live-tunable via
-    # Loopctl.SystemConfig; the in-code defaults match the seeded rows and apply on
-    # a cache miss (safe degrade) — keep any raised timeout under the yield budget.
-    opts =
-      [
-        json: %{input: text, model: model},
-        # NOTE: never log `opts` / `api_key` — the key is a tenant secret.
-        headers: [{"authorization", "Bearer #{api_key}"}],
-        retry: :transient,
-        max_retries: SystemConfig.get_int("embedding_max_retries", 0),
-        receive_timeout: SystemConfig.get_int("embedding_receive_timeout_ms", 4_000)
-      ]
-      |> maybe_put_plug()
-
-    case Req.post("#{base_url}/embeddings", opts) do
+    case Req.post(embeddings_url(), opts) do
       {:ok, %{status: 200, body: %{"data" => [%{"embedding" => embedding} | _]} = resp}} ->
         record_usage_safe(tenant_id, model, resp["usage"])
         {:ok, embedding}
 
-      {:ok, %{status: status, body: body} = resp} ->
-        Logger.warning("Loopctl.Knowledge.EmbeddingClient: API error (status=#{status})")
-        # US-37.3: on a throttle response (429/503) parse the provider Retry-After
-        # and thread it (clamped, value-free) into the sanitized error so the
-        # tenant-scoped breaker cooldown AND the Oban worker snooze honor it instead
-        # of blind polynomial backoff. Absent/garbage → nil → the legacy 3-tuple.
-        # SANITIZE either way: the provider error body can echo a masked key fragment
-        # (review #3). Drop it — keep only status (+ Retry-After) — so it never
-        # reaches the caller / an Oban `{:error, reason}` persisted into oban_jobs.errors.
-        retry_after = RetryAfter.from_response(status, resp)
-        {:error, ProviderError.sanitize({:api_error, status, body}, retry_after)}
-
-      {:error, reason} ->
-        Logger.warning(
-          "Loopctl.Knowledge.EmbeddingClient: request failed (#{ProviderError.log_tag({:request_failed, reason})})"
-        )
-
-        {:error, {:request_failed, reason}}
+      other ->
+        handle_error(other)
     end
+  end
+
+  # Sends `input` as an ARRAY and maps each returned `%{"index" => i, "embedding" =>
+  # v}` back to input position `i` — sorting/looking up BY the response index, NEVER
+  # by array position (AC-37.4.1). Returns vectors in INPUT ORDER so the caller can
+  # zip them against `texts`. A short/mismatched `data` array (any input index with
+  # no returned vector) fails the WHOLE batch (AC-37.4.3) — no partial/misaligned
+  # result reaches the caller.
+  defp do_post_batch(tenant_id, api_key, model, texts) do
+    opts =
+      request_opts(
+        api_key,
+        %{input: texts, model: model},
+        batch_receive_timeout_ms(length(texts))
+      )
+
+    case Req.post(embeddings_url(), opts) do
+      {:ok, %{status: 200, body: %{"data" => data} = resp}} when is_list(data) ->
+        case map_vectors_by_index(data, length(texts)) do
+          {:ok, vectors} ->
+            record_usage_safe(tenant_id, model, resp["usage"])
+            {:ok, vectors}
+
+          :error ->
+            Logger.warning(
+              "Loopctl.Knowledge.EmbeddingClient: batch response index mismatch " <>
+                "(#{length(data)} vectors for #{length(texts)} inputs)"
+            )
+
+            {:error, {:embedding_index_mismatch, length(texts), length(data)}}
+        end
+
+      other ->
+        handle_error(other)
+    end
+  end
+
+  # `receive_timeout` is caller-supplied and kept STRICTLY BELOW `Knowledge`'s
+  # Task.yield budget (review #10): a single attempt, no client-side retries by
+  # default. The single (interactive) path uses a tight, latency-sensitive budget;
+  # the batch path a count-SCALED one (see the callers). Job-level retry is Oban's
+  # responsibility for the worker, and the query path fast-fails to keyword search.
+  # All knobs are DB-backed and live-tunable via Loopctl.SystemConfig; the in-code
+  # defaults match the seeded rows and apply on a cache miss (safe degrade).
+  defp request_opts(api_key, json_body, receive_timeout) do
+    [
+      json: json_body,
+      # NOTE: never log `opts` / `api_key` — the key is a tenant secret.
+      headers: [{"authorization", "Bearer #{api_key}"}],
+      retry: :transient,
+      max_retries: SystemConfig.get_int("embedding_max_retries", 0),
+      receive_timeout: receive_timeout
+    ]
+    |> maybe_put_plug()
+  end
+
+  defp single_receive_timeout_ms do
+    SystemConfig.get_int("embedding_receive_timeout_ms", @default_receive_timeout_ms)
+  end
+
+  # Batch path receive_timeout: base + per-item, scaled by the array size so a large
+  # ~100-input request gets proportionally more wire time than one text — WITHOUT
+  # loosening the single-path timeout. Mirrors the worker's yield shape (smaller base)
+  # so it always fails before the worker's yield.
+  defp batch_receive_timeout_ms(count) do
+    base = SystemConfig.get_int("embedding_batch_receive_base_ms", @default_batch_receive_base_ms)
+
+    per_item =
+      SystemConfig.get_int(
+        "embedding_batch_receive_per_item_ms",
+        @default_batch_receive_per_item_ms
+      )
+
+    base + per_item * max(count, 1)
+  end
+
+  defp embeddings_url do
+    base_url = provider_config()[:base_url] || @default_base_url
+    "#{base_url}/embeddings"
+  end
+
+  # Builds the map index -> embedding from the (order-unguaranteed) `data` array,
+  # then pulls one vector per input position 0..count-1. Any missing index halts
+  # with `:error` (batch fails as a unit). Non-integer/malformed entries are dropped
+  # from the lookup, which surfaces as a missing index below.
+  defp map_vectors_by_index(data, count) do
+    by_index =
+      Enum.reduce(data, %{}, fn
+        %{"index" => i, "embedding" => v}, acc when is_integer(i) and is_list(v) ->
+          Map.put(acc, i, v)
+
+        _, acc ->
+          acc
+      end)
+
+    result =
+      Enum.reduce_while(0..(count - 1)//1, [], fn i, acc ->
+        case Map.fetch(by_index, i) do
+          {:ok, v} -> {:cont, [v | acc]}
+          :error -> {:halt, :error}
+        end
+      end)
+
+    case result do
+      :error -> :error
+      list -> {:ok, Enum.reverse(list)}
+    end
+  end
+
+  # Shared non-200 / transport handling for BOTH the single and batch paths.
+  defp handle_error({:ok, %{status: status, body: body} = resp}) do
+    Logger.warning("Loopctl.Knowledge.EmbeddingClient: API error (status=#{status})")
+    # US-37.3: on a throttle response (429/503) parse the provider Retry-After
+    # and thread it (clamped, value-free) into the sanitized error so the
+    # tenant-scoped breaker cooldown AND the Oban worker snooze honor it instead
+    # of blind polynomial backoff. Absent/garbage → nil → the legacy 3-tuple.
+    # SANITIZE either way: the provider error body can echo a masked key fragment
+    # (review #3). Drop it — keep only status (+ Retry-After) — so it never
+    # reaches the caller / an Oban `{:error, reason}` persisted into oban_jobs.errors.
+    retry_after = RetryAfter.from_response(status, resp)
+    {:error, ProviderError.sanitize({:api_error, status, body}, retry_after)}
+  end
+
+  defp handle_error({:error, reason}) do
+    Logger.warning(
+      "Loopctl.Knowledge.EmbeddingClient: request failed (#{ProviderError.log_tag({:request_failed, reason})})"
+    )
+
+    {:error, {:request_failed, reason}}
   end
 
   # BEST-EFFORT usage recording: the embedding call has already SUCCEEDED (and been
