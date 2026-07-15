@@ -382,14 +382,15 @@ defmodule LoopctlWeb.ContextRetrieverController do
   defp check_retrieve_rate(tenant_id) do
     bucket = "cr_retrieve:tenant:#{tenant_id}"
 
-    case rate_limiter().check_rate(bucket, retrieve_rate_window_ms(), retrieve_rate_limit()) do
-      {:allow, _count} -> :ok
-      {:deny, _limit} -> {:error, :rate_limited}
+    # FAIL-OPEN capacity gate (per-tenant retrieval throughput, not an auth
+    # gate): on a limiter fault allow, matching the RPM plug / admission parity.
+    # `within_limit?/3` absorbs the behaviour's `{:error, _}` shape so a
+    # soft-error can't raise CaseClauseError → 500.
+    if Loopctl.RateLimiter.within_limit?(bucket, retrieve_rate_window_ms(), retrieve_rate_limit()) do
+      :ok
+    else
+      {:error, :rate_limited}
     end
-  end
-
-  defp rate_limiter do
-    Application.get_env(:loopctl, :rate_limiter, Loopctl.RateLimiter.Hammer)
   end
 
   defp retrieve_rate_window_ms do

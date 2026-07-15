@@ -19,7 +19,7 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
     * a PER-TENANT cap (`:export_max_concurrent_per_tenant`, default #{1}) — so one
       tenant firing many exports can't consume the whole global budget.
 
-  ## Design (mirrors `Loopctl.RateLimiter.Server`)
+  ## Design (GenServer-owned ETS in-flight counter)
 
   A single GenServer owns a public, named ETS table of in-flight counters. WRITES
   (acquire/release) are SERIALIZED through the GenServer's `handle_call`, so each

@@ -415,6 +415,11 @@ defmodule Loopctl.ObanConfig do
          {"45 4 * * *", Loopctl.Workers.PromotionEvalWorker, args: %{"mode" => "all_tenants"}},
          {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
          {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
+         # US-38.2: prune expired windows from the cluster-global Postgres rate
+         # limiter's counter table. A cheap index-range delete; a no-op when the
+         # Postgres limiter is unselected (table empty). Keep in sync with the
+         # crontab assertion in oban_plugins_config_test.exs.
+         {"*/10 * * * *", Loopctl.Workers.RateLimitCounterCleanupWorker},
          # Cross-tenant memory-promotion sweep (Epic 29 / US-29.2). Runs every 10 min —
          # KEEP this in sync with :memory_promotion_sweep_interval_seconds (600) below,
          # which is the data form of this schedule that the boot invariant reasons over.

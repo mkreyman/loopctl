@@ -67,11 +67,14 @@ defmodule Loopctl.Provider.Admission do
   Live-tunable via `"provider_admission_snooze_seconds"` (default 5s); the jitter
   avoids a thundering-herd of snoozed jobs re-checking in lockstep.
 
-  ## Node-local by design (AC-37.1.6)
+  ## Node-local by DEFAULT; cluster-global when the Postgres impl is selected
 
-  Hammer's default backend is node-local ETS, so each node keeps its own bucket.
-  A cluster-wide shared bucket is explicitly OUT OF SCOPE (deferred to Epic 38);
-  the effective fleet ceiling is `rpm * node_count`.
+  This gate resolves the active limiter through `Loopctl.RateLimiter.impl/0`. The
+  DEFAULT is Hammer's node-local ETS, so each node keeps its own bucket and the
+  effective fleet ceiling is `rpm * node_count`. US-38.2 (Epic 38) makes this
+  cluster-global OPT-IN: setting `RATE_LIMITER=postgres` swaps in the shared
+  `Loopctl.RateLimiter.Postgres` counter store, and this gate enforces ONE global
+  budget with no change here (the bucket key already isolates each tenant).
 
   ## Fail-OPEN (AC-37.1.6)
 
@@ -131,7 +134,7 @@ defmodule Loopctl.Provider.Admission do
     bucket = bucket_key(tenant_id, provider)
     limit = limit_for(provider)
 
-    case rate_limiter().check_rate(bucket, @window_ms, limit) do
+    case Loopctl.RateLimiter.impl().check_rate(bucket, @window_ms, limit) do
       {:allow, _count} -> :ok
       {:deny, _limit} -> {:error, :rate_limited_local}
       # Hammer's documented soft-error shape ({:error, reason}, e.g. its ETS
@@ -193,9 +196,4 @@ defmodule Loopctl.Provider.Admission do
 
   defp limit_for(:anthropic),
     do: SystemConfig.get_int("provider_admission_anthropic_rpm", @default_anthropic_rpm)
-
-  # Config-based DI (project convention): resolve the limiter at call time so
-  # config/test.exs can swap in Loopctl.MockRateLimiter. NEVER passed as an opt.
-  defp rate_limiter,
-    do: Application.get_env(:loopctl, :rate_limiter, Loopctl.RateLimiter.Hammer)
 end

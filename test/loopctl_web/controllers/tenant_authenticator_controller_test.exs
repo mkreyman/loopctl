@@ -115,8 +115,14 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
       {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
 
-      Mox.expect(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
-        {:deny, 0}
+      # US-38.2: the inbound RPM plug (LoopctlWeb.Plugs.RateLimiter) now also
+      # resolves through the :rate_limiter DI, so it hits this mock first with the
+      # "key:"/"tenant:" buckets. Deny ONLY the controller's own "enroll:actions:"
+      # bucket so the plug lets the request reach the controller, whose rate-limit
+      # check is what we're asserting returns 429 code "rate_limited".
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "enroll:actions:" <> _tenant, _window, _limit -> {:deny, 0}
+        _bucket, _window, _limit -> {:allow, 1}
       end)
 
       conn =
@@ -514,8 +520,14 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
       fixture(:root_authenticator, tenant_id: tenant.id)
       {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
 
-      Mox.expect(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
-        {:deny, 0}
+      # US-38.2: the inbound RPM plug (LoopctlWeb.Plugs.RateLimiter) now also
+      # resolves through the :rate_limiter DI, so it hits this mock first with the
+      # "key:"/"tenant:" buckets. Deny ONLY the controller's own "enroll:actions:"
+      # bucket so the plug lets the request reach the controller, whose rate-limit
+      # check is what we're asserting returns 429 code "rate_limited".
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "enroll:actions:" <> _tenant, _window, _limit -> {:deny, 0}
+        _bucket, _window, _limit -> {:allow, 1}
       end)
 
       resp =
@@ -532,8 +544,14 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
       {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
 
-      Mox.expect(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
-        {:deny, 0}
+      # US-38.2: the inbound RPM plug (LoopctlWeb.Plugs.RateLimiter) now also
+      # resolves through the :rate_limiter DI, so it hits this mock first with the
+      # "key:"/"tenant:" buckets. Deny ONLY the controller's own "enroll:actions:"
+      # bucket so the plug lets the request reach the controller, whose rate-limit
+      # check is what we're asserting returns 429 code "rate_limited".
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "enroll:actions:" <> _tenant, _window, _limit -> {:deny, 0}
+        _bucket, _window, _limit -> {:allow, 1}
       end)
 
       resp =

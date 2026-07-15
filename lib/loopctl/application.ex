@@ -28,6 +28,12 @@ defmodule Loopctl.Application do
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
       {Task.Supervisor, name: Loopctl.TaskSupervisor},
+      # US-38.2: owns the public ETS table backing the throttled, PII-safe
+      # rate-limiter fail-open logger, so a sustained limiter/DB outage emits a
+      # bounded heartbeat per bucket-family instead of one warning per request
+      # (and never writes client IPs into the logs). Node-local; pure ETS owner
+      # with no other dependency.
+      Loopctl.RateLimiter.FailOpenLog,
       {Oban, Application.fetch_env!(:loopctl, Oban)},
       # US-35.2: supervised, node-local singleton that subscribes to the fixed
       # audit-chain firehose topic and debounce-enqueues one ComputeSthWorker job
@@ -35,7 +41,6 @@ defmodule Loopctl.Application do
       # activity-gated. After PubSub (it subscribes in init) and Oban (it inserts
       # jobs). Purely additive — the per-minute cron is unchanged.
       Loopctl.AuditChain.SthEnqueuer,
-      Loopctl.RateLimiter.Server,
       # US-37.5: owns the public ETS table holding the per-tenant in-flight HeavyRead
       # counters so a stable, long-lived owner survives the transient request/worker
       # process that incremented one. acquire/release BYPASS this owner (lock-free

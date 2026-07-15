@@ -138,19 +138,19 @@ defmodule LoopctlWeb.SignupLive do
     end
   end
 
-  defp rate_limiter do
-    Application.get_env(:loopctl, :rate_limiter, Loopctl.RateLimiter.Hammer)
-  end
-
   # Shared per-connection action budget. Every abusable handler draws from this
   # single bucket so the TOTAL rate of expensive/logging/echoing events is
   # bounded (no single handler is an unrated amplifier).
   defp ensure_action_budget(socket) do
     bucket = "signup:actions:#{socket.assigns.rate_key}"
 
-    case rate_limiter().check_rate(bucket, @rate_window_ms, @max_actions_per_window) do
-      {:allow, _count} -> :ok
-      {:deny, _limit} -> {:error, "Too many attempts. Please slow down and try again later."}
+    # FAIL-CLOSED anti-abuse gate: on a limiter fault deny rather than unlock the
+    # shared per-connection budget. `gate_ok?/3` also absorbs the behaviour's
+    # `{:error, _}` shape so a soft-error can't crash the LiveView process.
+    if Loopctl.RateLimiter.gate_ok?(bucket, @rate_window_ms, @max_actions_per_window) do
+      :ok
+    else
+      {:error, "Too many attempts. Please slow down and try again later."}
     end
   end
 
@@ -347,17 +347,21 @@ defmodule LoopctlWeb.SignupLive do
          assign(socket, :error, "Enroll at least one authenticator before completing signup")}
 
       auths ->
+        # FAIL-CLOSED signup-submit gate: `gate_ok?/3` returns false on a deny,
+        # a limiter fault, OR the Postgres fail-open sentinel, so a store fault
+        # can't unlock per-IP signup abuse protection, and the behaviour's
+        # `{:error, _}` shape can't fall through the `with` uncaught.
         with :ok <- ensure_action_budget(socket),
              :ok <- ensure_tenant_field_sizes(params),
-             {:allow, _count} <-
-               rate_limiter().check_rate(
+             true <-
+               Loopctl.RateLimiter.gate_ok?(
                  socket.assigns.rate_key,
                  @rate_window_ms,
                  @max_signups_per_ip
                ) do
           complete_signup(params, auths, socket)
         else
-          {:deny, _limit} ->
+          false ->
             {:noreply,
              assign(socket, :error, "Too many signup attempts. Please try again later.")}
 
@@ -397,9 +401,14 @@ defmodule LoopctlWeb.SignupLive do
   defp ensure_verification_budget(socket) do
     bucket = "signup:webauthn:#{socket.assigns.rate_key}"
 
-    case rate_limiter().check_rate(bucket, @rate_window_ms, @max_webauthn_verifications) do
-      {:allow, _count} -> :ok
-      {:deny, _limit} -> {:error, "Too many verification attempts. Please try again later."}
+    # FAIL-CLOSED brute-force gate (WebAuthn attestation verify is CPU-bound —
+    # Chain-of-Custody v2 L0 protection): on a limiter fault deny rather than
+    # unlock the verify throttle. `gate_ok?/3` also absorbs the behaviour's
+    # `{:error, _}` shape so a soft-error can't crash the LiveView process.
+    if Loopctl.RateLimiter.gate_ok?(bucket, @rate_window_ms, @max_webauthn_verifications) do
+      :ok
+    else
+      {:error, "Too many verification attempts. Please try again later."}
     end
   end
 

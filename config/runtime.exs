@@ -20,6 +20,32 @@ if System.get_env("PHX_SERVER") do
   config :loopctl, LoopctlWeb.Endpoint, server: true
 end
 
+# US-38.2 (Epic 38, GH #353): OPT-IN cluster-global rate limiter.
+#
+# The `:rate_limiter` behaviour impl defaults to node-local ETS
+# (`Loopctl.RateLimiter.Hammer`) — set nowhere, so callers fall back to it —
+# which means any global limit becomes `limit × node_count` across a cluster.
+# Setting `RATE_LIMITER=postgres` selects the shared Postgres-backed impl so the
+# web RPM plug, `Loopctl.Provider.Admission`, and the signup/enroll/retrieve
+# gates all enforce ONE cluster-wide budget with no code change. UNSET (or any
+# other value) leaves today's exact node-local ETS behaviour untouched. This
+# provisions NOTHING — the counter table already ships in a migration; the env
+# var only flips which behaviour impl the DI resolves. Never set to a
+# placeholder value (epic_35 STH_SWEEP_CRON lesson).
+#
+# Operational caveats when enabling (see Loopctl.RateLimiter.Postgres moduledoc):
+#   * Fail-open blast radius broadens to every caller. Capacity gates (RPM plug,
+#     retrieve, provider admission) stay fail-OPEN on a DB fault; the anti-abuse /
+#     brute-force SECURITY gates (signup abuse, WebAuthn-verify, enroll) use
+#     `Loopctl.RateLimiter.gate_ok?/3` and fail-CLOSED, so a DB fault cannot
+#     silently unlock them.
+#   * `check_rate/3` runs a single upsert via the BYPASSRLS `Loopctl.AdminRepo`
+#     on every authenticated request — size/monitor the AdminRepo pool, and note
+#     the hottest bucket's single row is a serialization + autovacuum-bloat point.
+if System.get_env("RATE_LIMITER") == "postgres" do
+  config :loopctl, :rate_limiter, Loopctl.RateLimiter.Postgres
+end
+
 config :loopctl, LoopctlWeb.Endpoint,
   http: [
     port: String.to_integer(System.get_env("PORT", "4000")),
