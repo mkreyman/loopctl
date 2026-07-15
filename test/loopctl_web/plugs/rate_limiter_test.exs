@@ -141,7 +141,10 @@ defmodule LoopctlWeb.Plugs.RateLimiterTest do
           assert resp.status == 200
         end)
 
-      assert log =~ "failing OPEN"
+      # Throttled, PII-safe fail-open log: the bucket is reduced to its
+      # non-identifying family ("key"/"tenant"), never the raw UUID.
+      assert log =~ "fail-open"
+      assert log =~ "family=key"
     end
   end
 end

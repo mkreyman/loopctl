@@ -40,7 +40,7 @@ defmodule Loopctl.RateLimiter.Postgres do
   (see `Loopctl.Provider.Admission`'s window-semantics note): a fresh window
   opens on the first request for a `(bucket, window)` and resets at the boundary.
 
-  ## Bounded cost
+  ## Bounded cost — and its contention/bloat hotspot
 
   Exactly one indexed row touch per check (the `(bucket, window_start)` unique
   index is both the ON CONFLICT target and the point lookup) — never a scan, no
@@ -48,7 +48,25 @@ defmodule Loopctl.RateLimiter.Postgres do
   `Loopctl.Workers.RateLimitCounterCleanupWorker` (a bounded index-range delete
   on `window_start`), not on the hot path.
 
-  ## Access path — `Loopctl.AdminRepo`, cross-tenant
+  This is NOT free at scale, and the design (AC-prescribed) can't avoid it:
+
+    * **Single-row serialization.** Every check — INCLUDING already-over-limit
+      requests — issues `DO UPDATE SET count = count + 1` against the ONE
+      `(bucket, window_start)` row for that bucket's current window. For the
+      hottest tenant under overload (exactly the scenario `RATE_LIMITER=postgres`
+      targets) this converts a lock-free per-node ETS `update_counter` into a
+      network round-trip plus a contended single-row `UPDATE`: every node
+      serializes on that row's lock. The obvious `WHERE count < limit` guard
+      CANNOT be used — a non-matching WHERE returns no row, `%{rows: [[count]]}`
+      fails to match, and the rescue fails OPEN (disabling the limit), so the
+      increment must run on every request.
+    * **Dead-tuple bloat.** Each increment produces a dead tuple, so the hot
+      row bloats within its 60s window until autovacuum catches up.
+
+  Before enabling at scale, consider aggressive per-table autovacuum settings on
+  `rate_limit_counters` and monitor lock waits / row bloat on the hottest buckets.
+
+  ## Access path — `Loopctl.AdminRepo`, cross-tenant, ON THE REQUEST HOT PATH
 
   `rate_limit_counters` is a GLOBAL table with NO `tenant_id`; tenant/key
   isolation lives entirely in the `bucket` STRING (`"key:<uuid>"`,
@@ -58,21 +76,47 @@ defmodule Loopctl.RateLimiter.Postgres do
   dev/test), NEVER `Loopctl.Repo` (whose RLS would block cross-tenant writes).
   RLS is ENABLEd on the table only to deny that low-privilege role.
 
+  This DELIBERATELY broadens where the BYPASSRLS `AdminRepo` connection runs:
+  when this impl is selected, `check_rate/3` issues an `AdminRepo.query!` on the
+  hot path of EVERY authenticated API request and every outbound provider check —
+  wider than `AdminRepo`'s historical "never for regular tenant-scoped requests"
+  scope (see `Loopctl.AdminRepo`). It is safe on the merits: the table holds no
+  tenant data and the statement is a fixed, fully parameterized single upsert, so
+  BYPASSRLS confers no extra leak/injection risk. But two operational
+  consequences must be planned for before a clustered rollout:
+
+    1. Every check consumes an `AdminRepo` pool connection, so under load/attack
+       the limiter can EXHAUST the `AdminRepo` pool → raise → the fail-open path
+       below → self-reinforcing loss of rate limiting under exactly the load the
+       limiter exists to contain. Size and monitor the `AdminRepo` pool for this
+       per-request load before enabling.
+    2. The `AdminRepo` contract is now broader than its original docs — future
+       changes must not assume `AdminRepo` is off the request path.
+
   ## Fail-OPEN (parity with the ETS/Hammer path and US-37.1)
 
   A monitoring/limiter fault must NEVER block all traffic. ANY error raised,
-  exited, or thrown by the DB call is caught, LOGGED, and returns `{:allow, 0}`
-  (allow the request, full remaining) — the limiter degrades to "no gate", never
-  to "deny everything". `{:allow, 0}` (not `{:error, _}`) is returned
-  deliberately so callers that only branch on `{:allow, _}` / `{:deny, _}` (the
-  web plug) stay robust without a call-site change.
+  exited, or thrown by the DB call is caught, LOGGED (throttled + PII-safe, see
+  `fail_open/2`), and returns `{:allow, 0}` (allow the request, full remaining) —
+  the limiter degrades to "no gate", never to "deny everything". `{:allow, 0}`
+  (not `{:error, _}`) is returned deliberately so callers that only branch on
+  `{:allow, _}` / `{:deny, _}` (the web plug) stay robust without a call-site
+  change.
+
+  Selecting this impl broadens fail-open to EVERY caller resolving through
+  `Loopctl.RateLimiter.impl/0`. To keep it from silently unlocking the
+  anti-abuse / brute-force SECURITY gates (signup abuse, WebAuthn-verify,
+  enroll), those gates call `Loopctl.RateLimiter.gate_ok?/3`, which treats the
+  `{:allow, 0}` fail-open sentinel as DENIED (fail-CLOSED). The capacity gates
+  (RPM plug, retrieve, provider admission) intentionally stay fail-OPEN. This
+  tradeoff is also documented at the `RATE_LIMITER=postgres` switch in
+  `config/runtime.exs`.
   """
 
   @behaviour Loopctl.RateLimiter.Behaviour
 
-  require Logger
-
   alias Loopctl.AdminRepo
+  alias Loopctl.RateLimiter.FailOpenLog
 
   @upsert """
   INSERT INTO rate_limit_counters (id, bucket, window_start, count, inserted_at, updated_at)
@@ -106,11 +150,18 @@ defmodule Loopctl.RateLimiter.Postgres do
 
   # Fail OPEN on ANY limiter/DB fault: log and allow. Single sink so every
   # failure mode degrades identically (parity with Loopctl.Provider.Admission).
+  # The warning is emitted through the THROTTLED, PII-safe
+  # `Loopctl.RateLimiter.FailOpenLog` (at most one line per bucket-family per
+  # window, IP/UUID suffix stripped) so a sustained DB outage — when EVERY check
+  # fails here — cannot flood the logs or write client IPs into them.
+  #
+  # NOTE: `{:allow, 0}` is the fail-open SENTINEL. Capacity callers
+  # (`within_limit?/3`, the RPM plug) honour it as "allowed"; the anti-abuse /
+  # brute-force security gates use `Loopctl.RateLimiter.gate_ok?/3`, which treats
+  # `{:allow, 0}` as DENIED — so selecting this impl does NOT broaden fail-open
+  # into those security gates.
   defp fail_open(bucket, detail) do
-    Logger.warning(
-      "Loopctl.RateLimiter.Postgres: limiter DB error for bucket=#{bucket}; " <>
-        "failing OPEN (allowing request): #{detail}"
-    )
+    FailOpenLog.warn(:postgres, bucket, detail)
 
     {:allow, 0}
   end

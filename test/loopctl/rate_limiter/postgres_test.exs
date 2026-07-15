@@ -115,8 +115,11 @@ defmodule Loopctl.RateLimiter.PostgresTest do
           assert {:allow, 0} = Postgres.check_rate(b, @window_ms, 5)
         end)
 
-      assert log =~ "failing OPEN"
-      assert log =~ b
+      assert log =~ "fail-open"
+      # PII-safe: only the non-identifying bucket FAMILY is logged; the unique
+      # id suffix is stripped, so the full bucket never reaches the log.
+      assert log =~ "family=test:failopen"
+      refute log =~ b
     end
 
     test "an arithmetic fault (window_ms = 0) also fails OPEN rather than crashing the caller" do
@@ -127,7 +130,7 @@ defmodule Loopctl.RateLimiter.PostgresTest do
           assert {:allow, 0} = Postgres.check_rate(b, 0, 5)
         end)
 
-      assert log =~ "failing OPEN"
+      assert log =~ "fail-open"
     end
   end
 

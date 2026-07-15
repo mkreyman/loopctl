@@ -529,13 +529,17 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
   defp check_rate_limit(tenant_id) do
     bucket = "enroll:actions:#{tenant_id}"
 
-    case Loopctl.RateLimiter.impl().check_rate(
-           bucket,
-           @enroll_rate_window_ms,
-           @max_enroll_actions_per_window
-         ) do
-      {:allow, _count} -> :ok
-      {:deny, _limit} -> {:error, :rate_limited}
+    # FAIL-CLOSED anti-abuse gate (WebAuthn enroll/revoke is CPU-bound): on a
+    # limiter fault deny rather than unlock the throttle. `gate_ok?/3` also
+    # absorbs the behaviour's `{:error, _}` shape so a soft-error can't raise.
+    if Loopctl.RateLimiter.gate_ok?(
+         bucket,
+         @enroll_rate_window_ms,
+         @max_enroll_actions_per_window
+       ) do
+      :ok
+    else
+      {:error, :rate_limited}
     end
   end
 

@@ -31,8 +31,7 @@ defmodule LoopctlWeb.Plugs.RateLimiter do
 
   import Plug.Conn
 
-  require Logger
-
+  alias Loopctl.RateLimiter.FailOpenLog
   alias Loopctl.Tenants
 
   @default_per_key_limit 300
@@ -97,10 +96,10 @@ defmodule LoopctlWeb.Plugs.RateLimiter do
   end
 
   defp fail_open(identifier, detail) do
-    Logger.warning(
-      "LoopctlWeb.Plugs.RateLimiter: limiter error for #{identifier}; " <>
-        "failing OPEN (allowing request): #{detail}"
-    )
+    # Throttled + PII-safe (bounded per bucket-family per window; UUID suffix
+    # stripped) so a sustained limiter outage — when every request fails here —
+    # can't flood the logs.
+    FailOpenLog.warn(:plug, identifier, detail)
 
     {:allow, 0}
   end

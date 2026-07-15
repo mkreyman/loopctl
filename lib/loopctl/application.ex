@@ -28,6 +28,12 @@ defmodule Loopctl.Application do
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
       {Task.Supervisor, name: Loopctl.TaskSupervisor},
+      # US-38.2: owns the public ETS table backing the throttled, PII-safe
+      # rate-limiter fail-open logger, so a sustained limiter/DB outage emits a
+      # bounded heartbeat per bucket-family instead of one warning per request
+      # (and never writes client IPs into the logs). Node-local; pure ETS owner
+      # with no other dependency.
+      Loopctl.RateLimiter.FailOpenLog,
       {Oban, Application.fetch_env!(:loopctl, Oban)},
       # US-35.2: supervised, node-local singleton that subscribes to the fixed
       # audit-chain firehose topic and debounce-enqueues one ComputeSthWorker job

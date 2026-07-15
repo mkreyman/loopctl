@@ -32,6 +32,16 @@ end
 # provisions NOTHING — the counter table already ships in a migration; the env
 # var only flips which behaviour impl the DI resolves. Never set to a
 # placeholder value (epic_35 STH_SWEEP_CRON lesson).
+#
+# Operational caveats when enabling (see Loopctl.RateLimiter.Postgres moduledoc):
+#   * Fail-open blast radius broadens to every caller. Capacity gates (RPM plug,
+#     retrieve, provider admission) stay fail-OPEN on a DB fault; the anti-abuse /
+#     brute-force SECURITY gates (signup abuse, WebAuthn-verify, enroll) use
+#     `Loopctl.RateLimiter.gate_ok?/3` and fail-CLOSED, so a DB fault cannot
+#     silently unlock them.
+#   * `check_rate/3` runs a single upsert via the BYPASSRLS `Loopctl.AdminRepo`
+#     on every authenticated request — size/monitor the AdminRepo pool, and note
+#     the hottest bucket's single row is a serialization + autovacuum-bloat point.
 if System.get_env("RATE_LIMITER") == "postgres" do
   config :loopctl, :rate_limiter, Loopctl.RateLimiter.Postgres
 end

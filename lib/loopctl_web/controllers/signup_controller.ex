@@ -59,9 +59,14 @@ defmodule LoopctlWeb.SignupController do
     # payloads would 422 without ever counting against the cap, defeating it.
     bucket = "api_signup:ip:#{client_ip(conn)}"
 
-    case Loopctl.RateLimiter.impl().check_rate(bucket, @rate_window_ms, @max_signups_per_ip) do
-      {:allow, _count} -> validate_and_signup(conn, params)
-      {:deny, _limit} -> rate_limited(conn)
+    # FAIL-CLOSED anti-abuse gate: on a limiter fault (or the Postgres impl's
+    # fail-open sentinel) deny rather than silently unlock per-IP signup abuse
+    # protection. `gate_ok?/3` also absorbs the behaviour's `{:error, _}` shape,
+    # so a Hammer soft-error can't raise CaseClauseError → 500 here.
+    if Loopctl.RateLimiter.gate_ok?(bucket, @rate_window_ms, @max_signups_per_ip) do
+      validate_and_signup(conn, params)
+    else
+      rate_limited(conn)
     end
   end
 
