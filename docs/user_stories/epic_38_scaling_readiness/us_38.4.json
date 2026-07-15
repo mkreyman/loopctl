@@ -1,0 +1,47 @@
+{
+  "id": "US-38.4",
+  "title": "HNSW m/ef_construction tuning + memories.embedding dual-index justification review",
+  "epic": { "id": "epic_38", "name": "Horizontal Scaling Readiness (code-only)" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "All vector indexes use pgvector defaults (m=16, ef_construction=64) — untuned — and memories.embedding carries TWO HNSW indexes (full + live-only partial). Index build/maintenance cost and recall quality both scale with the corpus, so tuning params and confirming the dual index is warranted is a scaling-readiness concern. Review-first: only change what's justified.",
+  "background": {
+    "reference": "GH #353. All HNSW indexes go through lib/loopctl/repo/hnsw_index.ex (capability-based) or inline migration SQL; NONE specify m/ef_construction (grep finds no WITH (m/ef_construction) — all pgvector defaults m=16, ef_construction=64). articles.embedding: ONE index articles_embedding_hnsw_idx (vector_cosine_ops). memories.embedding: DUAL — memories_embedding_hnsw_idx (full, 20260709000100) + memories_live_embedding_hnsw_idx (partial WHERE superseded_by IS NULL, 20260709000300). The partial migration's comment says both coexist deliberately (full = historical incl. superseded; partial = live-only fast path).",
+    "includes": "CODE-ONLY, review-first: (a) evaluate whether tuning m/ef_construction (and query-time ef_search) improves recall/latency/build-cost enough to justify a reindex, and either apply it (online) or document why defaults stay; (b) confirm the memories dual-index is justified vs a single (partial) index — if the full index is rarely used (superseded rows seldom searched), dropping it saves build/maintenance cost. Any index change is an ONLINE migration and must not regress recall."
+  },
+  "story": {
+    "as_a": "loopctl operator whose vector corpus grows over time",
+    "i_want_to": "tune the HNSW index parameters where it measurably helps and confirm the memories.embedding dual index is warranted (dropping the redundant one if not)",
+    "so_that": "vector index build/maintenance cost and recall quality are deliberate engineering choices sized for scale, not unexamined pgvector defaults and an unquestioned duplicate index"
+  },
+  "rationale": "HNSW m/ef_construction trade build time + index size + recall; leaving them at defaults across a growing corpus is an unexamined scaling risk, and a dual HNSW index on one column doubles build/maintenance cost — worth confirming it earns its keep. A review-first story avoids churn: change parameters or drop an index only where evidence (recall/latency/usage) justifies it, with an online migration and a recall guard so nothing regresses.",
+  "acceptance_criteria": [
+    { "id": "AC-38.4.1", "description": "The HNSW parameters are made configurable/explicit (m, ef_construction on the index; ef_search at query time) via SystemConfig or the hnsw_index.ex builder — even if the chosen values equal the current defaults, they are now intentional and documented, not implicit. A test asserts the index/query builder uses the configured values.", "status": "pending" },
+    { "id": "AC-38.4.2", "description": "A documented evaluation of m/ef_construction/ef_search for loopctl's corpus (recall vs latency vs build/size) is captured (in the PR / a doc), and any change is applied via an ONLINE migration (CONCURRENTLY, @disable_ddl_transaction) on articles/memories. If defaults are kept, the rationale is documented. A recall test (nearest-neighbour quality on a fixture set) passes before and after — no recall regression.", "status": "pending" },
+    { "id": "AC-38.4.3", "description": "The memories.embedding dual-index is reviewed with evidence (is the full index — including superseded rows — actually queried, or do all live searches use the partial WHERE superseded_by IS NULL?). Outcome: EITHER keep both with a documented justification, OR drop the redundant one via an online migration if searches never need superseded rows. Whichever, semantic recall of LIVE memories is unchanged (test).", "status": "pending" },
+    { "id": "AC-38.4.4", "description": "Any migration is online and reversible-safe on the hot memories/articles tables (no write-blocking DDL, no long lock); a rollback path is noted. No behavior change beyond index tuning; query results (recall set) for a fixed fixture are equivalent before/after (test). No infra; purely DB/migration + config code.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-38.4.1", "name": "HNSW params are explicit/configurable", "type": "unit",
+      "preconditions": ["configured m/ef_construction/ef_search"],
+      "steps": ["build an index def / issue a vector query"],
+      "expected_results": ["the configured params are used (WITH (m=.., ef_construction=..); SET LOCAL hnsw.ef_search)"], "status": "pending" },
+    { "id": "TC-38.4.2", "name": "recall not regressed by tuning", "type": "integration",
+      "preconditions": ["fixture corpus with known nearest neighbours"],
+      "steps": ["run kNN before and after the tuning/migration"],
+      "expected_results": ["the expected neighbours are still returned (no recall regression)"], "status": "pending" },
+    { "id": "TC-38.4.3", "name": "live-memory recall unchanged after dual-index decision", "type": "integration",
+      "preconditions": ["memories with superseded + live rows"],
+      "steps": ["semantic recall of live memories"],
+      "expected_results": ["live recall identical regardless of the dual-index outcome"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/repo/hnsw_index.ex (parameterize m/ef_construction), the vector query path (VectorSearch / knowledge.ex / memory.ex — ef_search via SET LOCAL hnsw.ef_search), migrations under priv/repo/migrations for any reindex, SystemConfig for the params.",
+    "pgvector: index params via WITH (m = .., ef_construction = ..); query-time recall/latency via SET LOCAL hnsw.ef_search = .. (per-query, pgbouncer-safe). Reindex to change m/ef_construction (CREATE INDEX CONCURRENTLY new, drop old) — online.",
+    "Dual memories index: check actual query predicates — if every live search filters superseded_by IS NULL, the partial index serves them and the full index only matters for historical/superseded lookups (are there any?). Decide with evidence; drop only if truly redundant.",
+    "Review-FIRST: this story may legitimately conclude 'keep defaults / keep both' WITH documented justification — that is a valid outcome, not a non-fix. Any change must be online + recall-guarded.",
+    "No infra. Online migrations only. Config-based DI; no Application.put_env in tests."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 400000
+}

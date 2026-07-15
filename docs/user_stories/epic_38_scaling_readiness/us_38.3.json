@@ -1,0 +1,51 @@
+{
+  "id": "US-38.3",
+  "title": "Cluster-safe SthEnqueuer singleton + clustering-readiness verification gate + DNSCluster test",
+  "epic": { "id": "epic_38", "name": "Horizontal Scaling Readiness (code-only)" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "Two scale-out sharp edges: (1) the US-35.2 SthEnqueuer is a node-local singleton, so on N nodes each node's subscriber enqueues off the same audit firehose = N× duplicate STH-enqueue work; (2) there is NO clustering verification anywhere, so a machine-count increase could silently run un-clustered (node-local PubSub) with no signal. Both are code-fixable now; neither sets the cluster secret or scales anything.",
+  "background": {
+    "reference": "GH #353. SthEnqueuer (lib/loopctl/audit_chain/sth_enqueuer.ex) is a supervised node-local singleton subscribing to the audit firehose (US-35.2); on N nodes all N subscribe and enqueue (dup work; safe via sth_needed?/Oban unique but wasteful). DNSCluster is wired (application.ex:28, runtime.exs:345) but unset → :ignore; there is NO Node.list/clustering health check or gate and NO DNSCluster test. PubSub is cross-node PG2 (correct); SettingsCache/ApiKeyCache invalidation is already cluster-correct (do NOT touch).",
+    "includes": "CODE-ONLY: make SthEnqueuer a CLUSTER singleton (e.g. :global registration or a leadership check) so exactly one node enqueues off the firehose regardless of node count; add a clustering-readiness verification (a health/status check that reports whether DNS_CLUSTER_QUERY is set and Node.list/0 shows peers) + a documented gate ('do not raise scale count until clustering verified'); add the missing DNSCluster wiring test. Does NOT set DNS_CLUSTER_QUERY (infra) and does NOT scale."
+  },
+  "story": {
+    "as_a": "loopctl operator preparing to scale out",
+    "i_want_to": "have exactly one node process the audit firehose (a cluster singleton), and a clustering-readiness signal that tells me whether the fleet is actually clustered before I raise the node count",
+    "so_that": "scaling out doesn't silently duplicate STH-enqueue work on every node or run un-clustered (node-local PubSub) without warning — the readiness to go multi-node is verifiable in code"
+  },
+  "rationale": "The audit firehose should be drained once per cluster, not once per node; a :global singleton (or leader election) fixes the duplication cheaply and safely (single-node behavior unchanged — one node is still the singleton). A clustering-readiness check + gate turns 'is the fleet actually clustered?' from an invisible assumption into an observable signal, so the eventual scale-out is deliberate and verified rather than a silent degradation. Both are pure code and change nothing on a single node.",
+  "acceptance_criteria": [
+    { "id": "AC-38.3.1", "description": "SthEnqueuer becomes a cluster singleton: across N clustered nodes, exactly ONE instance subscribes to / drains the audit firehose (via :global registration or a leadership check), eliminating the N× duplicate enqueue. On a SINGLE node behavior is unchanged (that node is the singleton). If the singleton's node dies, another node takes over (failover). A test asserts single-node still enqueues, and (simulated) multi-registration yields one active enqueuer.", "status": "pending" },
+    { "id": "AC-38.3.2", "description": "A clustering-readiness verification exists: a function/health signal reports whether DNS_CLUSTER_QUERY is configured and whether Node.list/0 shows the expected peers (vs EXPECTED_APP_NODES). Exposed via the existing health/observability surface (e.g. a field in /health or a ScaleMetrics gauge) — bounded, no sensitive data. On a single node it reports 'single-node / clustering not required', not an error.", "status": "pending" },
+    { "id": "AC-38.3.3", "description": "A documented gate: raising machine count past 1 should be preceded by verifying clustering (the readiness signal green). This is DOCUMENTED (README/runbook + a boot log when EXPECTED_APP_NODES > 1 but Node.list is empty → WARN, not crash) — it does NOT enforce-by-crashing (single-node must always boot) and does NOT set the secret or scale.", "status": "pending" },
+    { "id": "AC-38.3.4", "description": "The missing DNSCluster wiring test is added: asserts DNSCluster is in the supervision tree and that :dns_cluster_query resolves from env (unset → :ignore). Purely additive; no behavior change on a single node; DNS_CLUSTER_QUERY is NOT set by this story.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-38.3.1", "name": "single node still enqueues; cluster = one enqueuer", "type": "integration",
+      "preconditions": ["single node"],
+      "steps": ["append audit entries; let the enqueuer run"],
+      "expected_results": ["STH enqueued as today; with simulated :global registration only one enqueuer is active"], "status": "pending" },
+    { "id": "TC-38.3.2", "name": "clustering-readiness signal", "type": "unit",
+      "preconditions": ["single node, DNS_CLUSTER_QUERY unset"],
+      "steps": ["query the readiness signal"],
+      "expected_results": ["reports single-node / not-required (not an error); no sensitive data"], "status": "pending" },
+    { "id": "TC-38.3.3", "name": "WARN when EXPECTED_APP_NODES>1 but no peers", "type": "unit",
+      "preconditions": ["EXPECTED_APP_NODES=2, Node.list empty"],
+      "steps": ["run the boot check"],
+      "expected_results": ["logs a WARN; app still boots (no crash)"], "status": "pending" },
+    { "id": "TC-38.3.4", "name": "DNSCluster wiring test", "type": "unit",
+      "preconditions": [],
+      "steps": ["inspect supervision tree + :dns_cluster_query resolution"],
+      "expected_results": ["DNSCluster present; unset env → :ignore"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/audit_chain/sth_enqueuer.ex (:global name or leadership gate), lib/loopctl/application.ex, lib/loopctl/telemetry/scale_metrics.ex or the /health path (readiness signal), a new test/loopctl/cluster_readiness_test.exs + DNSCluster wiring test.",
+    ":global registration is simplest for a single logical enqueuer; handle the name-clash on register (one wins, others idle) and failover on node down. Alternatively a leader check via Node.self() == hd(Enum.sort([node()|Node.list()])). Keep single-node a no-op-equivalent.",
+    "Readiness gate is a WARN + documented runbook step, NOT a hard crash — single-node must always boot (EXPECTED_APP_NODES default 2 already only WARNs in db_capacity; mirror that).",
+    "Do NOT set DNS_CLUSTER_QUERY (infra/out of scope). Do NOT touch SettingsCache/ApiKeyCache PubSub invalidation — already cluster-correct.",
+    "Assert outcome class not exact timing; config-based DI; no Application.put_env in tests."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 350000
+}

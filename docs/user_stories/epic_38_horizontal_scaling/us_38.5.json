@@ -1,0 +1,20 @@
+{
+  "number": "38.5",
+  "title": "Analyze and document HNSW index config; justify dual-index design or consolidate",
+  "description": "Review the dual-HNSW-index configuration on `memories.embedding` (and any other dual-indexed vectors) to confirm it is necessary or consolidate to a single partial index. Document HNSW parameters (m, ef_construction) and confirm they are not left at pgvector defaults; tune for query latency vs memory footprint.",
+  "acceptance_criteria": [
+    "Document the current index topology: identify all HNSW indexes on vector columns, their m/ef_construction values, and whether they are duplicated",
+    "For each dual index: explain the business case (different query strategies, different k values, different freshness SLAs) or consolidate to single",
+    "Benchmark query latency on a 1M-row memory embedding set: measure p50/p95/p99 latency for semantic_recall with current m/ef_construction, then test m=8/16 and ef_construction=32/64 variants",
+    "Confirm memory footprint vs latency tradeoff: if m=16/ef=64 is necessary for sub-5ms p95, document it; if m=8/ef=32 achieves <10ms p95 with 40% less memory, switch to it",
+    "Update migration docs to specify explicit m/ef_construction values (never rely on pgvector defaults) when creating new HNSW indexes",
+    "Add a periodic telemetry report: index_stats (index name, size_bytes, m, ef_construction, row_count, last_vacuumed) at :telemetry.execute([:loopctl, :index, :stats], %{...})",
+    "Tests verify that index params are queryable from the information schema (pg_indexes system view); snapshot current config in version-control comments",
+    "Documentation: 'HNSW Configuration & Scaling' section in docs/ clarifies m/ef tuning and when to revisit as row count grows"
+  ],
+  "story_type": "feature",
+  "effort": "medium",
+  "depends_on": [],
+  "epic": 38,
+  "tags": ["vector-search", "postgres", "performance", "scale"]
+}

@@ -1,0 +1,19 @@
+{
+  "number": "38.2",
+  "title": "Support replica DSN via config; gate HeavyReadRepo switchover",
+  "description": "Add runtime config knobs to support a separate replica DSN (read-only Postgres), and conditionally route HeavyReadRepo queries to it without changing application code. Maintains single-node behavior when replica is absent; enables switchover via config secret.",
+  "acceptance_criteria": [
+    "New config `:replica_dsn` (env var REPLICA_DSN or blank) is optional; absence means HeavyReadRepo == primary Repo DSN",
+    "HeavyReadRepo.Repo is initialized once at boot with replica DSN if present, primary DSN otherwise",
+    "No runtime branching (if replica_dsn? do X else Y) in query paths — config decides at boot, not per-query",
+    "All read-only code paths (enumeration, export, vector search, HeavyRead context) use HeavyReadRepo; writes always use Repo (never HeavyReadRepo)",
+    "Tests verify queries on HeavyReadRepo hit the intended pool; mocks can inject replica DSN and assert pool switching",
+    "Secrets manager (Fly secrets, or .env for dev) documents replica DSN as an optional knob; deploy instructions mention it does NOT auto-create a replica (manual provisioning step)",
+    "No code changes needed in query modules — all routing happens via Repo selection (HeavyReadRepo vs Repo module aliases)"
+  ],
+  "story_type": "feature",
+  "effort": "medium",
+  "depends_on": ["38.1"],
+  "epic": 38,
+  "tags": ["database", "scale", "config", "replica"]
+}

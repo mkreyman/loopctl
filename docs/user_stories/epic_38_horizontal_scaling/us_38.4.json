@@ -1,0 +1,21 @@
+{
+  "number": "38.4",
+  "title": "Back rate limiter with cluster-global store (Postgres window); remove per-node ETS",
+  "description": "Replace the per-node ETS rate limiter with a cluster-global Postgres-backed window function so that global limits are enforced across all nodes, not multiplied by node count. A single agent's token limit remains constant whether it runs on 1 or N nodes.",
+  "acceptance_criteria": [
+    "New Postgres window function `rate_limit_check(key, limit, window_seconds)` returns {allowed: bool, remaining: int, reset_at: timestamptz}",
+    "Window function uses Postgres 15+ `RANGE BETWEEN CURRENT_TIMESTAMP - INTERVAL ... AND CURRENT_TIMESTAMP` to count requests in the window",
+    "RateLimiter.Behaviour callback updated: `check/3` now calls the window function via `Repo.query!/2` instead of ETS lookup",
+    "Configuration `:rate_limiter_backend` can be `:ets` (single-node legacy) or `:postgres` (cluster-global); defaults to `:postgres`",
+    "ETS code paths remain for backward compat but are NO LONGER used in production config; tests can switch backends",
+    "Rate limit keys include tenant_id and provider (e.g. `rate_limit:tenant:123:provider:anthropic`) for isolation",
+    "Tests verify: with `:postgres` backend, two concurrent nodes checking the same limit key both see the same `remaining` counter; one request increments the count on both",
+    "Performance: Postgres window function is indexed on (key, created_at DESC) for fast scans; measure latency vs ETS and document expected p99 (should be <2ms per check)",
+    "Failover: if Postgres is unreachable (timeout/conn error), rate limiting fails CLOSED (deny all requests, log error) to protect the provider from a rogue burst when metrics are unavailable"
+  ],
+  "story_type": "feature",
+  "effort": "large",
+  "depends_on": ["38.1"],
+  "epic": 38,
+  "tags": ["rate-limiting", "scale", "postgres", "cluster"]
+}

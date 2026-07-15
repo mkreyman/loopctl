@@ -1,0 +1,51 @@
+{
+  "id": "US-38.1",
+  "title": "Replica-ready read config: REPLICA_DATABASE_URL plumbing (defaults to primary) + DbCapacity replica dimension",
+  "epic": { "id": "epic_38", "name": "Horizontal Scaling Readiness (code-only)" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "Makes loopctl replica-READY in code without provisioning a replica: HeavyReadRepo can target a separate read DSN when one is configured, and DbCapacity can model primary-vs-replica budgets. Until an operator sets REPLICA_DATABASE_URL, behavior is byte-for-byte identical to today (reads hit the primary).",
+  "background": {
+    "reference": "GH #353. HeavyReadRepo (config/runtime.exs:299-305) uses `url: admin_database_url` where admin_database_url = ADMIN_DATABASE_URL || database_url (runtime.exs:134-135) — the SAME physical primary as the write-capable AdminRepo. It is pool isolation (US-27.11), not a replica. No REPLICA_DATABASE_URL plumbing exists. DbCapacity (lib/loopctl/db_capacity.ex) models a SINGLE physical Postgres: @prod_pool_sizes %{repo: 10, admin_repo: 3, heavy_read_repo: 8}, @verified_live_max_connections 100, max_supported_nodes ~3.",
+    "includes": "CODE-ONLY: add REPLICA_DATABASE_URL env plumbing so HeavyReadRepo targets a replica DSN WHEN SET, falling back to the primary (admin_database_url) when unset — so nothing changes today. Keep BYPASSRLS role parity + the pgbouncer-safe SET LOCAL timeout design. Extend DbCapacity to model a replica connection dimension (config-only) so the budget accountant is ready before a replica exists. Actually provisioning the replica is INFRA and OUT OF SCOPE."
+  },
+  "story": {
+    "as_a": "loopctl operator preparing to scale out",
+    "i_want_to": "point HeavyReadRepo (and pure-read/vector/enumeration/export paths) at a read replica DSN via REPLICA_DATABASE_URL when one exists, defaulting to the primary when it is unset",
+    "so_that": "when I later provision a Fly MPG read replica the app already routes heavy reads to it with a single env change — and until then the app behaves exactly as it does today (reads on the primary)"
+  },
+  "rationale": "The only thing standing between loopctl and replica offload is config plumbing: HeavyReadRepo is already an isolated, read-only-shaped pool, so giving it an optional separate DSN (default = primary) makes the app replica-ready with zero behavior change today and zero infra. Modeling the replica budget in DbCapacity now means the connection accountant is correct the moment a replica is added.",
+  "acceptance_criteria": [
+    { "id": "AC-38.1.1", "description": "HeavyReadRepo's DSN is resolved as REPLICA_DATABASE_URL when set, else admin_database_url (today's value). When REPLICA_DATABASE_URL is UNSET, the resolved config is IDENTICAL to today (a test asserts byte-identical repo config / same DSN as before). BYPASSRLS role parity and the SET LOCAL statement_timeout / prepare: :unnamed pgbouncer-safety are preserved on the replica path.", "status": "pending" },
+    { "id": "AC-38.1.2", "description": "Write-safety: nothing that writes can be routed to the replica. HeavyReadRepo remains read-only in usage (it already is); a guard/test asserts the replica DSN is only ever used for reads (no AdminRepo/Repo writes rerouted). If REPLICA_DATABASE_URL points somewhere unreachable, the app fails loud at boot (clear error) rather than silently degrading — OR documents a primary-fallback; pick and test one.", "status": "pending" },
+    { "id": "AC-38.1.3", "description": "DbCapacity is extended to model a replica connection dimension: primary budget (Repo + AdminRepo + write-side) vs replica budget (HeavyReadRepo when REPLICA_DATABASE_URL set). When no replica is configured, the model and max_supported_nodes math are UNCHANGED from today (regression test on the existing numbers). When a replica is modeled, HeavyReadRepo connections count against the replica budget, not the primary — raising the effective primary headroom. Config-only; no pool sizes actually changed.", "status": "pending" },
+    { "id": "AC-38.1.4", "description": "Purely additive config plumbing behind an env var that DEFAULTS OFF (unset → primary). No infra provisioned, no scaling, no pool-size change to production defaults. Documented: setting REPLICA_DATABASE_URL is a future gated op. No Application.put_env in tests; config-based DI.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-38.1.1", "name": "unset REPLICA_DATABASE_URL → identical to today", "type": "unit",
+      "preconditions": ["REPLICA_DATABASE_URL not set"],
+      "steps": ["resolve HeavyReadRepo config"],
+      "expected_results": ["DSN == admin_database_url; config identical to current behavior"], "status": "pending" },
+    { "id": "TC-38.1.2", "name": "set REPLICA_DATABASE_URL → HeavyRead targets replica", "type": "unit",
+      "preconditions": ["REPLICA_DATABASE_URL set to a distinct DSN"],
+      "steps": ["resolve HeavyReadRepo config"],
+      "expected_results": ["HeavyReadRepo DSN == replica; prepare: :unnamed + SET LOCAL timeout preserved; Repo/AdminRepo unchanged (primary)"], "status": "pending" },
+    { "id": "TC-38.1.3", "name": "DbCapacity replica dimension", "type": "unit",
+      "preconditions": ["model with and without a replica configured"],
+      "steps": ["compute budgets"],
+      "expected_results": ["no replica → numbers unchanged from today; with replica → HeavyRead conns counted against replica, primary headroom rises"], "status": "pending" },
+    { "id": "TC-38.1.4", "name": "no write routed to replica", "type": "integration",
+      "preconditions": ["replica DSN configured (can be same physical in test)"],
+      "steps": ["exercise a write path"],
+      "expected_results": ["writes go via Repo/AdminRepo (primary), never HeavyReadRepo"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: config/runtime.exs (:134-135 admin_database_url, :299-305 HeavyReadRepo — add REPLICA_DATABASE_URL || admin_database_url), lib/loopctl/db_capacity.ex (replica dimension in the budget model + max_supported_nodes), lib/loopctl/heavy_read_repo.ex.",
+    "Default MUST be unset → primary (admin_database_url) so today is unchanged. Keep BYPASSRLS parity: the replica must use the same read role capabilities as HeavyReadRepo today.",
+    "Eventual-consistency is acceptable for HeavyRead paths (vector/enumeration/export/analytics) — but confirm no path reads-its-own-write in a way that would break on replica lag; if one does, it must stay on the primary or tolerate lag (document).",
+    "DbCapacity: model replica connections separately but do NOT change production pool sizes in this story (that needs the infra/plan). Keep the existing db_capacity_test numbers green when no replica configured.",
+    "No infra: this story does NOT provision a replica. Config-based DI; no Application.put_env in tests."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 350000
+}
