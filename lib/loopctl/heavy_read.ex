@@ -77,21 +77,54 @@ defmodule Loopctl.HeavyRead do
   This is the SINGLE source of truth for heavy-read opts — every consumer
   (`Loopctl.Knowledge`, `Loopctl.Audit`) builds opts via this function so the
   `[timeout, telemetry_options, statement_timeout]` shape can't drift between callers.
-  Known endpoints: `:suggested_links`, `:semantic_search`, `:distant_pairs`,
-  `:distant_pairs_bridge` (the slower `bridge_path=true` branch — its own key so its
-  statement_timeout/slow-query telemetry are distinct), `:novelty`, `:enumeration`,
-  `:change_feed`, `:vector_search` (the shared kNN helper path), `:memory_recall`
-  (the US-28.2 agent-memory HNSW recall via `all_memory/4`), `:ingestion_jobs`
-  (the US-34.6 `GET /knowledge/ingestion-jobs` COUNT + list over the Oban-owned
-  `oban_jobs` table, bounded by a partial expression index), `:sth_incremental`
-  (the US-35.1 bounded "entries above the STH checkpoint" tail read over
-  `audit_chain`, folded into the persisted Merkle peaks).
+  Known endpoints are enumerated in `known_endpoints/0`: `:suggested_links`,
+  `:semantic_search`, `:distant_pairs`, `:distant_pairs_bridge` (the slower
+  `bridge_path=true` branch — its own key so its statement_timeout/slow-query
+  telemetry are distinct), `:novelty`, `:enumeration`, `:change_feed`,
+  `:vector_search` (the shared kNN helper path), `:memory_recall` (the US-28.2
+  agent-memory HNSW recall via `all_memory/4`), `:ingestion_jobs` (the US-34.6
+  `GET /knowledge/ingestion-jobs` COUNT + list over the Oban-owned `oban_jobs` table,
+  bounded by a partial expression index), `:sth_incremental` (the US-35.1 bounded
+  "entries above the STH checkpoint" tail read over `audit_chain`, folded into the
+  persisted Merkle peaks), and `:export` (the US-27.16 long streamed-export scans).
   """
   @spec opts(atom()) :: keyword()
   def opts(endpoint) when is_atom(endpoint) do
     base = [timeout: 15_000, telemetry_options: [endpoint: endpoint]]
     Keyword.put(base, :statement_timeout, statement_timeout_for(endpoint))
   end
+
+  # Every endpoint atom a caller passes to `opts/1` / stamps into `telemetry_options`.
+  # `opts/1` itself accepts ANY atom (the timeout defaults are endpoint-agnostic), but
+  # `Loopctl.HeavyRead.TenantGate.weight_for/1` partitions these into heavy vs light
+  # cost weights — so this list is the SOURCE OF TRUTH the gate's drift guard
+  # (`tenant_gate_test.exs`) checks its `@heavy_endpoints` against: a new endpoint
+  # added here without a deliberate heavy/light weight decision fails that test rather
+  # than silently defaulting to light weight and under-charging a heavy read.
+  @known_endpoints ~w(
+    suggested_links
+    semantic_search
+    distant_pairs
+    distant_pairs_bridge
+    novelty
+    enumeration
+    change_feed
+    vector_search
+    memory_recall
+    ingestion_jobs
+    sth_incremental
+    export
+  )a
+
+  @doc """
+  The known heavy-read endpoint atoms (documented in `opts/1`).
+
+  The canonical set `Loopctl.HeavyRead.TenantGate` assigns cost weights to; the gate's
+  drift guard test partitions exactly this set into heavy vs light so a newly-added
+  endpoint can't silently fall through to light weight.
+  """
+  @spec known_endpoints() :: [atom()]
+  def known_endpoints, do: @known_endpoints
 
   # The per-endpoint override if a positive int, else the pool-wide default. Always a
   # positive int → every heavy read runs under a SET LOCAL statement_timeout (the

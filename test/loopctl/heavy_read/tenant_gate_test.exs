@@ -13,6 +13,7 @@ defmodule Loopctl.HeavyRead.TenantGateTest do
   use Loopctl.DataCase, async: true
 
   alias Loopctl.DbCapacity
+  alias Loopctl.HeavyRead
   alias Loopctl.HeavyRead.TenantGate
 
   describe "acquire/3 per-tenant concurrency cap (AC-37.5.1)" do
@@ -205,4 +206,107 @@ defmodule Loopctl.HeavyRead.TenantGateTest do
       assert TenantGate.count(tenant, missing) == 0
     end
   end
+
+  # Finding #3 (US-37.5 review): cap/0's live-tunable value MUST be clamped so an
+  # operator knob can neither 500 every heavy read (non-positive → acquire/4's
+  # `cap > 0` guard FunctionClauseError, AC-37.5.5 fail-open violation) nor silently
+  # defeat fairness (K < heavy_weight → all shed; K >= pool → monopolization).
+  describe "clamp_cap/1 range clamp (AC-37.5.5)" do
+    setup do
+      %{lower: TenantGate.heavy_weight(), upper: max(TenantGate.heavy_weight(), pool() - 1)}
+    end
+
+    test "a NON-POSITIVE cap is floored to heavy_weight (never a FunctionClauseError 500)",
+         %{lower: lower} do
+      assert TenantGate.clamp_cap(0) == lower
+      assert TenantGate.clamp_cap(-5) == lower
+
+      # The whole point: the clamped cap is a valid `pos_integer` acquire/4 accepts —
+      # no FunctionClauseError propagates uncaught to 500 every heavy read on the node.
+      tenant = Ecto.UUID.generate()
+      assert TenantGate.acquire(tenant, 1, TenantGate.clamp_cap(0)) == :ok
+      TenantGate.release(tenant, 1)
+    end
+
+    test "a cap BELOW heavy_weight is floored (a single heavy read always fits)", %{lower: lower} do
+      assert TenantGate.clamp_cap(1) == lower
+      assert lower >= TenantGate.heavy_weight()
+    end
+
+    test "a cap AT/ABOVE the pool is capped to pool-1 (a slot always remains for neighbours)",
+         %{upper: upper} do
+      assert TenantGate.clamp_cap(pool()) == upper
+      assert TenantGate.clamp_cap(100_000) == upper
+      assert upper < pool()
+    end
+
+    test "an in-range cap passes through unchanged", %{lower: lower, upper: upper} do
+      in_range = lower..upper |> Enum.to_list() |> Enum.at(div(upper - lower, 2))
+      assert TenantGate.clamp_cap(in_range) == in_range
+    end
+
+    test "cap/0 always resolves a positive integer >= heavy_weight (guard always matches)" do
+      assert TenantGate.cap() >= TenantGate.heavy_weight()
+      assert TenantGate.cap() > 0
+    end
+  end
+
+  # Finding #6 (US-37.5 review): weight_for/1's heavy-endpoint list is hand-maintained;
+  # without a guard a NEW heavy endpoint a caller adds could silently fall through to
+  # LIGHT weight and under-charge a genuinely heavy read. These pin it to
+  # HeavyRead.known_endpoints/0 (the source-of-truth set) so drift fails the suite.
+  describe "endpoint weight drift guard (AC-37.5.2, review finding #6)" do
+    # The DELIBERATE weight for EVERY known endpoint. Adding an endpoint to
+    # HeavyRead.known_endpoints/0 without a decision here fails the coverage test below.
+    @expected_weights %{
+      vector_search: :heavy,
+      semantic_search: :heavy,
+      memory_recall: :heavy,
+      novelty: :heavy,
+      suggested_links: :heavy,
+      distant_pairs: :heavy,
+      distant_pairs_bridge: :heavy,
+      export: :heavy,
+      enumeration: :light,
+      change_feed: :light,
+      ingestion_jobs: :light,
+      sth_incremental: :light
+    }
+
+    test "every @heavy_endpoints atom is a known HeavyRead endpoint (no orphan/typo)" do
+      known = MapSet.new(HeavyRead.known_endpoints())
+
+      for ep <- TenantGate.heavy_endpoints() do
+        assert MapSet.member?(known, ep),
+               "heavy endpoint #{inspect(ep)} is not in HeavyRead.known_endpoints/0 — typo or removed caller?"
+      end
+    end
+
+    test "the expected-weight map covers EXACTLY HeavyRead.known_endpoints/0" do
+      assert MapSet.new(Map.keys(@expected_weights)) == MapSet.new(HeavyRead.known_endpoints()),
+             "a known endpoint has no deliberate heavy/light weight decision (or vice versa) — " <>
+               "update @expected_weights AND TenantGate's @heavy_endpoints together."
+    end
+
+    test "weight_for/1 classifies each known endpoint at its deliberate weight" do
+      heavy = TenantGate.heavy_weight()
+      light = TenantGate.light_weight()
+
+      for {endpoint, kind} <- @expected_weights do
+        expected = if kind == :heavy, do: heavy, else: light
+
+        assert TenantGate.weight_for(endpoint) == expected,
+               "wrong weight for #{inspect(endpoint)}"
+      end
+    end
+
+    test "an unknown/nil endpoint weights LIGHT (safe default for a bare heavy read)" do
+      assert TenantGate.weight_for(nil) == TenantGate.light_weight()
+
+      assert TenantGate.weight_for(:some_future_unregistered_endpoint) ==
+               TenantGate.light_weight()
+    end
+  end
+
+  defp pool, do: DbCapacity.heavy_read_budget().pool
 end

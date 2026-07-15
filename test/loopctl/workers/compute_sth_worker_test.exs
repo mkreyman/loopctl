@@ -11,6 +11,7 @@ defmodule Loopctl.Workers.ComputeSthWorkerTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
+  alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Workers.ComputeSthWorker
 
@@ -140,6 +141,32 @@ defmodule Loopctl.Workers.ComputeSthWorkerTest do
       sth = AuditChain.get_latest_sth(tenant.id)
       assert %AuditChain.SignedTreeHead{} = sth
       assert sth.chain_position == 0
+    end
+
+    # Finding #2 (US-37.5 review): the STH tail read goes through the per-tenant
+    # HeavyRead gate (endpoint :sth_incremental). Under a tenant's heavy-read burst it
+    # can shed (OverloadedError); the worker must SNOOZE (loss-free) rather than
+    # error/retry-churn toward max_attempts and drop a custody-critical checkpoint.
+    test "SNOOZES (no attempt consumed) when the STH read is shed over-cap" do
+      {tenant, _priv} = signing_tenant()
+      {:ok, _} = AuditChain.append(tenant.id, append_attrs())
+
+      # Reaches the sign path (an appended entry, no STH yet), then the tail read sheds.
+      assert AuditChain.sth_needed?(tenant.id)
+
+      # Saturate this tenant's per-tenant in-flight slice so the STH heavy read is shed.
+      cap = TenantGate.cap()
+      assert TenantGate.acquire(tenant.id, cap, cap) == :ok
+
+      assert {:snooze, seconds} =
+               ComputeSthWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      assert is_integer(seconds) and seconds > 0
+
+      # No STH was written — the shed happened before any signing/persistence.
+      assert AuditChain.get_latest_sth(tenant.id) == nil
+
+      TenantGate.release(tenant.id, cap)
     end
   end
 

@@ -20,6 +20,15 @@ defmodule Loopctl.Knowledge.ProposalGate do
   Embedding requires a network call. On ANY failure — API down, power/internet
   outage, system-scoped proposal with no tenant — `assess/3` falls **open**:
   `%{verdict: :unknown, ...}`, so write-back is never blocked by the gate.
+
+  The SAME fall-open covers the novelty NEAREST-NEIGHBOUR read: `assess/3` runs
+  SYNCHRONOUSLY in the `knowledge_create` write path, and that vector read goes
+  through the per-tenant HeavyRead gate (US-37.5). It passes `on_overload: :tag`, so
+  an over-cap shed returns `{:error, :heavy_read_overloaded}` and the gate falls open
+  — a per-tenant READ limiter must NEVER 429 a WRITE (`knowledge_create`), and the
+  gate's "never block write-back" invariant holds during exactly the high-load
+  incident it exists to survive. (Contrast a plain API kNN read, which defaults to
+  `:raise` → a legitimate 429.)
   """
 
   @behaviour Loopctl.Knowledge.ProposalAssessorBehaviour
@@ -52,14 +61,26 @@ defmodule Loopctl.Knowledge.ProposalGate do
     # timeout.
     case Knowledge.generate_embedding(tenant_id, build_text(attrs)) do
       {:ok, vector} when is_list(vector) and vector != [] ->
-        neighbors =
-          VectorSearch.nearest(tenant_id, vector, @neighbors_k,
-            threshold: overlap,
-            visibility_agent_id: Keyword.get(opts, :visibility_agent_id)
-          )
+        # `on_overload: :tag` (US-37.5): assess/3 runs SYNCHRONOUSLY in the
+        # knowledge_create write path, so an over-cap HeavyRead shed must NOT raise a
+        # 429 on a WRITE — it returns `{:error, :heavy_read_overloaded}` and the gate
+        # falls OPEN, consistent with its treatment of every other novelty-check failure.
+        case VectorSearch.nearest(tenant_id, vector, @neighbors_k,
+               threshold: overlap,
+               on_overload: :tag,
+               visibility_agent_id: Keyword.get(opts, :visibility_agent_id)
+             ) do
+          {:error, :heavy_read_overloaded} ->
+            Logger.warning(
+              "ProposalGate: novelty read shed (heavy_read_overloaded), falling open"
+            )
 
-        score = neighbors |> List.first() |> neighbor_score()
-        %{verdict: classify(score, dup, overlap), score: score, neighbors: neighbors}
+            open_verdict()
+
+          neighbors when is_list(neighbors) ->
+            score = neighbors |> List.first() |> neighbor_score()
+            %{verdict: classify(score, dup, overlap), score: score, neighbors: neighbors}
+        end
 
       {:error, :no_api_key} ->
         # Mandatory BYO: keyless tenant — fall open (never block write-back) and audit

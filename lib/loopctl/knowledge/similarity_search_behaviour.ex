@@ -49,12 +49,15 @@ defmodule Loopctl.Knowledge.SimilaritySearchBehaviour do
   highest similarity first, scoped to `tenant_id`.
 
   Mirrors `Loopctl.Knowledge.VectorSearch.nearest/4`: `opts` may carry
-  `:exclude_id`, `:project_or_global`, `:threshold`, `:pool`, etc.
+  `:exclude_id`, `:project_or_global`, `:threshold`, `:pool`, etc. When a caller
+  passes `on_overload: :tag` (US-37.5), an over-cap heavy-read shed returns
+  `{:error, :heavy_read_overloaded}` instead of raising — the graceful-degrade path
+  (the auto-link worker snoozes; the ProposalGate write-back gate falls open).
   """
   @callback nearest(
               tenant_id :: binary(),
               target_embedding :: term(),
               k :: pos_integer(),
               opts :: keyword()
-            ) :: [candidate()]
+            ) :: [candidate()] | {:error, :heavy_read_overloaded}
 end

@@ -163,24 +163,35 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   defp find_and_link_similar(article, tenant_id, threshold, max_comparisons) do
     maybe_emit_corpus_size(article, tenant_id, max_comparisons)
 
-    candidates = find_similar_articles(article, tenant_id, threshold, max_comparisons)
-    conflict_threshold = conflict_threshold()
+    case find_similar_articles(article, tenant_id, threshold, max_comparisons) do
+      {:error, :heavy_read_overloaded} ->
+        # US-37.5: the tenant is over its per-tenant HeavyRead slice, so the kNN read
+        # was shed (`on_overload: :tag`). Yield LOSS-FREE with `{:snooze, n}` (no
+        # attempt consumed, same as the FairShare gate above) rather than erroring —
+        # a raised OverloadedError would burn attempts toward max_attempts and could
+        # PERMANENTLY lose this article's auto-links under a sustained heavy-read
+        # burst. Retried when the tenant's heavy-read load subsides.
+        {:snooze, FairShare.snooze_seconds()}
 
-    # A `relates_to` ambient link for everything >= the link threshold, PLUS a
-    # `:potential_conflict` flag (route-the-findings #4) for pairs >= the conflict
-    # threshold — too similar to comfortably coexist, for the consumer to resolve.
-    # Dedup is type-aware so the two link types don't crowd each other out.
-    relates =
-      build_links(article.id, candidates, tenant_id, :relates_to, fn _sim -> true end)
+      candidates when is_list(candidates) ->
+        conflict_threshold = conflict_threshold()
 
-    conflicts =
-      build_links(article.id, candidates, tenant_id, :potential_conflict, fn sim ->
-        sim >= conflict_threshold
-      end)
+        # A `relates_to` ambient link for everything >= the link threshold, PLUS a
+        # `:potential_conflict` flag (route-the-findings #4) for pairs >= the conflict
+        # threshold — too similar to comfortably coexist, for the consumer to resolve.
+        # Dedup is type-aware so the two link types don't crowd each other out.
+        relates =
+          build_links(article.id, candidates, tenant_id, :relates_to, fn _sim -> true end)
 
-    created_count = create_links(relates ++ conflicts, tenant_id)
-    log_audit_event(article.id, tenant_id, created_count)
-    :ok
+        conflicts =
+          build_links(article.id, candidates, tenant_id, :potential_conflict, fn sim ->
+            sim >= conflict_threshold
+          end)
+
+        created_count = create_links(relates ++ conflicts, tenant_id)
+        log_audit_event(article.id, tenant_id, created_count)
+        :ok
+    end
   end
 
   defp build_links(article_id, candidates, tenant_id, type, keep?) do
@@ -242,18 +253,27 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   # project's matches all fall outside the global top-pool it could under-fill, the same
   # documented post-ANN-filter limitation `VectorSearch` carries for `tags`/`category`.
   defp find_similar_articles(article, tenant_id, threshold, max_comparisons) do
-    tenant_id
-    |> @similarity_search.nearest(article.embedding, max_comparisons,
-      exclude_id: article.id,
-      project_or_global: article.project_id,
-      threshold: 0.0,
-      pool: VectorSearch.pool_size(max_comparisons)
-    )
-    # The helper returns `%{id, title, category, similarity_score}`; the linking path
-    # keys on `:id` + `:similarity`, so map the score across and keep the inclusive
-    # `>= threshold` boundary in memory (see the threshold note above).
-    |> Enum.map(fn %{id: id, similarity_score: score} -> %{id: id, similarity: score} end)
-    |> Enum.filter(fn %{similarity: sim} -> sim >= threshold end)
+    # US-37.5: `on_overload: :tag` so an over-cap heavy-read shed returns
+    # `{:error, :heavy_read_overloaded}` (propagated up to a loss-free `{:snooze, n}`
+    # in `find_and_link_similar/4`) instead of raising and burning a job attempt.
+    case @similarity_search.nearest(tenant_id, article.embedding, max_comparisons,
+           exclude_id: article.id,
+           project_or_global: article.project_id,
+           threshold: 0.0,
+           on_overload: :tag,
+           pool: VectorSearch.pool_size(max_comparisons)
+         ) do
+      {:error, :heavy_read_overloaded} = err ->
+        err
+
+      candidates when is_list(candidates) ->
+        # The helper returns `%{id, title, category, similarity_score}`; the linking
+        # path keys on `:id` + `:similarity`, so map the score across and keep the
+        # inclusive `>= threshold` boundary in memory (see the threshold note above).
+        candidates
+        |> Enum.map(fn %{id: id, similarity_score: score} -> %{id: id, similarity: score} end)
+        |> Enum.filter(fn %{similarity: sim} -> sim >= threshold end)
+    end
   end
 
   # US-36.4 (AC-36.4.1): the corpus-size-vs-limit warning used to run a full `count(*)`

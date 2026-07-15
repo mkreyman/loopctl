@@ -5,6 +5,7 @@ defmodule Loopctl.Knowledge.ProposalGateTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.ProposalGate
 
@@ -100,6 +101,32 @@ defmodule Loopctl.Knowledge.ProposalGateTest do
     test "system scope (nil tenant) skips the gate" do
       assert %{verdict: :unknown, neighbors: []} =
                ProposalGate.assess(nil, %{"title" => "X", "body" => "Y"})
+    end
+
+    # Finding #1 (US-37.5 review): assess/3 runs SYNCHRONOUSLY in the knowledge_create
+    # write path. Its novelty read goes through the per-tenant HeavyRead gate; an
+    # over-cap tenant must NOT 429 the WRITE — the gate falls OPEN (:unknown), matching
+    # its treatment of every other novelty-check failure.
+    test "falls OPEN (:unknown) when the novelty read is SHED over-cap — never 429s a write",
+         %{tenant: tenant} do
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, e([1.0])}
+      end)
+
+      # Saturate this tenant's per-tenant in-flight slice so the very next heavy read
+      # (the novelty kNN) is shed. cap/0 is the clamped live value the wired gate uses.
+      cap = TenantGate.cap()
+      assert TenantGate.acquire(tenant.id, cap, cap) == :ok
+
+      assessment = ProposalGate.assess(tenant.id, %{"title" => "Supervisors", "body" => "OTP"})
+
+      # Fall OPEN: no verdict, no neighbors — the write proceeds unblocked, NOT a raise.
+      assert assessment.verdict == :unknown
+      assert assessment.score == nil
+      assert assessment.neighbors == []
+
+      # Release the pre-filled budget so the shared VM-wide counter doesn't leak.
+      TenantGate.release(tenant.id, cap)
     end
   end
 end

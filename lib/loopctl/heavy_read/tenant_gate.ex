@@ -72,12 +72,20 @@ defmodule Loopctl.HeavyRead.TenantGate do
   `acquire/3` returns `:ok` (allow the read), `release/2` returns `:ok`. An
   unmeasurable limiter degrades to "no limit", never to "all reads blocked".
 
-  By contrast, a MALFORMED CAP fails LOUD: `cap/0`/`weight_for/1` read config
-  OUTSIDE any rescue, so a bad `heavy_read_tenant_cap` (a non-positive int) surfaces
-  rather than being swallowed into a silent fail-open that disables fairness during
-  the very incident an operator is tuning. `Loopctl.SystemConfig.get_int/2` itself
-  never raises (returns the default on miss), and the app-env default is a positive
-  literal, so in practice the cap is always valid.
+  A MALFORMED CAP is CLAMPED (not trusted, not fail-loud): `cap/0` runs the
+  live-tunable `"heavy_read_tenant_cap"` value through `clamp_cap/1` into the
+  structurally valid range `[heavy_weight/0, pool - 1]` — logging a warning when it
+  clamps. This is deliberate and load-bearing for AC-37.5.5: an operator setting a
+  NON-POSITIVE cap (`0`/negative) would otherwise make `acquire/4`'s `cap > 0` guard
+  match no clause and raise a `FunctionClauseError` — which is NOT an
+  `OverloadedError`, so the 429 handler never fires and EVERY heavy read on the node
+  500s (the exact "limiter fault blocks all heavy reads" AC-37.5.5 forbids). Flooring
+  at `heavy_weight/0` also prevents a `K < heavy_weight` value making every heavy read
+  shed for all tenants, and the `pool - 1` ceiling stops a `K >= pool` value silently
+  re-enabling the single-tenant monopolization this gate exists to prevent (it
+  guarantees `N - K >= 1` slots always remain for neighbours). `Loopctl.SystemConfig.get_int/2`
+  itself never raises (returns the default on miss); the clamp turns any out-of-range
+  operator knob into a safe, logged value rather than a node-wide outage.
 
   ## Config — env-driven, live-tunable, node-local (AC-37.5.5)
 
@@ -132,10 +140,16 @@ defmodule Loopctl.HeavyRead.TenantGate do
 
   # HeavyRead endpoints whose queries are the EXPENSIVE ones — vector/kNN scans,
   # semantic ranking, HNSW memory recall, the novelty/suggested-links ANN probes,
-  # and the distant-pairs analytic reads. They consume `heavy_weight/0` of a tenant's
-  # in-flight budget; every other (lighter, bounded, fast-releasing) endpoint —
-  # change feed, enumeration, ingestion-jobs count, STH tail, LLM usage — consumes
-  # `light_weight/0`. Kept in sync with `Loopctl.HeavyRead.opts/1`'s known endpoints.
+  # the distant-pairs analytic reads, and the long (60s) streamed-export scans. They
+  # consume `heavy_weight/0` of a tenant's in-flight budget; every other (lighter,
+  # bounded, fast-releasing) endpoint — change feed, enumeration, ingestion-jobs
+  # count, STH tail, LLM usage — consumes `light_weight/0`.
+  #
+  # DRIFT GUARD: every atom here MUST be a `Loopctl.HeavyRead.known_endpoints/0`
+  # member, and that full known set is partitioned (heavy vs light) by
+  # `tenant_gate_test.exs`'s endpoint-weight guard — so a NEW heavy endpoint a caller
+  # adds (registered in `known_endpoints/0`) cannot silently fall through
+  # `weight_for/1` to light weight and under-charge a genuinely heavy read.
   @heavy_endpoints ~w(
     vector_search
     semantic_search
@@ -144,6 +158,7 @@ defmodule Loopctl.HeavyRead.TenantGate do
     suggested_links
     distant_pairs
     distant_pairs_bridge
+    export
   )a
 
   # --- Client API ---
@@ -245,12 +260,44 @@ defmodule Loopctl.HeavyRead.TenantGate do
   Live-tunable via the `"heavy_read_tenant_cap"` `SystemConfig` key; on a cache miss
   it falls back to the `:heavy_read_tenant_cap` application env, whose default is
   `Loopctl.DbCapacity.heavy_read_tenant_slice/0` (pinned `< HEAVY_READ_POOL_SIZE`).
-  Read OUTSIDE any rescue so a malformed cap fails loud rather than silently
-  disabling fairness.
+  The configured value is CLAMPED via `clamp_cap/1` into `[heavy_weight/0, pool - 1]`
+  so a malformed operator knob (non-positive → node-wide 500; `< heavy_weight` →
+  every read sheds; `>= pool` → monopolization) is turned into a safe, LOGGED value
+  rather than an outage or a silently-defeated gate (AC-37.5.5). Always returns a
+  positive integer `>= heavy_weight/0`, so `acquire/4`'s `cap > 0` guard always matches.
   """
   @spec cap() :: pos_integer()
   def cap do
-    SystemConfig.get_int(@cap_config_key, cap_default())
+    @cap_config_key
+    |> SystemConfig.get_int(cap_default())
+    |> clamp_cap()
+  end
+
+  @doc """
+  Clamps a configured cap into the structurally valid range `[heavy_weight/0, pool - 1]`,
+  logging a warning when the input was out of range.
+
+  The lower floor (`heavy_weight/0`) guarantees a single heavy read always fits AND
+  keeps `acquire/4`'s `cap > 0` guard satisfied (a non-positive cap would otherwise
+  raise a `FunctionClauseError` OUTSIDE the acquire rescue → a node-wide 500, the
+  AC-37.5.5 fail-open violation). The upper ceiling (`pool - 1`) guarantees at least
+  one pool slot always remains for a tenant's neighbours, so no cap value can
+  re-enable single-tenant monopolization. Exposed for the drift/range guard test.
+  """
+  @spec clamp_cap(integer()) :: pos_integer()
+  def clamp_cap(configured) when is_integer(configured) do
+    lower = heavy_weight()
+    upper = max(lower, pool_size() - 1)
+    clamped = configured |> max(lower) |> min(upper)
+
+    if clamped != configured do
+      Logger.warning(
+        "HeavyRead.TenantGate: configured cap #{inspect(configured)} out of range " <>
+          "[#{lower}, #{upper}] (heavy_weight..pool-1); clamped to #{clamped}"
+      )
+    end
+
+    clamped
   end
 
   @doc """
@@ -265,6 +312,10 @@ defmodule Loopctl.HeavyRead.TenantGate do
   def weight_for(endpoint) when endpoint in @heavy_endpoints, do: heavy_weight()
   def weight_for(_endpoint), do: light_weight()
 
+  @doc "The endpoint atoms weighted `heavy_weight/0` (for the drift/range guard test)."
+  @spec heavy_endpoints() :: [atom()]
+  def heavy_endpoints, do: @heavy_endpoints
+
   @doc "The in-flight budget a HEAVY endpoint's read consumes (env `:heavy_read_weight_heavy`, default #{@default_heavy_weight})."
   @spec heavy_weight() :: pos_integer()
   def heavy_weight, do: Application.get_env(:loopctl, @heavy_weight_env, @default_heavy_weight)
@@ -278,6 +329,11 @@ defmodule Loopctl.HeavyRead.TenantGate do
 
   defp cap_default,
     do: Application.get_env(:loopctl, @cap_env, DbCapacity.heavy_read_tenant_slice())
+
+  # The heavy-read pool size the cap ceiling is derived from (`pool - 1`). The
+  # documented budget (`DbCapacity.heavy_read_budget/0`) is the same reference
+  # `heavy_read_tenant_slice/0` is pinned against, so cap and default stay coherent.
+  defp pool_size, do: DbCapacity.heavy_read_budget().pool
 
   # --- Server callbacks (table-owner only; acquire/release bypass this process) ---
 

@@ -3,6 +3,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.EmbeddingConcurrency
 
@@ -413,6 +414,46 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       # Should still find via keyword match
       assert results != []
       assert Enum.any?(results, &(&1.title == "Testing Guide"))
+    end
+  end
+
+  # Finding #4 (US-37.5 review): the user-facing keyword-fallback-on-overload degrade
+  # (search_semantic → {:error, :heavy_read_overloaded} → combined_keyword_fallback)
+  # had no coverage. Here the embedding SUCCEEDS but the semantic heavy read is SHED
+  # over the per-tenant cap, so combined search must degrade to keyword_only and
+  # surface `meta.fallback_reason == "heavy_read_overloaded"` — the SAME graceful path
+  # as an embedding failure, keeping other tenants' access to the shared pool.
+  describe "search_combined/3 - keyword fallback on over-cap semantic shed (US-37.5)" do
+    test "an over-cap semantic shed → keyword_only + fallback_reason heavy_read_overloaded" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Testing Guide",
+        body: "Unit test patterns for testing Elixir applications.",
+        status: :published
+      })
+
+      # Embedding SUCCEEDS (so the semantic branch is attempted); the semantic HeavyRead
+      # (search_semantic, on_overload: :tag) then sheds because the tenant is over-cap.
+      # Keyword search runs on AdminRepo (ungated), so it still returns matches.
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      cap = TenantGate.cap()
+      assert TenantGate.acquire(tenant.id, cap, cap) == :ok
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.search_combined(tenant.id, "testing")
+
+      assert meta.search_mode == "keyword_only"
+      assert meta.fallback == true
+      assert meta.fallback_reason == "heavy_read_overloaded"
+      assert Enum.any?(results, &(&1.title == "Testing Guide"))
+
+      TenantGate.release(tenant.id, cap)
     end
   end
 

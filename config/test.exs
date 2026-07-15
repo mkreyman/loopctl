@@ -314,15 +314,20 @@ config :loopctl, :embedding_max_concurrent, 64
 # LOW per-tenant cap via acquire/3. Production uses the config.exs default (6).
 config :loopctl, :embedding_max_concurrent_per_tenant, 64
 
-# US-37.5: high suite-wide default for the per-tenant in-flight HeavyRead cap (K) so
-# the gate wired into Loopctl.HeavyRead.all/one/all_memory is effectively a NO-OP for
-# incidental heavy reads across the async suite — they must not collide on the shared,
-# VM-wide per-tenant counters and spuriously shed. The gate's OWN unit test
-# (tenant_gate_test.exs) passes explicit LOW caps to acquire/3, independent of this
+# US-37.5: suite-wide default for the per-tenant in-flight HeavyRead cap (K). Set to
+# the clamp CEILING (`pool - 1`, pool = Loopctl.DbCapacity.heavy_read_budget().pool = 8),
+# the highest value `TenantGate.cap/0`'s `clamp_cap/1` admits — so the gate wired into
+# Loopctl.HeavyRead.all/one/all_memory stays as permissive as possible for incidental
+# heavy reads across the async suite (each test uses a UNIQUE fixture tenant, so
+# per-tenant, VM-wide counters do not collide across tests; a single test would need
+# >7 units of concurrent SAME-tenant heavy-read weight to shed). A former sentinel
+# (100_000) is no longer usable: `cap/0` now clamps any out-of-range value into
+# `[heavy_weight, pool - 1]` and LOGS on clamp, so an out-of-range test cap would spam
+# warnings on every heavy read AND still resolve to 7. The gate's OWN unit test
+# (tenant_gate_test.exs) passes explicit LOW caps to acquire/4, independent of this
 # value. Production uses Loopctl.DbCapacity.heavy_read_tenant_slice/0 (4), live-tunable
-# via the "heavy_read_tenant_cap" SystemConfig key. Mirrors the embedding/export
-# high-suite-cap precedent above.
-config :loopctl, :heavy_read_tenant_cap, 100_000
+# via the "heavy_read_tenant_cap" SystemConfig key.
+config :loopctl, :heavy_read_tenant_cap, 7
 
 # US-28.2: a small per-(tenant, subject) long-term memory cap so the quota path
 # (`{:error, :quota_exceeded}`) is testable without inserting tens of thousands of

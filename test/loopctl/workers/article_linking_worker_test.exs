@@ -240,6 +240,33 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
     end
   end
 
+  # Finding #2 (US-37.5 review): when the per-tenant HeavyRead gate sheds the kNN read
+  # (returned as `{:error, :heavy_read_overloaded}` via `on_overload: :tag`), the worker
+  # must yield LOSS-FREE with `{:snooze, n}` — not error/retry-churn toward max_attempts
+  # (which could permanently lose an article's auto-links under a sustained burst).
+  describe "perform/1 heavy-read overload (US-37.5)" do
+    test "passes on_overload: :tag and SNOOZES (no attempt consumed) when the read is shed" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, opts ->
+        # The worker asks for the graceful-degrade disposition, not a raise.
+        assert Keyword.fetch!(opts, :on_overload) == :tag
+        {:error, :heavy_read_overloaded}
+      end)
+
+      assert {:snooze, seconds} =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      assert is_integer(seconds) and seconds > 0
+
+      # No links were created — the job made no partial progress before snoozing.
+      assert AdminRepo.all(from(l in ArticleLink, where: l.tenant_id == ^tenant.id)) == []
+    end
+  end
+
   # --- TC-21.2.2: Skips articles below threshold ---
 
   describe "perform/1 threshold filtering" do
