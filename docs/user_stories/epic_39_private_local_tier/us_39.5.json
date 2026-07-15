@@ -1,0 +1,47 @@
+{
+  "id": "US-39.5",
+  "title": "Encrypt private-tier bodies at rest + vector-only recall (drop plaintext FTS for that tier)",
+  "epic": { "id": "epic_39", "name": "Private / Local-Only Knowledge & Memory" },
+  "priority": "medium",
+  "phase": "data-sovereignty",
+  "priority_note": "Completes data-at-rest for the private tier. Today article/memory bodies are stored PLAINTEXT (they back the tsvector full-text search). For health/DNA/financial data, the body should be encrypted at rest so even a DB dump doesn't reveal it. Semantic search works on the VECTOR, not the plaintext, so vector-only recall lets us encrypt the body without losing retrieval.",
+  "background": {
+    "reference": "Article/memory bodies are plaintext: search_vector = to_tsvector(body) (20260410021836_add_search_vector_to_articles.exs, 20260712000000_add_search_vectors_to_backing_tables.exs). Only BYO keys use Looctl.Vault.Binary (Cloak) encryption. Cloak/Vault infra already exists in the app (field-level AES-256-GCM).",
+    "includes": "For a scope/article/memory flagged private (tie to US-39.4 local_only or a separate encrypted flag): store the body via Cloak (encrypted at rest), SKIP tsvector generation (can't FTS ciphertext), and rely on vector similarity (the embedding, computed locally per US-39.2/3) for recall — decrypting the body only on retrieval to the authorized caller. Non-private tier unchanged (plaintext + FTS)."
+  },
+  "story": {
+    "as_a": "a user storing health/DNA/financial data in a self-hosted second brain",
+    "i_want_to": "have private-tier article/memory bodies encrypted at rest and retrieved by semantic vector search",
+    "so_that": "a database dump or disk image never exposes my private content in plaintext, while I can still recall it semantically"
+  },
+  "rationale": "Local models keep private data off the network; encrypting the body keeps it protected on disk too. Because recall uses the vector (not the plaintext body), we can encrypt the body with the existing Cloak machinery and simply skip plaintext FTS for the private tier — a clean, low-risk way to close the last exposure without losing the core retrieval capability.",
+  "acceptance_criteria": [
+    { "id": "AC-39.5.1", "description": "A private/encrypted marking (per-scope, aligned with US-39.4 local_only, or an explicit encrypt_body flag) causes the article/memory BODY to be stored encrypted via the existing Cloak/Vault (Loopctl.Vault.Binary) machinery. A DB-level read of the row shows ciphertext, not plaintext. Non-private rows are unchanged (plaintext).", "status": "pending" },
+    { "id": "AC-39.5.2", "description": "For encrypted-body rows, tsvector/FTS is SKIPPED (you can't full-text-search ciphertext) and recall is vector-only (semantic similarity on the embedding). A test: an encrypted-tier memory/article is recalled by memory_recall/knowledge search via vector similarity, and does NOT appear in a plaintext keyword-only search of the body.", "status": "pending" },
+    { "id": "AC-39.5.3", "description": "On retrieval to an authorized (in-scope) caller, the body is transparently decrypted and returned as today; an out-of-scope caller gets the usual 404/scope-denied (no plaintext, no existence leak). Tenant/scope isolation preserved.", "status": "pending" },
+    { "id": "AC-39.5.4", "description": "Default-off + non-breaking: existing rows and the hosted instance are unchanged (plaintext + FTS). Docs state the trade-off (encrypted tier loses keyword FTS; relies on local embeddings) and the embedding-inversion caveat (vectors can partially leak — keep sensitive vectors on a self-hosted DB). No UI.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-39.5.1", "name": "private body is ciphertext at rest", "type": "integration",
+      "preconditions": ["encrypt flag on; create article/memory"],
+      "steps": ["read the raw DB column"],
+      "expected_results": ["ciphertext, not plaintext; decrypts on app retrieval"], "status": "pending" },
+    { "id": "TC-39.5.2", "name": "vector recall works, FTS skipped", "type": "integration",
+      "preconditions": ["encrypted-tier row with a local embedding"],
+      "steps": ["semantic recall; then plaintext keyword search of body"],
+      "expected_results": ["found by vector similarity; NOT surfaced by plaintext FTS; no tsvector stored"], "status": "pending" },
+    { "id": "TC-39.5.3", "name": "scope isolation on encrypted body", "type": "integration",
+      "preconditions": ["encrypted row in tenant A"],
+      "steps": ["tenant B attempts retrieval"],
+      "expected_results": ["404/denied; no plaintext, no existence leak"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/knowledge/article.ex + lib/loopctl/memory/memory.ex (conditional Cloak type for body / conditional tsvector), the search paths (skip FTS + rely on vector for encrypted tier), a per-scope encrypt/private flag + migration, docs/self-hosting.md.",
+    "Cloak/Vault already in the app (Loopctl.Vault.Binary for keys) — reuse it for the body. The tricky bit is CONDITIONAL encryption (only private tier) + skipping the generated tsvector column for those rows.",
+    "Recall uses the vector, so encryption doesn't break semantic search — but keyword/FTS is lost for encrypted rows (document it). Local embedding (US-39.2/3) is a prerequisite for a truly-private tier (don't embed private text via a cloud model).",
+    "Embedding-inversion caveat in docs: stored vectors can partially reconstruct text → keep sensitive vectors on a self-hosted DB.",
+    "Aligns with US-39.4's local_only marking (private ⇒ local_only ⇒ encrypted is a sensible bundle, but keep the flags composable). No UI. No Application.put_env in tests."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 400000
+}

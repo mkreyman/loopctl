@@ -1,0 +1,47 @@
+{
+  "id": "US-39.1",
+  "title": "Configurable embedding dimension end-to-end (migrations + HNSW honor :embedding_dimensions)",
+  "epic": { "id": "epic_39", "name": "Private / Local-Only Knowledge & Memory" },
+  "priority": "high",
+  "phase": "data-sovereignty",
+  "priority_note": "THE self-host blocker. A user's agent correctly identified that the hardcoded vector(1536) prevents self-hosting with a local embedding model (nomic-embed 768, bge 1024, etc.). The Elixir validation layer ALREADY reads a configurable :embedding_dimensions; only the DB schema/index doesn't honor it. Unblocking this is the prerequisite for any local-embedding privacy story.",
+  "background": {
+    "reference": "config/config.exs:16 sets `embedding_dimensions: 1536`. validate_embedding_dimensions/1 already reads Application.get_env(:loopctl, :embedding_dimensions, 1536) in lib/loopctl/knowledge/article.ex:490 and lib/loopctl/memory/memory.ex:266. BUT the columns are hardcoded: articles `ALTER TABLE articles ADD COLUMN embedding vector(1536)` (20260410022854_enable_pgvector_and_add_embedding.exs:25); memories `ALTER TABLE memories ADD COLUMN embedding vector(1536)` (20260709000000_create_memory_stores.exs:101); HNSW indexes built on those fixed-dim columns (lib/loopctl/repo/hnsw_index.ex, 20260709000100/300). So on a fresh self-host, a 768-dim local vector fails to insert.",
+    "includes": "Deployment-level dimension (one dim per instance) — sufficient for a single-org private self-host. Per-TENANT dimension (mixing dims in one HNSW column is impossible) is OUT OF SCOPE / deferred. Changing dim on an existing populated instance requires re-embedding + reindex — a documented one-time setup step, NOT an online migration."
+  },
+  "story": {
+    "as_a": "someone self-hosting loopctl with a local embedding model",
+    "i_want_to": "set the embedding vector dimension for my instance via config so the DB columns and HNSW indexes are created at that dimension",
+    "so_that": "I can run knowledge + memory embeddings against a local OpenAI-compatible model (768/1024/etc.) instead of being forced to OpenAI's 1536-dim model"
+  },
+  "rationale": "The app already treats the dimension as configurable everywhere EXCEPT the schema. Making the vector-column and HNSW-index creation read the same :embedding_dimensions config closes the gap with no behavior change for the default (1536) instance, and unblocks the entire local/private tier. It's the smallest change with the largest sovereignty payoff.",
+  "acceptance_criteria": [
+    { "id": "AC-39.1.1", "description": "The articles.embedding and memories.embedding vector columns and their HNSW indexes are created at the dimension from Application.get_env(:loopctl, :embedding_dimensions) (default 1536). On a FRESH database with :embedding_dimensions set to e.g. 768, the columns are vector(768) and a 768-dim embedding inserts + kNN-searches successfully. On the default (1536) instance, schema is byte-identical to today (regression test).", "status": "pending" },
+    { "id": "AC-39.1.2", "description": "The configured dimension is the single source of truth: the migration/setup path, validate_embedding_dimensions/1 (article + memory), and any hardcoded 1536 literals in the vector path all resolve from :embedding_dimensions. A test asserts no code path assumes 1536 when the config differs (grep-guard test or a config-override test that exercises insert+recall at a non-1536 dim).", "status": "pending" },
+    { "id": "AC-39.1.3", "description": "Changing the dimension on an EXISTING instance is handled safely: the system detects a mismatch (configured dim != column dim) at boot and fails loud with a clear, actionable message (re-embed + reindex required) rather than silently corrupting/rejecting inserts. A documented mix task or runbook performs the re-embed+reindex. This story does NOT auto-migrate existing data.", "status": "pending" },
+    { "id": "AC-39.1.4", "description": "Purely enables a config; no default change. Hosted loopctl.com (1536, OpenAI) is unaffected. Documented in docs/agent-memory.md / a new docs/self-hosting.md: how to set the dimension for a local model.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-39.1.1", "name": "fresh DB at 768 dim round-trips", "type": "integration",
+      "preconditions": [":embedding_dimensions=768; fresh schema"],
+      "steps": ["insert a 768-dim article + memory embedding", "kNN search"],
+      "expected_results": ["insert succeeds; nearest-neighbour returns the row"], "status": "pending" },
+    { "id": "TC-39.1.2", "name": "default 1536 schema unchanged", "type": "unit",
+      "preconditions": ["default config"],
+      "steps": ["inspect the generated column/index dimension"],
+      "expected_results": ["vector(1536) as today; existing dimension tests pass"], "status": "pending" },
+    { "id": "TC-39.1.3", "name": "dim mismatch fails loud at boot", "type": "unit",
+      "preconditions": ["column is vector(1536); config says 768"],
+      "steps": ["run the boot/dimension check"],
+      "expected_results": ["clear error naming the mismatch + remediation; no silent corruption"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: priv/repo/migrations (the vector-column creation — parameterize the dimension from config; a fresh install reads :embedding_dimensions), lib/loopctl/repo/hnsw_index.ex (index dim), config/config.exs + config/runtime.exs (EMBEDDING_DIMENSION env → :embedding_dimensions), a new boot check + a re-embed/reindex mix task, docs/self-hosting.md.",
+    "pgvector: `vector(N)` column type is fixed per column; HNSW index inherits it. Migrations must interpolate N from config at run time (Ecto migrations can read Application env). For an existing 1536 instance the migration is a no-op; the dimension is only chosen at fresh install.",
+    "Do NOT attempt per-tenant dimensions (impossible in one HNSW column) — deployment-level only; note per-tenant as future work.",
+    "Re-embed+reindex on dim change is offline/one-time (CREATE INDEX CONCURRENTLY the new, re-run embedding workers) — documented, not automated here.",
+    "Config-based DI; no Application.put_env in tests (use config/test overrides or a scoped helper)."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 400000
+}
