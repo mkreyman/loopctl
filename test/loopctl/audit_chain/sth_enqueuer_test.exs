@@ -410,42 +410,108 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
       assert enqueued_tid == tenant.id
     end
 
-    test "TC-38.3.1: a second instance under the SAME {:global, _} name yields :ignore (one active enqueuer)" do
-      # Simulate a multi-node collision on the cluster-global name: the first instance
-      # wins the {:global, _} registration; a second start under the SAME global name
-      # collides and start_link/1 maps the {:already_started, _} to :ignore, so the
-      # local supervisor treats the child as started rather than crash-looping. Net:
-      # exactly ONE active enqueuer across the (simulated) cluster.
-      global_atom = :"sth_singleton_#{System.unique_integer([:positive])}"
-      global_name = {:global, global_atom}
+    test "TC-38.3.1: two :singleton instances contend → exactly ONE leader, one live standby (one active enqueuer)" do
+      # Simulate a multi-node cluster on ONE test node: two :singleton-mode instances
+      # contend for one isolated leadership_key via :global.register_name/2. Exactly
+      # one wins leadership (the sole drainer); the OTHER is a LIVE standby monitoring
+      # the leader — NOT :ignore, NOT dead. That live standby is what makes real
+      # failover possible (see the failover test below).
+      key = :"sth_lead_#{System.unique_integer([:positive])}"
 
-      first =
-        start_supervised!(
-          Supervisor.child_spec({SthEnqueuer, [name: global_name, subscribe: false]},
-            id: :sth_global_singleton
-          )
-        )
+      {a, b} = start_two_singletons(key)
 
-      assert is_pid(first)
-      assert :global.whereis_name(global_atom) == first
+      # Barrier: :sys.get_state blocks until each handle_continue(:establish_role) ran.
+      roles = Enum.sort([:sys.get_state(a).role, :sys.get_state(b).role])
+      assert roles == [:leader, :standby]
 
-      # Second registration under the same global name → :ignore (NOT a crash, NOT a
-      # second process).
-      assert :ignore == SthEnqueuer.start_link(name: global_name, subscribe: false)
+      leader = :global.whereis_name(key)
+      assert leader in [a, b]
 
-      # The original remains the one and only globally-registered, alive instance.
-      assert :global.whereis_name(global_atom) == first
-      assert Process.alive?(first)
+      # BOTH remain alive — the loser is a standby, not a terminated/ignored child.
+      assert Process.alive?(a)
+      assert Process.alive?(b)
     end
 
-    test "TC-38.3.1: the DEFAULT (unnamed) start is the cluster-global singleton the app already holds" do
-      # The app-boot instance started with default opts, so it registered under
-      # {:global, SthEnqueuer}. A fresh DEFAULT start therefore collides and returns
-      # :ignore — proving the default name IS the cluster-wide global singleton
-      # (exactly one active across the cluster), and that a redundant node start is a
-      # graceful no-op rather than a crash.
-      assert is_pid(:global.whereis_name(SthEnqueuer))
-      assert :ignore == SthEnqueuer.start_link(subscribe: false)
+    test "TC-38.3.1: FAILOVER — killing the leader promotes a surviving standby that resumes draining" do
+      # The behavior AC-38.3.1 actually requires: 'If the singleton's node dies,
+      # another node takes over (failover).' Kill the leader (:temporary child ⇒ NOT
+      # restarted, so this cleanly simulates the OWNER NODE dying, not a same-node
+      # process crash). :global frees the name; the standby's cross-node monitor fires
+      # {:DOWN, ...}; it re-registers, becomes the new leader, and can still enqueue.
+      tenant = fixture(:tenant)
+      key = :"sth_failover_#{System.unique_integer([:positive])}"
+
+      {a, b} = start_two_singletons(key)
+      _ = :sys.get_state(a)
+      _ = :sys.get_state(b)
+
+      leader = :global.whereis_name(key)
+      standby = if leader == a, do: b, else: a
+      assert :sys.get_state(standby).role == :standby
+
+      # Kill the leader and wait for its death to be observed.
+      ref = Process.monitor(leader)
+      Process.exit(leader, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^leader, _reason}, 2_000
+
+      # The standby takes over the cluster-global leadership name (real failover).
+      assert eventually(fn -> :global.whereis_name(key) == standby end)
+      assert :sys.get_state(standby).role == :leader
+
+      # And the new leader still drains: the enqueue path works after takeover.
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, _job} = SthEnqueuer.enqueue_sth_job(%{tenant_id: tenant.id})
+      end)
+
+      assert [%{args: %{"tenant_id" => enqueued_tid}}] = all_enqueued(worker: ComputeSthWorker)
+      assert enqueued_tid == tenant.id
+    end
+
+    test "TC-38.3.1: the app-boot instance holds the cluster-global {:global, SthEnqueuer} leadership" do
+      # The app-boot instance started with default opts (:singleton mode keyed on
+      # __MODULE__), so it registered under {:global, SthEnqueuer} and is the live
+      # cluster singleton — exactly one active drainer across the (single-node) cluster.
+      leader = :global.whereis_name(SthEnqueuer)
+      assert is_pid(leader)
+      assert Process.alive?(leader)
+    end
+  end
+
+  # Start two :singleton-mode instances contending on one isolated leadership_key.
+  # :temporary so a killed leader is NOT restarted (clean node-death simulation);
+  # subscribe: false so neither touches the sandbox from its own process.
+  defp start_two_singletons(key) do
+    a =
+      start_supervised!(
+        Supervisor.child_spec({SthEnqueuer, [leadership_key: key, subscribe: false]},
+          id: :sth_singleton_a,
+          restart: :temporary
+        )
+      )
+
+    b =
+      start_supervised!(
+        Supervisor.child_spec({SthEnqueuer, [leadership_key: key, subscribe: false]},
+          id: :sth_singleton_b,
+          restart: :temporary
+        )
+      )
+
+    {a, b}
+  end
+
+  # Poll a predicate until true or a bounded deadline — assert outcome CLASS, not
+  # exact timing (the async-suite flake lesson): failover is asynchronous (:global
+  # de-register + monitor :DOWN + re-register), so we wait for the end state.
+  defp eventually(fun, attempts \\ 100, sleep_ms \\ 20)
+  defp eventually(_fun, 0, _sleep_ms), do: false
+
+  defp eventually(fun, attempts, sleep_ms) do
+    if fun.() do
+      true
+    else
+      Process.sleep(sleep_ms)
+      eventually(fun, attempts - 1, sleep_ms)
     end
   end
 end

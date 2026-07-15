@@ -9,7 +9,7 @@ defmodule Loopctl.ClusterReadinessTest do
   unset `DNS_CLUSTER_QUERY` env resolves to `:ignore`).
 
   All classification/WARN cases are driven through the PURE `readiness/3` /
-  `warn_if_expected_peers_missing/2` seams with injected inputs — no real cluster,
+  `warn_if_expected_peers_missing/3` seams with injected inputs — no real cluster,
   no `EXPECTED_APP_NODES` env mutation — so the async suite asserts outcome CLASS,
   not real topology/timing (the async-suite flake lesson).
   """
@@ -30,9 +30,26 @@ defmodule Loopctl.ClusterReadinessTest do
       assert %{status: :single_node} = ClusterReadiness.readiness(1, [:peer@host], true)
     end
 
-    test "DNS query unset ⇒ :single_node regardless of expected count (clustering not enabled)" do
-      assert %{status: :single_node} = ClusterReadiness.readiness(3, [], false)
-      assert %{status: :single_node} = ClusterReadiness.readiness(3, [:a@h, :b@h], false)
+    test "DNS unset at/below the single-node default (2) ⇒ :single_node (indistinguishable from a normal single-node deploy)" do
+      # EXPECTED_APP_NODES unset defaults to 2 (DbCapacity). DNS unset at count 2 is
+      # the standard single-node prod state — it must NOT be flagged, because a
+      # forgotten DNS_CLUSTER_QUERY at the default count cannot be told apart from
+      # "never intended to cluster".
+      assert %{status: :single_node} = ClusterReadiness.readiness(2, [], false)
+      assert %{status: :single_node} = ClusterReadiness.readiness(1, [], false)
+    end
+
+    test "MEDIUM FINDING: DNS unset with EXPECTED_APP_NODES raised ABOVE the default (>2) ⇒ :clustering_expected_dns_unconfigured (not silently :single_node)" do
+      # The 'machine-count bump silently un-clustered' case the story exists to
+      # surface: an operator explicitly raised the node count but left
+      # DNS_CLUSTER_QUERY unset. This is distinguishable from the default single-node
+      # deploy (count 2), so it gets its own status rather than being swallowed as
+      # :single_node. Peer count is irrelevant — peers can never connect without DNS.
+      assert %{status: :clustering_expected_dns_unconfigured} =
+               ClusterReadiness.readiness(3, [], false)
+
+      assert %{status: :clustering_expected_dns_unconfigured} =
+               ClusterReadiness.readiness(5, [:a@h, :b@h], false)
     end
 
     test ":clustered when configured and the expected peers are connected" do
@@ -58,7 +75,13 @@ defmodule Loopctl.ClusterReadinessTest do
       # `peers` is a COUNT (integer), never the node-name list.
       assert readiness.peers == 2
       assert is_integer(readiness.peers)
-      assert readiness.status in [:single_node, :clustered, :expected_peers_missing]
+
+      assert readiness.status in [
+               :single_node,
+               :clustered,
+               :expected_peers_missing,
+               :clustering_expected_dns_unconfigured
+             ]
 
       # No value in the map is (or contains) a node name atom/string.
       refute Enum.any?(Map.values(readiness), fn v ->
@@ -82,13 +105,26 @@ defmodule Loopctl.ClusterReadinessTest do
     test "dns_cluster_query_configured?/0 is false when DNS_CLUSTER_QUERY is unset (test env)" do
       refute ClusterReadiness.dns_cluster_query_configured?()
     end
+
+    test "the single-node baseline stays in lockstep with the DbCapacity default count" do
+      # ClusterReadiness's :single_node vs :clustering_expected_dns_unconfigured split
+      # hinges on the DbCapacity default node count (2). If that default ever changes,
+      # this behavioral coupling catches it: at EXACTLY the default count with DNS
+      # unset the signal must stay quiet (:single_node), and one above it must flag.
+      default = Loopctl.DbCapacity.expected_app_nodes()
+
+      assert %{status: :single_node} = ClusterReadiness.readiness(default, [], false)
+
+      assert %{status: :clustering_expected_dns_unconfigured} =
+               ClusterReadiness.readiness(default + 1, [], false)
+    end
   end
 
-  describe "warn_if_expected_peers_missing/2 boot gate (AC-38.3.3, TC-38.3.3)" do
-    test "TC-38.3.3: EXPECTED_APP_NODES > 1 with an empty Node.list WARNs and returns :ok (never raises)" do
+  describe "warn_if_expected_peers_missing/3 boot gate (AC-38.3.3, TC-38.3.3)" do
+    test "TC-38.3.3: DNS configured + EXPECTED_APP_NODES > 1 + empty Node.list WARNs and returns :ok (never raises)" do
       log =
         capture_log(fn ->
-          assert :ok == ClusterReadiness.warn_if_expected_peers_missing(3, [])
+          assert :ok == ClusterReadiness.warn_if_expected_peers_missing(3, [], true)
         end)
 
       assert log =~ "Clustering readiness"
@@ -96,8 +132,76 @@ defmodule Loopctl.ClusterReadinessTest do
       assert log =~ "UN-CLUSTERED"
       # It is documented as a WARN, not a crash.
       assert log =~ "WARN, not a crash"
+      # The boot-time transient is self-described so operators don't chase a lone WARN.
+      assert log =~ "gauge"
       # No node names are ever emitted (there are none here, but pin the contract).
       refute log =~ "@"
+    end
+
+    test "REGRESSION (medium finding): the standard single-node prod default does NOT warn" do
+      # DNS_CLUSTER_QUERY unset (dns_configured? == false) with the DbCapacity default
+      # EXPECTED_APP_NODES=2 and no peers is the EXACT current/correct prod state. It
+      # must NOT fire the UN-CLUSTERED alarm — it is :single_node, matching readiness/0
+      # (previously this path cried wolf on every normal single-node boot).
+      log =
+        capture_log(fn ->
+          assert :ok == ClusterReadiness.warn_if_expected_peers_missing(2, [], false)
+        end)
+
+      refute log =~ "UN-CLUSTERED"
+      refute log =~ "EXPECTED_APP_NODES"
+    end
+
+    test "MEDIUM FINDING: DNS unset + EXPECTED_APP_NODES raised above the default (>2) WARNs with a 'set DNS_CLUSTER_QUERY first' guard" do
+      # The forgot-DNS-after-count-bump case must now produce a boot WARN (previously
+      # it was swallowed as :single_node and emitted nothing). The message tells the
+      # operator the specific guard and that it will NOT self-clear.
+      log =
+        capture_log(fn ->
+          assert :ok == ClusterReadiness.warn_if_expected_peers_missing(3, [], false)
+        end)
+
+      assert log =~ "EXPECTED_APP_NODES=3"
+      assert log =~ "UN-CLUSTERED"
+      assert log =~ "DNS_CLUSTER_QUERY"
+      # Distinct from the missing-peers WARN: this one cannot self-clear.
+      assert log =~ "will NOT self-clear"
+      assert log =~ "WARN, not a crash"
+      refute log =~ "@"
+    end
+
+    test "the boot WARN mirrors readiness/3's un-clustered classifications exactly (DNS-gated)" do
+      # For every (expected, peers, dns) triple the boot WARN fires IFF the readiness
+      # classification is one of the two un-clustered states — :expected_peers_missing
+      # or :clustering_expected_dns_unconfigured — so the two functions can never
+      # disagree about the same node (the crux of the medium finding).
+      warning_statuses = [:expected_peers_missing, :clustering_expected_dns_unconfigured]
+
+      for {expected, peers, dns} <- [
+            {1, [], false},
+            {1, [], true},
+            {2, [], false},
+            {2, [], true},
+            {2, [:peer@host], true},
+            {3, [:a@h], true},
+            {3, [:a@h, :b@h], true},
+            {3, [], false},
+            {5, [], false}
+          ] do
+        status = ClusterReadiness.readiness(expected, peers, dns).status
+
+        log =
+          capture_log(fn ->
+            assert :ok == ClusterReadiness.warn_if_expected_peers_missing(expected, peers, dns)
+          end)
+
+        warned? = log =~ "UN-CLUSTERED"
+        expected_warn? = status in warning_statuses
+
+        assert warned? == expected_warn?,
+               "expected warn?=#{expected_warn?} for " <>
+                 "(#{expected}, #{inspect(peers)}, dns=#{dns}) [status=#{status}], got warn?=#{warned?}"
+      end
     end
 
     test "a single expected node does NOT WARN and returns :ok" do
@@ -106,7 +210,7 @@ defmodule Loopctl.ClusterReadinessTest do
       # un-clustered WARNING.
       log =
         capture_log(fn ->
-          assert :ok == ClusterReadiness.warn_if_expected_peers_missing(1, [])
+          assert :ok == ClusterReadiness.warn_if_expected_peers_missing(1, [], true)
         end)
 
       refute log =~ "UN-CLUSTERED"
@@ -116,7 +220,7 @@ defmodule Loopctl.ClusterReadinessTest do
     test "expected > 1 WITH the peers connected does NOT WARN and returns :ok" do
       log =
         capture_log(fn ->
-          assert :ok == ClusterReadiness.warn_if_expected_peers_missing(2, [:peer@host])
+          assert :ok == ClusterReadiness.warn_if_expected_peers_missing(2, [:peer@host], true)
         end)
 
       refute log =~ "UN-CLUSTERED"

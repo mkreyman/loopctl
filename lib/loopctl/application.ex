@@ -35,11 +35,14 @@ defmodule Loopctl.Application do
       # with no other dependency.
       Loopctl.RateLimiter.FailOpenLog,
       {Oban, Application.fetch_env!(:loopctl, Oban)},
-      # US-35.2: supervised, node-local singleton that subscribes to the fixed
-      # audit-chain firehose topic and debounce-enqueues one ComputeSthWorker job
-      # per tenant that appends, making STH computation event-driven and
-      # activity-gated. After PubSub (it subscribes in init) and Oban (it inserts
-      # jobs). Purely additive — the per-minute cron is unchanged.
+      # US-35.2 / US-38.3: supervised, CLUSTER-WIDE singleton (leadership via
+      # :global, negotiated in init) that subscribes to the fixed audit-chain
+      # firehose topic and debounce-enqueues one ComputeSthWorker job per tenant
+      # that appends, making STH computation event-driven and activity-gated.
+      # Every node keeps a live process, but exactly ONE (the leader) drains the
+      # firehose cluster-wide; the rest stand by and fail over on leader death.
+      # After PubSub (the leader subscribes in init) and Oban (it inserts jobs).
+      # Purely additive — the per-minute cron is unchanged.
       Loopctl.AuditChain.SthEnqueuer,
       # US-37.5: owns the public ETS table holding the per-tenant in-flight HeavyRead
       # counters so a stable, long-lived owner survives the transient request/worker

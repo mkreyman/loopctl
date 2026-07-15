@@ -710,8 +710,9 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       #     `poll_cluster_readiness/0` (a periodic measurement wired into
       #     `LoopctlWeb.Telemetry.periodic_measurements/0`) from
       #     `Loopctl.ClusterReadiness.readiness/0`. The measurement is the connected
-      #     BEAM peer COUNT (`length(Node.list/0)`); the ONLY tag is the bounded 3-value
-      #     `status` set (`:single_node`/`:clustered`/`:expected_peers_missing`) — NEVER
+      #     BEAM peer COUNT (`length(Node.list/0)`); the ONLY tag is the bounded 4-value
+      #     `status` set (`:single_node`/`:clustered`/`:expected_peers_missing`/
+      #     `:clustering_expected_dns_unconfigured`) — NEVER
       #     a node NAME or the DNS query string (both endpoints/ports are non-public,
       #     but the no-sensitive-data + bounded-cardinality contract AC-27.15.3 holds
       #     regardless). On a single node this reads `{status="single_node", count=0}`,
@@ -729,7 +730,8 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   @doc """
   `tag_values` for the clustering-readiness peer gauge (US-38.3). Emits ONLY the
-  bounded `status` label (`:single_node`/`:clustered`/`:expected_peers_missing`) —
+  bounded `status` label (`:single_node`/`:clustered`/`:expected_peers_missing`/
+  `:clustering_expected_dns_unconfigured`) —
   NEVER a node name or the DNS query string. Defaults a missing status to `"unknown"`
   so a direct `:telemetry.execute/3` with a partial map never raises or emits blank.
   """
