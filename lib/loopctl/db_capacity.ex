@@ -61,6 +61,19 @@ defmodule Loopctl.DbCapacity do
   @heavy_read_fast_reads 6
   @heavy_read_export_reserve 2
 
+  # US-37.5: the per-tenant in-flight SLICE (K) of the heavy-read pool. No single
+  # tenant's concurrent, cost-weighted heavy reads may hold more than K of the pool's
+  # N (=8) slots at once (`Loopctl.HeavyRead.TenantGate`), so a tenant always leaves
+  # `N - K` slots for its neighbours — one tenant's vector/analytic burst can no longer
+  # 503 every other tenant on the shared BYPASSRLS pool. K MUST be `< pool` (a test
+  # pins this) so a tenant can never take the whole pool, and `>= 1` so the gate can
+  # never starve a tenant to zero heavy reads. K=4 (~half of 8) leaves at least 4 slots
+  # for other tenants while giving any one tenant ample concurrency (2 heavy reads at
+  # weight 2, or 4 light reads at weight 1). Live-tunable per node via the
+  # `"heavy_read_tenant_cap"` SystemConfig key / `:heavy_read_tenant_cap` app env
+  # (see `Loopctl.HeavyRead.TenantGate.cap/0`); this is the documented default.
+  @heavy_read_tenant_slice 4
+
   # The Oban Postgres notifier holds one dedicated LISTEN connection PER NODE (outside
   # the pools). Migrations on deploy + the remote console are a small per-cluster fixed
   # reserve.
@@ -104,6 +117,16 @@ defmodule Loopctl.DbCapacity do
       pool: @heavy_read_fast_reads + @heavy_read_export_reserve
     }
   end
+
+  @doc """
+  The per-tenant in-flight SLICE (K) of the heavy-read pool (US-37.5): the max number
+  of the pool's N slots one tenant's cost-weighted concurrent heavy reads may hold
+  before `Loopctl.HeavyRead.TenantGate` sheds the next one. Always `< heavy_read_budget().pool`
+  (no tenant can take the whole pool) and `>= 1`. The documented default the gate's
+  `cap/0` falls back to on a `SystemConfig`/app-env miss.
+  """
+  @spec heavy_read_tenant_slice() :: pos_integer()
+  def heavy_read_tenant_slice, do: @heavy_read_tenant_slice
 
   @doc "The last fly-mpg `SHOW max_connections` value verified by a human (see moduledoc)."
   @spec verified_live_max_connections() :: pos_integer()

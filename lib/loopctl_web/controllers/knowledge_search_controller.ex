@@ -631,7 +631,17 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   defp execute_search(tenant_id, {:search, q}, "semantic", opts) do
     case Knowledge.generate_embedding(tenant_id, q) do
       {:ok, embedding} ->
-        Knowledge.search_semantic(tenant_id, embedding, opts)
+        # US-37.5: an explicit semantic search whose heavy read is SHED (tenant over
+        # its per-tenant in-flight HeavyRead cap) degrades to keyword-only — same
+        # graceful fallback as a keyless tenant — instead of a 429, so a neighbour's
+        # burst can't hard-fail this tenant's search.
+        case Knowledge.search_semantic(tenant_id, embedding, opts) do
+          {:error, :heavy_read_overloaded} ->
+            semantic_keyword_fallback(tenant_id, q, opts, :heavy_read_overloaded)
+
+          result ->
+            result
+        end
 
       {:error, :no_api_key} ->
         # Mandatory BYO (review #8): a keyless tenant's explicit semantic search must

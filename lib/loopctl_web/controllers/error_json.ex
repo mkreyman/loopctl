@@ -71,6 +71,24 @@ defmodule LoopctlWeb.ErrorJSON do
     }
   end
 
+  # US-37.5: a tenant over its per-tenant in-flight HeavyRead cap raises
+  # Loopctl.HeavyRead.OverloadedError, which LoopctlWeb.Plugs.HeavyReadOverloadHandler
+  # (Plug.Exception) maps to 429. Surface a self-identifying `code` so the client can
+  # tell this per-tenant heavy-read backpressure apart from the generic request-rate
+  # 429 (rendered by FallbackController, which carries no `code`). The read was shed to
+  # protect OTHER tenants' access to the shared BYPASSRLS pool — retrying shortly, or
+  # narrowing the query, will succeed.
+  def render("429.json", _assigns) do
+    %{
+      error: %{
+        status: 429,
+        code: "heavy_read_overloaded",
+        message:
+          "This tenant has too many concurrent heavy reads in flight. Please retry shortly."
+      }
+    }
+  end
+
   # Catch-all for any other status code templates
   def render(template, _assigns) do
     status =

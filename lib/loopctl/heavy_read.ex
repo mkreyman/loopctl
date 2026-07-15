@@ -54,6 +54,8 @@ defmodule Loopctl.HeavyRead do
   docs/runbooks/knowledge-scale.md.
   """
 
+  alias Loopctl.HeavyRead.TenantGate
+
   @doc "Resolved heavy-read repo (DI). `HeavyReadRepo` in prod/dev, `AdminRepo` in test."
   @spec repo() :: module()
   def repo, do: Application.get_env(:loopctl, :heavy_read_repo, Loopctl.HeavyReadRepo)
@@ -127,23 +129,33 @@ defmodule Loopctl.HeavyRead do
   (there is no un-timed "pool default" path: pgbouncer rejects a startup-`:parameters`
   statement_timeout, so the timeout MUST be applied per-read via SET LOCAL — US-27.13).
   """
-  @spec all(binary(), Ecto.Queryable.t(), keyword()) :: [term()]
+  @spec all(binary(), Ecto.Queryable.t(), keyword()) ::
+          [term()] | {:error, :heavy_read_overloaded}
   def all(tenant_id, queryable, opts \\ []) do
     # `Keyword.pop/3` with a default cleanly distinguishes "absent → pool default" from a
     # PRESENT value (which is validated as a positive int below) — unlike `st || default`,
     # which would silently treat an explicit `0` as truthy and an explicit `nil` as "use
     # default", muddying the always-timed contract.
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
+    {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard!(tenant_id, queryable)
-    with_statement_timeout(st, fn -> repo().all(query, opts) end)
+
+    gated(tenant_id, opts, on_overload, fn ->
+      with_statement_timeout(st, fn -> repo().all(query, opts) end)
+    end)
   end
 
   @doc "Like `Repo.one/2`, with the same tenant-scoping guard and `:statement_timeout` as `all/3`."
-  @spec one(binary(), Ecto.Queryable.t(), keyword()) :: term() | nil
+  @spec one(binary(), Ecto.Queryable.t(), keyword()) ::
+          term() | nil | {:error, :heavy_read_overloaded}
   def one(tenant_id, queryable, opts \\ []) do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
+    {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard!(tenant_id, queryable)
-    with_statement_timeout(st, fn -> repo().one(query, opts) end)
+
+    gated(tenant_id, opts, on_overload, fn ->
+      with_statement_timeout(st, fn -> repo().one(query, opts) end)
+    end)
   end
 
   @doc """
@@ -167,11 +179,62 @@ defmodule Loopctl.HeavyRead do
   cross-subject row is ever RETURNED, which is what the isolation boundary needs;
   tenant remains enforced on every source (the cross-tenant boundary).
   """
-  @spec all_memory(binary(), binary(), Ecto.Queryable.t(), keyword()) :: [term()]
+  @spec all_memory(binary(), binary(), Ecto.Queryable.t(), keyword()) ::
+          [term()] | {:error, :heavy_read_overloaded}
   def all_memory(tenant_id, subject_id, queryable, opts \\ []) do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
+    {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard_memory!(tenant_id, subject_id, queryable)
-    with_statement_timeout(st, fn -> repo().all(query, opts) end)
+
+    gated(tenant_id, opts, on_overload, fn ->
+      with_statement_timeout(st, fn -> repo().all(query, opts) end)
+    end)
+  end
+
+  # --- US-37.5: per-tenant cost-weighted in-flight limiter ---
+
+  # Wrap a heavy read with the per-tenant, cost-weighted in-flight gate
+  # (`Loopctl.HeavyRead.TenantGate`): reserve `weight` of the tenant's budget BEFORE
+  # the pool checkout, run, then RELEASE in an `after` so a query that raises (a
+  # statement_timeout CANCEL, a DB error) or times out never leaks budget. The weight
+  # is derived from the endpoint carried in `opts`' `telemetry_options` (heavy
+  # vector/analytic reads cost more than light ones); the cap (K) is the node-local
+  # per-tenant slice from config.
+  #
+  # Over the cap the acquire sheds the read (never a pool-exhaustion crash for OTHER
+  # tenants): `on_overload: :raise` (the default, for API reads) raises
+  # `OverloadedError` → a 429 with the app error envelope; `on_overload: :tag` (search
+  # callers that keyword-fall-back) returns `{:error, :heavy_read_overloaded}`. The
+  # gate itself FAILS OPEN on a limiter fault (allows the read), so a broken gate never
+  # blocks all heavy reads.
+  defp gated(tenant_id, opts, on_overload, fun) do
+    weight = TenantGate.weight_for(endpoint(opts))
+
+    case TenantGate.acquire(tenant_id, weight, TenantGate.cap()) do
+      :ok ->
+        try do
+          fun.()
+        after
+          TenantGate.release(tenant_id, weight)
+        end
+
+      {:error, :heavy_read_overloaded} = err ->
+        shed(on_overload, err, tenant_id)
+    end
+  end
+
+  defp shed(:tag, err, _tenant_id), do: err
+
+  defp shed(:raise, _err, tenant_id) do
+    raise Loopctl.HeavyRead.OverloadedError, tenant_id: tenant_id
+  end
+
+  # The endpoint atom `opts/1` stamps into `telemetry_options` — the natural per-query
+  # weight key. Absent (a bare call with no `opts/1`) → nil → TenantGate weights it light.
+  defp endpoint(opts) do
+    opts
+    |> Keyword.get(:telemetry_options, [])
+    |> Keyword.get(:endpoint)
   end
 
   # Run `fun` under a per-read SET LOCAL statement_timeout. There is NO un-timed path:

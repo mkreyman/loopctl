@@ -314,6 +314,16 @@ config :loopctl, :embedding_max_concurrent, 64
 # LOW per-tenant cap via acquire/3. Production uses the config.exs default (6).
 config :loopctl, :embedding_max_concurrent_per_tenant, 64
 
+# US-37.5: high suite-wide default for the per-tenant in-flight HeavyRead cap (K) so
+# the gate wired into Loopctl.HeavyRead.all/one/all_memory is effectively a NO-OP for
+# incidental heavy reads across the async suite — they must not collide on the shared,
+# VM-wide per-tenant counters and spuriously shed. The gate's OWN unit test
+# (tenant_gate_test.exs) passes explicit LOW caps to acquire/3, independent of this
+# value. Production uses Loopctl.DbCapacity.heavy_read_tenant_slice/0 (4), live-tunable
+# via the "heavy_read_tenant_cap" SystemConfig key. Mirrors the embedding/export
+# high-suite-cap precedent above.
+config :loopctl, :heavy_read_tenant_cap, 100_000
+
 # US-28.2: a small per-(tenant, subject) long-term memory cap so the quota path
 # (`{:error, :quota_exceeded}`) is testable without inserting tens of thousands of
 # rows. Kept above the largest pagination test (25 rows) so that test stays under
