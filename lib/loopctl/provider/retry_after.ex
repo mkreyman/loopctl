@@ -9,9 +9,12 @@ defmodule Loopctl.Provider.RetryAfter do
 
   The parser is DEFENSIVE: a missing, empty, or malformed header yields `nil`, so
   callers fall back to their existing backoff. The result is CLAMPED to a sane
-  maximum (`embedding_breaker_max_cooldown_seconds`, SystemConfig, default
-  #{300}s) so a hostile `Retry-After: 999999999` can never wedge a breaker open
-  or pin an Oban queue.
+  maximum (`provider_retry_after_max_seconds`, SystemConfig, default #{300}s) so a
+  hostile `Retry-After: 999999999` can never wedge a breaker open or pin an Oban
+  queue. NOTE: this parser is provider-GENERIC (it serves BOTH the embedding client
+  AND the Anthropic client), so its clamp ceiling is a provider-neutral key —
+  distinct from the embedding-breaker-specific `embedding_breaker_max_cooldown_seconds`
+  that governs how long the embedding circuit breaker stays open.
 
   Both provider clients (`Loopctl.Knowledge.EmbeddingClient`,
   `Loopctl.Llm.Anthropic`) call `from_response/2` on a throttle response
@@ -74,12 +77,30 @@ defmodule Loopctl.Provider.RetryAfter do
   def from_error(_other), do: nil
 
   @doc """
+  Normalize a parsed Retry-After into a POSITIVE Oban snooze interval (seconds).
+
+  A provider may legitimately send `Retry-After: 0` (parsed to `0`), and RFC 7231
+  permits it. But `{:snooze, 0}` reschedules effectively immediately AND bumps
+  `max_attempts`, so on a breaker-LESS path (the Anthropic content-ingestion
+  worker) a provider persistently returning `429/503` + `Retry-After: 0` would
+  hot-loop with no attempt cap — the exact behavior AC-37.3.5 says to avoid.
+  Floor at `1` so every throttle snooze makes forward progress. (US-37.3 review.)
+  """
+  @spec snooze_seconds(non_neg_integer()) :: pos_integer()
+  def snooze_seconds(retry_after) when is_integer(retry_after), do: max(retry_after, 1)
+
+  @doc """
   The clamp ceiling (seconds) for a parsed Retry-After. Live-tunable via the
-  `"embedding_breaker_max_cooldown_seconds"` SystemConfig key.
+  provider-neutral `"provider_retry_after_max_seconds"` SystemConfig key.
+
+  This parser is shared by every provider client, so its ceiling is deliberately
+  NOT the embedding-breaker key: an operator tuning the embedding breaker's open
+  cooldown (`embedding_breaker_max_cooldown_seconds`) must not silently move the
+  Anthropic ingestion snooze ceiling too.
   """
   @spec max_seconds() :: pos_integer()
   def max_seconds do
-    SystemConfig.get_int("embedding_breaker_max_cooldown_seconds", @default_max_seconds)
+    SystemConfig.get_int("provider_retry_after_max_seconds", @default_max_seconds)
   end
 
   defp clamp(seconds), do: seconds |> max(0) |> min(max_seconds())

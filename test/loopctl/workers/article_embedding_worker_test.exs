@@ -561,6 +561,44 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
     end
   end
 
+  # --- US-37.3 (AC-37.3.5): OPEN breaker → loss-free snooze, never an attempt-consuming discard ---
+
+  describe "open breaker (US-37.3)" do
+    test "snoozes (loss-free) when the tenant breaker is OPEN, without calling the provider" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      article =
+        create_draft_then_publish(tenant.id, %{
+          title: "Breaker Open Article",
+          body: "The tenant breaker is open from a throttle storm."
+        })
+
+      # Trip the tenant breaker with @failure_threshold (3) countable 429 failures.
+      # `stub` (not an exact `expect`) deliberately avoids the Mox async-supervisor
+      # $callers exact-count race — the embed runs in a Task under async_nolink.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:error, {:api_error, 429, :provider_error}}
+      end)
+
+      for _ <- 1..3, do: Knowledge.generate_embedding(tenant.id, "x")
+      assert {:error, :circuit_open} = Knowledge.generate_embedding(tenant.id, "x")
+
+      # Breaker OPEN → the worker snoozes loss-free (no Oban attempt consumed), NOT
+      # {:error, ...} — which would consume an attempt and, under a long honored
+      # cooldown exceeding the 4-attempt window, DISCARD the job and leave the article
+      # permanently un-embedded. The provider is never hit here: generate_embedding
+      # short-circuits on the OPEN breaker (deterministic ETS state) BEFORE spawning
+      # the embed task, so the snooze is reached without a client call.
+      assert {:snooze, seconds} =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+
+      assert is_integer(seconds) and seconds > 0
+    end
+  end
+
   # --- Idempotency: a retry with unchanged content never re-calls the provider (#12) ---
 
   describe "idempotent re-runs" do

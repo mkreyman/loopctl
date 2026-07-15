@@ -60,6 +60,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Oban.FairShare
   alias Loopctl.Provider.Admission
+  alias Loopctl.Provider.RetryAfter
   alias Loopctl.SystemConfig
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
@@ -318,8 +319,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       # US-37.3 (AC-37.3.3): a chunk's Anthropic extraction was throttled with a
       # provider Retry-After. Snooze the whole job loss-free for ~that interval
       # (no attempt consumed) instead of the blind `attempt^4` backoff.
+      # `RetryAfter.snooze_seconds/1` floors the value POSITIVE: this Anthropic path
+      # has NO circuit breaker, so a provider persistently returning `Retry-After: 0`
+      # would otherwise `{:snooze, 0}` hot-loop (each snooze bumps max_attempts, so it
+      # never terminates by attempt cap) — the exact behavior AC-37.3.5 forbids.
       {:throttled, retry_after, _acc} ->
-        {:snooze, retry_after}
+        {:snooze, RetryAfter.snooze_seconds(retry_after)}
 
       acc ->
         finalize_ingest(acc, chunk_count, dropped)

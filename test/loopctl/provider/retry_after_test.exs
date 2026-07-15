@@ -62,6 +62,20 @@ defmodule Loopctl.Provider.RetryAfterTest do
     end
   end
 
+  describe "snooze_seconds/1 (positive floor)" do
+    test "floors at 1 so a provider Retry-After: 0 never yields {:snooze, 0}" do
+      # A legitimate `Retry-After: 0` parses to 0; snooze_seconds/1 floors it to 1 so
+      # the breaker-less Anthropic ingestion path can't hot-reschedule with no attempt
+      # cap (US-37.3 review).
+      assert RetryAfter.snooze_seconds(0) == 1
+    end
+
+    test "passes through a positive Retry-After unchanged" do
+      assert RetryAfter.snooze_seconds(30) == 30
+      assert RetryAfter.snooze_seconds(1) == 1
+    end
+  end
+
   describe "from_response/2" do
     test "parses Retry-After only for throttle statuses (429/503)" do
       resp = %Req.Response{status: 429, headers: %{"retry-after" => ["30"]}}

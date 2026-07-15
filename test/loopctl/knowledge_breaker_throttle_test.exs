@@ -69,6 +69,28 @@ defmodule Loopctl.KnowledgeBreakerThrottleTest do
       end
     end
 
+    # AC-37.3.1: a non-throttle, non-credential 4xx (400/404/422) is a per-request
+    # client error, NOT a systemic provider incident — it must stay EXEMPT ("other
+    # 4xx keep today's behavior"). Guards the catch-all `breaker_countable?/1`
+    # is_integer(status) -> false clause against a future refactor silently making a
+    # generic 4xx trip the breaker.
+    for {label, term} <- [
+          {"400 (bad request)", {:error, {:api_error, 400, :provider_error}}},
+          {"404 (not found)", {:error, {:api_error, 404, :provider_error}}},
+          {"422 (unprocessable)", {:error, {:api_error, 422, :provider_error}}}
+        ] do
+      test "#{label} is exempt → breaker stays closed" do
+        tenant = fixture(:tenant)
+        Knowledge.reset_circuit_breaker(tenant.id)
+        always_return(unquote(Macro.escape(term)))
+
+        results = for _ <- 1..6, do: Knowledge.generate_embedding(tenant.id, "x")
+
+        refute Enum.any?(results, &match?({:error, :circuit_open}, &1))
+        assert Enum.all?(results, &match?(unquote(Macro.escape(term)), &1))
+      end
+    end
+
     test "no_api_key never reaches the breaker and surfaces cleanly" do
       tenant = fixture(:tenant)
       Knowledge.reset_circuit_breaker(tenant.id)

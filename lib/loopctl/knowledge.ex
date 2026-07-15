@@ -7334,6 +7334,10 @@ defmodule Loopctl.Knowledge do
   # in-code default doubles as the documented default. A provider Retry-After
   # RAISES this floor (see `cooldown_seconds/1`), clamped to the SystemConfig max.
   @cooldown_seconds 30
+  # Ceiling (seconds) the breaker's open cooldown is clamped to — the embedding-
+  # breaker-specific max, env-driven via `"embedding_breaker_max_cooldown_seconds"`.
+  # Deliberately distinct from the provider-generic `RetryAfter.max_seconds/0`.
+  @max_cooldown_seconds 300
   # US-37.3 latency trip (AC-37.3.4): consecutive/windowed slow-but-successful
   # provider calls trip the breaker (slow-but-alive protection). Both knobs are
   # env-driven via SystemConfig; a threshold of 0 (the default) DISABLES the
@@ -7380,6 +7384,29 @@ defmodule Loopctl.Knowledge do
     end
 
     :ok
+  end
+
+  @doc """
+  Remaining open-cooldown (seconds) for a tenant's embedding circuit breaker, or
+  `0` when the breaker is closed/absent.
+
+  US-37.3 (AC-37.3.5): lets an Oban embedding worker snooze for ~the remaining open
+  window on `{:error, :circuit_open}` — a LOSS-FREE reschedule that consumes no
+  attempt — instead of returning `{:error, ...}`, which burns a `max_attempts`
+  budget. With a honored Retry-After cooldown up to the breaker max (300s) able to
+  exceed a job's whole 4-attempt window, the `{:error, ...}` path would DISCARD the
+  job and leave the article/memory permanently un-embedded (there is no embedding
+  backfill). Snoozing avoids that.
+  """
+  @spec circuit_breaker_cooldown_remaining(Ecto.UUID.t()) :: non_neg_integer()
+  def circuit_breaker_cooldown_remaining(tenant_id) when is_binary(tenant_id) do
+    ensure_circuit_breaker_table()
+    key = {tenant_id, :open_until}
+
+    case :ets.lookup(@circuit_breaker_table, key) do
+      [{^key, open_until}] -> max(0, open_until - System.monotonic_time(:second))
+      [] -> 0
+    end
   end
 
   # Task.yield budget for a query embedding. Kept STRICTLY ABOVE the embedding
@@ -7726,11 +7753,20 @@ defmodule Loopctl.Knowledge do
   defp cooldown_seconds(nil), do: base_cooldown_seconds()
 
   defp cooldown_seconds(retry_after) when is_integer(retry_after) do
-    retry_after |> max(base_cooldown_seconds()) |> min(RetryAfter.max_seconds())
+    retry_after |> max(base_cooldown_seconds()) |> min(max_cooldown_seconds())
   end
 
   defp base_cooldown_seconds do
     SystemConfig.get_int("embedding_breaker_cooldown_seconds", @cooldown_seconds)
+  end
+
+  # The breaker's OWN open-cooldown ceiling — an embedding-breaker-specific key,
+  # NOT the provider-generic `RetryAfter.max_seconds/0` (which serves the Anthropic
+  # client too). Keeping them separate lets an operator cap how long the embedding
+  # breaker stays open without moving the shared Retry-After parser's ceiling.
+  # Defaults to the same 300s, so behavior is unchanged until the key is tuned.
+  defp max_cooldown_seconds do
+    SystemConfig.get_int("embedding_breaker_max_cooldown_seconds", @max_cooldown_seconds)
   end
 
   defp latency_threshold_ms do

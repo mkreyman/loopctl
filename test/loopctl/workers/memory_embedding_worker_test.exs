@@ -195,6 +195,30 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorkerTest do
       assert {:snooze, 30} = MemoryEmbeddingWorker.perform(job(memory.id, tenant.id))
     end
 
+    test "US-37.3 (AC-37.3.5): an OPEN breaker snoozes (loss-free), never calling the provider" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      memory = fixture(:memory, %{tenant_id: tenant.id, subject_id: "s", text: "breaker open"})
+
+      # Trip the tenant breaker with @failure_threshold (3) countable 429 failures.
+      # `stub` (not an exact `expect`) deliberately avoids the Mox async-supervisor
+      # $callers exact-count race — the embed runs in a Task under async_nolink.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:error, {:api_error, 429, :provider_error}}
+      end)
+
+      for _ <- 1..3, do: Knowledge.generate_embedding(tenant.id, "x")
+      assert {:error, :circuit_open} = Knowledge.generate_embedding(tenant.id, "x")
+
+      # Breaker OPEN → loss-free snooze (no attempt consumed), NOT {:error, ...} —
+      # which under a long honored cooldown would discard the job and leave the memory
+      # permanently un-embedded. The provider is never hit: generate_embedding
+      # short-circuits on the OPEN breaker (deterministic ETS state) BEFORE spawning
+      # the embed task.
+      assert {:snooze, seconds} = MemoryEmbeddingWorker.perform(job(memory.id, tenant.id))
+      assert is_integer(seconds) and seconds > 0
+    end
+
     test "US-37.2 (AC-37.2.2): the SAME per-node concurrency cap gates the worker (snooze, client never called)" do
       tenant = fixture(:tenant)
       Knowledge.reset_circuit_breaker(tenant.id)
