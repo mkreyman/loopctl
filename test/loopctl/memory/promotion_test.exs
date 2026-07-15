@@ -150,6 +150,32 @@ defmodule Loopctl.Memory.PromotionTest do
       assert all_promoted(other.id, "A") == []
     end
 
+    # US-37.5: when the tenant is over its per-tenant HeavyRead slice, the near-dup recall
+    # is SHED (`on_overload: :tag`) and `persist_promotion/2` returns a loss-free
+    # `{:error, :heavy_read_overloaded}` — NOT a raised OverloadedError — and writes nothing.
+    test "returns {:error, :heavy_read_overloaded} (no rows) when the HeavyRead gate sheds" do
+      alias Loopctl.HeavyRead.TenantGate
+
+      tenant = fixture(:tenant)
+      scope = %{fixture(:memory_scope, tenant_id: tenant.id, subject_id: "A") | session_id: "s1"}
+
+      candidate = %{
+        text: "fact under overload",
+        when_to_apply: "",
+        tags: [],
+        confidence: 0.9,
+        cross_links: []
+      }
+
+      # Saturate the fresh tenant's in-flight budget so the near-dup recall sheds.
+      cap = TenantGate.cap()
+      assert :ok = TenantGate.acquire(tenant.id, cap, cap)
+      on_exit(fn -> TenantGate.release(tenant.id, cap) end)
+
+      assert {:error, :heavy_read_overloaded} = Memory.persist_promotion(scope, [candidate])
+      assert all_promoted(tenant.id, "A") == []
+    end
+
     test "structurally refuses the reserved promotion-eval subject (US-29.5 AC-29.5.3)" do
       tenant = fixture(:tenant)
       eval_subject = Memory.eval_subject_id()

@@ -43,7 +43,16 @@ defmodule Loopctl.Workers.ComputeSthWorker do
 
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
+  alias Loopctl.HeavyRead.OverloadedError
   alias Loopctl.Tenants.Tenant
+
+  # US-37.5: bounded, jittered snooze (seconds) when a tenant's STH tail read is shed
+  # by the per-tenant HeavyRead in-flight gate. Loss-free (no attempt consumed), so a
+  # sustained heavy-read burst can never exhaust this worker's max_attempts and DROP a
+  # custody-critical STH checkpoint — it is re-attempted once the tenant's heavy-read
+  # load subsides (and `sth_needed?/1` re-fires, so nothing is lost meanwhile).
+  @overload_snooze_base_seconds 5
+  @overload_snooze_jitter_seconds 10
 
   # US-32.5: bounded jitter window (seconds) spread across the per-minute cron
   # tick, so per-tenant fanout jobs don't all land at the same `:00` instant.
@@ -77,24 +86,48 @@ defmodule Loopctl.Workers.ComputeSthWorker do
 
   def perform(%Oban.Job{args: %{"tenant_id" => tenant_id}}) do
     if AuditChain.sth_needed?(tenant_id) do
-      case AuditChain.sign_and_store_tree_head(tenant_id) do
-        {:ok, sth} ->
-          Logger.info(
-            "ComputeSthWorker: signed STH for tenant #{tenant_id} at position #{sth.chain_position}"
-          )
-
-          :ok
-
-        {:error, :empty_chain} ->
-          :ok
-
-        {:error, reason} ->
-          Logger.warning("ComputeSthWorker: failed for tenant #{tenant_id}: #{inspect(reason)}")
-          {:error, reason}
-      end
+      sign_tenant(tenant_id)
     else
       :ok
     end
+  end
+
+  # `sign_and_store_tree_head/1`'s bounded STH tail read runs through the per-tenant
+  # HeavyRead gate (endpoint `:sth_incremental`, default `on_overload: :raise`). Under
+  # a tenant's sustained heavy-read burst that read can be SHED, raising
+  # `HeavyRead.OverloadedError`. Rescue it here (the only heavy read in this call path)
+  # and yield loss-free with `{:snooze, n}` instead of erroring — an errored STH job
+  # would retry-churn and could exhaust max_attempts, dropping a custody-critical
+  # checkpoint. (An out-of-band DB error still fails normally via the `{:error, _}`
+  # tuple below; only the deliberate overload shed is turned into a snooze.)
+  defp sign_tenant(tenant_id) do
+    case AuditChain.sign_and_store_tree_head(tenant_id) do
+      {:ok, sth} ->
+        Logger.info(
+          "ComputeSthWorker: signed STH for tenant #{tenant_id} at position #{sth.chain_position}"
+        )
+
+        :ok
+
+      {:error, :empty_chain} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("ComputeSthWorker: failed for tenant #{tenant_id}: #{inspect(reason)}")
+        {:error, reason}
+    end
+  rescue
+    OverloadedError ->
+      Logger.info(
+        "ComputeSthWorker: STH read shed (heavy_read_overloaded) for tenant #{tenant_id}; snoozing"
+      )
+
+      {:snooze, overload_snooze_seconds()}
+  end
+
+  # :rand.uniform(jitter + 1) ∈ 1..jitter+1 → -1 gives 0..jitter (0 when jitter=0).
+  defp overload_snooze_seconds do
+    @overload_snooze_base_seconds + :rand.uniform(@overload_snooze_jitter_seconds + 1) - 1
   end
 
   @doc """

@@ -3,6 +3,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
 
   alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
+  alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.ArticleLink
 
@@ -617,6 +618,42 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       # (generous CI headroom; the precise timing assertion is in the unit test).
       assert elapsed_us / 1_000 < 900,
              "request should fast-fail near the timeout, took #{elapsed_us / 1_000}ms"
+    end
+  end
+
+  # Finding #4 (US-37.5 review): the user-facing OverloadedError → 429 render envelope
+  # had NO end-to-end coverage. This asserts a REAL heavy read shed over the per-tenant
+  # in-flight cap surfaces as a 429 carrying the self-identifying
+  # `code: "heavy_read_overloaded"` at the HTTP boundary (status mapping via
+  # HeavyReadOverloadHandler → ErrorJSON "429.json"). Mirrors the 504 db-timeout e2e
+  # above, but for the per-tenant shed.
+  describe "per-tenant heavy-read overload -> 429 (US-37.5, AC-37.5.3)" do
+    test "an over-cap tenant's heavy read surfaces as 429 heavy_read_overloaded", %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target", [1.0, 0.0])
+
+      # Saturate this tenant's per-tenant in-flight slice so the very next wired heavy
+      # read is shed. The DataCase default stub routes suggest_links_with_meta to the
+      # REAL Knowledge path, whose read runs with the default `on_overload: :raise` (an
+      # API read). Unlike a DB-timeout (which the controller rescues into a tuple),
+      # OverloadedError is NOT rescued — it propagates to Phoenix render_errors, which
+      # maps it via HeavyReadOverloadHandler → 429 and re-raises, so this asserts the
+      # SENT error response with `assert_error_sent`.
+      cap = TenantGate.cap()
+      assert TenantGate.acquire(tenant.id, cap, cap) == :ok
+
+      {429, _headers, body} =
+        assert_error_sent(429, fn ->
+          conn
+          |> auth_conn(key)
+          |> get(~p"/api/v1/knowledge/articles/#{target.id}/suggested_links")
+        end)
+
+      decoded = Jason.decode!(body)
+      assert decoded["error"]["status"] == 429
+      assert decoded["error"]["code"] == "heavy_read_overloaded"
+
+      TenantGate.release(tenant.id, cap)
     end
   end
 end

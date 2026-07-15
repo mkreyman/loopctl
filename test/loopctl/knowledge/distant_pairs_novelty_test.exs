@@ -199,5 +199,32 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyTest do
       # Idea identical to the base-prior ⇒ MIN distance ≈ 0.
       assert_in_delta scored.novelty_score, 0.0, 1.0e-4
     end
+
+    # US-37.5: when the tenant is over its per-tenant HeavyRead slice, the novelty aggregate
+    # is SHED. `nearest_prior_distance/4` now passes `on_overload: :tag` and maps the shed to
+    # a DELIBERATE nil score — a graceful degrade, NOT a raised OverloadedError caught as an
+    # incidental Task.async_stream `{:exit, _}`. prior_count is unaffected (its count query is
+    # not gated), so a nil score under load stays distinguishable via the surrounding context.
+    test "novelty_score degrades to nil (not a crash) when the HeavyRead gate sheds the aggregate",
+         %{tenant: tenant} do
+      alias Loopctl.HeavyRead.TenantGate
+
+      idea_vec = embedding_at(:math.pi() / 6)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, idea_vec}
+      end)
+
+      # Saturate the tenant's in-flight HeavyRead budget so the novelty MIN(<=>) read sheds.
+      cap = TenantGate.cap()
+      assert :ok = TenantGate.acquire(tenant.id, cap, cap)
+      on_exit(fn -> TenantGate.release(tenant.id, cap) end)
+
+      assert {:ok, [scored], prior_count} =
+               Knowledge.novelty_scores(tenant.id, [%{text: "an idea"}])
+
+      assert prior_count == 2
+      assert scored.novelty_score == nil
+    end
   end
 end

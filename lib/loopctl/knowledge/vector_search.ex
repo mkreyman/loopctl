@@ -249,12 +249,11 @@ defmodule Loopctl.Knowledge.VectorSearch do
   a bound `^[float()]` param via `to_embedding_list/1` (never the struct — #168).
   """
   @impl true
-  @spec nearest(Ecto.UUID.t(), target_embedding(), pos_integer(), keyword()) :: [
-          candidate()
-        ]
+  @spec nearest(Ecto.UUID.t(), target_embedding(), pos_integer(), keyword()) ::
+          [candidate()] | {:error, :heavy_read_overloaded}
   def nearest(tenant_id, target_embedding, k, opts \\ []) when is_binary(tenant_id) do
     query = candidate_query(tenant_id, target_embedding, k, opts)
-    HeavyRead.all(tenant_id, query, heavy_read_opts())
+    HeavyRead.all(tenant_id, query, heavy_read_opts(opts))
   end
 
   @doc """
@@ -639,7 +638,18 @@ defmodule Loopctl.Knowledge.VectorSearch do
   # (per-endpoint override else the pool default, applied via SET LOCAL) AND the endpoint key
   # for slow-query telemetry — rather than hand-rolling a list that drifts from every other
   # heavy consumer. `HeavyRead.opts/1` carries the 15s client-timeout backstop itself.
-  defp heavy_read_opts do
-    HeavyRead.opts(:vector_search)
+  #
+  # US-37.5: a caller MAY pass `on_overload: :tag` (or `:raise`) in `nearest/4`'s opts to
+  # choose the over-cap disposition. `:tag` makes the shed return
+  # `{:error, :heavy_read_overloaded}` (the graceful-degrade path — the ProposalGate
+  # write-back gate falls OPEN, the auto-link worker snoozes) instead of raising a 429.
+  # Absent, it defaults to `HeavyRead`'s `:raise` (a plain API kNN read → 429).
+  defp heavy_read_opts(opts) do
+    base = HeavyRead.opts(:vector_search)
+
+    case Keyword.fetch(opts, :on_overload) do
+      {:ok, disposition} -> Keyword.put(base, :on_overload, disposition)
+      :error -> base
+    end
   end
 end

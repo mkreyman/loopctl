@@ -5445,10 +5445,20 @@ defmodule Loopctl.Knowledge do
   # (`a.tenant_id == ^tenant_id`) and is bounded by prior-tag selectivity — NEVER a
   # full-corpus read (the verified plan shape is documented on novelty_distance_query/4).
   defp nearest_prior_distance(tenant_id, embedding, prior_tag, vis) do
-    tenant_id
-    |> novelty_distance_query(embedding, prior_tag, vis)
+    query = novelty_distance_query(tenant_id, embedding, prior_tag, vis)
     # Heavy vector aggregate — dedicated pool via Loopctl.HeavyRead (US-27.11).
-    |> then(&HeavyRead.one(tenant_id, &1, heavy_read_opts(:novelty)))
+    # `on_overload: :tag` (US-37.5): over the tenant's HeavyRead slice the read is SHED
+    # and returns `{:error, :heavy_read_overloaded}` — mapped to a DELIBERATE `nil` novelty
+    # score here (the same graceful degrade a genuinely unscorable idea gets), rather than
+    # RAISING an OverloadedError that the `Task.async_stream` in `novelty_scores/3` would
+    # catch as an incidental `{:exit, _}` and log as a scary task crash. Non-destructive:
+    # nil already means "not scored".
+    opts = Keyword.put(heavy_read_opts(:novelty), :on_overload, :tag)
+
+    case HeavyRead.one(tenant_id, query, opts) do
+      {:error, :heavy_read_overloaded} -> nil
+      distance -> distance
+    end
   end
 
   # The `MIN(embedding <=> $const::vector)` aggregate query, scoped to the prior-tag set.
@@ -5974,6 +5984,7 @@ defmodule Loopctl.Knowledge do
   """
   @spec search_semantic(Ecto.UUID.t(), [float()], keyword()) ::
           {:ok, %{results: [map()], meta: map()}}
+          | {:error, :heavy_read_overloaded}
   def search_semantic(tenant_id, query_embedding, opts \\ []) do
     limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(@max_relevance_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
@@ -5996,10 +6007,12 @@ defmodule Loopctl.Knowledge do
     # in-contract page (limit ≤ #{@max_relevance_page_size}) is served; only an
     # unusually-deep offset beyond the pool cap is affected — the documented post-ANN-filter
     # tradeoff `VectorSearch` already carries (see its moduledoc).
-    results =
-      tenant_id
-      |> semantic_results_query(query_embedding, opts)
-      |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(:semantic_search)))
+    # US-37.5: pass `on_overload: :tag` so an over-cap heavy-read shed returns
+    # `{:error, :heavy_read_overloaded}` (rather than raising a 429) — semantic search
+    # degrades gracefully to KEYWORD-only fallback on overload, exactly as it does on
+    # an embedding failure. Either heavy read's shed short-circuits to the tagged error
+    # the callers map to keyword fallback.
+    results_query = semantic_results_query(tenant_id, query_embedding, opts)
 
     # COUNT — kept as a SEPARATE full-corpus filtered `count(*)` so `total_count` PRESERVES
     # its pre-27.7a meaning (the size of the whole embedded+filtered ranked corpus, NOT the
@@ -6009,27 +6022,45 @@ defmodule Loopctl.Knowledge do
     # category+tags count is a BitmapAnd bounded by selectivity; the unfiltered count is a
     # bounded tenant scan — inherently O(tenant rows) for a true `count(*)`).
     count_query = semantic_count_query(tenant_id, query_embedding, status, opts)
-    total_count = HeavyRead.one(tenant_id, count_query, heavy_read_opts(:semantic_search))
 
-    maybe_record_search_access(tenant_id, results, nil, opts, "semantic")
+    case HeavyRead.all(tenant_id, results_query, semantic_heavy_read_opts()) do
+      {:error, :heavy_read_overloaded} = err ->
+        err
 
-    {:ok,
-     %{
-       results: results,
-       meta: %{
-         total_count: total_count,
-         limit: limit,
-         offset: offset,
-         search_mode: "semantic_only",
-         # Every EMBEDDED article passing the filters is ranked by similarity
-         # (no relevance cutoff), so total_count is the size of that embedded
-         # set — NOT a match count, and <= the total published count (articles
-         # without an embedding are excluded). Use knowledge_stats for the
-         # full wiki size.
-         total_count_scope: "ranked_corpus",
-         pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
-       }
-     }}
+      results ->
+        case HeavyRead.one(tenant_id, count_query, semantic_heavy_read_opts()) do
+          {:error, :heavy_read_overloaded} = err ->
+            err
+
+          total_count ->
+            maybe_record_search_access(tenant_id, results, nil, opts, "semantic")
+
+            {:ok,
+             %{
+               results: results,
+               meta: %{
+                 total_count: total_count,
+                 limit: limit,
+                 offset: offset,
+                 search_mode: "semantic_only",
+                 # Every EMBEDDED article passing the filters is ranked by similarity
+                 # (no relevance cutoff), so total_count is the size of that embedded
+                 # set — NOT a match count, and <= the total published count (articles
+                 # without an embedding are excluded). Use knowledge_stats for the
+                 # full wiki size.
+                 total_count_scope: "ranked_corpus",
+                 pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
+               }
+             }}
+        end
+    end
+  end
+
+  # US-37.5: heavy-read opts for the semantic search reads with the graceful-degrade
+  # flag — an over-cap shed returns `{:error, :heavy_read_overloaded}` (search falls
+  # back to keyword-only) instead of raising a 429.
+  defp semantic_heavy_read_opts do
+    [{:on_overload, :tag} | heavy_read_opts(:semantic_search)]
   end
 
   # Relevance-pool truncation signal (US-27.7a — NOT silent; mirrors the suggested-links
@@ -6260,60 +6291,78 @@ defmodule Loopctl.Knowledge do
 
     case {keyword_result, embedding_result} do
       {{:ok, kw}, {:ok, embedding}} ->
-        {:ok, semantic} = search_semantic(tenant_id, embedding, sub_opts)
+        # US-37.5: the semantic heavy read can be SHED when the tenant is over its
+        # per-tenant in-flight HeavyRead cap. That returns `{:error,
+        # :heavy_read_overloaded}` (rather than raising a 429) so combined search
+        # degrades to keyword-only — the SAME graceful fallback as an embedding
+        # failure, keeping OTHER tenants' access to the shared BYPASSRLS pool.
+        case search_semantic(tenant_id, embedding, sub_opts) do
+          {:ok, semantic} ->
+            # Distinguish the OTHER silent-degradation cause (#297): the embedding
+            # SUCCEEDED but semantic ranking returned nothing (a recall/HNSW problem,
+            # NOT an embed failure). Combined does NOT fall back here — keyword still
+            # merges — so this sets no fallback/fallback_reason; it only emits the
+            # alertable signal and the meta carries `semantic_result_count`.
+            maybe_emit_semantic_empty(tenant_id, length(semantic.results), query_string)
 
-        # Distinguish the OTHER silent-degradation cause (#297): the embedding
-        # SUCCEEDED but semantic ranking returned nothing (a recall/HNSW problem,
-        # NOT an embed failure). Combined does NOT fall back here — keyword still
-        # merges — so this sets no fallback/fallback_reason; it only emits the
-        # alertable signal and the meta carries `semantic_result_count`.
-        maybe_emit_semantic_empty(tenant_id, length(semantic.results), query_string)
+            {:ok, merged} = merge_results(kw, semantic, keyword_weight, semantic_weight, opts)
 
-        {:ok, merged} = merge_results(kw, semantic, keyword_weight, semantic_weight, opts)
+            maybe_record_search_access(
+              tenant_id,
+              merged.results,
+              query_string,
+              opts,
+              "combined"
+            )
 
-        maybe_record_search_access(
-          tenant_id,
-          merged.results,
-          query_string,
-          opts,
-          "combined"
-        )
+            {:ok, merged}
 
-        {:ok, merged}
+          {:error, :heavy_read_overloaded} ->
+            combined_keyword_fallback(tenant_id, kw, :heavy_read_overloaded, query_string, opts)
+        end
 
       {{:ok, kw}, {:error, reason}} ->
         # Fallback to keyword-only. Capture the discarded embedding-error reason as
         # a stable, non-sensitive tag (sanitized via ProviderError so no api key /
         # provider body leaks), surface it in meta, and emit telemetry + a log so a
         # silent degradation becomes alertable (#297).
-        fallback_reason = record_semantic_fallback(tenant_id, reason, query_string)
-        paginated = paginate_results(kw.results, opts)
-
-        maybe_record_search_access(
-          tenant_id,
-          paginated.results,
-          query_string,
-          opts,
-          "combined_fallback"
-        )
-
-        {:ok,
-         %{
-           results: paginated.results,
-           meta:
-             Map.merge(kw.meta, %{
-               fallback: true,
-               search_mode: "keyword_only",
-               fallback_reason: fallback_reason,
-               total_count: kw.meta.total_count,
-               limit: paginated.limit,
-               offset: paginated.offset
-             })
-         }}
+        combined_keyword_fallback(tenant_id, kw, reason, query_string, opts)
 
       {kw_error, _} ->
         kw_error
     end
+  end
+
+  # Degrade combined search to keyword-only when the semantic side is unavailable —
+  # either an embedding-generation error (#297) OR an over-cap HeavyRead shed
+  # (US-37.5, `:heavy_read_overloaded`). Records the discarded reason as a stable,
+  # non-sensitive `fallback_reason` tag (sanitized via ProviderError), surfaces it in
+  # meta, and emits telemetry + a log so the degradation is alertable, not silent.
+  defp combined_keyword_fallback(tenant_id, kw, reason, query_string, opts) do
+    fallback_reason = record_semantic_fallback(tenant_id, reason, query_string)
+    paginated = paginate_results(kw.results, opts)
+
+    maybe_record_search_access(
+      tenant_id,
+      paginated.results,
+      query_string,
+      opts,
+      "combined_fallback"
+    )
+
+    {:ok,
+     %{
+       results: paginated.results,
+       meta:
+         Map.merge(kw.meta, %{
+           fallback: true,
+           search_mode: "keyword_only",
+           fallback_reason: fallback_reason,
+           total_count: kw.meta.total_count,
+           limit: paginated.limit,
+           offset: paginated.offset
+         })
+     }}
   end
 
   # -- Semantic → keyword fallback observability (#297) ------------------------
@@ -6375,6 +6424,9 @@ defmodule Loopctl.Knowledge do
   defp reason_to_tag(:no_api_key), do: "no_embedding_key"
   defp reason_to_tag(:circuit_open), do: "embedding_circuit_open"
   defp reason_to_tag(:rate_limited_local), do: "embedding_rate_limited_local"
+  # US-37.5: the semantic heavy read was shed because the tenant is over its
+  # per-tenant in-flight HeavyRead cap; search degraded to keyword-only.
+  defp reason_to_tag(:heavy_read_overloaded), do: "heavy_read_overloaded"
   defp reason_to_tag(:timeout), do: "embedding_timeout"
 
   defp reason_to_tag({:api_error, status, _}) when is_integer(status),

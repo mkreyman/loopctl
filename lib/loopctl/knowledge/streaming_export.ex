@@ -45,6 +45,23 @@ defmodule Loopctl.Knowledge.StreamingExport do
   so a consumer detects truncation. The error is mapped through `LoopctlWeb.DBError`
   semantics by the controller so no SQL/params/vector-literals/stack-traces reach
   the partial bytes.
+
+  ## Per-tenant heavy-read weight + overload disposition (US-37.5)
+
+  Every export scan is a genuinely HEAVY, long (60s) read, so it is stamped with the
+  `:export` endpoint (`export_read_opts/0`) — weighted `heavy` (2) by
+  `Loopctl.HeavyRead.TenantGate` (an unweighted read defaults to LIGHT, letting a
+  tenant hold more concurrent export slots than the cost model intends). The reads
+  keep HeavyRead's default `on_overload: :raise`, so when a tenant is over its
+  per-tenant in-flight slice an export scan sheds by RAISING
+  `Loopctl.HeavyRead.OverloadedError`. That is a DELIBERATE fail-closed disposition:
+  the raise is caught by the same page/aggregate/link `rescue` clauses that fail
+  closed on any DB error (`safe_fetch_page/5`, `emit_index/4`, `emit_article_page/5`)
+  — the writer is aborted, the consumer detects truncation, and the export is
+  re-run once the tenant's heavy-read load subsides. (Since the scan is released
+  between keyset pages, an export mostly coexists; a shed only occurs when the tenant
+  is ALREADY saturating its slice — failing that one export is the correct fairness
+  outcome.)
   """
 
   import Ecto.Query
@@ -60,6 +77,15 @@ defmodule Loopctl.Knowledge.StreamingExport do
   @default_chunk_size 200
   @default_max_links_per_article 100
   @default_max_stream_duration_ms :timer.minutes(10)
+
+  # Export pages/aggregates/link preloads get a longer per-read timeout than fast reads
+  # (60s vs the 10s fast-read default) — a single page (even a dense graph at prod
+  # scale) completes well under 60s, so this only prevents a legitimately slow page
+  # timing out mid-export. The `:export` endpoint makes `Loopctl.HeavyRead.TenantGate`
+  # weight these HEAVY (US-37.5) — an unstamped read would default to LIGHT and let a
+  # tenant hold more concurrent export slots than the heavy-scan cost model intends.
+  @export_statement_timeout_ms 60_000
+  @export_endpoint :export
 
   @doc "Configured keyset page size (articles held in memory per page). Tunable for tests."
   @spec chunk_size() :: pos_integer()
@@ -188,8 +214,9 @@ defmodule Loopctl.Knowledge.StreamingExport do
       |> group_by([a], a.category)
       |> select([a], %{category: a.category, count: count(a.id)})
 
-    # Export aggregations use the same extended 60s timeout as export pages.
-    HeavyRead.all(tenant_id, query, statement_timeout: 60_000)
+    # Export aggregations use the same extended 60s timeout + heavy `:export` weight as
+    # export pages. A shed (OverloadedError) is caught by `emit_index/4`'s rescue → fail-closed.
+    HeavyRead.all(tenant_id, query, export_read_opts())
   end
 
   # --- article pages (keyset walk) ---
@@ -288,11 +315,10 @@ defmodule Loopctl.Knowledge.StreamingExport do
       })
       |> limit(^(page_size + 1))
 
-    # Export pages have a longer per-page timeout than fast reads: 60s instead of the
-    # 10s fast-read default. A single page read (even with `export_max_links_per_article: 100`
-    # and dense graph) should complete in well under 60s at realistic prod scale; this
-    # prevents a legitimate slow page from timing out mid-export.
-    rows = HeavyRead.all(tenant_id, query, statement_timeout: 60_000)
+    # Export pages carry the extended 60s per-read timeout + heavy `:export` weight
+    # (see `export_read_opts/0`). A shed (OverloadedError) is caught by
+    # `safe_fetch_page/5`'s rescue → fail-closed abort.
+    rows = HeavyRead.all(tenant_id, query, export_read_opts())
 
     if length(rows) > page_size do
       page = Enum.take(rows, page_size)
@@ -455,13 +481,27 @@ defmodule Loopctl.Knowledge.StreamingExport do
         }
       )
 
-    # Export link queries use the same extended 60s timeout as export pages.
+    # Export link queries use the same extended 60s timeout + heavy `:export` weight as
+    # export pages. A shed (OverloadedError) is caught by `emit_article_page/5`'s rescue
+    # (this runs inside its per-page link preload) → fail-closed abort.
     tenant_id
-    |> HeavyRead.all(query, statement_timeout: 60_000)
+    |> HeavyRead.all(query, export_read_opts())
     |> Enum.map(&Map.put(&1, :direction, direction))
   end
 
   # --- shared query + helpers ---
+
+  # Heavy-read opts shared by every export scan (page / aggregate / link preload): the
+  # extended 60s `SET LOCAL statement_timeout` AND the `:export` telemetry endpoint that
+  # weights the read HEAVY on `Loopctl.HeavyRead.TenantGate` (US-37.5). The default
+  # `on_overload: :raise` disposition is deliberate — the raise fails closed via the
+  # caller's rescue (see the moduledoc "overload disposition" section).
+  defp export_read_opts do
+    [
+      statement_timeout: @export_statement_timeout_ms,
+      telemetry_options: [endpoint: @export_endpoint]
+    ]
+  end
 
   @doc """
   The export base query: the EXACT WHERE of the legacy `export_base_query/2`

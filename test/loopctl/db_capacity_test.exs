@@ -33,6 +33,16 @@ defmodule Loopctl.DbCapacityTest do
     assert pool == DbCapacity.prod_pool_sizes().heavy_read_repo
   end
 
+  test "US-37.5: per-tenant heavy-read slice K is >= 1 and strictly < the pool size" do
+    k = DbCapacity.heavy_read_tenant_slice()
+    pool = DbCapacity.heavy_read_budget().pool
+
+    assert k >= 1
+    # K < pool so no single tenant's cost-weighted concurrent heavy reads can hold the
+    # WHOLE pool — always leaving pool - K slots for other tenants (no cross-tenant 503).
+    assert k < pool
+  end
+
   test "peak budget = steady + one overlap node + per-node notifier + fixed ops" do
     # 2 nodes: 42 steady + 21 overlap + 2 notifier(1/node) + 2 fixed = 67.
     assert DbCapacity.peak_total(2) == 67

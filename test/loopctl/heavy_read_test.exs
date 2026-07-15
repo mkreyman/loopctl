@@ -10,6 +10,8 @@ defmodule Loopctl.HeavyReadTest do
   use Loopctl.DataCase, async: true
 
   alias Loopctl.HeavyRead
+  alias Loopctl.HeavyRead.OverloadedError
+  alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge.Article
 
   import Ecto.Query
@@ -222,6 +224,79 @@ defmodule Loopctl.HeavyReadTest do
       assert_raise ArgumentError, ~r/scoped to the given tenant/, fn ->
         HeavyRead.all(Ecto.UUID.generate(), q)
       end
+    end
+  end
+
+  describe "per-tenant in-flight gate wired into the wrapper (US-37.5, AC-37.5.3)" do
+    # Force over-cap deterministically for a FRESH random tenant WITHOUT global config
+    # mutation: pre-fill its in-flight counter to exactly the configured cap with one
+    # high-weight acquire, so the very next wired heavy read (adding weight >= 1)
+    # exceeds the cap and is shed. Another tenant's counter is untouched, so it is
+    # served — the isolation the gate guarantees.
+    setup do
+      cap = TenantGate.cap()
+      {:ok, cap: cap}
+    end
+
+    test "an over-cap tenant's API read RAISES OverloadedError while another tenant is served",
+         %{cap: cap} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      a1 = fixture(:article, %{tenant_id: tenant_a.id, title: "A-only"})
+      b1 = fixture(:article, %{tenant_id: tenant_b.id, title: "B-only"})
+
+      query_for = fn tid ->
+        from(a in Article, where: a.tenant_id == ^tid, select: %{id: a.id})
+      end
+
+      # Saturate A's slice exactly.
+      assert TenantGate.acquire(tenant_a.id, cap, cap) == :ok
+
+      # A's next heavy read (default on_overload: :raise → API path) is SHED as a 429.
+      assert_raise OverloadedError, fn ->
+        HeavyRead.all(tenant_a.id, query_for.(tenant_a.id), HeavyRead.opts(:enumeration))
+      end
+
+      # B — sharing the same node-local gate — is unaffected: it gets real rows, not a
+      # pool-exhaustion crash. Isolation: A's saturation never touched B's counter.
+      results_b =
+        HeavyRead.all(tenant_b.id, query_for.(tenant_b.id), HeavyRead.opts(:enumeration))
+
+      assert Enum.map(results_b, & &1.id) == [b1.id]
+
+      # Cleanup the pre-filled budget so the shared VM-wide counter doesn't leak.
+      TenantGate.release(tenant_a.id, cap)
+      assert a1.id
+    end
+
+    test "on_overload: :tag returns {:error, :heavy_read_overloaded} (search keyword-fallback path)",
+         %{cap: cap} do
+      tenant = fixture(:tenant)
+      _ = fixture(:article, %{tenant_id: tenant.id})
+      query = from(a in Article, where: a.tenant_id == ^tenant.id, select: %{id: a.id})
+
+      assert TenantGate.acquire(tenant.id, cap, cap) == :ok
+
+      # With :tag, an over-cap shed returns the tagged tuple (search degrades to keyword
+      # fallback) instead of raising — the graceful path for the semantic search caller.
+      assert HeavyRead.all(tenant.id, query, [
+               {:on_overload, :tag} | HeavyRead.opts(:semantic_search)
+             ]) ==
+               {:error, :heavy_read_overloaded}
+
+      TenantGate.release(tenant.id, cap)
+    end
+
+    test "under cap, the wired gate is transparent — a normal read returns rows and frees its slot" do
+      tenant = fixture(:tenant)
+      a1 = fixture(:article, %{tenant_id: tenant.id})
+      query = from(a in Article, where: a.tenant_id == ^tenant.id, select: %{id: a.id})
+
+      results = HeavyRead.all(tenant.id, query, HeavyRead.opts(:enumeration))
+      assert Enum.map(results, & &1.id) == [a1.id]
+
+      # The slot was released in the `after` — the tenant holds zero budget afterward.
+      assert TenantGate.count(tenant.id) == 0
     end
   end
 

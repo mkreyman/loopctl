@@ -36,6 +36,13 @@ defmodule Loopctl.Application do
       # jobs). Purely additive — the per-minute cron is unchanged.
       Loopctl.AuditChain.SthEnqueuer,
       Loopctl.RateLimiter.Server,
+      # US-37.5: owns the public ETS table holding the per-tenant in-flight HeavyRead
+      # counters so a stable, long-lived owner survives the transient request/worker
+      # process that incremented one. acquire/release BYPASS this owner (lock-free
+      # :ets.update_counter on the hot read path); it exists only to own the table.
+      # Node-local per-tenant, cost-weighted cap on the BYPASSRLS heavy-read pool so
+      # one tenant's vector/analytic burst can't 503 every other tenant (GH #354).
+      Loopctl.HeavyRead.TenantGate,
       # US-27.16: owns the ETS table tracking in-flight streaming-export slots so a
       # crashed exporter's slot is reclaimed (concurrency cap, AC-27.16.6).
       Loopctl.Knowledge.ExportConcurrency,
