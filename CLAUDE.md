@@ -19,6 +19,21 @@ Refer to `docs/design-system.md` for full specifications. Key points:
 
 ---
 
+## Load Orchestration State on Every Session Start
+
+Load the orchestration protocol and build status from memory-keeper at the start of every conversation:
+
+```
+mcp__memory-keeper__context_get({ key: "CRITICAL_ALWAYS_READ_FIRST_PRINCIPLES", channel: "loopctl" })
+mcp__memory-keeper__context_get({ key: "build_status", channel: "loopctl" })
+```
+
+These hold the orchestration loop rules (you are READ-ONLY on code, you dispatch agents), current build
+progress (which epics/stories are done), architectural decisions made during implementation, and the DI /
+fixture / mock patterns to enforce. Load and read both before starting implementation work.
+
+---
+
 ## Agents, workflow, and domain routing
 
 This is a **thin, repo-specific** layer. The Elixir engineering roster, thinking/pattern skills, and
@@ -215,10 +230,11 @@ mix ecto.reset         # Drop, create, migrate
 ## Key Documents
 
 - **PRD**: `docs/prd.md` — full product requirements
-- **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — 200+ stories across 36 epics
-- **Skills**: `skills/loopctl-*.md` — 6 orchestration skills
+- **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — one JSON file per story, grouped by epic folder
+- **Skills**: `skills/loopctl-*.md` — orchestration skills
 - **Orchestration Guide**: `docs/orchestration-guide.md` — methodology: loop, trust model, checkpointing
-- **MCP Server**: `mcp-server/` — 87 typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
+- **Build Status**: memory-keeper key `build_status`, channel `loopctl`
+- **MCP Server**: `mcp-server/` — typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
 
 ## MCP Server
 
