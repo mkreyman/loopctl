@@ -315,6 +315,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       {:rate_limited_local, _acc} ->
         {:snooze, Admission.snooze_seconds()}
 
+      # US-37.3 (AC-37.3.3): a chunk's Anthropic extraction was throttled with a
+      # provider Retry-After. Snooze the whole job loss-free for ~that interval
+      # (no attempt consumed) instead of the blind `attempt^4` backoff.
+      {:throttled, retry_after, _acc} ->
+        {:snooze, retry_after}
+
       acc ->
         finalize_ingest(acc, chunk_count, dropped)
     end
@@ -369,6 +375,16 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
         # reduce and signal the caller to snooze the whole job loss-free — the gate
         # is shut, so re-attempting the remaining chunks now would just re-hit it.
         {:halt, {:rate_limited_local, acc}}
+
+      {:error, {:api_error, _status, :provider_error, retry_after}}
+      when is_integer(retry_after) ->
+        # US-37.3 (AC-37.3.3): the Anthropic extraction call was throttled (429/503)
+        # with a provider Retry-After. Halt and snooze the WHOLE job loss-free for
+        # ~that interval (no Oban attempt consumed) rather than routing it through
+        # finalize_errors' transient-retry path, which would burn max_attempts under
+        # sustained throttling. Already-persisted chunks stay committed and are
+        # idempotent, so the re-run resumes without re-billing them.
+        {:halt, {:throttled, retry_after, acc}}
 
       {:error, reason} ->
         # Persist what earlier chunks produced; record the error and keep going —

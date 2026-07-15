@@ -35,6 +35,7 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Provider.Admission
+  alias Loopctl.Provider.RetryAfter
   alias Loopctl.SystemConfig
 
   @default_base_url "https://api.openai.com/v1"
@@ -88,12 +89,17 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
         record_usage_safe(tenant_id, model, resp["usage"])
         {:ok, embedding}
 
-      {:ok, %{status: status, body: body}} ->
+      {:ok, %{status: status, body: body} = resp} ->
         Logger.warning("Loopctl.Knowledge.EmbeddingClient: API error (status=#{status})")
-        # SANITIZE: the provider error body can echo a masked key fragment (review
-        # #3). Drop it — keep only the status — so it never reaches the caller / an
-        # Oban `{:error, reason}` persisted into oban_jobs.errors.
-        {:error, ProviderError.sanitize({:api_error, status, body})}
+        # US-37.3: on a throttle response (429/503) parse the provider Retry-After
+        # and thread it (clamped, value-free) into the sanitized error so the
+        # tenant-scoped breaker cooldown AND the Oban worker snooze honor it instead
+        # of blind polynomial backoff. Absent/garbage → nil → the legacy 3-tuple.
+        # SANITIZE either way: the provider error body can echo a masked key fragment
+        # (review #3). Drop it — keep only status (+ Retry-After) — so it never
+        # reaches the caller / an Oban `{:error, reason}` persisted into oban_jobs.errors.
+        retry_after = RetryAfter.from_response(status, resp)
+        {:error, ProviderError.sanitize({:api_error, status, body}, retry_after)}
 
       {:error, reason} ->
         Logger.warning(

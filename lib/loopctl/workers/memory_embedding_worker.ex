@@ -118,6 +118,13 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
         # a discard) so the embed retries once local demand subsides.
         {:snooze, Admission.snooze_seconds()}
 
+      {:error, {:api_error, _status, :provider_error, retry_after}}
+      when is_integer(retry_after) ->
+        # US-37.3 (AC-37.3.3): provider throttle (429/503) with a Retry-After —
+        # snooze loss-free for ~that interval (no attempt consumed) instead of the
+        # blind `attempt^4` backoff. Already clamped to the SystemConfig max at parse.
+        {:snooze, retry_after}
+
       {:error, reason} ->
         # US-34.3 (review MED #1): the `[:loopctl, :llm, :provider_error]` telemetry
         # signal is now recorded ONCE, upstream, in

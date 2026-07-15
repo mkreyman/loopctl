@@ -233,6 +233,16 @@ defmodule Loopctl.Llm do
   else (5xx, transport, timeout, crash) is transient.
   """
   @spec permanent_provider_error?(term()) :: boolean()
+  # US-37.3: the throttle 4-tuple (`{:api_error, status, :provider_error,
+  # retry_after}`) only ever carries a 429/503 (see `Loopctl.Provider.RetryAfter`)
+  # — both transient. Classify it explicitly so the widened arity never falls
+  # through to a misleading verdict.
+  def permanent_provider_error?({:api_error, status, _, _}) when status in [408, 429], do: false
+
+  def permanent_provider_error?({:api_error, status, _, _})
+      when is_integer(status) and status >= 400 and status < 500,
+      do: true
+
   def permanent_provider_error?({:api_error, status, _}) when status in [408, 429], do: false
 
   def permanent_provider_error?({:api_error, status, _})

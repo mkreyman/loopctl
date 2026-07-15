@@ -32,6 +32,12 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   Uses a custom polynomial backoff: `attempt^4 + 15 + rand(0..30*attempt)`.
   With `max_attempts: 4`, approximate delays are ~16s, ~31s, ~96s, ~271s.
 
+  US-37.3: when a throttle error (429/503) carries a provider `Retry-After`, the
+  worker instead `{:snooze, retry_after}`s (loss-free, no Oban attempt consumed)
+  for ~that interval rather than the blind polynomial backoff — so it never
+  hot-retries into a throttling provider. A throttle WITHOUT a Retry-After keeps
+  the polynomial backoff.
+
   ## Uniqueness
 
   Unique per `article_id` within a 300-second window. If a new job is
@@ -117,6 +123,16 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
         # consumed, never a discard) — mirrors the FairShare.gate snooze pattern —
         # so the embed is retried once local demand subsides.
         {:snooze, Admission.snooze_seconds()}
+
+      {:error, {:api_error, _status, :provider_error, retry_after}}
+      when is_integer(retry_after) ->
+        # US-37.3 (AC-37.3.3): the provider signalled a throttle (429/503) with a
+        # Retry-After. Snooze loss-free for ~that interval (no Oban attempt consumed)
+        # INSTEAD of the blind `attempt^4` backoff, so we don't hot-retry into a
+        # throttling provider. The value is already clamped to the SystemConfig max
+        # at parse time. A throttle WITHOUT a Retry-After falls through to the generic
+        # branch below and keeps the polynomial backoff.
+        {:snooze, retry_after}
 
       {:error, reason} ->
         # Classify on the raw reason, but the term that becomes an Oban discard/error

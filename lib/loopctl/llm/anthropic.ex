@@ -32,6 +32,7 @@ defmodule Loopctl.Llm.Anthropic do
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Provider.Admission
+  alias Loopctl.Provider.RetryAfter
 
   @base_url "https://api.anthropic.com/v1"
   @anthropic_version "2023-06-01"
@@ -149,14 +150,25 @@ defmodule Loopctl.Llm.Anthropic do
         # anomaly observable/actionable without polluting the outage counter.
         {:error, ProviderError.sanitize(reason)}
 
-      {:ok, %{status: status, body: body}} ->
+      {:ok, %{status: status, body: body} = resp} ->
         Logger.warning("Loopctl.Llm.Anthropic: API error (op=#{operation}, status=#{status})")
         # SANITIZE the provider error body (review #11): it can echo a masked key
         # fragment, and callers surface it as an Oban `{:error, reason}` persisted
         # into oban_jobs.errors. Drop the body; keep only the status.
+        #
+        # US-37.3: on a throttle response (429/503) parse the provider Retry-After and
+        # thread it (clamped, value-free) into the sanitized error so a snooze-capable
+        # worker (ContentIngestionWorker) yields loss-free for ~that interval instead
+        # of the blind `attempt^4` backoff. The breaker itself stays embedding-only
+        # (it lives in `Knowledge` and only guards `generate_embedding/3`); the
+        # Anthropic path has never had a breaker and this story does not add one —
+        # `record_provider_error/1` still feeds the fleet-wide provider-error storm
+        # signal, and honoring Retry-After on the worker snooze is the win here.
+        # `record_provider_error/1` classifies on the RAW 3-tuple reason (429 →
+        # transient), unchanged; only the RETURNED term widens to the 4-tuple.
         reason = {:api_error, status, body}
         record_provider_error(reason)
-        {:error, ProviderError.sanitize(reason)}
+        {:error, ProviderError.sanitize(reason, RetryAfter.from_response(status, resp))}
 
       {:error, reason} ->
         # Never inspect the raw transport reason (review MED #4) — log a value-free

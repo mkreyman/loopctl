@@ -59,6 +59,8 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Projects.Project
+  alias Loopctl.Provider.RetryAfter
+  alias Loopctl.SystemConfig
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
@@ -4206,6 +4208,11 @@ defmodule Loopctl.Knowledge do
 
   defp permanent_merge_error?(:unparseable_merge), do: true
 
+  # US-37.3: a throttle 4-tuple (429/503 + Retry-After) is transient — it must NOT
+  # match the permanent 4xx clause below (that clause is arity-3 only, but be
+  # explicit so the widened shape can never be misclassified as permanent).
+  defp permanent_merge_error?({:api_error, _status, _tag, _retry_after}), do: false
+
   defp permanent_merge_error?({:api_error, status, _body})
        when is_integer(status) and status >= 400 and status < 500 and status != 408 and
               status != 429,
@@ -6429,6 +6436,10 @@ defmodule Loopctl.Knowledge do
   defp reason_to_tag(:heavy_read_overloaded), do: "heavy_read_overloaded"
   defp reason_to_tag(:timeout), do: "embedding_timeout"
 
+  # US-37.3: the throttle 4-tuple carries a Retry-After — the tag is still status-only.
+  defp reason_to_tag({:api_error, status, _, _}) when is_integer(status),
+    do: "embedding_provider_error_#{status}"
+
   defp reason_to_tag({:api_error, status, _}) when is_integer(status),
     do: "embedding_provider_error_#{status}"
 
@@ -7318,7 +7329,17 @@ defmodule Loopctl.Knowledge do
   @circuit_breaker_table :loopctl_embedding_circuit_breaker
   @failure_threshold 3
   @failure_window_seconds 60
+  # Base breaker cooldown (seconds). US-37.3: env-driven via SystemConfig
+  # (`"embedding_breaker_cooldown_seconds"`) so it is tunable without a deploy; the
+  # in-code default doubles as the documented default. A provider Retry-After
+  # RAISES this floor (see `cooldown_seconds/1`), clamped to the SystemConfig max.
   @cooldown_seconds 30
+  # US-37.3 latency trip (AC-37.3.4): consecutive/windowed slow-but-successful
+  # provider calls trip the breaker (slow-but-alive protection). Both knobs are
+  # env-driven via SystemConfig; a threshold of 0 (the default) DISABLES the
+  # latency trip entirely (disabled-safe).
+  @default_latency_threshold_ms 0
+  @default_latency_count 5
 
   @doc false
   def init_circuit_breaker do
@@ -7385,13 +7406,33 @@ defmodule Loopctl.Knowledge do
     #10; US-37.2 supervises the task so its crash never crashes the caller).
   - A crash rescue handler.
 
-  Returns `{:ok, embedding}` or `{:error, reason}`. Two error classes are EXEMPT
-  from the breaker: `{:error, :no_api_key}` (a per-tenant config gap) and 4xx
-  provider responses (per-tenant credential/quota problems — 401/403/429). Only
-  5xx / transport / timeout / crash failures count toward opening the breaker
-  (review #1). This is the single guarded entry point — the embedding worker and
-  the proposal gate route through it too (review #4) so circuit-open is both
-  respected AND contributed to.
+  Returns `{:ok, embedding}` or `{:error, reason}`.
+
+  ## What counts toward the breaker (US-37.3 — 4xx SPLIT)
+
+  The blanket "all 4xx are exempt" rule is GONE. The 4xx class is now split by
+  cause:
+
+    * **429 / 408 (THROTTLE)** — COUNT toward the breaker. A sustained rate-limit
+      storm is a systemic signal: counting it lets the breaker open so the
+      interactive path sheds to keyword search and the workers snooze, instead of
+      hot-retrying into a throttling provider. When the throttle response carried a
+      provider `Retry-After`, that value RAISES the cooldown (see
+      `cooldown_seconds/1`).
+    * **401 / 403 (and other 4xx) — CREDENTIAL/request problems** — remain EXEMPT.
+      A per-tenant bad/revoked key must never open a breaker that would degrade
+      every tenant (review #1).
+    * `{:error, :no_api_key}` (a per-tenant config gap) and
+      `{:error, :rate_limited_local}` (US-37.1 node-local admission backpressure —
+      self-imposed, not a provider failure) remain EXEMPT.
+    * 5xx / transport / timeout / crash still count.
+    * **Latency (AC-37.3.4)** — a run of slow-but-SUCCESSFUL calls (over the
+      configured `"embedding_breaker_latency_threshold_ms"`, disabled at 0) also
+      trips the breaker (slow-but-alive protection).
+
+  This is the single guarded entry point — the embedding worker and the proposal
+  gate route through it too (review #4) so circuit-open is both respected AND
+  contributed to.
 
   It is ALSO the single choke point for the `[:loopctl, :llm, :provider_error]`
   telemetry signal's embedding half (US-34.3 AC-34.3.3, review MED #1): both Oban
@@ -7400,7 +7441,9 @@ defmodule Loopctl.Knowledge do
   near-dup lookup) funnel through here, so recording the signal in
   `run_embedding_task/3` — rather than per-worker after this function returns —
   covers every embedding path exactly once, with the same breaker-countable gate
-  (a per-tenant 4xx never contributes) and no double-count.
+  and no double-count. NOTE (US-37.3): because 429/408 now COUNT, they also emit
+  the storm signal as `:transient` (throttle IS a systemic signal now) — the
+  intended consequence of the split; a per-tenant 401/403 still never contributes.
 
   `opts`:
     * `:timeout` — Task.yield budget in ms (default `#{@embedding_yield_ms}`).
@@ -7456,6 +7499,10 @@ defmodule Loopctl.Knowledge do
     # rather than crashing THIS process (AC-37.2.5). The inner rescue still catches
     # embedding-client exceptions and returns {:error, {:embedding_crash, ...}};
     # async_nolink additionally protects against exits the rescue can't catch.
+    # US-37.3 (AC-37.3.4): measure wall-clock per guarded call so a slow-but-alive
+    # provider can trip the breaker on latency (not just on hard failures).
+    started_ms = System.monotonic_time(:millisecond)
+
     task =
       Task.Supervisor.async_nolink(Loopctl.Knowledge.EmbeddingTaskSupervisor, fn ->
         try do
@@ -7467,7 +7514,7 @@ defmodule Loopctl.Knowledge do
 
     case Task.yield(task, timeout) || Task.shutdown(task) do
       {:ok, {:ok, embedding}} ->
-        record_success(tenant_id)
+        record_call_outcome(tenant_id, System.monotonic_time(:millisecond) - started_ms)
         {:ok, embedding}
 
       # A missing tenant key is a config gap, not a provider failure — do NOT
@@ -7490,7 +7537,11 @@ defmodule Loopctl.Knowledge do
   end
 
   defp maybe_record_failure(tenant_id, reason) do
-    if breaker_countable?(reason), do: record_failure(tenant_id)
+    # US-37.3: a throttle error may carry a provider Retry-After — thread it so the
+    # breaker cooldown honors it (see `record_failure/2` -> `cooldown_seconds/1`).
+    if breaker_countable?(reason),
+      do: record_failure(tenant_id, RetryAfter.from_error(reason))
+
     :ok
   end
 
@@ -7503,11 +7554,12 @@ defmodule Loopctl.Knowledge do
   # embedding path exactly once with no double-count.
   #
   # Gated by the SAME `breaker_countable?/1` classification the circuit breaker
-  # uses: a per-tenant credential/quota 4xx (401/403/429) is never a systemic
-  # provider incident, so it must never inflate this fleet-wide storm signal —
-  # exactly like it must never trip the breaker. `:no_api_key` and `:circuit_open`
-  # never reach this function (handled by earlier `case` clauses in
-  # `run_embedding_task/3`), so no explicit exclusion clause is needed here.
+  # uses: a per-tenant CREDENTIAL 4xx (401/403) is never a systemic provider
+  # incident, so it must never inflate this fleet-wide storm signal — exactly like
+  # it must never trip the breaker. US-37.3: a THROTTLE 4xx (429/408) now DOES
+  # count (throttle is a systemic signal), so it is recorded here as `:transient`.
+  # `:no_api_key` and `:circuit_open` never reach this function (handled by earlier
+  # `case` clauses in `run_embedding_task/3`), so no explicit exclusion is needed.
   defp maybe_record_provider_error(reason) do
     if breaker_countable?(reason) do
       class = if Loopctl.Llm.permanent_provider_error?(reason), do: :permanent, else: :transient
@@ -7517,14 +7569,33 @@ defmodule Loopctl.Knowledge do
     :ok
   end
 
-  # Only systemic provider/infra failures count toward the breaker. A 4xx is a
-  # per-tenant credential/quota problem (401/403/429) and must NEVER contribute —
-  # otherwise one tenant's bad key would open the breaker and degrade every tenant
-  # sharing it (review #1). Mirrors the `:no_api_key` exemption.
+  # US-37.3 — 4xx SPLIT. The blanket 4xx exemption is gone; the class is split by
+  # cause:
+  #   * 429 (Too Many Requests) / 408 (Request Timeout) are THROTTLE signals — they
+  #     COUNT. A sustained rate-limit storm is systemic, not per-tenant: counting it
+  #     lets the breaker open so the interactive path sheds to keyword and the
+  #     workers snooze, instead of hot-retrying into a throttling provider.
+  #   * 401 / 403 (and every other 4xx) are per-tenant CREDENTIAL/request problems —
+  #     EXEMPT, so one tenant's bad/revoked key never opens a breaker that would
+  #     degrade every tenant sharing it (review #1). Mirrors the `:no_api_key` exemption.
+  #   * 5xx counts (systemic outage). The throttle 4-tuple carries a Retry-After but
+  #     classifies identically to its 3-tuple form.
+  defp breaker_countable?({:api_error, status, _, _}) when status in [408, 429], do: true
+
+  defp breaker_countable?({:api_error, status, _, _})
+       when is_integer(status) and status >= 500,
+       do: true
+
+  defp breaker_countable?({:api_error, status, _, _}) when is_integer(status), do: false
+
+  defp breaker_countable?({:api_error, status, _}) when status in [408, 429], do: true
+
   defp breaker_countable?({:api_error, status, _}) when is_integer(status) and status >= 500,
     do: true
 
   defp breaker_countable?({:api_error, status, _}) when is_integer(status), do: false
+
+  defp breaker_countable?({:api_error, status}) when status in [408, 429], do: true
 
   defp breaker_countable?({:api_error, status}) when is_integer(status) and status >= 500,
     do: true
@@ -7564,12 +7635,18 @@ defmodule Loopctl.Knowledge do
     end
   end
 
+  defp record_failure(tenant_id), do: record_failure(tenant_id, nil)
+
   # The failure counter is keyed by the WINDOW PERIOD (review #2): each rolling
   # window is a DISTINCT ETS key, so an expired window is simply a different key —
   # there is no non-atomic "check the timestamp, then reset the counter in place"
   # step to race. `update_counter/4` is the sole, atomic mutation, so a burst of
   # concurrent failures for one tenant counts reliably to the threshold.
-  defp record_failure(tenant_id) do
+  #
+  # US-37.3: `retry_after` (seconds, or nil) is a provider Retry-After parsed from a
+  # throttle response — it RAISES the cooldown floor when the breaker opens (see
+  # `cooldown_seconds/1`) so we back off for at least as long as the provider asked.
+  defp record_failure(tenant_id, retry_after) do
     ensure_circuit_breaker_table()
     now = System.monotonic_time(:second)
     period = period_for(now)
@@ -7587,10 +7664,81 @@ defmodule Loopctl.Knowledge do
       )
 
     if count >= @failure_threshold do
-      :ets.insert(@circuit_breaker_table, {{tenant_id, :open_until}, now + @cooldown_seconds})
+      open_breaker(tenant_id, now, retry_after)
     end
 
     :ok
+  end
+
+  # US-37.3 (AC-37.3.4): classify a SUCCESSFUL call's latency. A fast/normal
+  # success clears the tenant's breaker state (full health); a SLOW success
+  # (over the configured threshold) records a slow-call toward the latency trip.
+  # Disabled-safe: a threshold of 0/unset means the latency trip never fires and a
+  # success always just clears state (identical to pre-US-37.3 behavior).
+  defp record_call_outcome(tenant_id, elapsed_ms) do
+    threshold = latency_threshold_ms()
+
+    if threshold > 0 and elapsed_ms > threshold do
+      record_slow_call(tenant_id)
+    else
+      record_success(tenant_id)
+    end
+  end
+
+  # Slow-but-alive protection. Mirrors the failure-window counter but on a distinct
+  # `:slow` key, so a run of slow successes within the window trips the breaker
+  # WITHOUT a fast success in between resetting it (a fast success clears both
+  # counters via `record_success/1` -> `clear_tenant_breaker/2`). The cooldown here
+  # uses the base cooldown (no provider Retry-After on a 200).
+  defp record_slow_call(tenant_id) do
+    ensure_circuit_breaker_table()
+    now = System.monotonic_time(:second)
+    period = period_for(now)
+
+    :ets.delete(@circuit_breaker_table, slow_key(tenant_id, period - 1))
+
+    count =
+      :ets.update_counter(
+        @circuit_breaker_table,
+        slow_key(tenant_id, period),
+        {2, 1},
+        {slow_key(tenant_id, period), 0}
+      )
+
+    if count >= latency_count() do
+      open_breaker(tenant_id, now, nil)
+    end
+
+    :ok
+  end
+
+  defp open_breaker(tenant_id, now, retry_after) do
+    :ets.insert(
+      @circuit_breaker_table,
+      {{tenant_id, :open_until}, now + cooldown_seconds(retry_after)}
+    )
+  end
+
+  # Cooldown (seconds) the breaker stays open. US-37.3: a provider Retry-After
+  # RAISES the floor (back off at least as long as asked), bounded by the
+  # SystemConfig max so a hostile header can't wedge the breaker open. Absent
+  # Retry-After keeps the base cooldown.
+  defp cooldown_seconds(nil), do: base_cooldown_seconds()
+
+  defp cooldown_seconds(retry_after) when is_integer(retry_after) do
+    retry_after |> max(base_cooldown_seconds()) |> min(RetryAfter.max_seconds())
+  end
+
+  defp base_cooldown_seconds do
+    SystemConfig.get_int("embedding_breaker_cooldown_seconds", @cooldown_seconds)
+  end
+
+  defp latency_threshold_ms do
+    SystemConfig.get_int("embedding_breaker_latency_threshold_ms", @default_latency_threshold_ms)
+  end
+
+  defp latency_count do
+    SystemConfig.get_int("embedding_breaker_latency_count", @default_latency_count)
   end
 
   defp record_success(tenant_id) do
@@ -7600,16 +7748,20 @@ defmodule Loopctl.Knowledge do
   end
 
   # Delete ALL of a tenant's breaker state: the open flag + the current and previous
-  # window counters (a failure is always in one of those two periods).
+  # window counters for BOTH the failure and the slow (latency) windows (a failure /
+  # slow call is always in one of the two periods).
   defp clear_tenant_breaker(tenant_id, now) do
     period = period_for(now)
     :ets.delete(@circuit_breaker_table, {tenant_id, :open_until})
     :ets.delete(@circuit_breaker_table, failures_key(tenant_id, period))
     :ets.delete(@circuit_breaker_table, failures_key(tenant_id, period - 1))
+    :ets.delete(@circuit_breaker_table, slow_key(tenant_id, period))
+    :ets.delete(@circuit_breaker_table, slow_key(tenant_id, period - 1))
     :ok
   end
 
   defp failures_key(tenant_id, period), do: {tenant_id, :failures, period}
+  defp slow_key(tenant_id, period), do: {tenant_id, :slow, period}
 
   defp period_for(now), do: div(now, @failure_window_seconds)
 

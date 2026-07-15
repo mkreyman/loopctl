@@ -30,6 +30,7 @@ defmodule Loopctl.Llm.ProviderError do
   @typedoc "A sanitized provider error term (never carries a response body)."
   @type t ::
           {:api_error, integer(), :provider_error}
+          | {:api_error, integer(), :provider_error, non_neg_integer() | nil}
           | {:request_failed, atom()}
           | {:embedding_crash, :exception}
           | atom()
@@ -41,6 +42,13 @@ defmodule Loopctl.Llm.ProviderError do
   structured domain-error tuples (which are provably key-free).
   """
   @spec sanitize(term()) :: t()
+  # US-37.3: an already-sanitized throttle 4-tuple carries only a status + a
+  # parsed Retry-After integer (both value-free) — preserve it idempotently so a
+  # second sanitize pass at a worker boundary never drops the Retry-After.
+  def sanitize({:api_error, status, :provider_error, retry_after})
+      when is_integer(status) and (is_integer(retry_after) or is_nil(retry_after)),
+      do: {:api_error, status, :provider_error, retry_after}
+
   def sanitize({:api_error, status, _body}) when is_integer(status),
     do: {:api_error, status, :provider_error}
 
@@ -66,11 +74,33 @@ defmodule Loopctl.Llm.ProviderError do
   def sanitize(other), do: other
 
   @doc """
+  Sanitize an `{:api_error, status, body}` while attaching a parsed provider
+  `Retry-After` (US-37.3). A `nil` Retry-After collapses to the arity-preserving
+  3-tuple (unchanged legacy shape); a present one produces the throttle 4-tuple
+  `{:api_error, status, :provider_error, retry_after}` that the breaker cooldown
+  and Oban worker snooze read via `Loopctl.Provider.RetryAfter.from_error/1`.
+  """
+  @spec sanitize(term(), non_neg_integer() | nil) :: t()
+  def sanitize(reason, nil), do: sanitize(reason)
+
+  def sanitize({:api_error, status, _body}, retry_after)
+      when is_integer(status) and is_integer(retry_after),
+      do: {:api_error, status, :provider_error, retry_after}
+
+  def sanitize({:api_error, status}, retry_after)
+      when is_integer(status) and is_integer(retry_after),
+      do: {:api_error, status, :provider_error, retry_after}
+
+  # A Retry-After on any non-api_error shape is meaningless — sanitize normally.
+  def sanitize(reason, _retry_after), do: sanitize(reason)
+
+  @doc """
   A short, log-safe tag for a provider error (never includes a body). Accepts a
   bare error term or an `{:error, term}` tuple.
   """
   @spec log_tag(term()) :: String.t()
   def log_tag({:error, inner}), do: log_tag(inner)
+  def log_tag({:api_error, status, _, _}), do: "api_error status=#{status}"
   def log_tag({:api_error, status, _}), do: "api_error status=#{status}"
   def log_tag({:api_error, status}), do: "api_error status=#{status}"
   def log_tag({:request_failed, _}), do: "request_failed"

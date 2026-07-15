@@ -181,6 +181,20 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorkerTest do
       assert is_integer(seconds) and seconds > 0
     end
 
+    test "US-37.3 (AC-37.3.3): a throttle 429 with a Retry-After snoozes ~that interval" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      memory = fixture(:memory, %{tenant_id: tenant.id, subject_id: "s", text: "throttled"})
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:error, {:api_error, 429, :provider_error, 30}}
+      end)
+
+      # Loss-free snooze for the provider Retry-After (no attempt consumed), NOT the
+      # polynomial backoff and NOT a discard.
+      assert {:snooze, 30} = MemoryEmbeddingWorker.perform(job(memory.id, tenant.id))
+    end
+
     test "US-37.2 (AC-37.2.2): the SAME per-node concurrency cap gates the worker (snooze, client never called)" do
       tenant = fixture(:tenant)
       Knowledge.reset_circuit_breaker(tenant.id)

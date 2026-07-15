@@ -472,6 +472,32 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       assert {:snooze, seconds} = result
       assert is_integer(seconds) and seconds > 0
     end
+
+    test "US-37.3 (AC-37.3.3): an extraction throttle carrying a Retry-After SNOOZES ~that interval" do
+      %{tenant: tenant} = setup_tenant()
+
+      # The Anthropic extraction was throttled (429/503) and surfaced the throttle
+      # 4-tuple with a parsed, clamped Retry-After. The whole job snoozes loss-free
+      # (no attempt consumed) for ~that interval instead of the blind attempt^4 backoff.
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
+        {:error, {:api_error, 429, :provider_error, 30}}
+      end)
+
+      result =
+        ContentIngestionWorker.perform(%Oban.Job{
+          id: 108,
+          args: %{
+            "tenant_id" => tenant.id,
+            "content" => "Throttled content",
+            "content_hash" => "throttle_retry_after_test",
+            "source_type" => "ingestion"
+          }
+        })
+
+      assert {:snooze, 30} = result
+    end
   end
 
   # --- Project scoping ---
