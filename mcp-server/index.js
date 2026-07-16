@@ -402,6 +402,17 @@ async function createProject({ name, slug, repo_url, description, tech_stack, mi
   return toContent(result);
 }
 
+async function createKbScope({ name, slug, repo_url, description, tech_stack }) {
+  const body = { name, slug };
+  if (repo_url) body.repo_url = repo_url;
+  if (description) body.description = description;
+  if (tech_stack) body.tech_stack = tech_stack;
+  // Uses the AGENT key (not ORCH): a KB scope is agent-createable on the KB tier — that is
+  // the whole point. The server forces kind: :kb; a body-supplied kind is ignored.
+  const result = await apiCall("POST", "/api/v1/kb-scopes", body, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
 async function deleteProject({ project_id }) {
   const result = await apiCall(
     "DELETE",
@@ -2096,6 +2107,25 @@ const TOOLS = [
           description:
             "Optional project mission/goal statement that cascades into story context. Surfaces in get_story responses as project_mission so agents see the why without a second fetch. Max 2000 chars.",
         },
+      },
+      required: ["name", "slug"],
+    },
+  },
+  {
+    name: "create_kb_scope",
+    description:
+      "Create a knowledge-only project scope (kind: kb) for the current tenant. Unlike create_project (work project, orchestrator+ / human-anchored), this is available to an agent-rooted (KB-tier) tenant with an agent key: a kb scope carries NO chain-of-custody / work-breakdown surface (it cannot host epics/stories/dispatch/ui-tests), it exists only to partition knowledge articles by repo so captured/created articles can be project-scoped. Then resolve_project by its repo_url/slug and pass the returned id as project_id on article/knowledge writes. Counts toward the tenant's max_projects budget.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Scope name (often the repo name)." },
+        slug: { type: "string", description: "URL-safe slug (often the repo basename)." },
+        repo_url: {
+          type: "string",
+          description: "Repo URL, so resolve_project can map a repo to this scope.",
+        },
+        description: { type: "string", description: "Scope description." },
+        tech_stack: { type: "string", description: "Tech stack summary." },
       },
       required: ["name", "slug"],
     },
@@ -4859,6 +4889,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "create_project":
       return await createProject(args);
+
+    case "create_kb_scope":
+      return await createKbScope(args);
 
     case "delete_project":
       return await deleteProject(args);

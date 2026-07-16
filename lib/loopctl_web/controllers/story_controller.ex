@@ -36,6 +36,10 @@ defmodule LoopctlWeb.StoryController do
   plug LoopctlWeb.Plugs.RequireHumanAnchor
        when action in [:create, :create_in_project, :update, :delete]
 
+  # A :kb scope can never host stories created directly under a project. (`create` goes
+  # through :epic_id, and epics cannot exist on a :kb scope, so it is transitively barred.)
+  plug LoopctlWeb.Plugs.RequireWorkProject when action in [:create_in_project]
+
   tags(["Stories"])
 
   operation(:create,

@@ -26,6 +26,9 @@ defmodule LoopctlWeb.ImportExportController do
   # NOT applied to :export_project — export is a read-only KB-tier-safe op.
   plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:import_project]
 
+  # A :kb scope can never receive an imported work breakdown. Import uses the :id path param.
+  plug LoopctlWeb.Plugs.RequireWorkProject, [param: "id"] when action in [:import_project]
+
   tags(["Import/Export"])
 
   operation(:import_project,

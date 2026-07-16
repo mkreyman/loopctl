@@ -46,9 +46,12 @@ defmodule Loopctl.Projects do
     actor_label = Keyword.get(opts, :actor_label)
     actor_type = Keyword.get(opts, :actor_type, "api_key")
     metadata = Keyword.get(opts, :metadata, %{})
+    # `kind` is set on the struct, NOT via cast — a request body can never mint or elevate
+    # a scope's kind. Defaults to :work; the KB-scope create path passes `kind: :kb`.
+    kind = Keyword.get(opts, :kind, :work)
 
     changeset =
-      %Project{tenant_id: tenant_id}
+      %Project{tenant_id: tenant_id, kind: kind}
       |> Project.create_changeset(attrs)
 
     multi =
@@ -73,7 +76,8 @@ defmodule Loopctl.Projects do
           new_state: %{
             "name" => project.name,
             "slug" => project.slug,
-            "status" => to_string(project.status)
+            "status" => to_string(project.status),
+            "kind" => to_string(project.kind)
           }
         }
       end)
