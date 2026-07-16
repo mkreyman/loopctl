@@ -37,7 +37,18 @@ defmodule Loopctl.Memory.GraduationTest do
       assert reloaded.recall_count == 1
       refute is_nil(reloaded.last_recalled_at)
 
-      # A second recall bumps again — the counter accumulates hotness.
+      # A second recall WITHIN the cooldown window does NOT bump: the dedup stops a tight
+      # single-agent loop from inflating the hotness signal and gaming graduation.
+      assert %{meta: %{fallback: false}} = Memory.recall(scope, query: "sky", limit: 5)
+      assert reload(target).recall_count == 1
+
+      # Once the cooldown has elapsed (simulated by ageing last_recalled_at past the
+      # window), a fresh recall bumps again — genuine cross-window hotness accumulates.
+      from(m in MemorySchema, where: m.id == ^target.id)
+      |> AdminRepo.update_all(
+        set: [last_recalled_at: DateTime.add(DateTime.utc_now(), -2, :hour)]
+      )
+
       assert %{meta: %{fallback: false}} = Memory.recall(scope, query: "sky", limit: 5)
       assert reload(target).recall_count == 2
     end

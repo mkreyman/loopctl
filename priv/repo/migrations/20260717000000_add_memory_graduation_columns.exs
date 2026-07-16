@@ -24,9 +24,13 @@ defmodule Loopctl.Repo.Migrations.AddMemoryGraduationColumns do
       add_if_not_exists :graduated_at, :utc_datetime_usec, null: true
     end
 
-    # Partial index backing the cross-tenant graduation sweep candidate query
-    # (`Loopctl.Workers.MemoryGraduationSweepWorker`): live, not-yet-graduated memories
-    # ordered by hotness within a tenant. The predicate matches the sweep's WHERE
+    # Partial index backing the graduation sweep's PER-TENANT candidate query
+    # (`Loopctl.Workers.MemoryGraduationSweepWorker`): for a given tenant, live,
+    # not-yet-graduated memories ordered by hotness. Because the index LEADS with
+    # tenant_id, it serves the sweep's `tenant_id = ? ... ORDER BY recall_count DESC`
+    # scan (equality + in-index descending order, no sort) but could NOT serve a bare
+    # cross-tenant global sort — which is why the sweep queries per tenant and round-robins
+    # rather than issuing one global ORDER BY. The predicate matches the sweep's WHERE
     # (`graduated_at IS NULL AND superseded_by IS NULL`) so the index stays small — it
     # only holds rows still eligible for graduation — and it is a plain btree that does
     # NOT touch the HNSW embedding indexes.

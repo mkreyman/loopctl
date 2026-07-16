@@ -489,6 +489,12 @@ config :loopctl, :memory_graduation_recall_threshold, 3
 config :loopctl, :memory_graduation_max_per_run, 50
 config :loopctl, :memory_graduation_scan_limit, 500
 
+# Dedup window (seconds) for the recall-count hotness bump (`Loopctl.Memory.bump_recall_counts/2`).
+# A memory's `recall_count` is bumped at most once per window, so a single agent replaying the
+# same query in a tight loop cannot inflate the "frequently-recalled" signal and force premature
+# graduation. Genuine repeated value across sessions/time still accumulates across windows.
+config :loopctl, :memory_recall_bump_cooldown_seconds, 3600
+
 # Epic 30 / US-30.1: per-tenant cap on entity definitions
 # (`Loopctl.ContextRetriever.Registry`). Bounds the dynamic ListTools payload/
 # latency of the generated agent query surface so a tenant admin cannot inflate

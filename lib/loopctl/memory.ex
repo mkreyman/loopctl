@@ -536,7 +536,9 @@ defmodule Loopctl.Memory do
 
   @doc """
   Best-effort, OFF-hot-path increment of `recall_count` (+1) and refresh of
-  `last_recalled_at` for the given live memory `ids` in `tenant_id`.
+  `last_recalled_at` for the given live memory `ids` in `tenant_id`, DEDUPED to at most
+  once per memory per `recall_bump_cooldown_seconds/0` so a tight single-agent recall loop
+  cannot game the hotness signal that drives graduation.
 
   Mirrors `Loopctl.Knowledge.Analytics.record_access/6`: the write is fire-and-forget
   and can NEVER fail a recall. Under the default `:async` mode it runs in a supervised
@@ -568,9 +570,20 @@ defmodule Loopctl.Memory do
 
   defp do_bump_recall_counts(tenant_id, ids) do
     now = DateTime.utc_now()
+    cutoff = DateTime.add(now, -recall_bump_cooldown_seconds(), :second)
 
+    # DEDUP the bump to at most once per memory per cooldown window. `recall_count` is the
+    # "frequently-recalled / proven-valuable" signal the graduation sweep thresholds on, so
+    # it must reflect BROAD, repeated value across sessions/time — not a tight single-agent
+    # loop. Without this window a single agent issuing the same query N times in one loop
+    # would force graduation (default threshold 3), letting one agent flood the wiki. Only
+    # a recall whose row was last counted BEFORE the cooldown (or never) bumps; recalls
+    # inside the window are ignored for hotness. `last_recalled_at` therefore marks the last
+    # COUNTED recall, so it doubles as the dedup cursor.
     from(m in MemorySchema,
-      where: m.tenant_id == ^tenant_id and m.id in ^ids
+      where:
+        m.tenant_id == ^tenant_id and m.id in ^ids and
+          (is_nil(m.last_recalled_at) or m.last_recalled_at < ^cutoff)
     )
     |> AdminRepo.update_all(set: [last_recalled_at: now], inc: [recall_count: 1])
 
@@ -1532,10 +1545,23 @@ defmodule Loopctl.Memory do
   so re-graduating the same memory is a no-op dedup, then calls
   `Loopctl.Knowledge.propose_article/3`.
 
-  On ANY successful verdict — `:created`, `:gated_to_draft`, `:duplicate`, or
-  `:deduplicated` — the memory's content is now durable, so `graduated_at` is stamped
-  (idempotently, only if still NULL) and the memory is never re-processed by the sweep.
-  A `{:error, _}` from the write is returned WITHOUT stamping, so a later run retries.
+  On ANY successful verdict `graduated_at` is stamped (idempotently, only if still NULL)
+  and the memory is never re-processed by the sweep — but the DURABILITY guarantee differs
+  by verdict:
+
+    * `:created` / `:duplicate` / `:deduplicated` — the content is represented by a
+      PUBLISHED article (a fresh one, or the canonical existing one), i.e. searchable now.
+    * `:gated_to_draft` — the novelty gate judged the content a near-duplicate and created
+      it as an UNPUBLISHED draft in the human-review queue. It is NOT yet searchable; a
+      reviewer publishes or discards it. Stamping is still correct: the content IS
+      represented (as a draft), and re-selecting the memory would only re-spend embedding
+      budget to hit the idempotency no-op — but the sweep does NOT re-materialize a draft
+      that a reviewer later discards.
+
+  A STRUCTURAL `{:error, changeset}` (the only error the novelty gate surfaces — a
+  backend outage falls open to a create, not an error tuple) IS stamped, because it can
+  never succeed on retry; leaving it un-stamped would livelock the hottest-first sweep on
+  a permanently-invalid candidate, re-spending embedding budget every run.
 
   Options: `:re_scope` (`:global` → `project_id: nil`); `:actor_id`/`:actor_label`/
   `:actor_type` are forwarded to `propose_article/3` for audit attribution.
@@ -1546,22 +1572,36 @@ defmodule Loopctl.Memory do
     project_id = graduation_project_id(memory, opts)
     attrs = memory_to_article_attrs(memory, project_id)
 
-    case Knowledge.propose_article(memory.tenant_id, attrs, propose_opts(opts)) do
+    case Knowledge.propose_article(memory.tenant_id, attrs, propose_opts(memory, opts)) do
       {:ok, %{verdict: verdict, article: article}} ->
         stamp_graduated(memory)
         {:ok, verdict, article}
 
       {:error, :duplicate_title, existing} ->
-        # A same-title / different-body collision. The stable per-memory
-        # idempotency_key makes this effectively unreachable for a DISTINCT memory (the
-        # title also carries the memory id suffix), but if it ever fires the content is
-        # already represented under that title — treat as durable and stamp so the sweep
+        # A same-title / different-body collision. The per-memory idempotency_key +
+        # the FULL memory id in the title suffix make this unreachable for a DISTINCT
+        # memory (two distinct memories can no longer collide on title), so if it ever
+        # fires the content is already represented under that title — stamp so the sweep
         # does not livelock retrying a title that will always collide.
         stamp_graduated(memory)
         {:ok, :duplicate, existing}
 
-      {:error, reason} ->
-        {:error, reason}
+      {:error, %Ecto.Changeset{} = changeset} ->
+        # A STRUCTURAL (validation) failure is DETERMINISTIC — the same attrs fail
+        # identically on every retry. Left un-stamped, the sweep would re-select this
+        # (hottest-first, `graduated_at IS NULL`) memory every hour and re-spend the
+        # novelty-gate embedding budget on a candidate that can NEVER succeed (a per-slot
+        # livelock). Tags are already sanitized in `memory_to_article_attrs/2`; stamping
+        # here terminally records any OTHER structural impossibility (e.g. an over-size
+        # body) so it is not retried forever. `graduated_at` here means "graduation was
+        # terminally attempted", not "a live article exists".
+        Logger.warning(
+          "Memory.graduate_memory_record structural failure (stamping to avoid livelock): " <>
+            "tenant=#{memory.tenant_id} memory=#{memory.id} errors=#{inspect(changeset.errors)}"
+        )
+
+        stamp_graduated(memory)
+        {:error, changeset}
     end
   end
 
@@ -1581,6 +1621,18 @@ defmodule Loopctl.Memory do
   @spec graduation_scan_limit() :: pos_integer()
   def graduation_scan_limit do
     Application.get_env(:loopctl, :memory_graduation_scan_limit, 500)
+  end
+
+  @doc """
+  Cooldown window (seconds) that dedups recall-count bumps per memory.
+
+  A memory's `recall_count` is bumped at most once per this window (see
+  `bump_recall_counts/2`), so a single agent replaying the same query in a tight loop
+  cannot inflate the "frequently-recalled" hotness signal and force premature graduation.
+  """
+  @spec recall_bump_cooldown_seconds() :: pos_integer()
+  def recall_bump_cooldown_seconds do
+    Application.get_env(:loopctl, :memory_recall_bump_cooldown_seconds, 3600)
   end
 
   # A caller may only graduate a memory it OWNS: scoped by (tenant_id, subject_id) on
@@ -1607,7 +1659,19 @@ defmodule Loopctl.Memory do
       title: graduation_title(memory),
       body: memory.text,
       category: :finding,
-      tags: memory.tags || [],
+      # PUBLISHED, not draft: knowledge_search/knowledge_context return PUBLISHED articles
+      # only, so a draft graduation would be invisible and the wiki would never grow.
+      # create_article/3 TRUSTS attrs[:status] and the Article moduledoc requires a
+      # non-controller caller to sanitize it server-side — this IS that sanitization. The
+      # novelty gate may still downgrade to :draft on a :low_novelty verdict (the
+      # human-review queue), which is the ONE intended unpublished outcome.
+      status: :published,
+      # Memory tags are unvalidated at the memory tier, but the Article changeset enforces
+      # count (<=50), length (<=100), and format. Copying arbitrary client-set tags verbatim
+      # would make a structurally-impossible candidate fail the changeset on EVERY sweep — a
+      # per-slot livelock that re-spends embedding budget hourly. Sanitize to Article's
+      # limits so graduation can never be poisoned by a hostile/oversized tag set.
+      tags: sanitize_graduation_tags(memory.tags),
       project_id: project_id,
       # Stable per-memory key: re-graduation (a race, a retry, or a second sweep before
       # graduated_at commits) is an idempotent no-op dedup rather than a partial dup.
@@ -1616,19 +1680,52 @@ defmodule Loopctl.Memory do
         "source" => "memory_graduation",
         "graduated_from_memory_id" => memory.id,
         "graduated_from_subject_id" => memory.subject_id,
-        "recall_count" => memory.recall_count
+        "recall_count" => memory.recall_count,
+        # PRESERVE SUBJECT-level isolation. A Memory is agent-private working memory scoped
+        # by (tenant_id, subject_id); graduating it into a tenant-wide SHARED article would
+        # expose one agent's private memory to every peer in the tenant (cross-subject
+        # leak). Stamp OWNER visibility keyed to the memory's subject so the graduated
+        # article stays discoverable by its owner (durable) but is NOT peer-readable —
+        # `Knowledge.propose_article/3` is passed the matching `visibility_agent_id` so the
+        # idempotency/dedup lookups resolve against the owner-visible row.
+        "agent_id" => memory.subject_id,
+        "visibility" => "owner",
+        "memory_type" => "finding"
       }
     }
   end
 
-  # Title = the memory's first line, trimmed and byte-bounded, with a short memory-id
-  # suffix so two DISTINCT memories whose first lines coincide do not collide on the
-  # (tenant_id, title) unique index (the novelty gate still catches genuine SEMANTIC
-  # duplicates — the suffix only prevents a mechanical DB title clash). Bounded to the
-  # Article 500-char title limit.
+  # Article tag constraints (mirror `Loopctl.Knowledge.Article`'s @max_tags/@max_tag_length/
+  # @tag_pattern). Memory tags are unbounded/unvalidated, so clamp+filter to what the Article
+  # changeset accepts: drop non-binary, empty, over-long, and format-invalid tags, then cap
+  # the count. Keeping only ALREADY-VALID tags (rather than mangling) guarantees the article
+  # changeset's tag validation cannot fail on a graduated memory.
+  @graduation_max_tags 50
+  @graduation_max_tag_length 100
+  @graduation_tag_pattern ~r/^[a-zA-Z0-9_-]+$/
+  defp sanitize_graduation_tags(tags) when is_list(tags) do
+    tags
+    |> Enum.filter(fn tag ->
+      is_binary(tag) and byte_size(tag) > 0 and
+        String.length(tag) <= @graduation_max_tag_length and
+        Regex.match?(@graduation_tag_pattern, tag)
+    end)
+    |> Enum.take(@graduation_max_tags)
+  end
+
+  defp sanitize_graduation_tags(_), do: []
+
+  # Title = the memory's first line, trimmed and byte-bounded, with the FULL memory-id
+  # suffix so two DISTINCT memories whose first lines coincide can never collide on the
+  # (tenant_id, title) unique index. A truncated (8-char) suffix left a birthday-bounded
+  # collision window in which a distinct memory's body was silently dropped (it hit the
+  # title index, returned the FIRST memory's article, and got stamped without ever being
+  # captured); the full UUID closes that data-loss path. The novelty gate still catches
+  # genuine SEMANTIC duplicates — the suffix only prevents a mechanical DB title clash.
+  # Bounded to the Article 500-char title limit.
   @graduation_title_max 500
   defp graduation_title(%MemorySchema{text: text, id: id}) do
-    suffix = " (memory " <> String.slice(id, 0, 8) <> ")"
+    suffix = " (memory " <> id <> ")"
 
     base =
       text
@@ -1641,7 +1738,13 @@ defmodule Loopctl.Memory do
     String.slice(base, 0, @graduation_title_max - String.length(suffix)) <> suffix
   end
 
-  defp propose_opts(opts), do: Keyword.take(opts, [:actor_id, :actor_label, :actor_type])
+  # Forward audit attribution to propose_article/3, plus the OWNER visibility agent id
+  # (= the memory's subject) so the create dedup/idempotency lookups resolve against the
+  # owner-visible graduated article (matches metadata.visibility = "owner").
+  defp propose_opts(%MemorySchema{subject_id: subject_id}, opts) do
+    [visibility_agent_id: subject_id] ++
+      Keyword.take(opts, [:actor_id, :actor_label, :actor_type])
+  end
 
   # Idempotent, conditional stamp: mark the memory graduated ONLY if still NULL, so a
   # concurrent stamp (two sweep ticks, or explicit + sweep) is a harmless no-op and the
