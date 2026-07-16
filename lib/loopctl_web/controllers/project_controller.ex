@@ -275,12 +275,20 @@ defmodule LoopctlWeb.ProjectController do
     end
   end
 
+  # Defense-in-depth cap on the length of each resolve identifier. HTTP
+  # request-line limits and the small per-tenant project count already bound the
+  # real cost, but this rejects a pathologically long value before it reaches the
+  # regex passes in repo_ref/1 and the leading-wildcard ILIKE scan.
+  @max_identifier_length 512
+
   @doc """
   GET /api/v1/projects/resolve
 
   Resolves a project from any of slug, repo_url, or name. Requires agent+ role.
-  Returns 200 with the project on a match, 404 when nothing matches, and 422
-  when no identifier was supplied.
+  Returns 200 with the project (and `matched_by`, the identifier that produced
+  the hit) on a match, 404 when nothing matches, 409 when a fuzzy identifier
+  matches more than one active project (ambiguous), and 422 when no identifier
+  was supplied or an identifier exceeds the length cap.
   """
   def resolve(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
@@ -291,15 +299,40 @@ defmodule LoopctlWeb.ProjectController do
       name: params["name"]
     ]
 
+    with :ok <- validate_identifier_lengths(opts),
+         {:ok, project, matched_by} <- resolve_result(tenant_id, opts) do
+      json(conn, %{project: project_json(project), matched_by: matched_by})
+    end
+  end
+
+  defp validate_identifier_lengths(opts) do
+    if Enum.any?(opts, fn {_key, value} ->
+         is_binary(value) and byte_size(value) > @max_identifier_length
+       end) do
+      {:error, :unprocessable_entity,
+       "Identifier values must be at most #{@max_identifier_length} characters"}
+    else
+      :ok
+    end
+  end
+
+  # Map the resolver's outcomes onto FallbackController clauses so this endpoint
+  # emits the standard error envelope (%{error: %{status, message}}) like every
+  # other action. :not_found flows straight through to the 404 clause; the
+  # {:ok, project, matched_by} success passes through unchanged.
+  defp resolve_result(tenant_id, opts) do
     case Projects.resolve_project(tenant_id, opts) do
-      {:ok, project} ->
-        json(conn, %{project: project_json(project)})
+      {:ok, project, matched_by} ->
+        {:ok, project, matched_by}
 
       {:error, :not_found} ->
-        conn |> put_status(:not_found) |> json(%{error: "not_found"})
+        {:error, :not_found}
+
+      {:error, :ambiguous} ->
+        {:error, :ambiguous_resolution}
 
       {:error, :no_identifier} ->
-        conn |> put_status(:unprocessable_entity) |> json(%{error: "no_identifier"})
+        {:error, :unprocessable_entity, "Provide slug, repo_url, or name"}
     end
   end
 
