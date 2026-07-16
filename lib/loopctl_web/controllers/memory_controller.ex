@@ -66,7 +66,12 @@ defmodule LoopctlWeb.MemoryController do
         "similarity) or `session` (short-term; requires `session_id` and `content`; " <>
         "`expires_at` is OPTIONAL — the server defaults it to now + the session-memory " <>
         "TTL and floors any supplied value up to the promotion sweep window, so a turn " <>
-        "is always promoted before it can be pruned). Returns 201 with the created " <>
+        "is always promoted before it can be pruned). An optional `project_id` (UUID) " <>
+        "partitions the memory to a project; absent/blank writes a tenant-wide (global) " <>
+        "memory. `project_id` is a partition key, NOT an isolation boundary, but it is " <>
+        "validated for tenant-ownership — a malformed value, or a well-formed UUID that " <>
+        "is not a project in the caller's own tenant, is rejected with a 422 " <>
+        "(`invalid_project_id`) rather than persisted. Returns 201 with the created " <>
         "memory. Subject to the full " <>
         ":authenticated chain (custody halt, witness header, rate limiting).",
     request_body: {"Memory params", "application/json", Schemas.MemoryCreateRequest},
@@ -85,11 +90,16 @@ defmodule LoopctlWeb.MemoryController do
     description:
       "Recalls the caller's own long-term memories most similar to `query` " <>
         "(cosine over an HNSW index), scoped to the key's `(tenant_id, subject_id)`. " <>
-        "The query is supplied in the request BODY. When embedding generation is " <>
+        "An optional `project_id` (UUID) partitions the result: absent/blank returns " <>
+        "GLOBAL (tenant-wide) memories only, while a present `project_id` returns the " <>
+        "merged `global ∪ that-project` set; another project's memories are excluded. " <>
+        "A malformed `project_id` is a 422 (`invalid_project_id`). The query is " <>
+        "supplied in the request BODY. When embedding generation is " <>
         "unavailable the response degrades to a recent-first text match with " <>
         "`meta.fallback: true` and a stable `meta.reason` (score is null on that " <>
         "path) — never a silent empty result. No silent hard cap: `limit` is " <>
-        "clamped to the vector-search max and `meta.underfilled` flags a short page.",
+        "clamped to the vector-search max and `meta.underfilled` flags a short page " <>
+        "(a small live scope, or a cross-subject/cross-project pool under-fill).",
     request_body: {"Recall params", "application/json", Schemas.MemoryRecallRequest},
     responses: %{
       200 => {"Recall results", "application/json", Schemas.MemoryRecallResponse},
@@ -220,16 +230,26 @@ defmodule LoopctlWeb.MemoryController do
             }
           })
 
-          # NOTE (review finding, disproven): the three clauses above are EXHAUSTIVE
+        # A body-supplied `project_id` that is malformed, nonexistent, or belongs to
+        # ANOTHER tenant (#411 Gap 2 tenancy fix): `Memory.remember/2` validates
+        # tenant-ownership BEFORE the RLS-bypassing insert, so the cross-tenant FK
+        # check is never the boundary gate. Both "foreign" and "nonexistent" collapse
+        # to the SAME 422 (no cross-tenant existence oracle), reusing the malformed-UUID
+        # `invalid_project_id` envelope so the three cases are indistinguishable.
+        {:error, :project_not_found} ->
+          invalid_project_id(conn)
+
+          # NOTE (review finding, disproven): the four clauses above are EXHAUSTIVE
           # for `Memory.remember/2`. Dialyzer's success typing proves the return is
           # exactly `{:ok, memory} | {:error, :quota_exceeded} | {:error,
-          # %Ecto.Changeset{}}` — the `remember_long_term/2` `:embedding_job` Multi
-          # step can only fail with an `Ecto.Changeset` (Oban validates the job via a
-          # changeset), so no non-changeset error term can reach here. A catch-all
-          # would be unreachable dead code (`pattern_match_cov`), and `@dialyzer`
-          # suppressions are forbidden. Dialyzer is the compile-time guard: if
-          # `remember/2` ever gains a new error shape, this case stops being total and
-          # the build breaks — a stronger contract than a runtime catch-all.
+          # :project_not_found} | {:error, %Ecto.Changeset{}}` — the
+          # `remember_long_term/2` `:embedding_job` Multi step can only fail with an
+          # `Ecto.Changeset` (Oban validates the job via a changeset), so no
+          # non-changeset error term can reach here. A catch-all would be unreachable
+          # dead code (`pattern_match_cov`), and `@dialyzer` suppressions are forbidden.
+          # Dialyzer is the compile-time guard: if `remember/2` ever gains a new error
+          # shape, this case stops being total and the build breaks — a stronger
+          # contract than a runtime catch-all.
       end
     end)
   end
@@ -489,15 +509,24 @@ defmodule LoopctlWeb.MemoryController do
   # PARTITION key (recall merges `global ∪ active-project`), NOT an isolation
   # boundary — so, unlike tenant_id/subject_id, it MAY come from the body, but it is
   # validated as a UUID here so a malformed value is a deterministic 422 rather than
-  # a downstream cast error. Absent/blank → global scope (`nil`); a valid UUID string
-  # → that project; anything else → `:error`.
+  # a downstream cast error. Absent/blank (including whitespace-only) → global scope
+  # (`nil`) — the value is trimmed before the blank check so `"   "` matches the
+  # schema's documented "absent/blank writes a tenant-wide (global) memory" wording
+  # rather than falling through to a spurious 422; a valid UUID string → that project;
+  # anything else → `:error`. (Tenant-ownership of a well-formed UUID is enforced
+  # separately at the context write path — see `Memory.remember/2`.)
   defp parse_project_id(nil), do: {:ok, nil}
-  defp parse_project_id(""), do: {:ok, nil}
 
   defp parse_project_id(value) when is_binary(value) do
-    case Ecto.UUID.cast(value) do
-      {:ok, uuid} -> {:ok, uuid}
-      :error -> :error
+    case String.trim(value) do
+      "" ->
+        {:ok, nil}
+
+      trimmed ->
+        case Ecto.UUID.cast(trimmed) do
+          {:ok, uuid} -> {:ok, uuid}
+          :error -> :error
+        end
     end
   end
 
@@ -510,7 +539,9 @@ defmodule LoopctlWeb.MemoryController do
       error: %{
         status: 422,
         code: "invalid_project_id",
-        message: "The `project_id` field must be a valid UUID."
+        message:
+          "The `project_id` field must be a valid UUID identifying a project in your " <>
+            "own tenant."
       }
     })
   end

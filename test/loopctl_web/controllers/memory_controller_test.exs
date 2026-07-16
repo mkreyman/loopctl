@@ -509,6 +509,67 @@ defmodule LoopctlWeb.MemoryControllerTest do
       assert body["error"]["code"] == "invalid_project_id"
       assert body["error"]["status"] == 422
     end
+
+    test "create with another tenant's project_id is rejected (no cross-tenant FK oracle/edge)",
+         %{conn: conn} do
+      # #411 Gap 2 tenancy fix: a well-formed UUID that exists in ANOTHER tenant must
+      # NOT be accepted. The insert runs on the BYPASSRLS AdminRepo, so the FK check
+      # would otherwise validate cross-tenant (a 201 for a foreign project = existence
+      # oracle + cross-tenant graph edge). Ownership is validated before the write, so
+      # a foreign project collapses to the SAME 422 as a nonexistent one (no oracle).
+      tenant = fixture(:tenant)
+      other_tenant = fixture(:tenant)
+      foreign_project = fixture(:project, %{tenant_id: other_tenant.id})
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      body =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory", %{
+          "tier" => "long_term",
+          "text" => "should not persist under a foreign project",
+          "project_id" => foreign_project.id
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_project_id"
+      assert body["error"]["status"] == 422
+
+      # A well-formed, nonexistent project_id (in no tenant) is indistinguishable —
+      # same 422, so the response is not an existence oracle.
+      nonexistent =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory", %{
+          "tier" => "long_term",
+          "text" => "should not persist under a nonexistent project",
+          "project_id" => Ecto.UUID.generate()
+        })
+        |> json_response(422)
+
+      assert nonexistent["error"]["code"] == "invalid_project_id"
+    end
+
+    test "create with a whitespace-only project_id is treated as global (blank), not a 422", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      created =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory", %{
+          "tier" => "long_term",
+          "text" => "blank project writes global",
+          "project_id" => "   "
+        })
+        |> json_response(201)
+
+      assert created["data"]["project_id"] == nil
+    end
   end
 
   # --- Quota-exceeded envelope over HTTP (create/2) ---

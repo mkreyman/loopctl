@@ -361,6 +361,53 @@ defmodule Loopctl.MemoryContextTest do
       assert g.id in fb_ids
       refute ma.id in fb_ids
     end
+
+    test "semantic path: project scoping compounds pool under-fill — meta.underfilled flags a project-scoped page starved by other-project pool dominance",
+         %{a: a, b: b} do
+      # The inner ANN over-fetch pool is sized for SUBJECT dilution only and is
+      # project-AGNOSTIC (project scoping is a SECOND outer filter, #411 Gap 2). So a
+      # subject whose nearest neighbours are dominated by OTHER-project rows can
+      # under-fill a project-scoped recall even when >= k in-scope rows exist beyond
+      # the pool horizon. In test the pool is capped at 6 (config/test.exs), so 6
+      # nearer other-project rows fully occupy it and push the one in-scope row past
+      # the horizon. `meta.underfilled` MUST surface that (the SAME accepted tradeoff
+      # as the cross-subject case verified at prod scale in `ScaleRecallTest` /
+      # US-28.5, here made deterministic with a tiny fixed pool + fixed embeddings).
+      near = List.replace_at(List.duplicate(0.0, 1536), 0, 1.0)
+      far = List.replace_at(List.duplicate(0.0, 1536), 1, 1.0)
+
+      # Deterministic distances: "NEAR"-tagged text (query + the 6 pool fillers) embeds
+      # to `near` (cosine distance 0), everything else to the orthogonal `far`
+      # (distance 1). Used at BOTH write time (inline embedding worker) and recall time.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
+        if String.contains?(text, "NEAR"), do: {:ok, near}, else: {:ok, far}
+      end)
+
+      # 6 other-project (proj_b) rows are the globally-nearest → they fill the whole
+      # size-6 pool.
+      for i <- 1..6 do
+        {:ok, _} = Memory.remember(b, %{tier: :long_term, text: "NEAR pool filler #{i}"})
+      end
+
+      # One in-scope (proj_a) row, FARTHER than every pool row → rank 7, beyond the
+      # size-6 pool horizon.
+      {:ok, in_scope} =
+        Memory.remember(a, %{tier: :long_term, text: "far in-scope alpha fact"})
+
+      %{results: results, meta: meta} = Memory.recall(a, query: "NEAR needle", limit: 1)
+
+      # The size-6 pool held only other-project rows, which the outer project filter
+      # discards → an empty page, flagged under-filled, even though an in-scope row
+      # exists beyond the horizon. This is the compounded post-pool selectivity the
+      # subject-only pool sizing does not account for.
+      assert meta.fallback == false
+      assert results == []
+      assert meta.underfilled
+
+      # Proof the in-scope row genuinely exists (it is simply beyond the pool horizon,
+      # not absent): the subject-scoped list surfaces it.
+      assert in_scope.id in default_list_ids(a)
+    end
   end
 
   # --- TC-28.2.5: supersede ---
