@@ -11,8 +11,8 @@ defmodule Loopctl.Repo.Migrations.AddProjectsTenantLowerNameIndex do
   """
 
   def change do
-    create index(:projects, [:tenant_id, "lower(name)"],
-             name: :projects_tenant_id_lower_name_index
-           )
+    create_if_not_exists index(:projects, [:tenant_id, "lower(name)"],
+                           name: :projects_tenant_id_lower_name_index
+                         )
   end
 end
