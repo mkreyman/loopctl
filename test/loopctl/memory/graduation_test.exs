@@ -132,6 +132,74 @@ defmodule Loopctl.Memory.GraduationTest do
       assert article.project_id == nil
     end
 
+    test "re_scope: :global on an ALREADY-graduated memory refuses loudly (no silent wrong-scope success)",
+         %{scope: scope, project: project, tenant: tenant} do
+      memory =
+        fixture(:memory,
+          tenant_id: scope.tenant_id,
+          subject_id: scope.subject_id,
+          project_id: project.id,
+          text: "worth globalizing after it proved itself in-project"
+        )
+
+      # First: default (project) graduation → a project-scoped article.
+      assert {:ok, _v1, project_article} = Memory.graduate_memory(scope, memory.id)
+      assert project_article.project_id == project.id
+
+      # A memory has at most one graduated article (the (tenant_id, title) unique index),
+      # so re_scope: :global on the now-graduated memory must NOT silently return the
+      # project article as success — it refuses loudly, leaving the project article intact.
+      assert {:error, :already_graduated} =
+               Memory.graduate_memory(scope, memory.id, re_scope: :global)
+
+      count =
+        from(a in Article, where: a.tenant_id == ^tenant.id) |> AdminRepo.aggregate(:count, :id)
+
+      assert count == 1
+    end
+
+    test "re_scope: :global works on a FIRST (ungraduated) graduation", %{
+      scope: scope,
+      project: project
+    } do
+      memory =
+        fixture(:memory,
+          tenant_id: scope.tenant_id,
+          subject_id: scope.subject_id,
+          project_id: project.id,
+          text: "globalize me on first graduation"
+        )
+
+      assert {:ok, _v, article} = Memory.graduate_memory(scope, memory.id, re_scope: :global)
+      assert article.project_id == nil
+    end
+
+    test "a fell-open novelty gate (embedding backend down) is NOT stamped and creates no article",
+         %{scope: scope, project: project, tenant: tenant} do
+      memory =
+        fixture(:memory,
+          tenant_id: scope.tenant_id,
+          subject_id: scope.subject_id,
+          project_id: project.id,
+          text: "content the gate could not assess"
+        )
+
+      # The gate falls open with :unknown when the embedding backend is unavailable.
+      Mox.stub(Loopctl.MockProposalAssessor, :assess, fn _tenant_id, _attrs, _opts ->
+        %{verdict: :unknown, score: nil, neighbors: []}
+      end)
+
+      # Automated/graduation callers pass on_gate_unavailable: :skip, so a fell-open
+      # assessment is a retryable error — no un-deduplicated article is injected and the
+      # memory stays eligible (graduated_at NULL) for a later tick once embeddings recover.
+      assert {:error, :gate_unavailable} = Memory.graduate_memory(scope, memory.id)
+      assert is_nil(reload(memory).graduated_at)
+
+      assert 0 ==
+               from(a in Article, where: a.tenant_id == ^tenant.id)
+               |> AdminRepo.aggregate(:count, :id)
+    end
+
     test "a foreign (other-subject/tenant) memory id returns :not_found — no cross-subject oracle",
          %{scope: scope, project: project} do
       memory =

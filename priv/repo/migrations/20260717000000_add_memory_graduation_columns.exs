@@ -15,9 +15,24 @@ defmodule Loopctl.Repo.Migrations.AddMemoryGraduationColumns do
   #     deduplicated all mean "now durable"). NULL = not yet graduated. The sweep skips
   #     a non-NULL row so a memory is graduated at most once.
   #
-  # `create_if_not_exists` on every column keeps the migration idempotent/re-runnable.
+  # `*_if_not_exists` on every column/index keeps the migration idempotent/re-runnable.
+  #
+  # CONCURRENTLY (no table lock) since `memories` is a live, write-hot OLTP table
+  # (written on every remember() insert, updated on every recall bump) — a plain
+  # CREATE INDEX would take an ACCESS EXCLUSIVE lock for the whole build and stall
+  # those writes during deploy. The DDL transaction + migration lock are disabled
+  # because CREATE INDEX CONCURRENTLY cannot run inside a transaction, matching the
+  # sibling `20260709000400_add_memories_tenant_inserted_at_index.exs` convention on
+  # this same table.
+  @disable_ddl_transaction true
+  @disable_migration_lock true
 
-  def change do
+  @index "memories_graduation_sweep_idx"
+
+  def up do
+    # Adding a column with a CONSTANT default is a fast, metadata-only operation on
+    # PG11+ (no table rewrite), so the three column adds do not block writes; only
+    # the index build needed CONCURRENTLY.
     alter table(:memories) do
       add_if_not_exists :recall_count, :integer, null: false, default: 0
       add_if_not_exists :last_recalled_at, :utc_datetime_usec, null: true
@@ -34,9 +49,20 @@ defmodule Loopctl.Repo.Migrations.AddMemoryGraduationColumns do
     # (`graduated_at IS NULL AND superseded_by IS NULL`) so the index stays small — it
     # only holds rows still eligible for graduation — and it is a plain btree that does
     # NOT touch the HNSW embedding indexes.
-    create_if_not_exists index(:memories, [:tenant_id, :recall_count],
-                           where: "graduated_at IS NULL AND superseded_by IS NULL",
-                           name: :memories_graduation_sweep_idx
-                         )
+    execute("""
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS #{@index}
+      ON memories (tenant_id, recall_count)
+      WHERE graduated_at IS NULL AND superseded_by IS NULL
+    """)
+  end
+
+  def down do
+    execute("DROP INDEX CONCURRENTLY IF EXISTS #{@index}")
+
+    alter table(:memories) do
+      remove_if_exists :recall_count, :integer
+      remove_if_exists :last_recalled_at, :utc_datetime_usec
+      remove_if_exists :graduated_at, :utc_datetime_usec
+    end
   end
 end

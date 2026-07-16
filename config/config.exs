@@ -484,7 +484,10 @@ config :loopctl, :session_memory_ttl_seconds, 3600
 # - recall_threshold: recall-count at/above which a memory is eligible to graduate.
 # - max_per_run: per-tick execution budget — the max memories one hourly sweep processes,
 #   bounding the novelty-gate embedding spend per run.
-# - scan_limit: max candidate rows a sweep tick scans across all tenants.
+# - scan_limit: max distinct TENANTS a sweep tick considers (a tenant cap, NOT a row cap).
+#   The sweep needs at most max_per_run tenants and pulls ~ceil(max_per_run / n_tenants)
+#   rows each, so worst-case candidate rows fetched per tick is ~2*max_per_run, not
+#   scan_limit*max_per_run.
 config :loopctl, :memory_graduation_recall_threshold, 3
 config :loopctl, :memory_graduation_max_per_run, 50
 config :loopctl, :memory_graduation_scan_limit, 500
@@ -494,6 +497,19 @@ config :loopctl, :memory_graduation_scan_limit, 500
 # same query in a tight loop cannot inflate the "frequently-recalled" signal and force premature
 # graduation. Genuine repeated value across sessions/time still accumulates across windows.
 config :loopctl, :memory_recall_bump_cooldown_seconds, 3600
+
+# Minimum cosine similarity a recalled memory must clear for its hotness bump to count
+# (`Loopctl.Memory.recall_bump_min_score/0`). recall returns the top-k by distance
+# regardless of absolute relevance, so without a floor a sparse subject scope (fewer than
+# k live memories) would auto-graduate low-relevance NOISE. Only a recall at/above this
+# similarity (`max(0.0, 1.0 - distance)`) bumps recall_count.
+config :loopctl, :memory_recall_bump_min_score, 0.6
+
+# Max concurrent in-flight recall-count bump tasks per node
+# (`Loopctl.Memory.RecallBumpTaskSupervisor` max_children). Bounds the fan-out of the
+# fire-and-forget async bump so a recall burst cannot spawn unbounded background writes
+# that starve the write pool — over the cap the bump is simply dropped (best-effort).
+config :loopctl, :memory_recall_bump_max_tasks, 200
 
 # Epic 30 / US-30.1: per-tenant cap on entity definitions
 # (`Loopctl.ContextRetriever.Registry`). Bounds the dynamic ListTools payload/

@@ -392,6 +392,12 @@ defmodule Loopctl.Knowledge do
   articles, and it falls open (`:unknown`) rather than blocking a write when the
   embedding backend is unavailable.
 
+  Pass `on_gate_unavailable: :skip` (default `:create`) so a fell-open `:unknown`
+  assessment returns `{:error, :gate_unavailable}` WITHOUT creating — for automated
+  callers that must not inject an un-deduplicated article during an embedding outage and
+  would rather retry once the gate can assess. Pass `embedding: vector` to reuse an
+  already-computed embedding of the assessed text instead of generating a new one.
+
   Returns `{:ok, result}` where `result` is a map:
 
       %{
@@ -407,6 +413,7 @@ defmodule Loopctl.Knowledge do
   @spec propose_article(Ecto.UUID.t() | nil, map(), keyword()) ::
           {:ok, map()}
           | {:error, :duplicate_title, Article.t()}
+          | {:error, :gate_unavailable}
           | {:error, Ecto.Changeset.t()}
   def propose_article(tenant_id, attrs, opts \\ []) do
     attrs = stringify_top_keys(attrs)
@@ -442,7 +449,21 @@ defmodule Loopctl.Knowledge do
     create_proposal(tenant_id, gated_attrs, assessment, opts, :gated_to_draft)
   end
 
-  # :novel or :unknown (gate fell open) — proceed on the requested path.
+  # :unknown — the gate FELL OPEN (embedding backend unavailable; it could not actually
+  # assess novelty). By DEFAULT this proceeds like :novel (create), preserving the
+  # never-block-a-write contract for interactive callers. An AUTOMATED caller that must
+  # not inject an un-deduplicated article during an outage passes
+  # `on_gate_unavailable: :skip`, which returns `{:error, :gate_unavailable}` WITHOUT
+  # creating, so the caller can retry once embeddings recover and dedup then.
+  defp gate_proposal(tenant_id, attrs, %{verdict: :unknown} = assessment, opts) do
+    if Keyword.get(opts, :on_gate_unavailable, :create) == :skip do
+      {:error, :gate_unavailable}
+    else
+      create_proposal(tenant_id, attrs, assessment, opts, :created)
+    end
+  end
+
+  # :novel — the gate assessed the proposal as genuinely new; create on the requested path.
   defp gate_proposal(tenant_id, attrs, assessment, opts) do
     create_proposal(tenant_id, attrs, assessment, opts, :created)
   end
