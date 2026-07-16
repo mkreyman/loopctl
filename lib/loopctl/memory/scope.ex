@@ -21,7 +21,12 @@ defmodule Loopctl.Memory.Scope do
 
   - `tenant_id` — the owning tenant UUID (required)
   - `subject_id` — the memory scope owner = the API-key identity (required)
-  - `project_id` — optional project UUID (`nil` = tenant-wide)
+  - `project_id` — optional project UUID. It is a PARTITION key, NOT an isolation
+    boundary (`tenant_id`/`subject_id` are). `nil` means GLOBAL — the rows whose
+    `project_id` column is NULL — NOT "every project in the tenant". On `recall/2`
+    a `nil` scope is therefore GLOBAL-ONLY (it does not union across projects), and
+    a present `project_id` recalls `global ∪ that project`. (#411 Gap 2 — see
+    `Loopctl.Memory.recall/2`.)
   - `session_id` — optional session identifier. Not an isolation key; carried on the
     scope only so the explicit promotion trigger `Loopctl.Memory.promote_session/1`
     (US-29.2) can accept a `%{scope | session_id: ...}` struct without a second

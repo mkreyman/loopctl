@@ -362,6 +362,49 @@ defmodule Loopctl.MemoryContextTest do
       refute ma.id in fb_ids
     end
 
+    test "a well-formed project_id owned by ANOTHER tenant (and a nonexistent one) recalls global-only with no cross-tenant/partition leak",
+         %{global: global, a: a} do
+      # Recall deliberately does NOT tenant-validate project_id (it is a partition key,
+      # not the isolation boundary — see Memory.recall/2). Its safety therefore rests
+      # ENTIRELY on the (tenant_id, subject_id) predicate bounding results. Prove it:
+      # a project_id belonging to a FOREIGN tenant, and a nonexistent well-formed UUID,
+      # must each yield exactly the caller's GLOBAL rows — never the foreign row, never
+      # the caller's OWN project-scoped row.
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+
+      # A separate tenant with its own project + a memory under the SAME subject_id
+      # string, so only the (tenant_id) predicate — not a subject mismatch — keeps it out.
+      other_tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(other_tenant.id)
+      foreign_proj = fixture(:project, %{tenant_id: other_tenant.id})
+
+      foreign_scope = %Scope{
+        tenant_id: other_tenant.id,
+        subject_id: global.subject_id,
+        project_id: foreign_proj.id
+      }
+
+      {:ok, foreign} =
+        Memory.remember(foreign_scope, %{tier: :long_term, text: "foreign widgets fact"})
+
+      # Caller (our tenant/subject) passes the FOREIGN tenant's project_id.
+      cross = %{global | project_id: foreign_proj.id}
+      cross_ids = default_recall_ids(cross, "widgets")
+
+      assert g.id in cross_ids
+      refute ma.id in cross_ids
+      refute foreign.id in cross_ids
+
+      # A well-formed but NONEXISTENT project_id → same global-only result.
+      nonexistent = %{global | project_id: Ecto.UUID.generate()}
+      nonexistent_ids = default_recall_ids(nonexistent, "widgets")
+
+      assert g.id in nonexistent_ids
+      refute ma.id in nonexistent_ids
+      refute foreign.id in nonexistent_ids
+    end
+
     test "semantic path: project scoping compounds pool under-fill — meta.underfilled flags a project-scoped page starved by other-project pool dominance",
          %{a: a, b: b} do
       # The inner ANN over-fetch pool is sized for SUBJECT dilution only and is

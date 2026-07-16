@@ -91,9 +91,17 @@ defmodule LoopctlWeb.MemoryController do
       "Recalls the caller's own long-term memories most similar to `query` " <>
         "(cosine over an HNSW index), scoped to the key's `(tenant_id, subject_id)`. " <>
         "An optional `project_id` (UUID) partitions the result: absent/blank returns " <>
-        "GLOBAL (tenant-wide) memories only, while a present `project_id` returns the " <>
+        "GLOBAL memories only (the rows whose `project_id` is NULL — NOT a union across " <>
+        "all your projects), while a present `project_id` returns the " <>
         "merged `global ∪ that-project` set; another project's memories are excluded. " <>
-        "A malformed `project_id` is a 422 (`invalid_project_id`). The query is " <>
+        "A malformed `project_id` is a 422 (`invalid_project_id`). NOTE the deliberate " <>
+        "asymmetry with `POST /memory` (create): recall does NOT tenant-validate a " <>
+        "well-formed `project_id`, because it is a partition key, not the isolation " <>
+        "boundary. A well-formed `project_id` that is a typo, stale, or owned by another " <>
+        "tenant is treated as an empty partition and returns your GLOBAL rows only with " <>
+        "NO error (never any other tenant's/subject's rows — the `(tenant_id, subject_id)` " <>
+        "predicate still bounds every result), whereas create 422s the same value. " <>
+        "The query is " <>
         "supplied in the request BODY. When embedding generation is " <>
         "unavailable the response degrades to a recent-first text match with " <>
         "`meta.fallback: true` and a stable `meta.reason` (score is null on that " <>
@@ -513,24 +521,39 @@ defmodule LoopctlWeb.MemoryController do
   # (`nil`) — the value is trimmed before the blank check so `"   "` matches the
   # schema's documented "absent/blank writes a tenant-wide (global) memory" wording
   # rather than falling through to a spurious 422; a valid UUID string → that project;
-  # anything else → `:error`. (Tenant-ownership of a well-formed UUID is enforced
-  # separately at the context write path — see `Memory.remember/2`.)
+  # anything else → `:error`. This gate is FORMAT-only. Tenant-ownership of a
+  # well-formed UUID is enforced separately AND ASYMMETRICALLY: the write path
+  # (`Memory.remember/2`) validates it and 422s a foreign/nonexistent project; the
+  # recall path deliberately does NOT (project_id is a partition key there, so an
+  # unowned id reads as an empty partition → global-only, no error). See
+  # `Loopctl.Memory.recall/2` for why.
   defp parse_project_id(nil), do: {:ok, nil}
 
   defp parse_project_id(value) when is_binary(value) do
     case String.trim(value) do
-      "" ->
-        {:ok, nil}
-
-      trimmed ->
-        case Ecto.UUID.cast(trimmed) do
-          {:ok, uuid} -> {:ok, uuid}
-          :error -> :error
-        end
+      "" -> {:ok, nil}
+      trimmed -> cast_project_uuid(trimmed)
     end
   end
 
   defp parse_project_id(_), do: :error
+
+  # Require the CANONICAL 36-char hyphenated form BEFORE `Ecto.UUID.cast`. `cast/1`
+  # alone also accepts a raw 16-BYTE binary (e.g. a 16-char ASCII string) and
+  # hex-encodes it, so a plainly-non-UUID value would slip through the format gate.
+  # Matching the hyphenated shape first makes the boundary a deterministic 422 for
+  # such input rather than deferring to a downstream lookup.
+  defp cast_project_uuid(trimmed) do
+    with true <- canonical_uuid?(trimmed),
+         {:ok, uuid} <- Ecto.UUID.cast(trimmed) do
+      {:ok, uuid}
+    else
+      _ -> :error
+    end
+  end
+
+  @uuid_format ~r/\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/
+  defp canonical_uuid?(value), do: Regex.match?(@uuid_format, value)
 
   defp invalid_project_id(conn) do
     conn
