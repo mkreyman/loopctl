@@ -216,6 +216,333 @@ defmodule Loopctl.ProjectsTest do
     end
   end
 
+  describe "resolve_project/2" do
+    test "resolves by exact slug" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id, slug: "loopctl"})
+
+      assert {:ok, found} = Projects.resolve_project(tenant.id, slug: "loopctl")
+      assert found.id == project.id
+    end
+
+    test "resolves by repo_url in https form" do
+      tenant = fixture(:tenant)
+
+      project =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "loopctl",
+          repo_url: "https://github.com/mkreyman/loopctl"
+        })
+
+      assert {:ok, found} =
+               Projects.resolve_project(tenant.id,
+                 repo_url: "https://github.com/mkreyman/loopctl"
+               )
+
+      assert found.id == project.id
+    end
+
+    test "resolves by repo_url in git@ ssh form (with .git suffix)" do
+      tenant = fixture(:tenant)
+
+      project =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "loopctl",
+          repo_url: "https://github.com/mkreyman/loopctl"
+        })
+
+      assert {:ok, found} =
+               Projects.resolve_project(tenant.id,
+                 repo_url: "git@github.com:mkreyman/loopctl.git"
+               )
+
+      assert found.id == project.id
+    end
+
+    test "resolves by repo_url in bare owner/repo form" do
+      tenant = fixture(:tenant)
+
+      project =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "loopctl",
+          repo_url: "git@github.com:mkreyman/loopctl.git"
+        })
+
+      assert {:ok, found} =
+               Projects.resolve_project(tenant.id, repo_url: "mkreyman/loopctl")
+
+      assert found.id == project.id
+    end
+
+    test "resolves by name case-insensitively" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id, name: "LoopCtl", slug: "loopctl"})
+
+      assert {:ok, found} = Projects.resolve_project(tenant.id, name: "loopctl")
+      assert found.id == project.id
+
+      assert {:ok, found2} = Projects.resolve_project(tenant.id, name: "LOOPCTL")
+      assert found2.id == project.id
+    end
+
+    test "slug takes precedence over name when both point to different projects" do
+      tenant = fixture(:tenant)
+
+      by_slug =
+        fixture(:project, %{tenant_id: tenant.id, name: "Slug Project", slug: "the-slug"})
+
+      _by_name =
+        fixture(:project, %{tenant_id: tenant.id, name: "the-slug", slug: "other-slug"})
+
+      assert {:ok, found} =
+               Projects.resolve_project(tenant.id, slug: "the-slug", name: "the-slug")
+
+      assert found.id == by_slug.id
+    end
+
+    test "repo_url takes precedence over name" do
+      tenant = fixture(:tenant)
+
+      by_repo =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          name: "Repo Project",
+          slug: "repo-project",
+          repo_url: "https://github.com/mkreyman/loopctl"
+        })
+
+      _by_name =
+        fixture(:project, %{tenant_id: tenant.id, name: "mkreyman/loopctl", slug: "name-project"})
+
+      assert {:ok, found} =
+               Projects.resolve_project(tenant.id,
+                 repo_url: "mkreyman/loopctl",
+                 name: "mkreyman/loopctl"
+               )
+
+      assert found.id == by_repo.id
+    end
+
+    test "prefers active project when multiple match by repo_url" do
+      tenant = fixture(:tenant)
+
+      archived =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "archived-repo",
+          repo_url: "https://github.com/mkreyman/loopctl"
+        })
+
+      Projects.archive_project(tenant.id, archived)
+
+      active =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "active-repo",
+          repo_url: "git@github.com:mkreyman/loopctl.git"
+        })
+
+      assert {:ok, found} =
+               Projects.resolve_project(tenant.id, repo_url: "mkreyman/loopctl")
+
+      assert found.id == active.id
+      assert found.status == :active
+    end
+
+    test "prefers active project when multiple match by name" do
+      tenant = fixture(:tenant)
+
+      archived =
+        fixture(:project, %{tenant_id: tenant.id, name: "Shared", slug: "archived-name"})
+
+      Projects.archive_project(tenant.id, archived)
+
+      active = fixture(:project, %{tenant_id: tenant.id, name: "Shared", slug: "active-name"})
+
+      assert {:ok, found} = Projects.resolve_project(tenant.id, name: "shared")
+      assert found.id == active.id
+      assert found.status == :active
+    end
+
+    test "returns not_found when no project matches" do
+      tenant = fixture(:tenant)
+      fixture(:project, %{tenant_id: tenant.id, slug: "exists"})
+
+      assert {:error, :not_found} =
+               Projects.resolve_project(tenant.id, slug: "missing")
+
+      assert {:error, :not_found} =
+               Projects.resolve_project(tenant.id, repo_url: "someone/else")
+
+      assert {:error, :not_found} = Projects.resolve_project(tenant.id, name: "nope")
+    end
+
+    test "returns no_identifier when no identifier supplied" do
+      tenant = fixture(:tenant)
+
+      assert {:error, :no_identifier} = Projects.resolve_project(tenant.id, [])
+      assert {:error, :no_identifier} = Projects.resolve_project(tenant.id, %{})
+
+      assert {:error, :no_identifier} =
+               Projects.resolve_project(tenant.id, slug: "", repo_url: "  ", name: nil)
+    end
+
+    test "accepts a map of options as well as a keyword list" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id, slug: "map-opts"})
+
+      assert {:ok, found} = Projects.resolve_project(tenant.id, %{slug: "map-opts"})
+      assert found.id == project.id
+    end
+
+    test "never resolves another tenant's project (slug)" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      _project = fixture(:project, %{tenant_id: tenant_b.id, slug: "cross-tenant"})
+
+      assert {:error, :not_found} =
+               Projects.resolve_project(tenant_a.id, slug: "cross-tenant")
+    end
+
+    test "never resolves another tenant's project (repo_url and name)" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      _project =
+        fixture(:project, %{
+          tenant_id: tenant_b.id,
+          name: "Cross Tenant",
+          slug: "cross-tenant",
+          repo_url: "https://github.com/mkreyman/loopctl"
+        })
+
+      assert {:error, :not_found} =
+               Projects.resolve_project(tenant_a.id, repo_url: "mkreyman/loopctl")
+
+      assert {:error, :not_found} =
+               Projects.resolve_project(tenant_a.id, name: "cross tenant")
+    end
+
+    test "does not raise on malformed repo_url input" do
+      tenant = fixture(:tenant)
+      fixture(:project, %{tenant_id: tenant.id, slug: "safe"})
+
+      assert {:error, :not_found} =
+               Projects.resolve_project(tenant.id, repo_url: ":::")
+
+      assert {:error, :not_found} =
+               Projects.resolve_project(tenant.id, repo_url: "just-one-segment")
+    end
+
+    test "exact repo_url match beats a same-owner/repo match on a different host" do
+      tenant = fixture(:tenant)
+
+      github =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "gh-app",
+          repo_url: "https://github.com/acme/app"
+        })
+
+      gitlab =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "gl-app",
+          repo_url: "https://gitlab.com/acme/app"
+        })
+
+      # Exact host should win over the mere owner/repo suffix match.
+      assert {:ok, found} =
+               Projects.resolve_project(tenant.id, repo_url: "https://gitlab.com/acme/app")
+
+      assert found.id == gitlab.id
+
+      assert {:ok, found2} =
+               Projects.resolve_project(tenant.id, repo_url: "https://github.com/acme/app")
+
+      assert found2.id == github.id
+    end
+
+    test "ignores decoy projects whose owner/repo does not match (bounded scan)" do
+      tenant = fixture(:tenant)
+
+      # Decoys with a different owner/repo must never be considered.
+      _decoy1 =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "decoy-1",
+          repo_url: "https://github.com/other/thing"
+        })
+
+      _decoy2 =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "decoy-2",
+          repo_url: "https://github.com/unrelated/repo"
+        })
+
+      target =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "target",
+          repo_url: "https://github.com/mkreyman/loopctl"
+        })
+
+      assert {:ok, found} =
+               Projects.resolve_project(tenant.id, repo_url: "mkreyman/loopctl")
+
+      assert found.id == target.id
+    end
+
+    test "degenerate repo_url normalizing to empty does not collide with a degenerate stored repo_url" do
+      tenant = fixture(:tenant)
+
+      # ".git" is a non-empty (castable) string that normalizes to "".
+      _degenerate =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "degenerate",
+          repo_url: ".git"
+        })
+
+      assert {:error, :not_found} =
+               Projects.resolve_project(tenant.id, repo_url: ".git")
+
+      assert {:error, :not_found} =
+               Projects.resolve_project(tenant.id, repo_url: "/")
+
+      assert {:error, :not_found} =
+               Projects.resolve_project(tenant.id, repo_url: "/.git")
+    end
+
+    test "resolves by name with mixed case (Postgres lower on both sides)" do
+      tenant = fixture(:tenant)
+
+      project =
+        fixture(:project, %{tenant_id: tenant.id, name: "MixedCase Project", slug: "mixed-case"})
+
+      assert {:ok, found} =
+               Projects.resolve_project(tenant.id, name: "mixedcase project")
+
+      assert found.id == project.id
+
+      assert {:ok, found2} =
+               Projects.resolve_project(tenant.id, name: "MIXEDCASE PROJECT")
+
+      assert found2.id == project.id
+
+      # NOTE: A non-ASCII case-folding assertion (e.g. "Café Ölçek" vs
+      # "café ölçek") is intentionally omitted: this DB's `lower()` locale does
+      # not fold accented uppercase, so such an assertion is not portable here.
+      # The fix's value is that BOTH sides now fold through the same Postgres
+      # `lower()` rather than mixing Elixir String.downcase/1 with SQL lower(),
+      # eliminating the cross-locale divergence regardless of the active locale.
+    end
+  end
+
   describe "update_project/4" do
     test "updates project name" do
       tenant = fixture(:tenant)

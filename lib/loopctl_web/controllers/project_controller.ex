@@ -21,7 +21,9 @@ defmodule LoopctlWeb.ProjectController do
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create, :update]
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
-  plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index, :show, :progress]
+
+  plug LoopctlWeb.Plugs.RequireRole,
+       [role: :agent] when action in [:index, :show, :progress, :resolve]
 
   # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
   plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :update, :delete]
@@ -93,6 +95,27 @@ defmodule LoopctlWeb.ProjectController do
     responses: %{
       200 => {"Archived project", "application/json", Schemas.ProjectResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:resolve,
+    summary: "Resolve project",
+    description:
+      "Resolves a project from any of slug, repo_url, or name (precedence: slug, repo_url, name). Requires agent+ role.",
+    parameters: [
+      slug: [in: :query, type: :string, description: "Exact project slug"],
+      repo_url: [
+        in: :query,
+        type: :string,
+        description: "Repository URL (ssh, https, or bare owner/repo)"
+      ],
+      name: [in: :query, type: :string, description: "Project name (case-insensitive)"]
+    ],
+    responses: %{
+      200 => {"Resolved project", "application/json", Schemas.ProjectResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"No identifier supplied", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -249,6 +272,34 @@ defmodule LoopctlWeb.ProjectController do
         {:error, %Ecto.Changeset{} = changeset} ->
           {:error, changeset}
       end
+    end
+  end
+
+  @doc """
+  GET /api/v1/projects/resolve
+
+  Resolves a project from any of slug, repo_url, or name. Requires agent+ role.
+  Returns 200 with the project on a match, 404 when nothing matches, and 422
+  when no identifier was supplied.
+  """
+  def resolve(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    opts = [
+      slug: params["slug"],
+      repo_url: params["repo_url"],
+      name: params["name"]
+    ]
+
+    case Projects.resolve_project(tenant_id, opts) do
+      {:ok, project} ->
+        json(conn, %{project: project_json(project)})
+
+      {:error, :not_found} ->
+        conn |> put_status(:not_found) |> json(%{error: "not_found"})
+
+      {:error, :no_identifier} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: "no_identifier"})
     end
   end
 
