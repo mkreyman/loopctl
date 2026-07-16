@@ -121,7 +121,7 @@ REST endpoint (`PATCH /api/v1/tenants/me/llm-config`), and the docs — so you (
 autonomous agent) can self-remediate without a human. Full agent-tenant lifecycle:
 [`docs/onboarding-agent-tenant.md`](../docs/onboarding-agent-tenant.md).
 
-## Tools (84)
+## Tools (89)
 
 > Plus **per-tenant generated Context Retriever tools** (`cr_*`) appended
 > dynamically at runtime — see [Dynamic per-tenant Context Retriever
@@ -133,6 +133,7 @@ autonomous agent) can self-remediate without a human. Full agent-tenant lifecycl
 |---|---|
 | `get_tenant` | Get current tenant info. Use to verify connectivity. |
 | `list_projects` | List all projects in the current tenant. |
+| `resolve_project` | Resolve a repo to its `project_id` in one cheap call — provide any of `slug`, `repo_url` (`git@github.com:owner/repo.git`, `https://github.com/owner/repo`, and bare `owner/repo` all match), or `name`. Precedence `slug > repo_url > name`, first match wins. Use the returned `id` to scope captures/recall (`memory_*`, `recall_context`). `404` `not_found` if nothing matches, `422` `no_identifier` if none supplied, `409` if a fuzzy identifier matches more than one active project. |
 | `create_project` | Create a new project in the current tenant. |
 | `delete_project` | **Requires `LOOPCTL_USER_KEY`.** Delete a project and all of its dependent resources (epics, stories, audit entries). Irreversible — orchestrator role is not sufficient. |
 | `get_progress` | Get progress summary for a project, including story counts by status. Pass `include_cost=true` for cost data. |
@@ -244,6 +245,8 @@ it is enforced server-side and a no-op for a non-superadmin key — see below.)
 | `memory_list` | List your own long-term memories, newest first, paginated with `meta.total_count/limit/offset` (the true scoped count, never silently capped by `limit`). Optional: `limit`, `offset`, `include_superseded`, `all_subjects` (superadmin only; ignored for non-superadmin keys). |
 | `memory_forget` | Delete one of your own long-term memories by id. A foreign-subject, foreign-tenant, or unknown id returns 404 (no existence leak). Required: `id`. |
 | `memory_promote` | Call at session end to compile this session's short-term (`session`-tier) memory into durable `long_term` memory — unlike `memory_remember` (a single explicit write), this compiles the whole session in one shot; fire it once at session end, not per turn. Returns 202 with `{job_id, session_id, status: "enqueued"}` — promotion runs asynchronously, so the resulting memory is recallable via `memory_recall` only after the worker drains. You can only promote your own sessions (scope resolved server-side from your key). Required: `session_id`. |
+| `recall_context` | ONE round-trip returning the re-ranked `global ∪ active-project` union of long-term MEMORY **and** KNOWLEDGE for `query` — what you previously assembled by calling `memory_recall` and `knowledge_search` separately. Pass `project_id` (from `resolve_project`) to merge global with that project on both sides; absent → global-only. The knowledge half is combined-search *summaries* (not full bodies — use `knowledge_context` for those). Response carries merged `results` (each tagged `source: memory\|knowledge`) plus the untouched per-source `memory`/`knowledge` envelopes; `meta.degraded?` flags a one-sided degrade (the other side is still returned — never a 500). A blank query, or one over 500 chars, is a `422` up front. Required: `query`. Optional: `project_id`, `limit`. |
+| `memory_graduate` | Graduate ONE of your long-term memories into a durable Knowledge Wiki article — the explicit, on-demand version of the hourly graduation sweep. Use when a private memory has proven valuable enough to become shared knowledge. Scope is key-derived (you can only graduate your OWN memory; a foreign/unknown `memory_id` → 404). DEDUPED by the novelty gate: `data.verdict` is `created` (novel → published) or `gated_to_draft` (near-dup → review draft) with a new article (**201**), or `duplicate`/`deduplicated` (already represented → canonical article, nothing created) (**200**). By default the article inherits the memory's project scope; pass `re_scope: "global"` to promote a PROJECT memory to a tenant-wide article — only valid on its FIRST graduation (`409` `already_graduated` otherwise). `503` `gate_unavailable` if the embedding backend is down — retry later. Required: `memory_id`. Optional: `re_scope` (`inherit`\|`global`). |
 
 ### Knowledge Management Tools (orchestrator key)
 

@@ -20,12 +20,21 @@ references: `docs/context-retriever.md`, `docs/agent-memory.md`,
   `POST /api/v1/retrieve/:entity`. Parameterized (never model SQL), dual
   tenant-scoped, allowlist-shaped, audited (fail-closed), rate-limited. Use to
   query live operational state by a structured filter or full-text search.
-- **`memory_*` — Agent Memory** (Epic 28; `Loopctl.Memory`; tables
+- **`memory_*` — Agent Memory** (Epic 28 / #411; `Loopctl.Memory`; tables
   `memories`/`session_memories`): PRIVATE to your `(tenant, subject_id)` scope.
   Use for facts, preferences, and observations THIS agent learned about ITS
   task/user and needs to recall later. `long_term` = vector-embedded +
-  semantically recalled; `session` = chronological + TTL-pruned. Tools:
-  `memory_remember`, `memory_recall`, `memory_list`, `memory_forget`.
+  semantically recalled; `session` = chronological + TTL-pruned. An optional
+  `project_id` PARTITIONS a memory (global vs project); it is NOT the isolation
+  boundary (`(tenant, subject_id)` is) — resolve a repo to its `project_id` with
+  `resolve_project`. Tools: `memory_remember`, `memory_recall`, `memory_list`,
+  `memory_forget`, `memory_promote` (compile a finished session's short-term turns
+  into long-term memory), `memory_graduate` (graduate a proven-valuable long-term
+  memory INTO a shared `knowledge_*` article — the bridge between the private and
+  shared surfaces; `re_scope: "global"` promotes a project memory tenant-wide), and
+  `recall_context` (ONE round-trip returning the merged, re-ranked `global ∪
+  active-project` union of memory AND knowledge — prefer it over separate
+  `memory_recall` + `knowledge_search` calls).
 - **`knowledge_*` — Knowledge Wiki**: SHARED, curated tenant DOCUMENTS, deduped and
   linked. Use when the insight is worth ANOTHER agent reading.
   - **`knowledge_hybrid_search`** (Epic 31): resolves a query to a governed

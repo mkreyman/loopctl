@@ -321,6 +321,10 @@ defmodule LoopctlWeb.Router do
     # Literal /memory/promote must precede the parameterized delete so it is not
     # captured as an :id (US-29.3).
     post "/memory/promote", MemoryController, :promote
+    # Literal /memory/graduate (#411 Gap 3 surface) — explicit per-memory graduation
+    # into a durable knowledge article. Like /memory/promote it MUST precede the
+    # parameterized delete below so it is not captured as an :id.
+    post "/memory/graduate", MemoryController, :graduate
     post "/memory", MemoryController, :create
     get "/memory", MemoryController, :index
     delete "/memory/:id", MemoryController, :delete

@@ -3323,6 +3323,73 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule MemoryGraduateRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryGraduateRequest",
+      description:
+        "Params for POST /memory/graduate (#411 Gap 3). Scope (tenant_id/subject_id) is " <>
+          "derived from the API key — only `memory_id` and the optional `re_scope` are " <>
+          "read from the body.",
+      type: :object,
+      required: [:memory_id],
+      properties: %{
+        memory_id: %Schema{
+          type: :string,
+          format: :uuid,
+          description:
+            "UUID of the caller's OWN long-term memory to graduate into a knowledge article."
+        },
+        re_scope: %Schema{
+          type: :string,
+          enum: ["inherit", "global"],
+          description:
+            "Article scope. `inherit` (default) keeps the memory's own `project_id` " <>
+              "(project memory → project article, global memory → global article). " <>
+              "`global` promotes a PROJECT memory to a tenant-wide (project_id: null) " <>
+              "article — only valid on the memory's FIRST graduation."
+        }
+      }
+    })
+  end
+
+  defmodule MemoryGraduateResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryGraduateResponse",
+      description:
+        "Result of graduating a memory into a durable knowledge article. `verdict` is the " <>
+          "novelty-gate outcome; `created` is true only when a new article was materialized " <>
+          "(`created`/`gated_to_draft`), false for a dedup (`duplicate`/`deduplicated`). The " <>
+          "`article` is a body-less summary — fetch the full body via GET /articles/:id.",
+      type: :object,
+      properties: %{
+        data: %Schema{
+          type: :object,
+          properties: %{
+            verdict: %Schema{
+              type: :string,
+              enum: ["created", "gated_to_draft", "duplicate", "deduplicated"],
+              description: "The novelty-gate verdict for the graduated content."
+            },
+            created: %Schema{
+              type: :boolean,
+              description: "Whether a NEW article (published or review draft) was materialized."
+            },
+            article: %Schema{
+              type: :object,
+              description: "Body-less summary of the resulting (created or canonical) article."
+            }
+          }
+        }
+      }
+    })
+  end
+
   defmodule MemoryListResponse do
     @moduledoc false
     require OpenApiSpex

@@ -117,6 +117,16 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/memory"},
                {:post, "/api/v1/memory/recall"},
                {:post, "/api/v1/memory/promote"},
+               # graduate (#411 Gap 3) creates a knowledge article — a WRITE — but so does
+               # /memory/promote (allowlisted above) and knowledge_create, both
+               # agent-reachable. It is the explicit, on-demand trigger for the same
+               # memory→knowledge graduation the hourly sweep runs, over the agent's OWN
+               # memory under the same (tenant, subject) key-derived scope. Gating it behind
+               # human-anchor would make the on-demand path unreachable for the KB-tier
+               # agent that is its intended user, so it is allowlisted alongside its
+               # memory_* siblings. MemoryController carries NO RequireHumanAnchor plug
+               # (RequireRole :agent only), so this classification is consistent.
+               {:post, "/api/v1/memory/graduate"},
                {:delete, "/api/v1/memory/:id"},
                # Merged recall (#411 Gap 2) — a POST-shaped READ returning the
                # re-ranked global ∪ active-project union of agent memory + knowledge,

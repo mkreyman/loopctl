@@ -163,6 +163,159 @@ during a halt.
 
 ---
 
+## Project scope — the `project_id` PARTITION key (#411)
+
+Every memory row also carries an optional **`project_id`**. It **partitions** a
+subject's memories into a **global** bucket (`project_id IS NULL` — tenant-wide,
+cross-project) and one bucket **per project**. Crucially:
+
+- **`project_id` is a PARTITION key, NOT the isolation boundary.** The isolation
+  boundary is still `(tenant_id, subject_id)` — always key-derived, never
+  body-supplied. `project_id` only narrows *which of the subject's own memories*
+  a read sees; it can never cross the subject/tenant boundary.
+- **Write** (`POST /api/v1/memory`): an absent/blank `project_id` writes a
+  **global** memory; a present one partitions the memory to that project. On
+  write, `project_id` **is** tenant-validated — a malformed value, or a
+  well-formed UUID that is not a project in the caller's own tenant, is a `422`
+  (`invalid_project_id`), never a silently mis-scoped row.
+- **Recall** merges **`global ∪ active-project`**: an absent/blank `project_id`
+  returns **global-only** memories; a present one returns the union of global +
+  that project (another project's memories are excluded). Recall deliberately
+  does **NOT** tenant-validate a well-formed `project_id` (it's a partition key
+  there): a stale/typo/foreign UUID reads as an *empty partition* → your global
+  rows only, with **no error** (the `(tenant, subject)` predicate still bounds
+  every result). This asymmetry with write is intentional.
+
+### Resolving a repo → `project_id` (`resolve_project`, #411 Gap 1)
+
+Agents know their repo, not the project UUID. `Loopctl.Projects.resolve_project/2`
+maps a `repo_url` / `slug` / `name` to a `project_id` in one cheap call:
+
+| Surface | |
+|---------|--|
+| Context | `Loopctl.Projects.resolve_project/2` |
+| HTTP | `GET /api/v1/projects/resolve?repo_url=…` (or `slug=` / `name=`) |
+| MCP | `resolve_project` |
+
+Precedence is `slug > repo_url > name`, first match wins; `repo_url` accepts
+`git@github.com:owner/repo.git`, `https://github.com/owner/repo`, and bare
+`owner/repo`. Returns the project (use its `id` to scope captures/recall), `404`
+`not_found` if nothing matches, `422` `no_identifier` if none supplied, `409`
+`ambiguous_resolution` if a fuzzy identifier matches more than one active project.
+
+### Merged recall — `POST /api/v1/recall` (`recall_context`, #411 Gap 2)
+
+One round-trip returning the re-ranked **`global ∪ active-project` union of
+long-term MEMORY *and* KNOWLEDGE** — what a harness previously assembled by
+calling `/memory/recall` and `/knowledge/search` separately.
+
+| Surface | |
+|---------|--|
+| Context | `Loopctl.Memory.recall_context/2` |
+| HTTP | `POST /api/v1/recall` `{query, project_id?, limit?}` |
+| MCP | `recall_context` |
+
+- The knowledge half is the **combined SEARCH** (article *summaries* —
+  `{id, title, category, tags, score, snippet}`), **not** the deep-read
+  `/knowledge/context` (full bodies + linked refs). Callers needing full bodies
+  still call `/knowledge/context`.
+- Response carries the merged `results` (each tagged `source: "memory" |
+  "knowledge"`, sorted by a heuristically-comparable `score` DESC —
+  `meta.results_ranking: "heuristic_cross_source"`) **plus** the untouched
+  per-source `memory` and `knowledge` envelopes so callers can re-rank.
+  Cross-source scores are heuristic, not calibrated.
+- **Query validation up front**: a non-string / blank / whitespace-only `query`
+  is `422` (`invalid_query`); a query longer than **500 characters** is `422`
+  (`query_too_long`) — rejected *before* any embedding is generated, matching
+  `/knowledge/search` (never a half-degraded memory-only 200).
+- **Degraded path (never a 500):** if the knowledge side errors or degrades to
+  keyword-only, OR the memory heavy-read pool is shed under the per-tenant cap,
+  the *other* side is still returned with `meta.degraded?: true` (and
+  `meta.degraded_reason` naming why). Agent-role keys are forced to **published**
+  articles and their own/`shared` memories (#163).
+
+---
+
+## Graduation — HOT memory → durable knowledge (#411 Gap 3)
+
+The tier *above* long-term memory. A long-term memory that has proven valuable —
+recalled often enough — is written back into the **curated Knowledge Wiki** as a
+durable article, DEDUPED by the same **novelty gate** (`propose_article/3`) that
+guards every agent write-back. This is how a subject's *private* working memory
+graduates into *shared* tenant knowledge.
+
+### Recall-count hotness signal (off the hot path)
+
+Recall bumps a memory's `recall_count` (+ `last_recalled_at`) so "frequently
+recalled = proven valuable" is measurable — but the bump is deliberately
+conservative so the signal stays honest:
+
+- **Off the hot path**: the bump is a fire-and-forget async write (bounded by
+  `memory_recall_bump_max_tasks` = **200** concurrent tasks/node; over the cap it
+  is simply dropped — best-effort, never blocks recall).
+- **Relevance floor**: only a recall whose cosine similarity clears
+  `memory_recall_bump_min_score` = **0.6** counts, so a sparse subject scope
+  doesn't auto-inflate low-relevance noise.
+- **Cooldown**: a given memory is bumped at most once per
+  `memory_recall_bump_cooldown_seconds` = **3600** s, so a tight single-agent
+  recall loop can't game graduation.
+- The **degraded ILIKE fallback path never bumps** (keeps the hotness signal
+  clean).
+
+### The hourly sweep (`MemoryGraduationSweepWorker`)
+
+`Loopctl.Workers.MemoryGraduationSweepWorker` runs **hourly** and graduates
+not-yet-graduated (`graduated_at IS NULL`) memories at or above the recall
+threshold:
+
+- **Threshold** — `memory_graduation_recall_threshold` = **3** recalls.
+- **Per-run budget** — at most `memory_graduation_max_per_run` = **50** memories
+  graduated per tick.
+- **Scan fan-out** — `memory_graduation_scan_limit` = **500** bounds the
+  distinct-tenant scan; round-robin fairness keeps one busy tenant from starving
+  others (worst-case candidate rows per tick ≈ `2 * max_per_run`, not
+  `scan_limit * max_per_run`).
+- Each candidate is graduated via the novelty gate and **stamped `graduated_at`**
+  on any durable verdict, so it is never re-processed. A **fell-open** gate
+  (embedding backend down) is NOT stamped — the memory re-graduates and dedups
+  once embeddings recover. The sweep **never re-scopes** (a project memory
+  graduates to a project article).
+
+### Explicit, on-demand graduation (`memory_graduate`)
+
+`Loopctl.Memory.graduate_memory/3` is the explicit per-memory trigger — the
+on-demand version of the sweep, now reachable by agents:
+
+| Surface | |
+|---------|--|
+| Context | `Loopctl.Memory.graduate_memory/3` |
+| HTTP | `POST /api/v1/memory/graduate` `{memory_id, re_scope?}` |
+| MCP | `memory_graduate` |
+
+- Scope is key-derived — a caller may only graduate its **own** memory; a
+  foreign/nonexistent `memory_id` is `404` (no cross-subject existence oracle). A
+  malformed `memory_id` is `422` (`invalid_memory_id`).
+- The novelty-gate `verdict` drives the status: `created` (novel → published) or
+  `gated_to_draft` (near-duplicate → unpublished review draft) → **201** with a
+  new article; `duplicate` / `deduplicated` (already represented → the canonical
+  article, nothing created) → **200**. The response `data` carries
+  `{verdict, created, article}` (a body-less article summary — fetch the full
+  body via `GET /articles/:id`).
+- **local→global re-scope**: by default the article inherits the memory's
+  `project_id` (project memory → project article, global memory → global
+  article). Pass `re_scope: "global"` to promote a **project** memory to a
+  tenant-wide (`project_id: null`) article. This is the **only** way graduation
+  re-scopes — the sweep never does, because over-generalizing a project fact to
+  tenant-wide is a mis-scoping the novelty gate cannot catch.
+- A memory has **at most one** graduated article (the `(tenant_id, title)` unique
+  index). So `re_scope: "global"` on an **already-graduated** memory returns
+  `409` (`already_graduated`) rather than silently returning the wrong-scoped
+  article — globalize on the **first** graduation instead. If the gate falls open
+  (embedding backend down) graduation returns `503` (`gate_unavailable`) and
+  stamps nothing — retry once embeddings recover.
+
+---
+
 ## PII / secret stance
 
 **Memory text leaves the tenant boundary to a third-party embedding provider.**
@@ -195,16 +348,22 @@ the tenant owns that exposure.
 |-----------|----------------------------|----------|----------|
 | Write | `remember/2` | `POST /api/v1/memory` | `memory_remember` |
 | Recall (semantic) | `recall/2` | `POST /api/v1/memory/recall` | `memory_recall` |
+| Merged recall (memory ∪ knowledge) | `recall_context/2` | `POST /api/v1/recall` | `recall_context` |
 | List (long-term) | `list/2` | `GET /api/v1/memory` | `memory_list` |
 | Forget | `forget/2` | `DELETE /api/v1/memory/:id` | `memory_forget` |
+| Promote (session → long-term) | `promote_session/1` | `POST /api/v1/memory/promote` | `memory_promote` |
+| Graduate (memory → knowledge) | `graduate_memory/3` | `POST /api/v1/memory/graduate` | `memory_graduate` |
+| Resolve repo → `project_id` | `Loopctl.Projects.resolve_project/2` | `GET /api/v1/projects/resolve` | `resolve_project` |
 | Session history | `session_history/2` | — | — |
 | Supersede | `supersede/3` | — | — |
 | Oversight list/delete | `list_all_subjects/2` / `forget_any/2` | `?all_subjects=true` / `DELETE :id` (superadmin) | via `memory_list`/`memory_forget` |
 
-The MCP layer calls the HTTP API (not the context). There are exactly **four**
-`memory_*` tools — `session_history/2` and `supersede/3` are context-level seams
-with no MCP tool. The MCP tools expose **no** `tenant_id`/`subject_id` parameter,
-so a cross-scope read is not even expressible there (scope is key-derived).
+The MCP layer calls the HTTP API (not the context). `session_history/2` and
+`supersede/3` are context-level seams with no MCP tool. The memory-substrate MCP
+tools expose **no** `tenant_id`/`subject_id` parameter, so a cross-scope read is
+not even expressible there (scope is key-derived); only `project_id` — a
+partition key, not the isolation boundary — is caller-supplied on the
+project-aware surfaces.
 
 Every read path returns the **pinned envelope**:
 

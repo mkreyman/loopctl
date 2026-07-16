@@ -5,6 +5,33 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.42.0 — 2026-07-16 (#411 — agent-memory substrate: resolve_project, recall_context, memory_graduate)
+
+### Added
+
+- **`resolve_project`** (#411 Gap 1) — resolve a repo to its `project_id` in one
+  call over `GET /api/v1/projects/resolve`. Accepts any of `slug`, `repo_url`
+  (SSH, HTTPS, or bare `owner/repo`), or `name` (precedence `slug > repo_url >
+  name`). Use the returned `id` to scope `memory_*` / `recall_context`.
+- **`recall_context`** (#411 Gap 2) — ONE round-trip over `POST /api/v1/recall`
+  returning the re-ranked `global ∪ active-project` union of long-term MEMORY and
+  KNOWLEDGE (combined-search summaries) for a `query`, each result tagged
+  `source: memory|knowledge`, plus the untouched per-source `memory`/`knowledge`
+  envelopes. Prefer over separate `memory_recall` + `knowledge_search`. Pass
+  `project_id` (from `resolve_project`) to merge global with that project.
+- **`memory_graduate`** (#411 Gap 3) — graduate one of your long-term memories
+  into a durable Knowledge Wiki article over `POST /api/v1/memory/graduate` — the
+  explicit, on-demand version of the hourly graduation sweep. DEDUPED by the
+  novelty gate (`data.verdict` `created`/`gated_to_draft` → new article, 201;
+  `duplicate`/`deduplicated` → canonical article, 200). `re_scope: "global"`
+  promotes a project memory tenant-wide on its FIRST graduation. Scope is
+  key-derived (foreign/unknown `memory_id` → 404).
+- **Publish note.** `resolve_project` and `recall_context` shipped to `index.js`
+  in #411 Gaps 1–2 without a version bump, so the published `loopctl-mcp-server`
+  (2.41.0) lacked them; this 2.42.0 bump publishes all three new tools together.
+  All ride the existing authenticated/witness pipeline (agent key, shared
+  `apiCall` + witness-STH). Additive only. Tool count → 89.
+
 ## 2.41.0 — 2026-07-11 (US-31.4 — hybrid retrieval + progressive disclosure tools)
 
 ### Added
