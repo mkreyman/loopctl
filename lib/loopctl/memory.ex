@@ -1652,11 +1652,15 @@ defmodule Loopctl.Memory do
 
   ## Reachability
 
-  This is a PROGRAMMATIC primitive: `graduate_memory/3` (explicit, incl. `re_scope:
-  :global`) and `MemoryGraduationSweepWorker` (the hourly cadence, which never re-scopes)
-  are its only callers. It is NOT wired to an HTTP/MCP endpoint today, so the `re_scope:
-  :global` path is reachable only from code — exposing an on-demand graduate primitive to
-  agents is a deliberate, un-taken product decision.
+  `graduate_memory/3` (explicit, incl. `re_scope: :global`) and
+  `MemoryGraduationSweepWorker` (the hourly cadence, which never re-scopes) are its
+  callers. The explicit primitive is now exposed on-demand to agents via
+  `POST /api/v1/memory/graduate` (`MemoryController.graduate/2`) and the MCP
+  `memory_graduate` tool — including the `re_scope: :global` path, driven by the
+  endpoint's `re_scope` param (enum `"inherit"`/`"global"`). Ownership is enforced by the
+  `(tenant_id, subject_id)` scope in `graduate_memory/3`, and the explicit path
+  deliberately bypasses the sweep's recall-threshold/per-run caps (see
+  `MemoryController.graduate/2` for the cost-model rationale).
 
   Options: `:re_scope` (`:global` → `project_id: nil`); `:actor_id`/`:actor_label`/
   `:actor_type` are forwarded to `propose_article/3` for audit attribution.

@@ -48,6 +48,7 @@ defmodule LoopctlWeb.MemoryController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Memory
   alias Loopctl.Memory.Scope
+  alias LoopctlWeb.AuditContext
   alias LoopctlWeb.Helpers.Visibility
   alias LoopctlWeb.MemoryJSON
   alias LoopctlWeb.RecallJSON
@@ -225,7 +226,9 @@ defmodule LoopctlWeb.MemoryController do
         "gate: `verdict` is `created` (novel → published) or `gated_to_draft` (near-dup → " <>
         "unpublished draft) with 201, or `duplicate`/`deduplicated` (already represented → " <>
         "the canonical article, nothing created) with 200. A malformed `memory_id` is a " <>
-        "422 (`invalid_memory_id`). If the novelty gate falls open because the embedding " <>
+        "422 (`invalid_memory_id`); a `re_scope` outside the {`inherit`, `global`} enum is " <>
+        "a 422 (`invalid_re_scope`) — it is NEVER silently treated as `inherit`. If the " <>
+        "novelty gate falls open because the embedding " <>
         "backend is down it returns 503 (`gate_unavailable`) WITHOUT stamping — retry once " <>
         "embeddings recover. Subject to the full :authenticated write chain (custody halt, " <>
         "witness header, rate limiting).",
@@ -243,7 +246,7 @@ defmodule LoopctlWeb.MemoryController do
         {"Memory already graduated (re_scope on an already-graduated memory)", "application/json",
          Schemas.ErrorResponse},
       422 =>
-        {"Malformed memory_id, invalid structural content, or subject unresolvable",
+        {"Malformed memory_id, out-of-enum re_scope, invalid structural content, or subject unresolvable",
          "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 =>
@@ -551,19 +554,37 @@ defmodule LoopctlWeb.MemoryController do
   end
 
   @doc "POST /api/v1/memory/graduate"
+  # Cost model — DELIBERATELY no per-tenant graduation budget and no
+  # `graduation_recall_threshold`/`graduation_max_per_run` caps (unlike `promote/2`'s
+  # 429 per-hour budget and unlike `MemoryGraduationSweepWorker`'s recall-gated, per-run
+  # capped cadence). Graduation is a bounded, one-shot-per-memory write that REUSES the
+  # memory's existing `vector(1536)` embedding when present (only paying an embedding
+  # round-trip for a not-yet-embedded memory), whereas promotion triggers an LLM synthesis
+  # call — so the expensive-per-call budget promote needs does not apply here. The
+  # recall-count threshold is a sweep QUALITY signal (graduate only well-recalled memories
+  # automatically); an explicit, caller-triggered graduation intentionally opts out of it,
+  # and the general `RateLimiter` still throttles abuse. Revisit if graduation gains an
+  # unconditional embedding or LLM cost.
   def graduate(conn, params) do
-    case parse_memory_id(params["memory_id"]) do
-      {:ok, memory_id} ->
-        graduate_with_id(conn, params, memory_id)
-
-      :error ->
-        invalid_memory_id(conn)
+    with {:ok, memory_id} <- parse_memory_id(params["memory_id"]),
+         {:ok, re_scope_opts} <- parse_re_scope(params["re_scope"]) do
+      graduate_with_id(conn, memory_id, re_scope_opts)
+    else
+      # `parse_memory_id/1` returns a bare `:error`; `parse_re_scope/1` a tagged tuple.
+      :error -> invalid_memory_id(conn)
+      {:error, :invalid_re_scope} -> invalid_re_scope(conn)
     end
   end
 
-  defp graduate_with_id(conn, params, memory_id) do
+  defp graduate_with_id(conn, memory_id, re_scope_opts) do
     with_scope(conn, fn %Scope{} = scope ->
-      case Memory.graduate_memory(scope, memory_id, graduate_opts(params)) do
+      # Attribute the graduated article to the calling api_key (or the impersonating
+      # superadmin), mirroring ArticleController.create — the sweep worker attributes to
+      # `memory_graduation_sweep`, so an on-demand, caller-triggered write must not land
+      # unattributed in the curation/audit log. `propose_opts/2` picks the actor keys.
+      graduate_opts = re_scope_opts ++ AuditContext.from_conn(conn)
+
+      case Memory.graduate_memory(scope, memory_id, graduate_opts) do
         # `:created` / `:gated_to_draft` materialized a NEW article (a published one, or an
         # unpublished review draft) → 201. `:duplicate` / `:deduplicated` returned the
         # canonical EXISTING article (nothing created) → 200. Mirrors ArticleController's
@@ -622,13 +643,32 @@ defmodule LoopctlWeb.MemoryController do
     end)
   end
 
-  # `re_scope: "global"` maps to `re_scope: :global` (local→global graduation); absent or
-  # `"inherit"` keeps the memory's own scope (the default — no opt passed).
-  defp graduate_opts(params) do
-    case params["re_scope"] do
-      "global" -> [re_scope: :global]
-      _ -> []
-    end
+  # `re_scope` is an enum: `"global"` maps to `re_scope: :global` (local→global
+  # graduation); `"inherit"` or absent keeps the memory's own scope (the default — no opt
+  # passed). ANY other value (a typo like `"Global"`, garbage) is REJECTED with a
+  # deterministic 422 rather than silently defaulting to inherit: this action has no
+  # OpenApiSpex `CastAndValidate` plug, so the `["inherit", "global"]` enum declared by the
+  # request schema and the MCP tool is enforced here at the HTTP boundary. Silently
+  # inheriting on a typo would graduate the memory PROJECT-scoped and stamp `graduated_at`;
+  # because a corrected `re_scope: "global"` retry then 409s (`already_graduated`), the
+  # mis-scoping would be PERMANENT.
+  defp parse_re_scope(nil), do: {:ok, []}
+  defp parse_re_scope("inherit"), do: {:ok, []}
+  defp parse_re_scope("global"), do: {:ok, [re_scope: :global]}
+  defp parse_re_scope(_), do: {:error, :invalid_re_scope}
+
+  defp invalid_re_scope(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "invalid_re_scope",
+        message:
+          "The `re_scope` field must be either \"inherit\" (keep the memory's own scope) " <>
+            "or \"global\" (graduate the memory tenant-wide). Omit it to inherit."
+      }
+    })
   end
 
   defp graduate_status(verdict) when verdict in [:created, :gated_to_draft], do: :created

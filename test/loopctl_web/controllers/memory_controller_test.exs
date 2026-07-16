@@ -1291,5 +1291,98 @@ defmodule LoopctlWeb.MemoryControllerTest do
 
       assert body["error"]["code"] == "invalid_memory_id"
     end
+
+    test "an out-of-enum re_scope is a 422 (invalid_re_scope) and does NOT graduate the memory" do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+
+      memory =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          text: "a typo in re_scope must not silently graduate this project-scoped"
+        })
+
+      # "Global" (wrong case) / anything outside {"inherit","global"} is rejected up front
+      # rather than silently inheriting — a silent inherit would stamp graduated_at and make
+      # a corrected "global" retry 409 forever.
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/graduate", %{
+          "memory_id" => memory.id,
+          "re_scope" => "Global"
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_re_scope"
+      # The memory was NOT graduated by the rejected request.
+      assert is_nil(reload_memory(memory.id).graduated_at)
+    end
+
+    test "a duplicate verdict returns the canonical article without creating (200, created false)" do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      existing =
+        fixture(:article, %{tenant_id: tenant.id, title: "Canonical fact", status: :published})
+
+      memory =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          text: "the same canonical fact, reworded"
+        })
+
+      # Force the novelty gate to see this memory as a near-duplicate of `existing`, so
+      # nothing is created and the canonical article is returned → 200 (not 201).
+      Mox.stub(Loopctl.MockProposalAssessor, :assess, fn _tenant_id, _attrs, _opts ->
+        %{
+          verdict: :duplicate,
+          score: 0.98,
+          neighbors: [%{id: existing.id, title: existing.title, similarity_score: 0.98}]
+        }
+      end)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/graduate", %{"memory_id" => memory.id})
+        |> json_response(200)
+
+      assert body["data"]["verdict"] == "duplicate"
+      assert body["data"]["created"] == false
+      assert body["data"]["article"]["id"] == existing.id
+    end
+
+    test "a fell-open novelty gate is a 503 (gate_unavailable) and does NOT stamp the memory" do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      memory =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          text: "content the embedding backend could not assess"
+        })
+
+      # The gate falls open with :unknown when the embedding backend is down. Graduation
+      # passes on_gate_unavailable: :skip, so this is a retryable outage: no article is
+      # created, the memory stays eligible (graduated_at NULL), and the caller gets 503.
+      Mox.stub(Loopctl.MockProposalAssessor, :assess, fn _tenant_id, _attrs, _opts ->
+        %{verdict: :unknown, score: nil, neighbors: []}
+      end)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/graduate", %{"memory_id" => memory.id})
+        |> json_response(503)
+
+      assert body["error"]["code"] == "gate_unavailable"
+      assert is_nil(reload_memory(memory.id).graduated_at)
+    end
   end
 end
