@@ -1282,6 +1282,24 @@ async function memoryPromote({ session_id }) {
   return toContent(result);
 }
 
+async function memoryGraduate({ memory_id, re_scope }) {
+  // Explicit memory→knowledge graduation (#411 Gap 3). Scope (tenant_id/subject_id)
+  // is derived server-side from the agent key; memory_id identifies the caller's OWN
+  // memory to graduate. The graduated article stays OWNER-visible (not peer-readable).
+  // re_scope: "global" widens only the project partition (project → tenant-wide), NOT
+  // visibility, and only on the memory's first graduation.
+  const payload = { memory_id };
+  if (re_scope) payload.re_scope = re_scope;
+
+  const result = await apiCall(
+    "POST",
+    "/api/v1/memory/graduate",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 // --- Knowledge Management Tools (orch key) ---
 
 async function knowledgePublish({ article_id }) {
@@ -3665,6 +3683,45 @@ const TOOLS = [
       required: ["session_id"],
     },
   },
+  {
+    name: "memory_graduate",
+    description:
+      "Graduate ONE of your long-term memories into a durable Knowledge Wiki article — the " +
+      "explicit, on-demand version of the hourly graduation sweep. Use when a private memory " +
+      "has proven valuable enough to become durable, curated knowledge. IMPORTANT: the " +
+      "graduated article stays OWNER-VISIBLE (metadata.visibility=owner, keyed to your " +
+      "subject) — discoverable by YOU, NOT peer-readable; graduation does NOT share a memory " +
+      "with teammates, and re_scope only widens project scope, not visibility. Scope " +
+      "(tenant_id/subject_id) is resolved server-side from your API key: you can only " +
+      "graduate your OWN memory; a foreign/unknown memory_id returns 404 (no cross-subject " +
+      "leak). By default the article inherits the memory's project scope; pass " +
+      're_scope: "global" to promote a PROJECT memory to a tenant-wide (global) article — ' +
+      "only valid on the memory's FIRST graduation (re_scope: global on an already-graduated " +
+      "PROJECT memory returns 409 already_graduated; on an already-graduated GLOBAL memory it " +
+      "is an idempotent no-op → 200). The article is DEDUPED by the novelty gate: the " +
+      'response `data.verdict` is "created" (novel → published) or "gated_to_draft" ' +
+      '(near-duplicate → review draft) with a new article, or "duplicate"/"deduplicated" ' +
+      "(content already represented → the canonical article, nothing created). Returns 503 " +
+      "gate_unavailable if the embedding backend is down — retry later.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        memory_id: {
+          type: "string",
+          description: "UUID of your own long-term memory to graduate into a knowledge article.",
+        },
+        re_scope: {
+          type: "string",
+          enum: ["inherit", "global"],
+          description:
+            'Article scope. "inherit" (default) keeps the memory\'s project scope; ' +
+            '"global" promotes a PROJECT memory to a tenant-wide (global) article ' +
+            "(only on its first graduation).",
+        },
+      },
+      required: ["memory_id"],
+    },
+  },
 
   // Knowledge Management Tools (orchestrator key)
   {
@@ -4950,6 +5007,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "memory_promote":
       return await memoryPromote(args);
+
+    case "memory_graduate":
+      return await memoryGraduate(args);
 
     // Knowledge Management Tools
     case "knowledge_publish":

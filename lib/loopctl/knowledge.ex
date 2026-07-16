@@ -314,6 +314,10 @@ defmodule Loopctl.Knowledge do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
       actor_type = Keyword.get(opts, :actor_type, "api_key")
+      # AuditContext impersonation trail (impersonated_by / impersonated_at /
+      # effective_role) when a superadmin impersonates; %{} for direct writes. Recorded on
+      # the article's audit entry so an impersonated create is fully attributable.
+      audit_metadata = Keyword.get(opts, :metadata, %{})
 
       changeset =
         %Article{tenant_id: effective_tenant_id}
@@ -335,6 +339,7 @@ defmodule Loopctl.Knowledge do
             actor_type: actor_type,
             actor_id: actor_id,
             actor_label: actor_label,
+            metadata: audit_metadata,
             new_state: %{
               "title" => article.title,
               "category" => to_string(article.category),
@@ -602,12 +607,21 @@ defmodule Loopctl.Knowledge do
     end)
   end
 
-  # Look up by idempotency_key across ALL statuses, mirroring the partial unique
-  # index (which has no status predicate) so the conflicting row is always found.
-  defp get_article_by_idempotency_key(_tenant_id, nil, _vis), do: nil
-  defp get_article_by_idempotency_key(nil, _key, _vis), do: nil
+  @doc """
+  Look up an article by its `idempotency_key` across ALL statuses, mirroring the partial
+  unique index (which has no status predicate) so the conflicting/canonical row is always
+  found. `vis` (a `visibility_agent_id`) scopes the lookup to the owner-visible row so a
+  key colliding with another agent's private article can't be echoed (#163).
 
-  defp get_article_by_idempotency_key(tenant_id, key, vis) when is_binary(key) do
+  Public so callers holding a deterministic per-scope key (e.g. memory graduation) can
+  resolve the existing article for an idempotent no-op WITHOUT re-running the novelty gate.
+  """
+  @spec get_article_by_idempotency_key(Ecto.UUID.t() | nil, String.t() | nil, term()) ::
+          Article.t() | nil
+  def get_article_by_idempotency_key(_tenant_id, nil, _vis), do: nil
+  def get_article_by_idempotency_key(nil, _key, _vis), do: nil
+
+  def get_article_by_idempotency_key(tenant_id, key, vis) when is_binary(key) do
     from(a in Article,
       where: a.tenant_id == ^tenant_id and a.idempotency_key == ^key,
       order_by: [asc: a.inserted_at],
@@ -618,7 +632,7 @@ defmodule Loopctl.Knowledge do
   end
 
   # Non-binary key (e.g. an integer) → no lookup.
-  defp get_article_by_idempotency_key(_tenant_id, _key, _vis), do: nil
+  def get_article_by_idempotency_key(_tenant_id, _key, _vis), do: nil
 
   # Only the active-title index — NOT the slug indexes, whose conflicts are on a
   # different field and must not be recovered via a title lookup.

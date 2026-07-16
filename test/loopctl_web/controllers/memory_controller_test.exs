@@ -40,6 +40,10 @@ defmodule LoopctlWeb.MemoryControllerTest do
   defp scope_for(tenant_id, agent),
     do: %Scope{tenant_id: tenant_id, subject_id: to_string(agent.id)}
 
+  # Reload a long-term memory row directly (bypassing scope) to assert side effects
+  # like graduated_at — mirrors GraduationTest's `reload/1`.
+  defp reload_memory(id), do: Loopctl.AdminRepo.get(Loopctl.Memory.Memory, id)
+
   # Override the default promoter-LLM stub to emit a crafted candidate array, and
   # signal every call so a NON-call can be asserted (refute_received :llm_called).
   defp stub_promoter(candidates) do
@@ -1137,6 +1141,248 @@ defmodule LoopctlWeb.MemoryControllerTest do
       assert "explicit one" in texts
       refute "promoted one" in texts
       assert Enum.all?(body["data"], &(&1["source"] == "explicit"))
+    end
+  end
+
+  # --- #411 Gap 3 — POST /api/v1/memory/graduate (explicit memory→knowledge) ---
+  #
+  # Exposes `Memory.graduate_memory/3` over HTTP. Scope (tenant_id, subject_id) is
+  # key-derived; a caller may only graduate its OWN memory. The ConnCase default
+  # proposal-assessor stub returns `:novel` → verdict `:created` → 201.
+
+  describe "POST /api/v1/memory/graduate (#411 Gap 3)" do
+    test "graduates the caller's own memory into a new article (201, verdict created)" do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      memory =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          text: "runbook: restart the worker pool when the queue backs up"
+        })
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/graduate", %{"memory_id" => memory.id})
+        |> json_response(201)
+
+      assert body["data"]["verdict"] == "created"
+      assert body["data"]["created"] == true
+      assert is_binary(body["data"]["article"]["id"])
+      # The article summary is body-less (fetch the full body via /articles/:id).
+      refute Map.has_key?(body["data"]["article"], "body")
+
+      # The memory is now stamped graduated.
+      refute is_nil(reload_memory(memory.id).graduated_at)
+    end
+
+    test "re_scope: \"global\" produces a global (project_id nil) article from a project memory" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      memory =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          project_id: project.id,
+          text: "this fact is worth making tenant-wide"
+        })
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/graduate", %{
+          "memory_id" => memory.id,
+          "re_scope" => "global"
+        })
+        |> json_response(201)
+
+      assert body["data"]["article"]["project_id"] == nil
+    end
+
+    test "a foreign/nonexistent memory_id returns 404 — no cross-subject existence oracle" do
+      tenant = fixture(:tenant)
+      {raw_a, _key_a, _agent_a} = agent_key(tenant.id)
+      {_raw_b, _key_b, agent_b} = agent_key(tenant.id)
+
+      # A memory owned by agent B; agent A must not be able to graduate (or probe) it.
+      memory_b =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent_b.id),
+          text: "owned by another subject"
+        })
+
+      base_conn()
+      |> auth(raw_a)
+      |> post(~p"/api/v1/memory/graduate", %{"memory_id" => memory_b.id})
+      |> json_response(404)
+
+      # A well-formed but entirely unknown id is likewise 404.
+      base_conn()
+      |> auth(raw_a)
+      |> post(~p"/api/v1/memory/graduate", %{"memory_id" => Ecto.UUID.generate()})
+      |> json_response(404)
+
+      # B's memory was NOT graduated by A's failed attempt.
+      assert is_nil(reload_memory(memory_b.id).graduated_at)
+    end
+
+    test "re_scope: \"global\" on an ALREADY-graduated memory returns 409 already_graduated" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      memory =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          project_id: project.id,
+          text: "prove yourself in-project before globalizing"
+        })
+
+      # First: default (project) graduation succeeds.
+      base_conn()
+      |> auth(raw)
+      |> post(~p"/api/v1/memory/graduate", %{"memory_id" => memory.id})
+      |> json_response(201)
+
+      # A second graduation asking for re_scope: global refuses loudly (409).
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/graduate", %{
+          "memory_id" => memory.id,
+          "re_scope" => "global"
+        })
+        |> json_response(409)
+
+      assert body["error"]["code"] == "already_graduated"
+    end
+
+    test "a malformed memory_id is a 422 (invalid_memory_id)" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/graduate", %{"memory_id" => "not-a-uuid"})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_memory_id"
+    end
+
+    test "a missing memory_id is a 422 (invalid_memory_id)" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/graduate", %{})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_memory_id"
+    end
+
+    test "an out-of-enum re_scope is a 422 (invalid_re_scope) and does NOT graduate the memory" do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+
+      memory =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          text: "a typo in re_scope must not silently graduate this project-scoped"
+        })
+
+      # "Global" (wrong case) / anything outside {"inherit","global"} is rejected up front
+      # rather than silently inheriting — a silent inherit would stamp graduated_at and make
+      # a corrected "global" retry 409 forever.
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/graduate", %{
+          "memory_id" => memory.id,
+          "re_scope" => "Global"
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_re_scope"
+      # The memory was NOT graduated by the rejected request.
+      assert is_nil(reload_memory(memory.id).graduated_at)
+    end
+
+    test "a duplicate verdict returns the canonical article without creating (200, created false)" do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      existing =
+        fixture(:article, %{tenant_id: tenant.id, title: "Canonical fact", status: :published})
+
+      memory =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          text: "the same canonical fact, reworded"
+        })
+
+      # Force the novelty gate to see this memory as a near-duplicate of `existing`, so
+      # nothing is created and the canonical article is returned → 200 (not 201).
+      Mox.stub(Loopctl.MockProposalAssessor, :assess, fn _tenant_id, _attrs, _opts ->
+        %{
+          verdict: :duplicate,
+          score: 0.98,
+          neighbors: [%{id: existing.id, title: existing.title, similarity_score: 0.98}]
+        }
+      end)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/graduate", %{"memory_id" => memory.id})
+        |> json_response(200)
+
+      assert body["data"]["verdict"] == "duplicate"
+      assert body["data"]["created"] == false
+      assert body["data"]["article"]["id"] == existing.id
+    end
+
+    test "a fell-open novelty gate is a 503 (gate_unavailable) and does NOT stamp the memory" do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      memory =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          text: "content the embedding backend could not assess"
+        })
+
+      # The gate falls open with :unknown when the embedding backend is down. Graduation
+      # passes on_gate_unavailable: :skip, so this is a retryable outage: no article is
+      # created, the memory stays eligible (graduated_at NULL), and the caller gets 503.
+      Mox.stub(Loopctl.MockProposalAssessor, :assess, fn _tenant_id, _attrs, _opts ->
+        %{verdict: :unknown, score: nil, neighbors: []}
+      end)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/graduate", %{"memory_id" => memory.id})
+        |> json_response(503)
+
+      assert body["error"]["code"] == "gate_unavailable"
+      assert is_nil(reload_memory(memory.id).graduated_at)
     end
   end
 end

@@ -148,6 +148,46 @@ describe("#411 gap2: recall_context wiring", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #411 gap3 (docs+MCP surface): memory_graduate (explicit memory→knowledge)
+// ---------------------------------------------------------------------------
+
+describe("#411 gap3: memory_graduate wiring", () => {
+  test("TOOLS declares a memory_graduate tool requiring memory_id", () => {
+    assert.match(INDEX_SRC, /name: "memory_graduate",/, 'must declare a "memory_graduate" tool');
+    assert.match(
+      INDEX_SRC,
+      /name: "memory_graduate",[\s\S]*?required: \["memory_id"\],/,
+      "the memory_graduate tool must require memory_id",
+    );
+  });
+
+  test("memory_graduate declares a re_scope enum of inherit|global", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "memory_graduate",[\s\S]*?re_scope: \{[\s\S]*?enum: \["inherit", "global"\],/,
+      "the memory_graduate re_scope arg must be an enum of inherit|global",
+    );
+  });
+
+  test("memoryGraduate POSTs /api/v1/memory/graduate with memory_id/re_scope on the agent key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function memoryGraduate\(\{ memory_id, re_scope \}\) \{[\s\S]*?"POST",\s*\n\s*"\/api\/v1\/memory\/graduate",[\s\S]*?LOOPCTL_AGENT_KEY/,
+      "memoryGraduate must POST /api/v1/memory/graduate on the agent key",
+    );
+    assert.match(INDEX_SRC, /const payload = \{ memory_id \};\s*\n\s*if \(re_scope\) payload\.re_scope = re_scope;/);
+  });
+
+  test("the memory_graduate dispatch case calls memoryGraduate(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "memory_graduate":\s*\n\s*return await memoryGraduate\(args\);/,
+      "the memory_graduate dispatch case must call memoryGraduate(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #248 (mcp-02): knowledge_ingestion_jobs forwards limit/offset/since_days
 // ---------------------------------------------------------------------------
 

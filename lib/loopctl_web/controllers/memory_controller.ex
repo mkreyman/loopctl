@@ -48,6 +48,7 @@ defmodule LoopctlWeb.MemoryController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Memory
   alias Loopctl.Memory.Scope
+  alias LoopctlWeb.AuditContext
   alias LoopctlWeb.Helpers.Visibility
   alias LoopctlWeb.MemoryJSON
   alias LoopctlWeb.RecallJSON
@@ -203,6 +204,55 @@ defmodule LoopctlWeb.MemoryController do
         {"Promotion could not be enqueued (server error)", "application/json",
          Schemas.ErrorResponse},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:graduate,
+    summary: "Graduate (memory → durable knowledge article)",
+    description:
+      "Graduates ONE of the caller's own long-term memories (by `memory_id`) into a " <>
+        "durable Knowledge Wiki article via the novelty gate — the explicit, on-demand " <>
+        "trigger for the same primitive the hourly `MemoryGraduationSweepWorker` runs " <>
+        "(#411 Gap 3). Scope (`tenant_id`, `subject_id`) is derived from the API key — a " <>
+        "caller may only graduate its OWN memory; a foreign/nonexistent `memory_id` " <>
+        "returns 404 (no cross-subject existence oracle). By DEFAULT the article inherits " <>
+        "the memory's `project_id` (a project memory → a project article, a global memory " <>
+        "→ a global article); pass `re_scope: \"global\"` to promote a PROJECT-scoped " <>
+        "memory to a tenant-wide (`project_id: null`) article — the ONLY way graduation " <>
+        "re-scopes (the sweep never does). Because a memory has AT MOST ONE graduated " <>
+        "article, `re_scope: \"global\"` on an ALREADY-graduated memory returns 409 " <>
+        "(`already_graduated`) rather than silently returning the wrong-scoped article; " <>
+        "re-scope on the FIRST graduation instead. The article is DEDUPED by the novelty " <>
+        "gate: `verdict` is `created` (novel → published) or `gated_to_draft` (near-dup → " <>
+        "unpublished draft) with 201, or `duplicate`/`deduplicated` (already represented → " <>
+        "the canonical article, nothing created) with 200. A malformed `memory_id` is a " <>
+        "422 (`invalid_memory_id`); a `re_scope` outside the {`inherit`, `global`} enum is " <>
+        "a 422 (`invalid_re_scope`) — it is NEVER silently treated as `inherit`. If the " <>
+        "novelty gate falls open because the embedding " <>
+        "backend is down it returns 503 (`gate_unavailable`) WITHOUT stamping — retry once " <>
+        "embeddings recover. Subject to the full :authenticated write chain (custody halt, " <>
+        "witness header, rate limiting).",
+    request_body: {"Graduate params", "application/json", Schemas.MemoryGraduateRequest},
+    responses: %{
+      200 =>
+        {"Graduated (dedup: content already represented by an existing article)",
+         "application/json", Schemas.MemoryGraduateResponse},
+      201 =>
+        {"Graduated (a new published article or review draft was created)", "application/json",
+         Schemas.MemoryGraduateResponse},
+      404 =>
+        {"Memory not found in the caller's own scope", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"Memory already graduated (re_scope on an already-graduated memory)", "application/json",
+         Schemas.ErrorResponse},
+      422 =>
+        {"Malformed memory_id, out-of-enum re_scope, invalid structural content, or subject unresolvable",
+         "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 =>
+        {"Tenant custody halted (`custody_halted`) or novelty gate unavailable " <>
+           "(`gate_unavailable`, embedding backend down — retryable); the body `code` " <>
+           "distinguishes them", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -504,6 +554,145 @@ defmodule LoopctlWeb.MemoryController do
     end)
   end
 
+  @doc "POST /api/v1/memory/graduate"
+  # Cost model — DELIBERATELY no per-tenant graduation budget and no
+  # `graduation_recall_threshold`/`graduation_max_per_run` caps (unlike `promote/2`'s
+  # 429 per-hour budget and unlike `MemoryGraduationSweepWorker`'s recall-gated, per-run
+  # capped cadence). Graduation is a genuinely bounded, one-shot-per-memory write: an
+  # already-graduated memory SHORT-CIRCUITS to its existing article WITHOUT re-running the
+  # novelty gate (`Memory.graduate_memory_record/2`), so a loop of repeated graduate calls
+  # on the SAME memory cannot re-spend assessment/embedding on the tenant's key. The FIRST
+  # graduation REUSES the memory's existing `vector(1536)` embedding when present (only
+  # paying an embedding round-trip for a not-yet-embedded memory), whereas promotion
+  # triggers an LLM synthesis call — so the expensive-per-call budget promote needs does
+  # not apply here. The
+  # recall-count threshold is a sweep QUALITY signal (graduate only well-recalled memories
+  # automatically); an explicit, caller-triggered graduation intentionally opts out of it,
+  # and the general `RateLimiter` still throttles abuse. Revisit if graduation gains an
+  # unconditional embedding or LLM cost.
+  def graduate(conn, params) do
+    with {:ok, memory_id} <- parse_memory_id(params["memory_id"]),
+         {:ok, re_scope_opts} <- parse_re_scope(params["re_scope"]) do
+      graduate_with_id(conn, memory_id, re_scope_opts)
+    else
+      # `parse_memory_id/1` returns a bare `:error`; `parse_re_scope/1` a tagged tuple.
+      :error -> invalid_memory_id(conn)
+      {:error, :invalid_re_scope} -> invalid_re_scope(conn)
+    end
+  end
+
+  defp graduate_with_id(conn, memory_id, re_scope_opts) do
+    with_scope(conn, fn %Scope{} = scope ->
+      # Attribute the graduated article to the calling api_key (or the impersonating
+      # superadmin), mirroring ArticleController.create — the sweep worker attributes to
+      # `memory_graduation_sweep`, so an on-demand, caller-triggered write must not land
+      # unattributed in the curation/audit log. `propose_opts/2` picks the actor keys.
+      graduate_opts = re_scope_opts ++ AuditContext.from_conn(conn)
+
+      case Memory.graduate_memory(scope, memory_id, graduate_opts) do
+        # `:created` / `:gated_to_draft` materialized a NEW article (a published one, or an
+        # unpublished review draft) → 201. `:duplicate` / `:deduplicated` returned the
+        # canonical EXISTING article (nothing created) → 200. Mirrors ArticleController's
+        # verdict→status convention for the novelty gate.
+        {:ok, verdict, article} ->
+          conn
+          |> put_status(graduate_status(verdict))
+          |> json(MemoryJSON.graduate(%{verdict: verdict, article: article}))
+
+        # A foreign/nonexistent memory_id — no cross-subject existence oracle (404 via
+        # the FallbackController, same as forget/2).
+        {:error, :not_found} = error ->
+          error
+
+        # `re_scope: :global` on an already-graduated memory: a memory has at most one
+        # graduated article, so this refuses LOUDLY rather than returning the wrong-scoped
+        # article as success. A benign, deterministic conflict → 409.
+        {:error, :already_graduated} ->
+          conn
+          |> put_status(:conflict)
+          |> json(%{
+            error: %{
+              status: 409,
+              code: "already_graduated",
+              message:
+                "This memory has already been graduated into a knowledge article, so it " <>
+                  "cannot be re-graduated with a different scope. To globalize a memory, " <>
+                  "pass re_scope: \"global\" on its FIRST graduation; re-pointing an " <>
+                  "already-published article's scope is a separate curation action."
+            }
+          })
+
+        # The novelty gate FELL OPEN (embedding backend down) — it could not assess
+        # novelty, so nothing was created and the memory was NOT stamped. Transient
+        # server-side dependency outage → 503 so the caller retries once embeddings
+        # recover, rather than a 4xx that reads as a client error.
+        {:error, :gate_unavailable} ->
+          conn
+          |> put_status(:service_unavailable)
+          |> json(%{
+            error: %{
+              status: 503,
+              code: "gate_unavailable",
+              message:
+                "The novelty gate is temporarily unavailable (the embedding backend could " <>
+                  "not assess this memory), so nothing was graduated. The memory stays " <>
+                  "eligible — retry once embeddings recover."
+            }
+          })
+
+        # A STRUCTURAL validation failure (e.g. an over-size body). Deterministic → 422
+        # via the FallbackController's changeset clause.
+        {:error, %Ecto.Changeset{} = changeset} ->
+          {:error, changeset}
+
+          # NOTE (review finding, resolved by dialyzer-exhaustiveness, mirroring `create/2`
+          # above): the 5 clauses above are EXHAUSTIVE for `Memory.graduate_memory/3`.
+          # Although its `@spec` error union includes `term()`, dialyzer's success typing
+          # proves the ACTUAL return is exactly `{:ok, verdict, article} | {:error,
+          # :not_found | :already_graduated | :gate_unavailable | %Ecto.Changeset{}}` — the
+          # graduation path can only fail with those tagged atoms or a changeset (the
+          # novelty gate + `create_article/3` return no other error shape). A trailing
+          # `{:error, _reason}` catch-all would be unreachable dead code (`pattern_match_cov`),
+          # and `@dialyzer` suppressions are forbidden. Dialyzer is the compile-time guard:
+          # if `graduate_memory/3` ever gains a new error shape, this case stops being total
+          # and the build breaks — a stronger contract than a runtime catch-all that can
+          # never fire (unlike `promote/2`, whose underlying `Oban.insert/1` genuinely
+          # widens the success typing to `{:error, term()}`, so ITS catch-all is reachable).
+      end
+    end)
+  end
+
+  # `re_scope` is an enum: `"global"` maps to `re_scope: :global` (local→global
+  # graduation); `"inherit"` or absent keeps the memory's own scope (the default — no opt
+  # passed). ANY other value (a typo like `"Global"`, garbage) is REJECTED with a
+  # deterministic 422 rather than silently defaulting to inherit: this action has no
+  # OpenApiSpex `CastAndValidate` plug, so the `["inherit", "global"]` enum declared by the
+  # request schema and the MCP tool is enforced here at the HTTP boundary. Silently
+  # inheriting on a typo would graduate the memory PROJECT-scoped and stamp `graduated_at`;
+  # because a corrected `re_scope: "global"` retry then 409s (`already_graduated`), the
+  # mis-scoping would be PERMANENT.
+  defp parse_re_scope(nil), do: {:ok, []}
+  defp parse_re_scope("inherit"), do: {:ok, []}
+  defp parse_re_scope("global"), do: {:ok, [re_scope: :global]}
+  defp parse_re_scope(_), do: {:error, :invalid_re_scope}
+
+  defp invalid_re_scope(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "invalid_re_scope",
+        message:
+          "The `re_scope` field must be either \"inherit\" (keep the memory's own scope) " <>
+            "or \"global\" (graduate the memory tenant-wide). Omit it to inherit."
+      }
+    })
+  end
+
+  defp graduate_status(verdict) when verdict in [:created, :gated_to_draft], do: :created
+  defp graduate_status(_verdict), do: :ok
+
   @doc "GET /api/v1/memory"
   def index(conn, params) do
     api_key = conn.assigns.current_api_key
@@ -723,6 +912,34 @@ defmodule LoopctlWeb.MemoryController do
         message:
           "The `project_id` field must be a valid UUID identifying a project in your " <>
             "own tenant."
+      }
+    })
+  end
+
+  # Parse the REQUIRED `memory_id` for graduation. Unlike `project_id` (an optional
+  # partition key), `memory_id` identifies the row to graduate — a missing/blank/malformed
+  # value is a deterministic 422 up front rather than a downstream cast error. The same
+  # canonical-UUID gate as `parse_project_id/1` (hyphenated form BEFORE `Ecto.UUID.cast`,
+  # so a raw 16-byte binary cannot slip through). Ownership is enforced separately by
+  # `Memory.graduate_memory/3` via the `(tenant_id, subject_id)` scope (a foreign/unknown
+  # id → 404, no cross-subject oracle).
+  defp parse_memory_id(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> :error
+      trimmed -> cast_project_uuid(trimmed)
+    end
+  end
+
+  defp parse_memory_id(_), do: :error
+
+  defp invalid_memory_id(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "invalid_memory_id",
+        message: "The `memory_id` field is required and must be a valid memory UUID."
       }
     })
   end
