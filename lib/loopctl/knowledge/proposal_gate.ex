@@ -58,8 +58,9 @@ defmodule Loopctl.Knowledge.ProposalGate do
     # Route through the GUARDED embedding path (review #4): tenant-scoped circuit
     # breaker + timeout, so a provider outage fast-fails here (this runs SYNCHRONOUSLY
     # in the HTTP write path) instead of hammering a dead provider and risking an LB
-    # timeout.
-    case Knowledge.generate_embedding(tenant_id, build_text(attrs)) do
+    # timeout. A caller (e.g. memory graduation) that already holds a computed embedding
+    # of the assessed text may pass it via `:embedding` to skip this round-trip.
+    case reuse_or_generate_embedding(tenant_id, attrs, opts) do
       {:ok, vector} when is_list(vector) and vector != [] ->
         # `on_overload: :tag` (US-37.5): assess/3 runs SYNCHRONOUSLY in the
         # knowledge_create write path, so an over-cap HeavyRead shed must NOT raise a
@@ -112,6 +113,17 @@ defmodule Loopctl.Knowledge.ProposalGate do
 
   defp neighbor_score(nil), do: nil
   defp neighbor_score(%{similarity_score: s}), do: s
+
+  # Reuse a caller-supplied embedding when present (avoids a second embedding round-trip
+  # for text already embedded upstream — e.g. a memory's stored vector on graduation);
+  # otherwise embed the proposal text through the guarded path. A non-list / empty
+  # `:embedding` is ignored and we fall back to generating.
+  defp reuse_or_generate_embedding(tenant_id, attrs, opts) do
+    case Keyword.get(opts, :embedding) do
+      vector when is_list(vector) and vector != [] -> {:ok, vector}
+      _ -> Knowledge.generate_embedding(tenant_id, build_text(attrs))
+    end
+  end
 
   defp build_text(attrs) do
     title = attrs["title"] || attrs[:title] || ""

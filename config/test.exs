@@ -517,6 +517,10 @@ config :loopctl, :cli_req_plug, {Req.Test, Loopctl.CLI.Client}
 # inserts run inside the test process and share its sandbox connection.
 config :loopctl, :analytics_recording_mode, :sync
 
+# #411 Gap 3: bump memory recall_count synchronously in tests so the UPDATE runs
+# inside the test process and shares its sandbox connection (a spawned task would not).
+config :loopctl, :memory_recall_bump_mode, :sync
+
 # RLS: Switch to non-superuser role within transactions so RLS is enforced
 # The loopctl_app role must exist and have access to all tables.
 config :loopctl, :rls_role, "loopctl_app"

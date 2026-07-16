@@ -55,6 +55,7 @@ defmodule Loopctl.Memory do
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Memory.Memory, as: MemorySchema
   alias Loopctl.Memory.PromotionTelemetry
+  alias Loopctl.Memory.RecallBumpCache
   alias Loopctl.Memory.Scope
   alias Loopctl.Memory.SessionMemory
   alias Loopctl.Memory.SessionPromotion
@@ -496,13 +497,168 @@ defmodule Loopctl.Memory do
 
     # Reuse a precomputed embedding when the caller supplies one (the merged recall
     # generates it ONCE for both halves — #411 Gap 2); otherwise generate here.
-    case opt(opts, :embedding, nil) || Knowledge.generate_embedding(scope.tenant_id, query_text) do
-      {:ok, embedding} ->
-        recall_semantic(scope, embedding, k, include_superseded?, on_overload)
+    envelope =
+      case opt(opts, :embedding, nil) ||
+             Knowledge.generate_embedding(scope.tenant_id, query_text) do
+        {:ok, embedding} ->
+          recall_semantic(scope, embedding, k, include_superseded?, on_overload)
 
-      {:error, reason} ->
-        recall_fallback(scope, reason, query_text, k, include_superseded?, on_overload)
+        {:error, reason} ->
+          recall_fallback(scope, reason, query_text, k, include_superseded?, on_overload)
+      end
+
+    maybe_bump_recall(scope, envelope, include_superseded?)
+    envelope
+  end
+
+  # #411 Gap 3: bump the recall-count / last_recalled_at for the rows this recall
+  # returned — the "hotness" signal the graduation sweep thresholds on. Deliberately
+  # OFF the response path (best-effort, fire-and-forget) and gated so it never pollutes
+  # the signal or affects the response:
+  #
+  #   * ONLY the HEALTHY semantic path bumps (`meta.fallback == false`). A degraded
+  #     ILIKE fallback OR a HeavyRead-shed empty envelope both set `fallback: true`, so
+  #     neither bumps: a memory surfaced only because embeddings were down (a text
+  #     substring match) is NOT evidence of genuine semantic hotness, and counting it
+  #     would let a provider outage skew which memories graduate.
+  #   * `include_superseded: true` oversight reads do NOT bump — an admin/superadmin
+  #     inspecting the full (incl. superseded) corpus must not inflate live memories'
+  #     hotness. Only the default live recall counts.
+  #   * A bump failure is swallowed (logged at most): a recall response must NEVER fail
+  #     because the analytics-style counter write failed. Mirrors the Knowledge
+  #     `Analytics.record_access/6` fire-and-forget off-hot-path mechanism.
+  defp maybe_bump_recall(_scope, %{meta: %{fallback: true}}, _include_superseded?), do: :ok
+  defp maybe_bump_recall(_scope, _envelope, true), do: :ok
+
+  defp maybe_bump_recall(scope, envelope, false) do
+    # `Map.get(envelope, :results, [])` (not a `%{results: results}` head): a recall
+    # response must NEVER fail because of the analytics-shaped bump, so an unexpected
+    # `fallback: false` envelope shape lacking `results` degrades to a no-op here instead
+    # of raising a FunctionClauseError on the recall hot path.
+    #
+    # RELEVANCE FLOOR (not just top-k page membership). A healthy recall returns the
+    # top-k by cosine distance REGARDLESS of absolute relevance, so a subject with fewer
+    # than k live memories has ALL of them returned on every query — making a naive bump
+    # track the subject's query VOLUME, not any individual memory's value, and letting a
+    # sparse scope (the common case for a new agent/project) auto-graduate low-relevance
+    # NOISE after ~threshold recalls. Only bump rows whose similarity clears
+    # `recall_bump_min_score/0`, so "frequently-recalled = proven-valuable" holds even
+    # for tiny scopes. `score` is `max(0.0, 1.0 - distance)` (see `recall_semantic/5`),
+    # so higher = more similar.
+    floor = recall_bump_min_score()
+
+    ids =
+      for {%MemorySchema{id: id}, score} <- Map.get(envelope, :results, []),
+          is_binary(id),
+          is_number(score) and score >= floor,
+          do: id
+
+    bump_recall_counts(scope.tenant_id, ids)
+  end
+
+  @doc """
+  Best-effort, OFF-hot-path increment of `recall_count` (+1) and refresh of
+  `last_recalled_at` for the given live memory `ids` in `tenant_id`, DEDUPED to at most
+  once per memory per `recall_bump_cooldown_seconds/0` so a tight single-agent recall loop
+  cannot game the hotness signal that drives graduation.
+
+  Mirrors `Loopctl.Knowledge.Analytics.record_access/6`: the write is fire-and-forget
+  and can NEVER fail a recall. Under the default `:async` mode it runs in a task on the
+  BOUNDED `Loopctl.Memory.RecallBumpTaskSupervisor` (a `max_children` cap bounds the
+  fan-out so a recall burst can't spawn an unbounded set of background writes that starve
+  the write pool — over the cap the bump is simply dropped); tests set
+  `:memory_recall_bump_mode` to `:sync` so the write shares the Ecto sandbox connection
+  (a spawned task would not — the classic external-process sandbox gotcha). Any error is
+  logged and swallowed. The single UPDATE is scoped by `(tenant_id, id IN ...)` and is a
+  no-op for an empty id list.
+
+  ## Cooldown pre-filter (async path)
+
+  Before spawning, the async path drops ids already bumped within their cooldown window
+  via the node-local `Loopctl.Memory.RecallBumpCache`, so an idle-window recall issues
+  ZERO tasks and ZERO DB writes — the cooldown no-op no longer amplifies a read 1:1 into
+  a connection checkout. The DB-side `WHERE last_recalled_at < cutoff` REMAINS the source
+  of truth (the ETS cache is node-local and lost on restart), so a cross-node or
+  post-restart recall still dedups correctly at the DB.
+
+  ## Dedup is best-effort under concurrency (by design)
+
+  Two concurrent recalls of the same memory within one window can both read
+  `last_recalled_at` as stale (Postgres READ COMMITTED evaluates the WHERE once per
+  statement) and each increment +1, over-counting past the intended "at most once per
+  window". The ETS pre-filter narrows this to a same-node, same-instant race, and the
+  over-count is bounded by the concurrency, so the hotness signal is BEST-EFFORT: it
+  raises the bar against a single-agent tight loop (the anti-gaming goal) without
+  claiming a hard exactly-once guarantee. A hard guarantee would need a per-memory
+  advisory lock / single-writer path, which is not worth its cost for an analytics-shaped
+  counter.
+  """
+  @spec bump_recall_counts(String.t(), [String.t()]) :: :ok
+  def bump_recall_counts(_tenant_id, []), do: :ok
+
+  def bump_recall_counts(tenant_id, ids) when is_binary(tenant_id) and is_list(ids) do
+    case Application.get_env(:loopctl, :memory_recall_bump_mode, :async) do
+      :sync ->
+        do_bump_recall_counts(tenant_id, ids)
+
+      _async ->
+        async_bump_recall_counts(tenant_id, ids)
     end
+  rescue
+    error ->
+      Logger.warning("Memory.bump_recall_counts failed to spawn: #{Exception.message(error)}")
+      :ok
+  end
+
+  defp async_bump_recall_counts(tenant_id, ids) do
+    case RecallBumpCache.filter_uncooled(tenant_id, ids) do
+      # Every id is still inside its cooldown window on this node — a guaranteed DB no-op.
+      # Skip the task AND the connection checkout entirely.
+      [] ->
+        :ok
+
+      fresh_ids ->
+        Task.Supervisor.start_child(Loopctl.Memory.RecallBumpTaskSupervisor, fn ->
+          do_bump_recall_counts(tenant_id, fresh_ids)
+          # Record the bump only AFTER the write so the node-local window matches the DB.
+          RecallBumpCache.mark(tenant_id, fresh_ids)
+        end)
+
+        :ok
+    end
+  end
+
+  defp do_bump_recall_counts(tenant_id, ids) do
+    now = DateTime.utc_now()
+    cutoff = DateTime.add(now, -recall_bump_cooldown_seconds(), :second)
+
+    # DEDUP the bump to at most once per memory per cooldown window. `recall_count` is the
+    # "frequently-recalled / proven-valuable" signal the graduation sweep thresholds on, so
+    # it must reflect BROAD, repeated value across sessions/time — not a tight single-agent
+    # loop. Without this window a single agent issuing the same query N times in one loop
+    # would force graduation (default threshold 3), letting one agent flood the wiki. Only
+    # a recall whose row was last counted BEFORE the cooldown (or never) bumps; recalls
+    # inside the window are ignored for hotness. `last_recalled_at` therefore marks the last
+    # COUNTED recall, so it doubles as the dedup cursor.
+    from(m in MemorySchema,
+      where:
+        m.tenant_id == ^tenant_id and m.id in ^ids and
+          (is_nil(m.last_recalled_at) or m.last_recalled_at < ^cutoff)
+    )
+    |> AdminRepo.update_all(set: [last_recalled_at: now], inc: [recall_count: 1])
+
+    :ok
+  rescue
+    error ->
+      # A recall-count bump is analytics-shaped: never let a counter-write failure
+      # surface (the recall already returned). Log at :warning so a persistently
+      # failing bump is visible in production, then swallow.
+      Logger.warning(
+        "Memory.bump_recall_counts write failed (bump dropped): " <>
+          Exception.message(error)
+      )
+
+      :ok
   end
 
   # `:on_overload` controls how a per-tenant HeavyRead cap SHED is handled (US-37.5):
@@ -1395,6 +1551,403 @@ defmodule Loopctl.Memory do
       {:ok, memory} -> memory
       {:error, changeset} -> AdminRepo.rollback(changeset)
     end
+  end
+
+  # ===========================================================================
+  # Graduation — HOT long-term memories → durable knowledge articles (#411 Gap 3)
+  # ===========================================================================
+  #
+  # DISTINCT from the Epic 29 promotion pipeline below (session turns → long-term
+  # `memories`). Graduation is the NEXT tier up: a long-term memory that has been
+  # recalled often enough (`recall_count >= graduation_recall_threshold/0`) is written
+  # back into the curated Knowledge Wiki as a durable article, DEDUPED by the same
+  # novelty gate (`Loopctl.Knowledge.propose_article/3`) that guards every agent
+  # write-back — so re-graduation races and semantically-duplicate memories cannot
+  # bloat the corpus. The scheduled cadence is `Loopctl.Workers.MemoryGraduationSweepWorker`;
+  # `graduate_memory/3` is the explicit (per-memory) trigger the `memory_promote`-class
+  # primitive maps onto, and is where the local→global re-scope option lives.
+
+  @doc """
+  Explicit graduation of ONE memory (by id, within `scope`) into a durable knowledge
+  article.
+
+  The `scope` `(tenant_id, subject_id)` is the isolation boundary — a caller may only
+  graduate its OWN memory; a foreign/nonexistent id returns `{:error, :not_found}`
+  (no cross-subject existence oracle). On success returns `{:ok, verdict, article}`
+  where `verdict` is the novelty-gate outcome
+  (`:created | :gated_to_draft | :duplicate | :deduplicated`).
+
+  ## local→global re-scope (`:re_scope`)
+
+  By DEFAULT the article inherits the memory's scope (`project_id`) — a project memory
+  graduates to a project article, a global memory to a global article. Pass
+  `re_scope: :global` to promote a PROJECT-scoped memory to a tenant-wide (global,
+  `project_id: nil`) article. This is the ONLY way a memory changes scope on
+  graduation: the automated sweep NEVER re-scopes (it always keeps the memory's scope),
+  because over-generalizing a project fact to tenant-wide is a mis-scoping the novelty
+  gate cannot catch — it must be an explicit, deliberate caller action.
+  """
+  @spec graduate_memory(Scope.t(), String.t(), keyword()) ::
+          {:ok, atom(), Loopctl.Knowledge.Article.t()} | {:error, :not_found | term()}
+  def graduate_memory(%Scope{} = scope, memory_id, opts \\ []) when is_binary(memory_id) do
+    case fetch_owned_memory(scope, memory_id) do
+      nil -> {:error, :not_found}
+      %MemorySchema{} = memory -> graduate_memory_record(memory, opts)
+    end
+  end
+
+  @doc """
+  Graduates a `%Memory{}` record into a durable knowledge article via the novelty gate.
+
+  Shared by `graduate_memory/3` (explicit) and `MemoryGraduationSweepWorker` (cadence).
+  Builds the article attrs from the memory (title = first line of the text, body = the
+  full text, category `:finding`, the memory's tags), threads a stable `idempotency_key`
+  so re-graduating the same memory is a no-op dedup, then calls
+  `Loopctl.Knowledge.propose_article/3`.
+
+  On ANY successful verdict `graduated_at` is stamped (idempotently, only if still NULL)
+  and the memory is never re-processed by the sweep — but the DURABILITY guarantee differs
+  by verdict:
+
+    * `:created` / `:duplicate` / `:deduplicated` — the content is represented by a
+      PUBLISHED article (a fresh one, or the canonical existing one), i.e. searchable now.
+    * `:gated_to_draft` — the novelty gate judged the content a near-duplicate and created
+      it as an UNPUBLISHED draft in the human-review queue. It is NOT yet searchable; a
+      reviewer publishes or discards it. Stamping is still correct: the content IS
+      represented (as a draft), and re-selecting the memory would only re-spend embedding
+      budget to hit the idempotency no-op — but the sweep does NOT re-materialize a draft
+      that a reviewer later discards.
+
+  A STRUCTURAL `{:error, changeset}` IS stamped, because it can never succeed on retry;
+  leaving it un-stamped would livelock the hottest-first sweep on a permanently-invalid
+  candidate, re-spending embedding budget every run.
+
+  A TRANSIENT `{:error, :gate_unavailable}` — the novelty gate FELL OPEN because the
+  embedding backend was down and could not actually assess novelty — is NOT stamped and
+  NO article is created (`on_gate_unavailable: :skip` is passed to the gate). The memory
+  stays eligible so a later tick RE-graduates and dedups once embeddings recover, instead
+  of injecting an un-deduplicated published article during the outage and burning the
+  memory's one-shot graduation.
+
+  ## Embedding reuse
+
+  The memory already stores its own `vector(1536)` embedding (populated async by
+  `MemoryEmbeddingWorker`). When present it is threaded into the novelty gate
+  (`propose_article/3` → `assess/3`) so graduation reuses it instead of paying a second
+  embedding round-trip for the identical text; when the memory has not been embedded yet
+  (NULL) the gate embeds as before.
+
+  ## re_scope on an already-graduated memory refuses LOUDLY
+
+  A memory has AT MOST ONE graduated article — the `(tenant_id, title)` unique index
+  admits only one article per memory-title, so a project article and a global article of
+  the SAME memory cannot coexist. `re_scope: :global` on a memory whose `graduated_at` is
+  already set therefore returns `{:error, :already_graduated}` instead of silently
+  hitting the existing article's idempotency/title path and returning the WRONG-scoped
+  article as success. Globalize a memory by passing `re_scope: :global` on its FIRST
+  graduation (before the sweep graduates it project-scoped); re-pointing an
+  already-published article's scope is a separate, deliberate curation action. The
+  per-memory, per-scope `idempotency_key` keeps a same-scope re-graduation an idempotent
+  no-op.
+
+  ## Reachability
+
+  This is a PROGRAMMATIC primitive: `graduate_memory/3` (explicit, incl. `re_scope:
+  :global`) and `MemoryGraduationSweepWorker` (the hourly cadence, which never re-scopes)
+  are its only callers. It is NOT wired to an HTTP/MCP endpoint today, so the `re_scope:
+  :global` path is reachable only from code — exposing an on-demand graduate primitive to
+  agents is a deliberate, un-taken product decision.
+
+  Options: `:re_scope` (`:global` → `project_id: nil`); `:actor_id`/`:actor_label`/
+  `:actor_type` are forwarded to `propose_article/3` for audit attribution.
+  """
+  @spec graduate_memory_record(MemorySchema.t(), keyword()) ::
+          {:ok, atom(), Loopctl.Knowledge.Article.t()}
+          | {:error, :already_graduated | :gate_unavailable | term()}
+  def graduate_memory_record(%MemorySchema{} = memory, opts \\ []) do
+    if re_scope_conflict?(memory, opts) do
+      # An already-graduated memory cannot gain a second, differently-scoped article (one
+      # article per memory-title). Refuse LOUDLY rather than silently returning the
+      # existing wrong-scoped article as success.
+      {:error, :already_graduated}
+    else
+      do_graduate_memory_record(memory, opts)
+    end
+  end
+
+  # `re_scope: :global` only takes effect on a memory that has not yet graduated; on an
+  # already-graduated memory it would collide with the existing article, so it is refused.
+  # The sweep only ever calls with ungraduated memories (its query filters
+  # `graduated_at IS NULL`), so this never affects the automated cadence.
+  defp re_scope_conflict?(%MemorySchema{graduated_at: nil}, _opts), do: false
+  defp re_scope_conflict?(%MemorySchema{}, opts), do: Keyword.get(opts, :re_scope) == :global
+
+  defp do_graduate_memory_record(%MemorySchema{} = memory, opts) do
+    project_id = graduation_project_id(memory, opts)
+    attrs = memory_to_article_attrs(memory, project_id)
+
+    case Knowledge.propose_article(memory.tenant_id, attrs, propose_opts(memory, opts)) do
+      {:ok, %{verdict: verdict, article: article}} ->
+        stamp_graduated(memory)
+        {:ok, verdict, article}
+
+      {:error, :gate_unavailable} ->
+        # The gate FELL OPEN (embedding backend down) — it could not assess novelty, so
+        # nothing was created. Do NOT stamp: leave the memory eligible so a later tick
+        # re-graduates and dedups once embeddings recover, rather than permanently marking
+        # it graduated on an un-assessed (and un-deduplicated) outcome.
+        {:error, :gate_unavailable}
+
+      {:error, :duplicate_title, existing} ->
+        # A same-title / different-body collision. The per-memory idempotency_key +
+        # the FULL memory id in the title suffix make this unreachable for a DISTINCT
+        # memory (two distinct memories can no longer collide on title), so if it ever
+        # fires the content is already represented under that title — stamp so the sweep
+        # does not livelock retrying a title that will always collide.
+        stamp_graduated(memory)
+        {:ok, :duplicate, existing}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        # A STRUCTURAL (validation) failure is DETERMINISTIC — the same attrs fail
+        # identically on every retry. Left un-stamped, the sweep would re-select this
+        # (hottest-first, `graduated_at IS NULL`) memory every hour and re-spend the
+        # novelty-gate embedding budget on a candidate that can NEVER succeed (a per-slot
+        # livelock). Tags are already sanitized in `memory_to_article_attrs/2`; stamping
+        # here terminally records any OTHER structural impossibility (e.g. an over-size
+        # body) so it is not retried forever. `graduated_at` here means "graduation was
+        # terminally attempted", not "a live article exists".
+        Logger.warning(
+          "Memory.graduate_memory_record structural failure (stamping to avoid livelock): " <>
+            "tenant=#{memory.tenant_id} memory=#{memory.id} errors=#{inspect(changeset.errors)}"
+        )
+
+        stamp_graduated(memory)
+        {:error, changeset}
+    end
+  end
+
+  @doc "Recall-count at/above which the graduation sweep graduates a memory."
+  @spec graduation_recall_threshold() :: pos_integer()
+  def graduation_recall_threshold do
+    Application.get_env(:loopctl, :memory_graduation_recall_threshold, 3)
+  end
+
+  @doc "Per-run cap on memories graduated by one sweep tick (execution budget)."
+  @spec graduation_max_per_run() :: pos_integer()
+  def graduation_max_per_run do
+    Application.get_env(:loopctl, :memory_graduation_max_per_run, 50)
+  end
+
+  @doc """
+  Max distinct TENANTS a graduation sweep tick considers (a tenant cap, NOT a row cap).
+
+  The sweep only ever needs `graduation_max_per_run/0` tenants (round-robin serves at
+  least one memory per tenant, so no more than the per-run budget of tenants can
+  contribute in one tick), and it pulls only ~`ceil(max_per_run / n_tenants)` rows per
+  tenant, so the WORST-CASE candidate rows fetched per tick is bounded at roughly
+  `2 * max_per_run` — NOT `scan_limit * max_per_run`. This knob only bounds how wide the
+  DISTINCT-tenant scan may fan out before the random per-tick sample.
+  """
+  @spec graduation_scan_limit() :: pos_integer()
+  def graduation_scan_limit do
+    Application.get_env(:loopctl, :memory_graduation_scan_limit, 500)
+  end
+
+  @doc """
+  Minimum cosine similarity a recalled memory must clear for its hotness bump to count.
+
+  `recall/2` returns the top-k by distance regardless of absolute relevance, so without a
+  floor a sparse subject scope (fewer than k live memories) would have ALL of its
+  memories bumped on every query — auto-graduating low-relevance noise. Only a recall
+  whose similarity (`max(0.0, 1.0 - distance)`) is at or above this floor bumps
+  `recall_count`, keeping the "frequently-recalled = proven-valuable" premise honest for
+  small scopes.
+  """
+  @spec recall_bump_min_score() :: float()
+  def recall_bump_min_score do
+    Application.get_env(:loopctl, :memory_recall_bump_min_score, 0.6)
+  end
+
+  @doc """
+  Cooldown window (seconds) that dedups recall-count bumps per memory.
+
+  A memory's `recall_count` is bumped at most once per this window (see
+  `bump_recall_counts/2`), so a single agent replaying the same query in a tight loop
+  cannot inflate the "frequently-recalled" hotness signal and force premature graduation.
+  """
+  @spec recall_bump_cooldown_seconds() :: pos_integer()
+  def recall_bump_cooldown_seconds do
+    Application.get_env(:loopctl, :memory_recall_bump_cooldown_seconds, 3600)
+  end
+
+  # A caller may only graduate a memory it OWNS: scoped by (tenant_id, subject_id) on
+  # the BYPASSRLS AdminRepo (the explicit-predicate isolation this context uses).
+  defp fetch_owned_memory(%Scope{} = scope, memory_id) do
+    AdminRepo.one(
+      from(m in MemorySchema,
+        where:
+          m.id == ^memory_id and m.tenant_id == ^scope.tenant_id and
+            m.subject_id == ^scope.subject_id
+      )
+    )
+  end
+
+  defp graduation_project_id(%MemorySchema{} = memory, opts) do
+    case Keyword.get(opts, :re_scope) do
+      :global -> nil
+      _ -> memory.project_id
+    end
+  end
+
+  defp memory_to_article_attrs(%MemorySchema{} = memory, project_id) do
+    %{
+      title: graduation_title(memory),
+      body: memory.text,
+      category: :finding,
+      # PUBLISHED, not draft: knowledge_search/knowledge_context return PUBLISHED articles
+      # only, so a draft graduation would be invisible and the wiki would never grow.
+      # create_article/3 TRUSTS attrs[:status] and the Article moduledoc requires a
+      # non-controller caller to sanitize it server-side — this IS that sanitization. The
+      # novelty gate may still downgrade to :draft on a :low_novelty verdict (the
+      # human-review queue), which is the ONE intended unpublished outcome.
+      status: :published,
+      # Memory tags are unvalidated at the memory tier, but the Article changeset enforces
+      # count (<=50), length (<=100), and format. Copying arbitrary client-set tags verbatim
+      # would make a structurally-impossible candidate fail the changeset on EVERY sweep — a
+      # per-slot livelock that re-spends embedding budget hourly. Sanitize to Article's
+      # limits so graduation can never be poisoned by a hostile/oversized tag set.
+      tags: sanitize_graduation_tags(memory.tags),
+      project_id: project_id,
+      # Stable per-memory, PER-SCOPE key: re-graduation to the SAME scope (a race, a
+      # retry, or a second sweep before graduated_at commits) is an idempotent no-op
+      # dedup rather than a partial dup. The scope MUST be encoded: a `re_scope: :global`
+      # graduation of an already project-graduated memory would otherwise collide with
+      # the project-scoped article's key and hit the idempotent fast path — silently
+      # returning the wrong-scoped article and defeating the re-scope. Distinct scope =
+      # distinct key = the global article actually gets created.
+      idempotency_key: graduation_idempotency_key(memory.id, project_id),
+      metadata: %{
+        "source" => "memory_graduation",
+        "graduated_from_memory_id" => memory.id,
+        "graduated_from_subject_id" => memory.subject_id,
+        "recall_count" => memory.recall_count,
+        # PRESERVE SUBJECT-level isolation. A Memory is agent-private working memory scoped
+        # by (tenant_id, subject_id); graduating it into a tenant-wide SHARED article would
+        # expose one agent's private memory to every peer in the tenant (cross-subject
+        # leak). Stamp OWNER visibility keyed to the memory's subject so the graduated
+        # article stays discoverable by its owner (durable) but is NOT peer-readable —
+        # `Knowledge.propose_article/3` is passed the matching `visibility_agent_id` so the
+        # idempotency/dedup lookups resolve against the owner-visible row.
+        "agent_id" => memory.subject_id,
+        "visibility" => "owner",
+        "memory_type" => "finding"
+      }
+    }
+  end
+
+  # Article tag constraints (mirror `Loopctl.Knowledge.Article`'s @max_tags/@max_tag_length/
+  # @tag_pattern). Memory tags are unbounded/unvalidated, so clamp+filter to what the Article
+  # changeset accepts: drop non-binary, empty, over-long, and format-invalid tags, then cap
+  # the count. Keeping only ALREADY-VALID tags (rather than mangling) guarantees the article
+  # changeset's tag validation cannot fail on a graduated memory.
+  @graduation_max_tags 50
+  @graduation_max_tag_length 100
+  @graduation_tag_pattern ~r/^[a-zA-Z0-9_-]+$/
+  defp sanitize_graduation_tags(tags) when is_list(tags) do
+    tags
+    |> Enum.filter(fn tag ->
+      is_binary(tag) and byte_size(tag) > 0 and
+        String.length(tag) <= @graduation_max_tag_length and
+        Regex.match?(@graduation_tag_pattern, tag)
+    end)
+    |> Enum.take(@graduation_max_tags)
+  end
+
+  defp sanitize_graduation_tags(_), do: []
+
+  # Title = the memory's first line, trimmed and byte-bounded, with the FULL memory-id
+  # suffix so two DISTINCT memories whose first lines coincide can never collide on the
+  # (tenant_id, title) unique index. A truncated (8-char) suffix left a birthday-bounded
+  # collision window in which a distinct memory's body was silently dropped (it hit the
+  # title index, returned the FIRST memory's article, and got stamped without ever being
+  # captured); the full UUID closes that data-loss path. The novelty gate still catches
+  # genuine SEMANTIC duplicates — the suffix only prevents a mechanical DB title clash.
+  # Bounded to the Article 500-char title limit.
+  @graduation_title_max 500
+  defp graduation_title(%MemorySchema{text: text, id: id}) do
+    suffix = " (memory " <> id <> ")"
+
+    base =
+      text
+      |> String.split("\n", parts: 2)
+      |> List.first()
+      |> to_string()
+      |> String.trim()
+
+    base = if base == "", do: "Memory", else: base
+    String.slice(base, 0, @graduation_title_max - String.length(suffix)) <> suffix
+  end
+
+  # Forward audit attribution to propose_article/3, plus the OWNER visibility agent id
+  # (= the memory's subject) so the create dedup/idempotency lookups resolve against the
+  # owner-visible graduated article (matches metadata.visibility = "owner").
+  #
+  #   * `on_gate_unavailable: :skip` — for AUTOMATED graduation the gate must NOT fall
+  #     open and inject an un-deduplicated published article during an embedding outage;
+  #     it returns `{:error, :gate_unavailable}` so the memory re-graduates later.
+  #   * `:embedding` — reuse the memory's already-computed vector (when populated) so the
+  #     gate does not re-embed identical text; omitted (→ gate embeds) when NULL.
+  defp propose_opts(%MemorySchema{subject_id: subject_id} = memory, opts) do
+    [visibility_agent_id: subject_id, on_gate_unavailable: :skip]
+    |> maybe_put_embedding(memory)
+    |> Keyword.merge(Keyword.take(opts, [:actor_id, :actor_label, :actor_type]))
+  end
+
+  defp maybe_put_embedding(propose_opts, %MemorySchema{} = memory) do
+    case fetch_memory_embedding(memory) do
+      nil -> propose_opts
+      embedding -> Keyword.put(propose_opts, :embedding, embedding)
+    end
+  end
+
+  # The memory's `embedding` column is `load_in_query: false`, so it is NOT present on the
+  # struct the sweep/fetch loaded — an EXPLICIT `select` overrides that and returns just
+  # the vector (a cheap local read that saves an embedding API round-trip). NULL until
+  # `MemoryEmbeddingWorker` has embedded the memory.
+  defp fetch_memory_embedding(%MemorySchema{id: id, tenant_id: tenant_id}) do
+    from(m in MemorySchema,
+      where: m.id == ^id and m.tenant_id == ^tenant_id,
+      select: m.embedding
+    )
+    |> AdminRepo.one()
+    |> case do
+      %Pgvector{} = vector -> Pgvector.to_list(vector)
+      list when is_list(list) and list != [] -> list
+      _ -> nil
+    end
+  end
+
+  # Per-memory, PER-SCOPE idempotency key (see `memory_to_article_attrs/2`): global vs
+  # project graduation MUST yield distinct keys so a `re_scope: :global` graduation of an
+  # already project-graduated memory creates the global article instead of colliding with
+  # (and returning) the project-scoped one.
+  defp graduation_idempotency_key(memory_id, nil), do: "memory-graduation-#{memory_id}-global"
+
+  defp graduation_idempotency_key(memory_id, project_id),
+    do: "memory-graduation-#{memory_id}-project:#{project_id}"
+
+  # Idempotent, conditional stamp: mark the memory graduated ONLY if still NULL, so a
+  # concurrent stamp (two sweep ticks, or explicit + sweep) is a harmless no-op and the
+  # memory is graduated at most once.
+  defp stamp_graduated(%MemorySchema{id: id, tenant_id: tenant_id}) do
+    now = DateTime.utc_now()
+
+    from(m in MemorySchema,
+      where: m.id == ^id and m.tenant_id == ^tenant_id and is_nil(m.graduated_at)
+    )
+    |> AdminRepo.update_all(set: [graduated_at: now, updated_at: now])
+
+    :ok
   end
 
   # ===========================================================================

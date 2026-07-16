@@ -28,6 +28,21 @@ defmodule Loopctl.Application do
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
       {Task.Supervisor, name: Loopctl.TaskSupervisor},
+      # #411 Gap 3: owns the public ETS table that pre-filters recall-count hotness
+      # bumps already inside their per-memory cooldown window, so an idle-window
+      # recall issues ZERO background tasks and ZERO DB writes (the DB-side
+      # `WHERE last_recalled_at < cutoff` stays the source of truth). Node-local
+      # pure ETS owner; survives the transient recall/task process that wrote to it.
+      Loopctl.Memory.RecallBumpCache,
+      # #411 Gap 3: BOUNDED supervisor for the fire-and-forget recall-count bump
+      # tasks. `max_children` caps the fan-out so a burst of healthy recalls cannot
+      # spawn an unbounded set of background writes that starve the write pool —
+      # over the cap `start_child` returns `{:error, :max_children}` and the bump is
+      # dropped (best-effort analytics, never fails the recall). Separate from the
+      # general `Loopctl.TaskSupervisor` so bump backpressure is isolated.
+      {Task.Supervisor,
+       name: Loopctl.Memory.RecallBumpTaskSupervisor,
+       max_children: Application.get_env(:loopctl, :memory_recall_bump_max_tasks, 200)},
       # US-38.2: owns the public ETS table backing the throttled, PII-safe
       # rate-limiter fail-open logger, so a sustained limiter/DB outage emits a
       # bounded heartbeat per bucket-family instead of one warning per request

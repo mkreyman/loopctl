@@ -428,6 +428,14 @@ defmodule Loopctl.ObanConfig do
          # promoted before SessionMemoryPruneWorker can delete them (no silent
          # golden-nugget loss).
          {"*/10 * * * *", Loopctl.Workers.MemoryPromotionSweepWorker},
+         # #411 Gap 3: HOURLY graduation of HOT long-term memories (recall_count >=
+         # :memory_graduation_recall_threshold) into durable knowledge articles, deduped
+         # via the novelty gate. DELIBERATELY slower than the 10-min promotion sweep —
+         # graduation is not latency-sensitive and an hourly cadence keeps the
+         # novelty-gate embedding spend low. Bounded per run by
+         # :memory_graduation_max_per_run. Keep in sync with the crontab assertion in
+         # oban_plugins_config_test.exs.
+         {"0 * * * *", Loopctl.Workers.MemoryGraduationSweepWorker},
          # US-35.3: all-tenants STH safety sweep. Reduced from `"* * * * *"` (every
          # minute) to a low-frequency, config-driven backstop (default `*/5 * * * *`)
          # that only catches appends the event-driven enqueuer (US-35.2) missed. Each
