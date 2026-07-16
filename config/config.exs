@@ -476,6 +476,19 @@ config :loopctl, :memory_promotion_sweep_interval_seconds, 600
 config :loopctl, :memory_promotion_sweep_window_seconds, 900
 config :loopctl, :session_memory_ttl_seconds, 3600
 
+# Memory GRADUATION tunables (#411 Gap 3 — Loopctl.Workers.MemoryGraduationSweepWorker).
+# A DISTINCT, higher tier than the promotion loop above: a long-term memory recalled at
+# least `recall_threshold` times (via a HEALTHY semantic recall — the ILIKE fallback does
+# NOT bump the counter, so a provider outage cannot skew the signal) is graduated into a
+# durable Knowledge Wiki article, deduped by the novelty gate.
+# - recall_threshold: recall-count at/above which a memory is eligible to graduate.
+# - max_per_run: per-tick execution budget — the max memories one hourly sweep processes,
+#   bounding the novelty-gate embedding spend per run.
+# - scan_limit: max candidate rows a sweep tick scans across all tenants.
+config :loopctl, :memory_graduation_recall_threshold, 3
+config :loopctl, :memory_graduation_max_per_run, 50
+config :loopctl, :memory_graduation_scan_limit, 500
+
 # Epic 30 / US-30.1: per-tenant cap on entity definitions
 # (`Loopctl.ContextRetriever.Registry`). Bounds the dynamic ListTools payload/
 # latency of the generated agent query surface so a tenant admin cannot inflate

@@ -90,6 +90,15 @@ defmodule Loopctl.Memory.Memory do
     field :tags, {:array, :string}, default: []
     field :metadata, :map, default: %{}
 
+    # #411 Gap 3: recall-count tracking + graduation. None of these are cast from
+    # request params — `recall_count`/`last_recalled_at` are bumped OFF the recall hot
+    # path by `Loopctl.Memory.bump_recall_counts/2`, and `graduated_at` is stamped by
+    # the graduation sweep / the explicit graduation primitive. `graduated_at` NULL =
+    # not yet graduated into a durable knowledge article.
+    field :recall_count, :integer, default: 0
+    field :last_recalled_at, :utc_datetime_usec
+    field :graduated_at, :utc_datetime_usec
+
     belongs_to :superseded_by_memory, __MODULE__,
       foreign_key: :superseded_by,
       references: :id,
