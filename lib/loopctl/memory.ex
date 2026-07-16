@@ -44,6 +44,8 @@ defmodule Loopctl.Memory do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
@@ -57,6 +59,7 @@ defmodule Loopctl.Memory do
   alias Loopctl.Memory.SessionMemory
   alias Loopctl.Memory.SessionPromotion
   alias Loopctl.Projects
+  alias Loopctl.TelemetryEvents
   alias Loopctl.Workers.MemoryEmbeddingWorker
   alias Loopctl.Workers.MemoryPromotionWorker
 
@@ -489,46 +492,86 @@ defmodule Loopctl.Memory do
     query_text = to_string(opt(opts, :query, ""))
     k = clamp_k(opt(opts, :limit, @default_recall_k))
     include_superseded? = truthy?(opt(opts, :include_superseded, false))
+    on_overload = recall_on_overload(opt(opts, :on_overload, :raise))
 
     # Reuse a precomputed embedding when the caller supplies one (the merged recall
     # generates it ONCE for both halves — #411 Gap 2); otherwise generate here.
     case opt(opts, :embedding, nil) || Knowledge.generate_embedding(scope.tenant_id, query_text) do
       {:ok, embedding} ->
-        recall_semantic(scope, embedding, k, include_superseded?)
+        recall_semantic(scope, embedding, k, include_superseded?, on_overload)
 
       {:error, reason} ->
-        recall_fallback(scope, reason, query_text, k, include_superseded?)
+        recall_fallback(scope, reason, query_text, k, include_superseded?, on_overload)
     end
   end
 
-  defp recall_semantic(scope, embedding, k, include_superseded?) do
+  # `:on_overload` controls how a per-tenant HeavyRead cap SHED is handled (US-37.5):
+  # `:raise` (the DEFAULT, standalone `/memory/recall`) raises `OverloadedError` → a 429;
+  # `:tag` (the merged `/recall`, #411 Gap 2) degrades to an empty envelope so one shed
+  # pool cannot sink the whole merged endpoint. Only these two values are honored.
+  defp recall_on_overload(:tag), do: :tag
+  defp recall_on_overload(_), do: :raise
+
+  defp recall_semantic(scope, embedding, k, include_superseded?, on_overload) do
     query = memory_candidate_query(scope, embedding, k, include_superseded?)
 
-    rows =
-      HeavyRead.all_memory(
-        scope.tenant_id,
-        scope.subject_id,
-        query,
-        HeavyRead.opts(:memory_recall)
-      )
+    case HeavyRead.all_memory(
+           scope.tenant_id,
+           scope.subject_id,
+           query,
+           memory_recall_opts(on_overload)
+         ) do
+      {:error, :heavy_read_overloaded} ->
+        overloaded_memory_env(scope.tenant_id, k)
 
-    results =
-      Enum.map(rows, fn row ->
-        # Clamp to [0, 1]: pgvector cosine distance ranges [0, 2], so a distance > 1
-        # would make `1 - distance` NEGATIVE. Mirror VectorSearch's `:knn` score
-        # contract (GREATEST of 0 and `1 - distance`) so the [{memory, score}]
-        # envelope surfaced to US-28.3/US-28.4 never carries a negative similarity.
-        # Ordering is by ascending distance (below), so the clamp cannot reorder.
-        {row_to_memory(row), max(0.0, 1.0 - row.distance)}
-      end)
+      rows when is_list(rows) ->
+        results =
+          Enum.map(rows, fn row ->
+            # Clamp to [0, 1]: pgvector cosine distance ranges [0, 2], so a distance > 1
+            # would make `1 - distance` NEGATIVE. Mirror VectorSearch's `:knn` score
+            # contract (GREATEST of 0 and `1 - distance`) so the [{memory, score}]
+            # envelope surfaced to US-28.3/US-28.4 never carries a negative similarity.
+            # Ordering is by ascending distance (below), so the clamp cannot reorder.
+            {row_to_memory(row), max(0.0, 1.0 - row.distance)}
+          end)
+
+        %{
+          results: results,
+          meta: %{
+            total_count: length(results),
+            fallback: false,
+            reason: nil,
+            underfilled: length(results) < k
+          }
+        }
+    end
+  end
+
+  # HeavyRead opts for a memory recall, with the caller's shed policy layered on. `:raise`
+  # is `all_memory`'s own default, so it is only threaded explicitly for `:tag`.
+  defp memory_recall_opts(:tag),
+    do: Keyword.put(HeavyRead.opts(:memory_recall), :on_overload, :tag)
+
+  defp memory_recall_opts(_), do: HeavyRead.opts(:memory_recall)
+
+  # The empty, degraded memory envelope returned when the per-tenant HeavyRead cap SHED
+  # the memory read on the merged `/recall` path (`on_overload: :tag`). Emits an
+  # alertable telemetry event + log (the shed is otherwise silent here — a `:raise` shed
+  # would have surfaced as a 429) so operators can see a memory-half degradation, then
+  # returns empty so the knowledge half of the merged recall is still served rather than
+  # the whole endpoint 429-ing. `reason` mirrors the memory `meta.reason` fallback-tag
+  # contract (like the embedding-fallback tags), so callers can tell the memory side is
+  # empty by capacity, not by scope.
+  defp overloaded_memory_env(tenant_id, k) do
+    emit_recall_degraded(tenant_id, "memory", "heavy_read_overloaded")
 
     %{
-      results: results,
+      results: [],
       meta: %{
-        total_count: length(results),
-        fallback: false,
-        reason: nil,
-        underfilled: length(results) < k
+        total_count: 0,
+        fallback: true,
+        reason: "heavy_read_overloaded",
+        underfilled: k > 0
       }
     }
   end
@@ -664,7 +707,7 @@ defmodule Loopctl.Memory do
     struct(MemorySchema, Map.drop(row, [:distance]))
   end
 
-  defp recall_fallback(scope, reason, query_text, k, include_superseded?) do
+  defp recall_fallback(scope, reason, query_text, k, include_superseded?, on_overload) do
     reason_tag = fallback_reason_tag(reason)
 
     query =
@@ -679,25 +722,28 @@ defmodule Loopctl.Memory do
       |> maybe_ilike(query_text)
       |> maybe_scope_project(scope.project_id)
 
-    rows =
-      HeavyRead.all_memory(
-        scope.tenant_id,
-        scope.subject_id,
-        query,
-        HeavyRead.opts(:memory_recall)
-      )
+    case HeavyRead.all_memory(
+           scope.tenant_id,
+           scope.subject_id,
+           query,
+           memory_recall_opts(on_overload)
+         ) do
+      {:error, :heavy_read_overloaded} ->
+        overloaded_memory_env(scope.tenant_id, k)
 
-    results = Enum.map(rows, fn memory -> {memory, nil} end)
+      rows when is_list(rows) ->
+        results = Enum.map(rows, fn memory -> {memory, nil} end)
 
-    %{
-      results: results,
-      meta: %{
-        total_count: length(results),
-        fallback: true,
-        reason: reason_tag,
-        underfilled: length(results) < k
-      }
-    }
+        %{
+          results: results,
+          meta: %{
+            total_count: length(results),
+            fallback: true,
+            reason: reason_tag,
+            underfilled: length(results) < k
+          }
+        }
+    end
   end
 
   defp maybe_ilike(query, ""), do: query
@@ -792,12 +838,41 @@ defmodule Loopctl.Memory do
   Callers that need a calibrated re-rank get BOTH the merged view AND the untouched
   per-source envelopes (`:memory`, `:knowledge`), each carrying its own native scores.
 
-  ## Degradation, never a 500
+  ## Degradation, never a 500 (and never a whole-endpoint 429)
 
-  If `search_combined/3` returns an error (empty query, invalid weights, etc.) the
-  knowledge side degrades to empty results with `meta.degraded?: true` and the memory
-  side is still returned — the merged call never crashes on a knowledge fault. A
-  keyword-only knowledge fallback (embedding unavailable) also sets `degraded?: true`.
+  Degradation is SYMMETRIC across both halves — one degraded half never fails the whole
+  call:
+
+    * If `search_combined/3` returns an error (invalid weights, etc.) the knowledge side
+      degrades to empty results with `meta.degraded?: true` and the memory side is still
+      returned — the merged call never crashes on a knowledge fault. A keyword-only
+      knowledge fallback (embedding unavailable) also sets `degraded?: true`.
+    * If the per-tenant HeavyRead cap SHEDS the memory read, the merged path threads
+      `on_overload: :tag` so the memory side degrades to an EMPTY envelope (with
+      `degraded?: true`) instead of raising `OverloadedError` — so a shed memory pool
+      429-ing cannot discard the knowledge results the caller could still have gotten.
+      (The standalone `/memory/recall` keeps `on_overload: :raise` → a 429.)
+
+  `meta.degraded_reason` names WHY (a bounded tag), and the knowledge/memory-half
+  degradation each emits a `[:loopctl, :memory, :recall_context, :degraded]` telemetry
+  event + log so a silent partial failure is alertable.
+
+  ## Concurrency & cost
+
+  The two halves run SEQUENTIALLY (memory read, then knowledge combined read), not
+  Task-parallel — a deliberate cap-friendly choice that holds at most ONE per-tenant
+  HeavyRead slot at a time. The tradeoff: additive (not max) wall-clock latency and ~2x
+  the governed heavy-read throughput of a single search per `/recall`. Parallelizing is
+  intentionally NOT done, because two simultaneous slots would double a single request's
+  peak pressure under the very cap that shields other tenants.
+
+  ## Known bias on the degraded path
+
+  On a degraded knowledge side (keyword-only fallback) memory rows carry absolute cosine
+  scores while knowledge rows carry raw (un-normalized) keyword `relevance_score`, which
+  can exceed memory's cosine max of 1.0 and outrank memory in the merged `data`. A caller
+  needing memory-first ordering under degradation should read the per-source `:memory`
+  envelope (it preserves the honest native scores/nils), disclosed via `meta.degraded?`.
 
   ## Options
 
@@ -826,7 +901,8 @@ defmodule Loopctl.Memory do
           total_count: non_neg_integer(),    # length(results) after the merged cap
           memory_count: non_neg_integer(),   # memory rows BEFORE the merged cap
           knowledge_count: non_neg_integer(),# knowledge rows BEFORE the merged cap
-          degraded?: boolean(),              # knowledge errored or fell back to keyword
+          degraded?: boolean(),              # knowledge errored/fell back OR memory shed
+          degraded_reason: String.t() | nil, # bounded tag naming why (nil when healthy)
           results_ranking: String.t()        # "heuristic_cross_source" (see KNOWN BIAS)
         }
       }
@@ -856,7 +932,20 @@ defmodule Loopctl.Memory do
     # memory side could succeed while the knowledge side independently fell back).
     embedding_result = Knowledge.generate_embedding(scope.tenant_id, query)
 
-    memory_env = recall(scope, query: query, limit: limit, embedding: embedding_result)
+    # The two halves run SEQUENTIALLY (memory heavy-read, then the knowledge combined
+    # keyword+semantic reads) rather than Task-parallel — a DELIBERATE cap-friendly
+    # choice, NOT an oversight. Parallelizing would hold TWO per-tenant HeavyRead slots
+    # simultaneously under the very cap that shields other tenants (US-37.5), doubling a
+    # single /recall's peak concurrent slot pressure and raising the shed probability the
+    # cap exists to bound; sequential holds at most ONE slot at a time. The tradeoff is
+    # additive (not max) wall-clock latency and ~2x the governed heavy-read THROUGHPUT of
+    # a single search per /recall — acceptable while the endpoint is throughput/cap-bound
+    # rather than latency-bound. `on_overload: :tag` degrades a memory-half shed to an
+    # empty envelope so it never sinks the whole endpoint (symmetric with the knowledge
+    # half's keyword-only degrade).
+    memory_env =
+      recall(scope, query: query, limit: limit, embedding: embedding_result, on_overload: :tag)
+
     knowledge_env = knowledge_recall(scope, query, limit, opts, embedding_result)
 
     memory_items =
@@ -886,7 +975,14 @@ defmodule Loopctl.Memory do
         total_count: length(merged),
         memory_count: length(memory_items),
         knowledge_count: length(knowledge_items),
-        degraded?: knowledge_degraded?(knowledge_env),
+        # `degraded?` is true when EITHER half degraded: the knowledge side errored/fell
+        # back to keyword-only, OR the memory heavy-read pool was shed (empty by capacity).
+        degraded?: knowledge_degraded?(knowledge_env) or memory_degraded?(memory_env),
+        # A BOUNDED, non-sensitive tag naming WHY the merged recall degraded (or `nil`
+        # when it did not), so a caller can distinguish a scope-empty half from a
+        # fault-empty one without parsing the per-source envelopes. Knowledge degradation
+        # is reported first (it drives the documented `degraded?`), then memory.
+        degraded_reason: merged_degraded_reason(memory_env, knowledge_env),
         # The merged `results` order sorts memory's ABSOLUTE cosine similarity against
         # knowledge's POOL-NORMALIZED final_score — a heuristic, not a calibrated
         # cross-source ranking (knowledge is biased upward; see the moduledoc). Surface
@@ -925,22 +1021,89 @@ defmodule Loopctl.Memory do
         %{results: results, meta: Map.put(meta, :degraded?, Map.get(meta, :fallback, false))}
 
       {:error, reason} ->
-        degraded_knowledge_env(reason)
+        degraded_knowledge_env(scope.tenant_id, reason, limit)
 
       {:error, reason, _message} ->
-        degraded_knowledge_env(reason)
+        degraded_knowledge_env(scope.tenant_id, reason, limit)
     end
   end
 
-  # The uniform empty/degraded knowledge envelope used when `search_combined/3` cannot
-  # run (empty query, invalid weights, over-long query, ...). `error` carries the
-  # underlying reason atom for observability; `degraded?: true` drives the merged
-  # meta flag and tells the caller the knowledge side is empty by fault, not by scope.
-  defp degraded_knowledge_env(reason) do
-    %{results: [], meta: %{total_count: 0, degraded?: true, error: reason, fallback: false}}
+  # The uniform empty/degraded knowledge envelope used when `search_combined/3` returns
+  # a hard `{:error, _}` (empty query, invalid weights, ...) rather than a keyword-only
+  # fallback. Emits an alertable telemetry event + log (this branch was otherwise
+  # SILENT — no signal for operators, unlike the keyword-fallback path which records a
+  # reason) and builds a meta that is SHAPE-COMPATIBLE with the healthy
+  # `search_combined/3` meta (`total_count`/`limit`/`offset`) so the endpoint serializer
+  # can project it through the SAME `KnowledgeSearchJSON.render_meta` whitelist the
+  # standalone knowledge endpoints use. The reason is carried ONLY as a BOUNDED,
+  # non-sensitive `fallback_reason` tag — the raw internal reason atom is NEVER placed
+  # in the client-facing meta (it lives only in telemetry/logs), so `/recall` no longer
+  # leaks an internal atom the equivalent `/knowledge/search` would have stripped.
+  defp degraded_knowledge_env(tenant_id, reason, limit) do
+    tag = knowledge_degraded_reason_tag(reason)
+    emit_recall_degraded(tenant_id, "knowledge", tag)
+
+    %{
+      results: [],
+      meta: %{
+        total_count: 0,
+        limit: limit,
+        offset: 0,
+        degraded?: true,
+        fallback: true,
+        fallback_reason: tag
+      }
+    }
+  end
+
+  # Map a `search_combined/3` hard-error reason atom to a BOUNDED, non-sensitive tag safe
+  # to surface in `meta`/telemetry (never the raw atom). These three atoms are the FULL
+  # error contract of `search_combined/3` (dialyzer-verified) — with the controller now
+  # rejecting blank AND over-length queries up front, `:empty_query`/`:bad_request` are
+  # unreachable via `/recall`, but any of the contract's reasons is coerced to this set.
+  defp knowledge_degraded_reason_tag(:empty_query), do: "empty_query"
+  defp knowledge_degraded_reason_tag(:invalid_weights), do: "invalid_weights"
+  defp knowledge_degraded_reason_tag(:bad_request), do: "bad_request"
+
+  # Emit the merged-recall degradation signal (telemetry + log) for ONE degraded half so
+  # a silent partial failure of `/recall` is alertable. `reason`/`side` are BOUNDED tags;
+  # the query TEXT is never included (matching the other knowledge/memory telemetry).
+  defp emit_recall_degraded(tenant_id, side, reason) do
+    :telemetry.execute(
+      TelemetryEvents.recall_context_degraded(),
+      %{count: 1},
+      %{tenant_id: tenant_id, side: side, reason: reason}
+    )
+
+    Logger.warning(
+      "memory.recall_context degraded side=#{side} reason=#{reason} tenant_id=#{tenant_id}"
+    )
+
+    :ok
   end
 
   defp knowledge_degraded?(%{meta: meta}), do: Map.get(meta, :degraded?, false) == true
+
+  # The memory half is "degraded" for the merged `degraded?`/`degraded_reason` ONLY when
+  # its heavy read was SHED by the per-tenant cap (empty by capacity). An ordinary
+  # embedding-unavailable ILIKE fallback is NOT counted here — that path degrades BOTH
+  # halves and is already reflected via the knowledge side's keyword-only fallback.
+  defp memory_degraded?(%{meta: meta}), do: Map.get(meta, :reason) == "heavy_read_overloaded"
+
+  # A BOUNDED, non-sensitive tag naming why the merged recall degraded, or `nil`. Reports
+  # the knowledge side first (it drives the documented `degraded?`), then memory.
+  defp merged_degraded_reason(memory_env, knowledge_env) do
+    cond do
+      knowledge_degraded?(knowledge_env) ->
+        knowledge_env.meta[:fallback_reason] || "knowledge_degraded"
+
+      memory_degraded?(memory_env) ->
+        memory_env.meta[:reason]
+
+      true ->
+        nil
+    end
+  end
 
   # Knowledge combined ranking score. Normal combined results carry `:final_score`
   # (pool-normalized weighted keyword+semantic, in [0, 1]); when combined DEGRADES to a

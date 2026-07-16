@@ -63,6 +63,12 @@ defmodule LoopctlWeb.MemoryController do
 
   @memory_attr_keys ~w(tier text session_id role content expires_at confidence source_session_id tags metadata)
 
+  # The merged-recall query length cap, mirroring the knowledge half's
+  # `Loopctl.Knowledge.validate_query_string/1` 500-char limit so `/recall` rejects an
+  # over-length query at the boundary (BEFORE the shared embedding call) exactly as the
+  # standalone `/knowledge/search` does — never half-degrading to a memory-only 200.
+  @max_context_query_length 500
+
   operation(:create,
     summary: "Remember (write a memory)",
     description:
@@ -143,22 +149,32 @@ defmodule LoopctlWeb.MemoryController do
         "excluded). `project_id` is a PARTITION key, NOT the isolation boundary — " <>
         "`(tenant_id, subject_id)` is, and is derived from the API key, never the body. " <>
         "A malformed `project_id` is a 422 (`invalid_project_id`); a non-string, " <>
-        "missing, or blank/whitespace-only `query` is a 422 (`invalid_query`). The " <>
+        "missing, or blank/whitespace-only `query` is a 422 (`invalid_query`); a query " <>
+        "longer than 500 characters is a 422 (`query_too_long`) — rejected up front " <>
+        "(matching `/knowledge/search`) BEFORE any embedding is generated, never a " <>
+        "half-degraded memory-only 200. The " <>
         "response carries the merged `results` (each tagged `source: memory|knowledge`, " <>
         "sorted by a heuristically-comparable `score` DESC — `meta.results_ranking` is " <>
         "`heuristic_cross_source`) PLUS the untouched per-source `memory` and " <>
         "`knowledge` envelopes so callers can re-rank. Cross-source scores are " <>
         "heuristic, not calibrated (memory = absolute cosine similarity; knowledge = " <>
         "pool-normalized keyword+semantic, which biases knowledge UPWARD in the default " <>
-        "order). If the knowledge search errors or degrades to keyword-only the memory " <>
-        "side is still returned and `meta.degraded?` is true — never a 500. Agent role " <>
+        "order). On a DEGRADED knowledge side (keyword-only fallback) memory rows carry " <>
+        "absolute cosine scores while knowledge rows carry raw (un-normalized) keyword " <>
+        "`relevance_score`, which can outrank memory in the merged `data` — callers who " <>
+        "need memory-first ordering under degradation should read the per-source `memory` " <>
+        "envelope (it preserves the honest native scores). If the knowledge search " <>
+        "errors or degrades to keyword-only, OR the memory heavy-read pool is shed under " <>
+        "the per-tenant cap, the OTHER side is still returned and `meta.degraded?` is " <>
+        "true (`meta.degraded_reason` names why) — never a 500 and never a whole-endpoint " <>
+        "429 from one shed pool. Agent role " <>
         "is forced to published articles and its own/`shared` memories (#163).",
     request_body: {"Recall params", "application/json", Schemas.RecallContextRequest},
     responses: %{
       200 => {"Merged recall results", "application/json", Schemas.RecallContextResponse},
       422 =>
-        {"Subject unresolvable, non-string query, or invalid project_id", "application/json",
-         Schemas.ErrorResponse},
+        {"Subject unresolvable, non-string/blank/over-length query, or invalid project_id",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
     }
@@ -357,27 +373,38 @@ defmodule LoopctlWeb.MemoryController do
 
           json(conn, RecallJSON.context(Memory.recall_context(scope, opts)))
 
-        :error ->
+        {:error, :query_too_long} ->
+          query_too_long(conn)
+
+        {:error, :invalid_query} ->
           invalid_query(conn)
       end
     end)
   end
 
   # Coerce + trim the merged-recall query ONCE at the boundary, treating blank/
-  # whitespace-only uniformly across both halves. The knowledge half
-  # (`search_combined/3`) trims and rejects blank with `{:error, :empty_query}` while
-  # the memory half would ILIKE the untrimmed whitespace — so an absent/blank query
-  # previously yielded a confusing "memory-only with a spuriously degraded knowledge
-  # side" response and false `degraded?` alerts. The merged recall REQUIRES a non-blank
-  # query (the knowledge half is its point), so blank input is a clean 422 up front —
-  # matching the sibling knowledge search/context endpoints, not the degraded path.
+  # whitespace-only AND over-length uniformly across both halves. The knowledge half
+  # (`search_combined/3` → `validate_query_string/1`) trims, rejects blank with
+  # `{:error, :empty_query}`, AND rejects > #{@max_context_query_length}-char queries
+  # with `{:error, :bad_request, _}`; the memory half would ILIKE/embed the untrimmed
+  # value regardless. So an absent/blank OR an over-length query previously yielded a
+  # confusing "memory-only with a spuriously degraded knowledge side" response and a
+  # false `degraded?` alert — AND the over-length case additionally spent an outbound
+  # embedding provider call on the full (multi-KB) query BEFORE the knowledge cap
+  # rejected it. The merged recall REQUIRES a non-blank, ≤ #{@max_context_query_length}-
+  # char query (the knowledge half is its point), so both are a clean 422 up front —
+  # matching the sibling knowledge search/context endpoints, not the degraded path, and
+  # rejecting BEFORE `recall_context/2` generates the shared embedding.
   defp coerce_context_query(query) do
     with {:ok, coerced} <- coerce_query(query),
          trimmed = String.trim(coerced),
-         false <- trimmed == "" do
+         {:blank, false} <- {:blank, trimmed == ""},
+         {:too_long, false} <-
+           {:too_long, String.length(trimmed) > @max_context_query_length} do
       {:ok, trimmed}
     else
-      _ -> :error
+      {:too_long, true} -> {:error, :query_too_long}
+      _ -> {:error, :invalid_query}
     end
   end
 
@@ -625,6 +652,21 @@ defmodule LoopctlWeb.MemoryController do
         status: 422,
         code: "invalid_query",
         message: "The `query` field must be a string."
+      }
+    })
+  end
+
+  # Reject an over-length merged-recall query with a distinct 422 BEFORE any embedding
+  # is generated, matching the knowledge half's 500-char cap. A generic `invalid_query`
+  # would mislead ("must be a string"), so this names the length constraint explicitly.
+  defp query_too_long(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "query_too_long",
+        message: "The `query` must be at most #{@max_context_query_length} characters."
       }
     })
   end

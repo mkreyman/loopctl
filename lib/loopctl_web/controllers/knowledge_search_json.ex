@@ -147,7 +147,17 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
 
   defp truncate_snippet(_), do: nil
 
-  defp render_meta(meta) do
+  @doc """
+  Projects a `search_combined/3` / `search/3` result `meta` through the canonical
+  whitelist used by the knowledge search endpoints.
+
+  Shared with `LoopctlWeb.RecallJSON` (the merged `/recall` endpoint) so its knowledge
+  envelope emits the SAME whitelisted meta shape — never the raw context meta with any
+  internal reason atom. Requires `:total_count`, `:limit`, and `:offset` on `meta` (both
+  the healthy `search_combined/3` meta and the merged endpoint's degraded stub carry
+  them); the remaining keys are optional and emitted only when present.
+  """
+  def render_meta(meta) do
     %{
       total_count: meta[:total_count] || meta.total_count,
       limit: meta[:limit] || meta.limit,

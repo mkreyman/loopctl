@@ -21,6 +21,13 @@ defmodule LoopctlWeb.RecallJSON do
   Cross-source `score`s are heuristically comparable, not calibrated (see the context
   function's `@doc`); `meta.results_ranking` carries the `"heuristic_cross_source"`
   tag so consumers can detect this programmatically.
+
+  The knowledge envelope's `meta` is ALSO projected — through
+  `KnowledgeSearchJSON.render_meta/1`, the same whitelist the standalone knowledge
+  endpoints use — so both results AND meta match that shape. The raw context meta's
+  internal `error` reason atom is never passed through; only the bounded `fallback_reason`
+  tag survives (plus the merged-recall `degraded` flag). The top-level `meta` adds
+  `degraded_reason`, a bounded tag naming why a half degraded (or `null`).
   """
 
   alias LoopctlWeb.{KnowledgeSearchJSON, MemoryJSON}
@@ -33,9 +40,25 @@ defmodule LoopctlWeb.RecallJSON do
     %{
       data: Enum.map(results, &merged_item/1),
       memory: MemoryJSON.recall(memory),
-      knowledge: %{data: Enum.map(knowledge.results, &knowledge_summary/1), meta: knowledge.meta},
+      knowledge: %{
+        data: Enum.map(knowledge.results, &knowledge_summary/1),
+        meta: knowledge_meta(knowledge.meta)
+      },
       meta: meta_json(meta)
     }
+  end
+
+  # Project the knowledge envelope meta through the SAME `KnowledgeSearchJSON.render_meta`
+  # whitelist the standalone knowledge search endpoints use, then re-attach the merged-
+  # recall `degraded` flag. This keeps the moduledoc's promise (the knowledge side is the
+  # EXACT shape the knowledge search endpoints serialize) for META as well as results:
+  # the raw context meta's internal `error` reason atom (an internal capacity/validation
+  # signal `/knowledge/search` would strip) is NEVER passed through — only the bounded
+  # `fallback_reason` tag survives, exactly as on `/knowledge/search`.
+  defp knowledge_meta(meta) do
+    meta
+    |> KnowledgeSearchJSON.render_meta()
+    |> Map.put(:degraded, Map.get(meta, :degraded?, false))
   end
 
   defp merged_item(%{source: :memory, score: score, memory: memory}) do
@@ -62,6 +85,9 @@ defmodule LoopctlWeb.RecallJSON do
       memory_count: meta.memory_count,
       knowledge_count: meta.knowledge_count,
       degraded: meta.degraded?,
+      # A bounded, non-sensitive tag naming WHY the merged recall degraded (or `null`),
+      # so a caller can distinguish a scope-empty half from a fault-empty one.
+      degraded_reason: meta.degraded_reason,
       # Stable tag warning that the merged `data` order is a cross-source heuristic
       # (memory absolute cosine vs knowledge pool-normalized), NOT calibrated relevance.
       results_ranking: meta.results_ranking

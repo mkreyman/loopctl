@@ -245,6 +245,36 @@ defmodule Loopctl.TelemetryEvents do
   """
   def article_linking_corpus_size, do: [:loopctl, :knowledge, :article_linking, :corpus_size]
 
+  @doc """
+  One HALF of the merged recall (`POST /api/v1/recall`, `Loopctl.Memory.recall_context/2`,
+  #411 Gap 2) degraded to an EMPTY, non-fatal envelope so the OTHER half could still be
+  served — turning an otherwise silent partial failure into an alertable signal (the
+  merged `meta` only carries a coarse `degraded?`/`degraded_reason`, no per-side detail).
+
+  Fires when either half of the merged recall degrades:
+
+    * the KNOWLEDGE half: `search_combined/3` returned an `{:error, _}` (e.g. an
+      invalid-weights or bad-request rejection) instead of a keyword-only fallback, so
+      the knowledge side is empty by FAULT (not by scope), and
+    * the MEMORY half: the per-tenant HeavyRead cap SHED the memory read (`{:error,
+      :heavy_read_overloaded}`); on the merged path this degrades to an empty memory
+      envelope (`on_overload: :tag`) rather than raising a 429 that would sink the whole
+      endpoint.
+
+  A keyword-only knowledge fallback (embedding unavailable / a memory ILIKE embedding
+  fallback) already emits `knowledge_semantic_fallback/0` and is NOT re-emitted here —
+  this event is specifically the empty-by-fault degradations that carried no signal.
+
+  ## Payload (id/atom only — NEVER the raw query text, an api key, or a provider body)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{tenant_id, side, reason}` where `side` is `"memory"` | `"knowledge"`
+      (a BOUNDED 2-value tag) and `reason` is a BOUNDED, sanitized tag
+      (`"heavy_read_overloaded"` | `"empty_query"` | `"invalid_weights"` |
+      `"bad_request"` | `"knowledge_error"`).
+  """
+  def recall_context_degraded, do: [:loopctl, :memory, :recall_context, :degraded]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -262,7 +292,8 @@ defmodule Loopctl.TelemetryEvents do
       knowledge_hybrid_provenance(),
       llm_provider_error(),
       ingestion_backlog_gate_failed_open(),
-      article_linking_corpus_size()
+      article_linking_corpus_size(),
+      recall_context_degraded()
     ]
   end
 end

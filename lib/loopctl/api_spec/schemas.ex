@@ -3497,7 +3497,19 @@ defmodule Loopctl.ApiSpec.Schemas do
             knowledge_count: %Schema{type: :integer},
             degraded: %Schema{
               type: :boolean,
-              description: "True when the knowledge side errored or fell back to keyword-only."
+              description:
+                "True when EITHER half degraded: the knowledge side errored or fell back " <>
+                  "to keyword-only, OR the memory heavy-read pool was shed under the " <>
+                  "per-tenant cap (empty by capacity, never a whole-endpoint 429)."
+            },
+            degraded_reason: %Schema{
+              type: :string,
+              nullable: true,
+              description:
+                "Bounded, non-sensitive tag naming WHY the merged recall degraded " <>
+                  "(e.g. `heavy_read_overloaded`, `no_embedding_key`, `invalid_weights`), " <>
+                  "or `null` when healthy. Lets a caller tell a scope-empty half from a " <>
+                  "fault-empty one without parsing the per-source envelopes."
             },
             results_ranking: %Schema{
               type: :string,

@@ -119,6 +119,65 @@ defmodule LoopctlWeb.RecallControllerTest do
       end
     end
 
+    test "an over-length (>500 char) query is rejected up front with a 422 query_too_long" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+
+      # 501 chars: rejected at the boundary BEFORE any embedding is generated, so the
+      # knowledge half never half-degrades to an empty, spuriously-`degraded` 200.
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/recall", %{"query" => String.duplicate("a", 501)})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "query_too_long"
+      assert body["error"]["status"] == 422
+    end
+
+    test "a query of exactly 500 chars is accepted (boundary, returns 200)" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/recall", %{"query" => String.duplicate("a", 500)})
+        |> json_response(200)
+
+      assert %{"meta" => _meta} = body
+    end
+
+    test "the knowledge envelope meta is the whitelisted search shape (no raw error atom)" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      _ = published_article(tenant.id, "reshipment guide")
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/recall", %{"query" => "reshipments"})
+        |> json_response(200)
+
+      know_meta = body["knowledge"]["meta"]
+
+      # Projected through KnowledgeSearchJSON.render_meta: the canonical counters are
+      # present and the merged-recall `degraded` flag is re-attached...
+      assert Map.has_key?(know_meta, "total_count")
+      assert Map.has_key?(know_meta, "limit")
+      assert Map.has_key?(know_meta, "offset")
+      assert know_meta["degraded"] == false
+      # ...and the raw internal reason atom is NEVER passed through (unlike the old raw
+      # passthrough), matching what /knowledge/search would serialize.
+      refute Map.has_key?(know_meta, "error")
+
+      # The merged meta names why on degradation; healthy => null.
+      assert Map.has_key?(body["meta"], "degraded_reason")
+      assert body["meta"]["degraded_reason"] == nil
+    end
+
     test "a non-string query is rejected with a deterministic 422 invalid_query" do
       tenant = fixture(:tenant)
       {raw, _key, _agent} = agent_key(tenant.id)
