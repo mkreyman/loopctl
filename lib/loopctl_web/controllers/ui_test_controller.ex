@@ -24,6 +24,11 @@ defmodule LoopctlWeb.UiTestController do
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent] when action in [:create, :index, :show, :add_finding, :complete]
 
+  # A :kb scope can never host ui-test runs (a work-breakdown surface). This is the
+  # load-bearing guard: ui-tests are agent-accessible and NOT human-anchor gated, so once
+  # agent-rooted tenants can create :kb scopes, this plug is what keeps work off them.
+  plug LoopctlWeb.Plugs.RequireWorkProject when action in [:create, :add_finding, :complete]
+
   tags(["UI Tests"])
 
   operation(:create,

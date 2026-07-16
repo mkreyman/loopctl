@@ -23,9 +23,12 @@ defmodule LoopctlWeb.ProjectController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :agent] when action in [:index, :show, :progress, :resolve]
+       [role: :agent] when action in [:index, :show, :progress, :resolve, :create_kb_scope]
 
   # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  # NOTE: :create_kb_scope is deliberately NOT gated here — a :kb scope carries no
+  # chain-of-custody surface (RequireWorkProject bars work attachment), so an agent-rooted
+  # tenant may create one to partition its own knowledge. Extends owner decision #331.
   plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :update, :delete]
 
   tags(["Projects"])
@@ -37,6 +40,22 @@ defmodule LoopctlWeb.ProjectController do
     responses: %{
       201 => {"Project created", "application/json", Schemas.ProjectResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:create_kb_scope,
+    summary: "Create knowledge-only project scope",
+    description:
+      "Creates a knowledge-only project scope (kind: kb). Available at agent+ role and NOT " <>
+        "gated by the human-anchor tier, because a kb scope is structurally barred from the " <>
+        "work-breakdown / chain-of-custody surface. Use it to partition knowledge articles " <>
+        "by repo on the agent-rooted KB tier.",
+    request_body: {"KB scope params", "application/json", Schemas.ProjectCreateRequest},
+    responses: %{
+      201 => {"KB scope created", "application/json", Schemas.ProjectResponse},
+      422 =>
+        {"Validation error or project limit reached", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -153,6 +172,43 @@ defmodule LoopctlWeb.ProjectController do
     }
 
     case Projects.create_project(tenant_id, attrs, audit_opts) do
+      {:ok, project} ->
+        conn
+        |> put_status(:created)
+        |> json(%{project: project_json(project)})
+
+      {:error, :project_limit_reached} ->
+        {:error, :unprocessable_entity, "Project limit reached for this tenant"}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
+    end
+  end
+
+  @doc """
+  POST /api/v1/kb-scopes
+
+  Creates a knowledge-only project scope (`kind: :kb`). Available at agent+ role and NOT
+  gated by `RequireHumanAnchor`: a `:kb` scope carries no chain-of-custody surface
+  (`RequireWorkProject` bars work attachment), so an agent-rooted (KB-tier) tenant may
+  create one to partition its knowledge articles by repo. Delete stays user + human-anchored.
+  Extends owner decision #331 (the KB content surface is fully agent-usable) to KB scoping.
+  """
+  def create_kb_scope(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+
+    # No `mission`: a mission cascades into story context, and a :kb scope has no stories.
+    attrs = %{
+      name: params["name"],
+      slug: params["slug"],
+      repo_url: params["repo_url"],
+      description: params["description"],
+      tech_stack: params["tech_stack"],
+      metadata: params["metadata"] || %{}
+    }
+
+    case Projects.create_project(tenant_id, attrs, Keyword.put(audit_opts, :kind, :kb)) do
       {:ok, project} ->
         conn
         |> put_status(:created)
@@ -365,6 +421,7 @@ defmodule LoopctlWeb.ProjectController do
       description: project.description,
       tech_stack: project.tech_stack,
       status: project.status,
+      kind: project.kind,
       mission: project.mission,
       metadata: project.metadata,
       inserted_at: project.inserted_at,

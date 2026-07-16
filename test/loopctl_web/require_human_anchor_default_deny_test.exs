@@ -147,12 +147,25 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # are (correctly) absent from this allowlist and asserted to 403.
                {:post, "/api/v1/retrieve/:entity"},
 
+               # KB-only project scope: agent-createable by design (extends owner
+               # decision #331 — the KB surface is fully agent-usable). It forces
+               # kind: :kb and carries NO chain-of-custody surface, so it is correctly
+               # OUTSIDE the tier gate. A :kb scope is structurally barred from work by
+               # RequireWorkProject (see the :kb-rejection test), which is what lets the
+               # ui-tests exemption below stay safe now that agent-rooted tenants CAN
+               # create a project.
+               {:post, "/api/v1/kb-scopes"},
+
                # UI test runs (#4/#5 reviewed rationale): a QA/tooling surface,
                # NOT work-breakdown state. Every route is nested under
-               # `/projects/:project_id/...` and creating a project
-               # (`ProjectController.create`) is ALREADY tier-gated, so an
-               # agent-rooted tenant has no project to attach a UI test to —
-               # the surface is unreachable for it even without a per-route gate.
+               # `/projects/:project_id/...`. PREVIOUSLY justified as "unreachable
+               # because agent-rooted tenants can't create a project" — that premise
+               # NO LONGER HOLDS (they can now create a :kb scope). The surface stays
+               # safe because `RequireWorkProject` rejects a :kb project with
+               # 422 kb_project_no_work, so an agent-rooted tenant's only projects
+               # (:kb scopes) still cannot host a UI test. The `:kb`-rejection test
+               # (project_controller_test.exs) guards that positive invariant so this
+               # exemption cannot silently rot.
                {:post, "/api/v1/projects/:project_id/ui-tests"},
                {:post, "/api/v1/projects/:project_id/ui-tests/:id/findings"},
                {:post, "/api/v1/projects/:project_id/ui-tests/:id/complete"},

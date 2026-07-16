@@ -868,6 +868,11 @@ defmodule Loopctl.ApiSpec.Schemas do
         description: %Schema{type: :string, nullable: true},
         tech_stack: %Schema{type: :string, nullable: true},
         status: %Schema{type: :string, enum: ["active", "archived"]},
+        kind: %Schema{
+          type: :string,
+          enum: ["work", "kb"],
+          description: "work = full work-breakdown project; kb = knowledge-only scope"
+        },
         metadata: %Schema{type: :object, additionalProperties: true},
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}

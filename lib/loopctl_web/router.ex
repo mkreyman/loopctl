@@ -221,6 +221,9 @@ defmodule LoopctlWeb.Router do
     # Cheap repo -> project_id resolution (Gap 1 of #411). Must precede the
     # resources block so /projects/resolve is not captured by GET /projects/:id.
     get "/projects/resolve", ProjectController, :resolve
+    # KB-only project scope: agent-createable (agent+ role, no human-anchor gate), forces
+    # kind: :kb. Separate route so the human-anchored `POST /projects` stays untouched.
+    post "/kb-scopes", ProjectController, :create_kb_scope
     resources "/projects", ProjectController, only: [:create, :index, :show, :update, :delete]
     get "/projects/:id/progress", ProjectController, :progress
 
