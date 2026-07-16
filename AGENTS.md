@@ -30,8 +30,9 @@ references: `docs/context-retriever.md`, `docs/agent-memory.md`,
   `resolve_project`. Tools: `memory_remember`, `memory_recall`, `memory_list`,
   `memory_forget`, `memory_promote` (compile a finished session's short-term turns
   into long-term memory), `memory_graduate` (graduate a proven-valuable long-term
-  memory INTO a shared `knowledge_*` article — the bridge between the private and
-  shared surfaces; `re_scope: "global"` promotes a project memory tenant-wide), and
+  memory into a durable `knowledge_*` article that stays OWNER-visible — discoverable
+  by the owning subject, NOT peer-readable; it does NOT publish to the shared surface,
+  and `re_scope: "global"` widens only the project scope, not visibility), and
   `recall_context` (ONE round-trip returning the merged, re-ranked `global ∪
   active-project` union of memory AND knowledge — prefer it over separate
   `memory_recall` + `knowledge_search` calls).

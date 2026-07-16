@@ -1591,8 +1591,15 @@ defmodule Loopctl.Memory do
           {:ok, atom(), Loopctl.Knowledge.Article.t()} | {:error, :not_found | term()}
   def graduate_memory(%Scope{} = scope, memory_id, opts \\ []) when is_binary(memory_id) do
     case fetch_owned_memory(scope, memory_id) do
-      nil -> {:error, :not_found}
-      %MemorySchema{} = memory -> graduate_memory_record(memory, opts)
+      nil ->
+        {:error, :not_found}
+
+      %MemorySchema{} = memory ->
+        # EXPLICIT (on-demand) graduation must NOT terminally stamp `graduated_at` on a
+        # structural failure the way the sweep does for livelock protection: an over-size
+        # body would otherwise 422 while silently consuming the memory's one-shot
+        # graduation with no article and no recovery. Let the caller fix and retry.
+        graduate_memory_record(memory, Keyword.put(opts, :stamp_structural_error, false))
     end
   end
 
@@ -1641,14 +1648,19 @@ defmodule Loopctl.Memory do
 
   A memory has AT MOST ONE graduated article — the `(tenant_id, title)` unique index
   admits only one article per memory-title, so a project article and a global article of
-  the SAME memory cannot coexist. `re_scope: :global` on a memory whose `graduated_at` is
-  already set therefore returns `{:error, :already_graduated}` instead of silently
-  hitting the existing article's idempotency/title path and returning the WRONG-scoped
-  article as success. Globalize a memory by passing `re_scope: :global` on its FIRST
-  graduation (before the sweep graduates it project-scoped); re-pointing an
-  already-published article's scope is a separate, deliberate curation action. The
-  per-memory, per-scope `idempotency_key` keeps a same-scope re-graduation an idempotent
-  no-op.
+  the SAME memory cannot coexist. `re_scope: :global` on an already-graduated PROJECT
+  memory therefore returns `{:error, :already_graduated}` instead of silently hitting the
+  existing article's idempotency/title path and returning the WRONG-scoped article as
+  success. (On an already-graduated GLOBAL memory `re_scope: :global` is a no-op — same
+  scope — so it dedups idempotently, NOT a 409.) Globalize a PROJECT memory by passing
+  `re_scope: :global` on its FIRST graduation, before the hourly sweep graduates it
+  project-scoped — the sweep never re-scopes, so if it graduates a project memory first,
+  `re_scope: :global` will permanently 409 and that memory can no longer become
+  tenant-wide (a nondeterministic race the caller cannot beat; graduate promptly, or
+  re-point the published article's scope as a separate curation action). The per-memory,
+  per-scope `idempotency_key` keeps a same-scope re-graduation an idempotent no-op, and an
+  already-graduated memory SHORT-CIRCUITS to its existing article WITHOUT re-running the
+  novelty gate (no repeated assessment/embedding spend).
 
   ## Reachability
 
@@ -1669,22 +1681,56 @@ defmodule Loopctl.Memory do
           {:ok, atom(), Loopctl.Knowledge.Article.t()}
           | {:error, :already_graduated | :gate_unavailable | term()}
   def graduate_memory_record(%MemorySchema{} = memory, opts \\ []) do
-    if re_scope_conflict?(memory, opts) do
-      # An already-graduated memory cannot gain a second, differently-scoped article (one
-      # article per memory-title). Refuse LOUDLY rather than silently returning the
-      # existing wrong-scoped article as success.
-      {:error, :already_graduated}
-    else
-      do_graduate_memory_record(memory, opts)
+    cond do
+      re_scope_conflict?(memory, opts) ->
+        # An already-graduated PROJECT memory cannot gain a second, GLOBAL article (one
+        # article per memory-title). Refuse LOUDLY rather than silently returning the
+        # existing wrong-scoped article as success.
+        {:error, :already_graduated}
+
+      graduated?(memory) ->
+        # Already graduated at its OWN scope (a same-scope retry, or `re_scope: :global`
+        # on an already-global memory). Return the EXISTING article WITHOUT re-running the
+        # novelty gate: `propose_article/3` ALWAYS assesses (and, for a not-yet-embedded
+        # memory, embeds on the tenant's key) BEFORE the idempotency dedup, so re-proposing
+        # an already-graduated memory would burn embedding/vector-search spend on EVERY
+        # call. Short-circuit to the idempotent no-op the one-shot-per-memory cost model
+        # (see `MemoryController.graduate/2`) actually assumes.
+        resolve_existing_graduation(memory, opts)
+
+      true ->
+        do_graduate_memory_record(memory, opts)
     end
   end
 
+  defp graduated?(%MemorySchema{graduated_at: nil}), do: false
+  defp graduated?(%MemorySchema{}), do: true
+
   # `re_scope: :global` only takes effect on a memory that has not yet graduated; on an
-  # already-graduated memory it would collide with the existing article, so it is refused.
-  # The sweep only ever calls with ungraduated memories (its query filters
+  # already-graduated PROJECT memory it would collide with the existing article, so it is
+  # refused. The sweep only ever calls with ungraduated memories (its query filters
   # `graduated_at IS NULL`), so this never affects the automated cadence.
   defp re_scope_conflict?(%MemorySchema{graduated_at: nil}, _opts), do: false
+  # A GLOBAL memory (`project_id: nil`) is already tenant-wide, so `re_scope: :global` on
+  # it is a semantic no-op — same `project_id`, same scope-encoded `idempotency_key`. It
+  # can NEVER conflict; let it fall through to the idempotent short-circuit (200) instead
+  # of a misleading 409 that claims a "different scope" and breaks defensive retries.
+  defp re_scope_conflict?(%MemorySchema{project_id: nil}, _opts), do: false
   defp re_scope_conflict?(%MemorySchema{}, opts), do: Keyword.get(opts, :re_scope) == :global
+
+  # The memory already has its single graduated article; look it up by the deterministic
+  # per-scope idempotency key (owner-visible to the memory's subject) and return it as an
+  # idempotent no-op instead of re-proposing. A graduated memory with NO live article (a
+  # discarded draft, or a sweep-stamped structural failure) cannot be re-graduated → 409.
+  defp resolve_existing_graduation(%MemorySchema{} = memory, opts) do
+    project_id = graduation_project_id(memory, opts)
+    key = graduation_idempotency_key(memory.id, project_id)
+
+    case Knowledge.get_article_by_idempotency_key(memory.tenant_id, key, memory.subject_id) do
+      nil -> {:error, :already_graduated}
+      article -> {:ok, :duplicate, article}
+    end
+  end
 
   defp do_graduate_memory_record(%MemorySchema{} = memory, opts) do
     project_id = graduation_project_id(memory, opts)
@@ -1703,29 +1749,49 @@ defmodule Loopctl.Memory do
         {:error, :gate_unavailable}
 
       {:error, :duplicate_title, existing} ->
-        # A same-title / different-body collision. The per-memory idempotency_key +
-        # the FULL memory id in the title suffix make this unreachable for a DISTINCT
-        # memory (two distinct memories can no longer collide on title), so if it ever
-        # fires the content is already represented under that title — stamp so the sweep
-        # does not livelock retrying a title that will always collide.
-        stamp_graduated(memory)
-        {:ok, :duplicate, existing}
+        # A same-title collision — the FULL memory-id title suffix makes this unreachable
+        # for a DISTINCT memory (two distinct memories can no longer collide on title), so
+        # the colliding row is ANOTHER graduation of THIS SAME memory. Two cases, told
+        # apart by the existing article's scope:
+        #   * SAME scope as requested — a concurrent same-scope graduation raced past the
+        #     idempotency pre-check and won; the content IS represented at the right scope,
+        #     so this is an idempotent no-op (stamp + `:duplicate`).
+        #   * DIFFERENT scope — a concurrent FIRST graduation with a DIFFERING `re_scope`
+        #     already created this memory's single article at another scope. The in-memory
+        #     `graduated_at` guard can't catch this (both racers read `nil`); the
+        #     scope-independent `(tenant_id, title)` unique index collapses them and the
+        #     loser lands HERE. Returning `{:ok, :duplicate, existing}` would hand back the
+        #     WRONG-scoped article as success and permanently mis-scope the memory, so we
+        #     refuse LOUDLY (`:already_graduated` → 409) — closing the TOCTOU race so the
+        #     one-article-per-memory guarantee holds without a row lock.
+        if existing.project_id == graduation_project_id(memory, opts) do
+          stamp_graduated(memory)
+          {:ok, :duplicate, existing}
+        else
+          {:error, :already_graduated}
+        end
 
       {:error, %Ecto.Changeset{} = changeset} ->
         # A STRUCTURAL (validation) failure is DETERMINISTIC — the same attrs fail
-        # identically on every retry. Left un-stamped, the sweep would re-select this
-        # (hottest-first, `graduated_at IS NULL`) memory every hour and re-spend the
+        # identically on every retry. For the AUTOMATED sweep (`stamp_structural_error`
+        # defaults true) we stamp terminally: left un-stamped, the sweep would re-select
+        # this (hottest-first, `graduated_at IS NULL`) memory every hour and re-spend the
         # novelty-gate embedding budget on a candidate that can NEVER succeed (a per-slot
-        # livelock). Tags are already sanitized in `memory_to_article_attrs/2`; stamping
-        # here terminally records any OTHER structural impossibility (e.g. an over-size
-        # body) so it is not retried forever. `graduated_at` here means "graduation was
-        # terminally attempted", not "a live article exists".
-        Logger.warning(
-          "Memory.graduate_memory_record structural failure (stamping to avoid livelock): " <>
-            "tenant=#{memory.tenant_id} memory=#{memory.id} errors=#{inspect(changeset.errors)}"
-        )
+        # livelock). For an EXPLICIT caller (`stamp_structural_error: false`, set by
+        # `graduate_memory/3`) we do NOT stamp: terminally consuming the memory's one-shot
+        # graduation on a 422 with no article and no recovery is wrong HTTP semantics —
+        # memory text can legitimately exceed the Article body limit, so the caller must be
+        # able to trim and retry. `graduated_at` means "graduation was terminally
+        # attempted", not "a live article exists".
+        if Keyword.get(opts, :stamp_structural_error, true) do
+          Logger.warning(
+            "Memory.graduate_memory_record structural failure (stamping to avoid livelock): " <>
+              "tenant=#{memory.tenant_id} memory=#{memory.id} errors=#{inspect(changeset.errors)}"
+          )
 
-        stamp_graduated(memory)
+          stamp_graduated(memory)
+        end
+
         {:error, changeset}
     end
   end
@@ -1901,10 +1967,14 @@ defmodule Loopctl.Memory do
   #     it returns `{:error, :gate_unavailable}` so the memory re-graduates later.
   #   * `:embedding` — reuse the memory's already-computed vector (when populated) so the
   #     gate does not re-embed identical text; omitted (→ gate embeds) when NULL.
+  # `:metadata` carries the AuditContext impersonation trail (impersonated_by /
+  # impersonated_at / effective_role) for a superadmin-impersonated graduation; forward it
+  # so the graduated article's audit entry records WHO impersonated, not just the SA key
+  # id — a silent gap in a custody-relevant write path otherwise.
   defp propose_opts(%MemorySchema{subject_id: subject_id} = memory, opts) do
     [visibility_agent_id: subject_id, on_gate_unavailable: :skip]
     |> maybe_put_embedding(memory)
-    |> Keyword.merge(Keyword.take(opts, [:actor_id, :actor_label, :actor_type]))
+    |> Keyword.merge(Keyword.take(opts, [:actor_id, :actor_label, :actor_type, :metadata]))
   end
 
   defp maybe_put_embedding(propose_opts, %MemorySchema{} = memory) do

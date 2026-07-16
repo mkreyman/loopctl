@@ -241,8 +241,17 @@ calling `/memory/recall` and `/knowledge/search` separately.
 The tier *above* long-term memory. A long-term memory that has proven valuable —
 recalled often enough — is written back into the **curated Knowledge Wiki** as a
 durable article, DEDUPED by the same **novelty gate** (`propose_article/3`) that
-guards every agent write-back. This is how a subject's *private* working memory
-graduates into *shared* tenant knowledge.
+guards every agent write-back.
+
+**Visibility — graduated articles stay OWNER-visible, NOT peer-readable.** A memory
+is agent-private working memory scoped by `(tenant_id, subject_id)`; graduation
+deliberately stamps the article `metadata.visibility = "owner"` with
+`agent_id = subject_id` (see `memory_to_article_attrs/2`) so it becomes *durable*
+knowledge discoverable by the **owning subject** — it does NOT become tenant-wide
+*shared* knowledge that every peer can find via `knowledge_search` (graduating into a
+shared article would leak one agent's private memory to every peer in the tenant).
+`re_scope: "global"` only widens the **project partition** (project → tenant-wide
+`project_id: null`); it does NOT change visibility — the article remains owner-visible.
 
 ### Recall-count hotness signal (off the hot path)
 
@@ -308,11 +317,27 @@ on-demand version of the sweep, now reachable by agents:
   re-scopes — the sweep never does, because over-generalizing a project fact to
   tenant-wide is a mis-scoping the novelty gate cannot catch.
 - A memory has **at most one** graduated article (the `(tenant_id, title)` unique
-  index). So `re_scope: "global"` on an **already-graduated** memory returns
+  index). So `re_scope: "global"` on an already-graduated **project** memory returns
   `409` (`already_graduated`) rather than silently returning the wrong-scoped
-  article — globalize on the **first** graduation instead. If the gate falls open
-  (embedding backend down) graduation returns `503` (`gate_unavailable`) and
-  stamps nothing — retry once embeddings recover.
+  article. (On an already-graduated **global** memory `re_scope: "global"` is a
+  no-op — same scope — so it dedups to `200`, not `409`.) An already-graduated memory
+  short-circuits to its existing article **without re-running the novelty gate**, so
+  repeated `memory_graduate` calls never re-spend assessment/embedding budget.
+- **Globalization is a first-graduation race, and the caller cannot always beat it.**
+  `re_scope: "global"` is the ONLY way a project memory becomes tenant-wide, and it
+  only takes effect on the memory's FIRST graduation. But the **hourly sweep**
+  graduates eligible memories **project-scoped** (it never re-scopes). If the sweep
+  graduates a project memory before your on-demand call, `re_scope: "global"`
+  permanently `409`s and that memory can no longer become tenant-wide via graduation.
+  The window is bounded (a memory is only sweep-eligible once its `recall_count`
+  reaches the threshold, and the sweep runs at most hourly), so **graduate promptly**
+  when you intend to globalize; otherwise re-point the already-published article's
+  scope as a separate curation action.
+- The graduation race is serialized at the write: two concurrent FIRST graduations
+  with differing `re_scope` cannot both win — the loser gets a deterministic `409`
+  (`already_graduated`), never the wrong-scoped article as a `200`.
+- If the gate falls open (embedding backend down) graduation returns `503`
+  (`gate_unavailable`) and stamps nothing — retry once embeddings recover.
 
 ---
 

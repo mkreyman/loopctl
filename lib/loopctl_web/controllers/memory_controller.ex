@@ -250,8 +250,9 @@ defmodule LoopctlWeb.MemoryController do
          "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 =>
-        {"Novelty gate unavailable (embedding backend down) — retryable", "application/json",
-         Schemas.ErrorResponse}
+        {"Tenant custody halted (`custody_halted`) or novelty gate unavailable " <>
+           "(`gate_unavailable`, embedding backend down — retryable); the body `code` " <>
+           "distinguishes them", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -557,10 +558,14 @@ defmodule LoopctlWeb.MemoryController do
   # Cost model — DELIBERATELY no per-tenant graduation budget and no
   # `graduation_recall_threshold`/`graduation_max_per_run` caps (unlike `promote/2`'s
   # 429 per-hour budget and unlike `MemoryGraduationSweepWorker`'s recall-gated, per-run
-  # capped cadence). Graduation is a bounded, one-shot-per-memory write that REUSES the
-  # memory's existing `vector(1536)` embedding when present (only paying an embedding
-  # round-trip for a not-yet-embedded memory), whereas promotion triggers an LLM synthesis
-  # call — so the expensive-per-call budget promote needs does not apply here. The
+  # capped cadence). Graduation is a genuinely bounded, one-shot-per-memory write: an
+  # already-graduated memory SHORT-CIRCUITS to its existing article WITHOUT re-running the
+  # novelty gate (`Memory.graduate_memory_record/2`), so a loop of repeated graduate calls
+  # on the SAME memory cannot re-spend assessment/embedding on the tenant's key. The FIRST
+  # graduation REUSES the memory's existing `vector(1536)` embedding when present (only
+  # paying an embedding round-trip for a not-yet-embedded memory), whereas promotion
+  # triggers an LLM synthesis call — so the expensive-per-call budget promote needs does
+  # not apply here. The
   # recall-count threshold is a sweep QUALITY signal (graduate only well-recalled memories
   # automatically); an explicit, caller-triggered graduation intentionally opts out of it,
   # and the general `RateLimiter` still throttles abuse. Revisit if graduation gains an
@@ -639,6 +644,20 @@ defmodule LoopctlWeb.MemoryController do
         # via the FallbackController's changeset clause.
         {:error, %Ecto.Changeset{} = changeset} ->
           {:error, changeset}
+
+          # NOTE (review finding, resolved by dialyzer-exhaustiveness, mirroring `create/2`
+          # above): the 5 clauses above are EXHAUSTIVE for `Memory.graduate_memory/3`.
+          # Although its `@spec` error union includes `term()`, dialyzer's success typing
+          # proves the ACTUAL return is exactly `{:ok, verdict, article} | {:error,
+          # :not_found | :already_graduated | :gate_unavailable | %Ecto.Changeset{}}` — the
+          # graduation path can only fail with those tagged atoms or a changeset (the
+          # novelty gate + `create_article/3` return no other error shape). A trailing
+          # `{:error, _reason}` catch-all would be unreachable dead code (`pattern_match_cov`),
+          # and `@dialyzer` suppressions are forbidden. Dialyzer is the compile-time guard:
+          # if `graduate_memory/3` ever gains a new error shape, this case stops being total
+          # and the build breaks — a stronger contract than a runtime catch-all that can
+          # never fire (unlike `promote/2`, whose underlying `Oban.insert/1` genuinely
+          # widens the success typing to `{:error, term()}`, so ITS catch-all is reachable).
       end
     end)
   end
