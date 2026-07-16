@@ -3380,6 +3380,123 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule RecallContextRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RecallContextRequest",
+      description:
+        "Params for POST /recall (merged memory ∪ knowledge recall, #411 Gap 2). " <>
+          "Query supplied in the body; scope (tenant_id/subject_id) is derived from the " <>
+          "API key, never the body.",
+      type: :object,
+      properties: %{
+        query: %Schema{
+          type: :string,
+          description: "Text to embed / match against on BOTH the memory and knowledge sides."
+        },
+        limit: %Schema{
+          type: :integer,
+          description:
+            "Overall merged page size, clamped to [1, 50] (default 10). Applied " <>
+              "per-source first, then to the merged, re-ranked list."
+        },
+        project_id: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description:
+            "Optional project scope (a UUID PARTITION key, NOT an isolation boundary). " <>
+              "Present → both sides return the merged global ∪ that-project set; " <>
+              "absent/blank → global-only. A malformed value is a 422 invalid_project_id."
+        }
+      }
+    })
+  end
+
+  defmodule RecallContextResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RecallContextResponse",
+      description:
+        "Merged recall: `data` is the re-ranked union across memory + knowledge (each " <>
+          "item tagged `source`, sorted by a heuristically-comparable `score` DESC), " <>
+          "with the untouched per-source `memory` and `knowledge` envelopes for " <>
+          "re-ranking, plus `meta` (counts + degraded flag). Cross-source scores are " <>
+          "heuristic, not calibrated: memory `score` is cosine similarity in [0,1] " <>
+          "(null on the fallback path); knowledge `score` is a pool-normalized " <>
+          "keyword+semantic score.",
+      type: :object,
+      properties: %{
+        data: %Schema{
+          type: :array,
+          description: "Merged, re-ranked results across both sources.",
+          items: %Schema{
+            type: :object,
+            properties: %{
+              source: %Schema{type: :string, enum: ["memory", "knowledge"]},
+              score: %Schema{type: :number, format: :float, nullable: true},
+              memory: %Schema{
+                type: :object,
+                nullable: true,
+                description: "Present on `source: memory` items (see Memory schema)."
+              },
+              article: %Schema{
+                type: :object,
+                nullable: true,
+                description:
+                  "Present on `source: knowledge` items — the combined-search result " <>
+                    "map (article summary + scores)."
+              }
+            }
+          }
+        },
+        memory: %Schema{
+          type: :object,
+          description: "The unchanged /memory/recall envelope (data + meta).",
+          properties: %{
+            data: %Schema{
+              type: :array,
+              items: %Schema{
+                type: :object,
+                properties: %{
+                  memory: Memory,
+                  score: %Schema{type: :number, format: :float, nullable: true}
+                }
+              }
+            },
+            meta: %Schema{type: :object}
+          }
+        },
+        knowledge: %Schema{
+          type: :object,
+          description: "The unchanged combined-search envelope (data + meta).",
+          properties: %{
+            data: %Schema{type: :array, items: %Schema{type: :object}},
+            meta: %Schema{type: :object}
+          }
+        },
+        meta: %Schema{
+          type: :object,
+          properties: %{
+            query: %Schema{type: :string},
+            project_id: %Schema{type: :string, format: :uuid, nullable: true},
+            total_count: %Schema{type: :integer},
+            memory_count: %Schema{type: :integer},
+            knowledge_count: %Schema{type: :integer},
+            degraded: %Schema{
+              type: :boolean,
+              description: "True when the knowledge side errored or fell back to keyword-only."
+            }
+          }
+        }
+      }
+    })
+  end
+
   defmodule MemoryDeleteResponse do
     @moduledoc false
     require OpenApiSpex

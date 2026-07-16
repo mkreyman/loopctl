@@ -72,6 +72,13 @@ defmodule Loopctl.Memory do
   @default_list_limit 50
   @max_list_limit 200
 
+  # `recall_context/2` (the merged memory ∪ knowledge recall, #411 Gap 2 PR B) clamps
+  # its overall limit here. The per-source sub-recalls clamp independently (memory via
+  # `clamp_k/1`, knowledge inside `search_combined/3`); this bounds the merged, re-ranked
+  # page returned to the caller so a large `limit` cannot blow up the sort/take.
+  @default_context_limit 10
+  @max_context_limit 50
+
   # The reserved subject_id the promotion-quality eval (US-29.5) seeds its synthetic
   # labeled sessions under. It lives HERE — the shared memory context — so the eval, the
   # cross-tenant auto-promotion sweep, and the durable-promotion write path all reference
@@ -733,6 +740,185 @@ defmodule Loopctl.Memory do
     do: "embedding_provider_error_#{status}"
 
   defp api_error_tag(_other), do: "embedding_error"
+
+  # ===========================================================================
+  # Merged recall (memory ∪ knowledge) — #411 Gap 2 PR B
+  # ===========================================================================
+
+  @doc """
+  Runs BOTH the long-term memory recall AND the knowledge combined search for one
+  `(query, project_id)` and returns a single merged, re-ranked result — the
+  `global ∪ active-project` recall the harness previously had to assemble by calling
+  `memory_recall` and `knowledge_context`/`knowledge_search` separately (#411 Gap 2).
+
+  Both sub-recalls merge global with the active project:
+
+    * memory — `recall/2` (already merges `global ∪ scope.project_id`; PR A).
+    * knowledge — `Loopctl.Knowledge.search_combined/3` with
+      `project_scope: :with_global`, so a project-scoped combined search ALSO surfaces
+      tenant-wide (global) articles rather than project-only.
+
+  `project_id` is the PARTITION key on both sides, NOT the isolation boundary
+  (`tenant_id`/`subject_id` are — they come from `scope`, never the body). A nil
+  `scope.project_id` is global-only on the memory side and no-project-filter on the
+  knowledge side; a present one merges global with that project on both.
+
+  ## Scores are heuristically comparable, NOT calibrated
+
+  The merged list is sorted by a single `score` DESC across BOTH sources, but the two
+  scores come from different scales:
+
+    * memory `score` = `max(0, 1 - cosine_distance)` — an absolute per-row similarity
+      in `[0, 1]` (or `nil` on the ILIKE text-match fallback path, treated as `0.0`
+      for ranking only).
+    * knowledge `score` = the combined search's `final_score` — a weighted
+      keyword+semantic score, MIN-MAX normalized WITHIN the returned pool (so it is
+      pool-relative, not an absolute similarity).
+
+  Treat the cross-source ordering as a useful heuristic, not a calibrated ranking.
+  Callers that need to re-rank get BOTH the merged view AND the untouched per-source
+  envelopes (`:memory`, `:knowledge`) to do so.
+
+  ## Degradation, never a 500
+
+  If `search_combined/3` returns an error (empty query, invalid weights, etc.) the
+  knowledge side degrades to empty results with `meta.degraded?: true` and the memory
+  side is still returned — the merged call never crashes on a knowledge fault. A
+  keyword-only knowledge fallback (embedding unavailable) also sets `degraded?: true`.
+
+  ## Options
+
+    * `:query` — the query text (default `""`); embedded/ILIKE'd on the memory side and
+      passed to the knowledge combined search.
+    * `:limit` — overall merged page size, clamped to `[1, #{@max_context_limit}]`
+      (default #{@default_context_limit}). Applied per-source first, then to the merged,
+      re-ranked list.
+    * `:status` — knowledge status filter (controllers force `:published` for agent/
+      orchestrator roles, mirroring `knowledge/context`).
+    * `:visibility_agent_id` — knowledge agent-memory visibility scope (#163), passed
+      through to `search_combined/3` exactly as the knowledge context controller does.
+
+  ## Returns
+
+      %{
+        results: [
+          %{source: :memory, score: float, memory: %Memory{}}
+          | %{source: :knowledge, score: float, article: map()}
+        ],                                   # merged, sorted score DESC, capped at limit
+        memory: <the recall/2 envelope, unchanged>,
+        knowledge: <the search_combined envelope (results + meta), or a degraded stub>,
+        meta: %{
+          query: String.t(),
+          project_id: String.t() | nil,
+          total_count: non_neg_integer(),    # length(results) after the merged cap
+          memory_count: non_neg_integer(),   # memory rows BEFORE the merged cap
+          knowledge_count: non_neg_integer(),# knowledge rows BEFORE the merged cap
+          degraded?: boolean()               # knowledge errored or fell back to keyword
+        }
+      }
+
+  NB the `:article` on a `:knowledge` merged item is the `search_combined/3` result map
+  (article summary — id/title/category/tags/snippet + scores), the same shape the
+  knowledge search endpoints serialize, NOT a hydrated `%Loopctl.Knowledge.Article{}`
+  with a full body. The per-source `:knowledge` envelope carries the identical maps;
+  callers wanting full bodies deep-read via `knowledge/context`.
+  """
+  @spec recall_context(Scope.t(), keyword() | map()) :: %{
+          results: [map()],
+          memory: result_envelope(),
+          knowledge: %{results: [map()], meta: map()},
+          meta: map()
+        }
+  def recall_context(%Scope{} = scope, opts \\ []) do
+    query = to_string(opt(opts, :query, ""))
+    limit = clamp_context_limit(opt(opts, :limit, @default_context_limit))
+
+    memory_env = recall(scope, query: query, limit: limit)
+    knowledge_env = knowledge_recall(scope, query, limit, opts)
+
+    memory_items =
+      Enum.map(memory_env.results, fn {memory, score} ->
+        %{source: :memory, score: score, memory: memory}
+      end)
+
+    knowledge_items =
+      Enum.map(knowledge_env.results, fn result ->
+        %{source: :knowledge, score: knowledge_score(result), article: result}
+      end)
+
+    merged =
+      (memory_items ++ knowledge_items)
+      # `score` can be nil on the memory ILIKE fallback path — rank it as 0.0 without
+      # mutating the per-source envelope (which preserves the honest nil).
+      |> Enum.sort_by(&(&1.score || 0.0), :desc)
+      |> Enum.take(limit)
+
+    %{
+      results: merged,
+      memory: memory_env,
+      knowledge: knowledge_env,
+      meta: %{
+        query: query,
+        project_id: scope.project_id,
+        total_count: length(merged),
+        memory_count: length(memory_items),
+        knowledge_count: length(knowledge_items),
+        degraded?: knowledge_degraded?(knowledge_env)
+      }
+    }
+  end
+
+  # Run the knowledge half via `search_combined/3` with the merged `:with_global`
+  # project scope, translating its `{:ok, env} | {:error, ...}` result into a UNIFORM
+  # `%{results: [...], meta: %{...}}` envelope. On ANY error (empty query, invalid
+  # weights, bad_request) the knowledge side degrades to empty results tagged
+  # `degraded?: true` — the merged call never propagates a knowledge fault as a crash.
+  defp knowledge_recall(scope, query, limit, opts) do
+    kopts =
+      [
+        project_id: scope.project_id,
+        project_scope: :with_global,
+        limit: limit
+      ]
+      |> maybe_put_opt(:status, opt(opts, :status, nil))
+      |> maybe_put_opt(:visibility_agent_id, opt(opts, :visibility_agent_id, nil))
+
+    case Knowledge.search_combined(scope.tenant_id, query, kopts) do
+      {:ok, %{results: results, meta: meta}} ->
+        # A keyword-only fallback (embedding unavailable) sets meta.fallback; carry
+        # that forward as degraded? so the merged meta reflects a degraded knowledge side.
+        %{results: results, meta: Map.put(meta, :degraded?, Map.get(meta, :fallback, false))}
+
+      {:error, reason} ->
+        degraded_knowledge_env(reason)
+
+      {:error, reason, _message} ->
+        degraded_knowledge_env(reason)
+    end
+  end
+
+  # The uniform empty/degraded knowledge envelope used when `search_combined/3` cannot
+  # run (empty query, invalid weights, over-long query, ...). `error` carries the
+  # underlying reason atom for observability; `degraded?: true` drives the merged
+  # meta flag and tells the caller the knowledge side is empty by fault, not by scope.
+  defp degraded_knowledge_env(reason) do
+    %{results: [], meta: %{total_count: 0, degraded?: true, error: reason, fallback: false}}
+  end
+
+  defp knowledge_degraded?(%{meta: meta}), do: Map.get(meta, :degraded?, false) == true
+
+  # Knowledge combined `final_score` — a pool-normalized weighted keyword+semantic
+  # score in [0, 1]. Defaults to 0.0 for a malformed result map (defensive).
+  defp knowledge_score(%{final_score: score}) when is_number(score), do: score
+  defp knowledge_score(_), do: 0.0
+
+  defp clamp_context_limit(limit),
+    do: limit |> to_int(@default_context_limit) |> max(1) |> min(@max_context_limit)
+
+  # Add `{key, value}` to the opts only when value is non-nil, so an absent status /
+  # visibility scope leaves `search_combined/3` on its own defaults.
+  defp maybe_put_opt(opts, _key, nil), do: opts
+  defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   # ===========================================================================
   # forget / list / session_history / supersede (RLS OLTP path)

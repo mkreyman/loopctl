@@ -118,6 +118,11 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/memory/recall"},
                {:post, "/api/v1/memory/promote"},
                {:delete, "/api/v1/memory/:id"},
+               # Merged recall (#411 Gap 2) — a POST-shaped READ returning the
+               # re-ranked global ∪ active-project union of agent memory + knowledge,
+               # same KB-tier agent surface + (tenant, subject) key-derived scope as
+               # /memory/recall. Not a mutation.
+               {:post, "/api/v1/recall"},
 
                # Context Retriever (Epic 30, US-30.4) — `POST /retrieve/:entity` is a
                # POST-shaped READ (a governed filter/search over the tenant's OWN

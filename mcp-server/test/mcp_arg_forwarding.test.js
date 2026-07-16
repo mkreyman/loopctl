@@ -115,6 +115,39 @@ describe("#411 gap1: resolve_project wiring", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #411 gap2 (PR B): recall_context (merged memory ∪ knowledge, one round-trip)
+// ---------------------------------------------------------------------------
+
+describe("#411 gap2: recall_context wiring", () => {
+  test("TOOLS declares a recall_context tool requiring query", () => {
+    assert.match(INDEX_SRC, /name: "recall_context",/, 'must declare a "recall_context" tool');
+    assert.match(
+      INDEX_SRC,
+      /name: "recall_context",[\s\S]*?required: \["query"\],/,
+      "the recall_context tool must require query",
+    );
+  });
+
+  test("recallContext POSTs /api/v1/recall with query/project_id/limit on the agent key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function recallContext\(\{ query, project_id, limit \}\) \{[\s\S]*?"POST",\s*\n\s*"\/api\/v1\/recall",[\s\S]*?LOOPCTL_AGENT_KEY/,
+      "recallContext must POST /api/v1/recall on the agent key",
+    );
+    assert.match(INDEX_SRC, /const payload = \{ query \};\s*\n\s*if \(project_id\) payload\.project_id = project_id;/);
+    assert.match(INDEX_SRC, /if \(limit != null\) payload\.limit = limit;/);
+  });
+
+  test("the recall_context dispatch case calls recallContext(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "recall_context":\s*\n\s*return await recallContext\(args\);/,
+      "the recall_context dispatch case must call recallContext(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #248 (mcp-02): knowledge_ingestion_jobs forwards limit/offset/since_days
 // ---------------------------------------------------------------------------
 

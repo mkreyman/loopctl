@@ -2180,7 +2180,10 @@ defmodule Loopctl.Knowledge do
   defp apply_search_filters(query, status, opts) do
     query
     |> maybe_filter_by_status(status)
-    |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
+    |> apply_project_scope(
+      Keyword.get(opts, :project_id),
+      Keyword.get(opts, :project_scope, :strict)
+    )
     |> maybe_filter_by_category(Keyword.get(opts, :category))
     |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
     |> maybe_filter_by_memory_types(Keyword.get(opts, :memory_types))
@@ -5807,6 +5810,27 @@ defmodule Loopctl.Knowledge do
     )
   end
 
+  # Dispatch the project filter between the STRICT (project-only) and the MERGED
+  # (`global ∪ project`) predicate based on the `:project_scope` opt (#411 Gap 2, PR B).
+  #
+  #   * `:strict` (DEFAULT) → `maybe_filter_by_project_id/2` — `project_id == ^id`,
+  #     the historical behaviour every existing search/list caller relies on. Absent
+  #     `:project_scope` resolves here, so EVERY pre-existing caller is byte-identical.
+  #   * `:with_global` → `scope_project_or_global/2` — `project_id IS NULL OR == ^id`,
+  #     the merged-recall semantics `Loopctl.Memory.recall_context/2` needs so a
+  #     project-scoped combined search ALSO surfaces tenant-wide (global) articles.
+  #
+  # Threaded from `search_combined/3` through its `sub_opts` into BOTH the keyword +
+  # semantic-count filter set (`apply_search_filters/3`) and the semantic results pool
+  # (`apply_semantic_pool_filters/2`), so results and `total_count` stay consistent.
+  # A `nil` project_id is a no-op under either mode (strict short-circuits on nil;
+  # `scope_project_or_global(query, nil)` returns the query unchanged).
+  defp apply_project_scope(query, project_id, :with_global),
+    do: scope_project_or_global(query, project_id)
+
+  defp apply_project_scope(query, project_id, _strict),
+    do: maybe_filter_by_project_id(query, project_id)
+
   defp maybe_filter_by_project_id(query, nil), do: query
 
   defp maybe_filter_by_project_id(query, project_id) do
@@ -6264,7 +6288,10 @@ defmodule Loopctl.Knowledge do
   # select carries `project_id`/`category`/`tags`/`metadata`).
   defp apply_semantic_pool_filters(query, opts) do
     query
-    |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
+    |> apply_project_scope(
+      Keyword.get(opts, :project_id),
+      Keyword.get(opts, :project_scope, :strict)
+    )
     |> maybe_filter_by_category(Keyword.get(opts, :category))
     |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
     |> maybe_filter_by_memory_types(Keyword.get(opts, :memory_types))
@@ -6334,6 +6361,11 @@ defmodule Loopctl.Knowledge do
     - `:keyword_weight` -- weight for keyword scores (default 0.5)
     - `:semantic_weight` -- weight for semantic scores (default 0.5)
     - `:project_id`, `:category`, `:status`, `:tags` -- standard filters
+    - `:project_scope` -- how `:project_id` filters (default `:strict`). `:strict`
+      matches `project_id == id` (the historical behaviour); `:with_global` matches
+      `project_id IS NULL OR == id`, so a project-scoped search ALSO surfaces
+      tenant-wide (global) articles. Used by the merged `Loopctl.Memory.recall_context/2`
+      recall (#411 Gap 2). No-op when `:project_id` is absent.
     - `:limit` -- max ranked results to return (default 10, max
       #{@max_relevance_page_size}, min 1); relevance top-N, capped well below the
       enumeration page size

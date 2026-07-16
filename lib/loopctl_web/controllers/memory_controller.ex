@@ -8,6 +8,11 @@ defmodule LoopctlWeb.MemoryController do
   - `POST   /api/v1/memory/promote` — trigger session→long-term promotion (US-29.3)
   - `GET    /api/v1/memory`         — list (limit/offset + total_count meta)
   - `DELETE /api/v1/memory/:id`     — forget
+  - `POST   /api/v1/recall`         — MERGED recall: one round-trip returning the
+    re-ranked `global ∪ active-project` union of long-term memory AND knowledge
+    (`Loopctl.Memory.recall_context/2`, #411 Gap 2). Reuses the same key-derived
+    `(tenant_id, subject_id)` scope + `project_id` partition + 422 envelopes as
+    `/memory/recall`.
 
   ## Scope is derived from the KEY, never the body (AC-28.3.2)
 
@@ -43,7 +48,9 @@ defmodule LoopctlWeb.MemoryController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Memory
   alias Loopctl.Memory.Scope
+  alias LoopctlWeb.Helpers.Visibility
   alias LoopctlWeb.MemoryJSON
+  alias LoopctlWeb.RecallJSON
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -111,6 +118,38 @@ defmodule LoopctlWeb.MemoryController do
     request_body: {"Recall params", "application/json", Schemas.MemoryRecallRequest},
     responses: %{
       200 => {"Recall results", "application/json", Schemas.MemoryRecallResponse},
+      422 =>
+        {"Subject unresolvable, non-string query, or invalid project_id", "application/json",
+         Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:context,
+    summary: "Merged recall (memory ∪ knowledge, one round-trip)",
+    description:
+      "Returns ONE merged, re-ranked result combining the caller's long-term MEMORY " <>
+        "recall AND the KNOWLEDGE combined search for `(query, project_id)` — the " <>
+        "`global ∪ active-project` union the harness previously assembled by calling " <>
+        "`/memory/recall` and `/knowledge/context` separately (#411 Gap 2). Both sides " <>
+        "merge global with the active project: an absent/blank `project_id` returns " <>
+        "global-only memory + no-project-filter knowledge; a present `project_id` merges " <>
+        "global with that project on BOTH sides (another project's rows are excluded). " <>
+        "`project_id` is a PARTITION key, NOT the isolation boundary — `(tenant_id, " <>
+        "subject_id)` is, and is derived from the API key, never the body. A malformed " <>
+        "`project_id` is a 422 (`invalid_project_id`); a non-string `query` is a 422 " <>
+        "(`invalid_query`). The response carries the merged `results` (each tagged " <>
+        "`source: memory|knowledge`, sorted by a heuristically-comparable `score` DESC) " <>
+        "PLUS the untouched per-source `memory` and `knowledge` envelopes so callers can " <>
+        "re-rank. Cross-source scores are heuristic, not calibrated (memory = cosine " <>
+        "similarity; knowledge = pool-normalized keyword+semantic). If the knowledge " <>
+        "search errors or degrades to keyword-only the memory side is still returned and " <>
+        "`meta.degraded?` is true — never a 500. Agent role is forced to published " <>
+        "articles and its own/`shared` memories (#163).",
+    request_body: {"Recall params", "application/json", Schemas.RecallContextRequest},
+    responses: %{
+      200 => {"Merged recall results", "application/json", Schemas.RecallContextResponse},
       422 =>
         {"Subject unresolvable, non-string query, or invalid project_id", "application/json",
          Schemas.ErrorResponse},
@@ -290,6 +329,51 @@ defmodule LoopctlWeb.MemoryController do
       end
     end)
   end
+
+  @doc "POST /api/v1/recall"
+  def context(conn, params) do
+    case parse_project_id(params["project_id"]) do
+      {:ok, project_id} ->
+        context_with_project(conn, params, project_id)
+
+      :error ->
+        invalid_project_id(conn)
+    end
+  end
+
+  defp context_with_project(conn, params, project_id) do
+    with_scope(conn, project_id, fn scope ->
+      case coerce_query(params["query"]) do
+        {:ok, query} ->
+          opts =
+            [query: query, limit: params["limit"]]
+            |> Keyword.merge(knowledge_scope_opts(conn))
+
+          json(conn, RecallJSON.context(Memory.recall_context(scope, opts)))
+
+        :error ->
+          invalid_query(conn)
+      end
+    end)
+  end
+
+  # Knowledge-side read scoping for the merged recall, mirroring
+  # `KnowledgeContextController`: agent/orchestrator keys are forced to `:published`
+  # articles, and the agent-memory visibility scope (#163) hides other agents'
+  # private/owner memories. Higher roles pass neither (see everything, all statuses).
+  defp knowledge_scope_opts(conn) do
+    role = conn.assigns.current_api_key.role
+    role_atom = if is_binary(role), do: String.to_existing_atom(role), else: role
+
+    conn
+    |> Visibility.scope_opts()
+    |> maybe_force_published(role_atom)
+  end
+
+  defp maybe_force_published(opts, role) when role in [:agent, :orchestrator],
+    do: Keyword.put(opts, :status, :published)
+
+  defp maybe_force_published(opts, _role), do: opts
 
   @doc "POST /api/v1/memory/promote"
   def promote(conn, params) do
