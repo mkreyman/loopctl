@@ -529,6 +529,139 @@ defmodule LoopctlWeb.ProjectControllerTest do
     end
   end
 
+  describe "GET /api/v1/projects/resolve" do
+    test "resolves by slug and returns the project", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id, slug: "loopctl", name: "loopctl"})
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve?slug=loopctl")
+
+      body = json_response(conn, 200)
+      assert body["project"]["id"] == project.id
+      assert body["project"]["slug"] == "loopctl"
+      assert body["matched_by"] == "slug"
+    end
+
+    test "resolves by repo_url in ssh form", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      project =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "loopctl",
+          repo_url: "https://github.com/mkreyman/loopctl"
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/projects/resolve?repo_url=git@github.com:mkreyman/loopctl.git")
+
+      body = json_response(conn, 200)
+      assert body["project"]["id"] == project.id
+    end
+
+    test "resolves by name case-insensitively", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id, name: "LoopCtl", slug: "loopctl"})
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve?name=loopctl")
+
+      body = json_response(conn, 200)
+      assert body["project"]["id"] == project.id
+    end
+
+    test "returns 404 with not_found error when no match", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve?slug=missing")
+
+      body = json_response(conn, 404)
+      assert body["error"]["status"] == 404
+      assert is_binary(body["error"]["message"])
+    end
+
+    test "returns 422 with no_identifier error when no identifier supplied", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve")
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert is_binary(body["error"]["message"])
+    end
+
+    test "respects tenant isolation (never resolves another tenant's project)", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {key_a, _api_key} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent})
+
+      _project_b =
+        fixture(:project, %{
+          tenant_id: tenant_b.id,
+          slug: "cross-tenant",
+          repo_url: "https://github.com/mkreyman/loopctl"
+        })
+
+      conn = conn |> auth_conn(key_a) |> get(~p"/api/v1/projects/resolve?slug=cross-tenant")
+      assert json_response(conn, 404)["error"]["status"] == 404
+
+      conn2 =
+        build_conn()
+        |> auth_conn(key_a)
+        |> get(~p"/api/v1/projects/resolve?repo_url=mkreyman/loopctl")
+
+      assert json_response(conn2, 404)["error"]["status"] == 404
+    end
+
+    test "returns 409 ambiguous_resolution when a bare repo_url matches two hosts", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:project, %{
+        tenant_id: tenant.id,
+        slug: "gh-mirror",
+        repo_url: "https://github.com/acme/app"
+      })
+
+      fixture(:project, %{
+        tenant_id: tenant.id,
+        slug: "gl-mirror",
+        repo_url: "https://gitlab.com/acme/app"
+      })
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve?repo_url=acme/app")
+
+      body = json_response(conn, 409)
+      assert body["error"]["status"] == 409
+      assert body["error"]["code"] == "ambiguous_resolution"
+    end
+
+    test "returns 422 when an identifier exceeds the length cap", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      long_name = String.duplicate("a", 513)
+
+      conn =
+        conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve?name=#{long_name}")
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert is_binary(body["error"]["message"])
+    end
+
+    test "requires authentication", %{conn: conn} do
+      conn = get(conn, ~p"/api/v1/projects/resolve?slug=loopctl")
+      assert json_response(conn, 401)
+    end
+  end
+
   describe "cross-tenant isolation" do
     test "cannot list another tenant's projects", %{conn: conn} do
       tenant_a = fixture(:tenant)

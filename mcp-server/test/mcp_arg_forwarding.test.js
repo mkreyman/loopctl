@@ -86,6 +86,35 @@ describe("#247 mcp-01: list_projects pagination (real projectsPath)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #411 gap1: resolve_project (cheap repo -> project_id resolution)
+// ---------------------------------------------------------------------------
+
+describe("#411 gap1: resolve_project wiring", () => {
+  test("TOOLS declares a resolve_project tool", () => {
+    assert.match(INDEX_SRC, /name: "resolve_project",/, 'must declare a "resolve_project" tool');
+  });
+
+  test("resolveProject GETs /projects/resolve with slug/repo_url/name on the agent key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function resolveProject\(\{ slug, repo_url, name \} = \{\}\) \{[\s\S]*?\/api\/v1\/projects\/resolve\?\$\{params\}[\s\S]*?LOOPCTL_AGENT_KEY/,
+      "resolveProject must GET /api/v1/projects/resolve with a query string on the agent key",
+    );
+    assert.match(INDEX_SRC, /if \(slug\) params\.set\("slug", slug\);/);
+    assert.match(INDEX_SRC, /if \(repo_url\) params\.set\("repo_url", repo_url\);/);
+    assert.match(INDEX_SRC, /if \(name\) params\.set\("name", name\);/);
+  });
+
+  test("the resolve_project dispatch case calls resolveProject(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "resolve_project":\s*\n\s*return await resolveProject\(args\);/,
+      "the resolve_project dispatch case must call resolveProject(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #248 (mcp-02): knowledge_ingestion_jobs forwards limit/offset/since_days
 // ---------------------------------------------------------------------------
 

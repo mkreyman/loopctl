@@ -218,6 +218,9 @@ defmodule LoopctlWeb.Router do
     get "/agents/:id", AgentController, :show
 
     # Project management
+    # Cheap repo -> project_id resolution (Gap 1 of #411). Must precede the
+    # resources block so /projects/resolve is not captured by GET /projects/:id.
+    get "/projects/resolve", ProjectController, :resolve
     resources "/projects", ProjectController, only: [:create, :index, :show, :update, :delete]
     get "/projects/:id/progress", ProjectController, :progress
 

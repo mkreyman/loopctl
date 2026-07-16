@@ -12,6 +12,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :unauthorized}` -> 401
   - `{:error, :forbidden}` -> 403
   - `{:error, :conflict}` -> 409
+  - `{:error, :ambiguous_resolution}` -> 409 (a fuzzy identifier matched >1 active project)
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
   - `{:error, :self_verify_blocked}` -> 409 (same agent implemented and tries to verify)
@@ -58,6 +59,22 @@ defmodule LoopctlWeb.FallbackController do
     conn
     |> put_status(:conflict)
     |> json(%{error: %{status: 409, message: "Conflict"}})
+  end
+
+  # A fuzzy identifier (repo_url or name) matched more than one active project,
+  # so resolution refused to silently attach new work to whichever is older.
+  def call(conn, {:error, :ambiguous_resolution}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "ambiguous_resolution",
+        message:
+          "The supplied identifier matches more than one active project. " <>
+            "Disambiguate with an exact slug (or a fully-qualified, single-host repo_url)."
+      }
+    })
   end
 
   def call(conn, {:error, {:invalid_transition, ctx}}) do

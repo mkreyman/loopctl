@@ -376,6 +376,22 @@ async function listProjects(args = {}) {
   return toContent(result);
 }
 
+async function resolveProject({ slug, repo_url, name } = {}) {
+  // Cheap repo -> project_id resolution (loopctl #411 Gap 1). Server tries
+  // slug -> repo_url -> name and returns the first match; agent-role read.
+  const params = new URLSearchParams();
+  if (slug) params.set("slug", slug);
+  if (repo_url) params.set("repo_url", repo_url);
+  if (name) params.set("name", name);
+  const result = await apiCall(
+    "GET",
+    `/api/v1/projects/resolve?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function createProject({ name, slug, repo_url, description, tech_stack, mission }) {
   const body = { name, slug };
   if (repo_url) body.repo_url = repo_url;
@@ -1994,6 +2010,34 @@ const TOOLS = [
       properties: {
         page: { type: "integer", description: "Page number (default 1)." },
         page_size: { type: "integer", description: "Items per page (default 20)." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "resolve_project",
+    description:
+      "Resolve a repo to its project in one cheap call. Provide any of slug, " +
+      "repo_url (git@github.com:owner/repo.git, https://github.com/owner/repo, " +
+      "and bare owner/repo all match), or name. Precedence: slug > repo_url > " +
+      "name; first match wins. Returns the project (use its id to scope " +
+      "captures/recall), 404 not_found if nothing matches, 422 no_identifier " +
+      "if none supplied.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        slug: {
+          type: "string",
+          description: "Exact project slug (often the repo basename).",
+        },
+        repo_url: {
+          type: "string",
+          description: "Git remote URL or bare owner/repo.",
+        },
+        name: {
+          type: "string",
+          description: "Exact project name (case-insensitive).",
+        },
       },
       required: [],
     },
@@ -4693,6 +4737,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "list_projects":
       return await listProjects(args);
+
+    case "resolve_project":
+      return await resolveProject(args);
 
     case "create_project":
       return await createProject(args);
