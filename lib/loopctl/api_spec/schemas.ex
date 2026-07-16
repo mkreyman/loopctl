@@ -3423,12 +3423,16 @@ defmodule Loopctl.ApiSpec.Schemas do
       title: "RecallContextResponse",
       description:
         "Merged recall: `data` is the re-ranked union across memory + knowledge (each " <>
-          "item tagged `source`, sorted by a heuristically-comparable `score` DESC), " <>
-          "with the untouched per-source `memory` and `knowledge` envelopes for " <>
-          "re-ranking, plus `meta` (counts + degraded flag). Cross-source scores are " <>
-          "heuristic, not calibrated: memory `score` is cosine similarity in [0,1] " <>
-          "(null on the fallback path); knowledge `score` is a pool-normalized " <>
-          "keyword+semantic score.",
+          "item tagged `source`, sorted by a heuristically-comparable `score` DESC — " <>
+          "`meta.results_ranking` is `heuristic_cross_source`), with the untouched " <>
+          "per-source `memory` and `knowledge` envelopes for re-ranking, plus `meta` " <>
+          "(counts + degraded flag). Cross-source scores are heuristic, not calibrated: " <>
+          "memory `score` is ABSOLUTE cosine similarity in [0,1] (null on the fallback " <>
+          "path); knowledge `score` is a POOL-NORMALIZED keyword+semantic score (biases " <>
+          "knowledge upward in the default order). The knowledge `article`/`data` items " <>
+          "are combined-search SUMMARIES (id/title/category/tags/score + a truncated " <>
+          "snippet) — the same shape `/knowledge/search` returns, NOT full bodies or " <>
+          "linked references; call `/knowledge/context` for those.",
       type: :object,
       properties: %{
         data: %Schema{
@@ -3448,8 +3452,9 @@ defmodule Loopctl.ApiSpec.Schemas do
                 type: :object,
                 nullable: true,
                 description:
-                  "Present on `source: knowledge` items — the combined-search result " <>
-                    "map (article summary + scores)."
+                  "Present on `source: knowledge` items — the combined-search summary " <>
+                    "(id/title/category/tags/score + truncated snippet), the same " <>
+                    "whitelisted shape `/knowledge/search` returns."
               }
             }
           }
@@ -3473,7 +3478,10 @@ defmodule Loopctl.ApiSpec.Schemas do
         },
         knowledge: %Schema{
           type: :object,
-          description: "The unchanged combined-search envelope (data + meta).",
+          description:
+            "The combined-search envelope (data + meta). Each `data` item is the " <>
+              "whitelisted summary shape (id/title/category/tags/score + truncated " <>
+              "snippet), NOT the raw internal result map.",
           properties: %{
             data: %Schema{type: :array, items: %Schema{type: :object}},
             meta: %Schema{type: :object}
@@ -3490,6 +3498,13 @@ defmodule Loopctl.ApiSpec.Schemas do
             degraded: %Schema{
               type: :boolean,
               description: "True when the knowledge side errored or fell back to keyword-only."
+            },
+            results_ranking: %Schema{
+              type: :string,
+              description:
+                "Stable tag (`heuristic_cross_source`) warning that the merged `data` " <>
+                  "order mixes memory's absolute cosine with knowledge's pool-normalized " <>
+                  "score and is NOT a calibrated cross-source ranking."
             }
           }
         }

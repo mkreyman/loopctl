@@ -99,18 +99,23 @@ defmodule Loopctl.KnowledgeProjectScopeTest do
       refute MapSet.member?(got, ctx.other.id), "with_global must still exclude another project"
     end
 
-    test ":with_global with a nil project_id is global ∪ everything (no project filter)", ctx do
-      # scope_project_or_global(query, nil) is a no-op, so a nil project under with_global
-      # applies no project filter at all — every in-tenant article matches.
+    test ":with_global with a nil project_id is GLOBAL-ONLY (project_id IS NULL)", ctx do
+      # With no active project the `:with_global` union is global-only: a nil project_id
+      # scopes to `project_id IS NULL` (matching the merged-recall contract and the
+      # memory half), NOT the former no-op that returned every project's articles.
       assert {:ok, %{results: results}} =
                Knowledge.search_combined(ctx.tenant.id, "telemetry", project_scope: :with_global)
 
       got = ids(results)
 
-      assert MapSet.subset?(
-               MapSet.new([ctx.global.id, ctx.in_project.id, ctx.other.id]),
-               got
-             )
+      assert MapSet.member?(got, ctx.global.id),
+             "with_global + nil must include the global article"
+
+      refute MapSet.member?(got, ctx.in_project.id),
+             "with_global + nil must exclude project articles"
+
+      refute MapSet.member?(got, ctx.other.id),
+             "with_global + nil must exclude other-project articles"
     end
   end
 end

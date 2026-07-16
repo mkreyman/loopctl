@@ -132,21 +132,27 @@ defmodule LoopctlWeb.MemoryController do
       "Returns ONE merged, re-ranked result combining the caller's long-term MEMORY " <>
         "recall AND the KNOWLEDGE combined search for `(query, project_id)` — the " <>
         "`global ∪ active-project` union the harness previously assembled by calling " <>
-        "`/memory/recall` and `/knowledge/context` separately (#411 Gap 2). Both sides " <>
-        "merge global with the active project: an absent/blank `project_id` returns " <>
-        "global-only memory + no-project-filter knowledge; a present `project_id` merges " <>
-        "global with that project on BOTH sides (another project's rows are excluded). " <>
-        "`project_id` is a PARTITION key, NOT the isolation boundary — `(tenant_id, " <>
-        "subject_id)` is, and is derived from the API key, never the body. A malformed " <>
-        "`project_id` is a 422 (`invalid_project_id`); a non-string `query` is a 422 " <>
-        "(`invalid_query`). The response carries the merged `results` (each tagged " <>
-        "`source: memory|knowledge`, sorted by a heuristically-comparable `score` DESC) " <>
-        "PLUS the untouched per-source `memory` and `knowledge` envelopes so callers can " <>
-        "re-rank. Cross-source scores are heuristic, not calibrated (memory = cosine " <>
-        "similarity; knowledge = pool-normalized keyword+semantic). If the knowledge " <>
-        "search errors or degrades to keyword-only the memory side is still returned and " <>
-        "`meta.degraded?` is true — never a 500. Agent role is forced to published " <>
-        "articles and its own/`shared` memories (#163).",
+        "`/memory/recall` and `/knowledge/search` separately (#411 Gap 2). NOTE the " <>
+        "knowledge half is the COMBINED SEARCH: article SUMMARIES (id/title/category/" <>
+        "tags/score + a truncated snippet), NOT the deep-read `/knowledge/context` " <>
+        "(full article bodies + one-hop linked references + recency weighting). Callers " <>
+        "needing full bodies or linked refs must still call `/knowledge/context`. Both " <>
+        "sides merge global with the active project: an absent/blank `project_id` " <>
+        "returns GLOBAL-ONLY memory AND global-only knowledge; a present `project_id` " <>
+        "merges global with that project on BOTH sides (another project's rows are " <>
+        "excluded). `project_id` is a PARTITION key, NOT the isolation boundary — " <>
+        "`(tenant_id, subject_id)` is, and is derived from the API key, never the body. " <>
+        "A malformed `project_id` is a 422 (`invalid_project_id`); a non-string, " <>
+        "missing, or blank/whitespace-only `query` is a 422 (`invalid_query`). The " <>
+        "response carries the merged `results` (each tagged `source: memory|knowledge`, " <>
+        "sorted by a heuristically-comparable `score` DESC — `meta.results_ranking` is " <>
+        "`heuristic_cross_source`) PLUS the untouched per-source `memory` and " <>
+        "`knowledge` envelopes so callers can re-rank. Cross-source scores are " <>
+        "heuristic, not calibrated (memory = absolute cosine similarity; knowledge = " <>
+        "pool-normalized keyword+semantic, which biases knowledge UPWARD in the default " <>
+        "order). If the knowledge search errors or degrades to keyword-only the memory " <>
+        "side is still returned and `meta.degraded?` is true — never a 500. Agent role " <>
+        "is forced to published articles and its own/`shared` memories (#163).",
     request_body: {"Recall params", "application/json", Schemas.RecallContextRequest},
     responses: %{
       200 => {"Merged recall results", "application/json", Schemas.RecallContextResponse},
@@ -343,7 +349,7 @@ defmodule LoopctlWeb.MemoryController do
 
   defp context_with_project(conn, params, project_id) do
     with_scope(conn, project_id, fn scope ->
-      case coerce_query(params["query"]) do
+      case coerce_context_query(params["query"]) do
         {:ok, query} ->
           opts =
             [query: query, limit: params["limit"]]
@@ -357,16 +363,42 @@ defmodule LoopctlWeb.MemoryController do
     end)
   end
 
+  # Coerce + trim the merged-recall query ONCE at the boundary, treating blank/
+  # whitespace-only uniformly across both halves. The knowledge half
+  # (`search_combined/3`) trims and rejects blank with `{:error, :empty_query}` while
+  # the memory half would ILIKE the untrimmed whitespace — so an absent/blank query
+  # previously yielded a confusing "memory-only with a spuriously degraded knowledge
+  # side" response and false `degraded?` alerts. The merged recall REQUIRES a non-blank
+  # query (the knowledge half is its point), so blank input is a clean 422 up front —
+  # matching the sibling knowledge search/context endpoints, not the degraded path.
+  defp coerce_context_query(query) do
+    with {:ok, coerced} <- coerce_query(query),
+         trimmed = String.trim(coerced),
+         false <- trimmed == "" do
+      {:ok, trimmed}
+    else
+      _ -> :error
+    end
+  end
+
   # Knowledge-side read scoping for the merged recall, mirroring
   # `KnowledgeContextController`: agent/orchestrator keys are forced to `:published`
   # articles, and the agent-memory visibility scope (#163) hides other agents'
-  # private/owner memories. Higher roles pass neither (see everything, all statuses).
+  # private/owner memories. `:api_key_id` is threaded so `search_combined/3` records
+  # knowledge read-access analytics for /recall traffic (the sibling search/context
+  # endpoints set it too; without it the analytics guard silently records nothing).
+  #
+  # Higher roles (user/superadmin) pass NO `:status`, but `search_keyword`/
+  # `search_semantic` default `:status` to `:published`, so — unlike `/knowledge/context`
+  # (which accepts a `?status` override) — this endpoint has NO override and returns
+  # published-only knowledge for EVERY role, not "all statuses".
   defp knowledge_scope_opts(conn) do
     role = conn.assigns.current_api_key.role
     role_atom = if is_binary(role), do: String.to_existing_atom(role), else: role
 
     conn
     |> Visibility.scope_opts()
+    |> Keyword.put(:api_key_id, conn.assigns.current_api_key.id)
     |> maybe_force_published(role_atom)
   end
 

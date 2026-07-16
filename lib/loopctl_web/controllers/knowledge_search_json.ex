@@ -93,7 +93,15 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     if include_body, do: Map.put(base, :body, result.body), else: base
   end
 
-  defp render_result(result, mode) do
+  @doc """
+  Projects a single search result map into the canonical whitelisted summary shape
+  (`{id, title, category, tags, score}` plus a truncated `snippet` when present) for
+  the given `mode` (`"keyword" | "semantic" | "combined"`).
+
+  Shared with `LoopctlWeb.RecallJSON` so the merged `/recall` endpoint emits the same
+  shape as the knowledge search endpoints and never leaks raw internal result fields.
+  """
+  def render_result(result, mode) do
     base = %{
       id: result[:id] || result.id,
       title: result[:title] || result.title,

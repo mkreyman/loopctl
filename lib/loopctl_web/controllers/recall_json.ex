@@ -10,15 +10,20 @@ defmodule LoopctlWeb.RecallJSON do
   - A `:memory` merged item pairs its long-term `%Memory{}` (rendered via
     `MemoryJSON.memory_data/1`, so the raw embedding is never leaked) with its cosine
     similarity `score` (`null` on the memory ILIKE fallback path).
-  - A `:knowledge` merged item carries the `search_combined/3` result map (article
-    summary + scores — the same shape the knowledge search endpoints return) and its
-    pool-normalized combined `score`.
+  - A `:knowledge` merged item carries the article SUMMARY — projected through
+    `KnowledgeSearchJSON.render_result/2` (the canonical combined-search view:
+    `{id, title, category, tags, score, snippet}` truncated), the EXACT shape the
+    knowledge search endpoints serialize — plus its pool-normalized combined `score`.
+    Internal scoring fields (`relevance_score`/`normalized_score`/`final_score`),
+    `status`, `tenant_id`, `project_id`, and timestamps are intentionally NOT exposed
+    here, matching those endpoints.
 
   Cross-source `score`s are heuristically comparable, not calibrated (see the context
-  function's `@doc`).
+  function's `@doc`); `meta.results_ranking` carries the `"heuristic_cross_source"`
+  tag so consumers can detect this programmatically.
   """
 
-  alias LoopctlWeb.MemoryJSON
+  alias LoopctlWeb.{KnowledgeSearchJSON, MemoryJSON}
 
   @doc """
   Renders the merged recall: `data` (merged, re-ranked), `memory` + `knowledge`
@@ -28,7 +33,7 @@ defmodule LoopctlWeb.RecallJSON do
     %{
       data: Enum.map(results, &merged_item/1),
       memory: MemoryJSON.recall(memory),
-      knowledge: %{data: knowledge.results, meta: knowledge.meta},
+      knowledge: %{data: Enum.map(knowledge.results, &knowledge_summary/1), meta: knowledge.meta},
       meta: meta_json(meta)
     }
   end
@@ -38,8 +43,14 @@ defmodule LoopctlWeb.RecallJSON do
   end
 
   defp merged_item(%{source: :knowledge, score: score, article: article}) do
-    %{source: "knowledge", score: score, article: article}
+    %{source: "knowledge", score: score, article: knowledge_summary(article)}
   end
+
+  # Project a raw `search_combined/3` result map through the canonical combined-search
+  # summary view so /recall emits the SAME whitelisted shape ({id, title, category,
+  # tags, score, snippet}) the knowledge search endpoints do — never the raw map with
+  # its internal scoring fields, status, tenant_id, project_id, and timestamps.
+  defp knowledge_summary(result), do: KnowledgeSearchJSON.render_result(result, "combined")
 
   # `degraded?` (atom key with a trailing `?`) is the internal flag; expose it as the
   # clean JSON key `degraded`.
@@ -50,7 +61,10 @@ defmodule LoopctlWeb.RecallJSON do
       total_count: meta.total_count,
       memory_count: meta.memory_count,
       knowledge_count: meta.knowledge_count,
-      degraded: meta.degraded?
+      degraded: meta.degraded?,
+      # Stable tag warning that the merged `data` order is a cross-source heuristic
+      # (memory absolute cosine vs knowledge pool-normalized), NOT calibrated relevance.
+      results_ranking: meta.results_ranking
     }
   end
 end

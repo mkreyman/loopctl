@@ -5823,8 +5823,19 @@ defmodule Loopctl.Knowledge do
   # Threaded from `search_combined/3` through its `sub_opts` into BOTH the keyword +
   # semantic-count filter set (`apply_search_filters/3`) and the semantic results pool
   # (`apply_semantic_pool_filters/2`), so results and `total_count` stay consistent.
-  # A `nil` project_id is a no-op under either mode (strict short-circuits on nil;
-  # `scope_project_or_global(query, nil)` returns the query unchanged).
+  #
+  # `nil` project_id behaviour DIFFERS by mode (deliberately):
+  #   * `:strict` — a no-op (`maybe_filter_by_project_id/2` short-circuits nil), so an
+  #     absent project matches ALL projects — the historical list/search behaviour.
+  #   * `:with_global` — scopes to GLOBAL-ONLY (`project_id IS NULL`), NOT the query
+  #     unchanged. The merged-recall contract (the OpenAPI RecallContextRequest and the
+  #     MCP recall_context tool both promise "absent/blank project → global-only") and
+  #     the memory half (`Memory.maybe_scope_project/2`, nil → `project_id IS NULL`)
+  #     require the union to be global-only with no active project — NOT every project's
+  #     articles flooding the merged limit for a multi-project tenant.
+  defp apply_project_scope(query, nil, :with_global),
+    do: where(query, [a], is_nil(a.project_id))
+
   defp apply_project_scope(query, project_id, :with_global),
     do: scope_project_or_global(query, project_id)
 
@@ -6365,7 +6376,13 @@ defmodule Loopctl.Knowledge do
       matches `project_id == id` (the historical behaviour); `:with_global` matches
       `project_id IS NULL OR == id`, so a project-scoped search ALSO surfaces
       tenant-wide (global) articles. Used by the merged `Loopctl.Memory.recall_context/2`
-      recall (#411 Gap 2). No-op when `:project_id` is absent.
+      recall (#411 Gap 2). Under `:strict` an absent `:project_id` is a no-op (all
+      projects); under `:with_global` an absent `:project_id` scopes to GLOBAL-ONLY
+      (`project_id IS NULL`), matching the documented `global ∪ active-project` union.
+    - `:embedding` -- an optional precomputed `{:ok, embedding} | {:error, reason}`
+      for `query_string`. When supplied the semantic half reuses it instead of making
+      an outbound provider call (the merged recall shares ONE embedding across both
+      halves — #411 Gap 2); an `{:error, _}` degrades to keyword-only as usual.
     - `:limit` -- max ranked results to return (default 10, max
       #{@max_relevance_page_size}, min 1); relevance top-N, capped well below the
       enumeration page size
@@ -6431,7 +6448,15 @@ defmodule Loopctl.Knowledge do
       |> Keyword.put(:_skip_record_access, true)
 
     keyword_result = search_keyword(tenant_id, query_string, sub_opts)
-    embedding_result = try_generate_embedding(tenant_id, query_string, [])
+
+    # Reuse a caller-supplied embedding when present (the merged recall generates ONE
+    # embedding for both its memory + knowledge halves — #411 Gap 2) instead of making
+    # a second outbound provider call; otherwise generate here as before.
+    embedding_result =
+      case Keyword.get(opts, :embedding) do
+        nil -> try_generate_embedding(tenant_id, query_string, [])
+        precomputed -> precomputed
+      end
 
     case {keyword_result, embedding_result} do
       {{:ok, kw}, {:ok, embedding}} ->

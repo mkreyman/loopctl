@@ -79,6 +79,44 @@ defmodule LoopctlWeb.RecallControllerTest do
       assert meta["memory_count"] >= 1
       assert meta["knowledge_count"] >= 1
       assert meta["total_count"] == length(data)
+      # The merged ordering is a documented cross-source heuristic, surfaced so callers
+      # don't read it as calibrated relevance.
+      assert meta["results_ranking"] == "heuristic_cross_source"
+
+      # Knowledge items are the whitelisted combined-search SUMMARY — never the raw
+      # result map's internal scoring fields, status, tenant_id, project_id, timestamps.
+      know_item = Enum.find(know_data, &(&1["id"] == article.id))
+
+      assert Map.keys(know_item)
+             |> Enum.sort()
+             |> Enum.all?(&(&1 in ~w(id title category tags score snippet)))
+
+      refute Map.has_key?(know_item, "tenant_id")
+      refute Map.has_key?(know_item, "status")
+      refute Map.has_key?(know_item, "final_score")
+      refute Map.has_key?(know_item, "inserted_at")
+
+      merged_know = Enum.find(data, &(&1["source"] == "knowledge"))["article"]
+      refute Map.has_key?(merged_know, "tenant_id")
+      refute Map.has_key?(merged_know, "status")
+    end
+
+    test "a missing or blank/whitespace-only query is rejected with a 422 invalid_query" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+
+      for q <- [nil, "", "   ", "\t\n"] do
+        params = if is_nil(q), do: %{}, else: %{"query" => q}
+
+        body =
+          base_conn()
+          |> auth(raw)
+          |> post(~p"/api/v1/recall", params)
+          |> json_response(422)
+
+        assert body["error"]["code"] == "invalid_query"
+        assert body["error"]["status"] == 422
+      end
     end
 
     test "a non-string query is rejected with a deterministic 422 invalid_query" do

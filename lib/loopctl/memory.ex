@@ -490,7 +490,9 @@ defmodule Loopctl.Memory do
     k = clamp_k(opt(opts, :limit, @default_recall_k))
     include_superseded? = truthy?(opt(opts, :include_superseded, false))
 
-    case Knowledge.generate_embedding(scope.tenant_id, query_text) do
+    # Reuse a precomputed embedding when the caller supplies one (the merged recall
+    # generates it ONCE for both halves — #411 Gap 2); otherwise generate here.
+    case opt(opts, :embedding, nil) || Knowledge.generate_embedding(scope.tenant_id, query_text) do
       {:ok, embedding} ->
         recall_semantic(scope, embedding, k, include_superseded?)
 
@@ -760,8 +762,11 @@ defmodule Loopctl.Memory do
 
   `project_id` is the PARTITION key on both sides, NOT the isolation boundary
   (`tenant_id`/`subject_id` are — they come from `scope`, never the body). A nil
-  `scope.project_id` is global-only on the memory side and no-project-filter on the
-  knowledge side; a present one merges global with that project on both.
+  `scope.project_id` is GLOBAL-ONLY on BOTH sides (memory: `project_id IS NULL`;
+  knowledge: `:with_global` with a nil project also scopes to `project_id IS NULL`),
+  so with no active project the union is global-only — matching the published
+  RecallContextRequest / MCP recall_context contract. A present project merges global
+  with that project on both.
 
   ## Scores are heuristically comparable, NOT calibrated
 
@@ -775,9 +780,17 @@ defmodule Loopctl.Memory do
       keyword+semantic score, MIN-MAX normalized WITHIN the returned pool (so it is
       pool-relative, not an absolute similarity).
 
+  KNOWN BIAS: because the knowledge `final_score` is min-max normalized within the
+  returned pool, the top knowledge row is ~1.0 regardless of its ABSOLUTE relevance,
+  so knowledge items systematically outrank memory items in the default `results`
+  ordering even when the memory matches are strong. This is a documented heuristic,
+  NOT a calibrated cross-source ranking — do NOT read the merged `results` order as
+  "knowledge was more relevant than memory". `meta.results_ranking` carries the stable
+  tag `"heuristic_cross_source"` so consumers can detect this programmatically.
+
   Treat the cross-source ordering as a useful heuristic, not a calibrated ranking.
-  Callers that need to re-rank get BOTH the merged view AND the untouched per-source
-  envelopes (`:memory`, `:knowledge`) to do so.
+  Callers that need a calibrated re-rank get BOTH the merged view AND the untouched
+  per-source envelopes (`:memory`, `:knowledge`), each carrying its own native scores.
 
   ## Degradation, never a 500
 
@@ -813,7 +826,8 @@ defmodule Loopctl.Memory do
           total_count: non_neg_integer(),    # length(results) after the merged cap
           memory_count: non_neg_integer(),   # memory rows BEFORE the merged cap
           knowledge_count: non_neg_integer(),# knowledge rows BEFORE the merged cap
-          degraded?: boolean()               # knowledge errored or fell back to keyword
+          degraded?: boolean(),              # knowledge errored or fell back to keyword
+          results_ranking: String.t()        # "heuristic_cross_source" (see KNOWN BIAS)
         }
       }
 
@@ -833,8 +847,17 @@ defmodule Loopctl.Memory do
     query = to_string(opt(opts, :query, ""))
     limit = clamp_context_limit(opt(opts, :limit, @default_context_limit))
 
-    memory_env = recall(scope, query: query, limit: limit)
-    knowledge_env = knowledge_recall(scope, query, limit, opts)
+    # Generate the query embedding ONCE and thread it into BOTH halves. This
+    # single-round-trip endpoint otherwise made TWO uncached outbound provider calls
+    # for the identical query (recall/2 → generate_embedding AND knowledge_recall →
+    # search_combined → try_generate_embedding), doubling embedding latency/cost and
+    # consuming two per-tenant embedding-concurrency slots. Sharing one embedding also
+    # makes the two halves' semantic-vs-keyword degradation AGREE (previously the
+    # memory side could succeed while the knowledge side independently fell back).
+    embedding_result = Knowledge.generate_embedding(scope.tenant_id, query)
+
+    memory_env = recall(scope, query: query, limit: limit, embedding: embedding_result)
+    knowledge_env = knowledge_recall(scope, query, limit, opts, embedding_result)
 
     memory_items =
       Enum.map(memory_env.results, fn {memory, score} ->
@@ -863,7 +886,12 @@ defmodule Loopctl.Memory do
         total_count: length(merged),
         memory_count: length(memory_items),
         knowledge_count: length(knowledge_items),
-        degraded?: knowledge_degraded?(knowledge_env)
+        degraded?: knowledge_degraded?(knowledge_env),
+        # The merged `results` order sorts memory's ABSOLUTE cosine similarity against
+        # knowledge's POOL-NORMALIZED final_score — a heuristic, not a calibrated
+        # cross-source ranking (knowledge is biased upward; see the moduledoc). Surface
+        # a stable tag so consumers don't mistake the order for calibrated relevance.
+        results_ranking: "heuristic_cross_source"
       }
     }
   end
@@ -873,7 +901,7 @@ defmodule Loopctl.Memory do
   # `%{results: [...], meta: %{...}}` envelope. On ANY error (empty query, invalid
   # weights, bad_request) the knowledge side degrades to empty results tagged
   # `degraded?: true` — the merged call never propagates a knowledge fault as a crash.
-  defp knowledge_recall(scope, query, limit, opts) do
+  defp knowledge_recall(scope, query, limit, opts, embedding_result) do
     kopts =
       [
         project_id: scope.project_id,
@@ -882,6 +910,13 @@ defmodule Loopctl.Memory do
       ]
       |> maybe_put_opt(:status, opt(opts, :status, nil))
       |> maybe_put_opt(:visibility_agent_id, opt(opts, :visibility_agent_id, nil))
+      # Thread the read-attribution key so `search_combined/3` records knowledge-access
+      # analytics for /recall traffic (the guard in `maybe_record_search_access/5` skips
+      # recording when `:api_key_id` is nil). Sibling search/context endpoints set it too.
+      |> maybe_put_opt(:api_key_id, opt(opts, :api_key_id, nil))
+      # Reuse the embedding generated ONCE in `recall_context/2` so the knowledge half
+      # does not make a second provider call for the identical query (#411 Gap 2).
+      |> maybe_put_opt(:embedding, embedding_result)
 
     case Knowledge.search_combined(scope.tenant_id, query, kopts) do
       {:ok, %{results: results, meta: meta}} ->
@@ -907,9 +942,18 @@ defmodule Loopctl.Memory do
 
   defp knowledge_degraded?(%{meta: meta}), do: Map.get(meta, :degraded?, false) == true
 
-  # Knowledge combined `final_score` — a pool-normalized weighted keyword+semantic
-  # score in [0, 1]. Defaults to 0.0 for a malformed result map (defensive).
-  defp knowledge_score(%{final_score: score}) when is_number(score), do: score
+  # Knowledge combined ranking score. Normal combined results carry `:final_score`
+  # (pool-normalized weighted keyword+semantic, in [0, 1]); when combined DEGRADES to a
+  # keyword-only fallback the results carry `:relevance_score` (and no `:final_score`),
+  # so mirror `KnowledgeSearchJSON.extract_score/2`'s chain
+  # (`final_score || relevance_score || similarity_score`) via bracket access rather
+  # than scoring every degraded-path item 0.0 and sinking all knowledge below memory.
+  # Defaults to 0.0 for a malformed/scoreless result map (defensive).
+  defp knowledge_score(result) when is_map(result) do
+    score = result[:final_score] || result[:relevance_score] || result[:similarity_score]
+    if is_number(score), do: score, else: 0.0
+  end
+
   defp knowledge_score(_), do: 0.0
 
   defp clamp_context_limit(limit),

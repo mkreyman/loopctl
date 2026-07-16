@@ -109,11 +109,12 @@ defmodule Loopctl.MemoryRecallContextTest do
       assert %{article: %{final_score: _}, score: _} = know_item
     end
 
-    test "a nil-project scope is global-only on MEMORY; knowledge applies no project filter" do
-      # Documented asymmetry (#411 Gap 2): memory's nil semantics are global-only
-      # (`project_id IS NULL` rows), but Knowledge has no 'global-only' mode — a nil
-      # project_id under `:with_global` (or strict) is a no-op filter, so the knowledge
-      # side returns ALL the tenant's matching articles (global + project-tagged alike).
+    test "a nil-project scope is global-only on BOTH memory and knowledge" do
+      # With no active project the `global ∪ active-project` union is GLOBAL-ONLY on
+      # BOTH sides (matching the published RecallContextRequest / MCP recall_context
+      # contract). Memory's nil semantics scope to `project_id IS NULL`; knowledge's
+      # `:with_global` mode ALSO scopes a nil project to `project_id IS NULL` (rather
+      # than the former no-op that flooded the merged limit with every project's rows).
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       Knowledge.reset_circuit_breaker(tenant.id)
@@ -137,10 +138,10 @@ defmodule Loopctl.MemoryRecallContextTest do
       assert MapSet.equal?(memory_ids(result.memory), MapSet.new([global_mem.id]))
       refute MapSet.member?(memory_ids(result.memory), project_mem.id)
 
-      # Knowledge: no project filter → BOTH the global and the project-tagged article.
+      # Knowledge: global-only too → the global article, NOT the project-tagged one.
       k_ids = knowledge_ids(result.knowledge)
       assert MapSet.member?(k_ids, global_art.id)
-      assert MapSet.member?(k_ids, project_art.id)
+      refute MapSet.member?(k_ids, project_art.id)
     end
   end
 
