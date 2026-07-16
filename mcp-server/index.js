@@ -1222,6 +1222,26 @@ async function memoryRecall({ query, limit, include_superseded }) {
   return toContent(result);
 }
 
+async function recallContext({ query, project_id, limit }) {
+  // Merged recall (#411 Gap 2): ONE round-trip returning the re-ranked
+  // global ∪ active-project union of long-term MEMORY and KNOWLEDGE. Scope
+  // (tenant_id/subject_id) is derived server-side from the agent key; project_id is
+  // the partition key (merges global with that project on BOTH sides).
+  const payload = { query };
+  if (project_id) payload.project_id = project_id;
+  if (limit != null) payload.limit = limit;
+
+  const result = await apiCall(
+    "POST",
+    "/api/v1/recall",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  // Surface both per-source metas (memory fallback/underfilled + knowledge degraded)
+  // so the caller can tell a degraded recall from a genuinely empty scope.
+  return toContent(result);
+}
+
 async function memoryList({ limit, offset, include_superseded, all_subjects }) {
   // all_subjects is superadmin-only server-side; a non-superadmin key sending
   // this is ignored (falls back to its own subject) rather than erroring — the
@@ -3529,6 +3549,45 @@ const TOOLS = [
     },
   },
   {
+    name: "recall_context",
+    description:
+      "MERGED recall in ONE round-trip: the re-ranked global ∪ active-project union of " +
+      "your long-term MEMORY (private working state) AND the shared KNOWLEDGE wiki for " +
+      "`query` — instead of calling memory_recall and knowledge_context/knowledge_search " +
+      "separately and merging by hand (#411 Gap 2). Both sides merge global with the " +
+      "active project: pass project_id to include that project's rows alongside global " +
+      "ones on BOTH sides (another project's rows are excluded); omit it for global-only. " +
+      "project_id is a PARTITION key, NOT isolation — scope (tenant/subject) is resolved " +
+      "server-side from your key. Returns `data` (merged, each item tagged source: " +
+      "memory|knowledge, sorted by a heuristically-comparable score DESC) PLUS the " +
+      "untouched per-source `memory` and `knowledge` envelopes so you can re-rank. " +
+      "Cross-source scores are heuristic, not calibrated. If the knowledge search " +
+      "degrades (embedding unavailable) or errors, the memory side is still returned and " +
+      "meta.degraded is true — never a hard failure.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Text to embed / match against on BOTH the memory and knowledge sides.",
+        },
+        project_id: {
+          type: "string",
+          format: "uuid",
+          description:
+            "Optional: partition scope. Present → both sides return global ∪ that project; " +
+            "omit → global-only.",
+        },
+        limit: {
+          type: "integer",
+          description:
+            "Optional: overall merged page size, clamped to [1, 50] (default 10).",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
     name: "memory_list",
     description:
       "List YOUR OWN long-term memories, newest first — private, scoped working state, " +
@@ -4880,6 +4939,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "memory_recall":
       return await memoryRecall(args);
+    case "recall_context":
+      return await recallContext(args);
 
     case "memory_list":
       return await memoryList(args);

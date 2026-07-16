@@ -8,6 +8,11 @@ defmodule LoopctlWeb.MemoryController do
   - `POST   /api/v1/memory/promote` — trigger session→long-term promotion (US-29.3)
   - `GET    /api/v1/memory`         — list (limit/offset + total_count meta)
   - `DELETE /api/v1/memory/:id`     — forget
+  - `POST   /api/v1/recall`         — MERGED recall: one round-trip returning the
+    re-ranked `global ∪ active-project` union of long-term memory AND knowledge
+    (`Loopctl.Memory.recall_context/2`, #411 Gap 2). Reuses the same key-derived
+    `(tenant_id, subject_id)` scope + `project_id` partition + 422 envelopes as
+    `/memory/recall`.
 
   ## Scope is derived from the KEY, never the body (AC-28.3.2)
 
@@ -43,7 +48,9 @@ defmodule LoopctlWeb.MemoryController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Memory
   alias Loopctl.Memory.Scope
+  alias LoopctlWeb.Helpers.Visibility
   alias LoopctlWeb.MemoryJSON
+  alias LoopctlWeb.RecallJSON
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -55,6 +62,12 @@ defmodule LoopctlWeb.MemoryController do
   tags(["Agent Memory"])
 
   @memory_attr_keys ~w(tier text session_id role content expires_at confidence source_session_id tags metadata)
+
+  # The merged-recall query length cap, mirroring the knowledge half's
+  # `Loopctl.Knowledge.validate_query_string/1` 500-char limit so `/recall` rejects an
+  # over-length query at the boundary (BEFORE the shared embedding call) exactly as the
+  # standalone `/knowledge/search` does — never half-degrading to a memory-only 200.
+  @max_context_query_length 500
 
   operation(:create,
     summary: "Remember (write a memory)",
@@ -114,6 +127,54 @@ defmodule LoopctlWeb.MemoryController do
       422 =>
         {"Subject unresolvable, non-string query, or invalid project_id", "application/json",
          Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:context,
+    summary: "Merged recall (memory ∪ knowledge, one round-trip)",
+    description:
+      "Returns ONE merged, re-ranked result combining the caller's long-term MEMORY " <>
+        "recall AND the KNOWLEDGE combined search for `(query, project_id)` — the " <>
+        "`global ∪ active-project` union the harness previously assembled by calling " <>
+        "`/memory/recall` and `/knowledge/search` separately (#411 Gap 2). NOTE the " <>
+        "knowledge half is the COMBINED SEARCH: article SUMMARIES (id/title/category/" <>
+        "tags/score + a truncated snippet), NOT the deep-read `/knowledge/context` " <>
+        "(full article bodies + one-hop linked references + recency weighting). Callers " <>
+        "needing full bodies or linked refs must still call `/knowledge/context`. Both " <>
+        "sides merge global with the active project: an absent/blank `project_id` " <>
+        "returns GLOBAL-ONLY memory AND global-only knowledge; a present `project_id` " <>
+        "merges global with that project on BOTH sides (another project's rows are " <>
+        "excluded). `project_id` is a PARTITION key, NOT the isolation boundary — " <>
+        "`(tenant_id, subject_id)` is, and is derived from the API key, never the body. " <>
+        "A malformed `project_id` is a 422 (`invalid_project_id`); a non-string, " <>
+        "missing, or blank/whitespace-only `query` is a 422 (`invalid_query`); a query " <>
+        "longer than 500 characters is a 422 (`query_too_long`) — rejected up front " <>
+        "(matching `/knowledge/search`) BEFORE any embedding is generated, never a " <>
+        "half-degraded memory-only 200. The " <>
+        "response carries the merged `results` (each tagged `source: memory|knowledge`, " <>
+        "sorted by a heuristically-comparable `score` DESC — `meta.results_ranking` is " <>
+        "`heuristic_cross_source`) PLUS the untouched per-source `memory` and " <>
+        "`knowledge` envelopes so callers can re-rank. Cross-source scores are " <>
+        "heuristic, not calibrated (memory = absolute cosine similarity; knowledge = " <>
+        "pool-normalized keyword+semantic, which biases knowledge UPWARD in the default " <>
+        "order). On a DEGRADED knowledge side (keyword-only fallback) memory rows carry " <>
+        "absolute cosine scores while knowledge rows carry raw (un-normalized) keyword " <>
+        "`relevance_score`, which can outrank memory in the merged `data` — callers who " <>
+        "need memory-first ordering under degradation should read the per-source `memory` " <>
+        "envelope (it preserves the honest native scores). If the knowledge search " <>
+        "errors or degrades to keyword-only, OR the memory heavy-read pool is shed under " <>
+        "the per-tenant cap, the OTHER side is still returned and `meta.degraded?` is " <>
+        "true (`meta.degraded_reason` names why) — never a 500 and never a whole-endpoint " <>
+        "429 from one shed pool. Agent role " <>
+        "is forced to published articles and its own/`shared` memories (#163).",
+    request_body: {"Recall params", "application/json", Schemas.RecallContextRequest},
+    responses: %{
+      200 => {"Merged recall results", "application/json", Schemas.RecallContextResponse},
+      422 =>
+        {"Subject unresolvable, non-string/blank/over-length query, or invalid project_id",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
     }
@@ -290,6 +351,88 @@ defmodule LoopctlWeb.MemoryController do
       end
     end)
   end
+
+  @doc "POST /api/v1/recall"
+  def context(conn, params) do
+    case parse_project_id(params["project_id"]) do
+      {:ok, project_id} ->
+        context_with_project(conn, params, project_id)
+
+      :error ->
+        invalid_project_id(conn)
+    end
+  end
+
+  defp context_with_project(conn, params, project_id) do
+    with_scope(conn, project_id, fn scope ->
+      case coerce_context_query(params["query"]) do
+        {:ok, query} ->
+          opts =
+            [query: query, limit: params["limit"]]
+            |> Keyword.merge(knowledge_scope_opts(conn))
+
+          json(conn, RecallJSON.context(Memory.recall_context(scope, opts)))
+
+        {:error, :query_too_long} ->
+          query_too_long(conn)
+
+        {:error, :invalid_query} ->
+          invalid_query(conn)
+      end
+    end)
+  end
+
+  # Coerce + trim the merged-recall query ONCE at the boundary, treating blank/
+  # whitespace-only AND over-length uniformly across both halves. The knowledge half
+  # (`search_combined/3` → `validate_query_string/1`) trims, rejects blank with
+  # `{:error, :empty_query}`, AND rejects > #{@max_context_query_length}-char queries
+  # with `{:error, :bad_request, _}`; the memory half would ILIKE/embed the untrimmed
+  # value regardless. So an absent/blank OR an over-length query previously yielded a
+  # confusing "memory-only with a spuriously degraded knowledge side" response and a
+  # false `degraded?` alert — AND the over-length case additionally spent an outbound
+  # embedding provider call on the full (multi-KB) query BEFORE the knowledge cap
+  # rejected it. The merged recall REQUIRES a non-blank, ≤ #{@max_context_query_length}-
+  # char query (the knowledge half is its point), so both are a clean 422 up front —
+  # matching the sibling knowledge search/context endpoints, not the degraded path, and
+  # rejecting BEFORE `recall_context/2` generates the shared embedding.
+  defp coerce_context_query(query) do
+    with {:ok, coerced} <- coerce_query(query),
+         trimmed = String.trim(coerced),
+         {:blank, false} <- {:blank, trimmed == ""},
+         {:too_long, false} <-
+           {:too_long, String.length(trimmed) > @max_context_query_length} do
+      {:ok, trimmed}
+    else
+      {:too_long, true} -> {:error, :query_too_long}
+      _ -> {:error, :invalid_query}
+    end
+  end
+
+  # Knowledge-side read scoping for the merged recall, mirroring
+  # `KnowledgeContextController`: agent/orchestrator keys are forced to `:published`
+  # articles, and the agent-memory visibility scope (#163) hides other agents'
+  # private/owner memories. `:api_key_id` is threaded so `search_combined/3` records
+  # knowledge read-access analytics for /recall traffic (the sibling search/context
+  # endpoints set it too; without it the analytics guard silently records nothing).
+  #
+  # Higher roles (user/superadmin) pass NO `:status`, but `search_keyword`/
+  # `search_semantic` default `:status` to `:published`, so — unlike `/knowledge/context`
+  # (which accepts a `?status` override) — this endpoint has NO override and returns
+  # published-only knowledge for EVERY role, not "all statuses".
+  defp knowledge_scope_opts(conn) do
+    role = conn.assigns.current_api_key.role
+    role_atom = if is_binary(role), do: String.to_existing_atom(role), else: role
+
+    conn
+    |> Visibility.scope_opts()
+    |> Keyword.put(:api_key_id, conn.assigns.current_api_key.id)
+    |> maybe_force_published(role_atom)
+  end
+
+  defp maybe_force_published(opts, role) when role in [:agent, :orchestrator],
+    do: Keyword.put(opts, :status, :published)
+
+  defp maybe_force_published(opts, _role), do: opts
 
   @doc "POST /api/v1/memory/promote"
   def promote(conn, params) do
@@ -509,6 +652,21 @@ defmodule LoopctlWeb.MemoryController do
         status: 422,
         code: "invalid_query",
         message: "The `query` field must be a string."
+      }
+    })
+  end
+
+  # Reject an over-length merged-recall query with a distinct 422 BEFORE any embedding
+  # is generated, matching the knowledge half's 500-char cap. A generic `invalid_query`
+  # would mislead ("must be a string"), so this names the length constraint explicitly.
+  defp query_too_long(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "query_too_long",
+        message: "The `query` must be at most #{@max_context_query_length} characters."
       }
     })
   end

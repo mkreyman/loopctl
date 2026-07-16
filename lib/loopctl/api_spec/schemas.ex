@@ -3380,6 +3380,150 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule RecallContextRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RecallContextRequest",
+      description:
+        "Params for POST /recall (merged memory ∪ knowledge recall, #411 Gap 2). " <>
+          "Query supplied in the body; scope (tenant_id/subject_id) is derived from the " <>
+          "API key, never the body.",
+      type: :object,
+      properties: %{
+        query: %Schema{
+          type: :string,
+          description: "Text to embed / match against on BOTH the memory and knowledge sides."
+        },
+        limit: %Schema{
+          type: :integer,
+          description:
+            "Overall merged page size, clamped to [1, 50] (default 10). Applied " <>
+              "per-source first, then to the merged, re-ranked list."
+        },
+        project_id: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description:
+            "Optional project scope (a UUID PARTITION key, NOT an isolation boundary). " <>
+              "Present → both sides return the merged global ∪ that-project set; " <>
+              "absent/blank → global-only. A malformed value is a 422 invalid_project_id."
+        }
+      }
+    })
+  end
+
+  defmodule RecallContextResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RecallContextResponse",
+      description:
+        "Merged recall: `data` is the re-ranked union across memory + knowledge (each " <>
+          "item tagged `source`, sorted by a heuristically-comparable `score` DESC — " <>
+          "`meta.results_ranking` is `heuristic_cross_source`), with the untouched " <>
+          "per-source `memory` and `knowledge` envelopes for re-ranking, plus `meta` " <>
+          "(counts + degraded flag). Cross-source scores are heuristic, not calibrated: " <>
+          "memory `score` is ABSOLUTE cosine similarity in [0,1] (null on the fallback " <>
+          "path); knowledge `score` is a POOL-NORMALIZED keyword+semantic score (biases " <>
+          "knowledge upward in the default order). The knowledge `article`/`data` items " <>
+          "are combined-search SUMMARIES (id/title/category/tags/score + a truncated " <>
+          "snippet) — the same shape `/knowledge/search` returns, NOT full bodies or " <>
+          "linked references; call `/knowledge/context` for those.",
+      type: :object,
+      properties: %{
+        data: %Schema{
+          type: :array,
+          description: "Merged, re-ranked results across both sources.",
+          items: %Schema{
+            type: :object,
+            properties: %{
+              source: %Schema{type: :string, enum: ["memory", "knowledge"]},
+              score: %Schema{type: :number, format: :float, nullable: true},
+              memory: %Schema{
+                type: :object,
+                nullable: true,
+                description: "Present on `source: memory` items (see Memory schema)."
+              },
+              article: %Schema{
+                type: :object,
+                nullable: true,
+                description:
+                  "Present on `source: knowledge` items — the combined-search summary " <>
+                    "(id/title/category/tags/score + truncated snippet), the same " <>
+                    "whitelisted shape `/knowledge/search` returns."
+              }
+            }
+          }
+        },
+        memory: %Schema{
+          type: :object,
+          description: "The unchanged /memory/recall envelope (data + meta).",
+          properties: %{
+            data: %Schema{
+              type: :array,
+              items: %Schema{
+                type: :object,
+                properties: %{
+                  memory: Memory,
+                  score: %Schema{type: :number, format: :float, nullable: true}
+                }
+              }
+            },
+            meta: %Schema{type: :object}
+          }
+        },
+        knowledge: %Schema{
+          type: :object,
+          description:
+            "The combined-search envelope (data + meta). Each `data` item is the " <>
+              "whitelisted summary shape (id/title/category/tags/score + truncated " <>
+              "snippet), NOT the raw internal result map.",
+          properties: %{
+            data: %Schema{type: :array, items: %Schema{type: :object}},
+            meta: %Schema{type: :object}
+          }
+        },
+        meta: %Schema{
+          type: :object,
+          properties: %{
+            query: %Schema{type: :string},
+            project_id: %Schema{type: :string, format: :uuid, nullable: true},
+            total_count: %Schema{type: :integer},
+            memory_count: %Schema{type: :integer},
+            knowledge_count: %Schema{type: :integer},
+            degraded: %Schema{
+              type: :boolean,
+              description:
+                "True when EITHER half degraded: the knowledge side errored or fell back " <>
+                  "to keyword-only, OR the memory heavy-read pool was shed under the " <>
+                  "per-tenant cap (empty by capacity, never a whole-endpoint 429)."
+            },
+            degraded_reason: %Schema{
+              type: :string,
+              nullable: true,
+              description:
+                "Bounded, non-sensitive tag naming WHY the merged recall degraded " <>
+                  "(e.g. `heavy_read_overloaded`, `no_embedding_key`, `invalid_weights`), " <>
+                  "or `null` when healthy. Lets a caller tell a scope-empty half from a " <>
+                  "fault-empty one without parsing the per-source envelopes."
+            },
+            results_ranking: %Schema{
+              type: :string,
+              description:
+                "Stable tag (`heuristic_cross_source`) warning that the merged `data` " <>
+                  "order mixes memory's absolute cosine with knowledge's pool-normalized " <>
+                  "score and is NOT a calibrated cross-source ranking."
+            }
+          }
+        }
+      }
+    })
+  end
+
   defmodule MemoryDeleteResponse do
     @moduledoc false
     require OpenApiSpex

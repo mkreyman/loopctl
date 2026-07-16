@@ -325,6 +325,11 @@ defmodule LoopctlWeb.Router do
     get "/memory", MemoryController, :index
     delete "/memory/:id", MemoryController, :delete
 
+    # Merged recall (Epic 28 / #411 Gap 2) — ONE round-trip returning the re-ranked
+    # `global ∪ active-project` union of long-term memory AND knowledge. Reuses the
+    # MemoryController scope-from-key + project-partition helpers.
+    post "/recall", MemoryController, :context
+
     # Context Retriever (Epic 30, US-30.4) — entity-definition CRUD + the
     # model-invoked query surface. Literal /retrieve/tools MUST precede the
     # parameterized /retrieve/:entity so it is not captured as an :entity.
