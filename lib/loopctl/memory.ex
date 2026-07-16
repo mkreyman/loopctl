@@ -56,6 +56,7 @@ defmodule Loopctl.Memory do
   alias Loopctl.Memory.Scope
   alias Loopctl.Memory.SessionMemory
   alias Loopctl.Memory.SessionPromotion
+  alias Loopctl.Projects
   alias Loopctl.Workers.MemoryEmbeddingWorker
   alias Loopctl.Workers.MemoryPromotionWorker
 
@@ -117,7 +118,17 @@ defmodule Loopctl.Memory do
       `embedding` starts NULL and is populated asynchronously).
 
   `tenant_id`, `subject_id`, and `project_id` come from `scope` and are set
-  programmatically on the struct — never cast from `attrs`. A long-term write is
+  programmatically on the struct — never cast from `attrs`. `tenant_id`/`subject_id`
+  are the key-derived isolation boundary; `project_id` is a partition key that MAY
+  originate from the request body (see the controller), so — because the insert runs
+  on the BYPASSRLS `AdminRepo` and its `foreign_key_constraint(:project_id)` would
+  otherwise validate against EVERY tenant's projects — a present `project_id` is
+  validated tenant-ownership FIRST (`Loopctl.Projects.get_project/2`) and refused with
+  `{:error, :project_not_found}` when it is malformed, nonexistent, or belongs to
+  another tenant. This closes the cross-tenant FK existence oracle + cross-tenant graph
+  edge the FK check would otherwise permit; the DB FK constraint is defense-in-depth,
+  never the tenant-boundary gate (mirrors `Loopctl.Knowledge.validate_project_ownership/2`).
+  A long-term write is
   refused with `{:error, :quota_exceeded}` once the per-`(tenant, subject)` cap
   (`:max_long_term_memories_per_subject`, default 10_000) is reached. The cap counts
   ONLY live (non-superseded) rows, so it bounds the recallable tier; superseded rows
@@ -129,11 +140,31 @@ defmodule Loopctl.Memory do
   """
   @spec remember(Scope.t(), map()) ::
           {:ok, MemorySchema.t() | SessionMemory.t()}
-          | {:error, Ecto.Changeset.t() | :quota_exceeded}
+          | {:error, Ecto.Changeset.t() | :quota_exceeded | :project_not_found}
   def remember(%Scope{} = scope, attrs) when is_map(attrs) do
-    case normalize_tier(opt(attrs, :tier, :long_term)) do
-      :session -> remember_session(scope, attrs)
-      :long_term -> remember_long_term(scope, attrs)
+    with :ok <- validate_project_scope(scope) do
+      case normalize_tier(opt(attrs, :tier, :long_term)) do
+        :session -> remember_session(scope, attrs)
+        :long_term -> remember_long_term(scope, attrs)
+      end
+    end
+  end
+
+  # `project_id` is a body-suppliable partition key that is INSERTED via the BYPASSRLS
+  # `AdminRepo`, so the schema's `foreign_key_constraint(:project_id)` evaluates against
+  # projects in EVERY tenant. Validating tenant-ownership HERE — before the write —
+  # means the FK is never the tenant-boundary gate: a well-formed UUID that exists in
+  # ANOTHER tenant (an existence oracle + a cross-tenant graph edge) and a nonexistent
+  # UUID both take the SAME `{:error, :project_not_found}` path, so neither leaks nor
+  # partitions across the isolation boundary. `nil` (global/tenant-wide) is always
+  # allowed. Mirrors `Loopctl.Knowledge.validate_project_ownership/2`; a malformed
+  # value is caught by `get_project/2`'s own UUID guard (→ `:not_found`).
+  defp validate_project_scope(%Scope{project_id: nil}), do: :ok
+
+  defp validate_project_scope(%Scope{tenant_id: tenant_id, project_id: project_id}) do
+    case Projects.get_project(tenant_id, project_id) do
+      {:ok, _project} -> :ok
+      {:error, :not_found} -> {:error, :project_not_found}
     end
   end
 
@@ -289,8 +320,24 @@ defmodule Loopctl.Memory do
     |> case do
       {:ok, %{memory: memory}} -> {:ok, memory}
       {:error, :quota, :quota_exceeded, _changes} -> {:error, :quota_exceeded}
-      {:error, :memory, %Ecto.Changeset{} = changeset, _changes} -> {:error, changeset}
+      {:error, :memory, %Ecto.Changeset{} = changeset, _changes} -> memory_insert_error(changeset)
       {:error, :embedding_job, reason, _changes} -> {:error, reason}
+    end
+  end
+
+  # `validate_project_scope/1` runs BEFORE this advisory-locked Multi (check-then-act),
+  # so a project deleted in the window between that read and the insert trips the
+  # BYPASSRLS `foreign_key_constraint(:project_id)` at insert time — surfacing as a
+  # changeset error on `:project_id` rather than the intended `:project_not_found`. Map
+  # that back so the deleted-mid-write RACE returns the SAME `{:error, :project_not_found}`
+  # envelope (controller → `invalid_project_id`) as a foreign/nonexistent `project_id`
+  # caught pre-insert, keeping the caller contract consistent (#411 review). Any other
+  # changeset error (e.g. a `:text` validation) passes through unchanged.
+  defp memory_insert_error(%Ecto.Changeset{errors: errors} = changeset) do
+    if Keyword.has_key?(errors, :project_id) do
+      {:error, :project_not_found}
+    else
+      {:error, changeset}
     end
   end
 
@@ -343,6 +390,30 @@ defmodule Loopctl.Memory do
   `Loopctl.HeavyRead.all_memory/4`'s structural guard. Superseded rows are
   excluded unless `opts[:include_superseded]` is true.
 
+  ## `project_id` is a partition key here — recall does NOT tenant-validate it
+
+  `scope.project_id` selects a PARTITION, it is not the isolation boundary
+  (`tenant_id`/`subject_id` are). Recall therefore deliberately does NOT check
+  project ownership, and its `nil`/foreign/nonexistent semantics differ from the
+  write path ON PURPOSE:
+
+    * `project_id: nil` → GLOBAL-ONLY: only rows whose `project_id` column is NULL
+      (NOT a union across the subject's projects — see `Loopctl.Memory.Scope`).
+    * a present, well-formed `project_id` → `global ∪ that project`.
+    * a well-formed `project_id` that is a TYPO, STALE, or belongs to ANOTHER
+      tenant → treated as global-only (it simply matches no in-tenant rows), with
+      NO error. This is safe — the `(tenant_id, subject_id)` predicate still bounds
+      every result, so a foreign project_id can never surface another tenant's or
+      subject's rows — but it is INTENTIONALLY ASYMMETRIC with `remember/2`, which
+      validates ownership up front and 422s a foreign/nonexistent `project_id`
+      (`:project_not_found` → `invalid_project_id`). Recall stays validation-free so
+      an unowned partition is a quiet empty-partition read rather than a DB round-trip
+      on the hot recall path; the trade is that a client bug (wrong-tenant
+      `project_id`) is masked on recall where it would 422 on create. Callers that
+      need an unowned-project error must validate the id before recall.
+    * a malformed (non-UUID) `project_id` → global-only (the `:binary_id` cast is
+      guarded rather than raising; controllers 422 it at the boundary first).
+
   ## Index-safety (AC-28.2.3)
 
   A selective `(tenant_id, subject_id)` btree on the inner index-ordered subquery
@@ -359,8 +430,33 @@ defmodule Loopctl.Memory do
   kept), so superseded rows never occupy pool slots and default recall does not
   under-fill with live rows for a heavily-superseding subject. `include_superseded:
   true` uses the full index. `meta.underfilled` is `true` when fewer than the
-  requested `k` rows were recalled (a small live scope OR cross-subject pool
-  under-fill) so callers can distinguish it from a genuinely capped page.
+  requested `k` rows were recalled — nothing more. It is a single boolean
+  (`length(results) < k`) and DOES NOT distinguish WHY the page is short: a
+  genuinely small live scope, a cross-SUBJECT pool under-fill, and (since #411
+  Gap 2) a cross-PROJECT pool under-fill all raise it identically. So `underfilled:
+  true` means only "fewer than `k` here" — a caller CANNOT read it as "there is
+  nothing more" vs "matching rows exist beyond the pool horizon; retry wider". A
+  cause-tagged signal (`meta.underfill_reason`) is deferred to the US-28.5 pool-
+  calibration story; until then treat `underfilled` as a hint to widen `limit`, not
+  a diagnosis.
+
+  ## Project scope compounds the pool under-fill window (#411 Gap 2)
+
+  The `global ∪ active-project` merge is a SECOND selective filter applied on the OUTER
+  over-the-pool query (`maybe_scope_project/2`), stacked on the subject filter. The
+  inner over-fetch pool (`VectorSearch.pool_size/1`) is calibrated for SUBJECT dilution
+  only and is project-AGNOSTIC (a selective project predicate on the inner ANN would
+  flip the planner off HNSW — #170/#172). So a subject whose in-scope
+  (`global + active-project`) live memories are sparse relative to its total
+  cross-project corpus can under-fill recall (`meta.underfilled: true`) even when ≥ k
+  in-scope memories exist beyond the pool horizon — the SAME accepted tradeoff as the
+  subject filter, now compounded. MITIGATION (`recall_pool_size/2`): when a project
+  scope is active the over-fetch factor is DOUBLED so the project filter draws from a
+  larger candidate pool, strictly REDUCING (never eliminating) the compounded
+  under-fill window — bounded by `:max_vector_pool` so worst-case recall cost is
+  unchanged. FULL pool re-calibration with a VERIFIED combined subject×project dilution
+  bound remains the US-28.5-class scale story that owns pool calibration; recall
+  SIGNALS any residual short page via `meta.underfilled` regardless.
 
   ## Degradation (AC-28.2.4)
 
@@ -441,7 +537,7 @@ defmodule Loopctl.Memory do
   # trivial filters on a tiny set that cannot defeat the index.
   defp memory_candidate_query(scope, embedding, k, include_superseded?) do
     target = VectorSearch.to_embedding_list(embedding)
-    pool = VectorSearch.pool_size(k)
+    pool = recall_pool_size(scope, k)
 
     inner =
       MemorySchema
@@ -466,13 +562,34 @@ defmodule Loopctl.Memory do
       |> VectorSearch.put_distance(target)
 
     from(c in subquery(inner),
+      as: :memory,
       where: c.subject_id == ^scope.subject_id,
       order_by: [asc: c.distance],
       limit: ^k,
       select: c
     )
     |> maybe_exclude_superseded_sub(include_superseded?)
+    |> maybe_scope_project(scope.project_id)
   end
+
+  # POOL SIZING (#411 Gap 2): `VectorSearch.pool_size/2` is calibrated for SUBJECT
+  # dilution ONLY (the subject filter lives on the OUTER query, off the HNSW inner ANN).
+  # The project scope (`maybe_scope_project/2`) is a SECOND, independent outer filter
+  # over this SAME pool, so a subject whose in-scope (global + active-project) rows are
+  # sparse relative to its total cross-project corpus can under-fill (surfaced via
+  # `meta.underfilled`). MITIGATION: when a project scope is ACTIVE we DOUBLE the
+  # over-fetch factor so the project filter draws from more candidate rows before
+  # LIMIT k — strictly REDUCING (never eliminating) the compounded under-fill window.
+  # It stays bounded by `:max_vector_pool` (the `min(cap)` in `pool_size/2`), so
+  # worst-case recall cost is unchanged and the deterministic under-fill test (whose
+  # cap pins the pool) is unaffected. FULL pool re-calibration with a VERIFIED combined
+  # subject×project dilution bound remains the US-28.5 scale story that owns pool
+  # calibration; this is the safe interim mitigation, not that calibration.
+  defp recall_pool_size(%Scope{project_id: project_id}, k) when is_binary(project_id) do
+    VectorSearch.pool_size(k, factor: VectorSearch.pool_factor() * 2)
+  end
+
+  defp recall_pool_size(%Scope{}, k), do: VectorSearch.pool_size(k)
 
   # Live-only filter on the INNER index-ordered ANN, applied ONLY on the default
   # (exclude-superseded) path. This is the ONE additional inner predicate that is
@@ -497,6 +614,40 @@ defmodule Loopctl.Memory do
   defp maybe_exclude_superseded_sub(query, false),
     do: where(query, [c], is_nil(c.superseded_by))
 
+  # #411 Gap 2: recall returns the merged `global ∪ active-project` set. `project_id`
+  # is a PARTITION key, NOT an isolation boundary — `tenant_id`/`subject_id` are (see
+  # `Memory.Scope` moduledoc). So a nil scope resolves to global-only
+  # (`project_id IS NULL`) and a present project merges global with that project. The
+  # `:binary_id` cast is guarded the way Knowledge does it: a malformed (non-UUID)
+  # value scopes to global-only rather than raising `Ecto.Query.CastError` (controllers
+  # 4xx at the boundary — this is defense in depth).
+  #
+  # ONE helper (was two hand-copied `_outer`/`_base` clauses — a silent-drift hazard
+  # on an isolation-adjacent path, #411 review). It targets the NAMED `:memory`
+  # binding, which BOTH call sites declare (`as: :memory`): the semantic path's outer
+  # over-the-pool subquery (whose `select` projects `project_id`) and the fallback
+  # path's base `memories` table. Naming the binding (rather than the former positional
+  # `[x]` first-binding) makes the "this must filter the memories relation" dependency
+  # EXPLICIT and compile-checked: a future refactor that introduces a join with a
+  # different first binding, or drops the `as: :memory`, fails to compile here instead
+  # of silently filtering the wrong table on an isolation-adjacent path (#411 review).
+  # NB: Memory's nil semantics (nil → global-only) DELIBERATELY differ from
+  # `Loopctl.Knowledge.scope_project_or_global/2` (nil → no project filter at all);
+  # they are different features, so this is intentionally NOT shared across contexts.
+  #
+  # This predicate MUST stay on the OUTER over-the-pool query (like the subject and
+  # superseded filters) — never on `index_safe_knn_base`'s inner ANN, where a
+  # selective predicate would flip the planner off the HNSW index.
+  defp maybe_scope_project(query, project_id) when is_binary(project_id) do
+    if valid_uuid?(project_id) do
+      where(query, [memory: m], is_nil(m.project_id) or m.project_id == ^project_id)
+    else
+      where(query, [memory: m], is_nil(m.project_id))
+    end
+  end
+
+  defp maybe_scope_project(query, _), do: where(query, [memory: m], is_nil(m.project_id))
+
   # Rebuild a %Memory{} from the recalled projection map. `embedding` is
   # `load_in_query: false` so it is intentionally absent (recall never returns the
   # raw vector); `:distance` is a computed column, dropped before struct build.
@@ -509,6 +660,7 @@ defmodule Loopctl.Memory do
 
     query =
       from(m in MemorySchema,
+        as: :memory,
         where: m.tenant_id == ^scope.tenant_id,
         where: m.subject_id == ^scope.subject_id,
         order_by: [desc: m.inserted_at, desc: m.id],
@@ -516,6 +668,7 @@ defmodule Loopctl.Memory do
       )
       |> maybe_exclude_superseded_base(include_superseded?)
       |> maybe_ilike(query_text)
+      |> maybe_scope_project(scope.project_id)
 
     rows =
       HeavyRead.all_memory(
@@ -1133,9 +1286,17 @@ defmodule Loopctl.Memory do
   worker; the rows written so far stand, matching the resumable-not-all-or-nothing
   contract).
 
+  A present `scope.project_id` is tenant-ownership-validated FIRST (same
+  `validate_project_scope/1` gate as `remember/2`) so this BYPASSRLS write can never
+  point a promoted row at another tenant's project; a foreign/nonexistent id short-
+  circuits the run with `{:error, :project_not_found}` (TERMINAL for the worker — a
+  bad `project_id` is not fixed by retrying). `nil` (today's only caller value) skips
+  the check.
+
   Returns `{:ok, summary}` on full success, `{:error, :embeddings_degraded}`,
   `{:error, :heavy_read_overloaded}` (the per-tenant HeavyRead gate shed the near-dup
   recall — a loss-free snooze for the worker, treated like `:embeddings_degraded`),
+  `{:error, :project_not_found}` (foreign/nonexistent `project_id` — terminal),
   `{:error, :quota_exceeded, summary}`, or `{:error, other}` (a bad write —
   retryable). `summary` is `%{promoted, superseded, deduped}` (promoted = fresh
   inserts; superseded = insert-and-supersede pairs; deduped = exact-dup skips).
@@ -1144,6 +1305,7 @@ defmodule Loopctl.Memory do
           {:ok, map()}
           | {:error, :embeddings_degraded}
           | {:error, :heavy_read_overloaded}
+          | {:error, :project_not_found}
           | {:error, :quota_exceeded, map()}
           | {:error, term()}
   def persist_promotion(%Scope{subject_id: @eval_subject_id}, _candidates) do
@@ -1157,6 +1319,24 @@ defmodule Loopctl.Memory do
   end
 
   def persist_promotion(%Scope{} = scope, candidates) when is_list(candidates) do
+    with :ok <- validate_project_scope(scope) do
+      persist_promotion_candidates(scope, candidates)
+    end
+  end
+
+  # #411 Gap 2 (security): `scope.project_id` reaches this BYPASSRLS durable-write
+  # chokepoint straight from the promotion worker's Oban args (`Map.get(args,
+  # "project_id")`) and is set on the row via `long_term_changeset/2` → the SAME
+  # `AdminRepo` insert `remember/2` uses. The schema's `foreign_key_constraint(:project_id)`
+  # runs BYPASSRLS and is explicitly "never the tenant-boundary gate" (schema moduledoc),
+  # so this path MUST run the SAME `validate_project_scope/1` ownership check `remember/2`
+  # does BEFORE the write — otherwise a future change that threads a `project_id` into
+  # promotion (mirroring exactly what Gap 2 did for create) would persist an unvalidated,
+  # possibly cross-tenant `project_id` with no compile-time signal, reopening the
+  # cross-tenant graph edge / FK existence oracle on a promoted row. Today every caller
+  # passes `project_id: nil` (short-circuits to `:ok` with no query), so this is a
+  # future-proofing guard with no hot-path cost.
+  defp persist_promotion_candidates(%Scope{} = scope, candidates) do
     Enum.reduce_while(candidates, {:ok, %{promoted: 0, superseded: 0, deduped: 0}}, fn candidate,
                                                                                        {:ok, acc} ->
       case promote_one(scope, candidate) do

@@ -18,6 +18,7 @@ defmodule Loopctl.MemoryContextTest do
   alias Loopctl.Knowledge
   alias Loopctl.Memory
   alias Loopctl.Memory.Memory, as: MemorySchema
+  alias Loopctl.Memory.Scope
 
   import Ecto.Query
 
@@ -246,6 +247,209 @@ defmodule Loopctl.MemoryContextTest do
 
       assert %{results: [], meta: %{fallback: true, reason: _}} =
                Memory.recall(empty_scope, query: "alamo")
+    end
+  end
+
+  # --- #411 Gap 2: recall merges global ∪ active-project ---
+
+  describe "recall/2 project scoping (merged global ∪ active-project, #411 Gap 2)" do
+    setup do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      proj_a = fixture(:project, %{tenant_id: tenant.id})
+      proj_b = fixture(:project, %{tenant_id: tenant.id})
+      subject_id = "subject-#{System.unique_integer([:positive])}"
+
+      global = %Scope{tenant_id: tenant.id, subject_id: subject_id, project_id: nil}
+      a = %{global | project_id: proj_a.id}
+      b = %{global | project_id: proj_b.id}
+
+      %{global: global, a: a, b: b, proj_a: proj_a, proj_b: proj_b}
+    end
+
+    test "semantic path: an active project_id merges global ∪ that project, excludes another project",
+         %{global: global, a: a, b: b} do
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+      {:ok, mb} = Memory.remember(b, %{tier: :long_term, text: "project beta widgets fact"})
+
+      ids = default_recall_ids(a, "widgets")
+
+      assert %{meta: %{fallback: false}} = Memory.recall(a, query: "widgets", limit: 10)
+      assert g.id in ids
+      assert ma.id in ids
+      refute mb.id in ids
+    end
+
+    test "semantic path: a nil project_id returns global-only (excludes any project-scoped memory)",
+         %{global: global, a: a, b: b} do
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+      {:ok, mb} = Memory.remember(b, %{tier: :long_term, text: "project beta widgets fact"})
+
+      ids = default_recall_ids(global, "widgets")
+
+      assert g.id in ids
+      refute ma.id in ids
+      refute mb.id in ids
+    end
+
+    test "fallback path: an active project_id merges global ∪ that project, excludes another project",
+         %{global: global, a: a, b: b} do
+      # Force the ILIKE fallback for the whole test.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:error, :no_api_key}
+      end)
+
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+      {:ok, mb} = Memory.remember(b, %{tier: :long_term, text: "project beta widgets fact"})
+
+      assert %{results: results, meta: %{fallback: true}} =
+               Memory.recall(a, query: "widgets", limit: 10)
+
+      ids = Enum.map(results, fn {m, _} -> m.id end)
+
+      assert g.id in ids
+      assert ma.id in ids
+      refute mb.id in ids
+    end
+
+    test "fallback path: a nil project_id returns global-only", %{global: global, a: a, b: b} do
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:error, :no_api_key}
+      end)
+
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+      {:ok, mb} = Memory.remember(b, %{tier: :long_term, text: "project beta widgets fact"})
+
+      assert %{results: results, meta: %{fallback: true}} =
+               Memory.recall(global, query: "widgets", limit: 10)
+
+      ids = Enum.map(results, fn {m, _} -> m.id end)
+
+      assert g.id in ids
+      refute ma.id in ids
+      refute mb.id in ids
+    end
+
+    test "a malformed project_id does not raise and is treated as global-only", %{
+      global: global,
+      a: a
+    } do
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+
+      malformed = %{global | project_id: "not-a-uuid"}
+
+      # Semantic path.
+      assert %{results: results} = Memory.recall(malformed, query: "widgets", limit: 10)
+      ids = Enum.map(results, fn {m, _} -> m.id end)
+      assert g.id in ids
+      refute ma.id in ids
+
+      # Fallback path.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:error, :no_api_key}
+      end)
+
+      assert %{results: fb_results, meta: %{fallback: true}} =
+               Memory.recall(malformed, query: "widgets", limit: 10)
+
+      fb_ids = Enum.map(fb_results, fn {m, _} -> m.id end)
+      assert g.id in fb_ids
+      refute ma.id in fb_ids
+    end
+
+    test "a well-formed project_id owned by ANOTHER tenant (and a nonexistent one) recalls global-only with no cross-tenant/partition leak",
+         %{global: global, a: a} do
+      # Recall deliberately does NOT tenant-validate project_id (it is a partition key,
+      # not the isolation boundary — see Memory.recall/2). Its safety therefore rests
+      # ENTIRELY on the (tenant_id, subject_id) predicate bounding results. Prove it:
+      # a project_id belonging to a FOREIGN tenant, and a nonexistent well-formed UUID,
+      # must each yield exactly the caller's GLOBAL rows — never the foreign row, never
+      # the caller's OWN project-scoped row.
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+
+      # A separate tenant with its own project + a memory under the SAME subject_id
+      # string, so only the (tenant_id) predicate — not a subject mismatch — keeps it out.
+      other_tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(other_tenant.id)
+      foreign_proj = fixture(:project, %{tenant_id: other_tenant.id})
+
+      foreign_scope = %Scope{
+        tenant_id: other_tenant.id,
+        subject_id: global.subject_id,
+        project_id: foreign_proj.id
+      }
+
+      {:ok, foreign} =
+        Memory.remember(foreign_scope, %{tier: :long_term, text: "foreign widgets fact"})
+
+      # Caller (our tenant/subject) passes the FOREIGN tenant's project_id.
+      cross = %{global | project_id: foreign_proj.id}
+      cross_ids = default_recall_ids(cross, "widgets")
+
+      assert g.id in cross_ids
+      refute ma.id in cross_ids
+      refute foreign.id in cross_ids
+
+      # A well-formed but NONEXISTENT project_id → same global-only result.
+      nonexistent = %{global | project_id: Ecto.UUID.generate()}
+      nonexistent_ids = default_recall_ids(nonexistent, "widgets")
+
+      assert g.id in nonexistent_ids
+      refute ma.id in nonexistent_ids
+      refute foreign.id in nonexistent_ids
+    end
+
+    test "semantic path: project scoping compounds pool under-fill — meta.underfilled flags a project-scoped page starved by other-project pool dominance",
+         %{a: a, b: b} do
+      # The inner ANN over-fetch pool is sized for SUBJECT dilution only and is
+      # project-AGNOSTIC (project scoping is a SECOND outer filter, #411 Gap 2). So a
+      # subject whose nearest neighbours are dominated by OTHER-project rows can
+      # under-fill a project-scoped recall even when >= k in-scope rows exist beyond
+      # the pool horizon. In test the pool is capped at 6 (config/test.exs), so 6
+      # nearer other-project rows fully occupy it and push the one in-scope row past
+      # the horizon. `meta.underfilled` MUST surface that (the SAME accepted tradeoff
+      # as the cross-subject case verified at prod scale in `ScaleRecallTest` /
+      # US-28.5, here made deterministic with a tiny fixed pool + fixed embeddings).
+      near = List.replace_at(List.duplicate(0.0, 1536), 0, 1.0)
+      far = List.replace_at(List.duplicate(0.0, 1536), 1, 1.0)
+
+      # Deterministic distances: "NEAR"-tagged text (query + the 6 pool fillers) embeds
+      # to `near` (cosine distance 0), everything else to the orthogonal `far`
+      # (distance 1). Used at BOTH write time (inline embedding worker) and recall time.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
+        if String.contains?(text, "NEAR"), do: {:ok, near}, else: {:ok, far}
+      end)
+
+      # 6 other-project (proj_b) rows are the globally-nearest → they fill the whole
+      # size-6 pool.
+      for i <- 1..6 do
+        {:ok, _} = Memory.remember(b, %{tier: :long_term, text: "NEAR pool filler #{i}"})
+      end
+
+      # One in-scope (proj_a) row, FARTHER than every pool row → rank 7, beyond the
+      # size-6 pool horizon.
+      {:ok, in_scope} =
+        Memory.remember(a, %{tier: :long_term, text: "far in-scope alpha fact"})
+
+      %{results: results, meta: meta} = Memory.recall(a, query: "NEAR needle", limit: 1)
+
+      # The size-6 pool held only other-project rows, which the outer project filter
+      # discards → an empty page, flagged under-filled, even though an in-scope row
+      # exists beyond the horizon. This is the compounded post-pool selectivity the
+      # subject-only pool sizing does not account for.
+      assert meta.fallback == false
+      assert results == []
+      assert meta.underfilled
+
+      # Proof the in-scope row genuinely exists (it is simply beyond the pool horizon,
+      # not absent): the subject-scoped list surfaces it.
+      assert in_scope.id in default_list_ids(a)
     end
   end
 

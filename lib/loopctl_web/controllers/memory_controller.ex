@@ -66,15 +66,20 @@ defmodule LoopctlWeb.MemoryController do
         "similarity) or `session` (short-term; requires `session_id` and `content`; " <>
         "`expires_at` is OPTIONAL — the server defaults it to now + the session-memory " <>
         "TTL and floors any supplied value up to the promotion sweep window, so a turn " <>
-        "is always promoted before it can be pruned). Returns 201 with the created " <>
+        "is always promoted before it can be pruned). An optional `project_id` (UUID) " <>
+        "partitions the memory to a project; absent/blank writes a tenant-wide (global) " <>
+        "memory. `project_id` is a partition key, NOT an isolation boundary, but it is " <>
+        "validated for tenant-ownership — a malformed value, or a well-formed UUID that " <>
+        "is not a project in the caller's own tenant, is rejected with a 422 " <>
+        "(`invalid_project_id`) rather than persisted. Returns 201 with the created " <>
         "memory. Subject to the full " <>
         ":authenticated chain (custody halt, witness header, rate limiting).",
     request_body: {"Memory params", "application/json", Schemas.MemoryCreateRequest},
     responses: %{
       201 => {"Memory created", "application/json", Schemas.MemoryResponse},
       422 =>
-        {"Validation error, quota exceeded, or subject unresolvable", "application/json",
-         Schemas.ErrorResponse},
+        {"Validation error, quota exceeded, invalid project_id, or subject unresolvable",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
     }
@@ -85,16 +90,30 @@ defmodule LoopctlWeb.MemoryController do
     description:
       "Recalls the caller's own long-term memories most similar to `query` " <>
         "(cosine over an HNSW index), scoped to the key's `(tenant_id, subject_id)`. " <>
-        "The query is supplied in the request BODY. When embedding generation is " <>
+        "An optional `project_id` (UUID) partitions the result: absent/blank returns " <>
+        "GLOBAL memories only (the rows whose `project_id` is NULL — NOT a union across " <>
+        "all your projects), while a present `project_id` returns the " <>
+        "merged `global ∪ that-project` set; another project's memories are excluded. " <>
+        "A malformed `project_id` is a 422 (`invalid_project_id`). NOTE the deliberate " <>
+        "asymmetry with `POST /memory` (create): recall does NOT tenant-validate a " <>
+        "well-formed `project_id`, because it is a partition key, not the isolation " <>
+        "boundary. A well-formed `project_id` that is a typo, stale, or owned by another " <>
+        "tenant is treated as an empty partition and returns your GLOBAL rows only with " <>
+        "NO error (never any other tenant's/subject's rows — the `(tenant_id, subject_id)` " <>
+        "predicate still bounds every result), whereas create 422s the same value. " <>
+        "The query is " <>
+        "supplied in the request BODY. When embedding generation is " <>
         "unavailable the response degrades to a recent-first text match with " <>
         "`meta.fallback: true` and a stable `meta.reason` (score is null on that " <>
         "path) — never a silent empty result. No silent hard cap: `limit` is " <>
-        "clamped to the vector-search max and `meta.underfilled` flags a short page.",
+        "clamped to the vector-search max and `meta.underfilled` flags a short page " <>
+        "(a small live scope, or a cross-subject/cross-project pool under-fill).",
     request_body: {"Recall params", "application/json", Schemas.MemoryRecallRequest},
     responses: %{
       200 => {"Recall results", "application/json", Schemas.MemoryRecallResponse},
       422 =>
-        {"Subject unresolvable or non-string query", "application/json", Schemas.ErrorResponse},
+        {"Subject unresolvable, non-string query, or invalid project_id", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
     }
@@ -188,7 +207,17 @@ defmodule LoopctlWeb.MemoryController do
 
   @doc "POST /api/v1/memory"
   def create(conn, params) do
-    with_scope(conn, fn scope ->
+    case parse_project_id(params["project_id"]) do
+      {:ok, project_id} ->
+        create_with_project(conn, params, project_id)
+
+      :error ->
+        invalid_project_id(conn)
+    end
+  end
+
+  defp create_with_project(conn, params, project_id) do
+    with_scope(conn, project_id, fn scope ->
       case Memory.remember(scope, memory_attrs(params)) do
         {:ok, memory} ->
           conn |> put_status(:created) |> json(MemoryJSON.show(%{memory: memory}))
@@ -209,23 +238,43 @@ defmodule LoopctlWeb.MemoryController do
             }
           })
 
-          # NOTE (review finding, disproven): the three clauses above are EXHAUSTIVE
+        # A body-supplied `project_id` that is malformed, nonexistent, or belongs to
+        # ANOTHER tenant (#411 Gap 2 tenancy fix): `Memory.remember/2` validates
+        # tenant-ownership BEFORE the RLS-bypassing insert, so the cross-tenant FK
+        # check is never the boundary gate. Both "foreign" and "nonexistent" collapse
+        # to the SAME 422 (no cross-tenant existence oracle), reusing the malformed-UUID
+        # `invalid_project_id` envelope so the three cases are indistinguishable.
+        {:error, :project_not_found} ->
+          invalid_project_id(conn)
+
+          # NOTE (review finding, disproven): the four clauses above are EXHAUSTIVE
           # for `Memory.remember/2`. Dialyzer's success typing proves the return is
           # exactly `{:ok, memory} | {:error, :quota_exceeded} | {:error,
-          # %Ecto.Changeset{}}` — the `remember_long_term/2` `:embedding_job` Multi
-          # step can only fail with an `Ecto.Changeset` (Oban validates the job via a
-          # changeset), so no non-changeset error term can reach here. A catch-all
-          # would be unreachable dead code (`pattern_match_cov`), and `@dialyzer`
-          # suppressions are forbidden. Dialyzer is the compile-time guard: if
-          # `remember/2` ever gains a new error shape, this case stops being total and
-          # the build breaks — a stronger contract than a runtime catch-all.
+          # :project_not_found} | {:error, %Ecto.Changeset{}}` — the
+          # `remember_long_term/2` `:embedding_job` Multi step can only fail with an
+          # `Ecto.Changeset` (Oban validates the job via a changeset), so no
+          # non-changeset error term can reach here. A catch-all would be unreachable
+          # dead code (`pattern_match_cov`), and `@dialyzer` suppressions are forbidden.
+          # Dialyzer is the compile-time guard: if `remember/2` ever gains a new error
+          # shape, this case stops being total and the build breaks — a stronger
+          # contract than a runtime catch-all.
       end
     end)
   end
 
   @doc "POST /api/v1/memory/recall"
   def recall(conn, params) do
-    with_scope(conn, fn scope ->
+    case parse_project_id(params["project_id"]) do
+      {:ok, project_id} ->
+        recall_with_project(conn, params, project_id)
+
+      :error ->
+        invalid_project_id(conn)
+    end
+  end
+
+  defp recall_with_project(conn, params, project_id) do
+    with_scope(conn, project_id, fn scope ->
       case coerce_query(params["query"]) do
         {:ok, query} ->
           opts = [
@@ -389,20 +438,25 @@ defmodule LoopctlWeb.MemoryController do
   # nil is forbidden") — escaping as a bare HTTP 500. Guard it here, mirroring the
   # index/2 + delete/2 oversight guards, so a tenant-less key gets the deterministic
   # 422 impersonation envelope instead of a null-scoped op (AC-28.3.2 / .5).
-  defp with_scope(conn, fun) do
+  # `project_id` is an OPTIONAL, UUID-validated scope input — a PARTITION key, NOT an
+  # isolation boundary. It is threaded onto the `%Scope{}` for create + recall (the
+  # only paths where project scoping is meaningful); `index/2` and `delete/2` pass
+  # `nil`. Unlike `project_id`, `tenant_id`/`subject_id` are NEVER read from the body —
+  # they are the isolation boundary and stay key-derived.
+  defp with_scope(conn, project_id \\ nil, fun) do
     api_key = conn.assigns.current_api_key
 
     if is_nil(api_key.tenant_id) do
       impersonation_tenant_required(conn)
     else
-      resolve_scope(conn, api_key, fun)
+      resolve_scope(conn, api_key, project_id, fun)
     end
   end
 
-  defp resolve_scope(conn, api_key, fun) do
+  defp resolve_scope(conn, api_key, project_id, fun) do
     case Memory.subject_id_for(api_key) do
       {:ok, subject_id} ->
-        fun.(%Scope{tenant_id: api_key.tenant_id, subject_id: subject_id, project_id: nil})
+        fun.(%Scope{tenant_id: api_key.tenant_id, subject_id: subject_id, project_id: project_id})
 
       {:error, :subject_id_unresolvable} ->
         conn
@@ -459,9 +513,68 @@ defmodule LoopctlWeb.MemoryController do
     })
   end
 
-  # Pass only the recognized memory attributes through to the context — any
-  # tenant_id/subject_id/scope/project_id in the body is dropped here (scope is
-  # derived from the key). `tier` is read by `Memory.remember/2`.
+  # Parse the optional `project_id` scope input (#411 Gap 2). `project_id` is a
+  # PARTITION key (recall merges `global ∪ active-project`), NOT an isolation
+  # boundary — so, unlike tenant_id/subject_id, it MAY come from the body, but it is
+  # validated as a UUID here so a malformed value is a deterministic 422 rather than
+  # a downstream cast error. Absent/blank (including whitespace-only) → global scope
+  # (`nil`) — the value is trimmed before the blank check so `"   "` matches the
+  # schema's documented "absent/blank writes a tenant-wide (global) memory" wording
+  # rather than falling through to a spurious 422; a valid UUID string → that project;
+  # anything else → `:error`. This gate is FORMAT-only. Tenant-ownership of a
+  # well-formed UUID is enforced separately AND ASYMMETRICALLY: the write path
+  # (`Memory.remember/2`) validates it and 422s a foreign/nonexistent project; the
+  # recall path deliberately does NOT (project_id is a partition key there, so an
+  # unowned id reads as an empty partition → global-only, no error). See
+  # `Loopctl.Memory.recall/2` for why.
+  defp parse_project_id(nil), do: {:ok, nil}
+
+  defp parse_project_id(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> {:ok, nil}
+      trimmed -> cast_project_uuid(trimmed)
+    end
+  end
+
+  defp parse_project_id(_), do: :error
+
+  # Require the CANONICAL 36-char hyphenated form BEFORE `Ecto.UUID.cast`. `cast/1`
+  # alone also accepts a raw 16-BYTE binary (e.g. a 16-char ASCII string) and
+  # hex-encodes it, so a plainly-non-UUID value would slip through the format gate.
+  # Matching the hyphenated shape first makes the boundary a deterministic 422 for
+  # such input rather than deferring to a downstream lookup.
+  defp cast_project_uuid(trimmed) do
+    with true <- canonical_uuid?(trimmed),
+         {:ok, uuid} <- Ecto.UUID.cast(trimmed) do
+      {:ok, uuid}
+    else
+      _ -> :error
+    end
+  end
+
+  @uuid_format ~r/\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/
+  defp canonical_uuid?(value), do: Regex.match?(@uuid_format, value)
+
+  defp invalid_project_id(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "invalid_project_id",
+        message:
+          "The `project_id` field must be a valid UUID identifying a project in your " <>
+            "own tenant."
+      }
+    })
+  end
+
+  # Pass only the recognized memory attributes through to the context. tenant_id and
+  # subject_id in the body are always dropped here — they are the isolation boundary
+  # and are derived from the key. `project_id` is NOT a memory attribute either: it is
+  # now an explicit, UUID-validated scope input on create/recall (#411 Gap 2), threaded
+  # via the `%Scope{}` (see `parse_project_id/1` + `with_scope/3`), never cast from
+  # `attrs`. `tier` is read by `Memory.remember/2`.
   defp memory_attrs(params), do: Map.take(params, @memory_attr_keys)
 
   defp all_subjects?(params), do: params["all_subjects"] in [true, "true"]

@@ -233,6 +233,20 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
         PromotionTelemetry.emit(:degraded, %{count: 1}, meta(scope, session_id))
         {:snooze, @snooze_seconds}
 
+      {:error, :project_not_found} ->
+        # #411 Gap 2: `persist_promotion/2` refused a foreign/nonexistent `project_id`
+        # (today unreachable — every enqueue passes `project_id: nil` — but terminal if a
+        # future change threads one through). Retrying cannot fix a bad partition id, so
+        # DISCARD rather than loop toward max_attempts. No watermark advance: the row was
+        # never written.
+        PromotionTelemetry.emit(
+          :failed,
+          %{count: 1},
+          Map.put(meta(scope, session_id), :stage, :persist)
+        )
+
+        {:discard, :project_not_found}
+
       {:error, :quota_exceeded, summary} ->
         emit_summary(scope, session_id, summary)
         # The subject hit its hard live-memory cap mid-run, so `persist_promotion/2`
