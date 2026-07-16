@@ -3221,6 +3221,15 @@ defmodule Loopctl.ApiSpec.Schemas do
           nullable: true,
           description:
             "Optional: arbitrary structured metadata to attach to the memory (either tier)."
+        },
+        project_id: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description:
+            "Optional project scope (a UUID PARTITION key, NOT an isolation boundary). " <>
+              "Absent/blank writes a tenant-wide (global) memory; a malformed value is " <>
+              "rejected with a 422 invalid_project_id."
         }
       }
     })
@@ -3240,7 +3249,16 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :integer,
           description: "Max results, clamped to the vector-search max (no silent hard cap)."
         },
-        include_superseded: %Schema{type: :boolean, description: "Default false."}
+        include_superseded: %Schema{type: :boolean, description: "Default false."},
+        project_id: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description:
+            "Optional project scope (a UUID PARTITION key, NOT an isolation boundary). " <>
+              "Recall returns the merged global ∪ active-project set; absent/blank means " <>
+              "global-only. A malformed value is rejected with a 422 invalid_project_id."
+        }
       }
     })
   end

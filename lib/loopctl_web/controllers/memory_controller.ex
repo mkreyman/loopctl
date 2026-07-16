@@ -73,8 +73,8 @@ defmodule LoopctlWeb.MemoryController do
     responses: %{
       201 => {"Memory created", "application/json", Schemas.MemoryResponse},
       422 =>
-        {"Validation error, quota exceeded, or subject unresolvable", "application/json",
-         Schemas.ErrorResponse},
+        {"Validation error, quota exceeded, invalid project_id, or subject unresolvable",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
     }
@@ -94,7 +94,8 @@ defmodule LoopctlWeb.MemoryController do
     responses: %{
       200 => {"Recall results", "application/json", Schemas.MemoryRecallResponse},
       422 =>
-        {"Subject unresolvable or non-string query", "application/json", Schemas.ErrorResponse},
+        {"Subject unresolvable, non-string query, or invalid project_id", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
     }
@@ -188,7 +189,17 @@ defmodule LoopctlWeb.MemoryController do
 
   @doc "POST /api/v1/memory"
   def create(conn, params) do
-    with_scope(conn, fn scope ->
+    case parse_project_id(params["project_id"]) do
+      {:ok, project_id} ->
+        create_with_project(conn, params, project_id)
+
+      :error ->
+        invalid_project_id(conn)
+    end
+  end
+
+  defp create_with_project(conn, params, project_id) do
+    with_scope(conn, project_id, fn scope ->
       case Memory.remember(scope, memory_attrs(params)) do
         {:ok, memory} ->
           conn |> put_status(:created) |> json(MemoryJSON.show(%{memory: memory}))
@@ -225,7 +236,17 @@ defmodule LoopctlWeb.MemoryController do
 
   @doc "POST /api/v1/memory/recall"
   def recall(conn, params) do
-    with_scope(conn, fn scope ->
+    case parse_project_id(params["project_id"]) do
+      {:ok, project_id} ->
+        recall_with_project(conn, params, project_id)
+
+      :error ->
+        invalid_project_id(conn)
+    end
+  end
+
+  defp recall_with_project(conn, params, project_id) do
+    with_scope(conn, project_id, fn scope ->
       case coerce_query(params["query"]) do
         {:ok, query} ->
           opts = [
@@ -389,20 +410,25 @@ defmodule LoopctlWeb.MemoryController do
   # nil is forbidden") — escaping as a bare HTTP 500. Guard it here, mirroring the
   # index/2 + delete/2 oversight guards, so a tenant-less key gets the deterministic
   # 422 impersonation envelope instead of a null-scoped op (AC-28.3.2 / .5).
-  defp with_scope(conn, fun) do
+  # `project_id` is an OPTIONAL, UUID-validated scope input — a PARTITION key, NOT an
+  # isolation boundary. It is threaded onto the `%Scope{}` for create + recall (the
+  # only paths where project scoping is meaningful); `index/2` and `delete/2` pass
+  # `nil`. Unlike `project_id`, `tenant_id`/`subject_id` are NEVER read from the body —
+  # they are the isolation boundary and stay key-derived.
+  defp with_scope(conn, project_id \\ nil, fun) do
     api_key = conn.assigns.current_api_key
 
     if is_nil(api_key.tenant_id) do
       impersonation_tenant_required(conn)
     else
-      resolve_scope(conn, api_key, fun)
+      resolve_scope(conn, api_key, project_id, fun)
     end
   end
 
-  defp resolve_scope(conn, api_key, fun) do
+  defp resolve_scope(conn, api_key, project_id, fun) do
     case Memory.subject_id_for(api_key) do
       {:ok, subject_id} ->
-        fun.(%Scope{tenant_id: api_key.tenant_id, subject_id: subject_id, project_id: nil})
+        fun.(%Scope{tenant_id: api_key.tenant_id, subject_id: subject_id, project_id: project_id})
 
       {:error, :subject_id_unresolvable} ->
         conn
@@ -459,9 +485,42 @@ defmodule LoopctlWeb.MemoryController do
     })
   end
 
-  # Pass only the recognized memory attributes through to the context — any
-  # tenant_id/subject_id/scope/project_id in the body is dropped here (scope is
-  # derived from the key). `tier` is read by `Memory.remember/2`.
+  # Parse the optional `project_id` scope input (#411 Gap 2). `project_id` is a
+  # PARTITION key (recall merges `global ∪ active-project`), NOT an isolation
+  # boundary — so, unlike tenant_id/subject_id, it MAY come from the body, but it is
+  # validated as a UUID here so a malformed value is a deterministic 422 rather than
+  # a downstream cast error. Absent/blank → global scope (`nil`); a valid UUID string
+  # → that project; anything else → `:error`.
+  defp parse_project_id(nil), do: {:ok, nil}
+  defp parse_project_id(""), do: {:ok, nil}
+
+  defp parse_project_id(value) when is_binary(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, uuid} -> {:ok, uuid}
+      :error -> :error
+    end
+  end
+
+  defp parse_project_id(_), do: :error
+
+  defp invalid_project_id(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "invalid_project_id",
+        message: "The `project_id` field must be a valid UUID."
+      }
+    })
+  end
+
+  # Pass only the recognized memory attributes through to the context. tenant_id and
+  # subject_id in the body are always dropped here — they are the isolation boundary
+  # and are derived from the key. `project_id` is NOT a memory attribute either: it is
+  # now an explicit, UUID-validated scope input on create/recall (#411 Gap 2), threaded
+  # via the `%Scope{}` (see `parse_project_id/1` + `with_scope/3`), never cast from
+  # `attrs`. `tier` is read by `Memory.remember/2`.
   defp memory_attrs(params), do: Map.take(params, @memory_attr_keys)
 
   defp all_subjects?(params), do: params["all_subjects"] in [true, "true"]

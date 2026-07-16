@@ -472,6 +472,7 @@ defmodule Loopctl.Memory do
       select: c
     )
     |> maybe_exclude_superseded_sub(include_superseded?)
+    |> maybe_scope_project_outer(scope.project_id)
   end
 
   # Live-only filter on the INNER index-ordered ANN, applied ONLY on the default
@@ -497,6 +498,40 @@ defmodule Loopctl.Memory do
   defp maybe_exclude_superseded_sub(query, false),
     do: where(query, [c], is_nil(c.superseded_by))
 
+  # #411 Gap 2: recall returns the merged `global ∪ active-project` set (mirrors
+  # `Loopctl.Knowledge.scope_project_or_global/2`). `project_id` is a PARTITION key,
+  # NOT an isolation boundary — `tenant_id`/`subject_id` are (see `Memory.Scope`
+  # moduledoc). So a nil scope resolves to global-only (`project_id IS NULL`) and a
+  # present project merges global with that project. The `:binary_id` cast is guarded
+  # the way Knowledge does it: a malformed (non-UUID) value scopes to global-only
+  # rather than raising `Ecto.Query.CastError` (controllers 4xx at the boundary —
+  # this is defense in depth). Two arities because Ecto `where` needs the binding
+  # position at compile time: the semantic path filters the outer over-the-pool
+  # subquery's `[c]` projection, the fallback path filters the base `[m]` table.
+  #
+  # This predicate MUST stay on the OUTER over-the-pool query (like the subject and
+  # superseded filters) — never on `index_safe_knn_base`'s inner ANN, where a
+  # selective predicate would flip the planner off the HNSW index.
+  defp maybe_scope_project_outer(query, project_id) when is_binary(project_id) do
+    if valid_uuid?(project_id) do
+      where(query, [c], is_nil(c.project_id) or c.project_id == ^project_id)
+    else
+      where(query, [c], is_nil(c.project_id))
+    end
+  end
+
+  defp maybe_scope_project_outer(query, _), do: where(query, [c], is_nil(c.project_id))
+
+  defp maybe_scope_project_base(query, project_id) when is_binary(project_id) do
+    if valid_uuid?(project_id) do
+      where(query, [m], is_nil(m.project_id) or m.project_id == ^project_id)
+    else
+      where(query, [m], is_nil(m.project_id))
+    end
+  end
+
+  defp maybe_scope_project_base(query, _), do: where(query, [m], is_nil(m.project_id))
+
   # Rebuild a %Memory{} from the recalled projection map. `embedding` is
   # `load_in_query: false` so it is intentionally absent (recall never returns the
   # raw vector); `:distance` is a computed column, dropped before struct build.
@@ -516,6 +551,7 @@ defmodule Loopctl.Memory do
       )
       |> maybe_exclude_superseded_base(include_superseded?)
       |> maybe_ilike(query_text)
+      |> maybe_scope_project_base(scope.project_id)
 
     rows =
       HeavyRead.all_memory(

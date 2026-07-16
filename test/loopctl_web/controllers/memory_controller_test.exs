@@ -393,6 +393,124 @@ defmodule LoopctlWeb.MemoryControllerTest do
     end
   end
 
+  # --- #411 Gap 2: project_id on create + recall (merged global ∪ active-project) ---
+
+  describe "POST /api/v1/memory + /recall project_id scoping (#411 Gap 2)" do
+    test "create persists a valid project_id", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      created =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory", %{
+          "tier" => "long_term",
+          "text" => "prefers reshipments",
+          "project_id" => project.id
+        })
+        |> json_response(201)
+
+      assert created["data"]["project_id"] == project.id
+    end
+
+    test "recall with a valid project_id returns merged global ∪ project", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # Global memory (no project_id).
+      conn
+      |> auth(raw)
+      |> post(~p"/api/v1/memory", %{"tier" => "long_term", "text" => "global widgets fact"})
+      |> json_response(201)
+
+      # Project-scoped memory.
+      base_conn()
+      |> auth(raw)
+      |> post(~p"/api/v1/memory", %{
+        "tier" => "long_term",
+        "text" => "project widgets fact",
+        "project_id" => project.id
+      })
+      |> json_response(201)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/recall", %{"query" => "widgets", "project_id" => project.id})
+        |> json_response(200)
+
+      texts = Enum.map(body["data"], & &1["memory"]["text"])
+      assert "global widgets fact" in texts
+      assert "project widgets fact" in texts
+    end
+
+    test "recall with a different project_id excludes that project's memory", %{conn: _conn} do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      project_a = fixture(:project, %{tenant_id: tenant.id})
+      project_b = fixture(:project, %{tenant_id: tenant.id})
+
+      base_conn()
+      |> auth(raw)
+      |> post(~p"/api/v1/memory", %{
+        "tier" => "long_term",
+        "text" => "project alpha widgets fact",
+        "project_id" => project_a.id
+      })
+      |> json_response(201)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/recall", %{"query" => "widgets", "project_id" => project_b.id})
+        |> json_response(200)
+
+      texts = Enum.map(body["data"], & &1["memory"]["text"])
+      refute "project alpha widgets fact" in texts
+    end
+
+    test "a malformed project_id on recall returns a deterministic 422 invalid_project_id", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+
+      body =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/recall", %{"query" => "widgets", "project_id" => "not-a-uuid"})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_project_id"
+      assert body["error"]["status"] == 422
+    end
+
+    test "a malformed project_id on create returns a deterministic 422 invalid_project_id", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+
+      body =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory", %{
+          "tier" => "long_term",
+          "text" => "x",
+          "project_id" => "not-a-uuid"
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_project_id"
+      assert body["error"]["status"] == 422
+    end
+  end
+
   # --- Quota-exceeded envelope over HTTP (create/2) ---
 
   describe "POST /api/v1/memory quota" do

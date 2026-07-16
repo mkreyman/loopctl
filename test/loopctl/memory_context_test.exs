@@ -18,6 +18,7 @@ defmodule Loopctl.MemoryContextTest do
   alias Loopctl.Knowledge
   alias Loopctl.Memory
   alias Loopctl.Memory.Memory, as: MemorySchema
+  alias Loopctl.Memory.Scope
 
   import Ecto.Query
 
@@ -246,6 +247,119 @@ defmodule Loopctl.MemoryContextTest do
 
       assert %{results: [], meta: %{fallback: true, reason: _}} =
                Memory.recall(empty_scope, query: "alamo")
+    end
+  end
+
+  # --- #411 Gap 2: recall merges global ∪ active-project ---
+
+  describe "recall/2 project scoping (merged global ∪ active-project, #411 Gap 2)" do
+    setup do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      proj_a = fixture(:project, %{tenant_id: tenant.id})
+      proj_b = fixture(:project, %{tenant_id: tenant.id})
+      subject_id = "subject-#{System.unique_integer([:positive])}"
+
+      global = %Scope{tenant_id: tenant.id, subject_id: subject_id, project_id: nil}
+      a = %{global | project_id: proj_a.id}
+      b = %{global | project_id: proj_b.id}
+
+      %{global: global, a: a, b: b, proj_a: proj_a, proj_b: proj_b}
+    end
+
+    test "semantic path: an active project_id merges global ∪ that project, excludes another project",
+         %{global: global, a: a, b: b} do
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+      {:ok, mb} = Memory.remember(b, %{tier: :long_term, text: "project beta widgets fact"})
+
+      ids = default_recall_ids(a, "widgets")
+
+      assert %{meta: %{fallback: false}} = Memory.recall(a, query: "widgets", limit: 10)
+      assert g.id in ids
+      assert ma.id in ids
+      refute mb.id in ids
+    end
+
+    test "semantic path: a nil project_id returns global-only (excludes any project-scoped memory)",
+         %{global: global, a: a, b: b} do
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+      {:ok, mb} = Memory.remember(b, %{tier: :long_term, text: "project beta widgets fact"})
+
+      ids = default_recall_ids(global, "widgets")
+
+      assert g.id in ids
+      refute ma.id in ids
+      refute mb.id in ids
+    end
+
+    test "fallback path: an active project_id merges global ∪ that project, excludes another project",
+         %{global: global, a: a, b: b} do
+      # Force the ILIKE fallback for the whole test.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:error, :no_api_key}
+      end)
+
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+      {:ok, mb} = Memory.remember(b, %{tier: :long_term, text: "project beta widgets fact"})
+
+      assert %{results: results, meta: %{fallback: true}} =
+               Memory.recall(a, query: "widgets", limit: 10)
+
+      ids = Enum.map(results, fn {m, _} -> m.id end)
+
+      assert g.id in ids
+      assert ma.id in ids
+      refute mb.id in ids
+    end
+
+    test "fallback path: a nil project_id returns global-only", %{global: global, a: a, b: b} do
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:error, :no_api_key}
+      end)
+
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+      {:ok, mb} = Memory.remember(b, %{tier: :long_term, text: "project beta widgets fact"})
+
+      assert %{results: results, meta: %{fallback: true}} =
+               Memory.recall(global, query: "widgets", limit: 10)
+
+      ids = Enum.map(results, fn {m, _} -> m.id end)
+
+      assert g.id in ids
+      refute ma.id in ids
+      refute mb.id in ids
+    end
+
+    test "a malformed project_id does not raise and is treated as global-only", %{
+      global: global,
+      a: a
+    } do
+      {:ok, g} = Memory.remember(global, %{tier: :long_term, text: "global widgets fact"})
+      {:ok, ma} = Memory.remember(a, %{tier: :long_term, text: "project alpha widgets fact"})
+
+      malformed = %{global | project_id: "not-a-uuid"}
+
+      # Semantic path.
+      assert %{results: results} = Memory.recall(malformed, query: "widgets", limit: 10)
+      ids = Enum.map(results, fn {m, _} -> m.id end)
+      assert g.id in ids
+      refute ma.id in ids
+
+      # Fallback path.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:error, :no_api_key}
+      end)
+
+      assert %{results: fb_results, meta: %{fallback: true}} =
+               Memory.recall(malformed, query: "widgets", limit: 10)
+
+      fb_ids = Enum.map(fb_results, fn {m, _} -> m.id end)
+      assert g.id in fb_ids
+      refute ma.id in fb_ids
     end
   end
 
