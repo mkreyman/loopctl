@@ -1,0 +1,33 @@
+{
+  "id": "US-40.5",
+  "title": "channel_recent pagination (cursor for deep history)",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 + memory-keeper retirement" },
+  "priority": "low",
+  "phase": "coordination_bus_v2_A",
+  "story": {
+    "as_a": "coding agent (or dashboard) reviewing a repo's coordination history",
+    "i_want_to": "page back through channel posts beyond the most recent 100",
+    "so_that": "I can review the full 30-day window of activity, not just the newest page"
+  },
+  "rationale": "v1 caps channel_recent at 100 recency-only — fine for 'what happened lately' but not for reviewing history or backing the dashboard (US-40.6). A stable cursor over (inserted_at, id) enables deep reads without offset drift as new posts arrive.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §3.3; review N6",
+    "includes": "Keyset/cursor pagination over (inserted_at DESC, id), consistent with any existing loopctl cursor convention."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.5.1", "description": "channel_recent accepts an optional cursor encoded/decoded via the existing Loopctl.KeysetCursor (integrity-protected, tenant-bound, namespaced — returns {:error, :invalid} on tamper/cross-tenant); the response meta returns next_cursor when more rows exist and null when exhausted, using the established %{data, has_more, next_cursor} shape.", "status": "pending" },
+    { "id": "AC-40.5.2", "description": "Keyset pagination is stable under concurrent inserts (no skipped/duplicated rows across pages), unlike offset. Still filters expires_at > now() and the tenant/project scope.", "status": "pending" },
+    { "id": "AC-40.5.3", "description": "Backward compatible: without a cursor, behavior is exactly US-39.3 (newest page, limit<=100).", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.5.1", "name": "cursor pages the full set without gaps", "type": "integration", "preconditions": ["250 live posts"], "steps": ["page with limit=100 following next_cursor to exhaustion"], "expected_results": ["all 250 seen exactly once; final next_cursor null"] },
+    { "id": "TC-40.5.2", "name": "insert during paging doesn't drift", "type": "integration", "preconditions": ["page 1 fetched, then a new post inserted"], "steps": ["fetch page 2 via cursor"], "expected_results": ["no row from page 1 reappears; no row skipped"] }
+  ],
+  "technical_notes": [
+    "Keyset: WHERE (inserted_at, id) < (cursor_inserted_at, cursor_id) ORDER BY inserted_at DESC, id DESC LIMIT n.",
+    "Use Loopctl.KeysetCursor (lib/loopctl/keyset_cursor.ex) to encode/decode — do NOT roll base64-of-tuple (tamperable, no tenant binding = a security regression vs the existing helper).",
+    "Match the established meta shape %{data, has_more, next_cursor} (change_controller.ex:122-127, audit.ex:202-215). Note the repo has a mixed convention (article_controller uses offset); keyset is the right choice here."
+  ],
+  "dependencies": ["US-39.3"],
+  "estimated_tokens": 120000
+}

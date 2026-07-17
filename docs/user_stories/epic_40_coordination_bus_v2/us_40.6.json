@@ -1,0 +1,39 @@
+{
+  "id": "US-40.6",
+  "title": "SSE live dashboard — a human watches the fleet coordinate",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 + memory-keeper retirement" },
+  "priority": "low",
+  "phase": "coordination_bus_v2_B",
+  "story": {
+    "as_a": "human operator running agents across several machines",
+    "i_want_to": "watch a live feed of the coordination channel(s) for a repo in my browser",
+    "so_that": "I can see my sessions leaving each other messages in real time — the ONE place realtime actually earns its keep (a human observer, not the agents)"
+  },
+  "rationale": "The design (§5) concluded realtime is wasted on agents (they consume at turn boundaries) but valuable for a HUMAN watching. This is that surface: a read-only, one-way SSE feed of channel posts. SSE (not websockets) because it is one-way, reconnects trivially, and is friendly to Fly's suspend-on-idle. It renders untrusted, agent-authored post bodies into a browser, so it carries an XSS surface that must be closed.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §5; loopctl public web + auth",
+    "includes": "Read-only view; reuse channel_recent for backfill (US-40.5 cursor) + an SSE stream for new posts."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.6.1", "description": "The SSE stream is served from a HUMAN cookie/browser-session-authenticated surface — NOT the agent-key /api/v1 :authenticated pipeline (Bearer). Native browser EventSource cannot set an Authorization header (cookies only), so an agent-key /api/v1 endpoint is unreachable from EventSource. Resolve to one of: a cookie-session web route, or a short-lived signed query-param stream token minted by an authenticated page. (First confirm loopctl HAS a human cookie-session auth surface distinct from agent keys — not evidenced in the current code; if absent, that surface is a prerequisite.) READ-ONLY, one-way.", "status": "pending" },
+    { "id": "AC-40.6.2", "description": "A web view backfills recent posts (channel_recent + KeysetCursor from US-40.5) then subscribes to the stream for live appends; reconnect on drop resumes via Last-Event-ID, where the id is a SERVER-controlled keyset token ((inserted_at,id)), never attacker-controlled text.", "status": "pending" },
+    { "id": "AC-40.6.3", "description": "XSS-safe in the browser: body/key/refs/host are HEEx-escaped / rendered as text (never raw/innerHTML). AND SSE-framing-safe on the wire: each event is serialized as SINGLE-LINE JSON in one `data:` field (newlines escaped) so a post body containing newlines/`data:`/`event:`/`id:` cannot inject SSE control lines. Both are required — browser-escape alone does not close stream injection.", "status": "pending" },
+    { "id": "AC-40.6.4", "description": "Tenant+project scoped: the PubSub topic is tenant-namespaced and the subscription is GATED by Projects.get_project(tenant_id, project_id) ownership BEFORE subscribe (a user cannot stream another tenant's project topic — mirror channel_recent oracle-safety). Resource-bounded: a per-user/per-tenant concurrent-stream cap AND a max stream duration / idle timeout (each SSE conn pins a BEAM process + a PubSub subscription — cap them). Fly-suspend-friendly: bounded keepalive, an idle stream does not pin a machine awake indefinitely.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.6.1", "name": "new post appears on the stream", "type": "integration", "preconditions": ["an authenticated operator subscribed to a project's stream"], "steps": ["an agent posts to that channel"], "expected_results": ["the post is pushed as an SSE event"] },
+    { "id": "TC-40.6.2", "name": "cross-tenant stream is denied", "type": "integration", "preconditions": ["operator authenticated for tenant A"], "steps": ["subscribe with tenant B's project_id"], "expected_results": ["denied / empty; no B posts streamed"] },
+    { "id": "TC-40.6.3", "name": "script-bearing body is rendered inert", "type": "integration", "preconditions": ["a post body containing <script>...</script>"], "steps": ["render it in the web view"], "expected_results": ["shown as escaped text; no script executes"] }
+  ],
+  "technical_notes": [
+    "SSE (text/event-stream) via Phoenix send_chunked (streaming_export.ex:144,522 shows the chunked pattern; there is NO existing text/event-stream endpoint — this is greenfield, so the framing discipline in AC-40.6.3 must be authored, not copied).",
+    "Phoenix.PubSub exists ({Phoenix.PubSub, name: Loopctl.PubSub}, application.ex:29). Add a broadcast on the channel_post insert path to a TENANT-NAMESPACED topic; gate subscribe on Projects.get_project ownership.",
+    "NOT websockets (design §5) — one-way, reconnect-cheap, suspend-friendly.",
+    "Auth: this is the human web surface, not agent keys — EventSource sends cookies, not Bearer. Serve from a cookie-session route or a signed stream token; confirm/introduce a human auth surface first.",
+    "Escape ALL agent-authored fields in the web layer (HEEx auto-escapes; never raw/innerHTML) AND single-line-JSON each SSE event.",
+    "Backfill via US-40.5 KeysetCursor; server-minted Last-Event-ID for resume.",
+    "Cap concurrent streams per user/tenant + a max duration; each conn = a BEAM process + PubSub sub."
+  ],
+  "dependencies": ["US-39.3", "US-40.5"],
+  "estimated_tokens": 300000
+}

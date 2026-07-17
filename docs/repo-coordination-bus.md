@@ -119,8 +119,8 @@ The store is mandatory either way (late joiners, replay, audit, offline). The de
 
 The audit (§1.2) makes this concrete. memory-keeper's used surface is three things, each with a home:
 
-1. **key/value working state** (`context_items`, mostly uncategorized) → `kind:state` posts.
-2. **checkpoint handoff** (`build-complete-<ticket>`) → `kind:handoff` posts (and this is the piece that becomes **multi-machine** — the file checkpoint never was).
+1. **key/value working state** (`context_items`, mostly uncategorized) → keyed posts (a post with an optional upsert `key` — there is no message-type taxonomy; §3.2).
+2. **checkpoint handoff** (`build-complete-<ticket>`) → a keyed post (`key: build-complete-<ticket>`) — the piece that becomes **multi-machine** (the file checkpoint never was).
 3. **cross-session history + search** → the 30-day roll is queryable; keepers graduate to Knowledge (permanent semantic search — the exact capability SETUP.md says degrades without memory-keeper).
 
 Everything else (entities, relations, journal, compression, observations, agent-tasks, file-cache) has **zero fleet usage** — nothing to preserve.
