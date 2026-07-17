@@ -5,6 +5,19 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.43.0 — 2026-07-16 (#418 — KB-only project scopes for agent-rooted tenants)
+
+### Added
+
+- **`create_kb_scope`** — create a knowledge-only project scope (`kind: kb`) for
+  the current tenant over `POST /api/v1/kb-scopes`, using the AGENT key. Unlike
+  `create_project` (a work project, orchestrator+ / human-anchored), a KB scope is
+  available to an agent-rooted (KB-tier) tenant: it carries NO work-breakdown /
+  chain-of-custody surface (it cannot host epics/stories/dispatch/ui-tests) and
+  exists only to partition knowledge articles by repo. Resolve it with
+  `resolve_project` and pass the returned `id` as `project_id` on article/knowledge
+  writes. Counts toward the tenant's `max_projects` budget.
+
 ## 2.42.0 — 2026-07-16 (#411 — agent-memory substrate: resolve_project, recall_context, memory_graduate)
 
 ### Added
