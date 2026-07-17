@@ -5,6 +5,19 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.44.0 — 2026-07-17 (KB-scope lifecycle: agent archive + restore)
+
+### Added
+
+- **`archive_kb_scope`** — archive (reversible soft-delete) a `kind: kb` scope you own,
+  on the agent key, over `DELETE /api/v1/kb-scopes/:id`. Frees the scope's slot in the
+  tenant's `max_projects` budget so an agent-rooted tenant can reclaim KB-scope capacity
+  (closes the one-way ratchet from 2.43.0). Rejects a `kind: work` project (422); idempotent
+  on an already-archived scope.
+- **`restore_kb_scope`** — re-activate an archived `kind: kb` scope (the reverse of archive),
+  over `POST /api/v1/kb-scopes/:id/restore`. Re-consumes an active `max_projects` slot (422
+  at the cap). Rejects a `kind: work` project (422).
+
 ## 2.43.0 — 2026-07-16 (#418 — KB-only project scopes for agent-rooted tenants)
 
 ### Added

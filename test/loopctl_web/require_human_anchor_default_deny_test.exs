@@ -155,6 +155,11 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # ui-tests exemption below stay safe now that agent-rooted tenants CAN
                # create a project.
                {:post, "/api/v1/kb-scopes"},
+               # Archive an agent-owned :kb scope (reversible soft-delete) to reclaim its
+               # max_projects slot — agent-managed, NOT custody. The action rejects a :work
+               # project (422), so it can never archive a work project without human-anchor.
+               {:delete, "/api/v1/kb-scopes/:id"},
+               {:post, "/api/v1/kb-scopes/:id/restore"},
 
                # UI test runs (#4/#5 reviewed rationale): a QA/tooling surface,
                # NOT work-breakdown state. Every route is nested under

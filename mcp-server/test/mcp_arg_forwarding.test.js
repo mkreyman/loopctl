@@ -140,6 +140,34 @@ describe("#418: create_kb_scope wiring", () => {
   });
 });
 
+describe("KB-scope lifecycle: archive_kb_scope / restore_kb_scope wiring", () => {
+  test("TOOLS declares archive_kb_scope and restore_kb_scope", () => {
+    assert.match(INDEX_SRC, /name: "archive_kb_scope",/, 'must declare "archive_kb_scope"');
+    assert.match(INDEX_SRC, /name: "restore_kb_scope",/, 'must declare "restore_kb_scope"');
+  });
+
+  test("archiveKbScope DELETEs /kb-scopes/:id on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function archiveKbScope\(\{ project_id \}\)[\s\S]*?"DELETE",\s*`\/api\/v1\/kb-scopes\/\$\{project_id\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "archiveKbScope must DELETE /api/v1/kb-scopes/:id on the agent key",
+    );
+  });
+
+  test("restoreKbScope POSTs /kb-scopes/:id/restore on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function restoreKbScope\(\{ project_id \}\)[\s\S]*?"POST",\s*`\/api\/v1\/kb-scopes\/\$\{project_id\}\/restore`,[\s\S]*?process\.env\.LOOPCTL_AGENT_KEY/,
+      "restoreKbScope must POST /api/v1/kb-scopes/:id/restore on the agent key",
+    );
+  });
+
+  test("dispatch cases call archiveKbScope/restoreKbScope", () => {
+    assert.match(INDEX_SRC, /case "archive_kb_scope":\s*\n\s*return await archiveKbScope\(args\);/);
+    assert.match(INDEX_SRC, /case "restore_kb_scope":\s*\n\s*return await restoreKbScope\(args\);/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // #411 gap2 (PR B): recall_context (merged memory ∪ knowledge, one round-trip)
 // ---------------------------------------------------------------------------

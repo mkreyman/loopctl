@@ -23,7 +23,16 @@ defmodule LoopctlWeb.ProjectController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :agent] when action in [:index, :show, :progress, :resolve, :create_kb_scope]
+       [role: :agent]
+       when action in [
+              :index,
+              :show,
+              :progress,
+              :resolve,
+              :create_kb_scope,
+              :archive_kb_scope,
+              :restore_kb_scope
+            ]
 
   # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
   # NOTE: :create_kb_scope is deliberately NOT gated here — a :kb scope carries no
@@ -56,6 +65,40 @@ defmodule LoopctlWeb.ProjectController do
       201 => {"KB scope created", "application/json", Schemas.ProjectResponse},
       422 =>
         {"Validation error or project limit reached", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:archive_kb_scope,
+    summary: "Archive a knowledge-only project scope",
+    description:
+      "Archives (soft-deletes, reversible) a kind: kb project scope owned by the tenant. " <>
+        "Agent+ role and NOT human-anchor gated (extends #331 / create_kb_scope). Archiving " <>
+        "frees the scope's slot in the tenant's max_projects budget so agents can reclaim " <>
+        "KB-scope capacity. A kind: work project is rejected (422) — archiving a work project " <>
+        "remains human-anchored via DELETE /projects/:id.",
+    parameters: [id: [in: :path, type: :string, description: "KB scope (project) UUID"]],
+    responses: %{
+      200 => {"Archived KB scope", "application/json", Schemas.ProjectResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Not a KB scope", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:restore_kb_scope,
+    summary: "Restore (un-archive) a knowledge-only project scope",
+    description:
+      "Re-activates an archived kind: kb scope owned by the tenant (the reverse of DELETE " <>
+        "/kb-scopes/:id). Agent+ role, not human-anchor gated. Re-activating consumes an " <>
+        "active max_projects slot, so it is rejected 422 when the tenant is at its cap. A " <>
+        "kind: work project is rejected 422.",
+    parameters: [id: [in: :path, type: :string, description: "KB scope (project) UUID"]],
+    responses: %{
+      200 => {"Restored KB scope", "application/json", Schemas.ProjectResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Not a KB scope, or project limit reached", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -221,6 +264,75 @@ defmodule LoopctlWeb.ProjectController do
         {:error, changeset}
     end
   end
+
+  @doc """
+  DELETE /api/v1/kb-scopes/:id
+
+  Archives (soft-deletes, reversible) a `kind: :kb` project scope owned by the tenant.
+  Agent+ role, NOT human-anchor gated — a KB scope is agent-managed (extends owner decision
+  #331 / create_kb_scope, and archive is a reversible, audited soft-delete, the class of KB
+  op #331 keeps agent-usable). Archiving frees the scope's slot in the tenant's max_projects
+  active budget, so an agent can reclaim KB-scope capacity it created. A `kind: :work` project
+  is rejected with 422 — archiving a work project stays human-anchored via DELETE /projects/:id.
+  A missing or cross-tenant id is a clean 404 (get_project is tenant-scoped). Reverse it with
+  POST /kb-scopes/:id/restore (also agent role), so the KB-scope lifecycle is fully
+  agent-managed. Idempotent: archiving an already-archived scope is a no-op with no new audit
+  row.
+  """
+  def archive_kb_scope(conn, %{"id" => project_id}) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+
+    with {:ok, project} <- Projects.get_project(tenant_id, project_id),
+         :ok <- ensure_kb_scope(project),
+         {:ok, archived} <- Projects.archive_project(tenant_id, project, audit_opts) do
+      json(conn, %{project: project_json(archived)})
+    end
+  end
+
+  @doc """
+  POST /api/v1/kb-scopes/:id/restore
+
+  Re-activates an archived `kind: :kb` scope owned by the tenant — the reverse of
+  DELETE /kb-scopes/:id, so the KB-scope lifecycle is fully agent-managed. Agent+ role, NOT
+  human-anchor gated. Re-activating consumes an active max_projects slot, so it is rejected
+  422 (project limit reached) when the tenant is at its cap. A `kind: :work` project is
+  rejected 422; a missing or cross-tenant id is a clean 404.
+  """
+  def restore_kb_scope(conn, %{"id" => project_id}) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+
+    with {:ok, project} <- Projects.get_project(tenant_id, project_id),
+         :ok <- ensure_kb_scope(project),
+         {:ok, activated} <- restore_result(tenant_id, project, audit_opts) do
+      json(conn, %{project: project_json(activated)})
+    end
+  end
+
+  defp restore_result(tenant_id, project, opts) do
+    case Projects.unarchive_project(tenant_id, project, opts) do
+      {:ok, activated} ->
+        {:ok, activated}
+
+      {:error, :project_limit_reached} ->
+        {:error, :unprocessable_entity, "Project limit reached for this tenant"}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
+    end
+  end
+
+  # Only a knowledge-only scope may be archived/restored at agent role. A work project falls
+  # through to this 422 so it can never be archived or restored without the human-anchored
+  # DELETE/PATCH /projects/:id path.
+  defp ensure_kb_scope(%{kind: :kb}), do: :ok
+
+  defp ensure_kb_scope(_project),
+    do:
+      {:error, :unprocessable_entity,
+       "Only a knowledge-only project scope (kind: kb) can be managed (archive/restore) at " <>
+         "agent role; a work project requires a human-anchored tenant."}
 
   @doc """
   GET /api/v1/projects
