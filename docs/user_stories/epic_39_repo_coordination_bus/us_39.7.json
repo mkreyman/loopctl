@@ -1,0 +1,38 @@
+{
+  "id": "US-39.7",
+  "title": "Delete a channel post (redact path — remove a leaked/regretted post before its 30-day expiry)",
+  "epic": { "id": "epic_39", "name": "Repo Coordination Bus" },
+  "priority": "high",
+  "phase": "coordination_bus_v1",
+  "story": {
+    "as_a": "coding agent that posted something it shouldn't have",
+    "i_want_to": "delete a channel post immediately",
+    "so_that": "a leaked secret or mistaken message is removed from the repo channel now — not left readable (and auto-injected into every new session on every machine) for up to 30 days"
+  },
+  "rationale": "The secret denylist (US-39.1) is defense-in-depth and inherently incomplete — when it misses, a secret is published to the channel AND auto-amplified by the SessionStart injection (US-39.6) into every new session on the repo, fleet-wide, with no way to remove it until the sweep. A delete path is the required backstop: it turns 'un-removable for 30 days' into 'removable now'. Given a single cooperative tenant, delete is tenant-scoped (any agent can remove any post in its tenant) and audited for accountability — so whoever NOTICES a leak can remove it, not only its author.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §3; review M4",
+    "includes": "Hard-delete is consistent with the transient 30-day model + the sweep (US-39.5). Audited via Audit.log_in_multi/3."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-39.7.1", "description": "DELETE /api/v1/channel/posts/:id is RequireRole :agent, NOT behind RequireHumanAnchor. It deletes the post if it exists in the caller's tenant; otherwise a 404 (a post in another tenant is indistinguishable from nonexistent — no cross-tenant oracle). An OpenApiSpex operation/1 spec is declared.", "status": "pending" },
+    { "id": "AC-39.7.2", "description": "Deletion is tenant-scoped: any agent in the tenant may delete any post in that tenant (cooperative single-tenant model, enables secret cleanup by whoever notices) — but NEVER a post in another tenant (AdminRepo query filters tenant_id; a foreign id is 404).", "status": "pending" },
+    { "id": "AC-39.7.3", "description": "The delete is audited (Audit.log_in_multi, entity_type \"channel_post\", action \"deleted\", actor = the deleting agent, capturing the deleted post's id/agent_id) in the same transaction — so removals are accountable even though the row is gone.", "status": "pending" },
+    { "id": "AC-39.7.4", "description": "A channel_delete(post_id) MCP tool (agent key) is added to the Node proxy alongside channel_post/channel_recent (US-39.4), with source-regex tests, and shipped in the same version bump/autopublish.", "status": "pending" },
+    { "id": "AC-39.7.5", "description": "A deleted post no longer appears in channel_recent and is not injected by US-39.6 — verified end to end.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-39.7.1", "name": "agent deletes a post in its tenant", "type": "integration", "preconditions": ["tenant = fixture(:tenant); project = fixture(:project, %{tenant_id: tenant.id})", "{key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})", "a post exists"], "steps": ["DELETE /api/v1/channel/posts/#{post.id}"], "expected_results": ["200/204", "post gone from channel_recent", "audit entry action \"deleted\""] },
+    { "id": "TC-39.7.2", "name": "another agent in the same tenant can delete (secret cleanup)", "type": "integration", "preconditions": ["a post authored by agent A", "{key_b,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) (agent B)"], "steps": ["agent B DELETEs A's post"], "expected_results": ["deleted", "audit actor == agent B"] },
+    { "id": "TC-39.7.3", "name": "cross-tenant delete is 404 (no oracle, no deletion)", "type": "integration", "preconditions": ["tenant = fixture(:tenant); other = fixture(:tenant)", "a post on other's project", "{key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"], "steps": ["DELETE that post's id"], "expected_results": ["404", "the other tenant's post still exists"] },
+    { "id": "TC-39.7.4", "name": "nonexistent id is 404 identical to cross-tenant", "type": "integration", "preconditions": ["agent key"], "steps": ["DELETE a random UUID"], "expected_results": ["404, body identical to the cross-tenant 404"] }
+  ],
+  "technical_notes": [
+    "Context: Loopctl.Coordination.delete_post(tenant_id, agent_id, post_id) -> {:ok, post} | {:error, :not_found}; AdminRepo query filters id + tenant_id (UUID-guard the id -> clean 404, no 500). Wrap delete + audit in Ecto.Multi.",
+    "Controller action alongside post/recent; route DELETE /api/v1/channel/posts/:id.",
+    "Default-deny guard test: allowlist {:delete, \"/api/v1/channel/posts/:id\"} with the coordination-surface justification (it is a DELETE, so it IS walked by the default-deny test).",
+    "MCP: add channel_delete to mcp-server/index.js + tests; fold into US-39.4's version bump if merged together, else its own bump."
+  ],
+  "dependencies": ["US-39.2", "US-39.4"],
+  "estimated_tokens": 170000
+}

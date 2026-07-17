@@ -1,0 +1,47 @@
+{
+  "id": "US-39.2",
+  "title": "channel_post write endpoint + context (agent role, per-session upsert, unconditional server-stamped agent_id, ownership, rate-limit)",
+  "epic": { "id": "epic_39", "name": "Repo Coordination Bus" },
+  "priority": "high",
+  "phase": "coordination_bus_v1",
+  "story": {
+    "as_a": "coding agent working a repo",
+    "i_want_to": "POST a short message to my repo's coordination channel, optionally under a key that upserts my own working-state",
+    "so_that": "other sessions on the same repo — on any machine — can see what I found, did, or am doing"
+  },
+  "rationale": "This is the write half and the primary trust boundary. It must stamp the author identity from the verified key (not the body), confine the post to a project the caller's tenant owns, set the 30-day TTL server-side, and resist abuse (post spam / upsert thrash) — so no caller can forge authorship, post into another tenant's channel, evade retention, or exhaust the store/audit chain.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §3.2, §3.6; owner decision #331; reviews D1/D2/D3/M1/M3/M6/M7/M9/N1",
+    "includes": "Auth/role mirrors create_kb_scope (project_controller.ex:23-40): role: :agent, NOT under RequireHumanAnchor. Writes use AdminRepo + explicit tenant filter (Knowledge/Projects pattern). Ownership via Projects.get_project/2. Audit via Audit.log_in_multi/3 (audit.ex:105)."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-39.2.1", "description": "POST /api/v1/channel/posts accepts {project_id, body, key?, refs?, session_id?, host?}. RequireRole :agent, NOT behind RequireHumanAnchor (coordination surface, #331). An OpenApiSpex operation/1 spec is declared so it appears in the API docs and passes openapi_test.exs (loopctl maintains OpenAPI — same requirement create_kb_scope had).", "status": "pending" },
+    { "id": "AC-39.2.2", "description": "tenant_id = conn.assigns.current_api_key.tenant_id and agent_id = the key's api_key.agent_id, stamped server-side. agent_id is required UNCONDITIONALLY (channel_posts.agent_id is NOT NULL) — a key with no agent_id gets 403 agent_identity_required. (Note: do NOT copy article_controller bind_agent_identity's CONDITIONAL gate, which only fires when memory metadata is present; here identity is always required.) Any agent_id/tenant_id in the body is ignored.", "status": "pending" },
+    { "id": "AC-39.2.3", "description": "project_id must exist and belong to the caller's tenant, checked via Projects.get_project(tenant_id, project_id). A missing project AND a cross-tenant project both return 422 with a BYTE-IDENTICAL error body (no oracle distinguishing 'not yours' from 'does not exist') and NO row is created.", "status": "pending" },
+    { "id": "AC-39.2.4", "description": "expires_at = now + 30 days, set server-side (never from body).", "status": "pending" },
+    { "id": "AC-39.2.5", "description": "With key present the write UPSERTS on (tenant_id, project_id, session_id, key) — PER SESSION: a second post from the SAME session with the same key updates body/refs/updated_at and resets expires_at, returning the same row id; a different session's same key is a distinct row (no cross-session clobber). Without key, every post is a new append-only row.", "status": "pending" },
+    { "id": "AC-39.2.6", "description": "Returns 201 (created) or 200 (upsert-updated) with the post JSON incl. server-stamped agent_id/tenant_id/expires_at. Missing body / body>16KB / invalid refs (US-39.1 AC-39.1.5) / denylist hit (US-39.1 AC-39.1.6) → 422, not persisted.", "status": "pending" },
+    { "id": "AC-39.2.7", "description": "The write is audited (Audit.log_in_multi, entity_type \"channel_post\", action \"posted\"/\"upserted\", actor = the agent) in the same AdminRepo.transaction, so authorship is tamper-evident.", "status": "pending" },
+    { "id": "AC-39.2.8", "description": "The endpoint is rate-limited: per (tenant_id, agent_id) writes are capped per rolling window (returning 429 with Retry-After) using the project's existing limiter (the :authenticated pipeline RateLimiter / Hammer convention), so an agent cannot spam unbounded posts nor thrash a single key. The cap is a config value, not hardcoded.", "status": "pending" },
+    { "id": "AC-39.2.9", "description": "Security-relevant events are emitted as structured logs/telemetry: denylist rejection, cross-tenant/not-found ownership rejection (422), agent_identity_required (403), and rate-limit trip (429) — so exfil attempts and enumeration scans are observable.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-39.2.1", "name": "agent posts to own project channel", "type": "integration", "preconditions": ["tenant = fixture(:tenant, %{trust_tier: :agent_rooted})", "project = fixture(:project, %{tenant_id: tenant.id})", "{key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"], "steps": ["POST {project_id: project.id, body: \"pushed PR #107, CI green\"}"], "expected_results": ["201", "agent_id == the key's agent_id", "expires_at ~30d"] },
+    { "id": "TC-39.2.2", "name": "body-supplied agent_id/tenant_id ignored", "type": "integration", "preconditions": ["tenant = fixture(:tenant); project = fixture(:project, %{tenant_id: tenant.id})", "{key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"], "steps": ["POST with a foreign agent_id + tenant_id in the body"], "expected_results": ["stored agent_id/tenant_id are the key's"] },
+    { "id": "TC-39.2.3", "name": "cross-tenant AND not-found project both 422, identical body", "type": "integration", "preconditions": ["tenant = fixture(:tenant); other = fixture(:tenant)", "foreign = fixture(:project, %{tenant_id: other.id})", "{key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"], "steps": ["POST with foreign.id", "POST with a random nonexistent UUID"], "expected_results": ["both 422", "response bodies are identical (no existence oracle)", "no row created either time"] },
+    { "id": "TC-39.2.4", "name": "keyed post upserts within a session, not across", "type": "integration", "preconditions": ["tenant = fixture(:tenant); project = fixture(:project, %{tenant_id: tenant.id})", "{key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})", "an existing post session_id \"S1\" key \"session_goal\" body \"v1\""], "steps": ["POST session_id \"S1\" key \"session_goal\" body \"v2\"", "POST session_id \"S2\" key \"session_goal\" body \"other\""], "expected_results": ["S1 row updated in place to v2 (same id, one row)", "S2 is a distinct row", "no clobber across sessions"] },
+    { "id": "TC-39.2.5", "name": "agent key without agent_id is 403", "type": "integration", "preconditions": ["{key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: nil})"], "steps": ["POST a channel post"], "expected_results": ["403 agent_identity_required; no row"] },
+    { "id": "TC-39.2.6", "name": "over-cap writes are 429", "type": "integration", "preconditions": ["tenant + project + agent key", "write cap set low for the test"], "steps": ["POST more than the cap in the window"], "expected_results": ["excess returns 429 with Retry-After", "a security-event log is emitted"] }
+  ],
+  "technical_notes": [
+    "Controller: LoopctlWeb.ChannelPostController; route POST /api/v1/channel/posts in :authenticated.",
+    "Context: Loopctl.Coordination.post(tenant_id, agent_id, attrs) using AdminRepo (NOT the RLS Repo — matches Knowledge/Projects). Wrap insert/upsert + audit in Ecto.Multi (Audit.log_in_multi/3).",
+    "Upsert: AdminRepo.insert(cs, on_conflict: {:replace, [:body, :refs, :updated_at, :expires_at]}, conflict_target: [:tenant_id, :project_id, :session_id, :key]) only when key present; keyless plain-insert. Precedent: knowledge.ex:4066, memory.ex:2262.",
+    "Ownership: Projects.get_project/2 (projects.ex:107) returns {:ok,%Project{}}|{:error,:not_found}; UUID-cast-guarded (no 500 on malformed id). Map :not_found -> the shared 422 (same body as cross-tenant). Do NOT call Knowledge.validate_project_ownership (it is defp/private).",
+    "agent_id per #163 = api_key.agent_id; REQUIRED here (not the conditional memory-metadata gate).",
+    "Default-deny guard test: allowlist {:post, \"/api/v1/channel/posts\"} with the coordination-surface justification.",
+    "Rate limit: reuse the :authenticated pipeline RateLimiter/Hammer; make the per-(tenant,agent) write cap configurable."
+  ],
+  "dependencies": ["US-39.1"],
+  "estimated_tokens": 300000
+}
