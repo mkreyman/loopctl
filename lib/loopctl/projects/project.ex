@@ -109,6 +109,14 @@ defmodule Loopctl.Projects.Project do
   end
 
   @doc """
+  Changeset for re-activating an archived project (setting status to :active).
+  """
+  @spec activate_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
+  def activate_changeset(project) do
+    change(project, status: :active)
+  end
+
+  @doc """
   Returns the list of valid statuses.
   """
   @spec statuses() :: [atom()]

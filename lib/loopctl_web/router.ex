@@ -224,6 +224,10 @@ defmodule LoopctlWeb.Router do
     # KB-only project scope: agent-createable (agent+ role, no human-anchor gate), forces
     # kind: :kb. Separate route so the human-anchored `POST /projects` stays untouched.
     post "/kb-scopes", ProjectController, :create_kb_scope
+    # Archive (reversible soft-delete) an agent-owned :kb scope to reclaim its budget slot;
+    # restore re-activates it (re-consumes a slot). Both agent-managed, no custody surface.
+    delete "/kb-scopes/:id", ProjectController, :archive_kb_scope
+    post "/kb-scopes/:id/restore", ProjectController, :restore_kb_scope
     resources "/projects", ProjectController, only: [:create, :index, :show, :update, :delete]
     get "/projects/:id/progress", ProjectController, :progress
 

@@ -413,6 +413,30 @@ async function createKbScope({ name, slug, repo_url, description, tech_stack }) 
   return toContent(result);
 }
 
+async function archiveKbScope({ project_id }) {
+  // Reversible soft-delete of an agent-owned :kb scope on the AGENT key; frees its
+  // max_projects slot. The server rejects a :work project (422). Reverse with restore_kb_scope.
+  const result = await apiCall(
+    "DELETE",
+    `/api/v1/kb-scopes/${project_id}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function restoreKbScope({ project_id }) {
+  // Re-activate an archived :kb scope on the AGENT key (re-consumes a max_projects slot;
+  // 422 if at the cap). The server rejects a :work project (422).
+  const result = await apiCall(
+    "POST",
+    `/api/v1/kb-scopes/${project_id}/restore`,
+    {},
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function deleteProject({ project_id }) {
   const result = await apiCall(
     "DELETE",
@@ -2128,6 +2152,30 @@ const TOOLS = [
         tech_stack: { type: "string", description: "Tech stack summary." },
       },
       required: ["name", "slug"],
+    },
+  },
+  {
+    name: "archive_kb_scope",
+    description:
+      "Archive (reversible soft-delete) a knowledge-only project scope (kind: kb) you own, on the agent key. Frees the scope's slot in the tenant's max_projects budget so you can reclaim KB-scope capacity — the reverse of create_kb_scope. Its articles remain readable/writable; restore_kb_scope re-activates it. Rejects a kind: work project (422) — archiving a work project stays human-anchored. Idempotent on an already-archived scope.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "UUID of the :kb scope to archive." },
+      },
+      required: ["project_id"],
+    },
+  },
+  {
+    name: "restore_kb_scope",
+    description:
+      "Restore (re-activate) an archived knowledge-only project scope (kind: kb) you own, on the agent key — the reverse of archive_kb_scope. Re-activating consumes an active max_projects slot, so it is rejected (422) when the tenant is at its cap. Rejects a kind: work project (422).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "UUID of the archived :kb scope to restore." },
+      },
+      required: ["project_id"],
     },
   },
   {
@@ -4892,6 +4940,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "create_kb_scope":
       return await createKbScope(args);
+
+    case "archive_kb_scope":
+      return await archiveKbScope(args);
+
+    case "restore_kb_scope":
+      return await restoreKbScope(args);
 
     case "delete_project":
       return await deleteProject(args);

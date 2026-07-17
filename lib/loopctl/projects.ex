@@ -293,7 +293,16 @@ defmodule Loopctl.Projects do
   """
   @spec archive_project(Ecto.UUID.t(), Project.t(), keyword()) ::
           {:ok, Project.t()} | {:error, Ecto.Changeset.t()}
-  def archive_project(tenant_id, %Project{} = project, opts \\ []) do
+  def archive_project(tenant_id, project, opts \\ [])
+
+  def archive_project(tenant_id, %Project{status: :archived} = project, _opts) do
+    # Idempotent: archiving an already-archived project is a no-op and writes NO new audit
+    # row, so a repeated DELETE can't inflate the append-only audit log.
+    _ = tenant_id
+    {:ok, project}
+  end
+
+  def archive_project(tenant_id, %Project{} = project, opts) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
     actor_type = Keyword.get(opts, :actor_type, "api_key")
@@ -322,6 +331,66 @@ defmodule Loopctl.Projects do
     case AdminRepo.transaction(multi) do
       {:ok, %{project: archived}} ->
         {:ok, archived}
+
+      {:error, :project, changeset, _changes} ->
+        {:error, changeset}
+    end
+  end
+
+  @doc """
+  Re-activates (un-archives) an archived project, scoped to a tenant.
+
+  Idempotent for an already-active project (no-op, no audit row). Re-activating consumes an
+  active `max_projects` slot, so it enforces the same limit as create and returns
+  `{:error, :project_limit_reached}` when the tenant is at its cap. Writes an audit entry in
+  the same transaction.
+  """
+  @spec unarchive_project(Ecto.UUID.t(), Project.t(), keyword()) ::
+          {:ok, Project.t()} | {:error, Ecto.Changeset.t() | :project_limit_reached}
+  def unarchive_project(tenant_id, project, opts \\ [])
+
+  def unarchive_project(_tenant_id, %Project{status: :active} = project, _opts) do
+    {:ok, project}
+  end
+
+  def unarchive_project(tenant_id, %Project{} = project, opts) do
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+    metadata = Keyword.get(opts, :metadata, %{})
+
+    changeset = Project.activate_changeset(project)
+
+    multi =
+      Multi.new()
+      |> Multi.run(:check_limit, fn _repo, _changes ->
+        count = count_projects(tenant_id, status: :active)
+        max = get_project_limit(tenant_id)
+
+        if count < max, do: {:ok, count}, else: {:error, :project_limit_reached}
+      end)
+      |> Multi.update(:project, changeset)
+      |> Audit.log_in_multi(:audit, fn %{project: activated} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "project",
+          entity_id: activated.id,
+          action: "unarchived",
+          actor_type: actor_type,
+          actor_id: actor_id,
+          actor_label: actor_label,
+          metadata: metadata,
+          old_state: %{"status" => to_string(project.status)},
+          new_state: %{"status" => to_string(activated.status)}
+        }
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{project: activated}} ->
+        {:ok, activated}
+
+      {:error, :check_limit, :project_limit_reached, _changes} ->
+        {:error, :project_limit_reached}
 
       {:error, :project, changeset, _changes} ->
         {:error, changeset}
