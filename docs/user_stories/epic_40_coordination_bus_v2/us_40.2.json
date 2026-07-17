@@ -1,0 +1,35 @@
+{
+  "id": "US-40.2",
+  "title": "Presence: who is live on this repo right now",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 + memory-keeper retirement" },
+  "priority": "medium",
+  "phase": "coordination_bus_v2_A",
+  "story": {
+    "as_a": "coding agent about to make a change on a repo",
+    "i_want_to": "see which other sessions (which machine/agent) are currently active on this repo",
+    "so_that": "I know a human is concurrently working the same repo from another machine before I push or merge"
+  },
+  "rationale": "The single most collision-prone moment is 'someone else is on this repo right now.' v1 gives recent posts but not liveness. Presence answers 'who is active now' cheaply by reading recency signals already tracked — no new heartbeat protocol needed for a first cut.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §3.6; the existing UpdateLastSeen plug already stamps api-key/agent last_seen on every request",
+    "includes": "Derive presence from recent channel activity (posts in the last N minutes) and/or the existing last_seen signal — approximate, not a hard heartbeat."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.2.1", "description": "GET /api/v1/channel/presence?project_id= (agent role, tenant+project scoped) returns the set of sessions/agents considered 'active' on the project within a recency window (e.g. posted or seen in the last N minutes), each with agent_id, host, session_id, and last-active timestamp.", "status": "pending" },
+    { "id": "AC-40.2.2", "description": "Presence is derived (no new heartbeat table): active = distinct (session_id, host, agent_id) that posted to THIS project's channel within the window (configurable). Do NOT augment with agents.last_seen — that signal is global-to-the-agent (UpdateLastSeen stamps agents.last_seen_at, not per-project) and debounced via TouchBuffer, so it would report an agent 'live on this repo' when it is active on a DIFFERENT repo. Caveat (document): a live-but-quiet session that hasn't posted in the window won't appear, and session_id may be null when CLAUDE_SESSION_ID is unset — presence is approximate by design.", "status": "pending" },
+    { "id": "AC-40.2.3", "description": "Oracle-safe + tenant-scoped identically to channel_recent: an unowned/nonexistent project returns an empty presence set, never 404; only agent_id is authoritative attribution.", "status": "pending" },
+    { "id": "AC-40.2.4", "description": "A channel_presence(project_id) MCP tool is added, and presence is surfaced in the SessionStart TEAM CHANNEL block (US-39.6) as a one-line 'also active: <host/agent>' when non-empty.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.2.1", "name": "recent poster shows as active", "type": "integration", "preconditions": ["a post from session S2 within the window"], "steps": ["GET /channel/presence?project_id="], "expected_results": ["S2 listed active"] },
+    { "id": "TC-40.2.2", "name": "stale session drops out", "type": "integration", "preconditions": ["a post from S3 older than the window"], "steps": ["GET presence"], "expected_results": ["S3 not listed"] },
+    { "id": "TC-40.2.3", "name": "cross-tenant presence is empty (no oracle)", "type": "integration", "preconditions": ["another tenant's active project"], "steps": ["GET presence with that project_id"], "expected_results": ["empty set, 200"] }
+  ],
+  "technical_notes": [
+    "Simplest v1: a windowed DISTINCT over channel_posts (session_id, host, agent_id, max(inserted_at)) via AdminRepo + explicit tenant filter.",
+    "Do not build a heartbeat/websocket for presence — recency-from-posts is enough for the collision-awareness use case (design §5).",
+    "Reuse channel_recent's oracle-safety + scoping exactly."
+  ],
+  "dependencies": ["US-39.3"],
+  "estimated_tokens": 150000
+}

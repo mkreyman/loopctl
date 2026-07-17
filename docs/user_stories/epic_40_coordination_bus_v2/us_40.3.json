@@ -1,0 +1,38 @@
+{
+  "id": "US-40.3",
+  "title": "Turn-boundary freshness pull (inject channel deltas each turn, not just at SessionStart)",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 + memory-keeper retirement" },
+  "priority": "medium",
+  "phase": "coordination_bus_v2_A",
+  "story": {
+    "as_a": "coding agent in a long-running session",
+    "i_want_to": "receive NEW channel posts from other sessions at each turn, not only at SessionStart",
+    "so_that": "when a session on another machine posts mid-way through my long session, I see it at my next turn instead of never"
+  },
+  "rationale": "SessionStart injection (US-39.6) only fires once. A long session (like a big review) would never see a heads-up posted by another machine an hour in. This is the near-realtime-for-agents mechanism from the design (§5): a per-turn pull of the delta is the finest granularity an agent can actually consume — capturing all the value a websocket could, with no persistent connection and no fight with Fly suspend.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §3.3, §5; claude-config hooks (UserPromptSubmit or Stop hook); reuse US-39.6's injection-safety wholesale",
+    "includes": "A UserPromptSubmit hook pulls channel_recent(since=last_seen) and injects only new posts; last_seen persisted per session."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.3.1", "description": "A claude-config hook (UserPromptSubmit preferred) pulls channel_recent(project_id, since=<last-seen-for-this-session>) each turn and injects ONLY posts newer than the last pull, from OTHER sessions, as a compact TEAM CHANNEL update.", "status": "pending" },
+    { "id": "AC-40.3.2", "description": "It persists a per-(session, project) last-seen high-watermark (the newest inserted_at it has injected) so the same post is never re-injected turn after turn.", "status": "pending" },
+    { "id": "AC-40.3.3", "description": "It inherits US-39.6's untrusted-content hardening EXACTLY (jq-encoded bodies, fenced + truncated, off-switch-aware: CLAUDE_MEMORY / .claude/memory-off / CLAUDE_TEAM_CHANNEL=0). CRITICAL, sharper than SessionStart: a UserPromptSubmit hook that exits non-zero or emits decision:block ERASES the user's submitted prompt. This hook must ALWAYS exit 0 and NEVER block — a capture/network failure must silently produce no injection, never lose the prompt.", "status": "pending" },
+    { "id": "AC-40.3.4", "description": "Silent when there are no new other-session posts (the common case). UserPromptSubmit's default timeout is 30s (not 600s), so the network calls MUST be backgrounded with a wall-clock kill / tight cumulative --max-time budget well under 30s — a slow/hung loopctl can never delay or drop the turn.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.3.1", "name": "new other-session post appears next turn", "type": "integration", "preconditions": ["a session mid-run", "another session posts after SessionStart"], "steps": ["trigger the UserPromptSubmit hook"], "expected_results": ["the new post is injected once"] },
+    { "id": "TC-40.3.2", "name": "already-seen posts are not re-injected", "type": "integration", "preconditions": ["a post already injected last turn"], "steps": ["trigger the hook again"], "expected_results": ["that post is NOT re-injected (high-watermark advanced)"] },
+    { "id": "TC-40.3.3", "name": "quiet channel adds no block and is fast", "type": "integration", "preconditions": ["no new posts"], "steps": ["trigger the hook"], "expected_results": ["no injection, returns within the per-turn budget"] },
+    { "id": "TC-40.3.4", "name": "malicious body is inert (inherited hardening)", "type": "integration", "preconditions": ["a new post with a shell-injection body"], "steps": ["trigger the hook"], "expected_results": ["inert text, no execution, valid output"] }
+  ],
+  "technical_notes": [
+    "Repo: claude-config. Prefer UserPromptSubmit (fires each user turn) over Stop; confirm the event provides session_id + a place to inject context.",
+    "Persist last-seen in a small per-session file (e.g. ~/.claude/.team-channel-seen-<session>) or reuse a scratch location; key by (session, project).",
+    "Factor US-39.6's render/escape/off-switch/timeout logic into a shared hook helper — and PARAMETERIZE hookEventName (session-start.sh:317-319 hardcodes \"SessionStart\"; this hook must emit hookSpecificOutput with hookEventName \"UserPromptSubmit\").",
+    "Seed the per-turn watermark (AC-40.3.2) from the SessionStart injection time so the first turn doesn't re-inject what SessionStart just showed. Intra-session races are a non-issue (UserPromptSubmit fires serially, blocking the turn); cross-session isolation is the per-session watermark file.",
+    "Keep it CHEAP: a single since-filtered call; background it with a wall-clock kill so a slow network never delays the turn."
+  ],
+  "dependencies": ["US-39.6"],
+  "estimated_tokens": 200000
+}
