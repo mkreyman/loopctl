@@ -1,0 +1,35 @@
+{
+  "id": "US-39.5",
+  "title": "30-day Oban TTL sweep worker for channel_posts",
+  "epic": { "id": "epic_39", "name": "Repo Coordination Bus" },
+  "priority": "medium",
+  "phase": "coordination_bus_v1",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "have expired channel posts deleted automatically on a schedule",
+    "so_that": "the coordination roll stays small and honors the uniform 30-day retention without manual cleanup"
+  },
+  "rationale": "Retention is a release gate, not a nicety. A scheduled, idempotent, bounded sweep keeps the table lean and enforces the 30-day window; anything worth keeping longer has already been graduated to Knowledge, so hard-deleting expired rows loses nothing.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §3.4; review D5",
+    "includes": "Drop-in template is Loopctl.Workers.SessionMemoryPruneWorker (session_memory_prune_worker.ex): use Oban.Worker, @batch_size 1000, delete_in_batches/2 that loops limit(@batch_size) |> AdminRepo.all() then where(id in ^ids) |> AdminRepo.delete_all(), all-tenants on BYPASSRLS AdminRepo, scheduled {\"*/5 * * * *\"} in oban_config crontab. NOTE: the #411 MemoryGraduationSweepWorker is a scan-and-graduate job, NOT a TTL delete — do not copy it."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-39.5.1", "description": "An Oban worker Loopctl.Workers.ChannelPostSweeper deletes channel_posts WHERE expires_at < now(). Scheduled via the Oban crontab in lib/loopctl/oban_config.ex plugins/0 at a fixed cadence (mirror SessionMemoryPruneWorker's {\"*/5 * * * *\"}).", "status": "pending" },
+    { "id": "AC-39.5.2", "description": "The sweep is bounded per run (deletes in batches with a max, logging the count) so a large backlog cannot lock the table; it is safe to run repeatedly (idempotent).", "status": "pending" },
+    { "id": "AC-39.5.3", "description": "The sweep runs across all tenants (admin/BYPASSRLS repo, like other maintenance workers) but only ever touches rows past expires_at — it never deletes a live post.", "status": "pending" },
+    { "id": "AC-39.5.4", "description": "The worker is registered in the Oban config/cron plugin and appears in Oban observability like the other periodic workers.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-39.5.1", "name": "sweep deletes expired, keeps live", "type": "integration", "preconditions": ["tenant = fixture(:tenant); project = fixture(:project, %{tenant_id: tenant.id})", "one post with expires_at in the past", "one post with expires_at in the future"], "steps": ["perform ChannelPostSweeper"], "expected_results": ["expired post deleted", "live post remains"] },
+    { "id": "TC-39.5.2", "name": "sweep is idempotent (second run no-ops)", "type": "integration", "preconditions": ["no expired rows"], "steps": ["perform the worker twice"], "expected_results": ["{:ok, ...} both times; zero deletions on the second"] },
+    { "id": "TC-39.5.3", "name": "batch bound is honored", "type": "integration", "preconditions": ["more expired rows than the batch max"], "steps": ["perform once"], "expected_results": ["at most batch-max deleted in one run; remaining swept next run"] }
+  ],
+  "technical_notes": [
+    "Worker: Loopctl.Workers.ChannelPostSweeper (use Oban.Worker); schedule in the Oban :crontab.",
+    "Delete via the admin repo with a LIMIT/returning-based batch (or delete_all with a subquery LIMIT) to bound each run.",
+    "Mirror the existing memory-graduation / retention sweep worker for cadence, logging, and test style."
+  ],
+  "dependencies": ["US-39.1"],
+  "estimated_tokens": 150000
+}

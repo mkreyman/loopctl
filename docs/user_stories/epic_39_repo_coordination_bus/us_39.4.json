@@ -1,0 +1,39 @@
+{
+  "id": "US-39.4",
+  "title": "MCP tools channel_post + channel_recent (Node proxy, agent key) + publish",
+  "epic": { "id": "epic_39", "name": "Repo Coordination Bus" },
+  "priority": "high",
+  "phase": "coordination_bus_v1",
+  "story": {
+    "as_a": "coding agent using the loopctl MCP tools",
+    "i_want_to": "call channel_post and channel_recent directly as MCP tools",
+    "so_that": "I can leave and read repo coordination messages from inside a session without hand-crafting HTTP calls"
+  },
+  "rationale": "The MCP proxy is how agents actually reach loopctl. The two v1 tools must map 1:1 onto the endpoints on the agent key, fill host from the local machine automatically, and ship via the existing version-bump autopublish so a fresh session picks them up.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §3.6; mcp-server/index.js create_kb_scope pattern (US-39.2/39.3 endpoints)",
+    "includes": "Mirrors the create_kb_scope tool: agent-key apiCall, tool def, dispatch case, node --test source-regex tests, package.json version bump, CHANGELOG, mcp-autopublish."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-39.4.1", "description": "channel_post(project_id, body, key?, refs?) posts to POST /api/v1/channel/posts on the AGENT key. host is auto-filled from os.hostname(). session_id is auto-filled by the proxy from the SAME identifier SessionStart sees (CLAUDE_SESSION_ID env when Claude Code sets it; else omitted) — NOT a caller argument — so US-39.6 self-dedup can match. It carries no authority (client-supplied, informational only).", "status": "pending" },
+    { "id": "AC-39.4.2", "description": "channel_recent(project_id, since?, limit?) GETs /api/v1/channel/posts on the agent key and returns the recent posts.", "status": "pending" },
+    { "id": "AC-39.4.6", "description": "The session_id the tool writes and the session_id US-39.6 reads from the SessionStart stdin payload are the SAME value (both the Claude Code session id). If unavailable, session_id is null and self-dedup gracefully no-ops (a session may see its own posts echoed) — never an error, never a security dependency.", "status": "pending" },
+    { "id": "AC-39.4.3", "description": "Both tools are declared in TOOLS and wired in the dispatch switch; node --test source-regex tests assert each tool is declared, dispatched, and hits the correct path/method on the agent key (mirroring the create_kb_scope tests).", "status": "pending" },
+    { "id": "AC-39.4.4", "description": "mcp-server/package.json version is bumped and a CHANGELOG entry added, so mcp-autopublish publishes the new version on merge (the version-change-on-master trigger).", "status": "pending" },
+    { "id": "AC-39.4.5", "description": "The full mcp-server node --test suite is green.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-39.4.1", "name": "channel_post tool declared + dispatched on agent key", "type": "unit", "preconditions": ["read mcp-server/index.js source"], "steps": ["assert TOOLS has name: \"channel_post\"", "assert dispatch case returns channelPost(args)", "assert channelPost POSTs /api/v1/channel/posts with LOOPCTL_AGENT_KEY"], "expected_results": ["all three source-regex assertions pass"] },
+    { "id": "TC-39.4.2", "name": "channel_recent tool declared + dispatched on agent key", "type": "unit", "preconditions": ["read source"], "steps": ["assert TOOLS has name: \"channel_recent\"", "assert dispatch case returns channelRecent(args)", "assert channelRecent GETs /api/v1/channel/posts"], "expected_results": ["assertions pass"] },
+    { "id": "TC-39.4.3", "name": "host is auto-filled from os.hostname()", "type": "unit", "preconditions": ["read channelPost source"], "steps": ["assert body sets host from os.hostname() when not provided"], "expected_results": ["host is populated by the proxy"] },
+    { "id": "TC-39.4.4", "name": "version bumped so autopublish fires", "type": "unit", "preconditions": ["compare package.json version to the previous published version"], "steps": ["read mcp-server/package.json version + CHANGELOG top entry"], "expected_results": ["version is greater; CHANGELOG documents channel_post/channel_recent"] }
+  ],
+  "technical_notes": [
+    "Edit mcp-server/index.js: two async helpers (channelPost/channelRecent), two tool defs, two dispatch cases — copy the create_kb_scope shape exactly.",
+    "Use process.env.LOOPCTL_AGENT_KEY for both (coordination is agent-role).",
+    "Add tests to mcp-server/test/mcp_arg_forwarding.test.js in the same source-regex style as the create_kb_scope block.",
+    "Bump mcp-server/package.json version + add a CHANGELOG.md entry; mcp-autopublish.yml publishes on the package.json version change on master."
+  ],
+  "dependencies": ["US-39.2", "US-39.3"],
+  "estimated_tokens": 150000
+}
