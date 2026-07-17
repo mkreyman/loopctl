@@ -115,6 +115,32 @@ describe("#411 gap1: resolve_project wiring", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #418: create_kb_scope (KB-only project scope, agent-createable)
+// ---------------------------------------------------------------------------
+
+describe("#418: create_kb_scope wiring", () => {
+  test("TOOLS declares a create_kb_scope tool", () => {
+    assert.match(INDEX_SRC, /name: "create_kb_scope",/, 'must declare a "create_kb_scope" tool');
+  });
+
+  test("createKbScope POSTs /kb-scopes on the AGENT key (not the orch key)", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function createKbScope\([\s\S]*?"POST",\s*"\/api\/v1\/kb-scopes",\s*body,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "createKbScope must POST /api/v1/kb-scopes with the agent key",
+    );
+  });
+
+  test("the create_kb_scope dispatch case calls createKbScope(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "create_kb_scope":\s*\n\s*return await createKbScope\(args\);/,
+      "the create_kb_scope dispatch case must call createKbScope(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #411 gap2 (PR B): recall_context (merged memory ∪ knowledge, one round-trip)
 // ---------------------------------------------------------------------------
 
