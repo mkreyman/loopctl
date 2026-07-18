@@ -213,6 +213,71 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert log =~ "agent_identity_required"
     end
 
+    # AC-39.2.2 (defense-in-depth) — a key whose server-stamped agent_id belongs to
+    # another tenant (a misconfigured key; the agent FKs are non-composite) is a 403
+    # agent_identity_required IDENTITY fault, NOT a 422 project probe.
+    test "a key whose agent belongs to another tenant -> 403 agent_identity_required, no row" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      other = fixture(:tenant)
+      foreign_agent = fixture(:agent, %{tenant_id: other.id})
+
+      {raw, _key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: foreign_agent.id})
+
+      log =
+        capture_log(fn ->
+          conn = post_json(raw, %{"project_id" => project.id, "body" => "x"})
+
+          assert %{"error" => %{"code" => "agent_identity_required", "status" => 403}} =
+                   json_response(conn, 403)
+        end)
+
+      assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
+      assert log =~ "agent_identity_required"
+    end
+
+    # AC-39.2.8 — a per-write cap stored as a JSON STRING must still enforce. Without
+    # coercion the string flows to the limiter verbatim, where Elixir term ordering
+    # (int < binary) never denies (Hammer) or the is_integer guard raises and is
+    # swallowed to fail-open (Postgres) — either way silently neutering the cap.
+    test "a coordination write cap stored as a STRING is coerced and still enforces (429)" do
+      stub_counting_limiter()
+      tenant = fixture(:tenant, %{settings: %{"channel_post_write_limit_per_minute" => "3"}})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      for _ <- 1..3 do
+        conn = post_json(raw, %{"project_id" => project.id, "body" => "x"})
+        assert conn.status in [200, 201]
+      end
+
+      conn = post_json(raw, %{"project_id" => project.id, "body" => "x"})
+      assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
+    end
+
+    # AC-39.2.9 — a rate-limiter fault must fail OPEN (write allowed) but stay
+    # OBSERVABLE via the shared throttled FailOpenLog, never be silently swallowed.
+    test "a rate-limiter fault fails open (write allowed) and is logged, not swallowed" do
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
+        raise "limiter boom"
+      end)
+
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      log =
+        capture_log(fn ->
+          conn = post_json(raw, %{"project_id" => project.id, "body" => "x"})
+          # Fail-open: the write still lands despite the limiter fault.
+          assert conn.status in [200, 201]
+        end)
+
+      assert log =~ "RateLimiter fail-open"
+      assert log =~ "channel_post_write:key"
+    end
+
     # TC-39.2.6
     test "over-cap writes are 429 with Retry-After and emit a security-event log" do
       stub_counting_limiter()

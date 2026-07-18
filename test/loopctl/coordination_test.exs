@@ -350,6 +350,62 @@ defmodule Loopctl.CoordinationTest do
                })
     end
 
+    test "a foreign-tenant agent_id returns {:error, :agent_not_found}, distinct from the project error",
+         ctx do
+      %{tenant: tenant, project: project, audit: audit} = ctx
+      other = fixture(:tenant)
+      foreign_agent = fixture(:agent, %{tenant_id: other.id}).id
+
+      # A valid project but an agent that belongs to another tenant: the ownership
+      # guard is restored (defense-in-depth — the agent FKs are non-composite) and
+      # maps to a DISTINCT error so the endpoint attributes an identity fault, not a
+      # cross-tenant project probe.
+      assert {:error, :agent_not_found} =
+               Coordination.post(tenant.id, foreign_agent, %{
+                 project_id: project.id,
+                 body: "x",
+                 audit: audit
+               })
+
+      assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
+
+      assert AdminRepo.aggregate(
+               from(a in AuditLog, where: a.entity_type == "channel_post"),
+               :count,
+               :id
+             ) == 0
+    end
+
+    test "the created/updated outcome is derived from the persisted row, not a pre-transaction probe",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      # Pre-seed the keyed slot directly, then post/3 the SAME slot: the outcome
+      # must reflect the row that actually persists (an in-place update via
+      # ON CONFLICT), read from the returned row's timestamps rather than a
+      # pre-transaction existence check that a concurrent write or TTL sweep could
+      # invalidate between the read and the insert.
+      assert {:ok, seed} =
+               Coordination.create_post(tenant.id, project.id, agent_id, %{
+                 "body" => "seed",
+                 "session_id" => "S1",
+                 "key" => "session_goal"
+               })
+
+      assert {:ok, post, :updated} =
+               Coordination.post(tenant.id, agent_id, %{
+                 project_id: project.id,
+                 session_id: "S1",
+                 key: "session_goal",
+                 body: "v2",
+                 audit: audit
+               })
+
+      assert post.id == seed.id
+      assert post.body == "v2"
+      assert audit_actions(tenant.id, post.id) == ["upserted"]
+    end
+
     test "a missing body returns {:error, changeset} and writes no post or audit row", ctx do
       %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
 

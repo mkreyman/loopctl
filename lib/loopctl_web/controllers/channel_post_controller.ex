@@ -19,10 +19,12 @@ defmodule LoopctlWeb.ChannelPostController do
 
   Every abuse-relevant outcome emits a `[:loopctl, :coordination, event]`
   telemetry event + a structured warning so exfil attempts and enumeration scans
-  are observable: `:agent_identity_required` (403), `:ownership_rejected` (422,
-  cross-tenant/not-found — no existence oracle), and `:rate_limited` (429). The
-  denylist rejection (422) signal is emitted from `Loopctl.Coordination` at the
-  point the write is rejected.
+  are observable: `:agent_identity_required` (403 — the key carries no agent
+  identity, OR its agent belongs to another tenant), `:ownership_rejected` (422,
+  cross-tenant/not-found project — no existence oracle), and `:rate_limited`
+  (429). The denylist rejection (422) signal is emitted from `Loopctl.Coordination`
+  at the point the write is rejected. A rate-limiter fault degrades to "no gate"
+  but is logged via the shared throttled `FailOpenLog`, never swallowed silently.
   """
 
   use LoopctlWeb, :controller
@@ -32,6 +34,7 @@ defmodule LoopctlWeb.ChannelPostController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Coordination
+  alias Loopctl.RateLimiter.FailOpenLog
   alias Loopctl.Tenants
   alias LoopctlWeb.AuditContext
 
@@ -59,6 +62,11 @@ defmodule LoopctlWeb.ChannelPostController do
   # `channel_post_write_limit_per_minute` setting (mirrors the pipeline limiter's
   # `rate_limit_requests_per_minute`). Not hardcoded at the call site.
   @default_write_limit 120
+
+  # Fallback for the generic per-key pipeline limit, kept in sync with
+  # LoopctlWeb.Plugs.RateLimiter's @default_per_key_limit. Used to clamp the
+  # coordination cap so it stays the binding (and observable) constraint.
+  @pipeline_per_key_limit_default 300
 
   operation(:create,
     summary: "Post to a repo coordination channel",
@@ -152,6 +160,30 @@ defmodule LoopctlWeb.ChannelPostController do
 
         {:error, :unprocessable_entity, @ownership_error_message}
 
+      {:error, :agent_not_found} ->
+        # Defense-in-depth: the key's server-stamped agent_id does not belong to
+        # this tenant (a misconfigured key — the agent FKs are non-composite, so
+        # the DB alone would accept the mis-attributed row). This is an IDENTITY
+        # fault, not a project probe, so it emits the :agent_identity_required
+        # signal + a 403 — never the :ownership_rejected project signal — keeping
+        # the two failure modes correctly attributed.
+        emit_security_event(:agent_identity_required, %{
+          tenant_id: tenant_id,
+          agent_id: agent_id,
+          project_id: params["project_id"]
+        })
+
+        conn
+        |> put_status(:forbidden)
+        |> json(%{
+          error: %{
+            status: 403,
+            code: "agent_identity_required",
+            message:
+              "This API key's agent identity is not valid for this tenant; it cannot post an attributed channel message"
+          }
+        })
+
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
     end
@@ -188,33 +220,81 @@ defmodule LoopctlWeb.ChannelPostController do
 
   # Reuse the RateLimiter behaviour seam (config-based DI). Fail OPEN on any
   # limiter fault — a limiter outage must degrade to "no gate", never block
-  # writes (parity with LoopctlWeb.Plugs.RateLimiter).
+  # writes — but route every fail-open through the SHARED throttled, PII-safe
+  # `FailOpenLog` (full parity with LoopctlWeb.Plugs.RateLimiter) so a sustained
+  # write-cap limiter outage stays observable (AC-39.2.9) instead of being
+  # silently swallowed.
   defp check_rate(identifier, limit) do
     case Loopctl.RateLimiter.impl().check_rate(identifier, @write_window_ms, limit) do
       {:allow, count} when is_integer(count) -> {:allow, count}
       {:deny, denied} when is_integer(denied) -> {:deny, denied}
-      _other -> {:allow, 0}
+      other -> fail_open(identifier, "limiter returned #{inspect(other)}")
     end
   rescue
-    _ -> {:allow, 0}
+    e -> fail_open(identifier, Exception.message(e))
   catch
-    :exit, _ -> {:allow, 0}
-    :throw, _ -> {:allow, 0}
+    :exit, reason -> fail_open(identifier, "limiter exit: #{inspect(reason)}")
+    :throw, value -> fail_open(identifier, "limiter throw: #{inspect(value)}")
+  end
+
+  # Degrade to "no gate" on a limiter fault, but emit a throttled, PII-safe warning
+  # (the bucket family reduces to `channel_post_write:key`, UUID suffix stripped)
+  # so the outage is not invisible.
+  defp fail_open(identifier, detail) do
+    FailOpenLog.warn(:coordination, identifier, detail)
+    {:allow, 0}
   end
 
   defp write_limit(nil), do: default_write_limit()
 
   defp write_limit(tenant) do
-    Tenants.get_tenant_settings(
-      tenant,
-      "channel_post_write_limit_per_minute",
-      default_write_limit()
-    )
+    configured =
+      tenant
+      |> Tenants.get_tenant_settings("channel_post_write_limit_per_minute", default_write_limit())
+      |> coerce_positive_int(default_write_limit())
+
+    # AC-39.2.8/9: the coordination write cap must remain a TIGHTER constraint than
+    # the generic per-key pipeline limiter (LoopctlWeb.Plugs.RateLimiter), which
+    # runs FIRST in the pipeline and emits no coordination-specific security signal.
+    # If a tenant set this above the pipeline limit, every coordination rate-limit
+    # trip would be shadowed by an anonymous pipeline 429 — blinding the AC-39.2.9
+    # abuse detectors. Clamp so the coordination cap can never exceed (and thus be
+    # shadowed by) the pipeline cap.
+    min(configured, pipeline_per_key_limit(tenant))
   end
 
   defp default_write_limit do
     Application.get_env(:loopctl, :channel_post_write_limit_per_minute, @default_write_limit)
   end
+
+  # The generic per-key pipeline limit that runs before this controller plug. Read
+  # from the SAME tenant setting the pipeline limiter uses; default kept in sync
+  # with LoopctlWeb.Plugs.RateLimiter's @default_per_key_limit.
+  defp pipeline_per_key_limit(tenant) do
+    tenant
+    |> Tenants.get_tenant_settings(
+      "rate_limit_requests_per_minute",
+      @pipeline_per_key_limit_default
+    )
+    |> coerce_positive_int(@pipeline_per_key_limit_default)
+  end
+
+  # A tenant setting stored as a non-integer (e.g. the JSON string "3") would
+  # silently NEUTER the cap: `get_tenant_settings/3` is a bare Map.get on raw jsonb,
+  # so the Hammer limiter would then compare via Elixir term ordering (every integer
+  # < every binary → never denies) and the Postgres limiter's `is_integer` guard
+  # would raise (swallowed to fail-open). Coerce an integer or an integer STRING to
+  # a positive integer; a zero/negative/garbage value falls back to `default`.
+  defp coerce_positive_int(value, _default) when is_integer(value) and value > 0, do: value
+
+  defp coerce_positive_int(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {n, ""} when n > 0 -> n
+      _ -> default
+    end
+  end
+
+  defp coerce_positive_int(_value, default), do: default
 
   defp window_reset_at do
     now = System.system_time(:second)
