@@ -22,8 +22,10 @@ defmodule Loopctl.Coordination do
 
   import Ecto.Query
 
+  alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Agents
+  alias Loopctl.Audit
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Projects
 
@@ -75,6 +77,188 @@ defmodule Loopctl.Coordination do
       |> AdminRepo.insert()
       |> tap_secret_blocked()
     end
+  end
+
+  @doc """
+  Writes a coordination post on behalf of a **verified agent identity**, with
+  ownership enforcement, audit, and per-session upsert — the HTTP write path
+  (US-39.2). This is the richer sibling of `create_post/4`: it runs the insert
+  (or keyed upsert) and the audit-log write in a single `AdminRepo.transaction`
+  so authorship is tamper-evident, and it distinguishes a freshly-created post
+  from an in-place slot update so the endpoint can answer 201 vs 200.
+
+  `tenant_id` and `agent_id` are server-stamped by the caller (from the verified
+  key identity — never the request body). `attrs` carries the caller-supplied
+  fields plus two context keys the changeset never casts:
+
+    * `:project_id` — the channel; ownership is checked via
+      `Projects.get_project/2`. A missing OR cross-tenant project returns the
+      SAME `{:error, :not_found}` (no existence oracle — the endpoint maps both
+      to one byte-identical 422).
+    * `:audit` — the actor context keyword list (from
+      `LoopctlWeb.AuditContext.from_conn/1`) written into the audit entry.
+
+  `expires_at` is fixed server-side at `now + #{@retention_days} days`.
+
+  ## Upsert semantics
+
+  With a `key` present the write UPSERTS on the LIVE partial unique index
+  `(tenant_id, project_id, agent_id, session_id, key) WHERE key IS NOT NULL` —
+  `agent_id` participates (it is server-stamped and constant per session, so
+  this changes nothing observable versus the doc's stale
+  `(tenant, project, session, key)` target, but it MUST match the live index or
+  the insert raises). A repeat write from the SAME session refreshes its own
+  slot (`body`/`refs`/`updated_at`/`expires_at`); a different session's same key
+  is a distinct row. Without a `key` every post is a new append-only row.
+
+  ## Returns
+
+    * `{:ok, %ChannelPost{}, :created}` — a new row was inserted (HTTP 201)
+    * `{:ok, %ChannelPost{}, :updated}` — an existing session slot was upserted
+      in place (HTTP 200)
+    * `{:error, :not_found}` — the project is missing or belongs to another
+      tenant (endpoint → shared 422)
+    * `{:error, :agent_not_found}` — the server-stamped `agent_id` does not belong
+      to `tenant_id` (a misconfigured key; endpoint → 403, attributed as an
+      identity fault, NOT a cross-tenant project probe)
+    * `{:error, %Ecto.Changeset{}}` — a size/shape bound, denylist hit, or NUL
+      byte was rejected; nothing was persisted (endpoint → 422)
+  """
+  @spec post(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+          {:ok, ChannelPost.t(), :created | :updated}
+          | {:error, :not_found}
+          | {:error, :agent_not_found}
+          | {:error, Ecto.Changeset.t()}
+  def post(tenant_id, agent_id, attrs) do
+    project_id = Map.get(attrs, :project_id)
+    audit = Map.get(attrs, :audit, [])
+
+    # Ownership is enforced for BOTH the project and the agent, each mapped to a
+    # DISTINCT error so the endpoint attributes the failure correctly — a missing/
+    # cross-tenant project is `:not_found` (→ 422 `:ownership_rejected`), a
+    # foreign-tenant agent is `:agent_not_found` (→ 403 `:agent_identity_required`).
+    # Folding both into one `{:error, :not_found}` would blame `project_id` (and
+    # misfire the project security signal) for an identity fault. `agent_id` is
+    # server-stamped from the ALREADY-verified key identity and tenant-paired at key
+    # creation, so the agent check is defense-in-depth — BUT that pairing is not
+    # enforced by any DB constraint (the `agents`/`api_keys`/`channel_posts` agent
+    # FKs are all non-composite on `id` alone), so a misconfigured key carrying a
+    # foreign-tenant `agent_id` would otherwise persist a post mis-attributed to
+    # that foreign agent. Restoring the guard (mirroring sibling `create_post/4`)
+    # closes that regression; the NOT NULL FK to `agents` remains the backstop for
+    # the "agent row deleted while its api_key persists" race.
+    with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
+         {:ok, _agent} <- agent_owned(tenant_id, agent_id) do
+      changeset =
+        %ChannelPost{
+          tenant_id: tenant_id,
+          project_id: project_id,
+          agent_id: agent_id,
+          expires_at: default_expires_at()
+        }
+        |> ChannelPost.create_changeset(attrs)
+
+      run_post(tenant_id, changeset, audit)
+    end
+  end
+
+  # Assert the server-stamped agent belongs to the tenant, mapped to a DISTINCT
+  # error from the project guard so the endpoint separates an identity fault (403)
+  # from a cross-tenant project probe (422).
+  defp agent_owned(tenant_id, agent_id) do
+    case Agents.get_agent(tenant_id, agent_id) do
+      {:ok, agent} -> {:ok, agent}
+      {:error, :not_found} -> {:error, :agent_not_found}
+    end
+  end
+
+  # Insert (or keyed upsert) + audit in one transaction. The created-vs-updated
+  # outcome is derived from the PERSISTED row returned by the write itself — never
+  # from a pre-transaction existence probe. A pre-read was a TOCTOU race: two
+  # concurrent same-session writes could both read `exists? == false` and both
+  # report 201 (even though the partial unique index turns one into a DO UPDATE),
+  # and a US-39.5 TTL sweep deleting the slot between the read and the insert
+  # produced the inverse mislabel — mis-stamping both the 201/200 status and the
+  # audit action. Instead: on a fresh INSERT Ecto stamps `inserted_at` and
+  # `updated_at` to the SAME instant; the ON CONFLICT DO UPDATE refreshes
+  # `updated_at` (a new now) but never `inserted_at` (kept from the original
+  # insert). So on the keyed path (`returning: true` reads the real persisted row)
+  # equal timestamps ⇒ created and divergent ⇒ in-place update. This reflects the
+  # actual write outcome atomically, so the label is correct even under a concurrent
+  # same-session race or a sweep deleting the slot mid-flight.
+  defp run_post(tenant_id, changeset, audit) do
+    key = Ecto.Changeset.get_field(changeset, :key)
+    insert_opts = insert_opts(key)
+
+    multi =
+      Multi.new()
+      |> Multi.insert(:post, changeset, insert_opts)
+      |> Audit.log_in_multi(:audit, fn %{post: post} ->
+        audit_attrs(tenant_id, post, post_outcome(post), audit)
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{post: post}} ->
+        {:ok, post, post_outcome(post)}
+
+      {:error, :post, %Ecto.Changeset{} = changeset, _changes} ->
+        tap_secret_blocked({:error, changeset})
+
+      # Any OTHER failed step (today only `:audit`, whose only failure mode is a
+      # changeset) is normalised to the SAME documented `{:error, %Ecto.Changeset{}}`
+      # shape — `run_post/3` never leaks an off-spec `{:error, reason}` to the
+      # controller, so no controller catch-all (which dialyzer would reject as dead
+      # code) is needed. If `Audit.log_in_multi/3` is ever changed to fail with a
+      # non-changeset error, this clause stops covering it and dialyzer fails the
+      # build here (a compile-gate guard, stronger than a runtime 500 fallback).
+      {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
+        {:error, changeset}
+    end
+  end
+
+  # Keyless posts are always a new append-only row. A keyed post UPSERTS on the
+  # LIVE PARTIAL unique index (`... WHERE key IS NOT NULL`, index
+  # `channel_posts_session_key_uidx`). Postgres cannot INFER a partial index from a
+  # bare column list — the ON CONFLICT must carry the matching predicate — so the
+  # conflict_target is an unsafe_fragment mirroring the index columns AND its WHERE
+  # clause (same pattern as memory.ex:2510). `agent_id` participates so a spoofed
+  # session_id can never overwrite another agent's slot. `returning: true` is
+  # REQUIRED on the upsert path: on a DO UPDATE Ecto otherwise leaves the returned
+  # struct's autogenerated `id` and timestamps at the phantom values it generated
+  # for the INSERT ATTEMPT (the existing row kept its own). Reading the row back
+  # makes the returned struct — the response JSON, the audit entity_id, AND the
+  # `post_outcome/1` timestamp comparison — reflect the real persisted row.
+  defp insert_opts(nil), do: []
+
+  defp insert_opts(_key) do
+    [
+      on_conflict: {:replace, [:body, :refs, :updated_at, :expires_at]},
+      conflict_target:
+        {:unsafe_fragment,
+         "(tenant_id, project_id, agent_id, session_id, key) WHERE key IS NOT NULL"},
+      returning: true
+    ]
+  end
+
+  # Created vs in-place update, read from the PERSISTED row (see run_post/3). A
+  # fresh insert stamps both timestamps to the same instant; a keyed upsert's DO
+  # UPDATE refreshes `updated_at` while preserving the original `inserted_at`, so
+  # equal ⇒ created, divergent ⇒ updated.
+  defp post_outcome(%ChannelPost{inserted_at: ts, updated_at: ts}), do: :created
+  defp post_outcome(%ChannelPost{}), do: :updated
+
+  defp audit_attrs(tenant_id, post, outcome, audit) do
+    %{
+      tenant_id: tenant_id,
+      project_id: post.project_id,
+      entity_type: "channel_post",
+      entity_id: post.id,
+      action: if(outcome == :created, do: "posted", else: "upserted"),
+      actor_type: Keyword.get(audit, :actor_type, "api_key"),
+      actor_id: Keyword.get(audit, :actor_id),
+      actor_label: Keyword.get(audit, :actor_label),
+      metadata: Keyword.get(audit, :metadata, %{})
+    }
   end
 
   # Fire the "credential blocked" security signal once, at the point a write is

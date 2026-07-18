@@ -1,6 +1,10 @@
 defmodule Loopctl.CoordinationTest do
   use Loopctl.DataCase, async: true
 
+  import Ecto.Query
+
+  alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Repo
@@ -230,5 +234,215 @@ defmodule Loopctl.CoordinationTest do
       posts = Coordination.recent(tenant.id, project.id)
       assert length(posts) == 2
     end
+  end
+
+  describe "post/3" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      audit = [
+        actor_type: "api_key",
+        actor_id: Ecto.UUID.generate(),
+        actor_label: "agent:worker-1"
+      ]
+
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit}
+    end
+
+    test "a keyless post is created (201) and writes a 'posted' audit row", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      assert {:ok, post, :created} =
+               Coordination.post(tenant.id, agent_id, %{
+                 project_id: project.id,
+                 body: "pushed PR #107",
+                 audit: audit
+               })
+
+      assert post.tenant_id == tenant.id
+      assert post.agent_id == agent_id
+
+      expected = DateTime.add(DateTime.utc_now(), Coordination.retention_days() * 86_400, :second)
+      assert_in_delta DateTime.to_unix(post.expires_at), DateTime.to_unix(expected), 120
+
+      entry = one_audit_entry(tenant.id, post.id)
+      assert entry.action == "posted"
+      assert entry.entity_type == "channel_post"
+      assert entry.actor_label == "agent:worker-1"
+    end
+
+    test "a repeat keyed post from the same session upserts (200), same id, 'upserted' audit",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      base = %{project_id: project.id, session_id: "S1", key: "session_goal", audit: audit}
+
+      assert {:ok, first, :created} =
+               Coordination.post(tenant.id, agent_id, Map.put(base, :body, "v1"))
+
+      assert {:ok, second, :updated} =
+               Coordination.post(tenant.id, agent_id, Map.put(base, :body, "v2"))
+
+      assert second.id == first.id
+      assert second.body == "v2"
+
+      # exactly one row for the slot
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 1
+
+      # Append-only audit chain: the same slot id now carries "posted" (create)
+      # then "upserted" (the in-place refresh).
+      assert audit_actions(tenant.id, second.id) == ["posted", "upserted"]
+    end
+
+    test "a different session's same key is a distinct row (no cross-session clobber)", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      assert {:ok, s1, :created} =
+               Coordination.post(tenant.id, agent_id, %{
+                 project_id: project.id,
+                 session_id: "S1",
+                 key: "session_goal",
+                 body: "v1",
+                 audit: audit
+               })
+
+      assert {:ok, s2, :created} =
+               Coordination.post(tenant.id, agent_id, %{
+                 project_id: project.id,
+                 session_id: "S2",
+                 key: "session_goal",
+                 body: "other",
+                 audit: audit
+               })
+
+      assert s1.id != s2.id
+    end
+
+    test "a missing project returns {:error, :not_found} and writes nothing", ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+
+      assert {:error, :not_found} =
+               Coordination.post(tenant.id, agent_id, %{
+                 project_id: Ecto.UUID.generate(),
+                 body: "x",
+                 audit: audit
+               })
+
+      assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
+    end
+
+    test "a cross-tenant project returns {:error, :not_found} (same as missing)", ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+      other = fixture(:tenant)
+      foreign = fixture(:project, %{tenant_id: other.id})
+
+      assert {:error, :not_found} =
+               Coordination.post(tenant.id, agent_id, %{
+                 project_id: foreign.id,
+                 body: "x",
+                 audit: audit
+               })
+    end
+
+    test "a foreign-tenant agent_id returns {:error, :agent_not_found}, distinct from the project error",
+         ctx do
+      %{tenant: tenant, project: project, audit: audit} = ctx
+      other = fixture(:tenant)
+      foreign_agent = fixture(:agent, %{tenant_id: other.id}).id
+
+      # A valid project but an agent that belongs to another tenant: the ownership
+      # guard is restored (defense-in-depth — the agent FKs are non-composite) and
+      # maps to a DISTINCT error so the endpoint attributes an identity fault, not a
+      # cross-tenant project probe.
+      assert {:error, :agent_not_found} =
+               Coordination.post(tenant.id, foreign_agent, %{
+                 project_id: project.id,
+                 body: "x",
+                 audit: audit
+               })
+
+      assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
+
+      assert AdminRepo.aggregate(
+               from(a in AuditLog, where: a.entity_type == "channel_post"),
+               :count,
+               :id
+             ) == 0
+    end
+
+    test "the created/updated outcome is derived from the persisted row, not a pre-transaction probe",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      # Pre-seed the keyed slot directly, then post/3 the SAME slot: the outcome
+      # must reflect the row that actually persists (an in-place update via
+      # ON CONFLICT), read from the returned row's timestamps rather than a
+      # pre-transaction existence check that a concurrent write or TTL sweep could
+      # invalidate between the read and the insert.
+      assert {:ok, seed} =
+               Coordination.create_post(tenant.id, project.id, agent_id, %{
+                 "body" => "seed",
+                 "session_id" => "S1",
+                 "key" => "session_goal"
+               })
+
+      assert {:ok, post, :updated} =
+               Coordination.post(tenant.id, agent_id, %{
+                 project_id: project.id,
+                 session_id: "S1",
+                 key: "session_goal",
+                 body: "v2",
+                 audit: audit
+               })
+
+      assert post.id == seed.id
+      assert post.body == "v2"
+      assert audit_actions(tenant.id, post.id) == ["upserted"]
+    end
+
+    test "a missing body returns {:error, changeset} and writes no post or audit row", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Coordination.post(tenant.id, agent_id, %{
+                 project_id: project.id,
+                 audit: audit
+               })
+
+      refute changeset.valid?
+      assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
+
+      assert AdminRepo.aggregate(
+               from(a in AuditLog, where: a.entity_type == "channel_post"),
+               :count,
+               :id
+             ) == 0
+    end
+  end
+
+  defp one_audit_entry(tenant_id, entity_id) do
+    AdminRepo.one!(
+      from(a in AuditLog,
+        where: a.tenant_id == ^tenant_id and a.entity_type == "channel_post",
+        where: a.entity_id == ^entity_id
+      )
+    )
+  end
+
+  defp audit_actions(tenant_id, entity_id) do
+    AdminRepo.all(
+      from(a in AuditLog,
+        where: a.tenant_id == ^tenant_id and a.entity_type == "channel_post",
+        where: a.entity_id == ^entity_id,
+        order_by: [asc: a.inserted_at],
+        select: a.action
+      )
+    )
   end
 end

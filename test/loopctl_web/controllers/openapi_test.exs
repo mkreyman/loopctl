@@ -109,6 +109,21 @@ defmodule LoopctlWeb.OpenApiTest do
       assert Map.has_key?(schemas, "RetrieveToolsResponse")
       assert Map.has_key?(schemas, "RetrieveResponse")
     end
+
+    # US-39.2 (AC-39.2.1) — the Coordination Bus write endpoint (Epic 39) must
+    # render in the OpenAPI spec (declared via `operation(...)` in
+    # ChannelPostController) so it shows up at /swaggerui.
+    test "includes the Coordination Bus (Epic 39) write endpoint", %{conn: conn} do
+      body = conn |> get("/api/v1/openapi") |> json_response(200)
+      paths = body["paths"]
+
+      assert Map.has_key?(paths, "/api/v1/channel/posts")
+      assert Map.has_key?(paths["/api/v1/channel/posts"], "post")
+
+      schemas = body["components"]["schemas"]
+      assert Map.has_key?(schemas, "ChannelPostRequest")
+      assert Map.has_key?(schemas, "ChannelPostResponse")
+    end
   end
 
   describe "GET /swaggerui" do

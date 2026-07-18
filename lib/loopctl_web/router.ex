@@ -123,6 +123,13 @@ defmodule LoopctlWeb.Router do
 
     get "/routes", RouteDiscoveryController, :index
 
+    # Repo Coordination Bus (Epic 39) — the third memory plane. Agent-role write
+    # to a project's transient coordination channel. NOT human-anchor gated
+    # (coordination surface, owner decision #331). Per-key/per-tenant rate
+    # limiting comes from the :authenticated pipeline RateLimiter; the controller
+    # adds a tighter, config-driven per-write cap.
+    post "/channel/posts", ChannelPostController, :create
+
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
 
