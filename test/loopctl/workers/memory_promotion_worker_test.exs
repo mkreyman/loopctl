@@ -54,14 +54,26 @@ defmodule Loopctl.Workers.MemoryPromotionWorkerTest do
 
   # A 1536-dim unit vector keyed on `seed` — distinct seeds are orthogonal (cosine
   # score 0, not near-dup), identical seeds are identical (score 1.0, near-dup).
+  # A 16-hot 1536-dim vector keyed on the full seed term. Two seeds collide only if
+  # all sixteen independent hashes collide (negligible), so distinct seeds are
+  # near-orthogonal and equal seeds are identical (distance 0) — exactly what the
+  # near-dup assertions need.
   defp unit_vec(seed) do
-    idx = rem(:erlang.phash2(seed), 1536)
-    Enum.map(0..1535, fn i -> if i == idx, do: 1.0, else: 0.0 end)
+    hot = for salt <- 0..15, into: MapSet.new(), do: rem(:erlang.phash2({seed, salt}), 1536)
+    Enum.map(0..1535, fn i -> if MapSet.member?(hot, i), do: 1.0, else: 0.0 end)
   end
 
+  # Fold `tenant_id` into the embedding seed so THIS test's vectors live in their
+  # own well-separated region of the globally-shared pgvector HNSW index. Without
+  # this the text-only seed puts every tenant's "shared" near-dup at the SAME
+  # index point, where other tenants' concurrent rows crowd it and the ef_search
+  # graph walk non-deterministically misses the exact match under full-suite load
+  # (issue #421). Per-tenant seeding preserves the WITHIN-test geometry (equal
+  # text_to_seed → identical vector → near-dup; distinct → near-orthogonal) while
+  # isolating it across tenants, so near-dup recall is deterministic.
   defp stub_embeddings(text_to_seed) do
-    stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
-      {:ok, unit_vec(text_to_seed.(text))}
+    stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn tenant_id, text ->
+      {:ok, unit_vec({tenant_id, text_to_seed.(text)})}
     end)
   end
 

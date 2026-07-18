@@ -356,9 +356,28 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
       assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
 
+      # The pair is promoted exactly ONCE no matter how many times the worker runs
+      # (guarded by promote_conflicts/1's `not exists` check AND the article_links
+      # unique index — a same-direction re-insert can never mint a second row).
       assert [_only_one] = conflict_links(tenant.id, a.id, b.id)
-      assert [_, second] = lint_audit_entries(tenant.id) |> Enum.sort_by(& &1.inserted_at)
-      assert second.new_state["conflicts_promoted"] == 0
+
+      # Idempotency is ORDER-INDEPENDENT: across the two runs exactly one promotion
+      # happened (the first); the other run promoted nothing new. Assert the MULTISET of
+      # per-run promotion counts, not positional order. `lint_audit_entries/1` is
+      # unordered and audit `inserted_at` is NOT a total order across two same-tenant
+      # runs — the audit_log column carries a DB-side `now()` (transaction-timestamp)
+      # default, so two entries written in this test's single sandbox transaction can
+      # share an `inserted_at` to the microsecond. Sorting on that key alone then leaves
+      # the "second" slot at the mercy of arbitrary heap return order and can surface the
+      # first run's entry (conflicts_promoted == 1) — the intermittent failure. (The
+      # production audit-history reader guards the same collision with a mandatory
+      # (inserted_at, id) tiebreak.)
+      promotions =
+        lint_audit_entries(tenant.id)
+        |> Enum.map(& &1.new_state["conflicts_promoted"])
+        |> Enum.sort()
+
+      assert promotions == [0, 1]
     end
   end
 
