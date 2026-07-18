@@ -2262,7 +2262,7 @@ const TOOLS = [
         key: {
           type: "string",
           description:
-            "Optional per-session working-state slot key. When given, upserts the caller's slot for that key instead of appending a new post.",
+            "Optional per-session working-state slot key. When given, upserts the caller's slot for that key instead of appending a new post. Requires an active Claude Code session: the upsert is keyed on the auto-filled session_id (from CLAUDE_SESSION_ID), so a keyed post made outside a Claude Code session — where that env var is absent — is rejected with a 422 (session_id can't be blank). Omit key to append a plain post, which needs no session.",
         },
         refs: {
           type: "object",

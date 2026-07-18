@@ -182,6 +182,17 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
     );
   });
 
+  test("the channel_post `key` property documents its active-session dependency", () => {
+    // A keyed upsert is keyed on the auto-filled session_id (from CLAUDE_SESSION_ID),
+    // which the server makes REQUIRED for keyed posts. Outside a Claude Code session
+    // that env var is absent and the post 422s — the description must warn about it.
+    assert.match(
+      INDEX_SRC,
+      /Optional per-session working-state slot key[\s\S]*?Requires an active Claude Code session[\s\S]*?422/,
+      "the channel_post `key` description must document that keyed posts require an active session (422 otherwise)",
+    );
+  });
+
   test("the channel_post dispatch case calls channelPost(args)", () => {
     assert.match(
       INDEX_SRC,
