@@ -73,6 +73,19 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
       assert AdminRepo.aggregate(expired_query(), :count) == 0
     end
 
+    # TC-39.5.5 — an operator-supplied "limit" over Postgres's 65535 bind-parameter
+    # cap must NOT crash the job. The selected ids are passed as an explicit list to
+    # `where(p.id in ^batch_ids)` (one bind param each), so batch_limit/1 clamps the
+    # arg to @batch_size. Passing a value well above the cap still sweeps normally.
+    test "clamps an oversized limit arg so it never exceeds the bind-parameter cap" do
+      %{tenant: tenant, project: project, agent: agent} = setup_context()
+
+      for _ <- 1..3, do: insert_post(tenant, project, agent, -60)
+
+      assert :ok = ChannelPostSweeper.perform(%Oban.Job{args: %{"limit" => 70_000}})
+      assert AdminRepo.aggregate(expired_query(), :count) == 0
+    end
+
     # TC-39.5.4 — AC-39.5.3: the BYPASSRLS sweep is cross-tenant. The predicate
     # (`expires_at < now()`) carries no tenant column, so a SINGLE perform/1 run
     # must delete an expired row under tenant A while leaving a live row under a

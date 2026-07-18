@@ -79,6 +79,13 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
 
   # The bound is data injected via job args (not app env), so a test — or an
   # operator via a one-off job — can tune the per-run cap without config changes.
-  defp batch_limit(%{"limit" => limit}) when is_integer(limit) and limit > 0, do: limit
+  # Clamped to @batch_size: the selected ids are passed as an explicit list to
+  # `where(p.id in ^batch_ids)`, one bind parameter each, so an unbounded limit
+  # >= 65536 would exceed Postgres's 65535-parameter cap and crash every retry.
+  # Capping at @batch_size keeps the id-list well under the limit while still
+  # letting an operator shrink the per-run cap.
+  defp batch_limit(%{"limit" => limit}) when is_integer(limit) and limit > 0,
+    do: min(limit, @batch_size)
+
   defp batch_limit(_args), do: @batch_size
 end

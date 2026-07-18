@@ -38,7 +38,7 @@ defmodule Loopctl.Repo.Migrations.CreateChannelPosts do
              name: :channel_posts_recent_idx
            )
 
-    # TTL sweep path (US-39.5): delete WHERE expires_at <= now().
+    # TTL sweep path (US-39.5): delete WHERE expires_at < now().
     create index(:channel_posts, [:expires_at])
 
     # Per-SESSION keyed upsert slot: two concurrent sessions writing key "session_goal"
