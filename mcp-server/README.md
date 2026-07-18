@@ -121,7 +121,7 @@ REST endpoint (`PATCH /api/v1/tenants/me/llm-config`), and the docs — so you (
 autonomous agent) can self-remediate without a human. Full agent-tenant lifecycle:
 [`docs/onboarding-agent-tenant.md`](../docs/onboarding-agent-tenant.md).
 
-## Tools (89)
+## Tools (95)
 
 > Plus **per-tenant generated Context Retriever tools** (`cr_*`) appended
 > dynamically at runtime — see [Dynamic per-tenant Context Retriever
@@ -138,6 +138,25 @@ autonomous agent) can self-remediate without a human. Full agent-tenant lifecycl
 | `delete_project` | **Requires `LOOPCTL_USER_KEY`.** Delete a project and all of its dependent resources (epics, stories, audit entries). Irreversible — orchestrator role is not sufficient. |
 | `get_progress` | Get progress summary for a project, including story counts by status. Pass `include_cost=true` for cost data. |
 | `import_stories` | Import stories into a project from a structured payload (Epic 12 import format). Pass `merge: true` to add stories to epics that already exist (otherwise duplicates return 409). For large payloads, use `payload_path` to read JSON from disk instead of passing it inline. |
+
+### KB Scope Tools (agent key)
+
+Knowledge-only project scopes (`kind: kb`) partition knowledge articles by repo. Unlike `create_project` (work project, orchestrator+ / human-anchored), these are available to an agent-rooted (KB-tier) tenant on an agent key and carry NO chain-of-custody / work-breakdown surface.
+
+| Tool | Description |
+|---|---|
+| `create_kb_scope` | Create a knowledge-only project scope (`kind: kb`) for the current tenant. A kb scope cannot host epics/stories/dispatch/ui-tests — it exists only to partition knowledge articles by repo. Resolve it via `resolve_project` and pass the returned id as `project_id` on article/knowledge writes. Counts toward the tenant's `max_projects` budget. |
+| `archive_kb_scope` | Archive (reversible soft-delete) a kb scope you own. Frees the scope's slot in the tenant's `max_projects` budget; its articles remain readable/writable. Rejects a `kind: work` project (422). Idempotent on an already-archived scope. |
+| `restore_kb_scope` | Restore (re-activate) an archived kb scope you own — the reverse of `archive_kb_scope`. Consumes an active `max_projects` slot, so it is rejected (422) when the tenant is at its cap. Rejects a `kind: work` project (422). |
+
+### Repo Coordination Tools (agent key)
+
+Epic 39 Repo Coordination Bus — a lightweight, tenant-isolated channel for agents to share working state. A channel IS a `project_id` (a work project or a kb scope); posts are RLS-scoped to the caller's tenant, so this is an agent-role coordination surface, not a chain-of-custody gate.
+
+| Tool | Description |
+|---|---|
+| `channel_post` | Post a message to a repo coordination channel. Provide a `key` to upsert your per-session working-state slot (200) instead of appending a new post (201); omit it to append. `host` and `session_id` are proxy-supplied — do NOT pass them. Optional structured `refs` map (`file`, `pr`, `branch`, `commit`). Required: `project_id`, `body`. |
+| `channel_recent` | Read recent posts from a repo coordination channel — RLS returns only your own tenant's channel (oracle-safe read). Use `since` (a full ISO8601 instant) to page forward and `limit` to cap results (default 25, max 100). Required: `project_id`. |
 
 ### Story Tools
 
@@ -323,6 +342,10 @@ Key distribution for the dispatch pattern (Epic 26): per-dispatch ephemeral keys
 | `dispatch` | Mint an ephemeral, scoped api_key for a sub-agent dispatch, carrying its lineage path. The `raw_key` is returned ONCE — pass it to the sub-agent's launch args, never store it in env vars; it expires after `expires_in_seconds` (default 3600, max 14400). Required: `role` (`agent`/`orchestrator`), `agent_id`. Optional: `parent_dispatch_id`, `story_id`. |
 | `recover_cap` | Re-mint a capability token for a story you're assigned to, after a session crash lost your cap. Required: `story_id`. Optional: `cap_type` (`start_cap`/`report_cap`, default `start_cap`), `lineage`. |
 | `get_sth` | Get the latest Signed Tree Head for a tenant's tamper-evident audit chain. Public — no auth required. Required: `tenant_id`. |
+| `request_authenticator_challenge` | **US-26.7.2.** Step 1 of the opt-in WebAuthn trust-tier upgrade ceremony: issues a registration challenge for enrolling a hardware authenticator against an EXISTING agent-rooted (KB-tier) tenant, promoting it to `human_anchored` on success. Requires an interactive WebAuthn client. |
+| `enroll_authenticator` | Step 2 of the WebAuthn trust-tier upgrade ceremony: completes enrollment with the attestation produced by `navigator.credentials.create()` against the challenge from `request_authenticator_challenge`. On a tenant's first enrollment the tenant is promoted to `human_anchored`. |
+| `request_authenticator_revoke_challenge` | Issues a fresh-assertion challenge to authorize revoking one of a tenant's enrolled WebAuthn authenticators. Requires an interactive WebAuthn client + human touch to produce the assertion `revoke_authenticator` needs. |
+| `revoke_authenticator` | Revokes an enrolled authenticator using the assertion from `request_authenticator_revoke_challenge` (`navigator.credentials.get()` against an existing authenticator — human touch required). Refuses (409 `last_authenticator`) when it would leave a human-anchored tenant with no authenticators. |
 
 ## Wiki Attribution
 
