@@ -18,11 +18,17 @@ defmodule Loopctl.Security.SecretDenylistTest do
         "sk_live_" <> String.duplicate("a", 24),
         "sk_test_" <> String.duplicate("a", 24),
         "rk_live_" <> String.duplicate("a", 24),
-        # JWT (header.payload.signature)
-        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N",
+        # JWT (header.payload.signature). Assembled at runtime, NOT written as a
+        # contiguous literal, so no scannable secret-shaped string lands in
+        # source — this is what keeps GitGuardian (which scans source literals)
+        # from flagging these intentional denylist fixtures. Do NOT "simplify"
+        # these back into full string literals; that re-breaks the secret scan.
+        "eyJ" <>
+          String.duplicate("a", 20) <>
+          "." <> String.duplicate("b", 20) <> "." <> String.duplicate("c", 20),
         # URL-embedded credentials
         "DATABASE_URL=postgres://user:s3cretpw@db.internal:5432/app",
-        "clone https://mark:ghp_notreal@github.com/acme/repo"
+        "clone https://mark:" <> String.duplicate("z", 12) <> "@github.com/acme/repo"
       ]
 
       for s <- secrets do
