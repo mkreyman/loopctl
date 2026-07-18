@@ -187,6 +187,14 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:delete, "/api/v1/webhooks/:id"},
                {:post, "/api/v1/webhooks/:id/test"},
 
+               # Repo Coordination Bus (Epic 39, US-39.2) — the channel write is a
+               # COORDINATION surface, NOT chain-of-custody: posting to your own
+               # tenant's channel is the same content class the KB surface (owner
+               # decision #331) is fully agent-usable for. Agent-role, authorship
+               # server-stamped from the verified key, tenant-scoped — so it is
+               # deliberately OUTSIDE the human-anchor tier gate (design brief §4).
+               {:post, "/api/v1/channel/posts"},
+
                # Superadmin-only admin scope — RequireRole already pins these
                # to superadmin; Impersonate explicitly skips
                # /api/v1/admin/*, so current_tenant is always nil

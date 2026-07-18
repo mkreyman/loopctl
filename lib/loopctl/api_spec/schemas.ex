@@ -893,6 +893,85 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  # ---------- Coordination Bus (Epic 39) ----------
+
+  defmodule ChannelPostRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ChannelPostRequest",
+      description:
+        "Request body for posting to a repo coordination channel. agent_id and tenant_id are " <>
+          "stamped server-side from the verified key and are ignored if present in the body.",
+      type: :object,
+      required: [:project_id, :body],
+      properties: %{
+        project_id: %Schema{
+          type: :string,
+          format: :uuid,
+          description: "The channel — a project the caller's tenant owns"
+        },
+        body: %Schema{type: :string, description: "Free-text message (<= 16KB)"},
+        key: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "Optional working-state slot key; a repeat post from the same session upserts it"
+        },
+        session_id: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Client-supplied session id (required when key is set)"
+        },
+        host: %Schema{type: :string, nullable: true, description: "Client-supplied hostname"},
+        refs: %Schema{
+          type: :object,
+          nullable: true,
+          description: "Optional structured refs; allowed keys: file, pr, branch, commit",
+          additionalProperties: %Schema{type: :string}
+        }
+      },
+      example: %{
+        project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        body: "pushed PR #107, CI green",
+        key: "session_goal",
+        session_id: "S1",
+        refs: %{pr: "107", branch: "feature/us-39-2"}
+      }
+    })
+  end
+
+  defmodule ChannelPostResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ChannelPostResponse",
+      description: "A coordination channel post",
+      type: :object,
+      properties: %{
+        post: %Schema{
+          type: :object,
+          properties: %{
+            id: %Schema{type: :string, format: :uuid},
+            tenant_id: %Schema{type: :string, format: :uuid},
+            project_id: %Schema{type: :string, format: :uuid},
+            agent_id: %Schema{type: :string, format: :uuid},
+            session_id: %Schema{type: :string, nullable: true},
+            host: %Schema{type: :string, nullable: true},
+            key: %Schema{type: :string, nullable: true},
+            body: %Schema{type: :string},
+            refs: %Schema{type: :object, nullable: true, additionalProperties: true},
+            expires_at: %Schema{type: :string, format: :"date-time"},
+            inserted_at: %Schema{type: :string, format: :"date-time"},
+            updated_at: %Schema{type: :string, format: :"date-time"}
+          }
+        }
+      }
+    })
+  end
+
   # ---------- Epics ----------
 
   defmodule EpicResponse do

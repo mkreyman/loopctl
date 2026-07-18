@@ -22,8 +22,10 @@ defmodule Loopctl.Coordination do
 
   import Ecto.Query
 
+  alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Agents
+  alias Loopctl.Audit
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Projects
 
@@ -75,6 +77,158 @@ defmodule Loopctl.Coordination do
       |> AdminRepo.insert()
       |> tap_secret_blocked()
     end
+  end
+
+  @doc """
+  Writes a coordination post on behalf of a **verified agent identity**, with
+  ownership enforcement, audit, and per-session upsert — the HTTP write path
+  (US-39.2). This is the richer sibling of `create_post/4`: it runs the insert
+  (or keyed upsert) and the audit-log write in a single `AdminRepo.transaction`
+  so authorship is tamper-evident, and it distinguishes a freshly-created post
+  from an in-place slot update so the endpoint can answer 201 vs 200.
+
+  `tenant_id` and `agent_id` are server-stamped by the caller (from the verified
+  key identity — never the request body). `attrs` carries the caller-supplied
+  fields plus two context keys the changeset never casts:
+
+    * `:project_id` — the channel; ownership is checked via
+      `Projects.get_project/2`. A missing OR cross-tenant project returns the
+      SAME `{:error, :not_found}` (no existence oracle — the endpoint maps both
+      to one byte-identical 422).
+    * `:audit` — the actor context keyword list (from
+      `LoopctlWeb.AuditContext.from_conn/1`) written into the audit entry.
+
+  `expires_at` is fixed server-side at `now + #{@retention_days} days`.
+
+  ## Upsert semantics
+
+  With a `key` present the write UPSERTS on the LIVE partial unique index
+  `(tenant_id, project_id, agent_id, session_id, key) WHERE key IS NOT NULL` —
+  `agent_id` participates (it is server-stamped and constant per session, so
+  this changes nothing observable versus the doc's stale
+  `(tenant, project, session, key)` target, but it MUST match the live index or
+  the insert raises). A repeat write from the SAME session refreshes its own
+  slot (`body`/`refs`/`updated_at`/`expires_at`); a different session's same key
+  is a distinct row. Without a `key` every post is a new append-only row.
+
+  ## Returns
+
+    * `{:ok, %ChannelPost{}, :created}` — a new row was inserted (HTTP 201)
+    * `{:ok, %ChannelPost{}, :updated}` — an existing session slot was upserted
+      in place (HTTP 200)
+    * `{:error, :not_found}` — the project is missing or belongs to another
+      tenant (endpoint → shared 422)
+    * `{:error, %Ecto.Changeset{}}` — a size/shape bound, denylist hit, or NUL
+      byte was rejected; nothing was persisted (endpoint → 422)
+  """
+  @spec post(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+          {:ok, ChannelPost.t(), :created | :updated}
+          | {:error, :not_found}
+          | {:error, Ecto.Changeset.t()}
+  def post(tenant_id, agent_id, attrs) do
+    project_id = Map.get(attrs, :project_id)
+    audit = Map.get(attrs, :audit, [])
+
+    with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
+         {:ok, _agent} <- Agents.get_agent(tenant_id, agent_id) do
+      changeset =
+        %ChannelPost{
+          tenant_id: tenant_id,
+          project_id: project_id,
+          agent_id: agent_id,
+          expires_at: default_expires_at()
+        }
+        |> ChannelPost.create_changeset(attrs)
+
+      run_post(tenant_id, changeset, audit)
+    end
+  end
+
+  # Insert (or keyed upsert) + audit in one transaction. The created/updated
+  # outcome is resolved from a pre-existence check on the slot rather than the
+  # returned row's timestamps: with `on_conflict: {:replace, ...}` Ecto does NOT
+  # read `inserted_at` back, so `inserted_at == updated_at` cannot distinguish an
+  # insert from an update. The slot is keyed on `agent_id + session_id`, and a
+  # single session is single-threaded, so the check is race-free in practice
+  # (a different session targets a different slot).
+  defp run_post(tenant_id, changeset, audit) do
+    key = Ecto.Changeset.get_field(changeset, :key)
+
+    {insert_opts, outcome} =
+      if is_nil(key) do
+        {[], :created}
+      else
+        # The LIVE arbiter is a PARTIAL unique index
+        # (`... WHERE key IS NOT NULL`, index `channel_posts_session_key_uidx`).
+        # Postgres cannot INFER a partial index from a bare column list — the
+        # ON CONFLICT must carry the matching predicate — so the conflict_target
+        # is an unsafe_fragment mirroring the index columns AND its WHERE clause
+        # (same pattern as memory.ex:2510). agent_id participates so a spoofed
+        # session_id can never overwrite another agent's slot.
+        {[
+           on_conflict: {:replace, [:body, :refs, :updated_at, :expires_at]},
+           conflict_target:
+             {:unsafe_fragment,
+              "(tenant_id, project_id, agent_id, session_id, key) WHERE key IS NOT NULL"},
+           # `returning: true` is REQUIRED on the upsert path: on a DO UPDATE,
+           # Ecto otherwise leaves the returned struct's autogenerated `id` (and
+           # timestamps) at the values it generated for the INSERT ATTEMPT — a
+           # phantom id that was never persisted (the existing row kept its own).
+           # Reading the row back makes the returned struct (and the response
+           # JSON / audit entity_id) reflect the real persisted row.
+           returning: true
+         ], slot_outcome(changeset)}
+      end
+
+    multi =
+      Multi.new()
+      |> Multi.insert(:post, changeset, insert_opts)
+      |> Audit.log_in_multi(:audit, fn %{post: post} ->
+        audit_attrs(tenant_id, post, outcome, audit)
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{post: post}} ->
+        {:ok, post, outcome}
+
+      {:error, :post, %Ecto.Changeset{} = changeset, _changes} ->
+        tap_secret_blocked({:error, changeset})
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
+    end
+  end
+
+  # Does the keyed working-state slot already exist? Determines 201 (created) vs
+  # 200 (upsert-updated). Matches the LIVE partial unique index columns exactly.
+  defp slot_outcome(changeset) do
+    tenant_id = Ecto.Changeset.get_field(changeset, :tenant_id)
+    project_id = Ecto.Changeset.get_field(changeset, :project_id)
+    agent_id = Ecto.Changeset.get_field(changeset, :agent_id)
+    session_id = Ecto.Changeset.get_field(changeset, :session_id)
+    key = Ecto.Changeset.get_field(changeset, :key)
+
+    exists? =
+      ChannelPost
+      |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
+      |> where([p], p.agent_id == ^agent_id and p.session_id == ^session_id and p.key == ^key)
+      |> AdminRepo.exists?()
+
+    if exists?, do: :updated, else: :created
+  end
+
+  defp audit_attrs(tenant_id, post, outcome, audit) do
+    %{
+      tenant_id: tenant_id,
+      project_id: post.project_id,
+      entity_type: "channel_post",
+      entity_id: post.id,
+      action: if(outcome == :created, do: "posted", else: "upserted"),
+      actor_type: Keyword.get(audit, :actor_type, "api_key"),
+      actor_id: Keyword.get(audit, :actor_id),
+      actor_label: Keyword.get(audit, :actor_label),
+      metadata: Keyword.get(audit, :metadata, %{})
+    }
   end
 
   # Fire the "credential blocked" security signal once, at the point a write is
