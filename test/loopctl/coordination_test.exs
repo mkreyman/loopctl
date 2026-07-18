@@ -39,6 +39,49 @@ defmodule Loopctl.CoordinationTest do
                })
     end
 
+    test "a mispaired agent (belongs to another tenant) returns {:error, :not_found}" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      project_a = fixture(:project, %{tenant_id: tenant_a.id})
+      agent_b = fixture(:agent, %{tenant_id: tenant_b.id}).id
+
+      assert {:error, :not_found} =
+               Coordination.create_post(tenant_a.id, project_a.id, agent_b, %{
+                 "body" => "cross-tenant agent attribution"
+               })
+    end
+
+    test "a blocked secret emits the security signal once, at rejection time" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      tenant_id = tenant.id
+      handler_id = "coord-secret-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :coordination, :secret_blocked],
+        fn _event, measurements, meta, _cfg ->
+          if meta[:tenant_id] == tenant_id,
+            do: send(test_pid, {:secret_blocked, measurements, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assert {:error, %Ecto.Changeset{}} =
+               Coordination.create_post(tenant.id, project.id, agent_id, %{
+                 "body" => "sk-" <> String.duplicate("a", 30)
+               })
+
+      assert_receive {:secret_blocked, %{count: 1}, %{field: :body}}
+      # Exactly one emission for the single rejected field — no double-count.
+      refute_receive {:secret_blocked, _, _}, 50
+    end
+
     test "a duplicate same-session keyed post returns {:error, changeset}, not a raise" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
@@ -106,6 +149,28 @@ defmodule Loopctl.CoordinationTest do
         Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "hi"})
 
       assert Coordination.recent(tenant.id, project.id, limit: 0) == []
+    end
+
+    test "limit: \"0\" (string, as a ?limit= query param would arrive) returns []" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      {:ok, _} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "hi"})
+
+      assert Coordination.recent(tenant.id, project.id, limit: "0") == []
+    end
+
+    test "a garbage (non-integer) limit string falls back to the default" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      {:ok, _} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "hi"})
+
+      assert [%ChannelPost{}] = Coordination.recent(tenant.id, project.id, limit: "abc")
     end
 
     test "a malformed (non-UUID) project_id yields [] rather than a CastError" do

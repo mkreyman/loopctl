@@ -137,6 +137,100 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       assert is_nil(Ecto.Changeset.get_field(cs, :key))
     end
 
+    test "rejects a whitespace-only body (must not land as an empty post)" do
+      for blank <- ["   ", "\n\t", " \n "] do
+        cs = ChannelPost.create_changeset(base_struct(), %{"body" => blank})
+        refute cs.valid?, "expected #{inspect(blank)} body to be rejected"
+        assert %{body: _} = errors_on(cs)
+      end
+    end
+
+    test "refs value cap is byte-based, not grapheme-based" do
+      # 200 four-byte chars = 800 bytes > 512, but only 200 graphemes — a
+      # grapheme-based cap would wrongly accept it.
+      val = String.duplicate("😀", 200)
+      assert byte_size(val) > 512
+      assert String.length(val) <= 512
+
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => %{"branch" => val}
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "an oversized, secret-shaped body is rejected on BOTH length and the secret scan" do
+      # body is both oversized AND secret-shaped. The scan is bounded (only the
+      # first @scan_byte_cap bytes are handed to the denylist — CPU-safe) but NOT
+      # suppressed by the length error: a credential in the leading bytes still
+      # records the secret error (and fires the secret_blocked signal).
+      big_secret = "sk-" <> String.duplicate("a", 20_000)
+      cs = ChannelPost.create_changeset(base_struct(), %{"body" => big_secret})
+      refute cs.valid?
+      assert Enum.any?(errors_on(cs).body, &(&1 =~ "secret"))
+      assert Enum.any?(errors_on(cs).body, &(&1 =~ "byte"))
+    end
+
+    test "a length error on one field does not suppress another field's secret scan" do
+      # Regression: an unrelated oversized field must NOT gate the secret scan of a
+      # different field. A credential in body is still detected even when host blows
+      # its byte cap — the write is rejected on both, and the secret error is present.
+      oversized_host = String.duplicate("h", 300)
+
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "here is my key sk-" <> String.duplicate("a", 30),
+          "host" => oversized_host
+        })
+
+      refute cs.valid?
+      assert Enum.any?(errors_on(cs).body, &(&1 =~ "secret"))
+      assert Enum.any?(errors_on(cs).host, &(&1 =~ "byte"))
+    end
+
+    test "an oversized refs value cannot bypass the secret scan cap" do
+      # refs values are also scanned over a bounded slice — an oversized refs value
+      # (rejected by validate_refs) does not amplify the denylist scan, and a
+      # credential in its leading bytes is still detected.
+      big_ref = "sk-" <> String.duplicate("a", 2_000)
+
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => %{"file" => big_ref}
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "building the changeset has no side effects (no telemetry on the pure path)" do
+      # Scope the handler to THIS test's tenant so a concurrent async test emitting
+      # the same event can never trip our refute_receive.
+      struct = base_struct()
+      tenant_id = struct.tenant_id
+      handler_id = "chanpost-pure-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :coordination, :secret_blocked],
+        fn _event, _measurements, meta, _cfg ->
+          if meta[:tenant_id] == tenant_id, do: send(test_pid, :secret_blocked_fired)
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      ChannelPost.create_changeset(struct, %{"body" => "sk-" <> String.duplicate("a", 30)})
+
+      refute_receive :secret_blocked_fired, 50
+    end
+
     test "rejects a NUL byte in the body (would 500 at insert otherwise)" do
       cs = ChannelPost.create_changeset(base_struct(), %{"body" => "before" <> <<0>> <> "after"})
       refute cs.valid?
