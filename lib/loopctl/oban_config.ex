@@ -436,6 +436,12 @@ defmodule Loopctl.ObanConfig do
          # :memory_graduation_max_per_run. Keep in sync with the crontab assertion in
          # oban_plugins_config_test.exs.
          {"0 * * * *", Loopctl.Workers.MemoryGraduationSweepWorker},
+         # Ingestion capture-silence dead-man's-switch: hourly scan for tenants whose
+         # established article source_types (e.g. session_log) went silent. HARDCODED
+         # schedule (no env var) so app boot never depends on a new env var. Detection
+         # self-gates on "established + stale", so the interval is a latency knob only.
+         # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+         {"7 * * * *", Loopctl.Workers.IngestionHealthWorker},
          # US-35.3: all-tenants STH safety sweep. Reduced from `"* * * * *"` (every
          # minute) to a low-frequency, config-driven backstop (default `*/5 * * * *`)
          # that only catches appends the event-driven enqueuer (US-35.2) missed. Each

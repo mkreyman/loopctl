@@ -200,6 +200,15 @@ config :loopctl, LoopctlWeb.Endpoint,
 # Print only warnings and errors during test
 config :logger, level: :warning
 
+# Narrow capture-silence monitoring to `session_log` in tests so specs can assert
+# that OTHER source_types are not flagged (the prod default is `:all`). The `:all`
+# behavior is covered by passing explicit config to `IngestionHealth.detect/1`.
+config :loopctl, :ingestion_health,
+  monitored_source_types: ["session_log"],
+  established_threshold: 5,
+  staleness_threshold_hours: 72,
+  establishment_window_hours: 720
+
 # Use simple formatter in test (override JSON default from config.exs).
 # The template prints only level + message (custom metadata is asserted via the
 # message string in tests), but declare `metadata: :all` so Credo's

@@ -824,6 +824,35 @@ async function getCostAnomalies({ project_id, page, page_size }) {
   return toContent(result);
 }
 
+async function getIngestionAnomalies({
+  source_type,
+  anomaly_type,
+  resolved,
+  include_archived,
+  page,
+  page_size,
+}) {
+  const params = new URLSearchParams();
+  if (source_type) params.set("source_type", source_type);
+  if (anomaly_type) params.set("anomaly_type", anomaly_type);
+  if (resolved != null) params.set("resolved", String(resolved));
+  if (include_archived != null) params.set("include_archived", String(include_archived));
+  if (page != null) params.set("page", String(page));
+  if (page_size != null) params.set("page_size", String(page_size));
+
+  const query = params.toString() ? `?${params}` : "";
+  // Orchestrator-gated endpoint (RequireRole :orchestrator). Pass the ORCH key
+  // explicitly so a misconfigured single agent-role LOOPCTL_API_KEY fails loudly
+  // rather than drifting into an undiagnosable 403.
+  const result = await apiCall(
+    "GET",
+    `/api/v1/ingestion-anomalies${query}`,
+    undefined,
+    process.env.LOOPCTL_ORCH_KEY
+  );
+  return toContent(result);
+}
+
 async function setTokenBudget({ scope_type, scope_id, budget_millicents, alert_threshold_pct }) {
   const body = { scope_type, scope_id, budget_millicents };
   if (alert_threshold_pct != null) body.alert_threshold_pct = alert_threshold_pct;
@@ -2747,6 +2776,41 @@ const TOOLS = [
         },
         page: { type: "integer", description: "Page number (default 1)." },
         page_size: { type: "integer", description: "Anomalies per page (default 20)." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "get_ingestion_anomalies",
+    description:
+      "Get ingestion-health anomalies — capture-silence (a source_type that was producing " +
+      "articles has gone silent). Use to check whether knowledge capture is still landing. " +
+      "Paginated (page/page_size); advance `page` to enumerate all. Filter by source_type, " +
+      "anomaly_type, resolved status, or include archived.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_type: {
+          type: "string",
+          description: 'Optional: filter to one article source_type (e.g. "session_log").',
+        },
+        anomaly_type: {
+          type: "string",
+          enum: ["capture_silence"],
+          description: 'Optional: filter by anomaly type (only "capture_silence" is currently produced).',
+        },
+        resolved: {
+          type: "string",
+          enum: ["false", "true", "all"],
+          description:
+            'Which anomalies to return: "false" = unresolved only (default), "true" = resolved only, "all" = both.',
+        },
+        include_archived: {
+          type: "boolean",
+          description: "Optional: include archived (retired-source) anomalies (default false).",
+        },
+        page: { type: "integer", description: "Page number (default 1)." },
+        page_size: { type: "integer", description: "Anomalies per page (default 20, max 100)." },
       },
       required: [],
     },
@@ -5018,6 +5082,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "get_cost_anomalies":
       return await getCostAnomalies(args);
+
+    case "get_ingestion_anomalies":
+      return await getIngestionAnomalies(args);
 
     case "set_token_budget":
       return await setTokenBudget(args);

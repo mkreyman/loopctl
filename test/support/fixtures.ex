@@ -20,6 +20,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Llm.SettingsCache
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Llm.UsageEvent, as: LlmUsageEvent
@@ -493,6 +494,21 @@ defmodule Loopctl.Fixtures do
         story_cost_millicents: 75_000,
         reference_avg_millicents: 25_000,
         deviation_factor: Decimal.new("3.0"),
+        resolved: false,
+        metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:ingestion_anomaly, attrs) do
+    Map.merge(
+      %{
+        source_type: "session_log",
+        anomaly_type: :capture_silence,
+        last_event_at: DateTime.add(DateTime.utc_now(), -96, :hour),
+        hours_stale: 96,
+        sample_count: 5,
         resolved: false,
         metadata: %{}
       },
@@ -1226,6 +1242,32 @@ defmodule Loopctl.Fixtures do
     AdminRepo.insert!(changeset)
   end
 
+  def fixture(:ingestion_anomaly, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    data = build(:ingestion_anomaly, attrs)
+
+    # `archived` is not cast by create_changeset (mirrors CostAnomaly — it's set by
+    # the archival path, not the create surface), so put it on the changeset directly
+    # when a test needs an archived row.
+    changeset =
+      %IngestionAnomaly{tenant_id: tenant_id}
+      |> IngestionAnomaly.create_changeset(data)
+      |> Ecto.Changeset.put_change(:archived, Map.get(data, :archived, false))
+
+    AdminRepo.insert!(changeset)
+  end
+
   def fixture(:review_record, attrs) do
     attrs = Enum.into(attrs, %{})
 
@@ -1649,6 +1691,32 @@ defmodule Loopctl.Fixtures do
   Generates a fresh binary UUID for use in tests.
   """
   def uuid, do: Ecto.UUID.generate()
+
+  @doc """
+  Inserts a knowledge `Article` with a controlled `inserted_at` and `source_type`.
+
+  The normal `fixture(:article, ...)` path auto-sets `inserted_at` to now via
+  timestamps; the ingestion capture-silence detector reasons over `inserted_at`, so
+  tests need to backdate captured articles. Pass `:inserted_at` (a DateTime) and
+  `:source_type`; auto-creates a tenant when `:tenant_id` is absent.
+  """
+  def captured_article(attrs) do
+    attrs = Enum.into(attrs, %{})
+    {inserted_at, attrs} = Map.pop(attrs, :inserted_at)
+    article = fixture(:article, attrs)
+
+    if inserted_at do
+      import Ecto.Query
+
+      {1, [updated]} =
+        from(a in Article, where: a.id == ^article.id, select: a)
+        |> AdminRepo.update_all(set: [inserted_at: inserted_at])
+
+      updated
+    else
+      article
+    end
+  end
 
   # --- Private helpers ---
 
