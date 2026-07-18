@@ -416,8 +416,40 @@ defmodule Loopctl.MemoryContextTest do
       # the horizon. `meta.underfilled` MUST surface that (the SAME accepted tradeoff
       # as the cross-subject case verified at prod scale in `ScaleRecallTest` /
       # US-28.5, here made deterministic with a tiny fixed pool + fixed embeddings).
-      near = List.replace_at(List.duplicate(0.0, 1536), 0, 1.0)
-      far = List.replace_at(List.duplicate(0.0, 1536), 1, 1.0)
+      # TEST-UNIQUE, well-separated embedding points. `near`/`far` must NOT sit on the
+      # globally-common dim-0/dim-1 one-hots: the `memories` pgvector HNSW index is a
+      # SINGLE index physically shared across every tenant/test, and its ef_search
+      # candidate set is filled BEFORE the tenant/project filter. Other tests writing
+      # rows at a shared point (e.g. the per-tenant default embedding's hot dims, or any
+      # dim-0 one-hot) would crowd this test's candidate set and non-deterministically
+      # evict its 6 NEAR fillers → the under-fill assertion flakes. Mirroring the
+      # per-tenant `deterministic_embedding/1` fix (test/support/data_case.ex), derive
+      # the hot dimensions from THIS test's tenant — shared by projects a and b, which
+      # share a tenant_id, so both projects' rows land on the SAME points — via 16
+      # independent hashes, so another test collides only if all sixteen hashes collide
+      # (negligible). `near` and `far` are kept ORTHOGONAL (disjoint hot dims) so the
+      # intended geometry is EXACT: every "NEAR" text is cosine-distance 0 from the
+      # query, `far` is distance 1.
+      near_dims =
+        for salt <- 0..15,
+            into: MapSet.new(),
+            do: rem(:erlang.phash2({a.tenant_id, :near, salt}), 1536)
+
+      far_dims =
+        for salt <- 0..15,
+            into: MapSet.new(),
+            do: rem(:erlang.phash2({a.tenant_id, :far, salt}), 1536)
+
+      # Guarantee near ⊥ far even if a hash lands a near dim and a far dim on the same
+      # index (both vectors stay multi-hot and test-unique).
+      far_dims = MapSet.difference(far_dims, near_dims)
+
+      one_hot = fn dims ->
+        Enum.map(0..1535, fn i -> if MapSet.member?(dims, i), do: 1.0, else: 0.0 end)
+      end
+
+      near = one_hot.(near_dims)
+      far = one_hot.(far_dims)
 
       # Deterministic distances: "NEAR"-tagged text (query + the 6 pool fillers) embeds
       # to `near` (cosine distance 0), everything else to the orthogonal `far`
