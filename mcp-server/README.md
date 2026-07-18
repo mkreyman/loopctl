@@ -188,6 +188,7 @@ autonomous agent) can self-remediate without a human. Full agent-tenant lifecycl
 | `get_cost_summary` | orch | Get cost/token usage summary for a project, optionally broken down by `agent`, `epic`, or `model`. |
 | `get_story_token_usage` | orch | Get all token usage records for a single story. |
 | `get_cost_anomalies` | orch | Get cost anomaly alerts — stories or agents exceeding expected budgets. Optionally filter by project. |
+| `get_ingestion_anomalies` | orch | Get ingestion-health anomalies — capture-silence (a source_type stopped producing articles) and high write-rejection rate. Check whether knowledge capture is still landing. |
 | `set_token_budget` | orch | Set a token budget (in millicents) for a project, epic, story, or agent scope. Requires orchestrator role. |
 
 ### Knowledge Wiki Tools (agent key)

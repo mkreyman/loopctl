@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.45.0 — 2026-07-18 (ingestion-health anomalies)
+
+### Added
+
+- **`get_ingestion_anomalies`** — list ingestion-health anomalies (capture-silence: a
+  `source_type` that was producing articles has gone silent; and high article-write
+  rejection rate) over `GET /api/v1/ingestion-anomalies` (orchestrator key). Use it to
+  check whether knowledge capture is still landing. Paginated (`page`/`page_size`), with
+  optional `source_type`, `anomaly_type`, `resolved` (`false`/`true`/`all`), and
+  `include_archived` filters. Complements `get_cost_anomalies`.
+
 ## 2.44.0 — 2026-07-17 (KB-scope lifecycle: agent archive + restore)
 
 ### Added
