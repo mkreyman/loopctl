@@ -152,17 +152,24 @@ config :loopctl,
   scale_alert_provider_error_rate_per_min: 10
 
 # Ingestion capture-silence monitor (dead-man's-switch for knowledge capture).
-# Config-based DI for `Loopctl.Knowledge.IngestionHealth` — all three tunables have
+# Config-based DI for `Loopctl.Knowledge.IngestionHealth` — all tunables have
 # in-code defaults in that module, so this block is an override point, not a boot
-# dependency. `:monitored_source_types` are article `source_type`s watched for
-# silence; `:established_threshold` is the minimum article count before a source_type
-# is considered "established" (and thus eligible to be flagged when it goes silent);
-# `:staleness_threshold_hours` is how long an established source_type may go without a
-# new article before `IngestionHealthWorker` flags a `:capture_silence` anomaly.
+# dependency. `:monitored_source_types` are the article `source_type`s watched for
+# silence; `:all` (the default) monitors EVERY source_type that crosses the
+# established threshold — a silent-capture outage affects any source_type
+# (knowledge_create 409 drops hit web_article/newsletter/session_log alike), so the
+# monitor defaults to broad coverage rather than session_log-only. A list narrows it.
+# `:established_threshold` is the minimum article count (within the establishment
+# window) before a source_type is considered "established" (and thus eligible to be
+# flagged when it goes silent); `:staleness_threshold_hours` is how long an
+# established source_type may go without a new article before `IngestionHealthWorker`
+# flags a `:capture_silence` anomaly; `:establishment_window_hours` scopes
+# establishment to RECENT activity so a wound-down source_type is not flagged forever.
 config :loopctl, :ingestion_health,
-  monitored_source_types: ["session_log"],
+  monitored_source_types: :all,
   established_threshold: 5,
-  staleness_threshold_hours: 72
+  staleness_threshold_hours: 72,
+  establishment_window_hours: 720
 
 # US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
 # defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/

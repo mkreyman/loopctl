@@ -136,6 +136,21 @@ defmodule LoopctlWeb.IngestionAnomalyControllerTest do
       assert body["ingestion_anomaly"]["resolved"] == true
     end
 
+    test "archives an anomaly with ?archived=true (user)", %{conn: conn} do
+      ctx = setup_tenant_with_anomalies()
+
+      conn =
+        conn
+        |> auth_conn(ctx.user_key)
+        |> patch(~p"/api/v1/ingestion-anomalies/#{ctx.anomaly1.id}?archived=true")
+
+      body = json_response(conn, 200)
+      assert body["ingestion_anomaly"]["id"] == ctx.anomaly1.id
+      assert body["ingestion_anomaly"]["archived"] == true
+      # Archiving does not resolve — it is a distinct disposition.
+      assert body["ingestion_anomaly"]["resolved"] == false
+    end
+
     test "returns 403 for orchestrator (resolve requires :user)", %{conn: conn} do
       ctx = setup_tenant_with_anomalies()
 

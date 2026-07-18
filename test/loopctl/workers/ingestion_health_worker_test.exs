@@ -9,6 +9,7 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge.IngestionAnomaly
+  alias Loopctl.Knowledge.IngestionHealth
   alias Loopctl.Workers.IngestionHealthWorker
   alias Loopctl.Workers.ScaleAlertDeliveryWorker
   alias Loopctl.Workers.WebhookDeliveryWorker
@@ -139,6 +140,84 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
       # Still exactly one anomaly row and one detected audit entry.
       assert length(anomalies_for(tenant.id)) == 1
       assert detected_audit_count(tenant.id, "session_log") == 1
+    end
+
+    test "a resolved anomaly is NOT re-created/re-notified while silence persists" do
+      tenant = fixture(:tenant)
+      seed_captures(tenant.id, "session_log", 5, @stale_hours)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        [anomaly] = anomalies_for(tenant.id)
+
+        # Operator resolves it; the source_type is still silent (no new capture).
+        assert {:ok, _} = IngestionHealth.resolve_anomaly(tenant.id, anomaly.id)
+
+        # Next hourly run must NOT create a fresh anomaly or re-fire the alarm.
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+        assert length(all_enqueued(worker: ScaleAlertDeliveryWorker)) == 1
+      end)
+
+      # Still exactly one (now-resolved) row and one detected audit entry.
+      assert length(anomalies_for(tenant.id)) == 1
+      assert detected_audit_count(tenant.id, "session_log") == 1
+    end
+
+    test "re-flags only after captures resume and the source goes silent again" do
+      tenant = fixture(:tenant)
+      seed_captures(tenant.id, "session_log", 5, @stale_hours)
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      [anomaly] = anomalies_for(tenant.id)
+      assert {:ok, _} = IngestionHealth.resolve_anomaly(tenant.id, anomaly.id)
+
+      # Captures RESUME (a newer article) then the source goes silent again past
+      # the staleness threshold — this is a genuinely new regression.
+      captured(tenant.id, "session_log", 80)
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+      # A second (unresolved) anomaly is created for the new silence episode.
+      unresolved = anomalies_for(tenant.id) |> Enum.reject(& &1.resolved)
+      assert length(unresolved) == 1
+      assert detected_audit_count(tenant.id, "session_log") == 2
+    end
+
+    test "an archived anomaly permanently suppresses re-detection for that source_type" do
+      tenant = fixture(:tenant)
+      seed_captures(tenant.id, "session_log", 5, @stale_hours)
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      [anomaly] = anomalies_for(tenant.id)
+      assert {:ok, _} = IngestionHealth.archive_anomaly(tenant.id, anomaly.id)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        # No new operator alert — the archived source_type is suppressed.
+        assert all_enqueued(worker: ScaleAlertDeliveryWorker) == []
+      end)
+
+      # No new anomaly rows were created (still just the archived one).
+      assert length(anomalies_for(tenant.id)) == 1
+    end
+
+    test "operator-alert payload conforms to the ScaleAlert contract (metric/value/threshold)" do
+      tenant = fixture(:tenant)
+      seed_captures(tenant.id, "session_log", 5, @stale_hours)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+        [job] = all_enqueued(worker: ScaleAlertDeliveryWorker)
+        payload = job.args["payload"]
+
+        assert payload["alert"] == "ingestion.capture_silence"
+        assert payload["metric"] == "ingestion.capture_silence.hours_stale"
+        assert is_integer(payload["value"])
+        assert payload["threshold"] == 72
+        assert payload["window_seconds"] == 72 * 3600
+      end)
     end
 
     test "tenant isolation — tenant A's silence never flags tenant B" do

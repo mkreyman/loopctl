@@ -5,6 +5,7 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionHealth
 
   import Ecto.Query
@@ -79,6 +80,57 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
 
       assert tenant_a.id in candidate_tenants
       refute tenant_b.id in candidate_tenants
+    end
+
+    test "monitored_source_types :all flags any established + stale source_type" do
+      tenant = fixture(:tenant)
+      # "newsletter" is NOT in the test-env narrow monitoring list, so it is only
+      # flagged when detect/1 is given `:all` (the prod default).
+      for _ <- 1..5, do: captured(tenant.id, "newsletter", @stale_hours)
+
+      cfg = %{
+        monitored_source_types: :all,
+        established_threshold: 5,
+        staleness_threshold_hours: 72
+      }
+
+      candidates = IngestionHealth.detect(cfg) |> Enum.filter(&(&1.tenant_id == tenant.id))
+
+      assert [%{source_type: "newsletter"}] = candidates
+    end
+
+    test "recency window excludes a wound-down source_type silent past the window" do
+      tenant = fixture(:tenant)
+      # Established long ago (well beyond the establishment window) and silent since:
+      # a legitimately wound-down workflow, NOT a fresh regression — must not flag.
+      for _ <- 1..5, do: captured(tenant.id, "session_log", 24 * 60)
+
+      cfg = %{
+        monitored_source_types: ["session_log"],
+        established_threshold: 5,
+        staleness_threshold_hours: 72,
+        # 30-day window; captures 60 days old age out of establishment.
+        establishment_window_hours: 720
+      }
+
+      assert IngestionHealth.detect(cfg) |> Enum.filter(&(&1.tenant_id == tenant.id)) == []
+    end
+  end
+
+  describe "IngestionAnomaly.create_changeset/2 invariants" do
+    test "rejects sample_count 0 (never established) and hours_stale 0 (not stale)" do
+      base = %{
+        source_type: "session_log",
+        anomaly_type: :capture_silence,
+        hours_stale: 96,
+        sample_count: 5
+      }
+
+      refute IngestionAnomaly.create_changeset(%IngestionAnomaly{}, %{base | sample_count: 0}).valid?
+
+      refute IngestionAnomaly.create_changeset(%IngestionAnomaly{}, %{base | hours_stale: 0}).valid?
+
+      assert IngestionAnomaly.create_changeset(%IngestionAnomaly{}, base).valid?
     end
   end
 
@@ -168,6 +220,73 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
 
       assert {:error, :not_found} =
                IngestionHealth.resolve_anomaly(tenant.id, Ecto.UUID.generate())
+    end
+
+    test "re-resolving an already-resolved anomaly is an idempotent no-op (no bogus audit)" do
+      tenant = fixture(:tenant)
+      anomaly = fixture(:ingestion_anomaly, %{tenant_id: tenant.id, resolved: true})
+
+      assert {:ok, resolved} = IngestionHealth.resolve_anomaly(tenant.id, anomaly.id)
+      assert resolved.resolved == true
+
+      # No `false -> true` audit transition is written for a row already resolved.
+      audit_count =
+        from(a in AuditLog,
+          where:
+            a.tenant_id == ^tenant.id and a.entity_type == "ingestion_anomaly" and
+              a.action == "resolved" and a.entity_id == ^anomaly.id
+        )
+        |> AdminRepo.aggregate(:count)
+
+      assert audit_count == 0
+    end
+  end
+
+  describe "archive_anomaly/3" do
+    test "flips archived and writes an audit entry" do
+      tenant = fixture(:tenant)
+      anomaly = fixture(:ingestion_anomaly, %{tenant_id: tenant.id})
+
+      assert {:ok, archived} =
+               IngestionHealth.archive_anomaly(tenant.id, anomaly.id, actor_type: "api_key")
+
+      assert archived.archived == true
+
+      audit_count =
+        from(a in AuditLog,
+          where:
+            a.tenant_id == ^tenant.id and a.entity_type == "ingestion_anomaly" and
+              a.action == "archived" and a.entity_id == ^anomaly.id
+        )
+        |> AdminRepo.aggregate(:count)
+
+      assert audit_count == 1
+    end
+
+    test "re-archiving an already-archived anomaly is an idempotent no-op" do
+      tenant = fixture(:tenant)
+      anomaly = fixture(:ingestion_anomaly, %{tenant_id: tenant.id, archived: true})
+
+      assert {:ok, archived} = IngestionHealth.archive_anomaly(tenant.id, anomaly.id)
+      assert archived.archived == true
+
+      audit_count =
+        from(a in AuditLog,
+          where:
+            a.tenant_id == ^tenant.id and a.entity_type == "ingestion_anomaly" and
+              a.action == "archived" and a.entity_id == ^anomaly.id
+        )
+        |> AdminRepo.aggregate(:count)
+
+      assert audit_count == 0
+    end
+
+    test "returns :not_found for another tenant's anomaly" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      anomaly = fixture(:ingestion_anomaly, %{tenant_id: tenant_a.id})
+
+      assert {:error, :not_found} = IngestionHealth.archive_anomaly(tenant_b.id, anomaly.id)
     end
   end
 end

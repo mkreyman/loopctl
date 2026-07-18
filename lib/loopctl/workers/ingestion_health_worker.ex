@@ -18,6 +18,19 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   On an EXISTING unresolved anomaly it silently refreshes the figures — NO re-notify
   (anti-alarm-fatigue), exactly like `CostAnomalyWorker`.
 
+  ## Suppression: resolve sticks, archive is permanent
+
+  A resolved anomaly is NOT re-created on the next run just because the source_type
+  is still silent — that would re-fire audit + operator alert + webhook every hour
+  and defeat the whole point of resolving. `flag_candidate/1` suppresses re-creation
+  while the current silence is already covered by a resolved anomaly (its
+  `last_event_at` snapshot is at/after the candidate's), and only re-flags once
+  captures RESUME (advancing `last_event_at`) and then go silent again.
+
+  An **archived** anomaly permanently suppresses re-detection for that source_type
+  (the operator's escape hatch for a legitimately-retired workflow) — regardless of
+  its resolved flag.
+
   ## Race-safety
 
   Creation uses the same `insert_all` + `on_conflict: :nothing` against a unique
@@ -25,6 +38,14 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   uses: `{1, [row]}` means we genuinely inserted (notify); `{0, _}` means a concurrent
   run already inserted + notified (skip). We still check-first so an update never emits
   audit/webhook.
+
+  ## Atomic detection record
+
+  The anomaly row insert and its `detected` audit entry are written in ONE
+  `AdminRepo` transaction, so a crash mid-notify can never leave a persisted anomaly
+  without its audit record (an Oban retry would otherwise find the row and take the
+  no-notify update path, permanently losing the audit entry). The operator alert and
+  webhook enqueues stay post-commit — they are Oban-durable once enqueued.
 
   ## Schedule
 
@@ -41,6 +62,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
 
   import Ecto.Query
 
+  alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Knowledge.IngestionAnomaly
@@ -74,19 +96,59 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
        }) do
     # Check first (like CostAnomalyWorker) so an UPDATE never emits audit/webhook/alert.
     # The unique partial index still guards against races on the insert path below.
+    # NB: exclude archived rows here — an archived-but-unresolved row must not be
+    # silently update-refreshed; archival is handled explicitly below.
     existing =
       IngestionAnomaly
       |> where([a], a.tenant_id == ^tenant_id)
       |> where([a], a.source_type == ^source_type)
       |> where([a], a.anomaly_type == :capture_silence)
       |> where([a], a.resolved == false)
+      |> where([a], a.archived == false)
       |> AdminRepo.one()
 
-    if existing do
-      update_existing(existing, last_event_at, hours_stale, sample_count)
-    else
-      create_new(tenant_id, source_type, last_event_at, hours_stale, sample_count)
+    cond do
+      archived_suppression?(tenant_id, source_type) ->
+        # Operator archived this source_type — permanent escape hatch, never re-flag.
+        :suppressed
+
+      existing ->
+        update_existing(existing, last_event_at, hours_stale, sample_count)
+
+      acknowledged_silence?(tenant_id, source_type, last_event_at) ->
+        # This exact silence is already covered by a resolved anomaly (no capture
+        # since it was resolved) — suppress re-creation to avoid re-firing audit +
+        # operator alert + webhook every hour. Re-flags only once captures resume
+        # (last_event_at advances) and the source goes silent again.
+        :suppressed
+
+      true ->
+        create_new(tenant_id, source_type, last_event_at, hours_stale, sample_count)
     end
+  end
+
+  # An archived anomaly (resolved or not) permanently suppresses re-detection for
+  # that source_type — the operator's escape hatch for a retired workflow.
+  defp archived_suppression?(tenant_id, source_type) do
+    IngestionAnomaly
+    |> where([a], a.tenant_id == ^tenant_id)
+    |> where([a], a.source_type == ^source_type)
+    |> where([a], a.anomaly_type == :capture_silence)
+    |> where([a], a.archived == true)
+    |> AdminRepo.exists?()
+  end
+
+  # True when a resolved (non-archived) anomaly's snapshot is at/after the current
+  # silence's last_event_at, i.e. no NEW capture has arrived since it was resolved.
+  defp acknowledged_silence?(tenant_id, source_type, last_event_at) do
+    IngestionAnomaly
+    |> where([a], a.tenant_id == ^tenant_id)
+    |> where([a], a.source_type == ^source_type)
+    |> where([a], a.anomaly_type == :capture_silence)
+    |> where([a], a.resolved == true)
+    |> where([a], a.archived == false)
+    |> where([a], not is_nil(a.last_event_at) and a.last_event_at >= ^last_event_at)
+    |> AdminRepo.exists?()
   end
 
   # Silently refresh the figures on an existing unresolved anomaly — no re-notify.
@@ -137,8 +199,11 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     end
   end
 
-  # insert_all + on_conflict: :nothing against the unresolved unique partial index.
-  # {1, [row]} = we inserted (notify); {0, _} = concurrent run won the race (skip).
+  # insert_all + on_conflict: :nothing against the unresolved unique partial index,
+  # with the `detected` audit entry in the SAME transaction so the anomaly row can
+  # never be persisted without its audit record (an Oban retry would otherwise find
+  # the row, take the no-notify update path, and lose the audit entry permanently).
+  # {1, [row]} = we inserted (audit + notify); {0, _} = concurrent run won the race.
   defp insert_new_anomaly(tenant_id, changeset) do
     now = DateTime.utc_now()
 
@@ -158,26 +223,51 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
       ])
       |> Map.merge(%{id: Ecto.UUID.generate(), inserted_at: now, updated_at: now})
 
-    case AdminRepo.insert_all(IngestionAnomaly, [entry],
-           on_conflict: :nothing,
-           conflict_target:
-             {:unsafe_fragment,
-              ~s|("tenant_id","source_type","anomaly_type") WHERE resolved = false|},
-           returning: true
-         ) do
-      {1, [anomaly]} ->
-        notify_new_anomaly(tenant_id, anomaly)
+    multi =
+      Multi.new()
+      |> Multi.run(:anomaly, fn repo, _changes ->
+        case repo.insert_all(IngestionAnomaly, [entry],
+               on_conflict: :nothing,
+               conflict_target:
+                 {:unsafe_fragment,
+                  ~s|("tenant_id","source_type","anomaly_type") WHERE resolved = false|},
+               returning: true
+             ) do
+          {1, [anomaly]} -> {:ok, anomaly}
+          {0, _} -> {:ok, :conflict}
+        end
+      end)
+      |> Multi.run(:audit, fn _repo, %{anomaly: anomaly} ->
+        case anomaly do
+          :conflict -> {:ok, :skipped}
+          %IngestionAnomaly{} = row -> log_detected(tenant_id, row)
+        end
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{anomaly: :conflict}} ->
+        # Lost the race: the concurrent inserter already emitted audit + alert + webhook.
+        nil
+
+      {:ok, %{anomaly: %IngestionAnomaly{} = anomaly}} ->
+        # Audit is now committed atomically with the row; the operator alert + webhook
+        # are Oban-durable once enqueued, so keep them post-commit.
+        fire_operator_alert(tenant_id, anomaly)
+        fire_anomaly_webhook(tenant_id, anomaly)
         anomaly
 
-      {0, _} ->
-        # Lost the race: the concurrent inserter already emitted audit + alert + webhook.
+      {:error, step, reason, _changes} ->
+        Logger.warning(
+          "IngestionHealthWorker: failed to persist anomaly for tenant #{tenant_id} " <>
+            "(step #{inspect(step)}): #{inspect(reason)}"
+        )
+
         nil
     end
   end
 
-  # Audit + operator alert + per-tenant webhook. Called ONLY for a genuinely persisted
-  # anomaly, never for a conflict/no-op insert.
-  defp notify_new_anomaly(tenant_id, anomaly) do
+  # Writes the `detected` audit entry inside the create transaction (AdminRepo).
+  defp log_detected(tenant_id, anomaly) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "ingestion_anomaly",
       entity_id: anomaly.id,
@@ -197,19 +287,25 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
         "hours_stale" => anomaly.hours_stale
       }
     })
-
-    fire_operator_alert(tenant_id, anomaly)
-    fire_anomaly_webhook(tenant_id, anomaly)
-
-    :ok
   end
 
   # Enqueue an operator alert through ScaleAlertDeliveryWorker with an id-only payload.
   # That worker resolves SCALE_ALERT_WEBHOOK_URL itself and no-ops when unset, so this
   # is channel-agnostic and safe when unconfigured — we never read/require the URL here.
   defp fire_operator_alert(tenant_id, anomaly) do
+    # Conform to the ScaleAlert operator-alert contract (%{alert, metric, value,
+    # threshold, window_seconds, at}) so the shared alert channel — including
+    # ScaleAlertDeliveryWorker's no-URL skip log that reads metric=value — renders
+    # meaningful values. Extra context fields (tenant_id/source_type/last_event_at)
+    # ride alongside; consumers branch on the `alert` discriminator.
+    staleness_hours = IngestionHealth.staleness_threshold_hours()
+
     payload = %{
       "alert" => "ingestion.capture_silence",
+      "metric" => "ingestion.capture_silence.hours_stale",
+      "value" => anomaly.hours_stale,
+      "threshold" => staleness_hours,
+      "window_seconds" => staleness_hours * 3600,
       "tenant_id" => tenant_id,
       "source_type" => anomaly.source_type,
       "hours_stale" => anomaly.hours_stale,

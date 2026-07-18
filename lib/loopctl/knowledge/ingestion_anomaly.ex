@@ -24,9 +24,11 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
   - `anomaly_type` -- one of the types above
   - `last_event_at` -- `max(inserted_at)` of that source_type's articles (nil if none)
   - `hours_stale` -- whole hours between `last_event_at` and detection time
-  - `sample_count` -- total articles of that source_type (the "established" evidence)
+  - `sample_count` -- articles of that source_type within the recency/establishment
+    window (the "recently established" evidence)
   - `resolved` -- whether the anomaly has been acknowledged/resolved
-  - `archived` -- archived anomalies are excluded from the default list
+  - `archived` -- archived anomalies are excluded from the default list and
+    permanently suppress re-detection for a retired source_type
   - `metadata` -- extensible JSONB map
   """
 
@@ -92,8 +94,13 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
     ])
     |> validate_required([:source_type, :anomaly_type, :hours_stale, :sample_count])
     |> validate_inclusion(:anomaly_type, @anomaly_types)
-    |> validate_number(:hours_stale, greater_than_or_equal_to: 0)
-    |> validate_number(:sample_count, greater_than_or_equal_to: 0)
+    # A capture-silence anomaly is, by definition, a source_type that WENT stale —
+    # so it must have been established (>= 1 captured article) and stale (> 0 hours).
+    # sample_count: 0 ("never established") / hours_stale: 0 ("not actually stale")
+    # are logically impossible anomalies; reject them at the invariant boundary
+    # even though the detection layer already only feeds established+stale figures.
+    |> validate_number(:hours_stale, greater_than: 0)
+    |> validate_number(:sample_count, greater_than_or_equal_to: 1)
     |> validate_metadata_size()
     |> foreign_key_constraint(:tenant_id)
   end
@@ -104,6 +111,20 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
   @spec resolve_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
   def resolve_changeset(anomaly) do
     change(anomaly, resolved: true)
+  end
+
+  @doc """
+  Changeset for archiving an anomaly.
+
+  Archiving is the operator's PERMANENT escape hatch for a legitimately-retired
+  `source_type`: an archived anomaly is excluded from the default list AND
+  suppresses re-detection for that source_type (see
+  `Loopctl.Workers.IngestionHealthWorker`), so a wound-down workflow is not
+  re-flagged on every hourly run.
+  """
+  @spec archive_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
+  def archive_changeset(anomaly) do
+    change(anomaly, archived: true)
   end
 
   @metadata_max_bytes 65_536

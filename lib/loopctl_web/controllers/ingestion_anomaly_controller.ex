@@ -3,7 +3,8 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   Controller for ingestion capture-silence anomaly management.
 
   - `GET /api/v1/ingestion-anomalies` -- list unresolved anomalies (orchestrator+)
-  - `PATCH /api/v1/ingestion-anomalies/:id` -- mark anomaly as resolved (user+)
+  - `PATCH /api/v1/ingestion-anomalies/:id` -- mark anomaly as resolved, or
+    `?archived=true` to permanently archive a retired source_type (user+)
 
   Role gating mirrors `LoopctlWeb.CostAnomalyController` exactly: listing at the
   same read role cost anomalies use, and resolution at `:user` (a custody-adjacent
@@ -72,23 +73,32 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   )
 
   operation(:update,
-    summary: "Resolve ingestion anomaly",
-    description: "Marks an ingestion capture-silence anomaly as resolved.",
+    summary: "Resolve or archive ingestion anomaly",
+    description:
+      "Marks an ingestion capture-silence anomaly as resolved. Pass ?archived=true to " <>
+        "instead ARCHIVE it — the permanent escape hatch for a retired source_type, which " <>
+        "hides it from the default list and suppresses re-detection.",
     parameters: [
-      id: [in: :path, type: :string, description: "Anomaly UUID"]
+      id: [in: :path, type: :string, description: "Anomaly UUID"],
+      archived: [
+        in: :query,
+        type: :boolean,
+        description: "When true, archive (permanently suppress) instead of resolve"
+      ]
     ],
     responses: %{
       200 =>
-        {"Anomaly resolved", "application/json",
+        {"Anomaly resolved or archived", "application/json",
          %OpenApiSpex.Schema{
            type: :object,
-           description: "Confirmation of resolution",
+           description: "Confirmation of resolution or archival",
            properties: %{
              ingestion_anomaly: %OpenApiSpex.Schema{
                type: :object,
                properties: %{
                  id: %OpenApiSpex.Schema{type: :string, format: :uuid},
                  resolved: %OpenApiSpex.Schema{type: :boolean, example: true},
+                 archived: %OpenApiSpex.Schema{type: :boolean, example: false},
                  updated_at: %OpenApiSpex.Schema{type: :string, format: :"date-time"}
                }
              }
@@ -133,9 +143,9 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   @doc """
   PATCH /api/v1/ingestion-anomalies/:id
 
-  Marks an ingestion anomaly as resolved.
+  Marks an ingestion anomaly as resolved, or archives it when `?archived=true`.
   """
-  def update(conn, %{"id" => id}) do
+  def update(conn, %{"id" => id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
@@ -145,11 +155,19 @@ defmodule LoopctlWeb.IngestionAnomalyController do
       actor_type: "api_key"
     ]
 
-    with {:ok, anomaly} <- IngestionHealth.resolve_anomaly(tenant_id, id, audit_opts) do
+    result =
+      if parse_bool(params["archived"]) == true do
+        IngestionHealth.archive_anomaly(tenant_id, id, audit_opts)
+      else
+        IngestionHealth.resolve_anomaly(tenant_id, id, audit_opts)
+      end
+
+    with {:ok, anomaly} <- result do
       json(conn, %{
         ingestion_anomaly: %{
           id: anomaly.id,
           resolved: anomaly.resolved,
+          archived: anomaly.archived,
           updated_at: anomaly.updated_at
         }
       })
