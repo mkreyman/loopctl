@@ -233,8 +233,35 @@ defmodule Loopctl.Coordination do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{post: post}} -> {:ok, post}
+      {:ok, %{post: post}} ->
+        {:ok, post}
+
+      # The only convertible Multi error is a failed step carrying an invalid
+      # changeset. `Multi.delete` never yields such a tuple (a missing row RAISES
+      # `Ecto.StaleEntryError`, rescued below), so today this can only be the
+      # `:audit` step. The audit attrs are built programmatically with every
+      # required field present, so this branch is UNREACHABLE with valid input; it
+      # exists to keep `run_delete/4` TOTAL — never a `CaseClauseError`/500 leaked
+      # to the controller — and, like sibling `run_post/3`, acts as a compile-gate:
+      # if `Audit.log_in_multi/3` is ever changed to fail with a non-changeset
+      # error this clause stops covering it and dialyzer fails the build here.
+      # `delete_post/3`'s contract admits only `:not_found`, and this branch rolls
+      # the whole transaction back (nothing deleted, nothing audited), so it
+      # normalises to the same 404 the story mandates.
+      {:error, _step, %Ecto.Changeset{}, _changes} ->
+        {:error, :not_found}
     end
+  rescue
+    # Concurrent double-delete. `fetch_owned_post/2` is an UNLOCKED read, so between
+    # it and `Multi.delete` another deleter — or the US-39.5 TTL sweep — can remove
+    # the row. The feature explicitly enables "whoever NOTICES a leaked secret,
+    # fleet-wide" to delete, making two agents deleting the same post a first-class
+    # case. The losing DELETE matches 0 rows and Ecto raises `Ecto.StaleEntryError`
+    # (Multi does NOT convert a stale delete to an `{:error, ...}` tuple; it
+    # propagates out of the transaction). A just-deleted post is now nonexistent,
+    # and the AC maps nonexistent → 404, so collapse the race to the SAME idempotent
+    # `{:error, :not_found}` a nonexistent id returns — never a 500.
+    Ecto.StaleEntryError -> {:error, :not_found}
   end
 
   defp delete_audit_attrs(tenant_id, agent_id, post, audit) do

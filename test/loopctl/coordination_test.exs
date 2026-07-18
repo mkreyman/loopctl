@@ -798,6 +798,53 @@ defmodule Loopctl.CoordinationTest do
 
       assert %ChannelPost{} = AdminRepo.get(ChannelPost, post.id)
     end
+
+    test "deleting an already-deleted post is an idempotent {:error, :not_found}, never a raise (stale-delete race)",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "race"})
+
+      assert {:ok, _deleted} = Coordination.delete_post(tenant.id, agent_id, post.id, audit)
+
+      # The fleet-wide "whoever notices a leaked secret" model makes two agents
+      # deleting the SAME post a first-class case. A second delete of the now-gone
+      # row must be an idempotent 404 — never an Ecto.StaleEntryError/500. (This is
+      # the caller-visible half of the concurrent race: run_delete/4's rescue
+      # collapses a true TOCTOU stale DELETE to the identical outcome.)
+      assert {:error, :not_found} =
+               Coordination.delete_post(tenant.id, agent_id, post.id, audit)
+    end
+
+    test "an audit-step failure rolls back the delete and returns {:error, :not_found}, never a 500",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "keepme"})
+
+      # Force the audit insert to fail: actor_type is a REQUIRED audit field, and an
+      # explicit nil in the audit context overrides run_delete's "api_key" default,
+      # yielding an invalid audit changeset — the {:error, :audit, changeset, _}
+      # Multi branch. It must NOT CaseClauseError/500; run_delete/4 normalises it to
+      # the contract's 404 and the whole transaction rolls back.
+      bad_audit = [actor_type: nil, actor_id: Ecto.UUID.generate(), actor_label: "x"]
+
+      assert {:error, :not_found} =
+               Coordination.delete_post(tenant.id, agent_id, post.id, bad_audit)
+
+      # Transaction rolled back: the post survives and no audit row was written.
+      assert %ChannelPost{} = AdminRepo.get(ChannelPost, post.id)
+
+      assert AdminRepo.aggregate(
+               from(a in AuditLog,
+                 where: a.entity_type == "channel_post" and a.entity_id == ^post.id
+               ),
+               :count,
+               :id
+             ) == 0
+    end
   end
 
   defp one_audit_entry(tenant_id, entity_id) do
