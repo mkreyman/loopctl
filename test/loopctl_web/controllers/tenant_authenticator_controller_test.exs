@@ -9,7 +9,6 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
 
   import Loopctl.Fixtures
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Tenants
@@ -617,70 +616,25 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
     end
   end
 
-  # review #1 regression: the residual double-first-enroll race, at the HTTP
-  # layer. Two concurrent POST .../authenticators against an agent_rooted
-  # tenant, BOTH with NO reauth_assertion (both are first-enroll attempts).
-  # Exactly one must 201 (flip to human_anchored + enroll); the loser must be
-  # rejected 401 reauth_required by the under-lock gate — it must NOT get a
-  # 201 grafting a second, possession-unproven device.
-  describe "concurrent double-first-enroll at the HTTP layer (review #1)" do
-    @tag :capture_log
-    test "exactly one 201; the loser gets 401 reauth_required, never 201", %{conn: _conn} do
-      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
-      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
-
-      # Two independent single-use challenges, issued sequentially before the race.
-      issue_challenge = fn ->
-        build_conn()
-        |> authed(raw_key)
-        |> post(~p"/api/v1/tenants/#{tenant.id}/authenticators/challenge", %{})
-        |> json_response(200)
-        |> Map.fetch!("data")
-        |> Map.fetch!("challenge_id")
-      end
-
-      challenge_a = issue_challenge.()
-      challenge_b = issue_challenge.()
-
-      parent = self()
-
-      fire = fn challenge_id ->
-        Task.async(fn ->
-          Sandbox.allow(Loopctl.Repo, parent, self())
-          Sandbox.allow(Loopctl.AdminRepo, parent, self())
-          Mox.allow(Loopctl.MockWebAuthn, parent, self())
-          Mox.allow(Loopctl.MockRateLimiter, parent, self())
-
-          build_conn()
-          |> authed(raw_key)
-          |> post(
-            ~p"/api/v1/tenants/#{tenant.id}/authenticators",
-            attestation_body(challenge_id)
-          )
-        end)
-      end
-
-      task_a = fire.(challenge_a)
-      task_b = fire.(challenge_b)
-
-      result_a = Task.await(task_a, 10_000)
-      result_b = Task.await(task_b, 10_000)
-
-      assert Enum.sort([result_a.status, result_b.status]) == [201, 401]
-
-      loser = Enum.find([result_a, result_b], &(&1.status == 401))
-      assert Jason.decode!(loser.resp_body)["error"]["code"] == "reauth_required"
-
-      # Exactly ONE device was grafted on; the tenant is human_anchored with a
-      # single upgrade entry.
-      assert RootAuthenticators.count_by_tenant(tenant.id) == 1
-      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
-      assert reloaded.trust_tier == :human_anchored
-
-      {:ok, upgraded} =
-        Audit.list_entries(tenant.id, entity_type: "tenant", action: "tenant_trust_upgraded")
-
-      assert upgraded.total == 1
-    end
-  end
+  # review #1 regression — the residual double-first-enroll race: two concurrent
+  # first-enrollments on an agent_rooted tenant must result in EXACTLY ONE 201
+  # (flip to human_anchored + enroll) with the loser rejected :reauth_required by
+  # the under-lock gate, never a second possession-unproven device grafted on.
+  #
+  # This invariant is proven DETERMINISTICALLY by
+  # `test/loopctl/tenants/enrollment_lock_test.exs`, which races the enroll path
+  # over two GENUINELY independent DB sessions (`async: false` +
+  # `Sandbox.checkout(AdminRepo, sandbox: false)`). It cannot be proven at this
+  # HTTP layer under `use ConnCase, async: true`: a `Task.async` race there
+  # multiplexes every `Sandbox.allow`-shared process onto ONE checked-out
+  # sandbox connection, so the two enroll transactions never truly contend on the
+  # tenant-row `FOR UPDATE` lock — the outcome is decided by nondeterministic
+  # DBConnection interleaving (intermittently both-201 / both-401 / a deadlock
+  # crash), NOT by the production lock. That is exactly the sandbox limitation
+  # documented in `test/loopctl/rate_limiter/postgres_concurrency_test.exs` and in
+  # `enrollment_lock_test.exs`'s own moduledoc, so this describe block was a
+  # structurally-flaky duplicate and was removed. The controller's mapping of
+  # `Enrollment.enroll -> {:error, :reauth_required}` to HTTP 401
+  # (`error.code == "reauth_required"`) is covered deterministically by the
+  # "subsequent enrollment gate (TC-26.7.2.2)" test above.
 end

@@ -26,8 +26,22 @@ defmodule Loopctl.RateLimiter.PostgresTest do
 
   defp bucket(prefix), do: "test:#{prefix}:#{Ecto.UUID.generate()}"
 
+  # Pin the DI clock to a fixed instant well inside a single unix-minute window so
+  # a multi-call `check_rate` SEQUENCE cannot straddle a real 60s window boundary
+  # mid-test. Without this the default `MockClock` stub (DataCase) returns real
+  # `DateTime.utc_now/0`; under full-suite load the several sequential AdminRepo
+  # round-trips can cross the boundary, roll the counter to a fresh window_start,
+  # and reset the count mid-sequence — the source of the intermittent
+  # off-by-a-count / unexpected-allow failures. The instant is mid-window (t=30s)
+  # so it is nowhere near either edge.
+  defp pin_clock(instant \\ ~U[2026-07-15 10:00:30Z]) do
+    stub(Loopctl.MockClock, :utc_now, fn -> instant end)
+    :ok
+  end
+
   describe "check_rate/3 fixed-window counting" do
     test "allows up to the limit then denies within the same window" do
+      pin_clock()
       b = bucket("count")
       limit = 5
 
@@ -52,6 +66,7 @@ defmodule Loopctl.RateLimiter.PostgresTest do
     end
 
     test "tenant/key isolation: different buckets do not share a counter" do
+      pin_clock()
       b1 = bucket("iso-a")
       b2 = bucket("iso-b")
       limit = 2
@@ -165,6 +180,7 @@ defmodule Loopctl.RateLimiter.PostgresTest do
       # allow/deny sequence single-node — so selecting it changes only the STORE
       # (per-node → shared), never the per-request decision a limit yields. This
       # runs the real `Postgres.check_rate/3`, so deleting it fails the test.
+      pin_clock()
       b = bucket("parity")
       limit = 4
 

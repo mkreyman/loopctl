@@ -1229,100 +1229,15 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     end
   end
 
-  # US-34.3 review fix (MED #1): `run_embedding_task/3` is the single choke point
-  # for the `[:loopctl, :llm, :provider_error]` signal's embedding half — it must
-  # fire for EVERY embedding call site (not just the two Oban workers), including
-  # `Knowledge.generate_embedding/3` called directly, which is what every
-  # query-time caller (combined/semantic search, novelty scoring, `Memory.recall/2`,
-  # promotion) ultimately does. Prior to the fix, none of these calls emitted the
-  # signal at all — only the workers did.
-  describe "generate_embedding/3 - provider_error telemetry (US-34.3 review fix MED #1)" do
-    defp attach_provider_error_listener(test_pid) do
-      handler_id = {:generate_embedding_provider_error_test, System.unique_integer([:positive])}
-
-      :telemetry.attach(
-        handler_id,
-        [:loopctl, :llm, :provider_error],
-        fn
-          # Forward ONLY embedding-provider events. `[:loopctl, :llm, :provider_error]`
-          # is a VM-GLOBAL telemetry event, so under `async: true` a concurrent
-          # Anthropic-path test emitting it with provider="anthropic" would otherwise
-          # leak into this test's mailbox — failing the `assert_received`/
-          # `refute_received` assertions below non-deterministically.
-          _event, measurements, %{provider: "embedding"} = metadata, _config ->
-            send(test_pid, {:provider_error_emitted, measurements, metadata})
-
-          _event, _measurements, _metadata, _config ->
-            :ok
-        end,
-        nil
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
-    end
-
-    test "a genuine 5xx failure emits provider=embedding class=:transient" do
-      %{tenant: tenant} = setup_tenant()
-      Knowledge.reset_circuit_breaker(tenant.id)
-      attach_provider_error_listener(self())
-
-      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
-        {:error, {:api_error, 500, :provider_error}}
-      end)
-
-      assert {:error, {:api_error, 500, _}} = Knowledge.generate_embedding(tenant.id, "q")
-
-      assert_received {:provider_error_emitted, %{count: 1}, metadata}
-      assert metadata == %{provider: "embedding", class: :transient}
-    end
-
-    test "a per-tenant 4xx (credential/quota) NEVER emits provider_error (gated by breaker_countable?/1, mirrors the circuit breaker exemption)" do
-      %{tenant: tenant} = setup_tenant()
-      Knowledge.reset_circuit_breaker(tenant.id)
-      attach_provider_error_listener(self())
-
-      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
-        {:error, {:api_error, 401, :provider_error}}
-      end)
-
-      assert {:error, {:api_error, 401, _}} = Knowledge.generate_embedding(tenant.id, "q")
-
-      refute_received {:provider_error_emitted, _measurements, _metadata}
-    end
-
-    test "a keyless tenant's :no_api_key never emits provider_error (a config gap, not a provider incident)" do
-      %{tenant: tenant} = setup_tenant()
-      Knowledge.reset_circuit_breaker(tenant.id)
-      attach_provider_error_listener(self())
-
-      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
-        {:error, :no_api_key}
-      end)
-
-      assert {:error, :no_api_key} = Knowledge.generate_embedding(tenant.id, "q")
-
-      refute_received {:provider_error_emitted, _measurements, _metadata}
-    end
-
-    test "the circuit breaker's own :circuit_open short-circuit never emits provider_error (a derived, already-counted consequence)" do
-      %{tenant: tenant} = setup_tenant()
-      Knowledge.reset_circuit_breaker(tenant.id)
-
-      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
-        {:error, {:api_error, 500, :provider_error}}
-      end)
-
-      # Trip the breaker first (3 failures).
-      for _i <- 1..3 do
-        Knowledge.generate_embedding(tenant.id, "q")
-      end
-
-      attach_provider_error_listener(self())
-      assert {:error, :circuit_open} = Knowledge.generate_embedding(tenant.id, "q")
-
-      refute_received {:provider_error_emitted, _measurements, _metadata}
-    end
-  end
+  # NOTE: the `generate_embedding/3 - provider_error telemetry (US-34.3 review fix
+  # MED #1)` describe block was EXTRACTED to the sibling module
+  # `test/loopctl/knowledge_semantic_search_provider_error_test.exs`, which runs
+  # `async: false`. Those tests attach a handler on the VM-global
+  # `[:loopctl, :llm, :provider_error]` telemetry event, whose metadata carries no
+  # `tenant_id` (see `Loopctl.LLM.record_provider_error/2`), so the handler cannot
+  # be tenant-scoped and a concurrent embedding emitter would leak into its mailbox
+  # and trip `refute_received`. Keeping this file `async: true` requires them to
+  # live in the non-async sibling.
 
   # --- Score normalization edge case ---
 
