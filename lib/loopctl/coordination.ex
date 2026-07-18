@@ -24,6 +24,7 @@ defmodule Loopctl.Coordination do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Coordination.ChannelPost
+  alias Loopctl.Projects
 
   # Uniform retention for every post — one authoritative constant in code, not a
   # DB default (owner decision; the fleet audit showed the category taxonomy and
@@ -45,21 +46,29 @@ defmodule Loopctl.Coordination do
   `session_id`/`host`/`key`/`refs` are cast from `attrs`. `expires_at` is fixed at
   `now + #{@retention_days} days`.
 
-  Returns `{:ok, %ChannelPost{}}` or `{:error, %Ecto.Changeset{}}` (size/shape
-  bound violation or a secret-denylist hit — the caller learns the content did
-  not land).
+  The `project_id` must belong to `tenant_id`; a mispaired call returns
+  `{:error, :not_found}` rather than inserting a cross-tenant-shaped row (the
+  primitive asserts its own ownership invariant — the write endpoint's fuller
+  ownership/audit path is US-39.2).
+
+  Returns `{:ok, %ChannelPost{}}`, `{:error, %Ecto.Changeset{}}` (size/shape
+  bound violation, a secret-denylist hit, or a session-key slot collision — the
+  caller learns the content did not land), or `{:error, :not_found}` when the
+  project does not belong to the tenant.
   """
   @spec create_post(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
-          {:ok, ChannelPost.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, ChannelPost.t()} | {:error, Ecto.Changeset.t()} | {:error, :not_found}
   def create_post(tenant_id, project_id, agent_id, attrs) do
-    %ChannelPost{
-      tenant_id: tenant_id,
-      project_id: project_id,
-      agent_id: agent_id,
-      expires_at: default_expires_at()
-    }
-    |> ChannelPost.create_changeset(attrs)
-    |> AdminRepo.insert()
+    with {:ok, _project} <- Projects.get_project(tenant_id, project_id) do
+      %ChannelPost{
+        tenant_id: tenant_id,
+        project_id: project_id,
+        agent_id: agent_id,
+        expires_at: default_expires_at()
+      }
+      |> ChannelPost.create_changeset(attrs)
+      |> AdminRepo.insert()
+    end
   end
 
   @doc """
@@ -78,7 +87,7 @@ defmodule Loopctl.Coordination do
     ChannelPost
     |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
     |> where([p], p.expires_at > ^now)
-    |> order_by([p], desc: p.inserted_at)
+    |> order_by([p], desc: p.inserted_at, desc: p.id)
     |> limit(^limit)
     |> AdminRepo.all()
   end

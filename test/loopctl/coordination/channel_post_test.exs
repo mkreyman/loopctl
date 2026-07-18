@@ -44,6 +44,34 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       assert %{key: _} = errors_on(cs)
     end
 
+    test "rejects a keyed post without a session_id (per-session slot needs a session)" do
+      cs = ChannelPost.create_changeset(base_struct(), %{"body" => "ok", "key" => "session_goal"})
+      refute cs.valid?
+      assert %{session_id: _} = errors_on(cs)
+    end
+
+    test "accepts a keyed post that carries a session_id" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "key" => "session_goal",
+          "session_id" => "S1"
+        })
+
+      assert cs.valid?
+    end
+
+    test "body cap is byte-based, not grapheme-based" do
+      # 8_193 multibyte (2-byte) chars = 16_386 bytes > 16_384, but only 8_193
+      # graphemes — a grapheme-based cap would wrongly accept it.
+      big = String.duplicate("é", 8_193)
+      assert byte_size(big) > 16_384
+      assert String.length(big) < 16_384
+      cs = ChannelPost.create_changeset(base_struct(), %{"body" => big})
+      refute cs.valid?
+      assert %{body: _} = errors_on(cs)
+    end
+
     test "rejects refs with a key outside the allowlist" do
       cs =
         ChannelPost.create_changeset(base_struct(), %{

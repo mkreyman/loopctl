@@ -79,29 +79,55 @@ defmodule Loopctl.Coordination.ChannelPost do
   on the struct by the context and are validated for presence here as a guard
   against a context bug — they are never castable.
 
-  Enforces the size/shape bounds (`body` <= 16KB, `key` <= 200, constrained
+  Enforces the size/shape bounds (`body` <= 16KB, `key` <= 200 bytes, constrained
   `refs`) and runs the shared secret denylist over `body`, every `refs` value,
   and `key` — a match rejects the write (surfaced as a 422) rather than silently
   dropping the content.
+
+  A keyed post is a per-session working-state slot, so `session_id` is required
+  whenever `key` is present — without it the partial unique index (which treats a
+  NULL `session_id` as distinct) can never dedupe the slot. The DB constraints
+  (the session-key partial unique index and the tenant/project foreign keys) are
+  declared here so a collision or missing parent surfaces as `{:error, changeset}`
+  (422) rather than an unhandled `Ecto.ConstraintError` (500).
   """
   @spec create_changeset(t(), map()) :: Ecto.Changeset.t()
   def create_changeset(post, attrs) do
     post
     |> cast(attrs, [:session_id, :host, :key, :body, :refs])
     |> validate_required([:tenant_id, :project_id, :agent_id, :body, :expires_at])
-    |> validate_length(:body, max: @body_max_length)
-    |> validate_length(:key, max: @key_max_length)
+    |> validate_length(:body, max: @body_max_length, count: :bytes)
+    |> validate_length(:key, max: @key_max_length, count: :bytes)
+    |> maybe_require_session_for_key()
     |> validate_refs()
     |> validate_no_secrets()
+    |> foreign_key_constraint(:tenant_id)
+    |> foreign_key_constraint(:project_id)
+    |> unique_constraint(:key,
+      name: :channel_posts_session_key_uidx,
+      message: "has already been used by this session (working-state slot)"
+    )
   end
 
-  @doc "Maximum allowed `body` length in characters."
+  @doc "Maximum allowed `body` length in bytes."
   @spec body_max_length() :: pos_integer()
   def body_max_length, do: @body_max_length
 
   @doc "Allowed keys for the `refs` map."
   @spec allowed_ref_keys() :: [String.t()]
   def allowed_ref_keys, do: @allowed_ref_keys
+
+  # A keyed post occupies a per-(tenant, project, session) working-state slot. The
+  # partial unique index includes session_id, and Postgres treats a NULL session_id
+  # as distinct — so without a session_id a keyed post can never upsert/dedupe and
+  # would accumulate unbounded duplicate rows. Require session_id whenever key is set.
+  defp maybe_require_session_for_key(changeset) do
+    if get_field(changeset, :key) do
+      validate_required(changeset, :session_id)
+    else
+      changeset
+    end
+  end
 
   defp validate_refs(changeset) do
     validate_change(changeset, :refs, fn :refs, refs ->

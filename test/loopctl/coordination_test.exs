@@ -28,6 +28,32 @@ defmodule Loopctl.CoordinationTest do
       assert_in_delta DateTime.to_unix(post.expires_at), DateTime.to_unix(expected), 120
     end
 
+    test "a mispaired project (belongs to another tenant) returns {:error, :not_found}" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+
+      assert {:error, :not_found} =
+               Coordination.create_post(tenant_a.id, project_b.id, Ecto.UUID.generate(), %{
+                 "body" => "cross-tenant attempt"
+               })
+    end
+
+    test "a duplicate same-session keyed post returns {:error, changeset}, not a raise" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = Ecto.UUID.generate()
+
+      attrs = %{"body" => "goal", "session_id" => "S1", "key" => "session_goal"}
+
+      assert {:ok, _post} = Coordination.create_post(tenant.id, project.id, agent_id, attrs)
+
+      assert {:error, %Ecto.Changeset{} = cs} =
+               Coordination.create_post(tenant.id, project.id, agent_id, attrs)
+
+      assert %{key: _} = errors_on(cs)
+    end
+
     test "accepts valid refs restricted to the allowlist" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
