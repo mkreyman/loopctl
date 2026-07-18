@@ -2776,9 +2776,9 @@ const TOOLS = [
     name: "get_ingestion_anomalies",
     description:
       "Get ingestion-health anomalies — capture-silence (a source_type that was producing " +
-      "articles has gone silent) and high article-write rejection rate. Use to check whether " +
-      "knowledge capture is still landing. Paginated (page/page_size); advance `page` to " +
-      "enumerate all. Filter by source_type, anomaly_type, resolved status, or include archived.",
+      "articles has gone silent). Use to check whether knowledge capture is still landing. " +
+      "Paginated (page/page_size); advance `page` to enumerate all. Filter by source_type, " +
+      "anomaly_type, resolved status, or include archived.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2788,7 +2788,8 @@ const TOOLS = [
         },
         anomaly_type: {
           type: "string",
-          description: 'Optional: filter by anomaly type (e.g. "capture_silence").',
+          enum: ["capture_silence"],
+          description: 'Optional: filter by anomaly type (only "capture_silence" is currently produced).',
         },
         resolved: {
           type: "string",

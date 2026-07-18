@@ -10,8 +10,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Added
 
 - **`get_ingestion_anomalies`** — list ingestion-health anomalies (capture-silence: a
-  `source_type` that was producing articles has gone silent; and high article-write
-  rejection rate) over `GET /api/v1/ingestion-anomalies` (orchestrator key). Use it to
+  `source_type` that was producing articles has gone silent) over
+  `GET /api/v1/ingestion-anomalies` (orchestrator key). Use it to
   check whether knowledge capture is still landing. Paginated (`page`/`page_size`), with
   optional `source_type`, `anomaly_type`, `resolved` (`false`/`true`/`all`), and
   `include_archived` filters. Complements `get_cost_anomalies`.
