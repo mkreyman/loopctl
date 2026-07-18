@@ -692,6 +692,114 @@ defmodule Loopctl.CoordinationTest do
     end
   end
 
+  describe "delete_post/3" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      audit = [
+        actor_type: "api_key",
+        actor_id: Ecto.UUID.generate(),
+        actor_label: "agent:deleter-1"
+      ]
+
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit}
+    end
+
+    test "deletes a post in the tenant, removes it from recent, writes a 'deleted' audit row (TC-39.7.1)",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "oops, a secret"})
+
+      assert {:ok, deleted} = Coordination.delete_post(tenant.id, agent_id, post.id, audit)
+      assert deleted.id == post.id
+
+      # Row is gone.
+      assert is_nil(AdminRepo.get(ChannelPost, post.id))
+      refute Enum.any?(Coordination.recent(tenant.id, project.id), &(&1.id == post.id))
+
+      # Audit trail survives the hard delete.
+      entry = one_audit_entry(tenant.id, post.id)
+      assert entry.action == "deleted"
+      assert entry.entity_type == "channel_post"
+      assert entry.actor_label == "agent:deleter-1"
+      assert entry.metadata["deleted_post_agent_id"] == agent_id
+    end
+
+    test "any agent B in the same tenant may delete agent A's post; audit actor is B (TC-39.7.2)",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_a} = ctx
+      agent_b = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_a, %{"body" => "from A"})
+
+      audit_b = [
+        actor_type: "api_key",
+        actor_id: Ecto.UUID.generate(),
+        actor_label: "agent:agent-b"
+      ]
+
+      assert {:ok, _deleted} = Coordination.delete_post(tenant.id, agent_b, post.id, audit_b)
+      assert is_nil(AdminRepo.get(ChannelPost, post.id))
+
+      entry = one_audit_entry(tenant.id, post.id)
+      assert entry.action == "deleted"
+      # The DELETING agent (B) is the audit actor — distinct from the author (A).
+      assert entry.actor_label == "agent:agent-b"
+      assert entry.metadata["deleted_post_agent_id"] == agent_a
+      assert entry.metadata["deleted_by_agent_id"] == agent_b
+    end
+
+    test "a cross-tenant post id returns {:error, :not_found} and the foreign row still exists (TC-39.7.3)",
+         ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+      other = fixture(:tenant)
+      other_project = fixture(:project, %{tenant_id: other.id})
+      other_agent = fixture(:agent, %{tenant_id: other.id}).id
+
+      {:ok, foreign_post} =
+        Coordination.create_post(other.id, other_project.id, other_agent, %{"body" => "theirs"})
+
+      assert {:error, :not_found} =
+               Coordination.delete_post(tenant.id, agent_id, foreign_post.id, audit)
+
+      # The other tenant's post is untouched.
+      assert %ChannelPost{} = AdminRepo.get(ChannelPost, foreign_post.id)
+    end
+
+    test "a nonexistent random UUID returns {:error, :not_found} (TC-39.7.4)", ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+
+      assert {:error, :not_found} =
+               Coordination.delete_post(tenant.id, agent_id, Ecto.UUID.generate(), audit)
+    end
+
+    test "a malformed (non-UUID) post id returns {:error, :not_found}, never a CastError", ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+
+      assert {:error, :not_found} =
+               Coordination.delete_post(tenant.id, agent_id, "not-a-uuid", audit)
+    end
+
+    test "tenant isolation: deleting with the wrong tenant_id does not remove the row", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+      other = fixture(:tenant)
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "mine"})
+
+      # Same post id, but scoped to a different tenant → not found, row intact.
+      assert {:error, :not_found} =
+               Coordination.delete_post(other.id, agent_id, post.id, audit)
+
+      assert %ChannelPost{} = AdminRepo.get(ChannelPost, post.id)
+    end
+  end
+
   defp one_audit_entry(tenant_id, entity_id) do
     AdminRepo.one!(
       from(a in AuditLog,

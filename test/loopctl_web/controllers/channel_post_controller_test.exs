@@ -13,6 +13,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
   import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelPost
 
@@ -571,6 +572,123 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         |> get(@path, %{"project_id" => project.id})
 
       assert conn.status in [401, 403]
+    end
+  end
+
+  describe "DELETE /api/v1/channel/posts/:id" do
+    defp delete_path(id), do: "#{@path}/#{id}"
+
+    defp seed_channel_post(tenant, project, agent_id, body \\ "leaked secret") do
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => body})
+
+      post
+    end
+
+    # TC-39.7.1 + AC-39.7.5 (end to end): deletes → 204, gone from channel_recent.
+    test "an agent deletes a post in its tenant -> 204 and it is gone from channel_recent" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+      post = seed_channel_post(tenant, project, agent.id)
+
+      conn = authed_conn(raw) |> delete(delete_path(post.id))
+      assert response(conn, 204) == ""
+
+      # AC-39.7.5: no longer surfaced by channel_recent.
+      read = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+      assert %{"data" => data} = json_response(read, 200)
+      refute Enum.any?(data, &(&1["id"] == post.id))
+
+      # AC-39.7.3: the deletion is audited even though the row is gone.
+      entry =
+        AdminRepo.one!(
+          from(a in AuditLog,
+            where:
+              a.tenant_id == ^tenant.id and a.entity_type == "channel_post" and
+                a.entity_id == ^post.id and a.action == "deleted"
+          )
+        )
+
+      assert entry.action == "deleted"
+    end
+
+    # TC-39.7.2: any agent B in the same tenant can delete agent A's post.
+    test "agent B in the same tenant deletes agent A's post -> 204, audit actor is B's key" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {_raw_a, _key_a, agent_a} = agent_key(tenant)
+      {raw_b, key_b, _agent_b} = agent_key(tenant)
+
+      post = seed_channel_post(tenant, project, agent_a.id, "from A")
+
+      conn = authed_conn(raw_b) |> delete(delete_path(post.id))
+      assert response(conn, 204) == ""
+
+      entry =
+        AdminRepo.one!(
+          from(a in AuditLog,
+            where:
+              a.tenant_id == ^tenant.id and a.entity_type == "channel_post" and
+                a.entity_id == ^post.id and a.action == "deleted"
+          )
+        )
+
+      # The deleting key (B) is the audit actor — not the post's author (A).
+      assert entry.actor_id == key_b.id
+      assert entry.metadata["deleted_post_agent_id"] == agent_a.id
+    end
+
+    # TC-39.7.3: cross-tenant delete → 404, the other tenant's post still exists.
+    test "a cross-tenant delete returns 404 and the other tenant's post still exists" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant)
+
+      other = fixture(:tenant)
+      other_project = fixture(:project, %{tenant_id: other.id})
+      other_agent = fixture(:agent, %{tenant_id: other.id})
+      foreign_post = seed_channel_post(other, other_project, other_agent.id, "theirs")
+
+      conn = authed_conn(raw) |> delete(delete_path(foreign_post.id))
+      assert json_response(conn, 404)
+
+      # The foreign row is untouched.
+      assert %ChannelPost{} = AdminRepo.get(ChannelPost, foreign_post.id)
+    end
+
+    # TC-39.7.4: nonexistent random UUID → 404, body byte-identical to cross-tenant.
+    test "a nonexistent random UUID returns 404 with a body byte-identical to the cross-tenant 404" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant)
+
+      other = fixture(:tenant)
+      other_project = fixture(:project, %{tenant_id: other.id})
+      other_agent = fixture(:agent, %{tenant_id: other.id})
+      foreign_post = seed_channel_post(other, other_project, other_agent.id, "theirs")
+
+      cross = authed_conn(raw) |> delete(delete_path(foreign_post.id))
+      nonexistent = authed_conn(raw) |> delete(delete_path(Ecto.UUID.generate()))
+
+      assert cross.status == 404
+      assert nonexistent.status == 404
+      # No existence oracle: the two 404 bodies are byte-identical.
+      assert cross.resp_body == nonexistent.resp_body
+    end
+
+    test "the route requires agent role (an unauthenticated caller cannot delete)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {_raw, _key, agent} = agent_key(tenant)
+      post = seed_channel_post(tenant, project, agent.id)
+
+      conn =
+        build_conn()
+        |> put_req_header("x-loopctl-last-known-sth", @sth_header)
+        |> delete(delete_path(post.id))
+
+      assert conn.status in [401, 403]
+      # The post is untouched by the rejected request.
+      assert %ChannelPost{} = AdminRepo.get(ChannelPost, post.id)
     end
   end
 end
