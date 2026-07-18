@@ -133,6 +133,11 @@ defmodule LoopctlWeb.Router do
     # of a project's live channel. project_id/since/limit query params; the tenant
     # is key-derived, never from params.
     get "/channel/posts", ChannelPostController, :index
+    # channel post redact/delete (US-39.7): agent-role, tenant-scoped HARD delete
+    # of a leaked/regretted post before its 30-day TTL. Any agent in the tenant may
+    # delete any post in that tenant; a foreign/nonexistent id is a byte-identical
+    # 404 (no cross-tenant oracle). Audited in-transaction. NOT human-anchor gated.
+    delete "/channel/posts/:id", ChannelPostController, :delete
 
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update

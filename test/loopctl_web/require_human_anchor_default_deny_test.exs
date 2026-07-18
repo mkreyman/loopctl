@@ -194,6 +194,11 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # server-stamped from the verified key, tenant-scoped — so it is
                # deliberately OUTSIDE the human-anchor tier gate (design brief §4).
                {:post, "/api/v1/channel/posts"},
+               # US-39.7 channel post redact/delete — same COORDINATION surface
+               # (agent-role, authorship/tenant server-derived from the verified
+               # key, tenant-scoped), NOT chain-of-custody, so deliberately outside
+               # the human-anchor tier gate (design brief §3, owner decision #331).
+               {:delete, "/api/v1/channel/posts/:id"},
 
                # Superadmin-only admin scope — RequireRole already pins these
                # to superadmin; Impersonate explicitly skips

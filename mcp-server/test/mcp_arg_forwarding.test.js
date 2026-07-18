@@ -210,6 +210,40 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// #39.7: channel_delete (Repo Coordination Bus redact path)
+// ---------------------------------------------------------------------------
+
+describe("#39.7: channel_delete wiring", () => {
+  test("TOOLS declares channel_delete", () => {
+    assert.match(INDEX_SRC, /name: "channel_delete",/, 'must declare a "channel_delete" tool');
+  });
+
+  test("channelDelete DELETEs /channel/posts/${post_id} on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelDelete\([\s\S]*?"DELETE",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelDelete must DELETE /api/v1/channel/posts/${post_id} with the agent key",
+    );
+  });
+
+  test("the channel_delete tool requires post_id", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_delete",[\s\S]*?required: \["post_id"\]/,
+      "the channel_delete inputSchema must require post_id",
+    );
+  });
+
+  test("the channel_delete dispatch case calls channelDelete(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_delete":\s*\n\s*return await channelDelete\(args\);/,
+      "the channel_delete dispatch case must call channelDelete(args)",
+    );
+  });
+});
+
 describe("KB-scope lifecycle: archive_kb_scope / restore_kb_scope wiring", () => {
   test("TOOLS declares archive_kb_scope and restore_kb_scope", () => {
     assert.match(INDEX_SRC, /name: "archive_kb_scope",/, 'must declare "archive_kb_scope"');

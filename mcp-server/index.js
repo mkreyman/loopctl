@@ -477,6 +477,21 @@ async function channelRecent({ project_id, since, limit }) {
   return toContent(result);
 }
 
+async function channelDelete({ post_id }) {
+  // Repo Coordination Bus (Epic 39, US-39.7): HARD-delete a coordination post in
+  // the caller's tenant — the redact path for a leaked/regretted post, before its
+  // 30-day TTL. Agent-role, tenant-scoped: any agent in the tenant may delete any
+  // post in that tenant; a foreign or nonexistent id returns a 404 (no cross-tenant
+  // existence oracle).
+  const result = await apiCall(
+    "DELETE",
+    `/api/v1/channel/posts/${post_id}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function deleteProject({ project_id }) {
   const result = await apiCall(
     "DELETE",
@@ -2301,6 +2316,21 @@ const TOOLS = [
         },
       },
       required: ["project_id"],
+    },
+  },
+  {
+    name: "channel_delete",
+    description:
+      "Delete a post from a repo coordination channel (Epic 39 Repo Coordination Bus) on the agent key — the redact path (US-39.7). Use this to immediately remove a leaked or regretted post (e.g. one that slipped a secret past the denylist) before its 30-day TTL. Agent-role, tenant-scoped: any agent in your tenant may delete any post in that tenant, enabling cleanup by whoever notices the leak. A post that does not exist in your tenant (including one in another tenant) returns a 404 — no cross-tenant existence oracle. The deletion is hard (the row is gone) but audited.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        post_id: {
+          type: "string",
+          description: "UUID of the channel post to delete (must be in your tenant).",
+        },
+      },
+      required: ["post_id"],
     },
   },
   {
@@ -5118,6 +5148,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "channel_recent":
       return await channelRecent(args);
+
+    case "channel_delete":
+      return await channelDelete(args);
 
     case "delete_project":
       return await deleteProject(args);

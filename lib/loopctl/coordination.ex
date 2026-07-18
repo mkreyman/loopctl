@@ -166,6 +166,126 @@ defmodule Loopctl.Coordination do
     end
   end
 
+  @doc """
+  HARD-deletes a channel post — the redact path (US-39.7).
+
+  The backstop for a leaked/regretted post: whoever NOTICES a leaked secret (the
+  denylist is best-effort, US-39.1) can remove the row immediately, before its
+  30-day TTL (US-39.5) would sweep it. A hard delete is consistent with the
+  transient model — there is nothing to soft-retain in a channel that expires
+  wholesale.
+
+  Cooperative single-tenant model: `agent_id` is the DELETING agent (the audit
+  actor), which may differ from the post's AUTHOR `agent_id` — any agent in the
+  tenant may delete any post in that tenant, enabling cleanup by whoever spots
+  the leak. It may NEVER delete a post in another tenant: the fetch filters on
+  BOTH `id` and `tenant_id` (the explicit tenant boundary on the AdminRepo path),
+  so a foreign (or nonexistent) `post_id` returns `{:error, :not_found}` —
+  byte-identical outcomes, no cross-tenant existence oracle (KB "IDOR Prevention
+  in Multi-Tenant Delete Operations").
+
+  A malformed `post_id` (a non-UUID path segment) is guarded first and returns
+  `{:error, :not_found}` too, so a bad id is a clean 404 — never an
+  `Ecto.Query.CastError`/500 (mirrors the `valid_uuid?` guard in `recent_page/3`).
+
+  The delete and its audit entry (`entity_type "channel_post"`, action
+  `"deleted"`, actor = the deleting agent's key context, capturing the deleted
+  post's `id` as `entity_id` and the original author `agent_id` in metadata) run
+  in ONE `Ecto.Multi` transaction, so the removal stays accountable even though
+  the row is gone.
+
+  `audit` is the actor-context keyword list from
+  `LoopctlWeb.AuditContext.from_conn/1`, threaded from the controller.
+
+  Returns `{:ok, %ChannelPost{}}` (the deleted row) or `{:error, :not_found}`.
+  """
+  @spec delete_post(Ecto.UUID.t(), Ecto.UUID.t(), term(), keyword()) ::
+          {:ok, ChannelPost.t()} | {:error, :not_found | :audit_write_failed}
+  def delete_post(tenant_id, agent_id, post_id, audit \\ []) do
+    if valid_uuid?(post_id) do
+      case fetch_owned_post(tenant_id, post_id) do
+        nil -> {:error, :not_found}
+        post -> run_delete(tenant_id, agent_id, post, audit)
+      end
+    else
+      {:error, :not_found}
+    end
+  end
+
+  # Fetch a post by id CONSTRAINED to the caller's tenant — the isolation
+  # boundary on the AdminRepo (BYPASSRLS) path. A foreign-tenant or nonexistent
+  # id returns nil, so both collapse to the same 404 (no existence oracle).
+  defp fetch_owned_post(tenant_id, post_id) do
+    ChannelPost
+    |> where([p], p.id == ^post_id and p.tenant_id == ^tenant_id)
+    |> AdminRepo.one()
+  end
+
+  # Delete + audit in ONE transaction so the removal survives in the trail even
+  # though the row is hard-deleted (AC-39.7.3). The DELETING agent is the audit
+  # actor (from `audit`); the post's original author is captured in metadata.
+  defp run_delete(tenant_id, agent_id, post, audit) do
+    multi =
+      Multi.new()
+      |> Multi.delete(:post, post)
+      |> Audit.log_in_multi(:audit, fn %{post: deleted} ->
+        delete_audit_attrs(tenant_id, agent_id, deleted, audit)
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{post: post}} ->
+        {:ok, post}
+
+      # The `:audit` step failed with an invalid changeset. `Multi.delete` never
+      # yields such a tuple (a missing row RAISES `Ecto.StaleEntryError`, rescued
+      # below), so a convertible Multi error here is ALWAYS the audit insert. Because
+      # the delete and the audit share ONE transaction, a failed audit rolls the
+      # DELETE back too: the post SURVIVES. This is the redact path (a leaked
+      # secret), so folding it into the contract's `:not_found` would be
+      # fail-UNSAFE — the caller would read the resulting 404 as "already
+      # gone/handled" and believe the secret (and its 30-day-TTL SessionStart
+      # injection) is removed when it is NOT. Instead surface a DISTINCT error the
+      # controller maps to a 5xx, so the agent RETRIES the redaction rather than
+      # trusting a false 404. Matching `:audit` explicitly (not `_step`) preserves
+      # the compile-gate `run_delete/4` had: if `Audit.log_in_multi/3` is ever
+      # changed to fail with a non-changeset value, this clause stops covering it
+      # and dialyzer fails the build here rather than silently mis-mapping it.
+      {:error, :audit, %Ecto.Changeset{}, _changes} ->
+        {:error, :audit_write_failed}
+    end
+  rescue
+    # Concurrent double-delete. `fetch_owned_post/2` is an UNLOCKED read, so between
+    # it and `Multi.delete` another deleter — or the US-39.5 TTL sweep — can remove
+    # the row. The feature explicitly enables "whoever NOTICES a leaked secret,
+    # fleet-wide" to delete, making two agents deleting the same post a first-class
+    # case. The losing DELETE matches 0 rows and Ecto raises `Ecto.StaleEntryError`
+    # (Multi does NOT convert a stale delete to an `{:error, ...}` tuple; it
+    # propagates out of the transaction). A just-deleted post is now nonexistent,
+    # and the AC maps nonexistent → 404, so collapse the race to the SAME idempotent
+    # `{:error, :not_found}` a nonexistent id returns — never a 500.
+    Ecto.StaleEntryError -> {:error, :not_found}
+  end
+
+  defp delete_audit_attrs(tenant_id, agent_id, post, audit) do
+    %{
+      tenant_id: tenant_id,
+      project_id: post.project_id,
+      entity_type: "channel_post",
+      entity_id: post.id,
+      action: "deleted",
+      actor_type: Keyword.get(audit, :actor_type, "api_key"),
+      actor_id: Keyword.get(audit, :actor_id),
+      actor_label: Keyword.get(audit, :actor_label),
+      metadata:
+        audit
+        |> Keyword.get(:metadata, %{})
+        |> Map.merge(%{
+          "deleted_post_agent_id" => post.agent_id,
+          "deleted_by_agent_id" => agent_id
+        })
+    }
+  end
+
   # Assert the server-stamped agent belongs to the tenant, mapped to a DISTINCT
   # error from the project guard so the endpoint separates an identity fault (403)
   # from a cross-tenant project probe (422).

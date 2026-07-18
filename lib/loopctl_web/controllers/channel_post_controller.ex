@@ -5,6 +5,15 @@ defmodule LoopctlWeb.ChannelPostController do
   - `POST /api/v1/channel/posts` — agent+, posts one short coordination message
     to a project's channel (a channel IS a `project_id`), optionally under a
     `key` that upserts the caller's own per-session working-state slot.
+  - `GET /api/v1/channel/posts` — agent+, reads a project's live channel
+    (channel_recent), tenant-scoped and oracle-safe.
+  - `DELETE /api/v1/channel/posts/:id` — agent+, HARD-deletes a post in the
+    caller's tenant (the redact path, US-39.7): the backstop for a leaked/
+    regretted post, letting whoever notices remove it before its 30-day TTL. Any
+    agent in the tenant may delete any post in that tenant (cooperative single-
+    tenant model); a foreign or nonexistent id is a byte-identical 404 (no
+    cross-tenant existence oracle). Same coordination trust posture as the write:
+    `role: :agent`, deliberately NOT behind `RequireHumanAnchor`.
 
   ## Trust posture (owner decision #331, design brief §4)
 
@@ -49,7 +58,7 @@ defmodule LoopctlWeb.ChannelPostController do
   # The read (`:index`) is the same agent-role, tenant-scoped coordination surface
   # as the write — never human-anchor gated (the human-anchor default-deny test
   # only walks POST/PUT/PATCH/DELETE, so this GET needs no allowlist entry).
-  plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:create, :index]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:create, :index, :delete]
 
   # Per-write rate limit (AC-39.2.8): a TIGHTER, config-driven cap on top of the
   # generic per-key/per-tenant pipeline RateLimiter, reusing the same
@@ -151,6 +160,37 @@ defmodule LoopctlWeb.ChannelPostController do
            }
          }},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:delete,
+    summary: "Delete a repo coordination channel post (redact path)",
+    description:
+      "HARD-deletes a coordination post in the caller's tenant — the redact path (US-39.7). The " <>
+        "backstop for a leaked/regretted post: whoever notices a leaked secret can remove it " <>
+        "immediately, before its 30-day TTL. Agent+ role, NOT behind the human-anchor tier " <>
+        "(coordination surface, owner decision #331). Cooperative single-tenant model: any agent " <>
+        "in the tenant may delete any post in that tenant, but NEVER a post in another tenant — a " <>
+        "foreign OR nonexistent id returns a byte-identical 404 (no cross-tenant existence " <>
+        "oracle). The delete is audited (action \"deleted\", actor = the deleting agent) in the " <>
+        "same transaction, so the removal stays accountable even though the row is gone.",
+    parameters: [
+      id: [
+        in: :path,
+        type: :string,
+        required: true,
+        description: "The post id — must belong to the caller's tenant"
+      ]
+    ],
+    responses: %{
+      204 => "Post deleted (no content)",
+      404 =>
+        {"Post not found (nonexistent or in another tenant)", "application/json",
+         Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"The delete could not be recorded in the audit trail and was rolled back; " <>
+           "the post still exists. Retry the request.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -329,6 +369,42 @@ defmodule LoopctlWeb.ChannelPostController do
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
+    end
+  end
+
+  @doc """
+  DELETE /api/v1/channel/posts/:id
+
+  HARD-deletes a coordination post in the caller's tenant — the redact path
+  (US-39.7). Requires agent+ role (NOT human-anchor gated). Any agent in the
+  tenant may delete any post in that tenant; a foreign or nonexistent id returns
+  a byte-identical 404 via the shared `FallbackController` (no cross-tenant
+  existence oracle). The deleting agent is the audit actor.
+  """
+  def delete(conn, params) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+
+    case Coordination.delete_post(
+           tenant_id,
+           api_key.agent_id,
+           params["id"],
+           AuditContext.from_conn(conn)
+         ) do
+      {:ok, _post} ->
+        send_resp(conn, :no_content, "")
+
+      {:error, :not_found} ->
+        # Cross-tenant AND nonexistent both land here — the shared 404 body is
+        # byte-identical (no existence oracle), guaranteed by the FallbackController.
+        {:error, :not_found}
+
+      {:error, :audit_write_failed} = err ->
+        # The delete could not be durably audited, so the whole transaction rolled
+        # back and the post STILL EXISTS. On this redact path that MUST NOT masquerade
+        # as a 404 ("already gone") — the FallbackController maps this to a 5xx so the
+        # agent retries the redaction instead of trusting a false success.
+        err
     end
   end
 

@@ -5,6 +5,20 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.48.0 — 2026-07-18 (repo coordination bus — redact/delete)
+
+### Added
+
+- **`channel_delete`** — hard-delete (redact) a coordination post over
+  `DELETE /api/v1/channel/posts/:id` on the agent key (Epic 39 Repo Coordination
+  Bus, US-39.7). The backstop for a leaked/regretted post: whoever NOTICES a
+  leaked secret can remove the row immediately, before its 30-day TTL sweeps it.
+  Cooperative single-tenant model — any agent in the tenant may delete any post
+  in that tenant (the deleting agent is the audit actor), but NEVER a post in
+  another tenant: a foreign or nonexistent id returns a byte-identical 404 (no
+  cross-tenant existence oracle). The delete and its `deleted` audit entry run in
+  one transaction, so the removal stays accountable even though the row is gone.
+
 ## 2.47.0 — 2026-07-18 (repo coordination bus tools)
 
 ### Added
