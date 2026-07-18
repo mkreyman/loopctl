@@ -28,7 +28,11 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
     window (the "recently established" evidence)
   - `resolved` -- whether the anomaly has been acknowledged/resolved
   - `archived` -- archived anomalies are excluded from the default list and
-    permanently suppress re-detection for a retired source_type
+    suppress re-detection for a retired source_type until un-archived
+  - `alerted` -- whether the out-of-band operator alert + webhook were fired.
+    Makes notification AT-LEAST-ONCE: a worker crash between the atomic row
+    insert and the post-commit enqueues leaves `alerted: false`, so a later run
+    re-fires the notifications instead of losing them on the no-notify path.
   - `metadata` -- extensible JSONB map
   """
 
@@ -51,6 +55,7 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
              :sample_count,
              :resolved,
              :archived,
+             :alerted,
              :metadata,
              :inserted_at,
              :updated_at
@@ -66,6 +71,7 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
     field :sample_count, :integer
     field :resolved, :boolean, default: false
     field :archived, :boolean, default: false
+    field :alerted, :boolean, default: false
     field :metadata, :map, default: %{}
 
     timestamps()
@@ -116,15 +122,42 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
   @doc """
   Changeset for archiving an anomaly.
 
-  Archiving is the operator's PERMANENT escape hatch for a legitimately-retired
+  Archiving is the operator's escape hatch for a legitimately-retired
   `source_type`: an archived anomaly is excluded from the default list AND
   suppresses re-detection for that source_type (see
   `Loopctl.Workers.IngestionHealthWorker`), so a wound-down workflow is not
-  re-flagged on every hourly run.
+  re-flagged on every hourly run. It is REVERSIBLE via `unarchive_changeset/1`
+  so a mistaken archive (e.g. a workflow later revived) can restore monitoring.
   """
   @spec archive_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
   def archive_changeset(anomaly) do
     change(anomaly, archived: true)
+  end
+
+  @doc """
+  Changeset for un-archiving an anomaly — the inverse of `archive_changeset/1`.
+
+  Restores monitoring for a source_type whose anomaly was archived: once
+  `archived` is false again, `Loopctl.Workers.IngestionHealthWorker` no longer
+  suppresses re-detection, so a revived workflow that goes silent is caught
+  again. Without this the archive escape hatch would be a permanent, irreversible
+  blind spot — the exact failure the dead-man's-switch exists to eliminate.
+  """
+  @spec unarchive_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
+  def unarchive_changeset(anomaly) do
+    change(anomaly, archived: false)
+  end
+
+  @doc """
+  Changeset that records the out-of-band operator alert + webhook were fired.
+
+  Used to make notification at-least-once: set only AFTER the post-commit
+  enqueues succeed, so a crash before this leaves `alerted: false` and a later
+  run re-fires the notifications rather than losing them.
+  """
+  @spec mark_alerted_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
+  def mark_alerted_changeset(anomaly) do
+    change(anomaly, alerted: true)
   end
 
   @metadata_max_bytes 65_536

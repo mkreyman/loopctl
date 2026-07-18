@@ -1,6 +1,8 @@
 defmodule LoopctlWeb.IngestionAnomalyControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
+  alias Loopctl.Knowledge.IngestionHealth
+
   setup :verify_on_exit!
 
   defp auth_conn(conn, raw_key) do
@@ -149,6 +151,61 @@ defmodule LoopctlWeb.IngestionAnomalyControllerTest do
       assert body["ingestion_anomaly"]["archived"] == true
       # Archiving does not resolve — it is a distinct disposition.
       assert body["ingestion_anomaly"]["resolved"] == false
+    end
+
+    test "un-archives an anomaly with ?archived=false (user)", %{conn: conn} do
+      ctx = setup_tenant_with_anomalies()
+
+      archived =
+        fixture(:ingestion_anomaly, %{
+          tenant_id: ctx.tenant.id,
+          source_type: "manual",
+          archived: true
+        })
+
+      conn =
+        conn
+        |> auth_conn(ctx.user_key)
+        |> patch(~p"/api/v1/ingestion-anomalies/#{archived.id}?archived=false")
+
+      body = json_response(conn, 200)
+      assert body["ingestion_anomaly"]["id"] == archived.id
+      assert body["ingestion_anomaly"]["archived"] == false
+    end
+
+    test "malformed ?archived value is rejected with 422, not silently resolved", %{conn: conn} do
+      ctx = setup_tenant_with_anomalies()
+
+      conn =
+        conn
+        |> auth_conn(ctx.user_key)
+        |> patch(~p"/api/v1/ingestion-anomalies/#{ctx.anomaly1.id}?archived=1")
+
+      assert json_response(conn, 422)
+
+      # The anomaly was NOT resolved as a side effect of the malformed request:
+      # it still appears in the default (unresolved-only) list.
+      {:ok, %{data: data}} = IngestionHealth.list_anomalies(ctx.tenant.id)
+      assert ctx.anomaly1.id in Enum.map(data, & &1.id)
+    end
+
+    test "resolved=all returns both resolved and unresolved in one call", %{conn: conn} do
+      ctx = setup_tenant_with_anomalies()
+
+      fixture(:ingestion_anomaly, %{
+        tenant_id: ctx.tenant.id,
+        source_type: "manual",
+        resolved: true
+      })
+
+      conn =
+        conn
+        |> auth_conn(ctx.user_key)
+        |> get(~p"/api/v1/ingestion-anomalies?resolved=all")
+
+      body = json_response(conn, 200)
+      # 2 unresolved (from setup) + 1 resolved = 3.
+      assert body["meta"]["total_count"] == 3
     end
 
     test "returns 403 for orchestrator (resolve requires :user)", %{conn: conn} do

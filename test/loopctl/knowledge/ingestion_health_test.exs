@@ -68,6 +68,24 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
       assert length(candidates) == 1
     end
 
+    test "honors a per-source-type establishment threshold override" do
+      tenant = fixture(:tenant)
+      # Only 2 stale captures — below the global threshold of 5, but an override
+      # lowers the bar for this low-volume-but-critical source_type.
+      for _ <- 1..2, do: captured(tenant.id, "session_log", @stale_hours)
+
+      candidates =
+        IngestionHealth.detect(%{
+          monitored_source_types: ["session_log"],
+          established_threshold: 5,
+          established_threshold_overrides: %{"session_log" => 2},
+          staleness_threshold_hours: 72
+        })
+        |> Enum.filter(&(&1.tenant_id == tenant.id))
+
+      assert [%{source_type: "session_log", sample_count: 2}] = candidates
+    end
+
     test "tenant isolation — a stale tenant does not surface another tenant's data" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
@@ -183,6 +201,128 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
 
       assert data == []
       assert total == 0
+    end
+
+    test "resolved: :all returns both resolved and unresolved" do
+      tenant = fixture(:tenant)
+      fixture(:ingestion_anomaly, %{tenant_id: tenant.id, source_type: "session_log"})
+
+      fixture(:ingestion_anomaly, %{
+        tenant_id: tenant.id,
+        source_type: "manual",
+        resolved: true
+      })
+
+      {:ok, %{total: default_total}} = IngestionHealth.list_anomalies(tenant.id)
+      assert default_total == 1
+
+      {:ok, %{total: all_total}} = IngestionHealth.list_anomalies(tenant.id, resolved: :all)
+      assert all_total == 2
+    end
+
+    test "recomputes hours_stale for an unresolved anomaly at read time" do
+      tenant = fixture(:tenant)
+      # last_event_at 200h ago but a stale detection-time snapshot of only 80h.
+      anomaly =
+        fixture(:ingestion_anomaly, %{
+          tenant_id: tenant.id,
+          source_type: "session_log",
+          hours_stale: 80,
+          last_event_at: DateTime.add(DateTime.utc_now(), -200, :hour)
+        })
+
+      {:ok, %{data: [read]}} = IngestionHealth.list_anomalies(tenant.id)
+      assert read.id == anomaly.id
+      # Read-time recompute reports the TRUE current age (~200h), not the frozen 80h.
+      assert read.hours_stale >= 199
+    end
+  end
+
+  describe "unarchive_anomaly/3" do
+    test "flips archived back to false and restores monitoring, with an audit entry" do
+      tenant = fixture(:tenant)
+      anomaly = fixture(:ingestion_anomaly, %{tenant_id: tenant.id, archived: true})
+
+      assert {:ok, unarchived} =
+               IngestionHealth.unarchive_anomaly(tenant.id, anomaly.id, actor_type: "api_key")
+
+      assert unarchived.archived == false
+
+      audit_count =
+        from(a in AuditLog,
+          where:
+            a.tenant_id == ^tenant.id and a.entity_type == "ingestion_anomaly" and
+              a.action == "unarchived" and a.entity_id == ^anomaly.id
+        )
+        |> AdminRepo.aggregate(:count)
+
+      assert audit_count == 1
+    end
+
+    test "un-archiving a non-archived anomaly is an idempotent no-op (no bogus audit)" do
+      tenant = fixture(:tenant)
+      anomaly = fixture(:ingestion_anomaly, %{tenant_id: tenant.id, archived: false})
+
+      assert {:ok, result} = IngestionHealth.unarchive_anomaly(tenant.id, anomaly.id)
+      assert result.archived == false
+
+      audit_count =
+        from(a in AuditLog,
+          where:
+            a.tenant_id == ^tenant.id and a.entity_type == "ingestion_anomaly" and
+              a.action == "unarchived"
+        )
+        |> AdminRepo.aggregate(:count)
+
+      assert audit_count == 0
+    end
+
+    test "returns :not_found for another tenant's anomaly" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      anomaly = fixture(:ingestion_anomaly, %{tenant_id: tenant_a.id, archived: true})
+
+      assert {:error, :not_found} = IngestionHealth.unarchive_anomaly(tenant_b.id, anomaly.id)
+    end
+  end
+
+  describe "auto_resolve_recovered/0" do
+    test "resolves an open anomaly whose captures have resumed" do
+      tenant = fixture(:tenant)
+
+      anomaly =
+        fixture(:ingestion_anomaly, %{
+          tenant_id: tenant.id,
+          source_type: "session_log",
+          last_event_at: DateTime.add(DateTime.utc_now(), -100, :hour)
+        })
+
+      # A capture ARRIVES after the anomaly's last_event_at → the stream recovered.
+      captured(tenant.id, "session_log", 1)
+
+      assert IngestionHealth.auto_resolve_recovered() >= 1
+
+      {:ok, reloaded} = IngestionHealth.get_anomaly(tenant.id, anomaly.id)
+      assert reloaded.resolved == true
+    end
+
+    test "leaves an open anomaly untouched while the source is still silent" do
+      tenant = fixture(:tenant)
+
+      anomaly =
+        fixture(:ingestion_anomaly, %{
+          tenant_id: tenant.id,
+          source_type: "session_log",
+          last_event_at: DateTime.add(DateTime.utc_now(), -100, :hour)
+        })
+
+      # Only OLD captures (older than last_event_at) — no recovery.
+      captured(tenant.id, "session_log", 150)
+
+      IngestionHealth.auto_resolve_recovered()
+
+      {:ok, reloaded} = IngestionHealth.get_anomaly(tenant.id, anomaly.id)
+      assert reloaded.resolved == false
     end
   end
 

@@ -10,15 +10,26 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
 
   - a `Loopctl.Audit` entry (`entity_type: "ingestion_anomaly"`, `action: "detected"`,
     `actor_type: "system"`),
+  - an always-on operator-visible `Logger.error` (so a detected silence surfaces in
+    logs/monitoring even when no optional alert channel or webhook is configured),
   - an OPERATOR alert enqueued via `Loopctl.Workers.ScaleAlertDeliveryWorker` (which
     resolves `SCALE_ALERT_WEBHOOK_URL` itself and no-ops when unset — channel-agnostic
     and safe when unconfigured; this worker never reads the URL), and
   - a per-tenant `knowledge.ingestion_anomaly_detected` webhook event.
 
   On an EXISTING unresolved anomaly it silently refreshes the figures — NO re-notify
-  (anti-alarm-fatigue), exactly like `CostAnomalyWorker`.
+  (anti-alarm-fatigue), exactly like `CostAnomalyWorker` — UNLESS that row was never
+  successfully alerted (`alerted: false`), in which case it re-fires the operator
+  alert + webhook once (at-least-once recovery; see "Alert durability" below).
 
-  ## Suppression: resolve sticks, archive is permanent
+  ## Recovery: auto-resolve when captures resume
+
+  After detection, `Loopctl.Knowledge.IngestionHealth.auto_resolve_recovered/0`
+  closes any open anomaly whose `(tenant, source_type)` has produced an article
+  newer than the anomaly's `last_event_at`. Without this a fully-recovered stream
+  would keep a stale open anomaly forever, indistinguishable from an ongoing outage.
+
+  ## Suppression: resolve sticks, archive suppresses (reversibly)
 
   A resolved anomaly is NOT re-created on the next run just because the source_type
   is still silent — that would re-fire audit + operator alert + webhook every hour
@@ -27,9 +38,18 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   `last_event_at` snapshot is at/after the candidate's), and only re-flags once
   captures RESUME (advancing `last_event_at`) and then go silent again.
 
-  An **archived** anomaly permanently suppresses re-detection for that source_type
-  (the operator's escape hatch for a legitimately-retired workflow) — regardless of
-  its resolved flag.
+  An **archived** anomaly suppresses re-detection for that source_type (the operator's
+  escape hatch for a legitimately-retired workflow) — regardless of its resolved flag.
+  Archiving is REVERSIBLE (`IngestionHealth.unarchive_anomaly/3`): un-archiving lifts
+  the suppression, so it is not a permanent blind spot.
+
+  ## Alert durability (at-least-once)
+
+  The anomaly row + `detected` audit are inserted atomically, but the operator alert
+  + webhook enqueues run POST-commit (they can't join the AdminRepo transaction — Oban
+  jobs insert through `Loopctl.Repo`). A crash between commit and enqueue would leave
+  an unresolved row with `alerted: false`; the next run detects that and re-fires the
+  notifications rather than silently losing them on the no-notify update path.
 
   ## Race-safety
 
@@ -76,6 +96,22 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
+    if anomalies_table_ready?() do
+      run()
+    else
+      # Version skew: code deployed on the hourly crontab before its table
+      # migration landed. Skip quietly (self-heals next run) instead of crashing
+      # the job and burning Oban retries on an UndefinedTable error.
+      Logger.warning(
+        "IngestionHealthWorker: ingestion_anomalies table not present yet " <>
+          "(migration pending); skipping this run"
+      )
+
+      :ok
+    end
+  end
+
+  defp run do
     candidates = IngestionHealth.detect()
 
     Logger.info(
@@ -84,7 +120,25 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
 
     Enum.each(candidates, &flag_candidate/1)
 
+    # Close anomalies whose captures have resumed (recovered streams), so an open
+    # anomaly always means "still silent" and not "recovered but never cleared".
+    resolved = IngestionHealth.auto_resolve_recovered()
+
+    if resolved > 0 do
+      Logger.info("IngestionHealthWorker: auto-resolved #{resolved} recovered anomaly(ies)")
+    end
+
     :ok
+  end
+
+  # `to_regclass` returns NULL when the relation does not exist (no exception),
+  # so this is a cheap, crash-free readiness probe for the version-skew window.
+  defp anomalies_table_ready? do
+    case AdminRepo.query("SELECT to_regclass('ingestion_anomalies')", []) do
+      {:ok, %{rows: [[nil]]}} -> false
+      {:ok, _} -> true
+      _ -> false
+    end
   end
 
   defp flag_candidate(%{
@@ -109,8 +163,15 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
 
     cond do
       archived_suppression?(tenant_id, source_type) ->
-        # Operator archived this source_type — permanent escape hatch, never re-flag.
+        # Operator archived this source_type — escape hatch, never re-flag (until un-archived).
         :suppressed
+
+      existing && not existing.alerted ->
+        # The row was persisted (+ audited atomically) but its POST-commit operator
+        # alert + webhook never fired (worker crashed in the gap). Re-fire them now —
+        # at-least-once recovery — then refresh figures. Without this, a genuine
+        # capture-silence alert would be lost across all retries.
+        recover_lost_notification(tenant_id, existing, last_event_at, hours_stale, sample_count)
 
       existing ->
         update_existing(existing, last_event_at, hours_stale, sample_count)
@@ -127,8 +188,9 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     end
   end
 
-  # An archived anomaly (resolved or not) permanently suppresses re-detection for
-  # that source_type — the operator's escape hatch for a retired workflow.
+  # An archived anomaly (resolved or not) suppresses re-detection for that
+  # source_type — the operator's escape hatch for a retired workflow, reversible
+  # via IngestionHealth.unarchive_anomaly/3.
   defp archived_suppression?(tenant_id, source_type) do
     IngestionAnomaly
     |> where([a], a.tenant_id == ^tenant_id)
@@ -149,6 +211,49 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     |> where([a], a.archived == false)
     |> where([a], not is_nil(a.last_event_at) and a.last_event_at >= ^last_event_at)
     |> AdminRepo.exists?()
+  end
+
+  # Recovery path: the row exists but its post-commit notifications never fired
+  # (alerted=false). Re-fire the operator alert + webhook (at-least-once), mark it
+  # alerted, and refresh figures. Idempotent audit already exists from the atomic
+  # detection insert, so we do NOT re-log "detected".
+  defp recover_lost_notification(tenant_id, existing, last_event_at, hours_stale, sample_count) do
+    notify(tenant_id, existing)
+    update_existing(existing, last_event_at, hours_stale, sample_count)
+  end
+
+  # Fire the out-of-band operator alert + webhook, then flip `alerted` so a healthy
+  # run never re-fires. Ordering makes notification at-least-once: if the process
+  # dies before mark_alerted, the next run's recovery branch re-fires.
+  defp notify(tenant_id, anomaly) do
+    fire_operator_alert(tenant_id, anomaly)
+    fire_anomaly_webhook(tenant_id, anomaly)
+    mark_alerted(anomaly)
+  end
+
+  defp mark_alerted(anomaly) do
+    case anomaly |> IngestionAnomaly.mark_alerted_changeset() |> AdminRepo.update() do
+      {:ok, _updated} ->
+        :ok
+
+      {:error, changeset} ->
+        Logger.warning(
+          "IngestionHealthWorker: failed to mark anomaly #{anomaly.id} alerted: " <>
+            "#{inspect(changeset.errors)}"
+        )
+    end
+  end
+
+  # Always-on operator-visible signal, independent of the optional webhook URL and
+  # per-tenant webhook subscriptions: a detected capture-silence is a genuine
+  # operational event, so it must surface in logs/monitoring even when no alert
+  # channel is wired.
+  defp log_detected_alarm(tenant_id, anomaly) do
+    Logger.error(
+      "IngestionHealthWorker: capture-silence detected — tenant=#{tenant_id} " <>
+        "source_type=#{anomaly.source_type} hours_stale=#{anomaly.hours_stale} " <>
+        "sample_count=#{anomaly.sample_count} anomaly_id=#{anomaly.id}"
+    )
   end
 
   # Silently refresh the figures on an existing unresolved anomaly — no re-notify.
@@ -250,10 +355,12 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
         nil
 
       {:ok, %{anomaly: %IngestionAnomaly{} = anomaly}} ->
-        # Audit is now committed atomically with the row; the operator alert + webhook
-        # are Oban-durable once enqueued, so keep them post-commit.
-        fire_operator_alert(tenant_id, anomaly)
-        fire_anomaly_webhook(tenant_id, anomaly)
+        # Audit is committed atomically with the row. The operator alert + webhook
+        # can't join that transaction (Oban jobs insert via Loopctl.Repo), so they run
+        # post-commit and `alerted` is flipped only after they're enqueued — a crash in
+        # the gap leaves alerted=false and the next run re-fires (at-least-once).
+        log_detected_alarm(tenant_id, anomaly)
+        notify(tenant_id, anomaly)
         anomaly
 
       {:error, step, reason, _changes} ->

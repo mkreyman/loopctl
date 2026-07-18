@@ -202,6 +202,56 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
       assert length(anomalies_for(tenant.id)) == 1
     end
 
+    test "re-fires a lost operator alert for an unresolved-but-unalerted row (at-least-once)" do
+      tenant = fixture(:tenant)
+      seed_captures(tenant.id, "session_log", 5, @stale_hours)
+
+      # Simulate a crash between the atomic anomaly insert and the post-commit
+      # enqueues: the row exists, unresolved, but was never alerted.
+      last_event = DateTime.add(DateTime.utc_now(), -@stale_hours, :hour)
+
+      anomaly =
+        fixture(:ingestion_anomaly, %{
+          tenant_id: tenant.id,
+          source_type: "session_log",
+          hours_stale: @stale_hours,
+          sample_count: 5,
+          last_event_at: last_event
+        })
+
+      refute anomaly.alerted
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        # The lost operator alert is recovered on this run.
+        assert_enqueued(worker: ScaleAlertDeliveryWorker)
+      end)
+
+      # The row is now marked alerted so a healthy subsequent run won't re-fire.
+      [reloaded] = anomalies_for(tenant.id)
+      assert reloaded.alerted == true
+    end
+
+    test "auto-resolves an open anomaly whose captures resumed" do
+      tenant = fixture(:tenant)
+
+      anomaly =
+        fixture(:ingestion_anomaly, %{
+          tenant_id: tenant.id,
+          source_type: "session_log",
+          last_event_at: DateTime.add(DateTime.utc_now(), -100, :hour)
+        })
+
+      # A fresh capture after the anomaly's snapshot — the stream recovered.
+      captured(tenant.id, "session_log", 1)
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+      [reloaded] = anomalies_for(tenant.id)
+      assert reloaded.id == anomaly.id
+      assert reloaded.resolved == true
+    end
+
     test "operator-alert payload conforms to the ScaleAlert contract (metric/value/threshold)" do
       tenant = fixture(:tenant)
       seed_captures(tenant.id, "session_log", 5, @stale_hours)

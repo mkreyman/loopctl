@@ -3,8 +3,9 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   Controller for ingestion capture-silence anomaly management.
 
   - `GET /api/v1/ingestion-anomalies` -- list unresolved anomalies (orchestrator+)
-  - `PATCH /api/v1/ingestion-anomalies/:id` -- mark anomaly as resolved, or
-    `?archived=true` to permanently archive a retired source_type (user+)
+  - `PATCH /api/v1/ingestion-anomalies/:id` -- mark anomaly as resolved;
+    `?archived=true` archives a retired source_type, `?archived=false` un-archives
+    it (restoring monitoring) (user+)
 
   Role gating mirrors `LoopctlWeb.CostAnomalyController` exactly: listing at the
   same read role cost anomalies use, and resolution at `:user` (a custody-adjacent
@@ -51,9 +52,10 @@ defmodule LoopctlWeb.IngestionAnomalyController do
       ],
       resolved: [
         in: :query,
-        type: :boolean,
+        type: :string,
         description:
-          "Filter by resolved status. true = resolved only, false = unresolved only (default: false)"
+          "Filter by resolved status: true = resolved only, false = unresolved only " <>
+            "(default: false), all = both resolved and unresolved (complete timeline)"
       ],
       page: [in: :query, type: :integer, description: "Page number"],
       page_size: [in: :query, type: :integer, description: "Items per page"]
@@ -73,17 +75,21 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   )
 
   operation(:update,
-    summary: "Resolve or archive ingestion anomaly",
+    summary: "Resolve, archive, or un-archive ingestion anomaly",
     description:
       "Marks an ingestion capture-silence anomaly as resolved. Pass ?archived=true to " <>
-        "instead ARCHIVE it — the permanent escape hatch for a retired source_type, which " <>
-        "hides it from the default list and suppresses re-detection.",
+        "instead ARCHIVE it — the escape hatch for a retired source_type, which hides it " <>
+        "from the default list and suppresses re-detection. Pass ?archived=false to " <>
+        "UN-ARCHIVE it, restoring monitoring for a mistakenly-archived source_type. A " <>
+        "malformed ?archived value is rejected with 422.",
     parameters: [
       id: [in: :path, type: :string, description: "Anomaly UUID"],
       archived: [
         in: :query,
         type: :boolean,
-        description: "When true, archive (permanently suppress) instead of resolve"
+        description:
+          "true = archive (suppress re-detection); false = un-archive (restore monitoring); " <>
+            "omit = resolve"
       ]
     ],
     responses: %{
@@ -123,7 +129,7 @@ defmodule LoopctlWeb.IngestionAnomalyController do
       |> maybe_add_opt(:source_type, params["source_type"])
       |> maybe_add_opt(:anomaly_type, params["anomaly_type"])
       |> maybe_add_opt(:include_archived, parse_bool(params["include_archived"]))
-      |> maybe_add_opt(:resolved, parse_bool(params["resolved"]))
+      |> maybe_add_opt(:resolved, parse_resolved(params["resolved"]))
       |> maybe_add_opt(:page, parse_int(params["page"]))
       |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
 
@@ -143,7 +149,9 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   @doc """
   PATCH /api/v1/ingestion-anomalies/:id
 
-  Marks an ingestion anomaly as resolved, or archives it when `?archived=true`.
+  Resolves the anomaly, or (with `?archived=true`) archives it, or (with
+  `?archived=false`) un-archives it. A malformed `?archived` value yields 422 so a
+  state-changing intent is never silently downgraded to a resolve.
   """
   def update(conn, %{"id" => id} = params) do
     api_key = conn.assigns.current_api_key
@@ -155,14 +163,8 @@ defmodule LoopctlWeb.IngestionAnomalyController do
       actor_type: "api_key"
     ]
 
-    result =
-      if parse_bool(params["archived"]) == true do
-        IngestionHealth.archive_anomaly(tenant_id, id, audit_opts)
-      else
-        IngestionHealth.resolve_anomaly(tenant_id, id, audit_opts)
-      end
-
-    with {:ok, anomaly} <- result do
+    with {:ok, action} <- archived_action(params),
+         {:ok, anomaly} <- apply_action(action, tenant_id, id, audit_opts) do
       json(conn, %{
         ingestion_anomaly: %{
           id: anomaly.id,
@@ -174,6 +176,38 @@ defmodule LoopctlWeb.IngestionAnomalyController do
     end
   end
 
+  # Determine intent from ?archived. Absent -> resolve. Explicit true/false ->
+  # archive/unarchive. Any other (malformed) value is rejected — never silently
+  # downgraded to resolve, which would be a wrong state change for the operator.
+  defp archived_action(params) do
+    case Map.fetch(params, "archived") do
+      :error ->
+        {:ok, :resolve}
+
+      {:ok, raw} ->
+        case parse_bool(raw) do
+          true ->
+            {:ok, :archive}
+
+          false ->
+            {:ok, :unarchive}
+
+          nil ->
+            {:error, :unprocessable_entity,
+             "Invalid 'archived' value #{inspect(raw)}; expected true or false."}
+        end
+    end
+  end
+
+  defp apply_action(:archive, tenant_id, id, opts),
+    do: IngestionHealth.archive_anomaly(tenant_id, id, opts)
+
+  defp apply_action(:unarchive, tenant_id, id, opts),
+    do: IngestionHealth.unarchive_anomaly(tenant_id, id, opts)
+
+  defp apply_action(:resolve, tenant_id, id, opts),
+    do: IngestionHealth.resolve_anomaly(tenant_id, id, opts)
+
   # --- Private helpers ---
 
   defp parse_bool(nil), do: nil
@@ -182,6 +216,11 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   defp parse_bool(true), do: true
   defp parse_bool(false), do: false
   defp parse_bool(_), do: nil
+
+  # `resolved=all` is a sentinel meaning "both resolved and unresolved"; anything
+  # else parses as a boolean (nil -> omitted -> context default of unresolved-only).
+  defp parse_resolved("all"), do: :all
+  defp parse_resolved(other), do: parse_bool(other)
 
   defp parse_int(nil), do: nil
 
