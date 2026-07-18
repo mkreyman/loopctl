@@ -2,26 +2,33 @@ defmodule Loopctl.Security.SecretDenylist do
   @moduledoc """
   Shared secret-pattern denylist.
 
-  Mirrors, in Elixir, the exact regex set the knowledge-capture summarizer uses
-  in `claude-config/hooks/knowledge-capture.sh` (the "knowledge extractor"): a
-  hit means the scanned text almost certainly carries a credential and must NOT
-  be persisted. Used by the coordination bus (`Loopctl.Coordination.ChannelPost`)
-  to scan `body`, every `refs` value, and `key` before a post lands — a match is
-  an explicit rejection (surfaced as a 422), never a silent drop.
+  The canonical credential-shape set lives in the bash knowledge-capture
+  summarizer at `claude-config/hooks/knowledge-capture.sh` (the "knowledge
+  extractor"); this module re-implements those credential patterns in Elixir so
+  the same shapes are blocked on the coordination plane. A hit means the scanned
+  text almost certainly carries a credential and must NOT be persisted. Used by
+  the coordination bus (`Loopctl.Coordination.ChannelPost`) to scan `body`,
+  `key`, `session_id`, `host`, and every `refs` value before a post lands — a
+  match is an explicit rejection (surfaced as a 422), never a silent drop.
 
-  The set is deliberately the same across the fleet so an operator reasons about
-  one denylist, not two. It targets high-confidence credential shapes (long,
+  The two lists live in separate repos with no shared compile-time source, so
+  parity is a CONVENTION, not a guarantee: when you add a credential shape to one,
+  add it to the other. (The bash script additionally scans for destructive shell
+  commands — that is deletion-guard scope, not credential-denylist scope, and is
+  intentionally absent here.) It targets high-confidence credential shapes (long,
   prefixed tokens / key material), not general "looks secret-ish" heuristics, to
   keep false positives near zero on ordinary coordination chatter.
   """
 
-  # High-confidence credential patterns. Kept in lock-step with
-  # claude-config/hooks/knowledge-capture.sh (the bash `jq | test(...)` set).
+  # High-confidence credential patterns. Keep in sync (by convention) with the
+  # credential shapes in claude-config/hooks/knowledge-capture.sh.
   @patterns [
     # Bearer <token>
     ~r/Bearer\s+[A-Za-z0-9_\-]{20,}/i,
     # OpenAI / Anthropic style sk- keys
     ~r/\bsk-[A-Za-z0-9_\-]{20,}/i,
+    # Stripe secret keys (sk_live_ / sk_test_) and restricted keys (rk_live_/rk_test_)
+    ~r/\b[rs]k_(live|test)_[A-Za-z0-9]{20,}/,
     # loopctl agent/orchestrator keys
     ~r/\blc_[A-Za-z0-9_\-]{20,}/,
     # GitHub personal-access / OAuth / server / refresh tokens
@@ -31,7 +38,11 @@ defmodule Loopctl.Security.SecretDenylist do
     # PEM private key blocks
     ~r/-----BEGIN [A-Z ]*PRIVATE KEY-----/,
     # Slack tokens (bot/user/app/refresh/legacy)
-    ~r/\bxox[baprs]-[A-Za-z0-9\-]{10,}/i
+    ~r/\bxox[baprs]-[A-Za-z0-9\-]{10,}/i,
+    # JWTs (header.payload.signature, all base64url) — often bearer credentials
+    ~r/\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}/,
+    # URL-embedded credentials, e.g. postgres://user:s3cret@host, https://u:p@host
+    ~r/\b[a-z][a-z0-9+.\-]*:\/\/[^\s:\/@]+:[^\s:\/@]+@/i
   ]
 
   @doc """

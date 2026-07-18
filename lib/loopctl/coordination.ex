@@ -75,21 +75,29 @@ defmodule Loopctl.Coordination do
   Returns recent, non-expired posts for a tenant's project channel, newest first.
 
   Isolation is the explicit `tenant_id` filter (AdminRepo path); expired posts
-  are filtered defensively even before the TTL sweep runs. `opts`:
+  are filtered defensively even before the TTL sweep runs. A non-UUID
+  `tenant_id`/`project_id` (e.g. a malformed path segment once US-39.3 wires an
+  endpoint) yields `[]` rather than an `Ecto.Query.CastError` — mirroring the
+  `valid_uuid?` guard in `Projects.get_project`. `opts`:
 
-    * `:limit` — max rows (default #{@default_recent_limit}, capped at #{@max_recent_limit})
+    * `:limit` — max rows (default #{@default_recent_limit}, capped at
+      #{@max_recent_limit}); `limit: 0` (or negative) returns `[]`.
   """
-  @spec recent(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: [ChannelPost.t()]
+  @spec recent(term(), term(), keyword()) :: [ChannelPost.t()]
   def recent(tenant_id, project_id, opts \\ []) do
-    limit = opts |> Keyword.get(:limit, @default_recent_limit) |> clamp_limit()
-    now = DateTime.utc_now()
+    if valid_uuid?(tenant_id) and valid_uuid?(project_id) do
+      limit = opts |> Keyword.get(:limit, @default_recent_limit) |> clamp_limit()
+      now = DateTime.utc_now()
 
-    ChannelPost
-    |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
-    |> where([p], p.expires_at > ^now)
-    |> order_by([p], desc: p.inserted_at, desc: p.id)
-    |> limit(^limit)
-    |> AdminRepo.all()
+      ChannelPost
+      |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
+      |> where([p], p.expires_at > ^now)
+      |> order_by([p], desc: p.inserted_at, desc: p.id)
+      |> limit(^limit)
+      |> AdminRepo.all()
+    else
+      []
+    end
   end
 
   defp default_expires_at do
@@ -99,5 +107,12 @@ defmodule Loopctl.Coordination do
   defp clamp_limit(limit) when is_integer(limit) and limit > 0,
     do: min(limit, @max_recent_limit)
 
+  # An explicit non-positive limit means "no rows" — honour it rather than
+  # silently coercing to the default (LIMIT 0 returns []).
+  defp clamp_limit(limit) when is_integer(limit) and limit <= 0, do: 0
+
   defp clamp_limit(_), do: @default_recent_limit
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 end

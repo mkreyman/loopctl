@@ -12,13 +12,16 @@ defmodule Loopctl.Repo.Migrations.CreateChannelPosts do
         null: false
 
       # Server-stamped from the verified key identity — a post always has an author.
-      add :agent_id, :binary_id, null: false
+      # FK to agents so attribution can never dangle (matches token_usage_reports).
+      add :agent_id, references(:agents, type: :binary_id, on_delete: :delete_all), null: false
 
       # Client-supplied, informational, spoofable — never used for authorization.
+      # Length-bounded in the changeset (see ChannelPost.create_changeset).
       add :session_id, :text, null: true
       add :host, :text, null: true
 
-      # Optional per-session upsert key (working-state slot). No message-type taxonomy.
+      # Optional per-session working-state slot key. No message-type taxonomy.
+      # Insert-with-unique-reject in US-39.1; on_conflict upsert lands in US-39.2.
       add :key, :text, null: true
 
       add :body, :text, null: false

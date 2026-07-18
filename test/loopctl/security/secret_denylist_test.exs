@@ -13,7 +13,16 @@ defmodule Loopctl.Security.SecretDenylistTest do
         "github_pat_" <> String.duplicate("a", 30),
         "AKIA" <> String.duplicate("A", 16),
         "-----BEGIN RSA PRIVATE KEY-----",
-        "xoxb-" <> String.duplicate("a", 20)
+        "xoxb-" <> String.duplicate("a", 20),
+        # Stripe secret / restricted keys (underscore prefix, not sk-)
+        "sk_live_" <> String.duplicate("a", 24),
+        "sk_test_" <> String.duplicate("a", 24),
+        "rk_live_" <> String.duplicate("a", 24),
+        # JWT (header.payload.signature)
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N",
+        # URL-embedded credentials
+        "DATABASE_URL=postgres://user:s3cretpw@db.internal:5432/app",
+        "clone https://mark:ghp_notreal@github.com/acme/repo"
       ]
 
       for s <- secrets do

@@ -100,6 +100,59 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       refute :category in fields
       refute :type in fields
     end
+
+    test "rejects an over-long session_id (bounds the keyed-slot btree index row)" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "session_id" => String.duplicate("s", 201)
+        })
+
+      refute cs.valid?
+      assert %{session_id: _} = errors_on(cs)
+    end
+
+    test "rejects an over-long host" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "host" => String.duplicate("h", 256)
+        })
+
+      refute cs.valid?
+      assert %{host: _} = errors_on(cs)
+    end
+
+    test "a blank key is normalised to nil (no keyed slot, no forced session_id)" do
+      cs = ChannelPost.create_changeset(base_struct(), %{"body" => "ok", "key" => ""})
+      assert cs.valid?
+      assert is_nil(Ecto.Changeset.get_field(cs, :key))
+      # blank key must NOT force session_id to be required
+      refute Map.has_key?(errors_on(cs), :session_id)
+    end
+
+    test "a whitespace-only key is normalised to nil" do
+      cs = ChannelPost.create_changeset(base_struct(), %{"body" => "ok", "key" => "   "})
+      assert cs.valid?
+      assert is_nil(Ecto.Changeset.get_field(cs, :key))
+    end
+
+    test "rejects a NUL byte in the body (would 500 at insert otherwise)" do
+      cs = ChannelPost.create_changeset(base_struct(), %{"body" => "before" <> <<0>> <> "after"})
+      refute cs.valid?
+      assert %{body: _} = errors_on(cs)
+    end
+
+    test "rejects a NUL byte in session_id" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "session_id" => "S" <> <<0>> <> "1"
+        })
+
+      refute cs.valid?
+      assert %{session_id: _} = errors_on(cs)
+    end
   end
 
   describe "secret denylist" do
@@ -133,6 +186,42 @@ defmodule Loopctl.Coordination.ChannelPostTest do
 
       refute cs.valid?
       assert %{key: _} = errors_on(cs)
+    end
+
+    test "rejects a secret in session_id (persisted + echoed to peer sessions)" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "session_id" => "sk-" <> String.duplicate("a", 30)
+        })
+
+      refute cs.valid?
+      assert %{session_id: _} = errors_on(cs)
+    end
+
+    test "rejects a secret in host" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "host" => "Bearer " <> String.duplicate("a", 30)
+        })
+
+      refute cs.valid?
+      assert %{host: _} = errors_on(cs)
+    end
+
+    test "accumulates errors across every offending field in one pass" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "sk-" <> String.duplicate("a", 30),
+          "session_id" => "S1",
+          "key" => "lc_" <> String.duplicate("a", 30)
+        })
+
+      refute cs.valid?
+      errors = errors_on(cs)
+      assert %{body: _} = errors
+      assert %{key: _} = errors
     end
   end
 end

@@ -9,7 +9,7 @@ defmodule Loopctl.CoordinationTest do
     test "inserts with programmatic tenant/project/agent/expires and cast body" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      agent_id = Ecto.UUID.generate()
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
 
       assert {:ok, post} =
                Coordination.create_post(tenant.id, project.id, agent_id, %{
@@ -42,8 +42,7 @@ defmodule Loopctl.CoordinationTest do
     test "a duplicate same-session keyed post returns {:error, changeset}, not a raise" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      agent_id = Ecto.UUID.generate()
-
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
       attrs = %{"body" => "goal", "session_id" => "S1", "key" => "session_goal"}
 
       assert {:ok, _post} = Coordination.create_post(tenant.id, project.id, agent_id, attrs)
@@ -57,9 +56,10 @@ defmodule Loopctl.CoordinationTest do
     test "accepts valid refs restricted to the allowlist" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
 
       assert {:ok, post} =
-               Coordination.create_post(tenant.id, project.id, Ecto.UUID.generate(), %{
+               Coordination.create_post(tenant.id, project.id, agent_id, %{
                  "body" => "see the fix",
                  "refs" => %{"pr" => "107", "branch" => "epic-39-us-39.1"}
                })
@@ -73,9 +73,10 @@ defmodule Loopctl.CoordinationTest do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
       project_a = fixture(:project, %{tenant_id: tenant_a.id})
+      agent_a = fixture(:agent, %{tenant_id: tenant_a.id}).id
 
       {:ok, _post} =
-        Coordination.create_post(tenant_a.id, project_a.id, Ecto.UUID.generate(), %{
+        Coordination.create_post(tenant_a.id, project_a.id, agent_a, %{
           "body" => "tenant A only"
         })
 
@@ -95,11 +96,56 @@ defmodule Loopctl.CoordinationTest do
     end
   end
 
+  describe "recent/3 limit and guard behavior" do
+    test "limit: 0 returns an empty list (honours the explicit request)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      {:ok, _} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "hi"})
+
+      assert Coordination.recent(tenant.id, project.id, limit: 0) == []
+    end
+
+    test "a malformed (non-UUID) project_id yields [] rather than a CastError" do
+      tenant = fixture(:tenant)
+      assert Coordination.recent(tenant.id, "not-a-uuid") == []
+    end
+
+    test "a malformed (non-UUID) tenant_id yields []" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      assert Coordination.recent("not-a-uuid", project.id) == []
+    end
+
+    test "a blank key posts as a keyless append-only post (no slot collision)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      assert {:ok, p1} =
+               Coordination.create_post(tenant.id, project.id, agent_id, %{
+                 "body" => "one",
+                 "key" => ""
+               })
+
+      assert is_nil(p1.key)
+
+      # A second blank-key post in the same session must NOT collide.
+      assert {:ok, _p2} =
+               Coordination.create_post(tenant.id, project.id, agent_id, %{
+                 "body" => "two",
+                 "key" => ""
+               })
+    end
+  end
+
   describe "per-session keyed slot" do
     test "two sessions with the same key do not clobber each other" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      agent_id = Ecto.UUID.generate()
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
 
       assert {:ok, post_a} =
                Coordination.create_post(tenant.id, project.id, agent_id, %{
