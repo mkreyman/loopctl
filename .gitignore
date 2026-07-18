@@ -46,3 +46,4 @@ mcp-server/node_modules/
 
 # Playwright MCP session output (transient)
 .playwright-mcp/
+.claude/implement-plan.run.json

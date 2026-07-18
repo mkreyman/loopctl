@@ -122,6 +122,42 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
     end
 
+    # TC-39.2.3b — the cross-tenant/not-found 422 emits the :ownership_rejected
+    # security signal (AC-39.2.9 enumeration-scan detector). Without this the
+    # detector could be silently dropped and the suite would still pass.
+    test "a cross-tenant project 422 emits the ownership_rejected security signal" do
+      tenant = fixture(:tenant)
+      other = fixture(:tenant)
+      foreign = fixture(:project, %{tenant_id: other.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      handler_id = "coord-ownership-#{System.unique_integer([:positive])}"
+      test_pid = self()
+      tenant_id = tenant.id
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :coordination, :ownership_rejected],
+        fn _event, measurements, meta, _cfg ->
+          if meta[:tenant_id] == tenant_id,
+            do: send(test_pid, {:ownership_rejected, measurements, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      log =
+        capture_log(fn ->
+          conn = post_json(raw, %{"project_id" => foreign.id, "body" => "x"})
+          assert json_response(conn, 422)
+        end)
+
+      assert log =~ "ownership_rejected"
+      assert_receive {:ownership_rejected, %{count: 1}, meta}
+      assert meta.project_id == foreign.id
+    end
+
     # TC-39.2.4
     test "keyed post upserts within a session (200, same id) and is distinct across sessions (201)" do
       tenant = fixture(:tenant)
@@ -212,6 +248,47 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         post_json(raw, %{"project_id" => project.id, "body" => String.duplicate("a", 16_385)})
 
       assert json_response(conn, 422)
+      assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
+    end
+
+    # AC-39.2.9 — a denylist hit on the real HTTP write path (post/3 -> run_post ->
+    # tap_secret_blocked) emits the secret_blocked signal + structured log at
+    # rejection time. Previously only create_post/4 exercised this; a regression
+    # dropping the HTTP-path emission would otherwise pass the suite.
+    test "a secret-shaped body is rejected 422 and emits the secret_blocked security signal" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      handler_id = "coord-secret-http-#{System.unique_integer([:positive])}"
+      test_pid = self()
+      tenant_id = tenant.id
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :coordination, :secret_blocked],
+        fn _event, measurements, meta, _cfg ->
+          if meta[:tenant_id] == tenant_id,
+            do: send(test_pid, {:secret_blocked, measurements, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      log =
+        capture_log(fn ->
+          conn =
+            post_json(raw, %{
+              "project_id" => project.id,
+              "body" => "sk-" <> String.duplicate("a", 30)
+            })
+
+          assert json_response(conn, 422)
+        end)
+
+      assert log =~ "coordination denylist hit"
+      assert_receive {:secret_blocked, %{count: 1}, %{field: :body}}
       assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
     end
 

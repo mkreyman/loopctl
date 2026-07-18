@@ -129,8 +129,18 @@ defmodule Loopctl.Coordination do
     project_id = Map.get(attrs, :project_id)
     audit = Map.get(attrs, :audit, [])
 
-    with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
-         {:ok, _agent} <- Agents.get_agent(tenant_id, agent_id) do
+    # Only `project_id` is ownership-checked here. `agent_id` is NOT re-verified:
+    # unlike `create_post/4` (a general primitive that asserts BOTH ids), this HTTP
+    # path receives `agent_id` server-stamped from the ALREADY-verified key identity
+    # and tenant-paired at key creation, so an `Agents.get_agent/2` guard would be
+    # redundant. Worse, folding its failure into the same `{:error, :not_found}`
+    # would make a caller with a perfectly valid project get a 422 blaming
+    # `project_id` (and misattribute the `:ownership_rejected` security signal) on
+    # the low-reachability "agent row deleted while its api_key persists" case —
+    # conflating an identity fault with a cross-tenant probe. The NOT NULL FK to
+    # `agents` (surfaced as an `:agent_id` changeset error via
+    # `foreign_key_constraint/2`) remains the real, correctly-attributed guard.
+    with {:ok, _project} <- Projects.get_project(tenant_id, project_id) do
       changeset =
         %ChannelPost{
           tenant_id: tenant_id,
@@ -194,8 +204,15 @@ defmodule Loopctl.Coordination do
       {:error, :post, %Ecto.Changeset{} = changeset, _changes} ->
         tap_secret_blocked({:error, changeset})
 
-      {:error, _step, reason, _changes} ->
-        {:error, reason}
+      # Any OTHER failed step (today only `:audit`, whose only failure mode is a
+      # changeset) is normalised to the SAME documented `{:error, %Ecto.Changeset{}}`
+      # shape — `run_post/3` never leaks an off-spec `{:error, reason}` to the
+      # controller, so no controller catch-all (which dialyzer would reject as dead
+      # code) is needed. If `Audit.log_in_multi/3` is ever changed to fail with a
+      # non-changeset error, this clause stops covering it and dialyzer fails the
+      # build here (a compile-gate guard, stronger than a runtime 500 fallback).
+      {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
+        {:error, changeset}
     end
   end
 
