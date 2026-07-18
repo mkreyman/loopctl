@@ -170,27 +170,32 @@ defmodule LoopctlWeb.IngestionAnomalyController do
             include_archived: include_archived
           },
           # Warn when a source_type filter names a never-seen source, so an empty list
-          # is never mistaken for "healthy ingestion".
-          warnings: source_type_warnings(tenant_id, source_type)
+          # is never mistaken for "healthy ingestion". ONLY on an empty page — a
+          # non-empty page already carries the anomalies it would caveat, and the
+          # "empty result does not imply healthy" message would then contradict itself.
+          warnings: source_type_warnings(tenant_id, source_type, result.data)
         }
       })
     end
   end
 
-  # When a source_type filter names a source with NO recorded write activity for this
-  # tenant, an empty anomaly list does not imply healthy ingestion — surface that.
-  defp source_type_warnings(tenant_id, source_type) when is_binary(source_type) do
+  # When a source_type filter names a source with NO ingestion activity for this
+  # tenant AND the page is empty, an empty anomaly list does not imply healthy
+  # ingestion — surface that. A non-empty page needs no such caveat (it already shows
+  # anomalies), and the "empty result does not imply healthy" wording would misfire.
+  defp source_type_warnings(tenant_id, source_type, [] = _empty_data)
+       when is_binary(source_type) do
     if IngestionHealth.source_type_seen?(tenant_id, source_type) do
       []
     else
       [
-        "source_type #{inspect(source_type)} has no recorded write activity for this " <>
+        "source_type #{inspect(source_type)} has no recorded ingestion activity for this " <>
           "tenant; an empty result does not imply healthy ingestion for it."
       ]
     end
   end
 
-  defp source_type_warnings(_tenant_id, _source_type), do: []
+  defp source_type_warnings(_tenant_id, _source_type, _data), do: []
 
   @doc """
   PATCH /api/v1/ingestion-anomalies/:id

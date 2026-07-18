@@ -185,23 +185,44 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     end
   end
 
+  # Reject-rate detection needs BOTH the rollup table (migration 20260717210000) AND
+  # the WIDENED anomaly_type CHECK that admits 'high_reject_rate' (migration
+  # 20260717210001). In a partial deploy where the first migration landed but the
+  # second did not, a high_reject_rate insert would raise a CHECK violation inside the
+  # Multi and fail the Oban job. Gate on both so the reject path skips quietly (and
+  # self-heals next run) until the CHECK is widened, instead of burning retries.
   defp write_stats_table_ready? do
-    case AdminRepo.query("SELECT to_regclass('ingestion_write_stats')", []) do
+    relation_present?("ingestion_write_stats") and high_reject_rate_check_ready?()
+  end
+
+  defp relation_present?(relation) do
+    case AdminRepo.query("SELECT to_regclass($1)", [relation]) do
       {:ok, %{rows: [[nil]]}} -> false
       {:ok, _} -> true
       _ -> false
     end
   end
 
-  # `to_regclass` returns NULL when the relation does not exist (no exception),
-  # so this is a cheap, crash-free readiness probe for the version-skew window.
-  defp anomalies_table_ready? do
-    case AdminRepo.query("SELECT to_regclass('ingestion_anomalies')", []) do
-      {:ok, %{rows: [[nil]]}} -> false
-      {:ok, _} -> true
-      _ -> false
+  # True once the ingestion_anomalies anomaly_type CHECK admits 'high_reject_rate'.
+  # Reads the constraint definition from the catalog (crash-free): absent constraint
+  # or a definition that does not yet mention the value ⇒ not ready.
+  defp high_reject_rate_check_ready? do
+    case AdminRepo.query(
+           "SELECT pg_get_constraintdef(oid) FROM pg_constraint " <>
+             "WHERE conname = 'ingestion_anomalies_anomaly_type_check'",
+           []
+         ) do
+      {:ok, %{rows: [[definition]]}} when is_binary(definition) ->
+        String.contains?(definition, "high_reject_rate")
+
+      _ ->
+        false
     end
   end
+
+  # `to_regclass` returns NULL when the relation does not exist (no exception),
+  # so this is a cheap, crash-free readiness probe for the version-skew window.
+  defp anomalies_table_ready?, do: relation_present?("ingestion_anomalies")
 
   # Dispatch by detector type: capture_silence (writes stopped) vs high_reject_rate
   # (writes rejected). Both reuse the same persist/notify/at-least-once machinery.

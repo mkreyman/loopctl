@@ -284,6 +284,10 @@ defmodule LoopctlWeb.ArticleController do
 
     # System articles require superadmin role; everything else is agent+.
     if scope == "system" and api_key.role != :superadmin do
+      # Count the reject: an upfront authorization drop persists no article row, so
+      # without this the high_reject_rate detector would be blind to a 403 reject storm.
+      emit_write_telemetry(conn, params, :validation_error)
+
       conn
       |> put_status(:forbidden)
       |> json(%{
@@ -297,8 +301,15 @@ defmodule LoopctlWeb.ArticleController do
       # Validate project_id (path segment or JSON body) up front so a non-UUID
       # value returns a clean 422 instead of reaching validate_project_ownership/2
       # and raising Ecto.Query.CastError (500).
-      with :ok <- ProjectId.validate(params["project_id"]) do
-        create_validated(conn, api_key, params, draft?, gate?)
+      case ProjectId.validate(params["project_id"]) do
+        :ok ->
+          create_validated(conn, api_key, params, draft?, gate?)
+
+        error ->
+          # Count the upfront validation drop too, so a client hammering create with a
+          # malformed project_id (100% 422s, zero article rows) still moves reject_rate.
+          emit_write_telemetry(conn, params, :validation_error)
+          error
       end
     end
   end
@@ -325,6 +336,9 @@ defmodule LoopctlWeb.ArticleController do
         create_article(conn, tenant_id, bound_attrs, audit_opts, draft?, gate?)
 
       {:error, :no_agent_identity} ->
+        # Count the reject: an identity-required drop persists no article row.
+        emit_write_telemetry(conn, attrs, :validation_error)
+
         conn
         |> put_status(:forbidden)
         |> json(%{
@@ -499,10 +513,22 @@ defmodule LoopctlWeb.ArticleController do
     )
   end
 
+  # Normalize the telemetry source_type to the durable rollup's bucketing rules.
+  #
+  # `source_type` on a REJECTED write is arbitrary client input (the changeset
+  # already refused it), so forwarding it raw would (a) mint an unbounded number of
+  # `ingestion_write_stats` rows — one per distinct garbage value — letting a reject
+  # storm fragment across buckets below `min_attempts` and evade the high_reject_rate
+  # detector, and (b) let a literal `"(unstamped)"` collide with the NULL sentinel.
+  # Fold any value NOT in `Article.known_source_types/0` into `nil` so it lands in the
+  # single COALESCE('') unstamped bucket — only the ~8 known values key distinct rows.
   defp telemetry_source_type(attrs) do
     case attrs["source_type"] || attrs[:source_type] do
-      st when is_binary(st) -> st
-      _ -> nil
+      st when is_binary(st) ->
+        if st in Article.known_source_types(), do: st, else: nil
+
+      _ ->
+        nil
     end
   end
 

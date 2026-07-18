@@ -35,6 +35,20 @@ defmodule Loopctl.Application do
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
       {Task.Supervisor, name: Loopctl.TaskSupervisor},
+      # PR B2: BOUNDED supervisor for the fire-and-forget `ingestion_write_stats`
+      # rollup upserts spawned by `Loopctl.Telemetry.IngestionWriteStats`. The
+      # high_reject_rate detector's trigger condition is a client HAMMERING create in a
+      # retry loop (a title_conflict/validation storm) — i.e. exactly when write volume
+      # spikes — so an UNBOUNDED per-write task fan-out would flood the small BYPASSRLS
+      # AdminRepo pool (also serving the rate limiter + auth) precisely during the
+      # incident this feature detects, amplifying the outage. `max_children` caps the
+      # fan-out: over the cap `start_child` returns `{:error, :max_children}` and the
+      # increment is DROPPED (best-effort analytics, never blocks/fails the observed
+      # write). Separate from the general `Loopctl.TaskSupervisor` so this backpressure
+      # is isolated, mirroring `Loopctl.Memory.RecallBumpTaskSupervisor`.
+      {Task.Supervisor,
+       name: Loopctl.Telemetry.IngestionWriteStatsTaskSupervisor,
+       max_children: Application.get_env(:loopctl, :ingestion_write_stats_max_tasks, 200)},
       # #411 Gap 3: owns the public ETS table that pre-filters recall-count hotness
       # bumps already inside their per-memory cooldown window, so an idle-window
       # recall issues ZERO background tasks and ZERO DB writes (the DB-side
