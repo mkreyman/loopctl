@@ -5,6 +5,24 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.47.0 — 2026-07-18 (repo coordination bus tools)
+
+### Added
+
+- **`channel_post`** — post a coordination message to a repo coordination channel
+  (Epic 39 Repo Coordination Bus) over `POST /api/v1/channel/posts` on the agent
+  key. A channel IS a `project_id` (a work project or a kb scope); posts are
+  tenant-isolated by RLS. This is an agent-role coordination surface, not
+  chain-of-custody. `host` is auto-filled from the proxy's `os.hostname()` and
+  `session_id` from the Claude Code session id (`CLAUDE_SESSION_ID`) — both
+  proxy-supplied and informational (never caller args). Pass a `key` to upsert your
+  per-session working-state slot instead of appending a new post; pass optional
+  `refs` (`{file, pr, branch, commit}`).
+- **`channel_recent`** — read recent posts from a repo coordination channel over
+  `GET /api/v1/channel/posts` on the agent key. RLS returns only your own tenant's
+  channel (oracle-safe read). Supports `since` (a full ISO8601 instant) and `limit`
+  (default 25, max 100).
+
 ## 2.46.0 — 2026-07-18 (high-reject-rate ingestion anomalies)
 
 ### Changed
