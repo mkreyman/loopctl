@@ -3,7 +3,6 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
 
   import Ecto.Query
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Skills
@@ -1058,57 +1057,11 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
     end
   end
 
-  # --- Concurrent claim race condition test ---
-
-  describe "concurrent claim race condition" do
-    @tag :capture_log
-    test "only one agent wins the claim", %{conn: _conn} do
-      tenant = fixture(:tenant)
-      project = fixture(:project, %{tenant_id: tenant.id})
-      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
-
-      story =
-        fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :contracted})
-
-      agent_a = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
-      agent_b = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
-
-      {raw_key_a, _} =
-        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent_a.id})
-
-      {raw_key_b, _} =
-        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent_b.id})
-
-      # Allow sandbox access for spawned tasks
-      parent = self()
-
-      task_a =
-        Task.async(fn ->
-          Sandbox.allow(Loopctl.Repo, parent, self())
-          Sandbox.allow(Loopctl.AdminRepo, parent, self())
-
-          build_conn()
-          |> auth_conn(raw_key_a)
-          |> post(~p"/api/v1/stories/#{story.id}/claim")
-        end)
-
-      task_b =
-        Task.async(fn ->
-          Sandbox.allow(Loopctl.Repo, parent, self())
-          Sandbox.allow(Loopctl.AdminRepo, parent, self())
-
-          build_conn()
-          |> auth_conn(raw_key_b)
-          |> post(~p"/api/v1/stories/#{story.id}/claim")
-        end)
-
-      result_a = Task.await(task_a, 10_000)
-      result_b = Task.await(task_b, 10_000)
-
-      statuses = Enum.sort([result_a.status, result_b.status])
-
-      # Exactly one 200 and one 409
-      assert statuses == [200, 409]
-    end
-  end
+  # The concurrent-claim race invariant ("only one agent wins the claim") is
+  # proven deterministically in `test/loopctl/progress/claim_lock_test.exs`
+  # using two independent `sandbox: false` DB sessions. It CANNOT be tested at
+  # the HTTP layer here: the sandbox multiplexes every allowed Task onto ONE
+  # shared connection, so the claim's `SELECT ... FOR UPDATE` lock can neither
+  # serialize the two requests nor be distinguished from no lock at all — the
+  # old two-`Task.async` POST test was flaky for exactly that reason.
 end
