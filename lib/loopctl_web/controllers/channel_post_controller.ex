@@ -25,6 +25,10 @@ defmodule LoopctlWeb.ChannelPostController do
   (429). The denylist rejection (422) signal is emitted from `Loopctl.Coordination`
   at the point the write is rejected. A rate-limiter fault degrades to "no gate"
   but is logged via the shared throttled `FailOpenLog`, never swallowed silently.
+
+  The READ (`:index`) emits `:read_error` on any internal fault (US-39.3
+  technical_notes) before re-raising to the sanitizing DB-error backstop — the
+  errored read stays tenant-agnostic, never a cross-tenant existence oracle.
   """
 
   use LoopctlWeb, :controller
@@ -113,7 +117,11 @@ defmodule LoopctlWeb.ChannelPostController do
       since: [
         in: :query,
         type: :string,
-        description: "ISO8601 instant; return only posts touched after it (delta read)"
+        description:
+          "Full ISO8601 INSTANT (e.g. 2026-07-18T00:00:00Z or 2026-07-18T00:00:00); " <>
+            "return only posts touched after it (delta read). A date-only value " <>
+            "(e.g. 2026-07-18) is the wrong granularity and is IGNORED — the whole " <>
+            "live channel is returned, not a delta. Supply a full instant."
       ],
       limit: [
         in: :query,
@@ -132,7 +140,12 @@ defmodule LoopctlWeb.ChannelPostController do
                type: :object,
                properties: %{
                  limit: %OpenApiSpex.Schema{type: :integer},
-                 count: %OpenApiSpex.Schema{type: :integer}
+                 count: %OpenApiSpex.Schema{type: :integer},
+                 has_more: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description:
+                     "True when the limit truncated the result — more live matching posts exist"
+                 }
                }
              }
            }
@@ -161,16 +174,43 @@ defmodule LoopctlWeb.ChannelPostController do
     # passed back into `recent/3`, which re-clamps harmlessly.
     applied_limit = Coordination.clamp_recent_limit(params["limit"])
 
-    posts =
-      Coordination.recent(tenant_id, params["project_id"],
+    # `has_more` is an HONEST truncation signal: `recent_page/3` fetches
+    # `limit + 1` and reports whether a matching post exists beyond the applied
+    # limit, so a consumer never mistakes a truncated page for the whole channel
+    # (it can re-read with a tighter `since` / smaller window). A full cursor is
+    # US-39.6's job; this is the cheap "there is more" flag.
+    {posts, has_more} =
+      Coordination.recent_page(tenant_id, params["project_id"],
         limit: applied_limit,
         since: params["since"]
       )
 
     json(conn, %{
       data: Enum.map(posts, &channel_post_json/1),
-      meta: %{limit: applied_limit, count: length(posts)}
+      meta: %{limit: applied_limit, count: length(posts), has_more: has_more}
     })
+  rescue
+    e ->
+      # US-39.3 technical_notes: "Emit a security-event log on any internal error
+      # but never leak cross-tenant existence." `recent/3` is total for well-formed
+      # input (a non-UUID, missing, cross-tenant, or nonexistent project_id all
+      # yield an empty list, never a raise — the oracle-safe guard), so the only
+      # path that reaches here is a genuine server-side fault (e.g. a DB outage).
+      # Emit the coordination-surface security signal (parity with the create
+      # path's :ownership_rejected / :agent_identity_required / :rate_limited),
+      # then RE-RAISE so the existing DBErrorBackstop/ErrorJSON machinery renders
+      # the SAME sanitized, tenant-agnostic 500/503/504 body it renders today — the
+      # errored read stays uniform regardless of tenant or project, so it never
+      # becomes a cross-tenant existence oracle.
+      api_key = conn.assigns.current_api_key
+
+      emit_security_event(:read_error, %{
+        tenant_id: api_key.tenant_id,
+        api_key_id: api_key.id,
+        project_id: params["project_id"]
+      })
+
+      reraise e, __STACKTRACE__
   end
 
   # AC-39.3.5: the exact read field set — enough to render "who / which machine /

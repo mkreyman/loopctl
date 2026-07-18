@@ -471,13 +471,46 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       cross_body = json_response(cross, 200)
       missing_body = json_response(missing, 200)
 
-      assert cross_body == %{"data" => [], "meta" => %{"limit" => 25, "count" => 0}}
+      assert cross_body == %{
+               "data" => [],
+               "meta" => %{"limit" => 25, "count" => 0, "has_more" => false}
+             }
+
       assert cross_body == missing_body
 
       # And identical to an owned-but-empty project of the caller's own tenant.
       own_empty = fixture(:project, %{tenant_id: tenant.id})
       owned = authed_conn(raw) |> get(@path, %{"project_id" => own_empty.id})
       assert json_response(owned, 200) == cross_body
+    end
+
+    # TC-39.3.4 (edge): a NON-UUID and a MISSING project_id take the same
+    # oracle-safe path — `recent/3`'s `valid_uuid?` guard short-circuits to `[]`,
+    # so `index/2` returns the byte-identical empty envelope, never a 500 or an
+    # Ecto.Query.CastError. Locks the uniform-empty contract at the HTTP boundary
+    # so a future refactor of the guard can't silently regress it.
+    test "a non-UUID project_id returns 200 with the identical empty envelope" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant)
+
+      conn = authed_conn(raw) |> get(@path, %{"project_id" => "garbage-not-a-uuid"})
+
+      assert json_response(conn, 200) == %{
+               "data" => [],
+               "meta" => %{"limit" => 25, "count" => 0, "has_more" => false}
+             }
+    end
+
+    test "a missing project_id returns 200 with the identical empty envelope" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant)
+
+      conn = authed_conn(raw) |> get(@path, %{})
+
+      assert json_response(conn, 200) == %{
+               "data" => [],
+               "meta" => %{"limit" => 25, "count" => 0, "has_more" => false}
+             }
     end
 
     # TC-39.3.5
@@ -496,6 +529,9 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert length(data) == 100
       assert meta["limit"] == 100
       assert meta["count"] == 100
+      # 150 live posts but only 100 returned -> the envelope tells the caller the
+      # page was truncated (honest signal, not left to infer from count == limit).
+      assert meta["has_more"] == true
     end
 
     test "another tenant's posts are never visible (tenant isolation)" do

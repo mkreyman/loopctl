@@ -316,6 +316,34 @@ defmodule Loopctl.CoordinationTest do
       assert bodies == ["new"]
     end
 
+    test "since accepts an OFFSET-LESS ISO8601 string, interpreted as UTC", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      t1 = DateTime.add(base, -300, :second)
+      t2 = DateTime.add(base, -200, :second)
+      t3 = DateTime.add(base, -100, :second)
+
+      seed_post(tenant, project, agent_id, "old", t1)
+      seed_post(tenant, project, agent_id, "new", t3)
+
+      # A hand-crafted / tool-supplied offset-less instant (no `Z`/`+HH:MM`) must
+      # STILL apply the delta filter (interpreted as UTC), not silently degrade to
+      # "no filter" and return the whole channel. `NaiveDateTime.to_iso8601/1`
+      # emits exactly this offset-less form.
+      offset_less = NaiveDateTime.to_iso8601(DateTime.to_naive(t2))
+      refute offset_less =~ ~r/(Z|[+-]\d\d:\d\d)$/
+
+      bodies =
+        tenant.id
+        |> Coordination.recent(project.id, since: offset_less)
+        |> Enum.map(& &1.body)
+
+      assert bodies == ["new"]
+    end
+
     test "a malformed since string is a no-op filter (not an error)", %{
       tenant: tenant,
       project: project,
@@ -330,6 +358,87 @@ defmodule Loopctl.CoordinationTest do
       )
 
       assert [%ChannelPost{}] = Coordination.recent(tenant.id, project.id, since: "not-a-date")
+    end
+
+    test "a date-only since (wrong granularity) is a no-op filter, returns the whole channel", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      seed_post(tenant, project, agent_id, "old", DateTime.add(base, -300, :second))
+      seed_post(tenant, project, agent_id, "new", DateTime.add(base, -100, :second))
+
+      # "2026-07-18" is a valid ISO8601 DATE but not an INSTANT: it resolves to
+      # neither an offset-bearing nor an offset-less DateTime, so the delta filter
+      # is a no-op and the WHOLE live channel comes back (documented contract —
+      # never a 400, never a silent partial delta). Supply a full instant to
+      # actually get a delta.
+      date_only = base |> DateTime.to_date() |> Date.to_iso8601()
+      refute date_only =~ ~r/T/
+
+      bodies =
+        tenant.id
+        |> Coordination.recent(project.id, since: date_only)
+        |> Enum.map(& &1.body)
+        |> Enum.sort()
+
+      assert bodies == ["new", "old"]
+    end
+
+    test "delta ORDER BY GREATEST keeps a re-touched slot from being truncated by limit", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      since = DateTime.add(base, -200, :second)
+
+      # A keyed slot whose inserted_at PREDATES `since` but whose updated_at is the
+      # MOST RECENT touch of all — it matches the GREATEST(...) > since filter.
+      {:ok, slot} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "slot"})
+
+      {:ok, _} =
+        slot
+        |> Ecto.Changeset.change(
+          inserted_at: DateTime.add(base, -300, :second),
+          updated_at: DateTime.add(base, -10, :second)
+        )
+        |> AdminRepo.update()
+
+      # Two ordinary posts inserted AFTER `since` but BEFORE the slot's touch.
+      seed_post(tenant, project, agent_id, "p1", DateTime.add(base, -100, :second))
+      seed_post(tenant, project, agent_id, "p2", DateTime.add(base, -50, :second))
+
+      # limit 2 with 3 matching rows: under a plain inserted_at DESC order the slot
+      # (stale inserted_at) would rank last and be dropped; under the delta's
+      # GREATEST DESC order it ranks FIRST (most-recent touch) and survives.
+      bodies =
+        tenant.id
+        |> Coordination.recent(project.id, since: since, limit: 2)
+        |> Enum.map(& &1.body)
+
+      assert "slot" in bodies
+      assert bodies == ["slot", "p2"]
+    end
+
+    test "recent_page reports has_more when the limit truncates, false otherwise", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      for n <- 1..3 do
+        seed_post(tenant, project, agent_id, "p#{n}", DateTime.add(base, -n, :second))
+      end
+
+      assert {truncated, true} = Coordination.recent_page(tenant.id, project.id, limit: 2)
+      assert length(truncated) == 2
+
+      assert {full, false} = Coordination.recent_page(tenant.id, project.id, limit: 5)
+      assert length(full) == 3
     end
 
     test "clamp_recent_limit reflects the applied default (25) and cap (100)" do

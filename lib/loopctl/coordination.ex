@@ -302,25 +302,52 @@ defmodule Loopctl.Coordination do
     * `:since` — when present, returns only posts touched AFTER this instant,
       filtering `GREATEST(inserted_at, updated_at) > since` so a keyed slot
       upserted after `since` (its `updated_at` advanced) still surfaces as a
-      delta. Accepts a `DateTime` or an ISO8601 string (as a `?since=` query
-      param arrives); a malformed or absent value is a NO-OP filter (never a
-      400).
+      delta. In this delta mode the ORDER BY is also `GREATEST(inserted_at,
+      updated_at) DESC` (not plain `inserted_at DESC`) so a re-touched slot ranks
+      by its most-recent touch and is not the first row dropped by `:limit`.
+      Accepts a `DateTime` or a full ISO8601 INSTANT string (as a `?since=` query
+      param arrives) — an OFFSET-LESS but valid instant (e.g.
+      `"2026-07-18T00:00:00"`) is interpreted as UTC. A malformed, absent, or
+      wrong-granularity value (e.g. a date-only `"2026-07-18"`) is a NO-OP filter
+      that returns the whole live channel — never a 400; supply a full instant to
+      get a delta.
   """
   @spec recent(term(), term(), keyword()) :: [ChannelPost.t()]
   def recent(tenant_id, project_id, opts \\ []) do
+    {posts, _has_more} = recent_page(tenant_id, project_id, opts)
+    posts
+  end
+
+  @doc """
+  Like `recent/3` but also reports whether the `:limit` TRUNCATED the result.
+
+  Returns `{posts, has_more}` where `has_more` is `true` iff at least one more
+  live, matching post exists beyond the applied `:limit`. Detected by fetching
+  `limit + 1` rows and checking for the overflow row (no extra COUNT query), so
+  the endpoint can surface an HONEST truncation signal in its `meta` envelope
+  rather than leaving consumers to infer it from `count == limit`. A full cursor
+  (paging past the truncation) is out of scope — US-39.6 owns dedup/paging; this
+  is only the cheap "there is more" flag.
+  """
+  @spec recent_page(term(), term(), keyword()) :: {[ChannelPost.t()], boolean()}
+  def recent_page(tenant_id, project_id, opts \\ []) do
     if valid_uuid?(tenant_id) and valid_uuid?(project_id) do
       limit = opts |> Keyword.get(:limit, @default_recent_limit) |> clamp_limit()
+      since = opts |> Keyword.get(:since) |> normalize_since()
       now = DateTime.utc_now()
 
-      ChannelPost
-      |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
-      |> where([p], p.expires_at > ^now)
-      |> apply_since(Keyword.get(opts, :since))
-      |> order_by([p], desc: p.inserted_at, desc: p.seq)
-      |> limit(^limit)
-      |> AdminRepo.all()
+      rows =
+        ChannelPost
+        |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
+        |> where([p], p.expires_at > ^now)
+        |> apply_since(since)
+        |> order_recent(since)
+        |> limit(^(limit + 1))
+        |> AdminRepo.all()
+
+      {Enum.take(rows, limit), length(rows) > limit}
     else
-      []
+      {[], false}
     end
   end
 
@@ -334,23 +361,77 @@ defmodule Loopctl.Coordination do
   @spec clamp_recent_limit(term()) :: non_neg_integer()
   def clamp_recent_limit(limit), do: clamp_limit(limit)
 
-  # `:since` delta filter. A DateTime (or a parseable ISO8601 string) filters to
-  # posts whose most-recent touch — GREATEST(inserted_at, updated_at) — is strictly
-  # after `since`, so a session slot upserted after `since` still surfaces even
-  # though its `inserted_at` predates it. Anything else (nil, malformed string) is
-  # a no-op so a bad `?since=` degrades to "no filter", never a 400.
+  # Resolve the caller's `:since` (a `DateTime`, an ISO8601 string, or
+  # nil/garbage) to a single `%DateTime{}` or `nil`, ONCE, so the delta FILTER
+  # (`apply_since/2`) and the delta ORDERING (`order_recent/2`) agree on the same
+  # value. A malformed, absent, or wrong-granularity (date-only) value resolves to
+  # `nil` — a no-op filter with the default ordering, never a 400.
+  defp normalize_since(%DateTime{} = since), do: since
+
+  defp normalize_since(since) when is_binary(since) do
+    case parse_since(since) do
+      {:ok, dt} -> dt
+      :error -> nil
+    end
+  end
+
+  defp normalize_since(_since), do: nil
+
+  # `:since` delta filter. Filters to posts whose most-recent touch —
+  # GREATEST(inserted_at, updated_at) — is strictly after `since`, so a session
+  # slot upserted after `since` still surfaces even though its `inserted_at`
+  # predates it. `nil` (absent/malformed/date-only) is a no-op so a bad `?since=`
+  # degrades to "no filter", never a 400.
   defp apply_since(query, %DateTime{} = since) do
     where(query, [p], fragment("GREATEST(?, ?)", p.inserted_at, p.updated_at) > ^since)
   end
 
-  defp apply_since(query, since) when is_binary(since) do
-    case DateTime.from_iso8601(since) do
-      {:ok, dt, _offset} -> apply_since(query, dt)
-      _ -> query
-    end
+  defp apply_since(query, nil), do: query
+
+  # AC-39.3.1 orders the plain read `inserted_at DESC`. But a DELTA read (`since`
+  # present) filters on GREATEST(inserted_at, updated_at) — so a keyed slot whose
+  # `updated_at` (not `inserted_at`) advanced past `since` MATCHES the filter yet,
+  # ordered by its stale `inserted_at`, would rank last among matched rows and be
+  # the FIRST dropped by LIMIT — the exact SessionStart working-state slot the bus
+  # exists to surface (US-39.6 dedup). In delta mode we therefore order by the SAME
+  # GREATEST(inserted_at, updated_at) the filter uses, so a re-touched slot ranks
+  # by its most-recent touch and is not silently truncated. The non-delta read
+  # keeps the AC-mandated `inserted_at DESC`. `seq` (bigserial) DESC tie-breaks.
+  defp order_recent(query, %DateTime{}) do
+    order_by(query, [p],
+      desc: fragment("GREATEST(?, ?)", p.inserted_at, p.updated_at),
+      desc: p.seq
+    )
   end
 
-  defp apply_since(query, _since), do: query
+  defp order_recent(query, nil) do
+    order_by(query, [p], desc: p.inserted_at, desc: p.seq)
+  end
+
+  # Parse an ISO8601 `since` into a UTC DateTime. `DateTime.from_iso8601/1` only
+  # accepts an offset-bearing instant (the `...Z`/`+HH:MM` form that
+  # `DateTime.to_iso8601/1` emits on the programmatic path). A hand-crafted or
+  # tool-supplied but otherwise-valid OFFSET-LESS instant (e.g.
+  # "2026-07-18T00:00:00") returns `{:error, :missing_offset}` there — so without
+  # this fallback it would fall through to the no-op clause and SILENTLY disable
+  # the delta filter, returning the whole channel and defeating the "read only
+  # what's new" contract. Interpret an offset-less-but-valid ISO8601 instant as
+  # UTC (loopctl stores every timestamp in UTC) rather than dropping the filter.
+  defp parse_since(since) do
+    case DateTime.from_iso8601(since) do
+      {:ok, dt, _offset} ->
+        {:ok, dt}
+
+      {:error, :missing_offset} ->
+        case NaiveDateTime.from_iso8601(since) do
+          {:ok, naive} -> {:ok, DateTime.from_naive!(naive, "Etc/UTC")}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
 
   defp default_expires_at do
     DateTime.add(DateTime.utc_now(), @retention_days * 24 * 60 * 60, :second)
