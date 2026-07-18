@@ -415,6 +415,13 @@ defmodule Loopctl.ObanConfig do
          {"45 4 * * *", Loopctl.Workers.PromotionEvalWorker, args: %{"mode" => "all_tenants"}},
          {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
          {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
+         # US-39.5: 30-day TTL sweep for the coordination bus. Hard-deletes
+         # channel_posts past expires_at, bounded per run (single batch, drains a
+         # backlog over successive runs) so a large backlog cannot lock the table.
+         # Runs across all tenants on AdminRepo (BYPASSRLS) — the expiry predicate
+         # is tenant-independent. Keep in sync with the crontab assertion in
+         # oban_plugins_config_test.exs.
+         {"*/5 * * * *", Loopctl.Workers.ChannelPostSweeper},
          # US-38.2: prune expired windows from the cluster-global Postgres rate
          # limiter's counter table. A cheap index-range delete; a no-op when the
          # Postgres limiter is unselected (table empty). Keep in sync with the
