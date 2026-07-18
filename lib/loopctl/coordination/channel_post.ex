@@ -203,6 +203,12 @@ defmodule Loopctl.Coordination.ChannelPost do
         not Enum.all?(Map.values(refs), &valid_ref_value?/1) ->
           [refs: "values must be strings of at most #{@ref_value_max_length} characters"]
 
+        Enum.any?(Map.values(refs), &(is_binary(&1) and String.contains?(&1, <<0>>))) ->
+          # jsonb cannot store a NUL ( ) in a string value — Postgres raises a
+          # raw Postgrex.Error (500) at insert. Reject it as a 422 here, matching the
+          # text-field NUL guard, so no field is a 500 vector.
+          [refs: "must not contain NUL bytes"]
+
         refs_serialized_size(refs) > @refs_serialized_max_bytes ->
           [refs: "serialized size exceeds #{@refs_serialized_max_bytes} bytes"]
 

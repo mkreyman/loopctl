@@ -143,6 +143,17 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       assert %{body: _} = errors_on(cs)
     end
 
+    test "rejects a NUL byte in a refs value (jsonb would 500 otherwise)" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => %{"branch" => "main" <> <<0>> <> "x"}
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
     test "rejects a NUL byte in session_id" do
       cs =
         ChannelPost.create_changeset(base_struct(), %{
