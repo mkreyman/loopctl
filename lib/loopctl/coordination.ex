@@ -23,6 +23,7 @@ defmodule Loopctl.Coordination do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Projects
 
@@ -46,20 +47,24 @@ defmodule Loopctl.Coordination do
   `session_id`/`host`/`key`/`refs` are cast from `attrs`. `expires_at` is fixed at
   `now + #{@retention_days} days`.
 
-  The `project_id` must belong to `tenant_id`; a mispaired call returns
-  `{:error, :not_found}` rather than inserting a cross-tenant-shaped row (the
-  primitive asserts its own ownership invariant — the write endpoint's fuller
-  ownership/audit path is US-39.2).
+  Both `project_id` and `agent_id` must belong to `tenant_id`; a mispaired call
+  returns `{:error, :not_found}` rather than inserting a cross-tenant-shaped row
+  (the primitive asserts its own ownership invariant for BOTH ids — the write
+  endpoint's fuller ownership/audit path is US-39.2). In the real flow `agent_id`
+  is server-stamped from the verified key identity so it always matches; the
+  explicit check is defense-in-depth mirroring the `project_id` guard, so the
+  ownership invariant is not silently one-sided.
 
   Returns `{:ok, %ChannelPost{}}`, `{:error, %Ecto.Changeset{}}` (size/shape
   bound violation, a secret-denylist hit, or a session-key slot collision — the
   caller learns the content did not land), or `{:error, :not_found}` when the
-  project does not belong to the tenant.
+  project or agent does not belong to the tenant.
   """
   @spec create_post(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
           {:ok, ChannelPost.t()} | {:error, Ecto.Changeset.t()} | {:error, :not_found}
   def create_post(tenant_id, project_id, agent_id, attrs) do
-    with {:ok, _project} <- Projects.get_project(tenant_id, project_id) do
+    with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
+         {:ok, _agent} <- Agents.get_agent(tenant_id, agent_id) do
       %ChannelPost{
         tenant_id: tenant_id,
         project_id: project_id,
@@ -68,11 +73,28 @@ defmodule Loopctl.Coordination do
       }
       |> ChannelPost.create_changeset(attrs)
       |> AdminRepo.insert()
+      |> tap_secret_blocked()
     end
   end
 
+  # Fire the "credential blocked" security signal once, at the point a write is
+  # actually rejected — NOT inside the (pure) changeset builder, which would
+  # re-emit on every rebuild/preview and double-count the signal. A no-op unless
+  # the rejection carries a secret-denylist error.
+  defp tap_secret_blocked({:error, %Ecto.Changeset{} = changeset} = result) do
+    ChannelPost.emit_secret_blocked_events(changeset)
+    result
+  end
+
+  defp tap_secret_blocked(result), do: result
+
   @doc """
   Returns recent, non-expired posts for a tenant's project channel, newest first.
+
+  Ordering is `inserted_at DESC`, tie-broken by the monotonic `seq` (bigserial)
+  DESC — so two posts sharing the same microsecond `inserted_at` sort by true
+  insertion order, not by their random v4 `id`. Newest-first is therefore
+  insert-order-correct, not merely stable.
 
   Isolation is the explicit `tenant_id` filter (AdminRepo path); expired posts
   are filtered defensively even before the TTL sweep runs. A non-UUID
@@ -81,7 +103,10 @@ defmodule Loopctl.Coordination do
   `valid_uuid?` guard in `Projects.get_project`. `opts`:
 
     * `:limit` — max rows (default #{@default_recent_limit}, capped at
-      #{@max_recent_limit}); `limit: 0` (or negative) returns `[]`.
+      #{@max_recent_limit}); `limit: 0` (or negative) returns `[]`. Accepts an
+      integer or an integer STRING (e.g. `"0"`/`"1000"` from a `?limit=` query
+      param once US-39.3 wires an endpoint) so the documented contract holds for
+      the real endpoint input; any other value falls back to the default.
   """
   @spec recent(term(), term(), keyword()) :: [ChannelPost.t()]
   def recent(tenant_id, project_id, opts \\ []) do
@@ -92,7 +117,7 @@ defmodule Loopctl.Coordination do
       ChannelPost
       |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
       |> where([p], p.expires_at > ^now)
-      |> order_by([p], desc: p.inserted_at, desc: p.id)
+      |> order_by([p], desc: p.inserted_at, desc: p.seq)
       |> limit(^limit)
       |> AdminRepo.all()
     else
@@ -110,6 +135,18 @@ defmodule Loopctl.Coordination do
   # An explicit non-positive limit means "no rows" — honour it rather than
   # silently coercing to the default (LIMIT 0 returns []).
   defp clamp_limit(limit) when is_integer(limit) and limit <= 0, do: 0
+
+  # US-39.3 will wire this to an HTTP endpoint where `?limit=` arrives as a string.
+  # Parse an integer string and re-clamp so the documented contract (`"0"` -> [],
+  # `"1000"` capped at #{@max_recent_limit}) holds; a non-integer / trailing-garbage
+  # value falls back to the default rather than silently returning the default 50
+  # for a well-formed `"0"`.
+  defp clamp_limit(limit) when is_binary(limit) do
+    case Integer.parse(limit) do
+      {n, ""} -> clamp_limit(n)
+      _ -> @default_recent_limit
+    end
+  end
 
   defp clamp_limit(_), do: @default_recent_limit
 

@@ -11,6 +11,19 @@ defmodule Loopctl.Security.SecretDenylist do
   `key`, `session_id`, `host`, and every `refs` value before a post lands — a
   match is an explicit rejection (surfaced as a 422), never a silent drop.
 
+  ## Best-effort, NOT a DLP boundary
+
+  This targets ~11 high-confidence, *prefixed* credential shapes (see `@patterns`)
+  to keep false positives near zero on ordinary chatter. It is deliberately NOT a
+  comprehensive credential filter and MUST NOT be relied on as a data-loss-
+  prevention boundary: a plaintext DB password, an unprefixed high-entropy token,
+  a base64 blob, or `PGPASSWORD=hunter2` all pass straight through. For the
+  coordination bus — cross-session/cross-machine readable for 30 days — the real
+  backstop for a credential this denylist misses is the delete/redact path
+  (US-39.7), not this scan. Callers scan a bounded prefix per field, so a
+  credential padded past the byte cap is rejected on length but may not fire the
+  `secret_blocked` telemetry signal.
+
   The two lists live in separate repos with no shared compile-time source, so
   parity is a CONVENTION, not a guarantee: when you add a credential shape to one,
   add it to the other. (The bash script additionally scans for destructive shell

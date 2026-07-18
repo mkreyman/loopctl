@@ -44,6 +44,11 @@ defmodule Loopctl.Repo.Migrations.CreateChannelPosts do
     # Per-SESSION keyed upsert slot: two concurrent sessions writing key "session_goal"
     # do not clobber each other (session_id participates in the uniqueness). Partial —
     # only keyed posts are constrained; keyless posts are append-only.
+    #
+    # NOTE: agent_id is added to this index by a LATER migration
+    # (20260718000000_harden_channel_posts_slot_and_ordering) so the change applies
+    # to already-migrated environments — this migration landed on master (#425) and
+    # is never re-run. Do NOT edit the index here.
     create unique_index(:channel_posts, [:tenant_id, :project_id, :session_id, :key],
              where: "key IS NOT NULL",
              name: :channel_posts_session_key_uidx

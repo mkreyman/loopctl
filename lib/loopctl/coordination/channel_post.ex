@@ -10,10 +10,13 @@ defmodule Loopctl.Coordination.ChannelPost do
   doing. Retention is a uniform 30 days (`expires_at`); there is deliberately
   **no message-type taxonomy** (`:kind`/`:category`/`:type`) — the fleet audit
   showed the category taxonomy was essentially unused. An optional `key` reserves
-  a per-session working-state slot: in US-39.1 a second write to the same
-  `(tenant, project, session, key)` is **rejected** by the partial unique index
-  (`{:error, changeset}`), not merged; the `on_conflict` upsert that lets a
-  session refresh its own slot lands in US-39.2.
+  a per-(agent, session) working-state slot: in US-39.1 a second write to the same
+  `(tenant, project, agent, session, key)` is **rejected** by the partial unique
+  index (`{:error, changeset}`), not merged; the `on_conflict` upsert that lets a
+  session refresh its own slot lands in US-39.2. The **verified** `agent_id`
+  participates in the slot key so a spoofed, client-supplied `session_id` can
+  never collide with (US-39.1) — nor, once US-39.2 adds the upsert, overwrite —
+  another agent's slot.
 
   ## Trust boundary
 
@@ -47,6 +50,8 @@ defmodule Loopctl.Coordination.ChannelPost do
   @refs_serialized_max_bytes 4_096
   @allowed_ref_keys ~w(file pr branch commit)
 
+  @secret_error_message "must not contain a secret or credential"
+
   # Text fields that must never carry a NUL byte (Postgres rejects them at insert
   # time with a raw Postgrex.Error/500) nor a denylisted credential shape.
   @scanned_text_fields [:body, :key, :session_id, :host]
@@ -79,6 +84,11 @@ defmodule Loopctl.Coordination.ChannelPost do
 
     field :expires_at, :utc_datetime_usec
 
+    # DB-generated monotonic sequence (bigserial): strictly increasing with insert
+    # order, so newest-first reads can tie-break same-microsecond `inserted_at`
+    # values by true insertion order instead of a random v4 `id`. Never cast.
+    field :seq, :integer, read_after_writes: true
+
     timestamps()
   end
 
@@ -98,30 +108,33 @@ defmodule Loopctl.Coordination.ChannelPost do
   (surfaced as a 422) rather than silently dropping the content or leaking a
   credential onto the shared, cross-session-readable channel.
 
-  A blank (`""`/whitespace) `key` is normalised to `nil` so it means "no keyed
-  slot" rather than occupying the `(tenant, project, session, key)` slot with an
-  empty string. A keyed post is a per-session working-state slot, so `session_id`
-  is required whenever `key` is present — without it the partial unique index
-  (which treats a NULL `session_id` as distinct) can never dedupe the slot. The
-  DB constraints (the session-key partial unique index and the
-  tenant/project/agent foreign keys) are declared here so a collision or missing
-  parent surfaces as `{:error, changeset}` (422) rather than an unhandled
-  `Ecto.ConstraintError` (500).
+  A blank (`""`/whitespace-only) `body`, `key`, `session_id`, or `host` is
+  normalised to `nil` before the required/uniqueness checks: for `body` this
+  makes `validate_required/2` reject a whitespace-only post (an effectively empty
+  message must not land as noise on the shared, 30-day channel); for `key` it
+  means "no keyed slot" rather than occupying the
+  `(tenant, project, agent, session, key)` slot with an empty string. A keyed
+  post is a per-(agent, session) working-state slot, so `session_id` is required
+  whenever `key` is present — without it the partial unique index (which treats a
+  NULL `session_id` as distinct) can never dedupe the slot. The DB constraints
+  (the session-key partial unique index and the tenant/project/agent foreign
+  keys) are declared here so a collision or missing parent surfaces as
+  `{:error, changeset}` (422) rather than an unhandled `Ecto.ConstraintError`
+  (500).
   """
   @spec create_changeset(t(), map()) :: Ecto.Changeset.t()
   def create_changeset(post, attrs) do
     post
     |> cast(attrs, [:session_id, :host, :key, :body, :refs])
-    |> normalize_blank([:key, :session_id, :host])
+    |> normalize_blank([:body, :key, :session_id, :host])
     |> validate_required([:tenant_id, :project_id, :agent_id, :body, :expires_at])
     |> validate_length(:body, max: @body_max_length, count: :bytes)
     |> validate_length(:key, max: @key_max_length, count: :bytes)
     |> validate_length(:session_id, max: @session_id_max_length, count: :bytes)
     |> validate_length(:host, max: @host_max_length, count: :bytes)
-    |> validate_no_null_bytes()
     |> maybe_require_session_for_key()
     |> validate_refs()
-    |> validate_no_secrets()
+    |> scan_text_and_refs()
     |> foreign_key_constraint(:tenant_id)
     |> foreign_key_constraint(:project_id)
     |> foreign_key_constraint(:agent_id)
@@ -139,11 +152,14 @@ defmodule Loopctl.Coordination.ChannelPost do
   @spec allowed_ref_keys() :: [String.t()]
   def allowed_ref_keys, do: @allowed_ref_keys
 
-  # JSON clients routinely send `""` for an absent field, and in Elixir `""` is
-  # truthy — so a blank `key` would force `session_id` to be required AND occupy a
-  # real `(tenant, project, session, key)` slot (the partial index keys on
-  # `key IS NOT NULL`), colliding on the next blank-key post. Normalise blank text
-  # to `nil` so `""` means "no value", not a real slot / spoofable field.
+  # JSON clients routinely send `""` (or whitespace) for an absent field, and in
+  # Elixir `""` is truthy — so a blank `key` would force `session_id` to be
+  # required AND occupy a real `(tenant, project, agent, session, key)` slot (the
+  # partial index keys on `key IS NOT NULL`), colliding on the next blank-key
+  # post, and a blank/whitespace `body` would sneak past `validate_required/2` and
+  # land as an effectively empty post. Normalise blank/whitespace text to `nil` so
+  # `""`/`"   "` means "no value" (required-body rejects it; a keyless post has no
+  # slot / spoofable field).
   defp normalize_blank(changeset, fields) do
     Enum.reduce(fields, changeset, &blank_change_to_nil/2)
   end
@@ -161,6 +177,44 @@ defmodule Loopctl.Coordination.ChannelPost do
     end
   end
 
+  # Scan every persisted text field and every `refs` value for NUL bytes and
+  # denylisted credential shapes — over a BOUNDED prefix of each value.
+  # `validate_length/3` is non-halting, so without a cap an oversized field would
+  # be walked in full by `String.contains?/2` and every denylist regex — a
+  # CPU-amplification surface once US-39.2 wires this changeset to an HTTP handler.
+  # `scan_slice/1` caps the bytes handed to each scanner at `@scan_byte_cap`,
+  # bounding the work to O(@scan_byte_cap) per field regardless of input size (and
+  # closing the same amplification path via an oversized `refs` value, which
+  # `validate_length` never flags).
+  #
+  # Scanning is UNCONDITIONAL and PER-FIELD — deliberately NOT gated on a whole-
+  # changeset length check. An earlier design skipped ALL scans whenever ANY field
+  # had a length error, so a credential in `body` slipped past unscanned merely
+  # because an unrelated `host` was oversized — that defeated the operator-visible
+  # `secret_blocked` signal and broke the accumulate-every-offending-field contract.
+  # Now an over-length field is still rejected on length, AND a credential in its
+  # first `@scan_byte_cap` bytes still fires the signal. The only residual gap is a
+  # credential padded PAST the cap: rejected on length (no leak) but intentionally
+  # invisible to the secret signal — the documented best-effort tradeoff (see
+  # `Loopctl.Security.SecretDenylist`).
+  defp scan_text_and_refs(changeset) do
+    changeset
+    |> validate_no_null_bytes()
+    |> validate_no_secrets()
+  end
+
+  # Cap the bytes handed to the NUL/secret scanners so an oversized field (rejected
+  # on length regardless) cannot amplify scan cost. Byte-sliced to match the
+  # byte-based length bounds; the denylist regexes are byte-oriented (no `/u`), so a
+  # slice landing mid-codepoint is harmless. Every legitimate (within-length) field
+  # is <= @scan_byte_cap, so this never truncates a value that will actually land.
+  @scan_byte_cap @body_max_length
+
+  defp scan_slice(value) when is_binary(value) and byte_size(value) > @scan_byte_cap,
+    do: binary_part(value, 0, @scan_byte_cap)
+
+  defp scan_slice(value), do: value
+
   # Postgres `text`/`varchar` columns cannot store a NUL byte and raise a raw
   # Postgrex.Error (500) at insert time. JSON permits a NUL byte and Elixir strings
   # accept it, so reject it in the changeset — the caller learns it did not land
@@ -170,7 +224,7 @@ defmodule Loopctl.Coordination.ChannelPost do
   end
 
   defp reject_null_bytes(field, changeset) do
-    value = get_field(changeset, field)
+    value = changeset |> get_field(field) |> scan_slice()
 
     if is_binary(value) and String.contains?(value, <<0>>) do
       add_error(changeset, field, "must not contain NUL bytes")
@@ -179,10 +233,11 @@ defmodule Loopctl.Coordination.ChannelPost do
     end
   end
 
-  # A keyed post occupies a per-(tenant, project, session) working-state slot. The
-  # partial unique index includes session_id, and Postgres treats a NULL session_id
-  # as distinct — so without a session_id a keyed post can never upsert/dedupe and
-  # would accumulate unbounded duplicate rows. Require session_id whenever key is set.
+  # A keyed post occupies a per-(tenant, project, agent, session) working-state
+  # slot. The partial unique index includes session_id, and Postgres treats a NULL
+  # session_id as distinct — so without a session_id a keyed post can never
+  # upsert/dedupe and would accumulate unbounded duplicate rows. Require session_id
+  # whenever key is set.
   defp maybe_require_session_for_key(changeset) do
     if get_field(changeset, :key) do
       validate_required(changeset, :session_id)
@@ -201,7 +256,7 @@ defmodule Loopctl.Coordination.ChannelPost do
           [refs: "may only contain keys #{Enum.join(@allowed_ref_keys, ", ")}"]
 
         not Enum.all?(Map.values(refs), &valid_ref_value?/1) ->
-          [refs: "values must be strings of at most #{@ref_value_max_length} characters"]
+          [refs: "values must be strings of at most #{@ref_value_max_length} bytes"]
 
         Enum.any?(Map.values(refs), &(is_binary(&1) and String.contains?(&1, <<0>>))) ->
           # jsonb cannot store a NUL ( ) in a string value — Postgres raises a
@@ -218,8 +273,11 @@ defmodule Loopctl.Coordination.ChannelPost do
     end)
   end
 
+  # Byte-based to match the other text bounds (body/key/session_id/host all use
+  # `validate_length(count: :bytes)`): a grapheme count would let a 512-grapheme
+  # value of multibyte chars blow past the intended per-value storage cap.
   defp valid_ref_value?(value) when is_binary(value),
-    do: String.length(value) <= @ref_value_max_length
+    do: byte_size(value) <= @ref_value_max_length
 
   defp valid_ref_value?(_), do: false
 
@@ -242,9 +300,9 @@ defmodule Loopctl.Coordination.ChannelPost do
   # (no secret value) so an operator can see repeated credential-leak attempts.
   defp validate_no_secrets(changeset) do
     changeset
-    |> add_secret_errors(@scanned_text_fields, &get_field(changeset, &1))
+    |> add_secret_errors(@scanned_text_fields, &(changeset |> get_field(&1) |> scan_slice()))
     |> add_secret_errors([:refs], fn :refs ->
-      changeset |> get_field(:refs) |> Kernel.||(%{}) |> Map.values()
+      changeset |> get_field(:refs) |> Kernel.||(%{}) |> Map.values() |> Enum.map(&scan_slice/1)
     end)
   end
 
@@ -258,12 +316,31 @@ defmodule Loopctl.Coordination.ChannelPost do
           else: SecretDenylist.contains_secret?(value)
 
       if has_secret? do
-        emit_secret_blocked(acc, field)
-        add_error(acc, field, "must not contain a secret or credential")
+        add_error(acc, field, @secret_error_message)
       else
         acc
       end
     end)
+  end
+
+  @doc """
+  Emits the "credential blocked" security signal (a `:telemetry` event + a
+  structured warning) for each field a REJECTED changeset flagged for carrying a
+  secret shape.
+
+  The denylist check itself runs (side-effect-free) inside `create_changeset/2`,
+  but the signal is fired here — invoked by `Loopctl.Coordination.create_post/4`
+  only once, at the point an insert is actually rejected. Keeping the emission out
+  of the changeset builder means it fires exactly once per persisted rejection,
+  not on every (pure) changeset rebuild, dry-run, or validation preview.
+  """
+  @spec emit_secret_blocked_events(Ecto.Changeset.t()) :: :ok
+  def emit_secret_blocked_events(%Ecto.Changeset{} = changeset) do
+    for {field, {msg, _opts}} <- changeset.errors, msg == @secret_error_message do
+      emit_secret_blocked(changeset, field)
+    end
+
+    :ok
   end
 
   defp emit_secret_blocked(changeset, field) do
