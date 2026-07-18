@@ -29,11 +29,16 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   tags(["Knowledge Wiki"])
 
   operation(:index,
-    summary: "List ingestion capture-silence anomalies",
+    summary: "List ingestion anomalies (capture-silence + high-reject-rate)",
     description:
-      "Returns unresolved ingestion capture-silence anomalies for the tenant. " <>
-        "Filterable by source_type and anomaly_type. " <>
-        "Archived anomalies are excluded by default; use ?include_archived=true to include them.",
+      "Returns unresolved ingestion anomalies for the tenant — both capture_silence " <>
+        "(a source_type that stopped producing articles) and high_reject_rate (writes " <>
+        "attempted but rejected at high rate, which persist no article row). " <>
+        "Filterable by source_type and anomaly_type. Archived anomalies are excluded by " <>
+        "default; use ?include_archived=true to include them. A malformed ?resolved value " <>
+        "is rejected with 422. The response `meta.filters` echoes the effective filters, " <>
+        "and `meta.warnings` flags a source_type filter that names a never-seen source " <>
+        "(so an empty list is not mistaken for healthy).",
     parameters: [
       source_type: [
         in: :query,
@@ -43,7 +48,7 @@ defmodule LoopctlWeb.IngestionAnomalyController do
       anomaly_type: [
         in: :query,
         type: :string,
-        description: "Filter by anomaly type: capture_silence"
+        description: "Filter by anomaly type: capture_silence or high_reject_rate"
       ],
       include_archived: [
         in: :query,
@@ -70,6 +75,7 @@ defmodule LoopctlWeb.IngestionAnomalyController do
              meta: Schemas.PaginationMeta
            }
          }},
+      422 => {"Invalid 'resolved' filter value", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -124,27 +130,61 @@ defmodule LoopctlWeb.IngestionAnomalyController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
-    opts =
-      []
-      |> maybe_add_opt(:source_type, params["source_type"])
-      |> maybe_add_opt(:anomaly_type, params["anomaly_type"])
-      |> maybe_add_opt(:include_archived, parse_bool(params["include_archived"]))
-      |> maybe_add_opt(:resolved, parse_resolved(params["resolved"]))
-      |> maybe_add_opt(:page, parse_int(params["page"]))
-      |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
+    # A malformed ?resolved value is rejected with 422 (not silently coerced to the
+    # unresolved-only default) — mirrors the update action's malformed-?archived guard.
+    with {:ok, resolved} <- parse_resolved(params["resolved"]) do
+      source_type = string_filter(params["source_type"])
+      anomaly_type = string_filter(params["anomaly_type"])
+      include_archived = parse_bool(params["include_archived"]) || false
 
-    {:ok, result} = IngestionHealth.list_anomalies(tenant_id, opts)
+      opts =
+        []
+        |> maybe_add_opt(:source_type, source_type)
+        |> maybe_add_opt(:anomaly_type, anomaly_type)
+        |> maybe_add_opt(:include_archived, include_archived)
+        |> maybe_add_opt(:resolved, resolved)
+        |> maybe_add_opt(:page, parse_int(params["page"]))
+        |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
 
-    json(conn, %{
-      data: result.data,
-      meta: %{
-        page: result.page,
-        page_size: result.page_size,
-        total_count: result.total,
-        total_pages: ceil_div(result.total, result.page_size)
-      }
-    })
+      {:ok, result} = IngestionHealth.list_anomalies(tenant_id, opts)
+
+      json(conn, %{
+        data: result.data,
+        meta: %{
+          page: result.page,
+          page_size: result.page_size,
+          total_count: result.total,
+          total_pages: ceil_div(result.total, result.page_size),
+          # Echo the EFFECTIVE filters (post-default) so a caller can confirm what was
+          # actually applied — an omitted `resolved` reports the unresolved-only default.
+          filters: %{
+            source_type: source_type,
+            anomaly_type: anomaly_type,
+            resolved: if(is_nil(resolved), do: false, else: resolved),
+            include_archived: include_archived
+          },
+          # Warn when a source_type filter names a never-seen source, so an empty list
+          # is never mistaken for "healthy ingestion".
+          warnings: source_type_warnings(tenant_id, source_type)
+        }
+      })
+    end
   end
+
+  # When a source_type filter names a source with NO recorded write activity for this
+  # tenant, an empty anomaly list does not imply healthy ingestion — surface that.
+  defp source_type_warnings(tenant_id, source_type) when is_binary(source_type) do
+    if IngestionHealth.source_type_seen?(tenant_id, source_type) do
+      []
+    else
+      [
+        "source_type #{inspect(source_type)} has no recorded write activity for this " <>
+          "tenant; an empty result does not imply healthy ingestion for it."
+      ]
+    end
+  end
+
+  defp source_type_warnings(_tenant_id, _source_type), do: []
 
   @doc """
   PATCH /api/v1/ingestion-anomalies/:id
@@ -217,10 +257,26 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   defp parse_bool(false), do: false
   defp parse_bool(_), do: nil
 
-  # `resolved=all` is a sentinel meaning "both resolved and unresolved"; anything
-  # else parses as a boolean (nil -> omitted -> context default of unresolved-only).
-  defp parse_resolved("all"), do: :all
-  defp parse_resolved(other), do: parse_bool(other)
+  # `resolved=all` is a sentinel meaning "both resolved and unresolved"; true/false
+  # narrow to that status; absent/empty -> {:ok, nil} (context default of
+  # unresolved-only). A malformed value is rejected with 422 rather than silently
+  # coerced, so an empty result is never mistaken for a deliberate filter.
+  defp parse_resolved(nil), do: {:ok, nil}
+  defp parse_resolved(""), do: {:ok, nil}
+  defp parse_resolved("all"), do: {:ok, :all}
+  defp parse_resolved("true"), do: {:ok, true}
+  defp parse_resolved("false"), do: {:ok, false}
+  defp parse_resolved(true), do: {:ok, true}
+  defp parse_resolved(false), do: {:ok, false}
+
+  defp parse_resolved(other) do
+    {:error, :unprocessable_entity,
+     "Invalid 'resolved' value #{inspect(other)}; expected true, false, or all."}
+  end
+
+  # A query filter must be a non-empty string to apply; empty/absent/malformed -> nil.
+  defp string_filter(value) when is_binary(value) and value != "", do: value
+  defp string_filter(_), do: nil
 
   defp parse_int(nil), do: nil
 

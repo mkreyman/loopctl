@@ -16,16 +16,27 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
   ## Anomaly Types
 
   - `capture_silence` -- an established source_type produced no new article for
-    longer than the configured staleness threshold.
+    longer than the configured staleness threshold (writes STOPPED).
+  - `high_reject_rate` -- writes of a source_type were ATTEMPTED but REJECTED at high
+    rate over a rolling window (the OTHER outage signature: 409 title_conflict /
+    validation drops that persist NO article row). Detected off the durable
+    `ingestion_write_stats` rollup, not the `articles` table. For this type the
+    freshness fields are repurposed: `sample_count` = total write attempts in the
+    window; `hours_stale` is not meaningful (set to 0); `last_event_at` is nil. The
+    reject figures (reject_rate, total_attempts, rejects, window_days,
+    dominant_reason) live in `metadata`.
 
   ## Fields
 
-  - `source_type` -- the article `source_type` whose capture stream went silent
+  - `source_type` -- the article `source_type` whose capture stream went silent /
+    whose writes are being rejected
   - `anomaly_type` -- one of the types above
-  - `last_event_at` -- `max(inserted_at)` of that source_type's articles (nil if none)
-  - `hours_stale` -- whole hours between `last_event_at` and detection time
+  - `last_event_at` -- `max(inserted_at)` of that source_type's articles (nil if none;
+    always nil for `high_reject_rate`)
+  - `hours_stale` -- whole hours between `last_event_at` and detection time (0 for
+    `high_reject_rate`)
   - `sample_count` -- articles of that source_type within the recency/establishment
-    window (the "recently established" evidence)
+    window (capture_silence), or total write attempts in the window (high_reject_rate)
   - `resolved` -- whether the anomaly has been acknowledged/resolved
   - `archived` -- archived anomalies are excluded from the default list and
     suppress re-detection for a retired source_type until un-archived
@@ -40,9 +51,10 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
 
   @type t :: %__MODULE__{}
 
-  # Extensible list — a future detector (e.g. `:capture_drop_rate`) can be added
-  # here alongside the CHECK constraint in the migration.
-  @anomaly_types [:capture_silence]
+  # Extensible list — kept in sync with the `ingestion_anomalies_anomaly_type_check`
+  # DB CHECK constraint (widened per new value via migration). A future detector can
+  # be added here alongside a CHECK-widening migration.
+  @anomaly_types [:capture_silence, :high_reject_rate]
 
   @derive {Jason.Encoder,
            only: [
@@ -100,15 +112,26 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
     ])
     |> validate_required([:source_type, :anomaly_type, :hours_stale, :sample_count])
     |> validate_inclusion(:anomaly_type, @anomaly_types)
-    # A capture-silence anomaly is, by definition, a source_type that WENT stale —
-    # so it must have been established (>= 1 captured article) and stale (> 0 hours).
-    # sample_count: 0 ("never established") / hours_stale: 0 ("not actually stale")
-    # are logically impossible anomalies; reject them at the invariant boundary
-    # even though the detection layer already only feeds established+stale figures.
-    |> validate_number(:hours_stale, greater_than: 0)
+    # Both types carry at least one sample: capture_silence needs >= 1 established
+    # article; high_reject_rate needs >= 1 (in practice >= min_attempts) write attempt.
     |> validate_number(:sample_count, greater_than_or_equal_to: 1)
+    |> validate_type_invariants()
     |> validate_metadata_size()
     |> foreign_key_constraint(:tenant_id)
+  end
+
+  # Per-type invariant on `hours_stale`. A capture-silence anomaly is, by definition,
+  # a source_type that WENT stale — so it must be stale (> 0 hours); hours_stale: 0
+  # ("not actually stale") is a logically impossible anomaly, rejected at the boundary
+  # even though detection already only feeds stale figures. A high_reject_rate anomaly
+  # has no staleness dimension (its evidence is the reject ratio in metadata), so
+  # hours_stale is a non-meaningful 0 — allow >= 0.
+  defp validate_type_invariants(changeset) do
+    case get_field(changeset, :anomaly_type) do
+      :capture_silence -> validate_number(changeset, :hours_stale, greater_than: 0)
+      :high_reject_rate -> validate_number(changeset, :hours_stale, greater_than_or_equal_to: 0)
+      _ -> changeset
+    end
   end
 
   @doc """

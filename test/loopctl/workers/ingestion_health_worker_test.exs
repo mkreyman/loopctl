@@ -288,4 +288,128 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
       assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
     end
   end
+
+  # --- PR B2: high-reject-rate detection ---
+
+  describe "perform/1 — high-reject-rate detection" do
+    # Reject-rate config pins (config/test.exs): min_attempts 10, threshold 0.5.
+    defp seed_reject_stats(tenant_id, source_type, counters) do
+      fixture(
+        :ingestion_write_stats,
+        Map.merge(%{tenant_id: tenant_id, source_type: source_type}, counters)
+      )
+    end
+
+    test "flags an established high-reject source_type with audit + operator alert + webhook" do
+      tenant = fixture(:tenant)
+
+      fixture(:webhook, %{
+        tenant_id: tenant.id,
+        events: ["knowledge.ingestion_anomaly_detected"]
+      })
+
+      # 10 attempts, 8 rejects (rate 0.8 > 0.5, total >= min_attempts 10).
+      seed_reject_stats(tenant.id, "web_article", %{created_count: 2, title_conflict_count: 8})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert_enqueued(worker: ScaleAlertDeliveryWorker)
+        assert_enqueued(worker: WebhookDeliveryWorker, args: %{tenant_id: tenant.id})
+      end)
+
+      [anomaly] = anomalies_for(tenant.id)
+      assert anomaly.anomaly_type == :high_reject_rate
+      assert anomaly.source_type == "web_article"
+      assert anomaly.resolved == false
+      assert anomaly.sample_count == 10
+      assert anomaly.metadata["total_attempts"] == 10
+      assert anomaly.metadata["rejects"] == 8
+      assert anomaly.metadata["reject_rate"] > 0.5
+      assert anomaly.metadata["dominant_reason"] == "title_conflict"
+      assert anomaly.metadata["window_days"] == 7
+
+      assert detected_audit_count(tenant.id, "web_article") == 1
+    end
+
+    test "operator-alert payload conforms to the ScaleAlert contract for high_reject_rate" do
+      tenant = fixture(:tenant)
+      seed_reject_stats(tenant.id, "web_article", %{created_count: 2, validation_error_count: 8})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+        [job] = all_enqueued(worker: ScaleAlertDeliveryWorker)
+        payload = job.args["payload"]
+
+        assert payload["alert"] == "ingestion.high_reject_rate"
+        assert payload["metric"] == "ingestion.high_reject_rate.reject_rate"
+        assert payload["value"] > 0.5
+        assert payload["threshold"] == 0.5
+        assert payload["window_seconds"] == 7 * 86_400
+        assert payload["dominant_reason"] == "validation_error"
+      end)
+    end
+
+    test "does not flag below min_attempts even at a high reject rate" do
+      tenant = fixture(:tenant)
+      # 5 attempts, 4 rejects (rate 0.8) but total < min_attempts 10.
+      seed_reject_stats(tenant.id, "web_article", %{created_count: 1, title_conflict_count: 4})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        refute_enqueued(worker: ScaleAlertDeliveryWorker)
+      end)
+
+      assert anomalies_for(tenant.id) == []
+    end
+
+    test "does not flag when the reject rate is at/below threshold" do
+      tenant = fixture(:tenant)
+      # 10 attempts, 4 rejects (rate 0.4 <= 0.5).
+      seed_reject_stats(tenant.id, "web_article", %{created_count: 6, title_conflict_count: 4})
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+      assert anomalies_for(tenant.id) == []
+      assert detected_audit_count(tenant.id, "web_article") == 0
+    end
+
+    test "a second run on the same reject condition updates in place and does NOT re-notify" do
+      tenant = fixture(:tenant)
+      seed_reject_stats(tenant.id, "web_article", %{created_count: 2, title_conflict_count: 8})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+        assert length(all_enqueued(worker: ScaleAlertDeliveryWorker)) == 1
+      end)
+
+      assert length(anomalies_for(tenant.id)) == 1
+      assert detected_audit_count(tenant.id, "web_article") == 1
+    end
+
+    test "tenant isolation — tenant A's rejects never flag tenant B" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      seed_reject_stats(tenant_a.id, "web_article", %{created_count: 2, title_conflict_count: 8})
+      # B: same volume but low reject rate.
+      seed_reject_stats(tenant_b.id, "web_article", %{created_count: 8, title_conflict_count: 2})
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+      assert [%{anomaly_type: :high_reject_rate}] = anomalies_for(tenant_a.id)
+      assert anomalies_for(tenant_b.id) == []
+    end
+
+    test "excludes a NULL source_type reject bucket (anomaly requires a source_type)" do
+      tenant = fixture(:tenant)
+      seed_reject_stats(tenant.id, nil, %{created_count: 2, title_conflict_count: 8})
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+      assert anomalies_for(tenant.id) == []
+    end
+  end
 end

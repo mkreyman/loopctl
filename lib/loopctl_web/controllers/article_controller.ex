@@ -32,6 +32,7 @@ defmodule LoopctlWeb.ArticleController do
   alias Loopctl.Auth.Role
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.TelemetryEvents
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.AuditContext
   alias LoopctlWeb.Helpers.Pagination
@@ -383,8 +384,10 @@ defmodule LoopctlWeb.ArticleController do
   # Novelty-gated path: render by verdict. A near-duplicate is NOT created — the
   # caller is pointed at the canonical article. A low-novelty proposal is created as
   # a draft with the near-neighbors surfaced so a reviewer/consumer can merge.
-  defp render_proposal(conn, {:ok, %{verdict: :duplicate} = result}, _attrs, _draft?) do
+  defp render_proposal(conn, {:ok, %{verdict: :duplicate} = result}, attrs, _draft?) do
     %{article: existing, assessment: assessment} = result
+
+    emit_write_telemetry(conn, attrs, :deduplicated)
 
     conn
     |> put_status(:ok)
@@ -399,8 +402,10 @@ defmodule LoopctlWeb.ArticleController do
     })
   end
 
-  defp render_proposal(conn, {:ok, %{verdict: :gated_to_draft} = result}, _attrs, _draft?) do
+  defp render_proposal(conn, {:ok, %{verdict: :gated_to_draft} = result}, attrs, _draft?) do
     %{article: article, assessment: assessment} = result
+
+    emit_write_telemetry(conn, attrs, :gated_to_draft)
 
     conn
     |> put_status(:created)
@@ -419,13 +424,17 @@ defmodule LoopctlWeb.ArticleController do
   end
 
   defp render_proposal(conn, {:ok, %{verdict: :deduplicated, article: existing}}, attrs, draft?) do
+    emit_write_telemetry(conn, attrs, :deduplicated)
+
     conn
     |> put_status(:ok)
     |> json(dedup_response(existing, attrs, draft?))
   end
 
   # :created (novel, or gate fell open) — normal create response.
-  defp render_proposal(conn, {:ok, %{article: article}}, _attrs, _draft?) do
+  defp render_proposal(conn, {:ok, %{article: article}}, attrs, _draft?) do
+    emit_write_telemetry(conn, attrs, :created)
+
     conn
     |> put_status(:created)
     |> json(create_response(article))
@@ -435,19 +444,25 @@ defmodule LoopctlWeb.ArticleController do
     do: render_create(conn, error, attrs, draft?)
 
   # Ungated path (force: true) — the original create semantics.
-  defp render_create(conn, {:ok, article}, _attrs, _draft?) do
+  defp render_create(conn, {:ok, article}, attrs, _draft?) do
+    emit_write_telemetry(conn, attrs, :created)
+
     conn
     |> put_status(:created)
     |> json(create_response(article))
   end
 
   defp render_create(conn, {:ok, :deduplicated, existing}, attrs, draft?) do
+    emit_write_telemetry(conn, attrs, :deduplicated)
+
     conn
     |> put_status(:ok)
     |> json(dedup_response(existing, attrs, draft?))
   end
 
-  defp render_create(conn, {:error, :duplicate_title, existing}, _attrs, _draft?) do
+  defp render_create(conn, {:error, :duplicate_title, existing}, attrs, _draft?) do
+    emit_write_telemetry(conn, attrs, :title_conflict)
+
     conn
     |> put_status(:conflict)
     |> json(%{
@@ -463,8 +478,33 @@ defmodule LoopctlWeb.ArticleController do
     })
   end
 
-  defp render_create(_conn, {:error, %Ecto.Changeset{} = changeset}, _attrs, _draft?),
-    do: {:error, changeset}
+  defp render_create(conn, {:error, %Ecto.Changeset{} = changeset}, attrs, _draft?) do
+    emit_write_telemetry(conn, attrs, :validation_error)
+    {:error, changeset}
+  end
+
+  # Emit the article-write outcome telemetry (PR B2). Folded into the durable
+  # `ingestion_write_stats` rollup by `Loopctl.Telemetry.IngestionWriteStats` so a
+  # high-rejection-rate outage (which persists NO article row) stays observable.
+  # Emission must never change response behavior — it is a fire-and-forget increment.
+  defp emit_write_telemetry(conn, attrs, outcome) do
+    :telemetry.execute(
+      TelemetryEvents.article_write(),
+      %{count: 1},
+      %{
+        tenant_id: conn.assigns.current_api_key.tenant_id,
+        source_type: telemetry_source_type(attrs),
+        outcome: outcome
+      }
+    )
+  end
+
+  defp telemetry_source_type(attrs) do
+    case attrs["source_type"] || attrs[:source_type] do
+      st when is_binary(st) -> st
+      _ -> nil
+    end
+  end
 
   defp gate_meta(verdict, assessment) do
     %{

@@ -5,6 +5,7 @@ defmodule Loopctl.Application do
 
   use Application
 
+  alias Loopctl.Telemetry.IngestionWriteStats
   alias Loopctl.Telemetry.SlowQueryLogger
 
   @impl true
@@ -18,6 +19,12 @@ defmodule Loopctl.Application do
 
     # US-27.4: uniform slow-query logging across all repos via one telemetry handler.
     SlowQueryLogger.attach()
+
+    # PR B2: fold every KB article write OUTCOME into the durable
+    # `ingestion_write_stats` rollup (the no-persist / high-rejection-rate detector's
+    # data source). Self-rescuing, so a dropped rollup increment never affects the
+    # write it observes.
+    IngestionWriteStats.attach()
 
     children = [
       LoopctlWeb.Telemetry,

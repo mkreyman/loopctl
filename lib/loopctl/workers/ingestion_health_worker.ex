@@ -120,6 +120,17 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
 
     Enum.each(candidates, &flag_candidate/1)
 
+    # PR B2: the no-persist / high-rejection-rate sibling detector. A rejected write
+    # leaves no article row, so it is invisible to the capture-silence scan above;
+    # this reads the durable `ingestion_write_stats` rollup instead.
+    reject_candidates = detect_reject_candidates()
+
+    Logger.info(
+      "IngestionHealthWorker: #{length(reject_candidates)} high-reject-rate candidate(s) detected"
+    )
+
+    Enum.each(reject_candidates, &flag_candidate/1)
+
     # Close anomalies whose captures have resumed (recovered streams), so an open
     # anomaly always means "still silent" and not "recovered but never cleared".
     resolved = IngestionHealth.auto_resolve_recovered()
@@ -129,6 +140,31 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     end
 
     :ok
+  end
+
+  # Reject-rate detection reads its own rollup table; guard the version-skew window
+  # (code on the hourly crontab before the migration landed) exactly like the
+  # anomalies-table probe, so a missing rollup table skips quietly instead of
+  # crashing the job.
+  defp detect_reject_candidates do
+    if write_stats_table_ready?() do
+      IngestionHealth.detect_high_reject_rate()
+    else
+      Logger.warning(
+        "IngestionHealthWorker: ingestion_write_stats table not present yet " <>
+          "(migration pending); skipping reject-rate detection this run"
+      )
+
+      []
+    end
+  end
+
+  defp write_stats_table_ready? do
+    case AdminRepo.query("SELECT to_regclass('ingestion_write_stats')", []) do
+      {:ok, %{rows: [[nil]]}} -> false
+      {:ok, _} -> true
+      _ -> false
+    end
   end
 
   # `to_regclass` returns NULL when the relation does not exist (no exception),
@@ -141,7 +177,14 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     end
   end
 
-  defp flag_candidate(%{
+  # Dispatch by detector type: capture_silence (writes stopped) vs high_reject_rate
+  # (writes rejected). Both reuse the same persist/notify/at-least-once machinery.
+  defp flag_candidate(%{anomaly_type: :high_reject_rate} = candidate),
+    do: flag_reject_rate(candidate)
+
+  defp flag_candidate(candidate), do: flag_capture_silence(candidate)
+
+  defp flag_capture_silence(%{
          tenant_id: tenant_id,
          source_type: source_type,
          last_event_at: last_event_at,
@@ -162,7 +205,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
       |> AdminRepo.one()
 
     cond do
-      archived_suppression?(tenant_id, source_type) ->
+      archived_suppression?(tenant_id, source_type, :capture_silence) ->
         # Operator archived this source_type — escape hatch, never re-flag (until un-archived).
         :suppressed
 
@@ -189,13 +232,13 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   end
 
   # An archived anomaly (resolved or not) suppresses re-detection for that
-  # source_type — the operator's escape hatch for a retired workflow, reversible
-  # via IngestionHealth.unarchive_anomaly/3.
-  defp archived_suppression?(tenant_id, source_type) do
+  # (source_type, anomaly_type) — the operator's escape hatch for a retired
+  # workflow, reversible via IngestionHealth.unarchive_anomaly/3.
+  defp archived_suppression?(tenant_id, source_type, anomaly_type) do
     IngestionAnomaly
     |> where([a], a.tenant_id == ^tenant_id)
     |> where([a], a.source_type == ^source_type)
-    |> where([a], a.anomaly_type == :capture_silence)
+    |> where([a], a.anomaly_type == ^anomaly_type)
     |> where([a], a.archived == true)
     |> AdminRepo.exists?()
   end
@@ -211,6 +254,117 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     |> where([a], a.archived == false)
     |> where([a], not is_nil(a.last_event_at) and a.last_event_at >= ^last_event_at)
     |> AdminRepo.exists?()
+  end
+
+  # --- High-reject-rate flagging (PR B2) ---
+
+  # Mirrors flag_capture_silence structurally, reusing the SAME persist/notify/
+  # at-least-once machinery, but with reject-rate semantics: no last_event_at/
+  # resume episode (rejects have no natural "resumed" signal), so resolve is sticky
+  # (a resolved reject-rate anomaly suppresses re-creation while rejects persist —
+  # anti-alarm-fatigue) until archived/unarchived.
+  defp flag_reject_rate(%{tenant_id: tenant_id, source_type: source_type} = candidate) do
+    existing =
+      IngestionAnomaly
+      |> where([a], a.tenant_id == ^tenant_id)
+      |> where([a], a.source_type == ^source_type)
+      |> where([a], a.anomaly_type == :high_reject_rate)
+      |> where([a], a.resolved == false)
+      |> where([a], a.archived == false)
+      |> AdminRepo.one()
+
+    cond do
+      archived_suppression?(tenant_id, source_type, :high_reject_rate) ->
+        :suppressed
+
+      existing && not existing.alerted ->
+        # At-least-once recovery: the row was persisted + audited atomically but its
+        # post-commit alert/webhook never fired. Re-fire, then refresh figures.
+        notify(tenant_id, existing)
+        update_existing_reject(existing, candidate)
+
+      existing ->
+        update_existing_reject(existing, candidate)
+
+      resolved_reject_suppression?(tenant_id, source_type) ->
+        # Operator resolved it and rejects still persist — do not re-fire every run.
+        :suppressed
+
+      true ->
+        create_new_reject(tenant_id, candidate)
+    end
+  end
+
+  # A resolved (non-archived) high_reject_rate anomaly suppresses re-creation while
+  # the reject condition persists — mirrors capture_silence's "resolve sticks".
+  defp resolved_reject_suppression?(tenant_id, source_type) do
+    IngestionAnomaly
+    |> where([a], a.tenant_id == ^tenant_id)
+    |> where([a], a.source_type == ^source_type)
+    |> where([a], a.anomaly_type == :high_reject_rate)
+    |> where([a], a.resolved == true)
+    |> where([a], a.archived == false)
+    |> AdminRepo.exists?()
+  end
+
+  defp create_new_reject(tenant_id, candidate) do
+    changeset =
+      IngestionAnomaly.create_changeset(
+        %IngestionAnomaly{tenant_id: tenant_id},
+        %{
+          source_type: candidate.source_type,
+          anomaly_type: :high_reject_rate,
+          # No staleness dimension for a reject-rate anomaly: last_event_at nil,
+          # hours_stale 0, sample_count = total write attempts in the window.
+          last_event_at: nil,
+          hours_stale: 0,
+          sample_count: candidate.total_attempts,
+          metadata: reject_metadata(candidate)
+        }
+      )
+
+    if changeset.valid? do
+      insert_new_anomaly(tenant_id, changeset)
+    else
+      Logger.warning(
+        "IngestionHealthWorker: invalid high_reject_rate anomaly for tenant " <>
+          "#{tenant_id}/#{candidate.source_type}, skipping: #{inspect(changeset.errors)}"
+      )
+
+      nil
+    end
+  end
+
+  # Silently refresh the reject figures on an existing unresolved anomaly — no re-notify.
+  defp update_existing_reject(existing, candidate) do
+    case existing
+         |> IngestionAnomaly.create_changeset(%{
+           hours_stale: 0,
+           sample_count: candidate.total_attempts,
+           metadata: reject_metadata(candidate)
+         })
+         |> AdminRepo.update() do
+      {:ok, updated} ->
+        updated
+
+      {:error, changeset} ->
+        Logger.warning(
+          "IngestionHealthWorker: failed to update high_reject_rate anomaly " <>
+            "#{existing.id}: #{inspect(changeset.errors)}"
+        )
+
+        existing
+    end
+  end
+
+  defp reject_metadata(candidate) do
+    %{
+      "reject_rate" => candidate.reject_rate,
+      "total_attempts" => candidate.total_attempts,
+      "rejects" => candidate.rejects,
+      "window_days" => candidate.window_days,
+      "dominant_reason" => candidate.dominant_reason
+    }
   end
 
   # Recovery path: the row exists but its post-commit notifications never fired
@@ -248,6 +402,17 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # per-tenant webhook subscriptions: a detected capture-silence is a genuine
   # operational event, so it must surface in logs/monitoring even when no alert
   # channel is wired.
+  defp log_detected_alarm(tenant_id, %IngestionAnomaly{anomaly_type: :high_reject_rate} = anomaly) do
+    md = anomaly.metadata || %{}
+
+    Logger.error(
+      "IngestionHealthWorker: high-reject-rate detected — tenant=#{tenant_id} " <>
+        "source_type=#{anomaly.source_type} reject_rate=#{md["reject_rate"]} " <>
+        "total_attempts=#{md["total_attempts"]} rejects=#{md["rejects"]} " <>
+        "dominant_reason=#{md["dominant_reason"]} anomaly_id=#{anomaly.id}"
+    )
+  end
+
   defp log_detected_alarm(tenant_id, anomaly) do
     Logger.error(
       "IngestionHealthWorker: capture-silence detected — tenant=#{tenant_id} " <>
@@ -374,6 +539,32 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   end
 
   # Writes the `detected` audit entry inside the create transaction (AdminRepo).
+  defp log_detected(tenant_id, %IngestionAnomaly{anomaly_type: :high_reject_rate} = anomaly) do
+    md = anomaly.metadata || %{}
+
+    Audit.create_log_entry(tenant_id, %{
+      entity_type: "ingestion_anomaly",
+      entity_id: anomaly.id,
+      action: "detected",
+      actor_type: "system",
+      new_state: %{
+        "anomaly_type" => to_string(anomaly.anomaly_type),
+        "source_type" => anomaly.source_type,
+        "reject_rate" => md["reject_rate"],
+        "total_attempts" => md["total_attempts"],
+        "rejects" => md["rejects"],
+        "window_days" => md["window_days"],
+        "dominant_reason" => md["dominant_reason"]
+      },
+      metadata: %{
+        "anomaly_id" => anomaly.id,
+        "source_type" => anomaly.source_type,
+        "anomaly_type" => to_string(anomaly.anomaly_type),
+        "reject_rate" => md["reject_rate"]
+      }
+    })
+  end
+
   defp log_detected(tenant_id, anomaly) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "ingestion_anomaly",
@@ -399,6 +590,30 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # Enqueue an operator alert through ScaleAlertDeliveryWorker with an id-only payload.
   # That worker resolves SCALE_ALERT_WEBHOOK_URL itself and no-ops when unset, so this
   # is channel-agnostic and safe when unconfigured — we never read/require the URL here.
+  defp fire_operator_alert(
+         tenant_id,
+         %IngestionAnomaly{anomaly_type: :high_reject_rate} = anomaly
+       ) do
+    md = anomaly.metadata || %{}
+    window_days = md["window_days"] || IngestionHealth.reject_window_days()
+
+    payload = %{
+      "alert" => "ingestion.high_reject_rate",
+      "metric" => "ingestion.high_reject_rate.reject_rate",
+      "value" => md["reject_rate"],
+      "threshold" => IngestionHealth.reject_rate_threshold(),
+      "window_seconds" => window_days * 86_400,
+      "tenant_id" => tenant_id,
+      "source_type" => anomaly.source_type,
+      "total_attempts" => md["total_attempts"],
+      "rejects" => md["rejects"],
+      "dominant_reason" => md["dominant_reason"],
+      "at" => DateTime.utc_now() |> DateTime.to_iso8601()
+    }
+
+    enqueue_operator_alert(payload, anomaly)
+  end
+
   defp fire_operator_alert(tenant_id, anomaly) do
     # Conform to the ScaleAlert operator-alert contract (%{alert, metric, value,
     # threshold, window_seconds, at}) so the shared alert channel — including
@@ -420,6 +635,10 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
       "at" => DateTime.utc_now() |> DateTime.to_iso8601()
     }
 
+    enqueue_operator_alert(payload, anomaly)
+  end
+
+  defp enqueue_operator_alert(payload, anomaly) do
     case %{payload: payload} |> ScaleAlertDeliveryWorker.new() |> Oban.insert() do
       {:ok, _job} ->
         :ok
@@ -440,17 +659,35 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     webhooks = EventGenerator.matching_webhooks(tenant_id, @webhook_event_type, nil)
 
     if webhooks != [] do
-      payload = %{
-        "anomaly_id" => anomaly.id,
-        "source_type" => anomaly.source_type,
-        "anomaly_type" => to_string(anomaly.anomaly_type),
-        "hours_stale" => anomaly.hours_stale,
-        "sample_count" => anomaly.sample_count,
-        "last_event_at" => iso8601(anomaly.last_event_at)
-      }
-
+      payload = anomaly_webhook_payload(anomaly)
       Enum.each(webhooks, &deliver_anomaly_event(tenant_id, &1, payload, anomaly.id))
     end
+  end
+
+  defp anomaly_webhook_payload(%IngestionAnomaly{anomaly_type: :high_reject_rate} = anomaly) do
+    md = anomaly.metadata || %{}
+
+    %{
+      "anomaly_id" => anomaly.id,
+      "source_type" => anomaly.source_type,
+      "anomaly_type" => to_string(anomaly.anomaly_type),
+      "reject_rate" => md["reject_rate"],
+      "total_attempts" => md["total_attempts"],
+      "rejects" => md["rejects"],
+      "window_days" => md["window_days"],
+      "dominant_reason" => md["dominant_reason"]
+    }
+  end
+
+  defp anomaly_webhook_payload(anomaly) do
+    %{
+      "anomaly_id" => anomaly.id,
+      "source_type" => anomaly.source_type,
+      "anomaly_type" => to_string(anomaly.anomaly_type),
+      "hours_stale" => anomaly.hours_stale,
+      "sample_count" => anomaly.sample_count,
+      "last_event_at" => iso8601(anomaly.last_event_at)
+    }
   end
 
   defp deliver_anomaly_event(tenant_id, webhook, payload, anomaly_id) do

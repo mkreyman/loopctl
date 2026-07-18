@@ -6,11 +6,25 @@ defmodule LoopctlWeb.ArticleControllerTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.IngestionWriteStats
 
   import Ecto.Query
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
+  end
+
+  # PR B2: the create render paths emit [:loopctl, :knowledge, :article_write], folded
+  # into the ingestion_write_stats rollup by the boot-attached telemetry handler (which
+  # runs in this request/test process, sharing its sandbox connection).
+  defp write_stats(tenant_id, source_type) do
+    AdminRepo.one(
+      from(s in IngestionWriteStats,
+        where:
+          s.tenant_id == ^tenant_id and s.source_type == ^source_type and
+            s.day == ^Date.utc_today()
+      )
+    )
   end
 
   describe "POST /api/v1/articles" do
@@ -36,6 +50,56 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["data"]["status"] == "published"
       assert is_nil(body["data"]["project_id"])
       assert body["note"] =~ "published"
+    end
+
+    test "a create emits article_write telemetry folded into the write-stats rollup", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Rollup Wiring Check",
+          "body" => "prove the create render path emits article_write telemetry",
+          "category" => "pattern",
+          "source_type" => "web_article"
+        })
+
+      assert json_response(conn, 201)
+
+      row = write_stats(tenant.id, "web_article")
+      assert row.created_count == 1
+    end
+
+    test "a title_conflict emits the title_conflict outcome to the rollup", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      params = %{
+        "title" => "Conflicting Title",
+        "body" => "original body content for the conflict check",
+        "category" => "pattern",
+        "source_type" => "web_article",
+        # force: true takes the ungated create path so a same-title different-body
+        # second write yields a 409 title_conflict (not a novelty-gate dedup).
+        "force" => true
+      }
+
+      conn |> auth_conn(raw_key) |> post(~p"/api/v1/articles", params)
+
+      conn2 =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{params | "body" => "a different body triggers 409"})
+
+      assert json_response(conn2, 409)
+
+      row = write_stats(tenant.id, "web_article")
+      assert row.created_count == 1
+      assert row.title_conflict_count == 1
     end
 
     test "agent can stage a draft via draft: true", %{conn: conn} do

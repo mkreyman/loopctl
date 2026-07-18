@@ -275,6 +275,26 @@ defmodule Loopctl.TelemetryEvents do
   """
   def recall_context_degraded, do: [:loopctl, :memory, :recall_context, :degraded]
 
+  @doc """
+  A KB article WRITE OUTCOME was rendered (PR B2). Emitted from EVERY render path of
+  `LoopctlWeb.ArticleController.create` so write outcomes are observable even when
+  NOTHING is persisted (a rejected write leaves no article row). Folded into the
+  durable `ingestion_write_stats` per-(tenant, source_type, day) rollup by the
+  self-rescuing `Loopctl.Telemetry.IngestionWriteStats` handler, which
+  `Loopctl.Knowledge.IngestionHealth` reads to flag a `:high_reject_rate` anomaly —
+  the no-persist sibling of the capture-silence dead-man's-switch.
+
+  ## Payload (id/atom only — never article content)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{tenant_id, source_type, outcome}` where `source_type` is the
+      article's advisory source_type or `nil`, and `outcome` is a BOUNDED atom:
+      `:created` (novel/forced create), `:deduplicated` (200 idempotent/near-dup
+      dedup), `:gated_to_draft` (novelty gate staged a draft), `:title_conflict`
+      (409 title taken), or `:validation_error` (changeset/other 4xx).
+  """
+  def article_write, do: [:loopctl, :knowledge, :article_write]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -293,7 +313,8 @@ defmodule Loopctl.TelemetryEvents do
       llm_provider_error(),
       ingestion_backlog_gate_failed_open(),
       article_linking_corpus_size(),
-      recall_context_degraded()
+      recall_context_degraded(),
+      article_write()
     ]
   end
 end

@@ -75,6 +75,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.IngestionAnomaly
+  alias Loopctl.Knowledge.IngestionWriteStats
   alias Loopctl.Tenants.Tenant
 
   @default_monitored_source_types :all
@@ -83,12 +84,29 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   @default_establishment_window_hours 720
   @default_established_threshold_overrides %{}
 
+  # High-reject-rate detector defaults (PR B2).
+  @default_reject_rate_threshold 0.5
+  @default_min_attempts 10
+  @default_reject_window_days 7
+
   @type candidate :: %{
           tenant_id: Ecto.UUID.t(),
           source_type: String.t(),
+          anomaly_type: :capture_silence,
           last_event_at: DateTime.t(),
           hours_stale: non_neg_integer(),
           sample_count: non_neg_integer()
+        }
+
+  @type reject_candidate :: %{
+          tenant_id: Ecto.UUID.t(),
+          source_type: String.t(),
+          anomaly_type: :high_reject_rate,
+          total_attempts: non_neg_integer(),
+          rejects: non_neg_integer(),
+          reject_rate: float(),
+          window_days: pos_integer(),
+          dominant_reason: String.t()
         }
 
   # --- Config accessors (documented defaults) ---
@@ -139,6 +157,29 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   @spec establishment_window_hours() :: pos_integer()
   def establishment_window_hours,
     do: Keyword.get(config(), :establishment_window_hours, @default_establishment_window_hours)
+
+  @doc """
+  Fraction of write attempts (0.0-1.0) above which a source_type's rolling window is
+  flagged `:high_reject_rate` (`rejects / total_attempts > threshold`). Default 0.5.
+  """
+  @spec reject_rate_threshold() :: float()
+  def reject_rate_threshold,
+    do: Keyword.get(config(), :reject_rate_threshold, @default_reject_rate_threshold)
+
+  @doc """
+  Minimum total write attempts in the window before a reject rate is trusted enough
+  to flag (avoids alerting on statistical noise from a handful of writes). Default 10.
+  """
+  @spec min_attempts() :: pos_integer()
+  def min_attempts, do: Keyword.get(config(), :min_attempts, @default_min_attempts)
+
+  @doc """
+  Rolling window (in days) over the `ingestion_write_stats` rollup for the
+  reject-rate scan. Default 7.
+  """
+  @spec reject_window_days() :: pos_integer()
+  def reject_window_days,
+    do: Keyword.get(config(), :reject_window_days, @default_reject_window_days)
 
   defp config, do: Application.get_env(:loopctl, :ingestion_health, [])
 
@@ -240,6 +281,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
         %{
           tenant_id: tenant_id,
           source_type: source_type,
+          anomaly_type: :capture_silence,
           last_event_at: to_utc_datetime(last_event_at),
           hours_stale: hours_stale,
           sample_count: sample_count
@@ -248,6 +290,122 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     else
       []
     end
+  end
+
+  # --- High-reject-rate detection (PR B2) ---
+
+  @doc """
+  Scans the `ingestion_write_stats` rollup for `:high_reject_rate` candidates using
+  the configured tunables. Returns a flat list of `t:reject_candidate/0` maps — PURE,
+  no DB writes.
+
+  A rejected write leaves NO article row, so the capture-silence detector (which reads
+  `articles`) is blind to it. This complementary detector reads the durable write-
+  outcome rollup instead: for each `(tenant, non-null source_type)` over a rolling
+  `reject_window_days` window, it sums all outcome counters into `total_attempts`,
+  sums `title_conflict + validation_error` into `rejects`, and flags when
+  `total_attempts >= min_attempts` AND `rejects / total_attempts > reject_rate_threshold`.
+
+  NULL-`source_type` buckets are excluded (an `ingestion_anomalies` row requires a
+  non-null source_type, mirroring the capture-silence monitor's stamped-source_type
+  contract).
+  """
+  @spec detect_high_reject_rate() :: [reject_candidate()]
+  def detect_high_reject_rate do
+    detect_high_reject_rate(%{
+      reject_rate_threshold: reject_rate_threshold(),
+      min_attempts: min_attempts(),
+      reject_window_days: reject_window_days()
+    })
+  end
+
+  @doc """
+  `detect_high_reject_rate/0` with explicit config. Exposed so a caller can drive
+  detection with a specific configuration without touching global app env.
+  """
+  @spec detect_high_reject_rate(%{
+          required(:reject_rate_threshold) => float(),
+          required(:min_attempts) => pos_integer(),
+          required(:reject_window_days) => pos_integer()
+        }) :: [reject_candidate()]
+  def detect_high_reject_rate(%{
+        reject_rate_threshold: threshold,
+        min_attempts: min_attempts,
+        reject_window_days: window_days
+      }) do
+    # Inclusive rolling window of `window_days` days ending today. The day-leading
+    # index makes this predicate a range seek, so the read is bounded to the window.
+    window_start = Date.add(Date.utc_today(), -(window_days - 1))
+
+    IngestionWriteStats
+    |> join(:inner, [s], t in Tenant, on: t.id == s.tenant_id and t.status == :active)
+    |> where([s], not is_nil(s.source_type))
+    |> where([s], s.day >= ^window_start)
+    |> group_by([s], [s.tenant_id, s.source_type])
+    |> select([s], %{
+      tenant_id: s.tenant_id,
+      source_type: s.source_type,
+      created: sum(s.created_count),
+      deduplicated: sum(s.deduplicated_count),
+      drafted: sum(s.drafted_count),
+      title_conflict: sum(s.title_conflict_count),
+      validation_error: sum(s.validation_error_count)
+    })
+    |> AdminRepo.all()
+    |> Enum.flat_map(&reject_candidate_or_skip(&1, threshold, min_attempts, window_days))
+  end
+
+  defp reject_candidate_or_skip(row, threshold, min_attempts, window_days) do
+    created = to_int(row.created)
+    deduplicated = to_int(row.deduplicated)
+    drafted = to_int(row.drafted)
+    title_conflict = to_int(row.title_conflict)
+    validation_error = to_int(row.validation_error)
+
+    total_attempts = created + deduplicated + drafted + title_conflict + validation_error
+    rejects = title_conflict + validation_error
+    reject_rate = if total_attempts > 0, do: rejects / total_attempts, else: 0.0
+
+    if total_attempts >= min_attempts and reject_rate > threshold do
+      [
+        %{
+          tenant_id: row.tenant_id,
+          source_type: row.source_type,
+          anomaly_type: :high_reject_rate,
+          total_attempts: total_attempts,
+          rejects: rejects,
+          reject_rate: reject_rate,
+          window_days: window_days,
+          dominant_reason: dominant_reason(title_conflict, validation_error)
+        }
+      ]
+    else
+      []
+    end
+  end
+
+  # The reject reason that contributed the most drops (ties -> title_conflict).
+  defp dominant_reason(title_conflict, validation_error) do
+    if title_conflict >= validation_error, do: "title_conflict", else: "validation_error"
+  end
+
+  # A `sum(bigint)` comes back from Postgres as `numeric` -> Ecto `Decimal`; normalize
+  # to an integer (nil when a group somehow has no rows).
+  defp to_int(nil), do: 0
+  defp to_int(%Decimal{} = d), do: Decimal.to_integer(d)
+  defp to_int(n) when is_integer(n), do: n
+
+  @doc """
+  Whether the tenant has EVER recorded a write-outcome for `source_type` (any row in
+  `ingestion_write_stats`). Used by the controller to warn when a `source_type`
+  filter names a never-seen source, so an empty anomaly list is not mistaken for
+  "healthy".
+  """
+  @spec source_type_seen?(Ecto.UUID.t(), String.t()) :: boolean()
+  def source_type_seen?(tenant_id, source_type) when is_binary(source_type) do
+    IngestionWriteStats
+    |> where([s], s.tenant_id == ^tenant_id and s.source_type == ^source_type)
+    |> AdminRepo.exists?()
   end
 
   # --- Query surface (mirrors Loopctl.TokenUsage.list_anomalies/resolve_anomaly) ---
