@@ -308,6 +308,10 @@ defmodule LoopctlWeb.Router do
     get "/cost-anomalies", CostAnomalyController, :index
     patch "/cost-anomalies/:id", CostAnomalyController, :update
 
+    # Ingestion capture-silence anomalies (dead-man's-switch for knowledge capture)
+    get "/ingestion-anomalies", IngestionAnomalyController, :index
+    patch "/ingestion-anomalies/:id", IngestionAnomalyController, :update
+
     # Token analytics (Epic 21)
     get "/analytics/agents", AnalyticsController, :agents
     get "/analytics/epics", AnalyticsController, :epics

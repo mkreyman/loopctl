@@ -151,6 +151,19 @@ config :loopctl,
   scale_alert_oban_discard_rate_per_min: 10,
   scale_alert_provider_error_rate_per_min: 10
 
+# Ingestion capture-silence monitor (dead-man's-switch for knowledge capture).
+# Config-based DI for `Loopctl.Knowledge.IngestionHealth` — all three tunables have
+# in-code defaults in that module, so this block is an override point, not a boot
+# dependency. `:monitored_source_types` are article `source_type`s watched for
+# silence; `:established_threshold` is the minimum article count before a source_type
+# is considered "established" (and thus eligible to be flagged when it goes silent);
+# `:staleness_threshold_hours` is how long an established source_type may go without a
+# new article before `IngestionHealthWorker` flags a `:capture_silence` anomaly.
+config :loopctl, :ingestion_health,
+  monitored_source_types: ["session_log"],
+  established_threshold: 5,
+  staleness_threshold_hours: 72
+
 # US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
 # defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/
 # mutate writer busts the key_hash entry in-band. A cached entry is re-validated
