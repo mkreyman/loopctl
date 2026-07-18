@@ -25,6 +25,10 @@ defmodule LoopctlWeb.ChannelPostController do
   (429). The denylist rejection (422) signal is emitted from `Loopctl.Coordination`
   at the point the write is rejected. A rate-limiter fault degrades to "no gate"
   but is logged via the shared throttled `FailOpenLog`, never swallowed silently.
+
+  The READ (`:index`) emits `:read_error` on any internal fault (US-39.3
+  technical_notes) before re-raising to the sanitizing DB-error backstop — the
+  errored read stays tenant-agnostic, never a cross-tenant existence oracle.
   """
 
   use LoopctlWeb, :controller
@@ -42,11 +46,16 @@ defmodule LoopctlWeb.ChannelPostController do
 
   # Coordination surface (#331): agent role, NO RequireHumanAnchor. See the
   # coordination-surface allowlist entry in require_human_anchor_default_deny_test.
-  plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:create]
+  # The read (`:index`) is the same agent-role, tenant-scoped coordination surface
+  # as the write — never human-anchor gated (the human-anchor default-deny test
+  # only walks POST/PUT/PATCH/DELETE, so this GET needs no allowlist entry).
+  plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:create, :index]
 
   # Per-write rate limit (AC-39.2.8): a TIGHTER, config-driven cap on top of the
   # generic per-key/per-tenant pipeline RateLimiter, reusing the same
-  # `Loopctl.RateLimiter` behaviour seam. Bounds post spam / upsert thrash.
+  # `Loopctl.RateLimiter` behaviour seam. Bounds post spam / upsert thrash. The
+  # read is NOT behind this write cap — it is covered by the generic pipeline
+  # per-key/per-tenant limiter like every other read.
   plug :rate_limit_write when action in [:create]
 
   tags(["Coordination"])
@@ -88,6 +97,140 @@ defmodule LoopctlWeb.ChannelPostController do
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
+
+  operation(:index,
+    summary: "Read a repo coordination channel (channel_recent)",
+    description:
+      "Returns LIVE coordination posts for a project's channel (a channel IS a project_id), " <>
+        "newest-first (inserted_at DESC). Agent+ role, tenant-scoped from the verified key — " <>
+        "project_id is a query param but the tenant is NEVER taken from params. ORACLE-SAFE: a " <>
+        "project_id belonging to another tenant, or a nonexistent one, returns 200 with an empty " <>
+        "list — identical to an owned-but-empty channel, never a 404. Only non-expired posts are " <>
+        "returned (expires_at > now, independent of the TTL sweep). `since` (ISO8601) returns only " <>
+        "posts touched after that instant; `limit` defaults to 25 and is clamped to a max of 100.",
+    parameters: [
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "The channel — a project the caller's tenant owns"
+      ],
+      since: [
+        in: :query,
+        type: :string,
+        description:
+          "Full ISO8601 INSTANT (e.g. 2026-07-18T00:00:00Z or 2026-07-18T00:00:00); " <>
+            "return only posts touched after it (delta read). A date-only value " <>
+            "(e.g. 2026-07-18) is the wrong granularity and is IGNORED — the whole " <>
+            "live channel is returned, not a delta. Supply a full instant."
+      ],
+      limit: [
+        in: :query,
+        type: :integer,
+        description: "Max posts (default 25, clamped to 100)"
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Channel posts", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: Schemas.ChannelPostListItem},
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{
+                 limit: %OpenApiSpex.Schema{type: :integer},
+                 count: %OpenApiSpex.Schema{type: :integer},
+                 has_more: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description:
+                     "True when the limit truncated the result — more live matching posts exist"
+                 }
+               }
+             }
+           }
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  @doc """
+  GET /api/v1/channel/posts
+
+  Reads a project's coordination channel. Requires agent+ role. The channel is a
+  `project_id` query param; the tenant is always derived from the verified key.
+
+  ORACLE-SAFE: a cross-tenant or nonexistent `project_id` returns 200 with an
+  empty list — uniform with an owned-but-empty channel, never a 404. There is NO
+  ownership pre-check and NO branch to 404: the explicit `tenant_id` filter in
+  `Coordination.recent/3` simply excludes any post not in the caller's tenant, so
+  a probe learns nothing about whether the project exists elsewhere.
+  """
+  def index(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    # The applied limit for the `meta` envelope comes from the SAME clamp
+    # `recent/3` uses (default 25, cap 100) — never a divergent second copy. It is
+    # passed back into `recent/3`, which re-clamps harmlessly.
+    applied_limit = Coordination.clamp_recent_limit(params["limit"])
+
+    # `has_more` is an HONEST truncation signal: `recent_page/3` fetches
+    # `limit + 1` and reports whether a matching post exists beyond the applied
+    # limit, so a consumer never mistakes a truncated page for the whole channel
+    # (it can re-read with a tighter `since` / smaller window). A full cursor is
+    # US-39.6's job; this is the cheap "there is more" flag.
+    {posts, has_more} =
+      Coordination.recent_page(tenant_id, params["project_id"],
+        limit: applied_limit,
+        since: params["since"]
+      )
+
+    json(conn, %{
+      data: Enum.map(posts, &channel_post_json/1),
+      meta: %{limit: applied_limit, count: length(posts), has_more: has_more}
+    })
+  rescue
+    e ->
+      # US-39.3 technical_notes: "Emit a security-event log on any internal error
+      # but never leak cross-tenant existence." `recent/3` is total for well-formed
+      # input (a non-UUID, missing, cross-tenant, or nonexistent project_id all
+      # yield an empty list, never a raise — the oracle-safe guard), so the only
+      # path that reaches here is a genuine server-side fault (e.g. a DB outage).
+      # Emit the coordination-surface security signal (parity with the create
+      # path's :ownership_rejected / :agent_identity_required / :rate_limited),
+      # then RE-RAISE so the existing DBErrorBackstop/ErrorJSON machinery renders
+      # the SAME sanitized, tenant-agnostic 500/503/504 body it renders today — the
+      # errored read stays uniform regardless of tenant or project, so it never
+      # becomes a cross-tenant existence oracle.
+      api_key = conn.assigns.current_api_key
+
+      emit_security_event(:read_error, %{
+        tenant_id: api_key.tenant_id,
+        api_key_id: api_key.id,
+        project_id: params["project_id"]
+      })
+
+      reraise e, __STACKTRACE__
+  end
+
+  # AC-39.3.5: the exact read field set — enough to render "who / which machine /
+  # which session / when" and to self-dedupe by session_id. Deliberately narrower
+  # than the schema's `@derive Jason.Encoder` (which also carries
+  # tenant_id/project_id/expires_at): a dedicated builder keeps the response to the
+  # AC's contract, matching the project_json/1 convention.
+  defp channel_post_json(post) do
+    %{
+      id: post.id,
+      agent_id: post.agent_id,
+      session_id: post.session_id,
+      host: post.host,
+      key: post.key,
+      body: post.body,
+      refs: post.refs,
+      inserted_at: post.inserted_at,
+      updated_at: post.updated_at
+    }
+  end
 
   @doc """
   POST /api/v1/channel/posts
