@@ -34,8 +34,12 @@ defmodule Loopctl.Coordination do
   # per-type retentions were unused).
   @retention_days 30
 
-  @default_recent_limit 50
-  @max_recent_limit 200
+  # Read-bound convention (US-39.3): the `channel_recent` endpoint defaults to 25
+  # rows and CLAMPS a larger `?limit=` to 100 (not a 400) — see AC-39.3.3. These
+  # are the single source of truth for both the context primitive and the HTTP
+  # endpoint's `meta.limit`.
+  @default_recent_limit 25
+  @max_recent_limit 100
 
   @doc "The uniform retention window, in days, applied to every post."
   @spec retention_days() :: pos_integer()
@@ -282,15 +286,25 @@ defmodule Loopctl.Coordination do
 
   Isolation is the explicit `tenant_id` filter (AdminRepo path); expired posts
   are filtered defensively even before the TTL sweep runs. A non-UUID
-  `tenant_id`/`project_id` (e.g. a malformed path segment once US-39.3 wires an
-  endpoint) yields `[]` rather than an `Ecto.Query.CastError` — mirroring the
-  `valid_uuid?` guard in `Projects.get_project`. `opts`:
+  `tenant_id`/`project_id` (e.g. a malformed path segment from the
+  `channel_recent` endpoint) yields `[]` rather than an `Ecto.Query.CastError` —
+  mirroring the `valid_uuid?` guard in `Projects.get_project`. This is also the
+  oracle-safe path: a cross-tenant or nonexistent (but well-formed) `project_id`
+  is simply excluded by the explicit `tenant_id`/`project_id` filter and yields
+  `[]` — identical to an owned-but-empty channel, revealing nothing about whether
+  the project exists in another tenant. `opts`:
 
     * `:limit` — max rows (default #{@default_recent_limit}, capped at
       #{@max_recent_limit}); `limit: 0` (or negative) returns `[]`. Accepts an
-      integer or an integer STRING (e.g. `"0"`/`"1000"` from a `?limit=` query
-      param once US-39.3 wires an endpoint) so the documented contract holds for
-      the real endpoint input; any other value falls back to the default.
+      integer or an integer STRING (e.g. `"0"`/`"1000"` from the `?limit=` query
+      param) so the documented contract holds for the real endpoint input; any
+      other value falls back to the default.
+    * `:since` — when present, returns only posts touched AFTER this instant,
+      filtering `GREATEST(inserted_at, updated_at) > since` so a keyed slot
+      upserted after `since` (its `updated_at` advanced) still surfaces as a
+      delta. Accepts a `DateTime` or an ISO8601 string (as a `?since=` query
+      param arrives); a malformed or absent value is a NO-OP filter (never a
+      400).
   """
   @spec recent(term(), term(), keyword()) :: [ChannelPost.t()]
   def recent(tenant_id, project_id, opts \\ []) do
@@ -301,6 +315,7 @@ defmodule Loopctl.Coordination do
       ChannelPost
       |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
       |> where([p], p.expires_at > ^now)
+      |> apply_since(Keyword.get(opts, :since))
       |> order_by([p], desc: p.inserted_at, desc: p.seq)
       |> limit(^limit)
       |> AdminRepo.all()
@@ -308,6 +323,34 @@ defmodule Loopctl.Coordination do
       []
     end
   end
+
+  @doc """
+  Clamps a `:limit` value to the `channel_recent` read-bound contract (default
+  #{@default_recent_limit}, cap #{@max_recent_limit}), accepting an integer or an
+  integer string. Exposed so the HTTP endpoint can report the ACTUALLY-applied
+  limit in its `meta` envelope from the SAME source of truth `recent/3` uses,
+  never a divergent second copy.
+  """
+  @spec clamp_recent_limit(term()) :: non_neg_integer()
+  def clamp_recent_limit(limit), do: clamp_limit(limit)
+
+  # `:since` delta filter. A DateTime (or a parseable ISO8601 string) filters to
+  # posts whose most-recent touch — GREATEST(inserted_at, updated_at) — is strictly
+  # after `since`, so a session slot upserted after `since` still surfaces even
+  # though its `inserted_at` predates it. Anything else (nil, malformed string) is
+  # a no-op so a bad `?since=` degrades to "no filter", never a 400.
+  defp apply_since(query, %DateTime{} = since) do
+    where(query, [p], fragment("GREATEST(?, ?)", p.inserted_at, p.updated_at) > ^since)
+  end
+
+  defp apply_since(query, since) when is_binary(since) do
+    case DateTime.from_iso8601(since) do
+      {:ok, dt, _offset} -> apply_since(query, dt)
+      _ -> query
+    end
+  end
+
+  defp apply_since(query, _since), do: query
 
   defp default_expires_at do
     DateTime.add(DateTime.utc_now(), @retention_days * 24 * 60 * 60, :second)
@@ -320,11 +363,11 @@ defmodule Loopctl.Coordination do
   # silently coercing to the default (LIMIT 0 returns []).
   defp clamp_limit(limit) when is_integer(limit) and limit <= 0, do: 0
 
-  # US-39.3 will wire this to an HTTP endpoint where `?limit=` arrives as a string.
+  # The `channel_recent` endpoint (US-39.3) passes `?limit=` through as a string.
   # Parse an integer string and re-clamp so the documented contract (`"0"` -> [],
   # `"1000"` capped at #{@max_recent_limit}) holds; a non-integer / trailing-garbage
-  # value falls back to the default rather than silently returning the default 50
-  # for a well-formed `"0"`.
+  # value falls back to the default rather than silently returning the default for
+  # a well-formed `"0"`.
   defp clamp_limit(limit) when is_binary(limit) do
     case Integer.parse(limit) do
       {n, ""} -> clamp_limit(n)

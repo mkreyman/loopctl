@@ -13,6 +13,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
   import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelPost
 
   @path "/api/v1/channel/posts"
@@ -365,6 +366,173 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         build_conn()
         |> put_req_header("x-loopctl-last-known-sth", @sth_header)
         |> post(@path, %{"project_id" => project.id, "body" => "x"})
+
+      assert conn.status in [401, 403]
+    end
+  end
+
+  describe "GET /api/v1/channel/posts (channel_recent)" do
+    # Seed a live post with a controlled inserted_at/updated_at for deterministic
+    # ordering + since deltas (create_post always stamps "now").
+    defp seed_post(tenant, project, agent_id, body, at) do
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => body})
+
+      {:ok, post} =
+        post
+        |> Ecto.Changeset.change(inserted_at: at, updated_at: at)
+        |> AdminRepo.update()
+
+      post
+    end
+
+    # TC-39.3.1
+    test "3 live posts t1<t2<t3 -> data has 3, ordered t3,t2,t1" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      seed_post(tenant, project, agent.id, "one", DateTime.add(base, -300, :second))
+      seed_post(tenant, project, agent.id, "two", DateTime.add(base, -200, :second))
+      seed_post(tenant, project, agent.id, "three", DateTime.add(base, -100, :second))
+
+      conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+      assert %{"data" => data, "meta" => meta} = json_response(conn, 200)
+
+      assert Enum.map(data, & &1["body"]) == ["three", "two", "one"]
+      assert meta["count"] == 3
+      assert meta["limit"] == 25
+
+      # AC-39.3.5: the exact read field set, and only that set.
+      first = hd(data)
+
+      assert Map.keys(first) |> Enum.sort() ==
+               ~w(agent_id body host id inserted_at key refs session_id updated_at)
+
+      assert first["agent_id"] == agent.id
+    end
+
+    # TC-39.3.2
+    test "one expired + one live -> only the live post" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      {:ok, live} =
+        Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "live"})
+
+      {:ok, expired} =
+        Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "expired"})
+
+      # Force the second post's expires_at into the past (an expired-but-not-swept row).
+      {:ok, _} =
+        expired
+        |> Ecto.Changeset.change(expires_at: DateTime.add(DateTime.utc_now(), -60, :second))
+        |> AdminRepo.update()
+
+      conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+      assert %{"data" => [post]} = json_response(conn, 200)
+      assert post["id"] == live.id
+      assert post["body"] == "live"
+    end
+
+    # TC-39.3.3
+    test "posts at t1 and t3; since=t2 -> only t3" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      t2 = DateTime.add(base, -200, :second)
+      seed_post(tenant, project, agent.id, "old", DateTime.add(base, -300, :second))
+      seed_post(tenant, project, agent.id, "new", DateTime.add(base, -100, :second))
+
+      conn =
+        authed_conn(raw)
+        |> get(@path, %{"project_id" => project.id, "since" => DateTime.to_iso8601(t2)})
+
+      assert %{"data" => [post]} = json_response(conn, 200)
+      assert post["body"] == "new"
+    end
+
+    # TC-39.3.4 — oracle-safety: cross-tenant AND nonexistent both 200 empty,
+    # byte-identical to each other (and to an owned-but-empty channel).
+    test "cross-tenant AND nonexistent project_id both 200 with an identical empty envelope" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant)
+
+      other = fixture(:tenant)
+      foreign = fixture(:project, %{tenant_id: other.id})
+
+      cross = authed_conn(raw) |> get(@path, %{"project_id" => foreign.id})
+      missing = authed_conn(raw) |> get(@path, %{"project_id" => Ecto.UUID.generate()})
+
+      cross_body = json_response(cross, 200)
+      missing_body = json_response(missing, 200)
+
+      assert cross_body == %{"data" => [], "meta" => %{"limit" => 25, "count" => 0}}
+      assert cross_body == missing_body
+
+      # And identical to an owned-but-empty project of the caller's own tenant.
+      own_empty = fixture(:project, %{tenant_id: tenant.id})
+      owned = authed_conn(raw) |> get(@path, %{"project_id" => own_empty.id})
+      assert json_response(owned, 200) == cross_body
+    end
+
+    # TC-39.3.5
+    test "150 live posts, limit=1000 -> exactly 100 returned (clamped, not a 400)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      for n <- 1..150 do
+        {:ok, _} =
+          Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "p#{n}"})
+      end
+
+      conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id, "limit" => "1000"})
+      assert %{"data" => data, "meta" => meta} = json_response(conn, 200)
+      assert length(data) == 100
+      assert meta["limit"] == 100
+      assert meta["count"] == 100
+    end
+
+    test "another tenant's posts are never visible (tenant isolation)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      {:ok, _} =
+        Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "mine"})
+
+      other = fixture(:tenant)
+      other_project = fixture(:project, %{tenant_id: other.id})
+      other_agent = fixture(:agent, %{tenant_id: other.id})
+
+      {:ok, _} =
+        Coordination.create_post(other.id, other_project.id, other_agent.id, %{
+          "body" => "theirs"
+        })
+
+      # The caller sees only its own post on its own channel...
+      conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+      assert %{"data" => [post]} = json_response(conn, 200)
+      assert post["body"] == "mine"
+
+      # ...and gets an empty list for the other tenant's channel (oracle-safe).
+      cross = authed_conn(raw) |> get(@path, %{"project_id" => other_project.id})
+      assert %{"data" => []} = json_response(cross, 200)
+    end
+
+    test "the read requires agent role (an unauthenticated caller cannot read)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      conn =
+        build_conn()
+        |> put_req_header("x-loopctl-last-known-sth", @sth_header)
+        |> get(@path, %{"project_id" => project.id})
 
       assert conn.status in [401, 403]
     end

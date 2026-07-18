@@ -129,6 +129,10 @@ defmodule LoopctlWeb.Router do
     # limiting comes from the :authenticated pipeline RateLimiter; the controller
     # adds a tighter, config-driven per-write cap.
     post "/channel/posts", ChannelPostController, :create
+    # channel_recent read (US-39.3): agent-role, tenant-scoped, oracle-safe read
+    # of a project's live channel. project_id/since/limit query params; the tenant
+    # is key-derived, never from params.
+    get "/channel/posts", ChannelPostController, :index
 
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update

@@ -210,6 +210,163 @@ defmodule Loopctl.CoordinationTest do
     end
   end
 
+  describe "recent/3 since and limit contract (US-39.3)" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+      %{tenant: tenant, project: project, agent_id: agent_id}
+    end
+
+    defp seed_post(tenant, project, agent_id, body, inserted_at) do
+      # Seed a post at a controlled inserted_at/updated_at so ordering + since
+      # deltas are deterministic (create_post always stamps "now").
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => body})
+
+      {:ok, post} =
+        post
+        |> Ecto.Changeset.change(inserted_at: inserted_at, updated_at: inserted_at)
+        |> AdminRepo.update()
+
+      post
+    end
+
+    test "orders newest-first by inserted_at", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      t1 = DateTime.add(base, -300, :second)
+      t2 = DateTime.add(base, -200, :second)
+      t3 = DateTime.add(base, -100, :second)
+
+      seed_post(tenant, project, agent_id, "one", t1)
+      seed_post(tenant, project, agent_id, "two", t2)
+      seed_post(tenant, project, agent_id, "three", t3)
+
+      bodies = tenant.id |> Coordination.recent(project.id) |> Enum.map(& &1.body)
+      assert bodies == ["three", "two", "one"]
+    end
+
+    test "since filters on GREATEST(inserted_at, updated_at) > since", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      t1 = DateTime.add(base, -300, :second)
+      t2 = DateTime.add(base, -200, :second)
+      t3 = DateTime.add(base, -100, :second)
+
+      seed_post(tenant, project, agent_id, "old", t1)
+      seed_post(tenant, project, agent_id, "new", t3)
+
+      bodies =
+        tenant.id |> Coordination.recent(project.id, since: t2) |> Enum.map(& &1.body)
+
+      assert bodies == ["new"]
+    end
+
+    test "since surfaces a slot whose updated_at (not inserted_at) advanced past since", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      old = DateTime.add(base, -300, :second)
+      since = DateTime.add(base, -200, :second)
+      touched = DateTime.add(base, -100, :second)
+
+      # inserted_at predates `since`, but updated_at (a later upsert) is after it —
+      # GREATEST(inserted_at, updated_at) surfaces it as a delta.
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "slot"})
+
+      {:ok, _} =
+        post
+        |> Ecto.Changeset.change(inserted_at: old, updated_at: touched)
+        |> AdminRepo.update()
+
+      bodies =
+        tenant.id |> Coordination.recent(project.id, since: since) |> Enum.map(& &1.body)
+
+      assert bodies == ["slot"]
+    end
+
+    test "since accepts an ISO8601 string (as a ?since= query param arrives)", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      t1 = DateTime.add(base, -300, :second)
+      t2 = DateTime.add(base, -200, :second)
+      t3 = DateTime.add(base, -100, :second)
+
+      seed_post(tenant, project, agent_id, "old", t1)
+      seed_post(tenant, project, agent_id, "new", t3)
+
+      bodies =
+        tenant.id
+        |> Coordination.recent(project.id, since: DateTime.to_iso8601(t2))
+        |> Enum.map(& &1.body)
+
+      assert bodies == ["new"]
+    end
+
+    test "a malformed since string is a no-op filter (not an error)", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      seed_post(
+        tenant,
+        project,
+        agent_id,
+        "a",
+        DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      )
+
+      assert [%ChannelPost{}] = Coordination.recent(tenant.id, project.id, since: "not-a-date")
+    end
+
+    test "clamp_recent_limit reflects the applied default (25) and cap (100)" do
+      assert Coordination.clamp_recent_limit(nil) == 25
+      assert Coordination.clamp_recent_limit(10) == 10
+      assert Coordination.clamp_recent_limit(1000) == 100
+      assert Coordination.clamp_recent_limit("1000") == 100
+      assert Coordination.clamp_recent_limit("0") == 0
+    end
+
+    test "limit clamps to 100 even when more than 100 live posts exist", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      for n <- 1..105 do
+        {:ok, _} =
+          Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "p#{n}"})
+      end
+
+      assert length(Coordination.recent(tenant.id, project.id, limit: 1000)) == 100
+    end
+
+    test "default limit (no opt) is 25", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      for n <- 1..30 do
+        {:ok, _} =
+          Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "p#{n}"})
+      end
+
+      assert length(Coordination.recent(tenant.id, project.id)) == 25
+    end
+  end
+
   describe "per-session keyed slot" do
     test "two sessions with the same key do not clobber each other" do
       tenant = fixture(:tenant)

@@ -972,6 +972,31 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule ChannelPostListItem do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ChannelPostListItem",
+      description:
+        "One coordination channel post as returned by the channel_recent read endpoint. " <>
+          "agent_id is the only server-stamped (authoritative) attribution; session_id and host " <>
+          "are client-supplied and informational.",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        agent_id: %Schema{type: :string, format: :uuid},
+        session_id: %Schema{type: :string, nullable: true},
+        host: %Schema{type: :string, nullable: true},
+        key: %Schema{type: :string, nullable: true},
+        body: %Schema{type: :string},
+        refs: %Schema{type: :object, nullable: true, additionalProperties: true},
+        inserted_at: %Schema{type: :string, format: :"date-time"},
+        updated_at: %Schema{type: :string, format: :"date-time"}
+      }
+    })
+  end
+
   # ---------- Epics ----------
 
   defmodule EpicResponse do
