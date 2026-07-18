@@ -179,7 +179,11 @@ config :loopctl, :ingestion_health,
   establishment_window_hours: 720,
   reject_rate_threshold: 0.5,
   min_attempts: 10,
-  reject_window_days: 7
+  reject_window_days: 7,
+  # Retention (days) for the append-only `ingestion_write_stats` rollup; the hourly
+  # worker prunes older rows so the table (and the cross-tenant reject-rate scan) stays
+  # bounded. Only the rolling `reject_window_days` window is ever read.
+  write_stats_retention_days: 90
 
 # US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
 # defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/

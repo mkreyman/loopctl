@@ -213,6 +213,11 @@ config :loopctl, :ingestion_health,
   min_attempts: 10,
   reject_window_days: 7
 
+# Run the write-outcome rollup upsert INLINE in test (prod dispatches it to a
+# supervised task): inline shares the emitting test process's sandboxed connection, so
+# the rollup row is readable back synchronously in specs.
+config :loopctl, Loopctl.Telemetry.IngestionWriteStats, async: false
+
 # Use simple formatter in test (override JSON default from config.exs).
 # The template prints only level + message (custom metadata is asserted via the
 # message string in tests), but declare `metadata: :all` so Credo's

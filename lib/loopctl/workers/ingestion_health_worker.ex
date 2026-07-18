@@ -22,12 +22,16 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   successfully alerted (`alerted: false`), in which case it re-fires the operator
   alert + webhook once (at-least-once recovery; see "Alert durability" below).
 
-  ## Recovery: auto-resolve when captures resume
+  ## Recovery: auto-resolve when the outage clears
 
   After detection, `Loopctl.Knowledge.IngestionHealth.auto_resolve_recovered/0`
-  closes any open anomaly whose `(tenant, source_type)` has produced an article
-  newer than the anomaly's `last_event_at`. Without this a fully-recovered stream
-  would keep a stale open anomaly forever, indistinguishable from an ongoing outage.
+  closes any open capture-silence anomaly whose `(tenant, source_type)` has produced
+  an article newer than the anomaly's `last_event_at`.
+  `auto_resolve_recovered_reject_rate/1` does the analogous close for high_reject_rate
+  anomalies whose reject rate fell back below threshold (no longer a candidate).
+  Without this a fully-recovered stream would keep a stale open anomaly forever,
+  indistinguishable from an ongoing outage. The reject-rate close ALSO stamps
+  `last_event_at` (episode ended), which re-arms suppression — see below.
 
   ## Suppression: resolve sticks, archive suppresses (reversibly)
 
@@ -123,16 +127,11 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     # PR B2: the no-persist / high-rejection-rate sibling detector. A rejected write
     # leaves no article row, so it is invisible to the capture-silence scan above;
     # this reads the durable `ingestion_write_stats` rollup instead.
-    reject_candidates = detect_reject_candidates()
+    run_reject_rate_detection()
 
-    Logger.info(
-      "IngestionHealthWorker: #{length(reject_candidates)} high-reject-rate candidate(s) detected"
-    )
-
-    Enum.each(reject_candidates, &flag_candidate/1)
-
-    # Close anomalies whose captures have resumed (recovered streams), so an open
-    # anomaly always means "still silent" and not "recovered but never cleared".
+    # Close capture-silence anomalies whose captures have resumed (recovered streams),
+    # so an open anomaly always means "still silent" and not "recovered but never
+    # cleared".
     resolved = IngestionHealth.auto_resolve_recovered()
 
     if resolved > 0 do
@@ -142,20 +141,47 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     :ok
   end
 
-  # Reject-rate detection reads its own rollup table; guard the version-skew window
-  # (code on the hourly crontab before the migration landed) exactly like the
-  # anomalies-table probe, so a missing rollup table skips quietly instead of
-  # crashing the job.
-  defp detect_reject_candidates do
+  # Reject-rate detection, recovery, and rollup pruning all read/write the
+  # `ingestion_write_stats` table; guard the version-skew window (code on the hourly
+  # crontab before the migration landed) exactly like the anomalies-table probe, so a
+  # missing rollup table skips quietly instead of crashing the job. Crucially, recovery
+  # is guarded TOO: an empty candidate list from a MISSING table must not be read as
+  # "everything recovered" and mass-close active reject anomalies.
+  defp run_reject_rate_detection do
     if write_stats_table_ready?() do
-      IngestionHealth.detect_high_reject_rate()
+      reject_candidates = IngestionHealth.detect_high_reject_rate()
+
+      Logger.info(
+        "IngestionHealthWorker: #{length(reject_candidates)} high-reject-rate candidate(s) detected"
+      )
+
+      Enum.each(reject_candidates, &flag_candidate/1)
+
+      # Close reject-rate anomalies whose reject rate recovered (no longer a candidate).
+      # This resolves open rows that would otherwise freeze open, AND stamps the
+      # recovery time so a resolved row stops suppressing a FUTURE storm (re-arm).
+      closed = IngestionHealth.auto_resolve_recovered_reject_rate(reject_candidates)
+
+      if closed > 0 do
+        Logger.info(
+          "IngestionHealthWorker: auto-closed #{closed} recovered high-reject-rate anomaly(ies)"
+        )
+      end
+
+      # Retention: the rollup is append-only and only the rolling window is read, so
+      # prune aged rows to keep the table (and the cross-tenant scan) bounded.
+      pruned = IngestionHealth.prune_write_stats()
+
+      if pruned > 0 do
+        Logger.info("IngestionHealthWorker: pruned #{pruned} aged ingestion_write_stats row(s)")
+      end
     else
       Logger.warning(
         "IngestionHealthWorker: ingestion_write_stats table not present yet " <>
           "(migration pending); skipping reject-rate detection this run"
       )
 
-      []
+      :ok
     end
   end
 
@@ -259,10 +285,13 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # --- High-reject-rate flagging (PR B2) ---
 
   # Mirrors flag_capture_silence structurally, reusing the SAME persist/notify/
-  # at-least-once machinery, but with reject-rate semantics: no last_event_at/
-  # resume episode (rejects have no natural "resumed" signal), so resolve is sticky
-  # (a resolved reject-rate anomaly suppresses re-creation while rejects persist —
-  # anti-alarm-fatigue) until archived/unarchived.
+  # at-least-once machinery, but with reject-rate semantics: rejects have no natural
+  # "resumed" signal (no newer article), so recovery is defined as "no longer a
+  # candidate" and marked by stamping `last_event_at` (episode ended). A resolved
+  # reject-rate anomaly suppresses re-creation ONLY while its episode is still active
+  # (`last_event_at IS NULL`) — anti-alarm-fatigue while rejects persist — and re-arms
+  # once recovery stamps `last_event_at`, so a future storm re-fires. Archiving is the
+  # separate operator escape hatch.
   defp flag_reject_rate(%{tenant_id: tenant_id, source_type: source_type} = candidate) do
     existing =
       IngestionAnomaly
@@ -295,8 +324,14 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     end
   end
 
-  # A resolved (non-archived) high_reject_rate anomaly suppresses re-creation while
-  # the reject condition persists — mirrors capture_silence's "resolve sticks".
+  # A resolved (non-archived) high_reject_rate anomaly suppresses re-creation while the
+  # reject condition persists — mirrors capture_silence's "resolve sticks". But only an
+  # ACTIVE episode suppresses: `last_event_at IS NULL` means the episode has not yet
+  # been marked recovered. Once IngestionHealth.auto_resolve_recovered_reject_rate/1
+  # stamps `last_event_at` (rejects fell below threshold), the resolved row stops
+  # suppressing, so a FRESH storm for the same source_type re-fires instead of being
+  # silenced forever. Without this scope a single operator resolve would blind the
+  # detector to every future outage of that source_type.
   defp resolved_reject_suppression?(tenant_id, source_type) do
     IngestionAnomaly
     |> where([a], a.tenant_id == ^tenant_id)
@@ -304,6 +339,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     |> where([a], a.anomaly_type == :high_reject_rate)
     |> where([a], a.resolved == true)
     |> where([a], a.archived == false)
+    |> where([a], is_nil(a.last_event_at))
     |> AdminRepo.exists?()
   end
 

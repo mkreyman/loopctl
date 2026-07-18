@@ -173,6 +173,20 @@ defmodule LoopctlWeb.IngestionAnomalyControllerTest do
       assert json_response(conn, 422)
     end
 
+    test "rejects an unknown ?anomaly_type value with 422 (not an empty 'healthy' list)",
+         %{conn: conn} do
+      ctx = setup_tenant_with_anomalies()
+
+      # The natural typo (hyphens instead of underscores) must not flow into a
+      # `where false` that returns [] and reads as healthy ingestion.
+      conn =
+        conn
+        |> auth_conn(ctx.user_key)
+        |> get(~p"/api/v1/ingestion-anomalies?anomaly_type=high-reject-rate")
+
+      assert json_response(conn, 422)
+    end
+
     test "echoes the effective filters in meta.filters", %{conn: conn} do
       ctx = setup_tenant_with_anomalies()
 

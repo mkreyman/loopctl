@@ -24,7 +24,10 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
     freshness fields are repurposed: `sample_count` = total write attempts in the
     window; `hours_stale` is not meaningful (set to 0); `last_event_at` is nil. The
     reject figures (reject_rate, total_attempts, rejects, window_days,
-    dominant_reason) live in `metadata`.
+    dominant_reason) live in `metadata`. `last_event_at` starts nil while the reject
+    episode is ACTIVE and is stamped with the recovery time (episode ENDED) by
+    `Loopctl.Knowledge.IngestionHealth.auto_resolve_recovered_reject_rate/1` — that
+    stamp is what re-arms detection so a future reject storm re-fires.
 
   ## Fields
 
@@ -140,6 +143,19 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
   @spec resolve_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
   def resolve_changeset(anomaly) do
     change(anomaly, resolved: true)
+  end
+
+  @doc """
+  Changeset closing a RECOVERED `:high_reject_rate` anomaly.
+
+  Sets `resolved: true` (closing an open row) AND stamps `last_event_at` with the
+  recovery time. The `last_event_at` stamp marks the reject episode as ENDED so it
+  no longer suppresses re-detection — a future storm for the same source_type
+  re-fires. Applied by `IngestionHealth.auto_resolve_recovered_reject_rate/1`.
+  """
+  @spec reject_recovered_changeset(%__MODULE__{}, DateTime.t()) :: Ecto.Changeset.t()
+  def reject_recovered_changeset(anomaly, recovered_at) do
+    change(anomaly, resolved: true, last_event_at: recovered_at)
   end
 
   @doc """

@@ -550,9 +550,12 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
              |> Enum.filter(&(&1.tenant_id == tenant.id)) == []
     end
 
-    test "excludes NULL source_type buckets" do
+    test "flags a NULL/unstamped source_type bucket under the sentinel source_type" do
       tenant = fixture(:tenant)
 
+      # source_type is optional on a KB write, so the majority of agent captures omit
+      # it; a reject outage on those unstamped writes must NOT be a blind spot. The NULL
+      # bucket is surfaced under the sentinel (non-null so it can persist as an anomaly).
       fixture(:ingestion_write_stats, %{
         tenant_id: tenant.id,
         source_type: nil,
@@ -560,8 +563,41 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
         title_conflict_count: 8
       })
 
-      assert IngestionHealth.detect_high_reject_rate()
-             |> Enum.filter(&(&1.tenant_id == tenant.id)) == []
+      [candidate] =
+        IngestionHealth.detect_high_reject_rate()
+        |> Enum.filter(&(&1.tenant_id == tenant.id))
+
+      assert candidate.source_type == IngestionHealth.unstamped_source_type()
+      assert candidate.total_attempts == 10
+      assert candidate.rejects == 8
+    end
+
+    test "folds NULL and empty-string source_type into ONE unstamped bucket" do
+      tenant = fixture(:tenant)
+
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: nil,
+        day: Date.utc_today(),
+        created_count: 1,
+        title_conflict_count: 4
+      })
+
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: "",
+        day: Date.add(Date.utc_today(), -1),
+        created_count: 1,
+        title_conflict_count: 4
+      })
+
+      [candidate] =
+        IngestionHealth.detect_high_reject_rate()
+        |> Enum.filter(&(&1.tenant_id == tenant.id))
+
+      assert candidate.source_type == IngestionHealth.unstamped_source_type()
+      assert candidate.total_attempts == 10
+      assert candidate.rejects == 8
     end
 
     test "honors an explicit config passed to detect_high_reject_rate/1" do

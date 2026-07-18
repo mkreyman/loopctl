@@ -88,6 +88,16 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   @default_reject_rate_threshold 0.5
   @default_min_attempts 10
   @default_reject_window_days 7
+  @default_write_stats_retention_days 90
+
+  # Sentinel `source_type` for the NULL/unstamped write bucket. `source_type` on a
+  # KB write is advisory + nullable, so the MAJORITY of agent captures (patterns,
+  # decisions, session findings) omit it — those rejected writes land in the
+  # COALESCE('') bucket of `ingestion_write_stats`. `ingestion_anomalies.source_type`
+  # is NOT NULL (and `validate_required` rejects ""), so a reject-rate outage on
+  # unstamped writes is recorded under THIS sentinel rather than being a permanent
+  # blind spot (the exact 409 title_conflict outage class this detector exists to catch).
+  @unstamped_source_type "(unstamped)"
 
   @type candidate :: %{
           tenant_id: Ecto.UUID.t(),
@@ -180,6 +190,22 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   @spec reject_window_days() :: pos_integer()
   def reject_window_days,
     do: Keyword.get(config(), :reject_window_days, @default_reject_window_days)
+
+  @doc """
+  Retention (in days) for the `ingestion_write_stats` rollup. Rows older than this are
+  pruned by the hourly worker so the table does not grow unbounded (only the rolling
+  `reject_window_days` window is ever read). Default 90.
+  """
+  @spec write_stats_retention_days() :: pos_integer()
+  def write_stats_retention_days,
+    do: Keyword.get(config(), :write_stats_retention_days, @default_write_stats_retention_days)
+
+  @doc """
+  Sentinel `source_type` under which reject-rate anomalies for NULL/unstamped writes
+  are recorded (see the module attribute for why the NULL bucket needs a sentinel).
+  """
+  @spec unstamped_source_type() :: String.t()
+  def unstamped_source_type, do: @unstamped_source_type
 
   defp config, do: Application.get_env(:loopctl, :ingestion_health, [])
 
@@ -306,9 +332,12 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   sums `title_conflict + validation_error` into `rejects`, and flags when
   `total_attempts >= min_attempts` AND `rejects / total_attempts > reject_rate_threshold`.
 
-  NULL-`source_type` buckets are excluded (an `ingestion_anomalies` row requires a
-  non-null source_type, mirroring the capture-silence monitor's stamped-source_type
-  contract).
+  NULL/unstamped `source_type` writes are NOT excluded: since `source_type` is optional
+  on a KB write, the reject path's source_type is chosen by the FAILING client, so
+  "just stamp it" is no mitigation. The NULL bucket (`COALESCE(source_type, '')`) is
+  folded into a single candidate under `unstamped_source_type/0` (`ingestion_anomalies`
+  requires a non-null source_type, so the sentinel stands in), ensuring an unstamped
+  reject outage is not a permanent blind spot.
   """
   @spec detect_high_reject_rate() :: [reject_candidate()]
   def detect_high_reject_rate do
@@ -334,17 +363,20 @@ defmodule Loopctl.Knowledge.IngestionHealth do
         reject_window_days: window_days
       }) do
     # Inclusive rolling window of `window_days` days ending today. The day-leading
-    # index makes this predicate a range seek, so the read is bounded to the window.
+    # index (`ingestion_write_stats_day_index`) makes `day >= window_start` a range
+    # seek, so the read is bounded to the window rather than a seq-scan of the rollup.
     window_start = Date.add(Date.utc_today(), -(window_days - 1))
 
+    # Group by COALESCE(source_type, '') so NULL and empty-string writes fold into ONE
+    # bucket (surfaced as `unstamped_source_type/0` downstream) — an unstamped reject
+    # outage is caught, not silently dropped into a NULL rollup row no detector scans.
     IngestionWriteStats
     |> join(:inner, [s], t in Tenant, on: t.id == s.tenant_id and t.status == :active)
-    |> where([s], not is_nil(s.source_type))
     |> where([s], s.day >= ^window_start)
-    |> group_by([s], [s.tenant_id, s.source_type])
+    |> group_by([s], [s.tenant_id, fragment("COALESCE(?, '')", s.source_type)])
     |> select([s], %{
       tenant_id: s.tenant_id,
-      source_type: s.source_type,
+      source_type: fragment("COALESCE(?, '')", s.source_type),
       created: sum(s.created_count),
       deduplicated: sum(s.deduplicated_count),
       drafted: sum(s.drafted_count),
@@ -370,7 +402,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
       [
         %{
           tenant_id: row.tenant_id,
-          source_type: row.source_type,
+          source_type: reject_source_type(row.source_type),
           anomaly_type: :high_reject_rate,
           total_attempts: total_attempts,
           rejects: rejects,
@@ -383,6 +415,11 @@ defmodule Loopctl.Knowledge.IngestionHealth do
       []
     end
   end
+
+  # The COALESCE('') NULL/empty bucket surfaces under the sentinel so it can be
+  # persisted as an anomaly (non-null source_type) and matched by the worker's queries.
+  defp reject_source_type(""), do: @unstamped_source_type
+  defp reject_source_type(source_type), do: source_type
 
   # The reject reason that contributed the most drops (ties -> title_conflict).
   defp dominant_reason(title_conflict, validation_error) do
@@ -671,6 +708,102 @@ defmodule Loopctl.Knowledge.IngestionHealth do
       a.tenant_id == ^tenant_id and a.source_type == ^source_type and a.inserted_at > ^last
     )
     |> AdminRepo.exists?()
+  end
+
+  @doc """
+  Closes `:high_reject_rate` anomalies whose reject rate has RECOVERED.
+
+  A rejected write has no natural "resumed" signal like capture-silence's newer
+  article, so recovery is defined as: the `(tenant, source_type)` is no longer a
+  current reject candidate (rate dropped back below threshold, or volume fell below
+  the noise floor). `current_candidates` is the SAME list the worker just computed,
+  so this shares one scan of the rollup.
+
+  For each ACTIVE reject anomaly (archived == false and `last_event_at IS NULL`, which
+  covers both open rows and operator-resolved-but-still-active episodes) whose
+  `(tenant, source_type)` is NOT in the candidate set, it stamps `last_event_at` with
+  the recovery time (marking the episode ENDED) and sets `resolved: true`. Two
+  problems are fixed at once:
+
+  - **Open anomalies never froze open**: a recovered stream's open anomaly is resolved
+    instead of staying `resolved: false` forever with stale figures.
+  - **Resolved-suppression re-arms**: `Loopctl.Workers.IngestionHealthWorker`'s
+    `resolved_reject_suppression?` only counts resolved rows with `last_event_at IS
+    NULL`, so once recovery stamps `last_event_at` the resolved row stops suppressing —
+    a FUTURE reject storm for the same source_type re-fires instead of being silenced
+    forever. Mirrors how capture-silence re-arms when `last_event_at` advances.
+
+  Returns the number of anomalies closed. Called by the hourly worker.
+  """
+  @spec auto_resolve_recovered_reject_rate([reject_candidate()]) :: non_neg_integer()
+  def auto_resolve_recovered_reject_rate(current_candidates) do
+    active_keys = MapSet.new(current_candidates, &{&1.tenant_id, &1.source_type})
+    now = DateTime.utc_now()
+
+    IngestionAnomaly
+    |> where([a], a.anomaly_type == :high_reject_rate)
+    |> where([a], a.archived == false)
+    |> where([a], is_nil(a.last_event_at))
+    |> AdminRepo.all()
+    |> Enum.reduce(0, fn anomaly, acc ->
+      if MapSet.member?(active_keys, {anomaly.tenant_id, anomaly.source_type}),
+        do: acc,
+        else: acc + close_recovered_reject(anomaly, now)
+    end)
+  end
+
+  # Stamp the recovery time (episode ended) + mark resolved, auditing the resolve
+  # transition only when the row was previously unresolved (an already-resolved row is
+  # a system bookkeeping mark, not a state change worth a resolved-audit entry).
+  defp close_recovered_reject(%IngestionAnomaly{tenant_id: tenant_id} = anomaly, now) do
+    was_resolved = anomaly.resolved
+
+    multi =
+      Multi.new()
+      |> Multi.run(:anomaly, fn repo, _changes ->
+        anomaly |> IngestionAnomaly.reject_recovered_changeset(now) |> repo.update()
+      end)
+      |> Multi.run(:audit, fn repo, %{anomaly: updated} ->
+        if was_resolved do
+          {:ok, :skipped}
+        else
+          audit_insert(
+            repo,
+            audit_attrs(
+              tenant_id,
+              updated.id,
+              "resolved",
+              [actor_type: "system", actor_label: "ingestion_health:auto_resolve_reject_rate"],
+              %{old_state: %{"resolved" => false}, new_state: %{"resolved" => true}}
+            )
+          )
+        end
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, _} -> 1
+      {:error, _step, _reason, _changes} -> 0
+    end
+  end
+
+  @doc """
+  Prunes `ingestion_write_stats` rows older than `write_stats_retention_days`.
+
+  The rollup is append-only (one row per tenant/source_type/day) and only the rolling
+  `reject_window_days` window is ever read, so without pruning it would grow forever.
+  Deletes by the day-leading index (`day < cutoff`). Called by the hourly worker.
+  Returns the number of rows deleted.
+  """
+  @spec prune_write_stats() :: non_neg_integer()
+  def prune_write_stats do
+    cutoff = Date.add(Date.utc_today(), -write_stats_retention_days())
+
+    {deleted, _} =
+      IngestionWriteStats
+      |> where([s], s.day < ^cutoff)
+      |> AdminRepo.delete_all()
+
+    deleted
   end
 
   # --- Private helpers ---

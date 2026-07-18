@@ -16,6 +16,7 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionHealth
 
   action_fallback LoopctlWeb.FallbackController
@@ -36,7 +37,8 @@ defmodule LoopctlWeb.IngestionAnomalyController do
         "attempted but rejected at high rate, which persist no article row). " <>
         "Filterable by source_type and anomaly_type. Archived anomalies are excluded by " <>
         "default; use ?include_archived=true to include them. A malformed ?resolved value " <>
-        "is rejected with 422. The response `meta.filters` echoes the effective filters, " <>
+        "or an unknown ?anomaly_type is rejected with 422. The response `meta.filters` " <>
+        "echoes the effective filters, " <>
         "and `meta.warnings` flags a source_type filter that names a never-seen source " <>
         "(so an empty list is not mistaken for healthy).",
     parameters: [
@@ -75,7 +77,9 @@ defmodule LoopctlWeb.IngestionAnomalyController do
              meta: Schemas.PaginationMeta
            }
          }},
-      422 => {"Invalid 'resolved' filter value", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Invalid 'resolved' or 'anomaly_type' filter value", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -130,11 +134,13 @@ defmodule LoopctlWeb.IngestionAnomalyController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
-    # A malformed ?resolved value is rejected with 422 (not silently coerced to the
-    # unresolved-only default) — mirrors the update action's malformed-?archived guard.
-    with {:ok, resolved} <- parse_resolved(params["resolved"]) do
+    # A malformed ?resolved OR an unknown ?anomaly_type is rejected with 422 (not
+    # silently coerced / turned into a `where false` empty list) — so an operator who
+    # mistypes a filter sees the error, not a zero-result that reads as "healthy".
+    # Mirrors the update action's malformed-?archived guard.
+    with {:ok, resolved} <- parse_resolved(params["resolved"]),
+         {:ok, anomaly_type} <- parse_anomaly_type(params["anomaly_type"]) do
       source_type = string_filter(params["source_type"])
-      anomaly_type = string_filter(params["anomaly_type"])
       include_archived = parse_bool(params["include_archived"]) || false
 
       opts =
@@ -273,6 +279,27 @@ defmodule LoopctlWeb.IngestionAnomalyController do
     {:error, :unprocessable_entity,
      "Invalid 'resolved' value #{inspect(other)}; expected true, false, or all."}
   end
+
+  # Absent/empty -> {:ok, nil} (no filter). A known anomaly_type -> {:ok, value}. An
+  # UNKNOWN value (e.g. the natural typo "high-reject-rate") is rejected with 422 rather
+  # than flowing into the context's `where(false)` and returning an empty list that an
+  # operator would misread as healthy ingestion.
+  defp parse_anomaly_type(nil), do: {:ok, nil}
+  defp parse_anomaly_type(""), do: {:ok, nil}
+
+  defp parse_anomaly_type(value) when is_binary(value) do
+    if value in known_anomaly_types() do
+      {:ok, value}
+    else
+      {:error, :unprocessable_entity,
+       "Invalid 'anomaly_type' value #{inspect(value)}; expected one of " <>
+         "#{Enum.join(known_anomaly_types(), ", ")}."}
+    end
+  end
+
+  defp parse_anomaly_type(_), do: {:ok, nil}
+
+  defp known_anomaly_types, do: Enum.map(IngestionAnomaly.anomaly_types(), &Atom.to_string/1)
 
   # A query filter must be a non-empty string to apply; empty/absent/malformed -> nil.
   defp string_filter(value) when is_binary(value) and value != "", do: value

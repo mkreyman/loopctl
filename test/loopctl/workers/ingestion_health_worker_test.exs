@@ -403,13 +403,84 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
       assert anomalies_for(tenant_b.id) == []
     end
 
-    test "excludes a NULL source_type reject bucket (anomaly requires a source_type)" do
+    test "flags a NULL/unstamped source_type reject bucket under the sentinel source_type" do
       tenant = fixture(:tenant)
       seed_reject_stats(tenant.id, nil, %{created_count: 2, title_conflict_count: 8})
 
       assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
 
-      assert anomalies_for(tenant.id) == []
+      [anomaly] = anomalies_for(tenant.id)
+      assert anomaly.anomaly_type == :high_reject_rate
+      assert anomaly.source_type == IngestionHealth.unstamped_source_type()
+      assert anomaly.metadata["total_attempts"] == 10
+      assert anomaly.metadata["rejects"] == 8
+    end
+  end
+
+  describe "high-reject-rate recovery + re-arm" do
+    test "auto-closes an open reject anomaly once the reject rate recovers" do
+      tenant = fixture(:tenant)
+      seed_reject_stats(tenant.id, "web_article", %{created_count: 2, title_conflict_count: 8})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      [open] = anomalies_for(tenant.id)
+      assert open.resolved == false
+      assert is_nil(open.last_event_at)
+
+      # Rejects recover: replace the rollup with a healthy window (no longer a candidate).
+      Loopctl.AdminRepo.delete_all(
+        from(s in Loopctl.Knowledge.IngestionWriteStats, where: s.tenant_id == ^tenant.id)
+      )
+
+      seed_reject_stats(tenant.id, "web_article", %{created_count: 10, title_conflict_count: 0})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      [closed] = anomalies_for(tenant.id)
+      assert closed.resolved == true
+      # last_event_at is stamped with the recovery time (episode ended) so the row
+      # stops suppressing a future storm.
+      assert %DateTime{} = closed.last_event_at
+    end
+
+    test "a resolved anomaly re-arms after recovery: a fresh storm re-fires" do
+      tenant = fixture(:tenant)
+      seed_reject_stats(tenant.id, "web_article", %{created_count: 2, title_conflict_count: 8})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      # Operator resolves; rejects then recover so the recovery pass stamps last_event_at.
+      [open] = anomalies_for(tenant.id)
+      {:ok, _} = IngestionHealth.resolve_anomaly(tenant.id, open.id, actor_type: "system")
+
+      Loopctl.AdminRepo.delete_all(
+        from(s in Loopctl.Knowledge.IngestionWriteStats, where: s.tenant_id == ^tenant.id)
+      )
+
+      seed_reject_stats(tenant.id, "web_article", %{created_count: 10, title_conflict_count: 0})
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+      # A NEW storm: because the resolved row was marked recovered (last_event_at set),
+      # it no longer suppresses — a fresh unresolved anomaly is created. Clear the rollup
+      # first so the new storm reuses today's (tenant, source, day) bucket.
+      AdminRepo.delete_all(
+        from(s in Loopctl.Knowledge.IngestionWriteStats, where: s.tenant_id == ^tenant.id)
+      )
+
+      seed_reject_stats(tenant.id, "web_article", %{created_count: 2, title_conflict_count: 8})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      assert Enum.any?(anomalies_for(tenant.id), &(&1.resolved == false))
     end
   end
 end
