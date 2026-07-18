@@ -437,6 +437,46 @@ async function restoreKbScope({ project_id }) {
   return toContent(result);
 }
 
+async function channelPost({ project_id, body, key, refs }) {
+  // Repo Coordination Bus (Epic 39): post a coordination message to a channel
+  // (a channel IS a project_id — a work project or a kb scope). Agent-role, RLS
+  // tenant-scoped — posting to your own tenant's channel is coordination, NOT
+  // self-approval (owner decision #331), so it carries no chain-of-custody authority.
+  const payload = { project_id, body };
+  if (key) payload.key = key;
+  if (refs) payload.refs = refs;
+  // host + session_id are proxy-filled (NOT caller args). host from os.hostname();
+  // session_id from CLAUDE_SESSION_ID (the SAME id SessionStart sees) so US-39.6
+  // self-dedup can skip a session's own echoed posts. Omit session_id entirely when
+  // unset — it is client-supplied + informational, never a security dependency.
+  payload.host = os.hostname();
+  if (process.env.CLAUDE_SESSION_ID) payload.session_id = process.env.CLAUDE_SESSION_ID;
+  const result = await apiCall(
+    "POST",
+    "/api/v1/channel/posts",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function channelRecent({ project_id, since, limit }) {
+  // Read recent coordination posts for a channel (project_id) on the AGENT key.
+  // Oracle-safe read: returns the tenant's own channel only (RLS). `since` is a full
+  // ISO8601 instant (date-only is ignored server-side); limit defaults to 25, max 100.
+  const params = new URLSearchParams();
+  if (project_id) params.set("project_id", project_id);
+  if (since) params.set("since", since);
+  if (limit) params.set("limit", limit);
+  const result = await apiCall(
+    "GET",
+    `/api/v1/channel/posts?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function deleteProject({ project_id }) {
   const result = await apiCall(
     "DELETE",
@@ -2203,6 +2243,62 @@ const TOOLS = [
       type: "object",
       properties: {
         project_id: { type: "string", description: "UUID of the archived :kb scope to restore." },
+      },
+      required: ["project_id"],
+    },
+  },
+  {
+    name: "channel_post",
+    description:
+      "Post a message to a repo coordination channel (Epic 39 Repo Coordination Bus) on the agent key. A channel IS a project_id (a work project or a kb scope); posts are tenant-isolated by RLS. This is an agent-role COORDINATION surface, not chain-of-custody — posting to your own tenant's channel is not self-approval. host is auto-filled from the proxy's os.hostname() and session_id is auto-filled from the Claude Code session id (both proxy-supplied, informational only — do NOT pass them). Provide a key to upsert your per-session working-state slot (200) instead of appending a new post (201); omit it to append.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "UUID of the channel (a work project or kb scope) to post to.",
+        },
+        body: { type: "string", description: "The coordination message body." },
+        key: {
+          type: "string",
+          description:
+            "Optional per-session working-state slot key. When given, upserts the caller's slot for that key instead of appending a new post.",
+        },
+        refs: {
+          type: "object",
+          description:
+            "Optional structured references map: { file, pr, branch, commit }.",
+          properties: {
+            file: { type: "string" },
+            pr: { type: "string" },
+            branch: { type: "string" },
+            commit: { type: "string" },
+          },
+        },
+      },
+      required: ["project_id", "body"],
+    },
+  },
+  {
+    name: "channel_recent",
+    description:
+      "Read recent posts from a repo coordination channel (Epic 39 Repo Coordination Bus) on the agent key. A channel IS a project_id; RLS returns only your own tenant's channel, so this is an oracle-safe read. Use since (a full ISO8601 instant) to page forward from a known point and limit to cap results (default 25, max 100).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "UUID of the channel (a work project or kb scope) to read.",
+        },
+        since: {
+          type: "string",
+          description:
+            "Optional ISO8601 instant; return posts newer than this (date-only is ignored server-side).",
+        },
+        limit: {
+          type: "integer",
+          description: "Optional max posts to return (default 25, max 100).",
+        },
       },
       required: ["project_id"],
     },
@@ -5016,6 +5112,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "restore_kb_scope":
       return await restoreKbScope(args);
+
+    case "channel_post":
+      return await channelPost(args);
+
+    case "channel_recent":
+      return await channelRecent(args);
 
     case "delete_project":
       return await deleteProject(args);

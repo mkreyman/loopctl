@@ -140,6 +140,65 @@ describe("#418: create_kb_scope wiring", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// #39.4: channel_post / channel_recent (Repo Coordination Bus proxy tools)
+// ---------------------------------------------------------------------------
+
+describe("#39.4: channel_post / channel_recent wiring", () => {
+  test("TOOLS declares channel_post and channel_recent", () => {
+    assert.match(INDEX_SRC, /name: "channel_post",/, 'must declare a "channel_post" tool');
+    assert.match(INDEX_SRC, /name: "channel_recent",/, 'must declare a "channel_recent" tool');
+  });
+
+  test("channelPost POSTs /channel/posts on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/posts",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelPost must POST /api/v1/channel/posts with the agent key",
+    );
+  });
+
+  test("channelPost auto-fills host from os.hostname()", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?payload\.host = os\.hostname\(\)/,
+      "channelPost must set host from os.hostname()",
+    );
+  });
+
+  test("channelPost auto-fills session_id from CLAUDE_SESSION_ID when set", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?if \(process\.env\.CLAUDE_SESSION_ID\) payload\.session_id = process\.env\.CLAUDE_SESSION_ID/,
+      "channelPost must fill session_id from CLAUDE_SESSION_ID only when set",
+    );
+  });
+
+  test("channelRecent GETs /channel/posts on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelRecent\([\s\S]*?"GET",\s*`\/api\/v1\/channel\/posts\?\$\{params\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelRecent must GET /api/v1/channel/posts with a query string on the agent key",
+    );
+  });
+
+  test("the channel_post dispatch case calls channelPost(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_post":\s*\n\s*return await channelPost\(args\);/,
+      "the channel_post dispatch case must call channelPost(args)",
+    );
+  });
+
+  test("the channel_recent dispatch case calls channelRecent(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_recent":\s*\n\s*return await channelRecent\(args\);/,
+      "the channel_recent dispatch case must call channelRecent(args)",
+    );
+  });
+});
+
 describe("KB-scope lifecycle: archive_kb_scope / restore_kb_scope wiring", () => {
   test("TOOLS declares archive_kb_scope and restore_kb_scope", () => {
     assert.match(INDEX_SRC, /name: "archive_kb_scope",/, 'must declare "archive_kb_scope"');
