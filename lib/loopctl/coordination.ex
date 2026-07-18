@@ -200,7 +200,7 @@ defmodule Loopctl.Coordination do
   Returns `{:ok, %ChannelPost{}}` (the deleted row) or `{:error, :not_found}`.
   """
   @spec delete_post(Ecto.UUID.t(), Ecto.UUID.t(), term(), keyword()) ::
-          {:ok, ChannelPost.t()} | {:error, :not_found}
+          {:ok, ChannelPost.t()} | {:error, :not_found | :audit_write_failed}
   def delete_post(tenant_id, agent_id, post_id, audit \\ []) do
     if valid_uuid?(post_id) do
       case fetch_owned_post(tenant_id, post_id) do
@@ -236,20 +236,22 @@ defmodule Loopctl.Coordination do
       {:ok, %{post: post}} ->
         {:ok, post}
 
-      # The only convertible Multi error is a failed step carrying an invalid
-      # changeset. `Multi.delete` never yields such a tuple (a missing row RAISES
-      # `Ecto.StaleEntryError`, rescued below), so today this can only be the
-      # `:audit` step. The audit attrs are built programmatically with every
-      # required field present, so this branch is UNREACHABLE with valid input; it
-      # exists to keep `run_delete/4` TOTAL — never a `CaseClauseError`/500 leaked
-      # to the controller — and, like sibling `run_post/3`, acts as a compile-gate:
-      # if `Audit.log_in_multi/3` is ever changed to fail with a non-changeset
-      # error this clause stops covering it and dialyzer fails the build here.
-      # `delete_post/3`'s contract admits only `:not_found`, and this branch rolls
-      # the whole transaction back (nothing deleted, nothing audited), so it
-      # normalises to the same 404 the story mandates.
-      {:error, _step, %Ecto.Changeset{}, _changes} ->
-        {:error, :not_found}
+      # The `:audit` step failed with an invalid changeset. `Multi.delete` never
+      # yields such a tuple (a missing row RAISES `Ecto.StaleEntryError`, rescued
+      # below), so a convertible Multi error here is ALWAYS the audit insert. Because
+      # the delete and the audit share ONE transaction, a failed audit rolls the
+      # DELETE back too: the post SURVIVES. This is the redact path (a leaked
+      # secret), so folding it into the contract's `:not_found` would be
+      # fail-UNSAFE — the caller would read the resulting 404 as "already
+      # gone/handled" and believe the secret (and its 30-day-TTL SessionStart
+      # injection) is removed when it is NOT. Instead surface a DISTINCT error the
+      # controller maps to a 5xx, so the agent RETRIES the redaction rather than
+      # trusting a false 404. Matching `:audit` explicitly (not `_step`) preserves
+      # the compile-gate `run_delete/4` had: if `Audit.log_in_multi/3` is ever
+      # changed to fail with a non-changeset value, this clause stops covering it
+      # and dialyzer fails the build here rather than silently mis-mapping it.
+      {:error, :audit, %Ecto.Changeset{}, _changes} ->
+        {:error, :audit_write_failed}
     end
   rescue
     # Concurrent double-delete. `fetch_owned_post/2` is an UNLOCKED read, so between

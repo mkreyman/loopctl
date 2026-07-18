@@ -187,7 +187,10 @@ defmodule LoopctlWeb.ChannelPostController do
       404 =>
         {"Post not found (nonexistent or in another tenant)", "application/json",
          Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"The delete could not be recorded in the audit trail and was rolled back; " <>
+           "the post still exists. Retry the request.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -395,6 +398,13 @@ defmodule LoopctlWeb.ChannelPostController do
         # Cross-tenant AND nonexistent both land here — the shared 404 body is
         # byte-identical (no existence oracle), guaranteed by the FallbackController.
         {:error, :not_found}
+
+      {:error, :audit_write_failed} = err ->
+        # The delete could not be durably audited, so the whole transaction rolled
+        # back and the post STILL EXISTS. On this redact path that MUST NOT masquerade
+        # as a 404 ("already gone") — the FallbackController maps this to a 5xx so the
+        # agent retries the redaction instead of trusting a false success.
+        err
     end
   end
 

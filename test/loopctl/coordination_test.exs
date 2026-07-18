@@ -817,7 +817,7 @@ defmodule Loopctl.CoordinationTest do
                Coordination.delete_post(tenant.id, agent_id, post.id, audit)
     end
 
-    test "an audit-step failure rolls back the delete and returns {:error, :not_found}, never a 500",
+    test "an audit-step failure rolls back the delete and returns {:error, :audit_write_failed} (fail-safe, never a masking 404)",
          ctx do
       %{tenant: tenant, project: project, agent_id: agent_id} = ctx
 
@@ -827,11 +827,13 @@ defmodule Loopctl.CoordinationTest do
       # Force the audit insert to fail: actor_type is a REQUIRED audit field, and an
       # explicit nil in the audit context overrides run_delete's "api_key" default,
       # yielding an invalid audit changeset — the {:error, :audit, changeset, _}
-      # Multi branch. It must NOT CaseClauseError/500; run_delete/4 normalises it to
-      # the contract's 404 and the whole transaction rolls back.
+      # Multi branch. Because the delete shares the transaction, the post SURVIVES,
+      # so the redact path must NOT report a masking 404 ("already gone") — it
+      # surfaces a DISTINCT {:error, :audit_write_failed} the controller maps to a
+      # 5xx so the agent retries. It must never CaseClauseError/leak a raw 500.
       bad_audit = [actor_type: nil, actor_id: Ecto.UUID.generate(), actor_label: "x"]
 
-      assert {:error, :not_found} =
+      assert {:error, :audit_write_failed} =
                Coordination.delete_post(tenant.id, agent_id, post.id, bad_audit)
 
       # Transaction rolled back: the post survives and no audit row was written.
