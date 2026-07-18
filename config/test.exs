@@ -207,7 +207,16 @@ config :loopctl, :ingestion_health,
   monitored_source_types: ["session_log"],
   established_threshold: 5,
   staleness_threshold_hours: 72,
-  establishment_window_hours: 720
+  establishment_window_hours: 720,
+  # PR B2 reject-rate detector pins (deterministic thresholds for specs).
+  reject_rate_threshold: 0.5,
+  min_attempts: 10,
+  reject_window_days: 7
+
+# Run the write-outcome rollup upsert INLINE in test (prod dispatches it to a
+# supervised task): inline shares the emitting test process's sandboxed connection, so
+# the rollup row is readable back synchronously in specs.
+config :loopctl, Loopctl.Telemetry.IngestionWriteStats, async: false
 
 # Use simple formatter in test (override JSON default from config.exs).
 # The template prints only level + message (custom metadata is asserted via the

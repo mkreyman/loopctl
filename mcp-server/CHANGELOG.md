@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.46.0 — 2026-07-18 (high-reject-rate ingestion anomalies)
+
+### Changed
+
+- **`get_ingestion_anomalies`** — the `anomaly_type` filter now accepts
+  `high_reject_rate` alongside `capture_silence`. `high_reject_rate` flags a
+  source_type whose writes are ATTEMPTED but REJECTED at high rate over a rolling
+  window (409 title_conflict / validation drops that persist no article row) — the
+  complement to capture_silence (writes stopped). Use it to catch the OTHER outage
+  signature where knowledge capture is landing calls but silently dropping them.
+
 ## 2.45.0 — 2026-07-18 (ingestion-health anomalies)
 
 ### Added

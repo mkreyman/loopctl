@@ -21,6 +21,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.IngestionAnomaly
+  alias Loopctl.Knowledge.IngestionWriteStats
   alias Loopctl.Llm.SettingsCache
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Llm.UsageEvent, as: LlmUsageEvent
@@ -511,6 +512,21 @@ defmodule Loopctl.Fixtures do
         sample_count: 5,
         resolved: false,
         metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:ingestion_write_stats, attrs) do
+    Map.merge(
+      %{
+        source_type: "session_log",
+        day: Date.utc_today(),
+        created_count: 0,
+        deduplicated_count: 0,
+        drafted_count: 0,
+        title_conflict_count: 0,
+        validation_error_count: 0
       },
       Enum.into(attrs, %{})
     )
@@ -1266,6 +1282,26 @@ defmodule Loopctl.Fixtures do
       |> Ecto.Changeset.put_change(:archived, Map.get(data, :archived, false))
 
     AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:ingestion_write_stats, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    data = build(:ingestion_write_stats, Map.delete(attrs, :tenant_id))
+
+    %IngestionWriteStats{tenant_id: tenant_id}
+    |> IngestionWriteStats.changeset(data)
+    |> AdminRepo.insert!()
   end
 
   def fixture(:review_record, attrs) do

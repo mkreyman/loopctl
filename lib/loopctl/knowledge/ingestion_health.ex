@@ -23,7 +23,12 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   index (`articles_inserted_tenant_source_idx`) LEADS with `inserted_at` so that
   predicate is an index RANGE SEEK — the read is bounded to the rolling window
   (recent activity), NOT the whole corpus, so cost does not grow unbounded as the
-  article table ages.
+  article table ages. This boundedness holds ONLY while that index is present and
+  valid; because a silently-missing index would degrade this monitor to a Seq Scan
+  (the very "silently stop monitoring" failure it exists to prevent), it — and the
+  reject-rate detector's `ingestion_write_stats_day_index` — are registered
+  in `Loopctl.IndexHealth`'s critical-index list so a boot probe alarms if either is
+  missing/invalid rather than letting the scan quietly go unbounded.
 
   ## Monitoring contract: source_type must be stamped
 
@@ -66,6 +71,13 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     thresholds, e.g. `%{"session_log" => 2}` to monitor a low-volume critical source)
   - `:staleness_threshold_hours` -- default `72`
   - `:establishment_window_hours` -- default `720` (30 days)
+  - `:reject_rate_threshold` -- default `0.5` (reject fraction that flags high_reject_rate)
+  - `:min_attempts` -- default `10` (window write-attempt floor before a reject rate is trusted)
+  - `:min_attempts_overrides` -- default `%{}` (per-source-type overrides of the attempt
+    floor, e.g. `%{"session_log" => 3}` to monitor a low-volume critical source that
+    would otherwise fall below `min_attempts` and evade high_reject_rate detection)
+  - `:reject_window_days` -- default `7`
+  - `:write_stats_retention_days` -- default `90`
   """
 
   import Ecto.Query
@@ -75,6 +87,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.IngestionAnomaly
+  alias Loopctl.Knowledge.IngestionWriteStats
   alias Loopctl.Tenants.Tenant
 
   @default_monitored_source_types :all
@@ -83,12 +96,40 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   @default_establishment_window_hours 720
   @default_established_threshold_overrides %{}
 
+  # High-reject-rate detector defaults (PR B2).
+  @default_reject_rate_threshold 0.5
+  @default_min_attempts 10
+  @default_min_attempts_overrides %{}
+  @default_reject_window_days 7
+  @default_write_stats_retention_days 90
+
+  # Sentinel `source_type` for the NULL/unstamped write bucket. `source_type` on a
+  # KB write is advisory + nullable, so the MAJORITY of agent captures (patterns,
+  # decisions, session findings) omit it — those rejected writes land in the
+  # COALESCE('') bucket of `ingestion_write_stats`. `ingestion_anomalies.source_type`
+  # is NOT NULL (and `validate_required` rejects ""), so a reject-rate outage on
+  # unstamped writes is recorded under THIS sentinel rather than being a permanent
+  # blind spot (the exact 409 title_conflict outage class this detector exists to catch).
+  @unstamped_source_type "(unstamped)"
+
   @type candidate :: %{
           tenant_id: Ecto.UUID.t(),
           source_type: String.t(),
+          anomaly_type: :capture_silence,
           last_event_at: DateTime.t(),
           hours_stale: non_neg_integer(),
           sample_count: non_neg_integer()
+        }
+
+  @type reject_candidate :: %{
+          tenant_id: Ecto.UUID.t(),
+          source_type: String.t(),
+          anomaly_type: :high_reject_rate,
+          total_attempts: non_neg_integer(),
+          rejects: non_neg_integer(),
+          reject_rate: float(),
+          window_days: pos_integer(),
+          dominant_reason: String.t()
         }
 
   # --- Config accessors (documented defaults) ---
@@ -139,6 +180,62 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   @spec establishment_window_hours() :: pos_integer()
   def establishment_window_hours,
     do: Keyword.get(config(), :establishment_window_hours, @default_establishment_window_hours)
+
+  @doc """
+  Fraction of write attempts (0.0-1.0) above which a source_type's rolling window is
+  flagged `:high_reject_rate` (`rejects / total_attempts > threshold`). Default 0.5.
+  """
+  @spec reject_rate_threshold() :: float()
+  def reject_rate_threshold,
+    do: Keyword.get(config(), :reject_rate_threshold, @default_reject_rate_threshold)
+
+  @doc """
+  Minimum total write attempts in the window before a reject rate is trusted enough
+  to flag (avoids alerting on statistical noise from a handful of writes). Default 10.
+  """
+  @spec min_attempts() :: pos_integer()
+  def min_attempts, do: Keyword.get(config(), :min_attempts, @default_min_attempts)
+
+  @doc """
+  Per-source-type overrides for the minimum-attempts floor (mirrors
+  `established_threshold_overrides/0` for the capture-silence detector).
+
+  A map of `source_type => pos_integer`. A LOW-VOLUME but critical source (fewer than
+  the global `min_attempts` write attempts in the window) that is 100% rejecting would
+  otherwise fall between BOTH detectors — never enough attempts for high_reject_rate,
+  and (if it never established) never a capture_silence candidate either — leaving a
+  full-reject outage silent for the whole window. An override lets an operator monitor
+  such a source at a lower attempt floor without lowering the bar for noisy ones. The
+  unstamped bucket is addressed under the `unstamped_source_type/0` sentinel key.
+  Default `%{}` (no overrides — every source_type uses the global floor).
+  """
+  @spec min_attempts_overrides() :: %{optional(String.t()) => pos_integer()}
+  def min_attempts_overrides,
+    do: Keyword.get(config(), :min_attempts_overrides, @default_min_attempts_overrides)
+
+  @doc """
+  Rolling window (in days) over the `ingestion_write_stats` rollup for the
+  reject-rate scan. Default 7.
+  """
+  @spec reject_window_days() :: pos_integer()
+  def reject_window_days,
+    do: Keyword.get(config(), :reject_window_days, @default_reject_window_days)
+
+  @doc """
+  Retention (in days) for the `ingestion_write_stats` rollup. Rows older than this are
+  pruned by the hourly worker so the table does not grow unbounded (only the rolling
+  `reject_window_days` window is ever read). Default 90.
+  """
+  @spec write_stats_retention_days() :: pos_integer()
+  def write_stats_retention_days,
+    do: Keyword.get(config(), :write_stats_retention_days, @default_write_stats_retention_days)
+
+  @doc """
+  Sentinel `source_type` under which reject-rate anomalies for NULL/unstamped writes
+  are recorded (see the module attribute for why the NULL bucket needs a sentinel).
+  """
+  @spec unstamped_source_type() :: String.t()
+  def unstamped_source_type, do: @unstamped_source_type
 
   defp config, do: Application.get_env(:loopctl, :ingestion_health, [])
 
@@ -240,6 +337,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
         %{
           tenant_id: tenant_id,
           source_type: source_type,
+          anomaly_type: :capture_silence,
           last_event_at: to_utc_datetime(last_event_at),
           hours_stale: hours_stale,
           sample_count: sample_count
@@ -248,6 +346,174 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     else
       []
     end
+  end
+
+  # --- High-reject-rate detection (PR B2) ---
+
+  @doc """
+  Scans the `ingestion_write_stats` rollup for `:high_reject_rate` candidates using
+  the configured tunables. Returns a flat list of `t:reject_candidate/0` maps — PURE,
+  no DB writes.
+
+  A rejected write leaves NO article row, so the capture-silence detector (which reads
+  `articles`) is blind to it. This complementary detector reads the durable write-
+  outcome rollup instead: for each `(tenant, non-null source_type)` over a rolling
+  `reject_window_days` window, it sums all outcome counters into `total_attempts`,
+  sums `title_conflict + validation_error` into `rejects`, and flags when
+  `total_attempts >= min_attempts` AND `rejects / total_attempts > reject_rate_threshold`.
+
+  NULL/unstamped `source_type` writes are NOT excluded: since `source_type` is optional
+  on a KB write, the reject path's source_type is chosen by the FAILING client, so
+  "just stamp it" is no mitigation. The NULL bucket (`COALESCE(source_type, '')`) is
+  folded into a single candidate under `unstamped_source_type/0` (`ingestion_anomalies`
+  requires a non-null source_type, so the sentinel stands in), ensuring an unstamped
+  reject outage is not a permanent blind spot.
+  """
+  @spec detect_high_reject_rate() :: [reject_candidate()]
+  def detect_high_reject_rate do
+    detect_high_reject_rate(%{
+      reject_rate_threshold: reject_rate_threshold(),
+      min_attempts: min_attempts(),
+      min_attempts_overrides: min_attempts_overrides(),
+      reject_window_days: reject_window_days()
+    })
+  end
+
+  @doc """
+  `detect_high_reject_rate/0` with explicit config. Exposed so a caller can drive
+  detection with a specific configuration without touching global app env.
+  """
+  @spec detect_high_reject_rate(%{
+          required(:reject_rate_threshold) => float(),
+          required(:min_attempts) => pos_integer(),
+          required(:reject_window_days) => pos_integer(),
+          optional(:min_attempts_overrides) => %{optional(String.t()) => pos_integer()}
+        }) :: [reject_candidate()]
+  def detect_high_reject_rate(
+        %{
+          reject_rate_threshold: threshold,
+          min_attempts: min_attempts,
+          reject_window_days: window_days
+        } = opts
+      ) do
+    overrides = Map.get(opts, :min_attempts_overrides, %{})
+    # Inclusive rolling window of `window_days` days ending today. The day-leading
+    # index (`ingestion_write_stats_day_index`) makes `day >= window_start` a range
+    # seek, so the read is bounded to the window rather than a seq-scan of the rollup.
+    window_start = Date.add(Date.utc_today(), -(window_days - 1))
+
+    # Group by COALESCE(source_type, '') so NULL and empty-string writes fold into ONE
+    # bucket (surfaced as `unstamped_source_type/0` downstream) — an unstamped reject
+    # outage is caught, not silently dropped into a NULL rollup row no detector scans.
+    IngestionWriteStats
+    |> join(:inner, [s], t in Tenant, on: t.id == s.tenant_id and t.status == :active)
+    |> where([s], s.day >= ^window_start)
+    |> group_by([s], [s.tenant_id, fragment("COALESCE(?, '')", s.source_type)])
+    |> select([s], %{
+      tenant_id: s.tenant_id,
+      source_type: fragment("COALESCE(?, '')", s.source_type),
+      created: sum(s.created_count),
+      deduplicated: sum(s.deduplicated_count),
+      drafted: sum(s.drafted_count),
+      title_conflict: sum(s.title_conflict_count),
+      validation_error: sum(s.validation_error_count)
+    })
+    |> AdminRepo.all()
+    |> Enum.flat_map(
+      &reject_candidate_or_skip(&1, threshold, min_attempts, overrides, window_days)
+    )
+  end
+
+  defp reject_candidate_or_skip(row, threshold, min_attempts, overrides, window_days) do
+    created = to_int(row.created)
+    deduplicated = to_int(row.deduplicated)
+    drafted = to_int(row.drafted)
+    title_conflict = to_int(row.title_conflict)
+    validation_error = to_int(row.validation_error)
+
+    total_attempts = created + deduplicated + drafted + title_conflict + validation_error
+    rejects = title_conflict + validation_error
+    reject_rate = if total_attempts > 0, do: rejects / total_attempts, else: 0.0
+
+    # A low-volume critical source can be monitored below the global floor via a
+    # per-source override (keyed by the operator-facing source_type, sentinel included).
+    source_type = reject_source_type(row.source_type)
+    effective_min_attempts = Map.get(overrides, source_type, min_attempts)
+
+    if total_attempts >= effective_min_attempts and reject_rate > threshold do
+      [
+        %{
+          tenant_id: row.tenant_id,
+          source_type: source_type,
+          anomaly_type: :high_reject_rate,
+          total_attempts: total_attempts,
+          rejects: rejects,
+          reject_rate: reject_rate,
+          window_days: window_days,
+          dominant_reason: dominant_reason(title_conflict, validation_error)
+        }
+      ]
+    else
+      []
+    end
+  end
+
+  # The COALESCE('') NULL/empty bucket surfaces under the sentinel so it can be
+  # persisted as an anomaly (non-null source_type) and matched by the worker's queries.
+  defp reject_source_type(""), do: @unstamped_source_type
+  defp reject_source_type(source_type), do: source_type
+
+  # The reject reason that contributed the most drops (ties -> title_conflict).
+  defp dominant_reason(title_conflict, validation_error) do
+    if title_conflict >= validation_error, do: "title_conflict", else: "validation_error"
+  end
+
+  # A `sum(bigint)` comes back from Postgres as `numeric` -> Ecto `Decimal`; normalize
+  # to an integer (nil when a group somehow has no rows).
+  defp to_int(nil), do: 0
+  defp to_int(%Decimal{} = d), do: Decimal.to_integer(d)
+  defp to_int(n) when is_integer(n), do: n
+
+  @doc """
+  Whether the tenant has EVER seen ingestion activity for `source_type` — either a
+  recorded write-outcome (`ingestion_write_stats`, the create-path telemetry) OR a
+  persisted `articles` row (which covers non-create write paths like bulk/content
+  ingestion that never emit create telemetry). Used by the controller to warn when a
+  `source_type` filter names a genuinely never-seen source, so an EMPTY anomaly list is
+  not mistaken for "healthy".
+
+  The `unstamped_source_type/0` sentinel (`"(unstamped)"`) is special-cased: unstamped
+  writes are stored with a NULL/empty `source_type`, so it probes those rows rather than
+  matching the literal sentinel string (which no row carries) — otherwise a tenant with
+  real unstamped traffic would be falsely warned "no recorded activity".
+  """
+  @spec source_type_seen?(Ecto.UUID.t(), String.t()) :: boolean()
+  def source_type_seen?(tenant_id, source_type) when is_binary(source_type) do
+    write_stats_seen?(tenant_id, source_type) or articles_seen?(tenant_id, source_type)
+  end
+
+  defp write_stats_seen?(tenant_id, @unstamped_source_type) do
+    IngestionWriteStats
+    |> where([s], s.tenant_id == ^tenant_id and (is_nil(s.source_type) or s.source_type == ""))
+    |> AdminRepo.exists?()
+  end
+
+  defp write_stats_seen?(tenant_id, source_type) do
+    IngestionWriteStats
+    |> where([s], s.tenant_id == ^tenant_id and s.source_type == ^source_type)
+    |> AdminRepo.exists?()
+  end
+
+  defp articles_seen?(tenant_id, @unstamped_source_type) do
+    Article
+    |> where([a], a.tenant_id == ^tenant_id and is_nil(a.source_type))
+    |> AdminRepo.exists?()
+  end
+
+  defp articles_seen?(tenant_id, source_type) do
+    Article
+    |> where([a], a.tenant_id == ^tenant_id and a.source_type == ^source_type)
+    |> AdminRepo.exists?()
   end
 
   # --- Query surface (mirrors Loopctl.TokenUsage.list_anomalies/resolve_anomaly) ---
@@ -477,42 +743,134 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   """
   @spec auto_resolve_recovered() :: non_neg_integer()
   def auto_resolve_recovered do
-    open =
-      IngestionAnomaly
-      |> where([a], a.resolved == false and a.archived == false)
-      |> where([a], a.anomaly_type == :capture_silence)
+    # Set-based recovery filter: load ONLY the anomalies that already have a newer
+    # article (i.e. captures genuinely resumed), via a correlated EXISTS — ONE query
+    # instead of an `exists?` per open anomaly (the previous N+1 that grew with the
+    # open-anomaly count during a widespread incident). The per-row resolve below is
+    # then necessary work (locked flip + audit entry) run only for recovered rows.
+    recovered =
+      from(a in IngestionAnomaly, as: :anomaly)
+      |> where([anomaly: a], a.resolved == false and a.archived == false)
+      |> where([anomaly: a], a.anomaly_type == :capture_silence)
+      |> where([anomaly: a], not is_nil(a.last_event_at))
+      |> where(
+        [anomaly: a],
+        exists(
+          from(art in Article,
+            where:
+              art.tenant_id == parent_as(:anomaly).tenant_id and
+                art.source_type == parent_as(:anomaly).source_type and
+                art.inserted_at > parent_as(:anomaly).last_event_at
+          )
+        )
+      )
       |> AdminRepo.all()
 
-    Enum.reduce(open, 0, fn anomaly, acc -> acc + resolve_if_recovered(anomaly) end)
-  end
-
-  # Returns 1 if the anomaly's captures resumed AND it was resolved, else 0.
-  defp resolve_if_recovered(anomaly) do
-    with true <- captures_resumed?(anomaly),
-         {:ok, _} <-
-           do_resolve(anomaly.tenant_id, anomaly,
+    Enum.reduce(recovered, 0, fn anomaly, acc ->
+      case do_resolve(anomaly.tenant_id, anomaly,
              actor_type: "system",
              actor_label: "ingestion_health:auto_resolve"
            ) do
-      1
-    else
-      _ -> 0
+        {:ok, _} -> acc + 1
+        _ -> acc
+      end
+    end)
+  end
+
+  @doc """
+  Closes `:high_reject_rate` anomalies whose reject rate has RECOVERED.
+
+  A rejected write has no natural "resumed" signal like capture-silence's newer
+  article, so recovery is defined as: the `(tenant, source_type)` is no longer a
+  current reject candidate (rate dropped back below threshold, or volume fell below
+  the noise floor). `current_candidates` is the SAME list the worker just computed,
+  so this shares one scan of the rollup.
+
+  For each ACTIVE reject anomaly (archived == false and `last_event_at IS NULL`, which
+  covers both open rows and operator-resolved-but-still-active episodes) whose
+  `(tenant, source_type)` is NOT in the candidate set, it stamps `last_event_at` with
+  the recovery time (marking the episode ENDED) and sets `resolved: true`. Two
+  problems are fixed at once:
+
+  - **Open anomalies never froze open**: a recovered stream's open anomaly is resolved
+    instead of staying `resolved: false` forever with stale figures.
+  - **Resolved-suppression re-arms**: `Loopctl.Workers.IngestionHealthWorker`'s
+    `resolved_reject_suppression?` only counts resolved rows with `last_event_at IS
+    NULL`, so once recovery stamps `last_event_at` the resolved row stops suppressing —
+    a FUTURE reject storm for the same source_type re-fires instead of being silenced
+    forever. Mirrors how capture-silence re-arms when `last_event_at` advances.
+
+  Returns the number of anomalies closed. Called by the hourly worker.
+  """
+  @spec auto_resolve_recovered_reject_rate([reject_candidate()]) :: non_neg_integer()
+  def auto_resolve_recovered_reject_rate(current_candidates) do
+    active_keys = MapSet.new(current_candidates, &{&1.tenant_id, &1.source_type})
+    now = DateTime.utc_now()
+
+    IngestionAnomaly
+    |> where([a], a.anomaly_type == :high_reject_rate)
+    |> where([a], a.archived == false)
+    |> where([a], is_nil(a.last_event_at))
+    |> AdminRepo.all()
+    |> Enum.reduce(0, fn anomaly, acc ->
+      if MapSet.member?(active_keys, {anomaly.tenant_id, anomaly.source_type}),
+        do: acc,
+        else: acc + close_recovered_reject(anomaly, now)
+    end)
+  end
+
+  # Stamp the recovery time (episode ended) + mark resolved, auditing the resolve
+  # transition only when the row was previously unresolved (an already-resolved row is
+  # a system bookkeeping mark, not a state change worth a resolved-audit entry).
+  defp close_recovered_reject(%IngestionAnomaly{tenant_id: tenant_id} = anomaly, now) do
+    was_resolved = anomaly.resolved
+
+    multi =
+      Multi.new()
+      |> Multi.run(:anomaly, fn repo, _changes ->
+        anomaly |> IngestionAnomaly.reject_recovered_changeset(now) |> repo.update()
+      end)
+      |> Multi.run(:audit, fn repo, %{anomaly: updated} ->
+        if was_resolved do
+          {:ok, :skipped}
+        else
+          audit_insert(
+            repo,
+            audit_attrs(
+              tenant_id,
+              updated.id,
+              "resolved",
+              [actor_type: "system", actor_label: "ingestion_health:auto_resolve_reject_rate"],
+              %{old_state: %{"resolved" => false}, new_state: %{"resolved" => true}}
+            )
+          )
+        end
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, _} -> 1
+      {:error, _step, _reason, _changes} -> 0
     end
   end
 
-  defp captures_resumed?(%IngestionAnomaly{last_event_at: nil}), do: false
+  @doc """
+  Prunes `ingestion_write_stats` rows older than `write_stats_retention_days`.
 
-  defp captures_resumed?(%IngestionAnomaly{
-         tenant_id: tenant_id,
-         source_type: source_type,
-         last_event_at: last
-       }) do
-    Article
-    |> where(
-      [a],
-      a.tenant_id == ^tenant_id and a.source_type == ^source_type and a.inserted_at > ^last
-    )
-    |> AdminRepo.exists?()
+  The rollup is append-only (one row per tenant/source_type/day) and only the rolling
+  `reject_window_days` window is ever read, so without pruning it would grow forever.
+  Deletes by the day-leading index (`day < cutoff`). Called by the hourly worker.
+  Returns the number of rows deleted.
+  """
+  @spec prune_write_stats() :: non_neg_integer()
+  def prune_write_stats do
+    cutoff = Date.add(Date.utc_today(), -write_stats_retention_days())
+
+    {deleted, _} =
+      IngestionWriteStats
+      |> where([s], s.day < ^cutoff)
+      |> AdminRepo.delete_all()
+
+    deleted
   end
 
   # --- Private helpers ---

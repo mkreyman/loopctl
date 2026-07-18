@@ -24,7 +24,15 @@ defmodule Loopctl.IndexHealth do
   # Add to this list whenever a new CONCURRENTLY-built index becomes load-bearing.
   @critical_indexes [
     {"articles_tenant_inserted_id_idx", "US-27.9a article keyset pagination"},
-    {"articles_tenant_source_inserted_id_idx", "US-27.9b by-source keyset pagination"}
+    {"articles_tenant_source_inserted_id_idx", "US-27.9b by-source keyset pagination"},
+    # PR B2 ingestion-health monitors: their hourly cross-tenant scans claim window
+    # boundedness via these range-seek indexes. If one is silently missing/invalid
+    # (a CONCURRENTLY build that failed, an IF-NOT-EXISTS no-op over an invalid index),
+    # the "never silently stop monitoring" detector itself degrades to an unbounded
+    # Seq Scan of the largest tables — so probe them at boot like any other hot path.
+    {"articles_inserted_tenant_source_idx",
+     "PR B2 capture-silence hourly scan (inserted_at range seek)"},
+    {"ingestion_write_stats_day_index", "PR B2 high-reject-rate hourly scan (day range seek)"}
   ]
 
   @doc """

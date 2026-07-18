@@ -2783,10 +2783,12 @@ const TOOLS = [
   {
     name: "get_ingestion_anomalies",
     description:
-      "Get ingestion-health anomalies — capture-silence (a source_type that was producing " +
-      "articles has gone silent). Use to check whether knowledge capture is still landing. " +
-      "Paginated (page/page_size); advance `page` to enumerate all. Filter by source_type, " +
-      "anomaly_type, resolved status, or include archived.",
+      "Get ingestion-health anomalies — capture_silence (a source_type that was producing " +
+      "articles has gone silent) and high_reject_rate (writes attempted but rejected at high " +
+      "rate — 409 title_conflict / validation drops that persist no article row). Use to check " +
+      "whether knowledge capture is still landing AND being accepted. Paginated (page/page_size); " +
+      "advance `page` to enumerate all. Filter by source_type, anomaly_type, resolved status, or " +
+      "include archived.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2796,8 +2798,12 @@ const TOOLS = [
         },
         anomaly_type: {
           type: "string",
-          enum: ["capture_silence"],
-          description: 'Optional: filter by anomaly type (only "capture_silence" is currently produced).',
+          // Keep in sync with Loopctl.Knowledge.IngestionAnomaly @anomaly_types (the
+          // server-side Ecto.Enum + the ingestion_anomalies_anomaly_type_check DB CHECK).
+          enum: ["capture_silence", "high_reject_rate"],
+          description:
+            'Optional: filter by anomaly type — "capture_silence" (writes stopped) or ' +
+            '"high_reject_rate" (writes rejected at high rate).',
         },
         resolved: {
           type: "string",

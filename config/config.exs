@@ -165,11 +165,25 @@ config :loopctl,
 # established source_type may go without a new article before `IngestionHealthWorker`
 # flags a `:capture_silence` anomaly; `:establishment_window_hours` scopes
 # establishment to RECENT activity so a wound-down source_type is not flagged forever.
+#
+# PR B2 (no-persist / high-rejection-rate detector): `:reject_rate_threshold` is the
+# fraction of window write attempts above which a source_type is flagged
+# `:high_reject_rate` (rejects / total_attempts > threshold); `:min_attempts` is the
+# minimum window write attempts before that ratio is trusted (noise floor);
+# `:reject_window_days` is the rolling window (days) over the `ingestion_write_stats`
+# rollup the reject-rate scan reads.
 config :loopctl, :ingestion_health,
   monitored_source_types: :all,
   established_threshold: 5,
   staleness_threshold_hours: 72,
-  establishment_window_hours: 720
+  establishment_window_hours: 720,
+  reject_rate_threshold: 0.5,
+  min_attempts: 10,
+  reject_window_days: 7,
+  # Retention (days) for the append-only `ingestion_write_stats` rollup; the hourly
+  # worker prunes older rows so the table (and the cross-tenant reject-rate scan) stays
+  # bounded. Only the rolling `reject_window_days` window is ever read.
+  write_stats_retention_days: 90
 
 # US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
 # defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/

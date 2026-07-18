@@ -120,6 +120,115 @@ defmodule LoopctlWeb.IngestionAnomalyControllerTest do
       assert body["data"] == []
       assert body["meta"]["total_count"] == 0
     end
+
+    test "lists and filters both anomaly types", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      fixture(:ingestion_anomaly, %{tenant_id: tenant.id, source_type: "session_log"})
+
+      fixture(:ingestion_anomaly, %{
+        tenant_id: tenant.id,
+        source_type: "web_article",
+        anomaly_type: :high_reject_rate,
+        hours_stale: 0,
+        metadata: %{"reject_rate" => 0.8}
+      })
+
+      # Both listed by default.
+      body =
+        conn |> auth_conn(key) |> get(~p"/api/v1/ingestion-anomalies") |> json_response(200)
+
+      assert body["meta"]["total_count"] == 2
+
+      # Filter to high_reject_rate only.
+      body =
+        conn
+        |> auth_conn(key)
+        |> get(~p"/api/v1/ingestion-anomalies?anomaly_type=high_reject_rate")
+        |> json_response(200)
+
+      assert length(body["data"]) == 1
+      assert hd(body["data"])["anomaly_type"] == "high_reject_rate"
+
+      # Filter to capture_silence only.
+      body =
+        conn
+        |> auth_conn(key)
+        |> get(~p"/api/v1/ingestion-anomalies?anomaly_type=capture_silence")
+        |> json_response(200)
+
+      assert length(body["data"]) == 1
+      assert hd(body["data"])["anomaly_type"] == "capture_silence"
+    end
+
+    test "rejects a malformed ?resolved value with 422", %{conn: conn} do
+      ctx = setup_tenant_with_anomalies()
+
+      conn =
+        conn
+        |> auth_conn(ctx.user_key)
+        |> get(~p"/api/v1/ingestion-anomalies?resolved=maybe")
+
+      assert json_response(conn, 422)
+    end
+
+    test "rejects an unknown ?anomaly_type value with 422 (not an empty 'healthy' list)",
+         %{conn: conn} do
+      ctx = setup_tenant_with_anomalies()
+
+      # The natural typo (hyphens instead of underscores) must not flow into a
+      # `where false` that returns [] and reads as healthy ingestion.
+      conn =
+        conn
+        |> auth_conn(ctx.user_key)
+        |> get(~p"/api/v1/ingestion-anomalies?anomaly_type=high-reject-rate")
+
+      assert json_response(conn, 422)
+    end
+
+    test "echoes the effective filters in meta.filters", %{conn: conn} do
+      ctx = setup_tenant_with_anomalies()
+
+      body =
+        conn
+        |> auth_conn(ctx.user_key)
+        |> get(~p"/api/v1/ingestion-anomalies?source_type=session_log")
+        |> json_response(200)
+
+      assert body["meta"]["filters"]["source_type"] == "session_log"
+      # Omitted resolved reports the unresolved-only default.
+      assert body["meta"]["filters"]["resolved"] == false
+      assert body["meta"]["filters"]["include_archived"] == false
+      assert body["meta"]["filters"]["anomaly_type"] == nil
+    end
+
+    test "warns when a source_type filter names a never-seen source", %{conn: conn} do
+      ctx = setup_tenant_with_anomalies()
+
+      body =
+        conn
+        |> auth_conn(ctx.user_key)
+        |> get(~p"/api/v1/ingestion-anomalies?source_type=never_written")
+        |> json_response(200)
+
+      assert body["meta"]["warnings"] != []
+      assert Enum.any?(body["meta"]["warnings"], &String.contains?(&1, "never_written"))
+    end
+
+    test "no warning when the source_type has recorded write activity", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      fixture(:ingestion_write_stats, %{tenant_id: tenant.id, source_type: "web_article"})
+
+      body =
+        conn
+        |> auth_conn(key)
+        |> get(~p"/api/v1/ingestion-anomalies?source_type=web_article")
+        |> json_response(200)
+
+      assert body["meta"]["warnings"] == []
+    end
   end
 
   # --- PATCH /api/v1/ingestion-anomalies/:id ---

@@ -429,4 +429,242 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
       assert {:error, :not_found} = IngestionHealth.archive_anomaly(tenant_b.id, anomaly.id)
     end
   end
+
+  # --- PR B2: high-reject-rate detection off the ingestion_write_stats rollup ---
+
+  describe "detect_high_reject_rate/0" do
+    test "flags an established (>= min_attempts) high-reject source_type" do
+      tenant = fixture(:tenant)
+
+      # 10 attempts, 8 rejects (title_conflict) -> rate 0.8 > 0.5.
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: "web_article",
+        created_count: 2,
+        title_conflict_count: 8
+      })
+
+      candidates =
+        IngestionHealth.detect_high_reject_rate()
+        |> Enum.filter(&(&1.tenant_id == tenant.id))
+
+      assert [candidate] = candidates
+      assert candidate.anomaly_type == :high_reject_rate
+      assert candidate.source_type == "web_article"
+      assert candidate.total_attempts == 10
+      assert candidate.rejects == 8
+      assert candidate.reject_rate == 0.8
+      assert candidate.window_days == 7
+      assert candidate.dominant_reason == "title_conflict"
+    end
+
+    test "sums title_conflict + validation_error as rejects; picks the dominant reason" do
+      tenant = fixture(:tenant)
+
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: "web_article",
+        created_count: 2,
+        title_conflict_count: 3,
+        validation_error_count: 6
+      })
+
+      [candidate] =
+        IngestionHealth.detect_high_reject_rate()
+        |> Enum.filter(&(&1.tenant_id == tenant.id))
+
+      assert candidate.total_attempts == 11
+      assert candidate.rejects == 9
+      assert candidate.dominant_reason == "validation_error"
+    end
+
+    test "does not flag below min_attempts" do
+      tenant = fixture(:tenant)
+
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: "web_article",
+        created_count: 1,
+        title_conflict_count: 4
+      })
+
+      assert IngestionHealth.detect_high_reject_rate()
+             |> Enum.filter(&(&1.tenant_id == tenant.id)) == []
+    end
+
+    test "does not flag when reject rate is at/below the threshold" do
+      tenant = fixture(:tenant)
+
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: "web_article",
+        created_count: 6,
+        title_conflict_count: 4
+      })
+
+      assert IngestionHealth.detect_high_reject_rate()
+             |> Enum.filter(&(&1.tenant_id == tenant.id)) == []
+    end
+
+    test "sums across days within the rolling window" do
+      tenant = fixture(:tenant)
+
+      # Two days inside the 7-day window, each 5 attempts / 4 rejects -> 10 / 8.
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: "web_article",
+        day: Date.utc_today(),
+        created_count: 1,
+        title_conflict_count: 4
+      })
+
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: "web_article",
+        day: Date.add(Date.utc_today(), -3),
+        created_count: 1,
+        validation_error_count: 4
+      })
+
+      [candidate] =
+        IngestionHealth.detect_high_reject_rate()
+        |> Enum.filter(&(&1.tenant_id == tenant.id))
+
+      assert candidate.total_attempts == 10
+      assert candidate.rejects == 8
+    end
+
+    test "excludes rows older than the rolling window" do
+      tenant = fixture(:tenant)
+
+      # A high-reject bucket 10 days ago is outside the default 7-day window.
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: "web_article",
+        day: Date.add(Date.utc_today(), -10),
+        created_count: 2,
+        title_conflict_count: 8
+      })
+
+      assert IngestionHealth.detect_high_reject_rate()
+             |> Enum.filter(&(&1.tenant_id == tenant.id)) == []
+    end
+
+    test "flags a NULL/unstamped source_type bucket under the sentinel source_type" do
+      tenant = fixture(:tenant)
+
+      # source_type is optional on a KB write, so the majority of agent captures omit
+      # it; a reject outage on those unstamped writes must NOT be a blind spot. The NULL
+      # bucket is surfaced under the sentinel (non-null so it can persist as an anomaly).
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: nil,
+        created_count: 2,
+        title_conflict_count: 8
+      })
+
+      [candidate] =
+        IngestionHealth.detect_high_reject_rate()
+        |> Enum.filter(&(&1.tenant_id == tenant.id))
+
+      assert candidate.source_type == IngestionHealth.unstamped_source_type()
+      assert candidate.total_attempts == 10
+      assert candidate.rejects == 8
+    end
+
+    test "folds NULL and empty-string source_type into ONE unstamped bucket" do
+      tenant = fixture(:tenant)
+
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: nil,
+        day: Date.utc_today(),
+        created_count: 1,
+        title_conflict_count: 4
+      })
+
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: "",
+        day: Date.add(Date.utc_today(), -1),
+        created_count: 1,
+        title_conflict_count: 4
+      })
+
+      [candidate] =
+        IngestionHealth.detect_high_reject_rate()
+        |> Enum.filter(&(&1.tenant_id == tenant.id))
+
+      assert candidate.source_type == IngestionHealth.unstamped_source_type()
+      assert candidate.total_attempts == 10
+      assert candidate.rejects == 8
+    end
+
+    test "honors an explicit config passed to detect_high_reject_rate/1" do
+      tenant = fixture(:tenant)
+
+      # 6 attempts, 4 rejects -> rate 0.66; below default min_attempts 10 but an
+      # explicit lower min_attempts + threshold flags it.
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: "web_article",
+        created_count: 2,
+        title_conflict_count: 4
+      })
+
+      candidates =
+        IngestionHealth.detect_high_reject_rate(%{
+          reject_rate_threshold: 0.5,
+          min_attempts: 5,
+          reject_window_days: 7
+        })
+        |> Enum.filter(&(&1.tenant_id == tenant.id))
+
+      assert [%{source_type: "web_article"}] = candidates
+    end
+
+    test "tenant isolation — one tenant's rejects never surface for another" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant_a.id,
+        source_type: "web_article",
+        created_count: 2,
+        title_conflict_count: 8
+      })
+
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant_b.id,
+        source_type: "web_article",
+        created_count: 8,
+        title_conflict_count: 2
+      })
+
+      tenants =
+        IngestionHealth.detect_high_reject_rate() |> Enum.map(& &1.tenant_id) |> Enum.uniq()
+
+      assert tenant_a.id in tenants
+      refute tenant_b.id in tenants
+    end
+  end
+
+  describe "source_type_seen?/2" do
+    test "true when the tenant has a write-stats row for the source_type" do
+      tenant = fixture(:tenant)
+      fixture(:ingestion_write_stats, %{tenant_id: tenant.id, source_type: "web_article"})
+
+      assert IngestionHealth.source_type_seen?(tenant.id, "web_article")
+    end
+
+    test "false for a never-seen source_type (and is tenant-scoped)" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      fixture(:ingestion_write_stats, %{tenant_id: tenant_a.id, source_type: "web_article"})
+
+      refute IngestionHealth.source_type_seen?(tenant_a.id, "never_seen")
+      # Tenant B never recorded web_article.
+      refute IngestionHealth.source_type_seen?(tenant_b.id, "web_article")
+    end
+  end
 end
