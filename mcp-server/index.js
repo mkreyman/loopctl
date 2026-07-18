@@ -841,7 +841,15 @@ async function getIngestionAnomalies({
   if (page_size != null) params.set("page_size", String(page_size));
 
   const query = params.toString() ? `?${params}` : "";
-  const result = await apiCall("GET", `/api/v1/ingestion-anomalies${query}`);
+  // Orchestrator-gated endpoint (RequireRole :orchestrator). Pass the ORCH key
+  // explicitly so a misconfigured single agent-role LOOPCTL_API_KEY fails loudly
+  // rather than drifting into an undiagnosable 403.
+  const result = await apiCall(
+    "GET",
+    `/api/v1/ingestion-anomalies${query}`,
+    undefined,
+    process.env.LOOPCTL_ORCH_KEY
+  );
   return toContent(result);
 }
 
