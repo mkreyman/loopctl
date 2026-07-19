@@ -148,6 +148,16 @@ defmodule LoopctlWeb.Router do
     # human-anchor gated.
     delete "/channel/posts/:id", ChannelPostController, :delete
 
+    # Directed-handoff discovery read (Epic 40, US-40.C1): agent-role,
+    # tenant-scoped, oracle-safe read of DIRECTED, OPEN, UNCLAIMED handoffs for the
+    # caller's host/capabilities. A SEPARATE, pinned set — NOT the newest-N
+    # recency preview — so a directed handoff is always visible even on a busy
+    # channel. STATIC path under a DISTINCT prefix (`/channel/handoffs`, not
+    # `/channel/posts/...`), so the `:id` post route never shadows it. project_id +
+    # optional host/capabilities query params; the tenant is key-derived, never
+    # from params.
+    get "/channel/handoffs", ChannelPostController, :handoffs
+
     # Graduate a coordination post into the durable Knowledge wiki (Epic 40,
     # US-40.E1) — the CONTENT-SELECTIVE promotion of a genuinely reusable finding
     # with no external tracker (a transient directive is left to expire). Agent

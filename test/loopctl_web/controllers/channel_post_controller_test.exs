@@ -1278,6 +1278,149 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     end
   end
 
+  describe "GET /api/v1/channel/handoffs (directed discovery, US-40.C1)" do
+    @handoffs_path "/api/v1/channel/handoffs"
+
+    # Insert a handoff post directly (bypassing the session-required-for-key
+    # changeset rule + membership gate) so read tests control key/addressing.
+    defp seed_handoff(tenant, project, agent_id, attrs) do
+      now = DateTime.utc_now()
+
+      AdminRepo.insert!(%ChannelPost{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        agent_id: agent_id,
+        body: Map.get(attrs, :body, "please pick up this handoff"),
+        key: Map.fetch!(attrs, :key),
+        to_host: Map.get(attrs, :to_host),
+        to_capability: Map.get(attrs, :to_capability),
+        expires_at: Map.get(attrs, :expires_at, DateTime.add(now, 30 * 86_400, :second))
+      })
+    end
+
+    test "returns a capability-directed handoff as a pinned set with bounded previews" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      seed_handoff(tenant, project, agent.id, %{
+        key: "handoff:repo#812",
+        to_capability: "fly-auth"
+      })
+
+      conn =
+        authed_conn(raw)
+        |> get(@handoffs_path, %{"project_id" => project.id, "capabilities" => "fly-auth"})
+
+      assert %{"data" => [row], "meta" => meta} = json_response(conn, 200)
+      assert row["key"] == "handoff:repo#812"
+      assert row["to_capability"] == "fly-auth"
+      # Bounded read model — body_preview + truncated, NEVER a full body.
+      assert row["body_preview"] == "please pick up this handoff"
+      assert row["truncated"] == false
+      refute Map.has_key?(row, "body")
+      assert meta["count"] == 1
+      # Pinned set: no limit / next_cursor meta (never truncated).
+      refute Map.has_key?(meta, "limit")
+      refute Map.has_key?(meta, "next_cursor")
+
+      # Same narrowed field set as the list read.
+      assert Map.keys(row) |> Enum.sort() ==
+               ~w(agent_id body_preview host id inserted_at key refs session_id to_capability to_host truncated updated_at)
+    end
+
+    # AC-40.C1.2: PINNED — a directed handoff is returned even behind many newer
+    # status posts (not subject to the newest-N recency truncation).
+    test "a directed handoff is returned even behind 150 newer status posts (pinned)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      seed_handoff(tenant, project, agent.id, %{key: "handoff:pinned", to_capability: "fly-auth"})
+
+      for i <- 1..150 do
+        {:ok, _} =
+          Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "status #{i}"})
+      end
+
+      conn =
+        authed_conn(raw)
+        |> get(@handoffs_path, %{"project_id" => project.id, "capabilities" => "fly-auth"})
+
+      assert %{"data" => [row]} = json_response(conn, 200)
+      assert row["key"] == "handoff:pinned"
+    end
+
+    # AC-40.C1.4: oracle-safe — cross-tenant / nonexistent / malformed project_id
+    # all return a 200 empty envelope, never a 404.
+    test "cross-tenant, nonexistent, and malformed project_id all return 200 empty (no 404)" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant)
+
+      other = fixture(:tenant)
+      other_project = fixture(:project, %{tenant_id: other.id})
+      other_agent = fixture(:agent, %{tenant_id: other.id})
+
+      seed_handoff(other, other_project, other_agent.id, %{
+        key: "handoff:theirs",
+        to_capability: "fly-auth"
+      })
+
+      cross =
+        authed_conn(raw)
+        |> get(@handoffs_path, %{"project_id" => other_project.id, "capabilities" => "fly-auth"})
+
+      missing =
+        authed_conn(raw)
+        |> get(@handoffs_path, %{
+          "project_id" => Ecto.UUID.generate(),
+          "capabilities" => "fly-auth"
+        })
+
+      malformed =
+        authed_conn(raw)
+        |> get(@handoffs_path, %{
+          "project_id" => "garbage-not-a-uuid",
+          "capabilities" => "fly-auth"
+        })
+
+      assert %{"data" => [], "meta" => %{"count" => 0}} = json_response(cross, 200)
+      assert json_response(cross, 200) == json_response(missing, 200)
+      assert json_response(cross, 200) == json_response(malformed, 200)
+    end
+
+    test "the handoffs read requires agent role (an unauthenticated caller cannot read)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      conn =
+        build_conn()
+        |> put_req_header("x-loopctl-last-known-sth", @sth_header)
+        |> get(@handoffs_path, %{"project_id" => project.id})
+
+      assert conn.status in [401, 403]
+    end
+
+    # AC-40.D5.1: the handoffs read is behind the DEDICATED per-read coordination
+    # cap (same @read_actions gate as :index/:show). A burst past it is 429.
+    test "an over-cap handoffs read burst is 429 with Retry-After (dedicated read cap)" do
+      stub_counting_limiter()
+      tenant = fixture(:tenant, %{settings: %{"channel_post_read_limit_per_minute" => 2}})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      for _ <- 1..2 do
+        conn = authed_conn(raw) |> get(@handoffs_path, %{"project_id" => project.id})
+        assert conn.status == 200
+      end
+
+      conn = authed_conn(raw) |> get(@handoffs_path, %{"project_id" => project.id})
+      assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
+      assert [retry] = get_resp_header(conn, "retry-after")
+      assert String.to_integer(retry) >= 1
+    end
+  end
+
   describe "DELETE /api/v1/channel/posts/:id" do
     defp delete_path(id), do: "#{@path}/#{id}"
 

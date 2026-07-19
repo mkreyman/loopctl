@@ -1495,6 +1495,149 @@ defmodule Loopctl.Coordination do
     end
   end
 
+  @doc """
+  Directed-handoff discovery read (US-40.C1): the DEDICATED, PINNED availability
+  query that surfaces DIRECTED, OPEN, UNCLAIMED handoffs to a caller — never
+  interleaved into, and never truncated by, the newest-N `recent_page/3` recency
+  preview.
+
+  A handoff IS a post carrying the stable `handoff:<anchor>` key (US-40.B2), so
+  the set is `key LIKE 'handoff:%'` (a left-anchored, index-served prefix — there
+  is deliberately NO `kind` column). Given a caller's advisory target
+  `%{host: me, capabilities: caps}`, it returns every live handoff that is:
+
+    * addressed to the caller — `to_host = ^me` OR `to_capability = ANY(^caps)` —
+      OR is a BROADCAST handoff (both `to_host` and `to_capability` NULL). The
+      broadcast rule (AC-40.C1.3) is DEFAULT-INCLUDE so an unaddressed handoff is
+      never orphaned: it surfaces to everyone until someone claims it. An empty
+      `caps` list is safe (`in ^[]` is always false — a caller with no
+      capabilities still sees its host-directed and broadcast handoffs);
+    * not expired (`expires_at > now`, independent of the TTL sweep); and
+    * NOT covered by an ACTIVE claim (US-40.B1). The NOT-EXISTS join key is
+      `channel_claims.ref = channel_posts.key` — the handoff post's stable key IS
+      the claim ref. This coupling is always sound: every `key LIKE 'handoff:%'`
+      row has a non-null key by construction, so no keyless handoff can slip past
+      the correlation. A claim is ACTIVE — and therefore EXCLUDES the handoff —
+      when it is DONE (`done_at IS NOT NULL`, TERMINAL) OR still OPEN
+      (`lease_expires_at > now`). A handoff REOPENS only when its claim was
+      RELEASED (row deleted → NOT EXISTS true) or its lease EXPIRED WITHOUT
+      completion (`done_at IS NULL AND lease_expires_at <= now`). A DONE handoff
+      never reappears.
+
+  ## Ordering
+
+  Pinned OLDEST-unclaimed-first (`inserted_at ASC`, `seq ASC` tie-break) so a
+  STALE directed handoff floats to the top — the opposite of the newest-first
+  recency read, because the point of this set is "the work that has been waiting
+  longest for me", not "what just happened".
+
+  ## Isolation & oracle-safety
+
+  Runs on `AdminRepo` (BYPASSRLS) with EXPLICIT `tenant_id` AND `project_id`
+  filters (the module convention — a query omitting the tenant filter is a bug).
+  `host`/`capabilities` are caller-supplied ADVISORY hints that filter WHAT is
+  shown; they NEVER widen WHO may read — the result is always bounded to the
+  caller's tenant. Do NOT authorize on them. A malformed `tenant_id`/`project_id`
+  returns `[]` (the `valid_uuid?/1` guard), and a cross-tenant or nonexistent
+  `project_id` naturally returns `[]` too (never a 404) — identical oracle posture
+  to `recent_page/3`.
+
+  Returns `[preview()]` — the SAME bounded read-model projection the list read
+  uses (`select_preview/1` + `finalize_preview/1`), so bodies are 512-byte bounded
+  previews framed as untrusted DATA, never full un-fenced bodies.
+  """
+  @spec directed_handoffs(term(), term(), map()) :: [preview()]
+  def directed_handoffs(tenant_id, project_id, target \\ %{}) do
+    if valid_uuid?(tenant_id) and valid_uuid?(project_id) do
+      host = normalize_host(target)
+      caps = normalize_capabilities(target)
+      now = DateTime.utc_now()
+
+      from(p in ChannelPost, as: :post)
+      |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
+      |> where([p], like(p.key, "handoff:%"))
+      |> where([p], p.expires_at > ^now)
+      |> where(^directed_target_filter(host, caps))
+      |> where([p], not exists(active_claim_subquery(now)))
+      |> order_by([p], asc: p.inserted_at, asc: p.seq)
+      |> select_preview()
+      |> AdminRepo.all()
+      |> Enum.map(&finalize_preview/1)
+    else
+      []
+    end
+  end
+
+  # Correlated NOT-EXISTS subquery: an ACTIVE claim on the handoff post's key
+  # (`channel_claims.ref = channel_posts.key`, same tenant/project). ACTIVE =
+  # DONE (`done_at IS NOT NULL`, terminal) OR OPEN (`lease_expires_at > now`). A
+  # RELEASED claim (row gone) or an expired-without-done lease is NOT active, so
+  # the handoff reappears. `parent_as(:post)` correlates to the outer query's
+  # `:post` binding.
+  defp active_claim_subquery(now) do
+    from(c in ChannelClaim,
+      where:
+        c.tenant_id == parent_as(:post).tenant_id and
+          c.project_id == parent_as(:post).project_id and
+          c.ref == parent_as(:post).key and
+          (not is_nil(c.done_at) or c.lease_expires_at > ^now)
+    )
+  end
+
+  # Compose the advisory target WHERE (US-40.C1): a handoff surfaces when it is
+  # directed to the caller's host, directed to one of the caller's capabilities,
+  # OR is an unaddressed BROADCAST (both target columns NULL — default-include so
+  # nothing is orphaned). `host`/`caps` are already normalized; an absent host or
+  # empty caps list simply drops that OR branch. Broadcast is ALWAYS included, so
+  # we seed with it and OR in the present hints — keeping each clause trivial.
+  defp directed_target_filter(host, caps) do
+    dynamic([p], is_nil(p.to_host) and is_nil(p.to_capability))
+    |> or_host_filter(host)
+    |> or_capabilities_filter(caps)
+  end
+
+  defp or_host_filter(filter, host) when is_binary(host),
+    do: dynamic([p], p.to_host == ^host or ^filter)
+
+  defp or_host_filter(filter, _host), do: filter
+
+  defp or_capabilities_filter(filter, [_ | _] = caps),
+    do: dynamic([p], p.to_capability in ^caps or ^filter)
+
+  defp or_capabilities_filter(filter, _caps), do: filter
+
+  # A blank host is "no host hint" (drops the to_host OR branch); anything
+  # non-binary is ignored. Matches the blank-normalization posture of the write path.
+  defp normalize_host(%{host: host}) when is_binary(host) do
+    case String.trim(host) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_host(_), do: nil
+
+  # Normalize the caller's capability hints to a clean list of non-blank strings.
+  # Accepts a list (repeated query param) or a comma-joined string (the MCP/HTTP
+  # convention). Anything else → []. Empty list is safe (`in ^[]` is always false).
+  defp normalize_capabilities(%{capabilities: caps}) when is_list(caps) do
+    caps
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp normalize_capabilities(%{capabilities: caps}) when is_binary(caps) do
+    caps
+    |> String.split(",")
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp normalize_capabilities(_), do: []
+
   @typedoc """
   A single LIST-read row: a bounded read-model projection (NOT a `%ChannelPost{}`).
   Carries `body_preview` (a prefix of at most `#{@preview_bytes}` bytes) + `truncated`
