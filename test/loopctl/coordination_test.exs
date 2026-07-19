@@ -1074,21 +1074,23 @@ defmodule Loopctl.CoordinationTest do
       %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
       project = fixture(:project, %{tenant_id: tenant.id})
 
-      # A DIFFERENT tenant has a project whose id collides in NEITHER value nor
-      # tenant; even if a story assigned our agent_id existed under another
-      # tenant_id, the explicit tenant filter in the membership query excludes it.
+      # Seed a story under a DIFFERENT tenant that matches BOTH the project_id and
+      # the assigned_agent_id the membership query looks for — so tenant_id is the
+      # SOLE discriminator. If the explicit `s.tenant_id == ^tenant_id` predicate
+      # were dropped from agent_member_of_project?/3, this row would match on
+      # (project_id, assigned_agent_id) and wrongly grant membership. The denial
+      # below therefore proves the tenant filter is load-bearing.
       other = fixture(:tenant)
-      other_project = fixture(:project, %{tenant_id: other.id})
-      other_agent = fixture(:agent, %{tenant_id: other.id}).id
 
       fixture(:story, %{
         tenant_id: other.id,
-        project_id: other_project.id,
-        assigned_agent_id: other_agent,
+        project_id: project.id,
+        assigned_agent_id: agent_id,
         agent_status: :assigned
       })
 
-      # Our agent has no assignment in OUR tenant's project -> denied.
+      # Our agent has no assignment in OUR tenant's project -> denied, even though
+      # the cross-tenant story references our project_id and our agent_id.
       assert {:error, :not_found} =
                Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
