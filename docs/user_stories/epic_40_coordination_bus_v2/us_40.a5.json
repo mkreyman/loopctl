@@ -30,7 +30,7 @@
     "Migration: add :to_host, :text, null: true; add :to_capability, :text, null: true; partial indexes as in AC-40.A5.2.",
     "Schema: two string fields; add both to cast (channel_post.ex:128), normalize_blank (:129), @scanned_text_fields (:57); validate_length(:to_host, max: 255) / validate_length(:to_capability, max: 128), count: :bytes.",
     "Reuse the EXACT spoofable-field framing already established for host/session_id (channel_post.ex:24-27) — copy that doc discipline so a future reader cannot mistake these for authz.",
-    "These columns are consumed by 40.C1 (directed discovery): `kind='handoff' AND (to_host=$me OR to_capability IN $caps) AND NOT EXISTS(open claim)`. Ship this BEFORE 40.C1 (sequencing step 6 -> 7).",
+    "These columns are consumed by 40.C1 (directed discovery): `key LIKE 'handoff:%' AND (to_host=$me OR to_capability IN $caps) AND NOT EXISTS(open claim)` (a handoff is identified by its `handoff:` key, 40.B2 — there is NO `kind` column). Ship this BEFORE 40.C1 (sequencing step 6 -> 7).",
     "MCP: add to_host/to_capability to channel_post; return them in channel_recent output. Note in the tool description they are advisory.",
     "Prioritize to_capability (the #812 real target was `fly auth`, a capability, not a host)."
   ],

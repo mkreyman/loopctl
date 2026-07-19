@@ -29,7 +29,7 @@
   ],
   "technical_notes": [
     "Reuse channel_post with a claim key convention + a short per-post expires_at override — add an optional ttl_seconds arg to the write path (server clamps it) rather than a new table.",
-    "Surface claims in the consumer (US-39.6 SessionStart injection — the retained consumer surface; the running-session turn-boundary pull formerly numbered US-40.3 moved to the claude-config companion, so target US-39.6 / the companion, NOT the removed US-40.3): prefer the INDEXED `kind = 'claim'` filter introduced by US-40.A4 over an unindexed `key LIKE 'claim:%'` prefix scan — A4's `kind` (panel agreed-gap #7) exists precisely to replace O(n) key-prefix scans at fleet volume. If 40.A4's `kind` has not landed, the `key LIKE 'claim:%'` scan is the fallback, but the indexed kind is the target once available.",
+    "Surface claims in the consumer (US-39.6 SessionStart injection — the retained consumer surface; the running-session turn-boundary pull formerly numbered US-40.3 moved to the claude-config companion, so target US-39.6 / the companion, NOT the removed US-40.3): filter advisory locks by their `key LIKE 'claim:%'` prefix. There is NO `kind` column (the owner's 'no message types' decision stands — 40.A4 was cut). If the prefix scan needs to scale, add a PARTIAL index `WHERE key LIKE 'claim:%'` on the lock's scoping columns — same left-anchored-prefix + partial-index approach 40.C1 uses for handoff discovery — rather than a message-type column.",
     "MCP: claim/release tools; both agent key.",
     "Explicitly advisory: no server-side edit prevention — this is coordination, not a mutex."
   ],

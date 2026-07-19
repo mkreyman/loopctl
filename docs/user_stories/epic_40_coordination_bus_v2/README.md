@@ -45,7 +45,7 @@ carried over. `40.A2` was DROPPED at sign-off (see below).
 |-------|-------|
 | **40.A1** | `refs` as a typed-open LIST `[{type,value,label?}]` + scan type/value/label + count cap (the one genuine shipped defect) |
 | **40.A3** | Drop the redundant `channel_posts_recent_idx` (write-amplification bug fix) |
-| **40.A4** ⚠️ | Optional open indexed `kind` for read-routing (NOT an enum, NOT retention-tied). **BLOCKED: OPEN owner-decision gate** — see below; also adds AC-40.A4.5 (server-enforced non-null key for `kind=handoff`) that makes 40.C1's exactly-once discovery join sound. |
+| *(40.A4 — CUT)* | A `kind` read-routing column was proposed by the panel and **declined by the owner** (2026-07-18): message types stay out. Handoff/claim identity is the stable `handoff:` / `claim:` **key prefix** (partial-indexed), not a type column — so there is no separate "require a key" enforcement either (a handoff IS a `handoff:`-keyed post). |
 | **40.A5** | Advisory addressing: `to_host` / `to_capability` (surfacing-only, never authz) |
 
 ### Group B — Claim / exactly-once lifecycle
@@ -57,7 +57,7 @@ carried over. `40.A2` was DROPPED at sign-off (see below).
 ### Group C — Discovery & delivery
 | Story | Title |
 |-------|-------|
-| **40.C1** | Directed-handoff discovery read: open/unclaimed handoffs for me/my capability (kind + addressing + NOT EXISTS open claim), pinned above recency |
+| **40.C1** | Directed-handoff discovery read: open/unclaimed handoffs for me/my capability (`handoff:` key-prefix + addressing + NOT EXISTS open claim), pinned above recency |
 | **40.C2** | Delta/cursor read on `(inserted_at, seq)` + commit-lag lost-write fix + previews-not-bodies (**supersedes old US-40.5**) |
 
 ### Group D — Security guardrails (load-bearing; from the security-adversary)
@@ -80,15 +80,12 @@ rather than a separate story. Numbering is intentional, not an omission.)*
 
 ## Blocking gates (must clear before the gated stories are implemented)
 
-- **40.A4 — OPEN owner-decision gate (blocks A4 and, transitively, C1).** `us_40.a4.json`
-  carries an `owner_decision_conflict` marked **OPEN**: reintroducing an indexed `kind`
-  un-bundles the owner's locked "no message kind" decision
-  (docs/repo-coordination-bus.md §3.2 / §7 decision 5) on panel authority, which only the
-  owner can authorize. **A4 must NOT be implemented until Mark signs off** on the
-  routing-only `kind` (and the doc is amended + added to "Signed-off decisions folded in").
-  Because **40.C1 depends on 40.A4**, the entire directed-discovery half (C1) is blocked
-  behind this gate too. This is NOT a panel-decided fold-in — do not treat A4/C1 as
-  ordinary committed work until the gate clears.
+- **40.A4 (`kind` column) — RESOLVED: CUT.** The panel proposed an indexed read-routing
+  `kind` column; the owner declined (2026-07-18) — the "no message types" decision stands.
+  Discovery/routing uses the stable `handoff:` / `claim:` **key prefix** (partial-indexed),
+  not a type column, so 40.C1 no longer depends on A4 and the directed-discovery half is
+  unblocked. (A handoff IS a `handoff:`-keyed post, so C1's claim-join stays sound with no
+  separate key-presence enforcement.)
 - **40.B1 claim writes — membership gate coupling (see D3).** B1 now depends on 40.D3 so
   claim/release/done ship membership-gated; D3's shared predicate lands with or before
   B1's claim writes (see the dependency-edges note above).
@@ -102,16 +99,15 @@ rather than a separate story. Numbering is intentional, not an omission.)*
 5. **40.B1 + 40.B2** (claim table + idempotency) — B1's claim writes are membership-gated
    by 40.D3's shared predicate, so land D3's `project_writable_by_agent` with or before
    this step (B1 → 40.D3)
-6. **40.A4 + 40.A5** (`kind` + advisory addressing) — ⚠️ **40.A4 is BLOCKED on the OPEN
-   owner-decision gate** (see "Blocking gates"); do not implement A4 until Mark signs off
-7. **40.C1** (directed discovery — composes A4 + A5 + B1) — transitively blocked by the
-   A4 owner gate; A4.5's server-enforced handoff key is what makes C1's exactly-once join
-   sound
+6. **40.A5** (advisory addressing `to_host` / `to_capability`) — *(40.A4 `kind` was cut)*
+7. **40.C1** (directed discovery — composes the `handoff:` key-prefix + A5 + B1); the
+   `handoff:` key both identifies a handoff and is the claim-join ref, so the exactly-once
+   join is sound with no `kind` column and no separate key-presence rule
 8. *(turn-boundary push + subscription + skill-awareness → claude-config companion)*
 9. **40.D2 + 40.D3 + 40.D5** (delete gate, write scoping, read limits)
 10. **40.E1** (graduate bridge) → then **US-40.7** (retirement, hard-gated)
 
-Dependency edges encoded in the JSON: 40.B2→40.B1; 40.B1→40.D3; 40.C2→40.D1; 40.C1→{40.A4,40.A5,40.B1,40.B2,40.D1};
+Dependency edges encoded in the JSON: 40.B2→40.B1; 40.B1→40.D3; 40.C2→40.D1; 40.C1→{40.A5,40.B1,40.B2,40.D1};
 40.D5→40.D1; 40.E1→{40.D1,40.D3}; US-40.7→40.E1. (40.B1 depends on 40.D3 because the
 CLAIM writes (claim/release/done) must be membership-gated by the SAME
 `project_writable_by_agent` predicate 40.D3 adds to the post write — otherwise a
@@ -136,7 +132,7 @@ Epic 39 code).
 | US-40.5 pagination | **Superseded → 40.C2** (its `(inserted_at, id)` keyset was a panel-rejected defect; C2 keysets on `(inserted_at, seq)` + fixes the lost-write hazard). File `us_40.5.json` removed. |
 | US-40.6 SSE dashboard | **DEFERRED** (kept as `us_40.6.json`, marked deferred). |
 | US-40.7 retirement | **Carried over**, essentially unchanged (deps repointed to 40.E1). |
-| — | **New:** 40.A1, 40.A3, 40.A4, 40.A5, 40.B1, 40.B2, 40.C1, 40.C2, 40.D1, 40.D2, 40.D3, 40.D5. |
+| — | **New:** 40.A1, 40.A3, 40.A5, 40.B1, 40.B2, 40.C1, 40.C2, 40.D1, 40.D2, 40.D3, 40.D5. *(40.A4 `kind` was proposed by the panel, then cut — owner declined message types.)* |
 
 ## Deferred (on their own merits — not "solo")
 
@@ -162,11 +158,11 @@ Epic 39 code).
 - **US-40.4 Advisory file soft-locks** (`us_40.4.json`) — **Retained + clarified**
   (advisory, non-exclusive collision-avoidance on FILE targets; explicitly NOT the
   exactly-once handoff claim, which is 40.B1). It builds only on shipped Epic 39 code
-  (channel_posts + a short TTL) plus the indexed `kind='claim'` filter once 40.A4 lands,
-  so it has no in-epic prerequisite beyond A4's `kind` (falls back to a `key LIKE 'claim:%'`
-  scan if A4 has not landed). It is NOT on the numbered A–E claim/discovery sequence; land
-  it any time AFTER 40.A4 (step 6). Distinct from the Deferred set (40.2, 40.6) — it IS in
-  scope, just off the critical path.
+  (channel_posts + a short TTL); advisory locks are identified by a `key LIKE 'claim:%'`
+  prefix (partial-indexed if it needs to scale — same approach 40.C1 uses for `handoff:`),
+  NOT a `kind` column. It has no in-epic prerequisite and is NOT on the numbered A–E
+  claim/discovery sequence; land it any time. Distinct from the Deferred set (40.2, 40.6) —
+  it IS in scope, just off the critical path.
 
 ## Signed-off decisions folded in
 
@@ -197,7 +193,7 @@ The client/skill half is a separate claude-config work item, NOT loopctl server 
   out of push, keeps pull membership) + skill-awareness (actively check for directed
   handoffs during long work; claim before acting).
 - **The `/handoff` skill** — write payload to the durable home → post a keyed pointer
-  (`kind=handoff`, `to_capability`, refs anchor, stable `handoff:<anchor>` key, TL;DR body)
+  (stable `handoff:<anchor>` key — which IS the handoff's identity, `to_capability`, refs anchor, TL;DR body)
   → receiver discovers (40.C1), claims (40.B1), acts, marks done.
 - SessionStart injection (US-39.6) already shipped.
 
