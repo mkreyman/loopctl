@@ -7,6 +7,7 @@ defmodule Loopctl.CoordinationTest do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelPost
+  alias Loopctl.Progress
   alias Loopctl.Repo
 
   describe "create_post/4" do
@@ -1123,6 +1124,60 @@ defmodule Loopctl.CoordinationTest do
                Coordination.post(tenant.id, agent_id, :orchestrator, %{
                  project_id: project.id,
                  body: "orchestrator post",
+                 audit: audit
+               })
+    end
+
+    # ACCEPTED RISK (AC-40.D3.4) — documents the signed-off residual, does NOT
+    # assert a bug is fixed. Membership derives from `stories.assigned_agent_id`,
+    # and claiming is self-service for the `:agent` role — so a compromised agent
+    # key can bootstrap its own membership of any sibling project that carries a
+    # claimable pending story, then post into that channel. This is a DELIBERATE
+    # accepted risk (see the `Loopctl.Coordination` moduledoc + docs/repo-
+    # coordination-bus.md sign-off): the claim is an audited, work-hijacking state
+    # change (observable), each post is blast-bounded by the 512-byte preview, and
+    # the durable closure — binding a claim to a dispatch lineage — is Chain of
+    # Custody v2 (Epic 26). This guard runs the REAL self-service contract + claim
+    # flow and will break DELIBERATELY when Epic 26 tightens the claim path, forcing
+    # a conscious revisit rather than a silent regression.
+    test "ACCEPTED RISK (AC-40.D3.4): an :agent self-grants sibling-project membership by claiming a pending story there",
+         ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+      sibling = fixture(:project, %{tenant_id: tenant.id})
+
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          project_id: sibling.id,
+          agent_status: :pending
+        })
+
+      # Before the self-claim the agent is a non-member of the sibling: default-deny.
+      assert {:error, :not_found} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: sibling.id,
+                 body: "pre-claim injection attempt",
+                 audit: audit
+               })
+
+      # Self-service contract + claim — no dispatch, no operator. The contract echo
+      # (story_title/ac_count) is an anti-confusion check, not an authorization
+      # barrier, so it is skipped here; `claim_story` sets `assigned_agent_id` to
+      # the caller itself with no check that the work was dispatched to it.
+      assert {:ok, _} =
+               Progress.contract_story(tenant.id, story.id, %{},
+                 agent_id: agent_id,
+                 skip_contract_check: true
+               )
+
+      assert {:ok, _} = Progress.claim_story(tenant.id, story.id, agent_id: agent_id)
+
+      # Having self-granted membership, the same agent can now post into the
+      # sibling project's channel. Accepted residual — closure is Epic 26.
+      assert {:ok, _post, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: sibling.id,
+                 body: "post-claim: membership self-granted",
                  audit: audit
                })
     end

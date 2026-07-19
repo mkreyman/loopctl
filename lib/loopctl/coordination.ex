@@ -169,6 +169,60 @@ defmodule Loopctl.Coordination do
   a missing project or foreign-tenant agent still surface their own distinct
   errors first.
 
+  ## Accepted risk — signed-off residual (AC-40.D3.4)
+
+  AC-40.D3.4 requires that any residual hole left by choosing the story-assignment
+  membership model (rather than a full, non-self-grantable membership relation) be
+  a DELIBERATE, documented sign-off — never a silent no-op. Two residuals are
+  accepted here, both consciously, both observable:
+
+    1. **Membership is SELF-GRANTABLE via the claim path.** `assigned_agent_id` is
+       set by `Progress.claim_story/3`, and claiming is self-service for the
+       `:agent` role (`POST /stories/:id/contract` then `/claim`). So a compromised
+       `:agent` key CAN, within its own tenant, contract + claim a pending story in
+       a sibling project P2 to make itself a member of P2, then post into P2's
+       channel — narrowing but not fully closing the tenant-wide injection vector
+       this story targets. This is accepted because: (a) the claim is a
+       state-mutating, AUDITED event (`Audit.log_in_multi`) that HIJACKS real work
+       (a claimable/dependency-satisfied story must exist in P2), so the bootstrap
+       is observable and disruptive, not silent; (b) the injection blast radius per
+       post is already bounded by the 512-byte SessionStart preview (`@preview_bytes`);
+       and (c) the FULL closure — binding a claim to a dispatch lineage so an agent
+       may only claim work DISPATCHED to it — is Chain of Custody v2 (Epic 26,
+       `docs/chain-of-custody-v2.md` L4; `dispatches.lineage_path`). That is out of
+       scope for US-40.D3 and cannot be relied on yet: legacy env-var agent keys
+       (with no dispatch) remain valid through the Epic 26 deprecation window, so a
+       dispatch-only membership source would deny the still-supported legacy path.
+       The compensating control named by decision 2 is per-project-scoped agent
+       keys; dispatch-lineage-bound claiming is the durable fix. The "ACCEPTED RISK
+       (AC-40.D3.4)" test in `coordination_test.exs` runs the real self-service
+       contract + claim flow to keep this accepted behavior VISIBLE — it will break,
+       DELIBERATELY, when Epic 26 binds the claim path to a dispatch lineage, forcing
+       a conscious revisit rather than a silent regression.
+
+    2. **Membership tracks the CURRENT assignment only**, so the surface is narrower
+       than the pre-US-40.D3 tenant-wide bus: an agent posting BEFORE it claims a
+       story, a distinct REVIEWER/verifier agent (`reviewer_agent_id` differs from
+       `assigned_agent_id`), and an `:orchestrator`-role key carrying an agent
+       identity (level 2, below the `:user` bypass) are all default-denied without a
+       current assignment; and releasing the only story in a project
+       (`unclaim_story`/`force_unclaim_story` null `assigned_agent_id`) revokes write
+       access, so a "released, blocked on X" follow-up cannot be posted. (`report_story`
+       does NOT null the assignment, so the normal reported_done/verify flow keeps
+       write access.) These denials all collapse to the same oracle-safe 422, so they
+       are unobservable to the caller — accepted under the default-deny decision-2
+       model and flagged here as a heads-up for the US-40.B1 claim/release coupling.
+
+  ## Coupling (US-40.B1 / US-40.E1)
+
+  This predicate is SHARED: the claim writes (US-40.B1 claim/release/done) and the
+  graduate write (US-40.E1) MUST gate through `project_writable_by_agent/4`. Note
+  the deliberate non-circularity for the CLAIM gate: claiming a story is HOW an
+  agent obtains assignment-membership, so gating the coordination-CLAIM write on
+  membership does not gate the story-`claim_story` transition itself — 40.B1 must
+  ensure it does not create a bootstrap where you need membership to claim the very
+  work that would grant it.
+
   ## Upsert semantics
 
   With a `key` present the write UPSERTS on the LIVE partial unique index
@@ -231,6 +285,20 @@ defmodule Loopctl.Coordination do
     # "not a member" vs "not your tenant" oracle. This runs LAST so a missing
     # project (:not_found) and a foreign-tenant agent (:agent_not_found) keep
     # their distinct, correctly-attributed errors.
+    #
+    # DELIBERATELY outside the `run_post/3` insert transaction — like the sibling
+    # `Projects.get_project/2` and `agent_owned/2` guards above it. This is a
+    # benign, accepted TOCTOU: a concurrent story unclaim/reassign between this
+    # read and the insert can let a post commit on just-stale membership (or deny a
+    # just-assigned agent). It is NOT a correctness or security defect — membership
+    # WAS true at check time, so which side of the microsecond boundary the commit
+    # lands on is semantically irrelevant (the same post one tick earlier is
+    # unarguably authorized), and the worst case is a single stale-authorized or
+    # stale-denied post, never a cross-tenant/cross-project escalation (the tenant
+    # and project predicates are re-evaluated by the insert's own FKs/columns).
+    # Folding the check into the transaction would not close the window (READ
+    # COMMITTED still lets a concurrent unclaim commit between the two statements)
+    # and would only add coupling — so it stays a pre-flight guard.
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- agent_owned(tenant_id, agent_id),
          :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role) do
@@ -299,7 +367,11 @@ defmodule Loopctl.Coordination do
   # in the project. Runs on `AdminRepo` (BYPASSRLS) with an EXPLICIT `tenant_id`
   # filter — the module's isolation convention; omitting it would be a cross-tenant
   # bug. `exists?` compiles to `SELECT 1 ... LIMIT 1`, so it never materializes rows.
-  # Source table: `stories` (`Loopctl.WorkBreakdown.Story`).
+  # Source table: `stories` (`Loopctl.WorkBreakdown.Story`). The 3-predicate probe
+  # is backed by the composite `stories_assigned_agent_project_idx` on
+  # `(assigned_agent_id, project_id)` (migration 20260719120000) so it seeks
+  # straight to the pair and stays flat even for an agent with many assignments,
+  # rather than seeking on `assigned_agent_id` alone and heap-rechecking project.
   defp agent_member_of_project?(tenant_id, agent_id, project_id) do
     Story
     |> where(
