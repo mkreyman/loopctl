@@ -926,10 +926,31 @@ defmodule Loopctl.ApiSpec.Schemas do
         },
         host: %Schema{type: :string, nullable: true, description: "Client-supplied hostname"},
         refs: %Schema{
-          type: :object,
+          type: :array,
           nullable: true,
-          description: "Optional structured refs; allowed keys: file, pr, branch, commit",
-          additionalProperties: %Schema{type: :string}
+          description:
+            "Optional bounded, typed-open LIST of reference items (max 50). Each item is " <>
+              "{type, value, label?}: type is a FREE string (<=64 bytes, no allowlist), value " <>
+              "<=512 bytes, optional label <=128 bytes. A secret/NUL byte in ANY item field is " <>
+              "rejected (422).",
+          items: %Schema{
+            type: :object,
+            required: [:type, :value],
+            # The server rejects any item carrying a key other than type/value/label
+            # (an extra key would be an unscanned exfil field) with a 422 — see
+            # `ChannelPost.valid_ref_item?/1`. Publish that strictness so a client
+            # following the contract does not add a field the spec calls legal.
+            additionalProperties: false,
+            properties: %{
+              type: %Schema{type: :string, description: "Free-form ref type (<=64 bytes)"},
+              value: %Schema{type: :string, description: "Ref value (<=512 bytes)"},
+              label: %Schema{
+                type: :string,
+                nullable: true,
+                description: "Optional human label (<=128 bytes)"
+              }
+            }
+          }
         }
       },
       example: %{
@@ -937,7 +958,10 @@ defmodule Loopctl.ApiSpec.Schemas do
         body: "pushed PR #107, CI green",
         key: "session_goal",
         session_id: "S1",
-        refs: %{pr: "107", branch: "feature/us-39-2"}
+        refs: [
+          %{type: "pr", value: "107"},
+          %{type: "file", value: "lib/fly/auth.ex:42", label: "the failing call"}
+        ]
       }
     })
   end
@@ -962,7 +986,11 @@ defmodule Loopctl.ApiSpec.Schemas do
             host: %Schema{type: :string, nullable: true},
             key: %Schema{type: :string, nullable: true},
             body: %Schema{type: :string},
-            refs: %Schema{type: :object, nullable: true, additionalProperties: true},
+            refs: %Schema{
+              type: :array,
+              nullable: true,
+              items: %Schema{type: :object, additionalProperties: true}
+            },
             expires_at: %Schema{type: :string, format: :"date-time"},
             inserted_at: %Schema{type: :string, format: :"date-time"},
             updated_at: %Schema{type: :string, format: :"date-time"}
@@ -990,7 +1018,11 @@ defmodule Loopctl.ApiSpec.Schemas do
         host: %Schema{type: :string, nullable: true},
         key: %Schema{type: :string, nullable: true},
         body: %Schema{type: :string},
-        refs: %Schema{type: :object, nullable: true, additionalProperties: true},
+        refs: %Schema{
+          type: :array,
+          nullable: true,
+          items: %Schema{type: :object, additionalProperties: true}
+        },
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
       }

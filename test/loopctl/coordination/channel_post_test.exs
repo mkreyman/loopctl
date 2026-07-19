@@ -72,22 +72,159 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       assert %{body: _} = errors_on(cs)
     end
 
-    test "rejects refs with a key outside the allowlist" do
+    # TC-40.A1.1 — a multi-item typed-open list is accepted and round-trips as the list.
+    test "accepts a multi-item typed-open refs list" do
+      refs = [
+        %{"type" => "issue", "value" => "#812"},
+        %{"type" => "file", "value" => "lib/a.ex:1", "label" => "the failing call"},
+        %{"type" => "commit", "value" => "abc123"}
+      ]
+
+      cs = ChannelPost.create_changeset(base_struct(), %{"body" => "ok", "refs" => refs})
+      assert cs.valid?
+      assert Ecto.Changeset.get_field(cs, :refs) == refs
+    end
+
+    # TC-40.A1.2 — the fixed-key allowlist is GONE; a free `type` is accepted.
+    test "accepts a free ref type not in the old allowlist" do
       cs =
         ChannelPost.create_changeset(base_struct(), %{
           "body" => "ok",
-          "refs" => %{"evil" => "value"}
+          "refs" => [%{"type" => "capability", "value" => "read:secrets"}]
+        })
+
+      assert cs.valid?
+    end
+
+    # TC-40.A1.5 — the explicit item-count cap (not just the byte backstop).
+    test "rejects a refs list over the item-count cap" do
+      over =
+        for i <- 1..(ChannelPost.refs_max_items() + 1), do: %{"type" => "t", "value" => "#{i}"}
+
+      cs = ChannelPost.create_changeset(base_struct(), %{"body" => "ok", "refs" => over})
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "accepts a refs list exactly at the item-count cap" do
+      at = for i <- 1..ChannelPost.refs_max_items(), do: %{"type" => "t", "value" => "#{i}"}
+      cs = ChannelPost.create_changeset(base_struct(), %{"body" => "ok", "refs" => at})
+      assert cs.valid?
+    end
+
+    # TC-40.A1.6 — malformed items are 422 changeset errors, never a 500.
+    test "rejects malformed refs items as 422, not a crash" do
+      # item missing a required `type`
+      cs_missing =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"value" => "x"}]
+        })
+
+      refute cs_missing.valid?
+      assert %{refs: _} = errors_on(cs_missing)
+
+      # items that are not maps
+      cs_scalars =
+        ChannelPost.create_changeset(base_struct(), %{"body" => "ok", "refs" => ["a", "b"]})
+
+      refute cs_scalars.valid?
+      assert %{refs: _} = errors_on(cs_scalars)
+
+      # a non-list refs value (cast-level rejection, still a 422 not a 500)
+      cs_nonlist =
+        ChannelPost.create_changeset(base_struct(), %{"body" => "ok", "refs" => %{"file" => "x"}})
+
+      refute cs_nonlist.valid?
+      assert %{refs: _} = errors_on(cs_nonlist)
+    end
+
+    test "rejects a ref item carrying an unexpected key (no unscanned exfil field)" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => "file", "value" => "x", "evil" => "y"}]
         })
 
       refute cs.valid?
       assert %{refs: _} = errors_on(cs)
     end
 
-    test "rejects an over-large refs value" do
+    # AC-40.A1.4 — a non-string field (a scalar number, or a nested map/list value)
+    # in an otherwise well-shaped item is malformed and must be rejected as a 422,
+    # not persisted or crashed. The `is_binary` guard in valid_ref_field?/2 (and the
+    # nil clause in valid_ref_label?/1) handle it; this pins the AC-named edge case.
+    test "rejects a non-string ref value (number)" do
       cs =
         ChannelPost.create_changeset(base_struct(), %{
           "body" => "ok",
-          "refs" => %{"branch" => String.duplicate("x", 9_000)}
+          "refs" => [%{"type" => "file", "value" => 123}]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "rejects a non-string ref type (number)" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => 7, "value" => "x"}]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "rejects a nested (non-string) ref value" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => "file", "value" => %{"nested" => "obj"}}]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "rejects a non-string ref label" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => "file", "value" => "x", "label" => 99}]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "rejects an over-length ref type" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => String.duplicate("t", 65), "value" => "x"}]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "rejects an over-length ref value" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => "branch", "value" => String.duplicate("x", 513)}]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "rejects an over-length ref label" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => "file", "value" => "x", "label" => String.duplicate("l", 129)}]
         })
 
       refute cs.valid?
@@ -145,7 +282,7 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       end
     end
 
-    test "refs value cap is byte-based, not grapheme-based" do
+    test "ref value cap is byte-based, not grapheme-based" do
       # 200 four-byte chars = 800 bytes > 512, but only 200 graphemes — a
       # grapheme-based cap would wrongly accept it.
       val = String.duplicate("😀", 200)
@@ -155,7 +292,7 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       cs =
         ChannelPost.create_changeset(base_struct(), %{
           "body" => "ok",
-          "refs" => %{"branch" => val}
+          "refs" => [%{"type" => "branch", "value" => val}]
         })
 
       refute cs.valid?
@@ -191,8 +328,8 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       assert Enum.any?(errors_on(cs).host, &(&1 =~ "byte"))
     end
 
-    test "an oversized refs value cannot bypass the secret scan cap" do
-      # refs values are also scanned over a bounded slice — an oversized refs value
+    test "an oversized ref value cannot bypass the secret scan cap" do
+      # ref fields are also scanned over a bounded slice — an oversized ref value
       # (rejected by validate_refs) does not amplify the denylist scan, and a
       # credential in its leading bytes is still detected.
       big_ref = "sk-" <> String.duplicate("a", 2_000)
@@ -200,7 +337,7 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       cs =
         ChannelPost.create_changeset(base_struct(), %{
           "body" => "ok",
-          "refs" => %{"file" => big_ref}
+          "refs" => [%{"type" => "file", "value" => big_ref}]
         })
 
       refute cs.valid?
@@ -237,15 +374,35 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       assert %{body: _} = errors_on(cs)
     end
 
-    test "rejects a NUL byte in a refs value (jsonb would 500 otherwise)" do
+    test "rejects a NUL byte in a ref value (jsonb would 500 otherwise)" do
       cs =
         ChannelPost.create_changeset(base_struct(), %{
           "body" => "ok",
-          "refs" => %{"branch" => "main" <> <<0>> <> "x"}
+          "refs" => [%{"type" => "branch", "value" => "main" <> <<0>> <> "x"}]
         })
 
       refute cs.valid?
       assert %{refs: _} = errors_on(cs)
+    end
+
+    test "rejects a NUL byte in a ref type or label" do
+      cs_type =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => "br" <> <<0>> <> "anch", "value" => "x"}]
+        })
+
+      refute cs_type.valid?
+      assert %{refs: _} = errors_on(cs_type)
+
+      cs_label =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => "file", "value" => "x", "label" => "a" <> <<0>> <> "b"}]
+        })
+
+      refute cs_label.valid?
+      assert %{refs: _} = errors_on(cs_label)
     end
 
     test "rejects a NUL byte in session_id" do
@@ -271,15 +428,72 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       assert %{body: _} = errors_on(cs)
     end
 
-    test "rejects a secret in a refs value" do
+    test "rejects a secret in a ref value" do
       cs =
         ChannelPost.create_changeset(base_struct(), %{
           "body" => "ok",
-          "refs" => %{"branch" => "lc_" <> String.duplicate("a", 30)}
+          "refs" => [%{"type" => "branch", "value" => "lc_" <> String.duplicate("a", 30)}]
         })
 
       refute cs.valid?
       assert %{refs: _} = errors_on(cs)
+    end
+
+    # TC-40.A1.3 — a secret in a ref TYPE is scanned + rejected (keys are now
+    # attacker-writable), exactly as one in `value`.
+    test "rejects a secret in a ref type" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => "lc_" <> String.duplicate("a", 30), "value" => "x"}]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    # TC-40.A1.4 — a secret in a ref LABEL is scanned + rejected.
+    test "rejects a secret in a ref label" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [
+            %{"type" => "file", "value" => "x", "label" => "sk-" <> String.duplicate("a", 30)}
+          ]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    # The refs secret hit fires the operator-visible secret_blocked signal on the
+    # :refs field (the rejection path), same as a body hit.
+    test "a secret in a ref field fires the secret_blocked signal for :refs" do
+      struct = base_struct()
+      tenant_id = struct.tenant_id
+      handler_id = "chanpost-refs-secret-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :coordination, :secret_blocked],
+        fn _event, _measurements, meta, _cfg ->
+          if meta[:tenant_id] == tenant_id and meta[:field] == :refs,
+            do: send(test_pid, :refs_secret_blocked)
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      cs =
+        ChannelPost.create_changeset(struct, %{
+          "body" => "ok",
+          "refs" => [%{"type" => "lc_" <> String.duplicate("a", 30), "value" => "x"}]
+        })
+
+      ChannelPost.emit_secret_blocked_events(cs)
+      assert_receive :refs_secret_blocked, 100
     end
 
     test "rejects a secret in the key" do

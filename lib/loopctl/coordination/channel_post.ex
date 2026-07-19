@@ -38,6 +38,7 @@ defmodule Loopctl.Coordination.ChannelPost do
 
   require Logger
 
+  alias Loopctl.Coordination.RefsList
   alias Loopctl.Security.SecretDenylist
 
   @type t :: %__MODULE__{}
@@ -46,9 +47,30 @@ defmodule Loopctl.Coordination.ChannelPost do
   @key_max_length 200
   @session_id_max_length 200
   @host_max_length 255
+
+  # `refs` is a bounded, typed-OPEN LIST of reference items
+  # `[%{"type" => string, "value" => string, "label" => string?}]` (US-40.A1). The
+  # item-COUNT cap is the PRIMARY bound; the serialized-bytes ceiling is secondary.
+  #
+  #   * <= @refs_max_items (50) items — the primary fan-out/injection bound (do NOT
+  #     rely on the byte backstop alone: at ~16KB it caps at an obscure ~32 items
+  #     and is an amplifier).
+  #   * per item: `type` <= 64 bytes, `value` <= 512 bytes, optional `label` <= 128
+  #     bytes — all FREE strings (no key allowlist; `type` is caller-chosen).
+  #   * total serialized JSON <= @refs_serialized_max_bytes. Sized for the 50-item
+  #     cap: worst case 50 * ({"type":"<=64>","value":"<=512>","label":"<=128>"})
+  #     ~= 37KB, so the ceiling is set above that (48KB) to never reject a legit
+  #     50-item post while still bounding a pathological payload.
+  @ref_type_max_length 64
   @ref_value_max_length 512
-  @refs_serialized_max_bytes 4_096
-  @allowed_ref_keys ~w(file pr branch commit)
+  @ref_label_max_length 128
+  @refs_max_items 50
+  @refs_serialized_max_bytes 49_152
+
+  # The ONLY keys a ref item may carry. Enforced so an item cannot smuggle an extra,
+  # UNSCANNED field onto the 30-day cross-session bus (the secret/NUL scan below
+  # only walks these three keys).
+  @allowed_ref_item_keys ~w(type value label)
 
   @secret_error_message "must not contain a secret or credential"
 
@@ -80,7 +102,7 @@ defmodule Loopctl.Coordination.ChannelPost do
     field :host, :string
     field :key, :string
     field :body, :string
-    field :refs, :map
+    field :refs, RefsList
 
     field :expires_at, :utc_datetime_usec
 
@@ -101,12 +123,14 @@ defmodule Loopctl.Coordination.ChannelPost do
   against a context bug — they are never castable.
 
   Enforces the size/shape bounds (`body` <= 16KB, `key` <= 200 bytes,
-  `session_id` <= 200 bytes, `host` <= 255 bytes, constrained `refs`), rejects
-  NUL bytes in every text field (Postgres cannot store them — the guard turns a
-  raw 500 into a 422), and runs the shared secret denylist over `body`, `key`,
-  `session_id`, `host`, and every `refs` value — a match rejects the write
-  (surfaced as a 422) rather than silently dropping the content or leaking a
-  credential onto the shared, cross-session-readable channel.
+  `session_id` <= 200 bytes, `host` <= 255 bytes, and a bounded typed-open `refs`
+  LIST — at most #{@refs_max_items} items, each `%{"type" => .., "value" => ..,
+  "label"? => ..}` with per-field byte caps), rejects NUL bytes in every text
+  field AND every `refs` item field (Postgres cannot store them — the guard turns
+  a raw 500 into a 422), and runs the shared secret denylist over `body`, `key`,
+  `session_id`, `host`, and EVERY `refs` item field (`type`, `value`, `label`) — a
+  match rejects the write (surfaced as a 422) rather than silently dropping the
+  content or leaking a credential onto the shared, cross-session-readable channel.
 
   A blank (`""`/whitespace-only) `body`, `key`, `session_id`, or `host` is
   normalised to `nil` before the required/uniqueness checks: for `body` this
@@ -148,9 +172,9 @@ defmodule Loopctl.Coordination.ChannelPost do
   @spec body_max_length() :: pos_integer()
   def body_max_length, do: @body_max_length
 
-  @doc "Allowed keys for the `refs` map."
-  @spec allowed_ref_keys() :: [String.t()]
-  def allowed_ref_keys, do: @allowed_ref_keys
+  @doc "Maximum number of items allowed in the `refs` list."
+  @spec refs_max_items() :: pos_integer()
+  def refs_max_items, do: @refs_max_items
 
   # JSON clients routinely send `""` (or whitespace) for an absent field, and in
   # Elixir `""` is truthy — so a blank `key` would force `session_id` to be
@@ -246,19 +270,30 @@ defmodule Loopctl.Coordination.ChannelPost do
     end
   end
 
+  # `refs` is a bounded, typed-OPEN LIST (US-40.A1). The `RefsList` custom type has
+  # already admitted a list (a non-list scalar 422s as a cast error before this
+  # runs); here we enforce the deep invariants and produce SPECIFIC 422 messages.
+  # `cond` order: the item-COUNT cap is checked before per-item shape so a 51-item
+  # payload fails fast on the primary bound; the shape gate must pass before the NUL
+  # scan (which reads item fields); serialized bytes is the secondary ceiling last.
   defp validate_refs(changeset) do
     validate_change(changeset, :refs, fn :refs, refs ->
       cond do
-        not (is_map(refs) and not is_struct(refs)) ->
-          [refs: "must be a map"]
+        not is_list(refs) ->
+          [refs: "must be a list"]
 
-        not (Map.keys(refs) |> Enum.map(&to_string/1) |> Enum.all?(&(&1 in @allowed_ref_keys))) ->
-          [refs: "may only contain keys #{Enum.join(@allowed_ref_keys, ", ")}"]
+        length(refs) > @refs_max_items ->
+          [refs: "must have at most #{@refs_max_items} items"]
 
-        not Enum.all?(Map.values(refs), &valid_ref_value?/1) ->
-          [refs: "values must be strings of at most #{@ref_value_max_length} bytes"]
+        not Enum.all?(refs, &valid_ref_item?/1) ->
+          [
+            refs:
+              "each item must be a map with a string \"type\" (<=#{@ref_type_max_length} bytes) " <>
+                "and \"value\" (<=#{@ref_value_max_length} bytes) and an optional string " <>
+                "\"label\" (<=#{@ref_label_max_length} bytes), and no other keys"
+          ]
 
-        Enum.any?(Map.values(refs), &(is_binary(&1) and String.contains?(&1, <<0>>))) ->
+        Enum.any?(refs, &ref_item_has_null_byte?/1) ->
           # jsonb cannot store a NUL ( ) in a string value — Postgres raises a
           # raw Postgrex.Error (500) at insert. Reject it as a 422 here, matching the
           # text-field NUL guard, so no field is a 500 vector.
@@ -273,13 +308,55 @@ defmodule Loopctl.Coordination.ChannelPost do
     end)
   end
 
-  # Byte-based to match the other text bounds (body/key/session_id/host all use
-  # `validate_length(count: :bytes)`): a grapheme count would let a 512-grapheme
-  # value of multibyte chars blow past the intended per-value storage cap.
-  defp valid_ref_value?(value) when is_binary(value),
-    do: byte_size(value) <= @ref_value_max_length
+  # A valid ref item is a plain map carrying a string `type` and `value` (both
+  # required) and an OPTIONAL string `label` — and NO other keys (an extra key would
+  # be an unscanned exfil field). Missing `type`/`value`, a non-string field, an
+  # over-length field, or an unexpected key all fail → 422.
+  defp valid_ref_item?(item) when is_map(item) and not is_struct(item) do
+    Map.has_key?(item, "type") and Map.has_key?(item, "value") and
+      Enum.all?(Map.keys(item), &(&1 in @allowed_ref_item_keys)) and
+      valid_ref_field?(Map.get(item, "type"), @ref_type_max_length) and
+      valid_ref_field?(Map.get(item, "value"), @ref_value_max_length) and
+      valid_ref_label?(Map.get(item, "label"))
+  end
 
-  defp valid_ref_value?(_), do: false
+  defp valid_ref_item?(_), do: false
+
+  # `label` is optional: absent (`nil`) is fine, otherwise a bounded string.
+  defp valid_ref_label?(nil), do: true
+  defp valid_ref_label?(label), do: valid_ref_field?(label, @ref_label_max_length)
+
+  # Byte-based to match the other text bounds (body/key/session_id/host all use
+  # `validate_length(count: :bytes)`): a grapheme count would let a value of
+  # multibyte chars blow past the intended per-field storage cap.
+  defp valid_ref_field?(value, max) when is_binary(value), do: byte_size(value) <= max
+  defp valid_ref_field?(_, _), do: false
+
+  # True if ANY of a ref item's scanned fields (`type`/`value`/`label`) contains a
+  # NUL byte. Non-map / non-string fields are simply skipped.
+  defp ref_item_has_null_byte?(item) when is_map(item) do
+    item
+    |> Map.take(@allowed_ref_item_keys)
+    |> Map.values()
+    |> Enum.any?(&(is_binary(&1) and String.contains?(&1, <<0>>)))
+  end
+
+  defp ref_item_has_null_byte?(_), do: false
+
+  # Flatten every ref item's scanned string fields (`type`/`value`/`label`) into one
+  # list for the secret denylist scan (AC-40.A1.3) — `nil` labels and any non-string
+  # values drop out via the `is_binary/1` filter.
+  defp flatten_ref_fields(refs) when is_list(refs) do
+    Enum.flat_map(refs, fn
+      item when is_map(item) ->
+        item |> Map.take(@allowed_ref_item_keys) |> Map.values() |> Enum.filter(&is_binary/1)
+
+      _ ->
+        []
+    end)
+  end
+
+  defp flatten_ref_fields(_), do: []
 
   defp refs_serialized_size(refs) do
     case Jason.encode(refs) do
@@ -302,9 +379,30 @@ defmodule Loopctl.Coordination.ChannelPost do
     changeset
     |> add_secret_errors(@scanned_text_fields, &(changeset |> get_field(&1) |> scan_slice()))
     |> add_secret_errors([:refs], fn :refs ->
-      changeset |> get_field(:refs) |> Kernel.||(%{}) |> Map.values() |> Enum.map(&scan_slice/1)
+      # Scan EVERY item field — `type`, `value`, AND `label` — not just values
+      # (AC-40.A1.3): keys/labels are now attacker-writable, so a secret in a ref
+      # `type`/`label` must be rejected exactly as one in `value`. Each field is
+      # `scan_slice/1`'d (bounded scan cost) before the denylist walk.
+      #
+      # Cap the item COUNT at @refs_max_items BEFORE flattening: an over-cap list is
+      # already rejected by `validate_refs/1`, so items past the cap never persist
+      # and need not be scanned. Without this cap the secret scan walks EVERY item
+      # of an arbitrarily long (up to the 2MB-body) list — a per-rejected-request
+      # CPU-amplification surface that the item-count cap exists precisely to bound
+      # (AC-40.A1.2). `Enum.take/2` on a non-list is a no-op via `cap_refs_for_scan/1`.
+      changeset
+      |> get_field(:refs)
+      |> cap_refs_for_scan()
+      |> flatten_ref_fields()
+      |> Enum.map(&scan_slice/1)
     end)
   end
+
+  # Bound the fan-out of the secret scan to the same item-count cap the persist path
+  # enforces: only the first @refs_max_items items can ever land, so scanning more is
+  # wasted work an attacker could weaponise on a rejected request.
+  defp cap_refs_for_scan(refs) when is_list(refs), do: Enum.take(refs, @refs_max_items)
+  defp cap_refs_for_scan(other), do: other
 
   defp add_secret_errors(changeset, fields, extractor) do
     Enum.reduce(fields, changeset, fn field, acc ->

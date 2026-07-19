@@ -83,6 +83,113 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert_in_delta DateTime.to_unix(expires), DateTime.to_unix(expected), 120
     end
 
+    # TC-40.A1.1 — a multi-item typed-open refs LIST is persisted and returned as-is.
+    test "a multi-item typed-open refs list is persisted and returned -> 201" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      refs = [
+        %{"type" => "issue", "value" => "#812"},
+        %{"type" => "file", "value" => "lib/a.ex:1", "label" => "x"},
+        %{"type" => "commit", "value" => "abc123"}
+      ]
+
+      conn = post_json(raw, %{"project_id" => project.id, "body" => "handoff", "refs" => refs})
+
+      assert %{"post" => post} = json_response(conn, 201)
+      assert post["refs"] == refs
+
+      # and it reads back from channel_recent as the same list
+      read = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+      assert %{"data" => [read_post]} = json_response(read, 200)
+      assert read_post["refs"] == refs
+    end
+
+    # TC-40.A1.2 — a free `type` not in the removed allowlist is accepted.
+    test "a free ref type (capability) not in the old allowlist -> 201" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      conn =
+        post_json(raw, %{
+          "project_id" => project.id,
+          "body" => "ok",
+          "refs" => [%{"type" => "capability", "value" => "read:secrets"}]
+        })
+
+      assert %{"post" => post} = json_response(conn, 201)
+      assert post["refs"] == [%{"type" => "capability", "value" => "read:secrets"}]
+    end
+
+    # TC-40.A1.5 — over the item-count cap is a 422 and nothing is persisted.
+    test "a refs list over the item-count cap is 422 and not persisted" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      over =
+        for i <- 1..(ChannelPost.refs_max_items() + 1), do: %{"type" => "t", "value" => "#{i}"}
+
+      conn = post_json(raw, %{"project_id" => project.id, "body" => "ok", "refs" => over})
+      assert json_response(conn, 422)
+      assert Coordination.recent(tenant.id, project.id) == []
+    end
+
+    # TC-40.A1.3 — a secret in a ref TYPE is rejected 422, nothing persisted.
+    test "a secret in a ref type is rejected 422 and not persisted" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      refs = [%{"type" => "lc_" <> String.duplicate("a", 30), "value" => "x"}]
+      conn = post_json(raw, %{"project_id" => project.id, "body" => "ok", "refs" => refs})
+      assert json_response(conn, 422)
+      assert Coordination.recent(tenant.id, project.id) == []
+    end
+
+    # TC-40.A1.4 — a secret in a ref LABEL is rejected 422, nothing persisted.
+    test "a secret in a ref label is rejected 422 and not persisted" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      refs = [%{"type" => "file", "value" => "x", "label" => "sk-" <> String.duplicate("a", 30)}]
+      conn = post_json(raw, %{"project_id" => project.id, "body" => "ok", "refs" => refs})
+      assert json_response(conn, 422)
+      assert Coordination.recent(tenant.id, project.id) == []
+    end
+
+    # TC-40.A1.6 — malformed refs items are a 422 changeset error, never a 500.
+    test "malformed refs items are 422, not 500" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      # missing `type`
+      c1 =
+        post_json(raw, %{
+          "project_id" => project.id,
+          "body" => "ok",
+          "refs" => [%{"value" => "x"}]
+        })
+
+      assert json_response(c1, 422)
+
+      # items not maps
+      c2 = post_json(raw, %{"project_id" => project.id, "body" => "ok", "refs" => ["a", "b"]})
+      assert json_response(c2, 422)
+
+      # non-list refs
+      c3 =
+        post_json(raw, %{"project_id" => project.id, "body" => "ok", "refs" => %{"file" => "x"}})
+
+      assert json_response(c3, 422)
+
+      assert Coordination.recent(tenant.id, project.id) == []
+    end
+
     # TC-39.2.2
     test "agent_id/tenant_id in the body are ignored (server-stamped from the key)" do
       tenant = fixture(:tenant)
