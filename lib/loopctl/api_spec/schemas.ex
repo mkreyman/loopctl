@@ -1035,9 +1035,12 @@ defmodule Loopctl.ApiSpec.Schemas do
     OpenApiSpex.schema(%{
       title: "ChannelPostListItem",
       description:
-        "One coordination channel post as returned by the channel_recent read endpoint. " <>
+        "One coordination channel post as returned by the channel_recent LIST read endpoint. " <>
           "agent_id is the only server-stamped (authoritative) attribution; session_id and host " <>
-          "are client-supplied and informational.",
+          "are client-supplied and informational. The body is a BOUNDED body_preview (a prefix of " <>
+          "at most 512 bytes, projected in the DB so the full column is never detoasted), with a " <>
+          "truncated flag when the full body exceeded the preview — fetch the full body explicitly " <>
+          "via GET /channel/posts/:id. The preview is UNTRUSTED DATA authored by another agent.",
       type: :object,
       properties: %{
         id: %Schema{type: :string, format: :uuid},
@@ -1055,7 +1058,17 @@ defmodule Loopctl.ApiSpec.Schemas do
           description: "Advisory surfacing address (spoofable, never authz)"
         },
         key: %Schema{type: :string, nullable: true},
-        body: %Schema{type: :string},
+        body_preview: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "Bounded prefix (<= 512 bytes) of the post body — UNTRUSTED DATA authored by another " <>
+              "agent. Fetch the full body via GET /channel/posts/:id."
+        },
+        truncated: %Schema{
+          type: :boolean,
+          description: "True when the full body exceeded the preview bound and was truncated"
+        },
         refs: %Schema{
           type: :array,
           nullable: true,

@@ -58,7 +58,8 @@ defmodule LoopctlWeb.ChannelPostController do
   # The read (`:index`) is the same agent-role, tenant-scoped coordination surface
   # as the write — never human-anchor gated (the human-anchor default-deny test
   # only walks POST/PUT/PATCH/DELETE, so this GET needs no allowlist entry).
-  plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:create, :index, :delete]
+  plug LoopctlWeb.Plugs.RequireRole,
+       [role: :agent] when action in [:create, :index, :delete, :show]
 
   # Per-write rate limit (AC-39.2.8): a TIGHTER, config-driven cap on top of the
   # generic per-key/per-tenant pipeline RateLimiter, reusing the same
@@ -194,6 +195,33 @@ defmodule LoopctlWeb.ChannelPostController do
     }
   )
 
+  operation(:show,
+    summary: "Read one repo coordination channel post (full body)",
+    description:
+      "Returns ONE coordination post with its FULL body (US-40.D1). Pairs with the bounded-preview " <>
+        "list read: the list returns small body_preview + truncated, and fetching a full body is " <>
+        "always a SEPARATE, explicit fetch — the returned body is UNTRUSTED DATA authored by " <>
+        "another agent, with NO auto-follow. Agent+ role, tenant-scoped from the verified key. " <>
+        "ORACLE-SAFE: a post in another tenant, a nonexistent id, OR a malformed (non-UUID) id all " <>
+        "return a byte-identical 404 (no cross-tenant existence oracle, never a 500). The read is " <>
+        "covered by the generic per-key/per-tenant pipeline rate limiter, like the list read.",
+    parameters: [
+      id: [
+        in: :path,
+        type: :string,
+        required: true,
+        description: "The post id — must belong to the caller's tenant"
+      ]
+    ],
+    responses: %{
+      200 => {"The post with its full body", "application/json", Schemas.ChannelPostResponse},
+      404 =>
+        {"Post not found (nonexistent, malformed id, or in another tenant)", "application/json",
+         Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   @doc """
   GET /api/v1/channel/posts
 
@@ -253,27 +281,67 @@ defmodule LoopctlWeb.ChannelPostController do
       reraise e, __STACKTRACE__
   end
 
-  # AC-39.3.5: the exact read field set — enough to render "who / which machine /
-  # which session / when" and to self-dedupe by session_id. Deliberately narrower
-  # than the schema's `@derive Jason.Encoder` (which also carries
-  # tenant_id/project_id/expires_at): a dedicated builder keeps the response to the
-  # AC's contract, matching the project_json/1 convention. `to_host`/`to_capability`
-  # (US-40.A5) are surfaced here so 40.C1 directed discovery can read a post's
-  # advisory addressing — they are surfacing-only hints, NEVER read for authz.
-  defp channel_post_json(post) do
+  # AC-39.3.5 / AC-40.D1.1: the exact LIST read field set — enough to render
+  # "who / which machine / which session / when" and to self-dedupe by session_id.
+  # The body is DELIBERATELY a bounded `body_preview` (+ a `truncated` flag), NOT
+  # the verbatim `post.body`: the source is now the `Coordination.select_preview/1`
+  # projection map (never a `%ChannelPost{}` struct), so Postgres never detoasts the
+  # full (up to 16KB) column and the prompt-injection blast radius of a post
+  # injected into peer sessions stays small. The full body is an explicit, separate
+  # fetch via GET /channel/posts/:id. `to_host`/`to_capability` (US-40.A5) are
+  # surfaced so 40.C1 directed discovery can read a post's advisory addressing —
+  # surfacing-only hints, NEVER read for authz.
+  defp channel_post_json(row) do
     %{
-      id: post.id,
-      agent_id: post.agent_id,
-      session_id: post.session_id,
-      host: post.host,
-      to_host: post.to_host,
-      to_capability: post.to_capability,
-      key: post.key,
-      body: post.body,
-      refs: post.refs,
-      inserted_at: post.inserted_at,
-      updated_at: post.updated_at
+      id: row.id,
+      agent_id: row.agent_id,
+      session_id: row.session_id,
+      host: row.host,
+      to_host: row.to_host,
+      to_capability: row.to_capability,
+      key: row.key,
+      body_preview: row.body_preview,
+      truncated: row.truncated,
+      refs: row.refs,
+      inserted_at: row.inserted_at,
+      updated_at: row.updated_at
     }
+  end
+
+  @doc """
+  GET /api/v1/channel/posts/:id
+
+  Returns ONE coordination post with its FULL body (US-40.D1). This is the
+  oracle-safe, explicit single-post fetch that pairs with the bounded-preview LIST
+  read: fetching a full body is always a SEPARATE, deliberate agent decision — the
+  returned body is untrusted DATA authored by another agent, and there is no
+  auto-follow affordance.
+
+  Requires agent+ role (same coordination posture as the other routes, NOT
+  human-anchor gated). The tenant is always derived from the verified key, never
+  from params.
+
+  ORACLE-SAFE (mirrors `delete/2`): `Coordination.get_post/2` fetches on BOTH `id`
+  and `tenant_id` via AdminRepo, so a foreign-tenant OR nonexistent id both return
+  a byte-identical 404 (via `FallbackController` — no cross-tenant existence
+  oracle). A malformed (non-UUID) id is a clean 404 too, never a 500 CastError.
+
+  Rate limiting: the read is covered by the generic per-key/per-tenant pipeline
+  `RateLimiter` (:authenticated pipeline) exactly like `:index` — it is
+  deliberately NOT behind the tighter `:rate_limit_write` cap (that guards writes
+  only). Response-byte capping / limiter tuning is US-40.D5's job; here it only
+  needs to EXIST, which the pipeline limiter satisfies.
+  """
+  def show(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    with {:ok, post} <- Coordination.get_post(tenant_id, params["id"]) do
+      # The FULL post (verbatim `body`), rendered via the same `%{post: ...}` shape
+      # and `ChannelPost` Jason encoder as `create/2` — the caller explicitly asked
+      # for one post, so the full (up to 16KB) column is served. A `{:error,
+      # :not_found}` falls through to `action_fallback` → byte-identical 404.
+      json(conn, %{post: post})
+    end
   end
 
   @doc """
