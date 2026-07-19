@@ -38,6 +38,14 @@ defmodule Loopctl.CoordinationClaimRaceTest do
 
     on_exit(fn ->
       :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+      # Deleting the tenant cascades to channel_claims (FK on_delete: delete_all)
+      # but NOT to audit_log: its tenant FK was dropped in migration
+      # 20260401031345 and audit_log is append-only (a delete-blocking trigger),
+      # so each committed claim's "claimed" audit row is intentionally left as a
+      # dangling-tenant_id orphan. This is the accepted consequence of the
+      # append-only + no-tenant-FK audit design (same as progress/claim_lock_test.exs);
+      # correctness is preserved because every assertion here is tenant-scoped, so
+      # accumulated orphans from prior runs never affect counts. No schema change.
       AdminRepo.delete_all(from(t in Tenant, where: t.id == ^tenant.id))
     end)
 

@@ -528,10 +528,12 @@ defmodule Loopctl.Coordination do
 
   The update and its audit entry run in ONE `AdminRepo.transaction` (Multi).
 
-  Returns `{:ok, %ChannelClaim{}}` (the updated claim) or `{:error, :not_found}`.
+  Returns `{:ok, %ChannelClaim{}}` (the updated claim), `{:error, :not_found}`, or
+  `{:error, %Ecto.Changeset{}}` (the `:audit` Multi step's changeset insert failed —
+  see `run_claim_lifecycle/7`).
   """
   @spec done(Ecto.UUID.t(), Ecto.UUID.t(), term(), term()) ::
-          {:ok, ChannelClaim.t()} | {:error, :not_found}
+          {:ok, ChannelClaim.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
   def done(tenant_id, agent_id, project_id, ref, audit \\ []) do
     case fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
       %ChannelClaim{} = claim ->
@@ -553,10 +555,12 @@ defmodule Loopctl.Coordination do
   `:role` needed). The delete and its audit entry run in ONE
   `AdminRepo.transaction` (Multi).
 
-  Returns `{:ok, %ChannelClaim{}}` (the deleted claim) or `{:error, :not_found}`.
+  Returns `{:ok, %ChannelClaim{}}` (the deleted claim), `{:error, :not_found}`, or
+  `{:error, %Ecto.Changeset{}}` (the `:audit` Multi step's changeset insert failed —
+  see `run_claim_lifecycle/7`).
   """
   @spec release(Ecto.UUID.t(), Ecto.UUID.t(), term(), term()) ::
-          {:ok, ChannelClaim.t()} | {:error, :not_found}
+          {:ok, ChannelClaim.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
   def release(tenant_id, agent_id, project_id, ref, audit \\ []) do
     case fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
       %ChannelClaim{} = claim ->
