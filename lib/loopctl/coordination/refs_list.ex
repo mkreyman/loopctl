@@ -28,17 +28,26 @@ defmodule Loopctl.Coordination.RefsList do
   list unchanged (already string-keyed maps from `jsonb`), which keeps the keyed-
   slot `on_conflict` upsert (`Loopctl.Coordination`) correct.
 
-  ## Legacy-map load coercion (AC-40.A1.5 — no live row breaks)
+  ## Load fail-soft (AC-40.A1.5 — no live row breaks)
 
   Before US-40.A1 `refs` was a fixed-key MAP, and an empty `%{}` was a valid,
-  persistable value. `load/1` therefore ALSO coerces a stored JSON OBJECT into the
-  list form (`%{}` → `[]`, `{file, pr}` → `[{file}, {pr}]`, key-sorted to mirror
-  the data migration) instead of raising. This is defense-in-depth: the
+  persistable value. `load/1` therefore coerces a stored JSON OBJECT into the list
+  form (`%{}` → `[]`, `{file, pr}` → `[{file}, {pr}]`, key-sorted to mirror the
+  data migration) instead of raising. This is defense-in-depth: the
   `ReshapeChannelPostsRefsToList` data migration reshapes every object row, but a
   single legacy row that escaped it (a replica lag, a manual write) must not 500
   the whole channel read — one un-loadable row would deny the coordination bus.
+
+  For completeness the SAME invariant covers an UNEXPECTED stored jsonb SCALAR
+  (string/number/boolean) — a shape neither the old fixed-key map schema nor `up/0`
+  could ever persist, reachable only via corruption or a manual write. Rather than
+  raise an `Ecto` load error and 500 the channel read, `load/1` coerces it to `nil`
+  (an empty ref set) and logs a warning so the corrupt row is surfaced, not
+  silently hidden. Any loadable value is thus one no un-loadable row can deny.
   """
   use Ecto.Type
+
+  require Logger
 
   @impl true
   def type, do: :map
@@ -64,7 +73,17 @@ defmodule Loopctl.Coordination.RefsList do
     {:ok, list}
   end
 
-  def load(_), do: :error
+  # Fail-soft on an unexpected stored jsonb SCALAR (string/number/boolean) — a shape
+  # neither the old map schema nor `up/0` could persist, only reachable via
+  # corruption/manual write. Coerce to `nil` (empty ref set) instead of raising a
+  # load error that would 500 the channel read; log so the corrupt row is surfaced.
+  def load(other) do
+    Logger.warning(
+      "RefsList.load/1 coercing unexpected stored refs value to nil: #{inspect(other)}"
+    )
+
+    {:ok, nil}
+  end
 
   @impl true
   def dump(nil), do: {:ok, nil}

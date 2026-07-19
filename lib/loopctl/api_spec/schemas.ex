@@ -936,6 +936,11 @@ defmodule Loopctl.ApiSpec.Schemas do
           items: %Schema{
             type: :object,
             required: [:type, :value],
+            # The server rejects any item carrying a key other than type/value/label
+            # (an extra key would be an unscanned exfil field) with a 422 — see
+            # `ChannelPost.valid_ref_item?/1`. Publish that strictness so a client
+            # following the contract does not add a field the spec calls legal.
+            additionalProperties: false,
             properties: %{
               type: %Schema{type: :string, description: "Free-form ref type (<=64 bytes)"},
               value: %Schema{type: :string, description: "Ref value (<=512 bytes)"},

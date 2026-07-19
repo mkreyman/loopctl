@@ -16,6 +16,24 @@ defmodule Loopctl.Repo.Migrations.ReshapeChannelPostsRefsToList do
   row MUST be normalised, not just the non-empty ones (AC-40.A1.5: no live row
   breaks). Rows already an array, or NULL, are left untouched. Item order is STABLE
   (`ORDER BY key`, deterministic) so a `{file, pr}` map reshapes to `[{file}, {pr}]`.
+
+  ## `down/0` is INTENTIONALLY LOSSY
+
+  Rolling back folds the list back to a fixed-key map via `jsonb_object_agg(type ->
+  value)`. This is a deliberately lossy inverse because the reshape is an
+  EXPRESSIVENESS EXPANSION the old map shape cannot represent:
+
+    * Multiple items sharing a `type` (the exact multi-issue / multi-`file:line`
+      handoff this story exists to enable) collapse to the LAST value for that key —
+      `[{file:a}, {file:b}]` rolls back to `{"file": "b"}`.
+    * The optional `label` is dropped entirely (`down` folds only `type -> value`).
+
+  This is acceptable: `down/0` exists to restore the OLD SCHEMA shape, not to
+  round-trip data the old schema never supported. The `WHERE item ->> 'type' IS NOT
+  NULL` guard skips any element with a JSON-null `type` (only reachable via a
+  corrupt/manual row — `validate_refs` and `up/0` never emit one) so
+  `jsonb_object_agg` cannot raise `field name must not be null` and abort the
+  rollback.
   """
   use Ecto.Migration
 
@@ -45,6 +63,7 @@ defmodule Loopctl.Repo.Migrations.ReshapeChannelPostsRefsToList do
         SELECT jsonb_object_agg(item ->> 'type', item ->> 'value')
         FROM jsonb_array_elements(refs) AS item
         WHERE item ? 'type' AND item ? 'value'
+          AND item ->> 'type' IS NOT NULL
       ),
       '{}'::jsonb
     )
