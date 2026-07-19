@@ -279,9 +279,10 @@ defmodule Loopctl.TelemetryEvents do
   A KB article WRITE OUTCOME was rendered (PR B2). Emitted from EVERY outcome path of
   `LoopctlWeb.ArticleController.create` — both the create-path renderers (created,
   deduplicated, gated_to_draft, title_conflict, validation_error) AND the upfront
-  rejection paths that return before a create is attempted (system-scope 403,
-  malformed project_id 422, agent-identity-required 403, all counted as
-  `:validation_error`) — so write outcomes are observable even when NOTHING is
+  rejection paths that return before a create is attempted (system-scope 403 and
+  agent-identity-required 403 counted as `:forbidden` — excluded from the
+  high_reject_rate detector; malformed project_id 422 as `:validation_error`) — so
+  write outcomes are observable even when NOTHING is
   persisted (a rejected write leaves no article row). Folded into the durable
   `ingestion_write_stats` per-(tenant, source_type, day) rollup by the self-rescuing
   `Loopctl.Telemetry.IngestionWriteStats` handler, which
