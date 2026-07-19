@@ -88,12 +88,58 @@ defmodule Loopctl.CoordinationClaimTest do
       assert claim_audit_actions(tenant.id, claim.id) == ["claimed"]
     end
 
-    test "the same agent re-claiming its own held ref also -> already_claimed (exactly-once excludes claimant)" do
+    test "the OWNER re-claiming its own still-active ref is idempotent -> {:ok, same claim}" do
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+
+      assert {:ok, first} =
+               Coordination.claim(tenant.id, agent, project.id, "r", role: :agent, audit: audit())
+
+      # A lost-response retry by the TRUE owner returns the SAME claim, not a 409 —
+      # closing the dropped-handoff window (the owner would otherwise be told "another
+      # agent owns this, move on" and abandon a handoff it actually holds).
+      assert {:ok, second} =
+               Coordination.claim(tenant.id, agent, project.id, "r", role: :agent, audit: audit())
+
+      assert second.id == first.id
+      assert second.done_at == nil
+
+      # Still exactly one row, and NO second "claimed" audit entry (nothing changed).
+      assert AdminRepo.aggregate(
+               from(c in ChannelClaim, where: c.ref == "r" and c.tenant_id == ^tenant.id),
+               :count
+             ) == 1
+
+      assert claim_audit_actions(tenant.id, first.id) == ["claimed"]
+    end
+
+    test "a DIFFERENT agent re-claiming the same active ref still -> already_claimed" do
+      %{tenant: tenant, project: project, agent_id: agent_a} = setup_member()
+      agent_b = fixture(:agent, %{tenant_id: tenant.id}).id
+      make_member(tenant, project, agent_b)
+
+      assert {:ok, _} =
+               Coordination.claim(tenant.id, agent_a, project.id, "r",
+                 role: :agent,
+                 audit: audit()
+               )
+
+      assert {:error, :already_claimed} =
+               Coordination.claim(tenant.id, agent_b, project.id, "r",
+                 role: :agent,
+                 audit: audit()
+               )
+    end
+
+    test "the OWNER re-claiming its OWN already-DONE ref -> already_claimed (not reopened)" do
       %{tenant: tenant, project: project, agent_id: agent} = setup_member()
 
       assert {:ok, _} =
                Coordination.claim(tenant.id, agent, project.id, "r", role: :agent, audit: audit())
 
+      assert {:ok, _} = Coordination.done(tenant.id, agent, project.id, "r", audit())
+
+      # Once the owner has marked the ref done, re-claiming does NOT idempotently
+      # reopen it — the completed slot is still occupied.
       assert {:error, :already_claimed} =
                Coordination.claim(tenant.id, agent, project.id, "r", role: :agent, audit: audit())
     end

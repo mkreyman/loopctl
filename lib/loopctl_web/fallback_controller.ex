@@ -80,10 +80,13 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
-  # US-40.B1: a coordination handoff `ref` was already claimed by another agent —
-  # the loser of an INSERT-to-claim race on the (tenant_id, project_id, ref) unique
-  # index. A distinct `code` so a losing agent learns another agent owns the ref and
-  # moves on (never confused with the generic 409 conflict).
+  # US-40.B1: a coordination handoff `ref` is already claimed — the loser of an
+  # INSERT-to-claim race on the (tenant_id, project_id, ref) unique index. A distinct
+  # `code` so a losing agent learns the ref is taken and moves on (never confused with
+  # the generic 409 conflict). The message does NOT assert "another agent": the true
+  # owner re-claiming its own ACTIVE ref is served idempotently (200) upstream, so a
+  # 409 here means either a PEER owns the ref or the caller already completed it — in
+  # both cases the caller should move on rather than retry the same ref.
   def call(conn, {:error, :already_claimed}) do
     conn
     |> put_status(:conflict)
@@ -91,7 +94,8 @@ defmodule LoopctlWeb.FallbackController do
       error: %{
         status: 409,
         code: "already_claimed",
-        message: "This ref has already been claimed by another agent."
+        message:
+          "This ref is already claimed (by another agent, or already completed by you). Do not retry the same ref; move on to other work."
       }
     })
   end

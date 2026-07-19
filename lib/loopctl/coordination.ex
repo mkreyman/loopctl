@@ -480,7 +480,19 @@ defmodule Loopctl.Coordination do
   The insert and its audit entry run in ONE `AdminRepo.transaction` (Multi),
   mirroring `run_post/3`, so a claim is never recorded without an accountable trail.
 
-  Returns `{:ok, %ChannelClaim{}}`, `{:error, :already_claimed}`,
+  ## Idempotent owner re-claim
+
+  INSERT-to-claim is exactly-once, but the OWNER re-claiming its OWN still-active
+  (`done_at IS NULL`) ref is IDEMPOTENT — it returns `{:ok, existing}`, not a 409.
+  This closes a dropped-handoff window: if the winning insert commits but the caller
+  never sees the 201 (a lost HTTP response / MCP timeout), the retry must NOT be told
+  "another agent owns this, move on" — the caller IS the owner and would otherwise
+  abandon a handoff it holds until the lease expires. A genuine racing loser (a peer
+  owns the slot), and the owner re-claiming its OWN already-DONE claim, still get
+  `{:error, :already_claimed}`.
+
+  Returns `{:ok, %ChannelClaim{}}` (fresh claim OR idempotent owner re-claim),
+  `{:error, :already_claimed}`,
   `{:error, :not_found}` (missing/cross-tenant/cross-project),
   `{:error, :agent_not_found}` (foreign-tenant server-stamped agent), or
   `{:error, %Ecto.Changeset{}}` (a bad `ref` — over-length or NUL byte).
@@ -532,7 +544,7 @@ defmodule Loopctl.Coordination do
   `{:error, %Ecto.Changeset{}}` (the `:audit` Multi step's changeset insert failed —
   see `run_claim_lifecycle/7`).
   """
-  @spec done(Ecto.UUID.t(), Ecto.UUID.t(), term(), term()) ::
+  @spec done(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
           {:ok, ChannelClaim.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
   def done(tenant_id, agent_id, project_id, ref, audit \\ []) do
     case fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
@@ -559,7 +571,7 @@ defmodule Loopctl.Coordination do
   `{:error, %Ecto.Changeset{}}` (the `:audit` Multi step's changeset insert failed —
   see `run_claim_lifecycle/7`).
   """
-  @spec release(Ecto.UUID.t(), Ecto.UUID.t(), term(), term()) ::
+  @spec release(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
           {:ok, ChannelClaim.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
   def release(tenant_id, agent_id, project_id, ref, audit \\ []) do
     case fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
@@ -603,12 +615,16 @@ defmodule Loopctl.Coordination do
 
   # Insert + audit in one transaction. A UNIQUE violation on
   # (tenant_id, project_id, ref) — declared as `unique_constraint(:ref, ...)` on the
-  # changeset — is caught by Ecto and returned as an `{:error, :claim, changeset,
-  # _}` carrying that constraint error, which we map to `{:error, :already_claimed}`
-  # (→ 409). A NON-unique changeset error (an over-length or NUL-byte `ref`) is
-  # returned as `{:error, %Ecto.Changeset{}}` (→ 422). The `:already_claimed`
-  # discriminator is the presence of the `:unique` constraint error, NOT a blanket
-  # "any changeset error" — so a validation failure never masquerades as a 409.
+  # changeset — is caught by Ecto and returned as an `{:error, :claim, changeset, _}`
+  # carrying that constraint error. We then DISAMBIGUATE the loser via
+  # `resolve_claim_collision/4`: the true owner re-claiming its own ACTIVE claim (a
+  # lost-response retry) gets an idempotent `{:ok, existing}`, while a genuine racing
+  # loser (or a re-claim of one's own already-done claim) gets `{:error,
+  # :already_claimed}` (→ 409). A NON-unique changeset error (an over-length or
+  # NUL-byte `ref`) is returned as `{:error, %Ecto.Changeset{}}` (→ 422). The
+  # `:already_claimed` discriminator is the presence of the `:unique` constraint
+  # error, NOT a blanket "any changeset error" — so a validation failure never
+  # masquerades as a 409.
   defp run_claim(tenant_id, project_id, agent_id, changeset, audit) do
     multi =
       Multi.new()
@@ -622,7 +638,12 @@ defmodule Loopctl.Coordination do
         {:ok, claim}
 
       {:error, :claim, %Ecto.Changeset{} = changeset, _changes} ->
-        if already_claimed?(changeset), do: {:error, :already_claimed}, else: {:error, changeset}
+        if already_claimed?(changeset) do
+          ref = Ecto.Changeset.get_field(changeset, :ref)
+          resolve_claim_collision(tenant_id, project_id, agent_id, ref)
+        else
+          {:error, changeset}
+        end
 
       # Any OTHER failed step (today only `:audit`, whose sole failure mode is a
       # changeset) is normalised to `{:error, %Ecto.Changeset{}}`. Matching a
@@ -643,6 +664,41 @@ defmodule Loopctl.Coordination do
     Enum.any?(errors, fn {_field, {_msg, opts}} ->
       Keyword.get(opts, :constraint) == :unique
     end)
+  end
+
+  # An INSERT-to-claim lost the (tenant_id, project_id, ref) unique index. That is
+  # EITHER a genuine racing loser (a PEER already owns the slot) OR the TRUE OWNER
+  # re-claiming after a lost response (a dropped 201 / MCP timeout — the insert
+  # committed but the caller never saw the reply). Disambiguate by reading the winning
+  # row: an ACTIVE (done_at IS NULL) claim held by THIS caller is an idempotent owner
+  # re-claim, so return {:ok, existing} — the owner keeps the handoff it actually
+  # holds instead of being falsely told "another agent owns this, move on" and
+  # abandoning it until the lease expires. Anything else (a peer's claim, a
+  # since-released/gone row, or the caller's OWN already-DONE claim) is a real
+  # collision -> {:error, :already_claimed} (409).
+  #
+  # No new TOCTOU window: the unique index still enforces exactly-once at INSERT time;
+  # this read runs AFTER the failed insert only to CLASSIFY the loser, never to decide
+  # whether to insert. A rare concurrent release between the insert and this read
+  # yields a nil lookup -> a safe 409 (the caller retries), never a dropped handoff.
+  defp resolve_claim_collision(tenant_id, project_id, agent_id, ref) do
+    case fetch_claim_by_ref(tenant_id, project_id, ref) do
+      %ChannelClaim{claimant_agent_id: ^agent_id, done_at: nil} = existing -> {:ok, existing}
+      _ -> {:error, :already_claimed}
+    end
+  end
+
+  # Fetch the winning claim for a ref by its (tenant_id, project_id, ref) unique key.
+  # tenant_id/project_id are already validated UUIDs (claim/5 resolved the project) and
+  # ref is the normalized changeset value, so no valid_uuid?/is_binary guards are
+  # needed here (unlike fetch_owned_claim/4, which takes raw path segments).
+  defp fetch_claim_by_ref(tenant_id, project_id, ref) do
+    ChannelClaim
+    |> where(
+      [c],
+      c.tenant_id == ^tenant_id and c.project_id == ^project_id and c.ref == ^ref
+    )
+    |> AdminRepo.one()
   end
 
   # done (Multi.update) / release (Multi.delete) + audit in ONE transaction so the
