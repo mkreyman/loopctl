@@ -202,7 +202,7 @@ mix ecto.reset         # Drop, create, migrate
 - **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — 60 stories across 15 epics
 - **Skills**: `skills/loopctl-*.md` — 6 orchestration skills
 - **Orchestration Guide**: `docs/orchestration-guide.md` — methodology: loop, trust model, checkpointing
-- **MCP Server**: `mcp-server/` — 84 typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
+- **MCP Server**: `mcp-server/` — 85 typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
 - **Build Status**: memory-keeper key `build_status`, channel `loopctl`
 
 ## MCP Server

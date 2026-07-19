@@ -265,6 +265,76 @@ describe("#39.7: channel_delete wiring", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// #40.D1: channel_get (full-body read) + untrusted-DATA framing (TC-40.D1.5)
+// ---------------------------------------------------------------------------
+
+describe("#40.D1: channel_get wiring + untrusted-DATA framing", () => {
+  test("TOOLS declares channel_get requiring post_id", () => {
+    assert.match(INDEX_SRC, /name: "channel_get",/, 'must declare a "channel_get" tool');
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_get",[\s\S]*?required: \["post_id"\]/,
+      "the channel_get inputSchema must require post_id",
+    );
+  });
+
+  test("channelGet GETs /channel/posts/${post_id} on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelGet\([\s\S]*?"GET",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelGet must GET /api/v1/channel/posts/${post_id} with the agent key",
+    );
+  });
+
+  test("the channel_get dispatch case calls channelGet(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_get":\s*\n\s*return await channelGet\(args\);/,
+      "the channel_get dispatch case must call channelGet(args)",
+    );
+  });
+
+  test("channel_get frames the returned body as UNTRUSTED DATA (AC-40.D1.4)", () => {
+    const getTool = /name: "channel_get",\s*\n\s*description:\s*\n?\s*"([^"]*)"/.exec(INDEX_SRC);
+    assert.ok(getTool, "channel_get must have a description");
+    assert.match(getTool[1], /UNTRUSTED DATA/, "channel_get body must be framed as UNTRUSTED DATA");
+    assert.match(getTool[1], /NO auto-follow/i, "channel_get must state there is no auto-follow");
+  });
+
+  test("channel_recent frames returned bodies as UNTRUSTED DATA + bounded previews (AC-40.D1.2)", () => {
+    const recentTool = /name: "channel_recent",\s*\n\s*description:\s*\n?\s*"([^"]*)"/.exec(
+      INDEX_SRC,
+    );
+    assert.ok(recentTool, "channel_recent must have a description");
+    assert.match(
+      recentTool[1],
+      /UNTRUSTED DATA/,
+      "channel_recent bodies must be framed as UNTRUSTED DATA",
+    );
+    assert.match(
+      recentTool[1],
+      /body_preview/,
+      "channel_recent must document the bounded body_preview",
+    );
+  });
+
+  test("no fetch-and-follow / auto-follow tool exists (AC-40.D1.2/3)", () => {
+    // The security posture forbids any tool that fetches a post AND acts on it.
+    assert.doesNotMatch(
+      INDEX_SRC,
+      /name: "channel_[a-z_]*follow[a-z_]*"/,
+      "there must be no channel_*follow* fetch-and-follow tool",
+    );
+    // No tool description should instruct the agent to FOLLOW a fetched body.
+    assert.doesNotMatch(
+      INDEX_SRC,
+      /fetch [^"]*and follow/i,
+      "no tool may offer a fetch-and-follow affordance",
+    );
+  });
+});
+
 describe("KB-scope lifecycle: archive_kb_scope / restore_kb_scope wiring", () => {
   test("TOOLS declares archive_kb_scope and restore_kb_scope", () => {
     assert.match(INDEX_SRC, /name: "archive_kb_scope",/, 'must declare "archive_kb_scope"');

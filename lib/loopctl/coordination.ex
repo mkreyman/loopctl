@@ -41,9 +41,45 @@ defmodule Loopctl.Coordination do
   @default_recent_limit 25
   @max_recent_limit 100
 
+  # Read-model preview bound (US-40.D1), in BYTES. The LIST read never returns a
+  # full post body: it projects a SMALL bounded prefix via a DB `substring` so the
+  # TOASTed `body` column is never detoasted, and — since these previews are
+  # injected into every peer agent session on the repo via the SessionStart hook —
+  # so the prompt-injection blast radius of any single post stays small. A full
+  # body is an explicit, separate fetch (`get_post/2` → GET /channel/posts/:id).
+  # This is the SINGLE read-model primitive: US-40.C2's cursor/delta read CONSUMES
+  # the same `select_preview/1` + `finalize_preview/1` helpers rather than
+  # re-deriving them.
+  #
+  # This @preview_bytes bound is BYTE-semantic and is enforced authoritatively in
+  # ELIXIR (`bounded_preview/1` + `utf8_prefix/2`), NOT by the DB. See
+  # `@preview_probe_chars` for why the DB `substring` (which counts CHARACTERS)
+  # cannot and does not enforce it.
+  @preview_bytes 512
+
+  # The DB projection probe width, in CHARACTERS. Postgres `substring(text FOR n)`
+  # counts CHARACTERS, never bytes — so the DB slice does NOT (and cannot) enforce
+  # the @preview_bytes BYTE bound. We ask the DB for `@preview_bytes + 1`
+  # *characters* purely as a cheap detoast guard + truncation probe: because every
+  # UTF-8 character is >= 1 byte, `@preview_bytes + 1` characters is ALWAYS
+  # >= `@preview_bytes + 1` bytes, so the returned slice always carries enough
+  # bytes to (a) detect that the full body exceeded the @preview_bytes-BYTE bound
+  # and (b) have @preview_bytes bytes available to trim back to. The authoritative
+  # BYTE bound is then applied in Elixir by `finalize_preview/1`. A maintainer must
+  # NEVER trust this DB slice to be byte-bounded — it is character-bounded and
+  # deliberately over-fetches.
+  @preview_probe_chars @preview_bytes + 1
+
   @doc "The uniform retention window, in days, applied to every post."
   @spec retention_days() :: pos_integer()
   def retention_days, do: @retention_days
+
+  @doc """
+  The bounded preview size, in bytes, the LIST read projects for each post body.
+  Exposed so consumers (US-40.C2, tests) share one source of truth.
+  """
+  @spec preview_bytes() :: pos_integer()
+  def preview_bytes, do: @preview_bytes
 
   @doc """
   Creates a channel post.
@@ -222,9 +258,39 @@ defmodule Loopctl.Coordination do
     end
   end
 
+  @doc """
+  Fetches ONE post by id, tenant-scoped, returning its FULL body — the public,
+  shared by-id read (US-40.D1). This is the SINGLE shared by-id path: the
+  oracle-safe `GET /channel/posts/:id` endpoint uses it here, and graduate
+  (US-40.E1) reuses it rather than duplicating the query. It wraps the same
+  private `fetch_owned_post/2` the redact path (`delete_post/4`) uses.
+
+  ORACLE-SAFE, mirroring `delete_post/4`: the fetch filters on BOTH `id` and
+  `tenant_id` on `AdminRepo` (BYPASSRLS), so a foreign-tenant OR nonexistent id
+  both return `{:error, :not_found}` — byte-identical, no cross-tenant existence
+  oracle (KB "IDOR Prevention in Multi-Tenant Delete Operations"). A malformed
+  (non-UUID) `post_id` (or `tenant_id`) is guarded first and returns
+  `{:error, :not_found}` too — a clean 404, never an `Ecto.Query.CastError`/500.
+
+  Returns `{:ok, %ChannelPost{}}` (the full struct, including the un-truncated
+  `body`) or `{:error, :not_found}`.
+  """
+  @spec get_post(term(), term()) :: {:ok, ChannelPost.t()} | {:error, :not_found}
+  def get_post(tenant_id, post_id) do
+    if valid_uuid?(tenant_id) and valid_uuid?(post_id) do
+      case fetch_owned_post(tenant_id, post_id) do
+        nil -> {:error, :not_found}
+        post -> {:ok, post}
+      end
+    else
+      {:error, :not_found}
+    end
+  end
+
   # Fetch a post by id CONSTRAINED to the caller's tenant — the isolation
   # boundary on the AdminRepo (BYPASSRLS) path. A foreign-tenant or nonexistent
-  # id returns nil, so both collapse to the same 404 (no existence oracle).
+  # id returns nil, so both collapse to the same 404 (no existence oracle). Shared
+  # by the redact path (`delete_post/4`) and the public by-id read (`get_post/2`).
   defp fetch_owned_post(tenant_id, post_id) do
     ChannelPost
     |> where([p], p.id == ^post_id and p.tenant_id == ^tenant_id)
@@ -498,7 +564,7 @@ defmodule Loopctl.Coordination do
       that returns the whole live channel — never a 400; supply a full instant to
       get a delta.
   """
-  @spec recent(term(), term(), keyword()) :: [ChannelPost.t()]
+  @spec recent(term(), term(), keyword()) :: [preview()]
   def recent(tenant_id, project_id, opts \\ []) do
     {posts, _has_more} = recent_page(tenant_id, project_id, opts)
     posts
@@ -515,7 +581,7 @@ defmodule Loopctl.Coordination do
   (paging past the truncation) is out of scope — US-39.6 owns dedup/paging; this
   is only the cheap "there is more" flag.
   """
-  @spec recent_page(term(), term(), keyword()) :: {[ChannelPost.t()], boolean()}
+  @spec recent_page(term(), term(), keyword()) :: {[preview()], boolean()}
   def recent_page(tenant_id, project_id, opts \\ []) do
     if valid_uuid?(tenant_id) and valid_uuid?(project_id) do
       limit = opts |> Keyword.get(:limit, @default_recent_limit) |> clamp_limit()
@@ -528,13 +594,115 @@ defmodule Loopctl.Coordination do
         |> where([p], p.expires_at > ^now)
         |> apply_since(since)
         |> order_recent(since)
+        |> select_preview()
         |> limit(^(limit + 1))
         |> AdminRepo.all()
 
-      {Enum.take(rows, limit), length(rows) > limit}
+      page = rows |> Enum.take(limit) |> Enum.map(&finalize_preview/1)
+      {page, length(rows) > limit}
     else
       {[], false}
     end
+  end
+
+  @typedoc """
+  A single LIST-read row: a bounded read-model projection (NOT a `%ChannelPost{}`).
+  Carries `body_preview` (a prefix of at most `#{@preview_bytes}` bytes) + `truncated`
+  instead of the full `body`, plus the attribution/addressing/timestamp fields.
+  """
+  @type preview :: %{
+          id: Ecto.UUID.t(),
+          agent_id: Ecto.UUID.t(),
+          session_id: String.t() | nil,
+          host: String.t() | nil,
+          to_host: String.t() | nil,
+          to_capability: String.t() | nil,
+          key: String.t() | nil,
+          refs: term(),
+          body_preview: String.t() | nil,
+          truncated: boolean(),
+          inserted_at: DateTime.t(),
+          updated_at: DateTime.t()
+        }
+
+  @doc """
+  The shared read-model preview projection (US-40.D1) — the SINGLE read primitive
+  the LIST read here and US-40.C2's cursor/delta read both use.
+
+  Projects a bounded `body_preview` via `substring(body for #{@preview_probe_chars})`
+  so Postgres NEVER detoasts the full (up to 16KB, TOASTed) `body` column — it reads
+  at most `#{@preview_probe_chars}` CHARACTERS. Note `substring(text FOR n)` counts
+  CHARACTERS, not bytes, so this DB slice is CHARACTER-bounded, not byte-bounded: it
+  is a cheap detoast guard + truncation probe, NOT the byte-bound enforcement. The
+  extra `+1` character (`@preview_probe_chars` = `@preview_bytes + 1`) is the
+  truncation probe; because every UTF-8 character is >= 1 byte, the slice always
+  carries enough bytes for `finalize_preview/1` to (a) derive `truncated` and
+  (b) trim the returned preview back to at most `#{@preview_bytes}` BYTES — the
+  authoritative byte bound, applied in Elixir, never by the DB. Every other read
+  field is projected directly; `body` itself is deliberately absent (fetch it
+  explicitly via `get_post/2`).
+  """
+  @spec select_preview(Ecto.Query.t()) :: Ecto.Query.t()
+  def select_preview(query) do
+    select(query, [p], %{
+      id: p.id,
+      agent_id: p.agent_id,
+      session_id: p.session_id,
+      host: p.host,
+      to_host: p.to_host,
+      to_capability: p.to_capability,
+      key: p.key,
+      refs: p.refs,
+      inserted_at: p.inserted_at,
+      updated_at: p.updated_at,
+      # CHARACTER-bounded over-fetch (see @preview_probe_chars) — NOT byte-bounded.
+      body_preview: fragment("substring(? for ?)", p.body, ^@preview_probe_chars)
+    })
+  end
+
+  @doc """
+  Finalizes one `select_preview/1` projection row. This is where the authoritative
+  `#{@preview_bytes}`-BYTE bound is enforced (the DB slice is only CHARACTER-bounded
+  — see `select_preview/1`): derives `truncated` from the `#{@preview_probe_chars}`-
+  character probe slice and bounds `body_preview` to at most `#{@preview_bytes}`
+  BYTES (on a UTF-8 codepoint boundary, so the returned JSON is always valid).
+  Shared with US-40.C2 so both reads shape rows identically.
+  """
+  @spec finalize_preview(map()) :: preview()
+  def finalize_preview(%{body_preview: raw} = row) do
+    {preview, truncated} = bounded_preview(raw)
+
+    row
+    |> Map.put(:body_preview, preview)
+    |> Map.put(:truncated, truncated)
+  end
+
+  # `body` is `validate_required`, so the projected slice is a binary in practice;
+  # the nil clause is defensive. This is the authoritative BYTE-bound enforcement
+  # (the DB slice is only character-bounded): `truncated` is true iff the slice is
+  # MORE than @preview_bytes BYTES (i.e. the full body exceeded the byte bound —
+  # sound because the character-bounded DB over-fetch always carries enough bytes
+  # to observe this); in that case trim the returned preview back to @preview_bytes
+  # bytes on a valid UTF-8 boundary.
+  defp bounded_preview(raw) when is_binary(raw) do
+    if byte_size(raw) > @preview_bytes do
+      {utf8_prefix(raw, @preview_bytes), true}
+    else
+      {raw, false}
+    end
+  end
+
+  defp bounded_preview(_), do: {nil, false}
+
+  # Largest valid-UTF-8 prefix of `str` no longer than `max` bytes. The DB
+  # substring returns whole codepoints, so a byte-cut can split at most a 1–3 byte
+  # trailing codepoint; drop trailing bytes until the prefix is valid UTF-8 (so
+  # Jason never chokes on a half codepoint). At most 3 iterations.
+  defp utf8_prefix(str, max) when byte_size(str) <= max, do: str
+
+  defp utf8_prefix(str, max) do
+    candidate = binary_part(str, 0, max)
+    if String.valid?(candidate), do: candidate, else: utf8_prefix(str, max - 1)
   end
 
   @doc """

@@ -228,7 +228,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       read = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
       assert %{"data" => [read_post]} = json_response(read, 200)
-      assert read_post["body"] == "broadcast"
+      assert read_post["body_preview"] == "broadcast"
       assert is_nil(read_post["to_host"])
       assert is_nil(read_post["to_capability"])
     end
@@ -275,7 +275,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       # to_host did not restrict read visibility.
       read = authed_conn(raw_b) |> get(@path, %{"project_id" => project.id})
       assert %{"data" => [read_post]} = json_response(read, 200)
-      assert read_post["body"] == "addressed elsewhere"
+      assert read_post["body_preview"] == "addressed elsewhere"
       assert read_post["to_host"] == "some-other-host"
     end
 
@@ -597,15 +597,18 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
       assert %{"data" => data, "meta" => meta} = json_response(conn, 200)
 
-      assert Enum.map(data, & &1["body"]) == ["three", "two", "one"]
+      assert Enum.map(data, & &1["body_preview"]) == ["three", "two", "one"]
+      # Short bodies are returned verbatim in body_preview, not truncated (AC-40.D1.1).
+      assert Enum.all?(data, &(&1["truncated"] == false))
       assert meta["count"] == 3
       assert meta["limit"] == 25
 
-      # AC-39.3.5: the exact read field set, and only that set.
+      # AC-39.3.5 / AC-40.D1.1: the exact read field set, and only that set — `body`
+      # is now `body_preview` + `truncated` (bounded read model).
       first = hd(data)
 
       assert Map.keys(first) |> Enum.sort() ==
-               ~w(agent_id body host id inserted_at key refs session_id to_capability to_host updated_at)
+               ~w(agent_id body_preview host id inserted_at key refs session_id to_capability to_host truncated updated_at)
 
       assert first["agent_id"] == agent.id
     end
@@ -631,7 +634,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
       assert %{"data" => [post]} = json_response(conn, 200)
       assert post["id"] == live.id
-      assert post["body"] == "live"
+      assert post["body_preview"] == "live"
     end
 
     # TC-39.3.3
@@ -650,7 +653,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         |> get(@path, %{"project_id" => project.id, "since" => DateTime.to_iso8601(t2)})
 
       assert %{"data" => [post]} = json_response(conn, 200)
-      assert post["body"] == "new"
+      assert post["body_preview"] == "new"
     end
 
     # TC-39.3.4 — oracle-safety: cross-tenant AND nonexistent both 200 empty,
@@ -751,7 +754,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       # The caller sees only its own post on its own channel...
       conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
       assert %{"data" => [post]} = json_response(conn, 200)
-      assert post["body"] == "mine"
+      assert post["body_preview"] == "mine"
 
       # ...and gets an empty list for the other tenant's channel (oracle-safe).
       cross = authed_conn(raw) |> get(@path, %{"project_id" => other_project.id})
@@ -768,6 +771,149 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         |> get(@path, %{"project_id" => project.id})
 
       assert conn.status in [401, 403]
+    end
+
+    # TC-40.D1.1 — a 16KB body is returned as a bounded body_preview (<= 512 bytes)
+    # with truncated=true; the FULL body is never present in the list response.
+    test "a 16KB-body post is listed as a bounded body_preview with truncated=true, full body absent" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      big = String.duplicate("a", 16_384)
+      {:ok, _} = Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => big})
+
+      conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+      assert %{"data" => [post]} = json_response(conn, 200)
+
+      preview = post["body_preview"]
+      assert byte_size(preview) <= Coordination.preview_bytes()
+      assert post["truncated"] == true
+      # The full 16KB body is not present anywhere in the response payload.
+      refute post["body"]
+      refute String.contains?(Jason.encode!(post), big)
+      # The preview is a genuine prefix of the body.
+      assert String.starts_with?(big, preview)
+    end
+  end
+
+  describe "GET /api/v1/channel/posts/:id (full body, US-40.D1)" do
+    defp show_path(id), do: "#{@path}/#{id}"
+
+    # TC-40.D1.2 — an owned post → 200 with the FULL body.
+    test "an owned post returns 200 with the full body" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      big = String.duplicate("z", 16_384)
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => big})
+
+      conn = authed_conn(raw) |> get(show_path(post.id))
+      assert %{"post" => body} = json_response(conn, 200)
+      assert body["id"] == post.id
+      assert body["agent_id"] == agent.id
+      # The FULL body is served (not a bounded preview).
+      assert body["body"] == big
+      assert byte_size(body["body"]) == 16_384
+
+      # Read-model discipline (US-40.D1): the by-id read is the full-body
+      # COUNTERPART to the list read, NOT the write-echo resource. It carries the
+      # SAME narrowed field set as channel_post_json/1 (plus verbatim body) and
+      # deliberately does NOT re-widen to tenant_id / project_id / expires_at.
+      assert Map.keys(body) |> Enum.sort() ==
+               ~w(agent_id body host id inserted_at key refs session_id to_capability to_host updated_at)
+
+      refute Map.has_key?(body, "tenant_id")
+      refute Map.has_key?(body, "project_id")
+      refute Map.has_key?(body, "expires_at")
+      refute Map.has_key?(body, "body_preview")
+      refute Map.has_key?(body, "truncated")
+    end
+
+    # TC-40.D1.3 — a post in ANOTHER tenant → 404, byte-identical to a nonexistent id.
+    test "a foreign-tenant id and a nonexistent id both return a byte-identical 404 (no oracle)" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant)
+
+      other = fixture(:tenant)
+      other_project = fixture(:project, %{tenant_id: other.id})
+      other_agent = fixture(:agent, %{tenant_id: other.id})
+
+      {:ok, foreign} =
+        Coordination.create_post(other.id, other_project.id, other_agent.id, %{
+          "body" => "theirs"
+        })
+
+      cross = authed_conn(raw) |> get(show_path(foreign.id))
+      missing = authed_conn(raw) |> get(show_path(Ecto.UUID.generate()))
+
+      cross_body = json_response(cross, 404)
+      missing_body = json_response(missing, 404)
+
+      assert cross_body == %{"error" => %{"status" => 404, "message" => "Not found"}}
+      assert cross_body == missing_body
+    end
+
+    # TC-40.D1.4 — a malformed (non-UUID) id → clean 404, never a 500 CastError,
+    # byte-identical to the nonexistent-id 404.
+    test "a malformed (non-UUID) id returns 404, not a 500, identical to a nonexistent id" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant)
+
+      malformed = authed_conn(raw) |> get(show_path("not-a-uuid"))
+      missing = authed_conn(raw) |> get(show_path(Ecto.UUID.generate()))
+
+      assert json_response(malformed, 404) == %{
+               "error" => %{"status" => 404, "message" => "Not found"}
+             }
+
+      assert json_response(malformed, 404) == json_response(missing, 404)
+    end
+
+    test "the full-body read requires agent role (an unauthenticated caller cannot read)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {_raw, _key, agent} = agent_key(tenant)
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "x"})
+
+      conn =
+        build_conn()
+        |> put_req_header("x-loopctl-last-known-sth", @sth_header)
+        |> get(show_path(post.id))
+
+      assert conn.status in [401, 403]
+    end
+
+    # AC-40.D1.4 — the full-body :show read must be rate-limited. It is covered by
+    # the generic per-key limiter of the :authenticated pipeline (NOT the tighter
+    # write cap, which guards writes only). This asserts that guarantee actually
+    # holds for :show: once the per-key RPM budget is exhausted, further reads are
+    # 429 with a Retry-After, exactly like every other authenticated read.
+    test "over-cap :show reads are 429 with Retry-After (pipeline limiter applies)" do
+      stub_counting_limiter()
+      tenant = fixture(:tenant, %{settings: %{"rate_limit_requests_per_minute" => 2}})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "readable"})
+
+      # First 2 reads are within the per-key cap.
+      for _ <- 1..2 do
+        conn = authed_conn(raw) |> get(show_path(post.id))
+        assert conn.status == 200
+      end
+
+      # The 3rd read trips the per-key limiter -> 429 with a Retry-After.
+      conn = authed_conn(raw) |> get(show_path(post.id))
+      assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
+      assert [retry] = get_resp_header(conn, "retry-after")
+      assert String.to_integer(retry) >= 1
     end
   end
 

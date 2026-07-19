@@ -117,8 +117,9 @@ defmodule Loopctl.CoordinationTest do
                })
 
       assert post.refs == refs
-      # persisted list survives a fresh read (RefsList.load round-trip)
-      assert [%ChannelPost{refs: ^refs}] = Coordination.recent(tenant.id, project.id)
+      # persisted list survives a fresh read (RefsList.load round-trip). The LIST
+      # read now returns bounded preview maps (US-40.D1), not %ChannelPost{} structs.
+      assert [%{refs: ^refs}] = Coordination.recent(tenant.id, project.id)
     end
   end
 
@@ -136,8 +137,8 @@ defmodule Loopctl.CoordinationTest do
 
       # AdminRepo path: tenant_b's explicit filter yields zero rows for A's project.
       assert Coordination.recent(tenant_b.id, project_a.id) == []
-      # And tenant_a sees its own post.
-      assert [%ChannelPost{body: "tenant A only"}] =
+      # And tenant_a sees its own post (as a bounded preview map, US-40.D1).
+      assert [%{body_preview: "tenant A only", truncated: false}] =
                Coordination.recent(tenant_a.id, project_a.id)
 
       # RLS Repo path (belt-and-suspenders): scoped to tenant_b, the row is invisible.
@@ -181,7 +182,7 @@ defmodule Loopctl.CoordinationTest do
       {:ok, _} =
         Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "hi"})
 
-      assert [%ChannelPost{}] = Coordination.recent(tenant.id, project.id, limit: "abc")
+      assert [%{body_preview: _}] = Coordination.recent(tenant.id, project.id, limit: "abc")
     end
 
     test "a malformed (non-UUID) project_id yields [] rather than a CastError" do
@@ -253,7 +254,7 @@ defmodule Loopctl.CoordinationTest do
       seed_post(tenant, project, agent_id, "two", t2)
       seed_post(tenant, project, agent_id, "three", t3)
 
-      bodies = tenant.id |> Coordination.recent(project.id) |> Enum.map(& &1.body)
+      bodies = tenant.id |> Coordination.recent(project.id) |> Enum.map(& &1.body_preview)
       assert bodies == ["three", "two", "one"]
     end
 
@@ -271,7 +272,7 @@ defmodule Loopctl.CoordinationTest do
       seed_post(tenant, project, agent_id, "new", t3)
 
       bodies =
-        tenant.id |> Coordination.recent(project.id, since: t2) |> Enum.map(& &1.body)
+        tenant.id |> Coordination.recent(project.id, since: t2) |> Enum.map(& &1.body_preview)
 
       assert bodies == ["new"]
     end
@@ -297,7 +298,7 @@ defmodule Loopctl.CoordinationTest do
         |> AdminRepo.update()
 
       bodies =
-        tenant.id |> Coordination.recent(project.id, since: since) |> Enum.map(& &1.body)
+        tenant.id |> Coordination.recent(project.id, since: since) |> Enum.map(& &1.body_preview)
 
       assert bodies == ["slot"]
     end
@@ -318,7 +319,7 @@ defmodule Loopctl.CoordinationTest do
       bodies =
         tenant.id
         |> Coordination.recent(project.id, since: DateTime.to_iso8601(t2))
-        |> Enum.map(& &1.body)
+        |> Enum.map(& &1.body_preview)
 
       assert bodies == ["new"]
     end
@@ -346,7 +347,7 @@ defmodule Loopctl.CoordinationTest do
       bodies =
         tenant.id
         |> Coordination.recent(project.id, since: offset_less)
-        |> Enum.map(& &1.body)
+        |> Enum.map(& &1.body_preview)
 
       assert bodies == ["new"]
     end
@@ -364,7 +365,8 @@ defmodule Loopctl.CoordinationTest do
         DateTime.utc_now() |> DateTime.truncate(:microsecond)
       )
 
-      assert [%ChannelPost{}] = Coordination.recent(tenant.id, project.id, since: "not-a-date")
+      assert [%{body_preview: _}] =
+               Coordination.recent(tenant.id, project.id, since: "not-a-date")
     end
 
     test "a date-only since (wrong granularity) is a no-op filter, returns the whole channel", %{
@@ -387,7 +389,7 @@ defmodule Loopctl.CoordinationTest do
       bodies =
         tenant.id
         |> Coordination.recent(project.id, since: date_only)
-        |> Enum.map(& &1.body)
+        |> Enum.map(& &1.body_preview)
         |> Enum.sort()
 
       assert bodies == ["new", "old"]
@@ -424,7 +426,7 @@ defmodule Loopctl.CoordinationTest do
       bodies =
         tenant.id
         |> Coordination.recent(project.id, since: since, limit: 2)
-        |> Enum.map(& &1.body)
+        |> Enum.map(& &1.body_preview)
 
       assert "slot" in bodies
       assert bodies == ["slot", "p2"]
@@ -506,6 +508,147 @@ defmodule Loopctl.CoordinationTest do
       assert post_a.id != post_b.id
       posts = Coordination.recent(tenant.id, project.id)
       assert length(posts) == 2
+    end
+  end
+
+  describe "bounded preview projection (US-40.D1)" do
+    test "a small body is returned verbatim in body_preview with truncated=false" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      {:ok, _} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "short body"})
+
+      assert [row] = Coordination.recent(tenant.id, project.id)
+      assert row.body_preview == "short body"
+      assert row.truncated == false
+      # The read model carries no full `body` key — only the bounded preview.
+      refute Map.has_key?(row, :body)
+    end
+
+    test "a 16KB body is truncated to <= preview_bytes with truncated=true (prefix of the body)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      big = String.duplicate("a", 16_384)
+      {:ok, _} = Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => big})
+
+      assert [row] = Coordination.recent(tenant.id, project.id)
+      assert byte_size(row.body_preview) <= Coordination.preview_bytes()
+      assert row.truncated == true
+      assert String.starts_with?(big, row.body_preview)
+    end
+
+    test "a body of exactly preview_bytes is not truncated" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      n = Coordination.preview_bytes()
+      body = String.duplicate("b", n)
+      {:ok, _} = Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => body})
+
+      assert [row] = Coordination.recent(tenant.id, project.id)
+      assert row.body_preview == body
+      assert byte_size(row.body_preview) == n
+      assert row.truncated == false
+    end
+
+    test "a body one byte over preview_bytes is truncated to exactly preview_bytes" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      n = Coordination.preview_bytes()
+      body = String.duplicate("c", n + 1)
+      {:ok, _} = Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => body})
+
+      assert [row] = Coordination.recent(tenant.id, project.id)
+      assert byte_size(row.body_preview) == n
+      assert row.truncated == true
+    end
+
+    test "a multibyte body truncates on a codepoint boundary (valid UTF-8, valid JSON)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      # 3-byte codepoints so the byte cut at preview_bytes (512) lands MID-codepoint
+      # (512 = 170*3 + 2), forcing utf8_prefix/2's repair loop to drop the split
+      # trailing bytes. 300 chars = 900 bytes: over the 512-byte preview bound,
+      # within the 16KB body cap.
+      body = String.duplicate("€", 300)
+      {:ok, _} = Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => body})
+
+      assert [row] = Coordination.recent(tenant.id, project.id)
+      # The repair loop dropped the 2 split trailing bytes: 512 is not a multiple
+      # of 3, so the valid prefix is STRICTLY under the bound (510 = 170*3), which
+      # only holds if utf8_prefix/2's else-branch actually ran.
+      assert byte_size(row.body_preview) < Coordination.preview_bytes()
+      assert byte_size(row.body_preview) == 510
+      assert row.truncated == true
+      assert String.valid?(row.body_preview)
+      # It is a genuine prefix of the original body (no codepoint mangled).
+      assert String.starts_with?(body, row.body_preview)
+      # Encodes cleanly (a split codepoint would break Jason).
+      assert {:ok, _} = Jason.encode(row.body_preview)
+    end
+  end
+
+  describe "get_post/2 (US-40.D1)" do
+    test "an owned post returns {:ok, post} with the FULL body" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      big = String.duplicate("z", 16_384)
+
+      {:ok, created} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => big})
+
+      assert {:ok, %ChannelPost{} = post} = Coordination.get_post(tenant.id, created.id)
+      assert post.id == created.id
+      # The full 16KB body is returned (not a bounded preview).
+      assert post.body == big
+      assert byte_size(post.body) == 16_384
+    end
+
+    test "a post in another tenant returns {:error, :not_found} (no cross-tenant oracle)" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      agent_b = fixture(:agent, %{tenant_id: tenant_b.id}).id
+
+      {:ok, foreign} =
+        Coordination.create_post(tenant_b.id, project_b.id, agent_b, %{"body" => "theirs"})
+
+      assert {:error, :not_found} = Coordination.get_post(tenant_a.id, foreign.id)
+      # And a nonexistent id in tenant_a returns the identical error (byte-identical
+      # 404 at the HTTP boundary — no existence oracle).
+      assert {:error, :not_found} = Coordination.get_post(tenant_a.id, Ecto.UUID.generate())
+    end
+
+    test "a nonexistent id returns {:error, :not_found}" do
+      tenant = fixture(:tenant)
+      assert {:error, :not_found} = Coordination.get_post(tenant.id, Ecto.UUID.generate())
+    end
+
+    test "a malformed (non-UUID) post_id returns {:error, :not_found}, not a CastError" do
+      tenant = fixture(:tenant)
+      assert {:error, :not_found} = Coordination.get_post(tenant.id, "not-a-uuid")
+    end
+
+    test "a malformed (non-UUID) tenant_id returns {:error, :not_found}" do
+      project_tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: project_tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: project_tenant.id}).id
+
+      {:ok, post} =
+        Coordination.create_post(project_tenant.id, project.id, agent_id, %{"body" => "hi"})
+
+      assert {:error, :not_found} = Coordination.get_post("not-a-uuid", post.id)
     end
   end
 
