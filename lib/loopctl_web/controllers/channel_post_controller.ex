@@ -702,6 +702,14 @@ defmodule LoopctlWeb.ChannelPostController do
           }
         })
 
+      {:error, :conflict} = err ->
+        # US-40.B2 rare double race: a keyless idempotent write's winning row was
+        # hard-deleted (US-39.7) between the failed insert and BOTH the recovery
+        # SELECT and the bounded re-append. The slot kept churning, so `post/4`
+        # returns a RETRYABLE 409 (not a misleading 422) — `action_fallback` maps
+        # `{:error, :conflict}` to a 409 the client can safely re-fire.
+        err
+
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
     end

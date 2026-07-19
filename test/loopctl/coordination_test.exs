@@ -1320,6 +1320,26 @@ defmodule Loopctl.CoordinationTest do
       %{tenant: tenant, project: project, agent_id: agent_id, audit: audit}
     end
 
+    test "the idempotency partial index is scoped to KEYLESS rows (WHERE ... AND key IS NULL)" do
+      # Storage-layer backstop for the keyless-only invariant (the changeset 422 in
+      # `validate_key_idempotency_exclusion/1` is primary; this index is
+      # defense-in-depth). Assert the APPLIED index predicate excludes keyed rows so
+      # a future migration edit can't silently drop `AND key IS NULL` and re-open the
+      # out-of-scope cross-session keyed-dedup hole — the exact regression the medium
+      # review finding flagged. Also confirms the DB-under-test matches the
+      # migration-as-written (guards against an in-place migration edit leaving a
+      # stale index behind an already-applied version).
+      indexdef =
+        AdminRepo.query!(
+          "SELECT indexdef FROM pg_indexes WHERE indexname = 'channel_posts_idempotency_uidx'"
+        ).rows
+        |> List.first()
+        |> List.first()
+
+      assert indexdef =~ "idempotency_key IS NOT NULL"
+      assert indexdef =~ "key IS NULL"
+    end
+
     test "TC-40.B2.2: a keyless write with an idempotency token dedups to the same row", ctx do
       %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
 
@@ -1454,6 +1474,109 @@ defmodule Loopctl.CoordinationTest do
                })
 
       assert %{idempotency_key: _} = errors_on(cs)
+    end
+
+    test "AC-40.B2.3: a NUL byte in the idempotency_key is a 422, never a raw 500", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      assert {:error, %Ecto.Changeset{} = cs} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "nul in token",
+                 idempotency_key: "before" <> <<0>> <> "after",
+                 audit: audit
+               })
+
+      # The token is in @scanned_text_fields, so the NUL guard turns Postgres's raw
+      # 500 into a clean 422 changeset error on :idempotency_key — nothing persists.
+      assert %{idempotency_key: ["must not contain NUL bytes"]} = errors_on(cs)
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 0
+    end
+
+    test "AC-40.B2.3: a denylisted credential in the idempotency_key is rejected (422)", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      # A `sk-`-shaped token must be scanned exactly like body/key/host — the
+      # idempotency_key is a persisted, scanned text field, so a credential shape in
+      # it is blocked rather than stored on the 30-day cross-session bus.
+      assert {:error, %Ecto.Changeset{} = cs} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "secret in token",
+                 idempotency_key: "sk-" <> String.duplicate("a", 30),
+                 audit: audit
+               })
+
+      assert %{idempotency_key: [msg]} = errors_on(cs)
+      assert msg =~ "secret or credential"
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 0
+    end
+
+    test "a post carrying BOTH a key and an idempotency_key is rejected (422)", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      # The keyed slot and the idempotency token are orthogonal, keyless-only
+      # dimensions. Sending both is nonsensical and would otherwise let a keyed post
+      # ride the idempotency index (enabling out-of-scope cross-session keyed dedup),
+      # so create_changeset rejects it explicitly rather than silently no-op'ing.
+      assert {:error, %Ecto.Changeset{} = cs} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 session_id: "S1",
+                 key: "handoff:repo#812",
+                 body: "both key and token",
+                 idempotency_key: "abc",
+                 audit: audit
+               })
+
+      assert %{idempotency_key: [msg]} = errors_on(cs)
+      assert msg =~ "keyless append path only"
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 0
+    end
+
+    test "two KEYED posts reusing one idempotency_key across sessions do NOT cross-session dedup",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      # The exact scenario from the medium review finding: two keyed posts sharing an
+      # idempotency_key but from DIFFERENT sessions. Because both are rejected (a
+      # keyed post may not carry a token at all), the second session's write is NEVER
+      # silently dropped in favor of the first — the keyless/keyed boundary holds.
+      both = fn session_id ->
+        Coordination.post(tenant.id, agent_id, :agent, %{
+          project_id: project.id,
+          session_id: session_id,
+          key: "handoff:repo#812",
+          body: "keyed + token from #{session_id}",
+          idempotency_key: "shared-token",
+          audit: audit
+        })
+      end
+
+      assert {:error, %Ecto.Changeset{}} = both.("S1")
+      assert {:error, %Ecto.Changeset{}} = both.("S2")
+
+      # Nothing landed — no keyed slot pointer, no idempotency row, no silent drop.
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 0
     end
 
     test "TC-40.B2.5: a double-fired handoff yields one pointer slot + at most one open claim",

@@ -40,13 +40,19 @@ defmodule Loopctl.Coordination.ChannelPost do
       the same `(tenant_id, project_id, agent_id, idempotency_key)` returns the
       EXISTING post (`{:ok, post, :deduplicated}`) instead of appending a duplicate
       — the same guarantee `knowledge_create` gives. Enforced by the partial unique
-      index `channel_posts_idempotency_uidx WHERE idempotency_key IS NOT NULL`,
-      caught with `unique_constraint` and resolved to the existing row. Scoped to
-      `(tenant, project, agent)` so one agent's token never collides with another's.
-      Absent, the write is exactly today's append-only behavior (US-39.2). This is a
-      SEPARATE dedup dimension and MUST NEVER be part of the working-state slot key
-      (`insert_opts/1` conflict_target) — the token is consulted on the KEYLESS path
-      only.
+      index `channel_posts_idempotency_uidx WHERE idempotency_key IS NOT NULL AND
+      key IS NULL`, caught with `unique_constraint` and resolved to the existing row.
+      Scoped to `(tenant, project, agent)` so one agent's token never collides with
+      another's. Absent, the write is exactly today's append-only behavior (US-39.2).
+      This is a SEPARATE dedup dimension and MUST NEVER be part of the working-state
+      slot key (`insert_opts/1` conflict_target) — the token is consulted on the
+      KEYLESS path only. That keyless-only invariant is enforced two ways: the index
+      predicate carries `AND key IS NULL` (a keyed post never participates in the
+      idempotency dimension, so no out-of-scope cross-session keyed dedup), and
+      `create_changeset/2` REJECTS (422) a request carrying BOTH a `key` and an
+      `idempotency_key` — the combination is nonsensical (the keyed slot already
+      dedups a same-session re-fire) and would otherwise silently provide no
+      idempotency guarantee.
 
   ## Trust boundary
 
@@ -247,6 +253,7 @@ defmodule Loopctl.Coordination.ChannelPost do
     |> validate_length(:to_host, max: @host_max_length, count: :bytes)
     |> validate_length(:to_capability, max: @to_capability_max_length, count: :bytes)
     |> maybe_require_session_for_key()
+    |> validate_key_idempotency_exclusion()
     |> validate_refs()
     |> scan_text_and_refs()
     |> foreign_key_constraint(:tenant_id)
@@ -359,6 +366,33 @@ defmodule Loopctl.Coordination.ChannelPost do
   defp maybe_require_session_for_key(changeset) do
     if get_field(changeset, :key) do
       validate_required(changeset, :session_id)
+    else
+      changeset
+    end
+  end
+
+  # The client idempotency token and the keyed working-state slot are two ORTHOGONAL
+  # dedup dimensions (see moduledoc): the token is consulted on the KEYLESS path
+  # ONLY. A post carrying BOTH a `key` and an `idempotency_key` is nonsensical — the
+  # keyed slot already dedups a same-session re-fire, and letting the token ride
+  # along a keyed post would either (a) silently provide NO idempotency guarantee
+  # (the token column sits inert on a keyed row) or (b), under a bare
+  # `idempotency_key IS NOT NULL` index, drag the keyed post into the idempotency
+  # dimension and enable OUT-OF-SCOPE cross-session keyed dedup that silently drops a
+  # second session's distinct slot write. Reject the combination with an explicit 422
+  # so a confused client learns immediately instead of getting a silent no-op (or
+  # worse, a dropped write). The scoped partial index (`... AND key IS NULL`) is the
+  # storage-layer backstop; this is the primary, user-facing contract. Both fields
+  # are already blank-normalized to nil, so this fires only when BOTH are genuinely
+  # present.
+  defp validate_key_idempotency_exclusion(changeset) do
+    if not is_nil(get_field(changeset, :key)) and
+         not is_nil(get_field(changeset, :idempotency_key)) do
+      add_error(
+        changeset,
+        :idempotency_key,
+        "cannot be combined with a keyed post — the idempotency token applies to the keyless append path only"
+      )
     else
       changeset
     end

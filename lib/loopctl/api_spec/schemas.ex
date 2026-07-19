@@ -930,7 +930,10 @@ defmodule Loopctl.ApiSpec.Schemas do
               "(tenant, project, agent, idempotency_key) returns the EXISTING post " <>
               "(200, created:false) instead of appending a duplicate — the same guarantee " <>
               "knowledge_create gives. Scoped per-agent, so one agent's token never collides " <>
-              "with another's. Absent, the write is exactly append-only."
+              "with another's. Absent, the write is exactly append-only. It applies to the " <>
+              "keyless append path ONLY: combining it with a key is REJECTED (422) — the " <>
+              "keyed slot already dedups a same-session re-fire, so send one or the other, " <>
+              "never both."
         },
         session_id: %Schema{
           type: :string,

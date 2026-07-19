@@ -302,11 +302,14 @@ defmodule Loopctl.Coordination do
   `(tenant_id, project_id, agent_id, idempotency_key)` returns the EXISTING post
   (`{:ok, post, :deduplicated}`, HTTP 200 `created: false`) rather than appending a
   duplicate — the same guarantee `knowledge_create` gives. It is enforced by the
-  partial unique index `channel_posts_idempotency_uidx` and caught with
-  insert-and-recover (no TOCTOU). The token is a SEPARATE dedup dimension from the
-  keyed slot and is consulted ONLY on the keyless path; absent, the write is
-  exactly today's append-only behavior. One agent's token never collides with
-  another's (scoped per `(tenant, project, agent)`).
+  partial unique index `channel_posts_idempotency_uidx` (scoped
+  `WHERE idempotency_key IS NOT NULL AND key IS NULL`, so a KEYED post never
+  participates) and caught with insert-and-recover (no TOCTOU). The token is a
+  SEPARATE dedup dimension from the keyed slot and is consulted ONLY on the keyless
+  path; a request carrying BOTH a `key` and an `idempotency_key` is rejected (422)
+  as nonsensical. Absent, the write is exactly today's append-only behavior. One
+  agent's token never collides with another's (scoped per `(tenant, project,
+  agent)`).
 
   ## Returns
 
@@ -329,6 +332,7 @@ defmodule Loopctl.Coordination do
           {:ok, ChannelPost.t(), :created | :updated | :deduplicated}
           | {:error, :not_found}
           | {:error, :agent_not_found}
+          | {:error, :conflict}
           | {:error, Ecto.Changeset.t()}
   def post(tenant_id, agent_id, role, attrs) do
     project_id = Map.get(attrs, :project_id)
@@ -1113,7 +1117,13 @@ defmodule Loopctl.Coordination do
   # equal timestamps ⇒ created and divergent ⇒ in-place update. This reflects the
   # actual write outcome atomically, so the label is correct even under a concurrent
   # same-session race or a sweep deleting the slot mid-flight.
-  defp run_post(tenant_id, changeset, audit) do
+  defp run_post(tenant_id, changeset, audit), do: run_post(tenant_id, changeset, audit, 1)
+
+  # `retries_left` bounds the idempotency-recovery re-attempt (see
+  # `resolve_idempotency_collision/4`): a hard-delete of the winning row between the
+  # failed insert and the recovery SELECT frees the idempotency slot, so we re-run
+  # the append ONCE (budget 1) rather than bounce a misleading non-retryable 422.
+  defp run_post(tenant_id, changeset, audit, retries_left) do
     key = Ecto.Changeset.get_field(changeset, :key)
     insert_opts = insert_opts(key)
 
@@ -1140,7 +1150,7 @@ defmodule Loopctl.Coordination do
         # rollback exactly like the claim path. Any other rejection (a size/shape
         # bound, denylist hit, NUL byte, or the keyed slot collision) stays a 422.
         if idempotency_conflict?(failed) do
-          resolve_idempotency_collision(tenant_id, failed)
+          resolve_idempotency_collision(tenant_id, failed, changeset, audit, retries_left)
         else
           tap_secret_blocked({:error, failed})
         end
@@ -1171,18 +1181,41 @@ defmodule Loopctl.Coordination do
   # Resolve a lost idempotency insert to the EXISTING row and report it as a
   # `:deduplicated` outcome (the third documented `post/4` result). The scope
   # fields are the SERVER-STAMPED struct values (tenant_id/project_id/agent_id) plus
-  # the normalized changeset `idempotency_key` — never client-echoed. A rare
-  # concurrent hard-delete (US-39.7) of the winning row between the failed insert
-  # and this SELECT yields nil; fall back to the raw changeset (→ 422) so the caller
-  # retries cleanly rather than seeing a 500.
-  defp resolve_idempotency_collision(tenant_id, %Ecto.Changeset{} = changeset) do
-    project_id = Ecto.Changeset.get_field(changeset, :project_id)
-    agent_id = Ecto.Changeset.get_field(changeset, :agent_id)
-    idempotency_key = Ecto.Changeset.get_field(changeset, :idempotency_key)
+  # the normalized changeset `idempotency_key` — never client-echoed.
+  #
+  # The nil case is a rare double race: the winning row was HARD-deleted (US-39.7)
+  # between the failed insert and this recovery SELECT. That is NOT a duplicate and
+  # NOT bad input — the idempotency slot is now FREE, so the caller's append would
+  # succeed on a fresh insert. Returning the raw changeset here would surface a
+  # NON-retryable 422 ("has already been used") that MCP/HTTP clients don't retry,
+  # silently losing the append and lying about the token being taken. Instead we
+  # RE-RUN the append once (`retries_left`), which either lands cleanly or — if a
+  # concurrent writer re-took the slot in the meantime — re-collides and dedups to
+  # THAT row. Only if the slot keeps churning past the budget do we return a
+  # retryable `{:error, :conflict}` (→ 409), an honest "transient race, retry"
+  # signal rather than a misleading 422. `original_changeset` is the pre-failure
+  # changeset (the `failed` one carries the added unique-constraint error), reused to
+  # rebuild a fresh insert Multi.
+  defp resolve_idempotency_collision(
+         tenant_id,
+         %Ecto.Changeset{} = failed,
+         %Ecto.Changeset{} = original_changeset,
+         audit,
+         retries_left
+       ) do
+    project_id = Ecto.Changeset.get_field(failed, :project_id)
+    agent_id = Ecto.Changeset.get_field(failed, :agent_id)
+    idempotency_key = Ecto.Changeset.get_field(failed, :idempotency_key)
 
     case get_post_by_idempotency_key(tenant_id, project_id, agent_id, idempotency_key) do
-      %ChannelPost{} = existing -> {:ok, existing, :deduplicated}
-      nil -> {:error, changeset}
+      %ChannelPost{} = existing ->
+        {:ok, existing, :deduplicated}
+
+      nil when retries_left > 0 ->
+        run_post(tenant_id, original_changeset, audit, retries_left - 1)
+
+      nil ->
+        {:error, :conflict}
     end
   end
 

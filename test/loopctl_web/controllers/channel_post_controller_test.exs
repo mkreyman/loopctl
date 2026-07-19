@@ -1080,8 +1080,16 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       first = authed_conn(raw) |> get(@path, %{"project_id" => project.id, "limit" => "2"})
       cursor = json_response(first, 200)["meta"]["next_cursor"]
-      {head, <<last::utf8>>} = String.split_at(cursor, -1)
-      mutated = head <> if(last == ?A, do: "B", else: "A")
+
+      # Flip the FIRST base64 char (always fully significant — top 6 bits of payload
+      # byte 0) so the HMAC verify deterministically fails. Flipping the LAST char is
+      # unreliable: with `padding: false` base64 a trailing char can carry only
+      # zero-padding low bits when the byte length is not a multiple of 3, so an
+      # A<->B flip there decodes to identical bytes and the cursor stays valid (a
+      # data-dependent flake).
+      <<first_char, rest::binary>> = cursor
+      flipped = if first_char == ?A, do: ?B, else: ?A
+      mutated = <<flipped>> <> rest
 
       conn =
         authed_conn(raw)

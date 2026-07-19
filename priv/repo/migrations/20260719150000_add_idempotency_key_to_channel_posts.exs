@@ -19,6 +19,17 @@ defmodule Loopctl.Repo.Migrations.AddIdempotencyKeyToChannelPosts do
   (`channel_posts_session_key_uidx`, on `session_id + key`) and MUST stay
   orthogonal to it — the idempotency token is only consulted on the KEYLESS path.
 
+  To keep that orthogonality TRUE at the storage layer, the partial index is
+  scoped `WHERE idempotency_key IS NOT NULL AND key IS NULL`: the idempotency
+  dimension applies to KEYLESS posts ONLY. Without the `key IS NULL` predicate a
+  KEYED post that also carried a token would silently participate in the
+  idempotency index, enabling out-of-scope cross-session KEYED dedup (a second
+  session's distinct keyed slot write would collide on the token and be dropped)
+  — the exact anti-invariant the moduledoc forbids. The application layer belts
+  this: `ChannelPost.create_changeset/2` REJECTS a request carrying both `key`
+  and `idempotency_key` (422), so no row ever holds both non-null; the scoped
+  predicate is the defense-in-depth backstop for that contract.
+
   The `channel_posts` table already has RLS ENABLED (not FORCE); a column add
   needs no RLS change.
   """
@@ -30,7 +41,7 @@ defmodule Loopctl.Repo.Migrations.AddIdempotencyKeyToChannelPosts do
 
     create unique_index(:channel_posts, [:tenant_id, :project_id, :agent_id, :idempotency_key],
              name: :channel_posts_idempotency_uidx,
-             where: "idempotency_key IS NOT NULL"
+             where: "idempotency_key IS NOT NULL AND key IS NULL"
            )
   end
 end
