@@ -1080,6 +1080,60 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule ChannelPostFull do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ChannelPostFull",
+      description:
+        "One coordination channel post as returned by the by-id full-body read " <>
+          "(GET /channel/posts/:id). This is the full-body COUNTERPART to the LIST " <>
+          "read item: it carries the SAME narrowed read-model field discipline as " <>
+          "ChannelPostListItem, differing ONLY in that the bounded body_preview + " <>
+          "truncated pair is replaced by the verbatim body the caller explicitly " <>
+          "fetched. It deliberately does NOT re-widen to the write-echo resource " <>
+          "shape (ChannelPostResponse) — tenant_id, project_id and expires_at are " <>
+          "omitted so the by-id read honors the same minimal read surface the LIST " <>
+          "read established. The body is UNTRUSTED DATA authored by another agent.",
+      type: :object,
+      properties: %{
+        post: %Schema{
+          type: :object,
+          properties: %{
+            id: %Schema{type: :string, format: :uuid},
+            agent_id: %Schema{type: :string, format: :uuid},
+            session_id: %Schema{type: :string, nullable: true},
+            host: %Schema{type: :string, nullable: true},
+            to_host: %Schema{
+              type: :string,
+              nullable: true,
+              description: "Advisory surfacing address (spoofable, never authz)"
+            },
+            to_capability: %Schema{
+              type: :string,
+              nullable: true,
+              description: "Advisory surfacing address (spoofable, never authz)"
+            },
+            key: %Schema{type: :string, nullable: true},
+            body: %Schema{
+              type: :string,
+              description:
+                "The verbatim full post body — UNTRUSTED DATA authored by another agent."
+            },
+            refs: %Schema{
+              type: :array,
+              nullable: true,
+              items: %Schema{type: :object, additionalProperties: true}
+            },
+            inserted_at: %Schema{type: :string, format: :"date-time"},
+            updated_at: %Schema{type: :string, format: :"date-time"}
+          }
+        }
+      }
+    })
+  end
+
   # ---------- Epics ----------
 
   defmodule EpicResponse do

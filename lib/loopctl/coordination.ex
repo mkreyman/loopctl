@@ -41,15 +41,34 @@ defmodule Loopctl.Coordination do
   @default_recent_limit 25
   @max_recent_limit 100
 
-  # Read-model preview bound (US-40.D1). The LIST read never returns a full post
-  # body: it projects a SMALL bounded prefix via a DB `substring` so the TOASTed
-  # `body` column is never detoasted, and — since these previews are injected into
-  # every peer agent session on the repo via the SessionStart hook — so the
-  # prompt-injection blast radius of any single post stays small. A full body is an
-  # explicit, separate fetch (`get_post/2` → GET /channel/posts/:id). This is the
-  # SINGLE read-model primitive: US-40.C2's cursor/delta read CONSUMES the same
-  # `select_preview/1` + `finalize_preview/1` helpers rather than re-deriving them.
+  # Read-model preview bound (US-40.D1), in BYTES. The LIST read never returns a
+  # full post body: it projects a SMALL bounded prefix via a DB `substring` so the
+  # TOASTed `body` column is never detoasted, and — since these previews are
+  # injected into every peer agent session on the repo via the SessionStart hook —
+  # so the prompt-injection blast radius of any single post stays small. A full
+  # body is an explicit, separate fetch (`get_post/2` → GET /channel/posts/:id).
+  # This is the SINGLE read-model primitive: US-40.C2's cursor/delta read CONSUMES
+  # the same `select_preview/1` + `finalize_preview/1` helpers rather than
+  # re-deriving them.
+  #
+  # This @preview_bytes bound is BYTE-semantic and is enforced authoritatively in
+  # ELIXIR (`bounded_preview/1` + `utf8_prefix/2`), NOT by the DB. See
+  # `@preview_probe_chars` for why the DB `substring` (which counts CHARACTERS)
+  # cannot and does not enforce it.
   @preview_bytes 512
+
+  # The DB projection probe width, in CHARACTERS. Postgres `substring(text FOR n)`
+  # counts CHARACTERS, never bytes — so the DB slice does NOT (and cannot) enforce
+  # the @preview_bytes BYTE bound. We ask the DB for `@preview_bytes + 1`
+  # *characters* purely as a cheap detoast guard + truncation probe: because every
+  # UTF-8 character is >= 1 byte, `@preview_bytes + 1` characters is ALWAYS
+  # >= `@preview_bytes + 1` bytes, so the returned slice always carries enough
+  # bytes to (a) detect that the full body exceeded the @preview_bytes-BYTE bound
+  # and (b) have @preview_bytes bytes available to trim back to. The authoritative
+  # BYTE bound is then applied in Elixir by `finalize_preview/1`. A maintainer must
+  # NEVER trust this DB slice to be byte-bounded — it is character-bounded and
+  # deliberately over-fetches.
+  @preview_probe_chars @preview_bytes + 1
 
   @doc "The uniform retention window, in days, applied to every post."
   @spec retention_days() :: pos_integer()
@@ -610,13 +629,18 @@ defmodule Loopctl.Coordination do
   The shared read-model preview projection (US-40.D1) — the SINGLE read primitive
   the LIST read here and US-40.C2's cursor/delta read both use.
 
-  Projects a bounded `body_preview` via `substring(body for #{@preview_bytes}+1)` so
-  Postgres NEVER detoasts the full (up to 16KB, TOASTed) `body` column — it reads
-  at most `#{@preview_bytes}+1` characters. The `+1` is the truncation probe:
-  `finalize_preview/1` derives `truncated` from it and trims the returned preview
-  back to at most `#{@preview_bytes}` bytes. Every other read field is projected
-  directly; `body` itself is deliberately absent (fetch it explicitly via
-  `get_post/2`).
+  Projects a bounded `body_preview` via `substring(body for #{@preview_probe_chars})`
+  so Postgres NEVER detoasts the full (up to 16KB, TOASTed) `body` column — it reads
+  at most `#{@preview_probe_chars}` CHARACTERS. Note `substring(text FOR n)` counts
+  CHARACTERS, not bytes, so this DB slice is CHARACTER-bounded, not byte-bounded: it
+  is a cheap detoast guard + truncation probe, NOT the byte-bound enforcement. The
+  extra `+1` character (`@preview_probe_chars` = `@preview_bytes + 1`) is the
+  truncation probe; because every UTF-8 character is >= 1 byte, the slice always
+  carries enough bytes for `finalize_preview/1` to (a) derive `truncated` and
+  (b) trim the returned preview back to at most `#{@preview_bytes}` BYTES — the
+  authoritative byte bound, applied in Elixir, never by the DB. Every other read
+  field is projected directly; `body` itself is deliberately absent (fetch it
+  explicitly via `get_post/2`).
   """
   @spec select_preview(Ecto.Query.t()) :: Ecto.Query.t()
   def select_preview(query) do
@@ -631,15 +655,18 @@ defmodule Loopctl.Coordination do
       refs: p.refs,
       inserted_at: p.inserted_at,
       updated_at: p.updated_at,
-      body_preview: fragment("substring(? for ?)", p.body, ^(@preview_bytes + 1))
+      # CHARACTER-bounded over-fetch (see @preview_probe_chars) — NOT byte-bounded.
+      body_preview: fragment("substring(? for ?)", p.body, ^@preview_probe_chars)
     })
   end
 
   @doc """
-  Finalizes one `select_preview/1` projection row: derives `truncated` from the
-  `#{@preview_bytes}+1` probe slice and bounds `body_preview` to at most
-  `#{@preview_bytes}` bytes (on a UTF-8 codepoint boundary, so the returned JSON is
-  always valid). Shared with US-40.C2 so both reads shape rows identically.
+  Finalizes one `select_preview/1` projection row. This is where the authoritative
+  `#{@preview_bytes}`-BYTE bound is enforced (the DB slice is only CHARACTER-bounded
+  — see `select_preview/1`): derives `truncated` from the `#{@preview_probe_chars}`-
+  character probe slice and bounds `body_preview` to at most `#{@preview_bytes}`
+  BYTES (on a UTF-8 codepoint boundary, so the returned JSON is always valid).
+  Shared with US-40.C2 so both reads shape rows identically.
   """
   @spec finalize_preview(map()) :: preview()
   def finalize_preview(%{body_preview: raw} = row) do
@@ -651,9 +678,12 @@ defmodule Loopctl.Coordination do
   end
 
   # `body` is `validate_required`, so the projected slice is a binary in practice;
-  # the nil clause is defensive. `truncated` is true iff the DB probe returned MORE
-  # than @preview_bytes bytes (i.e. the full body exceeded the preview); in that
-  # case trim the returned preview back to the bound on a valid UTF-8 boundary.
+  # the nil clause is defensive. This is the authoritative BYTE-bound enforcement
+  # (the DB slice is only character-bounded): `truncated` is true iff the slice is
+  # MORE than @preview_bytes BYTES (i.e. the full body exceeded the byte bound —
+  # sound because the character-bounded DB over-fetch always carries enough bytes
+  # to observe this); in that case trim the returned preview back to @preview_bytes
+  # bytes on a valid UTF-8 boundary.
   defp bounded_preview(raw) when is_binary(raw) do
     if byte_size(raw) > @preview_bytes do
       {utf8_prefix(raw, @preview_bytes), true}

@@ -818,6 +818,19 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       # The FULL body is served (not a bounded preview).
       assert body["body"] == big
       assert byte_size(body["body"]) == 16_384
+
+      # Read-model discipline (US-40.D1): the by-id read is the full-body
+      # COUNTERPART to the list read, NOT the write-echo resource. It carries the
+      # SAME narrowed field set as channel_post_json/1 (plus verbatim body) and
+      # deliberately does NOT re-widen to tenant_id / project_id / expires_at.
+      assert Map.keys(body) |> Enum.sort() ==
+               ~w(agent_id body host id inserted_at key refs session_id to_capability to_host updated_at)
+
+      refute Map.has_key?(body, "tenant_id")
+      refute Map.has_key?(body, "project_id")
+      refute Map.has_key?(body, "expires_at")
+      refute Map.has_key?(body, "body_preview")
+      refute Map.has_key?(body, "truncated")
     end
 
     # TC-40.D1.3 — a post in ANOTHER tenant → 404, byte-identical to a nonexistent id.

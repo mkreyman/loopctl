@@ -214,7 +214,7 @@ defmodule LoopctlWeb.ChannelPostController do
       ]
     ],
     responses: %{
-      200 => {"The post with its full body", "application/json", Schemas.ChannelPostResponse},
+      200 => {"The post with its full body", "application/json", Schemas.ChannelPostFull},
       404 =>
         {"Post not found (nonexistent, malformed id, or in another tenant)", "application/json",
          Schemas.ErrorResponse},
@@ -331,17 +331,50 @@ defmodule LoopctlWeb.ChannelPostController do
   deliberately NOT behind the tighter `:rate_limit_write` cap (that guards writes
   only). Response-byte capping / limiter tuning is US-40.D5's job; here it only
   needs to EXIST, which the pipeline limiter satisfies.
+
+  READ-MODEL DISCIPLINE: the response is the full-body COUNTERPART to the LIST
+  read, NOT the write-echo resource. `channel_post_full_json/1` projects the SAME
+  narrowed field set as the list read (`channel_post_json/1`), differing ONLY in
+  that the bounded `body_preview` + `truncated` pair is replaced by the verbatim
+  `body` the caller explicitly fetched. It deliberately does NOT reuse the raw
+  `%ChannelPost{}` Jason encoder (which also carries `tenant_id`/`project_id`/
+  `expires_at`): a by-id read honors the same minimal read surface the list read
+  established rather than re-widening the read model on the read path. `tenant_id`
+  is always the caller's own (key-derived, redundant), and `project_id` was
+  already known from the project-scoped list the caller drilled in from.
   """
   def show(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
     with {:ok, post} <- Coordination.get_post(tenant_id, params["id"]) do
-      # The FULL post (verbatim `body`), rendered via the same `%{post: ...}` shape
-      # and `ChannelPost` Jason encoder as `create/2` — the caller explicitly asked
-      # for one post, so the full (up to 16KB) column is served. A `{:error,
+      # The FULL post (verbatim `body`) under the narrowed read-model shape — the
+      # caller explicitly asked for one post, so the full (up to 16KB) column is
+      # served, but the field discipline matches the list read. A `{:error,
       # :not_found}` falls through to `action_fallback` → byte-identical 404.
-      json(conn, %{post: post})
+      json(conn, %{post: channel_post_full_json(post)})
     end
+  end
+
+  # The by-id full-body read shape (US-40.D1): the LIST read's field discipline
+  # (`channel_post_json/1`) with the verbatim `body` in place of the bounded
+  # `body_preview` + `truncated` pair. It deliberately mirrors the narrowed read
+  # model rather than the wider write-echo struct shape — `tenant_id`/`project_id`/
+  # `expires_at` are omitted so the read path never re-widens what the list read
+  # narrowed. See the `show/2` docstring for the rationale.
+  defp channel_post_full_json(post) do
+    %{
+      id: post.id,
+      agent_id: post.agent_id,
+      session_id: post.session_id,
+      host: post.host,
+      to_host: post.to_host,
+      to_capability: post.to_capability,
+      key: post.key,
+      body: post.body,
+      refs: post.refs,
+      inserted_at: post.inserted_at,
+      updated_at: post.updated_at
+    }
   end
 
   @doc """
