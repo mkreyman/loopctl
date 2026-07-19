@@ -148,6 +148,18 @@ defmodule LoopctlWeb.Router do
     # human-anchor gated.
     delete "/channel/posts/:id", ChannelPostController, :delete
 
+    # Repo Coordination Bus CLAIM surface (Epic 40, US-40.B1) — exactly-once handoff
+    # claims. INSERT-to-claim: the first inserter on (tenant_id, project_id, ref)
+    # wins; a loser gets a distinct 409 already_claimed. Agent-role, project-scoped
+    # by membership (US-40.D3), NOT human-anchor gated (coordination surface, owner
+    # decision #331). `ref` is carried in the BODY (a free string like
+    # "handoff:repo#812"), never the path, so done/release are POSTs too. The static
+    # /release and /done paths are declared BEFORE the bare create path is irrelevant
+    # (all three are distinct literal paths — no :id capture to shadow).
+    post "/channel/claims", ChannelClaimController, :create
+    post "/channel/claims/done", ChannelClaimController, :done
+    post "/channel/claims/release", ChannelClaimController, :release
+
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
 

@@ -12,6 +12,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :unauthorized}` -> 401
   - `{:error, :forbidden}` -> 403
   - `{:error, :conflict}` -> 409
+  - `{:error, :already_claimed}` -> 409 (US-40.B1: a coordination handoff ref was already claimed by another agent)
   - `{:error, :ambiguous_resolution}` -> 409 (a fuzzy identifier matched >1 active project)
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
@@ -75,6 +76,22 @@ defmodule LoopctlWeb.FallbackController do
         message:
           "The supplied identifier matches more than one active project. " <>
             "Disambiguate with an exact slug (or a fully-qualified, single-host repo_url)."
+      }
+    })
+  end
+
+  # US-40.B1: a coordination handoff `ref` was already claimed by another agent —
+  # the loser of an INSERT-to-claim race on the (tenant_id, project_id, ref) unique
+  # index. A distinct `code` so a losing agent learns another agent owns the ref and
+  # moves on (never confused with the generic 409 conflict).
+  def call(conn, {:error, :already_claimed}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "already_claimed",
+        message: "This ref has already been claimed by another agent."
       }
     })
   end

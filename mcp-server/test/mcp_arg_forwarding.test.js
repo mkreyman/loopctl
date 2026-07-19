@@ -232,6 +232,68 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
 });
 
 // ---------------------------------------------------------------------------
+// US-40.B1: channel_claim / channel_release / channel_done (exactly-once handoff)
+// ---------------------------------------------------------------------------
+
+describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () => {
+  test("TOOLS declares channel_claim, channel_release, channel_done", () => {
+    assert.match(INDEX_SRC, /name: "channel_claim",/, 'must declare a "channel_claim" tool');
+    assert.match(INDEX_SRC, /name: "channel_release",/, 'must declare a "channel_release" tool');
+    assert.match(INDEX_SRC, /name: "channel_done",/, 'must declare a "channel_done" tool');
+  });
+
+  test("channel_claim description maps 409 already_claimed to a clear 'another agent owns it' message", () => {
+    assert.match(
+      INDEX_SRC,
+      /409 already_claimed[\s\S]*?ANOTHER AGENT ALREADY OWNS THIS REF/,
+      "channel_claim must tell a loser another agent already owns the ref (move on)",
+    );
+  });
+
+  test("channelClaim POSTs /channel/claims on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelClaim\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelClaim must POST /api/v1/channel/claims with the agent key",
+    );
+  });
+
+  test("channelRelease POSTs /channel/claims/release on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelRelease\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims\/release",[\s\S]*?process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelRelease must POST /api/v1/channel/claims/release with the agent key",
+    );
+  });
+
+  test("channelDone POSTs /channel/claims/done on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelDone\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims\/done",[\s\S]*?process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelDone must POST /api/v1/channel/claims/done with the agent key",
+    );
+  });
+
+  test("the claim dispatch cases call the right functions", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_claim":\s*\n\s*return await channelClaim\(args\);/,
+      "the channel_claim dispatch case must call channelClaim(args)",
+    );
+    assert.match(
+      INDEX_SRC,
+      /case "channel_release":\s*\n\s*return await channelRelease\(args\);/,
+      "the channel_release dispatch case must call channelRelease(args)",
+    );
+    assert.match(
+      INDEX_SRC,
+      /case "channel_done":\s*\n\s*return await channelDone\(args\);/,
+      "the channel_done dispatch case must call channelDone(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #39.7: channel_delete (Repo Coordination Bus redact path)
 // ---------------------------------------------------------------------------
 
