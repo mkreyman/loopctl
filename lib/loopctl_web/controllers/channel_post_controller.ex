@@ -414,11 +414,11 @@ defmodule LoopctlWeb.ChannelPostController do
         })
 
       agent_id ->
-        write_post(conn, tenant_id, agent_id, params)
+        write_post(conn, tenant_id, agent_id, api_key.role, params)
     end
   end
 
-  defp write_post(conn, tenant_id, agent_id, params) do
+  defp write_post(conn, tenant_id, agent_id, role, params) do
     # Only caller-supplied fields are threaded through; project_id is validated
     # for ownership in the context, and audit carries the verified actor context.
     # agent_id/tenant_id in the body are never read.
@@ -435,7 +435,7 @@ defmodule LoopctlWeb.ChannelPostController do
       audit: AuditContext.from_conn(conn)
     }
 
-    case Coordination.post(tenant_id, agent_id, attrs) do
+    case Coordination.post(tenant_id, agent_id, role, attrs) do
       {:ok, post, :created} ->
         conn
         |> put_status(:created)
@@ -447,7 +447,11 @@ defmodule LoopctlWeb.ChannelPostController do
         |> json(%{post: post})
 
       {:error, :not_found} ->
-        # AC-39.2.3: missing AND cross-tenant collapse to one byte-identical 422.
+        # AC-39.2.3 + AC-40.D3.1/D3.4: missing, cross-tenant, AND cross-PROJECT
+        # (a non-member agent posting to a sibling project in its own tenant)
+        # ALL collapse to one byte-identical 422 — no oracle distinguishing them.
+        # The :ownership_rejected signal fires on every case, so a cross-project
+        # injection attempt is observable exactly like a cross-tenant probe.
         emit_security_event(:ownership_rejected, %{
           tenant_id: tenant_id,
           agent_id: agent_id,
