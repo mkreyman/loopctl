@@ -508,6 +508,50 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       refute cs.valid?
       assert %{to_capability: _} = errors_on(cs)
     end
+
+    # AC-40.B2.3 — the idempotency_key is in @scanned_text_fields, so a NUL byte
+    # (which Postgres cannot store — a raw 500 at insert) is caught as a 422.
+    test "rejects a NUL byte in idempotency_key" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "idempotency_key" => "tok" <> <<0>> <> "en"
+        })
+
+      refute cs.valid?
+      assert %{idempotency_key: ["must not contain NUL bytes"]} = errors_on(cs)
+    end
+
+    # The keyed slot and the keyless idempotency token are orthogonal dimensions:
+    # a post may not carry BOTH (the token would otherwise ride a keyed post into
+    # the idempotency index and enable out-of-scope cross-session keyed dedup).
+    test "rejects a post carrying both a key and an idempotency_key" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "session_id" => "S1",
+          "key" => "handoff:repo#812",
+          "idempotency_key" => "tok"
+        })
+
+      refute cs.valid?
+      assert %{idempotency_key: [msg]} = errors_on(cs)
+      assert msg =~ "keyless append path only"
+    end
+
+    # A keyless post carrying ONLY an idempotency_key (no key) is valid — this is
+    # the intended retry-safe append path.
+    test "accepts a keyless post carrying only an idempotency_key" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "idempotency_key" => "tok"
+        })
+
+      assert cs.valid?
+      assert Ecto.Changeset.get_field(cs, :idempotency_key) == "tok"
+      assert is_nil(Ecto.Changeset.get_field(cs, :key))
+    end
   end
 
   describe "secret denylist" do
@@ -645,6 +689,19 @@ defmodule Loopctl.Coordination.ChannelPostTest do
 
       refute cs.valid?
       assert %{to_capability: _} = errors_on(cs)
+    end
+
+    # AC-40.B2.3 — the idempotency_key is in @scanned_text_fields, so a credential
+    # shape in the token is blocked rather than stored on the cross-session bus.
+    test "rejects a secret in idempotency_key" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "idempotency_key" => "sk-" <> String.duplicate("a", 30)
+        })
+
+      refute cs.valid?
+      assert %{idempotency_key: _} = errors_on(cs)
     end
 
     test "accumulates errors across every offending field in one pass" do

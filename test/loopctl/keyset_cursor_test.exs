@@ -126,7 +126,7 @@ defmodule Loopctl.KeysetCursorTest do
     test "a byte-mutated integer cursor is rejected (tamper → invalid)",
          %{tenant_id: t, seq_position: pos} do
       cursor = ChannelCursor.encode(t, pos)
-      mutated = flip_last_byte(cursor)
+      mutated = tamper_cursor(cursor)
       assert {:error, :invalid} = ChannelCursor.decode(t, mutated)
     end
 
@@ -153,12 +153,16 @@ defmodule Loopctl.KeysetCursorTest do
     end
   end
 
-  # Flip the last base64 char to a different valid char so the decoded HMAC differs
-  # (the signature is the trailing bytes) — a deterministic tamper.
-  defp flip_last_byte(cursor) do
-    {head, <<last::utf8>>} = String.split_at(cursor, -1)
-    replacement = if last == ?A, do: "B", else: "A"
-    head <> replacement
+  # Flip the FIRST base64 char (always fully significant — it encodes the top 6 bits
+  # of payload byte 0), so the decoded payload — and thus the recomputed HMAC —
+  # differs. Flipping the LAST char is unreliable: with `padding: false` base64 the
+  # trailing char can carry only zero-padding low bits when the byte length is not a
+  # multiple of 3, so an A<->B flip there (they differ only in the lowest bit)
+  # decodes to identical bytes and the cursor stays VALID — a data-dependent flake.
+  defp tamper_cursor(cursor) do
+    <<first, rest::binary>> = cursor
+    flipped = if first == ?A, do: ?B, else: ?A
+    <<flipped>> <> rest
   end
 
   describe "delegators preserve the defensive contract" do

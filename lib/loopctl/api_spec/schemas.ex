@@ -917,7 +917,23 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :string,
           nullable: true,
           description:
-            "Optional working-state slot key; a repeat post from the same session upserts it"
+            "Optional working-state slot key; a repeat post from the same session upserts it. " <>
+              "A handoff should pass a stable key of the form handoff:<anchor> " <>
+              "(e.g. handoff:repo#812) so a same-session retry refreshes the same slot."
+        },
+        idempotency_key: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "Optional client idempotency token for the KEYLESS write path (<=255 bytes). " <>
+              "When supplied without a key, a repeat write with the same " <>
+              "(tenant, project, agent, idempotency_key) returns the EXISTING post " <>
+              "(200, created:false) instead of appending a duplicate — the same guarantee " <>
+              "knowledge_create gives. Scoped per-agent, so one agent's token never collides " <>
+              "with another's. Absent, the write is exactly append-only. It applies to the " <>
+              "keyless append path ONLY: combining it with a key is REJECTED (422) — the " <>
+              "keyed slot already dedups a same-session re-fire, so send one or the other, " <>
+              "never both."
         },
         session_id: %Schema{
           type: :string,
@@ -1023,6 +1039,12 @@ defmodule Loopctl.ApiSpec.Schemas do
             inserted_at: %Schema{type: :string, format: :"date-time"},
             updated_at: %Schema{type: :string, format: :"date-time"}
           }
+        },
+        created: %Schema{
+          type: :boolean,
+          description:
+            "true when a new post was appended or a session slot upserted; false when a " <>
+              "keyless idempotency_key write deduplicated to an existing post (US-40.B2)"
         }
       }
     })

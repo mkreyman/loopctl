@@ -140,11 +140,16 @@ defmodule LoopctlWeb.ChannelPostController do
         "decision #331). tenant_id and agent_id are stamped server-side from the verified key — " <>
         "any agent_id/tenant_id in the body is ignored. With a `key` the write upserts the " <>
         "caller's own per-session working-state slot (200); without a key it is a new " <>
-        "append-only row (201). expires_at is set server-side to now + 30 days.",
+        "append-only row (201). On the keyless path an OPTIONAL idempotency_key makes a " <>
+        "retried append idempotent: a repeat write with the same (tenant, project, agent, " <>
+        "idempotency_key) returns the EXISTING post (200, created:false) instead of " <>
+        "appending a duplicate. expires_at is set server-side to now + 30 days.",
     request_body: {"Channel post params", "application/json", Schemas.ChannelPostRequest},
     responses: %{
       201 => {"Post created", "application/json", Schemas.ChannelPostResponse},
-      200 => {"Session slot upserted in place", "application/json", Schemas.ChannelPostResponse},
+      200 =>
+        {"Session slot upserted in place, or a keyless idempotent write deduplicated to " <>
+           "the existing post (created:false)", "application/json", Schemas.ChannelPostResponse},
       403 => {"Agent identity required", "application/json", Schemas.ErrorResponse},
       422 =>
         {"Validation error or unknown/cross-tenant project", "application/json",
@@ -625,6 +630,11 @@ defmodule LoopctlWeb.ChannelPostController do
       project_id: params["project_id"],
       body: params["body"],
       key: params["key"],
+      # OPTIONAL client idempotency token for the KEYLESS write path (US-40.B2):
+      # when supplied without a `key`, a repeat write with the same
+      # (tenant, project, agent, idempotency_key) returns the existing post
+      # (created:false) instead of appending a duplicate.
+      idempotency_key: params["idempotency_key"],
       refs: params["refs"],
       session_id: params["session_id"],
       host: params["host"],
@@ -638,12 +648,21 @@ defmodule LoopctlWeb.ChannelPostController do
       {:ok, post, :created} ->
         conn
         |> put_status(:created)
-        |> json(%{post: post})
+        |> json(%{post: post, created: true})
 
       {:ok, post, :updated} ->
         conn
         |> put_status(:ok)
-        |> json(%{post: post})
+        |> json(%{post: post, created: true})
+
+      {:ok, post, :deduplicated} ->
+        # US-40.B2: a KEYLESS write whose client idempotency_key already exists
+        # for this (tenant, project, agent) — the EXISTING post is returned and
+        # nothing new was appended. 200 with `created: false` so the caller can
+        # tell a dedup from a fresh 201 append (TC-40.B2.2).
+        conn
+        |> put_status(:ok)
+        |> json(%{post: post, created: false})
 
       {:error, :not_found} ->
         # AC-39.2.3 + AC-40.D3.1/D3.4: missing, cross-tenant, AND cross-PROJECT
@@ -682,6 +701,14 @@ defmodule LoopctlWeb.ChannelPostController do
               "This API key's agent identity is not valid for this tenant; it cannot post an attributed channel message"
           }
         })
+
+      {:error, :conflict} = err ->
+        # US-40.B2 rare double race: a keyless idempotent write's winning row was
+        # hard-deleted (US-39.7) between the failed insert and BOTH the recovery
+        # SELECT and the bounded re-append. The slot kept churning, so `post/4`
+        # returns a RETRYABLE 409 (not a misleading 422) — `action_fallback` maps
+        # `{:error, :conflict}` to a 409 the client can safely re-fire.
+        err
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}

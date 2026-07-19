@@ -437,13 +437,25 @@ async function restoreKbScope({ project_id }) {
   return toContent(result);
 }
 
-async function channelPost({ project_id, body, key, refs, to_host, to_capability }) {
+async function channelPost({
+  project_id,
+  body,
+  key,
+  idempotency_key,
+  refs,
+  to_host,
+  to_capability,
+}) {
   // Repo Coordination Bus (Epic 39): post a coordination message to a channel
   // (a channel IS a project_id — a work project or a kb scope). Agent-role, RLS
   // tenant-scoped — posting to your own tenant's channel is coordination, NOT
   // self-approval (owner decision #331), so it carries no chain-of-custody authority.
   const payload = { project_id, body };
   if (key) payload.key = key;
+  // US-40.B2: optional client idempotency token for the KEYLESS path — a repeat
+  // keyless write with the same token returns the existing post (created:false)
+  // instead of appending a duplicate. Mirrors knowledge_create.
+  if (idempotency_key) payload.idempotency_key = idempotency_key;
   if (refs) payload.refs = refs;
   // Advisory, SPOOFABLE, surfacing-only addressing (US-40.A5): these label a
   // post's intended target (a host or, primarily, a capability). They are caller
@@ -2350,7 +2362,7 @@ const TOOLS = [
   {
     name: "channel_post",
     description:
-      "Post a message to a repo coordination channel (Epic 39 Repo Coordination Bus) on the agent key. A channel IS a project_id (a work project or a kb scope); posts are tenant-isolated by RLS. This is an agent-role COORDINATION surface, not chain-of-custody — posting to your own tenant's channel is not self-approval. host is auto-filled from the proxy's os.hostname() and session_id is auto-filled from the Claude Code session id (both proxy-supplied, informational only — do NOT pass them). Provide a key to upsert your per-session working-state slot (200) instead of appending a new post (201); omit it to append. OPTIONAL advisory addressing: set to_capability (preferred) and/or to_host to LABEL a post's intended target (e.g. to_capability 'fly auth'). These are ADVISORY / SURFACING-ONLY and SPOOFABLE — a discovery hint that 40.C1 reads to surface directed-to-me posts, NEVER authorization, ownership, or a delivery guarantee. They gate nothing; a post with no addressing stays a broadcast visible to everyone on the channel.",
+      "Post a message to a repo coordination channel (Epic 39 Repo Coordination Bus) on the agent key. A channel IS a project_id (a work project or a kb scope); posts are tenant-isolated by RLS. This is an agent-role COORDINATION surface, not chain-of-custody — posting to your own tenant's channel is not self-approval. host is auto-filled from the proxy's os.hostname() and session_id is auto-filled from the Claude Code session id (both proxy-supplied, informational only — do NOT pass them). Provide a key to upsert your per-session working-state slot (200) instead of appending a new post (201); omit it to append. A HANDOFF should pass a stable key of the form handoff:<anchor> (e.g. handoff:repo#812), derived from the handoff's durable-home anchor, so a same-session retry refreshes the same slot instead of duplicating it. For a KEYLESS reconcile that must be retry-safe (a retried or offline-reconciled append), instead pass an idempotency_key token (NOT alongside a key — key and idempotency_key are mutually exclusive, and a post carrying both is rejected with a 422): a repeat keyless write with the same token returns the EXISTING post (200, created:false) instead of appending a duplicate — the same guarantee knowledge_create gives. OPTIONAL advisory addressing: set to_capability (preferred) and/or to_host to LABEL a post's intended target (e.g. to_capability 'fly auth'). These are ADVISORY / SURFACING-ONLY and SPOOFABLE — a discovery hint that 40.C1 reads to surface directed-to-me posts, NEVER authorization, ownership, or a delivery guarantee. They gate nothing; a post with no addressing stays a broadcast visible to everyone on the channel.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2362,7 +2374,12 @@ const TOOLS = [
         key: {
           type: "string",
           description:
-            "Optional per-session working-state slot key. When given, upserts the caller's slot for that key instead of appending a new post. Requires an active Claude Code session: the upsert is keyed on the auto-filled session_id (from CLAUDE_SESSION_ID), so a keyed post made outside a Claude Code session — where that env var is absent — is rejected with a 422 (session_id can't be blank). Omit key to append a plain post, which needs no session.",
+            "Optional per-session working-state slot key. When given, upserts the caller's slot for that key instead of appending a new post. A handoff should use a stable key of the form handoff:<anchor> (e.g. handoff:repo#812) so a same-session retry refreshes the same slot. Requires an active Claude Code session: the upsert is keyed on the auto-filled session_id (from CLAUDE_SESSION_ID), so a keyed post made outside a Claude Code session — where that env var is absent — is rejected with a 422 (session_id can't be blank). Omit key to append a plain post, which needs no session.",
+        },
+        idempotency_key: {
+          type: "string",
+          description:
+            "Optional client idempotency token for the KEYLESS write path (<=255 bytes). When supplied without a key, a repeat write with the same (tenant, project, agent, idempotency_key) returns the EXISTING post (created:false) instead of appending a duplicate — the same guarantee knowledge_create gives, for a retried or offline-reconciled append. Scoped per-agent, so one agent's token never collides with another's. Absent, the write is exactly append-only. Applies to the KEYLESS path ONLY: do NOT combine it with a key — a post carrying both is REJECTED with a 422 (the keyed slot already dedups a same-session re-fire). Send a key OR an idempotency_key, never both.",
         },
         to_capability: {
           type: "string",

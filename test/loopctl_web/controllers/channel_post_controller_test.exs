@@ -415,6 +415,77 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert count == 2
     end
 
+    # TC-40.B2.2 — a keyless write with a client idempotency token dedups: the
+    # second write returns the SAME post id with created:false (a 200), and no
+    # duplicate row is appended.
+    test "keyless write with an idempotency token: 201 created, then 200 created:false, one row" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      params = %{
+        "project_id" => project.id,
+        "body" => "offline-reconciled handoff",
+        "idempotency_key" => "abc"
+      }
+
+      c1 = post_json(raw, params)
+      assert %{"post" => p1, "created" => true} = json_response(c1, 201)
+
+      c2 = post_json(raw, params)
+      assert %{"post" => p2, "created" => false} = json_response(c2, 200)
+      assert p2["id"] == p1["id"]
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 1
+    end
+
+    # TC-40.B2.3 — two agents in the same tenant/project posting the SAME token get
+    # two distinct posts (the token is scoped per-agent); neither dedups the other.
+    test "different agents, same token, no collision: two distinct posts" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_a, _key_a, _agent_a} = member_agent_key(tenant, project)
+      {raw_b, _key_b, _agent_b} = member_agent_key(tenant, project)
+
+      params = fn -> %{"project_id" => project.id, "body" => "x", "idempotency_key" => "abc"} end
+
+      assert %{"post" => pa, "created" => true} = json_response(post_json(raw_a, params.()), 201)
+      assert %{"post" => pb, "created" => true} = json_response(post_json(raw_b, params.()), 201)
+
+      refute pa["id"] == pb["id"]
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 2
+    end
+
+    # TC-40.B2.4 — no token = append-only: two writes with the same body and no
+    # token yield two rows (exactly the US-39.2 behavior, unchanged).
+    test "no idempotency token: two identical writes append two rows" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      params = %{"project_id" => project.id, "body" => "same body, no token"}
+
+      assert %{"post" => p1, "created" => true} = json_response(post_json(raw, params), 201)
+      assert %{"post" => p2, "created" => true} = json_response(post_json(raw, params), 201)
+
+      refute p1["id"] == p2["id"]
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 2
+    end
+
     # TC-39.2.5
     test "an agent key with no agent identity -> 403 agent_identity_required, no row + security log" do
       tenant = fixture(:tenant)
@@ -1009,8 +1080,16 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       first = authed_conn(raw) |> get(@path, %{"project_id" => project.id, "limit" => "2"})
       cursor = json_response(first, 200)["meta"]["next_cursor"]
-      {head, <<last::utf8>>} = String.split_at(cursor, -1)
-      mutated = head <> if(last == ?A, do: "B", else: "A")
+
+      # Flip the FIRST base64 char (always fully significant — top 6 bits of payload
+      # byte 0) so the HMAC verify deterministically fails. Flipping the LAST char is
+      # unreliable: with `padding: false` base64 a trailing char can carry only
+      # zero-padding low bits when the byte length is not a multiple of 3, so an
+      # A<->B flip there decodes to identical bytes and the cursor stays valid (a
+      # data-dependent flake).
+      <<first_char, rest::binary>> = cursor
+      flipped = if first_char == ?A, do: ?B, else: ?A
+      mutated = <<flipped>> <> rest
 
       conn =
         authed_conn(raw)
