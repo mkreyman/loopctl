@@ -383,9 +383,26 @@ defmodule Loopctl.Coordination.ChannelPost do
       # (AC-40.A1.3): keys/labels are now attacker-writable, so a secret in a ref
       # `type`/`label` must be rejected exactly as one in `value`. Each field is
       # `scan_slice/1`'d (bounded scan cost) before the denylist walk.
-      changeset |> get_field(:refs) |> flatten_ref_fields() |> Enum.map(&scan_slice/1)
+      #
+      # Cap the item COUNT at @refs_max_items BEFORE flattening: an over-cap list is
+      # already rejected by `validate_refs/1`, so items past the cap never persist
+      # and need not be scanned. Without this cap the secret scan walks EVERY item
+      # of an arbitrarily long (up to the 2MB-body) list — a per-rejected-request
+      # CPU-amplification surface that the item-count cap exists precisely to bound
+      # (AC-40.A1.2). `Enum.take/2` on a non-list is a no-op via `cap_refs_for_scan/1`.
+      changeset
+      |> get_field(:refs)
+      |> cap_refs_for_scan()
+      |> flatten_ref_fields()
+      |> Enum.map(&scan_slice/1)
     end)
   end
+
+  # Bound the fan-out of the secret scan to the same item-count cap the persist path
+  # enforces: only the first @refs_max_items items can ever land, so scanning more is
+  # wasted work an attacker could weaponise on a rejected request.
+  defp cap_refs_for_scan(refs) when is_list(refs), do: Enum.take(refs, @refs_max_items)
+  defp cap_refs_for_scan(other), do: other
 
   defp add_secret_errors(changeset, fields, extractor) do
     Enum.reduce(fields, changeset, fn field, acc ->

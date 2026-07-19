@@ -150,6 +150,54 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       assert %{refs: _} = errors_on(cs)
     end
 
+    # AC-40.A1.4 — a non-string field (a scalar number, or a nested map/list value)
+    # in an otherwise well-shaped item is malformed and must be rejected as a 422,
+    # not persisted or crashed. The `is_binary` guard in valid_ref_field?/2 (and the
+    # nil clause in valid_ref_label?/1) handle it; this pins the AC-named edge case.
+    test "rejects a non-string ref value (number)" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => "file", "value" => 123}]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "rejects a non-string ref type (number)" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => 7, "value" => "x"}]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "rejects a nested (non-string) ref value" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => "file", "value" => %{"nested" => "obj"}}]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
+    test "rejects a non-string ref label" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "refs" => [%{"type" => "file", "value" => "x", "label" => 99}]
+        })
+
+      refute cs.valid?
+      assert %{refs: _} = errors_on(cs)
+    end
+
     test "rejects an over-length ref type" do
       cs =
         ChannelPost.create_changeset(base_struct(), %{

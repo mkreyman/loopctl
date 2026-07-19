@@ -27,6 +27,16 @@ defmodule Loopctl.Coordination.RefsList do
   so a bad scalar/map can never 500 downstream. `load/1`/`dump/1` round-trip the
   list unchanged (already string-keyed maps from `jsonb`), which keeps the keyed-
   slot `on_conflict` upsert (`Loopctl.Coordination`) correct.
+
+  ## Legacy-map load coercion (AC-40.A1.5 — no live row breaks)
+
+  Before US-40.A1 `refs` was a fixed-key MAP, and an empty `%{}` was a valid,
+  persistable value. `load/1` therefore ALSO coerces a stored JSON OBJECT into the
+  list form (`%{}` → `[]`, `{file, pr}` → `[{file}, {pr}]`, key-sorted to mirror
+  the data migration) instead of raising. This is defense-in-depth: the
+  `ReshapeChannelPostsRefsToList` data migration reshapes every object row, but a
+  single legacy row that escaped it (a replica lag, a manual write) must not 500
+  the whole channel read — one un-loadable row would deny the coordination bus.
   """
   use Ecto.Type
 
@@ -41,6 +51,19 @@ defmodule Loopctl.Coordination.RefsList do
   @impl true
   def load(nil), do: {:ok, nil}
   def load(list) when is_list(list), do: {:ok, list}
+  # Coerce a legacy fixed-key MAP (pre-US-40.A1 shape, incl. an empty `%{}`) into
+  # the list form rather than raising — see "Legacy-map load coercion" above. Keys
+  # are sorted so the item order matches the data migration's `ORDER BY key`; each
+  # value is kept as-is (old-shape values were always strings).
+  def load(map) when is_map(map) and not is_struct(map) do
+    list =
+      map
+      |> Enum.sort_by(fn {k, _v} -> k end)
+      |> Enum.map(fn {k, v} -> %{"type" => to_string(k), "value" => v} end)
+
+    {:ok, list}
+  end
+
   def load(_), do: :error
 
   @impl true
