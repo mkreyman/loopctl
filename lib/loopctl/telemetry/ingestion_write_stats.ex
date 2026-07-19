@@ -17,9 +17,26 @@ defmodule Loopctl.Telemetry.IngestionWriteStats do
   process, and the BYPASSRLS `AdminRepo` pool is small (3 conns in prod) and already
   carries the per-request rate-limiter upsert — so a blocking upsert here would couple
   article-write tail latency to AdminRepo pool checkout (up to the checkout timeout)
-  under pool pressure or a DB blip. To decouple, the increment is dispatched to a
-  supervised, fire-and-forget task (`async?/0`, default true) so the request path never
-  blocks on it.
+  under pool pressure or a DB blip. To decouple the SLOW part (the AdminRepo checkout +
+  upsert), the increment is dispatched to a supervised, fire-and-forget task
+  (`async?/0`, default true) so the request path never waits on the DB round-trip.
+
+  ### Residual coupling (honest bound, not "zero blocking")
+
+  The dispatch itself is `Task.Supervisor.start_child/2`, which is a `GenServer.call`
+  into the SINGLE bounded task-supervisor process. Under normal (low-frequency) write
+  load that call returns in microseconds. But the `:high_reject_rate` detector this feeds
+  triggers on a client HAMMERING create in a retry loop — a high-frequency write storm by
+  design — and during such a storm every request serializes through that one supervisor
+  mailbox, so the "async" dispatch is NOT fully decoupled from the request path: it is
+  BOUNDED (a fast mailbox enqueue, capped by the 5s call timeout whose EXIT is caught
+  below), not zero. This is acceptable for a best-effort analytics counter — correctness
+  is unaffected (drops/exits are caught and swallowed) — but it is real latency coupling
+  to a shared process precisely during the storm being observed. If that coupling ever
+  matters (writes grow hot enough that the supervisor mailbox is a measurable tail-latency
+  contributor), the drop-in upgrade is the ETS-buffer + periodic-flush design named below:
+  an `:ets.update_counter/3` on the hot path (no process call at all) with one flusher
+  owning AdminRepo.
 
   ## Bounded fan-out (the reject storm is the worst case)
 
@@ -29,11 +46,27 @@ defmodule Loopctl.Telemetry.IngestionWriteStats do
   upsert per rejected write, contending for the 3-conn pool (shared with the rate
   limiter + auth) and amplifying the very outage the detector exists to catch. So the
   dispatch goes through the BOUNDED `Loopctl.Telemetry.IngestionWriteStatsTaskSupervisor`
-  (`max_children`, default 200): over the cap `start_child` returns
-  `{:error, :max_children}` and the increment is DROPPED (best-effort analytics) rather
-  than queueing unbounded checkouts. If write volume ever grows hot enough to pressure
-  the pool even under the cap, an ETS-buffer+flush (ScaleAlerts style) is the drop-in
-  next step.
+  (`max_children`, default 10 — sized to the 3-conn AdminRepo pool, NOT a large fan-out,
+  so a storm cannot oversubscribe the pool with concurrent checkouts): over the cap
+  `start_child` returns `{:error, :max_children}` and the increment is DROPPED
+  (best-effort analytics) rather than queueing unbounded checkouts. If write volume ever
+  grows hot enough to pressure the pool even under the cap, an ETS-buffer+flush
+  (ScaleAlerts style) is the drop-in next step.
+
+  Because drops happen precisely DURING a reject storm, a per-drop `Logger.warning` would
+  itself flood the logging pipeline at exactly the wrong moment (a DoS amplification of
+  the incident being observed). So the drop log is SAMPLED: every drop bumps a shared
+  atomic counter and only one aggregate warning is emitted per `@drop_log_sample` drops
+  (plus the very first), bounding drop-log volume regardless of storm rate.
+
+  IMPORTANT — these counters are RATIO-safe but NOT absolute-count-safe under a storm.
+  Because drops at the `max_children` cap happen precisely DURING a reject storm, the
+  rollup systematically UNDERCOUNTS during the very incidents it records. That is fine for
+  the ratio-based `:high_reject_rate` detector — drops are outcome-independent, so
+  `reject_rate` is preserved and `total_attempts` still clears `min_attempts` during a
+  storm. Do NOT, however, layer any ABSOLUTE-volume alerting (e.g. "N rejects/window")
+  on `ingestion_write_stats` without accounting for this storm-time undercount, or move
+  to the ETS-buffer design first so bursts are absorbed rather than dropped.
 
   In TEST the dispatch runs INLINE (`config :loopctl, #{inspect(__MODULE__)}, async:
   false`) so the upsert shares the emitting test process's sandboxed connection and the
@@ -144,20 +177,56 @@ defmodule Loopctl.Telemetry.IngestionWriteStats do
       {:error, :max_children} ->
         # Bounded supervisor at capacity (a write burst): DROP the increment rather
         # than block the observed request or queue an unbounded AdminRepo checkout.
-        Logger.warning(
-          "IngestionWriteStats: task supervisor at capacity; dropping #{column} increment"
-        )
+        log_dropped_increment(:max_children, column)
 
       {:error, reason} ->
-        Logger.warning("IngestionWriteStats: failed to start upsert task: #{inspect(reason)}")
+        log_dropped_increment({:error, reason}, column)
     end
 
     :ok
   catch
     kind, reason ->
       # :exit (:noproc) if the supervisor is down, etc. Never let it escape to :telemetry.
-      Logger.warning("IngestionWriteStats: upsert dispatch #{kind}: #{inspect(reason)}")
+      log_dropped_increment({kind, reason}, column)
       :ok
+  end
+
+  # SAMPLED drop log. Drops happen precisely DURING a reject storm (the incident this
+  # rollup observes), so an unthrottled per-drop `Logger.warning` would flood the log
+  # pipeline exactly when the node is already under load — amplifying the storm. Count
+  # every drop in a shared atomic counter and emit ONE aggregate warning per
+  # `@drop_log_sample` drops (plus the very first, so a nascent storm still surfaces).
+  @drop_log_sample 1000
+  defp log_dropped_increment(cause, column) do
+    n = increment_drop_counter()
+
+    if rem(n - 1, @drop_log_sample) == 0 do
+      Logger.warning(
+        "IngestionWriteStats: dropping rollup increments under load " <>
+          "(#{n} dropped since boot; latest cause=#{inspect(cause)}, column=#{column})"
+      )
+    end
+
+    :ok
+  end
+
+  # Shared, lazily-initialized atomic drop counter (best-effort: a rare init race just
+  # loses a couple of counts, which is fine for a sampled diagnostic). `:counters` is
+  # lock-free with write concurrency, so bumping it on the drop path adds no contention.
+  defp increment_drop_counter do
+    ref =
+      case :persistent_term.get({__MODULE__, :drop_counter}, nil) do
+        nil ->
+          new = :counters.new(1, [:write_concurrency])
+          :persistent_term.put({__MODULE__, :drop_counter}, new)
+          new
+
+        existing ->
+          existing
+      end
+
+    :counters.add(ref, 1, 1)
+    :counters.get(ref, 1)
   end
 
   # Task body runs in its OWN process, outside handle_event's rescue, so it self-rescues:
