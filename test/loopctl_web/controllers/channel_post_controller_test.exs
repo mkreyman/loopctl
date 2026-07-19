@@ -518,6 +518,9 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         end)
 
       assert log =~ "rate_limited"
+      # The signal carries a write discriminator so an external telemetry/log
+      # consumer can tell write flooding from read scraping (US-40.D5).
+      assert log =~ "limit_kind=write"
     end
 
     # AC-39.2.6 — a denylist hit / oversized body is a 422 (validation), not persisted.
@@ -1217,6 +1220,10 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         end)
 
       assert log =~ "rate_limited"
+      # The signal carries a READ discriminator so an external telemetry/log
+      # consumer can tell read scraping from write flooding (US-40.D5) — the two
+      # trips are no longer an indistinguishable :rate_limited shape.
+      assert log =~ "limit_kind=read"
 
       # The trip was counted on the READ bucket, distinct from the write bucket —
       # read and write abuse are independently observable (US-40.D5 technical note).
@@ -1282,6 +1289,64 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         assert conn.status == 200
         assert get_resp_header(conn, "retry-after") == []
       end
+    end
+
+    # AC-40.D5.3 — the coordination read cap is CLAMPED below the tenant's live
+    # pipeline per-key cap (read_limit/1's min/2). A tenant misconfiguring the read
+    # cap ABOVE the pipeline cap must NOT leave read trips shadowed by an anonymous
+    # pipeline 429: the effective read cap is the pipeline value, not the configured
+    # (larger) read value. Assert the EFFECTIVE limit the controller hands the read
+    # bucket, independent of plug ordering (parity with write_limit/1's clamp).
+    test "AC-40.D5.3: a read cap set ABOVE the pipeline cap is clamped to the pipeline value" do
+      {:ok, limits} = Agent.start_link(fn -> %{} end)
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window_ms, limit ->
+        Agent.update(limits, &Map.put(&1, bucket, limit))
+        {:allow, 1}
+      end)
+
+      # Read cap (100) deliberately set ABOVE the pipeline per-key cap (3).
+      tenant =
+        fixture(:tenant, %{
+          settings: %{
+            "channel_post_read_limit_per_minute" => 100,
+            "rate_limit_requests_per_minute" => 3
+          }
+        })
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+      assert conn.status == 200
+
+      read_bucket =
+        limits
+        |> Agent.get(&Map.keys/1)
+        |> Enum.find(&String.starts_with?(&1, "channel_post_read:key"))
+
+      # Effective cap clamped to the pipeline value (3), NOT the configured 100.
+      assert Agent.get(limits, &Map.get(&1, read_bucket)) == 3
+    end
+
+    # AC-40.D5.3 — a per-read cap stored as a JSON STRING must still enforce. Without
+    # coercion the string flows to the limiter verbatim, where Elixir term ordering
+    # (int < binary) never denies (Hammer) or the is_integer guard raises and is
+    # swallowed to fail-open (Postgres) — either way silently neutering the read cap.
+    # Mirrors the write-path regression test ("...write cap stored as a STRING...").
+    test "a coordination read cap stored as a STRING is coerced and still enforces (429)" do
+      stub_counting_limiter()
+      tenant = fixture(:tenant, %{settings: %{"channel_post_read_limit_per_minute" => "3"}})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      for _ <- 1..3 do
+        conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+        assert conn.status == 200
+      end
+
+      conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+      assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
     end
 
     # AC-40.D5.2 — the read response is BOUNDED BY CONSTRUCTION; this story adds the

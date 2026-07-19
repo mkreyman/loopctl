@@ -62,8 +62,15 @@ defmodule LoopctlWeb.ChannelPostController do
   # The read (`:index`) is the same agent-role, tenant-scoped coordination surface
   # as the write — never human-anchor gated (the human-anchor default-deny test
   # only walks POST/PUT/PATCH/DELETE, so this GET needs no allowlist entry).
+  # `:handoffs` is named PROACTIVELY here (parity with the `rate_limit_read`
+  # guard, AC-40.D5.1) so that when 40.C1 lands the `:handoffs` action ON THIS
+  # controller, the agent-role gate attaches in lockstep with the read limiter —
+  # never a body-returning read that is rate-limited but escapes controller-level
+  # role enforcement. Until then the guard simply never matches the nonexistent
+  # action. (If 40.C1 instead implements handoffs in a SEPARATE controller,
+  # neither this guard nor the limiter below applies and both mentions are inert.)
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :agent] when action in [:create, :index, :delete, :show]
+       [role: :agent] when action in [:create, :index, :delete, :show, :handoffs]
 
   # Per-write rate limit (AC-39.2.8): a TIGHTER, config-driven cap on top of the
   # generic per-key/per-tenant pipeline RateLimiter, reusing the same
@@ -81,8 +88,10 @@ defmodule LoopctlWeb.ChannelPostController do
   # per-key/per-tenant limiter: this dedicated cap trips FIRST (clamped below the
   # pipeline cap) so a read burst emits the coordination `:rate_limited` signal
   # instead of being shadowed by an anonymous pipeline 429. `:handoffs` is named
-  # proactively (AC-40.D5.1); until 40.C1 lands that action the guard simply never
-  # matches, so 40.C1's route inherits this limiter automatically when it arrives.
+  # proactively (AC-40.D5.1) and kept SYMMETRIC with the RequireRole guard above;
+  # until 40.C1 lands that action the guard simply never matches. IF 40.C1 defines
+  # `:handoffs` ON THIS controller, both the role gate and this limiter attach to it
+  # automatically; if 40.C1 puts handoffs in a separate controller, neither applies.
   plug :rate_limit_read when action in [:index, :show, :handoffs]
 
   tags(["Coordination"])
@@ -570,7 +579,8 @@ defmodule LoopctlWeb.ChannelPostController do
 
         emit_security_event(:rate_limited, %{
           tenant_id: api_key.tenant_id,
-          api_key_id: api_key.id
+          api_key_id: api_key.id,
+          limit_kind: :write
         })
 
         conn
@@ -605,7 +615,8 @@ defmodule LoopctlWeb.ChannelPostController do
 
         emit_security_event(:rate_limited, %{
           tenant_id: api_key.tenant_id,
-          api_key_id: api_key.id
+          api_key_id: api_key.id,
+          limit_kind: :read
         })
 
         conn
@@ -731,7 +742,8 @@ defmodule LoopctlWeb.ChannelPostController do
         "(tenant=#{Map.get(metadata, :tenant_id)} " <>
         "api_key=#{Map.get(metadata, :api_key_id)} " <>
         "agent=#{Map.get(metadata, :agent_id)} " <>
-        "project=#{Map.get(metadata, :project_id)})"
+        "project=#{Map.get(metadata, :project_id)} " <>
+        "limit_kind=#{Map.get(metadata, :limit_kind)})"
     )
 
     :ok
