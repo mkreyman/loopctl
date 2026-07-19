@@ -1,0 +1,39 @@
+{
+  "id": "US-40.D3",
+  "title": "Scope channel WRITES to the caller's own project (membership) — default-deny cross-project posting",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
+  "priority": "high",
+  "phase": "coordination_bus_v2_D",
+  "story": {
+    "as_a": "loopctl operator whose tenant has many projects and many agent keys",
+    "i_want_to": "ensure an agent can only post to the channel of a project it belongs to — not any project in the tenant",
+    "so_that": "one compromised agent key cannot inject prompt content into every project channel across the whole tenant"
+  },
+  "rationale": "The security-adversary's prompt-injection blast-radius finding + signed-off decision 2: today the write only checks that the project is OWNED BY THE TENANT — post/3 calls Projects.get_project(tenant_id, project_id) (coordination.ex:154) and nothing more. So ANY tenant agent key can post to ANY project channel in the tenant, and that body auto-injects into every other session's SessionStart on that repo. One compromised agent key = a tenant-wide injector. Decision 2 makes the default 'the session's OWN repo/project channel, only that channel': the server must ENFORCE write-to-own-project (project-scoped keys / membership), default-deny cross-project posting — turning the client-side default into a real boundary against a rogue tenant key.",
+  "background": {
+    "reference": "signed-off decision 2 (membership = the session's own project; server enforces write-to-own-project); security-adversary 'Prompt-injection blast radius ... create only checks project ownership by tenant'; post/3 (coordination.ex:136-167, the check at :154); the existing ownership-rejected 422 path (channel_post_controller.ex:336-344).",
+    "includes": "A project-membership (or project-scoped-key) predicate on the write path, default-deny, with the same oracle-safe 422 as the current cross-tenant rejection."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.D3.1", "description": "The write (post/3, coordination.ex:136-167) authorizes the caller against the SPECIFIC project, not merely the tenant: the agent must be a member of / scoped to the target project. A post to a project the caller does not belong to (even within its own tenant) is rejected with the SAME byte-identical 422 ownership error the cross-tenant case already returns (@ownership_error_message, channel_post_controller.ex:74, 336-344) — no oracle distinguishing 'not a member' from 'not in your tenant' from 'does not exist'.", "status": "pending" },
+    { "id": "AC-40.D3.2", "description": "Membership is derived from an AUTHENTICATED, server-side source — either a project scope on the api_key (a project-scoped key) or an explicit membership relation — NEVER a client-supplied field. The exact mechanism is chosen from what loopctl already has (api_key project scoping if present; else a minimal channel-membership predicate); the choice + its source table are documented. Default-DENY: absent an explicit membership/scope, the write is rejected.", "status": "pending" },
+    { "id": "AC-40.D3.3", "description": "The READ posture is unchanged (reads stay oracle-safe + tenant-scoped as today, channel_post_controller.ex:200-254) — this story scopes WRITES only. A test asserts a second project in the SAME tenant, that the agent is not a member of, cannot be posted to, while the agent's own project still works.", "status": "pending" },
+    { "id": "AC-40.D3.4", "description": "If a full membership model is out of reach in this story, the accepted-risk fallback (re-scope line 98 / decision 2) is per-project-scoped agent keys as the compensating control — but that must be a DELIBERATE, documented sign-off, not a silent no-op. Default remains deny cross-project; the story does NOT ship leaving the tenant-wide hole open. The security signal (:ownership_rejected, channel_post_controller.ex:338) fires on a cross-project attempt so the injector is observable.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.D3.1", "name": "agent posts to its own project", "type": "integration", "preconditions": ["agent A scoped/member of project P1"], "steps": ["POST /channel/posts project_id=P1"], "expected_results": ["201"] },
+    { "id": "TC-40.D3.2", "name": "agent cannot post to a sibling project in the same tenant", "type": "integration", "preconditions": ["project P2 in the same tenant; agent A not a member of P2"], "steps": ["POST /channel/posts project_id=P2"], "expected_results": ["422 @ownership_error_message (byte-identical to cross-tenant); :ownership_rejected signal fires; nothing persisted"] },
+    { "id": "TC-40.D3.3", "name": "cross-tenant still 422 (unchanged)", "type": "integration", "preconditions": ["a project in another tenant"], "steps": ["POST to it"], "expected_results": ["422, identical body"] },
+    { "id": "TC-40.D3.4", "name": "read is unaffected", "type": "integration", "preconditions": ["existing US-39.3 read tests"], "steps": ["run them"], "expected_results": ["green — reads unchanged"] }
+  ],
+  "technical_notes": [
+    "The check lives in post/3 (coordination.ex:154): today `with {:ok, _project} <- Projects.get_project(tenant_id, project_id)`. ADD a membership predicate: `... , {:ok, _} <- project_writable_by_agent(tenant_id, agent_id, project_id)` returning {:error, :not_found} on non-membership so the endpoint maps it to the SAME 422 (channel_post_controller.ex:336-344) — no new error code, no oracle.",
+    "FIRST establish what loopctl has: does api_keys carry a project scope? Is there an agents<->projects membership relation? Grep for project scoping on api_key / a project_members-style table. Use the existing mechanism; only add a minimal one if none exists. Document the source in the story impl.",
+    "Also gate the CLAIM writes (40.B1 claim/release/done) and the graduate (40.E1) the same way — a claim/graduate on a project you cannot post to should also be denied. Note the coupling; keep the predicate shared.",
+    "Keep the :ownership_rejected telemetry (channel_post_controller.ex:336-344) firing so a cross-project attempt is observable (AC-39.2.9 parity).",
+    "Decision 2 fallback (per-project-scoped keys as the compensating control) is acceptable ONLY as a documented sign-off (AC-40.D3.4) — never ship silently leaving any tenant agent able to post anywhere.",
+    "Sequencing: step 9 (with 40.D2, 40.D5)."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 200000
+}

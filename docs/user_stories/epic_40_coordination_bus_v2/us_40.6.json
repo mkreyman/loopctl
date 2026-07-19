@@ -1,9 +1,11 @@
 {
   "id": "US-40.6",
   "title": "SSE live dashboard — a human watches the fleet coordinate",
-  "epic": { "id": "epic_40", "name": "Coordination Bus v2 + memory-keeper retirement" },
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
   "priority": "low",
-  "phase": "coordination_bus_v2_B",
+  "phase": "coordination_bus_v2_deferred",
+  "status": "deferred",
+  "deferred_rationale": "DEFERRED by the 5-reviewer design panel re-scope. The SSE dashboard is OPERATOR OVERSIGHT, and loopctl is agent-native: the AGENTS are the consumers of the bus and they consume at turn boundaries, not over SSE — so an SSE feed adds no value to the coordination loop itself. Human oversight already has a path (the superadmin API). This surface is also the heaviest lift here (a human cookie-session auth surface that may not yet exist, SSE-framing hardening, connection caps) for the least coordination value. Not on the active A-E path; revisit as a standalone operator-observability feature after the agent-facing bus is solid.",
   "story": {
     "as_a": "human operator running agents across several machines",
     "i_want_to": "watch a live feed of the coordination channel(s) for a repo in my browser",
@@ -12,11 +14,11 @@
   "rationale": "The design (§5) concluded realtime is wasted on agents (they consume at turn boundaries) but valuable for a HUMAN watching. This is that surface: a read-only, one-way SSE feed of channel posts. SSE (not websockets) because it is one-way, reconnects trivially, and is friendly to Fly's suspend-on-idle. It renders untrusted, agent-authored post bodies into a browser, so it carries an XSS surface that must be closed.",
   "background": {
     "reference": "docs/repo-coordination-bus.md §5; loopctl public web + auth",
-    "includes": "Read-only view; reuse channel_recent for backfill (US-40.5 cursor) + an SSE stream for new posts."
+    "includes": "Read-only view; reuse channel_recent for backfill (US-40.C2 cursor) + an SSE stream for new posts."
   },
   "acceptance_criteria": [
     { "id": "AC-40.6.1", "description": "The SSE stream is served from a HUMAN cookie/browser-session-authenticated surface — NOT the agent-key /api/v1 :authenticated pipeline (Bearer). Native browser EventSource cannot set an Authorization header (cookies only), so an agent-key /api/v1 endpoint is unreachable from EventSource. Resolve to one of: a cookie-session web route, or a short-lived signed query-param stream token minted by an authenticated page. (First confirm loopctl HAS a human cookie-session auth surface distinct from agent keys — not evidenced in the current code; if absent, that surface is a prerequisite.) READ-ONLY, one-way.", "status": "pending" },
-    { "id": "AC-40.6.2", "description": "A web view backfills recent posts (channel_recent + KeysetCursor from US-40.5) then subscribes to the stream for live appends; reconnect on drop resumes via Last-Event-ID, where the id is a SERVER-controlled keyset token ((inserted_at,id)), never attacker-controlled text.", "status": "pending" },
+    { "id": "AC-40.6.2", "description": "A web view backfills recent posts (channel_recent + the keyset cursor from US-40.C2) then subscribes to the stream for live appends; reconnect on drop resumes via Last-Event-ID, where the id is a SERVER-controlled keyset token on (inserted_at, seq) (US-40.C2's keyset — NEVER (inserted_at, id): the random-v4-UUID tiebreak was the panel-rejected defect), never attacker-controlled text.", "status": "pending" },
     { "id": "AC-40.6.3", "description": "XSS-safe in the browser: body/key/refs/host are HEEx-escaped / rendered as text (never raw/innerHTML). AND SSE-framing-safe on the wire: each event is serialized as SINGLE-LINE JSON in one `data:` field (newlines escaped) so a post body containing newlines/`data:`/`event:`/`id:` cannot inject SSE control lines. Both are required — browser-escape alone does not close stream injection.", "status": "pending" },
     { "id": "AC-40.6.4", "description": "Tenant+project scoped: the PubSub topic is tenant-namespaced and the subscription is GATED by Projects.get_project(tenant_id, project_id) ownership BEFORE subscribe (a user cannot stream another tenant's project topic — mirror channel_recent oracle-safety). Resource-bounded: a per-user/per-tenant concurrent-stream cap AND a max stream duration / idle timeout (each SSE conn pins a BEAM process + a PubSub subscription — cap them). Fly-suspend-friendly: bounded keepalive, an idle stream does not pin a machine awake indefinitely.", "status": "pending" }
   ],
@@ -31,9 +33,9 @@
     "NOT websockets (design §5) — one-way, reconnect-cheap, suspend-friendly.",
     "Auth: this is the human web surface, not agent keys — EventSource sends cookies, not Bearer. Serve from a cookie-session route or a signed stream token; confirm/introduce a human auth surface first.",
     "Escape ALL agent-authored fields in the web layer (HEEx auto-escapes; never raw/innerHTML) AND single-line-JSON each SSE event.",
-    "Backfill via US-40.5 KeysetCursor; server-minted Last-Event-ID for resume.",
+    "Backfill via US-40.C2's keyset cursor on (inserted_at, seq); server-minted Last-Event-ID for resume (never (inserted_at, id)).",
     "Cap concurrent streams per user/tenant + a max duration; each conn = a BEAM process + PubSub sub."
   ],
-  "dependencies": ["US-39.3", "US-40.5"],
+  "dependencies": ["US-39.3", "US-40.C2"],
   "estimated_tokens": 300000
 }

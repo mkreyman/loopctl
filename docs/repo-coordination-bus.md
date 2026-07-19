@@ -58,6 +58,7 @@ A channel is a `project_id` (a work project, or the KB scope created via `create
 Deliberately minimal (owner decision, 2026-07-17: *"I wouldn't bother with message types and their specific retentions. It's really that simple."*). A post carries, server-stamped: `agent_id` (from the key — tamper-evident, never from the body), `host`, `session_id`, `created_at`, `project_id`; plus a free-text `body`, an **optional** `key`, and **optional** structured `refs` (`{file, pr, branch, commit}`).
 
 - **No `kind` enum.** A post is just a message on the repo's channel. Whether it's a heads-up, a status, a hand-off, or a working-state note is expressed in the body/refs, not a required taxonomy — the fleet audit showed the 6-category taxonomy in memory-keeper was barely used, so we don't reintroduce one.
+  - **OPEN (pending owner sign-off, Epic 40 US-40.A4):** the 5-reviewer design panel proposes un-bundling this decision into RETENTION taxonomy (stays retired — retention remains uniform 30d) vs a read-ROUTING label. It would reintroduce ONLY an optional, freeform, indexed `kind` (NO enum, NO per-kind retention) to route discovery reads. This reinterprets a locked owner decision and is NOT yet authorized — see `docs/user_stories/epic_40_coordination_bus_v2/us_40.a4.json` `owner_decision_conflict`. Until Mark signs off, this section stands as written.
 - **`key` is optional and enables upsert.** Posting with the same `(project_id, key)` overwrites — that covers memory-keeper's dominant keyed working-state pattern (`session_goal`, `test_plan`, `build-complete-<ticket>`) without a schema. Omit `key` for a plain append-only message.
 - **Advisory locks / presence are NOT in this model.** ("Who's editing what / who's live" is a later refinement built on `refs` + `UpdateLastSeen`, not a message type — see §7. v1 is: post and read.)
 
@@ -99,7 +100,9 @@ Ordering + tamper-evidence come from the existing audit chain + STH — no separ
 
 ## 4. Security / tier posture
 
-This is a **coordination surface, not chain-of-custody.** Posting/reading your own tenant's channel is not "approving your own work" — it is the same *content* class as the KB surface that owner decision #331 already made fully agent-usable. So: **agent-role, no `RequireHumanAnchor`**, RLS tenant-scoped, `agent_id` stamped server-side (never from the body). Cross-tenant isolation is the existing RLS boundary. No new trust surface.
+This is a **coordination surface, not chain-of-custody.** Posting/reading your own tenant's channel is not "approving your own work" — it is the same *content* class as the KB surface that owner decision #331 already made fully agent-usable. So: **agent-role, no `RequireHumanAnchor`**, RLS tenant-scoped, `agent_id` stamped server-side (never from the body). Cross-tenant isolation is the existing RLS boundary.
+
+**Trust-surface note (updated by Epic 40 US-40.D3, owner signed-off decision 2).** v1 added no new *cross-tenant* trust surface — RLS remains the isolation boundary. Epic 40, driven by the security-adversary's prompt-injection blast-radius finding, DOES add one deliberate INTRA-tenant boundary: channel WRITES are scoped to the caller's own project (project membership / project-scoped keys), default-deny cross-project posting, so one compromised agent key cannot inject into every project channel across the tenant. This is a narrow write-authorization predicate (reads stay tenant-scoped + oracle-safe, unchanged), aligned with the multi-tenant/RLS rules — it refines, not replaces, the RLS posture. See `docs/user_stories/epic_40_coordination_bus_v2/us_40.d3.json`.
 
 ---
 
@@ -143,3 +146,4 @@ Everything else (entities, relations, journal, compression, observations, agent-
 3. **TEAM CHANNEL injection is created/on by default for every repo** (no per-repo opt-in). ✔
 4. **memory-keeper retirement gate:** full migration of agent/skill references follows *flawless* real use of the new channels — the bus must prove itself first. ✔
 5. **Keep it simple:** no message-type taxonomy, no per-type retention (§3.2, §3.4). ✔
+   - **OPEN (Epic 40 US-40.A4, pending owner sign-off):** the design panel proposes reintroducing an optional read-ROUTING `kind` label (NO enum, retention stays uniform 30d) — un-bundling the retention taxonomy (retired) from the routing concern. This reinterprets this locked decision and requires Mark's explicit authorization before it is folded in (§3.2 note; us_40.a4.json `owner_decision_conflict`). Not yet approved.

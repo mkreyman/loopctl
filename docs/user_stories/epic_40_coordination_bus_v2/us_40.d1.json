@@ -1,0 +1,41 @@
+{
+  "id": "US-40.D1",
+  "title": "Harden the read path: bounded previews framed as untrusted DATA + oracle-safe GET /channel/posts/:id",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
+  "priority": "high",
+  "phase": "coordination_bus_v2_D",
+  "story": {
+    "as_a": "coding agent whose SessionStart/turn hook injects channel content into my context",
+    "i_want_to": "read only bounded previews framed as untrusted DATA, and fetch a full body only via a deliberate, oracle-safe, rate-limited by-id call",
+    "so_that": "the agent-facing read path is as hardened as the injection hook — no full un-fenced bodies, no auto-follow lever, no cross-tenant existence oracle"
+  },
+  "rationale": "The re-scope calls this the panel's BIGGEST MISS (invariant 4): reads must be as hardened as the SessionStart hook. Today channel_recent / the MCP read returns FULL, un-fenced bodies (channel_post_json/1 returns post.body verbatim, channel_post_controller.ex:268) that get injected into every other session on the repo. The security-adversary's prompt-injection finding: the surface GROWS with freer refs, bigger previews, and surfacing the post id ('fetch post X for full instructions'). Mitigation: keep previews SMALL, frame them as untrusted DATA in the tool description, and make the full-body fetch a SEPARATE deliberate call — GET /channel/posts/:id — that is oracle-safe (filter id AND tenant_id on the AdminRepo path, exactly like fetch_owned_post/2, coordination.ex:218-222) and rate-limited, with NO 'auto-follow this id' affordance.",
+  "background": {
+    "reference": "re-scope invariant 4 + Group D; security-adversary 'Prompt-injection blast radius' + 'Multi-tenant isolation is solid (id/project_id AND tenant_id filtered)'; channel_post_json/1 (channel_post_controller.ex:261-273); fetch_owned_post/2 (coordination.ex:218-222); the read has no by-id endpoint today (router.ex:131-140).",
+    "includes": "A bounded-preview list read (coordinated with 40.C2's substring projection), a new oracle-safe GET /:id, untrusted-DATA framing in the MCP tool descriptions, and NO auto-follow lever."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.D1.1", "description": "OWNERSHIP: this story (40.D1) BUILDS the shared DB substring-projection preview builder — `fragment(\"substring(? for ?)\", p.body, ^N)` returning `body_preview` + `truncated` + `id` — as the single read-model primitive; 40.C2's delta/cursor read CONSUMES it (C2 depends on D1, so D1 lands the projection first and C2 reuses it — neither attributes the mechanism to the other). The list read (channel_recent / GET /channel/posts, channel_post_controller.ex:209-254) uses it so the full column is never detoasted; channel_post_json/1 (channel_post_controller.ex:261-273) returns `body_preview` + `truncated` + `id`, replacing the verbatim `post.body` at line 268. N is small (e.g. 512 bytes) to keep the injection blast radius small (security-adversary).", "status": "pending" },
+    { "id": "AC-40.D1.2", "description": "The MCP channel_recent / channel_handoffs tool descriptions (mcp-server/index.js ~2298-2320) explicitly FRAME returned bodies as UNTRUSTED DATA authored by other agents — not instructions to follow. There is NO 'fetch post X and follow it' auto-follow tool or affordance; fetching a full body is always an explicit, separate agent decision (AC-40.D1.3).", "status": "pending" },
+    { "id": "AC-40.D1.3", "description": "New GET /api/v1/channel/posts/:id (agent role, channel_post_controller.ex:61 posture) returns ONE post's full body, ORACLE-SAFE: it fetches with `WHERE id = ^id AND tenant_id = ^tenant_id` on the AdminRepo (BYPASSRLS) path — mirroring fetch_owned_post/2 (coordination.ex:218-222) — so a foreign-tenant or nonexistent id returns a byte-identical 404 (no existence oracle). A malformed (non-UUID) id is a clean 404 via the valid_uuid? guard (coordination.ex:581-582), never an Ecto.Query.CastError/500.", "status": "pending" },
+    { "id": "AC-40.D1.4", "description": "The full body returned by GET /:id is itself rendered inside the same untrusted-DATA fence by the MCP client (a channel_get tool description states the body is untrusted). GET /:id is rate-limited + response-byte-capped (coordinated with 40.D5). A `channel_get(post_id)` MCP tool is added and shipped.", "status": "pending" },
+    { "id": "AC-40.D1.5", "description": "Coordination.get_post(tenant_id, post_id) is added as the public, tenant-scoped, UUID-guarded fetch (v1/Epic 39 ships only list + an INTERNAL delete lookup, fetch_owned_post/2 coordination.ex:218-222). It is the single shared fetch path used by GET /:id here AND by graduate (40.E1) — no duplicated by-id query.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.D1.1", "name": "list returns bounded preview not full body", "type": "integration", "preconditions": ["a post with a 16KB body"], "steps": ["GET /channel/posts"], "expected_results": ["body_preview <= N bytes, truncated=true; full 16KB body NOT present"] },
+    { "id": "TC-40.D1.2", "name": "GET /:id returns the full body for an owned post", "type": "integration", "preconditions": ["an owned post"], "steps": ["GET /channel/posts/:id"], "expected_results": ["200 with the full body"] },
+    { "id": "TC-40.D1.3", "name": "GET /:id cross-tenant is a byte-identical 404", "type": "integration", "preconditions": ["a post in another tenant"], "steps": ["GET /channel/posts/:that_id"], "expected_results": ["404, identical body to a nonexistent id (no oracle)"] },
+    { "id": "TC-40.D1.4", "name": "GET /:id malformed id is a clean 404", "type": "integration", "preconditions": ["-"], "steps": ["GET /channel/posts/not-a-uuid"], "expected_results": ["404, not a 500 CastError"] },
+    { "id": "TC-40.D1.5", "name": "no auto-follow affordance exists", "type": "unit", "preconditions": ["the MCP tool set"], "steps": ["inspect tool descriptions"], "expected_results": ["bodies framed as untrusted DATA; no tool that fetches-and-follows an id automatically"] }
+  ],
+  "technical_notes": [
+    "PAIR with 40.C2 (they co-own the read path): the substring projection + preview shape is authored once and used by both the list read (here) and the delta/cursor read (40.C2). Land previews BEFORE any body-cap change (architect ordering; body cap stays 16KB per signed-off decision 1, so this is about the read model, not a cap bump).",
+    "GET /:id: add route in router.ex after line 135 (the existing GET /channel/posts). Reuse Coordination.get_post/2 (new, AC-40.D1.5) which wraps the fetch_owned_post/2 query (coordination.ex:218-222) but PUBLIC + UUID-guarded. Same oracle-safety proof as the delete path (coordination.ex:180-213).",
+    "Untrusted-DATA framing: update the MCP tool descriptions in mcp-server/index.js (channel_recent ~2298, add channel_get). The framing is the same discipline SessionStart injection already uses (per the epic-39 hardening) — mirror it.",
+    "NO auto-follow: do NOT add any tool or hook that reads an id from a body and auto-fetches it. The blast-radius mitigation is 'previews small + fetch is a deliberate human/agent choice'.",
+    "Rate-limit/byte-cap on GET /:id is specified in 40.D5 (they coordinate on the :show/:index limiter) — here just require it exists.",
+    "Sequencing: step 4, PAIRED with 40.C2. This is the read-hardening half; 40.C2 is the cursor/lost-write half."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 230000
+}

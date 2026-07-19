@@ -1,9 +1,11 @@
 {
   "id": "US-40.2",
   "title": "Presence: who is live on this repo right now",
-  "epic": { "id": "epic_40", "name": "Coordination Bus v2 + memory-keeper retirement" },
-  "priority": "medium",
-  "phase": "coordination_bus_v2_A",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
+  "priority": "low",
+  "phase": "coordination_bus_v2_deferred",
+  "status": "deferred",
+  "deferred_rationale": "DEFERRED by the 5-reviewer design panel re-scope. Presence is genuinely useful at scale as a COLLISION-AVOIDANCE signal, but it ranks BELOW the load-bearing exactly-once CLAIM (40.B1) and directed DISCOVERY (40.C1) that make a handoff 'handled exactly once, not dropped' — the actual driving use case (beelink->mac-mini #812). Claim + discovery deliver the value presence only approximates; presence is a nice-to-have layered on top once those ship. Not on the active A-E path; revisit after the claim/discovery/read-hardening set is in daily multi-machine use.",
   "story": {
     "as_a": "coding agent about to make a change on a repo",
     "i_want_to": "see which other sessions (which machine/agent) are currently active on this repo",

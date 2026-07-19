@@ -1,0 +1,39 @@
+{
+  "id": "US-40.D2",
+  "title": "Restrict redact/delete to the post's own author (or elevated role) — kill the censor-and-replace vector",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
+  "priority": "high",
+  "phase": "coordination_bus_v2_D",
+  "story": {
+    "as_a": "agent that posted a message which accidentally leaked my own secret",
+    "i_want_to": "be the only one (besides an elevated operator) who can delete MY post before its TTL",
+    "so_that": "self-leak-pullback still works, but no other agent can silently censor-and-replace my messages on the shared channel"
+  },
+  "rationale": "The security-adversary + signed-off decision 3: today ANY tenant agent hard-deletes ANY post — delete_post/4 (coordination.ex:204-213) fetches by (id, tenant_id) only and the moduledoc explicitly says 'any agent in the tenant may delete any post in that tenant' (coordination.ex:180-186, channel_post_controller.ex:12-16). On a cross-session bus that is a CENSOR-AND-REPLACE primitive: a compromised/rogue agent key can delete another agent's handoff and post a lookalike, and no one notices. The ONLY legitimate delete reason in the transient model is pulling back YOUR OWN leaked secret before the 30-day TTL. So restrict delete to the post's OWN author (the server-stamped agent_id) OR an elevated role (>= user). This kills the any-agent vector while preserving self-leak-pullback.",
+  "background": {
+    "reference": "signed-off decision 3 (restrict US-39.7 redact to the post's OWN author or elevated role); security-adversary censor-and-replace; delete_post/4 + fetch_owned_post/2 + run_delete/4 (coordination.ex:204-287); the delete audit already captures deleted_post_agent_id vs deleted_by_agent_id (coordination.ex:281-285).",
+    "includes": "An authorship (or elevated-role) check on the delete path; keeps the audit + oracle-safety intact."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.D2.1", "description": "delete_post (coordination.ex:204-213) authorizes the delete: the caller's server-stamped agent_id MUST equal the post's author agent_id, OR the caller's role is elevated (>= user). A non-author agent attempting to delete another agent's post gets {:error, :not_found} — byte-identical to a missing post (no oracle revealing the post exists but is not yours). The fetch already binds (id, tenant_id) (fetch_owned_post/2, coordination.ex:218-222); add the author/role predicate.", "status": "pending" },
+    { "id": "AC-40.D2.2", "description": "The author check uses the AUTHENTICATED, server-stamped identity — never a client-supplied field. It compares post.agent_id to the caller's verified api_key.agent_id (channel_post_controller.ex:385-393). host/session_id (spoofable, channel_post.ex:24-27) are NEVER used. The elevated-role bypass is the escape hatch for an operator cleaning up a leak the author cannot (author's session gone) — gated on RequireRole >= user, not agent.", "status": "pending" },
+    { "id": "AC-40.D2.3", "description": "The moduledoc + endpoint doc are corrected: the 'any agent in the tenant may delete any post' framing (coordination.ex:180-186, channel_post_controller.ex:12-16, 170-176) is REPLACED with 'author-only (or elevated role) — the redact path is for self-leak-pullback, not fleet-wide cleanup'. The audit metadata (deleted_post_agent_id / deleted_by_agent_id, coordination.ex:281-285) is retained — now they will normally be equal.", "status": "pending" },
+    { "id": "AC-40.D2.4", "description": "OPEN DECISION flagged for final owner confirmation (write it AUTHOR-ONLY for now): decision 3 offers an alternative — remove agent-delete ENTIRELY and rely on the denylist + 30-day TTL. This story implements AUTHOR-ONLY (+ elevated role); a technical_note records the alternative so the owner can choose to drop agent-delete altogether at review. Do NOT implement the removal without the owner's nod.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.D2.1", "name": "author can delete own post", "type": "integration", "preconditions": ["agent A posted a post"], "steps": ["A deletes it"], "expected_results": ["204; row gone; audited (deleted_by == deleted_post agent)"] },
+    { "id": "TC-40.D2.2", "name": "non-author agent cannot delete another agent's post", "type": "integration", "preconditions": ["agent A posted; agent B (role agent) in the same tenant"], "steps": ["B deletes A's post"], "expected_results": ["404 (byte-identical to nonexistent); A's post survives"] },
+    { "id": "TC-40.D2.3", "name": "elevated role can delete any post in tenant", "type": "integration", "preconditions": ["a user-role key; a post by agent A"], "steps": ["the user-role caller deletes A's post"], "expected_results": ["204; audited as deleted by the elevated actor"] },
+    { "id": "TC-40.D2.4", "name": "cross-tenant delete is still 404 (unchanged)", "type": "integration", "preconditions": ["a post in another tenant"], "steps": ["delete it"], "expected_results": ["404, no oracle"] }
+  ],
+  "technical_notes": [
+    "Thread the caller's author identity + role into delete_post: add the predicate to fetch_owned_post/2 (coordination.ex:218-222) — either `WHERE id AND tenant_id AND agent_id = ^caller_agent_id` for the author path, OR fetch then check `post.agent_id == caller_agent_id or elevated?`. Prefer fetch-then-check so the elevated-role bypass is clean and both non-author and nonexistent collapse to the same nil -> :not_found (no oracle).",
+    "Role: the route is currently RequireRole role: :agent (channel_post_controller.ex:61). Keep :agent for the AUTHOR path; the elevated bypass checks the api_key role (>= user) inside the action/context. Do NOT split into two routes.",
+    "Correct the docs that assert fleet-wide delete (coordination.ex:180-186, 227; channel_post_controller.ex:12-16, 170-176). This is the behavior change the security review requires.",
+    "ALTERNATIVE (owner decision, decision 3): drop agent-delete entirely (rely on denylist + TTL). NOT implemented here — flagged in AC-40.D2.4. If the owner picks it, this story becomes 'remove the DELETE route for agent role; keep an elevated-only redact'.",
+    "Keep the audit-in-Multi + StaleEntryError race handling (run_delete/4, coordination.ex:227-267) exactly — only the authorization gate changes.",
+    "Sequencing: step 9 (with 40.D3, 40.D5)."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 150000
+}

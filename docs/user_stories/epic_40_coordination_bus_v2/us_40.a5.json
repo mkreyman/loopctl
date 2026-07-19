@@ -1,0 +1,39 @@
+{
+  "id": "US-40.A5",
+  "title": "Advisory addressing: optional `to_host` / `to_capability` (surfacing-only, NEVER authz)",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
+  "priority": "high",
+  "phase": "coordination_bus_v2_A",
+  "story": {
+    "as_a": "coding agent handing off work that only a specific machine or capability can pick up",
+    "i_want_to": "address a post to a `to_host` and/or `to_capability` so the intended receiver can discover it as directed-to-me",
+    "so_that": "beelink->mac-mini #812 ('mac-mini because it has the fly auth capability') is a structured, routable target instead of prose buried in the body"
+  },
+  "rationale": "The panel's #1 agreed gap: #812 is 'beelink -> mac-mini because of a capability (fly auth)' and there is no addressing field — it is prose in the body, so the receiver cannot tell a message is for it and the bus cannot route it. Add optional, indexed `to_host` / `to_capability`. CRITICAL from the security-adversary: both are SPOOFABLE (a caller can claim any target), so they are SURFACING-ONLY — a discovery/read hint, NEVER authorization. They gate nothing; RLS + tenant scoping remain the only real boundary. #812's real target was a capability (`fly auth`), so `to_capability` matters more than `to_host`.",
+  "background": {
+    "reference": "panel agreed-gap #1 ('No addressing / targeting'); invariant 5 in the re-scope ('Spoofable fields are advisory/surfacing ONLY, never authorization'); the existing host/session_id spoofable-field precedent (channel_post.ex:24-27, 296-297).",
+    "includes": "Two nullable, freeform, indexed columns feeding the directed-discovery read (40.C1); explicit documentation that they are advisory."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.A5.1", "description": "Add `to_host text NULL` and `to_capability text NULL` to channel_posts (migration) + `field :to_host, :string` / `field :to_capability, :string` (channel_post.ex:75-93). Both are cast (channel_post.ex:128), blank-normalized to nil (:129), length-bounded (host <=255 like @host_max_length channel_post.ex:48; capability <=128 bytes), NUL/secret-scanned (added to @scanned_text_fields, :57), and FREEFROM (no enum). A post may set neither, either, or both.", "status": "pending" },
+    { "id": "AC-40.A5.2", "description": "A partial index supports the directed read: `(tenant_id, project_id, to_capability) WHERE to_capability IS NOT NULL` and `(tenant_id, project_id, to_host) WHERE to_host IS NOT NULL` (or a combined index) so 40.C1's `to_host=$me OR to_capability IN $caps` is index-served.", "status": "pending" },
+    { "id": "AC-40.A5.3", "description": "DOCUMENTED INVARIANT (moduledoc + the schema field doc + the MCP tool description): to_host/to_capability are ADVISORY SURFACING fields — spoofable, like host/session_id (channel_post.ex:24-27). They are NEVER read for authorization, ownership, or delivery guarantees; a caller can address a post to any host/capability. The ONLY authorization remains the verified key's tenant + (after 40.D3) project membership. A test asserts no code path branches on to_host/to_capability for an authz decision.", "status": "pending" },
+    { "id": "AC-40.A5.4", "description": "Both fields are returned in the read (channel_post_json/1, channel_post_controller.ex:261-273) and settable via the MCP channel_post tool (index.js ~440, ~2266-2296). Backward compatible: NULL on existing rows; a post without addressing is a broadcast (visible to everyone on the channel) exactly as today.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.A5.1", "name": "addressed post stores and returns both fields", "type": "integration", "preconditions": ["a project + agent"], "steps": ["POST /channel/posts with to_host=mac-mini, to_capability=fly-auth", "GET /channel/posts"], "expected_results": ["the row + read carry both fields"] },
+    { "id": "TC-40.A5.2", "name": "unaddressed post is a broadcast", "type": "integration", "preconditions": ["a project + agent"], "steps": ["post with no to_host/to_capability"], "expected_results": ["201; both fields NULL; visible on the plain channel_recent"] },
+    { "id": "TC-40.A5.3", "name": "secret in to_capability is blocked", "type": "integration", "preconditions": ["a project + agent"], "steps": ["post to_capability=\"ghp_ABCDEFGHIJKLMNOPQRST\""], "expected_results": ["422 secret-denylist"] },
+    { "id": "TC-40.A5.4", "name": "addressing is not authorization (spoof is harmless)", "type": "integration", "preconditions": ["agent A posts to_host=some-other-host"], "steps": ["read the channel as any agent in the tenant"], "expected_results": ["the post is visible to the whole tenant channel — to_host did not restrict who can READ it; it only labels the intended target"] }
+  ],
+  "technical_notes": [
+    "Migration: add :to_host, :text, null: true; add :to_capability, :text, null: true; partial indexes as in AC-40.A5.2.",
+    "Schema: two string fields; add both to cast (channel_post.ex:128), normalize_blank (:129), @scanned_text_fields (:57); validate_length(:to_host, max: 255) / validate_length(:to_capability, max: 128), count: :bytes.",
+    "Reuse the EXACT spoofable-field framing already established for host/session_id (channel_post.ex:24-27) — copy that doc discipline so a future reader cannot mistake these for authz.",
+    "These columns are consumed by 40.C1 (directed discovery): `kind='handoff' AND (to_host=$me OR to_capability IN $caps) AND NOT EXISTS(open claim)`. Ship this BEFORE 40.C1 (sequencing step 6 -> 7).",
+    "MCP: add to_host/to_capability to channel_post; return them in channel_recent output. Note in the tool description they are advisory.",
+    "Prioritize to_capability (the #812 real target was `fly auth`, a capability, not a host)."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 130000
+}
