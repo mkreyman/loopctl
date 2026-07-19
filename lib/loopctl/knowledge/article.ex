@@ -35,7 +35,7 @@ defmodule Loopctl.Knowledge.Article do
   @category_values Loopctl.Knowledge.Categories.all()
   @status_values [:draft, :published, :archived, :superseded]
   @scope_values [:tenant, :system]
-  @known_source_types ~w(review_finding manual agent session_log newsletter skill web_article ingestion)
+  @known_source_types ~w(review_finding manual agent session_log newsletter skill web_article ingestion channel_graduation)
   @tag_pattern ~r/^[a-zA-Z0-9_-]+$/
   @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
   # Topical tags only. Structural identity (e.g. a "hub", or an article's source)

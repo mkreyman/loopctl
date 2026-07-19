@@ -31,7 +31,9 @@ defmodule Loopctl.Coordination do
   alias Loopctl.Coordination.ChannelCursor
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.KeysetSeek
+  alias Loopctl.Knowledge
   alias Loopctl.Projects
+  alias Loopctl.Security.SecretDenylist
   alias Loopctl.WorkBreakdown.Story
 
   # Uniform retention for every post — one authoritative constant in code, not a
@@ -860,6 +862,88 @@ defmodule Loopctl.Coordination do
       end
     else
       {:error, :not_found}
+    end
+  end
+
+  @doc """
+  Graduates ONE coordination post into the durable Knowledge wiki (US-40.E1).
+
+  This is the CONTENT-SELECTIVE promotion of a genuinely reusable finding that has
+  no external tracker — NOT the general handoff-durability answer. A transient
+  "run this SQL" directive is left to expire (the 30-day TTL sweep reclaims it); a
+  reusable lesson graduates. There is NO automatic graduation — this is only ever
+  an explicit, deliberate agent call.
+
+  The orchestration lives HERE (not the controller) so the module boundary owns
+  the multi-context sequence, and it REUSES Knowledge's existing guardrails rather
+  than bypassing them:
+
+    1. `get_post/2` — tenant-scoped, oracle-safe fetch (foreign-tenant /
+       nonexistent / malformed id all collapse to `{:error, :not_found}`).
+    2. `project_writable_by_agent/4` — the SHARED project-membership gate
+       (US-40.D3): a non-member agent graduating a sibling-project post is denied
+       identically to a not-found (`{:error, :not_found}`), no oracle. Elevated
+       roles (`>= :user`) bypass, matching the redact/claim surfaces.
+    3. `SecretDenylist.contains_secret?/1` over the post body BEFORE proposing —
+       neither `propose_article/3` nor `create_article/3` runs a secret scan, so
+       this explicit step is what stops a credential being smuggled from the
+       coordination plane into the durable plane. A hit returns
+       `{:error, :unprocessable_entity, msg}` (→ 422) and nothing lands.
+    4. `Loopctl.Knowledge.propose_article/3` — the SEMANTIC NOVELTY gate (never
+       `create_article/3` directly). A near-duplicate returns
+       `%{verdict: :duplicate, article: existing, created: false}` and creates
+       nothing, so a single-use / duplicate finding does not pollute the wiki.
+
+  Provenance (AC-40.E1.3): the article carries `source_type: "channel_graduation"`
+  and `source_id` = the originating post id, attributed to the graduating agent
+  via the caller's audit context.
+
+  The source post is KEPT — the 30-day TTL sweep reclaims it (there is no
+  `graduated` column on `channel_posts`); the author may separately redact it via
+  the DELETE path.
+
+  Returns the `propose_article/3` result unchanged on success, or `{:error,
+  :not_found}` / `{:error, :unprocessable_entity, msg}` from the gates above, or a
+  forwarded `{:error, :duplicate_title, %Article{}}` / `{:error,
+  %Ecto.Changeset{}}` (e.g. a missing required title).
+  """
+  @spec graduate_post(Ecto.UUID.t(), Ecto.UUID.t(), atom(), term(), map()) ::
+          {:ok, map()}
+          | {:error, :not_found}
+          | {:error, :unprocessable_entity, String.t()}
+          | {:error, :duplicate_title, Knowledge.Article.t()}
+          | {:error, Ecto.Changeset.t()}
+  def graduate_post(tenant_id, agent_id, role, post_id, %{} = params) do
+    with {:ok, post} <- get_post(tenant_id, post_id),
+         :ok <- project_writable_by_agent(tenant_id, agent_id, post.project_id, role),
+         :ok <- scan_graduation_body(post.body) do
+      attrs = %{
+        title: params[:title],
+        body: post.body,
+        # A graduated post is a reusable FINDING by default (the durable home for a
+        # lesson with no external tracker); an explicit `category` may override it.
+        category: params[:category] || :finding,
+        project_id: post.project_id,
+        tags: params[:tags],
+        source_type: "channel_graduation",
+        source_id: post.id,
+        scope: :tenant
+      }
+
+      Knowledge.propose_article(tenant_id, attrs, params[:audit] || [])
+    end
+  end
+
+  # Explicit secret scan over the post body BEFORE it reaches Knowledge. Neither
+  # propose_article/3 nor create_article/3 scans, so this is the ONLY thing keeping
+  # a credential out of the durable, tenant-wide-readable knowledge plane on this
+  # path. A hit is an explicit 422 rejection, never a silent drop.
+  defp scan_graduation_body(body) do
+    if SecretDenylist.contains_secret?(body) do
+      {:error, :unprocessable_entity,
+       "post body contains a denylisted secret pattern; it cannot be graduated to the durable knowledge plane"}
+    else
+      :ok
     end
   end
 

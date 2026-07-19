@@ -77,12 +77,18 @@ defmodule LoopctlWeb.ChannelPostController do
   # write — never human-anchor gated (the human-anchor default-deny test only
   # walks POST/PUT/PATCH/DELETE, so these GETs need no allowlist entry).
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :agent] when action in [:create, :delete] or action in @read_actions
+       [role: :agent]
+       when action in [:create, :delete, :graduate] or action in @read_actions
 
   # Per-write rate limit (AC-39.2.8): a TIGHTER, config-driven cap on top of the
   # generic per-key/per-tenant pipeline RateLimiter, reusing the same
   # `Loopctl.RateLimiter` behaviour seam. Bounds post spam / upsert thrash.
-  plug :rate_limit_write when action in [:create]
+  # `:graduate` (US-40.E1) is a WRITE into the durable Knowledge plane — it reuses
+  # the SAME per-write cap as `:create` (AC-40.E1.4: rate-bounded so it cannot
+  # bulk-flood Knowledge from the channel). Per-api_key + per-tenant buckets only —
+  # deliberately NO per-agent bucket (none exists). The generic pipeline per-key /
+  # per-tenant limiter still runs first.
+  plug :rate_limit_write when action in [:create, :graduate]
 
   # Per-read rate limit (AC-40.D5.1): a PARALLEL, config-driven cap on the
   # agent-facing read path — `:index` (channel_recent), `:show` (GET /:id, the
@@ -281,6 +287,66 @@ defmodule LoopctlWeb.ChannelPostController do
       200 => {"The post with its full body", "application/json", Schemas.ChannelPostFull},
       404 =>
         {"Post not found (nonexistent, malformed id, or in another tenant)", "application/json",
+         Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:graduate,
+    summary: "Graduate a coordination post into the durable Knowledge wiki",
+    description:
+      "Promotes ONE coordination post into the durable Knowledge wiki (US-40.E1). CONTENT-SELECTIVE: " <>
+        "this is for a genuinely REUSABLE finding that has no external tracker — NOT the general " <>
+        "handoff-durability answer. A transient directive (e.g. 'run this SQL') should be LEFT TO " <>
+        "EXPIRE (posts auto-expire in 30 days); a reusable lesson graduates. There is NO automatic " <>
+        "graduation — this is always an explicit, deliberate agent call. `title` is REQUIRED; the " <>
+        "body is carried from the post, project_id is carried over, `tags` are optional. Agent+ " <>
+        "role, project-scoped by membership (US-40.D3), NOT human-anchor gated (coordination surface, " <>
+        "owner decision #331). Reuses Knowledge's EXISTING guardrails — the SEMANTIC NOVELTY gate " <>
+        "(a near-duplicate returns 200 deduplicated and creates nothing) plus an explicit secret " <>
+        "scan over the body (a denylisted credential shape returns 422 and nothing lands) — never a " <>
+        "bypass. The article carries source_type 'channel_graduation' + source_id = the post id, " <>
+        "attributed to the graduating agent. The source post is KEPT (the 30-day TTL sweep reclaims " <>
+        "it); it is NOT marked graduated. Rate-bounded by the per-write cap so it cannot bulk-flood " <>
+        "Knowledge from the channel.",
+    parameters: [
+      id: [
+        in: :path,
+        type: :string,
+        required: true,
+        description: "The post id — must belong to the caller's tenant"
+      ]
+    ],
+    request_body:
+      {"Graduation params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:title],
+         properties: %{
+           title: %OpenApiSpex.Schema{
+             type: :string,
+             description: "The Knowledge article title (required)"
+           },
+           tags: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{type: :string},
+             description: "Optional topical tags for the article"
+           }
+         }
+       }},
+    responses: %{
+      201 =>
+        {"Article created from the post", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      200 =>
+        {"A near-duplicate already exists; nothing created (deduplicated)", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      403 => {"Agent identity required", "application/json", Schemas.ErrorResponse},
+      404 =>
+        {"Post not found (nonexistent, malformed id, in another tenant, or not a project member)",
+         "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error, or the body carries a denylisted secret", "application/json",
          Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -609,6 +675,138 @@ defmodule LoopctlWeb.ChannelPostController do
         {:error, changeset}
     end
   end
+
+  @doc """
+  POST /api/v1/channel/posts/:id/graduate
+
+  Graduates a coordination post into the durable Knowledge wiki (US-40.E1).
+  Requires agent+ role and a key that carries an agent identity (403
+  `agent_identity_required` otherwise — mirrors `create/2`).
+
+  CONTENT-SELECTIVE: for a genuinely REUSABLE finding with no external tracker,
+  NOT routine handoffs (a transient directive is left to expire). The orchestration
+  — tenant-scoped fetch, project-membership gate, secret scan, and the semantic
+  novelty gate — lives in `Coordination.graduate_post/5`, keeping the controller
+  thin. `{:error, :not_found}` (nonexistent / cross-tenant / non-member) and
+  `{:error, :unprocessable_entity, msg}` (denylisted secret) fall through to
+  `action_fallback`.
+  """
+  def graduate(conn, params) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+
+    case api_key.agent_id do
+      nil ->
+        # Parity with create/2: an attributed durable article requires a verified
+        # agent identity — no article is created without one.
+        emit_security_event(:agent_identity_required, %{
+          tenant_id: tenant_id,
+          api_key_id: api_key.id
+        })
+
+        conn
+        |> put_status(:forbidden)
+        |> json(%{
+          error: %{
+            status: 403,
+            code: "agent_identity_required",
+            message:
+              "This API key has no agent identity; it cannot graduate a channel post to Knowledge"
+          }
+        })
+
+      agent_id ->
+        graduate_params = %{
+          title: params["title"],
+          tags: params["tags"],
+          # Optional — the context defaults to :finding (a reusable lesson).
+          category: params["category"],
+          audit: AuditContext.from_conn(conn)
+        }
+
+        conn
+        |> render_graduation(
+          Coordination.graduate_post(
+            tenant_id,
+            agent_id,
+            api_key.role,
+            params["id"],
+            graduate_params
+          )
+        )
+    end
+  end
+
+  # Render the `Coordination.graduate_post/5` outcome, mirroring
+  # `LoopctlWeb.ArticleController.render_proposal/4`:
+  #   * :duplicate    → 200, nothing created, point at the canonical article
+  #     (so a single-use/duplicate finding does NOT pollute the wiki — AC-40.E1.2)
+  #   * :created / :gated_to_draft → 201, the created article
+  #   * :deduplicated (idempotency_key no-op) → 200 reference
+  # `{:error, :not_found}`, `{:error, :unprocessable_entity, msg}` (secret),
+  # `{:error, :duplicate_title, _}`, and `{:error, %Ecto.Changeset{}}` all fall
+  # through to `action_fallback` (404 / 422).
+  defp render_graduation(conn, {:ok, %{verdict: :duplicate, article: existing}}) do
+    conn
+    |> put_status(:ok)
+    |> json(%{
+      deduplicated: true,
+      data: %{id: existing.id, title: existing.title, status: to_string(existing.status)},
+      note:
+        "A near-duplicate already exists (id #{existing.id}). Nothing was graduated — read or " <>
+          "update the existing article instead."
+    })
+  end
+
+  defp render_graduation(conn, {:ok, %{verdict: :deduplicated, article: existing}}) do
+    conn
+    |> put_status(:ok)
+    |> json(%{
+      deduplicated: true,
+      data: %{id: existing.id, status: to_string(existing.status)},
+      note: "An article with this identity already exists. Nothing was graduated."
+    })
+  end
+
+  defp render_graduation(conn, {:ok, %{article: article}}) do
+    conn
+    |> put_status(:created)
+    |> json(%{
+      data: %{
+        id: article.id,
+        title: article.title,
+        status: to_string(article.status),
+        source_type: article.source_type,
+        source_id: article.source_id,
+        project_id: article.project_id
+      },
+      note:
+        "Graduated the coordination post into Knowledge (id #{article.id}). The source post is " <>
+          "kept and will expire on its 30-day TTL; redact it via DELETE if it must be removed sooner."
+    })
+  end
+
+  # Exact-title collision with a DIFFERENT-bodied active article (distinct from the
+  # semantic novelty gate — the title unique guard). Mirror article_controller's
+  # 409 title_conflict; the FallbackController has no clause for this 3-tuple.
+  defp render_graduation(conn, {:error, :duplicate_title, existing}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "title_conflict",
+        message:
+          "An article with this title already exists with different content. Choose a different " <>
+            "title or update the existing article.",
+        details: %{existing_article_id: existing.id}
+      }
+    })
+  end
+
+  # {:error, :not_found} | {:error, :unprocessable_entity, msg} |
+  # {:error, %Ecto.Changeset{}} → FallbackController (404 / 422).
+  defp render_graduation(conn, error), do: LoopctlWeb.FallbackController.call(conn, error)
 
   @doc """
   DELETE /api/v1/channel/posts/:id
