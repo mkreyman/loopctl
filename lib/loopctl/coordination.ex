@@ -216,11 +216,12 @@ defmodule Loopctl.Coordination do
   @doc """
   HARD-deletes a channel post — the redact path (US-39.7).
 
-  The backstop for a leaked/regretted post: whoever NOTICES a leaked secret (the
-  denylist is best-effort, US-39.1) can remove the row immediately, before its
-  30-day TTL (US-39.5) would sweep it. A hard delete is consistent with the
-  transient model — there is nothing to soft-retain in a channel that expires
-  wholesale.
+  The backstop for a leaked/regretted post: the AUTHOR who notices their own
+  leaked secret (the denylist is best-effort, US-39.1) can pull the row back
+  immediately, before its 30-day TTL (US-39.5) would sweep it (an elevated
+  operator can do so on the author's behalf — see below). A hard delete is
+  consistent with the transient model — there is nothing to soft-retain in a
+  channel that expires wholesale.
 
   Author-only (or elevated role) — the redact path is for self-leak-pullback,
   NOT fleet-wide cleanup (US-40.D2). `agent_id` is the DELETING agent (the audit
@@ -290,9 +291,9 @@ defmodule Loopctl.Coordination do
   shared by-id read (US-40.D1). This is the SINGLE shared by-id path: the
   oracle-safe `GET /channel/posts/:id` endpoint uses it here, and graduate
   (US-40.E1) reuses it rather than duplicating the query. It wraps the same
-  private `fetch_owned_post/2` the redact path (`delete_post/4`) uses.
+  private `fetch_owned_post/2` the redact path (`delete_post/5`) uses.
 
-  ORACLE-SAFE, mirroring `delete_post/4`: the fetch filters on BOTH `id` and
+  ORACLE-SAFE, mirroring `delete_post/5`: the fetch filters on BOTH `id` and
   `tenant_id` on `AdminRepo` (BYPASSRLS), so a foreign-tenant OR nonexistent id
   both return `{:error, :not_found}` — byte-identical, no cross-tenant existence
   oracle (KB "IDOR Prevention in Multi-Tenant Delete Operations"). A malformed
@@ -317,7 +318,7 @@ defmodule Loopctl.Coordination do
   # Fetch a post by id CONSTRAINED to the caller's tenant — the isolation
   # boundary on the AdminRepo (BYPASSRLS) path. A foreign-tenant or nonexistent
   # id returns nil, so both collapse to the same 404 (no existence oracle). Shared
-  # by the redact path (`delete_post/4`) and the public by-id read (`get_post/2`).
+  # by the redact path (`delete_post/5`) and the public by-id read (`get_post/2`).
   defp fetch_owned_post(tenant_id, post_id) do
     ChannelPost
     |> where([p], p.id == ^post_id and p.tenant_id == ^tenant_id)
@@ -358,9 +359,12 @@ defmodule Loopctl.Coordination do
     end
   rescue
     # Concurrent double-delete. `fetch_owned_post/2` is an UNLOCKED read, so between
-    # it and `Multi.delete` another deleter — or the US-39.5 TTL sweep — can remove
-    # the row. The feature explicitly enables "whoever NOTICES a leaked secret,
-    # fleet-wide" to delete, making two agents deleting the same post a first-class
+    # it and `Multi.delete` the row can vanish. Under the author-only gate
+    # (`authorized_to_delete?/3`, US-40.D2) two DIFFERENT agents can no longer both
+    # delete the same post, so the legitimate races are: the author double-deleting
+    # (two concurrent redact calls from the same session), the US-39.5 TTL sweep
+    # reaping the row, or an elevated operator (`>= :user`) racing the author's own
+    # pullback. Any of these makes a concurrent delete of the same post a first-class
     # case. The losing DELETE matches 0 rows and Ecto raises `Ecto.StaleEntryError`
     # (Multi does NOT convert a stale delete to an `{:error, ...}` tuple; it
     # propagates out of the transaction). A just-deleted post is now nonexistent,

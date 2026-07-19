@@ -1060,6 +1060,42 @@ defmodule Loopctl.CoordinationTest do
       assert entry.metadata["deleted_by_agent_id"] == elevated_agent
     end
 
+    test "an orchestrator (role :orchestrator) non-author may NOT delete agent A's post; the gate draws at :user, not :orchestrator (TC-40.D2.4)",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_a} = ctx
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_a, %{"body" => "from A"})
+
+      audit_orch = [
+        actor_type: "api_key",
+        actor_id: Ecto.UUID.generate(),
+        actor_label: "orchestrator:orch"
+      ]
+
+      # The elevated bypass in authorized_to_delete?/3 requires role_at_least?(role,
+      # :user). orchestrator(2) < user(3), so an orchestrator sits ABOVE the route's
+      # RequireRole :agent floor (it reaches this context) but BELOW the :user gate:
+      # it is a non-author with an insufficient role and must be DENIED. This pins the
+      # exact threshold — a regression loosening the gate to :orchestrator (letting an
+      # orchestrator censor any agent's post, the vector this story kills) would flip
+      # this to {:ok, _} and fail here.
+      assert {:error, :not_found} =
+               Coordination.delete_post(tenant.id, orch_agent, :orchestrator, post.id, audit_orch)
+
+      # A's post survives untouched, and no audit "deleted" row was written.
+      assert %ChannelPost{} = AdminRepo.get(ChannelPost, post.id)
+
+      assert AdminRepo.aggregate(
+               from(a in AuditLog,
+                 where: a.entity_type == "channel_post" and a.entity_id == ^post.id
+               ),
+               :count,
+               :id
+             ) == 0
+    end
+
     test "a cross-tenant post id returns {:error, :not_found} and the foreign row still exists (TC-39.7.3)",
          ctx do
       %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
