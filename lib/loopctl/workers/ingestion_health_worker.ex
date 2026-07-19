@@ -122,7 +122,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
       "IngestionHealthWorker: #{length(candidates)} capture-silence candidate(s) detected"
     )
 
-    Enum.each(candidates, &flag_candidate/1)
+    flag_candidates(candidates, :capture_silence)
 
     # PR B2: the no-persist / high-rejection-rate sibling detector. A rejected write
     # leaves no article row, so it is invisible to the capture-silence scan above;
@@ -155,7 +155,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
         "IngestionHealthWorker: #{length(reject_candidates)} high-reject-rate candidate(s) detected"
       )
 
-      Enum.each(reject_candidates, &flag_candidate/1)
+      flag_candidates(reject_candidates, :high_reject_rate)
 
       # Close reject-rate anomalies whose reject rate recovered (no longer a candidate).
       # This resolves open rows that would otherwise freeze open, AND stamps the
@@ -224,35 +224,70 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # so this is a cheap, crash-free readiness probe for the version-skew window.
   defp anomalies_table_ready?, do: relation_present?("ingestion_anomalies")
 
+  # Batch the per-candidate existence/suppression probes into ONE set-based query per
+  # detector type, then process each candidate against the in-memory result. Previously
+  # each candidate ran 3-4 sequential AdminRepo queries (existing lookup + archived-
+  # suppression + acknowledged/resolved-suppression + the insert), so a WIDESPREAD outage
+  # (many candidates at once — the worst case this detector exists for) made the hourly
+  # job O(open anomalies) on the 3-conn AdminRepo pool. Prefetching keeps the probe cost
+  # constant, mirroring the set-based auto_resolve_recovered_* optimization.
+  defp flag_candidates([], _anomaly_type), do: :ok
+
+  defp flag_candidates(candidates, anomaly_type) do
+    by_key = prefetch_anomalies(candidates, anomaly_type)
+
+    Enum.each(candidates, fn candidate ->
+      rows = Map.get(by_key, {candidate.tenant_id, candidate.source_type}, [])
+      flag_candidate(anomaly_type, candidate, rows)
+    end)
+  end
+
+  # Load EVERY anomaly of `anomaly_type` (any resolved/archived state) for the candidate
+  # (tenant_id, source_type) keys in one query, grouped by key. Over-fetches the cartesian
+  # of the distinct tenant_ids × source_types then filters to the exact key set in memory
+  # (tuple IN is awkward in Ecto); the candidate set is small (bounded by tenants ×
+  # source_types), so this is a handful of rows and a single round-trip.
+  defp prefetch_anomalies(candidates, anomaly_type) do
+    keys = MapSet.new(candidates, &{&1.tenant_id, &1.source_type})
+    tenant_ids = candidates |> Enum.map(& &1.tenant_id) |> Enum.uniq()
+    source_types = candidates |> Enum.map(& &1.source_type) |> Enum.uniq()
+
+    IngestionAnomaly
+    |> where([a], a.anomaly_type == ^anomaly_type)
+    |> where([a], a.tenant_id in ^tenant_ids)
+    |> where([a], a.source_type in ^source_types)
+    |> AdminRepo.all()
+    |> Enum.filter(&MapSet.member?(keys, {&1.tenant_id, &1.source_type}))
+    |> Enum.group_by(&{&1.tenant_id, &1.source_type})
+  end
+
   # Dispatch by detector type: capture_silence (writes stopped) vs high_reject_rate
-  # (writes rejected). Both reuse the same persist/notify/at-least-once machinery.
-  defp flag_candidate(%{anomaly_type: :high_reject_rate} = candidate),
-    do: flag_reject_rate(candidate)
+  # (writes rejected). Both reuse the same persist/notify/at-least-once machinery and the
+  # prefetched `rows` for the candidate's (tenant, source_type) key.
+  defp flag_candidate(:high_reject_rate, candidate, rows),
+    do: flag_reject_rate(candidate, rows)
 
-  defp flag_candidate(candidate), do: flag_capture_silence(candidate)
+  defp flag_candidate(:capture_silence, candidate, rows),
+    do: flag_capture_silence(candidate, rows)
 
-  defp flag_capture_silence(%{
-         tenant_id: tenant_id,
-         source_type: source_type,
-         last_event_at: last_event_at,
-         hours_stale: hours_stale,
-         sample_count: sample_count
-       }) do
-    # Check first (like CostAnomalyWorker) so an UPDATE never emits audit/webhook/alert.
-    # The unique partial index still guards against races on the insert path below.
-    # NB: exclude archived rows here — an archived-but-unresolved row must not be
-    # silently update-refreshed; archival is handled explicitly below.
-    existing =
-      IngestionAnomaly
-      |> where([a], a.tenant_id == ^tenant_id)
-      |> where([a], a.source_type == ^source_type)
-      |> where([a], a.anomaly_type == :capture_silence)
-      |> where([a], a.resolved == false)
-      |> where([a], a.archived == false)
-      |> AdminRepo.one()
+  defp flag_capture_silence(
+         %{
+           tenant_id: tenant_id,
+           source_type: source_type,
+           last_event_at: last_event_at,
+           hours_stale: hours_stale,
+           sample_count: sample_count
+         },
+         rows
+       ) do
+    # Find the live (unresolved, non-archived) row like CostAnomalyWorker so an UPDATE
+    # never emits audit/webhook/alert. The unique partial index still guards against
+    # races on the insert path below. NB: an archived-but-unresolved row must not be
+    # silently update-refreshed; archival is handled explicitly by the first cond branch.
+    existing = Enum.find(rows, &(&1.resolved == false and &1.archived == false))
 
     cond do
-      archived_suppression?(tenant_id, source_type, :capture_silence) ->
+      archived_suppression?(rows) ->
         # Operator archived this source_type — escape hatch, never re-flag (until un-archived).
         :suppressed
 
@@ -266,7 +301,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
       existing ->
         update_existing(existing, last_event_at, hours_stale, sample_count)
 
-      acknowledged_silence?(tenant_id, source_type, last_event_at) ->
+      acknowledged_silence?(rows, last_event_at) ->
         # This exact silence is already covered by a resolved anomaly (no capture
         # since it was resolved) — suppress re-creation to avoid re-firing audit +
         # operator alert + webhook every hour. Re-flags only once captures resume
@@ -280,27 +315,17 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
 
   # An archived anomaly (resolved or not) suppresses re-detection for that
   # (source_type, anomaly_type) — the operator's escape hatch for a retired
-  # workflow, reversible via IngestionHealth.unarchive_anomaly/3.
-  defp archived_suppression?(tenant_id, source_type, anomaly_type) do
-    IngestionAnomaly
-    |> where([a], a.tenant_id == ^tenant_id)
-    |> where([a], a.source_type == ^source_type)
-    |> where([a], a.anomaly_type == ^anomaly_type)
-    |> where([a], a.archived == true)
-    |> AdminRepo.exists?()
-  end
+  # workflow, reversible via IngestionHealth.unarchive_anomaly/3. `rows` are already
+  # scoped to one (tenant, source_type, anomaly_type) key by the prefetch.
+  defp archived_suppression?(rows), do: Enum.any?(rows, & &1.archived)
 
   # True when a resolved (non-archived) anomaly's snapshot is at/after the current
   # silence's last_event_at, i.e. no NEW capture has arrived since it was resolved.
-  defp acknowledged_silence?(tenant_id, source_type, last_event_at) do
-    IngestionAnomaly
-    |> where([a], a.tenant_id == ^tenant_id)
-    |> where([a], a.source_type == ^source_type)
-    |> where([a], a.anomaly_type == :capture_silence)
-    |> where([a], a.resolved == true)
-    |> where([a], a.archived == false)
-    |> where([a], not is_nil(a.last_event_at) and a.last_event_at >= ^last_event_at)
-    |> AdminRepo.exists?()
+  defp acknowledged_silence?(rows, last_event_at) do
+    Enum.any?(rows, fn a ->
+      a.resolved and not a.archived and not is_nil(a.last_event_at) and
+        DateTime.compare(a.last_event_at, last_event_at) != :lt
+    end)
   end
 
   # --- High-reject-rate flagging (PR B2) ---
@@ -313,18 +338,11 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # (`last_event_at IS NULL`) — anti-alarm-fatigue while rejects persist — and re-arms
   # once recovery stamps `last_event_at`, so a future storm re-fires. Archiving is the
   # separate operator escape hatch.
-  defp flag_reject_rate(%{tenant_id: tenant_id, source_type: source_type} = candidate) do
-    existing =
-      IngestionAnomaly
-      |> where([a], a.tenant_id == ^tenant_id)
-      |> where([a], a.source_type == ^source_type)
-      |> where([a], a.anomaly_type == :high_reject_rate)
-      |> where([a], a.resolved == false)
-      |> where([a], a.archived == false)
-      |> AdminRepo.one()
+  defp flag_reject_rate(%{tenant_id: tenant_id} = candidate, rows) do
+    existing = Enum.find(rows, &(&1.resolved == false and &1.archived == false))
 
     cond do
-      archived_suppression?(tenant_id, source_type, :high_reject_rate) ->
+      archived_suppression?(rows) ->
         :suppressed
 
       existing && not existing.alerted ->
@@ -336,7 +354,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
       existing ->
         update_existing_reject(existing, candidate)
 
-      resolved_reject_suppression?(tenant_id, source_type) ->
+      resolved_reject_suppression?(rows) ->
         # Operator resolved it and rejects still persist — do not re-fire every run.
         :suppressed
 
@@ -352,16 +370,10 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # stamps `last_event_at` (rejects fell below threshold), the resolved row stops
   # suppressing, so a FRESH storm for the same source_type re-fires instead of being
   # silenced forever. Without this scope a single operator resolve would blind the
-  # detector to every future outage of that source_type.
-  defp resolved_reject_suppression?(tenant_id, source_type) do
-    IngestionAnomaly
-    |> where([a], a.tenant_id == ^tenant_id)
-    |> where([a], a.source_type == ^source_type)
-    |> where([a], a.anomaly_type == :high_reject_rate)
-    |> where([a], a.resolved == true)
-    |> where([a], a.archived == false)
-    |> where([a], is_nil(a.last_event_at))
-    |> AdminRepo.exists?()
+  # detector to every future outage of that source_type. `rows` are prefetched and
+  # already scoped to the candidate's (tenant, source_type, high_reject_rate) key.
+  defp resolved_reject_suppression?(rows) do
+    Enum.any?(rows, &(&1.resolved and not &1.archived and is_nil(&1.last_event_at)))
   end
 
   defp create_new_reject(tenant_id, candidate) do

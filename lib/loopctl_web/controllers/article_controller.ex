@@ -284,9 +284,12 @@ defmodule LoopctlWeb.ArticleController do
 
     # System articles require superadmin role; everything else is agent+.
     if scope == "system" and api_key.role != :superadmin do
-      # Count the reject: an upfront authorization drop persists no article row, so
-      # without this the high_reject_rate detector would be blind to a 403 reject storm.
-      emit_write_telemetry(conn, params, :validation_error)
+      # Count the reject under the DISTINCT :forbidden outcome (a 403 authz drop persists
+      # no article row). It is tracked for observability but excluded from the
+      # high_reject_rate reject numerator/denominator — a scope-misuse 403 storm is
+      # permission misuse, not an ingestion-pipeline outage, and must not page the
+      # operator nor dilute a genuine title_conflict/validation_error signal.
+      emit_write_telemetry(conn, params, :forbidden)
 
       conn
       |> put_status(:forbidden)
@@ -336,8 +339,11 @@ defmodule LoopctlWeb.ArticleController do
         create_article(conn, tenant_id, bound_attrs, audit_opts, draft?, gate?)
 
       {:error, :no_agent_identity} ->
-        # Count the reject: an identity-required drop persists no article row.
-        emit_write_telemetry(conn, attrs, :validation_error)
+        # Count the reject under the DISTINCT :forbidden outcome (an identity-required
+        # 403 drop persists no article row) — excluded from the high_reject_rate
+        # detector, like the scope-forbidden case above: authz misuse is not an
+        # ingestion-pipeline outage.
+        emit_write_telemetry(conn, attrs, :forbidden)
 
         conn
         |> put_status(:forbidden)
