@@ -13,8 +13,9 @@ defmodule Loopctl.KeysetSeek do
   seek directly.
 
   The query's binding must expose `inserted_at` and `id` on its FIRST positional
-  binding (`[a]`) — every caller's base query is `from(a in Schema, ...)`, so this
-  holds.
+  binding (`[a]`) for `after_position/2`, or `inserted_at` and `seq` for
+  `before_position/2` — every caller's base query is `from(a in Schema, ...)`, so
+  this holds.
   """
 
   import Ecto.Query
@@ -37,6 +38,34 @@ defmodule Loopctl.KeysetSeek do
         a.id,
         type(^inserted_at, a.inserted_at),
         type(^id, a.id)
+      )
+    )
+  end
+
+  @doc """
+  Adds the DESC (newest-first) keyset seek
+  `WHERE (inserted_at, seq) < (^cursor_inserted_at, ^cursor_seq)` to `query`
+  (US-40.C2). Unlike `after_position/2` (ASC on `(inserted_at, id)`), this walks
+  history OLDER than the cursor and tie-breaks on `seq` — a monotonic bigint column
+  (e.g. `channel_posts.seq` bigserial), NOT a random v4 UUID — so the ordering is
+  deterministic. The `type(^seq, a.seq)` annotation sends the bound as a bigint so
+  the composite `(tenant_id, project_id, inserted_at DESC, seq DESC)` btree serves
+  the seek directly. With `nil` (no cursor), returns the query unchanged (start from
+  the newest row).
+  """
+  @spec before_position(Ecto.Query.t(), {DateTime.t(), integer()} | nil) :: Ecto.Query.t()
+  def before_position(query, nil), do: query
+
+  def before_position(query, {%DateTime{} = inserted_at, seq}) when is_integer(seq) do
+    where(
+      query,
+      [a],
+      fragment(
+        "(?, ?) < (?, ?)",
+        a.inserted_at,
+        a.seq,
+        type(^inserted_at, a.inserted_at),
+        type(^seq, a.seq)
       )
     )
   end

@@ -12,6 +12,7 @@ defmodule Loopctl.KeysetCursorTest do
   use ExUnit.Case, async: true
 
   alias Loopctl.Audit.ChangesCursor
+  alias Loopctl.Coordination.ChannelCursor
   alias Loopctl.KeysetCursor
   alias Loopctl.Knowledge.ArticleCursor
 
@@ -61,6 +62,103 @@ defmodule Loopctl.KeysetCursorTest do
       assert {:ok, ^pos} = ChangesCursor.decode(t, change_cursor)
       assert {:error, :invalid} = ArticleCursor.decode(t, change_cursor)
     end
+  end
+
+  describe "integer tiebreak (US-40.C2: `(inserted_at, seq)` keyset)" do
+    setup do
+      %{
+        tenant_id: Ecto.UUID.generate(),
+        seq_position: {~U[2026-06-24 09:00:00.123456Z], 42}
+      }
+    end
+
+    test "encode/3 + decode/3 round-trip an integer second element",
+         %{tenant_id: t, seq_position: pos} do
+      cursor = KeysetCursor.encode("channel_cursor", t, pos)
+      assert {:ok, ^pos} = KeysetCursor.decode("channel_cursor", t, cursor)
+    end
+
+    test "the ChannelCursor delegator round-trips a `(inserted_at, seq)` position",
+         %{tenant_id: t, seq_position: pos} do
+      cursor = ChannelCursor.encode(t, pos)
+      assert {:ok, ^pos} = ChannelCursor.decode(t, cursor)
+    end
+
+    test "a large bigint seq (bigserial range) round-trips exactly",
+         %{tenant_id: t} do
+      pos = {~U[2026-06-24 09:00:00.000001Z], 9_223_372_036_854_775_000}
+      cursor = ChannelCursor.encode(t, pos)
+      assert {:ok, ^pos} = ChannelCursor.decode(t, cursor)
+    end
+
+    test "the raw seq is NOT recoverable in plaintext from the cursor (no cross-tenant volume oracle)",
+         %{tenant_id: t} do
+      # Reproduces the review finding's empirical attack: a holder with NO secret and
+      # NO tenant key tries to read the global `seq` back out of its own cursor.
+      seq = 987_654_321
+      cursor = ChannelCursor.encode(t, {~U[2026-06-24 09:00:00.123456Z], seq})
+
+      {:ok, blob} = Base.url_decode64(cursor, padding: false)
+      # binary_to_term with [:used] tolerates the trailing HMAC bytes and hands back
+      # the payload term — which is now the ENCRYPTED shape, not the raw seq.
+      {term, _used} = :erlang.binary_to_term(blob, [:safe, :used])
+
+      assert {:kie, _micros, iv, ct, tag} = term
+      assert is_binary(iv) and is_binary(ct) and is_binary(tag)
+      # The seq appears NOWHERE in the decoded term...
+      refute seq in Tuple.to_list(term)
+      # ...and the ciphertext is not just the plaintext seq bytes.
+      refute ct == <<seq::signed-integer-64>>
+      # ...nor anywhere in the raw cursor bytes.
+      refute :binary.match(blob, <<seq::signed-integer-64>>) != :nomatch
+    end
+
+    test "the same position encodes to DIFFERENT cursors each time (random IV, non-deterministic)",
+         %{tenant_id: t, seq_position: pos} do
+      c1 = ChannelCursor.encode(t, pos)
+      c2 = ChannelCursor.encode(t, pos)
+      refute c1 == c2
+      # Both still round-trip to the same position.
+      assert {:ok, ^pos} = ChannelCursor.decode(t, c1)
+      assert {:ok, ^pos} = ChannelCursor.decode(t, c2)
+    end
+
+    test "a byte-mutated integer cursor is rejected (tamper → invalid)",
+         %{tenant_id: t, seq_position: pos} do
+      cursor = ChannelCursor.encode(t, pos)
+      mutated = flip_last_byte(cursor)
+      assert {:error, :invalid} = ChannelCursor.decode(t, mutated)
+    end
+
+    test "an integer cursor minted for tenant A does not decode for tenant B",
+         %{tenant_id: t, seq_position: pos} do
+      cursor = ChannelCursor.encode(t, pos)
+      assert {:error, :invalid} = ChannelCursor.decode(Ecto.UUID.generate(), cursor)
+    end
+
+    test "a channel (integer) cursor does NOT decode on a UUID surface, same tenant",
+         %{tenant_id: t, seq_position: pos} do
+      channel_cursor = ChannelCursor.encode(t, pos)
+      assert {:ok, ^pos} = ChannelCursor.decode(t, channel_cursor)
+      # Cross-namespace replay fails verification (the HMAC key folds the namespace).
+      assert {:error, :invalid} = ChangesCursor.decode(t, channel_cursor)
+      assert {:error, :invalid} = ArticleCursor.decode(t, channel_cursor)
+    end
+
+    test "a UUID cursor does NOT decode on the channel surface, same tenant",
+         %{tenant_id: t} do
+      uuid_position = {~U[2026-06-24 09:00:00.123456Z], Ecto.UUID.generate()}
+      article_cursor = ArticleCursor.encode(t, uuid_position)
+      assert {:error, :invalid} = ChannelCursor.decode(t, article_cursor)
+    end
+  end
+
+  # Flip the last base64 char to a different valid char so the decoded HMAC differs
+  # (the signature is the trailing bytes) — a deterministic tamper.
+  defp flip_last_byte(cursor) do
+    {head, <<last::utf8>>} = String.split_at(cursor, -1)
+    replacement = if last == ?A, do: "B", else: "A"
+    head <> replacement
   end
 
   describe "delegators preserve the defensive contract" do

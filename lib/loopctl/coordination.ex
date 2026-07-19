@@ -27,7 +27,9 @@ defmodule Loopctl.Coordination do
   alias Loopctl.Agents
   alias Loopctl.Audit
   alias Loopctl.Auth.Role
+  alias Loopctl.Coordination.ChannelCursor
   alias Loopctl.Coordination.ChannelPost
+  alias Loopctl.KeysetSeek
   alias Loopctl.Projects
   alias Loopctl.WorkBreakdown.Story
 
@@ -71,6 +73,42 @@ defmodule Loopctl.Coordination do
   # NEVER trust this DB slice to be byte-bounded — it is character-bounded and
   # deliberately over-fetches.
   @preview_probe_chars @preview_bytes + 1
+
+  # Commit-lag look-back window, in SECONDS (US-40.C2, AC-40.C2.2). `inserted_at`
+  # and `seq` are assigned PRE-COMMIT, so a row with an EARLIER inserted_at / LOWER
+  # seq can COMMIT after a later row. A naive delta read at `since = last_seen`
+  # would then skip such a late-committing earlier row PERMANENTLY (it sorts before
+  # the watermark yet became visible only after the reader passed it). We subtract
+  # this bounded epsilon from `since` (`effective_since = since - epsilon`) so rows
+  # WITHIN epsilon of the watermark are RE-SCANNED rather than lost.
+  #
+  # DELIVERY CONTRACT: the SERVER guarantees AT-LEAST-ONCE with a bounded, deliberate
+  # OVERLAP — the epsilon look-back re-delivers rows near the watermark, never
+  # dropping one. Direction is safe: over-deliver, never lose. EXACTLY-once is the
+  # CONSUMER's job (the claude-config turn-boundary hook keeps a per-session
+  # high-watermark and dedups the small overlap by id/seq); the server does NOT
+  # itself dedup — consumer dedup lives in the companion, out of scope here. Five
+  # seconds comfortably covers plausible transaction commit lag on this path while
+  # keeping the re-delivered overlap tiny.
+  #
+  # TRUNCATION-DRAIN RULE (the ONLY caveat to "advance the watermark"): a delta read
+  # is bounded by `:limit` (default #{@default_recent_limit}, cap #{@max_recent_limit})
+  # and returns `has_more == true` when MORE matching rows exist in the (since, now]
+  # window than the limit. Because delta mode orders by GREATEST(inserted_at,
+  # updated_at) DESC, truncation drops the OLDEST-touched matching rows, not the
+  # newest. A consumer that blindly advances `since` to the newest GREATEST it saw
+  # would step PAST those dropped older rows and never see them again (a lost-write
+  # gap). The rule that closes the gap: WHILE `has_more` is true, do NOT advance the
+  # watermark past the truncation — DRAIN the backlog first via the keyset/history
+  # read (`recent_page/3` with `:cursor`, walked to exhaustion; see AC-40.C2.4),
+  # which returns EVERY live row (including the truncated older ones) newest→oldest,
+  # then advance `since` only once a delta read comes back `has_more == false`. In
+  # practice a turn-boundary burst is far under the limit so `has_more` is false and
+  # the watermark advances directly; the drain path is the reliability backstop that
+  # makes "a long session sees every new post without a lost-write gap" hold even
+  # under a burst larger than the cap. (No keyset cursor is emitted in delta mode by
+  # design — AC-40.C2.4 — so the drain is the history read, not a delta continuation.)
+  @commit_lag_epsilon_seconds 5
 
   @doc "The uniform retention window, in days, applied to every post."
   @spec retention_days() :: pos_integer()
@@ -763,45 +801,115 @@ defmodule Loopctl.Coordination do
       wrong-granularity value (e.g. a date-only `"2026-07-18"`) is a NO-OP filter
       that returns the whole live channel — never a 400; supply a full instant to
       get a delta.
+
+      Delta reads are bounded by `:limit`. When the (since, now] window holds more
+      matching rows than the limit, the OLDEST-touched matching rows are truncated
+      (delta orders GREATEST(inserted_at, updated_at) DESC). `recent/3` discards the
+      truncation signal — use `recent_page/3` (which returns `has_more`) plus the
+      TRUNCATION-DRAIN RULE (see `@commit_lag_epsilon_seconds` and `recent_page/3`)
+      to guarantee a burst larger than the cap is drained without a lost-write gap.
   """
   @spec recent(term(), term(), keyword()) :: [preview()]
   def recent(tenant_id, project_id, opts \\ []) do
-    {posts, _has_more} = recent_page(tenant_id, project_id, opts)
+    {posts, _has_more, _next_cursor} = recent_page(tenant_id, project_id, opts)
     posts
   end
 
   @doc """
-  Like `recent/3` but also reports whether the `:limit` TRUNCATED the result.
+  Like `recent/3` but also reports truncation and the keyset paging cursor
+  (US-40.C2).
 
-  Returns `{posts, has_more}` where `has_more` is `true` iff at least one more
-  live, matching post exists beyond the applied `:limit`. Detected by fetching
-  `limit + 1` rows and checking for the overflow row (no extra COUNT query), so
-  the endpoint can surface an HONEST truncation signal in its `meta` envelope
-  rather than leaving consumers to infer it from `count == limit`. A full cursor
-  (paging past the truncation) is out of scope — US-39.6 owns dedup/paging; this
-  is only the cheap "there is more" flag.
+  Returns `{posts, has_more, next_cursor}`:
+
+    * `has_more` — `true` iff at least one more live, matching post exists beyond
+      the applied `:limit`. Detected by fetching `limit + 1` rows and checking for
+      the overflow row (no extra COUNT query), so the endpoint surfaces an HONEST
+      truncation signal rather than leaving consumers to infer it from
+      `count == limit`. TRUNCATION-DRAIN RULE (delta mode): because delta orders
+      GREATEST(inserted_at, updated_at) DESC, an overflowing window truncates the
+      OLDEST-touched matching rows. A consumer MUST NOT advance its `since` watermark
+      while `has_more` is true — the newest-first truncation means advancing steps
+      PAST the dropped older rows permanently (a lost-write gap). Instead, drain the
+      backlog via the HISTORY read (`cursor:` walked to exhaustion), which returns
+      every live row including the truncated ones, then advance `since` only once a
+      delta read returns `has_more == false`. (Delta mode emits no `next_cursor`, so
+      the drain is the keyset/history read — not a delta continuation. See
+      `@commit_lag_epsilon_seconds`.)
+    * `next_cursor` — the `(inserted_at, seq)` keyset position of the LAST returned
+      row when more history remains, else `nil`. This is a HISTORY-paging construct:
+      it is returned only for the HISTORY read (no `:since` delta window). The
+      caller re-issues `recent_page/3` with `cursor: next_cursor` to walk the next
+      older page, until `next_cursor` is `nil` (exhausted). See AC-40.C2.4 for why a
+      keyset cursor is NOT emitted in delta mode.
+
+  ## Two distinct reads (AC-40.C2.4 — do NOT unify)
+
+    * `:cursor` present → HISTORY read. Seeks `(inserted_at, seq) < cursor` and
+      orders `inserted_at DESC, seq DESC` — a deterministic walk keyed on the
+      monotonic `seq` bigserial (NEVER the random `id`; this is why US-40.C2
+      supersedes US-40.5). Pages the full set of ALREADY-COMMITTED live rows without
+      gaps or dups: for any row visible when a page is read, the strict `< cursor`
+      seek reaches it on exactly one page. It does NOT (and by design need not)
+      guarantee that a row which COMMITS mid-walk with `(inserted_at, seq)` ABOVE an
+      already-emitted cursor is later returned by the backward walk — that row sits
+      above the walk's descending frontier, so a subsequent older page never revisits
+      it. This is the standard keyset property (a backward walk sees a consistent
+      snapshot from its start point, not rows that appear newer-than-frontier after
+      the fact), and it is deliberate here: NEW-row completeness near `now` is owned
+      by the epsilon-protected DELTA read (`:since`), which look-back re-scans exactly
+      that pre-commit-lag class of row. The two reads split the completeness
+      contract — history walks committed history downward, delta catches new/late
+      commits at the head. A cursor takes PRECEDENCE over `:since` (the two reads are
+      never combined).
+    * `:since` present (no cursor) → DELTA read. Applies a bounded commit-lag
+      look-back (`effective_since = since - #{@commit_lag_epsilon_seconds}s`, see
+      `@commit_lag_epsilon_seconds`) so a late-committing earlier row is re-scanned
+      rather than lost (AT-LEAST-ONCE with a small deliberate overlap the CONSUMER
+      dedups). Filters + orders on `GREATEST(inserted_at, updated_at)` so a
+      re-touched slot ranks by its most-recent touch. Delta paging is the consumer
+      advancing its `since` watermark, so `next_cursor` is `nil` here — with ONE
+      completeness caveat when the window overflows `:limit`: see the TRUNCATION-DRAIN
+      RULE below and on `has_more`.
+    * neither → NEWEST page (exactly US-39.3), `inserted_at DESC, seq DESC`, plus a
+      `next_cursor` when the page truncated (opt-in keyset paging over live history).
+
+  `opts`:
+
+    * `:cursor` — a `{inserted_at, seq}` keyset position (already decoded/verified
+      by the caller, e.g. `ChannelCursor.decode/2`). A non-tuple / wrong-shape value
+      is treated as absent.
+    * `:limit`, `:since` — as `recent/3`.
   """
-  @spec recent_page(term(), term(), keyword()) :: {[preview()], boolean()}
+  @spec recent_page(term(), term(), keyword()) ::
+          {[preview()], boolean(), ChannelCursor.position() | nil}
   def recent_page(tenant_id, project_id, opts \\ []) do
     if valid_uuid?(tenant_id) and valid_uuid?(project_id) do
       limit = opts |> Keyword.get(:limit, @default_recent_limit) |> clamp_limit()
-      since = opts |> Keyword.get(:since) |> normalize_since()
+      cursor = opts |> Keyword.get(:cursor) |> normalize_cursor()
+
+      # A cursor (history paging) takes precedence over `since` (delta window): the
+      # two reads are distinct (AC-40.C2.4) and never unified. When a cursor is
+      # present, ignore `since`.
+      since = if cursor, do: nil, else: opts |> Keyword.get(:since) |> normalize_since()
       now = DateTime.utc_now()
 
       rows =
         ChannelPost
         |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
         |> where([p], p.expires_at > ^now)
-        |> apply_since(since)
+        |> apply_since(commit_lag_since(since))
+        |> apply_cursor(cursor)
         |> order_recent(since)
         |> select_preview()
         |> limit(^(limit + 1))
         |> AdminRepo.all()
 
-      page = rows |> Enum.take(limit) |> Enum.map(&finalize_preview/1)
-      {page, length(rows) > limit}
+      has_more = length(rows) > limit
+      kept = Enum.take(rows, limit)
+      page = Enum.map(kept, &finalize_preview/1)
+      {page, has_more, next_cursor(kept, has_more, since)}
     else
-      {[], false}
+      {[], false, nil}
     end
   end
 
@@ -812,6 +920,7 @@ defmodule Loopctl.Coordination do
   """
   @type preview :: %{
           id: Ecto.UUID.t(),
+          seq: integer(),
           agent_id: Ecto.UUID.t(),
           session_id: String.t() | nil,
           host: String.t() | nil,
@@ -846,6 +955,15 @@ defmodule Loopctl.Coordination do
   def select_preview(query) do
     select(query, [p], %{
       id: p.id,
+      # `seq` (bigserial) is projected so the LIST read's keyset next_cursor
+      # (US-40.C2) is the last row's `(inserted_at, seq)` without a second fetch.
+      # It is never exposed to clients: the controller's `channel_post_json/1` picks
+      # explicit fields and does NOT put `seq` in the JSON body, AND — because `seq`
+      # is a GLOBAL cross-tenant counter — it rides inside the cursor only in
+      # AES-256-GCM ENCRYPTED form (see `Loopctl.KeysetCursor`). The HMAC alone would
+      # keep the cursor unforgeable but NOT unreadable, so signing is not enough to
+      # keep a global counter server-side; the payload encryption is what does.
+      seq: p.seq,
       agent_id: p.agent_id,
       session_id: p.session_id,
       host: p.host,
@@ -941,6 +1059,49 @@ defmodule Loopctl.Coordination do
   end
 
   defp apply_since(query, nil), do: query
+
+  # Commit-lag look-back (AC-40.C2.2): widen the delta window backwards by the
+  # bounded epsilon so a row whose earlier `inserted_at`/lower `seq` COMMITTED after
+  # the reader's watermark is RE-SCANNED, not silently skipped. At-least-once with a
+  # small deliberate overlap; the consumer dedups (see `@commit_lag_epsilon_seconds`).
+  # `nil` (history/newest read, no delta) is unchanged.
+  defp commit_lag_since(nil), do: nil
+
+  defp commit_lag_since(%DateTime{} = since),
+    do: DateTime.add(since, -@commit_lag_epsilon_seconds, :second)
+
+  # History keyset seek (AC-40.C2.1): step to rows strictly OLDER than the cursor by
+  # `(inserted_at, seq)`, tie-broken on the monotonic `seq` bigserial. Delegates to
+  # the shared `KeysetSeek.before_position/2` (the load-bearing `type/2` annotations
+  # live there). `nil` (no cursor) is the newest page.
+  defp apply_cursor(query, nil), do: query
+
+  defp apply_cursor(query, {%DateTime{}, seq} = cursor) when is_integer(seq),
+    do: KeysetSeek.before_position(query, cursor)
+
+  # Validate the caller-supplied `:cursor` opt to the `{DateTime, integer_seq}`
+  # keyset shape; anything else (nil, a bare timestamp, a UUID tuple, garbage) is
+  # treated as absent — a bad cursor degrades to the newest page, never a crash.
+  defp normalize_cursor({%DateTime{}, seq} = cursor) when is_integer(seq), do: cursor
+  defp normalize_cursor(_), do: nil
+
+  # The keyset `next_cursor` is a HISTORY-paging construct (AC-40.C2.4): the
+  # `(inserted_at, seq)` of the last returned row, emitted ONLY for the history read
+  # (no `:since` delta window) when more rows remain. In DELTA mode the read is a
+  # watermark window ordered by GREATEST(inserted_at, updated_at) — a re-touched slot
+  # ranks by its `updated_at` while the keyset walks `inserted_at`, so a keyset
+  # cursor there would be incoherent; delta paging is the consumer advancing `since`,
+  # so we return `nil`. Also `nil` when history is exhausted (`has_more == false`).
+  defp next_cursor(_kept, false, _since), do: nil
+  defp next_cursor(_kept, true, %DateTime{}), do: nil
+  # `limit: 0` (or negative) returns no rows even though more exist — there is no
+  # last row to anchor a cursor on, so there is nothing to page from.
+  defp next_cursor([], true, nil), do: nil
+
+  defp next_cursor(kept, true, nil) do
+    last = List.last(kept)
+    {last.inserted_at, last.seq}
+  end
 
   # AC-39.3.1 orders the plain read `inserted_at DESC`. But a DELTA read (`since`
   # present) filters on GREATEST(inserted_at, updated_at) — so a keyed slot whose
