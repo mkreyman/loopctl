@@ -242,11 +242,11 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
     assert.match(INDEX_SRC, /name: "channel_done",/, 'must declare a "channel_done" tool');
   });
 
-  test("channel_claim description maps 409 already_claimed to a clear 'another agent owns it' message", () => {
+  test("channel_claim description maps 409 already_claimed to an honest 'ref is taken' message", () => {
     assert.match(
       INDEX_SRC,
-      /409 already_claimed[\s\S]*?ANOTHER AGENT ALREADY OWNS THIS REF/,
-      "channel_claim must tell a loser another agent already owns the ref (move on)",
+      /409 already_claimed[\s\S]*?either another agent owns it, or you already completed it/,
+      "channel_claim must honestly tell a loser the ref is taken — either another agent owns it or you already completed it (move on)",
     );
   });
 
