@@ -652,11 +652,21 @@ defmodule Loopctl.CoordinationTest do
     end
   end
 
-  describe "post/3" do
+  describe "post/4" do
     setup do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      # US-40.D3: writes are project-scoped by membership. Make the agent a
+      # writable member of the project by assigning it a story there, so these
+      # upsert/addressing/audit tests exercise the happy path through the new gate.
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        assigned_agent_id: agent_id,
+        agent_status: :assigned
+      })
 
       audit = [
         actor_type: "api_key",
@@ -671,7 +681,7 @@ defmodule Loopctl.CoordinationTest do
       %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
 
       assert {:ok, post, :created} =
-               Coordination.post(tenant.id, agent_id, %{
+               Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
                  body: "pushed PR #107",
                  audit: audit
@@ -696,10 +706,10 @@ defmodule Loopctl.CoordinationTest do
       base = %{project_id: project.id, session_id: "S1", key: "session_goal", audit: audit}
 
       assert {:ok, first, :created} =
-               Coordination.post(tenant.id, agent_id, Map.put(base, :body, "v1"))
+               Coordination.post(tenant.id, agent_id, :agent, Map.put(base, :body, "v1"))
 
       assert {:ok, second, :updated} =
-               Coordination.post(tenant.id, agent_id, Map.put(base, :body, "v2"))
+               Coordination.post(tenant.id, agent_id, :agent, Map.put(base, :body, "v2"))
 
       assert second.id == first.id
       assert second.body == "v2"
@@ -730,6 +740,7 @@ defmodule Loopctl.CoordinationTest do
                Coordination.post(
                  tenant.id,
                  agent_id,
+                 :agent,
                  base
                  |> Map.put(:body, "broadcast state")
                  |> Map.put(:to_host, "mac-mini")
@@ -744,6 +755,7 @@ defmodule Loopctl.CoordinationTest do
                Coordination.post(
                  tenant.id,
                  agent_id,
+                 :agent,
                  base
                  |> Map.put(:body, "directed handoff")
                  |> Map.put(:to_host, "beelink")
@@ -784,6 +796,7 @@ defmodule Loopctl.CoordinationTest do
                Coordination.post(
                  tenant.id,
                  agent_id,
+                 :agent,
                  base
                  |> Map.put(:body, "directed handoff")
                  |> Map.put(:to_host, "beelink")
@@ -798,6 +811,7 @@ defmodule Loopctl.CoordinationTest do
                Coordination.post(
                  tenant.id,
                  agent_id,
+                 :agent,
                  base |> Map.put(:body, "still working, refreshed")
                )
 
@@ -819,6 +833,7 @@ defmodule Loopctl.CoordinationTest do
                Coordination.post(
                  tenant.id,
                  agent_id,
+                 :agent,
                  base
                  |> Map.put(:body, "moved hosts")
                  |> Map.put(:to_host, "mac-mini")
@@ -838,7 +853,7 @@ defmodule Loopctl.CoordinationTest do
       %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
 
       assert {:ok, s1, :created} =
-               Coordination.post(tenant.id, agent_id, %{
+               Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
                  session_id: "S1",
                  key: "session_goal",
@@ -847,7 +862,7 @@ defmodule Loopctl.CoordinationTest do
                })
 
       assert {:ok, s2, :created} =
-               Coordination.post(tenant.id, agent_id, %{
+               Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
                  session_id: "S2",
                  key: "session_goal",
@@ -862,7 +877,7 @@ defmodule Loopctl.CoordinationTest do
       %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
 
       assert {:error, :not_found} =
-               Coordination.post(tenant.id, agent_id, %{
+               Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: Ecto.UUID.generate(),
                  body: "x",
                  audit: audit
@@ -877,7 +892,7 @@ defmodule Loopctl.CoordinationTest do
       foreign = fixture(:project, %{tenant_id: other.id})
 
       assert {:error, :not_found} =
-               Coordination.post(tenant.id, agent_id, %{
+               Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: foreign.id,
                  body: "x",
                  audit: audit
@@ -895,7 +910,7 @@ defmodule Loopctl.CoordinationTest do
       # maps to a DISTINCT error so the endpoint attributes an identity fault, not a
       # cross-tenant project probe.
       assert {:error, :agent_not_found} =
-               Coordination.post(tenant.id, foreign_agent, %{
+               Coordination.post(tenant.id, foreign_agent, :agent, %{
                  project_id: project.id,
                  body: "x",
                  audit: audit
@@ -927,7 +942,7 @@ defmodule Loopctl.CoordinationTest do
                })
 
       assert {:ok, post, :updated} =
-               Coordination.post(tenant.id, agent_id, %{
+               Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
                  session_id: "S1",
                  key: "session_goal",
@@ -944,7 +959,7 @@ defmodule Loopctl.CoordinationTest do
       %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
 
       assert {:error, %Ecto.Changeset{} = changeset} =
-               Coordination.post(tenant.id, agent_id, %{
+               Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
                  audit: audit
                })
@@ -957,6 +972,186 @@ defmodule Loopctl.CoordinationTest do
                :count,
                :id
              ) == 0
+    end
+  end
+
+  # US-40.D3: project-scoped WRITE membership. A channel is a project_id; before
+  # this story any tenant agent key could post into any project channel in the
+  # tenant (a tenant-wide prompt injector, since posts auto-inject into peer
+  # SessionStart). Writes now default-DENY cross-project: an `:agent` must be a
+  # writable MEMBER of the target project (a story assignment), else the write is
+  # rejected with the SAME {:error, :not_found} a cross-tenant project returns.
+  describe "post/4 project-scoped write membership (US-40.D3)" do
+    setup do
+      tenant = fixture(:tenant)
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      audit = [
+        actor_type: "api_key",
+        actor_id: Ecto.UUID.generate(),
+        actor_label: "agent:worker-1"
+      ]
+
+      %{tenant: tenant, agent_id: agent_id, audit: audit}
+    end
+
+    test "an agent assigned to a story in the project (a member) can post -> created", ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        assigned_agent_id: agent_id,
+        agent_status: :assigned
+      })
+
+      assert {:ok, _post, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "member post",
+                 audit: audit
+               })
+    end
+
+    test "a non-member agent (own tenant, no story assignment) is denied and writes nothing",
+         ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # Same tenant, valid project, valid agent — but the agent is assigned to NO
+      # story in this project. Default-deny: {:error, :not_found}, byte-identical
+      # to the cross-tenant case, and nothing persisted.
+      assert {:error, :not_found} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "cross-project injection",
+                 audit: audit
+               })
+
+      assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
+
+      assert AdminRepo.aggregate(
+               from(a in AuditLog, where: a.entity_type == "channel_post"),
+               :count,
+               :id
+             ) == 0
+    end
+
+    test "membership in ONE project does not grant writes to a SIBLING project in the same tenant",
+         ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+      p1 = fixture(:project, %{tenant_id: tenant.id})
+      p2 = fixture(:project, %{tenant_id: tenant.id})
+
+      # The agent is a member of p1 only.
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: p1.id,
+        assigned_agent_id: agent_id,
+        agent_status: :assigned
+      })
+
+      # p1 works.
+      assert {:ok, _post, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: p1.id,
+                 body: "my own project",
+                 audit: audit
+               })
+
+      # p2 (same tenant, not a member) is denied.
+      assert {:error, :not_found} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: p2.id,
+                 body: "sibling project",
+                 audit: audit
+               })
+    end
+
+    test "membership is tenant-scoped: an assignment in another tenant's project never grants",
+         ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # A DIFFERENT tenant has a project whose id collides in NEITHER value nor
+      # tenant; even if a story assigned our agent_id existed under another
+      # tenant_id, the explicit tenant filter in the membership query excludes it.
+      other = fixture(:tenant)
+      other_project = fixture(:project, %{tenant_id: other.id})
+      other_agent = fixture(:agent, %{tenant_id: other.id}).id
+
+      fixture(:story, %{
+        tenant_id: other.id,
+        project_id: other_project.id,
+        assigned_agent_id: other_agent,
+        agent_status: :assigned
+      })
+
+      # Our agent has no assignment in OUR tenant's project -> denied.
+      assert {:error, :not_found} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "x",
+                 audit: audit
+               })
+    end
+
+    test "an elevated role (>= :user) bypasses the membership gate", ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # No story assignment for this agent, but the caller holds :user — the
+      # operator escape hatch (mirrors the redact-path bypass). Post succeeds.
+      assert {:ok, _post, :created} =
+               Coordination.post(tenant.id, agent_id, :user, %{
+                 project_id: project.id,
+                 body: "operator coordination",
+                 audit: audit
+               })
+    end
+
+    test "an :orchestrator (below :user) is NOT bypassed and must be a member", ctx do
+      %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # Documented choice: the bypass threshold is >= :user, so :orchestrator
+      # (level 2) is still gated by membership. No assignment -> denied.
+      assert {:error, :not_found} =
+               Coordination.post(tenant.id, agent_id, :orchestrator, %{
+                 project_id: project.id,
+                 body: "orchestrator post",
+                 audit: audit
+               })
+    end
+  end
+
+  describe "project_writable_by_agent/4 (US-40.D3 shared predicate)" do
+    test "returns :ok for a member, {:error, :not_found} for a non-member" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      member = fixture(:agent, %{tenant_id: tenant.id}).id
+      stranger = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        assigned_agent_id: member,
+        agent_status: :assigned
+      })
+
+      assert :ok = Coordination.project_writable_by_agent(tenant.id, member, project.id, :agent)
+
+      assert {:error, :not_found} =
+               Coordination.project_writable_by_agent(tenant.id, stranger, project.id, :agent)
+    end
+
+    test "an elevated role is :ok even without membership" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      assert :ok = Coordination.project_writable_by_agent(tenant.id, agent_id, project.id, :user)
     end
   end
 

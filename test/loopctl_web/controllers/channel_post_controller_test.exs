@@ -35,6 +35,25 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     {raw, key, agent}
   end
 
+  # A role:agent key whose agent is a WRITABLE MEMBER of `project` (US-40.D3):
+  # writes are now project-scoped by membership (a channel is a project_id), and
+  # membership is derived from a story assignment. Assigning the agent a story in
+  # `project` admits its writes through the default-deny gate. Use this wherever a
+  # test expects a SUCCESSFUL (or changeset-level) post to its own project; the
+  # cross-tenant/not-found tests deliberately keep the plain, non-member key.
+  defp member_agent_key(tenant, project, attrs \\ %{}) do
+    {raw, key, agent} = agent_key(tenant, attrs)
+
+    fixture(:story, %{
+      tenant_id: tenant.id,
+      project_id: project.id,
+      assigned_agent_id: agent.id,
+      agent_status: :assigned
+    })
+
+    {raw, key, agent}
+  end
+
   defp authed_conn(raw) do
     build_conn()
     |> put_req_header("x-loopctl-last-known-sth", @sth_header)
@@ -68,7 +87,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "agent posts to own project channel -> 201 with server-stamped identity + ~30d expiry" do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, agent} = agent_key(tenant)
+      {raw, _key, agent} = member_agent_key(tenant, project)
 
       conn = post_json(raw, %{"project_id" => project.id, "body" => "pushed PR #107, CI green"})
 
@@ -87,7 +106,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "a multi-item typed-open refs list is persisted and returned -> 201" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       refs = [
         %{"type" => "issue", "value" => "#812"},
@@ -110,7 +129,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "a free ref type (capability) not in the old allowlist -> 201" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       conn =
         post_json(raw, %{
@@ -127,7 +146,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "a refs list over the item-count cap is 422 and not persisted" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       over =
         for i <- 1..(ChannelPost.refs_max_items() + 1), do: %{"type" => "t", "value" => "#{i}"}
@@ -141,7 +160,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "a secret in a ref type is rejected 422 and not persisted" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       refs = [%{"type" => "lc_" <> String.duplicate("a", 30), "value" => "x"}]
       conn = post_json(raw, %{"project_id" => project.id, "body" => "ok", "refs" => refs})
@@ -153,7 +172,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "a secret in a ref label is rejected 422 and not persisted" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       refs = [%{"type" => "file", "value" => "x", "label" => "sk-" <> String.duplicate("a", 30)}]
       conn = post_json(raw, %{"project_id" => project.id, "body" => "ok", "refs" => refs})
@@ -165,7 +184,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "malformed refs items are 422, not 500" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       # missing `type`
       c1 =
@@ -194,7 +213,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "post with to_host + to_capability -> 201, and both surface on the read" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       conn =
         post_json(raw, %{
@@ -218,7 +237,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "post with no to_host/to_capability -> 201, both null, visible on channel_recent" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       conn = post_json(raw, %{"project_id" => project.id, "body" => "broadcast"})
 
@@ -237,7 +256,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "a secret in to_capability is rejected 422 and not persisted" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       conn =
         post_json(raw, %{
@@ -259,8 +278,8 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "a post addressed to another host is still visible to a different agent in the tenant" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw_a, _key_a, _agent_a} = agent_key(tenant)
-      {raw_b, _key_b, _agent_b} = agent_key(tenant)
+      {raw_a, _key_a, _agent_a} = member_agent_key(tenant, project)
+      {raw_b, _key_b, _agent_b} = member_agent_key(tenant, project)
 
       conn =
         post_json(raw_a, %{
@@ -283,7 +302,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "agent_id/tenant_id in the body are ignored (server-stamped from the key)" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, agent} = agent_key(tenant)
+      {raw, _key, agent} = member_agent_key(tenant, project)
 
       foreign_tenant = fixture(:tenant)
       foreign_agent = fixture(:agent, %{tenant_id: foreign_tenant.id})
@@ -360,7 +379,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "keyed post upserts within a session (200, same id) and is distinct across sessions (201)" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       slot = fn session, body ->
         %{
@@ -443,7 +462,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       stub_counting_limiter()
       tenant = fixture(:tenant, %{settings: %{"channel_post_write_limit_per_minute" => "3"}})
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       for _ <- 1..3 do
         conn = post_json(raw, %{"project_id" => project.id, "body" => "x"})
@@ -463,7 +482,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       log =
         capture_log(fn ->
@@ -481,7 +500,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       stub_counting_limiter()
       tenant = fixture(:tenant, %{settings: %{"channel_post_write_limit_per_minute" => 3}})
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       # First 3 writes are within the per-write cap.
       for _ <- 1..3 do
@@ -505,7 +524,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "an oversized body is rejected 422 and not persisted" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       conn =
         post_json(raw, %{"project_id" => project.id, "body" => String.duplicate("a", 16_385)})
@@ -521,7 +540,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     test "a secret-shaped body is rejected 422 and emits the secret_blocked security signal" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
-      {raw, _key, _agent} = agent_key(tenant)
+      {raw, _key, _agent} = member_agent_key(tenant, project)
 
       handler_id = "coord-secret-http-#{System.unique_integer([:positive])}"
       test_pid = self()
@@ -565,6 +584,107 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         |> post(@path, %{"project_id" => project.id, "body" => "x"})
 
       assert conn.status in [401, 403]
+    end
+
+    # US-40.D3 — writes are scoped to the caller's OWN project (membership),
+    # default-deny cross-project posting. Before this, any tenant agent key could
+    # post into any project channel in the tenant, and that body auto-injects into
+    # every peer session on the repo — a tenant-wide prompt injector. These prove
+    # the server enforces write-to-own-project and that "not a member", "not your
+    # tenant", and "does not exist" all collapse to ONE byte-identical 422.
+
+    # TC-40.D3.1 + AC-40.D3.3: a member of P1 posts to P1 -> 201, while a SECOND
+    # project P2 in the SAME tenant that the agent is NOT a member of is rejected.
+    test "a member posts to its own project (201) but not to a sibling project it is not in (422)" do
+      tenant = fixture(:tenant)
+      p1 = fixture(:project, %{tenant_id: tenant.id})
+      p2 = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, p1)
+
+      # P1 (the agent's own project) works.
+      own = post_json(raw, %{"project_id" => p1.id, "body" => "on my project"})
+      assert %{"post" => _} = json_response(own, 201)
+
+      # P2 (same tenant, not a member) is denied — cross-project default-deny.
+      sibling = post_json(raw, %{"project_id" => p2.id, "body" => "cross-project injection"})
+      assert json_response(sibling, 422)
+
+      # Nothing persisted for P2.
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^p2.id),
+               :count,
+               :id
+             ) == 0
+    end
+
+    # TC-40.D3.2: a non-member post to a same-tenant project is byte-identical to
+    # the cross-tenant 422, fires :ownership_rejected, and persists nothing.
+    test "a non-member cross-project 422 is byte-identical to cross-tenant + fires ownership_rejected" do
+      tenant = fixture(:tenant)
+      own_project = fixture(:project, %{tenant_id: tenant.id})
+      sibling = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, own_project)
+
+      # A project in ANOTHER tenant, for the byte-identical baseline.
+      other = fixture(:tenant)
+      foreign = fixture(:project, %{tenant_id: other.id})
+
+      handler_id = "coord-d3-ownership-#{System.unique_integer([:positive])}"
+      test_pid = self()
+      tenant_id = tenant.id
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :coordination, :ownership_rejected],
+        fn _event, measurements, meta, _cfg ->
+          if meta[:tenant_id] == tenant_id,
+            do: send(test_pid, {:ownership_rejected, measurements, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      cross_project_body =
+        post_json(raw, %{"project_id" => sibling.id, "body" => "x"}) |> json_response(422)
+
+      cross_tenant_body =
+        post_json(raw, %{"project_id" => foreign.id, "body" => "x"}) |> json_response(422)
+
+      # No oracle: the cross-PROJECT body equals the cross-TENANT body.
+      assert cross_project_body == cross_tenant_body
+
+      # The injector is observable: :ownership_rejected fired for the cross-project
+      # attempt (referencing the sibling project id).
+      assert_receive {:ownership_rejected, %{count: 1}, %{project_id: sibling_id}}
+      assert sibling_id == sibling.id
+
+      # Nothing persisted for the sibling project.
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^sibling.id),
+               :count,
+               :id
+             ) == 0
+    end
+
+    # TC-40.D3.3: a project in another tenant -> 422, identical body (regression
+    # guard — reads/cross-tenant posture unchanged by the membership addition).
+    test "a project in another tenant is still 422 (regression guard)" do
+      tenant = fixture(:tenant)
+      own_project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, own_project)
+
+      other = fixture(:tenant)
+      foreign = fixture(:project, %{tenant_id: other.id})
+
+      body =
+        post_json(raw, %{"project_id" => foreign.id, "body" => "x"}) |> json_response(422)
+
+      # Same byte-identical ownership message the cross-tenant case always returned.
+      assert body["error"]["message"] ==
+               "project_id does not exist or does not belong to your tenant"
+
+      assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
     end
   end
 

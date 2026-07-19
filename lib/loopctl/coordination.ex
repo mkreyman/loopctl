@@ -29,6 +29,7 @@ defmodule Loopctl.Coordination do
   alias Loopctl.Auth.Role
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Projects
+  alias Loopctl.WorkBreakdown.Story
 
   # Uniform retention for every post — one authoritative constant in code, not a
   # DB default (owner decision; the fleet audit showed the category taxonomy and
@@ -131,8 +132,10 @@ defmodule Loopctl.Coordination do
   from an in-place slot update so the endpoint can answer 201 vs 200.
 
   `tenant_id` and `agent_id` are server-stamped by the caller (from the verified
-  key identity — never the request body). `attrs` carries the caller-supplied
-  fields plus two context keys the changeset never casts:
+  key identity — never the request body); `role` is the caller's VERIFIED key
+  role (used only for the elevated-role membership bypass, below — never a
+  spoofable body field). `attrs` carries the caller-supplied fields plus two
+  context keys the changeset never casts:
 
     * `:project_id` — the channel; ownership is checked via
       `Projects.get_project/2`. A missing OR cross-tenant project returns the
@@ -142,6 +145,29 @@ defmodule Loopctl.Coordination do
       `LoopctlWeb.AuditContext.from_conn/1`) written into the audit entry.
 
   `expires_at` is fixed server-side at `now + #{@retention_days} days`.
+
+  ## Project-scoped write authorization (US-40.D3) — default-DENY cross-project
+
+  Owning the target project's TENANT is NOT sufficient to write to its channel:
+  the caller must ALSO be a WRITABLE MEMBER of the specific project (see
+  `project_writable_by_agent/4`). Absent membership the write is rejected with the
+  SAME `{:error, :not_found}` a missing/cross-tenant project returns — so a
+  cross-PROJECT attempt (an `:agent` posting to a sibling project in its own
+  tenant it is not assigned to) collapses to the byte-identical 422 the
+  cross-tenant case yields, no oracle distinguishing "not a member" from "not your
+  tenant" from "does not exist". This closes the tenant-wide prompt-injection hole:
+  before US-40.D3 any tenant agent key could post into any project channel, and
+  that body auto-injects into every peer session on the repo via SessionStart.
+
+  Membership is derived from an AUTHENTICATED server-side source — a story
+  assignment (`stories.assigned_agent_id`) — never a client field; an `:agent`
+  with no assigned story in the project is denied (default-deny). Elevated roles
+  (`>= :user`) bypass the membership gate, mirroring the redact-path escape hatch
+  (`authorized_to_delete?/3`): the threat model is specifically the `:agent` role
+  ("one compromised agent key"), and an operator legitimately curates across
+  projects. The check runs AFTER `Projects.get_project/2` and `agent_owned/2`, so
+  a missing project or foreign-tenant agent still surface their own distinct
+  errors first.
 
   ## Upsert semantics
 
@@ -175,12 +201,12 @@ defmodule Loopctl.Coordination do
     * `{:error, %Ecto.Changeset{}}` — a size/shape bound, denylist hit, or NUL
       byte was rejected; nothing was persisted (endpoint → 422)
   """
-  @spec post(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+  @spec post(Ecto.UUID.t(), Ecto.UUID.t(), atom(), map()) ::
           {:ok, ChannelPost.t(), :created | :updated}
           | {:error, :not_found}
           | {:error, :agent_not_found}
           | {:error, Ecto.Changeset.t()}
-  def post(tenant_id, agent_id, attrs) do
+  def post(tenant_id, agent_id, role, attrs) do
     project_id = Map.get(attrs, :project_id)
     audit = Map.get(attrs, :audit, [])
 
@@ -198,8 +224,16 @@ defmodule Loopctl.Coordination do
     # that foreign agent. Restoring the guard (mirroring sibling `create_post/4`)
     # closes that regression; the NOT NULL FK to `agents` remains the backstop for
     # the "agent row deleted while its api_key persists" race.
+    # US-40.D3: after the project and agent ownership guards, enforce project-
+    # scoped WRITE membership. A non-member `:agent` (even in its own tenant) is
+    # rejected with the SAME `{:error, :not_found}` the missing/cross-tenant
+    # project returns, so the endpoint maps it to the byte-identical 422 with no
+    # "not a member" vs "not your tenant" oracle. This runs LAST so a missing
+    # project (:not_found) and a foreign-tenant agent (:agent_not_found) keep
+    # their distinct, correctly-attributed errors.
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
-         {:ok, _agent} <- agent_owned(tenant_id, agent_id) do
+         {:ok, _agent} <- agent_owned(tenant_id, agent_id),
+         :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role) do
       changeset =
         %ChannelPost{
           tenant_id: tenant_id,
@@ -211,6 +245,69 @@ defmodule Loopctl.Coordination do
 
       run_post(tenant_id, changeset, audit)
     end
+  end
+
+  @doc """
+  Authorizes a project-scoped WRITE by an agent — the SHARED default-deny
+  membership gate (US-40.D3).
+
+  Returns `:ok` when the caller may write to the project's coordination surface,
+  `{:error, :not_found}` otherwise. The `:not_found` shape is deliberate: callers
+  fold it into the SAME byte-identical 422 a missing/cross-tenant project returns,
+  so a cross-project write attempt reveals no "not a member" vs "not your tenant"
+  vs "does not exist" oracle.
+
+  Two ways to be authorized:
+
+    1. **Membership** — the agent is assigned to at least one story in the project
+       (`stories.assigned_agent_id`, scoped by an EXPLICIT `tenant_id` filter on
+       the `AdminRepo`/BYPASSRLS path — the module's isolation convention). This is
+       the AUTHENTICATED, server-side source: `agent_id` and `tenant_id` are both
+       key-derived, never client-supplied. In the loopctl flow an implementer that
+       claims/starts a story gets `assigned_agent_id` set, so a working agent IS a
+       member of the project it works on. Default-DENY: no assignment ⇒ no write.
+
+    2. **Elevated role** — a caller with `role >= :user` bypasses the membership
+       check, mirroring the redact-path operator escape hatch
+       (`authorized_to_delete?/3`). The threat model is the `:agent` role (one
+       compromised agent key posting into every project channel); operators
+       legitimately curate across projects. NOTE the deliberate choice: an
+       `:orchestrator` (level 2, below `:user`) does NOT bypass and must be a
+       member via story assignment — the gate is enforced for every role below
+       `:user`.
+
+  ## Coupling (keep SHARED)
+
+  This is the single project-scoped-write predicate for the coordination surface.
+  The CLAIM writes (US-40.B1 claim/release/done) and the graduate write
+  (US-40.E1) MUST gate through this same function — a claim/graduate on a project
+  the caller cannot post to is denied identically — rather than re-deriving
+  membership. Do not inline a second copy.
+  """
+  @spec project_writable_by_agent(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), atom()) ::
+          :ok | {:error, :not_found}
+  def project_writable_by_agent(tenant_id, agent_id, project_id, role) do
+    if Role.role_at_least?(role, :user) or
+         agent_member_of_project?(tenant_id, agent_id, project_id) do
+      :ok
+    else
+      {:error, :not_found}
+    end
+  end
+
+  # Membership derivation (US-40.D3): the agent is assigned to at least one story
+  # in the project. Runs on `AdminRepo` (BYPASSRLS) with an EXPLICIT `tenant_id`
+  # filter — the module's isolation convention; omitting it would be a cross-tenant
+  # bug. `exists?` compiles to `SELECT 1 ... LIMIT 1`, so it never materializes rows.
+  # Source table: `stories` (`Loopctl.WorkBreakdown.Story`).
+  defp agent_member_of_project?(tenant_id, agent_id, project_id) do
+    Story
+    |> where(
+      [s],
+      s.tenant_id == ^tenant_id and s.project_id == ^project_id and
+        s.assigned_agent_id == ^agent_id
+    )
+    |> AdminRepo.exists?()
   end
 
   @doc """
