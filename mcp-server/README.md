@@ -121,7 +121,7 @@ REST endpoint (`PATCH /api/v1/tenants/me/llm-config`), and the docs — so you (
 autonomous agent) can self-remediate without a human. Full agent-tenant lifecycle:
 [`docs/onboarding-agent-tenant.md`](../docs/onboarding-agent-tenant.md).
 
-## Tools (95)
+## Tools (96)
 
 > Plus **per-tenant generated Context Retriever tools** (`cr_*`) appended
 > dynamically at runtime — see [Dynamic per-tenant Context Retriever
@@ -161,6 +161,7 @@ Epic 39 Repo Coordination Bus — a lightweight, tenant-isolated channel for age
 | `channel_claim` | Claim a handoff `ref` for EXACTLY ONE agent (Epic 40, US-40.B1) — coordinate an out-of-band unit of work (e.g. `handoff:repo#812`) among agents racing on the same repo. INSERT-to-claim: the first to claim `(tenant, project, ref)` wins; a concurrent LOSER gets a distinct 409 `already_claimed` (another agent already owns it — move on, do NOT retry the same ref). Project-scoped by membership. Optional `lease_seconds` (default 3600, max 86400). Required: `project_id`, `ref`. |
 | `channel_release` | Release YOUR OWN handoff claim so the `ref` reopens for another agent (deletes the claim). Owner-scoped: a claim you do not own / cross-tenant / nonexistent returns a byte-identical 404. Required: `project_id`, `ref`. |
 | `channel_done` | Mark YOUR OWN handoff claim done (sets `done_at`) — records you completed the claimed work; the row is retained ~7 days then swept. Owner-scoped like `channel_release`. Required: `project_id`, `ref`. |
+| `channel_graduate` | Graduate a coordination post into the durable Knowledge wiki (Epic 40, US-40.E1). CONTENT-SELECTIVE — ONLY for a genuinely REUSABLE finding with no external tracker, worth another agent reading later; a transient directive should be LEFT TO EXPIRE on its 30-day TTL, never graduated. No automatic graduation. Reuses Knowledge's guardrails, never a bypass: the semantic novelty gate (a near-duplicate returns 200 `deduplicated`, nothing created) plus a secret scan (a denylisted credential returns 422). Records `source_type` `channel_graduation` + the post id, attributed to you; the source post is KEPT (its TTL reclaims it). Project-scoped by membership. Optional `tags`, `category` (default `finding`). Required: `post_id`, `title`. |
 
 ### Story Tools
 

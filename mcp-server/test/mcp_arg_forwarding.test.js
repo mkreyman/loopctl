@@ -397,6 +397,58 @@ describe("#40.D1: channel_get wiring + untrusted-DATA framing", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// #40.E1: channel_graduate (graduate a coordination post into Knowledge)
+// ---------------------------------------------------------------------------
+
+describe("#40.E1: channel_graduate wiring", () => {
+  test("TOOLS declares channel_graduate requiring post_id and title", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_graduate",/,
+      'must declare a "channel_graduate" tool',
+    );
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_graduate",[\s\S]*?required: \["post_id", "title"\]/,
+      "the channel_graduate inputSchema must require post_id and title",
+    );
+  });
+
+  test("channelGraduate POSTs /channel/posts/${post_id}/graduate on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelGraduate\([\s\S]*?"POST",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}\/graduate`,\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelGraduate must POST /api/v1/channel/posts/${post_id}/graduate with the agent key",
+    );
+  });
+
+  test("the channel_graduate dispatch case calls channelGraduate(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_graduate":\s*\n\s*return await channelGraduate\(args\);/,
+      "the channel_graduate dispatch case must call channelGraduate(args)",
+    );
+  });
+
+  test("channel_graduate description states it is CONTENT-SELECTIVE and transient posts should expire (AC-40.E1.4/5)", () => {
+    const gradTool = /name: "channel_graduate",\s*\n\s*description:\s*\n?\s*"([^"]*)"/.exec(
+      INDEX_SRC,
+    );
+    assert.ok(gradTool, "channel_graduate must have a description");
+    assert.match(
+      gradTool[1],
+      /REUSABLE/,
+      "channel_graduate must state it is for a reusable finding",
+    );
+    assert.match(
+      gradTool[1],
+      /LEFT TO EXPIRE|left to expire/,
+      "channel_graduate must say transient directives should be left to expire",
+    );
+  });
+});
+
 describe("KB-scope lifecycle: archive_kb_scope / restore_kb_scope wiring", () => {
   test("TOOLS declares archive_kb_scope and restore_kb_scope", () => {
     assert.match(INDEX_SRC, /name: "archive_kb_scope",/, 'must declare "archive_kb_scope"');

@@ -557,6 +557,26 @@ async function channelDelete({ post_id }) {
   return toContent(result);
 }
 
+async function channelGraduate({ post_id, title, tags, category }) {
+  // Repo Coordination Bus (Epic 40, US-40.E1): graduate a coordination post into
+  // the durable Knowledge wiki on the AGENT key. CONTENT-SELECTIVE — for a
+  // genuinely REUSABLE finding with no external tracker, NOT routine handoffs (a
+  // transient directive should be left to expire on its 30-day TTL). Reuses
+  // Knowledge's semantic novelty gate (a near-duplicate returns 200 deduplicated,
+  // nothing created) plus an explicit secret scan (a denylisted credential returns
+  // 422) — never a bypass. Project-scoped by membership; tenant/agent server-stamped.
+  const payload = { title };
+  if (tags) payload.tags = tags;
+  if (category) payload.category = category;
+  const result = await apiCall(
+    "POST",
+    `/api/v1/channel/posts/${post_id}/graduate`,
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function deleteProject({ project_id }) {
   const result = await apiCall(
     "DELETE",
@@ -2429,6 +2449,35 @@ const TOOLS = [
         },
       },
       required: ["post_id"],
+    },
+  },
+  {
+    name: "channel_graduate",
+    description:
+      "Graduate a repo coordination post into the durable Knowledge wiki (Epic 40 Repo Coordination Bus, US-40.E1), on the agent key. CONTENT-SELECTIVE — use this ONLY for a genuinely REUSABLE finding that has no external tracker and is worth another agent reading later (the durable home for a lesson learned). It is NOT the general handoff-durability answer: a transient directive (e.g. 'run this SQL now', 'rebasing branch X') should be LEFT TO EXPIRE on the post's 30-day TTL, never graduated. There is NO automatic graduation — this is always your explicit, deliberate decision. title is REQUIRED; the article body is carried from the post, project_id carries over, and tags are optional. Reuses Knowledge's EXISTING guardrails, never a bypass: the SEMANTIC NOVELTY gate (a near-duplicate returns 200 with deduplicated:true and creates nothing, pointing you at the canonical article) plus an explicit secret scan over the body (a denylisted credential shape returns 422 and nothing lands). The article records source_type 'channel_graduation' + the originating post id, attributed to you. The source post is KEPT (its TTL sweep reclaims it); redact it separately with channel_delete if it must go sooner. Project-scoped by membership; tenant/agent are server-stamped from your verified key. Rate-bounded so it cannot bulk-flood Knowledge from the channel.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        post_id: {
+          type: "string",
+          description: "UUID of the channel post to graduate (must be in your tenant).",
+        },
+        title: {
+          type: "string",
+          description: "Title for the durable Knowledge article (required).",
+        },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional topical tags for the article.",
+        },
+        category: {
+          type: "string",
+          description:
+            "Optional article category (defaults to 'finding' — a reusable lesson).",
+        },
+      },
+      required: ["post_id", "title"],
     },
   },
   {
@@ -5303,6 +5352,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "channel_delete":
       return await channelDelete(args);
+    case "channel_graduate":
+      return await channelGraduate(args);
 
     case "channel_claim":
       return await channelClaim(args);

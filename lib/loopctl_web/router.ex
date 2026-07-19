@@ -148,6 +148,15 @@ defmodule LoopctlWeb.Router do
     # human-anchor gated.
     delete "/channel/posts/:id", ChannelPostController, :delete
 
+    # Graduate a coordination post into the durable Knowledge wiki (Epic 40,
+    # US-40.E1) — the CONTENT-SELECTIVE promotion of a genuinely reusable finding
+    # with no external tracker (a transient directive is left to expire). Agent
+    # role, project-scoped by membership (US-40.D3), NOT human-anchor gated
+    # (coordination surface, owner decision #331). Goes through Knowledge's
+    # semantic novelty gate + an explicit secret scan — never a bypass. The static
+    # `/graduate` suffix does NOT shadow `get "/channel/posts/:id"`.
+    post "/channel/posts/:id/graduate", ChannelPostController, :graduate
+
     # Repo Coordination Bus CLAIM surface (Epic 40, US-40.B1) — exactly-once handoff
     # claims. INSERT-to-claim: the first inserter on (tenant_id, project_id, ref)
     # wins; a loser gets a distinct 409 already_claimed. Agent-role, project-scoped

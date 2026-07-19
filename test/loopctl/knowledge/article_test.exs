@@ -274,6 +274,25 @@ defmodule Loopctl.Knowledge.ArticleTest do
       end
     end
 
+    # TC-40.E1.5 — the graduate path (US-40.E1) stamps source_type
+    # "channel_graduation"; it must be in @known_source_types so validate_source_type/1
+    # passes rather than rejecting the durable provenance marker.
+    test "accepts the channel_graduation source_type (US-40.E1)" do
+      assert "channel_graduation" in Article.known_source_types()
+
+      changeset =
+        Article.create_changeset(%Article{}, %{
+          title: "Graduated finding",
+          body: "A reusable lesson.",
+          category: :finding,
+          source_type: "channel_graduation",
+          source_id: Ecto.UUID.generate()
+        })
+
+      assert changeset.valid?
+      refute errors_on(changeset)[:source_type]
+    end
+
     test "rejects non-map metadata" do
       changeset =
         Article.create_changeset(%Article{}, %{
