@@ -431,6 +431,16 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     title_conflict = to_int(row.title_conflict)
     validation_error = to_int(row.validation_error)
 
+    # Denominator = ALL five write outcomes, including the SUCCESSFUL deduplicated
+    # and drafted outcomes. `reject_rate` is therefore "fraction of ALL write attempts
+    # rejected", not "fraction of new-content-CREATE attempts rejected". This is
+    # deliberate (tenant-wide, a pipeline that mostly dedups is largely working), but
+    # it is a KNOWN blind spot: a genuine title_conflict/validation reject storm on a
+    # source_type that ALSO carries heavy legitimate idempotent-dedup traffic can be
+    # diluted below `reject_rate_threshold` and evade this detector
+    # (e.g. 600 rejects / (1000 dedup + 600) = 0.375 < 0.5). If a source with high
+    # idempotent-dedup volume needs coverage, prefer a create+reject-only denominator
+    # or an absolute rejects/window rate for it rather than widening this ratio.
     total_attempts = created + deduplicated + drafted + title_conflict + validation_error
     rejects = title_conflict + validation_error
     reject_rate = if total_attempts > 0, do: rejects / total_attempts, else: 0.0
@@ -822,16 +832,34 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   # Stamp the recovery time (episode ended) + mark resolved, auditing the resolve
   # transition only when the row was previously unresolved (an already-resolved row is
   # a system bookkeeping mark, not a state change worth a resolved-audit entry).
-  defp close_recovered_reject(%IngestionAnomaly{tenant_id: tenant_id} = anomaly, now) do
-    was_resolved = anomaly.resolved
-
+  #
+  # The candidate struct was bulk-loaded UNLOCKED in auto_resolve_recovered_reject_rate/1
+  # (AdminRepo.all, no FOR UPDATE). If an operator PATCH-resolves or archives the same
+  # anomaly between that load and this transaction, `anomaly.resolved` would be STALE
+  # (false), so trusting it would write a bogus resolved:false->true entry into the
+  # append-only, hash-chained audit log for a flip that already happened. So re-read the
+  # row FOR UPDATE inside the transaction and compute `was_resolved` from the LOCKED row
+  # — matching transition/8's locked, audit-honest flip.
+  defp close_recovered_reject(%IngestionAnomaly{id: id, tenant_id: tenant_id}, now) do
     multi =
       Multi.new()
-      |> Multi.run(:anomaly, fn repo, _changes ->
-        anomaly |> IngestionAnomaly.reject_recovered_changeset(now) |> repo.update()
+      |> Multi.run(:locked, fn repo, _changes ->
+        locked =
+          IngestionAnomaly
+          |> where([a], a.id == ^id and a.tenant_id == ^tenant_id)
+          |> lock("FOR UPDATE")
+          |> repo.one()
+
+        {:ok, locked}
       end)
-      |> Multi.run(:audit, fn repo, %{anomaly: updated} ->
-        if was_resolved do
+      |> Multi.run(:anomaly, fn repo, %{locked: locked} ->
+        case locked do
+          nil -> {:error, :not_found}
+          row -> row |> IngestionAnomaly.reject_recovered_changeset(now) |> repo.update()
+        end
+      end)
+      |> Multi.run(:audit, fn repo, %{locked: locked, anomaly: updated} ->
+        if locked.resolved do
           {:ok, :skipped}
         else
           audit_insert(

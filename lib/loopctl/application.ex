@@ -46,9 +46,18 @@ defmodule Loopctl.Application do
       # increment is DROPPED (best-effort analytics, never blocks/fails the observed
       # write). Separate from the general `Loopctl.TaskSupervisor` so this backpressure
       # is isolated, mirroring `Loopctl.Memory.RecallBumpTaskSupervisor`.
+      #
+      # The cap is sized to the AdminRepo pool (ADMIN_POOL_SIZE, default 3), NOT set to
+      # a large fan-out: each task issues one AdminRepo checkout, so a cap far above the
+      # pool merely oversubscribes the 3-conn pool during a storm (queueing checkouts
+      # past `queue_target`/`queue_interval` and starving the co-tenant rate-limiter/auth
+      # upserts). A small multiple of the pool (default 10) allows brief overlap while
+      # keeping concurrent checkout demand bounded to roughly the pool depth — excess
+      # increments drop rather than pile onto the pool. Under normal low-frequency writes
+      # tasks complete in microseconds, so the cap is never approached.
       {Task.Supervisor,
        name: Loopctl.Telemetry.IngestionWriteStatsTaskSupervisor,
-       max_children: Application.get_env(:loopctl, :ingestion_write_stats_max_tasks, 200)},
+       max_children: Application.get_env(:loopctl, :ingestion_write_stats_max_tasks, 10)},
       # #411 Gap 3: owns the public ETS table that pre-filters recall-count hotness
       # bumps already inside their per-memory cooldown window, so an idle-window
       # recall issues ZERO background tasks and ZERO DB writes (the DB-side
