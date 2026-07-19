@@ -50,8 +50,10 @@ defmodule Loopctl.Coordination do
 
   `tenant_id`, `project_id`, `agent_id`, and `expires_at` are set programmatically
   on the struct (never from caller input); only `body` and the optional
-  `session_id`/`host`/`key`/`refs` are cast from `attrs`. `expires_at` is fixed at
-  `now + #{@retention_days} days`.
+  `session_id`/`host`/`key`/`refs`/`to_host`/`to_capability` are cast from `attrs`
+  (`to_host`/`to_capability` are the advisory, spoofable, surfacing-only addressing
+  fields — see the `ChannelPost` moduledoc trust boundary). `expires_at` is fixed
+  at `now + #{@retention_days} days`.
 
   Both `project_id` and `agent_id` must belong to `tenant_id`; a mispaired call
   returns `{:error, :not_found}` rather than inserting a cross-tenant-shaped row
@@ -112,10 +114,14 @@ defmodule Loopctl.Coordination do
   this changes nothing observable versus the doc's stale
   `(tenant, project, session, key)` target, but it MUST match the live index or
   the insert raises). A repeat write from the SAME session refreshes its own
-  slot's caller-variable payload — `body`, `refs`, the advisory addressing
-  (`to_host`/`to_capability`, US-40.A5), `updated_at`, and `expires_at` — so a
-  keyed re-post can re-address a handoff slot or promote a broadcast slot to
-  directed; `inserted_at`, `host`, and `session_id` are set-once (kept from the
+  slot's caller-variable payload — `body`, `refs`, `updated_at`, and `expires_at`
+  are fully replaced, while the advisory addressing (`to_host`/`to_capability`,
+  US-40.A5) is PRESERVE-ON-OMIT: a supplied value re-addresses a handoff slot or
+  promotes a broadcast slot to directed, but an OMITTED value keeps the
+  previously-set target (COALESCE) rather than NULL-wiping it — so a body-only or
+  TTL-only refresh never silently demotes a directed slot out of 40.C1 discovery
+  (clearing addressing by omission is intentionally unsupported; delete + re-post
+  to demote). `inserted_at`, `host`, and `session_id` are set-once (kept from the
   original insert). A different session's same key is a distinct row. Without a
   `key` every post is a new append-only row.
 
@@ -357,19 +363,36 @@ defmodule Loopctl.Coordination do
   # makes the returned struct — the response JSON, the audit entity_id, AND the
   # `post_outcome/1` timestamp comparison — reflect the real persisted row.
   #
-  # The replace list carries the CALLER-VARIABLE payload — the fields a re-post of
-  # the SAME working-state slot may legitimately change:
+  # The DO UPDATE refreshes the CALLER-VARIABLE payload — the fields a re-post of
+  # the SAME working-state slot may legitimately change — but with TWO distinct
+  # merge rules, because the fields differ in how a caller signals intent:
   #
-  #   * `body`/`refs` — the message content.
-  #   * `to_host`/`to_capability` (US-40.A5) — advisory addressing. These are
-  #     per-message intent, not slot-identity metadata, so a keyed re-post must be
-  #     able to re-address the slot (or promote a broadcast working-state slot to
-  #     directed) — otherwise the FIRST-set addressing sticks and 40.C1 directed
-  #     discovery (which surfaces "directed-to-me" posts by `to_host`/`to_capability`)
-  #     would read stale targets on a handoff refresh. They refresh like `body`.
-  #   * `updated_at`/`expires_at` — the refresh timestamp and the TTL extension.
+  #   * FULL REPLACE (`body`/`refs`/`updated_at`/`expires_at`) — overwritten with
+  #     the incoming values every time. `body` is `validate_required`, so it can
+  #     never be accidentally omitted; `refs` is content the caller re-curates with
+  #     each post; the two timestamps are the refresh instant and the TTL extension.
   #
-  # Deliberately EXCLUDED (set-once at first insert): `inserted_at` (so
+  #   * PRESERVE-ON-OMIT (`to_host`/`to_capability`, US-40.A5) — advisory addressing,
+  #     merged with `COALESCE(EXCLUDED.<field>, existing.<field>)`: a non-nil
+  #     incoming value re-addresses (or promotes a broadcast slot to directed), but
+  #     an OMITTED value (nil) KEEPS the previously-set target rather than wiping it.
+  #     This is deliberate and asymmetric to `body`: addressing is OPTIONAL and is
+  #     the field a refresh most commonly omits — the controller sends
+  #     `to_host: params["to_host"]` (nil when the JSON omits it) and the MCP proxy
+  #     only adds the keys when present (`if (to_host) payload.to_host = to_host`),
+  #     so a keyed re-post that touches only `body` or extends TTL through the normal
+  #     agent path carries NO addressing. Under a plain replace that would silently
+  #     NULL-wipe the routing and demote a directed handoff slot to broadcast,
+  #     dropping it out of 40.C1 directed discovery (`to_host=$me OR to_capability
+  #     IN $caps`) with no error surfaced — breaking the exact directed-handoff use
+  #     case this story exists to enable. COALESCE makes an accidental omission a
+  #     no-op instead of a silent routing loss. Re-addressing still works (a non-nil
+  #     value wins); the only thing you CANNOT do by omission is CLEAR addressing
+  #     (demote a directed slot back to broadcast) — a deliberately unsupported,
+  #     never-designed-for path. To demote, delete the slot (US-39.7) and re-post
+  #     without addressing.
+  #
+  # Deliberately UNTOUCHED (set-once at first insert): `inserted_at` (so
   # `post_outcome/1` can tell created from updated), and `host`/`session_id`, which
   # are slot-identity/attribution metadata the story mandates mirroring from the
   # original insert, not refreshable payload.
@@ -377,12 +400,34 @@ defmodule Loopctl.Coordination do
 
   defp insert_opts(_key) do
     [
-      on_conflict: {:replace, [:body, :refs, :to_host, :to_capability, :updated_at, :expires_at]},
+      on_conflict: keyed_slot_on_conflict(),
       conflict_target:
         {:unsafe_fragment,
          "(tenant_id, project_id, agent_id, session_id, key) WHERE key IS NOT NULL"},
       returning: true
     ]
+  end
+
+  # DO UPDATE for a keyed working-state slot. `body`/`refs`/`updated_at`/`expires_at`
+  # are replaced with the incoming values (`EXCLUDED.*` is the row we tried to
+  # insert); `to_host`/`to_capability` COALESCE the incoming value over the stored
+  # one so an OMITTED (nil) advisory target preserves the previously-set routing
+  # instead of NULL-wiping it (see the insert_opts/1 comment for why addressing is
+  # preserve-on-omit while body is full-replace). Mirrors the `EXCLUDED`-driven
+  # on_conflict query in `Loopctl.AuditChain`.
+  defp keyed_slot_on_conflict do
+    from(p in ChannelPost,
+      update: [
+        set: [
+          body: fragment("EXCLUDED.body"),
+          refs: fragment("EXCLUDED.refs"),
+          to_host: fragment("COALESCE(EXCLUDED.to_host, ?)", p.to_host),
+          to_capability: fragment("COALESCE(EXCLUDED.to_capability, ?)", p.to_capability),
+          updated_at: fragment("EXCLUDED.updated_at"),
+          expires_at: fragment("EXCLUDED.expires_at")
+        ]
+      ]
+    )
   end
 
   # Created vs in-place update, read from the PERSISTED row (see run_post/3). A

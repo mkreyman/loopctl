@@ -579,8 +579,8 @@ defmodule Loopctl.CoordinationTest do
       # to_host/to_capability are caller-variable advisory PAYLOAD, not slot-identity
       # metadata — so a keyed re-post of the same working-state slot must be able to
       # re-address it (US-40.A5), otherwise 40.C1 directed discovery reads the stale
-      # FIRST-set target on a handoff refresh. They are in the on_conflict replace
-      # list alongside body/refs, so the upsert overwrites them.
+      # FIRST-set target on a handoff refresh. A SUPPLIED (non-nil) value overrides
+      # via COALESCE(EXCLUDED, existing) on the upsert.
       base = %{project_id: project.id, session_id: "S1", key: "handoff:fly", audit: audit}
 
       assert {:ok, first, :created} =
@@ -616,6 +616,73 @@ defmodule Loopctl.CoordinationTest do
       reloaded = AdminRepo.get!(ChannelPost, second.id)
       assert reloaded.to_host == "beelink"
       assert reloaded.to_capability == "fly-auth"
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 1
+    end
+
+    test "a keyed re-post that OMITS addressing preserves it (no silent demote to broadcast)",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      # The directed-handoff footgun this story must NOT have: a session posts a
+      # directed slot, then re-posts the SAME slot to update only body / extend TTL
+      # and OMITS addressing (the default through the controller + MCP proxy, which
+      # send to_host/to_capability only when present). Addressing is preserve-on-omit
+      # (COALESCE(EXCLUDED, existing)), so the omitted target is KEPT — the slot stays
+      # directed and remains visible to 40.C1 directed discovery, rather than being
+      # silently NULL-wiped to a broadcast.
+      base = %{project_id: project.id, session_id: "S1", key: "handoff:fly", audit: audit}
+
+      assert {:ok, first, :created} =
+               Coordination.post(
+                 tenant.id,
+                 agent_id,
+                 base
+                 |> Map.put(:body, "directed handoff")
+                 |> Map.put(:to_host, "beelink")
+                 |> Map.put(:to_capability, "fly-auth")
+               )
+
+      assert first.to_host == "beelink"
+      assert first.to_capability == "fly-auth"
+
+      # Re-post the SAME slot updating ONLY body — no to_host/to_capability keys.
+      assert {:ok, second, :updated} =
+               Coordination.post(
+                 tenant.id,
+                 agent_id,
+                 base |> Map.put(:body, "still working, refreshed")
+               )
+
+      assert second.id == first.id
+      assert second.body == "still working, refreshed"
+
+      # Addressing survived the body-only refresh (both the returned struct and the
+      # persisted row) — the slot is still directed, not demoted to broadcast.
+      assert second.to_host == "beelink"
+      assert second.to_capability == "fly-auth"
+
+      reloaded = AdminRepo.get!(ChannelPost, second.id)
+      assert reloaded.to_host == "beelink"
+      assert reloaded.to_capability == "fly-auth"
+
+      # A subsequent re-post CAN still change one target while omitting the other:
+      # the supplied to_host overrides, the omitted to_capability is preserved.
+      assert {:ok, third, :updated} =
+               Coordination.post(
+                 tenant.id,
+                 agent_id,
+                 base
+                 |> Map.put(:body, "moved hosts")
+                 |> Map.put(:to_host, "mac-mini")
+               )
+
+      assert third.to_host == "mac-mini"
+      assert third.to_capability == "fly-auth"
 
       assert AdminRepo.aggregate(
                from(p in ChannelPost, where: p.project_id == ^project.id),
