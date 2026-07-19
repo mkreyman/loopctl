@@ -9,11 +9,15 @@ defmodule LoopctlWeb.ChannelPostController do
     (channel_recent), tenant-scoped and oracle-safe.
   - `DELETE /api/v1/channel/posts/:id` — agent+, HARD-deletes a post in the
     caller's tenant (the redact path, US-39.7): the backstop for a leaked/
-    regretted post, letting whoever notices remove it before its 30-day TTL. Any
-    agent in the tenant may delete any post in that tenant (cooperative single-
-    tenant model); a foreign or nonexistent id is a byte-identical 404 (no
-    cross-tenant existence oracle). Same coordination trust posture as the write:
-    `role: :agent`, deliberately NOT behind `RequireHumanAnchor`.
+    regretted post, letting the AUTHOR pull it back before its 30-day TTL.
+    Author-only (or elevated role) — the redact path is for self-leak-pullback,
+    NOT fleet-wide cleanup (US-40.D2): the caller must be the post's own author
+    (server-stamped `agent_id`) OR hold an elevated role (`>= :user`, the
+    operator escape hatch). A non-author agent gets a byte-identical 404 (no
+    existence oracle) — same as a foreign or nonexistent id. Coordination trust
+    posture: `role: :agent` at the route (the elevated bypass is checked inside
+    the action against the verified key), deliberately NOT behind
+    `RequireHumanAnchor`.
 
   ## Trust posture (owner decision #331, design brief §4)
 
@@ -168,13 +172,14 @@ defmodule LoopctlWeb.ChannelPostController do
     summary: "Delete a repo coordination channel post (redact path)",
     description:
       "HARD-deletes a coordination post in the caller's tenant — the redact path (US-39.7). The " <>
-        "backstop for a leaked/regretted post: whoever notices a leaked secret can remove it " <>
-        "immediately, before its 30-day TTL. Agent+ role, NOT behind the human-anchor tier " <>
-        "(coordination surface, owner decision #331). Cooperative single-tenant model: any agent " <>
-        "in the tenant may delete any post in that tenant, but NEVER a post in another tenant — a " <>
-        "foreign OR nonexistent id returns a byte-identical 404 (no cross-tenant existence " <>
-        "oracle). The delete is audited (action \"deleted\", actor = the deleting agent) in the " <>
-        "same transaction, so the removal stays accountable even though the row is gone.",
+        "backstop for a leaked/regretted post: the AUTHOR can pull it back before its 30-day TTL. " <>
+        "Agent+ role, NOT behind the human-anchor tier (coordination surface, owner decision " <>
+        "#331). Author-only (or elevated role) — the redact path is for self-leak-pullback, NOT " <>
+        "fleet-wide cleanup (US-40.D2): the caller must be the post's own author (server-stamped " <>
+        "agent_id) OR hold an elevated role (>= user). A non-author agent gets a byte-identical " <>
+        "404 (no existence oracle) — same as a foreign or nonexistent id. The delete is audited " <>
+        "(action \"deleted\", actor = the deleting agent) in the same transaction, so the removal " <>
+        "stays accountable even though the row is gone.",
     parameters: [
       id: [
         in: :path,
@@ -484,9 +489,10 @@ defmodule LoopctlWeb.ChannelPostController do
   DELETE /api/v1/channel/posts/:id
 
   HARD-deletes a coordination post in the caller's tenant — the redact path
-  (US-39.7). Requires agent+ role (NOT human-anchor gated). Any agent in the
-  tenant may delete any post in that tenant; a foreign or nonexistent id returns
-  a byte-identical 404 via the shared `FallbackController` (no cross-tenant
+  (US-39.7). Requires agent+ role (NOT human-anchor gated). Author-only (or
+  elevated role, US-40.D2): the caller must be the post's own author OR hold an
+  elevated role (`>= :user`). A non-author agent — like a foreign or nonexistent
+  id — returns a byte-identical 404 via the shared `FallbackController` (no
   existence oracle). The deleting agent is the audit actor.
   """
   def delete(conn, params) do
@@ -496,6 +502,7 @@ defmodule LoopctlWeb.ChannelPostController do
     case Coordination.delete_post(
            tenant_id,
            api_key.agent_id,
+           api_key.role,
            params["id"],
            AuditContext.from_conn(conn)
          ) do

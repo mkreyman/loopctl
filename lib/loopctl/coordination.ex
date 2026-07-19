@@ -26,6 +26,7 @@ defmodule Loopctl.Coordination do
   alias Loopctl.AdminRepo
   alias Loopctl.Agents
   alias Loopctl.Audit
+  alias Loopctl.Auth.Role
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Projects
 
@@ -221,14 +222,27 @@ defmodule Loopctl.Coordination do
   transient model — there is nothing to soft-retain in a channel that expires
   wholesale.
 
-  Cooperative single-tenant model: `agent_id` is the DELETING agent (the audit
-  actor), which may differ from the post's AUTHOR `agent_id` — any agent in the
-  tenant may delete any post in that tenant, enabling cleanup by whoever spots
-  the leak. It may NEVER delete a post in another tenant: the fetch filters on
-  BOTH `id` and `tenant_id` (the explicit tenant boundary on the AdminRepo path),
-  so a foreign (or nonexistent) `post_id` returns `{:error, :not_found}` —
+  Author-only (or elevated role) — the redact path is for self-leak-pullback,
+  NOT fleet-wide cleanup (US-40.D2). `agent_id` is the DELETING agent (the audit
+  actor) AND the authorization principal: the delete is permitted ONLY when the
+  caller's server-stamped `agent_id` equals the post's AUTHOR `agent_id`, OR the
+  caller holds an elevated role (`>= :user`, `role`). This kills the
+  censor-and-replace vector: a non-author agent could otherwise hard-delete any
+  peer's post on the shared bus. A non-author agent (role `:agent`) attempting to
+  delete another agent's post gets `{:error, :not_found}` — BYTE-IDENTICAL to a
+  missing post, so there is no existence oracle revealing the post exists but is
+  not yours.
+
+  The elevated-role bypass (`>= :user`) is the operator escape hatch: cleaning up
+  a leak the author cannot (the author's session is gone). It is gated on the
+  VERIFIED key's role — never on spoofable `host`/`session_id`.
+
+  It may NEVER delete a post in another tenant: the fetch filters on BOTH `id`
+  and `tenant_id` (the explicit tenant boundary on the AdminRepo path), so a
+  foreign (or nonexistent) `post_id` returns `{:error, :not_found}` —
   byte-identical outcomes, no cross-tenant existence oracle (KB "IDOR Prevention
-  in Multi-Tenant Delete Operations").
+  in Multi-Tenant Delete Operations"). The non-author and foreign-tenant and
+  nonexistent cases ALL collapse to the same `{:error, :not_found}`.
 
   A malformed `post_id` (a non-UUID path segment) is guarded first and returns
   `{:error, :not_found}` too, so a bad id is a clean 404 — never an
@@ -245,17 +259,30 @@ defmodule Loopctl.Coordination do
 
   Returns `{:ok, %ChannelPost{}}` (the deleted row) or `{:error, :not_found}`.
   """
-  @spec delete_post(Ecto.UUID.t(), Ecto.UUID.t(), term(), keyword()) ::
+  @spec delete_post(Ecto.UUID.t(), Ecto.UUID.t(), atom(), term(), keyword()) ::
           {:ok, ChannelPost.t()} | {:error, :not_found | :audit_write_failed}
-  def delete_post(tenant_id, agent_id, post_id, audit \\ []) do
-    if valid_uuid?(post_id) do
-      case fetch_owned_post(tenant_id, post_id) do
-        nil -> {:error, :not_found}
-        post -> run_delete(tenant_id, agent_id, post, audit)
-      end
+  def delete_post(tenant_id, agent_id, role, post_id, audit \\ []) do
+    # A malformed id (false), a nonexistent/foreign-tenant post (nil), AND a post
+    # the caller may NOT delete (present but not theirs and not elevated, false)
+    # ALL fall through the `else` to the SAME `{:error, :not_found}` — no oracle
+    # revealing the post exists but is not yours (US-40.D2). Only an authorized
+    # delete reaches `run_delete/4` (whose `{:ok, _}` / `:audit_write_failed`
+    # results are the `with` body's terminal value, never re-mapped by `else`).
+    with true <- valid_uuid?(post_id),
+         %ChannelPost{} = post <- fetch_owned_post(tenant_id, post_id),
+         true <- authorized_to_delete?(post, agent_id, role) do
+      run_delete(tenant_id, agent_id, post, audit)
     else
-      {:error, :not_found}
+      _ -> {:error, :not_found}
     end
+  end
+
+  # US-40.D2 authorization gate: the caller is the post's OWN author (server-
+  # stamped `agent_id` equals the post's author `agent_id`) OR holds an elevated
+  # role (`>= :user`, the operator escape hatch). Compares the AUTHENTICATED,
+  # server-stamped identity only — never spoofable `host`/`session_id`.
+  defp authorized_to_delete?(%ChannelPost{agent_id: author_id}, caller_agent_id, caller_role) do
+    author_id == caller_agent_id or Role.role_at_least?(caller_role, :user)
   end
 
   @doc """

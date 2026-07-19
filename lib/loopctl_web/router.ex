@@ -140,9 +140,12 @@ defmodule LoopctlWeb.Router do
     # malformed id is a byte-identical 404 (no cross-tenant existence oracle).
     get "/channel/posts/:id", ChannelPostController, :show
     # channel post redact/delete (US-39.7): agent-role, tenant-scoped HARD delete
-    # of a leaked/regretted post before its 30-day TTL. Any agent in the tenant may
-    # delete any post in that tenant; a foreign/nonexistent id is a byte-identical
-    # 404 (no cross-tenant oracle). Audited in-transaction. NOT human-anchor gated.
+    # of a leaked/regretted post before its 30-day TTL. Author-only (or elevated
+    # role >= :user), US-40.D2 — the redact path is for self-leak-pullback, not
+    # fleet-wide cleanup; the elevated bypass is checked inside the action against
+    # the verified key. A non-author agent — like a foreign/nonexistent id — is a
+    # byte-identical 404 (no existence oracle). Audited in-transaction. NOT
+    # human-anchor gated.
     delete "/channel/posts/:id", ChannelPostController, :delete
 
     get "/tenants/me", TenantController, :show
