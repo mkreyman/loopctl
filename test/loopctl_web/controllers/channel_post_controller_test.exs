@@ -1188,4 +1188,137 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert %ChannelPost{} = AdminRepo.get(ChannelPost, post.id)
     end
   end
+
+  describe "read rate limiting (US-40.D5)" do
+    # TC-40.D5.1 — a burst of :index reads past the DEDICATED read cap gets 429 with
+    # a Retry-After and emits the coordination :rate_limited signal, on a bucket
+    # SEPARATE from the write cap. The read cap (3) trips at a LOWER count than the
+    # pipeline per-key cap (default 300), so the coordination signal fires instead
+    # of being shadowed by an anonymous pipeline 429 (independence/observability).
+    test "an :index read burst past the read cap is 429 with Retry-After + :rate_limited signal" do
+      counts = stub_counting_limiter()
+      tenant = fixture(:tenant, %{settings: %{"channel_post_read_limit_per_minute" => 3}})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      # First 3 reads are within the per-read cap.
+      for _ <- 1..3 do
+        conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+        assert conn.status == 200
+      end
+
+      log =
+        capture_log(fn ->
+          conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+
+          assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
+          assert [retry] = get_resp_header(conn, "retry-after")
+          assert String.to_integer(retry) >= 1
+        end)
+
+      assert log =~ "rate_limited"
+
+      # The trip was counted on the READ bucket, distinct from the write bucket —
+      # read and write abuse are independently observable (US-40.D5 technical note).
+      buckets = Agent.get(counts, &Map.keys/1)
+      assert Enum.any?(buckets, &String.starts_with?(&1, "channel_post_read:key"))
+      refute Enum.any?(buckets, &String.starts_with?(&1, "channel_post_write:key"))
+    end
+
+    # TC-40.D5.2 — the full-body :show read is behind the SAME dedicated read cap,
+    # not only the pipeline limiter: a burst of by-id reads trips at the read cap.
+    test "GET /:id is rate-limited by the dedicated read cap too" do
+      stub_counting_limiter()
+      tenant = fixture(:tenant, %{settings: %{"channel_post_read_limit_per_minute" => 3}})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      {:ok, post} = Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "hi"})
+
+      for _ <- 1..3 do
+        conn = authed_conn(raw) |> get(show_path(post.id))
+        assert conn.status == 200
+      end
+
+      conn = authed_conn(raw) |> get(show_path(post.id))
+      assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
+      assert [retry] = get_resp_header(conn, "retry-after")
+      assert String.to_integer(retry) >= 1
+    end
+
+    # TC-40.D5.3 — a read-path limiter fault fails OPEN (read allowed) but stays
+    # OBSERVABLE via the shared throttled FailOpenLog on the read bucket family,
+    # never silently swallowed (full parity with the write path).
+    test "a limiter fault on the read path fails open (read allowed) and is logged" do
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
+        raise "limiter boom"
+      end)
+
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      log =
+        capture_log(fn ->
+          conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+          # Fail-open: the read still lands despite the limiter fault.
+          assert conn.status == 200
+        end)
+
+      assert log =~ "RateLimiter fail-open"
+      assert log =~ "channel_post_read:key"
+    end
+
+    # TC-40.D5.4 — a normal read cadence under the cap is unaffected: backward
+    # compatible with US-39.3 / US-40.C2 (reads behave exactly as before the cap).
+    test "a normal read cadence under the cap is unaffected (all 200, no 429)" do
+      stub_counting_limiter()
+      tenant = fixture(:tenant, %{settings: %{"channel_post_read_limit_per_minute" => 10}})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      for _ <- 1..5 do
+        conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+        assert conn.status == 200
+        assert get_resp_header(conn, "retry-after") == []
+      end
+    end
+
+    # AC-40.D5.2 — the read response is BOUNDED BY CONSTRUCTION; this story adds the
+    # limiter and ASSERTS the bounds already hold. The list clamps `limit` to 100
+    # (@max_recent_limit) and returns bounded previews (not full bodies).
+    test "AC-40.D5.2: :index clamps limit to 100 and returns bounded previews, not full bodies" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      big = String.duplicate("a", 16_384)
+      {:ok, _} = Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => big})
+
+      conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id, "limit" => "1000"})
+      assert %{"data" => [post], "meta" => meta} = json_response(conn, 200)
+
+      # `limit` clamped to the @max_recent_limit of 100 (list bounded by row count).
+      assert meta["limit"] == 100
+      # Bounded preview, not the full (up to 16KB) body.
+      assert byte_size(post["body_preview"]) <= Coordination.preview_bytes()
+      assert post["truncated"] == true
+      refute Map.has_key?(post, "body")
+    end
+
+    # AC-40.D5.2 — the single-post read returns exactly one post whose body is
+    # inherently bounded by @body_max_length (16KB, channel_post.ex).
+    test "AC-40.D5.2: GET /:id returns exactly one post whose body is <= 16KB" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      big = String.duplicate("b", 16_384)
+      {:ok, post} = Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => big})
+
+      conn = authed_conn(raw) |> get(show_path(post.id))
+      assert %{"post" => body} = json_response(conn, 200)
+      assert byte_size(body["body"]) <= 16_384
+    end
+  end
 end
