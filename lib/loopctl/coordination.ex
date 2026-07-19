@@ -295,11 +295,28 @@ defmodule Loopctl.Coordination do
   original insert). A different session's same key is a distinct row. Without a
   `key` every post is a new append-only row.
 
+  ## Keyless idempotency (US-40.B2)
+
+  On the KEYLESS path (no `key`), an OPTIONAL client `idempotency_key` makes a
+  retried/offline-reconciled append retry-safe: a repeat write with the same
+  `(tenant_id, project_id, agent_id, idempotency_key)` returns the EXISTING post
+  (`{:ok, post, :deduplicated}`, HTTP 200 `created: false`) rather than appending a
+  duplicate — the same guarantee `knowledge_create` gives. It is enforced by the
+  partial unique index `channel_posts_idempotency_uidx` and caught with
+  insert-and-recover (no TOCTOU). The token is a SEPARATE dedup dimension from the
+  keyed slot and is consulted ONLY on the keyless path; absent, the write is
+  exactly today's append-only behavior. One agent's token never collides with
+  another's (scoped per `(tenant, project, agent)`).
+
   ## Returns
 
     * `{:ok, %ChannelPost{}, :created}` — a new row was inserted (HTTP 201)
     * `{:ok, %ChannelPost{}, :updated}` — an existing session slot was upserted
       in place (HTTP 200)
+    * `{:ok, %ChannelPost{}, :deduplicated}` — a KEYLESS write carried a client
+      `idempotency_key` that already exists for this
+      `(tenant, project, agent)`; the EXISTING post is returned and nothing new
+      was appended (HTTP 200, `created: false`) — US-40.B2
     * `{:error, :not_found}` — the project is missing or belongs to another
       tenant (endpoint → shared 422)
     * `{:error, :agent_not_found}` — the server-stamped `agent_id` does not belong
@@ -309,7 +326,7 @@ defmodule Loopctl.Coordination do
       byte was rejected; nothing was persisted (endpoint → 422)
   """
   @spec post(Ecto.UUID.t(), Ecto.UUID.t(), atom(), map()) ::
-          {:ok, ChannelPost.t(), :created | :updated}
+          {:ok, ChannelPost.t(), :created | :updated | :deduplicated}
           | {:error, :not_found}
           | {:error, :agent_not_found}
           | {:error, Ecto.Changeset.t()}
@@ -1111,8 +1128,22 @@ defmodule Loopctl.Coordination do
       {:ok, %{post: post}} ->
         {:ok, post, post_outcome(post)}
 
-      {:error, :post, %Ecto.Changeset{} = changeset, _changes} ->
-        tap_secret_blocked({:error, changeset})
+      {:error, :post, %Ecto.Changeset{} = failed, _changes} ->
+        # A KEYLESS write carrying a client idempotency token that races/retries
+        # into the `channel_posts_idempotency_uidx` partial unique index is a
+        # DEDUP, not a failure: catch the unique violation and resolve it to the
+        # EXISTING row (insert-and-recover, no TOCTOU — the DB index is the
+        # exactly-once gate; this SELECT only CLASSIFIES the loser, mirroring
+        # `resolve_claim_collision/4` and `Knowledge.resolve_create_conflict/4`).
+        # The failed transaction rolled back, so NO audit entry was written for the
+        # duplicate — correct, nothing changed; the recovery SELECT runs AFTER the
+        # rollback exactly like the claim path. Any other rejection (a size/shape
+        # bound, denylist hit, NUL byte, or the keyed slot collision) stays a 422.
+        if idempotency_conflict?(failed) do
+          resolve_idempotency_collision(tenant_id, failed)
+        else
+          tap_secret_blocked({:error, failed})
+        end
 
       # Any OTHER failed step (today only `:audit`, whose only failure mode is a
       # changeset) is normalised to the SAME documented `{:error, %Ecto.Changeset{}}`
@@ -1125,6 +1156,52 @@ defmodule Loopctl.Coordination do
         {:error, changeset}
     end
   end
+
+  # A KEYLESS idempotent write lost the
+  # `(tenant_id, project_id, agent_id, idempotency_key)` partial unique index.
+  # Detect it by the constraint kind + name so a non-idempotency unique violation
+  # (the keyed working-state slot) or a validation error is NOT misread as a dedup.
+  defp idempotency_conflict?(%Ecto.Changeset{errors: errors}) do
+    Enum.any?(errors, fn {_field, {_msg, opts}} ->
+      Keyword.get(opts, :constraint) == :unique and
+        Keyword.get(opts, :constraint_name) == "channel_posts_idempotency_uidx"
+    end)
+  end
+
+  # Resolve a lost idempotency insert to the EXISTING row and report it as a
+  # `:deduplicated` outcome (the third documented `post/4` result). The scope
+  # fields are the SERVER-STAMPED struct values (tenant_id/project_id/agent_id) plus
+  # the normalized changeset `idempotency_key` — never client-echoed. A rare
+  # concurrent hard-delete (US-39.7) of the winning row between the failed insert
+  # and this SELECT yields nil; fall back to the raw changeset (→ 422) so the caller
+  # retries cleanly rather than seeing a 500.
+  defp resolve_idempotency_collision(tenant_id, %Ecto.Changeset{} = changeset) do
+    project_id = Ecto.Changeset.get_field(changeset, :project_id)
+    agent_id = Ecto.Changeset.get_field(changeset, :agent_id)
+    idempotency_key = Ecto.Changeset.get_field(changeset, :idempotency_key)
+
+    case get_post_by_idempotency_key(tenant_id, project_id, agent_id, idempotency_key) do
+      %ChannelPost{} = existing -> {:ok, existing, :deduplicated}
+      nil -> {:error, changeset}
+    end
+  end
+
+  # Look up a post by its `(tenant_id, project_id, agent_id, idempotency_key)`
+  # scope — the exact columns of `channel_posts_idempotency_uidx` — on `AdminRepo`
+  # (BYPASSRLS) with the EXPLICIT tenant filter the module mandates. Mirrors
+  # `Knowledge.get_article_by_idempotency_key/3` and `fetch_claim_by_ref/3`. Only a
+  # binary key ever matched the index, so a non-binary key never resolves.
+  defp get_post_by_idempotency_key(tenant_id, project_id, agent_id, key) when is_binary(key) do
+    ChannelPost
+    |> where(
+      [p],
+      p.tenant_id == ^tenant_id and p.project_id == ^project_id and
+        p.agent_id == ^agent_id and p.idempotency_key == ^key
+    )
+    |> AdminRepo.one()
+  end
+
+  defp get_post_by_idempotency_key(_tenant_id, _project_id, _agent_id, _key), do: nil
 
   # Keyless posts are always a new append-only row. A keyed post UPSERTS on the
   # LIVE PARTIAL unique index (`... WHERE key IS NOT NULL`, index

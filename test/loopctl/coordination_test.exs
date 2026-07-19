@@ -1292,6 +1292,237 @@ defmodule Loopctl.CoordinationTest do
     end
   end
 
+  # US-40.B2: an OPTIONAL client idempotency token on the KEYLESS write path. A
+  # keyless post is a pure append, so a retried or offline-reconciled /handoff
+  # write would duplicate the row. With a token, a repeat write of the same
+  # (tenant, project, agent, idempotency_key) returns the EXISTING post
+  # (:deduplicated) instead of appending a duplicate — the same guarantee
+  # knowledge_create gives. Absent, the write is exactly append-only (US-39.2).
+  describe "post/4 keyless idempotency (US-40.B2)" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        assigned_agent_id: agent_id,
+        agent_status: :assigned
+      })
+
+      audit = [
+        actor_type: "api_key",
+        actor_id: Ecto.UUID.generate(),
+        actor_label: "agent:worker-1"
+      ]
+
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit}
+    end
+
+    test "TC-40.B2.2: a keyless write with an idempotency token dedups to the same row", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      base = %{
+        project_id: project.id,
+        body: "offline-reconciled handoff",
+        idempotency_key: "abc",
+        audit: audit
+      }
+
+      assert {:ok, first, :created} = Coordination.post(tenant.id, agent_id, :agent, base)
+
+      # A repeat with the SAME token returns the EXISTING post, no new row.
+      assert {:ok, second, :deduplicated} = Coordination.post(tenant.id, agent_id, :agent, base)
+
+      assert second.id == first.id
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 1
+
+      # The dedup rolled back the transaction, so no second audit row was written.
+      assert audit_actions(tenant.id, first.id) == ["posted"]
+    end
+
+    test "TC-40.B2.3: different agents, same token, no collision (scoped per-agent)", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_a, audit: audit} = ctx
+
+      agent_b = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        assigned_agent_id: agent_b,
+        agent_status: :assigned
+      })
+
+      base = %{project_id: project.id, body: "shared token", idempotency_key: "abc", audit: audit}
+
+      assert {:ok, post_a, :created} = Coordination.post(tenant.id, agent_a, :agent, base)
+      assert {:ok, post_b, :created} = Coordination.post(tenant.id, agent_b, :agent, base)
+
+      # Two DISTINCT posts — the token is scoped per (tenant, project, agent), so B's
+      # write neither dedups nor collides with A's.
+      refute post_a.id == post_b.id
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 2
+    end
+
+    test "TC-40.B2.4: no token = append-only (two writes = two rows, unchanged)", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      base = %{project_id: project.id, body: "same body, no token", audit: audit}
+
+      assert {:ok, first, :created} = Coordination.post(tenant.id, agent_id, :agent, base)
+      assert {:ok, second, :created} = Coordination.post(tenant.id, agent_id, :agent, base)
+
+      refute first.id == second.id
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 2
+    end
+
+    test "tenant isolation: the same token in tenant A does not dedup a write in tenant B", ctx do
+      %{tenant: tenant_a, project: project_a, agent_id: agent_a, audit: audit} = ctx
+
+      tenant_b = fixture(:tenant)
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      agent_b = fixture(:agent, %{tenant_id: tenant_b.id}).id
+
+      fixture(:story, %{
+        tenant_id: tenant_b.id,
+        project_id: project_b.id,
+        assigned_agent_id: agent_b,
+        agent_status: :assigned
+      })
+
+      assert {:ok, post_a, :created} =
+               Coordination.post(tenant_a.id, agent_a, :agent, %{
+                 project_id: project_a.id,
+                 body: "tenant A",
+                 idempotency_key: "shared-token",
+                 audit: audit
+               })
+
+      # Tenant B, same token — a fresh create, never a cross-tenant dedup.
+      assert {:ok, post_b, :created} =
+               Coordination.post(tenant_b.id, agent_b, :agent, %{
+                 project_id: project_b.id,
+                 body: "tenant B",
+                 idempotency_key: "shared-token",
+                 audit: audit
+               })
+
+      refute post_a.id == post_b.id
+      assert post_b.tenant_id == tenant_b.id
+    end
+
+    test "a blank/whitespace idempotency_key normalizes to nil (append-only, no dedup)", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      base = %{project_id: project.id, body: "blank token", idempotency_key: "   ", audit: audit}
+
+      assert {:ok, first, :created} = Coordination.post(tenant.id, agent_id, :agent, base)
+      assert is_nil(first.idempotency_key)
+
+      # A second blank-token write appends (blank ⇒ nil ⇒ no idempotency dimension),
+      # exactly like the no-token path — it does NOT collide on the partial index
+      # (which is WHERE idempotency_key IS NOT NULL).
+      assert {:ok, second, :created} = Coordination.post(tenant.id, agent_id, :agent, base)
+      refute first.id == second.id
+    end
+
+    test "an over-length idempotency_key is a 422 changeset error, not a dedup", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      assert {:error, %Ecto.Changeset{} = cs} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "too long",
+                 idempotency_key: String.duplicate("a", 256),
+                 audit: audit
+               })
+
+      assert %{idempotency_key: _} = errors_on(cs)
+    end
+
+    test "TC-40.B2.5: a double-fired handoff yields one pointer slot + at most one open claim",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      ref = "handoff:repo#812"
+
+      # The /handoff flow: a stable-KEY pointer post (same-session upsert) PLUS a
+      # CLAIM on the ref (US-40.B1) — the cross-session exactly-once backstop for the
+      # WORK. Fire the whole thing twice (a retry) from the same session.
+      pointer = fn ->
+        Coordination.post(tenant.id, agent_id, :agent, %{
+          project_id: project.id,
+          session_id: "S1",
+          key: "handoff:repo#812",
+          body: "handoff: finish repo#812",
+          audit: audit
+        })
+      end
+
+      assert {:ok, p1, :created} = pointer.()
+      assert {:ok, p2, :updated} = pointer.()
+      assert p2.id == p1.id
+
+      # First claim wins; the second claim of the SAME ref by the SAME still-active
+      # owner is an idempotent owner re-claim (returns the same claim), never a
+      # second open claim. A genuine peer racer would get {:error, :already_claimed}.
+      assert {:ok, claim1} = Coordination.claim(tenant.id, agent_id, project.id, ref)
+      assert {:ok, claim2} = Coordination.claim(tenant.id, agent_id, project.id, ref)
+      assert claim2.id == claim1.id
+
+      # Exactly one pointer post and exactly one open claim survived the double-fire.
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 1
+
+      assert AdminRepo.aggregate(
+               from(c in Loopctl.Coordination.ChannelClaim,
+                 where: c.project_id == ^project.id and is_nil(c.done_at)
+               ),
+               :count,
+               :id
+             ) == 1
+    end
+
+    test "TC-40.B2.5: a peer's second claim of the same ref is rejected (already_claimed)", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_a} = ctx
+
+      agent_b = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        assigned_agent_id: agent_b,
+        agent_status: :assigned
+      })
+
+      ref = "handoff:repo#812"
+
+      assert {:ok, _claim} = Coordination.claim(tenant.id, agent_a, project.id, ref)
+
+      # A DIFFERENT agent claiming the same ref loses the unique index → 409.
+      assert {:error, :already_claimed} = Coordination.claim(tenant.id, agent_b, project.id, ref)
+    end
+  end
+
   # US-40.D3: project-scoped WRITE membership. A channel is a project_id; before
   # this story any tenant agent key could post into any project channel in the
   # tenant (a tenant-wide prompt injector, since posts auto-inject into peer
