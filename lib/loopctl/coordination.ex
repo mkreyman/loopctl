@@ -957,9 +957,12 @@ defmodule Loopctl.Coordination do
       id: p.id,
       # `seq` (bigserial) is projected so the LIST read's keyset next_cursor
       # (US-40.C2) is the last row's `(inserted_at, seq)` without a second fetch.
-      # It stays SERVER-SIDE: the controller's `channel_post_json/1` picks explicit
-      # fields and does NOT expose `seq` in the JSON body — it only rides inside the
-      # opaque, HMAC-signed cursor.
+      # It is never exposed to clients: the controller's `channel_post_json/1` picks
+      # explicit fields and does NOT put `seq` in the JSON body, AND — because `seq`
+      # is a GLOBAL cross-tenant counter — it rides inside the cursor only in
+      # AES-256-GCM ENCRYPTED form (see `Loopctl.KeysetCursor`). The HMAC alone would
+      # keep the cursor unforgeable but NOT unreadable, so signing is not enough to
+      # keep a global counter server-side; the payload encryption is what does.
       seq: p.seq,
       agent_id: p.agent_id,
       session_id: p.session_id,

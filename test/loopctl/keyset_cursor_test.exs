@@ -91,6 +91,38 @@ defmodule Loopctl.KeysetCursorTest do
       assert {:ok, ^pos} = ChannelCursor.decode(t, cursor)
     end
 
+    test "the raw seq is NOT recoverable in plaintext from the cursor (no cross-tenant volume oracle)",
+         %{tenant_id: t} do
+      # Reproduces the review finding's empirical attack: a holder with NO secret and
+      # NO tenant key tries to read the global `seq` back out of its own cursor.
+      seq = 987_654_321
+      cursor = ChannelCursor.encode(t, {~U[2026-06-24 09:00:00.123456Z], seq})
+
+      {:ok, blob} = Base.url_decode64(cursor, padding: false)
+      # binary_to_term with [:used] tolerates the trailing HMAC bytes and hands back
+      # the payload term — which is now the ENCRYPTED shape, not the raw seq.
+      {term, _used} = :erlang.binary_to_term(blob, [:safe, :used])
+
+      assert {:kie, _micros, iv, ct, tag} = term
+      assert is_binary(iv) and is_binary(ct) and is_binary(tag)
+      # The seq appears NOWHERE in the decoded term...
+      refute seq in Tuple.to_list(term)
+      # ...and the ciphertext is not just the plaintext seq bytes.
+      refute ct == <<seq::signed-integer-64>>
+      # ...nor anywhere in the raw cursor bytes.
+      refute :binary.match(blob, <<seq::signed-integer-64>>) != :nomatch
+    end
+
+    test "the same position encodes to DIFFERENT cursors each time (random IV, non-deterministic)",
+         %{tenant_id: t, seq_position: pos} do
+      c1 = ChannelCursor.encode(t, pos)
+      c2 = ChannelCursor.encode(t, pos)
+      refute c1 == c2
+      # Both still round-trip to the same position.
+      assert {:ok, ^pos} = ChannelCursor.decode(t, c1)
+      assert {:ok, ^pos} = ChannelCursor.decode(t, c2)
+    end
+
     test "a byte-mutated integer cursor is rejected (tamper → invalid)",
          %{tenant_id: t, seq_position: pos} do
       cursor = ChannelCursor.encode(t, pos)
