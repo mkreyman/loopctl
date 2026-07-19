@@ -57,20 +57,46 @@ defmodule LoopctlWeb.ChannelPostController do
 
   action_fallback LoopctlWeb.FallbackController
 
+  # SINGLE SOURCE OF TRUTH for the agent-facing READ actions, shared by BOTH the
+  # agent-role gate and the per-read rate cap below so the two can NEVER drift
+  # apart: every read action is role-gated AND read-capped in lockstep, never a
+  # body-returning read that is rate-limited but escapes controller-level role
+  # enforcement (or vice versa). `:handoffs` (GET /channel/handoffs, 40.C1
+  # directed discovery) is listed PROACTIVELY (AC-40.D5.1): when 40.C1 lands that
+  # action ON THIS controller both guards attach automatically; until then the
+  # guards simply never match the nonexistent action. If 40.C1 instead implements
+  # handoffs in a SEPARATE controller, neither guard applies and 40.C1 MUST
+  # re-apply the read cap there (cross-story invariant — see the 40.C1 review
+  # note / wiki finding).
+  @read_actions [:index, :show, :handoffs]
+
   # Coordination surface (#331): agent role, NO RequireHumanAnchor. See the
   # coordination-surface allowlist entry in require_human_anchor_default_deny_test.
-  # The read (`:index`) is the same agent-role, tenant-scoped coordination surface
-  # as the write — never human-anchor gated (the human-anchor default-deny test
-  # only walks POST/PUT/PATCH/DELETE, so this GET needs no allowlist entry).
+  # The reads are the same agent-role, tenant-scoped coordination surface as the
+  # write — never human-anchor gated (the human-anchor default-deny test only
+  # walks POST/PUT/PATCH/DELETE, so these GETs need no allowlist entry).
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :agent] when action in [:create, :index, :delete, :show]
+       [role: :agent] when action in [:create, :delete] or action in @read_actions
 
   # Per-write rate limit (AC-39.2.8): a TIGHTER, config-driven cap on top of the
   # generic per-key/per-tenant pipeline RateLimiter, reusing the same
-  # `Loopctl.RateLimiter` behaviour seam. Bounds post spam / upsert thrash. The
-  # read is NOT behind this write cap — it is covered by the generic pipeline
-  # per-key/per-tenant limiter like every other read.
+  # `Loopctl.RateLimiter` behaviour seam. Bounds post spam / upsert thrash.
   plug :rate_limit_write when action in [:create]
+
+  # Per-read rate limit (AC-40.D5.1): a PARALLEL, config-driven cap on the
+  # agent-facing read path — `:index` (channel_recent), `:show` (GET /:id, the
+  # full-body fetch), and `:handoffs` (GET /channel/handoffs, 40.C1 directed
+  # discovery — a body-returning read that must NOT escape the read limiter). It
+  # reuses the SAME `Loopctl.RateLimiter` behaviour seam and the fail-open +
+  # throttled FailOpenLog discipline as `rate_limit_write`, but on its own bucket
+  # family (`channel_post_read:key`) so read and write abuse are independently
+  # observable. The read is no longer covered ONLY by the generic pipeline
+  # per-key/per-tenant limiter: this dedicated cap trips FIRST (clamped below the
+  # pipeline cap) so a read burst emits the coordination `:rate_limited` signal
+  # instead of being shadowed by an anonymous pipeline 429. Uses the SAME
+  # `@read_actions` list as the RequireRole gate above — structural symmetry, so a
+  # read action can never be role-gated without also being read-capped.
+  plug :rate_limit_read when action in @read_actions
 
   tags(["Coordination"])
 
@@ -85,6 +111,14 @@ defmodule LoopctlWeb.ChannelPostController do
   # `channel_post_write_limit_per_minute` setting (mirrors the pipeline limiter's
   # `rate_limit_requests_per_minute`). Not hardcoded at the call site.
   @default_write_limit 120
+
+  # Config-default per-minute READ cap (AC-40.D5.1); a tenant may override via the
+  # `channel_post_read_limit_per_minute` setting, mirroring the write cap. Set
+  # ABOVE the write default (reads are cheaper and more frequent) but still BELOW
+  # the pipeline per-key default (@pipeline_per_key_limit_default 300) so the
+  # coordination read cap stays the binding, observable constraint by default —
+  # `read_limit/1` additionally clamps it below the tenant's live pipeline cap.
+  @default_read_limit 240
 
   # Fallback for the generic per-key pipeline limit, kept in sync with
   # LoopctlWeb.Plugs.RateLimiter's @default_per_key_limit. Used to clamp the
@@ -209,7 +243,8 @@ defmodule LoopctlWeb.ChannelPostController do
         "another agent, with NO auto-follow. Agent+ role, tenant-scoped from the verified key. " <>
         "ORACLE-SAFE: a post in another tenant, a nonexistent id, OR a malformed (non-UUID) id all " <>
         "return a byte-identical 404 (no cross-tenant existence oracle, never a 500). The read is " <>
-        "covered by the generic per-key/per-tenant pipeline rate limiter, like the list read.",
+        "behind the dedicated per-read coordination rate cap (channel_post_read_limit_per_minute, " <>
+        "US-40.D5), on its own bucket separate from the write cap, like the list read.",
     parameters: [
       id: [
         in: :path,
@@ -331,11 +366,14 @@ defmodule LoopctlWeb.ChannelPostController do
   a byte-identical 404 (via `FallbackController` — no cross-tenant existence
   oracle). A malformed (non-UUID) id is a clean 404 too, never a 500 CastError.
 
-  Rate limiting: the read is covered by the generic per-key/per-tenant pipeline
-  `RateLimiter` (:authenticated pipeline) exactly like `:index` — it is
-  deliberately NOT behind the tighter `:rate_limit_write` cap (that guards writes
-  only). Response-byte capping / limiter tuning is US-40.D5's job; here it only
-  needs to EXIST, which the pipeline limiter satisfies.
+  Rate limiting: the read is behind the dedicated per-read coordination cap
+  (`rate_limit_read`, US-40.D5) exactly like `:index` — a config-driven,
+  tenant-overridable per-minute cap on its OWN `channel_post_read:key` bucket,
+  clamped below the generic pipeline per-key limiter so a read burst trips the
+  coordination `:rate_limited` signal first. It is deliberately NOT on the write
+  bucket (`:rate_limit_write` guards writes only) — read and write abuse are
+  independently observable. Response bytes are bounded by construction: this read
+  returns exactly one post whose `body` is <= @body_max_length (16KB).
 
   READ-MODEL DISCIPLINE: the response is the full-body COUNTERPART to the LIST
   read, NOT the write-echo resource. `channel_post_full_json/1` projects the SAME
@@ -545,7 +583,44 @@ defmodule LoopctlWeb.ChannelPostController do
 
         emit_security_event(:rate_limited, %{
           tenant_id: api_key.tenant_id,
-          api_key_id: api_key.id
+          api_key_id: api_key.id,
+          limit_kind: :write
+        })
+
+        conn
+        |> put_resp_header("retry-after", to_string(retry_after))
+        |> put_status(:too_many_requests)
+        |> json(%{error: %{status: 429, message: "Rate limit exceeded"}})
+        |> halt()
+    end
+  end
+
+  # Per-read rate limit (AC-40.D5.1/3/4): the read-path counterpart to
+  # `rate_limit_write`, on a SEPARATE bucket family (`channel_post_read:key`) so
+  # read and write abuse are counted and observed independently. Reuses the SAME
+  # `check_rate/2` (fail-open + throttled FailOpenLog), `window_reset_at/0`, and
+  # `emit_security_event/2` helpers — no duplication. On a trip it emits the
+  # coordination `:rate_limited` signal and returns 429 with a `retry-after`
+  # header, then `halt()`s. On a limiter fault `check_rate/2` fails OPEN so a
+  # limiter outage never blocks reads (the outage stays observable via FailOpenLog).
+  defp rate_limit_read(conn, _opts) do
+    api_key = conn.assigns.current_api_key
+    tenant = conn.assigns[:current_tenant]
+    limit = read_limit(tenant)
+    identifier = "channel_post_read:key:#{api_key.id}"
+
+    case check_rate(identifier, limit) do
+      {:allow, _count} ->
+        conn
+
+      {:deny, _limit} ->
+        reset_at = window_reset_at()
+        retry_after = max(1, reset_at - System.system_time(:second))
+
+        emit_security_event(:rate_limited, %{
+          tenant_id: api_key.tenant_id,
+          api_key_id: api_key.id,
+          limit_kind: :read
         })
 
         conn
@@ -605,6 +680,28 @@ defmodule LoopctlWeb.ChannelPostController do
     Application.get_env(:loopctl, :channel_post_write_limit_per_minute, @default_write_limit)
   end
 
+  defp read_limit(nil), do: default_read_limit()
+
+  defp read_limit(tenant) do
+    configured =
+      tenant
+      |> Tenants.get_tenant_settings("channel_post_read_limit_per_minute", default_read_limit())
+      |> coerce_positive_int(default_read_limit())
+
+    # AC-40.D5.3: the coordination read cap must remain a TIGHTER constraint than
+    # the generic per-key pipeline limiter (LoopctlWeb.Plugs.RateLimiter), which
+    # runs FIRST in the pipeline and emits no coordination-specific security signal.
+    # If a tenant set this above the pipeline limit, every coordination read-rate
+    # trip would be shadowed by an anonymous pipeline 429 — blinding the read-abuse
+    # detectors. Clamp so the read cap can never exceed (and thus be shadowed by)
+    # the pipeline cap, full parity with write_limit/1's clamp.
+    min(configured, pipeline_per_key_limit(tenant))
+  end
+
+  defp default_read_limit do
+    Application.get_env(:loopctl, :channel_post_read_limit_per_minute, @default_read_limit)
+  end
+
   # The generic per-key pipeline limit that runs before this controller plug. Read
   # from the SAME tenant setting the pipeline limiter uses; default kept in sync
   # with LoopctlWeb.Plugs.RateLimiter's @default_per_key_limit.
@@ -644,12 +741,24 @@ defmodule LoopctlWeb.ChannelPostController do
   defp emit_security_event(event, metadata) do
     :telemetry.execute([:loopctl, :coordination, event], %{count: 1}, metadata)
 
+    # `limit_kind` (:write / :read) is the rate-cap discriminator and is carried
+    # ONLY by the two :rate_limited callers. Render it solely when present so the
+    # four non-rate-limit events (:read_error, :agent_identity_required,
+    # :ownership_rejected) don't emit a dangling `limit_kind=` (nil) token — the
+    # full telemetry map still carries whatever keys each caller passed.
+    limit_kind_token =
+      case Map.fetch(metadata, :limit_kind) do
+        {:ok, kind} -> " limit_kind=#{kind}"
+        :error -> ""
+      end
+
     Logger.warning(
       "coordination security event: #{event} " <>
         "(tenant=#{Map.get(metadata, :tenant_id)} " <>
         "api_key=#{Map.get(metadata, :api_key_id)} " <>
         "agent=#{Map.get(metadata, :agent_id)} " <>
-        "project=#{Map.get(metadata, :project_id)})"
+        "project=#{Map.get(metadata, :project_id)}" <>
+        limit_kind_token <> ")"
     )
 
     :ok
