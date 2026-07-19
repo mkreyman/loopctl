@@ -283,6 +283,104 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
       assert keys(rows) == ["handoff:older", "handoff:newer"]
     end
 
+    # US-40.C1 safety cap (regression for the unbounded-read finding): the pinned set
+    # is never truncated by the newest-N recency cutoff, but it IS bounded by a large
+    # hard safety cap so a pathological channel can't return an unbounded agent-facing
+    # response. The cap retains OLDEST-first (the most at-risk aging handoffs).
+    test "the pinned set is bounded by the hard safety cap, retaining oldest-first", ctx do
+      cap = Coordination.max_directed_handoffs()
+      now = DateTime.utc_now()
+
+      # Seed cap + 5 broadcast handoffs, each with a strictly increasing inserted_at so
+      # oldest-first ordering (and thus which rows the cap drops) is deterministic.
+      entries =
+        for i <- 1..(cap + 5) do
+          ts = DateTime.add(now, i, :second)
+
+          %{
+            tenant_id: ctx.tenant.id,
+            project_id: ctx.project.id,
+            agent_id: ctx.agent_id,
+            body: "handoff #{i}",
+            key: "handoff:cap##{i}",
+            expires_at: DateTime.add(now, 30 * 86_400, :second),
+            inserted_at: ts,
+            updated_at: ts
+          }
+        end
+
+      AdminRepo.insert_all(ChannelPost, entries)
+
+      {rows, overflowed?} =
+        Coordination.directed_handoffs_page(ctx.tenant.id, ctx.project.id, %{})
+
+      # Bounded at the cap, never the full cap + 5.
+      assert length(rows) == cap
+      # Oldest-first retained: the very first seeded handoff is present, the newest is dropped.
+      assert "handoff:cap#1" in keys(rows)
+      refute "handoff:cap##{cap + 5}" in keys(rows)
+      # And the truncation is NOT silent: the caller is told the pinned set overflowed
+      # (so it can read the channel directly instead of trusting a truncated set).
+      assert overflowed?
+
+      # The list-returning arity-3 wrapper stays backward-compatible (same capped rows).
+      assert Coordination.directed_handoffs(ctx.tenant.id, ctx.project.id, %{}) == rows
+    end
+
+    # US-40.C1 overflow signal (regression for the "cap drops NEWEST with no signal"
+    # finding): below the cap, the pinned set is complete, so overflow is false.
+    test "directed_handoffs_page/3 reports overflow? = false when under the cap", ctx do
+      handoff(ctx, %{key: "handoff:a", to_capability: "fly-auth"})
+      handoff(ctx, %{key: "handoff:b", to_capability: "fly-auth"})
+
+      {rows, overflowed?} =
+        Coordination.directed_handoffs_page(ctx.tenant.id, ctx.project.id, %{
+          capabilities: ["fly-auth"]
+        })
+
+      assert length(rows) == 2
+      refute overflowed?
+    end
+
+    # US-40.C1 dedup (regression for the "no DISTINCT ON (key)" finding): the SAME
+    # handoff key fired from two sessions/agents (the cross-machine offline-reconcile
+    # this epic targets) is TWO distinct pointer rows — the keyed-slot unique index
+    # includes session_id. The pinned discovery read must surface ONE row per LOGICAL
+    # handoff, keeping the OLDEST pointer, so the set and meta.count are not inflated.
+    test "dedups the same handoff key from different sessions to one pinned row", ctx do
+      now = DateTime.utc_now()
+
+      entries =
+        for {session, offset} <- [{"sess-a", 0}, {"sess-b", 5}] do
+          ts = DateTime.add(now, offset, :second)
+
+          %{
+            tenant_id: ctx.tenant.id,
+            project_id: ctx.project.id,
+            agent_id: ctx.agent_id,
+            session_id: session,
+            body: "please pick up this handoff",
+            key: "handoff:repo#812",
+            to_capability: "fly-auth",
+            expires_at: DateTime.add(now, 30 * 86_400, :second),
+            inserted_at: ts,
+            updated_at: ts
+          }
+        end
+
+      AdminRepo.insert_all(ChannelPost, entries)
+
+      rows =
+        Coordination.directed_handoffs(ctx.tenant.id, ctx.project.id, %{
+          capabilities: ["fly-auth"]
+        })
+
+      # ONE logical handoff, not two pointer rows.
+      assert keys(rows) == ["handoff:repo#812"]
+      # DISTINCT ON keeps the OLDEST pointer (sess-a) as the representative.
+      assert [%{session_id: "sess-a"}] = rows
+    end
+
     test "a malformed project_id returns [] (valid_uuid? guard, never a crash)", ctx do
       assert [] ==
                Coordination.directed_handoffs(ctx.tenant.id, "not-a-uuid", %{

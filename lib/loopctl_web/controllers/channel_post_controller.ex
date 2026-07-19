@@ -253,7 +253,11 @@ defmodule LoopctlWeb.ChannelPostController do
         "never WHO may read. ORACLE-SAFE: a project_id belonging to another tenant, a nonexistent one, " <>
         "or a malformed one all return 200 with an empty list, never a 404. Bodies are BOUNDED " <>
         "previews (body_preview + truncated) framed as UNTRUSTED DATA authored by another agent — " <>
-        "never full bodies; fetch a full body via GET /channel/posts/:id.",
+        "never full bodies; fetch a full body via GET /channel/posts/:id. One row per LOGICAL " <>
+        "handoff: duplicate pointers for the same key from different sessions are deduped, so " <>
+        "meta.count counts logical handoffs. meta.overflow is true only on a pathological channel " <>
+        "that hit the hard safety cap (the newest directed handoffs are dropped oldest-first) — " <>
+        "read the channel directly when it is set.",
     parameters: [
       project_id: [
         in: :query,
@@ -286,7 +290,13 @@ defmodule LoopctlWeb.ChannelPostController do
              meta: %OpenApiSpex.Schema{
                type: :object,
                properties: %{
-                 count: %OpenApiSpex.Schema{type: :integer}
+                 count: %OpenApiSpex.Schema{type: :integer},
+                 overflow: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description:
+                     "True when the pinned set hit the hard safety cap and the NEWEST " <>
+                       "directed handoffs were dropped (oldest-first) — read the channel directly."
+                 }
                }
              }
            }
@@ -593,21 +603,28 @@ defmodule LoopctlWeb.ChannelPostController do
   nonexistent, OR malformed `project_id` — so this action never 404s and has no
   ownership pre-check, uniform with `:index`. Renders the SAME bounded-preview
   `channel_post_json/1` shape (body_preview + truncated, includes to_host/
-  to_capability), and `meta` carries only `count` — this set is pinned, so there is
-  no `limit`/`next_cursor` (it is never truncated).
+  to_capability). The set is pinned, so there is no `limit`/`next_cursor` — it is
+  NEVER truncated by the newest-N recency cutoff. `meta` carries `count` plus an
+  `overflow` boolean: on a pathological channel the set is bounded by a large hard
+  safety cap (`Coordination.max_directed_handoffs/0`), and because it is ordered
+  oldest-first that cap drops the NEWEST directed handoffs — `overflow: true` tells
+  the caller the pinned set was truncated and it should read the channel directly.
+  Multiple pointer rows for the same logical handoff (same key from different
+  sessions) are deduped to one row by the context, so `count` reflects LOGICAL
+  handoffs.
   """
   def handoffs(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    handoffs =
-      Coordination.directed_handoffs(tenant_id, params["project_id"], %{
+    {handoffs, overflowed?} =
+      Coordination.directed_handoffs_page(tenant_id, params["project_id"], %{
         host: params["host"],
         capabilities: params["capabilities"]
       })
 
     json(conn, %{
       data: Enum.map(handoffs, &channel_post_json/1),
-      meta: %{count: length(handoffs)}
+      meta: %{count: length(handoffs), overflow: overflowed?}
     })
   end
 

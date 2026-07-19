@@ -1320,6 +1320,8 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert row["truncated"] == false
       refute Map.has_key?(row, "body")
       assert meta["count"] == 1
+      # Under the hard cap, so the pinned set is complete — overflow is false.
+      assert meta["overflow"] == false
       # Pinned set: no limit / next_cursor meta (never truncated).
       refute Map.has_key?(meta, "limit")
       refute Map.has_key?(meta, "next_cursor")
