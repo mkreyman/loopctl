@@ -10,12 +10,31 @@ defmodule Loopctl.KeysetCursor do
   per-surface delegators (`Loopctl.Knowledge.ArticleCursor`,
   `Loopctl.Audit.ChangesCursor`) bind their namespace and forward here.
 
-  A keyset position is the stable unique tuple `(inserted_at, id)`. The `id`
-  tie-break is mandatory: `inserted_at` is `utc_datetime_usec` and bulk
+  A keyset position is a stable unique tuple `(inserted_at, tiebreak)`. The
+  tiebreak is mandatory: `inserted_at` is `utc_datetime_usec` and bulk
   `insert_all` / `Ecto.Multi` ties timestamps, so `inserted_at` alone is NOT unique
   and a page boundary could skip or duplicate tied rows. This module turns that
   ordering position into an opaque string the caller hands back as `?cursor=`, and
   turns it back into the tuple on the next request.
+
+  ## Tiebreak: UUID or monotonic integer (US-40.C2)
+
+  Two shapes of tiebreak are supported, and the codec is bijective for BOTH:
+
+  - A `binary_id` **UUID** (`Ecto.UUID.t()`) — the original shape, used where the
+    table's stable tie-break is its random `id` (article list, change feed). The
+    payload embeds the raw 16-byte UUID.
+  - A **monotonic integer** — used by the repo Coordination Bus (`channel_posts`),
+    whose newest-first read tie-breaks on the `seq` bigserial column (strictly
+    increasing with insert order) rather than a random v4 `id`. Keyset paging on
+    `(inserted_at, id)` there would be non-deterministic because `id` carries no
+    order; `(inserted_at, seq)` is the correct deterministic keyset. The payload
+    carries the integer directly under a DISTINCT tag, so a UUID cursor and an
+    integer cursor never deserialize into each other.
+
+  Both shapes ride the SAME HMAC/tamper/cross-tenant/cross-namespace discipline —
+  the tiebreak lives inside the signed payload, so an integer cursor is exactly as
+  forge-resistant and tenant-bound as a UUID one.
 
   ## Trust model (AC-27.9a.3/.4, AC-27.9b.4)
 
@@ -41,26 +60,32 @@ defmodule Loopctl.KeysetCursor do
 
   @hmac_bytes 32
 
-  @typedoc "The keyset position: the `(inserted_at, id)` of a row in (inserted_at ASC, id ASC) order."
-  @type position :: {DateTime.t(), Ecto.UUID.t()}
+  @typedoc """
+  The keyset position: the `(inserted_at, tiebreak)` of a row, where `tiebreak` is
+  either the row's `binary_id` UUID (inserted_at ASC, id ASC order) or a monotonic
+  integer such as a `seq` bigserial (inserted_at DESC, seq DESC order).
+  """
+  @type position :: {DateTime.t(), Ecto.UUID.t() | integer()}
 
   @doc """
-  Encodes the keyset position `{inserted_at, id}` into an opaque cursor string,
-  signed with `namespace`'s per-tenant key.
+  Encodes the keyset position `{inserted_at, tiebreak}` into an opaque cursor
+  string, signed with `namespace`'s per-tenant key. `tiebreak` is either a
+  `binary_id` UUID (string) or a monotonic integer (e.g. a `seq` bigserial).
 
   The returned string is URL-safe Base64 with no padding, so it is safe as a bare
   `?cursor=` query value.
   """
   @spec encode(String.t(), Ecto.UUID.t(), position()) :: String.t()
-  def encode(namespace, tenant_id, {%DateTime{} = inserted_at, id})
-      when is_binary(namespace) and is_binary(tenant_id) and is_binary(id) do
-    payload = serialize(inserted_at, id)
+  def encode(namespace, tenant_id, {%DateTime{} = inserted_at, tiebreak})
+      when is_binary(namespace) and is_binary(tenant_id) and
+             (is_binary(tiebreak) or is_integer(tiebreak)) do
+    payload = serialize(inserted_at, tiebreak)
     sig = :crypto.mac(:hmac, :sha256, secret(namespace, tenant_id), payload)
     Base.url_encode64(payload <> sig, padding: false)
   end
 
   @doc """
-  Decodes and verifies an opaque cursor, returning `{:ok, {inserted_at, id}}`.
+  Decodes and verifies an opaque cursor, returning `{:ok, {inserted_at, tiebreak}}`.
 
   Verifies the HMAC with `namespace`'s per-tenant key. ANY problem — malformed
   Base64, wrong length, signature mismatch (tampered payload, a cursor signed for a
@@ -82,15 +107,25 @@ defmodule Loopctl.KeysetCursor do
 
   # --- internals ---
 
-  # Canonical, fixed-shape payload: a tagged 2-tuple of the inserted_at in integer
-  # microseconds (so the value is exact and order-preserving) and the raw 16-byte
-  # UUID. term_to_binary is compact and round-trips precisely; we never call
+  # Canonical, fixed-shape payload: a tagged tuple of the inserted_at in integer
+  # microseconds (so the value is exact and order-preserving) and the tiebreak.
+  # term_to_binary is compact and round-trips precisely; we never call
   # binary_to_term WITHOUT [:safe] and we re-validate the shape, so a forged payload
   # can't deserialize into anything dangerous.
-  defp serialize(%DateTime{} = inserted_at, id) do
+  #
+  # Two tags keep the shapes disjoint so a UUID cursor and an integer cursor can
+  # never deserialize into each other:
+  #   {:k, micros, raw16}  → UUID tiebreak (raw 16-byte binary_id)
+  #   {:ki, micros, seq}   → integer tiebreak (e.g. a `seq` bigserial)
+  defp serialize(%DateTime{} = inserted_at, id) when is_binary(id) do
     micros = DateTime.to_unix(inserted_at, :microsecond)
     {:ok, raw} = Ecto.UUID.dump(id)
     :erlang.term_to_binary({:k, micros, raw})
+  end
+
+  defp serialize(%DateTime{} = inserted_at, seq) when is_integer(seq) do
+    micros = DateTime.to_unix(inserted_at, :microsecond)
+    :erlang.term_to_binary({:ki, micros, seq})
   end
 
   defp deserialize(payload) do
@@ -101,6 +136,12 @@ defmodule Loopctl.KeysetCursor do
              {:ok, id} <- Ecto.UUID.load(raw) do
           {:ok, {datetime, id}}
         else
+          _ -> {:error, :invalid}
+        end
+
+      {:ki, micros, seq} when is_integer(micros) and is_integer(seq) ->
+        case from_unix_micros(micros) do
+          {:ok, datetime} -> {:ok, {datetime, seq}}
           _ -> {:error, :invalid}
         end
 

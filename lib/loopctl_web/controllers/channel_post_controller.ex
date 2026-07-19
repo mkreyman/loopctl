@@ -51,6 +51,7 @@ defmodule LoopctlWeb.ChannelPostController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Coordination
+  alias Loopctl.Coordination.ChannelCursor
   alias Loopctl.RateLimiter.FailOpenLog
   alias Loopctl.Tenants
   alias LoopctlWeb.AuditContext
@@ -150,12 +151,18 @@ defmodule LoopctlWeb.ChannelPostController do
     summary: "Read a repo coordination channel (channel_recent)",
     description:
       "Returns LIVE coordination posts for a project's channel (a channel IS a project_id), " <>
-        "newest-first (inserted_at DESC). Agent+ role, tenant-scoped from the verified key — " <>
-        "project_id is a query param but the tenant is NEVER taken from params. ORACLE-SAFE: a " <>
-        "project_id belonging to another tenant, or a nonexistent one, returns 200 with an empty " <>
+        "newest-first (inserted_at DESC, seq DESC). Agent+ role, tenant-scoped from the verified " <>
+        "key — project_id is a query param but the tenant is NEVER taken from params. ORACLE-SAFE: " <>
+        "a project_id belonging to another tenant, or a nonexistent one, returns 200 with an empty " <>
         "list — identical to an owned-but-empty channel, never a 404. Only non-expired posts are " <>
-        "returned (expires_at > now, independent of the TTL sweep). `since` (ISO8601) returns only " <>
-        "posts touched after that instant; `limit` defaults to 25 and is clamped to a max of 100.",
+        "returned (expires_at > now, independent of the TTL sweep). Bodies are BOUNDED previews " <>
+        "(body_preview + truncated), never full bodies — fetch a full body via GET " <>
+        "/channel/posts/:id. `since` (ISO8601) returns only posts touched after that instant " <>
+        "(delta read, with a bounded commit-lag look-back so a late-committing earlier row is " <>
+        "re-delivered — AT-LEAST-ONCE with a small overlap the consumer dedups). `cursor` pages " <>
+        "older history via the keyset `(inserted_at, seq)`: follow `meta.next_cursor` verbatim " <>
+        "until it is null (exhausted). A cursor takes precedence over `since`. A tampered or " <>
+        "cross-tenant cursor is rejected with 400. `limit` defaults to 25 and is clamped to 100.",
     parameters: [
       project_id: [
         in: :query,
@@ -170,6 +177,15 @@ defmodule LoopctlWeb.ChannelPostController do
             "return only posts touched after it (delta read). A date-only value " <>
             "(e.g. 2026-07-18) is the wrong granularity and is IGNORED — the whole " <>
             "live channel is returned, not a delta. Supply a full instant."
+      ],
+      cursor: [
+        in: :query,
+        type: :string,
+        description:
+          "Opaque keyset paging token. Omit for the newest page, then follow " <>
+            "meta.next_cursor verbatim to page OLDER history by (inserted_at, seq). " <>
+            "Tenant-bound and integrity-signed; a tampered or cross-tenant cursor " <>
+            "returns 400. Takes precedence over `since`."
       ],
       limit: [
         in: :query,
@@ -193,11 +209,19 @@ defmodule LoopctlWeb.ChannelPostController do
                    type: :boolean,
                    description:
                      "True when the limit truncated the result — more live matching posts exist"
+                 },
+                 next_cursor: %OpenApiSpex.Schema{
+                   type: :string,
+                   nullable: true,
+                   description:
+                     "Opaque keyset paging token for the next OLDER page; null when history is " <>
+                       "exhausted or in delta (`since`) mode. Follow it verbatim as `?cursor=`."
                  }
                }
              }
            }
          }},
+      400 => {"Invalid or tampered cursor", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -282,21 +306,47 @@ defmodule LoopctlWeb.ChannelPostController do
     # passed back into `recent/3`, which re-clamps harmlessly.
     applied_limit = Coordination.clamp_recent_limit(params["limit"])
 
-    # `has_more` is an HONEST truncation signal: `recent_page/3` fetches
-    # `limit + 1` and reports whether a matching post exists beyond the applied
-    # limit, so a consumer never mistakes a truncated page for the whole channel
-    # (it can re-read with a tighter `since` / smaller window). A full cursor is
-    # US-39.6's job; this is the cheap "there is more" flag.
-    {posts, has_more} =
-      Coordination.recent_page(tenant_id, params["project_id"],
-        limit: applied_limit,
-        since: params["since"]
-      )
+    case resolve_cursor(tenant_id, params) do
+      {:ok, cursor} ->
+        # `has_more` is an HONEST truncation signal: `recent_page/3` fetches
+        # `limit + 1` and reports whether a matching post exists beyond the applied
+        # limit. `next_cursor` (US-40.C2) is the keyset paging token — the
+        # `(inserted_at, seq)` of the last row when more HISTORY remains (null when
+        # exhausted, or in delta/`since` mode). A consumer follows it verbatim to
+        # walk the full live channel without gaps or dups.
+        {posts, has_more, next_cursor} =
+          Coordination.recent_page(tenant_id, params["project_id"],
+            limit: applied_limit,
+            since: params["since"],
+            cursor: cursor
+          )
 
-    json(conn, %{
-      data: Enum.map(posts, &channel_post_json/1),
-      meta: %{limit: applied_limit, count: length(posts), has_more: has_more}
-    })
+        json(conn, %{
+          data: Enum.map(posts, &channel_post_json/1),
+          meta: %{
+            limit: applied_limit,
+            count: length(posts),
+            has_more: has_more,
+            next_cursor: encode_cursor(tenant_id, next_cursor)
+          }
+        })
+
+      :error ->
+        # A tampered, cross-tenant, or malformed cursor decodes to {:error, :invalid}
+        # (TC-5). Reject with a 400 rather than silently resetting to the newest page,
+        # so a forged cursor never surfaces cross-tenant rows and the client learns to
+        # follow `next_cursor` verbatim. Uniform for any bad cursor — no oracle.
+        conn
+        |> put_status(:bad_request)
+        |> json(%{
+          error: %{
+            code: "invalid_cursor",
+            message:
+              "Invalid or tampered cursor. Omit `cursor` for the newest page, then " <>
+                "follow `meta.next_cursor` verbatim to page older history."
+          }
+        })
+    end
   rescue
     e ->
       # US-39.3 technical_notes: "Emit a security-event log on any internal error
@@ -347,6 +397,39 @@ defmodule LoopctlWeb.ChannelPostController do
       updated_at: row.updated_at
     }
   end
+
+  # Resolve the `?cursor=` param (US-40.C2) to a `{:ok, position_or_nil}` for
+  # `recent_page/3`, or `:error` for a bad cursor (→ 400). Mirrors the change-feed
+  # `resolve_seek/2` convention:
+  #   - cursor ABSENT    → {:ok, nil} (newest page / delta by `since`)
+  #   - cursor EMPTY ""  → {:ok, nil} (treat `cursor=` like "start")
+  #   - cursor a token   → decode + verify with the CALLER's tenant key; a
+  #                        forged/tampered/cross-tenant/cross-namespace token fails
+  #                        verification → :error (TC-5), never a silent reset
+  #   - cursor non-string → :error
+  defp resolve_cursor(tenant_id, params) do
+    case Map.fetch(params, "cursor") do
+      :error ->
+        {:ok, nil}
+
+      {:ok, ""} ->
+        {:ok, nil}
+
+      {:ok, raw} when is_binary(raw) ->
+        case ChannelCursor.decode(tenant_id, raw) do
+          {:ok, position} -> {:ok, position}
+          {:error, :invalid} -> :error
+        end
+
+      {:ok, _non_string} ->
+        :error
+    end
+  end
+
+  defp encode_cursor(_tenant_id, nil), do: nil
+
+  defp encode_cursor(tenant_id, {%DateTime{}, seq} = position) when is_integer(seq),
+    do: ChannelCursor.encode(tenant_id, position)
 
   @doc """
   GET /api/v1/channel/posts/:id

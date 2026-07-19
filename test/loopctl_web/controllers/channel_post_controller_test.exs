@@ -799,7 +799,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       assert cross_body == %{
                "data" => [],
-               "meta" => %{"limit" => 25, "count" => 0, "has_more" => false}
+               "meta" => %{"limit" => 25, "count" => 0, "has_more" => false, "next_cursor" => nil}
              }
 
       assert cross_body == missing_body
@@ -823,7 +823,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       assert json_response(conn, 200) == %{
                "data" => [],
-               "meta" => %{"limit" => 25, "count" => 0, "has_more" => false}
+               "meta" => %{"limit" => 25, "count" => 0, "has_more" => false, "next_cursor" => nil}
              }
     end
 
@@ -835,7 +835,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       assert json_response(conn, 200) == %{
                "data" => [],
-               "meta" => %{"limit" => 25, "count" => 0, "has_more" => false}
+               "meta" => %{"limit" => 25, "count" => 0, "has_more" => false, "next_cursor" => nil}
              }
     end
 
@@ -922,6 +922,162 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert String.starts_with?(big, preview)
     end
   end
+
+  describe "GET /api/v1/channel/posts cursor paging (US-40.C2)" do
+    # TC-1 at the HTTP boundary: page the full channel via ?cursor= to exhaustion.
+    test "?cursor= pages the full channel, next_cursor null when exhausted, no dups" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      for n <- 1..250 do
+        {:ok, _} =
+          Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "p#{n}"})
+      end
+
+      {ids, page_count, final_cursor} = page_via_http(raw, project.id, 100)
+
+      assert length(ids) == 250
+      assert length(Enum.uniq(ids)) == 250
+      assert page_count == 3
+      assert is_nil(final_cursor)
+    end
+
+    test "next_cursor is present when more rows exist, null on the last page" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      for n <- 1..3 do
+        {:ok, _} =
+          Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "p#{n}"})
+      end
+
+      # First page (limit 2) truncates → next_cursor present.
+      first = authed_conn(raw) |> get(@path, %{"project_id" => project.id, "limit" => "2"})
+      assert %{"data" => d1, "meta" => m1} = json_response(first, 200)
+      assert length(d1) == 2
+      assert m1["has_more"] == true
+      assert is_binary(m1["next_cursor"])
+
+      # Following it returns the final row and exhausts → next_cursor null.
+      second =
+        authed_conn(raw)
+        |> get(@path, %{"project_id" => project.id, "limit" => "2", "cursor" => m1["next_cursor"]})
+
+      assert %{"data" => d2, "meta" => m2} = json_response(second, 200)
+      assert length(d2) == 1
+      assert m2["has_more"] == false
+      assert is_nil(m2["next_cursor"])
+
+      # No overlap between the two pages.
+      ids1 = MapSet.new(d1, & &1["id"])
+      assert Enum.all?(d2, &(&1["id"] not in ids1))
+    end
+
+    test "backward compatible: without a cursor, behavior is the US-39.3 newest page" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      seed_post(tenant, project, agent.id, "one", DateTime.add(base, -300, :second))
+      seed_post(tenant, project, agent.id, "two", DateTime.add(base, -200, :second))
+      seed_post(tenant, project, agent.id, "three", DateTime.add(base, -100, :second))
+
+      conn = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+      assert %{"data" => data, "meta" => meta} = json_response(conn, 200)
+      assert Enum.map(data, & &1["body_preview"]) == ["three", "two", "one"]
+      assert meta["limit"] == 25
+      assert meta["has_more"] == false
+      # A fully-returned channel exhausts → next_cursor null.
+      assert is_nil(meta["next_cursor"])
+      # body_preview stays server-side w.r.t. seq — never surfaced in a data item.
+      refute Map.has_key?(hd(data), "seq")
+    end
+
+    # TC-5 — a tampered / cross-tenant cursor is rejected with 400; no cross-tenant rows.
+    test "a byte-mutated cursor is rejected with 400" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      for n <- 1..3 do
+        {:ok, _} =
+          Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "p#{n}"})
+      end
+
+      first = authed_conn(raw) |> get(@path, %{"project_id" => project.id, "limit" => "2"})
+      cursor = json_response(first, 200)["meta"]["next_cursor"]
+      {head, <<last::utf8>>} = String.split_at(cursor, -1)
+      mutated = head <> if(last == ?A, do: "B", else: "A")
+
+      conn =
+        authed_conn(raw)
+        |> get(@path, %{"project_id" => project.id, "cursor" => mutated})
+
+      assert %{"error" => err} = json_response(conn, 400)
+      assert err["code"] == "invalid_cursor"
+    end
+
+    test "a cursor minted for tenant A is rejected for tenant B (400, no cross-tenant rows)" do
+      tenant_a = fixture(:tenant)
+      project_a = fixture(:project, %{tenant_id: tenant_a.id})
+      {raw_a, _key_a, agent_a} = agent_key(tenant_a)
+
+      for n <- 1..3 do
+        {:ok, _} =
+          Coordination.create_post(tenant_a.id, project_a.id, agent_a.id, %{"body" => "a#{n}"})
+      end
+
+      # Tenant A mints a valid cursor.
+      first = authed_conn(raw_a) |> get(@path, %{"project_id" => project_a.id, "limit" => "2"})
+      cursor_a = json_response(first, 200)["meta"]["next_cursor"]
+      assert is_binary(cursor_a)
+
+      # Tenant B replays it against tenant A's project — rejected (400), no rows leak.
+      tenant_b = fixture(:tenant)
+      {raw_b, _key_b, _agent_b} = agent_key(tenant_b)
+
+      conn =
+        authed_conn(raw_b)
+        |> get(@path, %{"project_id" => project_a.id, "cursor" => cursor_a})
+
+      assert json_response(conn, 400)["error"]["code"] == "invalid_cursor"
+    end
+  end
+
+  # Page the channel over HTTP following meta.next_cursor; returns
+  # {all_ids, page_count, final_next_cursor}.
+  defp page_via_http(raw, project_id, limit) do
+    results =
+      :start
+      |> Stream.unfold(&fetch_page(&1, raw, project_id, limit))
+      |> Enum.to_list()
+
+    ids = Enum.flat_map(results, &elem(&1, 0))
+    final = results |> List.last() |> elem(1)
+    {ids, length(results), final}
+  end
+
+  defp fetch_page(:done, _raw, _project_id, _limit), do: nil
+
+  defp fetch_page(cursor_state, raw, project_id, limit) do
+    cursor = if cursor_state == :start, do: nil, else: cursor_state
+    params = page_params(project_id, limit, cursor)
+
+    %{"data" => data, "meta" => meta} =
+      raw |> authed_conn() |> get(@path, params) |> json_response(200)
+
+    next = meta["next_cursor"]
+    {{Enum.map(data, & &1["id"]), next}, if(next, do: next, else: :done)}
+  end
+
+  defp page_params(project_id, limit, nil),
+    do: %{"project_id" => project_id, "limit" => Integer.to_string(limit)}
+
+  defp page_params(project_id, limit, cursor),
+    do: project_id |> page_params(limit, nil) |> Map.put("cursor", cursor)
 
   describe "GET /api/v1/channel/posts/:id (full body, US-40.D1)" do
     defp show_path(id), do: "#{@path}/#{id}"

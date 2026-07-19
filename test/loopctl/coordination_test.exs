@@ -444,10 +444,13 @@ defmodule Loopctl.CoordinationTest do
         seed_post(tenant, project, agent_id, "p#{n}", DateTime.add(base, -n, :second))
       end
 
-      assert {truncated, true} = Coordination.recent_page(tenant.id, project.id, limit: 2)
-      assert length(truncated) == 2
+      assert {truncated, true, next_cursor} =
+               Coordination.recent_page(tenant.id, project.id, limit: 2)
 
-      assert {full, false} = Coordination.recent_page(tenant.id, project.id, limit: 5)
+      assert length(truncated) == 2
+      assert match?({%DateTime{}, seq} when is_integer(seq), next_cursor)
+
+      assert {full, false, nil} = Coordination.recent_page(tenant.id, project.id, limit: 5)
       assert length(full) == 3
     end
 
@@ -483,6 +486,319 @@ defmodule Loopctl.CoordinationTest do
       end
 
       assert length(Coordination.recent(tenant.id, project.id)) == 25
+    end
+  end
+
+  describe "recent_page/3 keyset cursor + commit-lag delta (US-40.C2)" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+      %{tenant: tenant, project: project, agent_id: agent_id}
+    end
+
+    # Follow next_cursor to exhaustion, returning the concatenated rows + page count.
+    defp page_all(tenant_id, project_id, limit) do
+      pages =
+        Stream.unfold(:start, fn
+          :done ->
+            nil
+
+          state ->
+            cursor = if state == :start, do: nil, else: state
+
+            {page, _has_more, next} =
+              Coordination.recent_page(tenant_id, project_id, limit: limit, cursor: cursor)
+
+            {page, if(next, do: next, else: :done)}
+        end)
+        |> Enum.to_list()
+
+      {Enum.concat(pages), length(pages)}
+    end
+
+    # TC-1
+    test "cursor pages the full live set to exhaustion with no gaps or dups", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      for n <- 1..250 do
+        {:ok, _} =
+          Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "p#{n}"})
+      end
+
+      {rows, page_count} = page_all(tenant.id, project.id, 100)
+
+      ids = Enum.map(rows, & &1.id)
+      assert length(ids) == 250, "expected all 250 posts seen exactly once"
+      assert length(Enum.uniq(ids)) == 250, "no dups across pages"
+      assert page_count == 3, "100 + 100 + 50 → 3 pages"
+
+      # Deterministic newest-first ordering keyed on the monotonic seq: strictly
+      # descending, total order even across same-microsecond inserted_at ties.
+      seqs = Enum.map(rows, & &1.seq)
+      assert seqs == Enum.sort(seqs, :desc)
+      assert length(Enum.uniq(seqs)) == 250
+
+      # Final page exhausts history: next_cursor is null.
+      last_page_cursor =
+        Stream.iterate(nil, fn c ->
+          {_p, _hm, next} =
+            Coordination.recent_page(tenant.id, project.id, limit: 100, cursor: c)
+
+          next
+        end)
+        |> Enum.take(4)
+        |> List.last()
+
+      assert is_nil(last_page_cursor)
+    end
+
+    # TC-2
+    test "rows sharing inserted_at order by seq DESC deterministically across runs", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      ts = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      # seq is assigned at create time in order a < b < c; all three share inserted_at.
+      for body <- ["a", "b", "c"] do
+        seed_post(tenant, project, agent_id, body, ts)
+      end
+
+      for _ <- 1..5 do
+        bodies = tenant.id |> Coordination.recent(project.id) |> Enum.map(& &1.body_preview)
+        assert bodies == ["c", "b", "a"]
+      end
+    end
+
+    # TC-3
+    test "commit-lag look-back re-scans a late-committing earlier row (not dropped)", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      watermark = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      # B is the row the reader already saw, AT the watermark.
+      seed_post(tenant, project, agent_id, "B_seen", watermark)
+
+      # A has an EARLIER inserted_at but (simulating a pre-commit-assigned timestamp
+      # whose txn committed AFTER B) is only now visible — WITHIN the epsilon window.
+      seed_post(tenant, project, agent_id, "A_late", DateTime.add(watermark, -2, :second))
+
+      # A row older than the epsilon window must NOT be pulled in (bounded look-back,
+      # not "return everything before the watermark").
+      seed_post(tenant, project, agent_id, "far_old", DateTime.add(watermark, -60, :second))
+
+      bodies =
+        tenant.id
+        |> Coordination.recent(project.id, since: watermark)
+        |> Enum.map(& &1.body_preview)
+
+      # Without the look-back, A_late (GREATEST = watermark-2s) would NOT satisfy
+      # `> watermark` and would be lost forever. With epsilon it is re-delivered.
+      assert "A_late" in bodies
+      refute "far_old" in bodies
+    end
+
+    # TC-6
+    test "an upserted slot after `since` surfaces (GREATEST) and is not dropped by limit", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      since = DateTime.add(base, -200, :second)
+
+      {:ok, slot} =
+        Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "slot"})
+
+      {:ok, _} =
+        slot
+        |> Ecto.Changeset.change(
+          inserted_at: DateTime.add(base, -300, :second),
+          updated_at: DateTime.add(base, -10, :second)
+        )
+        |> AdminRepo.update()
+
+      seed_post(tenant, project, agent_id, "p1", DateTime.add(base, -100, :second))
+      seed_post(tenant, project, agent_id, "p2", DateTime.add(base, -50, :second))
+
+      {rows, has_more, next_cursor} =
+        Coordination.recent_page(tenant.id, project.id, since: since, limit: 2)
+
+      bodies = Enum.map(rows, & &1.body_preview)
+      assert bodies == ["slot", "p2"]
+      assert has_more
+      # Delta mode does not emit a keyset cursor (paging is the consumer advancing
+      # `since`); the keyset walks inserted_at, GREATEST ordering is a delta concept.
+      assert is_nil(next_cursor)
+    end
+
+    test "a cursor takes precedence over `since` (the two reads are not unified)", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      for n <- 1..5 do
+        seed_post(tenant, project, agent_id, "p#{n}", DateTime.add(base, -n * 10, :second))
+      end
+
+      {first_page, true, cursor} = Coordination.recent_page(tenant.id, project.id, limit: 2)
+      assert length(first_page) == 2
+
+      # Pass BOTH a cursor and a `since` that alone would filter everything out. The
+      # cursor wins → history walk continues; `since` is ignored.
+      future = DateTime.add(base, 3600, :second)
+
+      {second_page, _hm, _next} =
+        Coordination.recent_page(tenant.id, project.id, limit: 2, cursor: cursor, since: future)
+
+      first_ids = MapSet.new(first_page, & &1.id)
+      assert Enum.all?(second_page, &(&1.id not in first_ids))
+      assert length(second_page) == 2
+    end
+
+    # TC-4 (also covered by the D1 preview describe) — the cursor read returns a
+    # bounded preview, never the full body.
+    test "cursor read returns a bounded body_preview + truncated, never the full body", %{
+      tenant: tenant,
+      project: project,
+      agent_id: agent_id
+    } do
+      big = String.duplicate("x", 16_384)
+      {:ok, _} = Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => big})
+
+      {[row], _hm, _next} = Coordination.recent_page(tenant.id, project.id, limit: 10)
+
+      assert byte_size(row.body_preview) <= Coordination.preview_bytes()
+      assert row.truncated
+      refute Map.has_key?(row, :body)
+    end
+
+    test "tenant isolation: paging tenant B cannot see tenant A's channel", %{
+      tenant: tenant_a,
+      project: project_a,
+      agent_id: agent_a
+    } do
+      for n <- 1..3 do
+        {:ok, _} =
+          Coordination.create_post(tenant_a.id, project_a.id, agent_a, %{"body" => "a#{n}"})
+      end
+
+      tenant_b = fixture(:tenant)
+
+      # Same project_id, different tenant → the explicit tenant filter excludes all
+      # rows; the cursor path is no exception.
+      assert {[], false, nil} =
+               Coordination.recent_page(tenant_b.id, project_a.id, limit: 100)
+    end
+
+    # TRUNCATION-DRAIN RULE (Finding 1): a delta window larger than :limit truncates
+    # the OLDEST-touched matching rows (delta orders GREATEST desc). Blindly advancing
+    # the `since` watermark to the newest row would step PAST those older rows forever
+    # (a lost-write gap). This proves the documented recovery affordance: the truncated
+    # older row IS recoverable by DRAINING the backlog via the history cursor read.
+    test "delta truncation: the dropped OLDEST row is recoverable via the history cursor drain",
+         %{tenant: tenant, project: project, agent_id: agent_id} do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      since = DateTime.add(base, -200, :second)
+
+      p_old = seed_post(tenant, project, agent_id, "p_old", DateTime.add(base, -150, :second))
+      _p_mid = seed_post(tenant, project, agent_id, "p_mid", DateTime.add(base, -100, :second))
+      _p_new = seed_post(tenant, project, agent_id, "p_new", DateTime.add(base, -50, :second))
+
+      # Delta read at limit 2 over a 3-row window: newest two kept, p_old truncated.
+      {delta_rows, has_more, next_cursor} =
+        Coordination.recent_page(tenant.id, project.id, since: since, limit: 2)
+
+      assert has_more
+      assert is_nil(next_cursor)
+      delta_bodies = Enum.map(delta_rows, & &1.body_preview)
+      assert delta_bodies == ["p_new", "p_mid"]
+      refute "p_old" in delta_bodies
+
+      # The lost-write gap: naively advancing the watermark to the newest row and
+      # re-reading the delta would NOT surface p_old (it sorts below the new watermark,
+      # even after the epsilon look-back). This is what the drain rule exists to avoid.
+      advanced = DateTime.add(base, -50, :second)
+
+      {advanced_rows, _hm, _nc} =
+        Coordination.recent_page(tenant.id, project.id, since: advanced, limit: 100)
+
+      refute "p_old" in Enum.map(advanced_rows, & &1.body_preview)
+
+      # DRAIN affordance: the history cursor read (walked to exhaustion) returns EVERY
+      # live row, including the truncated p_old — so a burst larger than the cap loses
+      # nothing when the consumer drains before advancing its watermark.
+      {drained, _pages} = page_all(tenant.id, project.id, 2)
+      drained_ids = Enum.map(drained, & &1.id)
+      assert p_old.id in drained_ids
+      assert length(drained_ids) == 3
+      assert length(Enum.uniq(drained_ids)) == 3
+    end
+
+    # Finding 2: the history keyset walk pages the already-COMMITTED snapshot without
+    # gaps or dups, but does NOT claim to also return a row that COMMITS mid-walk above
+    # the emitted cursor frontier — that new-row completeness is the DELTA read's job.
+    # This is the covering test for the narrowed AC-40.C2.5 / recent_page/3 claim.
+    test "history walk covers committed rows; a mid-walk insert is owned by the delta read, not the backward walk",
+         %{tenant: tenant, project: project, agent_id: agent_id} do
+      base = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      committed =
+        for n <- 1..5 do
+          seed_post(tenant, project, agent_id, "c#{n}", DateTime.add(base, -n * 10, :second))
+        end
+
+      committed_ids = MapSet.new(committed, & &1.id)
+
+      # First history page (frontier established at the 2nd row's cursor).
+      {first_page, true, cursor} = Coordination.recent_page(tenant.id, project.id, limit: 2)
+      assert length(first_page) == 2
+
+      # A brand-new post COMMITS mid-walk. create_post stamps `now`, so its
+      # (inserted_at, seq) is ABOVE the already-emitted cursor frontier.
+      watermark = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      {:ok, late} = Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "late"})
+
+      # Continue the backward walk from the mid-walk cursor to exhaustion.
+      continuation =
+        Stream.unfold(cursor, fn
+          nil ->
+            nil
+
+          c ->
+            {page, _hm, next} =
+              Coordination.recent_page(tenant.id, project.id, limit: 2, cursor: c)
+
+            {page, next}
+        end)
+        |> Enum.to_list()
+        |> Enum.concat()
+
+      walked_ids = MapSet.new(first_page ++ continuation, & &1.id)
+
+      # Committed-snapshot completeness: every row that existed when the walk started
+      # is returned exactly once across the pages.
+      assert MapSet.subset?(committed_ids, walked_ids)
+      walked_list = Enum.map(first_page ++ continuation, & &1.id)
+      assert length(walked_list) == length(Enum.uniq(walked_list)), "no dups across pages"
+
+      # The mid-walk insert is ABOVE the frontier — the backward walk does NOT revisit
+      # it. This is the standard, deliberate keyset property (not a lost write).
+      refute late.id in walked_ids
+
+      # New-row completeness is owned by the DELTA read: a watermark just before the
+      # insert surfaces the late row that the backward walk skipped.
+      {delta, _hm, _nc} =
+        Coordination.recent_page(tenant.id, project.id, since: watermark, limit: 100)
+
+      assert late.id in Enum.map(delta, & &1.id)
     end
   end
 
