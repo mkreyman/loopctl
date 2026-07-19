@@ -18,7 +18,14 @@ defmodule Loopctl.Repo.DropRedundantChannelPostsRecentIdxMigrationTest do
   exercises the SHIPPED `up/0`/`down/0` verbatim (single source of truth), so a
   defect edited into the migration file WILL fail this test.
   """
-  use Loopctl.DataCase, async: true
+  # async: false (the documented global-state-coupling exception to async-everywhere):
+  # up/0 runs DROP INDEX and down/0 runs CREATE INDEX on the SHARED channel_posts
+  # table, each taking a cross-connection ACCESS EXCLUSIVE lock. Async siblings
+  # (coordination_test / channel_post_controller_test) INSERT into channel_posts
+  # concurrently (ROW EXCLUSIVE), which the ACCESS EXCLUSIVE lock conflicts with —
+  # a latent serialize/hang-until-timeout flake on a hot table. Running in ExUnit's
+  # sync phase eliminates the cross-module contention at near-zero cost.
+  use Loopctl.DataCase, async: false
 
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
