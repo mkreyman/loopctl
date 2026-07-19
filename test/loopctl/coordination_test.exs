@@ -573,6 +573,57 @@ defmodule Loopctl.CoordinationTest do
       assert audit_actions(tenant.id, second.id) == ["posted", "upserted"]
     end
 
+    test "a keyed re-post refreshes advisory addressing (to_host/to_capability) in place", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
+
+      # to_host/to_capability are caller-variable advisory PAYLOAD, not slot-identity
+      # metadata — so a keyed re-post of the same working-state slot must be able to
+      # re-address it (US-40.A5), otherwise 40.C1 directed discovery reads the stale
+      # FIRST-set target on a handoff refresh. They are in the on_conflict replace
+      # list alongside body/refs, so the upsert overwrites them.
+      base = %{project_id: project.id, session_id: "S1", key: "handoff:fly", audit: audit}
+
+      assert {:ok, first, :created} =
+               Coordination.post(
+                 tenant.id,
+                 agent_id,
+                 base
+                 |> Map.put(:body, "broadcast state")
+                 |> Map.put(:to_host, "mac-mini")
+               )
+
+      assert first.to_host == "mac-mini"
+      assert is_nil(first.to_capability)
+
+      # Re-post the SAME slot: change to_host AND newly add to_capability (promote a
+      # host-directed slot to a capability-directed one).
+      assert {:ok, second, :updated} =
+               Coordination.post(
+                 tenant.id,
+                 agent_id,
+                 base
+                 |> Map.put(:body, "directed handoff")
+                 |> Map.put(:to_host, "beelink")
+                 |> Map.put(:to_capability, "fly-auth")
+               )
+
+      assert second.id == first.id
+      assert second.to_host == "beelink"
+      assert second.to_capability == "fly-auth"
+
+      # The addressing on the PERSISTED row reflects the refresh (not a phantom on
+      # the returned struct only).
+      reloaded = AdminRepo.get!(ChannelPost, second.id)
+      assert reloaded.to_host == "beelink"
+      assert reloaded.to_capability == "fly-auth"
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 1
+    end
+
     test "a different session's same key is a distinct row (no cross-session clobber)", ctx do
       %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
 

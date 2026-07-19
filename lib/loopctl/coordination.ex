@@ -112,8 +112,12 @@ defmodule Loopctl.Coordination do
   this changes nothing observable versus the doc's stale
   `(tenant, project, session, key)` target, but it MUST match the live index or
   the insert raises). A repeat write from the SAME session refreshes its own
-  slot (`body`/`refs`/`updated_at`/`expires_at`); a different session's same key
-  is a distinct row. Without a `key` every post is a new append-only row.
+  slot's caller-variable payload — `body`, `refs`, the advisory addressing
+  (`to_host`/`to_capability`, US-40.A5), `updated_at`, and `expires_at` — so a
+  keyed re-post can re-address a handoff slot or promote a broadcast slot to
+  directed; `inserted_at`, `host`, and `session_id` are set-once (kept from the
+  original insert). A different session's same key is a distinct row. Without a
+  `key` every post is a new append-only row.
 
   ## Returns
 
@@ -352,11 +356,28 @@ defmodule Loopctl.Coordination do
   # for the INSERT ATTEMPT (the existing row kept its own). Reading the row back
   # makes the returned struct — the response JSON, the audit entity_id, AND the
   # `post_outcome/1` timestamp comparison — reflect the real persisted row.
+  #
+  # The replace list carries the CALLER-VARIABLE payload — the fields a re-post of
+  # the SAME working-state slot may legitimately change:
+  #
+  #   * `body`/`refs` — the message content.
+  #   * `to_host`/`to_capability` (US-40.A5) — advisory addressing. These are
+  #     per-message intent, not slot-identity metadata, so a keyed re-post must be
+  #     able to re-address the slot (or promote a broadcast working-state slot to
+  #     directed) — otherwise the FIRST-set addressing sticks and 40.C1 directed
+  #     discovery (which surfaces "directed-to-me" posts by `to_host`/`to_capability`)
+  #     would read stale targets on a handoff refresh. They refresh like `body`.
+  #   * `updated_at`/`expires_at` — the refresh timestamp and the TTL extension.
+  #
+  # Deliberately EXCLUDED (set-once at first insert): `inserted_at` (so
+  # `post_outcome/1` can tell created from updated), and `host`/`session_id`, which
+  # are slot-identity/attribution metadata the story mandates mirroring from the
+  # original insert, not refreshable payload.
   defp insert_opts(nil), do: []
 
   defp insert_opts(_key) do
     [
-      on_conflict: {:replace, [:body, :refs, :updated_at, :expires_at]},
+      on_conflict: {:replace, [:body, :refs, :to_host, :to_capability, :updated_at, :expires_at]},
       conflict_target:
         {:unsafe_fragment,
          "(tenant_id, project_id, agent_id, session_id, key) WHERE key IS NOT NULL"},
