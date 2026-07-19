@@ -57,20 +57,26 @@ defmodule LoopctlWeb.ChannelPostController do
 
   action_fallback LoopctlWeb.FallbackController
 
+  # SINGLE SOURCE OF TRUTH for the agent-facing READ actions, shared by BOTH the
+  # agent-role gate and the per-read rate cap below so the two can NEVER drift
+  # apart: every read action is role-gated AND read-capped in lockstep, never a
+  # body-returning read that is rate-limited but escapes controller-level role
+  # enforcement (or vice versa). `:handoffs` (GET /channel/handoffs, 40.C1
+  # directed discovery) is listed PROACTIVELY (AC-40.D5.1): when 40.C1 lands that
+  # action ON THIS controller both guards attach automatically; until then the
+  # guards simply never match the nonexistent action. If 40.C1 instead implements
+  # handoffs in a SEPARATE controller, neither guard applies and 40.C1 MUST
+  # re-apply the read cap there (cross-story invariant — see the 40.C1 review
+  # note / wiki finding).
+  @read_actions [:index, :show, :handoffs]
+
   # Coordination surface (#331): agent role, NO RequireHumanAnchor. See the
   # coordination-surface allowlist entry in require_human_anchor_default_deny_test.
-  # The read (`:index`) is the same agent-role, tenant-scoped coordination surface
-  # as the write — never human-anchor gated (the human-anchor default-deny test
-  # only walks POST/PUT/PATCH/DELETE, so this GET needs no allowlist entry).
-  # `:handoffs` is named PROACTIVELY here (parity with the `rate_limit_read`
-  # guard, AC-40.D5.1) so that when 40.C1 lands the `:handoffs` action ON THIS
-  # controller, the agent-role gate attaches in lockstep with the read limiter —
-  # never a body-returning read that is rate-limited but escapes controller-level
-  # role enforcement. Until then the guard simply never matches the nonexistent
-  # action. (If 40.C1 instead implements handoffs in a SEPARATE controller,
-  # neither this guard nor the limiter below applies and both mentions are inert.)
+  # The reads are the same agent-role, tenant-scoped coordination surface as the
+  # write — never human-anchor gated (the human-anchor default-deny test only
+  # walks POST/PUT/PATCH/DELETE, so these GETs need no allowlist entry).
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :agent] when action in [:create, :index, :delete, :show, :handoffs]
+       [role: :agent] when action in [:create, :delete] or action in @read_actions
 
   # Per-write rate limit (AC-39.2.8): a TIGHTER, config-driven cap on top of the
   # generic per-key/per-tenant pipeline RateLimiter, reusing the same
@@ -87,12 +93,10 @@ defmodule LoopctlWeb.ChannelPostController do
   # observable. The read is no longer covered ONLY by the generic pipeline
   # per-key/per-tenant limiter: this dedicated cap trips FIRST (clamped below the
   # pipeline cap) so a read burst emits the coordination `:rate_limited` signal
-  # instead of being shadowed by an anonymous pipeline 429. `:handoffs` is named
-  # proactively (AC-40.D5.1) and kept SYMMETRIC with the RequireRole guard above;
-  # until 40.C1 lands that action the guard simply never matches. IF 40.C1 defines
-  # `:handoffs` ON THIS controller, both the role gate and this limiter attach to it
-  # automatically; if 40.C1 puts handoffs in a separate controller, neither applies.
-  plug :rate_limit_read when action in [:index, :show, :handoffs]
+  # instead of being shadowed by an anonymous pipeline 429. Uses the SAME
+  # `@read_actions` list as the RequireRole gate above — structural symmetry, so a
+  # read action can never be role-gated without also being read-capped.
+  plug :rate_limit_read when action in @read_actions
 
   tags(["Coordination"])
 
@@ -737,13 +741,24 @@ defmodule LoopctlWeb.ChannelPostController do
   defp emit_security_event(event, metadata) do
     :telemetry.execute([:loopctl, :coordination, event], %{count: 1}, metadata)
 
+    # `limit_kind` (:write / :read) is the rate-cap discriminator and is carried
+    # ONLY by the two :rate_limited callers. Render it solely when present so the
+    # four non-rate-limit events (:read_error, :agent_identity_required,
+    # :ownership_rejected) don't emit a dangling `limit_kind=` (nil) token — the
+    # full telemetry map still carries whatever keys each caller passed.
+    limit_kind_token =
+      case Map.fetch(metadata, :limit_kind) do
+        {:ok, kind} -> " limit_kind=#{kind}"
+        :error -> ""
+      end
+
     Logger.warning(
       "coordination security event: #{event} " <>
         "(tenant=#{Map.get(metadata, :tenant_id)} " <>
         "api_key=#{Map.get(metadata, :api_key_id)} " <>
         "agent=#{Map.get(metadata, :agent_id)} " <>
-        "project=#{Map.get(metadata, :project_id)} " <>
-        "limit_kind=#{Map.get(metadata, :limit_kind)})"
+        "project=#{Map.get(metadata, :project_id)}" <>
+        limit_kind_token <> ")"
     )
 
     :ok

@@ -371,6 +371,9 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
         end)
 
       assert log =~ "ownership_rejected"
+      # A non-rate-limit event carries NO `limit_kind` — its log line must not emit
+      # a dangling `limit_kind=` token (the discriminator is write/read-cap only).
+      refute log =~ "limit_kind="
       assert_receive {:ownership_rejected, %{count: 1}, meta}
       assert meta.project_id == foreign.id
     end
