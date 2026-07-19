@@ -17,6 +17,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
   alias Loopctl.ContextRetriever.Entity
+  alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
@@ -994,6 +995,35 @@ defmodule Loopctl.Fixtures do
     story = AdminRepo.insert!(changeset)
 
     apply_story_overrides(story, agent_status, verified_status, assigned_agent_id)
+  end
+
+  # US-40.B1: a coordination handoff claim, inserted DIRECTLY on AdminRepo
+  # (bypassing the membership gate) so lifecycle/sweeper/isolation tests can seed
+  # claims with arbitrary `done_at`/`lease_expires_at`. Auto-creates tenant/project/
+  # agent when not supplied. Override any of `:ref`, `:claimant_agent_id`,
+  # `:claimed_at`, `:lease_expires_at`, `:done_at`.
+  def fixture(:channel_claim, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    tenant_id = Map.get(attrs, :tenant_id) || fixture(:tenant).id
+    project_id = Map.get(attrs, :project_id) || fixture(:project, %{tenant_id: tenant_id}).id
+
+    claimant_agent_id =
+      Map.get(attrs, :claimant_agent_id) || fixture(:agent, %{tenant_id: tenant_id}).id
+
+    now = DateTime.utc_now()
+    claimed_at = Map.get(attrs, :claimed_at, now)
+    lease_expires_at = Map.get(attrs, :lease_expires_at, DateTime.add(now, 3600, :second))
+
+    AdminRepo.insert!(%ChannelClaim{
+      tenant_id: tenant_id,
+      project_id: project_id,
+      claimant_agent_id: claimant_agent_id,
+      ref: Map.get(attrs, :ref, "handoff:repo##{System.unique_integer([:positive])}"),
+      claimed_at: claimed_at,
+      lease_expires_at: lease_expires_at,
+      done_at: Map.get(attrs, :done_at)
+    })
   end
 
   def fixture(:epic_dependency, attrs) do

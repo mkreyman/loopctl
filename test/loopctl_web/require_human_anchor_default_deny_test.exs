@@ -199,6 +199,14 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # key, tenant-scoped), NOT chain-of-custody, so deliberately outside
                # the human-anchor tier gate (design brief §3, owner decision #331).
                {:delete, "/api/v1/channel/posts/:id"},
+               # US-40.B1 Repo Coordination Bus CLAIM surface — exactly-once handoff
+               # claim/release/done. Same COORDINATION posture as the channel posts:
+               # agent-role, tenant_id/agent_id/role server-stamped from the verified
+               # key, project-scoped by membership — NOT chain-of-custody, so
+               # deliberately outside the human-anchor tier gate (owner decision #331).
+               {:post, "/api/v1/channel/claims"},
+               {:post, "/api/v1/channel/claims/release"},
+               {:post, "/api/v1/channel/claims/done"},
 
                # Superadmin-only admin scope — RequireRole already pins these
                # to superadmin; Impersonate explicitly skips

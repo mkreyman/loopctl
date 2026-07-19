@@ -422,6 +422,13 @@ defmodule Loopctl.ObanConfig do
          # is tenant-independent. Keep in sync with the crontab assertion in
          # oban_plugins_config_test.exs.
          {"*/5 * * * *", Loopctl.Workers.ChannelPostSweeper},
+         # US-40.B1: lifecycle-aware sweep for coordination-bus CLAIMS. Reclaims
+         # ONLY done-past-retention (done_at < now - 7d) and abandoned-lease
+         # (done_at IS NULL AND lease_expires_at < now) claims — NEVER an open,
+         # unexpired claim. Distinct from the uniform channel_posts TTL sweep.
+         # Bounded per run on AdminRepo (BYPASSRLS). Keep in sync with the crontab
+         # assertion in oban_plugins_config_test.exs.
+         {"*/5 * * * *", Loopctl.Workers.ChannelClaimSweeper},
          # US-38.2: prune expired windows from the cluster-global Postgres rate
          # limiter's counter table. A cheap index-range delete; a no-op when the
          # Postgres limiter is unselected (table empty). Keep in sync with the

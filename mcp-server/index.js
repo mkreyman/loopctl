@@ -498,6 +498,49 @@ async function channelGet({ post_id }) {
   return toContent(result);
 }
 
+async function channelClaim({ project_id, ref, lease_seconds }) {
+  // Repo Coordination Bus (Epic 40, US-40.B1): INSERT-to-claim a handoff ref for
+  // EXACTLY ONE agent, on the AGENT key. The first inserter on (tenant, project,
+  // ref) wins (201); a concurrent loser gets a distinct 409 already_claimed so it
+  // learns another agent owns the ref and moves on. Agent-role, project-scoped by
+  // membership (US-40.D3), tenant/agent server-stamped from the verified key.
+  const payload = { project_id, ref };
+  if (lease_seconds) payload.lease_seconds = lease_seconds;
+  const result = await apiCall(
+    "POST",
+    "/api/v1/channel/claims",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function channelRelease({ project_id, ref }) {
+  // Repo Coordination Bus (Epic 40, US-40.B1): RELEASE (delete) your OWN claim on
+  // ref so it reopens for the next racer. Owner-scoped: a non-owner / cross-tenant /
+  // missing claim returns a byte-identical 404 (no oracle).
+  const result = await apiCall(
+    "POST",
+    "/api/v1/channel/claims/release",
+    { project_id, ref },
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function channelDone({ project_id, ref }) {
+  // Repo Coordination Bus (Epic 40, US-40.B1): mark your OWN claim on ref done
+  // (sets done_at). Owner-scoped like channel_release — a non-owner / cross-tenant /
+  // missing claim returns a byte-identical 404 (no oracle).
+  const result = await apiCall(
+    "POST",
+    "/api/v1/channel/claims/done",
+    { project_id, ref },
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function channelDelete({ post_id }) {
   // Repo Coordination Bus (Epic 39, US-39.7): HARD-delete a coordination post in
   // the caller's tenant — the redact path for a leaked/regretted post, before its
@@ -2386,6 +2429,57 @@ const TOOLS = [
         },
       },
       required: ["post_id"],
+    },
+  },
+  {
+    name: "channel_claim",
+    description:
+      "Claim a handoff ref for EXACTLY ONE agent on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key. Use this to coordinate an out-of-band unit of work (e.g. 'handoff:repo#812') among several agents racing on the same repo, so only ONE picks it up. INSERT-to-claim: the first agent to claim (tenant, project, ref) wins and gets the claim. Re-claiming YOUR OWN still-active ref is idempotent — it returns your existing claim, so a lost response / timeout is safe to retry with the same ref. A 409 already_claimed means the ref is TAKEN — either another agent owns it, or you already completed it — so do NOT retry the same ref, move on to other work. A channel IS a project_id; the claim is tenant-isolated and project-scoped by membership (you must be a writable member of the project). tenant/agent are server-stamped from your verified key. Mark the work finished with channel_done, or give it up for another agent with channel_release.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "UUID of the channel (project) the handoff belongs to.",
+        },
+        ref: {
+          type: "string",
+          description:
+            "The claimed anchor — a free string naming the unit of work, e.g. 'handoff:repo#812' (<=512 bytes). Uniqueness is on (tenant, project, ref).",
+        },
+        lease_seconds: {
+          type: "integer",
+          description:
+            "Optional lease length in seconds (default 3600, max 86400). After the lease expires without a channel_done, an abandoned-lease sweep reopens the ref for another agent.",
+        },
+      },
+      required: ["project_id", "ref"],
+    },
+  },
+  {
+    name: "channel_release",
+    description:
+      "Release (give up) YOUR OWN claim on a handoff ref on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key — deletes the claim so the ref reopens and another agent can claim it. Owner-scoped: you can only release a claim you made; a claim you do not own, or one in another tenant, or a nonexistent one, returns a byte-identical 404 (no existence oracle).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "UUID of the channel (project)." },
+        ref: { type: "string", description: "The claimed anchor to release." },
+      },
+      required: ["project_id", "ref"],
+    },
+  },
+  {
+    name: "channel_done",
+    description:
+      "Mark YOUR OWN handoff claim done on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key — sets done_at, recording that you completed the claimed work. The done claim is retained briefly (7 days) as an audit/idempotency breadcrumb, then swept. Owner-scoped: you can only mark done a claim you made; a claim you do not own, or one in another tenant, or a nonexistent one, returns a byte-identical 404 (no existence oracle).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "UUID of the channel (project)." },
+        ref: { type: "string", description: "The claimed anchor to mark done." },
+      },
+      required: ["project_id", "ref"],
     },
   },
   {
@@ -5209,6 +5303,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "channel_delete":
       return await channelDelete(args);
+
+    case "channel_claim":
+      return await channelClaim(args);
+
+    case "channel_release":
+      return await channelRelease(args);
+
+    case "channel_done":
+      return await channelDone(args);
 
     case "delete_project":
       return await deleteProject(args);
