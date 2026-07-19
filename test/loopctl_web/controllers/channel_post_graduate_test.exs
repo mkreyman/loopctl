@@ -175,6 +175,79 @@ defmodule LoopctlWeb.ChannelPostGraduateTest do
       assert AdminRepo.aggregate(from(a in "articles"), :count) == count_before
     end
 
+    # A token-shaped TAG carries a denylisted secret → 422, nothing graduated. Tags are
+    # caller-supplied and brand-new at graduation (channel_posts have no tags, so a tag
+    # never passed the creation-path denylist) and land in the same durable, tenant-wide-
+    # readable plane the scan protects. Regression for the tag smuggling vector.
+    test "a token-shaped tag carrying a secret is rejected with 422 and nothing is graduated" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = member_agent_key(tenant, project)
+
+      post = create_post(tenant, project, agent, "a perfectly benign finding")
+      count_before = AdminRepo.aggregate(from(a in "articles"), :count)
+
+      # A real GitHub PAT shape: fits Article's ^[A-Za-z0-9_-]+$ tag pattern AND fires
+      # the SecretDenylist. Title + body are clean — only the tag smuggles the secret.
+      conn =
+        authed_conn(raw)
+        |> post(graduate_path(post.id), %{
+          "title" => "Clean title",
+          "tags" => ["ops", "ghp_16C7e42F292c6912E7710c838347Ae178B4a"]
+        })
+
+      assert %{"error" => _} = json_response(conn, 422)
+      assert AdminRepo.aggregate(from(a in "articles"), :count) == count_before
+    end
+
+    # #163 — an AGENT-role graduation must scope the novelty-gate dedup to the caller's
+    # own visibility, or the near-neighbor pool (and a :duplicate re-fetch) can echo
+    # ANOTHER agent's private/owner memory id/title/status. Assert the caller's
+    # visibility_agent_id is threaded into the assessor opts.
+    test "an agent graduation threads the caller's visibility_agent_id into the novelty gate" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = member_agent_key(tenant, project)
+
+      test_pid = self()
+
+      stub(Loopctl.MockProposalAssessor, :assess, fn _t, _a, opts ->
+        send(test_pid, {:assess_opts, opts})
+        %{verdict: :novel, score: 0.0, neighbors: []}
+      end)
+
+      post = create_post(tenant, project, agent, "A scoped reusable lesson.")
+
+      conn =
+        authed_conn(raw)
+        |> post(graduate_path(post.id), %{"title" => "Scoped Lesson"})
+
+      assert json_response(conn, 201)
+      assert_received {:assess_opts, opts}
+      assert Keyword.get(opts, :visibility_agent_id) == to_string(agent.id)
+    end
+
+    # Finding 3 — the embedding backend is down: the gate falls open (:unknown) and
+    # `on_gate_unavailable: :skip` must short-circuit WITHOUT creating an un-deduplicated
+    # article. 503 + nothing graduated (mirrors the reviewed Memory graduation posture).
+    test "a fell-open novelty gate returns 503 and graduates nothing" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = member_agent_key(tenant, project)
+
+      gate_verdict(:unknown, [])
+
+      post = create_post(tenant, project, agent, "A lesson the gate cannot assess.")
+      count_before = AdminRepo.aggregate(from(a in "articles"), :count)
+
+      conn =
+        authed_conn(raw)
+        |> post(graduate_path(post.id), %{"title" => "Outage lesson"})
+
+      assert %{"error" => %{"code" => "gate_unavailable"}} = json_response(conn, 503)
+      assert AdminRepo.aggregate(from(a in "articles"), :count) == count_before
+    end
+
     # TC-40.E1.4 (tenant isolation) — a post in ANOTHER tenant → 404, no article
     # created. get_post/2 is tenant-scoped, so there is no cross-tenant oracle.
     test "graduating another tenant's post returns 404 and creates no article" do

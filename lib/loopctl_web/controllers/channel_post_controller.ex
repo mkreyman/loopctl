@@ -351,10 +351,16 @@ defmodule LoopctlWeb.ChannelPostController do
       404 =>
         {"Post not found (nonexistent, malformed id, in another tenant, or not a project member)",
          "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"Title conflicts with an existing active article that has different content",
+         "application/json", Schemas.ErrorResponse},
       422 =>
-        {"Validation error, or the body carries a denylisted secret", "application/json",
+        {"Validation error, or the title/tags/body carry a denylisted secret", "application/json",
          Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 =>
+        {"Novelty gate temporarily unavailable (embedding backend down); nothing graduated, retry",
+         "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -806,6 +812,26 @@ defmodule LoopctlWeb.ChannelPostController do
           "An article with this title already exists with different content. Choose a different " <>
             "title or update the existing article.",
         details: %{existing_article_id: existing.id}
+      }
+    })
+  end
+
+  # The novelty gate FELL OPEN (embedding backend down) and `on_gate_unavailable: :skip`
+  # short-circuited WITHOUT creating — automated graduation must not inject an
+  # un-deduplicated article during an outage. Transient server-side dependency outage →
+  # 503 so the caller retries once embeddings recover (mirrors MemoryController's
+  # graduation posture); the source post is kept and stays eligible.
+  defp render_graduation(conn, {:error, :gate_unavailable}) do
+    conn
+    |> put_status(:service_unavailable)
+    |> json(%{
+      error: %{
+        status: 503,
+        code: "gate_unavailable",
+        message:
+          "The novelty gate is temporarily unavailable (the embedding backend could not " <>
+            "assess this post), so nothing was graduated. The source post is kept — retry " <>
+            "once embeddings recover."
       }
     })
   end

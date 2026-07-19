@@ -906,18 +906,22 @@ defmodule Loopctl.Coordination do
   Returns the `propose_article/3` result unchanged on success, or `{:error,
   :not_found}` / `{:error, :unprocessable_entity, msg}` from the gates above, or a
   forwarded `{:error, :duplicate_title, %Article{}}` / `{:error,
-  %Ecto.Changeset{}}` (e.g. a missing required title).
+  %Ecto.Changeset{}}` (e.g. a missing required title). Because propose is called
+  with `on_gate_unavailable: :skip`, an embedding-backend outage returns `{:error,
+  :gate_unavailable}` WITHOUT creating an un-deduplicated article (retry once the
+  gate can assess) — matching the reviewed Memory graduation posture.
   """
   @spec graduate_post(Ecto.UUID.t(), Ecto.UUID.t(), atom(), term(), map()) ::
           {:ok, map()}
           | {:error, :not_found}
           | {:error, :unprocessable_entity, String.t()}
           | {:error, :duplicate_title, Knowledge.Article.t()}
+          | {:error, :gate_unavailable}
           | {:error, Ecto.Changeset.t()}
   def graduate_post(tenant_id, agent_id, role, post_id, %{} = params) do
     with {:ok, post} <- get_post(tenant_id, post_id),
          :ok <- project_writable_by_agent(tenant_id, agent_id, post.project_id, role),
-         :ok <- scan_graduation_content(params[:title], post.body) do
+         :ok <- scan_graduation_content(params[:title], post.body, params[:tags]) do
       attrs = %{
         title: params[:title],
         body: post.body,
@@ -933,24 +937,56 @@ defmodule Loopctl.Coordination do
         # unpublished outcome (the human-review queue).
         status: :published,
         project_id: post.project_id,
-        tags: params[:tags],
+        # `articles.tags` is NOT NULL (schema default []); casting an explicit nil
+        # overrides that default and 500s the insert, so a tag-less graduation must
+        # coalesce to [] here rather than pass nil through.
+        tags: params[:tags] || [],
         source_type: "channel_graduation",
         source_id: post.id,
         scope: :tenant
       }
 
-      Knowledge.propose_article(tenant_id, attrs, params[:audit] || [])
+      Knowledge.propose_article(tenant_id, attrs, propose_opts(agent_id, role, params))
     end
   end
 
-  # Explicit secret scan over BOTH the caller-supplied title and the post body BEFORE
-  # they reach Knowledge. Neither propose_article/3 nor create_article/3 scans, so this
-  # is the ONLY thing keeping a credential out of the durable, tenant-wide-readable
-  # knowledge plane on this path. The title is caller-supplied and lands in the durable
-  # plane just like the body, so it is scanned too — closing the adjacent smuggling
-  # vector. A hit is an explicit 422 rejection, never a silent drop.
-  defp scan_graduation_content(title, body) do
-    if SecretDenylist.contains_secret?(title) or SecretDenylist.contains_secret?(body) do
+  # Build the opts passed to `Knowledge.propose_article/3`, mirroring the reviewed
+  # sibling graduation paths (ArticleController.create + Memory graduation):
+  #
+  #   * `:visibility_agent_id` for AGENT-role callers (= the caller's agent id, #163).
+  #     The novelty-gate dedup assesses against the published corpus; WITHOUT a
+  #     visibility scope its near-neighbor pool would include OTHER agents' private/
+  #     owner memory articles, and a `:duplicate` verdict re-fetches + echoes that
+  #     article's id/title/status back to the caller — a cross-agent oracle. Scoping
+  #     the pool (and the canonical_neighbor re-fetch) to the caller's own visibility
+  #     closes the boundary #163 isolates. Higher roles (orchestrator/user/superadmin)
+  #     are trusted/observability and see everything, so no filter is applied — parity
+  #     with `LoopctlWeb.Helpers.Visibility.scope_opts/1`.
+  #   * `on_gate_unavailable: :skip` — automated graduation must NOT fall open and
+  #     inject an un-deduplicated published article during an embedding outage; it
+  #     returns `{:error, :gate_unavailable}` so the caller retries once embeddings
+  #     recover. Matches the reviewed Memory graduation posture (Memory.propose_opts/2).
+  defp propose_opts(agent_id, role, params) do
+    (params[:audit] || [])
+    |> Keyword.put(:on_gate_unavailable, :skip)
+    |> Keyword.merge(visibility_opts(agent_id, role))
+  end
+
+  defp visibility_opts(agent_id, :agent), do: [visibility_agent_id: to_string(agent_id)]
+  defp visibility_opts(_agent_id, _role), do: []
+
+  # Explicit secret scan over the caller-supplied title, the caller-supplied tags, and
+  # the post body BEFORE they reach Knowledge. Neither propose_article/3 nor
+  # create_article/3 scans, so this is the ONLY thing keeping a credential out of the
+  # durable, tenant-wide-readable knowledge plane on this path. The title AND tags are
+  # caller-supplied and brand-new at graduation (channel_posts carry no tags, so tags
+  # never passed the creation-path denylist), and they land in the durable plane just
+  # like the body — a token-shaped tag (e.g. a PAT/AWS key/Slack token, all of which fit
+  # Article's `^[A-Za-z0-9_-]+$` tag pattern) is the adjacent smuggling vector, so tags
+  # are scanned too. A hit is an explicit 422 rejection, never a silent drop.
+  defp scan_graduation_content(title, body, tags) do
+    if SecretDenylist.contains_secret?(title) or SecretDenylist.contains_secret?(body) or
+         Enum.any?(tags || [], &SecretDenylist.contains_secret?/1) do
       {:error, :unprocessable_entity,
        "graduation content contains a denylisted secret pattern; it cannot be graduated to the durable knowledge plane"}
     else
