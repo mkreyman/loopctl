@@ -875,6 +875,33 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       assert conn.status in [401, 403]
     end
+
+    # AC-40.D1.4 — the full-body :show read must be rate-limited. It is covered by
+    # the generic per-key limiter of the :authenticated pipeline (NOT the tighter
+    # write cap, which guards writes only). This asserts that guarantee actually
+    # holds for :show: once the per-key RPM budget is exhausted, further reads are
+    # 429 with a Retry-After, exactly like every other authenticated read.
+    test "over-cap :show reads are 429 with Retry-After (pipeline limiter applies)" do
+      stub_counting_limiter()
+      tenant = fixture(:tenant, %{settings: %{"rate_limit_requests_per_minute" => 2}})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = agent_key(tenant)
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent.id, %{"body" => "readable"})
+
+      # First 2 reads are within the per-key cap.
+      for _ <- 1..2 do
+        conn = authed_conn(raw) |> get(show_path(post.id))
+        assert conn.status == 200
+      end
+
+      # The 3rd read trips the per-key limiter -> 429 with a Retry-After.
+      conn = authed_conn(raw) |> get(show_path(post.id))
+      assert %{"error" => %{"status" => 429}} = json_response(conn, 429)
+      assert [retry] = get_resp_header(conn, "retry-after")
+      assert String.to_integer(retry) >= 1
+    end
   end
 
   describe "DELETE /api/v1/channel/posts/:id" do

@@ -575,15 +575,23 @@ defmodule Loopctl.CoordinationTest do
       project = fixture(:project, %{tenant_id: tenant.id})
       agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
 
-      # 2-byte codepoints so a naive byte cut at preview_bytes could split one.
-      # 400 chars = 800 bytes: over the 512-byte preview bound, within the 16KB body cap.
-      body = String.duplicate("é", 400)
+      # 3-byte codepoints so the byte cut at preview_bytes (512) lands MID-codepoint
+      # (512 = 170*3 + 2), forcing utf8_prefix/2's repair loop to drop the split
+      # trailing bytes. 300 chars = 900 bytes: over the 512-byte preview bound,
+      # within the 16KB body cap.
+      body = String.duplicate("€", 300)
       {:ok, _} = Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => body})
 
       assert [row] = Coordination.recent(tenant.id, project.id)
-      assert byte_size(row.body_preview) <= Coordination.preview_bytes()
+      # The repair loop dropped the 2 split trailing bytes: 512 is not a multiple
+      # of 3, so the valid prefix is STRICTLY under the bound (510 = 170*3), which
+      # only holds if utf8_prefix/2's else-branch actually ran.
+      assert byte_size(row.body_preview) < Coordination.preview_bytes()
+      assert byte_size(row.body_preview) == 510
       assert row.truncated == true
       assert String.valid?(row.body_preview)
+      # It is a genuine prefix of the original body (no codepoint mangled).
+      assert String.starts_with?(body, row.body_preview)
       # Encodes cleanly (a split codepoint would break Jason).
       assert {:ok, _} = Jason.encode(row.body_preview)
     end
