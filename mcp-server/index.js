@@ -2280,14 +2280,22 @@ const TOOLS = [
             "Optional per-session working-state slot key. When given, upserts the caller's slot for that key instead of appending a new post. Requires an active Claude Code session: the upsert is keyed on the auto-filled session_id (from CLAUDE_SESSION_ID), so a keyed post made outside a Claude Code session — where that env var is absent — is rejected with a 422 (session_id can't be blank). Omit key to append a plain post, which needs no session.",
         },
         refs: {
-          type: "object",
+          type: "array",
           description:
-            "Optional structured references map: { file, pr, branch, commit }.",
-          properties: {
-            file: { type: "string" },
-            pr: { type: "string" },
-            branch: { type: "string" },
-            commit: { type: "string" },
+            "Optional bounded LIST of structured reference items (max ~50 items). Each item is " +
+            "{ type, value, label? }: type is a FREE string (e.g. issue, file, pr, branch, commit, " +
+            "capability — no fixed allowlist), value is the pointer (e.g. #812, lib/fly/auth.ex:42), " +
+            "and label is an optional human note. Use one item PER reference — a handoff can point at " +
+            "many issues / file:line pairs / commits. Over the ~50-item cap is rejected (422); a " +
+            "secret or NUL byte in ANY item field (type/value/label) is also rejected (422).",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", description: "Free-form ref type (<=64 bytes)." },
+              value: { type: "string", description: "Ref value/pointer (<=512 bytes)." },
+              label: { type: "string", description: "Optional human label (<=128 bytes)." },
+            },
+            required: ["type", "value"],
           },
         },
       },

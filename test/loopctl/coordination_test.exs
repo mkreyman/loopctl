@@ -100,18 +100,25 @@ defmodule Loopctl.CoordinationTest do
       assert %{key: _} = errors_on(cs)
     end
 
-    test "accepts valid refs restricted to the allowlist" do
+    test "accepts a typed-open refs list and round-trips it through the DB" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
 
+      refs = [
+        %{"type" => "pr", "value" => "107"},
+        %{"type" => "branch", "value" => "epic-39-us-39.1"}
+      ]
+
       assert {:ok, post} =
                Coordination.create_post(tenant.id, project.id, agent_id, %{
                  "body" => "see the fix",
-                 "refs" => %{"pr" => "107", "branch" => "epic-39-us-39.1"}
+                 "refs" => refs
                })
 
-      assert post.refs == %{"pr" => "107", "branch" => "epic-39-us-39.1"}
+      assert post.refs == refs
+      # persisted list survives a fresh read (RefsList.load round-trip)
+      assert [%ChannelPost{refs: ^refs}] = Coordination.recent(tenant.id, project.id)
     end
   end
 
