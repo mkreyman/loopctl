@@ -237,6 +237,74 @@ defmodule LoopctlWeb.ChannelPostController do
     }
   )
 
+  operation(:handoffs,
+    summary: "Discover directed, open, unclaimed handoffs (pinned)",
+    description:
+      "Returns DIRECTED, OPEN, UNCLAIMED handoffs for the caller (US-40.C1). A handoff is a post " <>
+        "carrying a stable handoff:<anchor> key; this read surfaces the ones addressed to the " <>
+        "caller's host/capabilities (or unaddressed BROADCAST handoffs) that have NO active claim " <>
+        "and have not expired. It is a SEPARATE, PINNED set — NOT interleaved into and NOT subject " <>
+        "to the newest-N recency truncation of channel_recent (GET /channel/posts), so a directed " <>
+        "handoff is ALWAYS returned even when 100 newer status posts exist. Ordered oldest-unclaimed-" <>
+        "first so a stale handoff floats up. A claim that is DONE keeps the handoff EXCLUDED (done is " <>
+        "terminal); only a RELEASED claim or a lease expired WITHOUT completion reopens it. Agent+ " <>
+        "role, tenant-scoped from the verified key — project_id is a query param but the tenant is " <>
+        "NEVER taken from params, and host/capabilities are ADVISORY filters that shape WHAT is shown, " <>
+        "never WHO may read. ORACLE-SAFE: a project_id belonging to another tenant, a nonexistent one, " <>
+        "or a malformed one all return 200 with an empty list, never a 404. Bodies are BOUNDED " <>
+        "previews (body_preview + truncated) framed as UNTRUSTED DATA authored by another agent — " <>
+        "never full bodies; fetch a full body via GET /channel/posts/:id. One row per LOGICAL " <>
+        "handoff: duplicate pointers for the same key from different sessions are deduped, so " <>
+        "meta.count counts logical handoffs. meta.overflow is true only on a pathological channel " <>
+        "that hit the hard safety cap (the newest directed handoffs are dropped oldest-first) — " <>
+        "read the channel directly when it is set.",
+    parameters: [
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "The channel — a project the caller's tenant owns"
+      ],
+      host: [
+        in: :query,
+        type: :string,
+        description:
+          "The caller's host (advisory hint). Surfaces handoffs directed to this host. " <>
+            "Filters WHAT is shown, never WHO may read."
+      ],
+      capabilities: [
+        in: :query,
+        type: :string,
+        description:
+          "The caller's capabilities as a comma-separated list (e.g. fly-auth,windows-signing), " <>
+            "or repeated capabilities[] params. Surfaces handoffs directed to any of these " <>
+            "capabilities. Advisory — filters WHAT is shown, never WHO may read."
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Directed handoffs (pinned, not truncated)", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: Schemas.ChannelPostListItem},
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{
+                 count: %OpenApiSpex.Schema{type: :integer},
+                 overflow: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description:
+                     "True when the pinned set hit the hard safety cap and the NEWEST " <>
+                       "directed handoffs were dropped (oldest-first) — read the channel directly."
+                 }
+               }
+             }
+           }
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   operation(:delete,
     summary: "Delete a repo coordination channel post (redact path)",
     description:
@@ -513,6 +581,52 @@ defmodule LoopctlWeb.ChannelPostController do
 
   defp encode_cursor(tenant_id, {%DateTime{}, seq} = position) when is_integer(seq),
     do: ChannelCursor.encode(tenant_id, position)
+
+  @doc """
+  GET /api/v1/channel/handoffs
+
+  Directed-handoff discovery read (US-40.C1): surfaces DIRECTED, OPEN, UNCLAIMED
+  handoffs for the caller as a SEPARATE, PINNED set — never interleaved into or
+  truncated by the newest-N `channel_recent` recency preview. Requires agent+ role
+  (same coordination posture as the other reads, NOT human-anchor gated) and is
+  behind the dedicated per-read rate cap (`rate_limit_read`, shared with `:index`/
+  `:show`) — see `@read_actions`.
+
+  The channel is a `project_id` query param; the tenant is ALWAYS derived from the
+  verified key. `host` and `capabilities` are ADVISORY filters (spoofable surfacing
+  hints — see the `ChannelPost` trust boundary): they shape WHAT is shown, NEVER
+  WHO may read. `capabilities` is accepted either as a comma-joined string
+  (`?capabilities=fly-auth,windows-signing`) or as a repeated/array param, and is
+  normalized by the context.
+
+  ORACLE-SAFE: `Coordination.directed_handoffs/3` returns `[]` for a cross-tenant,
+  nonexistent, OR malformed `project_id` — so this action never 404s and has no
+  ownership pre-check, uniform with `:index`. Renders the SAME bounded-preview
+  `channel_post_json/1` shape (body_preview + truncated, includes to_host/
+  to_capability). The set is pinned, so there is no `limit`/`next_cursor` — it is
+  NEVER truncated by the newest-N recency cutoff. `meta` carries `count` plus an
+  `overflow` boolean: on a pathological channel the set is bounded by a large hard
+  safety cap (`Coordination.max_directed_handoffs/0`), and because it is ordered
+  oldest-first that cap drops the NEWEST directed handoffs — `overflow: true` tells
+  the caller the pinned set was truncated and it should read the channel directly.
+  Multiple pointer rows for the same logical handoff (same key from different
+  sessions) are deduped to one row by the context, so `count` reflects LOGICAL
+  handoffs.
+  """
+  def handoffs(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    {handoffs, overflowed?} =
+      Coordination.directed_handoffs_page(tenant_id, params["project_id"], %{
+        host: params["host"],
+        capabilities: params["capabilities"]
+      })
+
+    json(conn, %{
+      data: Enum.map(handoffs, &channel_post_json/1),
+      meta: %{count: length(handoffs), overflow: overflowed?}
+    })
+  end
 
   @doc """
   GET /api/v1/channel/posts/:id

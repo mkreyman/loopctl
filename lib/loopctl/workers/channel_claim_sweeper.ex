@@ -7,10 +7,27 @@ defmodule Loopctl.Workers.ChannelClaimSweeper do
   a claim sweep is LIFECYCLE-AWARE and MUST NEVER delete an OPEN, unexpired claim —
   doing so would silently steal a handoff a live agent still holds. It removes ONLY:
 
-    * **DONE claims past retention** — `done_at IS NOT NULL AND done_at < now() -
-      #{7}d` (`Coordination.claim_done_retention_days/0` is the single source of
-      truth). A done claim is kept briefly as an audit/idempotency breadcrumb, then
-      reaped.
+    * **DONE claims past retention, WHOSE HANDOFF POST IS NO LONGER LIVE** —
+      `done_at IS NOT NULL AND done_at < now() - #{7}d`
+      (`Coordination.claim_done_retention_days/0` is the single source of truth)
+      **AND** no live `channel_posts` row shares the claim's `ref`
+      (`NOT EXISTS (post WHERE key = claim.ref AND expires_at > now())`, same
+      tenant/project). A done claim is kept as an audit/idempotency breadcrumb for
+      at least the retention window AND for as long as the handoff post it
+      terminates is still discoverable, then reaped.
+
+      The live-post guard is the TERMINAL-GUARANTEE COUPLING (US-40.C1, high
+      finding). `Coordination.directed_handoffs/3` encodes a completed handoff's
+      terminality SOLELY through the presence of its DONE claim row (the correlated
+      `NOT EXISTS(active_claim)`: `channel_claims.ref = channel_posts.key`). If this
+      sweeper reaped that DONE claim while the post was still live (posts live 30d
+      via `Coordination.retention_days/0`; a DONE claim's own 7d retention is far
+      shorter, AND the upsert FULL-REPLACE path can even RE-EXTEND a post's
+      `expires_at`), the freed `(tenant_id, project_id, ref)` slot would let the
+      finished handoff both REAPPEAR in the pinned discovery set and accept a fresh
+      re-claim (double-done). Retaining the DONE claim while ANY live post shares
+      its ref makes "a DONE handoff never reappears" DURABLY true for the post's
+      whole life, without coupling two independent numeric retentions.
     * **Abandoned leases** — `done_at IS NULL AND lease_expires_at < now()`. The
       claimant's lease expired without a `done`, so the ref REOPENS for the next
       racer (the deleted row frees the `(tenant_id, project_id, ref)` unique slot).
@@ -39,6 +56,7 @@ defmodule Loopctl.Workers.ChannelClaimSweeper do
   alias Loopctl.AdminRepo
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelClaim
+  alias Loopctl.Coordination.ChannelPost
 
   @batch_size 1000
 
@@ -56,13 +74,17 @@ defmodule Loopctl.Workers.ChannelClaimSweeper do
     limit = batch_limit(args)
 
     # The lifecycle-aware reclaim predicate (AC-40.B1.4): a DONE claim past retention
-    # OR an abandoned (expired-lease, not-done) claim. NEVER an open, unexpired claim
-    # (`done_at IS NULL AND lease_expires_at >= now()` is excluded by construction).
+    # WHOSE handoff post is no longer live, OR an abandoned (expired-lease, not-done)
+    # claim. NEVER an open, unexpired claim (`done_at IS NULL AND
+    # lease_expires_at >= now()` is excluded by construction), and NEVER a DONE claim
+    # while a live post still shares its ref (the terminal-guarantee coupling — see
+    # the moduledoc and `live_post_exists/1`).
     ids =
-      ChannelClaim
+      from(c in ChannelClaim, as: :claim)
       |> where(
         [c],
-        (not is_nil(c.done_at) and c.done_at < ^done_cutoff) or
+        (not is_nil(c.done_at) and c.done_at < ^done_cutoff and
+           not exists(live_post_exists(now))) or
           (is_nil(c.done_at) and c.lease_expires_at < ^now)
       )
       |> select([c], c.id)
@@ -85,6 +107,24 @@ defmodule Loopctl.Workers.ChannelClaimSweeper do
 
         :ok
     end
+  end
+
+  # Correlated NOT-EXISTS probe for a LIVE handoff post sharing this claim's ref —
+  # the same `channel_claims.ref = channel_posts.key` (+ tenant/project) correlation
+  # `Coordination.directed_handoffs/3` uses to gate discovery. While such a post is
+  # live (`expires_at > now`), the DONE claim that makes it terminal must be RETAINED
+  # so the finished handoff can neither reappear nor accept a re-claim. `parent_as(:claim)`
+  # correlates to the outer sweep query's `:claim` binding. A claim whose ref matches
+  # no live post (an already-expired handoff, or a non-handoff ref) is unguarded and
+  # reaps normally on the retention window.
+  defp live_post_exists(now) do
+    from(p in ChannelPost,
+      where:
+        p.tenant_id == parent_as(:claim).tenant_id and
+          p.project_id == parent_as(:claim).project_id and
+          p.key == parent_as(:claim).ref and
+          p.expires_at > ^now
+    )
   end
 
   # Clamped to @batch_size: the selected ids are passed as an explicit list to

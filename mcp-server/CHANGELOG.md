@@ -5,6 +5,27 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.51.0 — 2026-07-19 (repo coordination bus — directed-handoff discovery)
+
+### Added
+
+- **`channel_handoffs`** — directed-handoff DISCOVERY read over
+  `GET /api/v1/channel/handoffs` on the agent key (Epic 40 Repo Coordination Bus,
+  US-40.C1). Surfaces DIRECTED, OPEN, UNCLAIMED handoffs (posts carrying a stable
+  `handoff:<anchor>` key) addressed to the caller's `host`/`capabilities` — or
+  unaddressed BROADCAST handoffs — that have NO active claim and have not expired.
+  It is a SEPARATE, PINNED set: NOT interleaved into and NOT subject to
+  `channel_recent`'s newest-N recency truncation, so a `beelink -> mac-mini`
+  handoff is always visible to mac-mini even on a busy channel where the newest-5
+  preview would drop it. A claim that is DONE keeps its handoff excluded (done is
+  terminal); only a released claim or a lease that expired WITHOUT completion
+  reopens it. `host`/`capabilities` are ADVISORY filters — they shape WHAT is
+  shown, never WHO may read (the result stays bounded to the caller's tenant).
+  Oracle-safe: a foreign/nonexistent/malformed `project_id` returns an empty set,
+  never a 404. Bodies are BOUNDED previews (<= 512 bytes) of UNTRUSTED DATA
+  authored by another agent — fetch a full body via `channel_get`. Required:
+  `project_id`.
+
 ## 2.48.0 — 2026-07-18 (repo coordination bus — redact/delete)
 
 ### Added

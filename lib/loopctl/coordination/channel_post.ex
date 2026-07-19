@@ -29,7 +29,11 @@ defmodule Loopctl.Coordination.ChannelPost do
       SAME-SESSION re-fire (a retry) refreshes the SAME row — no duplicate. This
       dedups the same-session retry ONLY: a re-fire from a DIFFERENT session
       (offline-reconcile) has a different `session_id` and creates a SEPARATE
-      pointer row; that duplicate pointer is TOLERATED (harmless noise). The
+      pointer row. At WRITE time that duplicate pointer is tolerated (it is a real,
+      independently-attributed row), but the directed-handoff discovery READ
+      (`Coordination.directed_handoffs/3`) collapses same-key pointers with
+      `DISTINCT ON (key)`, so the pinned set surfaces ONE row per logical handoff —
+      the duplicate never inflates the read or its `meta.count`. The
       `handoff:<anchor>` format is a CLIENT-SIDE convention (the /handoff skill) —
       the server does NOT validate it, only treats it as an ordinary slot key. The
       CLAIM (US-40.B1, keyed on `ref`, claimant-independent) — NOT this pointer — is

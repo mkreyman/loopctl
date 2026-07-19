@@ -8,7 +8,23 @@ defmodule Loopctl.Workers.ChannelClaimSweeperTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelClaim
+  alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Workers.ChannelClaimSweeper
+
+  # A live handoff post whose stable key IS the claim's ref (the
+  # `channel_claims.ref = channel_posts.key` correlation directed_handoffs/3 gates on).
+  defp live_handoff_post(tenant, project, ref) do
+    now = DateTime.utc_now()
+
+    AdminRepo.insert!(%ChannelPost{
+      tenant_id: tenant.id,
+      project_id: project.id,
+      agent_id: fixture(:agent, %{tenant_id: tenant.id}).id,
+      body: "please pick up this handoff",
+      key: ref,
+      expires_at: DateTime.add(now, Coordination.retention_days() * 86_400, :second)
+    })
+  end
 
   # A DONE claim older than the retention window (done_at < now - 7d).
   defp done_and_old(ctx) do
@@ -134,6 +150,69 @@ defmodule Loopctl.Workers.ChannelClaimSweeperTest do
 
       assert :ok = ChannelClaimSweeper.perform(%Oban.Job{args: %{"limit" => 70_000}})
       assert live_count(tenant) == 0
+    end
+
+    # US-40.C1 terminal-guarantee coupling (regression for the double-done finding):
+    # a DONE claim past its 7d retention MUST NOT be reaped while the 30d handoff post
+    # it terminates is still live — otherwise the freed unique slot would let the
+    # finished handoff reappear in directed_handoffs/3 AND accept a fresh re-claim.
+    test "keeps a done+old claim while its handoff post is still live (terminal guarantee)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      ref = "handoff:still-live"
+
+      # DONE and well past the 7d claim retention...
+      old_done = done_and_old(Map.put(base(tenant, project), :ref, ref))
+      # ...but the handoff post it terminates is still live (30d TTL).
+      post = live_handoff_post(tenant, project, ref)
+
+      assert :ok = ChannelClaimSweeper.perform(%Oban.Job{args: %{}})
+
+      # The DONE claim is RETAINED — its terminal signal must outlive the live post.
+      refute is_nil(AdminRepo.get(ChannelClaim, old_done.id))
+
+      # The handoff stays terminal in the discovery read: it does NOT reappear.
+      assert [] ==
+               Coordination.directed_handoffs(tenant.id, project.id, %{})
+
+      # Sanity: the post is genuinely still live (the exclusion is the claim, not expiry).
+      refute is_nil(AdminRepo.get(ChannelPost, post.id))
+    end
+
+    test "reaps a done+old claim once its handoff post has expired (post no longer live)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      ref = "handoff:expired-post"
+
+      old_done = done_and_old(Map.put(base(tenant, project), :ref, ref))
+
+      # An EXPIRED post sharing the ref — no longer live, so no terminal guard applies.
+      now = DateTime.utc_now()
+
+      AdminRepo.insert!(%ChannelPost{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        agent_id: fixture(:agent, %{tenant_id: tenant.id}).id,
+        body: "expired handoff",
+        key: ref,
+        expires_at: DateTime.add(now, -60, :second)
+      })
+
+      assert :ok = ChannelClaimSweeper.perform(%Oban.Job{args: %{}})
+
+      # The breadcrumb window has passed AND no live post guards it → reaped.
+      assert is_nil(AdminRepo.get(ChannelClaim, old_done.id))
+    end
+
+    test "still reaps a done+old claim whose ref matches no post at all (non-handoff ref)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # A DONE+old claim on a ref with no corresponding post — unguarded, reaps normally.
+      old_done = done_and_old(Map.put(base(tenant, project), :ref, "handoff:no-post"))
+
+      assert :ok = ChannelClaimSweeper.perform(%Oban.Job{args: %{}})
+      assert is_nil(AdminRepo.get(ChannelClaim, old_done.id))
     end
 
     test "sweeps across all tenants in one run (BYPASSRLS, tenant-independent predicate)" do
