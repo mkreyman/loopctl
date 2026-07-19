@@ -955,16 +955,50 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert entry.action == "deleted"
     end
 
-    # TC-39.7.2: any agent B in the same tenant can delete agent A's post.
-    test "agent B in the same tenant deletes agent A's post -> 204, audit actor is B's key" do
+    # TC-40.D2.2: a non-author agent B (role :agent) may NOT delete agent A's post.
+    test "agent B (role :agent) deleting agent A's post -> 404 (byte-identical to nonexistent), A's post untouched" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       {_raw_a, _key_a, agent_a} = agent_key(tenant)
-      {raw_b, key_b, _agent_b} = agent_key(tenant)
+      {raw_b, _key_b, _agent_b} = agent_key(tenant)
 
       post = seed_channel_post(tenant, project, agent_a.id, "from A")
 
-      conn = authed_conn(raw_b) |> delete(delete_path(post.id))
+      # US-40.D2 kills the censor-and-replace vector: a non-author agent gets a 404
+      # byte-identical to the nonexistent-post 404 (no existence oracle).
+      cross = authed_conn(raw_b) |> delete(delete_path(post.id))
+      nonexistent = authed_conn(raw_b) |> delete(delete_path(Ecto.UUID.generate()))
+
+      assert cross.status == 404
+      assert nonexistent.status == 404
+      assert cross.resp_body == nonexistent.resp_body
+
+      # A's post is untouched, and no "deleted" audit row was written.
+      assert %ChannelPost{} = AdminRepo.get(ChannelPost, post.id)
+
+      assert AdminRepo.aggregate(
+               from(a in AuditLog,
+                 where:
+                   a.entity_type == "channel_post" and a.entity_id == ^post.id and
+                     a.action == "deleted"
+               ),
+               :count,
+               :id
+             ) == 0
+    end
+
+    # TC-40.D2.3: an elevated (role :user) caller CAN delete another agent's post.
+    test "a role :user caller deleting agent A's post -> 204, audit actor is the elevated key" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {_raw_a, _key_a, agent_a} = agent_key(tenant)
+      # An elevated (>= :user) operator key — still carries an agent identity so it
+      # is the audit actor.
+      {raw_user, key_user, elevated_agent} = agent_key(tenant, %{role: :user})
+
+      post = seed_channel_post(tenant, project, agent_a.id, "from A")
+
+      conn = authed_conn(raw_user) |> delete(delete_path(post.id))
       assert response(conn, 204) == ""
 
       entry =
@@ -976,9 +1010,10 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
           )
         )
 
-      # The deleting key (B) is the audit actor — not the post's author (A).
-      assert entry.actor_id == key_b.id
+      # The elevated deleting key is the audit actor — not the post's author (A).
+      assert entry.actor_id == key_user.id
       assert entry.metadata["deleted_post_agent_id"] == agent_a.id
+      assert entry.metadata["deleted_by_agent_id"] == elevated_agent.id
     end
 
     # TC-39.7.3: cross-tenant delete → 404, the other tenant's post still exists.

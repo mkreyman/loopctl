@@ -960,7 +960,7 @@ defmodule Loopctl.CoordinationTest do
     end
   end
 
-  describe "delete_post/3" do
+  describe "delete_post/5" do
     setup do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
@@ -975,14 +975,17 @@ defmodule Loopctl.CoordinationTest do
       %{tenant: tenant, project: project, agent_id: agent_id, audit: audit}
     end
 
-    test "deletes a post in the tenant, removes it from recent, writes a 'deleted' audit row (TC-39.7.1)",
+    test "the author deletes their OWN post, removes it from recent, writes a 'deleted' audit row (TC-40.D2.1)",
          ctx do
       %{tenant: tenant, project: project, agent_id: agent_id, audit: audit} = ctx
 
       {:ok, post} =
         Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "oops, a secret"})
 
-      assert {:ok, deleted} = Coordination.delete_post(tenant.id, agent_id, post.id, audit)
+      # Author (agent_id) deletes their own post — role :agent is sufficient.
+      assert {:ok, deleted} =
+               Coordination.delete_post(tenant.id, agent_id, :agent, post.id, audit)
+
       assert deleted.id == post.id
 
       # Row is gone.
@@ -997,7 +1000,7 @@ defmodule Loopctl.CoordinationTest do
       assert entry.metadata["deleted_post_agent_id"] == agent_id
     end
 
-    test "any agent B in the same tenant may delete agent A's post; audit actor is B (TC-39.7.2)",
+    test "a non-author agent B (role :agent) may NOT delete agent A's post; gets {:error, :not_found}, A's post survives (TC-40.D2.2)",
          ctx do
       %{tenant: tenant, project: project, agent_id: agent_a} = ctx
       agent_b = fixture(:agent, %{tenant_id: tenant.id}).id
@@ -1011,15 +1014,86 @@ defmodule Loopctl.CoordinationTest do
         actor_label: "agent:agent-b"
       ]
 
-      assert {:ok, _deleted} = Coordination.delete_post(tenant.id, agent_b, post.id, audit_b)
+      # US-40.D2 kills the censor-and-replace vector: a non-author agent gets the
+      # SAME {:error, :not_found} a missing post returns — no existence oracle.
+      assert {:error, :not_found} =
+               Coordination.delete_post(tenant.id, agent_b, :agent, post.id, audit_b)
+
+      # A's post survives untouched, and no audit "deleted" row was written.
+      assert %ChannelPost{} = AdminRepo.get(ChannelPost, post.id)
+
+      assert AdminRepo.aggregate(
+               from(a in AuditLog,
+                 where: a.entity_type == "channel_post" and a.entity_id == ^post.id
+               ),
+               :count,
+               :id
+             ) == 0
+    end
+
+    test "an elevated (role :user) caller CAN delete agent A's post; audit actor is the elevated caller (TC-40.D2.3)",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_a} = ctx
+      elevated_agent = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_a, %{"body" => "from A"})
+
+      audit_user = [
+        actor_type: "api_key",
+        actor_id: Ecto.UUID.generate(),
+        actor_label: "user:operator"
+      ]
+
+      # The elevated-role escape hatch (>= :user): an operator can clean up a leak
+      # the author cannot (author's session gone).
+      assert {:ok, _deleted} =
+               Coordination.delete_post(tenant.id, elevated_agent, :user, post.id, audit_user)
+
       assert is_nil(AdminRepo.get(ChannelPost, post.id))
 
       entry = one_audit_entry(tenant.id, post.id)
       assert entry.action == "deleted"
-      # The DELETING agent (B) is the audit actor — distinct from the author (A).
-      assert entry.actor_label == "agent:agent-b"
+      # The elevated DELETING actor is the audit actor — distinct from the author (A).
+      assert entry.actor_label == "user:operator"
       assert entry.metadata["deleted_post_agent_id"] == agent_a
-      assert entry.metadata["deleted_by_agent_id"] == agent_b
+      assert entry.metadata["deleted_by_agent_id"] == elevated_agent
+    end
+
+    test "an orchestrator (role :orchestrator) non-author may NOT delete agent A's post; the gate draws at :user, not :orchestrator (TC-40.D2.4)",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_a} = ctx
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      {:ok, post} =
+        Coordination.create_post(tenant.id, project.id, agent_a, %{"body" => "from A"})
+
+      audit_orch = [
+        actor_type: "api_key",
+        actor_id: Ecto.UUID.generate(),
+        actor_label: "orchestrator:orch"
+      ]
+
+      # The elevated bypass in authorized_to_delete?/3 requires role_at_least?(role,
+      # :user). orchestrator(2) < user(3), so an orchestrator sits ABOVE the route's
+      # RequireRole :agent floor (it reaches this context) but BELOW the :user gate:
+      # it is a non-author with an insufficient role and must be DENIED. This pins the
+      # exact threshold — a regression loosening the gate to :orchestrator (letting an
+      # orchestrator censor any agent's post, the vector this story kills) would flip
+      # this to {:ok, _} and fail here.
+      assert {:error, :not_found} =
+               Coordination.delete_post(tenant.id, orch_agent, :orchestrator, post.id, audit_orch)
+
+      # A's post survives untouched, and no audit "deleted" row was written.
+      assert %ChannelPost{} = AdminRepo.get(ChannelPost, post.id)
+
+      assert AdminRepo.aggregate(
+               from(a in AuditLog,
+                 where: a.entity_type == "channel_post" and a.entity_id == ^post.id
+               ),
+               :count,
+               :id
+             ) == 0
     end
 
     test "a cross-tenant post id returns {:error, :not_found} and the foreign row still exists (TC-39.7.3)",
@@ -1033,7 +1107,7 @@ defmodule Loopctl.CoordinationTest do
         Coordination.create_post(other.id, other_project.id, other_agent, %{"body" => "theirs"})
 
       assert {:error, :not_found} =
-               Coordination.delete_post(tenant.id, agent_id, foreign_post.id, audit)
+               Coordination.delete_post(tenant.id, agent_id, :agent, foreign_post.id, audit)
 
       # The other tenant's post is untouched.
       assert %ChannelPost{} = AdminRepo.get(ChannelPost, foreign_post.id)
@@ -1043,14 +1117,14 @@ defmodule Loopctl.CoordinationTest do
       %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
 
       assert {:error, :not_found} =
-               Coordination.delete_post(tenant.id, agent_id, Ecto.UUID.generate(), audit)
+               Coordination.delete_post(tenant.id, agent_id, :agent, Ecto.UUID.generate(), audit)
     end
 
     test "a malformed (non-UUID) post id returns {:error, :not_found}, never a CastError", ctx do
       %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
 
       assert {:error, :not_found} =
-               Coordination.delete_post(tenant.id, agent_id, "not-a-uuid", audit)
+               Coordination.delete_post(tenant.id, agent_id, :agent, "not-a-uuid", audit)
     end
 
     test "tenant isolation: deleting with the wrong tenant_id does not remove the row", ctx do
@@ -1062,7 +1136,7 @@ defmodule Loopctl.CoordinationTest do
 
       # Same post id, but scoped to a different tenant → not found, row intact.
       assert {:error, :not_found} =
-               Coordination.delete_post(other.id, agent_id, post.id, audit)
+               Coordination.delete_post(other.id, agent_id, :agent, post.id, audit)
 
       assert %ChannelPost{} = AdminRepo.get(ChannelPost, post.id)
     end
@@ -1074,15 +1148,17 @@ defmodule Loopctl.CoordinationTest do
       {:ok, post} =
         Coordination.create_post(tenant.id, project.id, agent_id, %{"body" => "race"})
 
-      assert {:ok, _deleted} = Coordination.delete_post(tenant.id, agent_id, post.id, audit)
+      assert {:ok, _deleted} =
+               Coordination.delete_post(tenant.id, agent_id, :agent, post.id, audit)
 
-      # The fleet-wide "whoever notices a leaked secret" model makes two agents
-      # deleting the SAME post a first-class case. A second delete of the now-gone
-      # row must be an idempotent 404 — never an Ecto.StaleEntryError/500. (This is
-      # the caller-visible half of the concurrent race: run_delete/4's rescue
-      # collapses a true TOCTOU stale DELETE to the identical outcome.)
+      # The author re-deleting their own now-gone post is a first-class idempotency
+      # case (and a stand-in for the TOCTOU race where the row vanishes between the
+      # fetch and the Multi.delete). A second delete of the now-gone row must be an
+      # idempotent 404 — never an Ecto.StaleEntryError/500. (This is the
+      # caller-visible half of the concurrent race: run_delete/4's rescue collapses
+      # a true TOCTOU stale DELETE to the identical outcome.)
       assert {:error, :not_found} =
-               Coordination.delete_post(tenant.id, agent_id, post.id, audit)
+               Coordination.delete_post(tenant.id, agent_id, :agent, post.id, audit)
     end
 
     test "an audit-step failure rolls back the delete and returns {:error, :audit_write_failed} (fail-safe, never a masking 404)",
@@ -1102,7 +1178,7 @@ defmodule Loopctl.CoordinationTest do
       bad_audit = [actor_type: nil, actor_id: Ecto.UUID.generate(), actor_label: "x"]
 
       assert {:error, :audit_write_failed} =
-               Coordination.delete_post(tenant.id, agent_id, post.id, bad_audit)
+               Coordination.delete_post(tenant.id, agent_id, :agent, post.id, bad_audit)
 
       # Transaction rolled back: the post survives and no audit row was written.
       assert %ChannelPost{} = AdminRepo.get(ChannelPost, post.id)

@@ -501,9 +501,10 @@ async function channelGet({ post_id }) {
 async function channelDelete({ post_id }) {
   // Repo Coordination Bus (Epic 39, US-39.7): HARD-delete a coordination post in
   // the caller's tenant — the redact path for a leaked/regretted post, before its
-  // 30-day TTL. Agent-role, tenant-scoped: any agent in the tenant may delete any
-  // post in that tenant; a foreign or nonexistent id returns a 404 (no cross-tenant
-  // existence oracle).
+  // 30-day TTL. Author-only (or elevated role >= user), US-40.D2: you may delete
+  // only your OWN post (server-stamped agent_id) unless your key holds an elevated
+  // role. A non-author agent — like a foreign or nonexistent id — returns a
+  // byte-identical 404 (no existence oracle).
   const result = await apiCall(
     "DELETE",
     `/api/v1/channel/posts/${post_id}`,
@@ -2375,7 +2376,7 @@ const TOOLS = [
   {
     name: "channel_delete",
     description:
-      "Delete a post from a repo coordination channel (Epic 39 Repo Coordination Bus) on the agent key — the redact path (US-39.7). Use this to immediately remove a leaked or regretted post (e.g. one that slipped a secret past the denylist) before its 30-day TTL. Agent-role, tenant-scoped: any agent in your tenant may delete any post in that tenant, enabling cleanup by whoever notices the leak. A post that does not exist in your tenant (including one in another tenant) returns a 404 — no cross-tenant existence oracle. The deletion is hard (the row is gone) but audited.",
+      "Delete a post from a repo coordination channel (Epic 39 Repo Coordination Bus) on the agent key — the redact path (US-39.7). Use this to immediately pull back your OWN leaked or regretted post (e.g. one that slipped a secret past the denylist) before its 30-day TTL. Author-only (or elevated role >= user), US-40.D2 — the redact path is for self-leak-pullback, NOT fleet-wide cleanup: you may delete only a post you authored (server-stamped agent_id), unless your key holds an elevated role (an operator escape hatch for cleaning up a leak whose author's session is gone). A post you may not delete — a peer's post, or one that does not exist in your tenant (including another tenant's) — returns a byte-identical 404 (no existence oracle). The deletion is hard (the row is gone) but audited.",
     inputSchema: {
       type: "object",
       properties: {
