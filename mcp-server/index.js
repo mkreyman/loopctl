@@ -437,7 +437,7 @@ async function restoreKbScope({ project_id }) {
   return toContent(result);
 }
 
-async function channelPost({ project_id, body, key, refs }) {
+async function channelPost({ project_id, body, key, refs, to_host, to_capability }) {
   // Repo Coordination Bus (Epic 39): post a coordination message to a channel
   // (a channel IS a project_id — a work project or a kb scope). Agent-role, RLS
   // tenant-scoped — posting to your own tenant's channel is coordination, NOT
@@ -445,6 +445,12 @@ async function channelPost({ project_id, body, key, refs }) {
   const payload = { project_id, body };
   if (key) payload.key = key;
   if (refs) payload.refs = refs;
+  // Advisory, SPOOFABLE, surfacing-only addressing (US-40.A5): these label a
+  // post's intended target (a host or, primarily, a capability). They are caller
+  // args (NOT auto-filled like host/session_id) and are read only as a discovery
+  // hint by 40.C1 directed discovery — NEVER for authorization or delivery.
+  if (to_host) payload.to_host = to_host;
+  if (to_capability) payload.to_capability = to_capability;
   // host + session_id are proxy-filled (NOT caller args). host from os.hostname();
   // session_id from CLAUDE_SESSION_ID (the SAME id SessionStart sees) so US-39.6
   // self-dedup can skip a session's own echoed posts. Omit session_id entirely when
@@ -2265,7 +2271,7 @@ const TOOLS = [
   {
     name: "channel_post",
     description:
-      "Post a message to a repo coordination channel (Epic 39 Repo Coordination Bus) on the agent key. A channel IS a project_id (a work project or a kb scope); posts are tenant-isolated by RLS. This is an agent-role COORDINATION surface, not chain-of-custody — posting to your own tenant's channel is not self-approval. host is auto-filled from the proxy's os.hostname() and session_id is auto-filled from the Claude Code session id (both proxy-supplied, informational only — do NOT pass them). Provide a key to upsert your per-session working-state slot (200) instead of appending a new post (201); omit it to append.",
+      "Post a message to a repo coordination channel (Epic 39 Repo Coordination Bus) on the agent key. A channel IS a project_id (a work project or a kb scope); posts are tenant-isolated by RLS. This is an agent-role COORDINATION surface, not chain-of-custody — posting to your own tenant's channel is not self-approval. host is auto-filled from the proxy's os.hostname() and session_id is auto-filled from the Claude Code session id (both proxy-supplied, informational only — do NOT pass them). Provide a key to upsert your per-session working-state slot (200) instead of appending a new post (201); omit it to append. OPTIONAL advisory addressing: set to_capability (preferred) and/or to_host to LABEL a post's intended target (e.g. to_capability 'fly auth'). These are ADVISORY / SURFACING-ONLY and SPOOFABLE — a discovery hint that 40.C1 reads to surface directed-to-me posts, NEVER authorization, ownership, or a delivery guarantee. They gate nothing; a post with no addressing stays a broadcast visible to everyone on the channel.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2278,6 +2284,16 @@ const TOOLS = [
           type: "string",
           description:
             "Optional per-session working-state slot key. When given, upserts the caller's slot for that key instead of appending a new post. Requires an active Claude Code session: the upsert is keyed on the auto-filled session_id (from CLAUDE_SESSION_ID), so a keyed post made outside a Claude Code session — where that env var is absent — is rejected with a 422 (session_id can't be blank). Omit key to append a plain post, which needs no session.",
+        },
+        to_capability: {
+          type: "string",
+          description:
+            "Optional ADVISORY / SURFACING-ONLY target capability, e.g. 'fly auth' (<=128 bytes). Preferred over to_host. SPOOFABLE — a discovery hint that 40.C1 reads to surface directed-to-me posts, NEVER authorization, ownership, or a delivery guarantee. Gates nothing.",
+        },
+        to_host: {
+          type: "string",
+          description:
+            "Optional ADVISORY / SURFACING-ONLY target host, e.g. 'mac-mini' (<=255 bytes). SPOOFABLE — a discovery hint only, NEVER authorization, ownership, or a delivery guarantee. Prefer to_capability when the real target is a capability rather than a machine.",
         },
         refs: {
           type: "array",

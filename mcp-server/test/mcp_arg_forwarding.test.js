@@ -174,6 +174,27 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
     );
   });
 
+  test("channelPost forwards advisory to_host/to_capability only when set (US-40.A5)", () => {
+    // to_host/to_capability are caller args (unlike auto-filled host/session_id),
+    // conditionally added to the payload so an unset addressing field is omitted
+    // rather than sent as undefined. AC-40.A5.4 requires them settable via MCP.
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?if \(to_host\) payload\.to_host = to_host;/,
+      "channelPost must forward to_host only when set",
+    );
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?if \(to_capability\) payload\.to_capability = to_capability;/,
+      "channelPost must forward to_capability only when set",
+    );
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\(\{[^}]*\bto_host\b[^}]*\bto_capability\b[^}]*\}\)/,
+      "channelPost must destructure to_host and to_capability from its args",
+    );
+  });
+
   test("channelRecent GETs /channel/posts on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
