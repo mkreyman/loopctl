@@ -1,0 +1,36 @@
+{
+  "id": "US-40.A3",
+  "title": "Drop the redundant channel_posts_recent_idx (write-amplification cleanup)",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
+  "priority": "medium",
+  "phase": "coordination_bus_v2_A",
+  "story": {
+    "as_a": "loopctl operator carrying the coordination bus at platform volume",
+    "i_want_to": "remove the now-redundant recent-reads index that the hardening migration superseded but never dropped",
+    "so_that": "every channel_posts write maintains one recency btree instead of two overlapping ones — no wasted write amplification or bloat"
+  },
+  "rationale": "The design panel's architect flagged a real shipped bug: the create migration (20260717020000_create_channel_posts.exs:37-39) added `channel_posts_recent_idx` on `(tenant_id, project_id, inserted_at DESC)`; the hardening migration (20260718000000_harden_channel_posts_slot_and_ordering.exs:34-36) added `channel_posts_recent_seq_idx` on `(tenant_id, project_id, inserted_at DESC, seq DESC)` — a strict SUPERSET that serves every query the old index served — but never dropped the old one. Both are plain btrees, so every insert now maintains two overlapping indexes. On a bus that takes a post per session-turn across a fleet this is pure write amplification and bloat with zero read benefit. This is the zero-risk first step in the re-scope sequencing.",
+  "background": {
+    "reference": "priv/repo/migrations/20260717020000_create_channel_posts.exs:37-39 (old index); priv/repo/migrations/20260718000000_harden_channel_posts_slot_and_ordering.exs:34-36 (superseding index); panel finding 'Redundant index (real shipped bug)'.",
+    "includes": "A forward-only cleanup migration that drops the superseded index; the recent-reads path keeps using channel_posts_recent_seq_idx, which order_recent/2 (coordination.ex:520-529) already targets."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.A3.1", "description": "A new cleanup migration drops `channel_posts_recent_idx` (the index created at 20260717020000_create_channel_posts.exs:37-39). After migrate, `\\d channel_posts` (or an information_schema/pg_indexes query) shows `channel_posts_recent_seq_idx` present and `channel_posts_recent_idx` absent.", "status": "pending" },
+    { "id": "AC-40.A3.2", "description": "The migration is idempotent-safe for already-migrated and fresh environments: `drop_if_exists index(..., name: :channel_posts_recent_idx)` so a fresh DB that never had the old index (were the create migration ever consolidated) does not fail. `down/0` recreates `channel_posts_recent_idx` exactly as the create migration declared it, so the migration is reversible.", "status": "pending" },
+    { "id": "AC-40.A3.3", "description": "No code change to coordination.ex is required: recent_page/3 (coordination.ex:453-472) already orders by `inserted_at DESC, seq DESC` (order_recent/2 non-delta clause, coordination.ex:527-529), which is served by `channel_posts_recent_seq_idx`. The read path is verified unchanged (existing US-39.3 read tests stay green)." , "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.A3.1", "name": "old index is gone after migrate", "type": "integration", "preconditions": ["a migrated test DB"], "steps": ["query pg_indexes WHERE tablename='channel_posts'"], "expected_results": ["channel_posts_recent_seq_idx present", "channel_posts_recent_idx absent"] },
+    { "id": "TC-40.A3.2", "name": "recent read still returns newest-first", "type": "integration", "preconditions": ["several posts with same-microsecond inserted_at, differing seq"], "steps": ["Coordination.recent(tenant_id, project_id)"], "expected_results": ["ordering is inserted_at DESC then seq DESC — identical to pre-migration behavior"] },
+    { "id": "TC-40.A3.3", "name": "migration rolls back cleanly", "type": "unit", "preconditions": ["migration applied"], "steps": ["run the migration down/0"], "expected_results": ["channel_posts_recent_idx is recreated; no error"] }
+  ],
+  "technical_notes": [
+    "Pure DDL cleanup — no schema/context change. Add priv/repo/migrations/<ts>_drop_redundant_channel_posts_recent_idx.exs.",
+    "up/0: `drop_if_exists index(:channel_posts, [:tenant_id, :project_id, \"inserted_at DESC\"], name: :channel_posts_recent_idx)`.",
+    "down/0: recreate it exactly as 20260717020000_create_channel_posts.exs:37-39 (same columns, same name) for reversibility.",
+    "Do NOT touch channel_posts_recent_seq_idx (the keeper) or channel_posts_session_key_uidx. seq is read_after_writes (channel_post.ex:90); the seq index is the sole recency btree after this.",
+    "Zero-risk, do FIRST in the sequencing — it de-risks the busier read/write changes that follow by shrinking the write path."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 90000
+}

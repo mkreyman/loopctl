@@ -1,34 +1,206 @@
-# Epic 40 — Coordination Bus v2 + memory-keeper retirement (deferred roadmap)
+# Epic 40 (re-scoped) — Repo Coordination Bus: agent-native handoff & coordination
 
-Follows **Epic 39** (the coordination-bus v1 wedge: post / read / inject / delete). This epic captures everything v1 deliberately deferred, written now while the design + codebase context is fresh so it isn't re-derived later. Design source: **`docs/repo-coordination-bus.md`** (§5 realtime, §6 retirement, §7).
+Follows **Epic 39** (the coordination-bus v1 wedge: post / read / inject / delete).
+This epic was **re-scoped by a completed 5-reviewer design panel** (constructive BA +
+Elixir systems architect; adversarial BA + architect + security-adversary). The panel
+inverted v1's "pointer-board-only" lean and corrected several concrete defects. This
+folder now carries **only the loopctl SERVER surface**; the claude-config client/skill
+companion is tracked separately (see the bottom).
 
-**Gating:** none of this ships until v1 has proven itself in real multi-machine use (owner decision — "full migration follows flawless use of the new channels"). Phase C (retirement) is hard-gated on Phases A/B being in daily use.
+## Framing (the correction)
 
-**Reviewed:** these stories were run through a technical-grounding + security lens before commit; its corrections are folded in. Notably: graduation must use `Knowledge.propose_article/3` (the novelty gate) + a separate secret scan — `create_article/3` runs neither (US-40.1); the SSE dashboard needs a **human cookie/session auth** surface (browser `EventSource` can't send a Bearer header) plus SSE-framing + connection-cap hardening (US-40.6); the per-turn hook must **always exit 0** (a `UserPromptSubmit` non-zero exit erases the user's prompt) within a 30s budget (US-40.3); presence must not use agent-global `last_seen` (US-40.2); pagination reuses `Loopctl.KeysetCursor` (US-40.5). The rate-limiter has per-api_key + per-tenant buckets (no per-agent) — corrected in both epics' rate-limit ACs.
+loopctl is **agent-native, multi-tenant, concurrent, and adversarial** (chain-of-custody
+v2, the sneaky-vs-lazy-bastard threat model). The bus must serve **many agents on the same
+repo, across machines and tenants, some mutually distrusting** — NOT a solo
+human-in-the-loop. That inverts the earlier lean: **exactly-once claim, directed discovery,
+and the security guardrails are load-bearing, not gold-plating.**
 
-## Phases & decomposition
+The driving use case is the real **beelink → mac-mini #812** handoff. v1 removed copy-paste
+of *content*; it did NOT deliver *"handled exactly once, not dropped."* A human still had to
+NOTICE and ROUTE the handoff. This epic closes that gap.
 
-| Story | Title | Phase | Repo | Depends |
-|-------|-------|-------|------|---------|
-| US-40.1 | Graduate a channel post to Knowledge (retention-safety bridge) | A — v2 | loopctl | epic 39 |
-| US-40.2 | Presence: who is live on this repo now | A — v2 | loopctl | epic 39 (US-39.3) |
-| US-40.3 | Turn-boundary freshness pull (inject channel deltas each turn) | A — v2 | **claude-config** | US-39.6 |
-| US-40.4 | Advisory soft-locks (claim/release a file target) | A — v2 | loopctl + claude-config | US-39.2, US-39.3 |
-| US-40.5 | channel_recent pagination (cursor for deep history) | A — v2 | loopctl | US-39.3 |
-| US-40.6 | SSE live dashboard — a human watches the fleet coordinate | B — human surface | loopctl (web) | US-39.3 |
-| US-40.7 | memory-keeper retirement: usage inventory, migration, decommission | C — retirement (gated) | claude-config (+ fleet) | Phases A/B in daily use |
+### Design invariants (what the whole thing rests on)
 
-## Design anchors carried from v1
+1. **Payload lives in a durable home; the bus carries a discoverable, claimable POINTER.**
+   Durable home = a GitHub issue/PR, a `docs/` file, or **Knowledge** (40.E1, for a reusable
+   finding with no external tracker). The bus body stays a bounded TL;DR + pointer.
+2. **The channel is a subscription surface (Slack semantics).** Working a repo = membership.
+   (The push/opt-out mechanics are the claude-config companion; loopctl exposes the reads.)
+3. **Handoff is claimable exactly-once.** Concurrent agents race; the winner claims, the
+   loser sees `409 already_claimed`. Done-state is explicit. (40.B1)
+4. **Reads are as hardened as the SessionStart hook** — bounded previews framed as untrusted
+   DATA, never full un-fenced bodies (the panel's biggest miss). (40.D1)
+5. **Spoofable fields (`host`, `session_id`, `to_host`, `to_capability`) are advisory /
+   surfacing ONLY, never authorization.** (40.A5)
 
-- **The three planes stay separate:** Knowledge (durable/curated), Memory (agent-private), Channel (repo-scoped/transient, 30d). US-40.1 is the bridge that makes "30-day hard delete loses nothing" literally true — the only story here that touches durability.
-- **No realtime for agents.** US-40.3 (turn-boundary pull) is the near-realtime-for-agents mechanism — agents consume at turn boundaries, so a per-turn pull captures all the value a websocket could, without persistent connections (design §5). Realtime/SSE (US-40.6) is **for the human observer only**, one-way, and Fly-suspend-friendly.
-- **Untrusted-content discipline is inherited.** US-40.3 (and any injection surface) reuses US-39.6's hardening: post bodies are JSON-encoded, fenced, truncated, fail-open, off-switch-aware.
-- **Retirement is evidence-gated, reversible, per-repo.** US-40.7 starts with the audit (already partly done: only `context_items` + `checkpoints` + embeddings-search are used fleet-wide; the other ~12 memory-keeper feature areas have zero rows), maps each used capability to the bus/graduation, migrates one repo at a time behind a flag, and keeps files as the offline source of truth.
+## Stories (loopctl server surface), grouped A–E
 
-## Non-negotiable constraints (release gates, per story)
+Numbering scheme: the **re-scoped active work uses letter suffixes** (`us_40.a1.json` …
+`us_40.e1.json`) grouped A–E; **pre-existing carried-over stories keep their original
+numbers** (`us_40.2`, `us_40.4`, `us_40.6`, `us_40.7`). Letters = new rescope; numbers =
+carried over. `40.A2` was DROPPED at sign-off (see below).
 
-- Everything inherits epic 39's gates (tenant isolation via AdminRepo+explicit-filter, agent_id server-stamped, oracle-safety, agent-role/no-human-anchor, secret-scan, audit).
-- **US-40.1** must not let an agent smuggle un-vetted content into the durable Knowledge plane at scale: graduation goes through the SAME novelty/secret gates as `knowledge_create`, is attributed, and is rate-bounded.
-- **US-40.4** locks are ADVISORY (cooperative), never a hard mutex — they inform, they do not block; expiry + explicit release + a visible owner are required so a dead session can't wedge a file forever.
-- **US-40.6** the dashboard is READ-ONLY and one-way (SSE), authenticated, tenant-scoped, and renders untrusted post bodies with the same escaping discipline as US-39.6 (it is a human-facing web view of agent-authored text — XSS surface).
-- **US-40.7** is reversible at every step; no memory-keeper decommission until the bus has carried the three real use cases (state, handoff, search) in daily use, and files remain the local/offline fallback.
+### Group A — Data-model & write-path corrections
+| Story | Title |
+|-------|-------|
+| **40.A1** | `refs` as a typed-open LIST `[{type,value,label?}]` + scan type/value/label + count cap (the one genuine shipped defect) |
+| **40.A3** | Drop the redundant `channel_posts_recent_idx` (write-amplification bug fix) |
+| *(40.A4 — CUT)* | A `kind` read-routing column was proposed by the panel and **declined by the owner** (2026-07-18): message types stay out. Handoff/claim identity is the stable `handoff:` / `claim:` **key prefix** (partial-indexed), not a type column — so there is no separate "require a key" enforcement either (a handoff IS a `handoff:`-keyed post). |
+| **40.A5** | Advisory addressing: `to_host` / `to_capability` (surfacing-only, never authz) |
+
+### Group B — Claim / exactly-once lifecycle
+| Story | Title |
+|-------|-------|
+| **40.B1** | `channel_claims` table — INSERT-to-claim, `UNIQUE(tenant,project,ref)`, `409 already_claimed`, lifecycle-aware sweep, claim/release/done MCP |
+| **40.B2** | Idempotency — stable `handoff:<anchor>` key + optional client idempotency token on keyless writes |
+
+### Group C — Discovery & delivery
+| Story | Title |
+|-------|-------|
+| **40.C1** | Directed-handoff discovery read: open/unclaimed handoffs for me/my capability (`handoff:` key-prefix + addressing + NOT EXISTS open claim), pinned above recency |
+| **40.C2** | Delta/cursor read on `(inserted_at, seq)` + commit-lag lost-write fix + previews-not-bodies (**supersedes old US-40.5**) |
+
+### Group D — Security guardrails (load-bearing; from the security-adversary)
+| Story | Title |
+|-------|-------|
+| **40.D1** | Harden the read path: bounded previews as untrusted DATA + oracle-safe `GET /channel/posts/:id`, no auto-follow lever |
+| **40.D2** | Restrict redact/delete to the post's OWN author (or elevated role) — kill the censor-and-replace vector |
+| **40.D3** | Scope channel WRITES to the caller's own project (membership) — default-deny cross-project posting |
+| **40.D5** | Read rate-limit + response byte-cap on index/show (today only `:create` has the tight cap) |
+
+*(No 40.D4: the D-group ships D1/D2/D3/D5 — 40.D4 was folded into 40.D5 during panel
+sequencing (read rate-limit + response byte-cap are one story), leaving the number retired
+rather than a separate story. Numbering is intentional, not an omission.)*
+
+### Group E — Durability bridge
+| Story | Title |
+|-------|-------|
+| **40.E1** | Graduate-to-Knowledge for a reusable finding with no external tracker — content-selective, NOT graduate-every-handoff (**refocus of old US-40.1**) |
+| **US-40.7** | memory-keeper retirement: inventory, per-repo migration, decommission (gated, reversible) — carried over, essentially unchanged |
+
+## Blocking gates (must clear before the gated stories are implemented)
+
+- **40.A4 (`kind` column) — RESOLVED: CUT.** The panel proposed an indexed read-routing
+  `kind` column; the owner declined (2026-07-18) — the "no message types" decision stands.
+  Discovery/routing uses the stable `handoff:` / `claim:` **key prefix** (partial-indexed),
+  not a type column, so 40.C1 no longer depends on A4 and the directed-discovery half is
+  unblocked. (A handoff IS a `handoff:`-keyed post, so C1's claim-join stays sound with no
+  separate key-presence enforcement.)
+- **40.B1 claim writes — membership gate coupling (see D3).** B1 now depends on 40.D3 so
+  claim/release/done ship membership-gated; D3's shared predicate lands with or before
+  B1's claim writes (see the dependency-edges note above).
+
+## Suggested sequencing (each step safe alone)
+
+1. **40.A3** (index cleanup, zero-risk)
+2. **40.A1** (the shipped refs defect + key/label scan)
+3. *(40.A2 DROPPED — see decisions)*
+4. **40.D1 + 40.C2** (bounded read previews + oracle-safe `GET /:id` + cursor / lost-write fix) — they co-own the read path
+5. **40.B1 + 40.B2** (claim table + idempotency) — B1's claim writes are membership-gated
+   by 40.D3's shared predicate, so land D3's `project_writable_by_agent` with or before
+   this step (B1 → 40.D3)
+6. **40.A5** (advisory addressing `to_host` / `to_capability`) — *(40.A4 `kind` was cut)*
+7. **40.C1** (directed discovery — composes the `handoff:` key-prefix + A5 + B1); the
+   `handoff:` key both identifies a handoff and is the claim-join ref, so the exactly-once
+   join is sound with no `kind` column and no separate key-presence rule
+8. *(turn-boundary push + subscription + skill-awareness → claude-config companion)*
+9. **40.D2 + 40.D3 + 40.D5** (delete gate, write scoping, read limits)
+10. **40.E1** (graduate bridge) → then **US-40.7** (retirement, hard-gated)
+
+Dependency edges encoded in the JSON: 40.B2→40.B1; 40.B1→40.D3; 40.C2→40.D1; 40.C1→{40.A5,40.B1,40.B2,40.D1};
+40.D5→40.D1; 40.E1→{40.D1,40.D3}; US-40.7→40.E1. (40.B1 depends on 40.D3 because the
+CLAIM writes (claim/release/done) must be membership-gated by the SAME
+`project_writable_by_agent` predicate 40.D3 adds to the post write — otherwise a
+same-tenant non-member could claim/block or release handoffs in a sibling project, the
+exact cross-project blast radius D3 closes for posting. D3's shared predicate therefore
+lands with or before B1's claim writes; if the numbered order below is kept, pull it
+forward or co-deliver B1+D3.) (40.C1 depends on 40.B2 because its
+NOT-EXISTS-open-claim join is `claims.ref = posts.key`, which needs B2's stable
+`handoff:<anchor>` key; and on 40.D1 because the directed-handoff read returns other agents'
+bodies and must reuse D1's bounded-preview / untrusted-DATA read-hardening.) The A-group
+data-model stories and the D2/D3 guardrails have no in-epic prerequisites (they modify shipped
+Epic 39 code).
+
+## Old → new map
+
+| Old (v1-deferred) | Disposition |
+|-------------------|-------------|
+| US-40.1 graduate-to-Knowledge | **Refocused → 40.E1** (content-selective; NOT the general handoff-durability answer). File `us_40.1.json` removed. |
+| US-40.2 presence | **DEFERRED** (kept as `us_40.2.json`, marked deferred). |
+| US-40.3 turn-boundary pull | **Moved to claude-config** companion (a Claude Code hook, not loopctl code). File `us_40.3.json` removed from this epic. |
+| US-40.4 file soft-locks | **Retained + clarified** (`us_40.4.json`): advisory collision-avoidance, explicitly **NOT** the exactly-once handoff claim (40.B1 is). |
+| US-40.5 pagination | **Superseded → 40.C2** (its `(inserted_at, id)` keyset was a panel-rejected defect; C2 keysets on `(inserted_at, seq)` + fixes the lost-write hazard). File `us_40.5.json` removed. |
+| US-40.6 SSE dashboard | **DEFERRED** (kept as `us_40.6.json`, marked deferred). |
+| US-40.7 retirement | **Carried over**, essentially unchanged (deps repointed to 40.E1). |
+| — | **New:** 40.A1, 40.A3, 40.A5, 40.B1, 40.B2, 40.C1, 40.C2, 40.D1, 40.D2, 40.D3, 40.D5. *(40.A4 `kind` was proposed by the panel, then cut — owner declined message types.)* |
+
+## Deferred (on their own merits — not "solo")
+
+- **US-40.2 Presence** — collision-avoidance value, but ranks below claim (40.B1) + discovery
+  (40.C1). Revisit after those are in daily use.
+- **US-40.6 SSE dashboard** — operator oversight; agents don't consume SSE (they consume at
+  turn boundaries), and human oversight already has the superadmin API path. Heaviest lift,
+  least coordination value.
+- **Abandoned/expiring-unclaimed-handoff ALERT (panel agreed-gap #4, second half) —
+  DEFERRED with rationale.** Gap #4 has two halves: (a) a DONE handoff lingering as noise —
+  **addressed** by 40.B1's lifecycle-aware sweep; and (b) a directed handoff that reaches
+  the 30-day TTL still UNCLAIMED, expiring silently with no alert. Half (b) is deliberately
+  deferred: 40.C1 already pins **oldest-unclaimed-first** so an aging directed handoff floats
+  to the top of the discovery read the moment any eligible session looks, which is the
+  agent-native surfacing path (agents consume at turn boundaries, not via a push alarm).
+  A dedicated expiry-escalation alert is operator-oversight tooling (same class as the
+  deferred SSE dashboard, US-40.6) and belongs with that oversight surface, not the
+  claim/discovery critical path. Revisit alongside US-40.6 if unclaimed-handoff expiry
+  proves a real loss in daily use; the TTL is 30 days, so the risk window is long.
+
+## Carried-over stories retained off the critical A–E path
+
+- **US-40.4 Advisory file soft-locks** (`us_40.4.json`) — **Retained + clarified**
+  (advisory, non-exclusive collision-avoidance on FILE targets; explicitly NOT the
+  exactly-once handoff claim, which is 40.B1). It builds only on shipped Epic 39 code
+  (channel_posts + a short TTL); advisory locks are identified by a `key LIKE 'claim:%'`
+  prefix (partial-indexed if it needs to scale — same approach 40.C1 uses for `handoff:`),
+  NOT a `kind` column. It has no in-epic prerequisite and is NOT on the numbered A–E
+  claim/discovery sequence; land it any time. Distinct from the Deferred set (40.2, 40.6) —
+  it IS in scope, just off the critical path.
+
+## Signed-off decisions folded in
+
+1. **Body cap = 16 KB (unchanged).** No 2 MB, no bump. Consequently `@scan_byte_cap`
+   already equals `@body_max_length` (channel_post.ex:45, 211) so the whole body is always
+   scanned — **40.A2 (decouple scan cap) is DROPPED**: no change needed unless the cap is
+   raised, which it isn't.
+2. **Membership = the session's OWN project channel by default.** Server-side, **40.D3**
+   enforces write-to-own-project (project-scoped keys / membership), default-deny
+   cross-project posting.
+3. **Delete/redact = the post's OWN author (or elevated role)** — **40.D2**. Kills the
+   any-agent censor-and-replace vector while preserving self-leak-pullback. (Final owner
+   nod pending between author-only vs removing agent-delete entirely; written as
+   author-only, alternative flagged in 40.D2's ACs.)
+4. **Running-session notification is a claude-config/SKILL concern, NOT loopctl.** loopctl
+   exposes only the delta/cursor read (40.C2). The turn-boundary push / periodic-pull moves
+   to the companion set.
+5. **Whole epic authored in one go**, then run the enhanced review ON the written story set
+   before implementation.
+
+## claude-config companion (tracked separately — OUT OF SCOPE for this epic)
+
+The client/skill half is a separate claude-config work item, NOT loopctl server stories:
+- **Running-session turn-boundary awareness** (a `UserPromptSubmit`/Stop hook pulling the
+  40.C2 delta since the session's last-seen cursor; the formerly-numbered US-40.3) — verify
+  the Claude Code hook capability there.
+- **Subscription / opt-out semantics** surfaced to the agent (`CLAUDE_TEAM_CHANNEL=0` opts
+  out of push, keeps pull membership) + skill-awareness (actively check for directed
+  handoffs during long work; claim before acting).
+- **The `/handoff` skill** — write payload to the durable home → post a keyed pointer
+  (stable `handoff:<anchor>` key — which IS the handoff's identity, `to_capability`, refs anchor, TL;DR body)
+  → receiver discovers (40.C1), claims (40.B1), acts, marks done.
+- SessionStart injection (US-39.6) already shipped.
+
+## Inherited gates (per story, from Epic 39)
+
+Tenant isolation via AdminRepo + explicit tenant filter; `agent_id` server-stamped;
+oracle-safety (byte-identical 404s, no existence oracle); agent-role/no-human-anchor on the
+coordination surface (#331); secret-denylist scan; append-only, hash-chained audit. New
+tables use `ENABLE ROW LEVEL SECURITY` (not FORCE) per the multi-tenant rule, and every
+context module ships a tenant-isolation test case.

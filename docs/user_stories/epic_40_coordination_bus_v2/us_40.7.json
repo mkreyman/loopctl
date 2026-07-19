@@ -1,9 +1,9 @@
 {
   "id": "US-40.7",
   "title": "memory-keeper retirement: usage inventory, per-repo migration, decommission (gated, reversible)",
-  "epic": { "id": "epic_40", "name": "Coordination Bus v2 + memory-keeper retirement" },
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
   "priority": "low",
-  "phase": "coordination_bus_v2_C",
+  "phase": "coordination_bus_v2_E",
   "story": {
     "as_a": "operator maintaining the fleet's memory tooling",
     "i_want_to": "migrate the agent/skill references off the local, per-machine memory-keeper onto the hosted coordination bus + Knowledge, and then decommission memory-keeper",
@@ -31,6 +31,6 @@
     "Sequence: pilot repo -> soak -> next repos -> decommission memory-keeper MCP + archive DBs. Never delete a memory-keeper DB until well past cutover.",
     "Keep files as offline source of truth; the bus degrades gracefully when loopctl is unreachable (same as the capture hook)."
   ],
-  "dependencies": ["US-40.1", "US-40.3"],
+  "dependencies": ["US-40.E1"],
   "estimated_tokens": 250000
 }
