@@ -26,6 +26,17 @@ defmodule Loopctl.Coordination.ChannelPost do
   `session_id` are client-supplied, informational, and spoofable — never used for
   authorization or as authoritative attribution.
 
+  `to_host` and `to_capability` (US-40.A5) are the same class: OPTIONAL, freeform,
+  client-supplied ADVISORY SURFACING fields that label a post's *intended* target
+  (a host or, primarily, a capability such as "fly auth"). They are SPOOFABLE — a
+  caller can address a post to ANY host/capability — and are read ONLY as a
+  discovery hint (40.C1 directed discovery surfaces "directed-to-me" posts). They
+  are NEVER read for authorization, ownership, or any delivery guarantee: they
+  gate NOTHING. A post may set neither, either, or both; a post with no addressing
+  remains a broadcast visible to EVERYONE on the channel exactly as today. The
+  ONLY authorization boundary remains the verified key's tenant (+ after 40.D3,
+  project membership).
+
   ## Isolation
 
   Runtime isolation is `AdminRepo` (BYPASSRLS) + an explicit `tenant_id` filter in
@@ -47,6 +58,7 @@ defmodule Loopctl.Coordination.ChannelPost do
   @key_max_length 200
   @session_id_max_length 200
   @host_max_length 255
+  @to_capability_max_length 128
 
   # `refs` is a bounded, typed-OPEN LIST of reference items
   # `[%{"type" => string, "value" => string, "label" => string?}]` (US-40.A1). The
@@ -76,7 +88,7 @@ defmodule Loopctl.Coordination.ChannelPost do
 
   # Text fields that must never carry a NUL byte (Postgres rejects them at insert
   # time with a raw Postgrex.Error/500) nor a denylisted credential shape.
-  @scanned_text_fields [:body, :key, :session_id, :host]
+  @scanned_text_fields [:body, :key, :session_id, :host, :to_host, :to_capability]
 
   @derive {Jason.Encoder,
            only: [
@@ -86,6 +98,8 @@ defmodule Loopctl.Coordination.ChannelPost do
              :agent_id,
              :session_id,
              :host,
+             :to_host,
+             :to_capability,
              :key,
              :body,
              :refs,
@@ -100,6 +114,9 @@ defmodule Loopctl.Coordination.ChannelPost do
     field :agent_id, :binary_id
     field :session_id, :string
     field :host, :string
+    # Advisory, spoofable, surfacing-only addressing (US-40.A5) — NEVER authz.
+    field :to_host, :string
+    field :to_capability, :string
     field :key, :string
     field :body, :string
     field :refs, RefsList
@@ -117,22 +134,29 @@ defmodule Loopctl.Coordination.ChannelPost do
   @doc """
   Changeset for creating a channel post.
 
-  Casts ONLY the caller-supplied fields `[:session_id, :host, :key, :body, :refs]`.
+  Casts ONLY the caller-supplied fields
+  `[:session_id, :host, :to_host, :to_capability, :key, :body, :refs]`.
   `tenant_id`, `project_id`, `agent_id`, and `expires_at` are set programmatically
   on the struct by the context and are validated for presence here as a guard
-  against a context bug — they are never castable.
+  against a context bug — they are never castable. `to_host`/`to_capability` are
+  OPTIONAL, freeform ADVISORY SURFACING fields (spoofable — see the moduledoc
+  trust boundary); they gate NOTHING and are validated only for size/NUL/secret
+  hygiene like `host`/`session_id`.
 
   Enforces the size/shape bounds (`body` <= 16KB, `key` <= 200 bytes,
-  `session_id` <= 200 bytes, `host` <= 255 bytes, and a bounded typed-open `refs`
-  LIST — at most #{@refs_max_items} items, each `%{"type" => .., "value" => ..,
-  "label"? => ..}` with per-field byte caps), rejects NUL bytes in every text
-  field AND every `refs` item field (Postgres cannot store them — the guard turns
-  a raw 500 into a 422), and runs the shared secret denylist over `body`, `key`,
-  `session_id`, `host`, and EVERY `refs` item field (`type`, `value`, `label`) — a
-  match rejects the write (surfaced as a 422) rather than silently dropping the
-  content or leaking a credential onto the shared, cross-session-readable channel.
+  `session_id` <= 200 bytes, `host` <= 255 bytes, `to_host` <= 255 bytes,
+  `to_capability` <= 128 bytes, and a bounded typed-open `refs` LIST — at most
+  #{@refs_max_items} items, each `%{"type" => .., "value" => .., "label"? => ..}`
+  with per-field byte caps), rejects NUL bytes in every text field AND every
+  `refs` item field (Postgres cannot store them — the guard turns a raw 500 into a
+  422), and runs the shared secret denylist over `body`, `key`, `session_id`,
+  `host`, `to_host`, `to_capability`, and EVERY `refs` item field (`type`,
+  `value`, `label`) — a match rejects the write (surfaced as a 422) rather than
+  silently dropping the content or leaking a credential onto the shared,
+  cross-session-readable channel.
 
-  A blank (`""`/whitespace-only) `body`, `key`, `session_id`, or `host` is
+  A blank (`""`/whitespace-only) `body`, `key`, `session_id`, `host`, `to_host`,
+  or `to_capability` is
   normalised to `nil` before the required/uniqueness checks: for `body` this
   makes `validate_required/2` reject a whitespace-only post (an effectively empty
   message must not land as noise on the shared, 30-day channel); for `key` it
@@ -149,13 +173,15 @@ defmodule Loopctl.Coordination.ChannelPost do
   @spec create_changeset(t(), map()) :: Ecto.Changeset.t()
   def create_changeset(post, attrs) do
     post
-    |> cast(attrs, [:session_id, :host, :key, :body, :refs])
-    |> normalize_blank([:body, :key, :session_id, :host])
+    |> cast(attrs, [:session_id, :host, :to_host, :to_capability, :key, :body, :refs])
+    |> normalize_blank([:body, :key, :session_id, :host, :to_host, :to_capability])
     |> validate_required([:tenant_id, :project_id, :agent_id, :body, :expires_at])
     |> validate_length(:body, max: @body_max_length, count: :bytes)
     |> validate_length(:key, max: @key_max_length, count: :bytes)
     |> validate_length(:session_id, max: @session_id_max_length, count: :bytes)
     |> validate_length(:host, max: @host_max_length, count: :bytes)
+    |> validate_length(:to_host, max: @host_max_length, count: :bytes)
+    |> validate_length(:to_capability, max: @to_capability_max_length, count: :bytes)
     |> maybe_require_session_for_key()
     |> validate_refs()
     |> scan_text_and_refs()

@@ -257,13 +257,17 @@ defmodule LoopctlWeb.ChannelPostController do
   # which session / when" and to self-dedupe by session_id. Deliberately narrower
   # than the schema's `@derive Jason.Encoder` (which also carries
   # tenant_id/project_id/expires_at): a dedicated builder keeps the response to the
-  # AC's contract, matching the project_json/1 convention.
+  # AC's contract, matching the project_json/1 convention. `to_host`/`to_capability`
+  # (US-40.A5) are surfaced here so 40.C1 directed discovery can read a post's
+  # advisory addressing — they are surfacing-only hints, NEVER read for authz.
   defp channel_post_json(post) do
     %{
       id: post.id,
       agent_id: post.agent_id,
       session_id: post.session_id,
       host: post.host,
+      to_host: post.to_host,
+      to_capability: post.to_capability,
       key: post.key,
       body: post.body,
       refs: post.refs,
@@ -319,6 +323,9 @@ defmodule LoopctlWeb.ChannelPostController do
       refs: params["refs"],
       session_id: params["session_id"],
       host: params["host"],
+      # Advisory, spoofable, surfacing-only addressing (US-40.A5) — NEVER authz.
+      to_host: params["to_host"],
+      to_capability: params["to_capability"],
       audit: AuditContext.from_conn(conn)
     }
 

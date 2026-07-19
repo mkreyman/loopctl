@@ -190,6 +190,95 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert Coordination.recent(tenant.id, project.id) == []
     end
 
+    # TC-40.A5.1 — advisory addressing round-trips on both the write and the read.
+    test "post with to_host + to_capability -> 201, and both surface on the read" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      conn =
+        post_json(raw, %{
+          "project_id" => project.id,
+          "body" => "beelink -> mac-mini for fly auth",
+          "to_host" => "mac-mini",
+          "to_capability" => "fly-auth"
+        })
+
+      assert %{"post" => post} = json_response(conn, 201)
+      assert post["to_host"] == "mac-mini"
+      assert post["to_capability"] == "fly-auth"
+
+      read = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+      assert %{"data" => [read_post]} = json_response(read, 200)
+      assert read_post["to_host"] == "mac-mini"
+      assert read_post["to_capability"] == "fly-auth"
+    end
+
+    # TC-40.A5.2 — no addressing -> 201, both NULL, visible on plain channel_recent.
+    test "post with no to_host/to_capability -> 201, both null, visible on channel_recent" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      conn = post_json(raw, %{"project_id" => project.id, "body" => "broadcast"})
+
+      assert %{"post" => post} = json_response(conn, 201)
+      assert is_nil(post["to_host"])
+      assert is_nil(post["to_capability"])
+
+      read = authed_conn(raw) |> get(@path, %{"project_id" => project.id})
+      assert %{"data" => [read_post]} = json_response(read, 200)
+      assert read_post["body"] == "broadcast"
+      assert is_nil(read_post["to_host"])
+      assert is_nil(read_post["to_capability"])
+    end
+
+    # TC-40.A5.3 — a secret in to_capability is rejected 422, nothing persisted.
+    test "a secret in to_capability is rejected 422 and not persisted" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = agent_key(tenant)
+
+      conn =
+        post_json(raw, %{
+          "project_id" => project.id,
+          "body" => "ok",
+          "to_capability" => "ghp_ABCDEFGHIJKLMNOPQRST"
+        })
+
+      assert json_response(conn, 422)
+      assert Coordination.recent(tenant.id, project.id) == []
+    end
+
+    # TC-40.A5.4 — addressing is NOT authorization: a post addressed to_host a
+    # DIFFERENT machine is still visible to the whole tenant channel when read by a
+    # DIFFERENT agent. to_host labels the intended target; it never restricts who
+    # can READ (the only authz boundary is the verified key's tenant). This is the
+    # AC-40.A5.3 "no authz branch on to_host/to_capability" proof at the integration
+    # level: a spoofed address does not change read visibility.
+    test "a post addressed to another host is still visible to a different agent in the tenant" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_a, _key_a, _agent_a} = agent_key(tenant)
+      {raw_b, _key_b, _agent_b} = agent_key(tenant)
+
+      conn =
+        post_json(raw_a, %{
+          "project_id" => project.id,
+          "body" => "addressed elsewhere",
+          "to_host" => "some-other-host"
+        })
+
+      assert json_response(conn, 201)
+
+      # A DIFFERENT agent in the SAME tenant reads the channel: the post IS visible,
+      # to_host did not restrict read visibility.
+      read = authed_conn(raw_b) |> get(@path, %{"project_id" => project.id})
+      assert %{"data" => [read_post]} = json_response(read, 200)
+      assert read_post["body"] == "addressed elsewhere"
+      assert read_post["to_host"] == "some-other-host"
+    end
+
     # TC-39.2.2
     test "agent_id/tenant_id in the body are ignored (server-stamped from the key)" do
       tenant = fixture(:tenant)
@@ -516,7 +605,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       first = hd(data)
 
       assert Map.keys(first) |> Enum.sort() ==
-               ~w(agent_id body host id inserted_at key refs session_id updated_at)
+               ~w(agent_id body host id inserted_at key refs session_id to_capability to_host updated_at)
 
       assert first["agent_id"] == agent.id
     end

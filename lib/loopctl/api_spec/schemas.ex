@@ -925,6 +925,24 @@ defmodule Loopctl.ApiSpec.Schemas do
           description: "Client-supplied session id (required when key is set)"
         },
         host: %Schema{type: :string, nullable: true, description: "Client-supplied hostname"},
+        to_host: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "Optional ADVISORY SURFACING address: the intended target host (<=255 bytes). " <>
+              "Client-supplied and SPOOFABLE — a discovery hint only, NEVER authorization, " <>
+              "ownership, or a delivery guarantee. It gates nothing; a post with no addressing " <>
+              "is a broadcast visible to everyone on the channel."
+        },
+        to_capability: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "Optional ADVISORY SURFACING address: the intended target capability, e.g. " <>
+              "\"fly auth\" (<=128 bytes). Client-supplied and SPOOFABLE — a discovery hint " <>
+              "only, NEVER authorization, ownership, or a delivery guarantee. Prefer this over " <>
+              "to_host when the real target is a capability rather than a machine."
+        },
         refs: %Schema{
           type: :array,
           nullable: true,
@@ -984,6 +1002,16 @@ defmodule Loopctl.ApiSpec.Schemas do
             agent_id: %Schema{type: :string, format: :uuid},
             session_id: %Schema{type: :string, nullable: true},
             host: %Schema{type: :string, nullable: true},
+            to_host: %Schema{
+              type: :string,
+              nullable: true,
+              description: "Advisory surfacing address (spoofable, never authz)"
+            },
+            to_capability: %Schema{
+              type: :string,
+              nullable: true,
+              description: "Advisory surfacing address (spoofable, never authz)"
+            },
             key: %Schema{type: :string, nullable: true},
             body: %Schema{type: :string},
             refs: %Schema{
@@ -1016,6 +1044,16 @@ defmodule Loopctl.ApiSpec.Schemas do
         agent_id: %Schema{type: :string, format: :uuid},
         session_id: %Schema{type: :string, nullable: true},
         host: %Schema{type: :string, nullable: true},
+        to_host: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Advisory surfacing address (spoofable, never authz)"
+        },
+        to_capability: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Advisory surfacing address (spoofable, never authz)"
+        },
         key: %Schema{type: :string, nullable: true},
         body: %Schema{type: :string},
         refs: %Schema{

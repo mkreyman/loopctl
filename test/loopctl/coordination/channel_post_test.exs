@@ -415,6 +415,99 @@ defmodule Loopctl.Coordination.ChannelPostTest do
       refute cs.valid?
       assert %{session_id: _} = errors_on(cs)
     end
+
+    # US-40.A5 — advisory addressing (to_host/to_capability): freeform, optional,
+    # spoofable surfacing fields. A post may set neither, either, or both.
+    test "accepts a post carrying both to_host and to_capability" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "to_host" => "mac-mini",
+          "to_capability" => "fly-auth"
+        })
+
+      assert cs.valid?
+      assert Ecto.Changeset.get_field(cs, :to_host) == "mac-mini"
+      assert Ecto.Changeset.get_field(cs, :to_capability) == "fly-auth"
+    end
+
+    test "accepts a post with only to_capability (host absent)" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "to_capability" => "fly-auth"
+        })
+
+      assert cs.valid?
+      assert is_nil(Ecto.Changeset.get_field(cs, :to_host))
+      assert Ecto.Changeset.get_field(cs, :to_capability) == "fly-auth"
+    end
+
+    test "accepts a post with only to_host (capability absent)" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{"body" => "ok", "to_host" => "beelink"})
+
+      assert cs.valid?
+      assert Ecto.Changeset.get_field(cs, :to_host) == "beelink"
+      assert is_nil(Ecto.Changeset.get_field(cs, :to_capability))
+    end
+
+    test "a blank to_host/to_capability is normalised to nil" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "to_host" => "",
+          "to_capability" => "   "
+        })
+
+      assert cs.valid?
+      assert is_nil(Ecto.Changeset.get_field(cs, :to_host))
+      assert is_nil(Ecto.Changeset.get_field(cs, :to_capability))
+    end
+
+    test "rejects an over-long to_host (>255 bytes)" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "to_host" => String.duplicate("h", 256)
+        })
+
+      refute cs.valid?
+      assert %{to_host: _} = errors_on(cs)
+    end
+
+    test "rejects an over-long to_capability (>128 bytes)" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "to_capability" => String.duplicate("c", 129)
+        })
+
+      refute cs.valid?
+      assert %{to_capability: _} = errors_on(cs)
+    end
+
+    test "rejects a NUL byte in to_host" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "to_host" => "mac" <> <<0>> <> "mini"
+        })
+
+      refute cs.valid?
+      assert %{to_host: _} = errors_on(cs)
+    end
+
+    test "rejects a NUL byte in to_capability" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "to_capability" => "fly" <> <<0>> <> "auth"
+        })
+
+      refute cs.valid?
+      assert %{to_capability: _} = errors_on(cs)
+    end
   end
 
   describe "secret denylist" do
@@ -527,6 +620,31 @@ defmodule Loopctl.Coordination.ChannelPostTest do
 
       refute cs.valid?
       assert %{host: _} = errors_on(cs)
+    end
+
+    # US-40.A5 — to_host/to_capability are wired into @scanned_text_fields, so a
+    # credential shape in either advisory address is rejected (a spoofed address is
+    # still a cross-session-readable field that must never carry a secret).
+    test "rejects a secret in to_host" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "to_host" => "ghp_" <> String.duplicate("a", 30)
+        })
+
+      refute cs.valid?
+      assert %{to_host: _} = errors_on(cs)
+    end
+
+    test "rejects a secret in to_capability" do
+      cs =
+        ChannelPost.create_changeset(base_struct(), %{
+          "body" => "ok",
+          "to_capability" => "ghp_" <> String.duplicate("a", 30)
+        })
+
+      refute cs.valid?
+      assert %{to_capability: _} = errors_on(cs)
     end
 
     test "accumulates errors across every offending field in one pass" do
