@@ -884,11 +884,12 @@ defmodule Loopctl.Coordination do
        (US-40.D3): a non-member agent graduating a sibling-project post is denied
        identically to a not-found (`{:error, :not_found}`), no oracle. Elevated
        roles (`>= :user`) bypass, matching the redact/claim surfaces.
-    3. `SecretDenylist.contains_secret?/1` over the post body BEFORE proposing —
-       neither `propose_article/3` nor `create_article/3` runs a secret scan, so
-       this explicit step is what stops a credential being smuggled from the
-       coordination plane into the durable plane. A hit returns
-       `{:error, :unprocessable_entity, msg}` (→ 422) and nothing lands.
+    3. `SecretDenylist.contains_secret?/1` over BOTH the caller-supplied title and
+       the post body BEFORE proposing — neither `propose_article/3` nor
+       `create_article/3` runs a secret scan, so this explicit step is what stops a
+       credential being smuggled from the coordination plane into the durable plane
+       (both title and body land in the tenant-wide-readable knowledge plane). A hit
+       returns `{:error, :unprocessable_entity, msg}` (→ 422) and nothing lands.
     4. `Loopctl.Knowledge.propose_article/3` — the SEMANTIC NOVELTY gate (never
        `create_article/3` directly). A near-duplicate returns
        `%{verdict: :duplicate, article: existing, created: false}` and creates
@@ -916,13 +917,21 @@ defmodule Loopctl.Coordination do
   def graduate_post(tenant_id, agent_id, role, post_id, %{} = params) do
     with {:ok, post} <- get_post(tenant_id, post_id),
          :ok <- project_writable_by_agent(tenant_id, agent_id, post.project_id, role),
-         :ok <- scan_graduation_body(post.body) do
+         :ok <- scan_graduation_content(params[:title], post.body) do
       attrs = %{
         title: params[:title],
         body: post.body,
         # A graduated post is a reusable FINDING by default (the durable home for a
         # lesson with no external tracker); an explicit `category` may override it.
         category: params[:category] || :finding,
+        # PUBLISHED, not draft: knowledge_search/knowledge_context return PUBLISHED
+        # articles only, and the novelty gate assesses only the published corpus — so a
+        # draft graduation would be invisible AND would never dedup a sibling graduation,
+        # the exact wiki-pollution AC-40.E1 prevents. This mirrors the reviewed
+        # memory→knowledge precedent (Memory.memory_to_article_attrs/2). The novelty gate
+        # may still downgrade to :draft on a :low_novelty verdict — the ONE intended
+        # unpublished outcome (the human-review queue).
+        status: :published,
         project_id: post.project_id,
         tags: params[:tags],
         source_type: "channel_graduation",
@@ -934,14 +943,16 @@ defmodule Loopctl.Coordination do
     end
   end
 
-  # Explicit secret scan over the post body BEFORE it reaches Knowledge. Neither
-  # propose_article/3 nor create_article/3 scans, so this is the ONLY thing keeping
-  # a credential out of the durable, tenant-wide-readable knowledge plane on this
-  # path. A hit is an explicit 422 rejection, never a silent drop.
-  defp scan_graduation_body(body) do
-    if SecretDenylist.contains_secret?(body) do
+  # Explicit secret scan over BOTH the caller-supplied title and the post body BEFORE
+  # they reach Knowledge. Neither propose_article/3 nor create_article/3 scans, so this
+  # is the ONLY thing keeping a credential out of the durable, tenant-wide-readable
+  # knowledge plane on this path. The title is caller-supplied and lands in the durable
+  # plane just like the body, so it is scanned too — closing the adjacent smuggling
+  # vector. A hit is an explicit 422 rejection, never a silent drop.
+  defp scan_graduation_content(title, body) do
+    if SecretDenylist.contains_secret?(title) or SecretDenylist.contains_secret?(body) do
       {:error, :unprocessable_entity,
-       "post body contains a denylisted secret pattern; it cannot be graduated to the durable knowledge plane"}
+       "graduation content contains a denylisted secret pattern; it cannot be graduated to the durable knowledge plane"}
     else
       :ok
     end

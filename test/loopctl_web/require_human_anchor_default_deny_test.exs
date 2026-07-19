@@ -199,6 +199,17 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # key, tenant-scoped), NOT chain-of-custody, so deliberately outside
                # the human-anchor tier gate (design brief §3, owner decision #331).
                {:delete, "/api/v1/channel/posts/:id"},
+               # US-40.E1 channel post → Knowledge graduation. An on-demand, agent-
+               # triggered promotion of a reusable coordination finding into the durable
+               # wiki — the SAME memory→knowledge graduation posture as
+               # /memory/graduate (allowlisted above) and knowledge_create, both
+               # agent-reachable. Agent-role, authorship/tenant server-derived from the
+               # verified key, project-scoped by membership (US-40.D3), reusing Knowledge's
+               # EXISTING guardrails (semantic novelty gate + secret scan) — a COORDINATION
+               # surface, NOT chain-of-custody, so deliberately outside the human-anchor
+               # tier gate (owner decision #331). ChannelPostController carries NO
+               # RequireHumanAnchor plug, so this classification is consistent.
+               {:post, "/api/v1/channel/posts/:id/graduate"},
                # US-40.B1 Repo Coordination Bus CLAIM surface — exactly-once handoff
                # claim/release/done. Same COORDINATION posture as the channel posts:
                # agent-role, tenant_id/agent_id/role server-stamped from the verified

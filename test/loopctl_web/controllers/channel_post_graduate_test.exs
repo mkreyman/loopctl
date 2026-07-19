@@ -102,6 +102,17 @@ defmodule LoopctlWeb.ChannelPostGraduateTest do
       assert article.source_id == post.id
       assert article.tags == ["ops"]
 
+      # Promotion into the DISCOVERABLE durable plane: a graduated finding must be
+      # PUBLISHED, not a draft — knowledge_search/knowledge_context return published
+      # articles only and the novelty gate assesses only the published corpus, so a
+      # draft graduation would be invisible AND would never dedup a sibling graduation.
+      assert article.status == :published
+
+      # And it is actually retrievable via the published-only keyword search surface,
+      # proving the promotion reached the discoverable plane (not just the row).
+      assert {:ok, %{results: results}} = Knowledge.search_keyword(tenant.id, "reusable")
+      assert data["id"] in Enum.map(results, & &1.id)
+
       # The source post is KEPT (30-day TTL sweep reclaims it) — not force-graduated.
       assert {:ok, %ChannelPost{}} = Coordination.get_post(tenant.id, post.id)
     end

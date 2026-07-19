@@ -327,6 +327,12 @@ defmodule LoopctlWeb.ChannelPostController do
              type: :string,
              description: "The Knowledge article title (required)"
            },
+           category: %OpenApiSpex.Schema{
+             type: :string,
+             description:
+               "Optional article category; defaults to 'finding' (a reusable lesson) when omitted",
+             default: "finding"
+           },
            tags: %OpenApiSpex.Schema{
              type: :array,
              items: %OpenApiSpex.Schema{type: :string},
