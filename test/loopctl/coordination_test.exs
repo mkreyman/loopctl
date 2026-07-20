@@ -1292,6 +1292,285 @@ defmodule Loopctl.CoordinationTest do
     end
   end
 
+  # US-454: the three defect fixes from the cross-machine handoff incident
+  # (issue #454). Defect 1 — a session without CLAUDE_SESSION_ID could only
+  # post keyless, so its handoffs were invisible to directed discovery and
+  # unclaimable; the server now derives a handoff:<anchor> key from the body
+  # and mints a surrogate session_id instead of 422ing, and TELLS the sender
+  # via the provenance markers. Defect 3 — supersession is a real terminal
+  # state (`superseded_by`), excluded from discovery, marked in the history
+  # read. (Defect 2's see-everything discovery is covered in
+  # directed_handoffs_test.exs.)
+  describe "post/4 US-454 handoff rescue + supersession" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        assigned_agent_id: agent_id,
+        agent_status: :assigned
+      })
+
+      %{tenant: tenant, project: project, agent_id: agent_id}
+    end
+
+    test "a keyless post whose body announces a handoff gets the key DERIVED (discoverable), marked key_source",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      assert {:ok, post, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "HANDOFF (handoff:pr#453-port-4030) — dev port moved, update .mcp.json"
+               })
+
+      assert post.key == "handoff:pr#453-port-4030"
+      assert post.key_source == "derived_from_body"
+
+      # And it is discoverable as a handoff — the exact failure of the incident.
+      assert [row] = Coordination.directed_handoffs(tenant.id, project.id, %{})
+      assert row.key == "handoff:pr#453-port-4030"
+    end
+
+    test "a keyless post with no handoff anchor stays keyless and unmarked", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      assert {:ok, post, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "just a status update"
+               })
+
+      assert is_nil(post.key)
+      assert is_nil(post.key_source)
+    end
+
+    test "an explicit key always wins over a body anchor (no derivation)", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      assert {:ok, post, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 session_id: "S1",
+                 key: "handoff:explicit",
+                 body: "discussing handoff:other-anchor in passing"
+               })
+
+      assert post.key == "handoff:explicit"
+      assert is_nil(post.key_source)
+    end
+
+    test "a keyed post WITHOUT session_id is rescued by a surrogate (no more 422), marked session_id_source",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      assert {:ok, post, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 key: "handoff:nosession",
+                 body: "keyed but the proxy had no CLAUDE_SESSION_ID"
+               })
+
+      assert post.session_id =~ ~r/^srvgen-/
+      assert post.session_id_source == "server_surrogate"
+
+      # Discoverable + the claim ref (= key) exists, so it is claimable.
+      assert [row] = Coordination.directed_handoffs(tenant.id, project.id, %{})
+      assert row.key == "handoff:nosession"
+    end
+
+    test "a keyed post WITH session_id keeps it (no surrogate, no marker)", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      assert {:ok, post, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 session_id: "real-session",
+                 key: "handoff:withsession",
+                 body: "normal keyed post"
+               })
+
+      assert post.session_id == "real-session"
+      assert is_nil(post.session_id_source)
+    end
+
+    test "a HANDOFF body carrying a client idempotency token 422s LOUDLY (derived key + token are mutually exclusive)",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 idempotency_key: "retry-token-1",
+                 body: "HANDOFF (handoff:with-token) — retried append"
+               })
+
+      assert %{idempotency_key: [_ | _]} = errors_on(changeset)
+      assert AdminRepo.aggregate(ChannelPost, :count, :id) == 0
+    end
+
+    test "supersedes marks the target superseded_by in the same transaction; discovery excludes it",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      assert {:ok, stale, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 key: "handoff:old",
+                 body: "pre-merge instructions"
+               })
+
+      assert {:ok, successor, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 key: "handoff:new",
+                 body: "post-merge instructions",
+                 supersedes: stale.id
+               })
+
+      reloaded = AdminRepo.get!(ChannelPost, stale.id)
+      assert reloaded.superseded_by == successor.id
+
+      # The stale handoff is retired from discovery (defect 3); the live one stays.
+      assert [row] = Coordination.directed_handoffs(tenant.id, project.id, %{})
+      assert row.key == "handoff:new"
+    end
+
+    test "the history read MARKS a superseded post with its successor id", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      assert {:ok, stale, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "stale status"
+               })
+
+      assert {:ok, successor, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "current status",
+                 supersedes: stale.id
+               })
+
+      rows = Coordination.recent(tenant.id, project.id, limit: 10)
+      stale_row = Enum.find(rows, &(&1.id == stale.id))
+      assert stale_row.superseded_by == successor.id
+    end
+
+    test "supersedes on another agent's post is rejected byte-identically (:agent role)", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+      other_agent = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      # The other agent must be a writable MEMBER to post at all (US-40.D3).
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        assigned_agent_id: other_agent,
+        agent_status: :assigned
+      })
+
+      assert {:ok, other_post, :created} =
+               Coordination.post(tenant.id, other_agent, :agent, %{
+                 project_id: project.id,
+                 body: "someone else's post"
+               })
+
+      assert {:error, :not_found} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "trying to retire a peer's post",
+                 supersedes: other_post.id
+               })
+
+      assert is_nil(AdminRepo.get!(ChannelPost, other_post.id).superseded_by)
+    end
+
+    test "an elevated role (>= :user) MAY supersede another agent's post (operator curation)",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+      other_agent = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        assigned_agent_id: other_agent,
+        agent_status: :assigned
+      })
+
+      assert {:ok, other_post, :created} =
+               Coordination.post(tenant.id, other_agent, :agent, %{
+                 project_id: project.id,
+                 body: "a mistaken post"
+               })
+
+      assert {:ok, successor, :created} =
+               Coordination.post(tenant.id, agent_id, :user, %{
+                 project_id: project.id,
+                 body: "operator correction",
+                 supersedes: other_post.id
+               })
+
+      assert AdminRepo.get!(ChannelPost, other_post.id).superseded_by == successor.id
+    end
+
+    test "supersedes a nonexistent or cross-project post is the byte-identical :not_found", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      assert {:error, :not_found} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "superseding a ghost",
+                 supersedes: Ecto.UUID.generate()
+               })
+
+      other_project = fixture(:project, %{tenant_id: tenant.id})
+
+      # Membership on the OTHER channel too, so the post lands there.
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: other_project.id,
+        assigned_agent_id: agent_id,
+        agent_status: :assigned
+      })
+
+      assert {:ok, foreign, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: other_project.id,
+                 body: "post on another channel"
+               })
+
+      assert {:error, :not_found} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "cross-project supersede attempt",
+                 supersedes: foreign.id
+               })
+    end
+
+    test "self-supersede via the keyed upsert path 422s (cannot supersede itself)", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      base = %{project_id: project.id, session_id: "S1", key: "handoff:self"}
+
+      assert {:ok, first, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, Map.put(base, :body, "v1"))
+
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Coordination.post(
+                 tenant.id,
+                 agent_id,
+                 :agent,
+                 base |> Map.put(:body, "v2") |> Map.put(:supersedes, first.id)
+               )
+
+      assert %{superseded_by: [_ | _]} = errors_on(changeset)
+      assert is_nil(AdminRepo.get!(ChannelPost, first.id).superseded_by)
+    end
+  end
+
   # US-40.B2: an OPTIONAL client idempotency token on the KEYLESS write path. A
   # keyless post is a pure append, so a retried or offline-reconciled /handoff
   # write would duplicate the row. With a token, a repeat write of the same

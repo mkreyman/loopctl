@@ -178,13 +178,26 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
                })
     end
 
-    # TC-40.C1.6
-    test "a handoff addressed to a capability the caller lacks is not returned", ctx do
+    # TC-40.C1.6 — REWRITTEN for US-454 defect 2: addressing is a label, not a
+    # filter. The default see-everything read returns the elsewhere-directed
+    # handoff (labelled directed_to_me: false) so no session can strand it;
+    # only_mine: true restores the narrow view.
+    test "a handoff addressed to a capability the caller lacks is still returned (labelled not-mine); only_mine narrows",
+         ctx do
       handoff(ctx, %{key: "handoff:signing", to_capability: "windows-signing"})
+
+      assert [row] =
+               Coordination.directed_handoffs(ctx.tenant.id, ctx.project.id, %{
+                 capabilities: ["fly-auth"]
+               })
+
+      assert row.key == "handoff:signing"
+      assert row.directed_to_me == false
 
       assert [] ==
                Coordination.directed_handoffs(ctx.tenant.id, ctx.project.id, %{
-                 capabilities: ["fly-auth"]
+                 capabilities: ["fly-auth"],
+                 only_mine: true
                })
     end
 
@@ -198,17 +211,30 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
                })
     end
 
-    test "a host-directed handoff is returned when the caller's host matches", ctx do
+    test "a host-directed handoff is labelled by host match; visible to other hosts by default (US-454)",
+         ctx do
       handoff(ctx, %{key: "handoff:to-mac", to_host: "mac-mini"})
 
       assert [row] =
                Coordination.directed_handoffs(ctx.tenant.id, ctx.project.id, %{host: "mac-mini"})
 
       assert row.key == "handoff:to-mac"
+      assert row.directed_to_me == true
 
-      # A different host does not match.
-      assert [] ==
+      # US-454 (defect 2): a DIFFERENT host still sees it (directed_to_me:
+      # false) — a handoff addressed to an offline/mistyped host is never
+      # stranded. only_mine: true restores the pre-fix narrow view.
+      assert [other] =
                Coordination.directed_handoffs(ctx.tenant.id, ctx.project.id, %{host: "beelink"})
+
+      assert other.key == "handoff:to-mac"
+      assert other.directed_to_me == false
+
+      assert [] ==
+               Coordination.directed_handoffs(ctx.tenant.id, ctx.project.id, %{
+                 host: "beelink",
+                 only_mine: true
+               })
     end
 
     test "a BROADCAST handoff (no addressing) is included by default so nothing is orphaned",
@@ -255,8 +281,24 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
       handoff(ctx, %{key: "handoff:cap-only", to_capability: "fly-auth"})
 
       rows = Coordination.directed_handoffs(ctx.tenant.id, ctx.project.id, %{capabilities: []})
-      # Broadcast is included; the capability-directed one is NOT (empty caps).
-      assert keys(rows) == ["handoff:bcast"]
+      # US-454 (defect 2): the default see-everything read returns BOTH — the
+      # broadcast (directed_to_me: true) AND the capability-directed one
+      # (directed_to_me: false with empty caps). only_mine keeps the old rule:
+      # broadcast included, capability-directed excluded with empty caps.
+      assert keys(rows) == ["handoff:bcast", "handoff:cap-only"]
+
+      assert %{
+               "handoff:bcast" => true,
+               "handoff:cap-only" => false
+             } = Map.new(rows, &{&1.key, &1.directed_to_me})
+
+      mine =
+        Coordination.directed_handoffs(ctx.tenant.id, ctx.project.id, %{
+          capabilities: [],
+          only_mine: true
+        })
+
+      assert keys(mine) == ["handoff:bcast"]
     end
 
     test "ordering pins oldest-unclaimed-first so a stale handoff floats up", ctx do

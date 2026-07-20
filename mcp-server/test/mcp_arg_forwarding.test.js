@@ -166,11 +166,21 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
     );
   });
 
-  test("channelPost auto-fills session_id from CLAUDE_SESSION_ID when set", () => {
+  test("channelPost auto-fills session_id from CHANNEL_SESSION_ID (CLAUDE_SESSION_ID or process-lifetime fallback, US-454)", () => {
+    // US-454 (defect 1): before the fallback, an absent CLAUDE_SESSION_ID meant
+    // NO session_id was sent and the keyed (handoff) path 422d — silently
+    // forcing undiscoverable keyless posts. The proxy now ALWAYS sends one:
+    // the real session id when present, else ONE random id minted at process
+    // start so same-process retries upsert the same slot.
     assert.match(
       INDEX_SRC,
-      /async function channelPost\([\s\S]*?if \(process\.env\.CLAUDE_SESSION_ID\) payload\.session_id = process\.env\.CLAUDE_SESSION_ID/,
-      "channelPost must fill session_id from CLAUDE_SESSION_ID only when set",
+      /const CHANNEL_SESSION_ID = process\.env\.CLAUDE_SESSION_ID \|\| crypto\.randomUUID\(\);/,
+      "must define CHANNEL_SESSION_ID as CLAUDE_SESSION_ID with a randomUUID fallback",
+    );
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?payload\.session_id = CHANNEL_SESSION_ID;/,
+      "channelPost must always send CHANNEL_SESSION_ID",
     );
   });
 
@@ -195,6 +205,27 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
     );
   });
 
+  test("channelPost forwards supersedes only when set (US-454 defect 3)", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?if \(supersedes\) payload\.supersedes = supersedes;/,
+      "channelPost must forward supersedes only when set",
+    );
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\(\{[^}]*\bsupersedes\b[^}]*\}\)/,
+      "channelPost must destructure supersedes from its args",
+    );
+  });
+
+  test("channelHandoffs forwards only_mine=true only when set (US-454 defect 2)", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelHandoffs\([\s\S]*?if \(only_mine\) params\.set\("only_mine", "true"\);/,
+      "channelHandoffs must forward only_mine=true only when set",
+    );
+  });
+
   test("channelRecent GETs /channel/posts on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
@@ -203,14 +234,16 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
     );
   });
 
-  test("the channel_post `key` property documents its active-session dependency", () => {
-    // A keyed upsert is keyed on the auto-filled session_id (from CLAUDE_SESSION_ID),
-    // which the server makes REQUIRED for keyed posts. Outside a Claude Code session
-    // that env var is absent and the post 422s — the description must warn about it.
+  test("the channel_post `key` property documents the session fallbacks (US-454)", () => {
+    // US-454 (defect 1): the keyed path no longer hard-requires a Claude Code
+    // session — the description must document the proxy's process-lifetime
+    // fallback AND the server's surrogate rescue (with its response-meta
+    // marker), so agents know a keyed post always lands and how to tell when a
+    // fallback fired.
     assert.match(
       INDEX_SRC,
-      /Optional per-session working-state slot key[\s\S]*?Requires an active Claude Code session[\s\S]*?422/,
-      "the channel_post `key` description must document that keyed posts require an active session (422 otherwise)",
+      /Optional per-session working-state slot key[\s\S]*?process-lifetime fallback[\s\S]*?surrogate[\s\S]*?session_id_source/,
+      "the channel_post `key` description must document the session fallbacks (US-454)",
     );
   });
 

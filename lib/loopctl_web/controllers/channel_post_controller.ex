@@ -533,7 +533,7 @@ defmodule LoopctlWeb.ChannelPostController do
   # surfaced so 40.C1 directed discovery can read a post's advisory addressing —
   # surfacing-only hints, NEVER read for authz.
   defp channel_post_json(row) do
-    %{
+    base = %{
       id: row.id,
       agent_id: row.agent_id,
       session_id: row.session_id,
@@ -544,9 +544,21 @@ defmodule LoopctlWeb.ChannelPostController do
       body_preview: row.body_preview,
       truncated: row.truncated,
       refs: row.refs,
+      # US-454 (defect 3): supersession marker — non-null = retired, value is
+      # the successor's id.
+      superseded_by: row.superseded_by,
       inserted_at: row.inserted_at,
       updated_at: row.updated_at
     }
+
+    # US-454 (defect 2): the advisory discovery label rides ONLY on the
+    # handoffs read (the context puts it on those rows); the history read's
+    # field set stays exactly as narrow as before.
+    if Map.has_key?(row, :directed_to_me) do
+      Map.put(base, :directed_to_me, row.directed_to_me)
+    else
+      base
+    end
   end
 
   # Resolve the `?cursor=` param (US-40.C2) to a `{:ok, position_or_nil}` for
@@ -619,13 +631,30 @@ defmodule LoopctlWeb.ChannelPostController do
     {handoffs, overflowed?} =
       Coordination.directed_handoffs_page(tenant_id, params["project_id"], %{
         host: params["host"],
-        capabilities: params["capabilities"]
+        capabilities: params["capabilities"],
+        # US-454 (defect 2): DEFAULT is every open, unclaimed handoff on the
+        # channel, each labelled `directed_to_me`. `only_mine=true` is the
+        # explicit opt-in narrow view (addressed to me / broadcast only).
+        only_mine: params["only_mine"] in ["true", "1", true]
       })
 
     json(conn, %{
       data: Enum.map(handoffs, &channel_post_json/1),
       meta: %{count: length(handoffs), overflow: overflowed?}
     })
+  end
+
+  # US-454 (defect 1 fix 3): write-path provenance the sender MUST see. When the
+  # server rescued the write — derived the handoff key from the body because no
+  # `key` was sent, and/or minted a surrogate session_id because the proxy
+  # supplied none (no CLAUDE_SESSION_ID) — the markers say so LOUDLY in the
+  # response instead of letting the sender believe it made a fully-keyed,
+  # session-deduped post. Both nil on a normal client-driven write.
+  defp post_write_meta(post) do
+    %{
+      key_source: Map.get(post, :key_source),
+      session_id_source: Map.get(post, :session_id_source)
+    }
   end
 
   @doc """
@@ -695,6 +724,7 @@ defmodule LoopctlWeb.ChannelPostController do
       key: post.key,
       body: post.body,
       refs: post.refs,
+      superseded_by: post.superseded_by,
       inserted_at: post.inserted_at,
       updated_at: post.updated_at
     }
@@ -755,6 +785,10 @@ defmodule LoopctlWeb.ChannelPostController do
       # Advisory, spoofable, surfacing-only addressing (US-40.A5) — NEVER authz.
       to_host: params["to_host"],
       to_capability: params["to_capability"],
+      # US-454 (defect 3): OPTIONAL id of a post this one retires. The context
+      # scope-checks (same tenant+project) and authorizes (author or role >=
+      # :user) the target, then marks it superseded_by in the same transaction.
+      supersedes: params["supersedes"],
       audit: AuditContext.from_conn(conn)
     }
 
@@ -762,12 +796,12 @@ defmodule LoopctlWeb.ChannelPostController do
       {:ok, post, :created} ->
         conn
         |> put_status(:created)
-        |> json(%{post: post, created: true})
+        |> json(%{post: post, created: true, meta: post_write_meta(post)})
 
       {:ok, post, :updated} ->
         conn
         |> put_status(:ok)
-        |> json(%{post: post, created: true})
+        |> json(%{post: post, created: true, meta: post_write_meta(post)})
 
       {:ok, post, :deduplicated} ->
         # US-40.B2: a KEYLESS write whose client idempotency_key already exists

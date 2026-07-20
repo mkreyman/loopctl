@@ -400,7 +400,24 @@ defmodule Loopctl.Coordination do
     # and would only add coupling — so it stays a pre-flight guard.
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- agent_owned(tenant_id, agent_id),
-         :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role) do
+         :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role),
+         {:ok, supersedes} <-
+           fetch_supersede_target(
+             tenant_id,
+             project_id,
+             Map.get(attrs, :supersedes),
+             agent_id,
+             role
+           ) do
+      # US-454 (defect 1): rescue handoffs that would otherwise land keyless and
+      # silently undiscoverable, and keep the keyed path available when the MCP
+      # proxy supplied no session_id (the 422 "session_id can't be blank" that
+      # forced the degraded keyless fallback in the incident behind issue #454).
+      attrs =
+        attrs
+        |> maybe_derive_handoff_key()
+        |> maybe_surrogate_session()
+
       changeset =
         %ChannelPost{
           tenant_id: tenant_id,
@@ -409,9 +426,100 @@ defmodule Loopctl.Coordination do
           expires_at: default_expires_at()
         }
         |> ChannelPost.create_changeset(attrs)
+        |> put_provenance_changes(attrs)
 
-      run_post(tenant_id, changeset, audit)
+      run_post(tenant_id, changeset, audit, supersedes)
     end
+  end
+
+  # US-454 (defect 1), issue fix 1: a KEYLESS post whose body announces a
+  # `handoff:<anchor>` gets the anchor DERIVED as its key server-side, rather
+  # than landing with key NULL — invisible to `directed_handoffs/3` (which
+  # filters `key LIKE 'handoff:%'`) and unclaimable (claim ref == key). The
+  # /handoff convention is client-side, but a client without a session (no
+  # CLAUDE_SESSION_ID) could not use the keyed path at all before this fallback;
+  # deriving makes the only post it COULD produce discoverable. The first anchor
+  # match wins; the result still flows through the changeset's 200-byte bound and
+  # the key+idempotency_key exclusion (so a HANDOFF body carrying a client
+  # idempotency token 422s LOUDLY instead of silently staying keyless — issue
+  # fix 2). Capped so the derived key can never exceed the column bound.
+  @handoff_anchor_regex ~r/handoff:[A-Za-z0-9][A-Za-z0-9_.\-\/#:]{0,198}/
+
+  defp maybe_derive_handoff_key(attrs) do
+    key = Map.get(attrs, :key)
+    body = Map.get(attrs, :body)
+
+    if present_string?(key) or not is_binary(body) do
+      attrs
+    else
+      case Regex.run(@handoff_anchor_regex, body) do
+        [anchor] -> attrs |> Map.put(:key, anchor) |> Map.put(:key_source, "derived_from_body")
+        _no_anchor -> attrs
+      end
+    end
+  end
+
+  # US-454 (defect 1), issue fix 1: a keyed post with NO session_id (the MCP
+  # proxy had no CLAUDE_SESSION_ID to auto-fill) no longer 422s — the server
+  # mints a UNIQUE surrogate session id, so the slot insert succeeds and the
+  # handoff is discoverable/claimable. The surrogate is unique per write, so
+  # same-"session" retries do NOT upsert (there is no session identity to dedupe
+  # against) — duplicate pointers are collapsed at read time by DISTINCT ON
+  # (key), and the CLAIM remains the cross-session exactly-once backstop. The
+  # `session_id_source` marker lets the endpoint tell the sender its post was
+  # rescued (issue fix 3: surface the degraded state at post time).
+  defp maybe_surrogate_session(attrs) do
+    if present_string?(Map.get(attrs, :key)) and not present_string?(Map.get(attrs, :session_id)) do
+      attrs
+      |> Map.put(:session_id, "srvgen-" <> Ecto.UUID.generate())
+      |> Map.put(:session_id_source, "server_surrogate")
+    else
+      attrs
+    end
+  end
+
+  defp present_string?(value), do: is_binary(value) and String.trim(value) != ""
+
+  # Carry the write-path provenance markers onto the returned struct (virtual
+  # fields — never persisted) so the endpoint can surface them in the response.
+  defp put_provenance_changes(changeset, attrs) do
+    changeset
+    |> Ecto.Changeset.put_change(:key_source, Map.get(attrs, :key_source))
+    |> Ecto.Changeset.put_change(:session_id_source, Map.get(attrs, :session_id_source))
+  end
+
+  # US-454 (defect 3): resolve the OPTIONAL `supersedes` target for a post. The
+  # target must live in the SAME tenant+project channel, and the caller must be
+  # its AUTHOR or hold role >= :user (mirrors `authorized_to_delete?/3` — the
+  # same "who may retire a post" boundary). Any miss — nonexistent, cross-
+  # project, or not-yours — collapses to `{:error, :not_found}` so the endpoint
+  # maps it to the byte-identical 422 with no existence/ownership oracle.
+  defp fetch_supersede_target(_tenant_id, _project_id, nil, _agent_id, _role), do: {:ok, nil}
+
+  defp fetch_supersede_target(tenant_id, project_id, target_id, agent_id, role)
+       when is_binary(target_id) do
+    target =
+      ChannelPost
+      |> where(
+        [p],
+        p.tenant_id == ^tenant_id and p.project_id == ^project_id and p.id == ^target_id
+      )
+      |> AdminRepo.one()
+
+    case target do
+      %ChannelPost{} = post ->
+        if post.agent_id == agent_id or Role.role_at_least?(role, :user) do
+          {:ok, post}
+        else
+          {:error, :not_found}
+        end
+
+      nil ->
+        {:error, :not_found}
+    end
+  rescue
+    # A malformed (non-UUID) target id is the same "not found" — no shape oracle.
+    Ecto.Query.CastError -> {:error, :not_found}
   end
 
   @doc """
@@ -1142,19 +1250,20 @@ defmodule Loopctl.Coordination do
   # equal timestamps ⇒ created and divergent ⇒ in-place update. This reflects the
   # actual write outcome atomically, so the label is correct even under a concurrent
   # same-session race or a sweep deleting the slot mid-flight.
-  defp run_post(tenant_id, changeset, audit), do: run_post(tenant_id, changeset, audit, 1)
+  defp run_post(tenant_id, changeset, audit, supersedes, retries_left \\ 1)
 
   # `retries_left` bounds the idempotency-recovery re-attempt (see
-  # `resolve_idempotency_collision/4`): a hard-delete of the winning row between the
+  # `resolve_idempotency_collision/5`): a hard-delete of the winning row between the
   # failed insert and the recovery SELECT frees the idempotency slot, so we re-run
   # the append ONCE (budget 1) rather than bounce a misleading non-retryable 422.
-  defp run_post(tenant_id, changeset, audit, retries_left) do
+  defp run_post(tenant_id, changeset, audit, supersedes, retries_left) do
     key = Ecto.Changeset.get_field(changeset, :key)
     insert_opts = insert_opts(key)
 
     multi =
       Multi.new()
       |> Multi.insert(:post, changeset, insert_opts)
+      |> maybe_supersede_step(supersedes)
       |> Audit.log_in_multi(:audit, fn %{post: post} ->
         audit_attrs(tenant_id, post, post_outcome(post), audit)
       end)
@@ -1175,7 +1284,14 @@ defmodule Loopctl.Coordination do
         # rollback exactly like the claim path. Any other rejection (a size/shape
         # bound, denylist hit, NUL byte, or the keyed slot collision) stays a 422.
         if idempotency_conflict?(failed) do
-          resolve_idempotency_collision(tenant_id, failed, changeset, audit, retries_left)
+          resolve_idempotency_collision(
+            tenant_id,
+            failed,
+            changeset,
+            audit,
+            supersedes,
+            retries_left
+          )
         else
           tap_secret_blocked({:error, failed})
         end
@@ -1190,6 +1306,32 @@ defmodule Loopctl.Coordination do
       {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
     end
+  end
+
+  # US-454 (defect 3): when the post declares `supersedes: <target>`, mark the
+  # target retired IN THE SAME TRANSACTION as the insert/upsert, so a handoff
+  # and its successor can never be half-visible (a crash between two writes
+  # would leave the stale one looking live). The target was already authorized
+  # and scope-checked by `fetch_supersede_target/5`. A self-supersede — only
+  # reachable on the keyed UPSERT path, where the persisted slot row's id can
+  # equal the target id the caller passed — is rejected as a changeset error so
+  # it flows through the existing `{:error, _step, %Ecto.Changeset{}, _}`
+  # normalisation (→ 422) instead of introducing a new error shape.
+  defp maybe_supersede_step(multi, nil), do: multi
+
+  defp maybe_supersede_step(multi, %ChannelPost{} = target) do
+    Multi.run(multi, :supersede, fn repo, %{post: post} ->
+      if target.id == post.id do
+        {:error,
+         target
+         |> Ecto.Changeset.change()
+         |> Ecto.Changeset.add_error(:superseded_by, "cannot supersede itself")}
+      else
+        target
+        |> Ecto.Changeset.change(superseded_by: post.id)
+        |> repo.update()
+      end
+    end)
   end
 
   # A KEYLESS idempotent write lost the
@@ -1226,6 +1368,7 @@ defmodule Loopctl.Coordination do
          %Ecto.Changeset{} = failed,
          %Ecto.Changeset{} = original_changeset,
          audit,
+         supersedes,
          retries_left
        ) do
     project_id = Ecto.Changeset.get_field(failed, :project_id)
@@ -1237,7 +1380,7 @@ defmodule Loopctl.Coordination do
         {:ok, existing, :deduplicated}
 
       nil when retries_left > 0 ->
-        run_post(tenant_id, original_changeset, audit, retries_left - 1)
+        run_post(tenant_id, original_changeset, audit, supersedes, retries_left - 1)
 
       nil ->
         {:error, :conflict}
@@ -1624,6 +1767,12 @@ defmodule Loopctl.Coordination do
     if valid_uuid?(tenant_id) and valid_uuid?(project_id) do
       host = normalize_host(target)
       caps = normalize_capabilities(target)
+      # US-454 (defect 2): addressing is a HINT, never a filter. The DEFAULT is
+      # "see every open, unclaimed handoff on the channel" (owner requirement:
+      # any session on the repo may read — and act on — any outstanding
+      # handoff, so a mistyped/offline/busy addressee never strands work).
+      # `only_mine: true` restores the pre-fix narrow view explicitly.
+      only_mine? = Map.get(target, :only_mine, false) == true
       now = DateTime.utc_now()
 
       # DISTINCT ON (key) requires `key` to LEAD the ORDER BY; keeping the oldest
@@ -1635,7 +1784,11 @@ defmodule Loopctl.Coordination do
         |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
         |> where([p], like(p.key, "handoff:%"))
         |> where([p], p.expires_at > ^now)
-        |> where(^directed_target_filter(host, caps))
+        # US-454 (defect 3): a superseded handoff is RETIRED — it leaves the
+        # discovery set the same way a DONE claim removes one, so a reader never
+        # picks up pre-supersession instructions.
+        |> where([p], is_nil(p.superseded_by))
+        |> where(^handoff_visibility_filter(only_mine?, host, caps))
         |> where([p], not exists(active_claim_subquery(now)))
         |> distinct([p], p.key)
         |> order_by([p], asc: p.key, asc: p.inserted_at, asc: p.seq)
@@ -1650,6 +1803,10 @@ defmodule Loopctl.Coordination do
         |> select_preview()
         |> AdminRepo.all()
         |> Enum.map(&finalize_preview/1)
+        # US-454 (defect 2): host/caps are a LABELLING input now, not a filter —
+        # every row carries `directed_to_me` so the caller can sort/surface
+        # without any handoff being hidden from it.
+        |> Enum.map(&Map.put(&1, :directed_to_me, directed_to_me?(&1, host, caps)))
 
       {Enum.take(rows, @max_directed_handoffs), length(rows) > @max_directed_handoffs}
     else
@@ -1673,12 +1830,36 @@ defmodule Loopctl.Coordination do
     )
   end
 
+  # US-454 (defect 2): the addressing WHERE now applies ONLY on the explicit
+  # opt-in narrow view (`only_mine: true`). The default see-everything read has
+  # no addressing filter at all — a handoff addressed to another host stays
+  # visible (and claimable) by every session on the channel, so a wrong/absent
+  # addressee can never strand it.
+  defp handoff_visibility_filter(true = _only_mine?, host, caps),
+    do: directed_target_filter(host, caps)
+
+  defp handoff_visibility_filter(_only_mine?, _host, _caps), do: dynamic([p], true)
+
+  # Per-row advisory label (US-454 defect 2): TRUE when the handoff is a
+  # broadcast (addressed to everyone, including this caller) or is directed at
+  # the caller's host / one of its capabilities; FALSE when it is directed
+  # elsewhere. Purely informational — the row is returned either way; callers
+  # use the label to sort/surface "mine first".
+  defp directed_to_me?(row, host, caps) do
+    broadcast? = is_nil(row.to_host) and is_nil(row.to_capability)
+    host_hit? = is_binary(host) and row.to_host == host
+    cap_hit? = is_binary(row.to_capability) and row.to_capability in caps
+
+    broadcast? or host_hit? or cap_hit?
+  end
+
   # Compose the advisory target WHERE (US-40.C1): a handoff surfaces when it is
   # directed to the caller's host, directed to one of the caller's capabilities,
   # OR is an unaddressed BROADCAST (both target columns NULL — default-include so
   # nothing is orphaned). `host`/`caps` are already normalized; an absent host or
   # empty caps list simply drops that OR branch. Broadcast is ALWAYS included, so
   # we seed with it and OR in the present hints — keeping each clause trivial.
+  # Only consulted on the opt-in `only_mine: true` narrow view (US-454).
   defp directed_target_filter(host, caps) do
     dynamic([p], is_nil(p.to_host) and is_nil(p.to_capability))
     |> or_host_filter(host)
@@ -1785,6 +1966,9 @@ defmodule Loopctl.Coordination do
       to_capability: p.to_capability,
       key: p.key,
       refs: p.refs,
+      # US-454 (defect 3): the history read MARKS retired posts (discovery
+      # excludes them; here a reader of the stale post sees its successor's id).
+      superseded_by: p.superseded_by,
       inserted_at: p.inserted_at,
       updated_at: p.updated_at,
       # CHARACTER-bounded over-fetch (see @preview_probe_chars) — NOT byte-bounded.
