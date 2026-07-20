@@ -59,8 +59,11 @@ defmodule Loopctl.Capabilities do
   @doc """
   Verifies a capability token against the expected parameters.
 
-  Checks: type match, story match, lineage exact match, not expired,
-  not consumed, nonce exists.
+  Checks (`validate_cap/6`, in order): type match, story match, lineage exact
+  match, not expired, not consumed, and a valid ed25519 SIGNATURE over the
+  token's fields, verified against the tenant's `audit_signing_public_key`
+  (`verify_signature/2`). The signature check fails CLOSED when the tenant has
+  no public key — it is the only cryptographic check here, so never drop it.
   """
   @spec verify(Ecto.UUID.t(), map()) ::
           {:ok, CapabilityToken.t()} | {:error, atom()}

@@ -19,6 +19,11 @@ defmodule Loopctl.Dispatches do
   @max_expires_seconds 14_400
   @default_expires_seconds 3_600
 
+  # Upper bound on the verifier candidate pool fetched per request-review, so the
+  # selection never degrades into an unbounded fetch as ephemeral dispatches
+  # accumulate with agent fan-out.
+  @verifier_pool_limit 500
+
   @doc """
   Creates a new dispatch with an ephemeral API key.
 
@@ -264,7 +269,36 @@ defmodule Loopctl.Dispatches do
     end
   end
 
-  @doc "Checks if two lineage paths share a common prefix of length >= 1."
+  @doc """
+  Returns the lineage path of the (non-revoked) dispatch that minted `api_key_id`.
+
+  This is the server-side way to learn the CALLER's lineage: it is derived from
+  the key the request authenticated with, never taken from client input. Returns
+  `[]` when the key was not minted by a dispatch (legacy env-var keys) or the
+  dispatch is revoked — `[]` is inert for `lineage_shares_prefix?/2`, so callers
+  fall back to their agent-id checks rather than short-circuiting them.
+  """
+  @spec lineage_for_api_key(Ecto.UUID.t(), Ecto.UUID.t() | nil) :: [Ecto.UUID.t()]
+  def lineage_for_api_key(_tenant_id, nil), do: []
+
+  def lineage_for_api_key(tenant_id, api_key_id) do
+    from(d in Dispatch,
+      where: d.tenant_id == ^tenant_id and d.api_key_id == ^api_key_id and is_nil(d.revoked_at),
+      select: d.lineage_path,
+      limit: 1
+    )
+    |> AdminRepo.one()
+    |> Kernel.||([])
+  end
+
+  @doc """
+  Checks if two lineage paths share a common ROOT (their first element).
+
+  This is deliberately a shared-root test, not a general prefix test: every
+  dispatch descended from the same root dispatch shares element 0, which is what
+  "same lineage" means for custody separation. An empty lineage on either side is
+  never a match.
+  """
   @spec lineage_shares_prefix?(list(), list()) :: boolean()
   def lineage_shares_prefix?([], _), do: false
   def lineage_shares_prefix?(_, []), do: false
@@ -281,6 +315,13 @@ defmodule Loopctl.Dispatches do
   Selection is deterministic but unpredictable to the orchestrator:
   seeded with sha256(tenant_audit_public_key + story_id).
 
+  SCALE: the same-lineage rejection is pushed into SQL (compare lineage ROOTS,
+  `lineage_path[1]`) and the candidate pool is capped at `@verifier_pool_limit`,
+  so this never loads the tenant's whole active-dispatch set into memory on the
+  request-review path — that path runs on the deliberately tiny BYPASSRLS admin
+  pool. The Elixir `Enum.reject` is kept as a belt-and-braces filter for the rows
+  the SQL predicate cannot express (e.g. a NULL/empty lineage_path).
+
   Returns `{:ok, dispatch}` or `{:error, :no_eligible_verifier}`.
   """
   @spec select_verifier(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
@@ -295,8 +336,10 @@ defmodule Loopctl.Dispatches do
             is_nil(d.revoked_at) and
             d.expires_at > ^now and
             d.role in [:orchestrator, :agent],
-        order_by: [asc: d.created_at]
+        order_by: [asc: d.created_at],
+        limit: @verifier_pool_limit
       )
+      |> reject_same_root(implementer_lineage)
       |> AdminRepo.all()
       |> Enum.reject(fn d -> lineage_shares_prefix?(d.lineage_path, implementer_lineage) end)
 
@@ -323,6 +366,18 @@ defmodule Loopctl.Dispatches do
   end
 
   # --- Private ---
+
+  # SQL half of the same-lineage rejection: drop every candidate whose lineage
+  # ROOT equals the implementer's root. With an empty implementer lineage there
+  # is nothing to reject (the caller's Enum.reject is likewise inert) — see the
+  # `select_verifier/3` doc and the chain-of-custody skill's L4 section.
+  defp reject_same_root(query, []), do: query
+
+  defp reject_same_root(query, [root | _]) do
+    from(d in query,
+      where: is_nil(fragment("?[1]", d.lineage_path)) or fragment("?[1]", d.lineage_path) != ^root
+    )
+  end
 
   defp mint_and_link_key(tenant_id, dispatch, agent_id, expires_at) do
     key_attrs = %{
