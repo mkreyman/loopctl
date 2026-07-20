@@ -1,0 +1,141 @@
+{
+  "id": "US-41.2",
+  "title": "Per-tenant embedding endpoint (embedding_base_url) + config-time dimension probe with legible remediation",
+  "epic": {
+    "id": "epic_41",
+    "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
+  },
+  "priority": "high",
+  "background": "The embedding endpoint is server-wide: config/runtime.exs:391-394 sets %{base_url: OPENAI_BASE_URL || \"https://api.openai.com/v1\", model: ...}, read at knowledge/embedding_client.ex:194 (@default_base_url at :41, provider_config/0 at :295). Per-tenant configuration today (llm/tenant_llm_settings.ex:41-54) covers api_key, extraction_model, classification_model, merge_model, embedding_api_key, embedding_model - key and model, but NOT endpoint. Importantly the embedding KEY is already per-tenant and MANDATORY (embedding_client.ex:58-60,75-77; the global operator key was deliberately removed - see the comment at runtime.exs:385-390), so the per-tenant credential plumbing and its MCP surface (set_llm_config) already exist. Adding the endpoint is one field plus one read - not a subsystem. TWO grounded constraints the 39 draft missed: (1) the set_llm_config surface is ROLE :user, not agent - router.ex:185-189 puts PATCH /tenants/me/llm-config in the :user scope with an explicit comment that the PATCH stores a tenant secret, and mcp-server/index.js:1836-1843 sends the exact LOOPCTL_USER_KEY with the global-key override bypassed (reviews #12/#13). (2) UrlGuard.pin/1 (net/url_guard.ex, GHSA-jh42-wf7g-f5rg) unconditionally blocks loopback, 10/8, 100.64/10, 169.254/16 and Fly 6PN - i.e. exactly where a local Ollama or TEI lives - and accepts only a :schemes option, so 'just reuse UrlGuard' does not compose with a local endpoint.",
+  "story": {
+    "as_a": "an agent configuring a tenant that must not send content to third-party providers",
+    "i_want_to": "set the tenant's embedding endpoint to a local or self-chosen OpenAI-compatible server through the same MCP tool already used for the key, and be told immediately if the endpoint is unusable",
+    "so_that": "embeddings are computed where the tenant chooses, and a misconfiguration fails at config time with a fix I can act on - not hours later as an opaque write error"
+  },
+  "rationale": "This is the smallest change that makes the hosted service usable for a privacy-constrained tenant, and it is the prerequisite for the egress guard in US-41.4 (there is nothing to point at until an endpoint is configurable). The probe exists because loopctl has NO UI: a human would notice a broken endpoint in a settings screen, an agent will not unless the tool tells it.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-41.2.1",
+      "description": "tenant_llm_settings gains embedding_base_url (nullable; NULL means fall back to the server-wide default, preserving today's behavior exactly). The RESOLUTION POINT is named explicitly: Llm.resolve/2's returned map gains :base_url (it returns only %{api_key, model} today, embedding_client.ex:58-80), and the arity-zero embeddings_url/0 (embedding_client.ex:193) is replaced by that resolved value. A test asserts BOTH post paths - do_post/single (embedding_client.ex:86) AND do_post_batch (:100) - hit the tenant endpoint, so one path cannot be fixed while the other silently calls the vendor default.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.2",
+      "description": "The field is writable through the EXISTING set_llm_config MCP tool and its matching JSON API endpoint - no new tool, no UI - and that surface REMAINS role :user (router.ex:185-189, LlmConfigController's RequireRole). The epic's agent-manageability audit is corrected accordingly: endpoint configuration is USER-write, not agent-write, because the same PATCH carries tenant secrets (api_key, embedding_api_key) and CLAUDE.md's role checklist forbids lowering a secret-bearing endpoint to :agent. If a genuinely agent-writable endpoint field is ever wanted it must be a SEPARATE non-secret route with its own AC and its own security argument - not a role downgrade on this one. A test asserts an agent-role key gets 403 on the endpoint write.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.3",
+      "description": "Config-time probe: setting embedding_base_url (or embedding_model) issues ONE test embedding against the supplied endpoint before persisting. On failure NOTHING is persisted and the call returns a legible, agent-readable error. On success the returned dimension is validated against the instance's published supported set (US-41.1 AC-41.1.3) and recorded as the tenant's PENDING dimension - never activated implicitly. THE PROBE NEVER SHIPS AN EXISTING CREDENTIAL TO A NEW HOST: changing embedding_base_url REQUIRES the caller to supply a matching embedding_api_key in the same PATCH, or to pass an explicit acknowledgement that the currently-stored key will be transmitted in the Authorization header to the new host. Without one of the two the call is refused with a remediation - otherwise an endpoint-only PATCH silently sends the tenant's OpenAI key to an attacker-chosen or merely untrusted server. A test asserts a key is never sent to a host other than the one it was configured for. The chat-endpoint probe in US-41.3 AC-41.3.3 carries the identical rule.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.4",
+      "description": "A dimension CHANGE is a gated, staged cutover, never a silent corpus blackhole. A probe that returns a dimension different from the tenant's current one must: (a) refuse unless the caller supplies an explicit acknowledgement/force flag, (b) report in meta how many article and memory rows must be re-embedded, (c) record the new value as pending_dimension and enqueue the re-embed backfill, activating the new dimension only when the backfill reports completion, and (d) define in-flight Oban embedding job behavior - a job whose vector dimension no longer matches the pending target is tagged and retried against the pending dimension rather than written or silently discarded, WITH A BOUNDED retry policy: the existing ArticleEmbeddingWorker shape (max_attempts 4, permanent errors discarded) applies, and on exhaustion the job reaches a TERMINAL discard that is surfaced through the existing job/anomaly surfaces naming the tenant, the pending dimension and the endpoint - never an unbounded retry against an endpoint that cannot satisfy it. THROUGHOUT the window recall keeps serving at the tenant's ACTIVE dimension per US-41.1 AC-41.1.10 (old and new vectors coexist because uniqueness is (id, dim), and the QUERY embedding is generated against the ACTIVE dimension's endpoint/model, never the pending one); the pending vectors are not consulted until activation, after which stale-dimension rows are dropped. A test asserts an un-acknowledged dimension change is refused, that the corpus stays fully searchable at the active dimension for the whole backfill (not merely at the moment of refusal), and that a permanently failing re-embed job terminates instead of retrying forever.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.5",
+      "description": "Probe failures are distinguishable and each carries a meta.remediation payload in the same ACTION REQUIRED shape knowledge_search already returns for a missing embedding key: unreachable endpoint, auth rejected, non-OpenAI-compatible response shape, and dimension-not-supported-by-this-instance are four DIFFERENT messages, each naming the concrete next step.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.6",
+      "description": "The probe never leaks secrets: the endpoint URL is echoed in errors and posture reports, the API key never is. A test asserts no key material appears in any error body, log line, or audit entry.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.7",
+      "description": "The probe is bounded and cannot be used as an SSRF primitive or a DoS lever, WITHOUT re-blocking the local endpoints this epic exists to enable. It routes through the SINGLE egress policy module introduced in US-41.4 (AC-41.4.9) - an allowlist-aware wrapper over UrlGuard (e.g. UrlGuard.pin/2 gaining an allow: option fed by the deployment allowlist and the tenant's declared trusted endpoints) - never a second, divergent URL policy. Blanket 'reuse UrlGuard as-is' is explicitly NOT acceptable: UrlGuard.pin/1 blocks loopback and every private range, so an unmodified reuse makes a local endpoint unconfigurable. Outside an allowlisted/declared host the default denylist still applies, the probe has a short timeout, and it is rate-limited per tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.8",
+      "description": "Default-off and non-breaking: a tenant that never sets embedding_base_url behaves exactly as today, including the mandatory-BYO-key behavior. No existing tenant is re-probed or re-embedded by this story.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-41.2.1",
+      "name": "tenant endpoint overrides the server default on BOTH post paths",
+      "type": "integration",
+      "preconditions": ["tenant with embedding_base_url set to a stub local server"],
+      "steps": ["trigger a single embedding", "trigger a batch embedding"],
+      "expected_results": ["both requests go to the tenant endpoint", "the server-wide default is not contacted on either path"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.2",
+      "name": "probe records the dimension returned by the endpoint as PENDING",
+      "type": "integration",
+      "preconditions": ["stub endpoint returning 768-dim vectors", "tenant with no existing corpus"],
+      "steps": ["set embedding_base_url via set_llm_config"],
+      "expected_results": ["settings persisted", "tenant dimension recorded as 768", "subsequent writes validate against 768"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.3",
+      "name": "dimension change on a populated corpus is refused without acknowledgement",
+      "type": "integration",
+      "preconditions": ["tenant with an existing 1536-dim corpus", "stub endpoint returning 768-dim vectors"],
+      "steps": ["set embedding_base_url with no acknowledgement flag", "then retry with the flag"],
+      "expected_results": ["first attempt refused with a remediation naming the row count to re-embed", "corpus still fully searchable after the refusal", "second attempt records pending_dimension and enqueues the re-embed backfill", "the corpus stays fully searchable at the ACTIVE (1536) dimension for the WHOLE backfill window - queries are embedded against the active endpoint/model, and the partially-written 768-dim rows are not consulted", "the new dimension activates only after the backfill completes, and stale 1536-dim rows are dropped only then", "a re-embed job that can never succeed reaches a terminal discard surfaced on the anomaly surface, not an unbounded retry"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.4",
+      "name": "unreachable endpoint fails closed with remediation",
+      "type": "integration",
+      "preconditions": ["endpoint that refuses connections"],
+      "steps": ["set embedding_base_url"],
+      "expected_results": ["error names the endpoint and the failure class", "meta.remediation present and actionable", "NOTHING persisted - prior settings intact"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.5",
+      "name": "each probe failure class is distinguishable",
+      "type": "integration",
+      "preconditions": ["four stub endpoints: refuses, 401s, returns non-OpenAI JSON, returns an unsupported dimension"],
+      "steps": ["attempt configuration against each"],
+      "expected_results": ["four distinct error codes and four distinct remediation texts - never one generic failure"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.6",
+      "name": "no key material leaks",
+      "type": "unit",
+      "preconditions": ["tenant with an embedding key"],
+      "steps": ["force each probe failure path", "inspect error body, logs, audit entries", "PATCH only embedding_base_url to a NEW host with neither a matching key nor the acknowledgement flag", "repeat with the acknowledgement flag"],
+      "expected_results": ["endpoint present", "key absent everywhere", "the endpoint-only PATCH is refused with a remediation and NO Authorization header carrying the stored key ever reaches the new host", "with the acknowledgement flag the probe proceeds and the transmission is recorded in the audit entry"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.7",
+      "name": "policy module governs reachability in both directions",
+      "type": "integration",
+      "preconditions": ["a tenant WITHOUT a declared/allowlisted local endpoint", "a tenant WITH one"],
+      "steps": ["attempt to set a private-range endpoint as each tenant"],
+      "expected_results": ["the undeclared tenant is rejected before any request with a clear error - no SSRF into the operator network", "the declared tenant's private-range endpoint is probed successfully"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.8",
+      "name": "endpoint write stays role :user",
+      "type": "integration",
+      "preconditions": ["agent, orchestrator and user keys"],
+      "steps": ["PATCH /tenants/me/llm-config with embedding_base_url at each role"],
+      "expected_results": ["agent and orchestrator keys are refused", "user key succeeds", "no alternate route accepts the write at a lower role"],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Reuse Loopctl.Vault.Binary for nothing new here - the endpoint is not a secret and MUST be readable by egress_posture (US-41.4). Only keys stay encrypted. The endpoint is nonetheless written through a :user-role route because that PATCH also carries the keys.",
+    "The SSRF consideration cuts both ways: a local_only tenant NEEDS to reach private-range addresses (that is the point), while a hosted non-local tenant must not be able to probe the operator's internal network. Resolve this in ONE policy module (US-41.4 AC-41.4.9) consulted by the probe, provider calls, ingestion and webhook delivery - do not write a second, divergent URL policy here.",
+    "Record the probe result (endpoint, dimension, timestamp, outcome) in the audit log - US-41.7 builds the custody claim on top of exactly this record.",
+    "Ollama's OpenAI-compatible surface and HuggingFace TEI are the two reference targets; test against stubs shaped like both rather than assuming one vendor's response envelope.",
+    "SettingsCache has a documented staleness window; the pending/active dimension split must be read through a path that cannot serve a stale ACTIVE dimension to an in-flight embedding job."
+  ],
+  "dependencies": ["US-41.1", "US-41.4"],
+  "estimated_tokens": 350000
+}

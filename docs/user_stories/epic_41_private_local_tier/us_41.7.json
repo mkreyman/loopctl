@@ -1,0 +1,163 @@
+{
+  "id": "US-41.7",
+  "title": "Egress posture as a witnessed custody claim in the audit chain / STH",
+  "epic": {
+    "id": "epic_41",
+    "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
+  },
+  "priority": "medium",
+  "background": "Epic 26 gave loopctl a hash-chained, append-only audit chain (US-26.1.1) with signed tree heads published at a public endpoint (US-26.1.2) and a witness protocol (US-26.5.2). Today that chain answers 'who did this work and did anyone mark their own homework'. It says nothing about WHERE the data went. Meanwhile US-41.2 records probe results and US-41.4 records egress decisions, so the facts already exist as log entries - they are simply not bound into the chain as claims a third party can verify. Two operational facts constrain the design: custody/audit-chain writes run on AdminRepo, whose pool is THREE connections shared with every other admin operation - saturating it is the documented outage that forced HeavyReadRepo into existence (KB 9c766ca7) - and a harvest writes many articles, which is exactly that load profile. Second, embeddings are produced ASYNCHRONOUSLY by Oban workers after the row is written, and US-41.1 AC-41.1.10 supports an agent-triggered re-embed when the tenant changes model, so a single write-time snapshot cannot describe a row's whole egress history.",
+  "story": {
+    "as_a": "a user who put private documents into a hosted second brain",
+    "i_want_to": "obtain a signed, witnessed attestation that a given article was produced with zero third-party egress",
+    "so_that": "I can VERIFY the privacy claim after the fact instead of trusting the operator's configuration screenshot"
+  },
+  "rationale": "This is the story that makes hosted loopctl strictly better than a self-hosted fork rather than merely as good. Someone who self-hosts gets privacy but no proof - they cannot show anyone, including themselves six months later, that a given harvest stayed local. Binding egress posture into the existing chain-of-custody extends it from 'who did the work' to 'where the data went', which is a natural L1/L2 extension of the Epic 26 model rather than a new mechanism.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-41.7.1",
+      "description": "The claim is an APPEND-ONLY SEQUENCE of per-operation postures bound to the article or memory - one entry per content-touching operation (create/extract, each embedding, each classification or merge, each re-embed) - NOT a single write-time snapshot. Each entry records the RESOLVED posture for that operation: embedding endpoint + its classification (network-local / tenant-declared / non-local per US-41.4 AC-41.4.5), chat endpoint + classification, local_only state, encrypt_body state, and a timestamp. A single snapshot would be falsified the moment an async embedding job or an agent-triggered re-embed ships the body to a different endpoint (US-41.1 AC-41.1.10), which per AC-41.7.8's own principle is worse than no claim at all.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.2",
+      "description": "The read surface reports zero-third-party-egress ONLY when the recorded sequence for that row is COMPLETE and every entry in it was local. COMPLETENESS IS PROVEN, NOT ASSUMED, because AC-41.7.7 appends asynchronously outside the content transaction: each content-touching operation assigns a MONOTONIC PER-ROW OPERATION SEQUENCE NUMBER inside the content transaction itself (an outbox row), and the claim reader requires the recorded entries to form a CONTIGUOUS sequence up to the highest assigned number. ANY GAP - a batch job that exhausted retries, was discarded, or a node that died between the provider call and the append - degrades the aggregate to 'incomplete', NEVER to zero-egress; likewise a row with unflushed pending entries reports 'incomplete/pending', not zero-egress. Without this, ordinary job loss (not an attacker) silently converts an operation that DID egress into a satisfied zero-egress attestation - which by AC-41.7.8's own principle is worse than no claim. Tests: (a) re-embed an article against a vendor endpoint after a local write and assert the aggregate flips from zero-egress to mixed while the ORIGINAL entry stays unchanged; (b) delete one recorded entry from the middle of a row's sequence and assert the claim flips to incomplete rather than reporting zero egress.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.3",
+      "description": "Each recorded entry is the ACTUAL resolved values used for that operation, not the current settings read back later, and entries are immutable. A subsequent settings change must not alter what any existing entry says - a test changes settings after the write and asserts the historical entries are unchanged.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.4",
+      "description": "The claim rides the existing STH machinery: once included in a signed tree head, the posture record is externally verifiable through the existing public STH endpoint and inclusion-proof path, using the existing witness protocol. No parallel signing scheme is introduced.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.5",
+      "description": "An agent-readable surface returns the custody claim for a given article or memory - MCP tool + matching JSON endpoint, no UI - reporting whether it was produced with zero third-party egress, and if not, which endpoints were involved.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.6",
+      "description": "The claim payload carries an explicit COVERAGE field enumerating which egress paths the attestation covers, defaulting to provider-calls-only until US-41.5 lands (webhook delivery is an uncovered path; a zero-third-party-egress claim that ignores it would be incomplete). The surface must not emit an unqualified zero-egress claim while coverage is partial. The claim is otherwise precise about its scope and does not overstate: it attests to the endpoints loopctl called for THIS operation. It does not and must not claim anything about what those endpoints did with the data afterwards. The wording is reviewed for exactly this.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.7",
+      "description": "Recording is cheap and non-blocking on the hot path BY DESIGN, not by assertion: entries are batched and appended asynchronously (an Oban-enqueued chain append per batch), NEVER a synchronous AdminRepo round-trip per produced article - the AdminRepo pool is three connections shared with all admin work and saturating it is a documented outage mode. The AC names the write path and its pool budget, and a test or benchmark asserts that a bulk harvest of N articles does not saturate the AdminRepo pool. A failure to record is itself surfaced rather than silently dropped (a missing claim must never read as a satisfied claim) - mechanically, via AC-41.7.2's contiguous-sequence requirement, not by hope. THE APPEND IS IDEMPOTENT: each entry carries a unique key of (row_id, operation_sequence), so an Oban retry after a partial success is a no-op rather than a duplicate in an append-only, hash-chained structure that is later signed into an STH. A test replays a partially-succeeded batch job and asserts no duplicate entries and an unchanged chain.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.8",
+      "description": "Absence is legible, and it is DISTINGUISHED FROM PENDING - three states, not two. (a) 'no claim recorded': rows written before this story, or in a scope with no local_only marking - no operation sequence was ever assigned. (b) 'claim pending': operation sequence numbers were assigned but one or more batch appends have not flushed yet; the payload carries the pending-entry count and the enqueued batch reference. (c) a complete claim (zero-egress / mixed / incomplete per AC-41.7.2). Collapsing (b) into (a) would make a read between the content write and the batch flush return 'no claim recorded' for a row that will have a claim - semantically ambiguous exactly where this story insists on legibility. None of the three may be read as a positive attestation unless it is (c) with a contiguous sequence.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.9",
+      "description": "Any new table or column introduced by this story (posture entries, per-row claim state) carries tenant_id, uses the enable_rls/1 macro (ENABLE, not FORCE, per CLAUDE.md's Multi-Tenant Rules), and has a tenant-isolation test asserting tenant A cannot read tenant B's custody claims.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-41.7.1",
+      "name": "posture recorded and bound to the article",
+      "type": "integration",
+      "preconditions": ["local_only scope with local endpoints"],
+      "steps": ["harvest a document", "fetch the custody claim BEFORE draining the Oban queue", "drain the append batch queue", "fetch the claim again"],
+      "expected_results": ["the pre-drain read returns 'claim pending' with a pending-entry count - never 'no claim recorded' and never a zero-egress attestation", "after draining, the claim reports zero third-party egress for the covered paths over a contiguous operation sequence", "names the local endpoints used", "coverage field states which egress paths are attested"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.2",
+      "name": "async embedding and re-embed appear as their own entries",
+      "type": "integration",
+      "preconditions": ["article created under local endpoints", "tenant later switched to a vendor embedding endpoint"],
+      "steps": ["let the async embedding job run", "trigger a re-embed after the switch", "read the claim"],
+      "expected_results": ["separate entries for create, embed and re-embed", "the aggregate claim reports MIXED posture, not zero egress", "the original create/embed entries are unchanged"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.3",
+      "name": "historical entries are immutable under settings change",
+      "type": "integration",
+      "preconditions": ["article written under local endpoints"],
+      "steps": ["change the tenant to vendor endpoints", "re-read the entries for the original article"],
+      "expected_results": ["unchanged - still report the endpoints actually used at that operation"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.4",
+      "name": "claim is included in an STH and externally verifiable",
+      "type": "integration",
+      "preconditions": ["posture record written", "STH computed"],
+      "steps": ["fetch the STH and the inclusion proof"],
+      "expected_results": ["the record verifies against the signed tree head via the existing protocol"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.5",
+      "name": "no claim recorded reads as absent, not as satisfied",
+      "type": "integration",
+      "preconditions": ["article written before this story"],
+      "steps": ["fetch its custody claim"],
+      "expected_results": ["explicit no-claim-recorded response", "nothing that could be misread as an attestation either way"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.6",
+      "name": "mixed-posture write is reported accurately",
+      "type": "integration",
+      "preconditions": ["local embedding endpoint but vendor chat endpoint"],
+      "steps": ["harvest a document", "read the claim"],
+      "expected_results": ["claim does NOT report zero third-party egress", "names the vendor endpoint involved"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.7",
+      "name": "bulk harvest does not saturate the AdminRepo pool",
+      "type": "integration",
+      "preconditions": ["a harvest producing many articles"],
+      "steps": ["run the harvest", "observe AdminRepo pool checkouts and queue time"],
+      "expected_results": ["posture entries are batched/async - no per-article synchronous AdminRepo round-trip", "pool checkout queueing stays within the documented budget"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.8",
+      "name": "coverage is driven by configuration, and any uncovered path suppresses unqualified wording",
+      "type": "integration",
+      "preconditions": ["US-41.5 IS landed - it is a hard dependency of this story, so the round-1 precondition 'US-41.5 not yet landed' was an unreachable state and the AC-41.7.6 coverage behaviour would have gone untested", "the covered-path set driven by configuration: one case with webhook egress coverage enabled, one with it disabled"],
+      "steps": ["read a claim in each configuration"],
+      "expected_results": ["the coverage field ENUMERATES the covered paths in both cases", "with webhook coverage disabled the coverage field names provider calls only and the payload and tool description carry NO unqualified zero-third-party-egress wording", "with every path covered the wording is still scoped to what loopctl called, never to what those endpoints did afterwards"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.9",
+      "name": "custody claims are tenant-isolated",
+      "type": "integration",
+      "preconditions": ["two tenants with claims"],
+      "steps": ["read tenant A's claim as tenant B"],
+      "expected_results": ["not visible - RLS policy enforced"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.10",
+      "name": "a lost or replayed append cannot forge a zero-egress claim",
+      "type": "integration",
+      "preconditions": ["an article with a complete, all-local operation sequence", "an article whose only NON-local operation's append batch was discarded after exhausting retries"],
+      "steps": ["delete one entry from the middle of the first article's sequence and read its claim", "read the second article's claim", "replay a partially-succeeded append batch and re-read"],
+      "expected_results": ["the gapped sequence reports INCOMPLETE, never zero-egress - job loss cannot launder an egressing operation into a satisfied attestation", "the article with the dropped non-local append reports incomplete, and the drop is surfaced on the failure surface", "the replay is a no-op: no duplicate entries, chain and STH unchanged - appends are idempotent on (row_id, operation_sequence)"],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Reuse the Epic 26 chain and STH machinery wholesale - the value here is that the claim inherits an ALREADY-WITNESSED structure. A separate signing path would be both more work and less trustworthy.",
+    "Hot-path cost matters and is a design constraint, not an assertion: harvesting writes many articles and AuditChain.append runs on the 3-connection AdminRepo pool (KB 9c766ca7). Batch the appends through Oban rather than adding a synchronous round-trip per article.",
+    "Wording review is a real acceptance criterion, not a formality. The difference between 'loopctl sent this to no third party' and 'this data was never seen by a third party' is the difference between a true claim and a false one.",
+    "US-41.5 is a hard dependency: until webhook egress is covered, the claim's coverage field must say so (AC-41.7.6). The earlier 'either land 41.5 first or scope the wording' note is now resolved as BOTH - 41.5 is in the dependency list AND coverage is explicit."
+  ],
+  "dependencies": ["US-41.4", "US-41.5"],
+  "estimated_tokens": 450000
+}
