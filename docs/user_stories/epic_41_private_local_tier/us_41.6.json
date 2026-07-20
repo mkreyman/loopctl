@@ -6,7 +6,7 @@
     "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
   },
   "priority": "medium",
-  "background": "articles.body (knowledge/article.ex:52) and memories.text (memory/memory.ex:84) are plain :string columns. Loopctl.Vault.Binary is applied to exactly four fields repo-wide: llm/tenant_llm_settings.ex:44 and :51 (the two BYO keys), webhooks/webhook.ex:61 (signing_secret_encrypted), auth/idempotency_cache.ex:16 (response_data). articles.search_vector is a generated tsvector over title (weight A) + body (weight B) with a GIN index (20260410021836_add_search_vector_to_articles.exs:6-13), so plaintext bodies are load-bearing for keyword search. Note also that the existing private/owner visibility (article.ex:114, @valid_visibilities shared|private|owner) is a metadata STRING enforced query-side ONLY for agent-role callers (coordination.ex:1021-1022) - user, orchestrator and superadmin keys see private articles, and memories have no visibility field at all. That flag is the wrong lever for health/DNA data; encryption is the right one.",
+  "background": "articles.body (knowledge/article.ex:52) and memories.text (memory/memory.ex:84) are plain :string columns. Loopctl.Vault.Binary (Cloak.Ecto.Binary over a SINGLE GLOBAL vault) is applied to exactly four fields repo-wide: llm/tenant_llm_settings.ex:44 and :51 (the two BYO keys), webhooks/webhook.ex:61 (signing_secret_encrypted), auth/idempotency_cache.ex:16 (response_data) - and every one of them sits on a :binary column (e.g. 20260327060723:8, 20260327181351:12). articles.search_vector is a STORED GENERATED tsvector over title (weight A) + body (weight B) with a GIN index (20260410021836_add_search_vector_to_articles.exs:6-13), so plaintext bodies are load-bearing for keyword search AND Postgres will refuse to alter the type of body while that generated column depends on it. Two facts constrain the design: (1) a Cloak/Ecto type is PER-FIELD - its cast/dump/load callbacks receive only the field value, no row and no tenant - so neither 'is this row encrypted?' nor 'which tenant's DEK?' is answerable inside the type; (2) the existing private/owner visibility (article.ex:114, @valid_visibilities shared|private|owner) is a metadata STRING enforced query-side ONLY for agent-role callers (coordination.ex:1021-1022) - user, orchestrator and superadmin keys see private articles. On memories: the memories TABLE has no visibility column, and memories are scoped by explicit (tenant_id, subject_id) predicates; graduated memory ARTICLES do carry metadata.visibility = 'owner' (memory.ex:1907-1912), enforced for agent-role callers only (#163). Either way the visibility flag is the wrong lever for health/DNA data; encryption is the right one.",
   "story": {
     "as_a": "a user storing health, DNA or financial data in a second brain",
     "i_want_to": "have private-tier bodies encrypted at rest and recalled semantically",
@@ -16,41 +16,61 @@
   "acceptance_criteria": [
     {
       "id": "AC-41.6.1",
-      "description": "An encrypt_body marking (per-scope, aligned with US-41.4's local_only, or an explicit flag) causes article bodies and memory texts in that scope to be stored via the existing Cloak/Vault machinery using a PER-TENANT data encryption key. A direct DB read of the row shows ciphertext. Non-private rows are unchanged.",
+      "description": "The storage mechanism is specified concretely, because the plain 'reuse Cloak/Vault' framing is NOT expressible with the current machinery (single global vault; per-field types with no row or tenant context; :binary column required while body is :string and is a dependency of a STORED generated column). The implementation is: a SEPARATE nullable body_encrypted :binary column (memories: text_encrypted) with body/text NULL for encrypted rows - exactly one of the pair is non-null, enforced by a CHECK constraint - plus a resolver in the context layer that reads whichever is present. Encryption/decryption happens where the row and tenant ARE in scope (context functions or a tagged custom Ecto.Type carrying an in-row ciphertext marker), never inside a bare Cloak.Ecto.Binary field. Non-encrypted rows are byte-for-byte unchanged. A test reads an encrypted row directly via SQL and finds ciphertext in body_encrypted and NULL in body.",
       "status": "pending"
     },
     {
       "id": "AC-41.6.2",
-      "description": "For encrypted rows the tsvector/FTS path is SKIPPED (ciphertext cannot be usefully indexed) and recall is vector-only. A test asserts an encrypted article is found by semantic search and does NOT appear in a plaintext keyword search of its body - and that the generated search_vector contains no plaintext body content.",
+      "description": "The per-tenant DEK store is created BY THIS STORY, not assumed: a table (or vault-backed store) holding one wrapped DEK per tenant, each wrapped by the server KEK, with the wrapping/unwrapping path, the cache lifetime and the rotation entry point all specified. Cloak's global vault provides the KEK; it does NOT provide per-tenant keys. This is the security-critical design decision of the story and is reviewed as such.",
       "status": "pending"
     },
     {
       "id": "AC-41.6.3",
-      "description": "On retrieval by an in-scope caller the body is transparently decrypted and returned as today; an out-of-scope caller gets the usual 404/scope-denied with no plaintext and no existence leak. Tenant and subject isolation are preserved exactly as before.",
+      "description": "An encrypt_body marking (per-scope, aligned with US-41.4's local_only) selects which rows are encrypted, using US-41.4 AC-41.4.2's precedence rule verbatim (most-restrictive-wins; a project can never relax a tenant marking; a row with no project inherits the tenant marking). Roles mirror US-41.4 AC-41.4.1: enabling is orchestrator+, disabling is role :user, both audited.",
       "status": "pending"
     },
     {
       "id": "AC-41.6.4",
-      "description": "The threat model is stated plainly in the docs AND in the tool descriptions that expose the flag: v1 protects against a database dump, a stolen backup and a disk image. It does NOT protect against a compromised application server or against the operator, because the vault key is server-held. No text in this epic, the API docs, or the MCP tool descriptions may imply otherwise.",
+      "description": "For encrypted rows the tsvector/FTS path is SKIPPED (ciphertext cannot be usefully indexed) and recall is vector-only. Because articles.search_vector is a STORED GENERATED column whose expression is table-wide, this requires an explicit ONLINE strategy, not an in-place expression change (altering it forces a full table rewrite plus a GIN rebuild, against the repo's documented no-write-outage convention, 20260712000000): drop the generated column and replace it with the TRIGGER-MAINTAINED search_vector pattern already used for stories/projects/epics, backfilling in resumable batches with the GIN index rebuilt CONCURRENTLY. The trigger writes title-only for encrypted rows. A test asserts an encrypted article is found by semantic search, does NOT appear in a plaintext keyword search of its body, and that its search_vector contains no body plaintext.",
       "status": "pending"
     },
     {
       "id": "AC-41.6.5",
-      "description": "The embedding-inversion caveat is documented at the same place: with bodies encrypted, the stored VECTORS become the residual exposure, since embeddings can partially leak content. The docs state this rather than implying encryption closes the gap.",
+      "description": "Whenever the semantic path is unavailable (fallback:true, circuit open, or egress_blocked per US-41.4 AC-41.4.7), any response that could have matched encrypted rows MUST state in meta that encrypted-tier content was excluded, because encrypted rows are not keyword-searchable by construction. Degraded retrieval is an observed normal operating mode at corpus scale (KB 877a415d), not an edge case, so a silent empty or partial result here would read as data loss. Never a bare empty list.",
       "status": "pending"
     },
     {
       "id": "AC-41.6.6",
-      "description": "Key rotation is possible without data loss: rotating a tenant's DEK re-encrypts that tenant's rows via a resumable backfill, consistent with how Cloak rotation is handled elsewhere in the app. A tenant with no encrypted rows is a no-op.",
+      "description": "On retrieval by an in-scope caller the body is transparently decrypted and returned as today. The confidentiality boundary is stated EXACTLY and not overclaimed: encryption preserves TENANT isolation (and, for memories, SUBJECT isolation) - a caller from another tenant gets the usual 404/scope-denied with no plaintext and no existence leak. WITHIN a tenant, encryption changes NOTHING about who may read: user, orchestrator and superadmin keys decrypt exactly as before, and the private/owner visibility filter still applies only to agent-role callers. That boundary is stated in the tool descriptions alongside the AC-41.6.7 threat model, so no reader mistakes encryption for role-based access control.",
       "status": "pending"
     },
     {
       "id": "AC-41.6.7",
-      "description": "Default-off and non-breaking: existing rows and the hosted default stay plaintext with FTS. Enabling the flag affects rows written after it, and a documented, agent-triggerable backfill converts existing rows in scope.",
+      "description": "The threat model is stated plainly in the docs AND in the tool descriptions that expose the flag: v1 protects against a database dump, a stolen backup and a disk image. It does NOT protect against a compromised application server, against another role inside the same tenant, or against the operator, because the KEK is server-held. No text in this epic, the API docs, or the MCP tool descriptions may imply otherwise.",
       "status": "pending"
     },
     {
       "id": "AC-41.6.8",
+      "description": "The embedding-inversion caveat is documented at the same place: with bodies encrypted, the stored VECTORS become the residual exposure, since embeddings can partially leak content. The docs state this rather than implying encryption closes the gap.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.9",
+      "description": "Key rotation is possible without data loss: rotating a tenant's DEK re-encrypts that tenant's rows via a resumable backfill, consistent with how Cloak rotation is handled elsewhere in the app. A tenant with no encrypted rows is a no-op.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.10",
+      "description": "Default-off and non-breaking: existing rows and the hosted default stay plaintext with FTS. Enabling the flag affects rows written after it, and a documented, agent-triggerable backfill converts existing rows in scope.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.11",
+      "description": "DISABLING encrypt_body is specified, not left to chance: the OFF transition requires role :user, and it enqueues a resumable DECRYPT backfill that rewrites each row back to plaintext body/text so the search_vector trigger repopulates the full-text entry - otherwise a decrypted row would read as plaintext tier while being permanently unsearchable. Rows still awaiting decryption remain readable and remain excluded from FTS, and the surface reports how many rows are still encrypted. A test disables the flag on a corpus and asserts every row is both readable AND keyword-searchable after the backfill completes.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.12",
       "description": "Superadmin reads of encrypted-tier rows are audited as a distinct, visible event. If the operator can technically decrypt (they can, in v1), that access must at minimum leave a witnessed trace.",
       "status": "pending"
     }
@@ -62,7 +82,7 @@
       "type": "integration",
       "preconditions": ["scope with encrypt_body enabled"],
       "steps": ["create an article", "read the row directly via SQL"],
-      "expected_results": ["body column is ciphertext", "no plaintext fragment present", "search_vector contains no body plaintext"],
+      "expected_results": ["body is NULL and body_encrypted is ciphertext", "no plaintext fragment present", "search_vector contains no body plaintext", "the CHECK constraint rejects a row with both columns set"],
       "status": "pending"
     },
     {
@@ -76,24 +96,33 @@
     },
     {
       "id": "TC-41.6.3",
-      "name": "transparent decryption for in-scope caller, denial for out-of-scope",
+      "name": "degraded retrieval reports the encrypted-tier exclusion",
       "type": "integration",
-      "preconditions": ["two tenants, one encrypted article"],
-      "steps": ["fetch as the owning tenant", "fetch as the other tenant"],
-      "expected_results": ["owner gets plaintext", "other gets 404 with no existence leak"],
+      "preconditions": ["encrypted rows", "semantic path forced unavailable (fallback / circuit open / egress_blocked)"],
+      "steps": ["run a search that would have matched an encrypted row"],
+      "expected_results": ["meta states encrypted-tier content was excluded and why", "never a silent empty or partial result"],
       "status": "pending"
     },
     {
       "id": "TC-41.6.4",
-      "name": "per-tenant key isolation",
+      "name": "tenant isolation holds; intra-tenant roles are unchanged",
       "type": "integration",
-      "preconditions": ["two tenants with encrypted rows"],
-      "steps": ["attempt to decrypt tenant A's row with tenant B's key"],
-      "expected_results": ["fails - keys are not interchangeable"],
+      "preconditions": ["two tenants, one encrypted article", "user, orchestrator and agent keys in the owning tenant"],
+      "steps": ["fetch as the owning tenant at each role", "fetch as the other tenant"],
+      "expected_results": ["in-tenant user and orchestrator get plaintext - encryption is not access control", "agent-role visibility filtering behaves exactly as before", "the other tenant gets 404 with no existence leak"],
       "status": "pending"
     },
     {
       "id": "TC-41.6.5",
+      "name": "per-tenant key isolation",
+      "type": "integration",
+      "preconditions": ["two tenants with encrypted rows"],
+      "steps": ["attempt to decrypt tenant A's row with tenant B's DEK"],
+      "expected_results": ["fails - keys are not interchangeable"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.6.6",
       "name": "key rotation is resumable and lossless",
       "type": "integration",
       "preconditions": ["tenant with encrypted rows"],
@@ -102,7 +131,25 @@
       "status": "pending"
     },
     {
-      "id": "TC-41.6.6",
+      "id": "TC-41.6.7",
+      "name": "disabling encrypt_body restores searchability",
+      "type": "integration",
+      "preconditions": ["tenant with an encrypted corpus"],
+      "steps": ["disable encrypt_body at role :user", "let the decrypt backfill finish", "keyword search a distinctive body phrase"],
+      "expected_results": ["an agent-role attempt to disable is refused", "every row readable as plaintext", "keyword search finds the phrase - no permanently unsearchable rows", "progress is reported while rows remain encrypted"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.6.8",
+      "name": "search_vector cutover causes no write outage",
+      "type": "integration",
+      "preconditions": ["a populated articles corpus"],
+      "steps": ["run the generated-column-to-trigger migration", "write articles during the backfill", "keyword search"],
+      "expected_results": ["writes succeed throughout - no full-table-rewrite lock", "rows written mid-migration are searchable after completion"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.6.9",
       "name": "superadmin read is audited",
       "type": "integration",
       "preconditions": ["encrypted row", "superadmin key"],
@@ -112,12 +159,12 @@
     }
   ],
   "technical_notes": [
-    "Cloak's Ecto types work per-field; the challenge here is the PER-TENANT key, which the current single-vault setup does not do. Decide the key-derivation approach explicitly and review it - this is the security-critical design decision of the story.",
-    "The generated search_vector column is computed in the DB from title and body. For encrypted rows it must not be generated from the ciphertext either (that leaks nothing but wastes space and could confuse ranking) - handle the generated-column semantics deliberately.",
+    "Cloak's Ecto types work per-field and see neither the row nor the tenant; that is precisely why AC-41.6.1 uses a separate ciphertext column plus context-layer encryption rather than swapping body's type. Do not attempt a conditional Cloak.Ecto.Binary - it cannot be written.",
+    "articles.search_vector is a STORED GENERATED column. Postgres refuses to alter the type of a column a generated column depends on, and changing the generation expression rewrites the table. AC-41.6.4's drop-and-trigger cutover (mirroring stories/projects/epics) is the online path; treat it as the migration risk of this story.",
     "Titles: decide whether titles are also encrypted. A plaintext title on a DNA article leaks a great deal. If titles stay plaintext for findability, say so loudly in the docs - do not leave it implicit.",
     "A tenant-held KEK (so the operator genuinely cannot decrypt) is the real upgrade and belongs in its own story. Do not gesture at it here.",
-    "Cross-check against the visibility asymmetry in the background note: encryption is orthogonal to the visibility flag, and users will conflate them. The tool descriptions must be precise about which one does what."
+    "Cross-check against the visibility asymmetry in the background note: encryption is orthogonal to the visibility flag, and users will conflate them. The tool descriptions must be precise about which one does what - encryption is tenant/subject isolation at rest, NOT intra-tenant role separation."
   ],
-  "dependencies": ["US-41.1"],
-  "estimated_tokens": 450000
+  "dependencies": ["US-41.1", "US-41.4"],
+  "estimated_tokens": 550000
 }

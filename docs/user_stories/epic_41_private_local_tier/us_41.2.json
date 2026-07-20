@@ -6,46 +6,51 @@
     "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
   },
   "priority": "high",
-  "background": "The embedding endpoint is server-wide: config/runtime.exs:382-385 sets %{base_url: OPENAI_BASE_URL || \"https://api.openai.com/v1\", model: ...}, read at knowledge/embedding_client.ex:194 (@default_base_url at :41, provider_config/0 at :295). Per-tenant configuration today (llm/tenant_llm_settings.ex:41-54) covers api_key, extraction_model, classification_model, merge_model, embedding_api_key, embedding_model - key and model, but NOT endpoint. Importantly the embedding KEY is already per-tenant and MANDATORY (embedding_client.ex:58-60,75-77; the global operator key was deliberately removed in runtime.exs:375-381), so the per-tenant credential plumbing and its MCP surface (set_llm_config) already exist. Adding the endpoint is one field plus one read - not a subsystem.",
+  "background": "The embedding endpoint is server-wide: config/runtime.exs:382-385 sets %{base_url: OPENAI_BASE_URL || \"https://api.openai.com/v1\", model: ...}, read at knowledge/embedding_client.ex:194 (@default_base_url at :41, provider_config/0 at :295). Per-tenant configuration today (llm/tenant_llm_settings.ex:41-54) covers api_key, extraction_model, classification_model, merge_model, embedding_api_key, embedding_model - key and model, but NOT endpoint. Importantly the embedding KEY is already per-tenant and MANDATORY (embedding_client.ex:58-60,75-77; the global operator key was deliberately removed in runtime.exs:375-381), so the per-tenant credential plumbing and its MCP surface (set_llm_config) already exist. Adding the endpoint is one field plus one read - not a subsystem. TWO grounded constraints the 39 draft missed: (1) the set_llm_config surface is ROLE :user, not agent - router.ex:185-189 puts PATCH /tenants/me/llm-config in the :user scope with an explicit comment that the PATCH stores a tenant secret, and mcp-server/index.js:1836-1843 sends the exact LOOPCTL_USER_KEY with the global-key override bypassed (reviews #12/#13). (2) UrlGuard.pin/1 (net/url_guard.ex, GHSA-jh42-wf7g-f5rg) unconditionally blocks loopback, 10/8, 100.64/10, 169.254/16 and Fly 6PN - i.e. exactly where a local Ollama or TEI lives - and accepts only a :schemes option, so 'just reuse UrlGuard' does not compose with a local endpoint.",
   "story": {
     "as_a": "an agent configuring a tenant that must not send content to third-party providers",
-    "i_want_to": "set the tenant's embedding endpoint to a local or self-chosen OpenAI-compatible server through the same MCP tool I already use for the key, and be told immediately if the endpoint is unusable",
+    "i_want_to": "set the tenant's embedding endpoint to a local or self-chosen OpenAI-compatible server through the same MCP tool already used for the key, and be told immediately if the endpoint is unusable",
     "so_that": "embeddings are computed where the tenant chooses, and a misconfiguration fails at config time with a fix I can act on - not hours later as an opaque write error"
   },
   "rationale": "This is the smallest change that makes the hosted service usable for a privacy-constrained tenant, and it is the prerequisite for the egress guard in US-41.4 (there is nothing to point at until an endpoint is configurable). The probe exists because loopctl has NO UI: a human would notice a broken endpoint in a settings screen, an agent will not unless the tool tells it.",
   "acceptance_criteria": [
     {
       "id": "AC-41.2.1",
-      "description": "tenant_llm_settings gains embedding_base_url (nullable; NULL means fall back to the server-wide default, preserving today's behavior exactly). embedding_client.ex resolves the tenant value first, the runtime default second.",
+      "description": "tenant_llm_settings gains embedding_base_url (nullable; NULL means fall back to the server-wide default, preserving today's behavior exactly). The RESOLUTION POINT is named explicitly: Llm.resolve/2's returned map gains :base_url (it returns only %{api_key, model} today, embedding_client.ex:58-80), and the arity-zero embeddings_url/0 (embedding_client.ex:193) is replaced by that resolved value. A test asserts BOTH post paths - do_post/single (embedding_client.ex:86) AND do_post_batch (:100) - hit the tenant endpoint, so one path cannot be fixed while the other silently calls the vendor default.",
       "status": "pending"
     },
     {
       "id": "AC-41.2.2",
-      "description": "The field is writable through the EXISTING set_llm_config MCP tool and its matching JSON API endpoint - no new tool, no UI. The tool description states plainly that the endpoint must be OpenAI-compatible (POST /embeddings) and that changing it may require a re-embed (US-41.1 AC-41.1.6).",
+      "description": "The field is writable through the EXISTING set_llm_config MCP tool and its matching JSON API endpoint - no new tool, no UI - and that surface REMAINS role :user (router.ex:185-189, LlmConfigController's RequireRole). The epic's agent-manageability audit is corrected accordingly: endpoint configuration is USER-write, not agent-write, because the same PATCH carries tenant secrets (api_key, embedding_api_key) and CLAUDE.md's role checklist forbids lowering a secret-bearing endpoint to :agent. If a genuinely agent-writable endpoint field is ever wanted it must be a SEPARATE non-secret route with its own AC and its own security argument - not a role downgrade on this one. A test asserts an agent-role key gets 403 on the endpoint write.",
       "status": "pending"
     },
     {
       "id": "AC-41.2.3",
-      "description": "Config-time probe: setting embedding_base_url (or embedding_model) issues ONE test embedding against the supplied endpoint before persisting. On success the returned dimension is recorded as the tenant's dimension. On failure NOTHING is persisted and the call returns a legible, agent-readable error.",
+      "description": "Config-time probe: setting embedding_base_url (or embedding_model) issues ONE test embedding against the supplied endpoint before persisting. On failure NOTHING is persisted and the call returns a legible, agent-readable error. On success the returned dimension is validated against the instance's published supported set (US-41.1 AC-41.1.3) and recorded as the tenant's PENDING dimension - never activated implicitly.",
       "status": "pending"
     },
     {
       "id": "AC-41.2.4",
-      "description": "Probe failures are distinguishable and each carries a meta.remediation payload in the same ACTION REQUIRED shape knowledge_search already returns for a missing embedding key: unreachable endpoint, auth rejected, non-OpenAI-compatible response shape, and dimension-not-supported-by-this-instance are four DIFFERENT messages, each naming the concrete next step.",
+      "description": "A dimension CHANGE is a gated, staged cutover, never a silent corpus blackhole. Because US-41.1 AC-41.1.10 excludes stale-dimension rows from recall, a probe that returns a dimension different from the tenant's current one must: (a) refuse unless the caller supplies an explicit acknowledgement/force flag, (b) report in meta how many article and memory rows will become stale, (c) record the new value as pending_dimension and enqueue the re-embed backfill, activating the new dimension only when the backfill reports completion, and (d) define in-flight Oban embedding job behavior - a job whose vector dimension no longer matches the pending target is tagged and retried against the pending dimension rather than written or silently discarded. A test asserts an un-acknowledged dimension change is refused and the corpus stays searchable.",
       "status": "pending"
     },
     {
       "id": "AC-41.2.5",
-      "description": "The probe never leaks secrets: the endpoint URL is echoed in errors and posture reports, the API key never is. A test asserts no key material appears in any error body, log line, or audit entry.",
+      "description": "Probe failures are distinguishable and each carries a meta.remediation payload in the same ACTION REQUIRED shape knowledge_search already returns for a missing embedding key: unreachable endpoint, auth rejected, non-OpenAI-compatible response shape, and dimension-not-supported-by-this-instance are four DIFFERENT messages, each naming the concrete next step.",
       "status": "pending"
     },
     {
       "id": "AC-41.2.6",
-      "description": "The probe is bounded and cannot be used as an SSRF primitive or a DoS lever: it reuses the existing URL guard used by ingestion (workers/content_ingestion_worker.ex:620-632, UrlGuard.pinned_request_opts/1 + redirect: false), has a short timeout, and is rate-limited per tenant.",
+      "description": "The probe never leaks secrets: the endpoint URL is echoed in errors and posture reports, the API key never is. A test asserts no key material appears in any error body, log line, or audit entry.",
       "status": "pending"
     },
     {
       "id": "AC-41.2.7",
+      "description": "The probe is bounded and cannot be used as an SSRF primitive or a DoS lever, WITHOUT re-blocking the local endpoints this epic exists to enable. It routes through the SINGLE egress policy module introduced in US-41.4 (AC-41.4.9) - an allowlist-aware wrapper over UrlGuard (e.g. UrlGuard.pin/2 gaining an allow: option fed by the deployment allowlist and the tenant's declared trusted endpoints) - never a second, divergent URL policy. Blanket 'reuse UrlGuard as-is' is explicitly NOT acceptable: UrlGuard.pin/1 blocks loopback and every private range, so an unmodified reuse makes a local endpoint unconfigurable. Outside an allowlisted/declared host the default denylist still applies, the probe has a short timeout, and it is rate-limited per tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.8",
       "description": "Default-off and non-breaking: a tenant that never sets embedding_base_url behaves exactly as today, including the mandatory-BYO-key behavior. No existing tenant is re-probed or re-embedded by this story.",
       "status": "pending"
     }
@@ -53,24 +58,33 @@
   "test_cases": [
     {
       "id": "TC-41.2.1",
-      "name": "tenant endpoint overrides the server default",
+      "name": "tenant endpoint overrides the server default on BOTH post paths",
       "type": "integration",
       "preconditions": ["tenant with embedding_base_url set to a stub local server"],
-      "steps": ["trigger an embedding"],
-      "expected_results": ["the request goes to the tenant endpoint", "the server-wide default is not contacted"],
+      "steps": ["trigger a single embedding", "trigger a batch embedding"],
+      "expected_results": ["both requests go to the tenant endpoint", "the server-wide default is not contacted on either path"],
       "status": "pending"
     },
     {
       "id": "TC-41.2.2",
-      "name": "probe records the dimension returned by the endpoint",
+      "name": "probe records the dimension returned by the endpoint as PENDING",
       "type": "integration",
-      "preconditions": ["stub endpoint returning 768-dim vectors"],
+      "preconditions": ["stub endpoint returning 768-dim vectors", "tenant with no existing corpus"],
       "steps": ["set embedding_base_url via set_llm_config"],
       "expected_results": ["settings persisted", "tenant dimension recorded as 768", "subsequent writes validate against 768"],
       "status": "pending"
     },
     {
       "id": "TC-41.2.3",
+      "name": "dimension change on a populated corpus is refused without acknowledgement",
+      "type": "integration",
+      "preconditions": ["tenant with an existing 1536-dim corpus", "stub endpoint returning 768-dim vectors"],
+      "steps": ["set embedding_base_url with no acknowledgement flag", "then retry with the flag"],
+      "expected_results": ["first attempt refused with a remediation naming the stale-row count", "corpus still fully searchable after the refusal", "second attempt records pending_dimension and enqueues the re-embed backfill", "the new dimension activates only after the backfill completes"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.4",
       "name": "unreachable endpoint fails closed with remediation",
       "type": "integration",
       "preconditions": ["endpoint that refuses connections"],
@@ -79,7 +93,7 @@
       "status": "pending"
     },
     {
-      "id": "TC-41.2.4",
+      "id": "TC-41.2.5",
       "name": "each probe failure class is distinguishable",
       "type": "integration",
       "preconditions": ["four stub endpoints: refuses, 401s, returns non-OpenAI JSON, returns an unsupported dimension"],
@@ -88,7 +102,7 @@
       "status": "pending"
     },
     {
-      "id": "TC-41.2.5",
+      "id": "TC-41.2.6",
       "name": "no key material leaks",
       "type": "unit",
       "preconditions": ["tenant with an embedding key"],
@@ -97,21 +111,31 @@
       "status": "pending"
     },
     {
-      "id": "TC-41.2.6",
-      "name": "probe cannot reach internal addresses when the guard forbids it",
+      "id": "TC-41.2.7",
+      "name": "policy module governs reachability in both directions",
       "type": "integration",
-      "preconditions": ["URL guard configured to reject the target range"],
-      "steps": ["attempt to set an endpoint pointing at a forbidden address"],
-      "expected_results": ["rejected by the guard before any request", "clear error"],
+      "preconditions": ["a tenant WITHOUT a declared/allowlisted local endpoint", "a tenant WITH one"],
+      "steps": ["attempt to set a private-range endpoint as each tenant"],
+      "expected_results": ["the undeclared tenant is rejected before any request with a clear error - no SSRF into the operator network", "the declared tenant's private-range endpoint is probed successfully"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.8",
+      "name": "endpoint write stays role :user",
+      "type": "integration",
+      "preconditions": ["agent, orchestrator and user keys"],
+      "steps": ["PATCH /tenants/me/llm-config with embedding_base_url at each role"],
+      "expected_results": ["agent and orchestrator keys are refused", "user key succeeds", "no alternate route accepts the write at a lower role"],
       "status": "pending"
     }
   ],
   "technical_notes": [
-    "Reuse Loopctl.Vault.Binary for nothing new here - the endpoint is not a secret and MUST be readable by egress_posture (US-41.4). Only keys stay encrypted.",
-    "The SSRF consideration cuts both ways: a local_only tenant NEEDS to reach private-range addresses (that is the point), while a hosted non-local tenant should not be able to probe the operator's internal network. Resolve this by making the allowlist policy (US-41.4) govern which ranges are reachable, and have the probe consult the same policy - do not write a second, divergent URL policy here.",
+    "Reuse Loopctl.Vault.Binary for nothing new here - the endpoint is not a secret and MUST be readable by egress_posture (US-41.4). Only keys stay encrypted. The endpoint is nonetheless written through a :user-role route because that PATCH also carries the keys.",
+    "The SSRF consideration cuts both ways: a local_only tenant NEEDS to reach private-range addresses (that is the point), while a hosted non-local tenant must not be able to probe the operator's internal network. Resolve this in ONE policy module (US-41.4 AC-41.4.9) consulted by the probe, provider calls, ingestion and webhook delivery - do not write a second, divergent URL policy here.",
     "Record the probe result (endpoint, dimension, timestamp, outcome) in the audit log - US-41.7 builds the custody claim on top of exactly this record.",
-    "Ollama's OpenAI-compatible surface and HuggingFace TEI are the two reference targets; test against stubs shaped like both rather than assuming one vendor's response envelope."
+    "Ollama's OpenAI-compatible surface and HuggingFace TEI are the two reference targets; test against stubs shaped like both rather than assuming one vendor's response envelope.",
+    "SettingsCache has a documented staleness window; the pending/active dimension split must be read through a path that cannot serve a stale ACTIVE dimension to an in-flight embedding job."
   ],
   "dependencies": ["US-41.1"],
-  "estimated_tokens": 300000
+  "estimated_tokens": 350000
 }

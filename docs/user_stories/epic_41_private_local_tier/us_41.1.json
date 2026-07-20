@@ -6,7 +6,7 @@
     "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
   },
   "priority": "high",
-  "background": "The embedding vector dimension is pinned by the column type in exactly two migrations: priv/repo/migrations/20260410022854_enable_pgvector_and_add_embedding.exs:25 (ALTER TABLE articles ADD COLUMN embedding vector(1536)) and priv/repo/migrations/20260709000000_create_memory_stores.exs:101 (memories). The HNSW indexes do NOT pin a dimension - lib/loopctl/repo/hnsw_index.ex:125 emits USING hnsw (embedding vector_cosine_ops) parameterized only by table name, so it inherits whatever the column type is. Application.get_env(:loopctl, :embedding_dimensions, 1536) (config/config.exs:16) exists but is a CHANGESET VALIDATION ONLY (article.ex:490,506; memory.ex:281) - changing it does not change the column type, so 1536 is effectively hard system-wide. This is the blocker reported in #409: a local embedding model with a different native dimension (nomic-embed 768, bge 1024) cannot be used at all. The 2026-07-15 draft proposed a deployment-level single dimension; that is reversed here because the user who filed #409 is a HOSTED tenant, and a deployment-level dimension would force them off the hosted service to get a local model.",
+  "background": "The embedding vector dimension is pinned by the column type in exactly two migrations: priv/repo/migrations/20260410022854_enable_pgvector_and_add_embedding.exs:25 (ALTER TABLE articles ADD COLUMN embedding vector(1536)) and priv/repo/migrations/20260709000000_create_memory_stores.exs:101 (memories). Application.get_env(:loopctl, :embedding_dimensions, 1536) (config/config.exs:16) exists but is a CHANGESET VALIDATION ONLY (article.ex:490,506; memory.ex:281) - changing it does not change the column type, so 1536 is effectively hard system-wide. This is the blocker reported in #409: a local embedding model with a different native dimension (nomic-embed 768, bge 1024) cannot be used at all. The 2026-07-15 draft proposed a deployment-level single dimension; that is reversed here because the user who filed #409 is a HOSTED tenant, and a deployment-level dimension would force them off the hosted service to get a local model. CORRECTION to the 39 draft's premise: it is NOT true that 'HNSW inherits the column type so a mixed-dimension column is free'. pgvector refuses to build an hnsw/ivfflat index on a vector column with no dimension modifier, and a WHERE dim = N partial predicate does not supply a typmod - lib/loopctl/repo/hnsw_index.ex:125 emits USING hnsw (embedding vector_cosine_ops) which only works because the column today IS vector(1536). Two further grounded facts constrain this story: (a) the LIVE articles HNSW index (20260709000300, US-28.2) is PARTIAL on WHERE superseded_by IS NULL precisely so the recall inner-ANN predicate matches exactly and superseded rows cannot occupy pool slots; superseded_by lives on articles, not on a side table. (b) semantic search, novelty and suggest-links run on HeavyReadRepo (BYPASSRLS) via the Loopctl.HeavyRead facade, whose guard!/2 (heavy_read.ex:642-660) RAISES unless every base-table source, recursively including joins and subqueries, carries a conjunctive tenant_id equality - RLS does nothing on that path.",
   "story": {
     "as_a": "a tenant whose privacy or cost constraints require a specific embedding model",
     "i_want_to": "choose an embedding model whose native dimension is not 1536 and have loopctl store and index those vectors correctly",
@@ -16,37 +16,62 @@
   "acceptance_criteria": [
     {
       "id": "AC-41.1.1",
-      "description": "Vectors move to side tables article_embeddings(article_id, dim, embedding) and memory_embeddings(memory_id, dim, embedding), each tenant_id-scoped with RLS via the existing enable_rls/1 macro (repo/rls_helpers.ex:38-63, ENABLE not FORCE), and a unique constraint on (article_id) / (memory_id) so one row holds the current vector.",
+      "description": "Vectors move to side tables article_embeddings(article_id, dim, embedding, superseded_by_denorm) and memory_embeddings(memory_id, dim, embedding), each tenant_id-scoped with RLS via the existing enable_rls/1 macro (repo/rls_helpers.ex:38-63, ENABLE not FORCE), and a unique constraint on (article_id) / (memory_id) so one row holds the current vector. The live-row predicate the current articles HNSW index depends on (WHERE superseded_by IS NULL, 20260709000300) is NOT expressible across tables, so a live/superseded marker is DENORMALIZED onto article_embeddings and kept in sync with articles.superseded_by (same transaction or trigger). A test supersedes an article and asserts the embeddings row's marker flips and the row leaves the ANN pool.",
       "status": "pending"
     },
     {
       "id": "AC-41.1.2",
-      "description": "One PARTIAL HNSW index per distinct dimension in use (WHERE dim = N), created by an idempotent helper extending repo/hnsw_index.ex. Adding a new dimension creates its index without touching existing ones; no index is created for a dimension with no rows.",
+      "description": "Per-dimension ANN indexing is specified in a form pgvector actually accepts, VERIFIED against pgvector before the story is contracted: pgvector will not index an unconstrained vector column, so a WHERE dim = N partial index over a bare vector column is NOT an acceptable implementation. The implementation is ONE of (a) a typed column/table/partition per supported dimension (LIST partitioning on dim with a vector(N) column per partition), or (b) an expression index over an explicit cast - CREATE INDEX ... USING hnsw ((embedding::vector(768)) vector_cosine_ops) WHERE dim = 768 AND superseded_by_denorm IS NULL - with the query using the IDENTICAL cast expression so the planner can match it. Whichever is chosen, each per-dimension index also carries the live-row predicate from AC-41.1.1, and the helper extending repo/hnsw_index.ex detects existence by EXACT INDEX NAME, not by access method (hnsw_index.ex:116-126's amname check would skip every index after the first, which is why 20260709000300 already had to detect by name).",
       "status": "pending"
     },
     {
       "id": "AC-41.1.3",
-      "description": "A tenant's dimension is derived from its configured embedding model, not set by hand, and is readable via the API/MCP. Writing a vector whose length disagrees with the tenant's recorded dimension is rejected with a legible error naming both values - never silently stored or truncated.",
+      "description": "Index DDL is OPERATOR/MIGRATION PLANE ONLY - never issued from the request path and never from set_llm_config. The instance publishes a FIXED set of supported dimensions on .well-known/loopctl (US-41.4 AC-41.4.7); their indexes are pre-created by migration with @disable_ddl_transaction true + @disable_migration_lock true so CREATE INDEX CONCURRENTLY is legal, and the US-41.2 probe REJECTS any dimension outside that published set with the dimension-not-supported-by-this-instance remediation. Adding a dimension to the supported set is a migration plus a config change, not an agent action. A test asserts no API/MCP path issues index DDL.",
       "status": "pending"
     },
     {
       "id": "AC-41.1.4",
-      "description": "Search and recall join the side table and filter by the caller tenant's dimension, so a tenant NEVER sees or ranks against vectors of a different dimension. A cross-dimension similarity comparison must be impossible by construction (the query is dimension-scoped), not merely unlikely.",
+      "description": "A tenant's dimension is stored on the tenant (a tenant_embedding_dimension column added BY THIS STORY, so US-41.1 is implementable without US-41.2) and is readable via the API/MCP. Its v1 derivation is a STATIC model-to-dimension table shipped in this story, with :embedding_dimensions (1536) as the default for a tenant with no explicit model. US-41.2's config-time probe later reconciles with and OVERRIDES that table when a real endpoint reports a different dimension. Writing a vector whose length disagrees with the tenant's recorded dimension is rejected with a legible error naming both values - never silently stored or truncated.",
       "status": "pending"
     },
     {
       "id": "AC-41.1.5",
-      "description": "Backfill migration moves every existing articles.embedding / memories.embedding into the side table with dim = 1536, is resumable and batched (the corpus is large - see epic 27 scale work), and leaves the old column in place but unused until a follow-up drop. Zero behavior change for existing tenants: same results, same ranking.",
+      "description": "Search and recall are dimension-scoped WITHOUT putting a join inside the index-ordered top-k. The ANN stage stays the documented filter-after-ANN shape (KB bd4a26b6, prod issue #172): a pure index-ordered inner top-pool over the embeddings relation whose WHERE clause contains ONLY predicates the partial index carries (tenant_id, dim, live marker), with every other filter and every join applied OUTSIDE that subquery. A cross-dimension similarity comparison must be impossible by construction (the inner pool is dimension-scoped), not merely unlikely.",
       "status": "pending"
     },
     {
       "id": "AC-41.1.6",
-      "description": "Changing a tenant's embedding model (and therefore dimension) is supported via an agent-triggerable re-embed backfill that reports progress through the existing job/anomaly surfaces. It is documented as a one-time operation, NOT an online migration; stale-dimension rows are excluded from recall until re-embedded rather than being compared incorrectly.",
+      "description": "The new relations satisfy the HeavyRead BYPASSRLS contract, not just RLS: every query that reaches article_embeddings / memory_embeddings through Loopctl.HeavyRead carries a CONJUNCTIVE tenant_id equality on the embeddings source itself (joined or subqueried), so HeavyRead.all/3's guard!/2 does not raise; memory_embeddings additionally satisfies guard_memory!/3's outermost subject_id equality. Tests cover BOTH paths: an RLS isolation test on Loopctl.Repo AND a test asserting guard!/2 accepts the real search query.",
       "status": "pending"
     },
     {
       "id": "AC-41.1.7",
-      "description": "Query performance on the hosted default (dim 1536) does not regress measurably versus the current single-column form. The added join is on an indexed FK; a benchmark or query-plan assertion documents the result.",
+      "description": "System-scoped articles (Article @scope_values [:tenant, :system], tenant_id nil, read by every tenant via 'a.tenant_id == ^tenant_id or a.scope == :system') have a DEFINED storage and recall story: article_embeddings.tenant_id is nullable for scope :system rows with an explicit RLS policy admitting them to every tenant, and the shared canonical corpus is embedded at EVERY dimension in the instance's supported set (one row per (article_id, dim), which relaxes AC-41.1.1's uniqueness to (article_id, dim) for system rows). If an instance chooses not to do that, the story must instead state explicitly that the system corpus is keyword-only for non-default-dimension tenants and the search response must say so in meta. A test asserts a 768-dim tenant can semantically recall a system article.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.1.8",
+      "description": "Cutover is explicit, not implied. During the backfill window writes go to BOTH the legacy articles.embedding / memories.embedding column and the side table (dual-write); reads keep using the legacy column until a flag is flipped, and the flag may only be flipped after the backfill reports completion. The dual-write is removed in the follow-up drop story. A test asserts search results are unchanged MID-backfill (with only part of the corpus migrated) and that an embedding written mid-backfill is present in both locations.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.1.9",
+      "description": "Backfill migration moves every existing articles.embedding / memories.embedding into the side table with dim = 1536, is resumable and batched (the corpus is large - see epic 27 scale work), and leaves the old column in place but unused until a follow-up drop. Zero behavior change for existing tenants: same results, same ranking.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.1.10",
+      "description": "Changing a tenant's embedding model (and therefore dimension) is supported via an agent-triggerable re-embed backfill that reports progress through the existing job/anomaly surfaces. It is documented as a one-time operation, NOT an online migration; stale-dimension rows are excluded from recall until re-embedded rather than being compared incorrectly, and the exclusion is reported in the search response meta so an agent sees WHY recall shrank.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.1.11",
+      "description": "The expected dimension is resolved ONCE per operation or batch and passed INTO the changeset as an option/attr; the validators at article.ex:490,506 and memory.ex:281 stay PURE (no Repo read, no process-dictionary lookup) so the ~100-article batch embedding path (US-37.4) does not become an N+1. A test asserts a batch of N articles performs no per-item settings query.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.1.12",
+      "description": "Query performance on the hosted default (dim 1536) does not regress. Because a small test DB never reproduces the planner's cost-based choice, the acceptance gate is a PRODUCTION-shaped EXPLAIN (AdminRepo.explain via fly rpc against the real corpus) plus a plan assertion that NO Seq Scan reaches the vector relation and the per-dimension index is the chosen path. A local-only benchmark is explicitly NOT sufficient evidence.",
       "status": "pending"
     }
   ],
@@ -62,20 +87,20 @@
     },
     {
       "id": "TC-41.1.2",
-      "name": "partial HNSW index exists per dimension and is used",
+      "name": "per-dimension ANN index is CHOSEN by the planner at production scale",
       "type": "integration",
-      "preconditions": ["rows at two distinct dimensions"],
+      "preconditions": ["rows at two distinct dimensions", "a production-shaped EXPLAIN target (AdminRepo.explain against the real corpus)"],
       "steps": ["EXPLAIN the semantic search query for each dimension"],
-      "expected_results": ["each plan uses the partial HNSW index for its own dim", "no sequential scan over the side table"],
+      "expected_results": ["each plan uses the per-dimension index for its own dim", "no Seq Scan reaches the vector relation", "the assertion is made without enable_seqscan=off - eligibility is not selection"],
       "status": "pending"
     },
     {
       "id": "TC-41.1.3",
-      "name": "backfill is resumable and lossless",
+      "name": "backfill is resumable and lossless, and search is unchanged mid-flight",
       "type": "integration",
       "preconditions": ["articles and memories with existing 1536-dim embeddings"],
-      "steps": ["run the backfill", "interrupt it midway", "re-run to completion"],
-      "expected_results": ["every vector present exactly once at dim 1536", "no duplicates from the re-run", "search results identical to pre-backfill"],
+      "steps": ["run the backfill", "interrupt it midway", "run a semantic search while partially migrated", "write a new embedding while partially migrated", "re-run to completion"],
+      "expected_results": ["mid-backfill search results identical to pre-backfill", "the mid-flight embedding is present in BOTH the legacy column and the side table", "every vector present exactly once at dim 1536 after completion", "no duplicates from the re-run"],
       "status": "pending"
     },
     {
@@ -89,22 +114,59 @@
     },
     {
       "id": "TC-41.1.5",
-      "name": "tenant isolation on the side tables",
+      "name": "tenant isolation on BOTH the RLS path and the HeavyRead path",
       "type": "integration",
       "preconditions": ["two tenants with embeddings"],
-      "steps": ["query article_embeddings as tenant A"],
-      "expected_results": ["tenant B rows are not visible (RLS policy enforced)"],
+      "steps": ["query article_embeddings as tenant A via Loopctl.Repo", "run the real semantic search query through Loopctl.HeavyRead"],
+      "expected_results": ["tenant B rows are not visible (RLS policy enforced)", "guard!/2 does not raise - the joined embeddings source carries a conjunctive tenant_id equality", "an intentionally unscoped variant of the query DOES raise, proving the guard is load-bearing"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.1.6",
+      "name": "superseded rows leave the ANN pool",
+      "type": "integration",
+      "preconditions": ["a full default-size pool of live articles plus superseded ones"],
+      "steps": ["supersede an article that would otherwise rank in the top pool", "run recall"],
+      "expected_results": ["the superseded row does not occupy a pool slot", "the pool is filled with live rows - no silent under-fill"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.1.7",
+      "name": "system-scoped corpus is reachable at a non-default dimension",
+      "type": "integration",
+      "preconditions": ["a system-scoped article", "a tenant configured at 768 dims"],
+      "steps": ["run semantic search as the 768-dim tenant"],
+      "expected_results": ["the system article is recallable per the documented strategy, OR the response meta explicitly reports the system corpus as keyword-only for this dimension - never a silent absence"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.1.8",
+      "name": "index DDL is not reachable from the request path",
+      "type": "integration",
+      "preconditions": ["agent, orchestrator and user keys", "a dimension outside the published supported set"],
+      "steps": ["attempt to configure the unsupported dimension via set_llm_config at every role"],
+      "expected_results": ["rejected with the dimension-not-supported remediation", "no CREATE INDEX is issued by any API or MCP path"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.1.9",
+      "name": "batch embedding performs no per-item dimension lookup",
+      "type": "integration",
+      "preconditions": ["a batch of 100 articles to embed"],
+      "steps": ["run the batch", "count settings/tenant queries"],
+      "expected_results": ["the tenant dimension is resolved once for the batch", "no N+1"],
       "status": "pending"
     }
   ],
   "technical_notes": [
-    "Only two column definitions actually pin the dimension; the HNSW helper (repo/hnsw_index.ex:125) is dimension-agnostic and can be reused nearly as-is with an added WHERE dim = N predicate.",
-    "Keep :embedding_dimensions as the DEFAULT for a tenant with no explicit model, so existing config semantics survive; the changeset validations at article.ex:490,506 and memory.ex:281 must switch to validating against the TENANT's dimension, not the global config.",
-    "pgvector cannot compare vectors of different dimensions - it errors. That is a safety net, not the design: the query must be dimension-scoped so the error is unreachable in normal operation.",
-    "Do NOT drop articles.embedding / memories.embedding in this story. Land the side table + backfill first, verify in prod, drop in a follow-up so a rollback stays trivial.",
-    "Memories already use explicit (tenant_id, subject_id) predicates rather than relying on RLS alone (memory.ex:18-42) - preserve that pattern on memory_embeddings.",
-    "Watch index build cost: HNSW builds are expensive at corpus scale. Create partial indexes CONCURRENTLY and treat a new dimension's first index build as an operational step."
+    "Verify the chosen per-dimension index form against pgvector FIRST (AC-41.1.2). If the expression-index-over-cast form does not plan as hoped, fall back to LIST partitioning on dim with a typed vector(N) column per partition - do not ship a design that assumes a bare vector column can be HNSW-indexed.",
+    "Keep :embedding_dimensions as the DEFAULT for a tenant with no explicit model, so existing config semantics survive.",
+    "pgvector cannot compare vectors of different dimensions - it errors. That is a safety net, not the design: the inner ANN pool must be dimension-scoped so the error is unreachable in normal operation.",
+    "Do NOT drop articles.embedding / memories.embedding in this story. Land the side table + dual-write + backfill first, verify in prod, drop in a follow-up so a rollback stays trivial.",
+    "Memories already use explicit (tenant_id, subject_id) predicates rather than relying on RLS alone (memory.ex:18-42) - preserve that pattern on memory_embeddings; HeavyRead.guard_memory!/3 requires it structurally.",
+    "Watch index build cost: HNSW builds are expensive at corpus scale. Per-dimension indexes are built CONCURRENTLY from a migration with @disable_ddl_transaction true and @disable_migration_lock true - never inline in a request.",
+    "Second brain: 'Decision: per-tenant embedding dimension (supersedes the 2026-07-15 deployment-level call)' records this call and the corrected cost analysis; KB bd4a26b6 records the JOIN-kills-HNSW incident (#172); KB 9c766ca7 records the three-repo split and the HeavyRead guard."
   ],
   "dependencies": [],
-  "estimated_tokens": 450000
+  "estimated_tokens": 600000
 }

@@ -45,13 +45,29 @@ epic; anything that fails it is a design bug, not a docs gap:
 
 | Knob | Scope | Agent-manageable? | Surface |
 |---|---|---|---|
-| `embedding_base_url` | tenant | **write** | extend existing `set_llm_config` MCP tool + PATCH API |
-| extraction/classification/merge endpoint | tenant | **write** | same tool, same pattern |
-| `local_only`, `encrypt_body` scope marking | tenant/project | **write** | new MCP tool + endpoint (US-41.4) |
-| `LOCAL_ENDPOINT_ALLOWLIST` | deployment | **read-only** — it is the trust root; an agent must never widen its own allowlist | reported by `egress_posture` |
-| embedding **dimension** | tenant (US-41.1) | **write** (choice of model) — the DDL is never agent-writable | published on `.well-known/loopctl`; validated by a config-time probe |
+| `embedding_base_url` | tenant | **NO — role `:user`** (corrected) | `set_llm_config` MCP tool + PATCH API, which is `role: :user` (`router.ex:185-189`) because the same PATCH stores tenant secrets |
+| extraction/classification/merge endpoint | tenant | **NO — role `:user`** (corrected) | same tool, same route, same reason |
+| `local_only`, `encrypt_body` scope marking | tenant/project | **asymmetric**: enabling (tightening) at `:orchestrator`+, clearing at `:user` | new MCP tool + endpoint (US-41.4) |
+| tenant-declared **trusted endpoints** | tenant | **NO — role `:user`** | new MCP tool + endpoint (US-41.4); reported by `egress_posture` |
+| `LOCAL_ENDPOINT_ALLOWLIST` | deployment | **read-only at every role** — it is the trust root; nobody widens it through the API | reported by `egress_posture` |
+| `egress_posture` (read) | tenant | **read at `:agent`** — verify-before-harvest must work with the key an agent already holds | new MCP tool + endpoint (US-41.4) |
+| embedding **dimension** | tenant (US-41.1) | **NO — follows the endpoint write at `:user`**; the DDL is never writable from the request path at any role | published on `.well-known/loopctl`; validated by a config-time probe |
 
-Two consequences fall out of that audit, and both are new relative to the 39 draft:
+**Correction to the 39 draft (and to an earlier version of this table).** The draft
+asserted that `embedding_base_url` and the chat endpoint were *agent*-writable "via the
+existing `set_llm_config` tool". That is false and was never true: `PATCH
+/tenants/me/llm-config` sits in the `role: :user` scope (`router.ex:185-189`) precisely
+because it stores tenant secrets, and `mcp-server/index.js:1836-1843` sends the exact
+`LOOPCTL_USER_KEY` with the global-key override deliberately bypassed (reviews #12/#13).
+Lowering that route to `:agent` would be a trust-boundary change requiring the CLAUDE.md
+role-hierarchy argument, and this epic does **not** make it. Endpoint configuration is a
+**human/user-role** act; everything an agent needs at run time — discovery
+(`.well-known`), verification (`egress_posture`), and tightening (`local_only` at
+orchestrator+) — stays agent-reachable. The no-UI principle is preserved by making
+configuration *scriptable through the API by the tenant's user key*, not by widening what
+an agent key may do with secrets.
+
+Three consequences fall out of that audit, and all three are new relative to the 39 draft:
 
 1. **Publish instance capabilities on `.well-known/loopctl`** (the US-26.0.4
    discovery endpoint): supported embedding dimensions, whether non-default
@@ -64,6 +80,17 @@ Two consequences fall out of that audit, and both are new relative to the 39 dra
    supplied endpoint, check the dimension, and fail fast with a `meta.remediation`
    payload — the same ACTION-REQUIRED shape `knowledge_search` already returns for
    a missing embedding key.
+3. **"Local" is two concepts, not one.** *Network* locality (loopback / private
+   ranges / the deployment allowlist) and *non-third-party-ness* (an endpoint the
+   tenant owns and attests to) are different things, and conflating them breaks the
+   hosted case outright: on the hosted instance the server's loopback and private
+   ranges are the **operator's** network, so a hosted tenant's own Ollama/TEI box is
+   reachable only via a public hostname (VPS, tailscale funnel, their own domain).
+   A network-locality-only definition would classify every real hosted `local_only`
+   tenant as non-local and hard-block them, with the only escape hatch being an
+   allowlist no tenant may touch. US-41.4 therefore adds a **per-tenant declared
+   trusted-endpoint list** (role `:user`), and the posture report and custody claim
+   label the two distinctly: *network-local* vs *tenant-declared, not network-local*.
 
 ## Grounded current state (re-verified against master 2026-07-20)
 
@@ -72,12 +99,12 @@ Three of them changed.
 
 | Capability | Today | Gap |
 |---|---|---|
-| Embedding **dimension** | `:embedding_dimensions` (`config/config.exs:16`) is a **changeset validation only** (`article.ex:490,506`, `memory.ex:281`); the column type is pinned by **two** `ALTER TABLE`s (`20260410022854:25`, `20260709000000:101`). **HNSW indexes do NOT pin a dimension** — they inherit the column type (`repo/hnsw_index.ex:125`). | per-tenant dimension -> **US-41.1** |
+| Embedding **dimension** | `:embedding_dimensions` (`config/config.exs:16`) is a **changeset validation only** (`article.ex:490,506`, `memory.ex:281`); the column type is pinned by **two** `ALTER TABLE`s (`20260410022854:25`, `20260709000000:101`). `repo/hnsw_index.ex:125` emits `USING hnsw (embedding vector_cosine_ops)` — which works *only because the column is `vector(1536)` today*. pgvector **refuses** to index an unconstrained `vector` column, and a `WHERE dim = N` predicate supplies no typmod, so a mixed-dimension side table needs a typed column/partition per dimension **or** an expression index over an explicit cast. | per-tenant dimension -> **US-41.1** |
 | Embedding **endpoint** | server-wide `runtime.exs:382-385`, read at `embedding_client.ex:194` | per-tenant `embedding_base_url` -> **US-41.2** |
 | Embedding **key** | **already per-tenant and MANDATORY** — no tenant key, no call (`embedding_client.ex:58-60,75-77`); the global operator key was deliberately removed (`runtime.exs:375-381`) | none — this is why US-41.2 is one field, not a subsystem |
 | Extraction **endpoint** | `@base_url` hardcoded (`anthropic.ex:37`, used `:139`). No provider behaviour — but six **task-level** behaviours exist and are config-swappable (already Mox-mapped in `config/test.exs`) | 4 sibling impls, not a refactor -> **US-41.3** |
 | Egress **enforcement** | `Provider.Admission` sits before all three provider `Req.post`s (`anthropic.ex:118`, `embedding_client.ex:91,101`) — but it is **FAIL-OPEN by design** (`admission.ex:81-97`, `fail_open/2:183`), a burst shedder, not a deny-gate | fail-CLOSED guard + posture surface -> **US-41.4** |
-| Non-provider **egress** | webhook delivery posts tenant-supplied URLs and **bypasses Admission entirely** (`webhooks/req_delivery.ex:43`) | -> **US-41.5** (missed by the 39 draft) |
+| Non-provider **egress** | webhook delivery posts tenant-supplied URLs and **bypasses Admission entirely** (`webhooks/req_delivery.ex:43`) — but *not* unguarded: `:20` calls `UrlGuard.pin/1` and `:31` uses `pinned_request_opts` (`redirect: false`), which blocks loopback, private, CGNAT, link-local and Fly 6PN to close GHSA-jh42-wf7g-f5rg. So a `local_only` destination is blocked today by the **SSRF** guard, not the locality guard | one shared egress policy module -> **US-41.5** (missed by the 39 draft) |
 | Data **at rest** | `articles.body` and `memories.text` are plaintext `:string`; Cloak covers exactly 4 fields (2 BYO keys, `webhook.signing_secret_encrypted`, `idempotency_cache.response_data`); `articles.search_vector` is generated from title+body | encrypted tier -> **US-41.6** |
 | Egress **provenance** | none — posture is config, not a recorded fact | witnessed custody claim -> **US-41.7** |
 
@@ -90,28 +117,41 @@ axes were merged:
 
 - **Axis A — where inference happens.** US-41.2, 41.3, 41.4, 41.5. All per-tenant.
   These ship on the hosted service unchanged. A hosted tenant points inference at
-  their own endpoint and their content never touches Anthropic/OpenAI, while
-  keeping every hosted advantage: managed DB, RLS, hash-chained audit, STH witness,
-  verification runs, zero ops burden.
+  their own endpoint — declared as a trusted endpoint per consequence 3 above, since
+  a hosted tenant's box is public-hostname-reachable, not network-local — and their
+  content never touches Anthropic/OpenAI, while keeping every hosted advantage:
+  managed DB, RLS, hash-chained audit, STH witness, verification runs, zero ops
+  burden.
 - **Axis B — where data rests.** US-41.1 and US-41.6. Also per-tenant, once the
   dimension moves to a side table.
 
 **Superseded decision.** The 2026-07-15 call ("deployment-level dimension,
-per-tenant deferred") is reversed. It is now cheap (only two column definitions
-move; HNSW inherits) and it is the only version that serves a hosted tenant running
-a 768-dim local model. See US-41.1.
+per-tenant deferred") is reversed: it is the only version that serves a hosted tenant
+running a 768-dim local model. It is **not** as cheap as the draft claimed — the
+"HNSW inherits the column type, so only two column definitions move" framing was wrong
+(see the dimension row above and US-41.1 AC-41.1.2). The reversal and its corrected cost
+analysis are recorded in the second brain as the decision article *"Decision: per-tenant
+embedding dimension (supersedes the 2026-07-15 deployment-level call) — loopctl epic 41"*
+(`ae9a1719-e368-4175-8218-fa6e878cb277`), so the call is retrievable by agents rather
+than living only in this README. See US-41.1.
 
 ## Stories
+
+Dependency note: **US-41.4 no longer depends on 41.2/41.3.** The classifier, fail-closed
+guard, egress policy module and `egress_posture` surface are implementable against today's
+hardcoded vendor endpoints, and posture reporting is strictly more truthful early —
+blocking the epic's highest-value safety control behind ~1.25M tokens of data-model
+prerequisites was a sequencing bug, not a real dependency.
 
 | Story | Title | Axis | Depends |
 |-------|-------|------|---------|
 | US-41.1 | Per-tenant embedding dimension via an `article_embeddings` / `memory_embeddings` side table | B | — |
 | US-41.2 | Per-tenant embedding **endpoint** + config-time dimension probe with legible remediation | A | US-41.1 |
 | US-41.3 | Pluggable extraction/classification/merge endpoint (OpenAI-compatible local chat) | A | — |
-| US-41.4 | **Fail-closed** no-egress guard + `local_only` scope marking + `egress_posture` MCP tool + `.well-known` capability publication | A | US-41.2, US-41.3 |
+| US-41.4 | **Fail-closed** no-egress guard + `local_only` scope marking + tenant-declared trusted endpoints + `egress_posture` MCP tool + `.well-known` capability publication | A | — |
 | US-41.5 | Extend the egress guard to non-provider egress (webhook delivery) | A | US-41.4 |
-| US-41.6 | Encrypted private-tier bodies at rest + vector-only recall + honest threat model | B | US-41.1 |
-| US-41.7 | Egress posture as a **witnessed custody claim** in the audit chain / STH | A | US-41.4 |
+| US-41.6 | Encrypted private-tier bodies at rest + vector-only recall + honest threat model | B | US-41.1, US-41.4 |
+| US-41.7 | Egress posture as a **witnessed custody claim** in the audit chain / STH | A | US-41.4, US-41.5 |
 
 ## Decisions
 
@@ -119,9 +159,13 @@ a 768-dim local model. See US-41.1.
 - **Private tier is solved with crypto, not a visibility flag.** Today's
   `private`/`owner` visibility is a metadata string filtered query-side **only for
   agent-role callers** (`coordination.ex:1021-1022`) — user/orchestrator/superadmin
-  keys see private articles, and memories have no visibility field at all.
-  Hardening that flag is the wrong lever for health/DNA data; encryption is the
-  right one.
+  keys see private articles. The `memories` **table** has no visibility column;
+  graduated memory *articles* do carry `metadata.visibility = "owner"`
+  (`memory.ex:1907-1912`), also enforced only for agent-role callers (#163), and
+  memories themselves are scoped by explicit `(tenant_id, subject_id)` predicates.
+  Either way, hardening that flag is the wrong lever for health/DNA data; encryption
+  is the right one — and encryption is **tenant/subject isolation at rest, not
+  intra-tenant role separation** (US-41.6 AC-41.6.6).
 - **Honest threat model, stated in the docs and the tool descriptions.** US-41.6 v1
   uses a per-tenant DEK **held server-side**. That protects against a DB dump or a
   disk image — exactly what the AC claims — and **NOT** against a compromised app

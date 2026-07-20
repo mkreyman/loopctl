@@ -6,7 +6,7 @@
     "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
   },
   "priority": "high",
-  "background": "Model providers are not the only path content leaves the box. An audit of every outbound Req call in lib/ found: anthropic.ex:139 and embedding_client.ex:109,133 are gated by Admission; workers/content_ingestion_worker.ex:634 (Req.get of an arbitrary ingestion URL) bypasses it and is guarded instead by UrlGuard.pinned_request_opts/1 + redirect: false (:620-632); verification/github_actions.ex:17, secrets/fly_adapter.ex:60,112 and webhooks/req_delivery.ex:43 all bypass Admission entirely. Of these, webhook delivery is the one that can carry TENANT CONTENT to a TENANT-SUPPLIED URL. The 2026-07-15 draft missed this: a local_only guarantee that covers embeddings and extraction but not webhooks is not a guarantee, and stating it as one would be worse than not offering the tier.",
+  "background": "Model providers are not the only path content leaves the box. An audit of every outbound Req call in lib/ found: anthropic.ex:139 and embedding_client.ex:109,133 are gated by Admission; workers/content_ingestion_worker.ex:634 (Req.get of an arbitrary ingestion URL) bypasses it and is guarded instead by UrlGuard.pinned_request_opts/1 + redirect: false (:620-632); verification/github_actions.ex:17, secrets/fly_adapter.ex:60,112 and webhooks/req_delivery.ex:43 all bypass Admission entirely. Of these, webhook delivery is the one that can carry TENANT CONTENT to a TENANT-SUPPLIED URL. The 2026-07-15 draft missed this: a local_only guarantee that covers embeddings and extraction but not webhooks is not a guarantee. CORRECTION to that inventory: webhook delivery bypasses ADMISSION but is NOT otherwise unguarded - req_delivery.ex:20 calls UrlGuard.pin/1 and :31 uses pinned_request_opts with redirect: false, and UrlGuard blocks loopback, private, CGNAT, link-local and Fly 6PN targets to close GHSA-jh42-wf7g-f5rg. So today a loopback webhook destination returns {:error, \"blocked_url: :blocked_ip\"}, and a local_only tenant - who by definition needs a private-range or tenant-declared destination - is blocked by the SSRF guard rather than by the locality guard. This story therefore does not add a URL policy; it routes webhook delivery through the SINGLE policy module from US-41.4 AC-41.4.9, which composes the SSRF denylist with the allowlist/tenant-declaration carve-outs.",
   "story": {
     "as_a": "a tenant who marked a scope local_only",
     "i_want_to": "have that marking cover EVERY path content can leave the instance, including webhook delivery",
@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-41.5.1",
-      "description": "Webhook delivery consults the same local classification as US-41.4. For a local_only scope, a delivery whose destination is not classified local is refused before the request, with the same fail-closed semantics (unclassifiable means refuse).",
+      "description": "Webhook delivery consults the SAME single egress policy module as US-41.4 (AC-41.4.9) - the one that composes UrlGuard's SSRF denylist with the deployment allowlist and the tenant's declared trusted endpoints. For a local_only scope, a delivery whose destination is not classified local (network-local or tenant-declared) is refused before the request, with the same fail-closed semantics (unclassifiable means refuse). Conversely a destination that IS allowlisted or tenant-declared must become deliverable, which it is not today: req_delivery.ex:20's unconditional UrlGuard.pin/1 currently rejects every loopback/private destination, so this story replaces that call with the policy module rather than adding a second policy beside it. Scope precedence follows US-41.4 AC-41.4.2 (most-restrictive-wins; a subscription with no project follows the tenant marking).",
       "status": "pending"
     },
     {
@@ -36,12 +36,17 @@
     },
     {
       "id": "AC-41.5.5",
-      "description": "egress_posture (US-41.4 AC-41.4.6) is extended to report webhook destinations and their local classification, so the posture report covers every content-carrying egress path. Until this story lands, the posture report must state that its scope is provider calls only.",
+      "description": "egress_posture (US-41.4 AC-41.4.8) is extended to report webhook destinations and their local classification (network-local vs tenant-declared vs non-local), so the posture report covers every content-carrying egress path. Until this story lands, the posture report must state that its scope is provider calls only.",
       "status": "pending"
     },
     {
       "id": "AC-41.5.6",
-      "description": "The remaining outbound paths are explicitly triaged in the docs with a rationale for each: ingestion URL fetch (inbound content, sends no tenant data, already URL-guarded), GitHub verification (commit metadata only), Fly secrets (operator-plane, no tenant content). Any that DO carry tenant content are brought under the guard rather than documented away.",
+      "description": "The remaining outbound paths are explicitly triaged in the docs with a rationale for each: ingestion URL fetch (inbound content, sends no tenant data, already URL-guarded), GitHub verification (commit metadata only), Fly secrets (operator-plane, no tenant content). Any that DO carry tenant content are brought under the guard rather than documented away. All of them - including the ingestion fetch - consult the single policy module, so no path keeps a private copy of the URL rules.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.5.7",
+      "description": "Any new table or column introduced by this story (blocked-delivery records, per-subscription locality classification) carries tenant_id, uses the enable_rls/1 macro (ENABLE, not FORCE, per CLAUDE.md's Multi-Tenant Rules), and has a tenant-isolation test asserting tenant A cannot read tenant B's blocked-delivery records.",
       "status": "pending"
     }
   ],
@@ -50,18 +55,18 @@
       "id": "TC-41.5.1",
       "name": "local_only blocks a public webhook destination",
       "type": "integration",
-      "preconditions": ["local_only scope", "subscription pointing at a public URL"],
+      "preconditions": ["local_only scope", "subscription pointing at a public, undeclared URL"],
       "steps": ["trigger an event"],
       "expected_results": ["no request issued", "delivery recorded as blocked with a legible reason"],
       "status": "pending"
     },
     {
       "id": "TC-41.5.2",
-      "name": "local destination still delivers",
+      "name": "allowlisted / tenant-declared destination still delivers",
       "type": "integration",
-      "preconditions": ["local_only scope", "subscription pointing at a loopback URL"],
+      "preconditions": ["local_only scope", "subscription pointing at a destination present in the deployment allowlist (or declared as a tenant trusted endpoint) - NOT a bare loopback URL, which UrlGuard blocks by default"],
       "steps": ["trigger an event"],
-      "expected_results": ["delivered normally"],
+      "expected_results": ["delivered normally", "and a control case: the same private-range host WITHOUT an allowlist/declaration entry is still refused by the SSRF policy - GHSA-jh42-wf7g-f5rg stays closed"],
       "status": "pending"
     },
     {
@@ -90,13 +95,22 @@
       "steps": ["trigger several events", "inspect the job queue"],
       "expected_results": ["no unbounded retry backlog - blocked is terminal for that delivery"],
       "status": "pending"
+    },
+    {
+      "id": "TC-41.5.6",
+      "name": "blocked-delivery records are tenant-isolated",
+      "type": "integration",
+      "preconditions": ["two tenants, one with blocked deliveries"],
+      "steps": ["read blocked-delivery records as the other tenant"],
+      "expected_results": ["not visible - RLS policy enforced"],
+      "status": "pending"
     }
   ],
   "technical_notes": [
-    "webhooks/req_delivery.ex:43 uses Req.request/1 and is invoked from the delivery worker - the guard belongs where the destination is resolved, before the request is built, mirroring the provider-call placement.",
+    "webhooks/req_delivery.ex:20 (UrlGuard.pin/1) and :31 (pinned_request_opts, redirect: false) are the existing guard; :43 issues the request. The change is to replace the direct UrlGuard call with the US-41.4 policy module at the point the destination is resolved, mirroring the provider-call placement. Do NOT weaken the default denylist - the carve-out is allowlist/declaration-driven only.",
     "Webhook signing secrets are already Cloak-encrypted (webhooks/webhook.ex:61); the destination URL is not a secret and must be readable by egress_posture.",
-    "Do not conflate 'blocked' with 'failed' in the delivery record - a blocked delivery is a configuration conflict, and an operator or agent reading failures needs to tell them apart.",
-    "AC-41.5.6 is a real audit, not a paragraph: re-run the outbound Req call inventory at implementation time, since new call sites may have landed."
+    "Do not conflate 'blocked' with 'failed' in the delivery record - a blocked delivery is a configuration conflict, and an operator or agent reading failures needs to tell them apart. Note there are now TWO block reasons to distinguish: SSRF-denied (policy) and locality-denied (local_only).",
+    "AC-41.5.6 is a real audit, not a paragraph: re-run the outbound Req call inventory at implementation time, since new call sites may have landed. The US-41.4 AC-41.4.4 static check makes that inventory mechanical."
   ],
   "dependencies": ["US-41.4"],
   "estimated_tokens": 300000
