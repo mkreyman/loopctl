@@ -1,5 +1,24 @@
 import Config
 
+# Test concurrency + pool sizing — BOUNDED, and the two MUST move together.
+#
+# Three repos (Repo, AdminRepo, HeavyReadRepo) each open `pool_size` connections
+# EAGERLY at boot, so the suite's floor demand is 3 * pool_size before a single
+# test runs. Sizing that purely off the core count overruns a stock Postgres
+# `max_connections` (100) on a high-core dev box: 24 cores * 2 * 3 repos = 144,
+# which fails as `DBConnection.ConnectionError ... queue_timeout` on sandbox
+# checkout — a full DB that reads like a missing one. Capping keeps the floor at
+# 3 * 16 = 48 on every machine (mac-mini, blockit, beelink) and in CI, leaving
+# room for a second Elixir app sharing the same local Postgres.
+#
+# `max_cases` is derived from the SAME number on purpose: the pool must never be
+# smaller than the count of concurrently running async tests, or the suite
+# deadlocks on checkout from the other direction. Change one, change both.
+test_concurrency = min(System.schedulers_online(), 8)
+test_pool_size = test_concurrency * 2
+
+config :ex_unit, max_cases: test_concurrency
+
 # Configure your database
 #
 # The MIX_TEST_PARTITION environment variable can be used
@@ -11,7 +30,7 @@ config :loopctl, Loopctl.Repo,
   hostname: "localhost",
   database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
-  pool_size: System.schedulers_online() * 2
+  pool_size: test_pool_size
 
 # AdminRepo — same database, sandbox mode for tests
 config :loopctl, Loopctl.AdminRepo,
@@ -20,7 +39,7 @@ config :loopctl, Loopctl.AdminRepo,
   hostname: "localhost",
   database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
-  pool_size: System.schedulers_online() * 2,
+  pool_size: test_pool_size,
   # Scale tests seed ~80k rows under Sandbox.unboxed_run/2, which can exceed the
   # default 60s ownership timeout (the seed takes >2 min) → "owner process crashed".
   # Allow the unboxed connection to be held long enough for the prod-floor seed.
@@ -44,7 +63,7 @@ config :loopctl, Loopctl.HeavyReadRepo,
   hostname: "localhost",
   database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
-  pool_size: System.schedulers_online() * 2,
+  pool_size: test_pool_size,
   ownership_timeout: :timer.minutes(30)
 
 # The pool-wide DEFAULT server-side statement_timeout (US-27.13), applied via SET LOCAL on
