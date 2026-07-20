@@ -1,47 +1,99 @@
 {
-  "id": "US-39.3",
-  "title": "Pluggable extraction/classification/merge endpoint (OpenAI-compatible local chat) → fully-local harvesting",
-  "epic": { "id": "epic_39", "name": "Private / Local-Only Knowledge & Memory" },
-  "priority": "medium",
-  "phase": "data-sovereignty",
-  "priority_note": "The BIGGEST egress for private data is extraction — turning a doc into articles sends its full content to Anthropic, whose endpoint is hardcoded. Local embeddings (US-39.2) don't help if extraction still ships the whole document to the cloud. This makes the extraction/classification/merge provider pluggable so harvesting can run against a local OpenAI-compatible chat model.",
-  "background": {
-    "reference": "lib/loopctl/llm/anthropic.ex:37 @base_url \"https://api.anthropic.com/v1\" (hardcoded); the extraction/classification/merge models are per-tenant (tenant_llm_settings.ex: extraction_model/classification_model/merge_model) but the ENDPOINT + provider shape (Anthropic messages API) are fixed. Local chat servers (Ollama, LM Studio, vLLM, llama.cpp) speak the OpenAI /chat/completions shape, not Anthropic's.",
-    "includes": "Two viable approaches: (a) add an OpenAI-compatible chat provider selectable via config (a sibling to the Anthropic client behind a provider behaviour), keyed by a per-tenant/deployment extraction_base_url + provider type; or (b) if using a local server that emulates Anthropic's API, just make the Anthropic base_url configurable. Approach (a) is more general (most local servers are OpenAI-shaped). Default stays Anthropic. This is more work than US-39.2 because it's a different API shape, not just a base_url."
+  "id": "US-41.3",
+  "title": "Pluggable extraction / classification / merge endpoint (OpenAI-compatible local chat)",
+  "epic": {
+    "id": "epic_41",
+    "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
   },
+  "priority": "high",
+  "background": "Extraction is the BIGGEST leak: turning a document into articles sends its FULL CONTENT to Anthropic, and the endpoint is hardcoded at lib/loopctl/llm/anthropic.ex:37 (@base_url, used at :139) with no env var and no tenant field. There is no provider behaviour. However, six TASK-level behaviours already exist and every one is config-swappable (all are Mox-mapped in config/test.exs:312,378,395): Knowledge.ExtractorBehaviour (llm_extractor.ex:20), Knowledge.ClassifierBehaviour (claude_category_classifier.ex:17), Knowledge.MergeSynthesizerBehaviour (claude_merge_synthesizer.ex:14), Knowledge.ContentExtractorBehaviour (claude_content_extractor.ex:18), Memory.Promoter.LlmBehaviour (promoter/default_llm.ex), Knowledge.EmbeddingBehaviour (embedding_client.ex:31, resolved at knowledge.ex:8110). Each current impl calls Loopctl.Llm.Anthropic directly. The 2026-07-15 draft deferred this story as 'bigger scope'; that assessment was wrong - the seam already exists, so this is a set of sibling modules, not a refactor of the LLM layer.",
   "story": {
-    "as_a": "a self-hoster harvesting private documents",
-    "i_want_to": "run the extraction/classification/merge LLM steps against a local OpenAI-compatible chat model",
-    "so_that": "a private document's full content is processed entirely on my own infrastructure and never sent to Anthropic (or any third party)"
+    "as_a": "an agent harvesting a user's private documents",
+    "i_want_to": "have extraction, classification and merge run against a local OpenAI-compatible chat endpoint instead of Anthropic",
+    "so_that": "the document's full text - the largest and most sensitive payload in the pipeline - never leaves the tenant's chosen boundary"
   },
-  "rationale": "Closing the embedding leak without closing the extraction leak leaves the larger exposure open. Abstracting the extraction provider behind a behaviour (Anthropic default + an OpenAI-compatible local option, selected by config) lets the whole harvest pipeline run local, completing true data sovereignty when combined with US-39.1/39.2.",
+  "rationale": "Closing embeddings (US-41.2) while leaving extraction on a hardcoded vendor endpoint would ship a privacy tier that leaks the actual documents. Extraction is where the raw content goes, so a private tier without it is worse than none - it would be a guarantee that is false in the one place users most assume it holds.",
   "acceptance_criteria": [
-    { "id": "AC-39.3.1", "description": "The extraction/classification/merge LLM call is resolved through a provider behaviour with at least two implementations: the existing Anthropic client (default) and an OpenAI-compatible chat client. Selection is config-driven (per-tenant and/or deployment: an llm_provider + extraction_base_url). Default config = Anthropic, byte-identical to today (regression test).", "status": "pending" },
-    { "id": "AC-39.3.2", "description": "When configured for the local/OpenAI-compatible provider with a local extraction_base_url, an end-to-end harvest (ingest → extract → article) completes with NO call to api.anthropic.com (mock asserts zero). Token-usage accounting, circuit-breaker, and retry behavior work for the local provider path too (reuse US-37.1/37.3 admission + breaker).", "status": "pending" },
-    { "id": "AC-39.3.3", "description": "Set via the existing config surface (set_llm_config MCP tool / PATCH), cached + bust like other settings; agent-discoverable via the tool docstring. Validation: http(s) URL; unreachable/misconfigured endpoint degrades via the existing provider-error path, not a crash. No UI.", "status": "pending" },
-    { "id": "AC-39.3.4", "description": "Output-shape parity: the extraction result (article/knowledge structure) is normalized so downstream (novelty gate, linking, storage) is provider-agnostic. A test compares the parsed extraction output shape across providers for a fixed input (deterministic stubs).", "status": "pending" }
+    {
+      "id": "AC-41.3.1",
+      "description": "An OpenAI-compatible chat client module exists alongside Loopctl.Llm.Anthropic, taking base_url + key + model from tenant settings, with the same return contract and the same ProviderError mapping (llm/provider_error.ex) so callers are unchanged.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.3.2",
+      "description": "Sibling implementations of the four content behaviours (extractor, classifier, merge synthesizer, content extractor) plus the memory promoter LLM route to the OpenAI-compatible client. Selection is per-tenant at runtime, NOT a compile-time config swap, because two tenants on one node may use different providers.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.3.3",
+      "description": "Endpoint, model and provider for the chat surface are settable through the EXISTING set_llm_config MCP tool + matching API, consistent with US-41.2, and carry the same config-time probe and remediation shape (a trivial completion is issued before persisting).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.3.4",
+      "description": "Local models are weaker at structured output than Claude: every impl validates the response shape and fails the item with a legible, agent-readable reason rather than writing malformed articles. A model that cannot produce the required structure is reported as a configuration problem, not silently degraded output.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.3.5",
+      "description": "Every provider call from the new client passes through Provider.Admission (as anthropic.ex:118 does) so backpressure and the US-41.4 egress guard apply uniformly. A new provider atom is added to the fixed @providers list - never a user-supplied value, never String.to_atom on input.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.3.6",
+      "description": "Token usage / cost accounting continues to work for the alternate provider, or the story explicitly records that a local endpoint reports no usage and how that is represented (a zero-cost provider is fine; a silently missing usage row is not).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.3.7",
+      "description": "Default unchanged: a tenant that configures nothing keeps Anthropic with the hardcoded endpoint and identical behavior.",
+      "status": "pending"
+    }
   ],
   "test_cases": [
-    { "id": "TC-39.3.1", "name": "default remains Anthropic", "type": "unit",
-      "preconditions": ["default config"],
-      "steps": ["resolve the extraction provider"],
-      "expected_results": ["Anthropic client; existing extraction tests pass unchanged"], "status": "pending" },
-    { "id": "TC-39.3.2", "name": "local provider harvest, no Anthropic egress", "type": "integration",
-      "preconditions": ["llm_provider=openai_compatible; extraction_base_url=local stub"],
-      "steps": ["ingest + extract a doc"],
-      "expected_results": ["local stub called; api.anthropic.com never contacted; article produced"], "status": "pending" },
-    { "id": "TC-39.3.3", "name": "provider-agnostic output shape", "type": "integration",
-      "preconditions": ["deterministic stubs for both providers"],
-      "steps": ["extract the same input via each"],
-      "expected_results": ["normalized article structure equivalent downstream"], "status": "pending" }
+    {
+      "id": "TC-41.3.1",
+      "name": "tenant-scoped provider selection",
+      "type": "integration",
+      "preconditions": ["tenant A on Anthropic default", "tenant B configured to a stub OpenAI-compatible endpoint"],
+      "steps": ["run an extraction for each tenant in the same node"],
+      "expected_results": ["A hits Anthropic, B hits the stub", "no cross-contamination of client or credentials"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.3.2",
+      "name": "malformed local-model output fails legibly",
+      "type": "integration",
+      "preconditions": ["stub endpoint returning prose instead of the required structure"],
+      "steps": ["run extraction"],
+      "expected_results": ["item fails with a shape-validation reason naming the endpoint and model", "no malformed article written", "not retried blindly"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.3.3",
+      "name": "admission applies to the new provider",
+      "type": "unit",
+      "preconditions": ["admission limit exhausted for the new provider"],
+      "steps": ["attempt a call"],
+      "expected_results": ["rate_limited_local returned before any Req.post"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.3.4",
+      "name": "usage accounting present for the alternate provider",
+      "type": "integration",
+      "preconditions": ["tenant on the stub endpoint"],
+      "steps": ["run extraction", "read token usage"],
+      "expected_results": ["a usage record exists with the documented representation - never a silently absent row"],
+      "status": "pending"
+    }
   ],
   "technical_notes": [
-    "Files: new lib/loopctl/llm/provider.ex behaviour + lib/loopctl/llm/openai_compatible.ex impl (sibling to anthropic.ex), the extraction/classification/merge call sites (route through the behaviour), tenant_llm_settings.ex (llm_provider enum + extraction_base_url), set_llm_config controller/OpenAPI + MCP tool, config/runtime.exs deployment defaults.",
-    "OpenAI /chat/completions vs Anthropic /messages differ in request/response shape + system-prompt handling — the OpenAI-compatible impl adapts both directions. Keep the prompt templates provider-neutral where possible.",
-    "Reuse the epic-37 Provider.Admission gate + circuit breaker for the new provider path (don't bypass admission).",
-    "Bigger than US-39.2 (new API shape, not just base_url) — consider scoping to extraction-only first, classification/merge as follow-on if needed.",
-    "MCP-server change → package.json bump. Config-based DI; no Application.put_env in tests."
+    "Do NOT introduce a grand provider abstraction over Anthropic + OpenAI. The task-level behaviours are the existing, tested seam; adding sibling impls keeps the blast radius small and the review tractable.",
+    "Anthropic's messages API and the OpenAI chat-completions API differ in system-prompt handling and tool/JSON-mode semantics - the differences belong INSIDE the new client, so the behaviour contract stays identical.",
+    "config/test.exs already maps all these behaviours to Mox mocks; extend that pattern rather than inventing per-test stubs (CLAUDE.md forbids Application.put_env in tests).",
+    "Per-tenant runtime selection means the resolution helper must take tenant_id - resist the temptation to reuse the compile-time Application.compile_env pattern used by Oban workers here."
   ],
   "dependencies": [],
-  "estimated_tokens": 450000
+  "estimated_tokens": 500000
 }

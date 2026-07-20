@@ -1,47 +1,117 @@
 {
-  "id": "US-39.2",
-  "title": "Per-tenant / per-deployment embedding endpoint (embedding_base_url) → local OpenAI-compatible server",
-  "epic": { "id": "epic_39", "name": "Private / Local-Only Knowledge & Memory" },
+  "id": "US-41.2",
+  "title": "Per-tenant embedding endpoint (embedding_base_url) + config-time dimension probe with legible remediation",
+  "epic": {
+    "id": "epic_41",
+    "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
+  },
   "priority": "high",
-  "phase": "data-sovereignty",
-  "priority_note": "Today a tenant can BYO an embedding key + model, but NOT the endpoint — base_url is a server-wide runtime default. So embeddings can't be pointed at a local model. This adds the missing knob so a self-hosted instance (or a tenant) routes embeddings to any OpenAI-compatible endpoint, including a local Ollama/TEI.",
-  "background": {
-    "reference": "lib/loopctl/knowledge/embedding_client.ex:41 @default_base_url \"https://api.openai.com/v1\"; the moduledoc says base_url comes from runtime config. lib/loopctl/llm/tenant_llm_settings.ex has embedding_api_key + embedding_model (per-tenant) but NO embedding_base_url. So the endpoint is not tenant-overridable.",
-    "includes": "Add embedding_base_url to TenantLlmSettings (validated URL) AND a deployment default (env). Resolution order: tenant embedding_base_url -> deployment default (EMBEDDING_BASE_URL) -> @default_base_url. Reuse the existing SettingsCache (US-32.3) + Vault patterns. Local endpoints (Ollama http://localhost:11434/v1, TEI, LM Studio) speak the OpenAI embeddings API, so no client rewrite — only the base_url plumbing."
-  },
+  "background": "The embedding endpoint is server-wide: config/runtime.exs:382-385 sets %{base_url: OPENAI_BASE_URL || \"https://api.openai.com/v1\", model: ...}, read at knowledge/embedding_client.ex:194 (@default_base_url at :41, provider_config/0 at :295). Per-tenant configuration today (llm/tenant_llm_settings.ex:41-54) covers api_key, extraction_model, classification_model, merge_model, embedding_api_key, embedding_model - key and model, but NOT endpoint. Importantly the embedding KEY is already per-tenant and MANDATORY (embedding_client.ex:58-60,75-77; the global operator key was deliberately removed in runtime.exs:375-381), so the per-tenant credential plumbing and its MCP surface (set_llm_config) already exist. Adding the endpoint is one field plus one read - not a subsystem.",
   "story": {
-    "as_a": "a self-hoster (or a privacy-conscious tenant)",
-    "i_want_to": "configure the embedding endpoint (base_url) at the tenant or deployment level, not just the key and model",
-    "so_that": "my document text is embedded by a local OpenAI-compatible model and never sent to OpenAI (or any third party)"
+    "as_a": "an agent configuring a tenant that must not send content to third-party providers",
+    "i_want_to": "set the tenant's embedding endpoint to a local or self-chosen OpenAI-compatible server through the same MCP tool I already use for the key, and be told immediately if the endpoint is unusable",
+    "so_that": "embeddings are computed where the tenant chooses, and a misconfiguration fails at config time with a fix I can act on - not hours later as an opaque write error"
   },
-  "rationale": "The embedding client is already OpenAI-compatible; the only thing pinning it to OpenAI is a non-overridable base_url. Exposing embedding_base_url (tenant + deployment default) with the existing key/model BYO machinery makes local embeddings a config change, composing with US-39.1's dimension flexibility to complete the local-embedding path.",
+  "rationale": "This is the smallest change that makes the hosted service usable for a privacy-constrained tenant, and it is the prerequisite for the egress guard in US-41.4 (there is nothing to point at until an endpoint is configurable). The probe exists because loopctl has NO UI: a human would notice a broken endpoint in a settings screen, an agent will not unless the tool tells it.",
   "acceptance_criteria": [
-    { "id": "AC-39.2.1", "description": "TenantLlmSettings gains embedding_base_url (validated http(s) URL, nullable). The embedding client resolves base_url as: tenant.embedding_base_url || deployment EMBEDDING_BASE_URL || the OpenAI default. Unset everywhere → today's behavior (OpenAI). A test asserts each resolution level.", "status": "pending" },
-    { "id": "AC-39.2.2", "description": "Set via the existing config surface: the set_llm_config MCP tool / PATCH endpoint accepts embedding_base_url; it's cached (SettingsCache) and busts on update like the other settings. Agent-discoverable (the tool schema + remediation message document it). No new UI (agent-native).", "status": "pending" },
-    { "id": "AC-39.2.3", "description": "Validation + safety: only http(s) URLs; the value is stored/handled consistently with existing settings (redaction as appropriate). A misconfigured/unreachable endpoint surfaces as the existing embedding error path (circuit breaker / fallback) — it does NOT crash the request. Test: a local stub endpoint returns embeddings and they're stored.", "status": "pending" },
-    { "id": "AC-39.2.4", "description": "Composes with US-39.1: when embedding_base_url points at a local model whose dimension matches the configured :embedding_dimensions, an end-to-end harvest→embed→recall works with zero call to OpenAI (asserted by a mock that fails if openai.com is contacted). Default instance unchanged.", "status": "pending" }
+    {
+      "id": "AC-41.2.1",
+      "description": "tenant_llm_settings gains embedding_base_url (nullable; NULL means fall back to the server-wide default, preserving today's behavior exactly). embedding_client.ex resolves the tenant value first, the runtime default second.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.2",
+      "description": "The field is writable through the EXISTING set_llm_config MCP tool and its matching JSON API endpoint - no new tool, no UI. The tool description states plainly that the endpoint must be OpenAI-compatible (POST /embeddings) and that changing it may require a re-embed (US-41.1 AC-41.1.6).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.3",
+      "description": "Config-time probe: setting embedding_base_url (or embedding_model) issues ONE test embedding against the supplied endpoint before persisting. On success the returned dimension is recorded as the tenant's dimension. On failure NOTHING is persisted and the call returns a legible, agent-readable error.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.4",
+      "description": "Probe failures are distinguishable and each carries a meta.remediation payload in the same ACTION REQUIRED shape knowledge_search already returns for a missing embedding key: unreachable endpoint, auth rejected, non-OpenAI-compatible response shape, and dimension-not-supported-by-this-instance are four DIFFERENT messages, each naming the concrete next step.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.5",
+      "description": "The probe never leaks secrets: the endpoint URL is echoed in errors and posture reports, the API key never is. A test asserts no key material appears in any error body, log line, or audit entry.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.6",
+      "description": "The probe is bounded and cannot be used as an SSRF primitive or a DoS lever: it reuses the existing URL guard used by ingestion (workers/content_ingestion_worker.ex:620-632, UrlGuard.pinned_request_opts/1 + redirect: false), has a short timeout, and is rate-limited per tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.2.7",
+      "description": "Default-off and non-breaking: a tenant that never sets embedding_base_url behaves exactly as today, including the mandatory-BYO-key behavior. No existing tenant is re-probed or re-embedded by this story.",
+      "status": "pending"
+    }
   ],
   "test_cases": [
-    { "id": "TC-39.2.1", "name": "base_url resolution order", "type": "unit",
-      "preconditions": ["combinations of tenant/deployment/none set"],
-      "steps": ["resolve the embedding base_url"],
-      "expected_results": ["tenant > deployment > OpenAI default; unset → OpenAI"], "status": "pending" },
-    { "id": "TC-39.2.2", "name": "local endpoint used, no OpenAI egress", "type": "integration",
-      "preconditions": ["embedding_base_url = local stub; matching dim"],
-      "steps": ["generate an embedding"],
-      "expected_results": ["local stub called; openai.com never contacted (mock asserts zero)"], "status": "pending" },
-    { "id": "TC-39.2.3", "name": "set via set_llm_config + cache bust", "type": "integration",
-      "preconditions": ["tenant"],
-      "steps": ["set embedding_base_url, then generate embedding"],
-      "expected_results": ["new endpoint takes effect (cache busted)"], "status": "pending" }
+    {
+      "id": "TC-41.2.1",
+      "name": "tenant endpoint overrides the server default",
+      "type": "integration",
+      "preconditions": ["tenant with embedding_base_url set to a stub local server"],
+      "steps": ["trigger an embedding"],
+      "expected_results": ["the request goes to the tenant endpoint", "the server-wide default is not contacted"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.2",
+      "name": "probe records the dimension returned by the endpoint",
+      "type": "integration",
+      "preconditions": ["stub endpoint returning 768-dim vectors"],
+      "steps": ["set embedding_base_url via set_llm_config"],
+      "expected_results": ["settings persisted", "tenant dimension recorded as 768", "subsequent writes validate against 768"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.3",
+      "name": "unreachable endpoint fails closed with remediation",
+      "type": "integration",
+      "preconditions": ["endpoint that refuses connections"],
+      "steps": ["set embedding_base_url"],
+      "expected_results": ["error names the endpoint and the failure class", "meta.remediation present and actionable", "NOTHING persisted - prior settings intact"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.4",
+      "name": "each probe failure class is distinguishable",
+      "type": "integration",
+      "preconditions": ["four stub endpoints: refuses, 401s, returns non-OpenAI JSON, returns an unsupported dimension"],
+      "steps": ["attempt configuration against each"],
+      "expected_results": ["four distinct error codes and four distinct remediation texts - never one generic failure"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.5",
+      "name": "no key material leaks",
+      "type": "unit",
+      "preconditions": ["tenant with an embedding key"],
+      "steps": ["force each probe failure path", "inspect error body, logs, audit entries"],
+      "expected_results": ["endpoint present", "key absent everywhere"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.2.6",
+      "name": "probe cannot reach internal addresses when the guard forbids it",
+      "type": "integration",
+      "preconditions": ["URL guard configured to reject the target range"],
+      "steps": ["attempt to set an endpoint pointing at a forbidden address"],
+      "expected_results": ["rejected by the guard before any request", "clear error"],
+      "status": "pending"
+    }
   ],
   "technical_notes": [
-    "Files: lib/loopctl/llm/tenant_llm_settings.ex (+ migration add column), lib/loopctl/knowledge/embedding_client.ex (base_url resolution), lib/loopctl/llm.ex / settings resolution + SettingsCache (US-32.3), the set_llm_config controller/OpenAPI + MCP tool (mcp-server), config/runtime.exs (EMBEDDING_BASE_URL deployment default).",
-    "No client rewrite: Ollama/TEI/LM Studio expose the OpenAI /embeddings shape. Just thread the resolved base_url into the Req.post.",
-    "MCP-server change requires a mcp-server/package.json version bump for npm auto-publish (the #331 gotcha).",
-    "Agent-native: expose via set_llm_config + document in the tool docstring/remediation; no UI.",
-    "Config-based DI; SettingsCache bust on update; no Application.put_env in tests."
+    "Reuse Loopctl.Vault.Binary for nothing new here - the endpoint is not a secret and MUST be readable by egress_posture (US-41.4). Only keys stay encrypted.",
+    "The SSRF consideration cuts both ways: a local_only tenant NEEDS to reach private-range addresses (that is the point), while a hosted non-local tenant should not be able to probe the operator's internal network. Resolve this by making the allowlist policy (US-41.4) govern which ranges are reachable, and have the probe consult the same policy - do not write a second, divergent URL policy here.",
+    "Record the probe result (endpoint, dimension, timestamp, outcome) in the audit log - US-41.7 builds the custody claim on top of exactly this record.",
+    "Ollama's OpenAI-compatible surface and HuggingFace TEI are the two reference targets; test against stubs shaped like both rather than assuming one vendor's response envelope."
   ],
-  "dependencies": [],
-  "estimated_tokens": 350000
+  "dependencies": ["US-41.1"],
+  "estimated_tokens": 300000
 }

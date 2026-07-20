@@ -1,52 +1,133 @@
 {
-  "id": "US-39.4",
-  "title": "Fail-closed no-egress guard (per-scope local_only) + agent-discoverable egress-posture report",
-  "epic": { "id": "epic_39", "name": "Private / Local-Only Knowledge & Memory" },
-  "priority": "high",
-  "phase": "data-sovereignty",
-  "priority_note": "The primitive that turns 'I hope it stays local' into an ENFORCED invariant. Marking data local_only and refusing, fail-closed, any outbound provider call to a non-local endpoint for that data means a private document can NEVER accidentally egress — even via a misconfig. Plus an agent-discoverable posture report so an agent can VERIFY locality before harvesting sensitive data (loopctl is agent-native, self-discoverable, no UI).",
-  "background": {
-    "reference": "Epic 37 added lib/loopctl/provider/admission.ex — a single chokepoint in front of EVERY outbound provider Req.post (embedding US-37.1; admission gate resolves via Loopctl.RateLimiter.Behaviour). That chokepoint is the ideal enforcement point for an egress guard. Today there is no concept of 'this data must not leave the box'.",
-    "includes": "Add a local_only marking at the scope level (tenant and/or project, and optionally per-ingest request) + an allowlist of local/private endpoints (loopback, private ranges, or an explicit LOCAL_ENDPOINT_ALLOWLIST). At the admission chokepoint, before any provider call handling local_only data, if the resolved endpoint is not in the allowlist → refuse with {:error, :egress_blocked} (fail-closed), surfaced as a clear agent-readable error. Add an egress-posture MCP tool + endpoint reporting: configured provider endpoints, whether each is local, and per-scope local_only status."
+  "id": "US-41.4",
+  "title": "Fail-closed no-egress guard + local_only scope marking + egress_posture MCP tool + .well-known capability publication",
+  "epic": {
+    "id": "epic_41",
+    "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
   },
+  "priority": "critical",
+  "priority_note": "Highest-value story in the epic. #331 shipped agent autonomy over KB content while egress stayed uncontrolled AND undiscoverable - an agent can harvest a DNA file today with no supported way to check where it goes first. This story closes that, and it is the one capability that cannot be replaced by careful configuration.",
+  "background": "Loopctl.Provider.Admission (lib/loopctl/provider/admission.ex, US-37.1 / GH #352) already sits immediately before every model-provider Req.post: anthropic.ex:118 guards :139, embedding_client.ex:91 and :101 guard :109 and :133. That makes it the correct chokepoint. CRITICALLY it is FAIL-OPEN BY DESIGN (admission.ex:81-97, fail_open/2 at :183) - it is a burst shedder whose job is to shed load without ever blocking legitimate traffic. An egress guard needs the OPPOSITE failure semantics. Fusing the two decisions would mean a Hammer or SystemConfig hiccup silently degrades the privacy guarantee to 'allow', turning a guarantee into a hope. The guard must therefore be a SEPARATE check at the same call sites that cannot inherit the fail-open path.",
   "story": {
     "as_a": "an agent about to harvest a user's private documents",
-    "i_want_to": "mark the target scope local_only and have loopctl HARD-REFUSE any provider call that would send that data to a non-local endpoint, and be able to query the instance's egress posture first",
-    "so_that": "private data can never leave the box — not by misconfiguration, not by a wrong base_url — and I can verify the instance is fully local before I start"
+    "i_want_to": "mark the target scope local_only, have loopctl HARD-REFUSE any provider call that would send that data to a non-local endpoint, and query the instance's egress posture before I start",
+    "so_that": "private data cannot leave the boundary by misconfiguration or by a wrong base_url, and I can verify locality first instead of trusting it"
   },
-  "rationale": "Config knobs (US-39.1/2/3) MAKE local possible; this GUARANTEES it. A fail-closed check at the epic-37 admission chokepoint is the cheapest place to enforce a no-egress invariant for marked data, and an egress-posture report makes locality self-discoverable — both squarely in loopctl's agent-native design. Together they convert the user's privacy 'worry' into a provable property.",
+  "rationale": "A privacy tier that depends on the operator configuring three endpoints correctly is not a guarantee. Fail-closed enforcement plus a machine-readable posture surface converts it into one an agent can verify - which is the only form that works on a platform with no UI.",
   "acceptance_criteria": [
-    { "id": "AC-39.4.1", "description": "A local_only marking exists at scope level (at least per-tenant and/or per-project; optionally per-ingest). When set, Provider.Admission refuses any outbound provider call (embedding, extraction, classification, merge) whose resolved endpoint is not in the local/allowlisted set, returning {:error, :egress_blocked} BEFORE the Req.post. Fail-CLOSED: if the endpoint can't be classified as local, it is treated as non-local (refuse).", "status": "pending" },
-    { "id": "AC-39.4.2", "description": "The local/allowlist classification is explicit and configurable: loopback + private-range hosts, plus an operator LOCAL_ENDPOINT_ALLOWLIST. api.openai.com / api.anthropic.com are never local. A test asserts a local_only scope with an OpenAI base_url is BLOCKED, and with a local base_url is ALLOWED.", "status": "pending" },
-    { "id": "AC-39.4.3", "description": "egress_blocked degrades safely and legibly: the interactive path treats it like the circuit-open/rate-limited-local fallback (keyword search, never a 500); harvesting fails the item with a clear, agent-readable reason ('scope is local_only but endpoint X is not local') so the agent knows to fix config, NOT retry blindly. No data is sent.", "status": "pending" },
-    { "id": "AC-39.4.4", "description": "An agent-discoverable egress-posture surface: a new MCP tool (e.g. egress_posture) + JSON endpoint reports the configured embedding/extraction endpoints, whether each is classified local, the LOCAL_ENDPOINT_ALLOWLIST, and per-scope local_only status. No secrets leaked (endpoints shown, keys never). This is how an agent verifies locality before harvesting sensitive data. NO UI (agent-native).", "status": "pending" },
-    { "id": "AC-39.4.5", "description": "Default-off + non-breaking: scopes are not local_only by default; the hosted instance behaves exactly as today. Setting local_only is opt-in via API/MCP. The guard adds one cheap classification check per provider call (no measurable hot-path cost).", "status": "pending" }
+    {
+      "id": "AC-41.4.1",
+      "description": "A local_only marking exists at tenant and project scope, settable via a new MCP tool + matching JSON API endpoint (no UI). Default off everywhere; the hosted instance behaves exactly as today until a scope opts in.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.4.2",
+      "description": "When a scope is local_only, every outbound model-provider call whose resolved endpoint is not classified local is refused with {:error, :egress_blocked} BEFORE the Req.post. The check is FAIL-CLOSED: if the endpoint cannot be classified, or if the classification machinery itself errors, the call is REFUSED. A test forces the classifier to raise and asserts the call is blocked, not admitted.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.4.3",
+      "description": "The guard is a SEPARATE decision from Provider.Admission's fail-open rate check, at the same call sites. Admission's fail_open/2 path can never admit a call that the egress guard would refuse. A test asserts that with the admission backend fully unavailable (fail-open triggered), a local_only scope with a non-local endpoint is still BLOCKED.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.4.4",
+      "description": "Local classification is explicit and operator-controlled: loopback and private-range hosts, plus a LOCAL_ENDPOINT_ALLOWLIST. api.openai.com and api.anthropic.com are never local. The allowlist is DEPLOYMENT-scoped and READ-ONLY to agents - it is the trust root, and an agent must never be able to widen its own allowlist through any tool or endpoint. A test asserts no API path mutates it.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.4.5",
+      "description": "egress_blocked degrades safely and legibly: the interactive path falls back like the existing circuit-open/rate-limited-local case (keyword search, never a 500); harvesting fails the ITEM with an agent-readable reason naming the scope and the offending endpoint, so the agent fixes config instead of retrying blindly. No data is sent in any path.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.4.6",
+      "description": "An egress_posture MCP tool + matching JSON endpoint reports: the resolved embedding and chat endpoints for the calling tenant, whether each is classified local, the deployment allowlist, and per-scope local_only status. Endpoints are shown; keys never are. This is how an agent verifies locality BEFORE harvesting.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.4.7",
+      "description": "The .well-known/loopctl discovery endpoint (US-26.0.4) publishes instance CAPABILITIES: supported embedding dimensions, whether tenant-supplied endpoints are permitted, and which tiers exist - so an agent can discover the instance's constraints BEFORE authenticating.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.4.8",
+      "description": "Hot-path cost is one cheap classification per provider call, with no additional network or DB round-trip on the common path (resolved config is already loaded). A benchmark or timing assertion documents it.",
+      "status": "pending"
+    }
   ],
   "test_cases": [
-    { "id": "TC-39.4.1", "name": "local_only + cloud endpoint is blocked fail-closed", "type": "integration",
-      "preconditions": ["scope local_only=true; embedding base_url=api.openai.com"],
-      "steps": ["attempt to embed/extract for that scope"],
-      "expected_results": ["{:error, :egress_blocked}; NO Req.post to openai (mock zero); clear reason"], "status": "pending" },
-    { "id": "TC-39.4.2", "name": "local_only + local endpoint is allowed", "type": "integration",
-      "preconditions": ["scope local_only=true; base_url=localhost local stub"],
-      "steps": ["embed/extract"],
-      "expected_results": ["allowed; local stub called; succeeds"], "status": "pending" },
-    { "id": "TC-39.4.3", "name": "unclassifiable endpoint fails closed", "type": "unit",
-      "preconditions": ["local_only=true; endpoint not in allowlist, not obviously local"],
-      "steps": ["run the guard"],
-      "expected_results": ["treated as non-local → blocked (fail-closed)"], "status": "pending" },
-    { "id": "TC-39.4.4", "name": "egress-posture report", "type": "integration",
-      "preconditions": ["mixed config"],
-      "steps": ["call the egress_posture tool/endpoint"],
-      "expected_results": ["reports endpoints + local/non-local classification + per-scope local_only; no secrets"], "status": "pending" }
+    {
+      "id": "TC-41.4.1",
+      "name": "local_only blocks a vendor endpoint, allows a local one",
+      "type": "integration",
+      "preconditions": ["scope marked local_only"],
+      "steps": ["attempt an embedding with base_url api.openai.com", "attempt one with a loopback endpoint"],
+      "expected_results": ["first: egress_blocked before any Req.post, nothing sent", "second: allowed"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.4.2",
+      "name": "guard survives admission fail-open",
+      "type": "integration",
+      "preconditions": ["local_only scope, non-local endpoint", "admission backend unavailable so fail_open/2 admits"],
+      "steps": ["attempt a provider call"],
+      "expected_results": ["still blocked by the egress guard - fail-open must not leak into the privacy decision"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.4.3",
+      "name": "unclassifiable endpoint fails closed",
+      "type": "unit",
+      "preconditions": ["local_only scope", "classifier forced to raise or return unknown"],
+      "steps": ["attempt a provider call"],
+      "expected_results": ["refused", "reason states the endpoint could not be classified as local"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.4.4",
+      "name": "allowlist is not agent-writable",
+      "type": "integration",
+      "preconditions": ["agent, orchestrator and user keys"],
+      "steps": ["attempt to modify the allowlist through every exposed tool and endpoint"],
+      "expected_results": ["no path mutates it at any role"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.4.5",
+      "name": "posture report is complete and leaks nothing",
+      "type": "integration",
+      "preconditions": ["tenant with configured endpoints and keys"],
+      "steps": ["call egress_posture"],
+      "expected_results": ["endpoints, local classification, allowlist and per-scope local_only present", "no key material anywhere in the payload"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.4.6",
+      "name": "interactive search degrades rather than 500s",
+      "type": "integration",
+      "preconditions": ["local_only scope with a non-local embedding endpoint"],
+      "steps": ["run a semantic search"],
+      "expected_results": ["keyword fallback with meta explaining egress_blocked", "HTTP 200, never a 500"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.4.7",
+      "name": "capabilities discoverable pre-auth",
+      "type": "integration",
+      "preconditions": ["no credentials"],
+      "steps": ["GET .well-known/loopctl"],
+      "expected_results": ["supported dimensions, tenant-endpoint support and tier list present", "no tenant-specific data leaked"],
+      "status": "pending"
+    }
   ],
   "technical_notes": [
-    "Files: lib/loopctl/provider/admission.ex (add the egress classification + fail-closed refuse), a scope local_only column (tenants and/or projects) + migration, endpoint-classification helper (loopback/private-range/allowlist), config LOCAL_ENDPOINT_ALLOWLIST, a new egress-posture controller/endpoint + MCP tool, the interactive + harvest call sites to handle :egress_blocked.",
-    "Enforce at the SINGLE admission chokepoint so every provider path (embedding + the US-39.3 extraction provider) is covered by construction — do not scatter checks.",
-    "Fail-CLOSED is the whole point: unknown/unclassifiable endpoint => non-local => refuse. Better to block a harvest than leak.",
-    "Depends on US-39.2 + US-39.3 (needs the resolved endpoints to classify). Agent-native posture report, no UI.",
-    "MCP-server change → package.json bump. Config-based DI; no Application.put_env in tests; assert outcome class not timing."
+    "Place the guard at the same three call sites Admission already guards (anthropic.ex:118, embedding_client.ex:91,101) plus any new client from US-41.3 - but as its own with-clause, so the two failure modes never share a code path.",
+    "Classification must resolve the endpoint HOST, not the configured string, and must not be fooled by DNS pointing a public name at a private address or vice versa. Decide and document the resolution policy explicitly; the ingestion UrlGuard (content_ingestion_worker.ex:620-632) already faces this problem - reuse its approach rather than inventing a second one.",
+    "This story covers MODEL-PROVIDER egress only. Webhook delivery bypasses Admission entirely (webhooks/req_delivery.ex:43) and is handled in US-41.5 - the docs and the posture report must NOT claim total egress control until 41.5 lands.",
+    "egress_posture is a read tool and should be available at agent role: an agent must be able to check locality with the key it already has, or the whole verify-before-harvest workflow fails.",
+    "Record every egress_blocked decision in the audit log - US-41.7 turns these records into the custody claim."
   ],
-  "dependencies": ["US-39.2", "US-39.3"],
-  "estimated_tokens": 400000
+  "dependencies": ["US-41.2", "US-41.3"],
+  "estimated_tokens": 500000
 }

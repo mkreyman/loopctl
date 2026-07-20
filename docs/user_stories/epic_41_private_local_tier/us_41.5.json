@@ -1,47 +1,103 @@
 {
-  "id": "US-39.5",
-  "title": "Encrypt private-tier bodies at rest + vector-only recall (drop plaintext FTS for that tier)",
-  "epic": { "id": "epic_39", "name": "Private / Local-Only Knowledge & Memory" },
-  "priority": "medium",
-  "phase": "data-sovereignty",
-  "priority_note": "Completes data-at-rest for the private tier. Today article/memory bodies are stored PLAINTEXT (they back the tsvector full-text search). For health/DNA/financial data, the body should be encrypted at rest so even a DB dump doesn't reveal it. Semantic search works on the VECTOR, not the plaintext, so vector-only recall lets us encrypt the body without losing retrieval.",
-  "background": {
-    "reference": "Article/memory bodies are plaintext: search_vector = to_tsvector(body) (20260410021836_add_search_vector_to_articles.exs, 20260712000000_add_search_vectors_to_backing_tables.exs). Only BYO keys use Looctl.Vault.Binary (Cloak) encryption. Cloak/Vault infra already exists in the app (field-level AES-256-GCM).",
-    "includes": "For a scope/article/memory flagged private (tie to US-39.4 local_only or a separate encrypted flag): store the body via Cloak (encrypted at rest), SKIP tsvector generation (can't FTS ciphertext), and rely on vector similarity (the embedding, computed locally per US-39.2/3) for recall — decrypting the body only on retrieval to the authorized caller. Non-private tier unchanged (plaintext + FTS)."
+  "id": "US-41.5",
+  "title": "Extend the egress guard to non-provider egress (webhook delivery)",
+  "epic": {
+    "id": "epic_41",
+    "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
   },
+  "priority": "high",
+  "background": "Model providers are not the only path content leaves the box. An audit of every outbound Req call in lib/ found: anthropic.ex:139 and embedding_client.ex:109,133 are gated by Admission; workers/content_ingestion_worker.ex:634 (Req.get of an arbitrary ingestion URL) bypasses it and is guarded instead by UrlGuard.pinned_request_opts/1 + redirect: false (:620-632); verification/github_actions.ex:17, secrets/fly_adapter.ex:60,112 and webhooks/req_delivery.ex:43 all bypass Admission entirely. Of these, webhook delivery is the one that can carry TENANT CONTENT to a TENANT-SUPPLIED URL. The 2026-07-15 draft missed this: a local_only guarantee that covers embeddings and extraction but not webhooks is not a guarantee, and stating it as one would be worse than not offering the tier.",
   "story": {
-    "as_a": "a user storing health/DNA/financial data in a self-hosted second brain",
-    "i_want_to": "have private-tier article/memory bodies encrypted at rest and retrieved by semantic vector search",
-    "so_that": "a database dump or disk image never exposes my private content in plaintext, while I can still recall it semantically"
+    "as_a": "a tenant who marked a scope local_only",
+    "i_want_to": "have that marking cover EVERY path content can leave the instance, including webhook delivery",
+    "so_that": "the guarantee I was given is the guarantee I actually have - not one that holds for two subsystems and silently fails for a third"
   },
-  "rationale": "Local models keep private data off the network; encrypting the body keeps it protected on disk too. Because recall uses the vector (not the plaintext body), we can encrypt the body with the existing Cloak machinery and simply skip plaintext FTS for the private tier — a clean, low-risk way to close the last exposure without losing the core retrieval capability.",
+  "rationale": "A privacy guarantee is only as strong as its weakest egress path. Shipping US-41.4 alone would let loopctl truthfully report 'all providers local' while a webhook subscription ships article bodies to an arbitrary internet host. This story closes the gap and, just as importantly, makes the posture report honest.",
   "acceptance_criteria": [
-    { "id": "AC-39.5.1", "description": "A private/encrypted marking (per-scope, aligned with US-39.4 local_only, or an explicit encrypt_body flag) causes the article/memory BODY to be stored encrypted via the existing Cloak/Vault (Loopctl.Vault.Binary) machinery. A DB-level read of the row shows ciphertext, not plaintext. Non-private rows are unchanged (plaintext).", "status": "pending" },
-    { "id": "AC-39.5.2", "description": "For encrypted-body rows, tsvector/FTS is SKIPPED (you can't full-text-search ciphertext) and recall is vector-only (semantic similarity on the embedding). A test: an encrypted-tier memory/article is recalled by memory_recall/knowledge search via vector similarity, and does NOT appear in a plaintext keyword-only search of the body.", "status": "pending" },
-    { "id": "AC-39.5.3", "description": "On retrieval to an authorized (in-scope) caller, the body is transparently decrypted and returned as today; an out-of-scope caller gets the usual 404/scope-denied (no plaintext, no existence leak). Tenant/scope isolation preserved.", "status": "pending" },
-    { "id": "AC-39.5.4", "description": "Default-off + non-breaking: existing rows and the hosted instance are unchanged (plaintext + FTS). Docs state the trade-off (encrypted tier loses keyword FTS; relies on local embeddings) and the embedding-inversion caveat (vectors can partially leak — keep sensitive vectors on a self-hosted DB). No UI.", "status": "pending" }
+    {
+      "id": "AC-41.5.1",
+      "description": "Webhook delivery consults the same local classification as US-41.4. For a local_only scope, a delivery whose destination is not classified local is refused before the request, with the same fail-closed semantics (unclassifiable means refuse).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.5.2",
+      "description": "A blocked delivery is NOT a silent drop and NOT an infinite retry: the event is recorded as blocked with an agent-readable reason, surfaced through the existing webhook delivery/failure surfaces, so the tenant can see that a subscription is incompatible with their local_only marking.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.5.3",
+      "description": "Creating or updating a webhook subscription with a non-local destination on an already-local_only scope is rejected AT CONFIG TIME with a legible remediation, rather than accepted and silently blocked at delivery time.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.5.4",
+      "description": "Marking a scope local_only when incompatible webhook subscriptions already exist does not silently break them: the operation either refuses with a list of the offending subscriptions or completes and reports them explicitly. Which one is chosen is documented; a silent state change is not acceptable.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.5.5",
+      "description": "egress_posture (US-41.4 AC-41.4.6) is extended to report webhook destinations and their local classification, so the posture report covers every content-carrying egress path. Until this story lands, the posture report must state that its scope is provider calls only.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.5.6",
+      "description": "The remaining outbound paths are explicitly triaged in the docs with a rationale for each: ingestion URL fetch (inbound content, sends no tenant data, already URL-guarded), GitHub verification (commit metadata only), Fly secrets (operator-plane, no tenant content). Any that DO carry tenant content are brought under the guard rather than documented away.",
+      "status": "pending"
+    }
   ],
   "test_cases": [
-    { "id": "TC-39.5.1", "name": "private body is ciphertext at rest", "type": "integration",
-      "preconditions": ["encrypt flag on; create article/memory"],
-      "steps": ["read the raw DB column"],
-      "expected_results": ["ciphertext, not plaintext; decrypts on app retrieval"], "status": "pending" },
-    { "id": "TC-39.5.2", "name": "vector recall works, FTS skipped", "type": "integration",
-      "preconditions": ["encrypted-tier row with a local embedding"],
-      "steps": ["semantic recall; then plaintext keyword search of body"],
-      "expected_results": ["found by vector similarity; NOT surfaced by plaintext FTS; no tsvector stored"], "status": "pending" },
-    { "id": "TC-39.5.3", "name": "scope isolation on encrypted body", "type": "integration",
-      "preconditions": ["encrypted row in tenant A"],
-      "steps": ["tenant B attempts retrieval"],
-      "expected_results": ["404/denied; no plaintext, no existence leak"], "status": "pending" }
+    {
+      "id": "TC-41.5.1",
+      "name": "local_only blocks a public webhook destination",
+      "type": "integration",
+      "preconditions": ["local_only scope", "subscription pointing at a public URL"],
+      "steps": ["trigger an event"],
+      "expected_results": ["no request issued", "delivery recorded as blocked with a legible reason"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.5.2",
+      "name": "local destination still delivers",
+      "type": "integration",
+      "preconditions": ["local_only scope", "subscription pointing at a loopback URL"],
+      "steps": ["trigger an event"],
+      "expected_results": ["delivered normally"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.5.3",
+      "name": "incompatible subscription rejected at creation",
+      "type": "integration",
+      "preconditions": ["scope already local_only"],
+      "steps": ["create a subscription with a public destination"],
+      "expected_results": ["rejected with remediation naming the conflict", "nothing persisted"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.5.4",
+      "name": "pre-existing subscriptions surfaced when enabling local_only",
+      "type": "integration",
+      "preconditions": ["scope with a public webhook subscription"],
+      "steps": ["mark the scope local_only"],
+      "expected_results": ["the offending subscriptions are reported explicitly per the documented behavior - never silently disabled"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.5.5",
+      "name": "blocked deliveries do not retry forever",
+      "type": "integration",
+      "preconditions": ["local_only scope", "blocked subscription"],
+      "steps": ["trigger several events", "inspect the job queue"],
+      "expected_results": ["no unbounded retry backlog - blocked is terminal for that delivery"],
+      "status": "pending"
+    }
   ],
   "technical_notes": [
-    "Files: lib/loopctl/knowledge/article.ex + lib/loopctl/memory/memory.ex (conditional Cloak type for body / conditional tsvector), the search paths (skip FTS + rely on vector for encrypted tier), a per-scope encrypt/private flag + migration, docs/self-hosting.md.",
-    "Cloak/Vault already in the app (Loopctl.Vault.Binary for keys) — reuse it for the body. The tricky bit is CONDITIONAL encryption (only private tier) + skipping the generated tsvector column for those rows.",
-    "Recall uses the vector, so encryption doesn't break semantic search — but keyword/FTS is lost for encrypted rows (document it). Local embedding (US-39.2/3) is a prerequisite for a truly-private tier (don't embed private text via a cloud model).",
-    "Embedding-inversion caveat in docs: stored vectors can partially reconstruct text → keep sensitive vectors on a self-hosted DB.",
-    "Aligns with US-39.4's local_only marking (private ⇒ local_only ⇒ encrypted is a sensible bundle, but keep the flags composable). No UI. No Application.put_env in tests."
+    "webhooks/req_delivery.ex:43 uses Req.request/1 and is invoked from the delivery worker - the guard belongs where the destination is resolved, before the request is built, mirroring the provider-call placement.",
+    "Webhook signing secrets are already Cloak-encrypted (webhooks/webhook.ex:61); the destination URL is not a secret and must be readable by egress_posture.",
+    "Do not conflate 'blocked' with 'failed' in the delivery record - a blocked delivery is a configuration conflict, and an operator or agent reading failures needs to tell them apart.",
+    "AC-41.5.6 is a real audit, not a paragraph: re-run the outbound Req call inventory at implementation time, since new call sites may have landed."
   ],
-  "dependencies": [],
-  "estimated_tokens": 400000
+  "dependencies": ["US-41.4"],
+  "estimated_tokens": 300000
 }

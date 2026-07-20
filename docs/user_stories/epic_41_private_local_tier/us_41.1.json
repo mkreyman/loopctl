@@ -1,47 +1,110 @@
 {
-  "id": "US-39.1",
-  "title": "Configurable embedding dimension end-to-end (migrations + HNSW honor :embedding_dimensions)",
-  "epic": { "id": "epic_39", "name": "Private / Local-Only Knowledge & Memory" },
+  "id": "US-41.1",
+  "title": "Per-tenant embedding dimension via an article_embeddings / memory_embeddings side table",
+  "epic": {
+    "id": "epic_41",
+    "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
+  },
   "priority": "high",
-  "phase": "data-sovereignty",
-  "priority_note": "THE self-host blocker. A user's agent correctly identified that the hardcoded vector(1536) prevents self-hosting with a local embedding model (nomic-embed 768, bge 1024, etc.). The Elixir validation layer ALREADY reads a configurable :embedding_dimensions; only the DB schema/index doesn't honor it. Unblocking this is the prerequisite for any local-embedding privacy story.",
-  "background": {
-    "reference": "config/config.exs:16 sets `embedding_dimensions: 1536`. validate_embedding_dimensions/1 already reads Application.get_env(:loopctl, :embedding_dimensions, 1536) in lib/loopctl/knowledge/article.ex:490 and lib/loopctl/memory/memory.ex:266. BUT the columns are hardcoded: articles `ALTER TABLE articles ADD COLUMN embedding vector(1536)` (20260410022854_enable_pgvector_and_add_embedding.exs:25); memories `ALTER TABLE memories ADD COLUMN embedding vector(1536)` (20260709000000_create_memory_stores.exs:101); HNSW indexes built on those fixed-dim columns (lib/loopctl/repo/hnsw_index.ex, 20260709000100/300). So on a fresh self-host, a 768-dim local vector fails to insert.",
-    "includes": "Deployment-level dimension (one dim per instance) — sufficient for a single-org private self-host. Per-TENANT dimension (mixing dims in one HNSW column is impossible) is OUT OF SCOPE / deferred. Changing dim on an existing populated instance requires re-embedding + reindex — a documented one-time setup step, NOT an online migration."
-  },
+  "background": "The embedding vector dimension is pinned by the column type in exactly two migrations: priv/repo/migrations/20260410022854_enable_pgvector_and_add_embedding.exs:25 (ALTER TABLE articles ADD COLUMN embedding vector(1536)) and priv/repo/migrations/20260709000000_create_memory_stores.exs:101 (memories). The HNSW indexes do NOT pin a dimension - lib/loopctl/repo/hnsw_index.ex:125 emits USING hnsw (embedding vector_cosine_ops) parameterized only by table name, so it inherits whatever the column type is. Application.get_env(:loopctl, :embedding_dimensions, 1536) (config/config.exs:16) exists but is a CHANGESET VALIDATION ONLY (article.ex:490,506; memory.ex:281) - changing it does not change the column type, so 1536 is effectively hard system-wide. This is the blocker reported in #409: a local embedding model with a different native dimension (nomic-embed 768, bge 1024) cannot be used at all. The 2026-07-15 draft proposed a deployment-level single dimension; that is reversed here because the user who filed #409 is a HOSTED tenant, and a deployment-level dimension would force them off the hosted service to get a local model.",
   "story": {
-    "as_a": "someone self-hosting loopctl with a local embedding model",
-    "i_want_to": "set the embedding vector dimension for my instance via config so the DB columns and HNSW indexes are created at that dimension",
-    "so_that": "I can run knowledge + memory embeddings against a local OpenAI-compatible model (768/1024/etc.) instead of being forced to OpenAI's 1536-dim model"
+    "as_a": "a tenant whose privacy or cost constraints require a specific embedding model",
+    "i_want_to": "choose an embedding model whose native dimension is not 1536 and have loopctl store and index those vectors correctly",
+    "so_that": "I can run local or self-chosen embeddings on the SAME hosted instance, without forking to a self-hosted deployment"
   },
-  "rationale": "The app already treats the dimension as configurable everywhere EXCEPT the schema. Making the vector-column and HNSW-index creation read the same :embedding_dimensions config closes the gap with no behavior change for the default (1536) instance, and unblocks the entire local/private tier. It's the smallest change with the largest sovereignty payoff.",
+  "rationale": "Moving the vector out of a fixed-width column onto a dimension-tagged side table is what makes per-tenant embedding models possible on a shared multi-tenant instance. It is the difference between 'loopctl supports local models if you self-host' and 'loopctl supports local models', which is the whole product question behind this epic.",
   "acceptance_criteria": [
-    { "id": "AC-39.1.1", "description": "The articles.embedding and memories.embedding vector columns and their HNSW indexes are created at the dimension from Application.get_env(:loopctl, :embedding_dimensions) (default 1536). On a FRESH database with :embedding_dimensions set to e.g. 768, the columns are vector(768) and a 768-dim embedding inserts + kNN-searches successfully. On the default (1536) instance, schema is byte-identical to today (regression test).", "status": "pending" },
-    { "id": "AC-39.1.2", "description": "The configured dimension is the single source of truth: the migration/setup path, validate_embedding_dimensions/1 (article + memory), and any hardcoded 1536 literals in the vector path all resolve from :embedding_dimensions. A test asserts no code path assumes 1536 when the config differs (grep-guard test or a config-override test that exercises insert+recall at a non-1536 dim).", "status": "pending" },
-    { "id": "AC-39.1.3", "description": "Changing the dimension on an EXISTING instance is handled safely: the system detects a mismatch (configured dim != column dim) at boot and fails loud with a clear, actionable message (re-embed + reindex required) rather than silently corrupting/rejecting inserts. A documented mix task or runbook performs the re-embed+reindex. This story does NOT auto-migrate existing data.", "status": "pending" },
-    { "id": "AC-39.1.4", "description": "Purely enables a config; no default change. Hosted loopctl.com (1536, OpenAI) is unaffected. Documented in docs/agent-memory.md / a new docs/self-hosting.md: how to set the dimension for a local model.", "status": "pending" }
+    {
+      "id": "AC-41.1.1",
+      "description": "Vectors move to side tables article_embeddings(article_id, dim, embedding) and memory_embeddings(memory_id, dim, embedding), each tenant_id-scoped with RLS via the existing enable_rls/1 macro (repo/rls_helpers.ex:38-63, ENABLE not FORCE), and a unique constraint on (article_id) / (memory_id) so one row holds the current vector.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.1.2",
+      "description": "One PARTIAL HNSW index per distinct dimension in use (WHERE dim = N), created by an idempotent helper extending repo/hnsw_index.ex. Adding a new dimension creates its index without touching existing ones; no index is created for a dimension with no rows.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.1.3",
+      "description": "A tenant's dimension is derived from its configured embedding model, not set by hand, and is readable via the API/MCP. Writing a vector whose length disagrees with the tenant's recorded dimension is rejected with a legible error naming both values - never silently stored or truncated.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.1.4",
+      "description": "Search and recall join the side table and filter by the caller tenant's dimension, so a tenant NEVER sees or ranks against vectors of a different dimension. A cross-dimension similarity comparison must be impossible by construction (the query is dimension-scoped), not merely unlikely.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.1.5",
+      "description": "Backfill migration moves every existing articles.embedding / memories.embedding into the side table with dim = 1536, is resumable and batched (the corpus is large - see epic 27 scale work), and leaves the old column in place but unused until a follow-up drop. Zero behavior change for existing tenants: same results, same ranking.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.1.6",
+      "description": "Changing a tenant's embedding model (and therefore dimension) is supported via an agent-triggerable re-embed backfill that reports progress through the existing job/anomaly surfaces. It is documented as a one-time operation, NOT an online migration; stale-dimension rows are excluded from recall until re-embedded rather than being compared incorrectly.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.1.7",
+      "description": "Query performance on the hosted default (dim 1536) does not regress measurably versus the current single-column form. The added join is on an indexed FK; a benchmark or query-plan assertion documents the result.",
+      "status": "pending"
+    }
   ],
   "test_cases": [
-    { "id": "TC-39.1.1", "name": "fresh DB at 768 dim round-trips", "type": "integration",
-      "preconditions": [":embedding_dimensions=768; fresh schema"],
-      "steps": ["insert a 768-dim article + memory embedding", "kNN search"],
-      "expected_results": ["insert succeeds; nearest-neighbour returns the row"], "status": "pending" },
-    { "id": "TC-39.1.2", "name": "default 1536 schema unchanged", "type": "unit",
-      "preconditions": ["default config"],
-      "steps": ["inspect the generated column/index dimension"],
-      "expected_results": ["vector(1536) as today; existing dimension tests pass"], "status": "pending" },
-    { "id": "TC-39.1.3", "name": "dim mismatch fails loud at boot", "type": "unit",
-      "preconditions": ["column is vector(1536); config says 768"],
-      "steps": ["run the boot/dimension check"],
-      "expected_results": ["clear error naming the mismatch + remediation; no silent corruption"], "status": "pending" }
+    {
+      "id": "TC-41.1.1",
+      "name": "two tenants with different dimensions coexist and never cross-rank",
+      "type": "integration",
+      "preconditions": ["tenant A configured 1536-dim", "tenant B configured 768-dim", "both have embedded articles"],
+      "steps": ["run semantic search as tenant B"],
+      "expected_results": ["only tenant B's 768-dim vectors are considered", "no error, no dimension-mismatch from pgvector", "tenant A's rows are invisible (RLS) AND dimension-excluded"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.1.2",
+      "name": "partial HNSW index exists per dimension and is used",
+      "type": "integration",
+      "preconditions": ["rows at two distinct dimensions"],
+      "steps": ["EXPLAIN the semantic search query for each dimension"],
+      "expected_results": ["each plan uses the partial HNSW index for its own dim", "no sequential scan over the side table"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.1.3",
+      "name": "backfill is resumable and lossless",
+      "type": "integration",
+      "preconditions": ["articles and memories with existing 1536-dim embeddings"],
+      "steps": ["run the backfill", "interrupt it midway", "re-run to completion"],
+      "expected_results": ["every vector present exactly once at dim 1536", "no duplicates from the re-run", "search results identical to pre-backfill"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.1.4",
+      "name": "wrong-length vector is rejected legibly",
+      "type": "unit",
+      "preconditions": ["tenant recorded at dim 768"],
+      "steps": ["attempt to store a 1536-length vector"],
+      "expected_results": ["rejected with an error naming expected 768 and got 1536", "nothing written"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.1.5",
+      "name": "tenant isolation on the side tables",
+      "type": "integration",
+      "preconditions": ["two tenants with embeddings"],
+      "steps": ["query article_embeddings as tenant A"],
+      "expected_results": ["tenant B rows are not visible (RLS policy enforced)"],
+      "status": "pending"
+    }
   ],
   "technical_notes": [
-    "Files: priv/repo/migrations (the vector-column creation — parameterize the dimension from config; a fresh install reads :embedding_dimensions), lib/loopctl/repo/hnsw_index.ex (index dim), config/config.exs + config/runtime.exs (EMBEDDING_DIMENSION env → :embedding_dimensions), a new boot check + a re-embed/reindex mix task, docs/self-hosting.md.",
-    "pgvector: `vector(N)` column type is fixed per column; HNSW index inherits it. Migrations must interpolate N from config at run time (Ecto migrations can read Application env). For an existing 1536 instance the migration is a no-op; the dimension is only chosen at fresh install.",
-    "Do NOT attempt per-tenant dimensions (impossible in one HNSW column) — deployment-level only; note per-tenant as future work.",
-    "Re-embed+reindex on dim change is offline/one-time (CREATE INDEX CONCURRENTLY the new, re-run embedding workers) — documented, not automated here.",
-    "Config-based DI; no Application.put_env in tests (use config/test overrides or a scoped helper)."
+    "Only two column definitions actually pin the dimension; the HNSW helper (repo/hnsw_index.ex:125) is dimension-agnostic and can be reused nearly as-is with an added WHERE dim = N predicate.",
+    "Keep :embedding_dimensions as the DEFAULT for a tenant with no explicit model, so existing config semantics survive; the changeset validations at article.ex:490,506 and memory.ex:281 must switch to validating against the TENANT's dimension, not the global config.",
+    "pgvector cannot compare vectors of different dimensions - it errors. That is a safety net, not the design: the query must be dimension-scoped so the error is unreachable in normal operation.",
+    "Do NOT drop articles.embedding / memories.embedding in this story. Land the side table + backfill first, verify in prod, drop in a follow-up so a rollback stays trivial.",
+    "Memories already use explicit (tenant_id, subject_id) predicates rather than relying on RLS alone (memory.ex:18-42) - preserve that pattern on memory_embeddings.",
+    "Watch index build cost: HNSW builds are expensive at corpus scale. Create partial indexes CONCURRENTLY and treat a new dimension's first index build as an operational step."
   ],
   "dependencies": [],
-  "estimated_tokens": 400000
+  "estimated_tokens": 450000
 }
