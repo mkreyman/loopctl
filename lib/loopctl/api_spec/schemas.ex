@@ -985,6 +985,15 @@ defmodule Loopctl.ApiSpec.Schemas do
               }
             }
           }
+        },
+        supersedes: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description:
+            "Optional id of a post this one retires. The target must live in the same " <>
+              "tenant+project channel, and the caller must be its author or hold role >= :user. " <>
+              "A superseded post is excluded from handoff discovery and marked in the history read."
         }
       },
       example: %{
@@ -1045,6 +1054,20 @@ defmodule Loopctl.ApiSpec.Schemas do
           description:
             "true when a new post was appended or a session slot upserted; false when a " <>
               "keyless idempotency_key write deduplicated to an existing post (US-40.B2)"
+        },
+        meta: %Schema{
+          type: :object,
+          nullable: true,
+          description:
+            "Write-path provenance markers. Present on created/updated/deduplicated responses. " <>
+              "key_source is 'derived_from_body' when the server derived the handoff key from the " <>
+              "body because no key was sent. session_id_source is 'server_surrogate' when the server " <>
+              "minted a unique session id because the proxy supplied none. Both nil on a normal " <>
+              "client-driven write.",
+          properties: %{
+            key_source: %Schema{type: :string, nullable: true},
+            session_id_source: %Schema{type: :string, nullable: true}
+          }
         }
       }
     })
@@ -1095,6 +1118,19 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :array,
           nullable: true,
           items: %Schema{type: :object, additionalProperties: true}
+        },
+        superseded_by: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description: "The successor post id when this post has been superseded; nil when live."
+        },
+        directed_to_me: %Schema{
+          type: :boolean,
+          nullable: true,
+          description:
+            "Present only on the handoffs read. True when this handoff is addressed to the " <>
+              "caller's host/capabilities (or is an unaddressed broadcast)."
         },
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
@@ -1147,6 +1183,13 @@ defmodule Loopctl.ApiSpec.Schemas do
               type: :array,
               nullable: true,
               items: %Schema{type: :object, additionalProperties: true}
+            },
+            superseded_by: %Schema{
+              type: :string,
+              format: :uuid,
+              nullable: true,
+              description:
+                "The successor post id when this post has been superseded; nil when live."
             },
             inserted_at: %Schema{type: :string, format: :"date-time"},
             updated_at: %Schema{type: :string, format: :"date-time"}

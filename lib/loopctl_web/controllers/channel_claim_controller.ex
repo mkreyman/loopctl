@@ -33,12 +33,32 @@ defmodule LoopctlWeb.ChannelClaimController do
   require Logger
 
   alias Loopctl.Coordination
+  alias Loopctl.RateLimiter.FailOpenLog
+  alias Loopctl.Tenants
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent] when action in [:create, :done, :release]
+
+  # Per-claim rate limit (review finding): a dedicated cap on the claim write path,
+  # mirroring the ChannelPostController's per-write cap. Reuses the same RateLimiter
+  # behaviour seam, fail-open discipline, and security telemetry. The claim surface
+  # is high-value (24h leases, no operator force-release) so a dedicated cap is
+  # warranted even though the generic pipeline limiter also runs first.
+  plug :rate_limit_claim when action in [:create]
+
+  # 60s fixed window, matching the ETS/Hammer contract the pipeline limiter uses.
+  @claim_window_ms 60_000
+
+  # Config-default per-minute claim cap; a tenant may override via the
+  # `channel_claim_limit_per_minute` setting.
+  @default_claim_limit 60
+
+  # Fallback for the generic per-key pipeline limit, kept in sync with
+  # LoopctlWeb.Plugs.RateLimiter's @default_per_key_limit.
+  @pipeline_per_key_limit_default 300
 
   # A missing/cross-tenant/cross-project project returns this ONE message on the
   # claim path — no existence oracle (mirrors ChannelPostController).
@@ -179,6 +199,97 @@ defmodule LoopctlWeb.ChannelClaimController do
           "This API key's agent identity is not valid for this tenant; it cannot claim a coordination handoff"
       }
     })
+  end
+
+  # --- Rate limiting (function plug) ---
+
+  defp rate_limit_claim(conn, _opts) do
+    api_key = conn.assigns.current_api_key
+    tenant = conn.assigns[:current_tenant]
+    limit = claim_limit(tenant)
+    identifier = "channel_claim:key:#{api_key.id}"
+
+    case check_rate(identifier, limit) do
+      {:allow, _count} ->
+        conn
+
+      {:deny, _limit} ->
+        reset_at = window_reset_at()
+        retry_after = max(1, reset_at - System.system_time(:second))
+
+        emit_security_event(:rate_limited, %{
+          tenant_id: api_key.tenant_id,
+          api_key_id: api_key.id,
+          limit_kind: :claim
+        })
+
+        conn
+        |> put_resp_header("retry-after", to_string(retry_after))
+        |> put_status(:too_many_requests)
+        |> json(%{error: %{status: 429, message: "Rate limit exceeded"}})
+        |> halt()
+    end
+  end
+
+  defp check_rate(identifier, limit) do
+    case Loopctl.RateLimiter.impl().check_rate(identifier, @claim_window_ms, limit) do
+      {:allow, count} when is_integer(count) -> {:allow, count}
+      {:deny, denied} when is_integer(denied) -> {:deny, denied}
+      other -> fail_open(identifier, "limiter returned #{inspect(other)}")
+    end
+  rescue
+    e -> fail_open(identifier, Exception.message(e))
+  catch
+    :exit, reason -> fail_open(identifier, "limiter exit: #{inspect(reason)}")
+    :throw, value -> fail_open(identifier, "limiter throw: #{inspect(value)}")
+  end
+
+  defp fail_open(identifier, detail) do
+    FailOpenLog.warn(:coordination, identifier, detail)
+    {:allow, 0}
+  end
+
+  defp claim_limit(nil), do: default_claim_limit()
+
+  defp claim_limit(tenant) do
+    configured =
+      tenant
+      |> Tenants.get_tenant_settings("channel_claim_limit_per_minute", default_claim_limit())
+      |> coerce_positive_int(default_claim_limit())
+
+    min(configured, pipeline_per_key_limit(tenant))
+  end
+
+  defp default_claim_limit do
+    Application.get_env(:loopctl, :channel_claim_limit_per_minute, @default_claim_limit)
+  end
+
+  defp pipeline_per_key_limit(tenant) do
+    tenant
+    |> Tenants.get_tenant_settings(
+      "rate_limit_requests_per_minute",
+      @pipeline_per_key_limit_default
+    )
+    |> coerce_positive_int(@pipeline_per_key_limit_default)
+  end
+
+  defp coerce_positive_int(value, _default) when is_integer(value) and value > 0, do: value
+
+  defp coerce_positive_int(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {n, ""} when n > 0 -> n
+      _ -> default
+    end
+  end
+
+  defp coerce_positive_int(_value, default), do: default
+
+  defp window_reset_at do
+    # Hammer uses millisecond windows aligned to epoch; the next reset is the
+    # next multiple of the window size.
+    now = System.system_time(:millisecond)
+    ceil = div(now, @claim_window_ms) * @claim_window_ms + @claim_window_ms
+    div(ceil, 1000)
   end
 
   # Coordination-surface security telemetry (parity with ChannelPostController).

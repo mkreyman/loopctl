@@ -285,7 +285,7 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
       # broadcast (directed_to_me: true) AND the capability-directed one
       # (directed_to_me: false with empty caps). only_mine keeps the old rule:
       # broadcast included, capability-directed excluded with empty caps.
-      assert keys(rows) == ["handoff:bcast", "handoff:cap-only"]
+      assert Enum.sort(keys(rows)) == ["handoff:bcast", "handoff:cap-only"]
 
       assert %{
                "handoff:bcast" => true,
@@ -322,6 +322,7 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
           capabilities: ["fly-auth"]
         })
 
+      # Oldest-first: the longest-waiting handoff comes first (40.C1 design).
       assert keys(rows) == ["handoff:older", "handoff:newer"]
     end
 
@@ -358,7 +359,9 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
 
       # Bounded at the cap, never the full cap + 5.
       assert length(rows) == cap
-      # Oldest-first retained: the very first seeded handoff is present, the newest is dropped.
+
+      # Oldest-first retained: the very FIRST (oldest) seeded handoff is present,
+      # the newest overflow is dropped.
       assert "handoff:cap#1" in keys(rows)
       refute "handoff:cap##{cap + 5}" in keys(rows)
       # And the truncation is NOT silent: the caller is told the pinned set overflowed
@@ -388,8 +391,10 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
     # handoff key fired from two sessions/agents (the cross-machine offline-reconcile
     # this epic targets) is TWO distinct pointer rows — the keyed-slot unique index
     # includes session_id. The pinned discovery read must surface ONE row per LOGICAL
-    # handoff, keeping the OLDEST pointer, so the set and meta.count are not inflated.
-    test "dedups the same handoff key from different sessions to one pinned row", ctx do
+    # handoff, keeping the NEWEST pointer, so the set and meta.count are not inflated
+    # and a refreshed handoff from a new session wins over the stale one.
+    test "dedups the same handoff key from different sessions to one pinned row (newest wins)",
+         ctx do
       now = DateTime.utc_now()
 
       entries =
@@ -419,8 +424,8 @@ defmodule Loopctl.Coordination.DirectedHandoffsTest do
 
       # ONE logical handoff, not two pointer rows.
       assert keys(rows) == ["handoff:repo#812"]
-      # DISTINCT ON keeps the OLDEST pointer (sess-a) as the representative.
-      assert [%{session_id: "sess-a"}] = rows
+      # DISTINCT ON keeps the NEWEST pointer (sess-b) as the representative.
+      assert [%{session_id: "sess-b"}] = rows
     end
 
     test "a malformed project_id returns [] (valid_uuid? guard, never a crash)", ctx do

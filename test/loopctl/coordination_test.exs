@@ -1317,14 +1317,14 @@ defmodule Loopctl.CoordinationTest do
       %{tenant: tenant, project: project, agent_id: agent_id}
     end
 
-    test "a keyless post whose body announces a handoff gets the key DERIVED (discoverable), marked key_source",
+    test "a keyless post whose body STARTS WITH a handoff anchor gets the key DERIVED (discoverable), marked key_source",
          ctx do
       %{tenant: tenant, project: project, agent_id: agent_id} = ctx
 
       assert {:ok, post, :created} =
                Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
-                 body: "HANDOFF (handoff:pr#453-port-4030) — dev port moved, update .mcp.json"
+                 body: "handoff:pr#453-port-4030 — dev port moved, update .mcp.json"
                })
 
       assert post.key == "handoff:pr#453-port-4030"
@@ -1344,6 +1344,20 @@ defmodule Loopctl.CoordinationTest do
                  body: "just a status update"
                })
 
+      assert is_nil(post.key)
+      assert is_nil(post.key_source)
+    end
+
+    test "a keyless post with a passing mention (not at start-of-body) stays keyless", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+
+      assert {:ok, post, :created} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "done with handoff:repo#812, starting work on the next thing"
+               })
+
+      # The anchor is NOT at start-of-body, so derivation is skipped.
       assert is_nil(post.key)
       assert is_nil(post.key_source)
     end
@@ -1397,10 +1411,15 @@ defmodule Loopctl.CoordinationTest do
       assert is_nil(post.session_id_source)
     end
 
-    test "a HANDOFF body carrying a client idempotency token 422s LOUDLY (derived key + token are mutually exclusive)",
+    test "a HANDOFF-announcing body carrying a client idempotency token 422s LOUDLY (issue #454 fix 2)",
          ctx do
       %{tenant: tenant, project: project, agent_id: agent_id} = ctx
 
+      # The body announces a handoff, so the key IS derived — and the derived
+      # key + the client token trip the key/idempotency_key exclusion. A loud
+      # 422 beats a silent drop: the client must choose an explicit key (the
+      # keyed slot dedups its retry) or a token (keyless — and undiscoverable
+      # by its own choice, told so by the error).
       assert {:error, %Ecto.Changeset{} = changeset} =
                Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
@@ -1460,7 +1479,7 @@ defmodule Loopctl.CoordinationTest do
       assert stale_row.superseded_by == successor.id
     end
 
-    test "supersedes on another agent's post is rejected byte-identically (:agent role)", ctx do
+    test "supersedes on another agent's post is rejected (:agent role)", ctx do
       %{tenant: tenant, project: project, agent_id: agent_id} = ctx
       other_agent = fixture(:agent, %{tenant_id: tenant.id}).id
 
@@ -1478,7 +1497,7 @@ defmodule Loopctl.CoordinationTest do
                  body: "someone else's post"
                })
 
-      assert {:error, :not_found} =
+      assert {:error, :supersede_target_not_found} =
                Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
                  body: "trying to retire a peer's post",
@@ -1516,10 +1535,11 @@ defmodule Loopctl.CoordinationTest do
       assert AdminRepo.get!(ChannelPost, other_post.id).superseded_by == successor.id
     end
 
-    test "supersedes a nonexistent or cross-project post is the byte-identical :not_found", ctx do
+    test "supersedes a nonexistent or cross-project post returns :supersede_target_not_found",
+         ctx do
       %{tenant: tenant, project: project, agent_id: agent_id} = ctx
 
-      assert {:error, :not_found} =
+      assert {:error, :supersede_target_not_found} =
                Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
                  body: "superseding a ghost",
@@ -1542,12 +1562,41 @@ defmodule Loopctl.CoordinationTest do
                  body: "post on another channel"
                })
 
-      assert {:error, :not_found} =
+      assert {:error, :supersede_target_not_found} =
                Coordination.post(tenant.id, agent_id, :agent, %{
                  project_id: project.id,
                  body: "cross-project supersede attempt",
                  supersedes: foreign.id
                })
+    end
+
+    test "supersedes a post in another tenant returns :supersede_target_not_found", ctx do
+      %{tenant: tenant, project: project, agent_id: agent_id} = ctx
+      tenant_b = fixture(:tenant)
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      agent_b = fixture(:agent, %{tenant_id: tenant_b.id}).id
+
+      fixture(:story, %{
+        tenant_id: tenant_b.id,
+        project_id: project_b.id,
+        assigned_agent_id: agent_b,
+        agent_status: :assigned
+      })
+
+      assert {:ok, foreign_post, :created} =
+               Coordination.post(tenant_b.id, agent_b, :agent, %{
+                 project_id: project_b.id,
+                 body: "post in tenant B"
+               })
+
+      assert {:error, :supersede_target_not_found} =
+               Coordination.post(tenant.id, agent_id, :agent, %{
+                 project_id: project.id,
+                 body: "cross-tenant supersede attempt",
+                 supersedes: foreign_post.id
+               })
+
+      assert is_nil(AdminRepo.get!(ChannelPost, foreign_post.id).superseded_by)
     end
 
     test "self-supersede via the keyed upsert path 422s (cannot supersede itself)", ctx do
