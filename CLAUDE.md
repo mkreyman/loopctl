@@ -290,12 +290,30 @@ mix ecto.reset         # Drop, create, migrate
 ## Key Documents
 
 - **PRD**: `docs/prd.md` — full product requirements
-- **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — 231 stories across 38 epic folders
-- **Orchestration skills**: `skills/loopctl-*.md` — 6 skills describing the orchestration LOOP itself (dispatch, review, verify)
+- **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — one file per story, one folder per epic
+- **Orchestration skills**: `skills/loopctl-*.md` — the orchestration LOOP itself (dispatch, review, verify)
 - **Domain skills**: `.claude/skills/<domain>/SKILL.md` — code-map + invariants skills, loaded when you touch that domain (routing table below). Distinct from the `skills/loopctl-*.md` orchestration skills above.
 - **Orchestration Guide**: `docs/orchestration-guide.md` — methodology: loop, trust model, checkpointing
-- **MCP Server**: `mcp-server/` — 102 statically declared typed tools for Claude Code agents (no curl needed), plus per-tenant generated `cr_*` Context Retriever tools; published as `loopctl-mcp-server` on npm. `mcp-server/README.md` is the source of truth for the list.
+- **MCP Server**: `mcp-server/` — statically declared typed tools for Claude Code agents (no curl needed), plus per-tenant generated `cr_*` Context Retriever tools; published as `loopctl-mcp-server` on npm. `mcp-server/README.md` is the source of truth for the list.
 - **Build Status**: memory-keeper key `build_status`, channel `loopctl`
+
+### Doc hygiene: NEVER record inventory counts
+
+Do not write counts of things that grow — stories, epics, MCP tools, modules,
+skills, articles — into ANY doc (this file, `AGENTS.md`, `README`s, skills).
+They are wrong by the next merge and generate pure make-work: a whole PR (#147,
+"docs: sync tool count") was once spent resyncing a tool count that has since
+churned 57 -> 84 -> 85 -> 102. A review that "fixes" a stale count by writing a
+fresh one has fixed nothing; it has reset the rot clock.
+
+Write the **structure or the pointer** instead — a path glob (`us_N.M.json`,
+`skills/loopctl-*.md`) or the file that IS the list (`mcp-server/README.md`).
+Those stay true as the repo grows.
+
+The narrow exception is a cited config value that explains a BEHAVIOR, not a
+tally — e.g. AdminRepo's 3-connection pool (`config/runtime.exs:190`), which is
+*why* a heavy read starves the admin pool. Cite it at `file:line` so it can be
+re-checked.
 
 ### Domain skill routing
 
@@ -313,7 +331,7 @@ Claude Code agents should use the loopctl MCP tools instead of curl. Install via
 {"mcpServers": {"loopctl": {"command": "npx", "args": ["loopctl-mcp-server"], "env": {"LOOPCTL_SERVER": "https://loopctl.com", "LOOPCTL_ORCH_KEY": "...", "LOOPCTL_AGENT_KEY": "..."}}}}
 ```
 
-Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (102 statically declared tools, plus per-tenant `cr_*` Context Retriever tools). See `mcp-server/README.md` for the full list — it is the single source of truth for the count.
+Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc., plus per-tenant `cr_*` Context Retriever tools. See `mcp-server/README.md` for the full list — it is the single source of truth.
 
 ---
 

@@ -6,7 +6,7 @@ description: Use when working on loopctl's knowledge/retrieval product — the s
 # Knowledge Wiki & Retrieval Surfaces
 
 The knowledge/retrieval stack is loopctl's product core (it *is* the second brain). It is large
-(`lib/loopctl/knowledge/` ≈ 40 modules) and split across three distinct agent-facing surfaces plus a
+(`lib/loopctl/knowledge/`) and split across three distinct agent-facing surfaces plus a
 hybrid retrieval capability. This skill routes you to the right surface and the load-bearing invariants;
 full references live in `docs/agent-memory.md`, `docs/context-retriever.md`,
 `docs/knowledge-hybrid-retrieval.md`. AGENTS.md carries the same three-surface routing for quick recall.
