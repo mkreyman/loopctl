@@ -436,12 +436,21 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       ref = make_ref()
       handler_id = "test-skip-#{inspect(ref)}"
       parent = self()
+      this_tenant_id = tenant.id
 
+      # Telemetry handlers are VM-GLOBAL and this event name is shared across the
+      # article/memory/batch embedding workers, so a CONCURRENT async test's emission
+      # would otherwise fire THIS handler and leak into the mailbox — tripping the
+      # assert_received below. Forward ONLY events for this test's tenant (the emit
+      # site tags metadata.tenant_id) so recall stays deterministic under full-suite
+      # load, matching the memory_promotion_worker_test attach_telemetry pattern.
       :telemetry.attach(
         handler_id,
         [:loopctl, :embedding, :skipped_no_key],
         fn _event, measurements, metadata, _cfg ->
-          send(parent, {:telemetry, ref, measurements, metadata})
+          if metadata[:tenant_id] == this_tenant_id do
+            send(parent, {:telemetry, ref, measurements, metadata})
+          end
         end,
         nil
       )

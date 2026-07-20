@@ -17,9 +17,12 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
   alias Loopctl.ContextRetriever.Entity
+  alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.IngestionAnomaly
+  alias Loopctl.Knowledge.IngestionWriteStats
   alias Loopctl.Llm.SettingsCache
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Llm.UsageEvent, as: LlmUsageEvent
@@ -500,6 +503,36 @@ defmodule Loopctl.Fixtures do
     )
   end
 
+  def build(:ingestion_anomaly, attrs) do
+    Map.merge(
+      %{
+        source_type: "session_log",
+        anomaly_type: :capture_silence,
+        last_event_at: DateTime.add(DateTime.utc_now(), -96, :hour),
+        hours_stale: 96,
+        sample_count: 5,
+        resolved: false,
+        metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:ingestion_write_stats, attrs) do
+    Map.merge(
+      %{
+        source_type: "session_log",
+        day: Date.utc_today(),
+        created_count: 0,
+        deduplicated_count: 0,
+        drafted_count: 0,
+        title_conflict_count: 0,
+        validation_error_count: 0
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
   def build(:review_record, attrs) do
     Map.merge(
       %{
@@ -964,6 +997,35 @@ defmodule Loopctl.Fixtures do
     apply_story_overrides(story, agent_status, verified_status, assigned_agent_id)
   end
 
+  # US-40.B1: a coordination handoff claim, inserted DIRECTLY on AdminRepo
+  # (bypassing the membership gate) so lifecycle/sweeper/isolation tests can seed
+  # claims with arbitrary `done_at`/`lease_expires_at`. Auto-creates tenant/project/
+  # agent when not supplied. Override any of `:ref`, `:claimant_agent_id`,
+  # `:claimed_at`, `:lease_expires_at`, `:done_at`.
+  def fixture(:channel_claim, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    tenant_id = Map.get(attrs, :tenant_id) || fixture(:tenant).id
+    project_id = Map.get(attrs, :project_id) || fixture(:project, %{tenant_id: tenant_id}).id
+
+    claimant_agent_id =
+      Map.get(attrs, :claimant_agent_id) || fixture(:agent, %{tenant_id: tenant_id}).id
+
+    now = DateTime.utc_now()
+    claimed_at = Map.get(attrs, :claimed_at, now)
+    lease_expires_at = Map.get(attrs, :lease_expires_at, DateTime.add(now, 3600, :second))
+
+    AdminRepo.insert!(%ChannelClaim{
+      tenant_id: tenant_id,
+      project_id: project_id,
+      claimant_agent_id: claimant_agent_id,
+      ref: Map.get(attrs, :ref, "handoff:repo##{System.unique_integer([:positive])}"),
+      claimed_at: claimed_at,
+      lease_expires_at: lease_expires_at,
+      done_at: Map.get(attrs, :done_at)
+    })
+  end
+
   def fixture(:epic_dependency, attrs) do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
@@ -1224,6 +1286,52 @@ defmodule Loopctl.Fixtures do
       |> CostAnomaly.create_changeset(data)
 
     AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:ingestion_anomaly, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    data = build(:ingestion_anomaly, attrs)
+
+    # `archived` is not cast by create_changeset (mirrors CostAnomaly — it's set by
+    # the archival path, not the create surface), so put it on the changeset directly
+    # when a test needs an archived row.
+    changeset =
+      %IngestionAnomaly{tenant_id: tenant_id}
+      |> IngestionAnomaly.create_changeset(data)
+      |> Ecto.Changeset.put_change(:archived, Map.get(data, :archived, false))
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:ingestion_write_stats, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    data = build(:ingestion_write_stats, Map.delete(attrs, :tenant_id))
+
+    %IngestionWriteStats{tenant_id: tenant_id}
+    |> IngestionWriteStats.changeset(data)
+    |> AdminRepo.insert!()
   end
 
   def fixture(:review_record, attrs) do
@@ -1649,6 +1757,32 @@ defmodule Loopctl.Fixtures do
   Generates a fresh binary UUID for use in tests.
   """
   def uuid, do: Ecto.UUID.generate()
+
+  @doc """
+  Inserts a knowledge `Article` with a controlled `inserted_at` and `source_type`.
+
+  The normal `fixture(:article, ...)` path auto-sets `inserted_at` to now via
+  timestamps; the ingestion capture-silence detector reasons over `inserted_at`, so
+  tests need to backdate captured articles. Pass `:inserted_at` (a DateTime) and
+  `:source_type`; auto-creates a tenant when `:tenant_id` is absent.
+  """
+  def captured_article(attrs) do
+    attrs = Enum.into(attrs, %{})
+    {inserted_at, attrs} = Map.pop(attrs, :inserted_at)
+    article = fixture(:article, attrs)
+
+    if inserted_at do
+      import Ecto.Query
+
+      {1, [updated]} =
+        from(a in Article, where: a.id == ^article.id, select: a)
+        |> AdminRepo.update_all(set: [inserted_at: inserted_at])
+
+      updated
+    else
+      article
+    end
+  end
 
   # --- Private helpers ---
 

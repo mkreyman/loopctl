@@ -12,6 +12,8 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :unauthorized}` -> 401
   - `{:error, :forbidden}` -> 403
   - `{:error, :conflict}` -> 409
+  - `{:error, :already_claimed}` -> 409 (US-40.B1: a coordination handoff ref was already claimed by another agent)
+  - `{:error, :ambiguous_resolution}` -> 409 (a fuzzy identifier matched >1 active project)
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
   - `{:error, :self_verify_blocked}` -> 409 (same agent implemented and tries to verify)
@@ -25,6 +27,8 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message
   - `{:error, :unprocessable_entity, message}` -> 422 with custom message
+  - `{:error, :audit_write_failed}` -> 500 (US-39.7 redact path: a hard delete whose
+    audit insert failed, rolling the delete back — never masked as a 404)
   - `{:error, %Postgrex.Error{}}` -> 504/503/500 by SQLSTATE class (US-27.3)
   - `{:error, %DBConnection.ConnectionError{}}` -> 503 with Retry-After (US-27.3)
   """
@@ -58,6 +62,42 @@ defmodule LoopctlWeb.FallbackController do
     conn
     |> put_status(:conflict)
     |> json(%{error: %{status: 409, message: "Conflict"}})
+  end
+
+  # A fuzzy identifier (repo_url or name) matched more than one active project,
+  # so resolution refused to silently attach new work to whichever is older.
+  def call(conn, {:error, :ambiguous_resolution}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "ambiguous_resolution",
+        message:
+          "The supplied identifier matches more than one active project. " <>
+            "Disambiguate with an exact slug (or a fully-qualified, single-host repo_url)."
+      }
+    })
+  end
+
+  # US-40.B1: a coordination handoff `ref` is already claimed — the loser of an
+  # INSERT-to-claim race on the (tenant_id, project_id, ref) unique index. A distinct
+  # `code` so a losing agent learns the ref is taken and moves on (never confused with
+  # the generic 409 conflict). The message does NOT assert "another agent": the true
+  # owner re-claiming its own ACTIVE ref is served idempotently (200) upstream, so a
+  # 409 here means either a PEER owns the ref or the caller already completed it — in
+  # both cases the caller should move on rather than retry the same ref.
+  def call(conn, {:error, :already_claimed}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "already_claimed",
+        message:
+          "This ref is already claimed (by another agent, or already completed by you). Do not retry the same ref; move on to other work."
+      }
+    })
   end
 
   def call(conn, {:error, {:invalid_transition, ctx}}) do
@@ -314,6 +354,26 @@ defmodule LoopctlWeb.FallbackController do
 
   def call(conn, {:error, %DBConnection.ConnectionError{} = error}),
     do: render_db_error(conn, error)
+
+  # US-39.7 redact path: a channel-post HARD delete could not be durably recorded
+  # in the audit trail, so the whole transaction rolled back and the post STILL
+  # EXISTS. Fail-safe-on-security-path: a rolled-back redaction is NEVER reported as
+  # a 404 ("already gone/handled") — that would let an agent believe a leaked secret
+  # was removed when it was not. A 500 tells the caller the delete did NOT happen so
+  # it retries the redaction.
+  def call(conn, {:error, :audit_write_failed}) do
+    conn
+    |> put_status(:internal_server_error)
+    |> json(%{
+      error: %{
+        status: 500,
+        code: "audit_write_failed",
+        message:
+          "The delete could not be recorded in the audit trail and was rolled back; " <>
+            "the post still exists. Retry the request."
+      }
+    })
+  end
 
   def call(conn, {:error, %Changeset{} = changeset}) do
     details = format_changeset_errors(changeset)

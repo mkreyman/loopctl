@@ -27,6 +27,7 @@ defmodule Loopctl.Projects.Project do
   @type t :: %__MODULE__{}
 
   @statuses [:active, :archived]
+  @kinds [:work, :kb]
   @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
   @mission_max_length 2_000
 
@@ -40,6 +41,7 @@ defmodule Loopctl.Projects.Project do
              :description,
              :tech_stack,
              :status,
+             :kind,
              :mission,
              :metadata,
              :inserted_at,
@@ -54,6 +56,11 @@ defmodule Loopctl.Projects.Project do
     field :description, :string
     field :tech_stack, :string
     field :status, Ecto.Enum, values: @statuses, default: :active
+    # `:work` (default) carries the chain-of-custody surface; `:kb` is a knowledge-only
+    # scope. Deliberately NOT in any `cast/3` list — it is set programmatically in
+    # `Projects.create_project/3` (mirroring how `tenant_id` and `trust_tier` are kept
+    # out of cast), so a request body can never elevate a `:kb` scope into a `:work` one.
+    field :kind, Ecto.Enum, values: @kinds, default: :work
     field :mission, :string
     field :metadata, :map, default: %{}
 
@@ -102,10 +109,24 @@ defmodule Loopctl.Projects.Project do
   end
 
   @doc """
+  Changeset for re-activating an archived project (setting status to :active).
+  """
+  @spec activate_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
+  def activate_changeset(project) do
+    change(project, status: :active)
+  end
+
+  @doc """
   Returns the list of valid statuses.
   """
   @spec statuses() :: [atom()]
   def statuses, do: @statuses
+
+  @doc """
+  Returns the list of valid project kinds.
+  """
+  @spec kinds() :: [atom()]
+  def kinds, do: @kinds
 
   defp validate_slug(changeset) do
     changeset

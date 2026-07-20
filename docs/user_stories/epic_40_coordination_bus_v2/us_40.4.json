@@ -1,0 +1,38 @@
+{
+  "id": "US-40.4",
+  "title": "Advisory file soft-locks (collision-avoidance — NOT the exactly-once handoff claim)",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
+  "priority": "medium",
+  "phase": "coordination_bus_v2_C",
+  "scope_clarification": "PANEL CLARIFICATION (do not conflate with 40.B1): this story is ADVISORY, NON-EXCLUSIVE COLLISION-AVOIDANCE on FILE targets — two sessions CAN hold a soft-lock on the same file (AC-40.4.4), it only informs, it never blocks. That is the OPPOSITE of what a handoff needs. The exactly-once, first-writer-wins, 409-already_claimed HANDOFF CLAIM is 40.B1 (the channel_claims table, UNIQUE(tenant,project,ref)). The panel flagged that v1 let US-40.4's file soft-lock masquerade as covering handoff claims — it does not. Keep the two distinct: 40.4 = 'don't both edit foo.ex'; 40.B1 = 'exactly one agent picks up handoff #812'. This story is retained (collision-avoidance is real value) but is NOT on the critical A-E claim/discovery path and must never be cited as the handoff-claim primitive.",
+  "story": {
+    "as_a": "coding agent about to edit a specific file",
+    "i_want_to": "post an advisory claim on that file (with a short TTL) that other sessions can see",
+    "so_that": "two sessions on different machines don't unknowingly edit the same file and collide"
+  },
+  "rationale": "The collision-avoidance primitive deferred from v1. It is built ENTIRELY on the existing channel post model (refs.file + a short expiry) — no new table — and stays advisory: it informs, it never blocks. The whole point is cooperative awareness among a single tenant's agents, so a claim is a signal, and a dead session's claim must self-expire so it can't wedge a file forever.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §3.2, §3.6; built on channel_posts (refs) + a per-key upsert",
+    "includes": "A claim is a channel post with key = \"claim:<file>\", refs.file set, and a SHORT expires_at override (minutes, not 30 days); release deletes it (US-39.7) or lets it expire."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.4.1", "description": "claim(project_id, target) posts a channel entry with key \"claim:<target>\", refs.file=target, and a short TTL via an optional ttl_seconds arg on the write path SERVER-CLAMPED to [min, max] minutes (e.g. 1..60) — this is the ONE place expires_at is caller-influenced (v1 fixes it at now+30d), so the clamp bounds are a stated invariant. Upserts on the hardened 5-column slot key (tenant, project, agent_id, session, key — the server-stamped agent_id was added to channel_posts_session_key_uidx at migration 20260718000000:22-25, so the slot key is NOT the old 4-column (tenant, project, session, key)) so a session refreshes its own claim. NEVER blocks the caller (advisory).", "status": "pending" },
+    { "id": "AC-40.4.2", "description": "channel_recent / the TEAM CHANNEL block surface active claims distinctly ('claimed: <file> by <agent/host>, <age>'), so a session sees a live claim before editing — but the system does NOT prevent the edit (advisory only).", "status": "pending" },
+    { "id": "AC-40.4.3", "description": "release(project_id, target) removes the caller's claim. Since US-39.7 deletes by post id only (not by key), this needs a delete-by-(tenant, project, agent_id, session, key) path (the same hardened 5-column slot key as AC-40.4.1) OR an upsert-to-already-expired (expires_at in the past) — specify which; v1 ships neither, so add the minimal one. A claim also self-expires via its short TTL + the sweep, so a crashed/dead session can never hold a file indefinitely.", "status": "pending" },
+    { "id": "AC-40.4.4", "description": "Claims are per-session (a session claims for itself); two sessions can hold claims on the same file (advisory — the UI/agent decides). claim/release are exposed as MCP tools.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.4.1", "name": "claim appears as an active claim", "type": "integration", "preconditions": ["a project + agent"], "steps": ["claim(project, \"lib/foo.ex\")", "channel_recent"], "expected_results": ["an active claim on lib/foo.ex is listed", "the call returned without blocking"] },
+    { "id": "TC-40.4.2", "name": "claim self-expires (dead session can't wedge)", "type": "integration", "preconditions": ["a claim with a past expires_at"], "steps": ["run the sweep / read live claims"], "expected_results": ["the expired claim is gone / not surfaced"] },
+    { "id": "TC-40.4.3", "name": "release removes the claim", "type": "integration", "preconditions": ["an active claim"], "steps": ["release(project, \"lib/foo.ex\")"], "expected_results": ["claim no longer active"] },
+    { "id": "TC-40.4.4", "name": "claim never blocks a concurrent editor", "type": "integration", "preconditions": ["session A holds a claim on foo.ex"], "steps": ["session B claims foo.ex"], "expected_results": ["B's claim succeeds (advisory); both visible; no error/lock rejection"] }
+  ],
+  "technical_notes": [
+    "Reuse channel_post with a claim key convention + a short per-post expires_at override — add an optional ttl_seconds arg to the write path (server clamps it) rather than a new table.",
+    "Surface claims in the consumer (US-39.6 SessionStart injection — the retained consumer surface; the running-session turn-boundary pull formerly numbered US-40.3 moved to the claude-config companion, so target US-39.6 / the companion, NOT the removed US-40.3): filter advisory locks by their `key LIKE 'claim:%'` prefix. There is NO `kind` column (the owner's 'no message types' decision stands — 40.A4 was cut). If the prefix scan needs to scale, add a PARTIAL index `WHERE key LIKE 'claim:%'` on the lock's scoping columns — same left-anchored-prefix + partial-index approach 40.C1 uses for handoff discovery — rather than a message-type column.",
+    "MCP: claim/release tools; both agent key.",
+    "Explicitly advisory: no server-side edit prevention — this is coordination, not a mutex."
+  ],
+  "dependencies": ["US-39.2", "US-39.3"],
+  "estimated_tokens": 200000
+}

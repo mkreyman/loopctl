@@ -43,3 +43,7 @@ mcp-server/node_modules/
 !.claude/commands/**
 !.claude/agents/
 !.claude/agents/**
+
+# Playwright MCP session output (transient)
+.playwright-mcp/
+.claude/implement-plan.run.json

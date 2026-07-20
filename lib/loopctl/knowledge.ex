@@ -314,6 +314,10 @@ defmodule Loopctl.Knowledge do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
       actor_type = Keyword.get(opts, :actor_type, "api_key")
+      # AuditContext impersonation trail (impersonated_by / impersonated_at /
+      # effective_role) when a superadmin impersonates; %{} for direct writes. Recorded on
+      # the article's audit entry so an impersonated create is fully attributable.
+      audit_metadata = Keyword.get(opts, :metadata, %{})
 
       changeset =
         %Article{tenant_id: effective_tenant_id}
@@ -335,6 +339,7 @@ defmodule Loopctl.Knowledge do
             actor_type: actor_type,
             actor_id: actor_id,
             actor_label: actor_label,
+            metadata: audit_metadata,
             new_state: %{
               "title" => article.title,
               "category" => to_string(article.category),
@@ -392,6 +397,12 @@ defmodule Loopctl.Knowledge do
   articles, and it falls open (`:unknown`) rather than blocking a write when the
   embedding backend is unavailable.
 
+  Pass `on_gate_unavailable: :skip` (default `:create`) so a fell-open `:unknown`
+  assessment returns `{:error, :gate_unavailable}` WITHOUT creating — for automated
+  callers that must not inject an un-deduplicated article during an embedding outage and
+  would rather retry once the gate can assess. Pass `embedding: vector` to reuse an
+  already-computed embedding of the assessed text instead of generating a new one.
+
   Returns `{:ok, result}` where `result` is a map:
 
       %{
@@ -407,6 +418,7 @@ defmodule Loopctl.Knowledge do
   @spec propose_article(Ecto.UUID.t() | nil, map(), keyword()) ::
           {:ok, map()}
           | {:error, :duplicate_title, Article.t()}
+          | {:error, :gate_unavailable}
           | {:error, Ecto.Changeset.t()}
   def propose_article(tenant_id, attrs, opts \\ []) do
     attrs = stringify_top_keys(attrs)
@@ -442,7 +454,21 @@ defmodule Loopctl.Knowledge do
     create_proposal(tenant_id, gated_attrs, assessment, opts, :gated_to_draft)
   end
 
-  # :novel or :unknown (gate fell open) — proceed on the requested path.
+  # :unknown — the gate FELL OPEN (embedding backend unavailable; it could not actually
+  # assess novelty). By DEFAULT this proceeds like :novel (create), preserving the
+  # never-block-a-write contract for interactive callers. An AUTOMATED caller that must
+  # not inject an un-deduplicated article during an outage passes
+  # `on_gate_unavailable: :skip`, which returns `{:error, :gate_unavailable}` WITHOUT
+  # creating, so the caller can retry once embeddings recover and dedup then.
+  defp gate_proposal(tenant_id, attrs, %{verdict: :unknown} = assessment, opts) do
+    if Keyword.get(opts, :on_gate_unavailable, :create) == :skip do
+      {:error, :gate_unavailable}
+    else
+      create_proposal(tenant_id, attrs, assessment, opts, :created)
+    end
+  end
+
+  # :novel — the gate assessed the proposal as genuinely new; create on the requested path.
   defp gate_proposal(tenant_id, attrs, assessment, opts) do
     create_proposal(tenant_id, attrs, assessment, opts, :created)
   end
@@ -581,12 +607,21 @@ defmodule Loopctl.Knowledge do
     end)
   end
 
-  # Look up by idempotency_key across ALL statuses, mirroring the partial unique
-  # index (which has no status predicate) so the conflicting row is always found.
-  defp get_article_by_idempotency_key(_tenant_id, nil, _vis), do: nil
-  defp get_article_by_idempotency_key(nil, _key, _vis), do: nil
+  @doc """
+  Look up an article by its `idempotency_key` across ALL statuses, mirroring the partial
+  unique index (which has no status predicate) so the conflicting/canonical row is always
+  found. `vis` (a `visibility_agent_id`) scopes the lookup to the owner-visible row so a
+  key colliding with another agent's private article can't be echoed (#163).
 
-  defp get_article_by_idempotency_key(tenant_id, key, vis) when is_binary(key) do
+  Public so callers holding a deterministic per-scope key (e.g. memory graduation) can
+  resolve the existing article for an idempotent no-op WITHOUT re-running the novelty gate.
+  """
+  @spec get_article_by_idempotency_key(Ecto.UUID.t() | nil, String.t() | nil, term()) ::
+          Article.t() | nil
+  def get_article_by_idempotency_key(_tenant_id, nil, _vis), do: nil
+  def get_article_by_idempotency_key(nil, _key, _vis), do: nil
+
+  def get_article_by_idempotency_key(tenant_id, key, vis) when is_binary(key) do
     from(a in Article,
       where: a.tenant_id == ^tenant_id and a.idempotency_key == ^key,
       order_by: [asc: a.inserted_at],
@@ -597,7 +632,7 @@ defmodule Loopctl.Knowledge do
   end
 
   # Non-binary key (e.g. an integer) → no lookup.
-  defp get_article_by_idempotency_key(_tenant_id, _key, _vis), do: nil
+  def get_article_by_idempotency_key(_tenant_id, _key, _vis), do: nil
 
   # Only the active-title index — NOT the slug indexes, whose conflicts are on a
   # different field and must not be recovered via a title lookup.
@@ -2180,7 +2215,10 @@ defmodule Loopctl.Knowledge do
   defp apply_search_filters(query, status, opts) do
     query
     |> maybe_filter_by_status(status)
-    |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
+    |> apply_project_scope(
+      Keyword.get(opts, :project_id),
+      Keyword.get(opts, :project_scope, :strict)
+    )
     |> maybe_filter_by_category(Keyword.get(opts, :category))
     |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
     |> maybe_filter_by_memory_types(Keyword.get(opts, :memory_types))
@@ -5807,6 +5845,38 @@ defmodule Loopctl.Knowledge do
     )
   end
 
+  # Dispatch the project filter between the STRICT (project-only) and the MERGED
+  # (`global ∪ project`) predicate based on the `:project_scope` opt (#411 Gap 2, PR B).
+  #
+  #   * `:strict` (DEFAULT) → `maybe_filter_by_project_id/2` — `project_id == ^id`,
+  #     the historical behaviour every existing search/list caller relies on. Absent
+  #     `:project_scope` resolves here, so EVERY pre-existing caller is byte-identical.
+  #   * `:with_global` → `scope_project_or_global/2` — `project_id IS NULL OR == ^id`,
+  #     the merged-recall semantics `Loopctl.Memory.recall_context/2` needs so a
+  #     project-scoped combined search ALSO surfaces tenant-wide (global) articles.
+  #
+  # Threaded from `search_combined/3` through its `sub_opts` into BOTH the keyword +
+  # semantic-count filter set (`apply_search_filters/3`) and the semantic results pool
+  # (`apply_semantic_pool_filters/2`), so results and `total_count` stay consistent.
+  #
+  # `nil` project_id behaviour DIFFERS by mode (deliberately):
+  #   * `:strict` — a no-op (`maybe_filter_by_project_id/2` short-circuits nil), so an
+  #     absent project matches ALL projects — the historical list/search behaviour.
+  #   * `:with_global` — scopes to GLOBAL-ONLY (`project_id IS NULL`), NOT the query
+  #     unchanged. The merged-recall contract (the OpenAPI RecallContextRequest and the
+  #     MCP recall_context tool both promise "absent/blank project → global-only") and
+  #     the memory half (`Memory.maybe_scope_project/2`, nil → `project_id IS NULL`)
+  #     require the union to be global-only with no active project — NOT every project's
+  #     articles flooding the merged limit for a multi-project tenant.
+  defp apply_project_scope(query, nil, :with_global),
+    do: where(query, [a], is_nil(a.project_id))
+
+  defp apply_project_scope(query, project_id, :with_global),
+    do: scope_project_or_global(query, project_id)
+
+  defp apply_project_scope(query, project_id, _strict),
+    do: maybe_filter_by_project_id(query, project_id)
+
   defp maybe_filter_by_project_id(query, nil), do: query
 
   defp maybe_filter_by_project_id(query, project_id) do
@@ -6264,7 +6334,10 @@ defmodule Loopctl.Knowledge do
   # select carries `project_id`/`category`/`tags`/`metadata`).
   defp apply_semantic_pool_filters(query, opts) do
     query
-    |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
+    |> apply_project_scope(
+      Keyword.get(opts, :project_id),
+      Keyword.get(opts, :project_scope, :strict)
+    )
     |> maybe_filter_by_category(Keyword.get(opts, :category))
     |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
     |> maybe_filter_by_memory_types(Keyword.get(opts, :memory_types))
@@ -6334,6 +6407,17 @@ defmodule Loopctl.Knowledge do
     - `:keyword_weight` -- weight for keyword scores (default 0.5)
     - `:semantic_weight` -- weight for semantic scores (default 0.5)
     - `:project_id`, `:category`, `:status`, `:tags` -- standard filters
+    - `:project_scope` -- how `:project_id` filters (default `:strict`). `:strict`
+      matches `project_id == id` (the historical behaviour); `:with_global` matches
+      `project_id IS NULL OR == id`, so a project-scoped search ALSO surfaces
+      tenant-wide (global) articles. Used by the merged `Loopctl.Memory.recall_context/2`
+      recall (#411 Gap 2). Under `:strict` an absent `:project_id` is a no-op (all
+      projects); under `:with_global` an absent `:project_id` scopes to GLOBAL-ONLY
+      (`project_id IS NULL`), matching the documented `global ∪ active-project` union.
+    - `:embedding` -- an optional precomputed `{:ok, embedding} | {:error, reason}`
+      for `query_string`. When supplied the semantic half reuses it instead of making
+      an outbound provider call (the merged recall shares ONE embedding across both
+      halves — #411 Gap 2); an `{:error, _}` degrades to keyword-only as usual.
     - `:limit` -- max ranked results to return (default 10, max
       #{@max_relevance_page_size}, min 1); relevance top-N, capped well below the
       enumeration page size
@@ -6399,7 +6483,15 @@ defmodule Loopctl.Knowledge do
       |> Keyword.put(:_skip_record_access, true)
 
     keyword_result = search_keyword(tenant_id, query_string, sub_opts)
-    embedding_result = try_generate_embedding(tenant_id, query_string, [])
+
+    # Reuse a caller-supplied embedding when present (the merged recall generates ONE
+    # embedding for both its memory + knowledge halves — #411 Gap 2) instead of making
+    # a second outbound provider call; otherwise generate here as before.
+    embedding_result =
+      case Keyword.get(opts, :embedding) do
+        nil -> try_generate_embedding(tenant_id, query_string, [])
+        precomputed -> precomputed
+      end
 
     case {keyword_result, embedding_result} do
       {{:ok, kw}, {:ok, embedding}} ->

@@ -415,6 +415,20 @@ defmodule Loopctl.ObanConfig do
          {"45 4 * * *", Loopctl.Workers.PromotionEvalWorker, args: %{"mode" => "all_tenants"}},
          {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
          {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
+         # US-39.5: 30-day TTL sweep for the coordination bus. Hard-deletes
+         # channel_posts past expires_at, bounded per run (single batch, drains a
+         # backlog over successive runs) so a large backlog cannot lock the table.
+         # Runs across all tenants on AdminRepo (BYPASSRLS) — the expiry predicate
+         # is tenant-independent. Keep in sync with the crontab assertion in
+         # oban_plugins_config_test.exs.
+         {"*/5 * * * *", Loopctl.Workers.ChannelPostSweeper},
+         # US-40.B1: lifecycle-aware sweep for coordination-bus CLAIMS. Reclaims
+         # ONLY done-past-retention (done_at < now - 7d) and abandoned-lease
+         # (done_at IS NULL AND lease_expires_at < now) claims — NEVER an open,
+         # unexpired claim. Distinct from the uniform channel_posts TTL sweep.
+         # Bounded per run on AdminRepo (BYPASSRLS). Keep in sync with the crontab
+         # assertion in oban_plugins_config_test.exs.
+         {"*/5 * * * *", Loopctl.Workers.ChannelClaimSweeper},
          # US-38.2: prune expired windows from the cluster-global Postgres rate
          # limiter's counter table. A cheap index-range delete; a no-op when the
          # Postgres limiter is unselected (table empty). Keep in sync with the
@@ -428,6 +442,20 @@ defmodule Loopctl.ObanConfig do
          # promoted before SessionMemoryPruneWorker can delete them (no silent
          # golden-nugget loss).
          {"*/10 * * * *", Loopctl.Workers.MemoryPromotionSweepWorker},
+         # #411 Gap 3: HOURLY graduation of HOT long-term memories (recall_count >=
+         # :memory_graduation_recall_threshold) into durable knowledge articles, deduped
+         # via the novelty gate. DELIBERATELY slower than the 10-min promotion sweep —
+         # graduation is not latency-sensitive and an hourly cadence keeps the
+         # novelty-gate embedding spend low. Bounded per run by
+         # :memory_graduation_max_per_run. Keep in sync with the crontab assertion in
+         # oban_plugins_config_test.exs.
+         {"0 * * * *", Loopctl.Workers.MemoryGraduationSweepWorker},
+         # Ingestion capture-silence dead-man's-switch: hourly scan for tenants whose
+         # established article source_types (e.g. session_log) went silent. HARDCODED
+         # schedule (no env var) so app boot never depends on a new env var. Detection
+         # self-gates on "established + stale", so the interval is a latency knob only.
+         # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+         {"7 * * * *", Loopctl.Workers.IngestionHealthWorker},
          # US-35.3: all-tenants STH safety sweep. Reduced from `"* * * * *"` (every
          # minute) to a low-frequency, config-driven backstop (default `*/5 * * * *`)
          # that only catches appends the event-driven enqueuer (US-35.2) missed. Each

@@ -1,0 +1,36 @@
+{
+  "id": "US-40.7",
+  "title": "memory-keeper retirement: usage inventory, per-repo migration, decommission (gated, reversible)",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
+  "priority": "low",
+  "phase": "coordination_bus_v2_E",
+  "story": {
+    "as_a": "operator maintaining the fleet's memory tooling",
+    "i_want_to": "migrate the agent/skill references off the local, per-machine memory-keeper onto the hosted coordination bus + Knowledge, and then decommission memory-keeper",
+    "so_that": "one project's memory stops fragmenting across three machines and becomes a single hosted, searchable, multi-machine store"
+  },
+  "rationale": "This is the payoff the whole bus exists for, and the riskiest step — so it is HARD-GATED on the bus proving itself (owner decision: 'full migration follows flawless use of the new channels') and executed reversibly, one repo at a time, with files remaining the offline source of truth. The fleet audit already did the hard part of the inventory: only context_items + checkpoints + embeddings-search are used; ~12 other memory-keeper feature areas have zero rows fleet-wide.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §6; the fleet audit (blockit/mac-mini/beelink) recorded in docs/repo-coordination-bus.md §1.2",
+    "includes": "Three real use cases map onto: state posts (context_items), handoff posts (checkpoints), search+graduation (history/search)."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.7.1", "description": "GATE: this story does not begin until Phases A/B are in daily multi-machine use and the bus has carried the three real use cases (working-state, build->ship handoff, cross-session search) without incident for a defined soak period.", "status": "pending" },
+    { "id": "AC-40.7.2", "description": "A written migration map records: memory-keeper context_items -> channel_post (kind-less, key upsert); checkpoints (build-complete-<ticket>) -> channel_post handoff; history/search -> channel roll + graduation to Knowledge; and explicitly lists the zero-usage features (entities/relations/journal/compression/observations/agent_tasks/file_cache) as NOT migrated (dropped).", "status": "pending" },
+    { "id": "AC-40.7.3", "description": "Agent/skill references to mcp__memory-keeper__* are migrated per-repo behind a reversible switch (start with one repo, e.g. rgn-client-portal, which already treats memory-keeper as an optional mirror). Files (.claude/checkpoints, .claude/state/*.md) REMAIN the local/offline source of truth; the bus is the multi-machine layer.", "status": "pending" },
+    { "id": "AC-40.7.4", "description": "Each migration step is reversible (the memory-keeper config is left intact until the repo's bus usage is confirmed); decommission (removing the memory-keeper MCP server + DBs) happens only after all target repos are migrated and soaked.", "status": "pending" },
+    { "id": "AC-40.7.5", "description": "This story decomposes into per-repo migration sub-stories at execution time (WIP=1 per repo); this US captures the plan, the gate, the inventory, and the reversibility discipline — not a big-bang.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.7.1", "name": "pilot repo works on the bus with memory-keeper still present", "type": "integration", "preconditions": ["one repo migrated to bus-based state/handoff; memory-keeper still installed"], "steps": ["run the repo's build->ship handoff via the bus across two machines"], "expected_results": ["handoff succeeds cross-machine via the bus; nothing depends on the local memory-keeper DB"] },
+    { "id": "TC-40.7.2", "name": "rollback restores memory-keeper flow", "type": "integration", "preconditions": ["a migrated repo"], "steps": ["flip the reversible switch back"], "expected_results": ["the repo falls back to memory-keeper/files with no data loss"] }
+  ],
+  "technical_notes": [
+    "Mostly a claude-config + per-repo .claude/ config change (agent/skill tool references), NOT loopctl code.",
+    "Inventory is already grounded: fleet audit in docs/repo-coordination-bus.md §1.2 (home_care_billing 4,286 items across 3 machines; only 3 of ~15 features used).",
+    "Sequence: pilot repo -> soak -> next repos -> decommission memory-keeper MCP + archive DBs. Never delete a memory-keeper DB until well past cutover.",
+    "Keep files as offline source of truth; the bus degrades gracefully when loopctl is unreachable (same as the capture hook)."
+  ],
+  "dependencies": ["US-40.E1"],
+  "estimated_tokens": 250000
+}

@@ -117,7 +117,22 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/memory"},
                {:post, "/api/v1/memory/recall"},
                {:post, "/api/v1/memory/promote"},
+               # graduate (#411 Gap 3) creates a knowledge article — a WRITE — but so does
+               # /memory/promote (allowlisted above) and knowledge_create, both
+               # agent-reachable. It is the explicit, on-demand trigger for the same
+               # memory→knowledge graduation the hourly sweep runs, over the agent's OWN
+               # memory under the same (tenant, subject) key-derived scope. Gating it behind
+               # human-anchor would make the on-demand path unreachable for the KB-tier
+               # agent that is its intended user, so it is allowlisted alongside its
+               # memory_* siblings. MemoryController carries NO RequireHumanAnchor plug
+               # (RequireRole :agent only), so this classification is consistent.
+               {:post, "/api/v1/memory/graduate"},
                {:delete, "/api/v1/memory/:id"},
+               # Merged recall (#411 Gap 2) — a POST-shaped READ returning the
+               # re-ranked global ∪ active-project union of agent memory + knowledge,
+               # same KB-tier agent surface + (tenant, subject) key-derived scope as
+               # /memory/recall. Not a mutation.
+               {:post, "/api/v1/recall"},
 
                # Context Retriever (Epic 30, US-30.4) — `POST /retrieve/:entity` is a
                # POST-shaped READ (a governed filter/search over the tenant's OWN
@@ -132,12 +147,30 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # are (correctly) absent from this allowlist and asserted to 403.
                {:post, "/api/v1/retrieve/:entity"},
 
+               # KB-only project scope: agent-createable by design (extends owner
+               # decision #331 — the KB surface is fully agent-usable). It forces
+               # kind: :kb and carries NO chain-of-custody surface, so it is correctly
+               # OUTSIDE the tier gate. A :kb scope is structurally barred from work by
+               # RequireWorkProject (see the :kb-rejection test), which is what lets the
+               # ui-tests exemption below stay safe now that agent-rooted tenants CAN
+               # create a project.
+               {:post, "/api/v1/kb-scopes"},
+               # Archive an agent-owned :kb scope (reversible soft-delete) to reclaim its
+               # max_projects slot — agent-managed, NOT custody. The action rejects a :work
+               # project (422), so it can never archive a work project without human-anchor.
+               {:delete, "/api/v1/kb-scopes/:id"},
+               {:post, "/api/v1/kb-scopes/:id/restore"},
+
                # UI test runs (#4/#5 reviewed rationale): a QA/tooling surface,
                # NOT work-breakdown state. Every route is nested under
-               # `/projects/:project_id/...` and creating a project
-               # (`ProjectController.create`) is ALREADY tier-gated, so an
-               # agent-rooted tenant has no project to attach a UI test to —
-               # the surface is unreachable for it even without a per-route gate.
+               # `/projects/:project_id/...`. PREVIOUSLY justified as "unreachable
+               # because agent-rooted tenants can't create a project" — that premise
+               # NO LONGER HOLDS (they can now create a :kb scope). The surface stays
+               # safe because `RequireWorkProject` rejects a :kb project with
+               # 422 kb_project_no_work, so an agent-rooted tenant's only projects
+               # (:kb scopes) still cannot host a UI test. The `:kb`-rejection test
+               # (project_controller_test.exs) guards that positive invariant so this
+               # exemption cannot silently rot.
                {:post, "/api/v1/projects/:project_id/ui-tests"},
                {:post, "/api/v1/projects/:project_id/ui-tests/:id/findings"},
                {:post, "/api/v1/projects/:project_id/ui-tests/:id/complete"},
@@ -153,6 +186,38 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:patch, "/api/v1/webhooks/:id"},
                {:delete, "/api/v1/webhooks/:id"},
                {:post, "/api/v1/webhooks/:id/test"},
+
+               # Repo Coordination Bus (Epic 39, US-39.2) — the channel write is a
+               # COORDINATION surface, NOT chain-of-custody: posting to your own
+               # tenant's channel is the same content class the KB surface (owner
+               # decision #331) is fully agent-usable for. Agent-role, authorship
+               # server-stamped from the verified key, tenant-scoped — so it is
+               # deliberately OUTSIDE the human-anchor tier gate (design brief §4).
+               {:post, "/api/v1/channel/posts"},
+               # US-39.7 channel post redact/delete — same COORDINATION surface
+               # (agent-role, authorship/tenant server-derived from the verified
+               # key, tenant-scoped), NOT chain-of-custody, so deliberately outside
+               # the human-anchor tier gate (design brief §3, owner decision #331).
+               {:delete, "/api/v1/channel/posts/:id"},
+               # US-40.E1 channel post → Knowledge graduation. An on-demand, agent-
+               # triggered promotion of a reusable coordination finding into the durable
+               # wiki — the SAME memory→knowledge graduation posture as
+               # /memory/graduate (allowlisted above) and knowledge_create, both
+               # agent-reachable. Agent-role, authorship/tenant server-derived from the
+               # verified key, project-scoped by membership (US-40.D3), reusing Knowledge's
+               # EXISTING guardrails (semantic novelty gate + secret scan) — a COORDINATION
+               # surface, NOT chain-of-custody, so deliberately outside the human-anchor
+               # tier gate (owner decision #331). ChannelPostController carries NO
+               # RequireHumanAnchor plug, so this classification is consistent.
+               {:post, "/api/v1/channel/posts/:id/graduate"},
+               # US-40.B1 Repo Coordination Bus CLAIM surface — exactly-once handoff
+               # claim/release/done. Same COORDINATION posture as the channel posts:
+               # agent-role, tenant_id/agent_id/role server-stamped from the verified
+               # key, project-scoped by membership — NOT chain-of-custody, so
+               # deliberately outside the human-anchor tier gate (owner decision #331).
+               {:post, "/api/v1/channel/claims"},
+               {:post, "/api/v1/channel/claims/release"},
+               {:post, "/api/v1/channel/claims/done"},
 
                # Superadmin-only admin scope — RequireRole already pins these
                # to superadmin; Impersonate explicitly skips

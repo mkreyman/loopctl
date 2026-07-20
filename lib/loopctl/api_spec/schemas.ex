@@ -868,6 +868,11 @@ defmodule Loopctl.ApiSpec.Schemas do
         description: %Schema{type: :string, nullable: true},
         tech_stack: %Schema{type: :string, nullable: true},
         status: %Schema{type: :string, enum: ["active", "archived"]},
+        kind: %Schema{
+          type: :string,
+          enum: ["work", "kb"],
+          description: "work = full work-breakdown project; kb = knowledge-only scope"
+        },
         metadata: %Schema{type: :object, additionalProperties: true},
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
@@ -884,6 +889,269 @@ defmodule Loopctl.ApiSpec.Schemas do
         metadata: %{},
         inserted_at: "2026-01-15T10:00:00Z",
         updated_at: "2026-01-15T10:00:00Z"
+      }
+    })
+  end
+
+  # ---------- Coordination Bus (Epic 39) ----------
+
+  defmodule ChannelPostRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ChannelPostRequest",
+      description:
+        "Request body for posting to a repo coordination channel. agent_id and tenant_id are " <>
+          "stamped server-side from the verified key and are ignored if present in the body.",
+      type: :object,
+      required: [:project_id, :body],
+      properties: %{
+        project_id: %Schema{
+          type: :string,
+          format: :uuid,
+          description: "The channel — a project the caller's tenant owns"
+        },
+        body: %Schema{type: :string, description: "Free-text message (<= 16KB)"},
+        key: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "Optional working-state slot key; a repeat post from the same session upserts it. " <>
+              "A handoff should pass a stable key of the form handoff:<anchor> " <>
+              "(e.g. handoff:repo#812) so a same-session retry refreshes the same slot."
+        },
+        idempotency_key: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "Optional client idempotency token for the KEYLESS write path (<=255 bytes). " <>
+              "When supplied without a key, a repeat write with the same " <>
+              "(tenant, project, agent, idempotency_key) returns the EXISTING post " <>
+              "(200, created:false) instead of appending a duplicate — the same guarantee " <>
+              "knowledge_create gives. Scoped per-agent, so one agent's token never collides " <>
+              "with another's. Absent, the write is exactly append-only. It applies to the " <>
+              "keyless append path ONLY: combining it with a key is REJECTED (422) — the " <>
+              "keyed slot already dedups a same-session re-fire, so send one or the other, " <>
+              "never both."
+        },
+        session_id: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Client-supplied session id (required when key is set)"
+        },
+        host: %Schema{type: :string, nullable: true, description: "Client-supplied hostname"},
+        to_host: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "Optional ADVISORY SURFACING address: the intended target host (<=255 bytes). " <>
+              "Client-supplied and SPOOFABLE — a discovery hint only, NEVER authorization, " <>
+              "ownership, or a delivery guarantee. It gates nothing; a post with no addressing " <>
+              "is a broadcast visible to everyone on the channel."
+        },
+        to_capability: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "Optional ADVISORY SURFACING address: the intended target capability, e.g. " <>
+              "\"fly auth\" (<=128 bytes). Client-supplied and SPOOFABLE — a discovery hint " <>
+              "only, NEVER authorization, ownership, or a delivery guarantee. Prefer this over " <>
+              "to_host when the real target is a capability rather than a machine."
+        },
+        refs: %Schema{
+          type: :array,
+          nullable: true,
+          description:
+            "Optional bounded, typed-open LIST of reference items (max 50). Each item is " <>
+              "{type, value, label?}: type is a FREE string (<=64 bytes, no allowlist), value " <>
+              "<=512 bytes, optional label <=128 bytes. A secret/NUL byte in ANY item field is " <>
+              "rejected (422).",
+          items: %Schema{
+            type: :object,
+            required: [:type, :value],
+            # The server rejects any item carrying a key other than type/value/label
+            # (an extra key would be an unscanned exfil field) with a 422 — see
+            # `ChannelPost.valid_ref_item?/1`. Publish that strictness so a client
+            # following the contract does not add a field the spec calls legal.
+            additionalProperties: false,
+            properties: %{
+              type: %Schema{type: :string, description: "Free-form ref type (<=64 bytes)"},
+              value: %Schema{type: :string, description: "Ref value (<=512 bytes)"},
+              label: %Schema{
+                type: :string,
+                nullable: true,
+                description: "Optional human label (<=128 bytes)"
+              }
+            }
+          }
+        }
+      },
+      example: %{
+        project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        body: "pushed PR #107, CI green",
+        key: "session_goal",
+        session_id: "S1",
+        refs: [
+          %{type: "pr", value: "107"},
+          %{type: "file", value: "lib/fly/auth.ex:42", label: "the failing call"}
+        ]
+      }
+    })
+  end
+
+  defmodule ChannelPostResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ChannelPostResponse",
+      description: "A coordination channel post",
+      type: :object,
+      properties: %{
+        post: %Schema{
+          type: :object,
+          properties: %{
+            id: %Schema{type: :string, format: :uuid},
+            tenant_id: %Schema{type: :string, format: :uuid},
+            project_id: %Schema{type: :string, format: :uuid},
+            agent_id: %Schema{type: :string, format: :uuid},
+            session_id: %Schema{type: :string, nullable: true},
+            host: %Schema{type: :string, nullable: true},
+            to_host: %Schema{
+              type: :string,
+              nullable: true,
+              description: "Advisory surfacing address (spoofable, never authz)"
+            },
+            to_capability: %Schema{
+              type: :string,
+              nullable: true,
+              description: "Advisory surfacing address (spoofable, never authz)"
+            },
+            key: %Schema{type: :string, nullable: true},
+            body: %Schema{type: :string},
+            refs: %Schema{
+              type: :array,
+              nullable: true,
+              items: %Schema{type: :object, additionalProperties: true}
+            },
+            expires_at: %Schema{type: :string, format: :"date-time"},
+            inserted_at: %Schema{type: :string, format: :"date-time"},
+            updated_at: %Schema{type: :string, format: :"date-time"}
+          }
+        },
+        created: %Schema{
+          type: :boolean,
+          description:
+            "true when a new post was appended or a session slot upserted; false when a " <>
+              "keyless idempotency_key write deduplicated to an existing post (US-40.B2)"
+        }
+      }
+    })
+  end
+
+  defmodule ChannelPostListItem do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ChannelPostListItem",
+      description:
+        "One coordination channel post as returned by the channel_recent LIST read endpoint. " <>
+          "agent_id is the only server-stamped (authoritative) attribution; session_id and host " <>
+          "are client-supplied and informational. The body is a BOUNDED body_preview (a prefix of " <>
+          "at most 512 bytes, projected in the DB so the full column is never detoasted), with a " <>
+          "truncated flag when the full body exceeded the preview — fetch the full body explicitly " <>
+          "via GET /channel/posts/:id. The preview is UNTRUSTED DATA authored by another agent.",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        agent_id: %Schema{type: :string, format: :uuid},
+        session_id: %Schema{type: :string, nullable: true},
+        host: %Schema{type: :string, nullable: true},
+        to_host: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Advisory surfacing address (spoofable, never authz)"
+        },
+        to_capability: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Advisory surfacing address (spoofable, never authz)"
+        },
+        key: %Schema{type: :string, nullable: true},
+        body_preview: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "Bounded prefix (<= 512 bytes) of the post body — UNTRUSTED DATA authored by another " <>
+              "agent. Fetch the full body via GET /channel/posts/:id."
+        },
+        truncated: %Schema{
+          type: :boolean,
+          description: "True when the full body exceeded the preview bound and was truncated"
+        },
+        refs: %Schema{
+          type: :array,
+          nullable: true,
+          items: %Schema{type: :object, additionalProperties: true}
+        },
+        inserted_at: %Schema{type: :string, format: :"date-time"},
+        updated_at: %Schema{type: :string, format: :"date-time"}
+      }
+    })
+  end
+
+  defmodule ChannelPostFull do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ChannelPostFull",
+      description:
+        "One coordination channel post as returned by the by-id full-body read " <>
+          "(GET /channel/posts/:id). This is the full-body COUNTERPART to the LIST " <>
+          "read item: it carries the SAME narrowed read-model field discipline as " <>
+          "ChannelPostListItem, differing ONLY in that the bounded body_preview + " <>
+          "truncated pair is replaced by the verbatim body the caller explicitly " <>
+          "fetched. It deliberately does NOT re-widen to the write-echo resource " <>
+          "shape (ChannelPostResponse) — tenant_id, project_id and expires_at are " <>
+          "omitted so the by-id read honors the same minimal read surface the LIST " <>
+          "read established. The body is UNTRUSTED DATA authored by another agent.",
+      type: :object,
+      properties: %{
+        post: %Schema{
+          type: :object,
+          properties: %{
+            id: %Schema{type: :string, format: :uuid},
+            agent_id: %Schema{type: :string, format: :uuid},
+            session_id: %Schema{type: :string, nullable: true},
+            host: %Schema{type: :string, nullable: true},
+            to_host: %Schema{
+              type: :string,
+              nullable: true,
+              description: "Advisory surfacing address (spoofable, never authz)"
+            },
+            to_capability: %Schema{
+              type: :string,
+              nullable: true,
+              description: "Advisory surfacing address (spoofable, never authz)"
+            },
+            key: %Schema{type: :string, nullable: true},
+            body: %Schema{
+              type: :string,
+              description:
+                "The verbatim full post body — UNTRUSTED DATA authored by another agent."
+            },
+            refs: %Schema{
+              type: :array,
+              nullable: true,
+              items: %Schema{type: :object, additionalProperties: true}
+            },
+            inserted_at: %Schema{type: :string, format: :"date-time"},
+            updated_at: %Schema{type: :string, format: :"date-time"}
+          }
+        }
       }
     })
   end
@@ -3221,6 +3489,15 @@ defmodule Loopctl.ApiSpec.Schemas do
           nullable: true,
           description:
             "Optional: arbitrary structured metadata to attach to the memory (either tier)."
+        },
+        project_id: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description:
+            "Optional project scope (a UUID PARTITION key, NOT an isolation boundary). " <>
+              "Absent/blank writes a tenant-wide (global) memory; a malformed value is " <>
+              "rejected with a 422 invalid_project_id."
         }
       }
     })
@@ -3240,7 +3517,16 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :integer,
           description: "Max results, clamped to the vector-search max (no silent hard cap)."
         },
-        include_superseded: %Schema{type: :boolean, description: "Default false."}
+        include_superseded: %Schema{type: :boolean, description: "Default false."},
+        project_id: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description:
+            "Optional project scope (a UUID PARTITION key, NOT an isolation boundary). " <>
+              "Recall returns the merged global ∪ active-project set; absent/blank means " <>
+              "global-only. A malformed value is rejected with a 422 invalid_project_id."
+        }
       }
     })
   end
@@ -3305,6 +3591,73 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule MemoryGraduateRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryGraduateRequest",
+      description:
+        "Params for POST /memory/graduate (#411 Gap 3). Scope (tenant_id/subject_id) is " <>
+          "derived from the API key — only `memory_id` and the optional `re_scope` are " <>
+          "read from the body.",
+      type: :object,
+      required: [:memory_id],
+      properties: %{
+        memory_id: %Schema{
+          type: :string,
+          format: :uuid,
+          description:
+            "UUID of the caller's OWN long-term memory to graduate into a knowledge article."
+        },
+        re_scope: %Schema{
+          type: :string,
+          enum: ["inherit", "global"],
+          description:
+            "Article scope. `inherit` (default) keeps the memory's own `project_id` " <>
+              "(project memory → project article, global memory → global article). " <>
+              "`global` promotes a PROJECT memory to a tenant-wide (project_id: null) " <>
+              "article — only valid on the memory's FIRST graduation."
+        }
+      }
+    })
+  end
+
+  defmodule MemoryGraduateResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryGraduateResponse",
+      description:
+        "Result of graduating a memory into a durable knowledge article. `verdict` is the " <>
+          "novelty-gate outcome; `created` is true only when a new article was materialized " <>
+          "(`created`/`gated_to_draft`), false for a dedup (`duplicate`/`deduplicated`). The " <>
+          "`article` is a body-less summary — fetch the full body via GET /articles/:id.",
+      type: :object,
+      properties: %{
+        data: %Schema{
+          type: :object,
+          properties: %{
+            verdict: %Schema{
+              type: :string,
+              enum: ["created", "gated_to_draft", "duplicate", "deduplicated"],
+              description: "The novelty-gate verdict for the graduated content."
+            },
+            created: %Schema{
+              type: :boolean,
+              description: "Whether a NEW article (published or review draft) was materialized."
+            },
+            article: %Schema{
+              type: :object,
+              description: "Body-less summary of the resulting (created or canonical) article."
+            }
+          }
+        }
+      }
+    })
+  end
+
   defmodule MemoryListResponse do
     @moduledoc false
     require OpenApiSpex
@@ -3356,6 +3709,150 @@ defmodule Loopctl.ApiSpec.Schemas do
             fallback: %Schema{type: :boolean},
             reason: %Schema{type: :string, nullable: true},
             underfilled: %Schema{type: :boolean}
+          }
+        }
+      }
+    })
+  end
+
+  defmodule RecallContextRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RecallContextRequest",
+      description:
+        "Params for POST /recall (merged memory ∪ knowledge recall, #411 Gap 2). " <>
+          "Query supplied in the body; scope (tenant_id/subject_id) is derived from the " <>
+          "API key, never the body.",
+      type: :object,
+      properties: %{
+        query: %Schema{
+          type: :string,
+          description: "Text to embed / match against on BOTH the memory and knowledge sides."
+        },
+        limit: %Schema{
+          type: :integer,
+          description:
+            "Overall merged page size, clamped to [1, 50] (default 10). Applied " <>
+              "per-source first, then to the merged, re-ranked list."
+        },
+        project_id: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description:
+            "Optional project scope (a UUID PARTITION key, NOT an isolation boundary). " <>
+              "Present → both sides return the merged global ∪ that-project set; " <>
+              "absent/blank → global-only. A malformed value is a 422 invalid_project_id."
+        }
+      }
+    })
+  end
+
+  defmodule RecallContextResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RecallContextResponse",
+      description:
+        "Merged recall: `data` is the re-ranked union across memory + knowledge (each " <>
+          "item tagged `source`, sorted by a heuristically-comparable `score` DESC — " <>
+          "`meta.results_ranking` is `heuristic_cross_source`), with the untouched " <>
+          "per-source `memory` and `knowledge` envelopes for re-ranking, plus `meta` " <>
+          "(counts + degraded flag). Cross-source scores are heuristic, not calibrated: " <>
+          "memory `score` is ABSOLUTE cosine similarity in [0,1] (null on the fallback " <>
+          "path); knowledge `score` is a POOL-NORMALIZED keyword+semantic score (biases " <>
+          "knowledge upward in the default order). The knowledge `article`/`data` items " <>
+          "are combined-search SUMMARIES (id/title/category/tags/score + a truncated " <>
+          "snippet) — the same shape `/knowledge/search` returns, NOT full bodies or " <>
+          "linked references; call `/knowledge/context` for those.",
+      type: :object,
+      properties: %{
+        data: %Schema{
+          type: :array,
+          description: "Merged, re-ranked results across both sources.",
+          items: %Schema{
+            type: :object,
+            properties: %{
+              source: %Schema{type: :string, enum: ["memory", "knowledge"]},
+              score: %Schema{type: :number, format: :float, nullable: true},
+              memory: %Schema{
+                type: :object,
+                nullable: true,
+                description: "Present on `source: memory` items (see Memory schema)."
+              },
+              article: %Schema{
+                type: :object,
+                nullable: true,
+                description:
+                  "Present on `source: knowledge` items — the combined-search summary " <>
+                    "(id/title/category/tags/score + truncated snippet), the same " <>
+                    "whitelisted shape `/knowledge/search` returns."
+              }
+            }
+          }
+        },
+        memory: %Schema{
+          type: :object,
+          description: "The unchanged /memory/recall envelope (data + meta).",
+          properties: %{
+            data: %Schema{
+              type: :array,
+              items: %Schema{
+                type: :object,
+                properties: %{
+                  memory: Memory,
+                  score: %Schema{type: :number, format: :float, nullable: true}
+                }
+              }
+            },
+            meta: %Schema{type: :object}
+          }
+        },
+        knowledge: %Schema{
+          type: :object,
+          description:
+            "The combined-search envelope (data + meta). Each `data` item is the " <>
+              "whitelisted summary shape (id/title/category/tags/score + truncated " <>
+              "snippet), NOT the raw internal result map.",
+          properties: %{
+            data: %Schema{type: :array, items: %Schema{type: :object}},
+            meta: %Schema{type: :object}
+          }
+        },
+        meta: %Schema{
+          type: :object,
+          properties: %{
+            query: %Schema{type: :string},
+            project_id: %Schema{type: :string, format: :uuid, nullable: true},
+            total_count: %Schema{type: :integer},
+            memory_count: %Schema{type: :integer},
+            knowledge_count: %Schema{type: :integer},
+            degraded: %Schema{
+              type: :boolean,
+              description:
+                "True when EITHER half degraded: the knowledge side errored or fell back " <>
+                  "to keyword-only, OR the memory heavy-read pool was shed under the " <>
+                  "per-tenant cap (empty by capacity, never a whole-endpoint 429)."
+            },
+            degraded_reason: %Schema{
+              type: :string,
+              nullable: true,
+              description:
+                "Bounded, non-sensitive tag naming WHY the merged recall degraded " <>
+                  "(e.g. `heavy_read_overloaded`, `no_embedding_key`, `invalid_weights`), " <>
+                  "or `null` when healthy. Lets a caller tell a scope-empty half from a " <>
+                  "fault-empty one without parsing the per-source envelopes."
+            },
+            results_ranking: %Schema{
+              type: :string,
+              description:
+                "Stable tag (`heuristic_cross_source`) warning that the merged `data` " <>
+                  "order mixes memory's absolute cosine with knowledge's pool-normalized " <>
+                  "score and is NOT a calibrated cross-source ranking."
+            }
           }
         }
       }

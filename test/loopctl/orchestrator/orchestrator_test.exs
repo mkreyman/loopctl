@@ -3,6 +3,7 @@ defmodule Loopctl.OrchestratorTest do
 
   setup :verify_on_exit!
 
+  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.Orchestrator
 
   describe "save_state/4" do
@@ -155,8 +156,28 @@ defmodule Loopctl.OrchestratorTest do
         version: 1
       })
 
+      parent = self()
+
+      # This file is `async: true`, so DataCase starts the sandbox owner
+      # connections with `shared: false` (per-test ownership). A spawned
+      # `Task.async` process is NOT auto-granted the owner's sandboxed
+      # connection — without an explicit `Sandbox.allow/3` it runs on a
+      # different connection that cannot see the seeded version-1 row inside
+      # this test's transaction, so the two writers race nondeterministically
+      # (two successes, two conflicts, or an ownership crash). `save_state/3`
+      # performs all its work through `Loopctl.AdminRepo`; both repos are
+      # allowed here to share this test's single sandboxed connection, which
+      # is what serializes the two atomic `UPDATE ... WHERE version = 1`
+      # statements at the DB and makes the winner/conflict split deterministic.
+      allow_sandbox = fn ->
+        Sandbox.allow(Loopctl.Repo, parent, self())
+        Sandbox.allow(Loopctl.AdminRepo, parent, self())
+      end
+
       task1 =
         Task.async(fn ->
+          allow_sandbox.()
+
           Orchestrator.save_state(tenant.id, project.id, %{
             state_key: "main",
             state_data: %{"writer" => 1},
@@ -166,6 +187,8 @@ defmodule Loopctl.OrchestratorTest do
 
       task2 =
         Task.async(fn ->
+          allow_sandbox.()
+
           Orchestrator.save_state(tenant.id, project.id, %{
             state_key: "main",
             state_data: %{"writer" => 2},

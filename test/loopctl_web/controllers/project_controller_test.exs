@@ -30,6 +30,7 @@ defmodule LoopctlWeb.ProjectControllerTest do
       assert project["name"] == "loopctl"
       assert project["slug"] == "loopctl"
       assert project["status"] == "active"
+      assert project["kind"] == "work"
       assert project["repo_url"] == "https://github.com/mkreyman/loopctl"
       assert project["tech_stack"] == "elixir/phoenix"
       assert project["tenant_id"] == tenant.id
@@ -142,6 +143,294 @@ defmodule LoopctlWeb.ProjectControllerTest do
       project = json_response(conn, 201)["project"]
       assert Map.has_key?(project, "mission")
       assert project["mission"] == nil
+    end
+  end
+
+  describe "POST /api/v1/kb-scopes" do
+    test "agent-rooted tenant creates a KB scope with an agent key", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/kb-scopes", %{
+          "name" => "memory-loop-testbed",
+          "slug" => "memory-loop-testbed",
+          "repo_url" => "https://github.com/mkreyman/memory-loop-testbed"
+        })
+
+      project = json_response(conn, 201)["project"]
+      assert project["kind"] == "kb"
+      assert project["slug"] == "memory-loop-testbed"
+      assert project["status"] == "active"
+      assert project["tenant_id"] == tenant.id
+    end
+
+    test "KB scope is resolvable by repo_url (feeds capture project scoping)", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/kb-scopes", %{
+        "name" => "tb",
+        "slug" => "tb",
+        "repo_url" => "https://github.com/mkreyman/tb"
+      })
+
+      assert {:ok, project, _matched_by} =
+               Projects.resolve_project(tenant.id, repo_url: "https://github.com/mkreyman/tb")
+
+      assert project.kind == :kb
+    end
+
+    test "kind cannot be forced to :work via the request body", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/kb-scopes", %{"name" => "xx", "slug" => "xx", "kind" => "work"})
+
+      assert json_response(conn, 201)["project"]["kind"] == "kb"
+    end
+
+    test "KB scopes share the max_projects budget", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted, settings: %{"max_projects" => 1}})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {:ok, _} = Projects.create_project(tenant.id, %{name: "first", slug: "first"}, kind: :kb)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/kb-scopes", %{"name" => "second", "slug" => "second"})
+
+      assert json_response(conn, 422)["error"]["message"] =~ "Project limit reached"
+    end
+
+    test "a KB scope is a valid article scope", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "kb", slug: "kb"}, kind: :kb)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{kb.id}/articles", %{
+          "title" => "Testbed convention",
+          "body" => "A durable project-scoped fact for the testbed.",
+          "category" => "pattern"
+        })
+
+      assert json_response(conn, 201)["data"]["project_id"] == kb.id
+    end
+
+    test "existing POST /projects is unchanged: agent-rooted still 403s", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects", %{"name" => "w", "slug" => "w"})
+
+      assert json_response(conn, 403)["error"]["code"] == "custody_tier_required"
+    end
+  end
+
+  describe "DELETE /api/v1/kb-scopes/:id (agent archive of own KB scope)" do
+    test "agent-rooted tenant archives its own :kb scope", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "kb", slug: "kb"}, kind: :kb)
+
+      conn = conn |> auth_conn(raw_key) |> delete(~p"/api/v1/kb-scopes/#{kb.id}")
+
+      project = json_response(conn, 200)["project"]
+      assert project["id"] == kb.id
+      assert project["status"] == "archived"
+      assert project["kind"] == "kb"
+    end
+
+    test "archiving a :kb scope frees the max_projects budget slot", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted, settings: %{"max_projects" => 1}})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "first", slug: "first"}, kind: :kb)
+
+      # At the cap: a second create is rejected.
+      over =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/kb-scopes", %{"name" => "second", "slug" => "second"})
+
+      assert json_response(over, 422)["error"]["message"] =~ "Project limit reached"
+
+      # Archive the first, then the create succeeds (slot reclaimed).
+      _ = conn |> auth_conn(raw_key) |> delete(~p"/api/v1/kb-scopes/#{kb.id}")
+
+      again =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/kb-scopes", %{"name" => "third", "slug" => "third"})
+
+      assert json_response(again, 201)["project"]["kind"] == "kb"
+    end
+
+    test "rejects archiving a :work project at agent role (422)", %{conn: conn} do
+      # A human-anchored tenant (so it can hold a :work project) with an agent key.
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      work = fixture(:project, %{tenant_id: tenant.id, slug: "work"})
+
+      conn = conn |> auth_conn(raw_key) |> delete(~p"/api/v1/kb-scopes/#{work.id}")
+
+      assert json_response(conn, 422)["error"]["message"] =~ "kind: kb"
+      # And it is NOT archived.
+      assert {:ok, %{status: :active}} = Projects.get_project(tenant.id, work.id)
+    end
+
+    test "404 for a cross-tenant or missing scope", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      other = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {:ok, foreign} = Projects.create_project(other.id, %{name: "xx", slug: "xx"}, kind: :kb)
+
+      conn = conn |> auth_conn(raw_key) |> delete(~p"/api/v1/kb-scopes/#{foreign.id}")
+
+      assert json_response(conn, 404)
+      # The foreign scope is untouched.
+      assert {:ok, %{status: :active}} = Projects.get_project(other.id, foreign.id)
+    end
+
+    test "restore re-activates an archived :kb scope", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "kb", slug: "kb"}, kind: :kb)
+      {:ok, _} = Projects.archive_project(tenant.id, kb)
+
+      conn = conn |> auth_conn(raw_key) |> post(~p"/api/v1/kb-scopes/#{kb.id}/restore")
+
+      assert json_response(conn, 200)["project"]["status"] == "active"
+    end
+
+    test "restore is rejected 422 when the tenant is at its project cap", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted, settings: %{"max_projects" => 1}})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "a", slug: "aa"}, kind: :kb)
+      {:ok, _} = Projects.archive_project(tenant.id, kb)
+      # Fill the single active slot with another scope.
+      {:ok, _} = Projects.create_project(tenant.id, %{name: "b", slug: "bb"}, kind: :kb)
+
+      conn = conn |> auth_conn(raw_key) |> post(~p"/api/v1/kb-scopes/#{kb.id}/restore")
+
+      assert json_response(conn, 422)["error"]["message"] =~ "Project limit reached"
+      assert {:ok, %{status: :archived}} = Projects.get_project(tenant.id, kb.id)
+    end
+
+    test "archive is idempotent (no error on an already-archived scope)", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "kb", slug: "kb"}, kind: :kb)
+
+      _ = conn |> auth_conn(raw_key) |> delete(~p"/api/v1/kb-scopes/#{kb.id}")
+      again = conn |> auth_conn(raw_key) |> delete(~p"/api/v1/kb-scopes/#{kb.id}")
+
+      assert json_response(again, 200)["project"]["status"] == "archived"
+    end
+
+    test "restore rejects a :work project (422)", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      work = fixture(:project, %{tenant_id: tenant.id, slug: "work"})
+
+      conn = conn |> auth_conn(raw_key) |> post(~p"/api/v1/kb-scopes/#{work.id}/restore")
+
+      assert json_response(conn, 422)["error"]["message"] =~ "kind: kb"
+    end
+  end
+
+  describe "kind: :kb rejects work-breakdown (RequireWorkProject)" do
+    test "ui-test create on a :kb scope 422s (agent-rooted, the reachable surface)", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "kb", slug: "kb"}, kind: :kb)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{kb.id}/ui-tests", %{"name" => "run"})
+
+      assert json_response(conn, 422)["error"]["code"] == "kb_project_no_work"
+    end
+
+    test "epic create on a :kb scope 422s (human-anchored caller)", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "kb", slug: "kb"}, kind: :kb)
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/projects/#{kb.id}/epics", %{"name" => "e"})
+
+      assert json_response(conn, 422)["error"]["code"] == "kb_project_no_work"
+    end
+
+    test "story create_in_project on a :kb scope 422s (human-anchored caller)", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "kb", slug: "kb"}, kind: :kb)
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/projects/#{kb.id}/stories", %{"epic_number" => 1, "title" => "s"})
+
+      assert json_response(conn, 422)["error"]["code"] == "kb_project_no_work"
+    end
+
+    test "import on a :kb scope 422s (human-anchored caller)", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {user_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "kb", slug: "kb"}, kind: :kb)
+
+      conn =
+        conn
+        |> auth_conn(user_key)
+        |> post(~p"/api/v1/projects/#{kb.id}/import", %{"epics" => []})
+
+      assert json_response(conn, 422)["error"]["code"] == "kb_project_no_work"
+    end
+
+    test "orchestrator-state save on a :kb scope 422s (human-anchored caller)", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      {:ok, kb} = Projects.create_project(tenant.id, %{name: "kb", slug: "kb"}, kind: :kb)
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> put(~p"/api/v1/orchestrator/state/#{kb.id}", %{"state" => %{}})
+
+      assert json_response(conn, 422)["error"]["code"] == "kb_project_no_work"
+    end
+
+    test "a work project (kind: :work) is NOT rejected by the guard", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      work = fixture(:project, %{tenant_id: tenant.id, slug: "work"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{work.id}/ui-tests", %{"name" => "run"})
+
+      # It passes RequireWorkProject and reaches the action; whatever the action returns,
+      # it must NOT be the kb_project_no_work rejection.
+      refute conn.status == 422 and
+               Jason.decode!(conn.resp_body)["error"]["code"] == "kb_project_no_work"
     end
   end
 
@@ -526,6 +815,139 @@ defmodule LoopctlWeb.ProjectControllerTest do
         |> get(~p"/api/v1/projects/#{project_b.id}/progress")
 
       assert json_response(conn, 404)
+    end
+  end
+
+  describe "GET /api/v1/projects/resolve" do
+    test "resolves by slug and returns the project", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id, slug: "loopctl", name: "loopctl"})
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve?slug=loopctl")
+
+      body = json_response(conn, 200)
+      assert body["project"]["id"] == project.id
+      assert body["project"]["slug"] == "loopctl"
+      assert body["matched_by"] == "slug"
+    end
+
+    test "resolves by repo_url in ssh form", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      project =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "loopctl",
+          repo_url: "https://github.com/mkreyman/loopctl"
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/projects/resolve?repo_url=git@github.com:mkreyman/loopctl.git")
+
+      body = json_response(conn, 200)
+      assert body["project"]["id"] == project.id
+    end
+
+    test "resolves by name case-insensitively", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id, name: "LoopCtl", slug: "loopctl"})
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve?name=loopctl")
+
+      body = json_response(conn, 200)
+      assert body["project"]["id"] == project.id
+    end
+
+    test "returns 404 with not_found error when no match", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve?slug=missing")
+
+      body = json_response(conn, 404)
+      assert body["error"]["status"] == 404
+      assert is_binary(body["error"]["message"])
+    end
+
+    test "returns 422 with no_identifier error when no identifier supplied", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve")
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert is_binary(body["error"]["message"])
+    end
+
+    test "respects tenant isolation (never resolves another tenant's project)", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {key_a, _api_key} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent})
+
+      _project_b =
+        fixture(:project, %{
+          tenant_id: tenant_b.id,
+          slug: "cross-tenant",
+          repo_url: "https://github.com/mkreyman/loopctl"
+        })
+
+      conn = conn |> auth_conn(key_a) |> get(~p"/api/v1/projects/resolve?slug=cross-tenant")
+      assert json_response(conn, 404)["error"]["status"] == 404
+
+      conn2 =
+        build_conn()
+        |> auth_conn(key_a)
+        |> get(~p"/api/v1/projects/resolve?repo_url=mkreyman/loopctl")
+
+      assert json_response(conn2, 404)["error"]["status"] == 404
+    end
+
+    test "returns 409 ambiguous_resolution when a bare repo_url matches two hosts", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:project, %{
+        tenant_id: tenant.id,
+        slug: "gh-mirror",
+        repo_url: "https://github.com/acme/app"
+      })
+
+      fixture(:project, %{
+        tenant_id: tenant.id,
+        slug: "gl-mirror",
+        repo_url: "https://gitlab.com/acme/app"
+      })
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve?repo_url=acme/app")
+
+      body = json_response(conn, 409)
+      assert body["error"]["status"] == 409
+      assert body["error"]["code"] == "ambiguous_resolution"
+    end
+
+    test "returns 422 when an identifier exceeds the length cap", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      long_name = String.duplicate("a", 513)
+
+      conn =
+        conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects/resolve?name=#{long_name}")
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert is_binary(body["error"]["message"])
+    end
+
+    test "requires authentication", %{conn: conn} do
+      conn = get(conn, ~p"/api/v1/projects/resolve?slug=loopctl")
+      assert json_response(conn, 401)
     end
   end
 

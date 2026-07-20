@@ -46,6 +46,7 @@ defmodule Loopctl.Webhooks.Webhook do
     article.superseded
     article_link.created
     article_link.deleted
+    knowledge.ingestion_anomaly_detected
   )
 
   @doc """

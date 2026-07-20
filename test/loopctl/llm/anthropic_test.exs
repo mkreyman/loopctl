@@ -2,8 +2,33 @@ defmodule Loopctl.Llm.AnthropicTest do
   @moduledoc """
   The tenant's API key is a secret — it must NEVER appear in any log line, across
   ALL response branches of the client (review #16).
+
+  ## Why `async: false` (deliberate, not an oversight)
+
+  Most tests here attach a GLOBAL `:telemetry` handler on the VM-global event
+  `[:loopctl, :llm, :provider_error]` and assert on what lands in the test
+  process mailbox (`assert_received` / `refute_received`). The emitter in
+  `Loopctl.LLM.record_provider_error/2` DELIBERATELY puts NO `tenant_id` (nor any
+  high-cardinality id) in the event metadata — see the "NEVER `tenant_id`" note
+  in `lib/loopctl/llm.ex`. Because the metadata carries no tenant, the handlers
+  CANNOT be tenant-scoped: the best they can do is filter on `provider:
+  "anthropic"` (which they do). Under `async: true` that filter is not enough —
+  ANY concurrently-running test whose Anthropic path emits a `provider_error`
+  with `provider: "anthropic"` (content extraction/classification/merge/
+  memory-promotion all funnel through this shared client) would leak a
+  `{:provider_error_emitted, ...}` / `:unexpected_provider_error` message into a
+  listener's mailbox and trip the `refute_received` / metadata assertions
+  non-deterministically. The admission-gate listener does not even filter by
+  provider, so an embedding-path emission would leak into it too. This file is
+  ALSO an emitter: its 401/429/500/transport capture_log tests each record a
+  `provider_error`, so under async it would leak INTO other files' listeners.
+  A non-async module never runs concurrently with any other module
+  (`ExUnit.Case` `:async` docs), so no cross-file emitter is running while these
+  listeners are attached and no other file's listener is attached while these
+  emitters run. This mirrors `test/loopctl/knowledge_semantic_search_provider_error_test.exs`,
+  which documents `async: false` for exactly this VM-global-telemetry reason.
   """
-  use Loopctl.DataCase, async: true
+  use Loopctl.DataCase, async: false
 
   import ExUnit.CaptureLog
 
@@ -116,13 +141,14 @@ defmodule Loopctl.Llm.AnthropicTest do
         [:loopctl, :llm, :provider_error],
         fn
           # Forward ONLY this provider's events. `[:loopctl, :llm, :provider_error]`
-          # is a VM-GLOBAL telemetry event, so under `async: true` a concurrent
-          # embedding-path test (Knowledge.generate_embedding / the US-37.1
-          # embedding worker tests) emitting it with provider="embedding" would
-          # otherwise leak into THIS test's mailbox and fail the
-          # `assert_received {:provider_error_emitted, ...}` (received "embedding",
-          # expected "anthropic"). Filtering at the handler makes the assertion
-          # deterministic regardless of test scheduling.
+          # is a VM-GLOBAL telemetry event: a concurrent embedding-path test
+          # (Knowledge.generate_embedding / the US-37.1 embedding worker tests)
+          # emitting it with provider="embedding" must NOT be mistaken for this
+          # test's Anthropic call. Filtering at the handler keeps the
+          # `assert_received {:provider_error_emitted, ...}` assertion targeting
+          # only anthropic events. (This module is `async: false` — so no
+          # cross-file emitter runs concurrently at all — for exactly this
+          # VM-global-telemetry reason; see @moduledoc.)
           _event, measurements, %{provider: "anthropic"} = metadata, _config ->
             send(test_pid, {:provider_error_emitted, measurements, metadata})
 
@@ -213,9 +239,10 @@ defmodule Loopctl.Llm.AnthropicTest do
         handler_id,
         [:loopctl, :llm, :provider_error],
         fn
-          # Filter to this provider — the event is VM-global, so a concurrent
+          # Filter to this provider — the event is VM-global, so an unrelated
           # embedding-path emission must NOT be mistaken for this test's call
-          # emitting a provider_error on a successful 200.
+          # emitting a provider_error on a successful 200. (Module is
+          # `async: false` so no concurrent emitter runs; see @moduledoc.)
           _event, _measurements, %{provider: "anthropic"}, _config ->
             send(test_pid, :unexpected_provider_error)
 

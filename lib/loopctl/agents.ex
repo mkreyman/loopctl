@@ -114,14 +114,26 @@ defmodule Loopctl.Agents do
   - `{:ok, %Agent{}}` if found
   - `{:error, :not_found}` if not found or belongs to another tenant
   """
-  @spec get_agent(Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @spec get_agent(Ecto.UUID.t(), term()) ::
           {:ok, Agent.t()} | {:error, :not_found}
   def get_agent(tenant_id, agent_id) do
-    case AdminRepo.get_by(Agent, id: agent_id, tenant_id: tenant_id) do
-      nil -> {:error, :not_found}
-      agent -> {:ok, agent}
+    # `id: agent_id` on a :binary_id column raises Ecto.Query.CastError for a
+    # non-UUID value. Guard the cast so a malformed agent_id is a clean
+    # :not_found (-> 404), never a 500 — mirroring `Projects.get_project/2` so
+    # any caller that documents parity with the project guard (e.g.
+    # `Loopctl.Coordination.create_post/4`) actually holds.
+    if valid_uuid?(agent_id) do
+      case AdminRepo.get_by(Agent, id: agent_id, tenant_id: tenant_id) do
+        nil -> {:error, :not_found}
+        agent -> {:ok, agent}
+      end
+    else
+      {:error, :not_found}
     end
   end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   @doc """
   Updates an agent within a tenant.

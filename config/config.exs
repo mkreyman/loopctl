@@ -151,6 +151,40 @@ config :loopctl,
   scale_alert_oban_discard_rate_per_min: 10,
   scale_alert_provider_error_rate_per_min: 10
 
+# Ingestion capture-silence monitor (dead-man's-switch for knowledge capture).
+# Config-based DI for `Loopctl.Knowledge.IngestionHealth` — all tunables have
+# in-code defaults in that module, so this block is an override point, not a boot
+# dependency. `:monitored_source_types` are the article `source_type`s watched for
+# silence; `:all` (the default) monitors EVERY source_type that crosses the
+# established threshold — a silent-capture outage affects any source_type
+# (knowledge_create 409 drops hit web_article/newsletter/session_log alike), so the
+# monitor defaults to broad coverage rather than session_log-only. A list narrows it.
+# `:established_threshold` is the minimum article count (within the establishment
+# window) before a source_type is considered "established" (and thus eligible to be
+# flagged when it goes silent); `:staleness_threshold_hours` is how long an
+# established source_type may go without a new article before `IngestionHealthWorker`
+# flags a `:capture_silence` anomaly; `:establishment_window_hours` scopes
+# establishment to RECENT activity so a wound-down source_type is not flagged forever.
+#
+# PR B2 (no-persist / high-rejection-rate detector): `:reject_rate_threshold` is the
+# fraction of window write attempts above which a source_type is flagged
+# `:high_reject_rate` (rejects / total_attempts > threshold); `:min_attempts` is the
+# minimum window write attempts before that ratio is trusted (noise floor);
+# `:reject_window_days` is the rolling window (days) over the `ingestion_write_stats`
+# rollup the reject-rate scan reads.
+config :loopctl, :ingestion_health,
+  monitored_source_types: :all,
+  established_threshold: 5,
+  staleness_threshold_hours: 72,
+  establishment_window_hours: 720,
+  reject_rate_threshold: 0.5,
+  min_attempts: 10,
+  reject_window_days: 7,
+  # Retention (days) for the append-only `ingestion_write_stats` rollup; the hourly
+  # worker prunes older rows so the table (and the cross-tenant reject-rate scan) stays
+  # bounded. Only the rolling `reject_window_days` window is ever read.
+  write_stats_retention_days: 90
+
 # US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
 # defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/
 # mutate writer busts the key_hash entry in-band. A cached entry is re-validated
@@ -475,6 +509,41 @@ config :loopctl, :memory_promotion_sweep_scan_limit, 2000
 config :loopctl, :memory_promotion_sweep_interval_seconds, 600
 config :loopctl, :memory_promotion_sweep_window_seconds, 900
 config :loopctl, :session_memory_ttl_seconds, 3600
+
+# Memory GRADUATION tunables (#411 Gap 3 — Loopctl.Workers.MemoryGraduationSweepWorker).
+# A DISTINCT, higher tier than the promotion loop above: a long-term memory recalled at
+# least `recall_threshold` times (via a HEALTHY semantic recall — the ILIKE fallback does
+# NOT bump the counter, so a provider outage cannot skew the signal) is graduated into a
+# durable Knowledge Wiki article, deduped by the novelty gate.
+# - recall_threshold: recall-count at/above which a memory is eligible to graduate.
+# - max_per_run: per-tick execution budget — the max memories one hourly sweep processes,
+#   bounding the novelty-gate embedding spend per run.
+# - scan_limit: max distinct TENANTS a sweep tick considers (a tenant cap, NOT a row cap).
+#   The sweep needs at most max_per_run tenants and pulls ~ceil(max_per_run / n_tenants)
+#   rows each, so worst-case candidate rows fetched per tick is ~2*max_per_run, not
+#   scan_limit*max_per_run.
+config :loopctl, :memory_graduation_recall_threshold, 3
+config :loopctl, :memory_graduation_max_per_run, 50
+config :loopctl, :memory_graduation_scan_limit, 500
+
+# Dedup window (seconds) for the recall-count hotness bump (`Loopctl.Memory.bump_recall_counts/2`).
+# A memory's `recall_count` is bumped at most once per window, so a single agent replaying the
+# same query in a tight loop cannot inflate the "frequently-recalled" signal and force premature
+# graduation. Genuine repeated value across sessions/time still accumulates across windows.
+config :loopctl, :memory_recall_bump_cooldown_seconds, 3600
+
+# Minimum cosine similarity a recalled memory must clear for its hotness bump to count
+# (`Loopctl.Memory.recall_bump_min_score/0`). recall returns the top-k by distance
+# regardless of absolute relevance, so without a floor a sparse subject scope (fewer than
+# k live memories) would auto-graduate low-relevance NOISE. Only a recall at/above this
+# similarity (`max(0.0, 1.0 - distance)`) bumps recall_count.
+config :loopctl, :memory_recall_bump_min_score, 0.6
+
+# Max concurrent in-flight recall-count bump tasks per node
+# (`Loopctl.Memory.RecallBumpTaskSupervisor` max_children). Bounds the fan-out of the
+# fire-and-forget async bump so a recall burst cannot spawn unbounded background writes
+# that starve the write pool — over the cap the bump is simply dropped (best-effort).
+config :loopctl, :memory_recall_bump_max_tasks, 200
 
 # Epic 30 / US-30.1: per-tenant cap on entity definitions
 # (`Loopctl.ContextRetriever.Registry`). Bounds the dynamic ListTools payload/

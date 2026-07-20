@@ -5,6 +5,134 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.51.0 — 2026-07-19 (repo coordination bus — directed-handoff discovery)
+
+### Added
+
+- **`channel_handoffs`** — directed-handoff DISCOVERY read over
+  `GET /api/v1/channel/handoffs` on the agent key (Epic 40 Repo Coordination Bus,
+  US-40.C1). Surfaces DIRECTED, OPEN, UNCLAIMED handoffs (posts carrying a stable
+  `handoff:<anchor>` key) addressed to the caller's `host`/`capabilities` — or
+  unaddressed BROADCAST handoffs — that have NO active claim and have not expired.
+  It is a SEPARATE, PINNED set: NOT interleaved into and NOT subject to
+  `channel_recent`'s newest-N recency truncation, so a `beelink -> mac-mini`
+  handoff is always visible to mac-mini even on a busy channel where the newest-5
+  preview would drop it. A claim that is DONE keeps its handoff excluded (done is
+  terminal); only a released claim or a lease that expired WITHOUT completion
+  reopens it. `host`/`capabilities` are ADVISORY filters — they shape WHAT is
+  shown, never WHO may read (the result stays bounded to the caller's tenant).
+  Oracle-safe: a foreign/nonexistent/malformed `project_id` returns an empty set,
+  never a 404. Bodies are BOUNDED previews (<= 512 bytes) of UNTRUSTED DATA
+  authored by another agent — fetch a full body via `channel_get`. Required:
+  `project_id`.
+
+## 2.48.0 — 2026-07-18 (repo coordination bus — redact/delete)
+
+### Added
+
+- **`channel_delete`** — hard-delete (redact) a coordination post over
+  `DELETE /api/v1/channel/posts/:id` on the agent key (Epic 39 Repo Coordination
+  Bus, US-39.7). The backstop for a leaked/regretted post: whoever NOTICES a
+  leaked secret can remove the row immediately, before its 30-day TTL sweeps it.
+  Cooperative single-tenant model — any agent in the tenant may delete any post
+  in that tenant (the deleting agent is the audit actor), but NEVER a post in
+  another tenant: a foreign or nonexistent id returns a byte-identical 404 (no
+  cross-tenant existence oracle). The delete and its `deleted` audit entry run in
+  one transaction, so the removal stays accountable even though the row is gone.
+
+## 2.47.0 — 2026-07-18 (repo coordination bus tools)
+
+### Added
+
+- **`channel_post`** — post a coordination message to a repo coordination channel
+  (Epic 39 Repo Coordination Bus) over `POST /api/v1/channel/posts` on the agent
+  key. A channel IS a `project_id` (a work project or a kb scope); posts are
+  tenant-isolated by RLS. This is an agent-role coordination surface, not
+  chain-of-custody. `host` is auto-filled from the proxy's `os.hostname()` and
+  `session_id` from the Claude Code session id (`CLAUDE_SESSION_ID`) — both
+  proxy-supplied and informational (never caller args). Pass a `key` to upsert your
+  per-session working-state slot instead of appending a new post; pass optional
+  `refs` (`{file, pr, branch, commit}`).
+- **`channel_recent`** — read recent posts from a repo coordination channel over
+  `GET /api/v1/channel/posts` on the agent key. RLS returns only your own tenant's
+  channel (oracle-safe read). Supports `since` (a full ISO8601 instant) and `limit`
+  (default 25, max 100).
+
+## 2.46.0 — 2026-07-18 (high-reject-rate ingestion anomalies)
+
+### Changed
+
+- **`get_ingestion_anomalies`** — the `anomaly_type` filter now accepts
+  `high_reject_rate` alongside `capture_silence`. `high_reject_rate` flags a
+  source_type whose writes are ATTEMPTED but REJECTED at high rate over a rolling
+  window (409 title_conflict / validation drops that persist no article row) — the
+  complement to capture_silence (writes stopped). Use it to catch the OTHER outage
+  signature where knowledge capture is landing calls but silently dropping them.
+
+## 2.45.0 — 2026-07-18 (ingestion-health anomalies)
+
+### Added
+
+- **`get_ingestion_anomalies`** — list ingestion-health anomalies (capture-silence: a
+  `source_type` that was producing articles has gone silent) over
+  `GET /api/v1/ingestion-anomalies` (orchestrator key). Use it to
+  check whether knowledge capture is still landing. Paginated (`page`/`page_size`), with
+  optional `source_type`, `anomaly_type`, `resolved` (`false`/`true`/`all`), and
+  `include_archived` filters. Complements `get_cost_anomalies`.
+
+## 2.44.0 — 2026-07-17 (KB-scope lifecycle: agent archive + restore)
+
+### Added
+
+- **`archive_kb_scope`** — archive (reversible soft-delete) a `kind: kb` scope you own,
+  on the agent key, over `DELETE /api/v1/kb-scopes/:id`. Frees the scope's slot in the
+  tenant's `max_projects` budget so an agent-rooted tenant can reclaim KB-scope capacity
+  (closes the one-way ratchet from 2.43.0). Rejects a `kind: work` project (422); idempotent
+  on an already-archived scope.
+- **`restore_kb_scope`** — re-activate an archived `kind: kb` scope (the reverse of archive),
+  over `POST /api/v1/kb-scopes/:id/restore`. Re-consumes an active `max_projects` slot (422
+  at the cap). Rejects a `kind: work` project (422).
+
+## 2.43.0 — 2026-07-16 (#418 — KB-only project scopes for agent-rooted tenants)
+
+### Added
+
+- **`create_kb_scope`** — create a knowledge-only project scope (`kind: kb`) for
+  the current tenant over `POST /api/v1/kb-scopes`, using the AGENT key. Unlike
+  `create_project` (a work project, orchestrator+ / human-anchored), a KB scope is
+  available to an agent-rooted (KB-tier) tenant: it carries NO work-breakdown /
+  chain-of-custody surface (it cannot host epics/stories/dispatch/ui-tests) and
+  exists only to partition knowledge articles by repo. Resolve it with
+  `resolve_project` and pass the returned `id` as `project_id` on article/knowledge
+  writes. Counts toward the tenant's `max_projects` budget.
+
+## 2.42.0 — 2026-07-16 (#411 — agent-memory substrate: resolve_project, recall_context, memory_graduate)
+
+### Added
+
+- **`resolve_project`** (#411 Gap 1) — resolve a repo to its `project_id` in one
+  call over `GET /api/v1/projects/resolve`. Accepts any of `slug`, `repo_url`
+  (SSH, HTTPS, or bare `owner/repo`), or `name` (precedence `slug > repo_url >
+  name`). Use the returned `id` to scope `memory_*` / `recall_context`.
+- **`recall_context`** (#411 Gap 2) — ONE round-trip over `POST /api/v1/recall`
+  returning the re-ranked `global ∪ active-project` union of long-term MEMORY and
+  KNOWLEDGE (combined-search summaries) for a `query`, each result tagged
+  `source: memory|knowledge`, plus the untouched per-source `memory`/`knowledge`
+  envelopes. Prefer over separate `memory_recall` + `knowledge_search`. Pass
+  `project_id` (from `resolve_project`) to merge global with that project.
+- **`memory_graduate`** (#411 Gap 3) — graduate one of your long-term memories
+  into a durable Knowledge Wiki article over `POST /api/v1/memory/graduate` — the
+  explicit, on-demand version of the hourly graduation sweep. DEDUPED by the
+  novelty gate (`data.verdict` `created`/`gated_to_draft` → new article, 201;
+  `duplicate`/`deduplicated` → canonical article, 200). `re_scope: "global"`
+  promotes a project memory tenant-wide on its FIRST graduation. Scope is
+  key-derived (foreign/unknown `memory_id` → 404).
+- **Publish note.** `resolve_project` and `recall_context` shipped to `index.js`
+  in #411 Gaps 1–2 without a version bump, so the published `loopctl-mcp-server`
+  (2.41.0) lacked them; this 2.42.0 bump publishes all three new tools together.
+  All ride the existing authenticated/witness pipeline (agent key, shared
+  `apiCall` + witness-STH). Additive only. Tool count → 89.
+
 ## 2.41.0 — 2026-07-11 (US-31.4 — hybrid retrieval + progressive disclosure tools)
 
 ### Added

@@ -90,6 +90,15 @@ defmodule Loopctl.Memory.Memory do
     field :tags, {:array, :string}, default: []
     field :metadata, :map, default: %{}
 
+    # #411 Gap 3: recall-count tracking + graduation. None of these are cast from
+    # request params — `recall_count`/`last_recalled_at` are bumped OFF the recall hot
+    # path by `Loopctl.Memory.bump_recall_counts/2`, and `graduated_at` is stamped by
+    # the graduation sweep / the explicit graduation primitive. `graduated_at` NULL =
+    # not yet graduated into a durable knowledge article.
+    field :recall_count, :integer, default: 0
+    field :last_recalled_at, :utc_datetime_usec
+    field :graduated_at, :utc_datetime_usec
+
     belongs_to :superseded_by_memory, __MODULE__,
       foreign_key: :superseded_by,
       references: :id,
@@ -114,15 +123,21 @@ defmodule Loopctl.Memory.Memory do
 
   `tenant_id`, `subject_id`, and `project_id` are set programmatically on the
   struct and must NOT appear in `attrs`. Both `project_id` and `superseded_by`
-  are FKs whose Postgres constraint is checked with RLS BYPASSED, so accepting
+  are FKs whose Postgres constraint is checked with RLS BYPASSED, so casting
   either from request params would let a caller point at ANOTHER tenant's row (a
   cross-tenant graph edge + INSERT-time existence oracle). `superseded_by` is
-  set by `forget/2` (US-28.2); `project_id` is set by the US-28.2 write path from
-  the caller's already-authorized context — never cast — mirroring the sibling
+  set by `forget/2` (US-28.2); `project_id` is set programmatically on the struct
+  from `Loopctl.Memory.Scope` — never cast — mirroring the sibling
   `Loopctl.WorkBreakdown.Story` schema, which likewise sets `project_id`
   programmatically rather than casting it. (The Knowledge Wiki `Article` casts
   `project_id`, but a `Memory` is a stricter per-subject security boundary and
-  matches `Story`, not `Article`, here.) `embedding` is never cast here — it is
+  matches `Story`, not `Article`, here.) NB (#411 Gap 2): a `project_id` MAY now
+  originate from the request body as an explicit partition input, but it is
+  validated for tenant-ownership at the context write path
+  (`Loopctl.Memory.remember/2` → `Loopctl.Projects.get_project/2`) BEFORE the insert,
+  so the RLS-bypassing FK check below is never the tenant-boundary gate — it is
+  defense-in-depth behind an already-authorized value, preserving the "never point at
+  another tenant's project" invariant. `embedding` is never cast here — it is
   populated asynchronously via `embedding_changeset/3` in US-28.2. `metadata` is
   cast (mirrors `SessionMemory`) so the generic `metadata` contract advertised by
   the memory HTTP API / `memory_remember` MCP tool persists for this tier too.

@@ -2,6 +2,59 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-07-16 — Agent-memory substrate: project scope, merged recall, graduation (#411)
+
+### Added
+
+- **Gap 1 — cheap repo → `project_id` resolution.**
+  `Loopctl.Projects.resolve_project/2` (`GET /api/v1/projects/resolve`, MCP tool
+  `resolve_project`) maps a `repo_url` / `slug` / `name` to a project in one call
+  (precedence `slug > repo_url > name`; `repo_url` accepts SSH, HTTPS, and bare
+  `owner/repo`). `404` `not_found`, `422` `no_identifier`, `409`
+  `ambiguous_resolution` (a fuzzy identifier matched >1 active project).
+- **Gap 2 — the `project_id` partition key + merged recall.** Long-term memories
+  carry an optional `project_id` that PARTITIONS a subject's memories into a
+  `global` (NULL) bucket and one per project — a partition key, NOT the isolation
+  boundary (`(tenant_id, subject_id)` remains that, always key-derived). Write
+  tenant-validates `project_id` (`422 invalid_project_id`); recall merges
+  `global ∪ active-project` and treats an unowned id as an empty partition
+  (global-only, no error). `Loopctl.Memory.recall_context/2`
+  (`POST /api/v1/recall`, MCP tool `recall_context`) returns ONE re-ranked
+  `global ∪ active-project` union of long-term MEMORY *and* KNOWLEDGE (combined
+  search summaries), each result tagged `source: memory|knowledge`, plus the
+  untouched per-source envelopes. A blank/over-500-char query is a `422` up front;
+  a one-sided degrade returns the other side with `meta.degraded?: true` (never a
+  500). Agent role is forced to published articles + own/`shared` memories (#163).
+- **Gap 3 — recall-count graduation (HOT memory → durable knowledge).** Recall now
+  bumps a `recall_count`/`last_recalled_at` hotness signal off the hot path
+  (relevance floor `memory_recall_bump_min_score` = 0.6, cooldown
+  `memory_recall_bump_cooldown_seconds` = 3600 s, fan-out cap
+  `memory_recall_bump_max_tasks` = 200). The hourly
+  `Loopctl.Workers.MemoryGraduationSweepWorker` graduates not-yet-graduated
+  memories at/above `memory_graduation_recall_threshold` = 3 recalls into curated
+  knowledge articles via the novelty gate (per-run budget
+  `memory_graduation_max_per_run` = 50, scan fan-out
+  `memory_graduation_scan_limit` = 500), stamping `graduated_at` on any durable
+  verdict (a fell-open gate is not stamped — it re-graduates once embeddings
+  recover).
+- **Gap 3 surface — explicit, on-demand graduation.**
+  `Loopctl.Memory.graduate_memory/3` is now reachable over HTTP + MCP:
+  `POST /api/v1/memory/graduate` `{memory_id, re_scope?}` (MCP tool
+  `memory_graduate`). Scope is key-derived (a foreign/unknown `memory_id` → `404`,
+  no cross-subject oracle; malformed → `422 invalid_memory_id`). The novelty-gate
+  verdict drives the status: `created`/`gated_to_draft` → `201` with a new
+  article, `duplicate`/`deduplicated` → `200` (canonical article, nothing
+  created). `re_scope: "global"` promotes a PROJECT memory to a tenant-wide
+  article on its FIRST graduation only (`409 already_graduated` otherwise); a
+  fell-open gate returns `503 gate_unavailable`. Allowlisted as an agent-reachable
+  write in the default-deny custody classification (alongside `memory_promote` /
+  `knowledge_create`).
+- **Docs** — [`docs/agent-memory.md`](docs/agent-memory.md) extended with the
+  project-scope partition model, `resolve_project`, merged `recall_context`, the
+  recall-count graduation cadence, and `memory_graduate` + local→global re-scope;
+  `mcp-server/README.md`, `AGENTS.md`, and both changelogs updated. The
+  MCP server publishes these three new tools at `loopctl-mcp-server` **2.42.0**.
+
 ## [Unreleased] — 2026-07-11 — OKF-curated + RAG Hybrid Knowledge Retrieval (Epic 31)
 
 ### Added

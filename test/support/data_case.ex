@@ -131,18 +131,30 @@ defmodule Loopctl.DataCase do
       {:ok, 0}
     end)
 
-    # Default stub for embedding client -- returns a 1536-dim vector of 0.1.
+    # Default stub for embedding client -- a DETERMINISTIC FUNCTION OF THE INPUT
+    # TENANT (see `deterministic_embedding/1`), never a global constant. The old
+    # constant `List.duplicate(0.1, 1536)` made EVERY memory in EVERY tenant
+    # identical, so the single, globally-shared pgvector HNSW index on `memories`
+    # became one giant all-ties clique. Under concurrent full-suite load the graph
+    # walk cannot navigate that clique and non-deterministically MISSED exact
+    # matches, so near-dup supersede duplicated and scoped recalls came back empty
+    # (issue #421). Keying the vector on `tenant_id` gives each tenant its OWN
+    # well-separated point: within a tenant every text still maps to the SAME
+    # vector (so cross-text recall — query "drain" finding "batch drainer" — keeps
+    # working exactly as before, no test rewrites), but tenants no longer crowd
+    # each other's region of the index, so recall is deterministic under load.
     # tenant_id is threaded first (BYO embeddings, #294 extended).
-    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
-      {:ok, List.duplicate(0.1, 1536)}
+    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn tenant_id, _text ->
+      {:ok, deterministic_embedding(tenant_id)}
     end)
 
     # US-37.4: permissive default for the BATCH embedding path -- one 1536-dim vector
     # per input text, preserving input order (the real client maps by response index;
     # this deterministic stub returns them aligned so batch worker/store tests run
-    # unchanged). An empty batch returns [].
-    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _tenant_id, texts ->
-      {:ok, Enum.map(texts, fn _text -> List.duplicate(0.1, 1536) end)}
+    # unchanged). Keyed on `tenant_id` (never a global constant) for the same
+    # index-navigability reason as the single path above. An empty batch returns [].
+    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn tenant_id, texts ->
+      {:ok, Enum.map(texts, fn _text -> deterministic_embedding(tenant_id) end)}
     end)
 
     # US-37.2: permissive default for the per-node embedding concurrency gate --
@@ -324,5 +336,22 @@ defmodule Loopctl.DataCase do
         opts |> Keyword.get(String.to_existing_atom(key), key) |> to_string()
       end)
     end)
+  end
+
+  # A DETERMINISTIC per-TENANT embedding for the default MockEmbeddingClient stubs
+  # (stub_all_defaults/0). Returns a 1536-dim vector that is a PURE FUNCTION of the
+  # `tenant_id`, so every tenant occupies its own well-separated point in the
+  # shared pgvector HNSW index while every text WITHIN a tenant maps to the SAME
+  # vector. That separation is what keeps the index navigable (no global all-ties
+  # clique → the issue-#421 recall flake disappears), and the within-tenant
+  # sameness is what preserves the permissive default's existing semantics: a
+  # recall in a tenant matches any of that tenant's memories regardless of query
+  # text, so no recall test needs to set explicit embeddings. Sixteen
+  # hash-selected dimensions are set so two tenants collide only if all sixteen
+  # independent hashes collide (negligible). A non-binary input still hashes fine
+  # via :erlang.phash2/1.
+  defp deterministic_embedding(tenant_id) do
+    hot = for salt <- 0..15, into: MapSet.new(), do: rem(:erlang.phash2({tenant_id, salt}), 1536)
+    Enum.map(0..1535, fn i -> if MapSet.member?(hot, i), do: 1.0, else: 0.0 end)
   end
 end

@@ -1,0 +1,44 @@
+{
+  "id": "US-39.1",
+  "title": "channel_posts schema + migration (RLS + explicit-tenant-filter, indexes, 30-day expires_at, per-session keyed upsert)",
+  "epic": { "id": "epic_39", "name": "Repo Coordination Bus" },
+  "priority": "high",
+  "phase": "coordination_bus_v1",
+  "story": {
+    "as_a": "loopctl platform developer",
+    "i_want_to": "add a tenant-scoped channel_posts table (RLS enabled, but queried via AdminRepo with an explicit tenant_id filter like all other tenant content) whose rows are project-scoped messages with an optional per-session upsert key and a uniform 30-day expires_at",
+    "so_that": "agent sessions on the same repo (across machines) have a shared, short-lived, multi-machine coordination store to build the post/read API on"
+  },
+  "rationale": "The coordination bus is the third memory plane (Knowledge=durable, Memory=agent-private, Channel=repo-scoped/transient). It must be hosted (multi-machine) and tenant-isolated by the same discipline as every other loopctl content table — AdminRepo (BYPASSRLS) plus explicit tenant_id filtering in every query, with RLS enabled as defense-in-depth. The schema is deliberately minimal — no message-type taxonomy — because the fleet audit showed the category taxonomy was essentially unused; an optional key gives per-session upsert for keyed working-state without a type system.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §3.1, §3.4, §3.5; technical review D1/D2/M2/M6/M7",
+    "includes": "Mirrors the tenant_id + AdminRepo pattern of Loopctl.Knowledge.Article and Loopctl.Projects.Project; RLS enabled via Loopctl.Repo.RlsHelpers.enable_rls/1 (rls_helpers.ex:38) exactly as create_projects (20260327154649) and create_articles (20260410002347) do."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-39.1.1", "description": "A migration creates channel_posts with columns: id (binary_id pk), tenant_id (binary_id, references(:tenants, on_delete: :delete_all), not null), project_id (binary_id, references(:projects, on_delete: :delete_all), not null), agent_id (binary_id, not null), session_id (text, null), host (text, null), key (text, null), body (text, not null), refs (map/jsonb, null), expires_at (utc_datetime_usec, not null), inserted_at/updated_at timestamps.", "status": "pending" },
+    { "id": "AC-39.1.2", "description": "RLS is ENABLED on channel_posts via RlsHelpers.enable_rls(:channel_posts) (defense-in-depth). NOTE: production isolation is NOT RLS — it is AdminRepo + an explicit tenant_id filter in every Coordination query (the Knowledge/Projects pattern). Both must hold: a query missing the tenant_id filter is a bug even though RLS would also stop it.", "status": "pending" },
+    { "id": "AC-39.1.3", "description": "Indexes exist: (tenant_id, project_id, inserted_at DESC) for recent reads; (expires_at) for the sweep; and a UNIQUE index on (tenant_id, project_id, session_id, key) WHERE key IS NOT NULL. The key slot is per (tenant, project, SESSION) — NOT project-global — so two concurrent sessions writing key \"session_goal\" do not clobber each other (see M7).", "status": "pending" },
+    { "id": "AC-39.1.4", "description": "Loopctl.Coordination.ChannelPost schema defines the fields, @derive Jason.Encoder exposing id/tenant_id/project_id/agent_id/session_id/host/key/body/refs/expires_at/inserted_at/updated_at, and a create_changeset that casts ONLY [:session_id, :host, :key, :body, :refs] — tenant_id, project_id, agent_id, expires_at are set programmatically on the struct, never via cast. There is NO :kind/:category/:type field.", "status": "pending" },
+    { "id": "AC-39.1.5", "description": "create_changeset validates: body present and length <= 16384; key (when present) length <= 200; refs (when present) is a map whose keys are a subset of the allowlist {file, pr, branch, commit}, each value a string <= 512 chars, with a total serialized refs size <= 4KB (larger/other-keyed refs are invalid).", "status": "pending" },
+    { "id": "AC-39.1.6", "description": "A secret denylist (the same regex set the knowledge extractor uses: Bearer/sk-/lc_/gh[pousr]_/AKIA/PEM/xox) is run over body AND every refs value AND key. A match REJECTS the write with a 422 (does not persist) so the caller learns the info did not land — it is NOT silently dropped.", "status": "pending" },
+    { "id": "AC-39.1.7", "description": "The new table + indexes are online-safe (new table; no destructive rewrite) and the migration runs clean via the release migrate path.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-39.1.1", "name": "row inserts with programmatic tenant/project/agent/expires", "type": "integration", "preconditions": ["tenant = fixture(:tenant)", "project = fixture(:project, %{tenant_id: tenant.id})"], "steps": ["Insert a ChannelPost via Coordination with tenant_id/project_id/agent_id/expires_at set on the struct and body cast from attrs"], "expected_results": ["{:ok, post}", "expires_at ~30 days out", "key/refs nullable"] },
+    { "id": "TC-39.1.2", "name": "isolation holds on BOTH paths (AdminRepo+filter AND RLS)", "type": "integration", "preconditions": ["tenant_a = fixture(:tenant); tenant_b = fixture(:tenant)", "a post exists for tenant_a's project"], "steps": ["Coordination.recent(tenant_b.id, ...) via AdminRepo+explicit filter", "AND query channel_posts through the RLS Repo under tenant_b scope"], "expected_results": ["AdminRepo path: zero rows (explicit tenant filter)", "RLS Repo path: zero rows (belt-and-suspenders)"] },
+    { "id": "TC-39.1.3", "name": "per-session keyed slot: two sessions do not clobber", "type": "integration", "preconditions": ["tenant = fixture(:tenant); project = fixture(:project, %{tenant_id: tenant.id})", "session A post key \"session_goal\"; session B post same key"], "steps": ["Insert both keyed posts with different session_id"], "expected_results": ["both rows persist (unique index includes session_id)", "neither overwrites the other"] },
+    { "id": "TC-39.1.4", "name": "over-large / wrong-keyed refs rejected", "type": "unit", "preconditions": ["tenant = fixture(:tenant); project = fixture(:project, %{tenant_id: tenant.id})"], "steps": ["create_changeset with refs %{\"evil\" => String.duplicate(\"x\", 9000)}"], "expected_results": ["invalid; error on :refs (key not in allowlist AND size)"] },
+    { "id": "TC-39.1.5", "name": "secret in refs.branch is rejected 422", "type": "unit", "preconditions": ["tenant = fixture(:tenant); project = fixture(:project, %{tenant_id: tenant.id})"], "steps": ["create_changeset with refs %{\"branch\" => \"lc_\" <> String.duplicate(\"a\", 30)}"], "expected_results": ["invalid; denylist match on a refs value; not persisted"] },
+    { "id": "TC-39.1.6", "name": "no kind/type field exists", "type": "unit", "preconditions": [], "steps": ["Inspect Loopctl.Coordination.ChannelPost.__schema__(:fields)"], "expected_results": ["only the minimal set; no :kind/:category/:type"] }
+  ],
+  "technical_notes": [
+    "Schema: Loopctl.Coordination.ChannelPost; context: Loopctl.Coordination; table: channel_posts (no existing collision — verified).",
+    "RLS: RlsHelpers.enable_rls(:channel_posts) — ENABLE (not FORCE) like other tables; runtime isolation is AdminRepo + explicit tenant_id filter, NOT RLS (see Knowledge/Projects). RLS is defense-in-depth.",
+    "project_id references(:projects, on_delete: :delete_all) — same FK/cascade as articles.project_id, but NOT NULL here (articles.project_id is nullable; a channel post always has a channel).",
+    "expires_at set in the context as now + @retention_days (30) — one authoritative constant in code, not a DB default.",
+    "Factor the knowledge secret-denylist regex into a shared helper and run it over body + refs values + key.",
+    "Unique key slot is (tenant_id, project_id, session_id, key) WHERE key IS NOT NULL — per-session, decided under M7 to avoid cross-session clobber."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 220000
+}

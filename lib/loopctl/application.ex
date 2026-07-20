@@ -5,6 +5,7 @@ defmodule Loopctl.Application do
 
   use Application
 
+  alias Loopctl.Telemetry.IngestionWriteStats
   alias Loopctl.Telemetry.SlowQueryLogger
 
   @impl true
@@ -19,6 +20,12 @@ defmodule Loopctl.Application do
     # US-27.4: uniform slow-query logging across all repos via one telemetry handler.
     SlowQueryLogger.attach()
 
+    # PR B2: fold every KB article write OUTCOME into the durable
+    # `ingestion_write_stats` rollup (the no-persist / high-rejection-rate detector's
+    # data source). Self-rescuing, so a dropped rollup increment never affects the
+    # write it observes.
+    IngestionWriteStats.attach()
+
     children = [
       LoopctlWeb.Telemetry,
       Loopctl.Vault,
@@ -28,6 +35,44 @@ defmodule Loopctl.Application do
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
       {Task.Supervisor, name: Loopctl.TaskSupervisor},
+      # PR B2: BOUNDED supervisor for the fire-and-forget `ingestion_write_stats`
+      # rollup upserts spawned by `Loopctl.Telemetry.IngestionWriteStats`. The
+      # high_reject_rate detector's trigger condition is a client HAMMERING create in a
+      # retry loop (a title_conflict/validation storm) — i.e. exactly when write volume
+      # spikes — so an UNBOUNDED per-write task fan-out would flood the small BYPASSRLS
+      # AdminRepo pool (also serving the rate limiter + auth) precisely during the
+      # incident this feature detects, amplifying the outage. `max_children` caps the
+      # fan-out: over the cap `start_child` returns `{:error, :max_children}` and the
+      # increment is DROPPED (best-effort analytics, never blocks/fails the observed
+      # write). Separate from the general `Loopctl.TaskSupervisor` so this backpressure
+      # is isolated, mirroring `Loopctl.Memory.RecallBumpTaskSupervisor`.
+      #
+      # The cap is sized to the AdminRepo pool (ADMIN_POOL_SIZE, default 3), NOT set to
+      # a large fan-out: each task issues one AdminRepo checkout, so a cap far above the
+      # pool merely oversubscribes the 3-conn pool during a storm (queueing checkouts
+      # past `queue_target`/`queue_interval` and starving the co-tenant rate-limiter/auth
+      # upserts). A small multiple of the pool (default 10) allows brief overlap while
+      # keeping concurrent checkout demand bounded to roughly the pool depth — excess
+      # increments drop rather than pile onto the pool. Under normal low-frequency writes
+      # tasks complete in microseconds, so the cap is never approached.
+      {Task.Supervisor,
+       name: Loopctl.Telemetry.IngestionWriteStatsTaskSupervisor,
+       max_children: Application.get_env(:loopctl, :ingestion_write_stats_max_tasks, 10)},
+      # #411 Gap 3: owns the public ETS table that pre-filters recall-count hotness
+      # bumps already inside their per-memory cooldown window, so an idle-window
+      # recall issues ZERO background tasks and ZERO DB writes (the DB-side
+      # `WHERE last_recalled_at < cutoff` stays the source of truth). Node-local
+      # pure ETS owner; survives the transient recall/task process that wrote to it.
+      Loopctl.Memory.RecallBumpCache,
+      # #411 Gap 3: BOUNDED supervisor for the fire-and-forget recall-count bump
+      # tasks. `max_children` caps the fan-out so a burst of healthy recalls cannot
+      # spawn an unbounded set of background writes that starve the write pool —
+      # over the cap `start_child` returns `{:error, :max_children}` and the bump is
+      # dropped (best-effort analytics, never fails the recall). Separate from the
+      # general `Loopctl.TaskSupervisor` so bump backpressure is isolated.
+      {Task.Supervisor,
+       name: Loopctl.Memory.RecallBumpTaskSupervisor,
+       max_children: Application.get_env(:loopctl, :memory_recall_bump_max_tasks, 200)},
       # US-38.2: owns the public ETS table backing the throttled, PII-safe
       # rate-limiter fail-open logger, so a sustained limiter/DB outage emits a
       # bounded heartbeat per bucket-family instead of one warning per request

@@ -93,7 +93,15 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     if include_body, do: Map.put(base, :body, result.body), else: base
   end
 
-  defp render_result(result, mode) do
+  @doc """
+  Projects a single search result map into the canonical whitelisted summary shape
+  (`{id, title, category, tags, score}` plus a truncated `snippet` when present) for
+  the given `mode` (`"keyword" | "semantic" | "combined"`).
+
+  Shared with `LoopctlWeb.RecallJSON` so the merged `/recall` endpoint emits the same
+  shape as the knowledge search endpoints and never leaks raw internal result fields.
+  """
+  def render_result(result, mode) do
     base = %{
       id: result[:id] || result.id,
       title: result[:title] || result.title,
@@ -139,7 +147,17 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
 
   defp truncate_snippet(_), do: nil
 
-  defp render_meta(meta) do
+  @doc """
+  Projects a `search_combined/3` / `search/3` result `meta` through the canonical
+  whitelist used by the knowledge search endpoints.
+
+  Shared with `LoopctlWeb.RecallJSON` (the merged `/recall` endpoint) so its knowledge
+  envelope emits the SAME whitelisted meta shape — never the raw context meta with any
+  internal reason atom. Requires `:total_count`, `:limit`, and `:offset` on `meta` (both
+  the healthy `search_combined/3` meta and the merged endpoint's degraded stub carry
+  them); the remaining keys are optional and emitted only when present.
+  """
+  def render_meta(meta) do
     %{
       total_count: meta[:total_count] || meta.total_count,
       limit: meta[:limit] || meta.limit,

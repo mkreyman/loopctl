@@ -1,0 +1,38 @@
+{
+  "id": "US-40.D5",
+  "title": "Read rate-limit + response byte-cap on the channel read path (index + show)",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
+  "priority": "high",
+  "phase": "coordination_bus_v2_D",
+  "story": {
+    "as_a": "loopctl operator protecting the coordination bus from read-side abuse",
+    "i_want_to": "put the channel read endpoints behind a real limiter and a bounded response size",
+    "so_that": "a compromised or runaway agent key cannot cheaply scrape or DoS the bus, and a read response can never balloon"
+  },
+  "rationale": "Today only the WRITE has the tight cap: rate_limit_write is plugged on :create only (channel_post_controller.ex:68), and the read (:index) is 'covered by the generic pipeline per-key/per-tenant limiter like every other read' (channel_post_controller.ex:66-67) with NO channel-specific bound and NO response byte cap. The security-adversary's resource-exhaustion + blast-radius findings argue reads need their own bound — especially now that GET /:id (40.D1) exposes full bodies. Add a read limiter (parity with the write cap) + a bounded response size on :index and :show, so a scrape/DoS is throttled and a response can't balloon.",
+  "background": {
+    "reference": "security-adversary resource-exhaustion; channel_post_controller.ex:63-68 (write cap only), :413-465 (the rate_limit_write / check_rate / fail-open machinery to reuse); the read at :209-254; GET /:id introduced by 40.D1.",
+    "includes": "A read-side limiter reusing the existing RateLimiter behaviour seam + a response byte/row cap, applied to :index and the new :show."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.D5.1", "description": "A read rate-limit plug is applied to :index, the new :show (GET /:id, 40.D1), AND :handoffs (GET /channel/handoffs, 40.C1 — a body-returning agent-facing read that must not escape the read limiter), reusing the RateLimiter behaviour seam and the fail-open + throttled FailOpenLog discipline already used by rate_limit_write (channel_post_controller.ex:413-465). It is config-driven (a tenant-overridable per-minute read cap, mirroring channel_post_write_limit_per_minute, channel_post_controller.ex:82, 467-483) and emits the :rate_limited security signal (channel_post_controller.ex:427-430) on a trip.", "status": "pending" },
+    { "id": "AC-40.D5.2", "description": "A RESPONSE BYTE/ROW cap bounds the read: the list already clamps limit to 100 (coordination.ex:39-42) and — after 40.C2/40.D1 — returns bounded previews not full bodies, so the list response is bounded by construction. GET /:id returns exactly one post whose body is <= @body_max_length (16KB, channel_post.ex:45), so the single-post response is inherently bounded; assert both bounds hold (no unbounded read response path exists).", "status": "pending" },
+    { "id": "AC-40.D5.3", "description": "The read cap FAILS OPEN on a limiter fault (a limiter outage must not block reads) but routes every fail-open through the shared throttled FailOpenLog (channel_post_controller.ex:459-465) so the outage stays observable — full parity with the write path. The cap is clamped to stay a TIGHTER (observable) constraint than the generic pipeline per-key limiter (mirroring write_limit/1's clamp, channel_post_controller.ex:467-483), so a channel read trip is never shadowed by an anonymous pipeline 429.", "status": "pending" },
+    { "id": "AC-40.D5.4", "description": "429 responses carry a retry-after header (channel_post_controller.ex:432-436 pattern). Backward compatible: under the cap, reads behave exactly as US-39.3/US-40.C2. A test asserts a burst of reads past the cap gets 429 with retry-after, and that a normal read cadence is unaffected.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.D5.1", "name": "read burst past the cap is 429", "type": "integration", "preconditions": ["a low read cap configured for the tenant"], "steps": ["fire reads past the cap in the window"], "expected_results": ["429 with retry-after; :rate_limited signal fired"] },
+    { "id": "TC-40.D5.2", "name": "GET /:id is also rate-limited", "type": "integration", "preconditions": ["a low cap"], "steps": ["burst GET /:id"], "expected_results": ["429 after the cap"] },
+    { "id": "TC-40.D5.3", "name": "limiter fault fails open + logs", "type": "integration", "preconditions": ["the limiter impl raising"], "steps": ["read"], "expected_results": ["read succeeds (fail-open); FailOpenLog warned; not silently swallowed"] },
+    { "id": "TC-40.D5.4", "name": "normal cadence unaffected", "type": "integration", "preconditions": ["default cap"], "steps": ["a handful of reads"], "expected_results": ["all 200; no 429"] }
+  ],
+  "technical_notes": [
+    "Reuse the write path's machinery wholesale: add a `rate_limit_read` function plug modeled on rate_limit_write (channel_post_controller.ex:413-438), plugged `when action in [:index, :show, :handoffs]` (:handoffs is the 40.C1 directed-handoff read — a body-returning surface, so it shares the read limiter). Reuse check_rate/2 + fail_open/2 + window_reset_at/0 (channel_post_controller.ex:446-521). Add a `channel_post_read_limit_per_minute` tenant setting + @default_read_limit; clamp to the pipeline per-key limit (pipeline_per_key_limit/1, channel_post_controller.ex:492-499).",
+    "Identifier bucket: `channel_post_read:key:#{api_key.id}` (parallel to the write bucket at channel_post_controller.ex:417).",
+    "Response bounds are mostly already guaranteed once 40.C2/40.D1 land (previews + limit<=100 + single 16KB post). This story adds the LIMITER and ASSERTS the byte bounds — coordinate with 40.D1 (GET /:id) and 40.C2 (previews) so :show/:index exist in their bounded form first.",
+    "Do NOT put the read behind the WRITE cap bucket — separate buckets so read/write abuse are independently observable.",
+    "Sequencing: step 9 (with 40.D2, 40.D3). Depends on 40.D1 for the :show action to exist."
+  ],
+  "dependencies": ["US-40.D1"],
+  "estimated_tokens": 150000
+}

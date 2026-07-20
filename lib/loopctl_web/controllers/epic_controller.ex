@@ -28,6 +28,10 @@ defmodule LoopctlWeb.EpicController do
   # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
   plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :update, :delete]
 
+  # Belt-and-suspenders: a :kb scope can never host epics (positive invariant, independent
+  # of the tier gate above).
+  plug LoopctlWeb.Plugs.RequireWorkProject when action in [:create]
+
   tags(["Epics"])
 
   operation(:create,

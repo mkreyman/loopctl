@@ -67,6 +67,20 @@ defmodule LoopctlWeb.FallbackControllerTest do
       assert body["error"]["message"] == "Conflict"
     end
 
+    # US-39.7 redact path: a rolled-back hard delete (audit insert failed) must
+    # surface as a 5xx, never a masking 404 — the post still exists, so the agent
+    # must retry rather than believe a leaked secret was removed.
+    test "renders 500 for :audit_write_failed (never masked as a 404)", %{conn: conn} do
+      conn = call_fallback(conn, {:error, :audit_write_failed})
+
+      assert conn.status == 500
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 500
+      assert body["error"]["code"] == "audit_write_failed"
+      assert body["error"]["message"] =~ "still exists"
+      assert body["error"]["message"] =~ "Retry"
+    end
+
     test "renders 429 for :rate_limited with default retry hint", %{conn: conn} do
       conn = call_fallback(conn, {:error, :rate_limited})
 

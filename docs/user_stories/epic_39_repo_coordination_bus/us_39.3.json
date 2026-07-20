@@ -1,0 +1,42 @@
+{
+  "id": "US-39.3",
+  "title": "channel_recent read endpoint + context (AdminRepo + explicit tenant filter, since/limit, live-only, oracle-safe)",
+  "epic": { "id": "epic_39", "name": "Repo Coordination Bus" },
+  "priority": "high",
+  "phase": "coordination_bus_v1",
+  "story": {
+    "as_a": "coding agent starting or resuming work on a repo",
+    "i_want_to": "read the recent, non-expired posts on my repo's channel, optionally only those since a timestamp",
+    "so_that": "I can see what other sessions (on any machine) said or did without anyone hand-relaying it to me"
+  },
+  "rationale": "This is the read half and the payload behind the SessionStart TEAM CHANNEL block. It must be strictly tenant+project scoped (AdminRepo + explicit tenant_id filter, the loopctl content pattern), cheap, return only live posts newest-first with a since delta, and never leak whether another tenant's project exists.",
+  "background": {
+    "reference": "docs/repo-coordination-bus.md §3.3, §3.6; reviews D1/D4/M3/M9/N1",
+    "includes": "Read scoping mirrors ProjectController agent-open, tenant-scoped reads; queried via AdminRepo + explicit tenant_id filter (NOT RLS Repo)."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-39.3.1", "description": "GET /api/v1/channel/posts?project_id=&since=&limit= is RequireRole :agent, tenant-scoped from the key, and returns posts for that project_id ordered inserted_at DESC. An OpenApiSpex operation/1 spec is declared (passes openapi_test.exs).", "status": "pending" },
+    { "id": "AC-39.3.2", "description": "Only LIVE posts are returned: the query filters expires_at > now() defensively (independent of the sweep), so an expired-but-not-yet-swept post never appears.", "status": "pending" },
+    { "id": "AC-39.3.3", "description": "since (ISO8601) filters to greatest(inserted_at, updated_at) > since; limit defaults to 25 and is CLAMPED to a max of 100 (a larger value is clamped to 100, matching the read-bound convention — not a 400).", "status": "pending" },
+    { "id": "AC-39.3.4", "description": "ORACLE-SAFE: a project_id belonging to another tenant, or a nonexistent project_id, returns 200 with an EMPTY list — UNIFORMLY, identical to an owned-but-empty project. It NEVER returns 404 and never a different status/body that would reveal whether the project exists in another tenant.", "status": "pending" },
+    { "id": "AC-39.3.5", "description": "Each returned post includes id, agent_id, session_id, host, key, body, refs, inserted_at, updated_at — enough to render 'who / which machine / which session / when' and to self-dedupe by session_id. agent_id is the only server-stamped (authoritative) attribution; session_id/host are client-supplied and informational.", "status": "pending" },
+    { "id": "AC-39.3.6", "description": "The response is a standard {data: [...], meta: {...}} envelope; meta carries the applied limit and returned count.", "status": "pending" },
+    { "id": "AC-39.3.7", "description": "Query uses AdminRepo with an EXPLICIT tenant_id filter (never relies on RLS as the isolation mechanism), consistent with Knowledge/Projects reads.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-39.3.1", "name": "returns own project's live posts newest-first", "type": "integration", "preconditions": ["tenant = fixture(:tenant); project = fixture(:project, %{tenant_id: tenant.id})", "{key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})", "three live posts t1<t2<t3"], "steps": ["GET ?project_id=#{project.id}"], "expected_results": ["data has 3, ordered t3,t2,t1"] },
+    { "id": "TC-39.3.2", "name": "expired posts excluded", "type": "integration", "preconditions": ["one expired + one live post"], "steps": ["GET the channel"], "expected_results": ["only the live post returned"] },
+    { "id": "TC-39.3.3", "name": "since returns only the delta", "type": "integration", "preconditions": ["posts at t1 and t3; since=t2"], "steps": ["GET ...&since=<t2>"], "expected_results": ["only t3"] },
+    { "id": "TC-39.3.4", "name": "cross-tenant AND nonexistent project both 200 empty (no oracle)", "type": "integration", "preconditions": ["tenant = fixture(:tenant); other = fixture(:tenant)", "a post on other's project", "{key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"], "steps": ["GET with other's project_id", "GET with a random nonexistent UUID"], "expected_results": ["both 200 with empty data, identical responses"] },
+    { "id": "TC-39.3.5", "name": "limit clamped to 100", "type": "integration", "preconditions": ["150 live posts"], "steps": ["GET ...&limit=1000"], "expected_results": ["exactly 100 returned (clamped, not a 400)"] }
+  ],
+  "technical_notes": [
+    "Context: Loopctl.Coordination.recent(tenant_id, project_id, opts) — AdminRepo query filtering tenant_id + project_id + expires_at > now(), order inserted_at desc, limit clamped to 100.",
+    "Oracle-safety: return {:ok, []} for a project the tenant doesn't own — do NOT branch to :not_found. This keeps cross-tenant existence unobservable and simplifies the consumer.",
+    "Do NOT self-dedup server-side — that is the consumer's job (US-39.6).",
+    "This GET is NOT covered by require_human_anchor_default_deny_test (it only walks POST/PUT/PATCH/DELETE) — no allowlist entry needed (correcting the earlier note).",
+    "Emit a security-event log on any internal error but never leak cross-tenant existence."
+  ],
+  "dependencies": ["US-39.1"],
+  "estimated_tokens": 180000
+}

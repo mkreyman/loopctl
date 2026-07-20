@@ -21,6 +21,10 @@ defmodule LoopctlWeb.OrchestratorStateController do
   # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
   plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:save, :show, :history]
 
+  # Orchestrator state is chain-of-custody coordination — a :kb scope can never carry it.
+  # Guards the write; :show/:history are reads (a :kb scope simply has no state to return).
+  plug LoopctlWeb.Plugs.RequireWorkProject when action in [:save]
+
   tags(["Orchestrator"])
 
   operation(:save,

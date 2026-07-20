@@ -73,6 +73,20 @@ defmodule Loopctl.RateLimiter.FailOpenLog do
     :ok
   end
 
+  @doc false
+  # Test seam: clear the throttle entry for one `(source, family)` so a test that
+  # asserts a fail-open warning IS emitted cannot be silently throttled by a
+  # concurrent async test that tripped the SAME node-local `(source, family)`
+  # window first (the ETS table is process-independent and lives for the whole
+  # run). Best-effort — a missing table is a no-op, mirroring `should_emit?/2`.
+  @spec reset(atom(), String.t()) :: :ok
+  def reset(source, family) when is_atom(source) and is_binary(family) do
+    :ets.delete(@table, {source, family})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   # Reduce a bucket to a NON-identifying family token by dropping the trailing
   # id/IP segment. Bucket shapes: "key:<uuid>", "tenant:<uuid>",
   # "api_signup:ip:1.2.3.4", "signup:webauthn:<key>", "signup:actions:<key>",

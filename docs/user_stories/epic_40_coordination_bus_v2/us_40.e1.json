@@ -1,0 +1,42 @@
+{
+  "id": "US-40.E1",
+  "title": "Graduate a channel post to Knowledge — the durable home for a reusable finding with no external tracker",
+  "epic": { "id": "epic_40", "name": "Coordination Bus v2 (re-scoped): Repo Coordination Bus" },
+  "priority": "medium",
+  "phase": "coordination_bus_v2_E",
+  "story": {
+    "as_a": "coding agent that produced a genuinely reusable finding on the channel with no external tracker to hold it",
+    "i_want_to": "graduate that post into the durable Knowledge plane",
+    "so_that": "a reusable lesson survives the channel's 30-day expiry — while a transient directive is left to expire, not force-graduated"
+  },
+  "rationale": "Refocus of the old US-40.1. The panel narrowed it: graduate-to-Knowledge is NOT the general handoff-durability answer (a single-use handoff payload pollutes the wiki; the novelty gate rejects most, and handoff durability = an external artifact + pointer per invariant 1). It IS the right durable home for a CONTENT-APPROPRIATE case: a reusable finding with no external tracker. So this story is content-selective — a transient 'run this SQL' directive stays transient; a reusable finding graduates. It reuses Knowledge's existing guardrails (novelty gate + a separate secret scan), never a bypass, because it is the ONE path that moves channel content into the durable plane.",
+  "background": {
+    "reference": "panel 'US-40.1 graduate-to-Knowledge as the handoff durability answer -- WRONG' (keep it for genuine reusable lessons, NOT every handoff); re-scope invariant 1 + Group E (40.E1); Knowledge.propose_article/3 (knowledge.ex:423) vs create_article/3 (knowledge.ex:293); SecretDenylist (secret_denylist.ex); Coordination.get_post/2 (added by 40.D1).",
+    "includes": "An agent-triggered one-call promotion from a channel post to a Knowledge article, through the SAME novelty + secret gates as knowledge_create, content-selective and rate-bounded. Refocuses docs/user_stories/epic_40_coordination_bus_v2/us_40.1.json."
+  },
+  "acceptance_criteria": [
+    { "id": "AC-40.E1.1", "description": "POST /api/v1/channel/posts/:id/graduate (agent role) fetches the post tenant-scoped via Coordination.get_post/2 (the public path added by 40.D1) and creates a Knowledge article from it (title required, body from the post body, project_id carried over, tags). The source post is then kept (the sweep reclaims it in 30d) or deleted via the author-only redact (40.D2) — it is NOT marked 'graduated' (no such column exists on channel_posts).", "status": "pending" },
+    { "id": "AC-40.E1.2", "description": "Graduation goes through the SEMANTIC NOVELTY gate via Loopctl.Knowledge.propose_article/3 (knowledge.ex:423), NOT create_article/3 (knowledge.ex:293): a near-duplicate returns {verdict: :duplicate, article: existing, created: false} and creates nothing (so a single-use/duplicate finding does NOT pollute the wiki — the panel's core objection). Because neither propose_article nor create_article runs a secret scan, the shared SecretDenylist (secret_denylist.ex) is ALSO run over the post body as an explicit step BEFORE propose_article — a secret cannot be smuggled into the durable plane via this path. Project/tenant ownership is enforced (and, per 40.D3, project membership).", "status": "pending" },
+    { "id": "AC-40.E1.3", "description": "The resulting article carries provenance attributable to the channel origin: a source_type + a source reference to the originating post/agent, attributed to the graduating agent. NOTE: article validate_source_type (article.ex:468-482) restricts source_type to @known_source_types (article.ex:38: review_finding manual agent session_log newsletter skill web_article ingestion) — 'channel_graduation' is NOT in that list and would be REJECTED. Resolve by either (a) adding 'channel_graduation' to @known_source_types (article.ex:38), or (b) reusing source_type 'agent' with a source_id/reference naming the post. Pick one and state it; do NOT set an unknown source_type that fails validation.", "status": "pending" },
+    { "id": "AC-40.E1.4", "description": "CONTENT-SELECTIVE, not graduate-every-handoff: the tool/docs make explicit this is for a REUSABLE finding, not routine handoffs. There is NO automatic graduation of handoffs; graduation is an explicit, deliberate agent call. Rate-bounded by the existing limiter (per-api_key + per-tenant buckets — no per-agent bucket) so it cannot bulk-flood Knowledge from the channel.", "status": "pending" },
+    { "id": "AC-40.E1.5", "description": "A channel_graduate(post_id, title, tags?) MCP tool is added (agent key) and shipped in the mcp-server publish, with a description stating it is for reusable findings (transient directives should be left to expire).", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-40.E1.1", "name": "graduate a reusable finding creates an attributed article", "type": "integration", "preconditions": ["tenant = fixture(:tenant); project = fixture(:project, %{tenant_id: tenant.id}); {key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent}); a channel post exists"], "steps": ["POST /channel/posts/#{post.id}/graduate with a title"], "expected_results": ["a knowledge article created with the post body + project_id; provenance references the post/agent; valid source_type (passes validate_source_type)"] },
+    { "id": "TC-40.E1.2", "name": "near-duplicate graduation dedups (no wiki pollution)", "type": "integration", "preconditions": ["an existing article near-identical to the post"], "steps": ["graduate the post"], "expected_results": ["{verdict: :duplicate}; returns the existing article id; no duplicate created"] },
+    { "id": "TC-40.E1.3", "name": "secret in the post body blocks graduation", "type": "integration", "preconditions": ["a post whose body contains a token-shaped string"], "steps": ["graduate it"], "expected_results": ["422 denylist; nothing lands in Knowledge"] },
+    { "id": "TC-40.E1.4", "name": "cross-tenant post cannot be graduated", "type": "integration", "preconditions": ["a post in another tenant"], "steps": ["graduate its id"], "expected_results": ["404; no article created (Coordination.get_post/2 tenant-scoped, no oracle)"] },
+    { "id": "TC-40.E1.5", "name": "unknown source_type does not slip through", "type": "unit", "preconditions": ["the chosen source_type"], "steps": ["build the article changeset"], "expected_results": ["source_type is in @known_source_types (article.ex:38) — no validate_source_type error"] }
+  ],
+  "technical_notes": [
+    "Graduate via Loopctl.Knowledge.propose_article/3 (knowledge.ex:423) — it wraps create_article with the novelty gate and returns {:ok, %{verdict: :duplicate, article, created: false}} on a near-dup. create_article/3 (knowledge.ex:293) does exact-idempotency dedup + ownership + length caps but NOT the novelty gate and NO secret scan.",
+    "Run SecretDenylist (secret_denylist.ex, contains_secret?/1) over the post body as an explicit step BEFORE propose_article — the create path won't.",
+    "Reuse Coordination.get_post/2 (public, tenant-scoped, UUID-guarded) added by 40.D1 — do NOT add a second by-id fetch (the old US-40.1 added its own get_post; now 40.D1 owns it). This is why E1 depends on D1.",
+    "source_type: RESOLVE the validate_source_type constraint (article.ex:468-482, @known_source_types :38). Recommend adding 'channel_graduation' to @known_source_types (one-line, explicit provenance) OR reuse 'agent' + source_id = the post id. The old US-40.1 said set source_type 'channel_graduation' — that would FAIL validation as written; this AC fixes that.",
+    "Post-graduation fate: keep (sweep reclaims in 30d) OR author-only delete via 40.D2 — NOT a 'graduated' flag (no column).",
+    "MCP: add channel_graduate alongside the other channel tools (mcp-server/index.js).",
+    "This REFOCUSES us_40.1.json (delete it — this file replaces it). Sequencing: step 10 (with the /handoff skill, which is a claude-config companion tracked separately)."
+  ],
+  "dependencies": ["US-40.D1", "US-40.D3"],
+  "estimated_tokens": 200000
+}

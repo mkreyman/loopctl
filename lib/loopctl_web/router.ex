@@ -123,6 +123,62 @@ defmodule LoopctlWeb.Router do
 
     get "/routes", RouteDiscoveryController, :index
 
+    # Repo Coordination Bus (Epic 39) — the third memory plane. Agent-role write
+    # to a project's transient coordination channel. NOT human-anchor gated
+    # (coordination surface, owner decision #331). Per-key/per-tenant rate
+    # limiting comes from the :authenticated pipeline RateLimiter; the controller
+    # adds a tighter, config-driven per-write cap.
+    post "/channel/posts", ChannelPostController, :create
+    # channel_recent read (US-39.3): agent-role, tenant-scoped, oracle-safe read
+    # of a project's live channel. project_id/since/limit query params; the tenant
+    # is key-derived, never from params.
+    get "/channel/posts", ChannelPostController, :index
+    # channel post full-body read (US-40.D1): agent-role, tenant-scoped, oracle-safe
+    # fetch of ONE post's FULL body — the explicit companion to the bounded-preview
+    # list read above. Declared AFTER `get "/channel/posts"` so the static list path
+    # is matched first and the `:id` route never shadows it. A foreign/nonexistent/
+    # malformed id is a byte-identical 404 (no cross-tenant existence oracle).
+    get "/channel/posts/:id", ChannelPostController, :show
+    # channel post redact/delete (US-39.7): agent-role, tenant-scoped HARD delete
+    # of a leaked/regretted post before its 30-day TTL. Author-only (or elevated
+    # role >= :user), US-40.D2 — the redact path is for self-leak-pullback, not
+    # fleet-wide cleanup; the elevated bypass is checked inside the action against
+    # the verified key. A non-author agent — like a foreign/nonexistent id — is a
+    # byte-identical 404 (no existence oracle). Audited in-transaction. NOT
+    # human-anchor gated.
+    delete "/channel/posts/:id", ChannelPostController, :delete
+
+    # Directed-handoff discovery read (Epic 40, US-40.C1): agent-role,
+    # tenant-scoped, oracle-safe read of DIRECTED, OPEN, UNCLAIMED handoffs for the
+    # caller's host/capabilities. A SEPARATE, pinned set — NOT the newest-N
+    # recency preview — so a directed handoff is always visible even on a busy
+    # channel. STATIC path under a DISTINCT prefix (`/channel/handoffs`, not
+    # `/channel/posts/...`), so the `:id` post route never shadows it. project_id +
+    # optional host/capabilities query params; the tenant is key-derived, never
+    # from params.
+    get "/channel/handoffs", ChannelPostController, :handoffs
+
+    # Graduate a coordination post into the durable Knowledge wiki (Epic 40,
+    # US-40.E1) — the CONTENT-SELECTIVE promotion of a genuinely reusable finding
+    # with no external tracker (a transient directive is left to expire). Agent
+    # role, project-scoped by membership (US-40.D3), NOT human-anchor gated
+    # (coordination surface, owner decision #331). Goes through Knowledge's
+    # semantic novelty gate + an explicit secret scan — never a bypass. The static
+    # `/graduate` suffix does NOT shadow `get "/channel/posts/:id"`.
+    post "/channel/posts/:id/graduate", ChannelPostController, :graduate
+
+    # Repo Coordination Bus CLAIM surface (Epic 40, US-40.B1) — exactly-once handoff
+    # claims. INSERT-to-claim: the first inserter on (tenant_id, project_id, ref)
+    # wins; a loser gets a distinct 409 already_claimed. Agent-role, project-scoped
+    # by membership (US-40.D3), NOT human-anchor gated (coordination surface, owner
+    # decision #331). `ref` is carried in the BODY (a free string like
+    # "handoff:repo#812"), never the path, so done/release are POSTs too. The static
+    # /release and /done paths are declared BEFORE the bare create path is irrelevant
+    # (all three are distinct literal paths — no :id capture to shadow).
+    post "/channel/claims", ChannelClaimController, :create
+    post "/channel/claims/done", ChannelClaimController, :done
+    post "/channel/claims/release", ChannelClaimController, :release
+
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
 
@@ -218,6 +274,16 @@ defmodule LoopctlWeb.Router do
     get "/agents/:id", AgentController, :show
 
     # Project management
+    # Cheap repo -> project_id resolution (Gap 1 of #411). Must precede the
+    # resources block so /projects/resolve is not captured by GET /projects/:id.
+    get "/projects/resolve", ProjectController, :resolve
+    # KB-only project scope: agent-createable (agent+ role, no human-anchor gate), forces
+    # kind: :kb. Separate route so the human-anchored `POST /projects` stays untouched.
+    post "/kb-scopes", ProjectController, :create_kb_scope
+    # Archive (reversible soft-delete) an agent-owned :kb scope to reclaim its budget slot;
+    # restore re-activates it (re-consumes a slot). Both agent-managed, no custody surface.
+    delete "/kb-scopes/:id", ProjectController, :archive_kb_scope
+    post "/kb-scopes/:id/restore", ProjectController, :restore_kb_scope
     resources "/projects", ProjectController, only: [:create, :index, :show, :update, :delete]
     get "/projects/:id/progress", ProjectController, :progress
 
@@ -298,6 +364,10 @@ defmodule LoopctlWeb.Router do
     get "/cost-anomalies", CostAnomalyController, :index
     patch "/cost-anomalies/:id", CostAnomalyController, :update
 
+    # Ingestion capture-silence anomalies (dead-man's-switch for knowledge capture)
+    get "/ingestion-anomalies", IngestionAnomalyController, :index
+    patch "/ingestion-anomalies/:id", IngestionAnomalyController, :update
+
     # Token analytics (Epic 21)
     get "/analytics/agents", AnalyticsController, :agents
     get "/analytics/epics", AnalyticsController, :epics
@@ -318,9 +388,18 @@ defmodule LoopctlWeb.Router do
     # Literal /memory/promote must precede the parameterized delete so it is not
     # captured as an :id (US-29.3).
     post "/memory/promote", MemoryController, :promote
+    # Literal /memory/graduate (#411 Gap 3 surface) — explicit per-memory graduation
+    # into a durable knowledge article. Like /memory/promote it MUST precede the
+    # parameterized delete below so it is not captured as an :id.
+    post "/memory/graduate", MemoryController, :graduate
     post "/memory", MemoryController, :create
     get "/memory", MemoryController, :index
     delete "/memory/:id", MemoryController, :delete
+
+    # Merged recall (Epic 28 / #411 Gap 2) — ONE round-trip returning the re-ranked
+    # `global ∪ active-project` union of long-term memory AND knowledge. Reuses the
+    # MemoryController scope-from-key + project-partition helpers.
+    post "/recall", MemoryController, :context
 
     # Context Retriever (Epic 30, US-30.4) — entity-definition CRUD + the
     # model-invoked query surface. Literal /retrieve/tools MUST precede the

@@ -4,6 +4,7 @@ defmodule LoopctlWeb.Plugs.RateLimiterTest do
   setup :verify_on_exit!
 
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.RateLimiter.FailOpenLog
   alias LoopctlWeb.Plugs.RateLimiter
 
   defp auth_conn(conn, raw_key) do
@@ -133,6 +134,15 @@ defmodule LoopctlWeb.Plugs.RateLimiterTest do
 
       tenant = fixture(:tenant)
       {raw_key, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      # The fail-open warning is throttled per `(source, family)` in a shared,
+      # node-local ETS window that lives for the whole run. A concurrent async
+      # test whose pipeline plug tripped a `(:plug, "key")`/`(:plug, "tenant")`
+      # fail-open within the last 60s would otherwise suppress THIS test's warning
+      # and make the log assertion flaky. Clear our two families so the emission
+      # is deterministic (the plug checks the key bucket, then the tenant bucket).
+      FailOpenLog.reset(:plug, "key")
+      FailOpenLog.reset(:plug, "tenant")
 
       log =
         capture_log(fn ->

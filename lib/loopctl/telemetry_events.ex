@@ -245,6 +245,67 @@ defmodule Loopctl.TelemetryEvents do
   """
   def article_linking_corpus_size, do: [:loopctl, :knowledge, :article_linking, :corpus_size]
 
+  @doc """
+  One HALF of the merged recall (`POST /api/v1/recall`, `Loopctl.Memory.recall_context/2`,
+  #411 Gap 2) degraded to an EMPTY, non-fatal envelope so the OTHER half could still be
+  served — turning an otherwise silent partial failure into an alertable signal (the
+  merged `meta` only carries a coarse `degraded?`/`degraded_reason`, no per-side detail).
+
+  Fires when either half of the merged recall degrades:
+
+    * the KNOWLEDGE half: `search_combined/3` returned an `{:error, _}` (e.g. an
+      invalid-weights or bad-request rejection) instead of a keyword-only fallback, so
+      the knowledge side is empty by FAULT (not by scope), and
+    * the MEMORY half: the per-tenant HeavyRead cap SHED the memory read (`{:error,
+      :heavy_read_overloaded}`); on the merged path this degrades to an empty memory
+      envelope (`on_overload: :tag`) rather than raising a 429 that would sink the whole
+      endpoint.
+
+  A keyword-only knowledge fallback (embedding unavailable / a memory ILIKE embedding
+  fallback) already emits `knowledge_semantic_fallback/0` and is NOT re-emitted here —
+  this event is specifically the empty-by-fault degradations that carried no signal.
+
+  ## Payload (id/atom only — NEVER the raw query text, an api key, or a provider body)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{tenant_id, side, reason}` where `side` is `"memory"` | `"knowledge"`
+      (a BOUNDED 2-value tag) and `reason` is a BOUNDED, sanitized tag
+      (`"heavy_read_overloaded"` | `"empty_query"` | `"invalid_weights"` |
+      `"bad_request"` | `"knowledge_error"`).
+  """
+  def recall_context_degraded, do: [:loopctl, :memory, :recall_context, :degraded]
+
+  @doc """
+  A KB article WRITE OUTCOME was rendered (PR B2). Emitted from EVERY outcome path of
+  `LoopctlWeb.ArticleController.create` — both the create-path renderers (created,
+  deduplicated, gated_to_draft, title_conflict, validation_error) AND the upfront
+  rejection paths that return before a create is attempted (system-scope 403 and
+  agent-identity-required 403 counted as `:forbidden` — excluded from the
+  high_reject_rate detector; malformed project_id 422 as `:validation_error`) — so
+  write outcomes are observable even when NOTHING is
+  persisted (a rejected write leaves no article row). Folded into the durable
+  `ingestion_write_stats` per-(tenant, source_type, day) rollup by the self-rescuing
+  `Loopctl.Telemetry.IngestionWriteStats` handler, which
+  `Loopctl.Knowledge.IngestionHealth` reads to flag a `:high_reject_rate` anomaly —
+  the no-persist sibling of the capture-silence dead-man's-switch.
+
+  ## Payload (id/atom only — never article content)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{tenant_id, source_type, outcome}` where `source_type` is the
+      article's advisory source_type NORMALIZED against `Article.known_source_types/0`
+      (any non-allowlisted value — including all rejected-write garbage — folds to
+      `nil`, i.e. the unstamped bucket, so rollup cardinality stays bounded), and
+      `outcome` is a BOUNDED atom: `:created` (novel/forced create), `:deduplicated`
+      (200 idempotent/near-dup dedup), `:gated_to_draft` (novelty gate staged a
+      draft), `:title_conflict` (409 title taken), `:validation_error`
+      (changeset/other 4xx, including the upfront malformed-param 422), or `:forbidden`
+      (upfront 403 authz rejection — wrong scope/role or missing agent identity;
+      tracked separately and EXCLUDED from the high_reject_rate detector so authz
+      misuse is not paged as an ingestion outage).
+  """
+  def article_write, do: [:loopctl, :knowledge, :article_write]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -262,7 +323,9 @@ defmodule Loopctl.TelemetryEvents do
       knowledge_hybrid_provenance(),
       llm_provider_error(),
       ingestion_backlog_gate_failed_open(),
-      article_linking_corpus_size()
+      article_linking_corpus_size(),
+      recall_context_degraded(),
+      article_write()
     ]
   end
 end

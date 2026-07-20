@@ -200,6 +200,24 @@ config :loopctl, LoopctlWeb.Endpoint,
 # Print only warnings and errors during test
 config :logger, level: :warning
 
+# Narrow capture-silence monitoring to `session_log` in tests so specs can assert
+# that OTHER source_types are not flagged (the prod default is `:all`). The `:all`
+# behavior is covered by passing explicit config to `IngestionHealth.detect/1`.
+config :loopctl, :ingestion_health,
+  monitored_source_types: ["session_log"],
+  established_threshold: 5,
+  staleness_threshold_hours: 72,
+  establishment_window_hours: 720,
+  # PR B2 reject-rate detector pins (deterministic thresholds for specs).
+  reject_rate_threshold: 0.5,
+  min_attempts: 10,
+  reject_window_days: 7
+
+# Run the write-outcome rollup upsert INLINE in test (prod dispatches it to a
+# supervised task): inline shares the emitting test process's sandboxed connection, so
+# the rollup row is readable back synchronously in specs.
+config :loopctl, Loopctl.Telemetry.IngestionWriteStats, async: false
+
 # Use simple formatter in test (override JSON default from config.exs).
 # The template prints only level + message (custom metadata is asserted via the
 # message string in tests), but declare `metadata: :all` so Credo's
@@ -516,6 +534,10 @@ config :loopctl, :cli_req_plug, {Req.Test, Loopctl.CLI.Client}
 # Knowledge analytics: record access events synchronously in tests so the
 # inserts run inside the test process and share its sandbox connection.
 config :loopctl, :analytics_recording_mode, :sync
+
+# #411 Gap 3: bump memory recall_count synchronously in tests so the UPDATE runs
+# inside the test process and shares its sandbox connection (a spawned task would not).
+config :loopctl, :memory_recall_bump_mode, :sync
 
 # RLS: Switch to non-superuser role within transactions so RLS is enforced
 # The loopctl_app role must exist and have access to all tables.

@@ -86,6 +86,471 @@ describe("#247 mcp-01: list_projects pagination (real projectsPath)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #411 gap1: resolve_project (cheap repo -> project_id resolution)
+// ---------------------------------------------------------------------------
+
+describe("#411 gap1: resolve_project wiring", () => {
+  test("TOOLS declares a resolve_project tool", () => {
+    assert.match(INDEX_SRC, /name: "resolve_project",/, 'must declare a "resolve_project" tool');
+  });
+
+  test("resolveProject GETs /projects/resolve with slug/repo_url/name on the agent key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function resolveProject\(\{ slug, repo_url, name \} = \{\}\) \{[\s\S]*?\/api\/v1\/projects\/resolve\?\$\{params\}[\s\S]*?LOOPCTL_AGENT_KEY/,
+      "resolveProject must GET /api/v1/projects/resolve with a query string on the agent key",
+    );
+    assert.match(INDEX_SRC, /if \(slug\) params\.set\("slug", slug\);/);
+    assert.match(INDEX_SRC, /if \(repo_url\) params\.set\("repo_url", repo_url\);/);
+    assert.match(INDEX_SRC, /if \(name\) params\.set\("name", name\);/);
+  });
+
+  test("the resolve_project dispatch case calls resolveProject(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "resolve_project":\s*\n\s*return await resolveProject\(args\);/,
+      "the resolve_project dispatch case must call resolveProject(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #418: create_kb_scope (KB-only project scope, agent-createable)
+// ---------------------------------------------------------------------------
+
+describe("#418: create_kb_scope wiring", () => {
+  test("TOOLS declares a create_kb_scope tool", () => {
+    assert.match(INDEX_SRC, /name: "create_kb_scope",/, 'must declare a "create_kb_scope" tool');
+  });
+
+  test("createKbScope POSTs /kb-scopes on the AGENT key (not the orch key)", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function createKbScope\([\s\S]*?"POST",\s*"\/api\/v1\/kb-scopes",\s*body,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "createKbScope must POST /api/v1/kb-scopes with the agent key",
+    );
+  });
+
+  test("the create_kb_scope dispatch case calls createKbScope(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "create_kb_scope":\s*\n\s*return await createKbScope\(args\);/,
+      "the create_kb_scope dispatch case must call createKbScope(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #39.4: channel_post / channel_recent (Repo Coordination Bus proxy tools)
+// ---------------------------------------------------------------------------
+
+describe("#39.4: channel_post / channel_recent wiring", () => {
+  test("TOOLS declares channel_post and channel_recent", () => {
+    assert.match(INDEX_SRC, /name: "channel_post",/, 'must declare a "channel_post" tool');
+    assert.match(INDEX_SRC, /name: "channel_recent",/, 'must declare a "channel_recent" tool');
+  });
+
+  test("channelPost POSTs /channel/posts on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/posts",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelPost must POST /api/v1/channel/posts with the agent key",
+    );
+  });
+
+  test("channelPost auto-fills host from os.hostname()", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?payload\.host = os\.hostname\(\)/,
+      "channelPost must set host from os.hostname()",
+    );
+  });
+
+  test("channelPost auto-fills session_id from CLAUDE_SESSION_ID when set", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?if \(process\.env\.CLAUDE_SESSION_ID\) payload\.session_id = process\.env\.CLAUDE_SESSION_ID/,
+      "channelPost must fill session_id from CLAUDE_SESSION_ID only when set",
+    );
+  });
+
+  test("channelPost forwards advisory to_host/to_capability only when set (US-40.A5)", () => {
+    // to_host/to_capability are caller args (unlike auto-filled host/session_id),
+    // conditionally added to the payload so an unset addressing field is omitted
+    // rather than sent as undefined. AC-40.A5.4 requires them settable via MCP.
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?if \(to_host\) payload\.to_host = to_host;/,
+      "channelPost must forward to_host only when set",
+    );
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\([\s\S]*?if \(to_capability\) payload\.to_capability = to_capability;/,
+      "channelPost must forward to_capability only when set",
+    );
+    assert.match(
+      INDEX_SRC,
+      /async function channelPost\(\{[^}]*\bto_host\b[^}]*\bto_capability\b[^}]*\}\)/,
+      "channelPost must destructure to_host and to_capability from its args",
+    );
+  });
+
+  test("channelRecent GETs /channel/posts on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelRecent\([\s\S]*?"GET",\s*`\/api\/v1\/channel\/posts\?\$\{params\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelRecent must GET /api/v1/channel/posts with a query string on the agent key",
+    );
+  });
+
+  test("the channel_post `key` property documents its active-session dependency", () => {
+    // A keyed upsert is keyed on the auto-filled session_id (from CLAUDE_SESSION_ID),
+    // which the server makes REQUIRED for keyed posts. Outside a Claude Code session
+    // that env var is absent and the post 422s — the description must warn about it.
+    assert.match(
+      INDEX_SRC,
+      /Optional per-session working-state slot key[\s\S]*?Requires an active Claude Code session[\s\S]*?422/,
+      "the channel_post `key` description must document that keyed posts require an active session (422 otherwise)",
+    );
+  });
+
+  test("the channel_post dispatch case calls channelPost(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_post":\s*\n\s*return await channelPost\(args\);/,
+      "the channel_post dispatch case must call channelPost(args)",
+    );
+  });
+
+  test("the channel_recent dispatch case calls channelRecent(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_recent":\s*\n\s*return await channelRecent\(args\);/,
+      "the channel_recent dispatch case must call channelRecent(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// US-40.B1: channel_claim / channel_release / channel_done (exactly-once handoff)
+// ---------------------------------------------------------------------------
+
+describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () => {
+  test("TOOLS declares channel_claim, channel_release, channel_done", () => {
+    assert.match(INDEX_SRC, /name: "channel_claim",/, 'must declare a "channel_claim" tool');
+    assert.match(INDEX_SRC, /name: "channel_release",/, 'must declare a "channel_release" tool');
+    assert.match(INDEX_SRC, /name: "channel_done",/, 'must declare a "channel_done" tool');
+  });
+
+  test("channel_claim description maps 409 already_claimed to an honest 'ref is taken' message", () => {
+    assert.match(
+      INDEX_SRC,
+      /409 already_claimed[\s\S]*?either another agent owns it, or you already completed it/,
+      "channel_claim must honestly tell a loser the ref is taken — either another agent owns it or you already completed it (move on)",
+    );
+  });
+
+  test("channelClaim POSTs /channel/claims on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelClaim\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelClaim must POST /api/v1/channel/claims with the agent key",
+    );
+  });
+
+  test("channelRelease POSTs /channel/claims/release on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelRelease\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims\/release",[\s\S]*?process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelRelease must POST /api/v1/channel/claims/release with the agent key",
+    );
+  });
+
+  test("channelDone POSTs /channel/claims/done on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelDone\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/claims\/done",[\s\S]*?process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelDone must POST /api/v1/channel/claims/done with the agent key",
+    );
+  });
+
+  test("the claim dispatch cases call the right functions", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_claim":\s*\n\s*return await channelClaim\(args\);/,
+      "the channel_claim dispatch case must call channelClaim(args)",
+    );
+    assert.match(
+      INDEX_SRC,
+      /case "channel_release":\s*\n\s*return await channelRelease\(args\);/,
+      "the channel_release dispatch case must call channelRelease(args)",
+    );
+    assert.match(
+      INDEX_SRC,
+      /case "channel_done":\s*\n\s*return await channelDone\(args\);/,
+      "the channel_done dispatch case must call channelDone(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #39.7: channel_delete (Repo Coordination Bus redact path)
+// ---------------------------------------------------------------------------
+
+describe("#39.7: channel_delete wiring", () => {
+  test("TOOLS declares channel_delete", () => {
+    assert.match(INDEX_SRC, /name: "channel_delete",/, 'must declare a "channel_delete" tool');
+  });
+
+  test("channelDelete DELETEs /channel/posts/${post_id} on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelDelete\([\s\S]*?"DELETE",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelDelete must DELETE /api/v1/channel/posts/${post_id} with the agent key",
+    );
+  });
+
+  test("the channel_delete tool requires post_id", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_delete",[\s\S]*?required: \["post_id"\]/,
+      "the channel_delete inputSchema must require post_id",
+    );
+  });
+
+  test("the channel_delete dispatch case calls channelDelete(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_delete":\s*\n\s*return await channelDelete\(args\);/,
+      "the channel_delete dispatch case must call channelDelete(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #40.D1: channel_get (full-body read) + untrusted-DATA framing (TC-40.D1.5)
+// ---------------------------------------------------------------------------
+
+describe("#40.D1: channel_get wiring + untrusted-DATA framing", () => {
+  test("TOOLS declares channel_get requiring post_id", () => {
+    assert.match(INDEX_SRC, /name: "channel_get",/, 'must declare a "channel_get" tool');
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_get",[\s\S]*?required: \["post_id"\]/,
+      "the channel_get inputSchema must require post_id",
+    );
+  });
+
+  test("channelGet GETs /channel/posts/${post_id} on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelGet\([\s\S]*?"GET",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelGet must GET /api/v1/channel/posts/${post_id} with the agent key",
+    );
+  });
+
+  test("the channel_get dispatch case calls channelGet(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_get":\s*\n\s*return await channelGet\(args\);/,
+      "the channel_get dispatch case must call channelGet(args)",
+    );
+  });
+
+  test("channel_get frames the returned body as UNTRUSTED DATA (AC-40.D1.4)", () => {
+    const getTool = /name: "channel_get",\s*\n\s*description:\s*\n?\s*"([^"]*)"/.exec(INDEX_SRC);
+    assert.ok(getTool, "channel_get must have a description");
+    assert.match(getTool[1], /UNTRUSTED DATA/, "channel_get body must be framed as UNTRUSTED DATA");
+    assert.match(getTool[1], /NO auto-follow/i, "channel_get must state there is no auto-follow");
+  });
+
+  test("channel_recent frames returned bodies as UNTRUSTED DATA + bounded previews (AC-40.D1.2)", () => {
+    const recentTool = /name: "channel_recent",\s*\n\s*description:\s*\n?\s*"([^"]*)"/.exec(
+      INDEX_SRC,
+    );
+    assert.ok(recentTool, "channel_recent must have a description");
+    assert.match(
+      recentTool[1],
+      /UNTRUSTED DATA/,
+      "channel_recent bodies must be framed as UNTRUSTED DATA",
+    );
+    assert.match(
+      recentTool[1],
+      /body_preview/,
+      "channel_recent must document the bounded body_preview",
+    );
+  });
+
+  test("no fetch-and-follow / auto-follow tool exists (AC-40.D1.2/3)", () => {
+    // The security posture forbids any tool that fetches a post AND acts on it.
+    assert.doesNotMatch(
+      INDEX_SRC,
+      /name: "channel_[a-z_]*follow[a-z_]*"/,
+      "there must be no channel_*follow* fetch-and-follow tool",
+    );
+    // No tool description should instruct the agent to FOLLOW a fetched body.
+    assert.doesNotMatch(
+      INDEX_SRC,
+      /fetch [^"]*and follow/i,
+      "no tool may offer a fetch-and-follow affordance",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #40.E1: channel_graduate (graduate a coordination post into Knowledge)
+// ---------------------------------------------------------------------------
+
+describe("#40.E1: channel_graduate wiring", () => {
+  test("TOOLS declares channel_graduate requiring post_id and title", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_graduate",/,
+      'must declare a "channel_graduate" tool',
+    );
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_graduate",[\s\S]*?required: \["post_id", "title"\]/,
+      "the channel_graduate inputSchema must require post_id and title",
+    );
+  });
+
+  test("channelGraduate POSTs /channel/posts/${post_id}/graduate on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelGraduate\([\s\S]*?"POST",\s*`\/api\/v1\/channel\/posts\/\$\{post_id\}\/graduate`,\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelGraduate must POST /api/v1/channel/posts/${post_id}/graduate with the agent key",
+    );
+  });
+
+  test("the channel_graduate dispatch case calls channelGraduate(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_graduate":\s*\n\s*return await channelGraduate\(args\);/,
+      "the channel_graduate dispatch case must call channelGraduate(args)",
+    );
+  });
+
+  test("channel_graduate description states it is CONTENT-SELECTIVE and transient posts should expire (AC-40.E1.4/5)", () => {
+    const gradTool = /name: "channel_graduate",\s*\n\s*description:\s*\n?\s*"([^"]*)"/.exec(
+      INDEX_SRC,
+    );
+    assert.ok(gradTool, "channel_graduate must have a description");
+    assert.match(
+      gradTool[1],
+      /REUSABLE/,
+      "channel_graduate must state it is for a reusable finding",
+    );
+    assert.match(
+      gradTool[1],
+      /LEFT TO EXPIRE|left to expire/,
+      "channel_graduate must say transient directives should be left to expire",
+    );
+  });
+});
+
+describe("KB-scope lifecycle: archive_kb_scope / restore_kb_scope wiring", () => {
+  test("TOOLS declares archive_kb_scope and restore_kb_scope", () => {
+    assert.match(INDEX_SRC, /name: "archive_kb_scope",/, 'must declare "archive_kb_scope"');
+    assert.match(INDEX_SRC, /name: "restore_kb_scope",/, 'must declare "restore_kb_scope"');
+  });
+
+  test("archiveKbScope DELETEs /kb-scopes/:id on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function archiveKbScope\(\{ project_id \}\)[\s\S]*?"DELETE",\s*`\/api\/v1\/kb-scopes\/\$\{project_id\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "archiveKbScope must DELETE /api/v1/kb-scopes/:id on the agent key",
+    );
+  });
+
+  test("restoreKbScope POSTs /kb-scopes/:id/restore on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function restoreKbScope\(\{ project_id \}\)[\s\S]*?"POST",\s*`\/api\/v1\/kb-scopes\/\$\{project_id\}\/restore`,[\s\S]*?process\.env\.LOOPCTL_AGENT_KEY/,
+      "restoreKbScope must POST /api/v1/kb-scopes/:id/restore on the agent key",
+    );
+  });
+
+  test("dispatch cases call archiveKbScope/restoreKbScope", () => {
+    assert.match(INDEX_SRC, /case "archive_kb_scope":\s*\n\s*return await archiveKbScope\(args\);/);
+    assert.match(INDEX_SRC, /case "restore_kb_scope":\s*\n\s*return await restoreKbScope\(args\);/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #411 gap2 (PR B): recall_context (merged memory ∪ knowledge, one round-trip)
+// ---------------------------------------------------------------------------
+
+describe("#411 gap2: recall_context wiring", () => {
+  test("TOOLS declares a recall_context tool requiring query", () => {
+    assert.match(INDEX_SRC, /name: "recall_context",/, 'must declare a "recall_context" tool');
+    assert.match(
+      INDEX_SRC,
+      /name: "recall_context",[\s\S]*?required: \["query"\],/,
+      "the recall_context tool must require query",
+    );
+  });
+
+  test("recallContext POSTs /api/v1/recall with query/project_id/limit on the agent key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function recallContext\(\{ query, project_id, limit \}\) \{[\s\S]*?"POST",\s*\n\s*"\/api\/v1\/recall",[\s\S]*?LOOPCTL_AGENT_KEY/,
+      "recallContext must POST /api/v1/recall on the agent key",
+    );
+    assert.match(INDEX_SRC, /const payload = \{ query \};\s*\n\s*if \(project_id\) payload\.project_id = project_id;/);
+    assert.match(INDEX_SRC, /if \(limit != null\) payload\.limit = limit;/);
+  });
+
+  test("the recall_context dispatch case calls recallContext(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "recall_context":\s*\n\s*return await recallContext\(args\);/,
+      "the recall_context dispatch case must call recallContext(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #411 gap3 (docs+MCP surface): memory_graduate (explicit memory→knowledge)
+// ---------------------------------------------------------------------------
+
+describe("#411 gap3: memory_graduate wiring", () => {
+  test("TOOLS declares a memory_graduate tool requiring memory_id", () => {
+    assert.match(INDEX_SRC, /name: "memory_graduate",/, 'must declare a "memory_graduate" tool');
+    assert.match(
+      INDEX_SRC,
+      /name: "memory_graduate",[\s\S]*?required: \["memory_id"\],/,
+      "the memory_graduate tool must require memory_id",
+    );
+  });
+
+  test("memory_graduate declares a re_scope enum of inherit|global", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "memory_graduate",[\s\S]*?re_scope: \{[\s\S]*?enum: \["inherit", "global"\],/,
+      "the memory_graduate re_scope arg must be an enum of inherit|global",
+    );
+  });
+
+  test("memoryGraduate POSTs /api/v1/memory/graduate with memory_id/re_scope on the agent key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function memoryGraduate\(\{ memory_id, re_scope \}\) \{[\s\S]*?"POST",\s*\n\s*"\/api\/v1\/memory\/graduate",[\s\S]*?LOOPCTL_AGENT_KEY/,
+      "memoryGraduate must POST /api/v1/memory/graduate on the agent key",
+    );
+    assert.match(INDEX_SRC, /const payload = \{ memory_id \};\s*\n\s*if \(re_scope\) payload\.re_scope = re_scope;/);
+  });
+
+  test("the memory_graduate dispatch case calls memoryGraduate(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "memory_graduate":\s*\n\s*return await memoryGraduate\(args\);/,
+      "the memory_graduate dispatch case must call memoryGraduate(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #248 (mcp-02): knowledge_ingestion_jobs forwards limit/offset/since_days
 // ---------------------------------------------------------------------------
 

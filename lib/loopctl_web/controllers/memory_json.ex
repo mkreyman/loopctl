@@ -17,9 +17,28 @@ defmodule LoopctlWeb.MemoryJSON do
 
   alias Loopctl.Memory.Memory
   alias Loopctl.Memory.SessionMemory
+  alias LoopctlWeb.ArticleJSON
 
   @doc "Renders a single (newly written) memory."
   def show(%{memory: memory}), do: %{data: memory_data(memory)}
+
+  @doc """
+  Renders a graduation result (#411 Gap 3): the novelty-gate `verdict` plus a summary
+  of the resulting knowledge `article`. `created` is true only when a NEW article was
+  materialized (`:created` → published, `:gated_to_draft` → review draft); it is false
+  for `:duplicate`/`:deduplicated` (the canonical EXISTING article, nothing created).
+  The article body is intentionally omitted — the body-less `ArticleJSON.article_summary/1`
+  is enough to point the caller at the article (fetch the full body via `/articles/:id`).
+  """
+  def graduate(%{verdict: verdict, article: article}) do
+    %{
+      data: %{
+        verdict: to_string(verdict),
+        created: verdict in [:created, :gated_to_draft],
+        article: ArticleJSON.article_summary(article)
+      }
+    }
+  end
 
   @doc "Renders a paginated list of memories with `meta.total_count/limit/offset`."
   def index(%{results: results, meta: meta}) do
