@@ -82,7 +82,7 @@ loopctl does not make decisions, execute code, or run tests. It stores state, en
 | HTTP Client | Req |
 | Encryption | Cloak (AES-256-GCM) |
 | CLI | Escript |
-| Deployment | Docker Compose (PostgreSQL + App + Nginx) |
+| Deployment | Fly.io (app) + Fly Managed Postgres |
 
 ## Quick Start
 
@@ -104,10 +104,10 @@ psql -U postgres -c "GRANT ALL ON DATABASE loopctl_dev TO loopctl_app;"
 #    mix setup installs deps, creates the database, and runs migrations.
 #    A default Cloak encryption key is configured in config.exs for dev.
 mix setup
-mix phx.server       # Start server at localhost:4000
+mix phx.server       # Start server at localhost:4030
 
 # Verify it's working
-curl http://localhost:4000/health
+curl http://localhost:4030/health
 # Should return: {"status":"ok",...}
 
 # Token efficiency commands (after registering a tenant + project)
@@ -116,30 +116,7 @@ loopctl cost-anomalies --project my-app        # Open anomalies
 loopctl budget set --project my-app --scope per_story --limit 200000
 ```
 
-> **Note:** The `CLOAK_KEY` and `SECRET_KEY_BASE` environment variables are only required for production/Docker deployments. Dev uses defaults from `config/dev.exs` and `config/config.exs`.
-
-### Docker Deployment
-
-```bash
-# Prerequisites: Docker, Docker Compose
-
-cp .env.example .env
-# Edit .env with your secrets (see "Generate Secrets" below)
-
-# Generate TLS certificates for nginx (deploy/certs/ must exist)
-mkdir -p deploy/certs
-openssl req -x509 -newkey rsa:4096 -keyout deploy/certs/selfsigned.key \
-  -out deploy/certs/selfsigned.crt -days 365 -nodes \
-  -subj "/CN=loopctl.local"
-
-docker compose build
-docker compose up -d
-docker compose exec -T app /app/bin/migrate
-
-# Verify it's working
-curl -sk https://localhost:8443/health
-# Should return: {"status":"ok",...}
-```
+> **Note:** The `CLOAK_KEY` and `SECRET_KEY_BASE` environment variables are only required for production (Fly.io). Dev uses defaults from `config/dev.exs` and `config/config.exs`.
 
 ### Generate Secrets
 
@@ -151,7 +128,7 @@ mix phx.gen.secret
 elixir -e ':crypto.strong_rand_bytes(32) |> Base.encode64() |> IO.puts()'
 ```
 
-> **Ports:** Local development runs on `http://localhost:4000`. Docker deployment uses `https://localhost:8443` (nginx TLS proxy). All examples below use the local dev URL.
+> **Ports:** Local development runs on `http://localhost:4030`. Production is `https://loopctl.com` (Fly.io). All examples below use the local dev URL.
 
 ## API Overview
 
@@ -172,26 +149,26 @@ loopctl uses role-based API keys. Each role has specific permissions in the two-
 2. **Create role-specific keys** (using your user key):
    ```bash
    # Create an agent key (needed to register agents)
-   curl -X POST http://localhost:4000/api/v1/api_keys \
+   curl -X POST http://localhost:4030/api/v1/api_keys \
      -H "Authorization: Bearer lc_user_key" \
      -H "Content-Type: application/json" \
      -d '{"name": "agent-bootstrap", "role": "agent"}'
 
    # Register an orchestrator agent
-   curl -X POST http://localhost:4000/api/v1/agents/register \
+   curl -X POST http://localhost:4030/api/v1/agents/register \
      -H "Authorization: Bearer lc_agent_bootstrap_key" \
      -H "Content-Type: application/json" \
      -d '{"name": "orchestrator-main", "agent_type": "orchestrator"}'
    # Note the agent ID from the response
 
    # Create the orchestrator key linked to the agent
-   curl -X POST http://localhost:4000/api/v1/api_keys \
+   curl -X POST http://localhost:4030/api/v1/api_keys \
      -H "Authorization: Bearer lc_user_key" \
      -H "Content-Type: application/json" \
      -d '{"name": "orchestrator-main", "role": "orchestrator", "agent_id": "<agent_id>"}'
 
    # Create an implementer agent key
-   curl -X POST http://localhost:4000/api/v1/api_keys \
+   curl -X POST http://localhost:4030/api/v1/api_keys \
      -H "Authorization: Bearer lc_user_key" \
      -H "Content-Type: application/json" \
      -d '{"name": "worker-1", "role": "agent"}'
@@ -199,7 +176,7 @@ loopctl uses role-based API keys. Each role has specific permissions in the two-
 
 3. **Register your implementer agent** (using the agent key):
    ```bash
-   curl -X POST http://localhost:4000/api/v1/agents/register \
+   curl -X POST http://localhost:4030/api/v1/agents/register \
      -H "Authorization: Bearer lc_agent_key" \
      -H "Content-Type: application/json" \
      -d '{"name": "worker-1", "agent_type": "implementer"}'
@@ -319,7 +296,7 @@ Before claiming a story, agents must **contract** it -- acknowledging they have 
 
 ```bash
 # Agent fetches story, reads ACs, then contracts
-curl -X POST http://localhost:4000/api/v1/stories/:id/contract \
+curl -X POST http://localhost:4030/api/v1/stories/:id/contract \
   -H "Authorization: Bearer lc_agent_key" \
   -H "Content-Type: application/json" \
   -d '{"story_title": "Implement user auth", "ac_count": 8}'
@@ -331,7 +308,7 @@ Orchestrators can skip contract validation for bulk operations using `skip_contr
 (orchestrator role only):
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/stories/:id/contract \
+curl -X POST http://localhost:4030/api/v1/stories/:id/contract \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{"skip_contract_check": true}'
@@ -344,17 +321,17 @@ via `limit` and `offset`.
 
 ```bash
 # All stories in a project
-curl http://localhost:4000/api/v1/stories?project_id=<id>
+curl http://localhost:4030/api/v1/stories?project_id=<id>
 
 # Filter by status fields
-curl "http://localhost:4000/api/v1/stories?project_id=<id>&agent_status=reported_done&verified_status=unverified"
+curl "http://localhost:4030/api/v1/stories?project_id=<id>&agent_status=reported_done&verified_status=unverified"
 
 # Filter to a specific epic
-curl "http://localhost:4000/api/v1/stories?project_id=<id>&epic_id=<epic_id>"
+curl "http://localhost:4030/api/v1/stories?project_id=<id>&epic_id=<epic_id>"
 
 # Paginate a large project
-curl "http://localhost:4000/api/v1/stories?project_id=<id>&limit=500&offset=0"
-curl "http://localhost:4000/api/v1/stories?project_id=<id>&limit=500&offset=500"
+curl "http://localhost:4030/api/v1/stories?project_id=<id>&limit=500&offset=0"
+curl "http://localhost:4030/api/v1/stories?project_id=<id>&limit=500&offset=500"
 ```
 
 Available query parameters: `project_id` (required), `agent_status`, `verified_status`, `epic_id`,
@@ -371,7 +348,7 @@ the full application works end-to-end after a batch of stories has been merged.
 **Start a UI test run:**
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/projects/:project_id/ui-tests \
+curl -X POST http://localhost:4030/api/v1/projects/:project_id/ui-tests \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{"notes": "Post-epic-37 QA pass"}'
@@ -381,7 +358,7 @@ curl -X POST http://localhost:4000/api/v1/projects/:project_id/ui-tests \
 **Record findings** (one call per finding):
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/projects/:project_id/ui-tests/:id/findings \
+curl -X POST http://localhost:4030/api/v1/projects/:project_id/ui-tests/:id/findings \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -396,7 +373,7 @@ curl -X POST http://localhost:4000/api/v1/projects/:project_id/ui-tests/:id/find
 **Complete a UI test run:**
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/projects/:project_id/ui-tests/:id/complete \
+curl -X POST http://localhost:4030/api/v1/projects/:project_id/ui-tests/:id/complete \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{"summary": "3 bugs found, 1 enhancement suggestion"}'
@@ -405,14 +382,14 @@ curl -X POST http://localhost:4000/api/v1/projects/:project_id/ui-tests/:id/comp
 **List runs for a project:**
 
 ```bash
-curl "http://localhost:4000/api/v1/projects/:project_id/ui-tests" \
+curl "http://localhost:4030/api/v1/projects/:project_id/ui-tests" \
   -H "Authorization: Bearer lc_orch_key"
 ```
 
 **Get a single run with its findings:**
 
 ```bash
-curl "http://localhost:4000/api/v1/projects/:project_id/ui-tests/:id" \
+curl "http://localhost:4030/api/v1/projects/:project_id/ui-tests/:id" \
   -H "Authorization: Bearer lc_orch_key"
 ```
 
@@ -436,7 +413,7 @@ Each finding has the following fields:
 that already has completed work:
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/stories/bulk/mark-complete \
+curl -X POST http://localhost:4030/api/v1/stories/bulk/mark-complete \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -451,7 +428,7 @@ curl -X POST http://localhost:4000/api/v1/stories/bulk/mark-complete \
 `summary` are required:
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/epics/:id/verify-all \
+curl -X POST http://localhost:4030/api/v1/epics/:id/verify-all \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{"review_type": "enhanced", "summary": "All stories reviewed and AC-compliant"}'
@@ -462,7 +439,7 @@ curl -X POST http://localhost:4000/api/v1/epics/:id/verify-all \
 The verify endpoint **requires** both `review_type` and `summary`. Omitting either returns 422:
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/stories/:id/verify \
+curl -X POST http://localhost:4030/api/v1/stories/:id/verify \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{"result": "pass", "review_type": "enhanced", "summary": "All acceptance criteria met"}'
@@ -507,7 +484,7 @@ pending --> contracted --> assigned --> implementing --> reported_done
 The import endpoint accepts a structured JSON payload with epics, stories, and optional dependencies:
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/projects/:id/import \
+curl -X POST http://localhost:4030/api/v1/projects/:id/import \
   -H "Authorization: Bearer lc_user_key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -745,7 +722,7 @@ The CLI is an escript binary that wraps the REST API:
 mix escript.build
 
 # Configure
-./loopctl auth login --server https://loopctl.local:8443 --key lc_your_key
+./loopctl auth login --server https://loopctl.com --key lc_your_key
 
 # Use
 ./loopctl status --project my-project
@@ -775,8 +752,7 @@ cd mcp-server && npm install
       "command": "node",
       "args": ["/path/to/loopctl/mcp-server/index.js"],
       "env": {
-        "NODE_TLS_REJECT_UNAUTHORIZED": "0",
-        "LOOPCTL_SERVER": "https://192.168.86.55:8443",
+        "LOOPCTL_SERVER": "https://loopctl.com",
         "LOOPCTL_ORCH_KEY": "lc_your_orchestrator_key",
         "LOOPCTL_AGENT_KEY": "lc_your_agent_key",
         "LOOPCTL_REVIEWER_KEY": "lc_your_reviewer_key"
@@ -917,19 +893,15 @@ mix escript.build   # Build CLI binary
 - **[PRD](docs/prd.md)** -- Full product requirements document
 - **[User Stories](docs/user_stories/)** -- 75 stories across 17 epics
 - **[Skills](skills/)** -- 6 orchestration skill definitions (read by the orchestrator during the loop)
-- **[OpenAPI Spec](https://loopctl.local:8443/api/v1/openapi)** -- Machine-readable API spec (when running)
+- **[OpenAPI Spec](https://loopctl.com/api/v1/openapi)** -- Machine-readable API spec
 
 ## Deployment
 
-loopctl deploys as a 3-container Docker Compose stack:
-
-| Service | Image | Port |
-|---------|-------|------|
-| db | postgres:16 | Internal |
-| app | Elixir release | 4000 (internal) |
-| nginx | nginx:alpine | 8443 (HTTPS), 8080 (HTTP redirect) |
-
-See [deploy/](deploy/) for nginx config, systemd service, backup scripts, and setup guide.
+loopctl deploys to Fly.io (app `loopctl`, lax region) backed by Fly Managed
+Postgres. `fly.toml` builds from the root `Dockerfile` and CI deploys with
+`flyctl deploy --remote-only` on every green master push. See
+[deploy/FLY_SECRETS.md](deploy/FLY_SECRETS.md) for the required secrets and
+[deploy/fly-db-setup.sh](deploy/fly-db-setup.sh) for the RLS role setup.
 
 ## Troubleshooting
 
@@ -955,7 +927,7 @@ docker compose restart app
 The claim endpoint requires `exact_role: :agent`. User and orchestrator keys cannot claim stories. Create an agent key:
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/api_keys \
+curl -X POST http://localhost:4030/api/v1/api_keys \
   -H "Authorization: Bearer lc_user_key" \
   -H "Content-Type: application/json" \
   -d '{"name": "worker-1", "role": "agent"}'
@@ -975,7 +947,7 @@ Story numbers must be plain strings like `"1.1"` (no `"US-"` prefix). Epic numbe
 Superadmin keys are tenant-less. Use the `X-Impersonate-Tenant` header for tenant-scoped endpoints:
 
 ```bash
-curl http://localhost:4000/api/v1/projects \
+curl http://localhost:4030/api/v1/projects \
   -H "Authorization: Bearer lc_superadmin_key" \
   -H "X-Impersonate-Tenant: <tenant_id>"
 ```
@@ -986,14 +958,14 @@ The orchestrator API key must have `agent_id` set, linking it to a registered ag
 
 ```bash
 # 1. Register the orchestrator agent (using an agent-role bootstrap key)
-curl -X POST http://localhost:4000/api/v1/agents/register \
+curl -X POST http://localhost:4030/api/v1/agents/register \
   -H "Authorization: Bearer lc_agent_bootstrap_key" \
   -H "Content-Type: application/json" \
   -d '{"name": "orchestrator-main", "agent_type": "orchestrator"}'
 # Note the agent ID from the response
 
 # 2. Create the orchestrator key with agent_id
-curl -X POST http://localhost:4000/api/v1/api_keys \
+curl -X POST http://localhost:4030/api/v1/api_keys \
   -H "Authorization: Bearer lc_user_key" \
   -H "Content-Type: application/json" \
   -d '{"name": "orchestrator-main", "role": "orchestrator", "agent_id": "<agent_id>"}'

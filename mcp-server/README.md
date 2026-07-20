@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 77 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into typed MCP tools (plus per-tenant generated `cr_*` Context Retriever tools) so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands. The tool tables below are the list.
 
 ## Installation
 

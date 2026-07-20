@@ -14,6 +14,7 @@ defmodule LoopctlWeb.ReviewRecordController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias LoopctlWeb.AuditContext
 
@@ -93,10 +94,15 @@ defmodule LoopctlWeb.ReviewRecordController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
     reviewer_agent_id = api_key.agent_id
+    reviewer_lineage = Dispatches.lineage_for_api_key(tenant_id, api_key.id)
 
-    # Agent and orchestrator keys must have an agent_id set for chain-of-custody enforcement.
-    # User-role keys use a deterministic "human operator" sentinel that cannot collide
-    # with any real agent_id, satisfying the nil-is-never-permissive invariant (US-26.1.3).
+    # Agent and orchestrator keys must have an agent_id set for chain-of-custody
+    # enforcement. There is NO "human operator" sentinel: a user-role key with no
+    # agent passes a literal nil, which Progress.validate_not_self_review/3
+    # deliberately PERMITS (a human is structurally not the implementing agent).
+    # This cond is the half that keeps agent/orchestrator keys from reaching that
+    # permit — the exact_role plug above (which 403s agent keys outright) and the
+    # Progress guard are the other two. All three must change together.
     cond do
       api_key.role in [:agent, :orchestrator] and is_nil(reviewer_agent_id) ->
         {:error, :unprocessable_entity, "Agent ID required for chain-of-custody"}
@@ -105,17 +111,18 @@ defmodule LoopctlWeb.ReviewRecordController do
         # User-role keys represent human operators. nil reviewer_agent_id is
         # allowed because a human cannot be the same entity as the implementing
         # agent (validate_not_self_review accepts nil, gated by the controller).
-        do_create_review(conn, tenant_id, nil, story_id, params)
+        do_create_review(conn, tenant_id, nil, story_id, params, reviewer_lineage)
 
       true ->
-        do_create_review(conn, tenant_id, reviewer_agent_id, story_id, params)
+        do_create_review(conn, tenant_id, reviewer_agent_id, story_id, params, reviewer_lineage)
     end
   end
 
-  defp do_create_review(conn, tenant_id, reviewer_agent_id, story_id, params) do
+  defp do_create_review(conn, tenant_id, reviewer_agent_id, story_id, params, reviewer_lineage) do
     opts =
       AuditContext.from_conn(conn)
       |> Keyword.put(:reviewer_agent_id, reviewer_agent_id)
+      |> Keyword.put(:reviewer_lineage, reviewer_lineage)
 
     case Progress.record_review(tenant_id, story_id, params, opts) do
       {:ok, review_record} ->

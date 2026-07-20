@@ -143,6 +143,7 @@ defmodule Loopctl.MixProject do
         "deps.unlock --check-unused",
         "format --check-formatted",
         "credo --strict",
+        "loopctl.check_skill_citations",
         "deps.audit --ignore-file .mix_audit_ignore",
         "dialyzer",
         "test"

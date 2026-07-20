@@ -43,9 +43,17 @@ config :loopctl, Loopctl.HeavyReadRepo,
 config :loopctl, LoopctlWeb.Endpoint,
   # Binding to loopback ipv4 address prevents access from other machines.
   # Change to `ip: {0, 0, 0, 0}` to allow access from other machines.
+  # Default dev port is 4030 (not the Phoenix-default 4000) so this app can run
+  # alongside the other local Phoenix apps (per-app port registry: 4000/4010/4020 taken).
+  # COUPLING: 4030 is ALSO hardcoded in .mcp.json (tidewave MCP url), the WebAuthn
+  # origin below, and lib/loopctl/api_spec.ex (local dev server entry).
   # `websocket_options` caps a reassembled multi-frame websocket message (Bandit
   # server-level backstop; see the runtime.exs note).
-  http: [ip: {127, 0, 0, 1}, websocket_options: [max_fragmented_message_size: 64_000]],
+  http: [
+    ip: {127, 0, 0, 1},
+    port: 4030,
+    websocket_options: [max_fragmented_message_size: 64_000]
+  ],
   check_origin: false,
   code_reloader: true,
   debug_errors: true,
@@ -85,7 +93,7 @@ config :loopctl, dev_routes: true
 config :loopctl, :webauthn,
   rp_id: "localhost",
   rp_name: "loopctl (dev)",
-  origin: "http://localhost:4000",
+  origin: "http://localhost:4030",
   user_verification: "preferred"
 
 # Do not include metadata nor timestamps in development logs
