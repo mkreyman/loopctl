@@ -35,8 +35,7 @@ defmodule Loopctl.ApiSpec do
       },
       servers: [
         %Server{url: "/", description: "Current server"},
-        %Server{url: "http://localhost:4000", description: "Local development"},
-        %Server{url: "https://loopctl.local:8443", description: "Docker/Beelink deployment"}
+        %Server{url: "http://localhost:4030", description: "Local development"}
       ],
       tags: [
         %Tag{name: "Discovery", description: "API discovery and health"},
