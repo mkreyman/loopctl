@@ -25,20 +25,26 @@ never pass `tenant_id`/`subject_id`.
 
 ## Invariants (cited)
 
-1. **Novelty / dedup gate on create** — `Knowledge.propose_article/3` → `gate_proposal/4`
+1. **Novelty / dedup gate on create** — `Knowledge.propose_article/3` → the private `gate_proposal/4`
    (`propose_article/3` at `knowledge.ex:423`; the four `gate_proposal/4` clauses at `:433-472`).
+   **FIVE outcomes, not four** — `:duplicate`, `:low_novelty`, `:unknown`, `:novel`, and
+   `:deduplicated` (`created: false`, returned when `create_article` hits the idempotency-key path,
+   `knowledge.ex:481-482`). A caller matching only the first four falls through on a reachable
+   response.
    `:duplicate` returns the canonical neighbor without creating; `:low_novelty`
    is created but **forced to `status: "draft"`** (`:449`) with novelty stamped into
-   `metadata.proposal_novelty` (`stamp_proposal_metadata/2`, `:538`) so a smarter consumer decides.
+   `metadata.proposal_novelty` (`stamp_proposal_metadata/2`, `:526-539`) so a smarter consumer decides.
    Two branches that are easy to miss: `:duplicate` **falls through to create** if the canonical
    neighbor vanished between assess and now (`:438-440`), and `:unknown` creates only BY DEFAULT — a
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
    created (`:463-469`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:428-430`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3`. `:curated` wins ONLY when a
-   governed curated source's **absolute** (never pool-relative) confidence clears a scale-matched
-   threshold AND beats the best retrieved candidate by a margin AND is authoritative
-   (not superseded/conflicted). Otherwise `:retrieved`. Both branches return identical `results`/`meta`
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:6922`).
+   `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
+   (`absolute_score/1`, `:7049-7054`) clears a scale-matched threshold AND beats the best retrieved
+   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:7083-7093`; the pure decision is
+   `resolve_provenance/4`, `:7138-7148`) AND is authoritative (not superseded/conflicted — the caller
+   passes only `list_curated_sources/2`-filtered scores). Otherwise `:retrieved`. Both branches return identical `results`/`meta`
    key sets — callers branch on `meta.provenance` alone. A sparse pool must never let a near-but-wrong
    curated doc win.
 3. **All heavy KB reads route through `Loopctl.HeavyRead`** — semantic search, novelty, suggest-links,
@@ -47,10 +53,13 @@ never pass `tenant_id`/`subject_id`.
 4. **KB-content curation is agent-role and reversible (#331)** — `knowledge_create`, `knowledge_update`
    (ID-preserving in-place edit), `knowledge_archive`/`knowledge_delete` (soft delete → `status:
    :archived`, row retained), and `knowledge_resolve_conflict` in all dispositions are agent-role because
-   each is reversible + audited. The `:user` gate is drawn on **set-based blast radius, not
-   hard-delete-ness**: `unpublish`, `bulk_publish`, `bulk_unpublish` and ALL of `bulk_delete` (soft path
-   included) require `:user` (`article_workflow_controller.ex:36-39`); `drafts`/`publish` are
-   `:orchestrator` (`:33`).
+   each is reversible + audited. The `:user` set is single-article `unpublish` plus ALL the SET-BASED
+   bulk ops — `bulk_publish`, `bulk_unpublish` and the ENTIRE `bulk_delete` action, soft path included
+   (`article_workflow_controller.ex:37-39`). **Both criteria matter**: set-based blast radius (one call
+   mutates an unbounded set) AND irreversibility (`bulk_delete` carries a hard-delete path) — see the
+   controller `@moduledoc` (`:9-18`). Single-article ops are agent-role precisely BECAUSE they are
+   reversible + audited, so never drop reversibility when reasoning about a new op.
+   `drafts`/`publish` are `:orchestrator` (`:33`).
    Agent edits are visibility-scoped: an agent can only touch an article it can see. (See `chain-of-custody`.)
 
 ## Anti-patterns

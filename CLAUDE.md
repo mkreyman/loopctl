@@ -56,8 +56,18 @@ lib/loopctl/
 ├── skills/            # Skill versioning and performance
 ├── quality_assurance/ # UI test runs and findings (project-level QA)
 ├── token_usage/       # Token consumption tracking, budgets, cost anomalies
+├── knowledge/         # Knowledge Wiki: articles, embeddings, novelty gate, conflicts
+├── memory/            # Agent memory (Epic 28): memories, session_memories
+├── context_retriever/ # Governed structured access to live rows (Epic 30)
+├── coordination/      # Channels, posts, handoffs
+├── audit_chain/       # Hash-chained audit log, Signed Tree Heads
+├── capabilities/      # Capability tokens (L1)
+├── dispatches/        # Per-dispatch ephemeral keys, lineage paths (L4)
+├── heavy_read.ex      # Guarded facade over HeavyReadRepo (heavy/vector reads)
 ├── schema.ex          # Base schema macro
-└── repo.ex            # Ecto Repo
+├── admin_repo.ex      # BYPASSRLS repo (superadmin, custody writes)
+├── heavy_read_repo.ex # BYPASSRLS repo on its own pool (heavy reads)
+└── repo.ex            # Ecto Repo (RLS enforced)
 
 lib/loopctl_web/
 ├── controllers/       # JSON API controllers
@@ -98,7 +108,28 @@ before changing anything in the auth, signup, or audit pipelines.
 
 `superadmin (4) > user (3) > orchestrator (2) > agent (1)`
 
-Higher roles can access lower-role endpoints. The hierarchy is enforced by `RequireRole` plug.
+Higher roles can access lower-role endpoints — but ONLY where the endpoint uses the plug's
+`role:` option. `LoopctlWeb.Plugs.RequireRole` has TWO modes
+(`lib/loopctl_web/plugs/require_role.ex`):
+
+- `plug RequireRole, role: :orchestrator` — hierarchy applies (`Role.role_at_least?/2`); a `:user`
+  or `:superadmin` key passes.
+- `plug RequireRole, exact_role: :agent` (or a LIST of exact roles) — **NO hierarchy**. A higher
+  role is 403'd like any other non-member.
+
+**Every chain-of-custody endpoint is `exact_role`-gated**, so "just use a higher-privileged key"
+does NOT clear a 403 there:
+
+| Endpoint | Gate | Consequence |
+|----------|------|-------------|
+| `verify` / `reject` / `force_unclaim` / `verify_all` | `exact_role: :orchestrator` (`lib/loopctl_web/controllers/story_verification_controller.ex:28-29`) | a `:user` or `:superadmin` key CANNOT verify |
+| `contract` / `report` | `exact_role: [:agent, :orchestrator]` (`lib/loopctl_web/controllers/story_status_controller.ex:26-30`) | a human `:user` key CANNOT report |
+| `claim` / `start` / `request-review` / `unclaim` | `exact_role: :agent` (`:32-33`) | orchestrator/user keys cannot claim or start |
+| `review-complete` | `exact_role: [:orchestrator, :user]` (`lib/loopctl_web/controllers/review_record_controller.ex:22-23`) | an `:agent` key is 403'd BEFORE any controller logic runs |
+
+**Anti-pattern: never convert an `exact_role` custody gate to `role:`.** That is precisely what
+lets one high-privilege key both implement and report/verify — the failure the product exists to
+prevent. `exact_role` is the structural separation; the 403 is the gate working.
 
 ### Chain-of-Custody Enforcement
 
@@ -107,36 +138,61 @@ The API enforces that nobody marks their own work as done:
 - `POST /stories/:id/review-complete` — `409 self_review_blocked`
 - `POST /stories/:id/verify` — `409 self_verify_blocked`
 
-The three gates do NOT share one implementation. Only **verify** is lineage-aware today.
+All three gates are lineage-aware. They do NOT share one implementation, but each compares the
+CALLER's dispatch lineage (resolved server-side from the authenticating key, never client-supplied)
+against the implementer's, and each fails CLOSED on a story with no custody provenance.
 
-**verify** — `validate_not_self_verify/2` (`lib/loopctl/progress.ex:1612-1648`, US-26.2.2),
+**verify** — `validate_not_self_verify/2` (`lib/loopctl/progress.ex:1684-1715`, US-26.2.2),
 in order:
-1. **nil caller identity is blocked** — untrusted, never permissive (US-26.1.3, `:1613`).
+1. **nil caller identity is blocked** — untrusted, never permissive (US-26.1.3, `progress.ex:1682`).
 2. **Custody-orphaned story is blocked** with `missing_assigned_agent` — a reported-done
    story with no assigned agent and no lineage would otherwise pass VACUOUSLY, since a
-   non-nil verifier never equals a nil implementer (`:1626-1628`).
-3. **Lineage comparison (primary)** when both dispatch IDs exist — blocked if the
-   implementer and verifier lineage paths share a prefix
-   (`Dispatches.lineage_shares_prefix?/2`, `:1631-1639`).
-4. **`assigned_agent_id` equality** as the fallback for pre-dispatch stories (`:1642`).
+   non-nil verifier never equals a nil implementer (`progress.ex:1697-1699`).
+3. **Lineage comparison (primary)** when BOTH `implementer_dispatch_id` and
+   `verifier_dispatch_id` are set (`progress.ex:1702-1706`), decided by
+   `verify_lineage_separated/4` (`progress.ex:1725-1745`): an EMPTY lineage on either side —
+   which is what an unloadable/deleted dispatch row yields (`get_dispatch_lineage/2`,
+   `progress.ex:1747-1752`) — fails CLOSED, a shared lineage root
+   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:303-307`) blocks, and the
+   `assigned_agent_id` equality check is evaluated IN ADDITION to the lineage comparison, never
+   short-circuited by it.
+4. **`assigned_agent_id` equality** as the fallback for pre-dispatch stories
+   (`progress.ex:1709-1710`) and for every story that lacks a verifier dispatch.
 
-So on the verify path a sub-agent dispatched BY the implementer cannot verify its
-parent's work, even though the two have different `agent_id`s.
+`verifier_dispatch_id` is written only by the assign-verifier flow
+(`assign_rotating_verifier/3`, `progress.ex:363-397`); that write is checked, and a failure
+flags `verifier_needed` plus a `verifier_not_assigned` audit event
+(`flag_verifier_needed/5`, `progress.ex:399-423`) rather than silently leaving the field nil.
+Without a verifier dispatch the check degrades to plain agent-id equality.
 
-**report** — `validate_not_self_report/2` (`:2107-2128`) — nil identity is blocked
-(`:2107`), then plain `assigned_agent_id == agent_id` (`:2116`, `:2122`). Lineage is
-NOT yet compared: `:2113` computes the implementer lineage and discards it, per the
-`:2114-2115` comment ("reporter dispatch isn't tracked yet").
+**report** — `validate_not_self_report/3` (`progress.ex:2210-2235`) — nil identity is blocked
+(`progress.ex:2207`); a **custody-unattributed** story (nil `assigned_agent_id` AND nil
+`implementer_dispatch_id`) fails CLOSED with `missing_assigned_agent` and a
+`custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2240-2243`) instead of
+passing vacuously; then the reporter's dispatch lineage is compared against the implementer's
+(`lineage_conflict?/2`, `progress.ex:2249-2256`), then plain `assigned_agent_id == agent_id`.
+The DB CHECK `stories_reported_done_requires_agent` does NOT cover this — it is satisfied
+whenever `implementer_dispatch_id IS NULL` — so the code guard is the enforcement.
 
-**review-complete** — `validate_not_self_review/2` (`:2130-2165`) — custody-orphan
-backstop first (`:2137-2139`), then a **nil reviewer is deliberately PERMITTED**
-(`:2146-2147`): nil means a human operator on a user-role key, and the controller
-separately requires agent/orchestrator keys to supply a real `reviewer_agent_id`.
-Otherwise plain `assigned_agent_id` equality (`:2153`, `:2159`); lineage is likewise
-not yet wired.
+**review-complete** — `validate_not_self_review/3` (`progress.ex:2258-2288`) — custody-orphan
+backstop first (`progress.ex:2265-2267`), then a **nil reviewer is deliberately PERMITTED**
+(`progress.ex:2274-2275`): nil means a human operator on a user-role key. That permit has
+THREE parts which must change together:
+1. the `exact_role: [:orchestrator, :user]` plug
+   (`lib/loopctl_web/controllers/review_record_controller.ex:22-23`), which 403s an `:agent` key
+   before any controller code runs — so the `:agent` branch of the controller cond below is
+   unreachable today;
+2. `LoopctlWeb.ReviewRecordController.create/2`
+   (`lib/loopctl_web/controllers/review_record_controller.ex:92-116`), which rejects an
+   orchestrator key carrying no `agent_id` and passes a literal `nil` (there is NO "human
+   operator" sentinel) for a user key;
+3. the `Progress` permit itself.
+Then the reviewer's dispatch lineage comparison, then plain `assigned_agent_id` equality.
 
-Do NOT generalize the verify path's structural guarantee to the other two: on report
-and review-complete, a dispatched sub-agent with a distinct `agent_id` passes today.
+The reporter/reviewer lineage both come from `Dispatches.lineage_for_api_key/2`
+(`lib/loopctl/dispatches.ex:282-292`) — the dispatch that minted the calling key. A key not
+minted by a dispatch yields `[]`, which is inert (the agent-id checks still apply); it never
+short-circuits a gate.
 
 **The MCP server must NEVER hold both implementer and reviewer keys in the same process.** The 409 errors are the system working correctly — do not add workarounds.
 
@@ -145,9 +201,13 @@ and review-complete, a dispatched sub-agent with a distinct `agent_id` passes to
 Ask these questions:
 
 1. **Does this weaken chain-of-custody?** If a single session could now both implement and verify/report, the change is WRONG.
-2. **Does this give agents destructive capabilities?** Tenant-destructive and custody-critical operations must stay at `role: :user` (or WebAuthn): tenant/project delete, budget/token corrections, cost anomaly resolution, tenant audit-key rotation, break-glass override, the SET-BASED bulk KB ops (`knowledge_bulk_delete` — including its irreversible HARD-delete path — `bulk_publish`, `bulk_unpublish`), and anything in the work-breakdown / chain-of-custody surface. Constructive and metadata work-breakdown operations (create/update epics, stories, dependencies, imports, backfills for pre-loopctl work) are at `role: :orchestrator` so an autonomous orchestrator can compose a project and record state without human intervention. Agents (`role: :agent`) can never write work-breakdown data — only read it. The rule of thumb: if the operation IRREVERSIBLY removes data, or serves as a custody gate, it requires `:user`.
+2. **Does this give agents destructive capabilities?** Tenant-destructive and custody-critical operations must stay at `role: :user` (or WebAuthn): tenant/project delete, budget/token corrections, cost anomaly resolution, tenant audit-key rotation, break-glass override, single-article `unpublish` and the SET-BASED bulk KB ops (`knowledge_bulk_delete` — the WHOLE action, soft path included, and it also carries an irreversible HARD-delete path — `bulk_publish`, `bulk_unpublish`), and anything in the work-breakdown / chain-of-custody surface. Constructive and metadata work-breakdown operations (create/update epics, stories, dependencies, imports, backfills for pre-loopctl work) are at `role: :orchestrator` so an autonomous orchestrator can compose a project and record state without human intervention. Agents (`role: :agent`) can never write work-breakdown data — only read it. The rule of thumb: if the operation IRREVERSIBLY removes data, or serves as a custody gate, it requires `:user`.
 
-   **KB-content carve-out (#331).** The knowledge-wiki **content** surface is agent-role curation — `knowledge_create`, `knowledge_update` (in-place edit, ID-preserving), `knowledge_archive`/`knowledge_delete` (soft delete → `status: :archived`, row retained), and `knowledge_resolve_conflict` in ALL dispositions (`dismiss`, `supersede`, `merge`). These are the exception to "archive/DELETE ⇒ `:user`" precisely because each is **reversible + audited**: a soft delete retains the row, supersede retires the loser via a reversible `supersedes` link applied only by the privileged nightly executor, and merge produces a new DRAFT (never auto-published). Every mutation is recorded in the append-only, hash-chained audit log (and the per-tenant `kb_curation_log` when enabled). Agent edits/archives are additionally visibility-scoped: an agent can only touch an article it can see, so another agent's `private`/`owner` memory 404s. The human gate bought nothing here (nothing is irreversible or self-approval-shaped) while blocking the intended agent-native curation workflow. What stays `:user` on the KB surface: the irreversible bulk HARD delete only.
+   **KB-content carve-out (#331).** The knowledge-wiki **content** surface is agent-role curation — `knowledge_create`, `knowledge_update` (in-place edit, ID-preserving), `knowledge_archive`/`knowledge_delete` (soft delete → `status: :archived`, row retained), and `knowledge_resolve_conflict` in ALL dispositions (`dismiss`, `supersede`, `merge`). These are the exception to "archive/DELETE ⇒ `:user`" precisely because each is **reversible + audited**: a soft delete retains the row, supersede retires the loser via a reversible `supersedes` link applied only by the privileged nightly executor, and merge produces a new DRAFT (never auto-published). Every mutation is recorded in the append-only, hash-chained audit log (and the per-tenant `kb_curation_log` when enabled). Agent edits/archives are additionally visibility-scoped: an agent can only touch an article it can see, so another agent's `private`/`owner` memory 404s. The human gate bought nothing here (nothing is irreversible or self-approval-shaped) while blocking the intended agent-native curation workflow.
+
+   **What stays `:user` on the KB surface** (`lib/loopctl_web/controllers/article_workflow_controller.ex:37-39`): single-article `unpublish`, plus ALL the SET-BASED bulk ops — `bulk_publish`, `bulk_unpublish`, and the ENTIRE `bulk_delete` action *including its soft path*. Two criteria hold that line together: **set-based blast radius** (one call mutates an unbounded set) AND **irreversibility** (`bulk_delete` carries a hard-delete path that destroys rows). Single-article ops are agent-role because each is reversible + audited. `drafts` and single-article `publish` are `:orchestrator` (`:33`).
+
+   **KB project-scope carve-out (extends #331).** `:kb`-kind project scopes — `create_kb_scope`, `archive_kb_scope`, `restore_kb_scope` (`lib/loopctl_web/controllers/project_controller.ex:25-35`) — are `role: :agent` and deliberately NOT behind `RequireHumanAnchor` (`:36-40`): a `:kb` scope carries no chain-of-custody surface (`RequireWorkProject` bars work attachment), so an agent-rooted tenant may partition its own knowledge. `:work` project create/update/delete stays `:orchestrator`/`:user` AND human-anchored.
 3. **Does this collapse trust boundaries?** The role hierarchy exists so that agents can't self-promote. Lowering a role requirement is fine for read operations and for operations the role logically needs (orchestrators creating projects). It's wrong for operations that serve as a security gate.
 4. **Does this affect RLS?** New tables must use `ENABLE ROW LEVEL SECURITY` (not `FORCE`) since the production role (`schema_admin`) is the table owner without BYPASSRLS.
 
@@ -230,11 +290,20 @@ mix ecto.reset         # Drop, create, migrate
 ## Key Documents
 
 - **PRD**: `docs/prd.md` — full product requirements
-- **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — 60 stories across 15 epics
-- **Skills**: `skills/loopctl-*.md` — 6 orchestration skills
+- **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — 231 stories across 38 epic folders
+- **Orchestration skills**: `skills/loopctl-*.md` — 6 skills describing the orchestration LOOP itself (dispatch, review, verify)
+- **Domain skills**: `.claude/skills/<domain>/SKILL.md` — code-map + invariants skills, loaded when you touch that domain (routing table below). Distinct from the `skills/loopctl-*.md` orchestration skills above.
 - **Orchestration Guide**: `docs/orchestration-guide.md` — methodology: loop, trust model, checkpointing
-- **MCP Server**: `mcp-server/` — 85 typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
+- **MCP Server**: `mcp-server/` — 102 statically declared typed tools for Claude Code agents (no curl needed), plus per-tenant generated `cr_*` Context Retriever tools; published as `loopctl-mcp-server` on npm. `mcp-server/README.md` is the source of truth for the list.
 - **Build Status**: memory-keeper key `build_status`, channel `loopctl`
+
+### Domain skill routing
+
+| You are touching... | Load |
+|---------------------|------|
+| roles, auth pipeline, story lifecycle (report / review-complete / verify), capability tokens, dispatch lineage, WebAuthn / human anchor, audit chain | `.claude/skills/chain-of-custody/SKILL.md` |
+| tenant scoping, RLS policies, migrations, new tables, the three repos, heavy/vector reads | `.claude/skills/tenancy-rls/SKILL.md` |
+| Knowledge Wiki, agent memory, context retriever, hybrid search, novelty gate, embeddings, KB curation permissions | `.claude/skills/knowledge-wiki/SKILL.md` |
 
 ## MCP Server
 
@@ -244,7 +313,7 @@ Claude Code agents should use the loopctl MCP tools instead of curl. Install via
 {"mcpServers": {"loopctl": {"command": "npx", "args": ["loopctl-mcp-server"], "env": {"LOOPCTL_SERVER": "https://loopctl.com", "LOOPCTL_ORCH_KEY": "...", "LOOPCTL_AGENT_KEY": "..."}}}}
 ```
 
-Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (84 total). See `mcp-server/README.md` for the full list.
+Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (102 statically declared tools, plus per-tenant `cr_*` Context Retriever tools). See `mcp-server/README.md` for the full list — it is the single source of truth for the count.
 
 ---
 

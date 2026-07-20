@@ -16,6 +16,7 @@ defmodule LoopctlWeb.StoryStatusController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias Loopctl.Progress.StateMachine
   alias LoopctlWeb.AuditContext
@@ -332,7 +333,12 @@ defmodule LoopctlWeb.StoryStatusController do
   defp do_report(conn, tenant_id, api_key, story_id, params) do
     opts =
       AuditContext.from_conn(conn)
-      |> Keyword.merge(agent_id: api_key.agent_id)
+      |> Keyword.merge(
+        agent_id: api_key.agent_id,
+        # Chain of custody: the reporter's lineage is resolved SERVER-SIDE from
+        # the authenticating key's dispatch — never taken from the request body.
+        reporter_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+      )
       |> maybe_add_token_usage(params)
 
     artifact_params = extract_artifact_params(params)
@@ -344,6 +350,11 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :self_report_blocked} ->
         {:error, :self_report_blocked}
+
+      # Custody-unattributed story (no assigned agent, no implementer dispatch):
+      # the self-report guard fails closed rather than passing vacuously.
+      {:error, :missing_assigned_agent} ->
+        {:error, :missing_assigned_agent}
 
       {:error, {:invalid_transition, _ctx} = err} ->
         {:error, err}

@@ -105,17 +105,37 @@ defmodule Loopctl.Repo do
   # US-33.7 guard: `with_tenant/2` must own its transaction (see @doc above).
   # Fails loud so the follow-on blanket-reroute epic cannot introduce a
   # nested-transaction caller that silently leaks tenant/role context. No current
-  # caller nests. Skipped under the SQL sandbox, whose per-test transaction makes
-  # `in_transaction?/0` true by design.
+  # caller nests.
+  #
+  # IMPORTANT: the guard is INERT under the SQL sandbox (whose per-test
+  # transaction makes `in_transaction?/0` true by design), i.e. for the entire
+  # test suite. No integration test can catch a nested caller — the decision
+  # function is exposed as `assert_not_nested!/2` so at least the RULE is
+  # covered in CI (`test/loopctl/repo_nested_transaction_guard_test.exs`);
+  # actual nesting must be verified by inspection or in dev/prod.
   defp assert_not_nested! do
-    if in_transaction?() and not sandbox_pool?() do
-      raise "Loopctl.Repo.with_tenant/2 called inside an existing Repo transaction. " <>
-              "It must own its transaction: SET LOCAL app.current_tenant_id / ROLE are " <>
-              "transaction-scoped and would leak past the inner savepoint into the outer " <>
-              "transaction's tenant/role context. Set the RLS context directly in the " <>
-              "enclosing transaction instead (see Loopctl.Repo.set_rls_context/1)."
-    end
+    assert_not_nested!(in_transaction?(), sandbox_pool?())
   end
+
+  @doc """
+  The pure decision behind the `with_tenant/2` nested-transaction guard.
+
+  Raises when already inside a transaction on a NON-sandbox pool. Public only so
+  the sandbox carve-out (which disables the guard for the whole suite) can still
+  be exercised by a unit test.
+  """
+  @spec assert_not_nested!(boolean(), boolean()) :: :ok
+  def assert_not_nested!(in_transaction?, sandbox_pool?)
+
+  def assert_not_nested!(true, false) do
+    raise "Loopctl.Repo.with_tenant/2 called inside an existing Repo transaction. " <>
+            "It must own its transaction: SET LOCAL app.current_tenant_id / ROLE are " <>
+            "transaction-scoped and would leak past the inner savepoint into the outer " <>
+            "transaction's tenant/role context. Set the RLS context directly in the " <>
+            "enclosing transaction instead (see Loopctl.Repo.set_rls_context/1)."
+  end
+
+  def assert_not_nested!(_in_transaction?, _sandbox_pool?), do: :ok
 
   defp sandbox_pool? do
     Keyword.get(config(), :pool) == Ecto.Adapters.SQL.Sandbox
