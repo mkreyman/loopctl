@@ -83,7 +83,7 @@ lib/loopctl_web/
 3. **EVERY** query is scoped by RLS policies (SET LOCAL per transaction)
 4. `tenant_id` is **NEVER** in changeset `cast` — always set programmatically
 5. **EVERY** test includes a tenant isolation test case
-6. Two Repos: `Loopctl.Repo` (RLS enforced) and `Loopctl.AdminRepo` (BYPASSRLS for superadmin)
+6. Three Repos: `Loopctl.Repo` (RLS enforced), `Loopctl.AdminRepo` (BYPASSRLS for superadmin), and `Loopctl.HeavyReadRepo` (BYPASSRLS on its own pool, for heavy analytical/vector reads — reach it via `Loopctl.HeavyRead`, never directly; US-27.11)
 
 ## Security & Trust Model — Mandatory Review Checklist
 
@@ -103,9 +103,40 @@ Higher roles can access lower-role endpoints. The hierarchy is enforced by `Requ
 ### Chain-of-Custody Enforcement
 
 The API enforces that nobody marks their own work as done:
-- `POST /stories/:id/report` — `409 self_report_blocked` if caller == assigned_agent_id
-- `POST /stories/:id/review-complete` — `409 self_review_blocked` if caller == assigned_agent_id
-- `POST /stories/:id/verify` — `409 self_verify_blocked` if caller == assigned_agent_id
+- `POST /stories/:id/report` — `409 self_report_blocked`
+- `POST /stories/:id/review-complete` — `409 self_review_blocked`
+- `POST /stories/:id/verify` — `409 self_verify_blocked`
+
+The three gates do NOT share one implementation. Only **verify** is lineage-aware today.
+
+**verify** — `validate_not_self_verify/2` (`lib/loopctl/progress.ex:1612-1648`, US-26.2.2),
+in order:
+1. **nil caller identity is blocked** — untrusted, never permissive (US-26.1.3, `:1613`).
+2. **Custody-orphaned story is blocked** with `missing_assigned_agent` — a reported-done
+   story with no assigned agent and no lineage would otherwise pass VACUOUSLY, since a
+   non-nil verifier never equals a nil implementer (`:1626-1628`).
+3. **Lineage comparison (primary)** when both dispatch IDs exist — blocked if the
+   implementer and verifier lineage paths share a prefix
+   (`Dispatches.lineage_shares_prefix?/2`, `:1631-1639`).
+4. **`assigned_agent_id` equality** as the fallback for pre-dispatch stories (`:1642`).
+
+So on the verify path a sub-agent dispatched BY the implementer cannot verify its
+parent's work, even though the two have different `agent_id`s.
+
+**report** — `validate_not_self_report/2` (`:2107-2128`) — nil identity is blocked
+(`:2107`), then plain `assigned_agent_id == agent_id` (`:2116`, `:2122`). Lineage is
+NOT yet compared: `:2113` computes the implementer lineage and discards it, per the
+`:2114-2115` comment ("reporter dispatch isn't tracked yet").
+
+**review-complete** — `validate_not_self_review/2` (`:2130-2165`) — custody-orphan
+backstop first (`:2137-2139`), then a **nil reviewer is deliberately PERMITTED**
+(`:2146-2147`): nil means a human operator on a user-role key, and the controller
+separately requires agent/orchestrator keys to supply a real `reviewer_agent_id`.
+Otherwise plain `assigned_agent_id` equality (`:2153`, `:2159`); lineage is likewise
+not yet wired.
+
+Do NOT generalize the verify path's structural guarantee to the other two: on report
+and review-complete, a dispatched sub-agent with a distinct `agent_id` passes today.
 
 **The MCP server must NEVER hold both implementer and reviewer keys in the same process.** The 409 errors are the system working correctly — do not add workarounds.
 
