@@ -6,7 +6,7 @@
     "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
   },
   "priority": "high",
-  "background": "The embedding endpoint is server-wide: config/runtime.exs:382-385 sets %{base_url: OPENAI_BASE_URL || \"https://api.openai.com/v1\", model: ...}, read at knowledge/embedding_client.ex:194 (@default_base_url at :41, provider_config/0 at :295). Per-tenant configuration today (llm/tenant_llm_settings.ex:41-54) covers api_key, extraction_model, classification_model, merge_model, embedding_api_key, embedding_model - key and model, but NOT endpoint. Importantly the embedding KEY is already per-tenant and MANDATORY (embedding_client.ex:58-60,75-77; the global operator key was deliberately removed in runtime.exs:375-381), so the per-tenant credential plumbing and its MCP surface (set_llm_config) already exist. Adding the endpoint is one field plus one read - not a subsystem. TWO grounded constraints the 39 draft missed: (1) the set_llm_config surface is ROLE :user, not agent - router.ex:185-189 puts PATCH /tenants/me/llm-config in the :user scope with an explicit comment that the PATCH stores a tenant secret, and mcp-server/index.js:1836-1843 sends the exact LOOPCTL_USER_KEY with the global-key override bypassed (reviews #12/#13). (2) UrlGuard.pin/1 (net/url_guard.ex, GHSA-jh42-wf7g-f5rg) unconditionally blocks loopback, 10/8, 100.64/10, 169.254/16 and Fly 6PN - i.e. exactly where a local Ollama or TEI lives - and accepts only a :schemes option, so 'just reuse UrlGuard' does not compose with a local endpoint.",
+  "background": "The embedding endpoint is server-wide: config/runtime.exs:391-394 sets %{base_url: OPENAI_BASE_URL || \"https://api.openai.com/v1\", model: ...}, read at knowledge/embedding_client.ex:194 (@default_base_url at :41, provider_config/0 at :295). Per-tenant configuration today (llm/tenant_llm_settings.ex:41-54) covers api_key, extraction_model, classification_model, merge_model, embedding_api_key, embedding_model - key and model, but NOT endpoint. Importantly the embedding KEY is already per-tenant and MANDATORY (embedding_client.ex:58-60,75-77; the global operator key was deliberately removed - see the comment at runtime.exs:385-390), so the per-tenant credential plumbing and its MCP surface (set_llm_config) already exist. Adding the endpoint is one field plus one read - not a subsystem. TWO grounded constraints the 39 draft missed: (1) the set_llm_config surface is ROLE :user, not agent - router.ex:185-189 puts PATCH /tenants/me/llm-config in the :user scope with an explicit comment that the PATCH stores a tenant secret, and mcp-server/index.js:1836-1843 sends the exact LOOPCTL_USER_KEY with the global-key override bypassed (reviews #12/#13). (2) UrlGuard.pin/1 (net/url_guard.ex, GHSA-jh42-wf7g-f5rg) unconditionally blocks loopback, 10/8, 100.64/10, 169.254/16 and Fly 6PN - i.e. exactly where a local Ollama or TEI lives - and accepts only a :schemes option, so 'just reuse UrlGuard' does not compose with a local endpoint.",
   "story": {
     "as_a": "an agent configuring a tenant that must not send content to third-party providers",
     "i_want_to": "set the tenant's embedding endpoint to a local or self-chosen OpenAI-compatible server through the same MCP tool already used for the key, and be told immediately if the endpoint is unusable",
@@ -26,12 +26,12 @@
     },
     {
       "id": "AC-41.2.3",
-      "description": "Config-time probe: setting embedding_base_url (or embedding_model) issues ONE test embedding against the supplied endpoint before persisting. On failure NOTHING is persisted and the call returns a legible, agent-readable error. On success the returned dimension is validated against the instance's published supported set (US-41.1 AC-41.1.3) and recorded as the tenant's PENDING dimension - never activated implicitly.",
+      "description": "Config-time probe: setting embedding_base_url (or embedding_model) issues ONE test embedding against the supplied endpoint before persisting. On failure NOTHING is persisted and the call returns a legible, agent-readable error. On success the returned dimension is validated against the instance's published supported set (US-41.1 AC-41.1.3) and recorded as the tenant's PENDING dimension - never activated implicitly. THE PROBE NEVER SHIPS AN EXISTING CREDENTIAL TO A NEW HOST: changing embedding_base_url REQUIRES the caller to supply a matching embedding_api_key in the same PATCH, or to pass an explicit acknowledgement that the currently-stored key will be transmitted in the Authorization header to the new host. Without one of the two the call is refused with a remediation - otherwise an endpoint-only PATCH silently sends the tenant's OpenAI key to an attacker-chosen or merely untrusted server. A test asserts a key is never sent to a host other than the one it was configured for. The chat-endpoint probe in US-41.3 AC-41.3.3 carries the identical rule.",
       "status": "pending"
     },
     {
       "id": "AC-41.2.4",
-      "description": "A dimension CHANGE is a gated, staged cutover, never a silent corpus blackhole. Because US-41.1 AC-41.1.10 excludes stale-dimension rows from recall, a probe that returns a dimension different from the tenant's current one must: (a) refuse unless the caller supplies an explicit acknowledgement/force flag, (b) report in meta how many article and memory rows will become stale, (c) record the new value as pending_dimension and enqueue the re-embed backfill, activating the new dimension only when the backfill reports completion, and (d) define in-flight Oban embedding job behavior - a job whose vector dimension no longer matches the pending target is tagged and retried against the pending dimension rather than written or silently discarded. A test asserts an un-acknowledged dimension change is refused and the corpus stays searchable.",
+      "description": "A dimension CHANGE is a gated, staged cutover, never a silent corpus blackhole. A probe that returns a dimension different from the tenant's current one must: (a) refuse unless the caller supplies an explicit acknowledgement/force flag, (b) report in meta how many article and memory rows must be re-embedded, (c) record the new value as pending_dimension and enqueue the re-embed backfill, activating the new dimension only when the backfill reports completion, and (d) define in-flight Oban embedding job behavior - a job whose vector dimension no longer matches the pending target is tagged and retried against the pending dimension rather than written or silently discarded, WITH A BOUNDED retry policy: the existing ArticleEmbeddingWorker shape (max_attempts 4, permanent errors discarded) applies, and on exhaustion the job reaches a TERMINAL discard that is surfaced through the existing job/anomaly surfaces naming the tenant, the pending dimension and the endpoint - never an unbounded retry against an endpoint that cannot satisfy it. THROUGHOUT the window recall keeps serving at the tenant's ACTIVE dimension per US-41.1 AC-41.1.10 (old and new vectors coexist because uniqueness is (id, dim), and the QUERY embedding is generated against the ACTIVE dimension's endpoint/model, never the pending one); the pending vectors are not consulted until activation, after which stale-dimension rows are dropped. A test asserts an un-acknowledged dimension change is refused, that the corpus stays fully searchable at the active dimension for the whole backfill (not merely at the moment of refusal), and that a permanently failing re-embed job terminates instead of retrying forever.",
       "status": "pending"
     },
     {
@@ -80,7 +80,7 @@
       "type": "integration",
       "preconditions": ["tenant with an existing 1536-dim corpus", "stub endpoint returning 768-dim vectors"],
       "steps": ["set embedding_base_url with no acknowledgement flag", "then retry with the flag"],
-      "expected_results": ["first attempt refused with a remediation naming the stale-row count", "corpus still fully searchable after the refusal", "second attempt records pending_dimension and enqueues the re-embed backfill", "the new dimension activates only after the backfill completes"],
+      "expected_results": ["first attempt refused with a remediation naming the row count to re-embed", "corpus still fully searchable after the refusal", "second attempt records pending_dimension and enqueues the re-embed backfill", "the corpus stays fully searchable at the ACTIVE (1536) dimension for the WHOLE backfill window - queries are embedded against the active endpoint/model, and the partially-written 768-dim rows are not consulted", "the new dimension activates only after the backfill completes, and stale 1536-dim rows are dropped only then", "a re-embed job that can never succeed reaches a terminal discard surfaced on the anomaly surface, not an unbounded retry"],
       "status": "pending"
     },
     {
@@ -106,8 +106,8 @@
       "name": "no key material leaks",
       "type": "unit",
       "preconditions": ["tenant with an embedding key"],
-      "steps": ["force each probe failure path", "inspect error body, logs, audit entries"],
-      "expected_results": ["endpoint present", "key absent everywhere"],
+      "steps": ["force each probe failure path", "inspect error body, logs, audit entries", "PATCH only embedding_base_url to a NEW host with neither a matching key nor the acknowledgement flag", "repeat with the acknowledgement flag"],
+      "expected_results": ["endpoint present", "key absent everywhere", "the endpoint-only PATCH is refused with a remediation and NO Authorization header carrying the stored key ever reaches the new host", "with the acknowledgement flag the probe proceeds and the transmission is recorded in the audit entry"],
       "status": "pending"
     },
     {
@@ -136,6 +136,6 @@
     "Ollama's OpenAI-compatible surface and HuggingFace TEI are the two reference targets; test against stubs shaped like both rather than assuming one vendor's response envelope.",
     "SettingsCache has a documented staleness window; the pending/active dimension split must be read through a path that cannot serve a stale ACTIVE dimension to an in-flight embedding job."
   ],
-  "dependencies": ["US-41.1"],
+  "dependencies": ["US-41.1", "US-41.4"],
   "estimated_tokens": 350000
 }

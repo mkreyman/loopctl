@@ -16,12 +16,12 @@
   "acceptance_criteria": [
     {
       "id": "AC-41.6.1",
-      "description": "The storage mechanism is specified concretely, because the plain 'reuse Cloak/Vault' framing is NOT expressible with the current machinery (single global vault; per-field types with no row or tenant context; :binary column required while body is :string and is a dependency of a STORED generated column). The implementation is: a SEPARATE nullable body_encrypted :binary column (memories: text_encrypted) with body/text NULL for encrypted rows - exactly one of the pair is non-null, enforced by a CHECK constraint - plus a resolver in the context layer that reads whichever is present. Encryption/decryption happens where the row and tenant ARE in scope (context functions or a tagged custom Ecto.Type carrying an in-row ciphertext marker), never inside a bare Cloak.Ecto.Binary field. Non-encrypted rows are byte-for-byte unchanged. A test reads an encrypted row directly via SQL and finds ciphertext in body_encrypted and NULL in body.",
+      "description": "The storage mechanism is specified concretely, because the plain 'reuse Cloak/Vault' framing is NOT expressible with the current machinery (single global vault; per-field types with no row or tenant context; :binary column required while body is :string and is a dependency of a STORED generated column). The implementation is: a SEPARATE nullable body_encrypted :binary column (memories: text_encrypted) with body/text NULL for encrypted rows - exactly one of the pair is non-null, enforced by a CHECK constraint - plus a resolver in the context layer that reads whichever is present. Encryption/decryption happens where the row and tenant ARE in scope (context functions or a tagged custom Ecto.Type carrying an in-row ciphertext marker), never inside a bare Cloak.Ecto.Binary field. Non-encrypted rows are byte-for-byte unchanged. A test reads an encrypted row directly via SQL and finds ciphertext in body_encrypted and NULL in body. MIGRATION MECHANICS ARE SPELLED OUT, because articles.body is declared null: false (20260410002347_create_articles.exs:14) and a plain ADD CONSTRAINT ... CHECK takes ACCESS EXCLUSIVE and full-scans the table - both directly against this story's own no-write-outage stance: (i) DROP NOT NULL on articles.body and memories.text in their own migration; (ii) ADD CONSTRAINT ... CHECK ... NOT VALID (a brief lock, no scan), then VALIDATE CONSTRAINT in a SEPARATE migration (SHARE UPDATE EXCLUSIVE, concurrent-write-safe). TC-41.6.8 asserts no long ACCESS EXCLUSIVE hold for either step. EVERY READER AND WRITER GOES THROUGH THE RESOLVER, ENFORCED MECHANICALLY - not by convention. There are ~40 direct .body reads across ~20 modules in lib/ today (knowledge/streaming_export/okf_format.ex, obsidian_format.ex, controllers/article_json.ex, knowledge_search_json.ex, knowledge_context_json.ex, coordination.ex, knowledge_reclassify_worker.ex, article_embedding_worker.ex, content_chunker, the merge synthesizer, and knowledge.ex:667-671 same_content?/2 among them), and each one that misses the resolver returns an EMPTY body with an HTTP 200 - silent data loss, not an error. same_content?/2 is worse than empty: is_binary(nil) is false, so every encrypted row looks like new content, defeating dedup/idempotency and producing duplicates or spurious title conflicts. So, mirroring US-41.4 AC-41.4.4's approach for Req: a static/Credo check asserts that NO module outside the resolver reads articles.body / memories.text or CASTS them in a changeset, with an explicit allowlist, and a fixture violating it makes the check FAIL. WRITE paths are covered too: the #331 in-place edit, merge, supersede and memory-graduation paths must not be able to write a plaintext body onto an encrypted row (which would silently de-encrypt private content) - update_changeset casts :body directly today. Tests cover update/merge/supersede/graduation on an encrypted row leaving no plaintext in body, plus dedup, OKF and Obsidian streaming export, and chunking over an encrypted corpus.",
       "status": "pending"
     },
     {
       "id": "AC-41.6.2",
-      "description": "The per-tenant DEK store is created BY THIS STORY, not assumed: a table (or vault-backed store) holding one wrapped DEK per tenant, each wrapped by the server KEK, with the wrapping/unwrapping path, the cache lifetime and the rotation entry point all specified. Cloak's global vault provides the KEK; it does NOT provide per-tenant keys. This is the security-critical design decision of the story and is reviewed as such.",
+      "description": "The per-tenant DEK store is created BY THIS STORY, not assumed: a table (or vault-backed store) holding one wrapped DEK per tenant, each wrapped by the server KEK, with the wrapping/unwrapping path, the cache lifetime and the rotation entry point all specified. Cloak's global vault provides the KEK; it does NOT provide per-tenant keys. THE INVARIANT THAT MAKES AC-41.6.7's DB-DUMP PROTECTION REAL IS EXPLICIT AND TESTED: the KEK MUST NOT reside in the database or in any database backup. If the wrapped DEKs live in a table, a dump contains both the ciphertext and the wrapped keys, so the entire claim rests on the KEK being elsewhere (an env-injected secret / Fly secret / external vault) - an unstated prerequisite is not a control. A test asserts that a full logical dump of the database contains no KEK material and that the encrypted rows are undecryptable from the dump alone. EVERY DECRYPTION PATH TRAVERSES THE DEK UNWRAP, so unwrap is the one compensating control that also covers non-context callers (see AC-41.6.12): the key store logs each unwrap with actor, tenant and purpose. This is the security-critical design decision of the story and is reviewed as such.",
       "status": "pending"
     },
     {
@@ -31,12 +31,12 @@
     },
     {
       "id": "AC-41.6.4",
-      "description": "For encrypted rows the tsvector/FTS path is SKIPPED (ciphertext cannot be usefully indexed) and recall is vector-only. Because articles.search_vector is a STORED GENERATED column whose expression is table-wide, this requires an explicit ONLINE strategy, not an in-place expression change (altering it forces a full table rewrite plus a GIN rebuild, against the repo's documented no-write-outage convention, 20260712000000): drop the generated column and replace it with the TRIGGER-MAINTAINED search_vector pattern already used for stories/projects/epics, backfilling in resumable batches with the GIN index rebuilt CONCURRENTLY. The trigger writes title-only for encrypted rows. A test asserts an encrypted article is found by semantic search, does NOT appear in a plaintext keyword search of its body, and that its search_vector contains no body plaintext.",
+      "description": "For encrypted rows the tsvector/FTS path is SKIPPED (ciphertext cannot be usefully indexed) and recall is vector-only. Because articles.search_vector is a STORED GENERATED column whose expression is table-wide, this requires an explicit ONLINE strategy, not an in-place expression change (altering it forces a full table rewrite plus a GIN rebuild, against the repo's documented no-write-outage convention, 20260712000000): drop the generated column and replace it with the TRIGGER-MAINTAINED search_vector pattern already used for stories/projects/epics, backfilling in resumable batches with the GIN index rebuilt CONCURRENTLY. The trigger writes title-only for encrypted rows (see AC-41.6.14 on titles). READ CORRECTNESS DURING THE WINDOW IS GUARANTEED, not just write availability: mirroring US-41.1 AC-41.1.8, the cutover is DUAL-COLUMN / DUAL-READ with an explicit flag - the trigger-maintained column is populated alongside the generated one and reads keep using the generated column until the backfill reports completion, at which point a reversible flag flips reads to the new column and the generated column is dropped in a follow-up. Without this, keyword search over the whole corpus silently under-returns between the swap and backfill completion - the exact silent-partial-result failure AC-41.6.5 forbids everywhere else. A test asserts keyword results are IDENTICAL mid-migration (with only part of the corpus backfilled), in addition to TC-41.6.8's no-write-outage assertion. THE MEMORY PATH IS COVERED TOO: memories have no tsvector at all - keyword recall over memories is ILIKE on memory.text (memory.ex:909), and ilike(NULL, pattern) is NULL, so an encrypted memory would be dropped from keyword recall silently. Encrypted memories are therefore excluded from ILIKE recall DELIBERATELY and the exclusion is reported in meta per AC-41.6.5, never left to NULL semantics. A test asserts an encrypted article is found by semantic search, does NOT appear in a plaintext keyword search of its body, that its search_vector contains no body plaintext, and the equivalent for an encrypted MEMORY on the ILIKE path.",
       "status": "pending"
     },
     {
       "id": "AC-41.6.5",
-      "description": "Whenever the semantic path is unavailable (fallback:true, circuit open, or egress_blocked per US-41.4 AC-41.4.7), any response that could have matched encrypted rows MUST state in meta that encrypted-tier content was excluded, because encrypted rows are not keyword-searchable by construction. Degraded retrieval is an observed normal operating mode at corpus scale (KB 877a415d), not an edge case, so a silent empty or partial result here would read as data loss. Never a bare empty list.",
+      "description": "Whenever the semantic path is unavailable (fallback:true, circuit open, or egress_blocked per US-41.4 AC-41.4.7), any response that could have matched encrypted rows MUST populate US-41.4's reserved meta.excluded_tiers field, stating that encrypted-tier content was excluded, because encrypted rows are not keyword-searchable by construction. THIS APPLIES TO BOTH CORPORA EXPLICITLY: the articles FTS path AND the memory ILIKE fallback path (memory.ex:909) - naming only the article path would leave encrypted memories vanishing from recall with no error and no meta, which is the very failure this AC exists to prevent. Degraded retrieval is an observed normal operating mode at corpus scale (KB 877a415d), not an edge case, so a silent empty or partial result here would read as data loss. Never a bare empty list.",
       "status": "pending"
     },
     {
@@ -46,7 +46,7 @@
     },
     {
       "id": "AC-41.6.7",
-      "description": "The threat model is stated plainly in the docs AND in the tool descriptions that expose the flag: v1 protects against a database dump, a stolen backup and a disk image. It does NOT protect against a compromised application server, against another role inside the same tenant, or against the operator, because the KEK is server-held. No text in this epic, the API docs, or the MCP tool descriptions may imply otherwise.",
+      "description": "The threat model is stated plainly in the docs AND in the tool descriptions that expose the flag, and it is scoped to exactly what a server-held-KEK design can claim: v1 protects against a DATABASE DUMP, a STOLEN DATABASE BACKUP, and a disk image OF THE DATABASE VOLUME - and only because AC-41.6.2 requires the KEK to live outside the database and its backups. The round-1 unqualified 'disk image' is narrowed here: an image or memory capture of the APPLICATION host is NOT covered, since that host holds the KEK (e.g. materialized from a Fly secret into the machine environment). It does NOT protect against a compromised application server, against another role inside the same tenant, or against the operator. IT ALSO DOES NOT RESTRICT EGRESS: encryption is at rest only, so on a scope that is not local_only every body is still sent in full plaintext to Anthropic (extraction) and OpenAI (embedding) BEFORE it is encrypted at rest. That is stated as a first-class non-protection alongside the other three, because 'encrypted' is exactly the word a user storing health, DNA or financial data will read as end-to-end - and this story's own stated failure mode is a user trusting a privacy feature further than it goes. See AC-41.6.13 for the enable-time enforcement. No text in this epic, the API docs, or the MCP tool descriptions may imply otherwise.",
       "status": "pending"
     },
     {
@@ -66,12 +66,22 @@
     },
     {
       "id": "AC-41.6.11",
-      "description": "DISABLING encrypt_body is specified, not left to chance: the OFF transition requires role :user, and it enqueues a resumable DECRYPT backfill that rewrites each row back to plaintext body/text so the search_vector trigger repopulates the full-text entry - otherwise a decrypted row would read as plaintext tier while being permanently unsearchable. Rows still awaiting decryption remain readable and remain excluded from FTS, and the surface reports how many rows are still encrypted. A test disables the flag on a corpus and asserts every row is both readable AND keyword-searchable after the backfill completes.",
+      "description": "DISABLING encrypt_body is specified, not left to chance: the OFF transition requires role :user, and it enqueues a resumable DECRYPT backfill that rewrites each row back to plaintext body/text so the search_vector trigger repopulates the full-text entry - otherwise a decrypted row would read as plaintext tier while being permanently unsearchable. Rows still awaiting decryption remain readable and remain excluded from FTS, and the surface reports how many rows are still encrypted. A test disables the flag on a corpus containing BOTH articles and memories and asserts every row is readable AND keyword-recallable after the backfill completes - articles via the search_vector/FTS path and memories via the ILIKE path (memory.ex:909), since a restore test written against articles.body alone would leave memories.text permanently unsearchable and undetected.",
       "status": "pending"
     },
     {
       "id": "AC-41.6.12",
-      "description": "Superadmin reads of encrypted-tier rows are audited as a distinct, visible event. If the operator can technically decrypt (they can, in v1), that access must at minimum leave a witnessed trace.",
+      "description": "Superadmin reads of encrypted-tier rows THROUGH THE API are audited as a distinct, visible event. The scope is stated honestly rather than implied to be universal: decryption is specified at the context layer (AC-41.6.1), and the operator paths that matter most - AdminRepo / HeavyReadRepo direct SQL, mix tasks, and fly ssh psql - do NOT traverse the context layer, so an API-level hook cannot see them. Those paths are therefore OUT OF SCOPE of the read trace and the docs say so. The COMPENSATING CONTROL is at the one place every decryption path must pass: the DEK unwrap in the key store (AC-41.6.2) logs actor, tenant, purpose and count, so even a direct-SQL operator must unwrap a key to read plaintext and that unwrap is recorded. A test asserts both: a superadmin API read produces the distinct audit event, and a decryption performed outside the context layer still produces an unwrap log entry.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.13",
+      "description": "encrypt_body WITHOUT local_only is treated as a named POSTURE DEFECT, not a neutral configuration. The two flags remain independent (a tenant may legitimately want at-rest encryption while accepting vendor inference), but enabling encrypt_body on a scope that is not local_only MUST return an explicit warning in the response - naming that bodies still egress in full plaintext to the extraction and embedding providers before being encrypted at rest, and naming the remediation (enable local_only, or configure local endpoints first) - and egress_posture (US-41.4 AC-41.4.8) MUST report the combination as the named posture defect 'encrypted_at_rest_plaintext_in_flight'. The warning is not suppressible; it is the difference between a true and a false reading of the word 'encrypted' for the persona this story names (health, DNA, financial data). A test enables encrypt_body on a vendor-endpoint scope and asserts both the enable-time warning and the posture defect.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.14",
+      "description": "TITLES ARE NOT ENCRYPTED IN v1, and that is a decided AC rather than an open technical note - an undecided question inside a security story becomes an implementer's coin flip. Titles stay plaintext so that findability, dedup/title-conflict detection (knowledge.ex same_content?/2 and the title-uniqueness path), listing surfaces and the title-only search_vector of AC-41.6.4 keep working. THE CONSEQUENCE IS STATED LOUDLY in the docs, the threat model text and the tool descriptions that expose the flag: for health, DNA or financial content the TITLE is often the whole disclosure, so a user must title encrypted articles non-descriptively. TC-41.6.1's 'no plaintext fragment' assertion is scoped accordingly: no plaintext of the BODY anywhere (row or search_vector); the title IS present in plaintext by design. Encrypted titles are a separate story alongside the tenant-held KEK.",
       "status": "pending"
     }
   ],
@@ -82,7 +92,7 @@
       "type": "integration",
       "preconditions": ["scope with encrypt_body enabled"],
       "steps": ["create an article", "read the row directly via SQL"],
-      "expected_results": ["body is NULL and body_encrypted is ciphertext", "no plaintext fragment present", "search_vector contains no body plaintext", "the CHECK constraint rejects a row with both columns set"],
+      "expected_results": ["body is NULL and body_encrypted is ciphertext", "no plaintext fragment OF THE BODY present anywhere in the row", "search_vector contains no body plaintext - it holds the title only, which is plaintext BY DESIGN per AC-41.6.14", "the CHECK constraint rejects a row with both columns set, and rejects a row with neither"],
       "status": "pending"
     },
     {
@@ -98,9 +108,9 @@
       "id": "TC-41.6.3",
       "name": "degraded retrieval reports the encrypted-tier exclusion",
       "type": "integration",
-      "preconditions": ["encrypted rows", "semantic path forced unavailable (fallback / circuit open / egress_blocked)"],
-      "steps": ["run a search that would have matched an encrypted row"],
-      "expected_results": ["meta states encrypted-tier content was excluded and why", "never a silent empty or partial result"],
+      "preconditions": ["encrypted ARTICLES and encrypted MEMORIES", "semantic path forced unavailable (fallback / circuit open / egress_blocked)", "a scope with BOTH local_only and encrypt_body - the cross-story assertion moved here from US-41.4 TC-41.4.11, since encrypt_body does not exist when US-41.4 is verified"],
+      "steps": ["run a knowledge search that would have matched an encrypted article", "run a memory recall that would have matched an encrypted memory"],
+      "expected_results": ["meta.excluded_tiers (the field reserved by US-41.4 AC-41.4.7) states encrypted-tier content was excluded and why", "the memory ILIKE path reports the exclusion too - encrypted memories are excluded deliberately, not silently dropped by ilike(NULL, pattern)", "with local_only + encrypt_body the response states BOTH egress_blocked AND the encrypted-tier exclusion, and labels the result incomplete", "never a silent empty or partial result"],
       "status": "pending"
     },
     {
@@ -134,9 +144,9 @@
       "id": "TC-41.6.7",
       "name": "disabling encrypt_body restores searchability",
       "type": "integration",
-      "preconditions": ["tenant with an encrypted corpus"],
-      "steps": ["disable encrypt_body at role :user", "let the decrypt backfill finish", "keyword search a distinctive body phrase"],
-      "expected_results": ["an agent-role attempt to disable is refused", "every row readable as plaintext", "keyword search finds the phrase - no permanently unsearchable rows", "progress is reported while rows remain encrypted"],
+      "preconditions": ["tenant with an encrypted corpus of BOTH articles and memories"],
+      "steps": ["disable encrypt_body at role :user", "let the decrypt backfill finish", "keyword search a distinctive ARTICLE body phrase", "ILIKE-recall a distinctive MEMORY text phrase"],
+      "expected_results": ["an agent-role attempt to disable is refused", "every row readable as plaintext", "the article phrase is found via FTS AND the memory phrase via the ILIKE path - no permanently unsearchable rows in EITHER corpus", "progress is reported while rows remain encrypted"],
       "status": "pending"
     },
     {
@@ -144,24 +154,51 @@
       "name": "search_vector cutover causes no write outage",
       "type": "integration",
       "preconditions": ["a populated articles corpus"],
-      "steps": ["run the generated-column-to-trigger migration", "write articles during the backfill", "keyword search"],
-      "expected_results": ["writes succeed throughout - no full-table-rewrite lock", "rows written mid-migration are searchable after completion"],
+      "steps": ["run the DROP NOT NULL migration", "run the ADD CONSTRAINT ... NOT VALID migration and then the separate VALIDATE CONSTRAINT migration", "run the generated-column-to-trigger cutover", "write articles during the backfill", "keyword search MID-migration and after completion", "observe lock acquisitions throughout"],
+      "expected_results": ["writes succeed throughout - no full-table-rewrite lock and no long ACCESS EXCLUSIVE hold on any step", "keyword results mid-migration are IDENTICAL to pre-migration - reads keep using the generated column until the flag flips, so the corpus never silently under-returns", "rows written mid-migration are searchable after completion", "the read flag flip is reversible"],
       "status": "pending"
     },
     {
       "id": "TC-41.6.9",
-      "name": "superadmin read is audited",
+      "name": "operator decryption leaves a trace - API-audited, unwrap-logged elsewhere",
       "type": "integration",
-      "preconditions": ["encrypted row", "superadmin key"],
-      "steps": ["read the row as superadmin"],
-      "expected_results": ["a distinct audit event is recorded naming the actor and the row"],
+      "preconditions": ["encrypted row", "superadmin key", "a direct AdminRepo/mix-task read path that bypasses the context layer"],
+      "steps": ["read the row as superadmin through the API", "decrypt the same row through the non-context path"],
+      "expected_results": ["the API read records a distinct audit event naming the actor and the row", "the non-context decryption still produces a DEK-unwrap log entry naming actor, tenant and purpose", "the docs state plainly that direct database access is outside the API read trace and that unwrap logging is the compensating control - the AC does not imply universal coverage"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.6.10",
+      "name": "every body/text reader and writer goes through the resolver",
+      "type": "integration",
+      "preconditions": ["an encrypted corpus", "a fixture module in the scanned path list that reads articles.body directly"],
+      "steps": ["run the static/Credo resolver check", "OKF and Obsidian streaming export of the encrypted corpus", "run dedup/idempotency (same_content?/2) against identical content", "run the chunker, the reclassify worker and the embedding worker", "update, merge, supersede an encrypted article and graduate an encrypted memory"],
+      "expected_results": ["the static check FAILS on the fixture and passes on lib/ as shipped", "exports emit decrypted bodies, never empty ones - no 200 with silent data loss", "dedup correctly identifies duplicate content instead of treating every encrypted row as new", "no write path leaves plaintext in body/text on an encrypted row"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.6.11",
+      "name": "KEK is not in the database or its backups",
+      "type": "integration",
+      "preconditions": ["a tenant with encrypted rows and a wrapped DEK"],
+      "steps": ["take a full logical dump of the database", "attempt to decrypt an encrypted row using only the dump's contents"],
+      "expected_results": ["no KEK material appears anywhere in the dump", "decryption from the dump alone is impossible - the wrapped DEKs are useless without the externally-held KEK", "the threat-model text claims protection only for the database volume, never for an application-host image"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.6.12",
+      "name": "encrypt_body without local_only warns and is reported as a posture defect",
+      "type": "integration",
+      "preconditions": ["a scope on vendor endpoints with local_only OFF"],
+      "steps": ["enable encrypt_body", "call egress_posture"],
+      "expected_results": ["the enable response carries a non-suppressible warning naming plaintext egress to the extraction and embedding providers, with a remediation", "egress_posture reports the named defect 'encrypted_at_rest_plaintext_in_flight'", "the tool description and docs state that encryption at rest does not restrict egress"],
       "status": "pending"
     }
   ],
   "technical_notes": [
     "Cloak's Ecto types work per-field and see neither the row nor the tenant; that is precisely why AC-41.6.1 uses a separate ciphertext column plus context-layer encryption rather than swapping body's type. Do not attempt a conditional Cloak.Ecto.Binary - it cannot be written.",
     "articles.search_vector is a STORED GENERATED column. Postgres refuses to alter the type of a column a generated column depends on, and changing the generation expression rewrites the table. AC-41.6.4's drop-and-trigger cutover (mirroring stories/projects/epics) is the online path; treat it as the migration risk of this story.",
-    "Titles: decide whether titles are also encrypted. A plaintext title on a DNA article leaks a great deal. If titles stay plaintext for findability, say so loudly in the docs - do not leave it implicit.",
+    "Titles: DECIDED in AC-41.6.14 - plaintext in v1, for findability, dedup and the title-only search_vector, with the leak stated loudly in the docs and tool descriptions. This is no longer an open question for the implementer.",
     "A tenant-held KEK (so the operator genuinely cannot decrypt) is the real upgrade and belongs in its own story. Do not gesture at it here.",
     "Cross-check against the visibility asymmetry in the background note: encryption is orthogonal to the visibility flag, and users will conflate them. The tool descriptions must be precise about which one does what - encryption is tenant/subject isolation at rest, NOT intra-tenant role separation."
   ],

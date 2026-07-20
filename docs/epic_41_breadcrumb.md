@@ -38,9 +38,17 @@ repo-coordination-bus epic, and 40 is the coordination-bus v2 epic.
    endpoint at CONFIG time (an agent gets no settings screen to notice a mistake in).
 
 ## Key grounded facts (re-verified against master 2026-07-20, ~240 commits after the draft)
-- Dimension pinned in exactly TWO `ALTER TABLE`s; HNSW indexes inherit the column
-  type (`repo/hnsw_index.ex:125`) — smaller than the draft claimed
-- Embedding KEY is already per-tenant and MANDATORY (`runtime.exs:375-381`) — so
+- Dimension pinned in exactly TWO `ALTER TABLE`s. **CORRECTION (round 2):** the
+  earlier "HNSW indexes inherit the column type (`repo/hnsw_index.ex:125`) — smaller
+  than the draft claimed" bullet was WRONG and is retracted. pgvector refuses to
+  build an hnsw/ivfflat index on a `vector` column with no dimension modifier, and a
+  `WHERE dim = N` partial predicate supplies no typmod, so a mixed-dimension side
+  table needs a typed column/partition per dimension **or** an expression index over
+  an explicit cast. Single source of truth: the "Grounded current state" table in
+  `docs/user_stories/epic_41_private_local_tier/README.md` and US-41.1 AC-41.1.2 —
+  do not re-derive the cost from this file.
+- Embedding KEY is already per-tenant and MANDATORY (`runtime.exs:385-390` carries
+  the comment recording the deliberate removal of the global operator key) — so
   the per-tenant plumbing and its MCP surface already exist
 - `Provider.Admission` gates all three provider `Req.post`s but is **FAIL-OPEN by
   design** (`admission.ex:81-97`, `fail_open/2:183`) — the egress guard must be a
@@ -51,7 +59,11 @@ repo-coordination-bus epic, and 40 is the coordination-bus v2 epic.
 ## Next Steps
 1. `/review:enhanced-review-workflow` on PR #410 (README + 7 stories)
 2. Fix confirmed findings — no deferrals
-3. Implement 41.1 -> 41.2 -> 41.3 -> 41.4 -> 41.5, then 41.6 / 41.7
+3. Implement **41.4 first** -> 41.1 -> 41.2 -> 41.3 -> 41.5, then 41.6 / 41.7.
+   41.4 leads because AC-41.2.7 and AC-41.3.3 both REQUIRE the single egress policy
+   module introduced in AC-41.4.9 and forbid a second, divergent URL policy — the
+   old 41.1-first ordering forced exactly the duplicate policy those ACs call a
+   review failure. US-41.2 and US-41.3 now declare US-41.4 as a dependency.
 4. Update GH #409 with the re-scope (held for owner review, not yet posted)
 
 ## Breadcrumbs

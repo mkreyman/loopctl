@@ -26,7 +26,7 @@
     },
     {
       "id": "AC-41.3.3",
-      "description": "Endpoint, model and provider for the chat surface are settable through the EXISTING set_llm_config MCP tool + matching API, consistent with US-41.2, and carry the same config-time probe and remediation shape (a trivial completion is issued before persisting). Like US-41.2 AC-41.2.2 that write stays ROLE :user - the epic's agent-manageability audit is corrected to user-write for this row, since the same PATCH stores tenant secrets and CLAUDE.md's role checklist forbids downgrading it to :agent. The probe consults the single egress policy module (US-41.4 AC-41.4.9), not a private URL policy.",
+      "description": "Endpoint, model and provider for the chat surface are settable through the EXISTING set_llm_config MCP tool + matching API, consistent with US-41.2, and carry the same config-time probe and remediation shape (a trivial completion is issued before persisting). Like US-41.2 AC-41.2.2 that write stays ROLE :user - the epic's agent-manageability audit is corrected to user-write for this row, since the same PATCH stores tenant secrets and CLAUDE.md's role checklist forbids downgrading it to :agent. The probe consults the single egress policy module (US-41.4 AC-41.4.9), not a private URL policy - which is why this story DEPENDS on US-41.4 and is implemented after it. It also carries US-41.2 AC-41.2.3's credential rule verbatim: changing the chat endpoint requires a matching key in the same PATCH or an explicit acknowledgement that the stored key will be transmitted to the new host; the probe never ships an existing credential to a new host silently.",
       "status": "pending"
     },
     {
@@ -94,6 +94,6 @@
     "config/test.exs already maps all these behaviours to Mox mocks; the tenant-aware router keeps that mapping the seam config/test.exs points at (Knowledge.ExtractorBehaviour -> MockExtractor etc.), so no test needs Application.put_env (CLAUDE.md forbids it) and no existing test changes.",
     "Per-tenant runtime selection means the ROUTER's functions take tenant_id and resolve the sibling per call - resist the temptation to reuse the compile-time Application.compile_env pattern used by Oban workers here. This is a deliberate, documented departure from the compile-time half of the config-based DI convention, and the reason is that provider choice is tenant data, not deployment config."
   ],
-  "dependencies": [],
+  "dependencies": ["US-41.4"],
   "estimated_tokens": 500000
 }
