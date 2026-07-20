@@ -1,0 +1,123 @@
+{
+  "id": "US-41.6",
+  "title": "Encrypted private-tier bodies at rest + vector-only recall + honest threat model",
+  "epic": {
+    "id": "epic_41",
+    "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
+  },
+  "priority": "medium",
+  "background": "articles.body (knowledge/article.ex:52) and memories.text (memory/memory.ex:84) are plain :string columns. Loopctl.Vault.Binary is applied to exactly four fields repo-wide: llm/tenant_llm_settings.ex:44 and :51 (the two BYO keys), webhooks/webhook.ex:61 (signing_secret_encrypted), auth/idempotency_cache.ex:16 (response_data). articles.search_vector is a generated tsvector over title (weight A) + body (weight B) with a GIN index (20260410021836_add_search_vector_to_articles.exs:6-13), so plaintext bodies are load-bearing for keyword search. Note also that the existing private/owner visibility (article.ex:114, @valid_visibilities shared|private|owner) is a metadata STRING enforced query-side ONLY for agent-role callers (coordination.ex:1021-1022) - user, orchestrator and superadmin keys see private articles, and memories have no visibility field at all. That flag is the wrong lever for health/DNA data; encryption is the right one.",
+  "story": {
+    "as_a": "a user storing health, DNA or financial data in a second brain",
+    "i_want_to": "have private-tier bodies encrypted at rest and recalled semantically",
+    "so_that": "a database dump or a disk image never exposes my private content in plaintext, while my agent can still find it"
+  },
+  "rationale": "Local inference (US-41.2/41.3) stops content going to vendors, but the content still lands in a shared Postgres in plaintext, where it also feeds a full-text index. Encrypting the private tier closes the at-rest exposure. It must be shipped with an honest threat model, because the failure mode of a privacy feature is a user trusting it further than it goes.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-41.6.1",
+      "description": "An encrypt_body marking (per-scope, aligned with US-41.4's local_only, or an explicit flag) causes article bodies and memory texts in that scope to be stored via the existing Cloak/Vault machinery using a PER-TENANT data encryption key. A direct DB read of the row shows ciphertext. Non-private rows are unchanged.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.2",
+      "description": "For encrypted rows the tsvector/FTS path is SKIPPED (ciphertext cannot be usefully indexed) and recall is vector-only. A test asserts an encrypted article is found by semantic search and does NOT appear in a plaintext keyword search of its body - and that the generated search_vector contains no plaintext body content.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.3",
+      "description": "On retrieval by an in-scope caller the body is transparently decrypted and returned as today; an out-of-scope caller gets the usual 404/scope-denied with no plaintext and no existence leak. Tenant and subject isolation are preserved exactly as before.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.4",
+      "description": "The threat model is stated plainly in the docs AND in the tool descriptions that expose the flag: v1 protects against a database dump, a stolen backup and a disk image. It does NOT protect against a compromised application server or against the operator, because the vault key is server-held. No text in this epic, the API docs, or the MCP tool descriptions may imply otherwise.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.5",
+      "description": "The embedding-inversion caveat is documented at the same place: with bodies encrypted, the stored VECTORS become the residual exposure, since embeddings can partially leak content. The docs state this rather than implying encryption closes the gap.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.6",
+      "description": "Key rotation is possible without data loss: rotating a tenant's DEK re-encrypts that tenant's rows via a resumable backfill, consistent with how Cloak rotation is handled elsewhere in the app. A tenant with no encrypted rows is a no-op.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.7",
+      "description": "Default-off and non-breaking: existing rows and the hosted default stay plaintext with FTS. Enabling the flag affects rows written after it, and a documented, agent-triggerable backfill converts existing rows in scope.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.6.8",
+      "description": "Superadmin reads of encrypted-tier rows are audited as a distinct, visible event. If the operator can technically decrypt (they can, in v1), that access must at minimum leave a witnessed trace.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-41.6.1",
+      "name": "ciphertext at rest",
+      "type": "integration",
+      "preconditions": ["scope with encrypt_body enabled"],
+      "steps": ["create an article", "read the row directly via SQL"],
+      "expected_results": ["body column is ciphertext", "no plaintext fragment present", "search_vector contains no body plaintext"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.6.2",
+      "name": "semantic recall works, keyword recall does not",
+      "type": "integration",
+      "preconditions": ["encrypted article with an embedding"],
+      "steps": ["semantic search for its topic", "keyword search for a distinctive body phrase"],
+      "expected_results": ["semantic finds it", "keyword does not"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.6.3",
+      "name": "transparent decryption for in-scope caller, denial for out-of-scope",
+      "type": "integration",
+      "preconditions": ["two tenants, one encrypted article"],
+      "steps": ["fetch as the owning tenant", "fetch as the other tenant"],
+      "expected_results": ["owner gets plaintext", "other gets 404 with no existence leak"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.6.4",
+      "name": "per-tenant key isolation",
+      "type": "integration",
+      "preconditions": ["two tenants with encrypted rows"],
+      "steps": ["attempt to decrypt tenant A's row with tenant B's key"],
+      "expected_results": ["fails - keys are not interchangeable"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.6.5",
+      "name": "key rotation is resumable and lossless",
+      "type": "integration",
+      "preconditions": ["tenant with encrypted rows"],
+      "steps": ["start rotation", "interrupt", "resume"],
+      "expected_results": ["all rows readable after completion", "no double-encrypted or unreadable rows"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.6.6",
+      "name": "superadmin read is audited",
+      "type": "integration",
+      "preconditions": ["encrypted row", "superadmin key"],
+      "steps": ["read the row as superadmin"],
+      "expected_results": ["a distinct audit event is recorded naming the actor and the row"],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Cloak's Ecto types work per-field; the challenge here is the PER-TENANT key, which the current single-vault setup does not do. Decide the key-derivation approach explicitly and review it - this is the security-critical design decision of the story.",
+    "The generated search_vector column is computed in the DB from title and body. For encrypted rows it must not be generated from the ciphertext either (that leaks nothing but wastes space and could confuse ranking) - handle the generated-column semantics deliberately.",
+    "Titles: decide whether titles are also encrypted. A plaintext title on a DNA article leaks a great deal. If titles stay plaintext for findability, say so loudly in the docs - do not leave it implicit.",
+    "A tenant-held KEK (so the operator genuinely cannot decrypt) is the real upgrade and belongs in its own story. Do not gesture at it here.",
+    "Cross-check against the visibility asymmetry in the background note: encryption is orthogonal to the visibility flag, and users will conflate them. The tool descriptions must be precise about which one does what."
+  ],
+  "dependencies": ["US-41.1"],
+  "estimated_tokens": 450000
+}

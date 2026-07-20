@@ -1,0 +1,108 @@
+{
+  "id": "US-41.7",
+  "title": "Egress posture as a witnessed custody claim in the audit chain / STH",
+  "epic": {
+    "id": "epic_41",
+    "name": "Private / Local-Only Knowledge & Memory (data sovereignty)"
+  },
+  "priority": "medium",
+  "background": "Epic 26 gave loopctl a hash-chained, append-only audit chain (US-26.1.1) with signed tree heads published at a public endpoint (US-26.1.2) and a witness protocol (US-26.5.2). Today that chain answers 'who did this work and did anyone mark their own homework'. It says nothing about WHERE the data went. Meanwhile US-41.2 records probe results and US-41.4 records egress decisions, so the facts already exist as log entries - they are simply not bound into the chain as claims a third party can verify.",
+  "story": {
+    "as_a": "a user who put private documents into a hosted second brain",
+    "i_want_to": "obtain a signed, witnessed attestation that a given article was produced with zero third-party egress",
+    "so_that": "I can VERIFY the privacy claim after the fact instead of trusting the operator's configuration screenshot"
+  },
+  "rationale": "This is the story that makes hosted loopctl strictly better than a self-hosted fork rather than merely as good. Someone who self-hosts gets privacy but no proof - they cannot show anyone, including themselves six months later, that a given harvest stayed local. Binding egress posture into the existing chain-of-custody extends it from 'who did the work' to 'where the data went', which is a natural L1/L2 extension of the Epic 26 model rather than a new mechanism.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-41.7.1",
+      "description": "At ingest/write time, the RESOLVED egress posture for that operation (embedding endpoint + local classification, chat endpoint + local classification, local_only state, encrypt_body state) is recorded into the append-only audit chain, bound to the produced article or memory.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.2",
+      "description": "The recorded posture is the ACTUAL resolved values used for that operation, not the current settings read back later. A subsequent settings change must not alter what the record says about a past write - a test changes settings after the write and asserts the historical claim is unchanged.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.3",
+      "description": "The claim rides the existing STH machinery: once included in a signed tree head, the posture record is externally verifiable through the existing public STH endpoint and inclusion-proof path, using the existing witness protocol. No parallel signing scheme is introduced.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.4",
+      "description": "An agent-readable surface returns the custody claim for a given article or memory - MCP tool + matching JSON endpoint, no UI - reporting whether it was produced with zero third-party egress, and if not, which endpoints were involved.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.5",
+      "description": "The claim is precise about its scope and does not overstate: it attests to the endpoints loopctl called for THIS operation. It does not and must not claim anything about what those endpoints did with the data afterwards, nor about egress paths outside the guard's coverage. The wording is reviewed for exactly this.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.6",
+      "description": "Recording is cheap and non-blocking on the hot path, consistent with how existing audit writes are handled; a failure to record is itself surfaced rather than silently dropped (a missing claim must never read as a satisfied claim).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-41.7.7",
+      "description": "Absence is legible: for rows written before this story, or in a scope with no local_only marking, the surface returns an explicit 'no claim recorded' rather than anything that could be read as a negative or positive attestation.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-41.7.1",
+      "name": "posture recorded and bound to the article",
+      "type": "integration",
+      "preconditions": ["local_only scope with local endpoints"],
+      "steps": ["harvest a document", "fetch the custody claim for the produced article"],
+      "expected_results": ["claim reports zero third-party egress", "names the local endpoints used"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.2",
+      "name": "historical claim is immutable under settings change",
+      "type": "integration",
+      "preconditions": ["article written under local endpoints"],
+      "steps": ["change the tenant to vendor endpoints", "re-read the claim for the original article"],
+      "expected_results": ["unchanged - still reports the endpoints actually used at write time"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.3",
+      "name": "claim is included in an STH and externally verifiable",
+      "type": "integration",
+      "preconditions": ["posture record written", "STH computed"],
+      "steps": ["fetch the STH and the inclusion proof"],
+      "expected_results": ["the record verifies against the signed tree head via the existing protocol"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.4",
+      "name": "no claim recorded reads as absent, not as satisfied",
+      "type": "integration",
+      "preconditions": ["article written before this story"],
+      "steps": ["fetch its custody claim"],
+      "expected_results": ["explicit no-claim-recorded response", "nothing that could be misread as an attestation either way"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-41.7.5",
+      "name": "mixed-posture write is reported accurately",
+      "type": "integration",
+      "preconditions": ["local embedding endpoint but vendor chat endpoint"],
+      "steps": ["harvest a document", "read the claim"],
+      "expected_results": ["claim does NOT report zero third-party egress", "names the vendor endpoint involved"],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Reuse the Epic 26 chain and STH machinery wholesale - the value here is that the claim inherits an ALREADY-WITNESSED structure. A separate signing path would be both more work and less trustworthy.",
+    "Hot-path cost matters: harvesting writes many articles. Follow the existing audit-write pattern rather than adding a synchronous round-trip per article.",
+    "Wording review is a real acceptance criterion, not a formality. The difference between 'loopctl sent this to no third party' and 'this data was never seen by a third party' is the difference between a true claim and a false one.",
+    "Coordinate with US-41.5: until webhook egress is covered, a zero-third-party-egress claim would be incomplete. Either land 41.5 first or scope the claim's wording to provider calls explicitly."
+  ],
+  "dependencies": ["US-41.4"],
+  "estimated_tokens": 400000
+}
