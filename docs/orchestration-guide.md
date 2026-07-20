@@ -185,7 +185,7 @@ Set `initial_agent_status` and `initial_verified_status` on stories at import ti
 imported as `verified` are immediately treated as verified and unblock their dependents:
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/projects/:id/import \
+curl -X POST http://localhost:4030/api/v1/projects/:id/import \
   -H "Authorization: Bearer lc_superadmin_key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -237,7 +237,7 @@ strings; they normalize to integers before the DB lookup.
 Import stories normally (they start as `pending`), then bulk-complete them in one call:
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/stories/bulk/mark-complete \
+curl -X POST http://localhost:4030/api/v1/stories/bulk/mark-complete \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -301,7 +301,7 @@ After implementation agents have reported done on all stories in an epic, the or
 verify the entire epic in a single call instead of verifying each story individually:
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/epics/:id/verify-all \
+curl -X POST http://localhost:4030/api/v1/epics/:id/verify-all \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{"review_type": "enhanced", "summary": "Epic-wide review passed, all ACs met"}'
@@ -317,10 +317,10 @@ per page:
 
 ```bash
 # Find all stories still pending after bulk import
-curl "http://localhost:4000/api/v1/stories?project_id=:id&verified_status=unverified&limit=500"
+curl "http://localhost:4030/api/v1/stories?project_id=:id&verified_status=unverified&limit=500"
 
 # Find reported_done stories awaiting orchestrator verification
-curl "http://localhost:4000/api/v1/stories?project_id=:id&agent_status=reported_done&verified_status=unverified"
+curl "http://localhost:4030/api/v1/stories?project_id=:id&agent_status=reported_done&verified_status=unverified"
 ```
 
 ---
@@ -339,7 +339,7 @@ whole application from a user's perspective.
 
 1. **Start the run** via the loopctl API (orchestrator role):
    ```bash
-   curl -sk -X POST https://192.168.86.55:8443/api/v1/projects/:id/ui_test_runs \
+   curl -s -X POST https://loopctl.com/api/v1/projects/:id/ui_test_runs \
      -H "Authorization: Bearer ${LOOPCTL_API_KEY:-$LOOPCTL_ORCH_KEY}" \
      -H "Content-Type: application/json" \
      -d '{"notes": "Post-epic-37 QA pass"}'

@@ -46,17 +46,26 @@ if System.get_env("RATE_LIMITER") == "postgres" do
   config :loopctl, :rate_limiter, Loopctl.RateLimiter.Postgres
 end
 
-config :loopctl, LoopctlWeb.Endpoint,
-  http: [
-    port: String.to_integer(System.get_env("PORT", "4000")),
-    # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
-    # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects
-    # :max_fragmented_message_size). It caps a REASSEMBLED (multi-frame) websocket
-    # message; the socket DSL `max_frame_size: 64_000` caps a single frame.
-    # Without this, N sub-64KB continuation frames reassemble into one message up
-    # to Bandit's 8 MB default, bypassing the per-frame cap.
-    websocket_options: [max_fragmented_message_size: 64_000]
-  ]
+endpoint_http = [
+  # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
+  # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects
+  # :max_fragmented_message_size). It caps a REASSEMBLED (multi-frame) websocket
+  # message; the socket DSL `max_frame_size: 64_000` caps a single frame.
+  # Without this, N sub-64KB continuation frames reassemble into one message up
+  # to Bandit's 8 MB default, bypassing the per-frame cap.
+  websocket_options: [max_fragmented_message_size: 64_000]
+]
+
+# PORT overrides the env-specific default (dev.exs pins 4030; prod must set PORT —
+# fly.toml sets 8080). Applied only when present so this all-envs block does not
+# clobber the per-app dev port with the old Phoenix-default 4000.
+endpoint_http =
+  case System.get_env("PORT") do
+    nil -> endpoint_http
+    port -> Keyword.put(endpoint_http, :port, String.to_integer(port))
+  end
+
+config :loopctl, LoopctlWeb.Endpoint, http: endpoint_http
 
 # Oban queue widths are env-driven (US-32.2) so an operator can retune a hot/starved
 # queue during an incident via `fly secrets set OBAN_QUEUE_<NAME>` + restart, no deploy.
