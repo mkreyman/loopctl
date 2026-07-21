@@ -210,8 +210,8 @@ defmodule Loopctl.DataCase do
     # webhook-worker tests — which Req.Test.stub(Loopctl.Webhooks.ReqDelivery) — keep
     # working unchanged. ScaleAlerts tests override this with Mox.expect/3 to assert the
     # firing POST.
-    Mox.stub(Loopctl.MockDelivery, :deliver, fn url, body, headers ->
-      ReqDelivery.deliver(url, body, headers)
+    Mox.stub(Loopctl.MockDelivery, :deliver, fn url, body, headers, scope ->
+      ReqDelivery.deliver(url, body, headers, scope)
     end)
 
     # Default Req.Test stub for CLI HTTP client

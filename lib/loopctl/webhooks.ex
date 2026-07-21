@@ -8,6 +8,19 @@ defmodule Loopctl.Webhooks do
 
   All operations are tenant-scoped via `tenant_id` and include audit
   logging via `Ecto.Multi`.
+
+  ## Destinations are vetted at CONFIG TIME, not only at delivery time (US-41.5)
+
+  AC-41.5.3: creating or updating a subscription whose destination is not local
+  for an already-`local_only` scope is REJECTED here with a legible remediation,
+  rather than accepted and silently blocked on every later delivery. The check
+  needs tenant/DB state (the effective marking and the tenant's declarations), so
+  it lives in the context rather than the changeset — but it runs BEFORE the
+  `Ecto.Multi`, so nothing is persisted on rejection.
+
+  It consults the SAME single egress policy the delivery path does
+  (`Loopctl.Egress.webhook_destination_check/2` → `Loopctl.Egress.Policy`), with
+  purpose `:webhook`. There is deliberately no second copy of the URL rules here.
   """
 
   import Ecto.Query
@@ -15,6 +28,8 @@ defmodule Loopctl.Webhooks do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Egress
+  alias Loopctl.Egress.Scope
   alias Loopctl.Tenants
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
@@ -56,6 +71,7 @@ defmodule Loopctl.Webhooks do
           signing_secret_encrypted: raw_secret
         }
         |> Webhook.create_changeset(attrs)
+        |> validate_destination_locality(tenant_id)
 
       multi =
         Multi.new()
@@ -182,7 +198,10 @@ defmodule Loopctl.Webhooks do
         "active" => webhook.active
       }
 
-      changeset = Webhook.update_changeset(webhook, attrs)
+      changeset =
+        webhook
+        |> Webhook.update_changeset(attrs)
+        |> validate_destination_locality(tenant_id)
 
       multi =
         Multi.new()
@@ -209,6 +228,7 @@ defmodule Loopctl.Webhooks do
       case AdminRepo.transaction(multi) do
         {:ok, %{webhook: updated}} -> {:ok, updated}
         {:error, :webhook, changeset, _} -> {:error, changeset}
+        {:error, _step, reason, _changes} -> {:error, reason}
       end
     end
   end
@@ -441,6 +461,34 @@ defmodule Loopctl.Webhooks do
   end
 
   # --- Private helpers ---
+
+  # AC-41.5.3. Runs ONLY when the destination URL is actually being set/changed
+  # AND the changeset is otherwise valid: classifying a URL that already failed
+  # `validate_egress/1` would replace a precise scheme/DNS error with a locality
+  # one, and re-classifying an UNCHANGED url on an unrelated update (e.g.
+  # `active: false`) would make a subscription that predates the marking
+  # un-editable — including the very edit that fixes it.
+  defp validate_destination_locality(%Ecto.Changeset{valid?: false} = changeset, _tenant_id),
+    do: changeset
+
+  defp validate_destination_locality(changeset, tenant_id) do
+    case Ecto.Changeset.get_change(changeset, :url) do
+      nil ->
+        changeset
+
+      url ->
+        project_id = Ecto.Changeset.get_field(changeset, :project_id)
+        scope = Scope.new(tenant_id, project_id)
+
+        case Egress.webhook_destination_check(scope, url) do
+          :ok ->
+            changeset
+
+          {:error, {_verdict, remediation}} ->
+            Ecto.Changeset.add_error(changeset, :url, remediation)
+        end
+    end
+  end
 
   defp generate_signing_secret do
     :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)

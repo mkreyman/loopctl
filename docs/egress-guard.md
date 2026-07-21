@@ -1,4 +1,4 @@
-# Fail-closed no-egress guard (US-41.4)
+# Fail-closed no-egress guard (US-41.4, US-41.5)
 
 A privacy tier that depends on the operator configuring three endpoints
 correctly is not a guarantee. This is the enforcement that turns it into one an
@@ -7,19 +7,123 @@ agent can verify.
 ## What is actually guaranteed
 
 > Fail-closed `local_only` enforcement applies to **every outbound HTTP call made
-> by loopctl application code** on the MODEL-PROVIDER path.
+> by loopctl application code** on **every content-carrying path**: model-provider
+> calls, the ingestion fetch, and webhook delivery.
 
-That wording is deliberate and narrow. Three things it does **not** claim:
+US-41.5 closed the webhook gap; the wording is still deliberate and narrow. Two
+things it does **not** claim:
 
-1. **Webhook delivery is not covered yet.** `Loopctl.Webhooks.ReqDelivery`
-   bypasses this guard entirely (it has its own SSRF pin, but no locality
-   decision). Bringing it under the guard is US-41.5. Until then, neither the
-   docs nor the posture report claim total egress control.
-2. **HTTP performed inside a dependency is invisible.** The static chokepoint
+1. **HTTP performed inside a dependency is invisible.** The static chokepoint
    check is an AST scan of this repository; a library that opens its own socket
    is outside it.
-3. **The separate `mcp-server/` codebase is not scanned.** It is a different
+2. **The separate `mcp-server/` codebase is not scanned.** It is a different
    process on the agent's machine.
+
+## Outbound-path triage (US-41.5, AC-41.5.6)
+
+Every outbound path in `lib/` is enumerated below. The list is not prose: the
+`@allowed` map in `Loopctl.Egress.ChokepointScan` is the machine-checked
+inventory (`mix credo --strict`), and `Loopctl.Egress.ChokepointScanTest`
+asserts that **every allowlist entry has a row in this table** — a call site the
+static check exempts with no triage entry fails the build.
+
+The rule applied: **anything carrying tenant content is brought UNDER the guard.**
+Nothing content-carrying is documented away.
+
+| Call site | Carries tenant content? | Disposition |
+|---|---|---|
+| `Loopctl.Provider` (`lib/loopctl/provider.ex`) | yes | **IS the model-provider chokepoint wrapper.** Consults `Egress.Policy` on every call. Allowlisted because it is the wrapper, not a bypass. |
+| `Loopctl.Webhooks.ReqDelivery` (`lib/loopctl/webhooks/req_delivery.ex`) | **yes — the payload is tenant state** | **IS the webhook chokepoint wrapper (US-41.5).** Consults the same `Egress.Policy.check/4` with purpose `:webhook` and `tenant_supplied: true`, then pins (`pinned_request_opts` + `redirect: false`). Allowlisted for the same reason `Provider` is. |
+| `Loopctl.Workers.ContentIngestionWorker` (`resolve_content/3`) | no — INBOUND content; sends no tenant data | **Under the guard, not exempt.** Not in the allowlist at all: it pins with `UrlGuard.pin/1` and then issues the fetch through `Provider.get/3` (purpose `:ingest`, `pinned_by_caller: true`), so it consults the one policy like everything else. |
+| `Loopctl.Workers.ScaleAlertDeliveryWorker` | no — operator-plane alerting (metric name, value, threshold) | Delivers through `ReqDelivery` with **`scope: nil`**. The URL is operator configuration, not tenant data, and there is no tenant marking to apply; the SSRF denylist still applies (the same `UrlGuard` primitive the policy composes). |
+| `Loopctl.Verification.GitHubActions` (`lib/loopctl/verification/github_actions.ex`) | no — reads commit/check-run metadata | Operator-plane, fixed vendor host, never reachable from a tenant-supplied URL. Allowlisted. |
+| `Loopctl.Secrets.FlyAdapter` (`lib/loopctl/secrets/fly_adapter.ex`) | no — operator secret management | Operator-plane against the Fly GraphQL API. Fixed host, never tenant-supplied. Allowlisted. |
+| `Loopctl.CLI.Client` (`lib/loopctl/cli/client.ex`) | no — targets the CONFIGURED loopctl server | The loopctl CLI's own client: runs on the operator's machine, outside the server request path, and is not a tenant-content egress path to a third party. **Exempted by an explicit allowlist entry** rather than being silently unmatched by the static check. |
+
+## Webhook delivery under the guard (US-41.5)
+
+`ReqDelivery.deliver/4` takes the `Loopctl.Egress.Scope` the delivery is made on
+behalf of — `Scope.new(webhook.tenant_id, webhook.project_id)`, so a project-less
+subscription follows the TENANT marking (most-restrictive-wins, AC-41.4.2). The
+old unconditional `UrlGuard.pin/1` was REPLACED by the policy call, not wrapped
+around it: there is exactly one URL policy.
+
+Consequences worth stating:
+
+- A destination the OPERATOR allowlisted (or that the tenant declared **for the
+  `webhook` purpose**) is now **deliverable**. It was not before — the bare
+  `UrlGuard.pin/1` refused every loopback/private destination for every tenant.
+- A host declared for an Ollama **inference** box does **not** authorize POSTing
+  tenant content to it. Purpose scoping is re-derived on every read
+  (`Policy.resolve_verdict/2`).
+- A tenant declaration still carves **nothing** out of the SSRF denylist. Only
+  the operator deployment allowlist can reach a private range
+  (GHSA-jh42-wf7g-f5rg stays closed for every tenant-writable input).
+
+### `blocked` is a distinct delivery status, not a failure (AC-41.5.2)
+
+`webhook_events.status` gained `:blocked`. It is TERMINAL: the job returns `:ok`,
+burns no attempt, schedules no retry, and does **not** increment the webhook's
+`consecutive_failures` (the subscriber never failed — loopctl refused to call
+it). Blocked deliveries therefore cannot build a retry backlog.
+
+`event.error` carries `"<kind>: <Egress.refusal_reason/1>"`, where
+`Loopctl.Egress.block_kind/1` distinguishes the two block causes:
+
+| kind | cause | who can fix it |
+|---|---|---|
+| `ssrf_denied` | the destination resolves into a private/loopback/CGNAT/link-local/ULA range and is not in the operator deployment allowlist | the OPERATOR (allowlist) — a tenant declaration cannot |
+| `locality_denied` | the scope is `local_only` and the destination is not local for the `webhook` purpose | the TENANT (declare the endpoint, or clear the marking — both role `:user`) |
+
+`:pin_stale` / `:egress_unavailable` are neither: they are TRANSIENT
+(`block_kind/1` returns `:transient`), so the job SNOOZES without consuming an
+attempt and nothing is recorded as blocked.
+
+Stated rather than hidden: because a transient refusal consumes no attempt, it
+does NOT advance the worker's app-level 6-attempt ladder — a persistently
+unresolvable destination re-checks every `Egress.transient_snooze_seconds/0`
+instead of exhausting. That is the US-41.4 contract (`:pin_stale` /
+`:egress_unavailable` are NEVER terminal, because nothing re-enqueues a cancelled
+job after the re-pin), and it is one snoozed job per event, not a growing
+backlog — the terminal-state proof in `WebhookObanTerminalTest` covers the
+BLOCKED case, which is the one an unbounded ladder would have amplified.
+
+### Config time beats delivery time (AC-41.5.3)
+
+`Webhooks.create_webhook/3` and `update_webhook/4` reject a non-local destination
+on an already-`local_only` scope with a changeset error on `:url` carrying the
+remediation. The check runs before the `Ecto.Multi`, so nothing is persisted. It
+only fires when the URL is actually being set/changed and the changeset is
+otherwise valid — otherwise an unrelated edit (`active: false`) to a
+pre-existing, now-incompatible subscription would be un-savable, including the
+edit that fixes it.
+
+### Enabling `local_only` with incompatible subscriptions (AC-41.5.4)
+
+**The documented choice is REFUSE-BY-DEFAULT, then report on acknowledgement** —
+the same contract US-41.4 already used for provider endpoints, extended rather
+than duplicated. `Egress.enable_local_only/3` runs
+`blocked_webhook_subscriptions/1` in its pre-flight and returns
+`{:error, {:would_block, endpoints}}` with a `kind: :webhook` entry per offending
+subscription (carrying `webhook_id`, `endpoint`, `verdict`, `project_id`,
+`active`). Passing `acknowledge: true` completes the enable and REPORTS them in
+`blocked_endpoints` (and in the marking's `acknowledged_blocked_endpoints`).
+
+Subscriptions are never silently disabled or deleted. Coverage follows the
+marking: a tenant-scope marking covers every subscription; a project-scope
+marking covers only that project's subscriptions. INACTIVE subscriptions are
+included — re-activating one under an unchanged marking would otherwise produce
+a silently blocked destination.
+
+### Posture (AC-41.5.5)
+
+`Egress.posture/2` gained `webhook_destinations`: one entry per subscription with
+`endpoint`, `host`, `active`, the locality `verdict` label (network-local /
+tenant-declared (unverified attestation) / non-local / denylisted),
+`verdict_from_deployment_allowlist` (a BOOLEAN at `:agent` — allowlist contents
+stay `:user`+) and `blocked_by_local_only`. The destination URL is not a secret
+(only the signing secret is Cloak-encrypted), so it is disclosed like the
+provider endpoints.
 
 ## Tenant isolation: explicit scoping on `AdminRepo`, not RLS
 

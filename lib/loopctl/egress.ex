@@ -44,7 +44,10 @@ defmodule Loopctl.Egress do
   ## Mandatory pre-flight on ENABLE
 
   Because the enabling role cannot undo the transition, `enable_local_only/3`
-  classifies the scope's currently-resolved embedding and chat endpoints FIRST.
+  classifies the scope's currently-resolved embedding and chat endpoints FIRST —
+  and, since US-41.5 (AC-41.5.4), every WEBHOOK SUBSCRIPTION the marking would
+  cover (`blocked_webhook_subscriptions/1`). Subscriptions are never silently
+  disabled: they are either the reason for the refusal, or reported back.
   If any would become `egress_blocked` the operation is REFUSED with
   `{:error, {:would_block, endpoints}}` naming each offending endpoint — UNLESS
   the caller passes `acknowledge: true`, in which case it completes and REPORTS
@@ -72,6 +75,7 @@ defmodule Loopctl.Egress do
   alias Loopctl.Egress.TrustedEndpoint
   alias Loopctl.Knowledge.EmbeddingClient
   alias Loopctl.Llm
+  alias Loopctl.Webhooks.Webhook
 
   @blocked_window_seconds 60
 
@@ -240,17 +244,167 @@ defmodule Loopctl.Egress do
   end
 
   # The pre-flight. Endpoint resolution is TENANT-scoped only, so this classifies
-  # the tenant's currently-resolved embedding + chat endpoints for the scope.
+  # the tenant's currently-resolved embedding + chat endpoints for the scope, PLUS
+  # (US-41.5, AC-41.5.4) every webhook subscription the marking would cover.
   defp preflight_blocked_endpoints(%Scope{} = scope) do
-    scope
-    |> resolved_endpoints()
-    |> Enum.map(fn {kind, url} -> {kind, url, endpoint_verdict(scope, url)} end)
-    |> Enum.reject(fn {_kind, _url, verdict} ->
-      verdict in [:network_local, :tenant_declared]
+    provider =
+      scope
+      |> resolved_endpoints()
+      |> Enum.map(fn {kind, url} -> {kind, url, endpoint_verdict(scope, url, :inference)} end)
+      |> Enum.reject(fn {_kind, _url, verdict} -> local_verdict?(verdict) end)
+      |> Enum.map(fn {kind, url, verdict} ->
+        %{kind: kind, endpoint: url, verdict: to_string(verdict)}
+      end)
+
+    provider ++ blocked_webhook_subscriptions(scope)
+  end
+
+  @doc """
+  The webhook subscriptions a `local_only` marking on `scope` would REFUSE
+  (US-41.5, AC-41.5.4).
+
+  Feeds `enable_local_only/3`'s pre-flight, so enabling `local_only` while an
+  incompatible subscription exists is REFUSED with `{:error, {:would_block,
+  endpoints}}` naming each one — never a silent state change. Passing
+  `acknowledge: true` completes the enable and REPORTS them. That is the
+  DOCUMENTED choice (see `docs/egress-guard.md`): refuse by default, proceed only
+  on an explicit acknowledgement.
+
+  Coverage follows the marking, not the delivery scope: a TENANT-scope marking
+  (`project_id: nil`) covers every subscription, while a PROJECT-scope marking
+  covers only that project's subscriptions — a project marking cannot block a
+  tenant-wide (project-less) subscription, whose delivery scope it does not
+  narrow (AC-41.4.2, most-restrictive-wins).
+
+  INACTIVE subscriptions are included deliberately. They are not broken today,
+  but re-activating one under an unchanged marking would silently produce a
+  blocked destination, and "surfaced explicitly" is the whole point of the
+  pre-flight. Each entry carries `active` so a caller can weight them.
+  """
+  @spec blocked_webhook_subscriptions(Scope.t()) :: [map()]
+  def blocked_webhook_subscriptions(%Scope{tenant_id: tenant_id, project_id: project_id}) do
+    Webhook
+    |> where([w], w.tenant_id == ^tenant_id)
+    |> marking_covers_webhook(project_id)
+    |> order_by([w], asc: w.inserted_at)
+    |> AdminRepo.all()
+    |> Enum.map(fn webhook ->
+      delivery_scope = Scope.new(tenant_id, webhook.project_id)
+      {webhook, endpoint_verdict(delivery_scope, webhook.url, :webhook)}
     end)
-    |> Enum.map(fn {kind, url, verdict} ->
-      %{kind: kind, endpoint: url, verdict: to_string(verdict)}
+    |> Enum.reject(fn {_webhook, verdict} -> local_verdict?(verdict) end)
+    |> Enum.map(fn {webhook, verdict} ->
+      %{
+        kind: :webhook,
+        endpoint: webhook.url,
+        verdict: to_string(verdict),
+        webhook_id: webhook.id,
+        project_id: webhook.project_id,
+        active: webhook.active
+      }
     end)
+  end
+
+  # A TENANT marking covers every subscription; a PROJECT marking covers only that
+  # project's subscriptions.
+  defp marking_covers_webhook(query, nil), do: query
+
+  defp marking_covers_webhook(query, project_id),
+    do: where(query, [w], w.project_id == ^project_id)
+
+  @doc """
+  True when `verdict` means "local for this scope" — the ONE definition of
+  deliverable/admissible locality, shared by the guard, the pre-flight, the
+  config-time check and the posture report so they cannot drift.
+  """
+  @spec local_verdict?(atom()) :: boolean()
+  def local_verdict?(verdict), do: verdict in [:network_local, :tenant_declared]
+
+  @doc """
+  The locality verdict for a destination `url` under `scope` and `purpose`.
+
+  Purpose scoping is a SECURITY INVARIANT (AC-41.4.5 constraint 2): a host
+  declared for an Ollama inference box does NOT authorize POSTing tenant content
+  to it, so webhook callers must pass `:webhook`.
+  """
+  @spec endpoint_verdict(Scope.t(), String.t(), Policy.purpose()) :: atom()
+  def endpoint_verdict(%Scope{} = scope, url, purpose) do
+    host = URI.parse(url).host || url
+
+    case Policy.classify(scope, host, purpose) do
+      {:ok, %{verdict: verdict}} -> verdict
+      {:error, _} -> :unclassifiable
+    end
+  end
+
+  @doc """
+  The CONFIG-TIME verdict for a webhook destination (US-41.5, AC-41.5.3).
+
+  Returns `:ok` when the subscription may be created/updated, or
+  `{:error, {verdict, message}}` with a legible remediation naming the conflict.
+
+  TWO refusals, in the same order the delivery path applies them:
+
+    1. `:denylisted` — the destination resolves into a private/loopback/CGNAT/
+      link-local/ULA range and the OPERATOR deployment allowlist does not carve
+      it out. Refused for EVERY scope, marked or not (ie-02 /
+      GHSA-jh42-wf7g-f5rg). This decision moved here from
+      `Loopctl.Webhooks.Webhook.validate_url/1`, which could not see the tenant
+      and therefore refused every allowlisted destination too.
+    2. `:unclassifiable` — the host does not resolve. Reported DISTINCTLY from a
+      private address: "does not exist" and "exists but is forbidden" are
+      different problems with different fixes.
+    3. locality — the scope is `local_only` and the destination is not local for
+      the `webhook` purpose.
+
+  This is the ONLY DNS resolution performed for a webhook write: the changeset
+  above it validates SHAPE only.
+  """
+  @spec webhook_destination_check(Scope.t(), String.t()) ::
+          :ok | {:error, {atom(), String.t()}}
+  def webhook_destination_check(%Scope{} = scope, url) when is_binary(url) do
+    case endpoint_verdict(scope, url, :webhook) do
+      :denylisted ->
+        {:error, {:denylisted, denylisted_message(url)}}
+
+      :unclassifiable ->
+        {:error, {:unclassifiable, "host could not be resolved"}}
+
+      verdict ->
+        cond do
+          local_verdict?(verdict) ->
+            :ok
+
+          effective_local_only?(scope) ->
+            {:error, {verdict, webhook_remediation(scope, url, verdict)}}
+
+          true ->
+            :ok
+        end
+    end
+  end
+
+  # The legacy phrase is preserved as the PREFIX so existing API consumers that
+  # string-match it keep working; the remediation names WHO can change it, which
+  # a bare "must not target a private or loopback address" never did.
+  defp denylisted_message(url) do
+    host = URI.parse(url).host || url
+
+    "must not target a private or loopback address — #{host} resolves into a private, " <>
+      "loopback, CGNAT, link-local or ULA range. Only the OPERATOR deployment allowlist " <>
+      "can carve such a host out of the SSRF denylist; a tenant declaration cannot."
+  end
+
+  defp webhook_remediation(scope, url, verdict) do
+    host = URI.parse(url).host || url
+
+    "#{host} is #{verdict_label(verdict)} for #{Scope.key(scope)}, which is marked " <>
+      "local_only. A subscription to it would be refused at delivery time, so it is " <>
+      "rejected here instead. Either declare #{host} as a tenant-trusted endpoint FOR " <>
+      "THE 'webhook' PURPOSE (role :user — note a declaration is #{@tenant_declared_label}), " <>
+      "ask the operator to add it to the deployment allowlist if it is genuinely on the " <>
+      "deployment network, use a destination that is already local, or clear the " <>
+      "local_only marking on this scope (role :user)."
   end
 
   @doc """
@@ -272,15 +426,6 @@ defmodule Loopctl.Egress do
   @spec resolved_endpoints(Scope.t()) :: [{atom(), String.t()}]
   def resolved_endpoints(%Scope{tenant_id: tenant_id}) do
     [{:embedding, EmbeddingClient.base_url()}, {:chat, Llm.chat_base_url(tenant_id)}]
-  end
-
-  defp endpoint_verdict(scope, url) do
-    host = URI.parse(url).host || url
-
-    case Policy.classify(scope, host, :inference) do
-      {:ok, %{verdict: verdict}} -> verdict
-      {:error, _} -> :unclassifiable
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -449,6 +594,30 @@ defmodule Loopctl.Egress do
             nil -> ""
             remediation -> " remediation=#{remediation}"
           end
+    end
+  end
+
+  @doc """
+  WHICH of the two block causes a PERMANENT refusal is (US-41.5).
+
+    * `:ssrf_denied` — the destination resolves into a private/loopback/CGNAT/
+      link-local/ULA range and the OPERATOR deployment allowlist does not carve it
+      out. Unreachable for EVERY tenant, marked or not; a tenant declaration
+      cannot change it.
+    * `:locality_denied` — the destination is reachable, but the scope is
+      `local_only` and the destination is not classified local for the requested
+      purpose. A configuration conflict the TENANT can resolve.
+    * `:transient` — `:pin_stale` / `:egress_unavailable`; not a block at all.
+
+  An operator reading a blocked delivery needs the distinction: one is "ask the
+  operator", the other is "declare the endpoint or clear the marking".
+  """
+  @spec block_kind({atom(), map()} | atom()) :: :ssrf_denied | :locality_denied | :transient
+  def block_kind(term) do
+    case refusal(term) do
+      {:egress_blocked, %{verdict: :denylisted}} -> :ssrf_denied
+      {:egress_blocked, _details} -> :locality_denied
+      _other -> :transient
     end
   end
 
@@ -668,9 +837,13 @@ defmodule Loopctl.Egress do
 
   ## Scope of the guarantee
 
-  This story covers MODEL-PROVIDER egress only. Webhook delivery
-  (`Loopctl.Webhooks.ReqDelivery`) bypasses this guard and is handled in US-41.5,
-  so the report says so explicitly rather than implying total egress control.
+  Every CONTENT-CARRYING outbound path made by loopctl application code is
+  covered: the model-provider path (US-41.4), the ingestion fetch, and — since
+  US-41.5 — webhook delivery, reported per destination in `webhook_destinations`.
+  What is still NOT covered is stated rather than implied: HTTP performed inside
+  a dependency and the separate `mcp-server/` codebase are outside the static
+  chokepoint scan, and the remaining non-content outbound paths are triaged in
+  `docs/egress-guard.md`.
   """
   @spec posture(Ecto.UUID.t(), atom()) :: map()
   def posture(tenant_id, role \\ :agent) do
@@ -698,14 +871,17 @@ defmodule Loopctl.Egress do
     base = %{
       tenant_id: tenant_id,
       endpoints: endpoints,
+      webhook_destinations: webhook_destinations(tenant_id),
       declared_endpoints: declared,
       scopes: scopes,
       posture_defects: posture_defects(scopes),
       guarantee_scope:
         "Enforced for every outbound HTTP call made by loopctl application code on the " <>
-          "MODEL-PROVIDER path. Webhook delivery is NOT yet covered (US-41.5). HTTP " <>
+          "content-carrying paths: MODEL-PROVIDER calls, the ingestion fetch, and WEBHOOK " <>
+          "DELIVERY (per-destination classification in webhook_destinations). HTTP " <>
           "performed inside a dependency, and the separate mcp-server/ codebase, are " <>
-          "outside the static chokepoint check.",
+          "outside the static chokepoint check; the remaining non-content outbound paths " <>
+          "are triaged in docs/egress-guard.md.",
       tenant_declared_label: @tenant_declared_label
     }
 
@@ -750,13 +926,8 @@ defmodule Loopctl.Egress do
   end
 
   defp endpoint_posture(scope, kind, url) do
+    {verdict, from_allowlist} = classify_endpoint(scope, url, :inference)
     host = URI.parse(url).host || url
-
-    {verdict, from_allowlist} =
-      case Policy.classify(scope, host, :inference) do
-        {:ok, %{verdict: v, from_allowlist: a}} -> {v, a}
-        {:error, _} -> {:unclassifiable, false}
-      end
 
     %{
       kind: kind,
@@ -766,6 +937,47 @@ defmodule Loopctl.Egress do
       # Boolean only at :agent — the allowlist CONTENTS are operator-plane state.
       verdict_from_deployment_allowlist: from_allowlist
     }
+  end
+
+  # AC-41.5.5: the posture report covers EVERY content-carrying egress path, so a
+  # webhook destination is classified here exactly the way delivery classifies it
+  # — same policy module, same `:webhook` purpose, same DELIVERY scope
+  # (`tenant_id, webhook.project_id`). Anything else would let the report and the
+  # guard disagree, which is the failure mode the whole report exists to prevent.
+  #
+  # The destination URL is NOT a secret (only the signing secret is Cloak-encrypted),
+  # so it is disclosed at every role, exactly like the provider endpoints.
+  defp webhook_destinations(tenant_id) do
+    Webhook
+    |> where([w], w.tenant_id == ^tenant_id)
+    |> order_by([w], asc: w.inserted_at)
+    |> AdminRepo.all()
+    |> Enum.map(fn webhook ->
+      scope = Scope.new(tenant_id, webhook.project_id)
+      {verdict, from_allowlist} = classify_endpoint(scope, webhook.url, :webhook)
+      host = URI.parse(webhook.url).host || webhook.url
+
+      %{
+        webhook_id: webhook.id,
+        project_id: webhook.project_id,
+        scope: Scope.key(scope),
+        endpoint: webhook.url,
+        host: host,
+        active: webhook.active,
+        verdict: verdict_label(verdict),
+        verdict_from_deployment_allowlist: from_allowlist,
+        blocked_by_local_only: Policy.local_only?(scope) and not local_verdict?(verdict)
+      }
+    end)
+  end
+
+  defp classify_endpoint(scope, url, purpose) do
+    host = URI.parse(url).host || url
+
+    case Policy.classify(scope, host, purpose) do
+      {:ok, %{verdict: v, from_allowlist: a}} -> {v, a}
+      {:error, _} -> {:unclassifiable, false}
+    end
   end
 
   defp verdict_label(:network_local), do: "network-local"

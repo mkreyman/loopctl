@@ -14,9 +14,27 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
   1. Load webhook_event and associated webhook
   2. Check webhook is active (mark failed if deactivated)
   3. Build delivery payload with signing headers (US-10.4)
-  4. Make HTTP POST via delivery client
-  5. Update event status (delivered/failed/exhausted)
+  4. Make HTTP POST via delivery client, on the webhook's EGRESS SCOPE
+  5. Update event status (delivered/failed/exhausted/blocked)
   6. Update webhook consecutive_failures
+
+  ## Egress refusals are not delivery failures (US-41.5, AC-41.5.2/AC-41.5.5)
+
+  `Loopctl.Egress.oban_result/1` is the reference mapping and this worker follows
+  its SEMANTICS, not its literal return: the queue is `max_attempts: 1` with
+  app-level snooze retries, so a refusal must not burn an attempt or re-enter the
+  backoff ladder.
+
+    * `:egress_blocked` is PERMANENT — the event is marked `:blocked` with an
+      agent-readable reason, the aggregated blocked-decision counter is bumped,
+      and the job returns `:ok`. TERMINAL: no snooze, no attempt consumed, no
+      `consecutive_failures` increment (the subscriber never failed — loopctl
+      refused to call it), so a misconfigured subscription cannot build an
+      unbounded retry backlog (TC-41.5.5).
+    * `:pin_stale` / `:egress_unavailable` are TRANSIENT — the job snoozes for
+      `Egress.transient_snooze_seconds/0` WITHOUT consuming an attempt and
+      WITHOUT recording a block. A DHCP lease change or a pool blip must never
+      look like a privacy refusal.
   """
 
   use Oban.Worker, queue: :webhooks, max_attempts: 1
@@ -24,6 +42,8 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Egress
+  alias Loopctl.Egress.Scope
   alias Loopctl.Webhooks
   alias Loopctl.Webhooks.Signing
   alias Loopctl.Webhooks.Webhook
@@ -80,14 +100,60 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
     # Build headers with HMAC-SHA256 signature
     headers = build_headers(event, webhook, json_body)
 
-    case @delivery_client.deliver(webhook.url, json_body, headers) do
+    # The delivery scope is the webhook's own (tenant, project) pair —
+    # most-restrictive-wins, and a project-less subscription follows the TENANT
+    # marking (AC-41.4.2 / AC-41.5.1).
+    scope = Scope.new(webhook.tenant_id, webhook.project_id)
+
+    case @delivery_client.deliver(webhook.url, json_body, headers, scope) do
       {:ok, _response} ->
         mark_delivered(event, webhook)
         :ok
 
+      {:refused, refusal} ->
+        handle_refusal(event, webhook, scope, refusal)
+
       {:error, error_msg} ->
         handle_failure(event, webhook, error_msg)
     end
+  end
+
+  # AC-41.5.2: a blocked delivery is NOT a silent drop and NOT an infinite retry.
+  defp handle_refusal(event, webhook, scope, refusal) do
+    case Egress.block_kind(refusal) do
+      :transient ->
+        Logger.info(
+          "WebhookDeliveryWorker: transient egress refusal for webhook #{webhook.id}, " <>
+            "snoozing without burning an attempt — #{Egress.refusal_reason(refusal)}"
+        )
+
+        {:snooze, Egress.transient_snooze_seconds()}
+
+      kind ->
+        mark_blocked(event, scope, kind, refusal)
+        :ok
+    end
+  end
+
+  defp mark_blocked(event, scope, kind, {_tag, details} = refusal) do
+    reason = "#{kind}: #{Egress.refusal_reason(refusal)}"
+
+    Logger.warning(
+      "WebhookDeliveryWorker: delivery REFUSED before any request (event_id=#{event.id}) — " <>
+        reason
+    )
+
+    # The aggregated, deduplicated AC-41.4.6 record + the unbuffered
+    # [:loopctl, :egress, :blocked] telemetry counter.
+    Egress.record_blocked(scope, details)
+
+    event
+    |> Ecto.Changeset.change(%{
+      status: :blocked,
+      last_attempt_at: DateTime.utc_now(),
+      error: reason
+    })
+    |> AdminRepo.update!()
   end
 
   defp build_delivery_payload(event) do

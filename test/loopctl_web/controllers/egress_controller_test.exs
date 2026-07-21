@@ -178,9 +178,40 @@ defmodule LoopctlWeb.EgressControllerTest do
       assert scope["local_only"] == true
       assert scope["encrypt_body"] == false
       assert body["posture_defects"] == []
-      # The guarantee wording does NOT claim total egress control before US-41.5.
-      assert body["guarantee_scope"] =~ "US-41.5"
+
+      # US-41.5: webhook delivery is now covered and reported per destination, so
+      # the guarantee no longer carves it out — but it is still narrowed to what
+      # the static chokepoint check actually proves.
+      assert Map.has_key?(body, "webhook_destinations")
+      assert is_list(body["webhook_destinations"])
+      assert body["guarantee_scope"] =~ "WEBHOOK DELIVERY"
       assert body["guarantee_scope"] =~ "loopctl application code"
+      assert body["guarantee_scope"] =~ "inside a dependency"
+      refute body["guarantee_scope"] =~ "NOT yet covered"
+    end
+
+    # AC-41.5.5: the destination and its locality classification are readable at
+    # AGENT role (the URL is not a secret — only the signing secret is), while
+    # the allowlist CONTENTS stay a boolean.
+    test "webhook destinations are classified at :agent, allowlist as a BOOLEAN",
+         %{conn: conn, keys: keys, tenant: tenant} do
+      webhook =
+        fixture(:webhook, %{
+          tenant_id: tenant.id,
+          url: "https://hooks.example.com/inbound",
+          events: ["story.status_changed"]
+        })
+
+      body = conn |> auth(keys.agent) |> get(~p"/api/v1/egress/posture") |> json_response(200)
+
+      assert [destination] = body["webhook_destinations"]
+      assert destination["webhook_id"] == webhook.id
+      assert destination["endpoint"] == "https://hooks.example.com/inbound"
+      assert destination["host"] == "hooks.example.com"
+      assert is_binary(destination["verdict"])
+      assert is_boolean(destination["verdict_from_deployment_allowlist"])
+      assert destination["blocked_by_local_only"] == true
+      refute Map.has_key?(destination, "signing_secret_encrypted")
     end
 
     test "at :user — the allowlist contents ARE present", %{conn: conn, keys: keys} do

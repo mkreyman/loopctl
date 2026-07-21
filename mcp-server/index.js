@@ -4962,7 +4962,8 @@ const TOOLS = [
     name: "egress_posture",
     description:
       "VERIFY BEFORE YOU HARVEST. Reports this instance's egress posture for YOUR tenant: " +
-      "the resolved embedding and chat endpoints, a locality VERDICT for each " +
+      "the resolved embedding and chat endpoints, EVERY webhook destination " +
+      "(webhook_destinations), a locality VERDICT for each " +
       "(network-local / 'tenant-declared (unverified attestation), not network-local' / " +
       "non-local), your declared trusted endpoints with their purposes, per-scope " +
       "local_only status, and any named posture defects. Endpoints are shown; KEYS NEVER " +
@@ -4972,9 +4973,11 @@ const TOOLS = [
       "infrastructure and are NOT disclosed at agent role: you get only a boolean per " +
       "endpoint saying whether its verdict came from the allowlist (contents at user+). " +
       "SCOPE OF THE GUARANTEE: fail-closed enforcement covers every outbound HTTP call " +
-      "made by loopctl application code on the MODEL-PROVIDER path. Webhook delivery is " +
-      "not covered yet (US-41.5), and HTTP performed inside a dependency, plus this " +
-      "separate mcp-server codebase, are outside the static chokepoint check.",
+      "made by loopctl application code on every CONTENT-CARRYING path — model-provider " +
+      "calls, the ingestion fetch, and webhook delivery (US-41.5). HTTP performed inside " +
+      "a dependency, plus this separate mcp-server codebase, are outside the static " +
+      "chokepoint check; the remaining non-content outbound paths are triaged in " +
+      "docs/egress-guard.md.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
@@ -4985,10 +4988,13 @@ const TOOLS = [
       "everywhere; nothing changes until a scope opts in. Scope resolution is " +
       "MOST-RESTRICTIVE-WINS (project OR tenant) and a project can NEVER relax a tenant " +
       "marking. MANDATORY PRE-FLIGHT: the call is REFUSED with 409 would_block_endpoints, " +
-      "naming every endpoint that would become egress_blocked, unless you pass " +
+      "naming every endpoint that would become egress_blocked — including every WEBHOOK " +
+      "SUBSCRIPTION whose destination would be refused (kind: 'webhook', US-41.5) — " +
+      "unless you pass " +
       "acknowledge: true — because on a tenant still using vendor default endpoints this " +
       "instantly stops embedding, extraction, classification and merge, and only a " +
-      "human user-role key can undo it. Requires an ORCHESTRATOR key: tightening is safe " +
+      "human user-role key can undo it. Subscriptions are never silently disabled: they " +
+      "are either the reason for the refusal, or reported back to you on acknowledgement. Requires an ORCHESTRATOR key: tightening is safe " +
       "to automate. CLEARING is a different tool (clear_local_only) and is user-only.",
     inputSchema: {
       type: "object",

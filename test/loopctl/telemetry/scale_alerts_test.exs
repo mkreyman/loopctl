@@ -57,7 +57,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     # Default permissive stub (DataCase isn't used here — this is a plain ExUnit.Case),
     # so an unexpected deliver doesn't crash; tests that assert a POST override with
     # expect/3. Allowed in global mode for any process.
-    stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+    stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
       {:ok, %{status: 200, body: "ok"}}
     end)
 
@@ -160,7 +160,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
   end
 
   defp expect_delivery(test_pid) do
-    expect(Loopctl.MockDelivery, :deliver, fn url, body, headers ->
+    expect(Loopctl.MockDelivery, :deliver, fn url, body, headers, _scope ->
       send(test_pid, {:alert_delivered, url, body, headers})
       {:ok, %{status: 200, body: "ok"}}
     end)
@@ -288,7 +288,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
          %{server: server} do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h ->
+      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h, _scope ->
         send(test_pid, :unexpected_delivery)
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -353,7 +353,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
          %{server: server} do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
         send(test_pid, :unexpected_delivery)
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -370,7 +370,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
          %{server: server} do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
         send(test_pid, :unexpected_delivery)
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -414,7 +414,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     test "TC-34.3.4: no false fire under threshold for all three new signals", %{server: server} do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
         send(test_pid, :unexpected_delivery)
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -431,7 +431,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     test "queue_time p95 below the sample floor is skipped (no noise alert)", %{server: server} do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h ->
+      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h, _scope ->
         send(test_pid, :unexpected_delivery)
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -521,7 +521,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
       # unexpected expect were set, but here we assert NO delivery by counting calls.
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
         send(test_pid, :unexpected_delivery)
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -536,7 +536,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     test "p95 below the sample floor is skipped (no noise alert)", %{server: server} do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h ->
+      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h, _scope ->
         send(test_pid, :unexpected_delivery)
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -556,7 +556,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
       # Override the setup stub so EVERY deliver call is observable (a 2nd fire that fell
       # through to a silent stub would otherwise hide a debounce regression). Any call
       # sends {:fired, ...}, so refute_received is airtight.
-      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers, _scope ->
         send(test_pid, {:fired, Jason.decode!(body)["metric"]})
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -575,7 +575,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     test "after the metric clears, a fresh breach fires again", %{server: server} do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers, _scope ->
         send(test_pid, {:fired, Jason.decode!(body)["value"]})
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -600,7 +600,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     test "counters reset each evaluate so a one-off spike doesn't persist", %{server: server} do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
         send(test_pid, :fired)
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -619,7 +619,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     test "with a nil url, a breach logs and does NOT POST or enqueue (AC-34.5.4)" do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h ->
+      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h, _scope ->
         send(test_pid, :unexpected_delivery)
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -680,7 +680,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
          %{server: server} do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
         {:error, "connection_refused"}
       end)
 
@@ -722,7 +722,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      expect(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+      expect(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
         {:ok, %{status: 200, body: "ok"}}
       end)
 
@@ -754,7 +754,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
         end
       end
 
-      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers, _scope ->
         send(test_pid, {:delivered, Jason.decode!(body)["metric"]})
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -789,7 +789,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
         raise DBConnection.ConnectionError, "connection not available"
       end
 
-      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
         send(test_pid, :unexpected_delivery)
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -803,7 +803,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
         )
 
       emit_timeout(6)
-      # The call itself must complete normally (not crash/timeout) — proving `deliver/3`
+      # The call itself must complete normally (not crash/timeout) — proving `deliver/4`
       # rescued the raise instead of letting it propagate out of `handle_call(:evaluate)`.
       assert :ok = ScaleAlerts.evaluate(name)
 
@@ -813,7 +813,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
   end
 
   describe "no secret persisted in the enqueued job (review fix)" do
-    # Uses the `insert_fn` test seam to capture the EXACT job `deliver/3` builds, before
+    # Uses the `insert_fn` test seam to capture the EXACT job `deliver/4` builds, before
     # it reaches Oban, and proves the webhook URL (potentially secret-bearing) is never
     # part of the args that would be JSON-serialized into `oban_jobs.args`.
     test "the job enqueued for delivery carries only :payload — never the webhook url" do
@@ -824,7 +824,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
         Oban.insert(job)
       end
 
-      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
         {:ok, %{status: 200, body: "ok"}}
       end)
 
@@ -847,12 +847,12 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
 
   describe "malformed webhook url config does not crash the GenServer (review fix)" do
     # A non-nil, non-binary `:scale_alert_webhook_url` (e.g. a charlist/atom from a
-    # config typo) must be treated as a delivery error, not raise past `deliver/3` and
+    # config typo) must be treated as a delivery error, not raise past `deliver/4` and
     # crash the un-rescued `handle_call(:evaluate)`.
     test "a non-binary configured url logs, reports :error, and keeps the GenServer alive" do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h ->
+      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h, _scope ->
         send(test_pid, :unexpected_delivery)
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -867,7 +867,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
         )
 
       emit_timeout(6)
-      # Must complete normally (not crash/timeout) — proving the catch-all `deliver/3`
+      # Must complete normally (not crash/timeout) — proving the catch-all `deliver/4`
       # clause handled the malformed config instead of raising FunctionClauseError.
       assert :ok = ScaleAlerts.evaluate(name)
 
@@ -887,7 +887,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     test "re-fires once the re-notify interval elapses, stays silent before it, re-arms on clear" do
       test_pid = self()
 
-      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers ->
+      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers, _scope ->
         send(test_pid, {:fired, Jason.decode!(body)["metric"]})
         {:ok, %{status: 200, body: "ok"}}
       end)

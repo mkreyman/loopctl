@@ -197,10 +197,13 @@ defmodule LoopctlWeb.EgressController do
           error: "would_block_endpoints",
           message:
             "Enabling local_only on this scope would immediately block " <>
-              "#{length(blocked)} currently-resolved endpoint(s). Configure a " <>
+              "#{length(blocked)} currently-resolved endpoint(s) and/or webhook " <>
+              "subscription(s) (see blocked_endpoints[].kind). Configure a " <>
               "satisfying endpoint AT TENANT level (role :user), declare a trusted " <>
-              "endpoint (role :user), or retry with acknowledge=true to accept the " <>
-              "resulting blocked posture.",
+              "endpoint for the required purpose (role :user), repoint or remove the " <>
+              "offending webhook subscription(s), or retry with acknowledge=true to " <>
+              "accept the resulting blocked posture. Nothing was changed and no " <>
+              "subscription was disabled.",
           blocked_endpoints: blocked
         })
 
