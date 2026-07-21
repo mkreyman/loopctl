@@ -65,6 +65,36 @@ defmodule Loopctl.HeavyReadTest do
       refute HeavyRead.filters_by_tenant?(from(a in Article, where: a.id in subquery(sub)))
     end
 
+    test "the semantic side-table COUNT query passes the guard via its OUTER binding, not its WHERE subquery" do
+      # Review, finding 4: `Knowledge.semantic_side_table_count_query/4` embeds an
+      # OR-broadened `a.tenant_id == ^t or a.scope == :system` subquery in a WHERE
+      # `ae.article_id in subquery(...)`. The guard does NOT inspect where-clause
+      # subquery sources — it accepts the query ONLY because the OUTER `article_embeddings`
+      # binding carries a conjunctive `ae.tenant_id == ^t`. Pin BOTH halves so the
+      # reliance is enforced, not incidental:
+      #
+      #   (a) the real query passes;
+      assert HeavyRead.filters_by_tenant?(
+               Loopctl.Knowledge.semantic_side_table_count_query("t", 768, :published, [])
+             )
+
+      #   (b) the SAME shape with the outer tenant scope removed (leaning ONLY on the
+      #       OR-broadened WHERE-IN subquery) is REJECTED — proving a future edit that
+      #       placed a genuinely unscoped subquery in the WHERE cannot slip past.
+      or_broadened_sub =
+        from(a in Article, where: a.tenant_id == ^"t" or a.scope == :system, select: a.id)
+
+      unscoped_variant =
+        from(ae in Loopctl.Knowledge.ArticleEmbedding,
+          where: ae.dim == 768,
+          where: ae.live_denorm,
+          where: ae.article_id in subquery(or_broadened_sub),
+          select: count()
+        )
+
+      refute HeavyRead.filters_by_tenant?(unscoped_variant)
+    end
+
     test "FALSE when the FROM table is unscoped even if a JOINED table is scoped" do
       # Attack: primary table `a` returns all tenants; only `b` is scoped.
       refute HeavyRead.filters_by_tenant?(

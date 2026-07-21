@@ -264,6 +264,51 @@ defmodule Loopctl.Repo.HnswIndex do
   def drop_dimension_index_sql(table, dim),
     do: "DROP INDEX CONCURRENTLY IF EXISTS #{dimension_index_name(table, dim)};"
 
+  # The two embedding side tables that carry a per-dimension HNSW index per supported
+  # dimension.
+  @side_tables ["article_embeddings", "memory_embeddings"]
+
+  @doc """
+  Every per-dimension HNSW index the CURRENT published supported-dimension set
+  requires across both embedding side tables, as `{table, dim, index_name}` triples.
+
+  The dimension set is read from `:supported_embedding_dimensions` config — the SAME
+  set `.well-known` advertises and `Loopctl.Embeddings.supported_dimensions/0`
+  delegates to — so this is exactly "what the instance PUBLISHES must be indexed".
+  """
+  @spec required_dimension_indexes() :: [{String.t(), pos_integer(), String.t()}]
+  def required_dimension_indexes do
+    dims = Application.get_env(:loopctl, :supported_embedding_dimensions, [768, 1024, 1536])
+
+    for table <- @side_tables, dim <- dims do
+      {table, dim, dimension_index_name(table, dim)}
+    end
+  end
+
+  @doc """
+  The `required_dimension_indexes/0` that are ABSENT from `repo`'s catalog — the
+  mechanical drift guard for finding 6: "a dimension was PUBLISHED (config +
+  `.well-known`) without its per-dimension HNSW index built by a migration".
+
+  That misconfiguration is invisible to the compile-time supported-set guard (the
+  cast/where clauses generate fine) yet makes every read at that dimension emit an
+  unindexable `(embedding::vector(N))` cast that sequential-scans the whole corpus —
+  the #170/#172 planner-incident class. An EMPTY list means every published dimension
+  is indexed on BOTH side tables; a non-empty list is a deploy that advertised a
+  dimension whose migration has not run. Asserted by a fast (non-scale) drift test so
+  it fails on the PR that introduces the config/index mismatch, not in production.
+  """
+  @spec missing_dimension_indexes(Ecto.Repo.t()) ::
+          [{String.t(), pos_integer(), String.t()}]
+  def missing_dimension_indexes(repo) do
+    Enum.reject(required_dimension_indexes(), fn {_table, _dim, name} ->
+      %{rows: [[count]]} =
+        repo.query!("SELECT count(*) FROM pg_class WHERE relname = $1", [name])
+
+      count > 0
+    end)
+  end
+
   # A dimension is interpolated into DDL, so it is validated to be a plain positive
   # integer. Dimensions come ONLY from the deployment's supported-dimension config
   # (`Loopctl.Embeddings.supported_dimensions/0`), never from a request — index DDL

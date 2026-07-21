@@ -238,6 +238,41 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
       end
     end
 
+    for dim <- @gate_dimensions do
+      test "dim #{dim}: the per-dimension index is chosen even under a FORCED GENERIC plan",
+           %{tenant: tenant} do
+        dim = unquote(dim)
+
+        # Review, finding 2: `Repo.explain` on a fresh parameterized query yields a
+        # CUSTOM plan, where `dim = $n` matches the partial index by value substitution —
+        # so the ordinary gate cannot observe the PRODUCTION generic-plan case
+        # (`plan_cache_mode=auto` flips a prepared statement to generic after ~5 runs). If
+        # the dim predicate were a BOUND param, a generic plan could not prove `dim = $n`
+        # implies `dim = 768` and would revert to a seq scan (#170/#172). With the dim
+        # WHERE now a compile-time LITERAL (finding 1), the partial index matches
+        # regardless of plan mode — this forces a generic plan and proves it.
+        plan =
+          unboxed(fn ->
+            {:ok, plan} =
+              AdminRepo.transaction(fn ->
+                AdminRepo.query!("SET LOCAL plan_cache_mode = force_generic_plan")
+                explain_ann(tenant.id, dim)
+              end)
+
+            plan
+          end)
+
+        expected_index = HnswIndex.dimension_index_name("article_embeddings", dim)
+
+        assert plan =~ expected_index,
+               "under force_generic_plan the plan did NOT use #{expected_index} — the dim " <>
+                 "predicate is not matching the partial index under a generic plan:\n#{plan}"
+
+        refute plan =~ ~r/Seq Scan on article_embeddings/,
+               "a Seq Scan reached the vector relation under a generic plan:\n#{plan}"
+      end
+    end
+
     test "every supported dimension the instance publishes is covered by an index" do
       # The gate EXPLAINs the configured dimensions; this keeps the published set
       # honest for any not selected in this run (AC-41.1.3 / TC-41.1.8).

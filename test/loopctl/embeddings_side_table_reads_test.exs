@@ -376,14 +376,16 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       assert article.id in Enum.map(results, & &1.id)
     end
 
-    # Review #8: the LEGACY path deliberately carries NO dimension disclosure. It
-    # cannot be a true statement there (results come from `articles.embedding`, there
-    # is no per-dimension corpus to be unmaterialized and no re-embed can be
-    # observed), and computing it cost three extra queries — a tenants SELECT +
-    # settings read, a NOT EXISTS anti-join over every system-scoped article, and a
-    # re-embed existence probe — on the hottest read in the product, against
-    # AC-41.1.12's "the hosted default must not regress".
-    test "the legacy read path pays NOTHING for the dimension disclosure" do
+    # Review, finding 3: AC-41.1.7 requires the system-corpus recall state be stated
+    # EXPLICITLY on EVERY semantic response — "never a silent absence". On the LEGACY
+    # path the shared system corpus is not semantically recallable at all (the legacy
+    # inner ANN scopes `tenant_id == ^tenant_id`, excluding the NULL-tenant system
+    # rows), so the response carries a STATIC `keyword_only` disclosure. Crucially it is
+    # a compile-time CONSTANT — no per-dimension anti-join, no re-embed probe, no tenants
+    # SELECT — so the hot-path query cost the review guarded against is still zero: the
+    # per-DIMENSION side-table meta (`embedding_dimension` + the memoized
+    # `search_disclosure_meta` probes) remains absent.
+    test "the legacy read path discloses keyword-only system corpus WITHOUT paying any query cost" do
       tenant = fixture(:tenant)
       system_article()
       embedded_article(tenant.id, %{title: "Own"}, :close, 1536)
@@ -391,8 +393,12 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       refute Embeddings.side_table_reads_enabled?()
 
       assert {:ok, %{meta: meta}} = Knowledge.search_semantic(tenant.id, vec(1536, :query))
-      refute Map.has_key?(meta, :system_corpus_recall)
+      # The disclosure is present (AC-41.1.7, never silent)...
+      assert meta.system_corpus_recall == "keyword_only"
+      # ...but it is a static constant, so the per-dimension side-table meta and its
+      # queries are still absent on the legacy path.
       refute Map.has_key?(meta, :embedding_dimension)
+      refute Map.has_key?(meta, :system_corpus_dimension)
     end
 
     test "the SIDE-TABLE read path carries the disclosure AND triggers materialization" do
@@ -420,6 +426,31 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       assert job.args["tenant_id"] == tenant.id
       assert job.args["dim"] == 1536
       assert job.worker == "Loopctl.Workers.SystemCorpusEmbeddingWorker"
+    end
+
+    # Review, finding 11: the worker's Oban uniqueness covers only
+    # [:available, :scheduled, :retryable] (it must re-enqueue itself), so a COMPLETED
+    # corpus is NOT deduped — every repeated POST would insert a fresh no-op job an
+    # agent could loop to flood the embeddings queue. A fully-materialized corpus
+    # short-circuits to `:already_materialized` with NO job created.
+    test "a fully-materialized system corpus does NOT enqueue a redundant no-op job" do
+      tenant = fixture(:tenant)
+
+      for article <- Embeddings.unmaterialized_system_articles(tenant.id, 1536, limit: 1000) do
+        {:ok, _} =
+          Embeddings.materialize_system_article_embedding(
+            tenant.id,
+            article,
+            vec(1536, :close),
+            "sys",
+            1536
+          )
+      end
+
+      assert Embeddings.unmaterialized_system_articles(tenant.id, 1536, limit: 1) == []
+
+      assert {:ok, :already_materialized} =
+               Embeddings.enqueue_system_corpus_materialization(tenant.id)
     end
 
     test "the worker materializes the system corpus with the TENANT's own credential" do

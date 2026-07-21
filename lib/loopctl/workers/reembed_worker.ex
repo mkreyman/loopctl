@@ -24,10 +24,16 @@ defmodule Loopctl.Workers.ReembedWorker do
   tenant's configured model has moved away from it. A re-embed requires the tenant to
   point `tenant_llm_settings.embedding_model` at the NEW model (that is the only way
   target-dimension vectors can be obtained at all), and from that moment the two
-  disagree; this worker is the ONE caller that passes `embedding_model: :configured`
-  and therefore embeds with the pending model. `Embeddings.complete_reembed/2` then
-  re-pins the dimension AND the model together, in the same transaction as the
-  stale-row sweep. Without the pin, either the re-embed could never complete
+  disagree; this worker embeds with the PENDING model. The pending model is captured
+  ONCE at ENQUEUE (`Embeddings.enqueue_reembed/2`) and threaded through every
+  self-continuation in the job args, then embedded with as an explicit binary — NOT
+  re-read from the tenant's live config per batch (review, finding 12). That keeps the
+  whole corpus AND the completion pin on ONE model even if the tenant edits its
+  configured model mid-run; a legacy job without the field falls back to `:configured`.
+  `Embeddings.complete_reembed/3` then re-pins the dimension AND that same threaded
+  model together, in the same transaction as the stale-row sweep — pinning the model
+  only when it agrees with the target dimension, else NULL so the disagreement is
+  disclosed (finding 8). Without the pin, either the re-embed could never complete
   (vectors kept arriving at the old length) or recall degraded to keyword-only for
   the entire, corpus-sized window.
 
@@ -88,10 +94,15 @@ defmodule Loopctl.Workers.ReembedWorker do
   @max_text_length 32_000
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"tenant_id" => tenant_id, "target_dim" => target_dim}})
+  def perform(%Oban.Job{args: %{"tenant_id" => tenant_id, "target_dim" => target_dim} = args})
       when is_binary(tenant_id) and is_integer(target_dim) do
     if Embeddings.supported_dimension?(target_dim) do
-      run_batch(tenant_id, target_dim)
+      # The model that PRODUCES the pending corpus, captured at ENQUEUE and threaded
+      # through every self-continuation (review, finding 12). Embedding with it — and
+      # pinning it at completion — keeps the whole corpus AND the pin on ONE model even
+      # if the tenant edits its configured model mid-run. A legacy job enqueued before
+      # this field existed carries `nil` and falls back to `:configured`.
+      run_batch(tenant_id, target_dim, Map.get(args, "embedding_model"))
     else
       {:discard, {:unsupported_dimension, target_dim}}
     end
@@ -108,12 +119,12 @@ defmodule Loopctl.Workers.ReembedWorker do
   # target while the whole corpus still sits at the old one — under the old
   # `active == target_dim -> :ok` short-circuit that tenant's re-embed became a
   # permanent no-op and its recall stayed empty forever.
-  defp run_batch(tenant_id, target_dim) do
+  defp run_batch(tenant_id, target_dim, model) do
     batch = Knowledge.embedding_batch_max()
 
     case Embeddings.pending_reembed_articles(tenant_id, target_dim, batch) do
-      [] -> memory_batch(tenant_id, target_dim, batch)
-      articles -> embed_article_batch(tenant_id, target_dim, articles)
+      [] -> memory_batch(tenant_id, target_dim, model, batch)
+      articles -> embed_article_batch(tenant_id, target_dim, model, articles)
     end
   end
 
@@ -121,10 +132,10 @@ defmodule Loopctl.Workers.ReembedWorker do
   # untouched, yet the completion sweep deletes `memory_embeddings` rows at every
   # non-target dimension — so a "successful" re-embed wiped 100% of the tenant's
   # agent-memory vectors with no replacement.
-  defp memory_batch(tenant_id, target_dim, batch) do
+  defp memory_batch(tenant_id, target_dim, model, batch) do
     case Embeddings.pending_reembed_memories(tenant_id, target_dim, batch) do
-      [] -> finish(tenant_id, target_dim)
-      memories -> embed_memory_batch(tenant_id, target_dim, memories)
+      [] -> finish(tenant_id, target_dim, model)
+      memories -> embed_memory_batch(tenant_id, target_dim, model, memories)
     end
   end
 
@@ -140,19 +151,26 @@ defmodule Loopctl.Workers.ReembedWorker do
   #
   # Memories legitimately stay tenant-scoped: a memory has no project-level egress
   # marking to honour.
-  defp embed_article_batch(tenant_id, target_dim, articles) do
+  defp embed_article_batch(tenant_id, target_dim, model, articles) do
     articles
     |> Enum.group_by(& &1.project_id)
     |> Enum.reduce_while(:ok, fn {project_id, group}, :ok ->
       entries = Enum.map(group, fn a -> {a, article_text(a)} end)
 
       result =
-        embed_and_store(tenant_id, target_dim, entries, [project_id: project_id], fn triples ->
-          Embeddings.upsert_article_embeddings(tenant_id, triples,
-            dimension: target_dim,
-            legacy_write: false
-          )
-        end)
+        embed_and_store(
+          tenant_id,
+          target_dim,
+          model,
+          entries,
+          [project_id: project_id],
+          fn triples ->
+            Embeddings.upsert_article_embeddings(tenant_id, triples,
+              dimension: target_dim,
+              legacy_write: false
+            )
+          end
+        )
 
       case result do
         :ok -> {:cont, :ok}
@@ -160,28 +178,28 @@ defmodule Loopctl.Workers.ReembedWorker do
       end
     end)
     |> case do
-      :ok -> finish_batch(tenant_id, target_dim)
+      :ok -> finish_batch(tenant_id, target_dim, model)
       other -> other
     end
   end
 
-  defp embed_memory_batch(tenant_id, target_dim, memories) do
+  defp embed_memory_batch(tenant_id, target_dim, model, memories) do
     entries = Enum.map(memories, fn m -> {m, memory_text(m)} end)
 
-    case embed_and_store(tenant_id, target_dim, entries, [], fn triples ->
+    case embed_and_store(tenant_id, target_dim, model, entries, [], fn triples ->
            Embeddings.upsert_memory_embeddings(tenant_id, triples,
              dimension: target_dim,
              legacy_write: false
            )
          end) do
-      :ok -> finish_batch(tenant_id, target_dim)
+      :ok -> finish_batch(tenant_id, target_dim, model)
       other -> other
     end
   end
 
-  defp finish_batch(tenant_id, target_dim) do
+  defp finish_batch(tenant_id, target_dim, model) do
     emit_progress(tenant_id, Embeddings.reembed_progress(tenant_id, target_dim))
-    continue(tenant_id, target_dim)
+    continue(tenant_id, target_dim, model)
   end
 
   # ONE provider array call PER EGRESS SCOPE, ONE dimension check, then the batch
@@ -195,10 +213,14 @@ defmodule Loopctl.Workers.ReembedWorker do
   # while this runs. This worker's whole job is to produce vectors at the PENDING
   # model's dimension, so it — and only it — uses the tenant's currently configured
   # model.
-  defp embed_and_store(tenant_id, target_dim, entries, opts, store_fun) do
+  defp embed_and_store(tenant_id, target_dim, model, entries, opts, store_fun) do
     texts = Enum.map(entries, fn {_subject, text} -> text end)
 
-    case Knowledge.generate_embeddings(tenant_id, texts, [embedding_model: :configured] ++ opts) do
+    case Knowledge.generate_embeddings(
+           tenant_id,
+           texts,
+           [embedding_model: reembed_model(model)] ++ opts
+         ) do
       {:ok, vectors} when length(vectors) == length(entries) ->
         store_checked(tenant_id, target_dim, entries, vectors, store_fun)
 
@@ -209,6 +231,14 @@ defmodule Loopctl.Workers.ReembedWorker do
         handle_error(tenant_id, reason)
     end
   end
+
+  # WHICH model this re-embed generates with. The model captured at ENQUEUE (finding
+  # 12) is passed as an EXPLICIT binary so every batch — and the completion pin — uses
+  # ONE model regardless of a mid-run config edit. A legacy job (`nil`, enqueued before
+  # the field existed) falls back to `:configured`, the tenant's current setting, which
+  # is the pre-review behaviour.
+  defp reembed_model(nil), do: :configured
+  defp reembed_model(model) when is_binary(model), do: model
 
   defp store_checked(tenant_id, target_dim, entries, vectors, store_fun) do
     case Dimensions.check_batch_length(vectors, target_dim) do
@@ -243,8 +273,8 @@ defmodule Loopctl.Workers.ReembedWorker do
   # states this insert is swallowed by the CURRENTLY EXECUTING job and the run stops
   # after one batch. The insert result is checked so a genuine failure to schedule
   # the next batch retries the job rather than silently reporting success.
-  defp continue(tenant_id, target_dim) do
-    %{tenant_id: tenant_id, target_dim: target_dim}
+  defp continue(tenant_id, target_dim, model) do
+    %{tenant_id: tenant_id, target_dim: target_dim, embedding_model: model}
     |> __MODULE__.new(schedule_in: 1)
     |> Oban.insert()
     |> case do
@@ -265,8 +295,8 @@ defmodule Loopctl.Workers.ReembedWorker do
   # was left permanently pinned at the target with un-migrated rows excluded from
   # recall (review). Verifying and pinning inside the sweep's transaction means the
   # pin moves only on an interleaving where the sweep is also safe.
-  defp finish(tenant_id, target_dim) do
-    case Embeddings.complete_reembed(tenant_id, target_dim) do
+  defp finish(tenant_id, target_dim, model) do
+    case Embeddings.complete_reembed(tenant_id, target_dim, model) do
       {:ok, dropped} ->
         emit_progress(tenant_id, %{
           Embeddings.reembed_progress(tenant_id, target_dim)

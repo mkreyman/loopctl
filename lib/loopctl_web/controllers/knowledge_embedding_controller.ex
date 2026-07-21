@@ -110,6 +110,14 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
            dimension: dimension,
            force: force?
          ) do
+      {:ok, :already_materialized} ->
+        # No job created (review, finding 11): the system corpus is already fully
+        # materialized at this dimension, so a repeated POST is a no-op — never a fresh
+        # queue job. 200, not 202: nothing was enqueued.
+        conn
+        |> put_status(:ok)
+        |> json(%{enqueued: false, already_materialized: true, dimension: dimension})
+
       {:ok, _job} ->
         conn
         |> put_status(:accepted)

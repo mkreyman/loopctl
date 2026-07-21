@@ -226,7 +226,11 @@ defmodule Loopctl.Embeddings do
     ) || %{dimension: nil, model: nil}
   end
 
-  defp invalidate_tenant_pin(tenant_id), do: DisclosureCache.invalidate({:pin, tenant_id})
+  # invalidate_CLUSTER (review, findings 5/10): the pin write must bust EVERY node's
+  # node-local DisclosureCache, not just this one — a re-embed completion moves the
+  # dimension/model pin and sweeps the old-dimension rows, and a peer still serving the
+  # stale pin would scan a swept dimension (empty recall) or re-create swept rows.
+  defp invalidate_tenant_pin(tenant_id), do: DisclosureCache.invalidate_cluster({:pin, tenant_id})
 
   defp model_dimension(tenant_id) do
     case Llm.get_settings(tenant_id) do
@@ -1550,17 +1554,31 @@ defmodule Loopctl.Embeddings do
   exactly how the terminal state is meant to be cleared.
   """
   @spec enqueue_system_corpus_materialization(Ecto.UUID.t(), keyword()) ::
-          {:ok, Oban.Job.t()} | {:error, :materialization_terminal | term()}
+          {:ok, Oban.Job.t() | :already_materialized}
+          | {:error, :materialization_terminal | term()}
   def enqueue_system_corpus_materialization(tenant_id, opts \\ []) when is_binary(tenant_id) do
     dimension = Keyword.get(opts, :dimension) || active_dimension(tenant_id)
     force? = Keyword.get(opts, :force, false)
 
-    if not force? and system_corpus_terminal?(tenant_id, dimension) do
-      {:error, :materialization_terminal}
-    else
-      %{tenant_id: tenant_id, dim: dimension}
-      |> SystemCorpusEmbeddingWorker.new()
-      |> Oban.insert()
+    cond do
+      # Already fully materialized ⇒ NO job (review, finding 11). The worker's Oban
+      # uniqueness covers only [:available, :scheduled, :retryable] (it must re-enqueue
+      # itself), so a COMPLETED corpus is not deduped: without this short-circuit every
+      # repeated agent-role POST inserted and ran a fresh job that the anti-join makes a
+      # no-op — an agent key could loop the endpoint to flood the embeddings queue for
+      # its own tenant. A limit-1 anti-join probe is cheap and returns a 200-shaped
+      # `:already_materialized` with no job created. Checked BEFORE the terminal gate so
+      # a done-but-terminal corpus reports done, not a conflict.
+      unmaterialized_system_articles(tenant_id, dimension, limit: 1) == [] ->
+        {:ok, :already_materialized}
+
+      not force? and system_corpus_terminal?(tenant_id, dimension) ->
+        {:error, :materialization_terminal}
+
+      true ->
+        %{tenant_id: tenant_id, dim: dimension}
+        |> SystemCorpusEmbeddingWorker.new()
+        |> Oban.insert()
     end
   end
 
@@ -1602,7 +1620,15 @@ defmodule Loopctl.Embeddings do
   def enqueue_reembed(tenant_id, target_dimension)
       when is_binary(tenant_id) and is_integer(target_dimension) do
     if supported_dimension?(target_dimension) do
-      %{tenant_id: tenant_id, target_dim: target_dimension}
+      # Capture the model that will PRODUCE the target corpus AT ENQUEUE (review, finding
+      # 12): the worker embeds every batch with it and `complete_reembed/3` pins it, so a
+      # mid-run edit to `tenant_llm_settings.embedding_model` can neither split the corpus
+      # across two models nor make the completion pin a model that did not produce it.
+      %{
+        tenant_id: tenant_id,
+        target_dim: target_dimension,
+        embedding_model: Llm.embedding_model(tenant_id)
+      }
       |> ReembedWorker.new()
       |> Oban.insert()
     else
@@ -1628,22 +1654,43 @@ defmodule Loopctl.Embeddings do
   def reembed_progress(tenant_id, target_dimension)
       when is_binary(tenant_id) and is_integer(target_dimension) do
     active = active_dimension(tenant_id)
-    counts = dimension_counts(tenant_id)
-    total = Map.get(counts, active, 0)
-    done = Map.get(counts, target_dimension, 0)
 
-    %{
-      active_dimension: active,
-      target_dimension: target_dimension,
-      total: total,
-      done: min(done, total),
-      pending: max(total - done, 0),
-      # `done >= total` and NOT `total > 0 and …` (review #15): a tenant with an
-      # empty corpus at the active dimension has nothing left to re-embed, so it IS
-      # complete. The old form made such a tenant permanently incomplete, which the
-      # worker's completion decision reads.
-      complete: done >= total
-    }
+    case dimension_counts_status(tenant_id) do
+      # HeavyRead SHED (review, finding 9): counts are UNKNOWN, not zero. Reporting
+      # `total: 0`/`done: 0` here would make `done >= total` compute `complete: true` —
+      # emitting a false `complete:true`/`pending:0` telemetry + disclosure during a
+      # transient overload. An empty-but-genuinely-complete corpus is INDISTINGUISHABLE
+      # from a shed at the count layer, so on a shed we report NOT complete (the safe,
+      # self-correcting answer — actual completion is re-verified via `reembed_complete?`
+      # inside `complete_reembed/3`, never off this progress number).
+      :overloaded ->
+        %{
+          active_dimension: active,
+          target_dimension: target_dimension,
+          total: 0,
+          done: 0,
+          pending: 0,
+          complete: false
+        }
+
+      {:ok, counts} ->
+        total = Map.get(counts, active, 0)
+        done = Map.get(counts, target_dimension, 0)
+
+        %{
+          active_dimension: active,
+          target_dimension: target_dimension,
+          total: total,
+          done: min(done, total),
+          pending: max(total - done, 0),
+          # `done >= total` and NOT `total > 0 and …` (review #15): a tenant with an
+          # empty corpus at the active dimension has nothing left to re-embed, so it IS
+          # complete. The old form made such a tenant permanently incomplete, which the
+          # worker's completion decision reads. (The shed case above is handled
+          # separately so a `%{}` from an OVERLOAD is not misread as an empty corpus.)
+          complete: done >= total
+        }
+    end
   end
 
   @doc """
@@ -1963,20 +2010,21 @@ defmodule Loopctl.Embeddings do
   only on the interleaving where the sweep is also safe; anything else rolls back
   and the job retries with recall untouched.
   """
-  @spec complete_reembed(Ecto.UUID.t(), pos_integer()) ::
+  @spec complete_reembed(Ecto.UUID.t(), pos_integer(), String.t() | nil) ::
           {:ok, non_neg_integer()} | {:error, :reembed_incomplete | :not_found | term()}
-  def complete_reembed(tenant_id, target_dim)
-      when is_binary(tenant_id) and is_integer(target_dim) do
+  def complete_reembed(tenant_id, target_dim, model \\ nil)
+      when is_binary(tenant_id) and is_integer(target_dim) and
+             (is_binary(model) or is_nil(model)) do
     if supported_dimension?(target_dim) do
-      AdminRepo.transaction(fn -> do_complete_reembed(tenant_id, target_dim) end)
+      AdminRepo.transaction(fn -> do_complete_reembed(tenant_id, target_dim, model) end)
     else
       {:error, :unsupported_dimension}
     end
   end
 
-  defp do_complete_reembed(tenant_id, target_dim) do
+  defp do_complete_reembed(tenant_id, target_dim, model) do
     with :ok <- assert_reembed_complete(tenant_id, target_dim),
-         :ok <- pin_completed_reembed(tenant_id, target_dim),
+         :ok <- pin_completed_reembed(tenant_id, target_dim, model),
          {:ok, dropped} <- do_drop_stale_dimensions(tenant_id, target_dim) do
       # AUDIT the completion (review): completion DELETES every stale-dimension row, so
       # it is the data-removing half of the operation KB 3e89e251 requires be audited to
@@ -2001,18 +2049,31 @@ defmodule Loopctl.Embeddings do
     if reembed_complete?(tenant_id, target_dim), do: :ok, else: {:error, :reembed_incomplete}
   end
 
-  # The model pin moves WITH the dimension: from here on, ordinary embeddings
-  # (query vectors included) are generated with the model that produced the corpus
-  # now serving — which is the tenant's currently configured one, the very model the
-  # re-embed used.
-  defp pin_completed_reembed(tenant_id, target_dim) do
+  # The model pin moves WITH the dimension: from here on, ordinary embeddings (query
+  # vectors included) are generated with the model that produced the corpus now
+  # serving.
+  #
+  # `model` is THREADED from the worker — the model captured when the re-embed was
+  # ENQUEUED, i.e. the one that actually produced the target-dimension corpus (review,
+  # finding 12/TOCTOU). It is NOT re-read from the tenant's CURRENT config here: a
+  # tenant that edits `tenant_llm_settings.embedding_model` between the last batch and
+  # completion would otherwise have the pin record a model that did not produce the now
+  # active corpus, so `query_model_override/1` would generate query vectors in the wrong
+  # embedding space. A `nil` model (a legacy job enqueued before this field existed)
+  # falls back to the currently configured model.
+  #
+  # The pin uses the SAME model/dimension agreement check as `pin_set/2` (review,
+  # finding 8): only pin the model when it genuinely produces `target_dim` vectors.
+  # A disagreeing model is pinned as NULL so `model_pin_conflict/1` DISCLOSES the
+  # conflict, rather than pinning a disagreeing model that `model_pin_conflict/1`
+  # (which only fires on a nil pin) would never surface — a silent recall blackout.
+  defp pin_completed_reembed(tenant_id, target_dim, model) do
+    model = model || Llm.embedding_model(tenant_id)
+
     {n, _} =
       AdminRepo.update_all(
         from(t in Tenant, where: t.id == ^tenant_id),
-        set: [
-          tenant_embedding_dimension: target_dim,
-          tenant_embedding_model: Llm.embedding_model(tenant_id)
-        ]
+        set: completion_pin_set(target_dim, model)
       )
 
     if n == 0 do
@@ -2020,6 +2081,18 @@ defmodule Loopctl.Embeddings do
     else
       invalidate_tenant_pin(tenant_id)
       :ok
+    end
+  end
+
+  # Unlike `pin_set/2` (which leaves the model UNCHANGED on disagreement), completion
+  # must EXPLICITLY move the model with the dimension — so on disagreement it pins the
+  # model NULL, both flipping the dimension AND letting `model_pin_conflict/1` disclose
+  # the mismatch (finding 8).
+  defp completion_pin_set(target_dim, model) do
+    if Dimensions.for_model(model) == target_dim do
+      [tenant_embedding_dimension: target_dim, tenant_embedding_model: model]
+    else
+      [tenant_embedding_dimension: target_dim, tenant_embedding_model: nil]
     end
   end
 
@@ -2055,6 +2128,25 @@ defmodule Loopctl.Embeddings do
   # status endpoint. One tenant-scoped source with a conjunctive `tenant_id ==` equality,
   # so `guard!/2` accepts it. An overloaded shed degrades to no counts (`%{}`).
   defp dimension_counts_for(tenant_id, schema) do
+    case dimension_counts_for_status(tenant_id, schema) do
+      :overloaded -> %{}
+      {:ok, counts} -> counts
+    end
+  end
+
+  # `{:ok, counts}` or `:overloaded` — the OVERLOAD-DISTINGUISHING variant (review,
+  # finding 9). `dimension_counts_for/2` collapses a shed to `%{}` (its best-effort
+  # disclosure contract), but `reembed_progress/2` must tell "empty corpus" (genuinely
+  # `%{}`, complete) apart from "HeavyRead shed" (unknown, NOT complete) — so it reads
+  # this and never derives `complete:true` from a shed.
+  defp dimension_counts_status(tenant_id) do
+    with {:ok, articles} <- dimension_counts_for_status(tenant_id, ArticleEmbedding),
+         {:ok, memories} <- dimension_counts_for_status(tenant_id, MemoryEmbedding) do
+      {:ok, Map.merge(articles, memories, fn _dim, a, m -> a + m end)}
+    end
+  end
+
+  defp dimension_counts_for_status(tenant_id, schema) do
     query =
       from(x in schema,
         where: x.tenant_id == ^tenant_id,
@@ -2063,8 +2155,8 @@ defmodule Loopctl.Embeddings do
       )
 
     case HeavyRead.all(tenant_id, query, heavy_disclosure_opts()) do
-      {:error, :heavy_read_overloaded} -> %{}
-      rows when is_list(rows) -> Map.new(rows)
+      {:error, :heavy_read_overloaded} -> :overloaded
+      rows when is_list(rows) -> {:ok, Map.new(rows)}
     end
   end
 end

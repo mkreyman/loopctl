@@ -45,6 +45,18 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorker do
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
+    # The GLOBAL backfill + live_denorm repair run EXACTLY ONCE per crontab tick, here
+    # — NOT once per tenant (review, finding 7). `reconcile_articles/1` /
+    # `reconcile_memories/1` are tenant-UNSCOPED: the backfill is a global INSERT..SELECT
+    # anti-join and `repair_*_live_denorm/0` are unconditional full-join UPDATEs over
+    # every embedding row. Running them in the per-tenant branch fanned the same global
+    # full-scan work out N× (once per tenant) against AdminRepo's 3-connection pool every
+    # hour — the exact US-27.11 pool-starvation class the rest of this PR routes to
+    # HeavyRead to avoid, and pure redundant work (tenant_id is only used by the
+    # per-tenant active-dimension gap re-enqueue).
+    {:ok, _} = Embeddings.reconcile_articles(max_batches: 5)
+    {:ok, _} = Embeddings.reconcile_memories(max_batches: 5)
+
     tenant_ids()
     |> Enum.each(fn tenant_id ->
       %{tenant_id: tenant_id}
@@ -56,8 +68,9 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorker do
   end
 
   def perform(%Oban.Job{args: %{"tenant_id" => tenant_id}}) when is_binary(tenant_id) do
-    {:ok, _} = Embeddings.reconcile_articles(max_batches: 5)
-    {:ok, _} = Embeddings.reconcile_memories(max_batches: 5)
+    # Per-tenant work ONLY: the active-dimension gap re-enqueue is the sole reconcile
+    # step that actually reads a tenant argument. The global backfill / live_denorm
+    # repair ran once in the `all_tenants` branch above.
     reenqueue_active_dimension_gaps(tenant_id)
     :ok
   end

@@ -6633,19 +6633,21 @@ defmodule Loopctl.Knowledge do
             {:ok,
              %{
                results: results,
-               meta: %{
-                 total_count: total_count,
-                 limit: limit,
-                 offset: offset,
-                 search_mode: "semantic_only",
-                 # Every EMBEDDED article passing the filters is ranked by similarity
-                 # (no relevance cutoff), so total_count is the size of that embedded
-                 # set — NOT a match count, and <= the total published count (articles
-                 # without an embedding are excluded). Use knowledge_stats for the
-                 # full wiki size.
-                 total_count_scope: "ranked_corpus",
-                 pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
-               }
+               meta:
+                 %{
+                   total_count: total_count,
+                   limit: limit,
+                   offset: offset,
+                   search_mode: "semantic_only",
+                   # Every EMBEDDED article passing the filters is ranked by similarity
+                   # (no relevance cutoff), so total_count is the size of that embedded
+                   # set — NOT a match count, and <= the total published count (articles
+                   # without an embedding are excluded). Use knowledge_stats for the
+                   # full wiki size.
+                   total_count_scope: "ranked_corpus",
+                   pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
+                 }
+                 |> Map.merge(legacy_system_corpus_meta())
              }}
         end
     end
@@ -6904,6 +6906,26 @@ defmodule Loopctl.Knowledge do
   # enqueue refuses to re-drive a permanently-terminated materialization.
   defp semantic_disclosure_meta(tenant_id, dimension) when is_integer(dimension) do
     Embeddings.search_disclosure_meta(tenant_id, dimension)
+  end
+
+  # AC-41.1.7 mandates the system-corpus recall state be stated EXPLICITLY on every
+  # semantic response — "never a silent absence" (review, finding 3). On the LEGACY
+  # (pre-cutover) read path the shared system corpus is not semantically recallable at
+  # all: the legacy inner ANN (`index_safe_knn_base/4`) scopes `tenant_id ==
+  # ^tenant_id`, which excludes the NULL-tenant system rows, so system articles are
+  # keyword-only for EVERY tenant during the dual-write window. Emitting this static
+  # note keeps the disclosure present pre-flip too, rather than absent until the
+  # side-table path (which computes the per-tenant materialization state) takes over.
+  # This is a compile-time constant — NO query — so it does not reintroduce the hot-path
+  # cost the side-table disclosure is memoized to avoid.
+  defp legacy_system_corpus_meta do
+    %{
+      system_corpus_recall: "keyword_only",
+      system_corpus_reason:
+        "the shared system-scoped corpus is semantically recallable only on the " <>
+          "side-table read path; while this instance still serves the legacy " <>
+          "(pre-cutover) embedding column it is matched by keyword only for every tenant."
+    }
   end
 
   # US-37.5: heavy-read opts for the semantic search reads with the graceful-degrade

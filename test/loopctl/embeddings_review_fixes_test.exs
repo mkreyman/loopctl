@@ -343,6 +343,46 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       # ... and with the pin caught up, ordinary embeddings stop overriding again.
       assert Embeddings.query_model_override(tenant.id) == nil
     end
+
+    # Finding 8: a model that does NOT produce the target dimension must NOT be pinned —
+    # pinning it would be a silent recall blackout `model_pin_conflict/1` (which only
+    # fires on a nil pin) never surfaces. Completion NULLs the model so the conflict is
+    # disclosed.
+    test "completion pins the model NULL when the configured model disagrees with the target dim" do
+      tenant = fixture(:tenant)
+      fixture(:tenant_llm_settings, %{tenant_id: tenant.id, embedding_model: "bge-m3"})
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      assert Embeddings.resolve_write_dimension(tenant.id) == 1024
+      {:ok, _} = Embeddings.upsert_article_embedding(tenant.id, article, vec(1024), nil, 1024)
+      {:ok, _} = Embeddings.upsert_article_embedding(tenant.id, article, vec(768), nil, 768)
+
+      # Complete onto 768 while the configured model (bge-m3) still returns 1024 vectors.
+      assert {:ok, _} = Embeddings.complete_reembed(tenant.id, 768)
+
+      assert Embeddings.active_dimension(tenant.id) == 768
+      assert Embeddings.active_model(tenant.id) == nil
+      assert Embeddings.model_pin_conflict(tenant.id) != nil
+    end
+
+    # Finding 12 (TOCTOU): the pin records the model the worker THREADED (the one that
+    # produced the target corpus), not whatever the tenant reconfigured to mid-run. A
+    # threaded 768 model that DIFFERS from the live-config 768 model still wins.
+    test "completion pins the THREADED model, not the tenant's currently-configured one" do
+      tenant = fixture(:tenant)
+      fixture(:tenant_llm_settings, %{tenant_id: tenant.id, embedding_model: "bge-base-en"})
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      {:ok, _} = Embeddings.upsert_article_embedding(tenant.id, article, vec(768), nil, 768)
+      {:ok, _} = Embeddings.upsert_article_embedding(tenant.id, article, vec(1024), nil, 1024)
+
+      # Thread a DIFFERENT 768 model than the live config (bge-base-en); both are 768 so
+      # both agree with the target — the point is WHICH one is pinned.
+      assert {:ok, _} = Embeddings.complete_reembed(tenant.id, 768, "nomic-embed-text")
+
+      assert Embeddings.active_dimension(tenant.id) == 768
+      assert Embeddings.active_model(tenant.id) == "nomic-embed-text"
+    end
   end
 
   # ---------------------------------------------------------------------------

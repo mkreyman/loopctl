@@ -40,6 +40,19 @@ defmodule Loopctl.Embeddings.DisclosureCache do
   @default_ttl_ms 5_000
   @sweep_interval_ms 60_000
 
+  # Cross-node invalidation bridge (review, findings 5/10). The ETS table is
+  # `:named_table` (node-LOCAL) and Erlang clustering does NOT share ETS, so a pin
+  # write on one node is invisible to peers until their TTL expires. On a multi-node
+  # deployment (Fly) that left peers serving a STALE dimension/model pin for up to the
+  # TTL after `complete_reembed/2` swept the old-dimension rows: peer query vectors
+  # scanned a dimension whose rows were just deleted (empty recall, no keyword
+  # fallback) and peer writes re-created rows the sweep removed. Broadcasting the
+  # invalidation over `Phoenix.PubSub` busts every peer's node-local entry within a
+  # message hop — mirroring `Loopctl.Llm.SettingsCache.invalidate_cluster/1`. The TTL
+  # remains the bounded backstop if a broadcast is dropped (netsplit).
+  @pubsub Loopctl.PubSub
+  @invalidate_topic "embeddings:disclosure_cache:invalidate"
+
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -49,6 +62,10 @@ defmodule Loopctl.Embeddings.DisclosureCache do
   @impl true
   def init(_opts) do
     :ok = init_table()
+    # Subscribe so a PEER node's invalidation broadcast busts THIS node's entry.
+    # `Phoenix.PubSub` starts strictly before this owner in the supervision tree and
+    # stays up across our restarts, so the subscribe is safe to do inline.
+    Phoenix.PubSub.subscribe(@pubsub, @invalidate_topic)
     schedule_sweep()
     {:ok, %{}}
   end
@@ -67,6 +84,23 @@ defmodule Loopctl.Embeddings.DisclosureCache do
     end
 
     schedule_sweep()
+    {:noreply, state}
+  end
+
+  # A PEER node invalidated `key` (a pin write / re-embed completion there); bust our
+  # node-local entry so we stop serving the stale dimension/model pin.
+  def handle_info({:invalidate, key}, state) do
+    if :ets.whereis(@table) != :undefined, do: :ets.delete(@table, key)
+    {:noreply, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl true
+  def handle_cast({:broadcast_invalidate, key}, state) do
+    # Fan out to peer nodes, excluding self() (this node's subscriber is the owner
+    # itself) so the originating node does not re-process its own invalidation.
+    _ = Phoenix.PubSub.broadcast_from(@pubsub, self(), @invalidate_topic, {:invalidate, key})
     {:noreply, state}
   end
 
@@ -117,6 +151,27 @@ defmodule Loopctl.Embeddings.DisclosureCache do
   @spec invalidate(term()) :: :ok
   def invalidate(key) do
     if :ets.whereis(@table) != :undefined, do: :ets.delete(@table, key)
+    :ok
+  end
+
+  @doc """
+  Invalidates `key` on THIS node (see `invalidate/1`) AND broadcasts the invalidation
+  to peer nodes over `Phoenix.PubSub` so their node-local ETS busts promptly.
+
+  Used by the tenant-pin write paths (`Embeddings.invalidate_tenant_pin/1`) so a
+  re-embed completion — which moves the dimension/model pin AND sweeps the old rows —
+  is observed cluster-wide within a PubSub hop, not just on the node that handled the
+  write. Without this, peer nodes served the stale pin for up to the TTL and scanned a
+  swept dimension (empty recall) or re-created swept rows (findings 5/10). If the
+  broadcast is dropped (netsplit) the bounded TTL still evicts the peer's stale entry.
+  """
+  @spec invalidate_cluster(term()) :: :ok
+  def invalidate_cluster(key) do
+    invalidate(key)
+    # Broadcast off the (rare) write path via the owner so we can exclude THIS node's
+    # subscriber from the fan-out (no self-echo). `GenServer.cast` is safe if the owner
+    # is momentarily down mid-restart — the local invalidate already ran.
+    GenServer.cast(__MODULE__, {:broadcast_invalidate, key})
     :ok
   end
 

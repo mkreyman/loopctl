@@ -673,8 +673,11 @@ defmodule Loopctl.Knowledge.VectorSearch do
       `embedding` column is an UNCONSTRAINED `vector` — pgvector refuses to
       HNSW-index that — so the cast is what supplies the typmod, and the planner
       can only match the index if the query repeats it verbatim.
-    * the WHERE carries `dim == ^dimension` and `live_denorm`, which are EXACTLY
-      the per-dimension index's partial predicate. Nothing else may be added here:
+    * the WHERE carries `dim = <literal>` (a compile-time literal per supported
+      dimension via `dimension_where/2`, NOT a bound `^dimension` param — see that
+      function) and `live_denorm`, which are EXACTLY the per-dimension index's
+      partial predicate, matched even under a Postgres GENERIC plan. Nothing else
+      may be added here:
       a JOIN or a selective btree predicate inside the index-ordered top-k is the
       #170/#172 production incident (cost ~57k vs ~880 at 76k rows). Subject
       scope, project, tags, category and status all belong on an OUTER query over
@@ -708,9 +711,9 @@ defmodule Loopctl.Knowledge.VectorSearch do
              is_integer(dimension) and is_integer(pool) do
     from(x in schema,
       where: x.tenant_id == ^tenant_id,
-      where: x.dim == ^dimension,
       limit: ^pool
     )
+    |> dimension_where(dimension)
     |> maybe_live_denorm_only(Keyword.get(opts, :live_only, true))
     |> dimension_order_by(dimension, target)
   end
@@ -763,7 +766,32 @@ defmodule Loopctl.Knowledge.VectorSearch do
     end
   end
 
-  defp dimension_order_by(_query, dimension, _target) do
+  # NO raising fallback here (unlike `dimension_where/2`): in the ONLY caller,
+  # `index_safe_dimension_knn_base/6` runs `dimension_where/2` — the single validation
+  # gate — FIRST, which already raises for an unsupported dimension. A fallback here
+  # would be unreachable dead code (dialyzer `pattern_match_cov`), since the type is
+  # narrowed to the supported literal set by the time `dimension_order_by/3` is reached.
+
+  # ONE clause per SUPPORTED dimension, generated at COMPILE TIME — the `dim` predicate
+  # must be a LITERAL, not a bound `^dimension` param (review, finding 1).
+  #
+  # The per-dimension partial HNSW index carries a LITERAL partial predicate
+  # (`WHERE dim = 768 AND live_denorm`, `Loopctl.Repo.HnswIndex.create_dimension_index_sql/2`).
+  # Under a Postgres GENERIC plan (`plan_cache_mode=auto` flips a prepared statement to
+  # generic after ~5 executions) the planner cannot PROVE `dim = $1` implies `dim = 768`, so
+  # a bound `dim == ^dimension` disqualifies the partial index and the query reverts to a
+  # seq-scan + sort over the whole vector relation — the exact #170/#172 outage this module
+  # exists to prevent. Emitting `dim = 768` as a compile-time literal (the same closed,
+  # compile-time set `dimension_order_by/3` draws its literal cast from) makes the predicate
+  # match the index's literal predicate regardless of plan_cache_mode. An unsupported
+  # dimension hits the raising fallback rather than planning a seq scan.
+  for dim <- @supported_dimensions do
+    defp dimension_where(query, unquote(dim)) do
+      where(query, [x], x.dim == unquote(dim))
+    end
+  end
+
+  defp dimension_where(_query, dimension) do
     raise ArgumentError,
           "embedding dimension #{inspect(dimension)} is not supported by this instance " <>
             "(supported: #{inspect(@supported_dimensions)}). A dimension is only supported " <>
