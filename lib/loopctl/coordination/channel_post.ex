@@ -154,6 +154,7 @@ defmodule Loopctl.Coordination.ChannelPost do
              :key,
              :body,
              :refs,
+             :superseded_by,
              :expires_at,
              :inserted_at,
              :updated_at
@@ -176,6 +177,21 @@ defmodule Loopctl.Coordination.ChannelPost do
     field :idempotency_key, :string
     field :body, :string
     field :refs, RefsList
+
+    # US-454 (defect 3): supersession terminal state. Set PROGRAMMATICALLY by the
+    # context when a later post declares `supersedes: <this post id>` — never
+    # castable from caller input (a caller could otherwise self-retire or retire
+    # an arbitrary post outside the authorized write path). NULL = live. Directed
+    # handoff discovery EXCLUDES superseded posts; the history read marks them.
+    field :superseded_by, :binary_id
+
+    # US-454 (defect 1): write-path provenance markers, populated by
+    # `Coordination.post/4` so the endpoint can TELL the sender when its write was
+    # rescued by a server fallback (handoff key derived from the body, and/or a
+    # surrogate session_id minted because the proxy supplied none). Never
+    # persisted; nil on every read path.
+    field :key_source, :string, virtual: true
+    field :session_id_source, :string, virtual: true
 
     field :expires_at, :utc_datetime_usec
 

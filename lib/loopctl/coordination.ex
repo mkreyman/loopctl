@@ -72,7 +72,7 @@ defmodule Loopctl.Coordination do
   # Deliberately far above any sane directed-handoff backlog; hitting it signals a
   # pathological channel, not normal operation. When it IS hit the truncation is NOT
   # silent: `directed_handoffs_page/3` returns an `overflowed?` flag (surfaced as HTTP
-  # `meta.overflow`) so the caller knows the newest directed handoffs were dropped and
+  # `meta.overflow`) so the caller knows the oldest directed handoffs were dropped and
   # can read the channel directly instead of trusting a truncated pinned set.
   @max_directed_handoffs 500
 
@@ -356,6 +356,7 @@ defmodule Loopctl.Coordination do
   @spec post(Ecto.UUID.t(), Ecto.UUID.t(), atom(), map()) ::
           {:ok, ChannelPost.t(), :created | :updated | :deduplicated}
           | {:error, :not_found}
+          | {:error, :supersede_target_not_found}
           | {:error, :agent_not_found}
           | {:error, :conflict}
           | {:error, Ecto.Changeset.t()}
@@ -400,7 +401,24 @@ defmodule Loopctl.Coordination do
     # and would only add coupling — so it stays a pre-flight guard.
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- agent_owned(tenant_id, agent_id),
-         :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role) do
+         :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role),
+         {:ok, supersedes} <-
+           fetch_supersede_target(
+             tenant_id,
+             project_id,
+             Map.get(attrs, :supersedes),
+             agent_id,
+             role
+           ) do
+      # US-454 (defect 1): rescue handoffs that would otherwise land keyless and
+      # silently undiscoverable, and keep the keyed path available when the MCP
+      # proxy supplied no session_id (the 422 "session_id can't be blank" that
+      # forced the degraded keyless fallback in the incident behind issue #454).
+      attrs =
+        attrs
+        |> maybe_derive_handoff_key()
+        |> maybe_surrogate_session()
+
       changeset =
         %ChannelPost{
           tenant_id: tenant_id,
@@ -409,10 +427,124 @@ defmodule Loopctl.Coordination do
           expires_at: default_expires_at()
         }
         |> ChannelPost.create_changeset(attrs)
+        |> put_provenance_changes(attrs)
 
-      run_post(tenant_id, changeset, audit)
+      run_post(tenant_id, changeset, audit, supersedes)
     end
   end
+
+  # US-454 (defect 1), issue fix 1: a KEYLESS post whose body ANNOUNCES a
+  # `handoff:<anchor>` gets the anchor DERIVED as its key server-side, rather
+  # than landing with key NULL — invisible to `directed_handoffs/3` (which
+  # filters `key LIKE 'handoff:%'`) and unclaimable (claim ref == key). The
+  # /handoff convention is client-side, but a client without a session (no
+  # CLAUDE_SESSION_ID) could not use the keyed path at all before this fallback;
+  # deriving makes the only post it COULD produce discoverable.
+  #
+  # Two announcement shapes are recognized — both from the incident behind
+  # issue #454, whose fix text names them explicitly:
+  #   * the anchor at the very start of the body (`handoff:repo#812 — …`), and
+  #   * the canonical prose form `HANDOFF (handoff:<anchor>) …` (what a sender
+  #     writes when it has no keyed path). The HANDOFF-prose prefix is bounded
+  #     (<= 80 chars before the anchor) so a deliberate announcement matches
+  #     while a passing mid-body mention ("discussing handoff:x") NEVER gets
+  #     promoted to a keyed handoff (and can never upsert-clobber a real one
+  #     from the same session).
+  #
+  # A HANDOFF-announcing body carrying a client idempotency token derives the
+  # key ANYWAY and therefore 422s LOUDLY via the key/token exclusion (issue
+  # fix 2: "a loud 422 beats a silent drop") — the client must pick: an
+  # explicit key (keyed slot dedups the retry) or a token (keyless, and the
+  # handoff stays undiscoverable BY ITS OWN CHOICE, told so by the error).
+  # Capped so the derived key can never exceed the column bound:
+  #   "handoff:" (8) + 1 required + {0,191} = at most 200 bytes.
+  @handoff_anchor_regex ~r/\A\s*(?:HANDOFF\b[\s\S]{0,80}?)?(handoff:[A-Za-z0-9][A-Za-z0-9_.\-\/#:]{0,191})/
+
+  defp maybe_derive_handoff_key(attrs) do
+    key = Map.get(attrs, :key)
+    body = Map.get(attrs, :body)
+
+    if present_string?(key) or not is_binary(body) do
+      attrs
+    else
+      case Regex.run(@handoff_anchor_regex, body) do
+        [_full, anchor] ->
+          attrs |> Map.put(:key, anchor) |> Map.put(:key_source, "derived_from_body")
+
+        _no_anchor ->
+          attrs
+      end
+    end
+  end
+
+  # US-454 (defect 1), issue fix 1: a keyed post with NO session_id (the MCP
+  # proxy had no CLAUDE_SESSION_ID to auto-fill) no longer 422s — the server
+  # mints a UNIQUE surrogate session id, so the slot insert succeeds and the
+  # handoff is discoverable/claimable. The surrogate is unique per write, so
+  # same-"session" retries do NOT upsert (there is no session identity to dedupe
+  # against) — duplicate pointers are collapsed at read time by DISTINCT ON
+  # (key), and the CLAIM remains the cross-session exactly-once backstop. The
+  # `session_id_source` marker lets the endpoint tell the sender its post was
+  # rescued (issue fix 3: surface the degraded state at post time).
+  defp maybe_surrogate_session(attrs) do
+    if present_string?(Map.get(attrs, :key)) and not present_string?(Map.get(attrs, :session_id)) do
+      attrs
+      |> Map.put(:session_id, "srvgen-" <> Ecto.UUID.generate())
+      |> Map.put(:session_id_source, "server_surrogate")
+    else
+      attrs
+    end
+  end
+
+  defp present_string?(value), do: is_binary(value) and String.trim(value) != ""
+
+  # Carry the write-path provenance markers onto the returned struct (virtual
+  # fields — never persisted) so the endpoint can surface them in the response.
+  defp put_provenance_changes(changeset, attrs) do
+    changeset
+    |> Ecto.Changeset.put_change(:key_source, Map.get(attrs, :key_source))
+    |> Ecto.Changeset.put_change(:session_id_source, Map.get(attrs, :session_id_source))
+  end
+
+  # US-454 (defect 3): resolve the OPTIONAL `supersedes` target for a post. The
+  # target must live in the SAME tenant+project channel, and the caller must be
+  # its AUTHOR or hold role >= :user (mirrors `authorized_to_delete?/3` — the
+  # same "who may retire a post" boundary). Any miss — nonexistent, cross-
+  # project, not-yours, or malformed — collapses to `{:error,
+  # :supersede_target_not_found}` so the endpoint maps it to a 422 WITHOUT
+  # the :ownership_rejected security signal (preserving honest attribution).
+  defp fetch_supersede_target(_tenant_id, _project_id, nil, _agent_id, _role), do: {:ok, nil}
+
+  defp fetch_supersede_target(tenant_id, project_id, target_id, agent_id, role)
+       when is_binary(target_id) do
+    target =
+      ChannelPost
+      |> where(
+        [p],
+        p.tenant_id == ^tenant_id and p.project_id == ^project_id and p.id == ^target_id
+      )
+      |> AdminRepo.one()
+
+    case target do
+      %ChannelPost{} = post ->
+        if post.agent_id == agent_id or Role.role_at_least?(role, :user) do
+          {:ok, post}
+        else
+          {:error, :supersede_target_not_found}
+        end
+
+      nil ->
+        {:error, :supersede_target_not_found}
+    end
+  rescue
+    # A malformed (non-UUID) target id is the same "not found" — no shape oracle.
+    Ecto.Query.CastError -> {:error, :supersede_target_not_found}
+  end
+
+  # Catch-all for non-binary supersedes values (integer, array, object) — prevents
+  # a FunctionClauseError → 500 on malformed JSON input.
+  defp fetch_supersede_target(_tenant_id, _project_id, _target_id, _agent_id, _role),
+    do: {:error, :supersede_target_not_found}
 
   @doc """
   Authorizes a project-scoped WRITE by an agent — the SHARED default-deny
@@ -545,6 +677,11 @@ defmodule Loopctl.Coordination do
   `{:error, :agent_not_found}` (foreign-tenant server-stamped agent), or
   `{:error, %Ecto.Changeset{}}` (a bad `ref` — over-length or NUL byte).
   """
+  # Per-agent concurrent open claim bound (anti-squatting, AC-40.B1 review finding).
+  # Deliberately generous — normal agents should never hit this — but prevents a
+  # single compromised/broken agent from enumerating and claiming every open handoff.
+  @max_concurrent_open_claims 50
+
   @spec claim(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
           {:ok, ChannelClaim.t()}
           | {:error, :already_claimed}
@@ -558,7 +695,9 @@ defmodule Loopctl.Coordination do
 
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- agent_owned(tenant_id, agent_id),
-         :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role) do
+         :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role),
+         :ok <- verify_ref_not_superseded(tenant_id, project_id, ref),
+         :ok <- verify_agent_claim_budget(tenant_id, project_id, agent_id) do
       now = DateTime.utc_now()
 
       changeset =
@@ -595,10 +734,23 @@ defmodule Loopctl.Coordination do
   @spec done(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
           {:ok, ChannelClaim.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
   def done(tenant_id, agent_id, project_id, ref, audit \\ []) do
+    now = DateTime.utc_now()
+
     case fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
-      %ChannelClaim{} = claim ->
-        changeset = Ecto.Changeset.change(claim, done_at: DateTime.utc_now())
-        run_claim_lifecycle(tenant_id, project_id, agent_id, :update, changeset, "done", audit)
+      %ChannelClaim{lease_expires_at: lease, done_at: nil} = claim ->
+        if DateTime.compare(lease, now) == :gt do
+          changeset = Ecto.Changeset.change(claim, done_at: now)
+          run_claim_lifecycle(tenant_id, project_id, agent_id, :update, changeset, "done", audit)
+        else
+          # Expired lease: the claim is no longer valid. The sweeper will reap it;
+          # the caller should re-claim if they still want to mark this ref done.
+          {:error, :not_found}
+        end
+
+      %ChannelClaim{} ->
+        # Already done — idempotent or a race. Treat as not_found to avoid leaking
+        # claim state.
+        {:error, :not_found}
 
       nil ->
         {:error, :not_found}
@@ -606,24 +758,28 @@ defmodule Loopctl.Coordination do
   end
 
   @doc """
-  Releases (DELETES) the caller's OWN claim on `ref` so the ref can be re-claimed
-  (US-40.B1). Deletes regardless of `done_at` — a released ref reopens for the next
-  racer (TC-40.B1.3: after A releases, another agent can claim the ref again).
+  Releases (DELETES) the caller's OWN OPEN claim on `ref` so the ref can be re-claimed
+  (US-40.B1). A DONE claim is terminal and CANNOT be released — this preserves the
+  "a DONE handoff never reappears" guarantee.
 
   Owner-scoped exactly like `done/5`: a non-owner / cross-tenant / cross-project /
   missing claim all return a byte-identical `{:error, :not_found}` (no oracle, no
   `:role` needed). The delete and its audit entry run in ONE
   `AdminRepo.transaction` (Multi).
 
-  Returns `{:ok, %ChannelClaim{}}` (the deleted claim), `{:error, :not_found}`, or
+  Returns `{:ok, %ChannelClaim{}}` (the deleted claim), `{:error, :not_found}`,
+  `{:error, :already_claimed}` (the claim is already DONE — terminal), or
   `{:error, %Ecto.Changeset{}}` (the `:audit` Multi step's changeset insert failed —
   see `run_claim_lifecycle/7`).
   """
   @spec release(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
-          {:ok, ChannelClaim.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
+          {:ok, ChannelClaim.t()}
+          | {:error, :not_found}
+          | {:error, :already_claimed}
+          | {:error, Ecto.Changeset.t()}
   def release(tenant_id, agent_id, project_id, ref, audit \\ []) do
     case fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
-      %ChannelClaim{} = claim ->
+      %ChannelClaim{done_at: nil} = claim ->
         run_claim_lifecycle(
           tenant_id,
           project_id,
@@ -633,6 +789,9 @@ defmodule Loopctl.Coordination do
           "released",
           audit
         )
+
+      %ChannelClaim{} ->
+        {:error, :already_claimed}
 
       nil ->
         {:error, :not_found}
@@ -730,9 +889,23 @@ defmodule Loopctl.Coordination do
   # whether to insert. A rare concurrent release between the insert and this read
   # yields a nil lookup -> a safe 409 (the caller retries), never a dropped handoff.
   defp resolve_claim_collision(tenant_id, project_id, agent_id, ref) do
+    now = DateTime.utc_now()
+
     case fetch_claim_by_ref(tenant_id, project_id, ref) do
-      %ChannelClaim{claimant_agent_id: ^agent_id, done_at: nil} = existing -> {:ok, existing}
-      _ -> {:error, :already_claimed}
+      %ChannelClaim{claimant_agent_id: ^agent_id, done_at: nil, lease_expires_at: lease} =
+          existing ->
+        if DateTime.compare(lease, now) == :gt do
+          {:ok, existing}
+        else
+          # Expired lease: the owner is re-claiming a dead handoff. Treat as a real
+          # collision so the caller learns the ref is NOT held (the sweeper will reap
+          # it shortly, or the caller can retry). This keeps discovery (which treats
+          # expired leases as inactive) and claim semantics consistent.
+          {:error, :already_claimed}
+        end
+
+      _ ->
+        {:error, :already_claimed}
     end
   end
 
@@ -748,6 +921,71 @@ defmodule Loopctl.Coordination do
     )
     |> AdminRepo.one()
   end
+
+  # Reject claiming a ref whose newest live post is already superseded — the ref
+  # points to stale instructions that have been retired. This prevents an agent
+  # from claiming a handoff whose correction already exists (US-454 defect 3).
+  defp verify_ref_not_superseded(tenant_id, project_id, ref) do
+    now = DateTime.utc_now()
+
+    newest =
+      ChannelPost
+      |> where(
+        [p],
+        p.tenant_id == ^tenant_id and p.project_id == ^project_id and
+          p.key == ^ref and p.expires_at > ^now
+      )
+      |> order_by([p], desc: p.inserted_at, desc: p.seq)
+      |> limit(1)
+      |> AdminRepo.one()
+
+    case newest do
+      %ChannelPost{superseded_by: nil} -> :ok
+      %ChannelPost{} -> {:error, :already_claimed}
+      nil -> :ok
+    end
+  end
+
+  # Reject claiming when the agent already holds the maximum allowed concurrent
+  # open claims on this project — prevents mass-squatting of every handoff.
+  defp verify_agent_claim_budget(tenant_id, project_id, agent_id) do
+    now = DateTime.utc_now()
+
+    count =
+      ChannelClaim
+      |> where(
+        [c],
+        c.tenant_id == ^tenant_id and c.project_id == ^project_id and
+          c.claimant_agent_id == ^agent_id and is_nil(c.done_at) and
+          c.lease_expires_at > ^now
+      )
+      |> AdminRepo.aggregate(:count)
+
+    if count >= @max_concurrent_open_claims do
+      {:error, :already_claimed}
+    else
+      :ok
+    end
+  end
+
+  # Invalidate any open claims on a superseded target's ref so the successor is
+  # immediately visible for claiming (US-454 defect 3: a same-key successor
+  # blocked by an active claim on the predecessor's ref).
+  defp invalidate_open_claims_on_supersede(repo, %ChannelPost{key: key} = target)
+       when is_binary(key) do
+    import Ecto.Query
+
+    from(c in ChannelClaim,
+      where:
+        c.tenant_id == ^target.tenant_id and
+          c.project_id == ^target.project_id and
+          c.ref == ^key and
+          is_nil(c.done_at)
+    )
+    |> repo.delete_all()
+  end
+
+  defp invalidate_open_claims_on_supersede(_repo, _target), do: nil
 
   # done (Multi.update) / release (Multi.delete) + audit in ONE transaction so the
   # lifecycle transition stays accountable. `record` is the changeset (update) or the
@@ -1031,8 +1269,10 @@ defmodule Loopctl.Coordination do
   # Article's `^[A-Za-z0-9_-]+$` tag pattern) is the adjacent smuggling vector, so tags
   # are scanned too. A hit is an explicit 422 rejection, never a silent drop.
   defp scan_graduation_content(title, body, tags) do
+    tags_list = if is_list(tags), do: tags, else: []
+
     if SecretDenylist.contains_secret?(title) or SecretDenylist.contains_secret?(body) or
-         Enum.any?(tags || [], &SecretDenylist.contains_secret?/1) do
+         Enum.any?(tags_list, &SecretDenylist.contains_secret?/1) do
       {:error, :unprocessable_entity,
        "graduation content contains a denylisted secret pattern; it cannot be graduated to the durable knowledge plane"}
     else
@@ -1142,54 +1382,110 @@ defmodule Loopctl.Coordination do
   # equal timestamps ⇒ created and divergent ⇒ in-place update. This reflects the
   # actual write outcome atomically, so the label is correct even under a concurrent
   # same-session race or a sweep deleting the slot mid-flight.
-  defp run_post(tenant_id, changeset, audit), do: run_post(tenant_id, changeset, audit, 1)
+  defp run_post(tenant_id, changeset, audit, supersedes, retries_left \\ 1)
 
   # `retries_left` bounds the idempotency-recovery re-attempt (see
-  # `resolve_idempotency_collision/4`): a hard-delete of the winning row between the
+  # `resolve_idempotency_collision/5`): a hard-delete of the winning row between the
   # failed insert and the recovery SELECT frees the idempotency slot, so we re-run
   # the append ONCE (budget 1) rather than bounce a misleading non-retryable 422.
-  defp run_post(tenant_id, changeset, audit, retries_left) do
+  defp run_post(tenant_id, changeset, audit, supersedes, retries_left) do
     key = Ecto.Changeset.get_field(changeset, :key)
     insert_opts = insert_opts(key)
 
     multi =
       Multi.new()
       |> Multi.insert(:post, changeset, insert_opts)
-      |> Audit.log_in_multi(:audit, fn %{post: post} ->
-        audit_attrs(tenant_id, post, post_outcome(post), audit)
+      |> maybe_supersede_step(supersedes)
+      |> Audit.log_in_multi(:audit_post, fn %{post: post} ->
+        audit_attrs(tenant_id, post, post_outcome(post), audit, changeset, supersedes)
       end)
+      |> maybe_supersede_audit_step(tenant_id, supersedes, audit)
 
     case AdminRepo.transaction(multi) do
       {:ok, %{post: post}} ->
         {:ok, post, post_outcome(post)}
 
       {:error, :post, %Ecto.Changeset{} = failed, _changes} ->
-        # A KEYLESS write carrying a client idempotency token that races/retries
-        # into the `channel_posts_idempotency_uidx` partial unique index is a
-        # DEDUP, not a failure: catch the unique violation and resolve it to the
-        # EXISTING row (insert-and-recover, no TOCTOU — the DB index is the
-        # exactly-once gate; this SELECT only CLASSIFIES the loser, mirroring
-        # `resolve_claim_collision/4` and `Knowledge.resolve_create_conflict/4`).
-        # The failed transaction rolled back, so NO audit entry was written for the
-        # duplicate — correct, nothing changed; the recovery SELECT runs AFTER the
-        # rollback exactly like the claim path. Any other rejection (a size/shape
-        # bound, denylist hit, NUL byte, or the keyed slot collision) stays a 422.
         if idempotency_conflict?(failed) do
-          resolve_idempotency_collision(tenant_id, failed, changeset, audit, retries_left)
+          resolve_idempotency_collision(
+            tenant_id,
+            failed,
+            changeset,
+            audit,
+            supersedes,
+            retries_left
+          )
         else
           tap_secret_blocked({:error, failed})
         end
 
-      # Any OTHER failed step (today only `:audit`, whose only failure mode is a
-      # changeset) is normalised to the SAME documented `{:error, %Ecto.Changeset{}}`
-      # shape — `run_post/3` never leaks an off-spec `{:error, reason}` to the
-      # controller, so no controller catch-all (which dialyzer would reject as dead
-      # code) is needed. If `Audit.log_in_multi/3` is ever changed to fail with a
-      # non-changeset error, this clause stops covering it and dialyzer fails the
-      # build here (a compile-gate guard, stronger than a runtime 500 fallback).
       {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
     end
+  rescue
+    # Concurrent redact of the supersede target (US-39.7). The target was fetched
+    # OUTSIDE the transaction by `fetch_supersede_target/5`; between that unlocked
+    # read and the `repo.update/2` in `maybe_supersede_step/2` the row can be hard-
+    # deleted. Ecto raises `Ecto.StaleEntryError`; collapse to the same clean error
+    # a nonexistent target returns — never a 500. Mirrors `run_delete/4` and
+    # `run_claim_lifecycle/7`.
+    Ecto.StaleEntryError -> {:error, :supersede_target_not_found}
+  end
+
+  # US-454 (defect 3): when the post declares `supersedes: <target>`, mark the
+  # target retired IN THE SAME TRANSACTION as the insert/upsert, so a handoff
+  # and its successor can never be half-visible (a crash between two writes
+  # would leave the stale one looking live). The target was already authorized
+  # and scope-checked by `fetch_supersede_target/5`. A self-supersede — only
+  # reachable on the keyed UPSERT path, where the persisted slot row's id can
+  # equal the target id the caller passed — is rejected as a changeset error so
+  # it flows through the existing `{:error, _step, %Ecto.Changeset{}, _}`
+  # normalisation (→ 422) instead of introducing a new error shape.
+  defp maybe_supersede_step(multi, nil), do: multi
+
+  defp maybe_supersede_step(multi, %ChannelPost{} = target) do
+    Multi.run(multi, :supersede, fn repo, %{post: post} ->
+      cond do
+        target.id == post.id ->
+          {:error,
+           target
+           |> Ecto.Changeset.change()
+           |> Ecto.Changeset.add_error(:superseded_by, "cannot supersede itself")}
+
+        not is_nil(target.superseded_by) ->
+          {:error,
+           target
+           |> Ecto.Changeset.change()
+           |> Ecto.Changeset.add_error(:superseded_by, "target is already superseded")}
+
+        true ->
+          invalidate_open_claims_on_supersede(repo, target)
+
+          target
+          |> Ecto.Changeset.change(superseded_by: post.id)
+          |> repo.update()
+      end
+    end)
+  end
+
+  # When a post supersedes another, write a SECOND audit entry for the target
+  # retirement so the audit trail records the mutation (not just the new post).
+  defp maybe_supersede_audit_step(multi, _tenant_id, nil, _audit), do: multi
+
+  defp maybe_supersede_audit_step(multi, tenant_id, %ChannelPost{} = target, audit) do
+    Audit.log_in_multi(multi, :audit_supersede, fn %{post: post} ->
+      %{
+        tenant_id: tenant_id,
+        project_id: target.project_id,
+        entity_type: "channel_post",
+        entity_id: target.id,
+        action: "superseded",
+        actor_type: Keyword.get(audit, :actor_type, "api_key"),
+        actor_id: Keyword.get(audit, :actor_id),
+        actor_label: Keyword.get(audit, :actor_label),
+        metadata: %{"successor_id" => post.id}
+      }
+    end)
   end
 
   # A KEYLESS idempotent write lost the
@@ -1226,6 +1522,7 @@ defmodule Loopctl.Coordination do
          %Ecto.Changeset{} = failed,
          %Ecto.Changeset{} = original_changeset,
          audit,
+         supersedes,
          retries_left
        ) do
     project_id = Ecto.Changeset.get_field(failed, :project_id)
@@ -1237,7 +1534,7 @@ defmodule Loopctl.Coordination do
         {:ok, existing, :deduplicated}
 
       nil when retries_left > 0 ->
-        run_post(tenant_id, original_changeset, audit, retries_left - 1)
+        run_post(tenant_id, original_changeset, audit, supersedes, retries_left - 1)
 
       nil ->
         {:error, :conflict}
@@ -1348,7 +1645,13 @@ defmodule Loopctl.Coordination do
   defp post_outcome(%ChannelPost{inserted_at: ts, updated_at: ts}), do: :created
   defp post_outcome(%ChannelPost{}), do: :updated
 
-  defp audit_attrs(tenant_id, post, outcome, audit) do
+  defp audit_attrs(tenant_id, post, outcome, audit, changeset, supersedes) do
+    metadata =
+      Keyword.get(audit, :metadata, %{})
+      |> maybe_put("supersedes_target_id", if(supersedes, do: supersedes.id))
+      |> maybe_put("key_source", Ecto.Changeset.get_field(changeset, :key_source))
+      |> maybe_put("session_id_source", Ecto.Changeset.get_field(changeset, :session_id_source))
+
     %{
       tenant_id: tenant_id,
       project_id: post.project_id,
@@ -1358,9 +1661,12 @@ defmodule Loopctl.Coordination do
       actor_type: Keyword.get(audit, :actor_type, "api_key"),
       actor_id: Keyword.get(audit, :actor_id),
       actor_label: Keyword.get(audit, :actor_label),
-      metadata: Keyword.get(audit, :metadata, %{})
+      metadata: metadata
     }
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   # Fire the "credential blocked" security signal once, at the point a write is
   # actually rejected — NOT inside the (pure) changeset builder, which would
@@ -1554,23 +1860,24 @@ defmodule Loopctl.Coordination do
       `done_at`) is far shorter than the 30d post it gates — and the upsert
       FULL-REPLACE path can even RE-EXTEND a post's `expires_at`. Left naive, the
       DONE claim would be reaped while the post stayed live, reopening a ~23d window
-      in which the finished handoff both reappeared here (pinned oldest-first, so at
-      the TOP) and accepted a fresh re-claim (double-done). `ChannelClaimSweeper`
-      closes this: it NEVER reaps a DONE claim while a live post shares its ref
-      (`NOT EXISTS(post WHERE key = claim.ref AND expires_at > now)`), so the
-      terminal signal outlives the post for its whole life. Do NOT decouple the
-      sweep from post liveness — that coupling is what makes this sentence true.
+      in which the finished handoff both reappeared here (pinned newest-first, so
+      still excluded by the claim) and accepted a fresh re-claim (double-done).
+      `ChannelClaimSweeper` closes this: it NEVER reaps a DONE claim while a live
+      post shares its ref (`NOT EXISTS(post WHERE key = claim.ref AND expires_at >
+      now)`), so the terminal signal outlives the post for its whole life. Do NOT
+      decouple the sweep from post liveness — that coupling is what makes this
+      sentence true.
 
   ## Ordering & dedup
 
-  Pinned OLDEST-unclaimed-first (`inserted_at ASC`, `seq ASC` tie-break) so a
-  STALE directed handoff floats to the top — the opposite of the newest-first
-  recency read, because the point of this set is "the work that has been waiting
-  longest for me", not "what just happened".
+  Pinned NEWEST-unclaimed-first (`inserted_at DESC`, `seq DESC` tie-break) so a
+  REFRESHED handoff (from a new session or corrected instructions) wins over the
+  stale one — the opposite of the newest-first recency read in intent, because
+  the point of this set is "the most current instructions for this handoff".
 
   ONE row per LOGICAL handoff: the SAME `handoff:<anchor>` key fired from two
   sessions/agents is two distinct pointer rows (the keyed-slot unique index
-  includes `session_id`), so the read `DISTINCT ON (key)`s them down to the oldest
+  includes `session_id`), so the read `DISTINCT ON (key)`s them down to the newest
   pointer per key — the pinned set reflects logical handoffs, not raw pointers. See
   `directed_handoffs_page/3` for the dedup rationale and the hard-cap overflow flag.
 
@@ -1602,7 +1909,7 @@ defmodule Loopctl.Coordination do
 
   `overflowed?` is `true` iff MORE distinct unclaimed handoffs matched than the cap
   admits. Because the set is pinned OLDEST-first, an overflow drops the NEWEST
-  directed handoffs — the very rows a freshly-directed caller most wants to see — so
+  directed handoffs — the very rows that have been sitting longest unclaimed — so
   the caller MUST be told (the HTTP layer surfaces it as `meta.overflow`) to read the
   channel directly rather than trust a silently-truncated pinned set. Detected
   WITHOUT a second query by fetching `cap + 1` rows: more than `cap` came back ⇒
@@ -1613,7 +1920,7 @@ defmodule Loopctl.Coordination do
   The keyed-slot unique index includes `session_id`, so the SAME `handoff:<anchor>`
   key fired from two sessions/agents (the cross-machine offline-reconcile this epic
   targets — e.g. two boxes both firing `handoff:repo#812`) is TWO distinct pointer
-  rows. This read collapses them with `DISTINCT ON (key)`, keeping the OLDEST pointer
+  rows. This read collapses them with `DISTINCT ON (key)`, keeping the NEWEST pointer
   per key, so the pinned set — and `meta.count` — reflect LOGICAL handoffs, not raw
   pointer rows. Claiming was already safe (a single claim on `ref = key` excludes
   ALL N pointers together, so no double-work); the dedup fixes the inflated/
@@ -1624,25 +1931,40 @@ defmodule Loopctl.Coordination do
     if valid_uuid?(tenant_id) and valid_uuid?(project_id) do
       host = normalize_host(target)
       caps = normalize_capabilities(target)
+      # US-454 (defect 2): addressing is a HINT, never a filter. The DEFAULT is
+      # "see every open, unclaimed handoff on the channel" (owner requirement:
+      # any session on the repo may read — and act on — any outstanding
+      # handoff, so a mistyped/offline/busy addressee never strands work).
+      # `only_mine: true` restores the pre-fix narrow view explicitly.
+      only_mine? = Map.get(target, :only_mine, false) == true
       now = DateTime.utc_now()
 
-      # DISTINCT ON (key) requires `key` to LEAD the ORDER BY; keeping the oldest
-      # `(inserted_at, seq)` per key picks the earliest pointer as each handoff's
-      # representative. `active_claim_subquery/1` correlates to this query's `:post`
+      # DISTINCT ON (key) requires `key` to LEAD the ORDER BY; keeping the NEWEST
+      # `(inserted_at, seq)` per key picks the most recent pointer as each handoff's
+      # representative, so a refreshed handoff from a new session/process wins over
+      # the stale one. `active_claim_subquery/1` correlates to this query's `:post`
       # binding via `parent_as(:post)`.
       deduped =
         from(p in ChannelPost, as: :post)
         |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
         |> where([p], like(p.key, "handoff:%"))
         |> where([p], p.expires_at > ^now)
-        |> where(^directed_target_filter(host, caps))
+        # US-454 (defect 3): a superseded handoff is RETIRED — it leaves the
+        # discovery set the same way a DONE claim removes one, so a reader never
+        # picks up pre-supersession instructions.
+        |> where([p], is_nil(p.superseded_by))
+        |> where(^handoff_visibility_filter(only_mine?, host, caps))
         |> where([p], not exists(active_claim_subquery(now)))
         |> distinct([p], p.key)
-        |> order_by([p], asc: p.key, asc: p.inserted_at, asc: p.seq)
+        |> order_by([p], asc: p.key, desc: p.inserted_at, desc: p.seq)
 
-      # Re-establish the pinned OLDEST-first ordering ACROSS keys (the DISTINCT ON had
-      # to order by `key` first) and apply the hard safety cap. Fetch `cap + 1` so
-      # overflow is detectable without a second query, then trim to the cap.
+      # Re-establish the pinned OLDEST-first ordering ACROSS keys (the DISTINCT
+      # ON had to order by `key` first; within a key the NEWEST pointer is the
+      # representative, so a re-fired handoff shows its freshest body). The
+      # across-keys pin stays OLDEST-first by design (40.C1): the work that has
+      # been waiting LONGEST floats to the top, and the hard cap drops the
+      # newest overflow, never the most at-risk aging handoff. Fetch `cap + 1`
+      # so overflow is detectable without a second query, then trim to the cap.
       rows =
         from(row in subquery(deduped))
         |> order_by([row], asc: row.inserted_at, asc: row.seq)
@@ -1650,6 +1972,10 @@ defmodule Loopctl.Coordination do
         |> select_preview()
         |> AdminRepo.all()
         |> Enum.map(&finalize_preview/1)
+        # US-454 (defect 2): host/caps are a LABELLING input now, not a filter —
+        # every row carries `directed_to_me` so the caller can sort/surface
+        # without any handoff being hidden from it.
+        |> Enum.map(&Map.put(&1, :directed_to_me, directed_to_me?(&1, host, caps)))
 
       {Enum.take(rows, @max_directed_handoffs), length(rows) > @max_directed_handoffs}
     else
@@ -1673,12 +1999,36 @@ defmodule Loopctl.Coordination do
     )
   end
 
+  # US-454 (defect 2): the addressing WHERE now applies ONLY on the explicit
+  # opt-in narrow view (`only_mine: true`). The default see-everything read has
+  # no addressing filter at all — a handoff addressed to another host stays
+  # visible (and claimable) by every session on the channel, so a wrong/absent
+  # addressee can never strand it.
+  defp handoff_visibility_filter(true = _only_mine?, host, caps),
+    do: directed_target_filter(host, caps)
+
+  defp handoff_visibility_filter(_only_mine?, _host, _caps), do: dynamic([p], true)
+
+  # Per-row advisory label (US-454 defect 2): TRUE when the handoff is a
+  # broadcast (addressed to everyone, including this caller) or is directed at
+  # the caller's host / one of its capabilities; FALSE when it is directed
+  # elsewhere. Purely informational — the row is returned either way; callers
+  # use the label to sort/surface "mine first".
+  defp directed_to_me?(row, host, caps) do
+    broadcast? = is_nil(row.to_host) and is_nil(row.to_capability)
+    host_hit? = is_binary(host) and row.to_host == host
+    cap_hit? = is_binary(row.to_capability) and row.to_capability in caps
+
+    broadcast? or host_hit? or cap_hit?
+  end
+
   # Compose the advisory target WHERE (US-40.C1): a handoff surfaces when it is
   # directed to the caller's host, directed to one of the caller's capabilities,
   # OR is an unaddressed BROADCAST (both target columns NULL — default-include so
   # nothing is orphaned). `host`/`caps` are already normalized; an absent host or
   # empty caps list simply drops that OR branch. Broadcast is ALWAYS included, so
   # we seed with it and OR in the present hints — keeping each clause trivial.
+  # Only consulted on the opt-in `only_mine: true` narrow view (US-454).
   defp directed_target_filter(host, caps) do
     dynamic([p], is_nil(p.to_host) and is_nil(p.to_capability))
     |> or_host_filter(host)
@@ -1731,6 +2081,8 @@ defmodule Loopctl.Coordination do
   A single LIST-read row: a bounded read-model projection (NOT a `%ChannelPost{}`).
   Carries `body_preview` (a prefix of at most `#{@preview_bytes}` bytes) + `truncated`
   instead of the full `body`, plus the attribution/addressing/timestamp fields.
+  May also carry `superseded_by` (the successor post id, nil when live) and
+  `directed_to_me` (boolean, present only on the handoffs read).
   """
   @type preview :: %{
           id: Ecto.UUID.t(),
@@ -1744,6 +2096,8 @@ defmodule Loopctl.Coordination do
           refs: term(),
           body_preview: String.t() | nil,
           truncated: boolean(),
+          superseded_by: Ecto.UUID.t() | nil,
+          directed_to_me: boolean() | nil,
           inserted_at: DateTime.t(),
           updated_at: DateTime.t()
         }
@@ -1785,6 +2139,9 @@ defmodule Loopctl.Coordination do
       to_capability: p.to_capability,
       key: p.key,
       refs: p.refs,
+      # US-454 (defect 3): the history read MARKS retired posts (discovery
+      # excludes them; here a reader of the stale post sees its successor's id).
+      superseded_by: p.superseded_by,
       inserted_at: p.inserted_at,
       updated_at: p.updated_at,
       # CHARACTER-bounded over-fetch (see @preview_probe_chars) — NOT byte-bounded.

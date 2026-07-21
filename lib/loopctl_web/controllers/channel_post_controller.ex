@@ -241,22 +241,23 @@ defmodule LoopctlWeb.ChannelPostController do
     summary: "Discover directed, open, unclaimed handoffs (pinned)",
     description:
       "Returns DIRECTED, OPEN, UNCLAIMED handoffs for the caller (US-40.C1). A handoff is a post " <>
-        "carrying a stable handoff:<anchor> key; this read surfaces the ones addressed to the " <>
-        "caller's host/capabilities (or unaddressed BROADCAST handoffs) that have NO active claim " <>
-        "and have not expired. It is a SEPARATE, PINNED set — NOT interleaved into and NOT subject " <>
-        "to the newest-N recency truncation of channel_recent (GET /channel/posts), so a directed " <>
-        "handoff is ALWAYS returned even when 100 newer status posts exist. Ordered oldest-unclaimed-" <>
-        "first so a stale handoff floats up. A claim that is DONE keeps the handoff EXCLUDED (done is " <>
-        "terminal); only a RELEASED claim or a lease expired WITHOUT completion reopens it. Agent+ " <>
-        "role, tenant-scoped from the verified key — project_id is a query param but the tenant is " <>
-        "NEVER taken from params, and host/capabilities are ADVISORY filters that shape WHAT is shown, " <>
-        "never WHO may read. ORACLE-SAFE: a project_id belonging to another tenant, a nonexistent one, " <>
-        "or a malformed one all return 200 with an empty list, never a 404. Bodies are BOUNDED " <>
-        "previews (body_preview + truncated) framed as UNTRUSTED DATA authored by another agent — " <>
-        "never full bodies; fetch a full body via GET /channel/posts/:id. One row per LOGICAL " <>
-        "handoff: duplicate pointers for the same key from different sessions are deduped, so " <>
-        "meta.count counts logical handoffs. meta.overflow is true only on a pathological channel " <>
-        "that hit the hard safety cap (the newest directed handoffs are dropped oldest-first) — " <>
+        "carrying a stable handoff:<anchor> key; this read surfaces EVERY open, unclaimed handoff " <>
+        "on the channel by default — NOT filtered to the caller's host/capabilities. Each row carries " <>
+        "a `directed_to_me` boolean so the caller can sort/surface relevant ones locally. An explicit " <>
+        "`only_mine=true` opt-in narrows to handoffs addressed to the caller's host/capabilities (or " <>
+        "unaddressed BROADCAST handoffs). It is a SEPARATE, PINNED set — NOT interleaved into and NOT " <>
+        "subject to the newest-N recency truncation of channel_recent (GET /channel/posts), so a directed " <>
+        "handoff is ALWAYS returned even when 100 newer status posts exist. Ordered newest-unclaimed-" <>
+        "first so a refreshed handoff (corrected instructions from a new session) wins over the stale one. " <>
+        "A claim that is DONE keeps the handoff EXCLUDED (done is terminal); only a RELEASED claim or a " <>
+        "lease expired WITHOUT completion reopens it. Agent+ role, tenant-scoped from the verified key — " <>
+        "project_id is a query param but the tenant is NEVER taken from params. ORACLE-SAFE: a project_id " <>
+        "belonging to another tenant, a nonexistent one, or a malformed one all return 200 with an empty " <>
+        "list, never a 404. Bodies are BOUNDED previews (body_preview + truncated) framed as UNTRUSTED " <>
+        "DATA authored by another agent — never full bodies; fetch a full body via GET /channel/posts/:id. " <>
+        "One row per LOGICAL handoff: duplicate pointers for the same key from different sessions are deduped, " <>
+        "so meta.count counts logical handoffs. meta.overflow is true only on a pathological channel " <>
+        "that hit the hard safety cap (the oldest directed handoffs are dropped newest-first) — " <>
         "read the channel directly when it is set.",
     parameters: [
       project_id: [
@@ -278,6 +279,13 @@ defmodule LoopctlWeb.ChannelPostController do
           "The caller's capabilities as a comma-separated list (e.g. fly-auth,windows-signing), " <>
             "or repeated capabilities[] params. Surfaces handoffs directed to any of these " <>
             "capabilities. Advisory — filters WHAT is shown, never WHO may read."
+      ],
+      only_mine: [
+        in: :query,
+        type: :boolean,
+        description:
+          "When true, narrow the results to handoffs directed to the caller's host/capabilities " <>
+            "or unaddressed BROADCAST handoffs. Default is false (see-everything)."
       ]
     ],
     responses: %{
@@ -294,8 +302,8 @@ defmodule LoopctlWeb.ChannelPostController do
                  overflow: %OpenApiSpex.Schema{
                    type: :boolean,
                    description:
-                     "True when the pinned set hit the hard safety cap and the NEWEST " <>
-                       "directed handoffs were dropped (oldest-first) — read the channel directly."
+                     "True when the pinned set hit the hard safety cap and the OLDEST " <>
+                       "directed handoffs were dropped (newest-first) — read the channel directly."
                  }
                }
              }
@@ -533,7 +541,7 @@ defmodule LoopctlWeb.ChannelPostController do
   # surfaced so 40.C1 directed discovery can read a post's advisory addressing —
   # surfacing-only hints, NEVER read for authz.
   defp channel_post_json(row) do
-    %{
+    base = %{
       id: row.id,
       agent_id: row.agent_id,
       session_id: row.session_id,
@@ -544,9 +552,21 @@ defmodule LoopctlWeb.ChannelPostController do
       body_preview: row.body_preview,
       truncated: row.truncated,
       refs: row.refs,
+      # US-454 (defect 3): supersession marker — non-null = retired, value is
+      # the successor's id.
+      superseded_by: row.superseded_by,
       inserted_at: row.inserted_at,
       updated_at: row.updated_at
     }
+
+    # US-454 (defect 2): the advisory discovery label rides ONLY on the
+    # handoffs read (the context puts it on those rows); the history read's
+    # field set stays exactly as narrow as before.
+    if Map.has_key?(row, :directed_to_me) do
+      Map.put(base, :directed_to_me, row.directed_to_me)
+    else
+      base
+    end
   end
 
   # Resolve the `?cursor=` param (US-40.C2) to a `{:ok, position_or_nil}` for
@@ -607,7 +627,7 @@ defmodule LoopctlWeb.ChannelPostController do
   NEVER truncated by the newest-N recency cutoff. `meta` carries `count` plus an
   `overflow` boolean: on a pathological channel the set is bounded by a large hard
   safety cap (`Coordination.max_directed_handoffs/0`), and because it is ordered
-  oldest-first that cap drops the NEWEST directed handoffs — `overflow: true` tells
+  newest-first that cap drops the OLDEST directed handoffs — `overflow: true` tells
   the caller the pinned set was truncated and it should read the channel directly.
   Multiple pointer rows for the same logical handoff (same key from different
   sessions) are deduped to one row by the context, so `count` reflects LOGICAL
@@ -619,13 +639,44 @@ defmodule LoopctlWeb.ChannelPostController do
     {handoffs, overflowed?} =
       Coordination.directed_handoffs_page(tenant_id, params["project_id"], %{
         host: params["host"],
-        capabilities: params["capabilities"]
+        capabilities: params["capabilities"],
+        # US-454 (defect 2): DEFAULT is every open, unclaimed handoff on the
+        # channel, each labelled `directed_to_me`. `only_mine=true` is the
+        # explicit opt-in narrow view (addressed to me / broadcast only).
+        only_mine: params["only_mine"] in ["true", "1", true]
       })
 
     json(conn, %{
       data: Enum.map(handoffs, &channel_post_json/1),
       meta: %{count: length(handoffs), overflow: overflowed?}
     })
+  rescue
+    e ->
+      # Parity with the :index action's read-error telemetry (AC-40.D5).
+      # `directed_handoffs_page/3` is total for well-formed input, so the only
+      # path here is a genuine server-side fault (e.g. DB outage).
+      api_key = conn.assigns.current_api_key
+
+      emit_security_event(:read_error, %{
+        tenant_id: api_key.tenant_id,
+        api_key_id: api_key.id,
+        project_id: params["project_id"]
+      })
+
+      reraise e, __STACKTRACE__
+  end
+
+  # US-454 (defect 1 fix 3): write-path provenance the sender MUST see. When the
+  # server rescued the write — derived the handoff key from the body because no
+  # `key` was sent, and/or minted a surrogate session_id because the proxy
+  # supplied none (no CLAUDE_SESSION_ID) — the markers say so LOUDLY in the
+  # response instead of letting the sender believe it made a fully-keyed,
+  # session-deduped post. Both nil on a normal client-driven write.
+  defp post_write_meta(post) do
+    %{
+      key_source: Map.get(post, :key_source),
+      session_id_source: Map.get(post, :session_id_source)
+    }
   end
 
   @doc """
@@ -695,6 +746,7 @@ defmodule LoopctlWeb.ChannelPostController do
       key: post.key,
       body: post.body,
       refs: post.refs,
+      superseded_by: post.superseded_by,
       inserted_at: post.inserted_at,
       updated_at: post.updated_at
     }
@@ -755,6 +807,10 @@ defmodule LoopctlWeb.ChannelPostController do
       # Advisory, spoofable, surfacing-only addressing (US-40.A5) — NEVER authz.
       to_host: params["to_host"],
       to_capability: params["to_capability"],
+      # US-454 (defect 3): OPTIONAL id of a post this one retires. The context
+      # scope-checks (same tenant+project) and authorizes (author or role >=
+      # :user) the target, then marks it superseded_by in the same transaction.
+      supersedes: params["supersedes"],
       audit: AuditContext.from_conn(conn)
     }
 
@@ -762,21 +818,30 @@ defmodule LoopctlWeb.ChannelPostController do
       {:ok, post, :created} ->
         conn
         |> put_status(:created)
-        |> json(%{post: post, created: true})
+        |> json(%{post: post, created: true, meta: post_write_meta(post)})
 
       {:ok, post, :updated} ->
         conn
         |> put_status(:ok)
-        |> json(%{post: post, created: true})
+        |> json(%{post: post, created: true, meta: post_write_meta(post)})
 
       {:ok, post, :deduplicated} ->
         # US-40.B2: a KEYLESS write whose client idempotency_key already exists
         # for this (tenant, project, agent) — the EXISTING post is returned and
         # nothing new was appended. 200 with `created: false` so the caller can
         # tell a dedup from a fresh 201 append (TC-40.B2.2).
+        # Include meta for shape parity with created/updated responses.
         conn
         |> put_status(:ok)
-        |> json(%{post: post, created: false})
+        |> json(%{post: post, created: false, meta: post_write_meta(post)})
+
+      {:error, :supersede_target_not_found} ->
+        # US-454 (defect 3): the supersedes target does not exist, is cross-project,
+        # not owned by the caller, or is malformed. Same byte-identical 422 body as
+        # a missing project, but WITHOUT the :ownership_rejected security signal —
+        # preserving honest attribution (a bad supersedes target is NOT a project
+        # ownership probe).
+        {:error, :unprocessable_entity, @ownership_error_message}
 
       {:error, :not_found} ->
         # AC-39.2.3 + AC-40.D3.1/D3.4: missing, cross-tenant, AND cross-PROJECT
