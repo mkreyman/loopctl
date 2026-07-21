@@ -329,8 +329,26 @@ config :phoenix_ecto, :exclude_ecto_exceptions_from_plug, [
 ]
 
 # Hammer rate limiting (ETS backend)
+#
+# sec-4: `pool_size`/`pool_max_overflow` size the poolboy worker pool that fronts
+# EVERY `check_rate/3` call (Hammer.Supervisor defaults are 4 / 0). The
+# fail-CLOSED `LoopctlWeb.Plugs.AuthPathThrottle` runs first in the :authenticated
+# pipeline and calls the limiter on every request — including the ones it is about
+# to 429 — so a single-IP flood keeps hitting this pool at full rate while denied.
+# On the default 4-worker pool a poolboy checkout can then time out and exit,
+# which the fail-CLOSED gate normalises to a denial, spilling 429s onto LEGITIMATE
+# traffic from OTHER IPs (a cross-tenant collateral denial under the very flood the
+# gate defends against). A generous pool of fast (microsecond) ETS checks removes
+# that saturation headroom. Operator-overridable at runtime (config/runtime.exs).
 config :hammer,
-  backend: {Hammer.Backend.ETS, [expiry_ms: 60_000 * 60, cleanup_interval_ms: 60_000 * 10]}
+  backend:
+    {Hammer.Backend.ETS,
+     [
+       expiry_ms: 60_000 * 60,
+       cleanup_interval_ms: 60_000 * 10,
+       pool_size: 20,
+       pool_max_overflow: 10
+     ]}
 
 # Oban background jobs
 config :loopctl, Oban,

@@ -18,6 +18,12 @@ defmodule LoopctlWeb.Router do
   end
 
   pipeline :authenticated do
+    # sec-4 — fail-CLOSED per-IP volumetric throttle. MUST run first (before
+    # ExtractApiKey) so a flood of missing/invalid-key requests from one IP is
+    # counted and throttled (429) even though the key-resolution plugs would
+    # reject them 401 first. Distinct from the per-key RateLimiter below, which
+    # fails OPEN for authenticated capacity.
+    plug LoopctlWeb.Plugs.AuthPathThrottle
     plug LoopctlWeb.Plugs.ExtractApiKey
     plug LoopctlWeb.Plugs.ResolveApiKey
     plug LoopctlWeb.Plugs.SetTenant

@@ -383,8 +383,14 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
       create_project_entity(conn, user, project_status_fields())
       seed_project(tenant.id)
 
-      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
-        {:deny, 999}
+      # sec-4: let the fail-CLOSED auth-path gate (`auth_ip:*`) pass so this test
+      # exercises the CR controller's OWN per-tenant limiter over-limit path.
+      # Without scoping, the deny-all stub trips the AuthPathThrottle plug (first
+      # in the :authenticated pipeline) and 429s BEFORE the CR controller runs —
+      # the assertion would then pass for the wrong reason (CR limiter untested).
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "auth_ip:" <> _, _window, _limit -> {:allow, 1}
+        _bucket, _window, _limit -> {:deny, 999}
       end)
 
       resp =
