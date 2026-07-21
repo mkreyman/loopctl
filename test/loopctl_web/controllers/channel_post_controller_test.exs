@@ -805,7 +805,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       first = hd(data)
 
       assert Map.keys(first) |> Enum.sort() ==
-               ~w(agent_id body_preview host id inserted_at key refs session_id to_capability to_host truncated updated_at)
+               ~w(agent_id body_preview host id inserted_at key refs session_id superseded_by to_capability to_host truncated updated_at)
 
       assert first["agent_id"] == agent.id
     end
@@ -1185,7 +1185,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       # SAME narrowed field set as channel_post_json/1 (plus verbatim body) and
       # deliberately does NOT re-widen to tenant_id / project_id / expires_at.
       assert Map.keys(body) |> Enum.sort() ==
-               ~w(agent_id body host id inserted_at key refs session_id to_capability to_host updated_at)
+               ~w(agent_id body host id inserted_at key refs session_id superseded_by to_capability to_host updated_at)
 
       refute Map.has_key?(body, "tenant_id")
       refute Map.has_key?(body, "project_id")
@@ -1328,7 +1328,7 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
 
       # Same narrowed field set as the list read.
       assert Map.keys(row) |> Enum.sort() ==
-               ~w(agent_id body_preview host id inserted_at key refs session_id to_capability to_host truncated updated_at)
+               ~w(agent_id body_preview directed_to_me host id inserted_at key refs session_id superseded_by to_capability to_host truncated updated_at)
     end
 
     # AC-40.C1.2: PINNED — a directed handoff is returned even behind many newer

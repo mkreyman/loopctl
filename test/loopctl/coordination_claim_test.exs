@@ -266,7 +266,7 @@ defmodule Loopctl.CoordinationClaimTest do
   end
 
   describe "done/5 and release/5" do
-    test "TC-40.B1.3: done sets done_at; after release another agent can claim the ref again" do
+    test "TC-40.B1.3: done sets done_at; after release of an OPEN claim another agent can claim the ref again" do
       %{tenant: tenant, project: project, agent_id: agent_a} = setup_member()
       agent_b = fixture(:agent, %{tenant_id: tenant.id}).id
       make_member(tenant, project, agent_b)
@@ -277,18 +277,7 @@ defmodule Loopctl.CoordinationClaimTest do
                  audit: audit()
                )
 
-      assert {:ok, done} = Coordination.done(tenant.id, agent_a, project.id, "r", audit())
-      assert done.id == claim.id
-      assert done.done_at
-
-      # While the row still exists, B cannot claim.
-      assert {:error, :already_claimed} =
-               Coordination.claim(tenant.id, agent_b, project.id, "r",
-                 role: :agent,
-                 audit: audit()
-               )
-
-      # A releases -> the ref reopens.
+      # A releases while STILL OPEN -> the ref reopens.
       assert {:ok, released} = Coordination.release(tenant.id, agent_a, project.id, "r", audit())
       assert released.id == claim.id
       assert is_nil(AdminRepo.get(ChannelClaim, claim.id))
@@ -302,8 +291,29 @@ defmodule Loopctl.CoordinationClaimTest do
 
       assert b_claim.claimant_agent_id == agent_b
 
-      # Full lifecycle audit trail on the original claim id.
-      assert claim_audit_actions(tenant.id, claim.id) == ["claimed", "done", "released"]
+      # B marks done — done is terminal.
+      assert {:ok, done} = Coordination.done(tenant.id, agent_b, project.id, "r", audit())
+      assert done.id == b_claim.id
+      assert done.done_at
+
+      # Full lifecycle audit trail on B's claim.
+      assert claim_audit_actions(tenant.id, b_claim.id) == ["claimed", "done"]
+    end
+
+    test "releasing a DONE claim is refused (terminal guarantee)" do
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+
+      assert {:ok, claim} =
+               Coordination.claim(tenant.id, agent, project.id, "r", role: :agent, audit: audit())
+
+      assert {:ok, _} = Coordination.done(tenant.id, agent, project.id, "r", audit())
+
+      # A DONE claim is terminal and CANNOT be released.
+      assert {:error, :already_claimed} =
+               Coordination.release(tenant.id, agent, project.id, "r", audit())
+
+      # The row is still there.
+      refute is_nil(AdminRepo.get(ChannelClaim, claim.id))
     end
 
     test "TC-40.B1.4: a non-owner's done/release returns :not_found and leaves the claim untouched" do

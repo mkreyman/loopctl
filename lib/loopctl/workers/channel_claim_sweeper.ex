@@ -79,7 +79,12 @@ defmodule Loopctl.Workers.ChannelClaimSweeper do
     # lease_expires_at >= now()` is excluded by construction), and NEVER a DONE claim
     # while a live post still shares its ref (the terminal-guarantee coupling — see
     # the moduledoc and `live_post_exists/1`).
-    ids =
+    #
+    # Self-guarding single-statement delete: the predicate is re-evaluated at DELETE
+    # time (inside the subquery), so a row that changed state between read and delete
+    # simply matches 0 rows and is not removed. This closes the SELECT-then-DELETE
+    # TOCTOU window against concurrent post TTL re-extension and claim state change.
+    subq =
       from(c in ChannelClaim, as: :claim)
       |> where(
         [c],
@@ -89,24 +94,17 @@ defmodule Loopctl.Workers.ChannelClaimSweeper do
       )
       |> select([c], c.id)
       |> limit(^limit)
-      |> AdminRepo.all()
 
-    case ids do
-      [] ->
-        :ok
+    {count, _} =
+      ChannelClaim
+      |> where([c], c.id in subquery(subq))
+      |> AdminRepo.delete_all()
 
-      batch_ids ->
-        {count, _} =
-          ChannelClaim
-          |> where([c], c.id in ^batch_ids)
-          |> AdminRepo.delete_all()
-
-        if count > 0 do
-          Logger.info("ChannelClaimSweeper reclaimed #{count} spent channel claims")
-        end
-
-        :ok
+    if count > 0 do
+      Logger.info("ChannelClaimSweeper reclaimed #{count} spent channel claims")
     end
+
+    :ok
   end
 
   # Correlated NOT-EXISTS probe for a LIVE handoff post sharing this claim's ref —
@@ -123,7 +121,8 @@ defmodule Loopctl.Workers.ChannelClaimSweeper do
         p.tenant_id == parent_as(:claim).tenant_id and
           p.project_id == parent_as(:claim).project_id and
           p.key == parent_as(:claim).ref and
-          p.expires_at > ^now
+          p.expires_at > ^now and
+          is_nil(p.superseded_by)
     )
   end
 
