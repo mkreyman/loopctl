@@ -230,6 +230,111 @@ increment `consecutive_failures`, so the auto-disable valve never fires and a
 `local_only` tenant with one incompatible subscription emits a blocked row per
 matching state change indefinitely.
 
+## Witnessed custody claim (US-41.7)
+
+The posture report above is **configuration** — what the guard would decide right
+now. The custody claim is the **recorded fact**: what loopctl actually resolved,
+for each content-touching operation, on a specific article or memory row. It is
+what makes the privacy guarantee verifiable AFTER the fact rather than a
+screenshot of a settings screen.
+
+**Shape.** `custody_posture_entries` is an append-only sequence per row — one
+entry per create, per embedding (single AND bulk), per re-embed, per
+classification, per merge — carrying the endpoints resolved at that instant *for
+that operation*, their locality verdicts, `local_only` and a timestamp. An entry
+records only the endpoint kinds its operation actually resolves (`Custody.endpoint_kinds/1`):
+an `:embed` names the embedding endpoint, a `:classify` the chat endpoint, a
+`:create` neither, because the content write calls no provider. Recording both
+endpoints on every entry would state a falsehood in an immutable, chain-signed
+row. `encrypt_body` is deliberately NOT recorded until US-41.6 can derive it —
+asserting a hardcoded value into a signed attestation would make every entry
+written before the real setting lands a permanently signed false statement.
+
+A single write-time snapshot would be falsified the first time an async embedding
+job or an agent-triggered re-embed (US-41.1 AC-41.1.10) shipped the body to a
+different endpoint.
+
+**Completeness is proven, not assumed.** The chain append is asynchronous, so
+the reader cannot assume the entries it sees are all there were. Each operation
+allocates its sequence number from a SEPARATE, persisted per-row high-water mark
+(`custody_row_sequences`) BEFORE the outbound call, and the reader requires a
+contiguous sequence up to that mark — not up to the maximum of the rows that
+happen to survive. That distinction is the whole guarantee: measuring against the
+survivors would let tail loss restore a satisfied attestation, and a
+`MAX(sequence) + 1` allocator would then hand the erased number out again. Any
+gap — a lost batch job, a discarded append, a deleted row, an assignment that
+itself failed — reports `incomplete`, never no-third-party-egress.
+
+The sequence is allocated BEFORE the provider call and the call's `outcome` is
+patched on afterwards, so a call that egressed and then failed (5xx, read
+timeout, node death) still leaves a recorded operation naming the endpoint it
+went to.
+
+**Three states.** `no_claim_recorded` (no sequence was ever assigned — the row
+predates recording, or its scope is not marked `local_only`), `claim_pending`
+(assigned, batch not yet flushed; carries the pending count and batch refs), and
+`claim_recorded`, itself `complete`, `partial_history` or `incomplete`.
+`partial_history` means operation 0 is not the row's own `:create` — recording
+began mid-life (typically the scope was marked `local_only` after the row already
+existed), so loopctl has no record of how the row was produced and must not speak
+for that window.
+
+**`tenant_declared` is not network-local.** A tenant-declared endpoint is a
+PUBLIC host the tenant merely attested is its own. `third_party_egress_on_covered_paths`
+is `false` only when every recorded endpoint was `:network_local`; an all-local
+sequence that leans on a tenant declaration reports the string
+`"tenant_declared_unverified"` and a summary that says loopctl did not verify the
+attestation. The aggregate boolean and the summary are the two fields an agent
+branches on, so the qualification has to live in both.
+
+**Hot-path budget.** `AuditChain.append/2` runs a serialized `Multi` on the
+3-connection `AdminRepo` pool (`ADMIN_POOL_SIZE`, `config/runtime.exs`) — the
+documented saturation outage. So the content transaction only writes the outbox
+row, and a debounced, per-tenant-unique Oban job on the `audit` queue performs
+ONE chain append per batch, capped at `Custody.batch_limit/0` entries with the
+remainder re-enqueued (an uncapped batch would trade the forbidden per-article
+round-trip for one unbounded jsonb payload that Postgres TOASTs and every later
+merkle rebuild pays for). A 12-article harvest produces one append, not twelve.
+A tenant with no `local_only` marking assigns nothing and enqueues nothing.
+
+The append is idempotent: the flush looks its chain entry up BEFORE claiming any
+rows, so a retry after "append committed, bookkeeping lost" finishes the
+bookkeeping for the rows that leaf already contains and never sweeps
+newly-arrived entries into it. A flush that dies elsewhere stamps rows it can no
+longer finish; those become visible under `stale_pending` on
+`GET /api/v1/custody/failures` and are re-claimed by a later flush.
+
+**No parallel signing scheme.** The claim rides the Epic 26 chain and its signed
+tree heads. Each recorded entry carries a `chain_position` AND the
+`chain_entry_hash` of the leaf that carried it, and the leaf's payload names the
+row by a `posture_digest` the reader can recompute from the posture the claim
+returned. `GET /api/v1/audit/sth/{tenant_id}/inclusion/{position}` returns a
+merkle audit path that folds up to the `merkle_root` inside the already-published
+ed25519 STH — so a third party proves not just that SOME leaf sits at that
+position, but that it is the batch containing this row.
+
+That endpoint is public and unauthenticated like the STH itself, but unlike every
+other public route its work is O(chain length) rather than a single indexed
+lookup. It therefore carries a dedicated fail-closed per-IP throttle
+(`LoopctlWeb.Plugs.PublicProofThrottle`) and a bounded proof memo
+(`Loopctl.AuditChain.ProofCache`), since the `:api` pipeline has no limiter of
+its own.
+
+**Coverage, and the wording rule.** The claim carries an explicit `coverage`
+field enumerating the egress paths it covers and, with a reason, those it does
+not. `Loopctl.Custody.Coverage` intersects the configured set
+(`config :loopctl, :custody_coverage`) with the paths that actually record a
+per-row entry, so config can never make the surface over-claim. Webhook delivery
+is under the same fail-closed policy since US-41.5, but it is not a
+content-touching operation on a row, so it is listed as UNCOVERED rather than
+quietly counted. Every emitted string stays scoped to *the endpoints loopctl
+called for the recorded operations on this row* — never to what those endpoints
+did with the data afterwards.
+
+**Surfaces.** `GET /api/v1/custody/claims/:subject_type/:subject_id` and
+`GET /api/v1/custody/failures`, both role `:agent`; MCP tools `custody_claim` and
+`custody_failures`. No UI.
+
 ## Tenant isolation: explicit scoping on `AdminRepo`, not RLS
 
 The whole `Loopctl.Egress` context reads and writes through `Loopctl.AdminRepo`

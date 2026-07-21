@@ -4,7 +4,11 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.Custody
+  alias Loopctl.Egress
+  alias Loopctl.Egress.PinCache
   alias Loopctl.Knowledge
+  alias Loopctl.Test.AllowlistSource
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
   defp setup_tenant do
@@ -62,6 +66,54 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       # Verify embedding was stored (use explicit select since load_in_query: false)
       {:ok, updated} = Knowledge.get_article_with_embedding(tenant.id, article.id)
       assert updated.embedding != nil
+    end
+  end
+
+  # --- US-41.7 (AC-41.7.2): the sequence is allocated BEFORE the provider call ---
+
+  describe "custody posture on a FAILED provider call" do
+    test "a call that egressed and then failed still leaves a recorded operation" do
+      %{tenant: tenant} = setup_tenant()
+
+      AllowlistSource.put(["api.openai.com", "api.anthropic.com"])
+      on_exit(fn -> AllowlistSource.clear() end)
+
+      {:ok, article} =
+        Knowledge.create_article(tenant.id, %{
+          title: "Egressed then failed #{System.unique_integer([:positive])}",
+          body: "Body that leaves the process before the provider 5xx.",
+          category: :pattern,
+          status: :draft
+        })
+
+      # Mark local_only only NOW, so the create assigns nothing and the embed is
+      # unambiguously the operation under test.
+      {:ok, _} = Egress.enable_local_only(tenant.id, nil, acknowledge: true)
+      PinCache.invalidate_tenant(tenant.id)
+
+      article =
+        article
+        |> Ecto.Changeset.change(%{status: :published})
+        |> Loopctl.AdminRepo.update!()
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        # The request body has already left the process at this point.
+        {:error, {:api_error, 500, "Internal Server Error"}}
+      end)
+
+      assert {:error, _} =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+
+      # Allocating the sequence only on SUCCESS would leave no entry AND no gap
+      # here, and the claim would report no-third-party-egress for a row whose
+      # body did egress. The entry exists, names the endpoint, and is marked
+      # failed.
+      assert [entry] = Custody.list_entries(tenant.id, "article", article.id)
+      assert entry.operation == "embed"
+      assert entry.outcome == "failed"
+      assert [%{"host" => "api.openai.com"}] = entry.posture["endpoints"]
     end
   end
 

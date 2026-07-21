@@ -62,7 +62,9 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
 
   require Logger
 
+  alias Loopctl.Custody
   alias Loopctl.Egress
+  alias Loopctl.Egress.Scope
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Knowledge
@@ -193,7 +195,22 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
 
     opts = [timeout: batch_yield_ms(length(texts)), project_id: project_id]
 
-    case Knowledge.generate_embeddings(tenant_id, texts, opts) do
+    # US-41.7 (AC-41.7.1): this is the BULK path — the harvest load profile the
+    # custody story is scoped around — and every article's body in `texts` is
+    # shipped to the resolved embedding endpoint. Each therefore gets its OWN
+    # posture entry, recorded BEFORE the call so a batch that egressed and then
+    # failed leaves recorded operations rather than a contiguous sequence that
+    # omits them. Uninstrumented, this path would read as COMPLETE / all-local for
+    # a row whose body went to a vendor.
+    recorded = record_batch_custody(tenant_id, project_id, to_embed)
+    result = Knowledge.generate_embeddings(tenant_id, texts, opts)
+
+    Enum.each(
+      recorded,
+      &Custody.record_outcome(&1, if(match?({:ok, _}, result), do: :succeeded, else: :failed))
+    )
+
+    case result do
       {:ok, vectors} when length(vectors) == length(to_embed) ->
         store_all(tenant_id, Enum.zip(to_embed, vectors))
 
@@ -205,6 +222,20 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
       {:error, reason} ->
         handle_batch_error(tenant_id, to_embed, reason)
     end
+  end
+
+  # `:reembed` when the article already carried a vector, so a model/endpoint
+  # switch (US-41.1 AC-41.1.10) is legible as its own operation. One INSERT per
+  # article on the batch's own connection — the CHAIN append stays batched out to
+  # Oban (AC-41.7.7), so this adds no per-article AdminRepo chain round-trip.
+  defp record_batch_custody(tenant_id, project_id, to_embed) do
+    subjects =
+      Enum.map(to_embed, fn {article, _text, _hash} ->
+        operation = if article.has_embedding, do: :reembed, else: :embed
+        {"article", article.id, operation}
+      end)
+
+    Custody.record_all(Scope.new(tenant_id, project_id), subjects)
   end
 
   # Every error branch lives in its own function so `embed_and_store_sub_batch/2`

@@ -26,6 +26,7 @@ defmodule Loopctl.AuditChain do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain.Entry
+  alias Loopctl.AuditChain.ProofCache
   alias Loopctl.AuditChain.PubSub, as: ChainPubSub
   alias Loopctl.AuditChain.SignedTreeHead
   alias Loopctl.AuditChain.SthCheckpoint
@@ -586,6 +587,97 @@ defmodule Loopctl.AuditChain do
       {_, nil} -> true
       {entry, sth} -> entry.chain_position > sth.chain_position
     end
+  end
+
+  @doc """
+  US-41.7 (AC-41.7.4) — the MERKLE AUDIT PATH proving that the entry at
+  `position` is included in a tree head loopctl already signed.
+
+  This completes the EXISTING protocol rather than adding a parallel one: the
+  path is generated over exactly the leaves `compute_merkle_root/1` hashes
+  (`entry_hash` ordered by `chain_position`), with the SAME Bitcoin-style
+  duplicate-the-last-element padding, so folding it reproduces the `merkle_root`
+  inside the ed25519-signed STH the public endpoint already publishes. No new
+  signing key, no new signed structure.
+
+  The proof is generated against the SMALLEST STH covering `position` (the first
+  tree head that could contain it), so the `tree_size` is exactly that STH's
+  `chain_position + 1`.
+
+  ## Returns
+
+    * `{:ok, %{leaf_index, leaf_hash, tree_size, audit_path, sth}}` — `audit_path`
+      is an ordered list of `%{position: :left | :right, hash: binary}` siblings,
+      leaf level first.
+    * `{:error, :not_found}` — no such entry.
+    * `{:error, :not_yet_included}` — the entry exists but no STH covers it yet.
+  """
+  @spec inclusion_proof(Ecto.UUID.t(), integer()) ::
+          {:ok, map()} | {:error, :not_found | :not_yet_included}
+  def inclusion_proof(_tenant_id, position)
+      when not is_integer(position) or position < 0 or position > @max_chain_position,
+      do: {:error, :not_found}
+
+  def inclusion_proof(tenant_id, position) do
+    with %Entry{} = entry <- entry_at(tenant_id, position),
+         %SignedTreeHead{} = sth <- get_sth_at_position(tenant_id, position) do
+      # A proof is a pure function of (tenant, leaf position, STH) — all three
+      # immutable — so it is memoised. Deriving it costs O(chain length) rows,
+      # memory and SHA-256, and this function is now reachable from a PUBLIC,
+      # unauthenticated route; the memo bounds the repeated work and
+      # `LoopctlWeb.Plugs.PublicProofThrottle` bounds the request rate.
+      ProofCache.fetch({tenant_id, position, sth.chain_position}, fn ->
+        hashes = load_all_hashes_paged(tenant_id, sth.chain_position)
+
+        {:ok,
+         %{
+           leaf_index: position,
+           leaf_hash: entry.entry_hash,
+           tree_size: length(hashes),
+           audit_path: audit_path(hashes, position),
+           sth: sth
+         }}
+      end)
+    else
+      nil -> inclusion_proof_error(tenant_id, position)
+    end
+  end
+
+  defp inclusion_proof_error(tenant_id, position) do
+    case entry_at(tenant_id, position) do
+      nil -> {:error, :not_found}
+      %Entry{} -> {:error, :not_yet_included}
+    end
+  end
+
+  defp entry_at(tenant_id, position) do
+    from(e in Entry,
+      where: e.tenant_id == ^tenant_id and e.chain_position == ^position,
+      limit: 1
+    )
+    |> AdminRepo.one()
+  end
+
+  # Sibling hashes, level by level, mirroring `merkle_tree/1` EXACTLY: pad an odd
+  # level by duplicating its last element, then pair left-to-right.
+  defp audit_path(hashes, index), do: audit_path(hashes, index, [])
+
+  defp audit_path([_single], _index, acc), do: Enum.reverse(acc)
+
+  defp audit_path(hashes, index, acc) do
+    padded =
+      if rem(length(hashes), 2) == 1, do: hashes ++ [List.last(hashes)], else: hashes
+
+    sibling_index = Bitwise.bxor(index, 1)
+    sibling = Enum.at(padded, sibling_index)
+    side = if rem(index, 2) == 0, do: :right, else: :left
+
+    next_level =
+      padded
+      |> Enum.chunk_every(2)
+      |> Enum.map(fn [a, b] -> :crypto.hash(:sha256, a <> b) end)
+
+    audit_path(next_level, div(index, 2), [%{position: side, hash: sibling} | acc])
   end
 
   # --- STH helpers ---

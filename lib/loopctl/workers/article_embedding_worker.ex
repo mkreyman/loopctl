@@ -59,7 +59,9 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
 
   require Logger
 
+  alias Loopctl.Custody
   alias Loopctl.Egress
+  alias Loopctl.Egress.Scope
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Knowledge
@@ -125,7 +127,20 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
     # The effective marking is MOST-RESTRICTIVE (project OR tenant).
     opts = [timeout: @worker_yield_ms, project_id: article.project_id]
 
-    case Knowledge.generate_embedding(tenant_id, text, opts) do
+    # US-41.7 (AC-41.7.1/.2): the embedding is its OWN content-touching operation,
+    # recorded with the posture RESOLVED for THIS call — not folded into the
+    # article's write-time snapshot, which an async embed or a later re-embed
+    # against a different endpoint would falsify.
+    #
+    # Recorded BEFORE the call, not after. The sequence number is what proves
+    # completeness, so allocating it only on success would leave every failure
+    # that happens AFTER the request body left the process — a provider 5xx, a read
+    # timeout, a task yield timeout, a node death mid-call — with no entry AND no
+    # gap, and the claim would report no-third-party-egress for a row whose body
+    # did egress. AC-41.7.2 names exactly that scenario.
+    result = embed_with_custody(tenant_id, article, article_id, text, opts)
+
+    case result do
       {:ok, embedding} ->
         store(tenant_id, article_id, embedding, content_hash)
 
@@ -194,6 +209,30 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
           {:error, sanitized}
         end
     end
+  end
+
+  defp embed_with_custody(tenant_id, article, article_id, text, opts) do
+    recorded = record_custody_posture(tenant_id, article, article_id)
+    result = Knowledge.generate_embedding(tenant_id, text, opts)
+    Custody.record_outcome(recorded, custody_outcome(result))
+    result
+  end
+
+  defp custody_outcome({:ok, _}), do: :succeeded
+  defp custody_outcome(_other), do: :failed
+
+  # `:reembed` when the article already carried a vector, so a model/endpoint
+  # switch (US-41.1 AC-41.1.10) is legible as its own operation rather than
+  # overwriting what the first embed recorded.
+  defp record_custody_posture(tenant_id, article, article_id) do
+    operation = if is_nil(article.embedding), do: :embed, else: :reembed
+
+    Custody.record(
+      Scope.new(tenant_id, article.project_id),
+      "article",
+      article_id,
+      operation
+    )
   end
 
   defp store(tenant_id, article_id, embedding, content_hash) do

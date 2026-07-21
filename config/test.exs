@@ -629,3 +629,12 @@ config :loopctl, :local_endpoint_allowlist, []
 # sandbox transaction). Tests drain their OWN tenant with
 # `Loopctl.Egress.flush_blocked_decisions/1`.
 config :loopctl, :egress_blocked_flush_ms, :infinity
+
+# US-41.7 (AC-41.7.6 / TC-41.7.8): coverage is a DI seam so both configurations
+# (webhook coverage enabled / disabled) are exercisable without `put_env` in a
+# test file. The DataCase default stub delegates to the real
+# `Loopctl.Custody.Coverage`, so every other test sees production coverage.
+config :loopctl, :custody_coverage_source, Loopctl.MockCustodyCoverage
+
+# No debounce in test: a drain immediately after a write must flush the batch.
+config :loopctl, :custody_flush_debounce_seconds, 0

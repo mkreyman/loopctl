@@ -129,7 +129,7 @@ REST endpoint (`PATCH /api/v1/tenants/me/llm-config`), and the docs — so you (
 autonomous agent) can self-remediate without a human. Full agent-tenant lifecycle:
 [`docs/onboarding-agent-tenant.md`](../docs/onboarding-agent-tenant.md).
 
-## Tools (109)
+## Tools
 
 > Plus **per-tenant generated Context Retriever tools** (`cr_*`) appended
 > dynamically at runtime — see [Dynamic per-tenant Context Retriever
@@ -332,6 +332,8 @@ nothing changes until a scope opts in.
 | `declare_trusted_endpoint` | Declare a host you attest is YOUR OWN so a `local_only` scope can reach it. **This is an unverified tenant attestation, not network locality** — labelled as such everywhere. Three enforced constraints: PUBLIC addresses only (write time AND pin time), PURPOSE-SCOPED (`inference` / `webhook` / `ingest`), vendor hosts excluded. Carves nothing out of the SSRF denylist. Requires **user** key. |
 | `revoke_trusted_endpoint` | Revoke a declaration. Invalidation is IMMEDIATE and cluster-wide — a revoked declaration does not keep working for the remainder of the pin TTL. Requires **user** key. |
 | `egress_repin` | Recover from a `:pin_stale` error (your box got a new DHCP lease and the pinned address set changed — DISTINCT from `egress_blocked`). Re-resolves and re-pins the host. **Agent** key by design: requiring a human user-role write to recover would contradict loopctl's agent-native, no-UI design. |
+| `custody_claim` | The recorded **egress custody claim** for one article or memory row: the append-only sequence of per-operation postures (create, each embed, each re-embed, each classification, each merge) with the endpoints resolved for THAT operation and their verdicts, plus the aggregate. Rides the existing hash-chained audit log + signed tree heads — each entry carries a `chain_position` and the leaf's `chain_entry_hash`, so `GET /api/v1/audit/sth/{tenant_id}/inclusion/{position}` proves inclusion of *that* leaf, and the leaf's payload names this row by a recomputable `posture_digest`. THREE states, only one an attestation: `no_claim_recorded`, `claim_pending`, `claim_recorded` (`complete` / `partial_history` / `incomplete`). Completeness is measured against a persisted per-row high-water mark, so losing the tail of a sequence is a gap, not a clean claim. `third_party_egress_on_covered_paths` is `false` only for NETWORK-local endpoints; a tenant-declared (unverified) endpoint yields `"tenant_declared_unverified"`. Attests ONLY to the endpoints loopctl called on the paths in `coverage` — never to what those endpoints did afterwards. **Agent** key. |
+| `custody_failures` | Custody posture entries whose chain append was DROPPED after exhausting retries, plus `stale_pending` entries stranded by a flush that died outside its own final-attempt branch. Surfaced rather than silently absent: each `data` entry degrades its row's claim to `incomplete`, and a stranded entry would otherwise read as an in-flight claim forever. **Agent** key. |
 
 ### Discovery Tools
 

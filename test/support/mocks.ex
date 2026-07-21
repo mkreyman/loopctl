@@ -89,3 +89,9 @@ Mox.defmock(Loopctl.MockBacklogCounter, for: Loopctl.Oban.BacklogCounterBehaviou
 # wired via config/test.exs), NOT a Mox mock — so the production router stays on
 # the hot path for every request and the catch/log/sanitize path is exercised by
 # an opt-in `x-test-raise-db-error` request header rather than a global mock.
+
+# US-41.7 (AC-41.7.6): the custody claim's COVERAGE source. The DataCase default
+# stub delegates to the real `Loopctl.Custody.Coverage` (production coverage), and
+# TC-41.7.8 overrides it with Mox.expect/3 to exercise BOTH configurations —
+# webhook coverage enabled and disabled — without `Application.put_env` in a test.
+Mox.defmock(Loopctl.MockCustodyCoverage, for: Loopctl.Custody.CoverageBehaviour)

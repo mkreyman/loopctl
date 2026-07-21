@@ -65,6 +65,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Custody
   alias Loopctl.Egress
   alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Knowledge.Article
@@ -303,7 +304,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
     |> Task.async_stream(
       fn article ->
         scope = EgressScope.new(tenant_id, article.project_id)
-        {article, @classifier.classify(scope, article.title, article.body, classify_opts)}
+        {article, classify_with_custody(scope, article, classify_opts)}
       end,
       max_concurrency: max_concurrency,
       timeout: @classify_timeout_ms,
@@ -311,6 +312,18 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
       ordered: false
     )
     |> Enum.reduce(empty_tally(), &reduce_outcome(&1, &2, min_confidence, run_mode))
+  end
+
+  # US-41.7 (AC-41.7.1): classification POSTs the article's whole title + body to
+  # the tenant's chat endpoint, so it is a content-touching operation on that row
+  # and gets its own posture entry. Recorded BEFORE the call — a classification
+  # that egressed and then timed out must leave a recorded operation naming the
+  # endpoint, not a contiguous sequence that silently omits it.
+  defp classify_with_custody(scope, article, classify_opts) do
+    recorded = Custody.record(scope, "article", article.id, :classify)
+    result = @classifier.classify(scope, article.title, article.body, classify_opts)
+    Custody.record_outcome(recorded, if(match?({:ok, _}, result), do: :succeeded, else: :failed))
+    result
   end
 
   defp empty_tally do
