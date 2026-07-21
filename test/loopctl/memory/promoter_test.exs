@@ -4,6 +4,7 @@ defmodule Loopctl.Memory.PromoterTest do
   import Mox
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Memory.Memory, as: MemorySchema
   alias Loopctl.Memory.Promoter
 
@@ -58,8 +59,11 @@ defmodule Loopctl.Memory.PromoterTest do
           %{text: "e", confidence: 0.74}
         ])
 
-      expect(Loopctl.MockPromoterLLM, :extract, fn tenant_id, _content, _opts ->
-        assert tenant_id == tenant.id
+      # US-41.4 (AC-41.4.2): the promoter passes the EGRESS SCOPE, not a bare
+      # tenant_id, so a project-scoped memory's `local_only` marking is enforced
+      # when the session content is POSTed to the provider.
+      expect(Loopctl.MockPromoterLLM, :extract, fn egress_scope, _content, _opts ->
+        assert egress_scope == EgressScope.new(tenant.id, scope.project_id)
         {:ok, returned}
       end)
 

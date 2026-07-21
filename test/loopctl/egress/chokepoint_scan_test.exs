@@ -62,6 +62,22 @@ defmodule Loopctl.Egress.ChokepointScanTest do
              end)
     end
 
+    # REGRESSION (review): `detect/2` matched only literal alias heads, so
+    # `alias Req, as: Http; Http.post(...)`, `alias Req.Request; Request.run(...)`
+    # and `apply(Req, :post, [...])` all passed CI silently — and aliasing is the
+    # idiomatic way to add a call to a module that already aliases things.
+    test "an ALIASED Req call is flagged, not evaded", %{violations: violations} do
+      calls = Enum.map(violations, & &1.call)
+
+      # `Http.post/2` resolves to Req.post through the file's alias table.
+      assert Enum.count(calls, &(&1 == "Req.post")) >= 2
+      assert Enum.count(calls, &(&1 == "Req.Request.run")) >= 2
+    end
+
+    test "a literal apply/3 dispatch is flagged", %{violations: violations} do
+      assert Enum.any?(Enum.map(violations, & &1.call), &(&1 == "apply/3 -> Req.post"))
+    end
+
     test "the message names the wrapper and the escape hatch", %{violations: violations} do
       message = violations |> hd() |> ChokepointScan.message()
       assert message =~ "Loopctl.Provider.post/3"
@@ -117,6 +133,9 @@ defmodule Loopctl.Egress.ChokepointScanTest do
 
       assert doc =~ "inside a dependency"
       assert doc =~ "mcp-server"
+      # The alias-evasion gap was closed; the RUNTIME-computed-module gap replaces
+      # it in the disclosure, so the wording stays honest about what is proven.
+      assert doc =~ "computed at runtime"
       assert doc =~ "every outbound HTTP call made by loopctl application code"
     end
   end

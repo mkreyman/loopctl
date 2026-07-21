@@ -66,6 +66,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Egress
+  alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Knowledge.Article
   alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
@@ -253,7 +254,10 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
         title: a.title,
         body: a.body,
         category: a.category,
-        metadata: a.metadata
+        metadata: a.metadata,
+        # US-41.4 (AC-41.4.2): the article's own project is the egress scope its
+        # title+body are classified under.
+        project_id: a.project_id
       }
     )
     |> after_cursor(cursor)
@@ -284,7 +288,8 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
     batch
     |> Task.async_stream(
       fn article ->
-        {article, @classifier.classify(tenant_id, article.title, article.body, classify_opts)}
+        scope = EgressScope.new(tenant_id, article.project_id)
+        {article, @classifier.classify(scope, article.title, article.body, classify_opts)}
       end,
       max_concurrency: max_concurrency,
       timeout: @classify_timeout_ms,

@@ -521,5 +521,59 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       assert row.execution_result["action"] == "skipped"
       assert row.execution_result["reason"] == "no_api_key"
     end
+
+    # REGRESSION (review, US-41.4 AC-41.4.3): `permanent_merge_error?/1`'s catch-all
+    # bucketed `{:egress_blocked, details}` as TRANSIENT, so the row was left
+    # unexecuted and the nightly executor re-attempted the identical, PERMANENTLY
+    # refused synthesis forever — logging "transiently failed" each time. AC-41.4.3
+    # names merge explicitly as a path that must treat `:egress_blocked` as
+    # permanent (the reclassify worker was already fixed for exactly this).
+    test "an :egress_blocked synthesis is PERMANENT — marked failed, never retried", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _scope, _a, _b ->
+        {:error, {:egress_blocked, %{host: "api.anthropic.com", scope: "tenant:#{t.id}"}}}
+      end)
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(t.id, %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "merge",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high"
+        })
+
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+
+      row = AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: t.id)
+      refute is_nil(row.executed_at)
+      assert row.execution_result["action"] == "failed"
+      assert row.execution_result["reason"] =~ "egress_blocked"
+    end
+
+    # ... while a TRANSIENT egress refusal still self-heals and must stay retryable.
+    test "a :pin_stale synthesis stays TRANSIENT and is left for the next run", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _scope, _a, _b ->
+        {:error, {:pin_stale, %{host: "ollama.example.com"}}}
+      end)
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(t.id, %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "merge",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high"
+        })
+
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+
+      assert is_nil(
+               AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: t.id).executed_at
+             )
+    end
   end
 end

@@ -117,6 +117,30 @@ defmodule Loopctl.Egress.DegradedSearchTest do
 
       refute_received :unexpected_http_call
     end
+
+    # REGRESSION (review): only the COMBINED path degraded. An EXPLICIT
+    # `mode=semantic` request mapped the egress refusal through a catch-all to
+    # `:embedding_unavailable` and answered a bare 503 — no reason, no offending
+    # endpoint, no keyword fallback — mislabelling a permanent LOCAL configuration
+    # refusal as a provider outage. No test set `mode`, so the gap was invisible.
+    test "an EXPLICIT mode=semantic request degrades identically, never a bare 503",
+         %{conn: conn, tenant: tenant} do
+      seed_article(tenant)
+
+      body =
+        conn
+        |> get(~p"/api/v1/knowledge/search", %{"q" => "advisory locks", "mode" => "semantic"})
+        |> json_response(200)
+
+      assert body["meta"]["fallback"] == true
+      assert body["meta"]["search_mode"] == "keyword_only"
+      assert body["meta"]["fallback_reason"] == "egress_blocked"
+      assert body["meta"]["degraded"] == true
+      assert body["meta"]["offending_endpoint"] =~ "api.openai.com"
+      assert body["meta"]["excluded_tiers"] == []
+      refute body["data"] == []
+      refute_received :unexpected_http_call
+    end
   end
 
   describe "the degraded meta contract (AC-41.4.7, TC-41.4.11)" do

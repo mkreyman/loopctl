@@ -37,7 +37,12 @@ defmodule Loopctl.Knowledge.ExtractorBehaviour do
   Returns `{:ok, articles}` with a list of article attribute maps,
   `{:error, :no_api_key}` when the tenant has no key configured (mandatory BYO),
   or `{:error, reason}` on other failures (triggers Oban retry).
+
+  The first argument is the `Loopctl.Egress.Scope` the call is made on behalf of
+  (US-41.4, AC-41.4.2) — the reviewed STORY's project, since the review context is
+  POSTed to the provider. A bare `tenant_id` binary is shorthand for the
+  tenant-wide scope.
   """
-  @callback extract_articles(tenant_id :: Ecto.UUID.t(), context()) ::
+  @callback extract_articles(scope :: Loopctl.Egress.Scope.t() | Ecto.UUID.t(), context()) ::
               {:ok, [article_attrs()]} | {:error, :no_api_key} | {:error, term()}
 end

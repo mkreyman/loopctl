@@ -23,7 +23,16 @@ defmodule Loopctl.Knowledge.MergeSynthesizerBehaviour do
   `{:error, term}` — implementations MUST return an error (never a placeholder) when the
   backend is unavailable, so the executor leaves the resolution for retry rather than
   drafting garbage.
+
+  The first argument is the `Loopctl.Egress.Scope` the synthesis is made on behalf
+  of (US-41.4, AC-41.4.2) — BOTH source articles' bodies are POSTed, so the caller
+  passes the most restrictive of their projects. A bare `tenant_id` binary is
+  shorthand for the tenant-wide scope.
   """
-  @callback synthesize(tenant_id :: Ecto.UUID.t(), a :: article(), b :: article()) ::
+  @callback synthesize(
+              scope :: Loopctl.Egress.Scope.t() | Ecto.UUID.t(),
+              a :: article(),
+              b :: article()
+            ) ::
               {:ok, article()} | {:error, :no_api_key} | {:error, term()}
 end

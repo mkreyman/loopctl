@@ -32,9 +32,10 @@ defmodule Loopctl.Memory.Promoter.LLMBehaviour do
 
   ## Parameters
 
-  - `tenant_id` — the tenant whose BYO Anthropic key + extraction model to use.
-    The implementation resolves the tenant's key via `Loopctl.Llm.resolve/2` and
-    records token usage after a successful call.
+  - `scope` — the `Loopctl.Egress.Scope` the extraction is made on behalf of
+    (US-41.4, AC-41.4.2): the memory scope's PROJECT, since the session content is
+    POSTed to the provider. A bare `tenant_id` binary is shorthand for the
+    tenant-wide scope. Key + model resolution stays tenant-scoped.
   - `session_content` — the session's turns, already assembled by the caller into
     a single string to be framed as untrusted data. Never trust its contents.
   - `opts` — keyword list of options (reserved; currently unused).
@@ -48,7 +49,7 @@ defmodule Loopctl.Memory.Promoter.LLMBehaviour do
   - `{:error, reason}` — extraction failure (API error / transport error).
   """
   @callback extract(
-              tenant_id :: Ecto.UUID.t(),
+              scope :: Loopctl.Egress.Scope.t() | Ecto.UUID.t(),
               session_content :: String.t(),
               opts :: keyword()
             ) ::

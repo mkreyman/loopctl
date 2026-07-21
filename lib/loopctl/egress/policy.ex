@@ -69,6 +69,14 @@ defmodule Loopctl.Egress.Policy do
 
   @marking_key :__marking__
 
+  # Schemes a connection can be pinned for. Mirrors `UrlGuard`'s default scheme
+  # allowlist — anything else proceeds unpinned on the default path.
+  @pinnable_schemes ~w(http https)
+
+  # A marking read that loses the invalidation race is retried at most this many
+  # times before the (uncached) freshly-computed value is used for THIS call.
+  @marking_attempts 2
+
   @type verdict :: :network_local | :tenant_declared | :denylisted | :non_local
   @typedoc """
   The purpose-independent part of a classification — the ONLY thing cached.
@@ -121,7 +129,7 @@ defmodule Loopctl.Egress.Policy do
     # (transient), never `:egress_blocked` (permanent) — see the moduledoc.
     case marking(scope) do
       {:ok, true} -> guarded_check(scope, url, purpose)
-      {:ok, false} -> default_path(scope, url)
+      {:ok, false} -> default_path(scope, url, purpose)
       {:error, reason} -> marking_unavailable(scope, url, reason)
     end
   end
@@ -137,20 +145,34 @@ defmodule Loopctl.Egress.Policy do
     :throw, value -> fail_closed(scope, url, "classifier throw: #{inspect(value)}")
   end
 
-  # AC-41.4.12: a non-`local_only` scope on a vendor default re-resolves normally
-  # and PINS PER REQUEST at connect time. The pin is a TOCTOU control, not a
-  # locality decision, so a pin that cannot be taken must NOT become a refusal —
-  # that would hand every default tenant a brand-new failure mode. Fall back to
-  # the pre-US-41.4 behaviour instead.
-  defp default_path(scope, url) do
-    case UrlGuard.pin(url) do
-      {:ok, pinned} ->
-        {:ok, pinned}
+  # AC-41.4.12: a non-`local_only` scope on a vendor default PINS at connect time.
+  # The pin is a TOCTOU control, not a locality decision, so a pin that cannot be
+  # taken must NOT become a refusal — that would hand every default tenant a brand-
+  # new failure mode. Fall back to the pre-US-41.4 behaviour instead.
+  #
+  # The pin is served from the SAME cached, refresher-maintained entry the
+  # `local_only` path uses. This is 100% of existing traffic: resolving per request
+  # would put two uncached, synchronous `:inet.getaddrs/3` lookups (3s timeout each)
+  # in front of EVERY provider call, and — because the pinned IP is what the Finch
+  # pool keys on — would collapse connection reuse to a fresh TLS handshake every
+  # time a CDN-fronted vendor host rotated its answer. AC-41.4.12 bounds the hot
+  # path at one cheap classification with NO network or DB round-trip.
+  defp default_path(scope, url, purpose) do
+    uri = URI.parse(url)
 
-      {:error, reason} ->
+    with true <- uri.scheme in @pinnable_schemes,
+         host when is_binary(host) and host != "" <- uri.host,
+         # A denylisted host is left UNPINNED exactly as `UrlGuard.pin/2` used to
+         # leave it (`{:error, :blocked_ip}`): the default path never refuses, and
+         # the SSRF denylist is enforced by the callers that own it.
+         {:ok, %{ips: [ip | _], verdict: verdict}} when verdict != :denylisted <-
+           cached_classification(scope, host, purpose) do
+      {:ok, %{uri: uri, host: host, ip: ip}}
+    else
+      other ->
         Logger.debug(
           "Loopctl.Egress.Policy: per-request pin unavailable for #{Scope.key(scope)} " <>
-            "(#{inspect(reason)}); proceeding unpinned (scope is not local_only)"
+            "(#{inspect(other)}); proceeding unpinned (scope is not local_only)"
         )
 
         {:ok, :unpinned}
@@ -224,10 +246,23 @@ defmodule Loopctl.Egress.Policy do
   def reresolve(%{host: host, from_allowlist: from_allowlist}) when is_binary(host) do
     with {:ok, ips} <- UrlGuard.resolve_host(host) do
       cond do
-        from_allowlist and Allowlist.ips_allowed?(ips) -> {:ok, ips}
-        from_allowlist -> {:error, :no_longer_allowlisted}
-        UrlGuard.public_addresses?(ips) -> {:ok, ips}
-        true -> {:error, :blocked_ip}
+        # Re-check BOTH carve-out forms, exactly as `classify_uncached/2` grants
+        # them. Checking only the address form would fail revalidation for every
+        # host allowlisted BY NAME (the documented form, e.g. `ollama.internal`)
+        # whose addresses are not separately covered by a literal/CIDR — the entry
+        # would be re-put `pin_stale` with a fresh TTL every cycle and the tenant
+        # would flap between working and `{:error, :pin_stale}` forever.
+        from_allowlist and (Allowlist.host_allowed?(host) or Allowlist.ips_allowed?(ips)) ->
+          {:ok, ips}
+
+        from_allowlist ->
+          {:error, :no_longer_allowlisted}
+
+        UrlGuard.public_addresses?(ips) ->
+          {:ok, ips}
+
+        true ->
+          {:error, :blocked_ip}
       end
     end
   end
@@ -252,19 +287,41 @@ defmodule Loopctl.Egress.Policy do
     scope_key = Scope.key(scope)
 
     case PinCache.fetch(scope.tenant_id, scope_key, @marking_key) do
-      {:ok, %{local_only: value}} ->
-        {:ok, value}
-
-      _ ->
-        value = Egress.effective_local_only?(scope)
-        PinCache.put(scope.tenant_id, scope_key, @marking_key, %{local_only: value})
-        {:ok, value}
+      {:ok, %{local_only: value}} -> {:ok, value}
+      _ -> resolve_marking(scope, scope_key, @marking_attempts)
     end
   rescue
     e -> {:error, {:marking_error, Exception.message(e)}}
   catch
     :exit, reason -> {:error, {:marking_exit, reason}}
     :throw, value -> {:error, {:marking_throw, value}}
+  end
+
+  # The read-through half of the marking lookup. The tenant's invalidation
+  # GENERATION is captured BEFORE the DB read, so an `enable_local_only/3` that
+  # commits and invalidates while this read is in flight can never be masked by a
+  # stale `local_only: false` cached for the remaining TTL: the put is dropped and
+  # the read is retried once against the post-enable state.
+  defp resolve_marking(scope, scope_key, attempts_left) do
+    generation = PinCache.generation(scope.tenant_id)
+    value = Egress.effective_local_only?(scope)
+
+    PinCache.put(scope.tenant_id, scope_key, @marking_key, %{local_only: value},
+      generation: generation
+    )
+
+    cond do
+      not PinCache.stale_generation?(scope.tenant_id, generation) ->
+        {:ok, value}
+
+      attempts_left > 1 ->
+        resolve_marking(scope, scope_key, attempts_left - 1)
+
+      true ->
+        # Nothing was cached (the put was dropped), so only THIS call uses the
+        # possibly-superseded value; the next one reads the database again.
+        {:ok, value}
+    end
   end
 
   defp do_check(scope, url, purpose) do
@@ -317,9 +374,16 @@ defmodule Loopctl.Egress.Policy do
         {:ok, resolve_verdict(entry, purpose)}
 
       :miss ->
-        # Lazy initial population — no dependency on the US-41.2 probe.
+        # Lazy initial population — no dependency on the US-41.2 probe. The
+        # generation is captured BEFORE the (blocking) resolve + declaration read
+        # so a revocation landing in that window is not resurrected by this put.
+        generation = PinCache.generation(scope.tenant_id)
+
         with {:ok, attrs} <- classify_uncached(scope, host) do
-          {:ok, resolve_verdict(PinCache.put(scope.tenant_id, scope_key, host, attrs), purpose)}
+          entry =
+            PinCache.put(scope.tenant_id, scope_key, host, attrs, generation: generation)
+
+          {:ok, resolve_verdict(entry, purpose)}
         end
     end
   end

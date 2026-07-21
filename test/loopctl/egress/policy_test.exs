@@ -38,15 +38,26 @@ defmodule Loopctl.Egress.PolicyTest do
                Policy.check(scope, "https://api.openai.com/v1/embeddings", :inference)
     end
 
-    test "an unmarked scope needs no probe, no cache entry, no refusal", %{scope: scope} do
+    test "an unmarked scope needs no probe and no refusal, and its pin is CACHED",
+         %{scope: scope} do
       assert {:ok, pinned} =
                Policy.check(scope, "https://api.anthropic.com/v1/messages", :inference)
 
       assert pinned.host == "api.anthropic.com"
 
-      # The per-request pin is exactly that — per request. It never populates the
-      # classification cache, so an unmarked scope still costs no classification.
-      assert PinCache.fetch(scope.tenant_id, Scope.key(scope), "api.anthropic.com") == :miss
+      # AC-41.4.12 bounds the hot path at ONE CHEAP CLASSIFICATION with no network
+      # or DB round-trip — and the default path IS 100% of existing traffic. The pin
+      # therefore comes from the same cached entry the local_only path uses;
+      # resolving per request would put two uncached DNS lookups in front of every
+      # provider call AND change the Finch pool key whenever a CDN-fronted vendor
+      # host rotated its answer, collapsing connection reuse.
+      assert {:ok, _entry} =
+               PinCache.fetch(scope.tenant_id, Scope.key(scope), "api.anthropic.com")
+
+      stub(Loopctl.MockDnsResolver, :resolve, fn _ -> raise "hot path resolved DNS" end)
+
+      assert {:ok, %{host: "api.anthropic.com"}} =
+               Policy.check(scope, "https://api.anthropic.com/v1/messages", :inference)
     end
 
     # The pin is a TOCTOU control, not a locality decision: an unpinnable host must
@@ -317,7 +328,7 @@ defmodule Loopctl.Egress.PolicyTest do
       end)
 
       :ok = PinCache.mark_due(t.id, Scope.key(scope), "ollama.example.com")
-      assert PinCache.refresh_now() >= 1
+      assert PinCache.refresh_now(t.id) >= 1
 
       assert {:error, :pin_stale, details} =
                Policy.check(scope, "https://ollama.example.com/x", :inference)
@@ -354,7 +365,7 @@ defmodule Loopctl.Egress.PolicyTest do
 
       # Force a refresh pass over the whole table.
       :ok = PinCache.mark_due(t.id, Scope.key(scope), "private.example.com")
-      PinCache.refresh_now()
+      PinCache.refresh_now(t.id)
 
       {:ok, entry} = PinCache.fetch(t.id, Scope.key(scope), "private.example.com")
       refute entry.pin_stale
@@ -373,23 +384,25 @@ defmodule Loopctl.Egress.PolicyTest do
       assert entry.refresh_at < entry.expires_at
 
       :ok = PinCache.mark_due(t.id, Scope.key(scope), "ollama.example.com")
-      assert PinCache.refresh_now() >= 1
+      assert PinCache.refresh_now(t.id) >= 1
 
       {:ok, refreshed} = PinCache.fetch(t.id, Scope.key(scope), "ollama.example.com")
       refute refreshed.pin_stale
       assert {:ok, _} = Policy.check(scope, "https://ollama.example.com/x", :inference)
     end
 
-    test "a default tenant on vendor endpoints is unaffected: no cache entry, no refusal" do
+    test "a default tenant on vendor endpoints is unaffected: never refused, pin cached" do
       default = fixture(:tenant)
       on_exit(fn -> PinCache.invalidate_tenant(default.id) end)
       scope = Scope.new(default.id)
 
-      # Allowed (never refused), and pinned PER REQUEST — no classification cached.
+      # Allowed (never refused), and pinned from the SAME cached entry the
+      # local_only path uses — not a fresh DNS resolve per request.
       assert {:ok, %{host: "api.openai.com"}} =
                Policy.check(scope, "https://api.openai.com/v1/embeddings", :inference)
 
-      assert PinCache.fetch(default.id, Scope.key(scope), "api.openai.com") == :miss
+      assert {:ok, %{base_verdict: :public}} =
+               PinCache.fetch(default.id, Scope.key(scope), "api.openai.com")
     end
 
     test "the cached path does no DNS resolution (hot-path cost is one ETS read)",

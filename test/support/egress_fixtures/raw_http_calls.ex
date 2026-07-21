@@ -46,4 +46,14 @@ defmodule Loopctl.EgressFixtures.RawHttpCalls do
   def httpc_request, do: :httpc.request(~c"https://example.com")
   def gen_tcp_connect, do: :gen_tcp.connect(~c"example.com", 80, [])
   def ssl_connect, do: :ssl.connect(~c"example.com", 443, [])
+
+  # EVASION cases (US-41.4 review finding): a detector matching only literal alias
+  # heads passes all three of these silently, which would reduce "the wrapper is
+  # mandatory" to "the wrapper is conventional".
+  alias Req, as: Http
+  alias Req.Request
+
+  def aliased_req_post, do: Http.post("https://example.com", [])
+  def aliased_request_run, do: Request.run(Req.new(url: "https://example.com"))
+  def applied_req_post, do: apply(Req, :post, ["https://example.com", []])
 end

@@ -49,6 +49,20 @@ defmodule Loopctl.Egress.BlockedBuffer do
   @table :loopctl_egress_blocked_buffer
   @default_flush_ms :timer.seconds(5)
 
+  # AC-41.4.6 bounds rows per WINDOW, but on the `:ingest` purpose the host comes
+  # from a TENANT-SUPPLIED ingestion URL, so a tenant enqueueing N distinct
+  # hostnames would still write N rows per window forever (nothing prunes them;
+  # US-41.7 later serializes these rows into the custody claim). Distinct hosts per
+  # (tenant, window) are therefore capped; everything past the cap is aggregated
+  # under one sentinel host, so the signal survives and the cardinality does not.
+  @max_hosts_per_window 50
+  @overflow_host "(other hosts, over per-window cap)"
+
+  # Reserved bookkeeping keys, distinguished from buffered counters by their first
+  # element (a real counter key is a 6-tuple starting with a tenant UUID binary).
+  @host_count :__host_count__
+  @host_seen :__host_seen__
+
   alias Loopctl.Egress.Scope
 
   # --- Client API ---
@@ -67,6 +81,7 @@ defmodule Loopctl.Egress.BlockedBuffer do
   """
   @spec record(Scope.t(), String.t(), String.t(), DateTime.t()) :: :ok
   def record(%Scope{} = scope, host, reason, window) do
+    host = bounded_host(scope.tenant_id, window, host)
     key = {scope.tenant_id, scope.project_id, Scope.key(scope), host, reason, window}
     _ = :ets.update_counter(@table, key, {2, 1}, {key, 0})
     :ok
@@ -75,6 +90,34 @@ defmodule Loopctl.Egress.BlockedBuffer do
       # No table (owner restarting / not started): write straight through rather
       # than dropping the record.
       Loopctl.Egress.upsert_blocked_decision(row(key_fields(scope, host, reason, window)), 1)
+  end
+
+  @doc "The sentinel host over-cap refusals are aggregated under."
+  @spec overflow_host() :: String.t()
+  def overflow_host, do: @overflow_host
+
+  @doc "Distinct hosts recorded per (tenant, window) before aggregation kicks in."
+  @spec max_hosts_per_window() :: pos_integer()
+  def max_hosts_per_window, do: @max_hosts_per_window
+
+  # O(1): membership check for an already-counted host, else one counter bump.
+  defp bounded_host(tenant_id, window, host) do
+    seen_key = {@host_seen, tenant_id, window, host}
+
+    cond do
+      :ets.member(@table, seen_key) ->
+        host
+
+      :ets.update_counter(@table, {@host_count, tenant_id, window}, {2, 1}, {
+        {@host_count, tenant_id, window},
+        0
+      }) <= @max_hosts_per_window ->
+        :ets.insert(@table, {seen_key, 0})
+        host
+
+      true ->
+        @overflow_host
+    end
   end
 
   @doc "Drains and persists this node's buffered counters for ONE tenant."
@@ -94,11 +137,45 @@ defmodule Loopctl.Egress.BlockedBuffer do
   @doc "Drains and persists EVERY buffered counter on this node (the periodic flush)."
   @spec flush_all() :: :ok
   def flush_all do
-    @table |> :ets.match({:"$1", :_}) |> Enum.each(fn [key] -> drain(key) end)
+    # Match the 6-tuple counter shape ONLY, so the reserved distinct-host
+    # bookkeeping keys are never handed to `row/1`.
+    @table
+    |> :ets.match({{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"}, :_})
+    |> Enum.each(fn [tenant_id, project_id, scope_key, host, reason, window] ->
+      drain({tenant_id, project_id, scope_key, host, reason, window})
+    end)
+
+    purge_host_bookkeeping()
     :ok
   rescue
     ArgumentError -> :ok
   end
+
+  # Drop bookkeeping for windows that have closed — the cardinality cap is
+  # per-window, so keeping older windows' keys would leak one entry per host
+  # forever, which is the very growth this cap exists to stop.
+  defp purge_host_bookkeeping do
+    # The CURRENT window's bookkeeping must survive (the cap is per-window and the
+    # flush runs several times inside one window); only closed windows are dropped.
+    cutoff = Loopctl.Egress.current_window()
+
+    for [key] <- :ets.match(@table, {:"$1", :_}),
+        stale_bookkeeping?(key, cutoff) do
+      :ets.delete(@table, key)
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp stale_bookkeeping?({@host_count, _tenant_id, window}, cutoff),
+    do: DateTime.compare(window, cutoff) == :lt
+
+  defp stale_bookkeeping?({@host_seen, _tenant_id, window, _host}, cutoff),
+    do: DateTime.compare(window, cutoff) == :lt
+
+  defp stale_bookkeeping?(_key, _cutoff), do: false
 
   @doc false
   def table_name, do: @table

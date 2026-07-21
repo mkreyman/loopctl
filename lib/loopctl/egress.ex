@@ -361,7 +361,12 @@ defmodule Loopctl.Egress do
   @spec revoke_trusted_endpoint(Ecto.UUID.t(), String.t(), keyword()) ::
           {:ok, :revoked} | {:error, :not_found}
   def revoke_trusted_endpoint(tenant_id, host, opts \\ []) do
-    normalized = String.downcase(host)
+    # Route the lookup through the SAME normalization the declaration was stored
+    # with (trim + downcase + scheme/port/trailing-slash strip). A plain downcase
+    # here would 404 on every declaration written as "https://ollama.example.com/"
+    # or "ollama.example.com:11434" while the row kept changing the locality
+    # verdict — and AC-41.4.12 makes immediate revocation the invalidation guarantee.
+    normalized = TrustedEndpoint.normalize_host(host)
 
     TrustedEndpoint
     |> where([e], e.tenant_id == ^tenant_id and e.host == ^normalized)
@@ -633,7 +638,12 @@ defmodule Loopctl.Egress do
     |> AdminRepo.all()
   end
 
-  defp current_window do
+  @doc false
+  # The start of the current aggregation window. Public so
+  # `Loopctl.Egress.BlockedBuffer` prunes its per-window cardinality bookkeeping on
+  # exactly the same boundary the rows are keyed by.
+  @spec current_window() :: DateTime.t()
+  def current_window do
     now = DateTime.utc_now()
     secs = div(DateTime.to_unix(now), @blocked_window_seconds) * @blocked_window_seconds
     # `:utc_datetime_usec` demands {0, 6} precision; `from_unix!/1` yields {0, 0}
@@ -698,7 +708,11 @@ defmodule Loopctl.Egress do
     }
 
     if role in [:user, :superadmin] do
-      Map.put(base, :deployment_allowlist, Allowlist.raw_entries())
+      base
+      |> Map.put(:deployment_allowlist, Allowlist.raw_entries())
+      # Entries the operator believes are carve-outs and that parse as neither a
+      # host nor a CIDR grant NOTHING. Operator-plane detail, so `:user`+ only.
+      |> Map.put(:deployment_allowlist_defects, Allowlist.defects())
     else
       base
     end

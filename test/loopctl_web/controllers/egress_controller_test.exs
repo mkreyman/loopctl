@@ -401,5 +401,48 @@ defmodule LoopctlWeb.EgressControllerTest do
       assert body["repinned"] == true
       assert body["verdict"] == "tenant_declared"
     end
+
+    test "a resolved vendor endpoint is re-pinnable too", %{conn: conn, keys: keys} do
+      stub(Loopctl.MockDnsResolver, :resolve, fn _ -> {:ok, [{93, 184, 216, 34}]} end)
+
+      body =
+        conn
+        |> auth(keys.agent)
+        |> post(~p"/api/v1/egress/repin", %{host: "api.openai.com"})
+        |> json_response(200)
+
+      assert body["repinned"] == true
+    end
+
+    # REGRESSION (review): repin took an ARBITRARY host at role :agent and returned
+    # its locality verdict — a 3-way membership oracle over the OPERATOR deployment
+    # allowlist (network_local) and the private address space (denylisted), which
+    # AC-41.4.8 deliberately withholds from :agent and `Egress.posture/2` gates
+    # behind :user. It also forced server-side DNS of caller-chosen names (an
+    # existing internal name 200'd, a nonexistent one 422'd) and inserted every
+    # probed host into the globally named pin table the refresher then maintained.
+    test "an arbitrary host is REFUSED — no allowlist / internal-DNS oracle",
+         %{conn: conn, keys: keys} do
+      stub(Loopctl.MockDnsResolver, :resolve, fn _ -> raise "must not resolve a probed host" end)
+
+      body =
+        conn
+        |> auth(keys.agent)
+        |> post(~p"/api/v1/egress/repin", %{host: "secret-internal.operator.example"})
+        |> json_response(422)
+
+      assert body["error"] == "host_not_repinnable"
+      refute Map.has_key?(body, "verdict")
+    end
+
+    test "a non-string host is a clean 422, never a 500", %{conn: conn, keys: keys} do
+      body =
+        conn
+        |> auth(keys.agent)
+        |> post(~p"/api/v1/egress/repin", %{host: 123})
+        |> json_response(422)
+
+      assert body["error"] == "invalid_host"
+    end
   end
 end

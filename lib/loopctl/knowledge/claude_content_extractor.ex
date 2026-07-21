@@ -36,7 +36,7 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
   """
 
   @impl true
-  def extract_from_content(tenant_id, content, opts \\ []) do
+  def extract_from_content(scope_or_tenant_id, content, opts \\ []) do
     source_type = Keyword.get(opts, :source_type, "unknown")
 
     body_fun = fn _model ->
@@ -67,7 +67,11 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
     # COMMON fast-transient failure self-heals within the per-chunk budget. A slow
     # (~25s) first failure still can't fit a retry — unchanged, no regression — but
     # those are the minority.
-    case Anthropic.message(tenant_id, :extraction, body_fun, %{source_type: source_type},
+    case Anthropic.message(
+           scope_or_tenant_id,
+           :extraction,
+           body_fun,
+           %{source_type: source_type},
            receive_timeout: SystemConfig.get_int("extraction_receive_timeout_ms", 25_000),
            max_retries: SystemConfig.get_int("extraction_max_retries", 1)
          ) do

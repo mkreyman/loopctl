@@ -44,6 +44,38 @@ defmodule Loopctl.Egress.PinCache do
   `Loopctl.Auth.ApiKeyCache`): peers bust within a hop, and the bounded TTL is
   only the netsplit backstop.
 
+  ## Invalidation beats a concurrent refresh: the GENERATION counter
+
+  A refresh pass works from a SNAPSHOT and then blocks on DNS (up to ~6s). Without
+  a version check, an `invalidate_tenant/1` landing inside that window is silently
+  UNDONE when the pass re-puts the snapshot — a revoked declaration, or a
+  `local_only: false` marking read moments before an ENABLE, would come back with a
+  brand-new TTL. The same hole exists on the marking read-through path
+  (read DB → enable commits → invalidate → put the stale value).
+
+  So every tenant carries a monotonic GENERATION (`generation/1`), bumped by
+  `invalidate_local/1` BEFORE the rows are deleted. A writer captures the
+  generation BEFORE its slow work (DB read / DNS) and passes it to `put/5`; a put
+  whose captured generation is stale is DROPPED. `Loopctl.Egress.Policy` also
+  re-reads the marking once when it loses that race, so an ENABLE can never be
+  masked for the remainder of the TTL.
+
+  ## Entries EXPIRE and idle entries are evicted
+
+  A pass first sweeps every entry past its hard `expires_at`, then refreshes only
+  entries actually USED since the previous pass (`fetch/3` flags them). An entry
+  nothing looks up any more is therefore never re-resolved: it simply ages out and
+  is swept, instead of costing two DNS lookups per cycle for the life of the node.
+  `put/5` also refuses to grow the table past `@max_entries`.
+
+  ## The periodic pass runs OFF the owner process
+
+  `handle_info(:tick, _)` dispatches the pass to a monitored child process. The
+  owner is also the PubSub invalidation subscriber and the broadcast relay, so a
+  pass running IN it would queue this node's outgoing invalidation broadcast — and
+  a peer's incoming one — behind N x up-to-6s of DNS, which is exactly the
+  "peers bust within a hop" promise above. At most one pass runs at a time.
+
   ## `:pin_stale` is distinct from `:egress_blocked`
 
   The target deployments (a home Ollama box, a tailscale funnel, a DHCP VPS)
@@ -63,8 +95,15 @@ defmodule Loopctl.Egress.PinCache do
   alias Loopctl.Egress.Policy
 
   @table :loopctl_egress_pins
+  @gen_table :loopctl_egress_pin_generations
   @pubsub Loopctl.PubSub
   @invalidate_topic "egress:pin_cache:invalidate"
+
+  # Hard ceiling on resident entries. The pin table is keyed by
+  # `(tenant_id, scope_key, host)` and hosts can come from tenant-supplied ingest
+  # URLs, so an unbounded table is a memory amplifier. Past the cap NEW keys are
+  # not admitted (existing ones still refresh) until the sweep frees room.
+  @max_entries 50_000
 
   # Hard expiry. An entry past this is discarded and re-classified lazily.
   @ttl_ms :timer.minutes(10)
@@ -93,6 +132,7 @@ defmodule Loopctl.Egress.PinCache do
           purposes: [String.t()],
           state: :fresh | :revalidating,
           pin_stale: boolean(),
+          used: boolean(),
           refresh_at: integer(),
           expires_at: integer()
         }
@@ -109,6 +149,7 @@ defmodule Loopctl.Egress.PinCache do
           local_only: boolean(),
           state: :fresh | :revalidating,
           pin_stale: boolean(),
+          used: boolean(),
           refresh_at: integer(),
           expires_at: integer()
         }
@@ -124,14 +165,24 @@ defmodule Loopctl.Egress.PinCache do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc "Reads the cached entry, or `:miss` when absent or past its hard TTL."
+  @doc """
+  Reads the cached entry, or `:miss` when absent or past its hard TTL.
+
+  A hit FLAGS the entry as used (once per refresh cycle — the flag is only written
+  when it is currently `false`), which is what makes the refresher re-resolve the
+  live working set instead of every host ever classified.
+  """
   @spec fetch(Ecto.UUID.t(), String.t(), key_host()) :: {:ok, cached()} | :miss
   def fetch(tenant_id, scope_key, host) do
     key = {tenant_id, scope_key, host}
 
     case :ets.lookup(@table, key) do
       [{^key, entry}] ->
-        if now_ms() >= entry.expires_at, do: :miss, else: {:ok, entry}
+        if now_ms() >= entry.expires_at do
+          :miss
+        else
+          {:ok, mark_used(key, entry)}
+        end
 
       [] ->
         :miss
@@ -140,9 +191,27 @@ defmodule Loopctl.Egress.PinCache do
     ArgumentError -> :miss
   end
 
-  @doc "Stores a freshly classified entry with a jittered pre-expiry refresh point."
-  @spec put(Ecto.UUID.t(), String.t(), key_host(), map()) :: cached()
-  def put(tenant_id, scope_key, host, attrs) do
+  defp mark_used(_key, %{used: true} = entry), do: entry
+
+  defp mark_used(key, entry) do
+    used = Map.put(entry, :used, true)
+    :ets.insert(@table, {key, used})
+    used
+  rescue
+    ArgumentError -> entry
+  end
+
+  @doc """
+  Stores a freshly classified entry with a jittered pre-expiry refresh point.
+
+  `opts[:generation]` is the tenant generation the CALLER captured BEFORE its slow
+  work (a DB marking read, a DNS resolution). When it no longer matches, an
+  `invalidate_tenant/1` landed in that window and the write is DROPPED — the built
+  entry is still returned to the caller, it is simply not cached. Without this a
+  revocation or an ENABLE is silently resurrected for a full TTL.
+  """
+  @spec put(Ecto.UUID.t(), String.t(), key_host(), map(), keyword()) :: cached()
+  def put(tenant_id, scope_key, host, attrs, opts \\ []) do
     now = now_ms()
 
     entry =
@@ -153,6 +222,7 @@ defmodule Loopctl.Egress.PinCache do
         host: host,
         state: :fresh,
         pin_stale: Map.get(attrs, :pin_stale, false),
+        used: Map.get(attrs, :used, false),
         # An explicit `:refresh_at` / `:expires_at` in `attrs` WINS, so a caller
         # (and the deterministic refresher test) can steer the schedule; the
         # refresher itself DROPS both keys before re-putting, so a revalidated
@@ -161,10 +231,67 @@ defmodule Loopctl.Egress.PinCache do
         expires_at: Map.get(attrs, :expires_at) || now + @ttl_ms
       })
 
-    :ets.insert(@table, {{tenant_id, scope_key, host}, entry})
+    key = {tenant_id, scope_key, host}
+
+    if admit?(key, Keyword.get(opts, :generation), tenant_id) do
+      :ets.insert(@table, {key, entry})
+    end
+
     entry
   rescue
-    ArgumentError -> Map.merge(attrs, %{state: :fresh, pin_stale: false})
+    ArgumentError -> Map.merge(attrs, %{state: :fresh, pin_stale: false, used: false})
+  end
+
+  # A write is admitted when (a) the caller's captured generation is still current
+  # and (b) it does not grow the table past the hard cap.
+  defp admit?(key, generation, tenant_id) do
+    cond do
+      stale_generation?(tenant_id, generation) -> false
+      :ets.member(@table, key) -> true
+      :ets.info(@table, :size) < @max_entries -> true
+      true -> log_capacity_drop(key)
+    end
+  end
+
+  defp log_capacity_drop(key) do
+    Logger.warning(
+      "Loopctl.Egress.PinCache: at capacity (#{@max_entries} entries); not admitting " <>
+        "#{inspect(elem(key, 2))} — it will be re-classified on demand"
+    )
+
+    false
+  end
+
+  @doc """
+  The tenant's monotonic invalidation generation.
+
+  Capture it BEFORE any slow work whose result you intend to cache, then hand it
+  to `put/5`. Returns `0` when the counter table is unavailable (owner restarting),
+  which degrades to the pre-generation behaviour rather than refusing to cache.
+  """
+  @spec generation(Ecto.UUID.t()) :: non_neg_integer()
+  def generation(tenant_id) when is_binary(tenant_id) do
+    case :ets.lookup(@gen_table, tenant_id) do
+      [{^tenant_id, generation}] -> generation
+      [] -> 0
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
+  @doc "True when `generation` was superseded by an invalidation (`nil` never is)."
+  @spec stale_generation?(Ecto.UUID.t(), non_neg_integer() | nil) :: boolean()
+  def stale_generation?(_tenant_id, nil), do: false
+
+  def stale_generation?(tenant_id, generation) when is_integer(generation) do
+    generation(tenant_id) != generation
+  end
+
+  defp bump_generation(tenant_id) do
+    _ = :ets.update_counter(@gen_table, tenant_id, {2, 1}, {tenant_id, 0})
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   @doc "Drops one entry (the re-pin primitive — no role `:user` write required)."
@@ -193,9 +320,16 @@ defmodule Loopctl.Egress.PinCache do
     :ok
   end
 
-  @doc "Drops every entry for a tenant on THIS node only (peer-broadcast handler / tests)."
+  @doc """
+  Drops every entry for a tenant on THIS node only (peer-broadcast handler / tests).
+
+  The generation is bumped BEFORE the delete, so a writer that captured the old
+  generation and inserts after the delete is rejected by `put/5` instead of
+  resurrecting the invalidated state for a full TTL.
+  """
   @spec invalidate_local(Ecto.UUID.t()) :: :ok
   def invalidate_local(tenant_id) when is_binary(tenant_id) do
+    bump_generation(tenant_id)
     :ets.match_delete(@table, {{tenant_id, :_, :_}, :_})
     :ok
   rescue
@@ -249,9 +383,15 @@ defmodule Loopctl.Egress.PinCache do
   in-caller keeps it off a single-mailbox bottleneck AND lets an `async: true`
   test drive the identical code path `handle_info(:tick, _)` runs, without a
   cross-process Mox allowance against a shared, globally named server.
+
+  Pass a `tenant_id` in a TEST: the table is globally named and nothing clears it
+  between `async: true` tests, so an unscoped pass revalidates a NEIGHBOUR's
+  entries through the CALLING process's Mox DNS stub — a differing address set
+  flips that neighbour's entry to `pin_stale`. Scoping mirrors why
+  `Loopctl.Egress.BlockedBuffer.flush_tenant/1` exists.
   """
-  @spec refresh_now() :: non_neg_integer()
-  def refresh_now, do: refresh_due()
+  @spec refresh_now(Ecto.UUID.t() | :all) :: non_neg_integer()
+  def refresh_now(tenant_id \\ :all), do: refresh_due(tenant_id)
 
   @doc false
   def table_name, do: @table
@@ -260,20 +400,21 @@ defmodule Loopctl.Egress.PinCache do
 
   @impl true
   def init(_opts) do
-    table =
-      case :ets.whereis(@table) do
-        :undefined ->
-          :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
-
-        existing ->
-          existing
-      end
+    table = ensure_table(@table, read_concurrency: true)
+    _gens = ensure_table(@gen_table, write_concurrency: true)
 
     # Subscribe so a PEER node's invalidation broadcast busts THIS node's entries.
     # `Phoenix.PubSub` starts strictly before this owner in the supervision tree.
     Phoenix.PubSub.subscribe(@pubsub, @invalidate_topic)
     schedule_tick()
-    {:ok, %{table: table}}
+    {:ok, %{table: table, refresh_ref: nil}}
+  end
+
+  defp ensure_table(name, opts) do
+    case :ets.whereis(name) do
+      :undefined -> :ets.new(name, [:set, :public, :named_table] ++ opts)
+      existing -> existing
+    end
   end
 
   @impl true
@@ -292,22 +433,54 @@ defmodule Loopctl.Egress.PinCache do
   end
 
   def handle_info(:tick, state) do
-    refresh_due()
     schedule_tick()
-    {:noreply, state}
+    {:noreply, start_refresh(state)}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{refresh_ref: ref} = state) do
+    {:noreply, %{state | refresh_ref: nil}}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
 
+  # The pass runs in a MONITORED CHILD, never in this process: the owner is also
+  # the PubSub invalidation subscriber and the outgoing-broadcast relay, and a pass
+  # can block on N x up-to-6s of DNS. Running it here would queue a revocation
+  # behind the whole pass on this node AND delay applying a peer's. At most one
+  # pass at a time — a still-running pass simply skips this tick.
+  defp start_refresh(%{refresh_ref: nil} = state) do
+    {_pid, ref} = spawn_monitor(fn -> refresh_due(:all) end)
+    %{state | refresh_ref: ref}
+  end
+
+  defp start_refresh(state) do
+    Logger.debug("Loopctl.Egress.PinCache: previous refresh pass still running; skipping tick")
+    state
+  end
+
   defp schedule_tick, do: Process.send_after(self(), :tick, @tick_ms)
 
-  # Re-resolve every entry past its (jittered) refresh point, BEFORE its hard
-  # expiry. A refresh that finds a different address set marks the entry
+  # One pass: SWEEP expired entries, then re-resolve every entry that is past its
+  # (jittered) refresh point AND was actually used since the previous pass, BEFORE
+  # its hard expiry. A refresh that finds a different address set marks the entry
   # `pin_stale` instead of silently adopting the new address.
-  defp refresh_due do
+  #
+  # Refreshing only USED entries is what stops the table from becoming a permanent
+  # DNS load generator: an entry nothing looks up any more is never re-resolved, so
+  # its `expires_at` stands and the next sweep deletes it.
+  defp refresh_due(tenant_filter) do
     now = now_ms()
+    entries = Enum.filter(all(), &tenant_match?(&1, tenant_filter))
 
-    all()
+    {expired, live} = Enum.split_with(entries, &(now >= &1.expires_at))
+    Enum.each(expired, &delete(&1.tenant_id, &1.scope_key, &1.host))
+
+    {used, _idle} = Enum.split_with(live, &Map.get(&1, :used, false))
+
+    # Clear the usage flag for the next cycle. Idle entries are deliberately left
+    # untouched: they age out and the next sweep evicts them.
+    Enum.each(used, &clear_used/1)
+
     # `is_binary(host)` skips the marking entries the policy caches under an atom
     # key in the same table — they carry no pin to revalidate.
     #
@@ -316,9 +489,24 @@ defmodule Loopctl.Egress.PinCache do
     # refreshing one would only flip it to `pin_stale` — masking a permanent
     # refusal behind a transient, un-actionable "re-pin it" and silently stopping
     # the AC-41.4.6 blocked telemetry/audit trail for a still-blocked tenant.
+    used
     |> Enum.filter(&refreshable?(&1, now))
     |> Enum.map(&revalidate/1)
     |> Enum.count()
+  end
+
+  defp tenant_match?(_entry, :all), do: true
+  defp tenant_match?(entry, tenant_id), do: entry.tenant_id == tenant_id
+
+  defp clear_used(entry) do
+    key = {entry.tenant_id, entry.scope_key, entry.host}
+
+    case :ets.lookup(@table, key) do
+      [{^key, current}] -> :ets.insert(@table, {key, Map.put(current, :used, false)})
+      [] -> :ok
+    end
+  rescue
+    ArgumentError -> :ok
   end
 
   defp refreshable?(entry, now) do
@@ -327,14 +515,18 @@ defmodule Loopctl.Egress.PinCache do
   end
 
   defp revalidate(entry) do
-    mark_revalidating(entry)
+    # Capture the tenant generation BEFORE the (blocking, up-to-6s) DNS work: an
+    # `invalidate_tenant/1` landing inside that window must WIN, or the re-put
+    # below would resurrect the pre-invalidation entry with a brand-new TTL.
+    generation = generation(entry.tenant_id)
+    mark_revalidating(entry, generation)
     # Drop the schedule so the re-put gets a FRESH jittered refresh point and a
     # fresh hard expiry — otherwise a due entry would stay permanently due.
     base = Map.drop(entry, [:refresh_at, :expires_at])
 
     case Policy.reresolve(entry) do
       {:ok, ips} when ips == entry.ips ->
-        put(entry.tenant_id, entry.scope_key, entry.host, Map.put(base, :ips, ips))
+        reput(entry, Map.put(base, :ips, ips), generation)
 
       {:ok, ips} ->
         Logger.info(
@@ -342,9 +534,7 @@ defmodule Loopctl.Egress.PinCache do
             "marking pin_stale (re-pin required)"
         )
 
-        base
-        |> Map.merge(%{ips: ips, pin_stale: true})
-        |> then(&put(entry.tenant_id, entry.scope_key, entry.host, &1))
+        reput(entry, Map.merge(base, %{ips: ips, pin_stale: true}), generation)
 
       {:error, reason} ->
         Logger.warning(
@@ -352,17 +542,24 @@ defmodule Loopctl.Egress.PinCache do
             "(#{inspect(reason)}); marking pin_stale"
         )
 
-        base
-        |> Map.put(:pin_stale, true)
-        |> then(&put(entry.tenant_id, entry.scope_key, entry.host, &1))
+        reput(entry, Map.put(base, :pin_stale, true), generation)
     end
   end
 
-  defp mark_revalidating(entry) do
-    :ets.insert(
-      @table,
-      {{entry.tenant_id, entry.scope_key, entry.host}, Map.put(entry, :state, :revalidating)}
-    )
+  defp reput(entry, attrs, generation) do
+    put(entry.tenant_id, entry.scope_key, entry.host, attrs, generation: generation)
+  end
+
+  defp mark_revalidating(entry, generation) do
+    key = {entry.tenant_id, entry.scope_key, entry.host}
+
+    # Same generation guard: the snapshot this pass works from may already have
+    # been invalidated, and an unconditional insert would resurrect it.
+    if not stale_generation?(entry.tenant_id, generation) and :ets.member(@table, key) do
+      :ets.insert(@table, {key, Map.put(entry, :state, :revalidating)})
+    end
+
+    :ok
   rescue
     ArgumentError -> :ok
   end

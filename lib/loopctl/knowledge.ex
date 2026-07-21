@@ -48,6 +48,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Egress
+  alias Loopctl.Egress.Policy, as: EgressPolicy
   alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.HeavyRead
   alias Loopctl.KeysetSeek
@@ -4316,7 +4317,7 @@ defmodule Loopctl.Knowledge do
 
   defp do_merge(tenant_id, r, a, b) do
     case merge_synthesizer().synthesize(
-           tenant_id,
+           merge_egress_scope(tenant_id, a, b),
            %{title: a.title, body: a.body},
            %{title: b.title, body: b.body}
          ) do
@@ -4326,6 +4327,20 @@ defmodule Loopctl.Knowledge do
       {:error, reason} ->
         handle_merge_error(r, reason)
     end
+  end
+
+  # US-41.4 (AC-41.4.2): BOTH articles' bodies are POSTed to the model provider, so
+  # the synthesis must run under the MOST RESTRICTIVE of their scopes. When either
+  # article's project is marked `local_only`, that project's scope is used — a
+  # tenant-wide scope would let one project's content ship because the OTHER
+  # article happens to be unmarked.
+  defp merge_egress_scope(tenant_id, a, b) do
+    scopes =
+      [a.project_id, b.project_id]
+      |> Enum.uniq()
+      |> Enum.map(&EgressScope.new(tenant_id, &1))
+
+    Enum.find(scopes, hd(scopes), &EgressPolicy.local_only?/1)
   end
 
   # PERMANENT synthesis errors (non-408/429 4xx, unparseable output) must NOT be
@@ -4352,6 +4367,14 @@ defmodule Loopctl.Knowledge do
   end
 
   defp permanent_merge_error?(:unparseable_merge), do: true
+
+  # US-41.4 (AC-41.4.3): `:egress_blocked` is a PERMANENT local configuration
+  # refusal — nothing was sent and nothing changes on its own. Without this clause
+  # the catch-all buckets it as transient and the nightly conflict executor retries
+  # the identical, permanently refused synthesis forever, logging "transiently
+  # failed". `:pin_stale` / `:egress_unavailable` stay transient (they self-heal),
+  # which is why only this tag is listed.
+  defp permanent_merge_error?({:egress_blocked, _details}), do: true
 
   # US-37.3: a throttle 4-tuple (429/503 + Retry-After) is transient — it must NOT
   # match the permanent 4xx clause below (that clause is arity-3 only, but be

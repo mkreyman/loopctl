@@ -76,7 +76,7 @@ defmodule Loopctl.Memory.Promoter.DefaultLLM do
   @max_tokens 4_000
 
   @impl true
-  def extract(tenant_id, session_content, _opts \\ []) when is_binary(session_content) do
+  def extract(scope_or_tenant_id, session_content, _opts \\ []) when is_binary(session_content) do
     framed_content = neutralize_delimiters(session_content)
 
     body_fun = fn _model ->
@@ -96,7 +96,7 @@ defmodule Loopctl.Memory.Promoter.DefaultLLM do
       }
     end
 
-    Anthropic.message(tenant_id, :extraction, body_fun, %{},
+    Anthropic.message(scope_or_tenant_id, :extraction, body_fun, %{},
       receive_timeout: @receive_timeout,
       max_retries: @max_retries
     )

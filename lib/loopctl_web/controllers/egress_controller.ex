@@ -8,7 +8,7 @@ defmodule LoopctlWeb.EgressController do
   | operation                   | role           | why |
   |-----------------------------|----------------|-----|
   | `GET  /egress/posture`      | `:agent`       | verify-before-harvest must work with the key an agent already has |
-  | `POST /egress/repin`        | `:agent`       | `:pin_stale` recovery must not need a human |
+  | `POST /egress/repin`        | `:agent`       | `:pin_stale` recovery must not need a human — but ONLY for a host the tenant already uses (see `repin/2`) |
   | `POST /egress/local-only`   | `:orchestrator`| TIGHTENING is safe to automate |
   | `DELETE /egress/local-only` | `:user`        | CLEARING is the self-widening move an agent must never make |
   | `POST /egress/trusted-endpoints`   | `:user` | a declaration changes the locality verdict |
@@ -123,11 +123,16 @@ defmodule LoopctlWeb.EgressController do
     summary: "Re-pin a host after a :pin_stale refusal",
     description:
       "Role :agent. The :pin_stale remediation — target deployments change IP routinely, " <>
-        "so recovery must NOT require a role :user write.",
+        "so recovery must NOT require a role :user write. The host must be one the tenant " <>
+        "actually uses: a currently-resolved endpoint for the scope, or one of the tenant's " <>
+        "declared trusted endpoints (both readable at :agent via GET /egress/posture). An " <>
+        "arbitrary host is refused with 422 host_not_repinnable — returning a locality " <>
+        "verdict for any host would be a deployment-allowlist / internal-DNS membership " <>
+        "oracle at the lowest-privileged role.",
     request_body: {"Repin request", @json, @free_object},
     responses: %{
       200 => {"Re-pinned", @json, @free_object},
-      422 => {"Repin failed", @json, Schemas.ErrorResponse}
+      422 => {"Repin failed or host not repinnable", @json, Schemas.ErrorResponse}
     }
   )
 
@@ -255,7 +260,9 @@ defmodule LoopctlWeb.EgressController do
     key = conn.assigns.current_api_key
 
     case Egress.revoke_trusted_endpoint(key.tenant_id, host, actor_opts(conn)) do
-      {:ok, :revoked} -> json(conn, %{revoked: true, host: String.downcase(host)})
+      # Echo the CANONICAL stored form, not a bare downcase — otherwise the
+      # response names a host that is not the one that was deleted.
+      {:ok, :revoked} -> json(conn, %{revoked: true, host: TrustedEndpoint.normalize_host(host)})
       {:error, :not_found} -> {:error, :not_found}
     end
   end
@@ -267,22 +274,73 @@ defmodule LoopctlWeb.EgressController do
   funnel, DHCP VPS) change IP routinely, so recovery must NOT require a human
   `:user` write — that would contradict the epic's agent-native, no-UI design.
   """
-  def repin(conn, %{"host" => host} = params) do
+  def repin(conn, %{"host" => host} = params) when is_binary(host) do
     key = conn.assigns.current_api_key
 
     with {:ok, project_id} <- tenant_project_id(key.tenant_id, params["project_id"]) do
-      do_repin(conn, Scope.new(key.tenant_id, project_id), host)
+      scope = Scope.new(key.tenant_id, project_id)
+      do_repin(conn, scope, TrustedEndpoint.normalize_host(host))
     end
   end
 
+  # A non-string `host` (`{"host": 123}`) must be a clean 422, not a
+  # FunctionClauseError 500 — every other body-sourced param on this controller is
+  # guarded the same way.
+  def repin(conn, _params) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: "invalid_host",
+      message: "\"host\" is required and must be a string naming an endpoint this tenant uses."
+    })
+  end
+
+  # AC-41.4.8 withholds the deployment-allowlist CONTENTS from role `:agent`, and
+  # `Egress.posture/2` gates them behind `:user` for exactly that reason. An
+  # ARBITRARY-host repin re-opens that one guess at a time: the verdict is a 3-way
+  # membership oracle (`network_local` = in the OPERATOR allowlist, `denylisted` =
+  # resolves into private/CGNAT/link-local/6PN space, otherwise public), and it also
+  # forces server-side DNS resolution of caller-chosen names (an existing internal
+  # name 200s, a nonexistent one 422s) while inserting each probed host into the
+  # pin table the refresher then maintains.
+  #
+  # So the host must be one the CALLER already knows about: a currently-resolved
+  # endpoint for the scope, or one of the tenant's own declarations. Both sets are
+  # already readable at `:agent` via `GET /egress/posture`, so nothing new is
+  # disclosed, and the `:pin_stale` remediation — the whole point of this route —
+  # still needs no human `:user` write.
   defp do_repin(conn, scope, host) do
-    case Policy.repin(scope, String.downcase(host), :inference) do
+    if repinnable_host?(scope, host) do
+      repin_known_host(conn, scope, host)
+    else
+      conn
+      |> put_status(:unprocessable_entity)
+      |> json(%{
+        error: "host_not_repinnable",
+        message:
+          "Only an endpoint this tenant actually uses can be re-pinned: one of the " <>
+            "scope's resolved endpoints or one of the tenant's declared trusted " <>
+            "endpoints (see GET /api/v1/egress/posture). Re-pinning is not a lookup " <>
+            "service for arbitrary hosts."
+      })
+    end
+  end
+
+  defp repinnable_host?(scope, host) do
+    resolved =
+      scope
+      |> Egress.resolved_endpoints()
+      |> Enum.map(fn {_kind, url} -> URI.parse(url).host || url end)
+
+    declared = Enum.map(Egress.list_trusted_endpoints(scope.tenant_id), & &1.host)
+
+    host in resolved or host in declared
+  end
+
+  defp repin_known_host(conn, scope, host) do
+    case Policy.repin(scope, host, :inference) do
       {:ok, classification} ->
-        json(conn, %{
-          host: String.downcase(host),
-          repinned: true,
-          verdict: to_string(classification.verdict)
-        })
+        json(conn, %{host: host, repinned: true, verdict: to_string(classification.verdict)})
 
       {:error, reason} ->
         conn

@@ -201,6 +201,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
          {:ok, content} <- resolve_content(egress_scope(tenant_id, project_id), url, raw_content) do
       ctx = %{
         tenant_id: tenant_id,
+        # US-41.4 (AC-41.4.2): the SAME scope the fetch was made under. The chunk
+        # bodies are POSTed to the model provider from `extract_and_persist_chunk/5`,
+        # so passing only `tenant_id` there would leave a PROJECT-only local_only
+        # marking unenforced on the extraction half of this job.
+        egress_scope: egress_scope(tenant_id, project_id),
         # content_hash seeds the DETERMINISTIC per-article idempotency_key (#264,
         # Finding 1) so an Oban retry that re-walks already-persisted chunks
         # no-ops instead of inserting duplicate rows.
@@ -439,7 +444,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # persistence reintroduces that need — a cross-chunk title collision would
   # otherwise abort the whole chunk on the `articles_tenant_title_active_idx`).
   defp extract_and_persist_chunk(ctx, chunk, chunk_index, remaining, seen_titles) do
-    case @content_extractor.extract_from_content(ctx.tenant_id, chunk,
+    case @content_extractor.extract_from_content(ctx.egress_scope, chunk,
            source_type: ctx.source_type
          ) do
       {:ok, extracted} ->

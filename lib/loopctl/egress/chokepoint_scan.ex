@@ -23,6 +23,13 @@ defmodule Loopctl.Egress.ChokepointScan do
   `Finch.request!`, any `Mint.HTTP.*`, `:httpc.request`, `:gen_tcp.connect` and
   `:ssl.connect`.
 
+  Alias heads are RESOLVED through the file's `alias` declarations before
+  detection, so `alias Req, as: Http; Http.post(...)` and
+  `alias Req.Request; Request.run(...)` are flagged, and a literal
+  `apply(Req, :post, [...])` is flagged too. A detector that matched only literal
+  alias heads would let the most idiomatic way of adding an HTTP call pass CI
+  silently, which would reduce AC-41.4.4's "mandatory" to "conventional".
+
   ## (ii) The scanned path list is CONFIGURABLE
 
   Default `["lib"]`, overridable via `config :loopctl, :egress_scan_paths`. A
@@ -35,7 +42,10 @@ defmodule Loopctl.Egress.ChokepointScan do
 
   The scan cannot see HTTP performed inside a dependency (HTTP inside a dependency
   is invisible to an AST scan of this repo), and it does not cover
-  the separate `mcp-server/` codebase. Every guarantee statement in loopctl
+  the separate `mcp-server/` codebase. It also cannot see a call whose MODULE is
+  computed at runtime (`mod = Req; mod.post(...)`, `apply(module_from_config(),
+  :post, args)`) — alias resolution and literal `apply/3` are handled, a value
+  flowing through a variable is not. Every guarantee statement in loopctl
   (docs, tool descriptions, posture report, the US-41.7 custody claim) is
   therefore narrowed to exactly what is proven:
   "every outbound HTTP call made by loopctl application code".
@@ -132,8 +142,51 @@ defmodule Loopctl.Egress.ChokepointScan do
   @spec violations(String.t(), String.t()) :: [violation()]
   def violations(source, file) do
     case Code.string_to_quoted(source, columns: true) do
-      {:ok, ast} -> ast |> walk(nil, []) |> Enum.reverse() |> Enum.map(&Map.put(&1, :file, file))
-      {:error, _} -> []
+      {:ok, ast} ->
+        ast
+        |> walk(nil, aliases(ast), [])
+        |> Enum.reverse()
+        |> Enum.map(&Map.put(&1, :file, file))
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  @doc """
+  The file's `alias` declarations, as `local head => canonical parts`.
+
+  Without this, `alias Req, as: Http; Http.post(...)` and
+  `alias Req.Request; Request.run(...)` walk straight past a detector that matches
+  only literal alias heads — and the idiomatic way to add an HTTP call to a module
+  that already aliases things is exactly that. The map is FILE-scoped (a
+  deliberate over-approximation for a lint: an alias in one module of a file is
+  assumed for the rest of it, which can only ever over-report, never under-report).
+  """
+  @spec aliases(Macro.t()) :: %{atom() => [atom()]}
+  def aliases(ast) do
+    {_ast, collected} =
+      Macro.prewalk(ast, %{}, fn
+        {:alias, _, [{:__aliases__, _, parts}, opts]} = node, acc when is_list(opts) ->
+          {node, put_alias(acc, alias_as(opts) || List.last(parts), parts)}
+
+        {:alias, _, [{:__aliases__, _, parts}]} = node, acc ->
+          {node, put_alias(acc, List.last(parts), parts)}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    collected
+  end
+
+  defp put_alias(acc, nil, _parts), do: acc
+  defp put_alias(acc, local, parts) when is_atom(local), do: Map.put(acc, local, parts)
+
+  defp alias_as(opts) do
+    case Keyword.get(opts, :as) do
+      {:__aliases__, _, [name]} -> name
+      _ -> nil
     end
   end
 
@@ -152,36 +205,60 @@ defmodule Loopctl.Egress.ChokepointScan do
 
   # --- AST walk -------------------------------------------------------------
 
-  defp walk({:defmodule, _meta, [name_ast, body]}, module, acc) do
+  defp walk({:defmodule, _meta, [name_ast, body]}, module, aliases, acc) do
     inner = join_module(module, module_name(name_ast))
-    walk(body, inner, acc)
+    walk(body, inner, aliases, acc)
   end
 
-  defp walk({{:., meta, [target, fun]}, _call_meta, args}, module, acc) do
+  # `apply(Req, :post, [...])` — a dynamic dispatch that names the module
+  # literally is just as much a direct outbound call as `Req.post/1`.
+  defp walk({:apply, meta, [target, fun, args]}, module, aliases, acc)
+       when is_atom(fun) do
     acc =
-      case detect(target, fun) do
+      case detect(expand(target, aliases), fun) do
+        nil -> acc
+        call -> maybe_flag(module, "apply/3 -> " <> call, line(meta), acc)
+      end
+
+    walk(args, module, aliases, acc)
+  end
+
+  defp walk({{:., meta, [target, fun]}, _call_meta, args}, module, aliases, acc) do
+    acc =
+      case detect(expand(target, aliases), fun) do
         nil -> acc
         call -> maybe_flag(module, call, line(meta), acc)
       end
 
-    walk(args, module, acc)
+    walk(args, module, aliases, acc)
   end
 
-  defp walk({form, _meta, args}, module, acc) do
-    acc = walk(form, module, acc)
-    walk(args, module, acc)
+  defp walk({form, _meta, args}, module, aliases, acc) do
+    acc = walk(form, module, aliases, acc)
+    walk(args, module, aliases, acc)
   end
 
-  defp walk({left, right}, module, acc) do
-    acc = walk(left, module, acc)
-    walk(right, module, acc)
+  defp walk({left, right}, module, aliases, acc) do
+    acc = walk(left, module, aliases, acc)
+    walk(right, module, aliases, acc)
   end
 
-  defp walk(list, module, acc) when is_list(list) do
-    Enum.reduce(list, acc, &walk(&1, module, &2))
+  defp walk(list, module, aliases, acc) when is_list(list) do
+    Enum.reduce(list, acc, &walk(&1, module, aliases, &2))
   end
 
-  defp walk(_other, _module, acc), do: acc
+  defp walk(_other, _module, _aliases, acc), do: acc
+
+  # Rewrites an alias head through the file's `alias` declarations so the
+  # detectors below only ever see CANONICAL parts.
+  defp expand({:__aliases__, meta, [head | rest]}, aliases) when is_atom(head) do
+    case Map.get(aliases, head) do
+      nil -> {:__aliases__, meta, [head | rest]}
+      parts -> {:__aliases__, meta, parts ++ rest}
+    end
+  end
+
+  defp expand(other, _aliases), do: other
 
   defp maybe_flag(module, call, line, acc) do
     if is_binary(module) and Map.has_key?(@allowed, module) do

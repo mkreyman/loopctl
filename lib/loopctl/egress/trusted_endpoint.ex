@@ -73,6 +73,11 @@ defmodule Loopctl.Egress.TrustedEndpoint do
     |> cast(attrs, [:host, :purposes, :note, :declared_by_actor_type, :declared_by_actor_id])
     |> update_change(:host, &normalize_host/1)
     |> validate_required([:host, :purposes])
+    # Both columns are varchar(255). Without these an over-long value raises
+    # `Postgrex.Error` out of the insert and answers 500 instead of the documented
+    # 422 on a TENANT-WRITABLE endpoint.
+    |> validate_length(:host, max: 255)
+    |> validate_length(:note, max: 255)
     # NOT `validate_length(min: 1)`: `[]` equals the field DEFAULT, so Ecto records
     # no change and every change-based validation is skipped — an unscoped
     # declaration would slip through. (The DB CHECK cannot catch it either:
@@ -86,7 +91,18 @@ defmodule Loopctl.Egress.TrustedEndpoint do
     |> unique_constraint([:tenant_id, :host])
   end
 
-  defp normalize_host(host) when is_binary(host) do
+  @doc """
+  The canonical stored form of a declared host.
+
+  Trim, downcase, drop any scheme, trailing slash AND PORT. Classification keys on
+  `URI.parse(url).host`, which never carries a port, so a stored `host:port` would
+  validate and persist (201) and then NEVER match — the tenant would stay
+  `egress_blocked` with a remediation telling them to declare an endpoint they
+  already declared. `Loopctl.Egress.revoke_trusted_endpoint/3` normalizes through
+  here too, so a declaration is always revocable by the string it was created with.
+  """
+  @spec normalize_host(term()) :: term()
+  def normalize_host(host) when is_binary(host) do
     host
     |> String.trim()
     |> String.downcase()
@@ -94,12 +110,25 @@ defmodule Loopctl.Egress.TrustedEndpoint do
     |> String.trim_trailing("/")
   end
 
-  defp normalize_host(host), do: host
+  def normalize_host(host), do: host
 
   # A caller may declare "https://ollama.example.com" — keep only the authority.
+  # `URI.parse("ollama.example.com:11434")` reads the name as a SCHEME and yields
+  # `host: nil`, so the fallback has to strip the port itself. Inference endpoints
+  # almost always carry one, and the MCP tool text invites the form.
   defp strip_scheme(host) do
     case URI.parse(host) do
       %URI{host: h} when is_binary(h) and h != "" -> h
+      _ -> strip_port(host)
+    end
+  end
+
+  # Only a trailing `:<digits>` on a single-colon string — an unbracketed IPv6
+  # literal has many colons and is left alone (it fails the public-address check
+  # anyway).
+  defp strip_port(host) do
+    case String.split(host, ":") do
+      [h, port] -> if port != "" and String.match?(port, ~r/\A\d+\z/), do: h, else: host
       _ -> host
     end
   end

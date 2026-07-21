@@ -10,6 +10,7 @@ defmodule Loopctl.EgressTest do
   import Mox
 
   alias Loopctl.Egress
+  alias Loopctl.Egress.BlockedBuffer
   alias Loopctl.Egress.PinCache
   alias Loopctl.Egress.Scope
 
@@ -277,6 +278,65 @@ defmodule Loopctl.EgressTest do
       assert Egress.declared_purposes(t.id, "ollama.example.com") == []
       assert {:error, :not_found} = Egress.revoke_trusted_endpoint(t.id, "ollama.example.com")
     end
+
+    # REGRESSION (review): classification keys on `URI.parse(url).host`, which never
+    # carries a port, but `normalize_host/1` stored "ollama.example.com:11434"
+    # verbatim (URI.parse reads the NAME as the scheme, so the fallback kept the
+    # port). The declaration persisted with a 201 and then could never match —
+    # the tenant stayed egress_blocked with a remediation telling them to declare
+    # an endpoint they had already declared.
+    test "a host:port declaration is stored WITHOUT the port, so it can actually match",
+         %{tenant: t} do
+      assert {:ok, endpoint} =
+               Egress.declare_trusted_endpoint(t.id, %{
+                 "host" => "ollama.example.com:11434",
+                 "purposes" => ["inference"]
+               })
+
+      assert endpoint.host == "ollama.example.com"
+
+      # This is the lookup `Loopctl.Egress.Policy` actually performs.
+      assert Egress.declared_purposes(t.id, "ollama.example.com") == ["inference"]
+    end
+
+    # REGRESSION (review): `revoke_trusted_endpoint/3` only downcased, while
+    # `declare_trusted_endpoint/3` stripped scheme/port/trailing slash — so a
+    # declaration made with a URL form could not be revoked by the SAME string,
+    # while the row kept changing the locality verdict.
+    test "a declaration is revocable by the STRING it was created with", %{tenant: t} do
+      for form <- [
+            "https://ollama.example.com/",
+            "ollama.example.com:11434",
+            "OLLAMA.example.com"
+          ] do
+        {:ok, _} =
+          Egress.declare_trusted_endpoint(t.id, %{"host" => form, "purposes" => ["inference"]})
+
+        assert {:ok, :revoked} = Egress.revoke_trusted_endpoint(t.id, form)
+        assert Egress.declared_purposes(t.id, "ollama.example.com") == []
+      end
+    end
+
+    # An over-long value hit the varchar(255) column and raised `Postgrex.Error`
+    # out of the insert: a 500 on a TENANT-WRITABLE endpoint documented as 422.
+    test "over-long host/note are 422-shaped changeset errors, not a 500", %{tenant: t} do
+      assert {:error, changeset} =
+               Egress.declare_trusted_endpoint(t.id, %{
+                 "host" => "ollama.example.com",
+                 "purposes" => ["inference"],
+                 "note" => String.duplicate("n", 256)
+               })
+
+      assert %{note: [_ | _]} = errors_on(changeset)
+
+      assert {:error, host_cs} =
+               Egress.declare_trusted_endpoint(t.id, %{
+                 "host" => String.duplicate("h", 250) <> ".example.com",
+                 "purposes" => ["inference"]
+               })
+
+      assert %{host: [_ | _]} = errors_on(host_cs)
+    end
   end
 
   describe "blocked-decision aggregation (AC-41.4.6, TC-41.4.15)" do
@@ -314,6 +374,31 @@ defmodule Loopctl.EgressTest do
       :ok = Egress.flush_blocked_decisions(t.id)
 
       assert length(Egress.list_blocked_decisions(t.id)) == 3
+    end
+
+    # REGRESSION (review): rows are bounded per WINDOW, but on the `:ingest` purpose
+    # `endpoint_host` comes from a TENANT-SUPPLIED ingestion URL, so a tenant
+    # enqueueing N distinct hostnames wrote N rows per window forever, with nothing
+    # pruning them. Distinct hosts per (tenant, window) are now capped and the
+    # remainder is aggregated under one sentinel host.
+    test "distinct hosts per (tenant, window) are CAPPED, overflow aggregated", %{tenant: t} do
+      scope = Scope.new(t.id)
+      cap = BlockedBuffer.max_hosts_per_window()
+
+      for i <- 1..(cap + 25) do
+        :ok = Egress.record_blocked(scope, %{host: "h#{i}.example.com", verdict: :non_local})
+      end
+
+      :ok = Egress.flush_blocked_decisions(t.id)
+      rows = Egress.list_blocked_decisions(t.id, limit: 500)
+
+      # `cap` real hosts + exactly ONE aggregate row, never `cap + 25`.
+      assert length(rows) == cap + 1
+
+      overflow =
+        Enum.find(rows, &(&1.endpoint_host == BlockedBuffer.overflow_host()))
+
+      assert overflow.occurrence_count == 25
     end
 
     test "blocked decisions are tenant-isolated", %{tenant: t} do

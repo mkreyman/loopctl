@@ -181,7 +181,13 @@ defmodule Loopctl.Memory.Promoter do
   defp compile_turns(scope, turns) do
     content = assemble_content(turns)
 
-    with {:ok, text} <- llm().extract(scope.tenant_id, content, []),
+    # US-41.4 (AC-41.4.2): the session content is POSTed to the model provider, so
+    # the call carries the memory scope's PROJECT (a partition key on the memory
+    # scope, but a real egress scope here) — a project-only `local_only` marking
+    # must refuse promotion just as it refuses ingestion.
+    egress_scope = Loopctl.Egress.Scope.new(scope.tenant_id, scope.project_id)
+
+    with {:ok, text} <- llm().extract(egress_scope, content, []),
          {:ok, raw_candidates} <- parse_candidates(text) do
       candidates =
         raw_candidates
