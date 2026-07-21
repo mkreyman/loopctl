@@ -311,6 +311,7 @@ defmodule Loopctl.Llm.Anthropic do
     case Llm.record_usage(tenant_id, %{
            operation: operation,
            model: model,
+           provider: "anthropic",
            input_tokens: normalize_token(input),
            output_tokens: normalize_token(output),
            source_type: Map.get(meta, :source_type),

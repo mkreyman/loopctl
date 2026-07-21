@@ -1852,6 +1852,10 @@ async function setLlmConfig({
   merge_model,
   embedding_api_key,
   embedding_model,
+  chat_provider,
+  chat_base_url,
+  chat_api_key,
+  acknowledge_key_transmission,
 }) {
   const body = {};
   if (api_key != null) body.api_key = api_key;
@@ -1860,6 +1864,15 @@ async function setLlmConfig({
   if (merge_model !== undefined) body.merge_model = merge_model;
   if (embedding_api_key != null) body.embedding_api_key = embedding_api_key;
   if (embedding_model !== undefined) body.embedding_model = embedding_model;
+  // US-41.3: pluggable OpenAI-compatible chat endpoint. The server PROBES the
+  // endpoint with a trivial completion before persisting, and refuses an endpoint
+  // change that carries neither a matching chat_api_key nor an explicit
+  // acknowledge_key_transmission.
+  if (chat_provider !== undefined) body.chat_provider = chat_provider;
+  if (chat_base_url !== undefined) body.chat_base_url = chat_base_url;
+  if (chat_api_key != null) body.chat_api_key = chat_api_key;
+  if (acknowledge_key_transmission === true)
+    body.acknowledge_key_transmission = true;
   // PATCH (partial-merge) + EXACT user key (review #12, #13).
   const result = await apiCall(
     "PATCH",
@@ -5114,7 +5127,10 @@ const TOOLS = [
       "(extraction_model / classification_model / merge_model / embedding_model) are " +
       "free-form (any model the key permits) and default server-side when omitted. Typical " +
       'onboarding call: set_llm_config({api_key: "sk-ant-...", embedding_api_key: "sk-..."}). ' +
-      "Verify anytime with llm_config (has_api_key / has_embedding_key). REQUIRES your " +
+      "PRIVATE TIER: set chat_provider 'openai_compatible' + chat_base_url + chat_api_key " +
+      "to run extraction/classification/merge against YOUR OWN endpoint so document text " +
+      "never leaves your boundary; the endpoint is probed before it is saved. " +
+      "Verify anytime with llm_config (has_api_key / has_embedding_key / chat_provider). REQUIRES your " +
       "user-role key LOOPCTL_USER_KEY (minted by the human-anchored signup ceremony); if it " +
       "is unset the tool fails fast telling you to set it.",
     inputSchema: {
@@ -5150,6 +5166,39 @@ const TOOLS = [
           description:
             "Embedding model id (null → server default text-embedding-3-small).",
         },
+        chat_provider: {
+          type: "string",
+          enum: ["anthropic", "openai_compatible"],
+          description:
+            "Which provider serves the CHAT surface (ingest extraction, classification, " +
+            "merge synthesis, memory promotion). Omit or 'anthropic' keeps the hardcoded " +
+            "Anthropic endpoint and identical behaviour. 'openai_compatible' routes that " +
+            "surface — the largest and most sensitive payload in the pipeline, your " +
+            "documents' full text — to YOUR OWN endpoint instead.",
+        },
+        chat_base_url: {
+          type: "string",
+          description:
+            "API base of your OpenAI-compatible server, e.g. " +
+            "'https://llm.example.internal/v1' (the client appends /chat/completions). " +
+            "Required with chat_provider 'openai_compatible'. PROBED with a trivial " +
+            "completion BEFORE it is saved: an unreachable host, a rejected credential " +
+            "or a non-OpenAI-compatible response is a 422 and NOTHING is persisted.",
+        },
+        chat_api_key: {
+          type: "string",
+          description:
+            "Credential for chat_base_url. Write-only; stored encrypted, never returned. " +
+            "SEPARATE from api_key — your Anthropic key is never sent to your endpoint.",
+        },
+        acknowledge_key_transmission: {
+          type: "boolean",
+          description:
+            "Required when CHANGING chat_base_url without supplying a matching " +
+            "chat_api_key: explicitly acknowledges that the already-stored key will be " +
+            "transmitted to the new host. The probe never ships an existing credential to " +
+            "a new host silently. Not persisted.",
+        },
       },
       required: [],
     },
@@ -5157,7 +5206,7 @@ const TOOLS = [
   {
     name: "knowledge_llm_usage",
     description:
-      "Per-tenant LLM token-usage summary, grouped by operation + model + source_type + " +
+      "Per-tenant LLM token-usage summary, grouped by operation + model + provider + source_type + " +
       "day over an optional date range, newest day first, with offset/limit pagination " +
       "over meta.total_count. When `from` is omitted it defaults to a 90-day lookback; the " +
       "EFFECTIVE window is echoed in meta.from/meta.to so you can detect that older usage " +

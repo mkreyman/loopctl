@@ -36,9 +36,24 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
 
   @max_body_chars 16_000
 
+  @doc """
+  The classification system prompt.
+
+  Public so the OpenAI-compatible sibling
+  (`Loopctl.Knowledge.OpenAiCategoryClassifier`) shares it rather than keeping a
+  copy that drifts (US-41.3).
+  """
+  @spec system_prompt() :: String.t()
+  def system_prompt, do: @system_prompt
+
+  @doc "The user message for a `(title, body)` pair — shared with the sibling impl."
+  @spec user_content(String.t(), String.t() | nil) :: String.t()
+  def user_content(title, body),
+    do: "Title: #{title}\n\nBody:\n#{String.slice(body || "", 0, @max_body_chars)}"
+
   @impl true
   def classify(scope_or_tenant_id, title, body, opts \\ []) do
-    user_content = "Title: #{title}\n\nBody:\n#{String.slice(body || "", 0, @max_body_chars)}"
+    user_content = user_content(title, body)
 
     body_fun = fn _model ->
       %{

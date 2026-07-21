@@ -49,6 +49,7 @@ defmodule Loopctl.Llm do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.HeavyRead
+  alias Loopctl.Llm.Anthropic
   alias Loopctl.Llm.SettingsCache
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Llm.UsageEvent
@@ -70,7 +71,31 @@ defmodule Loopctl.Llm do
   @llm_operations [:extraction, :classification, :merge]
 
   @type operation :: :extraction | :classification | :merge | :embedding
-  @type resolved :: %{api_key: String.t(), model: String.t()}
+
+  @typedoc """
+  The chat provider a tenant's knowledge-LLM work runs against (US-41.3).
+
+  `:anthropic` is the DEFAULT for every tenant that configures nothing
+  (AC-41.3.7). `:openai_compatible` routes to the tenant's own
+  `chat_base_url` + `chat_api_key` via `Loopctl.Llm.OpenAiChat`.
+  """
+  @type chat_provider :: :anthropic | :openai_compatible
+
+  @typedoc """
+  A resolved provider call target.
+
+  `:provider` + `:base_url` were added by US-41.3. They are ADDITIVE — every
+  pre-existing caller pattern-matches `%{api_key: _, model: _}`, which still
+  matches. `:base_url` is the SINGLE source of the endpoint actually posted to,
+  read by `Loopctl.Egress.resolved_endpoints/1` so the posture report and the
+  egress guard can never vet different URLs (AC-41.4.9).
+  """
+  @type resolved :: %{
+          api_key: String.t(),
+          model: String.t(),
+          provider: chat_provider() | :embedding,
+          base_url: String.t() | nil
+        }
 
   # --- Settings ---
 
@@ -136,6 +161,7 @@ defmodule Loopctl.Llm do
     attrs = normalize_keys(attrs)
     api_key = Map.get(attrs, :api_key)
     embedding_api_key = Map.get(attrs, :embedding_api_key)
+    chat_api_key = Map.get(attrs, :chat_api_key)
     # UNCACHED read on the WRITE path: `get_settings/1` is now cached (and may hold a
     # negative `nil` entry), so fetch the existing row directly from the DB — a stale
     # or negative cached struct must never seed the insert_or_update changeset (US-32.3).
@@ -146,15 +172,21 @@ defmodule Loopctl.Llm do
       |> TenantLlmSettings.models_changeset(attrs)
       |> TenantLlmSettings.put_api_key(api_key)
       |> TenantLlmSettings.put_embedding_api_key(embedding_api_key)
+      |> TenantLlmSettings.put_chat_api_key(chat_api_key)
       |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
 
     key_set? = not is_nil(api_key)
     embedding_key_set? = not is_nil(embedding_api_key)
+    chat_key_set? = not is_nil(chat_api_key)
 
     Multi.new()
     |> Multi.insert_or_update(:settings, changeset)
     |> Multi.merge(fn %{settings: settings} ->
-      audit_multi(tenant_id, settings, changeset, key_set?, embedding_key_set?)
+      audit_multi(tenant_id, settings, changeset, %{
+        api_key: key_set?,
+        embedding_api_key: embedding_key_set?,
+        chat_api_key: chat_key_set?
+      })
     end)
     |> AdminRepo.transaction()
     |> case do
@@ -187,7 +219,13 @@ defmodule Loopctl.Llm do
   def resolve(tenant_id, :embedding) when is_binary(tenant_id) do
     case get_settings(tenant_id) do
       %TenantLlmSettings{embedding_api_key: key} = settings when is_binary(key) and key != "" ->
-        {:ok, %{api_key: key, model: model_for(settings, :embedding)}}
+        {:ok,
+         %{
+           api_key: key,
+           model: model_for(settings, :embedding),
+           provider: :embedding,
+           base_url: nil
+         }}
 
       _ ->
         {:error, :no_api_key}
@@ -196,12 +234,79 @@ defmodule Loopctl.Llm do
 
   def resolve(tenant_id, operation)
       when is_binary(tenant_id) and operation in @llm_operations do
-    case get_settings(tenant_id) do
-      %TenantLlmSettings{api_key: key} = settings when is_binary(key) and key != "" ->
-        {:ok, %{api_key: key, model: model_for(settings, operation)}}
+    tenant_id |> get_settings() |> resolve_chat(operation)
+  end
+
+  # US-41.3: the provider decision precedes the credential decision. Resolving the
+  # key FIRST and the provider second is the cross-provider credential-leak vector
+  # this ordering closes — an `openai_compatible` tenant must NEVER be handed the
+  # Anthropic `api_key`, and vice versa.
+  defp resolve_chat(%TenantLlmSettings{chat_provider: "openai_compatible"} = settings, operation) do
+    case {settings.chat_api_key, settings.chat_base_url} do
+      {key, base_url} when is_binary(key) and key != "" and is_binary(base_url) ->
+        {:ok,
+         %{
+           api_key: key,
+           model: model_for(settings, operation),
+           provider: :openai_compatible,
+           base_url: base_url
+         }}
 
       _ ->
         {:error, :no_api_key}
+    end
+  end
+
+  defp resolve_chat(%TenantLlmSettings{api_key: key} = settings, operation)
+       when is_binary(key) and key != "" do
+    {:ok,
+     %{
+       api_key: key,
+       model: model_for(settings, operation),
+       provider: :anthropic,
+       base_url: Anthropic.base_url()
+     }}
+  end
+
+  defp resolve_chat(_settings, _operation), do: {:error, :no_api_key}
+
+  @doc """
+  The tenant's CHAT provider, resolved WITHOUT touching any credential.
+
+  This is the single resolution point the five tenant-aware behaviour routers
+  (`Loopctl.Knowledge.ContentExtractorRouter` and siblings) consult per call. It
+  is deliberately credential-free: a router must decide WHICH sibling handles the
+  call before any key is read, so the Anthropic key can never be handed to the
+  OpenAI-compatible client (AC-41.3.2 / AC-41.3.3).
+
+  Returns `:anthropic` for every tenant that has configured nothing (AC-41.3.7).
+  """
+  @spec chat_provider(Ecto.UUID.t()) :: chat_provider()
+  def chat_provider(tenant_id) when is_binary(tenant_id) do
+    case get_settings(tenant_id) do
+      %TenantLlmSettings{chat_provider: "openai_compatible"} -> :openai_compatible
+      _ -> :anthropic
+    end
+  end
+
+  @doc """
+  The chat BASE URL currently resolved for `tenant_id` — the SINGLE source of the
+  endpoint the chat clients actually post to.
+
+  `Loopctl.Egress.resolved_endpoints/1` reads it from HERE rather than
+  re-deriving it, so the endpoint vetted by the posture report / `local_only`
+  pre-flight is always the endpoint the guard sees. A second, divergent URL
+  resolution is an AC-41.4.9 review failure.
+  """
+  @spec chat_base_url(Ecto.UUID.t()) :: String.t()
+  def chat_base_url(tenant_id) when is_binary(tenant_id) do
+    case get_settings(tenant_id) do
+      %TenantLlmSettings{chat_provider: "openai_compatible", chat_base_url: url}
+      when is_binary(url) and url != "" ->
+        url
+
+      _ ->
+        Anthropic.base_url()
     end
   end
 
@@ -320,7 +425,8 @@ defmodule Loopctl.Llm do
   matches the actual failure count 1:1 — no double-counting.
 
   Emits `[:loopctl, :llm, :provider_error]` with BOUNDED metadata ONLY: `provider`
-  (`"anthropic"` | `"embedding"`) and `class` (`:transient` | `:permanent`, per
+  (`"anthropic"` | `"embedding"` | `"openai_compatible"` — a FIXED set, never a
+  tenant-supplied host) and `class` (`:transient` | `:permanent`, per
   `permanent_provider_error?/1`) — NEVER `tenant_id`, an article/memory id, or any
   provider response body (the caller has already run the reason through
   `Loopctl.Llm.ProviderError.sanitize/1` before classifying it). Best-effort: a
@@ -328,7 +434,8 @@ defmodule Loopctl.Llm do
   """
   @spec record_provider_error(String.t(), :transient | :permanent) :: :ok
   def record_provider_error(provider, class)
-      when provider in ["anthropic", "embedding"] and class in [:transient, :permanent] do
+      when provider in ["anthropic", "embedding", "openai_compatible"] and
+             class in [:transient, :permanent] do
     :telemetry.execute([:loopctl, :llm, :provider_error], %{count: 1}, %{
       provider: provider,
       class: class
@@ -369,7 +476,11 @@ defmodule Loopctl.Llm do
       merge_model: nil,
       has_embedding_key: false,
       embedding_api_key_hint: nil,
-      embedding_model: nil
+      embedding_model: nil,
+      chat_provider: "anthropic",
+      chat_base_url: nil,
+      has_chat_key: false,
+      chat_api_key_hint: nil
     }
   end
 
@@ -382,7 +493,14 @@ defmodule Loopctl.Llm do
       merge_model: s.merge_model,
       has_embedding_key: has_key?(s.embedding_api_key),
       embedding_api_key_hint: api_key_hint(s.embedding_api_key),
-      embedding_model: s.embedding_model
+      embedding_model: s.embedding_model,
+      # US-41.3: the chat endpoint is NOT a secret — echoing it is the point (an
+      # operator/agent must be able to confirm where tenant content is going). The
+      # credential stays a `has_*` + last-4 hint like every other key.
+      chat_provider: s.chat_provider || "anthropic",
+      chat_base_url: s.chat_base_url,
+      has_chat_key: has_key?(s.chat_api_key),
+      chat_api_key_hint: api_key_hint(s.chat_api_key)
     }
   end
 
@@ -413,7 +531,8 @@ defmodule Loopctl.Llm do
   @max_summary_limit 200
 
   @doc """
-  Aggregates a tenant's usage, grouped by operation + model + source_type + day,
+  Aggregates a tenant's usage, grouped by operation + model + provider +
+  source_type + day,
   summing input/output tokens and counting events, over an optional date range.
 
   Opts: `:from`, `:to` (DateTime), `:limit` (default #{@default_summary_limit},
@@ -422,7 +541,8 @@ defmodule Loopctl.Llm do
   page across equal days.
 
   Returns `%{data: [row], meta: %{limit, offset, total_count}}` where each row is
-  `%{day, operation, model, source_type, input_tokens, output_tokens, event_count}`.
+  `%{day, operation, model, provider, source_type, input_tokens, output_tokens,
+  event_count}`.
   """
   @spec usage_summary(Ecto.UUID.t(), keyword()) :: %{data: [map()], meta: map()}
   def usage_summary(tenant_id, opts \\ []) when is_binary(tenant_id) do
@@ -443,12 +563,16 @@ defmodule Loopctl.Llm do
           fragment("date_trunc('day', ?)", e.occurred_at),
           e.operation,
           e.model,
+          e.provider,
           e.source_type
         ],
         select: %{
           day: fragment("date_trunc('day', ?)", e.occurred_at),
           operation: e.operation,
           model: e.model,
+          # US-41.3 (AC-41.3.6): provider-attributed so a tenant's local-endpoint
+          # spend is distinguishable from Anthropic's instead of silently blending.
+          provider: e.provider,
           source_type: e.source_type,
           input_tokens: sum(e.input_tokens),
           output_tokens: sum(e.output_tokens),
@@ -554,7 +678,8 @@ defmodule Loopctl.Llm do
   # Accept both atom- and string-keyed attrs; whitelist to the known keys so an
   # attacker can't smuggle e.g. tenant_id in.
   @known_attr_keys ~w(api_key embedding_api_key extraction_model classification_model
-                      merge_model embedding_model operation model input_tokens
+                      merge_model embedding_model chat_provider chat_base_url
+                      chat_api_key operation model provider input_tokens
                       output_tokens source_type article_id occurred_at)a
   defp normalize_keys(attrs) do
     Enum.reduce(@known_attr_keys, %{}, fn key, acc ->
@@ -582,10 +707,18 @@ defmodule Loopctl.Llm do
   # with the changed model fields; additionally record `llm_config.key_set` /
   # `llm_config.embedding_key_set` when the respective key was set/rotated (value
   # never included — only its last-4 hint).
-  defp audit_multi(tenant_id, settings, changeset, key_set?, embedding_key_set?) do
+  defp audit_multi(tenant_id, settings, changeset, keys_set) do
     changed_models =
       changeset.changes
       |> Map.take([:extraction_model, :classification_model, :merge_model, :embedding_model])
+      |> Map.new(fn {k, v} -> {Atom.to_string(k), v} end)
+
+    # US-41.3: the chat ENDPOINT change is auditable (the url is not a secret and
+    # naming it is the point — an operator must be able to see where tenant content
+    # started going), while the credential remains value-free everywhere.
+    changed_endpoint =
+      changeset.changes
+      |> Map.take([:chat_provider, :chat_base_url])
       |> Map.new(fn {k, v} -> {Atom.to_string(k), v} end)
 
     Multi.new()
@@ -600,13 +733,16 @@ defmodule Loopctl.Llm do
         actor_label: "llm_config",
         new_state: %{
           "changed_models" => changed_models,
-          "api_key_set" => key_set?,
-          "embedding_api_key_set" => embedding_key_set?
+          "changed_chat_endpoint" => changed_endpoint,
+          "api_key_set" => keys_set.api_key,
+          "embedding_api_key_set" => keys_set.embedding_api_key,
+          "chat_api_key_set" => keys_set.chat_api_key
         }
       }
     end)
-    |> maybe_audit_key_set(tenant_id, settings, key_set?, :api_key)
-    |> maybe_audit_key_set(tenant_id, settings, embedding_key_set?, :embedding_api_key)
+    |> maybe_audit_key_set(tenant_id, settings, keys_set.api_key, :api_key)
+    |> maybe_audit_key_set(tenant_id, settings, keys_set.embedding_api_key, :embedding_api_key)
+    |> maybe_audit_key_set(tenant_id, settings, keys_set.chat_api_key, :chat_api_key)
   end
 
   defp maybe_audit_key_set(multi, _tenant_id, _settings, false, _field), do: multi
@@ -620,6 +756,10 @@ defmodule Loopctl.Llm do
         :embedding_api_key ->
           {:audit_embedding_key_set, "llm_config.embedding_key_set", "embedding_api_key_hint",
            settings.embedding_api_key}
+
+        :chat_api_key ->
+          {:audit_chat_key_set, "llm_config.chat_key_set", "chat_api_key_hint",
+           settings.chat_api_key}
       end
 
     Audit.log_in_multi(multi, step, fn _ ->

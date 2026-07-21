@@ -74,7 +74,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   @classifier Application.compile_env(
                 :loopctl,
                 :category_classifier,
-                Loopctl.Knowledge.ClaudeCategoryClassifier
+                Loopctl.Knowledge.ClassifierRouter
               )
 
   @default_batch_size 100
@@ -369,6 +369,10 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   # batch look like an outage and drove the forever-snooze loop AC-41.4.3 forbids.
   defp permanent_classify_error?({tag, _details}) when tag in [:egress_blocked], do: true
   defp permanent_classify_error?(:unparseable_classification), do: true
+
+  # US-41.3 (AC-41.3.4): a shape failure from the OpenAI-compatible sibling. The
+  # configured model cannot emit the required JSON verdict, so no retry can fix it.
+  defp permanent_classify_error?({:invalid_response_shape, _details}), do: true
 
   defp permanent_classify_error?({:api_error, status, _body})
        when is_integer(status) and status >= 400 and status < 500 and status != 408 and

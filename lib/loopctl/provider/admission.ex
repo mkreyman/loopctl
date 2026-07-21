@@ -19,11 +19,22 @@ defmodule Loopctl.Provider.Admission do
 
       "provider_admission:embedding:<tenant_id>"
       "provider_admission:anthropic:<tenant_id>"
+      "provider_admission:openai_compatible:<tenant_id>"
 
   so one `(tenant, provider)` pair can never consume another's allowance
-  (AC-37.1.1). `provider` is a fixed atom (`:embedding` | `:anthropic`) — never a
-  user-supplied value — so the key is bounded and no `String.to_atom/1` on input
-  is involved.
+  (AC-37.1.1). `provider` is a fixed atom (`:embedding` | `:anthropic` |
+  `:openai_compatible`) — never a user-supplied value — so the key is bounded and
+  no `String.to_atom/1` on input is involved.
+
+  ## One shared atom for every tenant-supplied local endpoint (US-41.3, AC-41.3.5)
+
+  Every OpenAI-compatible chat endpoint — regardless of which tenant declared it
+  or what hardware backs it — admits under the SINGLE `:openai_compatible` atom,
+  so they share ONE global RPM ceiling. This is INTENTIONAL for v1: the bucket KEY
+  still isolates each tenant's count (a busy tenant cannot consume another's
+  allowance), only the limit VALUE is shared. Minting a per-endpoint atom would
+  mean `String.to_atom/1` on a tenant-supplied host — an unbounded atom table and
+  the exact anti-pattern the fixed `@providers` list exists to prevent.
 
   ## Algorithm — Hammer FIXED-WINDOW counter (not a leaky/token bucket)
 
@@ -52,6 +63,7 @@ defmodule Loopctl.Provider.Admission do
 
     * `"provider_admission_embedding_rpm"` — default 600 req/node/min
     * `"provider_admission_anthropic_rpm"` — default 300 req/node/min
+    * `"provider_admission_openai_compatible_rpm"` — default 300 req/node/min
 
   Defaults are deliberately generous: the gate is a defensive ceiling against a
   runaway burst, NOT a business quota. TPM is intentionally out of scope — the AC
@@ -101,7 +113,7 @@ defmodule Loopctl.Provider.Admission do
 
   alias Loopctl.SystemConfig
 
-  @providers [:embedding, :anthropic]
+  @providers [:embedding, :anthropic, :openai_compatible]
 
   # Fixed 60s window; the limit is the requests-per-minute ceiling per node.
   @window_ms 60_000
@@ -110,12 +122,15 @@ defmodule Loopctl.Provider.Admission do
   # a business quota. Tunable live via SystemConfig with no deploy.
   @default_embedding_rpm 600
   @default_anthropic_rpm 300
+  # US-41.3: ONE shared ceiling for EVERY tenant-supplied OpenAI-compatible chat
+  # endpoint. See the "Single shared atom" note in the moduledoc — deliberate for v1.
+  @default_openai_compatible_rpm 300
 
   # Base snooze (seconds) a worker waits after {:error, :rate_limited_local}
   # before Oban re-runs it loss-free. Live-tunable; jitter added in snooze_seconds/0.
   @default_snooze_seconds 5
 
-  @type provider :: :embedding | :anthropic
+  @type provider :: :embedding | :anthropic | :openai_compatible
 
   @doc """
   Admit (or reject) one outbound call for `{tenant_id, provider}`.
@@ -196,4 +211,15 @@ defmodule Loopctl.Provider.Admission do
 
   defp limit_for(:anthropic),
     do: SystemConfig.get_int("provider_admission_anthropic_rpm", @default_anthropic_rpm)
+
+  # US-41.3 (AC-41.3.5): adding the atom to @providers WITHOUT this clause would
+  # raise a FunctionClauseError inside `admit/2`'s try body, which the fail-open
+  # `rescue` above converts to `:ok` — i.e. a provider with NO rate limit at exactly
+  # the call site the US-41.4 egress guard sits beside. The two edits are ONE change.
+  defp limit_for(:openai_compatible),
+    do:
+      SystemConfig.get_int(
+        "provider_admission_openai_compatible_rpm",
+        @default_openai_compatible_rpm
+      )
 end

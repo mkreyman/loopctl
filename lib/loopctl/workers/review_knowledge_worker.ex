@@ -43,16 +43,18 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   alias Loopctl.Egress.Scope, as: EgressScope
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
+  import Loopctl.Llm.ShapeError, only: [is_shape_error: 1]
   alias Loopctl.Knowledge.Article
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
+  alias Loopctl.Llm.ShapeError
   alias Loopctl.Oban.FairShare
   alias Loopctl.Provider.Admission
 
   @extractor Application.compile_env(
                :loopctl,
                :knowledge_extractor,
-               Loopctl.Knowledge.LlmExtractor
+               Loopctl.Knowledge.ExtractorRouter
              )
 
   @max_articles 5
@@ -144,6 +146,14 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
     # `:egress_unavailable` SNOOZE (recoverable). The cancel reason NAMES the scope
     # and the offending endpoint (AC-41.4.6).
     Egress.oban_result(refusal)
+  end
+
+  defp classify_result({:error, shape}) when is_shape_error(shape) do
+    # US-41.3 (AC-41.3.4): a local model that cannot produce the required structure
+    # is a CONFIGURATION problem, not a transient failure. CANCEL with a reason
+    # naming the endpoint and the model — never a blind retry that re-POSTs the
+    # review context two more times to a model that will fail identically.
+    ShapeError.oban_result(shape)
   end
 
   defp classify_result({:error, :rate_limited_local}) do

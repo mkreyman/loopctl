@@ -88,11 +88,16 @@ describe("set_llm_config / llm_config tool descriptions onboard a stranger agent
   const source = readFileSync(indexPath, "utf8");
 
   // Isolate each tool block so assertions target the right description.
+  // Slice to the START OF THE NEXT tool declaration rather than a fixed byte
+  // window: a fixed window silently truncates the block as a tool's description /
+  // schema grows (US-41.3 added four chat-endpoint params), turning a real
+  // assertion into a false failure about text that IS present, just past the cut.
   function toolBlock(name) {
     const marker = `name: "${name}"`;
     const start = source.indexOf(marker);
     assert.ok(start !== -1, `tool ${name} should be defined`);
-    return source.slice(start, start + 2000);
+    const next = source.indexOf('\n    name: "', start + marker.length);
+    return next === -1 ? source.slice(start) : source.slice(start, next);
   }
 
   test("set_llm_config explains WHAT / WHY / WHEN / the required user key", () => {

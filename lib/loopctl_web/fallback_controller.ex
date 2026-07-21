@@ -389,6 +389,25 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # US-41.3 (AC-41.3.3): a chat-endpoint write refused by the credential rule or by
+  # the config-time probe. The details map is built by `Loopctl.Llm.ChatProbe` and
+  # is SECRET-FREE: it echoes the endpoint URL (the tenant's own declared host) and
+  # a machine-readable `code` + ACTION-REQUIRED `remediation`, never the key.
+  # Nothing was persisted.
+  def call(conn, {:error, refusal, %{code: code, message: message} = details})
+      when is_atom(refusal) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: code,
+        message: message,
+        remediation: Map.get(details, :remediation, %{})
+      }
+    })
+  end
+
   def call(conn, {:error, :bad_request, message}) when is_binary(message) do
     conn
     |> put_status(:bad_request)

@@ -5,6 +5,39 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.54.0 — 2026-07-20 (pluggable OpenAI-compatible chat endpoint — US-41.3)
+
+### Added
+
+- **`set_llm_config`** gains four params so the CHAT surface (ingest extraction,
+  classification, merge synthesis, memory promotion) can run against a tenant's OWN
+  OpenAI-compatible endpoint instead of the hardcoded Anthropic one. That surface
+  carries the largest and most sensitive payload in the pipeline — a harvested
+  document's full text — so a private tier without it would be a guarantee that is
+  false in the one place users most assume it holds.
+  - `chat_provider` — `anthropic` (default, unchanged) or `openai_compatible`.
+  - `chat_base_url` — the API base of your server; the client appends
+    `/chat/completions`.
+  - `chat_api_key` — the credential for THAT endpoint. A SEPARATE encrypted column
+    from `api_key`: your Anthropic key is never transmitted to your host.
+  - `acknowledge_key_transmission` — required when CHANGING `chat_base_url` without
+    supplying a matching `chat_api_key`; the probe never ships an already-stored
+    credential to a new host silently.
+
+  The endpoint is PROBED with a trivial completion BEFORE anything is persisted:
+  unreachable, auth-rejected and not-OpenAI-compatible are distinguished 422s, each
+  carrying an ACTION-REQUIRED `remediation`, and nothing is saved on failure. The
+  write stays **role `:user`** — the same PATCH stores tenant secrets.
+
+### Changed
+
+- **`llm_config`** now also returns `chat_provider`, `chat_base_url` (echoed — it is
+  your own declared host, not a secret), `has_chat_key` and `chat_api_key_hint`.
+  No key is ever returned.
+- **`knowledge_llm_usage`** rows are now grouped by `provider` as well, so a local
+  endpoint's spend is distinguishable from Anthropic's. A local endpoint that
+  reports no usage records a row with ZERO tokens — never a silently absent row.
+
 ## 2.53.1 — 2026-07-20 (US-41.4 review fixes)
 
 ### Changed
