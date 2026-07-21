@@ -12,13 +12,28 @@ defmodule Loopctl.Webhooks.WebhookEvent do
   - `delivered` -- successfully delivered (HTTP 2xx)
   - `failed` -- delivery failed, may be retried
   - `exhausted` -- all retry attempts used up
+  - `blocked` -- REFUSED by the egress guard before any request was made
+
+  ## `blocked` is deliberately NOT `failed` (US-41.5, AC-41.5.2)
+
+  A blocked delivery is a CONFIGURATION CONFLICT between the subscription's
+  destination and the scope's `local_only` marking (or the SSRF denylist) — not
+  a flaky endpoint. An operator or agent reading the delivery list needs to tell
+  them apart: `failed`/`exhausted` mean "the endpoint did not accept it, we
+  retried"; `blocked` means "loopctl refused to send it, and retrying changes
+  nothing until the configuration changes". It is TERMINAL: no attempts are
+  burned and no retry is scheduled.
+
+  `error` carries the agent-readable reason from `Loopctl.Egress.refusal_reason/1`,
+  prefixed with the BLOCK KIND (`ssrf_denied` vs `locality_denied`) so the two
+  refusal causes stay distinguishable.
   """
 
   use Loopctl.Schema
 
   @type t :: %__MODULE__{}
 
-  @statuses [:pending, :delivered, :failed, :exhausted]
+  @statuses [:pending, :delivered, :failed, :exhausted, :blocked]
 
   schema "webhook_events" do
     tenant_field()

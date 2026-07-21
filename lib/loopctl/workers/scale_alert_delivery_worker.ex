@@ -97,10 +97,20 @@ defmodule Loopctl.Workers.ScaleAlertDeliveryWorker do
     body = Jason.encode!(payload)
     headers = [{"content-type", "application/json"}]
 
-    case @delivery_client.deliver(url, body, headers) do
+    # `scope: nil` — OPERATOR-PLANE delivery (US-41.5). The URL is operator
+    # configuration, not tenant data, and the payload carries metric names and
+    # thresholds, not tenant content: there is no tenant `local_only` marking to
+    # apply. It stays guarded by the SSRF denylist (the same `UrlGuard` primitive
+    # the egress policy composes). Triaged in `docs/egress-guard.md`.
+    case @delivery_client.deliver(url, body, headers, nil) do
       {:ok, _resp} ->
         :ok
 
+      # There is deliberately NO `{:refused, _}` clause. Passing `scope: nil` above
+      # selects the operator-plane delivery path, which makes no locality decision
+      # and therefore cannot refuse — the compiler proves it (Elixir 1.19 flags a
+      # clause here as a typing violation), so adding one for symmetry would be
+      # dead code that misrepresents the contract.
       {:error, reason} ->
         Logger.warning(
           "ScaleAlertDeliveryWorker: delivery failed (#{inspect(reason)}), Oban will retry"

@@ -4,23 +4,83 @@ defmodule Loopctl.Webhooks.ReqDelivery do
 
   Makes HTTP POST requests to webhook URLs with JSON payloads.
   Uses a 10-second timeout. Supports Req.Test plug for test mocking.
+
+  ## The egress decision is delegated, never re-derived (US-41.5, AC-41.5.1)
+
+  A webhook destination is a TENANT-SUPPLIED url carrying TENANT CONTENT, so it
+  consults the ONE egress policy (`Loopctl.Egress.Policy.check/4`) with purpose
+  `:webhook` and `tenant_supplied: true` — exactly as the ingestion fetch and the
+  tenant-configured chat endpoint do. That single call subsumes what this module
+  used to do with a bare `UrlGuard.pin/1`, and adds the locality decision on top:
+
+    * the SSRF denylist stays MANDATORY for every scope, marked or not
+      (`tenant_supplied: true` makes a `:denylisted` verdict the PERMANENT
+      `:egress_blocked` on the default path) — GHSA-jh42-wf7g-f5rg stays closed;
+    * on a `local_only` scope a destination that is not `:network_local`
+      (operator deployment allowlist) or `:tenant_declared` FOR THE `webhook`
+      PURPOSE is refused BEFORE the request is built;
+    * conversely, an allowlisted or purpose-declared destination now BECOMES
+      deliverable — the old unconditional `UrlGuard.pin/1` refused every
+      loopback/private destination for every tenant.
+
+  The pin is still applied (`pinned_request_opts/2` + `redirect: false`), so the
+  IP connected to is the IP that was classified: no second resolution for an
+  attacker to rebind (ie-02 / GHSA-jh42-wf7g-f5rg).
+
+  `scope: nil` is OPERATOR-PLANE delivery (scale alerts). No tenant marking
+  applies, so it keeps the SSRF denylist alone — the same `UrlGuard` primitive
+  the policy composes, not a second policy. See `docs/egress-guard.md`.
   """
 
   @behaviour Loopctl.Webhooks.DeliveryBehaviour
 
+  alias Loopctl.Egress.Policy
+  alias Loopctl.Egress.Scope
   alias Loopctl.Net.UrlGuard
 
   @impl true
-  def deliver(url, body, headers) do
-    # Validate AND pin at delivery time (not just at changeset time) to defend
-    # against DNS rebinding / TOCTOU (ie-02 / GHSA-jh42-wf7g-f5rg): pin/1 resolves
-    # the host ONCE, and pinned_request_opts/1 makes Req connect to that exact IP
-    # while keeping the original host for Host/SNI/cert — so there is no second
-    # resolution for an attacker to rebind.
+  def deliver(url, body, headers, scope)
+
+  def deliver(url, body, headers, %Scope{} = scope) do
+    # `tenant_supplied: true`: the destination is tenant-writable, so the default
+    # (non-local_only) path must NOT degrade to an unpinned, redirect-following
+    # request when classification fails — it fails CLOSED as the TRANSIENT
+    # `:egress_unavailable`, and a denylisted host is the PERMANENT
+    # `:egress_blocked`. That is the same semantic the old `UrlGuard.pin/1`
+    # refusal had, expressed through the ONE policy.
+    case Policy.check(scope, url, :webhook, tenant_supplied: true) do
+      {:ok, %{} = pinned} ->
+        do_deliver(pinned, body, headers)
+
+      # Unreachable for `tenant_supplied: true` (that path refuses instead of
+      # degrading), but the policy's contract still admits it — so handle it as a
+      # REFUSAL rather than letting a future policy change silently hand webhook
+      # delivery an unpinned, redirect-following request to a tenant-chosen host.
+      {:ok, :unpinned} ->
+        {:refused, {:egress_unavailable, unpinnable_details(scope, url)}}
+
+      {:error, tag, details} ->
+        {:refused, {tag, details}}
+    end
+  end
+
+  def deliver(url, body, headers, nil) do
     case UrlGuard.pin(url) do
       {:ok, pinned} -> do_deliver(pinned, body, headers)
       {:error, reason} -> {:error, "blocked_url: #{reason}"}
     end
+  end
+
+  defp unpinnable_details(scope, url) do
+    %{
+      host: URI.parse(url).host,
+      scope: Scope.key(scope),
+      verdict: :unclassifiable,
+      remediation:
+        "The webhook destination could not be pinned, so nothing was sent. This is " <>
+          "TRANSIENT — the delivery is retried. Verify the destination host resolves " <>
+          "from loopctl and re-check with the egress_posture tool."
+    }
   end
 
   defp do_deliver(pinned, body, headers) do

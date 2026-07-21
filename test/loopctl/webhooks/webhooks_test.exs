@@ -112,7 +112,13 @@ defmodule Loopctl.WebhooksTest do
             "events" => ["story.status_changed"]
           })
 
-        assert "must not target a private or loopback address" in errors_on(changeset).url
+        # US-41.5: the address decision moved to the ONE policy, which can see the
+        # OPERATOR allowlist. The legacy phrase is preserved as the message PREFIX,
+        # now followed by the remediation naming WHO can carve it out.
+        assert Enum.any?(
+                 errors_on(changeset).url,
+                 &(&1 =~ "must not target a private or loopback address")
+               )
       end
     end
 
@@ -141,7 +147,10 @@ defmodule Loopctl.WebhooksTest do
           "events" => ["story.status_changed"]
         })
 
-      assert "must not target a private or loopback address" in errors_on(changeset).url
+      assert Enum.any?(
+               errors_on(changeset).url,
+               &(&1 =~ "must not target a private or loopback address")
+             )
     end
 
     test "reports an unresolvable host distinctly from a private address" do
@@ -158,7 +167,11 @@ defmodule Loopctl.WebhooksTest do
         })
 
       assert "host could not be resolved" in errors_on(changeset).url
-      refute "must not target a private or loopback address" in errors_on(changeset).url
+
+      refute Enum.any?(
+               errors_on(changeset).url,
+               &(&1 =~ "must not target a private or loopback address")
+             )
     end
 
     test "enforces max_webhooks limit" do

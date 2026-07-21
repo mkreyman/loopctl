@@ -16,6 +16,7 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
   setup :verify_on_exit!
 
   alias Loopctl.Knowledge
+  alias Loopctl.Test.AllowlistSource
   alias Loopctl.Workers.ContentIngestionWorker
 
   defp setup_tenant do
@@ -333,7 +334,12 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
         flunk("SSRF guard should have blocked the request before Req.get/1")
       end)
 
-      assert {:error, {:url_blocked, :blocked_ip}} =
+      # US-41.5 review: the SSRF call is made by the ONE policy
+      # (`denylist_gate/4` on a `tenant_supplied_url`), not by a second
+      # `UrlGuard.pin/1` pre-gate — so the refusal is the PERMANENT
+      # `:egress_blocked`, which `Egress.oban_result/1` CANCELS (it was retried as
+      # a generic error before). Nothing is fetched either way.
+      assert {:cancel, reason} =
                ContentIngestionWorker.perform(%Oban.Job{
                  id: 200,
                  args: %{
@@ -343,6 +349,10 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
                    "source_type" => "web_article"
                  }
                })
+
+      assert reason =~ "egress_blocked"
+      assert reason =~ "denylisted"
+      assert reason =~ "169.254.169.254"
 
       assert %{data: []} = Knowledge.list_articles(tenant.id, source_type: "web_article")
     end
@@ -354,7 +364,7 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
         {:ok, [{10, 0, 0, 5}]}
       end)
 
-      assert {:error, {:url_blocked, :blocked_ip}} =
+      assert {:cancel, reason} =
                ContentIngestionWorker.perform(%Oban.Job{
                  id: 201,
                  args: %{
@@ -364,6 +374,58 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
                    "source_type" => "web_article"
                  }
                })
+
+      assert reason =~ "egress_blocked"
+      assert reason =~ "denylisted"
+      assert reason =~ "rebind.example.com"
+    end
+
+    # The operator deployment allowlist could not be consulted while the fetch
+    # was pre-gated by a bare `UrlGuard.pin/1`: an allowlisted private host was a
+    # legal WEBHOOK destination but still a hard refusal as an INGESTION source.
+    # Now both paths ask the same policy (US-41.5 review).
+    test "an OPERATOR-allowlisted private host is fetchable as an ingestion source" do
+      %{tenant: tenant} = setup_tenant()
+
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host -> {:ok, [{10, 0, 0, 5}]} end)
+
+      Req.Test.stub(ContentIngestionWorker, fn conn ->
+        Req.Test.html(conn, "<html><body>Allowlisted ingest body</body></html>")
+      end)
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
+        {:ok,
+         [
+           %{
+             title: "Allowlisted host finding",
+             body: "Important pattern from an allowlisted internal host.",
+             category: :finding,
+             tags: ["egress"]
+           }
+         ]}
+      end)
+
+      AllowlistSource.put(["10.0.0.0/8"])
+
+      try do
+        assert :ok =
+                 ContentIngestionWorker.perform(%Oban.Job{
+                   id: 202,
+                   args: %{
+                     "tenant_id" => tenant.id,
+                     "url" => "https://internal.example.com/doc",
+                     "content_hash" => "allowlisted1",
+                     "source_type" => "web_article"
+                   }
+                 })
+      after
+        AllowlistSource.clear()
+      end
+
+      %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "web_article")
+      assert Enum.any?(articles, &(&1.title == "Allowlisted host finding"))
     end
   end
 

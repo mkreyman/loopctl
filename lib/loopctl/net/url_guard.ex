@@ -92,6 +92,33 @@ defmodule Loopctl.Net.UrlGuard do
   end
 
   @doc """
+  Validates only the SHAPE of `url` — scheme allowlist and host presence —
+  WITHOUT resolving DNS or applying the address denylist.
+
+  Exposed for callers whose ADDRESS decision belongs to `Loopctl.Egress.Policy`
+  rather than here (US-41.5): the webhook changeset validates shape at cast time,
+  and the `Loopctl.Webhooks` context then makes the ONE policy call, which does
+  the single DNS resolution and can see the OPERATOR deployment allowlist. Using
+  `validate_egress/2` there instead would resolve the host TWICE for one write
+  and re-decide the address with a copy of the rules that cannot see the
+  allowlist. The scheme list still lives here, so there is no second policy.
+  """
+  @spec validate_shape(String.t(), keyword()) :: {:ok, URI.t()} | {:error, reason()}
+  def validate_shape(url, opts \\ [])
+
+  def validate_shape(url, opts) when is_binary(url) do
+    schemes = Keyword.get(opts, :schemes, @default_schemes)
+    uri = URI.parse(url)
+
+    with :ok <- check_scheme(uri, schemes),
+         {:ok, _host} <- host(uri) do
+      {:ok, uri}
+    end
+  end
+
+  def validate_shape(_url, _opts), do: {:error, :invalid_url}
+
+  @doc """
   Validates `url` and returns the single IP to pin the connection to.
 
   Same checks as `validate_egress/2`, but on success returns
