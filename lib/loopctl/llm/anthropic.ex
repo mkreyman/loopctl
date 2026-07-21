@@ -44,6 +44,18 @@ defmodule Loopctl.Llm.Anthropic do
   @default_receive_timeout 25_000
   @default_max_retries 0
 
+  @doc """
+  The Anthropic API BASE URL this client actually posts to.
+
+  The SINGLE source of truth for the chat endpoint: `Loopctl.Egress` (posture +
+  the `local_only` enable pre-flight) reads it from HERE rather than re-deriving
+  it from a config key nothing else consults, so the endpoint that gets vetted is
+  always the endpoint the guard sees. A second, divergent URL resolution is an
+  AC-41.4.9 review failure.
+  """
+  @spec base_url() :: String.t()
+  def base_url, do: @base_url
+
   @type usage_meta :: %{
           optional(:source_type) => String.t() | nil,
           optional(:article_id) => Ecto.UUID.t() | nil
@@ -190,7 +202,7 @@ defmodule Loopctl.Llm.Anthropic do
     # refuses `local_only` scopes on a non-local endpoint BEFORE the request is
     # built. Admission (fail-OPEN) stays its own `with` clause above so the two
     # failure modes never share a code path.
-    case Provider.post("#{@base_url}/messages", opts, %{scope: scope, purpose: :inference}) do
+    case Provider.post("#{base_url()}/messages", opts, %{scope: scope, purpose: :inference}) do
       {:ok, %{status: 200, body: %{"content" => [%{"text" => text} | _]} = resp}} ->
         record_usage_safe(tenant_id, operation, model, resp["usage"], usage_meta)
         {:ok, text}
@@ -240,8 +252,9 @@ defmodule Loopctl.Llm.Anthropic do
       # `[:loopctl, :llm, :provider_error]` storm signal for what is, by design, a
       # permanent local refusal (the same reasoning that exempts
       # `:rate_limited_local`). No data was sent.
-      {:error, egress} when egress in [:egress_blocked, :pin_stale] ->
-        {:error, egress}
+      {:error, {egress, _details} = refusal}
+      when egress in [:egress_blocked, :pin_stale, :egress_unavailable] ->
+        {:error, refusal}
 
       {:error, reason} ->
         # Never inspect the raw transport reason (review MED #4) — log a value-free

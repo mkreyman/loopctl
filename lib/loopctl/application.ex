@@ -141,6 +141,12 @@ defmodule Loopctl.Application do
       # which every local_only tenant hard-refuses at once, and a privacy control
       # whose steady state is an outage gets disabled in production.
       Loopctl.Egress.PinCache,
+      # US-41.4 (AC-41.4.6): owns the ETS table that debounces blocked-decision
+      # WRITES off the refusal path. Bounding the ROW count is not enough — one
+      # upsert per blocked call still serializes thousands of row-lock round-trips
+      # a minute on the 3-connection AdminRepo pool the guard's own marking lookup
+      # needs. After AdminRepo (it writes via AdminRepo at flush).
+      Loopctl.Egress.BlockedBuffer,
       LoopctlWeb.Endpoint
     ]
 

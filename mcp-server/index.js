@@ -4991,7 +4991,8 @@ const TOOLS = [
       "at pin time, whether given literally or via a public hostname that resolves there; " +
       "private-range carve-outs are available ONLY through the operator-controlled " +
       "deployment allowlist, which no role can write. (2) PURPOSE-SCOPED — a host declared " +
-      "for inference does NOT authorize webhook POSTs of your content to it. (3) VENDOR " +
+      "for inference does NOT authorize webhook POSTs of your content to it, nor loopctl " +
+      "FETCHING tenant-supplied URLs from it (purpose 'ingest'). (3) VENDOR " +
       "HOSTS EXCLUDED (api.openai.com, api.anthropic.com). Requires your EXACT user-role " +
       "key.",
     inputSchema: {
@@ -5005,7 +5006,7 @@ const TOOLS = [
         },
         purposes: {
           type: "array",
-          items: { type: "string", enum: ["inference", "webhook"] },
+          items: { type: "string", enum: ["inference", "webhook", "ingest"] },
           description:
             "What this declaration authorizes. At least one. Declarations are honoured " +
             "ONLY for their declared purposes.",

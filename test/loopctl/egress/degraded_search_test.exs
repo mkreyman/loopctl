@@ -112,7 +112,9 @@ defmodule Loopctl.Egress.DegradedSearchTest do
       refute_received {[:loopctl, :llm, :provider_error], ^ref, _measurements, _metadata}
 
       # Breaker closed: the reason is STILL the egress refusal, not circuit_open.
-      assert {:error, :egress_blocked} = Knowledge.generate_embedding(tenant.id, "advisory locks")
+      assert {:error, {:egress_blocked, _}} =
+               Knowledge.generate_embedding(tenant.id, "advisory locks")
+
       refute_received :unexpected_http_call
     end
   end
@@ -136,6 +138,31 @@ defmodule Loopctl.Egress.DegradedSearchTest do
 
       # Reserved and extensible: present, and EMPTY until US-41.6 populates it.
       assert meta["excluded_tiers"] == []
+    end
+
+    # REGRESSION (review): `Knowledge` got the degraded contract but `Memory.recall/2`
+    # did not — its own `fallback_reason_tag/1` had no `:egress_blocked` clause, so
+    # `ProviderError.sanitize/1`'s catch-all passed the term through to the generic
+    # "embedding_error". A memory recall against a blocked scope therefore reported
+    # NO egress reason, NO offending endpoint, NO degraded flag and NO excluded_tiers
+    # — the agent-illegible outcome AC-41.4.7 exists to prevent. This story is the one
+    # that threaded the scope through the memory path, so the memory half is in scope.
+    test "the MEMORY half carries the identical degraded contract (AC-41.4.7)",
+         %{tenant: tenant} do
+      scope = %Loopctl.Memory.Scope{
+        tenant_id: tenant.id,
+        subject_id: Ecto.UUID.generate()
+      }
+
+      %{meta: meta} = Loopctl.Memory.recall(scope, query: "advisory locks", limit: 5)
+
+      assert meta.fallback == true
+      assert meta.reason == "egress_blocked"
+      assert meta.degraded == true
+      assert meta.offending_endpoint =~ "api.openai.com"
+      assert meta.excluded_tiers == []
+
+      refute_received :unexpected_http_call
     end
 
     test "the remediation is agent-actionable and names the role-:agent posture tool",

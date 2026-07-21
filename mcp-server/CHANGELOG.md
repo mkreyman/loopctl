@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.52.1 — 2026-07-20 (US-41.4 review fixes)
+
+### Changed
+
+- **`declare_trusted_endpoint`** — the purpose enum gains **`ingest`**. Purposes
+  are `inference | webhook | ingest`. The content-ingestion FETCH now consults the
+  same egress policy module as the provider guard (AC-41.4.9), so a host declared
+  for `inference` does NOT authorize loopctl to fetch tenant-supplied URLs from it
+  on a `local_only` scope, and vice versa.
+- README documents the six egress tools (the designated source of truth for the
+  tool list) and the tool count is corrected to 109.
+
 ## 2.52.0 — 2026-07-20 (fail-closed no-egress guard — US-41.4)
 
 ### Added

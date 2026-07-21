@@ -6584,23 +6584,13 @@ defmodule Loopctl.Knowledge do
   # a structurally impossible-to-populate result set that reads as "nothing in your
   # KB". Shipping the field now keeps the response contract stable across that
   # change. The offending-endpoint lookup is TENANT-scoped and DB-free.
-  defp degraded_contract_meta(tenant_id, fallback_reason) do
-    %{
-      degraded: true,
-      excluded_tiers: [],
-      offending_endpoint: offending_endpoint(tenant_id, fallback_reason)
-    }
-  end
-
-  defp offending_endpoint(tenant_id, _reason) do
-    tenant_id
-    |> EgressScope.new()
-    |> Egress.resolved_endpoints()
-    |> Enum.find_value(fn
-      {:embedding, url} -> url
-      _ -> nil
-    end)
-  end
+  # Shared verbatim with the MEMORY half (`Loopctl.Memory.recall/2`) so the
+  # AC-41.4.7 contract cannot drift between the two paths. `offending_endpoint` is
+  # OMITTED for a non-egress reason (`no_embedding_key`, `rate_limited_local`,
+  # budget shedding, a semantic-index problem): naming an endpoint that had nothing
+  # to do with the failure would send an agent chasing the wrong thing.
+  defp degraded_contract_meta(tenant_id, fallback_reason),
+    do: Egress.degraded_contract_meta(tenant_id, fallback_reason)
 
   # -- Semantic → keyword fallback observability (#297) ------------------------
   #
@@ -6664,6 +6654,14 @@ defmodule Loopctl.Knowledge do
   # keyword fallback, HTTP 200, never a 500, and never a bare empty list.
   defp reason_to_tag(:egress_blocked), do: "egress_blocked"
   defp reason_to_tag(:pin_stale), do: "pin_stale"
+  # US-41.4: the refusal now carries its DETAILS (`{tag, details}`) so the failure
+  # that reaches an agent/Oban record names the scope and the offending endpoint.
+  # The TAG stays bounded (safe as a Prometheus label).
+  defp reason_to_tag({tag, details})
+       when tag in [:egress_blocked, :pin_stale, :egress_unavailable] and is_map(details),
+       do: to_string(tag)
+
+  defp reason_to_tag(:egress_unavailable), do: "egress_unavailable"
   defp reason_to_tag(:circuit_open), do: "embedding_circuit_open"
   defp reason_to_tag(:rate_limited_local), do: "embedding_rate_limited_local"
   # US-37.5: the semantic heavy read was shed because the tenant is over its
@@ -8017,6 +8015,14 @@ defmodule Loopctl.Knowledge do
   # `:pin_stale` is DISTINCT from `:egress_blocked` (an IP changed, not a policy
   # refusal) and equally not a provider failure — remediation is a cheap re-pin.
   defp breaker_countable?(:pin_stale), do: false
+  defp breaker_countable?(:egress_unavailable), do: false
+
+  # The tagged refusal form `{tag, details}` (US-41.4 review): same reasoning —
+  # never a provider failure, no request was issued.
+  defp breaker_countable?({tag, details})
+       when tag in [:egress_blocked, :pin_stale, :egress_unavailable] and is_map(details),
+       do: false
+
   # Unknown/other transport-ish failures: count (conservative — a real outage).
   defp breaker_countable?(_), do: true
 

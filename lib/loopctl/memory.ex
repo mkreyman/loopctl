@@ -49,6 +49,9 @@ defmodule Loopctl.Memory do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Egress
+
+  import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.VectorSearch
@@ -892,12 +895,20 @@ defmodule Loopctl.Memory do
 
         %{
           results: results,
-          meta: %{
-            total_count: length(results),
-            fallback: true,
-            reason: reason_tag,
-            underfilled: length(results) < k
-          }
+          meta:
+            %{
+              total_count: length(results),
+              fallback: true,
+              reason: reason_tag,
+              underfilled: length(results) < k
+            }
+            # US-41.4 (AC-41.4.7): WHENEVER the semantic path is unavailable the
+            # response meta names the reason AND the offending endpoint, plus the
+            # reserved `excluded_tiers`. This story threaded the egress scope through
+            # the MEMORY path too, so the memory half carries the identical contract
+            # as `Loopctl.Knowledge` search — an agent must never get a generic
+            # "embedding_error" for what is actually a local_only refusal.
+            |> Map.merge(Egress.degraded_contract_meta(scope.tenant_id, reason_tag))
         }
     end
   end
@@ -921,14 +932,37 @@ defmodule Loopctl.Memory do
   # Map a discarded embedding-generation error to a STABLE, non-sensitive tag for
   # `meta.reason` (mirrors Loopctl.Knowledge's fallback tagging). Sanitized via
   # ProviderError first so no api key / provider body can leak.
+  # US-41.4 (AC-41.4.6/.7): a fail-CLOSED egress refusal, in either the tagged
+  # `{tag, details}` form or as a bare atom. Without these clauses
+  # `ProviderError.sanitize/1`'s catch-all passed the term through to
+  # `api_error_tag/1`, which reported the agent-illegible generic "embedding_error"
+  # with no egress reason, no offending_endpoint and no degraded flag.
+  defp fallback_reason_tag(refusal) when is_egress_refusal(refusal),
+    do: refusal |> elem(0) |> to_string()
+
+  defp fallback_reason_tag(reason)
+       when reason in [:egress_blocked, :pin_stale, :egress_unavailable],
+       do: to_string(reason)
+
   defp fallback_reason_tag(reason) do
     case ProviderError.sanitize(reason) do
-      :no_api_key -> "no_embedding_key"
-      :circuit_open -> "embedding_circuit_open"
-      :timeout -> "embedding_timeout"
-      {:request_failed, _} -> "embedding_request_failed"
-      {:embedding_crash, _} -> "embedding_crash"
-      other -> api_error_tag(other)
+      :no_api_key ->
+        "no_embedding_key"
+
+      :circuit_open ->
+        "embedding_circuit_open"
+
+      :timeout ->
+        "embedding_timeout"
+
+      {:request_failed, _} ->
+        "embedding_request_failed"
+
+      {:embedding_crash, _} ->
+        "embedding_crash"
+
+      other ->
+        api_error_tag(other)
     end
   end
 

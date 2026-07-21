@@ -17,8 +17,17 @@ defmodule LoopctlWeb.WellKnownCapabilitiesTest do
 
     caps = body["capabilities"]
 
-    assert caps["supported_embedding_dimensions"] == [1536]
-    assert caps["tenant_supplied_endpoints_permitted"] == true
+    # Derived from the SAME runtime config the application validates against
+    # (`:embedding_dimensions`), not a compile-time literal that could contradict it.
+    assert caps["supported_embedding_dimensions"] ==
+             [Application.get_env(:loopctl, :embedding_dimensions, 1536)]
+
+    # FALSE until US-41.2 ships the tenant-configurable endpoint surface. Declaring
+    # a TRUSTED endpoint (which US-41.4 does ship) changes the locality VERDICT for
+    # an endpoint — it does not let a tenant point loopctl at their own box — so it
+    # does not make this flag true. Advertising a capability the instance cannot
+    # honour defeats AC-41.4.10's whole purpose.
+    assert caps["tenant_supplied_endpoints_permitted"] == false
     assert "local_only" in caps["tiers"]
     assert caps["egress_posture_endpoint"] =~ "/api/v1/egress/posture"
     # Guarantee wording is narrowed to exactly what the chokepoint check proves.

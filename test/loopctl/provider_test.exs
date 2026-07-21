@@ -27,6 +27,8 @@ defmodule Loopctl.ProviderTest do
   alias Loopctl.Provider.Admission
   alias Loopctl.Test.AllowlistSource
 
+  import Loopctl.TelemetryHelpers, only: [receive_matching: 3]
+
   setup :verify_on_exit!
 
   setup do
@@ -52,7 +54,7 @@ defmodule Loopctl.ProviderTest do
       {:ok, _} = Egress.enable_local_only(t.id, nil, acknowledge: true)
       PinCache.invalidate_tenant(t.id)
 
-      assert {:error, :egress_blocked} =
+      assert {:error, {:egress_blocked, _details}} =
                Provider.post(
                  "https://api.openai.com/v1/embeddings",
                  [plug: never_called_plug()],
@@ -105,7 +107,7 @@ defmodule Loopctl.ProviderTest do
       stub(Loopctl.MockRateLimiter, :check_rate, fn _, _, _ -> exit(:noproc) end)
       assert :ok = Admission.admit(t.id, :embedding)
 
-      assert {:error, :egress_blocked} =
+      assert {:error, {:egress_blocked, _details}} =
                Provider.post(
                  "https://api.openai.com/v1/embeddings",
                  [plug: never_called_plug()],
@@ -129,11 +131,15 @@ defmodule Loopctl.ProviderTest do
          %{tenant: t, scope: scope} do
       ref = :telemetry_test.attach_event_handlers(self(), [[:loopctl, :egress, :blocked]])
 
-      assert {:error, :egress_blocked} =
+      assert {:error, {:egress_blocked, _details}} =
                Provider.post("https://api.openai.com/v1/embeddings", [], %{scope: scope})
 
-      assert_receive {[:loopctl, :egress, :blocked], ^ref, %{count: 1}, metadata}
-      assert metadata.tenant_id == t.id
+      # RECEIVE-UNTIL-MATCH: the telemetry handler is GLOBAL, so a concurrent test's
+      # blocked event under the same ref must be skipped, not asserted on.
+      {measurements, metadata} =
+        receive_matching([:loopctl, :egress, :blocked], ref, &(&1.tenant_id == t.id))
+
+      assert measurements.count == 1
       assert metadata.endpoint_host == "api.openai.com"
       assert metadata.reason == "non_local"
     end
@@ -142,7 +148,7 @@ defmodule Loopctl.ProviderTest do
       ref =
         :telemetry_test.attach_event_handlers(self(), [[:loopctl, :llm, :provider_error]])
 
-      assert {:error, :egress_blocked} =
+      assert {:error, {:egress_blocked, _details}} =
                Provider.post("https://api.openai.com/v1/embeddings", [], %{scope: scope})
 
       refute_receive {[:loopctl, :llm, :provider_error], ^ref, _, _}
@@ -151,9 +157,14 @@ defmodule Loopctl.ProviderTest do
     test "N refusals in one window write a BOUNDED, aggregated audit trail",
          %{tenant: t, scope: scope} do
       for _ <- 1..30 do
-        assert {:error, :egress_blocked} =
+        assert {:error, {:egress_blocked, _details}} =
                  Provider.post("https://api.openai.com/v1/embeddings", [], %{scope: scope})
       end
+
+      # AC-41.4.6: the WRITE is buffered too, not just the row count — 30 refusals
+      # produce ONE upsert carrying the accumulated delta, not 30 row-lock
+      # round-trips on the 3-connection AdminRepo pool.
+      :ok = Egress.flush_blocked_decisions(t.id)
 
       rows = Egress.list_blocked_decisions(t.id)
       assert length(rows) == 1

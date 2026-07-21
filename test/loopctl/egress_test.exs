@@ -13,6 +13,8 @@ defmodule Loopctl.EgressTest do
   alias Loopctl.Egress.PinCache
   alias Loopctl.Egress.Scope
 
+  import Loopctl.TelemetryHelpers, only: [receive_matching: 3, count_matching: 3]
+
   setup :verify_on_exit!
 
   setup do
@@ -66,7 +68,12 @@ defmodule Loopctl.EgressTest do
       assert Egress.effective_local_only?(Scope.new(t.id, nil))
     end
 
-    test "a marking is invisible to another tenant (RLS, TC-41.4.13)", %{tenant: t} do
+    # NOT labelled "RLS": the whole Egress context reads and writes through
+    # `AdminRepo` (BYPASSRLS), so what this proves is the mandatory explicit
+    # `where tenant_id == ^tenant_id` scoping — which IS the runtime isolation
+    # mechanism here (see the `Loopctl.Egress` moduledoc). The RLS policies the
+    # migration installs are defence in depth for any future Repo-routed access.
+    test "a marking is invisible to another tenant (tenant isolation, TC-41.4.13)", %{tenant: t} do
       other = fixture(:tenant)
       {:ok, _} = Egress.enable_local_only(t.id, nil, acknowledge: true)
 
@@ -107,7 +114,16 @@ defmodule Loopctl.EgressTest do
       actor_id = Ecto.UUID.generate()
       {:ok, _} = Egress.enable_local_only(t.id, nil, acknowledge: true, actor_id: actor_id)
 
-      assert_receive {[:loopctl, :egress, :local_only_enabled], ^ref, measurements, metadata}
+      # RECEIVE-UNTIL-MATCH, not assert-on-the-first-event: the handler is GLOBAL
+      # and forwards every concurrent async test's local_only_enabled event under
+      # the same ref, so asserting on the first message is seed-dependent.
+      {measurements, metadata} =
+        receive_matching(
+          [:loopctl, :egress, :local_only_enabled],
+          ref,
+          &(&1.tenant_id == t.id)
+        )
+
       assert measurements.blocked_endpoint_count >= 1
       assert metadata.tenant_id == t.id
       assert metadata.actor_id == actor_id
@@ -272,14 +288,22 @@ defmodule Loopctl.EgressTest do
 
       for _ <- 1..25, do: :ok = Egress.record_blocked(scope, details)
 
+      # The WRITE is buffered in ETS and flushed periodically (AC-41.4.6): bounding
+      # rows is not the same as bounding writes. Drain THIS tenant's counters — a
+      # global drain would take a concurrent async test's buffered rows and then
+      # fail to insert them against this test's sandbox connection.
+      :ok = Egress.flush_blocked_decisions(t.id)
+
       rows = Egress.list_blocked_decisions(t.id)
       assert length(rows) == 1
       assert hd(rows).occurrence_count == 25
       assert hd(rows).endpoint_host == "api.openai.com"
       assert hd(rows).reason == "non_local"
 
-      # The exact per-call rate lives in telemetry, not in rows.
-      for _ <- 1..25, do: assert_received({[:loopctl, :egress, :blocked], ^ref, %{count: 1}, _})
+      # The exact per-call rate lives in telemetry, not in rows — and the telemetry
+      # counter is UNBUFFERED, one emission per blocked call. Count only OUR
+      # tenant's events: the handler is global and forwards every concurrent test's.
+      assert count_matching([:loopctl, :egress, :blocked], ref, &(&1.tenant_id == t.id)) == 25
     end
 
     test "different endpoints/reasons get their own aggregated row", %{tenant: t} do
@@ -287,6 +311,7 @@ defmodule Loopctl.EgressTest do
       :ok = Egress.record_blocked(scope, %{host: "a.example.com", verdict: :non_local})
       :ok = Egress.record_blocked(scope, %{host: "b.example.com", verdict: :non_local})
       :ok = Egress.record_blocked(scope, %{host: "a.example.com", verdict: :denylisted})
+      :ok = Egress.flush_blocked_decisions(t.id)
 
       assert length(Egress.list_blocked_decisions(t.id)) == 3
     end
@@ -294,6 +319,7 @@ defmodule Loopctl.EgressTest do
     test "blocked decisions are tenant-isolated", %{tenant: t} do
       other = fixture(:tenant)
       :ok = Egress.record_blocked(Scope.new(t.id), %{host: "a.example.com", verdict: :non_local})
+      :ok = Egress.flush_blocked_decisions(t.id)
 
       assert length(Egress.list_blocked_decisions(t.id)) == 1
       assert Egress.list_blocked_decisions(other.id) == []

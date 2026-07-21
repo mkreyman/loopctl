@@ -275,6 +275,80 @@ defmodule LoopctlWeb.EgressControllerTest do
     end
   end
 
+  describe "project_id is resolved against the CALLER's tenant" do
+    # REGRESSION (review): `project_id` was taken from the request BODY and written
+    # straight into a row whose FK has no tenant component, so tenant A could persist
+    # a marking pointing at tenant B's project; a valid FOREIGN uuid returned 200
+    # while a nonexistent one 422'd on the FK (a cross-tenant existence oracle); and
+    # a non-UUID raised Ecto.Query.CastError -> 500.
+    test "a FOREIGN project_id is refused, byte-identically to a nonexistent one",
+         %{conn: conn, keys: keys} do
+      other = fixture(:tenant)
+      foreign = fixture(:project, %{tenant_id: other.id})
+
+      foreign_resp =
+        conn
+        |> auth(keys.orchestrator)
+        |> post(~p"/api/v1/egress/local-only", %{
+          "project_id" => foreign.id,
+          "acknowledge" => true
+        })
+
+      missing_resp =
+        conn
+        |> auth(keys.orchestrator)
+        |> post(~p"/api/v1/egress/local-only", %{
+          "project_id" => Ecto.UUID.generate(),
+          "acknowledge" => true
+        })
+
+      assert json_response(foreign_resp, 404) == json_response(missing_resp, 404)
+
+      # And NOTHING was written against the foreign project.
+      assert Egress.get_marking(other.id, foreign.id) == nil
+      refute Egress.effective_local_only?(Scope.new(other.id, foreign.id))
+    end
+
+    test "a MALFORMED project_id is a clean 404, never a 500", %{conn: conn, keys: keys} do
+      assert conn
+             |> auth(keys.orchestrator)
+             |> post(~p"/api/v1/egress/local-only", %{
+               "project_id" => "not-a-uuid",
+               "acknowledge" => true
+             })
+             |> json_response(404)
+
+      assert conn
+             |> auth(keys.user)
+             |> delete(~p"/api/v1/egress/local-only", %{"project_id" => "not-a-uuid"})
+             |> json_response(404)
+
+      assert conn
+             |> auth(keys.agent)
+             |> post(~p"/api/v1/egress/repin", %{
+               "host" => "ollama.example.com",
+               "project_id" => "not-a-uuid"
+             })
+             |> json_response(404)
+    end
+
+    test "the caller's OWN project is accepted", %{conn: conn, keys: keys, tenant: t} do
+      project = fixture(:project, %{tenant_id: t.id})
+
+      body =
+        conn
+        |> auth(keys.orchestrator)
+        |> post(~p"/api/v1/egress/local-only", %{
+          "project_id" => project.id,
+          "acknowledge" => true
+        })
+        |> json_response(200)
+
+      assert body["scope"] == "project:#{project.id}"
+      assert Egress.effective_local_only?(Scope.new(t.id, project.id))
+    end
+  end
+
   describe "tenant isolation (AC-41.4.11, TC-41.4.13)" do
     test "tenant B cannot see or mutate tenant A's marking", %{conn: conn, keys: keys, tenant: a} do
       {:ok, _} = Egress.enable_local_only(a.id, nil, acknowledge: true)
@@ -284,7 +358,18 @@ defmodule LoopctlWeb.EgressControllerTest do
       {raw_b, _} = fixture(:api_key, %{tenant_id: other.id, role: :user})
 
       body = conn |> auth(raw_b) |> get(~p"/api/v1/egress/posture") |> json_response(200)
-      assert body["scopes"] == []
+      # AC-41.4.8: the TENANT-scope entry is ALWAYS present so an agent doing
+      # verify-before-harvest can tell "not marked" from "field not populated" —
+      # explicitly `local_only: false` for a tenant that never enabled it.
+      assert body["scopes"] == [
+               %{
+                 "scope" => "tenant",
+                 "project_id" => nil,
+                 "local_only" => false,
+                 "encrypt_body" => false
+               }
+             ]
+
       assert body["tenant_id"] == other.id
 
       # B clearing "the" marking only ever touches its OWN tenant row.

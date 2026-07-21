@@ -23,10 +23,11 @@ defmodule Loopctl.Egress.TrustedEndpoint do
        `fdaa::/16` can never be declared — literally or via a public hostname
        that resolves there. Private/link-local/CGNAT/6PN carve-outs are available
        ONLY through the operator-controlled deployment allowlist.
-    2. **Purpose-scoped.** Each declaration names its purposes (`inference`
-       and/or `webhook`). A host declared for an Ollama box does NOT authorize
-       webhook POSTs of tenant content to it — one list must never become an
-       ambient capability across subsystems.
+    2. **Purpose-scoped.** Each declaration names its purposes (`inference`,
+       `webhook` and/or `ingest`). A host declared for an Ollama box does NOT
+       authorize webhook POSTs of tenant content to it, nor loopctl FETCHING
+       tenant-supplied URLs from it (`ingest`, the content-ingestion path) — one
+       list must never become an ambient capability across subsystems.
     3. **Vendor hosts excluded.** `api.openai.com` / `api.anthropic.com` are
        never local and may never be declared. This two-name check is a GUARDRAIL
        against the obvious mistake, NOT an integrity control (trivially defeated
@@ -42,7 +43,7 @@ defmodule Loopctl.Egress.TrustedEndpoint do
 
   @type t :: %__MODULE__{}
 
-  @purposes ~w(inference webhook)
+  @purposes ~w(inference webhook ingest)
   @vendor_hosts ~w(api.openai.com api.anthropic.com)
 
   schema "egress_trusted_endpoints" do

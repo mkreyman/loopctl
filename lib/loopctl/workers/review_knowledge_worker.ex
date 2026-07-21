@@ -39,6 +39,9 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Audit
+  alias Loopctl.Egress
+
+  import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Knowledge.Article
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -133,11 +136,13 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
     classify_result(result)
   end
 
-  defp classify_result({:error, egress}) when egress in [:egress_blocked, :pin_stale] do
-    # US-41.4 (AC-41.4.3): a fail-CLOSED egress refusal is PERMANENT — cancel, never
-    # retry. Retrying would burn max_attempts against a configuration that cannot
-    # change on its own, and no data was sent in the first place.
-    {:cancel, egress}
+  defp classify_result({:error, refusal})
+       when is_egress_refusal(refusal) do
+    # US-41.4 (AC-41.4.3): `Loopctl.Egress.oban_result/1` is the ONE mapping —
+    # `:egress_blocked` CANCELS (permanent; no data was sent), `:pin_stale` /
+    # `:egress_unavailable` SNOOZE (recoverable). The cancel reason NAMES the scope
+    # and the offending endpoint (AC-41.4.6).
+    Egress.oban_result(refusal)
   end
 
   defp classify_result({:error, :rate_limited_local}) do

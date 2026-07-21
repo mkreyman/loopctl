@@ -21,12 +21,31 @@ That wording is deliberate and narrow. Three things it does **not** claim:
 3. **The separate `mcp-server/` codebase is not scanned.** It is a different
    process on the agent's machine.
 
+## Tenant isolation: explicit scoping on `AdminRepo`, not RLS
+
+The whole `Loopctl.Egress` context reads and writes through `Loopctl.AdminRepo`
+(BYPASSRLS). The RLS policies the migration installs on the three tables are
+DEFENCE IN DEPTH for any future `Loopctl.Repo`-routed access; they are not the
+runtime enforcement mechanism here, and the isolation tests are labelled
+"tenant isolation" rather than "RLS" accordingly.
+
+That is deliberate: `effective_local_only?/1` is on the egress HOT PATH and is
+called from Oban workers and background tasks that own no
+`Loopctl.Repo.with_tenant/2` transaction, so routing it through RLS would mean
+opening a tenant-scoped transaction per provider call. The invariant that replaces
+the policy is mechanical and local — every function takes `tenant_id` (or a
+`Scope`) first and filters on it, and `tenant_id` is never cast from user input.
+`project_id`, which DOES arrive in a request body, is resolved against the
+caller's tenant via `Projects.get_project/2` before any write (foreign,
+nonexistent and malformed all return the same 404 — no cross-tenant oracle).
+
 ## The pieces
 
 | Module | Role |
 |---|---|
 | `Loopctl.Egress.Policy` | The ONE egress policy. Composes the SSRF denylist with the locality decision. A second, divergent URL policy anywhere in `lib/` is a review failure. |
-| `Loopctl.Provider` | The SINGLE MANDATORY CHOKEPOINT. Every model-provider call routes through `post/3`. |
+| `Loopctl.Provider` | The SINGLE MANDATORY CHOKEPOINT. Every model-provider call routes through `post/3`; the content-ingestion FETCH through `get/3` (purpose `:ingest`). |
+| `Loopctl.Egress.BlockedBuffer` | ETS debounce for the blocked-decision WRITE — bounds write volume, not just row count. |
 | `Loopctl.Egress.ChokepointScan` | Static AST scan; wired into `mix credo --strict` via `.credo/checks/direct_outbound_http.ex`. |
 | `Loopctl.Egress.PinCache` | Named, supervised owner of the resolved+classified pins. Jittered pre-expiry refresh. |
 | `Loopctl.Egress.Allowlist` | The OPERATOR deployment allowlist. Read-only at every role. |
@@ -51,7 +70,8 @@ triggered) a `local_only` scope on a non-local endpoint is still BLOCKED.
 `secrets/fly_adapter.ex`. A guarantee enforced by per-call-site convention
 regresses the first time someone adds a `Req` call. So:
 
-- every model-provider call goes through `Loopctl.Provider.post/3`;
+- every model-provider call goes through `Loopctl.Provider.post/3`, and the
+  content-ingestion FETCH through `Loopctl.Provider.get/3` (purpose `:ingest`);
 - the static check fails CI on any direct outbound HTTP in the scanned paths
   outside an explicit, JUSTIFIED module allowlist;
 - detected entry points: `Req.post/request/get/put/patch/delete/new`,
@@ -163,15 +183,24 @@ narrows only the MARKING.
 
 | return | meaning |
 |---|---|
-| `{:ok, :unpinned}` | scope is not `local_only` — proceed exactly as before |
-| `{:ok, pinned}` | allowed; connect via `UrlGuard.pinned_request_opts/2` |
-| `{:error, :egress_blocked}` | PERMANENT configuration refusal, before any request |
-| `{:error, :pin_stale}` | the pinned address set changed — re-pin, no `:user` write |
+| `{:ok, pinned}` | allowed; connect via `UrlGuard.pinned_request_opts/2`. Non-`local_only` scopes are pinned PER REQUEST too — default-off is about the REFUSAL, not the pin |
+| `{:ok, :unpinned}` | not `local_only` AND the per-request pin could not be taken. Proceeds exactly as before: a default scope never acquires a NEW failure mode |
+| `{:error, {:egress_blocked, details}}` | PERMANENT configuration refusal, before any request |
+| `{:error, {:pin_stale, details}}` | the pinned address set changed — re-pin, no `:user` write. TRANSIENT |
+| `{:error, {:egress_unavailable, details}}` | the `local_only` MARKING itself could not be read (DB/pool hiccup). Fail-closed for this call, TRANSIENT |
 
-- **Oban**: `:egress_blocked` (and `:pin_stale`) map to `{:cancel, reason}` in
-  every worker that can receive them — never `{:error, _}` (Oban retries it,
+Every refusal carries its `details` (`host`, `scope`, `verdict`, `remediation`),
+so the reason recorded on a cancelled Oban job NAMES the scope and the offending
+endpoint (AC-41.4.6) instead of a bare atom an operator cannot act on.
+
+- **Oban**: `Loopctl.Egress.oban_result/1` is the ONE mapping.
+  `:egress_blocked` → `{:cancel, reason}` — never `{:error, _}` (Oban retries it,
   burning `max_attempts` per item and repopulating the queue on every subsequent
-  write) and never `{:snooze, _}`.
+  write) and never `{:snooze, _}` (an indefinite re-check loop against a config
+  that will not change on its own). `:pin_stale` and `:egress_unavailable` →
+  `{:snooze, _}`: an IP change or a pool blip is RECOVERABLE, the supervised
+  refresher re-pins on its own, and nothing re-enqueues a cancelled job — so
+  cancelling would silently strand the article/memory un-embedded.
 - **Circuit breaker**: `Knowledge.breaker_countable?/1` returns `false` for both.
   A permanent local configuration refusal must never open the per-tenant breaker
   nor feed the fleet-wide `[:loopctl, :llm, :provider_error]` storm signal. The
@@ -184,9 +213,14 @@ narrows only the MARKING.
   200, never a 500 — with `meta.fallback_reason`, `meta.offending_endpoint`,
   `meta.degraded` and the reserved `meta.excluded_tiers` (present, empty here;
   populated by US-41.6).
-- **Audit write amplification is bounded**: blocked decisions are deduplicated
-  per `(scope, endpoint, reason, 60s window)` with an `occurrence_count`. The
-  exact per-call rate lives in telemetry, not in rows.
+- **Audit write amplification is bounded — ROWS *and* WRITES**: blocked decisions
+  are deduplicated per `(scope, endpoint, reason, 60s window)` with an
+  `occurrence_count`, AND the write itself is debounced in ETS by
+  `Loopctl.Egress.BlockedBuffer` (one upsert per tuple per flush interval carrying
+  the accumulated delta). Bounding rows alone would still serialize thousands of
+  row-lock round-trips a minute on the 3-connection BYPASSRLS pool — the same pool
+  the guard's own marking lookup needs. The exact per-call rate lives in telemetry,
+  not in rows.
 
 ## Hot path
 
@@ -195,9 +229,15 @@ is resolved and classified into a PINNED IP set cached under
 `(tenant_id, scope, host)` — never host alone, or tenant A's declaration would
 make a host read as local for tenant B.
 
-Invalidation is explicit and immediate on any mutation of the tenant's
-declarations, markings or endpoint settings — a revoked declaration does not keep
-working for the rest of the TTL.
+Invalidation is explicit, immediate and CLUSTER-WIDE on any mutation of the
+tenant's declarations, markings or endpoint settings — a revoked declaration does
+not keep working for the rest of the TTL, on ANY node. The ETS table is
+`:named_table` (node-local) and Erlang does not share ETS, so `invalidate_tenant/1`
+also broadcasts over `Phoenix.PubSub` (the pattern `Llm.SettingsCache` and
+`Auth.ApiKeyCache` already use): peers bust within a hop, and the bounded TTL is
+only the netsplit backstop. Without the broadcast, ENABLING `local_only` on one
+node would leave peers answering `local_only: false` for up to ten minutes — a
+privacy control with a ten-minute activation hole.
 
 `Loopctl.Egress.PinCache` is a NAMED SUPERVISED process with jittered pre-expiry
 refresh and a distinct `:revalidating` state. Without it, TTL expiry would be a
@@ -205,7 +245,14 @@ scheduled fleet-wide self-inflicted outage: every `local_only` tenant hard-refus
 at once. A privacy control whose steady state is an outage gets disabled in
 production, which is how the guarantee actually dies.
 
+Only PURPOSE-INDEPENDENT facts are cached (`base_verdict`, `ips`,
+`from_allowlist`, the host's declared `purposes`); the verdict is derived per read
+by `Policy.resolve_verdict/2`. Caching a purpose-derived verdict would let the
+FIRST purpose to touch a host fix its verdict for the whole TTL.
+
 Fail-closed is SCOPED: a stale or missing entry refuses only for `local_only`
 scopes. A scope that is not `local_only` re-resolves normally and pins per
 request, preserving the default-off promise for every existing tenant on vendor
-endpoints.
+endpoints. The `local_only` MARKING is resolved OUTSIDE the fail-closed classifier
+rescue, with its own failure handling — otherwise a pool hiccup would raise inside
+the rescue and PERMANENTLY cancel jobs for tenants that never opted in.

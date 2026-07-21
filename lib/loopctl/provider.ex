@@ -37,41 +37,80 @@ defmodule Loopctl.Provider do
 
   @type ctx :: %{
           required(:scope) => Scope.t(),
-          optional(:purpose) => Policy.purpose()
+          optional(:purpose) => Policy.purpose(),
+          optional(:pinned_by_caller) => boolean()
         }
 
   @doc """
   POSTs to `url` for `ctx.scope`, refusing BEFORE the request is built when the
   scope is `local_only` and the resolved endpoint is not classified local.
 
-  Returns `Req`'s own `{:ok, response} | {:error, exception}` when allowed, or:
+  Returns `Req`'s own `{:ok, response} | {:error, exception}` when allowed, or one
+  of the three refusal terms below. Each carries the DETAILS map (`host`, `scope`,
+  `verdict`, `remediation`) so the failure that reaches an Oban `cancelled_at` /
+  `errors` record NAMES the scope and the offending endpoint (AC-41.4.6) instead
+  of a bare atom an operator cannot act on:
 
-    * `{:error, :egress_blocked}` — a PERMANENT configuration refusal. No data
-      was sent. Oban workers map this to `{:cancel, :egress_blocked}` — never
+    * `{:error, {:egress_blocked, details}}` — a PERMANENT configuration refusal.
+      No data was sent. Oban workers map this to `{:cancel, _}` — never
       `{:error, _}` (which Oban retries) and never `{:snooze, _}`.
-    * `{:error, :pin_stale}` — the pinned address set changed; remediation is a
-      re-pin, which needs no role `:user` write. DISTINCT from `:egress_blocked`
-      and never conflated with it.
+    * `{:error, {:pin_stale, details}}` — the pinned address set changed;
+      remediation is a re-pin, which needs no role `:user` write. DISTINCT from
+      `:egress_blocked`, never conflated with it, and TRANSIENT: workers SNOOZE
+      it (the supervised refresher re-pins on its own, and cancelling would
+      permanently drop every in-flight job over a DHCP lease change).
+    * `{:error, {:egress_unavailable, details}}` — the `local_only` marking could
+      not be read (infrastructure hiccup). Fail-closed for this call, TRANSIENT,
+      snoozed by workers.
   """
   @spec post(String.t(), keyword(), ctx()) :: {:ok, term()} | {:error, term()}
-  def post(url, req_opts, %{scope: %Scope{} = scope} = ctx) do
+  def post(url, req_opts, ctx), do: request(:post, url, req_opts, ctx)
+
+  @doc """
+  GETs `url` for `ctx.scope` under the same guard as `post/3`.
+
+  Used by the content-ingestion FETCH path (AC-41.4.9: ingestion consults the ONE
+  policy module too), whose purpose is `:ingest` — a tenant declaration for
+  `inference` does NOT authorize loopctl to fetch tenant-supplied URLs, and vice
+  versa.
+
+  That caller has ALREADY applied `UrlGuard.pin/1` + `pinned_request_opts/1` (its
+  own SSRF gate, GHSA-j7m9-ffmr-pwhm, which must refuse a private-range URL for
+  EVERY tenant, marked or not), so it passes `pinned_by_caller: true` and this
+  wrapper leaves the connection options alone. Re-pinning them here would rewrite
+  `:url` and PREPEND a SECOND `Host` header onto opts that already carry one.
+  """
+  @spec get(String.t(), keyword(), ctx()) :: {:ok, term()} | {:error, term()}
+  def get(url, req_opts, ctx), do: request(:get, url, req_opts, ctx)
+
+  defp request(method, url, req_opts, %{scope: %Scope{} = scope} = ctx) do
     purpose = Map.get(ctx, :purpose, :inference)
+    caller_pinned? = Map.get(ctx, :pinned_by_caller, false)
 
     case Policy.check(scope, url, purpose) do
+      # `put_new`, never `put`: a caller that already pinned has `:url` rewritten
+      # to its validated IP, and overwriting it with the original hostname would
+      # silently DROP that SSRF pin and reopen the DNS-rebinding window.
       {:ok, :unpinned} ->
-        Req.post(url, req_opts)
+        req(method, Keyword.put_new(req_opts, :url, url))
+
+      {:ok, _pinned} when caller_pinned? ->
+        req(method, req_opts)
 
       {:ok, pinned} ->
-        Req.post(pinned_opts(pinned, req_opts))
+        req(method, pinned_opts(pinned, req_opts))
 
       {:error, :egress_blocked, details} ->
         Egress.record_blocked(scope, details)
-        {:error, :egress_blocked}
+        {:error, {:egress_blocked, details}}
 
-      {:error, :pin_stale, _details} ->
-        {:error, :pin_stale}
+      {:error, transient, details} when transient in [:pin_stale, :egress_unavailable] ->
+        {:error, {transient, details}}
     end
   end
+
+  defp req(:post, opts), do: Req.post(opts)
+  defp req(:get, opts), do: Req.get(opts)
 
   # Connect to exactly the IP the guard vetted (closing the resolve-then-connect
   # TOCTOU) while preserving the original host for Host/SNI/cert verification, and

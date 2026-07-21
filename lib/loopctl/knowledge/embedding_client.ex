@@ -200,10 +200,18 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
     base + per_item * max(count, 1)
   end
 
-  defp embeddings_url do
-    base_url = provider_config()[:base_url] || @default_base_url
-    "#{base_url}/embeddings"
-  end
+  @doc """
+  The embedding provider BASE URL this client actually posts to.
+
+  The SINGLE source of truth for the embedding endpoint: `Loopctl.Egress`
+  (posture + the local_only enable pre-flight) reads it from HERE rather than
+  re-deriving it, so the endpoint that is vetted is always the endpoint the guard
+  sees. A second, divergent URL resolution is an AC-41.4.9 review failure.
+  """
+  @spec base_url() :: String.t()
+  def base_url, do: provider_config()[:base_url] || @default_base_url
+
+  defp embeddings_url, do: "#{base_url()}/embeddings"
 
   # Builds the map index -> embedding from the (order-unguaranteed) `data` array,
   # then pulls one vector per input position 0..count-1. Any missing index halts
@@ -247,8 +255,9 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
   # through so `Knowledge.breaker_countable?/1` can exempt it from the circuit
   # breaker and the provider-error storm signal; wrapping it in
   # `{:request_failed, _}` would count it as a transport outage.
-  defp handle_error({:error, :egress_blocked}), do: {:error, :egress_blocked}
-  defp handle_error({:error, :pin_stale}), do: {:error, :pin_stale}
+  defp handle_error({:error, {egress, _details} = refusal})
+       when egress in [:egress_blocked, :pin_stale, :egress_unavailable],
+       do: {:error, refusal}
 
   # Shared non-200 / transport handling for BOTH the single and batch paths.
   defp handle_error({:ok, %{status: status, body: body} = resp}) do

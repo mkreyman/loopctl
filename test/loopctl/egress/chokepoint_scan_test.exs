@@ -35,7 +35,16 @@ defmodule Loopctl.Egress.ChokepointScanTest do
           "Mint.HTTP.connect",
           ":httpc.request",
           ":gen_tcp.connect",
-          ":ssl.connect"
+          ":ssl.connect",
+          # BANG variants — Req's idiomatic default, and the most likely way a
+          # future contributor adds a direct outbound call.
+          "Req.post!",
+          "Req.request!",
+          "Req.get!",
+          "Req.put!",
+          "Req.patch!",
+          "Req.delete!",
+          "Finch.request!"
         ] do
       test "flags #{call}", %{violations: violations} do
         assert Enum.any?(violations, &(&1.call == unquote(call))),

@@ -30,6 +30,7 @@ defmodule LoopctlWeb.EgressController do
   alias Loopctl.Egress.Policy
   alias Loopctl.Egress.Scope
   alias Loopctl.Egress.TrustedEndpoint
+  alias Loopctl.Projects
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -94,7 +95,7 @@ defmodule LoopctlWeb.EgressController do
     summary: "Declare a tenant-trusted endpoint",
     description:
       "Role :user ONLY. PUBLIC addresses only (enforced at write time AND again at pin " <>
-        "time), purpose-scoped (inference and/or webhook), vendor hosts excluded. A " <>
+        "time), purpose-scoped (inference, webhook and/or ingest), vendor hosts excluded. A " <>
         "declaration carves NOTHING out of the SSRF denylist — only the operator " <>
         "deployment allowlist can do that, and it has no route at any role.",
     request_body: {"Trusted endpoint declaration", @json, @free_object},
@@ -168,7 +169,13 @@ defmodule LoopctlWeb.EgressController do
 
     opts = Keyword.put(actor_opts(conn), :acknowledge, params["acknowledge"] == true)
 
-    case Egress.enable_local_only(key.tenant_id, params["project_id"], opts) do
+    with {:ok, project_id} <- tenant_project_id(key.tenant_id, params["project_id"]) do
+      do_enable_local_only(conn, key, project_id, params, opts)
+    end
+  end
+
+  defp do_enable_local_only(conn, key, project_id, params, opts) do
+    case Egress.enable_local_only(key.tenant_id, project_id, opts) do
       {:ok, %{blocked_endpoints: blocked}} ->
         json(conn, %{
           local_only: true,
@@ -205,9 +212,10 @@ defmodule LoopctlWeb.EgressController do
   def clear_local_only(conn, params) do
     key = conn.assigns.current_api_key
 
-    with {:ok, :cleared} <-
-           Egress.clear_local_only(key.tenant_id, params["project_id"], actor_opts(conn)) do
-      json(conn, %{local_only: false, scope: scope_label(params["project_id"])})
+    with {:ok, project_id} <- tenant_project_id(key.tenant_id, params["project_id"]),
+         {:ok, :cleared} <-
+           Egress.clear_local_only(key.tenant_id, project_id, actor_opts(conn)) do
+      json(conn, %{local_only: false, scope: scope_label(project_id)})
     end
   end
 
@@ -261,8 +269,13 @@ defmodule LoopctlWeb.EgressController do
   """
   def repin(conn, %{"host" => host} = params) do
     key = conn.assigns.current_api_key
-    scope = Scope.new(key.tenant_id, params["project_id"])
 
+    with {:ok, project_id} <- tenant_project_id(key.tenant_id, params["project_id"]) do
+      do_repin(conn, Scope.new(key.tenant_id, project_id), host)
+    end
+  end
+
+  defp do_repin(conn, scope, host) do
     case Policy.repin(scope, String.downcase(host), :inference) do
       {:ok, classification} ->
         json(conn, %{
@@ -277,6 +290,35 @@ defmodule LoopctlWeb.EgressController do
         |> json(%{error: "repin_failed", message: inspect(reason)})
     end
   end
+
+  # `project_id` arrives in the REQUEST BODY, so it must be resolved against the
+  # CALLER's tenant before it is written or scoped on. Without this:
+  #
+  #   * tenant A could persist a marking row whose `project_id` FK points at tenant
+  #     B's project (the migration's FK has no tenant component), leaving
+  #     cross-tenant referential state in a table US-41.7's custody claim later
+  #     serializes;
+  #   * a valid FOREIGN project UUID would 200 while a nonexistent one 422'd on the
+  #     FK — a cross-tenant existence oracle, in a codebase whose router guarantees
+  #     byte-identical responses elsewhere for exactly this reason;
+  #   * a non-UUID would raise `Ecto.Query.CastError` deep in `get_marking/2` and
+  #     surface as a 500 rather than a 422.
+  #
+  # Foreign, nonexistent and malformed all return the SAME 404, so the response
+  # discloses nothing about another tenant's projects.
+  defp tenant_project_id(_tenant_id, nil), do: {:ok, nil}
+  defp tenant_project_id(_tenant_id, ""), do: {:ok, nil}
+
+  defp tenant_project_id(tenant_id, project_id) when is_binary(project_id) do
+    # `Projects.get_project/2` is the shared chokepoint: it guards the UUID cast
+    # (malformed → `:not_found`, never a 500) AND scopes by tenant_id, so a foreign
+    # project is indistinguishable from a nonexistent one — a 404 either way.
+    with {:ok, project} <- Projects.get_project(tenant_id, project_id) do
+      {:ok, project.id}
+    end
+  end
+
+  defp tenant_project_id(_tenant_id, _other), do: {:error, :not_found}
 
   defp endpoint_view(%TrustedEndpoint{} = endpoint) do
     %{

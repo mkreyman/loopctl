@@ -62,6 +62,9 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
 
   require Logger
 
+  alias Loopctl.Egress
+
+  import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -212,15 +215,14 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   defp handle_batch_error(tenant_id, to_embed, :no_api_key),
     do: skip_no_embedding_key(tenant_id, to_embed)
 
-  # US-41.4 (AC-41.4.3): a fail-CLOSED egress refusal is a PERMANENT configuration
-  # state, not a transient failure. CANCEL — never {:error, _} (Oban retries it,
-  # burning max_attempts with backoff on every item and repopulating the queue on
-  # every subsequent write) and never {:snooze, _} (an indefinite re-check loop
-  # against a config that will not change on its own). No data was sent. Mirrors
-  # the terminal treatment US-41.5 requires for blocked webhook deliveries.
-  defp handle_batch_error(_tenant_id, _to_embed, egress)
-       when egress in [:egress_blocked, :pin_stale],
-       do: {:cancel, egress}
+  # US-41.4 (AC-41.4.3): the ONE mapping from an egress refusal to an Oban outcome
+  # lives in `Loopctl.Egress.oban_result/1`: `:egress_blocked` CANCELS (a permanent
+  # configuration state; no data was sent), `:pin_stale` / `:egress_unavailable`
+  # SNOOZE (recoverable — cancelling would silently strand the batch). The cancel
+  # reason NAMES the scope and the offending endpoint (AC-41.4.6).
+  defp handle_batch_error(_tenant_id, _to_embed, refusal)
+       when is_egress_refusal(refusal),
+       do: Egress.oban_result(refusal)
 
   # US-37.1 (AC-37.1.4): node-local admission backpressure is loss-free — snooze
   # the slot (no attempt consumed) so the batch retries once demand subsides.

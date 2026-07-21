@@ -19,11 +19,30 @@ defmodule Loopctl.Egress.PinCache do
   tenant A's declaration make a host read as local for tenant B. The scope
   component is `Loopctl.Egress.Scope.key/1`.
 
-  ## Invalidation is explicit and immediate
+  ## Only purpose-INDEPENDENT facts are cached
+
+  An entry stores `base_verdict` (`:network_local | :denylisted | :public`), the
+  resolved `ips`, `from_allowlist`, and the host's DECLARED `purposes`. The final
+  verdict is derived per read by `Loopctl.Egress.Policy.resolve_verdict/2`.
+  Caching a purpose-derived verdict would let the first purpose to touch a host
+  fix its verdict for the whole TTL (AC-41.4.5 constraint 2).
+
+  ## Invalidation is explicit, immediate AND CLUSTER-WIDE
 
   `invalidate_tenant/1` is called on ANY mutation of the tenant's declared
   endpoints, its scope markings, or its endpoint settings — a revoked declaration
   must not keep working for the remainder of the TTL.
+
+  The table is `:named_table`, i.e. node-LOCAL, and Erlang clustering does not
+  share ETS — loopctl clusters (DNSCluster is wired in the supervision tree). A
+  node-local-only invalidation would therefore leave PEER nodes honouring a
+  revoked declaration, and — because the scope's `local_only` MARKING is cached
+  here too — would leave a peer answering `local_only: false` for up to the full
+  TTL after an ENABLE: a privacy control with a ten-minute activation hole, while
+  the posture report attests the tightened posture. So `invalidate_tenant/1` also
+  broadcasts over `Phoenix.PubSub` (mirroring `Loopctl.Llm.SettingsCache` and
+  `Loopctl.Auth.ApiKeyCache`): peers bust within a hop, and the bounded TTL is
+  only the netsplit backstop.
 
   ## `:pin_stale` is distinct from `:egress_blocked`
 
@@ -44,6 +63,8 @@ defmodule Loopctl.Egress.PinCache do
   alias Loopctl.Egress.Policy
 
   @table :loopctl_egress_pins
+  @pubsub Loopctl.PubSub
+  @invalidate_topic "egress:pin_cache:invalidate"
 
   # Hard expiry. An entry past this is discarded and re-classified lazily.
   @ttl_ms :timer.minutes(10)
@@ -66,7 +87,7 @@ defmodule Loopctl.Egress.PinCache do
           tenant_id: Ecto.UUID.t(),
           scope_key: String.t(),
           host: key_host(),
-          verdict: :network_local | :tenant_declared | :denylisted | :non_local,
+          base_verdict: :network_local | :denylisted | :public,
           from_allowlist: boolean(),
           ips: [:inet.ip_address()],
           purposes: [String.t()],
@@ -156,15 +177,35 @@ defmodule Loopctl.Egress.PinCache do
   end
 
   @doc """
-  Drops EVERY entry for a tenant. Called immediately on any mutation of the
-  tenant's declarations, markings or endpoint settings (AC-41.4.12).
+  Drops EVERY entry for a tenant on THIS node AND on every peer node.
+
+  Called immediately on any mutation of the tenant's declarations, markings or
+  endpoint settings (AC-41.4.12). The PubSub fan-out is what makes an ENABLE take
+  effect cluster-wide within a hop instead of within the TTL — see the moduledoc.
   """
   @spec invalidate_tenant(Ecto.UUID.t()) :: :ok
   def invalidate_tenant(tenant_id) when is_binary(tenant_id) do
+    invalidate_local(tenant_id)
+    # Broadcast off the (rare) mutation path via the owner so THIS node's
+    # subscriber is excluded from the fan-out (no self-echo). `GenServer.cast` is
+    # safe if the owner is momentarily down mid-restart — the local drop already ran.
+    _ = safe_cast({:broadcast_invalidate, tenant_id})
+    :ok
+  end
+
+  @doc "Drops every entry for a tenant on THIS node only (peer-broadcast handler / tests)."
+  @spec invalidate_local(Ecto.UUID.t()) :: :ok
+  def invalidate_local(tenant_id) when is_binary(tenant_id) do
     :ets.match_delete(@table, {{tenant_id, :_, :_}, :_})
     :ok
   rescue
     ArgumentError -> :ok
+  end
+
+  defp safe_cast(message) do
+    GenServer.cast(__MODULE__, message)
+  catch
+    :exit, _reason -> :ok
   end
 
   @doc "All cached entries (diagnostics / the refresher / posture)."
@@ -228,11 +269,28 @@ defmodule Loopctl.Egress.PinCache do
           existing
       end
 
+    # Subscribe so a PEER node's invalidation broadcast busts THIS node's entries.
+    # `Phoenix.PubSub` starts strictly before this owner in the supervision tree.
+    Phoenix.PubSub.subscribe(@pubsub, @invalidate_topic)
     schedule_tick()
     {:ok, %{table: table}}
   end
 
   @impl true
+  def handle_cast({:broadcast_invalidate, tenant_id}, state) do
+    _ =
+      Phoenix.PubSub.broadcast_from(@pubsub, self(), @invalidate_topic, {:invalidate, tenant_id})
+
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:invalidate, tenant_id}, state) when is_binary(tenant_id) do
+    # A peer node changed this tenant's markings/declarations; bust our entries.
+    invalidate_local(tenant_id)
+    {:noreply, state}
+  end
+
   def handle_info(:tick, state) do
     refresh_due()
     schedule_tick()
@@ -252,9 +310,20 @@ defmodule Loopctl.Egress.PinCache do
     all()
     # `is_binary(host)` skips the marking entries the policy caches under an atom
     # key in the same table — they carry no pin to revalidate.
-    |> Enum.filter(&(is_binary(&1.host) and now >= &1.refresh_at and not &1.pin_stale))
+    #
+    # `:denylisted` entries are skipped too: a private-range host can NEVER
+    # revalidate (`Policy.reresolve/1` returns `{:error, :blocked_ip}`), so
+    # refreshing one would only flip it to `pin_stale` — masking a permanent
+    # refusal behind a transient, un-actionable "re-pin it" and silently stopping
+    # the AC-41.4.6 blocked telemetry/audit trail for a still-blocked tenant.
+    |> Enum.filter(&refreshable?(&1, now))
     |> Enum.map(&revalidate/1)
     |> Enum.count()
+  end
+
+  defp refreshable?(entry, now) do
+    is_binary(entry.host) and now >= entry.refresh_at and not entry.pin_stale and
+      Map.get(entry, :base_verdict) != :denylisted
   end
 
   defp revalidate(entry) do

@@ -24,7 +24,7 @@ defmodule LoopctlWeb.WellKnownController do
                     "0.0.0"
                 end)
 
-  @discovery_body %{
+  @discovery_base %{
     spec_version: "2",
     mcp_server: %{
       name: "loopctl-mcp-server",
@@ -46,12 +46,6 @@ defmodule LoopctlWeb.WellKnownController do
     # instance's constraints BEFORE authenticating. Strictly instance-wide: no
     # tenant-specific data appears here, and no tenant can influence it.
     capabilities: %{
-      # The FIXED set of embedding dimensions this instance supports (US-41.1
-      # AC-41.1.3). A tenant-supplied endpoint whose model emits a different
-      # dimension cannot be stored.
-      supported_embedding_dimensions: [1536],
-      # Whether a tenant may point loopctl at their OWN inference endpoint at all.
-      tenant_supplied_endpoints_permitted: true,
       # The privacy/storage tiers this instance implements today.
       tiers: ["standard", "local_only"],
       # The egress guarantee, narrowed to exactly what the static chokepoint check
@@ -64,29 +58,73 @@ defmodule LoopctlWeb.WellKnownController do
     }
   }
 
-  @discovery_json Jason.encode!(@discovery_body)
-  @etag "W/\"#{:crypto.hash(:sha256, @discovery_json) |> Base.encode16(case: :lower) |> String.slice(0, 16)}\""
+  @doc """
+  The discovery document, built at RUNTIME.
+
+  Two capability fields are DEPLOYMENT-DEPENDENT and must therefore be derived
+  from the same runtime config the application itself validates against — a
+  compile-time literal would publish a constraint the running instance does not
+  actually enforce, to UNAUTHENTICATED agents, with no way for the runtime value
+  to reach the document:
+
+    * `supported_embedding_dimensions` — read from `:embedding_dimensions`, the
+      key `Loopctl.Memory.Memory`'s validator reads (US-41.1 AC-41.1.3).
+    * `tenant_supplied_endpoints_permitted` — TRUE only once the endpoint-config
+      surface exists (US-41.2). Declaring a TRUSTED endpoint, which does ship in
+      US-41.4, changes the locality VERDICT for an endpoint — it does not let a
+      tenant point loopctl at their own Ollama box — so it does not make this
+      flag true. AC-41.4.10's whole purpose is that an agent can discover the
+      instance's constraints BEFORE authenticating; advertising a capability the
+      instance cannot honour defeats it.
+  """
+  @spec discovery_body() :: map()
+  def discovery_body do
+    put_in(@discovery_base, [:capabilities], capabilities())
+  end
+
+  defp capabilities do
+    Map.merge(@discovery_base.capabilities, %{
+      supported_embedding_dimensions: [
+        Application.get_env(:loopctl, :embedding_dimensions, 1536)
+      ],
+      tenant_supplied_endpoints_permitted: tenant_supplied_endpoints_permitted?()
+    })
+  end
+
+  # US-41.2 lands the tenant-configurable endpoint surface; until then no tenant
+  # can supply an endpoint on this instance, whatever the deployment config says.
+  defp tenant_supplied_endpoints_permitted?,
+    do: Application.get_env(:loopctl, :tenant_supplied_endpoints_permitted, false)
 
   @doc """
   GET /.well-known/loopctl
 
-  Returns the discovery document. Supports conditional GET via ETag.
+  Returns the discovery document. Supports conditional GET via ETag. The body and
+  its ETag are built per request (the document is a small map) so a
+  deployment-configured embedding dimension is reflected without a recompile.
   """
   def discovery(conn, _params) do
+    json = Jason.encode!(discovery_body())
+    etag = etag_for(json)
     if_none_match = get_req_header(conn, "if-none-match") |> List.first()
 
-    if if_none_match == @etag do
+    if if_none_match == etag do
       conn
       |> put_resp_header("cache-control", "public, max-age=3600")
-      |> put_resp_header("etag", @etag)
+      |> put_resp_header("etag", etag)
       |> send_resp(:not_modified, "")
     else
       conn
       |> put_resp_content_type("application/json")
       |> put_resp_header("cache-control", "public, max-age=3600")
-      |> put_resp_header("etag", @etag)
-      |> send_resp(:ok, @discovery_json)
+      |> put_resp_header("etag", etag)
+      |> send_resp(:ok, json)
     end
+  end
+
+  defp etag_for(json) do
+    hash = :sha256 |> :crypto.hash(json) |> Base.encode16(case: :lower) |> String.slice(0, 16)
+    ~s(W/"#{hash}")
   end
 
   @schema_body Jason.encode!(%{

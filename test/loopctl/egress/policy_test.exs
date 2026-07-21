@@ -30,17 +30,29 @@ defmodule Loopctl.Egress.PolicyTest do
   end
 
   describe "default-off (AC-41.4.12)" do
-    test "an unmarked scope proceeds UNPINNED — behaviour is byte-identical to before",
-         %{scope: scope} do
-      assert {:ok, :unpinned} =
+    # AC-41.4.12 verbatim: "for non-local_only scopes on vendor defaults the policy
+    # re-resolves normally and PINS PER REQUEST at connect time". Default-off is
+    # about the REFUSAL, not about dropping the TOCTOU pin.
+    test "an unmarked scope is ALLOWED and pinned per request", %{scope: scope} do
+      assert {:ok, %{host: "api.openai.com", ip: _ip, uri: %URI{}}} =
                Policy.check(scope, "https://api.openai.com/v1/embeddings", :inference)
     end
 
     test "an unmarked scope needs no probe, no cache entry, no refusal", %{scope: scope} do
-      assert {:ok, :unpinned} =
+      assert {:ok, pinned} =
                Policy.check(scope, "https://api.anthropic.com/v1/messages", :inference)
 
+      assert pinned.host == "api.anthropic.com"
+
+      # The per-request pin is exactly that — per request. It never populates the
+      # classification cache, so an unmarked scope still costs no classification.
       assert PinCache.fetch(scope.tenant_id, Scope.key(scope), "api.anthropic.com") == :miss
+    end
+
+    # The pin is a TOCTOU control, not a locality decision: an unpinnable host must
+    # NOT hand a default (unmarked) scope a brand-new failure mode.
+    test "an unmarked scope whose host cannot be pinned proceeds UNPINNED", %{scope: scope} do
+      assert {:ok, :unpinned} = Policy.check(scope, "https://127.0.0.1/v1/embeddings", :inference)
     end
   end
 
@@ -137,6 +149,27 @@ defmodule Loopctl.Egress.PolicyTest do
       assert details.verdict == :non_local
     end
 
+    # REGRESSION (review): the cache stored a PURPOSE-DERIVED verdict keyed only on
+    # (tenant, scope, host), so the FIRST purpose to touch a host fixed its verdict
+    # for the whole TTL — classify under :webhook first and the legitimately
+    # DECLARED inference endpoint was refused for up to 10 minutes. AC-41.4.5
+    # constraint (2) makes purpose scoping a security invariant, so it must be
+    # re-derived on every read, in EITHER order.
+    test "the verdict is purpose-scoped in BOTH orders — a cached entry never fixes it",
+         %{scope: scope} do
+      # Undeclared purpose FIRST (this is the ordering the old cache got wrong).
+      assert {:error, :egress_blocked, %{verdict: :non_local}} =
+               Policy.check(scope, "https://ollama.example.com/hook", :webhook)
+
+      # ... and the declared purpose is still honoured on the cached entry.
+      assert {:ok, %{ip: {203, 0, 113, 10}}} =
+               Policy.check(scope, "https://ollama.example.com/v1/embeddings", :inference)
+
+      # ... and back again.
+      assert {:error, :egress_blocked, %{verdict: :non_local}} =
+               Policy.check(scope, "https://ollama.example.com/hook", :webhook)
+    end
+
     test "an UNDECLARED public endpoint under the same marking is blocked", %{scope: scope} do
       assert {:error, :egress_blocked, _} =
                Policy.check(scope, "https://other.example.com/v1/embeddings", :inference)
@@ -147,6 +180,86 @@ defmodule Loopctl.Egress.PolicyTest do
       [declared] = posture.declared_endpoints
       assert declared.locality_label == Egress.tenant_declared_label()
       assert declared.locality_label =~ "unverified attestation"
+    end
+  end
+
+  describe "invalidation is CLUSTER-WIDE, not node-local (AC-41.4.12)" do
+    # REGRESSION (review): `invalidate_tenant/1` was a bare node-local
+    # `:ets.match_delete/2`. loopctl CLUSTERS (DNSCluster is wired in the
+    # supervision tree) and Erlang does not share ETS, so a revoked declaration kept
+    # working on peer nodes for the rest of the 10-minute TTL — and, because the
+    # scope's local_only MARKING is cached in the same table, ENABLING local_only on
+    # node A left node B answering `local_only: false` for up to ten minutes: a
+    # privacy control with a ten-minute activation hole, while the posture report
+    # attested the tightened posture. The repo already ships this pattern twice
+    # (`Llm.SettingsCache`, `Auth.ApiKeyCache`).
+    test "an invalidation is broadcast to peer nodes over PubSub", %{tenant: t} do
+      :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, "egress:pin_cache:invalidate")
+
+      # The broadcast is issued BY the cache owner (so the originating node's own
+      # subscriber is excluded), hence the round trip through the GenServer.
+      :ok = PinCache.invalidate_tenant(t.id)
+
+      assert_receive {:invalidate, tenant_id}, 1_000
+      assert tenant_id == t.id
+    end
+
+    test "the owner busts its node-local table when a PEER broadcasts", %{tenant: t, scope: scope} do
+      stub(Loopctl.MockDnsResolver, :resolve, fn _ -> {:ok, [{93, 184, 216, 34}]} end)
+      :ok = mark_local_only(t.id)
+
+      assert {:error, :egress_blocked, _} =
+               Policy.check(scope, "https://api.openai.com/v1/embeddings", :inference)
+
+      assert {:ok, _} = PinCache.fetch(t.id, Scope.key(scope), "api.openai.com")
+
+      # Simulate the message a peer node's broadcast delivers to this node's owner.
+      send(PinCache, {:invalidate, t.id})
+      # Round-trip a call through the owner to be sure the cast/info was processed.
+      _ = :sys.get_state(PinCache)
+
+      assert PinCache.fetch(t.id, Scope.key(scope), "api.openai.com") == :miss
+    end
+  end
+
+  describe "fail-closed is SCOPED, not universal (AC-41.4.12)" do
+    # REGRESSION (review): `check/3` wrapped the WHOLE decision — including the
+    # marking lookup — in the fail-closed rescue, so a DBConnection blip on the
+    # 3-connection AdminRepo pool returned the PERMANENT `:egress_blocked` for a
+    # scope with NO marking at all, and every worker maps that to {:cancel, _}.
+    # Seconds of pool pressure permanently cancelled embedding/extraction work for
+    # DEFAULT tenants. The marking is now resolved OUTSIDE the rescue, and its own
+    # failure is the TRANSIENT `:egress_unavailable`.
+    test "a marking-lookup failure is TRANSIENT :egress_unavailable, never :egress_blocked" do
+      # A scope whose tenant_id is not a UUID makes the marking query raise exactly
+      # the way a pool/connection failure does: inside `marking/1`, before any
+      # classification.
+      scope = %Scope{tenant_id: "not-a-uuid", project_id: nil}
+
+      assert {:error, :egress_unavailable, details} =
+               Policy.check(scope, "https://api.openai.com/v1/embeddings", :inference)
+
+      assert details.verdict == :marking_unavailable
+      assert details.remediation =~ "NOT a privacy refusal"
+    end
+
+    test "the transient refusal SNOOZES an Oban worker instead of cancelling it" do
+      assert {:snooze, seconds} = Egress.oban_result({:egress_unavailable, %{}})
+      assert is_integer(seconds) and seconds > 0
+
+      # ... and `:pin_stale` too: a DHCP lease change must not permanently drop
+      # every in-flight job (nothing re-enqueues a cancelled job after the re-pin).
+      assert {:snooze, _} = Egress.oban_result({:pin_stale, %{}})
+
+      # Only the PERMANENT refusal cancels — and its reason NAMES scope + endpoint.
+      assert {:cancel, reason} =
+               Egress.oban_result(
+                 {:egress_blocked,
+                  %{scope: "tenant:x", host: "api.openai.com", verdict: :non_local}}
+               )
+
+      assert reason =~ "tenant:x"
+      assert reason =~ "api.openai.com"
     end
   end
 
@@ -220,6 +333,36 @@ defmodule Loopctl.Egress.PolicyTest do
       assert pinned.ip == {203, 0, 113, 99}
     end
 
+    # REGRESSION (review): the refresher revalidated DENYLISTED entries too. A
+    # private-range host can never revalidate (`reresolve/1` -> {:error, :blocked_ip}),
+    # so after the first jittered refresh a permanently unreachable endpoint became
+    # `pin_stale` — reported as a TRANSIENT error with a re-pin remediation that can
+    # never help, mislabelled `verdict: :tenant_declared` for a host never declared,
+    # and (because Provider does not record a blocked decision on :pin_stale) the
+    # AC-41.4.6 blocked counter/audit trail SILENTLY STOPPED for a still-blocked
+    # tenant.
+    test "a denylisted entry stays :egress_blocked with its REAL verdict across refreshes",
+         %{tenant: t, scope: scope} do
+      stub(Loopctl.MockDnsResolver, :resolve, fn
+        "private.example.com" -> {:ok, [{10, 0, 0, 5}]}
+        "ollama.example.com" -> {:ok, [{203, 0, 113, 10}]}
+        _ -> {:ok, [{93, 184, 216, 34}]}
+      end)
+
+      assert {:error, :egress_blocked, %{verdict: :denylisted}} =
+               Policy.check(scope, "https://private.example.com/x", :inference)
+
+      # Force a refresh pass over the whole table.
+      :ok = PinCache.mark_due(t.id, Scope.key(scope), "private.example.com")
+      PinCache.refresh_now()
+
+      {:ok, entry} = PinCache.fetch(t.id, Scope.key(scope), "private.example.com")
+      refute entry.pin_stale
+
+      assert {:error, :egress_blocked, %{verdict: :denylisted}} =
+               Policy.check(scope, "https://private.example.com/x", :inference)
+    end
+
     test "the refresher re-pins BEFORE expiry, so TTL rollover is not a fleet-wide refusal",
          %{tenant: t, scope: scope} do
       assert {:ok, _} = Policy.check(scope, "https://ollama.example.com/x", :inference)
@@ -242,7 +385,8 @@ defmodule Loopctl.Egress.PolicyTest do
       on_exit(fn -> PinCache.invalidate_tenant(default.id) end)
       scope = Scope.new(default.id)
 
-      assert {:ok, :unpinned} =
+      # Allowed (never refused), and pinned PER REQUEST — no classification cached.
+      assert {:ok, %{host: "api.openai.com"}} =
                Policy.check(scope, "https://api.openai.com/v1/embeddings", :inference)
 
       assert PinCache.fetch(default.id, Scope.key(scope), "api.openai.com") == :miss

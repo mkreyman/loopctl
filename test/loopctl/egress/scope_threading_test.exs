@@ -25,6 +25,7 @@ defmodule Loopctl.Egress.ScopeThreadingTest do
   alias Loopctl.Llm
   alias Loopctl.Llm.Anthropic
   alias Loopctl.Workers.ArticleEmbeddingWorker
+  alias Loopctl.Workers.ContentIngestionWorker
 
   setup :verify_on_exit!
 
@@ -69,7 +70,7 @@ defmodule Loopctl.Egress.ScopeThreadingTest do
   describe "Knowledge.generate_embedding/3 (AC-41.4.2)" do
     test "a PROJECT-only marking blocks when the caller supplies the project",
          %{tenant: tenant, project: project} do
-      assert {:error, :egress_blocked} =
+      assert {:error, {:egress_blocked, _}} =
                Knowledge.generate_embedding(tenant.id, "hello", project_id: project.id)
 
       refute_received {:http_call, :embedding}
@@ -77,7 +78,7 @@ defmodule Loopctl.Egress.ScopeThreadingTest do
 
     test "an explicit :scope is honoured identically to :project_id",
          %{tenant: tenant, project: project} do
-      assert {:error, :egress_blocked} =
+      assert {:error, {:egress_blocked, _}} =
                Knowledge.generate_embedding(tenant.id, "hello",
                  scope: Scope.new(tenant.id, project.id)
                )
@@ -97,10 +98,15 @@ defmodule Loopctl.Egress.ScopeThreadingTest do
       marked = published_article(tenant.id, %{project_id: project.id})
       unmarked = published_article(tenant.id, %{})
 
-      assert {:cancel, :egress_blocked} =
+      # AC-41.4.6: the cancel reason NAMES the scope and the offending endpoint.
+      assert {:cancel, reason} =
                ArticleEmbeddingWorker.perform(%Oban.Job{
                  args: %{"tenant_id" => tenant.id, "article_id" => marked.id}
                })
+
+      assert reason =~ "egress_blocked"
+      assert reason =~ "project:#{project.id}"
+      assert reason =~ "api.openai.com"
 
       refute_received {:http_call, :embedding}
 
@@ -113,10 +119,46 @@ defmodule Loopctl.Egress.ScopeThreadingTest do
     end
   end
 
+  # AC-41.4.9 verbatim: "There is exactly ONE egress policy module and every
+  # outbound path consults it: the provider guard, the US-41.2 probe, INGESTION,
+  # and (in US-41.5) webhook delivery." Only webhook delivery is deferred by the AC.
+  # The ingestion FETCH previously issued a raw `Req.get/1` that consulted only
+  # `UrlGuard`, so a local_only scope could still make an outbound request to a
+  # tenant-supplied URL.
+  describe "the ingestion FETCH consults the ONE policy module (AC-41.4.9)" do
+    test "a local_only scope refuses a tenant-supplied URL fetch",
+         %{tenant: tenant, project: project} do
+      test_pid = self()
+
+      Req.Test.stub(ContentIngestionWorker, fn conn ->
+        send(test_pid, {:http_call, :ingest_fetch})
+        Req.Test.text(conn, "should never be fetched")
+      end)
+
+      assert {:cancel, reason} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 1,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "project_id" => project.id,
+                   "source_type" => "web_article",
+                   "content_hash" => "hash-#{System.unique_integer([:positive])}",
+                   "url" => "https://untrusted.example.com/post"
+                 }
+               })
+
+      assert reason =~ "egress_blocked"
+      assert reason =~ "untrusted.example.com"
+
+      # Nothing left the boundary.
+      refute_received {:http_call, :ingest_fetch}
+    end
+  end
+
   describe "Anthropic.message/5 accepts the scope as its first argument (AC-41.4.2)" do
     test "a project-scoped chat call is refused before the request is built",
          %{tenant: tenant, project: project} do
-      assert {:error, :egress_blocked} =
+      assert {:error, {:egress_blocked, _}} =
                Anthropic.message(
                  Scope.new(tenant.id, project.id),
                  :extraction,

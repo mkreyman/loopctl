@@ -2,7 +2,7 @@ defmodule Loopctl.Egress do
   @moduledoc """
   Context for the fail-closed no-egress guard (US-41.4).
 
-  Owns three pieces of tenant state — all RLS-protected (AC-41.4.11):
+  Owns three pieces of tenant state (AC-41.4.11):
 
     * `local_only` **scope markings** at tenant and project scope (AC-41.4.1/.2);
     * **tenant-declared trusted endpoints** (AC-41.4.5) — an UNVERIFIED TENANT
@@ -13,6 +13,24 @@ defmodule Loopctl.Egress do
   The operator deployment allowlist is deliberately NOT here: it is
   deployment-scoped, unwritable at every role, and lives outside RLS
   (`Loopctl.Egress.Allowlist`).
+
+  ## Isolation mechanism: EXPLICIT tenant scoping on `AdminRepo`, not RLS
+
+  Every read and write in this context goes through `Loopctl.AdminRepo`
+  (BYPASSRLS), so the RLS policies the migration installs on the three tables are
+  DEFENCE IN DEPTH for any future `Loopctl.Repo`-routed access — they are NOT the
+  runtime enforcement mechanism here. Say so plainly rather than labelling the
+  isolation tests "RLS": what actually isolates tenants in this context is the
+  mandatory `where tenant_id == ^tenant_id` on every query below, and the tests
+  named `tenant isolation` prove exactly that.
+
+  `AdminRepo` is deliberate, not an oversight. `effective_local_only?/1` is on the
+  egress HOT PATH and is called from Oban workers and background tasks that own no
+  `Loopctl.Repo.with_tenant/2` transaction; routing it through RLS would require
+  opening a tenant-scoped transaction per provider call. The invariant that
+  replaces the policy is therefore mechanical and local: EVERY function here takes
+  `tenant_id` (or a `Scope`) as its first argument and filters on it, and
+  `tenant_id` is never cast from user input (see `ScopeMarking` / `TrustedEndpoint`).
 
   ## Asymmetric roles on the marking
 
@@ -45,12 +63,15 @@ defmodule Loopctl.Egress do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Egress.Allowlist
+  alias Loopctl.Egress.BlockedBuffer
   alias Loopctl.Egress.BlockedDecision
   alias Loopctl.Egress.PinCache
   alias Loopctl.Egress.Policy
   alias Loopctl.Egress.Scope
   alias Loopctl.Egress.ScopeMarking
   alias Loopctl.Egress.TrustedEndpoint
+  alias Loopctl.Knowledge.EmbeddingClient
+  alias Loopctl.Llm.Anthropic
 
   @blocked_window_seconds 60
 
@@ -239,18 +260,16 @@ defmodule Loopctl.Egress do
   project-level endpoint override anywhere in loopctl. Today these are the
   hardcoded vendor defaults / the configured embedding provider; US-41.2 makes
   them configurable and this function is the single place that changes.
+
+  Both URLs are read from the CLIENT that resolves them (`EmbeddingClient.base_url/0`
+  and `Anthropic.base_url/0`) — never re-derived here. Re-deriving them would make
+  the posture report and the pre-flight vet a DUPLICATED CONSTANT that agrees with
+  the guard only by coincidence: exactly the "second, divergent URL policy"
+  AC-41.4.9 calls a review failure.
   """
   @spec resolved_endpoints(Scope.t()) :: [{atom(), String.t()}]
   def resolved_endpoints(%Scope{}) do
-    embedding_base =
-      :loopctl
-      |> Application.get_env(:embedding_provider, %{})
-      |> Map.get(:base_url, "https://api.openai.com/v1")
-
-    chat_base =
-      Application.get_env(:loopctl, :anthropic_base_url, "https://api.anthropic.com/v1")
-
-    [{:embedding, embedding_base}, {:chat, chat_base}]
+    [{:embedding, EmbeddingClient.base_url()}, {:chat, Anthropic.base_url()}]
   end
 
   defp endpoint_verdict(scope, url) do
@@ -367,22 +386,173 @@ defmodule Loopctl.Egress do
   end
 
   # ---------------------------------------------------------------------------
+  # Refusal terms — the ONE mapping from an egress refusal to an Oban outcome
+  # ---------------------------------------------------------------------------
+
+  @refusal_tags [:egress_blocked, :pin_stale, :egress_unavailable]
+
+  @doc """
+  True for a refusal term in its tagged `{tag, details}` form.
+
+  A GUARD (not a plain function) so call sites can pattern-match the refusal in a
+  function head — matching a bare 2-tuple without it would also swallow
+  `{:api_error, status}` and friends.
+  """
+  defguard is_egress_refusal(term)
+           when is_tuple(term) and tuple_size(term) == 2 and
+                  elem(term, 0) in [:egress_blocked, :pin_stale, :egress_unavailable]
+
+  @doc """
+  The three refusal tags `Loopctl.Provider` can return, in the tagged form
+  `{tag, details}`. Only `:egress_blocked` is PERMANENT.
+  """
+  @spec refusal_tags() :: [atom()]
+  def refusal_tags, do: @refusal_tags
+
+  @doc """
+  Normalizes any refusal term to `{tag, details}`, or `nil` when it is not a
+  refusal. Accepts the bare atom form for robustness.
+  """
+  @spec refusal(term()) :: {atom(), map()} | nil
+  def refusal({tag, details}) when tag in @refusal_tags and is_map(details), do: {tag, details}
+  def refusal(tag) when tag in @refusal_tags, do: {tag, %{}}
+  def refusal(_other), do: nil
+
+  @doc """
+  An AGENT-READABLE reason naming the scope and the offending endpoint
+  (AC-41.4.6).
+
+  This is what a worker puts in its `{:cancel, reason}` / snooze log, so the Oban
+  `cancelled_at` / `errors` record an operator reads names WHICH endpoint was
+  refused for WHICH scope — a bare `:egress_blocked` atom names neither.
+  """
+  @spec refusal_reason({atom(), map()} | atom()) :: String.t()
+  def refusal_reason(term) do
+    case refusal(term) do
+      nil ->
+        inspect(term)
+
+      {tag, details} ->
+        scope = Map.get(details, :scope, "unknown scope")
+        host = Map.get(details, :host) || "unknown endpoint"
+        verdict = details |> Map.get(:verdict, :unclassifiable) |> to_string()
+
+        "#{tag}: scope=#{scope} endpoint=#{host} verdict=#{verdict}" <>
+          case Map.get(details, :remediation) do
+            nil -> ""
+            remediation -> " remediation=#{remediation}"
+          end
+    end
+  end
+
+  @doc """
+  The ONE mapping from an egress refusal to an Oban worker result (AC-41.4.3).
+
+    * `:egress_blocked` → `{:cancel, reason}`. A PERMANENT configuration state
+      that will not change on its own; retrying burns `max_attempts` and
+      repopulates the queue on every subsequent write, and no data was sent.
+    * `:pin_stale` → `{:snooze, _}`. The tenant's box got a new DHCP lease; the
+      supervised refresher re-pins on its own and recovery needs no role `:user`
+      write. Cancelling here would permanently drop every in-flight
+      embedding/extraction job over an IP change, and nothing re-enqueues a
+      cancelled job after the re-pin — the articles would stay un-embedded
+      SILENTLY. AC-41.4.3 makes only `:egress_blocked` terminal.
+    * `:egress_unavailable` → `{:snooze, _}`. A transient infrastructure failure
+      reading the marking, not a privacy refusal at all.
+  """
+  @spec oban_result({atom(), map()} | atom()) ::
+          {:cancel, String.t()} | {:snooze, pos_integer()}
+  def oban_result(term) do
+    case refusal(term) do
+      {:egress_blocked, _details} = refusal ->
+        {:cancel, refusal_reason(refusal)}
+
+      {tag, _details} = refusal when tag in [:pin_stale, :egress_unavailable] ->
+        Logger.info("Loopctl.Egress: snoozing transient refusal — #{refusal_reason(refusal)}")
+        {:snooze, transient_snooze_seconds()}
+
+      nil ->
+        {:cancel, inspect(term)}
+    end
+  end
+
+  @doc """
+  The bounded `fallback_reason` tags that mean "the semantic path was refused by
+  the EGRESS guard" (AC-41.4.7). Shared by the knowledge and memory halves so the
+  degraded contract cannot drift between them.
+  """
+  @spec egress_fallback_reasons() :: [String.t()]
+  def egress_fallback_reasons, do: ~w(egress_blocked pin_stale egress_unavailable)
+
+  @doc """
+  The endpoint an EGRESS refusal was about, or `nil` for any other reason.
+
+  AC-41.4.7 asks the degraded meta to name "the offending endpoint" — i.e. the
+  endpoint the refusal was ABOUT. For a non-egress reason (`no_embedding_key`,
+  `rate_limited_local`, budget shedding, a semantic-index problem) there is no
+  offending endpoint, and naming one anyway would send an agent chasing an
+  endpoint that had nothing to do with the failure. Callers drop `nil`.
+  """
+  @spec offending_endpoint(Ecto.UUID.t(), String.t() | atom() | nil) :: String.t() | nil
+  def offending_endpoint(tenant_id, reason) do
+    if to_string(reason) in egress_fallback_reasons() do
+      tenant_id
+      |> Scope.new()
+      |> resolved_endpoints()
+      |> Enum.find_value(fn
+        {:embedding, url} -> url
+        _ -> nil
+      end)
+    end
+  end
+
+  @doc """
+  The AC-41.4.7 degraded-response contract fragment: `degraded`, the reserved
+  `excluded_tiers`, and (for an egress refusal only) `offending_endpoint`.
+
+  Shared by `Loopctl.Knowledge` search and `Loopctl.Memory` recall — this story
+  threaded the scope through BOTH paths, so both must name the reason and the
+  offending endpoint the same way.
+  """
+  @spec degraded_contract_meta(Ecto.UUID.t(), String.t() | atom() | nil) :: map()
+  def degraded_contract_meta(tenant_id, fallback_reason) do
+    base = %{degraded: true, excluded_tiers: []}
+
+    case offending_endpoint(tenant_id, fallback_reason) do
+      nil -> base
+      endpoint -> Map.put(base, :offending_endpoint, endpoint)
+    end
+  end
+
+  @doc "Seconds a worker snoozes on a TRANSIENT egress refusal (`:pin_stale`, `:egress_unavailable`)."
+  @spec transient_snooze_seconds() :: pos_integer()
+  def transient_snooze_seconds do
+    Application.get_env(:loopctl, :egress_transient_snooze_seconds, 60)
+  end
+
+  # ---------------------------------------------------------------------------
   # Blocked decisions — aggregated, bounded
   # ---------------------------------------------------------------------------
 
   @doc """
   Records ONE blocked decision.
 
-  Writes are DEDUPLICATED per `(scope, endpoint, reason, window)` — a single
-  upsert bumping `occurrence_count` — so a misconfigured harvest loop produces
-  one row per minute per tuple, not thousands. The exact per-call rate lives in
-  the `[:loopctl, :egress, :blocked]` telemetry counter emitted here.
+  Rows are DEDUPLICATED per `(scope, endpoint, reason, window)` — a single upsert
+  bumping `occurrence_count` — AND the WRITE itself is buffered in ETS by
+  `Loopctl.Egress.BlockedBuffer`, so a misconfigured harvest loop produces one
+  round-trip per flush interval per tuple rather than one per blocked call.
+
+  Bounding rows alone is not enough: every blocked call would still take a
+  row-level lock on the SAME conflict-target row against the 3-connection
+  BYPASSRLS pool — the very pool the guard's own marking lookup needs — turning a
+  hot loop into pool pressure on the privacy control itself. The EXACT per-call
+  rate lives in the `[:loopctl, :egress, :blocked]` telemetry counter emitted
+  here, which is unbuffered and never lossy.
   """
   @spec record_blocked(Scope.t(), map()) :: :ok
   def record_blocked(%Scope{} = scope, details) do
     host = Map.get(details, :host) || "unknown"
     reason = details |> Map.get(:verdict, :non_local) |> to_string()
-    window = current_window()
 
     :telemetry.execute(
       [:loopctl, :egress, :blocked],
@@ -395,6 +565,32 @@ defmodule Loopctl.Egress do
       }
     )
 
+    BlockedBuffer.record(scope, host, reason, current_window())
+  end
+
+  @doc """
+  Flushes this node's buffered blocked-decision counters for `tenant_id` to the
+  database NOW. Tenant-scoped so an `async: true` test never drains (and then
+  fails to insert) another test's buffered rows.
+  """
+  @spec flush_blocked_decisions(Ecto.UUID.t()) :: :ok
+  def flush_blocked_decisions(tenant_id), do: BlockedBuffer.flush_tenant(tenant_id)
+
+  @doc false
+  # The actual upsert, called by the buffer's flush. `count` is the number of
+  # blocked calls accumulated for the tuple since the last flush.
+  @spec upsert_blocked_decision(map(), pos_integer()) :: :ok
+  def upsert_blocked_decision(
+        %{
+          tenant_id: tenant_id,
+          project_id: project_id,
+          scope_key: scope_key,
+          endpoint_host: host,
+          reason: reason,
+          window_start: window
+        },
+        count
+      ) do
     now = DateTime.utc_now()
 
     AdminRepo.insert_all(
@@ -402,18 +598,18 @@ defmodule Loopctl.Egress do
       [
         %{
           id: Ecto.UUID.generate(),
-          tenant_id: scope.tenant_id,
-          project_id: scope.project_id,
-          scope_key: Scope.key(scope),
+          tenant_id: tenant_id,
+          project_id: project_id,
+          scope_key: scope_key,
           endpoint_host: host,
           reason: reason,
           window_start: window,
-          occurrence_count: 1,
+          occurrence_count: count,
           inserted_at: now,
           updated_at: now
         }
       ],
-      on_conflict: [inc: [occurrence_count: 1], set: [updated_at: now]],
+      on_conflict: [inc: [occurrence_count: count], set: [updated_at: now]],
       conflict_target:
         {:unsafe_fragment, "(tenant_id, scope_key, endpoint_host, reason, window_start)"}
     )
@@ -485,19 +681,7 @@ defmodule Loopctl.Egress do
         }
       )
 
-    scopes =
-      tenant_id
-      |> list_markings()
-      |> Enum.map(
-        &%{
-          scope: if(is_nil(&1.project_id), do: "tenant", else: "project:#{&1.project_id}"),
-          project_id: &1.project_id,
-          local_only: &1.local_only,
-          # encrypt_body ships in US-41.6 (which depends on this story); the field
-          # is reserved here so the posture contract does not change shape later.
-          encrypt_body: false
-        }
-      )
+    scopes = posture_scopes(tenant_id)
 
     base = %{
       tenant_id: tenant_id,
@@ -518,6 +702,35 @@ defmodule Loopctl.Egress do
     else
       base
     end
+  end
+
+  # A CLEAR deletes the marking row, and a tenant that never enabled local_only has
+  # none at all — so mapping over `list_markings/1` alone would report `scopes: []`
+  # for the DEFAULT posture AC-41.4.1 protects, and an agent doing verify-before-
+  # harvest could not tell "not marked" from "field not populated". The TENANT-scope
+  # entry is therefore ALWAYS present (AC-41.4.8: per-scope local_only and
+  # encrypt_body status), explicitly `false` when unmarked.
+  defp posture_scopes(tenant_id) do
+    rows = list_markings(tenant_id)
+
+    entries = Enum.map(rows, &scope_posture_entry(&1.project_id, &1.local_only))
+
+    if Enum.any?(rows, &is_nil(&1.project_id)) do
+      entries
+    else
+      [scope_posture_entry(nil, false) | entries]
+    end
+  end
+
+  defp scope_posture_entry(project_id, local_only) do
+    %{
+      scope: if(is_nil(project_id), do: "tenant", else: "project:#{project_id}"),
+      project_id: project_id,
+      local_only: local_only,
+      # encrypt_body ships in US-41.6 (which depends on this story); the field
+      # is reserved here so the posture contract does not change shape later.
+      encrypt_body: false
+    }
   end
 
   defp endpoint_posture(scope, kind, url) do

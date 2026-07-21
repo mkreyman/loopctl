@@ -18,8 +18,9 @@ defmodule Loopctl.Egress.ChokepointScan do
   ## (i) Detected entry points
 
   `Req.post` / `Req.request` / `Req.get` / `Req.put` / `Req.patch` / `Req.delete`
-  / `Req.new`, `Req.Request.run` / `Req.Request.run_request`, `Finch.request` /
-  `Finch.build`, any `Mint.HTTP.*`, `:httpc.request`, `:gen_tcp.connect` and
+  / `Req.new` **and their bang variants**, `Req.Request.run` /
+  `Req.Request.run_request` (+ bang), `Finch.request` / `Finch.build` /
+  `Finch.request!`, any `Mint.HTTP.*`, `:httpc.request`, `:gen_tcp.connect` and
   `:ssl.connect`.
 
   ## (ii) The scanned path list is CONFIGURABLE
@@ -63,16 +64,18 @@ defmodule Loopctl.Egress.ChokepointScan do
         "tenant-content egress, and never reachable from a tenant-supplied URL.",
     "Loopctl.CLI.Client" =>
       "The loopctl CLI talking to a loopctl server. Runs on the operator's machine, " <>
-        "not in the server process, and sends no tenant KB content to a model provider.",
-    "Loopctl.Workers.ContentIngestionWorker" =>
-      "Tenant-supplied URL FETCH (inbound content), already SSRF-guarded via UrlGuard. " <>
-        "It is not model-provider egress; its local_only treatment lands with the " <>
-        "ingestion path in a later epic-41 story."
+        "not in the server process, and sends no tenant KB content to a model provider."
   }
 
-  @req_functions ~w(post request get put patch delete new)a
-  @req_request_functions ~w(run run_request)a
-  @finch_functions ~w(request build)a
+  # BANG variants are included deliberately. `Req.post!` / `Req.get!` are the
+  # IDIOMATIC default, so a detection list of only the non-bang names would let the
+  # single most likely way a future contributor adds a direct outbound call pass CI
+  # silently — and this check is the only thing keeping the next call site from
+  # regressing the AC-41.4.4 guarantee that the wrapper is MANDATORY rather than
+  # per-call-site convention.
+  @req_functions ~w(post request get put patch delete new post! request! get! put! patch! delete!)a
+  @req_request_functions ~w(run run_request run! run_request!)a
+  @finch_functions ~w(request build request!)a
 
   @type violation :: %{
           file: String.t(),

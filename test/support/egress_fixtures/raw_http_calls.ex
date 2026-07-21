@@ -26,6 +26,20 @@ defmodule Loopctl.EgressFixtures.RawHttpCalls do
   def req_request_run_request,
     do: Req.Request.run_request(Req.new(url: "https://example.com"))
 
+  # BANG variants — the idiomatic default, and therefore the most likely way a
+  # future contributor regresses the chokepoint (US-41.4 review finding).
+  def req_post_bang, do: Req.post!("https://example.com", [])
+  def req_request_bang, do: Req.request!(url: "https://example.com")
+  def req_get_bang, do: Req.get!("https://example.com")
+  def req_put_bang, do: Req.put!("https://example.com")
+  def req_patch_bang, do: Req.patch!("https://example.com")
+  def req_delete_bang, do: Req.delete!("https://example.com")
+  # `Req.Request.run!/1` and `run_request!/1` do not exist in the pinned Req, so
+  # they cannot be called here — they stay in the DETECTION list anyway (a future
+  # Req may add them, and detecting a name that is never written costs nothing),
+  # but the negative control can only exercise the ones that compile.
+  def finch_request_bang, do: Finch.request!(finch_build(), Loopctl.Finch)
+
   def finch_request, do: Finch.request(finch_build(), Loopctl.Finch)
   def finch_build, do: Finch.build(:get, "https://example.com")
   def mint_connect, do: Mint.HTTP.connect(:https, "example.com", 443)

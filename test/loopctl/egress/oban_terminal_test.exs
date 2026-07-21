@@ -117,15 +117,22 @@ defmodule Loopctl.Egress.ObanTerminalTest do
       refute_received :unexpected_http_call
     end
 
-    test "the cancel reason is the DISTINCT :egress_blocked, not a generic failure",
+    test "the cancel reason NAMES the scope and the offending endpoint (AC-41.4.6)",
          %{tenant: tenant} do
       article = published_article(tenant.id)
 
-      assert {:cancel, :egress_blocked} =
+      # AC-41.4.6: the cancel reason NAMES the scope and the offending endpoint, so
+      # an operator reading the cancelled job can tell WHICH endpoint was refused —
+      # a bare `:egress_blocked` atom names neither.
+      assert {:cancel, reason} =
                perform_job(ArticleEmbeddingWorker, %{
                  "tenant_id" => tenant.id,
                  "article_id" => article.id
                })
+
+      assert reason =~ "egress_blocked"
+      assert reason =~ "tenant:#{tenant.id}"
+      assert reason =~ "api.openai.com"
 
       refute_received :unexpected_http_call
     end
@@ -136,7 +143,7 @@ defmodule Loopctl.Egress.ObanTerminalTest do
       articles = for _i <- 1..5, do: published_article(tenant.id)
 
       for article <- articles do
-        assert {:cancel, :egress_blocked} =
+        assert {:cancel, _reason} =
                  perform_job(ArticleEmbeddingWorker, %{
                    "tenant_id" => tenant.id,
                    "article_id" => article.id
@@ -145,7 +152,7 @@ defmodule Loopctl.Egress.ObanTerminalTest do
 
       # Still the egress refusal — NOT :circuit_open, which is what a countable
       # failure run of this length would have produced.
-      assert {:error, :egress_blocked} = Knowledge.generate_embedding(tenant.id, "anything")
+      assert {:error, {:egress_blocked, _}} = Knowledge.generate_embedding(tenant.id, "anything")
     end
   end
 end
