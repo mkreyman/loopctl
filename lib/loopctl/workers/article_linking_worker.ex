@@ -76,8 +76,10 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Embeddings
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Oban.FairShare
@@ -339,17 +341,39 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
       AdminRepo.transaction(fn ->
         AdminRepo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
 
-        from(a in Article,
-          where: a.tenant_id == ^tenant_id,
-          where: a.id != ^article.id,
-          where: not is_nil(a.embedding),
-          where: a.status == :published
-        )
+        article
+        |> corpus_count_query(tenant_id)
         |> scope_by_project(article.project_id)
         |> AdminRepo.aggregate(:count)
       end)
 
     total
+  end
+
+  # US-41.1 (review): behind the cutover flag "is embedded" is a side-table row at
+  # the tenant's active dimension. `articles.embedding` is never written for a
+  # non-1536 dimension, so this count reported 0 for those tenants and the
+  # over-limit operator warning it drives DISAPPEARED rather than being
+  # wrong-but-visible. Both shapes carry the conjunctive tenant equality.
+  defp corpus_count_query(article, tenant_id) do
+    if Embeddings.side_table_reads_enabled?() do
+      dimension = Embeddings.active_dimension(tenant_id)
+
+      from(a in Article,
+        join: ae in ArticleEmbedding,
+        on: ae.article_id == a.id and ae.tenant_id == ^tenant_id and ae.dim == ^dimension,
+        where: a.tenant_id == ^tenant_id,
+        where: a.id != ^article.id,
+        where: a.status == :published
+      )
+    else
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.id != ^article.id,
+        where: not is_nil(a.embedding),
+        where: a.status == :published
+      )
+    end
   end
 
   # Candidate-COUNT scoping for the over-limit warning only (a plain `count(*)`, NOT the

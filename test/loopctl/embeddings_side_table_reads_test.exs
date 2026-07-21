@@ -140,6 +140,35 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       assert HeavyRead.one(tenant.id, query) == 2
     end
 
+    # REVIEW #13: the count query used to join `articles` on `a.tenant_id ==
+    # ^tenant_id`, excluding system-scoped rows, while the hydration selects
+    # `tenant_id == ^tenant_id or scope == :system` and RETURNS them. Once a tenant
+    # materialized the system corpus, `length(results)` could exceed `total_count`,
+    # breaking the `total_count_scope: ranked_corpus` contract and making the
+    # truncation signal wrong (degenerately: total_count 0 with non-empty results).
+    test "total_count AGREES with the results about materialized system articles" do
+      tenant = fixture(:tenant)
+      sys = system_article()
+
+      {:ok, _} =
+        Embeddings.materialize_system_article_embedding(
+          tenant.id,
+          sys,
+          vec(1536, :close),
+          "sys",
+          1536
+        )
+
+      enable_side_table_reads()
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.search_semantic(tenant.id, vec(1536, :query))
+
+      assert Enum.map(results, & &1.id) == [sys.id]
+      assert meta.total_count == 1
+      refute meta.pool_capped
+    end
+
     test "a superseded article leaves the side-table ANN pool (trigger-enforced)" do
       tenant = fixture(:tenant)
       live = embedded_article(tenant.id, %{title: "Live"}, :close, 1536)
@@ -314,7 +343,14 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       assert article.id in Enum.map(results, & &1.id)
     end
 
-    test "the legacy read path carries the same disclosure" do
+    # Review #8: the LEGACY path deliberately carries NO dimension disclosure. It
+    # cannot be a true statement there (results come from `articles.embedding`, there
+    # is no per-dimension corpus to be unmaterialized and no re-embed can be
+    # observed), and computing it cost three extra queries — a tenants SELECT +
+    # settings read, a NOT EXISTS anti-join over every system-scoped article, and a
+    # re-embed existence probe — on the hottest read in the product, against
+    # AC-41.1.12's "the hosted default must not regress".
+    test "the legacy read path pays NOTHING for the dimension disclosure" do
       tenant = fixture(:tenant)
       system_article()
       embedded_article(tenant.id, %{title: "Own"}, :close, 1536)
@@ -322,7 +358,26 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       refute Embeddings.side_table_reads_enabled?()
 
       assert {:ok, %{meta: meta}} = Knowledge.search_semantic(tenant.id, vec(1536, :query))
+      refute Map.has_key?(meta, :system_corpus_recall)
+      refute Map.has_key?(meta, :embedding_dimension)
+    end
+
+    test "the SIDE-TABLE read path carries the disclosure AND triggers materialization" do
+      tenant = fixture(:tenant)
+      system_article()
+      embedded_article(tenant.id, %{title: "Own"}, :close, 1536)
+
+      enable_side_table_reads()
+
+      assert {:ok, %{meta: meta}} = Knowledge.search_semantic(tenant.id, vec(1536, :query))
       assert meta.system_corpus_recall == "keyword_only"
+
+      # AC-41.1.7 "on demand": the read that OBSERVES the unmaterialized corpus is
+      # what TRIGGERS its materialization. Without this the disclosure was a dead end
+      # — a tenant stayed keyword-only for the shared corpus forever unless an
+      # operator opened IEx. Oban runs `testing: :inline`, so the trigger has already
+      # executed by the time the search returns: assert the EFFECT.
+      assert Embeddings.unmaterialized_system_articles(tenant.id, 1536, limit: 1) == []
     end
 
     test "the materialization worker is enqueued idempotently per (tenant, dim)" do
@@ -456,6 +511,122 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
       assert Embeddings.active_dimension(tenant.id) == 768
       assert Embeddings.dimension_counts(tenant.id) == %{768 => 1}
+    end
+
+    # REVIEW #1 (critical): the completion sweep deletes off-dimension rows from BOTH
+    # side tables, so anything the work queue does not enumerate but the sweep does
+    # delete is a PERMANENT recall blackout. Memories and per-tenant materializations
+    # of SYSTEM-scoped articles were both in that hole.
+    test "the completion sweep NEVER deletes a row the re-embed did not migrate" do
+      tenant = fixture(:tenant)
+      article = embedded_article(tenant.id, %{title: "Own"}, :close, 1536)
+      sys = system_article()
+      memory = fixture(:memory, tenant_id: tenant.id)
+
+      {:ok, _} =
+        Embeddings.materialize_system_article_embedding(
+          tenant.id,
+          sys,
+          vec(1536, :close),
+          "sys",
+          1536
+        )
+
+      {:ok, _} =
+        Embeddings.upsert_memory_embedding(tenant.id, memory, vec(1536, :close), "mem", 1536)
+
+      # Only the tenant's OWN article has a 768 twin — the memory and the system
+      # materialization do not.
+      {:ok, _} =
+        Embeddings.upsert_article_embedding(tenant.id, article, vec(768, :close), nil, 768)
+
+      refute Embeddings.reembed_complete?(tenant.id, 768)
+
+      assert {:error, :reembed_incomplete} = Embeddings.drop_stale_dimensions(tenant.id, 768)
+
+      # Nothing was deleted: all three 1536 rows survive.
+      assert Embeddings.article_dimension_counts(tenant.id) == %{768 => 1, 1536 => 2}
+      assert Embeddings.memory_dimension_counts(tenant.id) == %{1536 => 1}
+    end
+
+    test "the work queue enumerates SYSTEM-scoped materializations and MEMORIES" do
+      tenant = fixture(:tenant)
+      sys = system_article()
+      memory = fixture(:memory, tenant_id: tenant.id)
+
+      {:ok, _} =
+        Embeddings.materialize_system_article_embedding(
+          tenant.id,
+          sys,
+          vec(1536, :close),
+          "sys",
+          1536
+        )
+
+      {:ok, _} =
+        Embeddings.upsert_memory_embedding(tenant.id, memory, vec(1536, :close), "mem", 1536)
+
+      # `articles.tenant_id` is NULL for a system article — the previous queue keyed
+      # off it and so never saw this row.
+      assert Enum.map(Embeddings.pending_reembed_articles(tenant.id, 768, 10), & &1.id) == [
+               sys.id
+             ]
+
+      assert Enum.map(Embeddings.pending_reembed_memories(tenant.id, 768, 10), & &1.id) == [
+               memory.id
+             ]
+    end
+
+    # REVIEW #10: the vectors come from the tenant's CURRENTLY configured model, which
+    # (the ordinary case) still emits the OLD length. That must be one legible,
+    # non-retryable failure, not five full-batch provider re-bills ending in an opaque
+    # changeset term.
+    test "the worker DISCARDS a batch whose model emits the wrong length, naming both" do
+      tenant = fixture(:tenant)
+      embedded_article(tenant.id, %{title: "Own"}, :close, 1536)
+
+      # The default stub emits 1536-dim vectors; the target is 768.
+      assert {:discard, {:dimension_mismatch, 768, 1536}} =
+               perform_job(Loopctl.Workers.ReembedWorker, %{
+                 "tenant_id" => tenant.id,
+                 "target_dim" => 768
+               })
+    end
+
+    # REVIEW #6: `active_dimension/1` is DERIVED, so a model change can move it to the
+    # target while the whole corpus is still at the old one. The old
+    # `active == target_dim -> :ok` short-circuit made the re-embed a permanent no-op
+    # for exactly that tenant, leaving it with empty recall forever.
+    test "a tenant whose ACTIVE dimension already equals the target still re-embeds" do
+      tenant = fixture(:tenant)
+      article = embedded_article(tenant.id, %{title: "Stale"}, :close, 1536)
+
+      # The model table now says 768 while the corpus is entirely at 1536.
+      {:ok, _} = Embeddings.set_tenant_dimension(tenant.id, 768)
+      assert Embeddings.active_dimension(tenant.id) == 768
+
+      assert Enum.map(Embeddings.pending_reembed_articles(tenant.id, 768, 10), & &1.id) == [
+               article.id
+             ]
+    end
+
+    # REVIEW #2: Oban's DEFAULT unique states include `:executing`, so a job
+    # re-enqueuing ITSELF conflicts with the job doing the enqueueing and the
+    # continuation is silently swallowed — a multi-batch corpus stalls after batch 1.
+    test "both self-continuing workers exclude :executing from their unique states" do
+      for worker <- [
+            Loopctl.Workers.ReembedWorker,
+            Loopctl.Workers.SystemCorpusEmbeddingWorker
+          ] do
+        states = worker.__opts__() |> Keyword.fetch!(:unique) |> Keyword.fetch!(:states)
+
+        refute :executing in states,
+               "#{inspect(worker)} would swallow its own self-continuation"
+
+        refute :completed in states
+        assert :available in states
+        assert :scheduled in states
+      end
     end
 
     test "the worker DISCARDS an unsupported target rather than seq-scanning forever" do

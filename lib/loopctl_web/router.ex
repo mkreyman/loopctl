@@ -442,6 +442,15 @@ defmodule LoopctlWeb.Router do
     # Knowledge Index (lightweight catalog)
     get "/knowledge/index", KnowledgeIndexController, :index
 
+    # US-41.1 — per-tenant embedding dimension surface. The literal
+    # /knowledge/embeddings paths precede nothing parameterized, but they are grouped
+    # here with the other literal /knowledge/* reads. `status` + `system-corpus` are
+    # agent+; `reembed` is orchestrator+ (it is cost-bearing and its completion
+    # DELETES the stale-dimension rows — see the controller moduledoc).
+    get "/knowledge/embeddings", KnowledgeEmbeddingController, :status
+    post "/knowledge/embeddings/system-corpus", KnowledgeEmbeddingController, :system_corpus
+    post "/knowledge/embeddings/reembed", KnowledgeEmbeddingController, :reembed
+
     # Knowledge Stats (aggregate counts by category/status)
     get "/knowledge/stats", KnowledgeStatsController, :stats
 

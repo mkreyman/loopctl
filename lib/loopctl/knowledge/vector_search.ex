@@ -138,8 +138,10 @@ defmodule Loopctl.Knowledge.VectorSearch do
 
   import Ecto.Query
 
+  alias Loopctl.Embeddings
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
 
   @typedoc "A nearest-neighbour candidate row."
@@ -178,6 +180,11 @@ defmodule Loopctl.Knowledge.VectorSearch do
   # the result before the outer post-ANN filters run.
   @default_pool_factor 5
   @default_pool_floor 100
+
+  # US-41.1 review #7: the side-table inner ANN cannot carry status/visibility (they
+  # are not in the per-dimension partial index), so it over-fetches by this factor
+  # and the outer query trims back to `pool`.
+  @default_side_table_over_fetch 4
 
   # Maximum number of tag values accepted in a `:tags` overlap filter, so a caller
   # can't pass an unbounded array literal into the index-residual `&&` predicate.
@@ -398,6 +405,22 @@ defmodule Loopctl.Knowledge.VectorSearch do
           Ecto.Query.t()
   def candidate_pool_query(tenant_id, target_embedding, pool, opts \\ [])
       when is_binary(tenant_id) and is_integer(pool) do
+    # US-41.1 AC-41.1.8 (review #3): the cutover flag routes EVERY consumer of this
+    # helper — `suggest_links`, the novelty/dedup `ProposalGate`, and
+    # `ArticleLinkingWorker` — onto the dimension-tagged side table, not just
+    # `search_semantic`. Leaving them on `articles.embedding` was a CORRECTNESS
+    # regression, not a degradation: `Knowledge.update_embedding/5` skips the legacy
+    # column entirely for any non-1536 dimension, so for a 768/1024 tenant those
+    # queries matched ZERO rows — `suggest_links` returned nothing and the dedup gate
+    # saw no priors and verdicted every proposal `novel`, creating duplicates.
+    if Embeddings.side_table_reads_enabled?() do
+      dimension_candidate_pool_query(tenant_id, target_embedding, pool, opts)
+    else
+      legacy_candidate_pool_query(tenant_id, target_embedding, pool, opts)
+    end
+  end
+
+  defp legacy_candidate_pool_query(tenant_id, target_embedding, pool, opts) do
     target = to_embedding_list(target_embedding)
     exclude_id = Keyword.get(opts, :exclude_id)
     vis = Keyword.get(opts, :visibility_agent_id)
@@ -411,6 +434,130 @@ defmodule Loopctl.Knowledge.VectorSearch do
       |> maybe_filter_by_visibility(vis)
 
     pool_select(base, Keyword.get(opts, :select, :knn), target)
+  end
+
+  @doc """
+  The SIDE-TABLE form of `candidate_pool_query/4` — same output shape, same pool
+  size, dimension-scoped ANN.
+
+  ## Why the inner ANN over-fetches (review #7)
+
+  The legacy inner carried `status = :published` and the visibility predicate INSIDE
+  the index-ordered top-k, so the pool held `pool` PUBLISHED, VISIBLE rows. The side
+  table carries neither: the per-dimension partial index's only status-ish predicate
+  is `live_denorm`, which mirrors `status <> 'superseded'` — so drafts, archived and
+  other agents' private articles occupy pool slots and the real predicates can only
+  be applied on the OUTER query. At an identical inner limit that returns strictly
+  FEWER published rows than the legacy path, i.e. a silent recall regression at
+  cutover.
+
+  The inner limit is therefore multiplied by `side_table_over_fetch/0` before the
+  outer status/visibility filters trim it back to `pool`. This is the documented,
+  deliberate cost of the side table; the alternative — encoding `published` in
+  `live_denorm` — would need a second denormalized marker plus a second partial HNSW
+  index per dimension, doubling an already-expensive build.
+  """
+  @spec dimension_candidate_pool_query(
+          Ecto.UUID.t(),
+          target_embedding(),
+          pos_integer(),
+          keyword()
+        ) :: Ecto.Query.t()
+  def dimension_candidate_pool_query(tenant_id, target_embedding, pool, opts \\ []) do
+    target = to_embedding_list(target_embedding)
+    dimension = Keyword.get(opts, :dimension) || Embeddings.active_dimension(tenant_id)
+    exclude_id = Keyword.get(opts, :exclude_id)
+    vis = Keyword.get(opts, :visibility_agent_id)
+    status = Keyword.get(opts, :status, :published)
+
+    inner =
+      ArticleEmbedding
+      |> index_safe_dimension_knn_base(tenant_id, target, dimension, side_table_inner_pool(pool))
+      |> select([e], %{article_id: e.article_id})
+      |> put_dimension_distance(dimension, target)
+
+    from(c in subquery(inner),
+      join: a in Article,
+      on: a.id == c.article_id and a.tenant_id == ^tenant_id,
+      order_by: [asc: c.distance],
+      limit: ^pool
+    )
+    |> maybe_filter_by_status_on_article(status)
+    |> maybe_exclude_self_on_article(exclude_id)
+    |> maybe_filter_by_visibility_on_article(vis)
+    |> dimension_pool_select(Keyword.get(opts, :select, :knn))
+  end
+
+  @doc """
+  Inner-ANN over-fetch multiplier for the side-table pool (config
+  `:embedding_side_table_over_fetch`, default #{@default_side_table_over_fetch}).
+  """
+  @spec side_table_over_fetch() :: pos_integer()
+  def side_table_over_fetch do
+    Application.get_env(
+      :loopctl,
+      :embedding_side_table_over_fetch,
+      @default_side_table_over_fetch
+    )
+  end
+
+  @doc false
+  @spec side_table_inner_pool(pos_integer()) :: pos_integer()
+  def side_table_inner_pool(pool) when is_integer(pool) and pool > 0 do
+    pool * side_table_over_fetch()
+  end
+
+  # Article-binding (second binding) forms of the inner filters. Same predicates as
+  # the legacy inner, applied over the materialized ≤(pool * over_fetch) rows.
+  defp maybe_filter_by_status_on_article(query, nil), do: query
+
+  defp maybe_filter_by_status_on_article(query, status),
+    do: where(query, [_c, a], a.status == ^status)
+
+  defp maybe_exclude_self_on_article(query, nil), do: query
+
+  defp maybe_exclude_self_on_article(query, exclude_id) when is_binary(exclude_id),
+    do: where(query, [_c, a], a.id != ^exclude_id)
+
+  defp maybe_filter_by_visibility_on_article(query, nil), do: query
+
+  defp maybe_filter_by_visibility_on_article(query, agent_id) when is_binary(agent_id) do
+    where(
+      query,
+      [_c, a],
+      fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", a.metadata) or
+        fragment("?->>'agent_id' = ?", a.metadata, ^agent_id)
+    )
+  end
+
+  # The SAME two projections `pool_select/3` emits, computed from the inner's raw
+  # `distance` instead of a second `<=>` — so this module keeps its single home for
+  # the cosine literal and the two paths cannot drift in score semantics.
+  defp dimension_pool_select(query, :knn) do
+    select(query, [c, a], %{
+      id: a.id,
+      title: a.title,
+      category: a.category,
+      tags: a.tags,
+      project_id: a.project_id,
+      similarity_score: fragment("GREATEST(0, 1 - ?)", c.distance)
+    })
+  end
+
+  defp dimension_pool_select(query, :semantic) do
+    select(query, [c, a], %{
+      id: a.id,
+      tenant_id: a.tenant_id,
+      project_id: a.project_id,
+      title: a.title,
+      category: a.category,
+      status: a.status,
+      tags: a.tags,
+      metadata: a.metadata,
+      inserted_at: a.inserted_at,
+      updated_at: a.updated_at,
+      similarity_score: fragment("1 - ?", c.distance)
+    })
   end
 
   @doc """
@@ -575,6 +722,32 @@ defmodule Loopctl.Knowledge.VectorSearch do
   end
 
   defp dimension_distance_select(_query, dimension, _target) do
+    raise ArgumentError, "embedding dimension #{inspect(dimension)} is not supported"
+  end
+
+  @doc """
+  The SIDE-TABLE form of the `MIN(embedding <=> $const)` novelty aggregate.
+
+  Postgres rewrites `MIN(x <=> $const)` into `ORDER BY (x <=> $const) LIMIT 1`, so
+  this is index-servable exactly like the ordering forms above — provided the cast
+  is character-identical to the indexed expression, which is why it is generated
+  from the same compile-time dimension set and lives here rather than in a caller.
+  """
+  @spec put_dimension_min_distance(Ecto.Query.t(), pos_integer(), [float()]) :: Ecto.Query.t()
+  def put_dimension_min_distance(query, dimension, target)
+      when is_integer(dimension) and is_list(target) do
+    dimension_min_distance_select(query, dimension, target)
+  end
+
+  for dim <- @supported_dimensions do
+    min_fragment = "MIN((?::vector(#{dim})) <=> ?)"
+
+    defp dimension_min_distance_select(query, unquote(dim), target) do
+      select(query, [x], fragment(unquote(min_fragment), x.embedding, ^target))
+    end
+  end
+
+  defp dimension_min_distance_select(_query, dimension, _target) do
     raise ArgumentError, "embedding dimension #{inspect(dimension)} is not supported"
   end
 

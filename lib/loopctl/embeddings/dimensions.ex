@@ -120,6 +120,27 @@ defmodule Loopctl.Embeddings.Dimensions do
   end
 
   @doc """
+  Checks a BATCH of freshly-generated vectors against `expected` ONCE, before any
+  of them is stored.
+
+  The re-embed path asks the tenant's CURRENTLY configured model for vectors and
+  stores them at an EXPLICIT target dimension. When the model has not been switched
+  yet (the ordinary case), every row fails the changeset validator, the batch halts
+  with an opaque changeset, and Oban re-bills the provider for a full batch on each
+  of five attempts. Detecting it here — once per batch, before the first write —
+  turns that into one legible, non-retryable failure naming BOTH values
+  (AC-41.1.4).
+  """
+  @spec check_batch_length([term()], pos_integer()) ::
+          :ok | {:error, {:dimension_mismatch, pos_integer(), non_neg_integer() | nil}}
+  def check_batch_length(vectors, expected) when is_list(vectors) and is_integer(expected) do
+    case Enum.find(vectors, fn v -> vector_length(v) != expected end) do
+      nil -> :ok
+      offender -> {:error, {:dimension_mismatch, expected, vector_length(offender)}}
+    end
+  end
+
+  @doc """
   The component count of an embedding value (`%Pgvector{}` or list), or `nil` when
   the value is absent / not a vector.
   """

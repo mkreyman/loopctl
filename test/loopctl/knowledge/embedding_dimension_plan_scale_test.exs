@@ -34,15 +34,49 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ScaleSeed
+  alias Loopctl.Knowledge.VectorSearch
+  alias Loopctl.Memory
+  alias Loopctl.Memory.Memory, as: MemorySchema
+  alias Loopctl.Memory.MemoryEmbedding
+  alias Loopctl.Memory.Scope
+  alias Loopctl.PlanAssertions
   alias Loopctl.Repo.HnswIndex
   alias Loopctl.Tenants.Tenant
 
   @moduletag :scale
-  @moduletag timeout: :timer.minutes(30)
+  # ALSO :scale_nightly (review #12/#17): the every-PR job runs `--only scale` with
+  # EMBEDDING_PLAN_GATE_DIMENSIONS=1536 (one dimension), while the schedule-only
+  # scale-nightly matrix runs `--only scale_nightly` with the var UNSET, so the FULL
+  # supported set (768/1024/1536, article + memory) is plan-gated there. An ExUnit
+  # `--only` include wins over the configured exclude, so both selectors reach this file.
+  @moduletag :scale_nightly
+  @moduletag timeout: :timer.minutes(60)
 
-  # Two distinct dimensions is the point of the story; 1536 is the hosted default
-  # (the "does not regress" case) and 768 is the local-model case from GH #409.
-  @gate_dimensions [768, 1536]
+  # EVERY supported dimension is gateable; WHICH ones run is set by the
+  # `EMBEDDING_PLAN_GATE_DIMENSIONS` env var (review #12 + #17).
+  #
+  #   * every-PR CI sets it to the hosted default (1536) — one dimension, ~30k rows,
+  #     so the per-PR seed cost stays bounded (the old hardcoded [768, 1536] seeded
+  #     60k HNSW-indexed rows on every push, and the ci.yml comment claimed it covered
+  #     "every supported dimension", which was false for 1024);
+  #   * the scale-nightly matrix leaves it unset, so the FULL supported set runs —
+  #     1024 included, with a real plan assertion rather than the pg_class index
+  #     existence check that was standing in for one.
+  @gate_dimensions (case System.get_env("EMBEDDING_PLAN_GATE_DIMENSIONS") do
+                      nil ->
+                        Application.compile_env(
+                          :loopctl,
+                          :supported_embedding_dimensions,
+                          [768, 1024, 1536]
+                        )
+
+                      csv ->
+                        csv
+                        |> String.split(",", trim: true)
+                        |> Enum.map(&String.to_integer(String.trim(&1)))
+                    end)
+                   |> Enum.filter(&(&1 <= 2000))
+                   |> Enum.sort()
 
   # Rows must be COMMITTED (outside the sandbox transaction) for ANALYZE to build
   # real statistics — an in-sandbox seed yields n≈0 and the planner would pick a
@@ -62,6 +96,7 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
 
         for dim <- @gate_dimensions do
           {:ok, _} = ScaleSeed.seed_embedding_side_table(t.id, dim)
+          {:ok, _} = ScaleSeed.seed_memory_embedding_side_table(t.id, dim)
         end
 
         t
@@ -69,6 +104,8 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
 
     on_exit(fn ->
       unboxed(fn ->
+        AdminRepo.delete_all(from(me in MemoryEmbedding, where: me.tenant_id == ^tenant.id))
+        AdminRepo.delete_all(from(m in MemorySchema, where: m.tenant_id == ^tenant.id))
         AdminRepo.delete_all(from(ae in ArticleEmbedding, where: ae.tenant_id == ^tenant.id))
         AdminRepo.delete_all(from(a in Article, where: a.tenant_id == ^tenant.id))
         AdminRepo.delete_all(from(t in Tenant, where: t.id == ^tenant.id))
@@ -111,9 +148,99 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
       end
     end
 
+    for dim <- @gate_dimensions do
+      test "dim #{dim}: MEMORY recall's per-dimension index is CHOSEN too",
+           %{tenant: tenant} do
+        dim = unquote(dim)
+        plan = unboxed(fn -> explain_memory_ann(tenant.id, dim) end)
+
+        expected_index = HnswIndex.dimension_index_name("memory_embeddings", dim)
+
+        assert plan =~ expected_index,
+               "expected the plan to use #{expected_index}, got:\n#{plan}"
+
+        refute plan =~ ~r/Seq Scan on memory_embeddings/,
+               "a Seq Scan reached the memory vector relation:\n#{plan}"
+      end
+    end
+
+    for dim <- @gate_dimensions do
+      test "dim #{dim}: the SIDE-TABLE novelty aggregate is bounded, not a full scan",
+           %{tenant: tenant} do
+        dim = unquote(dim)
+
+        # REVIEW: the side-table branch of `novelty_distance_query/4` replaces the
+        # legacy inline `tags &&` residual with an `ae.article_id IN (subquery)`
+        # semi-join over `article_embeddings` — a materially different residual, and
+        # the existing US-27.7b gate EXPLAINs the query builder with the cutover flag
+        # OFF, so it kept gating the LEGACY shape only. This gates the shape the
+        # request path actually runs after cutover.
+        query =
+          Knowledge.novelty_distance_side_table_query(
+            tenant.id,
+            ScaleSeed.embedding_for(3, dim),
+            ScaleSeed.plan_gate_prior_tag(),
+            nil,
+            dim
+          )
+
+        unboxed(fn ->
+          assert :ok = PlanAssertions.refute_seq_scan(query)
+
+          # Bounded by the ~2% prior tag, NOT by the corpus: the ceiling is
+          # comfortably above the tag set and far below the seeded corpus.
+          assert :ok =
+                   PlanAssertions.assert_actual_scan_rows_below(
+                     query,
+                     div(ScaleSeed.plan_gate_corpus_size(), 4)
+                   )
+        end)
+      end
+
+      test "dim #{dim}: the SIDE-TABLE suggest-links/dedup candidate pool is index-served",
+           %{tenant: tenant} do
+        dim = unquote(dim)
+
+        query =
+          VectorSearch.dimension_candidate_pool_query(
+            tenant.id,
+            ScaleSeed.embedding_for(5, dim),
+            50,
+            dimension: dim
+          )
+
+        plan = unboxed(fn -> AdminRepo.explain(:all, query) end)
+
+        # `suggest_links`, the novelty/dedup gate and `ArticleLinkingWorker` all route
+        # through this helper — it was never plan-gated on the side-table branch.
+        assert plan =~ HnswIndex.dimension_index_name("article_embeddings", dim),
+               "expected the per-dimension index, got:\n#{plan}"
+
+        refute plan =~ ~r/Seq Scan on article_embeddings/,
+               "a Seq Scan reached the vector relation:\n#{plan}"
+      end
+
+      test "dim #{dim}: the SIDE-TABLE distant-pairs candidate set stays LIMIT-bounded",
+           %{tenant: tenant} do
+        dim = unquote(dim)
+        query = Knowledge.pair_candidates_side_table_query(tenant.id, false, nil, dim)
+
+        # No `$const` target vector exists here (both operands are stored columns), so
+        # HNSW cannot apply BY NATURE — the invariant is the sampled LIMIT, exactly as
+        # for the legacy shape.
+        unboxed(fn ->
+          assert :ok =
+                   PlanAssertions.assert_actual_scan_rows_below(
+                     query,
+                     ScaleSeed.plan_gate_corpus_size()
+                   )
+        end)
+      end
+    end
+
     test "every supported dimension the instance publishes is covered by an index" do
-      # The gate EXPLAINs two dimensions; this keeps the published set honest for
-      # the rest (AC-41.1.3 / TC-41.1.8).
+      # The gate EXPLAINs the configured dimensions; this keeps the published set
+      # honest for any not selected in this run (AC-41.1.3 / TC-41.1.8).
       for dim <- Embeddings.supported_dimensions(),
           table <- ["article_embeddings", "memory_embeddings"] do
         name = HnswIndex.dimension_index_name(table, dim)
@@ -135,5 +262,22 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
     target = ScaleSeed.embedding_for(7, dim)
 
     AdminRepo.explain(:all, Knowledge.semantic_side_table_pool_query(tenant_id, target, dim, 100))
+  end
+
+  # The REAL memory-recall request-path inner ANN, for the same reason: the
+  # `(embedding::vector(N))` cast must match the per-dimension index verbatim.
+  defp explain_memory_ann(tenant_id, dim) do
+    target = ScaleSeed.embedding_for(11, dim)
+    scope = %Scope{tenant_id: tenant_id, subject_id: "us411-plan-gate"}
+
+    # Memory recall resolves the dimension from the TENANT (there is no explicit
+    # dimension argument on that path), so the tenant is pinned to the dimension
+    # under test before the query is built.
+    {:ok, _} = Embeddings.set_tenant_dimension(tenant_id, dim)
+
+    AdminRepo.explain(
+      :all,
+      Memory.memory_side_table_candidate_query(scope, target, 10, false)
+    )
   end
 end

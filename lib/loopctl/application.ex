@@ -114,6 +114,10 @@ defmodule Loopctl.Application do
       # long-lived owner (it would otherwise be created by a transient request/job/Task
       # and vanish when that process died — silently resetting the breaker).
       Loopctl.Knowledge.EmbeddingCircuitBreaker,
+      # US-41.1 (review): owns the ETS table memoizing the per-(tenant, dimension)
+      # semantic-search disclosure meta, so the steady-state system-corpus anti-join
+      # and the two re-embed existence probes are not paid on EVERY semantic search.
+      Loopctl.Embeddings.DisclosureCache,
       # US-32.3: owns the ETS table caching resolved+decrypted per-tenant LLM
       # settings so a per-provider-call DB read + Cloak decrypt becomes a
       # per-change one. Stable owner survives the request/Task/Oban process that

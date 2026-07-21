@@ -206,6 +206,24 @@ defmodule Loopctl.Llm do
   end
 
   @doc """
+  The embedding model this tenant is CURRENTLY configured with (its explicit
+  `embedding_model`, or the server default when it left the field nil).
+
+  Deliberately independent of key resolution: US-41.1 pins the model that produced
+  a tenant's active corpus on the tenant row and compares it against this value to
+  decide whether a query embedding needs the PINNED model rather than the currently
+  configured (mid-re-embed, pending) one. That comparison must work for a tenant
+  whose key is momentarily unset, so this never returns `{:error, :no_api_key}`.
+  """
+  @spec embedding_model(Ecto.UUID.t()) :: String.t()
+  def embedding_model(tenant_id) when is_binary(tenant_id) do
+    case get_settings(tenant_id) do
+      %TenantLlmSettings{} = settings -> model_for(settings, :embedding)
+      _ -> default_model(:embedding)
+    end
+  end
+
+  @doc """
   Whether the tenant has a usable Anthropic API key configured. Used by the
   ingest boundary (422 up front) and workers (discard) to enforce mandatory BYO
   WITHOUT holding the plaintext key.

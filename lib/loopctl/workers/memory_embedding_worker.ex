@@ -59,6 +59,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   alias Loopctl.Egress
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
+  alias Loopctl.Embeddings
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -105,7 +106,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
     text = build_embedding_text(memory)
     content_hash = content_hash(text)
 
-    if already_embedded?(memory, content_hash) do
+    if already_embedded?(tenant_id, memory, content_hash) do
       # Idempotent no-op: this exact content is already embedded. Never re-call the
       # paid provider.
       :ok
@@ -192,11 +193,32 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
     max(Knowledge.circuit_breaker_cooldown_remaining(tenant_id), Admission.snooze_seconds())
   end
 
-  defp already_embedded?(%{embedding: embedding, embedding_content_hash: hash}, content_hash)
+  # IDEMPOTENCY, at the ACTIVE dimension (review). The legacy `memories.embedding` /
+  # `memories.embedding_content_hash` pair is NEVER written for a non-1536 dimension
+  # (`Memory.update_memory_embedding/4` skips that step), so for exactly the 768/1024
+  # tenants this epic serves this guard was permanently `false` and every enqueue
+  # re-billed the paid provider. Behind the cutover flag it reads the hash the side
+  # table has been recording all along.
+  defp already_embedded?(tenant_id, memory, content_hash) do
+    if Embeddings.side_table_reads_enabled?() do
+      Embeddings.memory_embedded_hash(
+        tenant_id,
+        memory.id,
+        Embeddings.active_dimension(tenant_id)
+      ) == content_hash
+    else
+      legacy_already_embedded?(memory, content_hash)
+    end
+  end
+
+  defp legacy_already_embedded?(
+         %{embedding: embedding, embedding_content_hash: hash},
+         content_hash
+       )
        when not is_nil(embedding) and is_binary(hash),
        do: hash == content_hash
 
-  defp already_embedded?(_memory, _content_hash), do: false
+  defp legacy_already_embedded?(_memory, _content_hash), do: false
 
   defp content_hash(text) do
     # Delegates to the schema's single source of truth so the async worker hash and

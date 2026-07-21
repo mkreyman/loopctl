@@ -36,6 +36,14 @@ config :loopctl,
   # a REDUCED output dimension via the API's `dimensions` parameter; picking 1024 or
   # 1536 there brings it back inside this set.)
   supported_embedding_dimensions: [768, 1024, 1536],
+  # US-41.1 (review): TTL (ms) for the memoized semantic-search DISCLOSURE meta
+  # (`Loopctl.Embeddings.DisclosureCache`). The system-corpus anti-join + the two
+  # re-embed existence probes ran on EVERY semantic response and, in the steady
+  # state, always answered the same thing; the answer changes only when the
+  # materialization worker runs, a system article is published, or a re-embed makes
+  # progress. `0` disables caching entirely (config/test.exs sets 0 so tests observe
+  # a disclosure change immediately).
+  embedding_disclosure_cache_ms: 5_000,
   # US-38.4: EXPLICIT pgvector HNSW build parameters for every `CREATE INDEX ... USING
   # hnsw` (`Loopctl.Repo.HnswIndex`). These EQUAL pgvector's implicit defaults (m=16,
   # ef_construction=64) — a deliberate, documented "keep the defaults" tuning outcome

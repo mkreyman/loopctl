@@ -308,19 +308,24 @@ jobs:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
       # US-41.1 AC-41.1.12(i) — the per-dimension ANN plan GATE. It EXPLAINs the real
-      # request-path inner ANN for EVERY supported embedding dimension over a committed,
-      # ANALYZEd 30k-row corpus and fails if the per-dimension HNSW index is not the
+      # request-path inner ANN (BOTH article search and agent-memory recall — each has
+      # its own per-dimension index and its own verbatim `::vector(N)` cast) over a
+      # committed, ANALYZEd corpus and fails if the per-dimension HNSW index is not the
       # CHOSEN path (no `enable_seqscan = off` anywhere — eligibility is not selection).
-      # It belongs in this every-PR job, NOT the schedule-only scale-nightly matrix:
-      # a per-dimension index that stops planning is a silent production regression, and
-      # the seed is small enough (~60s) to afford on every push. This step is the gate;
-      # AC-41.1.12(ii)'s production EXPLAIN is an artifact report, deliberately not CI.
+      #
+      # ON EVERY PR it runs ONE dimension — the hosted default, 1536 — because each
+      # dimension seeds ~30k HNSW-indexed article rows PLUS ~30k memory rows, and
+      # seeding the whole supported set on every push is not worth the wall clock. The
+      # FULL supported set (768 / 1024 / 1536) runs in the schedule-only scale-nightly
+      # matrix, which leaves EMBEDDING_PLAN_GATE_DIMENSIONS unset. This step is the
+      # gate; AC-41.1.12(ii)'s production EXPLAIN is an artifact report, not CI.
       - name: Run per-dimension ANN plan gate (TC-41.1.2, AC-41.1.12(i))
         run: |
           SCALE_TESTS=true mix test --only scale \
             test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs
         env:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
+          EMBEDDING_PLAN_GATE_DIMENSIONS: "1536"
 
   pgbouncer-e2e:
     name: Pgbouncer e2e (US-27.13)
@@ -446,6 +451,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # US-41.1 AC-41.1.12(i): embedding_dimension_plan_scale_test.exs is listed here
+        # for the FULL supported-dimension matrix (768/1024/1536, article + memory). The
+        # every-PR job runs the same file with EMBEDDING_PLAN_GATE_DIMENSIONS=1536, so
+        # 1024 gets its real plan assertion here rather than an index-existence check.
+        # NB: the runbook guard parses the list items below by `take_while` — do NOT put
+        # a comment between `scale_file:` and its items, or entries after it go unseen.
         scale_file:
           - test/loopctl/knowledge/scale_seed_nightly_test.exs
           - test/loopctl/knowledge/vector_search_scale_test.exs
@@ -460,6 +471,7 @@ jobs:
           - test/loopctl/knowledge/scale_calibration_mismatch_scale_test.exs
           - test/loopctl/knowledge/vector_endpoint_e2e_latency_scale_test.exs
           - test/loopctl/knowledge/remediation_matrix_scale_test.exs
+          - test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs
     services:
       postgres:
         image: pgvector/pgvector:pg16

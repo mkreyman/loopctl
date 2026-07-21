@@ -238,6 +238,19 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/channel/claims/release"},
                {:post, "/api/v1/channel/claims/done"},
 
+               # US-41.1 system-corpus materialization — embeds the SHARED
+               # system-scoped article corpus for the CALLER's own tenant, with the
+               # caller's OWN embedding credential, into the caller's own rows. It
+               # only ADDS rows, removes nothing, and touches no custody state — the
+               # same KB-content posture the wiki write surface already has (owner
+               # decision #331). It is the AC-41.1.7 on-demand trigger, so gating it
+               # behind a human anchor would leave a KB-tier tenant permanently
+               # keyword-only on the shared corpus. The re-embed
+               # (/knowledge/embeddings/reembed) is deliberately NOT here: it deletes
+               # the stale-dimension rows and re-bills the tenant, so it carries
+               # RequireHumanAnchor.
+               {:post, "/api/v1/knowledge/embeddings/system-corpus"},
+
                # Superadmin-only admin scope — RequireRole already pins these
                # to superadmin; Impersonate explicitly skips
                # /api/v1/admin/*, so current_tenant is always nil

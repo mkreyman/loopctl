@@ -47,12 +47,14 @@ defmodule Loopctl.Embeddings do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Embeddings.Dimensions
+  alias Loopctl.Embeddings.DisclosureCache
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm
   alias Loopctl.Memory.Memory
   alias Loopctl.Memory.MemoryEmbedding
+  alias Loopctl.Repo
   alias Loopctl.SystemConfig
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Workers.ReembedWorker
@@ -120,19 +122,93 @@ defmodule Loopctl.Embeddings do
   changesets — never per item (AC-41.1.11). Both lookups are served from caches
   (`Llm.get_settings/1` is ETS-backed), but the contract is the call site's:
   `upsert_article_embeddings/3` resolves once for the whole batch.
+
+  ## SUPPORTED-ONLY (review)
+
+  The returned value is always in `supported_dimensions/0`. The derivation can
+  legitimately produce an UNSUPPORTED one — `Dimensions.for_model/1` maps
+  `text-embedding-3-large` to 3072, which is above pgvector's 2000-dimension HNSW
+  ceiling and therefore deliberately NOT in the published set — and every read-path
+  query builder RAISES on a dimension it has no compile-time cast for. Returning it
+  unchanged made a free-form `tenant_llm_settings.embedding_model` an unhandled 500
+  on the hottest read while `recall_availability/1` simultaneously reported
+  `semantic_available: true`. An unsupported derivation therefore resolves to the
+  deployment default and is DISCLOSED by `recall_availability/1`; writes then fail
+  legibly on `Dimensions.validate_vector_length/3` (naming both numbers) instead of
+  landing 3072-length rows in a table with no ANN index.
   """
   @spec active_dimension(Ecto.UUID.t()) :: pos_integer()
   def active_dimension(tenant_id) when is_binary(tenant_id) do
-    recorded_dimension(tenant_id) || model_dimension(tenant_id) || default_dimension()
+    dimension = declared_dimension(tenant_id)
+
+    if supported_dimension?(dimension), do: dimension, else: fallback_dimension()
   end
 
-  defp recorded_dimension(tenant_id) do
+  @doc """
+  The dimension the tenant's configuration IMPLIES, WITHOUT the supported-set gate
+  — i.e. what `active_dimension/1` would have returned pre-gate.
+
+  Only for DISCLOSURE (`recall_availability/1` compares the two to explain why a
+  tenant naming a 3072-dimension model gets no semantic recall). Never use it to
+  build a query or a changeset.
+  """
+  @spec declared_dimension(Ecto.UUID.t()) :: pos_integer()
+  def declared_dimension(tenant_id) when is_binary(tenant_id) do
+    tenant_pin(tenant_id).dimension || model_dimension(tenant_id) || default_dimension()
+  end
+
+  @doc """
+  The MODEL that produced the tenant's ACTIVE corpus (`tenants.tenant_embedding_model`),
+  or `nil` when nothing has been pinned yet.
+
+  Pinned by `resolve_write_dimension/1` on the first write and re-pinned atomically
+  with the dimension at re-embed completion (`complete_reembed/2`).
+  """
+  @spec active_model(Ecto.UUID.t()) :: String.t() | nil
+  def active_model(tenant_id) when is_binary(tenant_id), do: tenant_pin(tenant_id).model
+
+  @doc """
+  The model an ORDINARY embedding call must use, or `nil` when the tenant's current
+  configuration already agrees with the active corpus.
+
+  This is the AC-41.1.10 "query embeddings are generated against the model that
+  produced the ACTIVE corpus, never the pending one" guarantee, made resolvable: a
+  re-embed requires the tenant to point `tenant_llm_settings.embedding_model` at the
+  NEW model (that is the only way the worker can obtain target-dimension vectors),
+  and from that moment the configured model disagrees with the whole live corpus.
+  Returning the PIN here keeps query vectors — and any newly-written article/memory
+  vector — at the active dimension for the entire window; the re-embed worker is the
+  one caller that deliberately opts out and uses the configured (pending) model.
+
+  `nil` in the common case, so the overwhelmingly common path calls the embedding
+  client exactly as before.
+  """
+  @spec query_model_override(Ecto.UUID.t()) :: String.t() | nil
+  def query_model_override(tenant_id) when is_binary(tenant_id) do
+    case active_model(tenant_id) do
+      pinned when is_binary(pinned) ->
+        if pinned == Llm.embedding_model(tenant_id), do: nil, else: pinned
+
+      _ ->
+        nil
+    end
+  end
+
+  defp fallback_dimension do
+    default = default_dimension()
+
+    if supported_dimension?(default), do: default, else: legacy_dimension()
+  end
+
+  # ONE read for both pins — `active_dimension/1` and `active_model/1` are resolved
+  # from the same row, so a caller that needs both never pays for two round trips.
+  defp tenant_pin(tenant_id) do
     AdminRepo.one(
       from(t in Tenant,
         where: t.id == ^tenant_id,
-        select: t.tenant_embedding_dimension
+        select: %{dimension: t.tenant_embedding_dimension, model: t.tenant_embedding_model}
       )
-    )
+    ) || %{dimension: nil, model: nil}
   end
 
   defp model_dimension(tenant_id) do
@@ -140,6 +216,51 @@ defmodule Loopctl.Embeddings do
       %{embedding_model: model} -> Dimensions.for_model(model)
       _ -> nil
     end
+  end
+
+  @doc """
+  Resolves the dimension for a WRITE and PINS it if the tenant has none recorded.
+
+  Call this ONCE per operation or batch, in place of `active_dimension/1`, on every
+  path that is about to STORE vectors. The pin is what stops the derived leg of
+  `active_dimension/1` from moving under a populated corpus (review #6): once a
+  tenant has embedded anything at N, an edit to `tenant_llm_settings.embedding_model`
+  can no longer silently re-point recall at an empty dimension — moving to a new
+  dimension is then exactly one supported operation, the AC-41.1.10 re-embed, which
+  re-writes the pin only after the whole corpus is present at the target.
+
+  The tenant's MODEL is pinned by the same statement (AC-41.1.10): the dimension
+  records the SHAPE of the active corpus, the model records what PRODUCED it, and
+  `query_model_override/1` needs both to keep query vectors on the active corpus
+  while a re-embed is in flight.
+
+  ONE conditional `UPDATE ... WHERE tenant_embedding_dimension IS NULL OR
+  tenant_embedding_model IS NULL` per batch — never per item, so it does not
+  reintroduce the AC-41.1.11 N+1, and it is a no-op once both pins are set.
+  """
+  @spec resolve_write_dimension(Ecto.UUID.t()) :: pos_integer()
+  def resolve_write_dimension(tenant_id) when is_binary(tenant_id) do
+    dimension = active_dimension(tenant_id)
+
+    if supported_dimension?(dimension) do
+      # `dimension` is `active_dimension/1`, which already RETURNS the recorded pin
+      # when there is one, so re-setting it here is value-identical for an
+      # already-pinned tenant; the predicate only decides whether the row is touched
+      # at all.
+      AdminRepo.update_all(
+        from(t in Tenant,
+          where:
+            t.id == ^tenant_id and
+              (is_nil(t.tenant_embedding_dimension) or is_nil(t.tenant_embedding_model))
+        ),
+        set: [
+          tenant_embedding_dimension: dimension,
+          tenant_embedding_model: Llm.embedding_model(tenant_id)
+        ]
+      )
+    end
+
+    dimension
   end
 
   @doc """
@@ -152,7 +273,8 @@ defmodule Loopctl.Embeddings do
   data-layer backstop.)
   """
   @spec set_tenant_dimension(Ecto.UUID.t(), pos_integer()) ::
-          {:ok, Tenant.t()} | {:error, :unsupported_dimension | Ecto.Changeset.t()}
+          {:ok, Tenant.t()}
+          | {:error, :unsupported_dimension | :not_found | Ecto.Changeset.t()}
   def set_tenant_dimension(tenant_id, dimension)
       when is_binary(tenant_id) and is_integer(dimension) do
     if supported_dimension?(dimension) do
@@ -194,17 +316,36 @@ defmodule Loopctl.Embeddings do
   tenant has NO semantic recall — a fact the surface must state rather than return
   an unexplained empty result (AC-41.1.8, AC-41.1.10).
   """
-  @spec recall_availability(Ecto.UUID.t()) :: %{
+  @spec recall_availability(Ecto.UUID.t(), pos_integer() | nil) :: %{
           dimension: pos_integer(),
           reads_side_table: boolean(),
           semantic_available: boolean(),
           reason: String.t() | nil
         }
-  def recall_availability(tenant_id) when is_binary(tenant_id) do
-    dimension = active_dimension(tenant_id)
+  def recall_availability(tenant_id, dimension \\ nil) when is_binary(tenant_id) do
+    dimension = dimension || active_dimension(tenant_id)
     side_table? = side_table_reads_enabled?()
+    declared = declared_dimension(tenant_id)
 
     cond do
+      # The tenant NAMES a model this instance cannot serve (e.g. a 3072-dimension
+      # model, above pgvector's HNSW ceiling). `active_dimension/1` falls back to the
+      # supported default so no read path raises, but every vector that model returns
+      # then fails the length validation, so nothing is stored and recall is empty.
+      # Saying so is the whole point of this surface (AC-41.1.4 / AC-41.1.8).
+      not supported_dimension?(declared) ->
+        %{
+          dimension: dimension,
+          reads_side_table: side_table?,
+          semantic_available: false,
+          reason:
+            "this tenant's configured embedding model returns #{declared}-dimension " <>
+              "vectors, which this instance does not support (supported: " <>
+              "#{inspect(supported_dimensions())}). No ANN index exists for that " <>
+              "dimension, so its vectors are rejected at write time and search is " <>
+              "keyword-only until the tenant configures a supported model."
+        }
+
       side_table? ->
         %{
           dimension: dimension,
@@ -367,10 +508,34 @@ defmodule Loopctl.Embeddings do
           keyword()
         ) :: {:ok, [ArticleEmbedding.t()]} | {:error, term()}
   def upsert_article_embeddings(tenant_id, entries, opts \\ []) when is_binary(tenant_id) do
-    dimension = Keyword.get(opts, :dimension) || active_dimension(tenant_id)
+    dimension = Keyword.get(opts, :dimension) || resolve_write_dimension(tenant_id)
 
     Enum.reduce_while(entries, {:ok, []}, fn {article, embedding, hash}, {:ok, acc} ->
       case upsert_article_embedding(tenant_id, article, embedding, hash, dimension) do
+        {:ok, row} -> {:cont, {:ok, [row | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, rows} -> {:ok, Enum.reverse(rows)}
+      other -> other
+    end
+  end
+
+  @doc """
+  The memories twin of `upsert_article_embeddings/3` — resolves the dimension ONCE
+  and writes every `{memory, embedding, content_hash}` triple at it (AC-41.1.11).
+  """
+  @spec upsert_memory_embeddings(
+          Ecto.UUID.t(),
+          [{Memory.t(), [float()], String.t() | nil}],
+          keyword()
+        ) :: {:ok, [MemoryEmbedding.t()]} | {:error, term()}
+  def upsert_memory_embeddings(tenant_id, entries, opts \\ []) when is_binary(tenant_id) do
+    dimension = Keyword.get(opts, :dimension) || resolve_write_dimension(tenant_id)
+
+    Enum.reduce_while(entries, {:ok, []}, fn {memory, embedding, hash}, {:ok, acc} ->
+      case upsert_memory_embedding(tenant_id, memory, embedding, hash, dimension) do
         {:ok, row} -> {:cont, {:ok, [row | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
@@ -439,6 +604,20 @@ defmodule Loopctl.Embeddings do
   Public so a caller that already owns a transaction (`Loopctl.Knowledge.update_embedding/4`,
   which also writes the legacy column and the audit entry) can write the side-table
   row INSIDE it — AC-41.1.8(i)'s "one transaction, both locations".
+
+  ## A single atomic UPSERT, not read-then-write (review)
+
+  The previous form SELECTed the `(tenant_id, article_id, dim)` row and then
+  `insert_or_update`d it, with no lock between the two. Two concurrent writers for
+  the same key (`ArticleEmbeddingWorker` racing `BatchArticleEmbeddingWorker`, or a
+  live dual-write racing the AC-41.1.9 backfill's `INSERT ... ON CONFLICT DO
+  NOTHING`) both saw `existing == nil` and both INSERTed; the loser hit
+  `article_embeddings_tenant_article_dim_index`. Because this step runs inside the
+  AC-41.1.8(i) Multi, that changeset error rolled back the LEGACY column write and
+  the audit entry too, and the write was lost until Oban retried. `INSERT ... ON
+  CONFLICT DO UPDATE` makes the loser's write WIN-or-UPDATE instead of failing, with
+  no read at all. The BEFORE-INSERT/UPDATE trigger runs on both branches, so
+  `live_denorm` stays synced either way.
   """
   @spec upsert_article_embedding_row(
           module(),
@@ -449,20 +628,104 @@ defmodule Loopctl.Embeddings do
           pos_integer()
         ) :: {:ok, ArticleEmbedding.t()} | {:error, Ecto.Changeset.t()}
   def upsert_article_embedding_row(repo, tenant_id, article, embedding, content_hash, dimension) do
-    existing =
-      repo.one(
-        from(ae in ArticleEmbedding,
-          where:
-            ae.tenant_id == ^tenant_id and ae.article_id == ^article.id and ae.dim == ^dimension
-        )
-      )
-
-    (existing || %ArticleEmbedding{tenant_id: tenant_id})
+    %ArticleEmbedding{tenant_id: tenant_id}
     |> ArticleEmbedding.changeset(
       %{article_id: article.id, embedding: embedding, embedding_content_hash: content_hash},
       dimension
     )
-    |> repo.insert_or_update()
+    |> repo.insert(
+      on_conflict: {:replace, [:embedding, :embedding_content_hash, :updated_at]},
+      conflict_target: [:tenant_id, :article_id, :dim],
+      returning: [:id, :live_denorm, :inserted_at, :updated_at]
+    )
+  end
+
+  @doc """
+  The stored content hash for `article_id` at `dimension`, or `nil` when there is no
+  row (or the row predates hash recording).
+
+  This is the SIDE-TABLE half of embedding idempotency (review). Every dedupe guard
+  used to read `articles.embedding` + `articles.embedding_content_hash`, which
+  `update_embedding/5` never writes for a non-1536 dimension — so for exactly the
+  768/1024 tenants this epic exists for, the guard fell through to "not embedded" on
+  every invocation and every enqueue re-billed the paid provider.
+  """
+  @spec article_embedded_hash(Ecto.UUID.t(), Ecto.UUID.t(), pos_integer()) :: String.t() | nil
+  def article_embedded_hash(tenant_id, article_id, dimension) do
+    AdminRepo.one(
+      from(ae in ArticleEmbedding,
+        where:
+          ae.tenant_id == ^tenant_id and ae.article_id == ^article_id and ae.dim == ^dimension,
+        select: ae.embedding_content_hash
+      )
+    )
+  end
+
+  @doc "Batch form of `article_embedded_hash/3`: `%{article_id => hash}` for the rows present."
+  @spec article_embedded_hashes(Ecto.UUID.t(), [Ecto.UUID.t()], pos_integer()) :: %{
+          Ecto.UUID.t() => String.t() | nil
+        }
+  def article_embedded_hashes(_tenant_id, [], _dimension), do: %{}
+
+  def article_embedded_hashes(tenant_id, article_ids, dimension) do
+    from(ae in ArticleEmbedding,
+      where:
+        ae.tenant_id == ^tenant_id and ae.article_id in ^article_ids and ae.dim == ^dimension,
+      select: {ae.article_id, ae.embedding_content_hash}
+    )
+    |> AdminRepo.all()
+    |> Map.new()
+  end
+
+  @doc """
+  The subset of `article_ids` that HAS a side-table row at `dimension`, as a
+  `MapSet`.
+  """
+  # No @spec: a `MapSet.t()` return annotation trips dialyzer's contract_with_opaque
+  # check against the concrete success typing (a known false positive for opaque
+  # built-ins) — same treatment as `Knowledge.visible_article_ids/3`.
+  def embedded_article_ids(_tenant_id, [], _dimension), do: MapSet.new()
+
+  def embedded_article_ids(tenant_id, article_ids, dimension) do
+    from(ae in ArticleEmbedding,
+      where:
+        ae.tenant_id == ^tenant_id and ae.article_id in ^article_ids and ae.dim == ^dimension,
+      select: ae.article_id
+    )
+    |> AdminRepo.all()
+    |> MapSet.new()
+  end
+
+  @doc "The memories twin of `article_embedded_hash/3`."
+  @spec memory_embedded_hash(Ecto.UUID.t(), Ecto.UUID.t(), pos_integer()) :: String.t() | nil
+  def memory_embedded_hash(tenant_id, memory_id, dimension) do
+    AdminRepo.one(
+      from(me in MemoryEmbedding,
+        where: me.tenant_id == ^tenant_id and me.memory_id == ^memory_id and me.dim == ^dimension,
+        select: me.embedding_content_hash
+      )
+    )
+  end
+
+  @doc """
+  A memory's STORED vector at `dimension`, as a plain `[float()]`, or `nil`.
+
+  The graduation path reuses a memory's already-paid-for vector instead of asking the
+  provider again; reading it from `memories.embedding` alone meant a non-1536 tenant
+  paid for a fresh embedding on every graduation (review).
+  """
+  @spec memory_embedding_vector(Ecto.UUID.t(), Ecto.UUID.t(), pos_integer()) :: [float()] | nil
+  def memory_embedding_vector(tenant_id, memory_id, dimension) do
+    from(me in MemoryEmbedding,
+      where: me.tenant_id == ^tenant_id and me.memory_id == ^memory_id and me.dim == ^dimension,
+      select: me.embedding
+    )
+    |> AdminRepo.one()
+    |> case do
+      %Pgvector{} = vector -> Pgvector.to_list(vector)
+      list when is_list(list) and list != [] -> list
+      _ -> nil
+    end
   end
 
   @doc """
@@ -480,15 +743,7 @@ defmodule Loopctl.Embeddings do
           pos_integer()
         ) :: {:ok, MemoryEmbedding.t()} | {:error, Ecto.Changeset.t()}
   def upsert_memory_embedding_row(repo, tenant_id, memory, embedding, content_hash, dimension) do
-    existing =
-      repo.one(
-        from(me in MemoryEmbedding,
-          where:
-            me.tenant_id == ^tenant_id and me.memory_id == ^memory.id and me.dim == ^dimension
-        )
-      )
-
-    (existing || %MemoryEmbedding{tenant_id: tenant_id})
+    %MemoryEmbedding{tenant_id: tenant_id}
     |> MemoryEmbedding.changeset(
       %{
         memory_id: memory.id,
@@ -498,7 +753,15 @@ defmodule Loopctl.Embeddings do
       },
       dimension
     )
-    |> repo.insert_or_update()
+    |> repo.insert(
+      # Same atomic-upsert rationale as `upsert_article_embedding_row/6`. `subject_id`
+      # is replaced too: it is a DENORMALIZED copy of `memories.subject_id` (now also
+      # enforced by a composite FK), so a stale copy on the conflicting row must not
+      # survive a re-write.
+      on_conflict: {:replace, [:subject_id, :embedding, :embedding_content_hash, :updated_at]},
+      conflict_target: [:tenant_id, :memory_id, :dim],
+      returning: [:id, :live_denorm, :inserted_at, :updated_at]
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -508,49 +771,91 @@ defmodule Loopctl.Embeddings do
   @doc """
   Copies every legacy `articles.embedding` into the side table at dim 1536.
 
-  RESUMABLE and BATCHED: the cursor is the article `id` (a UUID, totally ordered),
-  and the batch is an anti-join against rows already present at dim 1536, so an
-  interrupted run resumes with no double work and a completed run re-run is a
-  no-op (no duplicates — TC-41.1.3). The legacy column is LEFT IN PLACE and
-  unused; dropping it is a deliberate follow-up so rollback stays trivial.
+  RESUMABLE and BATCHED: the batch is an anti-join against rows already present at
+  dim 1536, so an interrupted run resumes with no double work and a completed run
+  re-run is a no-op (no duplicates — TC-41.1.3). There is deliberately NO cursor:
+  every batch re-evaluates the anti-join, which is what makes an arbitrary
+  interleaving with the concurrent dual-write safe. The legacy column is LEFT IN
+  PLACE and unused; dropping it is a deliberate follow-up so rollback stays trivial.
 
-  Returns `{:ok, %{copied: n, batches: b}}`.
+  ## Completion is a GAP PROBE, not a zero-row batch (review #14)
+
+  A batch is `INSERT ... SELECT ... WHERE NOT EXISTS ... LIMIT n ON CONFLICT DO
+  NOTHING`. A batch whose selected rows were all swallowed by `ON CONFLICT` — the
+  race with the concurrent dual-write inserting the same `(tenant, article, 1536)`
+  between the SELECT and the INSERT — reports `num_rows == 0` while work REMAINS.
+  Halting there would report completion prematurely, and AC-41.1.8 makes the read
+  flag flip conditional on that report. So a zero-row batch only ends the run once
+  the reconciliation gap probe agrees there is nothing left; otherwise the run
+  continues, bounded by `@max_zero_progress_batches` consecutive no-progress
+  batches so a pathological repeated conflict cannot spin forever.
+
+  Returns `{:ok, %{copied: n, batches: b, complete: bool}}`. `complete` is FALSE
+  when the batch budget or the no-progress bound stopped the run with gaps left.
   """
   @spec backfill_articles(keyword()) ::
-          {:ok, %{copied: non_neg_integer(), batches: non_neg_integer()}}
+          {:ok, %{copied: non_neg_integer(), batches: non_neg_integer(), complete: boolean()}}
   def backfill_articles(opts \\ []) do
     batch_size = Keyword.get(opts, :batch_size, @default_batch_size)
     max_batches = Keyword.get(opts, :max_batches, :infinity)
-    run_backfill(&article_backfill_batch/1, batch_size, max_batches)
+
+    run_backfill(
+      &article_backfill_batch/1,
+      fn -> article_reconciliation_gaps(limit: 1) == [] end,
+      batch_size,
+      max_batches
+    )
   end
 
   @doc "The memories twin of `backfill_articles/1`."
   @spec backfill_memories(keyword()) ::
-          {:ok, %{copied: non_neg_integer(), batches: non_neg_integer()}}
+          {:ok, %{copied: non_neg_integer(), batches: non_neg_integer(), complete: boolean()}}
   def backfill_memories(opts \\ []) do
     batch_size = Keyword.get(opts, :batch_size, @default_batch_size)
     max_batches = Keyword.get(opts, :max_batches, :infinity)
-    run_backfill(&memory_backfill_batch/1, batch_size, max_batches)
+
+    run_backfill(
+      &memory_backfill_batch/1,
+      fn -> memory_reconciliation_gaps(limit: 1) == [] end,
+      batch_size,
+      max_batches
+    )
   end
 
-  defp run_backfill(batch_fun, batch_size, max_batches) do
-    Enum.reduce_while(Stream.iterate(0, &(&1 + 1)), %{copied: 0, batches: 0}, fn _i, acc ->
-      if batch_budget_exhausted?(acc, max_batches) do
-        {:halt, acc}
-      else
-        run_backfill_batch(batch_fun, batch_size, acc)
+  defp run_backfill(batch_fun, gaps_drained?, batch_size, max_batches) do
+    Enum.reduce_while(
+      Stream.iterate(0, &(&1 + 1)),
+      %{copied: 0, batches: 0, complete: false, zero_batches: 0},
+      fn _i, acc ->
+        if batch_budget_exhausted?(acc, max_batches) do
+          {:halt, acc}
+        else
+          run_backfill_batch(batch_fun, gaps_drained?, batch_size, acc)
+        end
       end
-    end)
-    |> then(&{:ok, &1})
+    )
+    |> then(&{:ok, Map.drop(&1, [:zero_batches])})
   end
 
   defp batch_budget_exhausted?(_acc, :infinity), do: false
   defp batch_budget_exhausted?(acc, max_batches), do: acc.batches >= max_batches
 
-  defp run_backfill_batch(batch_fun, batch_size, acc) do
+  # A no-progress batch is only terminal once the gap probe agrees the anti-join is
+  # drained. Otherwise it is a lost ON CONFLICT race: keep going, bounded.
+  @max_zero_progress_batches 3
+
+  defp run_backfill_batch(batch_fun, gaps_drained?, batch_size, acc) do
     case batch_fun.(batch_size) do
-      0 -> {:halt, acc}
-      n -> {:cont, %{copied: acc.copied + n, batches: acc.batches + 1}}
+      0 -> halt_or_retry(gaps_drained?, acc)
+      n -> {:cont, %{acc | copied: acc.copied + n, batches: acc.batches + 1, zero_batches: 0}}
+    end
+  end
+
+  defp halt_or_retry(gaps_drained?, acc) do
+    cond do
+      gaps_drained?.() -> {:halt, %{acc | complete: true}}
+      acc.zero_batches + 1 >= @max_zero_progress_batches -> {:halt, acc}
+      true -> {:cont, %{acc | zero_batches: acc.zero_batches + 1}}
     end
   end
 
@@ -669,20 +974,110 @@ defmodule Loopctl.Embeddings do
   end
 
   @doc """
-  Repairs every gap `article_reconciliation_gaps/1` reports, returning
-  `{:ok, %{repaired: n}}`.
+  Repairs every gap `article_reconciliation_gaps/1` reports AND every `live_denorm`
+  marker that has drifted from its parent, returning
+  `{:ok, %{repaired: n, live_denorm_repaired: n}}`.
   """
-  @spec reconcile_articles(keyword()) :: {:ok, %{repaired: non_neg_integer()}}
+  @spec reconcile_articles(keyword()) ::
+          {:ok,
+           %{
+             repaired: non_neg_integer(),
+             live_denorm_repaired: non_neg_integer(),
+             complete: boolean()
+           }}
   def reconcile_articles(opts \\ []) do
-    {:ok, %{copied: copied}} = backfill_articles(opts)
-    {:ok, %{repaired: copied}}
+    {:ok, %{copied: copied, complete: complete}} = backfill_articles(opts)
+    {:ok, drift} = repair_article_live_denorm()
+
+    {:ok, %{repaired: copied, live_denorm_repaired: drift, complete: complete}}
   end
 
   @doc "The memories twin of `reconcile_articles/1`."
-  @spec reconcile_memories(keyword()) :: {:ok, %{repaired: non_neg_integer()}}
+  @spec reconcile_memories(keyword()) ::
+          {:ok,
+           %{
+             repaired: non_neg_integer(),
+             live_denorm_repaired: non_neg_integer(),
+             complete: boolean()
+           }}
   def reconcile_memories(opts \\ []) do
-    {:ok, %{copied: copied}} = backfill_memories(opts)
-    {:ok, %{repaired: copied}}
+    {:ok, %{copied: copied, complete: complete}} = backfill_memories(opts)
+    {:ok, drift} = repair_memory_live_denorm()
+
+    {:ok, %{repaired: copied, live_denorm_repaired: drift, complete: complete}}
+  end
+
+  @doc """
+  Side-table rows whose `live_denorm` marker DISAGREES with their parent — the
+  marker-drift class the gap probe cannot see (review).
+
+  `article_reconciliation_gaps/1` only finds MISSING rows. A row that exists with a
+  STALE marker is invisible to it and strictly worse: the per-dimension HNSW indexes
+  are PARTIAL on `live_denorm`, so a superseded article marked live is IN the index
+  and occupies ANN pool slots on every recall (the US-28.2 regression), while a live
+  article marked dead vanishes from recall entirely. The trigger pair is the primary
+  mechanism and the `FOR SHARE` parent read closes the known write skew; this is the
+  standing safety net for anything neither covers.
+  """
+  @spec article_live_denorm_drift(keyword()) :: [Ecto.UUID.t()]
+  def article_live_denorm_drift(opts \\ []) do
+    limit = Keyword.get(opts, :limit, @default_batch_size)
+
+    AdminRepo.all(
+      from(ae in ArticleEmbedding,
+        join: a in Article,
+        on: a.id == ae.article_id,
+        where: ae.live_denorm != fragment("(? <> 'superseded')", a.status),
+        select: ae.id,
+        limit: ^limit
+      )
+    )
+  end
+
+  @doc "The memories twin of `article_live_denorm_drift/1`."
+  @spec memory_live_denorm_drift(keyword()) :: [Ecto.UUID.t()]
+  def memory_live_denorm_drift(opts \\ []) do
+    limit = Keyword.get(opts, :limit, @default_batch_size)
+
+    AdminRepo.all(
+      from(me in MemoryEmbedding,
+        join: m in Memory,
+        on: m.id == me.memory_id,
+        where: me.live_denorm != is_nil(m.superseded_by),
+        select: me.id,
+        limit: ^limit
+      )
+    )
+  end
+
+  @doc "Repairs every marker `article_live_denorm_drift/1` reports."
+  @spec repair_article_live_denorm() :: {:ok, non_neg_integer()}
+  def repair_article_live_denorm do
+    %{num_rows: n} =
+      AdminRepo.query!("""
+      UPDATE article_embeddings ae
+         SET live_denorm = (a.status <> 'superseded'), updated_at = ae.updated_at
+        FROM articles a
+       WHERE a.id = ae.article_id
+         AND ae.live_denorm IS DISTINCT FROM (a.status <> 'superseded')
+      """)
+
+    {:ok, n}
+  end
+
+  @doc "The memories twin of `repair_article_live_denorm/0`."
+  @spec repair_memory_live_denorm() :: {:ok, non_neg_integer()}
+  def repair_memory_live_denorm do
+    %{num_rows: n} =
+      AdminRepo.query!("""
+      UPDATE memory_embeddings me
+         SET live_denorm = (m.superseded_by IS NULL), updated_at = me.updated_at
+        FROM memories m
+       WHERE m.id = me.memory_id
+         AND me.live_denorm IS DISTINCT FROM (m.superseded_by IS NULL)
+      """)
+
+    {:ok, n}
   end
 
   # ---------------------------------------------------------------------------
@@ -699,6 +1094,18 @@ defmodule Loopctl.Embeddings do
   `tenant_id` row could never satisfy `HeavyRead.guard!/2`'s conjunctive tenant
   predicate. They are therefore embedded ON DEMAND PER TENANT with the requesting
   tenant's own credential and stored as ordinary rows carrying THAT tenant_id.
+
+  ## PUBLISHED only (review)
+
+  The enumeration carries `status == :published`. Without it every system-scoped
+  article in ANY status (draft, archived, superseded) had its full title+body sent to
+  the TENANT's embedding endpoint — which under Epic 41 is tenant-DECLARED and
+  possibly tenant-OPERATED, so operator content deliberately not published left the
+  instance to a tenant-controlled destination, billed to the tenant. Nothing was
+  gained: `hydrate_semantic_pool/6` applies the status filter and `live_denorm`
+  excludes superseded rows, so a non-published system article can never be returned.
+  Second-order, it also pinned `system_corpus_meta/2` at `keyword_only` forever for
+  every tenant whenever one unpublishable system article existed.
   """
   @spec unmaterialized_system_articles(Ecto.UUID.t(), pos_integer(), keyword()) :: [Article.t()]
   def unmaterialized_system_articles(tenant_id, dimension, opts \\ [])
@@ -706,9 +1113,8 @@ defmodule Loopctl.Embeddings do
     limit = Keyword.get(opts, :limit, @default_batch_size)
 
     AdminRepo.all(
-      from(a in Article,
+      from(a in system_articles_query(),
         as: :article,
-        where: a.scope == :system and is_nil(a.tenant_id),
         where:
           not exists(
             from(ae in ArticleEmbedding,
@@ -721,6 +1127,85 @@ defmodule Loopctl.Embeddings do
           ),
         limit: ^limit
       )
+    )
+  end
+
+  @doc """
+  System-scoped articles this tenant must (re-)embed at `dimension`: the
+  UNMATERIALIZED ones PLUS the ones whose body has changed since materialization.
+
+  Materialization used to be existence-only, and this worker is the ONLY writer for
+  system-scoped articles (the ordinary content-hash-driven workers never touch them,
+  because a system article has no `tenant_id`). So once materialized, an edit to a
+  system article's title or body left EVERY tenant's vector permanently stale with no
+  repair path short of manual deletion — while `system_corpus_meta/2` reported
+  `"semantic"` throughout (review).
+
+  Staleness is detected in SQL by `ae.updated_at < a.updated_at` (an edit bumps the
+  article's `updated_at`); the worker then compares the ACTUAL content hash before
+  spending anything, so an article that was touched without a content change costs a
+  `updated_at` touch rather than a provider call.
+
+  Deliberately NOT the query `system_corpus_meta/2` probes: a stale-but-present
+  corpus is still SEMANTICALLY searchable, so reporting `keyword_only` for it would
+  be false, and it would flip every tenant's search meta on any system-article edit.
+  """
+  @spec stale_system_articles(Ecto.UUID.t(), pos_integer(), keyword()) :: [Article.t()]
+  def stale_system_articles(tenant_id, dimension, opts \\ [])
+      when is_binary(tenant_id) and is_integer(dimension) do
+    limit = Keyword.get(opts, :limit, @default_batch_size)
+
+    AdminRepo.all(
+      from(a in system_articles_query(),
+        as: :article,
+        where:
+          not exists(
+            from(ae in ArticleEmbedding,
+              where:
+                ae.article_id == parent_as(:article).id and
+                  ae.tenant_id == ^tenant_id and
+                  ae.dim == ^dimension,
+              select: 1
+            )
+          ) or
+            exists(
+              from(ae in ArticleEmbedding,
+                where:
+                  ae.article_id == parent_as(:article).id and
+                    ae.tenant_id == ^tenant_id and
+                    ae.dim == ^dimension and
+                    ae.updated_at < parent_as(:article).updated_at,
+                select: 1
+              )
+            ),
+        limit: ^limit
+      )
+    )
+  end
+
+  @doc """
+  Marks a system article's materialization as CURRENT without re-embedding it — the
+  cheap branch of `stale_system_articles/3` for an article whose `updated_at` moved
+  but whose content hash did not.
+  """
+  @spec touch_system_article_embedding(Ecto.UUID.t(), Ecto.UUID.t(), pos_integer()) ::
+          {:ok, non_neg_integer()}
+  def touch_system_article_embedding(tenant_id, article_id, dimension) do
+    {n, _} =
+      AdminRepo.update_all(
+        from(ae in ArticleEmbedding,
+          where:
+            ae.tenant_id == ^tenant_id and ae.article_id == ^article_id and ae.dim == ^dimension
+        ),
+        set: [updated_at: DateTime.utc_now()]
+      )
+
+    {:ok, n}
+  end
+
+  defp system_articles_query do
+    from(a in Article,
+      where: a.scope == :system and is_nil(a.tenant_id) and a.status == :published
     )
   end
 
@@ -752,15 +1237,55 @@ defmodule Loopctl.Embeddings do
   Idempotent: the worker is `unique` per `(tenant_id, dim)` and its batch query is
   an anti-join, so re-enqueuing while a run is in flight is a no-op and a completed
   corpus makes the job an immediate `:ok`.
+
+  ## Terminal-state gate (review)
+
+  The worker's uniqueness was deliberately narrowed to
+  `[:available, :scheduled, :retryable]` so it can re-enqueue ITSELF, which means
+  `:discarded` and `:cancelled` jobs are NOT deduped. Since the search read path
+  enqueues this whenever the corpus reports `keyword_only`, a tenant whose
+  materialization terminated PERMANENTLY (`{:discard, {:no_embedding_key, _}}`, a
+  permanent provider error, an egress cancel, a persistent dimension mismatch)
+  re-enqueued a fresh job on every semantic search, forever, driven by user traffic.
+  An existing terminal job for `(tenant_id, dim)` therefore short-circuits with
+  `{:error, :materialization_terminal}`. `force: true` (the explicit operator/agent
+  POST) bypasses the gate — a human asking again is a new decision, and a retry is
+  exactly how the terminal state is meant to be cleared.
   """
   @spec enqueue_system_corpus_materialization(Ecto.UUID.t(), keyword()) ::
-          {:ok, Oban.Job.t()} | {:error, term()}
+          {:ok, Oban.Job.t()} | {:error, :materialization_terminal | term()}
   def enqueue_system_corpus_materialization(tenant_id, opts \\ []) when is_binary(tenant_id) do
     dimension = Keyword.get(opts, :dimension) || active_dimension(tenant_id)
+    force? = Keyword.get(opts, :force, false)
 
-    %{tenant_id: tenant_id, dim: dimension}
-    |> SystemCorpusEmbeddingWorker.new()
-    |> Oban.insert()
+    if not force? and system_corpus_terminal?(tenant_id, dimension) do
+      {:error, :materialization_terminal}
+    else
+      %{tenant_id: tenant_id, dim: dimension}
+      |> SystemCorpusEmbeddingWorker.new()
+      |> Oban.insert()
+    end
+  end
+
+  @doc """
+  Whether a system-corpus materialization for `(tenant_id, dimension)` has already
+  terminated permanently (`discarded` / `cancelled`).
+  """
+  @spec system_corpus_terminal?(Ecto.UUID.t(), pos_integer()) :: boolean()
+  def system_corpus_terminal?(tenant_id, dimension) do
+    worker = inspect(SystemCorpusEmbeddingWorker)
+
+    # OBAN's repo, not `AdminRepo`: `oban_jobs` is Oban's own, non-RLS table, and
+    # reading it through the same repo that WRITES it keeps the two consistent.
+    Repo.exists?(
+      from(j in "oban_jobs",
+        where:
+          j.worker == ^worker and j.state in ["discarded", "cancelled"] and
+            fragment("?->>'tenant_id' = ?", j.args, ^tenant_id) and
+            fragment("(?->>'dim')::int = ?", j.args, ^dimension),
+        limit: 1
+      )
+    )
   end
 
   @doc """
@@ -816,7 +1341,11 @@ defmodule Loopctl.Embeddings do
       total: total,
       done: min(done, total),
       pending: max(total - done, 0),
-      complete: total > 0 and done >= total
+      # `done >= total` and NOT `total > 0 and …` (review #15): a tenant with an
+      # empty corpus at the active dimension has nothing left to re-embed, so it IS
+      # complete. The old form made such a tenant permanently incomplete, which the
+      # worker's completion decision reads.
+      complete: done >= total
     }
   end
 
@@ -848,13 +1377,22 @@ defmodule Loopctl.Embeddings do
     end
   end
 
+  # BOTH side tables (review #14): a tenant whose only off-dimension rows are
+  # MEMORIES is just as mid-re-embed as one with off-dimension articles, and an
+  # article-only probe gave it no disclosure at all.
   defp reembed_in_flight?(tenant_id, active) do
     AdminRepo.exists?(
       from(ae in ArticleEmbedding,
         where: ae.tenant_id == ^tenant_id and ae.dim != ^active,
         limit: 1
       )
-    )
+    ) or
+      AdminRepo.exists?(
+        from(me in MemoryEmbedding,
+          where: me.tenant_id == ^tenant_id and me.dim != ^active,
+          limit: 1
+        )
+      )
   end
 
   defp build_reembed_meta(tenant_id, active) do
@@ -881,14 +1419,127 @@ defmodule Loopctl.Embeddings do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # The re-embed work queue (AC-41.1.10) — BOTH side tables, and system articles
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Articles that have a side-table row at SOME dimension other than `target_dim`
+  and none yet at `target_dim` — the resumable, idempotent re-embed work queue.
+
+  Two things this does NOT do, both of which were recall-destroying bugs (review #1):
+
+    * it does not key the source off the tenant's ACTIVE dimension. The source is
+      "any other dimension", so a tenant whose derived active dimension has already
+      moved to the target (a model change) still has its stale corpus enumerated
+      instead of the re-embed short-circuiting into a no-op.
+    * it does not require `articles.tenant_id == tenant_id`. SYSTEM-scoped articles
+      (`tenant_id IS NULL`, materialized PER TENANT by AC-41.1.7) carry the
+      requesting tenant's id on the EMBEDDING row, not the article row — filtering on
+      the article's tenant excluded every one of them from the re-embed, and the
+      completion sweep then deleted them.
+  """
+  @spec pending_reembed_articles(Ecto.UUID.t(), pos_integer(), pos_integer()) :: [Article.t()]
+  def pending_reembed_articles(tenant_id, target_dim, limit)
+      when is_binary(tenant_id) and is_integer(target_dim) and is_integer(limit) do
+    ids =
+      AdminRepo.all(
+        from(ae in ArticleEmbedding,
+          as: :src,
+          where: ae.tenant_id == ^tenant_id and ae.dim != ^target_dim,
+          where:
+            not exists(
+              from(t in ArticleEmbedding,
+                where:
+                  t.article_id == parent_as(:src).article_id and t.tenant_id == ^tenant_id and
+                    t.dim == ^target_dim,
+                select: 1
+              )
+            ),
+          distinct: true,
+          select: ae.article_id,
+          limit: ^limit
+        )
+      )
+
+    case ids do
+      [] ->
+        []
+
+      ids ->
+        AdminRepo.all(
+          from(a in Article,
+            where: a.id in ^ids,
+            where: a.tenant_id == ^tenant_id or a.scope == :system
+          )
+        )
+    end
+  end
+
+  @doc "The memories twin of `pending_reembed_articles/3`."
+  @spec pending_reembed_memories(Ecto.UUID.t(), pos_integer(), pos_integer()) :: [Memory.t()]
+  def pending_reembed_memories(tenant_id, target_dim, limit)
+      when is_binary(tenant_id) and is_integer(target_dim) and is_integer(limit) do
+    ids =
+      AdminRepo.all(
+        from(me in MemoryEmbedding,
+          as: :src,
+          where: me.tenant_id == ^tenant_id and me.dim != ^target_dim,
+          where:
+            not exists(
+              from(t in MemoryEmbedding,
+                where:
+                  t.memory_id == parent_as(:src).memory_id and t.tenant_id == ^tenant_id and
+                    t.dim == ^target_dim,
+                select: 1
+              )
+            ),
+          distinct: true,
+          select: me.memory_id,
+          limit: ^limit
+        )
+      )
+
+    case ids do
+      [] -> []
+      ids -> AdminRepo.all(from(m in Memory, where: m.id in ^ids and m.tenant_id == ^tenant_id))
+    end
+  end
+
+  @doc """
+  True when NOTHING (article or memory) is still awaiting a `target_dim` twin — the
+  precondition `drop_stale_dimensions/2` refuses to delete without.
+  """
+  @spec reembed_complete?(Ecto.UUID.t(), pos_integer()) :: boolean()
+  def reembed_complete?(tenant_id, target_dim) do
+    pending_reembed_articles(tenant_id, target_dim, 1) == [] and
+      pending_reembed_memories(tenant_id, target_dim, 1) == []
+  end
+
   @doc """
   Drops every side-table row for `tenant_id` at a dimension OTHER than `keep_dim`
   — the AC-41.1.10 stale-dimension cleanup, run only AFTER the re-embed reports
   completion.
+
+  FAIL-CLOSED (review #1): this deletes BOTH side tables, so calling it while any
+  row still lacks a `keep_dim` twin is a permanent recall blackout for exactly the
+  rows that were never migrated (agent memories and per-tenant system-article
+  materializations were the two classes that used to fall in that hole). The
+  precondition is therefore re-checked HERE, not just at the call site, and an
+  incomplete corpus returns `{:error, :reembed_incomplete}` with nothing deleted.
   """
-  @spec drop_stale_dimensions(Ecto.UUID.t(), pos_integer()) :: {:ok, non_neg_integer()}
+  @spec drop_stale_dimensions(Ecto.UUID.t(), pos_integer()) ::
+          {:ok, non_neg_integer()} | {:error, :reembed_incomplete}
   def drop_stale_dimensions(tenant_id, keep_dim)
       when is_binary(tenant_id) and is_integer(keep_dim) do
+    if reembed_complete?(tenant_id, keep_dim) do
+      do_drop_stale_dimensions(tenant_id, keep_dim)
+    else
+      {:error, :reembed_incomplete}
+    end
+  end
+
+  defp do_drop_stale_dimensions(tenant_id, keep_dim) do
     {articles, _} =
       AdminRepo.delete_all(
         from(ae in ArticleEmbedding, where: ae.tenant_id == ^tenant_id and ae.dim != ^keep_dim)
@@ -931,16 +1582,120 @@ defmodule Loopctl.Embeddings do
   end
 
   @doc """
+  The WHOLE search-response disclosure for `(tenant_id, dimension)` — the
+  AC-41.1.7 system-corpus state merged with the AC-41.1.10 re-embed state —
+  MEMOIZED for a short TTL.
+
+  This runs on every semantic response, and in the steady state its three queries
+  (a system-corpus anti-join that qualifies no rows, plus two re-embed existence
+  probes) always answer the same thing: the answer changes only when the
+  materialization worker runs, a system article is published, or a re-embed makes
+  progress — never as a function of the request. See
+  `Loopctl.Embeddings.DisclosureCache` (TTL `0` disables it).
+  """
+  @spec search_disclosure_meta(Ecto.UUID.t(), pos_integer()) :: map()
+  def search_disclosure_meta(tenant_id, dimension)
+      when is_binary(tenant_id) and is_integer(dimension) do
+    DisclosureCache.fetch({:disclosure, tenant_id, dimension}, fn ->
+      Map.merge(system_corpus_meta(tenant_id, dimension), reembed_meta(tenant_id, dimension))
+    end)
+  end
+
+  @doc """
+  Completes a re-embed onto `target_dim` ATOMICALLY: verify completeness, re-pin the
+  tenant's dimension AND model, then drop the stale-dimension rows — all in ONE
+  transaction.
+
+  ## Why the order and the transaction matter (review)
+
+  The worker used to `set_tenant_dimension/2` FIRST and then call
+  `drop_stale_dimensions/2`, which re-checks `reembed_complete?/2` and can return
+  `{:error, :reembed_incomplete}` — the fail-closed guard for exactly the race where
+  a new off-dimension row appears after the last batch. When that guard fired the pin
+  had ALREADY moved: `active_dimension/1` returned the target, recall served the
+  target corpus, and the raced rows existed only at the old dimension, silently
+  absent from results. If the job then exhausted its attempts, the tenant was left
+  permanently pinned at the target with un-migrated rows excluded from recall.
+
+  Verifying and pinning inside the same transaction as the sweep makes the pin move
+  only on the interleaving where the sweep is also safe; anything else rolls back
+  and the job retries with recall untouched.
+  """
+  @spec complete_reembed(Ecto.UUID.t(), pos_integer()) ::
+          {:ok, non_neg_integer()} | {:error, :reembed_incomplete | :not_found | term()}
+  def complete_reembed(tenant_id, target_dim)
+      when is_binary(tenant_id) and is_integer(target_dim) do
+    if supported_dimension?(target_dim) do
+      AdminRepo.transaction(fn -> do_complete_reembed(tenant_id, target_dim) end)
+    else
+      {:error, :unsupported_dimension}
+    end
+  end
+
+  defp do_complete_reembed(tenant_id, target_dim) do
+    with :ok <- assert_reembed_complete(tenant_id, target_dim),
+         :ok <- pin_completed_reembed(tenant_id, target_dim),
+         {:ok, dropped} <- do_drop_stale_dimensions(tenant_id, target_dim) do
+      dropped
+    else
+      {:error, reason} -> AdminRepo.rollback(reason)
+    end
+  end
+
+  defp assert_reembed_complete(tenant_id, target_dim) do
+    if reembed_complete?(tenant_id, target_dim), do: :ok, else: {:error, :reembed_incomplete}
+  end
+
+  # The model pin moves WITH the dimension: from here on, ordinary embeddings
+  # (query vectors included) are generated with the model that produced the corpus
+  # now serving — which is the tenant's currently configured one, the very model the
+  # re-embed used.
+  defp pin_completed_reembed(tenant_id, target_dim) do
+    {n, _} =
+      AdminRepo.update_all(
+        from(t in Tenant, where: t.id == ^tenant_id),
+        set: [
+          tenant_embedding_dimension: target_dim,
+          tenant_embedding_model: Llm.embedding_model(tenant_id)
+        ]
+      )
+
+    if n == 0, do: {:error, :not_found}, else: :ok
+  end
+
+  @doc """
   Counts a tenant's side-table rows per dimension — the AC-41.1.10 re-embed
   progress surface and the source of the "rows excluded from PENDING-dimension
   recall" number the search `meta` reports.
   """
   @spec dimension_counts(Ecto.UUID.t()) :: %{pos_integer() => non_neg_integer()}
   def dimension_counts(tenant_id) when is_binary(tenant_id) do
+    Map.merge(
+      article_dimension_counts(tenant_id),
+      memory_dimension_counts(tenant_id),
+      fn _dim, a, m -> a + m end
+    )
+  end
+
+  @doc "Per-dimension row counts for the ARTICLE side table only."
+  @spec article_dimension_counts(Ecto.UUID.t()) :: %{pos_integer() => non_neg_integer()}
+  def article_dimension_counts(tenant_id) when is_binary(tenant_id) do
     from(ae in ArticleEmbedding,
       where: ae.tenant_id == ^tenant_id,
       group_by: ae.dim,
       select: {ae.dim, count(ae.id)}
+    )
+    |> AdminRepo.all()
+    |> Map.new()
+  end
+
+  @doc "Per-dimension row counts for the MEMORY side table only."
+  @spec memory_dimension_counts(Ecto.UUID.t()) :: %{pos_integer() => non_neg_integer()}
+  def memory_dimension_counts(tenant_id) when is_binary(tenant_id) do
+    from(me in MemoryEmbedding,
+      where: me.tenant_id == ^tenant_id,
+      group_by: me.dim,
+      select: {me.dim, count(me.id)}
     )
     |> AdminRepo.all()
     |> Map.new()

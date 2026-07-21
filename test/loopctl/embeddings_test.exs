@@ -12,18 +12,19 @@ defmodule Loopctl.EmbeddingsTest do
   """
 
   use Loopctl.DataCase, async: true
+  use Oban.Testing, repo: Loopctl.Repo
 
   alias Loopctl.AdminRepo
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
   alias Loopctl.HeavyRead
+  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Memory.Memory
   alias Loopctl.Memory.MemoryEmbedding
   alias Loopctl.Repo.HnswIndex
-  alias LoopctlWeb.WellKnownController
 
   setup :verify_on_exit!
 
@@ -584,7 +585,142 @@ defmodule Loopctl.EmbeddingsTest do
     end
   end
 
+  describe "batch embedding — the REAL US-37.4 path (TC-41.1.9)" do
+    # The TC-41.1.9 test above exercises `upsert_article_embeddings/3`. The path the
+    # PRODUCT actually runs is `BatchArticleEmbeddingWorker.store_all/2`, which loops
+    # `Knowledge.update_embedding/5` once per article — so asserting only the former
+    # let the gate pass while the production path did ~100 tenant lookups per batch
+    # (review #5). This asserts on the SHAPE that matters: the tenant-query count must
+    # NOT scale with the batch size.
+    test "the tenant dimension lookup does not scale with the batch size" do
+      small = batch_worker_tenant_queries(3)
+      large = batch_worker_tenant_queries(30)
+
+      assert large <= small,
+             "tenant lookups scaled with batch size (#{small} -> #{large}) — the dimension " <>
+               "is being resolved per ARTICLE, which is exactly the AC-41.1.11 N+1"
+    end
+  end
+
+  describe "one transaction, both locations (AC-41.1.8(i))" do
+    # The existing coverage asserted atomicity by reading BOTH locations after a
+    # SUCCESSFUL write, which cannot distinguish one transaction from two (review
+    # #11). This forces a FAILURE after the dual-write steps and proves the legacy
+    # column write is rolled back with the side-table row.
+    test "a failure AFTER the dual-write rolls BOTH locations back" do
+      tenant = fixture(:tenant)
+      article = fixture(:article, tenant_id: tenant.id)
+
+      result =
+        Ecto.Multi.new()
+        |> Embeddings.article_embedding_multi(tenant.id, article, vec(1536), "h", 1536)
+        |> Ecto.Multi.run(:boom, fn _repo, _changes -> {:error, :boom} end)
+        |> AdminRepo.transaction()
+
+      assert {:error, :boom, :boom, _done} = result
+
+      assert is_nil(
+               AdminRepo.one(from(a in Article, where: a.id == ^article.id, select: a.embedding))
+             )
+
+      assert AdminRepo.aggregate(
+               from(ae in ArticleEmbedding, where: ae.article_id == ^article.id),
+               :count
+             ) == 0
+    end
+
+    test "a wrong-length vector fails the whole transaction, writing NEITHER location" do
+      tenant = fixture(:tenant)
+      article = fixture(:article, tenant_id: tenant.id)
+
+      assert {:error, %Ecto.Changeset{}} =
+               Embeddings.upsert_article_embedding(tenant.id, article, vec(768), "h", 1536)
+
+      assert is_nil(
+               AdminRepo.one(from(a in Article, where: a.id == ^article.id, select: a.embedding))
+             )
+
+      assert AdminRepo.aggregate(ArticleEmbedding, :count) == 0
+    end
+  end
+
+  describe "search results MID-backfill (AC-41.1.8 / TC-41.1.3)" do
+    # The backfill test asserted only `refute side_table_reads_enabled?()` — a config
+    # flag, not search output (review #11). AC-41.1.8 requires asserting that a
+    # semantic search over a PARTIALLY migrated corpus returns results IDENTICAL to
+    # pre-backfill.
+    test "a semantic search over a partially migrated corpus is byte-identical" do
+      tenant = fixture(:tenant)
+
+      for i <- 1..5 do
+        :article
+        |> fixture(tenant_id: tenant.id, status: :published)
+        |> Article.embedding_changeset(vec(1536, i), "h#{i}", 1536)
+        |> AdminRepo.update!()
+      end
+
+      assert {:ok, before} = Knowledge.search_semantic(tenant.id, vec(1536), limit: 10)
+
+      # Interrupt the backfill halfway: two of five rows mirrored.
+      assert {:ok, %{copied: 2}} = Embeddings.backfill_articles(batch_size: 2, max_batches: 1)
+      assert AdminRepo.aggregate(ArticleEmbedding, :count) == 2
+
+      assert {:ok, midway} = Knowledge.search_semantic(tenant.id, vec(1536), limit: 10)
+
+      assert Enum.map(midway.results, & &1.id) == Enum.map(before.results, & &1.id)
+      assert midway.meta.total_count == before.meta.total_count
+      assert midway.meta.search_mode == before.meta.search_mode
+    end
+
+    test "the backfill only reports `complete` once the gap probe agrees" do
+      tenant = fixture(:tenant)
+
+      for i <- 1..3 do
+        :article
+        |> fixture(tenant_id: tenant.id)
+        |> Article.embedding_changeset(vec(1536, i), "h#{i}", 1536)
+        |> AdminRepo.update!()
+      end
+
+      # Budget-limited run: work remains, so `complete` must be FALSE. AC-41.1.8
+      # makes the read-flag flip conditional on that report, so a premature
+      # completion is load-bearing (review #14).
+      assert {:ok, %{copied: 1, complete: false}} =
+               Embeddings.backfill_articles(batch_size: 1, max_batches: 1)
+
+      assert {:ok, %{complete: true}} = Embeddings.backfill_articles(batch_size: 10)
+    end
+  end
+
   # --- helpers ---
+
+  # Runs the REAL batch worker over `n` articles and returns how many `tenants`
+  # SELECTs it issued.
+  defp batch_worker_tenant_queries(n) do
+    tenant = fixture(:tenant)
+    articles = for _ <- 1..n, do: fixture(:article, tenant_id: tenant.id)
+    handler_id = "us411-batch-#{System.unique_integer([:positive])}"
+    parent = self()
+
+    :telemetry.attach(
+      handler_id,
+      [:loopctl, :repo, :query],
+      fn _event, _measurements, metadata, _config ->
+        if metadata[:query] =~ "FROM \"tenants\"", do: send(parent, :tenant_query)
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      perform_job(Loopctl.Workers.BatchArticleEmbeddingWorker, %{
+        "tenant_id" => tenant.id,
+        "article_ids" => Enum.map(articles, & &1.id)
+      })
+
+    tenant_query_count()
+  end
 
   defp tenant_query_count(acc \\ 0) do
     receive do

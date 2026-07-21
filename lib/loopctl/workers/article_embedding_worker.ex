@@ -62,6 +62,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   alias Loopctl.Egress
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
+  alias Loopctl.Embeddings
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -109,7 +110,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
     text = build_embedding_text(article)
     content_hash = content_hash(text)
 
-    if already_embedded?(article, content_hash) do
+    if already_embedded?(tenant_id, article, content_hash) do
       # Idempotent no-op: this exact content is already embedded (review #12). Ensure
       # linking is (re-)enqueued and finish — never re-call the paid provider.
       enqueue_linking(article_id, tenant_id)
@@ -212,11 +213,36 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
     max(Knowledge.circuit_breaker_cooldown_remaining(tenant_id), Admission.snooze_seconds())
   end
 
-  defp already_embedded?(%{embedding: embedding, embedding_content_hash: hash}, content_hash)
+  # IDEMPOTENCY, at the ACTIVE dimension (review).
+  #
+  # This guard used to read ONLY the legacy `articles.embedding` +
+  # `articles.embedding_content_hash`, which `Knowledge.update_embedding/5` NEVER
+  # writes for a non-1536 dimension. For exactly the 768/1024 tenants this epic
+  # exists for, both stayed NULL forever, so the guard fell through to `false` on
+  # every invocation and every enqueue re-billed the paid provider: a silent,
+  # unbounded cost loop. Behind the cutover flag the presence+hash check therefore
+  # consults the side table at the tenant's active dimension, where the hash HAS been
+  # recorded all along.
+  defp already_embedded?(tenant_id, article, content_hash) do
+    if Embeddings.side_table_reads_enabled?() do
+      Embeddings.article_embedded_hash(
+        tenant_id,
+        article.id,
+        Embeddings.active_dimension(tenant_id)
+      ) == content_hash
+    else
+      legacy_already_embedded?(article, content_hash)
+    end
+  end
+
+  defp legacy_already_embedded?(
+         %{embedding: embedding, embedding_content_hash: hash},
+         content_hash
+       )
        when not is_nil(embedding) and is_binary(hash),
        do: hash == content_hash
 
-  defp already_embedded?(_article, _content_hash), do: false
+  defp legacy_already_embedded?(_article, _content_hash), do: false
 
   defp content_hash(text) do
     :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)

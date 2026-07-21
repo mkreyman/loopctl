@@ -674,6 +674,41 @@ defmodule Loopctl.Memory do
   defp recall_on_overload(_), do: :raise
 
   defp recall_semantic(scope, embedding, k, include_superseded?, on_overload) do
+    case recall_dimension_check(scope, embedding) do
+      :ok -> do_recall_semantic(scope, embedding, k, include_superseded?, on_overload)
+      {:error, reason} -> unavailable_memory_env(scope.tenant_id, k, reason)
+    end
+  end
+
+  # US-41.1 AC-41.1.8 (review #9): the query vector's LENGTH is checked against the
+  # dimension the read path will scan BEFORE it is bound into the per-dimension cast
+  # fragment. WRITES were validated; READS were not, so any drift produced a
+  # raw Postgrex "different vector dimensions" 500 instead of the documented graceful
+  # degrade. The legacy column is `vector(1536)` unconditionally, so the pre-flip
+  # expected length is a constant and this costs NO extra query on that path.
+  defp recall_dimension_check(scope, embedding) do
+    actual = length(VectorSearch.to_embedding_list(embedding))
+
+    expected =
+      if Embeddings.side_table_reads_enabled?() do
+        Embeddings.active_dimension(scope.tenant_id)
+      else
+        Embeddings.legacy_dimension()
+      end
+
+    if actual == expected, do: :ok, else: {:error, "embedding_dimension_mismatch"}
+  end
+
+  defp unavailable_memory_env(tenant_id, k, reason) do
+    emit_recall_degraded(tenant_id, "memory", reason)
+
+    %{
+      results: [],
+      meta: %{total_count: 0, fallback: true, reason: reason, underfilled: k > 0}
+    }
+  end
+
+  defp do_recall_semantic(scope, embedding, k, include_superseded?, on_overload) do
     query = memory_candidate_query(scope, embedding, k, include_superseded?)
 
     case HeavyRead.all_memory(
@@ -776,7 +811,12 @@ defmodule Loopctl.Memory do
   # predicate on the per-dimension index, and building a second, full index per
   # dimension would double an already-expensive HNSW build at corpus scale for a path
   # that is not on the interactive recall route.
-  defp memory_side_table_candidate_query(scope, embedding, k, include_superseded?) do
+  # Public-but-`@doc false` (review #12) so the AC-41.1.12(i) CI plan gate can EXPLAIN
+  # the REAL memory-recall request-path query. Memory recall has its OWN per-dimension
+  # indexes and its own verbatim `(embedding::vector(N))` cast; asserting only the
+  # article query left a drift here invisible.
+  @doc false
+  def memory_side_table_candidate_query(scope, embedding, k, include_superseded?) do
     target = VectorSearch.to_embedding_list(embedding)
     pool = recall_pool_size(scope, k)
     dimension = Embeddings.active_dimension(scope.tenant_id)
@@ -2107,7 +2147,20 @@ defmodule Loopctl.Memory do
   # struct the sweep/fetch loaded — an EXPLICIT `select` overrides that and returns just
   # the vector (a cheap local read that saves an embedding API round-trip). NULL until
   # `MemoryEmbeddingWorker` has embedded the memory.
+  #
+  # US-41.1 (review): behind the cutover flag the vector is read from the
+  # dimension-tagged side table. The legacy column is NEVER written for a non-1536
+  # tenant, so for those tenants this was always nil and the graduation path silently
+  # paid the provider for a fresh embedding every time.
   defp fetch_memory_embedding(%MemorySchema{id: id, tenant_id: tenant_id}) do
+    if Embeddings.side_table_reads_enabled?() do
+      Embeddings.memory_embedding_vector(tenant_id, id, Embeddings.active_dimension(tenant_id))
+    else
+      fetch_legacy_memory_embedding(id, tenant_id)
+    end
+  end
+
+  defp fetch_legacy_memory_embedding(id, tenant_id) do
     from(m in MemorySchema,
       where: m.id == ^id and m.tenant_id == ^tenant_id,
       select: m.embedding
@@ -2558,6 +2611,16 @@ defmodule Loopctl.Memory do
   # `memory_candidate_query/4` that `recall_semantic/4` builds, so the near-dup path
   # cannot drift from ordinary recall.
   defp find_promoted_near_dup(scope, embedding) do
+    # Same AC-41.1.8 boundary check as `recall_semantic/5`: a length mismatch here
+    # would raise a raw pgvector error on the PROMOTION WRITE path. "No near-dup
+    # found" is the correct, safe degrade (the promotion proceeds as a new row).
+    case recall_dimension_check(scope, embedding) do
+      :ok -> do_find_promoted_near_dup(scope, embedding)
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp do_find_promoted_near_dup(scope, embedding) do
     query = memory_candidate_query(scope, embedding, @near_dup_recall_pool, false)
     # `on_overload: :tag` so an over-cap TenantGate shed returns
     # `{:error, :heavy_read_overloaded}` (mapped to a loss-free snooze upstream)
@@ -2667,8 +2730,9 @@ defmodule Loopctl.Memory do
       row ->
         # US-41.1: still ONE transaction (the caller's) — the legacy column and the
         # side-table row are both written here, so the promoted row can never exist
-        # with a vector in only one location.
-        dimension = Embeddings.active_dimension(scope.tenant_id)
+        # with a vector in only one location. `resolve_write_dimension/1` because
+        # this is a WRITE and must PIN (review) — see `update_memory_embedding/4`.
+        dimension = Embeddings.resolve_write_dimension(scope.tenant_id)
 
         with {:ok, updated} <-
                update_legacy_memory_embedding(repo, row, embedding, hash, dimension),
@@ -2907,7 +2971,15 @@ defmodule Loopctl.Memory do
         # written in ONE transaction. For a non-1536 tenant the legacy step is skipped
         # entirely — that column is `vector(1536)` and pgvector hard-errors on any
         # other length, so those tenants are side-table-only.
-        dimension = Embeddings.active_dimension(tenant_id)
+        #
+        # `resolve_write_dimension/1`, NOT `active_dimension/1` (review): this is a
+        # WRITE, and the pin is what stops the DERIVED leg of `active_dimension/1`
+        # from moving under a populated corpus. A tenant whose first/only embedded
+        # corpus is MEMORIES stayed unpinned on the old call, so a later
+        # `embedding_model` edit silently re-pointed recall at a dimension with zero
+        # stored vectors and `recall_dimension_check/2` turned recall into an empty
+        # `fallback: true` result set.
+        dimension = Embeddings.resolve_write_dimension(tenant_id)
 
         Ecto.Multi.new()
         |> Embeddings.memory_embedding_multi(

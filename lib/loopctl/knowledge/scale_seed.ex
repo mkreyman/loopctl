@@ -162,6 +162,96 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   end
 
   @doc """
+  The MEMORY twin of `seed_embedding_side_table/3` (review #12).
+
+  Agent-memory recall has its OWN per-dimension indexes and its own verbatim
+  `(embedding::vector(N))` cast — a cast that must match the indexed expression
+  character-for-character — yet it was never plan-gated, so a drift there was
+  invisible while the article gate stayed green.
+  """
+  @spec seed_memory_embedding_side_table(Ecto.UUID.t(), pos_integer(), keyword()) ::
+          {:ok, %{rows: non_neg_integer(), subject_id: String.t()}}
+  def seed_memory_embedding_side_table(tenant_id, dim, opts \\ [])
+      when is_binary(tenant_id) and is_integer(dim) do
+    count = Keyword.get(opts, :count, plan_gate_corpus_size())
+    batch_size = Keyword.get(opts, :batch_size, 1_000)
+    now = DateTime.utc_now()
+    subject_id = Keyword.get(opts, :subject_id, "us411-plan-gate")
+
+    memory_ids = seed_plan_gate_memories(tenant_id, subject_id, count, now)
+
+    memory_ids
+    |> Enum.with_index()
+    |> Enum.chunk_every(batch_size)
+    |> Enum.each(fn chunk ->
+      rows =
+        Enum.map(chunk, fn {memory_id, index} ->
+          %{
+            id: Ecto.UUID.bingenerate(),
+            tenant_id: Ecto.UUID.dump!(tenant_id),
+            memory_id: Ecto.UUID.dump!(memory_id),
+            subject_id: subject_id,
+            dim: dim,
+            embedding: Pgvector.new(embedding_for(index, dim)),
+            live_denorm: true,
+            inserted_at: now,
+            updated_at: now
+          }
+        end)
+
+      AdminRepo.insert_all("memory_embeddings", rows, on_conflict: :nothing)
+    end)
+
+    AdminRepo.query!("ANALYZE memory_embeddings")
+
+    {:ok, %{rows: count, subject_id: subject_id}}
+  end
+
+  defp seed_plan_gate_memories(tenant_id, subject_id, count, now) do
+    existing = plan_gate_memory_ids(tenant_id, subject_id, count)
+
+    if length(existing) >= count do
+      Enum.take(existing, count)
+    else
+      seq = System.unique_integer([:positive])
+
+      rows =
+        for i <- length(existing)..(count - 1) do
+          %{
+            id: Ecto.UUID.bingenerate(),
+            tenant_id: Ecto.UUID.dump!(tenant_id),
+            subject_id: subject_id,
+            text: "US-41.1 memory plan gate #{seq}-#{i}",
+            confidence: 1.0,
+            source: "explicit",
+            tags: [],
+            metadata: %{},
+            recall_count: 0,
+            inserted_at: now,
+            updated_at: now
+          }
+        end
+
+      rows
+      |> Enum.chunk_every(1_000)
+      |> Enum.each(&AdminRepo.insert_all("memories", &1, on_conflict: :nothing))
+
+      plan_gate_memory_ids(tenant_id, subject_id, count)
+    end
+  end
+
+  defp plan_gate_memory_ids(tenant_id, subject_id, count) do
+    AdminRepo.all(
+      from(m in Loopctl.Memory.Memory,
+        where: m.tenant_id == ^tenant_id and m.subject_id == ^subject_id,
+        select: m.id,
+        order_by: m.id,
+        limit: ^count
+      )
+    )
+  end
+
+  @doc """
   The committed corpus size (per dimension) the AC-41.1.12(i) plan gate seeds.
 
   Set past the measured Seq-Scan/HNSW crossover (see
@@ -170,6 +260,12 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   """
   @spec plan_gate_corpus_size() :: pos_integer()
   def plan_gate_corpus_size, do: 30_000
+
+  @plan_gate_prior_tag "us411-plan-gate-prior"
+
+  @doc "The ~2%-selective tag the AC-41.1.12(i) novelty plan gate scores against."
+  @spec plan_gate_prior_tag() :: String.t()
+  def plan_gate_prior_tag, do: @plan_gate_prior_tag
 
   defp seed_plan_gate_articles(tenant_id, count, now) do
     existing =
@@ -197,7 +293,11 @@ defmodule Loopctl.Knowledge.ScaleSeed do
             category: "reference",
             status: "published",
             scope: "tenant",
-            tags: [],
+            # ~2% of the corpus carries the prior tag, so the AC-41.1.12(i) gate can
+            # EXPLAIN the SIDE-TABLE novelty aggregate against a real, SELECTIVE
+            # prior set (review): the existing US-27.7b gate only ever covered the
+            # LEGACY branch, because it runs with the cutover flag off.
+            tags: if(rem(i, 50) == 0, do: [@plan_gate_prior_tag], else: []),
             source_type: "us411_plan_gate",
             metadata: %{},
             inserted_at: now,

@@ -58,6 +58,15 @@ defmodule Loopctl.Tenants.Tenant do
     # already stored for that tenant.
     field :tenant_embedding_dimension, :integer
 
+    # US-41.1 AC-41.1.10: the MODEL that produced the corpus at
+    # `tenant_embedding_dimension`. Pinned on first write alongside the dimension so
+    # every ordinary embedding (query vectors included) is generated with the model
+    # the ACTIVE corpus was produced by, even while the tenant has already
+    # re-configured `tenant_llm_settings.embedding_model` to the PENDING one for a
+    # re-embed. Re-pinned (with the dimension, in one transaction) at re-embed
+    # completion. NEVER cast from user input.
+    field :tenant_embedding_model, :string
+
     has_many :root_authenticators, Loopctl.Tenants.RootAuthenticator, foreign_key: :tenant_id
     has_many :audit_key_history, Loopctl.Tenants.AuditKeyHistory, foreign_key: :tenant_id
 

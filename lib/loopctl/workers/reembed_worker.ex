@@ -17,10 +17,35 @@ defmodule Loopctl.Workers.ReembedWorker do
   reports completion does this worker flip `tenants.tenant_embedding_dimension` and
   drop the stale rows.
 
+  That claim is IMPLEMENTED, not asserted (review): `tenants.tenant_embedding_model`
+  pins the model that produced the active corpus, and
+  `Loopctl.Embeddings.query_model_override/1` makes every ordinary embedding — query
+  vectors AND newly-written article/memory vectors — use that PIN whenever the
+  tenant's configured model has moved away from it. A re-embed requires the tenant to
+  point `tenant_llm_settings.embedding_model` at the NEW model (that is the only way
+  target-dimension vectors can be obtained at all), and from that moment the two
+  disagree; this worker is the ONE caller that passes `embedding_model: :configured`
+  and therefore embeds with the pending model. `Embeddings.complete_reembed/2` then
+  re-pins the dimension AND the model together, in the same transaction as the
+  stale-row sweep. Without the pin, either the re-embed could never complete
+  (vectors kept arriving at the old length) or recall degraded to keyword-only for
+  the entire, corpus-sized window.
+
   Do it the other way round — persist the new dimension first — and every query
   vector is at the pending dimension while the entire corpus is still at the old
   one, so NOTHING matches: a total search outage. That is the corpus blackhole this
   ordering exists to prevent.
+
+  ## EVERYTHING the completion sweep deletes must be re-embedded first
+
+  `Embeddings.drop_stale_dimensions/2` deletes off-dimension rows from BOTH side
+  tables, so this worker migrates BOTH: tenant articles, per-tenant materializations
+  of SYSTEM-scoped articles (whose `articles.tenant_id` is NULL — the embedding row
+  carries the tenant), and agent MEMORIES. Anything the work queue does not
+  enumerate but the sweep does delete is a permanent recall blackout for those rows;
+  that is why the queue is sourced from the SIDE TABLES (`ae.tenant_id`), never from
+  `articles.tenant_id`, and why `drop_stale_dimensions/2` re-checks the precondition
+  itself and refuses to delete an incomplete corpus.
 
   ## One-time operation, not an online migration
 
@@ -29,23 +54,32 @@ defmodule Loopctl.Workers.ReembedWorker do
   degrades in no way while it runs, but it is not something to trigger casually.
   """
 
+  # UNIQUE STATES, load-bearing (review #2): Oban's DEFAULT unique states include
+  # `:executing` and `:completed`, so a job re-enqueuing ITSELF from inside its own
+  # `perform/1` conflicts with the very job doing the enqueueing — `Oban.insert/1`
+  # returns the executing job, no continuation is created, and a corpus larger than
+  # one batch silently stalls after batch 1 (never reaching `finish/2`, so the
+  # dimension is never flipped). `:completed` is excluded for the same reason across
+  # a re-run. The remaining states still collapse duplicate ENQUEUES, which is all
+  # the uniqueness is for here.
   use Oban.Worker,
     queue: :embeddings,
     max_attempts: 5,
-    unique: [keys: [:tenant_id, :target_dim], period: 300],
+    unique: [
+      keys: [:tenant_id, :target_dim],
+      period: 300,
+      states: [:available, :scheduled, :retryable]
+    ],
     replace: [scheduled: [:args, :scheduled_at]]
 
   require Logger
 
-  import Ecto.Query
   import Loopctl.Egress, only: [is_egress_refusal: 1]
 
-  alias Loopctl.AdminRepo
   alias Loopctl.Egress
   alias Loopctl.Embeddings
+  alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Knowledge
-  alias Loopctl.Knowledge.Article
-  alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Provider.Admission
@@ -68,56 +102,99 @@ defmodule Loopctl.Workers.ReembedWorker do
     trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)
   end
 
+  # The work queue is keyed off "any dimension OTHER than the target", NOT off the
+  # tenant's ACTIVE dimension (review #6). The active dimension is DERIVED
+  # (`recorded || model || default`), so a model change alone can flip it to the
+  # target while the whole corpus still sits at the old one — under the old
+  # `active == target_dim -> :ok` short-circuit that tenant's re-embed became a
+  # permanent no-op and its recall stayed empty forever.
   defp run_batch(tenant_id, target_dim) do
-    active = Embeddings.active_dimension(tenant_id)
+    batch = Knowledge.embedding_batch_max()
 
-    if active == target_dim do
-      # Already the active dimension — nothing pending, nothing to flip.
-      :ok
-    else
-      pending_batch(tenant_id, active, target_dim)
+    case Embeddings.pending_reembed_articles(tenant_id, target_dim, batch) do
+      [] -> memory_batch(tenant_id, target_dim, batch)
+      articles -> embed_article_batch(tenant_id, target_dim, articles)
     end
   end
 
-  defp pending_batch(tenant_id, active, target_dim) do
-    case pending_articles(tenant_id, active, target_dim, Knowledge.embedding_batch_max()) do
+  # MEMORIES are re-embedded by the SAME job (review #1). They were previously
+  # untouched, yet the completion sweep deletes `memory_embeddings` rows at every
+  # non-target dimension — so a "successful" re-embed wiped 100% of the tenant's
+  # agent-memory vectors with no replacement.
+  defp memory_batch(tenant_id, target_dim, batch) do
+    case Embeddings.pending_reembed_memories(tenant_id, target_dim, batch) do
       [] -> finish(tenant_id, target_dim)
-      articles -> embed_batch(tenant_id, target_dim, articles)
+      memories -> embed_memory_batch(tenant_id, target_dim, memories)
     end
   end
 
-  # Articles with a vector at the ACTIVE dimension but none yet at the target — the
-  # resumable, idempotent work queue. An anti-join, so an interrupted run resumes
-  # exactly where it stopped and a completed run is an immediate no-op.
-  defp pending_articles(tenant_id, active, target_dim, limit) do
-    AdminRepo.all(
-      from(a in Article,
-        as: :article,
-        join: ae in ArticleEmbedding,
-        on: ae.article_id == a.id and ae.tenant_id == ^tenant_id and ae.dim == ^active,
-        where: a.tenant_id == ^tenant_id,
-        where:
-          not exists(
-            from(t in ArticleEmbedding,
-              where:
-                t.article_id == parent_as(:article).id and t.tenant_id == ^tenant_id and
-                  t.dim == ^target_dim,
-              select: 1
-            )
-          ),
-        limit: ^limit,
-        select: a
-      )
-    )
+  # GROUPED BY PROJECT (review): every provider array call must carry exactly ONE
+  # egress scope. `Knowledge.generate_embeddings/3` with no `:project_id` builds the
+  # TENANT-WIDE `Egress.Scope`, and `Egress.Policy.local_only?/1` resolves the
+  # effective marking as the MOST RESTRICTIVE of tenant and project — so a nil
+  # project silently DROPS a project-only `local_only` marking. Since
+  # `pending_reembed_articles/3` spans every project and `article_text/1` ships
+  # title+body, an orchestrator-triggered re-embed was a one-shot bulk disclosure of
+  # a local_only project's bodies to the tenant default endpoint. This mirrors
+  # `BatchArticleEmbeddingWorker`, which groups for exactly this reason.
+  #
+  # Memories legitimately stay tenant-scoped: a memory has no project-level egress
+  # marking to honour.
+  defp embed_article_batch(tenant_id, target_dim, articles) do
+    articles
+    |> Enum.group_by(& &1.project_id)
+    |> Enum.reduce_while(:ok, fn {project_id, group}, :ok ->
+      entries = Enum.map(group, fn a -> {a, article_text(a)} end)
+
+      result =
+        embed_and_store(tenant_id, target_dim, entries, [project_id: project_id], fn triples ->
+          Embeddings.upsert_article_embeddings(tenant_id, triples, dimension: target_dim)
+        end)
+
+      case result do
+        :ok -> {:cont, :ok}
+        other -> {:halt, other}
+      end
+    end)
+    |> case do
+      :ok -> finish_batch(tenant_id, target_dim)
+      other -> other
+    end
   end
 
-  defp embed_batch(tenant_id, target_dim, articles) do
-    entries = Enum.map(articles, fn a -> {a, embedding_text(a)} end)
-    texts = Enum.map(entries, fn {_a, text} -> text end)
+  defp embed_memory_batch(tenant_id, target_dim, memories) do
+    entries = Enum.map(memories, fn m -> {m, memory_text(m)} end)
 
-    case Knowledge.generate_embeddings(tenant_id, texts) do
+    case embed_and_store(tenant_id, target_dim, entries, [], fn triples ->
+           Embeddings.upsert_memory_embeddings(tenant_id, triples, dimension: target_dim)
+         end) do
+      :ok -> finish_batch(tenant_id, target_dim)
+      other -> other
+    end
+  end
+
+  defp finish_batch(tenant_id, target_dim) do
+    emit_progress(tenant_id, Embeddings.reembed_progress(tenant_id, target_dim))
+    continue(tenant_id, target_dim)
+  end
+
+  # ONE provider array call PER EGRESS SCOPE, ONE dimension check, then the batch
+  # write. The dimension check is per BATCH and BEFORE the first write (review #10):
+  # letting a wrong-length vector reach the changeset validator burned all five Oban
+  # attempts on full-batch provider spend and discarded with an opaque changeset.
+  #
+  # `embedding_model: :configured` is the ONE deliberate opt-out from the AC-41.1.10
+  # model pin (review): every OTHER embedding in the product is generated with the
+  # model that produced the ACTIVE corpus, precisely so recall does not black out
+  # while this runs. This worker's whole job is to produce vectors at the PENDING
+  # model's dimension, so it — and only it — uses the tenant's currently configured
+  # model.
+  defp embed_and_store(tenant_id, target_dim, entries, opts, store_fun) do
+    texts = Enum.map(entries, fn {_subject, text} -> text end)
+
+    case Knowledge.generate_embeddings(tenant_id, texts, [embedding_model: :configured] ++ opts) do
       {:ok, vectors} when length(vectors) == length(entries) ->
-        store_all(tenant_id, target_dim, Enum.zip(entries, vectors))
+        store_checked(tenant_id, target_dim, entries, vectors, store_fun)
 
       {:ok, _mismatch} ->
         {:error, :embedding_batch_length_mismatch}
@@ -127,60 +204,87 @@ defmodule Loopctl.Workers.ReembedWorker do
     end
   end
 
-  defp store_all(tenant_id, target_dim, pairs) do
-    result =
-      Enum.reduce_while(pairs, :ok, fn {{article, text}, vector}, :ok ->
+  defp store_checked(tenant_id, target_dim, entries, vectors, store_fun) do
+    case Dimensions.check_batch_length(vectors, target_dim) do
+      :ok ->
+        triples =
+          Enum.zip_with(entries, vectors, fn {subject, text}, vector ->
+            {subject, vector, content_hash(text)}
+          end)
+
         # The side table ONLY: the legacy column is vector(1536) and the target
         # dimension is by definition not the active one, so a dual-write here is
         # either physically impossible (non-1536) or would clobber the still-serving
         # active corpus. AC-41.1.8's dual-write is dim-1536-scoped for this reason.
-        case Embeddings.upsert_article_embedding(
-               tenant_id,
-               article,
-               vector,
-               content_hash(text),
-               target_dim
-             ) do
-          {:ok, _row} -> {:cont, :ok}
-          {:error, reason} -> {:halt, {:error, reason}}
+        with {:ok, _rows} <- store_fun.(triples) do
+          :ok
         end
-      end)
 
-    with :ok <- result do
-      progress = Embeddings.reembed_progress(tenant_id, target_dim)
-      emit_progress(tenant_id, progress)
-      continue(tenant_id, target_dim)
+      {:error, {:dimension_mismatch, expected, actual}} ->
+        Logger.error(
+          "ReembedWorker: tenant=#{tenant_id} model returned #{inspect(actual)}-dimension " <>
+            "vectors but the re-embed targets #{expected}; discarding rather than " <>
+            "re-billing the provider for four more attempts."
+        )
+
+        {:discard, {:dimension_mismatch, expected, actual}}
     end
   end
 
+  # Self-continuation. See the `unique:` comment above: without the narrowed unique
+  # states this insert is swallowed by the CURRENTLY EXECUTING job and the run stops
+  # after one batch. The insert result is checked so a genuine failure to schedule
+  # the next batch retries the job rather than silently reporting success.
   defp continue(tenant_id, target_dim) do
     %{tenant_id: tenant_id, target_dim: target_dim}
     |> __MODULE__.new(schedule_in: 1)
     |> Oban.insert()
-
-    :ok
+    |> case do
+      {:ok, _job} -> :ok
+      {:error, reason} -> {:error, {:reembed_continuation_failed, reason}}
+    end
   end
 
-  # COMPLETION, in the only safe order: flip the tenant's active dimension FIRST
-  # (the whole corpus is now present at the target), then drop the stale-dimension
-  # rows. Between the two, recall is already correct at the new dimension and the
-  # old rows are merely unused — the reverse order would leave a window with no
-  # corpus at either dimension.
+  # COMPLETION — ONE transaction that VERIFIES, then pins, then sweeps
+  # (`Embeddings.complete_reembed/2`).
+  #
+  # This used to pin FIRST and then call `drop_stale_dimensions/2`, which re-checks
+  # `reembed_complete?/2` and can return `{:error, :reembed_incomplete}` — the
+  # fail-closed guard for exactly the race where a new off-dimension row appears
+  # after the last batch. When that guard fired the pin had ALREADY moved: recall
+  # served the target corpus while the raced rows existed only at the old dimension,
+  # silently absent from results; if the job then exhausted its attempts the tenant
+  # was left permanently pinned at the target with un-migrated rows excluded from
+  # recall (review). Verifying and pinning inside the sweep's transaction means the
+  # pin moves only on an interleaving where the sweep is also safe.
   defp finish(tenant_id, target_dim) do
-    with {:ok, _tenant} <- Embeddings.set_tenant_dimension(tenant_id, target_dim) do
-      {:ok, dropped} = Embeddings.drop_stale_dimensions(tenant_id, target_dim)
+    case Embeddings.complete_reembed(tenant_id, target_dim) do
+      {:ok, dropped} ->
+        emit_progress(tenant_id, %{
+          Embeddings.reembed_progress(tenant_id, target_dim)
+          | complete: true
+        })
 
-      emit_progress(tenant_id, %{
-        Embeddings.reembed_progress(tenant_id, target_dim)
-        | complete: true
-      })
+        Logger.info(
+          "ReembedWorker: tenant=#{tenant_id} completed re-embed onto #{target_dim} dims; " <>
+            "dropped #{dropped} stale-dimension row(s)."
+        )
 
-      Logger.info(
-        "ReembedWorker: tenant=#{tenant_id} completed re-embed onto #{target_dim} dims; " <>
-          "dropped #{dropped} stale-dimension row(s)."
-      )
+        :ok
 
-      :ok
+      # Something raced a new off-dimension row in: NOTHING was pinned or dropped,
+      # so retrying is loss-free and recall is untouched meanwhile.
+      {:error, :reembed_incomplete} ->
+        {:error, :reembed_incomplete}
+
+      {:error, :not_found} ->
+        {:discard, {:tenant_not_found, tenant_id}}
+
+      {:error, :unsupported_dimension} ->
+        {:discard, {:unsupported_dimension, target_dim}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -227,9 +331,11 @@ defmodule Loopctl.Workers.ReembedWorker do
     end
   end
 
-  defp embedding_text(article) do
+  defp article_text(article) do
     String.slice("#{article.title}\n\n#{article.body}", 0, @max_text_length)
   end
+
+  defp memory_text(memory), do: String.slice(memory.text || "", 0, @max_text_length)
 
   defp content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
 end

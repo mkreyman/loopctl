@@ -327,6 +327,11 @@ config :loopctl, :cost_rollup, Loopctl.MockCostRollup
 # DI: Use mock token archival in tests
 config :loopctl, :token_archival, Loopctl.MockTokenArchival
 
+# US-41.1: disable the disclosure-meta memoization in tests so a test that changes
+# the system-corpus / re-embed state observes it on the very next search (the cache
+# is a hot-path optimization, not behavior).
+config :loopctl, :embedding_disclosure_cache_ms, 0
+
 # DI: Use mock embedding client in tests
 config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient
 
