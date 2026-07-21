@@ -84,4 +84,22 @@ defmodule LoopctlWeb.Plugs.RequireRole do
       |> halt()
     end
   end
+
+  # FAIL-CLOSED catch-all (#461 item 1). The three clauses above all pattern-match
+  # `assigns.current_api_key`, so a route that mounts this plug WITHOUT an
+  # authentication plug ahead of it (a future router mistake) would otherwise raise
+  # FunctionClauseError — a 500 that leaks a stacktrace and, worse, fails OPEN
+  # relative to the intended access decision. Instead we return a clean 401: no
+  # authenticated key means the caller is unauthorized, never silently allowed.
+  def call(conn, _opts) do
+    conn
+    |> put_status(:unauthorized)
+    |> Phoenix.Controller.json(%{
+      error: %{
+        status: 401,
+        message: "Authentication required"
+      }
+    })
+    |> halt()
+  end
 end
