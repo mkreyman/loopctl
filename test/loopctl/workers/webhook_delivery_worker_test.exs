@@ -236,4 +236,49 @@ defmodule Loopctl.Workers.WebhookDeliveryWorkerTest do
       assert unchanged_event.status == :pending
     end
   end
+
+  describe "per-tenant fair-share gate on the :webhooks queue (#461 item 6)" do
+    # Seed a raw executing :webhooks oban_jobs row for a tenant (Oban-owned table,
+    # no RLS → AdminRepo, same as FairShareTest). A direct insert occupies a slot
+    # WITHOUT running the job, so we can push a tenant over its fair share.
+    defp seed_executing_webhook_job(tenant_id) do
+      %{"tenant_id" => tenant_id}
+      |> Oban.Job.new(worker: "Loopctl.Workers.WebhookDeliveryWorker", queue: "webhooks")
+      |> Ecto.Changeset.put_change(:state, "executing")
+      |> AdminRepo.insert!()
+    end
+
+    test "snoozes (loss-free) when the tenant is over its fair share of executing slots" do
+      %{tenant: tenant, event: event} = create_test_event()
+
+      # webhooks queue width is 5 → derived cap = ceil(5/2) = 3. The job under test
+      # carries no Oban id (bare struct), so the gate uses the unscoped executing
+      # count; three executing rows for this tenant put it AT the cap.
+      for _ <- 1..3, do: seed_executing_webhook_job(tenant.id)
+
+      assert {:snooze, n} = WebhookDeliveryWorker.perform(build_job(event, tenant))
+      assert is_integer(n) and n > 0
+
+      # A snooze must NOT touch the event — no delivery attempt was made.
+      unchanged = AdminRepo.get!(WebhookEvent, event.id)
+      assert unchanged.status == :pending
+      assert unchanged.attempts == 0
+    end
+
+    test "proceeds with normal delivery when the tenant is under its fair share" do
+      %{tenant: tenant, event: event} = create_test_event()
+
+      # Two executing rows is below the cap of 3 → the gate allows the delivery.
+      for _ <- 1..2, do: seed_executing_webhook_job(tenant.id)
+
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
+        Req.Test.json(conn, %{"ok" => true})
+      end)
+
+      assert :ok = WebhookDeliveryWorker.perform(build_job(event, tenant))
+
+      delivered = AdminRepo.get!(WebhookEvent, event.id)
+      assert delivered.status == :delivered
+    end
+  end
 end

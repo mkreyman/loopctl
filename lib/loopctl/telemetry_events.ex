@@ -186,8 +186,9 @@ defmodule Loopctl.TelemetryEvents do
 
     * `measurements`: `%{count: 1}` — a pure increment.
     * `metadata`: `%{provider, class}` where `provider` is `"anthropic"` |
-      `"embedding"` (a BOUNDED 2-value set, the same credential/vendor split
-      `Loopctl.Llm.blocked_credential_provider/1` already uses) and `class` is
+      `"embedding"` | `"openai_compatible"` (a BOUNDED 3-value set since US-41.3 —
+      the FIXED provider atom's string form, NEVER the tenant-supplied host, which
+      would make the dimension unbounded) and `class` is
       `:transient` | `:permanent` (per `Loopctl.Llm.permanent_provider_error?/1`).
       The reason feeding classification has already been run through
       `Loopctl.Llm.ProviderError.sanitize/1`, so no key/body ever reaches this event.

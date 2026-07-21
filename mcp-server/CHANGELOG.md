@@ -5,7 +5,7 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## 2.54.0 — 2026-07-20 (per-tenant embedding dimension — US-41.1)
+## 2.56.0 — 2026-07-21 (per-tenant embedding dimension — US-41.1)
 
 ### Added
 
@@ -21,6 +21,104 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   per-tenant system-article materializations AND agent memories) onto a new dimension.
   Recall keeps serving at the current dimension for the whole run. One-time and
   cost-bearing; orchestrator-role because completion deletes the stale-dimension rows.
+## 2.55.0 — 2026-07-21 (witnessed egress custody claim — US-41.7)
+
+### Added
+
+- **`custody_claim`** — the recorded egress custody claim for one article or memory
+  row. Not a write-time snapshot: an APPEND-ONLY SEQUENCE of per-operation postures
+  (the create, each embedding, each re-embed, each classification/merge), each
+  carrying the endpoint loopctl actually resolved for THAT operation and its
+  locality verdict. A single snapshot would be falsified the moment an async
+  embedding job or an agent-triggered re-embed shipped the body to a different
+  endpoint.
+  - Three states, and only one of them is an attestation: `no_claim_recorded`
+    (no operation sequence was ever assigned — asserts nothing either way),
+    `claim_pending` (assigned, batch append not yet flushed; carries the pending
+    count and the batch references), and `claim_recorded`, itself `complete` or
+    `incomplete`.
+  - Completeness is PROVEN: the recorded entries must form a contiguous sequence up
+    to a PERSISTED per-row high-water mark (not to the maximum of the rows that
+    happen to survive, which would let tail loss restore a satisfied claim). A gap —
+    a lost batch job, a dropped append, a deleted entry — is reported `incomplete`,
+    NEVER as no-third-party-egress. A fourth reading, `partial_history`, covers a row
+    whose recording began after it already existed.
+  - `third_party_egress_on_covered_paths` is `false` only when every recorded
+    endpoint was NETWORK-local. A tenant-declared endpoint is a public host the
+    tenant merely attested is its own, so an all-local sequence resting on one
+    reports `"tenant_declared_unverified"` instead.
+  - Rides the EXISTING chain-of-custody machinery. Every recorded entry carries a
+    `chain_position` in the tenant's hash-chained audit log, and the new public
+    `GET /api/v1/audit/sth/{tenant_id}/inclusion/{position}` returns a merkle audit
+    path that folds up to the `merkle_root` inside the already-published, ed25519
+    signed tree head. No parallel signing scheme.
+  - Explicit `coverage` field enumerating which egress paths the attestation covers
+    and which it does not, with the reason. The wording stays scoped to the
+    endpoints loopctl called for THIS row; it says nothing about what those
+    endpoints did with the data afterwards.
+- **`custody_failures`** — entries whose chain append was dropped after exhausting
+  retries, plus `stale_pending` entries stranded by a flush that died outside its own
+  final-attempt branch, so a recording failure is legible rather than silently absent.
+
+## 2.54.0 — 2026-07-20 (pluggable OpenAI-compatible chat endpoint — US-41.3)
+
+### Added
+
+- **`set_llm_config`** gains four params so the CHAT surface (ingest extraction,
+  classification, merge synthesis, memory promotion) can run against a tenant's OWN
+  OpenAI-compatible endpoint instead of the hardcoded Anthropic one. That surface
+  carries the largest and most sensitive payload in the pipeline — a harvested
+  document's full text — so a private tier without it would be a guarantee that is
+  false in the one place users most assume it holds.
+  - `chat_provider` — `anthropic` (default, unchanged) or `openai_compatible`.
+  - `chat_base_url` — the API base of your server; the client appends
+    `/chat/completions`.
+  - `chat_api_key` — the credential for THAT endpoint. A SEPARATE encrypted column
+    from `api_key`: your Anthropic key is never transmitted to your host. OPTIONAL:
+    omit it for a KEYLESS server (Ollama / llama.cpp / LM Studio / vLLM commonly
+    serve `/chat/completions` with no auth) and no authorization header is sent.
+  - `acknowledge_key_transmission` — required when CHANGING `chat_base_url` to a NEW
+    host without supplying a matching `chat_api_key`; the probe never ships an
+    already-stored credential to a new host silently. A same-host re-probe (a model
+    change, a key rotation) needs no acknowledgement.
+
+  `extraction_model` is REQUIRED alongside `chat_provider: "openai_compatible"` —
+  the per-operation server default is an Anthropic model id no OpenAI-compatible
+  endpoint can serve, so there is no safe fallback — and it is the fallback for
+  `classification_model` / `merge_model` on that provider.
+
+  The endpoint is PROBED with a trivial completion PER DISTINCT RESOLVED MODEL
+  BEFORE anything is persisted: unreachable, auth-rejected and
+  not-OpenAI-compatible are distinguished 422s, each carrying an ACTION-REQUIRED
+  `remediation`, and nothing is saved on failure. The probe re-runs whenever the
+  chat SURFACE changes — provider, base_url, a rotated key or any per-operation
+  model — not only when the URL string moves. Because `chat_base_url` is
+  tenant-writable it is also held to the SSRF denylist: a host resolving into a
+  private/loopback/CGNAT/link-local range is refused unless the OPERATOR
+  deployment allowlist carves it out, and a host that cannot be resolved/classified
+  at all is refused rather than called unpinned. The write stays **role `:user`** —
+  the same PATCH stores tenant secrets.
+
+  `chat_base_url` must be a BARE API base — no query string, no fragment, no
+  embedded `user:pass@` credentials (the client appends `/chat/completions` to it,
+  and unlike `chat_api_key` the column is NOT encrypted, so anything in the URL is
+  stored, audited and echoed back in plaintext). Plaintext `http` is accepted ONLY
+  for a host the egress policy classifies network-local — the request carries your
+  key AND your full document text, so a public `http://` endpoint is refused with
+  `chat_endpoint_plaintext_refused`; use `https`.
+
+  Model ids may contain `/`, so HuggingFace repo ids
+  (`meta-llama/Meta-Llama-3-8B-Instruct`, `Qwen/Qwen2.5-7B-Instruct`) — what vLLM,
+  TGI, LM Studio and llama.cpp actually serve — are valid `extraction_model` values.
+
+### Changed
+
+- **`llm_config`** now also returns `chat_provider`, `chat_base_url` (echoed — it is
+  your own declared host, not a secret), `has_chat_key` and `chat_api_key_hint`.
+  No key is ever returned.
+- **`knowledge_llm_usage`** rows are now grouped by `provider` as well, so a local
+  endpoint's spend is distinguishable from Anthropic's. A local endpoint that
+  reports no usage records a row with ZERO tokens — never a silently absent row.
 
 ## 2.53.1 — 2026-07-20 (US-41.4 review fixes)
 

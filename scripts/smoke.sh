@@ -201,7 +201,10 @@ wait_for_health() {
 }
 
 # /health JSON shape (Loopctl.HealthCheck.Default):
-#   { "status": "ok"|"degraded", "version": "...", "checks": { "database": "ok", "oban": "ok" } }
+#   { "status": "ok"|"degraded", "ready": true|false,
+#     "checks": { "database": "ok", "oban": "ok", "scale_alerts": "ok", "oban_orphans": "ok" } }
+# (#461 item 5 removed the "version" field — the running build is deliberately not
+#  disclosed on this unauthenticated endpoint.)
 # It returns 503 "degraded" if EITHER db OR the Oban :default queue check fails. A
 # transient Oban blip with a healthy DB+KB is NOT a rollback signal, so we HARD
 # require HTTP 200 + database=="ok" and treat Oban-only degradation as a WARN (pass).

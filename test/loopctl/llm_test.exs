@@ -235,6 +235,32 @@ defmodule Loopctl.LlmTest do
       assert length(rows_b) == 1
     end
 
+    test "rows differing ONLY by provider still page stably (US-41.3 review)" do
+      # `provider` joined the group_by in US-41.3; leaving it out of the order_by
+      # left these three rows tied on EVERY ordering key, so Postgres could order
+      # them arbitrarily between LIMIT/OFFSET pages and duplicate or drop one.
+      tenant = fixture(:tenant)
+
+      for provider <- ["anthropic", "openai_compatible", "embedding"] do
+        {:ok, _} =
+          Llm.record_usage(tenant.id, %{
+            operation: :extraction,
+            model: "same-model-id",
+            provider: provider,
+            input_tokens: 1,
+            output_tokens: 1,
+            source_type: "s"
+          })
+      end
+
+      %{data: page1, meta: meta} = Llm.usage_summary(tenant.id, limit: 2, offset: 0)
+      %{data: page2} = Llm.usage_summary(tenant.id, limit: 2, offset: 2)
+
+      assert meta.total_count == 3
+      providers = Enum.map(page1 ++ page2, & &1.provider)
+      assert Enum.sort(providers) == ["anthropic", "embedding", "openai_compatible"]
+    end
+
     test "paginates with a stable order across pages" do
       tenant = fixture(:tenant)
 

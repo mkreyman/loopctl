@@ -2,14 +2,36 @@ defmodule LoopctlWeb.Endpoint do
   require Logger
   use Phoenix.Endpoint, otp_app: :loopctl
 
-  # The session will be stored in the cookie and signed,
-  # this means its contents can be read but not tampered with.
-  # Set :encryption_salt if you would also like to encrypt it.
+  # The session is stored in the cookie. It is BOTH signed (tamper-proof) and now
+  # ENCRYPTED (`encryption_salt`, a value distinct from `signing_salt`) so the
+  # signup-flow payload it carries — the client IP handed to `SignupLive` through
+  # the signed session (see the ClientIp note below) — is opaque at rest in the
+  # browser, not merely read-only (#461 item 3).
+  #
+  # ONE-TIME CUTOVER SIDE EFFECT: adding `encryption_salt` converts `_loopctl_key`
+  # from signed-only to signed+encrypted, so on the deploy that ships this, every
+  # pre-existing browser cookie (signed but not encrypted) can no longer be
+  # decrypted by Plug.Session and is silently discarded — a fresh empty session is
+  # started. Any in-flight signup relying on the session-carried client IP
+  # (SignupLive) and any active browser/LiveView session lose state at cutover.
+  # This self-heals within one request and is acceptable for a short signup flow;
+  # it is called out here so the transient invalidation is not shipped silently.
+  #
+  # `http_only: true` (the `:cookie` store's default, made explicit) keeps the
+  # cookie off `document.cookie`, and `secure:` marks it HTTPS-only in prod.
+  # `secure` is COMPILE-ENV gated (`config :loopctl, :session_secure` — true only in
+  # prod, see config/prod.exs): a hardcoded `secure: true` would stop the browser
+  # sending the cookie over plain HTTP in dev/test, breaking the LiveView WebSocket
+  # session handoff signup relies on. Prod already terminates TLS + `force_ssl`, so
+  # HTTP never reaches it.
   @session_options [
     store: :cookie,
     key: "_loopctl_key",
     signing_salt: "M0SC+kIe",
-    same_site: "Lax"
+    encryption_salt: "e5HwWdTe",
+    same_site: "Lax",
+    http_only: true,
+    secure: Application.compile_env(:loopctl, :session_secure, false)
   ]
 
   # The signup rate limiter no longer resolves the client IP from the fragile

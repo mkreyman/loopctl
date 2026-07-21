@@ -16,6 +16,14 @@ Or run directly with npx:
 npx loopctl-mcp-server
 ```
 
+### Requirements
+
+- **Node.js >= 20.6.0.** The server makes all outbound HTTPS calls through Node's
+  global `fetch` (undici). Node 20.6.0 is the first release where that transport
+  honors `NODE_EXTRA_CA_CERTS` (the setting used for a custom/self-signed loopctl
+  CA -- see Troubleshooting below). On older runtimes that env var is silently
+  ignored, so the floor is enforced via `engines` in `package.json`.
+
 ## Configuration
 
 Add to your `.mcp.json` (Claude Code) or equivalent MCP config:
@@ -121,7 +129,7 @@ REST endpoint (`PATCH /api/v1/tenants/me/llm-config`), and the docs — so you (
 autonomous agent) can self-remediate without a human. Full agent-tenant lifecycle:
 [`docs/onboarding-agent-tenant.md`](../docs/onboarding-agent-tenant.md).
 
-## Tools (109)
+## Tools
 
 > Plus **per-tenant generated Context Retriever tools** (`cr_*`) appended
 > dynamically at runtime — see [Dynamic per-tenant Context Retriever
@@ -300,7 +308,7 @@ it is enforced server-side and a no-op for a non-superadmin key — see below.)
 | Tool | Description |
 |---|---|
 | `llm_config` | **Check your onboarding status.** Get the tenant's BYO LLM config: per-operation models and whether each key is set — `has_api_key` (Anthropic) / `has_embedding_key` (OpenAI embedding) — plus masked last-4 hints. Never returns a key. Requires **user** key. |
-| `set_llm_config` | **First-time setup (do once).** Set/rotate the tenant's OWN **Anthropic `api_key`** (powers ingest) AND **OpenAI `embedding_api_key`** (powers semantic search) — both stored encrypted, never returned — plus the per-operation models (`extraction_model`/`classification_model`/`merge_model`/`embedding_model`). Any subset; partial-merge (omitting a key leaves it untouched). See [First-time setup](#first-time-setup--provision-your-byo-llm-keys). Requires **user** key. |
+| `set_llm_config` | **First-time setup (do once).** Set/rotate the tenant's OWN **Anthropic `api_key`** (powers ingest) AND **OpenAI `embedding_api_key`** (powers semantic search) — both stored encrypted, never returned — plus the per-operation models (`extraction_model`/`classification_model`/`merge_model`/`embedding_model`). Any subset; partial-merge (omitting a key leaves it untouched). **Private tier (US-41.3):** also sets `chat_provider` (`anthropic` | `openai_compatible`), `chat_base_url`, `extraction_model` (required on that provider) and `chat_api_key` (optional — omit it for a keyless local server) so ingest extraction / classification / merge / memory promotion run against YOUR OWN OpenAI-compatible endpoint and document text never leaves your boundary. Every model the config resolves to is PROBED with a trivial completion before it is saved (a 422 persists nothing); the probe re-runs on any chat-surface change (provider, base_url, key rotation, model), a private-range host is refused by the SSRF guard, and moving to a NEW host needs a matching `chat_api_key` or `acknowledge_key_transmission: true`. See [First-time setup](#first-time-setup--provision-your-byo-llm-keys). Requires **user** key. |
 | `knowledge_llm_usage` | Per-tenant LLM token-usage summary, grouped by operation + model + source_type + day over an optional `from`/`to` range (defaults to a 90-day lookback; effective window echoed in `meta.from`/`meta.to`), with `limit`/`offset` pagination. Record-only (no budget enforcement). Requires orchestrator key. |
 
 ### Knowledge Analytics Tools (orchestrator key)
@@ -327,6 +335,8 @@ nothing changes until a scope opts in.
 | `declare_trusted_endpoint` | Declare a host you attest is YOUR OWN so a `local_only` scope can reach it. **This is an unverified tenant attestation, not network locality** — labelled as such everywhere. Three enforced constraints: PUBLIC addresses only (write time AND pin time), PURPOSE-SCOPED (`inference` / `webhook` / `ingest`), vendor hosts excluded. Carves nothing out of the SSRF denylist. Requires **user** key. |
 | `revoke_trusted_endpoint` | Revoke a declaration. Invalidation is IMMEDIATE and cluster-wide — a revoked declaration does not keep working for the remainder of the pin TTL. Requires **user** key. |
 | `egress_repin` | Recover from a `:pin_stale` error (your box got a new DHCP lease and the pinned address set changed — DISTINCT from `egress_blocked`). Re-resolves and re-pins the host. **Agent** key by design: requiring a human user-role write to recover would contradict loopctl's agent-native, no-UI design. |
+| `custody_claim` | The recorded **egress custody claim** for one article or memory row: the append-only sequence of per-operation postures (create, each embed, each re-embed, each classification, each merge) with the endpoints resolved for THAT operation and their verdicts, plus the aggregate. Rides the existing hash-chained audit log + signed tree heads — each entry carries a `chain_position` and the leaf's `chain_entry_hash`, so `GET /api/v1/audit/sth/{tenant_id}/inclusion/{position}` proves inclusion of *that* leaf, and the leaf's payload names this row by a recomputable `posture_digest`. THREE states, only one an attestation: `no_claim_recorded`, `claim_pending`, `claim_recorded` (`complete` / `partial_history` / `incomplete`). Completeness is measured against a persisted per-row high-water mark, so losing the tail of a sequence is a gap, not a clean claim. `third_party_egress_on_covered_paths` is `false` only for NETWORK-local endpoints; a tenant-declared (unverified) endpoint yields `"tenant_declared_unverified"`. Attests ONLY to the endpoints loopctl called on the paths in `coverage` — never to what those endpoints did afterwards. **Agent** key. |
+| `custody_failures` | Custody posture entries whose chain append was DROPPED after exhausting retries, plus `stale_pending` entries stranded by a flush that died outside its own final-attempt branch. Surfaced rather than silently absent: each `data` entry degrades its row's claim to `incomplete`, and a stranded entry would otherwise read as an in-flight claim forever. **Agent** key. |
 
 ### Discovery Tools
 
@@ -522,7 +532,8 @@ clean one-time bootstrap (no cross-key collision).
 
 - Verify `LOOPCTL_SERVER` is set and reachable
 - Check that the server URL includes the protocol (`https://`)
-- If using a self-signed certificate, set `NODE_TLS_REJECT_UNAUTHORIZED=0` in your environment (not recommended for production)
+- If your loopctl server uses a custom or self-signed CA, set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` in your environment so Node trusts that CA while keeping TLS certificate verification enabled. This requires **Node >= 20.6.0** (or the >= 18.19.0 backport): this server issues all requests through Node's global `fetch` (undici), which only began honoring `NODE_EXTRA_CA_CERTS` in those releases. On older runtimes the variable is silently ignored and you will still see `unable to verify the first certificate` / self-signed-cert errors -- upgrade Node rather than disabling verification.
+- Do NOT set `NODE_TLS_REJECT_UNAUTHORIZED=0` -- it disables certificate verification for the entire Node process (all outbound TLS), exposing every connection to MITM, not just the loopctl one
 
 ### Authentication errors (401)
 

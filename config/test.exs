@@ -524,6 +524,12 @@ config :loopctl, :ingestion_req_plug, {Req.Test, Loopctl.Workers.ContentIngestio
 # dedicated LLM tests override with crafted content + usage blocks.
 config :loopctl, :anthropic_req_plug, {Req.Test, Loopctl.Llm.Anthropic}
 
+# US-41.3: the same seam for the OpenAI-compatible chat client + its config-time
+# endpoint probe, so the whole pluggable-provider flow (per-tenant endpoint/key
+# resolution, admission, egress chokepoint, shape validation, usage recording) is
+# exercised without a real local server.
+config :loopctl, :openai_chat_req_plug, {Req.Test, Loopctl.Llm.OpenAiChat}
+
 # Epic 28 (#179) embeddings BYO: route the real tenant-scoped EmbeddingClient
 # through a Req.Test plug so its own dedicated test exercises per-tenant key
 # resolution + usage recording without real OpenAI calls. Everywhere ELSE the
@@ -628,3 +634,12 @@ config :loopctl, :local_endpoint_allowlist, []
 # sandbox transaction). Tests drain their OWN tenant with
 # `Loopctl.Egress.flush_blocked_decisions/1`.
 config :loopctl, :egress_blocked_flush_ms, :infinity
+
+# US-41.7 (AC-41.7.6 / TC-41.7.8): coverage is a DI seam so both configurations
+# (webhook coverage enabled / disabled) are exercisable without `put_env` in a
+# test file. The DataCase default stub delegates to the real
+# `Loopctl.Custody.Coverage`, so every other test sees production coverage.
+config :loopctl, :custody_coverage_source, Loopctl.MockCustodyCoverage
+
+# No debounce in test: a drain immediately after a write must flush the batch.
+config :loopctl, :custody_flush_debounce_seconds, 0

@@ -115,15 +115,60 @@ defmodule Loopctl.Egress.ChokepointScanTest do
       end
     end
 
-    test "the known-unguarded call sites are named explicitly, not silently missed" do
+    test "the remaining non-content call sites are named explicitly, not silently missed" do
       allowed = ChokepointScan.allowed()
 
-      # These three are the sites Admission itself misses today. Naming them here
-      # is the point: the gap is DOCUMENTED, not invisible.
-      assert Map.has_key?(allowed, "Loopctl.Webhooks.ReqDelivery")
-      assert allowed["Loopctl.Webhooks.ReqDelivery"] =~ "US-41.5"
+      # Naming them here is the point: each exemption is DOCUMENTED, not invisible.
       assert Map.has_key?(allowed, "Loopctl.Verification.GitHubActions")
       assert Map.has_key?(allowed, "Loopctl.Secrets.FlyAdapter")
+      assert Map.has_key?(allowed, "Loopctl.CLI.Client")
+    end
+
+    # US-41.5 brought webhook delivery UNDER the guard, so its allowlist entry is
+    # now the same kind of entry `Loopctl.Provider` has — "IS the wrapper" — not
+    # "a known gap". A justification that still reads as a deferral would mean the
+    # docs and the posture report are claiming coverage the code does not have.
+    test "the webhook entry is a WRAPPER exemption, not a deferred gap" do
+      justification = ChokepointScan.allowed()["Loopctl.Webhooks.ReqDelivery"]
+
+      assert justification =~ "webhook chokepoint wrapper"
+      assert justification =~ "Egress.Policy"
+      assert justification =~ ":webhook"
+      refute justification =~ "Bringing it under"
+      refute justification =~ "must NOT claim total egress control yet"
+    end
+
+    # AC-41.5.6: the doc triage list must MATCH the static check's findings
+    # EXACTLY — an allowlisted call site with no triage entry is a review failure.
+    # Asserting it mechanically is what makes the audit standing rather than a
+    # paragraph that rots at the next merge.
+    test "every allowlisted module has a triage row in docs/egress-guard.md" do
+      doc = File.read!("docs/egress-guard.md")
+
+      for {module, _justification} <- ChokepointScan.allowed() do
+        assert doc =~ module,
+               "#{module} is exempted by the static check but has NO triage entry in " <>
+                 "docs/egress-guard.md (AC-41.5.6)"
+      end
+    end
+
+    # The other direction of AC-41.5.6: the paths the triage table claims are
+    # UNDER the guard must genuinely not be exempt. If either ever acquired an
+    # allowlist entry, the table would be advertising coverage that the static
+    # check had stopped enforcing.
+    test "the paths documented as UNDER the guard are NOT allowlisted" do
+      doc = File.read!("docs/egress-guard.md")
+      allowed = ChokepointScan.allowed()
+
+      for module <- [
+            "Loopctl.Workers.ContentIngestionWorker",
+            "Loopctl.Workers.ScaleAlertDeliveryWorker"
+          ] do
+        assert doc =~ module, "#{module} is missing from the triage table (AC-41.5.6)"
+
+        refute Map.has_key?(allowed, module),
+               "#{module} is documented as being UNDER the guard but is allowlisted out of it"
+      end
     end
   end
 

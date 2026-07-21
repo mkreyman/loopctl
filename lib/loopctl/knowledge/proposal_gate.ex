@@ -52,6 +52,25 @@ defmodule Loopctl.Knowledge.ProposalGate do
   def assess(nil, _attrs, _opts), do: open_verdict()
 
   def assess(tenant_id, attrs, opts) when is_binary(tenant_id) do
+    {embedding, gate_embedded?} = reuse_or_generate_embedding(tenant_id, attrs, opts)
+
+    tenant_id
+    |> do_assess(opts, embedding)
+    # US-41.7: the create path's OWN egress fact, threaded to the custody entry.
+    # This gate embeds the proposal's title+body SYNCHRONOUSLY inside
+    # `Knowledge.propose_article/3`, BEFORE the article row exists — so there is no
+    # earlier row to hang an entry on, and a `:low_novelty` proposal is created as a
+    # DRAFT, which never enqueues an embedding worker. Without this flag the create
+    # entry (whose `endpoint_kinds` are `[]`) would be the row's ONLY entry and would
+    # read `all_network_local` VACUOUSLY for a body already POSTed to the resolved
+    # embedding host. `true` means the guarded embedding path was INVOKED — which
+    # deliberately includes an invocation that then failed, because a call that
+    # egressed and then errored still egressed, and under-recording is the failure
+    # mode that produces a false zero-egress claim.
+    |> Map.put(:gate_embedded, gate_embedded?)
+  end
+
+  defp do_assess(tenant_id, opts, embedding) do
     dup = config(:knowledge_proposal_duplicate_threshold, @default_duplicate_threshold)
     overlap = config(:knowledge_proposal_overlap_threshold, @default_overlap_threshold)
 
@@ -60,7 +79,7 @@ defmodule Loopctl.Knowledge.ProposalGate do
     # in the HTTP write path) instead of hammering a dead provider and risking an LB
     # timeout. A caller (e.g. memory graduation) that already holds a computed embedding
     # of the assessed text may pass it via `:embedding` to skip this round-trip.
-    case reuse_or_generate_embedding(tenant_id, attrs, opts) do
+    case embedding do
       {:ok, vector} when is_list(vector) and vector != [] ->
         # `on_overload: :tag` (US-37.5): assess/3 runs SYNCHRONOUSLY in the
         # knowledge_create write path, so an over-cap HeavyRead shed must NOT raise a
@@ -118,10 +137,15 @@ defmodule Loopctl.Knowledge.ProposalGate do
   # for text already embedded upstream — e.g. a memory's stored vector on graduation);
   # otherwise embed the proposal text through the guarded path. A non-list / empty
   # `:embedding` is ignored and we fall back to generating.
+  #
+  # Returns `{result, gate_embedded?}` — the second element is the US-41.7 egress
+  # fact: `false` when a caller-supplied vector was reused (NO provider call was
+  # made, so recording an embedding endpoint would be a falsehood in the other
+  # direction), `true` when the guarded embedding path was invoked.
   defp reuse_or_generate_embedding(tenant_id, attrs, opts) do
     case Keyword.get(opts, :embedding) do
       vector when is_list(vector) and vector != [] ->
-        {:ok, vector}
+        {{:ok, vector}, false}
 
       _ ->
         # US-41.4 (AC-41.4.2): the text being embedded is the PROPOSAL's own title
@@ -129,9 +153,9 @@ defmodule Loopctl.Knowledge.ProposalGate do
         # project-only `local_only` marking would not be enforced on a path that
         # runs SYNCHRONOUSLY in the `knowledge_create` write path — and because the
         # gate deliberately falls OPEN, the refusal would be silent.
-        Knowledge.generate_embedding(tenant_id, build_text(attrs),
-          project_id: attrs["project_id"] || attrs[:project_id]
-        )
+        {Knowledge.generate_embedding(tenant_id, build_text(attrs),
+           project_id: attrs["project_id"] || attrs[:project_id]
+         ), true}
     end
   end
 
@@ -141,7 +165,7 @@ defmodule Loopctl.Knowledge.ProposalGate do
     String.slice("#{title}\n\n#{body}", 0, @max_text_length)
   end
 
-  defp open_verdict, do: %{verdict: :unknown, score: nil, neighbors: []}
+  defp open_verdict, do: %{verdict: :unknown, score: nil, neighbors: [], gate_embedded: false}
 
   defp config(key, default), do: Application.get_env(:loopctl, key, default)
 end

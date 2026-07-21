@@ -58,14 +58,19 @@ defmodule Loopctl.Egress.ChokepointScan do
   """
 
   # {module_name => justification}. An entry here exempts only the LINT; it does
-  # NOT exempt the call from US-41.5's webhook guard or any future coverage.
+  # NOT exempt the call from the egress guard. Every entry MUST have a matching
+  # row in the `docs/egress-guard.md` triage table — a parity assertion in
+  # `Loopctl.Egress.ChokepointScanTest` fails the build otherwise (AC-41.5.6), so
+  # the doc triage and this list can never drift.
   @allowed %{
     "Loopctl.Provider" =>
       "IS the chokepoint wrapper — the one sanctioned outbound provider call site.",
     "Loopctl.Webhooks.ReqDelivery" =>
-      "Webhook delivery. Already SSRF-guarded (UrlGuard.pin + pinned_request_opts + " <>
-        "redirect: false). Bringing it under the local_only guard is US-41.5, so this " <>
-        "story's guarantee wording must NOT claim total egress control yet.",
+      "IS the webhook chokepoint wrapper (US-41.5). Content-carrying egress, and fully " <>
+        "under the guard: it consults the ONE policy (Egress.Policy.check/4, purpose " <>
+        ":webhook, tenant_supplied: true) before building the request, then keeps the " <>
+        "pin (pinned_request_opts + redirect: false). It is allowlisted for the same " <>
+        "reason Loopctl.Provider is — it is the wrapper, not a call site that bypasses one.",
     "Loopctl.Verification.GitHubActions" =>
       "Reads GitHub check-run status for verification. Operator-plane, fixed vendor " <>
         "host, carries no tenant content outbound.",

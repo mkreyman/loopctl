@@ -75,24 +75,49 @@ defmodule Loopctl.Memory.Promoter.DefaultLLM do
   @max_retries 1
   @max_tokens 4_000
 
+  @doc """
+  The FIXED memory-extraction system prompt.
+
+  Public so the OpenAI-compatible sibling (`Loopctl.Memory.Promoter.OpenAiLLM`)
+  shares BOTH the determinism (AC-29.1.3) and the injection hardening
+  (AC-29.1.5) rather than keeping a copy that drifts (US-41.3).
+  """
+  @spec system_prompt() :: String.t()
+  def system_prompt, do: @system_prompt
+
+  @doc """
+  The user message framing UNTRUSTED `session_content`, with the delimiter markers
+  neutralized. Shared with the sibling impl so the hardening cannot be forgotten
+  on the OpenAI-compatible path.
+  """
+  @spec user_content(String.t()) :: String.t()
+  def user_content(session_content) when is_binary(session_content) do
+    "Extract durable memory facts from the session below.\n\n" <>
+      "#{@content_open}\n#{neutralize_delimiters(session_content)}\n#{@content_close}"
+  end
+
+  @doc "The deterministic request parameters shared by both provider impls."
+  @spec request_params() :: %{
+          max_tokens: pos_integer(),
+          receive_timeout: pos_integer(),
+          max_retries: non_neg_integer()
+        }
+  def request_params,
+    do: %{
+      max_tokens: @max_tokens,
+      receive_timeout: @receive_timeout,
+      max_retries: @max_retries
+    }
+
   @impl true
   def extract(scope_or_tenant_id, session_content, _opts \\ []) when is_binary(session_content) do
-    framed_content = neutralize_delimiters(session_content)
-
     body_fun = fn _model ->
       %{
         max_tokens: @max_tokens,
         # temperature 0 + fixed system prompt => deterministic (AC-29.1.3).
         temperature: 0,
         system: @system_prompt,
-        messages: [
-          %{
-            role: "user",
-            content:
-              "Extract durable memory facts from the session below.\n\n" <>
-                "#{@content_open}\n#{framed_content}\n#{@content_close}"
-          }
-        ]
+        messages: [%{role: "user", content: user_content(session_content)}]
       }
     end
 

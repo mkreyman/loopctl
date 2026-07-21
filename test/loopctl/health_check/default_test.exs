@@ -41,9 +41,13 @@ defmodule Loopctl.HealthCheck.DefaultTest do
       assert Map.has_key?(checks, :scale_alerts)
     end
 
-    test "reports a version string" do
-      assert {:ok, %{version: version}} = Default.check()
-      assert is_binary(version)
+    test "does NOT disclose an app version on the unauthenticated response (#461 item 5)" do
+      assert {:ok, result} = Default.check()
+      refute Map.has_key?(result, :version)
+      # status/ready/checks — the fields the LB and deploy gate act on — are intact.
+      assert Map.has_key?(result, :status)
+      assert Map.has_key?(result, :ready)
+      assert Map.has_key?(result, :checks)
     end
   end
 

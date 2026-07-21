@@ -4,9 +4,25 @@ defmodule LoopctlWeb.AdminTenantControllerTest do
   setup :verify_on_exit!
 
   alias Loopctl.Audit
+  alias Loopctl.AuditChain
+  alias Loopctl.Tenants
+  alias Loopctl.WebAuthn.Reauth
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
+  end
+
+  # Builds the assertion request object with SEPARATE base64url fields — the
+  # crypto-01 shape consumed by Reauth.verify_and_consume/3 (never one blob
+  # reused for all four values, which was the placeholder bug).
+  defp assertion_body(challenge_id, credential_id) do
+    %{
+      "challenge_id" => challenge_id,
+      "credential_id" => Base.url_encode64(credential_id, padding: false),
+      "authenticator_data" => Base.url_encode64(:crypto.strong_rand_bytes(37), padding: false),
+      "signature" => Base.url_encode64(:crypto.strong_rand_bytes(64), padding: false),
+      "client_data_json" => Base.url_encode64(~s({"type":"webauthn.get"}), padding: false)
+    }
   end
 
   describe "GET /api/v1/admin/tenants" do
@@ -400,6 +416,337 @@ defmodule LoopctlWeb.AdminTenantControllerTest do
 
         assert resp.status == 403, "Expected 403 for #{method} #{path}, got #{resp.status}"
       end
+    end
+  end
+
+  describe "POST /api/v1/admin/tenants/:id/clear-halt/challenge" do
+    test "issues a challenge bound to the target tenant's authenticators", %{conn: conn} do
+      {raw_key, _} = fixture(:api_key, %{role: :superadmin})
+      tenant = fixture(:tenant, %{audit_signing_public_key: :crypto.strong_rand_bytes(32)})
+      auth = fixture(:root_authenticator, tenant_id: tenant.id)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt/challenge", %{})
+
+      data = json_response(conn, 200)["data"]
+      assert data["challenge_id"]
+      assert data["challenge"] != ""
+      assert Base.url_encode64(auth.credential_id, padding: false) in data["allowed_credentials"]
+    end
+
+    test "returns 422 when the tenant has no enrolled authenticator", %{conn: conn} do
+      {raw_key, _} = fixture(:api_key, %{role: :superadmin})
+      tenant = fixture(:tenant, %{audit_signing_public_key: :crypto.strong_rand_bytes(32)})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt/challenge", %{})
+
+      assert json_response(conn, 422)["error"]["code"] == "no_authenticators"
+    end
+
+    test "rejects a non-superadmin key", %{conn: conn} do
+      tenant = fixture(:tenant, %{audit_signing_public_key: :crypto.strong_rand_bytes(32)})
+      _auth = fixture(:root_authenticator, tenant_id: tenant.id)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt/challenge", %{})
+
+      assert conn.status == 403
+    end
+
+    test "returns 404 (not 500) for a malformed non-UUID tenant id", %{conn: conn} do
+      {raw_key, _} = fixture(:api_key, %{role: :superadmin})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/not-a-uuid/clear-halt/challenge", %{})
+
+      assert json_response(conn, 404)["error"]["status"] == 404
+    end
+  end
+
+  describe "POST /api/v1/admin/tenants/:id/clear-halt" do
+    setup do
+      {raw_key, api_key} = fixture(:api_key, %{role: :superadmin})
+      tenant = fixture(:tenant, %{audit_signing_public_key: :crypto.strong_rand_bytes(32)})
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, sign_count: 0)
+      {:ok, _halted} = Tenants.halt_custody(tenant.id)
+
+      %{raw_key: raw_key, api_key: api_key, tenant: tenant, auth: auth}
+    end
+
+    defp issue_challenge(conn, raw_key, tenant_id) do
+      conn
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/admin/tenants/#{tenant_id}/clear-halt/challenge", %{})
+      |> json_response(200)
+      |> Map.fetch!("data")
+    end
+
+    test "clears the halt via the two-step challenge-bound ceremony", ctx do
+      %{conn: conn, raw_key: raw_key, api_key: api_key, tenant: tenant, auth: auth} = ctx
+
+      # Default MockWebAuthn stub verifies successfully (sign_count: 1).
+      challenge_data = issue_challenge(conn, raw_key, tenant.id)
+
+      clear_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{
+          "webauthn_assertion" =>
+            assertion_body(challenge_data["challenge_id"], auth.credential_id)
+        })
+
+      resp = json_response(clear_conn, 200)
+      assert resp["data"]["id"] == tenant.id
+      assert resp["data"]["custody_halted_at"] == nil
+      assert resp["data"]["status"] == "halt_cleared"
+
+      # Halt is actually cleared in the DB.
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      assert reloaded.custody_halted_at == nil
+
+      # The halt_cleared audit event was appended to the hash chain, and it
+      # records WHICH verified authenticator (credential + advanced counter)
+      # authorized the break-glass clear — not only the superadmin key.
+      %{data: entries} = AuditChain.list_entries(tenant.id, action: "halt_cleared")
+      assert length(entries) == 1
+      entry = hd(entries)
+      assert entry.payload["cleared_by"] == api_key.id
+
+      assert entry.payload["credential_id"] ==
+               Base.url_encode64(auth.credential_id, padding: false)
+
+      assert entry.payload["sign_count"] == 1
+    end
+
+    test "AC3: a rotate-audit-key challenge cannot clear a custody halt (cross-purpose)", ctx do
+      %{conn: conn, raw_key: raw_key, tenant: tenant, auth: auth} = ctx
+
+      # Mint a challenge for the DIFFERENT ceremony purpose (audit-key rotation)
+      # for the SAME tenant + enrolled authenticator. The default MockWebAuthn
+      # stub verifies any assertion successfully, so the ONLY thing standing
+      # between this cross-purpose challenge and a cleared halt is the purpose
+      # scoping in Reauth.consume_challenge (`c.purpose == ^purpose`).
+      {:ok, issued} = Reauth.issue_challenge(tenant.id, "rotate_audit_key")
+
+      clear_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{
+          "webauthn_assertion" => assertion_body(issued.challenge_id, auth.credential_id)
+        })
+
+      assert json_response(clear_conn, 401)["error"]["code"] == "webauthn_failed"
+
+      # The halt remains set — a rotate-audit-key challenge cleared nothing.
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      refute is_nil(reloaded.custody_halted_at)
+    end
+
+    test "a rejected break-glass attempt is recorded in the audit chain", ctx do
+      %{conn: conn, raw_key: raw_key, api_key: api_key, tenant: tenant, auth: auth} = ctx
+
+      Mox.stub(Loopctl.MockWebAuthn, :verify_authentication, fn _p, _c, _o ->
+        {:error, :invalid_assertion}
+      end)
+
+      challenge_data = issue_challenge(conn, raw_key, tenant.id)
+
+      clear_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{
+          "webauthn_assertion" =>
+            assertion_body(challenge_data["challenge_id"], auth.credential_id)
+        })
+
+      assert json_response(clear_conn, 401)["error"]["code"] == "webauthn_failed"
+
+      # The rejection is forensically recorded (L6): a compromised superadmin
+      # key attempting break-glass without the hardware factor leaves a trace.
+      %{data: entries} = AuditChain.list_entries(tenant.id, action: "halt_clear_rejected")
+      assert length(entries) == 1
+      assert hd(entries).payload["rejected_by"] == api_key.id
+
+      # No successful clear was recorded.
+      %{data: cleared} = AuditChain.list_entries(tenant.id, action: "halt_cleared")
+      assert cleared == []
+    end
+
+    test "rejects a garbage assertion that fails verification and does NOT clear the halt", ctx do
+      %{conn: conn, raw_key: raw_key, tenant: tenant, auth: auth} = ctx
+
+      Mox.stub(Loopctl.MockWebAuthn, :verify_authentication, fn _p, _c, _o ->
+        {:error, :invalid_assertion}
+      end)
+
+      challenge_data = issue_challenge(conn, raw_key, tenant.id)
+
+      clear_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{
+          "webauthn_assertion" =>
+            assertion_body(challenge_data["challenge_id"], auth.credential_id)
+        })
+
+      assert json_response(clear_conn, 401)["error"]["code"] == "webauthn_failed"
+
+      # Halt remains set.
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      refute is_nil(reloaded.custody_halted_at)
+    end
+
+    test "rejects an assertion referencing a non-existent challenge and keeps the halt", ctx do
+      %{conn: conn, raw_key: raw_key, tenant: tenant, auth: auth} = ctx
+
+      clear_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{
+          "webauthn_assertion" => assertion_body(Ecto.UUID.generate(), auth.credential_id)
+        })
+
+      assert json_response(clear_conn, 401)["error"]["code"] == "webauthn_failed"
+
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      refute is_nil(reloaded.custody_halted_at)
+    end
+
+    test "a challenge is single-use — replaying the consumed assertion is rejected", ctx do
+      %{conn: conn, raw_key: raw_key, tenant: tenant, auth: auth} = ctx
+
+      challenge_data = issue_challenge(conn, raw_key, tenant.id)
+      body = assertion_body(challenge_data["challenge_id"], auth.credential_id)
+
+      # First use clears the halt.
+      assert conn
+             |> auth_conn(raw_key)
+             |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{
+               "webauthn_assertion" => body
+             })
+             |> json_response(200)
+
+      # Re-halt, then replay the SAME (already-consumed) challenge.
+      {:ok, _} = Tenants.halt_custody(tenant.id)
+
+      replay_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{
+          "webauthn_assertion" => body
+        })
+
+      assert json_response(replay_conn, 401)["error"]["code"] == "webauthn_failed"
+
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      refute is_nil(reloaded.custody_halted_at)
+    end
+
+    test "a missing webauthn_assertion is rejected (webauthn_required) and keeps the halt", ctx do
+      %{conn: conn, raw_key: raw_key, tenant: tenant} = ctx
+
+      clear_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{})
+
+      assert json_response(clear_conn, 401)["error"]["code"] == "webauthn_required"
+
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      refute is_nil(reloaded.custody_halted_at)
+    end
+
+    test "a non-map webauthn_assertion is rejected (webauthn_required)", ctx do
+      %{conn: conn, raw_key: raw_key, tenant: tenant} = ctx
+
+      clear_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{
+          "webauthn_assertion" => Base.encode64(:crypto.strong_rand_bytes(64))
+        })
+
+      assert json_response(clear_conn, 401)["error"]["code"] == "webauthn_required"
+
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      refute is_nil(reloaded.custody_halted_at)
+    end
+
+    test "returns 404 (not 500) for a malformed non-UUID id even with a well-formed body", ctx do
+      %{conn: conn, raw_key: raw_key, auth: auth} = ctx
+
+      # A well-formed assertion body but a garbage path id must be caught by the
+      # up-front UUID guard (404), NOT raise Ecto.Query.CastError deep in
+      # consume_challenge's tenant_id predicate (which would 500).
+      clear_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/not-a-uuid/clear-halt", %{
+          "webauthn_assertion" => assertion_body(Ecto.UUID.generate(), auth.credential_id)
+        })
+
+      assert json_response(clear_conn, 404)["error"]["status"] == 404
+    end
+
+    test "a non-superadmin key is rejected on clear-halt (role gate unchanged)", ctx do
+      %{conn: conn, tenant: tenant, auth: auth} = ctx
+      # User key from a SEPARATE, non-halted tenant so the role gate (403) is
+      # exercised in isolation from any custody-halt request guard.
+      other = fixture(:tenant, %{slug: "role-gate-other"})
+      {user_key, _} = fixture(:api_key, %{tenant_id: other.id, role: :user})
+
+      clear_conn =
+        conn
+        |> auth_conn(user_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{
+          "webauthn_assertion" => assertion_body(Ecto.UUID.generate(), auth.credential_id)
+        })
+
+      assert clear_conn.status == 403
+
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      refute is_nil(reloaded.custody_halted_at)
+    end
+
+    test "tenant isolation: a challenge for tenant A cannot clear tenant B's halt", ctx do
+      %{conn: conn, raw_key: raw_key, tenant: tenant_a, auth: auth_a} = ctx
+
+      # Tenant B is independently halted with its own enrolled authenticator.
+      tenant_b =
+        fixture(:tenant, %{
+          slug: "halt-b",
+          audit_signing_public_key: :crypto.strong_rand_bytes(32)
+        })
+
+      _auth_b = fixture(:root_authenticator, tenant_id: tenant_b.id, sign_count: 0)
+      {:ok, _} = Tenants.halt_custody(tenant_b.id)
+
+      # Mint a challenge for tenant A, then try to spend it against tenant B.
+      challenge_a = issue_challenge(conn, raw_key, tenant_a.id)
+
+      cross_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant_b.id}/clear-halt", %{
+          "webauthn_assertion" =>
+            assertion_body(challenge_a["challenge_id"], auth_a.credential_id)
+        })
+
+      assert json_response(cross_conn, 401)["error"]["code"] == "webauthn_failed"
+
+      # Tenant B is still halted.
+      {:ok, reloaded_b} = Tenants.get_tenant(tenant_b.id)
+      refute is_nil(reloaded_b.custody_halted_at)
     end
   end
 end

@@ -56,7 +56,9 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
 
   require Logger
 
+  alias Loopctl.Custody
   alias Loopctl.Egress
+  alias Loopctl.Egress.Scope
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Embeddings
@@ -92,7 +94,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
             :ok
 
           {:ok, memory} ->
-            generate_and_store(memory, tenant_id, memory_id)
+            generate_and_store(memory, tenant_id, memory_id, memory.project_id)
         end
     end
   end
@@ -102,7 +104,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
     trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)
   end
 
-  defp generate_and_store(memory, tenant_id, memory_id) do
+  defp generate_and_store(memory, tenant_id, memory_id, project_id) do
     text = build_embedding_text(memory)
     content_hash = content_hash(text)
 
@@ -111,12 +113,32 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
       # paid provider.
       :ok
     else
-      generate(tenant_id, memory_id, text, content_hash)
+      generate(tenant_id, memory_id, text, content_hash, project_id)
     end
   end
 
-  defp generate(tenant_id, memory_id, text, content_hash) do
-    case Knowledge.generate_embedding(tenant_id, text, timeout: @worker_yield_ms) do
+  defp generate(tenant_id, memory_id, text, content_hash, project_id) do
+    # US-41.7 (AC-41.7.1/.2): the memory embedding is its own content-touching
+    # operation and gets its own custody posture entry.
+    #
+    # The scope carries the MEMORY'S OWN `project_id`, read off the row (the job
+    # args carry only memory_id/tenant_id). Memories DO carry a project_id
+    # (`Loopctl.Memory.Memory`), and both create paths assign their posture with
+    # `EgressScope.new(tenant_id, project_id)` — while `Egress.effective_local_only?/1`
+    # matches ONLY the tenant-wide marking when project_id is nil. A tenant-only
+    # scope here would therefore make a project-scoped `local_only` memory's create
+    # claimable while its embed silently allocated nothing, producing a COMPLETE,
+    # zero-egress claim for a row whose body was POSTed to the provider. It would
+    # also key `Policy.classify/3` on the wrong `Scope.key/1`, so a project-scoped
+    # trusted-endpoint declaration would not be applied and the RECORDED verdict
+    # could differ from the one the guard enforced (the AC-41.4.9 drift).
+    #
+    # Recorded BEFORE the call so a provider failure that happens AFTER the body
+    # left the process still leaves a recorded operation naming the endpoint, and
+    # never a contiguous sequence that omits it.
+    result = embed_with_custody(tenant_id, memory_id, text, project_id)
+
+    case result do
       {:ok, embedding} ->
         store(tenant_id, memory_id, embedding, content_hash)
 
@@ -176,6 +198,20 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
         end
     end
   end
+
+  defp embed_with_custody(tenant_id, memory_id, text, project_id) do
+    scope = Scope.new(tenant_id, project_id)
+    recorded = Custody.record(scope, "memory", memory_id, :embed)
+
+    result =
+      Knowledge.generate_embedding(tenant_id, text, timeout: @worker_yield_ms, scope: scope)
+
+    Custody.record_outcome(recorded, custody_outcome(result))
+    result
+  end
+
+  defp custody_outcome({:ok, _}), do: :succeeded
+  defp custody_outcome(_other), do: :failed
 
   defp store(tenant_id, memory_id, embedding, content_hash) do
     case Memory.update_memory_embedding(tenant_id, memory_id, embedding, content_hash) do

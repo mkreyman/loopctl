@@ -409,7 +409,9 @@ defmodule Loopctl.Memory.Promoter do
 
   # Resolve the LLM impl exactly like `merge_synthesizer/0` in Loopctl.Knowledge.
   defp llm do
-    Application.get_env(:loopctl, :promoter_llm, Loopctl.Memory.Promoter.DefaultLLM)
+    # US-41.3: the DEFAULT is the tenant-aware ROUTER; this Application.get_env stays
+    # the single resolution point, so config/test.exs's Mox mapping still intercepts.
+    Application.get_env(:loopctl, :promoter_llm, Loopctl.Memory.Promoter.LLMRouter)
   end
 
   @doc "Confidence threshold below which candidates are dropped (default #{@default_confidence_threshold})."

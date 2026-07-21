@@ -2,10 +2,18 @@ defmodule Loopctl.Workers.WebhookCleanupWorker do
   @moduledoc """
   Oban worker that prunes old webhook_events records.
 
-  Runs daily via the Oban Cron plugin. Deletes webhook events with status
-  `delivered` or `exhausted` that are older than the configurable retention
-  period (default: 30 days). Events with status `pending` or `failed` are
-  never pruned (they are still in-flight).
+  Runs daily via the Oban Cron plugin. Deletes webhook events in a TERMINAL
+  status — `delivered`, `exhausted` or `blocked` — that are older than the
+  configurable retention period (default: 30 days). Events with status `pending`
+  or `failed` are never pruned (they are still in-flight).
+
+  `:blocked` (US-41.5) is terminal exactly like `:exhausted`, so retention
+  applies identically — and it is the status most likely to be produced in VOLUME
+  by a persistent misconfiguration: a blocked delivery deliberately does not
+  increment `consecutive_failures`, so the auto-disable valve never fires and a
+  `local_only` tenant with one incompatible subscription emits a blocked row per
+  matching state change indefinitely. Excluding it from retention (the review
+  finding this comment records) meant those rows were never reclaimed.
 
   Deletions are batched (1000 per iteration) to avoid long-running transactions.
   """
@@ -22,6 +30,11 @@ defmodule Loopctl.Workers.WebhookCleanupWorker do
 
   @default_retention_days 30
   @batch_size 1000
+
+  # Terminal statuses — the ones retention may reclaim. Keep in parity with
+  # `Loopctl.Webhooks.WebhookEvent`'s status enum: a new terminal status that is
+  # not listed here is never pruned.
+  @terminal_statuses [:delivered, :exhausted, :blocked]
 
   @impl Oban.Worker
   def perform(_job) do
@@ -65,7 +78,7 @@ defmodule Loopctl.Workers.WebhookCleanupWorker do
     ids =
       WebhookEvent
       |> where([e], e.tenant_id == ^tenant_id)
-      |> where([e], e.status in [:delivered, :exhausted])
+      |> where([e], e.status in ^@terminal_statuses)
       |> where([e], e.inserted_at < ^cutoff)
       |> select([e], e.id)
       |> limit(@batch_size)

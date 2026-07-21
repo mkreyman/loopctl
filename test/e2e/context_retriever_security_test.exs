@@ -426,8 +426,14 @@ defmodule Loopctl.E2E.ContextRetrieverSecurityTest do
       define_story_entity(user)
 
       # Force the per-tenant bucket over-limit (config-based DI mock; no put_env).
-      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
-        {:deny, 999}
+      # sec-4: scope the deny so the fail-CLOSED auth-path gate (`auth_ip:*`)
+      # passes — otherwise AuthPathThrottle (first in the :authenticated pipeline)
+      # 429s BEFORE the CR controller runs, and both the 429 assertion AND the
+      # `context_audits == []` non-execution assertion below would hold for the
+      # WRONG reason (CR per-tenant limiter + no-execute behavior untested).
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "auth_ip:" <> _, _window, _limit -> {:allow, 1}
+        _bucket, _window, _limit -> {:deny, 999}
       end)
 
       resp =

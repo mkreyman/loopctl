@@ -41,6 +41,19 @@ defmodule Loopctl.Knowledge.LlmExtractor do
   no surrounding text or markdown fences.\
   """
 
+  @doc """
+  The review-extraction system prompt.
+
+  Public so the OpenAI-compatible sibling (`Loopctl.Knowledge.OpenAiExtractor`)
+  shares it rather than keeping a copy that drifts (US-41.3).
+  """
+  @spec system_prompt() :: String.t()
+  def system_prompt, do: @system_prompt
+
+  @doc "The user message for a review `context` — shared with the sibling impl."
+  @spec user_message(map()) :: String.t()
+  def user_message(context), do: build_user_message(context)
+
   @impl true
   def extract_articles(scope_or_tenant_id, context) do
     user_message = build_user_message(context)

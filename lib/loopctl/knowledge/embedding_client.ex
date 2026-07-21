@@ -325,6 +325,7 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
     case Llm.record_usage(tenant_id, %{
            operation: :embedding,
            model: model,
+           provider: "embedding",
            input_tokens: normalize_token(input),
            output_tokens: 0
          }) do

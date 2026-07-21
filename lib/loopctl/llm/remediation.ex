@@ -34,7 +34,7 @@ defmodule Loopctl.Llm.Remediation do
   @api "PATCH /api/v1/tenants/me/llm-config"
 
   @typedoc "The credential a blocked operation needs the tenant to provision."
-  @type credential :: :anthropic | :embedding
+  @type credential :: :anthropic | :embedding | :chat
 
   @typedoc "A machine-readable, secret-free remediation object."
   @type t :: %{
@@ -89,6 +89,38 @@ defmodule Loopctl.Llm.Remediation do
           "embeddings + semantic search. Your key is stored encrypted and never returned."
     }
   end
+
+  def for_credential(:chat) do
+    %{
+      action: "configure_llm",
+      missing: ["chat_base_url", "chat_api_key"],
+      credential: "openai_compatible_chat",
+      mcp_tool: @mcp_tool,
+      example:
+        ~s|set_llm_config({"chat_provider": "openai_compatible", "chat_base_url": | <>
+          ~s|"https://llm.example.internal/v1", "chat_api_key": "<key for THAT host>", | <>
+          ~s|"extraction_model": "<a model that host serves>"})|,
+      api: @api,
+      docs: @docs_url,
+      message:
+        "The chat surface (extraction / classification / merge / memory promotion) " <>
+          "can run against your OWN OpenAI-compatible endpoint so document text never " <>
+          "leaves your boundary. The endpoint is probed with a trivial completion " <>
+          "BEFORE it is saved, and changing it requires a matching chat_api_key in the " <>
+          "same request (or acknowledge_key_transmission: true to reuse the stored " <>
+          "one). Your key is stored encrypted and never returned. Role: user."
+    }
+  end
+
+  @doc """
+  Like `for_credential/1` but narrowing `missing` to the specific field(s) the
+  caller determined are absent (US-41.3). An empty list keeps the default.
+  """
+  @spec for_credential(credential(), [String.t()]) :: map()
+  def for_credential(credential, []), do: for_credential(credential)
+
+  def for_credential(credential, missing) when is_list(missing),
+    do: credential |> for_credential() |> Map.put(:missing, missing)
 
   @doc """
   Map a search `fallback_reason` tag (see `Loopctl.Knowledge`) to a remediation,

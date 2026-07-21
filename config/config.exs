@@ -359,8 +359,26 @@ config :phoenix_ecto, :exclude_ecto_exceptions_from_plug, [
 ]
 
 # Hammer rate limiting (ETS backend)
+#
+# sec-4: `pool_size`/`pool_max_overflow` size the poolboy worker pool that fronts
+# EVERY `check_rate/3` call (Hammer.Supervisor defaults are 4 / 0). The
+# fail-CLOSED `LoopctlWeb.Plugs.AuthPathThrottle` runs first in the :authenticated
+# pipeline and calls the limiter on every request — including the ones it is about
+# to 429 — so a single-IP flood keeps hitting this pool at full rate while denied.
+# On the default 4-worker pool a poolboy checkout can then time out and exit,
+# which the fail-CLOSED gate normalises to a denial, spilling 429s onto LEGITIMATE
+# traffic from OTHER IPs (a cross-tenant collateral denial under the very flood the
+# gate defends against). A generous pool of fast (microsecond) ETS checks removes
+# that saturation headroom. Operator-overridable at runtime (config/runtime.exs).
 config :hammer,
-  backend: {Hammer.Backend.ETS, [expiry_ms: 60_000 * 60, cleanup_interval_ms: 60_000 * 10]}
+  backend:
+    {Hammer.Backend.ETS,
+     [
+       expiry_ms: 60_000 * 60,
+       cleanup_interval_ms: 60_000 * 10,
+       pool_size: 20,
+       pool_max_overflow: 10
+     ]}
 
 # Oban background jobs
 config :loopctl, Oban,
@@ -383,6 +401,18 @@ config :loopctl, Oban,
     audit: 3,
     verification: 1
   ]
+
+# US-41.7 (AC-41.7.6) — which egress paths a custody claim ATTESTS to. Driven by
+# configuration rather than hardcoded so the claim's scope is an explicit,
+# reviewable fact. `Loopctl.Custody.Coverage` INTERSECTS this with the paths for
+# which a per-row posture entry is actually recorded, so adding a path here can
+# never make the surface over-claim.
+config :loopctl, :custody_coverage, covered_paths: [:provider_calls]
+
+# Seconds the per-tenant custody posture chain-append batch is debounced by. The
+# debounce IS the AdminRepo pool budget (3 connections): a bulk harvest collapses
+# to one append per window instead of one per article.
+config :loopctl, :custody_flush_debounce_seconds, 5
 
 # US-37.2 (GH #352): per-node ceiling on concurrent OUTBOUND embedding calls
 # (`Loopctl.Knowledge.EmbeddingConcurrency`). This is the in-code default used on a
@@ -495,13 +525,18 @@ config :loopctl, Loopctl.Vault,
     # {Cloak.Ciphers.AES.GCM, tag: "AES.GCM.V0", key: Base.decode64!("OLD_KEY"), iv_length: 12}
   ]
 
-# DI: Content extractor for knowledge ingestion
-config :loopctl, :content_extractor, Loopctl.Knowledge.ClaudeContentExtractor
+# DI: Content extractor for knowledge ingestion.
+# US-41.3: the module named here is the TENANT-AWARE ROUTER — it still is the one
+# `Application.get_env` resolution point, and it dispatches per call to the
+# Anthropic or OpenAI-compatible sibling based on the tenant's settings. A tenant
+# that configures nothing keeps Anthropic, unchanged (AC-41.3.7).
+config :loopctl, :content_extractor, Loopctl.Knowledge.ContentExtractorRouter
 
 # DI: Memory promotion compiler LLM (Epic 29). The production impl wraps the
 # shared tenant-scoped Anthropic client (operation :extraction) with temperature 0
 # and a fixed injection-hardened prompt. Overridden by a Mox mock in test env.
-config :loopctl, :promoter_llm, Loopctl.Memory.Promoter.DefaultLLM
+# US-41.3: tenant-aware router (dispatches to DefaultLLM or OpenAiLLM per tenant).
+config :loopctl, :promoter_llm, Loopctl.Memory.Promoter.LLMRouter
 
 # Memory promotion tunables (Loopctl.Memory.Promoter.compile/2). Candidates below
 # the confidence threshold are dropped; the result is capped to the top-N by
@@ -628,7 +663,8 @@ config :loopctl, :rls_reroute_list_stories_by_project, false
 
 # DI: Article category classifier for the reclassification backfill
 # (KnowledgeReclassifyWorker). Overridden in test env.
-config :loopctl, :category_classifier, Loopctl.Knowledge.ClaudeCategoryClassifier
+# US-41.3: tenant-aware router (Claude or OpenAI-compatible sibling per tenant).
+config :loopctl, :category_classifier, Loopctl.Knowledge.ClassifierRouter
 
 # Reclassification backfill tunables (KnowledgeReclassifyWorker). Query-shaped,
 # so they can also be passed per-kick in the job args.
@@ -671,7 +707,8 @@ config :loopctl, :knowledge_conflict_threshold, 0.93
 # Merge synthesizer (#4 step 2): the LLM that combines two articles a grounded agent
 # marked `:merge` into ONE draft. Resolves the tenant's BYO Anthropic key per-tenant
 # via Loopctl.Llm.resolve/2 (Epic 28, #179); drafts only.
-config :loopctl, :merge_synthesizer, Loopctl.Knowledge.ClaudeMergeSynthesizer
+# US-41.3: tenant-aware router (Claude or OpenAI-compatible sibling per tenant).
+config :loopctl, :merge_synthesizer, Loopctl.Knowledge.MergeSynthesizerRouter
 # Max `:relates_to`→`:potential_conflict` promotions the nightly lint sweep does per
 # tenant per run (bounds the existing-corpus backfill; it cycles over nights).
 config :loopctl, :knowledge_lint_max_conflict_promotions, 500

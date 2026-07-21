@@ -18,6 +18,12 @@ defmodule LoopctlWeb.Router do
   end
 
   pipeline :authenticated do
+    # sec-4 — fail-CLOSED per-IP volumetric throttle. MUST run first (before
+    # ExtractApiKey) so a flood of missing/invalid-key requests from one IP is
+    # counted and throttled (429) even though the key-resolution plugs would
+    # reject them 401 first. Distinct from the per-key RateLimiter below, which
+    # fails OPEN for authenticated capacity.
+    plug LoopctlWeb.Plugs.AuthPathThrottle
     plug LoopctlWeb.Plugs.ExtractApiKey
     plug LoopctlWeb.Plugs.ResolveApiKey
     plug LoopctlWeb.Plugs.SetTenant
@@ -102,6 +108,25 @@ defmodule LoopctlWeb.Router do
     get "/articles/system", SystemArticleController, :index
     get "/audit/sth/:tenant_id", AuditSthController, :show
     post "/signup", SignupController, :create
+  end
+
+  # US-41.7 (AC-41.7.4) — merkle inclusion proof against the SAME signed tree head
+  # published above. Public for the same reason the STH is: it carries hashes and
+  # the already-published STH, never a chain entry's payload.
+  #
+  # It gets its OWN pipeline because, unlike every other public route (all single
+  # indexed lookups), producing a proof reads every entry hash up to the STH and
+  # folds the whole merkle tree — O(chain length) rows, memory and SHA-256 per
+  # anonymous request. The `:api` pipeline carries no limiter (AuthPathThrottle and
+  # RateLimiter live only in `:authenticated`), so the gate is attached here.
+  pipeline :public_proof do
+    plug LoopctlWeb.Plugs.PublicProofThrottle
+  end
+
+  scope "/api/v1", LoopctlWeb do
+    pipe_through [:api, :public_proof]
+
+    get "/audit/sth/:tenant_id/inclusion/:position", AuditSthController, :inclusion
   end
 
   scope "/swaggerui" do
@@ -196,6 +221,12 @@ defmodule LoopctlWeb.Router do
     post "/egress/trusted-endpoints", EgressController, :declare_trusted
     delete "/egress/trusted-endpoints/:host", EgressController, :revoke_trusted
     post "/egress/repin", EgressController, :repin
+
+    # US-41.7 — witnessed custody claim (AC-41.7.5). READ at :agent (enforced in
+    # the controller, like the egress surface above): verify-after-harvest must
+    # work with the key an agent already holds.
+    get "/custody/failures", CustodyClaimController, :failures
+    get "/custody/claims/:subject_type/:subject_id", CustodyClaimController, :show
 
     get "/tenants/me/llm-config", LlmConfigController, :show
     patch "/tenants/me/llm-config", LlmConfigController, :update
@@ -572,6 +603,12 @@ defmodule LoopctlWeb.Router do
     post "/violators/:id/ignore", AdminViolatorController, :ignore
 
     # US-26.5.2 — Custody halt management
+    # Break-glass clear-halt is a two-step, challenge-bound WebAuthn ceremony
+    # (Chain of Custody v2, L6): step 1 mints a single-use challenge, step 2
+    # verifies the assertion against it before clearing the halt. The
+    # controller-level `RequireRole, exact_role: :superadmin` plug applies to
+    # BOTH actions.
+    post "/tenants/:id/clear-halt/challenge", AdminTenantController, :clear_halt_challenge
     post "/tenants/:id/clear-halt", AdminTenantController, :clear_halt
   end
 end

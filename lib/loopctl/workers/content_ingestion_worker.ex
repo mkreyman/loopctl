@@ -56,13 +56,14 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Egress
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
+  import Loopctl.Llm.ShapeError, only: [is_shape_error: 1]
   alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ContentChunker
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
-  alias Loopctl.Net.UrlGuard
+  alias Loopctl.Llm.ShapeError
   alias Loopctl.Oban.FairShare
   alias Loopctl.Provider
   alias Loopctl.Provider.Admission
@@ -73,11 +74,21 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   @content_extractor Application.compile_env(
                        :loopctl,
                        :content_extractor,
-                       Loopctl.Knowledge.ClaudeContentExtractor
+                       Loopctl.Knowledge.ContentExtractorRouter
                      )
 
   @max_articles 10
   @max_body_length 100_000
+
+  # Network-layer fetch-size backstop (#461 item 4). A hostile/misbehaving URL could
+  # otherwise stream unbounded bytes into memory; the pre-existing @max_body_length
+  # guard only rejects AFTER a full download (per-ARTICLE text, not the raw page).
+  # Req 0.6.3 has no `:max_body_length` option, so we cap at the network layer via
+  # `into:` a bounded collector that HALTS the transfer (closing the connection) the
+  # moment the accumulated body crosses this ceiling. Sized well above a large HTML
+  # page (an ~87KB newsletter's raw markup) but bounded, so it never truncates a
+  # legitimate fetch yet caps a malicious multi-GB stream.
+  @max_fetch_body_bytes 5_000_000
 
   # --- Multi-chunk timeout budget (#264) ---
   #
@@ -529,6 +540,9 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     # and these reasons land in oban_jobs.errors (surfaced by list_extraction_errors).
     # Classification below runs on the RAW errors (it needs the status/Postgrex code).
     first = errors |> Enum.reverse() |> List.first() |> ProviderError.sanitize()
+    # US-41.3: a shape failure renders as its agent-readable message (endpoint +
+    # model + why) rather than an opaque inspected tuple in oban_jobs.errors.
+    first_text = if is_shape_error(first), do: ShapeError.message(first), else: inspect(first)
 
     if Enum.all?(errors, &permanent_error?/1) do
       # No transient error a retry could clear — {:discard} (no infinite retry);
@@ -536,7 +550,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       {:discard,
        {:extraction_failed,
         "extraction permanently failed on #{length(errors)} chunk(s) " <>
-          "(first: #{inspect(first)}); persisted #{inserted} article(s) from " <>
+          "(first: #{first_text}); persisted #{inserted} article(s) from " <>
           "#{persisted} of #{attempted} attempted chunk(s) — not retryable"}}
     else
       # At least one transient error — retry the whole (idempotent) job so the
@@ -553,6 +567,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   #     index (the idempotency conflict target doesn't cover it), which is
   #     deterministic and would otherwise burn every retry before discard.
   # A non-constraint DB error (serialization/deadlock/connection) stays transient.
+  #   * US-41.3 (AC-41.3.4): a shape failure from the OpenAI-compatible path — the
+  #     configured model cannot produce the required structure, so every retry
+  #     re-POSTs the tenant's full document to a model that will fail identically.
+  defp permanent_error?({:invalid_response_shape, _details}), do: true
+
   defp permanent_error?({:api_error, status, _body})
        when is_integer(status) and status >= 400 and status < 500 and status != 408 and
               status != 429,
@@ -567,6 +586,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # The top-level gate normally discards before any chunk runs; this backstops the
   # case where the key is removed mid-job between chunks.
   defp permanent_error?(:no_api_key), do: true
+
+  # US-41.3: a provider mismatch (the chat client resolved a DIFFERENT provider than
+  # the one it guards, e.g. after a settings flip mid-job) is a deterministic
+  # CONFIGURATION state — retrying re-resolves the same settings and refuses
+  # identically, burning every attempt for nothing.
+  defp permanent_error?(:provider_mismatch), do: true
 
   defp permanent_error?(_), do: false
 
@@ -639,48 +664,61 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   end
 
   defp resolve_content(scope, url, _content) when is_binary(url) do
-    # SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm) AND the US-41.4 local_only
-    # guard, in that order — they are different controls:
+    # ONE address decision (US-41.5 review). This used to gate on `UrlGuard.pin/1`
+    # FIRST and only then consult the policy, which meant:
     #
-    #   * `UrlGuard.pin/1` is the SSRF denylist. It runs FIRST and unconditionally,
-    #     because a private-range URL must be refused for EVERY tenant, marked or not.
-    #   * `Loopctl.Provider.get/3` then applies the ONE egress policy (AC-41.4.9:
-    #     ingestion consults it too, not just the provider guard and the probe). The
-    #     purpose is `:ingest`: a host declared for `inference` does NOT authorize
-    #     loopctl to fetch tenant-supplied URLs on a local_only scope.
-    case UrlGuard.pin(url) do
-      {:ok, pinned} -> fetch_url(scope, url, pinned)
-      {:error, reason} -> blocked_url(url, reason)
-    end
+    #   * the pre-gate could not see the OPERATOR deployment allowlist, so an
+    #     allowlisted private host was a legal WEBHOOK destination but still a hard
+    #     refusal as an INGESTION source — an asymmetry inside the very path
+    #     US-41.5 unified; and
+    #   * every fetch resolved the URL twice.
+    #
+    # `Loopctl.Provider.get/3` now makes the whole decision through
+    # `Loopctl.Egress.Policy` with `tenant_supplied_url: true`, which is what turns
+    # a `:denylisted` verdict into the PERMANENT `:egress_blocked` on the default
+    # (unmarked) path — so the SSRF denylist stays mandatory for EVERY tenant,
+    # marked or not (worker-01 / GHSA-j7m9-ffmr-pwhm), and `denylist_gate/4` is the
+    # single place that call is made. The purpose is `:ingest`: a host declared for
+    # `inference` does NOT authorize loopctl to fetch tenant-supplied URLs.
+    fetch_url(scope, url)
   end
 
   defp resolve_content(_scope, nil, _), do: {:error, :no_content}
 
-  defp blocked_url(url, reason) do
-    Logger.warning(
-      "ContentIngestionWorker: refusing to fetch blocked URL " <>
-        "(url=#{url}, reason=#{reason})"
-    )
-
-    {:error, {:url_blocked, reason}}
-  end
-
-  defp fetch_url(scope, url, pinned) do
+  defp fetch_url(scope, url) do
     req_opts =
-      UrlGuard.pinned_request_opts(pinned)
-      |> Keyword.merge(
+      [
         receive_timeout: 15_000,
         retry: :transient,
         max_retries: 1,
         # Do not follow redirects — a redirect hop would re-enter an unvalidated
         # URL and bypass the egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm).
-        redirect: false
-      )
+        # `Provider` sets this too for a pinned request; belt and braces.
+        redirect: false,
+        # #461 item 4: stream the response through a bounded collector that aborts
+        # the transfer once the body exceeds @max_fetch_body_bytes (network-layer cap).
+        into: &collect_capped_body/2
+      ]
       |> maybe_add_plug()
 
-    case Provider.get(url, req_opts, %{scope: scope, purpose: :ingest, pinned_by_caller: true}) do
+    ctx = %{scope: scope, purpose: :ingest, tenant_supplied_url: true}
+
+    case Provider.get(url, req_opts, ctx) do
+      {:ok, %{private: %{ingestion_body_capped: true}}} ->
+        Logger.warning(
+          "ContentIngestionWorker: URL fetch aborted — body exceeds " <>
+            "#{@max_fetch_body_bytes} bytes (url=#{url})"
+        )
+
+        {:error, {:url_body_too_large, @max_fetch_body_bytes}}
+
       {:ok, %{status: status} = resp} when status in 200..299 ->
-        handle_fetched_body(resp.body, Req.Response.get_header(resp, "content-type"))
+        # `resp.body` is the iolist accumulated by `collect_capped_body/2`; flatten it
+        # back to a binary for the extractor.
+        handle_fetched_body(
+          IO.iodata_to_binary(resp.body),
+          Req.Response.get_header(resp, "content-type")
+        )
 
       {:ok, %{status: status}} ->
         Logger.warning(
@@ -717,7 +755,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       is_binary(content_type) and binary_content_type?(content_type) ->
         unsupported_content_discard("Content-Type \"#{content_type}\"")
 
-      is_binary(body) and not String.valid?(body) ->
+      not String.valid?(body) ->
         unsupported_content_discard("fetched body")
 
       true ->
@@ -789,14 +827,50 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     end
   end
 
-  defp strip_html(body) when is_binary(body) do
+  # `into:` collector that enforces the @max_fetch_body_bytes network-layer cap
+  # (#461 item 4). Accumulates the streamed body; the instant it crosses the ceiling
+  # it flags the response (`ingestion_body_capped`) and returns `{:halt, _}`, so Req
+  # stops reading and closes the connection instead of buffering an unbounded stream.
+  # A normally-completed fetch stays under the cap (the crossing chunk always halts),
+  # so `fetch_url/2` can treat the flag as an unambiguous "too large" signal.
+  #
+  # The accumulator is an IOLIST (`[resp.body, data]`), not a `resp.body <> data`
+  # binary concat: because Req threads the accumulator back through its stream loop
+  # between reductions, the BEAM writable-binary append optimization does not apply to
+  # a binary accumulator, so each chunk would copy the entire buffer so far — O(n^2)
+  # total bytes over a multi-chunk stream. Appending to an iolist is O(1) per chunk and
+  # the running byte total is tracked in a `:ingestion_body_bytes` private counter (so
+  # the cap check never has to walk the accumulated iodata), giving O(n) overall.
+  # `fetch_url/2` flattens the iolist back to a binary via `IO.iodata_to_binary/1`
+  # before handing it to the extractor.
+  #
+  # Public (`@doc false`) rather than private only so the cumulative multi-chunk
+  # crossing path can be unit-tested directly: `Req.Test`/`plug:` delivers a stubbed
+  # body as a SINGLE `{:data, _}` message (Req buffers `send_chunked`/`chunk` output),
+  # so the `:cont` accumulation branch this cap actually defends against under the real
+  # Finch adapter is not reachable through a stub — see the worker test.
+  @doc false
+  def collect_capped_body({:data, data}, {req, resp}) do
+    new_size = Req.Response.get_private(resp, :ingestion_body_bytes, 0) + byte_size(data)
+    resp = %{resp | body: [resp.body, data]}
+
+    if new_size > @max_fetch_body_bytes do
+      capped = Req.Response.put_private(resp, :ingestion_body_capped, true)
+      {:halt, {req, capped}}
+    else
+      {:cont, {req, Req.Response.put_private(resp, :ingestion_body_bytes, new_size)}}
+    end
+  end
+
+  # `body` is always a binary here: `handle_fetched_body/2`'s sole caller flattens the
+  # fetched iolist with `IO.iodata_to_binary/1` and the cond above already routes
+  # non-UTF-8 bytes to a discard, so no non-binary/invalid fallback clause is reachable.
+  defp strip_html(body) do
     body
     |> String.replace(~r/<[^>]+>/, " ")
     |> String.replace(~r/\s+/, " ")
     |> String.trim()
   end
-
-  defp strip_html(body), do: inspect(body)
 
   defp validate_and_filter(raw_articles) do
     raw_articles

@@ -16,11 +16,19 @@ defmodule Loopctl.Llm.UsageEvent do
 
   @operations [:extraction, :classification, :merge, :embedding]
 
+  # The FIXED provider set. Never a user-supplied value.
+  @providers ~w(anthropic embedding openai_compatible)
+
   schema "llm_usage_events" do
     tenant_field()
 
     field :operation, Ecto.Enum, values: @operations
     field :model, :string
+    # US-41.3 (AC-41.3.6): which provider actually served the call. A FIXED set
+    # (`"anthropic"` | `"embedding"` | `"openai_compatible"`) — NEVER the
+    # tenant-supplied host, which would make this column unbounded and leak the
+    # endpoint into the usage ledger.
+    field :provider, :string, default: "anthropic"
     field :input_tokens, :integer, default: 0
     field :output_tokens, :integer, default: 0
     field :source_type, :string
@@ -42,6 +50,7 @@ defmodule Loopctl.Llm.UsageEvent do
     |> cast(attrs, [
       :operation,
       :model,
+      :provider,
       :input_tokens,
       :output_tokens,
       :source_type,
@@ -49,6 +58,7 @@ defmodule Loopctl.Llm.UsageEvent do
       :occurred_at
     ])
     |> validate_required([:operation, :model, :occurred_at])
+    |> validate_inclusion(:provider, @providers)
     |> validate_number(:input_tokens, greater_than_or_equal_to: 0)
     |> validate_number(:output_tokens, greater_than_or_equal_to: 0)
     # A tenant deleted mid-flight (FK race) maps to a clean {:error, changeset}

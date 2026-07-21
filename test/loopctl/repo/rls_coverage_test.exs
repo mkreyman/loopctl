@@ -78,4 +78,50 @@ defmodule Loopctl.Repo.RlsCoverageTest do
 
     assert qual =~ "current_tenant_id()"
   end
+
+  # sec-5 (#460): the 8 tables below originally built a `tenant_isolation_policy`
+  # with the raw current_setting('app.current_tenant_id', true)::uuid cast instead
+  # of the exception-safe current_tenant_id() wrapper, AND diverged on the policy
+  # name. The normalization migration both renamed each policy to the canonical
+  # `tenant_isolation` and rewrote the predicate to the wrapper. This asserts every
+  # one now uses the unified name + wrapper, and the raw cast is gone.
+  @sec5_normalized_tables ~w(
+    audit_signed_tree_heads
+    audit_sth_checkpoints
+    tenant_audit_key_history
+    capability_tokens
+    audit_chain
+    dispatches
+    verification_runs
+    story_acceptance_criteria
+  )
+
+  test "sec-5 (#460) tables use the canonical tenant_isolation policy with the current_tenant_id() wrapper" do
+    for table <- @sec5_normalized_tables do
+      # The divergent `tenant_isolation_policy` name must be gone entirely.
+      %{rows: [[legacy_count]]} =
+        AdminRepo.query!(
+          "SELECT count(*) FROM pg_policies WHERE tablename = $1 AND policyname = 'tenant_isolation_policy'",
+          [table]
+        )
+
+      assert legacy_count == 0,
+             "#{table} still carries the divergent tenant_isolation_policy name after normalization"
+
+      %{rows: rows} =
+        AdminRepo.query!(
+          "SELECT qual FROM pg_policies WHERE tablename = $1 AND policyname = 'tenant_isolation'",
+          [table]
+        )
+
+      assert [[qual]] = rows,
+             "expected exactly one tenant_isolation policy on #{table}, got: #{inspect(rows)}"
+
+      assert qual =~ "current_tenant_id()",
+             "#{table}.tenant_isolation should use the current_tenant_id() wrapper, got: #{qual}"
+
+      refute qual =~ "current_setting",
+             "#{table}.tenant_isolation should not use the raw current_setting cast, got: #{qual}"
+    end
+  end
 end

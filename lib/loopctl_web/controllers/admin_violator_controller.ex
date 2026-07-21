@@ -8,7 +8,11 @@ defmodule LoopctlWeb.AdminViolatorController do
 
   alias Loopctl.AuditChain.Violations
 
-  plug LoopctlWeb.Plugs.RequireRole, role: :superadmin
+  # exact_role (not role) for convention consistency with every other admin
+  # controller (admin_stats/admin_audit/admin_tenant). superadmin is the top role,
+  # so this is functionally equivalent here — a TIGHTENING toward the exact-match
+  # trust-gate style, never a downgrade (#461 item 2).
+  plug LoopctlWeb.Plugs.RequireRole, exact_role: :superadmin
 
   @doc "GET /api/v1/admin/violators"
   def index(conn, params) do

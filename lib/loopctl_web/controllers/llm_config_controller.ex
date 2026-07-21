@@ -18,6 +18,7 @@ defmodule LoopctlWeb.LlmConfigController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Llm
+  alias Loopctl.Llm.ChatProbe
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -67,8 +68,14 @@ defmodule LoopctlWeb.LlmConfigController do
   @doc "PATCH /api/v1/tenants/me/llm-config"
   def update(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
+    attrs = config_params(params)
 
-    with {:ok, settings} <- Llm.upsert_settings(tenant_id, config_params(params)) do
+    # US-41.3 (AC-41.3.3): a chat-ENDPOINT change is credential-rule-checked and
+    # PROBED with a trivial completion BEFORE anything is persisted. A PATCH that
+    # does not touch the chat endpoint short-circuits inside `preflight/2`, so the
+    # default Anthropic path is byte-identical to before this story (AC-41.3.7).
+    with :ok <- ChatProbe.preflight(tenant_id, attrs),
+         {:ok, settings} <- Llm.upsert_settings(tenant_id, upsert_attrs(attrs)) do
       json(conn, Llm.settings_view(settings))
     end
   end
@@ -81,7 +88,17 @@ defmodule LoopctlWeb.LlmConfigController do
       "classification_model",
       "merge_model",
       "embedding_api_key",
-      "embedding_model"
+      "embedding_model",
+      # US-41.3: the pluggable chat surface.
+      "chat_provider",
+      "chat_base_url",
+      "chat_api_key",
+      "acknowledge_key_transmission"
     ])
   end
+
+  # `acknowledge_key_transmission` is a REQUEST-scoped assertion consumed by the
+  # probe, never a stored field — drop it before the upsert so it can't reach a
+  # changeset.
+  defp upsert_attrs(attrs), do: Map.delete(attrs, "acknowledge_key_transmission")
 end

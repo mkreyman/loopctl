@@ -16,6 +16,7 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
   setup :verify_on_exit!
 
   alias Loopctl.Knowledge
+  alias Loopctl.Test.AllowlistSource
   alias Loopctl.Workers.ContentIngestionWorker
 
   defp setup_tenant do
@@ -255,6 +256,70 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       assert length(articles) == 1
       assert hd(articles).title == "Web article finding"
     end
+
+    test "aborts and rejects a fetch whose body exceeds the network-layer cap (#461 item 4)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # A body larger than @max_fetch_body_bytes (5_000_000). The bounded `into:`
+      # collector halts the transfer and flags the response, so fetch_url returns
+      # a :url_body_too_large error BEFORE any extraction — the extractor is never
+      # reached and nothing is persisted.
+      oversized = String.duplicate("a", 5_000_001)
+
+      Req.Test.stub(ContentIngestionWorker, fn conn ->
+        Req.Test.html(conn, oversized)
+      end)
+
+      assert {:error, {:url_body_too_large, cap}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 314,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "url" => "https://example.com/huge",
+                   "content_hash" => "huge1",
+                   "source_type" => "web_article"
+                 }
+               })
+
+      assert cap == 5_000_000
+      assert %{data: []} = Knowledge.list_articles(tenant.id, source_type: "web_article")
+    end
+
+    test "collect_capped_body/2 halts once CUMULATIVE sub-cap chunks cross the cap (#461 item 4, streaming path)" do
+      # The test above feeds an oversized body as ONE chunk, exercising only the
+      # single-shot > cap branch. The cap actually defends the STREAMING case: many
+      # individually-sub-cap chunks whose running total crosses @max_fetch_body_bytes
+      # (5MB). That cumulative `:cont` accumulation cannot be exercised end-to-end via
+      # a stub — `Req.Test`/`plug:` buffers `send_chunked`/`chunk` output and delivers
+      # it to the `into:` collector as a SINGLE `{:data, _}` message — so drive the
+      # collector directly with three 2MB chunks (6MB total).
+      req = Req.new()
+      resp0 = Req.Response.new()
+
+      # 2MB chunk — well under the 5MB per-nothing cap on its own.
+      chunk = String.duplicate("a", 2_000_000)
+
+      # First two chunks (2MB, then 4MB cumulative) stay under the cap → :cont, no flag.
+      assert {:cont, {^req, resp1}} =
+               ContentIngestionWorker.collect_capped_body({:data, chunk}, {req, resp0})
+
+      refute Req.Response.get_private(resp1, :ingestion_body_capped)
+
+      assert {:cont, {^req, resp2}} =
+               ContentIngestionWorker.collect_capped_body({:data, chunk}, {req, resp1})
+
+      refute Req.Response.get_private(resp2, :ingestion_body_capped)
+
+      # Third chunk pushes the running total to 6MB, past the 5MB cap → :halt + flag.
+      assert {:halt, {^req, resp3}} =
+               ContentIngestionWorker.collect_capped_body({:data, chunk}, {req, resp2})
+
+      assert Req.Response.get_private(resp3, :ingestion_body_capped) == true
+
+      # The accumulated iolist holds the full 6MB intact (never truncated mid-stream);
+      # fetch_url/2 flattens it with IO.iodata_to_binary/1.
+      assert resp3.body |> IO.iodata_to_binary() |> byte_size() == 6_000_000
+    end
   end
 
   # --- SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm) ---
@@ -269,7 +334,12 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
         flunk("SSRF guard should have blocked the request before Req.get/1")
       end)
 
-      assert {:error, {:url_blocked, :blocked_ip}} =
+      # US-41.5 review: the SSRF call is made by the ONE policy
+      # (`denylist_gate/4` on a `tenant_supplied_url`), not by a second
+      # `UrlGuard.pin/1` pre-gate — so the refusal is the PERMANENT
+      # `:egress_blocked`, which `Egress.oban_result/1` CANCELS (it was retried as
+      # a generic error before). Nothing is fetched either way.
+      assert {:cancel, reason} =
                ContentIngestionWorker.perform(%Oban.Job{
                  id: 200,
                  args: %{
@@ -279,6 +349,10 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
                    "source_type" => "web_article"
                  }
                })
+
+      assert reason =~ "egress_blocked"
+      assert reason =~ "denylisted"
+      assert reason =~ "169.254.169.254"
 
       assert %{data: []} = Knowledge.list_articles(tenant.id, source_type: "web_article")
     end
@@ -290,7 +364,7 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
         {:ok, [{10, 0, 0, 5}]}
       end)
 
-      assert {:error, {:url_blocked, :blocked_ip}} =
+      assert {:cancel, reason} =
                ContentIngestionWorker.perform(%Oban.Job{
                  id: 201,
                  args: %{
@@ -300,6 +374,58 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
                    "source_type" => "web_article"
                  }
                })
+
+      assert reason =~ "egress_blocked"
+      assert reason =~ "denylisted"
+      assert reason =~ "rebind.example.com"
+    end
+
+    # The operator deployment allowlist could not be consulted while the fetch
+    # was pre-gated by a bare `UrlGuard.pin/1`: an allowlisted private host was a
+    # legal WEBHOOK destination but still a hard refusal as an INGESTION source.
+    # Now both paths ask the same policy (US-41.5 review).
+    test "an OPERATOR-allowlisted private host is fetchable as an ingestion source" do
+      %{tenant: tenant} = setup_tenant()
+
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host -> {:ok, [{10, 0, 0, 5}]} end)
+
+      Req.Test.stub(ContentIngestionWorker, fn conn ->
+        Req.Test.html(conn, "<html><body>Allowlisted ingest body</body></html>")
+      end)
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
+        {:ok,
+         [
+           %{
+             title: "Allowlisted host finding",
+             body: "Important pattern from an allowlisted internal host.",
+             category: :finding,
+             tags: ["egress"]
+           }
+         ]}
+      end)
+
+      AllowlistSource.put(["10.0.0.0/8"])
+
+      try do
+        assert :ok =
+                 ContentIngestionWorker.perform(%Oban.Job{
+                   id: 202,
+                   args: %{
+                     "tenant_id" => tenant.id,
+                     "url" => "https://internal.example.com/doc",
+                     "content_hash" => "allowlisted1",
+                     "source_type" => "web_article"
+                   }
+                 })
+      after
+        AllowlistSource.clear()
+      end
+
+      %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "web_article")
+      assert Enum.any?(articles, &(&1.title == "Allowlisted host finding"))
     end
   end
 
@@ -1158,6 +1284,33 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
                    "tenant_id" => tenant.id,
                    "content" => multi_chunk_content(3),
                    "content_hash" => "permanent_fail",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      assert reason =~ "not retryable"
+    end
+
+    # US-41.3 review: `:provider_mismatch` (the chat client resolved a DIFFERENT
+    # provider than the one it guards — reachable via the settings race the guards
+    # exist for) is a deterministic CONFIGURATION state. Retrying re-resolves the
+    # same settings and refuses identically, so it must not burn max_attempts.
+    test "a :provider_mismatch extraction failure is PERMANENT (discarded, not retried)" do
+      %{tenant: tenant} = setup_tenant()
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _chunk,
+                                                                       _opts ->
+        {:error, :provider_mismatch}
+      end)
+
+      assert {:discard, {:extraction_failed, reason}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 413,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => multi_chunk_content(3),
+                   "content_hash" => "provider_mismatch_permanent",
                    "source_type" => "newsletter"
                  }
                })

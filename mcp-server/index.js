@@ -1887,6 +1887,10 @@ async function setLlmConfig({
   merge_model,
   embedding_api_key,
   embedding_model,
+  chat_provider,
+  chat_base_url,
+  chat_api_key,
+  acknowledge_key_transmission,
 }) {
   const body = {};
   if (api_key != null) body.api_key = api_key;
@@ -1895,6 +1899,15 @@ async function setLlmConfig({
   if (merge_model !== undefined) body.merge_model = merge_model;
   if (embedding_api_key != null) body.embedding_api_key = embedding_api_key;
   if (embedding_model !== undefined) body.embedding_model = embedding_model;
+  // US-41.3: pluggable OpenAI-compatible chat endpoint. The server PROBES the
+  // endpoint with a trivial completion before persisting, and refuses an endpoint
+  // change that carries neither a matching chat_api_key nor an explicit
+  // acknowledge_key_transmission.
+  if (chat_provider !== undefined) body.chat_provider = chat_provider;
+  if (chat_base_url !== undefined) body.chat_base_url = chat_base_url;
+  if (chat_api_key != null) body.chat_api_key = chat_api_key;
+  if (acknowledge_key_transmission === true)
+    body.acknowledge_key_transmission = true;
   // PATCH (partial-merge) + EXACT user key (review #12, #13).
   const result = await apiCall(
     "PATCH",
@@ -1918,6 +1931,33 @@ async function egressPosture() {
   const result = await apiCall(
     "GET",
     "/api/v1/egress/posture",
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+// --- US-41.7: witnessed custody claim ---------------------------------------
+//
+// A READ, at agent role for the same reason egress_posture is: verifying a
+// harvest AFTER the fact must work with the key an agent already holds.
+async function custodyClaim({ subject_type, subject_id } = {}) {
+  if (!subject_type || !subject_id) {
+    throw new Error("subject_type and subject_id are required");
+  }
+  const result = await apiCall(
+    "GET",
+    `/api/v1/custody/claims/${encodeURIComponent(subject_type)}/${encodeURIComponent(subject_id)}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function custodyFailures() {
+  const result = await apiCall(
+    "GET",
+    "/api/v1/custody/failures",
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
@@ -5027,7 +5067,8 @@ const TOOLS = [
     name: "egress_posture",
     description:
       "VERIFY BEFORE YOU HARVEST. Reports this instance's egress posture for YOUR tenant: " +
-      "the resolved embedding and chat endpoints, a locality VERDICT for each " +
+      "the resolved embedding and chat endpoints, EVERY webhook destination " +
+      "(webhook_destinations), a locality VERDICT for each " +
       "(network-local / 'tenant-declared (unverified attestation), not network-local' / " +
       "non-local), your declared trusted endpoints with their purposes, per-scope " +
       "local_only status, and any named posture defects. Endpoints are shown; KEYS NEVER " +
@@ -5036,10 +5077,70 @@ const TOOLS = [
       "key you already have. NOTE the deployment allowlist CONTENTS are operator " +
       "infrastructure and are NOT disclosed at agent role: you get only a boolean per " +
       "endpoint saying whether its verdict came from the allowlist (contents at user+). " +
+      "Webhook destinations follow the same split: HOST plus verdict plus " +
+      "blocked_by_local_only at agent role, the FULL destination URL (endpoint) only at " +
+      "user+ — a webhook path is frequently the credential. " +
       "SCOPE OF THE GUARANTEE: fail-closed enforcement covers every outbound HTTP call " +
-      "made by loopctl application code on the MODEL-PROVIDER path. Webhook delivery is " +
-      "not covered yet (US-41.5), and HTTP performed inside a dependency, plus this " +
-      "separate mcp-server codebase, are outside the static chokepoint check.",
+      "made by loopctl application code on every CONTENT-CARRYING path — model-provider " +
+      "calls, the ingestion fetch, and webhook delivery (US-41.5). HTTP performed inside " +
+      "a dependency, plus this separate mcp-server codebase, are outside the static " +
+      "chokepoint check; the remaining non-content outbound paths are triaged in " +
+      "docs/egress-guard.md.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "custody_claim",
+    description:
+      "The recorded EGRESS CUSTODY CLAIM for one article or memory row: the append-only " +
+      "sequence of per-operation postures (create, each embedding, each re-embed, each " +
+      "classification/merge) with the endpoint loopctl resolved for THAT operation and its " +
+      "locality verdict, plus the aggregate over them. Each claim rides the existing " +
+      "hash-chained audit log and its signed tree heads — every recorded entry carries the " +
+      "chain_position you can fetch an inclusion proof for at " +
+      "GET /api/v1/audit/sth/{tenant_id}/inclusion/{position} and check against the public " +
+      "STH with the tenant's published audit key. THREE STATES, and only one of them is an " +
+      "attestation: 'no_claim_recorded' (no operation sequence was ever assigned — the row " +
+      "predates recording or its scope is not marked local_only; this asserts NOTHING in " +
+      "either direction), 'claim_pending' (sequences assigned, batch append not yet " +
+      "flushed), and 'claim_recorded', itself 'complete', 'partial_history' or " +
+      "'incomplete'. An INCOMPLETE sequence (a gap, a lost tail, or a dropped append) is " +
+      "never reported as no-third-party-egress: an unrecorded operation may have called " +
+      "any endpoint. Completeness is measured against a PERSISTED per-row high-water mark, " +
+      "not against the rows that happen to survive, so truncating the sequence cannot " +
+      "restore a satisfied claim. 'partial_history' means operation 0 is not this row's " +
+      "creation — recording began after the row already existed (typically the scope was " +
+      "marked local_only later), so loopctl has no record of how it was produced. " +
+      "third_party_egress_on_covered_paths is `false` ONLY when every recorded endpoint " +
+      "was NETWORK-LOCAL; when the sequence leans on a TENANT-DECLARED endpoint (a public " +
+      "host the tenant merely attested is its own, which loopctl never verified) the value " +
+      "is the string 'tenant_declared_unverified', not false. " +
+      "SCOPE, precisely: the claim attests ONLY to the endpoints loopctl called for the " +
+      "recorded operations on this row, on the egress paths enumerated in the `coverage` " +
+      "field. It makes NO statement about what those endpoints did with the data " +
+      "afterwards, and none about a path listed as uncovered. READ tool, AGENT role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subject_type: {
+          type: "string",
+          enum: ["article", "memory"],
+          description: "The kind of row the claim is bound to.",
+        },
+        subject_id: { type: "string", description: "The row's UUID." },
+      },
+      required: ["subject_type", "subject_id"],
+    },
+  },
+  {
+    name: "custody_failures",
+    description:
+      "Custody posture entries whose audit-chain append was DROPPED after exhausting " +
+      "retries, plus (under `stale_pending`) entries that have been in flight longer than " +
+      "the stale window. A recording failure is surfaced here rather than silently absent, " +
+      "because a missing claim must never read as a satisfied one: every entry under " +
+      "`data` degrades its row's claim to 'incomplete', and a stranded `stale_pending` " +
+      "entry is one a flush stamped and then died on — it would otherwise read as an " +
+      "in-flight claim indefinitely. READ tool, AGENT role.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
@@ -5050,10 +5151,13 @@ const TOOLS = [
       "everywhere; nothing changes until a scope opts in. Scope resolution is " +
       "MOST-RESTRICTIVE-WINS (project OR tenant) and a project can NEVER relax a tenant " +
       "marking. MANDATORY PRE-FLIGHT: the call is REFUSED with 409 would_block_endpoints, " +
-      "naming every endpoint that would become egress_blocked, unless you pass " +
+      "naming every endpoint that would become egress_blocked — including every WEBHOOK " +
+      "SUBSCRIPTION whose destination would be refused (kind: 'webhook', US-41.5) — " +
+      "unless you pass " +
       "acknowledge: true — because on a tenant still using vendor default endpoints this " +
       "instantly stops embedding, extraction, classification and merge, and only a " +
-      "human user-role key can undo it. Requires an ORCHESTRATOR key: tightening is safe " +
+      "human user-role key can undo it. Subscriptions are never silently disabled: they " +
+      "are either the reason for the refusal, or reported back to you on acknowledgement. Requires an ORCHESTRATOR key: tightening is safe " +
       "to automate. CLEARING is a different tool (clear_local_only) and is user-only.",
     inputSchema: {
       type: "object",
@@ -5192,7 +5296,11 @@ const TOOLS = [
       "(extraction_model / classification_model / merge_model / embedding_model) are " +
       "free-form (any model the key permits) and default server-side when omitted. Typical " +
       'onboarding call: set_llm_config({api_key: "sk-ant-...", embedding_api_key: "sk-..."}). ' +
-      "Verify anytime with llm_config (has_api_key / has_embedding_key). REQUIRES your " +
+      "PRIVATE TIER: set chat_provider 'openai_compatible' + chat_base_url + " +
+      "extraction_model (+ chat_api_key unless your server is keyless) to run " +
+      "extraction/classification/merge against YOUR OWN endpoint so document text " +
+      "never leaves your boundary; every model it resolves to is probed before it is saved. " +
+      "Verify anytime with llm_config (has_api_key / has_embedding_key / chat_provider). REQUIRES your " +
       "user-role key LOOPCTL_USER_KEY (minted by the human-anchored signup ceremony); if it " +
       "is unset the tool fails fast telling you to set it.",
     inputSchema: {
@@ -5206,7 +5314,14 @@ const TOOLS = [
         },
         extraction_model: {
           type: "string",
-          description: "Model id for knowledge extraction (null → server default).",
+          description:
+            "Model id for knowledge extraction (null → server default). REQUIRED with " +
+            "chat_provider 'openai_compatible': the server default is an Anthropic model " +
+            "id your endpoint cannot serve, so there is no safe fallback. It is also the " +
+            "fallback for classification_model / merge_model on that provider. " +
+            "HuggingFace repo ids are valid (e.g. 'meta-llama/Meta-Llama-3-8B-Instruct') " +
+            "— it is sent verbatim as the OpenAI `model` field, so it must match the name " +
+            "your server actually serves.",
         },
         classification_model: {
           type: "string",
@@ -5228,6 +5343,48 @@ const TOOLS = [
           description:
             "Embedding model id (null → server default text-embedding-3-small).",
         },
+        chat_provider: {
+          type: "string",
+          enum: ["anthropic", "openai_compatible"],
+          description:
+            "Which provider serves the CHAT surface (ingest extraction, classification, " +
+            "merge synthesis, memory promotion). Omit or 'anthropic' keeps the hardcoded " +
+            "Anthropic endpoint and identical behaviour. 'openai_compatible' routes that " +
+            "surface — the largest and most sensitive payload in the pipeline, your " +
+            "documents' full text — to YOUR OWN endpoint instead.",
+        },
+        chat_base_url: {
+          type: "string",
+          description:
+            "API base of your OpenAI-compatible server, e.g. " +
+            "'https://llm.example.internal/v1' (the client appends /chat/completions). " +
+            "Required with chat_provider 'openai_compatible'. PROBED with a trivial " +
+            "completion per resolved model BEFORE it is saved: an unreachable host, a " +
+            "rejected credential or a non-OpenAI-compatible response is a 422 and NOTHING " +
+            "is persisted. A host resolving into a private/loopback/link-local range is " +
+            "refused outright unless the OPERATOR allowlisted it (SSRF guard). Must be a " +
+            "BARE base: no query string, no fragment, no user:pass@ credentials (this " +
+            "column is NOT encrypted — anything in the URL is stored and echoed back). " +
+            "Plaintext http is accepted ONLY for a host the egress policy classifies " +
+            "network-local; a public http:// endpoint is refused because the request " +
+            "carries your key and your documents' full text in cleartext.",
+        },
+        chat_api_key: {
+          type: "string",
+          description:
+            "Credential for chat_base_url. Write-only; stored encrypted, never returned. " +
+            "SEPARATE from api_key — your Anthropic key is never sent to your endpoint. " +
+            "OPTIONAL: a local server that serves /chat/completions with no auth is " +
+            "configured by omitting this, and no authorization header is then sent.",
+        },
+        acknowledge_key_transmission: {
+          type: "boolean",
+          description:
+            "Required when CHANGING chat_base_url without supplying a matching " +
+            "chat_api_key: explicitly acknowledges that the already-stored key will be " +
+            "transmitted to the new host. The probe never ships an existing credential to " +
+            "a new host silently. Not persisted.",
+        },
       },
       required: [],
     },
@@ -5235,7 +5392,7 @@ const TOOLS = [
   {
     name: "knowledge_llm_usage",
     description:
-      "Per-tenant LLM token-usage summary, grouped by operation + model + source_type + " +
+      "Per-tenant LLM token-usage summary, grouped by operation + model + provider + source_type + " +
       "day over an optional date range, newest day first, with offset/limit pagination " +
       "over meta.total_count. When `from` is omitted it defaults to a 90-day lookback; the " +
       "EFFECTIVE window is echoed in meta.from/meta.to so you can detect that older usage " +
@@ -5995,6 +6152,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // US-41.4 — fail-closed no-egress guard
     case "egress_posture":
       return await egressPosture();
+
+    // US-41.7 — witnessed custody claim
+    case "custody_claim":
+      return await custodyClaim(args);
+
+    case "custody_failures":
+      return await custodyFailures();
 
     case "set_local_only":
       return await setLocalOnly(args);

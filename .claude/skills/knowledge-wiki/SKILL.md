@@ -26,24 +26,24 @@ never pass `tenant_id`/`subject_id`.
 ## Invariants (cited)
 
 1. **Novelty / dedup gate on create** — `Knowledge.propose_article/3` → the private `gate_proposal/4`
-   (`propose_article/3` at `knowledge.ex:428`; the four `gate_proposal/4` clauses at `:438-477`).
+   (`propose_article/3` at `knowledge.ex:441`; the four `gate_proposal/4` clauses at `:451-492`).
    **FIVE outcomes, not four** — `:duplicate`, `:low_novelty`, `:unknown`, `:novel`, and
    `:deduplicated` (`created: false`, returned when `create_article` hits the idempotency-key path,
-   `knowledge.ex:481-482`). A caller matching only the first four falls through on a reachable
+   `knowledge.ex:507-508`). A caller matching only the first four falls through on a reachable
    response.
    `:duplicate` returns the canonical neighbor without creating; `:low_novelty`
-   is created but **forced to `status: "draft"`** (`:449`) with novelty stamped into
-   `metadata.proposal_novelty` (`stamp_proposal_metadata/2`, `:526-539`) so a smarter consumer decides.
+   is created but **forced to `status: "draft"`** (`:467`) with novelty stamped into
+   `metadata.proposal_novelty` (`stamp_proposal_metadata/2`, `:552-565`) so a smarter consumer decides.
    Two branches that are easy to miss: `:duplicate` **falls through to create** if the canonical
-   neighbor vanished between assess and now (`:438-440`), and `:unknown` creates only BY DEFAULT — a
+   neighbor vanished between assess and now (`:457-460`), and `:unknown` creates only BY DEFAULT — a
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
-   created (`:463-469`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:428-430`)
+   created (`:481-487`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:447-449`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:7494`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:7574`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
-   (`absolute_score/1`, `:7558-7563`) clears a scale-matched threshold AND beats the best retrieved
-   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:7592-7602`; the pure decision is
-   `resolve_provenance/4`, `:7647-7657`) AND is authoritative (not superseded/conflicted — the caller
+   (`absolute_score/1`, `:7701-7706`) clears a scale-matched threshold AND beats the best retrieved
+   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:7735-7745`; the pure decision is
+   `resolve_provenance/4`, `:7790-7800`) AND is authoritative (not superseded/conflicted — the caller
    passes only `list_curated_sources/2`-filtered scores). Otherwise `:retrieved`. Both branches return identical `results`/`meta`
    key sets — callers branch on `meta.provenance` alone. A sparse pool must never let a near-but-wrong
    curated doc win.

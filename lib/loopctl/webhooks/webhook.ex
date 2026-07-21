@@ -102,21 +102,29 @@ defmodule Loopctl.Webhooks.Webhook do
     |> foreign_key_constraint(:project_id)
   end
 
-  # SSRF egress guard (ie-02 / GHSA-jh42-wf7g-f5rg). Delegates to the shared
-  # Loopctl.Net.UrlGuard, which does scheme allowlisting, real DNS resolution,
-  # and a private/loopback/link-local/metadata blocklist for BOTH IPv4 and IPv6
-  # (the old @private_ip_prefixes string blocklist missed IPv6, numeric IPv4,
-  # 0.0.0.0, and did no DNS resolution). Re-validated again at delivery time in
-  # Loopctl.Webhooks.ReqDelivery to defend against DNS rebinding.
+  # URL SHAPE validation only: scheme allowlist + host presence, via the shared
+  # `Loopctl.Net.UrlGuard`.
+  #
+  # The ADDRESS decision (DNS resolution + the private/loopback/metadata
+  # denylist) is DELIBERATELY NOT made here (US-41.5, AC-41.5.1/AC-41.5.6). A
+  # changeset cannot see the tenant, so it cannot consult the OPERATOR deployment
+  # allowlist — and deciding here kept a PRIVATE COPY of the URL rules that
+  # permanently refused every allowlisted loopback/private destination, which is
+  # exactly the destination the epic's local_only tier needs to reach. It also
+  # meant TWO DNS resolutions per write once the context started classifying.
+  #
+  # `Loopctl.Webhooks` therefore makes the ONE policy call
+  # (`Egress.webhook_destination_check/2`) right after this, and
+  # `Loopctl.Webhooks.ReqDelivery` re-applies it at delivery time. A
+  # non-allowlisted private destination is still rejected in BOTH places, so
+  # nothing is weakened (ie-02 / GHSA-jh42-wf7g-f5rg).
   defp validate_url(changeset) do
     validate_change(changeset, :url, fn :url, url ->
-      case UrlGuard.validate_egress(url) do
+      case UrlGuard.validate_shape(url) do
         {:ok, _uri} -> []
         {:error, :invalid_scheme} -> [url: "must use HTTPS or HTTP scheme"]
         {:error, :missing_host} -> [url: "must have a valid host"]
-        {:error, :invalid_url} -> [url: "must be a valid URL"]
-        {:error, :dns_resolution_failed} -> [url: "host could not be resolved"]
-        {:error, :blocked_ip} -> [url: "must not target a private or loopback address"]
+        {:error, _other} -> [url: "must be a valid URL"]
       end
     end)
   end

@@ -5,9 +5,13 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorkerTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Custody
+  alias Loopctl.Egress
+  alias Loopctl.Egress.PinCache
   alias Loopctl.Knowledge
   alias Loopctl.Memory
   alias Loopctl.ObanConfig
+  alias Loopctl.Test.AllowlistSource
   alias Loopctl.Workers.MemoryEmbeddingWorker
 
   defp job(memory_id, tenant_id) do
@@ -43,6 +47,46 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorkerTest do
       {:ok, reloaded} = Memory.get_memory_for_embedding(tenant.id, memory.id)
       refute is_nil(reloaded.embedding)
       assert is_binary(reloaded.embedding_content_hash)
+    end
+  end
+
+  # US-41.7 review: the embed's custody posture was recorded under a TENANT-ONLY
+  # egress scope while both memory create paths assign theirs with
+  # `EgressScope.new(tenant_id, project_id)`. Since `Egress.effective_local_only?/1`
+  # matches only the tenant-wide marking when project_id is nil, a project-scoped
+  # `local_only` memory got a claimable CREATE and a silently unrecorded EMBED —
+  # i.e. a COMPLETE, zero-egress claim for a body that was POSTed to the provider.
+  describe "custody scope follows the memory's own project (US-41.7)" do
+    test "a PROJECT-scoped local_only memory records its embed" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      AllowlistSource.put(["api.openai.com", "api.anthropic.com"])
+      on_exit(fn -> AllowlistSource.clear() end)
+
+      {:ok, _} = Egress.enable_local_only(tenant.id, project.id, acknowledge: true)
+      PinCache.invalidate_tenant(tenant.id)
+
+      memory =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: "s",
+          project_id: project.id,
+          text: "a project fact"
+        })
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, List.duplicate(0.3, 1536)}
+      end)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = MemoryEmbeddingWorker.perform(job(memory.id, tenant.id))
+      end)
+
+      assert [entry] = Custody.list_entries(tenant.id, "memory", memory.id)
+      assert entry.operation == "embed"
+      assert entry.posture["scope"] == "tenant:#{tenant.id}/project:#{project.id}"
     end
   end
 

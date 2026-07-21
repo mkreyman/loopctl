@@ -3,8 +3,19 @@ defmodule Loopctl.HealthCheck.Default do
   Default health check implementation.
 
   Checks database connectivity (SELECT 1), Oban process status, and the US-32.4
-  scale-alerts config-guard. Returns the application version from the mix project
-  config.
+  scale-alerts config-guard.
+
+  Note (#461 item 5): the running app version is intentionally NOT surfaced in the
+  response. `/health` is unauthenticated AND polled continuously by Fly's LB (every
+  10s), so it is a needless place to publish the exact build — deploy tooling reads
+  the version from the release/image, not this endpoint. This does NOT claim to
+  eliminate version fingerprinting: the same `Application.spec(:loopctl, :vsn)` is
+  still served, by design, at the unauthenticated discovery root (`GET /api/v1/`,
+  `LoopctlWeb.WelcomeController`) and in the OpenAPI document (`GET /api/v1/openapi`,
+  `Loopctl.ApiSpec` — `info.version` is a conventional, expected field there). The
+  narrow, honest benefit is keeping the highest-frequency liveness/readiness endpoint
+  minimal and not DUPLICATING the fingerprint onto it; the residual disclosure on the
+  discovery/OpenAPI surface is accepted.
 
   ## Liveness (`status`) vs readiness (`ready`) — US-32.4 post-review correction
 
@@ -97,7 +108,17 @@ defmodule Loopctl.HealthCheck.Default do
     ready =
       status == "ok" and checks.scale_alerts == "ok" and checks.oban_orphans == "ok"
 
-    result = %{status: status, ready: ready, version: app_version(), checks: checks}
+    # #461 item 5: the app version is deliberately NOT included in this response.
+    # Both `/health` (continuous, unauthenticated, hit by Fly's LB every 10s AND
+    # reachable by any internet caller) and `/health/ready` share this map, and
+    # deploy tooling reads the running build from the release/image, not this
+    # endpoint — so there is no reason to duplicate a version fingerprint onto the
+    # highest-frequency liveness/readiness probe. This does NOT eliminate version
+    # disclosure: `Application.spec(:loopctl, :vsn)` is still served, by design, at
+    # the discovery root (`GET /api/v1/`) and in the OpenAPI spec (`GET
+    # /api/v1/openapi`) — see the moduledoc. `status`/`ready` semantics — the fields
+    # the LB and the deploy smoke gate act on — are unchanged.
+    result = %{status: status, ready: ready, checks: checks}
 
     result =
       result
@@ -221,10 +242,6 @@ defmodule Loopctl.HealthCheck.Default do
         :oban_orphan_health_threshold,
         @default_oban_orphan_health_threshold
       )
-
-  defp app_version do
-    Application.spec(:loopctl, :vsn) |> to_string()
-  end
 
   # Only attach a `reasons.<key>` entry when a check actually failed with a reason —
   # keeps the healthy-path response shape unchanged (AC-32.4.2/3). Generalized (US-34.2)

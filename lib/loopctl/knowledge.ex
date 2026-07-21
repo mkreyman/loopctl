@@ -47,6 +47,7 @@ defmodule Loopctl.Knowledge do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Custody
   alias Loopctl.Egress
   alias Loopctl.Egress.Policy, as: EgressPolicy
   alias Loopctl.Egress.Scope, as: EgressScope
@@ -363,9 +364,21 @@ defmodule Loopctl.Knowledge do
           }
         end)
         |> maybe_enqueue_embedding(tenant_id, needs_embedding?)
+        # US-41.7 (AC-41.7.1/.2): assign this row's operation-0 sequence number and
+        # record the RESOLVED egress posture for the create INSIDE the content
+        # transaction. Cheap (one INSERT on the transaction's own connection) — the
+        # chain append is batched out to Oban, never a per-article AdminRepo
+        # round-trip (AC-41.7.7). A no-op unless the scope is marked `local_only`.
+        |> maybe_assign_custody_sequence(tenant_id, opts)
 
       case AdminRepo.transaction(multi) do
-        {:ok, %{article: article}} ->
+        {:ok, %{article: article} = changes} ->
+          # Only enqueue the flush when a sequence was ACTUALLY assigned. The
+          # predominantly non-local_only tenant base assigns nothing, and adding an
+          # unconditional Oban insert (plus a periodic no-op AdminRepo flush) to
+          # every article create is exactly the hot-path cost AC-41.7.7 makes a
+          # design constraint rather than an assertion.
+          maybe_enqueue_custody_flush(tenant_id, changes)
           {:ok, article}
 
         {:error, :article, changeset, _} ->
@@ -479,6 +492,14 @@ defmodule Loopctl.Knowledge do
   end
 
   defp create_proposal(tenant_id, attrs, assessment, opts, verdict) do
+    # US-41.7: carry the gate's OWN egress fact into the create's custody entry.
+    # The novelty gate embedded this proposal's title+body SYNCHRONOUSLY, before
+    # the row existed; a `:low_novelty` proposal is then created as a DRAFT, which
+    # never enqueues an embedding worker — so without this the create entry would
+    # be the row's ONLY entry and would vacuously read `all_network_local` for a
+    # body that had already left the process.
+    opts = Keyword.put(opts, :gate_embedded, Map.get(assessment, :gate_embedded, false))
+
     case create_article(tenant_id, attrs, opts) do
       {:ok, article} ->
         {:ok, %{verdict: verdict, article: article, created: true, assessment: assessment}}
@@ -549,23 +570,35 @@ defmodule Loopctl.Knowledge do
 
   # Make concurrent/retried creates safe on the (tenant_id, title) active unique
   # index. By the time the insert fails the constraint, the winning transaction
-  # has committed, so the existing row is visible (the recovery SELECT below
-  # deliberately mirrors the partial index's predicate, so the conflicting row is
-  # guaranteed visible unless it was concurrently archived). The idempotency
-  # signal is the article BODY itself (server-side, unforgeable): if the colliding
-  # payload's body equals the existing article's (after trimming leading/trailing
-  # whitespace), the conflict is a duplicate/retry -> return the existing row
-  # idempotently as `{:ok, :deduplicated, existing}` (a no-op the API answers 200).
-  # Otherwise it is a genuine different-body title collision ->
+  # has committed, so the winning row exists. The recovery SELECT
+  # (get_active_article_by_title/3) mirrors the partial index's active predicate
+  # AND is visibility-scoped by `vis` (mirroring get_article_by_idempotency_key/3,
+  # #163): it returns the winning row only when the caller may see it. The
+  # idempotency signal is the article BODY itself (server-side, unforgeable): if
+  # the colliding payload's body equals the existing article's (after trimming
+  # leading/trailing whitespace), the conflict is a duplicate/retry -> return the
+  # existing row idempotently as `{:ok, :deduplicated, existing}` (a no-op the API
+  # answers 200). Otherwise it is a genuine different-body title collision ->
   # `{:error, :duplicate_title, existing}` so the API can answer 409 (not a
   # retry-into-the-same-422). Non-(active-title) failures pass through unchanged.
   #
-  # The recovery SELECT runs after the insert's transaction has rolled back, so
-  # there is a tiny window in which a THIRD writer mutates or archives the winning
-  # row between its commit and our SELECT. That only produces a transient,
-  # self-healing outcome — a 409 (body now differs), or the original 422 (row now
-  # archived → SELECT returns nil) — which the client's next attempt resolves
-  # cleanly. We accept that rather than re-running the whole create under a lock.
+  # A nil recovery-SELECT result is an EXPECTED, intended outcome — not an
+  # impossible/transient edge — and the caller deliberately falls through to a
+  # generic uniqueness 422. Two distinct nil cases produce it:
+  #
+  #   1. Cross-agent private collision (the security invariant this path enforces):
+  #      the title collides with ANOTHER agent's private/owner article, so the
+  #      visibility filter excludes it. Falling through to a bare 422 leaks no
+  #      UUID, body, or existence signal about that private row. DO NOT drop the
+  #      visibility filter or this fallthrough to "fix" a phantom nil — doing so
+  #      silently reintroduces the private-article existence/UUID leak (#163).
+  #   2. Concurrent archival: the recovery SELECT runs after the insert's
+  #      transaction has rolled back, so a THIRD writer may mutate or archive the
+  #      winning row between its commit and our SELECT. That yields a transient,
+  #      self-healing outcome — a 409 (body now differs) or the 422 (row now
+  #      archived/superseded → SELECT returns nil) — which the client's next
+  #      attempt resolves cleanly. We accept that rather than re-running the whole
+  #      create under a lock.
   defp resolve_create_conflict(tenant_id, attrs, changeset, vis) do
     cond do
       # A single failed INSERT raises exactly one unique violation, so the
@@ -580,17 +613,17 @@ defmodule Loopctl.Knowledge do
         end
 
       active_title_conflict?(changeset) ->
-        resolve_title_conflict(tenant_id, attrs, changeset)
+        resolve_title_conflict(tenant_id, attrs, changeset, vis)
 
       true ->
         {:error, changeset}
     end
   end
 
-  defp resolve_title_conflict(tenant_id, attrs, changeset) do
+  defp resolve_title_conflict(tenant_id, attrs, changeset, vis) do
     title = attrs[:title] || attrs["title"]
 
-    case get_active_article_by_title(tenant_id, title) do
+    case get_active_article_by_title(tenant_id, title, vis) do
       %Article{} = existing ->
         if same_content?(existing, attrs) do
           {:ok, :deduplicated, existing}
@@ -648,22 +681,28 @@ defmodule Loopctl.Knowledge do
     end)
   end
 
-  defp get_active_article_by_title(_tenant_id, title) when not is_binary(title), do: nil
+  defp get_active_article_by_title(_tenant_id, title, _vis) when not is_binary(title), do: nil
 
   # tenant_id is nil for system-scoped articles; a NULL `=` never matches, so the
   # recovery simply doesn't apply to system scope (its conflicts are slug-based).
-  defp get_active_article_by_title(nil, _title), do: nil
+  defp get_active_article_by_title(nil, _title, _vis), do: nil
 
-  defp get_active_article_by_title(tenant_id, title) do
-    AdminRepo.one(
-      from(a in Article,
-        where:
-          a.tenant_id == ^tenant_id and a.title == ^title and
-            a.status not in [:archived, :superseded],
-        order_by: [asc: a.inserted_at],
-        limit: 1
-      )
+  # `vis` (a `visibility_agent_id`) scopes the recovery SELECT to owner-visible rows,
+  # mirroring get_article_by_idempotency_key/3 (#163). Because this path uses
+  # AdminRepo (BYPASSRLS) the visibility filter MUST live in the query — RLS won't
+  # apply it. A title colliding with another agent's private/owner article returns
+  # nil here → the caller falls through to a generic uniqueness 422, with no UUID,
+  # body, or existence signal leaked.
+  defp get_active_article_by_title(tenant_id, title, vis) do
+    from(a in Article,
+      where:
+        a.tenant_id == ^tenant_id and a.title == ^title and
+          a.status not in [:archived, :superseded],
+      order_by: [asc: a.inserted_at],
+      limit: 1
     )
+    |> maybe_filter_by_visibility(vis)
+    |> AdminRepo.one()
   end
 
   # Same content == same (whitespace-normalized) body. Derived server-side from
@@ -4318,11 +4357,26 @@ defmodule Loopctl.Knowledge do
   end
 
   defp do_merge(tenant_id, r, a, b) do
-    case merge_synthesizer().synthesize(
-           merge_egress_scope(tenant_id, a, b),
-           %{title: a.title, body: a.body},
-           %{title: b.title, body: b.body}
-         ) do
+    scope = merge_egress_scope(tenant_id, a, b)
+
+    # US-41.7 (AC-41.7.1): BOTH articles' full bodies are POSTed to the tenant's
+    # chat endpoint, so the merge is a content-touching operation on BOTH rows and
+    # each gets its own posture entry. Recorded BEFORE the call so a synthesis that
+    # egressed and then failed is still a recorded operation naming the endpoint it
+    # went to (AC-41.7.2), with the outcome patched on afterwards.
+    recorded = Enum.map([a, b], &Custody.record(scope, "article", &1.id, :merge))
+
+    result =
+      merge_synthesizer().synthesize(
+        scope,
+        %{title: a.title, body: a.body},
+        %{title: b.title, body: b.body}
+      )
+
+    outcome = if match?({:ok, _}, result), do: :succeeded, else: :failed
+    Enum.each(recorded, &Custody.record_outcome(&1, outcome))
+
+    case result do
       {:ok, %{title: title, body: body}} ->
         create_merged_draft(tenant_id, r, a, title, body)
 
@@ -4369,6 +4423,12 @@ defmodule Loopctl.Knowledge do
   end
 
   defp permanent_merge_error?(:unparseable_merge), do: true
+
+  # US-41.3 (AC-41.3.4): a shape failure from the OpenAI-compatible sibling — the
+  # configured local model cannot emit the required JSON object. PERMANENT, so the
+  # nightly executor stops re-attempting an identical synthesis (and never drafts a
+  # malformed merged article).
+  defp permanent_merge_error?({:invalid_response_shape, _details}), do: true
 
   # US-41.4 (AC-41.4.3): `:egress_blocked` is a PERMANENT local configuration
   # refusal — nothing was sent and nothing changes on its own. Without this clause
@@ -4449,7 +4509,10 @@ defmodule Loopctl.Knowledge do
   end
 
   defp merge_synthesizer do
-    Application.get_env(:loopctl, :merge_synthesizer, Loopctl.Knowledge.ClaudeMergeSynthesizer)
+    # US-41.3: the DEFAULT is the tenant-aware ROUTER; the resolution point itself
+    # (this Application.get_env) is unchanged, so config/test.exs's Mox mapping
+    # still intercepts.
+    Application.get_env(:loopctl, :merge_synthesizer, Loopctl.Knowledge.MergeSynthesizerRouter)
   end
 
   defp mark_resolution_executed(%ConflictResolution{} = r, execution_result) do
@@ -6060,6 +6123,23 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_visibility(vis)
     |> AdminRepo.all()
     |> MapSet.new()
+  end
+
+  @doc """
+  Whether `article_id` exists in `tenant_id` AND is visible to the caller (#163).
+
+  Fails CLOSED: an article that does not exist (or is not visible to `vis`)
+  returns `false`. Used by the US-41.7 custody-claim surface, which discloses a
+  row's existence, operation timeline, occurred-at timestamps, endpoints and
+  per-operation postures — not content, but #163's invariant is that visibility is
+  ENFORCED, not advisory, so an agent must not read the custody timeline of
+  another agent's private article any more than it reads the article.
+  """
+  @spec article_visible?(Ecto.UUID.t(), Ecto.UUID.t(), String.t() | nil) :: boolean()
+  def article_visible?(tenant_id, article_id, vis) do
+    tenant_id
+    |> visible_article_ids([article_id], vis)
+    |> MapSet.member?(article_id)
   end
 
   defp maybe_filter_by_visibility(query, nil), do: query
@@ -8803,6 +8883,44 @@ defmodule Loopctl.Knowledge do
 
     content_changed? or status_changed_to_published?
   end
+
+  # US-41.7 — the ONE place an article's operation-0 custody sequence is assigned.
+  # System-scoped articles (nil tenant) have no tenant to bind a claim to.
+  #
+  # Routed through `Custody.assign_in_multi/6` (rather than a local copy of it) so
+  # the "never fail the content write over a posture-recording fault" swallow —
+  # and the savepoint that makes it possible — has exactly ONE implementation.
+  defp maybe_assign_custody_sequence(multi, nil, _opts), do: multi
+
+  defp maybe_assign_custody_sequence(multi, tenant_id, opts) do
+    # `:create` resolves NO endpoint by itself — UNLESS the novelty gate ran, in
+    # which case this very request already POSTed the proposal's title+body to the
+    # resolved embedding endpoint (`Loopctl.Knowledge.ProposalGate`), before the row
+    # existed and therefore before any entry could be hung on it. `gate_embedded`
+    # comes from the assessment, so a proposal that REUSED a caller-supplied vector
+    # (no provider call) still records `[]`.
+    custody_opts =
+      if Keyword.get(opts, :gate_embedded, false),
+        do: [endpoint_kinds: [:embedding]],
+        else: []
+
+    # The scope follows the ARTICLE's project, which is only known once the insert
+    # has run — hence a scope FUNCTION over the Multi changes, not a static scope.
+    Custody.assign_in_multi(
+      multi,
+      :custody_posture,
+      &EgressScope.new(tenant_id, &1.article.project_id),
+      "article",
+      & &1.article.id,
+      :create,
+      custody_opts
+    )
+  end
+
+  defp maybe_enqueue_custody_flush(tenant_id, %{custody_posture: %Custody.PostureEntry{}}),
+    do: Custody.enqueue_flush(tenant_id)
+
+  defp maybe_enqueue_custody_flush(_tenant_id, _changes), do: :ok
 
   defp maybe_enqueue_embedding(multi, _tenant_id, false), do: multi
 

@@ -10,6 +10,7 @@ defmodule LoopctlWeb.ApiKeyController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Auth
+  alias Loopctl.Auth.ApiKey
   alias Loopctl.Tenants
 
   action_fallback LoopctlWeb.FallbackController
@@ -184,7 +185,18 @@ defmodule LoopctlWeb.ApiKeyController do
       agent_id: params["agent_id"]
     }
 
-    Auth.generate_api_key(attrs)
+    # Structural backstop (#462). On THIS controller path superadmin is blocked
+    # twice before the changeset's role-inclusion gate ever sees it: first
+    # `validate_not_superadmin/1` returns 403 for role "superadmin", then
+    # `safe_to_role/1` above maps "superadmin" (and any unknown string) to nil.
+    # So `role` is already nil here — if the 403 guard were bypassed the :http
+    # changeset would reject via `validate_required` ("can't be blank"), NOT via
+    # its "superadmin keys cannot be created via the API" message. The @http_roles
+    # superadmin exclusion is the backstop for DIRECT context callers that pass a
+    # raw `:superadmin` atom (bypassing `safe_to_role/1`); we still route through
+    # the HTTP-scoped changeset here so the context layer refuses a superadmin key
+    # on every path regardless of how `role` was derived.
+    Auth.generate_api_key(attrs, changeset: :http)
   end
 
   defp do_rotate_key(tenant, old_key, grace_hours) do
@@ -261,16 +273,18 @@ defmodule LoopctlWeb.ApiKeyController do
     }
   end
 
-  defp safe_to_role(nil), do: nil
-
+  # Coerce the client-supplied role string to a known HTTP-creatable role atom,
+  # or nil for anything else. The allowlist is derived from `ApiKey.http_roles/0`
+  # (the single source of truth: full role set minus :superadmin) by matching on
+  # the atom's string form — we NEVER `String.to_atom/1` untrusted input. Unknown
+  # strings and non-string JSON values (numbers, booleans, arrays) both map to
+  # nil, so they fail cleanly via `validate_required` (422 "can't be blank")
+  # rather than raising a FunctionClauseError -> 500.
   defp safe_to_role(role) when is_binary(role) do
-    case role do
-      "user" -> :user
-      "orchestrator" -> :orchestrator
-      "agent" -> :agent
-      _ -> nil
-    end
+    Enum.find(ApiKey.http_roles(), fn allowed -> Atom.to_string(allowed) == role end)
   end
+
+  defp safe_to_role(_role), do: nil
 
   defp parse_datetime(nil), do: nil
 

@@ -38,7 +38,8 @@ defmodule Loopctl.Provider do
   @type ctx :: %{
           required(:scope) => Scope.t(),
           optional(:purpose) => Policy.purpose(),
-          optional(:pinned_by_caller) => boolean()
+          optional(:pinned_by_caller) => boolean(),
+          optional(:tenant_supplied_url) => boolean()
         }
 
   @doc """
@@ -86,13 +87,27 @@ defmodule Loopctl.Provider do
   defp request(method, url, req_opts, %{scope: %Scope{} = scope} = ctx) do
     purpose = Map.get(ctx, :purpose, :inference)
     caller_pinned? = Map.get(ctx, :pinned_by_caller, false)
+    # `tenant_supplied_url: true` opts this call into the SSRF denylist on the
+    # DEFAULT (non-`local_only`) path. Set it wherever the url came from tenant
+    # data (`chat_base_url`), never for a hardcoded vendor endpoint. The decision
+    # itself stays in the ONE policy module (AC-41.4.9).
+    tenant_supplied? = Map.get(ctx, :tenant_supplied_url, false)
 
-    case Policy.check(scope, url, purpose) do
+    case Policy.check(scope, url, purpose, tenant_supplied: tenant_supplied?) do
       # `put_new`, never `put`: a caller that already pinned has `:url` rewritten
       # to its validated IP, and overwriting it with the original hostname would
       # silently DROP that SSRF pin and reopen the DNS-rebinding window.
       {:ok, :unpinned} ->
-        req(method, Keyword.put_new(req_opts, :url, url))
+        # DEFENCE IN DEPTH: `Policy.check/4` no longer returns `:unpinned` for a
+        # `tenant_supplied` url (it fails closed instead), but if that ever regresses,
+        # an unpinned request to a tenant-controlled host must at least not FOLLOW
+        # REDIRECTS back out to an unvalidated URL.
+        req(
+          method,
+          req_opts
+          |> Keyword.put_new(:url, url)
+          |> maybe_no_redirect(tenant_supplied?)
+        )
 
       {:ok, _pinned} when caller_pinned? ->
         req(method, req_opts)
@@ -108,6 +123,9 @@ defmodule Loopctl.Provider do
         {:error, {transient, details}}
     end
   end
+
+  defp maybe_no_redirect(opts, true), do: Keyword.put(opts, :redirect, false)
+  defp maybe_no_redirect(opts, false), do: opts
 
   defp req(:post, opts), do: Req.post(opts)
   defp req(:get, opts), do: Req.get(opts)

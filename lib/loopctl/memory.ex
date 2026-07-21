@@ -49,7 +49,9 @@ defmodule Loopctl.Memory do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Custody
   alias Loopctl.Egress
+  alias Loopctl.Egress.Scope, as: EgressScope
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Embeddings
@@ -329,17 +331,47 @@ defmodule Loopctl.Memory do
       end
     end)
     |> Multi.insert(:memory, long_term_changeset(scope, attrs))
+    # US-41.7 (AC-41.7.8): assign the memory's OPERATION-0 sequence inside the
+    # content transaction, exactly as an article's create does. Without it the
+    # window between the memory write and the embedding worker would read as
+    # "no claim recorded" for a row that WILL have a claim — collapsing state (b)
+    # into state (a), which is the ambiguity AC-41.7.8 forbids — and a memory whose
+    # embed job was lost would have no claim at all rather than an incomplete one.
+    |> Custody.assign_in_multi(
+      :custody_posture,
+      fn _changes -> EgressScope.new(scope.tenant_id, scope.project_id) end,
+      "memory",
+      & &1.memory.id,
+      :create
+    )
     |> Oban.insert(:embedding_job, fn %{memory: memory} ->
       MemoryEmbeddingWorker.new(%{memory_id: memory.id, tenant_id: memory.tenant_id})
     end)
     |> AdminRepo.transaction()
     |> case do
-      {:ok, %{memory: memory}} -> {:ok, memory}
-      {:error, :quota, :quota_exceeded, _changes} -> {:error, :quota_exceeded}
-      {:error, :memory, %Ecto.Changeset{} = changeset, _changes} -> memory_insert_error(changeset)
-      {:error, :embedding_job, reason, _changes} -> {:error, reason}
+      {:ok, %{memory: memory} = changes} ->
+        maybe_enqueue_custody_flush(memory.tenant_id, changes)
+        {:ok, memory}
+
+      {:error, :quota, :quota_exceeded, _changes} ->
+        {:error, :quota_exceeded}
+
+      {:error, :memory, %Ecto.Changeset{} = changeset, _changes} ->
+        memory_insert_error(changeset)
+
+      {:error, :embedding_job, reason, _changes} ->
+        {:error, reason}
     end
   end
+
+  # Only enqueue the batch flush when a sequence was ACTUALLY assigned — the
+  # predominantly non-local_only tenant base assigns nothing, and an unconditional
+  # Oban insert per memory write is the hot-path cost AC-41.7.7 makes a design
+  # constraint.
+  defp maybe_enqueue_custody_flush(tenant_id, %{custody_posture: %Custody.PostureEntry{}}),
+    do: Custody.enqueue_flush(tenant_id)
+
+  defp maybe_enqueue_custody_flush(_tenant_id, _changes), do: :ok
 
   # `validate_project_scope/1` runs BEFORE this advisory-locked Multi (check-then-act),
   # so a project deleted in the window between that read and the insert trips the
@@ -2696,6 +2728,16 @@ defmodule Loopctl.Memory do
         {:unsafe_fragment,
          "(tenant_id, subject_id, embedding_content_hash) WHERE source = 'promoted'"}
     )
+    # US-41.7: a promoted memory is a memory CREATE too, so it anchors its own
+    # operation-0 sequence. Without it a promoted row's claim would read as
+    # `partial_history` forever.
+    |> Custody.assign_in_multi(
+      :custody_posture,
+      fn _changes -> EgressScope.new(scope.tenant_id, scope.project_id) end,
+      "memory",
+      & &1.memory.id,
+      :create
+    )
     |> Multi.run(:store_embedding, fn repo, %{memory: memory} ->
       store_promoted_embedding(repo, scope, memory, embedding, hash)
     end)
@@ -2704,12 +2746,24 @@ defmodule Loopctl.Memory do
     end)
     |> AdminRepo.transaction()
     |> case do
-      {:ok, %{supersede: outcome}} -> {:ok, outcome}
-      {:error, :precheck, :already_promoted, _changes} -> {:ok, :deduped}
-      {:error, :quota, :quota_exceeded, _changes} -> {:error, :quota_exceeded}
-      {:error, :memory, %Ecto.Changeset{} = changeset, _changes} -> {:error, changeset}
-      {:error, :store_embedding, %Ecto.Changeset{} = changeset, _changes} -> {:error, changeset}
-      {:error, :supersede, %Ecto.Changeset{} = changeset, _changes} -> {:error, changeset}
+      {:ok, %{supersede: outcome} = changes} ->
+        maybe_enqueue_custody_flush(scope.tenant_id, changes)
+        {:ok, outcome}
+
+      {:error, :precheck, :already_promoted, _changes} ->
+        {:ok, :deduped}
+
+      {:error, :quota, :quota_exceeded, _changes} ->
+        {:error, :quota_exceeded}
+
+      {:error, :memory, %Ecto.Changeset{} = changeset, _changes} ->
+        {:error, changeset}
+
+      {:error, :store_embedding, %Ecto.Changeset{} = changeset, _changes} ->
+        {:error, changeset}
+
+      {:error, :supersede, %Ecto.Changeset{} = changeset, _changes} ->
+        {:error, changeset}
     end
   end
 
@@ -3076,6 +3130,38 @@ defmodule Loopctl.Memory do
       {:ok, value} -> value
       :error -> Map.get(opts, to_string(key), default)
     end
+  end
+
+  @doc """
+  The subset of `memory_ids` inside `(tenant_id, subject_id)` — the ENFORCED
+  memory isolation boundary (`Loopctl.Memory.Scope`).
+
+  Used by the US-41.7 custody-claim surface. A claim discloses a row's existence,
+  its operation timeline, occurred-at timestamps, endpoints and per-operation
+  postures. That is not the memory's content, but `(tenant_id, subject_id)` is the
+  boundary EVERY other memory read enforces — so answering a claim on tenant scope
+  alone would let any agent key in the tenant enumerate another agent's private
+  memories through the back door.
+  """
+  @spec owned_memory_ids(String.t(), String.t(), [String.t()]) :: [String.t()]
+  def owned_memory_ids(_tenant_id, _subject_id, []), do: []
+
+  def owned_memory_ids(tenant_id, subject_id, memory_ids)
+      when is_binary(tenant_id) and is_binary(subject_id) do
+    from(m in MemorySchema,
+      where: m.tenant_id == ^tenant_id and m.subject_id == ^subject_id and m.id in ^memory_ids,
+      select: m.id
+    )
+    |> Loopctl.AdminRepo.all()
+  end
+
+  @doc """
+  Whether `memory_id` exists inside the caller's own `(tenant_id, subject_id)`
+  scope. Fails CLOSED — a memory that does not exist returns `false`.
+  """
+  @spec memory_owned?(String.t(), String.t(), String.t()) :: boolean()
+  def memory_owned?(tenant_id, subject_id, memory_id) do
+    owned_memory_ids(tenant_id, subject_id, [memory_id]) != []
   end
 
   @doc """
