@@ -16,6 +16,14 @@ Or run directly with npx:
 npx loopctl-mcp-server
 ```
 
+### Requirements
+
+- **Node.js >= 20.6.0.** The server makes all outbound HTTPS calls through Node's
+  global `fetch` (undici). Node 20.6.0 is the first release where that transport
+  honors `NODE_EXTRA_CA_CERTS` (the setting used for a custom/self-signed loopctl
+  CA -- see Troubleshooting below). On older runtimes that env var is silently
+  ignored, so the floor is enforced via `engines` in `package.json`.
+
 ## Configuration
 
 Add to your `.mcp.json` (Claude Code) or equivalent MCP config:
@@ -519,7 +527,7 @@ clean one-time bootstrap (no cross-key collision).
 
 - Verify `LOOPCTL_SERVER` is set and reachable
 - Check that the server URL includes the protocol (`https://`)
-- If your loopctl server uses a custom or self-signed CA, set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` in your environment so Node trusts that CA while keeping TLS certificate verification enabled
+- If your loopctl server uses a custom or self-signed CA, set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` in your environment so Node trusts that CA while keeping TLS certificate verification enabled. This requires **Node >= 20.6.0** (or the >= 18.19.0 backport): this server issues all requests through Node's global `fetch` (undici), which only began honoring `NODE_EXTRA_CA_CERTS` in those releases. On older runtimes the variable is silently ignored and you will still see `unable to verify the first certificate` / self-signed-cert errors -- upgrade Node rather than disabling verification.
 - Do NOT set `NODE_TLS_REJECT_UNAUTHORIZED=0` -- it disables certificate verification for the entire Node process (all outbound TLS), exposing every connection to MITM, not just the loopctl one
 
 ### Authentication errors (401)
