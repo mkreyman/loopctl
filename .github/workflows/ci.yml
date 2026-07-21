@@ -307,6 +307,21 @@ jobs:
         env:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
+      # US-41.1 AC-41.1.12(i) — the per-dimension ANN plan GATE. It EXPLAINs the real
+      # request-path inner ANN for EVERY supported embedding dimension over a committed,
+      # ANALYZEd 30k-row corpus and fails if the per-dimension HNSW index is not the
+      # CHOSEN path (no `enable_seqscan = off` anywhere — eligibility is not selection).
+      # It belongs in this every-PR job, NOT the schedule-only scale-nightly matrix:
+      # a per-dimension index that stops planning is a silent production regression, and
+      # the seed is small enough (~60s) to afford on every push. This step is the gate;
+      # AC-41.1.12(ii)'s production EXPLAIN is an artifact report, deliberately not CI.
+      - name: Run per-dimension ANN plan gate (TC-41.1.2, AC-41.1.12(i))
+        run: |
+          SCALE_TESTS=true mix test --only scale \
+            test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs
+        env:
+          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
+
   pgbouncer-e2e:
     name: Pgbouncer e2e (US-27.13)
     # The default Test job connects to DIRECT Postgres, which ACCEPTS a statement_timeout

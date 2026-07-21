@@ -49,6 +49,15 @@ defmodule Loopctl.Tenants.Tenant do
     # RESTRICTIVE value (:agent_rooted) is both the schema and DB default.
     field :trust_tier, Ecto.Enum, values: @trust_tiers, default: :agent_rooted
 
+    # US-41.1 AC-41.1.4: the tenant's recorded embedding vector dimension. NULL
+    # means "not explicitly recorded" — `Loopctl.Embeddings.active_dimension/1`
+    # then derives it from the tenant's `embedding_model` via the static
+    # model-to-dimension table and falls back to `:embedding_dimensions` (1536).
+    # NEVER cast from user input: it is written by an operator or by the US-41.2
+    # endpoint probe, and it must always agree with the shape of the vectors
+    # already stored for that tenant.
+    field :tenant_embedding_dimension, :integer
+
     has_many :root_authenticators, Loopctl.Tenants.RootAuthenticator, foreign_key: :tenant_id
     has_many :audit_key_history, Loopctl.Tenants.AuditKeyHistory, foreign_key: :tenant_id
 

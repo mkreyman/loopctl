@@ -204,6 +204,76 @@ defmodule Loopctl.Repo.HnswIndex do
     """
   end
 
+  # ---------------------------------------------------------------------------
+  # US-41.1 AC-41.1.2 — PER-DIMENSION expression indexes on the embedding side
+  # tables (`article_embeddings` / `memory_embeddings`).
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  The canonical per-dimension HNSW index name for `table` at `dim`
+  (e.g. `article_embeddings_hnsw_dim_768_idx`).
+  """
+  @spec dimension_index_name(String.t(), pos_integer()) :: String.t()
+  def dimension_index_name(table, dim),
+    do: "#{validate!(table)}_hnsw_dim_#{validate_dimension!(dim)}_idx"
+
+  @doc """
+  SQL creating the per-dimension partial HNSW expression index for `table` at
+  `dim`, CONCURRENTLY, detected by EXACT NAME.
+
+  ## Why an expression index over an explicit cast (AC-41.1.2)
+
+  pgvector refuses to build an `hnsw`/`ivfflat` index on a `vector` column with no
+  dimension modifier, and a `WHERE dim = N` partial predicate does NOT supply a
+  typmod. The side tables therefore carry an UNCONSTRAINED `vector` column and the
+  index is built over the explicit cast `(embedding::vector(N))`. Verified against
+  pgvector 0.8.2: the index builds, and — on a corpus large enough for the index to
+  be the cheaper path — the planner CHOOSES it for a query whose `ORDER BY` uses the
+  IDENTICAL cast expression, with no `enable_seqscan = off`. The query side lives in
+  `Loopctl.Knowledge.VectorSearch.index_safe_dimension_knn_base/6`; the cast there
+  and the cast here must stay character-identical or the planner cannot match them.
+
+  Each index also carries the AC-41.1.1 live-row predicate (`AND live_denorm`), the
+  side-table analogue of US-28.2's `WHERE superseded_by IS NULL`, so superseded rows
+  are simply NOT IN the index and can never occupy an ANN pool slot.
+
+  ## Detection is BY NAME, never by access method
+
+  `create_if_absent_sql/1`'s `am.amname = 'hnsw'` capability check would see the
+  FIRST per-dimension index and skip every subsequent one (the same trap migration
+  `20260709000300` already had to avoid). There are intentionally N HNSW indexes per
+  side table — one per supported dimension.
+  """
+  @spec create_dimension_index_sql(String.t(), pos_integer()) :: String.t()
+  def create_dimension_index_sql(table, dim) do
+    table = validate!(table)
+    dim = validate_dimension!(dim)
+    index = dimension_index_name(table, dim)
+
+    """
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS #{index}
+      ON #{table}
+      USING hnsw ((embedding::vector(#{dim})) vector_cosine_ops)
+      #{with_params_clause()}
+      WHERE dim = #{dim} AND live_denorm;
+    """
+  end
+
+  @doc "SQL dropping the per-dimension HNSW index for `table` at `dim`."
+  @spec drop_dimension_index_sql(String.t(), pos_integer()) :: String.t()
+  def drop_dimension_index_sql(table, dim),
+    do: "DROP INDEX CONCURRENTLY IF EXISTS #{dimension_index_name(table, dim)};"
+
+  # A dimension is interpolated into DDL, so it is validated to be a plain positive
+  # integer. Dimensions come ONLY from the deployment's supported-dimension config
+  # (`Loopctl.Embeddings.supported_dimensions/0`), never from a request — index DDL
+  # is operator/migration plane only (AC-41.1.3).
+  defp validate_dimension!(dim) when is_integer(dim) and dim > 0, do: dim
+
+  defp validate_dimension!(dim) do
+    raise ArgumentError, "embedding dimension must be a positive integer, got: #{inspect(dim)}"
+  end
+
   # Table names are internal constants ("articles") or test-generated with
   # System.unique_integer — never user input — but validate defensively so the
   # interpolated identifier can never carry anything but a plain lowercase SQL

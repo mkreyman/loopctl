@@ -447,6 +447,138 @@ defmodule Loopctl.Knowledge.VectorSearch do
   end
 
   @doc """
+  The DIMENSION-SCOPED index-safe HNSW inner base over an embedding SIDE TABLE
+  (US-41.1 AC-41.1.5).
+
+  Same load-bearing filter-after-ANN shape as `index_safe_knn_base/4`, with two
+  differences that are both required for the per-tenant-dimension design:
+
+    * the ordering expression is the EXPLICIT CAST `(embedding::vector(N))`,
+      character-identical to the expression the per-dimension index is built over
+      (`Loopctl.Repo.HnswIndex.create_dimension_index_sql/2`). The side table's
+      `embedding` column is an UNCONSTRAINED `vector` — pgvector refuses to
+      HNSW-index that — so the cast is what supplies the typmod, and the planner
+      can only match the index if the query repeats it verbatim.
+    * the WHERE carries `dim == ^dimension` and `live_denorm`, which are EXACTLY
+      the per-dimension index's partial predicate. Nothing else may be added here:
+      a JOIN or a selective btree predicate inside the index-ordered top-k is the
+      #170/#172 production incident (cost ~57k vs ~880 at 76k rows). Subject
+      scope, project, tags, category and status all belong on an OUTER query over
+      the materialized pool.
+
+  Because the inner pool is dimension-scoped, a cross-dimension similarity
+  comparison is impossible BY CONSTRUCTION — pgvector's "different vector
+  dimensions" error is an unreachable safety net, not the mechanism.
+
+  `schema` is `Loopctl.Knowledge.ArticleEmbedding` or
+  `Loopctl.Memory.MemoryEmbedding`; `target` must already be a bound `[float()]`
+  list of exactly `dimension` components.
+
+  `:live_only` (default `true`) drops the `live_denorm` predicate when `false` — the
+  admin/oversight `include_superseded` recall path. That variant has NO matching
+  partial index by design (the per-dimension indexes carry the live predicate the AC
+  mandates, and a second full index per dimension would double an already-expensive
+  HNSW build at corpus scale), so it plans as a bounded top-k sort rather than an
+  index scan. Do NOT route interactive recall through it.
+  """
+  @spec index_safe_dimension_knn_base(
+          module(),
+          Ecto.UUID.t(),
+          [float()],
+          pos_integer(),
+          pos_integer(),
+          keyword()
+        ) :: Ecto.Query.t()
+  def index_safe_dimension_knn_base(schema, tenant_id, target, dimension, pool, opts \\ [])
+      when is_atom(schema) and is_binary(tenant_id) and is_list(target) and
+             is_integer(dimension) and is_integer(pool) do
+    from(x in schema,
+      where: x.tenant_id == ^tenant_id,
+      where: x.dim == ^dimension,
+      limit: ^pool
+    )
+    |> maybe_live_denorm_only(Keyword.get(opts, :live_only, true))
+    |> dimension_order_by(dimension, target)
+  end
+
+  defp maybe_live_denorm_only(query, false), do: query
+  defp maybe_live_denorm_only(query, _true), do: where(query, [x], x.live_denorm)
+
+  # ONE clause per SUPPORTED dimension, generated at COMPILE TIME.
+  #
+  # `fragment/2` requires a literal SQL string, and the cast's typmod cannot be a
+  # bound parameter (a typmod is part of the TYPE, not a value) — so the only way to
+  # emit `(embedding::vector(768))` is to have that exact literal in the AST. Doing it
+  # per supported dimension makes the set of emittable casts a CLOSED, compile-time
+  # set drawn from `:supported_embedding_dimensions`: no request-supplied value can
+  # ever reach the SQL, and an unsupported dimension hits the raising fallback below
+  # instead of silently sequential-scanning a corpus with no matching index.
+  #
+  # Compile-time (`Application.compile_env`) rather than runtime config is correct
+  # here: adding a dimension ALSO requires a migration to build its indexes
+  # CONCURRENTLY, so it is inherently a deploy-time change, and reading it the same
+  # way at compile time makes a config/index mismatch impossible to introduce by
+  # editing runtime config alone.
+  @supported_dimensions Application.compile_env(
+                          :loopctl,
+                          :supported_embedding_dimensions,
+                          [768, 1024, 1536, 3072]
+                        )
+
+  @doc "The compile-time supported-dimension set this module can emit a cast for."
+  @spec supported_dimensions() :: [pos_integer()]
+  def supported_dimensions, do: @supported_dimensions
+
+  for dim <- @supported_dimensions do
+    # Built here (plain Elixir) and `unquote`d so `fragment/2` receives a LITERAL.
+    # The left operand is character-identical to the indexed expression in
+    # `Loopctl.Repo.HnswIndex.create_dimension_index_sql/2`; the right operand stays a
+    # bound `^[float()]` param (never a re-interpolated `%Pgvector{}` — the #168 500)
+    # and resolves to `vector` through the `<=>` operator, which is enough for the
+    # planner to choose the per-dimension index (verified with EXPLAIN).
+    cast_fragment = "(?::vector(#{dim})) <=> ?"
+
+    defp dimension_order_by(query, unquote(dim), target) do
+      order_by(query, [x], asc: fragment(unquote(cast_fragment), x.embedding, ^target))
+    end
+  end
+
+  defp dimension_order_by(_query, dimension, _target) do
+    raise ArgumentError,
+          "embedding dimension #{inspect(dimension)} is not supported by this instance " <>
+            "(supported: #{inspect(@supported_dimensions)}). A dimension is only supported " <>
+            "once its per-dimension HNSW indexes have been built by a migration — index DDL " <>
+            "is operator/migration plane only."
+  end
+
+  @doc """
+  Merges the raw cosine `:distance` onto a SIDE-TABLE pool query's map selection,
+  using the same explicit per-dimension cast as `index_safe_dimension_knn_base/5`.
+
+  The only other home of the `<=>` literal for the side tables, keeping the
+  single-home invariant the cosine-reintroduction lint enforces.
+  """
+  @spec put_dimension_distance(Ecto.Query.t(), pos_integer(), [float()]) :: Ecto.Query.t()
+  def put_dimension_distance(query, dimension, target)
+      when is_integer(dimension) and is_list(target) do
+    dimension_distance_select(query, dimension, target)
+  end
+
+  for dim <- @supported_dimensions do
+    distance_fragment = "(?::vector(#{dim})) <=> ?"
+
+    defp dimension_distance_select(query, unquote(dim), target) do
+      select_merge(query, [x], %{
+        distance: fragment(unquote(distance_fragment), x.embedding, ^target)
+      })
+    end
+  end
+
+  defp dimension_distance_select(_query, dimension, _target) do
+    raise ArgumentError, "embedding dimension #{inspect(dimension)} is not supported"
+  end
+
+  @doc """
   Merges the raw cosine `:distance` (`embedding <=> $target`) onto `query`'s map
   selection.
 

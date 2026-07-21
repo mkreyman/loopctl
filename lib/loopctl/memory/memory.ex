@@ -48,6 +48,8 @@ defmodule Loopctl.Memory.Memory do
 
   use Loopctl.Schema
 
+  alias Loopctl.Embeddings.Dimensions
+
   @type t :: %__MODULE__{}
 
   @sources [:explicit, :promoted]
@@ -168,12 +170,21 @@ defmodule Loopctl.Memory.Memory do
   the configured `:embedding_dimensions` (default 1536) when non-nil. Used by
   US-28.2's async embedding worker.
   """
-  @spec embedding_changeset(%__MODULE__{}, list(number()) | nil, String.t() | nil) ::
-          Ecto.Changeset.t()
-  def embedding_changeset(memory, embedding, content_hash \\ nil) do
+  @spec embedding_changeset(
+          %__MODULE__{},
+          list(number()) | nil,
+          String.t() | nil,
+          pos_integer()
+        ) :: Ecto.Changeset.t()
+  def embedding_changeset(
+        memory,
+        embedding,
+        content_hash \\ nil,
+        expected_dimension \\ Application.get_env(:loopctl, :embedding_dimensions, 1536)
+      ) do
     memory
     |> change(%{embedding: embedding, embedding_content_hash: content_hash})
-    |> validate_embedding_dimensions()
+    |> Dimensions.validate_vector_length(:embedding, expected_dimension)
   end
 
   @doc "Allowed `source` values."
@@ -258,35 +269,6 @@ defmodule Loopctl.Memory.Memory do
 
       _ ->
         changeset
-    end
-  end
-
-  defp validate_embedding_dimensions(changeset) do
-    case get_change(changeset, :embedding) do
-      nil ->
-        changeset
-
-      %Pgvector{} = vector ->
-        check_dimensions(changeset, length(Pgvector.to_list(vector)))
-
-      embedding when is_list(embedding) ->
-        check_dimensions(changeset, length(embedding))
-
-      _ ->
-        changeset
-    end
-  end
-
-  defp check_dimensions(changeset, actual) do
-    expected = Application.get_env(:loopctl, :embedding_dimensions, 1536)
-
-    if actual == expected do
-      changeset
-    else
-      add_error(changeset, :embedding, "dimension mismatch: expected %{expected}, got %{actual}",
-        expected: expected,
-        actual: actual
-      )
     end
   end
 end
