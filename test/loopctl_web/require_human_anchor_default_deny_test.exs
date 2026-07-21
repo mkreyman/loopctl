@@ -248,7 +248,8 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/admin/tenants/:id/activate"},
                {:post, "/api/v1/admin/violators/:id/resolve"},
                {:post, "/api/v1/admin/violators/:id/ignore"},
-               {:post, "/api/v1/admin/tenants/:id/clear-halt"}
+               {:post, "/api/v1/admin/tenants/:id/clear-halt"},
+               {:post, "/api/v1/admin/tenants/:id/clear-halt/challenge"}
              ])
 
   # Routes gated by `exact_role:` (not hierarchy) that a plain `:user` key

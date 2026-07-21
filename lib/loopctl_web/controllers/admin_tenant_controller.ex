@@ -18,11 +18,20 @@ defmodule LoopctlWeb.AdminTenantController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
   alias Loopctl.Tenants
+  alias Loopctl.WebAuthn.Reauth
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, exact_role: :superadmin
+
+  # Break-glass custody-halt recovery is a Chain of Custody v2 L6 control:
+  # even a compromised superadmin key MUST prove possession of the tenant's
+  # enrolled hardware authenticator. The purpose string is a compile-time
+  # constant (never user input) and is DISTINCT from the audit-key rotation
+  # purpose, so a challenge minted for one ceremony cannot be replayed against
+  # the other — `Reauth.consume_challenge/3` scopes by `(tenant_id, purpose)`.
+  @clear_halt_purpose "clear_custody_halt"
 
   tags(["Admin"])
 
@@ -366,12 +375,108 @@ defmodule LoopctlWeb.AdminTenantController do
     end
   end
 
-  @doc "POST /api/v1/admin/tenants/:id/clear-halt — clears custody halt (break-glass, requires WebAuthn)"
+  operation(:clear_halt_challenge,
+    summary: "Issue a break-glass clear-halt reauth challenge (admin)",
+    description:
+      "Step 1 of the challenge-bound WebAuthn reauthentication ceremony for " <>
+        "break-glass custody-halt recovery. Issues an authentication challenge bound " <>
+        "to the target tenant's enrolled root authenticators, stores it server-side " <>
+        "(single-use, short TTL) and returns the opaque `challenge_id`, the base64url " <>
+        "challenge bytes, and the allowed credential ids. Requires superadmin.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    responses: %{
+      200 => {"Reauth challenge", "application/json", Schemas.ReauthChallengeResponse},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      422 => {"No enrolled authenticators", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc """
+  POST /api/v1/admin/tenants/:id/clear-halt/challenge
+
+  Step 1 of the break-glass reauth ceremony. Mints a server-side,
+  single-use, TTL-bounded authentication challenge bound to the TARGET
+  tenant (the path `:id`) and returns the opaque handle plus allowed
+  credential ids. Superadmin-only (controller-level `RequireRole` plug).
+
+  This is a cross-tenant superadmin operation, so there is NO ownership
+  check: the target tenant is the path `:id`, and tenant isolation holds
+  because the challenge is stored under that `tenant_id` and can only be
+  consumed against the same `tenant_id` in `clear_halt/2`.
+  """
+  def clear_halt_challenge(conn, %{"id" => tenant_id}) do
+    case Reauth.issue_challenge(tenant_id, @clear_halt_purpose) do
+      {:ok, issued} ->
+        conn
+        |> put_status(:ok)
+        |> json(%{
+          data: %{
+            challenge_id: issued.challenge_id,
+            challenge: issued.challenge,
+            allowed_credentials: issued.allowed_credentials,
+            rp_id: issued.rp_id,
+            expires_at: issued.expires_at
+          }
+        })
+
+      {:error, :no_authenticators} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{
+          error: %{
+            message:
+              "Tenant has no enrolled root authenticator to authorize break-glass recovery",
+            code: "no_authenticators",
+            status: 422
+          }
+        })
+
+      {:error, _reason} ->
+        conn
+        |> put_status(:internal_server_error)
+        |> json(%{error: %{message: "Failed to issue reauth challenge", status: 500}})
+    end
+  end
+
+  operation(:clear_halt,
+    summary: "Clear a tenant custody halt (break-glass, admin)",
+    description:
+      "Step 2 of the challenge-bound WebAuthn reauthentication ceremony. Verifies " <>
+        "the assertion against the STORED challenge from step 1 (challenge binding, " <>
+        "origin, RP-ID, signature against the enrolled COSE key, sign-counter " <>
+        "regression) and, on success, clears the tenant's custody halt. The " <>
+        "assertion is single-use — one challenge authorizes exactly one attempt. " <>
+        "Requires superadmin.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    request_body: {"WebAuthn assertion", "application/json", Schemas.RotateAuditKeyRequest},
+    responses: %{
+      200 =>
+        {"Halt cleared", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      401 => {"WebAuthn required or failed", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc """
+  POST /api/v1/admin/tenants/:id/clear-halt
+
+  Break-glass custody-halt recovery (Chain of Custody v2, L6). Superadmin
+  key alone is NOT sufficient: the caller must present a WebAuthn assertion
+  verified against a challenge issued by `challenge/2` and the target
+  tenant's enrolled root authenticator. The challenge is consumed exactly
+  once; replay is rejected.
+  """
   def clear_halt(conn, %{"id" => id} = params) do
-    # G7: Break-glass requires WebAuthn assertion
+    # Break-glass requires a VERIFIED WebAuthn assertion, not merely a
+    # present one. Mirror the rotate-audit-key guard: the assertion must be
+    # a map (the separate base64url fields), then it is cryptographically
+    # verified and the single-use challenge consumed before the halt clears.
     assertion = Map.get(params, "webauthn_assertion")
 
-    if is_nil(assertion) do
+    if is_map(assertion) do
+      verify_and_clear_halt(conn, id, assertion)
+    else
       conn
       |> put_status(:unauthorized)
       |> json(%{
@@ -383,8 +488,28 @@ defmodule LoopctlWeb.AdminTenantController do
           remediation: %{learn_more: "https://loopctl.com/wiki/break-glass"}
         }
       })
-    else
-      do_clear_halt(conn, id)
+    end
+  end
+
+  defp verify_and_clear_halt(conn, id, assertion) do
+    # Verify the assertion against the STORED challenge and the tenant's
+    # enrolled authenticator (challenge binding, signature, counter). The
+    # ceremony is single-use: the challenge is consumed here regardless of
+    # outcome. Only a genuinely verified assertion reaches do_clear_halt.
+    case Reauth.verify_and_consume(id, @clear_halt_purpose, assertion) do
+      {:ok, _verified} ->
+        do_clear_halt(conn, id)
+
+      {:error, _reason} ->
+        conn
+        |> put_status(:unauthorized)
+        |> json(%{
+          error: %{
+            code: "webauthn_failed",
+            status: 401,
+            message: "WebAuthn assertion verification failed"
+          }
+        })
     end
   end
 
