@@ -14,6 +14,7 @@ defmodule LoopctlWeb.Plugs.AuthPathThrottleTest do
   setup :verify_on_exit!
 
   alias Loopctl.RemoteIp
+  alias LoopctlWeb.Plugs.AuthPathThrottle
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
@@ -238,6 +239,94 @@ defmodule LoopctlWeb.Plugs.AuthPathThrottleTest do
 
       assert resp.status == 200
       assert_received {:auth_gate_args, "auth_ip:203.0.113.43", 60_000, 3_000}
+    end
+  end
+
+  describe "unresolvable client IP (finding #4: skip limiter, observe the no-op)" do
+    test "a proxy remote_ip SKIPS the limiter and emits an unresolved_ip telemetry event" do
+      test_pid = self()
+      handler = "test-unresolved-proxy-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:loopctl, :auth_path_throttle, :unresolved_ip],
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {:telemetry, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      # Fail LOUDLY if the limiter is ever called for the auth_ip bucket: the
+      # unresolved path must SKIP it (no unique 60-min ETS bucket per request),
+      # not call it with a "req:<n>" key that can never throttle.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
+        if String.starts_with?(bucket, "auth_ip:"),
+          do: send(test_pid, {:auth_limiter_called, bucket})
+
+        {:allow, 1}
+      end)
+
+      # 198.51.100.0/24 is the configured proxy range (config/test.exs): a
+      # remote_ip inside it cannot identify the real client.
+      conn = %{build_conn() | remote_ip: {198, 51, 100, 5}}
+      result = AuthPathThrottle.call(conn, [])
+
+      refute result.halted
+
+      assert_received {:telemetry, [:loopctl, :auth_path_throttle, :unresolved_ip], %{count: 1},
+                       %{reason: :proxy}}
+
+      refute_received {:auth_limiter_called, _}
+    end
+
+    test "a non-tuple remote_ip also skips the limiter and reports reason :non_tuple" do
+      test_pid = self()
+      handler = "test-unresolved-nontuple-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:loopctl, :auth_path_throttle, :unresolved_ip],
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {:telemetry, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
+        if String.starts_with?(bucket, "auth_ip:"),
+          do: send(test_pid, {:auth_limiter_called, bucket})
+
+        {:allow, 1}
+      end)
+
+      conn = %{build_conn() | remote_ip: nil}
+      result = AuthPathThrottle.call(conn, [])
+
+      refute result.halted
+
+      assert_received {:telemetry, [:loopctl, :auth_path_throttle, :unresolved_ip], %{count: 1},
+                       %{reason: :non_tuple}}
+
+      refute_received {:auth_limiter_called, _}
+    end
+  end
+
+  describe "RemoteIp.bucket_key_tagged/1 (tagged trusted-IP helper)" do
+    test "a resolved public client is tagged {:client, ip}" do
+      assert RemoteIp.bucket_key_tagged({203, 0, 113, 60}) == {:client, "203.0.113.60"}
+    end
+
+    test "a proxy IP is tagged {:unresolved, :proxy}" do
+      assert RemoteIp.bucket_key_tagged({198, 51, 100, 6}) == {:unresolved, :proxy}
+    end
+
+    test "a non-tuple address is tagged {:unresolved, :non_tuple}" do
+      assert RemoteIp.bucket_key_tagged(nil) == {:unresolved, :non_tuple}
+      assert RemoteIp.bucket_key_tagged("not-an-ip") == {:unresolved, :non_tuple}
     end
   end
 

@@ -31,7 +31,61 @@ defmodule LoopctlWeb.Plugs.AuthPathThrottle do
 
   Because it runs before the key (and therefore the role) is known, there is no
   superadmin exemption here — that exemption stays on the per-key limiter, which
-  still runs later for authenticated traffic.
+  still runs later for authenticated traffic. This is a CONSCIOUS accept, not an
+  oversight: exempting superadmin would require resolving the key/role FIRST,
+  which defeats the whole point of a gate that must count the missing/invalid-key
+  flood the auth plugs would otherwise 401. Consequence: superadmin traffic —
+  previously exempt at the per-key limiter — is now also subject to this coarse
+  per-IP ceiling. At the default 3000/60s that is generous headroom for the rare
+  superadmin operator, and a legitimate single-IP superadmin bulk job that needs
+  more has the zero-redeploy remedy of raising `AUTH_THROTTLE_MAX_REQUESTS_PER_IP`
+  (see "Operator configuration").
+
+  ## Availability tradeoff on a limiter-store OUTAGE (conscious accept)
+
+  Because this gate is fail-CLOSED AND runs first in the shared `:authenticated`
+  pipeline (both `/api/v1` and `/api/v1/admin`), a sustained limiter-store fault
+  429s EVERY authenticated request — valid-key and superadmin included — a full
+  authenticated-API denial. That is the deliberate INVERSE of the per-key limiter
+  (fail-OPEN) and is pinned by a valid-key test. Blast radius is bounded in
+  practice: the default node-local ETS limiter is in-process and effectively never
+  faults, so this only bites a `RATE_LIMITER=postgres` deployment when Postgres is
+  already down (the whole app is unavailable anyway). The fault is already
+  OBSERVABLE — `Loopctl.RateLimiter.gate_ok?/3` logs every limiter fault through
+  the throttled, PII-safe `Loopctl.RateLimiter.FailOpenLog` — so an operator gets
+  a bounded heartbeat to alert on. Note the `AUTH_THROTTLE_*` knobs tune the
+  ceiling, NOT this outage behaviour; a fail-OPEN "circuit breaker" here would
+  silently unlock the volumetric protection during a fault and is intentionally
+  NOT provided.
+
+  ## Limiter-pool sizing dependency
+
+  Every request (including ones about to be 429'd) calls the limiter, so a
+  single-IP flood drives `check_rate/3` at full rate even while denied. That load
+  passes through Hammer's poolboy worker pool (shared by ALL rate-limiter call
+  sites). On Hammer's default 4-worker pool a checkout can time out and exit under
+  saturation, which this fail-CLOSED gate normalises to a denial — spilling 429s
+  onto legitimate traffic from OTHER IPs. `config/config.exs` therefore sizes the
+  pool generously (`pool_size: 20, pool_max_overflow: 10`, overridable via
+  `HAMMER_POOL_SIZE` / `HAMMER_POOL_MAX_OVERFLOW`); operators running the
+  `RATE_LIMITER=postgres` backend (where each check is a DB round-trip, not a
+  microsecond ETS op) should size the pool and AdminRepo to their peak per-IP
+  request rate so the gate cannot become a cross-tenant availability dependency.
+
+  ## Unresolvable client IP (degrade-to-no-op is OBSERVABLE)
+
+  When `conn.remote_ip` is a configured proxy or a non-tuple, no stable per-client
+  bucket exists, so the gate cannot throttle. Rather than key a shared bucket on a
+  proxy IP (which would collapse every proxy-fronted visitor onto ONE bucket — a
+  cross-tenant DoS) the gate SKIPS the limiter entirely on that path. Skipping
+  also avoids the memory-growth vector of inserting a unique, never-reused 60-min
+  Hammer ETS bucket per request (`"req:<n>"`). Because the gate now runs on EVERY
+  authenticated request (not just signup), this no-op is worth observing, so the
+  path emits a `[:loopctl, :auth_path_throttle, :unresolved_ip]` telemetry event
+  (measurement `count: 1`, metadata `%{reason: :proxy | :non_tuple}`, no PII) —
+  the signal an operator would otherwise lack that the throttle was defeated by IP
+  resolution (e.g. off-Fly without `X-Forwarded-For`, a misconfigured `:proxies`
+  CIDR, or 6PN service-to-service traffic hitting `/api/v1`).
 
   ## Budget / window
 
@@ -96,9 +150,26 @@ defmodule LoopctlWeb.Plugs.AuthPathThrottle do
   @impl true
   def init(opts), do: opts
 
+  @telemetry_unresolved_ip [:loopctl, :auth_path_throttle, :unresolved_ip]
+
   @impl true
   def call(conn, _opts) do
-    bucket = "auth_ip:#{RemoteIp.bucket_key(conn.remote_ip)}"
+    case RemoteIp.bucket_key_tagged(conn.remote_ip) do
+      {:client, ip} ->
+        throttle(conn, "auth_ip:#{ip}")
+
+      {:unresolved, reason} ->
+        # No stable per-client bucket exists (proxy / non-tuple remote_ip). The
+        # gate cannot throttle here, so SKIP the limiter entirely — a unique
+        # "req:<n>" key never throttles yet accretes a 60-min ETS bucket per
+        # request. Emit a PII-free telemetry signal so the degrade-to-no-op is
+        # observable (see moduledoc), then pass through.
+        :telemetry.execute(@telemetry_unresolved_ip, %{count: 1}, %{reason: reason})
+        conn
+    end
+  end
+
+  defp throttle(conn, bucket) do
     {window_ms, max_requests_per_ip} = limits()
 
     if Loopctl.RateLimiter.gate_ok?(bucket, window_ms, max_requests_per_ip) do
