@@ -96,6 +96,12 @@ config :loopctl, :webauthn,
   origin: "http://localhost:4030",
   user_verification: "preferred"
 
+# Quiet the dev console: :info drops Ecto SQL query logs and other :debug
+# chatter. Note this filters :debug at the LOGGER level, before any handler sees
+# it — so Tidewave's (MCP) get_logs will ALSO no longer surface SQL/:debug lines.
+# If you need to inspect SQL via get_logs, temporarily set this back to :debug.
+config :logger, level: :info
+
 # Do not include metadata nor timestamps in development logs
 config :logger, :default_handler,
   formatter: {:logger_formatter, %{template: [:level, ": ", :message, "\n"]}}
