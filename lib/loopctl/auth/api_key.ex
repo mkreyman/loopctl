@@ -63,10 +63,16 @@ defmodule Loopctl.Auth.ApiKey do
 
   Identical to `create_changeset/2` except the allowed roles are restricted
   to `#{inspect(@http_roles)}` — `:superadmin` is structurally rejected with a
-  clear error (#462). This is a defense-in-depth backstop: the HTTP controller
-  already returns 403 for `role: "superadmin"`, and this changeset ensures any
-  caller that opts into the HTTP path cannot mint a superadmin key even if the
-  controller guard is bypassed.
+  clear error (#462).
+
+  This is a defense-in-depth backstop for DIRECT context callers that reach the
+  HTTP path with a raw `:superadmin` role. Note that the
+  `LoopctlWeb.ApiKeyController` create path does NOT exercise this specific
+  rejection: it returns 403 for `role: "superadmin"` first, and even if that
+  guard were bypassed its `safe_to_role/1` maps `"superadmin"` to `nil`, so the
+  changeset would fail via `validate_required` ("can't be blank") rather than
+  this role-inclusion message. The superadmin-specific message therefore only
+  fires for a caller passing the `:superadmin` atom directly to this changeset.
   """
   @spec http_create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def http_create_changeset(api_key \\ %__MODULE__{}, attrs) do

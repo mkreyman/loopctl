@@ -184,9 +184,17 @@ defmodule LoopctlWeb.ApiKeyController do
       agent_id: params["agent_id"]
     }
 
-    # Structural backstop (#462): even though `validate_not_superadmin/1` already
-    # returned 403 for role "superadmin" before we reach here, use the HTTP-scoped
-    # changeset so the context layer also refuses to mint a superadmin key.
+    # Structural backstop (#462). On THIS controller path superadmin is blocked
+    # twice before the changeset's role-inclusion gate ever sees it: first
+    # `validate_not_superadmin/1` returns 403 for role "superadmin", then
+    # `safe_to_role/1` above maps "superadmin" (and any unknown string) to nil.
+    # So `role` is already nil here — if the 403 guard were bypassed the :http
+    # changeset would reject via `validate_required` ("can't be blank"), NOT via
+    # its "superadmin keys cannot be created via the API" message. The @http_roles
+    # superadmin exclusion is the backstop for DIRECT context callers that pass a
+    # raw `:superadmin` atom (bypassing `safe_to_role/1`); we still route through
+    # the HTTP-scoped changeset here so the context layer refuses a superadmin key
+    # on every path regardless of how `role` was derived.
     Auth.generate_api_key(attrs, changeset: :http)
   end
 
