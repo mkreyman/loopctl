@@ -50,6 +50,34 @@ defmodule LoopctlWeb.ApiKeyControllerTest do
       end
     end
 
+    test "returns 422 (not 500) for a non-string role value", %{conn: _conn} do
+      # A non-string JSON role (number, boolean, array) must fail cleanly via
+      # validate_required rather than raising a FunctionClauseError -> 500.
+      for bad_role <- [123, true, ["agent"]] do
+        tenant = fixture(:tenant)
+        {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+        conn =
+          build_conn()
+          |> auth_conn(raw_key)
+          |> post(~p"/api/v1/api_keys", %{"name" => "bad", "role" => bad_role})
+
+        assert json_response(conn, 422)
+      end
+    end
+
+    test "returns 422 for an unknown role string", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/api_keys", %{"name" => "bad", "role" => "wizard"})
+
+      assert json_response(conn, 422)
+    end
+
     test "respects max_api_keys limit", %{conn: conn} do
       tenant = fixture(:tenant, %{settings: %{"max_api_keys" => 2}})
       {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})

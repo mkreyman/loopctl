@@ -49,6 +49,18 @@ defmodule Loopctl.Auth.ApiKeyTest do
       end
     end
 
+    test "a non-superadmin invalid role gets a generic error, not the superadmin message" do
+      tenant = fixture(:tenant)
+
+      changeset =
+        %ApiKey{tenant_id: tenant.id}
+        |> ApiKey.http_create_changeset(%{name: "k", role: :wizard})
+
+      refute changeset.valid?
+      assert "is invalid" in errors_on(changeset).role
+      refute "superadmin keys cannot be created via the API" in errors_on(changeset).role
+    end
+
     test "still enforces tenant_id for non-superadmin roles" do
       changeset = ApiKey.http_create_changeset(%ApiKey{}, %{name: "k", role: :user})
 

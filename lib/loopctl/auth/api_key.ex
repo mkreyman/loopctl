@@ -21,11 +21,15 @@ defmodule Loopctl.Auth.ApiKey do
   @roles [:superadmin, :user, :orchestrator, :agent]
 
   # Roles that may be minted through the public HTTP API-key create path.
-  # `:superadmin` is deliberately excluded: superadmin keys can only be
-  # provisioned out-of-band via the privileged `create_changeset/2` path
-  # (bootstrap/fixtures/dispatch). See #462 — defense-in-depth so a future
-  # internal caller that reaches the HTTP path can't mint a superadmin key.
-  @http_roles [:user, :orchestrator, :agent]
+  # Derived as the full role set MINUS `:superadmin` so this stays a single
+  # source of truth: adding a new non-superadmin role to `@roles` above makes
+  # it HTTP-creatable automatically, and the security-critical `:superadmin`
+  # exclusion is named explicitly here so it can never drift open. See #462 —
+  # defense-in-depth so a future internal caller that reaches the HTTP path
+  # can't mint a superadmin key. `LoopctlWeb.ApiKeyController.safe_to_role/1`
+  # references `http_roles/0` so the controller's string allowlist tracks this
+  # set too.
+  @http_roles @roles -- [:superadmin]
 
   schema "api_keys" do
     tenant_field()
@@ -82,21 +86,31 @@ defmodule Loopctl.Auth.ApiKey do
   end
 
   defp base_create_changeset(api_key, attrs, allowed_roles, opts \\ []) do
-    inclusion_opts =
-      case Keyword.get(opts, :role_message) do
-        nil -> []
-        message -> [message: message]
-      end
-
     api_key
     |> cast(attrs, [:name, :role, :expires_at, :agent_id])
     |> validate_required([:name, :role])
-    |> validate_inclusion(:role, allowed_roles, inclusion_opts)
+    |> validate_role_allowed(allowed_roles, Keyword.get(opts, :role_message))
     |> validate_tenant_for_role()
     |> unique_constraint([:tenant_id, :agent_id],
       name: :api_keys_one_role_per_agent_idx,
       message: "agent already has an active key with this role"
     )
+  end
+
+  # Restrict `:role` to `allowed_roles`. When a caller supplies a
+  # `role_message` (the HTTP path naming `:superadmin`), that message is used
+  # ONLY for the exact `:superadmin` value it describes — every OTHER
+  # disallowed role gets the generic "is invalid" so the error is never
+  # misattributed to superadmin. Mirrors `validate_inclusion/3` semantics
+  # (skips nil/absent changes so `validate_required` handles blanks).
+  defp validate_role_allowed(changeset, allowed_roles, role_message) do
+    validate_change(changeset, :role, fn :role, role ->
+      cond do
+        role in allowed_roles -> []
+        role == :superadmin and is_binary(role_message) -> [role: role_message]
+        true -> [role: "is invalid"]
+      end
+    end)
   end
 
   @doc """

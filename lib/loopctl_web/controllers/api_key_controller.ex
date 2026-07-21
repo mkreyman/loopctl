@@ -10,6 +10,7 @@ defmodule LoopctlWeb.ApiKeyController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Auth
+  alias Loopctl.Auth.ApiKey
   alias Loopctl.Tenants
 
   action_fallback LoopctlWeb.FallbackController
@@ -272,16 +273,18 @@ defmodule LoopctlWeb.ApiKeyController do
     }
   end
 
-  defp safe_to_role(nil), do: nil
-
+  # Coerce the client-supplied role string to a known HTTP-creatable role atom,
+  # or nil for anything else. The allowlist is derived from `ApiKey.http_roles/0`
+  # (the single source of truth: full role set minus :superadmin) by matching on
+  # the atom's string form — we NEVER `String.to_atom/1` untrusted input. Unknown
+  # strings and non-string JSON values (numbers, booleans, arrays) both map to
+  # nil, so they fail cleanly via `validate_required` (422 "can't be blank")
+  # rather than raising a FunctionClauseError -> 500.
   defp safe_to_role(role) when is_binary(role) do
-    case role do
-      "user" -> :user
-      "orchestrator" -> :orchestrator
-      "agent" -> :agent
-      _ -> nil
-    end
+    Enum.find(ApiKey.http_roles(), fn allowed -> Atom.to_string(allowed) == role end)
   end
+
+  defp safe_to_role(_role), do: nil
 
   defp parse_datetime(nil), do: nil
 
