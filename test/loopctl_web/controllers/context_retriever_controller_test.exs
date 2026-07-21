@@ -383,8 +383,44 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
       create_project_entity(conn, user, project_status_fields())
       seed_project(tenant.id)
 
-      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
-        {:deny, 999}
+      # sec-4: let the fail-CLOSED auth-path gate (`auth_ip:*`) pass so this test
+      # exercises the CR controller's OWN per-tenant limiter over-limit path.
+      # Without scoping, the deny-all stub trips the AuthPathThrottle plug (first
+      # in the :authenticated pipeline) and 429s BEFORE the CR controller runs —
+      # the assertion would then pass for the wrong reason (CR limiter untested).
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "auth_ip:" <> _, _window, _limit -> {:allow, 1}
+        _bucket, _window, _limit -> {:deny, 999}
+      end)
+
+      resp =
+        base_conn()
+        |> auth(agent)
+        |> post(~p"/api/v1/retrieve/project", %{
+          "field" => "status",
+          "op" => "filter",
+          "value" => "active"
+        })
+
+      assert json_response(resp, 429)
+    end
+
+    test "a limiter-store FAULT fails CLOSED (429), not open (#461 item 7)", %{conn: conn} do
+      tenant = commit_tenant()
+      user = user_key(tenant.id)
+      agent = agent_key(tenant.id)
+
+      create_project_entity(conn, user, project_status_fields())
+      seed_project(tenant.id)
+
+      # Let the auth-path gate pass, but make the CR per-tenant retrieve bucket's
+      # limiter FAULT ({:error, _}). The old fail-OPEN gate (within_limit?/3) would
+      # have ALLOWED this (200); the new fail-CLOSED gate (gate_ok?/3) must DENY it
+      # so a store fault can't unleash an unbounded per-request DB-query storm.
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "auth_ip:" <> _, _window, _limit -> {:allow, 1}
+        "cr_retrieve:" <> _, _window, _limit -> {:error, :limiter_store_down}
+        _bucket, _window, _limit -> {:allow, 1}
       end)
 
       resp =

@@ -3,7 +3,8 @@ defmodule LoopctlWeb.HealthController do
   Health check endpoints for monitoring and deployment verification.
 
   GET /health — LIVENESS. Returns application health status including database
-  connectivity, Oban status, and application version. Used by `fly.toml`'s
+  connectivity and Oban status (the running app version is deliberately NOT
+  disclosed to these unauthenticated endpoints — #461 item 5). Used by `fly.toml`'s
   `http_service` check as the CONTINUOUS load-balancer probe (10s interval) that
   decides whether a running node stays in traffic rotation — so its HTTP code is
   driven by `result.status`, which reflects database/oban only (see

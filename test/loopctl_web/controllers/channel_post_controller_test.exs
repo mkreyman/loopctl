@@ -550,8 +550,11 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     # AC-39.2.9 — a rate-limiter fault must fail OPEN (write allowed) but stay
     # OBSERVABLE via the shared throttled FailOpenLog, never be silently swallowed.
     test "a rate-limiter fault fails open (write allowed) and is logged, not swallowed" do
-      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
-        raise "limiter boom"
+      # sec-4: let the fail-CLOSED auth-path gate (`auth_ip:*`) pass so this test
+      # exercises the per-write limiter's OWN fail-OPEN handling in isolation.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "auth_ip:" <> _, _window, _limit -> {:allow, 1}
+        _bucket, _window, _limit -> raise "limiter boom"
       end)
 
       tenant = fixture(:tenant)
@@ -1640,8 +1643,11 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
     # OBSERVABLE via the shared throttled FailOpenLog on the read bucket family,
     # never silently swallowed (full parity with the write path).
     test "a limiter fault on the read path fails open (read allowed) and is logged" do
-      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
-        raise "limiter boom"
+      # sec-4: let the fail-CLOSED auth-path gate (`auth_ip:*`) pass so this test
+      # exercises the per-read limiter's OWN fail-OPEN handling in isolation.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "auth_ip:" <> _, _window, _limit -> {:allow, 1}
+        _bucket, _window, _limit -> raise "limiter boom"
       end)
 
       tenant = fixture(:tenant)

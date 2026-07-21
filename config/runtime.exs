@@ -46,6 +46,59 @@ if System.get_env("RATE_LIMITER") == "postgres" do
   config :loopctl, :rate_limiter, Loopctl.RateLimiter.Postgres
 end
 
+# sec-4: OPT-IN override of the node-local Hammer poolboy pool that fronts EVERY
+# `check_rate/3`. The base sizing lives in config/config.exs (20 / 10, up from
+# Hammer's 4 / 0 defaults) to keep the fail-CLOSED `AuthPathThrottle` from
+# saturating the pool under a single-IP flood (see that plug's moduledoc). These
+# env vars let an operator tune the pool for their node count / flood profile with
+# no redeploy. Only a valid POSITIVE integer is applied — an unset/blank/garbage
+# value leaves the config.exs default in place, so a bad placeholder can NEVER
+# crash release boot (epic_35 STH_SWEEP_CRON lesson).
+hammer_pool_opts =
+  [
+    pool_size: System.get_env("HAMMER_POOL_SIZE"),
+    pool_max_overflow: System.get_env("HAMMER_POOL_MAX_OVERFLOW")
+  ]
+  |> Enum.flat_map(fn {key, raw} ->
+    case raw && Integer.parse(raw) do
+      {n, ""} when n > 0 -> [{key, n}]
+      _ -> []
+    end
+  end)
+
+if hammer_pool_opts != [] do
+  # Merge onto the base backend config from config/config.exs (already loaded when
+  # runtime.exs evaluates) so the expiry/cleanup settings stay single-sourced there
+  # and only the pool sizing is overridden here.
+  {backend_mod, base_args} = Application.fetch_env!(:hammer, :backend)
+  config :hammer, backend: {backend_mod, Keyword.merge(base_args, hammer_pool_opts)}
+end
+
+# sec-4: OPT-IN override of the coarse per-IP auth-path throttle ceiling/window
+# (`LoopctlWeb.Plugs.AuthPathThrottle`). Unlike the tenant-overridable per-KEY
+# limit, this per-IP ceiling is a single global knob; these env vars are its
+# zero-redeploy operational remedy (e.g. raising it above the largest configured
+# per-tenant aggregate, or for a shared-egress/NAT deployment where many
+# legitimate keys share one outbound IP). Only a valid POSITIVE integer is
+# applied — an unset/blank/garbage value is ignored so a bad placeholder can
+# NEVER crash release boot (epic_35 STH_SWEEP_CRON lesson); the plug itself also
+# floors to its default on a non-positive value.
+auth_throttle_opts =
+  [
+    max_requests_per_ip: System.get_env("AUTH_THROTTLE_MAX_REQUESTS_PER_IP"),
+    window_ms: System.get_env("AUTH_THROTTLE_WINDOW_MS")
+  ]
+  |> Enum.flat_map(fn {key, raw} ->
+    case raw && Integer.parse(raw) do
+      {n, ""} when n > 0 -> [{key, n}]
+      _ -> []
+    end
+  end)
+
+if auth_throttle_opts != [] do
+  config :loopctl, LoopctlWeb.Plugs.AuthPathThrottle, auth_throttle_opts
+end
+
 endpoint_http = [
   # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
   # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects

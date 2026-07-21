@@ -382,11 +382,16 @@ defmodule LoopctlWeb.ContextRetrieverController do
   defp check_retrieve_rate(tenant_id) do
     bucket = "cr_retrieve:tenant:#{tenant_id}"
 
-    # FAIL-OPEN capacity gate (per-tenant retrieval throughput, not an auth
-    # gate): on a limiter fault allow, matching the RPM plug / admission parity.
-    # `within_limit?/3` absorbs the behaviour's `{:error, _}` shape so a
-    # soft-error can't raise CaseClauseError → 500.
-    if Loopctl.RateLimiter.within_limit?(bucket, retrieve_rate_window_ms(), retrieve_rate_limit()) do
+    # FAIL-CLOSED rate gate (#461 item 7). Each retrieve call runs a parameterized
+    # DB query per request, so this endpoint's cost profile makes a limiter-store
+    # fault opening the floodgates the wrong default: a fault should DENY (protecting
+    # the pool), not admit unbounded queries. `gate_ok?/3` returns `false` on any
+    # limiter fault (and on the Postgres impl's `{:allow, 0}` fail-open sentinel), so
+    # a soft-error yields 429 rather than an unbounded query storm — and it still
+    # absorbs the behaviour's `{:error, _}` shape so it can't raise → 500. Note: the
+    # pipeline-level RPM plug intentionally stays fail-open; only THIS per-tenant
+    # retrieve gate is fail-closed.
+    if Loopctl.RateLimiter.gate_ok?(bucket, retrieve_rate_window_ms(), retrieve_rate_limit()) do
       :ok
     else
       {:error, :rate_limited}

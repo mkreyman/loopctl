@@ -56,6 +56,66 @@ defmodule Loopctl.RemoteIp do
   def proxy?(_), do: false
 
   @doc """
+  Derives a STABLE per-IP bucket key for a rate-limit / throttle bucket from an
+  already-resolved `conn.remote_ip` value, or a UNIQUE per-request key when the
+  client cannot be trusted.
+
+  This is the single shared source for the "trusted-client bucket" rule so the
+  auth surfaces that throttle per IP (`LoopctlWeb.Plugs.AuthPathThrottle`,
+  `LoopctlWeb.SignupController`) cannot drift. `conn.remote_ip` must already have
+  been resolved by the `LoopctlWeb.Plugs.ClientIp` endpoint plug (which prefers
+  the unspoofable `fly-client-ip`).
+
+  Returns a unique, NON-shared per-request key (`"req:<n>"`) when the address is
+  not a tuple, or when it still resolves to a configured PROXY (the real client
+  could not be determined). Keying a shared bucket on a proxy IP would collapse
+  every proxy-fronted visitor onto ONE bucket, so a single flood could fill it
+  and deny everyone — a cross-tenant DoS. Falling back to a per-request key
+  forgoes limiting on that unresolved path instead of punishing everyone. On Fly
+  this fallback is unreachable (`fly-client-ip` is always present).
+  """
+  @spec bucket_key(:inet.ip_address() | term()) :: String.t()
+  def bucket_key(ip) do
+    case bucket_key_tagged(ip) do
+      {:client, str} -> str
+      {:unresolved, _reason} -> unique_request_key()
+    end
+  end
+
+  @doc """
+  Like `bucket_key/1` but TAGS the outcome so a caller can tell a stable
+  per-client bucket apart from the unresolvable fallback.
+
+  Returns `{:client, "1.2.3.4"}` when `ip` is a trusted, resolved client tuple, or
+  `{:unresolved, reason}` (`:non_tuple` | `:proxy`) when the real client cannot be
+  determined. A hot per-request throttle uses this to SKIP the limiter entirely on
+  the unresolved path — a `"req:<n>"` unique key can never throttle (count is
+  always 1) yet still inserts a 60-min Hammer ETS bucket per request, a silent
+  memory-growth vector — and to emit an observability signal for the
+  degradation-to-no-op that a bare `bucket_key/1` hides. On Fly this fallback is
+  unreachable (`fly-client-ip` is always present).
+  """
+  @spec bucket_key_tagged(:inet.ip_address() | term()) ::
+          {:client, String.t()} | {:unresolved, :non_tuple | :proxy}
+  def bucket_key_tagged(ip) do
+    cond do
+      not is_tuple(ip) ->
+        {:unresolved, :non_tuple}
+
+      proxy?(ip) ->
+        {:unresolved, :proxy}
+
+      true ->
+        case to_string_ip(ip) do
+          nil -> {:unresolved, :non_tuple}
+          str -> {:client, str}
+        end
+    end
+  end
+
+  defp unique_request_key, do: "req:#{System.unique_integer([:positive])}"
+
+  @doc """
   Normalizes an `:inet.ip_address/0` tuple to a stable string.
 
   IPv4-mapped IPv6 (`::ffff:a.b.c.d`, i.e. `{0,0,0,0,0,0xffff,_,_}` — how Bandit

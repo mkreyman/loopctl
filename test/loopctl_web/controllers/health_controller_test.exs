@@ -9,7 +9,6 @@ defmodule LoopctlWeb.HealthControllerTest do
         {:ok,
          %{
            status: "ok",
-           version: "0.1.0",
            checks: %{database: "ok", oban: "ok"}
          }}
       end)
@@ -17,7 +16,6 @@ defmodule LoopctlWeb.HealthControllerTest do
       conn = get(conn, "/health")
 
       assert json_response(conn, 200)["status"] == "ok"
-      assert json_response(conn, 200)["version"] == "0.1.0"
       assert json_response(conn, 200)["checks"]["database"] == "ok"
       assert json_response(conn, 200)["checks"]["oban"] == "ok"
     end
@@ -55,12 +53,16 @@ defmodule LoopctlWeb.HealthControllerTest do
       assert body["checks"]["database"] == "error"
     end
 
-    test "includes application version", %{conn: conn} do
+    test "does NOT disclose application version to the unauthenticated endpoint (#461 item 5)", %{
+      conn: conn
+    } do
+      # Mirror the real Loopctl.HealthCheck.Default response shape, which no longer
+      # carries a :version key — so no build fingerprint reaches anonymous callers.
       expect(Loopctl.MockHealthChecker, :check, fn ->
         {:ok,
          %{
            status: "ok",
-           version: "1.2.3",
+           ready: true,
            checks: %{database: "ok", oban: "ok"}
          }}
       end)
@@ -68,8 +70,8 @@ defmodule LoopctlWeb.HealthControllerTest do
       conn = get(conn, "/health")
       body = json_response(conn, 200)
 
-      assert is_binary(body["version"])
-      assert body["version"] != ""
+      refute Map.has_key?(body, "version")
+      assert body["status"] == "ok"
     end
 
     test "responds with JSON content type", %{conn: conn} do
