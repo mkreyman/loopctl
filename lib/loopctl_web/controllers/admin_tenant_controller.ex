@@ -18,11 +18,20 @@ defmodule LoopctlWeb.AdminTenantController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
   alias Loopctl.Tenants
+  alias Loopctl.WebAuthn.Reauth
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, exact_role: :superadmin
+
+  # Break-glass custody-halt recovery is a Chain of Custody v2 L6 control:
+  # even a compromised superadmin key MUST prove possession of the tenant's
+  # enrolled hardware authenticator. The purpose string is a compile-time
+  # constant (never user input) and is DISTINCT from the audit-key rotation
+  # purpose, so a challenge minted for one ceremony cannot be replayed against
+  # the other — `Reauth.consume_challenge/3` scopes by `(tenant_id, purpose)`.
+  @clear_halt_purpose "clear_custody_halt"
 
   tags(["Admin"])
 
@@ -366,12 +375,131 @@ defmodule LoopctlWeb.AdminTenantController do
     end
   end
 
-  @doc "POST /api/v1/admin/tenants/:id/clear-halt — clears custody halt (break-glass, requires WebAuthn)"
+  operation(:clear_halt_challenge,
+    summary: "Issue a break-glass clear-halt reauth challenge (admin)",
+    description:
+      "Step 1 of the challenge-bound WebAuthn reauthentication ceremony for " <>
+        "break-glass custody-halt recovery. Issues an authentication challenge bound " <>
+        "to the target tenant's enrolled root authenticators, stores it server-side " <>
+        "(single-use, short TTL) and returns the opaque `challenge_id`, the base64url " <>
+        "challenge bytes, and the allowed credential ids. Requires superadmin.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    responses: %{
+      200 => {"Reauth challenge", "application/json", Schemas.ReauthChallengeResponse},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      422 => {"No enrolled authenticators", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc """
+  POST /api/v1/admin/tenants/:id/clear-halt/challenge
+
+  Step 1 of the break-glass reauth ceremony. Mints a server-side,
+  single-use, TTL-bounded authentication challenge bound to the TARGET
+  tenant (the path `:id`) and returns the opaque handle plus allowed
+  credential ids. Superadmin-only (controller-level `RequireRole` plug).
+
+  This is a cross-tenant superadmin operation, so there is NO ownership
+  check: the target tenant is the path `:id`, and tenant isolation holds
+  because the challenge is stored under that `tenant_id` and can only be
+  consumed against the same `tenant_id` in `clear_halt/2`.
+  """
+  def clear_halt_challenge(conn, %{"id" => tenant_id}) do
+    # Guard the raw path :id up front: a non-UUID string would otherwise reach
+    # `where: tenant_id == ^tenant_id` on a :binary_id column and raise
+    # Ecto.Query.CastError (unhandled 500). Mirror record_rejected_break_glass:
+    # a malformed id addresses no real tenant, so 404.
+    case Ecto.UUID.cast(tenant_id) do
+      {:ok, uuid} -> issue_clear_halt_challenge(conn, uuid)
+      :error -> respond_tenant_not_found(conn)
+    end
+  end
+
+  defp issue_clear_halt_challenge(conn, tenant_id) do
+    case Reauth.issue_challenge(tenant_id, @clear_halt_purpose) do
+      {:ok, issued} ->
+        conn
+        |> put_status(:ok)
+        |> json(%{
+          data: %{
+            challenge_id: issued.challenge_id,
+            challenge: issued.challenge,
+            allowed_credentials: issued.allowed_credentials,
+            rp_id: issued.rp_id,
+            expires_at: issued.expires_at
+          }
+        })
+
+      {:error, :no_authenticators} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{
+          error: %{
+            message:
+              "Tenant has no enrolled root authenticator to authorize break-glass recovery",
+            code: "no_authenticators",
+            status: 422
+          }
+        })
+
+      {:error, _reason} ->
+        conn
+        |> put_status(:internal_server_error)
+        |> json(%{error: %{message: "Failed to issue reauth challenge", status: 500}})
+    end
+  end
+
+  operation(:clear_halt,
+    summary: "Clear a tenant custody halt (break-glass, admin)",
+    description:
+      "Step 2 of the challenge-bound WebAuthn reauthentication ceremony. Verifies " <>
+        "the assertion against the STORED challenge from step 1 (challenge binding, " <>
+        "origin, RP-ID, signature against the enrolled COSE key, sign-counter " <>
+        "regression) and, on success, clears the tenant's custody halt. The " <>
+        "assertion is single-use — one challenge authorizes exactly one attempt. " <>
+        "Requires superadmin.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    request_body: {"WebAuthn assertion", "application/json", Schemas.ReauthAssertionRequest},
+    responses: %{
+      200 =>
+        {"Halt cleared", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      401 => {"WebAuthn required or failed", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc """
+  POST /api/v1/admin/tenants/:id/clear-halt
+
+  Break-glass custody-halt recovery (Chain of Custody v2, L6). Superadmin
+  key alone is NOT sufficient: the caller must present a WebAuthn assertion
+  verified against a challenge issued by `clear_halt_challenge/2` and the
+  target tenant's enrolled root authenticator. The challenge is consumed
+  exactly once; replay is rejected.
+  """
   def clear_halt(conn, %{"id" => id} = params) do
-    # G7: Break-glass requires WebAuthn assertion
+    # Guard the raw path :id up front: the verify path (verify_and_consume ->
+    # consume_challenge) runs `c.tenant_id == ^tenant_id` on a :binary_id
+    # column BEFORE any 404, so a malformed id would raise Ecto.Query.CastError
+    # (unhandled 500) even with a well-formed assertion body. A non-UUID id
+    # addresses no real tenant, so 404 — mirroring record_rejected_break_glass.
+    case Ecto.UUID.cast(id) do
+      {:ok, uuid} -> require_assertion_and_clear(conn, uuid, params)
+      :error -> respond_tenant_not_found(conn)
+    end
+  end
+
+  defp require_assertion_and_clear(conn, id, params) do
+    # Break-glass requires a VERIFIED WebAuthn assertion, not merely a
+    # present one. Mirror the rotate-audit-key guard: the assertion must be
+    # a map (the separate base64url fields), then it is cryptographically
+    # verified and the single-use challenge consumed before the halt clears.
     assertion = Map.get(params, "webauthn_assertion")
 
-    if is_nil(assertion) do
+    if is_map(assertion) do
+      verify_and_clear_halt(conn, id, assertion)
+    else
       conn
       |> put_status(:unauthorized)
       |> json(%{
@@ -383,29 +511,114 @@ defmodule LoopctlWeb.AdminTenantController do
           remediation: %{learn_more: "https://loopctl.com/wiki/break-glass"}
         }
       })
-    else
-      do_clear_halt(conn, id)
     end
   end
 
-  defp do_clear_halt(conn, id) do
+  defp respond_tenant_not_found(conn) do
+    conn |> put_status(:not_found) |> json(%{error: %{message: "Not found", status: 404}})
+  end
+
+  defp verify_and_clear_halt(conn, id, assertion) do
+    # Verify the assertion against the STORED challenge and the tenant's
+    # enrolled authenticator (challenge binding, signature, counter). The
+    # ceremony is single-use: the challenge is consumed here regardless of
+    # outcome. Only a genuinely verified assertion reaches do_clear_halt.
+    case Reauth.verify_and_consume(id, @clear_halt_purpose, assertion) do
+      {:ok, verified} ->
+        do_clear_halt(conn, id, verified)
+
+      {:error, _reason} ->
+        # A REJECTED break-glass attempt is the exact signal of a compromised
+        # superadmin key trying to clear a byzantine halt WITHOUT the hardware
+        # factor. Record it in the tamper-evident chain (L6 forensics) so the
+        # audit record shows failed attempts, not only successful clears.
+        record_rejected_break_glass(conn, id)
+
+        conn
+        |> put_status(:unauthorized)
+        |> json(%{
+          error: %{
+            code: "webauthn_failed",
+            status: 401,
+            message: "WebAuthn assertion verification failed"
+          }
+        })
+    end
+  end
+
+  defp do_clear_halt(conn, id, verified) do
     case Tenants.clear_custody_halt(id) do
       {:ok, tenant} ->
-        # Break-glass: audit this critical operation
+        # Break-glass: audit this critical operation. Record WHICH enrolled
+        # authenticator authorized the clear (the verified credential + its
+        # advanced sign-counter), not only the superadmin key, so an incident
+        # responder can tie the recovery to a specific hardware factor.
         api_key = conn.assigns.current_api_key
 
-        Loopctl.AuditChain.append(tenant.id, %{
-          action: "halt_cleared",
-          actor_lineage: [],
-          entity_type: "tenant",
-          entity_id: tenant.id,
-          payload: %{"cleared_by" => api_key.id}
-        })
+        append_result =
+          Loopctl.AuditChain.append(tenant.id, %{
+            action: "halt_cleared",
+            actor_lineage: [],
+            entity_type: "tenant",
+            entity_id: tenant.id,
+            payload: %{
+              "cleared_by" => api_key.id,
+              "credential_id" =>
+                Base.url_encode64(verified.authenticator.credential_id, padding: false),
+              "sign_count" => verified.sign_count
+            }
+          })
 
-        json(conn, %{data: %{id: tenant.id, custody_halted_at: nil, status: "halt_cleared"}})
+        # For an L6 break-glass recovery the forensic record is NOT optional: a
+        # cleared halt with no tamper-evident trace is exactly the byzantine
+        # state this control exists to prevent. Unlike the routine suspend/
+        # activate paths, do NOT fire-and-forget the append — if it fails, the
+        # halt is already cleared (recovery succeeded) but the audit chain is
+        # broken, so surface it loudly (500) instead of a misleading 200.
+        # clear_custody_halt is idempotent, so an operator retry is safe.
+        case append_result do
+          {:ok, _entry} ->
+            json(conn, %{data: %{id: tenant.id, custody_halted_at: nil, status: "halt_cleared"}})
+
+          {:error, _reason} ->
+            conn
+            |> put_status(:internal_server_error)
+            |> json(%{
+              error: %{
+                code: "audit_append_failed",
+                status: 500,
+                message:
+                  "Custody halt was cleared but the break-glass audit entry could not be " <>
+                    "recorded. Investigate the audit chain before relying on this recovery."
+              }
+            })
+        end
 
       {:error, :not_found} ->
-        conn |> put_status(:not_found) |> json(%{error: %{message: "Not found", status: 404}})
+        respond_tenant_not_found(conn)
+    end
+  end
+
+  # Append a `halt_clear_rejected` entry to the tenant's audit chain. Guarded
+  # so it only fires for a real tenant: a garbage `:id` has no chain to append
+  # to (and the FK is not changeset-guarded, so an insert against a
+  # non-existent tenant would raise) and nothing to protect. The high-trust
+  # forensic signal is `rejected_by` — the server-verified superadmin key that
+  # attempted the clear and failed the hardware factor.
+  defp record_rejected_break_glass(conn, tenant_id) do
+    with {:ok, uuid} <- Ecto.UUID.cast(tenant_id),
+         {:ok, _tenant} <- Tenants.get_tenant(uuid) do
+      api_key = conn.assigns.current_api_key
+
+      Loopctl.AuditChain.append(uuid, %{
+        action: "halt_clear_rejected",
+        actor_lineage: [],
+        entity_type: "tenant",
+        entity_id: uuid,
+        payload: %{"rejected_by" => api_key.id}
+      })
+    else
+      _ -> :ok
     end
   end
 end

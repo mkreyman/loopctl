@@ -563,6 +563,12 @@ defmodule LoopctlWeb.Router do
     post "/violators/:id/ignore", AdminViolatorController, :ignore
 
     # US-26.5.2 — Custody halt management
+    # Break-glass clear-halt is a two-step, challenge-bound WebAuthn ceremony
+    # (Chain of Custody v2, L6): step 1 mints a single-use challenge, step 2
+    # verifies the assertion against it before clearing the halt. The
+    # controller-level `RequireRole, exact_role: :superadmin` plug applies to
+    # BOTH actions.
+    post "/tenants/:id/clear-halt/challenge", AdminTenantController, :clear_halt_challenge
     post "/tenants/:id/clear-halt", AdminTenantController, :clear_halt
   end
 end

@@ -17,11 +17,35 @@ This article documents the emergency procedures.
 
 ## Clearing a custody halt
 
+Clearing a halt is a mandatory **two-step, challenge-bound** WebAuthn ceremony.
+A superadmin key alone is NOT sufficient — each clear must be authorized by a
+fresh, single-use assertion from one of the target tenant's enrolled root
+authenticators. Both steps require superadmin.
+
+**Step 1 — request a challenge:**
+
+```bash
+POST /api/v1/admin/tenants/:id/clear-halt/challenge
+```
+
+Mints a server-side, single-use, TTL-bounded challenge bound to the target
+tenant and returns `challenge_id`, `challenge`, `allowed_credentials`, `rp_id`,
+and `expires_at`. Returns `422 no_authenticators` if the tenant has no enrolled
+root authenticator.
+
+**Step 2 — present the assertion:**
+
 ```bash
 POST /api/v1/admin/tenants/:id/clear-halt
 ```
 
-Requires a fresh WebAuthn assertion from a root authenticator.
+Send the WebAuthn assertion (in the `webauthn_assertion` field) produced for the
+challenge from step 1. The server verifies the assertion against the STORED
+challenge (challenge binding, origin, RP-ID, signature against the enrolled COSE
+key, sign-counter regression) and, on success, clears the halt. The challenge is
+consumed exactly once — one challenge authorizes exactly one attempt, and replay
+is rejected. Rejected attempts are recorded in the tenant's tamper-evident audit
+chain.
 
 ## Key recovery
 

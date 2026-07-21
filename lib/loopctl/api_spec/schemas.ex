@@ -561,6 +561,25 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule ReauthAssertionRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ReauthAssertionRequest",
+      description:
+        "Step 2 of the challenge-bound WebAuthn reauthentication ceremony, shared by " <>
+          "every custody-critical operation that gates on a fresh assertion (e.g. " <>
+          "break-glass clear-halt). Carries the WebAuthn assertion that is verified " <>
+          "against the STORED challenge from step 1 before the operation proceeds.",
+      type: :object,
+      required: [:webauthn_assertion],
+      properties: %{
+        webauthn_assertion: WebAuthnAssertion
+      }
+    })
+  end
+
   defmodule AuditKeyResponse do
     @moduledoc false
     require OpenApiSpex
