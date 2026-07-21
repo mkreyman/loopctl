@@ -153,6 +153,92 @@ jobs:
         env:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
+  retrieval-eval:
+    name: Retrieval Eval
+    runs-on: ubuntu-latest
+    # MIX_ENV=dev on purpose (the workflow-level default is test): `mix
+    # loopctl.retrieval.eval` opens its OWN DB connections, and config/test.exs puts all
+    # three repos behind Ecto.Adapters.SQL.Sandbox, where a non-checked-out process has no
+    # ownership and every query would fail. Dev is the same environment a developer runs
+    # the task in, so CI exercises the real invocation.
+    env:
+      MIX_ENV: dev
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: loopctl_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          # See lint job: config/*.exs is part of the key so a config-only change
+          # forces a clean recompile of config-sensitive deps instead of reusing a
+          # stale dep beam. No loose restore-keys, for the same reason.
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Create RLS roles
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -c "
+            DO \$\$
+            BEGIN
+              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_app') THEN
+                CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app';
+              END IF;
+              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_admin') THEN
+                CREATE ROLE loopctl_admin LOGIN PASSWORD 'loopctl_admin' BYPASSRLS;
+              END IF;
+            END \$\$;
+          "
+
+      # config/dev.exs points every repo at postgres:postgres@localhost/loopctl_dev, so
+      # the dev database is created here rather than reusing the service's loopctl_test.
+      - name: Setup database
+        run: mix ecto.create && mix ecto.migrate
+
+      - name: Grant RLS roles access to tables
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_dev -c "
+            GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
+            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
+          "
+
+      # #469: the retrieval-quality GATE. Runs the committed golden question set through
+      # search_combined/3 in BOTH the embeddings and keyword-only arms and fails when an
+      # aggregate metric drops below the committed baseline beyond tolerance. It gates
+      # deploy on purpose — #470 (RRF) and #471 (recency/authority) are only reviewable
+      # against a delta from this, so an advisory-only gate would be worth nothing.
+      #
+      # NB: the task itself HARD-FAILS on an empty golden set and on a missing/unreadable
+      # baseline in --fail-on-regression mode. Do not "simplify" either guard away: a run
+      # that scores nothing and exits 0 is a false green (the scale-nightly lesson below).
+      - name: Run golden-question retrieval eval gate
+        run: mix loopctl.retrieval.eval --mode both --fail-on-regression
+        timeout-minutes: 15
+
   security:
     name: Security
     runs-on: ubuntu-latest
@@ -547,7 +633,7 @@ jobs:
     # pgbouncer-e2e gates deploy (US-27.13): it is the only check that exercises the pgbouncer
     # layer, so a reintroduced pgbouncer-incompatible config must block the deploy, not just
     # go red advisorily.
-    needs: [lint, test, security, dialyzer, pgbouncer-e2e]
+    needs: [lint, test, security, dialyzer, pgbouncer-e2e, retrieval-eval]
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - uses: actions/checkout@v4
