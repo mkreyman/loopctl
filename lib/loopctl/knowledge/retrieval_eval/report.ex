@@ -53,12 +53,16 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
   end
 
   defp aggregate_section(result, comparison) do
+    # `answered@k` is the headline numerator AND the strictest gate check (compared with
+    # zero tolerance), so it is the metric most likely to regress alone — it MUST carry a
+    # REGRESSION flag in the table an operator reads first, not only in the one-line
+    # BASELINE status.
     rows =
       Enum.map(result.k_values, fn k ->
         {"recall@#{k}", result.recall_at_k[k]}
       end) ++
         Enum.map(result.k_values, fn k -> {"ndcg@#{k}", result.ndcg_at_k[k]} end) ++
-        [{"mrr", result.mrr}]
+        [{"mrr", result.mrr}, {"answered@#{result.answered_k}", result.answered}]
 
     baseline_by_metric =
       case comparison do
@@ -79,12 +83,16 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
   end
 
   # The Cerebras framing (#469 scope 4): questions answered WITH retrieval versus the
-  # no-retrieval arm, which is 0 by construction (an empty result set retrieves nothing).
+  # no-retrieval arm. The without-arm is 0 BY CONSTRUCTION (retrieval disabled = an empty
+  # result set = nothing retrieved), not a measured A/B — it is the definitional floor the
+  # with-retrieval numbers are read against, and it can never move. The line says so
+  # explicitly so a skimming reader does not mistake a tautology for a measurement.
   defp headline_section(result) do
     """
-    HEADLINE (with retrieval vs none)
+    HEADLINE (with retrieval vs none — the "none" arm is 0 by construction, not measured)
       answered@#{result.answered_k} : #{result.answered}/#{result.question_count} with retrieval, \
-    #{result.no_retrieval.answered}/#{result.question_count} without (spread #{result.spread.answered})
+    #{result.no_retrieval.answered}/#{result.question_count} without = 0 by construction \
+    (spread #{result.spread.answered})
       mrr           : #{fmt(result.mrr)} vs #{fmt(result.no_retrieval.mrr)} \
     (spread #{fmt_delta(result.spread.mrr)})\
     """
@@ -99,9 +107,14 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
 
     primary_k = Enum.min(result.k_values)
 
+    # Render the recall@k and nDCG@k deltas alongside d.mrr, not just d.mrr: a fusion
+    # change can lift the first-hit rank (d.mrr up) while dropping a second relevant doc
+    # out of the top-k (d.recall down). MRR-only would render that as an all-winners table
+    # with no loser — the opposite of the tradeoff signal the table exists to give.
     header =
       "  #{pad("question", 28)} #{pad("mode", 12)} #{pad("r@#{primary_k}", 7)} " <>
-        "#{pad("mrr", 7)} #{pad("ndcg@#{primary_k}", 9)} #{pad("d.mrr", 9)}"
+        "#{pad("mrr", 7)} #{pad("ndcg@#{primary_k}", 9)} " <>
+        "#{pad("d.mrr", 9)} #{pad("d.r@#{primary_k}", 9)} #{pad("d.ndcg@#{primary_k}", 11)}"
 
     rows =
       Enum.map_join(result.question_results, "\n", fn q ->
@@ -109,7 +122,9 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
 
         "  #{pad(q.id, 28)} #{pad(q.observed_mode, 12)} " <>
           "#{pad(fmt(q.recall_at_k[primary_k]), 7)} #{pad(fmt(q.mrr), 7)} " <>
-          "#{pad(fmt(q.ndcg_at_k[primary_k]), 9)} #{pad(fmt_delta(d && d.mrr_delta), 9)}"
+          "#{pad(fmt(q.ndcg_at_k[primary_k]), 9)} #{pad(fmt_delta(d && d.mrr_delta), 9)} " <>
+          "#{pad(fmt_delta(d && d.recall_delta[primary_k]), 9)} " <>
+          "#{pad(fmt_delta(d && d.ndcg_delta[primary_k]), 11)}"
       end)
 
     "PER-QUESTION\n" <> header <> "\n" <> rows
@@ -123,6 +138,16 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
 
   defp baseline_section(%{status: :golden_version_mismatch, golden_version: gv}) do
     "BASELINE\n  golden set version changed (#{gv.baseline} -> #{gv.current}) — re-baseline before comparing"
+  end
+
+  defp baseline_section(%{status: :question_set_mismatch}) do
+    "BASELINE\n  golden question set differs from the baseline's (added/removed/renamed a " <>
+      "question without re-baselining) — re-baseline before comparing"
+  end
+
+  defp baseline_section(%{status: :incomparable} = comparison) do
+    "BASELINE\n  status: INCOMPARABLE — no baseline value for #{Enum.join(comparison.uncomparable, ", ")}\n" <>
+      winners_losers(comparison)
   end
 
   defp baseline_section(%{status: :ok} = comparison) do
@@ -209,6 +234,7 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
     %{
       "status" => to_string(comparison.status),
       "regressions" => comparison.regressions,
+      "uncomparable" => Map.get(comparison, :uncomparable, []),
       "winners" => comparison.winners,
       "losers" => comparison.losers,
       "aggregate" =>
@@ -218,7 +244,8 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
             "current" => row.current,
             "baseline" => row.baseline,
             "delta" => row.delta,
-            "regression" => row.regression?
+            "regression" => row.regression?,
+            "uncomparable" => Map.get(row, :uncomparable?, false)
           }
         end)
     }

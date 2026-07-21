@@ -31,14 +31,17 @@ defmodule Loopctl.Knowledge.RetrievalEval do
     * **Not a network or LLM dependency.** Labels are self-contained (see `GoldenSet`),
       and both the document and query embeddings are DETERMINISTIC functions of the
       committed TEXT (`embedding_for_text/1`). Nothing is fetched.
-    * **Not a claim about a real embedding provider.** In CI the semantic lane is a
-      SYNTHETIC stand-in: a random-projection bag of words over the document text and,
-      independently, over the question text — reproducible without a provider, and
-      derived from TEXT rather than from the labels (a query vector built out of its own
-      relevant documents would rank them first by construction and pin the eval at a
-      vacuous 1.0). A run against a real provider is the same task invoked in dev/prod.
-      Read the numbers as a REGRESSION signal on ranking changes, not as an absolute
-      quality score.
+    * **Not a claim about a real embedding provider.** The semantic lane is ALWAYS a
+      SYNTHETIC stand-in — in dev, CI, and prod alike: a random-projection bag of words
+      over the document text and, independently, over the question text — reproducible
+      without a provider, and derived from TEXT rather than from the labels (a query
+      vector built out of its own relevant documents would rank them first by construction
+      and pin the eval at a vacuous 1.0). There is deliberately NO real-provider path on
+      this task: `embedding_opt/2` always supplies a synthetic vector (or, in
+      `:keyword_only`, `{:error, :no_api_key}`), and the corpus is seeded with synthetic
+      `embedding_for_doc/1` vectors, regardless of `MIX_ENV`. Read the numbers as a
+      REGRESSION signal on ranking changes, not as an absolute measure of a provider's
+      quality.
     * **Not persisted.** The baseline is a committed JSON file
       (`Loopctl.Knowledge.RetrievalEval.Baseline`) — no table, no migration, and the
       baseline moves only through a reviewed diff.
@@ -79,6 +82,11 @@ defmodule Loopctl.Knowledge.RetrievalEval do
   @default_k_values [5, 10]
 
   @telemetry_event [:loopctl, :knowledge, :retrieval_eval]
+
+  # Fixed namespace for the deterministic (UUIDv5) article ids `seed_corpus/2` derives from
+  # each golden `doc_id`. Any constant 16-byte value works; this one is arbitrary.
+  @doc_id_namespace <<0x04, 0x69, 0x5E, 0xED, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00,
+                      0x00, 0x00, 0x04, 0x69>>
 
   @type mode :: :embeddings | :keyword_only
 
@@ -461,12 +469,55 @@ defmodule Loopctl.Knowledge.RetrievalEval do
   is writable only by the dedicated embedding changeset, and the eval needs each document
   published AND embedded in one statement. Ids are generated up front so the caller can
   clean up EXACTLY its own rows (see `delete_corpus/2`) even if scoring raises.
+
+  ## Article ids are DETERMINISTIC (not random), and doc-ordered by construction
+
+  The article id is a deterministic UUID whose HIGH bytes derive from the golden `doc_id`
+  ALONE and whose LOW bytes fold in the `tenant_id`. That split is load-bearing for the
+  deploy gate's reproducibility, NOT cosmetic:
+
+    * `Knowledge.merge_results/5` keys its merged-candidate map by article id and returns
+      `Map.values/1`, whose iteration order is hash-driven by those keys; the id is ALSO the
+      deterministic secondary sort key that breaks `final_score` ties in both the merge and
+      the keyword `ORDER BY`. With random ids, which of two score-tied docs lands inside the
+      top-k boundary would flip run-to-run — making recall@k / nDCG@k / MRR / answered
+      nondeterministic exactly under the Reciprocal Rank Fusion change (#470) whose scores
+      tie BY CONSTRUCTION, i.e. the successor story this zero-tolerance gate exists to score.
+    * Because the HIGH bytes (which dominate the lexical UUID order) come from `doc_id` only,
+      the RELATIVE order of two different docs is stable across runs even though each run
+      mints a FRESH throwaway tenant — so a tie resolves the same way when the gate re-runs
+      against the committed baseline.
+    * The LOW bytes fold in `tenant_id` so the SAME doc seeded into different tenants (the
+      tenant-isolation tests) or by concurrent runs gets a globally-unique id — the
+      `articles` primary key is `id` ALONE, so a purely doc-derived id would PK-collide.
   """
   @spec seed_corpus(Ecto.UUID.t(), GoldenSet.t()) :: %{Ecto.UUID.t() => String.t()}
   def seed_corpus(tenant_id, golden) do
-    seeded = Enum.map(GoldenSet.corpus(golden), fn doc -> {Ecto.UUID.generate(), doc} end)
+    seeded =
+      Enum.map(GoldenSet.corpus(golden), fn doc ->
+        {deterministic_article_id(tenant_id, doc.doc_id), doc}
+      end)
+
     insert_corpus(tenant_id, seeded)
     Map.new(seeded, fn {id, doc} -> {id, doc.doc_id} end)
+  end
+
+  # A deterministic, well-formed (version-5, variant-10) UUID for a seeded article.
+  #
+  # High 60 bits (which dominate the lexical/`ORDER BY` comparison) come from `doc_id` ALONE,
+  # giving a stable cross-run ordering the deploy gate can reproduce; the low 62 bits fold in
+  # `tenant_id`, guaranteeing global uniqueness (the `articles` PK is `id`) so the same doc in
+  # two tenants / concurrent runs never collides. Distinct docs get distinct high bits (SHA-1
+  # collision resistance); a high-bit collision between two different docs is ~1-in-2^60 and
+  # would merely fall back to the tenant-folded low bits for that one pair.
+  defp deterministic_article_id(tenant_id, doc_id) do
+    <<hi::48, _::4, hi_rest::12, _::binary>> = :crypto.hash(:sha, @doc_id_namespace <> doc_id)
+
+    <<_::2, lo::62, _::binary>> =
+      :crypto.hash(:sha, @doc_id_namespace <> tenant_id <> "|" <> doc_id)
+
+    <<hi::48, 5::4, hi_rest::12, 2::2, lo::62>>
+    |> Ecto.UUID.load!()
   end
 
   defp insert_corpus(tenant_id, seeded) do

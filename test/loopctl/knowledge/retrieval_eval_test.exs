@@ -13,6 +13,8 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
   alias Loopctl.Knowledge.RetrievalEval.Baseline
   alias Loopctl.Knowledge.RetrievalEval.GoldenSet
   alias Loopctl.Knowledge.RetrievalEval.Report
+  alias Loopctl.Tenants
+  alias Loopctl.Tenants.Tenant
   alias Mix.Tasks.Loopctl.Retrieval.Eval, as: EvalTask
 
   # A tiny in-memory golden set (two questions, three docs each) so the DB-backed tests
@@ -186,6 +188,35 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
     end
   end
 
+  describe "GoldenSet.grade/2" do
+    test "a doc absent from relevant is grade 0 regardless of the graded map" do
+      # The documented contract (golden_set moduledoc): "a doc not in relevant is grade 0
+      # regardless". A graded distractor must NOT contribute a gain, or nDCG can exceed 1.
+      q = %{relevant: ["a"], graded: %{"a" => 1, "d" => 3}}
+
+      assert GoldenSet.grade(q, "a") == 1
+      assert GoldenSet.grade(q, "d") == 0
+      assert GoldenSet.grade(q, "unseen") == 0
+    end
+
+    test "a relevant doc with no explicit grade defaults to 1" do
+      assert GoldenSet.grade(%{relevant: ["a"], graded: %{}}, "a") == 1
+    end
+
+    test "nDCG cannot exceed 1.0 even when a non-relevant distractor carries a grade" do
+      # Reviewer's repro: corpus a (relevant, grade 1) + d (graded 3, NOT relevant),
+      # ranked [d, a]. Before the fix grade/2 returned d's 3 and nDCG blew past 1.0.
+      q = %{relevant: ["a"], graded: %{"d" => 3}}
+
+      gains = Map.new(["a", "d"], &{&1, GoldenSet.grade(q, &1)})
+      ideal = Enum.map(q.relevant, &GoldenSet.grade(q, &1))
+
+      ndcg = RetrievalEval.ndcg_at_k(["d", "a"], gains, ideal, 2)
+
+      assert ndcg <= 1.0
+    end
+  end
+
   describe "report rendering of undefined metrics" do
     test "prints n/a rather than 0.0 and does not crash" do
       assert Report.fmt(nil) == "n/a"
@@ -315,6 +346,28 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
         GoldenSet.parse!(valid_header <> "\n" <> entry <> "\n")
       end
 
+      # A question over the 500-char search limit would silently score 0 — reject it loudly.
+      assert_raise ArgumentError, ~r/over the 500-char limit/, fn ->
+        long = String.duplicate("x", 501)
+
+        entry =
+          ~s({"kind":"question","id":"q","question":"#{long}","relevant":["d"],) <>
+            ~s("corpus":[{"doc_id":"d","title":"t","body":"b","category":"pattern"}]})
+
+        GoldenSet.parse!(valid_header <> "\n" <> entry <> "\n")
+      end
+
+      # A grade on a doc that is not `relevant` is inert (grade/2 returns 0) — reject it so
+      # a contributor cannot believe a distractor is intentionally weighted.
+      assert_raise ArgumentError, ~r/is not in `relevant`/, fn ->
+        entry =
+          ~s({"kind":"question","id":"q","question":"q","relevant":["d"],"graded":{"e":2},) <>
+            ~s("corpus":[{"doc_id":"d","title":"t","body":"b","category":"pattern"},) <>
+            ~s({"doc_id":"e","title":"t2","body":"b2","category":"pattern"}]})
+
+        GoldenSet.parse!(valid_header <> "\n" <> entry <> "\n")
+      end
+
       assert_raise ArgumentError, ~r/has no questions/, fn ->
         GoldenSet.parse!(valid_header <> "\n")
       end
@@ -421,6 +474,35 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       assert metadata.tenant_id == tenant.id
       assert metadata.observed_mode == "combined"
     end
+
+    test "a hard search error scores 0 and a disagreeing observed mode aggregates to mixed" do
+      tenant = fixture(:tenant)
+
+      # One question over the 500-char search limit: search_combined/3 returns
+      # {:error, :bad_request}, which score_question's catch-all turns into a 0 (recall 0,
+      # mrr 0, observed_mode "unknown"). The other question scores "combined", so the
+      # aggregate observed_mode disagrees and resolves to "mixed".
+      base = small_golden_set()
+      [q1, q2] = base.questions
+      over_limit = %{q2 | question: String.duplicate("word ", 200)}
+      golden = %{base | questions: [q1, over_limit]}
+
+      {result, log} =
+        ExUnit.CaptureLog.with_log(fn ->
+          RetrievalEval.compute(tenant.id, golden_set: golden, k_values: [1, 3])
+        end)
+
+      assert log =~ "search failed for #{q2.id}"
+      assert result.observed_mode == "mixed"
+
+      errored = Enum.find(result.question_results, &(&1.id == q2.id))
+      assert errored.ranked == []
+      assert errored.mrr == 0.0
+      assert errored.answered == false
+      assert errored.observed_mode == "unknown"
+
+      assert article_count(tenant.id) == 0
+    end
   end
 
   # =========================================================================
@@ -514,6 +596,86 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       assert comparison.status == :regression
       assert "mrr" in comparison.regressions
     end
+
+    test "a changed question set blocks comparison even if the version string is unchanged",
+         %{result: result, baseline: baseline} do
+      # Simulate a golden question added without re-baselining: the baseline covers fewer
+      # questions than the run, but the free-text version header was left untouched.
+      stale =
+        update_in(baseline["modes"]["embeddings"]["questions"], &Map.delete(&1, "q-ecto-multi"))
+
+      comparison = Baseline.compare(result, stale)
+
+      assert comparison.status == :question_set_mismatch
+      assert comparison.aggregate == []
+      assert Report.render(result, comparison) =~ "re-baseline before comparing"
+    end
+
+    test "a metric with no baseline counterpart is INCOMPARABLE, not ok", %{result: result} do
+      # A `--k` present in the run but absent from the baseline: recall@3 / ndcg@3 have no
+      # baseline value, so the gate must fail closed rather than silently compare only mrr.
+      stripped =
+        result
+        |> then(&Baseline.from_results([&1]))
+        |> update_in(["modes", "embeddings", "recall_at_k"], &Map.delete(&1, "3"))
+        |> update_in(["modes", "embeddings", "ndcg_at_k"], &Map.delete(&1, "3"))
+
+      comparison = Baseline.compare(result, stripped)
+
+      assert comparison.status == :incomparable
+      assert "recall@3" in comparison.uncomparable
+      assert "ndcg@3" in comparison.uncomparable
+      assert Report.render(result, comparison) =~ "INCOMPARABLE"
+    end
+
+    test "comparing a mode absent from the baseline yields :missing_mode", %{
+      result: result,
+      baseline: baseline
+    } do
+      # The baseline holds only :embeddings; a keyword_only result has no counterpart.
+      comparison = Baseline.compare(%{result | mode: :keyword_only}, baseline)
+
+      assert comparison.status == :missing_mode
+      assert comparison.aggregate == []
+    end
+
+    test "winners and losers span recall/nDCG deltas, not mrr alone", %{
+      result: result,
+      baseline: baseline
+    } do
+      # Raise ONLY q-advisory-lock's baseline recall@1 above its current value: recall
+      # regresses for that question while its mrr delta stays 0. An mrr-only predicate
+      # would miss it; the full-delta predicate flags it as a loser.
+      shifted =
+        put_in(
+          baseline["modes"]["embeddings"]["questions"]["q-advisory-lock"]["recall_at_k"]["1"],
+          2.0
+        )
+
+      comparison = Baseline.compare(result, shifted)
+
+      adv = Enum.find(comparison.questions, &(&1.id == "q-advisory-lock"))
+      assert adv.mrr_delta in [0, 0.0]
+      assert adv.recall_delta[1] < 0
+
+      assert "q-advisory-lock" in comparison.losers
+    end
+
+    test "the AGGREGATE table renders answered@k with its REGRESSION flag", %{
+      result: result,
+      baseline: baseline
+    } do
+      # answered@k is the strictest (zero-tolerance) gate metric, so it is the one most
+      # likely to regress alone — it must carry the flag in the aggregate table, not only
+      # in the one-line BASELINE status.
+      raised = put_in(baseline["modes"]["embeddings"]["answered"], result.answered + 1)
+
+      comparison = Baseline.compare(result, raised)
+      rendered = Report.render(result, comparison)
+
+      assert comparison.status == :regression
+      assert rendered =~ ~r/AGGREGATE.*answered@#{result.answered_k}.*REGRESSION/s
+    end
   end
 
   # =========================================================================
@@ -604,6 +766,36 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
         end)
 
       assert output =~ "REGRESSION"
+    end
+
+    test "the gate fails closed when a requested mode has no baseline entry", ctx do
+      base_args = [
+        "--golden",
+        ctx.golden_path,
+        "--baseline",
+        ctx.baseline_path,
+        "--k",
+        "1",
+        "--k",
+        "3"
+      ]
+
+      # Baseline written for embeddings only.
+      capture_io(fn ->
+        EvalTask.run(base_args ++ ["--mode", "embeddings", "--update-baseline"])
+      end)
+
+      # A keyword_only gate run has no baseline entry — the task must exit non-zero via the
+      # "cannot compare (missing_mode)" branch, not print "no regression".
+      output =
+        capture_io(fn ->
+          assert_raise Mix.Error, ~r/retrieval eval gate failed/, fn ->
+            EvalTask.run(base_args ++ ["--mode", "keyword_only", "--fail-on-regression"])
+          end
+        end)
+
+      assert output =~ "no baseline entry for this mode"
+      refute output =~ "no regression against baseline"
     end
 
     test "a missing baseline is a hard failure in gate mode, never a silent pass", ctx do
@@ -708,6 +900,124 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       RetrievalEval.delete_corpus(tenant_b.id, Map.keys(b_seeded))
       assert article_count(tenant_b.id) == 0
     end
+  end
+
+  # =========================================================================
+  # 10. Deterministic seeded ids (reproducibility of the deploy gate)
+  # =========================================================================
+
+  describe "seed_corpus/2 deterministic ids" do
+    test "re-seeding the same tenant yields byte-identical ids (no random UUIDs)" do
+      tenant = fixture(:tenant)
+      golden = small_golden_set()
+
+      map1 = RetrievalEval.seed_corpus(tenant.id, golden)
+      RetrievalEval.delete_corpus(tenant.id, Map.keys(map1))
+      map2 = RetrievalEval.seed_corpus(tenant.id, golden)
+      RetrievalEval.delete_corpus(tenant.id, Map.keys(map2))
+
+      assert map1 == map2
+    end
+
+    test "the same doc gets a UNIQUE id per tenant, yet a STABLE cross-tenant doc order" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      golden = small_golden_set()
+
+      map_a = RetrievalEval.seed_corpus(tenant_a.id, golden)
+      map_b = RetrievalEval.seed_corpus(tenant_b.id, golden)
+
+      try do
+        # Global PK uniqueness: the `articles` PK is `id` alone, so a purely doc-derived id
+        # would collide when two tenants (or two concurrent runs) seed the same golden set.
+        assert MapSet.disjoint?(MapSet.new(Map.keys(map_a)), MapSet.new(Map.keys(map_b)))
+
+        # Reproducibility: the id is the merge / ORDER BY tiebreak, and its HIGH bytes derive
+        # from doc_id alone — so sorting by id yields the SAME doc sequence for both tenants,
+        # which is why a score tie resolves identically when the gate re-runs on a fresh
+        # throwaway tenant against the committed baseline.
+        order_a = map_a |> Enum.sort() |> Enum.map(&elem(&1, 1))
+        order_b = map_b |> Enum.sort() |> Enum.map(&elem(&1, 1))
+        assert order_a == order_b
+      after
+        RetrievalEval.delete_corpus(tenant_a.id, Map.keys(map_a))
+        RetrievalEval.delete_corpus(tenant_b.id, Map.keys(map_b))
+      end
+    end
+  end
+
+  # =========================================================================
+  # 11. --cleanup reaper: marker + age boundary (must not destroy customer data)
+  # =========================================================================
+
+  describe "mix loopctl.retrieval.eval --cleanup reaper safety" do
+    test "refuses to reap a slug-prefix collision that lacks the programmatic eval marker" do
+      # A customer/attacker who registers `retrieval-eval-*` (the slug is user-chosen and
+      # unreserved) has settings %{} — no signup path can set the marker. It must survive.
+      squatter = leaked_eval_tenant(settings: %{})
+      backdate_tenant(squatter.id, 120)
+
+      capture_io(fn -> EvalTask.run(["--cleanup"]) end)
+
+      assert tenant_exists?(squatter.id)
+    end
+
+    test "refuses to reap a genuine eval tenant younger than the age guard (concurrent run)" do
+      # Freshly created marked tenant simulates a concurrently in-flight run's throwaway
+      # tenant — the default 15-minute guard must keep the sweep off it.
+      fresh = leaked_eval_tenant([])
+
+      capture_io(fn -> EvalTask.run(["--cleanup"]) end)
+
+      assert tenant_exists?(fresh.id)
+    end
+
+    test "reaps a genuine eval tenant older than the age guard" do
+      leaked = leaked_eval_tenant([])
+      backdate_tenant(leaked.id, 120)
+
+      capture_io(fn -> EvalTask.run(["--cleanup"]) end)
+
+      refute tenant_exists?(leaked.id)
+    end
+
+    test "--min-age 0 reaps a marked fresh tenant when the operator knows none is in flight" do
+      leaked = leaked_eval_tenant([])
+
+      capture_io(fn -> EvalTask.run(["--cleanup", "--min-age", "0"]) end)
+
+      refute tenant_exists?(leaked.id)
+    end
+  end
+
+  # A tenant that looks like one this task minted: the user-choosable slug prefix PLUS the
+  # programmatic `settings.retrieval_eval` marker (overridable to simulate a slug squatter).
+  defp leaked_eval_tenant(overrides) do
+    slug = "retrieval-eval-#{System.unique_integer([:positive])}"
+
+    attrs =
+      Enum.into(overrides, %{
+        name: slug,
+        slug: slug,
+        email: "#{slug}@example.invalid",
+        settings: %{"retrieval_eval" => true}
+      })
+
+    {:ok, tenant} = Tenants.create_tenant(attrs)
+    tenant
+  end
+
+  defp backdate_tenant(tenant_id, minutes_ago) do
+    ts = DateTime.add(DateTime.utc_now(), -minutes_ago * 60, :second)
+
+    {1, _} =
+      AdminRepo.update_all(from(t in Tenant, where: t.id == ^tenant_id), set: [inserted_at: ts])
+
+    :ok
+  end
+
+  defp tenant_exists?(tenant_id) do
+    AdminRepo.exists?(from(t in Tenant, where: t.id == ^tenant_id))
   end
 
   defp article_count(tenant_id) do

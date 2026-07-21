@@ -36,7 +36,9 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
 
     * `id` — stable question identifier, unique across the file. It is the row key in
       the per-question report table, so renaming one breaks its baseline history.
-    * `question` — the query string handed to `search_combined/3` verbatim.
+    * `question` — the query string handed to `search_combined/3` verbatim. Must be at
+      most #{500} characters — `search_combined/3` hard-rejects a longer query, which the
+      scorer would silently turn into a 0, so the loader rejects it loudly instead.
     * `source` — free text provenance ("mined from article_access_events", "hand-authored
       from <doc>"). Documentation only.
     * `corpus` — the documents seeded for this question. Each carries:
@@ -49,7 +51,9 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
       non-empty subset of this question's own `corpus`.
     * `graded` — optional map of `doc_id => grade` (integer 0..3) used as the nDCG gain.
       A relevant doc missing from `graded` defaults to grade 1; a doc not in `relevant`
-      is grade 0 regardless.
+      is grade 0 regardless. Because a grade on a non-relevant doc is therefore inert (and
+      almost always a mistake), the loader rejects a `graded` key that is not also in
+      `relevant`.
 
   ## Adding a labeled question
 
@@ -61,9 +65,11 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
 
   `load!/1` (and therefore `default/0`) RAISES on a malformed file rather than silently
   scoring fewer questions: a missing/duplicate id, an empty question or corpus, a
-  duplicate `doc_id`/title, a `relevant` entry absent from that question's corpus, an
-  out-of-range grade, or an unknown category. A silently unscoreable question is worse
-  than a loud failure — it moves the aggregate without anyone noticing.
+  question over #{500} characters (which `search_combined/3` rejects outright), a
+  duplicate `doc_id`/title, a `relevant` entry absent from that question's corpus, a
+  `graded` key that is not also `relevant`, an out-of-range grade, or an unknown
+  category. A silently unscoreable question is worse than a loud failure — it moves the
+  aggregate without anyone noticing.
   """
 
   alias Loopctl.Knowledge.Categories
@@ -90,6 +96,11 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
   @relative_path "retrieval_eval/golden.jsonl"
 
   @max_grade 3
+
+  # Mirrors `Loopctl.Knowledge` `validate_query_string/1` (knowledge.ex ~6571): a query
+  # over 500 chars is hard-rejected by `search_combined/3` as `{:error, :bad_request}`,
+  # which the scorer would turn into a silent 0. Reject it at load time instead.
+  @max_question_length 500
 
   @doc "The default committed golden set (`priv/retrieval_eval/golden.jsonl`)."
   @spec default() :: t()
@@ -162,10 +173,18 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
   """
   @spec grade(question(), String.t()) :: non_neg_integer()
   def grade(%{relevant: relevant, graded: graded}, doc_id) do
+    # Relevance membership is checked FIRST so the documented contract holds no matter
+    # what `graded` contains: "a doc not in relevant is grade 0 regardless". Checking
+    # `graded` first (as an earlier version did) let a graded-but-not-relevant distractor
+    # contribute a positive gain to DCG without contributing to IDCG (which is built from
+    # `relevant` only), so nDCG@k could exceed 1.0. `validate_question!/1` also rejects a
+    # graded doc_id that is not relevant, so this branch is belt-and-suspenders — but the
+    # metric must be correct on any question map, including in-memory ones built in tests
+    # that never pass through the loader.
     cond do
+      doc_id not in relevant -> 0
       Map.has_key?(graded, doc_id) -> Map.fetch!(graded, doc_id)
-      doc_id in relevant -> 1
-      true -> 0
+      true -> 1
     end
   end
 
@@ -264,11 +283,20 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
     set
   end
 
-  defp validate_question!(%{id: id, corpus: corpus, relevant: relevant, graded: graded}) do
+  defp validate_question!(%{
+         id: id,
+         question: question,
+         corpus: corpus,
+         relevant: relevant,
+         graded: graded
+       }) do
     if corpus == [], do: raise(ArgumentError, "golden question #{id}: corpus is empty")
     if relevant == [], do: raise(ArgumentError, "golden question #{id}: relevant is empty")
 
+    validate_question_length!(id, question)
+
     corpus_ids = MapSet.new(corpus, & &1.doc_id)
+    relevant_ids = MapSet.new(relevant)
 
     # Label integrity: a `relevant` doc_id that is not in this question's own corpus can
     # never be retrieved, so the question would silently score 0 forever.
@@ -281,18 +309,37 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
 
     validate_unique!(relevant, "relevant doc_id in question #{id}")
 
-    Enum.each(graded, fn {doc_id, gradev} ->
-      unless MapSet.member?(corpus_ids, doc_id) do
-        raise ArgumentError,
-              "golden question #{id}: graded doc_id #{inspect(doc_id)} is not in its corpus"
-      end
+    Enum.each(graded, &validate_graded!(id, &1, corpus_ids, relevant_ids))
+  end
 
-      unless is_integer(gradev) and gradev >= 0 and gradev <= @max_grade do
-        raise ArgumentError,
-              "golden question #{id}: grade for #{doc_id} must be an integer 0..#{@max_grade}, " <>
-                "got #{inspect(gradev)}"
-      end
-    end)
+  defp validate_question_length!(id, question) do
+    if String.length(question) > @max_question_length do
+      raise ArgumentError,
+            "golden question #{id}: question is #{String.length(question)} chars, " <>
+              "over the #{@max_question_length}-char limit search_combined/3 enforces " <>
+              "(it would silently score 0)"
+    end
+  end
+
+  defp validate_graded!(id, {doc_id, gradev}, corpus_ids, relevant_ids) do
+    unless MapSet.member?(corpus_ids, doc_id) do
+      raise ArgumentError,
+            "golden question #{id}: graded doc_id #{inspect(doc_id)} is not in its corpus"
+    end
+
+    # A grade on a non-relevant doc is inert (grade/2 returns 0 for it) and would let a
+    # distractor look intentionally weighted — reject it so the labels stay honest.
+    unless MapSet.member?(relevant_ids, doc_id) do
+      raise ArgumentError,
+            "golden question #{id}: graded doc_id #{inspect(doc_id)} is not in `relevant` " <>
+              "(a grade on a non-relevant doc is ignored)"
+    end
+
+    unless is_integer(gradev) and gradev >= 0 and gradev <= @max_grade do
+      raise ArgumentError,
+            "golden question #{id}: grade for #{doc_id} must be an integer 0..#{@max_grade}, " <>
+              "got #{inspect(gradev)}"
+    end
   end
 
   # doc_ids AND titles must be globally unique: the whole file is seeded into ONE tenant,

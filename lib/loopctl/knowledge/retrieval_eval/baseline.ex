@@ -32,7 +32,10 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
 
   `golden_version` is recorded so a re-labelled golden set cannot be silently compared
   against stale numbers — `compare/3` flags the mismatch instead of reporting deltas that
-  mean nothing.
+  mean nothing. Because the version is free text the loader never checksums, `compare/3`
+  ALSO compares the actual question-id SET and flags `:question_set_mismatch` when the run
+  and the baseline cover different questions, even if the version string was left
+  untouched.
 
   ## Regression rule
 
@@ -40,6 +43,9 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
   `#{inspect(0.005)}`; `answered` uses a whole-question tolerance of 0). A metric that is
   `nil` on ONE side only is reported as an undefined delta and — because it means the
   metric stopped being computable — counts as a regression; `nil` on BOTH sides is inert.
+  A metric that is a NUMBER now with NO baseline counterpart (e.g. a `--k` not in the
+  baseline) is `:incomparable`, not `:ok` — the gate fails closed rather than pretending
+  it compared something it could not.
   """
 
   @relative_path "retrieval_eval/baseline_v1.json"
@@ -150,12 +156,15 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
   Returns
 
       %{
-        status: :ok | :regression | :missing_mode | :golden_version_mismatch,
+        status: :ok | :regression | :incomparable | :missing_mode
+              | :golden_version_mismatch | :question_set_mismatch,
         golden_version: %{current: .., baseline: ..},
-        aggregate: [%{metric: "recall@5", current: .., baseline: .., delta: .., regression?: ..}],
+        aggregate: [%{metric: "recall@5", current: .., baseline: .., delta: ..,
+                      regression?: .., uncomparable?: ..}],
         questions: [%{id: .., metric deltas ..}],
         winners: [..], losers: [..],
-        regressions: [metric names]
+        regressions: [metric names],
+        uncomparable: [metric names]
       }
   """
   @spec compare(map(), t(), keyword()) :: map()
@@ -172,9 +181,24 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
       baseline_golden != result.golden_version ->
         base_report(result, baseline_golden, :golden_version_mismatch)
 
+      question_set_changed?(result, baseline_mode) ->
+        base_report(result, baseline_golden, :question_set_mismatch)
+
       true ->
         build_comparison(result, baseline_mode, baseline_golden, tolerance)
     end
+  end
+
+  # `golden_version` is a free-text header field the loader does not derive or checksum, so
+  # adding/removing/renaming a question without bumping it would let a stale baseline pass:
+  # a new question missing from the baseline yields nil per-question deltas that read as
+  # non-regressions, and a differing question COUNT is never compared. Comparing the actual
+  # question-id SET closes that gap independently of the version string — the gate refuses
+  # to compare a run whose questions do not match the baseline's exactly.
+  defp question_set_changed?(result, baseline_mode) do
+    current_ids = MapSet.new(result.question_results, & &1.id)
+    baseline_ids = baseline_mode |> Map.get("questions", %{}) |> Map.keys() |> MapSet.new()
+    not MapSet.equal?(current_ids, baseline_ids)
   end
 
   defp base_report(result, baseline_golden, status) do
@@ -185,7 +209,8 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
       questions: [],
       winners: [],
       losers: [],
-      regressions: []
+      regressions: [],
+      uncomparable: []
     }
   end
 
@@ -197,15 +222,42 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
     questions = question_rows(result, baseline_mode)
     regressions = aggregate |> Enum.filter(& &1.regression?) |> Enum.map(& &1.metric)
 
+    # A metric present in the current run but ABSENT from the baseline (e.g. `--k 3`
+    # against a baseline that only holds k=5 and k=10) cannot be judged. Treating it as
+    # "no regression" is a false green — the gate would print "no regression" having
+    # silently compared only the metrics that happened to overlap. Surface it as its own
+    # uncomparable status so gate mode fails closed.
+    uncomparable = aggregate |> Enum.filter(& &1.uncomparable?) |> Enum.map(& &1.metric)
+
     %{
-      status: if(regressions == [], do: :ok, else: :regression),
+      status: comparison_status(regressions, uncomparable),
       golden_version: %{current: result.golden_version, baseline: baseline_golden},
       aggregate: aggregate,
       questions: questions,
-      winners: questions |> Enum.filter(&positive?(&1.mrr_delta)) |> Enum.map(& &1.id),
-      losers: questions |> Enum.filter(&negative?(&1.mrr_delta)) |> Enum.map(& &1.id),
-      regressions: regressions
+      # Winners/losers span EVERY per-question metric delta (mrr, recall@k, nDCG@k), not
+      # mrr alone: a change that lifts mrr while dropping recall must show up as a loser,
+      # so a question can legitimately be BOTH a winner and a loser — that IS the tradeoff.
+      winners: questions |> Enum.filter(&any_positive_delta?/1) |> Enum.map(& &1.id),
+      losers: questions |> Enum.filter(&any_negative_delta?/1) |> Enum.map(& &1.id),
+      regressions: regressions,
+      uncomparable: uncomparable
     }
+  end
+
+  # Regression wins over uncomparable wins over ok, so the most serious signal is the
+  # reported status and gate mode never reads "ok" while a metric it could not compare
+  # lurks in the aggregate.
+  defp comparison_status([_ | _], _uncomparable), do: :regression
+  defp comparison_status([], [_ | _]), do: :incomparable
+  defp comparison_status([], []), do: :ok
+
+  # Per-question winner/loser predicates over the full delta set. Undefined (nil) deltas
+  # are inert — neither a win nor a loss.
+  defp any_positive_delta?(q), do: Enum.any?(question_deltas(q), &positive?/1)
+  defp any_negative_delta?(q), do: Enum.any?(question_deltas(q), &negative?/1)
+
+  defp question_deltas(q) do
+    [q.mrr_delta | Map.values(q.recall_delta) ++ Map.values(q.ndcg_delta)]
   end
 
   defp metric_rows(result, baseline_mode, tolerance) do
@@ -238,9 +290,15 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
       current: current,
       baseline: baseline,
       delta: delta(current, baseline),
-      regression?: regression?(current, baseline, tolerance)
+      regression?: regression?(current, baseline, tolerance),
+      uncomparable?: uncomparable?(current, baseline)
     }
   end
+
+  # The current run produced a number for this metric but the baseline has none to compare
+  # against — the comparison is undefined, and in gate mode that must not read as "ok".
+  # (nil-current is handled by regression?/3 as a regression; nil-on-both is inert.)
+  defp uncomparable?(current, baseline), do: is_number(current) and is_nil(baseline)
 
   # `answered` is a whole-question count: any drop is a regression (no float tolerance).
   defp answered_row(result, baseline_mode) do
@@ -252,7 +310,8 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
       current: current,
       baseline: baseline,
       delta: delta(current, baseline),
-      regression?: is_integer(baseline) and current < baseline
+      regression?: is_integer(baseline) and current < baseline,
+      uncomparable?: uncomparable?(current, baseline)
     }
   end
 

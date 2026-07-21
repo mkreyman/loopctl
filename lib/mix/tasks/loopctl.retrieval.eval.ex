@@ -29,6 +29,22 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
       baseline by more than the tolerance. This is what CI runs.
     * `--tolerance` — float slack below baseline that is not a regression.
     * `--json` — emit the machine-readable result instead of the text report.
+    * `--cleanup` — reap any leaked eval tenants and their seeded corpus, then exit
+      without running an eval. Use after a run was killed (OOM / SIGKILL / CI cancel)
+      mid-flight and left rows behind. A tenant qualifies ONLY when it carries the
+      programmatic eval marker (`settings.retrieval_eval = true`, which no signup path
+      can set) — the user-choosable slug prefix alone is NOT sufficient — AND it is
+      older than `--min-age` minutes, so a concurrently in-flight run's fresh tenant is
+      never reaped out from under it.
+    * `--min-age` — minutes a tenant must have existed before `--cleanup` will reap it
+      (default 15). Guards against deleting a live run's tenant. Pass `--min-age 0`
+      only when you KNOW no eval is in flight.
+    * `--allow-prod` — permit the run in the `:prod` environment. Refused by default:
+      the task mints a throwaway, human-UNANCHORED tenant and hard-deletes it plus its
+      seeded published articles through `AdminRepo` (BYPASSRLS), which has no business
+      running against a production database unasked. There is no real-embedding-provider
+      path (the semantic lane is always synthetic), so a prod run buys nothing normal
+      dev/CI does not.
 
   Adding a labeled question and re-baselining: `docs/runbooks/retrieval_eval.md`.
   """
@@ -37,7 +53,10 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
 
   import Ecto.Query
 
+  require Logger
+
   alias Loopctl.AdminRepo
+  alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.RetrievalEval
   alias Loopctl.Knowledge.RetrievalEval.Baseline
   alias Loopctl.Knowledge.RetrievalEval.GoldenSet
@@ -47,6 +66,26 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
 
   @shortdoc "Run the golden-question retrieval eval against the committed baseline"
 
+  # Leaked eval tenants and their corpus are found by these stable markers so `--cleanup`
+  # (and any future reaper) can reap them without guessing.
+  #
+  # The AUTHORITATIVE identifier is `@corpus_marker`, stamped programmatically by this task
+  # into BOTH the throwaway tenant's `settings` (`settings.retrieval_eval = true`) and every
+  # seeded article's `metadata`. It is safe as a delete predicate precisely because NO signup
+  # path can set it: `Tenant.signup_changeset`/`self_signup_changeset` force `settings: %{}`
+  # and never cast it, so a customer or squatting attacker who registers a colliding
+  # `retrieval-eval-*` slug (the slug is user-chosen and unreserved) still cannot forge the
+  # marker — and is therefore never a reap candidate. The slug prefix is only a cheap
+  # pre-filter, NEVER the sole gate.
+  @tenant_slug_prefix "retrieval-eval-"
+  @corpus_marker "retrieval_eval"
+
+  # `--cleanup` refuses to delete a tenant younger than this many minutes: a concurrently
+  # in-flight eval (a parallel CI job or dev run on the same DB) has a freshly-created
+  # throwaway tenant, and reaping it mid-run would wipe its seeded corpus and mis-score the
+  # live run. Any normal run finishes well inside this window. `--min-age` overrides it.
+  @reap_min_age_minutes 15
+
   @switches [
     golden: :string,
     mode: :string,
@@ -55,7 +94,10 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
     update_baseline: :boolean,
     fail_on_regression: :boolean,
     tolerance: :float,
-    json: :boolean
+    json: :boolean,
+    cleanup: :boolean,
+    allow_prod: :boolean,
+    min_age: :integer
   ]
 
   @impl Mix.Task
@@ -64,6 +106,28 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
 
     Mix.Task.run("app.start")
 
+    # This task writes to and hard-deletes from the DB it is pointed at. In prod that is a
+    # production database, and the run offers nothing dev/CI does not (the provider lane is
+    # always synthetic). Refuse unless the operator opts in explicitly.
+    guard_prod!(opts)
+
+    if Keyword.get(opts, :cleanup, false) do
+      reap_leaked_tenants(opts)
+    else
+      run_eval(opts)
+    end
+  end
+
+  defp guard_prod!(opts) do
+    if Application.get_env(:loopctl, :env) == :prod and not Keyword.get(opts, :allow_prod, false) do
+      Mix.raise(
+        "retrieval eval: refusing to run in :prod (mints and hard-deletes a throwaway " <>
+          "tenant via AdminRepo). Pass --allow-prod only if you understand that."
+      )
+    end
+  end
+
+  defp run_eval(opts) do
     golden =
       case Keyword.get(opts, :golden) do
         nil -> GoldenSet.default()
@@ -204,17 +268,99 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
   # tenant would pollute that tenant's KB. Deleted in an `after` so a raising run leaves
   # nothing behind either.
   defp with_tenant(fun) do
+    unique = System.unique_integer([:positive])
+
     {:ok, tenant} =
       Tenants.create_tenant(%{
-        name: "retrieval-eval-#{System.unique_integer([:positive])}",
-        slug: "retrieval-eval-#{System.unique_integer([:positive])}",
-        email: "retrieval-eval-#{System.unique_integer([:positive])}@example.invalid"
+        name: "#{@tenant_slug_prefix}#{unique}",
+        slug: "#{@tenant_slug_prefix}#{unique}",
+        email: "#{@tenant_slug_prefix}#{unique}@example.invalid",
+        # The AUTHORITATIVE reap marker (see @corpus_marker): set programmatically here so
+        # `--cleanup` deletes only tenants THIS task minted, never a customer tenant that
+        # merely shares the (user-choosable) slug prefix. No signup path can set `settings`.
+        settings: %{@corpus_marker => true}
       })
 
     try do
       fun.(tenant.id)
     after
-      AdminRepo.delete_all(from(t in Tenant, where: t.id == ^tenant.id))
+      # Best-effort teardown that must NOT mask the eval result. An exception raised in an
+      # `after` replaces the block's value, so a raw delete that hits an FK violation
+      # (e.g. an Oban cron sweep wrote an audit/STH row for this tenant mid-run — those
+      # tables reference tenants ON DELETE NO ACTION) would BOTH discard the eval AND
+      # leave the tenant behind. Catch it, log it with the marker so `--cleanup` can
+      # finish the job, and let the result stand.
+      delete_tenant(tenant.id)
     end
+  end
+
+  # Reap eval tenants left behind by a killed run (OOM / SIGKILL / CI cancel).
+  #
+  # A tenant qualifies ONLY when ALL THREE hold — the AUTHORITATIVE gate is the programmatic
+  # `settings.retrieval_eval` marker (unforgeable via any signup path); the slug prefix is a
+  # cheap pre-filter, never the sole predicate; and the age guard keeps a concurrently
+  # in-flight run's fresh tenant out of the sweep. Their seeded corpus is deleted first (by
+  # the metadata marker) so a tenant with only-articles children deletes cleanly, and
+  # `delete_tenant/1`'s FK-RESTRICT rescue leaves any tenant carrying non-eval children
+  # intact (defense in depth behind the marker).
+  defp reap_leaked_tenants(opts) do
+    min_age = Keyword.get(opts, :min_age, @reap_min_age_minutes)
+
+    tenant_ids =
+      AdminRepo.all(
+        from(t in Tenant,
+          where:
+            like(t.slug, ^"#{@tenant_slug_prefix}%") and
+              fragment("? ->> ? = 'true'", t.settings, ^@corpus_marker) and
+              t.inserted_at < ago(^min_age, "minute"),
+          select: t.id
+        )
+      )
+
+    if tenant_ids == [] do
+      Mix.shell().info("Retrieval eval cleanup: no leaked eval tenants found.")
+    else
+      {reaped, failed} = Enum.reduce(tenant_ids, {0, 0}, &reap_tenant/2)
+
+      Mix.shell().info(
+        "Retrieval eval cleanup: reaped #{reaped} leaked eval tenant(s)" <>
+          if(failed > 0, do: ", #{failed} could not be deleted (see logs)", else: "") <> "."
+      )
+    end
+  end
+
+  # Delete one leaked tenant's corpus (by marker) then the tenant itself, tallying the
+  # outcome so a failure on one tenant does not abort the whole sweep.
+  defp reap_tenant(tenant_id, {ok, bad}) do
+    delete_corpus_for(tenant_id)
+
+    case delete_tenant(tenant_id) do
+      :ok -> {ok + 1, bad}
+      :error -> {ok, bad + 1}
+    end
+  end
+
+  defp delete_corpus_for(tenant_id) do
+    AdminRepo.delete_all(
+      from(a in Article,
+        where:
+          a.tenant_id == ^tenant_id and fragment("? ->> ? = 'true'", a.metadata, ^@corpus_marker)
+      )
+    )
+
+    :ok
+  end
+
+  defp delete_tenant(tenant_id) do
+    AdminRepo.delete_all(from(t in Tenant, where: t.id == ^tenant_id))
+    :ok
+  rescue
+    error ->
+      Logger.warning(
+        "retrieval eval: could not delete throwaway tenant #{tenant_id} " <>
+          "(#{Exception.message(error)}); run `mix loopctl.retrieval.eval --cleanup` to reap it"
+      )
+
+      :error
   end
 end

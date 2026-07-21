@@ -10,7 +10,16 @@ mix loopctl.retrieval.eval --mode both          # embeddings AND keyword-only ar
 mix loopctl.retrieval.eval --fail-on-regression # what CI runs
 mix loopctl.retrieval.eval --update-baseline    # re-baseline (both modes)
 mix loopctl.retrieval.eval --json               # machine-readable output
+mix loopctl.retrieval.eval --cleanup            # reap eval tenants a killed run leaked
 ```
+
+The task mints a throwaway tenant, seeds the corpus into it, and hard-deletes both on the
+way out (happy path AND when the run raises). If a run is KILLED (OOM / SIGKILL / CI
+cancel) the `after` never runs, leaking a tenant plus ~100 published, embedded articles;
+`--cleanup` reaps every tenant whose slug starts `retrieval-eval-` (deleting its seeded
+corpus first). The task also **refuses to run in `:prod`** unless you pass `--allow-prod`
+— it writes to and hard-deletes from whatever DB it is pointed at through `AdminRepo`
+(BYPASSRLS), and a prod run buys nothing dev/CI does not (the provider lane is synthetic).
 
 ## What it does
 
@@ -56,10 +65,33 @@ The report always names the mode it **observed** (read out of the search respons
 requested — a run that silently degraded says so, and `mixed` means the questions
 disagreed.
 
-The keyword-only arm scores far lower than the embeddings arm. That is the point: it is
-the arm with headroom, so a fusion change (e.g. reciprocal rank fusion) has somewhere to
-show a gain, while the embeddings arm is the arm with the least slack for a regression to
-hide in.
+The keyword-only arm scores far lower than the embeddings arm — but understand exactly
+what it does and does NOT buy before relying on it:
+
+* **It does not exercise fusion.** In `keyword_only` mode the eval passes
+  `embedding: {:error, :no_api_key}`, so `search_combined/3` never runs the semantic lane
+  and never calls `merge_results`. A fusion change (e.g. reciprocal rank fusion, #470)
+  therefore *cannot move this arm by a single rank* — fusion is exercised ONLY in the
+  `embeddings` arm. Judge #470 against the embeddings arm's per-question deltas, not this
+  one.
+* **It is pinned near the metric floor.** `search_keyword` builds its tsquery with
+  `websearch_to_tsquery('english', ?)`, which ANDs every non-stop lexeme, so a 10–12 word
+  natural-language golden question matches essentially no document. In the committed
+  baseline this arm answers only ~4 of 25 questions, with most per-question MRRs at 0. A
+  floored metric registers *improvements* but almost never *regressions* (a regression
+  needs `current < baseline - tolerance`, and you cannot drop below a floor), so its real
+  gate signal covers only the handful of questions that clear the floor.
+
+The arm still earns its place: it is the committed, reviewable measurement of the degraded
+production path (embedding provider unavailable), and a change that *raises* keyword recall
+shows up here. Just don't read it as headroom for a fusion change — that headroom is in
+the embeddings arm.
+
+Worth flagging beyond this harness: because `websearch_to_tsquery` ANDs every lexeme, the
+production degraded path (`fallback: true`, `search_mode: keyword_only`) returns nothing
+for typical multi-word agent questions. Loosening that query is a production-search
+ranking change (its own baseline + review, tracked with the fusion work), not part of this
+eval harness.
 
 ## Synthetic embeddings — read this before trusting an absolute number
 
@@ -75,8 +107,10 @@ Consequences, stated plainly:
 * The query vector is derived from the QUESTION TEXT, never from the labels. A vector
   built out of its own relevant documents would rank them first by construction and pin
   the eval at a vacuous 1.0 that no ranking change could move.
-* Read the numbers as a **regression signal**, not an absolute quality score. A run
-  against a real provider is the same mix task invoked in dev/prod.
+* Read the numbers as a **regression signal**, not an absolute quality score. There is
+  **no real-embedding-provider path** on this task: the semantic lane is always the
+  synthetic stand-in, in dev, CI, and prod alike (`embedding_opt/2` never calls a
+  provider). Do not read a dev/prod invocation as a real-provider measurement — it isn't.
 
 ## Adding a labeled question
 
@@ -108,6 +142,18 @@ confirmed hit), then WRITE the corpus into the fixture. Never label by productio
 UUID: CI starts with an empty database, so a UUID label is unscoreable everywhere but the
 machine that mined it.
 
+### Known limitation: the committed corpus is synthetic prose
+
+Every committed question today is `hand-authored`, and every corpus document is invented
+prose with a few hand-picked distractors — there is no mining tooling in the repo, only
+this by-hand instruction. The *self-contained-corpus* design (a portable fixture, no
+production DB dependency) is deliberate and worth keeping, but it does **not** require the
+TEXT to be invented. A more representative corpus copies REAL article bodies in under
+stable `doc_id`s — same portability, but the distractors are the ones fusion (#470) and
+recency/authority (#471) actually have to disambiguate, which is exactly where those
+changes bite. Until that mining pass lands, read a green embeddings arm as "did not
+regress on a synthetic corpus", not "is good on production traffic".
+
 ## Re-baselining
 
 ```
@@ -125,6 +171,15 @@ JSON so the diff shows exactly which questions moved. Re-baseline when:
 
 Never re-baseline to make a red gate green. The whole point is that the numbers move only
 through a reviewed commit.
+
+**Re-baseline on the SAME Postgres major the gate runs on (CI = `pgvector/pgvector:pg16`).**
+The `:keyword_only` arm's `answered` set is decided by Postgres `english` full-text stemming
+and `ts_rank_cd`, which are stable WITHIN a PG major but can shift ACROSS one. Dev machines
+span pg16/pg14; a baseline captured on pg14 can then read as a spurious regression against
+CI's pg16 (or mask a real one). Ranking ties inside a run are already made deterministic
+(article-id secondary sort in both the merge and the keyword `ORDER BY`, plus deterministic
+seeded article ids), so this is the remaining cross-environment variable — pin it by
+re-baselining on pg16.
 
 ## The CI gate
 

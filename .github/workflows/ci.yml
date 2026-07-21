@@ -195,7 +195,14 @@ jobs:
           # See lint job: config/*.exs is part of the key so a config-only change
           # forces a clean recompile of config-sensitive deps instead of reusing a
           # stale dep beam. No loose restore-keys, for the same reason.
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
+          #
+          # `-dev` suffix on purpose: this is the ONLY job that runs MIX_ENV=dev. Sharing
+          # the exact key of the MIX_ENV=test jobs means that on a key miss GitHub saves
+          # from whichever job finishes first — if it is this one, the saved _build holds
+          # only _build/dev and every test job then restores a tree with no test artifacts
+          # and recompiles. A distinct key keeps the dev and test build trees from
+          # clobbering each other in the cache.
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}-dev
 
       - name: Install dependencies
         run: mix deps.get
@@ -235,8 +242,21 @@ jobs:
       # NB: the task itself HARD-FAILS on an empty golden set and on a missing/unreadable
       # baseline in --fail-on-regression mode. Do not "simplify" either guard away: a run
       # that scores nothing and exits 0 is a false green (the scale-nightly lesson below).
+      # Tee the full report (aggregate + per-question winners/losers table) into the job's
+      # step summary so a reviewer of a ranking PR sees the delta on the run's summary page
+      # without opening the raw log and scrolling. PIPESTATUS preserves the gate's exit
+      # code across the tee so a regression still fails the job.
       - name: Run golden-question retrieval eval gate
-        run: mix loopctl.retrieval.eval --mode both --fail-on-regression
+        run: |
+          set -o pipefail
+          {
+            echo '## Retrieval eval'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          mix loopctl.retrieval.eval --mode both --fail-on-regression 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          status=${PIPESTATUS[0]}
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
         timeout-minutes: 15
 
   security:
