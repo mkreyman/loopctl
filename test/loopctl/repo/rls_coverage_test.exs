@@ -78,4 +78,38 @@ defmodule Loopctl.Repo.RlsCoverageTest do
 
     assert qual =~ "current_tenant_id()"
   end
+
+  # sec-5 (#460): the 8 tables below originally built tenant_isolation_policy with
+  # the raw current_setting('app.current_tenant_id', true)::uuid cast instead of
+  # the exception-safe current_tenant_id() wrapper. This asserts the normalization
+  # migration converted every one — the wrapper is present and the raw cast is gone.
+  @sec5_normalized_tables ~w(
+    audit_signed_tree_heads
+    audit_sth_checkpoints
+    tenant_audit_key_history
+    capability_tokens
+    audit_chain
+    dispatches
+    verification_runs
+    story_acceptance_criteria
+  )
+
+  test "sec-5 (#460) tables use the current_tenant_id() wrapper, not the raw current_setting cast" do
+    for table <- @sec5_normalized_tables do
+      %{rows: rows} =
+        AdminRepo.query!(
+          "SELECT qual FROM pg_policies WHERE tablename = $1 AND policyname = 'tenant_isolation_policy'",
+          [table]
+        )
+
+      assert [[qual]] = rows,
+             "expected exactly one tenant_isolation_policy on #{table}, got: #{inspect(rows)}"
+
+      assert qual =~ "current_tenant_id()",
+             "#{table}.tenant_isolation_policy should use the current_tenant_id() wrapper, got: #{qual}"
+
+      refute qual =~ "current_setting",
+             "#{table}.tenant_isolation_policy should not use the raw current_setting cast, got: #{qual}"
+    end
+  end
 end
