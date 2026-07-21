@@ -6,8 +6,16 @@ defmodule Loopctl.HealthCheck.Default do
   scale-alerts config-guard.
 
   Note (#461 item 5): the running app version is intentionally NOT surfaced in the
-  response. Both endpoints are unauthenticated, so publishing the exact build to any
-  internet caller was a needless version-fingerprint with no operational upside.
+  response. `/health` is unauthenticated AND polled continuously by Fly's LB (every
+  10s), so it is a needless place to publish the exact build — deploy tooling reads
+  the version from the release/image, not this endpoint. This does NOT claim to
+  eliminate version fingerprinting: the same `Application.spec(:loopctl, :vsn)` is
+  still served, by design, at the unauthenticated discovery root (`GET /api/v1/`,
+  `LoopctlWeb.WelcomeController`) and in the OpenAPI document (`GET /api/v1/openapi`,
+  `Loopctl.ApiSpec` — `info.version` is a conventional, expected field there). The
+  narrow, honest benefit is keeping the highest-frequency liveness/readiness endpoint
+  minimal and not DUPLICATING the fingerprint onto it; the residual disclosure on the
+  discovery/OpenAPI surface is accepted.
 
   ## Liveness (`status`) vs readiness (`ready`) — US-32.4 post-review correction
 
@@ -102,11 +110,14 @@ defmodule Loopctl.HealthCheck.Default do
 
     # #461 item 5: the app version is deliberately NOT included in this response.
     # Both `/health` (continuous, unauthenticated, hit by Fly's LB every 10s AND
-    # reachable by any internet caller) and `/health/ready` share this map, so
-    # disclosing the exact running build to anonymous callers handed attackers a
-    # free version-fingerprint for no operational benefit (deploy tooling reads the
-    # version from the release/image, not this endpoint). `status`/`ready` semantics
-    # — the fields the LB and the deploy smoke gate act on — are unchanged.
+    # reachable by any internet caller) and `/health/ready` share this map, and
+    # deploy tooling reads the running build from the release/image, not this
+    # endpoint — so there is no reason to duplicate a version fingerprint onto the
+    # highest-frequency liveness/readiness probe. This does NOT eliminate version
+    # disclosure: `Application.spec(:loopctl, :vsn)` is still served, by design, at
+    # the discovery root (`GET /api/v1/`) and in the OpenAPI spec (`GET
+    # /api/v1/openapi`) — see the moduledoc. `status`/`ready` semantics — the fields
+    # the LB and the deploy smoke gate act on — are unchanged.
     result = %{status: status, ready: ready, checks: checks}
 
     result =

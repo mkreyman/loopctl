@@ -717,7 +717,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
         {:error, {:url_body_too_large, @max_fetch_body_bytes}}
 
       {:ok, %{status: status} = resp} when status in 200..299 ->
-        handle_fetched_body(resp.body, Req.Response.get_header(resp, "content-type"))
+        # `resp.body` is the iolist accumulated by `collect_capped_body/2`; flatten it
+        # back to a binary for the extractor.
+        handle_fetched_body(
+          IO.iodata_to_binary(resp.body),
+          Req.Response.get_header(resp, "content-type")
+        )
 
       {:ok, %{status: status}} ->
         Logger.warning(
@@ -754,7 +759,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       is_binary(content_type) and binary_content_type?(content_type) ->
         unsupported_content_discard("Content-Type \"#{content_type}\"")
 
-      is_binary(body) and not String.valid?(body) ->
+      not String.valid?(body) ->
         unsupported_content_discard("fetched body")
 
       true ->
@@ -832,25 +837,44 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # stops reading and closes the connection instead of buffering an unbounded stream.
   # A normally-completed fetch stays under the cap (the crossing chunk always halts),
   # so `fetch_url/2` can treat the flag as an unambiguous "too large" signal.
-  defp collect_capped_body({:data, data}, {req, resp}) do
-    new_body = resp.body <> data
+  #
+  # The accumulator is an IOLIST (`[resp.body, data]`), not a `resp.body <> data`
+  # binary concat: because Req threads the accumulator back through its stream loop
+  # between reductions, the BEAM writable-binary append optimization does not apply to
+  # a binary accumulator, so each chunk would copy the entire buffer so far — O(n^2)
+  # total bytes over a multi-chunk stream. Appending to an iolist is O(1) per chunk and
+  # the running byte total is tracked in a `:ingestion_body_bytes` private counter (so
+  # the cap check never has to walk the accumulated iodata), giving O(n) overall.
+  # `fetch_url/2` flattens the iolist back to a binary via `IO.iodata_to_binary/1`
+  # before handing it to the extractor.
+  #
+  # Public (`@doc false`) rather than private only so the cumulative multi-chunk
+  # crossing path can be unit-tested directly: `Req.Test`/`plug:` delivers a stubbed
+  # body as a SINGLE `{:data, _}` message (Req buffers `send_chunked`/`chunk` output),
+  # so the `:cont` accumulation branch this cap actually defends against under the real
+  # Finch adapter is not reachable through a stub — see the worker test.
+  @doc false
+  def collect_capped_body({:data, data}, {req, resp}) do
+    new_size = Req.Response.get_private(resp, :ingestion_body_bytes, 0) + byte_size(data)
+    resp = %{resp | body: [resp.body, data]}
 
-    if byte_size(new_body) > @max_fetch_body_bytes do
-      capped = Req.Response.put_private(%{resp | body: new_body}, :ingestion_body_capped, true)
+    if new_size > @max_fetch_body_bytes do
+      capped = Req.Response.put_private(resp, :ingestion_body_capped, true)
       {:halt, {req, capped}}
     else
-      {:cont, {req, %{resp | body: new_body}}}
+      {:cont, {req, Req.Response.put_private(resp, :ingestion_body_bytes, new_size)}}
     end
   end
 
-  defp strip_html(body) when is_binary(body) do
+  # `body` is always a binary here: `handle_fetched_body/2`'s sole caller flattens the
+  # fetched iolist with `IO.iodata_to_binary/1` and the cond above already routes
+  # non-UTF-8 bytes to a discard, so no non-binary/invalid fallback clause is reachable.
+  defp strip_html(body) do
     body
     |> String.replace(~r/<[^>]+>/, " ")
     |> String.replace(~r/\s+/, " ")
     |> String.trim()
   end
-
-  defp strip_html(body), do: inspect(body)
 
   defp validate_and_filter(raw_articles) do
     raw_articles
