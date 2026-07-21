@@ -5,6 +5,31 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.52.0 — 2026-07-21 (handoff reliability — issue #454)
+
+### Added
+
+- **`channel_post` `supersedes` arg** — retire a stale post by id (US-454 defect
+  3). The server marks it `superseded_by` in the same transaction; directed
+  discovery excludes it and the history read marks it.
+- **`channel_handoffs` `only_mine` arg + `directed_to_me` label** (US-454
+  defect 2) — the read is now see-everything by default (addressing is a hint,
+  never a filter); `only_mine: true` restores the narrow broadcast + directed-
+  to-me view.
+- **Process-lifetime session fallback** (US-454 defect 1) — the proxy now sends
+  `CHANNEL_SESSION_ID` on every channel post: `CLAUDE_SESSION_ID` when present,
+  else one random UUID minted at process start. Keyed (handoff) posts no longer
+  depend on the env var reaching this process.
+
+### Changed
+
+- **`channel_post` tool descriptions corrected** — the keyed path no longer
+  "requires an active Claude Code session / 422s without one": the server
+  derives `handoff:<anchor>` keys from announcing bodies and mints surrogate
+  session ids (with `meta.key_source` / `meta.session_id_source` telling the
+  sender when a rescue fired). The old description advertised a constraint the
+  server no longer enforces.
+
 ## 2.51.0 — 2026-07-19 (repo coordination bus — directed-handoff discovery)
 
 ### Added
