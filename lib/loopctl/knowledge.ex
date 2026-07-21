@@ -547,23 +547,35 @@ defmodule Loopctl.Knowledge do
 
   # Make concurrent/retried creates safe on the (tenant_id, title) active unique
   # index. By the time the insert fails the constraint, the winning transaction
-  # has committed, so the existing row is visible (the recovery SELECT below
-  # deliberately mirrors the partial index's predicate, so the conflicting row is
-  # guaranteed visible unless it was concurrently archived). The idempotency
-  # signal is the article BODY itself (server-side, unforgeable): if the colliding
-  # payload's body equals the existing article's (after trimming leading/trailing
-  # whitespace), the conflict is a duplicate/retry -> return the existing row
-  # idempotently as `{:ok, :deduplicated, existing}` (a no-op the API answers 200).
-  # Otherwise it is a genuine different-body title collision ->
+  # has committed, so the winning row exists. The recovery SELECT
+  # (get_active_article_by_title/3) mirrors the partial index's active predicate
+  # AND is visibility-scoped by `vis` (mirroring get_article_by_idempotency_key/3,
+  # #163): it returns the winning row only when the caller may see it. The
+  # idempotency signal is the article BODY itself (server-side, unforgeable): if
+  # the colliding payload's body equals the existing article's (after trimming
+  # leading/trailing whitespace), the conflict is a duplicate/retry -> return the
+  # existing row idempotently as `{:ok, :deduplicated, existing}` (a no-op the API
+  # answers 200). Otherwise it is a genuine different-body title collision ->
   # `{:error, :duplicate_title, existing}` so the API can answer 409 (not a
   # retry-into-the-same-422). Non-(active-title) failures pass through unchanged.
   #
-  # The recovery SELECT runs after the insert's transaction has rolled back, so
-  # there is a tiny window in which a THIRD writer mutates or archives the winning
-  # row between its commit and our SELECT. That only produces a transient,
-  # self-healing outcome — a 409 (body now differs), or the original 422 (row now
-  # archived → SELECT returns nil) — which the client's next attempt resolves
-  # cleanly. We accept that rather than re-running the whole create under a lock.
+  # A nil recovery-SELECT result is an EXPECTED, intended outcome — not an
+  # impossible/transient edge — and the caller deliberately falls through to a
+  # generic uniqueness 422. Two distinct nil cases produce it:
+  #
+  #   1. Cross-agent private collision (the security invariant this path enforces):
+  #      the title collides with ANOTHER agent's private/owner article, so the
+  #      visibility filter excludes it. Falling through to a bare 422 leaks no
+  #      UUID, body, or existence signal about that private row. DO NOT drop the
+  #      visibility filter or this fallthrough to "fix" a phantom nil — doing so
+  #      silently reintroduces the private-article existence/UUID leak (#163).
+  #   2. Concurrent archival: the recovery SELECT runs after the insert's
+  #      transaction has rolled back, so a THIRD writer may mutate or archive the
+  #      winning row between its commit and our SELECT. That yields a transient,
+  #      self-healing outcome — a 409 (body now differs) or the 422 (row now
+  #      archived/superseded → SELECT returns nil) — which the client's next
+  #      attempt resolves cleanly. We accept that rather than re-running the whole
+  #      create under a lock.
   defp resolve_create_conflict(tenant_id, attrs, changeset, vis) do
     cond do
       # A single failed INSERT raises exactly one unique violation, so the
@@ -578,17 +590,17 @@ defmodule Loopctl.Knowledge do
         end
 
       active_title_conflict?(changeset) ->
-        resolve_title_conflict(tenant_id, attrs, changeset)
+        resolve_title_conflict(tenant_id, attrs, changeset, vis)
 
       true ->
         {:error, changeset}
     end
   end
 
-  defp resolve_title_conflict(tenant_id, attrs, changeset) do
+  defp resolve_title_conflict(tenant_id, attrs, changeset, vis) do
     title = attrs[:title] || attrs["title"]
 
-    case get_active_article_by_title(tenant_id, title) do
+    case get_active_article_by_title(tenant_id, title, vis) do
       %Article{} = existing ->
         if same_content?(existing, attrs) do
           {:ok, :deduplicated, existing}
@@ -646,22 +658,28 @@ defmodule Loopctl.Knowledge do
     end)
   end
 
-  defp get_active_article_by_title(_tenant_id, title) when not is_binary(title), do: nil
+  defp get_active_article_by_title(_tenant_id, title, _vis) when not is_binary(title), do: nil
 
   # tenant_id is nil for system-scoped articles; a NULL `=` never matches, so the
   # recovery simply doesn't apply to system scope (its conflicts are slug-based).
-  defp get_active_article_by_title(nil, _title), do: nil
+  defp get_active_article_by_title(nil, _title, _vis), do: nil
 
-  defp get_active_article_by_title(tenant_id, title) do
-    AdminRepo.one(
-      from(a in Article,
-        where:
-          a.tenant_id == ^tenant_id and a.title == ^title and
-            a.status not in [:archived, :superseded],
-        order_by: [asc: a.inserted_at],
-        limit: 1
-      )
+  # `vis` (a `visibility_agent_id`) scopes the recovery SELECT to owner-visible rows,
+  # mirroring get_article_by_idempotency_key/3 (#163). Because this path uses
+  # AdminRepo (BYPASSRLS) the visibility filter MUST live in the query — RLS won't
+  # apply it. A title colliding with another agent's private/owner article returns
+  # nil here → the caller falls through to a generic uniqueness 422, with no UUID,
+  # body, or existence signal leaked.
+  defp get_active_article_by_title(tenant_id, title, vis) do
+    from(a in Article,
+      where:
+        a.tenant_id == ^tenant_id and a.title == ^title and
+          a.status not in [:archived, :superseded],
+      order_by: [asc: a.inserted_at],
+      limit: 1
     )
+    |> maybe_filter_by_visibility(vis)
+    |> AdminRepo.one()
   end
 
   # Same content == same (whitespace-normalized) body. Derived server-side from
