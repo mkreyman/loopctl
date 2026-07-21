@@ -128,8 +128,14 @@ defmodule LoopctlWeb.Plugs.RateLimiterTest do
     test "the plug FAILS OPEN when the limiter raises (limiter outage never blocks all traffic)" do
       import ExUnit.CaptureLog
 
-      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window_ms, _limit ->
-        raise "limiter store is down"
+      # sec-4: the `:authenticated` pipeline now runs the fail-CLOSED
+      # `AuthPathThrottle` gate FIRST (bucket `auth_ip:*`). Let it pass so this
+      # test exercises the per-key limiter's OWN fail-OPEN handling in isolation
+      # (a partial fault). A total limiter outage that also faults `auth_ip:*`
+      # would be denied 429 by that earlier gate — the deliberate sec-4 tradeoff.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "auth_ip:" <> _, _window_ms, _limit -> {:allow, 1}
+        _bucket, _window_ms, _limit -> raise "limiter store is down"
       end)
 
       tenant = fixture(:tenant)

@@ -57,7 +57,7 @@ defmodule LoopctlWeb.SignupController do
     # US-26.7.1 (#6a) — the rate-limit check runs FIRST, so an oversized-field
     # request still consumes the per-IP budget. Otherwise a flood of oversized
     # payloads would 422 without ever counting against the cap, defeating it.
-    bucket = "api_signup:ip:#{client_ip(conn)}"
+    bucket = "api_signup:ip:#{RemoteIp.bucket_key(conn.remote_ip)}"
 
     # FAIL-CLOSED anti-abuse gate: on a limiter fault (or the Postgres impl's
     # fail-open sentinel) deny rather than silently unlock per-IP signup abuse
@@ -141,27 +141,6 @@ defmodule LoopctlWeb.SignupController do
 
   defp within_size?(value) when is_binary(value), do: byte_size(value) <= @max_field_bytes
   defp within_size?(_value), do: true
-
-  # US-26.7.1 (#6b) — proxy-aware per-IP bucket key, mirroring
-  # SignupLive.peer_identity/1. `conn.remote_ip` was resolved by the
-  # `LoopctlWeb.Plugs.ClientIp` endpoint plug (shared `Loopctl.RemoteIp`
-  # resolver, preferring the unspoofable `fly-client-ip`). If it still resolves
-  # to one of our configured PROXIES (e.g. Fly's 6PN when no forwarded header
-  # was present) we could NOT determine the real client — keying on the proxy
-  # IP would collapse EVERY visitor onto ONE shared bucket, so a single
-  # proxy-fronted flood would fill it and block legitimate signups. In that
-  # case we fall back to a per-request key (never a shared bucket): it forgoes
-  # limiting on this unresolved path rather than punishing everyone. On Fly the
-  # path is unreachable (fly-client-ip is always present and unspoofable).
-  defp client_ip(conn) do
-    ip = conn.remote_ip
-
-    cond do
-      not is_tuple(ip) -> "req:#{System.unique_integer([:positive])}"
-      RemoteIp.proxy?(ip) -> "req:#{System.unique_integer([:positive])}"
-      true -> RemoteIp.to_string_ip(ip) || "req:#{System.unique_integer([:positive])}"
-    end
-  end
 
   defp unprocessable(conn, message, details \\ nil) do
     conn
