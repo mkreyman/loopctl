@@ -184,7 +184,10 @@ defmodule LoopctlWeb.ApiKeyController do
       agent_id: params["agent_id"]
     }
 
-    Auth.generate_api_key(attrs)
+    # Structural backstop (#462): even though `validate_not_superadmin/1` already
+    # returned 403 for role "superadmin" before we reach here, use the HTTP-scoped
+    # changeset so the context layer also refuses to mint a superadmin key.
+    Auth.generate_api_key(attrs, changeset: :http)
   end
 
   defp do_rotate_key(tenant, old_key, grace_hours) do

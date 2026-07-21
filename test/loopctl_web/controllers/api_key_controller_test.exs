@@ -35,6 +35,21 @@ defmodule LoopctlWeb.ApiKeyControllerTest do
       assert json_response(conn, 403)
     end
 
+    test "creates lower-role keys (agent/orchestrator/user) via the HTTP path", %{conn: _conn} do
+      for role <- ["agent", "orchestrator", "user"] do
+        tenant = fixture(:tenant)
+        {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+        conn =
+          build_conn()
+          |> auth_conn(raw_key)
+          |> post(~p"/api/v1/api_keys", %{"name" => "k-#{role}", "role" => role})
+
+        body = json_response(conn, 201)
+        assert body["api_key"]["role"] == role
+      end
+    end
+
     test "respects max_api_keys limit", %{conn: conn} do
       tenant = fixture(:tenant, %{settings: %{"max_api_keys" => 2}})
       {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})

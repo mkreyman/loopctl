@@ -20,6 +20,13 @@ defmodule Loopctl.Auth.ApiKey do
 
   @roles [:superadmin, :user, :orchestrator, :agent]
 
+  # Roles that may be minted through the public HTTP API-key create path.
+  # `:superadmin` is deliberately excluded: superadmin keys can only be
+  # provisioned out-of-band via the privileged `create_changeset/2` path
+  # (bootstrap/fixtures/dispatch). See #462 — defense-in-depth so a future
+  # internal caller that reaches the HTTP path can't mint a superadmin key.
+  @http_roles [:user, :orchestrator, :agent]
+
   schema "api_keys" do
     tenant_field()
     field :name, :string
@@ -36,17 +43,49 @@ defmodule Loopctl.Auth.ApiKey do
   end
 
   @doc """
-  Changeset for creating a new API key.
+  Changeset for creating a new API key (privileged / full-role path).
+
+  Accepts the FULL role set including `:superadmin`. This is the bootstrap /
+  fixture / dispatch provisioning path — the only path that may mint a
+  superadmin key. HTTP callers must use `http_create_changeset/2` instead,
+  which structurally excludes `:superadmin` (#462).
 
   The `key_hash` and `key_prefix` are set programmatically, not via cast.
   The `tenant_id` is also set programmatically.
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(api_key \\ %__MODULE__{}, attrs) do
+    base_create_changeset(api_key, attrs, @roles)
+  end
+
+  @doc """
+  Changeset for creating a new API key via the public HTTP API path.
+
+  Identical to `create_changeset/2` except the allowed roles are restricted
+  to `#{inspect(@http_roles)}` — `:superadmin` is structurally rejected with a
+  clear error (#462). This is a defense-in-depth backstop: the HTTP controller
+  already returns 403 for `role: "superadmin"`, and this changeset ensures any
+  caller that opts into the HTTP path cannot mint a superadmin key even if the
+  controller guard is bypassed.
+  """
+  @spec http_create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def http_create_changeset(api_key \\ %__MODULE__{}, attrs) do
+    base_create_changeset(api_key, attrs, @http_roles,
+      role_message: "superadmin keys cannot be created via the API"
+    )
+  end
+
+  defp base_create_changeset(api_key, attrs, allowed_roles, opts \\ []) do
+    inclusion_opts =
+      case Keyword.get(opts, :role_message) do
+        nil -> []
+        message -> [message: message]
+      end
+
     api_key
     |> cast(attrs, [:name, :role, :expires_at, :agent_id])
     |> validate_required([:name, :role])
-    |> validate_inclusion(:role, @roles)
+    |> validate_inclusion(:role, allowed_roles, inclusion_opts)
     |> validate_tenant_for_role()
     |> unique_constraint([:tenant_id, :agent_id],
       name: :api_keys_one_role_per_agent_idx,
@@ -81,6 +120,13 @@ defmodule Loopctl.Auth.ApiKey do
   """
   @spec roles() :: [atom()]
   def roles, do: @roles
+
+  @doc """
+  Returns the list of roles that may be created via the public HTTP API path
+  (the full role set minus `:superadmin`). See `http_create_changeset/2`.
+  """
+  @spec http_roles() :: [atom()]
+  def http_roles, do: @http_roles
 
   defp validate_tenant_for_role(changeset) do
     validate_change(changeset, :role, fn :role, role ->
