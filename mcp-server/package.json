@@ -30,7 +30,7 @@
   "license": "MIT",
   "exports": "./index.js",
   "engines": {
-    "node": ">=18"
+    "node": ">=20.6.0"
   },
   "files": [
     "index.js",

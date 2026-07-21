@@ -42,9 +42,18 @@ defmodule Loopctl.Auth do
 
   - `attrs` — must include `:name` and `:role`. For non-superadmin keys,
     `:tenant_id` must be set in the attrs (it is applied programmatically).
+
+  ## Options
+
+  - `:changeset` — which validation to apply (#462). `:full` (default) uses
+    `ApiKey.create_changeset/2` and accepts the full role set including
+    `:superadmin` — this is the privileged bootstrap/fixture/dispatch path.
+    `:http` uses `ApiKey.http_create_changeset/2`, which structurally rejects
+    `:superadmin`. The public HTTP controller passes `changeset: :http`.
   """
-  @spec generate_api_key(map()) :: {:ok, {String.t(), ApiKey.t()}} | {:error, Ecto.Changeset.t()}
-  def generate_api_key(attrs) do
+  @spec generate_api_key(map(), keyword()) ::
+          {:ok, {String.t(), ApiKey.t()}} | {:error, Ecto.Changeset.t()}
+  def generate_api_key(attrs, opts \\ []) do
     raw_key = generate_raw_key()
     key_hash = hash_key(raw_key)
     key_prefix = String.slice(raw_key, 0, 8)
@@ -56,7 +65,7 @@ defmodule Loopctl.Auth do
 
     changeset =
       base
-      |> ApiKey.create_changeset(attrs)
+      |> build_create_changeset(attrs, Keyword.get(opts, :changeset, :full))
       |> Ecto.Changeset.put_change(:key_hash, key_hash)
       |> Ecto.Changeset.put_change(:key_prefix, key_prefix)
 
@@ -72,6 +81,12 @@ defmodule Loopctl.Auth do
         {:error, changeset}
     end
   end
+
+  defp build_create_changeset(base, attrs, :http),
+    do: ApiKey.http_create_changeset(base, attrs)
+
+  defp build_create_changeset(base, attrs, _full),
+    do: ApiKey.create_changeset(base, attrs)
 
   @doc """
   Verifies a raw API key by hashing it and looking up the hash.
