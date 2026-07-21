@@ -519,7 +519,8 @@ clean one-time bootstrap (no cross-key collision).
 
 - Verify `LOOPCTL_SERVER` is set and reachable
 - Check that the server URL includes the protocol (`https://`)
-- If using a self-signed certificate, set `NODE_TLS_REJECT_UNAUTHORIZED=0` in your environment (not recommended for production)
+- If your loopctl server uses a custom or self-signed CA, set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` in your environment so Node trusts that CA while keeping TLS certificate verification enabled
+- Do NOT set `NODE_TLS_REJECT_UNAUTHORIZED=0` -- it disables certificate verification for the entire Node process (all outbound TLS), exposing every connection to MITM, not just the loopctl one
 
 ### Authentication errors (401)
 
