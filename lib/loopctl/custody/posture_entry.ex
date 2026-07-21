@@ -20,7 +20,19 @@ defmodule Loopctl.Custody.PostureEntry do
   `local_endpoints_only`, `occurred_at` — is immutable, enforced by a database
   trigger (`custody_posture_entries_immutable_trigger`). Only the flush
   bookkeeping (`state`, `batch_id`, `chain_entry_id`, `chain_position`,
-  `failure_reason`, `recorded_at`) may change.
+  `chain_entry_hash`, `failure_reason`, `recorded_at`) and the call `outcome` may
+  change — and `outcome` only MONOTONICALLY, from `in_flight` to a terminal
+  value, also enforced by that trigger.
+
+  ## Validation lives in the DATABASE, not in a changeset
+
+  There is deliberately no changeset here: the ONLY write path is the raw
+  parameterised INSERT in `Loopctl.Custody`, which allocates the sequence number
+  in the same statement sequence. A changeset nobody calls reads as enforced
+  validation that is not enforced. The invariants are CHECK constraints instead
+  (`state`, `outcome`, `subject_type`, `operation`, `operation_sequence >= 0`)
+  plus the `(tenant_id, subject_type, subject_id, operation_sequence)` unique
+  index, so they hold for every writer including a future one.
   """
 
   use Loopctl.Schema
@@ -41,15 +53,23 @@ defmodule Loopctl.Custody.PostureEntry do
     field :local_endpoints_only, :boolean, default: false
     field :occurred_at, :utc_datetime_usec
 
+    # The outcome of the provider call this entry describes. Recorded BEFORE the
+    # call (`in_flight`) so a call that egressed and then died still leaves a
+    # recorded operation naming the endpoint it went to.
+    field :outcome, :string, default: "in_flight"
+
     field :state, :string, default: "pending"
     field :batch_id, Ecto.UUID
     field :chain_entry_id, Ecto.UUID
     field :chain_position, :integer
+    field :chain_entry_hash, :binary
     field :failure_reason, :string
     field :recorded_at, :utc_datetime_usec
 
     timestamps()
   end
+
+  @outcomes ~w(in_flight succeeded failed)
 
   @doc "The valid outbox states."
   @spec states() :: [String.t()]
@@ -59,36 +79,7 @@ defmodule Loopctl.Custody.PostureEntry do
   @spec subject_types() :: [String.t()]
   def subject_types, do: @subject_types
 
-  @doc """
-  Changeset for a newly ASSIGNED entry. `tenant_id` is never cast — it is set on
-  the struct by the caller (CLAUDE.md multi-tenant rule 4).
-  """
-  @spec changeset(t(), map()) :: Ecto.Changeset.t()
-  def changeset(entry, attrs) do
-    entry
-    |> cast(attrs, [
-      :subject_type,
-      :subject_id,
-      :operation_sequence,
-      :operation,
-      :posture,
-      :local_endpoints_only,
-      :occurred_at,
-      :state
-    ])
-    |> validate_required([
-      :subject_type,
-      :subject_id,
-      :operation_sequence,
-      :operation,
-      :posture,
-      :occurred_at
-    ])
-    |> validate_inclusion(:subject_type, @subject_types)
-    |> validate_inclusion(:state, @states)
-    |> validate_number(:operation_sequence, greater_than_or_equal_to: 0)
-    |> unique_constraint([:tenant_id, :subject_type, :subject_id, :operation_sequence],
-      name: :custody_posture_entries_row_sequence_idx
-    )
-  end
+  @doc "The valid provider-call outcomes."
+  @spec outcomes() :: [String.t()]
+  def outcomes, do: @outcomes
 end

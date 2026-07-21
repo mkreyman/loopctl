@@ -16,6 +16,27 @@ defmodule LoopctlWeb.AuditSthController do
   to get the smallest STH covering that chain position.
   """
   def show(conn, %{"tenant_id" => tenant_id} = params) do
+    case cast_tenant_id(tenant_id) do
+      {:ok, tenant_id} -> render_sth(conn, tenant_id, params)
+      :error -> bad_tenant_id(conn)
+    end
+  end
+
+  # `tenant_id` is a raw path segment on a PUBLIC, unauthenticated route, compared
+  # against a `:binary_id` column — a non-UUID segment raised `Ecto.Query.CastError`
+  # and 500'd. Both actions parse and range-guard `position` carefully; the tenant
+  # segment was not guarded at all.
+  defp cast_tenant_id(tenant_id), do: Ecto.UUID.cast(tenant_id)
+
+  defp bad_tenant_id(conn) do
+    conn
+    |> put_status(:bad_request)
+    |> json(%{
+      error: %{message: "tenant_id must be a UUID", code: "invalid_tenant_id", status: 400}
+    })
+  end
+
+  defp render_sth(conn, tenant_id, params) do
     sth =
       case Map.get(params, "at") do
         nil ->
@@ -62,6 +83,13 @@ defmodule LoopctlWeb.AuditSthController do
   key from `GET /api/v1/tenants/:id/audit_public_key`.
   """
   def inclusion(conn, %{"tenant_id" => tenant_id, "position" => position_str}) do
+    case cast_tenant_id(tenant_id) do
+      {:ok, tenant_id} -> render_inclusion(conn, tenant_id, position_str)
+      :error -> bad_tenant_id(conn)
+    end
+  end
+
+  defp render_inclusion(conn, tenant_id, position_str) do
     parsed =
       case Integer.parse(position_str) do
         {position, ""} -> position

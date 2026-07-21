@@ -70,7 +70,15 @@ defmodule Loopctl.Workers.CustodyPostureAppendWorker do
       {:error, reason} when attempt >= max ->
         # Last attempt: record the drop so a missing claim can never read as a
         # satisfied one (AC-41.7.7).
-        Custody.mark_batch_failed(tenant_id, batch_id, inspect(reason))
+        #
+        # A STABLE CODE plus a correlation id — never `inspect(reason)`. The raw
+        # term is typically a %Postgrex.Error{} (whose inspect renders the postgres
+        # message/detail/hint/constraint, and for some classes the offending
+        # statement) or an %Ecto.Changeset{} carrying rejected values, and this
+        # string is served verbatim to :agent-role callers via GET
+        # /custody/failures and via an incomplete claim's `failure_reason`. The raw
+        # term stays in the Logger.error below.
+        Custody.mark_batch_failed(tenant_id, batch_id, Custody.failure_reason(reason, id))
 
         Logger.error(
           "CustodyPostureAppendWorker: tenant=#{tenant_id} batch=#{batch_id} chain append " <>

@@ -107,11 +107,26 @@ defmodule LoopctlWeb.Router do
     get "/tenants/:id/audit_public_key", TenantAuditKeyController, :show
     get "/articles/system", SystemArticleController, :index
     get "/audit/sth/:tenant_id", AuditSthController, :show
-    # US-41.7 (AC-41.7.4) — merkle inclusion proof against the SAME signed tree
-    # head published above. Public for the same reason the STH is: it carries
-    # hashes and the already-published STH, never a chain entry's payload.
-    get "/audit/sth/:tenant_id/inclusion/:position", AuditSthController, :inclusion
     post "/signup", SignupController, :create
+  end
+
+  # US-41.7 (AC-41.7.4) — merkle inclusion proof against the SAME signed tree head
+  # published above. Public for the same reason the STH is: it carries hashes and
+  # the already-published STH, never a chain entry's payload.
+  #
+  # It gets its OWN pipeline because, unlike every other public route (all single
+  # indexed lookups), producing a proof reads every entry hash up to the STH and
+  # folds the whole merkle tree — O(chain length) rows, memory and SHA-256 per
+  # anonymous request. The `:api` pipeline carries no limiter (AuthPathThrottle and
+  # RateLimiter live only in `:authenticated`), so the gate is attached here.
+  pipeline :public_proof do
+    plug LoopctlWeb.Plugs.PublicProofThrottle
+  end
+
+  scope "/api/v1", LoopctlWeb do
+    pipe_through [:api, :public_proof]
+
+    get "/audit/sth/:tenant_id/inclusion/:position", AuditSthController, :inclusion
   end
 
   scope "/swaggerui" do

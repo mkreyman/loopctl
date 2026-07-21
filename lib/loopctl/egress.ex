@@ -1105,14 +1105,37 @@ defmodule Loopctl.Egress do
   enforced decision cannot drift. Re-deriving any of them here would be the
   "second, divergent URL policy" AC-41.4.9 calls a review failure.
 
+  `kinds` narrows the recorded endpoints to the ones THIS operation actually
+  resolves (AC-41.7.3: "the ACTUAL resolved values used for that operation").
+  Recording both endpoints for every operation would state a falsehood in the
+  immutable payload — an `:embed` entry naming the chat endpoint it never called,
+  and `endpoints_involved` listing endpoints for which no call was made.
+
+  ## Two DISTINCT locality aggregates
+
+  `local_endpoints_only` is true for `:network_local` OR `:tenant_declared`
+  endpoints; `network_local_endpoints_only` is true only for `:network_local`. A
+  tenant-declared endpoint is a PUBLIC address the tenant merely ATTESTED is its
+  own — an unverified attestation, not network locality — so the claim reader
+  must be able to tell the two apart before printing "no third-party call". Both
+  are recorded because both are facts about the same moment.
+
   This is a POINT-IN-TIME capture: the caller persists it immutably, and a later
   settings change must not alter what it says (AC-41.7.3).
+
+  `encrypt_body` is DELIBERATELY ABSENT. It ships in US-41.6; recording a
+  hardcoded `false` here would bake an asserted (rather than derived) value into
+  an immutable, chain-signed, ed25519-attested row — a permanently signed false
+  assertion the day the real setting lands. Every other key in this map is
+  derived from the same function the guard enforces with; this one is omitted
+  until it can be.
   """
-  @spec operation_posture(Scope.t()) :: map()
-  def operation_posture(%Scope{} = scope) do
+  @spec operation_posture(Scope.t(), [atom()] | :all) :: map()
+  def operation_posture(%Scope{} = scope, kinds \\ :all) do
     endpoints =
       scope
       |> resolved_endpoints()
+      |> Enum.filter(fn {kind, _url} -> kinds == :all or kind in kinds end)
       |> Enum.map(fn {kind, url} ->
         {verdict, from_allowlist} = classify_endpoint(scope, url, :inference)
 
@@ -1121,21 +1144,34 @@ defmodule Loopctl.Egress do
           endpoint: url,
           host: URI.parse(url).host || url,
           verdict: verdict_label(verdict),
+          # The raw verdict atom alongside the human label, so the claim reader
+          # branches on a stable code rather than on prose that may be reworded.
+          verdict_code: to_string(verdict),
           local: local_verdict?(verdict),
+          network_local: verdict == :network_local,
           verdict_from_deployment_allowlist: from_allowlist
         }
       end)
 
+    # An operation that resolves NO endpoint (`kinds: []` — a content write makes
+    # no provider call) is VACUOUSLY local: nothing was called, so nothing non-local
+    # was called. But an operation that SHOULD have resolved endpoints and produced
+    # none is a resolution FAULT, and must not read as local — hence the explicit
+    # arity check rather than a bare `Enum.all?/2` over an empty list.
+    resolved_all? = kinds == :all or length(endpoints) == length(kinds)
+
     %{
       scope: Scope.key(scope),
       local_only: effective_local_only?(scope),
-      # `encrypt_body` ships in US-41.6 (which depends on this story); recorded
-      # here from the start so the claim's shape does not change later.
-      encrypt_body: false,
       endpoints: endpoints,
-      local_endpoints_only: endpoints != [] and Enum.all?(endpoints, & &1.local)
+      endpoint_kinds_expected: expected_kind_labels(kinds),
+      local_endpoints_only: resolved_all? and Enum.all?(endpoints, & &1.local),
+      network_local_endpoints_only: resolved_all? and Enum.all?(endpoints, & &1.network_local)
     }
   end
+
+  defp expected_kind_labels(:all), do: :all
+  defp expected_kind_labels(kinds), do: Enum.map(kinds, &to_string/1)
 
   # A CLEAR deletes the marking row, and a tenant that never enabled local_only has
   # none at all — so mapping over `list_markings/1` alone would report `scopes: []`

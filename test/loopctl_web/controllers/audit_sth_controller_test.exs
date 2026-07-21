@@ -76,5 +76,26 @@ defmodule LoopctlWeb.AuditSthControllerTest do
              |> get(~p"/api/v1/audit/sth/#{tenant.id}?#{[at: "notanumber"]}")
              |> json_response(404)
     end
+
+    # `position` was carefully Integer.parse'd and range-guarded while `tenant_id`
+    # went straight into a `:binary_id` comparison — a non-UUID segment raised
+    # Ecto.Query.CastError and 500'd on a PUBLIC, unauthenticated route.
+    test "a non-UUID tenant_id is a 400, never a 500", %{conn: conn} do
+      body =
+        conn
+        |> get(~p"/api/v1/audit/sth/not-a-uuid")
+        |> json_response(400)
+
+      assert body["error"]["code"] == "invalid_tenant_id"
+    end
+
+    test "a non-UUID tenant_id on the inclusion-proof route is a 400 too", %{conn: conn} do
+      body =
+        conn
+        |> get(~p"/api/v1/audit/sth/not-a-uuid/inclusion/0")
+        |> json_response(400)
+
+      assert body["error"]["code"] == "invalid_tenant_id"
+    end
   end
 end

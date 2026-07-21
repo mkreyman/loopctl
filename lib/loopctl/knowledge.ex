@@ -367,11 +367,16 @@ defmodule Loopctl.Knowledge do
         # transaction. Cheap (one INSERT on the transaction's own connection) — the
         # chain append is batched out to Oban, never a per-article AdminRepo
         # round-trip (AC-41.7.7). A no-op unless the scope is marked `local_only`.
-        |> maybe_assign_custody_sequence(tenant_id)
+        |> maybe_assign_custody_sequence(tenant_id, opts)
 
       case AdminRepo.transaction(multi) do
-        {:ok, %{article: article}} ->
-          Custody.enqueue_flush(tenant_id)
+        {:ok, %{article: article} = changes} ->
+          # Only enqueue the flush when a sequence was ACTUALLY assigned. The
+          # predominantly non-local_only tenant base assigns nothing, and adding an
+          # unconditional Oban insert (plus a periodic no-op AdminRepo flush) to
+          # every article create is exactly the hot-path cost AC-41.7.7 makes a
+          # design constraint rather than an assertion.
+          maybe_enqueue_custody_flush(tenant_id, changes)
           {:ok, article}
 
         {:error, :article, changeset, _} ->
@@ -485,6 +490,14 @@ defmodule Loopctl.Knowledge do
   end
 
   defp create_proposal(tenant_id, attrs, assessment, opts, verdict) do
+    # US-41.7: carry the gate's OWN egress fact into the create's custody entry.
+    # The novelty gate embedded this proposal's title+body SYNCHRONOUSLY, before
+    # the row existed; a `:low_novelty` proposal is then created as a DRAFT, which
+    # never enqueues an embedding worker — so without this the create entry would
+    # be the row's ONLY entry and would vacuously read `all_network_local` for a
+    # body that had already left the process.
+    opts = Keyword.put(opts, :gate_embedded, Map.get(assessment, :gate_embedded, false))
+
     case create_article(tenant_id, attrs, opts) do
       {:ok, article} ->
         {:ok, %{verdict: verdict, article: article, created: true, assessment: assessment}}
@@ -4342,11 +4355,26 @@ defmodule Loopctl.Knowledge do
   end
 
   defp do_merge(tenant_id, r, a, b) do
-    case merge_synthesizer().synthesize(
-           merge_egress_scope(tenant_id, a, b),
-           %{title: a.title, body: a.body},
-           %{title: b.title, body: b.body}
-         ) do
+    scope = merge_egress_scope(tenant_id, a, b)
+
+    # US-41.7 (AC-41.7.1): BOTH articles' full bodies are POSTed to the tenant's
+    # chat endpoint, so the merge is a content-touching operation on BOTH rows and
+    # each gets its own posture entry. Recorded BEFORE the call so a synthesis that
+    # egressed and then failed is still a recorded operation naming the endpoint it
+    # went to (AC-41.7.2), with the outcome patched on afterwards.
+    recorded = Enum.map([a, b], &Custody.record(scope, "article", &1.id, :merge))
+
+    result =
+      merge_synthesizer().synthesize(
+        scope,
+        %{title: a.title, body: a.body},
+        %{title: b.title, body: b.body}
+      )
+
+    outcome = if match?({:ok, _}, result), do: :succeeded, else: :failed
+    Enum.each(recorded, &Custody.record_outcome(&1, outcome))
+
+    case result do
       {:ok, %{title: title, body: body}} ->
         create_merged_draft(tenant_id, r, a, title, body)
 
@@ -5892,6 +5920,23 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_visibility(vis)
     |> AdminRepo.all()
     |> MapSet.new()
+  end
+
+  @doc """
+  Whether `article_id` exists in `tenant_id` AND is visible to the caller (#163).
+
+  Fails CLOSED: an article that does not exist (or is not visible to `vis`)
+  returns `false`. Used by the US-41.7 custody-claim surface, which discloses a
+  row's existence, operation timeline, occurred-at timestamps, endpoints and
+  per-operation postures — not content, but #163's invariant is that visibility is
+  ENFORCED, not advisory, so an agent must not read the custody timeline of
+  another agent's private article any more than it reads the article.
+  """
+  @spec article_visible?(Ecto.UUID.t(), Ecto.UUID.t(), String.t() | nil) :: boolean()
+  def article_visible?(tenant_id, article_id, vis) do
+    tenant_id
+    |> visible_article_ids([article_id], vis)
+    |> MapSet.member?(article_id)
   end
 
   defp maybe_filter_by_visibility(query, nil), do: query
@@ -8283,20 +8328,41 @@ defmodule Loopctl.Knowledge do
 
   # US-41.7 — the ONE place an article's operation-0 custody sequence is assigned.
   # System-scoped articles (nil tenant) have no tenant to bind a claim to.
-  defp maybe_assign_custody_sequence(multi, nil), do: multi
+  #
+  # Routed through `Custody.assign_in_multi/6` (rather than a local copy of it) so
+  # the "never fail the content write over a posture-recording fault" swallow —
+  # and the savepoint that makes it possible — has exactly ONE implementation.
+  defp maybe_assign_custody_sequence(multi, nil, _opts), do: multi
 
-  defp maybe_assign_custody_sequence(multi, tenant_id) do
-    Multi.run(multi, :custody_posture, fn repo, %{article: article} ->
-      scope = EgressScope.new(tenant_id, article.project_id)
+  defp maybe_assign_custody_sequence(multi, tenant_id, opts) do
+    # `:create` resolves NO endpoint by itself — UNLESS the novelty gate ran, in
+    # which case this very request already POSTed the proposal's title+body to the
+    # resolved embedding endpoint (`Loopctl.Knowledge.ProposalGate`), before the row
+    # existed and therefore before any entry could be hung on it. `gate_embedded`
+    # comes from the assessment, so a proposal that REUSED a caller-supplied vector
+    # (no provider call) still records `[]`.
+    custody_opts =
+      if Keyword.get(opts, :gate_embedded, false),
+        do: [endpoint_kinds: [:embedding]],
+        else: []
 
-      case Custody.assign(repo, scope, "article", article.id, :create) do
-        {:ok, result} -> {:ok, result}
-        # Never fail the content write over a posture-recording fault: the missing
-        # entry surfaces as a GAP (claim -> incomplete), never as a satisfied claim.
-        {:error, reason} -> {:ok, {:error, reason}}
-      end
-    end)
+    # The scope follows the ARTICLE's project, which is only known once the insert
+    # has run — hence a scope FUNCTION over the Multi changes, not a static scope.
+    Custody.assign_in_multi(
+      multi,
+      :custody_posture,
+      &EgressScope.new(tenant_id, &1.article.project_id),
+      "article",
+      & &1.article.id,
+      :create,
+      custody_opts
+    )
   end
+
+  defp maybe_enqueue_custody_flush(tenant_id, %{custody_posture: %Custody.PostureEntry{}}),
+    do: Custody.enqueue_flush(tenant_id)
+
+  defp maybe_enqueue_custody_flush(_tenant_id, _changes), do: :ok
 
   defp maybe_enqueue_embedding(multi, _tenant_id, false), do: multi
 

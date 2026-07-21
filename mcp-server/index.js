@@ -5024,14 +5024,22 @@ const TOOLS = [
       "attestation: 'no_claim_recorded' (no operation sequence was ever assigned — the row " +
       "predates recording or its scope is not marked local_only; this asserts NOTHING in " +
       "either direction), 'claim_pending' (sequences assigned, batch append not yet " +
-      "flushed), and 'claim_recorded' which is itself 'complete' or 'incomplete'. An " +
-      "INCOMPLETE sequence (a gap, or a dropped append) is never reported as " +
-      "no-third-party-egress: an unrecorded operation may have called any endpoint. " +
+      "flushed), and 'claim_recorded', itself 'complete', 'partial_history' or " +
+      "'incomplete'. An INCOMPLETE sequence (a gap, a lost tail, or a dropped append) is " +
+      "never reported as no-third-party-egress: an unrecorded operation may have called " +
+      "any endpoint. Completeness is measured against a PERSISTED per-row high-water mark, " +
+      "not against the rows that happen to survive, so truncating the sequence cannot " +
+      "restore a satisfied claim. 'partial_history' means operation 0 is not this row's " +
+      "creation — recording began after the row already existed (typically the scope was " +
+      "marked local_only later), so loopctl has no record of how it was produced. " +
+      "third_party_egress_on_covered_paths is `false` ONLY when every recorded endpoint " +
+      "was NETWORK-LOCAL; when the sequence leans on a TENANT-DECLARED endpoint (a public " +
+      "host the tenant merely attested is its own, which loopctl never verified) the value " +
+      "is the string 'tenant_declared_unverified', not false. " +
       "SCOPE, precisely: the claim attests ONLY to the endpoints loopctl called for the " +
       "recorded operations on this row, on the egress paths enumerated in the `coverage` " +
       "field. It makes NO statement about what those endpoints did with the data " +
-      "afterwards, and none about a path listed as uncovered. A tenant-declared endpoint " +
-      "is an unverified attestation, not network-local. READ tool, AGENT role.",
+      "afterwards, and none about a path listed as uncovered. READ tool, AGENT role.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5049,9 +5057,12 @@ const TOOLS = [
     name: "custody_failures",
     description:
       "Custody posture entries whose audit-chain append was DROPPED after exhausting " +
-      "retries. A recording failure is surfaced here rather than silently absent, because " +
-      "a missing claim must never read as a satisfied one: every entry listed degrades its " +
-      "row's claim to 'incomplete'. READ tool, AGENT role.",
+      "retries, plus (under `stale_pending`) entries that have been in flight longer than " +
+      "the stale window. A recording failure is surfaced here rather than silently absent, " +
+      "because a missing claim must never read as a satisfied one: every entry under " +
+      "`data` degrades its row's claim to 'incomplete', and a stranded `stale_pending` " +
+      "entry is one a flush stamped and then died on — it would otherwise read as an " +
+      "in-flight claim indefinitely. READ tool, AGENT role.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {

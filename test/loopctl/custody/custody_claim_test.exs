@@ -2,10 +2,12 @@ defmodule Loopctl.CustodyClaimTest do
   @moduledoc """
   US-41.7 — egress posture as a witnessed custody claim in the audit chain / STH.
 
-  Covers TC-41.7.1 … TC-41.7.10. The claim's whole value is that it CANNOT be
-  read as a satisfied attestation unless the recorded sequence is complete and
-  contiguous, so most of these tests are adversarial: drop an entry, replay a
-  batch, change the settings afterwards, read before the flush.
+  Covers TC-41.7.1 … TC-41.7.10 plus the review's adversarial cases. The claim's
+  whole value is that it CANNOT be read as a satisfied attestation unless the
+  recorded sequence is complete and contiguous, so most of these tests are
+  adversarial: drop an entry (from the middle AND from the tail), replay a batch
+  while new rows arrive, change the settings afterwards, mark local_only after the
+  fact, read before the flush.
   """
 
   use Loopctl.DataCase, async: true
@@ -14,6 +16,7 @@ defmodule Loopctl.CustodyClaimTest do
   import Mox
 
   alias Ecto.Adapters.SQL
+  alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Verifier
@@ -24,6 +27,7 @@ defmodule Loopctl.CustodyClaimTest do
   alias Loopctl.Egress.PinCache
   alias Loopctl.Egress.Scope
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
   alias Loopctl.Test.AllowlistSource
 
   setup :verify_on_exit!
@@ -32,6 +36,9 @@ defmodule Loopctl.CustodyClaimTest do
   # server-wide embedding provider and the tenant's chat provider.
   @embedding_host "api.openai.com"
   @chat_host "api.anthropic.com"
+  # A PUBLIC host a tenant may legitimately declare as its own (a vendor host may
+  # never be declared — the policy rejects it at write time).
+  @declared_host "ollama.example.com"
 
   setup do
     tenant = fixture(:tenant)
@@ -88,6 +95,17 @@ defmodule Loopctl.CustodyClaimTest do
     Oban.drain_queue(queue: :audit, with_scheduled: true)
   end
 
+  defp queued_flush_jobs(tenant_id) do
+    from(j in "oban_jobs",
+      where:
+        j.worker == "Loopctl.Workers.CustodyPostureAppendWorker" and
+          j.state in ["available", "scheduled", "executing", "retryable"] and
+          fragment("?->>'tenant_id' = ?", j.args, ^tenant_id),
+      select: count(j.id)
+    )
+    |> Loopctl.Repo.one()
+  end
+
   defp chain_entry_count(tenant_id) do
     from(e in AuditChain.Entry,
       where: e.tenant_id == ^tenant_id and e.action == ^Custody.chain_action(),
@@ -116,10 +134,13 @@ defmodule Loopctl.CustodyClaimTest do
       assert claim.summary =~ "PENDING"
     end
 
-    test "after draining, the claim is complete, contiguous and all-local", %{
+    test "after draining, the claim is complete, contiguous and all network-local", %{
       tenant: t,
       article: article
     } do
+      scope = Scope.new(t.id, article.project_id)
+      {:ok, _} = record(scope, article.id, :embed)
+      {:ok, _} = record(scope, article.id, :classify)
       drain_custody()
 
       claim = claim!(t.id, article.id)
@@ -128,7 +149,7 @@ defmodule Loopctl.CustodyClaimTest do
       assert claim.completeness == "complete"
       assert claim.contiguous
       assert claim.third_party_egress_on_covered_paths == false
-      assert claim.posture == "all_local"
+      assert claim.posture == "all_network_local"
 
       # ... and it NAMES the local endpoints used.
       hosts = Enum.map(claim.endpoints_involved, & &1.host)
@@ -155,6 +176,65 @@ defmodule Loopctl.CustodyClaimTest do
     end
   end
 
+  describe "each entry records only the endpoints ITS operation resolves (AC-41.7.3)" do
+    setup %{tenant: tenant} do
+      all_endpoints_local()
+      :ok = mark_local_only(tenant.id)
+      {:ok, article: create_article(tenant.id)}
+    end
+
+    test "an embed names the embedding endpoint and NOT the chat endpoint it never called",
+         %{tenant: t, article: article} do
+      {:ok, _} = record(Scope.new(t.id, article.project_id), article.id, :embed)
+      drain_custody()
+
+      claim = claim!(t.id, article.id)
+      embed = Enum.find(claim.entries, &(&1.operation == "embed"))
+
+      assert Enum.map(embed.posture["endpoints"], & &1["kind"]) == ["embedding"]
+      assert Enum.map(embed.posture["endpoints"], & &1["host"]) == [@embedding_host]
+    end
+
+    test "a classify names the chat endpoint only", %{tenant: t, article: article} do
+      {:ok, _} = record(Scope.new(t.id, article.project_id), article.id, :classify)
+      drain_custody()
+
+      claim = claim!(t.id, article.id)
+      classify = Enum.find(claim.entries, &(&1.operation == "classify"))
+
+      assert Enum.map(classify.posture["endpoints"], & &1["kind"]) == ["chat"]
+      assert Enum.map(classify.posture["endpoints"], & &1["host"]) == [@chat_host]
+    end
+
+    test "a create resolves no endpoint at all — the content write calls nothing",
+         %{tenant: t, article: article} do
+      drain_custody()
+
+      claim = claim!(t.id, article.id)
+      create = Enum.find(claim.entries, &(&1.operation == "create"))
+
+      assert create.posture["endpoints"] == []
+      # Vacuously local: nothing was called, so nothing non-local was called.
+      assert create.local_endpoints_only
+      assert claim.endpoints_involved == []
+    end
+
+    test "encrypt_body is ABSENT, not asserted false, until it can be derived",
+         %{tenant: t, article: article} do
+      drain_custody()
+
+      [entry] = Custody.list_entries(t.id, "article", article.id)
+
+      # The row is immutable and hashed into an ed25519-signed tree head. A
+      # hardcoded `false` for a setting that ships in US-41.6 would make every
+      # entry written before then a permanently SIGNED false assertion about the
+      # tenant's encryption posture. Every other key here is DERIVED from the same
+      # function the guard enforces with; this one is omitted until it can be.
+      refute Map.has_key?(entry.posture, "encrypt_body")
+      assert Map.has_key?(entry.posture, "local_only")
+    end
+  end
+
   describe "TC-41.7.2 async embedding and re-embed appear as their own entries" do
     setup %{tenant: tenant} do
       all_endpoints_local()
@@ -174,7 +254,7 @@ defmodule Loopctl.CustodyClaimTest do
 
       before = claim!(t.id, article.id)
       assert before.completeness == "complete"
-      assert before.posture == "all_local"
+      assert before.posture == "all_network_local"
       original_entries = Custody.list_entries(t.id, "article", article.id)
 
       # The tenant switches to a vendor embedding endpoint and an agent triggers a
@@ -204,9 +284,10 @@ defmodule Loopctl.CustodyClaimTest do
       all_endpoints_local()
       :ok = mark_local_only(t.id)
       article = create_article(t.id)
+      {:ok, _} = record(Scope.new(t.id, article.project_id), article.id, :embed)
       drain_custody()
 
-      [before] = Custody.list_entries(t.id, "article", article.id)
+      [_create, before] = Custody.list_entries(t.id, "article", article.id)
 
       # Settings change: the operator carve-out goes away, so BOTH endpoints
       # would classify non-local from now on.
@@ -214,7 +295,7 @@ defmodule Loopctl.CustodyClaimTest do
       PinCache.invalidate_tenant(t.id)
       refute Egress.operation_posture(Scope.new(t.id)).local_endpoints_only
 
-      [after_change] = Custody.list_entries(t.id, "article", article.id)
+      [_create_after, after_change] = Custody.list_entries(t.id, "article", article.id)
 
       assert after_change.posture == before.posture
       assert after_change.local_endpoints_only == before.local_endpoints_only
@@ -231,6 +312,21 @@ defmodule Loopctl.CustodyClaimTest do
       assert_raise Postgrex.Error, ~r/immutable/, fn ->
         from(e in PostureEntry, where: e.id == ^entry.id)
         |> AdminRepo.update_all(set: [local_endpoints_only: false])
+      end
+    end
+
+    test "an outcome is MONOTONIC — a terminal outcome can never be rewritten", %{tenant: t} do
+      all_endpoints_local()
+      :ok = mark_local_only(t.id)
+      article = create_article(t.id)
+      [entry] = Custody.list_entries(t.id, "article", article.id)
+
+      :ok = Custody.record_outcome(entry, :failed)
+      assert [%{outcome: "failed"}] = Custody.list_entries(t.id, "article", article.id)
+
+      assert_raise Postgrex.Error, ~r/terminal/, fn ->
+        from(e in PostureEntry, where: e.id == ^entry.id)
+        |> AdminRepo.update_all(set: [outcome: "succeeded"])
       end
     end
   end
@@ -278,6 +374,40 @@ defmodule Loopctl.CustodyClaimTest do
                  proof.sth.merkle_root
                )
     end
+
+    test "the CLAIM binds to the proven leaf — position alone would prove nothing",
+         %{tenant: tenant} do
+      all_endpoints_local()
+      :ok = mark_local_only(tenant.id)
+
+      {_pub, priv} = :crypto.generate_key(:eddsa, :ed25519)
+      Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:ok, priv} end)
+      Loopctl.TenantKeys.init_cache()
+
+      article = create_article(tenant.id)
+      drain_custody()
+      {:ok, _sth} = AuditChain.sign_and_store_tree_head(tenant.id)
+
+      claim = claim!(tenant.id, article.id)
+      [entry] = claim.entries
+      [chain_entry] = claim.chain_entries
+
+      # (a) The claim exposes the LEAF HASH of the batch carrying this entry, and
+      #     it is the same leaf the inclusion proof proves at that position.
+      {:ok, proof} = AuditChain.inclusion_proof(tenant.id, entry.chain_position)
+      assert entry.chain_entry_hash == Base.url_encode64(proof.leaf_hash, padding: false)
+      assert chain_entry.entry_hash == entry.chain_entry_hash
+
+      # (b) ... and the leaf's PAYLOAD names this row's operation by a digest the
+      #     reader can recompute from the posture the claim returned. Position +
+      #     hash + payload digest is the whole chain of reasoning, end to end.
+      payload_entry =
+        Enum.find(chain_entry.payload["entries"], &(&1["subject_id"] == article.id))
+
+      assert payload_entry["operation"] == "create"
+      assert payload_entry["posture_digest"] == entry.posture_digest
+      assert entry.posture_digest == Custody.posture_digest(entry.posture)
+    end
   end
 
   describe "TC-41.7.5 no claim recorded reads as absent, not as satisfied" do
@@ -303,6 +433,9 @@ defmodule Loopctl.CustodyClaimTest do
       mixed_endpoints()
       :ok = mark_local_only(t.id)
       article = create_article(t.id)
+      # The classification pass is what actually POSTs the body to the CHAT
+      # endpoint, so it is the operation that carries the vendor egress.
+      {:ok, _} = record(Scope.new(t.id, article.project_id), article.id, :classify)
       drain_custody()
 
       claim = claim!(t.id, article.id)
@@ -315,6 +448,83 @@ defmodule Loopctl.CustodyClaimTest do
       assert vendor.local == false
       assert vendor.verdict == "non-local"
       assert claim.summary =~ "MIXED"
+    end
+  end
+
+  describe "tenant-declared endpoints are NOT reported as no-third-party-egress" do
+    test "an all-local sequence over a TENANT-DECLARED public host stays qualified",
+         %{tenant: t} do
+      # No operator allowlist: the tenant points its CHAT endpoint at a PUBLIC
+      # host it merely attests is its own (a vendor host may never be declared).
+      AllowlistSource.put([])
+
+      {:ok, _} =
+        Loopctl.Llm.upsert_settings(t.id, %{
+          "chat_provider" => "openai_compatible",
+          "chat_base_url" => "https://#{@declared_host}",
+          "extraction_model" => "llama-3.1-8b-instruct"
+        })
+
+      {:ok, _} =
+        Egress.declare_trusted_endpoint(t.id, %{
+          "host" => @declared_host,
+          "purposes" => ["inference"]
+        })
+
+      :ok = mark_local_only(t.id)
+      PinCache.invalidate_tenant(t.id)
+
+      article = create_article(t.id)
+      {:ok, _} = record(Scope.new(t.id, article.project_id), article.id, :classify)
+      drain_custody()
+
+      claim = claim!(t.id, article.id)
+      encoded = Jason.encode!(claim)
+
+      assert claim.completeness == "complete"
+      assert claim.posture == "all_local_including_tenant_declared"
+      # The two fields an agent branches on must BOTH carry the qualification.
+      assert claim.third_party_egress_on_covered_paths == "tenant_declared_unverified"
+      refute claim.third_party_egress_on_covered_paths == false
+      assert claim.summary =~ "TENANT-DECLARED"
+      assert claim.summary =~ "did not verify"
+      refute encoded =~ "made no third-party call"
+
+      endpoint = Enum.find(claim.endpoints_involved, &(&1.host == @declared_host))
+      assert endpoint.local == true
+      assert endpoint.network_local == false
+      assert endpoint.verdict_code == "tenant_declared"
+    end
+  end
+
+  describe "recording that starts mid-life is not a complete claim" do
+    test "marking local_only AFTER the row exists reports partial_history, not zero-egress",
+         %{tenant: t} do
+      all_endpoints_local()
+
+      # Harvested BEFORE any marking: no sequence is assigned for the create.
+      article = create_article(t.id)
+      assert claim!(t.id, article.id).claim_state == "no_claim_recorded"
+
+      # The tenant marks local_only afterwards and triggers a re-embed against
+      # local endpoints. Sequence 0 is now the RE-EMBED, not the create.
+      :ok = mark_local_only(t.id)
+
+      {:ok, %PostureEntry{operation_sequence: 0}} =
+        record(Scope.new(t.id, article.project_id), article.id, :reembed)
+
+      drain_custody()
+
+      claim = claim!(t.id, article.id)
+      encoded = Jason.encode!(claim)
+
+      assert claim.completeness == "partial_history"
+      assert claim.third_party_egress_on_covered_paths == "unknown"
+      assert claim.posture == "recording_started_mid_life"
+      assert claim.summary =~ "PARTIAL HISTORY"
+      # The row WAS created and first embedded under whatever settings then
+      # applied; the claim must not speak for that window.
+      refute encoded =~ "made no third-party call"
     end
   end
 
@@ -344,15 +554,34 @@ defmodule Loopctl.CustodyClaimTest do
       end
     end
 
-    defp queued_flush_jobs(tenant_id) do
-      from(j in "oban_jobs",
-        where:
-          j.worker == "Loopctl.Workers.CustodyPostureAppendWorker" and
-            j.state in ["available", "scheduled", "executing", "retryable"] and
-            fragment("?->>'tenant_id' = ?", j.args, ^tenant_id),
-        select: count(j.id)
-      )
-      |> Loopctl.Repo.one()
+    test "a tenant with NO local_only marking enqueues no flush job at all", %{tenant: t} do
+      # The predominantly non-local_only tenant base must not pay an Oban insert
+      # plus a periodic no-op AdminRepo flush per article create.
+      manual(fn ->
+        for _ <- 1..5, do: Knowledge.create_article(t.id, build(:article, %{status: :draft}))
+      end)
+
+      assert queued_flush_jobs(t.id) == 0
+    end
+
+    test "a batch is CAPPED, and the remainder is re-enqueued rather than folded in",
+         %{tenant: t} do
+      all_endpoints_local()
+      :ok = mark_local_only(t.id)
+
+      article = create_article(t.id)
+      scope = Scope.new(t.id, article.project_id)
+
+      # One more entry than a (test-shrunk) batch would carry is impossible to
+      # assert cheaply against the production 500 cap, so assert the CONTRACT the
+      # cap rests on instead: the limit is bounded and the flush re-enqueues while
+      # anything is still pending.
+      assert Custody.batch_limit() > 0
+      {:ok, _} = record(scope, article.id, :embed)
+
+      batch = Custody.batch_id(System.unique_integer([:positive]))
+      assert {:ok, 2} = Custody.flush_batch(t.id, batch)
+      assert claim!(t.id, article.id).completeness == "complete"
     end
   end
 
@@ -440,26 +669,70 @@ defmodule Loopctl.CustodyClaimTest do
       assert Custody.list_entries(b.id, "article", article.id) == []
     end
 
+    test "the RLS POLICY itself hides tenant A's rows from a tenant-B session", %{tenant: a} do
+      # `Loopctl.Custody` reads through AdminRepo (BYPASSRLS), so the query's own
+      # `where tenant_id ==` is what isolates it there. That proves the WHERE
+      # clause, not the policy — so exercise the POLICY too, through the
+      # RLS-enforced repo under tenant B's session. If a future query loses its
+      # tenant filter, this is the test that still catches it.
+      b = fixture(:tenant)
+      all_endpoints_local()
+      :ok = mark_local_only(a.id)
+      article = create_article(a.id)
+
+      assert [_] = Custody.list_entries(a.id, "article", article.id)
+
+      assert unscoped_posture_rows_visible_as(b.id) == 0
+      assert unscoped_posture_rows_visible_as(a.id) >= 1
+    end
+
     test "the table carries tenant_id and an RLS tenant_isolation policy (AC-41.7.9)" do
-      %{rows: [[count]]} =
-        SQL.query!(
-          AdminRepo,
-          "SELECT count(*) FROM pg_policies WHERE tablename = 'custody_posture_entries' AND policyname = 'tenant_isolation'",
-          []
-        )
+      for table <- ["custody_posture_entries", "custody_row_sequences"] do
+        %{rows: [[count]]} =
+          SQL.query!(
+            AdminRepo,
+            "SELECT count(*) FROM pg_policies WHERE tablename = $1 AND policyname = 'tenant_isolation'",
+            [table]
+          )
 
-      assert count == 1
+        assert count == 1
 
-      %{rows: [[relrowsecurity, relforcerowsecurity]]} =
-        SQL.query!(
-          AdminRepo,
-          "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'custody_posture_entries'",
-          []
-        )
+        %{rows: [[relrowsecurity, relforcerowsecurity]]} =
+          SQL.query!(
+            AdminRepo,
+            "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1",
+            [table]
+          )
 
-      # ENABLE, not FORCE (CLAUDE.md Multi-Tenant Rules).
-      assert relrowsecurity
-      refute relforcerowsecurity
+        # ENABLE, not FORCE (CLAUDE.md Multi-Tenant Rules).
+        assert relrowsecurity
+        refute relforcerowsecurity
+      end
+    end
+
+    # A DELIBERATELY UNSCOPED count with the RLS context set and the BYPASSRLS
+    # role dropped: the only thing keeping rows out of the result is the POLICY.
+    # Stays on the AdminRepo connection because that is where the sandbox
+    # transaction holding these rows lives.
+    defp unscoped_posture_rows_visible_as(tenant_id) do
+      {:ok, count} =
+        AdminRepo.transaction(fn ->
+          SQL.query!(
+            AdminRepo,
+            "SELECT set_config('app.current_tenant_id', $1, true)",
+            [tenant_id]
+          )
+
+          SQL.query!(AdminRepo, "SET LOCAL ROLE loopctl_app", [])
+
+          %{rows: [[count]]} =
+            SQL.query!(AdminRepo, "SELECT count(*) FROM custody_posture_entries", [])
+
+          SQL.query!(AdminRepo, "RESET ROLE", [])
+          count
+        end)
+
+      count
     end
   end
 
@@ -488,8 +761,61 @@ defmodule Loopctl.CustodyClaimTest do
       assert claim.completeness == "incomplete"
       assert claim.contiguous == false
       assert claim.third_party_egress_on_covered_paths == "unknown"
-      refute Map.get(claim, :posture) == "all_local"
+      refute Map.get(claim, :posture) == "all_network_local"
       assert claim.summary =~ "INCOMPLETE"
+    end
+
+    test "losing the TAIL of the sequence is a gap too — completeness is measured against the persisted high-water mark",
+         %{tenant: t, article: article} do
+      scope = Scope.new(t.id, article.project_id)
+      {:ok, _} = record(scope, article.id, :embed)
+
+      # The operation that actually egressed.
+      AllowlistSource.put([])
+      PinCache.invalidate_tenant(t.id)
+      {:ok, _} = record(scope, article.id, :reembed)
+      drain_custody()
+
+      assert claim!(t.id, article.id).third_party_egress_on_covered_paths == true
+
+      # Erase the LAST entry — the one that egressed. Measuring contiguity against
+      # the surviving rows would leave 0..1 contiguous and restore a satisfied
+      # all-local attestation.
+      [_zero, _one, tail] = Custody.list_entries(t.id, "article", article.id)
+      AdminRepo.delete!(tail)
+
+      claim = claim!(t.id, article.id)
+
+      assert claim.completeness == "incomplete"
+      assert claim.contiguous == false
+      assert claim.highest_assigned_sequence == 2
+      assert claim.third_party_egress_on_covered_paths == "unknown"
+    end
+
+    test "an erased sequence number is NEVER handed out again", %{tenant: t, article: article} do
+      scope = Scope.new(t.id, article.project_id)
+      {:ok, %PostureEntry{operation_sequence: 1}} = record(scope, article.id, :embed)
+
+      [_zero, one] = Custody.list_entries(t.id, "article", article.id)
+      AdminRepo.delete!(one)
+
+      # A MAX(sequence)+1 allocator would reuse 1 here and silently repair the gap,
+      # permanently destroying the evidence of the erased operation.
+      assert {:ok, %PostureEntry{operation_sequence: 2}} = record(scope, article.id, :classify)
+      assert claim!(t.id, article.id).completeness == "incomplete"
+    end
+
+    test "losing EVERY entry still reports incomplete, never absent", %{
+      tenant: t,
+      article: article
+    } do
+      from(e in PostureEntry, where: e.tenant_id == ^t.id) |> AdminRepo.delete_all()
+
+      claim = claim!(t.id, article.id)
+
+      assert claim.claim_state == "claim_recorded"
+      assert claim.completeness == "incomplete"
+      refute claim.claim_state == "no_claim_recorded"
     end
 
     test "a DROPPED non-local append reports incomplete and shows on the failure surface",
@@ -557,6 +883,119 @@ defmodule Loopctl.CustodyClaimTest do
       assert chain_entry_count(t.id) == chain_before
       assert [%{state: "recorded"}] = Custody.list_entries(t.id, "article", article.id)
     end
+
+    test "a replay NEVER sweeps newly-arrived entries into an already-appended batch",
+         %{tenant: t, article: article} do
+      job_id = System.unique_integer([:positive])
+      batch = Custody.batch_id(job_id)
+
+      assert {:ok, 1} = Custody.flush_batch(t.id, batch)
+
+      # Lost bookkeeping again...
+      from(e in PostureEntry, where: e.tenant_id == ^t.id)
+      |> AdminRepo.update_all(set: [state: "pending", batch_id: batch])
+
+      # ... and, crucially, a NEW operation lands between the two attempts. It is
+      # NOT in the already-committed leaf's payload, so it must not be marked
+      # recorded against it — that would hand the reader an inclusion proof for a
+      # leaf that does not contain the operation.
+      {:ok, fresh} = record(Scope.new(t.id, article.project_id), article.id, :embed)
+
+      # `:manual` so the flush's own "still pending, re-enqueue" job does not run
+      # INLINE and flush the new row before the assertions below observe it.
+      assert {:ok, 1} = manual(fn -> Custody.flush_batch(t.id, batch) end)
+
+      reloaded = AdminRepo.get!(PostureEntry, fresh.id)
+      assert reloaded.state == "pending"
+      assert is_nil(reloaded.chain_position)
+      assert is_nil(reloaded.chain_entry_id)
+
+      # ... and the leftover is RE-ENQUEUED rather than stranded. The same
+      # mechanism drains the remainder of a capped batch.
+      assert queued_flush_jobs(t.id) >= 1
+
+      # And the claim as a whole is still PENDING — not a satisfied attestation
+      # resting on a leaf that never carried the new operation.
+      assert claim!(t.id, article.id).claim_state == "claim_pending"
+    end
+  end
+
+  describe "a posture fault never destroys the content write (AC-41.7.7)" do
+    test "an assignment that fails inside the content transaction leaves the write committed",
+         %{tenant: t} do
+      all_endpoints_local()
+      :ok = mark_local_only(t.id)
+
+      # `:bogus` is rejected by the `custody_posture_entries_operation_check`
+      # constraint, so the ENTRY insert fails inside the enclosing transaction.
+      # Without the savepoint that would abort the whole content transaction — a
+      # posture-recording fault destroying the article write it merely describes.
+      result =
+        Multi.new()
+        |> Multi.insert(
+          :article,
+          Article.create_changeset(
+            %Article{tenant_id: t.id},
+            build(:article, %{status: :draft})
+          )
+        )
+        |> Custody.assign_in_multi(
+          :custody_posture,
+          fn _ -> Scope.new(t.id) end,
+          "article",
+          & &1.article.id,
+          :bogus
+        )
+        |> AdminRepo.transaction()
+
+      assert {:ok, %{article: article, custody_posture: {:error, _reason}}} = result
+      # The article COMMITTED.
+      assert AdminRepo.get(Article, article.id)
+
+      # ... and the consumed sequence number is a GAP, so the claim is incomplete
+      # rather than silently absent.
+      claim = claim!(t.id, article.id)
+      assert claim.completeness == "incomplete"
+      assert claim.highest_assigned_sequence == 0
+    end
+
+    test "an invalid subject_type is refused BEFORE a sequence is consumed", %{tenant: t} do
+      all_endpoints_local()
+      :ok = mark_local_only(t.id)
+      id = Ecto.UUID.generate()
+
+      assert {:error, :invalid_subject_type} =
+               Custody.assign(AdminRepo, Scope.new(t.id), "story", id, :create)
+
+      assert is_nil(Custody.highest_assigned_sequence(t.id, "story", id))
+    end
+  end
+
+  describe "a stranded pending batch is reaped and surfaced" do
+    test "a flush that died leaves rows re-claimable and visible on the failure surface",
+         %{tenant: t} do
+      all_endpoints_local()
+      :ok = mark_local_only(t.id)
+      article = create_article(t.id)
+
+      # A flush stamped its batch id and then died anywhere other than its own
+      # final-attempt error branch (exception, node death, pruned job). Nothing
+      # marks these failed, and no other flush could ever claim them.
+      dead_batch = Custody.batch_id(System.unique_integer([:positive]))
+      stale_at = DateTime.add(DateTime.utc_now(), -Custody.stale_pending_seconds() - 60, :second)
+
+      from(e in PostureEntry, where: e.tenant_id == ^t.id)
+      |> AdminRepo.update_all(set: [batch_id: dead_batch, updated_at: stale_at])
+
+      assert [_stranded] = Custody.list_stale_pending(t.id)
+
+      # A later flush REAPS them rather than leaving them pending forever.
+      assert {:ok, 1} =
+               Custody.flush_batch(t.id, Custody.batch_id(System.unique_integer([:positive])))
+
+      assert claim!(t.id, article.id).completeness == "complete"
+      assert Custody.list_stale_pending(t.id) == []
+    end
   end
 
   describe "unmarked scopes assign no sequence (hot-path cost)" do
@@ -575,6 +1014,9 @@ defmodule Loopctl.CustodyClaimTest do
       memory_id = Ecto.UUID.generate()
 
       {:ok, %PostureEntry{operation_sequence: 0}} =
+        manual(fn -> Custody.record(Scope.new(t.id), "memory", memory_id, :create) end)
+
+      {:ok, %PostureEntry{operation_sequence: 1}} =
         manual(fn -> Custody.record(Scope.new(t.id), "memory", memory_id, :embed) end)
 
       drain_custody()

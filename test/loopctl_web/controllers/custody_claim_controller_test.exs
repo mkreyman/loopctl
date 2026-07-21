@@ -6,6 +6,7 @@ defmodule LoopctlWeb.CustodyClaimControllerTest do
 
   use LoopctlWeb.ConnCase, async: true
 
+  import Ecto.Query
   import Mox
 
   alias Loopctl.AdminRepo
@@ -15,6 +16,7 @@ defmodule LoopctlWeb.CustodyClaimControllerTest do
   alias Loopctl.Custody.PostureEntry
   alias Loopctl.Egress
   alias Loopctl.Egress.PinCache
+  alias Loopctl.Egress.Scope
   alias Loopctl.Knowledge
   alias Loopctl.Test.AllowlistSource
 
@@ -122,6 +124,101 @@ defmodule LoopctlWeb.CustodyClaimControllerTest do
       |> json_response(401)
     end
 
+    test "a malformed subject id is a 400, never a 500", %{conn: conn, agent_key: key} do
+      body =
+        conn
+        |> auth(key)
+        |> get(~p"/api/v1/custody/claims/article/not-a-uuid")
+        |> json_response(400)
+
+      assert body["error"]["code"] == "invalid_subject_id"
+    end
+
+    test "an agent cannot read ANOTHER agent's memory claim", %{conn: conn, tenant: t} do
+      AllowlistSource.put(["api.openai.com", "api.anthropic.com"])
+      {:ok, _} = Egress.enable_local_only(t.id, nil, acknowledge: true)
+      PinCache.invalidate_tenant(t.id)
+
+      owner = fixture(:agent, %{tenant_id: t.id})
+      other = fixture(:agent, %{tenant_id: t.id})
+
+      {owner_raw, _} =
+        fixture(:api_key, %{tenant_id: t.id, role: :agent, agent_id: owner.id})
+
+      {other_raw, _} =
+        fixture(:api_key, %{tenant_id: t.id, role: :agent, agent_id: other.id})
+
+      memory =
+        fixture(:memory, %{tenant_id: t.id, subject_id: to_string(owner.id)})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        {:ok, _} =
+          Custody.record(Scope.new(t.id), "memory", memory.id, :embed)
+      end)
+
+      Oban.drain_queue(queue: :audit, with_scheduled: true)
+
+      # The OWNER sees its own timeline.
+      owner_body =
+        conn
+        |> auth(owner_raw)
+        |> get(~p"/api/v1/custody/claims/memory/#{memory.id}")
+        |> json_response(200)
+
+      assert owner_body["data"]["entries"] != []
+
+      # Another agent in the SAME tenant gets the ordinary absent-claim payload —
+      # no existence, no timeline, no endpoints. Byte-identical to a row that has
+      # no claim, so it is not an existence oracle either.
+      other_body =
+        conn
+        |> auth(other_raw)
+        |> get(~p"/api/v1/custody/claims/memory/#{memory.id}")
+        |> json_response(200)
+
+      assert other_body["data"]["claim_state"] == "no_claim_recorded"
+      assert other_body["data"]["entries"] == []
+    end
+
+    test "GET /custody/failures is filtered to subjects the caller can see", %{
+      conn: conn,
+      tenant: t
+    } do
+      AllowlistSource.put(["api.openai.com", "api.anthropic.com"])
+      {:ok, _} = Egress.enable_local_only(t.id, nil, acknowledge: true)
+      PinCache.invalidate_tenant(t.id)
+
+      owner = fixture(:agent, %{tenant_id: t.id})
+      other = fixture(:agent, %{tenant_id: t.id})
+
+      {other_raw, _} =
+        fixture(:api_key, %{tenant_id: t.id, role: :agent, agent_id: other.id})
+
+      memory = fixture(:memory, %{tenant_id: t.id, subject_id: to_string(owner.id)})
+
+      {:ok, entry} =
+        Oban.Testing.with_testing_mode(:manual, fn ->
+          Custody.record(Scope.new(t.id), "memory", memory.id, :embed)
+        end)
+
+      batch_id = Ecto.UUID.generate()
+
+      {1, _} =
+        from(e in PostureEntry, where: e.id == ^entry.id)
+        |> AdminRepo.update_all(set: [batch_id: batch_id])
+
+      {1, _} = Custody.mark_batch_failed(t.id, batch_id, "chain_append_failed (correlation=1)")
+
+      body =
+        conn
+        |> auth(other_raw)
+        |> get(~p"/api/v1/custody/failures")
+        |> json_response(200)
+
+      assert body["data"] == []
+      assert body["meta"]["count"] == 0
+    end
+
     test "tenant B cannot read tenant A's claim (TC-41.7.9)", %{conn: conn, tenant: a} do
       article = local_article(a.id)
 
@@ -164,6 +261,100 @@ defmodule LoopctlWeb.CustodyClaimControllerTest do
 
       assert body["meta"]["count"] == 1
       assert hd(body["data"])["failure_reason"] =~ "exhausted retries"
+    end
+
+    test "a STRANDED pending batch is surfaced too — it would otherwise be invisible", %{
+      conn: conn,
+      tenant: t,
+      agent_key: key
+    } do
+      article = local_article(t.id)
+      [entry] = Custody.list_entries(t.id, "article", article.id)
+
+      import Ecto.Query
+
+      # A flush stamped its batch id and then died outside its own final-attempt
+      # error branch: nothing marks these failed, and no other flush could claim
+      # them. Without a stale surface the row reads as an in-flight claim forever.
+      stale_at = DateTime.add(DateTime.utc_now(), -Custody.stale_pending_seconds() - 60, :second)
+
+      from(e in PostureEntry, where: e.id == ^entry.id)
+      |> AdminRepo.update_all(
+        set: [state: "pending", batch_id: Custody.batch_id(31_337), updated_at: stale_at]
+      )
+
+      body =
+        conn
+        |> auth(key)
+        |> get(~p"/api/v1/custody/failures")
+        |> json_response(200)
+
+      assert body["meta"]["stale_pending_count"] == 1
+      assert body["meta"]["stale_pending_after_seconds"] == Custody.stale_pending_seconds()
+      assert hd(body["stale_pending"])["subject_id"] == article.id
+    end
+  end
+
+  describe "the claim binds END TO END to the proven leaf (AC-41.7.4)" do
+    test "everything needed to verify comes out of the API, not the database", %{
+      conn: conn,
+      tenant: tenant,
+      agent_key: key
+    } do
+      {_pub, priv} = :crypto.generate_key(:eddsa, :ed25519)
+      Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:ok, priv} end)
+      Loopctl.TenantKeys.init_cache()
+      {pub, _} = :crypto.generate_key(:eddsa, :ed25519, priv)
+
+      tenant =
+        tenant
+        |> Ecto.Changeset.change(audit_signing_public_key: pub)
+        |> AdminRepo.update!()
+
+      article = local_article(tenant.id)
+      {:ok, _sth} = AuditChain.sign_and_store_tree_head(tenant.id)
+
+      claim =
+        conn
+        |> auth(key)
+        |> get(~p"/api/v1/custody/claims/article/#{article.id}")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      entry = hd(claim["entries"])
+      chain_entry = hd(claim["chain_entries"])
+
+      proof =
+        conn
+        |> get(~p"/api/v1/audit/sth/#{tenant.id}/inclusion/#{entry["chain_position"]}")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      # 1. The leaf the proof proves IS the chain entry the claim names.
+      assert proof["leaf_hash"] == entry["chain_entry_hash"]
+      assert chain_entry["entry_hash"] == entry["chain_entry_hash"]
+
+      # 2. That leaf's payload names THIS row's operation, by a digest recomputable
+      #    from the posture the claim returned. Without this a reader could prove
+      #    only that SOME leaf sits at that position.
+      payload_entry =
+        Enum.find(chain_entry["payload"]["entries"], &(&1["subject_id"] == article.id))
+
+      assert payload_entry["operation"] == "create"
+      assert payload_entry["posture_digest"] == entry["posture_digest"]
+
+      # 3. And the leaf folds up to the signed root.
+      path =
+        Enum.map(proof["audit_path"], fn %{"position" => side, "hash" => hash} ->
+          %{position: String.to_existing_atom(side), hash: decode(hash)}
+        end)
+
+      assert {:ok, true} =
+               Verifier.verify_inclusion(
+                 decode(proof["leaf_hash"]),
+                 path,
+                 decode(proof["sth"]["merkle_root"])
+               )
     end
   end
 

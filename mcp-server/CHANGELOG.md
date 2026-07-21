@@ -22,8 +22,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
     count and the batch references), and `claim_recorded`, itself `complete` or
     `incomplete`.
   - Completeness is PROVEN: the recorded entries must form a contiguous sequence up
-    to the highest assigned number. A gap — a lost batch job, a dropped append — is
-    reported `incomplete`, NEVER as no-third-party-egress.
+    to a PERSISTED per-row high-water mark (not to the maximum of the rows that
+    happen to survive, which would let tail loss restore a satisfied claim). A gap —
+    a lost batch job, a dropped append, a deleted entry — is reported `incomplete`,
+    NEVER as no-third-party-egress. A fourth reading, `partial_history`, covers a row
+    whose recording began after it already existed.
+  - `third_party_egress_on_covered_paths` is `false` only when every recorded
+    endpoint was NETWORK-local. A tenant-declared endpoint is a public host the
+    tenant merely attested is its own, so an all-local sequence resting on one
+    reports `"tenant_declared_unverified"` instead.
   - Rides the EXISTING chain-of-custody machinery. Every recorded entry carries a
     `chain_position` in the tenant's hash-chained audit log, and the new public
     `GET /api/v1/audit/sth/{tenant_id}/inclusion/{position}` returns a merkle audit
@@ -34,7 +41,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
     endpoints loopctl called for THIS row; it says nothing about what those
     endpoints did with the data afterwards.
 - **`custody_failures`** — entries whose chain append was dropped after exhausting
-  retries, so a recording failure is legible rather than silently absent.
+  retries, plus `stale_pending` entries stranded by a flush that died outside its own
+  final-attempt branch, so a recording failure is legible rather than silently absent.
 
 ## 2.54.0 — 2026-07-20 (pluggable OpenAI-compatible chat endpoint — US-41.3)
 

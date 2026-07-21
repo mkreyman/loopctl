@@ -26,6 +26,7 @@ defmodule Loopctl.AuditChain do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain.Entry
+  alias Loopctl.AuditChain.ProofCache
   alias Loopctl.AuditChain.PubSub, as: ChainPubSub
   alias Loopctl.AuditChain.SignedTreeHead
   alias Loopctl.AuditChain.SthCheckpoint
@@ -620,16 +621,23 @@ defmodule Loopctl.AuditChain do
   def inclusion_proof(tenant_id, position) do
     with %Entry{} = entry <- entry_at(tenant_id, position),
          %SignedTreeHead{} = sth <- get_sth_at_position(tenant_id, position) do
-      hashes = load_all_hashes_paged(tenant_id, sth.chain_position)
+      # A proof is a pure function of (tenant, leaf position, STH) — all three
+      # immutable — so it is memoised. Deriving it costs O(chain length) rows,
+      # memory and SHA-256, and this function is now reachable from a PUBLIC,
+      # unauthenticated route; the memo bounds the repeated work and
+      # `LoopctlWeb.Plugs.PublicProofThrottle` bounds the request rate.
+      ProofCache.fetch({tenant_id, position, sth.chain_position}, fn ->
+        hashes = load_all_hashes_paged(tenant_id, sth.chain_position)
 
-      {:ok,
-       %{
-         leaf_index: position,
-         leaf_hash: entry.entry_hash,
-         tree_size: length(hashes),
-         audit_path: audit_path(hashes, position),
-         sth: sth
-       }}
+        {:ok,
+         %{
+           leaf_index: position,
+           leaf_hash: entry.entry_hash,
+           tree_size: length(hashes),
+           audit_path: audit_path(hashes, position),
+           sth: sth
+         }}
+      end)
     else
       nil -> inclusion_proof_error(tenant_id, position)
     end

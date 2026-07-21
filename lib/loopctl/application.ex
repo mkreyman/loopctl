@@ -147,6 +147,10 @@ defmodule Loopctl.Application do
       # a minute on the 3-connection AdminRepo pool the guard's own marking lookup
       # needs. After AdminRepo (it writes via AdminRepo at flush).
       Loopctl.Egress.BlockedBuffer,
+      # US-41.7 (AC-41.7.4): bounded memo for merkle inclusion proofs, so the
+      # PUBLIC, unauthenticated proof endpoint cannot be turned into an O(chain
+      # length) CPU amplifier by repeating the same request.
+      Loopctl.AuditChain.ProofCache,
       LoopctlWeb.Endpoint
     ]
 

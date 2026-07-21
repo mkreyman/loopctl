@@ -465,6 +465,15 @@ defmodule Loopctl.ObanConfig do
          # by `sth_sweep_cron/0` (env `STH_SWEEP_CRON`) so it's tunable/revertible per
          # environment without a deploy.
          {sth_sweep_cron(), Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}},
+         # US-41.7: backstop for custody posture entries committed but never
+         # scheduled. `Custody.enqueue_flush/1` runs AFTER the content transaction
+         # commits and never fails its caller, so a death (or an Oban insert
+         # failure) in that window strands a `pending` outbox row with nothing
+         # scheduled — and the in-flush stranded-row reaper only runs when some
+         # OTHER write for the same tenant enqueues a flush. Enqueues the ordinary
+         # per-tenant flush for tenants with entries pending past the stale window.
+         # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+         {"*/5 * * * *", Loopctl.Workers.CustodyPostureSweepWorker},
          {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker},
          {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker}
        ]},
