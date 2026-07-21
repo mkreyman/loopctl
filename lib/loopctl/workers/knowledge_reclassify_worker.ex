@@ -74,7 +74,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   @classifier Application.compile_env(
                 :loopctl,
                 :category_classifier,
-                Loopctl.Knowledge.ClaudeCategoryClassifier
+                Loopctl.Knowledge.ClassifierRouter
               )
 
   @default_batch_size 100
@@ -283,7 +283,21 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
       )
 
     # Thread the ONCE-resolved credentials into every classify call (review #19).
-    classify_opts = [api_key: resolved.api_key, model: resolved.model]
+    #
+    # `:provider` travels WITH them (US-41.3 review) and is not optional: the
+    # provider is re-decided PER ARTICLE inside the async stream by
+    # `Loopctl.Knowledge.ClassifierRouter`, a SECOND independent settings read. If
+    # the tenant flips provider mid-batch (or a cluster invalidation / TTL refresh
+    # lands between the two reads), a provider-blind credential would be handed to
+    # whichever sibling the router picked — the exact cross-provider leak AC-41.3.3
+    # forbids. The tag lets the router (and the Anthropic sibling) verify that these
+    # credentials belong to the provider now being dispatched to, and fall back to a
+    # per-call resolve when they do not.
+    classify_opts = [
+      api_key: resolved.api_key,
+      model: resolved.model,
+      provider: resolved.provider
+    ]
 
     batch
     |> Task.async_stream(
@@ -369,6 +383,10 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   # batch look like an outage and drove the forever-snooze loop AC-41.4.3 forbids.
   defp permanent_classify_error?({tag, _details}) when tag in [:egress_blocked], do: true
   defp permanent_classify_error?(:unparseable_classification), do: true
+
+  # US-41.3 (AC-41.3.4): a shape failure from the OpenAI-compatible sibling. The
+  # configured model cannot emit the required JSON verdict, so no retry can fix it.
+  defp permanent_classify_error?({:invalid_response_shape, _details}), do: true
 
   defp permanent_classify_error?({:api_error, status, _body})
        when is_integer(status) and status >= 400 and status < 500 and status != 408 and

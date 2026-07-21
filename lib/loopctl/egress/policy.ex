@@ -108,6 +108,9 @@ defmodule Loopctl.Egress.Policy do
     * `{:ok, :unpinned}` — the scope is not `local_only` AND the per-request pin
       could not be taken (unresolvable/denylisted host). The call proceeds exactly
       as before: a non-`local_only` scope must never acquire a NEW failure mode.
+      NEVER returned for a `tenant_supplied: true` url — that path fails CLOSED
+      instead of issuing an unpinned, redirect-following request to a host an
+      attacker influences.
     * `{:error, :egress_blocked, details}` — refused BEFORE any request is built.
       PERMANENT: a configuration state that will not change on its own.
     * `{:error, :pin_stale, details}` — the host's address set changed; the
@@ -117,22 +120,24 @@ defmodule Loopctl.Egress.Policy do
       could not be resolved (a DB/pool hiccup). Fail-closed for this call, but
       TRANSIENT: callers snooze, never cancel.
   """
-  @spec check(Scope.t(), String.t(), purpose()) ::
+  @spec check(Scope.t(), String.t(), purpose(), keyword()) ::
           {:ok, :unpinned}
           | {:ok, UrlGuard.pinned()}
           | {:error, :egress_blocked, details()}
           | {:error, :pin_stale, details()}
           | {:error, :egress_unavailable, details()}
-  def check(%Scope{} = scope, url, purpose) when is_binary(url) do
+  def check(%Scope{} = scope, url, purpose, opts \\ []) when is_binary(url) do
     # The MARKING selects the regime, so it is resolved OUTSIDE the fail-closed
     # classifier rescue: an infrastructure hiccup here is `:egress_unavailable`
     # (transient), never `:egress_blocked` (permanent) — see the moduledoc.
     case marking(scope) do
       {:ok, true} -> guarded_check(scope, url, purpose)
-      {:ok, false} -> default_path(scope, url, purpose)
+      {:ok, false} -> default_path(scope, url, purpose, tenant_supplied?(opts))
       {:error, reason} -> marking_unavailable(scope, url, reason)
     end
   end
+
+  defp tenant_supplied?(opts), do: Keyword.get(opts, :tenant_supplied, false) == true
 
   # Fail-CLOSED, and ONLY for `local_only` scopes.
   defp guarded_check(scope, url, purpose) do
@@ -157,32 +162,111 @@ defmodule Loopctl.Egress.Policy do
   # pool keys on — would collapse connection reuse to a fresh TLS handshake every
   # time a CDN-fronted vendor host rotated its answer. AC-41.4.12 bounds the hot
   # path at one cheap classification with NO network or DB round-trip.
-  defp default_path(scope, url, purpose) do
+  #
+  # `tenant_supplied?` is how a caller that owns a TENANT-WRITABLE url opts into
+  # the SSRF denylist on this path (US-41.3 review). The default path was written
+  # when every url on it was a hardcoded vendor host, so a `:denylisted` verdict
+  # proceeded UNPINNED and the denylist was left "to the callers that own it" —
+  # which was true of ingestion (`UrlGuard.pin/1`) but became a hole the moment
+  # `chat_base_url` made this url tenant-writable. Rather than a second, divergent
+  # URL policy at the chat client (an AC-41.4.9 review failure), the ONE policy
+  # module refuses here. On a VENDOR (non-tenant-supplied) url nothing else changes:
+  # an unresolvable or unpinnable host still proceeds unpinned, so those scopes
+  # acquire no NEW failure mode. On a TENANT-SUPPLIED url the refusal is total — a
+  # `:denylisted` verdict is the PERMANENT `:egress_blocked`, and a
+  # classification/pin failure is the TRANSIENT `:egress_unavailable` (see
+  # `unpinned_or_refuse/4`); it never degrades to an unpinned, redirect-following
+  # request.
+  defp default_path(scope, url, purpose, tenant_supplied?) do
     uri = URI.parse(url)
 
     with true <- uri.scheme in @pinnable_schemes,
          host when is_binary(host) and host != "" <- uri.host,
-         # A denylisted host is left UNPINNED exactly as `UrlGuard.pin/2` used to
-         # leave it (`{:error, :blocked_ip}`): the default path never refuses, and
-         # the SSRF denylist is enforced by the callers that own it.
-         {:ok, %{ips: [ip | _], verdict: verdict}} when verdict != :denylisted <-
-           cached_classification(scope, host, purpose) do
+         {:ok, %{ips: [ip | _], verdict: verdict}} <-
+           cached_classification(scope, host, purpose),
+         :ok <- denylist_gate(scope, host, verdict, tenant_supplied?),
+         # A denylisted host is otherwise left UNPINNED exactly as `UrlGuard.pin/2`
+         # used to leave it (`{:error, :blocked_ip}`).
+         true <- verdict != :denylisted do
       {:ok, %{uri: uri, host: host, ip: ip}}
     else
-      other ->
-        Logger.debug(
-          "Loopctl.Egress.Policy: per-request pin unavailable for #{Scope.key(scope)} " <>
-            "(#{inspect(other)}); proceeding unpinned (scope is not local_only)"
-        )
+      {:error, :egress_blocked, _details} = refusal ->
+        refusal
 
-        {:ok, :unpinned}
+      other ->
+        unpinned_or_refuse(scope, url, other, tenant_supplied?)
     end
   rescue
-    _e -> {:ok, :unpinned}
+    e ->
+      unpinned_or_refuse(scope, url, {:classifier_raised, Exception.message(e)}, tenant_supplied?)
   catch
-    :exit, _reason -> {:ok, :unpinned}
-    :throw, _value -> {:ok, :unpinned}
+    :exit, reason -> unpinned_or_refuse(scope, url, {:classifier_exit, reason}, tenant_supplied?)
+    :throw, value -> unpinned_or_refuse(scope, url, {:classifier_throw, value}, tenant_supplied?)
   end
+
+  # The fall-through when the per-request pin could NOT be taken.
+  #
+  # For a HARDCODED VENDOR host this must degrade to the pre-US-41.4 behaviour: the
+  # pin is a TOCTOU control, not a locality decision, and turning a DNS blip into a
+  # refusal would hand every default tenant a brand-new failure mode.
+  #
+  # For a TENANT-SUPPLIED host it must NOT (US-41.3 review). `default_path/4` reaches
+  # here on a `cached_classification/3` miss + `classify_uncached/2` error (e.g. a DNS
+  # answer slower than the 3s resolve timeout), a classifier raise/exit/throw — all
+  # attacker-INFLUENCED conditions when the host is tenant-controlled. Degrading there
+  # would mean an unpinned request with Req's default redirect-FOLLOWING: make the
+  # first resolution fail, and the connect-time resolution can land on 127.0.0.1 /
+  # 169.254.169.254 / a Fly 6PN peer, with redirects followed on top. So we fail
+  # CLOSED — as `:egress_unavailable`, which is TRANSIENT (workers snooze, the probe
+  # reports a retryable refusal), because a resolve timeout is a blip, not a
+  # configuration state. A genuinely denylisted host is still the PERMANENT
+  # `:egress_blocked` from `denylist_gate/4`.
+  defp unpinned_or_refuse(scope, _url, other, false) do
+    Logger.debug(
+      "Loopctl.Egress.Policy: per-request pin unavailable for #{Scope.key(scope)} " <>
+        "(#{inspect(other)}); proceeding unpinned (scope is not local_only)"
+    )
+
+    {:ok, :unpinned}
+  end
+
+  defp unpinned_or_refuse(scope, url, other, true) do
+    host = safe_host(url)
+
+    Logger.warning(
+      "Loopctl.Egress.Policy: refusing a TENANT-SUPPLIED endpoint for " <>
+        "#{Scope.key(scope)}: #{inspect(host)} could not be classified/pinned " <>
+        "(#{inspect(other)}); failing CLOSED rather than issuing an unpinned, " <>
+        "redirect-following request"
+    )
+
+    {:error, :egress_unavailable,
+     scope
+     |> details(host, :unclassifiable)
+     |> Map.put(
+       :remediation,
+       "The tenant-supplied endpoint #{inspect(host)} could not be resolved or " <>
+         "classified, so the call was refused BEFORE any request was built (nothing " <>
+         "was sent). This is TRANSIENT — retry shortly. If it persists, verify the " <>
+         "host resolves from loopctl and re-check with the egress_posture tool."
+     )}
+  end
+
+  # The SSRF refusal for a tenant-writable url whose host resolves into a private,
+  # loopback, CGNAT, link-local or ULA range and is NOT carved out by the OPERATOR
+  # deployment allowlist. PERMANENT — a configuration state, not a blip — so the
+  # existing `:egress_blocked` handling (cancel, never retry) is exactly right, and
+  # the details map already carries the operator-allowlist remediation.
+  defp denylist_gate(scope, host, :denylisted, true) do
+    Logger.warning(
+      "Loopctl.Egress.Policy: refusing a TENANT-SUPPLIED endpoint for " <>
+        "#{Scope.key(scope)}: #{host} is denylisted (SSRF guard)"
+    )
+
+    {:error, :egress_blocked, details(scope, host, :denylisted)}
+  end
+
+  defp denylist_gate(_scope, _host, _verdict, _tenant_supplied?), do: :ok
 
   defp marking_unavailable(scope, url, reason) do
     Logger.warning(

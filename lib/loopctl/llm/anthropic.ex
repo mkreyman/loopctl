@@ -22,6 +22,20 @@ defmodule Loopctl.Llm.Anthropic do
   killing an in-flight request mid-way (which the client can neither observe nor
   retry). The defaults here are conservative; every real caller overrides them.
 
+  ## Credential isolation (US-41.3, AC-41.3.3)
+
+  `message/5` REFUSES with `{:error, :provider_mismatch}` unless the tenant
+  actually resolves to `:anthropic`. The mirror check lives in
+  `Loopctl.Llm.OpenAiChat.resolve_target/2`; both directions are guarded on
+  purpose, because `Llm.resolve/2` returns a tenant's LOCAL `chat_api_key` for an
+  `openai_compatible` tenant and this client posts to a HARDCODED vendor host —
+  the egress guard cannot flag that, since the destination is the default one.
+
+  `call/7` takes an EXPLICIT key and never consults `Llm.resolve/2`, so its caller
+  owns the provider decision; the one in-repo batch caller
+  (`Loopctl.Knowledge.ClaudeCategoryClassifier`) only accepts pre-resolved
+  credentials tagged `provider: :anthropic`.
+
   The API key is NEVER logged. HTTP is injectable for tests via the
   `:anthropic_req_plug` config (a `Req.Test` plug), so the whole flow — including
   usage recording — is exercised without real API calls.
@@ -67,6 +81,8 @@ defmodule Loopctl.Llm.Anthropic do
   Returns:
     * `{:ok, text}` on a 200 (usage recorded best-effort)
     * `{:error, :no_api_key}` when the tenant has no key (mandatory BYO)
+    * `{:error, :provider_mismatch}` when the tenant does NOT resolve to
+      `:anthropic` (see the credential-isolation note below)
     * `{:error, :rate_limited_local}` when the local admission bucket is empty
     * `{:error, {:api_error, status, :provider_error}}` on a non-200 (sanitized)
     * `{:error, {:api_error, status, :provider_error, retry_after}}` on a throttle
@@ -92,6 +108,7 @@ defmodule Loopctl.Llm.Anthropic do
         ) ::
           {:ok, String.t()}
           | {:error, :no_api_key}
+          | {:error, :provider_mismatch}
           | {:error, :rate_limited_local}
           | {:error, ProviderError.t()}
   def message(scope_or_tenant_id, operation, body_fun, usage_meta \\ %{}, req_opts \\ [])
@@ -102,8 +119,20 @@ defmodule Loopctl.Llm.Anthropic do
       {:error, :no_api_key} ->
         {:error, :no_api_key}
 
-      {:ok, %{api_key: api_key, model: model}} ->
+      # SYMMETRIC to `Loopctl.Llm.OpenAiChat.resolve_target/2` (US-41.3 review). The
+      # `:provider` tag is REQUIRED in the match: for an `openai_compatible` tenant
+      # `Llm.resolve/2` returns that tenant's LOCAL `chat_api_key`, and a provider-
+      # blind match would POST it to the hardcoded https://api.anthropic.com/v1 as
+      # `x-api-key` — a cross-provider credential leak the egress guard cannot catch,
+      # because the vendor host is the DEFAULT. `is_binary(api_key)` is part of the
+      # gate too: a KEYLESS local endpoint resolves `api_key: nil`, which must never
+      # be threaded into an Anthropic request.
+      {:ok, %{provider: :anthropic, api_key: api_key, model: model}}
+      when is_binary(api_key) and is_binary(model) ->
         call(scope, operation, api_key, model, body_fun, usage_meta, req_opts)
+
+      {:ok, %{}} ->
+        {:error, :provider_mismatch}
     end
   end
 
@@ -311,6 +340,7 @@ defmodule Loopctl.Llm.Anthropic do
     case Llm.record_usage(tenant_id, %{
            operation: operation,
            model: model,
+           provider: "anthropic",
            input_tokens: normalize_token(input),
            output_tokens: normalize_token(output),
            source_type: Map.get(meta, :source_type),

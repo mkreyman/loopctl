@@ -17,37 +17,37 @@
     {
       "id": "AC-41.3.1",
       "description": "An OpenAI-compatible chat client module exists alongside Loopctl.Llm.Anthropic, taking base_url + key + model from tenant settings, with the same return contract and the same ProviderError mapping (llm/provider_error.ex) so callers are unchanged.",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-41.3.2",
       "description": "Sibling implementations of the four content behaviours (extractor, classifier, merge synthesizer, content extractor) plus the memory promoter LLM route to the OpenAI-compatible client. Selection is per-tenant at runtime, NOT a compile-time config swap, because two tenants on one node may use different providers - AND the existing DI seam is PRESERVED rather than replaced: the module named in config stays the single resolution point (Application.get_env, per CLAUDE.md's config-based DI) and BECOMES A TENANT-AWARE ROUTER that dispatches to the Anthropic or OpenAI-compatible sibling based on tenant settings. config/test.exs's Mox mappings are therefore untouched; no test uses Application.put_env and no dependency is passed as a function opt. A test asserts two tenants resolve different siblings through the same configured module on one node.",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-41.3.3",
       "description": "Endpoint, model and provider for the chat surface are settable through the EXISTING set_llm_config MCP tool + matching API, consistent with US-41.2, and carry the same config-time probe and remediation shape (a trivial completion is issued before persisting). Like US-41.2 AC-41.2.2 that write stays ROLE :user - the epic's agent-manageability audit is corrected to user-write for this row, since the same PATCH stores tenant secrets and CLAUDE.md's role checklist forbids downgrading it to :agent. The probe consults the single egress policy module (US-41.4 AC-41.4.9), not a private URL policy - which is why this story DEPENDS on US-41.4 and is implemented after it. It also carries US-41.2 AC-41.2.3's credential rule verbatim: changing the chat endpoint requires a matching key in the same PATCH or an explicit acknowledgement that the stored key will be transmitted to the new host; the probe never ships an existing credential to a new host silently.",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-41.3.4",
       "description": "Local models are weaker at structured output than Claude: every impl validates the response shape and fails the item with a legible, agent-readable reason rather than writing malformed articles. A model that cannot produce the required structure is reported as a configuration problem, not silently degraded output.",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-41.3.5",
       "description": "Every provider call from the new client passes through Provider.Admission (as anthropic.ex:118 does) so backpressure and the US-41.4 egress guard apply uniformly. Adding the provider is TWO coordinated edits, not one: the new atom joins the fixed @providers list (never a user-supplied value, never String.to_atom on input) AND a matching limit_for/1 clause plus a @default_<provider>_rpm and a provider_admission_<name>_rpm SystemConfig key are added (admission.ex:104,194-201). Without the limit clause the call raises FunctionClauseError inside the try body and admission.ex:145's rescue converts it to fail_open -> :ok, i.e. a provider with NO rate limit at exactly the call site the US-41.4 guard must sit beside. A unit test asserts the new provider is actually rate-limited and NOT fail-opened. The single shared atom for all tenant-supplied local endpoints means one global RPM ceiling across tenants with different hardware; that is INTENTIONAL for v1 (bucket keys isolate counts, the limit is shared) and is documented as such.",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-41.3.6",
       "description": "Token usage / cost accounting continues to work for the alternate provider, or the story explicitly records that a local endpoint reports no usage and how that is represented (a zero-cost provider is fine; a silently missing usage row is not).",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-41.3.7",
       "description": "Default unchanged: a tenant that configures nothing keeps Anthropic with the hardcoded endpoint and identical behavior.",
-      "status": "pending"
+      "status": "complete"
     }
   ],
   "test_cases": [
@@ -55,37 +55,69 @@
       "id": "TC-41.3.1",
       "name": "tenant-scoped provider selection through the unchanged DI seam",
       "type": "integration",
-      "preconditions": ["tenant A on Anthropic default", "tenant B configured to a stub OpenAI-compatible endpoint"],
-      "steps": ["run an extraction for each tenant in the same node"],
-      "expected_results": ["A hits Anthropic, B hits the stub", "both resolve through the module named in config - the Mox mapping in config/test.exs still intercepts", "no cross-contamination of client or credentials"],
-      "status": "pending"
+      "preconditions": [
+        "tenant A on Anthropic default",
+        "tenant B configured to a stub OpenAI-compatible endpoint"
+      ],
+      "steps": [
+        "run an extraction for each tenant in the same node"
+      ],
+      "expected_results": [
+        "A hits Anthropic, B hits the stub",
+        "both resolve through the module named in config - the Mox mapping in config/test.exs still intercepts",
+        "no cross-contamination of client or credentials"
+      ],
+      "status": "complete"
     },
     {
       "id": "TC-41.3.2",
       "name": "malformed local-model output fails legibly",
       "type": "integration",
-      "preconditions": ["stub endpoint returning prose instead of the required structure"],
-      "steps": ["run extraction"],
-      "expected_results": ["item fails with a shape-validation reason naming the endpoint and model", "no malformed article written", "not retried blindly"],
-      "status": "pending"
+      "preconditions": [
+        "stub endpoint returning prose instead of the required structure"
+      ],
+      "steps": [
+        "run extraction"
+      ],
+      "expected_results": [
+        "item fails with a shape-validation reason naming the endpoint and model",
+        "no malformed article written",
+        "not retried blindly"
+      ],
+      "status": "complete"
     },
     {
       "id": "TC-41.3.3",
       "name": "admission applies to the new provider and does not fail open",
       "type": "unit",
-      "preconditions": ["admission limit exhausted for the new provider"],
-      "steps": ["attempt a call", "separately, call with the limit resolution path exercised"],
-      "expected_results": ["rate_limited_local returned before any Req.post", "no FunctionClauseError reaches the rescue/fail_open path - limit_for/1 has a clause for the new provider"],
-      "status": "pending"
+      "preconditions": [
+        "admission limit exhausted for the new provider"
+      ],
+      "steps": [
+        "attempt a call",
+        "separately, call with the limit resolution path exercised"
+      ],
+      "expected_results": [
+        "rate_limited_local returned before any Req.post",
+        "no FunctionClauseError reaches the rescue/fail_open path - limit_for/1 has a clause for the new provider"
+      ],
+      "status": "complete"
     },
     {
       "id": "TC-41.3.4",
       "name": "usage accounting present for the alternate provider",
       "type": "integration",
-      "preconditions": ["tenant on the stub endpoint"],
-      "steps": ["run extraction", "read token usage"],
-      "expected_results": ["a usage record exists with the documented representation - never a silently absent row"],
-      "status": "pending"
+      "preconditions": [
+        "tenant on the stub endpoint"
+      ],
+      "steps": [
+        "run extraction",
+        "read token usage"
+      ],
+      "expected_results": [
+        "a usage record exists with the documented representation - never a silently absent row"
+      ],
+      "status": "complete"
     }
   ],
   "technical_notes": [
@@ -94,6 +126,8 @@
     "config/test.exs already maps all these behaviours to Mox mocks; the tenant-aware router keeps that mapping the seam config/test.exs points at (Knowledge.ExtractorBehaviour -> MockExtractor etc.), so no test needs Application.put_env (CLAUDE.md forbids it) and no existing test changes.",
     "Per-tenant runtime selection means the ROUTER's functions take tenant_id and resolve the sibling per call - resist the temptation to reuse the compile-time Application.compile_env pattern used by Oban workers here. This is a deliberate, documented departure from the compile-time half of the config-based DI convention, and the reason is that provider choice is tenant data, not deployment config."
   ],
-  "dependencies": ["US-41.4"],
+  "dependencies": [
+    "US-41.4"
+  ],
   "estimated_tokens": 500000
 }

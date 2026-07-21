@@ -519,6 +519,12 @@ config :loopctl, :ingestion_req_plug, {Req.Test, Loopctl.Workers.ContentIngestio
 # dedicated LLM tests override with crafted content + usage blocks.
 config :loopctl, :anthropic_req_plug, {Req.Test, Loopctl.Llm.Anthropic}
 
+# US-41.3: the same seam for the OpenAI-compatible chat client + its config-time
+# endpoint probe, so the whole pluggable-provider flow (per-tenant endpoint/key
+# resolution, admission, egress chokepoint, shape validation, usage recording) is
+# exercised without a real local server.
+config :loopctl, :openai_chat_req_plug, {Req.Test, Loopctl.Llm.OpenAiChat}
+
 # Epic 28 (#179) embeddings BYO: route the real tenant-scoped EmbeddingClient
 # through a Req.Test plug so its own dedicated test exercises per-tenant key
 # resolution + usage recording without real OpenAI calls. Everywhere ELSE the

@@ -13,9 +13,10 @@ defmodule Loopctl.Workers.PromotionEvalWorker do
   Scoring the REAL compiler means each labeled session runs a real, tenant-scoped
   extraction LLM call on the tenant's BYO key. To avoid spending tokens on tenants who
   never configured extraction, the `all_tenants` fan-out only enqueues tenants that
-  have a usable extraction key (selected in one round-trip by joining
-  `tenant_llm_settings` on a non-null `api_key`); keyless tenants are skipped entirely
-  (no wasted job, no error). The cost is BOUNDED (the committed
+  have a usable extraction TARGET — an Anthropic key, or (US-41.3) a configured
+  `openai_compatible` chat endpoint, which has no Anthropic key at all. The predicate
+  mirrors `Loopctl.Llm.resolve(_, :extraction)` in SQL; unconfigured tenants are
+  skipped entirely (no wasted job, no error). The cost is BOUNDED (the committed
   dataset's handful of short synthetic sessions, once/day) and OBSERVABLE — the
   extraction call records per-tenant token usage best-effort, and the eval emits a
   per-tenant `[:loopctl, :memory_promotion, :eval]` telemetry event.
@@ -40,19 +41,7 @@ defmodule Loopctl.Workers.PromotionEvalWorker do
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
-    # Select active tenants that have a usable extraction key in ONE round-trip by joining
-    # tenant_llm_settings, instead of an N+1 `Llm.has_api_key?/1` settings read per tenant.
-    # A stored `api_key` is always non-empty (the settings changeset rejects blank keys), so
-    # `not is_nil(s.api_key)` is exactly the mandatory-BYO gate `resolve(_, :extraction)`
-    # applies — keyless tenants are skipped (no wasted job, no spent BYO tokens).
-    from(t in Tenant,
-      join: s in TenantLlmSettings,
-      on: s.tenant_id == t.id,
-      where: t.status == :active and not is_nil(s.api_key),
-      select: t.id
-    )
-    |> AdminRepo.all()
-    |> Enum.each(fn tenant_id ->
+    Enum.each(eligible_tenant_ids(), fn tenant_id ->
       %{"tenant_id" => tenant_id} |> __MODULE__.new() |> Oban.insert()
     end)
 
@@ -71,6 +60,46 @@ defmodule Loopctl.Workers.PromotionEvalWorker do
       {:snooze, _n} = snooze -> snooze
       :ok -> run_eval(tenant_id)
     end
+  end
+
+  @doc """
+  The active tenants the daily fan-out enqueues — those with a usable EXTRACTION
+  target.
+
+  Public so the predicate can be asserted directly against
+  `Loopctl.Llm.resolve(_, :extraction)` without executing a real per-tenant eval
+  (Oban runs `:inline` in tests).
+  """
+  @spec eligible_tenant_ids() :: [Ecto.UUID.t()]
+  def eligible_tenant_ids do
+    # Select in ONE round-trip by joining tenant_llm_settings, instead of an N+1
+    # `Llm.has_api_key?/1` settings read per tenant.
+    #
+    # This predicate MIRRORS `Loopctl.Llm.resolve(_, :extraction)` — i.e.
+    # `resolve_chat/2` — and must be kept in step with it. `resolve_chat/2` has TWO
+    # admitting clauses, and a denormalized copy that knows only about the first one
+    # silently drops every tenant matched by the second (no error, no telemetry, no
+    # job — the failure mode US-41.3 review caught):
+    #
+    #   * `chat_provider = 'openai_compatible'` resolves on `chat_base_url` +
+    #     `extraction_model` and NEVER reads the Anthropic `api_key` column, which is
+    #     nil for exactly the private-tier tenant this epic exists for; or
+    #   * a non-null Anthropic `api_key` (always non-empty — the settings changeset
+    #     rejects blank keys).
+    #
+    # Tenants matching neither are skipped (no wasted job, no spent BYO tokens).
+    from(t in Tenant,
+      join: s in TenantLlmSettings,
+      on: s.tenant_id == t.id,
+      where:
+        t.status == :active and
+          ((s.chat_provider == "openai_compatible" and not is_nil(s.chat_base_url) and
+              not is_nil(s.extraction_model)) or
+             (s.chat_provider != "openai_compatible" and not is_nil(s.api_key)) or
+             (is_nil(s.chat_provider) and not is_nil(s.api_key))),
+      select: t.id
+    )
+    |> AdminRepo.all()
   end
 
   defp run_eval(tenant_id) do

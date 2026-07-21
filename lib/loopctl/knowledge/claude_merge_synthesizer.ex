@@ -28,11 +28,26 @@ defmodule Loopctl.Knowledge.ClaudeMergeSynthesizer do
 
   @max_body_chars 12_000
 
+  @doc """
+  The merge system prompt.
+
+  Public so the OpenAI-compatible sibling
+  (`Loopctl.Knowledge.OpenAiMergeSynthesizer`) shares it rather than keeping a
+  copy that drifts (US-41.3).
+  """
+  @spec system_prompt() :: String.t()
+  def system_prompt, do: @system_prompt
+
+  @doc "The user message for two articles — shared with the sibling impl."
+  @spec user_content(map(), map()) :: String.t()
+  def user_content(a, b) do
+    "ARTICLE A\nTitle: #{a.title}\n\nBody:\n#{clip(a.body)}\n\n" <>
+      "ARTICLE B\nTitle: #{b.title}\n\nBody:\n#{clip(b.body)}"
+  end
+
   @impl true
   def synthesize(scope_or_tenant_id, a, b) do
-    user_content =
-      "ARTICLE A\nTitle: #{a.title}\n\nBody:\n#{clip(a.body)}\n\n" <>
-        "ARTICLE B\nTitle: #{b.title}\n\nBody:\n#{clip(b.body)}"
+    user_content = user_content(a, b)
 
     body_fun = fn _model ->
       %{

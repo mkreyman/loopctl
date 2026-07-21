@@ -71,6 +71,63 @@ defmodule Loopctl.Provider.AdmissionTest do
     assert :ok = Admission.admit(@tenant_a, :anthropic)
   end
 
+  describe "US-41.3 (TC-41.3.3): the :openai_compatible provider is REALLY rate-limited" do
+    test "an empty bucket denies — and NO fail-open path is taken" do
+      # THE regression this guards: adding the atom to @providers WITHOUT a matching
+      # `limit_for/1` clause raises FunctionClauseError inside the try body, which the
+      # fail-open rescue converts to `:ok`. That would leave the ONE provider whose
+      # endpoint is tenant-supplied with no ceiling, right beside the US-41.4 guard.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit -> {:deny, 0} end)
+
+      log =
+        capture_log(fn ->
+          assert {:error, :rate_limited_local} = Admission.admit(@tenant_a, :openai_compatible)
+        end)
+
+      refute log =~ "failing OPEN"
+    end
+
+    test "limit_for/1 resolves a real positive integer limit (not a FunctionClauseError)" do
+      test_pid = self()
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, window, limit ->
+        send(test_pid, {:gate, bucket, window, limit})
+        {:allow, 1}
+      end)
+
+      log =
+        capture_log(fn ->
+          assert :ok = Admission.admit(@tenant_a, :openai_compatible)
+        end)
+
+      refute log =~ "failing OPEN"
+
+      assert_received {:gate, bucket, 60_000, limit}
+      assert bucket == "provider_admission:openai_compatible:#{@tenant_a}"
+      assert is_integer(limit) and limit > 0
+    end
+
+    test "the bucket KEY isolates tenants even though the LIMIT is shared (documented v1 choice)" do
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "provider_admission:openai_compatible:" <> tenant, _window, _limit ->
+          if tenant == @tenant_a, do: {:deny, 0}, else: {:allow, 1}
+      end)
+
+      assert {:error, :rate_limited_local} = Admission.admit(@tenant_a, :openai_compatible)
+      assert :ok = Admission.admit(@tenant_b, :openai_compatible)
+    end
+
+    test "openai_compatible and anthropic buckets are independent for the SAME tenant" do
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "provider_admission:openai_compatible:" <> _tenant, _window, _limit -> {:deny, 0}
+        "provider_admission:anthropic:" <> _tenant, _window, _limit -> {:allow, 1}
+      end)
+
+      assert {:error, :rate_limited_local} = Admission.admit(@tenant_a, :openai_compatible)
+      assert :ok = Admission.admit(@tenant_a, :anthropic)
+    end
+  end
+
   test "FAIL-OPEN: a raised limiter exception allows the call and logs a warning (AC-37.1.6)" do
     stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
       raise "hammer/ets is down"

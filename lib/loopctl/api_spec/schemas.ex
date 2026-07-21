@@ -3342,6 +3342,40 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :string,
           nullable: true,
           description: "Embedding model id (null → server default `text-embedding-3-small`)"
+        },
+        chat_provider: %Schema{
+          type: :string,
+          enum: ["anthropic", "openai_compatible"],
+          nullable: true,
+          description:
+            "Which provider serves the CHAT surface (extraction / classification / " <>
+              "merge / content extraction / memory promotion). Null or `anthropic` " <>
+              "keeps the hardcoded Anthropic endpoint and identical behaviour."
+        },
+        chat_base_url: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "API base of an OpenAI-compatible server (the client appends " <>
+              "`/chat/completions`). Required when `chat_provider` is " <>
+              "`openai_compatible`. PROBED with a trivial completion before it is " <>
+              "saved; a probe failure is a 422 and nothing is persisted."
+        },
+        chat_api_key: %Schema{
+          type: :string,
+          writeOnly: true,
+          description:
+            "Credential for `chat_base_url` (write-only; stored encrypted, never " <>
+              "returned). SEPARATE from `api_key` — the Anthropic key is never sent " <>
+              "to a tenant-supplied host."
+        },
+        acknowledge_key_transmission: %Schema{
+          type: :boolean,
+          writeOnly: true,
+          description:
+            "Required when changing `chat_base_url` WITHOUT supplying a matching " <>
+              "`chat_api_key`: explicitly acknowledges that the already-stored key " <>
+              "will be transmitted to the new host. Not persisted."
         }
       },
       example: %{
@@ -3388,7 +3422,27 @@ defmodule Loopctl.ApiSpec.Schemas do
           nullable: true,
           description: "Masked last-4 hint for the embedding key; never the full key"
         },
-        embedding_model: %Schema{type: :string, nullable: true}
+        embedding_model: %Schema{type: :string, nullable: true},
+        chat_provider: %Schema{
+          type: :string,
+          description: "`anthropic` (default) or `openai_compatible`"
+        },
+        chat_base_url: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "The configured OpenAI-compatible API base, echoed back. NOT a secret — " <>
+              "it is the tenant's own declared host and naming it is the point."
+        },
+        has_chat_key: %Schema{
+          type: :boolean,
+          description: "Whether a credential for `chat_base_url` is configured"
+        },
+        chat_api_key_hint: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Masked last-4 hint for the chat key; never the full key"
+        }
       },
       example: %{
         has_api_key: true,
@@ -3398,7 +3452,11 @@ defmodule Loopctl.ApiSpec.Schemas do
         merge_model: nil,
         has_embedding_key: true,
         embedding_api_key_hint: "...Xy9z",
-        embedding_model: "text-embedding-3-small"
+        embedding_model: "text-embedding-3-small",
+        chat_provider: "anthropic",
+        chat_base_url: nil,
+        has_chat_key: false,
+        chat_api_key_hint: nil
       }
     })
   end
@@ -3449,8 +3507,8 @@ defmodule Loopctl.ApiSpec.Schemas do
       title: "LlmUsageResponse",
       description:
         "Per-tenant LLM token-usage summary, grouped by operation + model + " <>
-          "source_type + day over an optional date range. Record-only — there is " <>
-          "no budget enforcement.",
+          "provider + source_type + day over an optional date range. Record-only " <>
+          "— there is no budget enforcement.",
       type: :object,
       properties: %{
         data: %Schema{
@@ -3464,6 +3522,16 @@ defmodule Loopctl.ApiSpec.Schemas do
                 enum: ["extraction", "classification", "merge", "embedding"]
               },
               model: %Schema{type: :string},
+              # US-41.3 (AC-41.3.6): the ledger is provider-attributed, so a
+              # tenant's own OpenAI-compatible endpoint spend is distinguishable
+              # from Anthropic's and from embedding spend.
+              provider: %Schema{
+                type: :string,
+                enum: ["anthropic", "openai_compatible", "embedding"],
+                description:
+                  "Which provider surface the tokens were spent on. Rows recorded " <>
+                    "before US-41.3 are attributed by their operation."
+              },
               source_type: %Schema{type: :string, nullable: true},
               input_tokens: %Schema{type: :integer},
               output_tokens: %Schema{type: :integer},

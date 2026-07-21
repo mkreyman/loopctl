@@ -4386,6 +4386,12 @@ defmodule Loopctl.Knowledge do
 
   defp permanent_merge_error?(:unparseable_merge), do: true
 
+  # US-41.3 (AC-41.3.4): a shape failure from the OpenAI-compatible sibling — the
+  # configured local model cannot emit the required JSON object. PERMANENT, so the
+  # nightly executor stops re-attempting an identical synthesis (and never drafts a
+  # malformed merged article).
+  defp permanent_merge_error?({:invalid_response_shape, _details}), do: true
+
   # US-41.4 (AC-41.4.3): `:egress_blocked` is a PERMANENT local configuration
   # refusal — nothing was sent and nothing changes on its own. Without this clause
   # the catch-all buckets it as transient and the nightly conflict executor retries
@@ -4465,7 +4471,10 @@ defmodule Loopctl.Knowledge do
   end
 
   defp merge_synthesizer do
-    Application.get_env(:loopctl, :merge_synthesizer, Loopctl.Knowledge.ClaudeMergeSynthesizer)
+    # US-41.3: the DEFAULT is the tenant-aware ROUTER; the resolution point itself
+    # (this Application.get_env) is unchanged, so config/test.exs's Mox mapping
+    # still intercepts.
+    Application.get_env(:loopctl, :merge_synthesizer, Loopctl.Knowledge.MergeSynthesizerRouter)
   end
 
   defp mark_resolution_executed(%ConflictResolution{} = r, execution_result) do

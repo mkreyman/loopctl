@@ -1165,6 +1165,33 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       assert reason =~ "not retryable"
     end
 
+    # US-41.3 review: `:provider_mismatch` (the chat client resolved a DIFFERENT
+    # provider than the one it guards — reachable via the settings race the guards
+    # exist for) is a deterministic CONFIGURATION state. Retrying re-resolves the
+    # same settings and refuses identically, so it must not burn max_attempts.
+    test "a :provider_mismatch extraction failure is PERMANENT (discarded, not retried)" do
+      %{tenant: tenant} = setup_tenant()
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _chunk,
+                                                                       _opts ->
+        {:error, :provider_mismatch}
+      end)
+
+      assert {:discard, {:extraction_failed, reason}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 413,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => multi_chunk_content(3),
+                   "content_hash" => "provider_mismatch_permanent",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      assert reason =~ "not retryable"
+    end
+
     test "unique config excludes :completed so under-captured content can be resubmitted (#264 Finding 2)" do
       states =
         ContentIngestionWorker.__opts__() |> Keyword.fetch!(:unique) |> Keyword.fetch!(:states)

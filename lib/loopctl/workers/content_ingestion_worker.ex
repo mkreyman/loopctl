@@ -56,12 +56,14 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Egress
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
+  import Loopctl.Llm.ShapeError, only: [is_shape_error: 1]
   alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ContentChunker
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
+  alias Loopctl.Llm.ShapeError
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Oban.FairShare
   alias Loopctl.Provider
@@ -73,7 +75,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   @content_extractor Application.compile_env(
                        :loopctl,
                        :content_extractor,
-                       Loopctl.Knowledge.ClaudeContentExtractor
+                       Loopctl.Knowledge.ContentExtractorRouter
                      )
 
   @max_articles 10
@@ -529,6 +531,9 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     # and these reasons land in oban_jobs.errors (surfaced by list_extraction_errors).
     # Classification below runs on the RAW errors (it needs the status/Postgrex code).
     first = errors |> Enum.reverse() |> List.first() |> ProviderError.sanitize()
+    # US-41.3: a shape failure renders as its agent-readable message (endpoint +
+    # model + why) rather than an opaque inspected tuple in oban_jobs.errors.
+    first_text = if is_shape_error(first), do: ShapeError.message(first), else: inspect(first)
 
     if Enum.all?(errors, &permanent_error?/1) do
       # No transient error a retry could clear — {:discard} (no infinite retry);
@@ -536,7 +541,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       {:discard,
        {:extraction_failed,
         "extraction permanently failed on #{length(errors)} chunk(s) " <>
-          "(first: #{inspect(first)}); persisted #{inserted} article(s) from " <>
+          "(first: #{first_text}); persisted #{inserted} article(s) from " <>
           "#{persisted} of #{attempted} attempted chunk(s) — not retryable"}}
     else
       # At least one transient error — retry the whole (idempotent) job so the
@@ -553,6 +558,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   #     index (the idempotency conflict target doesn't cover it), which is
   #     deterministic and would otherwise burn every retry before discard.
   # A non-constraint DB error (serialization/deadlock/connection) stays transient.
+  #   * US-41.3 (AC-41.3.4): a shape failure from the OpenAI-compatible path — the
+  #     configured model cannot produce the required structure, so every retry
+  #     re-POSTs the tenant's full document to a model that will fail identically.
+  defp permanent_error?({:invalid_response_shape, _details}), do: true
+
   defp permanent_error?({:api_error, status, _body})
        when is_integer(status) and status >= 400 and status < 500 and status != 408 and
               status != 429,
@@ -567,6 +577,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # The top-level gate normally discards before any chunk runs; this backstops the
   # case where the key is removed mid-job between chunks.
   defp permanent_error?(:no_api_key), do: true
+
+  # US-41.3: a provider mismatch (the chat client resolved a DIFFERENT provider than
+  # the one it guards, e.g. after a settings flip mid-job) is a deterministic
+  # CONFIGURATION state — retrying re-resolves the same settings and refuses
+  # identically, burning every attempt for nothing.
+  defp permanent_error?(:provider_mismatch), do: true
 
   defp permanent_error?(_), do: false
 

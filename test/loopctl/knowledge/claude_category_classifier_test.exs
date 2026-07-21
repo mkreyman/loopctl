@@ -69,6 +69,7 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifierTest do
 
       assert {:ok, %{category: :pattern}} =
                ClaudeCategoryClassifier.classify(tenant.id, "T", "B",
+                 provider: :anthropic,
                  api_key: "test-anthropic-preresolved",
                  model: "claude-haiku-4-5-20251001"
                )
@@ -76,6 +77,35 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifierTest do
       assert_received {:req, headers, req_body}
       assert {"x-api-key", "test-anthropic-preresolved"} in headers
       assert req_body["model"] == "claude-haiku-4-5-20251001"
+    end
+
+    test "IGNORES pre-resolved credentials that are not tagged provider: :anthropic" do
+      # US-41.3 review: `Anthropic.call/7` takes an explicit key and never consults
+      # `Llm.resolve/2`, so the provider guard on `message/5` does not cover this
+      # path. An UNTAGGED (or `:openai_compatible`-tagged) credential is the tenant's
+      # LOCAL chat key — POSTing it to the hardcoded api.anthropic.com is the
+      # cross-provider leak AC-41.3.3 forbids. The fast path must be refused and the
+      # call must fall through to a per-call resolve, which here has no key at all.
+      tenant = fixture(:tenant)
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        send(self(), {:leaked, conn.req_headers})
+        Req.Test.json(conn, %{})
+      end)
+
+      for opts <- [
+            [api_key: "tenant-local-chat-key", model: "Qwen/Qwen2.5-7B-Instruct"],
+            [
+              provider: :openai_compatible,
+              api_key: "tenant-local-chat-key",
+              model: "Qwen/Qwen2.5-7B-Instruct"
+            ]
+          ] do
+        assert {:error, :no_api_key} =
+                 ClaudeCategoryClassifier.classify(tenant.id, "T", "B", opts)
+      end
+
+      refute_received {:leaked, _headers}
     end
   end
 

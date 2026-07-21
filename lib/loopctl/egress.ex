@@ -71,7 +71,7 @@ defmodule Loopctl.Egress do
   alias Loopctl.Egress.ScopeMarking
   alias Loopctl.Egress.TrustedEndpoint
   alias Loopctl.Knowledge.EmbeddingClient
-  alias Loopctl.Llm.Anthropic
+  alias Loopctl.Llm
 
   @blocked_window_seconds 60
 
@@ -261,15 +261,17 @@ defmodule Loopctl.Egress do
   hardcoded vendor defaults / the configured embedding provider; US-41.2 makes
   them configurable and this function is the single place that changes.
 
-  Both URLs are read from the CLIENT that resolves them (`EmbeddingClient.base_url/0`
-  and `Anthropic.base_url/0`) — never re-derived here. Re-deriving them would make
-  the posture report and the pre-flight vet a DUPLICATED CONSTANT that agrees with
-  the guard only by coincidence: exactly the "second, divergent URL policy"
-  AC-41.4.9 calls a review failure.
+  Both URLs are read from the module that RESOLVES them — `EmbeddingClient.base_url/0`
+  and, since US-41.3, `Loopctl.Llm.chat_base_url/1` (which returns the tenant's
+  configured OpenAI-compatible endpoint, or `Anthropic.base_url/0` when the tenant
+  configured nothing) — never re-derived here. Re-deriving them would make the
+  posture report and the pre-flight vet a DUPLICATED CONSTANT that agrees with the
+  guard only by coincidence: exactly the "second, divergent URL policy" AC-41.4.9
+  calls a review failure.
   """
   @spec resolved_endpoints(Scope.t()) :: [{atom(), String.t()}]
-  def resolved_endpoints(%Scope{}) do
-    [{:embedding, EmbeddingClient.base_url()}, {:chat, Anthropic.base_url()}]
+  def resolved_endpoints(%Scope{tenant_id: tenant_id}) do
+    [{:embedding, EmbeddingClient.base_url()}, {:chat, Llm.chat_base_url(tenant_id)}]
   end
 
   defp endpoint_verdict(scope, url) do

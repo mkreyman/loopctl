@@ -162,8 +162,9 @@ level (role `:user`) or clear the project marking.
 
 The scope has to REACH the guard, or the resolution above is decorative. The
 first argument of the provider-facing client APIs — `EmbeddingBehaviour`'s
-`generate_embedding/2` / `generate_embeddings/2`, and `Llm.Anthropic.message/5` /
-`call/7` — is therefore the `Loopctl.Egress.Scope`, with a bare `tenant_id`
+`generate_embedding/2` / `generate_embeddings/2`, `Llm.Anthropic.message/5` /
+`call/7`, and (US-41.3) `Llm.OpenAiChat.message/5` / `call/8` — is therefore the
+`Loopctl.Egress.Scope`, with a bare `tenant_id`
 accepted as shorthand for the tenant-wide scope (`Scope.coerce/1`). Callers that
 know a project supply it:
 
@@ -178,6 +179,53 @@ know a project supply it:
 
 Key and endpoint resolution stay tenant-scoped throughout — the project half
 narrows only the MARKING.
+
+### The chat endpoint is now tenant-resolved (US-41.3)
+
+`Egress.resolved_endpoints/1` reads the chat URL from `Llm.chat_base_url/1`, which
+returns the tenant's configured `chat_base_url` when `chat_provider` is
+`openai_compatible` and `Llm.Anthropic.base_url/0` otherwise. That is the SAME
+function the client posts to, so the posture report, the `local_only` enable
+pre-flight and the guard can never vet different URLs — re-deriving the URL here
+would be the "second, divergent URL policy" AC-41.4.9 calls a review failure.
+
+The US-41.3 config-time probe (`Llm.ChatProbe`) has no URL policy of its own either:
+it issues its trivial completion through `Loopctl.Provider.post/3`, so an endpoint
+that the guard would refuse is refused at CONFIG time, before it can be saved.
+
+#### `tenant_supplied_url: true` — the SSRF denylist on the DEFAULT path
+
+The default (non-`local_only`) path deliberately never REFUSES: an unpinnable or
+denylisted host proceeds unpinned, because the SSRF denylist "is enforced by the
+callers that own it" (ingestion pins with `UrlGuard.pin/1` first). That was sound
+while every URL on this path was a hardcoded vendor host. `chat_base_url` made one
+of them TENANT-WRITABLE, so the chat client and the probe pass
+`tenant_supplied_url: true` on `Loopctl.Provider.post/3`, and
+`Egress.Policy.check/4` then refuses a `:denylisted` verdict with
+`{:error, :egress_blocked, details}` for EVERY tenant, marked or not. Without it a
+role `:user` key could point loopctl at `169.254.169.254`, a `.internal` host or any
+RFC1918 address and read the outcome back through the probe's distinguishable
+refusals — an internal host+port oracle. An OPERATOR-allowlisted private host (the
+local-tier deployment shape) still passes as `:network_local`.
+
+The flag ALSO removes the fail-OPEN fallback for that URL. `{:ok, :unpinned}` keeps
+Req's default redirect-FOLLOWING and no IP pin, and the default path fell through
+to it for ANY non-denylist failure — a classification miss, a DNS answer slower
+than the 3s resolve timeout, a classifier raise/exit/throw. For a
+TENANT-CONTROLLED host those are attacker-INFLUENCED conditions: make the first
+resolution fail and the connect-time resolution can land on `127.0.0.1`,
+`169.254.169.254` or a Fly 6PN peer, with redirects followed on top. So a
+`tenant_supplied_url` call whose host cannot be classified/pinned is REFUSED with
+the TRANSIENT `{:error, :egress_unavailable, details}` (workers snooze; a resolve
+blip is not a permanent configuration state). A VENDOR URL is unchanged — it still
+degrades to unpinned, so no non-`local_only` tenant on a vendor endpoint acquires a
+new failure mode.
+
+Plaintext `http` for a `chat_base_url` is additionally gated at CONFIG time by
+`Llm.ChatProbe`: the request carries the `chat_api_key` AND the tenant's full
+document text, so `http` is accepted only for a host THIS module classifies
+`:network_local`. Everything else must be `https`. The decision is delegated here,
+not re-derived at the client (AC-41.4.9).
 
 ## Failure semantics
 
