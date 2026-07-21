@@ -119,7 +119,18 @@ defmodule LoopctlWeb.WikiShowLive do
 
     body
     |> check_internal_links(slugs)
-    |> Earmark.as_html!(compact_output: true)
+    |> MDEx.to_html!(
+      # Earmark (the prior renderer) enabled GitHub-Flavored Markdown by
+      # default; comrak/MDEx defaults to plain CommonMark, so GFM constructs
+      # (tables, strikethrough, task lists, bare-URL autolinks) must be opted
+      # into explicitly or real article content silently degrades to raw text.
+      extension: [table: true, strikethrough: true, tasklist: true, autolink: true],
+      # Defense-in-depth: since render: [unsafe: true] is NOT set, comrak
+      # already OMITS raw/dangerous HTML from untrusted bodies before this
+      # ammonia allow-list ever runs. The sanitize option guards against a
+      # future maintainer enabling unsafe passthrough.
+      sanitize: MDEx.Document.default_sanitize_options()
+    )
   end
 
   # Scan for /wiki/:slug links and flag broken ones

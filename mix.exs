@@ -106,8 +106,12 @@ defmodule Loopctl.MixProject do
       # WebAuthn / FIDO2 attestation verification (US-26.0.1)
       {:wax_, "~> 0.6"},
 
-      # Markdown rendering for wiki articles (US-26.0.3)
-      {:earmark, "~> 1.4"},
+      # Markdown rendering for wiki articles (US-26.0.3). MDEx (comrak) OMITS
+      # raw/dangerous HTML from untrusted bodies by default (render: [unsafe: true]
+      # is not set), so article bodies render XSS-safe on the public /wiki route
+      # without a separate sanitizer library; MDEx's built-in ammonia sanitize
+      # option is layered on top as defense-in-depth (sec-2).
+      {:mdex, "~> 0.13"},
 
       # YAML frontmatter parsing for OKF (Open Knowledge Format) interchange (#110)
       {:yaml_elixir, "~> 2.11"},

@@ -224,6 +224,143 @@ defmodule Loopctl.KnowledgeTest do
     end
   end
 
+  describe "create_article/3 title-conflict recovery respects visibility scope" do
+    # The duplicate-title recovery SELECT runs via AdminRepo (BYPASSRLS), so the
+    # caller's visibility scope must be applied in the query — otherwise a title
+    # colliding with another agent's private/owner article leaks its existence (a
+    # UUID in a 409) or, on a whitespace-normalized body match, the full private
+    # article. These tests pin that the recovery is scoped to owner-visible rows,
+    # mirroring the idempotency-key path.
+    setup do
+      %{tenant: tenant} = setup_tenant()
+      owner_agent = fixture(:agent, %{tenant_id: tenant.id})
+      other_agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      private =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          title: "Collide Title",
+          body: "PRIVATE BODY",
+          metadata: %{"visibility" => "private", "agent_id" => to_string(owner_agent.id)}
+        })
+
+      %{
+        tenant: tenant,
+        owner_agent: owner_agent,
+        other_agent: other_agent,
+        private: private
+      }
+    end
+
+    test "AC1: cross-agent private-title collision with a differing body yields a generic changeset error, no UUID",
+         %{tenant: tenant, other_agent: other_agent, private: private} do
+      result =
+        Knowledge.create_article(
+          tenant.id,
+          %{title: "Collide Title", body: "a different body entirely", category: :pattern},
+          visibility_agent_id: to_string(other_agent.id)
+        )
+
+      # Generic 422 shape — NOT {:error, :duplicate_title, _} (which would echo the
+      # private row) and NOT the private article struct.
+      assert {:error, %Ecto.Changeset{} = changeset} = result
+      assert Map.has_key?(errors_on(changeset), :title)
+
+      # No existence oracle: the private article's id never appears in the error.
+      refute match?({:error, :duplicate_title, _}, result)
+      refute inspect(result) =~ private.id
+    end
+
+    test "AC2: same collision with a MATCHING body does not return the private article's body/metadata/id",
+         %{tenant: tenant, other_agent: other_agent, private: private} do
+      # Body equals the private article's body after trim — the whitespace-normalized
+      # dedup path must still NOT hand back the invisible article.
+      result =
+        Knowledge.create_article(
+          tenant.id,
+          %{title: "Collide Title", body: "  PRIVATE BODY\n", category: :pattern},
+          visibility_agent_id: to_string(other_agent.id)
+        )
+
+      # The changeset carries only B's OWN submitted input; the invisible article is
+      # never handed back, so its id (the meaningful leak vector) must not surface.
+      assert {:error, %Ecto.Changeset{}} = result
+      refute match?({:ok, :deduplicated, _}, result)
+      refute inspect(result) =~ private.id
+    end
+
+    test "AC3: the OWNER (who can see its own private article) gets the normal recovery behavior",
+         %{tenant: tenant, owner_agent: owner_agent, private: private} do
+      # Owner, differing body → normal duplicate-title recovery echoing the row.
+      assert {:error, :duplicate_title, returned} =
+               Knowledge.create_article(
+                 tenant.id,
+                 %{title: "Collide Title", body: "owner's different body", category: :pattern},
+                 visibility_agent_id: to_string(owner_agent.id)
+               )
+
+      assert returned.id == private.id
+
+      # Owner, matching body → idempotent dedup returning the same row.
+      assert {:ok, :deduplicated, deduped} =
+               Knowledge.create_article(
+                 tenant.id,
+                 %{title: "Collide Title", body: "PRIVATE BODY", category: :pattern},
+                 visibility_agent_id: to_string(owner_agent.id)
+               )
+
+      assert deduped.id == private.id
+    end
+
+    test "AC3 (shared): a SHARED article collision is unchanged whether or not a vis scope is passed",
+         %{tenant: tenant, other_agent: other_agent} do
+      assert {:ok, shared} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Shared Collide",
+                 body: "shared original",
+                 category: :pattern
+               })
+
+      # Non-owning agent still sees the shared row → normal recovery.
+      assert {:error, :duplicate_title, returned} =
+               Knowledge.create_article(
+                 tenant.id,
+                 %{title: "Shared Collide", body: "shared different", category: :pattern},
+                 visibility_agent_id: to_string(other_agent.id)
+               )
+
+      assert returned.id == shared.id
+
+      assert {:ok, :deduplicated, deduped} =
+               Knowledge.create_article(
+                 tenant.id,
+                 %{title: "Shared Collide", body: "shared original", category: :pattern},
+                 visibility_agent_id: to_string(other_agent.id)
+               )
+
+      assert deduped.id == shared.id
+    end
+
+    test "AC5: a title collision across tenants does not recover and leaks nothing",
+         %{private: private} do
+      other_tenant = fixture(:tenant)
+      other_agent = fixture(:agent, %{tenant_id: other_tenant.id})
+
+      # Same title in a DIFFERENT tenant is not a conflict at all (the active-title
+      # index is per-tenant) — the create simply succeeds without touching tenant A.
+      assert {:ok, created} =
+               Knowledge.create_article(
+                 other_tenant.id,
+                 %{title: "Collide Title", body: "tenant B body", category: :pattern},
+                 visibility_agent_id: to_string(other_agent.id)
+               )
+
+      assert created.id != private.id
+      assert created.body == "tenant B body"
+    end
+  end
+
   describe "bulk_archive/3 (#136)" do
     test "archives draft/published, skips archived/superseded, reports not_found, partial-success" do
       %{tenant: tenant} = setup_tenant()
