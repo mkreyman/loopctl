@@ -7,6 +7,7 @@ defmodule Loopctl.Workers.MemoryPromotionWorkerTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Memory
   alias Loopctl.Memory.Memory, as: MemorySchema
   alias Loopctl.Workers.MemoryPromotionWorker
@@ -72,7 +73,8 @@ defmodule Loopctl.Workers.MemoryPromotionWorkerTest do
   # text_to_seed → identical vector → near-dup; distinct → near-orthogonal) while
   # isolating it across tenants, so near-dup recall is deterministic.
   defp stub_embeddings(text_to_seed) do
-    stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn tenant_id, text ->
+    stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn scope, text ->
+      tenant_id = EgressScope.coerce(scope).tenant_id
       {:ok, unit_vec({tenant_id, text_to_seed.(text)})}
     end)
   end

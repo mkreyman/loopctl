@@ -66,6 +66,9 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
 
   require Logger
 
+  alias Loopctl.Egress
+
+  import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Memory
   alias Loopctl.Memory.Promoter
   alias Loopctl.Memory.PromotionTelemetry
@@ -171,6 +174,16 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
         )
 
         persist(scope, session_id, fingerprint, candidates)
+
+      {:error, refusal} when is_egress_refusal(refusal) ->
+        # US-41.4 (AC-41.4.3): the ONE mapping from an egress refusal to an Oban
+        # outcome lives in `Loopctl.Egress.oban_result/1`: `:egress_blocked` CANCELS
+        # (a permanent configuration state; retrying burns max_attempts and no data
+        # was sent), while `:pin_stale` / `:egress_unavailable` SNOOZE (an IP change
+        # or a DB hiccup is recoverable, and cancelling would silently strand the
+        # item). The cancel reason NAMES the scope and the offending endpoint
+        # (AC-41.4.6).
+        Egress.oban_result(refusal)
 
       {:error, :rate_limited_local} ->
         # US-37.1 (AC-37.1.4): node-local provider admission backpressure. Snooze

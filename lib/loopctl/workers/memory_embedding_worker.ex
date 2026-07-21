@@ -56,6 +56,9 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
 
   require Logger
 
+  alias Loopctl.Egress
+
+  import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -118,6 +121,16 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
 
       {:error, :no_api_key} ->
         skip_no_embedding_key(tenant_id, memory_id)
+
+      {:error, refusal} when is_egress_refusal(refusal) ->
+        # US-41.4 (AC-41.4.3): the ONE mapping from an egress refusal to an Oban
+        # outcome lives in `Loopctl.Egress.oban_result/1`: `:egress_blocked` CANCELS
+        # (a permanent configuration state; retrying burns max_attempts and no data
+        # was sent), while `:pin_stale` / `:egress_unavailable` SNOOZE (an IP change
+        # or a DB hiccup is recoverable, and cancelling would silently strand the
+        # item). The cancel reason NAMES the scope and the offending endpoint
+        # (AC-41.4.6).
+        Egress.oban_result(refusal)
 
       {:error, :rate_limited_local} ->
         # US-37.1 (AC-37.1.4): a node-local provider admission rate-limit is

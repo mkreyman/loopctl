@@ -166,6 +166,28 @@ defmodule Loopctl.Net.UrlGuard do
     end
   end
 
+  @doc """
+  Resolves `host` (an IP literal or a hostname) to its address list WITHOUT
+  applying the denylist.
+
+  Exposed for `Loopctl.Egress.Policy` (US-41.4), which must be able to resolve a
+  host the OPERATOR deployment allowlist deliberately carves out of the denylist
+  (a loopback / private-range inference box). Pair it with `public_addresses?/1`
+  for everything that is NOT allowlisted, so the denylist keeps living in exactly
+  ONE module — there is no second, divergent URL policy (AC-41.4.9).
+  """
+  @spec resolve_host(String.t()) :: {:ok, [:inet.ip_address()]} | {:error, reason()}
+  def resolve_host(host) when is_binary(host), do: resolve(host)
+
+  @doc """
+  True when EVERY address in `ips` passes the private/loopback/CGNAT/link-local/
+  ULA denylist (including every v4-in-v6 embedding). An empty list is never
+  public — fail closed.
+  """
+  @spec public_addresses?([:inet.ip_address()]) :: boolean()
+  def public_addresses?([]), do: false
+  def public_addresses?(ips) when is_list(ips), do: check_ips(ips) == :ok
+
   # --- scheme / host ---
 
   defp check_scheme(%URI{scheme: scheme}, schemes) when is_binary(scheme) do

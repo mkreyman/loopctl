@@ -53,6 +53,10 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Egress
+
+  import Loopctl.Egress, only: [is_egress_refusal: 1]
+  alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ContentChunker
@@ -60,6 +64,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Oban.FairShare
+  alias Loopctl.Provider
   alias Loopctl.Provider.Admission
   alias Loopctl.Provider.RetryAfter
   alias Loopctl.SystemConfig
@@ -156,9 +161,20 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     # queue permanently (every lone job would snooze forever). See FairShare.
     case FairShare.gate(tenant_id, :ingestion, id) do
       {:snooze, _n} = snooze -> snooze
-      :ok -> ingest(tenant_id, source_type, content_hash, args)
+      :ok -> ingest_result(ingest(tenant_id, source_type, content_hash, args))
     end
   end
+
+  # US-41.4 (AC-41.4.3/.9): an egress refusal raised by the INGESTION FETCH (not
+  # just by the LLM extraction calls) is mapped by the ONE mapping —
+  # `Loopctl.Egress.oban_result/1` — so a `local_only` scope refusing a
+  # tenant-supplied URL CANCELS with a reason naming the scope and the endpoint,
+  # instead of being retried as a generic fetch failure.
+  defp ingest_result({:error, refusal})
+       when is_egress_refusal(refusal),
+       do: Egress.oban_result(refusal)
+
+  defp ingest_result(other), do: other
 
   defp ingest(tenant_id, source_type, content_hash, args) do
     url = args["url"]
@@ -182,9 +198,14 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     # the controller boundary 422s before enqueue, this is defense in depth.
     with :ok <- validate_project_id(project_id),
          :ok <- require_tenant_llm_key(tenant_id),
-         {:ok, content} <- resolve_content(url, raw_content) do
+         {:ok, content} <- resolve_content(egress_scope(tenant_id, project_id), url, raw_content) do
       ctx = %{
         tenant_id: tenant_id,
+        # US-41.4 (AC-41.4.2): the SAME scope the fetch was made under. The chunk
+        # bodies are POSTed to the model provider from `extract_and_persist_chunk/5`,
+        # so passing only `tenant_id` there would leave a PROJECT-only local_only
+        # marking unenforced on the extraction half of this job.
+        egress_scope: egress_scope(tenant_id, project_id),
         # content_hash seeds the DETERMINISTIC per-article idempotency_key (#264,
         # Finding 1) so an Oban retry that re-walks already-persisted chunks
         # no-ops instead of inserting duplicate rows.
@@ -317,6 +338,13 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       {:rate_limited_local, _acc} ->
         {:snooze, Admission.snooze_seconds()}
 
+      # US-41.4 (AC-41.4.3): an egress refusal — `Loopctl.Egress.oban_result/1` maps
+      # the PERMANENT `:egress_blocked` to a cancel (never {:error, _}, which Oban
+      # retries) and the recoverable `:pin_stale` / `:egress_unavailable` to a
+      # snooze. Already-persisted chunks stay committed; nothing left the boundary.
+      {:egress_refusal, refusal, _acc} ->
+        Egress.oban_result(refusal)
+
       # US-37.3 (AC-37.3.3): a chunk's Anthropic extraction was throttled with a
       # provider Retry-After. Snooze the whole job loss-free for ~that interval
       # (no attempt consumed) instead of the blind `attempt^4` backoff.
@@ -376,6 +404,14 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
              seen_titles: seen_titles
          }}
 
+      {:error, refusal} when is_egress_refusal(refusal) ->
+        # US-41.4 (AC-41.4.3): the scope is local_only and the resolved endpoint is
+        # not local (or the pin/marking is momentarily unusable). Halt the reduce and
+        # let `Loopctl.Egress.oban_result/1` decide the job outcome: CANCEL for the
+        # permanent `:egress_blocked`, SNOOZE for the recoverable `:pin_stale` /
+        # `:egress_unavailable`. No data was sent either way.
+        {:halt, {:egress_refusal, refusal, acc}}
+
       {:error, :rate_limited_local} ->
         # US-37.1 (AC-37.1.4): node-local provider admission backpressure. Halt the
         # reduce and signal the caller to snooze the whole job loss-free — the gate
@@ -408,7 +444,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # persistence reintroduces that need — a cross-chunk title collision would
   # otherwise abort the whole chunk on the `articles_tenant_title_active_idx`).
   defp extract_and_persist_chunk(ctx, chunk, chunk_index, remaining, seen_titles) do
-    case @content_extractor.extract_from_content(ctx.tenant_id, chunk,
+    case @content_extractor.extract_from_content(ctx.egress_scope, chunk,
            source_type: ctx.source_type
          ) do
       {:ok, extracted} ->
@@ -588,7 +624,13 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     byte_size(body)
   end
 
-  defp resolve_content(nil, content) when is_binary(content) and content != "" do
+  # US-41.4 (AC-41.4.2): articles carry a nullable `project_id`, so the ingestion
+  # fetch is scoped to the article's project when it has one and to the tenant
+  # otherwise. `Loopctl.Egress.Policy` resolves the effective marking as
+  # MOST-RESTRICTIVE (project OR tenant).
+  defp egress_scope(tenant_id, project_id), do: EgressScope.new(tenant_id, project_id)
+
+  defp resolve_content(_scope, nil, content) when is_binary(content) and content != "" do
     # Direct-content path: no Content-Type to consult, so the UTF-8 validity
     # check is the whole guard (#263). Non-UTF-8 inline content (a PDF/binary
     # posted directly) would raise Jason.EncodeError inside the extractor's JSON
@@ -596,18 +638,23 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     ensure_utf8_text(content)
   end
 
-  defp resolve_content(url, _content) when is_binary(url) do
-    # SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm). Validate AND pin the
-    # user-supplied URL immediately before fetching (the controller also validates
-    # at enqueue time). pin/1 resolves once and the connection targets that exact
-    # IP, closing the DNS-rebinding / TOCTOU window.
+  defp resolve_content(scope, url, _content) when is_binary(url) do
+    # SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm) AND the US-41.4 local_only
+    # guard, in that order — they are different controls:
+    #
+    #   * `UrlGuard.pin/1` is the SSRF denylist. It runs FIRST and unconditionally,
+    #     because a private-range URL must be refused for EVERY tenant, marked or not.
+    #   * `Loopctl.Provider.get/3` then applies the ONE egress policy (AC-41.4.9:
+    #     ingestion consults it too, not just the provider guard and the probe). The
+    #     purpose is `:ingest`: a host declared for `inference` does NOT authorize
+    #     loopctl to fetch tenant-supplied URLs on a local_only scope.
     case UrlGuard.pin(url) do
-      {:ok, pinned} -> fetch_url(url, pinned)
+      {:ok, pinned} -> fetch_url(scope, url, pinned)
       {:error, reason} -> blocked_url(url, reason)
     end
   end
 
-  defp resolve_content(nil, _), do: {:error, :no_content}
+  defp resolve_content(_scope, nil, _), do: {:error, :no_content}
 
   defp blocked_url(url, reason) do
     Logger.warning(
@@ -618,7 +665,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     {:error, {:url_blocked, reason}}
   end
 
-  defp fetch_url(url, pinned) do
+  defp fetch_url(scope, url, pinned) do
     req_opts =
       UrlGuard.pinned_request_opts(pinned)
       |> Keyword.merge(
@@ -631,7 +678,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       )
       |> maybe_add_plug()
 
-    case Req.get(req_opts) do
+    case Provider.get(url, req_opts, %{scope: scope, purpose: :ingest, pinned_by_caller: true}) do
       {:ok, %{status: status} = resp} when status in 200..299 ->
         handle_fetched_body(resp.body, Req.Response.get_header(resp, "content-type"))
 
@@ -642,6 +689,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
         )
 
         {:error, {:url_fetch_failed, status}}
+
+      {:error, refusal} when is_egress_refusal(refusal) ->
+        # US-41.4: the ingestion FETCH was refused by the egress guard. Propagate the
+        # refusal unchanged so `perform/1` maps it through `Egress.oban_result/1`
+        # (cancel vs snooze) instead of burying it in a generic fetch error.
+        {:error, refusal}
 
       {:error, reason} ->
         Logger.warning(

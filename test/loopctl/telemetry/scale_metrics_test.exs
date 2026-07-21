@@ -66,7 +66,8 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.oban.poll.error.count",
     "loopctl.ingestion.backlog_gate.failed_open.count",
     "loopctl.knowledge.article_linking.corpus_size",
-    "loopctl.cluster.peers.count"
+    "loopctl.cluster.peers.count",
+    "loopctl.egress.blocked.count"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this
@@ -1060,6 +1061,64 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       # The default ScaleAlerts ETS table is not owned by anyone in :test.
       assert :ets.info(:loopctl_scale_alerts) == :undefined
+    end
+  end
+
+  describe "egress.blocked counter (US-41.4, AC-41.4.6)" do
+    test "the counter is defined, tagged by the bounded reason + a cap-gated tenant_id" do
+      counter = metric("loopctl.egress.blocked.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert counter.event_name == [:loopctl, :egress, :blocked]
+      assert MapSet.new(counter.tags) == MapSet.new([:reason, :tenant_id])
+      # The endpoint HOST is tenant-supplied and therefore unbounded — it lives on the
+      # aggregated decision row and in egress_posture, never as a Prometheus label.
+      refute :endpoint_host in counter.tags
+    end
+
+    test "egress_blocked_tags/1 emits the bounded reason + gated tenant_id, never the host" do
+      tags =
+        ScaleMetrics.egress_blocked_tags(%{
+          reason: "non_local",
+          tenant_id: "t-1",
+          endpoint_host: "api.openai.com",
+          scope: "tenant:t-1"
+        })
+
+      assert tags.reason == "non_local"
+      refute Map.has_key?(tags, :endpoint_host)
+      refute Map.has_key?(tags, :scope)
+      assert Map.has_key?(tags, :tenant_id)
+
+      assert ScaleMetrics.egress_blocked_tags(%{}).reason == "unknown"
+    end
+
+    test "a blocked decision reaches a real Prometheus scrape (AC-41.4.6 aggregate rate)" do
+      reporter_name = :"egress_blocked_test_#{System.unique_integer([:positive])}"
+      counter = metric("loopctl.egress.blocked.count")
+
+      start_supervised!(
+        {TelemetryMetricsPrometheus.Core,
+         [metrics: [counter], name: reporter_name, start_async: false]}
+      )
+
+      for _i <- 1..3 do
+        :telemetry.execute([:loopctl, :egress, :blocked], %{count: 1}, %{
+          tenant_id: "t-1",
+          scope: "tenant:t-1",
+          endpoint_host: "api.openai.com",
+          reason: "non_local"
+        })
+      end
+
+      scrape = TelemetryMetricsPrometheus.Core.scrape(reporter_name)
+
+      assert scrape =~ "loopctl_egress_blocked_count"
+      assert scrape =~ ~s(reason="non_local")
+      # The exact per-call rate is what this counter exists for: the audit rows are
+      # deliberately deduplicated per window, so 3 calls must read as 3 here.
+      assert scrape =~ ~r/loopctl_egress_blocked_count\{[^}]*\} 3/
+      refute scrape =~ "api.openai.com"
     end
   end
 

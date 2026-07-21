@@ -1871,6 +1871,88 @@ async function setLlmConfig({
   return toContent(result);
 }
 
+// --- US-41.4: fail-closed no-egress guard -----------------------------------
+//
+// egress_posture is a READ available at AGENT role: an agent must be able to
+// verify locality with the key it already has, or the whole verify-before-harvest
+// workflow fails. WRITING local_only is asymmetric: ENABLE (tightening) is
+// orchestrator+, CLEAR (widening) is user-only, and declaring a trusted endpoint
+// is user-only. Re-pinning is agent-role on purpose — a home Ollama box or a DHCP
+// VPS changes IP routinely and recovery must not need a human.
+async function egressPosture() {
+  const result = await apiCall(
+    "GET",
+    "/api/v1/egress/posture",
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function setLocalOnly({ project_id, acknowledge } = {}) {
+  const body = {};
+  if (project_id != null) body.project_id = project_id;
+  if (acknowledge === true) body.acknowledge = true;
+  // ENABLE = tightening = orchestrator+.
+  const result = await apiCall(
+    "POST",
+    "/api/v1/egress/local-only",
+    body,
+    process.env.LOOPCTL_ORCH_KEY,
+  );
+  return toContent(result);
+}
+
+async function clearLocalOnly({ project_id } = {}) {
+  // CLEAR = self-widening = EXACT user key. An agent must never be able to
+  // re-open egress one tool call before a harvest.
+  const qs = project_id ? `?project_id=${encodeURIComponent(project_id)}` : "";
+  const result = await apiCall(
+    "DELETE",
+    `/api/v1/egress/local-only${qs}`,
+    null,
+    process.env.LOOPCTL_USER_KEY,
+    { exactKey: true },
+  );
+  return toContent(result);
+}
+
+async function declareTrustedEndpoint({ host, purposes, note } = {}) {
+  const body = { host, purposes };
+  if (note != null) body.note = note;
+  const result = await apiCall(
+    "POST",
+    "/api/v1/egress/trusted-endpoints",
+    body,
+    process.env.LOOPCTL_USER_KEY,
+    { exactKey: true },
+  );
+  return toContent(result);
+}
+
+async function revokeTrustedEndpoint({ host } = {}) {
+  const result = await apiCall(
+    "DELETE",
+    `/api/v1/egress/trusted-endpoints/${encodeURIComponent(host)}`,
+    null,
+    process.env.LOOPCTL_USER_KEY,
+    { exactKey: true },
+  );
+  return toContent(result);
+}
+
+async function egressRepin({ host, project_id } = {}) {
+  const body = { host };
+  if (project_id != null) body.project_id = project_id;
+  const result = await apiCall(
+    "POST",
+    "/api/v1/egress/repin",
+    body,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function knowledgeLlmUsage(args = {}) {
   // Query-string building lives in lib/http-helpers.js so the test suite exercises
   // the same from/to/limit/offset logic the server ships.
@@ -4864,6 +4946,145 @@ const TOOLS = [
 
   // Per-tenant BYO LLM config + usage (Epic 28 residual, #179)
   {
+    name: "egress_posture",
+    description:
+      "VERIFY BEFORE YOU HARVEST. Reports this instance's egress posture for YOUR tenant: " +
+      "the resolved embedding and chat endpoints, a locality VERDICT for each " +
+      "(network-local / 'tenant-declared (unverified attestation), not network-local' / " +
+      "non-local), your declared trusted endpoints with their purposes, per-scope " +
+      "local_only status, and any named posture defects. Endpoints are shown; KEYS NEVER " +
+      "ARE. Call this BEFORE sending private documents anywhere, instead of trusting that " +
+      "the operator configured things correctly. READ tool, available at AGENT role — the " +
+      "key you already have. NOTE the deployment allowlist CONTENTS are operator " +
+      "infrastructure and are NOT disclosed at agent role: you get only a boolean per " +
+      "endpoint saying whether its verdict came from the allowlist (contents at user+). " +
+      "SCOPE OF THE GUARANTEE: fail-closed enforcement covers every outbound HTTP call " +
+      "made by loopctl application code on the MODEL-PROVIDER path. Webhook delivery is " +
+      "not covered yet (US-41.5), and HTTP performed inside a dependency, plus this " +
+      "separate mcp-server codebase, are outside the static chokepoint check.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "set_local_only",
+    description:
+      "TIGHTEN the posture: mark a scope local_only so loopctl HARD-REFUSES any " +
+      "model-provider call whose resolved endpoint is not classified local. Default is OFF " +
+      "everywhere; nothing changes until a scope opts in. Scope resolution is " +
+      "MOST-RESTRICTIVE-WINS (project OR tenant) and a project can NEVER relax a tenant " +
+      "marking. MANDATORY PRE-FLIGHT: the call is REFUSED with 409 would_block_endpoints, " +
+      "naming every endpoint that would become egress_blocked, unless you pass " +
+      "acknowledge: true — because on a tenant still using vendor default endpoints this " +
+      "instantly stops embedding, extraction, classification and merge, and only a " +
+      "human user-role key can undo it. Requires an ORCHESTRATOR key: tightening is safe " +
+      "to automate. CLEARING is a different tool (clear_local_only) and is user-only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description:
+            "Mark this PROJECT only (omit to mark the whole tenant). A project-less row — " +
+            "a tenant-wide article, any memory — always follows the TENANT marking.",
+        },
+        acknowledge: {
+          type: "boolean",
+          description:
+            "Accept the reported blocked posture and proceed. Required when the pre-flight " +
+            "finds endpoints that would become egress_blocked.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "clear_local_only",
+    description:
+      "WIDEN the posture: remove a scope's local_only marking, re-permitting non-local " +
+      "model-provider egress for it. Requires your EXACT user-role key " +
+      "(LOOPCTL_USER_KEY) — deliberately NOT available to an agent or an orchestrator, " +
+      "because clearing is the self-widening move that would otherwise let an automated " +
+      "key re-open egress immediately before a harvest. Audited with actor and scope.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "Clear this PROJECT's marking (omit to clear the tenant marking).",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "declare_trusted_endpoint",
+    description:
+      "Declare a host you attest is YOUR OWN (your VPS, tailscale funnel, or domain) so a " +
+      "local_only scope can reach it. THIS IS AN UNVERIFIED TENANT ATTESTATION, NOT " +
+      "NETWORK LOCALITY: loopctl does not prove you own the host, and the posture report " +
+      "and custody claim label it 'tenant-declared (unverified attestation), not " +
+      "network-local' — never as network-local. THREE ENFORCED CONSTRAINTS: (1) PUBLIC " +
+      "ADDRESSES ONLY — a host that resolves to loopback, 0/8, 10/8, 127/8, 169.254/16, " +
+      "172.16-31, 192.168/16, 100.64/10 or fdaa::/16 is REJECTED at write time and again " +
+      "at pin time, whether given literally or via a public hostname that resolves there; " +
+      "private-range carve-outs are available ONLY through the operator-controlled " +
+      "deployment allowlist, which no role can write. (2) PURPOSE-SCOPED — a host declared " +
+      "for inference does NOT authorize webhook POSTs of your content to it, nor loopctl " +
+      "FETCHING tenant-supplied URLs from it (purpose 'ingest'). (3) VENDOR " +
+      "HOSTS EXCLUDED (api.openai.com, api.anthropic.com). Requires your EXACT user-role " +
+      "key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        host: {
+          type: "string",
+          description:
+            "The PUBLIC hostname (or a full URL — only the authority is kept), e.g. " +
+            "'ollama.example.com'.",
+        },
+        purposes: {
+          type: "array",
+          items: { type: "string", enum: ["inference", "webhook", "ingest"] },
+          description:
+            "What this declaration authorizes. At least one. Declarations are honoured " +
+            "ONLY for their declared purposes.",
+        },
+        note: { type: "string", description: "Free-form operator note." },
+      },
+      required: ["host", "purposes"],
+    },
+  },
+  {
+    name: "revoke_trusted_endpoint",
+    description:
+      "Revoke a tenant-declared trusted endpoint. Invalidation is IMMEDIATE — the " +
+      "declaration does not keep working for the remainder of the pin TTL. Requires your " +
+      "EXACT user-role key.",
+    inputSchema: {
+      type: "object",
+      properties: { host: { type: "string", description: "The declared host to revoke." } },
+      required: ["host"],
+    },
+  },
+  {
+    name: "egress_repin",
+    description:
+      "Recover from a :pin_stale error. loopctl pins the IP set it classified so the " +
+      "address it connects to is the address it vetted (closing DNS rebinding). When your " +
+      "box gets a new lease and the address set changes, calls return the DISTINCT " +
+      ":pin_stale error — NOT egress_blocked — and this tool re-resolves and re-pins the " +
+      "host. Available at AGENT role BY DESIGN: home Ollama boxes, tailscale funnels and " +
+      "DHCP VPSes change IP routinely, and requiring a human user-role write to recover " +
+      "would contradict loopctl's agent-native, no-UI design.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        host: { type: "string", description: "The host to re-pin." },
+        project_id: { type: "string", description: "Scope the re-pin to a project." },
+      },
+      required: ["host"],
+    },
+  },
+  {
     name: "llm_config",
     description:
       "CHECK your BYO LLM onboarding status. Returns this tenant's per-operation model " +
@@ -5683,6 +5904,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_ingestion_jobs":
       return await knowledgeIngestionJobs(args);
+
+    // US-41.4 — fail-closed no-egress guard
+    case "egress_posture":
+      return await egressPosture();
+
+    case "set_local_only":
+      return await setLocalOnly(args);
+
+    case "clear_local_only":
+      return await clearLocalOnly(args);
+
+    case "declare_trusted_endpoint":
+      return await declareTrustedEndpoint(args);
+
+    case "revoke_trusted_endpoint":
+      return await revokeTrustedEndpoint(args);
+
+    case "egress_repin":
+      return await egressRepin(args);
 
     // Per-tenant BYO LLM config + usage (Epic 28, #179)
     case "llm_config":

@@ -65,6 +65,8 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Egress
+  alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Knowledge.Article
   alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
@@ -154,38 +156,55 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
     batch = fetch_batch(tenant_id, cursor, batch_size)
     tally = process_batch(tenant_id, resolved, batch, run_mode, min_confidence)
 
-    if transient_outage?(batch, tally) do
-      # A batch dominated by TRANSIENT errors (connection refused, timeout, 5xx,
-      # 408/429) means the classifier upstream is unreachable -- NOT that the
-      # articles or the tenant's key are bad. Snooze: Oban re-runs THIS SAME job
-      # (same cursor) later WITHOUT consuming an attempt and WITHOUT advancing, so
-      # an outage pauses the migration and resumes cleanly when connectivity
-      # returns -- no articles skipped, no audit spam.
-      snooze =
-        Application.get_env(
-          :loopctl,
-          :knowledge_reclassify_snooze_seconds,
-          @default_snooze_seconds
+    cond do
+      # US-41.4 (AC-41.4.3): THIS is the classification worker the AC names. An
+      # egress refusal is NOT an upstream outage: `:egress_blocked` is a permanent
+      # local configuration state, so snoozing it would re-run the same cursor every
+      # 60s FOREVER for a permanently blocked tenant while logging the misleading
+      # "upstream likely unreachable". `Loopctl.Egress.oban_result/1` is the ONE
+      # mapping — CANCEL on `:egress_blocked` (naming the scope and the offending
+      # endpoint), SNOOZE on the recoverable `:pin_stale` / `:egress_unavailable`.
+      tally.egress_refusal ->
+        Logger.warning(
+          "KnowledgeReclassifyWorker: tenant=#{tenant_id} classification refused by the " <>
+            "egress guard — #{Egress.refusal_reason(tally.egress_refusal)}"
         )
 
-      Logger.warning(
-        "KnowledgeReclassifyWorker: tenant=#{tenant_id} batch failed to classify " <>
-          "(#{tally.transient_errors}/#{tally.processed} transient); upstream likely " <>
-          "unreachable. Snoozing #{snooze}s and retrying the same cursor (nothing skipped)."
-      )
+        Egress.oban_result(tally.egress_refusal)
 
-      {:snooze, snooze}
-    else
-      # PERMANENT errors (4xx auth/bad-request, unparseable) do NOT snooze — a
-      # permanently-misconfigured tenant (bad key / bogus model) would otherwise
-      # snooze every 60s forever (review #4). Log if permanent errors dominate,
-      # then advance normally: those articles stay unchanged and the migration
-      # progresses to completion rather than looping.
-      maybe_warn_permanent(tenant_id, tally)
-      log_audit(tenant_id, run_mode, tally, processed_so_far)
-      new_processed = processed_so_far + tally.processed
-      maybe_chain(batch, tenant_id, args, batch_size, max_per_run, new_processed)
-      :ok
+      transient_outage?(batch, tally) ->
+        # A batch dominated by TRANSIENT errors (connection refused, timeout, 5xx,
+        # 408/429) means the classifier upstream is unreachable -- NOT that the
+        # articles or the tenant's key are bad. Snooze: Oban re-runs THIS SAME job
+        # (same cursor) later WITHOUT consuming an attempt and WITHOUT advancing, so
+        # an outage pauses the migration and resumes cleanly when connectivity
+        # returns -- no articles skipped, no audit spam.
+        snooze =
+          Application.get_env(
+            :loopctl,
+            :knowledge_reclassify_snooze_seconds,
+            @default_snooze_seconds
+          )
+
+        Logger.warning(
+          "KnowledgeReclassifyWorker: tenant=#{tenant_id} batch failed to classify " <>
+            "(#{tally.transient_errors}/#{tally.processed} transient); upstream likely " <>
+            "unreachable. Snoozing #{snooze}s and retrying the same cursor (nothing skipped)."
+        )
+
+        {:snooze, snooze}
+
+      true ->
+        # PERMANENT errors (4xx auth/bad-request, unparseable) do NOT snooze — a
+        # permanently-misconfigured tenant (bad key / bogus model) would otherwise
+        # snooze every 60s forever (review #4). Log if permanent errors dominate,
+        # then advance normally: those articles stay unchanged and the migration
+        # progresses to completion rather than looping.
+        maybe_warn_permanent(tenant_id, tally)
+        log_audit(tenant_id, run_mode, tally, processed_so_far)
+        new_processed = processed_so_far + tally.processed
+        maybe_chain(batch, tenant_id, args, batch_size, max_per_run, new_processed)
+        :ok
     end
   end
 
@@ -235,7 +254,10 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
         title: a.title,
         body: a.body,
         category: a.category,
-        metadata: a.metadata
+        metadata: a.metadata,
+        # US-41.4 (AC-41.4.2): the article's own project is the egress scope its
+        # title+body are classified under.
+        project_id: a.project_id
       }
     )
     |> after_cursor(cursor)
@@ -266,7 +288,8 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
     batch
     |> Task.async_stream(
       fn article ->
-        {article, @classifier.classify(tenant_id, article.title, article.body, classify_opts)}
+        scope = EgressScope.new(tenant_id, article.project_id)
+        {article, @classifier.classify(scope, article.title, article.body, classify_opts)}
       end,
       max_concurrency: max_concurrency,
       timeout: @classify_timeout_ms,
@@ -285,6 +308,10 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
       errors: 0,
       transient_errors: 0,
       permanent_errors: 0,
+      # The FIRST egress refusal seen in the batch (US-41.4, AC-41.4.3). It decides
+      # the whole job's outcome: the guard's verdict is per-SCOPE, so every other
+      # article in the batch would be refused identically.
+      egress_refusal: nil,
       by_transition: %{}
     }
   end
@@ -296,6 +323,8 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   end
 
   defp reduce_outcome({:ok, {_article, {:error, reason}}}, acc, _min_confidence, _run_mode) do
+    acc = record_egress_refusal(acc, reason)
+
     # Classify error rate/transient split (review #4): a PERMANENT error (4xx
     # auth/bad-request, unparseable verdict, no_api_key) must not cause an infinite
     # snooze; only TRANSIENT errors (timeout/5xx/429/connection) signal an outage.
@@ -319,10 +348,26 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
     end
   end
 
+  # Remembers the FIRST egress refusal of the batch (nil-preserving: a later one
+  # never overwrites it, so the reported endpoint is the one actually hit first).
+  defp record_egress_refusal(%{egress_refusal: nil} = acc, reason) do
+    case Egress.refusal(reason) do
+      nil -> acc
+      refusal -> %{acc | egress_refusal: refusal}
+    end
+  end
+
+  defp record_egress_refusal(acc, _reason), do: acc
+
   # Permanent = a retry can't fix it: a 4xx (other than 408 timeout / 429 rate
   # limited, which ARE transient), an unparseable verdict, or a missing key.
   # Everything else (connection/timeout/5xx/request_failed) is transient.
   defp permanent_classify_error?(:no_api_key), do: true
+
+  # US-41.4: an egress refusal is NEVER a transient upstream outage. Without this
+  # clause the catch-all below buckets it as transient, which is what made the whole
+  # batch look like an outage and drove the forever-snooze loop AC-41.4.3 forbids.
+  defp permanent_classify_error?({tag, _details}) when tag in [:egress_blocked], do: true
   defp permanent_classify_error?(:unparseable_classification), do: true
 
   defp permanent_classify_error?({:api_error, status, _body})

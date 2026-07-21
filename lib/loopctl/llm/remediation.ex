@@ -102,5 +102,39 @@ defmodule Loopctl.Llm.Remediation do
   """
   @spec for_fallback_reason(String.t() | nil) :: t() | nil
   def for_fallback_reason("no_embedding_key"), do: for_credential(:embedding)
+
+  # US-41.4 (AC-41.4.6): a fail-CLOSED egress refusal IS agent-actionable, but the
+  # action is a POSTURE change, not a credential. Point the agent at the read tool
+  # it can call with the key it already has (`egress_posture`, role :agent) and name
+  # the three legitimate resolutions. A tenant declaration is deliberately labelled
+  # as an unverified attestation here too — the wording is a contract, not prose.
+  def for_fallback_reason("egress_blocked") do
+    %{
+      title: "Egress blocked by a local_only marking",
+      detail:
+        "This scope is marked local_only and the resolved endpoint is not classified " <>
+          "local, so the call was refused before any request was made and no data left " <>
+          "the boundary. Call the egress_posture tool (role :agent) to see the resolved " <>
+          "endpoints and their locality verdicts. Resolve it by declaring the endpoint " <>
+          "as a tenant-trusted endpoint for the required purpose (role :user; a " <>
+          "declaration is " <>
+          Loopctl.Egress.tenant_declared_label() <>
+          "), configuring a local endpoint AT TENANT level (role :user), or clearing " <>
+          "the local_only marking (role :user).",
+      action: "egress_posture"
+    }
+  end
+
+  def for_fallback_reason("pin_stale") do
+    %{
+      title: "Pinned endpoint address changed",
+      detail:
+        "The declared endpoint's address set changed (a new DHCP lease, a moved " <>
+          "tailscale funnel). This is NOT an egress policy refusal. Re-pin the endpoint " <>
+          "via the egress repin operation — it requires NO role :user write — and retry.",
+      action: "egress_repin"
+    }
+  end
+
   def for_fallback_reason(_other), do: nil
 end

@@ -22,9 +22,14 @@ defmodule Loopctl.Knowledge.ClassifierBehaviour do
   caller can resolve the tenant's key ONCE and thread it through many calls
   (review #19), avoiding a per-article `Loopctl.Llm.resolve/2` DB read. When
   absent, the implementation resolves per call.
+
+  The first argument is the `Loopctl.Egress.Scope` the call is made on behalf of
+  (US-41.4, AC-41.4.2) — the ARTICLE's project, since the article's title and body
+  are what gets POSTed to the provider. A bare `tenant_id` binary is shorthand for
+  the tenant-wide scope.
   """
   @callback classify(
-              tenant_id :: Ecto.UUID.t(),
+              scope :: Loopctl.Egress.Scope.t() | Ecto.UUID.t(),
               title :: String.t(),
               body :: String.t(),
               opts :: keyword()

@@ -17,6 +17,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Egress
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleCursor
@@ -629,7 +630,10 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   end
 
   defp execute_search(tenant_id, {:search, q}, "semantic", opts) do
-    case Knowledge.generate_embedding(tenant_id, q) do
+    # US-41.4 (AC-41.4.2): thread the request's `:project_id` filter into the egress
+    # scope, so a PROJECT-only `local_only` marking is enforced on the explicit
+    # semantic path exactly as it is on combined.
+    case Knowledge.generate_embedding(tenant_id, q, project_id: opts[:project_id]) do
       {:ok, embedding} ->
         # US-37.5: an explicit semantic search whose heavy read is SHED (tenant over
         # its per-tenant in-flight HeavyRead cap) degrades to keyword-only — same
@@ -647,6 +651,13 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         # Mandatory BYO (review #8): a keyless tenant's explicit semantic search must
         # NOT 503. Degrade to keyword-only with `fallback: true`, mirroring combined.
         semantic_keyword_fallback(tenant_id, q, opts, :no_api_key)
+
+      # US-41.4 (AC-41.4.6/.7): an EGRESS refusal is a permanent LOCAL configuration
+      # decision, not a provider outage. A bare 503 mislabels it, names neither the
+      # reason nor the offending endpoint, and denies the interactive path the
+      # keyword degrade the combined path already performs. Degrade identically.
+      {:error, {tag, _details}} when tag in [:egress_blocked, :pin_stale, :egress_unavailable] ->
+        semantic_keyword_fallback(tenant_id, q, opts, tag)
 
       {:error, _} ->
         {:error, :embedding_unavailable}
@@ -671,11 +682,17 @@ defmodule LoopctlWeb.KnowledgeSearchController do
          %{
            result
            | meta:
-               Map.merge(meta, %{
+               meta
+               |> Map.merge(%{
                  fallback: true,
                  search_mode: "keyword_only",
                  fallback_reason: fallback_reason
                })
+               # AC-41.4.7: for an EGRESS refusal the meta must also name the
+               # offending endpoint and carry the reserved `excluded_tiers` — the
+               # SAME contract fragment the combined path emits, so the two cannot
+               # drift. Omitted for non-egress reasons.
+               |> Map.merge(Egress.degraded_contract_meta(tenant_id, fallback_reason))
          }}
 
       other ->

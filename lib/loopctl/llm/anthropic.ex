@@ -29,8 +29,10 @@ defmodule Loopctl.Llm.Anthropic do
 
   require Logger
 
+  alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
+  alias Loopctl.Provider
   alias Loopctl.Provider.Admission
   alias Loopctl.Provider.RetryAfter
 
@@ -41,6 +43,18 @@ defmodule Loopctl.Llm.Anthropic do
   # timeout (review #5). retry :transient + max_retries drives Req's retry.
   @default_receive_timeout 25_000
   @default_max_retries 0
+
+  @doc """
+  The Anthropic API BASE URL this client actually posts to.
+
+  The SINGLE source of truth for the chat endpoint: `Loopctl.Egress` (posture +
+  the `local_only` enable pre-flight) reads it from HERE rather than re-deriving
+  it from a config key nothing else consults, so the endpoint that gets vetted is
+  always the endpoint the guard sees. A second, divergent URL resolution is an
+  AC-41.4.9 review failure.
+  """
+  @spec base_url() :: String.t()
+  def base_url, do: @base_url
 
   @type usage_meta :: %{
           optional(:source_type) => String.t() | nil,
@@ -61,20 +75,35 @@ defmodule Loopctl.Llm.Anthropic do
 
   All returned error terms are sanitized via `Loopctl.Llm.ProviderError` and never
   carry a raw provider body — the error union below is `ProviderError.t()`.
+
+  ## Egress scope (US-41.4, AC-41.4.2)
+
+  The first argument is the `Loopctl.Egress.Scope` the chat call is made on behalf
+  of; a bare `tenant_id` is accepted as shorthand for the tenant-wide scope. Key +
+  endpoint resolution stays TENANT-scoped — the project half narrows only the
+  `local_only` marking, which is applied at the egress chokepoint.
   """
-  @spec message(Ecto.UUID.t(), Llm.operation(), (String.t() -> map()), usage_meta(), keyword()) ::
+  @spec message(
+          EgressScope.t() | Ecto.UUID.t(),
+          Llm.operation(),
+          (String.t() -> map()),
+          usage_meta(),
+          keyword()
+        ) ::
           {:ok, String.t()}
           | {:error, :no_api_key}
           | {:error, :rate_limited_local}
           | {:error, ProviderError.t()}
-  def message(tenant_id, operation, body_fun, usage_meta \\ %{}, req_opts \\ [])
+  def message(scope_or_tenant_id, operation, body_fun, usage_meta \\ %{}, req_opts \\ [])
       when is_function(body_fun, 1) do
-    case Llm.resolve(tenant_id, operation) do
+    scope = EgressScope.coerce(scope_or_tenant_id)
+
+    case Llm.resolve(scope.tenant_id, operation) do
       {:error, :no_api_key} ->
         {:error, :no_api_key}
 
       {:ok, %{api_key: api_key, model: model}} ->
-        call(tenant_id, operation, api_key, model, body_fun, usage_meta, req_opts)
+        call(scope, operation, api_key, model, body_fun, usage_meta, req_opts)
     end
   end
 
@@ -91,7 +120,7 @@ defmodule Loopctl.Llm.Anthropic do
   `ProviderError.t()` — every returned error term is sanitized and body-free.
   """
   @spec call(
-          Ecto.UUID.t(),
+          EgressScope.t() | Ecto.UUID.t(),
           Llm.operation(),
           String.t(),
           String.t(),
@@ -102,13 +131,38 @@ defmodule Loopctl.Llm.Anthropic do
           {:ok, String.t()}
           | {:error, :rate_limited_local}
           | {:error, ProviderError.t()}
-  def call(tenant_id, operation, api_key, model, body_fun, usage_meta \\ %{}, req_opts \\ [])
+  def call(
+        scope_or_tenant_id,
+        operation,
+        api_key,
+        model,
+        body_fun,
+        usage_meta \\ %{},
+        req_opts \\ []
+      )
       when is_binary(api_key) and is_binary(model) and is_function(body_fun, 1) do
     body = model |> body_fun.() |> Map.put(:model, model)
-    post(tenant_id, operation, model, body, usage_meta, api_key, req_opts)
+
+    post(
+      EgressScope.coerce(scope_or_tenant_id),
+      operation,
+      model,
+      body,
+      usage_meta,
+      api_key,
+      req_opts
+    )
   end
 
-  defp post(tenant_id, operation, model, body, usage_meta, api_key, req_opts) do
+  defp post(
+         %EgressScope{tenant_id: tenant_id} = scope,
+         operation,
+         model,
+         body,
+         usage_meta,
+         api_key,
+         req_opts
+       ) do
     # US-37.1: per-(tenant, provider) token-bucket admission gate. On an empty
     # node-local bucket, short-circuit with `{:error, :rate_limited_local}` BEFORE
     # building/sending the request — and crucially BEFORE the `record_provider_error/1`
@@ -116,11 +170,19 @@ defmodule Loopctl.Llm.Anthropic do
     # `[:loopctl, :llm, :provider_error]` storm signal (parallel to the breaker
     # exemption in AC-37.1.3).
     with :ok <- Admission.admit(tenant_id, :anthropic) do
-      do_post(tenant_id, operation, model, body, usage_meta, api_key, req_opts)
+      do_post(scope, operation, model, body, usage_meta, api_key, req_opts)
     end
   end
 
-  defp do_post(tenant_id, operation, model, body, usage_meta, api_key, req_opts) do
+  defp do_post(
+         %EgressScope{tenant_id: tenant_id} = scope,
+         operation,
+         model,
+         body,
+         usage_meta,
+         api_key,
+         req_opts
+       ) do
     opts =
       [
         json: body,
@@ -136,7 +198,11 @@ defmodule Loopctl.Llm.Anthropic do
       |> maybe_put_plug()
 
     # NOTE: never log `opts` / `api_key` — the key is a tenant secret.
-    case Req.post("#{@base_url}/messages", opts) do
+    # US-41.4 (AC-41.4.4): routed through the SINGLE egress chokepoint, which
+    # refuses `local_only` scopes on a non-local endpoint BEFORE the request is
+    # built. Admission (fail-OPEN) stays its own `with` clause above so the two
+    # failure modes never share a code path.
+    case Provider.post("#{base_url()}/messages", opts, %{scope: scope, purpose: :inference}) do
       {:ok, %{status: 200, body: %{"content" => [%{"text" => text} | _]} = resp}} ->
         record_usage_safe(tenant_id, operation, model, resp["usage"], usage_meta)
         {:ok, text}
@@ -179,6 +245,16 @@ defmodule Loopctl.Llm.Anthropic do
         reason = {:api_error, status, body}
         record_provider_error(reason)
         {:error, ProviderError.sanitize(reason, RetryAfter.from_response(status, resp))}
+
+      # US-41.4: a fail-CLOSED egress refusal (and the DISTINCT `:pin_stale`) is a
+      # local CONFIGURATION decision, not a provider failure. Return the bare atom
+      # WITHOUT `record_provider_error/1` — counting it would inflate the fleet-wide
+      # `[:loopctl, :llm, :provider_error]` storm signal for what is, by design, a
+      # permanent local refusal (the same reasoning that exempts
+      # `:rate_limited_local`). No data was sent.
+      {:error, {egress, _details} = refusal}
+      when egress in [:egress_blocked, :pin_stale, :egress_unavailable] ->
+        {:error, refusal}
 
       {:error, reason} ->
         # Never inspect the raw transport reason (review MED #4) — log a value-free

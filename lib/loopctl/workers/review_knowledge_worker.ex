@@ -39,6 +39,10 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Audit
+  alias Loopctl.Egress
+  alias Loopctl.Egress.Scope, as: EgressScope
+
+  import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Knowledge.Article
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -133,6 +137,15 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
     classify_result(result)
   end
 
+  defp classify_result({:error, refusal})
+       when is_egress_refusal(refusal) do
+    # US-41.4 (AC-41.4.3): `Loopctl.Egress.oban_result/1` is the ONE mapping —
+    # `:egress_blocked` CANCELS (permanent; no data was sent), `:pin_stale` /
+    # `:egress_unavailable` SNOOZE (recoverable). The cancel reason NAMES the scope
+    # and the offending endpoint (AC-41.4.6).
+    Egress.oban_result(refusal)
+  end
+
   defp classify_result({:error, :rate_limited_local}) do
     # US-37.1 (AC-37.1.4): node-local provider admission backpressure is loss-free —
     # snooze (no Oban attempt consumed, never a discard) rather than burning a retry
@@ -153,13 +166,37 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   # Backstop for a key removed between the perform/1 gate and here: map
   # {:error, :no_api_key} to a clean {:discard} rather than an infinite retry.
   defp extract(tenant_id, context) do
-    case @extractor.extract_articles(tenant_id, context) do
+    # US-41.4 (AC-41.4.2): the review context (findings, summary) is POSTed to the
+    # model provider, so the call is scoped to the reviewed STORY's project — a
+    # project-only `local_only` marking must refuse it.
+    scope = EgressScope.new(tenant_id, story_project_id(tenant_id, context[:story_id]))
+
+    case @extractor.extract_articles(scope, context) do
       {:error, :no_api_key} ->
         {:discard, {:no_api_key, "tenant has no Anthropic API key configured (BYO required)"}}
 
       other ->
         other
     end
+  end
+
+  # The reviewed story's project, or `nil` (a tenant-wide scope) when the story is
+  # gone. Tenant-scoped, so a foreign story id can never widen the scope.
+  defp story_project_id(_tenant_id, nil), do: nil
+
+  defp story_project_id(tenant_id, story_id) do
+    import Ecto.Query
+
+    AdminRepo.one(
+      from(s in Loopctl.WorkBreakdown.Story,
+        where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+        select: s.project_id
+      )
+    )
+  rescue
+    # A malformed id must not crash the extraction: fall back to the (more
+    # restrictive-inheriting) tenant-wide scope.
+    _e -> nil
   end
 
   # A permanent failure a retry can't fix (mirrors ContentIngestionWorker):

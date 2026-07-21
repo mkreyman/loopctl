@@ -47,6 +47,9 @@ defmodule Loopctl.Knowledge do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Egress
+  alias Loopctl.Egress.Policy, as: EgressPolicy
+  alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.HeavyRead
   alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge.Analytics
@@ -4314,7 +4317,7 @@ defmodule Loopctl.Knowledge do
 
   defp do_merge(tenant_id, r, a, b) do
     case merge_synthesizer().synthesize(
-           tenant_id,
+           merge_egress_scope(tenant_id, a, b),
            %{title: a.title, body: a.body},
            %{title: b.title, body: b.body}
          ) do
@@ -4324,6 +4327,20 @@ defmodule Loopctl.Knowledge do
       {:error, reason} ->
         handle_merge_error(r, reason)
     end
+  end
+
+  # US-41.4 (AC-41.4.2): BOTH articles' bodies are POSTed to the model provider, so
+  # the synthesis must run under the MOST RESTRICTIVE of their scopes. When either
+  # article's project is marked `local_only`, that project's scope is used — a
+  # tenant-wide scope would let one project's content ship because the OTHER
+  # article happens to be unmarked.
+  defp merge_egress_scope(tenant_id, a, b) do
+    scopes =
+      [a.project_id, b.project_id]
+      |> Enum.uniq()
+      |> Enum.map(&EgressScope.new(tenant_id, &1))
+
+    Enum.find(scopes, hd(scopes), &EgressPolicy.local_only?/1)
   end
 
   # PERMANENT synthesis errors (non-408/429 4xx, unparseable output) must NOT be
@@ -4350,6 +4367,14 @@ defmodule Loopctl.Knowledge do
   end
 
   defp permanent_merge_error?(:unparseable_merge), do: true
+
+  # US-41.4 (AC-41.4.3): `:egress_blocked` is a PERMANENT local configuration
+  # refusal — nothing was sent and nothing changes on its own. Without this clause
+  # the catch-all buckets it as transient and the nightly conflict executor retries
+  # the identical, permanently refused synthesis forever, logging "transiently
+  # failed". `:pin_stale` / `:egress_unavailable` stay transient (they self-heal),
+  # which is why only this tag is listed.
+  defp permanent_merge_error?({:egress_blocked, _details}), do: true
 
   # US-37.3: a throttle 4-tuple (429/503 + Retry-After) is transient — it must NOT
   # match the permanent 4xx clause below (that clause is arity-3 only, but be
@@ -6489,7 +6514,7 @@ defmodule Loopctl.Knowledge do
     # a second outbound provider call; otherwise generate here as before.
     embedding_result =
       case Keyword.get(opts, :embedding) do
-        nil -> try_generate_embedding(tenant_id, query_string, [])
+        nil -> try_generate_embedding(tenant_id, query_string, project_id_opt(opts))
         precomputed -> precomputed
       end
 
@@ -6558,7 +6583,8 @@ defmodule Loopctl.Knowledge do
      %{
        results: paginated.results,
        meta:
-         Map.merge(kw.meta, %{
+         kw.meta
+         |> Map.merge(%{
            fallback: true,
            search_mode: "keyword_only",
            fallback_reason: fallback_reason,
@@ -6566,8 +6592,28 @@ defmodule Loopctl.Knowledge do
            limit: paginated.limit,
            offset: paginated.offset
          })
+         |> Map.merge(degraded_contract_meta(tenant_id, fallback_reason))
      }}
   end
+
+  # US-41.4 (AC-41.4.7): the degraded response is EXPLICITLY LABELLED and never a
+  # bare empty list. Whenever the semantic path is unavailable — `egress_blocked`,
+  # circuit open, or an embedding fallback — the meta names the REASON and the
+  # OFFENDING ENDPOINT, and carries a reserved, extensible `excluded_tiers` field.
+  #
+  # `excluded_tiers` is present and EMPTY here by contract. US-41.6 populates it:
+  # AC-41.6.4 removes encrypted bodies from the FTS index, so without the field a
+  # `local_only` + `encrypt_body` tenant would receive a successful-looking 200 with
+  # a structurally impossible-to-populate result set that reads as "nothing in your
+  # KB". Shipping the field now keeps the response contract stable across that
+  # change. The offending-endpoint lookup is TENANT-scoped and DB-free.
+  # Shared verbatim with the MEMORY half (`Loopctl.Memory.recall/2`) so the
+  # AC-41.4.7 contract cannot drift between the two paths. `offending_endpoint` is
+  # OMITTED for a non-egress reason (`no_embedding_key`, `rate_limited_local`,
+  # budget shedding, a semantic-index problem): naming an endpoint that had nothing
+  # to do with the failure would send an agent chasing the wrong thing.
+  defp degraded_contract_meta(tenant_id, fallback_reason),
+    do: Egress.degraded_contract_meta(tenant_id, fallback_reason)
 
   # -- Semantic → keyword fallback observability (#297) ------------------------
   #
@@ -6626,6 +6672,19 @@ defmodule Loopctl.Knowledge do
   end
 
   defp reason_to_tag(:no_api_key), do: "no_embedding_key"
+  # US-41.4 (AC-41.4.6/.7): the scope is `local_only` and the resolved embedding
+  # endpoint is not local, so the semantic path is refused BEFORE any request —
+  # keyword fallback, HTTP 200, never a 500, and never a bare empty list.
+  defp reason_to_tag(:egress_blocked), do: "egress_blocked"
+  defp reason_to_tag(:pin_stale), do: "pin_stale"
+  # US-41.4: the refusal now carries its DETAILS (`{tag, details}`) so the failure
+  # that reaches an agent/Oban record names the scope and the offending endpoint.
+  # The TAG stays bounded (safe as a Prometheus label).
+  defp reason_to_tag({tag, details})
+       when tag in [:egress_blocked, :pin_stale, :egress_unavailable] and is_map(details),
+       do: to_string(tag)
+
+  defp reason_to_tag(:egress_unavailable), do: "egress_unavailable"
   defp reason_to_tag(:circuit_open), do: "embedding_circuit_open"
   defp reason_to_tag(:rate_limited_local), do: "embedding_rate_limited_local"
   # US-37.5: the semantic heavy read was shed because the tenant is over its
@@ -7671,11 +7730,38 @@ defmodule Loopctl.Knowledge do
 
   `opts`:
     * `:timeout` — Task.yield budget in ms (default `#{@embedding_yield_ms}`).
+    * `:scope` — the `Loopctl.Egress.Scope` this call is made on behalf of
+      (US-41.4, AC-41.4.2). Defaults to the TENANT-WIDE scope. Supply it (or
+      `:project_id`) whenever the caller knows the project, so a project-only
+      `local_only` marking is enforced at the provider chokepoint.
+    * `:project_id` — shorthand for building the scope from an already-present
+      search/ingest filter.
   """
   @spec generate_embedding(Ecto.UUID.t(), String.t(), keyword()) ::
           {:ok, [float()]} | {:error, term()}
   def generate_embedding(tenant_id, query_string, opts \\ []) when is_binary(tenant_id) do
     try_generate_embedding(tenant_id, query_string, opts)
+  end
+
+  # US-41.4 (AC-41.4.2): the egress scope this embedding call is made on behalf of.
+  # Endpoint resolution is TENANT-scoped, so the project half narrows only the
+  # local_only MARKING — which `Loopctl.Egress.Policy` resolves MOST-RESTRICTIVE-wins
+  # (project OR tenant). A caller that knows no project (memories, tenant-wide
+  # articles) correctly gets the tenant-wide scope.
+  # Carries an already-present `:project_id` search/ingest filter into the egress
+  # scope without dragging the rest of the sub-search opts along.
+  defp project_id_opt(opts) do
+    case Keyword.get(opts, :project_id) do
+      nil -> []
+      project_id -> [project_id: project_id]
+    end
+  end
+
+  defp egress_scope(tenant_id, opts) do
+    case Keyword.get(opts, :scope) do
+      %EgressScope{} = scope -> scope
+      _ -> EgressScope.new(tenant_id, Keyword.get(opts, :project_id))
+    end
   end
 
   defp try_generate_embedding(tenant_id, query_string, opts) do
@@ -7685,7 +7771,7 @@ defmodule Loopctl.Knowledge do
       {:error, :circuit_open}
     else
       timeout = Keyword.get(opts, :timeout, @embedding_yield_ms)
-      run_embedding_task(tenant_id, query_string, timeout)
+      run_embedding_task(tenant_id, egress_scope(tenant_id, opts), query_string, timeout)
     end
   end
 
@@ -7703,11 +7789,11 @@ defmodule Loopctl.Knowledge do
   # fallback and the workers snooze on — so the interactive path degrades gracefully
   # instead of blocking, and NO circuit-breaker / provider-error signal is recorded
   # (self-imposed backpressure is not a provider failure).
-  defp run_embedding_task(tenant_id, query_string, timeout) do
+  defp run_embedding_task(tenant_id, scope, query_string, timeout) do
     case embedding_concurrency().acquire(tenant_id) do
       :ok ->
         try do
-          run_capped_embedding_task(tenant_id, query_string, timeout)
+          run_capped_embedding_task(tenant_id, scope, query_string, timeout)
         after
           embedding_concurrency().release(tenant_id)
         end
@@ -7717,7 +7803,7 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp run_capped_embedding_task(tenant_id, query_string, timeout) do
+  defp run_capped_embedding_task(tenant_id, scope, query_string, timeout) do
     # Task.Supervisor.async_nolink so an embedding task crash surfaces as
     # {:exit, reason} from Task.yield (the `_ ->` clause -> {:error, :timeout})
     # rather than crashing THIS process (AC-37.2.5). The inner rescue still catches
@@ -7730,7 +7816,7 @@ defmodule Loopctl.Knowledge do
     task =
       Task.Supervisor.async_nolink(Loopctl.Knowledge.EmbeddingTaskSupervisor, fn ->
         try do
-          embedding_client().generate_embedding(tenant_id, query_string)
+          embedding_client().generate_embedding(scope, query_string)
         rescue
           e -> {:error, {:embedding_crash, Exception.message(e)}}
         end
@@ -7776,6 +7862,8 @@ defmodule Loopctl.Knowledge do
 
   `opts`:
     * `:timeout` — Task.yield budget in ms (default `#{@embedding_yield_ms}`).
+    * `:scope` / `:project_id` — the egress scope (US-41.4, AC-41.4.2); see
+      `generate_embedding/3`.
   """
   @spec generate_embeddings(Ecto.UUID.t(), [String.t()], keyword()) ::
           {:ok, [[float()]]} | {:error, term()}
@@ -7795,18 +7883,18 @@ defmodule Loopctl.Knowledge do
       {:error, :circuit_open}
     else
       timeout = Keyword.get(opts, :timeout, @embedding_yield_ms)
-      run_embeddings_task(tenant_id, texts, timeout)
+      run_embeddings_task(tenant_id, egress_scope(tenant_id, opts), texts, timeout)
     end
   end
 
   # Mirrors `run_embedding_task/3`: ONE concurrency slot for the WHOLE batch
   # (US-37.2 — a batch is one outbound call, so it charges one slot), released in an
   # `after`. Over the cap → `{:error, :rate_limited_local}` (worker snoozes).
-  defp run_embeddings_task(tenant_id, texts, timeout) do
+  defp run_embeddings_task(tenant_id, scope, texts, timeout) do
     case embedding_concurrency().acquire(tenant_id) do
       :ok ->
         try do
-          run_capped_embeddings_task(tenant_id, texts, timeout)
+          run_capped_embeddings_task(tenant_id, scope, texts, timeout)
         after
           embedding_concurrency().release(tenant_id)
         end
@@ -7821,13 +7909,13 @@ defmodule Loopctl.Knowledge do
   # signal per batch — a batch failure counts once, not per text. UNLIKE the single
   # path it is EXEMPT from latency-based tripping (a batch's wall-clock is inherently
   # larger than one text; see the success clause below).
-  defp run_capped_embeddings_task(tenant_id, texts, timeout) do
+  defp run_capped_embeddings_task(tenant_id, scope, texts, timeout) do
     started_ms = System.monotonic_time(:millisecond)
 
     task =
       Task.Supervisor.async_nolink(Loopctl.Knowledge.EmbeddingTaskSupervisor, fn ->
         try do
-          embedding_client().generate_embeddings(tenant_id, texts)
+          embedding_client().generate_embeddings(scope, texts)
         rescue
           e -> {:error, {:embedding_crash, Exception.message(e)}}
         end
@@ -7937,6 +8025,27 @@ defmodule Loopctl.Knowledge do
   # (both gate on `breaker_countable?/1`); otherwise our own backpressure would
   # trip the breaker and degrade every tenant.
   defp breaker_countable?(:rate_limited_local), do: false
+  # US-41.4 (AC-41.4.6): a fail-CLOSED egress refusal is a PERMANENT LOCAL
+  # CONFIGURATION decision — the scope is `local_only` and the resolved endpoint is
+  # not local — not a provider failure. No request was ever issued. Counting it
+  # would open the per-tenant breaker (degrading every path for that tenant) and
+  # emit the fleet-wide `[:loopctl, :llm, :provider_error]` storm signal for a
+  # deliberate configuration state, exactly the failure `:rate_limited_local` was
+  # exempted for above. The replacement operator signal is the dedicated
+  # `[:loopctl, :egress, :blocked]` counter, so a tenant silently non-functional
+  # since an enable is still visible on the dashboards.
+  defp breaker_countable?(:egress_blocked), do: false
+  # `:pin_stale` is DISTINCT from `:egress_blocked` (an IP changed, not a policy
+  # refusal) and equally not a provider failure — remediation is a cheap re-pin.
+  defp breaker_countable?(:pin_stale), do: false
+  defp breaker_countable?(:egress_unavailable), do: false
+
+  # The tagged refusal form `{tag, details}` (US-41.4 review): same reasoning —
+  # never a provider failure, no request was issued.
+  defp breaker_countable?({tag, details})
+       when tag in [:egress_blocked, :pin_stale, :egress_unavailable] and is_map(details),
+       do: false
+
   # Unknown/other transport-ish failures: count (conservative — a real outage).
   defp breaker_countable?(_), do: true
 

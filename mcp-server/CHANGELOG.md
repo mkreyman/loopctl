@@ -5,6 +5,68 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.53.1 — 2026-07-20 (US-41.4 review fixes)
+
+### Changed
+
+- **`declare_trusted_endpoint`** — the purpose enum gains **`ingest`**. Purposes
+  are `inference | webhook | ingest`. The content-ingestion FETCH now consults the
+  same egress policy module as the provider guard (AC-41.4.9), so a host declared
+  for `inference` does NOT authorize loopctl to fetch tenant-supplied URLs from it
+  on a `local_only` scope, and vice versa.
+- README documents the six egress tools (the designated source of truth for the
+  tool list) and the tool count is corrected to 109.
+
+## 2.53.0 — 2026-07-20 (fail-closed no-egress guard — US-41.4)
+
+### Added
+
+- **`egress_posture`** — READ tool at AGENT role over `GET /api/v1/egress/posture`.
+  Reports the resolved embedding + chat endpoints for the calling tenant, a
+  locality VERDICT for each (network-local / "tenant-declared (unverified
+  attestation), not network-local" / non-local), the tenant's declared trusted
+  endpoints with their purposes, per-scope `local_only` status and any named
+  posture defects. Endpoints are shown; KEYS NEVER ARE. This is how an agent
+  VERIFIES locality before harvesting private documents, instead of trusting it.
+  The deployment allowlist CONTENTS are deliberately NOT disclosed at agent role
+  (operator infrastructure is precisely the target list an SSRF attacker wants):
+  at `:agent` the payload carries only a boolean per endpoint saying whether the
+  verdict came from the allowlist; contents appear at `:user` and above.
+- **`set_local_only`** — ORCHESTRATOR key. Marks a tenant or project scope
+  `local_only`, after which loopctl HARD-REFUSES any model-provider call whose
+  resolved endpoint is not classified local. Default OFF everywhere. Carries a
+  MANDATORY PRE-FLIGHT: refused with `409 would_block_endpoints` naming every
+  endpoint that would become `egress_blocked`, unless `acknowledge: true` is
+  passed — a silent enable on a vendor-default tenant is a tenant-wide outage
+  undoable only by a human key.
+- **`clear_local_only`** — EXACT user key. Roles are ASYMMETRIC on purpose:
+  tightening is safe to automate, clearing is the self-widening move an agent
+  must never make.
+- **`declare_trusted_endpoint`** / **`revoke_trusted_endpoint`** — EXACT user
+  key. A declaration is an UNVERIFIED TENANT ATTESTATION and is never presented
+  as network-local. Public addresses ONLY (checked at write time AND at pin
+  time), purpose-scoped (`inference` / `webhook`), vendor hosts excluded. A
+  declaration carves NOTHING out of the SSRF denylist — only the
+  operator-controlled deployment allowlist can do that, and no role can write it.
+- **`egress_repin`** — AGENT key. Recovers from the DISTINCT `:pin_stale` error
+  (never conflated with `egress_blocked`) when a declared host's address set
+  changes. Agent-role by design: home Ollama boxes, tailscale funnels and DHCP
+  VPSes change IP routinely.
+
+### Changed
+
+- `.well-known/loopctl` now publishes instance CAPABILITIES (supported embedding
+  dimensions, whether tenant-supplied endpoints are permitted, and the tier
+  list), discoverable PRE-AUTH. No tenant-specific data.
+
+### Scope of the guarantee
+
+Fail-closed enforcement covers **every outbound HTTP call made by loopctl
+application code** on the MODEL-PROVIDER path, proven by a static chokepoint
+check in CI. Webhook delivery is NOT yet covered (US-41.5). HTTP performed
+inside a dependency, and this separate `mcp-server/` codebase, are outside the
+static check — stated here rather than implied away.
+
 ## 2.52.0 — 2026-07-21 (handoff reliability — issue #454)
 
 ### Added

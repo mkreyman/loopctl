@@ -120,8 +120,18 @@ defmodule Loopctl.Knowledge.ProposalGate do
   # `:embedding` is ignored and we fall back to generating.
   defp reuse_or_generate_embedding(tenant_id, attrs, opts) do
     case Keyword.get(opts, :embedding) do
-      vector when is_list(vector) and vector != [] -> {:ok, vector}
-      _ -> Knowledge.generate_embedding(tenant_id, build_text(attrs))
+      vector when is_list(vector) and vector != [] ->
+        {:ok, vector}
+
+      _ ->
+        # US-41.4 (AC-41.4.2): the text being embedded is the PROPOSAL's own title
+        # and body, so the egress scope is the proposal's project. Without it a
+        # project-only `local_only` marking would not be enforced on a path that
+        # runs SYNCHRONOUSLY in the `knowledge_create` write path — and because the
+        # gate deliberately falls OPEN, the refusal would be silent.
+        Knowledge.generate_embedding(tenant_id, build_text(attrs),
+          project_id: attrs["project_id"] || attrs[:project_id]
+        )
     end
   end
 

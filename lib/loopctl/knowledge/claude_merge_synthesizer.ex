@@ -29,7 +29,7 @@ defmodule Loopctl.Knowledge.ClaudeMergeSynthesizer do
   @max_body_chars 12_000
 
   @impl true
-  def synthesize(tenant_id, a, b) do
+  def synthesize(scope_or_tenant_id, a, b) do
     user_content =
       "ARTICLE A\nTitle: #{a.title}\n\nBody:\n#{clip(a.body)}\n\n" <>
         "ARTICLE B\nTitle: #{b.title}\n\nBody:\n#{clip(b.body)}"
@@ -44,7 +44,7 @@ defmodule Loopctl.Knowledge.ClaudeMergeSynthesizer do
 
     # Merge is a larger synthesis with no tight outer timeout; give it a slightly
     # longer bounded client budget (review #5).
-    case Anthropic.message(tenant_id, :merge, body_fun, %{},
+    case Anthropic.message(scope_or_tenant_id, :merge, body_fun, %{},
            receive_timeout: 55_000,
            max_retries: 1
          ) do

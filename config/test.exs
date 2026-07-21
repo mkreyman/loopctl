@@ -608,3 +608,18 @@ config :loopctl, :article_similarity_search, Loopctl.MockArticleSimilaritySearch
 # a handful of links exercises the multi-chunk insert_all path without thousands of rows.
 config :loopctl, :article_link_corpus_sample_rate, 5
 config :loopctl, :article_link_insert_chunk_size, 2
+
+# US-41.4 — the OPERATOR deployment allowlist source. In test it is
+# PROCESS-LOCAL (`Loopctl.Test.AllowlistSource`) so an `async: true` test can
+# exercise an operator carve-out without `Application.put_env` (forbidden, and a
+# global race under async). The allowlist itself stays read-only at every role.
+config :loopctl, :local_allowlist_source, Loopctl.Test.AllowlistSource
+config :loopctl, :local_endpoint_allowlist, []
+
+# US-41.4 (AC-41.4.6): DISABLE the blocked-decision buffer's periodic flush in
+# test. The flush runs in the BlockedBuffer process, which owns no Ecto sandbox
+# connection, so a periodic drain would take an `async: true` test's buffered
+# counters and then fail to insert them (the tenant lives in another test's
+# sandbox transaction). Tests drain their OWN tenant with
+# `Loopctl.Egress.flush_blocked_decisions/1`.
+config :loopctl, :egress_blocked_flush_ms, :infinity

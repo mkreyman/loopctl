@@ -3,6 +3,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.EmbeddingConcurrency
@@ -1181,8 +1182,8 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       Knowledge.reset_circuit_breaker(b.id)
 
       # A always 5xx-fails; B always succeeds.
-      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn tenant_id, _text ->
-        if tenant_id == a.id do
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn scope, _text ->
+        if EgressScope.coerce(scope).tenant_id == a.id do
           {:error, {:api_error, 500, :provider_error}}
         else
           {:ok, make_embedding(:query)}

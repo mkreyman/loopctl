@@ -42,7 +42,7 @@ defmodule Loopctl.Knowledge.LlmExtractor do
   """
 
   @impl true
-  def extract_articles(tenant_id, context) do
+  def extract_articles(scope_or_tenant_id, context) do
     user_message = build_user_message(context)
 
     body_fun = fn _model ->
@@ -53,7 +53,11 @@ defmodule Loopctl.Knowledge.LlmExtractor do
       }
     end
 
-    case Anthropic.message(tenant_id, :extraction, body_fun, %{source_type: "review_finding"},
+    case Anthropic.message(
+           scope_or_tenant_id,
+           :extraction,
+           body_fun,
+           %{source_type: "review_finding"},
            receive_timeout: @receive_timeout,
            max_retries: @max_retries
          ) do

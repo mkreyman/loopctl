@@ -23,9 +23,13 @@ defmodule Loopctl.Knowledge.ContentExtractorBehaviour do
 
   ## Parameters
 
-  - `tenant_id` -- the tenant whose BYO Anthropic key + extraction model to use.
-    The implementation resolves the tenant's key via `Loopctl.Llm.resolve/2` and
-    records token usage after a successful call.
+  - `scope` -- the `Loopctl.Egress.Scope` the extraction call is made on behalf of
+    (US-41.4, AC-41.4.2); a bare `tenant_id` binary is shorthand for the
+    TENANT-WIDE scope. Key + model resolution stays tenant-scoped — the project
+    half narrows only the `local_only` marking, which is applied at the egress
+    chokepoint. CALLERS THAT KNOW THE PROJECT MUST PASS THE SCOPE: content is
+    POSTed to the provider from here, so a project-only marking that stops at the
+    caller is not enforced at all.
   - `content` -- raw text content to extract knowledge from
   - `opts` -- keyword list of options (e.g., `source_type: "newsletter"`)
 
@@ -37,7 +41,7 @@ defmodule Loopctl.Knowledge.ContentExtractorBehaviour do
   - `{:error, reason}` -- extraction failure (triggers Oban retry)
   """
   @callback extract_from_content(
-              tenant_id :: Ecto.UUID.t(),
+              scope :: Loopctl.Egress.Scope.t() | Ecto.UUID.t(),
               content :: String.t(),
               opts :: keyword()
             ) ::

@@ -121,7 +121,7 @@ REST endpoint (`PATCH /api/v1/tenants/me/llm-config`), and the docs — so you (
 autonomous agent) can self-remediate without a human. Full agent-tenant lifecycle:
 [`docs/onboarding-agent-tenant.md`](../docs/onboarding-agent-tenant.md).
 
-## Tools (96)
+## Tools (109)
 
 > Plus **per-tenant generated Context Retriever tools** (`cr_*`) appended
 > dynamically at runtime — see [Dynamic per-tenant Context Retriever
@@ -310,6 +310,20 @@ it is enforced server-side and a no-op for a non-superadmin key — see below.)
 | `knowledge_unused_articles` | Published articles with zero accesses in the window. Optional: `days_unused` (default 30), `limit` (default 50, max 200). |
 | `knowledge_curation_log` | Concise human-readable log of KB CURATION adjustments — novelty-gate decisions (`gate_duplicate`/`gate_draft`) and conflict resolutions (`supersede`/`merge`/`dismiss`) — for analyzing the agents'-KB rollout, distinct from the verbose audit log. Each entry: `{at, kind, summary, refs, actor, confidence}`. **RECORDED ONLY when `settings.kb_curation_log` is on** (PATCH `/api/v1/admin/tenants/:id` with `settings:{kb_curation_log:true}`); off by default = no rows. Most recent first. Requires orchestrator role. Optional: `kind`, `since` (ISO8601), `limit` (default 50, max 500), `offset`. |
 | `knowledge_retrieval_metrics` | Daily retrieval-PRECISION time series: for each day, the share of search results the agent then opened (search → get/context within a window). A proxy for whether retrieval is improving as the corpus is de-duplicated, better navigated (MOCs), and conflict-resolved. Most recent day first. Requires orchestrator role. Optional: `limit` (default 30, max 365), `offset`. |
+
+### Egress / Privacy Tools (US-41.4)
+
+The fail-closed no-egress guard. `local_only` is **OFF by default everywhere** —
+nothing changes until a scope opts in.
+
+| Tool | Description |
+|---|---|
+| `egress_posture` | **VERIFY BEFORE YOU HARVEST.** This instance's egress posture for your tenant: the resolved embedding + chat endpoints with a locality VERDICT for each (`network-local` / `tenant-declared (unverified attestation), not network-local` / `non-local`), your declared trusted endpoints and their purposes, per-scope `local_only` / `encrypt_body`, and any named posture defects. Endpoints are shown; **keys never are**. Deployment-allowlist CONTENTS appear only at **user**+ — at agent role each endpoint carries only a boolean saying whether its verdict came from the allowlist. Agent key. |
+| `set_local_only` | **TIGHTEN**: mark a scope `local_only`, so loopctl HARD-REFUSES any model-provider call whose resolved endpoint is not classified local. Scope resolution is MOST-RESTRICTIVE-WINS (project OR tenant); a project can never relax a tenant marking. MANDATORY PRE-FLIGHT: refused with **409** `would_block_endpoints` naming every endpoint that would become `egress_blocked`, unless you pass `acknowledge: true`. Requires **orchestrator** key — tightening is safe to automate. |
+| `clear_local_only` | **WIDEN**: remove a scope's `local_only` marking. Requires your **user** key (`LOOPCTL_USER_KEY`) — deliberately not available to an agent or orchestrator, because clearing is the self-widening move an automated key must never make one call before a harvest. Audited with actor + scope. |
+| `declare_trusted_endpoint` | Declare a host you attest is YOUR OWN so a `local_only` scope can reach it. **This is an unverified tenant attestation, not network locality** — labelled as such everywhere. Three enforced constraints: PUBLIC addresses only (write time AND pin time), PURPOSE-SCOPED (`inference` / `webhook` / `ingest`), vendor hosts excluded. Carves nothing out of the SSRF denylist. Requires **user** key. |
+| `revoke_trusted_endpoint` | Revoke a declaration. Invalidation is IMMEDIATE and cluster-wide — a revoked declaration does not keep working for the remainder of the pin TTL. Requires **user** key. |
+| `egress_repin` | Recover from a `:pin_stale` error (your box got a new DHCP lease and the pinned address set changed — DISTINCT from `egress_blocked`). Re-resolves and re-pins the host. **Agent** key by design: requiring a human user-role write to recover would contradict loopctl's agent-native, no-UI design. |
 
 ### Discovery Tools
 

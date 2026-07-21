@@ -185,6 +185,18 @@ defmodule LoopctlWeb.Router do
     # Per-tenant BYO Anthropic LLM config (Epic 28 residual, #179). Role :user —
     # the PATCH stores a tenant secret (enforced by the controller's RequireRole).
     # PATCH (partial-merge) mirrors the sibling PATCH /tenants/me.
+    # US-41.4 — fail-closed no-egress guard surface. Roles are ASYMMETRIC and are
+    # enforced INSIDE the controller (this router has no role scopes): posture and
+    # repin at :agent, ENABLE at :orchestrator, CLEAR + declarations at :user.
+    # There is deliberately NO route that mutates the deployment allowlist.
+    get "/egress/posture", EgressController, :posture
+    post "/egress/local-only", EgressController, :enable_local_only
+    delete "/egress/local-only", EgressController, :clear_local_only
+    get "/egress/trusted-endpoints", EgressController, :list_trusted
+    post "/egress/trusted-endpoints", EgressController, :declare_trusted
+    delete "/egress/trusted-endpoints/:host", EgressController, :revoke_trusted
+    post "/egress/repin", EgressController, :repin
+
     get "/tenants/me/llm-config", LlmConfigController, :show
     patch "/tenants/me/llm-config", LlmConfigController, :update
     post "/tenants/:id/rotate-audit-key/challenge", TenantAuditKeyController, :challenge

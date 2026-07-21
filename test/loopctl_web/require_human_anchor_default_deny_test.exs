@@ -30,6 +30,25 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # Tenant self-management + BYO LLM config — account-neutral, not custody.
                {:patch, "/api/v1/tenants/me"},
                {:patch, "/api/v1/tenants/me/llm-config"},
+               # US-41.4 — the egress posture surface (local_only markings,
+               # tenant-declared trusted endpoints, re-pin). Deliberately NOT
+               # tier-gated: these routes TIGHTEN or repair a tenant's OWN data
+               # sovereignty, create no custody artifact, and spend no operator
+               # resource. An agent-rooted (KB-tier, self-signup) tenant is exactly
+               # the audience that most needs local_only, so gating it behind
+               # RequireHumanAnchor would make the privacy tier unreachable from
+               # the tier it is meant to protect — contradicting Epic 41's claim
+               # that Axis A ships on the hosted service unchanged. The controls
+               # that matter here are ROLE gates (enable = :orchestrator, clear +
+               # declare + revoke = :user) plus the write-time public-address /
+               # purpose / vendor-host validation, not the custody tier. The
+               # deployment allowlist — the only thing with real SSRF reach — has
+               # no route at any role.
+               {:post, "/api/v1/egress/local-only"},
+               {:delete, "/api/v1/egress/local-only"},
+               {:post, "/api/v1/egress/trusted-endpoints"},
+               {:delete, "/api/v1/egress/trusted-endpoints/:host"},
+               {:post, "/api/v1/egress/repin"},
                # rotate-audit-key (challenge + rotate) is gated by a FRESH
                # per-op WebAuthn assertion (WebAuthn.Reauth) + tenant ownership,
                # a STRONGER control than the tier gate — an agent-rooted tenant
