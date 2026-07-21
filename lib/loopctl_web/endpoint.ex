@@ -8,6 +8,15 @@ defmodule LoopctlWeb.Endpoint do
   # the signed session (see the ClientIp note below) — is opaque at rest in the
   # browser, not merely read-only (#461 item 3).
   #
+  # ONE-TIME CUTOVER SIDE EFFECT: adding `encryption_salt` converts `_loopctl_key`
+  # from signed-only to signed+encrypted, so on the deploy that ships this, every
+  # pre-existing browser cookie (signed but not encrypted) can no longer be
+  # decrypted by Plug.Session and is silently discarded — a fresh empty session is
+  # started. Any in-flight signup relying on the session-carried client IP
+  # (SignupLive) and any active browser/LiveView session lose state at cutover.
+  # This self-heals within one request and is acceptable for a short signup flow;
+  # it is called out here so the transient invalidation is not shipped silently.
+  #
   # `http_only: true` (the `:cookie` store's default, made explicit) keeps the
   # cookie off `document.cookie`, and `secure:` marks it HTTPS-only in prod.
   # `secure` is COMPILE-ENV gated (`config :loopctl, :session_secure` — true only in

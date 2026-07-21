@@ -37,12 +37,22 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
                    )
 
   # Exponential backoff schedule in seconds. #461 item 6 (lifetime-cap sub-point):
-  # this schedule IS the total-lifetime cap for a repeatedly-failing delivery. The
-  # five snoozes sum to 60+300+1500+7200+36_000 = 45_060s (~12.5h), after which the
-  # 6th failed attempt hits @max_attempts and `mark_exhausted/5` terminates the job
-  # (status :exhausted) and calls `Webhooks.maybe_auto_disable/2` — so a dead
-  # endpoint is bounded in both wall-clock (~12.5h) AND attempts (6), then
-  # auto-disabled. No additional explicit age cap is needed on top of this.
+  # this schedule bounds a repeatedly-failing delivery. The five backoff snoozes
+  # sum to 60+300+1500+7200+36_000 = 45_060s (~12.5h), after which the 6th failed
+  # attempt hits @max_attempts and `mark_exhausted/5` terminates the job (status
+  # :exhausted) and calls `Webhooks.maybe_auto_disable/2`, auto-disabling the
+  # endpoint.
+  #
+  # The HARD bound is ATTEMPTS (6 real delivery failures) — that is guaranteed and
+  # is what actually terminates the job. The ~12.5h wall-clock figure is
+  # BEST-EFFORT, not a hard cap: the FairShare gate at the top of perform/1 returns
+  # {:snooze, n} WITHOUT consuming an attempt, so under sustained cross-tenant
+  # contention on the :webhooks queue a failing delivery can be fair-share-snoozed
+  # arbitrarily many times between real attempts, pushing actual wall-clock past
+  # ~12.5h. This never affects termination (the job still stops deterministically
+  # after 6 real failures); only the wall-clock figure is soft. No additional
+  # explicit age cap is imposed — if a hard wall-clock bound is ever required,
+  # derive it from event.inserted_at.
   @backoff_schedule [60, 300, 1500, 7200, 36_000]
   @max_attempts 6
 
