@@ -460,6 +460,17 @@ defmodule LoopctlWeb.AdminTenantControllerTest do
 
       assert conn.status == 403
     end
+
+    test "returns 404 (not 500) for a malformed non-UUID tenant id", %{conn: conn} do
+      {raw_key, _} = fixture(:api_key, %{role: :superadmin})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/not-a-uuid/clear-halt/challenge", %{})
+
+      assert json_response(conn, 404)["error"]["status"] == 404
+    end
   end
 
   describe "POST /api/v1/admin/tenants/:id/clear-halt" do
@@ -669,6 +680,22 @@ defmodule LoopctlWeb.AdminTenantControllerTest do
 
       {:ok, reloaded} = Tenants.get_tenant(tenant.id)
       refute is_nil(reloaded.custody_halted_at)
+    end
+
+    test "returns 404 (not 500) for a malformed non-UUID id even with a well-formed body", ctx do
+      %{conn: conn, raw_key: raw_key, auth: auth} = ctx
+
+      # A well-formed assertion body but a garbage path id must be caught by the
+      # up-front UUID guard (404), NOT raise Ecto.Query.CastError deep in
+      # consume_challenge's tenant_id predicate (which would 500).
+      clear_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/not-a-uuid/clear-halt", %{
+          "webauthn_assertion" => assertion_body(Ecto.UUID.generate(), auth.credential_id)
+        })
+
+      assert json_response(clear_conn, 404)["error"]["status"] == 404
     end
 
     test "a non-superadmin key is rejected on clear-halt (role gate unchanged)", ctx do

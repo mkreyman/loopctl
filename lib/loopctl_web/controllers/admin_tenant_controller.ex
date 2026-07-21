@@ -405,6 +405,17 @@ defmodule LoopctlWeb.AdminTenantController do
   consumed against the same `tenant_id` in `clear_halt/2`.
   """
   def clear_halt_challenge(conn, %{"id" => tenant_id}) do
+    # Guard the raw path :id up front: a non-UUID string would otherwise reach
+    # `where: tenant_id == ^tenant_id` on a :binary_id column and raise
+    # Ecto.Query.CastError (unhandled 500). Mirror record_rejected_break_glass:
+    # a malformed id addresses no real tenant, so 404.
+    case Ecto.UUID.cast(tenant_id) do
+      {:ok, uuid} -> issue_clear_halt_challenge(conn, uuid)
+      :error -> respond_tenant_not_found(conn)
+    end
+  end
+
+  defp issue_clear_halt_challenge(conn, tenant_id) do
     case Reauth.issue_challenge(tenant_id, @clear_halt_purpose) do
       {:ok, issued} ->
         conn
@@ -468,6 +479,18 @@ defmodule LoopctlWeb.AdminTenantController do
   exactly once; replay is rejected.
   """
   def clear_halt(conn, %{"id" => id} = params) do
+    # Guard the raw path :id up front: the verify path (verify_and_consume ->
+    # consume_challenge) runs `c.tenant_id == ^tenant_id` on a :binary_id
+    # column BEFORE any 404, so a malformed id would raise Ecto.Query.CastError
+    # (unhandled 500) even with a well-formed assertion body. A non-UUID id
+    # addresses no real tenant, so 404 — mirroring record_rejected_break_glass.
+    case Ecto.UUID.cast(id) do
+      {:ok, uuid} -> require_assertion_and_clear(conn, uuid, params)
+      :error -> respond_tenant_not_found(conn)
+    end
+  end
+
+  defp require_assertion_and_clear(conn, id, params) do
     # Break-glass requires a VERIFIED WebAuthn assertion, not merely a
     # present one. Mirror the rotate-audit-key guard: the assertion must be
     # a map (the separate base64url fields), then it is cryptographically
@@ -489,6 +512,10 @@ defmodule LoopctlWeb.AdminTenantController do
         }
       })
     end
+  end
+
+  defp respond_tenant_not_found(conn) do
+    conn |> put_status(:not_found) |> json(%{error: %{message: "Not found", status: 404}})
   end
 
   defp verify_and_clear_halt(conn, id, assertion) do
@@ -528,23 +555,47 @@ defmodule LoopctlWeb.AdminTenantController do
         # responder can tie the recovery to a specific hardware factor.
         api_key = conn.assigns.current_api_key
 
-        Loopctl.AuditChain.append(tenant.id, %{
-          action: "halt_cleared",
-          actor_lineage: [],
-          entity_type: "tenant",
-          entity_id: tenant.id,
-          payload: %{
-            "cleared_by" => api_key.id,
-            "credential_id" =>
-              Base.url_encode64(verified.authenticator.credential_id, padding: false),
-            "sign_count" => verified.sign_count
-          }
-        })
+        append_result =
+          Loopctl.AuditChain.append(tenant.id, %{
+            action: "halt_cleared",
+            actor_lineage: [],
+            entity_type: "tenant",
+            entity_id: tenant.id,
+            payload: %{
+              "cleared_by" => api_key.id,
+              "credential_id" =>
+                Base.url_encode64(verified.authenticator.credential_id, padding: false),
+              "sign_count" => verified.sign_count
+            }
+          })
 
-        json(conn, %{data: %{id: tenant.id, custody_halted_at: nil, status: "halt_cleared"}})
+        # For an L6 break-glass recovery the forensic record is NOT optional: a
+        # cleared halt with no tamper-evident trace is exactly the byzantine
+        # state this control exists to prevent. Unlike the routine suspend/
+        # activate paths, do NOT fire-and-forget the append — if it fails, the
+        # halt is already cleared (recovery succeeded) but the audit chain is
+        # broken, so surface it loudly (500) instead of a misleading 200.
+        # clear_custody_halt is idempotent, so an operator retry is safe.
+        case append_result do
+          {:ok, _entry} ->
+            json(conn, %{data: %{id: tenant.id, custody_halted_at: nil, status: "halt_cleared"}})
+
+          {:error, _reason} ->
+            conn
+            |> put_status(:internal_server_error)
+            |> json(%{
+              error: %{
+                code: "audit_append_failed",
+                status: 500,
+                message:
+                  "Custody halt was cleared but the break-glass audit entry could not be " <>
+                    "recorded. Investigate the audit chain before relying on this recovery."
+              }
+            })
+        end
 
       {:error, :not_found} ->
-        conn |> put_status(:not_found) |> json(%{error: %{message: "Not found", status: 404}})
+        respond_tenant_not_found(conn)
     end
   end
 
