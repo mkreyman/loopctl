@@ -34,7 +34,7 @@ Nothing content-carrying is documented away.
 |---|---|---|
 | `Loopctl.Provider` (`lib/loopctl/provider.ex`) | yes | **IS the model-provider chokepoint wrapper.** Consults `Egress.Policy` on every call. Allowlisted because it is the wrapper, not a bypass. |
 | `Loopctl.Webhooks.ReqDelivery` (`lib/loopctl/webhooks/req_delivery.ex`) | **yes — the payload is tenant state** | **IS the webhook chokepoint wrapper (US-41.5).** Consults the same `Egress.Policy.check/4` with purpose `:webhook` and `tenant_supplied: true`, then pins (`pinned_request_opts` + `redirect: false`). Allowlisted for the same reason `Provider` is. |
-| `Loopctl.Workers.ContentIngestionWorker` (`resolve_content/3`) | no — INBOUND content; sends no tenant data | **Under the guard, not exempt.** Not in the allowlist at all: it pins with `UrlGuard.pin/1` and then issues the fetch through `Provider.get/3` (purpose `:ingest`, `pinned_by_caller: true`), so it consults the one policy like everything else. |
+| `Loopctl.Workers.ContentIngestionWorker` (`resolve_content/3`) | no — INBOUND content; sends no tenant data | **Under the guard, not exempt.** Not in the allowlist at all: it issues the fetch through `Provider.get/3` (purpose `:ingest`, `tenant_supplied_url: true`), so the SSRF denylist AND the locality decision are both made by the ONE policy. The old unconditional `UrlGuard.pin/1` pre-gate was REMOVED (US-41.5 review): it could not see the OPERATOR deployment allowlist, so an allowlisted private host was a legal webhook destination but still refused as an ingestion source, and every fetch resolved the URL twice. |
 | `Loopctl.Workers.ScaleAlertDeliveryWorker` | no — operator-plane alerting (metric name, value, threshold) | Delivers through `ReqDelivery` with **`scope: nil`**. The URL is operator configuration, not tenant data, and there is no tenant marking to apply; the SSRF denylist still applies (the same `UrlGuard` primitive the policy composes). |
 | `Loopctl.Verification.GitHubActions` (`lib/loopctl/verification/github_actions.ex`) | no — reads commit/check-run metadata | Operator-plane, fixed vendor host, never reachable from a tenant-supplied URL. Allowlisted. |
 | `Loopctl.Secrets.FlyAdapter` (`lib/loopctl/secrets/fly_adapter.ex`) | no — operator secret management | Operator-plane against the Fly GraphQL API. Fixed host, never tenant-supplied. Allowlisted. |
@@ -79,23 +79,78 @@ it). Blocked deliveries therefore cannot build a retry backlog.
 (`block_kind/1` returns `:transient`), so the job SNOOZES without consuming an
 attempt and nothing is recorded as blocked.
 
-Stated rather than hidden: because a transient refusal consumes no attempt, it
-does NOT advance the worker's app-level 6-attempt ladder — a persistently
-unresolvable destination re-checks every `Egress.transient_snooze_seconds/0`
-instead of exhausting. That is the US-41.4 contract (`:pin_stale` /
-`:egress_unavailable` are NEVER terminal, because nothing re-enqueues a cancelled
-job after the re-pin), and it is one snoozed job per event, not a growing
-backlog — the terminal-state proof in `WebhookObanTerminalTest` covers the
-BLOCKED case, which is the one an unbounded ladder would have amplified.
+A refusal term the policy does NOT recognise is `:unrecognized` — TERMINAL, and
+handled exactly like a block. Fail-closed classification must not route an
+unknown term onto the retry path (that is how a malformed `{:refused, term}` from
+a future delivery client would become an immortal job); `Egress.oban_result/1`
+already cancels an unknown term, and `block_kind/1` now matches it.
+
+#### The transient path is BOUNDED
+
+"Transient" describes the CAUSE, not a guarantee that it ends. A destination
+whose domain lapses classifies as `:egress_unavailable` on EVERY attempt, so an
+unconditional snooze — on a `max_attempts: 1` queue where each snooze also bumps
+`max_attempts` — produced one IMMORTAL job per event: `attempts` stayed 0, the
+event stayed `pending`, `consecutive_failures` never rose, the subscription was
+never auto-disabled, and each new event added another permanent job. Events
+accumulate, so that IS a growing backlog, and it contradicts AC-41.5.2 ("NOT an
+infinite retry").
+
+So `WebhookDeliveryWorker` allows at most
+`WebhookDeliveryWorker.max_transient_snoozes/0` free (attempt-less) snoozes per
+job; after that the refusal falls through to the ordinary failure ladder —
+burning an attempt each time, reaching `:exhausted` at the 6th, incrementing
+`consecutive_failures` and reaching the auto-disable valve, exactly as an
+unreachable destination did before US-41.5. The count is DERIVED from
+`Oban.Job.attempt` minus the event's own `attempts` (Oban increments `attempt` on
+every execution), so it needs no new column. The US-41.4 contract still holds for
+the transient causes it was written for: a re-pinnable blip recovers inside the
+free window and never burns an attempt.
+
+#### A resolver failure is TRANSIENT even on a marked scope
+
+`Policy` maps every classification error — a plain NXDOMAIN, a resolver timeout —
+to `{:egress_blocked, verdict: :unclassifiable}`. Fail-closed is right; treating
+it as PERMANENT was not. It made the SAME failure asymmetric by marking: on an
+unmarked scope it is `:egress_unavailable` and retried, while on a `local_only`
+scope it terminally dropped the delivery and labelled it `locality_denied` — whose
+documented remediation ("declare the endpoint, or clear the marking") cannot fix a
+DNS outage on an endpoint that is already declared. And because
+`enable_local_only/3` and `clear_local_only/3` both invalidate the `PinCache`, a
+cold cache right after a marking change is the EXPECTED state.
+
+So `Egress.block_kind/1` classifies `:unclassifiable` **for a real host** as
+`:transient` — bounded by the free-snooze cap above, so a permanently dead host
+still exhausts and still auto-disables. A refusal with NO host is a malformed
+destination and stays permanent. `Egress.oban_result/1` is deliberately NOT
+changed: its callers hand the result straight to Oban with no snooze budget of
+their own, so snoozing there would recreate the immortal-job defect.
 
 ### Config time beats delivery time (AC-41.5.3)
 
 `Webhooks.create_webhook/3` and `update_webhook/4` reject a non-local destination
 on an already-`local_only` scope with a changeset error on `:url` carrying the
-remediation. The check runs before the `Ecto.Multi`, so nothing is persisted. It
-only fires when the URL is actually being set/changed and the changeset is
-otherwise valid — otherwise an unrelated edit (`active: false`) to a
-pre-existing, now-incompatible subscription would be un-savable, including the
+remediation. The check runs inside the write's `Ecto.Multi` (see the lock below),
+so nothing is persisted on rejection.
+
+`project_id` is validated to belong to the CALLER's tenant first. The webhooks FK
+targets `projects.id` alone and these writes go through `AdminRepo` (no RLS), so
+a foreign `project_id` was accepted — and US-41.5 makes that field the selector
+for the delivery scope, so it matched no marking of this tenant and side-stepped a
+project-scoped `local_only` marking without touching the audited, `:user`-gated
+marking row.
+
+It fires when the edit changes the EFFECTIVE EGRESS DECISION and the changeset is
+otherwise valid — that is: the `url`, the `project_id` (which IS the delivery
+scope, `Scope.new(tenant_id, project_id)`), or a `false -> true` re-activation.
+Keying it on the URL alone left it bypassable: a `PATCH` carrying only
+`project_id` re-scoped a public destination under a `local_only` project and was
+ACCEPTED — precisely the "accepted, then silently blocked at delivery time"
+outcome AC-41.5.3 exists to prevent. Re-activation is checked for the same reason
+the enable pre-flight reports INACTIVE subscriptions.
+
+An edit that changes NEITHER (`active: false`, `events: [...]`) skips the check,
+so a pre-existing, now-incompatible subscription stays savable — including by the
 edit that fixes it.
 
 ### Enabling `local_only` with incompatible subscriptions (AC-41.5.4)
@@ -115,15 +170,65 @@ marking covers only that project's subscriptions. INACTIVE subscriptions are
 included — re-activating one under an unchanged marking would otherwise produce
 a silently blocked destination.
 
+**The pre-flight and the marking write are ONE transaction, under an advisory
+lock.** The enable decides on a snapshot of the SUBSCRIPTIONS; a concurrent
+`create_webhook/3` decides on a snapshot of the MARKINGS. Interleaved without a
+lock, a subscription created after the pre-flight snapshot landed under the new
+marking: absent from `{:would_block, endpoints}`, absent from
+`acknowledged_blocked_endpoints`, silently blocked at delivery — the silent state
+change AC-41.5.4 rules out. Both writers now take
+`Egress.lock_scope_config!/2` (transaction-scoped `pg_advisory_xact_lock`, keyed
+on the tenant UUID's first four bytes rather than `:erlang.phash2/1`, whose
+hashing is not guaranteed stable across OTP releases) as the FIRST step and run
+their check inside it.
+
+**Webhook destinations in the returned list are redacted to their HOST below role
+`:user`** (`Egress.redact_blocked_endpoints/2`). `POST /api/v1/egress/local-only`
+is `role: :orchestrator`, one level under the `role: :user` gate on
+`LoopctlWeb.WebhookController`, and a webhook path is frequently the credential.
+The marking row and the audit event still record the full URL — that is
+server-side state a `:user` reads back.
+
 ### Posture (AC-41.5.5)
 
 `Egress.posture/2` gained `webhook_destinations`: one entry per subscription with
-`endpoint`, `host`, `active`, the locality `verdict` label (network-local /
-tenant-declared (unverified attestation) / non-local / denylisted),
+`host`, `active`, the locality `verdict` label (network-local / tenant-declared
+(unverified attestation) / non-local / denylisted),
 `verdict_from_deployment_allowlist` (a BOOLEAN at `:agent` — allowlist contents
-stay `:user`+) and `blocked_by_local_only`. The destination URL is not a secret
-(only the signing secret is Cloak-encrypted), so it is disclosed like the
-provider endpoints.
+stay `:user`+) and `blocked_by_local_only`.
+
+**The FULL destination URL (`endpoint`) is `:user`+ only.** A webhook destination
+is frequently a CAPABILITY URL whose PATH is the credential (Slack
+`hooks.slack.com/services/T…/B…/<token>`, Discord, Teams, Zapier, n8n), and
+`LoopctlWeb.WebhookController` is `role: :user` at module level — so emitting it
+on the un-gated posture endpoint would be a role DOWNGRADE of existing data.
+AC-41.5.5 asks for "webhook destinations and their local classification", which
+`host` + `verdict` + `blocked_by_local_only` satisfies at `:agent`; `endpoint` is
+added at `:user`+, the same boolean-vs-contents split the deployment allowlist
+already uses.
+
+**The classification pass is BOUNDED.** Both the posture report and the
+`local_only` enable pre-flight classify TENANT-SUPPLIED hosts, and a cache miss
+pays a real DNS resolve. Unbounded, a tenant could make the endpoint agents call
+before every harvest take `max_webhooks × 3s` (with `max_webhooks` itself
+tenant-settable). At most `Egress.max_classified_webhooks/0` rows are read, and
+once `Egress.classification_budget_ms/0` is spent the remaining rows are reported
+`unclassified` — which is NOT a local verdict, so the pre-flight still names them.
+
+FAILED classifications are also NEGATIVELY CACHED for
+`Egress.Policy.negative_ttl_ms/0` (short — long enough to collapse a burst, short
+enough that a resolver blip clears promptly). Previously only successes were
+cached, so a dead tenant-supplied host repaid the full multi-second resolve on
+every posture call, forever. A negative entry is a REFUSAL, never a permit, so it
+can never widen egress.
+
+### Retention
+
+`:blocked` is terminal, so `WebhookCleanupWorker` prunes it alongside
+`:delivered` and `:exhausted`. It has to: a blocked delivery deliberately does not
+increment `consecutive_failures`, so the auto-disable valve never fires and a
+`local_only` tenant with one incompatible subscription emits a blocked row per
+matching state change indefinitely.
 
 ## Tenant isolation: explicit scoping on `AdminRepo`, not RLS
 
@@ -299,12 +404,13 @@ that the guard would refuse is refused at CONFIG time, before it can be saved.
 
 #### `tenant_supplied_url: true` — the SSRF denylist on the DEFAULT path
 
-The default (non-`local_only`) path deliberately never REFUSES: an unpinnable or
-denylisted host proceeds unpinned, because the SSRF denylist "is enforced by the
-callers that own it" (ingestion pins with `UrlGuard.pin/1` first). That was sound
-while every URL on this path was a hardcoded vendor host. `chat_base_url` made one
-of them TENANT-WRITABLE, so the chat client and the probe pass
-`tenant_supplied_url: true` on `Loopctl.Provider.post/3`, and
+The default (non-`local_only`) path deliberately never REFUSES for a HARDCODED
+VENDOR host: an unpinnable one proceeds unpinned, because turning a DNS blip into
+a refusal would hand every default tenant a brand-new failure mode. That was the
+whole story while every URL on this path was a vendor host. `chat_base_url` made
+one of them TENANT-WRITABLE, so the chat client, the probe and (since the US-41.5
+review) the ingestion fetch pass `tenant_supplied_url: true` on
+`Loopctl.Provider.post/3` / `get/3`, and
 `Egress.Policy.check/4` then refuses a `:denylisted` verdict with
 `{:error, :egress_blocked, details}` for EVERY tenant, marked or not. Without it a
 role `:user` key could point loopctl at `169.254.169.254`, a `.internal` host or any

@@ -87,6 +87,18 @@ defmodule Loopctl.Egress.WebhookEgressTest do
     })
   end
 
+  # Oban increments `attempt` on EVERY execution (and bumps `max_attempts` on a
+  # snooze), so `attempt` is how the worker counts the free transient snoozes a
+  # job has already taken.
+  defp deliver_at(event, tenant_id, attempt) do
+    WebhookDeliveryWorker.perform(%Oban.Job{
+      attempt: attempt,
+      args: %{"webhook_event_id" => event.id, "tenant_id" => tenant_id}
+    })
+  end
+
+  defp reload(event), do: AdminRepo.get!(WebhookEvent, event.id)
+
   # --- TC-41.5.1 -------------------------------------------------------------
 
   describe "TC-41.5.1 — local_only blocks a public webhook destination" do
@@ -466,12 +478,35 @@ defmodule Loopctl.Egress.WebhookEgressTest do
 
       assert [destination] = posture.webhook_destinations
       assert destination.webhook_id == webhook.id
-      assert destination.endpoint == "https://hooks.example.com/inbound"
       assert destination.host == "hooks.example.com"
       assert destination.verdict == "non-local"
       assert destination.verdict_from_deployment_allowlist == false
       assert destination.blocked_by_local_only
       assert destination.active
+    end
+
+    # A webhook destination's PATH is frequently the credential (Slack/Discord/
+    # Teams/Zapier capability URLs), and `LoopctlWeb.WebhookController` is
+    # `role: :user` at module level — so disclosing the full URL on the un-gated
+    # posture endpoint would be a role DOWNGRADE of existing data.
+    test "the FULL destination URL is :user+ only; :agent gets host + verdict",
+         %{tenant: tenant} do
+      _webhook = subscription(tenant.id, "https://hooks.example.com/services/T0/B0/s3cr3t")
+
+      assert [agent_view] = Egress.posture(tenant.id, :agent).webhook_destinations
+      refute Map.has_key?(agent_view, :endpoint)
+      assert agent_view.host == "hooks.example.com"
+      assert agent_view.verdict
+
+      for role <- [:user, :superadmin] do
+        assert [privileged] = Egress.posture(tenant.id, role).webhook_destinations
+        assert privileged.endpoint == "https://hooks.example.com/services/T0/B0/s3cr3t"
+      end
+
+      # An ORCHESTRATOR key is below :user in the hierarchy and gets the same
+      # redacted view an agent does.
+      assert [orchestrator_view] = Egress.posture(tenant.id, :orchestrator).webhook_destinations
+      refute Map.has_key?(orchestrator_view, :endpoint)
     end
 
     test "a tenant-declared destination is labelled as an UNVERIFIED ATTESTATION",
@@ -497,6 +532,52 @@ defmodule Loopctl.Egress.WebhookEgressTest do
       refute destination.blocked_by_local_only
     end
 
+    # The endpoint agents are told to call BEFORE EVERY HARVEST classified every
+    # webhook row serially with no deadline, so tenant-writable input (hosts, and
+    # `max_webhooks` itself) could make it take tens of seconds.
+    test "classification is BOUNDED — a slow resolver yields unclassified entries, not a hang",
+         %{tenant: tenant} do
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host ->
+        Process.sleep(div(Egress.classification_budget_ms(), 2) + 100)
+        {:ok, [{93, 184, 216, 34}]}
+      end)
+
+      for i <- 1..3, do: subscription(tenant.id, "https://hooks-#{i}.example.com/inbound")
+
+      destinations = Egress.posture(tenant.id, :agent).webhook_destinations
+
+      # Every destination is still REPORTED (the report never silently drops rows)…
+      assert length(destinations) == 3
+
+      # …but the pass stops resolving once the budget is spent.
+      assert Enum.any?(destinations, &(&1.verdict == "unclassified"))
+    end
+
+    # Timed on the webhook-only pass (the `local_only` enable pre-flight), so the
+    # measurement is not diluted by the provider endpoints posture also classifies.
+    test "the webhook classification pass is bounded by the budget",
+         %{tenant: tenant, scope: scope} do
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host ->
+        Process.sleep(div(Egress.classification_budget_ms(), 2) + 100)
+        {:ok, [{93, 184, 216, 34}]}
+      end)
+
+      for i <- 1..5, do: subscription(tenant.id, "https://hooks-#{i}.example.com/inbound")
+
+      {elapsed_us, blocked} =
+        :timer.tc(fn -> Egress.blocked_webhook_subscriptions(scope) end)
+
+      assert length(blocked) == 5
+
+      # Unbounded this would be 5 x ~1.1s; bounded it is the budget plus at most
+      # one in-flight classification.
+      assert elapsed_us < 2 * Egress.classification_budget_ms() * 1_000
+    end
+
+    test "an unclassified destination is NOT treated as local (fail-closed)" do
+      refute Egress.local_verdict?(:unclassified)
+    end
+
     test "the guarantee wording no longer excludes webhook delivery", %{tenant: tenant} do
       guarantee = Egress.posture(tenant.id, :agent).guarantee_scope
 
@@ -504,5 +585,302 @@ defmodule Loopctl.Egress.WebhookEgressTest do
       refute guarantee =~ "NOT yet covered"
       refute guarantee =~ "US-41.5"
     end
+  end
+
+  # --- Review fixes ----------------------------------------------------------
+
+  describe "AC-41.5.2 — the TRANSIENT refusal path is BOUNDED" do
+    setup %{tenant: tenant} do
+      # An unresolvable destination on an UNMARKED tenant: `tenant_supplied: true`
+      # fails CLOSED as the TRANSIENT `:egress_unavailable` on every attempt. This
+      # is the shape (lapsed domain, NXDOMAIN, resolve timeout) that snoozed
+      # forever: attempts stayed 0, the event stayed pending, the subscription was
+      # never auto-disabled, and every new event added another immortal job.
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host -> {:error, :nxdomain} end)
+
+      webhook = subscription(tenant.id, "https://lapsed.example.com/inbound")
+      forbid_http!()
+
+      {:ok, webhook: webhook, event: pending_event(tenant.id, webhook.id)}
+    end
+
+    test "the first refusals snooze WITHOUT burning an attempt",
+         %{tenant: tenant, event: event} do
+      assert {:snooze, seconds} = deliver_at(event, tenant.id, 1)
+      assert seconds == Egress.transient_snooze_seconds()
+
+      reloaded = reload(event)
+      assert reloaded.attempts == 0
+      assert reloaded.status == :pending
+      refute_received :unexpected_http_call
+    end
+
+    test "past the free-snooze cap it falls through to the ORDINARY failure ladder",
+         %{tenant: tenant, event: event} do
+      attempt = WebhookDeliveryWorker.max_transient_snoozes() + 1
+
+      assert {:snooze, seconds} = deliver_at(event, tenant.id, attempt)
+      # The BACKOFF ladder, not the flat transient snooze.
+      assert seconds == WebhookDeliveryWorker.backoff_seconds(1)
+
+      reloaded = reload(event)
+      assert reloaded.attempts == 1
+      assert reloaded.error =~ "egress_unavailable_persisted"
+    end
+
+    test "it EXHAUSTS and reaches the auto-disable valve instead of retrying forever",
+         %{tenant: tenant, webhook: webhook, event: event} do
+      # One attempt short of the ladder's end, having already spent its free snoozes.
+      event =
+        event
+        |> Ecto.Changeset.change(%{attempts: 5})
+        |> AdminRepo.update!()
+
+      attempt = 5 + WebhookDeliveryWorker.max_transient_snoozes() + 1
+
+      assert :ok = deliver_at(event, tenant.id, attempt)
+
+      reloaded = reload(event)
+      assert reloaded.status == :exhausted
+      assert reloaded.attempts == 6
+
+      # The safety valve the unbounded snooze had disabled: consecutive_failures
+      # rises, so a permanently-unresolvable subscription is eventually disabled.
+      assert AdminRepo.get!(Webhooks.Webhook, webhook.id).consecutive_failures == 1
+    end
+
+    test "an UNRECOGNISED refusal term is TERMINAL, never an immortal snooze",
+         %{tenant: tenant, event: event} do
+      # A malformed `{:refused, term}` from a future delivery-client change, a Mox
+      # stub, or a third-party DeliveryBehaviour implementation.
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
+        {:refused, :something_new}
+      end)
+
+      assert Egress.block_kind(:something_new) == :unrecognized
+      assert :ok = deliver(event, tenant.id)
+
+      reloaded = reload(event)
+      assert reloaded.status == :blocked
+      assert reloaded.error =~ "unrecognized"
+      refute_received :unexpected_http_call
+    end
+
+    test "block_kind/1 keeps the two transient tags transient" do
+      assert Egress.block_kind({:pin_stale, %{}}) == :transient
+      assert Egress.block_kind({:egress_unavailable, %{}}) == :transient
+      assert Egress.block_kind({:egress_blocked, %{verdict: :denylisted}}) == :ssrf_denied
+      assert Egress.block_kind({:egress_blocked, %{verdict: :non_local}}) == :locality_denied
+    end
+  end
+
+  describe "AC-41.5.3 — the config-time check follows the SCOPE, not just the URL" do
+    test "moving a subscription into a local_only PROJECT is REJECTED", %{tenant: tenant} do
+      project = fixture(:project, %{tenant_id: tenant.id})
+      webhook = subscription(tenant.id, "https://hooks.example.com/inbound")
+      :ok = mark_local_only(tenant.id, project.id)
+
+      # The URL does not change — only the scope it is delivered under. Accepting
+      # this is the "accepted, then silently blocked at delivery time" outcome
+      # AC-41.5.3 forbids.
+      assert {:error, changeset} =
+               Webhooks.update_webhook(tenant.id, webhook.id, %{"project_id" => project.id})
+
+      assert %{url: [message]} = errors_on(changeset)
+      assert message =~ "local_only"
+
+      assert AdminRepo.get!(Webhooks.Webhook, webhook.id).project_id == nil
+    end
+
+    test "moving it into an UNMARKED project is still allowed", %{tenant: tenant} do
+      project = fixture(:project, %{tenant_id: tenant.id})
+      webhook = subscription(tenant.id, "https://hooks.example.com/inbound")
+
+      assert {:ok, updated} =
+               Webhooks.update_webhook(tenant.id, webhook.id, %{"project_id" => project.id})
+
+      assert updated.project_id == project.id
+    end
+
+    test "RE-ACTIVATING a now-incompatible subscription is REJECTED", %{tenant: tenant} do
+      webhook = subscription(tenant.id, "https://hooks.example.com/inbound", %{active: false})
+      :ok = mark_local_only(tenant.id)
+
+      assert {:error, changeset} =
+               Webhooks.update_webhook(tenant.id, webhook.id, %{"active" => true})
+
+      assert %{url: [_message]} = errors_on(changeset)
+      refute AdminRepo.get!(Webhooks.Webhook, webhook.id).active
+    end
+
+    test "DEACTIVATING an incompatible subscription stays possible", %{tenant: tenant} do
+      webhook = subscription(tenant.id, "https://hooks.example.com/inbound")
+      :ok = mark_local_only(tenant.id)
+
+      assert {:ok, updated} =
+               Webhooks.update_webhook(tenant.id, webhook.id, %{"active" => false})
+
+      refute updated.active
+    end
+
+    test "a project_id belonging to ANOTHER tenant is REJECTED", %{tenant: tenant} do
+      other = fixture(:tenant)
+      foreign = fixture(:project, %{tenant_id: other.id})
+      webhook = subscription(tenant.id, "https://hooks.example.com/inbound")
+
+      # The webhooks FK targets `projects.id` alone and writes go through
+      # AdminRepo (no RLS), so nothing below this check would have stopped it —
+      # and US-41.5 makes `project_id` the selector for the DELIVERY SCOPE, so a
+      # foreign one side-steps a project-scoped local_only marking.
+      assert {:error, changeset} =
+               Webhooks.update_webhook(tenant.id, webhook.id, %{"project_id" => foreign.id})
+
+      assert %{project_id: [message]} = errors_on(changeset)
+      assert message =~ "does not belong to this tenant"
+      assert AdminRepo.get!(Webhooks.Webhook, webhook.id).project_id == nil
+    end
+
+    test "CREATING with another tenant's project_id is REJECTED", %{tenant: tenant} do
+      other = fixture(:tenant)
+      foreign = fixture(:project, %{tenant_id: other.id})
+
+      assert {:error, changeset} =
+               Webhooks.create_webhook(tenant.id, %{
+                 "url" => "https://hooks.example.com/inbound",
+                 "events" => ["story.status_changed"],
+                 "project_id" => foreign.id
+               })
+
+      assert %{project_id: [_]} = errors_on(changeset)
+      assert Webhooks.count_webhooks(tenant.id) == 0
+    end
+  end
+
+  # --- transient CLASSIFICATION failures under local_only ---------------------
+
+  describe "a transient classification failure under local_only is NOT a permanent drop" do
+    setup %{tenant: tenant} do
+      webhook = subscription(tenant.id, "https://gone.example.com/inbound")
+      :ok = mark_local_only(tenant.id)
+      # The marking enable classified the host with the permissive default stub;
+      # drop that so the delivery below re-classifies against the failing one.
+      PinCache.invalidate_tenant(tenant.id)
+      forbid_http!()
+
+      {:ok, webhook: webhook, event: pending_event(tenant.id, webhook.id)}
+    end
+
+    defp resolver_fails_with(reason) do
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host -> {:error, reason} end)
+    end
+
+    test "an NXDOMAIN snoozes instead of terminally dropping the event",
+         %{tenant: tenant, event: event} do
+      resolver_fails_with(:nxdomain)
+
+      # Before the fix this was a TERMINAL `status: :blocked` labelled
+      # locality_denied — the same resolver failure that merely snoozes on an
+      # UNMARKED scope silently destroyed a one-shot notification on a marked one,
+      # and its remediation ("declare the endpoint, or clear the marking") cannot
+      # fix a DNS outage on an endpoint that is already declared.
+      assert {:snooze, seconds} = deliver_at(event, tenant.id, 1)
+      assert seconds == Egress.transient_snooze_seconds()
+
+      reloaded = reload(event)
+      assert reloaded.status == :pending
+      refute reloaded.status == :blocked
+      assert reloaded.attempts == 0
+      refute_received :unexpected_http_call
+    end
+
+    test "it is still BOUNDED — past the free snoozes it exhausts and auto-disables",
+         %{tenant: tenant, webhook: webhook, event: event} do
+      resolver_fails_with(:nxdomain)
+
+      event = event |> Ecto.Changeset.change(%{attempts: 5}) |> AdminRepo.update!()
+      attempt = 5 + WebhookDeliveryWorker.max_transient_snoozes() + 1
+
+      assert :ok = deliver_at(event, tenant.id, attempt)
+
+      reloaded = reload(event)
+      assert reloaded.status == :exhausted
+      assert AdminRepo.get!(Webhooks.Webhook, webhook.id).consecutive_failures == 1
+    end
+
+    test "block_kind/1 separates a resolver failure from a locality decision" do
+      assert Egress.block_kind({:egress_blocked, %{verdict: :unclassifiable, host: "a.example"}}) ==
+               :transient
+
+      # No host at all is a MALFORMED destination, which retrying never fixes.
+      assert Egress.block_kind({:egress_blocked, %{verdict: :unclassifiable, host: nil}}) ==
+               :locality_denied
+
+      # `oban_result/1` is deliberately coarser — its callers carry no snooze bound.
+      assert {:cancel, _} =
+               Egress.oban_result(
+                 {:egress_blocked, %{verdict: :unclassifiable, host: "a.example"}}
+               )
+    end
+
+    test "the FAILED classification is negatively cached, so the resolve is not repaid",
+         %{tenant: tenant} do
+      test_pid = self()
+
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host ->
+        send(test_pid, :resolved)
+        {:error, :nxdomain}
+      end)
+
+      scope = Scope.new(tenant.id)
+
+      assert Egress.endpoint_verdict(scope, "https://gone.example.com/x", :webhook) ==
+               :unclassifiable
+
+      assert_received :resolved
+
+      # Second lookup of the SAME dead host inside the negative TTL must not
+      # re-resolve: `posture/2` is role :agent, parameterless, and classifies
+      # TENANT-SUPPLIED hostnames, so an uncached failure was a repeatable
+      # multi-second cost for any agent key.
+      assert Egress.endpoint_verdict(scope, "https://gone.example.com/x", :webhook) ==
+               :unclassifiable
+
+      refute_received :resolved
+    end
+  end
+
+  # --- AC-41.5.4: the enable pre-flight is atomic ----------------------------
+
+  describe "AC-41.5.4 — the enable decision and the marking write are one transaction" do
+    test "a refused pre-flight writes NOTHING (no marking, no audit)", %{tenant: tenant} do
+      _webhook = subscription(tenant.id, "https://hooks.example.com/inbound")
+
+      before_audits = audit_count(tenant.id)
+
+      assert {:error, {:would_block, blocked}} = Egress.enable_local_only(tenant.id, nil)
+      assert Enum.any?(blocked, &(&1.kind == :webhook))
+
+      refute Egress.effective_local_only?(Scope.new(tenant.id))
+      assert Egress.get_marking(tenant.id, nil) == nil
+      assert audit_count(tenant.id) == before_audits
+    end
+
+    test "the advisory lock key is derived from the tenant UUID, stably", %{tenant: tenant} do
+      key = Egress.tenant_lock_key(tenant.id)
+
+      assert is_integer(key)
+      # Must fit PostgreSQL's int4 — pg_advisory_xact_lock(int4, int4).
+      assert key >= -2_147_483_648 and key <= 2_147_483_647
+      # Deterministic: two nodes in a rolling deploy must agree or they do not
+      # serialize at all (which is why this is NOT :erlang.phash2/1).
+      assert Egress.tenant_lock_key(tenant.id) == key
+      assert Egress.tenant_lock_key(fixture(:tenant).id) != key
+    end
+  end
+
+  defp audit_count(tenant_id) do
+    Loopctl.Audit.AuditLog
+    |> Ecto.Query.where([a], a.tenant_id == ^tenant_id)
+    |> AdminRepo.aggregate(:count, :id)
   end
 end

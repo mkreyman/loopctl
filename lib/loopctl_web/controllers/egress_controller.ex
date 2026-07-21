@@ -153,6 +153,11 @@ defmodule LoopctlWeb.EgressController do
   ARE. The deployment allowlist CONTENTS appear only at `:user`+ — at `:agent`
   the payload carries only a boolean per endpoint saying whether the verdict came
   from the allowlist.
+
+  Webhook destinations follow the same split: `host` + `verdict` +
+  `blocked_by_local_only` at `:agent`, the FULL destination URL only at `:user`+
+  (a webhook path is frequently the credential, and reading webhook URLs is
+  `role: :user` everywhere else).
   """
   def posture(conn, _params) do
     key = conn.assigns.current_api_key
@@ -168,6 +173,11 @@ defmodule LoopctlWeb.EgressController do
   `egress_blocked`, responds `409 would_block_endpoints` NAMING each offending
   endpoint. Retry with `"acknowledge": true` to proceed; the response then
   REPORTS the resulting blocked posture. Never a silent tenant-wide outage.
+
+  Webhook entries in `blocked_endpoints` carry only the destination HOST below
+  role `:user` (`Egress.redact_blocked_endpoints/2`) — this endpoint is
+  `:orchestrator`, one level under the `role: :user` gate on
+  `LoopctlWeb.WebhookController`, and a webhook path is frequently the credential.
   """
   def enable_local_only(conn, params) do
     key = conn.assigns.current_api_key
@@ -185,7 +195,7 @@ defmodule LoopctlWeb.EgressController do
         json(conn, %{
           local_only: true,
           scope: scope_label(params["project_id"]),
-          blocked_endpoints: blocked,
+          blocked_endpoints: Egress.redact_blocked_endpoints(blocked, key.role),
           acknowledged: params["acknowledge"] == true,
           note: blocked_note(blocked)
         })
@@ -204,7 +214,7 @@ defmodule LoopctlWeb.EgressController do
               "offending webhook subscription(s), or retry with acknowledge=true to " <>
               "accept the resulting blocked posture. Nothing was changed and no " <>
               "subscription was disabled.",
-          blocked_endpoints: blocked
+          blocked_endpoints: Egress.redact_blocked_endpoints(blocked, key.role)
         })
 
       {:error, reason} ->

@@ -450,10 +450,36 @@ defmodule Loopctl.Egress.Policy do
     end
   end
 
+  @doc """
+  How long a FAILED classification is remembered (review fix).
+
+  Only SUCCESSFUL classifications used to be cached, so every caller paid the full
+  resolve cost for an unresolvable host on every call, forever. That is the cost
+  `Loopctl.Egress.posture/2` pays — a role `:agent`, parameterless endpoint agents
+  are told to call before every harvest — over TENANT-SUPPLIED hostnames, and
+  `UrlGuard`'s resolver spends up to 6s (`:inet` then `:inet6`) per dead host.
+
+  Short on purpose: long enough to collapse a burst of lookups over the same dead
+  host, short enough that a resolver blip clears promptly. A negative entry is a
+  REFUSAL (`{:error, reason}`, fail-closed), never a permit, so caching one can
+  never widen egress — the worst it can do is refuse a recovered host for the
+  remainder of the window.
+  """
+  @spec negative_ttl_ms() :: pos_integer()
+  def negative_ttl_ms do
+    Application.get_env(:loopctl, :egress_negative_classification_ttl_ms, 30_000)
+  end
+
   defp cached_classification(scope, host, purpose) do
     scope_key = Scope.key(scope)
 
     case PinCache.fetch(scope.tenant_id, scope_key, host) do
+      # NEGATIVE cache hit. Short-circuited BEFORE `resolve_verdict/2`, which has
+      # no meaning for an entry that never resolved (its catch-all would report
+      # `:non_local` — a verdict, and on an unmarked scope a permissive one).
+      {:ok, %{base_verdict: :unresolvable} = entry} ->
+        {:error, Map.get(entry, :resolve_error, :unresolvable)}
+
       {:ok, entry} ->
         {:ok, resolve_verdict(entry, purpose)}
 
@@ -463,13 +489,31 @@ defmodule Loopctl.Egress.Policy do
         # so a revocation landing in that window is not resurrected by this put.
         generation = PinCache.generation(scope.tenant_id)
 
-        with {:ok, attrs} <- classify_uncached(scope, host) do
-          entry =
-            PinCache.put(scope.tenant_id, scope_key, host, attrs, generation: generation)
+        case classify_uncached(scope, host) do
+          {:ok, attrs} ->
+            entry =
+              PinCache.put(scope.tenant_id, scope_key, host, attrs, generation: generation)
 
-          {:ok, resolve_verdict(entry, purpose)}
+            {:ok, resolve_verdict(entry, purpose)}
+
+          {:error, reason} = error ->
+            cache_unresolvable(scope, scope_key, host, reason, generation)
+            error
         end
     end
+  end
+
+  defp cache_unresolvable(scope, scope_key, host, reason, generation) do
+    PinCache.put(
+      scope.tenant_id,
+      scope_key,
+      host,
+      %{base_verdict: :unresolvable, resolve_error: reason, ips: [], purposes: []},
+      generation: generation,
+      ttl_ms: negative_ttl_ms()
+    )
+
+    :ok
   end
 
   @doc """

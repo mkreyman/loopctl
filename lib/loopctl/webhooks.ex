@@ -30,6 +30,7 @@ defmodule Loopctl.Webhooks do
   alias Loopctl.Audit
   alias Loopctl.Egress
   alias Loopctl.Egress.Scope
+  alias Loopctl.Projects.Project
   alias Loopctl.Tenants
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
@@ -65,17 +66,15 @@ defmodule Loopctl.Webhooks do
          :ok <- check_webhook_limit(tenant_id, tenant) do
       raw_secret = generate_signing_secret()
 
-      changeset =
-        %Webhook{
-          tenant_id: tenant_id,
-          signing_secret_encrypted: raw_secret
-        }
-        |> Webhook.create_changeset(attrs)
-        |> validate_destination_locality(tenant_id)
+      base = %Webhook{tenant_id: tenant_id, signing_secret_encrypted: raw_secret}
 
       multi =
         Multi.new()
-        |> Multi.insert(:webhook, changeset)
+        |> lock_egress_config(tenant_id)
+        |> Multi.run(:changeset, fn _repo, _changes ->
+          validated_changeset(Webhook.create_changeset(base, attrs), tenant_id)
+        end)
+        |> Multi.insert(:webhook, & &1.changeset)
         |> Audit.log_in_multi(:audit, fn %{webhook: webhook} ->
           %{
             tenant_id: tenant_id,
@@ -98,7 +97,7 @@ defmodule Loopctl.Webhooks do
         {:ok, %{webhook: webhook}} ->
           {:ok, %{webhook: webhook, signing_secret: raw_secret}}
 
-        {:error, :webhook, changeset, _} ->
+        {:error, step, %Ecto.Changeset{} = changeset, _} when step in [:changeset, :webhook] ->
           {:error, changeset}
 
         {:error, _step, reason, _changes} ->
@@ -147,6 +146,45 @@ defmodule Loopctl.Webhooks do
 
     {:ok, %{data: webhooks, total: total, page: page, page_size: page_size}}
   end
+
+  @doc """
+  Every subscription `Loopctl.Egress` must classify, oldest first.
+
+  The ONE reader the egress guard uses, so webhook persistence stays behind THIS
+  context (US-41.5 review). `Loopctl.Egress` previously built its own queries
+  against `Loopctl.Webhooks.Webhook` for both the `local_only` pre-flight and the
+  posture report, which put the tenant-scoping predicate for webhooks in two
+  contexts: a later change to webhook visibility (soft delete, an archived flag,
+  a project-scoping rule) would have silently missed the guard and the report —
+  precisely the report/guard divergence the posture exists to prevent.
+
+  `project_id` selects the MARKING's coverage, not the delivery scope:
+
+    * `:all` — every subscription (a TENANT-scope marking covers all of them).
+    * a project UUID — only that project's subscriptions. A project marking
+      cannot cover a tenant-wide (project-less) subscription, whose delivery
+      scope it does not narrow (AC-41.4.2, most-restrictive-wins).
+
+  `:limit` bounds the number of rows an egress caller will classify (each
+  classification can cost a DNS resolve).
+  """
+  @spec list_for_egress(Ecto.UUID.t(), Ecto.UUID.t() | :all, keyword()) :: [Webhook.t()]
+  def list_for_egress(tenant_id, project_id \\ :all, opts \\ []) do
+    Webhook
+    |> where([w], w.tenant_id == ^tenant_id)
+    |> egress_project_filter(project_id)
+    |> order_by([w], asc: w.inserted_at)
+    |> maybe_limit(Keyword.get(opts, :limit))
+    |> AdminRepo.all()
+  end
+
+  defp egress_project_filter(query, :all), do: query
+
+  defp egress_project_filter(query, project_id),
+    do: where(query, [w], w.project_id == ^project_id)
+
+  defp maybe_limit(query, nil), do: query
+  defp maybe_limit(query, max) when is_integer(max), do: limit(query, ^max)
 
   @doc """
   Gets a webhook by ID, scoped to a tenant.
@@ -198,14 +236,13 @@ defmodule Loopctl.Webhooks do
         "active" => webhook.active
       }
 
-      changeset =
-        webhook
-        |> Webhook.update_changeset(attrs)
-        |> validate_destination_locality(tenant_id)
-
       multi =
         Multi.new()
-        |> Multi.update(:webhook, changeset)
+        |> lock_egress_config(tenant_id)
+        |> Multi.run(:changeset, fn _repo, _changes ->
+          validated_changeset(Webhook.update_changeset(webhook, attrs), tenant_id)
+        end)
+        |> Multi.update(:webhook, & &1.changeset)
         |> Audit.log_in_multi(:audit, fn %{webhook: updated} ->
           %{
             tenant_id: tenant_id,
@@ -226,9 +263,14 @@ defmodule Loopctl.Webhooks do
         end)
 
       case AdminRepo.transaction(multi) do
-        {:ok, %{webhook: updated}} -> {:ok, updated}
-        {:error, :webhook, changeset, _} -> {:error, changeset}
-        {:error, _step, reason, _changes} -> {:error, reason}
+        {:ok, %{webhook: updated}} ->
+          {:ok, updated}
+
+        {:error, step, %Ecto.Changeset{} = changeset, _} when step in [:changeset, :webhook] ->
+          {:error, changeset}
+
+        {:error, _step, reason, _changes} ->
+          {:error, reason}
       end
     end
   end
@@ -462,32 +504,125 @@ defmodule Loopctl.Webhooks do
 
   # --- Private helpers ---
 
-  # AC-41.5.3. Runs ONLY when the destination URL is actually being set/changed
-  # AND the changeset is otherwise valid: classifying a URL that already failed
-  # `validate_egress/1` would replace a precise scheme/DNS error with a locality
-  # one, and re-classifying an UNCHANGED url on an unrelated update (e.g.
-  # `active: false`) would make a subscription that predates the marking
-  # un-editable — including the very edit that fixes it.
+  # Serializes this write against a concurrent `Egress.enable_local_only/3` on the
+  # same tenant (review fix). The AC-41.5.3 config-time check reads the MARKING
+  # table, and the enable pre-flight reads the WEBHOOK table, so without a shared
+  # lock a subscription created between the pre-flight snapshot and the marking
+  # commit is neither refused here nor reported there — it is just silently
+  # blocked at delivery. Both writers take this lock FIRST and run their check
+  # inside it. See `Loopctl.Egress.lock_scope_config!/2`.
+  defp lock_egress_config(multi, tenant_id) do
+    Multi.run(multi, :egress_lock, fn repo, _changes ->
+      {:ok, Egress.lock_scope_config!(repo, tenant_id)}
+    end)
+  end
+
+  # The two DB-dependent validations, in the order their errors should surface:
+  # a `project_id` that is not this tenant's makes the egress SCOPE meaningless,
+  # so it is settled before the destination is classified under that scope.
+  #
+  # Returns an `{:ok, changeset}` / `{:error, changeset}` pair because it runs as
+  # a `Multi.run/3` step INSIDE the locked transaction (the classification would
+  # otherwise race the marking write). The DNS cost of a cache-missing
+  # classification is therefore paid while an `AdminRepo` connection is held —
+  # accepted deliberately: webhook writes are rare and capped by `max_webhooks`,
+  # and correctness of the config-time gate is the point of the story.
+  defp validated_changeset(changeset, tenant_id) do
+    validated =
+      changeset
+      |> validate_project_ownership(tenant_id)
+      |> validate_destination_locality(tenant_id)
+
+    if validated.valid?, do: {:ok, validated}, else: {:error, validated}
+  end
+
+  # `project_id` is cast from client input and its FK targets `projects.id`
+  # ALONE, so another tenant's project satisfies the database — and writes go
+  # through `AdminRepo`, which bypasses RLS. US-41.5 makes that load-bearing: the
+  # delivery scope IS `Scope.new(webhook.tenant_id, webhook.project_id)`, so a
+  # foreign `project_id` matches no marking of this tenant and side-steps a
+  # project-scoped `local_only` marking without touching the audited, `:user`-
+  # gated marking row (it also skews the pre-flight and the posture report, which
+  # scope by the same field). Validated here rather than by a composite FK so the
+  # caller gets a changeset error instead of a constraint violation, matching
+  # what `LoopctlWeb.EgressController` already does for its own `project_id`.
+  defp validate_project_ownership(%Ecto.Changeset{valid?: false} = changeset, _tenant_id),
+    do: changeset
+
+  defp validate_project_ownership(changeset, tenant_id) do
+    # `get_field/2` (not `get_change/2`): an update that changes only the URL must
+    # still be classified under a scope this tenant actually owns.
+    case Ecto.Changeset.get_field(changeset, :project_id) do
+      nil ->
+        changeset
+
+      project_id ->
+        if project_of_tenant?(tenant_id, project_id) do
+          changeset
+        else
+          Ecto.Changeset.add_error(
+            changeset,
+            :project_id,
+            "does not belong to this tenant (or does not exist)"
+          )
+        end
+    end
+  end
+
+  defp project_of_tenant?(tenant_id, project_id) do
+    Project
+    |> where([p], p.id == ^project_id and p.tenant_id == ^tenant_id)
+    |> limit(1)
+    |> AdminRepo.exists?()
+  end
+
+  # AC-41.5.3. Runs when the edit changes the EFFECTIVE EGRESS DECISION — the
+  # destination url, the scope it is delivered under (`project_id`), or a
+  # re-activation — AND the changeset is otherwise valid: classifying a URL that
+  # already failed `validate_egress/1` would replace a precise scheme/DNS error
+  # with a locality one.
+  #
+  # It deliberately does NOT run on an edit that touches neither (e.g.
+  # `active: false`, `events`), so a subscription that predates the marking stays
+  # editable — including by the very edit that fixes it.
+  #
+  # REVIEW FIX: keying only on a `:url` change left the check bypassable. The
+  # egress scope is `Scope.new(tenant_id, project_id)`, so a PATCH carrying only
+  # `project_id` re-scoped a public destination under a `local_only` project and
+  # was accepted — the "accepted, then silently blocked at delivery time" outcome
+  # AC-41.5.3 exists to prevent. A `false -> true` re-activation is checked for
+  # the same reason the pre-flight (AC-41.5.4) reports INACTIVE subscriptions:
+  # re-activating one under an unchanged marking would silently produce a blocked
+  # destination.
   defp validate_destination_locality(%Ecto.Changeset{valid?: false} = changeset, _tenant_id),
     do: changeset
 
   defp validate_destination_locality(changeset, tenant_id) do
-    case Ecto.Changeset.get_change(changeset, :url) do
-      nil ->
-        changeset
+    if egress_decision_changed?(changeset) do
+      url = Ecto.Changeset.get_field(changeset, :url)
+      project_id = Ecto.Changeset.get_field(changeset, :project_id)
+      scope = Scope.new(tenant_id, project_id)
 
-      url ->
-        project_id = Ecto.Changeset.get_field(changeset, :project_id)
-        scope = Scope.new(tenant_id, project_id)
+      case Egress.webhook_destination_check(scope, url) do
+        :ok ->
+          changeset
 
-        case Egress.webhook_destination_check(scope, url) do
-          :ok ->
-            changeset
-
-          {:error, {_verdict, remediation}} ->
-            Ecto.Changeset.add_error(changeset, :url, remediation)
-        end
+        {:error, {_verdict, remediation}} ->
+          Ecto.Changeset.add_error(changeset, :url, remediation)
+      end
+    else
+      changeset
     end
+  end
+
+  # `Map.has_key?/2` on `changes` rather than `get_change/2` for `:project_id`:
+  # UNSETTING the project (`project_id: nil`) widens a project-scoped delivery to
+  # the TENANT scope and must be classified too, and `get_change/2` returns nil
+  # for both "changed to nil" and "not changed".
+  defp egress_decision_changed?(changeset) do
+    not is_nil(Ecto.Changeset.get_change(changeset, :url)) or
+      Map.has_key?(changeset.changes, :project_id) or
+      Ecto.Changeset.get_change(changeset, :active) == true
   end
 
   defp generate_signing_secret do

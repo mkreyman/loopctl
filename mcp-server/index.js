@@ -4972,6 +4972,9 @@ const TOOLS = [
       "key you already have. NOTE the deployment allowlist CONTENTS are operator " +
       "infrastructure and are NOT disclosed at agent role: you get only a boolean per " +
       "endpoint saying whether its verdict came from the allowlist (contents at user+). " +
+      "Webhook destinations follow the same split: HOST plus verdict plus " +
+      "blocked_by_local_only at agent role, the FULL destination URL (endpoint) only at " +
+      "user+ — a webhook path is frequently the credential. " +
       "SCOPE OF THE GUARANTEE: fail-closed enforcement covers every outbound HTTP call " +
       "made by loopctl application code on every CONTENT-CARRYING path — model-provider " +
       "calls, the ingestion fetch, and webhook delivery (US-41.5). HTTP performed inside " +

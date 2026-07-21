@@ -64,7 +64,6 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Llm.ShapeError
-  alias Loopctl.Net.UrlGuard
   alias Loopctl.Oban.FairShare
   alias Loopctl.Provider
   alias Loopctl.Provider.Admission
@@ -655,46 +654,43 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   end
 
   defp resolve_content(scope, url, _content) when is_binary(url) do
-    # SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm) AND the US-41.4 local_only
-    # guard, in that order — they are different controls:
+    # ONE address decision (US-41.5 review). This used to gate on `UrlGuard.pin/1`
+    # FIRST and only then consult the policy, which meant:
     #
-    #   * `UrlGuard.pin/1` is the SSRF denylist. It runs FIRST and unconditionally,
-    #     because a private-range URL must be refused for EVERY tenant, marked or not.
-    #   * `Loopctl.Provider.get/3` then applies the ONE egress policy (AC-41.4.9:
-    #     ingestion consults it too, not just the provider guard and the probe). The
-    #     purpose is `:ingest`: a host declared for `inference` does NOT authorize
-    #     loopctl to fetch tenant-supplied URLs on a local_only scope.
-    case UrlGuard.pin(url) do
-      {:ok, pinned} -> fetch_url(scope, url, pinned)
-      {:error, reason} -> blocked_url(url, reason)
-    end
+    #   * the pre-gate could not see the OPERATOR deployment allowlist, so an
+    #     allowlisted private host was a legal WEBHOOK destination but still a hard
+    #     refusal as an INGESTION source — an asymmetry inside the very path
+    #     US-41.5 unified; and
+    #   * every fetch resolved the URL twice.
+    #
+    # `Loopctl.Provider.get/3` now makes the whole decision through
+    # `Loopctl.Egress.Policy` with `tenant_supplied_url: true`, which is what turns
+    # a `:denylisted` verdict into the PERMANENT `:egress_blocked` on the default
+    # (unmarked) path — so the SSRF denylist stays mandatory for EVERY tenant,
+    # marked or not (worker-01 / GHSA-j7m9-ffmr-pwhm), and `denylist_gate/4` is the
+    # single place that call is made. The purpose is `:ingest`: a host declared for
+    # `inference` does NOT authorize loopctl to fetch tenant-supplied URLs.
+    fetch_url(scope, url)
   end
 
   defp resolve_content(_scope, nil, _), do: {:error, :no_content}
 
-  defp blocked_url(url, reason) do
-    Logger.warning(
-      "ContentIngestionWorker: refusing to fetch blocked URL " <>
-        "(url=#{url}, reason=#{reason})"
-    )
-
-    {:error, {:url_blocked, reason}}
-  end
-
-  defp fetch_url(scope, url, pinned) do
+  defp fetch_url(scope, url) do
     req_opts =
-      UrlGuard.pinned_request_opts(pinned)
-      |> Keyword.merge(
+      [
         receive_timeout: 15_000,
         retry: :transient,
         max_retries: 1,
         # Do not follow redirects — a redirect hop would re-enter an unvalidated
         # URL and bypass the egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm).
+        # `Provider` sets this too for a pinned request; belt and braces.
         redirect: false
-      )
+      ]
       |> maybe_add_plug()
 
-    case Provider.get(url, req_opts, %{scope: scope, purpose: :ingest, pinned_by_caller: true}) do
+    ctx = %{scope: scope, purpose: :ingest, tenant_supplied_url: true}
+
+    case Provider.get(url, req_opts, ctx) do
       {:ok, %{status: status} = resp} when status in 200..299 ->
         handle_fetched_body(resp.body, Req.Response.get_header(resp, "content-type"))
 

@@ -59,6 +59,20 @@ defmodule Loopctl.Egress.WebhookObanTerminalTest do
     |> Map.new()
   end
 
+  # Drains until the queue holds no runnable job, returning the number of passes
+  # it took. Bounded so a job that never terminates FAILS the test instead of
+  # hanging the suite.
+  defp drain_until_settled(max_passes, pass \\ 0) do
+    drained = Oban.drain_queue(queue: :webhooks, with_scheduled: true)
+    executed = Map.get(drained, :snoozed, 0) + Map.get(drained, :success, 0)
+
+    cond do
+      executed == 0 -> pass
+      pass + 1 >= max_passes -> max_passes
+      true -> drain_until_settled(max_passes, pass + 1)
+    end
+  end
+
   test "several blocked deliveries leave NO retry backlog", %{tenant: tenant, webhook: webhook} do
     events =
       for _i <- 1..5 do
@@ -106,5 +120,68 @@ defmodule Loopctl.Egress.WebhookObanTerminalTest do
 
     assert length(blocked) == 5
     assert Enum.all?(blocked, &(&1 == {:blocked, 0}))
+  end
+
+  # REVIEW FIX (AC-41.5.2). The TRANSIENT branch snoozed unconditionally, and on a
+  # `max_attempts: 1` queue every snooze also bumps `max_attempts` — so a
+  # destination that can never be classified (lapsed domain, NXDOMAIN, resolve
+  # timeout) produced an IMMORTAL job per event. Draining `with_scheduled: true`
+  # is the end-to-end proof: under the old code this test would never terminate.
+  test "a permanently-unresolvable destination TERMINATES instead of snoozing forever" do
+    tenant = fixture(:tenant)
+    on_exit(fn -> PinCache.invalidate_tenant(tenant.id) end)
+
+    # No local_only marking: this is the DEFAULT posture, where a tenant-supplied
+    # url that cannot be classified fails closed as the TRANSIENT
+    # `:egress_unavailable` on every single attempt.
+    stub(Loopctl.MockDnsResolver, :resolve, fn _host -> {:error, :nxdomain} end)
+
+    webhook =
+      fixture(:webhook, %{
+        tenant_id: tenant.id,
+        url: "https://lapsed.example.invalid/inbound",
+        events: ["story.status_changed"]
+      })
+
+    event =
+      fixture(:webhook_event, %{
+        tenant_id: tenant.id,
+        webhook_id: webhook.id,
+        event_type: "story.status_changed",
+        payload: %{"event" => "story.status_changed"},
+        status: :pending
+      })
+
+    Oban.Testing.with_testing_mode(:manual, fn ->
+      {:ok, _} =
+        %{"webhook_event_id" => event.id, "tenant_id" => tenant.id}
+        |> WebhookDeliveryWorker.new()
+        |> Oban.insert()
+
+      # Each drain pass runs the jobs that exist NOW (snoozes re-schedule into the
+      # future), so drain repeatedly. The BOUND is what is under test: the job must
+      # stop needing passes. Under the old unconditional snooze it never would —
+      # the loop would exhaust its cap with the job still scheduled.
+      passes = drain_until_settled(20)
+
+      assert passes < 20, "the job never reached a terminal state (unbounded snooze)"
+
+      states = job_states("webhooks")
+      assert Map.get(states, "scheduled", 0) == 0
+      assert Map.get(states, "available", 0) == 0
+      assert Map.get(states, "retryable", 0) == 0
+    end)
+
+    refute_received :unexpected_http_call
+
+    # The event reached the ordinary ladder's end...
+    reloaded = AdminRepo.get!(WebhookEvent, event.id)
+    assert reloaded.status == :exhausted
+    assert reloaded.attempts == 6
+    assert reloaded.error =~ "egress_unavailable_persisted"
+
+    # ...and the auto-disable safety valve — dead while the snooze was unbounded —
+    # is reachable again.
+    assert AdminRepo.get!(Loopctl.Webhooks.Webhook, webhook.id).consecutive_failures == 1
   end
 end

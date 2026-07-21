@@ -106,6 +106,48 @@ defmodule LoopctlWeb.EgressControllerTest do
       assert body["blocked_endpoints"] != []
       assert body["note"] =~ "egress_blocked"
     end
+
+    test "a webhook destination in the pre-flight list is redacted to its HOST below :user",
+         %{conn: conn, keys: keys, tenant: t} do
+      secret_path = "/services/T00000/B00000/CAPABILITY-TOKEN"
+
+      fixture(:webhook, %{
+        tenant_id: t.id,
+        url: "https://hooks.example.com#{secret_path}",
+        events: ["story.status_changed"]
+      })
+
+      body =
+        conn
+        |> auth(keys.orchestrator)
+        |> post(~p"/api/v1/egress/local-only", %{})
+        |> json_response(409)
+
+      webhooks = Enum.filter(body["blocked_endpoints"], &(&1["kind"] == "webhook"))
+      assert [entry] = webhooks
+
+      # This endpoint is :orchestrator, one level BELOW the role: :user gate on
+      # WebhookController — and a webhook path is frequently the credential.
+      assert entry["endpoint"] == "hooks.example.com"
+      refute entry["endpoint"] =~ secret_path
+      refute Jason.encode!(body) =~ "CAPABILITY-TOKEN"
+
+      # Still actionable: the orchestrator learns WHICH subscription conflicts.
+      assert is_binary(entry["webhook_id"])
+    end
+
+    test "a :user DOES receive the full destination URL", %{conn: conn, keys: keys, tenant: t} do
+      url = "https://hooks.example.com/services/T00000/B00000/CAPABILITY-TOKEN"
+      fixture(:webhook, %{tenant_id: t.id, url: url, events: ["story.status_changed"]})
+
+      body =
+        conn
+        |> auth(keys.user)
+        |> post(~p"/api/v1/egress/local-only", %{})
+        |> json_response(409)
+
+      assert Enum.any?(body["blocked_endpoints"], &(&1["endpoint"] == url))
+    end
   end
 
   describe "the deployment allowlist is not writable at ANY role (AC-41.4.5, TC-41.4.7)" do
@@ -190,15 +232,16 @@ defmodule LoopctlWeb.EgressControllerTest do
       refute body["guarantee_scope"] =~ "NOT yet covered"
     end
 
-    # AC-41.5.5: the destination and its locality classification are readable at
-    # AGENT role (the URL is not a secret — only the signing secret is), while
-    # the allowlist CONTENTS stay a boolean.
-    test "webhook destinations are classified at :agent, allowlist as a BOOLEAN",
+    # AC-41.5.5: the destination's HOST and its locality classification are
+    # readable at AGENT role. The FULL URL is NOT: a webhook path is frequently
+    # the credential, and reading webhook URLs is `role: :user` on
+    # `LoopctlWeb.WebhookController` — the posture must not be a way around it.
+    test "webhook destinations are classified at :agent, URL and allowlist withheld",
          %{conn: conn, keys: keys, tenant: tenant} do
       webhook =
         fixture(:webhook, %{
           tenant_id: tenant.id,
-          url: "https://hooks.example.com/inbound",
+          url: "https://hooks.example.com/services/T0/B0/s3cr3t",
           events: ["story.status_changed"]
         })
 
@@ -206,12 +249,29 @@ defmodule LoopctlWeb.EgressControllerTest do
 
       assert [destination] = body["webhook_destinations"]
       assert destination["webhook_id"] == webhook.id
-      assert destination["endpoint"] == "https://hooks.example.com/inbound"
       assert destination["host"] == "hooks.example.com"
       assert is_binary(destination["verdict"])
       assert is_boolean(destination["verdict_from_deployment_allowlist"])
       assert destination["blocked_by_local_only"] == true
       refute Map.has_key?(destination, "signing_secret_encrypted")
+
+      refute Map.has_key?(destination, "endpoint")
+      refute Jason.encode!(body) =~ "s3cr3t"
+    end
+
+    test "at :user — the full webhook destination URL IS present",
+         %{conn: conn, keys: keys, tenant: tenant} do
+      _webhook =
+        fixture(:webhook, %{
+          tenant_id: tenant.id,
+          url: "https://hooks.example.com/services/T0/B0/s3cr3t",
+          events: ["story.status_changed"]
+        })
+
+      body = conn |> auth(keys.user) |> get(~p"/api/v1/egress/posture") |> json_response(200)
+
+      assert [destination] = body["webhook_destinations"]
+      assert destination["endpoint"] == "https://hooks.example.com/services/T0/B0/s3cr3t"
     end
 
     test "at :user — the allowlist contents ARE present", %{conn: conn, keys: keys} do

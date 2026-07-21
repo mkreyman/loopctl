@@ -75,7 +75,10 @@ defmodule Loopctl.Egress do
   alias Loopctl.Egress.TrustedEndpoint
   alias Loopctl.Knowledge.EmbeddingClient
   alias Loopctl.Llm
-  alias Loopctl.Webhooks.Webhook
+  # Webhook rows are read through the OWNING context's narrow reader
+  # (`Webhooks.list_for_egress/3`), never queried here: the tenant-scoping
+  # predicate for webhooks must live in exactly one place (US-41.5 review).
+  alias Loopctl.Webhooks
 
   @blocked_window_seconds 60
 
@@ -151,15 +154,56 @@ defmodule Loopctl.Egress do
   @spec enable_local_only(Ecto.UUID.t(), Ecto.UUID.t() | nil, keyword()) ::
           {:ok, map()} | {:error, {:would_block, [map()]} | Ecto.Changeset.t()}
   def enable_local_only(tenant_id, project_id, opts \\ []) do
-    scope = Scope.new(tenant_id, project_id)
-    acknowledge = Keyword.get(opts, :acknowledge, false)
-    blocked = preflight_blocked_endpoints(scope)
+    do_enable(Scope.new(tenant_id, project_id), opts)
+  end
 
-    if blocked != [] and not acknowledge do
-      {:error, {:would_block, blocked}}
-    else
-      do_enable(scope, blocked, opts)
-    end
+  # `pg_advisory_xact_lock` takes two int4s. The NAMESPACE isolates this lock
+  # class from every other advisory lock in the app (the memory quota, the
+  # Context Retriever entity cap) so hashing a tenant here can never collide with
+  # an unrelated lock keyed on the same integer.
+  @scope_marking_lock_ns 0x4105_0001
+
+  @doc """
+  Serializes everything that reads-then-writes a tenant's egress configuration
+  (review fix), inside the caller's transaction.
+
+  `enable_local_only/3` decides on a SNAPSHOT of the tenant's webhook
+  subscriptions (the pre-flight) and then writes the marking. Concurrently,
+  `Loopctl.Webhooks.create_webhook/3` decides on a snapshot of the MARKINGS (the
+  AC-41.5.3 config-time check) and then writes a subscription. Interleaved
+  without a lock, a subscription created after the pre-flight snapshot lands
+  under the new marking: it is absent from the `{:would_block, endpoints}` list,
+  absent from `acknowledged_blocked_endpoints`, and silently blocked at delivery
+  — the "silent state change" AC-41.5.4 rules out.
+
+  Both writers take THIS lock as the FIRST step of their transaction and both run
+  their check INSIDE it, so one of the two always observes the other's committed
+  state. It is transaction-scoped, so it releases on commit/rollback with no
+  unlock path to forget.
+
+  The key is derived from the tenant UUID's first four bytes rather than
+  `:erlang.phash2/1`, whose hashing is not guaranteed stable across OTP releases
+  — during a rolling deploy two nodes must agree on the key or they do not
+  serialize at all.
+  """
+  @spec lock_scope_config!(Ecto.Repo.t(), Ecto.UUID.t()) :: :ok
+  def lock_scope_config!(repo, tenant_id) do
+    repo.query!("SELECT pg_advisory_xact_lock($1, $2)", [
+      @scope_marking_lock_ns,
+      tenant_lock_key(tenant_id)
+    ])
+
+    :ok
+  end
+
+  @doc """
+  The STABLE signed int4 advisory-lock key for a tenant. Public so a test can
+  prove two real DB sessions derive the same key.
+  """
+  @spec tenant_lock_key(Ecto.UUID.t()) :: integer()
+  def tenant_lock_key(tenant_id) do
+    {:ok, <<key::signed-integer-32, _rest::binary>>} = Ecto.UUID.dump(tenant_id)
+    key
   end
 
   @doc """
@@ -195,34 +239,51 @@ defmodule Loopctl.Egress do
     end
   end
 
-  defp do_enable(%Scope{tenant_id: tenant_id, project_id: project_id} = scope, blocked, opts) do
+  # The pre-flight runs INSIDE the transaction, under `lock_scope_config!/2` —
+  # see that function for the race it closes. The cost is that a webhook
+  # classification (worst case a DNS resolve) happens while an `AdminRepo`
+  # connection is held; `classify_within_budget/3`'s deadline is what keeps that
+  # hold bounded, and enabling `local_only` is a rare operator write.
+  defp do_enable(%Scope{tenant_id: tenant_id, project_id: project_id} = scope, opts) do
+    acknowledge = Keyword.get(opts, :acknowledge, false)
     now = DateTime.utc_now()
 
-    attrs = %{
-      project_id: project_id,
-      local_only: true,
-      enabled_by_actor_type: Keyword.get(opts, :actor_type, "api_key"),
-      enabled_by_actor_id: Keyword.get(opts, :actor_id),
-      enabled_at: now,
-      acknowledged_blocked_endpoints: Enum.map(blocked, & &1.endpoint)
-    }
+    Multi.new()
+    |> Multi.run(:lock, fn repo, _changes ->
+      {:ok, lock_scope_config!(repo, tenant_id)}
+    end)
+    |> Multi.run(:preflight, fn _repo, _changes ->
+      blocked = preflight_blocked_endpoints(scope)
 
-    changeset =
+      if blocked != [] and not acknowledge do
+        {:error, {:would_block, blocked}}
+      else
+        {:ok, blocked}
+      end
+    end)
+    |> Multi.insert_or_update(:marking, fn %{preflight: blocked} ->
+      attrs = %{
+        project_id: project_id,
+        local_only: true,
+        enabled_by_actor_type: Keyword.get(opts, :actor_type, "api_key"),
+        enabled_by_actor_id: Keyword.get(opts, :actor_id),
+        enabled_at: now,
+        acknowledged_blocked_endpoints: Enum.map(blocked, & &1.endpoint)
+      }
+
       (get_marking(tenant_id, project_id) || %ScopeMarking{tenant_id: tenant_id})
       |> ScopeMarking.changeset(attrs)
-
-    Multi.new()
-    |> Multi.insert_or_update(:marking, changeset)
-    |> Audit.log_in_multi(:audit, fn _changes ->
+    end)
+    |> Audit.log_in_multi(:audit, fn %{preflight: blocked} ->
       audit_attrs(tenant_id, scope, "egress.local_only_enabled", opts, %{
         local_only: true,
         blocked_endpoints: Enum.map(blocked, & &1.endpoint),
-        acknowledged: Keyword.get(opts, :acknowledge, false)
+        acknowledged: acknowledge
       })
     end)
     |> AdminRepo.transaction()
     |> case do
-      {:ok, %{marking: marking}} ->
+      {:ok, %{marking: marking, preflight: blocked}} ->
         PinCache.invalidate_tenant(tenant_id)
 
         :telemetry.execute(
@@ -237,6 +298,13 @@ defmodule Loopctl.Egress do
         )
 
         {:ok, %{marking: marking, blocked_endpoints: blocked}}
+
+      # The pre-flight now REFUSES from inside the transaction, so its verdict
+      # arrives as a Multi failure. Unwrap it to the same `{:error,
+      # {:would_block, endpoints}}` the caller contract already documents —
+      # nothing was written, because the whole Multi rolled back.
+      {:error, :preflight, {:would_block, blocked}, _} ->
+        {:error, {:would_block, blocked}}
 
       {:error, _step, reason, _} ->
         {:error, reason}
@@ -283,14 +351,11 @@ defmodule Loopctl.Egress do
   """
   @spec blocked_webhook_subscriptions(Scope.t()) :: [map()]
   def blocked_webhook_subscriptions(%Scope{tenant_id: tenant_id, project_id: project_id}) do
-    Webhook
-    |> where([w], w.tenant_id == ^tenant_id)
-    |> marking_covers_webhook(project_id)
-    |> order_by([w], asc: w.inserted_at)
-    |> AdminRepo.all()
-    |> Enum.map(fn webhook ->
+    tenant_id
+    |> Webhooks.list_for_egress(project_id || :all, limit: max_classified_webhooks())
+    |> classify_within_budget(fn webhook ->
       delivery_scope = Scope.new(tenant_id, webhook.project_id)
-      {webhook, endpoint_verdict(delivery_scope, webhook.url, :webhook)}
+      endpoint_verdict(delivery_scope, webhook.url, :webhook)
     end)
     |> Enum.reject(fn {_webhook, verdict} -> local_verdict?(verdict) end)
     |> Enum.map(fn {webhook, verdict} ->
@@ -305,12 +370,86 @@ defmodule Loopctl.Egress do
     end)
   end
 
-  # A TENANT marking covers every subscription; a PROJECT marking covers only that
-  # project's subscriptions.
-  defp marking_covers_webhook(query, nil), do: query
+  @doc """
+  Redacts the pre-flight's blocked-endpoint list for `role` (review fix).
 
-  defp marking_covers_webhook(query, project_id),
-    do: where(query, [w], w.project_id == ^project_id)
+  `blocked_webhook_subscriptions/1` carries the FULL destination URL because
+  `enable_local_only/3` records it in the marking's
+  `acknowledged_blocked_endpoints` and in the audit event — server-side state a
+  `:user` reads back. But the pre-flight's list is also echoed to the CALLER, and
+  `POST /api/v1/egress/local-only` is `role: :orchestrator`, one level below the
+  `role: :user` gate on `LoopctlWeb.WebhookController`. Echoing it verbatim would
+  disclose webhook destination URLs — frequently capability URLs whose path IS the
+  credential (Slack, Discord, Teams, Zapier, n8n) — a role below the one that can
+  read them anywhere else.
+
+  So below `:user` a `:webhook` entry's `endpoint` is reduced to its HOST, which
+  is all an orchestrator needs to act on the conflict (it also carries
+  `webhook_id`). PROVIDER endpoints are left intact: they are operator/tenant
+  configuration already disclosed at `:agent` by `posture/2`.
+  """
+  @spec redact_blocked_endpoints([map()], atom()) :: [map()]
+  def redact_blocked_endpoints(blocked, role) when is_list(blocked) do
+    if role in [:user, :superadmin] do
+      blocked
+    else
+      Enum.map(blocked, &redact_blocked_endpoint/1)
+    end
+  end
+
+  defp redact_blocked_endpoint(%{kind: :webhook, endpoint: url} = entry) when is_binary(url) do
+    %{entry | endpoint: URI.parse(url).host || url}
+  end
+
+  defp redact_blocked_endpoint(entry), do: entry
+
+  @doc """
+  Rows an egress caller will classify for one tenant, and the wall-clock budget
+  it will spend doing so (US-41.5 review).
+
+  Both the posture report (role `:agent`) and the `local_only` enable pre-flight
+  classify TENANT-SUPPLIED webhook hosts, and a classification that misses the
+  `PinCache` pays a real DNS resolve (`UrlGuard`'s 3s timeout). Unbounded, a
+  tenant could make the endpoint agents are told to call BEFORE EVERY HARVEST
+  take `max_webhooks x 3s` — with `max_webhooks` itself tenant-settable.
+
+  So the work is bounded twice: at most `max_classified_webhooks/0` rows, and
+  once the budget is spent the remaining rows are reported `unclassified`
+  (cache-only, no resolve) rather than blocking the request. `unclassified` is
+  NOT a local verdict, so a budget-exhausted destination is reported as blocked
+  by the pre-flight — bounded the FAIL-CLOSED way.
+
+  Deliberately serial rather than `Task.async_stream/3`: the classifier reads the
+  DB (declared purposes) inside the caller's `Ecto` sandbox/RLS context, and this
+  bound must hold identically in a request, a worker and a test.
+  """
+  @spec classification_budget_ms() :: pos_integer()
+  def classification_budget_ms do
+    Application.get_env(:loopctl, :egress_classification_budget_ms, 2_000)
+  end
+
+  @doc "Maximum webhook rows one egress classification pass will look at."
+  @spec max_classified_webhooks() :: pos_integer()
+  def max_classified_webhooks do
+    Application.get_env(:loopctl, :egress_max_classified_webhooks, 50)
+  end
+
+  # Classifies `items` in order until the budget is spent; the rest get `skipped`.
+  # The FIRST item is always classified, so a single destination behaves exactly
+  # as it did before the bound.
+  defp classify_within_budget(items, classify_fun, skipped \\ :unclassified) do
+    deadline = System.monotonic_time(:millisecond) + classification_budget_ms()
+
+    items
+    |> Enum.with_index()
+    |> Enum.map(fn {item, index} ->
+      if index == 0 or System.monotonic_time(:millisecond) < deadline do
+        {item, classify_fun.(item)}
+      else
+        {item, skipped}
+      end
+    end)
+  end
 
   @doc """
   True when `verdict` means "local for this scope" — the ONE definition of
@@ -607,17 +746,59 @@ defmodule Loopctl.Egress do
     * `:locality_denied` — the destination is reachable, but the scope is
       `local_only` and the destination is not classified local for the requested
       purpose. A configuration conflict the TENANT can resolve.
-    * `:transient` — `:pin_stale` / `:egress_unavailable`; not a block at all.
+    * `:transient` — `:pin_stale` / `:egress_unavailable`, AND an
+      `:egress_blocked` whose verdict is `:unclassifiable` for a real host
+      (review fix, below); not a block at all.
+    * `:unrecognized` — the term is not an egress refusal at all. TERMINAL, and
+      deliberately so: this module's whole purpose is fail-closed classification,
+      so an unknown term must not be silently routed onto the retry path. A
+      malformed `{:refused, term}` from a future delivery-client change, a Mox
+      stub, or a third-party `DeliveryBehaviour` implementation therefore stops
+      loudly (a recorded, agent-readable block) instead of producing a job that
+      snoozes forever. This matches `oban_result/1`, which already cancels an
+      unrecognised term rather than snoozing it.
 
   An operator reading a blocked delivery needs the distinction: one is "ask the
   operator", the other is "declare the endpoint or clear the marking".
+
+  ## `:unclassifiable` is TRANSIENT, not `:locality_denied` (review fix)
+
+  `Policy.check_local_only/4` maps EVERY classification error — including a plain
+  NXDOMAIN or a 3s resolver timeout — to `{:egress_blocked, %{verdict:
+  :unclassifiable}}`. Fail-closed is right; calling it PERMANENT was not. It made
+  the same resolver hiccup asymmetric by marking: on an UNMARKED scope the
+  identical failure is `:egress_unavailable` and retried, while on a `local_only`
+  scope it terminally dropped the delivery — and labelled it `locality_denied`,
+  whose documented remediation ("declare the endpoint, or clear the marking")
+  cannot fix a DNS outage on an already-declared endpoint. `enable_local_only/3`
+  and `clear_local_only/3` both call `PinCache.invalidate_tenant/1`, so a cold
+  cache right after a marking change is the EXPECTED state, not an edge case.
+
+  It is transient only for a REAL host: `{:egress_blocked, %{verdict:
+  :unclassifiable, host: nil}}` is a URL with no host at all (a malformed
+  destination), which no amount of retrying fixes, so that stays permanent. The
+  retry it enables is bounded by
+  `Loopctl.Workers.WebhookDeliveryWorker.max_transient_snoozes/0`, after which the
+  ordinary failure ladder still exhausts and still auto-disables.
   """
-  @spec block_kind({atom(), map()} | atom()) :: :ssrf_denied | :locality_denied | :transient
+  @spec block_kind({atom(), map()} | atom()) ::
+          :ssrf_denied | :locality_denied | :transient | :unrecognized
   def block_kind(term) do
     case refusal(term) do
-      {:egress_blocked, %{verdict: :denylisted}} -> :ssrf_denied
-      {:egress_blocked, _details} -> :locality_denied
-      _other -> :transient
+      {:egress_blocked, %{verdict: :denylisted}} ->
+        :ssrf_denied
+
+      {:egress_blocked, %{verdict: :unclassifiable, host: host}} when is_binary(host) ->
+        :transient
+
+      {:egress_blocked, _details} ->
+        :locality_denied
+
+      {tag, _details} when tag in [:pin_stale, :egress_unavailable] ->
+        :transient
+
+      nil ->
+        :unrecognized
     end
   end
 
@@ -635,6 +816,19 @@ defmodule Loopctl.Egress do
       SILENTLY. AC-41.4.3 makes only `:egress_blocked` terminal.
     * `:egress_unavailable` → `{:snooze, _}`. A transient infrastructure failure
       reading the marking, not a privacy refusal at all.
+
+  ## Deliberately COARSER than `block_kind/1`
+
+  `block_kind/1` treats an `:egress_blocked` carrying `verdict: :unclassifiable`
+  for a real host as TRANSIENT (a resolver failure is not a locality decision).
+  This function does NOT, and the divergence is intentional rather than an
+  oversight: `oban_result/1`'s callers hand the result straight to Oban with no
+  snooze budget of their own, so snoozing an `:unclassifiable` would recreate
+  exactly the immortal-job defect the webhook worker's
+  `max_transient_snoozes/0` bound exists to prevent. `WebhookDeliveryWorker` uses
+  `block_kind/1` precisely BECAUSE it carries that bound.
+
+  A caller that wants the finer distinction must adopt a bound first.
   """
   @spec oban_result({atom(), map()} | atom()) ::
           {:cancel, String.t()} | {:snooze, pos_integer()}
@@ -835,6 +1029,11 @@ defmodule Loopctl.Egress do
   allowlist. Operator infrastructure is not disclosed to the lowest-privileged
   key of every tenant.
 
+  The same split applies to WEBHOOK DESTINATIONS: `host`, `verdict` and
+  `blocked_by_local_only` at every role; the FULL `endpoint` URL (path and query
+  included — often a capability credential) only at `:user`+, matching the
+  `role: :user` gate on `LoopctlWeb.WebhookController`.
+
   ## Scope of the guarantee
 
   Every CONTENT-CARRYING outbound path made by loopctl application code is
@@ -871,7 +1070,7 @@ defmodule Loopctl.Egress do
     base = %{
       tenant_id: tenant_id,
       endpoints: endpoints,
-      webhook_destinations: webhook_destinations(tenant_id),
+      webhook_destinations: webhook_destinations(tenant_id, role),
       declared_endpoints: declared,
       scopes: scopes,
       posture_defects: posture_defects(scopes),
@@ -945,29 +1144,45 @@ defmodule Loopctl.Egress do
   # (`tenant_id, webhook.project_id`). Anything else would let the report and the
   # guard disagree, which is the failure mode the whole report exists to prevent.
   #
-  # The destination URL is NOT a secret (only the signing secret is Cloak-encrypted),
-  # so it is disclosed at every role, exactly like the provider endpoints.
-  defp webhook_destinations(tenant_id) do
-    Webhook
-    |> where([w], w.tenant_id == ^tenant_id)
-    |> order_by([w], asc: w.inserted_at)
-    |> AdminRepo.all()
-    |> Enum.map(fn webhook ->
+  # DISCLOSURE (review fix): the full destination URL is `:user`+ only.
+  #
+  # A webhook destination is frequently a CAPABILITY URL whose PATH is the
+  # credential (Slack `hooks.slack.com/services/T.../B.../<token>`, Discord,
+  # Teams, Zapier, n8n). `LoopctlWeb.WebhookController` is `role: :user` at module
+  # level, so an `:agent` key cannot read those URLs anywhere else — emitting them
+  # here would be a role DOWNGRADE of existing data. AC-41.5.5 asks for "webhook
+  # destinations and their local classification", which `host` + `verdict` +
+  # `blocked_by_local_only` satisfies; `endpoint` is added at `:user`+, the same
+  # boolean-vs-contents split the deployment allowlist already uses.
+  defp webhook_destinations(tenant_id, role) do
+    tenant_id
+    |> Webhooks.list_for_egress(:all, limit: max_classified_webhooks())
+    |> classify_within_budget(
+      fn webhook ->
+        classify_endpoint(Scope.new(tenant_id, webhook.project_id), webhook.url, :webhook)
+      end,
+      {:unclassified, false}
+    )
+    |> Enum.map(fn {webhook, {verdict, from_allowlist}} ->
       scope = Scope.new(tenant_id, webhook.project_id)
-      {verdict, from_allowlist} = classify_endpoint(scope, webhook.url, :webhook)
       host = URI.parse(webhook.url).host || webhook.url
 
-      %{
+      base = %{
         webhook_id: webhook.id,
         project_id: webhook.project_id,
         scope: Scope.key(scope),
-        endpoint: webhook.url,
         host: host,
         active: webhook.active,
         verdict: verdict_label(verdict),
         verdict_from_deployment_allowlist: from_allowlist,
         blocked_by_local_only: Policy.local_only?(scope) and not local_verdict?(verdict)
       }
+
+      if role in [:user, :superadmin] do
+        Map.put(base, :endpoint, webhook.url)
+      else
+        base
+      end
     end)
   end
 
