@@ -17,6 +17,7 @@ defmodule Loopctl.DataCase do
   use ExUnit.CaseTemplate
 
   alias Ecto.Adapters.SQL.Sandbox
+  alias Loopctl.Custody.Coverage
   alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Oban.FairShare
   alias Loopctl.Telemetry.ScaleAlerts
@@ -67,6 +68,12 @@ defmodule Loopctl.DataCase do
   tests as needed.
   """
   def stub_all_defaults do
+    # US-41.7: production coverage by default, so every pre-existing test sees the
+    # real `Loopctl.Custody.Coverage` behaviour; TC-41.7.8 overrides it.
+    Mox.stub(Loopctl.MockCustodyCoverage, :covered_paths, fn ->
+      Coverage.covered_paths()
+    end)
+
     Mox.stub(Loopctl.MockHealthChecker, :check, fn ->
       {:ok,
        %{

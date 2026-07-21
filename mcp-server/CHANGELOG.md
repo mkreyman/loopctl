@@ -5,6 +5,37 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.55.0 — 2026-07-21 (witnessed egress custody claim — US-41.7)
+
+### Added
+
+- **`custody_claim`** — the recorded egress custody claim for one article or memory
+  row. Not a write-time snapshot: an APPEND-ONLY SEQUENCE of per-operation postures
+  (the create, each embedding, each re-embed, each classification/merge), each
+  carrying the endpoint loopctl actually resolved for THAT operation and its
+  locality verdict. A single snapshot would be falsified the moment an async
+  embedding job or an agent-triggered re-embed shipped the body to a different
+  endpoint.
+  - Three states, and only one of them is an attestation: `no_claim_recorded`
+    (no operation sequence was ever assigned — asserts nothing either way),
+    `claim_pending` (assigned, batch append not yet flushed; carries the pending
+    count and the batch references), and `claim_recorded`, itself `complete` or
+    `incomplete`.
+  - Completeness is PROVEN: the recorded entries must form a contiguous sequence up
+    to the highest assigned number. A gap — a lost batch job, a dropped append — is
+    reported `incomplete`, NEVER as no-third-party-egress.
+  - Rides the EXISTING chain-of-custody machinery. Every recorded entry carries a
+    `chain_position` in the tenant's hash-chained audit log, and the new public
+    `GET /api/v1/audit/sth/{tenant_id}/inclusion/{position}` returns a merkle audit
+    path that folds up to the `merkle_root` inside the already-published, ed25519
+    signed tree head. No parallel signing scheme.
+  - Explicit `coverage` field enumerating which egress paths the attestation covers
+    and which it does not, with the reason. The wording stays scoped to the
+    endpoints loopctl called for THIS row; it says nothing about what those
+    endpoints did with the data afterwards.
+- **`custody_failures`** — entries whose chain append was dropped after exhausting
+  retries, so a recording failure is legible rather than silently absent.
+
 ## 2.54.0 — 2026-07-20 (pluggable OpenAI-compatible chat endpoint — US-41.3)
 
 ### Added

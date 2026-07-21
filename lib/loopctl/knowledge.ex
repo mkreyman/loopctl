@@ -47,6 +47,7 @@ defmodule Loopctl.Knowledge do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Custody
   alias Loopctl.Egress
   alias Loopctl.Egress.Policy, as: EgressPolicy
   alias Loopctl.Egress.Scope, as: EgressScope
@@ -361,9 +362,16 @@ defmodule Loopctl.Knowledge do
           }
         end)
         |> maybe_enqueue_embedding(tenant_id, needs_embedding?)
+        # US-41.7 (AC-41.7.1/.2): assign this row's operation-0 sequence number and
+        # record the RESOLVED egress posture for the create INSIDE the content
+        # transaction. Cheap (one INSERT on the transaction's own connection) — the
+        # chain append is batched out to Oban, never a per-article AdminRepo
+        # round-trip (AC-41.7.7). A no-op unless the scope is marked `local_only`.
+        |> maybe_assign_custody_sequence(tenant_id)
 
       case AdminRepo.transaction(multi) do
         {:ok, %{article: article}} ->
+          Custody.enqueue_flush(tenant_id)
           {:ok, article}
 
         {:error, :article, changeset, _} ->
@@ -8271,6 +8279,23 @@ defmodule Loopctl.Knowledge do
     status_changed_to_published? = changeset.changes[:status] == :published
 
     content_changed? or status_changed_to_published?
+  end
+
+  # US-41.7 — the ONE place an article's operation-0 custody sequence is assigned.
+  # System-scoped articles (nil tenant) have no tenant to bind a claim to.
+  defp maybe_assign_custody_sequence(multi, nil), do: multi
+
+  defp maybe_assign_custody_sequence(multi, tenant_id) do
+    Multi.run(multi, :custody_posture, fn repo, %{article: article} ->
+      scope = EgressScope.new(tenant_id, article.project_id)
+
+      case Custody.assign(repo, scope, "article", article.id, :create) do
+        {:ok, result} -> {:ok, result}
+        # Never fail the content write over a posture-recording fault: the missing
+        # entry surfaces as a GAP (claim -> incomplete), never as a satisfied claim.
+        {:error, reason} -> {:ok, {:error, reason}}
+      end
+    end)
   end
 
   defp maybe_enqueue_embedding(multi, _tenant_id, false), do: multi

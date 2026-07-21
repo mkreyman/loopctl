@@ -372,6 +372,18 @@ config :loopctl, Oban,
     verification: 1
   ]
 
+# US-41.7 (AC-41.7.6) — which egress paths a custody claim ATTESTS to. Driven by
+# configuration rather than hardcoded so the claim's scope is an explicit,
+# reviewable fact. `Loopctl.Custody.Coverage` INTERSECTS this with the paths for
+# which a per-row posture entry is actually recorded, so adding a path here can
+# never make the surface over-claim.
+config :loopctl, :custody_coverage, covered_paths: [:provider_calls]
+
+# Seconds the per-tenant custody posture chain-append batch is debounced by. The
+# debounce IS the AdminRepo pool budget (3 connections): a bulk harvest collapses
+# to one append per window instead of one per article.
+config :loopctl, :custody_flush_debounce_seconds, 5
+
 # US-37.2 (GH #352): per-node ceiling on concurrent OUTBOUND embedding calls
 # (`Loopctl.Knowledge.EmbeddingConcurrency`). This is the in-code default used on a
 # `SystemConfig` cache miss; operators retune it live (no deploy) via the

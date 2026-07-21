@@ -230,6 +230,63 @@ increment `consecutive_failures`, so the auto-disable valve never fires and a
 `local_only` tenant with one incompatible subscription emits a blocked row per
 matching state change indefinitely.
 
+## Witnessed custody claim (US-41.7)
+
+The posture report above is **configuration** — what the guard would decide right
+now. The custody claim is the **recorded fact**: what loopctl actually resolved,
+for each content-touching operation, on a specific article or memory row. It is
+what makes the privacy guarantee verifiable AFTER the fact rather than a
+screenshot of a settings screen.
+
+**Shape.** `custody_posture_entries` is an append-only sequence per row — one
+entry per create, per embedding, per re-embed, per classification/merge —
+carrying the endpoints resolved at that instant, their locality verdicts,
+`local_only`, `encrypt_body` and a timestamp. A single write-time snapshot would
+be falsified the first time an async embedding job or an agent-triggered re-embed
+(US-41.1 AC-41.1.10) shipped the body to a different endpoint.
+
+**Completeness is proven, not assumed.** The chain append is asynchronous, so
+the reader cannot assume the entries it sees are all there were. The sequence
+number is assigned INSIDE the content transaction (the row doubles as an
+outbox), and the reader requires a contiguous `0..max`. Any gap — a lost batch
+job, a discarded append, a deleted row — reports `incomplete`, never
+no-third-party-egress. Ordinary job loss must not launder an operation that DID
+egress into a satisfied attestation.
+
+**Three states.** `no_claim_recorded` (no sequence was ever assigned — the row
+predates recording, or its scope is not marked `local_only`), `claim_pending`
+(assigned, batch not yet flushed; carries the pending count and batch refs), and
+`claim_recorded` (`complete` / `incomplete`). Only a complete, contiguous,
+all-local sequence is a positive statement.
+
+**Hot-path budget.** `AuditChain.append/2` runs a serialized `Multi` on the
+3-connection `AdminRepo` pool (`ADMIN_POOL_SIZE`, `config/runtime.exs`) — the
+documented saturation outage. So the content transaction only writes the outbox
+row, and a debounced, per-tenant-unique Oban job on the `audit` queue performs
+ONE chain append per batch. A 12-article harvest produces one append, not twelve.
+The append is idempotent on `(row_id, operation_sequence)` plus a batch-id
+lookup, so an Oban retry after a partial success is a no-op.
+
+**No parallel signing scheme.** The claim rides the Epic 26 chain and its signed
+tree heads. Each recorded entry carries a `chain_position`, and
+`GET /api/v1/audit/sth/{tenant_id}/inclusion/{position}` returns a merkle audit
+path that folds up to the `merkle_root` inside the already-published ed25519 STH.
+
+**Coverage, and the wording rule.** The claim carries an explicit `coverage`
+field enumerating the egress paths it covers and, with a reason, those it does
+not. `Loopctl.Custody.Coverage` intersects the configured set
+(`config :loopctl, :custody_coverage`) with the paths that actually record a
+per-row entry, so config can never make the surface over-claim. Webhook delivery
+is under the same fail-closed policy since US-41.5, but it is not a
+content-touching operation on a row, so it is listed as UNCOVERED rather than
+quietly counted. Every emitted string stays scoped to *the endpoints loopctl
+called for the recorded operations on this row* — never to what those endpoints
+did with the data afterwards.
+
+**Surfaces.** `GET /api/v1/custody/claims/:subject_type/:subject_id` and
+`GET /api/v1/custody/failures`, both role `:agent`; MCP tools `custody_claim` and
+`custody_failures`. No UI.
+
 ## Tenant isolation: explicit scoping on `AdminRepo`, not RLS
 
 The whole `Loopctl.Egress` context reads and writes through `Loopctl.AdminRepo`

@@ -59,7 +59,9 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
 
   require Logger
 
+  alias Loopctl.Custody
   alias Loopctl.Egress
+  alias Loopctl.Egress.Scope
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Knowledge
@@ -127,6 +129,12 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
 
     case Knowledge.generate_embedding(tenant_id, text, opts) do
       {:ok, embedding} ->
+        # US-41.7 (AC-41.7.1): the embedding is its OWN content-touching operation,
+        # recorded with the posture RESOLVED for THIS call — not folded into the
+        # article's write-time snapshot, which an async embed or a later re-embed
+        # against a different endpoint would falsify. `:reembed` when the article
+        # already carried a vector, so a model/endpoint switch is legible as such.
+        record_custody_posture(tenant_id, article, article_id)
         store(tenant_id, article_id, embedding, content_hash)
 
       {:error, :no_api_key} ->
@@ -194,6 +202,20 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
           {:error, sanitized}
         end
     end
+  end
+
+  # `:reembed` when the article already carried a vector, so a model/endpoint
+  # switch (US-41.1 AC-41.1.10) is legible as its own operation rather than
+  # overwriting what the first embed recorded.
+  defp record_custody_posture(tenant_id, article, article_id) do
+    operation = if is_nil(article.embedding), do: :embed, else: :reembed
+
+    Custody.record(
+      Scope.new(tenant_id, article.project_id),
+      "article",
+      article_id,
+      operation
+    )
   end
 
   defp store(tenant_id, article_id, embedding, content_hash) do

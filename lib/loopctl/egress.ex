@@ -1095,6 +1095,48 @@ defmodule Loopctl.Egress do
     end
   end
 
+  @doc """
+  The RESOLVED posture for ONE content-touching operation, as recorded by
+  US-41.7's custody claim (AC-41.7.1).
+
+  Deliberately derived from the SAME functions the guard itself uses —
+  `resolved_endpoints/1` for the endpoints, `Policy.classify/3` for the verdict,
+  `effective_local_only?/1` for the marking — so the recorded fact and the
+  enforced decision cannot drift. Re-deriving any of them here would be the
+  "second, divergent URL policy" AC-41.4.9 calls a review failure.
+
+  This is a POINT-IN-TIME capture: the caller persists it immutably, and a later
+  settings change must not alter what it says (AC-41.7.3).
+  """
+  @spec operation_posture(Scope.t()) :: map()
+  def operation_posture(%Scope{} = scope) do
+    endpoints =
+      scope
+      |> resolved_endpoints()
+      |> Enum.map(fn {kind, url} ->
+        {verdict, from_allowlist} = classify_endpoint(scope, url, :inference)
+
+        %{
+          kind: to_string(kind),
+          endpoint: url,
+          host: URI.parse(url).host || url,
+          verdict: verdict_label(verdict),
+          local: local_verdict?(verdict),
+          verdict_from_deployment_allowlist: from_allowlist
+        }
+      end)
+
+    %{
+      scope: Scope.key(scope),
+      local_only: effective_local_only?(scope),
+      # `encrypt_body` ships in US-41.6 (which depends on this story); recorded
+      # here from the start so the claim's shape does not change later.
+      encrypt_body: false,
+      endpoints: endpoints,
+      local_endpoints_only: endpoints != [] and Enum.all?(endpoints, & &1.local)
+    }
+  end
+
   # A CLEAR deletes the marking row, and a tenant that never enabled local_only has
   # none at all — so mapping over `list_markings/1` alone would report `scopes: []`
   # for the DEFAULT posture AC-41.4.1 protects, and an agent doing verify-before-
@@ -1195,11 +1237,19 @@ defmodule Loopctl.Egress do
     end
   end
 
-  defp verdict_label(:network_local), do: "network-local"
-  defp verdict_label(:tenant_declared), do: @tenant_declared_label
-  defp verdict_label(:denylisted), do: "non-local (blocked by the SSRF denylist)"
-  defp verdict_label(:non_local), do: "non-local"
-  defp verdict_label(other), do: to_string(other)
+  @doc """
+  The human-readable label for a locality verdict.
+
+  Public because US-41.7's custody claim records the SAME label the posture
+  report shows — re-deriving it there would be a second, drifting vocabulary for
+  the one policy's decisions.
+  """
+  @spec verdict_label(atom()) :: String.t()
+  def verdict_label(:network_local), do: "network-local"
+  def verdict_label(:tenant_declared), do: @tenant_declared_label
+  def verdict_label(:denylisted), do: "non-local (blocked by the SSRF denylist)"
+  def verdict_label(:non_local), do: "non-local"
+  def verdict_label(other), do: to_string(other)
 
   # Named posture DEFECTS. The first is US-41.6 AC-41.6.13's
   # `encrypted_at_rest_plaintext_in_flight`: encrypt_body enabled on a scope that

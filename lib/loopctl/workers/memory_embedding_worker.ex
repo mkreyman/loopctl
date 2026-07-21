@@ -56,7 +56,9 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
 
   require Logger
 
+  alias Loopctl.Custody
   alias Loopctl.Egress
+  alias Loopctl.Egress.Scope
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Knowledge
@@ -117,6 +119,10 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   defp generate(tenant_id, memory_id, text, content_hash) do
     case Knowledge.generate_embedding(tenant_id, text, timeout: @worker_yield_ms) do
       {:ok, embedding} ->
+        # US-41.7 (AC-41.7.1): the memory embedding is its own content-touching
+        # operation and gets its own custody posture entry. Memories carry no
+        # project_id, so the scope is tenant-wide.
+        Custody.record(Scope.new(tenant_id), "memory", memory_id, :embed)
         store(tenant_id, memory_id, embedding, content_hash)
 
       {:error, :no_api_key} ->

@@ -1902,6 +1902,33 @@ async function egressPosture() {
   return toContent(result);
 }
 
+// --- US-41.7: witnessed custody claim ---------------------------------------
+//
+// A READ, at agent role for the same reason egress_posture is: verifying a
+// harvest AFTER the fact must work with the key an agent already holds.
+async function custodyClaim({ subject_type, subject_id } = {}) {
+  if (!subject_type || !subject_id) {
+    throw new Error("subject_type and subject_id are required");
+  }
+  const result = await apiCall(
+    "GET",
+    `/api/v1/custody/claims/${encodeURIComponent(subject_type)}/${encodeURIComponent(subject_id)}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function custodyFailures() {
+  const result = await apiCall(
+    "GET",
+    "/api/v1/custody/failures",
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function setLocalOnly({ project_id, acknowledge } = {}) {
   const body = {};
   if (project_id != null) body.project_id = project_id;
@@ -4984,6 +5011,50 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
+    name: "custody_claim",
+    description:
+      "The recorded EGRESS CUSTODY CLAIM for one article or memory row: the append-only " +
+      "sequence of per-operation postures (create, each embedding, each re-embed, each " +
+      "classification/merge) with the endpoint loopctl resolved for THAT operation and its " +
+      "locality verdict, plus the aggregate over them. Each claim rides the existing " +
+      "hash-chained audit log and its signed tree heads — every recorded entry carries the " +
+      "chain_position you can fetch an inclusion proof for at " +
+      "GET /api/v1/audit/sth/{tenant_id}/inclusion/{position} and check against the public " +
+      "STH with the tenant's published audit key. THREE STATES, and only one of them is an " +
+      "attestation: 'no_claim_recorded' (no operation sequence was ever assigned — the row " +
+      "predates recording or its scope is not marked local_only; this asserts NOTHING in " +
+      "either direction), 'claim_pending' (sequences assigned, batch append not yet " +
+      "flushed), and 'claim_recorded' which is itself 'complete' or 'incomplete'. An " +
+      "INCOMPLETE sequence (a gap, or a dropped append) is never reported as " +
+      "no-third-party-egress: an unrecorded operation may have called any endpoint. " +
+      "SCOPE, precisely: the claim attests ONLY to the endpoints loopctl called for the " +
+      "recorded operations on this row, on the egress paths enumerated in the `coverage` " +
+      "field. It makes NO statement about what those endpoints did with the data " +
+      "afterwards, and none about a path listed as uncovered. A tenant-declared endpoint " +
+      "is an unverified attestation, not network-local. READ tool, AGENT role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subject_type: {
+          type: "string",
+          enum: ["article", "memory"],
+          description: "The kind of row the claim is bound to.",
+        },
+        subject_id: { type: "string", description: "The row's UUID." },
+      },
+      required: ["subject_type", "subject_id"],
+    },
+  },
+  {
+    name: "custody_failures",
+    description:
+      "Custody posture entries whose audit-chain append was DROPPED after exhausting " +
+      "retries. A recording failure is surfaced here rather than silently absent, because " +
+      "a missing claim must never read as a satisfied one: every entry listed degrades its " +
+      "row's claim to 'incomplete'. READ tool, AGENT role.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
     name: "set_local_only",
     description:
       "TIGHTEN the posture: mark a scope local_only so loopctl HARD-REFUSES any " +
@@ -5983,6 +6054,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // US-41.4 — fail-closed no-egress guard
     case "egress_posture":
       return await egressPosture();
+
+    // US-41.7 — witnessed custody claim
+    case "custody_claim":
+      return await custodyClaim(args);
+
+    case "custody_failures":
+      return await custodyFailures();
 
     case "set_local_only":
       return await setLocalOnly(args);
