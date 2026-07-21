@@ -31,7 +31,17 @@
           "apps/*/test/",
           "apps/*/web/"
         ],
-        excluded: [~r"/_build/", ~r"/deps/", ~r"/node_modules/"]
+        excluded: [
+          ~r"/_build/",
+          ~r"/deps/",
+          ~r"/node_modules/",
+          # US-41.4: the NEGATIVE-CONTROL fixture for the egress-chokepoint check
+          # deliberately makes one raw outbound call per detected entry point. It
+          # is scanned EXPLICITLY by the chokepoint test (which points the
+          # configurable scanned-path list at it and asserts every call is
+          # flagged); Credo must not also flag it as real code.
+          ~r"/test/support/egress_fixtures/"
+        ]
       },
       #
       # Load and configure plugins here:
@@ -53,7 +63,12 @@
       # VM. Order matters: the registry source must precede the check.
       requires: [
         "lib/loopctl/knowledge/cosine_lint_exceptions.ex",
-        ".credo/checks/cosine_query_reintroduction.ex"
+        ".credo/checks/cosine_query_reintroduction.ex",
+        # US-41.4 (AC-41.4.4): the egress-chokepoint guard. Same standalone-load
+        # mechanism — the scanner source is stdlib-only, so Credo compiles+loads
+        # it into its own VM. Order matters: the scanner must precede the check.
+        "lib/loopctl/egress/chokepoint_scan.ex",
+        ".credo/checks/direct_outbound_http.ex"
       ],
       #
       # If you want to enforce a style guide and need a more traditional linting
@@ -182,7 +197,9 @@
           ## check is dropped or weakened — `mix credo --strict` runs every check it
           ## ran before PLUS this one).
           #
-          {Loopctl.Credo.Check.CosineQueryReintroduction, []}
+          {Loopctl.Credo.Check.CosineQueryReintroduction, []},
+          ## US-41.4 (AC-41.4.4) — the egress-chokepoint guard.
+          {Loopctl.Credo.Check.DirectOutboundHttp, []}
         ],
         disabled: [
           #

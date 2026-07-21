@@ -172,6 +172,16 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
 
         persist(scope, session_id, fingerprint, candidates)
 
+      {:error, egress} when egress in [:egress_blocked, :pin_stale] ->
+        # US-41.4 (AC-41.4.3): a fail-CLOSED egress refusal is a PERMANENT
+        # configuration state, not a transient failure. CANCEL — never {:error, _}
+        # (Oban retries it, burning max_attempts with backoff on every item and
+        # repopulating the queue on every subsequent write) and never {:snooze, _}
+        # (an indefinite re-check loop against a config that will not change on its
+        # own). No data was sent. Mirrors the terminal treatment US-41.5 requires
+        # for blocked webhook deliveries.
+        {:cancel, egress}
+
       {:error, :rate_limited_local} ->
         # US-37.1 (AC-37.1.4): node-local provider admission backpressure. Snooze
         # loss-free (no attempt consumed, no watermark advance) rather than routing

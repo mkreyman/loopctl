@@ -32,8 +32,10 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
 
   require Logger
 
+  alias Loopctl.Egress.Scope
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
+  alias Loopctl.Provider
   alias Loopctl.Provider.Admission
   alias Loopctl.Provider.RetryAfter
   alias Loopctl.SystemConfig
@@ -106,7 +108,9 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
   defp do_post(tenant_id, api_key, model, text) do
     opts = request_opts(api_key, %{input: text, model: model}, single_receive_timeout_ms())
 
-    case Req.post(embeddings_url(), opts) do
+    # US-41.4 (AC-41.4.4): the SINGLE egress chokepoint. Fail-CLOSED, and a
+    # separate decision from the fail-OPEN admission gate above.
+    case Provider.post(embeddings_url(), opts, provider_ctx(tenant_id)) do
       {:ok, %{status: 200, body: %{"data" => [%{"embedding" => embedding} | _]} = resp}} ->
         record_usage_safe(tenant_id, model, resp["usage"])
         {:ok, embedding}
@@ -130,7 +134,7 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
         batch_receive_timeout_ms(length(texts))
       )
 
-    case Req.post(embeddings_url(), opts) do
+    case Provider.post(embeddings_url(), opts, provider_ctx(tenant_id)) do
       {:ok, %{status: 200, body: %{"data" => data} = resp}} when is_list(data) ->
         case map_vectors_by_index(data, length(texts)) do
           {:ok, vectors} ->
@@ -222,6 +226,22 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
       list -> {:ok, Enum.reverse(list)}
     end
   end
+
+  # US-41.4: the scope an embedding call is made on behalf of. Endpoint resolution
+  # is TENANT-scoped only, and articles/memories may have no project, so the scope
+  # threaded here is the tenant scope; a project-marked scope is resolved by
+  # `Loopctl.Egress.Policy` as MOST-RESTRICTIVE-wins over the tenant marking.
+  defp provider_ctx(tenant_id) do
+    %{scope: Scope.new(tenant_id), purpose: :inference}
+  end
+
+  # US-41.4: a fail-CLOSED egress refusal (and the DISTINCT `:pin_stale`) is a
+  # local configuration decision, not a provider failure. Pass the bare atom
+  # through so `Knowledge.breaker_countable?/1` can exempt it from the circuit
+  # breaker and the provider-error storm signal; wrapping it in
+  # `{:request_failed, _}` would count it as a transport outage.
+  defp handle_error({:error, :egress_blocked}), do: {:error, :egress_blocked}
+  defp handle_error({:error, :pin_stale}), do: {:error, :pin_stale}
 
   # Shared non-200 / transport handling for BOTH the single and batch paths.
   defp handle_error({:ok, %{status: status, body: body} = resp}) do

@@ -1,0 +1,320 @@
+defmodule LoopctlWeb.EgressControllerTest do
+  @moduledoc """
+  US-41.4 web surface: role asymmetry + mandatory pre-flight (TC-41.4.6), the
+  allowlist is not writable at any role (TC-41.4.7), the posture report is
+  complete and leaks nothing (TC-41.4.9), and markings are tenant-isolated
+  (TC-41.4.13).
+  """
+
+  use LoopctlWeb.ConnCase, async: true
+
+  import Mox
+
+  alias Loopctl.Egress
+  alias Loopctl.Egress.Allowlist
+  alias Loopctl.Egress.PinCache
+  alias Loopctl.Egress.Scope
+
+  setup :verify_on_exit!
+
+  setup do
+    tenant = fixture(:tenant)
+    on_exit(fn -> PinCache.invalidate_tenant(tenant.id) end)
+
+    keys =
+      Map.new([:agent, :orchestrator, :user], fn role ->
+        {raw, _} = fixture(:api_key, %{tenant_id: tenant.id, role: role})
+        {role, raw}
+      end)
+
+    {:ok, tenant: tenant, keys: keys}
+  end
+
+  defp auth(conn, raw), do: put_req_header(conn, "authorization", "Bearer #{raw}")
+
+  describe "role asymmetry on local_only (AC-41.4.1, TC-41.4.6)" do
+    test "an agent can NEITHER enable nor clear", %{conn: conn, keys: keys} do
+      assert conn
+             |> auth(keys.agent)
+             |> post(~p"/api/v1/egress/local-only", %{acknowledge: true})
+             |> json_response(403)
+
+      assert conn
+             |> auth(keys.agent)
+             |> delete(~p"/api/v1/egress/local-only")
+             |> json_response(403)
+    end
+
+    test "an orchestrator can ENABLE but NOT clear", %{conn: conn, keys: keys, tenant: t} do
+      assert conn
+             |> auth(keys.orchestrator)
+             |> post(~p"/api/v1/egress/local-only", %{acknowledge: true})
+             |> json_response(200)
+
+      assert Egress.effective_local_only?(Scope.new(t.id))
+
+      assert conn
+             |> auth(keys.orchestrator)
+             |> delete(~p"/api/v1/egress/local-only")
+             |> json_response(403)
+
+      # Still marked — the tightening role genuinely cannot undo it.
+      assert Egress.effective_local_only?(Scope.new(t.id))
+    end
+
+    test "a user can do BOTH", %{conn: conn, keys: keys, tenant: t} do
+      assert conn
+             |> auth(keys.user)
+             |> post(~p"/api/v1/egress/local-only", %{acknowledge: true})
+             |> json_response(200)
+
+      assert conn
+             |> auth(keys.user)
+             |> delete(~p"/api/v1/egress/local-only")
+             |> json_response(200)
+
+      refute Egress.effective_local_only?(Scope.new(t.id))
+    end
+
+    test "the pre-flight REFUSES an un-acknowledged enable on a vendor-endpoint scope, naming every offending endpoint",
+         %{conn: conn, keys: keys, tenant: t} do
+      body =
+        conn
+        |> auth(keys.orchestrator)
+        |> post(~p"/api/v1/egress/local-only", %{})
+        |> json_response(409)
+
+      assert body["error"] == "would_block_endpoints"
+      assert body["blocked_endpoints"] != []
+      assert Enum.all?(body["blocked_endpoints"], &is_binary(&1["endpoint"]))
+      assert body["message"] =~ "acknowledge=true"
+
+      # NOT a silent tenant-wide outage: nothing was written.
+      refute Egress.effective_local_only?(Scope.new(t.id))
+    end
+
+    test "the acknowledged retry succeeds and REPORTS the resulting blocked posture",
+         %{conn: conn, keys: keys} do
+      body =
+        conn
+        |> auth(keys.orchestrator)
+        |> post(~p"/api/v1/egress/local-only", %{acknowledge: true})
+        |> json_response(200)
+
+      assert body["local_only"] == true
+      assert body["acknowledged"] == true
+      assert body["blocked_endpoints"] != []
+      assert body["note"] =~ "egress_blocked"
+    end
+  end
+
+  describe "the deployment allowlist is not writable at ANY role (AC-41.4.5, TC-41.4.7)" do
+    test "no exposed egress route mutates it", %{conn: conn, keys: keys} do
+      before = Allowlist.raw_entries()
+
+      poison = ["10.0.0.0/8", "169.254.169.254"]
+
+      for role <- [:agent, :orchestrator, :user] do
+        c = auth(conn, keys[role])
+        post(c, ~p"/api/v1/egress/local-only", %{acknowledge: true, deployment_allowlist: poison})
+
+        post(c, ~p"/api/v1/egress/trusted-endpoints", %{
+          host: "x.example.com",
+          purposes: ["inference"],
+          deployment_allowlist: poison,
+          local_endpoint_allowlist: poison
+        })
+
+        post(c, ~p"/api/v1/egress/repin", %{host: "x.example.com", deployment_allowlist: poison})
+        delete(c, ~p"/api/v1/egress/local-only", %{deployment_allowlist: poison})
+        get(c, ~p"/api/v1/egress/posture")
+      end
+
+      assert Allowlist.raw_entries() == before
+    end
+
+    test "the router exposes no allowlist path at all" do
+      paths = Enum.map(LoopctlWeb.Router.__routes__(), & &1.path)
+      refute Enum.any?(paths, &(&1 =~ "allowlist"))
+    end
+  end
+
+  describe "posture report (AC-41.4.8, TC-41.4.9)" do
+    setup %{tenant: t} do
+      stub(Loopctl.MockDnsResolver, :resolve, fn
+        "ollama.example.com" -> {:ok, [{203, 0, 113, 10}]}
+        _ -> {:ok, [{93, 184, 216, 34}]}
+      end)
+
+      {:ok, _} =
+        Egress.declare_trusted_endpoint(t.id, %{
+          "host" => "ollama.example.com",
+          "purposes" => ["inference"]
+        })
+
+      {:ok, _} = Egress.enable_local_only(t.id, nil, acknowledge: true)
+      Loopctl.Llm.upsert_settings(t.id, %{"api_key" => "sk-ant-SECRET-POSTURE-CHECK"})
+      :ok
+    end
+
+    test "at :agent — own endpoints, verdicts, declarations, scopes; NO allowlist contents",
+         %{conn: conn, keys: keys} do
+      body = conn |> auth(keys.agent) |> get(~p"/api/v1/egress/posture") |> json_response(200)
+
+      assert length(body["endpoints"]) >= 2
+      assert Enum.all?(body["endpoints"], &is_binary(&1["verdict"]))
+      # Only a BOOLEAN about the allowlist — operator infrastructure is not
+      # disclosed to the lowest-privileged key of every tenant.
+      assert Enum.all?(body["endpoints"], &is_boolean(&1["verdict_from_deployment_allowlist"]))
+      refute Map.has_key?(body, "deployment_allowlist")
+
+      [declared] = body["declared_endpoints"]
+      assert declared["purposes"] == ["inference"]
+
+      assert declared["locality_label"] ==
+               "tenant-declared (unverified attestation), not network-local"
+
+      [scope] = body["scopes"]
+      assert scope["local_only"] == true
+      assert scope["encrypt_body"] == false
+      assert body["posture_defects"] == []
+      # The guarantee wording does NOT claim total egress control before US-41.5.
+      assert body["guarantee_scope"] =~ "US-41.5"
+      assert body["guarantee_scope"] =~ "loopctl application code"
+    end
+
+    test "at :user — the allowlist contents ARE present", %{conn: conn, keys: keys} do
+      body = conn |> auth(keys.user) |> get(~p"/api/v1/egress/posture") |> json_response(200)
+      assert Map.has_key?(body, "deployment_allowlist")
+      assert is_list(body["deployment_allowlist"])
+    end
+
+    test "NO key material appears in either payload", %{conn: conn, keys: keys} do
+      for role <- [:agent, :user] do
+        raw =
+          conn |> auth(keys[role]) |> get(~p"/api/v1/egress/posture") |> response(200)
+
+        refute raw =~ "sk-ant-SECRET-POSTURE-CHECK"
+        refute raw =~ "api_key"
+        refute raw =~ "embedding_api_key"
+      end
+    end
+
+    test "posture is available at :agent (verify-before-harvest works with the key it has)",
+         %{conn: conn, keys: keys} do
+      assert conn |> auth(keys.agent) |> get(~p"/api/v1/egress/posture") |> json_response(200)
+    end
+  end
+
+  describe "trusted-endpoint declarations (AC-41.4.5)" do
+    test "declaring requires :user", %{conn: conn, keys: keys} do
+      for role <- [:agent, :orchestrator] do
+        assert conn
+               |> auth(keys[role])
+               |> post(~p"/api/v1/egress/trusted-endpoints", %{
+                 host: "ollama.example.com",
+                 purposes: ["inference"]
+               })
+               |> json_response(403)
+      end
+    end
+
+    test "a :user declaration succeeds and is labelled an unverified attestation",
+         %{conn: conn, keys: keys} do
+      stub(Loopctl.MockDnsResolver, :resolve, fn _ -> {:ok, [{203, 0, 113, 10}]} end)
+
+      body =
+        conn
+        |> auth(keys.user)
+        |> post(~p"/api/v1/egress/trusted-endpoints", %{
+          host: "ollama.example.com",
+          purposes: ["inference"]
+        })
+        |> json_response(201)
+
+      assert body["host"] == "ollama.example.com"
+
+      assert body["locality_label"] ==
+               "tenant-declared (unverified attestation), not network-local"
+    end
+
+    test "a private-range declaration is rejected at write time", %{conn: conn, keys: keys} do
+      assert conn
+             |> auth(keys.user)
+             |> post(~p"/api/v1/egress/trusted-endpoints", %{
+               host: "169.254.169.254",
+               purposes: ["inference"]
+             })
+             |> json_response(422)
+    end
+
+    test "revoking requires :user and invalidates immediately", %{
+      conn: conn,
+      keys: keys,
+      tenant: t
+    } do
+      stub(Loopctl.MockDnsResolver, :resolve, fn _ -> {:ok, [{203, 0, 113, 10}]} end)
+
+      {:ok, _} =
+        Egress.declare_trusted_endpoint(t.id, %{
+          "host" => "ollama.example.com",
+          "purposes" => ["inference"]
+        })
+
+      assert conn
+             |> auth(keys.agent)
+             |> delete(~p"/api/v1/egress/trusted-endpoints/ollama.example.com")
+             |> json_response(403)
+
+      assert conn
+             |> auth(keys.user)
+             |> delete(~p"/api/v1/egress/trusted-endpoints/ollama.example.com")
+             |> json_response(200)
+
+      assert Egress.declared_purposes(t.id, "ollama.example.com") == []
+    end
+  end
+
+  describe "tenant isolation (AC-41.4.11, TC-41.4.13)" do
+    test "tenant B cannot see or mutate tenant A's marking", %{conn: conn, keys: keys, tenant: a} do
+      {:ok, _} = Egress.enable_local_only(a.id, nil, acknowledge: true)
+
+      other = fixture(:tenant)
+      on_exit(fn -> PinCache.invalidate_tenant(other.id) end)
+      {raw_b, _} = fixture(:api_key, %{tenant_id: other.id, role: :user})
+
+      body = conn |> auth(raw_b) |> get(~p"/api/v1/egress/posture") |> json_response(200)
+      assert body["scopes"] == []
+      assert body["tenant_id"] == other.id
+
+      # B clearing "the" marking only ever touches its OWN tenant row.
+      assert conn |> auth(raw_b) |> delete(~p"/api/v1/egress/local-only") |> json_response(200)
+      assert Egress.effective_local_only?(Scope.new(a.id))
+
+      # And A still sees its own.
+      body_a = conn |> auth(keys.user) |> get(~p"/api/v1/egress/posture") |> json_response(200)
+      assert [%{"local_only" => true}] = body_a["scopes"]
+    end
+  end
+
+  describe "repin is agent-reachable (AC-41.4.12)" do
+    test "an agent can re-pin without a :user write", %{conn: conn, keys: keys, tenant: t} do
+      stub(Loopctl.MockDnsResolver, :resolve, fn _ -> {:ok, [{203, 0, 113, 10}]} end)
+
+      {:ok, _} =
+        Egress.declare_trusted_endpoint(t.id, %{
+          "host" => "ollama.example.com",
+          "purposes" => ["inference"]
+        })
+
+      body =
+        conn
+        |> auth(keys.agent)
+        |> post(~p"/api/v1/egress/repin", %{host: "ollama.example.com"})
+        |> json_response(200)
+
+      assert body["repinned"] == true
+      assert body["verdict"] == "tenant_declared"
+    end
+  end
+end

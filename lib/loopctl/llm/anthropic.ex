@@ -29,8 +29,10 @@ defmodule Loopctl.Llm.Anthropic do
 
   require Logger
 
+  alias Loopctl.Egress.Scope
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
+  alias Loopctl.Provider
   alias Loopctl.Provider.Admission
   alias Loopctl.Provider.RetryAfter
 
@@ -136,7 +138,14 @@ defmodule Loopctl.Llm.Anthropic do
       |> maybe_put_plug()
 
     # NOTE: never log `opts` / `api_key` — the key is a tenant secret.
-    case Req.post("#{@base_url}/messages", opts) do
+    # US-41.4 (AC-41.4.4): routed through the SINGLE egress chokepoint, which
+    # refuses `local_only` scopes on a non-local endpoint BEFORE the request is
+    # built. Admission (fail-OPEN) stays its own `with` clause above so the two
+    # failure modes never share a code path.
+    case Provider.post("#{@base_url}/messages", opts, %{
+           scope: Scope.new(tenant_id),
+           purpose: :inference
+         }) do
       {:ok, %{status: 200, body: %{"content" => [%{"text" => text} | _]} = resp}} ->
         record_usage_safe(tenant_id, operation, model, resp["usage"], usage_meta)
         {:ok, text}
@@ -179,6 +188,15 @@ defmodule Loopctl.Llm.Anthropic do
         reason = {:api_error, status, body}
         record_provider_error(reason)
         {:error, ProviderError.sanitize(reason, RetryAfter.from_response(status, resp))}
+
+      # US-41.4: a fail-CLOSED egress refusal (and the DISTINCT `:pin_stale`) is a
+      # local CONFIGURATION decision, not a provider failure. Return the bare atom
+      # WITHOUT `record_provider_error/1` — counting it would inflate the fleet-wide
+      # `[:loopctl, :llm, :provider_error]` storm signal for what is, by design, a
+      # permanent local refusal (the same reasoning that exempts
+      # `:rate_limited_local`). No data was sent.
+      {:error, egress} when egress in [:egress_blocked, :pin_stale] ->
+        {:error, egress}
 
       {:error, reason} ->
         # Never inspect the raw transport reason (review MED #4) — log a value-free

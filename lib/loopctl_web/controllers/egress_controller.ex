@@ -1,0 +1,210 @@
+defmodule LoopctlWeb.EgressController do
+  @moduledoc """
+  Egress posture + `local_only` marking + tenant-declared trusted endpoints
+  (US-41.4). No UI — this is the JSON surface behind the MCP tools.
+
+  ## Roles are ASYMMETRIC, deliberately
+
+  | operation                   | role           | why |
+  |-----------------------------|----------------|-----|
+  | `GET  /egress/posture`      | `:agent`       | verify-before-harvest must work with the key an agent already has |
+  | `POST /egress/repin`        | `:agent`       | `:pin_stale` recovery must not need a human |
+  | `POST /egress/local-only`   | `:orchestrator`| TIGHTENING is safe to automate |
+  | `DELETE /egress/local-only` | `:user`        | CLEARING is the self-widening move an agent must never make |
+  | `POST /egress/trusted-endpoints`   | `:user` | a declaration changes the locality verdict |
+  | `DELETE /egress/trusted-endpoints` | `:user` | ditto |
+
+  Clearing `local_only` at anything below `:user` would let an agent re-open
+  egress one tool call before a harvest while US-41.7's witnessed claim
+  faithfully attested the weakened posture.
+
+  There is NO route that mutates the deployment allowlist, at any role including
+  `:user`: it is the trust root and it is operator-plane, not tenant, state.
+  """
+
+  use LoopctlWeb, :controller
+
+  alias Loopctl.Egress
+  alias Loopctl.Egress.Policy
+  alias Loopctl.Egress.Scope
+  alias Loopctl.Egress.TrustedEndpoint
+
+  action_fallback LoopctlWeb.FallbackController
+
+  # TIGHTENING the posture is safe to automate.
+  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:enable_local_only]
+
+  # WIDENING the posture — and every write that changes a locality verdict — is a
+  # human-key operation.
+  plug LoopctlWeb.Plugs.RequireRole,
+       [role: :user] when action in [:clear_local_only, :declare_trusted, :revoke_trusted]
+
+  @doc """
+  GET /api/v1/egress/posture — role `:agent`.
+
+  Reports the resolved embedding + chat endpoints, each one's locality VERDICT,
+  the tenant's declared endpoints with purposes, per-scope `local_only` /
+  `encrypt_body`, and any named posture defects. Endpoints are shown; KEYS NEVER
+  ARE. The deployment allowlist CONTENTS appear only at `:user`+ — at `:agent`
+  the payload carries only a boolean per endpoint saying whether the verdict came
+  from the allowlist.
+  """
+  def posture(conn, _params) do
+    key = conn.assigns.current_api_key
+    json(conn, Egress.posture(key.tenant_id, key.role))
+  end
+
+  @doc """
+  POST /api/v1/egress/local-only — role `:orchestrator`+.
+
+  Body: `{"project_id": "<uuid>"|null, "acknowledge": bool}`.
+
+  Runs the MANDATORY PRE-FLIGHT: if any currently-resolved endpoint would become
+  `egress_blocked`, responds `409 would_block_endpoints` NAMING each offending
+  endpoint. Retry with `"acknowledge": true` to proceed; the response then
+  REPORTS the resulting blocked posture. Never a silent tenant-wide outage.
+  """
+  def enable_local_only(conn, params) do
+    key = conn.assigns.current_api_key
+
+    opts = Keyword.put(actor_opts(conn), :acknowledge, params["acknowledge"] == true)
+
+    case Egress.enable_local_only(key.tenant_id, params["project_id"], opts) do
+      {:ok, %{blocked_endpoints: blocked}} ->
+        json(conn, %{
+          local_only: true,
+          scope: scope_label(params["project_id"]),
+          blocked_endpoints: blocked,
+          acknowledged: params["acknowledge"] == true,
+          note: blocked_note(blocked)
+        })
+
+      {:error, {:would_block, blocked}} ->
+        conn
+        |> put_status(:conflict)
+        |> json(%{
+          error: "would_block_endpoints",
+          message:
+            "Enabling local_only on this scope would immediately block " <>
+              "#{length(blocked)} currently-resolved endpoint(s). Configure a " <>
+              "satisfying endpoint AT TENANT level (role :user), declare a trusted " <>
+              "endpoint (role :user), or retry with acknowledge=true to accept the " <>
+              "resulting blocked posture.",
+          blocked_endpoints: blocked
+        })
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  DELETE /api/v1/egress/local-only — role `:user` ONLY.
+
+  Body/query: `project_id` (optional). Audited.
+  """
+  def clear_local_only(conn, params) do
+    key = conn.assigns.current_api_key
+
+    with {:ok, :cleared} <-
+           Egress.clear_local_only(key.tenant_id, params["project_id"], actor_opts(conn)) do
+      json(conn, %{local_only: false, scope: scope_label(params["project_id"])})
+    end
+  end
+
+  @doc "GET /api/v1/egress/trusted-endpoints — role `:agent`."
+  def list_trusted(conn, _params) do
+    key = conn.assigns.current_api_key
+
+    json(conn, %{
+      data: Enum.map(Egress.list_trusted_endpoints(key.tenant_id), &endpoint_view/1),
+      locality_label: Egress.tenant_declared_label()
+    })
+  end
+
+  @doc """
+  POST /api/v1/egress/trusted-endpoints — role `:user` ONLY.
+
+  Body: `{"host": "ollama.example.com", "purposes": ["inference"]}`.
+
+  Public addresses ONLY (validated at write time AND again at pin time),
+  purpose-scoped, vendor hosts excluded. The declaration is an UNVERIFIED TENANT
+  ATTESTATION and is never presented as network-local.
+  """
+  def declare_trusted(conn, params) do
+    key = conn.assigns.current_api_key
+    attrs = Map.take(params, ["host", "purposes", "note"])
+
+    with {:ok, endpoint} <-
+           Egress.declare_trusted_endpoint(key.tenant_id, attrs, actor_opts(conn)) do
+      conn
+      |> put_status(:created)
+      |> json(endpoint_view(endpoint))
+    end
+  end
+
+  @doc "DELETE /api/v1/egress/trusted-endpoints/:host — role `:user` ONLY. Invalidates immediately."
+  def revoke_trusted(conn, %{"host" => host}) do
+    key = conn.assigns.current_api_key
+
+    case Egress.revoke_trusted_endpoint(key.tenant_id, host, actor_opts(conn)) do
+      {:ok, :revoked} -> json(conn, %{revoked: true, host: String.downcase(host)})
+      {:error, :not_found} -> {:error, :not_found}
+    end
+  end
+
+  @doc """
+  POST /api/v1/egress/repin — role `:agent`.
+
+  The `:pin_stale` remediation. Target deployments (home Ollama box, tailscale
+  funnel, DHCP VPS) change IP routinely, so recovery must NOT require a human
+  `:user` write — that would contradict the epic's agent-native, no-UI design.
+  """
+  def repin(conn, %{"host" => host} = params) do
+    key = conn.assigns.current_api_key
+    scope = Scope.new(key.tenant_id, params["project_id"])
+
+    case Policy.repin(scope, String.downcase(host), :inference) do
+      {:ok, classification} ->
+        json(conn, %{
+          host: String.downcase(host),
+          repinned: true,
+          verdict: to_string(classification.verdict)
+        })
+
+      {:error, reason} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{error: "repin_failed", message: inspect(reason)})
+    end
+  end
+
+  defp endpoint_view(%TrustedEndpoint{} = endpoint) do
+    %{
+      id: endpoint.id,
+      host: endpoint.host,
+      purposes: endpoint.purposes,
+      note: endpoint.note,
+      # Verbatim by contract: never present a declaration as network-local.
+      locality_label: Egress.tenant_declared_label(),
+      declared_at: endpoint.inserted_at
+    }
+  end
+
+  defp blocked_note([]), do: "No currently-resolved endpoint became blocked."
+
+  defp blocked_note(blocked) do
+    "local_only is ACTIVE and #{length(blocked)} resolved endpoint(s) are now " <>
+      "egress_blocked. Embedding, extraction, classification and merge for this scope " <>
+      "will be refused until a local or tenant-declared endpoint is configured at " <>
+      "TENANT level (role :user), or the marking is cleared (role :user)."
+  end
+
+  defp scope_label(nil), do: "tenant"
+  defp scope_label(project_id), do: "project:#{project_id}"
+
+  defp actor_opts(conn) do
+    key = conn.assigns.current_api_key
+    [actor_type: "api_key", actor_id: key.id, actor_label: "#{key.role}:#{key.name}"]
+  end
+end

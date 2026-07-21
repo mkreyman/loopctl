@@ -393,6 +393,22 @@ if config_env() == :prod do
     model: System.get_env("OPENAI_EMBEDDING_MODEL") || "text-embedding-3-small"
   }
 
+  # US-41.4 (AC-41.4.5 / AC-41.4.9) — the OPERATOR-controlled deployment
+  # allowlist: the ONLY thing that can carve specific hosts/CIDRs out of
+  # `Loopctl.Net.UrlGuard`'s loopback/private/CGNAT/link-local/Fly-6PN denylist.
+  # It is DEPLOYMENT-scoped, lives outside RLS, and is READ-ONLY at every role
+  # including :user — there is deliberately no API path that mutates it. Tenant
+  # declarations carve NOTHING out; they only change the locality VERDICT for
+  # hosts that already pass the denylist.
+  #
+  #   LOCAL_ENDPOINT_ALLOWLIST="127.0.0.1,localhost,ollama.internal,10.1.0.0/16"
+  config :loopctl,
+         :local_endpoint_allowlist,
+         (System.get_env("LOCAL_ENDPOINT_ALLOWLIST") || "")
+         |> String.split(",", trim: true)
+         |> Enum.map(&String.trim/1)
+         |> Enum.reject(&(&1 == ""))
+
   # NOTE (Epic 28, #179): the global `:anthropic_provider` / `:knowledge_classifier_model`
   # config keys were REMOVED. Tenant knowledge-LLM work (content extraction,
   # classification, merge synthesis, review extraction) now resolves each tenant's

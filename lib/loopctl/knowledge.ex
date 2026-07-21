@@ -47,6 +47,8 @@ defmodule Loopctl.Knowledge do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Egress
+  alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.HeavyRead
   alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge.Analytics
@@ -6558,7 +6560,8 @@ defmodule Loopctl.Knowledge do
      %{
        results: paginated.results,
        meta:
-         Map.merge(kw.meta, %{
+         kw.meta
+         |> Map.merge(%{
            fallback: true,
            search_mode: "keyword_only",
            fallback_reason: fallback_reason,
@@ -6566,7 +6569,37 @@ defmodule Loopctl.Knowledge do
            limit: paginated.limit,
            offset: paginated.offset
          })
+         |> Map.merge(degraded_contract_meta(tenant_id, fallback_reason))
      }}
+  end
+
+  # US-41.4 (AC-41.4.7): the degraded response is EXPLICITLY LABELLED and never a
+  # bare empty list. Whenever the semantic path is unavailable — `egress_blocked`,
+  # circuit open, or an embedding fallback — the meta names the REASON and the
+  # OFFENDING ENDPOINT, and carries a reserved, extensible `excluded_tiers` field.
+  #
+  # `excluded_tiers` is present and EMPTY here by contract. US-41.6 populates it:
+  # AC-41.6.4 removes encrypted bodies from the FTS index, so without the field a
+  # `local_only` + `encrypt_body` tenant would receive a successful-looking 200 with
+  # a structurally impossible-to-populate result set that reads as "nothing in your
+  # KB". Shipping the field now keeps the response contract stable across that
+  # change. The offending-endpoint lookup is TENANT-scoped and DB-free.
+  defp degraded_contract_meta(tenant_id, fallback_reason) do
+    %{
+      degraded: true,
+      excluded_tiers: [],
+      offending_endpoint: offending_endpoint(tenant_id, fallback_reason)
+    }
+  end
+
+  defp offending_endpoint(tenant_id, _reason) do
+    tenant_id
+    |> EgressScope.new()
+    |> Egress.resolved_endpoints()
+    |> Enum.find_value(fn
+      {:embedding, url} -> url
+      _ -> nil
+    end)
   end
 
   # -- Semantic → keyword fallback observability (#297) ------------------------
@@ -6626,6 +6659,11 @@ defmodule Loopctl.Knowledge do
   end
 
   defp reason_to_tag(:no_api_key), do: "no_embedding_key"
+  # US-41.4 (AC-41.4.6/.7): the scope is `local_only` and the resolved embedding
+  # endpoint is not local, so the semantic path is refused BEFORE any request —
+  # keyword fallback, HTTP 200, never a 500, and never a bare empty list.
+  defp reason_to_tag(:egress_blocked), do: "egress_blocked"
+  defp reason_to_tag(:pin_stale), do: "pin_stale"
   defp reason_to_tag(:circuit_open), do: "embedding_circuit_open"
   defp reason_to_tag(:rate_limited_local), do: "embedding_rate_limited_local"
   # US-37.5: the semantic heavy read was shed because the tenant is over its
@@ -7937,6 +7975,19 @@ defmodule Loopctl.Knowledge do
   # (both gate on `breaker_countable?/1`); otherwise our own backpressure would
   # trip the breaker and degrade every tenant.
   defp breaker_countable?(:rate_limited_local), do: false
+  # US-41.4 (AC-41.4.6): a fail-CLOSED egress refusal is a PERMANENT LOCAL
+  # CONFIGURATION decision — the scope is `local_only` and the resolved endpoint is
+  # not local — not a provider failure. No request was ever issued. Counting it
+  # would open the per-tenant breaker (degrading every path for that tenant) and
+  # emit the fleet-wide `[:loopctl, :llm, :provider_error]` storm signal for a
+  # deliberate configuration state, exactly the failure `:rate_limited_local` was
+  # exempted for above. The replacement operator signal is the dedicated
+  # `[:loopctl, :egress, :blocked]` counter, so a tenant silently non-functional
+  # since an enable is still visible on the dashboards.
+  defp breaker_countable?(:egress_blocked), do: false
+  # `:pin_stale` is DISTINCT from `:egress_blocked` (an IP changed, not a policy
+  # refusal) and equally not a provider failure — remediation is a cheap re-pin.
+  defp breaker_countable?(:pin_stale), do: false
   # Unknown/other transport-ish failures: count (conservative — a real outage).
   defp breaker_countable?(_), do: true
 

@@ -181,41 +181,64 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
         # error; a length mismatch here is a contract violation — retry the batch.
         {:error, :embedding_batch_length_mismatch}
 
-      {:error, :no_api_key} ->
-        skip_no_embedding_key(tenant_id, to_embed)
-
-      {:error, :rate_limited_local} ->
-        # US-37.1 (AC-37.1.4): node-local admission backpressure is loss-free — snooze
-        # the slot (no attempt consumed) so the batch retries once demand subsides.
-        {:snooze, Admission.snooze_seconds()}
-
-      {:error, :circuit_open} ->
-        # US-37.3 (AC-37.3.5): breaker OPEN — snooze loss-free for ~the remaining open
-        # window rather than {:error, ...} (which could burn every attempt and DISCARD
-        # the batch while the breaker stays open, stranding the articles un-embedded).
-        {:snooze, circuit_open_snooze_seconds(tenant_id)}
-
-      {:error, {:api_error, _status, :provider_error, retry_after}}
-      when is_integer(retry_after) ->
-        # US-37.3 (AC-37.3.3): provider throttle with a Retry-After — snooze loss-free
-        # for ~that interval instead of the blind polynomial backoff.
-        {:snooze, RetryAfter.snooze_seconds(retry_after)}
-
       {:error, reason} ->
-        # No partial writes happened (we only store after a full success), so the whole
-        # batch fails/retries as a unit (AC-37.4.3). The Oban error term is SANITIZED.
-        sanitized = ProviderError.sanitize(reason)
+        handle_batch_error(tenant_id, to_embed, reason)
+    end
+  end
 
-        if Llm.permanent_provider_error?(reason) do
-          Logger.debug(
-            "BatchArticleEmbeddingWorker: tenant=#{tenant_id} batch=#{length(to_embed)} permanent " <>
-              "embedding error (#{ProviderError.log_tag(reason)}); discarding."
-          )
+  # Every error branch lives in its own function so `embed_and_store_sub_batch/2`
+  # stays under the credo --strict cyclomatic-complexity ceiling as US-41.4 adds
+  # the terminal `:egress_blocked` / `:pin_stale` cancellation.
+  defp handle_batch_error(tenant_id, to_embed, reason)
 
-          {:discard, {:embedding_permanent_error, sanitized}}
-        else
-          {:error, sanitized}
-        end
+  defp handle_batch_error(tenant_id, to_embed, :no_api_key),
+    do: skip_no_embedding_key(tenant_id, to_embed)
+
+  # US-41.4 (AC-41.4.3): a fail-CLOSED egress refusal is a PERMANENT configuration
+  # state, not a transient failure. CANCEL — never {:error, _} (Oban retries it,
+  # burning max_attempts with backoff on every item and repopulating the queue on
+  # every subsequent write) and never {:snooze, _} (an indefinite re-check loop
+  # against a config that will not change on its own). No data was sent. Mirrors
+  # the terminal treatment US-41.5 requires for blocked webhook deliveries.
+  defp handle_batch_error(_tenant_id, _to_embed, egress)
+       when egress in [:egress_blocked, :pin_stale],
+       do: {:cancel, egress}
+
+  # US-37.1 (AC-37.1.4): node-local admission backpressure is loss-free — snooze
+  # the slot (no attempt consumed) so the batch retries once demand subsides.
+  defp handle_batch_error(_tenant_id, _to_embed, :rate_limited_local),
+    do: {:snooze, Admission.snooze_seconds()}
+
+  # US-37.3 (AC-37.3.5): breaker OPEN — snooze loss-free for ~the remaining open
+  # window rather than {:error, ...} (which could burn every attempt and DISCARD
+  # the batch while the breaker stays open, stranding the articles un-embedded).
+  defp handle_batch_error(tenant_id, _to_embed, :circuit_open),
+    do: {:snooze, circuit_open_snooze_seconds(tenant_id)}
+
+  # US-37.3 (AC-37.3.3): provider throttle with a Retry-After — snooze loss-free
+  # for ~that interval instead of the blind polynomial backoff.
+  defp handle_batch_error(
+         _tenant_id,
+         _to_embed,
+         {:api_error, _status, :provider_error, retry_after}
+       )
+       when is_integer(retry_after),
+       do: {:snooze, RetryAfter.snooze_seconds(retry_after)}
+
+  defp handle_batch_error(tenant_id, to_embed, reason) do
+    # No partial writes happened (we only store after a full success), so the whole
+    # batch fails/retries as a unit (AC-37.4.3). The Oban error term is SANITIZED.
+    sanitized = ProviderError.sanitize(reason)
+
+    if Llm.permanent_provider_error?(reason) do
+      Logger.debug(
+        "BatchArticleEmbeddingWorker: tenant=#{tenant_id} batch=#{length(to_embed)} permanent " <>
+          "embedding error (#{ProviderError.log_tag(reason)}); discarding."
+      )
+
+      {:discard, {:embedding_permanent_error, sanitized}}
+    else
+      {:error, sanitized}
     end
   end
 

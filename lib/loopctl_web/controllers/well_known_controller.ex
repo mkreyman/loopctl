@@ -41,7 +41,27 @@ defmodule LoopctlWeb.WellKnownController do
     # ceremony required. A stranger agent discovering loopctl cold can POST
     # here to obtain a working tenant + key.
     signup_endpoint: "#{@base_url}/api/v1/signup",
-    contact: "operator@loopctl.com"
+    contact: "operator@loopctl.com",
+    # US-41.4 (AC-41.4.10) — INSTANCE CAPABILITIES, so an agent can discover the
+    # instance's constraints BEFORE authenticating. Strictly instance-wide: no
+    # tenant-specific data appears here, and no tenant can influence it.
+    capabilities: %{
+      # The FIXED set of embedding dimensions this instance supports (US-41.1
+      # AC-41.1.3). A tenant-supplied endpoint whose model emits a different
+      # dimension cannot be stored.
+      supported_embedding_dimensions: [1536],
+      # Whether a tenant may point loopctl at their OWN inference endpoint at all.
+      tenant_supplied_endpoints_permitted: true,
+      # The privacy/storage tiers this instance implements today.
+      tiers: ["standard", "local_only"],
+      # The egress guarantee, narrowed to exactly what the static chokepoint check
+      # proves. HTTP inside a dependency, and the separate mcp-server/ codebase,
+      # are outside it — and webhook delivery is not covered until US-41.5.
+      egress_guarantee:
+        "fail-closed local_only enforcement on every outbound HTTP call made by " <>
+          "loopctl application code on the model-provider path",
+      egress_posture_endpoint: "#{@base_url}/api/v1/egress/posture"
+    }
   }
 
   @discovery_json Jason.encode!(@discovery_body)
@@ -100,7 +120,25 @@ defmodule LoopctlWeb.WellKnownController do
                    required_agent_pattern_url: %{type: "string", format: "uri"},
                    system_articles_endpoint: %{type: "string", format: "uri"},
                    signup_endpoint: %{type: "string", format: "uri"},
-                   contact: %{type: "string"}
+                   contact: %{type: "string"},
+                   capabilities: %{
+                     type: "object",
+                     required: [
+                       "supported_embedding_dimensions",
+                       "tenant_supplied_endpoints_permitted",
+                       "tiers"
+                     ],
+                     properties: %{
+                       supported_embedding_dimensions: %{
+                         type: "array",
+                         items: %{type: "integer"}
+                       },
+                       tenant_supplied_endpoints_permitted: %{type: "boolean"},
+                       tiers: %{type: "array", items: %{type: "string"}},
+                       egress_guarantee: %{type: "string"},
+                       egress_posture_endpoint: %{type: "string", format: "uri"}
+                     }
+                   }
                  }
                })
 

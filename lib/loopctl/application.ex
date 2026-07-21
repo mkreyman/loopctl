@@ -134,6 +134,13 @@ defmodule Loopctl.Application do
       # writes via AdminRepo at flush); stable owner survives the request/Task/
       # Oban process that recorded a touch.
       Loopctl.TouchBuffer,
+      # US-41.4 (AC-41.4.12): owns the ETS table holding resolved+classified
+      # egress pins, keyed (tenant_id, scope, host). A NAMED SUPERVISED owner —
+      # not a bare TTL — because it re-resolves and re-pins BEFORE expiry with
+      # jitter; a TTL-expiry cliff would be a scheduled fleet-wide outage in
+      # which every local_only tenant hard-refuses at once, and a privacy control
+      # whose steady state is an outage gets disabled in production.
+      Loopctl.Egress.PinCache,
       LoopctlWeb.Endpoint
     ]
 

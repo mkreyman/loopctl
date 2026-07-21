@@ -133,6 +133,13 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
     classify_result(result)
   end
 
+  defp classify_result({:error, egress}) when egress in [:egress_blocked, :pin_stale] do
+    # US-41.4 (AC-41.4.3): a fail-CLOSED egress refusal is PERMANENT — cancel, never
+    # retry. Retrying would burn max_attempts against a configuration that cannot
+    # change on its own, and no data was sent in the first place.
+    {:cancel, egress}
+  end
+
   defp classify_result({:error, :rate_limited_local}) do
     # US-37.1 (AC-37.1.4): node-local provider admission backpressure is loss-free —
     # snooze (no Oban attempt consumed, never a discard) rather than burning a retry

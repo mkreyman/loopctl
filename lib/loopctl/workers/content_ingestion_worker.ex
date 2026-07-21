@@ -317,6 +317,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       {:rate_limited_local, _acc} ->
         {:snooze, Admission.snooze_seconds()}
 
+      # US-41.4 (AC-41.4.3): a fail-CLOSED egress refusal is terminal for Oban.
+      # Cancel — never {:error, _} (retried) and never {:snooze, _}. Already-persisted
+      # chunks stay committed; nothing left the boundary.
+      {:egress_blocked, egress, _acc} ->
+        {:cancel, egress}
+
       # US-37.3 (AC-37.3.3): a chunk's Anthropic extraction was throttled with a
       # provider Retry-After. Snooze the whole job loss-free for ~that interval
       # (no attempt consumed) instead of the blind `attempt^4` backoff.
@@ -375,6 +381,13 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
              persisted: acc.persisted + 1,
              seen_titles: seen_titles
          }}
+
+      {:error, egress} when egress in [:egress_blocked, :pin_stale] ->
+        # US-41.4 (AC-41.4.3): the scope is local_only and the resolved endpoint is
+        # not local. This is a PERMANENT configuration refusal — halt the reduce and
+        # signal the caller to CANCEL the whole job. Retrying would burn max_attempts
+        # and repopulate the queue on every subsequent write; no data was sent.
+        {:halt, {:egress_blocked, egress, acc}}
 
       {:error, :rate_limited_local} ->
         # US-37.1 (AC-37.1.4): node-local provider admission backpressure. Halt the
