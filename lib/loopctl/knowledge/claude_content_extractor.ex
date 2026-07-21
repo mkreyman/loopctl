@@ -35,6 +35,22 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
   fences.\
   """
 
+  @doc """
+  The extraction system prompt.
+
+  Public so the OpenAI-compatible sibling
+  (`Loopctl.Knowledge.OpenAiContentExtractor`) uses the SAME prompt instead of a
+  copy that silently drifts. The prompt is provider-independent; only the wire
+  protocol differs, and that difference lives inside the client (US-41.3).
+  """
+  @spec system_prompt() :: String.t()
+  def system_prompt, do: @system_prompt
+
+  @doc "The user message for `content` of `source_type` — shared with the sibling impl."
+  @spec user_content(String.t(), String.t()) :: String.t()
+  def user_content(content, source_type),
+    do: "Source type: #{source_type}\n\nContent:\n#{content}"
+
   @impl true
   def extract_from_content(scope_or_tenant_id, content, opts \\ []) do
     source_type = Keyword.get(opts, :source_type, "unknown")
@@ -44,10 +60,7 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
         max_tokens: 64_000,
         system: @system_prompt,
         messages: [
-          %{
-            role: "user",
-            content: "Source type: #{source_type}\n\nContent:\n#{content}"
-          }
+          %{role: "user", content: user_content(content, source_type)}
         ]
       }
     end

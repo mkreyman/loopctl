@@ -358,7 +358,11 @@ defmodule Loopctl.Fixtures do
       api_key: "test-anthropic-test-#{System.unique_integer([:positive])}",
       extraction_model: nil,
       classification_model: nil,
-      merge_model: nil
+      merge_model: nil,
+      # US-41.3: NULL chat_provider means the unchanged Anthropic default.
+      chat_provider: nil,
+      chat_base_url: nil,
+      chat_api_key: nil
     })
   end
 
@@ -1406,11 +1410,15 @@ defmodule Loopctl.Fixtures do
 
     data = build(:tenant_llm_settings, Map.delete(attrs, :tenant_id))
     api_key = Map.get(data, :api_key)
+    # US-41.3: the OpenAI-compatible chat credential is a SEPARATE encrypted column
+    # and, like `api_key`, is never cast.
+    chat_api_key = Map.get(data, :chat_api_key)
 
     settings =
       %TenantLlmSettings{tenant_id: tenant_id}
       |> TenantLlmSettings.models_changeset(data)
       |> TenantLlmSettings.put_api_key(api_key)
+      |> TenantLlmSettings.put_chat_api_key(chat_api_key)
       |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
       |> AdminRepo.insert!()
 

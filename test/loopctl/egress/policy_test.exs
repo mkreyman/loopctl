@@ -65,6 +65,74 @@ defmodule Loopctl.Egress.PolicyTest do
     test "an unmarked scope whose host cannot be pinned proceeds UNPINNED", %{scope: scope} do
       assert {:ok, :unpinned} = Policy.check(scope, "https://127.0.0.1/v1/embeddings", :inference)
     end
+
+    # US-41.3 review: the default path deliberately never refused, leaving the SSRF
+    # denylist "to the callers that own it" — safe while every url here was a
+    # hardcoded vendor host, a hole once `chat_base_url` made one tenant-writable.
+    # A caller that owns a tenant-writable url opts in with `tenant_supplied: true`.
+    test "a TENANT-SUPPLIED denylisted host is REFUSED even unmarked", %{scope: scope} do
+      assert {:error, :egress_blocked, details} =
+               Policy.check(scope, "http://169.254.169.254/v1/chat/completions", :inference,
+                 tenant_supplied: true
+               )
+
+      assert details.verdict == :denylisted
+      assert details.remediation =~ "OPERATOR deployment allowlist"
+    end
+
+    test "a TENANT-SUPPLIED host the OPERATOR allowlisted is still allowed", %{scope: scope} do
+      with_allowlist(["127.0.0.1"], fn ->
+        assert {:ok, pinned} =
+                 Policy.check(scope, "http://127.0.0.1:11434/v1/chat/completions", :inference,
+                   tenant_supplied: true
+                 )
+
+        assert pinned.ip == {127, 0, 0, 1}
+      end)
+    end
+
+    test "a TENANT-SUPPLIED PUBLIC host acquires no new failure mode", %{scope: scope} do
+      assert {:ok, _} =
+               Policy.check(scope, "https://api.openai.com/v1/chat/completions", :inference,
+                 tenant_supplied: true
+               )
+    end
+
+    # US-41.3 review: the residual half of the SSRF finding. `{:ok, :unpinned}` keeps
+    # Req's default redirect-FOLLOWING and no IP pin, and the default path fell
+    # through to it for ANY non-denylist failure — an unresolvable host, a resolve
+    # slower than the 3s timeout, a classifier raise/exit/throw. For a
+    # TENANT-CONTROLLED host that is an attacker-INFLUENCED condition: make the first
+    # resolution fail and the connect-time resolution can land on 127.0.0.1 /
+    # 169.254.169.254 / a Fly 6PN peer, redirects followed on top. It must fail
+    # CLOSED — and as the TRANSIENT `:egress_unavailable` (workers snooze), because a
+    # resolve failure is a blip, not the permanent configuration state
+    # `:egress_blocked` denotes.
+    test "a TENANT-SUPPLIED unresolvable host FAILS CLOSED instead of going unpinned",
+         %{tenant: tenant, scope: scope} do
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host -> {:error, :nxdomain} end)
+      url = "https://tenant-chosen.example.com/v1"
+
+      # The same url on the VENDOR path still degrades to unpinned — the fix must not
+      # hand default (non-tenant-supplied) traffic a brand-new failure mode.
+      assert {:ok, :unpinned} = Policy.check(scope, url, :inference)
+      PinCache.invalidate_tenant(tenant.id)
+
+      assert {:error, :egress_unavailable, details} =
+               Policy.check(scope, url, :inference, tenant_supplied: true)
+
+      assert details.verdict == :unclassifiable
+      assert details.remediation =~ "refused"
+    end
+
+    test "a TENANT-SUPPLIED host whose classifier RAISES fails closed too", %{scope: scope} do
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host -> raise "classifier exploded" end)
+
+      assert {:error, :egress_unavailable, _details} =
+               Policy.check(scope, "https://tenant-chosen.example.com/v1", :inference,
+                 tenant_supplied: true
+               )
+    end
   end
 
   describe "local_only refusal (AC-41.4.3, TC-41.4.1)" do

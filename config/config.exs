@@ -465,13 +465,18 @@ config :loopctl, Loopctl.Vault,
     # {Cloak.Ciphers.AES.GCM, tag: "AES.GCM.V0", key: Base.decode64!("OLD_KEY"), iv_length: 12}
   ]
 
-# DI: Content extractor for knowledge ingestion
-config :loopctl, :content_extractor, Loopctl.Knowledge.ClaudeContentExtractor
+# DI: Content extractor for knowledge ingestion.
+# US-41.3: the module named here is the TENANT-AWARE ROUTER — it still is the one
+# `Application.get_env` resolution point, and it dispatches per call to the
+# Anthropic or OpenAI-compatible sibling based on the tenant's settings. A tenant
+# that configures nothing keeps Anthropic, unchanged (AC-41.3.7).
+config :loopctl, :content_extractor, Loopctl.Knowledge.ContentExtractorRouter
 
 # DI: Memory promotion compiler LLM (Epic 29). The production impl wraps the
 # shared tenant-scoped Anthropic client (operation :extraction) with temperature 0
 # and a fixed injection-hardened prompt. Overridden by a Mox mock in test env.
-config :loopctl, :promoter_llm, Loopctl.Memory.Promoter.DefaultLLM
+# US-41.3: tenant-aware router (dispatches to DefaultLLM or OpenAiLLM per tenant).
+config :loopctl, :promoter_llm, Loopctl.Memory.Promoter.LLMRouter
 
 # Memory promotion tunables (Loopctl.Memory.Promoter.compile/2). Candidates below
 # the confidence threshold are dropped; the result is capped to the top-N by
@@ -598,7 +603,8 @@ config :loopctl, :rls_reroute_list_stories_by_project, false
 
 # DI: Article category classifier for the reclassification backfill
 # (KnowledgeReclassifyWorker). Overridden in test env.
-config :loopctl, :category_classifier, Loopctl.Knowledge.ClaudeCategoryClassifier
+# US-41.3: tenant-aware router (Claude or OpenAI-compatible sibling per tenant).
+config :loopctl, :category_classifier, Loopctl.Knowledge.ClassifierRouter
 
 # Reclassification backfill tunables (KnowledgeReclassifyWorker). Query-shaped,
 # so they can also be passed per-kick in the job args.
@@ -641,7 +647,8 @@ config :loopctl, :knowledge_conflict_threshold, 0.93
 # Merge synthesizer (#4 step 2): the LLM that combines two articles a grounded agent
 # marked `:merge` into ONE draft. Resolves the tenant's BYO Anthropic key per-tenant
 # via Loopctl.Llm.resolve/2 (Epic 28, #179); drafts only.
-config :loopctl, :merge_synthesizer, Loopctl.Knowledge.ClaudeMergeSynthesizer
+# US-41.3: tenant-aware router (Claude or OpenAI-compatible sibling per tenant).
+config :loopctl, :merge_synthesizer, Loopctl.Knowledge.MergeSynthesizerRouter
 # Max `:relates_to`→`:potential_conflict` promotions the nightly lint sweep does per
 # tenant per run (bounds the existing-corpus backfill; it cycles over nights).
 config :loopctl, :knowledge_lint_max_conflict_promotions, 500

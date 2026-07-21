@@ -69,6 +69,7 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
   alias Loopctl.Egress
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
+  alias Loopctl.Llm.ShapeError
   alias Loopctl.Memory
   alias Loopctl.Memory.Promoter
   alias Loopctl.Memory.PromotionTelemetry
@@ -218,6 +219,19 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
   # `max_attempts`. A bare `%Oban.Job{}` (unit tests) carries `attempt: 0` — below the cap
   # — so it stays retryable; the cap engages for real Oban-scheduled jobs as their attempt
   # count climbs.
+  # US-41.3 (AC-41.3.4): a shape failure is TERMINAL on the first attempt — the
+  # configured model cannot produce the required structure, and every retry re-POSTs
+  # the session content to a model that will fail identically.
+  defp compile_failure_result({:invalid_response_shape, _details} = shape, _attempt),
+    do: ShapeError.oban_result(shape)
+
+  # US-41.3: a provider mismatch is a deterministic CONFIGURATION state (the chat
+  # client resolved a DIFFERENT provider than the one it guards). Retrying
+  # re-resolves the same settings and refuses identically, so discard on the first
+  # attempt rather than burning the cap.
+  defp compile_failure_result(:provider_mismatch = reason, _attempt),
+    do: {:discard, {:compile_failed, reason}}
+
   defp compile_failure_result(reason, attempt)
        when is_integer(attempt) and attempt >= @max_compile_attempts do
     {:discard, {:compile_failed, reason}}
