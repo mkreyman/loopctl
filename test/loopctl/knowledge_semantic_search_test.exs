@@ -1459,4 +1459,251 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       assert meta.pool_capped == true
     end
   end
+
+  # --- #470: Reciprocal Rank Fusion (RRF) scoring ------------------------------
+
+  describe "search_combined/3 - RRF fusion (#470)" do
+    test "a keyword-only candidate scores exactly keyword_weight / (k + rank)" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      # No embedding → excluded from the semantic lane, so this is a PURE keyword-lane
+      # rank-1 candidate. Unique token keeps it the only keyword match.
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Zzquux Reference",
+        body: "The zzquux token appears only here.",
+        status: :published
+      })
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: [result]}} =
+        Knowledge.search_combined(tenant.id, "zzquux",
+          keyword_weight: 0.5,
+          semantic_weight: 0.5
+        )
+
+      # RRF: weight / (k + rank), default k = 60, rank 1 → 0.5 / 61.
+      assert_in_delta result.final_score, 0.5 / 61, 1.0e-9
+    end
+
+    test "the smoothing constant k is configurable per call" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Zzquux Reference",
+        body: "The zzquux token appears only here.",
+        status: :published
+      })
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: [result]}} =
+        Knowledge.search_combined(tenant.id, "zzquux",
+          keyword_weight: 0.5,
+          semantic_weight: 0.5,
+          rrf_k: 10
+        )
+
+      # weight / (k + rank) with k = 10, rank 1 → 0.5 / 11.
+      assert_in_delta result.final_score, 0.5 / 11, 1.0e-9
+    end
+
+    test "a cross-lane consensus doc outranks a doc that is #1 in a single lane" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      # Appears in BOTH lanes (keyword match on "consensus" + close embedding), but is
+      # unlikely to be strictly #1 in either.
+      consensus =
+        create_article_with_embedding(
+          tenant.id,
+          %{title: "Consensus Overview", body: "A consensus across retrieval lanes."},
+          :close
+        )
+
+      # Strong keyword-only spike: matches "consensus" but far embedding.
+      _kw_spike =
+        create_article_with_embedding(
+          tenant.id,
+          %{title: "Consensus Consensus Consensus", body: "consensus consensus consensus"},
+          :far
+        )
+
+      # Semantic-only: close embedding, no keyword match on "consensus".
+      _sem_spike =
+        create_article_with_embedding(
+          tenant.id,
+          %{title: "Fault Tolerance", body: "Supervisor trees prevent cascading failures."},
+          :close
+        )
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: results}} =
+        Knowledge.search_combined(tenant.id, "consensus",
+          keyword_weight: 0.5,
+          semantic_weight: 0.5
+        )
+
+      # The consensus doc, present in both lanes, wins the top slot over either
+      # single-lane spike — the smoothing constant makes agreement beat one strong vote.
+      assert hd(results).id == consensus.id
+    end
+
+    test "the min-max path is available behind the :min_max A/B flag" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      create_article_with_embedding(
+        tenant.id,
+        %{title: "Alpha Guide", body: "alpha content for fusion ab test"},
+        :close
+      )
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: results, meta: meta}} =
+        Knowledge.search_combined(tenant.id, "alpha", fusion_strategy: :min_max)
+
+      # Same public shape; min-max produces normalized 0..1 weighted-sum scores (a lone
+      # both-lane hit normalizes to 1.0 per lane → 0.5 + 0.5 = 1.0), unlike RRF's
+      # ~1/(k+rank) magnitudes.
+      assert meta.search_mode == "combined"
+      assert Enum.all?(results, &Map.has_key?(&1, :final_score))
+      assert Enum.all?(results, &(&1.final_score <= 1.0))
+    end
+
+    test "meta shape is preserved (MCP contract)" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      create_article_with_embedding(
+        tenant.id,
+        %{title: "Shape Guide", body: "shape preservation content"},
+        :close
+      )
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{meta: meta}} = Knowledge.search_combined(tenant.id, "shape")
+
+      assert meta.search_mode == "combined"
+      assert meta.total_count_scope == "merged_candidates"
+      assert is_integer(meta.total_count)
+      assert meta.limit == 10
+      assert meta.offset == 0
+      assert meta.pool_capped == false
+      assert is_integer(meta.semantic_result_count)
+    end
+  end
+
+  # --- #470: optional graph-neighbor lane -------------------------------------
+
+  describe "search_combined/3 - graph-neighbor lane (#470)" do
+    # A seed that matches the query so it enters the merged pool, plus a linked
+    # neighbor that matches NEITHER lane (no keyword hit, no embedding) so it can only
+    # surface through the graph lane.
+    defp seed_and_neighbor(tenant_id) do
+      seed =
+        fixture(:article, %{
+          tenant_id: tenant_id,
+          title: "Graphlane Seed",
+          body: "The graphlane token appears here.",
+          status: :published
+        })
+
+      neighbor =
+        fixture(:article, %{
+          tenant_id: tenant_id,
+          title: "Orphan Neighbor",
+          body: "Completely unrelated wording with no shared token.",
+          status: :published
+        })
+
+      fixture(:article_link, %{
+        tenant_id: tenant_id,
+        source_article_id: seed.id,
+        target_article_id: neighbor.id,
+        relationship_type: :relates_to
+      })
+
+      %{seed: seed, neighbor: neighbor}
+    end
+
+    test "is OFF by default — no neighbors injected" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      %{neighbor: neighbor} = seed_and_neighbor(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: results}} = Knowledge.search_combined(tenant.id, "graphlane")
+
+      refute Enum.any?(results, &(&1.id == neighbor.id))
+    end
+
+    test "when ON, one-hop neighbors join the fusion" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      %{seed: seed, neighbor: neighbor} = seed_and_neighbor(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: results, meta: meta}} =
+        Knowledge.search_combined(tenant.id, "graphlane", graph_lane: true)
+
+      ids = Enum.map(results, & &1.id)
+      assert seed.id in ids
+      assert neighbor.id in ids
+
+      neighbor_result = Enum.find(results, &(&1.id == neighbor.id))
+
+      # A graph-only hit carries neither raw score → its hybrid-resolver absolute_score
+      # is 0.0, and it must NOT inflate the semantic lane's row count.
+      refute Map.has_key?(neighbor_result, :relevance_score)
+      refute Map.has_key?(neighbor_result, :similarity_score)
+      assert Map.has_key?(neighbor_result, :final_score)
+      # The seed matched keyword only; nothing was embedded for the query direction, so
+      # the semantic lane contributed zero rows — the graph neighbor did not change that.
+      assert meta.semantic_result_count == 0
+    end
+
+    test "graph lane is tenant-scoped — tenant B neighbors never surface for tenant A" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant_a.id)
+
+      %{neighbor: neighbor_a} = seed_and_neighbor(tenant_a.id)
+      %{neighbor: neighbor_b} = seed_and_neighbor(tenant_b.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: results}} =
+        Knowledge.search_combined(tenant_a.id, "graphlane", graph_lane: true)
+
+      ids = Enum.map(results, & &1.id)
+      assert neighbor_a.id in ids
+      refute neighbor_b.id in ids
+    end
+  end
 end
