@@ -578,17 +578,17 @@ defmodule Loopctl.Knowledge do
         end
 
       active_title_conflict?(changeset) ->
-        resolve_title_conflict(tenant_id, attrs, changeset)
+        resolve_title_conflict(tenant_id, attrs, changeset, vis)
 
       true ->
         {:error, changeset}
     end
   end
 
-  defp resolve_title_conflict(tenant_id, attrs, changeset) do
+  defp resolve_title_conflict(tenant_id, attrs, changeset, vis) do
     title = attrs[:title] || attrs["title"]
 
-    case get_active_article_by_title(tenant_id, title) do
+    case get_active_article_by_title(tenant_id, title, vis) do
       %Article{} = existing ->
         if same_content?(existing, attrs) do
           {:ok, :deduplicated, existing}
@@ -646,22 +646,28 @@ defmodule Loopctl.Knowledge do
     end)
   end
 
-  defp get_active_article_by_title(_tenant_id, title) when not is_binary(title), do: nil
+  defp get_active_article_by_title(_tenant_id, title, _vis) when not is_binary(title), do: nil
 
   # tenant_id is nil for system-scoped articles; a NULL `=` never matches, so the
   # recovery simply doesn't apply to system scope (its conflicts are slug-based).
-  defp get_active_article_by_title(nil, _title), do: nil
+  defp get_active_article_by_title(nil, _title, _vis), do: nil
 
-  defp get_active_article_by_title(tenant_id, title) do
-    AdminRepo.one(
-      from(a in Article,
-        where:
-          a.tenant_id == ^tenant_id and a.title == ^title and
-            a.status not in [:archived, :superseded],
-        order_by: [asc: a.inserted_at],
-        limit: 1
-      )
+  # `vis` (a `visibility_agent_id`) scopes the recovery SELECT to owner-visible rows,
+  # mirroring get_article_by_idempotency_key/3 (#163). Because this path uses
+  # AdminRepo (BYPASSRLS) the visibility filter MUST live in the query — RLS won't
+  # apply it. A title colliding with another agent's private/owner article returns
+  # nil here → the caller falls through to a generic uniqueness 422, with no UUID,
+  # body, or existence signal leaked.
+  defp get_active_article_by_title(tenant_id, title, vis) do
+    from(a in Article,
+      where:
+        a.tenant_id == ^tenant_id and a.title == ^title and
+          a.status not in [:archived, :superseded],
+      order_by: [asc: a.inserted_at],
+      limit: 1
     )
+    |> maybe_filter_by_visibility(vis)
+    |> AdminRepo.one()
   end
 
   # Same content == same (whitespace-normalized) body. Derived server-side from
