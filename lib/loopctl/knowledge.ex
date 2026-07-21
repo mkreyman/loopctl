@@ -1878,7 +1878,13 @@ defmodule Loopctl.Knowledge do
                 fragment(
                   "ts_rank_cd(search_vector, websearch_to_tsquery('english', ?))",
                   ^query_string
-                )
+                ),
+              # DETERMINISTIC secondary key: `ts_rank_cd` ties (common on short/overlapping
+              # docs) otherwise resolve to Postgres' physical row order, which is not stable
+              # run-to-run. In :keyword_only mode this raw order IS the final ranking, and the
+              # retrieval-eval deploy gate compares `answered` at zero tolerance, so a tie at
+              # the top-k boundary must not flip the result set. The id makes the order total.
+              asc: a.id
             ]
           )
 
@@ -6840,10 +6846,15 @@ defmodule Loopctl.Knowledge do
         |> Map.put(:final_score, kw.final_score + sem.final_score)
       end)
 
+    # Sort by `final_score` desc with the article `id` as a DETERMINISTIC secondary key.
+    # `Map.values/1` order is hash-driven, and `final_score` ties are not incidental — the
+    # Reciprocal Rank Fusion scoring (#470) produces `1/(k+rank)` values that tie by
+    # construction. Without a tiebreak, which of two tied candidates survives the top-k limit
+    # (and thus recall@k / nDCG@k / MRR) would flip run-to-run. The id makes it total + stable.
     sorted =
       merged
       |> Map.values()
-      |> Enum.sort_by(& &1.final_score, :desc)
+      |> Enum.sort_by(&{&1.final_score, &1.id}, :desc)
 
     paginated = paginate_results(sorted, opts)
 
