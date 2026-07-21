@@ -255,6 +255,34 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       assert length(articles) == 1
       assert hd(articles).title == "Web article finding"
     end
+
+    test "aborts and rejects a fetch whose body exceeds the network-layer cap (#461 item 4)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # A body larger than @max_fetch_body_bytes (5_000_000). The bounded `into:`
+      # collector halts the transfer and flags the response, so fetch_url returns
+      # a :url_body_too_large error BEFORE any extraction — the extractor is never
+      # reached and nothing is persisted.
+      oversized = String.duplicate("a", 5_000_001)
+
+      Req.Test.stub(ContentIngestionWorker, fn conn ->
+        Req.Test.html(conn, oversized)
+      end)
+
+      assert {:error, {:url_body_too_large, cap}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 314,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "url" => "https://example.com/huge",
+                   "content_hash" => "huge1",
+                   "source_type" => "web_article"
+                 }
+               })
+
+      assert cap == 5_000_000
+      assert %{data: []} = Knowledge.list_articles(tenant.id, source_type: "web_article")
+    end
   end
 
   # --- SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm) ---

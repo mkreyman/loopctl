@@ -24,6 +24,7 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Oban.FairShare
   alias Loopctl.Webhooks
   alias Loopctl.Webhooks.Signing
   alias Loopctl.Webhooks.Webhook
@@ -35,7 +36,13 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
                      Loopctl.Webhooks.ReqDelivery
                    )
 
-  # Exponential backoff schedule in seconds
+  # Exponential backoff schedule in seconds. #461 item 6 (lifetime-cap sub-point):
+  # this schedule IS the total-lifetime cap for a repeatedly-failing delivery. The
+  # five snoozes sum to 60+300+1500+7200+36_000 = 45_060s (~12.5h), after which the
+  # 6th failed attempt hits @max_attempts and `mark_exhausted/5` terminates the job
+  # (status :exhausted) and calls `Webhooks.maybe_auto_disable/2` — so a dead
+  # endpoint is bounded in both wall-clock (~12.5h) AND attempts (6), then
+  # auto-disabled. No additional explicit age cap is needed on top of this.
   @backoff_schedule [60, 300, 1500, 7200, 36_000]
   @max_attempts 6
 
@@ -56,7 +63,27 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
   def timeout(_job), do: :timer.seconds(30)
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"webhook_event_id" => event_id, "tenant_id" => tenant_id}}) do
+  def perform(%Oban.Job{
+        id: id,
+        args: %{"webhook_event_id" => event_id, "tenant_id" => tenant_id}
+      }) do
+    # #461 item 6: per-tenant fair-share gate on the shared :webhooks queue. Without
+    # it, one tenant's many failing/slow endpoints could fill every :webhooks slot
+    # (width 5) and starve other tenants' deliveries. `gate/3` returns `{:snooze, n}`
+    # — Oban reschedules WITHOUT consuming an attempt (loss-free, and compatible with
+    # this worker's manual attempt tracking / max_attempts: 1) — when the tenant is
+    # over its derived fair share (ceil(5/2)=3). `id` excludes THIS already-executing
+    # job from its own executing-count (rank-based decision; see FairShare).
+    case FairShare.gate(tenant_id, :webhooks, id) do
+      {:snooze, _n} = snooze ->
+        snooze
+
+      :ok ->
+        deliver(tenant_id, event_id)
+    end
+  end
+
+  defp deliver(tenant_id, event_id) do
     with {:ok, event} <- load_event(tenant_id, event_id),
          {:ok, webhook} <- load_webhook(tenant_id, event.webhook_id) do
       # Check if webhook is active (unless test event)

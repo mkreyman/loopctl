@@ -100,4 +100,25 @@ defmodule LoopctlWeb.Plugs.RequireRoleTest do
       assert conn.status == 403
     end
   end
+
+  describe "fail-closed catch-all (#461 item 1)" do
+    test "no current_api_key assign → clean 401 JSON, halted, does not raise", %{conn: conn} do
+      # A route that mounts RequireRole with NO authentication plug ahead of it must
+      # fail CLOSED (401), not raise FunctionClauseError (500 + stacktrace leak).
+      conn = RequireRole.call(conn, %{role: :agent})
+
+      assert conn.halted
+      assert conn.status == 401
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 401
+      assert body["error"]["message"] == "Authentication required"
+    end
+
+    test "missing key fails closed for exact_role gates too", %{conn: conn} do
+      conn = RequireRole.call(conn, %{exact_role: :superadmin})
+
+      assert conn.halted
+      assert conn.status == 401
+    end
+  end
 end

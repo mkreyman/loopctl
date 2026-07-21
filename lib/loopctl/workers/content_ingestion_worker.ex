@@ -81,6 +81,16 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   @max_articles 10
   @max_body_length 100_000
 
+  # Network-layer fetch-size backstop (#461 item 4). A hostile/misbehaving URL could
+  # otherwise stream unbounded bytes into memory; the pre-existing @max_body_length
+  # guard only rejects AFTER a full download (per-ARTICLE text, not the raw page).
+  # Req 0.6.3 has no `:max_body_length` option, so we cap at the network layer via
+  # `into:` a bounded collector that HALTS the transfer (closing the connection) the
+  # moment the accumulated body crosses this ceiling. Sized well above a large HTML
+  # page (an ~87KB newsletter's raw markup) but bounded, so it never truncates a
+  # legitimate fetch yet caps a malicious multi-GB stream.
+  @max_fetch_body_bytes 5_000_000
+
   # --- Multi-chunk timeout budget (#264) ---
   #
   # A real ~87KB newsletter chunks into ~11 pieces, each 7–13s of LLM
@@ -690,11 +700,22 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
         max_retries: 1,
         # Do not follow redirects — a redirect hop would re-enter an unvalidated
         # URL and bypass the egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm).
-        redirect: false
+        redirect: false,
+        # #461 item 4: stream the response through a bounded collector that aborts
+        # the transfer once the body exceeds @max_fetch_body_bytes (network-layer cap).
+        into: &collect_capped_body/2
       )
       |> maybe_add_plug()
 
     case Provider.get(url, req_opts, %{scope: scope, purpose: :ingest, pinned_by_caller: true}) do
+      {:ok, %{private: %{ingestion_body_capped: true}}} ->
+        Logger.warning(
+          "ContentIngestionWorker: URL fetch aborted — body exceeds " <>
+            "#{@max_fetch_body_bytes} bytes (url=#{url})"
+        )
+
+        {:error, {:url_body_too_large, @max_fetch_body_bytes}}
+
       {:ok, %{status: status} = resp} when status in 200..299 ->
         handle_fetched_body(resp.body, Req.Response.get_header(resp, "content-type"))
 
@@ -802,6 +823,23 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     case Application.get_env(:loopctl, :ingestion_req_plug) do
       nil -> opts
       plug -> Keyword.put(opts, :plug, plug)
+    end
+  end
+
+  # `into:` collector that enforces the @max_fetch_body_bytes network-layer cap
+  # (#461 item 4). Accumulates the streamed body; the instant it crosses the ceiling
+  # it flags the response (`ingestion_body_capped`) and returns `{:halt, _}`, so Req
+  # stops reading and closes the connection instead of buffering an unbounded stream.
+  # A normally-completed fetch stays under the cap (the crossing chunk always halts),
+  # so `fetch_url/2` can treat the flag as an unambiguous "too large" signal.
+  defp collect_capped_body({:data, data}, {req, resp}) do
+    new_body = resp.body <> data
+
+    if byte_size(new_body) > @max_fetch_body_bytes do
+      capped = Req.Response.put_private(%{resp | body: new_body}, :ingestion_body_capped, true)
+      {:halt, {req, capped}}
+    else
+      {:cont, {req, %{resp | body: new_body}}}
     end
   end
 
