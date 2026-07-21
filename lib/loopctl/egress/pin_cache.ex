@@ -154,8 +154,35 @@ defmodule Loopctl.Egress.PinCache do
           expires_at: integer()
         }
 
+  @typedoc """
+  The THIRD shape: a NEGATIVE entry recording that a host failed to classify
+  (`Loopctl.Egress.Policy.cache_unresolvable/5`). It exists so an unresolvable
+  tenant-supplied host does not repay a multi-second DNS resolve on every
+  `Loopctl.Egress.posture/2` call, and it carries a much shorter TTL than a
+  success (`Policy.negative_ttl_ms/0`).
+
+  It is a REFUSAL, never a permit: `Policy` short-circuits it back to
+  `{:error, reason}` BEFORE `resolve_verdict/2`, whose catch-all would otherwise
+  invent a `:non_local` verdict for an entry that has none. It has no pin, so the
+  refresher skips it.
+  """
+  @type unresolvable_entry :: %{
+          tenant_id: Ecto.UUID.t(),
+          scope_key: String.t(),
+          host: key_host(),
+          base_verdict: :unresolvable,
+          resolve_error: term(),
+          ips: [],
+          purposes: [],
+          state: :fresh | :revalidating,
+          pin_stale: boolean(),
+          used: boolean(),
+          refresh_at: integer(),
+          expires_at: integer()
+        }
+
   @typedoc "Anything this cache can hold."
-  @type cached :: entry() | marking_entry()
+  @type cached :: entry() | marking_entry() | unresolvable_entry()
 
   # --- Client API ---
 
@@ -209,10 +236,16 @@ defmodule Loopctl.Egress.PinCache do
   `invalidate_tenant/1` landed in that window and the write is DROPPED — the built
   entry is still returned to the caller, it is simply not cached. Without this a
   revocation or an ENABLE is silently resurrected for a full TTL.
+
+  `opts[:ttl_ms]` overrides the hard TTL for this entry. Used by the NEGATIVE
+  cache (`Loopctl.Egress.Policy`), which must remember "this host did not resolve"
+  for far less time than a successful classification — long enough to collapse a
+  burst of lookups, short enough that recovery from a resolver blip is prompt.
   """
   @spec put(Ecto.UUID.t(), String.t(), key_host(), map(), keyword()) :: cached()
   def put(tenant_id, scope_key, host, attrs, opts \\ []) do
     now = now_ms()
+    ttl = Keyword.get(opts, :ttl_ms, @ttl_ms)
 
     entry =
       attrs
@@ -227,8 +260,11 @@ defmodule Loopctl.Egress.PinCache do
         # (and the deterministic refresher test) can steer the schedule; the
         # refresher itself DROPS both keys before re-putting, so a revalidated
         # entry always gets a fresh jittered point and can never loop.
-        refresh_at: Map.get(attrs, :refresh_at) || now + jittered_refresh_ms(),
-        expires_at: Map.get(attrs, :expires_at) || now + @ttl_ms
+        #
+        # `min/2` keeps a short-TTL entry from being scheduled for a refresh it
+        # would never live to see.
+        refresh_at: Map.get(attrs, :refresh_at) || now + min(jittered_refresh_ms(), ttl),
+        expires_at: Map.get(attrs, :expires_at) || now + ttl
       })
 
     key = {tenant_id, scope_key, host}
@@ -509,9 +545,12 @@ defmodule Loopctl.Egress.PinCache do
     ArgumentError -> :ok
   end
 
+  # `:unresolvable` (the NEGATIVE cache) is skipped for the same reason
+  # `:denylisted` is: there is no pin to revalidate, and its short TTL means it
+  # expires long before it could ever be due anyway.
   defp refreshable?(entry, now) do
     is_binary(entry.host) and now >= entry.refresh_at and not entry.pin_stale and
-      Map.get(entry, :base_verdict) != :denylisted
+      Map.get(entry, :base_verdict) not in [:denylisted, :unresolvable]
   end
 
   defp revalidate(entry) do

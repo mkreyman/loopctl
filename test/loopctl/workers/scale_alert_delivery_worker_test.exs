@@ -38,7 +38,7 @@ defmodule Loopctl.Workers.ScaleAlertDeliveryWorkerTest do
 
   describe "perform/1" do
     test "args carry no url — successful delivery resolves it from config and delivers the exact JSON payload + headers" do
-      expect(Loopctl.MockDelivery, :deliver, fn url, body, headers ->
+      expect(Loopctl.MockDelivery, :deliver, fn url, body, headers, _scope ->
         assert url == @url
         assert {"content-type", "application/json"} in headers
         assert Jason.decode!(body) == @payload
@@ -49,7 +49,7 @@ defmodule Loopctl.Workers.ScaleAlertDeliveryWorkerTest do
     end
 
     test "delivery failure returns {:error, _} so Oban retries (not dropped)" do
-      expect(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+      expect(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
         {:error, "connection_refused"}
       end)
 
@@ -58,7 +58,7 @@ defmodule Loopctl.Workers.ScaleAlertDeliveryWorkerTest do
     end
 
     test "a job with a persisted url arg (legacy/pre-fix job) is ignored — the config url wins" do
-      expect(Loopctl.MockDelivery, :deliver, fn url, _body, _headers ->
+      expect(Loopctl.MockDelivery, :deliver, fn url, _body, _headers, _scope ->
         assert url == @url
         {:ok, %{status: 200, body: "ok"}}
       end)
@@ -72,12 +72,12 @@ defmodule Loopctl.Workers.ScaleAlertDeliveryWorkerTest do
 
   describe "deliver_or_skip/2 (review fix — URL resolved at run time, not from args)" do
     test "a nil url (unset by delivery time) logs and completes as a no-op :ok, no delivery attempted" do
-      # No expect/3 set — verify_on_exit! would fail if `deliver/3` were called unexpectedly.
+      # No expect/3 set — verify_on_exit! would fail if `deliver/4` were called unexpectedly.
       assert :ok = ScaleAlertDeliveryWorker.deliver_or_skip(@payload, nil)
     end
 
     test "a binary url delivers exactly as perform/1 would" do
-      expect(Loopctl.MockDelivery, :deliver, fn url, body, headers ->
+      expect(Loopctl.MockDelivery, :deliver, fn url, body, headers, _scope ->
         assert url == @url
         assert {"content-type", "application/json"} in headers
         assert Jason.decode!(body) == @payload

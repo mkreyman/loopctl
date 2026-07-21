@@ -279,8 +279,11 @@ defmodule Loopctl.Egress.PolicyTest do
       # subscriber is excluded), hence the round trip through the GenServer.
       :ok = PinCache.invalidate_tenant(t.id)
 
-      assert_receive {:invalidate, tenant_id}, 1_000
-      assert tenant_id == t.id
+      # The topic is GLOBAL, so a CONCURRENT async test invalidating a different
+      # tenant can land first. Asserting on the FIRST message received made this
+      # test lose that race (two different tenant UUIDs). Drain until OUR tenant's
+      # broadcast arrives instead.
+      assert_invalidate_received(t.id)
     end
 
     test "the owner busts its node-local table when a PEER broadcasts", %{tenant: t, scope: scope} do
@@ -527,6 +530,18 @@ defmodule Loopctl.Egress.PolicyTest do
       fun.()
     after
       AllowlistSource.clear()
+    end
+  end
+
+  # `"egress:pin_cache:invalidate"` is a GLOBAL topic, so a concurrent async test
+  # invalidating a DIFFERENT tenant can be delivered first. Drain until ours
+  # arrives rather than asserting on whichever message happens to be first.
+  defp assert_invalidate_received(tenant_id) do
+    receive do
+      {:invalidate, ^tenant_id} -> :ok
+      {:invalidate, _other_tenant} -> assert_invalidate_received(tenant_id)
+    after
+      1_000 -> flunk("no {:invalidate, #{tenant_id}} broadcast received")
     end
   end
 end
