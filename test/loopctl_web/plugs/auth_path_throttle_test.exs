@@ -181,6 +181,64 @@ defmodule LoopctlWeb.Plugs.AuthPathThrottleTest do
 
       assert resp.status == 429
     end
+
+    test "a request bearing a VALID authenticated key is ALSO denied (429) on a store fault",
+         %{conn: _conn} do
+      # Pins the deliberate blast radius: because the gate runs FIRST in the
+      # :authenticated pipeline (before ExtractApiKey), a limiter-store fault
+      # denies ALL authenticated traffic — not just missing/invalid-key requests.
+      # A future change that accidentally scoped the fail-CLOSED gate to only
+      # unauthenticated requests would flip this valid-key case to 200 and be
+      # caught here.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window_ms, _limit ->
+        raise "limiter store is down"
+      end)
+
+      tenant = fixture(:tenant)
+      {raw_key, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      resp =
+        build_conn()
+        |> from_ip("203.0.113.42")
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/tenants/me")
+
+      assert resp.status == 429
+      assert json_response(resp, 429)["error"]["status"] == 429
+    end
+  end
+
+  describe "operator-configurable ceiling (sec-4 fix)" do
+    test "the default ceiling/window flow through to the limiter unchanged", %{conn: _conn} do
+      # Regression guard for the refactor from fixed module attributes to an
+      # Application-env-overridable ceiling: with no override configured, the gate
+      # must still pass the coarse DEFAULTS (3000 req / 60_000 ms) to the limiter.
+      # Observed via the DI stub's own arguments — no Application.put_env (test
+      # conventions forbid it); the default config leaves the knob unset.
+      test_pid = self()
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, window_ms, limit ->
+        # Report only the auth-path gate's args; the per-key limiter's
+        # key:*/tenant:* buckets pass through allowed.
+        if String.starts_with?(bucket, "auth_ip:") do
+          send(test_pid, {:auth_gate_args, bucket, window_ms, limit})
+        end
+
+        {:allow, 1}
+      end)
+
+      tenant = fixture(:tenant)
+      {raw_key, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      resp =
+        build_conn()
+        |> from_ip("203.0.113.43")
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/tenants/me")
+
+      assert resp.status == 200
+      assert_received {:auth_gate_args, "auth_ip:203.0.113.43", 60_000, 3_000}
+    end
   end
 
   describe "RemoteIp.bucket_key/1 (shared trusted-IP helper)" do

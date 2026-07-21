@@ -46,6 +46,31 @@ if System.get_env("RATE_LIMITER") == "postgres" do
   config :loopctl, :rate_limiter, Loopctl.RateLimiter.Postgres
 end
 
+# sec-4: OPT-IN override of the coarse per-IP auth-path throttle ceiling/window
+# (`LoopctlWeb.Plugs.AuthPathThrottle`). Unlike the tenant-overridable per-KEY
+# limit, this per-IP ceiling is a single global knob; these env vars are its
+# zero-redeploy operational remedy (e.g. raising it above the largest configured
+# per-tenant aggregate, or for a shared-egress/NAT deployment where many
+# legitimate keys share one outbound IP). Only a valid POSITIVE integer is
+# applied — an unset/blank/garbage value is ignored so a bad placeholder can
+# NEVER crash release boot (epic_35 STH_SWEEP_CRON lesson); the plug itself also
+# floors to its default on a non-positive value.
+auth_throttle_opts =
+  [
+    max_requests_per_ip: System.get_env("AUTH_THROTTLE_MAX_REQUESTS_PER_IP"),
+    window_ms: System.get_env("AUTH_THROTTLE_WINDOW_MS")
+  ]
+  |> Enum.flat_map(fn {key, raw} ->
+    case raw && Integer.parse(raw) do
+      {n, ""} when n > 0 -> [{key, n}]
+      _ -> []
+    end
+  end)
+
+if auth_throttle_opts != [] do
+  config :loopctl, LoopctlWeb.Plugs.AuthPathThrottle, auth_throttle_opts
+end
+
 endpoint_http = [
   # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
   # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects
