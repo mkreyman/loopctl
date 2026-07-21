@@ -448,7 +448,7 @@ defmodule LoopctlWeb.AdminTenantController do
         "assertion is single-use — one challenge authorizes exactly one attempt. " <>
         "Requires superadmin.",
     parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
-    request_body: {"WebAuthn assertion", "application/json", Schemas.RotateAuditKeyRequest},
+    request_body: {"WebAuthn assertion", "application/json", Schemas.ReauthAssertionRequest},
     responses: %{
       200 =>
         {"Halt cleared", "application/json",
@@ -463,9 +463,9 @@ defmodule LoopctlWeb.AdminTenantController do
 
   Break-glass custody-halt recovery (Chain of Custody v2, L6). Superadmin
   key alone is NOT sufficient: the caller must present a WebAuthn assertion
-  verified against a challenge issued by `challenge/2` and the target
-  tenant's enrolled root authenticator. The challenge is consumed exactly
-  once; replay is rejected.
+  verified against a challenge issued by `clear_halt_challenge/2` and the
+  target tenant's enrolled root authenticator. The challenge is consumed
+  exactly once; replay is rejected.
   """
   def clear_halt(conn, %{"id" => id} = params) do
     # Break-glass requires a VERIFIED WebAuthn assertion, not merely a
@@ -497,10 +497,16 @@ defmodule LoopctlWeb.AdminTenantController do
     # ceremony is single-use: the challenge is consumed here regardless of
     # outcome. Only a genuinely verified assertion reaches do_clear_halt.
     case Reauth.verify_and_consume(id, @clear_halt_purpose, assertion) do
-      {:ok, _verified} ->
-        do_clear_halt(conn, id)
+      {:ok, verified} ->
+        do_clear_halt(conn, id, verified)
 
       {:error, _reason} ->
+        # A REJECTED break-glass attempt is the exact signal of a compromised
+        # superadmin key trying to clear a byzantine halt WITHOUT the hardware
+        # factor. Record it in the tamper-evident chain (L6 forensics) so the
+        # audit record shows failed attempts, not only successful clears.
+        record_rejected_break_glass(conn, id)
+
         conn
         |> put_status(:unauthorized)
         |> json(%{
@@ -513,10 +519,13 @@ defmodule LoopctlWeb.AdminTenantController do
     end
   end
 
-  defp do_clear_halt(conn, id) do
+  defp do_clear_halt(conn, id, verified) do
     case Tenants.clear_custody_halt(id) do
       {:ok, tenant} ->
-        # Break-glass: audit this critical operation
+        # Break-glass: audit this critical operation. Record WHICH enrolled
+        # authenticator authorized the clear (the verified credential + its
+        # advanced sign-counter), not only the superadmin key, so an incident
+        # responder can tie the recovery to a specific hardware factor.
         api_key = conn.assigns.current_api_key
 
         Loopctl.AuditChain.append(tenant.id, %{
@@ -524,13 +533,41 @@ defmodule LoopctlWeb.AdminTenantController do
           actor_lineage: [],
           entity_type: "tenant",
           entity_id: tenant.id,
-          payload: %{"cleared_by" => api_key.id}
+          payload: %{
+            "cleared_by" => api_key.id,
+            "credential_id" =>
+              Base.url_encode64(verified.authenticator.credential_id, padding: false),
+            "sign_count" => verified.sign_count
+          }
         })
 
         json(conn, %{data: %{id: tenant.id, custody_halted_at: nil, status: "halt_cleared"}})
 
       {:error, :not_found} ->
         conn |> put_status(:not_found) |> json(%{error: %{message: "Not found", status: 404}})
+    end
+  end
+
+  # Append a `halt_clear_rejected` entry to the tenant's audit chain. Guarded
+  # so it only fires for a real tenant: a garbage `:id` has no chain to append
+  # to (and the FK is not changeset-guarded, so an insert against a
+  # non-existent tenant would raise) and nothing to protect. The high-trust
+  # forensic signal is `rejected_by` — the server-verified superadmin key that
+  # attempted the clear and failed the hardware factor.
+  defp record_rejected_break_glass(conn, tenant_id) do
+    with {:ok, uuid} <- Ecto.UUID.cast(tenant_id),
+         {:ok, _tenant} <- Tenants.get_tenant(uuid) do
+      api_key = conn.assigns.current_api_key
+
+      Loopctl.AuditChain.append(uuid, %{
+        action: "halt_clear_rejected",
+        actor_lineage: [],
+        entity_type: "tenant",
+        entity_id: uuid,
+        payload: %{"rejected_by" => api_key.id}
+      })
+    else
+      _ -> :ok
     end
   end
 end

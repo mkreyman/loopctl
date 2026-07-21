@@ -6,6 +6,7 @@ defmodule LoopctlWeb.AdminTenantControllerTest do
   alias Loopctl.Audit
   alias Loopctl.AuditChain
   alias Loopctl.Tenants
+  alias Loopctl.WebAuthn.Reauth
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
@@ -502,10 +503,72 @@ defmodule LoopctlWeb.AdminTenantControllerTest do
       {:ok, reloaded} = Tenants.get_tenant(tenant.id)
       assert reloaded.custody_halted_at == nil
 
-      # The halt_cleared audit event was appended to the hash chain.
+      # The halt_cleared audit event was appended to the hash chain, and it
+      # records WHICH verified authenticator (credential + advanced counter)
+      # authorized the break-glass clear — not only the superadmin key.
       %{data: entries} = AuditChain.list_entries(tenant.id, action: "halt_cleared")
       assert length(entries) == 1
-      assert hd(entries).payload["cleared_by"] == api_key.id
+      entry = hd(entries)
+      assert entry.payload["cleared_by"] == api_key.id
+
+      assert entry.payload["credential_id"] ==
+               Base.url_encode64(auth.credential_id, padding: false)
+
+      assert entry.payload["sign_count"] == 1
+    end
+
+    test "AC3: a rotate-audit-key challenge cannot clear a custody halt (cross-purpose)", ctx do
+      %{conn: conn, raw_key: raw_key, tenant: tenant, auth: auth} = ctx
+
+      # Mint a challenge for the DIFFERENT ceremony purpose (audit-key rotation)
+      # for the SAME tenant + enrolled authenticator. The default MockWebAuthn
+      # stub verifies any assertion successfully, so the ONLY thing standing
+      # between this cross-purpose challenge and a cleared halt is the purpose
+      # scoping in Reauth.consume_challenge (`c.purpose == ^purpose`).
+      {:ok, issued} = Reauth.issue_challenge(tenant.id, "rotate_audit_key")
+
+      clear_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{
+          "webauthn_assertion" => assertion_body(issued.challenge_id, auth.credential_id)
+        })
+
+      assert json_response(clear_conn, 401)["error"]["code"] == "webauthn_failed"
+
+      # The halt remains set — a rotate-audit-key challenge cleared nothing.
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      refute is_nil(reloaded.custody_halted_at)
+    end
+
+    test "a rejected break-glass attempt is recorded in the audit chain", ctx do
+      %{conn: conn, raw_key: raw_key, api_key: api_key, tenant: tenant, auth: auth} = ctx
+
+      Mox.stub(Loopctl.MockWebAuthn, :verify_authentication, fn _p, _c, _o ->
+        {:error, :invalid_assertion}
+      end)
+
+      challenge_data = issue_challenge(conn, raw_key, tenant.id)
+
+      clear_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/admin/tenants/#{tenant.id}/clear-halt", %{
+          "webauthn_assertion" =>
+            assertion_body(challenge_data["challenge_id"], auth.credential_id)
+        })
+
+      assert json_response(clear_conn, 401)["error"]["code"] == "webauthn_failed"
+
+      # The rejection is forensically recorded (L6): a compromised superadmin
+      # key attempting break-glass without the hardware factor leaves a trace.
+      %{data: entries} = AuditChain.list_entries(tenant.id, action: "halt_clear_rejected")
+      assert length(entries) == 1
+      assert hd(entries).payload["rejected_by"] == api_key.id
+
+      # No successful clear was recorded.
+      %{data: cleared} = AuditChain.list_entries(tenant.id, action: "halt_cleared")
+      assert cleared == []
     end
 
     test "rejects a garbage assertion that fails verification and does NOT clear the halt", ctx do
