@@ -38,6 +38,7 @@ defmodule Loopctl.Embeddings.DisclosureCache do
 
   @table :loopctl_embedding_disclosure_cache
   @default_ttl_ms 5_000
+  @sweep_interval_ms 60_000
 
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -48,8 +49,28 @@ defmodule Loopctl.Embeddings.DisclosureCache do
   @impl true
   def init(_opts) do
     :ok = init_table()
+    schedule_sweep()
     {:ok, %{}}
   end
+
+  # Periodic eviction (review): reads check `expires_at` themselves, but nothing
+  # deleted an expired row that is never looked up again, so the table retained a row
+  # for every `{tenant, dimension}` ever searched for the node's lifetime. This is the
+  # ETS-with-TTL house pattern (patterns-elixir-otp) — the read-side expiry check paired
+  # with a periodic `select_delete` of everything already past `expires_at`.
+  @impl true
+  def handle_info(:sweep, state) do
+    if :ets.whereis(@table) != :undefined do
+      now = System.monotonic_time(:millisecond)
+      # match {key, value, expires_at} where expires_at =< now
+      :ets.select_delete(@table, [{{:_, :_, :"$1"}, [{:"=<", :"$1", now}], [true]}])
+    end
+
+    schedule_sweep()
+    {:noreply, state}
+  end
+
+  defp schedule_sweep, do: Process.send_after(self(), :sweep, @sweep_interval_ms)
 
   @doc false
   @spec init_table() :: :ok
@@ -85,6 +106,17 @@ defmodule Loopctl.Embeddings.DisclosureCache do
   @spec flush() :: :ok
   def flush do
     if :ets.whereis(@table) != :undefined, do: :ets.delete_all_objects(@table)
+    :ok
+  end
+
+  @doc """
+  Drops the single cached entry for `key` — used by the tenant-pin write paths so a
+  re-embed completion (which moves the dimension/model pin) is observed immediately
+  rather than after the TTL.
+  """
+  @spec invalidate(term()) :: :ok
+  def invalidate(key) do
+    if :ets.whereis(@table) != :undefined, do: :ets.delete(@table, key)
     :ok
   end
 

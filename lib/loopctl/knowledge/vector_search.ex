@@ -272,8 +272,39 @@ defmodule Loopctl.Knowledge.VectorSearch do
   @spec nearest(Ecto.UUID.t(), target_embedding(), pos_integer(), keyword()) ::
           [candidate()] | {:error, :heavy_read_overloaded}
   def nearest(tenant_id, target_embedding, k, opts \\ []) when is_binary(tenant_id) do
-    query = candidate_query(tenant_id, target_embedding, k, opts)
-    HeavyRead.all(tenant_id, query, heavy_read_opts(opts))
+    # Query-vector length guard (review): the side-table ANN binds the target into the
+    # per-dimension `(embedding::vector(N))` cast, so a fresh query vector whose length
+    # disagrees with the read dimension (mid-model-change / stale setting / pin conflict)
+    # would raise pgvector's "different vector dimensions" 500 on this request path. An
+    # EMPTY result is the documented graceful degrade — every caller already handles "no
+    # neighbours" (suggest-links empty, ProposalGate novel, ArticleLinkingWorker no links).
+    case Embeddings.check_query_vector(tenant_id, to_embedding_list(target_embedding)) do
+      :ok ->
+        query = candidate_query(tenant_id, target_embedding, k, opts)
+        HeavyRead.all(tenant_id, query, nearest_heavy_read_opts(k, opts))
+
+      {:error, _mismatch} ->
+        []
+    end
+  end
+
+  # On the side-table path the inner ANN over-fetches by `side_table_over_fetch/0` to
+  # offset the status/visibility filtering it cannot carry — but an HNSW scan only
+  # returns ~ef_search rows regardless of LIMIT, so the over-fetch is inert unless
+  # ef_search is raised in lockstep (review). Raise it to cover the over-fetched inner
+  # pool whenever this read hits the side table; the legacy path is unaffected.
+  defp nearest_heavy_read_opts(k, opts) do
+    base = heavy_read_opts(opts)
+
+    reads_side_table? =
+      Keyword.get_lazy(opts, :reads_side_table, &Embeddings.side_table_reads_enabled?/0)
+
+    if reads_side_table? do
+      pool = candidate_pool(clamp_k(k), Keyword.get(opts, :pool))
+      Keyword.put(base, :hnsw_ef_search, side_table_ef_search(side_table_inner_pool(pool)))
+    else
+      base
+    end
   end
 
   @doc """
@@ -413,7 +444,16 @@ defmodule Loopctl.Knowledge.VectorSearch do
     # column entirely for any non-1536 dimension, so for a 768/1024 tenant those
     # queries matched ZERO rows — `suggest_links` returned nothing and the dedup gate
     # saw no priors and verdicted every proposal `novel`, creating duplicates.
-    if Embeddings.side_table_reads_enabled?() do
+    # The cutover flag is resolved ONCE per operation and threaded via `:reads_side_table`
+    # (review): re-reading `side_table_reads_enabled?/0` independently in the source-vector
+    # fetch and the candidate scan let an operator flip mid-request be observed differently
+    # by two stages of one operation (e.g. suggest_links reading the source from the side
+    # table but candidates from `articles.embedding`). The caller (suggest_links,
+    # search_semantic) resolves it once and passes it; absent, we fall back to a single read.
+    reads_side_table? =
+      Keyword.get_lazy(opts, :reads_side_table, &Embeddings.side_table_reads_enabled?/0)
+
+    if reads_side_table? do
       dimension_candidate_pool_query(tenant_id, target_embedding, pool, opts)
     else
       legacy_candidate_pool_query(tenant_id, target_embedding, pool, opts)
@@ -505,6 +545,33 @@ defmodule Loopctl.Knowledge.VectorSearch do
   @spec side_table_inner_pool(pos_integer()) :: pos_integer()
   def side_table_inner_pool(pool) when is_integer(pool) and pool > 0 do
     pool * side_table_over_fetch()
+  end
+
+  # The largest `hnsw.ef_search` the side-table path will request per read. An HNSW
+  # scan only inspects/returns ~`ef_search` graph nodes regardless of the LIMIT, so an
+  # inner LIMIT of `pool * over_fetch` is a NO-OP unless ef_search is raised to cover it
+  # — the over-fetch's whole purpose (offsetting the status/visibility filtering the
+  # side-table inner cannot carry) is otherwise structurally unreachable (review).
+  @default_max_side_table_ef_search 1000
+
+  @doc "Cap on the per-read `hnsw.ef_search` the side-table ANN requests (config `:side_table_max_ef_search`)."
+  @spec max_side_table_ef_search() :: pos_integer()
+  def max_side_table_ef_search do
+    Application.get_env(
+      :loopctl,
+      :side_table_max_ef_search,
+      @default_max_side_table_ef_search
+    )
+  end
+
+  @doc """
+  The `hnsw.ef_search` to apply for a side-table ANN whose inner LIMIT is `inner_pool`:
+  at least `inner_pool` (so the over-fetch actually returns that many candidates),
+  capped at `max_side_table_ef_search/0`. The over-fetch is inert without this.
+  """
+  @spec side_table_ef_search(pos_integer()) :: pos_integer()
+  def side_table_ef_search(inner_pool) when is_integer(inner_pool) and inner_pool > 0 do
+    min(inner_pool, max_side_table_ef_search())
   end
 
   # Article-binding (second binding) forms of the inner filters. Same predicates as
@@ -666,10 +733,16 @@ defmodule Loopctl.Knowledge.VectorSearch do
   # CONCURRENTLY, so it is inherently a deploy-time change, and reading it the same
   # way at compile time makes a config/index mismatch impossible to introduce by
   # editing runtime config alone.
+  # Fallback is [768, 1024, 1536] — NOT [..., 3072] (review). 3072 is above pgvector's
+  # 2000-dimension HNSW ceiling and is deliberately excluded from the configured set
+  # (config/config.exs), so a fallback that listed it would — if the config key were
+  # ever absent — advertise 3072 on `.well-known`, build no index for it, and let the
+  # query builder emit an unindexable `(embedding::vector(3072))` cast that
+  # sequential-scans the corpus (the #170/#172 planner incident class).
   @supported_dimensions Application.compile_env(
                           :loopctl,
                           :supported_embedding_dimensions,
-                          [768, 1024, 1536, 3072]
+                          [768, 1024, 1536]
                         )
 
   @doc "The compile-time supported-dimension set this module can emit a cast for."

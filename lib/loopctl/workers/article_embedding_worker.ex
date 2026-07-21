@@ -65,6 +65,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Embeddings
+  alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -237,10 +238,33 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   end
 
   defp store(tenant_id, article_id, embedding, content_hash) do
-    with {:ok, _article} <-
-           Knowledge.update_embedding(tenant_id, article_id, embedding, content_hash) do
-      enqueue_linking(article_id, tenant_id)
-      :ok
+    # Pre-write dimension check (review): resolve the write dimension ONCE, then verify
+    # the vector length BEFORE the changeset. An off-dimension model otherwise surfaced
+    # as a changeset validation error, `perform` returned `{:error, _}`, and Oban
+    # re-billed the provider on each of five attempts. A mismatch DISCARDS legibly.
+    dimension = Embeddings.resolve_write_dimension(tenant_id)
+
+    case Dimensions.check_batch_length([embedding], dimension) do
+      :ok ->
+        with {:ok, _article} <-
+               Knowledge.update_embedding(
+                 tenant_id,
+                 article_id,
+                 embedding,
+                 content_hash,
+                 dimension
+               ) do
+          enqueue_linking(article_id, tenant_id)
+          :ok
+        end
+
+      {:error, {:dimension_mismatch, expected, actual}} ->
+        Logger.debug(
+          "ArticleEmbeddingWorker: model returned #{inspect(actual)}-dimension vector but " <>
+            "the tenant is recorded at #{expected}; discarding rather than re-billing."
+        )
+
+        {:discard, {:dimension_mismatch, expected, actual}}
     end
   end
 
@@ -263,7 +287,10 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   # consults the side table at the tenant's active dimension, where the hash HAS been
   # recorded all along.
   defp already_embedded?(tenant_id, article, content_hash) do
-    if Embeddings.side_table_reads_enabled?() do
+    # Gated on the WRITE dimension (`use_side_table_hash?/1`), NOT the read flag
+    # (review): a non-1536 tenant NEVER has a legacy hash, so keying this on the read
+    # flag re-billed the provider on every enqueue until cutover.
+    if Embeddings.use_side_table_hash?(tenant_id) do
       Embeddings.article_embedded_hash(
         tenant_id,
         article.id,

@@ -268,7 +268,10 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # `orphans_embedding_enqueued` grew on every run — a structurally wrong lint report
   # for exactly the tenants this epic serves, and a driver of the re-billing loop.
   defp embedded_ids(tenant_id, orphan_ids) do
-    if Embeddings.side_table_reads_enabled?() do
+    # WRITE-dimension gated (`use_side_table_hash?/1`), not read-flag gated (review):
+    # a non-1536 tenant's `articles.embedding` is never written, so the read-flag gate
+    # classified every orphan "not embedded" and drove the re-billing loop.
+    if Embeddings.use_side_table_hash?(tenant_id) do
       Embeddings.embedded_article_ids(
         tenant_id,
         orphan_ids,

@@ -4687,8 +4687,14 @@ defmodule Loopctl.Knowledge do
       |> max(1)
       |> min(@max_relevance_page_size)
 
+    # Resolve the cutover flag ONCE for the whole operation and thread it (review): the
+    # source-vector fetch and the candidate scan must see the SAME value, or an operator
+    # flip mid-request makes suggest_links read the source from one table type and
+    # candidates from the other (a dimension mismatch / empty result).
+    reads_side_table? = Embeddings.side_table_reads_enabled?()
+
     with :ok <- validate_threshold(threshold) do
-      case fetch_article_embedding(tenant_id, article_id, vis) do
+      case fetch_article_embedding(tenant_id, article_id, vis, reads_side_table?) do
         nil ->
           {:error, :not_found}
 
@@ -4697,7 +4703,9 @@ defmodule Loopctl.Knowledge do
 
         %{embedding: embedding} ->
           {suggestions, meta} =
-            suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis)
+            suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis,
+              reads_side_table: reads_side_table?
+            )
 
           {:ok, suggestions, meta}
       end
@@ -4733,9 +4741,9 @@ defmodule Loopctl.Knowledge do
   # `suggest_links_with_meta/3` short-circuited to `{:ok, [], empty_suggestion_meta}`
   # — with `pool_exhausted: false`, i.e. indistinguishable from "no neighbours
   # exist". Migrating one half of a feature and not the other is the worst of both.
-  defp fetch_article_embedding(tenant_id, article_id, vis) do
+  defp fetch_article_embedding(tenant_id, article_id, vis, reads_side_table?) do
     if valid_uuid?(article_id) do
-      if Embeddings.side_table_reads_enabled?() do
+      if reads_side_table? do
         fetch_side_table_article_embedding(tenant_id, article_id, vis)
       else
         from(a in Article,
@@ -4767,17 +4775,18 @@ defmodule Loopctl.Knowledge do
     |> AdminRepo.one()
   end
 
-  defp suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis) do
+  defp suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis, opts) do
     # Routed through Loopctl.HeavyRead (US-27.11): the dedicated heavy-read pool,
     # isolated from the small AdminRepo pool, with a per-read SET LOCAL
     # statement_timeout (US-27.13 — a short transaction, the connection released at
     # commit). The wrapper structurally requires a tenant_id-filtered query; the
     # tenant predicate lives in this query's inner subquery. The 15s client timeout
     # is a backstop above the server-side statement_timeout.
-    query = suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis)
+    query =
+      suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis, opts)
+
     suggestions = HeavyRead.all(tenant_id, query, heavy_read_opts(:suggested_links))
 
-    pool = suggestion_candidate_pool(limit)
     returned = length(suggestions)
 
     meta =
@@ -4788,8 +4797,8 @@ defmodule Loopctl.Knowledge do
         threshold,
         vis,
         limit,
-        pool,
-        returned
+        returned,
+        opts
       )
 
     {suggestions, meta}
@@ -4831,14 +4840,15 @@ defmodule Loopctl.Knowledge do
          threshold,
          vis,
          limit,
-         pool,
-         returned
+         returned,
+         opts
        ) do
+    pool = suggestion_candidate_pool(limit)
     base = %{requested: limit, returned: returned, pool: pool}
     not_truncated = Map.merge(base, %{pool_exhausted: false, recall_truncated: false})
 
     if returned < limit do
-      case under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool) do
+      case under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool, opts) do
         # The probe is ADVISORY: its read failing (connection drop / statement_timeout)
         # must NOT fail a request whose suggestions are already in hand. Degrade to "no
         # truncation signal" rather than discarding a valid result (security review,
@@ -4928,8 +4938,8 @@ defmodule Loopctl.Knowledge do
   # / body data. Returns `:error` (NOT raising) on a DB connectivity / timeout fault so the
   # caller can fail-soft — a genuine query bug still surfaces (we re-raise non-cancel
   # Postgrex errors).
-  defp under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool) do
-    candidates = suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool)
+  defp under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool, opts) do
+    candidates = suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool, opts)
 
     probe =
       from(c in subquery(candidates),
@@ -4991,13 +5001,26 @@ defmodule Loopctl.Knowledge do
   # the SAME `suggestion_candidate_pool/1` value as before (passed as `:pool`), so the
   # over-fetch is byte-identical to the pre-migration sizing.
   @doc false
-  def suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis) do
-    VectorSearch.candidate_query(tenant_id, embedding, limit,
-      exclude_id: article_id,
-      exclude_linked: true,
-      threshold: threshold,
-      visibility_agent_id: vis,
-      pool: suggestion_candidate_pool(limit)
+  def suggestion_candidates_query(
+        tenant_id,
+        article_id,
+        embedding,
+        threshold,
+        limit,
+        vis,
+        opts \\ []
+      ) do
+    VectorSearch.candidate_query(
+      tenant_id,
+      embedding,
+      limit,
+      [
+        exclude_id: article_id,
+        exclude_linked: true,
+        threshold: threshold,
+        visibility_agent_id: vis,
+        pool: suggestion_candidate_pool(limit)
+      ] ++ Keyword.take(opts, [:reads_side_table])
     )
   end
 
@@ -5009,10 +5032,13 @@ defmodule Loopctl.Knowledge do
   # top-`pool` nearest-by-cosine with only index-safe filters (tenant / status /
   # not-null / not-self / visibility) and the computed `similarity_score`. The
   # anti-join + threshold + final `limit` are applied by the OUTER query.
-  defp suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool) do
-    VectorSearch.candidate_pool_query(tenant_id, embedding, pool,
-      exclude_id: article_id,
-      visibility_agent_id: vis
+  defp suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool, opts) do
+    VectorSearch.candidate_pool_query(
+      tenant_id,
+      embedding,
+      pool,
+      [exclude_id: article_id, visibility_agent_id: vis] ++
+        Keyword.take(opts, [:reads_side_table])
     )
   end
 
@@ -5779,6 +5805,18 @@ defmodule Loopctl.Knowledge do
   # (`a.tenant_id == ^tenant_id`) and is bounded by prior-tag selectivity — NEVER a
   # full-corpus read (the verified plan shape is documented on novelty_distance_query/4).
   defp nearest_prior_distance(tenant_id, embedding, prior_tag, vis) do
+    # Query-vector length guard (review): the side-table novelty aggregate binds this
+    # FRESH vector into the per-dimension `(embedding::vector(N))` cast, so a length
+    # disagreeing with the read dimension would raise pgvector's "different vector
+    # dimensions" 500 on the knowledge_create request path. `nil` is the documented
+    # no-score degrade (indistinguishable from "no comparable priors").
+    case Embeddings.check_query_vector(tenant_id, to_embedding_list(embedding)) do
+      :ok -> run_nearest_prior_distance(tenant_id, embedding, prior_tag, vis)
+      {:error, _mismatch} -> nil
+    end
+  end
+
+  defp run_nearest_prior_distance(tenant_id, embedding, prior_tag, vis) do
     query = novelty_distance_query(tenant_id, embedding, prior_tag, vis)
     # Heavy vector aggregate — dedicated pool via Loopctl.HeavyRead (US-27.11).
     # `on_overload: :tag` (US-37.5): over the tenant's HeavyRead slice the read is SHED
@@ -5968,6 +6006,10 @@ defmodule Loopctl.Knowledge do
           {:ok, %{article: article}} -> {:ok, article}
           {:error, :article, changeset, _} -> {:error, changeset}
           {:error, :side_table, changeset, _} -> {:error, changeset}
+          # The :audit step (Audit.log_in_multi) is also fallible; without this
+          # catch-all its `{:error, :audit, reason, _}` fell through to a
+          # CaseClauseError — a 500 / non-retryable crash instead of a mapped error.
+          {:error, _step, reason, _} -> {:error, reason}
         end
     end
   end
@@ -6017,8 +6059,8 @@ defmodule Loopctl.Knowledge do
           # US-41.1: clearing an article's embedding must clear BOTH locations in the
           # same transaction, at EVERY dimension — otherwise a cleared article stays
           # semantically recallable from the side table.
-          |> Multi.run(:side_table, fn _repo, _changes ->
-            Embeddings.delete_article_embeddings(tenant_id, article_id)
+          |> Multi.run(:side_table, fn repo, _changes ->
+            Embeddings.delete_article_embeddings(repo, tenant_id, article_id)
           end)
           |> Audit.log_in_multi(:audit, fn %{article: updated} ->
             %{
@@ -6036,6 +6078,7 @@ defmodule Loopctl.Knowledge do
         case AdminRepo.transaction(multi) do
           {:ok, %{article: article}} -> {:ok, article}
           {:error, :article, changeset, _} -> {:error, changeset}
+          {:error, _step, reason, _} -> {:error, reason}
         end
     end
   end
@@ -6651,17 +6694,24 @@ defmodule Loopctl.Knowledge do
     # predicates are applied in `hydrate_semantic_pool/6`. At an identical pool size
     # that returns strictly FEWER published rows than the legacy path. The inner
     # limit is therefore over-fetched and the hydration trims back.
-    pool_query =
-      semantic_side_table_pool_query(
-        tenant_id,
-        query_embedding,
-        dimension,
-        VectorSearch.side_table_inner_pool(pool)
-      )
+    inner_pool = VectorSearch.side_table_inner_pool(pool)
+    pool_query = semantic_side_table_pool_query(tenant_id, query_embedding, dimension, inner_pool)
 
     count_query = semantic_side_table_count_query(tenant_id, dimension, status, opts)
 
-    case HeavyRead.all(tenant_id, pool_query, semantic_heavy_read_opts()) do
+    # Raise `hnsw.ef_search` to cover the over-fetched inner pool (review): the HNSW
+    # scan only returns ~ef_search nodes regardless of LIMIT, so the side-table
+    # over-fetch that compensates for post-ANN status/visibility filtering does nothing
+    # unless ef_search is widened in lockstep. Piggybacks on the SET LOCAL transaction
+    # every heavy read already runs in (US-27.13) — no new pool-starvation risk.
+    pool_opts =
+      Keyword.put(
+        semantic_heavy_read_opts(),
+        :hnsw_ef_search,
+        VectorSearch.side_table_ef_search(inner_pool)
+      )
+
+    case HeavyRead.all(tenant_id, pool_query, pool_opts) do
       {:error, :heavy_read_overloaded} = err ->
         err
 
@@ -6712,11 +6762,6 @@ defmodule Loopctl.Knowledge do
   # `<=>` ordering — a count is order-independent, and an ORDER BY here would force a
   # full-corpus sort for nothing.
   #
-  # System-scoped articles are NOT counted (their `articles.tenant_id` is NULL, and a
-  # `or a.scope == :system` disjunction on the join-on would be exactly the
-  # OR-broadened tenant predicate `guard!/2` refuses). This matches the LEGACY path,
-  # which excludes them from the count too, so `total_count` semantics are unchanged;
-  # the system corpus's state is disclosed separately in `meta.system_corpus_*`.
   # SYSTEM-scoped articles ARE counted (review #13). The previous form joined
   # `articles` on `a.tenant_id == ^tenant_id`, which excluded them — while
   # `hydrate_semantic_pool/6` selects `a.tenant_id == ^tenant_id or a.scope ==
@@ -6777,27 +6822,55 @@ defmodule Loopctl.Knowledge do
         {id, 1 - (distance || 0.0)}
       end)
 
-    from(a in Article,
-      where: a.id in ^Map.keys(scores),
-      where: a.tenant_id == ^tenant_id or a.scope == :system,
-      select: %{
-        id: a.id,
-        tenant_id: a.tenant_id,
-        project_id: a.project_id,
-        title: a.title,
-        category: a.category,
-        status: a.status,
-        tags: a.tags,
-        inserted_at: a.inserted_at,
-        updated_at: a.updated_at
-      }
-    )
-    |> apply_search_filters(status, opts)
-    |> AdminRepo.all()
+    filtered =
+      from(a in Article,
+        where: a.id in ^Map.keys(scores),
+        where: a.tenant_id == ^tenant_id or a.scope == :system,
+        select: %{
+          id: a.id,
+          tenant_id: a.tenant_id,
+          project_id: a.project_id,
+          title: a.title,
+          category: a.category,
+          status: a.status,
+          tags: a.tags,
+          inserted_at: a.inserted_at,
+          updated_at: a.updated_at
+        }
+      )
+      |> apply_search_filters(status, opts)
+      |> AdminRepo.all()
+
+    # Under-fill observability (review): the side-table inner ANN cannot carry
+    # status/visibility, so drafts/archived/private rows occupy pool slots and are
+    # trimmed HERE. When the post-filter set shrinks below the ANN candidate pool the
+    # recall regression the fixed over-fetch is meant to offset is happening — emit it
+    # so it is measured, not silent (KB ae9a1719: silent under-fill is the failure the
+    # side-table design must avoid).
+    emit_side_table_underfill(tenant_id, length(pool_rows), length(filtered), limit)
+
+    filtered
     |> Enum.map(&Map.put(&1, :similarity_score, Map.fetch!(scores, &1.id)))
     |> Enum.sort_by(& &1.similarity_score, :desc)
     |> Enum.drop(offset)
     |> Enum.take(limit)
+  end
+
+  defp emit_side_table_underfill(tenant_id, pool_count, filtered_count, limit) do
+    if filtered_count < pool_count do
+      :telemetry.execute(
+        [:loopctl, :knowledge, :semantic_search, :side_table_underfill],
+        %{
+          pool_candidates: pool_count,
+          survived_filter: filtered_count,
+          trimmed: pool_count - filtered_count,
+          requested_limit: limit
+        },
+        %{tenant_id: tenant_id}
+      )
+    end
+
+    :ok
   end
 
   # The AC-41.1.7 + AC-41.1.10 disclosures every semantic response carries.
@@ -6823,30 +6896,15 @@ defmodule Loopctl.Knowledge do
   # and it scans every system-scoped article with a per-row index probe — a cost that
   # grows with loopctl's own canonical wiki corpus, paid on every semantic search,
   # against AC-41.1.12's "the hosted default must not regress".
+  # AC-41.1.7's "on demand" read-path materialization trigger now lives INSIDE
+  # `Embeddings.search_disclosure_meta/2`'s memoized cache fill (review #11), so it
+  # fires only on a DisclosureCache MISS rather than on every semantic response — the
+  # per-request unindexed `oban_jobs` scan + Oban insert it used to cost is gone. The
+  # worker is unique per `(tenant_id, dim)`, its batch query is an anti-join, and the
+  # enqueue refuses to re-drive a permanently-terminated materialization.
   defp semantic_disclosure_meta(tenant_id, dimension) when is_integer(dimension) do
-    meta = Embeddings.search_disclosure_meta(tenant_id, dimension)
-
-    # AC-41.1.7's "on demand": the read that OBSERVES an unmaterialized system corpus
-    # is what TRIGGERS its materialization. Without this the disclosure was a dead
-    # end — a tenant stayed keyword-only for the shared corpus forever unless an
-    # operator opened IEx. The worker is unique per `(tenant_id, dim)`, its batch
-    # query is an anti-join, and `enqueue_system_corpus_materialization/2` refuses to
-    # re-enqueue once a run for that `(tenant, dim)` has terminated PERMANENTLY — so
-    # a read-path enqueue can neither duplicate work nor loop forever on a tenant
-    # whose materialization can never succeed.
-    maybe_enqueue_system_corpus(tenant_id, dimension, meta)
-
-    meta
+    Embeddings.search_disclosure_meta(tenant_id, dimension)
   end
-
-  defp maybe_enqueue_system_corpus(tenant_id, dimension, %{
-         system_corpus_recall: "keyword_only"
-       }) do
-    Embeddings.enqueue_system_corpus_materialization(tenant_id, dimension: dimension)
-    :ok
-  end
-
-  defp maybe_enqueue_system_corpus(_tenant_id, _dimension, _meta), do: :ok
 
   # US-37.5: heavy-read opts for the semantic search reads with the graceful-degrade
   # flag — an over-cap shed returns `{:error, :heavy_read_overloaded}` (search falls

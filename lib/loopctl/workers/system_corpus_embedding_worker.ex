@@ -114,9 +114,13 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
       |> Enum.map(fn a -> {a, embedding_text(a)} end)
       |> split_unchanged(tenant_id, dim)
 
-    Enum.each(unchanged, fn {article, _text} ->
-      Embeddings.touch_system_article_embedding(tenant_id, article.id, dim)
-    end)
+    # ONE update_all for every unchanged article (review) rather than a per-item UPDATE
+    # in a path AC-41.1.11 otherwise de-N+1s.
+    Embeddings.touch_system_article_embeddings(
+      tenant_id,
+      Enum.map(unchanged, fn {article, _text} -> article.id end),
+      dim
+    )
 
     embed_entries(tenant_id, dim, entries)
   end

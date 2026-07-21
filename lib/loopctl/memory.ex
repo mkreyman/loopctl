@@ -3045,9 +3045,24 @@ defmodule Loopctl.Memory do
         )
         |> Loopctl.AdminRepo.transaction()
         |> case do
-          {:ok, %{legacy: updated}} -> {:ok, updated}
-          {:ok, _changes} -> {:ok, memory}
-          {:error, _step, reason, _done} -> {:error, reason}
+          {:ok, %{legacy: updated}} ->
+            {:ok, updated}
+
+          # Non-1536 path: the `:legacy` step is skipped, so returning the pre-update
+          # `memory` handed callers a STALE struct (nil `embedding`, stale
+          # `embedding_content_hash`) even though the side-table write succeeded — the
+          # wrong follow-up decision for exactly the tenants this epic serves (review).
+          # Reflect the write that actually happened onto the returned struct.
+          {:ok, %{side_table: side_row}} ->
+            {:ok,
+             %{
+               memory
+               | embedding: embedding,
+                 embedding_content_hash: side_row.embedding_content_hash
+             }}
+
+          {:error, _step, reason, _done} ->
+            {:error, reason}
         end
     end
   end

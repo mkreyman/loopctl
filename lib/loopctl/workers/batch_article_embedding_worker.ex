@@ -68,6 +68,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   alias Loopctl.Egress
   alias Loopctl.Egress.Scope
   alias Loopctl.Embeddings
+  alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -304,6 +305,29 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     # SELECT + a settings read), so the /4 form here was 100 tenant lookups per batch.
     dimension = Embeddings.resolve_write_dimension(tenant_id)
 
+    # Pre-write batch dimension check (review), mirroring ReembedWorker /
+    # SystemCorpusEmbeddingWorker: an off-dimension model otherwise surfaced per-row as
+    # a changeset error, and Oban re-billed the provider for the whole batch on each of
+    # five attempts. Catch it ONCE, before the first write, and DISCARD.
+    case Dimensions.check_batch_length(
+           Enum.map(article_vector_pairs, fn {_entry, v} -> v end),
+           dimension
+         ) do
+      :ok -> do_store_all(tenant_id, dimension, article_vector_pairs)
+      {:error, {:dimension_mismatch, expected, actual}} -> discard_mismatch(expected, actual)
+    end
+  end
+
+  defp discard_mismatch(expected, actual) do
+    Logger.debug(
+      "BatchArticleEmbeddingWorker: model returned #{inspect(actual)}-dimension vectors but " <>
+        "the tenant is recorded at #{expected}; discarding rather than re-billing."
+    )
+
+    {:discard, {:dimension_mismatch, expected, actual}}
+  end
+
+  defp do_store_all(tenant_id, dimension, article_vector_pairs) do
     Enum.reduce_while(article_vector_pairs, :ok, fn {{article, _text, hash}, vector}, :ok ->
       case Knowledge.update_embedding(tenant_id, article.id, vector, hash, dimension) do
         {:ok, _updated} ->
@@ -365,7 +389,10 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   end
 
   defp side_table_hashes(tenant_id, entries) do
-    if Embeddings.side_table_reads_enabled?() do
+    # WRITE-dimension gated (`use_side_table_hash?/1`), not read-flag gated (review):
+    # a non-1536 tenant has no legacy hash, so the read-flag gate re-billed the whole
+    # batch on every enqueue until cutover.
+    if Embeddings.use_side_table_hash?(tenant_id) do
       Embeddings.article_embedded_hashes(
         tenant_id,
         Enum.map(entries, fn {article, _text, _hash} -> article.id end),

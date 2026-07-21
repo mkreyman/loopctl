@@ -148,7 +148,10 @@ defmodule Loopctl.Workers.ReembedWorker do
 
       result =
         embed_and_store(tenant_id, target_dim, entries, [project_id: project_id], fn triples ->
-          Embeddings.upsert_article_embeddings(tenant_id, triples, dimension: target_dim)
+          Embeddings.upsert_article_embeddings(tenant_id, triples,
+            dimension: target_dim,
+            legacy_write: false
+          )
         end)
 
       case result do
@@ -166,7 +169,10 @@ defmodule Loopctl.Workers.ReembedWorker do
     entries = Enum.map(memories, fn m -> {m, memory_text(m)} end)
 
     case embed_and_store(tenant_id, target_dim, entries, [], fn triples ->
-           Embeddings.upsert_memory_embeddings(tenant_id, triples, dimension: target_dim)
+           Embeddings.upsert_memory_embeddings(tenant_id, triples,
+             dimension: target_dim,
+             legacy_write: false
+           )
          end) do
       :ok -> finish_batch(tenant_id, target_dim)
       other -> other
@@ -212,10 +218,12 @@ defmodule Loopctl.Workers.ReembedWorker do
             {subject, vector, content_hash(text)}
           end)
 
-        # The side table ONLY: the legacy column is vector(1536) and the target
-        # dimension is by definition not the active one, so a dual-write here is
-        # either physically impossible (non-1536) or would clobber the still-serving
-        # active corpus. AC-41.1.8's dual-write is dim-1536-scoped for this reason.
+        # The side table ONLY (`legacy_write: false`, review). The target dimension
+        # CAN legally be 1536 (reverting a 768 tenant to the hosted default), so the
+        # dim-1536 dual-write guard is not enough on its own: writing `articles.embedding`
+        # mid-run would publish the PENDING corpus's vectors to the still-serving legacy
+        # read path, and for a system article (`articles.tenant_id IS NULL`, shared by
+        # every tenant) it would clobber the global slot across tenants.
         with {:ok, _rows} <- store_fun.(triples) do
           :ok
         end

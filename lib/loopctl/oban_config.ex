@@ -475,7 +475,15 @@ defmodule Loopctl.ObanConfig do
          # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
          {"*/5 * * * *", Loopctl.Workers.CustodyPostureSweepWorker},
          {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker},
-         {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker}
+         {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
+         # US-41.1 (review): the STANDING embedding-side-table reconciliation pass —
+         # sweeps the dual-write crash window (legacy row without its dim-1536 mirror)
+         # AND the active-dimension gap a writer racing complete_reembed's sweep can
+         # strand. Both are otherwise permanent recall blackouts found only by a manual
+         # IEx call. Bounded per run; a backlog drains over successive hourly runs.
+         # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+         {"15 * * * *", Loopctl.Workers.EmbeddingReconciliationWorker,
+          args: %{"mode" => "all_tenants"}}
        ]},
       # Rescue jobs orphaned in :executing when a node dies mid-run (e.g. a deploy).
       # Without Lifeline these rows stay `executing` forever — 110 such orphans (from

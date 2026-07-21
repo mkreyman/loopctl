@@ -33,6 +33,8 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
 
   require Logger
 
+  alias Loopctl.Audit
+  alias Loopctl.Auth.Role
   alias Loopctl.Embeddings
 
   action_fallback LoopctlWeb.FallbackController
@@ -92,20 +94,40 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
   )
 
   def system_corpus(conn, _params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
     dimension = Embeddings.active_dimension(tenant_id)
 
-    # `force: true` — an EXPLICIT operator/agent POST bypasses the terminal-job gate
-    # that stops the search READ path from re-enqueuing forever (a human asking again
-    # is a new decision, and a retry is exactly how a terminal state gets cleared).
+    # `force: true` bypasses the terminal-job gate that stops a cost-bearing
+    # materialization from being re-driven forever (review). A PLAIN AGENT key does NOT
+    # get it: a tenant whose materialization terminated permanently could otherwise be
+    # re-driven by any agent every 300s. Only an orchestrator+ (a deliberate operator
+    # decision) clears a terminal state — the retry is exactly how it is meant to be
+    # cleared; a bare agent honours the gate.
+    force? = Role.role_at_least?(api_key.role, :orchestrator)
+
     case Embeddings.enqueue_system_corpus_materialization(tenant_id,
            dimension: dimension,
-           force: true
+           force: force?
          ) do
       {:ok, _job} ->
         conn
         |> put_status(:accepted)
         |> json(%{enqueued: true, dimension: dimension})
+
+      {:error, :materialization_terminal} ->
+        # A prior run for this (tenant, dimension) terminated permanently and this is a
+        # plain agent key, which does not force. An orchestrator+ retry clears it.
+        conn
+        |> put_status(:conflict)
+        |> json(%{
+          error: "materialization_terminal",
+          detail:
+            "a prior system-corpus materialization for this tenant and dimension " <>
+              "terminated permanently (e.g. no embedding key). Retry requires an " <>
+              "orchestrator+ key.",
+          dimension: dimension
+        })
 
       {:error, reason} ->
         enqueue_failed(conn, tenant_id, "system_corpus", reason)
@@ -132,10 +154,26 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
   )
 
   def reembed(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
 
     with {:ok, target} <- parse_dimension(params["target_dimension"]),
          {:ok, _job} <- Embeddings.enqueue_reembed(tenant_id, target) do
+      # AUDIT the enqueue (review): the re-embed re-bills the tenant for its whole
+      # corpus and its completion DELETES every stale-dimension row. KB 3e89e251 only
+      # permits a data-removing operation below `:user` when it is reversible AND
+      # audited; keeping it at `:orchestrator` therefore requires the audited trail this
+      # writes (an append-only, hash-chained audit_chain entry) on enqueue.
+      Audit.create_log_entry(tenant_id, %{
+        entity_type: "knowledge_embedding",
+        entity_id: tenant_id,
+        action: "embedding.reembed_enqueued",
+        actor_type: "api_key",
+        actor_id: api_key.id,
+        actor_label: "api_key:#{api_key.id}",
+        new_state: %{"target_dimension" => target}
+      })
+
       conn
       |> put_status(:accepted)
       |> json(%{
