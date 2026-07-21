@@ -27,6 +27,20 @@ defmodule Loopctl.Egress.Scope do
   end
 
   @doc """
+  Normalizes the first argument of a provider-facing API into a `Scope`.
+
+  The embedding and chat client APIs take the egress scope as their FIRST
+  argument (US-41.4, AC-41.4.2) so a project-only `local_only` marking is
+  enforced no matter which caller reaches the provider. A bare `tenant_id`
+  binary is accepted as shorthand for the TENANT-WIDE scope — the correct
+  reading for articles with a nil `project_id` and for memories, which have no
+  project association at all.
+  """
+  @spec coerce(t() | Ecto.UUID.t()) :: t()
+  def coerce(%__MODULE__{} = scope), do: scope
+  def coerce(tenant_id) when is_binary(tenant_id), do: new(tenant_id)
+
+  @doc """
   Stable string key for the scope, used as the pin-cache key component and the
   `scope_key` on aggregated blocked-decision rows.
 

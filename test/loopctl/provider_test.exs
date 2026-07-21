@@ -5,9 +5,18 @@ defmodule Loopctl.ProviderTest do
   blocked calls emit the replacement metric and never a provider-error signal
   (AC-41.4.6, TC-41.4.10/.15), and the pinned path is used when allowed
   (AC-41.4.12).
+
+  `async: false` (flake fix): the "emits NO provider-error storm signal" test does a
+  `refute_receive` on `[:loopctl, :llm, :provider_error]`, which is a VM-GLOBAL
+  telemetry event with no tenant in its metadata — a concurrent embedding-path test
+  emitting it with `provider: "embedding"` is indistinguishable from a leak here and
+  fails this assertion intermittently. Filtering at the handler cannot separate them
+  (this test's own path would carry the same provider tag), so the only sound fix is
+  the same one `Loopctl.Llm.AnthropicTest` already uses: no concurrent emitter at
+  all. ExUnit runs sync files alone, after the async ones.
   """
 
-  use Loopctl.DataCase, async: true
+  use Loopctl.DataCase, async: false
 
   import Mox
 

@@ -23,13 +23,112 @@ defmodule LoopctlWeb.EgressController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Egress
   alias Loopctl.Egress.Policy
   alias Loopctl.Egress.Scope
   alias Loopctl.Egress.TrustedEndpoint
 
   action_fallback LoopctlWeb.FallbackController
+
+  tags(["Egress"])
+
+  @json "application/json"
+  @free_object %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+
+  operation(:posture,
+    summary: "Egress posture",
+    description:
+      "Resolved embedding + chat endpoints with a locality VERDICT for each, the tenant's " <>
+        "declared trusted endpoints (labelled 'tenant-declared (unverified attestation), " <>
+        "not network-local'), per-scope local_only/encrypt_body, and named posture defects. " <>
+        "Endpoints are shown; KEYS NEVER ARE. Deployment-allowlist CONTENTS appear only at " <>
+        "role :user+ — at :agent each endpoint carries only a boolean saying whether the " <>
+        "verdict came from the allowlist. Role :agent.",
+    responses: %{
+      200 => {"Egress posture", @json, @free_object},
+      401 => {"Unauthorized", @json, Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:enable_local_only,
+    summary: "Enable local_only for a scope",
+    description:
+      "TIGHTENS the posture (role :orchestrator+). Runs the MANDATORY PRE-FLIGHT: if any " <>
+        "currently-resolved endpoint would become egress_blocked, responds 409 " <>
+        "would_block_endpoints NAMING each offending endpoint; retry with acknowledge=true " <>
+        "to proceed, and the response then REPORTS the resulting blocked posture.",
+    request_body: {"local_only enable request", @json, @free_object},
+    responses: %{
+      200 => {"local_only enabled", @json, @free_object},
+      403 => {"Insufficient role", @json, Schemas.ErrorResponse},
+      409 => {"Would block resolved endpoints", @json, Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:clear_local_only,
+    summary: "Clear local_only for a scope",
+    description:
+      "WIDENS the posture, so it is role :user ONLY — an agent or orchestrator key must " <>
+        "never be able to re-open egress one tool call before a harvest. Audited.",
+    parameters: [
+      project_id: [in: :query, type: :string, required: false, description: "Project UUID"]
+    ],
+    responses: %{
+      200 => {"local_only cleared", @json, @free_object},
+      403 => {"Insufficient role", @json, Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:list_trusted,
+    summary: "List tenant-declared trusted endpoints",
+    description:
+      "Role :agent. Every entry is labelled 'tenant-declared (unverified attestation), not " <>
+        "network-local' — loopctl does not prove the declaring tenant owns the host.",
+    responses: %{200 => {"Declared endpoints", @json, @free_object}}
+  )
+
+  operation(:declare_trusted,
+    summary: "Declare a tenant-trusted endpoint",
+    description:
+      "Role :user ONLY. PUBLIC addresses only (enforced at write time AND again at pin " <>
+        "time), purpose-scoped (inference and/or webhook), vendor hosts excluded. A " <>
+        "declaration carves NOTHING out of the SSRF denylist — only the operator " <>
+        "deployment allowlist can do that, and it has no route at any role.",
+    request_body: {"Trusted endpoint declaration", @json, @free_object},
+    responses: %{
+      201 => {"Endpoint declared", @json, @free_object},
+      403 => {"Insufficient role", @json, Schemas.ErrorResponse},
+      422 => {"Rejected declaration", @json, Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:revoke_trusted,
+    summary: "Revoke a tenant-declared trusted endpoint",
+    description: "Role :user ONLY. Invalidates the pin cache immediately.",
+    parameters: [
+      host: [in: :path, type: :string, required: true, description: "Declared host"]
+    ],
+    responses: %{
+      200 => {"Endpoint revoked", @json, @free_object},
+      403 => {"Insufficient role", @json, Schemas.ErrorResponse},
+      404 => {"Not found", @json, Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:repin,
+    summary: "Re-pin a host after a :pin_stale refusal",
+    description:
+      "Role :agent. The :pin_stale remediation — target deployments change IP routinely, " <>
+        "so recovery must NOT require a role :user write.",
+    request_body: {"Repin request", @json, @free_object},
+    responses: %{
+      200 => {"Re-pinned", @json, @free_object},
+      422 => {"Repin failed", @json, Schemas.ErrorResponse}
+    }
+  )
 
   # TIGHTENING the posture is safe to automate.
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:enable_local_only]

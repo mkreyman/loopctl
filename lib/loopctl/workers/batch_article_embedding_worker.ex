@@ -137,9 +137,25 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   # (snooze/discard/error), which the perform/1 caller returns to Oban.
   defp generate_and_store(tenant_id, to_embed) do
     to_embed
+    # US-41.4 (AC-41.4.2): group by the article's PROJECT first, so every provider
+    # array call carries exactly ONE egress scope. Mixing projects into one call would
+    # force a single scope on articles with different markings — and the only safe
+    # single scope would be the most restrictive one, which would block articles that
+    # are not marked. Grouping keeps each decision exact.
+    |> Enum.group_by(fn {article, _text, _hash} -> article.project_id end)
+    |> Enum.reduce_while(:ok, fn {project_id, group}, :ok ->
+      case generate_and_store_project_group(tenant_id, project_id, group) do
+        :ok -> {:cont, :ok}
+        other -> {:halt, other}
+      end
+    end)
+  end
+
+  defp generate_and_store_project_group(tenant_id, project_id, to_embed) do
+    to_embed
     |> chunk_by_char_budget(Knowledge.embedding_batch_max_chars())
     |> Enum.reduce_while(:ok, fn sub_batch, :ok ->
-      case embed_and_store_sub_batch(tenant_id, sub_batch) do
+      case embed_and_store_sub_batch(tenant_id, project_id, sub_batch) do
         :ok -> {:cont, :ok}
         other -> {:halt, other}
       end
@@ -169,10 +185,12 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     Enum.chunk_while(to_embed, {[], 0}, chunk_fun, after_fun)
   end
 
-  defp embed_and_store_sub_batch(tenant_id, to_embed) do
+  defp embed_and_store_sub_batch(tenant_id, project_id, to_embed) do
     texts = Enum.map(to_embed, fn {_article, text, _hash} -> text end)
 
-    case Knowledge.generate_embeddings(tenant_id, texts, timeout: batch_yield_ms(length(texts))) do
+    opts = [timeout: batch_yield_ms(length(texts)), project_id: project_id]
+
+    case Knowledge.generate_embeddings(tenant_id, texts, opts) do
       {:ok, vectors} when length(vectors) == length(to_embed) ->
         store_all(tenant_id, Enum.zip(to_embed, vectors))
 

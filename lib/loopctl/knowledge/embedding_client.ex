@@ -55,43 +55,49 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
   @default_batch_receive_per_item_ms 100
 
   @impl true
-  def generate_embedding(tenant_id, text) when is_binary(tenant_id) do
-    case Llm.resolve(tenant_id, :embedding) do
+  def generate_embedding(scope_or_tenant_id, text) do
+    scope = Scope.coerce(scope_or_tenant_id)
+
+    # Key + model resolution is TENANT-scoped (there is no project-level endpoint
+    # override anywhere in loopctl); the project half of the scope narrows only the
+    # local_only MARKING, which is applied at the egress chokepoint below.
+    case Llm.resolve(scope.tenant_id, :embedding) do
       {:error, :no_api_key} ->
         # Mandatory BYO: no tenant key => no provider call, no operator spend.
         {:error, :no_api_key}
 
       {:ok, %{api_key: api_key, model: model}} ->
-        post(tenant_id, api_key, model, text)
+        post(scope, api_key, model, text)
     end
   end
 
   @impl true
-  def generate_embeddings(tenant_id, texts)
-      when is_binary(tenant_id) and is_list(texts) do
+  def generate_embeddings(scope_or_tenant_id, texts) when is_list(texts) do
+    scope = Scope.coerce(scope_or_tenant_id)
+
     # An empty batch never touches the provider (no admission token spent).
     if texts == [] do
       {:ok, []}
     else
-      case Llm.resolve(tenant_id, :embedding) do
+      case Llm.resolve(scope.tenant_id, :embedding) do
         {:error, :no_api_key} ->
           # Mandatory BYO: no tenant key => no provider call, no operator spend.
           {:error, :no_api_key}
 
         {:ok, %{api_key: api_key, model: model}} ->
-          post_batch(tenant_id, api_key, model, texts)
+          post_batch(scope, api_key, model, texts)
       end
     end
   end
 
-  defp post(tenant_id, api_key, model, text) do
+  defp post(%Scope{tenant_id: tenant_id} = scope, api_key, model, text) do
     # US-37.1: per-(tenant, provider) token-bucket admission gate. On an empty
     # node-local bucket, fast-fail WITHOUT building/sending the request so the
     # caller degrades cheaply (interactive search → keyword fallback; embedding
     # jobs → snooze/retry). This return is breaker-EXEMPT (see Knowledge's
     # `breaker_countable?/1`).
     with :ok <- Admission.admit(tenant_id, :embedding) do
-      do_post(tenant_id, api_key, model, text)
+      do_post(scope, api_key, model, text)
     end
   end
 
@@ -99,18 +105,18 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
   # (AC-37.4.4) — the same single gate as the single-text path — so a ~100-text
   # batch is one bucket draw, not 100. Same breaker-exempt fast-fail on an empty
   # bucket.
-  defp post_batch(tenant_id, api_key, model, texts) do
+  defp post_batch(%Scope{tenant_id: tenant_id} = scope, api_key, model, texts) do
     with :ok <- Admission.admit(tenant_id, :embedding) do
-      do_post_batch(tenant_id, api_key, model, texts)
+      do_post_batch(scope, api_key, model, texts)
     end
   end
 
-  defp do_post(tenant_id, api_key, model, text) do
+  defp do_post(%Scope{tenant_id: tenant_id} = scope, api_key, model, text) do
     opts = request_opts(api_key, %{input: text, model: model}, single_receive_timeout_ms())
 
     # US-41.4 (AC-41.4.4): the SINGLE egress chokepoint. Fail-CLOSED, and a
     # separate decision from the fail-OPEN admission gate above.
-    case Provider.post(embeddings_url(), opts, provider_ctx(tenant_id)) do
+    case Provider.post(embeddings_url(), opts, provider_ctx(scope)) do
       {:ok, %{status: 200, body: %{"data" => [%{"embedding" => embedding} | _]} = resp}} ->
         record_usage_safe(tenant_id, model, resp["usage"])
         {:ok, embedding}
@@ -126,7 +132,7 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
   # zip them against `texts`. A short/mismatched `data` array (any input index with
   # no returned vector) fails the WHOLE batch (AC-37.4.3) — no partial/misaligned
   # result reaches the caller.
-  defp do_post_batch(tenant_id, api_key, model, texts) do
+  defp do_post_batch(%Scope{tenant_id: tenant_id} = scope, api_key, model, texts) do
     opts =
       request_opts(
         api_key,
@@ -134,7 +140,7 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
         batch_receive_timeout_ms(length(texts))
       )
 
-    case Provider.post(embeddings_url(), opts, provider_ctx(tenant_id)) do
+    case Provider.post(embeddings_url(), opts, provider_ctx(scope)) do
       {:ok, %{status: 200, body: %{"data" => data} = resp}} when is_list(data) ->
         case map_vectors_by_index(data, length(texts)) do
           {:ok, vectors} ->
@@ -227,12 +233,13 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
     end
   end
 
-  # US-41.4: the scope an embedding call is made on behalf of. Endpoint resolution
-  # is TENANT-scoped only, and articles/memories may have no project, so the scope
-  # threaded here is the tenant scope; a project-marked scope is resolved by
-  # `Loopctl.Egress.Policy` as MOST-RESTRICTIVE-wins over the tenant marking.
-  defp provider_ctx(tenant_id) do
-    %{scope: Scope.new(tenant_id), purpose: :inference}
+  # US-41.4 (AC-41.4.2): the scope an embedding call is made on behalf of, threaded
+  # from the CALLER (which is the only layer that knows the project). Endpoint
+  # resolution stays TENANT-scoped; `Loopctl.Egress.Policy` resolves the effective
+  # marking as MOST-RESTRICTIVE-wins (project OR tenant), so a project-only marking
+  # blocks here even though the endpoint came from tenant settings.
+  defp provider_ctx(%Scope{} = scope) do
+    %{scope: scope, purpose: :inference}
   end
 
   # US-41.4: a fail-CLOSED egress refusal (and the DISTINCT `:pin_stale`) is a

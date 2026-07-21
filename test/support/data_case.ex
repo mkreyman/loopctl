@@ -17,6 +17,7 @@ defmodule Loopctl.DataCase do
   use ExUnit.CaseTemplate
 
   alias Ecto.Adapters.SQL.Sandbox
+  alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Oban.FairShare
   alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Telemetry.ScaleMetrics
@@ -144,8 +145,8 @@ defmodule Loopctl.DataCase do
     # working exactly as before, no test rewrites), but tenants no longer crowd
     # each other's region of the index, so recall is deterministic under load.
     # tenant_id is threaded first (BYO embeddings, #294 extended).
-    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn tenant_id, _text ->
-      {:ok, deterministic_embedding(tenant_id)}
+    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn scope, _text ->
+      {:ok, deterministic_embedding(EgressScope.coerce(scope).tenant_id)}
     end)
 
     # US-37.4: permissive default for the BATCH embedding path -- one 1536-dim vector
@@ -153,7 +154,8 @@ defmodule Loopctl.DataCase do
     # this deterministic stub returns them aligned so batch worker/store tests run
     # unchanged). Keyed on `tenant_id` (never a global constant) for the same
     # index-navigability reason as the single path above. An empty batch returns [].
-    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn tenant_id, texts ->
+    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn scope, texts ->
+      tenant_id = EgressScope.coerce(scope).tenant_id
       {:ok, Enum.map(texts, fn _text -> deterministic_embedding(tenant_id) end)}
     end)
 

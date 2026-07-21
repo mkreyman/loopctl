@@ -724,8 +724,48 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
           "Connected BEAM cluster peers (Node.list/0 length), by clustering-readiness status.",
         tags: [:status],
         tag_values: &cluster_peers_tags/1
+      ),
+
+      # 24. Egress-blocked counter (US-41.4, AC-41.4.6). The AGGREGATE blocked-rate
+      #     signal that pairs with the deduplicated `egress_blocked_decisions` audit
+      #     rows: the rows are bounded to one per (scope, endpoint, reason, window),
+      #     so the EXACT per-call rate has to live here. Deliberately the REPLACEMENT
+      #     for the provider-error signal a fail-CLOSED refusal must never feed — a
+      #     `local_only` scope refusing a vendor endpoint is a configuration decision,
+      #     not a provider outage, so it is exempt from the circuit breaker
+      #     (`Knowledge.breaker_countable?/1`) and from
+      #     `[:loopctl, :llm, :provider_error]`. Without this counter a fleet-wide
+      #     misconfiguration would be invisible on the dashboards.
+      #
+      #     `reason` is the bounded `Loopctl.Egress.Policy.verdict()` enum
+      #     (`non_local`/`denylisted`/`tenant_declared`/`network_local`/
+      #     `unclassifiable`); `tenant_id` is CAP-GATED exactly like the other scale
+      #     counters. The `endpoint_host` in the event metadata is deliberately NOT a
+      #     label — it is tenant-supplied and therefore unbounded (AC-27.15.3). The
+      #     host lives in the aggregated decision row and in `egress_posture`, where
+      #     it is answerable per tenant instead of per time series.
+      counter("loopctl.egress.blocked.count",
+        event_name: [:loopctl, :egress, :blocked],
+        measurement: :count,
+        description:
+          "Outbound provider calls refused by the fail-closed egress guard, by reason and tenant.",
+        tags: [:reason, :tenant_id],
+        tag_values: &egress_blocked_tags/1
       )
     ]
+  end
+
+  @doc """
+  `tag_values` for the egress-blocked counter (US-41.4). Emits the bounded
+  `Loopctl.Egress.Policy` verdict as `reason` plus a CAP-GATED `tenant_id`. The
+  tenant-supplied `endpoint_host` is never a label (unbounded cardinality); it is
+  carried on the aggregated `egress_blocked_decisions` row and reported by
+  `egress_posture` instead. A missing reason defaults to `"unknown"` so a direct
+  `:telemetry.execute/3` with a partial map never emits a blank label.
+  """
+  @spec egress_blocked_tags(map()) :: map()
+  def egress_blocked_tags(metadata) do
+    %{reason: Map.get(metadata, :reason, "unknown"), tenant_id: gated_tenant_id(metadata)}
   end
 
   @doc """

@@ -29,7 +29,7 @@ defmodule Loopctl.Llm.Anthropic do
 
   require Logger
 
-  alias Loopctl.Egress.Scope
+  alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Provider
@@ -63,20 +63,35 @@ defmodule Loopctl.Llm.Anthropic do
 
   All returned error terms are sanitized via `Loopctl.Llm.ProviderError` and never
   carry a raw provider body — the error union below is `ProviderError.t()`.
+
+  ## Egress scope (US-41.4, AC-41.4.2)
+
+  The first argument is the `Loopctl.Egress.Scope` the chat call is made on behalf
+  of; a bare `tenant_id` is accepted as shorthand for the tenant-wide scope. Key +
+  endpoint resolution stays TENANT-scoped — the project half narrows only the
+  `local_only` marking, which is applied at the egress chokepoint.
   """
-  @spec message(Ecto.UUID.t(), Llm.operation(), (String.t() -> map()), usage_meta(), keyword()) ::
+  @spec message(
+          EgressScope.t() | Ecto.UUID.t(),
+          Llm.operation(),
+          (String.t() -> map()),
+          usage_meta(),
+          keyword()
+        ) ::
           {:ok, String.t()}
           | {:error, :no_api_key}
           | {:error, :rate_limited_local}
           | {:error, ProviderError.t()}
-  def message(tenant_id, operation, body_fun, usage_meta \\ %{}, req_opts \\ [])
+  def message(scope_or_tenant_id, operation, body_fun, usage_meta \\ %{}, req_opts \\ [])
       when is_function(body_fun, 1) do
-    case Llm.resolve(tenant_id, operation) do
+    scope = EgressScope.coerce(scope_or_tenant_id)
+
+    case Llm.resolve(scope.tenant_id, operation) do
       {:error, :no_api_key} ->
         {:error, :no_api_key}
 
       {:ok, %{api_key: api_key, model: model}} ->
-        call(tenant_id, operation, api_key, model, body_fun, usage_meta, req_opts)
+        call(scope, operation, api_key, model, body_fun, usage_meta, req_opts)
     end
   end
 
@@ -93,7 +108,7 @@ defmodule Loopctl.Llm.Anthropic do
   `ProviderError.t()` — every returned error term is sanitized and body-free.
   """
   @spec call(
-          Ecto.UUID.t(),
+          EgressScope.t() | Ecto.UUID.t(),
           Llm.operation(),
           String.t(),
           String.t(),
@@ -104,13 +119,38 @@ defmodule Loopctl.Llm.Anthropic do
           {:ok, String.t()}
           | {:error, :rate_limited_local}
           | {:error, ProviderError.t()}
-  def call(tenant_id, operation, api_key, model, body_fun, usage_meta \\ %{}, req_opts \\ [])
+  def call(
+        scope_or_tenant_id,
+        operation,
+        api_key,
+        model,
+        body_fun,
+        usage_meta \\ %{},
+        req_opts \\ []
+      )
       when is_binary(api_key) and is_binary(model) and is_function(body_fun, 1) do
     body = model |> body_fun.() |> Map.put(:model, model)
-    post(tenant_id, operation, model, body, usage_meta, api_key, req_opts)
+
+    post(
+      EgressScope.coerce(scope_or_tenant_id),
+      operation,
+      model,
+      body,
+      usage_meta,
+      api_key,
+      req_opts
+    )
   end
 
-  defp post(tenant_id, operation, model, body, usage_meta, api_key, req_opts) do
+  defp post(
+         %EgressScope{tenant_id: tenant_id} = scope,
+         operation,
+         model,
+         body,
+         usage_meta,
+         api_key,
+         req_opts
+       ) do
     # US-37.1: per-(tenant, provider) token-bucket admission gate. On an empty
     # node-local bucket, short-circuit with `{:error, :rate_limited_local}` BEFORE
     # building/sending the request — and crucially BEFORE the `record_provider_error/1`
@@ -118,11 +158,19 @@ defmodule Loopctl.Llm.Anthropic do
     # `[:loopctl, :llm, :provider_error]` storm signal (parallel to the breaker
     # exemption in AC-37.1.3).
     with :ok <- Admission.admit(tenant_id, :anthropic) do
-      do_post(tenant_id, operation, model, body, usage_meta, api_key, req_opts)
+      do_post(scope, operation, model, body, usage_meta, api_key, req_opts)
     end
   end
 
-  defp do_post(tenant_id, operation, model, body, usage_meta, api_key, req_opts) do
+  defp do_post(
+         %EgressScope{tenant_id: tenant_id} = scope,
+         operation,
+         model,
+         body,
+         usage_meta,
+         api_key,
+         req_opts
+       ) do
     opts =
       [
         json: body,
@@ -142,10 +190,7 @@ defmodule Loopctl.Llm.Anthropic do
     # refuses `local_only` scopes on a non-local endpoint BEFORE the request is
     # built. Admission (fail-OPEN) stays its own `with` clause above so the two
     # failure modes never share a code path.
-    case Provider.post("#{@base_url}/messages", opts, %{
-           scope: Scope.new(tenant_id),
-           purpose: :inference
-         }) do
+    case Provider.post("#{@base_url}/messages", opts, %{scope: scope, purpose: :inference}) do
       {:ok, %{status: 200, body: %{"content" => [%{"text" => text} | _]} = resp}} ->
         record_usage_safe(tenant_id, operation, model, resp["usage"], usage_meta)
         {:ok, text}

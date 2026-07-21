@@ -112,12 +112,17 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
       enqueue_linking(article_id, tenant_id)
       :ok
     else
-      generate(tenant_id, article_id, text, content_hash)
+      generate(tenant_id, article, article_id, text, content_hash)
     end
   end
 
-  defp generate(tenant_id, article_id, text, content_hash) do
-    case Knowledge.generate_embedding(tenant_id, text, timeout: @worker_yield_ms) do
+  defp generate(tenant_id, article, article_id, text, content_hash) do
+    # US-41.4 (AC-41.4.2): articles carry a nullable `project_id`, so the egress scope
+    # is the ARTICLE's project when it has one and the tenant-wide scope otherwise.
+    # The effective marking is MOST-RESTRICTIVE (project OR tenant).
+    opts = [timeout: @worker_yield_ms, project_id: article.project_id]
+
+    case Knowledge.generate_embedding(tenant_id, text, opts) do
       {:ok, embedding} ->
         store(tenant_id, article_id, embedding, content_hash)
 

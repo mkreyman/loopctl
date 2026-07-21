@@ -188,6 +188,16 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     # mode. `0` with no `fallback` = "embed worked but recall is broken" — distinct
     # from a keyword_only fallback.
     |> maybe_put(:semantic_result_count, meta[:semantic_result_count])
+    # US-41.4 (AC-41.4.7): the degraded response is EXPLICITLY LABELLED and never a
+    # bare empty list. `degraded` says the semantic tier was unavailable,
+    # `offending_endpoint` NAMES the endpoint the refusal/failure was about (an agent
+    # cannot act on "egress_blocked" alone), and `excluded_tiers` is the reserved,
+    # extensible field — present and EMPTY today, populated by US-41.6 when encrypted
+    # bodies leave the FTS index. Shipping it now keeps the response contract stable
+    # across that change instead of silently redefining an empty result set later.
+    |> maybe_put(:degraded, meta[:degraded])
+    |> maybe_put(:offending_endpoint, meta[:offending_endpoint])
+    |> maybe_put(:excluded_tiers, meta[:excluded_tiers])
     |> maybe_put_fallback(meta[:fallback])
   end
 

@@ -499,7 +499,7 @@ defmodule Loopctl.Memory do
     # generates it ONCE for both halves — #411 Gap 2); otherwise generate here.
     envelope =
       case opt(opts, :embedding, nil) ||
-             Knowledge.generate_embedding(scope.tenant_id, query_text) do
+             Knowledge.generate_embedding(scope.tenant_id, query_text, egress_opts(scope)) do
         {:ok, embedding} ->
           recall_semantic(scope, embedding, k, include_superseded?, on_overload)
 
@@ -1086,7 +1086,7 @@ defmodule Loopctl.Memory do
     # consuming two per-tenant embedding-concurrency slots. Sharing one embedding also
     # makes the two halves' semantic-vs-keyword degradation AGREE (previously the
     # memory side could succeed while the knowledge side independently fell back).
-    embedding_result = Knowledge.generate_embedding(scope.tenant_id, query)
+    embedding_result = Knowledge.generate_embedding(scope.tenant_id, query, egress_opts(scope))
 
     # The two halves run SEQUENTIALLY (memory heavy-read, then the knowledge combined
     # keyword+semantic reads) rather than Task-parallel — a DELIBERATE cap-friendly
@@ -2413,7 +2413,11 @@ defmodule Loopctl.Memory do
   # distance-ordered (nearest first), so the first ELIGIBLE promoted row above threshold
   # wins; missing one (pool dominated by explicit rows) is safe — insert fresh instead.
   defp nearest_live(scope, text) do
-    case Knowledge.generate_embedding(scope.tenant_id, MemorySchema.embedding_input(text)) do
+    case Knowledge.generate_embedding(
+           scope.tenant_id,
+           MemorySchema.embedding_input(text),
+           egress_opts(scope)
+         ) do
       {:error, _reason} ->
         {:error, :embeddings_degraded}
 
@@ -2798,6 +2802,12 @@ defmodule Loopctl.Memory do
   """
   @spec max_list_limit() :: pos_integer()
   def max_list_limit, do: @max_list_limit
+
+  # US-41.4 (AC-41.4.2): thread the memory scope's PROJECT into the egress scope so a
+  # project-only `local_only` marking blocks the outbound embedding call. Memories
+  # frequently have no project, in which case this correctly degrades to the
+  # tenant-wide scope.
+  defp egress_opts(%Scope{project_id: project_id}), do: [project_id: project_id]
 
   defp clamp_k(k), do: k |> to_int(@default_recall_k) |> max(1) |> min(VectorSearch.max_k())
 

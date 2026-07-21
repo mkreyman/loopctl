@@ -21,9 +21,23 @@ defmodule Loopctl.Knowledge.EmbeddingBehaviour do
   In `config/test.exs`, the mock is configured:
 
       config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient
+
+  ## Egress scope (US-41.4, AC-41.4.2)
+
+  The FIRST argument is the `Loopctl.Egress.Scope` the call is made on behalf of
+  — `(tenant_id, project_id)` — so a project-only `local_only` marking is
+  enforced at the provider chokepoint no matter which caller got here. A bare
+  `tenant_id` binary is accepted as shorthand for the tenant-wide scope
+  (`Loopctl.Egress.Scope.coerce/1`), which is the correct reading for memories
+  and for tenant-wide articles.
+
+  Endpoint RESOLUTION stays tenant-scoped: `project_id` narrows only the
+  MARKING, never the endpoint.
   """
 
-  @callback generate_embedding(tenant_id :: Ecto.UUID.t(), text :: String.t()) ::
+  @type scope :: Loopctl.Egress.Scope.t() | Ecto.UUID.t()
+
+  @callback generate_embedding(scope :: scope(), text :: String.t()) ::
               {:ok, [float()]} | {:error, :no_api_key} | {:error, term()}
 
   @doc """
@@ -45,6 +59,6 @@ defmodule Loopctl.Knowledge.EmbeddingBehaviour do
 
   An empty input list returns `{:ok, []}` WITHOUT a provider call (no token spent).
   """
-  @callback generate_embeddings(tenant_id :: Ecto.UUID.t(), texts :: [String.t()]) ::
+  @callback generate_embeddings(scope :: scope(), texts :: [String.t()]) ::
               {:ok, [[float()]]} | {:error, :no_api_key} | {:error, term()}
 end

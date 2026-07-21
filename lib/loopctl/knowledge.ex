@@ -6491,7 +6491,7 @@ defmodule Loopctl.Knowledge do
     # a second outbound provider call; otherwise generate here as before.
     embedding_result =
       case Keyword.get(opts, :embedding) do
-        nil -> try_generate_embedding(tenant_id, query_string, [])
+        nil -> try_generate_embedding(tenant_id, query_string, project_id_opt(opts))
         precomputed -> precomputed
       end
 
@@ -7709,11 +7709,38 @@ defmodule Loopctl.Knowledge do
 
   `opts`:
     * `:timeout` — Task.yield budget in ms (default `#{@embedding_yield_ms}`).
+    * `:scope` — the `Loopctl.Egress.Scope` this call is made on behalf of
+      (US-41.4, AC-41.4.2). Defaults to the TENANT-WIDE scope. Supply it (or
+      `:project_id`) whenever the caller knows the project, so a project-only
+      `local_only` marking is enforced at the provider chokepoint.
+    * `:project_id` — shorthand for building the scope from an already-present
+      search/ingest filter.
   """
   @spec generate_embedding(Ecto.UUID.t(), String.t(), keyword()) ::
           {:ok, [float()]} | {:error, term()}
   def generate_embedding(tenant_id, query_string, opts \\ []) when is_binary(tenant_id) do
     try_generate_embedding(tenant_id, query_string, opts)
+  end
+
+  # US-41.4 (AC-41.4.2): the egress scope this embedding call is made on behalf of.
+  # Endpoint resolution is TENANT-scoped, so the project half narrows only the
+  # local_only MARKING — which `Loopctl.Egress.Policy` resolves MOST-RESTRICTIVE-wins
+  # (project OR tenant). A caller that knows no project (memories, tenant-wide
+  # articles) correctly gets the tenant-wide scope.
+  # Carries an already-present `:project_id` search/ingest filter into the egress
+  # scope without dragging the rest of the sub-search opts along.
+  defp project_id_opt(opts) do
+    case Keyword.get(opts, :project_id) do
+      nil -> []
+      project_id -> [project_id: project_id]
+    end
+  end
+
+  defp egress_scope(tenant_id, opts) do
+    case Keyword.get(opts, :scope) do
+      %EgressScope{} = scope -> scope
+      _ -> EgressScope.new(tenant_id, Keyword.get(opts, :project_id))
+    end
   end
 
   defp try_generate_embedding(tenant_id, query_string, opts) do
@@ -7723,7 +7750,7 @@ defmodule Loopctl.Knowledge do
       {:error, :circuit_open}
     else
       timeout = Keyword.get(opts, :timeout, @embedding_yield_ms)
-      run_embedding_task(tenant_id, query_string, timeout)
+      run_embedding_task(tenant_id, egress_scope(tenant_id, opts), query_string, timeout)
     end
   end
 
@@ -7741,11 +7768,11 @@ defmodule Loopctl.Knowledge do
   # fallback and the workers snooze on — so the interactive path degrades gracefully
   # instead of blocking, and NO circuit-breaker / provider-error signal is recorded
   # (self-imposed backpressure is not a provider failure).
-  defp run_embedding_task(tenant_id, query_string, timeout) do
+  defp run_embedding_task(tenant_id, scope, query_string, timeout) do
     case embedding_concurrency().acquire(tenant_id) do
       :ok ->
         try do
-          run_capped_embedding_task(tenant_id, query_string, timeout)
+          run_capped_embedding_task(tenant_id, scope, query_string, timeout)
         after
           embedding_concurrency().release(tenant_id)
         end
@@ -7755,7 +7782,7 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp run_capped_embedding_task(tenant_id, query_string, timeout) do
+  defp run_capped_embedding_task(tenant_id, scope, query_string, timeout) do
     # Task.Supervisor.async_nolink so an embedding task crash surfaces as
     # {:exit, reason} from Task.yield (the `_ ->` clause -> {:error, :timeout})
     # rather than crashing THIS process (AC-37.2.5). The inner rescue still catches
@@ -7768,7 +7795,7 @@ defmodule Loopctl.Knowledge do
     task =
       Task.Supervisor.async_nolink(Loopctl.Knowledge.EmbeddingTaskSupervisor, fn ->
         try do
-          embedding_client().generate_embedding(tenant_id, query_string)
+          embedding_client().generate_embedding(scope, query_string)
         rescue
           e -> {:error, {:embedding_crash, Exception.message(e)}}
         end
@@ -7814,6 +7841,8 @@ defmodule Loopctl.Knowledge do
 
   `opts`:
     * `:timeout` — Task.yield budget in ms (default `#{@embedding_yield_ms}`).
+    * `:scope` / `:project_id` — the egress scope (US-41.4, AC-41.4.2); see
+      `generate_embedding/3`.
   """
   @spec generate_embeddings(Ecto.UUID.t(), [String.t()], keyword()) ::
           {:ok, [[float()]]} | {:error, term()}
@@ -7833,18 +7862,18 @@ defmodule Loopctl.Knowledge do
       {:error, :circuit_open}
     else
       timeout = Keyword.get(opts, :timeout, @embedding_yield_ms)
-      run_embeddings_task(tenant_id, texts, timeout)
+      run_embeddings_task(tenant_id, egress_scope(tenant_id, opts), texts, timeout)
     end
   end
 
   # Mirrors `run_embedding_task/3`: ONE concurrency slot for the WHOLE batch
   # (US-37.2 — a batch is one outbound call, so it charges one slot), released in an
   # `after`. Over the cap → `{:error, :rate_limited_local}` (worker snoozes).
-  defp run_embeddings_task(tenant_id, texts, timeout) do
+  defp run_embeddings_task(tenant_id, scope, texts, timeout) do
     case embedding_concurrency().acquire(tenant_id) do
       :ok ->
         try do
-          run_capped_embeddings_task(tenant_id, texts, timeout)
+          run_capped_embeddings_task(tenant_id, scope, texts, timeout)
         after
           embedding_concurrency().release(tenant_id)
         end
@@ -7859,13 +7888,13 @@ defmodule Loopctl.Knowledge do
   # signal per batch — a batch failure counts once, not per text. UNLIKE the single
   # path it is EXEMPT from latency-based tripping (a batch's wall-clock is inherently
   # larger than one text; see the success clause below).
-  defp run_capped_embeddings_task(tenant_id, texts, timeout) do
+  defp run_capped_embeddings_task(tenant_id, scope, texts, timeout) do
     started_ms = System.monotonic_time(:millisecond)
 
     task =
       Task.Supervisor.async_nolink(Loopctl.Knowledge.EmbeddingTaskSupervisor, fn ->
         try do
-          embedding_client().generate_embeddings(tenant_id, texts)
+          embedding_client().generate_embeddings(scope, texts)
         rescue
           e -> {:error, {:embedding_crash, Exception.message(e)}}
         end

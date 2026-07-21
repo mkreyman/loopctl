@@ -138,6 +138,27 @@ table and no project endpoint override. Consequence, stated rather than hidden: 
 `egress_blocked`; the remediation is to configure a satisfying endpoint AT TENANT
 level (role `:user`) or clear the project marking.
 
+### Threading the scope
+
+The scope has to REACH the guard, or the resolution above is decorative. The
+first argument of the provider-facing client APIs — `EmbeddingBehaviour`'s
+`generate_embedding/2` / `generate_embeddings/2`, and `Llm.Anthropic.message/5` /
+`call/7` — is therefore the `Loopctl.Egress.Scope`, with a bare `tenant_id`
+accepted as shorthand for the tenant-wide scope (`Scope.coerce/1`). Callers that
+know a project supply it:
+
+- `Knowledge.generate_embedding/3` / `generate_embeddings/3` take `:scope` (or
+  the shorthand `:project_id`) in `opts` and thread it to the client.
+- Combined search carries its existing `:project_id` filter into the scope.
+- `Memory` threads `Memory.Scope.project_id` (memories often have none — the
+  tenant-wide scope is then correct, not a fallback).
+- `ArticleEmbeddingWorker` uses the ARTICLE's `project_id`; the batch worker
+  GROUPS a chunk by `project_id` first, so every provider array call carries
+  exactly ONE scope rather than forcing one marking onto mixed articles.
+
+Key and endpoint resolution stay tenant-scoped throughout — the project half
+narrows only the MARKING.
+
 ## Failure semantics
 
 | return | meaning |
@@ -154,7 +175,11 @@ level (role `:user`) or clear the project marking.
 - **Circuit breaker**: `Knowledge.breaker_countable?/1` returns `false` for both.
   A permanent local configuration refusal must never open the per-tenant breaker
   nor feed the fleet-wide `[:loopctl, :llm, :provider_error]` storm signal. The
-  replacement operator signal is `[:loopctl, :egress, :blocked]`.
+  replacement operator signal is `[:loopctl, :egress, :blocked]`, registered as
+  the `loopctl.egress.blocked.count` Prometheus counter in
+  `Loopctl.Telemetry.ScaleMetrics` (tagged by the bounded verdict `reason` plus a
+  cap-gated `tenant_id`; the tenant-supplied endpoint host is deliberately NOT a
+  label — it lives on the aggregated decision row and in `egress_posture`).
 - **Interactive search**: degrades like circuit-open — keyword fallback, HTTP
   200, never a 500 — with `meta.fallback_reason`, `meta.offending_endpoint`,
   `meta.degraded` and the reserved `meta.excluded_tiers` (present, empty here;
