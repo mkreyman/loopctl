@@ -72,9 +72,17 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
 
   # Use pre-resolved credentials when the caller supplied them (batched callers
   # resolve once — review #19); otherwise resolve per call.
+  #
+  # The `provider: :anthropic` tag is MANDATORY on that fast path (US-41.3 review).
+  # `Anthropic.call/7` takes an explicit key and never consults
+  # `Loopctl.Llm.resolve/2`, so the provider guard on `Anthropic.message/5` does NOT
+  # cover it: an untagged (or `:openai_compatible`-tagged) credential is the
+  # tenant's LOCAL chat key, and POSTing it to the hardcoded api.anthropic.com is
+  # the cross-provider leak AC-41.3.3 forbids. On a mismatch we fall through to the
+  # per-call resolve, which is correct by construction.
   defp classify_via(scope_or_tenant_id, opts, body_fun) do
-    case {opts[:api_key], opts[:model]} do
-      {api_key, model} when is_binary(api_key) and is_binary(model) ->
+    case {opts[:provider], opts[:api_key], opts[:model]} do
+      {:anthropic, api_key, model} when is_binary(api_key) and is_binary(model) ->
         Anthropic.call(scope_or_tenant_id, :classification, api_key, model, body_fun)
 
       _ ->

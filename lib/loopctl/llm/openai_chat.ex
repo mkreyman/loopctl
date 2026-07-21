@@ -124,10 +124,17 @@ defmodule Loopctl.Llm.OpenAiChat do
     end
   end
 
-  @typedoc "A resolved OpenAI-compatible call target (endpoint is the FULL url)."
+  @typedoc """
+  A resolved OpenAI-compatible call target (endpoint is the FULL url).
+
+  `api_key` is `nil` for a KEYLESS endpoint — a local server that serves
+  `/chat/completions` with no auth at all. No authorization header is then sent
+  (see `auth_headers/1`); a fabricated placeholder would be shipped as a Bearer
+  token to the tenant's host for no benefit.
+  """
   @type target :: %{
           base_url: String.t(),
-          api_key: String.t(),
+          api_key: String.t() | nil,
           model: String.t(),
           endpoint: String.t()
         }
@@ -176,7 +183,7 @@ defmodule Loopctl.Llm.OpenAiChat do
           EgressScope.t() | Ecto.UUID.t(),
           Llm.operation(),
           String.t(),
-          String.t(),
+          String.t() | nil,
           String.t(),
           (String.t() -> map()),
           usage_meta(),
@@ -196,8 +203,8 @@ defmodule Loopctl.Llm.OpenAiChat do
         usage_meta \\ %{},
         req_opts \\ []
       )
-      when is_binary(base_url) and is_binary(api_key) and is_binary(model) and
-             is_function(body_fun, 1) do
+      when is_binary(base_url) and is_binary(model) and is_function(body_fun, 1) and
+             (is_binary(api_key) or is_nil(api_key)) do
     body = model |> body_fun.() |> to_chat_completions(model)
 
     post(
@@ -243,7 +250,7 @@ defmodule Loopctl.Llm.OpenAiChat do
     opts =
       [
         json: body,
-        headers: [{"authorization", "Bearer " <> api_key}],
+        headers: auth_headers(api_key),
         retry: :transient,
         max_retries: @default_max_retries,
         receive_timeout: @default_receive_timeout
@@ -255,15 +262,24 @@ defmodule Loopctl.Llm.OpenAiChat do
 
     # NOTE: never log `opts` / `api_key` — the key is a tenant secret. Routed
     # through the SINGLE egress chokepoint (`Loopctl.Provider`), which refuses a
-    # `local_only` scope on a non-local endpoint BEFORE the request is built.
-    case Provider.post(url, opts, %{scope: scope, purpose: :inference}) do
+    # `local_only` scope on a non-local endpoint BEFORE the request is built, and
+    # — because `tenant_supplied_url: true` — also refuses a DENYLISTED host on the
+    # default path. `chat_base_url` is tenant-writable, so without that flag a
+    # role-`:user` key could make loopctl POST tenant content at 169.254.169.254 or
+    # any RFC1918 address and read the outcome back (the default path deliberately
+    # leaves the SSRF denylist "to the callers that own it" — this is that caller).
+    case Provider.post(url, opts, %{
+           scope: scope,
+           purpose: :inference,
+           tenant_supplied_url: true
+         }) do
       {:ok,
        %{status: 200, body: %{"choices" => [%{"message" => %{"content" => text}} | _]} = resp}}
       when is_binary(text) ->
         record_usage_safe(tenant_id, operation, model, resp["usage"], usage_meta)
         {:ok, text}
 
-      {:ok, %{status: 200, body: %{"choices" => _}}} ->
+      {:ok, %{status: 200, body: %{"choices" => _} = resp}} ->
         # 200, OpenAI-ish envelope, but no text content: a refusal / non-text
         # content block / empty choice list. AC-41.3.4: a legible CONFIGURATION
         # error naming the endpoint + model, never a silently-degraded empty result.
@@ -271,10 +287,16 @@ defmodule Loopctl.Llm.OpenAiChat do
           "Loopctl.Llm.OpenAiChat: 200 with no text content (op=#{operation}, endpoint=#{url})"
         )
 
+        # AC-41.3.6: the endpoint answered 200, so TOKENS WERE SPENT even though the
+        # result is unusable. A silently absent usage row is not acceptable — record
+        # it (with whatever usage block the body carried, zero otherwise) BEFORE
+        # returning the shape error.
+        record_usage_safe(tenant_id, operation, model, usage_block(resp), usage_meta)
+
         {:error,
          ShapeError.new(url, model, :non_text_content, "expected choices[0].message.content")}
 
-      {:ok, %{status: 200, body: _body}} ->
+      {:ok, %{status: 200, body: resp}} ->
         # 200 without a `choices` envelope at all: the endpoint is not actually
         # OpenAI-compatible. Deliberately NOT `record_provider_error/1` (a 200 is a
         # provider SUCCESS — see the same reasoning in `Loopctl.Llm.Anthropic`), and
@@ -282,6 +304,10 @@ defmodule Loopctl.Llm.OpenAiChat do
         Logger.warning(
           "Loopctl.Llm.OpenAiChat: 200 with unexpected shape (op=#{operation}, endpoint=#{url})"
         )
+
+        # Same reasoning as the branch above: a 200 spent tokens, so the ledger gets
+        # a row either way (AC-41.3.6).
+        record_usage_safe(tenant_id, operation, model, usage_block(resp), usage_meta)
 
         {:error,
          ShapeError.new(
@@ -388,6 +414,20 @@ defmodule Loopctl.Llm.OpenAiChat do
         :ok
     end
   end
+
+  # The `usage` object out of a 200 body that is NOT the success shape. Bodies on
+  # those paths are arbitrary (a map, a string, a list), so read it defensively —
+  # a missing/odd block simply yields a ZERO-token row.
+  defp usage_block(%{"usage" => %{} = usage}), do: usage
+  defp usage_block(_body), do: nil
+
+  # A keyless endpoint (the epic's headline shape: Ollama / llama.cpp / LM Studio /
+  # vLLM on a private host serving /chat/completions with NO auth) sends NO
+  # authorization header rather than a fabricated placeholder Bearer token.
+  defp auth_headers(api_key) when is_binary(api_key) and api_key != "",
+    do: [{"authorization", "Bearer " <> api_key}]
+
+  defp auth_headers(_keyless), do: []
 
   defp token_counts(%{} = usage) do
     {normalize_token(Map.get(usage, "prompt_tokens", 0)),

@@ -283,7 +283,21 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
       )
 
     # Thread the ONCE-resolved credentials into every classify call (review #19).
-    classify_opts = [api_key: resolved.api_key, model: resolved.model]
+    #
+    # `:provider` travels WITH them (US-41.3 review) and is not optional: the
+    # provider is re-decided PER ARTICLE inside the async stream by
+    # `Loopctl.Knowledge.ClassifierRouter`, a SECOND independent settings read. If
+    # the tenant flips provider mid-batch (or a cluster invalidation / TTL refresh
+    # lands between the two reads), a provider-blind credential would be handed to
+    # whichever sibling the router picked — the exact cross-provider leak AC-41.3.3
+    # forbids. The tag lets the router (and the Anthropic sibling) verify that these
+    # credentials belong to the provider now being dispatched to, and fall back to a
+    # per-call resolve when they do not.
+    classify_opts = [
+      api_key: resolved.api_key,
+      model: resolved.model,
+      provider: resolved.provider
+    ]
 
     batch
     |> Task.async_stream(

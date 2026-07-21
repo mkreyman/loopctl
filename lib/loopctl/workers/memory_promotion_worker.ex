@@ -225,6 +225,13 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
   defp compile_failure_result({:invalid_response_shape, _details} = shape, _attempt),
     do: ShapeError.oban_result(shape)
 
+  # US-41.3: a provider mismatch is a deterministic CONFIGURATION state (the chat
+  # client resolved a DIFFERENT provider than the one it guards). Retrying
+  # re-resolves the same settings and refuses identically, so discard on the first
+  # attempt rather than burning the cap.
+  defp compile_failure_result(:provider_mismatch = reason, _attempt),
+    do: {:discard, {:compile_failed, reason}}
+
   defp compile_failure_result(reason, attempt)
        when is_integer(attempt) and attempt >= @max_compile_attempts do
     {:discard, {:compile_failed, reason}}

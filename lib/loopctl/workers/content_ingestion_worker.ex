@@ -578,6 +578,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # case where the key is removed mid-job between chunks.
   defp permanent_error?(:no_api_key), do: true
 
+  # US-41.3: a provider mismatch (the chat client resolved a DIFFERENT provider than
+  # the one it guards, e.g. after a settings flip mid-job) is a deterministic
+  # CONFIGURATION state — retrying re-resolves the same settings and refuses
+  # identically, burning every attempt for nothing.
+  defp permanent_error?(:provider_mismatch), do: true
+
   defp permanent_error?(_), do: false
 
   @constraint_violation_codes ~w(

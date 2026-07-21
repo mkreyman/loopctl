@@ -16,6 +16,7 @@ defmodule Loopctl.Llm.OpenAiShapeValidationTest do
   alias Loopctl.Knowledge.OpenAiMergeSynthesizer
   alias Loopctl.Llm
   alias Loopctl.Llm.ShapeError
+  alias Loopctl.Memory.Promoter.OpenAiLLM
 
   @base_url "https://local.example.com/v1"
   @model "llama-3.1-8b-instruct"
@@ -118,6 +119,42 @@ defmodule Loopctl.Llm.OpenAiShapeValidationTest do
     end
   end
 
+  describe "truncation is NOT a shape failure (US-41.3 review)" do
+    test "an array cut off mid-object is RECOVERED, exactly like the Anthropic path", %{
+      tenant: tenant
+    } do
+      # A max_tokens truncation: two complete articles, then a third cut off. The
+      # Anthropic extractor salvages these; discarding the tenant's chunk here (a
+      # shape error is PERMANENT) would lose articles for a TOKEN-BUDGET artifact
+      # that local models hit MORE often, under a misleading "CONFIGURATION" message.
+      complete =
+        JSON.encode!([
+          %{title: "One", body: "B1", category: "pattern", tags: []},
+          %{title: "Two", body: "B2", category: "finding", tags: []}
+        ])
+
+      truncated = String.trim_trailing(complete, "]") <> ~s|,{"title":"Three","bo|
+
+      stub_content(truncated)
+
+      assert {:ok, [%{title: "One"}, %{title: "Two"}]} =
+               OpenAiContentExtractor.extract_from_content(tenant.id, "raw")
+    end
+
+    test "an UNRECOVERABLE truncation is reported as :truncated_json, not :not_json", %{
+      tenant: tenant
+    } do
+      stub_content(~s|[{"title":"One","body":"B1","cat|)
+
+      assert {:error, {:invalid_response_shape, details}} =
+               OpenAiContentExtractor.extract_from_content(tenant.id, "raw")
+
+      assert details.reason == :truncated_json
+      assert details.detail =~ "max_tokens"
+      assert_named(details)
+    end
+  end
+
   describe "review extractor" do
     test "prose fails with a named shape error", %{tenant: tenant} do
       stub_content("I couldn't find anything reusable, sorry!")
@@ -182,6 +219,54 @@ defmodule Loopctl.Llm.OpenAiShapeValidationTest do
 
       assert details.reason == :missing_required_fields
       assert_named(details)
+    end
+  end
+
+  describe "memory promotion — the most attacker-influenced payload" do
+    test "prose fails with a named shape error instead of an untyped retry", %{tenant: tenant} do
+      stub_content("Sure, here are the durable facts I noticed: ...")
+
+      assert {:error, {:invalid_response_shape, details}} =
+               OpenAiLLM.extract(tenant.id, "[user] hi\n[assistant] hello")
+
+      assert details.reason == :not_json
+      assert_named(details)
+    end
+
+    test "a PARTIALLY malformed candidate list is refused, never silently subset-promoted", %{
+      tenant: tenant
+    } do
+      stub_content(
+        JSON.encode!([
+          %{text: "Mark prefers Elixir", confidence: 0.9},
+          %{text: "", confidence: "not a number"}
+        ])
+      )
+
+      assert {:error, {:invalid_response_shape, details}} =
+               OpenAiLLM.extract(tenant.id, "[user] hi\n[assistant] hello")
+
+      assert details.reason == :missing_required_fields
+      assert details.detail =~ "PARTIAL promotion"
+    end
+
+    test "an EXPLICIT empty array and a well-formed list both pass through unchanged", %{
+      tenant: tenant
+    } do
+      stub_content("[]")
+      assert {:ok, "[]"} = OpenAiLLM.extract(tenant.id, "[user] a\n[assistant] b")
+
+      valid = JSON.encode!([%{text: "A durable fact", confidence: 0.8}])
+      stub_content(valid)
+      assert {:ok, ^valid} = OpenAiLLM.extract(tenant.id, "[user] a\n[assistant] b")
+    end
+
+    test "the worker CANCELS a shape failure instead of re-POSTing the session content" do
+      # The promoter's own parser errors (:unexpected_llm_output /
+      # {:json_parse_error, _}) fall through to the retry clause; a shape error must
+      # not.
+      shape = ShapeError.new(@endpoint, @model, :not_json, nil)
+      assert {:cancel, _} = ShapeError.oban_result(shape)
     end
   end
 

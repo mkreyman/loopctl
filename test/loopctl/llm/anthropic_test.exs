@@ -315,4 +315,55 @@ defmodule Loopctl.Llm.AnthropicTest do
       assert {:ok, "ok"} = run(tenant)
     end
   end
+
+  describe "provider guard (US-41.3 review, AC-41.3.3)" do
+    # `Llm.resolve/2` returns the tenant's LOCAL `chat_api_key` for an
+    # `openai_compatible` tenant. A provider-BLIND match would POST it to the
+    # hardcoded https://api.anthropic.com/v1 as `x-api-key` — a cross-provider
+    # credential leak the egress guard cannot catch, because the vendor host is the
+    # DEFAULT. The mirror direction (`OpenAiChat.resolve_target/2`) was already
+    # guarded; the defence must be symmetric.
+    test "refuses :provider_mismatch for an openai_compatible tenant and sends NOTHING" do
+      tenant = fixture(:tenant)
+      test_pid = self()
+
+      {:ok, _} =
+        Llm.upsert_settings(tenant.id, %{
+          "chat_provider" => "openai_compatible",
+          "chat_base_url" => "https://llm.example.com/v1",
+          "extraction_model" => "Qwen/Qwen2.5-7B-Instruct",
+          "chat_api_key" => "tenant-local-chat-key"
+        })
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        send(test_pid, {:leaked, conn.req_headers})
+        Req.Test.json(conn, %{"content" => [%{"type" => "text", "text" => "ok"}]})
+      end)
+
+      assert {:error, :provider_mismatch} = run(tenant)
+      refute_received {:leaked, _headers}
+    end
+
+    # A KEYLESS local endpoint resolves `api_key: nil`; the old provider-blind clause
+    # matched it too and threaded a nil key into the Anthropic request.
+    test "refuses a KEYLESS openai_compatible tenant rather than sending a nil key" do
+      tenant = fixture(:tenant)
+      test_pid = self()
+
+      {:ok, _} =
+        Llm.upsert_settings(tenant.id, %{
+          "chat_provider" => "openai_compatible",
+          "chat_base_url" => "https://llm.example.com/v1",
+          "extraction_model" => "Qwen/Qwen2.5-7B-Instruct"
+        })
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        send(test_pid, :unexpected_http_call)
+        Req.Test.json(conn, %{"content" => [%{"type" => "text", "text" => "ok"}]})
+      end)
+
+      assert {:error, :provider_mismatch} = run(tenant)
+      refute_received :unexpected_http_call
+    end
+  end
 end

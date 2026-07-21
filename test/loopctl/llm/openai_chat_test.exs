@@ -178,7 +178,93 @@ defmodule Loopctl.Llm.OpenAiChatTest do
         refute inspect(details) =~ "sk-leaky-fragment"
       end)
 
-      assert %{data: []} = Llm.usage_summary(tenant.id, [])
+      # AC-41.3.6: the endpoint ANSWERED 200, so tokens were spent even though the
+      # body is unusable — a silently missing usage row is not acceptable.
+      assert %{data: [row]} = Llm.usage_summary(tenant.id, [])
+      assert row.provider == "openai_compatible"
+      assert row.model == "llama-3.1-8b-instruct"
+      assert row.input_tokens == 0
+      assert row.output_tokens == 0
+    end
+
+    test "a 200 with a choices envelope but no text content records the usage it reports" do
+      tenant = openai_tenant()
+
+      Req.Test.stub(Loopctl.Llm.OpenAiChat, fn conn ->
+        Req.Test.json(conn, %{
+          "choices" => [%{"message" => %{"role" => "assistant", "refusal" => "no"}}],
+          "usage" => %{"prompt_tokens" => 31, "completion_tokens" => 2}
+        })
+      end)
+
+      capture_log(fn ->
+        assert {:error, {:invalid_response_shape, details}} =
+                 OpenAiChat.message(tenant.id, :extraction, body_fun())
+
+        assert details.reason == :non_text_content
+      end)
+
+      assert %{data: [row]} = Llm.usage_summary(tenant.id, [])
+      assert row.provider == "openai_compatible"
+      assert row.input_tokens == 31
+      assert row.output_tokens == 2
+    end
+  end
+
+  describe "SSRF (chat_base_url is TENANT-WRITABLE)" do
+    test "a private-range endpoint is refused BEFORE the request is built" do
+      # `chat_base_url` is tenant data, so this client owns the SSRF denylist on the
+      # default (non-local_only) egress path. Without it a role :user key could make
+      # loopctl POST tenant content at the cloud metadata endpoint.
+      tenant = openai_tenant(%{"chat_base_url" => "http://169.254.169.254/v1"})
+
+      # No Req.Test stub is installed: reaching the transport at all would raise.
+      capture_log(fn ->
+        assert {:error, {:egress_blocked, details}} =
+                 OpenAiChat.message(tenant.id, :extraction, body_fun())
+
+        assert details.verdict == :denylisted
+      end)
+    end
+
+    test "a public vendor endpoint on the SAME default path is untouched" do
+      # The refusal must be scoped to the denylist, never a new failure mode for
+      # ordinary hosts (AC-41.4.12's default-off promise).
+      tenant = openai_tenant()
+      stub_completion("ANSWER", nil)
+
+      assert {:ok, "ANSWER"} = OpenAiChat.message(tenant.id, :extraction, body_fun())
+    end
+  end
+
+  describe "keyless endpoints (US-41.3 review)" do
+    test "a tenant with no chat key resolves and posts with NO authorization header" do
+      tenant = fixture(:tenant)
+
+      {:ok, _} =
+        Llm.upsert_settings(tenant.id, %{
+          "chat_provider" => "openai_compatible",
+          "chat_base_url" => @base_url,
+          "extraction_model" => "llama-3.1-8b-instruct"
+        })
+
+      stub_completion("ANSWER", nil)
+
+      assert {:ok, "ANSWER"} = OpenAiChat.message(tenant.id, :extraction, body_fun())
+
+      assert_received {:openai_request, _path, headers, _body}
+      refute List.keyfind(headers, "authorization", 0)
+    end
+  end
+
+  describe "model resolution is provider-aware (US-41.3 review)" do
+    test "an unset per-operation model follows the tenant's chat model, NOT the Anthropic default" do
+      tenant = openai_tenant()
+
+      # `@default_model` is "claude-haiku-…" — posting that to a local server would
+      # fail every call while a probe of some other model reported green.
+      assert {:ok, %{model: "llama-3.1-8b-instruct"}} = Llm.resolve(tenant.id, :classification)
+      assert {:ok, %{model: "llama-3.1-8b-instruct"}} = Llm.resolve(tenant.id, :merge)
     end
   end
 

@@ -89,9 +89,13 @@ defmodule Loopctl.Llm do
   matches. `:base_url` is the SINGLE source of the endpoint actually posted to,
   read by `Loopctl.Egress.resolved_endpoints/1` so the posture report and the
   egress guard can never vet different URLs (AC-41.4.9).
+
+  `:api_key` is `nil` ONLY for a KEYLESS `:openai_compatible` endpoint (a local
+  server with no auth). Both vendor paths always carry a key — a missing one is
+  `{:error, :no_api_key}`, never a nil credential.
   """
   @type resolved :: %{
-          api_key: String.t(),
+          api_key: String.t() | nil,
           model: String.t(),
           provider: chat_provider() | :embedding,
           base_url: String.t() | nil
@@ -133,12 +137,21 @@ defmodule Loopctl.Llm do
     end
   end
 
-  # Direct, UNCACHED DB read of the tenant's settings row. Used on the cache-miss
-  # read-through path AND by the write path (`upsert_settings/2`), which must fetch
-  # the existing row uncached so a cached (possibly negative) entry can never leak
-  # into the insert_or_update changeset.
+  @doc """
+  Direct, UNCACHED DB read of the tenant's settings row.
+
+  Every WRITE path must use this rather than `get_settings/1`: the cache is
+  node-local ETS, invalidated by a PubSub broadcast with a TTL backstop, so on a
+  multi-node deploy that dropped a peer's broadcast a cached struct can be stale
+  for up to the TTL. That is tolerable for a read; it is NOT tolerable for a
+  decision that gates a write — `upsert_settings/2` would seed the
+  `insert_or_update` changeset from a stale (or negative) struct, and
+  `Loopctl.Llm.ChatProbe.preflight/2` would compare the PATCH against a stale
+  endpoint (skipping the AC-41.3.3 credential-acknowledgement rule) and probe a
+  stale key.
+  """
   @spec load_settings(Ecto.UUID.t()) :: TenantLlmSettings.t() | nil
-  defp load_settings(tenant_id) when is_binary(tenant_id) do
+  def load_settings(tenant_id) when is_binary(tenant_id) do
     AdminRepo.get_by(TenantLlmSettings, tenant_id: tenant_id)
   end
 
@@ -242,12 +255,20 @@ defmodule Loopctl.Llm do
   # this ordering closes — an `openai_compatible` tenant must NEVER be handed the
   # Anthropic `api_key`, and vice versa.
   defp resolve_chat(%TenantLlmSettings{chat_provider: "openai_compatible"} = settings, operation) do
-    case {settings.chat_api_key, settings.chat_base_url} do
-      {key, base_url} when is_binary(key) and key != "" and is_binary(base_url) ->
+    # The credential is OPTIONAL here (a keyless local server is the epic's headline
+    # deployment shape), but the MODEL is not: the server default is an Anthropic
+    # model id and POSTing it to a tenant's local server would fail every call while
+    # the config-time probe reported green. `TenantLlmSettings` requires a model
+    # whenever this provider is selected, so this clause is the defensive backstop
+    # for a legacy/hand-written row — reported as the same "BYO not configured"
+    # terminal every caller already handles (422 at the boundary, discard in a
+    # worker) rather than a brand-new error term.
+    case {settings.chat_base_url, model_for(settings, operation)} do
+      {base_url, model} when is_binary(base_url) and is_binary(model) ->
         {:ok,
          %{
-           api_key: key,
-           model: model_for(settings, operation),
+           api_key: present(settings.chat_api_key),
+           model: model,
            provider: :openai_compatible,
            base_url: base_url
          }}
@@ -537,8 +558,8 @@ defmodule Loopctl.Llm do
 
   Opts: `:from`, `:to` (DateTime), `:limit` (default #{@default_summary_limit},
   clamped to #{@max_summary_limit}), `:offset` (default 0). Rows are ordered
-  `day desc` with an `(operation, model, source_type)` tiebreaker for a stable
-  page across equal days.
+  `day desc` with an `(operation, model, provider, source_type)` tiebreaker —
+  every grouped dimension — for a stable page across equal days.
 
   Returns `%{data: [row], meta: %{limit, offset, total_count}}` where each row is
   `%{day, operation, model, provider, source_type, input_tokens, output_tokens,
@@ -589,10 +610,17 @@ defmodule Loopctl.Llm do
 
     rows_query =
       from(g in subquery(grouped),
+        # EVERY grouped dimension participates in the ordering. `provider` joined
+        # the group_by in US-41.3, and omitting it from the sort leaves two rows
+        # that differ ONLY by provider (same tenant, same day, same model id, same
+        # source_type — a tenant that switched providers mid-day) tied on every
+        # ordering key, which Postgres may then order arbitrarily BETWEEN
+        # LIMIT/OFFSET pages: a duplicated or dropped row.
         order_by: [
           desc: g.day,
           asc: g.operation,
           asc: g.model,
+          asc: g.provider,
           asc: g.source_type
         ],
         limit: ^limit,
@@ -653,19 +681,54 @@ defmodule Loopctl.Llm do
   defp to_int(n) when is_integer(n), do: n
   defp to_int(nil), do: 0
 
-  defp model_for(%TenantLlmSettings{} = s, :extraction),
-    do: s.extraction_model || default_model(:extraction)
+  @doc """
+  The model `operation` resolves to for `settings` — the SINGLE model-resolution
+  point, shared by `resolve/2` and by the config-time probe
+  (`Loopctl.Llm.ChatProbe`).
 
-  defp model_for(%TenantLlmSettings{} = s, :classification),
-    do: s.classification_model || default_model(:classification)
+  Public precisely so the probe exercises the model a REAL call will use. A probe
+  that validated some other model id (a hardcoded `gpt-4o-mini`, say) would save a
+  provably broken configuration green: the tenant's local server would then be
+  handed the per-operation model this function actually returns.
 
-  defp model_for(%TenantLlmSettings{} = s, :merge),
-    do: s.merge_model || default_model(:merge)
-
-  defp model_for(%TenantLlmSettings{} = s, :embedding),
+  Provider-aware by construction (US-41.3 review): `@default_model` is an ANTHROPIC
+  model id, so it is NEVER handed to an OpenAI-compatible endpoint. On that
+  provider a per-operation model falls back to `extraction_model` — the model the
+  tenant declared for the endpoint — and to `nil` when the tenant declared none,
+  which `resolve/2` turns into a clean "not configured" refusal instead of a call
+  that cannot succeed.
+  """
+  @spec model_for(TenantLlmSettings.t(), operation()) :: String.t() | nil
+  def model_for(%TenantLlmSettings{} = s, :embedding),
     do: s.embedding_model || default_model(:embedding)
 
+  def model_for(%TenantLlmSettings{} = s, operation) when operation in @llm_operations do
+    per_operation_model(s, operation) || chat_model_fallback(s, operation)
+  end
+
+  defp per_operation_model(%TenantLlmSettings{} = s, :extraction), do: s.extraction_model
+  defp per_operation_model(%TenantLlmSettings{} = s, :classification), do: s.classification_model
+  defp per_operation_model(%TenantLlmSettings{} = s, :merge), do: s.merge_model
+
+  # On the OpenAI-compatible provider the fallback is the tenant's OWN declared
+  # chat model, never the Anthropic server default.
+  defp chat_model_fallback(
+         %TenantLlmSettings{chat_provider: "openai_compatible"} = s,
+         _operation
+       ),
+       do: s.extraction_model
+
+  defp chat_model_fallback(_settings, operation), do: default_model(operation)
+
   defp default_model(operation), do: Map.fetch!(@default_models, operation)
+
+  # `nil` for an absent-or-blank string; used wherever an OPTIONAL stored secret is
+  # normalized (a blank `chat_api_key` is the same as none — a keyless endpoint).
+  defp present(value) when is_binary(value) do
+    if String.trim(value) == "", do: nil, else: value
+  end
+
+  defp present(_value), do: nil
 
   defp has_key?(key), do: is_binary(key) and key != ""
 

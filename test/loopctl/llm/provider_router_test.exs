@@ -173,6 +173,51 @@ defmodule Loopctl.Llm.ProviderRouterTest do
       assert row_a.provider == "anthropic"
       assert row_b.provider == "openai_compatible"
     end
+
+    # US-41.3 review: `KnowledgeReclassifyWorker` resolves credentials ONCE per kick
+    # and the router re-decides the PROVIDER per article from a SECOND, independently
+    # cached settings read. The two CAN disagree — a mid-batch provider flip, a
+    # cluster invalidation, a TTL refresh — and the pre-resolved credential would
+    # then be handed to the wrong sibling. The router must forward pre-resolved
+    # credentials only when the caller TAGGED them with the provider now dispatching.
+    test "ClassifierRouter STRIPS pre-resolved credentials tagged for another provider" do
+      tenant = openai_tenant()
+      test_pid = self()
+
+      Req.Test.stub(Anthropic, fn conn ->
+        send(test_pid, :anthropic_was_called)
+        Req.Test.json(conn, %{"content" => [%{"type" => "text", "text" => "{}"}]})
+      end)
+
+      Req.Test.stub(Loopctl.Llm.OpenAiChat, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:openai, conn.req_headers, JSON.decode!(raw)})
+
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{"message" => %{"content" => ~s({"category":"pattern","confidence":0.9})}}
+          ],
+          "usage" => %{"prompt_tokens" => 1, "completion_tokens" => 1}
+        })
+      end)
+
+      # The batch resolved against Anthropic; the tenant now resolves openai_compatible.
+      assert {:ok, %{category: :pattern}} =
+               ClassifierRouter.classify(tenant.id, "T", "B",
+                 provider: :anthropic,
+                 api_key: "sk-ant-batch-resolved",
+                 model: "claude-haiku-4-5-20251001"
+               )
+
+      refute_received :anthropic_was_called
+      assert_received {:openai, headers, body}
+
+      # The OpenAI sibling re-resolved its OWN credential and model — the Anthropic
+      # key never left, and the Anthropic MODEL id was not posted to the local server.
+      assert {"authorization", "Bearer local-tenant-b-secret"} in headers
+      assert body["model"] == "llama-3.1-8b-instruct"
+      refute inspect(headers) =~ "sk-ant-batch-resolved"
+    end
   end
 
   describe "default unchanged (AC-41.3.7)" do

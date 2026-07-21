@@ -29,15 +29,24 @@ defmodule Loopctl.Llm.TenantLlmSettings do
 
   use Loopctl.Schema
 
+  alias Loopctl.Llm.ChatBaseUrl
+
   @type t :: %__MODULE__{}
 
-  # A plausible Anthropic model id — non-empty, bounded, no whitespace. We do NOT
-  # restrict to a known-model allow-list: the tenant may use any model their key
-  # permits (Sonnet, Opus, Haiku, dated snapshots, future ids).
-  @model_format ~r/^[A-Za-z0-9._:-]+$/
+  # A plausible model id — non-empty, bounded, no whitespace. We do NOT restrict to
+  # a known-model allow-list: the tenant may use any model their endpoint serves.
+  #
+  # `/` IS allowed (US-41.3 review): the class was calibrated for Anthropic ids
+  # (`claude-haiku-4-5-20251001`), but US-41.3 makes `extraction_model` MANDATORY
+  # for `openai_compatible` and sends it verbatim as the OpenAI `model` field,
+  # which must match the SERVED name exactly. vLLM / TGI / LM Studio / llama.cpp
+  # overwhelmingly serve HuggingFace repo ids —
+  # `meta-llama/Meta-Llama-3-8B-Instruct`, `Qwen/Qwen2.5-7B-Instruct` — so a class
+  # without `/` rejects the epic's headline deployment shape at the changeset.
+  @model_format ~r{^[A-Za-z0-9._:/-]+$}
   @max_model_length 200
   @max_api_key_length 500
-  @max_base_url_length 500
+  @max_base_url_length ChatBaseUrl.max_length()
 
   # US-41.3: the chat surface's provider. NULL is the DEFAULT and means Anthropic
   # with the hardcoded endpoint (AC-41.3.7) — a tenant that configures nothing is
@@ -166,24 +175,24 @@ defmodule Loopctl.Llm.TenantLlmSettings do
     |> validate_length(:chat_base_url, min: 1, max: @max_base_url_length)
     |> validate_base_url()
     |> validate_provider_requires_url()
+    |> validate_provider_requires_model()
   end
 
+  # Shape ONLY, through the SINGLE `Loopctl.Llm.ChatBaseUrl` validator that
+  # `Loopctl.Llm.ChatProbe` also uses — a second copy of the URL rules is exactly
+  # how the query-string/userinfo hole got in. Locality (is plaintext http allowed
+  # for THIS host?) is an EGRESS decision and stays with the one policy module,
+  # consulted by the probe on the write path.
   defp validate_base_url(changeset) do
     case get_change(changeset, :chat_base_url) do
       nil ->
         changeset
 
-      value when is_binary(value) ->
-        uri = URI.parse(String.trim(value))
-
-        if uri.scheme in ["http", "https"] and is_binary(uri.host) and uri.host != "" do
-          put_change(changeset, :chat_base_url, String.trim_trailing(String.trim(value), "/"))
-        else
-          add_error(changeset, :chat_base_url, "must be an absolute http(s) URL")
+      value ->
+        case ChatBaseUrl.normalize(value) do
+          {:ok, normalized} -> put_change(changeset, :chat_base_url, normalized)
+          {:error, reason} -> add_error(changeset, :chat_base_url, ChatBaseUrl.message(reason))
         end
-
-      _other ->
-        add_error(changeset, :chat_base_url, "must be a string")
     end
   end
 
@@ -198,11 +207,34 @@ defmodule Loopctl.Llm.TenantLlmSettings do
     end
   end
 
+  # US-41.3 review: selecting `openai_compatible` WITHOUT a model is a provably
+  # broken configuration. The per-operation server default is an ANTHROPIC model id
+  # (`Loopctl.Llm`'s `@default_model`), which a tenant's local server will reject on
+  # every call — so `extraction_model` is required here, and
+  # `Loopctl.Llm.model_for/2` uses it as the per-operation fallback on this
+  # provider. `classification_model` / `merge_model` stay optional: unset means
+  # "the same model as extraction", never the Anthropic default.
+  defp validate_provider_requires_model(changeset) do
+    provider = get_field(changeset, :chat_provider)
+    model = get_field(changeset, :extraction_model)
+
+    if provider == "openai_compatible" and (is_nil(model) or model == "") do
+      add_error(
+        changeset,
+        :extraction_model,
+        "is required when chat_provider is openai_compatible (the server default is an " <>
+          "Anthropic model id, which an OpenAI-compatible endpoint cannot serve)"
+      )
+    else
+      changeset
+    end
+  end
+
   defp validate_models(changeset) do
     Enum.reduce(@model_fields, changeset, fn field, acc ->
       acc
       |> validate_format(field, @model_format,
-        message: "must be a plausible model id (letters, digits, . _ : -)"
+        message: "must be a plausible model id (letters, digits, . _ : - /)"
       )
       |> validate_length(field, min: 1, max: @max_model_length)
     end)

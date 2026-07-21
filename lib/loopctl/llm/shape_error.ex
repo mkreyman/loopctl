@@ -36,6 +36,10 @@ defmodule Loopctl.Llm.ShapeError do
   @typedoc "The bounded set of shape-failure reasons."
   @type reason ::
           :not_json
+          # The response STARTS as the requested JSON but was cut off (max_tokens)
+          # and no complete leading object could be recovered. Distinct from
+          # `:not_json` (prose) because the remediation is the TOKEN BUDGET.
+          | :truncated_json
           | :not_a_list
           | :no_valid_items
           | :missing_required_fields

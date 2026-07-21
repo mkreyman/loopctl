@@ -3507,8 +3507,8 @@ defmodule Loopctl.ApiSpec.Schemas do
       title: "LlmUsageResponse",
       description:
         "Per-tenant LLM token-usage summary, grouped by operation + model + " <>
-          "source_type + day over an optional date range. Record-only — there is " <>
-          "no budget enforcement.",
+          "provider + source_type + day over an optional date range. Record-only " <>
+          "— there is no budget enforcement.",
       type: :object,
       properties: %{
         data: %Schema{
@@ -3522,6 +3522,16 @@ defmodule Loopctl.ApiSpec.Schemas do
                 enum: ["extraction", "classification", "merge", "embedding"]
               },
               model: %Schema{type: :string},
+              # US-41.3 (AC-41.3.6): the ledger is provider-attributed, so a
+              # tenant's own OpenAI-compatible endpoint spend is distinguishable
+              # from Anthropic's and from embedding spend.
+              provider: %Schema{
+                type: :string,
+                enum: ["anthropic", "openai_compatible", "embedding"],
+                description:
+                  "Which provider surface the tokens were spent on. Rows recorded " <>
+                    "before US-41.3 are attributed by their operation."
+              },
               source_type: %Schema{type: :string, nullable: true},
               input_tokens: %Schema{type: :integer},
               output_tokens: %Schema{type: :integer},

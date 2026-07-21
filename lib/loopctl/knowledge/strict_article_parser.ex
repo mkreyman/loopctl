@@ -26,6 +26,20 @@ defmodule Loopctl.Knowledge.StrictArticleParser do
 
   Every failure is a `Loopctl.Llm.ShapeError` naming the endpoint and the model,
   and is PERMANENT (never retried blindly).
+
+  ## Truncation is NOT a shape failure
+
+  A response cut off mid-array by `max_tokens` is a TOKEN-BUDGET artifact, not the
+  "your model cannot produce the structure" configuration problem this module
+  reports — and local models, with smaller context windows, hit it MORE often than
+  Claude. `Loopctl.Knowledge.ClaudeContentExtractor` recovers those by closing the
+  array after the last complete object; dropping that recovery here would
+  permanently `{:discard}` a tenant's chunk (via `permanent_error?/1`) that the
+  Anthropic path would have salvaged, under a misleading "this is a CONFIGURATION
+  problem" message. So truncation is recovered the same way, and only an
+  UNRECOVERABLE truncation is reported — as its own `:truncated_json` reason whose
+  remediation is the token budget, distinct from `:not_json` (the model answered
+  prose).
   """
 
   require Logger
@@ -54,7 +68,9 @@ defmodule Loopctl.Knowledge.StrictArticleParser do
   @spec parse(String.t() | nil, target()) ::
           {:ok, [map()]} | {:error, ShapeError.t()}
   def parse(text, %{endpoint: endpoint, model: model} = target) when is_binary(text) do
-    case text |> strip_markdown_fences() |> JSON.decode() do
+    stripped = strip_markdown_fences(text)
+
+    case JSON.decode(stripped) do
       {:ok, articles} when is_list(articles) ->
         normalize_all(articles, target)
 
@@ -66,19 +82,73 @@ defmodule Loopctl.Knowledge.StrictArticleParser do
          ShapeError.new(endpoint, model, :not_a_list, "expected a JSON array of article objects")}
 
       {:error, _reason} ->
-        {:error,
-         ShapeError.new(
-           endpoint,
-           model,
-           :not_json,
-           "the response was not JSON (a local model returning prose instead of the " <>
-             "requested JSON array is the usual cause)"
-         )}
+        undecodable(stripped, target)
     end
   end
 
   def parse(_text, %{endpoint: endpoint, model: model}),
     do: {:error, ShapeError.new(endpoint, model, :not_json, "the response was not text")}
+
+  # Text that did not decode. Either it was TRUNCATED mid-array (recoverable, and
+  # the same recovery the Anthropic path performs) or it was never JSON at all.
+  defp undecodable(text, %{endpoint: endpoint, model: model} = target) do
+    case recover_truncated_json(text) do
+      {:ok, articles} ->
+        Logger.info(
+          "StrictArticleParser: recovered #{length(articles)} articles from truncated JSON " <>
+            "(endpoint=#{endpoint} model=#{model})"
+        )
+
+        normalize_all(articles, target)
+
+      :error ->
+        {:error, ShapeError.new(endpoint, model, reason_for(text), detail_for(text))}
+    end
+  end
+
+  defp reason_for(text) do
+    if json_ish?(text), do: :truncated_json, else: :not_json
+  end
+
+  defp detail_for(text) do
+    if json_ish?(text) do
+      "the response STARTS as the requested JSON but does not parse and no complete " <>
+        "leading object could be recovered — the usual cause is the response being cut " <>
+        "off at the model's max_tokens, not a structure the model cannot produce"
+    else
+      "the response was not JSON (a local model returning prose instead of the " <>
+        "requested JSON array is the usual cause)"
+    end
+  end
+
+  defp json_ish?(text), do: String.starts_with?(text, ["[", "{"])
+
+  # Close the array after the last complete object, newest-first. Mirrors
+  # `Loopctl.Knowledge.ClaudeContentExtractor.recover_truncated_json/1`; the
+  # recovered list is then held to the SAME strict normalization as any other, so a
+  # recovered element that is malformed still refuses rather than writing a partial.
+  defp recover_truncated_json(text) do
+    array =
+      if String.starts_with?(text, "[") do
+        text
+      else
+        case Regex.run(~r/\[.*$/s, text) do
+          [match] -> match
+          _ -> text
+        end
+      end
+
+    ~r/\}/
+    |> Regex.scan(array, return: :index)
+    |> Enum.map(fn [{pos, _len}] -> pos end)
+    |> Enum.reverse()
+    |> Enum.find_value(:error, fn pos ->
+      case JSON.decode(String.slice(array, 0, pos + 1) <> "]") do
+        {:ok, [_ | _] = articles} -> {:ok, articles}
+        _ -> nil
+      end
+    end)
+  end
 
   defp normalize_all([], _target), do: {:ok, []}
 

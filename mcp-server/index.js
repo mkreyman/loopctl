@@ -5127,9 +5127,10 @@ const TOOLS = [
       "(extraction_model / classification_model / merge_model / embedding_model) are " +
       "free-form (any model the key permits) and default server-side when omitted. Typical " +
       'onboarding call: set_llm_config({api_key: "sk-ant-...", embedding_api_key: "sk-..."}). ' +
-      "PRIVATE TIER: set chat_provider 'openai_compatible' + chat_base_url + chat_api_key " +
-      "to run extraction/classification/merge against YOUR OWN endpoint so document text " +
-      "never leaves your boundary; the endpoint is probed before it is saved. " +
+      "PRIVATE TIER: set chat_provider 'openai_compatible' + chat_base_url + " +
+      "extraction_model (+ chat_api_key unless your server is keyless) to run " +
+      "extraction/classification/merge against YOUR OWN endpoint so document text " +
+      "never leaves your boundary; every model it resolves to is probed before it is saved. " +
       "Verify anytime with llm_config (has_api_key / has_embedding_key / chat_provider). REQUIRES your " +
       "user-role key LOOPCTL_USER_KEY (minted by the human-anchored signup ceremony); if it " +
       "is unset the tool fails fast telling you to set it.",
@@ -5144,7 +5145,14 @@ const TOOLS = [
         },
         extraction_model: {
           type: "string",
-          description: "Model id for knowledge extraction (null → server default).",
+          description:
+            "Model id for knowledge extraction (null → server default). REQUIRED with " +
+            "chat_provider 'openai_compatible': the server default is an Anthropic model " +
+            "id your endpoint cannot serve, so there is no safe fallback. It is also the " +
+            "fallback for classification_model / merge_model on that provider. " +
+            "HuggingFace repo ids are valid (e.g. 'meta-llama/Meta-Llama-3-8B-Instruct') " +
+            "— it is sent verbatim as the OpenAI `model` field, so it must match the name " +
+            "your server actually serves.",
         },
         classification_model: {
           type: "string",
@@ -5182,14 +5190,23 @@ const TOOLS = [
             "API base of your OpenAI-compatible server, e.g. " +
             "'https://llm.example.internal/v1' (the client appends /chat/completions). " +
             "Required with chat_provider 'openai_compatible'. PROBED with a trivial " +
-            "completion BEFORE it is saved: an unreachable host, a rejected credential " +
-            "or a non-OpenAI-compatible response is a 422 and NOTHING is persisted.",
+            "completion per resolved model BEFORE it is saved: an unreachable host, a " +
+            "rejected credential or a non-OpenAI-compatible response is a 422 and NOTHING " +
+            "is persisted. A host resolving into a private/loopback/link-local range is " +
+            "refused outright unless the OPERATOR allowlisted it (SSRF guard). Must be a " +
+            "BARE base: no query string, no fragment, no user:pass@ credentials (this " +
+            "column is NOT encrypted — anything in the URL is stored and echoed back). " +
+            "Plaintext http is accepted ONLY for a host the egress policy classifies " +
+            "network-local; a public http:// endpoint is refused because the request " +
+            "carries your key and your documents' full text in cleartext.",
         },
         chat_api_key: {
           type: "string",
           description:
             "Credential for chat_base_url. Write-only; stored encrypted, never returned. " +
-            "SEPARATE from api_key — your Anthropic key is never sent to your endpoint.",
+            "SEPARATE from api_key — your Anthropic key is never sent to your endpoint. " +
+            "OPTIONAL: a local server that serves /chat/completions with no auth is " +
+            "configured by omitting this, and no authorization header is then sent.",
         },
         acknowledge_key_transmission: {
           type: "boolean",

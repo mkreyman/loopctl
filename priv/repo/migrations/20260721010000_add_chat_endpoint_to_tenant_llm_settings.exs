@@ -17,8 +17,16 @@ defmodule Loopctl.Repo.Migrations.AddChatEndpointToTenantLlmSettings do
   #
   # `llm_usage_events.provider` makes the usage ledger provider-attributed, so a
   # local endpoint's rows are distinguishable from Anthropic's instead of silently
-  # blending (AC-41.3.6). Existing rows are all Anthropic-billed, hence the
-  # backfill default.
+  # blending (AC-41.3.6).
+  #
+  # The column default backfills every PRE-EXISTING row as "anthropic", which is
+  # right for the three chat operations but WRONG for `operation = 'embedding'`:
+  # embedding spend was never Anthropic's, and new embedding rows are written with
+  # provider "embedding" (`Loopctl.Knowledge.EmbeddingClient`). Left uncorrected,
+  # identical embedding work would split across two provider labels at an arbitrary
+  # deploy boundary and historical OpenAI embedding spend would be reported under
+  # Anthropic — the opposite of the attributed ledger AC-41.3.6 asks for. So the
+  # backfill is corrected in the SAME migration, before any read can see it.
 
   def change do
     alter table(:tenant_llm_settings) do
@@ -30,5 +38,13 @@ defmodule Loopctl.Repo.Migrations.AddChatEndpointToTenantLlmSettings do
     alter table(:llm_usage_events) do
       add :provider, :string, null: false, default: "anthropic"
     end
+
+    # Re-attribute the historical embedding rows. Reversible-safe: `up`-only work
+    # inside `change/0` is fine here because the DOWN path drops the column
+    # entirely, so the corrected values are discarded with it.
+    execute(
+      "UPDATE llm_usage_events SET provider = 'embedding' WHERE operation = 'embedding'",
+      "SELECT 1"
+    )
   end
 end

@@ -19,15 +19,42 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   - `chat_base_url` — the API base of your server; the client appends
     `/chat/completions`.
   - `chat_api_key` — the credential for THAT endpoint. A SEPARATE encrypted column
-    from `api_key`: your Anthropic key is never transmitted to your host.
-  - `acknowledge_key_transmission` — required when CHANGING `chat_base_url` without
-    supplying a matching `chat_api_key`; the probe never ships an already-stored
-    credential to a new host silently.
+    from `api_key`: your Anthropic key is never transmitted to your host. OPTIONAL:
+    omit it for a KEYLESS server (Ollama / llama.cpp / LM Studio / vLLM commonly
+    serve `/chat/completions` with no auth) and no authorization header is sent.
+  - `acknowledge_key_transmission` — required when CHANGING `chat_base_url` to a NEW
+    host without supplying a matching `chat_api_key`; the probe never ships an
+    already-stored credential to a new host silently. A same-host re-probe (a model
+    change, a key rotation) needs no acknowledgement.
 
-  The endpoint is PROBED with a trivial completion BEFORE anything is persisted:
-  unreachable, auth-rejected and not-OpenAI-compatible are distinguished 422s, each
-  carrying an ACTION-REQUIRED `remediation`, and nothing is saved on failure. The
-  write stays **role `:user`** — the same PATCH stores tenant secrets.
+  `extraction_model` is REQUIRED alongside `chat_provider: "openai_compatible"` —
+  the per-operation server default is an Anthropic model id no OpenAI-compatible
+  endpoint can serve, so there is no safe fallback — and it is the fallback for
+  `classification_model` / `merge_model` on that provider.
+
+  The endpoint is PROBED with a trivial completion PER DISTINCT RESOLVED MODEL
+  BEFORE anything is persisted: unreachable, auth-rejected and
+  not-OpenAI-compatible are distinguished 422s, each carrying an ACTION-REQUIRED
+  `remediation`, and nothing is saved on failure. The probe re-runs whenever the
+  chat SURFACE changes — provider, base_url, a rotated key or any per-operation
+  model — not only when the URL string moves. Because `chat_base_url` is
+  tenant-writable it is also held to the SSRF denylist: a host resolving into a
+  private/loopback/CGNAT/link-local range is refused unless the OPERATOR
+  deployment allowlist carves it out, and a host that cannot be resolved/classified
+  at all is refused rather than called unpinned. The write stays **role `:user`** —
+  the same PATCH stores tenant secrets.
+
+  `chat_base_url` must be a BARE API base — no query string, no fragment, no
+  embedded `user:pass@` credentials (the client appends `/chat/completions` to it,
+  and unlike `chat_api_key` the column is NOT encrypted, so anything in the URL is
+  stored, audited and echoed back in plaintext). Plaintext `http` is accepted ONLY
+  for a host the egress policy classifies network-local — the request carries your
+  key AND your full document text, so a public `http://` endpoint is refused with
+  `chat_endpoint_plaintext_refused`; use `https`.
+
+  Model ids may contain `/`, so HuggingFace repo ids
+  (`meta-llama/Meta-Llama-3-8B-Instruct`, `Qwen/Qwen2.5-7B-Instruct`) — what vLLM,
+  TGI, LM Studio and llama.cpp actually serve — are valid `extraction_model` values.
 
 ### Changed
 
