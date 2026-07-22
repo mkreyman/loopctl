@@ -1483,7 +1483,11 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       {:ok, %{results: [result]}} =
         Knowledge.search_combined(tenant.id, "zzquux",
           keyword_weight: 0.5,
-          semantic_weight: 0.5
+          semantic_weight: 0.5,
+          # Isolate the PURE RRF score — the #471 recency/authority priors multiply
+          # :final_score post-fusion and are tested separately.
+          recency_weight: 0.0,
+          authority_prior: false
         )
 
       # RRF: weight / (k + rank), default k = 60, rank 1 → 0.5 / 61.
@@ -1509,7 +1513,10 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
         Knowledge.search_combined(tenant.id, "zzquux",
           keyword_weight: 0.5,
           semantic_weight: 0.5,
-          rrf_k: 10
+          rrf_k: 10,
+          # Isolate the PURE RRF score (see the sibling k-default test).
+          recency_weight: 0.0,
+          authority_prior: false
         )
 
       # weight / (k + rank) with k = 10, rank 1 → 0.5 / 11.
@@ -1581,7 +1588,13 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       end)
 
       {:ok, %{results: results, meta: meta}} =
-        Knowledge.search_combined(tenant.id, "alpha", fusion_strategy: :min_max)
+        Knowledge.search_combined(tenant.id, "alpha",
+          fusion_strategy: :min_max,
+          # The <= 1.0 property is a min-max normalization invariant; the #471 priors would
+          # scale it past 1.0, so isolate the pure fusion score here (priors tested apart).
+          recency_weight: 0.0,
+          authority_prior: false
+        )
 
       # Same public shape; min-max produces normalized 0..1 weighted-sum scores (a lone
       # both-lane hit normalizes to 1.0 per lane → 0.5 + 0.5 = 1.0), unlike RRF's
@@ -1722,7 +1735,13 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       end)
 
       {:ok, %{results: results}} =
-        Knowledge.search_combined(tenant.id, "graphlane", graph_lane: true)
+        Knowledge.search_combined(tenant.id, "graphlane",
+          graph_lane: true,
+          # Assert the PURE graph-lane RRF magnitude; #471 priors (tested apart) would
+          # scale :final_score by the docs' authority factor.
+          recency_weight: 0.0,
+          authority_prior: false
+        )
 
       seed_result = Enum.find(results, &(&1.id == seed.id))
       neighbor_result = Enum.find(results, &(&1.id == neighbor.id))

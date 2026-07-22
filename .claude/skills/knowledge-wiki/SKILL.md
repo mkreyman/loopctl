@@ -39,11 +39,11 @@ never pass `tenant_id`/`subject_id`.
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
    created (`:481-487`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:447-449`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8003`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8119`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
-   (`absolute_score/1`, `:8130-8135`) clears a scale-matched threshold AND beats the best retrieved
-   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8181-8191`; the pure decision is
-   `resolve_provenance/4`, `:8236-8246`) AND is authoritative (not superseded/conflicted — the caller
+   (`absolute_score/1`, `:8246-8251`) clears a scale-matched threshold AND beats the best retrieved
+   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8297-8307`; the pure decision is
+   `resolve_provenance/4`, `:8352-8362`) AND is authoritative (not superseded/conflicted — the caller
    passes only `list_curated_sources/2`-filtered scores). Otherwise `:retrieved`. Both branches return identical `results`/`meta`
    key sets — callers branch on `meta.provenance` alone. A sparse pool must never let a near-but-wrong
    curated doc win.

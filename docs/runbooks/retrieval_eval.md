@@ -181,6 +181,70 @@ CI's pg16 (or mask a real one). Ranking ties inside a run are already made deter
 seeded article ids), so this is the remaining cross-environment variable — pin it by
 re-baselining on pg16.
 
+### #471 re-baseline: the priors are a like-for-like improvement (no accepted regression)
+
+The #471 ranking priors (recency + source/category authority) ship **default-on in every
+env** (`config/config.exs`: `knowledge_recency_weight` 0.3, `knowledge_authority_prior_enabled`
+true, `knowledge_authority_strength` 0.05 — no `test.exs` override). golden_v2 also adds one
+new question (`q-recency-fusion`) that exercises the recency prior directly.
+
+**Read the priors' effect on a LIKE-FOR-LIKE corpus — same golden_v2 question set, priors
+toggled OFF vs ON — not by diffing the golden_v1 (25q) baseline against the golden_v2 (26q)
+one.** That cross-corpus diff conflates two changes (a bigger distractor pool AND the priors)
+and produces a misleading "regression". Measured on golden_v2 with the priors OFF vs ON
+(reproduce with `RankingPriors` disabled via the `recency_weight: 0.0` /
+`authority_prior: false` search opts):
+
+| Metric (embeddings arm) | priors OFF | priors ON | delta |
+|-------------------------|-----------:|----------:|------:|
+| MRR                     | 0.7206     | 0.7463    | +0.0257 |
+| nDCG@10                 | 0.7328     | 0.7499    | +0.0172 |
+| nDCG@5                  | 0.6999     | 0.7204    | +0.0205 |
+| recall@10               | 0.8077     | 0.8077    | flat |
+
+Every aggregate metric is **flat or up** with the priors on, and NO pre-existing question
+regresses. Two pre-existing questions improve: `q-heavy-read` nDCG@10 **0.5112 -> 0.9449**
+(+0.434) and `q-keyword-fallback` nDCG@10 **0.8396 -> 0.8520** (+0.012). So AC-6's
+"aggregate >= baseline" holds on the merits.
+
+What is actually true about the numbers, stated plainly:
+
+* **The lift is RECENCY, not authority.** On this corpus "recency-only" (authority OFF)
+  scores identically to "both on" — the authority prior contributes **zero** net movement.
+  This synthetic corpus has few authority-decidable near-ties (the deterministic seeded-id
+  secondary sort already resolves most RRF ties), so the authority prior's merit is NOT
+  demonstrated by this eval; only recency's is. That is a limitation of the synthetic
+  corpus (see the "committed corpus is synthetic prose" note above), not evidence the
+  authority prior is inert in production.
+* **The keyword_only arm is unchanged by the priors** on golden_v2 (MRR/nDCG@10/recall@10
+  identical OFF vs ON): its five answered questions have same-age docs (recency inert) and
+  their order is fixed by the id tie-break. Recency needs no embedding, so it *can* apply
+  here — it simply has nothing aged to move.
+* **The earlier "0.86034 -> 0.85196 accepted regression" was a cross-corpus artifact, not a
+  priors effect.** 0.86034 was `q-keyword-fallback` on the SMALLER golden_v1 (25q). golden_v2
+  added `q-recency-fusion`, whose four corpus docs become distractors in the single shared
+  seeding tenant; those distractors alone dropped `q-keyword-fallback` to 0.8396 BEFORE any
+  prior ran. The recency prior then demotes those (deliberately stale, `age_days` 60–500)
+  distractors and lifts the grade-2 answer from rank 10 back to rank 8, recovering to 0.8520.
+  The priors *counteract* the corpus-expansion dip; they do not cause one.
+
+The gate compares against the regenerated-and-committed golden_v2 baseline (the normal
+re-baseline workflow below), and `q-keyword-fallback` is committed at its priors-on 0.8520 —
+so the gate is internally consistent and there is nothing to "accept".
+
+#### Operational caveat: "recency" is last-mutation time, not authored time
+
+The recency prior measures a document's age from `updated_at` (via
+`RankingPriors.recency_decay/2`), and `updated_at` is bumped by ANY row write that changes
+content — including a re-embed / content-hash refresh (`Knowledge.update_embedding/4`). A
+model migration or a **bulk re-embedding backfill therefore resets every touched note's
+apparent freshness to "now" and, run corpus-wide, globally flattens the recency signal**
+until authored-age drift re-accumulates. This is inherited from `knowledge_context` (#471's
+AC mandates reusing that exact field + decay), but #471 surfaces it on the PRIMARY search
+path — so after any mass re-embed, expect search ordering to shift, and prefer re-baselining
+the eval only once the corpus timestamps have settled. There is no separate authored/source
+timestamp to fall back to.
+
 ## The CI gate
 
 The `retrieval-eval` job in `.github/workflows/ci.yml` runs

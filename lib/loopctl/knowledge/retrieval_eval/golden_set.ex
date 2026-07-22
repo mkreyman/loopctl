@@ -47,6 +47,11 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
       * `title`, `body` — the article text. Titles must be unique file-wide.
       * `category` — one of `Loopctl.Knowledge.Categories.all/0`.
       * `tags` — optional list of tag strings.
+      * `age_days` — optional non-negative number. How many days BEFORE the seed instant
+        the article was last updated, so the seeded `updated_at`/`inserted_at` reflect it.
+        Absent/`0` means "updated now" (the default all docs used before #471). This is
+        what makes the recency prior testable: a recency-sensitive question can seed the
+        correct answer fresh among older near-tie distractors.
     * `relevant` — the doc_ids that SHOULD be retrieved for this question. Must be a
       non-empty subset of this question's own `corpus`.
     * `graded` — optional map of `doc_id => grade` (integer 0..3) used as the nDCG gain.
@@ -79,7 +84,8 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
           title: String.t(),
           body: String.t(),
           category: atom(),
-          tags: [String.t()]
+          tags: [String.t()],
+          age_days: number() | nil
         }
 
   @type question :: %{
@@ -231,13 +237,27 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
       title: fetch_string!(doc, "title", "line #{line_no} corpus"),
       body: fetch_string!(doc, "body", "line #{line_no} corpus"),
       category: category!(doc["category"], line_no),
-      tags: doc["tags"] || []
+      tags: doc["tags"] || [],
+      age_days: age_days!(doc["age_days"], line_no)
     }
   end
 
   defp normalize_doc!(other, line_no) do
     raise ArgumentError,
           "golden set line #{line_no}: corpus entry must be an object, got #{inspect(other)}"
+  end
+
+  # Optional per-doc age (days before the seed instant). Absent → nil (updated now).
+  # A negative age would place the doc in the FUTURE and silently invert the recency
+  # prior, so reject it loudly like every other malformed field.
+  defp age_days!(nil, _line_no), do: nil
+
+  defp age_days!(value, _line_no) when is_number(value) and value >= 0, do: value
+
+  defp age_days!(other, line_no) do
+    raise ArgumentError,
+          "golden set line #{line_no} corpus: age_days must be a non-negative number, " <>
+            "got #{inspect(other)}"
   end
 
   defp fetch_string!(map, key, where) do
