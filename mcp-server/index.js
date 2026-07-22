@@ -2461,7 +2461,14 @@ const TOOLS = [
   // Project Tools
   {
     name: "get_tenant",
-    description: "Get current tenant info. Use to verify connectivity.",
+    description:
+      "Get current tenant info. Use to verify connectivity, AND to discover which surfaces " +
+      "your tenant's trust_tier includes BEFORE attempting a write. The response carries " +
+      "`capabilities`: `surfaces` (each surface -> \"allowed\" | \"requires_human_anchor\"), " +
+      "`allowed`/`blocked` lists, `descriptions`, and `remediation` when something is blocked. " +
+      "An agent_rooted (self-signup, KB-tier) tenant has work_breakdown / chain_of_custody / " +
+      "dispatch / token_budgets blocked and knowledge_base / agent_memory / kb_project_scopes / " +
+      "coordination_bus allowed — check this instead of probing for a 403 per endpoint.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -2512,7 +2519,14 @@ const TOOLS = [
   },
   {
     name: "create_project",
-    description: "Create a new project in the current tenant.",
+    description:
+      "Create a new WORK project (kind: work) in the current tenant — the container for " +
+      "epics/stories/dispatch and the chain-of-custody surface. Requires orchestrator+ role " +
+      "AND a human_anchored tenant (WebAuthn signup ceremony); an agent_rooted tenant gets " +
+      "403 custody_tier_required, by design — a tenant must not be able to open a custody " +
+      "surface for itself. If you only need a project row to scope KNOWLEDGE to the repo you " +
+      "are on, use create_kb_scope instead (agent role, no human anchor). Call get_tenant " +
+      "first and read `capabilities` to see which of the two applies to your tenant.",
     inputSchema: {
       type: "object",
       properties: {

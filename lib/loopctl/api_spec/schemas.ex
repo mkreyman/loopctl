@@ -238,6 +238,18 @@ defmodule Loopctl.ApiSpec.Schemas do
             "US-26.7.1 — human_anchored (WebAuthn signup) unlocks the work-breakdown " <>
               "/ chain-of-custody surface; agent_rooted (self-signup) is KB-tier only."
         },
+        capabilities: %Schema{
+          type: :object,
+          additionalProperties: true,
+          description:
+            "#505 — which surfaces this tenant's `trust_tier` includes, so a caller can " <>
+              "discover the boundary BEFORE a write instead of probing for a 403. " <>
+              "`surfaces` maps each surface to either `allowed` or `requires_human_anchor`; " <>
+              "`allowed`/`blocked` are the same split as lists; `descriptions` explains " <>
+              "each surface; `remediation` (present only when `blocked` is non-empty) " <>
+              "carries the enrollment-upgrade path. The identical map is embedded in the " <>
+              "`custody_tier_required` 403 body."
+        },
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
       },
@@ -249,6 +261,12 @@ defmodule Loopctl.ApiSpec.Schemas do
         settings: %{},
         status: "active",
         trust_tier: "human_anchored",
+        capabilities: %{
+          trust_tier: "human_anchored",
+          surfaces: %{knowledge_base: "allowed", work_breakdown: "allowed"},
+          allowed: ["knowledge_base", "work_breakdown"],
+          blocked: []
+        },
         inserted_at: "2026-01-15T10:00:00Z",
         updated_at: "2026-01-15T10:00:00Z"
       }

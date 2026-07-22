@@ -5,6 +5,26 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.58.0 — 2026-07-22 (trust-tier capability discovery — #505)
+
+### Changed
+
+- **`get_tenant`** now documents (and the server now returns) a `capabilities` block:
+  which surfaces the tenant's `trust_tier` includes, as `surfaces`
+  (`"allowed"` / `"requires_human_anchor"`), `allowed`/`blocked` lists,
+  `descriptions`, and `remediation` when anything is blocked. An agent can read the
+  tier boundary UP FRONT instead of discovering it via a `403 custody_tier_required`
+  on each write.
+- **`create_project`** description now states the requirement it actually enforces —
+  orchestrator+ role AND a `human_anchored` tenant — and points an agent-rooted caller
+  at `create_kb_scope`, which establishes a repo-scoped project row for knowledge
+  without a custody surface. Previously the description promised "create a new project
+  in the current tenant" with no hint of the tier gate, so an agent-rooted tenant
+  could only learn the boundary by taking a 403.
+- The `custody_tier_required` **403 body** now embeds the same `capabilities` map plus,
+  where one genuinely exists, `remediation.agent_native_alternative` naming the endpoint
+  the caller CAN use. The gate itself is unchanged.
+
 ## 2.57.0 — 2026-07-22 (retention-sweep stall anomalies — #498)
 
 ### Changed

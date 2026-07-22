@@ -238,6 +238,53 @@ defmodule LoopctlWeb.ProjectControllerTest do
 
       assert json_response(conn, 403)["error"]["code"] == "custody_tier_required"
     end
+
+    # #505 — exact reproduction from the issue: an agent-rooted tenant calling
+    # create_project for its own repo. The 403 stands (it is L0 of the trust
+    # model), but it is no longer a dead end — it now says what IS open.
+    test "the 403 points at create_kb_scope and carries the tenant's capability map",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects", %{
+          "name" => "eCommerce Friendly",
+          "slug" => "ecommerce-friendly",
+          "repo_url" => "https://github.com/mkreyman/ecommerce-friendly"
+        })
+
+      error = json_response(conn, 403)["error"]
+
+      assert error["code"] == "custody_tier_required"
+
+      alternative = error["remediation"]["agent_native_alternative"]
+      assert alternative["tool"] == "create_kb_scope"
+      assert alternative["endpoint"] == "POST /api/v1/kb-scopes"
+      assert alternative["description"] =~ "kb"
+
+      assert "work_breakdown" in error["capabilities"]["blocked"]
+      assert "kb_project_scopes" in error["capabilities"]["allowed"]
+    end
+
+    test "and that alternative actually works — the agent establishes a scope for its repo",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/kb-scopes", %{
+          "name" => "eCommerce Friendly",
+          "slug" => "ecommerce-friendly",
+          "repo_url" => "https://github.com/mkreyman/ecommerce-friendly"
+        })
+
+      assert json_response(conn, 201)["project"]["slug"] == "ecommerce-friendly"
+    end
   end
 
   describe "DELETE /api/v1/kb-scopes/:id (agent archive of own KB scope)" do

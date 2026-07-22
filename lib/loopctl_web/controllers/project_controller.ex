@@ -38,7 +38,24 @@ defmodule LoopctlWeb.ProjectController do
   # NOTE: :create_kb_scope is deliberately NOT gated here — a :kb scope carries no
   # chain-of-custody surface (RequireWorkProject bars work attachment), so an agent-rooted
   # tenant may create one to partition its own knowledge. Extends owner decision #331.
-  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :update, :delete]
+  #
+  # #505 — the 403 names `create_kb_scope` as the agent-native alternative. An
+  # agent-rooted tenant hitting this gate almost always wants "a project row for
+  # the repo I am on", which a :kb scope gives it without a custody surface; the
+  # 403 previously left it with no path forward but a human WebAuthn upgrade.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor,
+       [
+         alternative: %{
+           tool: "create_kb_scope",
+           endpoint: "POST /api/v1/kb-scopes",
+           description:
+             "Creates a kind: kb project scope for this repo at agent role, with no " <>
+               "human anchor required. It partitions knowledge articles by repo but " <>
+               "cannot host epics/stories/dispatch — the work-breakdown surface stays " <>
+               "human-anchored by design."
+         }
+       ]
+       when action in [:create, :update, :delete]
 
   tags(["Projects"])
 
