@@ -16,19 +16,26 @@ defmodule Loopctl.Knowledge.VectorSearchTest do
   # --- embedding helpers (directional; cosine measures direction, not magnitude) ---
   #
   # `base`/`near` point the same way (cosine ≈ 1.0). `near_k` adds a small amount of
-  # the orthogonal half so cosine decreases monotonically with k — giving a stable
-  # similarity ranking. `orthogonal` shares no direction with `base` (cosine ≈ 0).
+  # the orthogonal direction so cosine decreases monotonically with k (1/sqrt(1+0.0025k²))
+  # — giving a stable similarity ranking. `orthogonal` shares no direction with `base`
+  # (cosine ≈ 0).
+  #
+  # All three are sourced from `Loopctl.DataCase.test_vec/2` so this file's vectors land in
+  # THIS test's disjoint window of the shared, cross-tenant pgvector HNSW index — dissolving
+  # the all-ties `half_ones` clique that flakes recall (see test_vec/2's @doc). The graded
+  # `near_embedding/1` is composed elementwise from the (disjoint) `:primary` and `:orthogonal`
+  # windows, so the exact cosine ordering is preserved with NO fixed coordinates.
 
-  @dims 768
+  defp base_embedding, do: test_vec(1536, :primary)
 
-  defp base_embedding, do: List.duplicate(1.0, @dims) ++ List.duplicate(0.0, @dims)
-
-  # Larger k => more orthogonal mass => lower cosine similarity to base.
+  # Larger k => more orthogonal-window mass => lower cosine similarity to base.
   defp near_embedding(k) when k >= 0 do
-    List.duplicate(1.0, @dims) ++ List.duplicate(k * 0.05, @dims)
+    primary = test_vec(1536, :primary)
+    orthogonal = test_vec(1536, :orthogonal)
+    Enum.zip_with(primary, orthogonal, fn p, o -> p + k * 0.05 * o end)
   end
 
-  defp orthogonal_embedding, do: List.duplicate(0.0, @dims) ++ List.duplicate(1.0, @dims)
+  defp orthogonal_embedding, do: test_vec(1536, :orthogonal)
 
   # Creates a PUBLISHED article with a known embedding, bypassing the Oban cascade.
   defp article_with_embedding(tenant_id, embedding, attrs \\ %{}) do

@@ -29,6 +29,8 @@ defmodule LoopctlWeb.ConnCase do
       import Phoenix.ConnTest
       import LoopctlWeb.ConnCase
       import Loopctl.Fixtures
+      # Per-test-unique embedding vectors for pgvector recall tests (shared with DataCase).
+      import Loopctl.DataCase, only: [test_vec: 1, test_vec: 2]
       import Mox
     end
   end
@@ -37,6 +39,9 @@ defmodule LoopctlWeb.ConnCase do
     Loopctl.DataCase.setup_sandbox(tags)
     Mox.set_mox_from_context(tags)
     Loopctl.DataCase.stub_all_defaults()
+    # Per-test embedding axis (see Loopctl.DataCase.test_vec/2): unique per test so
+    # pgvector recall vectors land in a disjoint window of the shared HNSW index.
+    Process.put(:test_vec_axis, System.unique_integer([:positive]))
     # Include the witness STH header on all test connections so the
     # ValidateWitnessHeader plug doesn't block authenticated requests.
     conn =

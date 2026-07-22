@@ -17,10 +17,12 @@ defmodule LoopctlWeb.KnowledgeHybridSearchControllerTest do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.ArticleAccessEvent
 
-  # Two orthogonal directions; identical directions cosine to 1.0 (clears the 0.75
-  # curated threshold), orthogonal to 0.0.
-  @direction_a List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
-  @direction_b List.duplicate(0.0, 768) ++ List.duplicate(1.0, 768)
+  # Two orthogonal directions; identical directions cosine to 1.0 (clears the 0.75 curated
+  # threshold), orthogonal to 0.0. Sourced per-test from `Loopctl.DataCase.test_vec/2`
+  # (functions, not compile-time attributes) so each test's vectors occupy a DISJOINT window
+  # of the shared HNSW index — dissolving the all-ties clique that flakes recall.
+  defp direction_a, do: test_vec(1536, :primary)
+  defp direction_b, do: test_vec(1536, :orthogonal)
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
@@ -61,7 +63,7 @@ defmodule LoopctlWeb.KnowledgeHybridSearchControllerTest do
           title: "Refund Policy",
           body: "Our refund policy allows returns within 30 days for a full refund."
         })
-        |> then(&set_embedding(tenant.id, &1, @direction_a))
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
 
       # A fuzzy, non-curated chunk on a different axis (does not clear the bar).
       _fuzzy =
@@ -71,10 +73,10 @@ defmodule LoopctlWeb.KnowledgeHybridSearchControllerTest do
           body: "How long orders take to ship.",
           status: :published
         })
-        |> then(&set_embedding(tenant.id, &1, @direction_b))
+        |> then(&set_embedding(tenant.id, &1, direction_b()))
 
       query = "refund policy"
-      stub_embeddings_by_query(%{query => @direction_a})
+      stub_embeddings_by_query(%{query => direction_a()})
 
       conn =
         conn
@@ -110,10 +112,10 @@ defmodule LoopctlWeb.KnowledgeHybridSearchControllerTest do
           body: "Some general onboarding notes for the team.",
           status: :published
         })
-        |> then(&set_embedding(tenant.id, &1, @direction_a))
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
 
       query = "onboarding notes"
-      stub_embeddings_by_query(%{query => @direction_a})
+      stub_embeddings_by_query(%{query => direction_a()})
 
       conn =
         conn
@@ -189,7 +191,7 @@ defmodule LoopctlWeb.KnowledgeHybridSearchControllerTest do
           title: "Tenant A Refund Policy",
           body: "Tenant A's confidential refund policy details."
         })
-        |> then(&set_embedding(tenant_a.id, &1, @direction_a))
+        |> then(&set_embedding(tenant_a.id, &1, direction_a()))
 
       # A key for a DIFFERENT tenant, seeded with its OWN decoy content so the
       # search pool is NON-EMPTY. This proves tenant A's curated article does not
@@ -205,10 +207,10 @@ defmodule LoopctlWeb.KnowledgeHybridSearchControllerTest do
           title: "Tenant B Refund Policy",
           body: "Tenant B's own refund policy on the same axis as tenant A's."
         })
-        |> then(&set_embedding(tenant_b.id, &1, @direction_a))
+        |> then(&set_embedding(tenant_b.id, &1, direction_a()))
 
       query = "refund policy"
-      stub_embeddings_by_query(%{query => @direction_a})
+      stub_embeddings_by_query(%{query => direction_a()})
 
       conn =
         conn
