@@ -270,16 +270,7 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
         # implies `dim = 768` and would revert to a seq scan (#170/#172). With the dim
         # WHERE now a compile-time LITERAL (finding 1), the partial index matches
         # regardless of plan mode — this forces a generic plan and proves it.
-        plan =
-          unboxed(fn ->
-            {:ok, plan} =
-              AdminRepo.transaction(fn ->
-                AdminRepo.query!("SET LOCAL plan_cache_mode = force_generic_plan")
-                explain_ann(tenant.id, dim)
-              end)
-
-            plan
-          end)
+        plan = unboxed(fn -> explain_ann_forcing_generic_plan(tenant.id, dim) end)
 
         expected_index = HnswIndex.dimension_index_name("article_embeddings", dim)
 
@@ -316,6 +307,37 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
     target = ScaleSeed.embedding_for(7, dim)
 
     AdminRepo.explain(:all, Knowledge.semantic_side_table_pool_query(tenant_id, target, dim, 100))
+  end
+
+  # EXPLAIN the SAME inner ANN under `plan_cache_mode = force_generic_plan`, which
+  # makes the planner build a GENERIC plan for the prepared statement immediately —
+  # the steady state production reaches under `plan_cache_mode = auto` after ~5
+  # executions. Proving the plan shape holds there is the whole point of the dim
+  # predicate being a compile-time LITERAL rather than a bound `$n` param.
+  #
+  # This deliberately does NOT use `AdminRepo.explain/2`: that opens its OWN
+  # transaction and `Repo.rollback`s it, which — nested inside the transaction that
+  # carries the `SET LOCAL` — poisons the outer transaction to `{:error, :rollback}`.
+  # So the query is rendered to SQL and EXPLAINed by hand in the SAME transaction as
+  # the `SET LOCAL`. EXPLAIN without ANALYZE does not execute the query, so there is
+  # nothing to roll back for correctness.
+  defp explain_ann_forcing_generic_plan(tenant_id, dim) do
+    target = ScaleSeed.embedding_for(7, dim)
+
+    {sql, params} =
+      AdminRepo.to_sql(
+        :all,
+        Knowledge.semantic_side_table_pool_query(tenant_id, target, dim, 100)
+      )
+
+    {:ok, plan} =
+      AdminRepo.transaction(fn ->
+        AdminRepo.query!("SET LOCAL plan_cache_mode = force_generic_plan")
+        %{rows: rows} = AdminRepo.query!("EXPLAIN (FORMAT TEXT) " <> sql, params)
+        Enum.map_join(rows, "\n", fn [line] -> line end)
+      end)
+
+    plan
   end
 
   # The REAL memory-recall request-path inner ANN, for the same reason: the
