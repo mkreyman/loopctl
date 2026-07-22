@@ -79,7 +79,7 @@ defmodule Loopctl.Knowledge.VectorSearch do
   objection that setting it per-request via `SET LOCAL` "needs a transaction and so
   re-introduces the #172 pool-starvation anti-pattern" is now **stale**: since US-27.13
   every heavy read ALREADY runs inside a short `SET LOCAL statement_timeout` transaction
-  (`Loopctl.HeavyRead.run_timed_transaction/4`), so a `SET LOCAL hnsw.ef_search = N`
+  (`Loopctl.HeavyRead.run_timed_transaction/5`), so a `SET LOCAL hnsw.ef_search = N`
   piggybacks on that EXISTING bounded, self-draining transaction with **no new
   starvation risk**. `Loopctl.HeavyRead.opts/1` therefore attaches `:hnsw_ef_search`
   (config `SystemConfig "hnsw_ef_search"`, default 40 = pgvector's default) to every

@@ -243,6 +243,7 @@ defmodule Loopctl.HeavyRead do
     base
     |> Keyword.put(:statement_timeout, statement_timeout_for(endpoint))
     |> maybe_put_ef_search(endpoint)
+    |> maybe_put_iterative_scan(endpoint)
   end
 
   # US-38.4: attach the per-QUERY `hnsw.ef_search` recall breadth ONLY to the
@@ -266,6 +267,26 @@ defmodule Loopctl.HeavyRead do
       case ef_search_override() do
         nil -> opts
         ef -> Keyword.put(opts, :hnsw_ef_search, ef)
+      end
+    else
+      opts
+    end
+  end
+
+  # #488: attach the per-QUERY `hnsw.iterative_scan` mode to the pgvector-ANN endpoints
+  # ONLY, and ONLY when an operator has turned it ON (SystemConfig `"hnsw_iterative_scan"`
+  # != "off"). It rides the SAME `SET LOCAL statement_timeout` transaction as ef_search,
+  # so it adds no new pool-starvation risk. It exists because the ANN filters `tenant_id`
+  # as a POST-index residual on a cross-tenant partial HNSW index: without iterative scan,
+  # a tenant whose near rows fall outside the global top-`ef_search` is silently
+  # under-returned. Default OFF so this is a NO-OP (and pgvector < 0.8, which lacks the GUC,
+  # never sees the `SET LOCAL`) until an operator enables it after verifying the deployed
+  # pgvector is >= 0.8 — a single `SystemConfig` UPDATE, no redeploy.
+  defp maybe_put_iterative_scan(opts, endpoint) do
+    if endpoint in @ann_endpoints do
+      case iterative_scan_override() do
+        nil -> opts
+        mode -> Keyword.put(opts, :hnsw_iterative_scan, mode)
       end
     else
       opts
@@ -339,7 +360,7 @@ defmodule Loopctl.HeavyRead do
   `SET LOCAL` is actually issued is decided by `maybe_put_ef_search/2`: at the default NO
   `SET LOCAL` fires (so a role-level `ALTER ROLE <role> SET hnsw.ef_search` is honored,
   never shadowed); a NON-default value is applied per-read via `SET LOCAL` inside the
-  heavy-read transaction (`run_timed_transaction/4`), taking precedence over any role/session
+  heavy-read transaction (`run_timed_transaction/5`), taking precedence over any role/session
   default for that ANN read.
   """
   @spec hnsw_ef_search() :: pos_integer()
@@ -347,6 +368,120 @@ defmodule Loopctl.HeavyRead do
     Loopctl.SystemConfig.get_int("hnsw_ef_search", @default_hnsw_ef_search)
     |> max(1)
     |> min(1000)
+  end
+
+  # `SystemConfig` is integer-only (get_int/put), so the mode is an INT CODE — this keeps
+  # the same single-UPDATE operator lever ef_search uses. The mode string is looked up from
+  # a fixed table, so the value interpolated into `SET LOCAL hnsw.iterative_scan = <mode>`
+  # is ALWAYS one of the three literals below, never operator/attacker text.
+  @default_hnsw_iterative_scan 0
+  @hnsw_iterative_scan_modes %{1 => "relaxed_order", 2 => "strict_order"}
+  @default_hnsw_max_scan_tuples 20_000
+
+  @doc """
+  The configured `hnsw.iterative_scan` mode for ANN reads (#488): `"off"`, `"relaxed_order"`,
+  or `"strict_order"`.
+
+  Read from the live-tunable `SystemConfig` key `"hnsw_iterative_scan"` as an INT CODE
+  (0 = off (default/missing/unknown), 1 = relaxed_order, 2 = strict_order), so an operator
+  enables iterative scan fleet-wide with a single `UPDATE` — no redeploy — AFTER confirming
+  the deployed pgvector is >= 0.8.
+  """
+  @spec hnsw_iterative_scan() :: String.t()
+  def hnsw_iterative_scan do
+    Map.get(
+      @hnsw_iterative_scan_modes,
+      Loopctl.SystemConfig.get_int("hnsw_iterative_scan", @default_hnsw_iterative_scan),
+      "off"
+    )
+  end
+
+  @doc """
+  The `hnsw.max_scan_tuples` ceiling applied alongside `hnsw.iterative_scan` (#488) —
+  bounds how far iterative scan may walk before giving up, so a pathological query cannot
+  scan the whole relation. Live-tunable via `SystemConfig` `"hnsw_max_scan_tuples"`
+  (pgvector's default #{@default_hnsw_max_scan_tuples}), clamped to a sane `[1, 1_000_000]`
+  so a bad value can never make the `SET LOCAL` raise and roll back the read.
+  """
+  @spec hnsw_max_scan_tuples() :: pos_integer()
+  def hnsw_max_scan_tuples do
+    Loopctl.SystemConfig.get_int("hnsw_max_scan_tuples", @default_hnsw_max_scan_tuples)
+    |> max(1)
+    |> min(1_000_000)
+  end
+
+  # The per-read `hnsw.iterative_scan` mode to APPLY via `SET LOCAL`, or `nil` when OFF
+  # (the default) — so the common path issues NO iterative-scan GUC round-trip and pgvector
+  # versions without the GUC are never touched. When an operator HAS enabled it, the
+  # capability probe (`iterative_scan_supported?/0`) is the second gate: on a pgvector < 0.8
+  # backend (no such GUC) it returns `nil` too, so enabling the config there is a NO-OP
+  # rather than a fleet-wide ANN outage. The `"off"` clause short-circuits BEFORE the probe,
+  # so the default path never pays for it.
+  @spec iterative_scan_override() :: String.t() | nil
+  defp iterative_scan_override do
+    case hnsw_iterative_scan() do
+      "off" -> nil
+      mode -> if iterative_scan_supported?(), do: mode, else: nil
+    end
+  end
+
+  @iterative_scan_min_version {0, 8, 0}
+
+  @doc """
+  Whether the connected pgvector supports `hnsw.iterative_scan` (pgvector >= 0.8.0).
+
+  Probed ONCE from `pg_extension` and cached in `:persistent_term`. The probe runs only when
+  an operator has actually enabled iterative scan (`iterative_scan_override/0` short-circuits
+  at OFF), so it costs one extra round-trip on the first enabled use and nothing after.
+  FAILS CLOSED: any error / missing row / unparseable version → `false`, so no
+  `hnsw.iterative_scan` GUC is emitted against a backend that would reject it and abort the
+  heavy-read transaction. This is what makes the "safe on pgvector < 0.8" guarantee hold even
+  if the config is enabled on such a backend.
+  """
+  @spec iterative_scan_supported?() :: boolean()
+  def iterative_scan_supported? do
+    case :persistent_term.get({__MODULE__, :iterative_scan_supported}, :unknown) do
+      :unknown ->
+        supported = probe_iterative_scan_support()
+        :persistent_term.put({__MODULE__, :iterative_scan_supported}, supported)
+        supported
+
+      cached ->
+        cached
+    end
+  end
+
+  defp probe_iterative_scan_support do
+    case Loopctl.Repo.query("SELECT extversion FROM pg_extension WHERE extname = 'vector'", []) do
+      {:ok, %{rows: [[version]]}} when is_binary(version) ->
+        version_at_least?(version, @iterative_scan_min_version)
+
+      _ ->
+        false
+    end
+  rescue
+    _ -> false
+  end
+
+  @doc """
+  Compare a `"MAJOR.MINOR[.PATCH]"` pgvector extversion against a `{maj, min, patch}` floor.
+  Malformed / non-numeric versions FAIL CLOSED (`false`), never raise.
+  """
+  @spec version_at_least?(String.t(), {non_neg_integer(), non_neg_integer(), non_neg_integer()}) ::
+          boolean()
+  def version_at_least?(version, {_, _, _} = floor) when is_binary(version) do
+    case parse_version(version) do
+      {_, _, _} = parsed -> parsed >= floor
+      :error -> false
+    end
+  end
+
+  defp parse_version(version) do
+    case version |> String.split(".") |> Enum.take(3) |> Enum.map(&Integer.parse/1) do
+      [{maj, _}, {min, _}, {patch, _}] -> {maj, min, patch}
+      [{maj, _}, {min, _}] -> {maj, min, 0}
+      _ -> :error
+    end
   end
 
   # The per-endpoint override if a positive int, else the pool-wide default. Always a
@@ -394,12 +529,13 @@ defmodule Loopctl.HeavyRead do
     # default", muddying the always-timed contract.
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     {ef, opts} = Keyword.pop(opts, :hnsw_ef_search, nil)
+    {iter, opts} = Keyword.pop(opts, :hnsw_iterative_scan, nil)
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard!(tenant_id, queryable)
     read_repo = repo_for(endpoint(opts))
 
     gated(tenant_id, opts, on_overload, fn ->
-      with_statement_timeout(read_repo, st, ef, fn -> read_repo.all(query, opts) end)
+      with_statement_timeout(read_repo, st, ef, iter, fn -> read_repo.all(query, opts) end)
     end)
   end
 
@@ -409,12 +545,13 @@ defmodule Loopctl.HeavyRead do
   def one(tenant_id, queryable, opts \\ []) do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     {ef, opts} = Keyword.pop(opts, :hnsw_ef_search, nil)
+    {iter, opts} = Keyword.pop(opts, :hnsw_iterative_scan, nil)
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard!(tenant_id, queryable)
     read_repo = repo_for(endpoint(opts))
 
     gated(tenant_id, opts, on_overload, fn ->
-      with_statement_timeout(read_repo, st, ef, fn -> read_repo.one(query, opts) end)
+      with_statement_timeout(read_repo, st, ef, iter, fn -> read_repo.one(query, opts) end)
     end)
   end
 
@@ -444,12 +581,13 @@ defmodule Loopctl.HeavyRead do
   def all_memory(tenant_id, subject_id, queryable, opts \\ []) do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     {ef, opts} = Keyword.pop(opts, :hnsw_ef_search, nil)
+    {iter, opts} = Keyword.pop(opts, :hnsw_iterative_scan, nil)
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard_memory!(tenant_id, subject_id, queryable)
     read_repo = repo_for(endpoint(opts))
 
     gated(tenant_id, opts, on_overload, fn ->
-      with_statement_timeout(read_repo, st, ef, fn -> read_repo.all(query, opts) end)
+      with_statement_timeout(read_repo, st, ef, iter, fn -> read_repo.all(query, opts) end)
     end)
   end
 
@@ -505,8 +643,8 @@ defmodule Loopctl.HeavyRead do
   # positive default, and a non-positive/`nil` value (an explicit mis-call) raises rather than
   # silently running un-timed (US-27.13: every heavy read MUST carry a server-side timeout
   # since the pgbouncer-rejected startup `:parameters` lever is gone).
-  defp with_statement_timeout(read_repo, ms, ef, fun) when is_integer(ms) and ms > 0 do
-    case run_timed_transaction(read_repo, ms, ef, fun) do
+  defp with_statement_timeout(read_repo, ms, ef, iter, fun) when is_integer(ms) and ms > 0 do
+    case run_timed_transaction(read_repo, ms, ef, iter, fun) do
       {:ok, result} ->
         result
 
@@ -519,7 +657,7 @@ defmodule Loopctl.HeavyRead do
     end
   end
 
-  defp with_statement_timeout(_read_repo, ms, _ef, _fun) do
+  defp with_statement_timeout(_read_repo, ms, _ef, _iter, _fun) do
     raise ArgumentError,
           ":statement_timeout (got #{inspect(ms)}) must be a positive integer (ms)"
   end
@@ -529,10 +667,11 @@ defmodule Loopctl.HeavyRead do
   # `SET LOCAL hnsw.ef_search` in the SAME transaction, then runs `fun`. Mirrors the
   # public `transaction/2` SET LOCAL, but pinned to the caller-resolved read repo so a
   # primary-pinned read (US-38.1) both times AND executes on the primary.
-  defp run_timed_transaction(read_repo, ms, ef, fun) do
+  defp run_timed_transaction(read_repo, ms, ef, iter, fun) do
     read_repo.transaction(fn ->
       read_repo.query!("SET LOCAL statement_timeout = #{ms}")
       maybe_set_ef_search(read_repo, ef)
+      maybe_set_iterative_scan(read_repo, iter)
       fun.()
     end)
   end
@@ -549,6 +688,24 @@ defmodule Loopctl.HeavyRead do
 
   defp maybe_set_ef_search(read_repo, ef) when is_integer(ef) and ef > 0 do
     read_repo.query!("SET LOCAL hnsw.ef_search = #{ef}")
+  end
+
+  # `SET LOCAL hnsw.iterative_scan = <mode>` + a bounded `hnsw.max_scan_tuples` for an ANN
+  # read (#488): when enabled, HNSW keeps scanning past the initial `ef_search` batch until
+  # the LIMIT is filled with rows that pass the residual `tenant_id` filter — closing the
+  # cross-tenant post-ANN-filter under-return. Fired ONLY when an operator has turned it on;
+  # `mode` is a validated literal from the fixed `@hnsw_iterative_scan_modes` table (never
+  # operator text), so the interpolation is injection-safe. `max_scan_tuples` is an
+  # integer clamped by `hnsw_max_scan_tuples/0`. Transaction-scoped (resets at COMMIT); `nil`
+  # (the default OFF) sets nothing, so a pgvector < 0.8 backend without the GUC is never
+  # touched. Both GUCs are pgvector custom GUCs settable before the vector module loads in
+  # the backend, applied when the ANN operator in `fun` runs — the same order ef_search uses.
+  defp maybe_set_iterative_scan(_read_repo, nil), do: :ok
+
+  defp maybe_set_iterative_scan(read_repo, mode)
+       when mode in ["relaxed_order", "strict_order"] do
+    read_repo.query!("SET LOCAL hnsw.iterative_scan = #{mode}")
+    read_repo.query!("SET LOCAL hnsw.max_scan_tuples = #{hnsw_max_scan_tuples()}")
   end
 
   @doc """

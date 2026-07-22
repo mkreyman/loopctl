@@ -145,6 +145,136 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     end
   end
 
+  describe "per-query hnsw.iterative_scan (#488)" do
+    test "hnsw_iterative_scan/0 maps SystemConfig int codes to modes (0/unknown => off)" do
+      assert HeavyRead.hnsw_iterative_scan() == "off", "default/missing => off"
+
+      prime_iterative_scan(1)
+      assert HeavyRead.hnsw_iterative_scan() == "relaxed_order"
+
+      prime_iterative_scan(2)
+      assert HeavyRead.hnsw_iterative_scan() == "strict_order"
+
+      prime_iterative_scan(99)
+      assert HeavyRead.hnsw_iterative_scan() == "off", "an unknown code falls back to off"
+    end
+
+    test "hnsw_max_scan_tuples/0 reads the pgvector default and clamps out-of-range" do
+      assert HeavyRead.hnsw_max_scan_tuples() == 20_000, "default"
+
+      prime_max_scan_tuples(5_000_000)
+      assert HeavyRead.hnsw_max_scan_tuples() == 1_000_000, "above-range clamps to max"
+
+      prime_max_scan_tuples(0)
+      assert HeavyRead.hnsw_max_scan_tuples() == 1, "zero clamps to min"
+    end
+
+    test "opts/1 attaches :hnsw_iterative_scan for ANN endpoints ONLY when enabled" do
+      # OFF (default): no key on any endpoint, so pgvector < 0.8 (no such GUC) is never touched.
+      for endpoint <- HeavyRead.ann_endpoints() do
+        refute Keyword.has_key?(HeavyRead.opts(endpoint), :hnsw_iterative_scan),
+               "expected #{endpoint} opts to carry NO :hnsw_iterative_scan at OFF"
+      end
+
+      prime_iterative_scan(1)
+
+      for endpoint <- HeavyRead.ann_endpoints() do
+        assert Keyword.get(HeavyRead.opts(endpoint), :hnsw_iterative_scan) == "relaxed_order",
+               "expected enabled ANN #{endpoint} opts to carry :hnsw_iterative_scan"
+      end
+
+      for endpoint <- HeavyRead.known_endpoints() -- HeavyRead.ann_endpoints() do
+        refute Keyword.has_key?(HeavyRead.opts(endpoint), :hnsw_iterative_scan),
+               "expected non-ANN #{endpoint} opts to NOT carry :hnsw_iterative_scan"
+      end
+    end
+
+    test "an enabled ANN heavy read issues SET LOCAL hnsw.iterative_scan + hnsw.max_scan_tuples" do
+      prime_iterative_scan(1)
+      prime_max_scan_tuples(50_000)
+      tenant = fixture(:tenant)
+      q = from(a in Article, where: a.tenant_id == ^tenant.id, select: %{id: a.id})
+
+      sqls =
+        Loopctl.PlanAssertions.capture_repo_queries(fn ->
+          HeavyRead.all(tenant.id, q, HeavyRead.opts(:vector_search))
+        end)
+        |> Enum.map(fn {sql, _params} -> sql end)
+
+      assert Enum.any?(sqls, &(&1 =~ ~r/SET LOCAL hnsw\.iterative_scan = relaxed_order/)),
+             "expected SET LOCAL hnsw.iterative_scan = relaxed_order, got: #{inspect(sqls)}"
+
+      assert Enum.any?(sqls, &(&1 =~ ~r/SET LOCAL hnsw\.max_scan_tuples = 50000/)),
+             "expected SET LOCAL hnsw.max_scan_tuples = 50000, got: #{inspect(sqls)}"
+    end
+
+    test "an ANN heavy read at OFF (default) issues NO SET LOCAL hnsw.iterative_scan" do
+      # The default must touch NOTHING iterative-scan — this is what keeps the feature
+      # inert (and safe on a pgvector < 0.8 backend without the GUC) until an operator opts in.
+      assert HeavyRead.hnsw_iterative_scan() == "off", "precondition: default OFF"
+      tenant = fixture(:tenant)
+      q = from(a in Article, where: a.tenant_id == ^tenant.id, select: %{id: a.id})
+
+      sqls =
+        Loopctl.PlanAssertions.capture_repo_queries(fn ->
+          HeavyRead.all(tenant.id, q, HeavyRead.opts(:vector_search))
+        end)
+        |> Enum.map(fn {sql, _params} -> sql end)
+
+      refute Enum.any?(sqls, &(&1 =~ ~r/iterative_scan|max_scan_tuples/)),
+             "expected an ANN read at OFF to touch NO iterative-scan GUC, got: #{inspect(sqls)}"
+    end
+
+    test "a non-ANN heavy read does NOT issue SET LOCAL hnsw.iterative_scan even when enabled" do
+      prime_iterative_scan(1)
+      tenant = fixture(:tenant)
+      q = from(a in Article, where: a.tenant_id == ^tenant.id, select: %{id: a.id})
+
+      sqls =
+        Loopctl.PlanAssertions.capture_repo_queries(fn ->
+          HeavyRead.all(tenant.id, q, HeavyRead.opts(:change_feed))
+        end)
+        |> Enum.map(fn {sql, _params} -> sql end)
+
+      refute Enum.any?(sqls, &(&1 =~ ~r/iterative_scan|max_scan_tuples/)),
+             "expected a non-ANN read to NOT touch iterative-scan GUCs, got: #{inspect(sqls)}"
+    end
+
+    test "version_at_least?/2 parses pgvector versions and FAILS CLOSED on malformed input" do
+      assert HeavyRead.version_at_least?("0.8.0", {0, 8, 0})
+      assert HeavyRead.version_at_least?("0.8.5", {0, 8, 0})
+      assert HeavyRead.version_at_least?("0.9.0", {0, 8, 0})
+      assert HeavyRead.version_at_least?("1.0.0", {0, 8, 0})
+      assert HeavyRead.version_at_least?("0.8", {0, 8, 0}), "missing patch defaults to 0"
+
+      refute HeavyRead.version_at_least?("0.7.4", {0, 8, 0})
+      refute HeavyRead.version_at_least?("0.7", {0, 8, 0})
+      refute HeavyRead.version_at_least?("garbage", {0, 8, 0}), "unparseable fails closed"
+      refute HeavyRead.version_at_least?("", {0, 8, 0})
+      refute HeavyRead.version_at_least?("0.x.0", {0, 8, 0})
+    end
+
+    test "iterative_scan_supported?/0 detects the test DB's pgvector (>= 0.8) — the enable gate" do
+      # On a < 0.8 backend this returns false, so enabling the config there is a NO-OP; the
+      # deterministic decision logic is covered by version_at_least?/2 above. Here we assert
+      # the live probe succeeds against the actual test DB so the emission tests' precondition
+      # (that iterative scan CAN be enabled) is real, not assumed.
+      assert HeavyRead.iterative_scan_supported?()
+    end
+  end
+
+  defp prime_iterative_scan(code) do
+    pt_key = {Loopctl.SystemConfig, "hnsw_iterative_scan"}
+    :persistent_term.put(pt_key, code)
+    on_exit(fn -> :persistent_term.erase(pt_key) end)
+  end
+
+  defp prime_max_scan_tuples(value) do
+    pt_key = {Loopctl.SystemConfig, "hnsw_max_scan_tuples"}
+    :persistent_term.put(pt_key, value)
+    on_exit(fn -> :persistent_term.erase(pt_key) end)
+  end
+
   # US-38.4: prime the live-tunable `SystemConfig "hnsw_ef_search"` cache directly (the
   # documented persistent_term key format) rather than `SystemConfig.put/2`, to avoid a
   # leaked DB row, and erase on exit. This module is `async: false` precisely BECAUSE this
