@@ -3858,6 +3858,10 @@ const TOOLS = [
       "a keyword and a semantic sub-search, each capped at 100, so up to ~200), or filtered_set " +
       "(list mode: the full set). Do NOT use a relevance-mode total_count to size the wiki — use " +
       "list mode or knowledge_stats. " +
+      "SCORE: in combined mode each result's `score` is a Reciprocal Rank Fusion weight " +
+      "(~0.008-0.016 at the top), NOT a normalized 0..1 confidence — use it only to compare " +
+      "RANK/order within one response; for an absolute 0..1 confidence use knowledge_hybrid_search " +
+      "(meta.confidence). " +
       "Pass story_id when working on a loopctl story so reads attribute correctly. " +
       "When you knowledge_get a result and it carries `potential_conflicts`, resolve it if it's " +
       "material to your task (see knowledge_get / the conflict-resolution wiki playbook). " +

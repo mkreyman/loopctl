@@ -748,6 +748,40 @@ config :loopctl, :knowledge_hybrid_curated_margin, 0.1
 config :loopctl, :knowledge_hybrid_curated_threshold_keyword, 0.5
 config :loopctl, :knowledge_hybrid_curated_margin_keyword, 0.1
 
+# search_combined/3 lane fusion (#470). RRF (Reciprocal Rank Fusion) replaces the
+# legacy min-max normalized weighted-sum: `score(doc) = Σ_lane weight_lane / (k +
+# rank_lane(doc))`. RRF is rank-based, so it is immune to the incommensurable-scale
+# problem (ts_rank_cd vs cosine similarity) that made min-max brittle, and the `k`
+# smoothing constant makes cross-lane consensus outweigh one lane's single #1 vote.
+# The legacy min-max path is kept behind `:min_max` for A/B and eval comparison.
+# All are overridable per-call (opts) for tests/experiments — config-DI, never
+# Application.put_env in tests.
+config :loopctl, :knowledge_fusion_strategy, :rrf
+# RRF smoothing constant. Default 60 per the canonical RRF formula (KB f4a10824).
+config :loopctl, :knowledge_rrf_k, 60
+# Optional third graph-neighbor lane (#470): one-hop link-graph neighbors of the top
+# merged candidates fed into the fusion. OFF by default — a purely additive recall
+# lane that a caller opts into. Graph-only neighbors carry no relevance/similarity
+# score (their hybrid-resolver absolute_score stays 0.0) and never inflate
+# meta.semantic_result_count.
+config :loopctl, :knowledge_rrf_graph_lane_enabled, false
+# Weight of the graph-neighbor lane in RRF fusion when enabled. Defaults to 0.25 —
+# STRICTLY BELOW the keyword/semantic per-lane weight (0.5 each). The graph lane carries
+# NO relevance/similarity signal (a neighbor surfaces only because it is link-adjacent to
+# a seed), so it must never tie OR outrank a genuine single-lane hit. At the primary weight
+# (0.5) a graph-rank-1 neighbor scores 0.5/(k+1) — EXACTLY equal to a single-lane rank-1
+# hit — and the deterministic `{final_score, id}` desc tiebreak could then float a
+# zero-signal neighbor with a larger id ABOVE the true top hit (#470 review). At 0.25 a
+# graph-rank-1 neighbor scores 0.25/(k+1) < 0.5/(k+1), so the "never outranks a genuine
+# single-lane top hit" invariant holds by construction, in POSITION not just in score. A
+# doc that is ALSO a genuine hit still sums its primary-lane contribution, so real
+# cross-lane consensus is unaffected.
+config :loopctl, :knowledge_rrf_graph_weight, 0.25
+# Number of top merged candidates used as graph-lane seeds (bounds link fan-out).
+config :loopctl, :knowledge_rrf_graph_seed_count, 10
+# Overall cap on distinct graph-lane neighbors injected into the fusion.
+config :loopctl, :knowledge_rrf_graph_max_neighbors, 20
+
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 

@@ -1163,27 +1163,28 @@ defmodule Loopctl.Memory do
 
   ## Scores are heuristically comparable, NOT calibrated
 
-  The merged list is sorted by a single `score` DESC across BOTH sources, but the two
-  scores come from different scales:
+  The merged list is sorted by a single `score` DESC across BOTH sources, and BOTH sides
+  are put on the SAME absolute 0..1 scale so neither systematically outranks the other:
 
     * memory `score` = `max(0, 1 - cosine_distance)` — an absolute per-row similarity
       in `[0, 1]` (or `nil` on the ILIKE text-match fallback path, treated as `0.0`
       for ranking only).
-    * knowledge `score` = the combined search's `final_score` — a weighted
-      keyword+semantic score, MIN-MAX normalized WITHIN the returned pool (so it is
-      pool-relative, not an absolute similarity).
+    * knowledge `score` = `Knowledge.absolute_result_score/1` — the ABSOLUTE per-row
+      relevance: the raw cosine `:similarity_score` (`1 - cosine_distance`, the SAME
+      derivation as the memory side) when the row matched semantically, else a bounded
+      `raw/(raw+1)` transform of the raw keyword `:relevance_score`. It is NOT the fused
+      `:final_score`: post-#470 combined search fuses lanes with RRF, whose `:final_score`
+      is a pool-relative `Σ weight/(k+rank)` value (top ~0.008-0.016) that — compared
+      against memory's 0..1 cosine — would sink every knowledge row below every memory
+      row (#470 review). Reading the absolute score removes that inversion.
 
-  KNOWN BIAS: because the knowledge `final_score` is min-max normalized within the
-  returned pool, the top knowledge row is ~1.0 regardless of its ABSOLUTE relevance,
-  so knowledge items systematically outrank memory items in the default `results`
-  ordering even when the memory matches are strong. This is a documented heuristic,
-  NOT a calibrated cross-source ranking — do NOT read the merged `results` order as
-  "knowledge was more relevant than memory". `meta.results_ranking` carries the stable
-  tag `"heuristic_cross_source"` so consumers can detect this programmatically.
-
-  Treat the cross-source ordering as a useful heuristic, not a calibrated ranking.
-  Callers that need a calibrated re-rank get BOTH the merged view AND the untouched
-  per-source envelopes (`:memory`, `:knowledge`), each carrying its own native scores.
+  STILL A HEURISTIC, not a fully calibrated ranking: the two absolute scores share a
+  scale and derivation for semantic matches, but a keyword-only knowledge row's
+  `raw/(raw+1)` transform is only magnitude-comparable to cosine, not identically
+  calibrated. So `meta.results_ranking` keeps the stable tag `"heuristic_cross_source"`
+  — do NOT over-read a one-position gap. Callers that need a calibrated re-rank get BOTH
+  the merged view AND the untouched per-source envelopes (`:memory`, `:knowledge`), each
+  carrying its own native scores.
 
   ## Degradation, never a 500 (and never a whole-endpoint 429)
 
@@ -1213,13 +1214,14 @@ defmodule Loopctl.Memory do
   intentionally NOT done, because two simultaneous slots would double a single request's
   peak pressure under the very cap that shields other tenants.
 
-  ## Known bias on the degraded path
+  ## The degraded path stays on the same bounded scale
 
-  On a degraded knowledge side (keyword-only fallback) memory rows carry absolute cosine
-  scores while knowledge rows carry raw (un-normalized) keyword `relevance_score`, which
-  can exceed memory's cosine max of 1.0 and outrank memory in the merged `data`. A caller
-  needing memory-first ordering under degradation should read the per-source `:memory`
-  envelope (it preserves the honest native scores/nils), disclosed via `meta.degraded?`.
+  On a degraded knowledge side (keyword-only fallback) knowledge rows carry only a raw
+  keyword `relevance_score`; `Knowledge.absolute_result_score/1` applies the same bounded
+  `raw/(raw+1)` transform there, so the merged score stays in 0..1 and can no longer
+  exceed memory's cosine max of 1.0 or spuriously outrank memory (pre-#470 the raw
+  un-normalized ts_rank_cd could). A caller needing the honest native scores/nils still
+  reads the per-source `:memory` envelope, disclosed via `meta.degraded?`.
 
   ## Options
 
@@ -1452,17 +1454,16 @@ defmodule Loopctl.Memory do
     end
   end
 
-  # Knowledge combined ranking score. Normal combined results carry `:final_score`
-  # (pool-normalized weighted keyword+semantic, in [0, 1]); when combined DEGRADES to a
-  # keyword-only fallback the results carry `:relevance_score` (and no `:final_score`),
-  # so mirror `KnowledgeSearchJSON.extract_score/2`'s chain
-  # (`final_score || relevance_score || similarity_score`) via bracket access rather
-  # than scoring every degraded-path item 0.0 and sinking all knowledge below memory.
-  # Defaults to 0.0 for a malformed/scoreless result map (defensive).
-  defp knowledge_score(result) when is_map(result) do
-    score = result[:final_score] || result[:relevance_score] || result[:similarity_score]
-    if is_number(score), do: score, else: 0.0
-  end
+  # Knowledge ranking score for the CROSS-SOURCE merge — the ABSOLUTE per-row relevance
+  # (`Knowledge.absolute_result_score/1`: raw cosine `:similarity_score`, else a bounded
+  # `raw/(raw+1)` transform of the raw keyword `:relevance_score`), NOT the fused
+  # `:final_score`. The merged list is sorted DESC by this single score across BOTH
+  # sources, and memory rows carry an absolute cosine `max(0, 1 - cosine_distance)` in
+  # [0, 1]; comparing them requires the knowledge side to be on that SAME absolute 0..1
+  # scale. Post-#470 the combined `:final_score` is an RRF `Σ weight/(k+rank)` value (top
+  # ~0.008-0.016) — reading it here would systematically sink every knowledge row below
+  # every memory row (#470 review). Defaults to 0.0 for a scoreless result map.
+  defp knowledge_score(result) when is_map(result), do: Knowledge.absolute_result_score(result)
 
   defp knowledge_score(_), do: 0.0
 

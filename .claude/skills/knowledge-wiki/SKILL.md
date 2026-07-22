@@ -39,11 +39,11 @@ never pass `tenant_id`/`subject_id`.
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
    created (`:481-487`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:447-449`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:7654`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8003`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
-   (`absolute_score/1`, `:7759-7764`) clears a scale-matched threshold AND beats the best retrieved
-   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:7735-7745`; the pure decision is
-   `resolve_provenance/4`, `:7790-7800`) AND is authoritative (not superseded/conflicted — the caller
+   (`absolute_score/1`, `:8130-8135`) clears a scale-matched threshold AND beats the best retrieved
+   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8181-8191`; the pure decision is
+   `resolve_provenance/4`, `:8236-8246`) AND is authoritative (not superseded/conflicted — the caller
    passes only `list_curated_sources/2`-filtered scores). Otherwise `:retrieved`. Both branches return identical `results`/`meta`
    key sets — callers branch on `meta.provenance` alone. A sparse pool must never let a near-but-wrong
    curated doc win.
@@ -62,6 +62,16 @@ never pass `tenant_id`/`subject_id`.
    `drafts`/`publish` are `:orchestrator` (`:33`).
    Agent edits are visibility-scoped: an agent can only touch an article it can see. (See `chain-of-custody`.)
 
+## Ranking changes are gated by the golden-question eval (#469)
+
+Any change to `search_combined/3` ranking (weights, fusion, recency/authority) must ship with a
+delta from `mix loopctl.retrieval.eval` — recall@k / MRR / nDCG against the committed golden set
+(`priv/retrieval_eval/golden.jsonl`) and baseline (`priv/retrieval_eval/baseline_v1.json`). The
+`retrieval-eval` CI job runs it in both the embeddings and keyword-only arms and gates `deploy`.
+How to add a labeled question, re-baseline, and read the per-question winners/losers table:
+`docs/runbooks/retrieval_eval.md`. Its semantic lane is a SYNTHETIC (provider-free) stand-in —
+a regression instrument, not an absolute quality score.
+
 ## Anti-patterns
 
 - Writing a private, task-local fact via `knowledge_create` (pollutes shared KB) — use `memory_remember`.
@@ -70,6 +80,8 @@ never pass `tenant_id`/`subject_id`.
 - Bypassing `propose_article`'s gate to force-create a near-duplicate.
 - A heavy vector read on `Repo`/`AdminRepo` (starves the admin pool) — route through `HeavyRead`.
 - Treating `hybrid_search` confidence as pool-relative — it is absolute, scale-matched, margin-gated.
+- Re-baselining the retrieval eval to turn a red gate green (the numbers move only with a reviewed
+  ranking change).
 
 ## Related
 

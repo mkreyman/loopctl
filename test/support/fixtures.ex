@@ -23,6 +23,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionWriteStats
+  alias Loopctl.Knowledge.RetrievalEval.GoldenSet, as: RetrievalGoldenSet
   alias Loopctl.Llm.SettingsCache
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Llm.UsageEvent, as: LlmUsageEvent
@@ -182,6 +183,49 @@ defmodule Loopctl.Fixtures do
         source_id: nil,
         metadata: %{}
       },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  # --- Retrieval eval (#469) in-memory golden-set builders -------------------
+  # Shaped exactly like `Loopctl.Knowledge.RetrievalEval.GoldenSet` normalizes the
+  # committed JSONL, so a test can drive the eval with a 2-3 question set instead of
+  # seeding the whole committed corpus.
+
+  def build(:retrieval_golden_doc, attrs) do
+    seq = System.unique_integer([:positive])
+
+    Map.merge(
+      %{
+        doc_id: "doc-#{seq}",
+        title: "Golden doc #{seq}",
+        body: "Golden doc body #{seq}.",
+        category: :pattern,
+        tags: []
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:retrieval_golden_question, attrs) do
+    seq = System.unique_integer([:positive])
+
+    Map.merge(
+      %{
+        id: "q-#{seq}",
+        question: "golden question #{seq}",
+        source: "fixture",
+        corpus: [],
+        relevant: [],
+        graded: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:retrieval_golden_set, attrs) do
+    Map.merge(
+      %{version: "test_golden_v1", description: "fixture golden set", questions: []},
       Enum.into(attrs, %{})
     )
   end
@@ -761,6 +805,12 @@ defmodule Loopctl.Fixtures do
   # "nothing durable". Not a DB row; it is the committed data the eval scores against.
   def fixture(:promotion_eval_dataset, _attrs) do
     PromotionEvalDataset.default()
+  end
+
+  # The COMMITTED retrieval-eval golden set (#469). `build(:retrieval_golden_set, ...)`
+  # builds a small in-memory one instead, for tests that must not seed 100 articles.
+  def fixture(:retrieval_golden_set, _attrs) do
+    RetrievalGoldenSet.default()
   end
 
   # A US-29.2 promotion WATERMARK row. Auto-creates a tenant when one isn't supplied;

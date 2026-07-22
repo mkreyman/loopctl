@@ -174,4 +174,39 @@ defmodule Loopctl.MemoryRecallContextTest do
       assert result.meta.total_count == 3
     end
   end
+
+  # --- #470: cross-source ranking must use the ABSOLUTE knowledge score, not RRF final_score
+  describe "recall_context/2 - cross-source ranking uses the absolute knowledge score (#470)" do
+    test "a knowledge merged score is the absolute per-row relevance, not the tiny RRF final_score",
+         ctx do
+      # A query embedding equal to the article embedding (0.1 vector) makes the knowledge
+      # article a near-perfect semantic match (cosine similarity ≈ 1.0).
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, List.duplicate(0.1, 1536)}
+      end)
+
+      art = article(ctx.tenant.id, ctx.project.id, "reshipment strong match")
+      _mem = mem(ctx.scope, ctx.project.id, "reshipment memory note")
+
+      result = Memory.recall_context(ctx.scope, query: "reshipment", limit: 20)
+
+      know_item =
+        Enum.find(result.results, &(&1.source == :knowledge and &1.article.id == art.id))
+
+      assert know_item
+
+      # The merged cross-source score is the ABSOLUTE relevance (cosine similarity ≈ 1.0 here)
+      # — the SAME 0..1 scale as memory's cosine — NOT the fused RRF final_score
+      # (`Σ weight/(k+rank)`, top ~0.008-0.016). Reading final_score here would sink every
+      # knowledge row below every memory row (#470 review).
+      assert know_item.score == Knowledge.absolute_result_score(know_item.article)
+      assert know_item.score > 0.5
+      assert know_item.score > (know_item.article[:final_score] || 0.0)
+
+      # The merged list is still sorted by that single score DESC across both sources.
+      scores = Enum.map(result.results, & &1.score)
+      assert scores == Enum.sort(scores, :desc)
+      assert result.meta.results_ranking == "heuristic_cross_source"
+    end
+  end
 end

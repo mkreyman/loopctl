@@ -168,6 +168,7 @@ defmodule Loopctl.HeavyRead.TenantGate do
     distant_pairs
     distant_pairs_bridge
     export
+    graph_lane
   )a
 
   # --- Client API ---

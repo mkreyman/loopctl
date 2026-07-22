@@ -125,6 +125,14 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     # Normal combined results carry :final_score; when combined degrades to a
     # keyword-only fallback the results carry :relevance_score instead, so fall
     # back to it (then similarity) rather than reporting a misleading 0.0.
+    #
+    # SCORE MAGNITUDE (post-#470): combined :final_score is now a Reciprocal Rank Fusion
+    # value — `Σ weight/(k+rank)`, so the top hit is ~0.008-0.016 (with k=60), NOT a
+    # normalized 0..1 similarity. Result ORDER is unchanged (still a pure sort by this
+    # score, higher = more relevant), so ranking/sort-by-score clients are unaffected; but
+    # any client that THRESHOLDS on or displays the absolute magnitude must treat `score`
+    # as an un-normalized relative rank weight, not a 0..1 confidence. Use
+    # knowledge_hybrid_search's `meta.confidence` (absolute) when a 0..1 signal is needed.
     result[:final_score] || result[:relevance_score] || result[:similarity_score] || 0.0
   end
 
