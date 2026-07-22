@@ -528,3 +528,14 @@ if config_env() == :prod do
   #
   # Check `Plug.SSL` for all available options in `force_ssl`.
 end
+
+# WebAuthn relying-party is configurable via env for non-loopctl.com deployments
+# (config.exs hardcodes loopctl.com, which breaks the enrollment ceremony on
+# localhost/self-hosted origins). Without the env var, behaviour is unchanged.
+if webauthn_rp_id = System.get_env("WEBAUTHN_RP_ID") do
+  config :loopctl, :webauthn,
+    rp_id: webauthn_rp_id,
+    rp_name: "loopctl",
+    origin: System.get_env("WEBAUTHN_ORIGIN") || "http://#{webauthn_rp_id}:4030",
+    user_verification: "preferred"
+end
