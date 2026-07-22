@@ -170,12 +170,17 @@ defmodule Loopctl.MixProject do
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
       "assets.deploy": ["tailwind loopctl --minify", "esbuild loopctl --minify", "phx.digest"],
       precommit: [
+        # hex.audit MUST run BEFORE `compile`: `compile` purges the archive code
+        # path, after which a chained `hex.audit` (a Hex archive task) fails with
+        # "task could not be found" — which silently broke every local `mix precommit`
+        # (CI was unaffected: it runs `mix hex.audit` as its own step). Running it
+        # first also fails fast on a retired/advised dependency.
+        "hex.audit",
         "compile --warnings-as-errors",
         "deps.unlock --check-unused",
         "format --check-formatted",
         "credo --strict",
         "loopctl.check_skill_citations",
-        "hex.audit",
         "dialyzer",
         "test"
       ]
