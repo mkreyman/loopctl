@@ -22,9 +22,36 @@ defmodule Loopctl.Workers.ChannelPostRescanWorker do
   coordination read (`recent/3`, `recent_page/3`, `directed_handoffs*`, `get_post/2`), so
   it stops being injected into new sessions. The ROW SURVIVES. The denylist is a
   prefix HEURISTIC, so a false positive that silently destroyed a coordination post
-  would be strictly worse than a flagged one; hard redaction stays the deliberate
-  operator action (`Loopctl.Coordination.delete_post/5`), which still resolves a
-  quarantined post by id.
+  would be strictly worse than a flagged one.
+
+  ### The operator review loop (what makes quarantine ≠ a delayed delete)
+
+  "Retained for review" is only true if a human can reach the row and act on it, so the
+  quarantine ships with a complete loop:
+
+    * READ — `Loopctl.Coordination.list_quarantined_posts/2`
+      (`GET /api/v1/channel/posts/quarantined`, `role: :user`) is the ONE read that
+      resolves quarantined rows, with full bodies. Every other read hides them, and the
+      alert/audit carry field NAMES only, so without this the operator's `post_ids`
+      sample would 404 everywhere.
+    * EXONERATE — `Loopctl.Coordination.release_post/3`
+      (`POST /api/v1/channel/posts/:id/release`, `role: :user`, audited) clears the
+      quarantine and stamps `quarantine_released_at`, which removes the row from THIS
+      worker's candidate set for good (otherwise the next run re-flags it).
+    * REDACT — `Loopctl.Coordination.delete_post/5` stays the destructive path and still
+      resolves a quarantined post by id.
+    * RETENTION — quarantining EXTENDS `expires_at` to at least
+      `ChannelPost.quarantine_review_days/0` days out, so the TTL sweeper
+      (`Loopctl.Workers.ChannelPostSweeper`, which deletes on the bare `expires_at`
+      predicate) cannot hard-delete the evidence out from under an open, deliberately
+      never-auto-resolved anomaly. The sweep stays the single deleter and retention
+      stays bounded; a quarantined row is invisible to every read for the whole window,
+      so the longer life costs no exposure.
+
+  A keyed working-state slot has a fourth, self-service exit: reposting the same key with
+  clean content takes the ON CONFLICT DO UPDATE, which CLEARS the quarantine (the
+  incoming write passed the write-time gate, so it is provably clean) instead of writing
+  new content into a permanently hidden row.
 
   ## Bounded, resumable, idempotent
 
@@ -71,11 +98,15 @@ defmodule Loopctl.Workers.ChannelPostRescanWorker do
   1. **No auto-resolve.** A quarantined credential stays an OPEN operator item until a
      human reviews the post. Nothing about a later clean run means the leak was handled,
      so auto-closing would write a false `resolved` claim into the audit log.
-  2. **A resolved anomaly does NOT suppress a new one.** For the episode detectors a
-     resolved row means "the operator acknowledged this ongoing condition". Here every
-     flag is a DISCRETE new leak, so after an operator resolves, the next detection
-     creates and alerts again. Only ARCHIVING suppresses (the operator's explicit,
-     reversible escape hatch).
+  2. **Neither a resolved NOR an open anomaly suppresses a new alert.** For the episode
+     detectors an open row means "this ONE ongoing condition is already paged" and a
+     resolved row means "the operator acknowledged it". Here every flag is a DISCRETE,
+     individually-actionable new leak, so credentials 2..N must page too: a run that
+     flags anything accumulates the figures into the open anomaly and re-notifies, and
+     after an operator resolves, the next detection creates and alerts again. Alarm
+     fatigue is bounded structurally — at most one page per tenant per hourly run, and
+     only on a run that actually flagged something. Only ARCHIVING suppresses (the
+     operator's explicit, reversible escape hatch).
 
   ### No tenant webhook (deliberate)
 
@@ -245,6 +276,10 @@ defmodule Loopctl.Workers.ChannelPostRescanWorker do
     ChannelPost
     |> where([p], p.expires_at > ^now)
     |> where([p], is_nil(p.quarantined_at))
+    # An operator EXONERATED this row (`Coordination.release_post/3`). Skip it
+    # permanently: the patterns that flagged it have not changed, so re-examining it
+    # would re-quarantine it within the hour and make release cosmetic.
+    |> where([p], is_nil(p.quarantine_released_at))
     |> where([p], is_nil(p.rescanned_at) or p.rescanned_at < ^revision)
     |> order_by([p], asc_nulls_first: p.rescanned_at, asc: p.seq)
     |> limit(^limit)
@@ -254,6 +289,15 @@ defmodule Loopctl.Workers.ChannelPostRescanWorker do
   # The stamp is a single bulk UPDATE over the CLEAN ids (offenders already carry
   # `rescanned_at` from their quarantine changeset, and are excluded from future
   # candidate queries by `quarantined_at` anyway).
+  #
+  # `rescanned_at` is the ONLY column written, and `updated_at` is deliberately LEFT
+  # ALONE (`update_all` does not auto-touch timestamps). `updated_at` is load-bearing
+  # for the coordination DELTA contract: `Coordination.recent_page/3` filters AND orders
+  # `?since=` reads on `GREATEST(inserted_at, updated_at)`. Touching it on a clean
+  # rescan would re-surface every scanned post — the whole live channel on the first
+  # runs after a deploy or a `SecretDenylist.revision/0` bump — at the head of every
+  # delta page, re-broadcasting posts each consumer already has. That is precisely the
+  # session-injection amplification #499 exists to shrink.
   defp stamp_scanned(posts, offenders, now) do
     offender_ids = MapSet.new(offenders, fn {post, _fields} -> post.id end)
 
@@ -264,7 +308,7 @@ defmodule Loopctl.Workers.ChannelPostRescanWorker do
       ids ->
         ChannelPost
         |> where([p], p.id in ^ids)
-        |> AdminRepo.update_all(set: [rescanned_at: now, updated_at: now])
+        |> AdminRepo.update_all(set: [rescanned_at: now])
 
         :ok
     end
@@ -346,16 +390,19 @@ defmodule Loopctl.Workers.ChannelPostRescanWorker do
         # The per-post quarantine + audit still happened; only the alert is suppressed.
         :suppressed
 
-      live && not live.alerted ->
-        # At-least-once recovery: the row was persisted + audited atomically but its
-        # post-commit alert never fired (crash in the gap). Re-fire, then refresh.
-        notify(tenant_id, live)
-        refresh_anomaly(live, offenders)
-
       live ->
-        # An unresolved detection is already raised for this tenant — accumulate the
-        # figures without re-paging (anti-alarm-fatigue), exactly like the siblings.
-        refresh_anomaly(live, offenders)
+        # An unresolved detection is already raised for this tenant. Unlike the #498
+        # EPISODE detectors (where an open anomaly means "this ONE ongoing condition is
+        # already paged"), every entry here is a DISCRETE, individually-actionable new
+        # leak: credentials 2..N landing on the bus after the first alert must page too,
+        # or "#499 detections are surfaced to the operator" holds only for the first
+        # one. So accumulate the figures FIRST (the alert then carries the running blast
+        # radius), then re-notify. This also subsumes the at-least-once recovery case
+        # (`alerted: false` after a crash in the persist→enqueue gap) — it re-fires for
+        # the same reason. Alarm fatigue is bounded by the worker's own hourly cadence:
+        # at most one page per tenant per run, and only on a run that flagged something.
+        refreshed = refresh_anomaly(live, offenders)
+        notify(tenant_id, refreshed)
 
       true ->
         create_anomaly(tenant_id, offenders, now)
@@ -374,14 +421,20 @@ defmodule Loopctl.Workers.ChannelPostRescanWorker do
 
   # Accumulate: `sample_count` is the RUNNING total of posts quarantined for this tenant
   # while the anomaly stays open, so an operator sees the full blast radius rather than
-  # only the most recent run's slice.
+  # only the most recent run's slice. The `post_ids` SAMPLE accumulates the same way
+  # (`merge_accumulated/2`) — a backlog drained across successive hourly runs must not leave
+  # the operator holding only the LAST batch's ids, since that list is their only direct
+  # pointer to the posts to review or redact.
   defp refresh_anomaly(anomaly, offenders) do
     total = (anomaly.sample_count || 0) + length(offenders)
 
     case anomaly
          |> IngestionAnomaly.create_changeset(%{
            sample_count: total,
-           metadata: anomaly_metadata(offenders, total)
+           metadata:
+             offenders
+             |> anomaly_metadata(total)
+             |> merge_accumulated(anomaly.metadata)
          })
          |> AdminRepo.update() do
       {:ok, updated} ->
@@ -441,6 +494,39 @@ defmodule Loopctl.Workers.ChannelPostRescanWorker do
       "denylist_revision" => DateTime.to_iso8601(SecretDenylist.revision())
     }
   end
+
+  # Carry the PREVIOUS runs' `post_ids` / `fields` forward into the refreshed metadata,
+  # oldest first, still capped at @alert_post_sample. `anomaly_metadata/2` only ever sees
+  # the CURRENT run's offenders, so without this the operator's id sample — their only
+  # pointer to the rows to review or redact via `Coordination.delete_post/5` — would be
+  # overwritten by the last batch on every drain run while `quarantined_count` climbed
+  # into the hundreds. Field names are a tiny closed set, so they merge as a sorted union.
+  defp merge_accumulated(metadata, nil), do: metadata
+
+  defp merge_accumulated(metadata, previous) when is_map(previous) do
+    %{
+      metadata
+      | "post_ids" =>
+          previous
+          |> carried("post_ids")
+          |> merged(metadata["post_ids"])
+          |> Enum.take(@alert_post_sample),
+        "fields" => previous |> carried("fields") |> merged(metadata["fields"]) |> Enum.sort()
+    }
+  end
+
+  defp merge_accumulated(metadata, _previous), do: metadata
+
+  # A previous run's metadata is JSONB round-tripped, so treat anything that is not a
+  # list as "nothing carried" rather than crashing the refresh on a hand-edited row.
+  defp carried(previous, key) do
+    case Map.get(previous, key) do
+      list when is_list(list) -> list
+      _ -> []
+    end
+  end
+
+  defp merged(carried, current), do: Enum.uniq(carried ++ current)
 
   # insert_all + on_conflict: :nothing against the unresolved unique partial index, with
   # the `detected` audit entry in the SAME transaction — the sibling detectors' shape.
@@ -605,28 +691,48 @@ defmodule Loopctl.Workers.ChannelPostRescanWorker do
   # so a crontab deploy ahead of either migration skips quietly and self-heals.
   defp schema_ready?, do: quarantine_column_present?() and secret_detected_check_ready?()
 
+  # Both probes are `SELECT EXISTS (...)` and SCHEMA-QUALIFIED to the connection's own
+  # search_path (`current_schemas(false)`), for two reasons that together decide whether
+  # the security rescan runs at all:
+  #
+  #   * `information_schema.columns` and `pg_constraint` are database-wide — `conname` is
+  #     unique per SCHEMA, not per database. A second `channel_posts` (or a restored
+  #     `pg_dump` in a secondary schema) visible to this role would return TWO rows, and
+  #     a strict single-row match (`rows: [[1]]`) would fall through to `false`,
+  #     DISABLING the rescan silently and permanently.
+  #   * `EXISTS` collapses any row count to exactly one boolean, so the match can never
+  #     be cardinality-sensitive again.
+  #
+  # Restricting to the search path also means the probe answers about the objects this
+  # connection's queries actually resolve to, not about some namesake elsewhere.
+  # BOTH quarantine columns must be present — `quarantined_at` (migration 20260722140000)
+  # AND `quarantine_released_at` (20260722140002), which `due_posts/2` filters on. A
+  # deploy that landed between the two migrations must skip, not crash on an
+  # UndefinedColumn every retry.
   defp quarantine_column_present? do
     case AdminRepo.query(
-           "SELECT 1 FROM information_schema.columns WHERE table_name = 'channel_posts' " <>
-             "AND column_name = 'quarantined_at'",
+           "SELECT COUNT(DISTINCT column_name) = 2 FROM information_schema.columns " <>
+             "WHERE table_name = 'channel_posts' " <>
+             "AND column_name IN ('quarantined_at', 'quarantine_released_at') " <>
+             "AND table_schema = ANY(current_schemas(false))",
            []
          ) do
-      {:ok, %{rows: [[1]]}} -> true
+      {:ok, %{rows: [[true]]}} -> true
       _ -> false
     end
   end
 
   defp secret_detected_check_ready? do
     case AdminRepo.query(
-           "SELECT pg_get_constraintdef(oid) FROM pg_constraint " <>
-             "WHERE conname = 'ingestion_anomalies_anomaly_type_check'",
+           "SELECT EXISTS (SELECT 1 FROM pg_constraint c " <>
+             "JOIN pg_namespace n ON n.oid = c.connamespace " <>
+             "WHERE c.conname = 'ingestion_anomalies_anomaly_type_check' " <>
+             "AND n.nspname = ANY(current_schemas(false)) " <>
+             "AND pg_get_constraintdef(c.oid) LIKE '%secret_detected%')",
            []
          ) do
-      {:ok, %{rows: [[definition]]}} when is_binary(definition) ->
-        String.contains?(definition, "secret_detected")
-
-      _ ->
-        false
+      {:ok, %{rows: [[true]]}} -> true
+      _ -> false
     end
   end
 

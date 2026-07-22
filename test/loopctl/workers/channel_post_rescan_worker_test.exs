@@ -12,6 +12,7 @@ defmodule Loopctl.Workers.ChannelPostRescanWorkerTest do
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Knowledge.IngestionAnomaly
+  alias Loopctl.Security.SecretDenylist
   alias Loopctl.TelemetryEvents
   alias Loopctl.Workers.ChannelPostRescanWorker
   alias Loopctl.Workers.ScaleAlertDeliveryWorker
@@ -102,6 +103,14 @@ defmodule Loopctl.Workers.ChannelPostRescanWorkerTest do
 
   defp reload(post), do: AdminRepo.get(ChannelPost, post.id)
 
+  # An instant `seconds` away from the declared denylist revision, at the microsecond
+  # precision `rescanned_at` (`:utc_datetime_usec`) requires.
+  defp revision_offset(seconds) do
+    SecretDenylist.revision()
+    |> DateTime.add(seconds, :second)
+    |> then(&%{&1 | microsecond: {0, 6}})
+  end
+
   describe "perform/1 — retroactive detection" do
     # AC-499.1: a post written BEFORE the pattern existed is DETECTED and FLAGGED —
     # and, crucially, NOT deleted.
@@ -143,7 +152,92 @@ defmodule Loopctl.Workers.ChannelPostRescanWorkerTest do
       assert is_nil(reloaded.quarantined_at)
       assert is_nil(reloaded.quarantine_reason)
       assert %DateTime{} = reloaded.rescanned_at
+      # `updated_at` is the DELTA-READ watermark (recent_page/3 filters AND orders
+      # `?since=` on GREATEST(inserted_at, updated_at)). A clean rescan must NOT touch
+      # it, or every run re-broadcasts the whole live channel to every ?since= consumer
+      # — the amplification #499 exists to shrink.
+      assert reloaded.updated_at == clean.updated_at
       assert quarantine_audits(ctx.tenant.id) == []
+    end
+
+    # The behavioural half of the assertion above: after a rescan, a delta consumer whose
+    # cursor predates the run must see NOTHING new.
+    test "a rescanned clean post does not re-surface in a ?since= delta read" do
+      ctx = setup_context()
+
+      # An OLD post, comfortably outside the delta read's commit-lag look-back.
+      old = DateTime.add(DateTime.utc_now(), -3600, :second)
+      insert_post(ctx, %{inserted_at: old, updated_at: old})
+
+      # A consumer that has already read everything up to now.
+      since = DateTime.utc_now()
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      assert {[], false, _cursor} =
+               Coordination.recent_page(ctx.tenant.id, ctx.project.id, since: since)
+    end
+
+    # AC-499.1's headline: RETROACTIVITY. A post already scanned under an OLDER pattern
+    # set (rescanned_at < SecretDenylist.revision/0) is re-examined and caught.
+    test "re-examines a post scanned BEFORE the current denylist revision" do
+      ctx = setup_context()
+      before_revision = revision_offset(-3600)
+
+      stale =
+        insert_post(ctx, %{body: "written earlier #{@secret}", rescanned_at: before_revision})
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      reloaded = reload(stale)
+      assert %DateTime{} = reloaded.quarantined_at
+      assert reloaded.quarantine_reason == "secret_denylist: body"
+    end
+
+    # The bound that stops the worker re-walking the whole corpus every hour: a post
+    # already scanned UNDER the current revision is skipped, even if it would match.
+    test "skips a post already scanned at or after the current denylist revision" do
+      ctx = setup_context()
+      after_revision = revision_offset(3600)
+
+      scanned =
+        insert_post(ctx, %{body: "already vetted #{@secret}", rescanned_at: after_revision})
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      reloaded = reload(scanned)
+      assert is_nil(reloaded.quarantined_at)
+      assert reloaded.rescanned_at == after_revision
+    end
+
+    # Quarantine must not let the TTL sweeper delete the operator's only reviewable
+    # artifact while the (never auto-resolved) anomaly is still open.
+    test "extends expires_at to the operator review window when quarantining" do
+      ctx = setup_context()
+
+      offender =
+        insert_post(ctx, %{
+          body: "leak #{@secret}",
+          # About to be swept: one day of TTL left.
+          expires_at: DateTime.add(DateTime.utc_now(), 86_400, :second)
+        })
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      reloaded = reload(offender)
+      review_floor = DateTime.add(DateTime.utc_now(), 29 * 86_400, :second)
+      assert DateTime.compare(reloaded.expires_at, review_floor) == :gt
+    end
+
+    test "never SHORTENS the TTL of a post that already outlives the review window" do
+      ctx = setup_context()
+      far_future = DateTime.add(DateTime.utc_now(), 120 * 86_400, :second)
+
+      offender = insert_post(ctx, %{body: "leak #{@secret}", expires_at: far_future})
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      assert DateTime.compare(reload(offender).expires_at, far_future) == :eq
     end
 
     # An expired post is already invisible to every read and the TTL sweep is about to
@@ -307,6 +401,48 @@ defmodule Loopctl.Workers.ChannelPostRescanWorkerTest do
       assert suppressed.sample_count == 1
     end
 
+    # A leaked credential is a DISCRETE, individually-actionable security event — unlike
+    # the #498 episode detectors, where an open anomaly means the ONE ongoing condition
+    # is already paged. Credentials 2..N must page too, or "#499 detections are surfaced
+    # to the operator" holds only for the first one.
+    test "re-alerts on a LATER distinct detection while the anomaly is still open" do
+      ctx = setup_context()
+      insert_post(ctx, %{body: "leak #{@secret}"})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+        assert_enqueued(worker: ScaleAlertDeliveryWorker)
+
+        [anomaly] = anomalies_for(ctx.tenant.id)
+        assert anomaly.alerted == true
+
+        # A SECOND, distinct leak lands while the first anomaly is unresolved.
+        insert_post(ctx, %{body: "another #{@secret}"})
+        assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+        # TWO pages, not one — and the figures accumulated.
+        assert length(all_enqueued(worker: ScaleAlertDeliveryWorker)) == 2
+        assert [%{sample_count: 2}] = anomalies_for(ctx.tenant.id)
+      end)
+    end
+
+    # The operator's `post_ids` sample is their only direct pointer to the rows to
+    # review or redact. A backlog drained across successive bounded runs must not leave
+    # them holding the LAST batch only.
+    test "accumulates post_ids across runs instead of replacing them" do
+      ctx = setup_context()
+      first = insert_post(ctx, %{body: "leak #{@secret}"})
+      second = insert_post(ctx, %{body: "another #{@secret}"})
+
+      job = %Oban.Job{args: %{"limit" => 1}}
+      assert :ok = ChannelPostRescanWorker.perform(job)
+      assert :ok = ChannelPostRescanWorker.perform(job)
+
+      assert [anomaly] = anomalies_for(ctx.tenant.id)
+      assert anomaly.sample_count == 2
+      assert Enum.sort(anomaly.metadata["post_ids"]) == Enum.sort([first.id, second.id])
+    end
+
     test "emits per-hit quarantine telemetry with field names only" do
       ctx = setup_context()
       attach_quarantine_telemetry(ctx.tenant.id)
@@ -341,6 +477,49 @@ defmodule Loopctl.Workers.ChannelPostRescanWorkerTest do
       assert {:error, :not_found} = Coordination.get_post(ctx.tenant.id, offender.id)
       assert Coordination.recent(ctx.tenant.id, ctx.project.id) == []
       assert Coordination.directed_handoffs(ctx.tenant.id, ctx.project.id, %{}) == []
+    end
+  end
+
+  describe "perform/1 — version-skew probes" do
+    # The catalog probes decide whether the whole security rescan runs. `conname` is
+    # unique per SCHEMA (and information_schema.columns is database-wide), so a
+    # NAMESAKE object — a staging schema, a pg_dump restored alongside — must not make
+    # the probe fall through to "migration pending" and disable the rescan forever.
+    test "still runs when a namesake channel_posts exists in another schema" do
+      ctx = setup_context()
+      schema = "skew_#{System.unique_integer([:positive])}"
+      AdminRepo.query!("CREATE SCHEMA #{schema}")
+      AdminRepo.query!("CREATE TABLE #{schema}.channel_posts (quarantined_at timestamptz)")
+
+      offender = insert_post(ctx, %{body: "leak #{@secret}"})
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      assert %DateTime{} = reload(offender).quarantined_at
+    end
+
+    # The other half: a crontab deploy that lands AHEAD of the migrations must skip
+    # quietly (and self-heal next run) rather than burn Oban retries.
+    test "skips quietly, warning, when the quarantine migration is not visible" do
+      ctx = setup_context()
+      offender = insert_post(ctx, %{body: "leak #{@secret}"})
+      schema = "skew_#{System.unique_integer([:positive])}"
+      AdminRepo.query!("CREATE SCHEMA #{schema}")
+
+      log =
+        capture_log(fn ->
+          # An empty search_path stands in for "the migrations have not landed yet".
+          AdminRepo.query!("SET LOCAL search_path TO #{schema}")
+
+          try do
+            assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+          after
+            AdminRepo.query!(~s|SET LOCAL search_path TO "$user", public|)
+          end
+        end)
+
+      assert log =~ "migration pending"
+      assert is_nil(reload(offender).quarantined_at)
     end
   end
 

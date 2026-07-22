@@ -129,6 +129,11 @@ defmodule Loopctl.Coordination.ChannelPost do
 
   @secret_error_message "must not contain a secret or credential"
 
+  # Minimum time a QUARANTINED post is retained for operator review (issue #499). The
+  # TTL sweeper hard-deletes on `expires_at`, so quarantining extends the deadline to at
+  # least this far out — see `quarantine_changeset/3`.
+  @quarantine_review_days 30
+
   # Text fields that must never carry a NUL byte (Postgres rejects them at insert
   # time with a raw Postgrex.Error/500) nor a denylisted credential shape.
   @scanned_text_fields [
@@ -196,6 +201,14 @@ defmodule Loopctl.Coordination.ChannelPost do
     # only and MUST NEVER carry the matched value.
     field :quarantined_at, :utc_datetime_usec
     field :quarantine_reason, :string
+
+    # The operator's EXONERATION marker (`Loopctl.Coordination.release_post/3`, role
+    # `:user`). Non-NULL = a human reviewed the quarantine and judged it a false
+    # positive, so the row is live again AND permanently out of the rescan candidate
+    # set — without it, the next run under the same patterns would instantly re-flag
+    # the post and release would be cosmetic. Cleared when a keyed slot is overwritten
+    # with new content, so an exonerated slot never becomes a scan-exempt channel.
+    field :quarantine_released_at, :utc_datetime_usec
 
     # The rescan cursor: when this row was last examined by the rescan worker. Older
     # than `Loopctl.Security.SecretDenylist.revision/0` (or NULL) means "due for a
@@ -316,24 +329,65 @@ defmodule Loopctl.Coordination.ChannelPost do
   — never the matched value, which would copy the credential into a second column.
 
   Quarantine is deliberately NOT a delete: the row survives for operator review, and
-  `Loopctl.Coordination.delete_post/5` remains the explicit redaction path.
+  `Loopctl.Coordination.delete_post/5` remains the explicit redaction path (with
+  `Loopctl.Coordination.release_post/3` the exoneration path for a false positive).
+
+  It also EXTENDS `expires_at` to at least `#{@quarantine_review_days}` days out (never
+  shortens it). The row is the operator's only reviewable artifact — the audit entry and
+  the anomaly carry FIELD NAMES only — and the `:secret_detected` anomaly is deliberately
+  never auto-resolved, so it stays an open item pointing at these post ids. Without the
+  extension, a post quarantined on day 29 of its 30-day TTL would be hard-deleted by
+  `Loopctl.Workers.ChannelPostSweeper` within a day and the operator would be left with
+  an open alert whose evidence no longer resolves. Extending (rather than exempting
+  quarantined rows from the sweep) keeps the TTL sweep the SINGLE deleter and keeps
+  retention bounded — a quarantined row is invisible to every read for the whole window,
+  so the longer life costs no exposure.
   """
   @spec quarantine_changeset(t(), [atom()], DateTime.t()) :: Ecto.Changeset.t()
   def quarantine_changeset(%__MODULE__{} = post, fields, at) do
     reason = "secret_denylist: " <> (fields |> Enum.map_join(",", &to_string/1))
 
-    change(post, quarantined_at: at, quarantine_reason: reason, rescanned_at: at)
+    change(post,
+      quarantined_at: at,
+      quarantine_reason: reason,
+      rescanned_at: at,
+      expires_at: review_deadline(post.expires_at, at)
+    )
+  end
+
+  # Never SHORTENS a TTL: a post that already outlives the review window keeps its own
+  # `expires_at`.
+  defp review_deadline(expires_at, at) do
+    deadline = DateTime.add(at, @quarantine_review_days * 86_400, :second)
+
+    case expires_at do
+      %DateTime{} = current ->
+        if DateTime.compare(current, deadline) == :gt, do: current, else: deadline
+
+      _ ->
+        deadline
+    end
   end
 
   @doc """
-  Changeset stamping the rescan cursor on a post that scanned CLEAN (issue #499).
+  Changeset RELEASING a quarantined post — the operator's exoneration path (issue #499).
 
-  Advances `rescanned_at` so successive bounded runs make progress instead of
-  re-scanning the same head batch. A `Loopctl.Security.SecretDenylist.revision/0` bump
-  makes every stamped row eligible again.
+  Applied by `Loopctl.Coordination.release_post/3` (role `:user`, audited) when a human
+  reviews a quarantine and judges it a FALSE POSITIVE. Clears `quarantined_at` /
+  `quarantine_reason` so every coordination read surfaces the post again, and stamps
+  `quarantine_released_at` so the rescan worker permanently skips the row — otherwise the
+  very next run, under the SAME pattern set that flagged it, would re-quarantine it and
+  the release would be cosmetic.
   """
-  @spec rescanned_changeset(t(), DateTime.t()) :: Ecto.Changeset.t()
-  def rescanned_changeset(%__MODULE__{} = post, at), do: change(post, rescanned_at: at)
+  @spec release_changeset(t(), DateTime.t()) :: Ecto.Changeset.t()
+  def release_changeset(%__MODULE__{} = post, at) do
+    change(post,
+      quarantined_at: nil,
+      quarantine_reason: nil,
+      quarantine_released_at: at,
+      rescanned_at: at
+    )
+  end
 
   @doc """
   Returns the PERSISTED fields of `post` whose value carries a denylisted credential
@@ -355,6 +409,13 @@ defmodule Loopctl.Coordination.ChannelPost do
   @doc "Maximum allowed `body` length in bytes."
   @spec body_max_length() :: pos_integer()
   def body_max_length, do: @body_max_length
+
+  @doc """
+  Minimum number of days a QUARANTINED post is retained for operator review before the
+  TTL sweep may reclaim it (issue #499).
+  """
+  @spec quarantine_review_days() :: pos_integer()
+  def quarantine_review_days, do: @quarantine_review_days
 
   @doc "Maximum number of items allowed in the `refs` list."
   @spec refs_max_items() :: pos_integer()

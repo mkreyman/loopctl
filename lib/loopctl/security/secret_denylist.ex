@@ -68,7 +68,18 @@ defmodule Loopctl.Security.SecretDenylist do
   # exactly the reactive-only behaviour #499 exists to remove. Forgetting to bump it is
   # not a correctness fault for NEW writes (the write-time gate uses the live patterns),
   # only a missed retroactive sweep.
+  # Forgetting the bump is NOT left to a code comment. `fingerprint/0` below is derived
+  # MECHANICALLY from the pattern SOURCES, and `secret_denylist_test.exs` pins it
+  # against `@declared_fingerprint`: any edit to @patterns reddens that test, whose
+  # failure message tells you to bump BOTH this timestamp and the declared fingerprint
+  # in the same commit. That converts a silently-missed retroactive sweep — which
+  # telemetry cannot distinguish from a healthy zero-hit run — into a failing build.
   @revision ~U[2026-07-22 00:00:00Z]
+
+  # Stable, content-derived identity of the pattern SET. Derived from each regex's
+  # `source` (never the compiled `re_pattern` binary, which is an opaque, potentially
+  # OTP-version-dependent term) so the value is reproducible across releases.
+  @pattern_fingerprint :erlang.phash2(Enum.map(@patterns, & &1.source))
 
   @doc """
   The instant the denylist pattern set last changed.
@@ -76,9 +87,24 @@ defmodule Loopctl.Security.SecretDenylist do
   Consumers that cache an "already scanned" marker (the coordination rescan) compare their
   marker against this to decide whether a previously-scanned row must be re-examined
   under the current patterns.
+
+  Kept honest by the `fingerprint/0` guard test — see the module source.
   """
   @spec revision() :: DateTime.t()
   def revision, do: @revision
+
+  @doc """
+  A stable content hash of the pattern SET (derived from the regex sources).
+
+  This exists ONLY to bind `revision/0` to the patterns it claims to describe: the
+  retroactive rescan (issue #499) re-examines a post solely on the `revision/0`
+  timestamp, so a new credential shape shipped WITHOUT a bump would apply to future
+  writes only — and no telemetry could distinguish "nothing to find" from "retroactivity
+  quietly disabled". The guard test asserts this value, so the pattern set cannot change
+  without a deliberate, reviewed revision bump.
+  """
+  @spec fingerprint() :: non_neg_integer()
+  def fingerprint, do: @pattern_fingerprint
 
   @doc """
   Returns `true` when `value` matches any denylisted secret pattern.

@@ -30,14 +30,25 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   tags(["Knowledge Wiki"])
 
   operation(:index,
-    summary: "List ingestion anomalies (capture-silence, high-reject-rate, sweep-stalled)",
+    summary:
+      "List ingestion anomalies (capture-silence, high-reject-rate, sweep-stalled, " <>
+        "secret-detected)",
     description:
       "Returns unresolved ingestion anomalies for the tenant — capture_silence " <>
         "(a source_type that stopped producing articles), high_reject_rate (writes " <>
-        "attempted but rejected at high rate, which persist no article row), and " <>
+        "attempted but rejected at high rate, which persist no article row), " <>
         "sweep_stalled (the channel-post retention sweep is no longer enforcing the " <>
         "30-day window for this tenant, recorded under the reserved source_type " <>
-        "channel_post_sweep). " <>
+        "channel_post_sweep), and secret_detected (the retroactive denylist rescan " <>
+        "QUARANTINED at least one live coordination post carrying a credential shape, " <>
+        "recorded under the reserved source_type channel_post_rescan). " <>
+        "secret_detected is a SECURITY detection, not a health signal: it is never " <>
+        "auto-resolved, its metadata carries quarantined_count plus a bounded sample of " <>
+        "post_ids and the offending FIELD NAMES (never a matched value), and the " <>
+        "quarantined rows themselves are readable only via GET " <>
+        "/api/v1/channel/posts/quarantined (role user), then redacted with DELETE " <>
+        "/api/v1/channel/posts/{id} or exonerated with POST " <>
+        "/api/v1/channel/posts/{id}/release. " <>
         "NOTE — surface overload: sweep_stalled is a COORDINATION-BUS retention alert, " <>
         "not a knowledge-ingestion one. It is served here because it reuses the same " <>
         "anomaly record, alerting and recovery machinery; filter on anomaly_type to " <>
@@ -60,7 +71,9 @@ defmodule LoopctlWeb.IngestionAnomalyController do
       anomaly_type: [
         in: :query,
         type: :string,
-        description: "Filter by anomaly type: capture_silence, high_reject_rate, or sweep_stalled"
+        description:
+          "Filter by anomaly type: capture_silence, high_reject_rate, sweep_stalled, or " <>
+            "secret_detected"
       ],
       include_archived: [
         in: :query,

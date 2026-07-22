@@ -42,6 +42,21 @@ defmodule Loopctl.Coordination do
   # per-type retentions were unused).
   @retention_days 30
 
+  # Issue #499: the 422 a KEYLESS idempotent re-write gets when the row holding its
+  # token has been QUARANTINED. Names the remedy explicitly — the caller must not
+  # believe a hidden post is live, and it cannot be silently released (its stored
+  # content is what the denylist flagged).
+  @quarantined_idempotency_message "a previous post with this idempotency_key was quarantined for carrying a credential shape and is no longer readable; remove the credential and retry with a NEW idempotency_key"
+
+  # Issue #499: the 422 for the post-write invariant in `secret_guard_step/1` — the
+  # write merged cleanly but the PERSISTED row still carries a credential in a field
+  # the keyed upsert preserves (`host`, or an omitted `to_host`/`to_capability`).
+  @persisted_secret_message "this keyed slot still carries a credential shape in a field a re-post cannot overwrite (host or advisory addressing); the write was rolled back — have an operator redact or release the post"
+
+  # Issue #499: bound on one page of the operator quarantine review read.
+  @quarantined_default_limit 25
+  @quarantined_max_limit 100
+
   # US-40.B1 claim lifecycle windows.
   #   * @default_lease_seconds — a claim's default lease (how long the claimant may
   #     hold the ref before an abandoned-lease sweep may reopen it). Overridable per
@@ -445,6 +460,10 @@ defmodule Loopctl.Coordination do
           | {:error, :supersede_target_not_found}
           | {:error, :agent_not_found}
           | {:error, :conflict}
+          # Issue #499 quarantine outcomes (message-carrying 422s): the idempotency
+          # token belongs to a QUARANTINED row, or the persisted row still carries a
+          # credential in a field the keyed upsert cannot overwrite.
+          | {:error, :unprocessable_entity, String.t()}
           | {:error, Ecto.Changeset.t()}
   def post(tenant_id, agent_id, role, attrs) do
     project_id = Map.get(attrs, :project_id)
@@ -1207,6 +1226,126 @@ defmodule Loopctl.Coordination do
   end
 
   @doc """
+  Lists the tenant's QUARANTINED posts — the operator review read (issue #499).
+
+  Quarantine is deliberately not a delete because the denylist is a prefix HEURISTIC and
+  a false positive must be recoverable. That only holds if a human can actually SEE the
+  flagged rows: every ordinary read (`recent_page/3`, `directed_handoffs_page/3`,
+  `get_post/2`) hides them, and the `:secret_detected` anomaly + audit entry carry FIELD
+  NAMES only. This is the one read that resolves them, so an operator can judge true vs
+  false positive and then either redact (`delete_post/5`) or exonerate
+  (`release_post/3`) — without direct DB access.
+
+  It returns the FULL body (that IS the artifact under review), which is why the endpoint
+  is `role: :user`, not the agent-role coordination surface.
+
+  Tenant-scoped on `AdminRepo` (BYPASSRLS) with the explicit tenant filter this module
+  mandates. Newest-quarantine-first. Opts: `:project_id` (optional filter — a malformed
+  value yields an empty list, never a cast error) and `:limit`
+  (default #{@quarantined_default_limit}, clamped to #{@quarantined_max_limit}).
+  """
+  @spec list_quarantined_posts(term(), keyword()) :: [ChannelPost.t()]
+  def list_quarantined_posts(tenant_id, opts \\ []) do
+    if valid_uuid?(tenant_id) do
+      ChannelPost
+      |> where([p], p.tenant_id == ^tenant_id and not is_nil(p.quarantined_at))
+      |> apply_quarantined_project(Keyword.get(opts, :project_id))
+      |> order_by([p], desc: p.quarantined_at, desc: p.seq)
+      |> limit(^quarantined_limit(Keyword.get(opts, :limit)))
+      |> AdminRepo.all()
+    else
+      []
+    end
+  end
+
+  defp apply_quarantined_project(query, nil), do: query
+
+  defp apply_quarantined_project(query, project_id) do
+    if valid_uuid?(project_id) do
+      where(query, [p], p.project_id == ^project_id)
+    else
+      # A malformed project filter must never widen the read to the whole tenant, and
+      # must never raise a CastError — return nothing.
+      where(query, [p], false)
+    end
+  end
+
+  @doc """
+  Default page size for `list_quarantined_posts/2` — the single source of truth shared
+  with the endpoint's `meta.limit`, so the two can never drift.
+  """
+  @spec quarantined_default_limit() :: pos_integer()
+  def quarantined_default_limit, do: @quarantined_default_limit
+
+  defp quarantined_limit(limit) when is_integer(limit) and limit > 0,
+    do: min(limit, @quarantined_max_limit)
+
+  defp quarantined_limit(_), do: @quarantined_default_limit
+
+  @doc """
+  RELEASES a quarantined post — the operator's exoneration path (issue #499).
+
+  The counterpart to `delete_post/5`: redact when the flag was RIGHT, release when it was
+  WRONG. Without it, the only remedy for a false positive is the destructive one that
+  quarantine-over-delete was chosen to avoid.
+
+  Clears `quarantined_at`/`quarantine_reason` (so every read surfaces the post again) and
+  stamps `quarantine_released_at`, which permanently removes the row from the rescan
+  candidate set — otherwise the next run, under the SAME patterns that flagged it, would
+  re-quarantine it within the hour and the release would be cosmetic.
+
+  Tenant-scoped and ORACLE-SAFE exactly like `delete_post/5`: a malformed, nonexistent,
+  foreign-tenant, or NOT-quarantined id all return `{:error, :not_found}` — byte-identical.
+  Authorization is the ROUTE's `role: :user` plug (an agent must never be able to unhide a
+  post the security rescan flagged); this function does not re-derive it, mirroring how
+  the other operator-only context calls are gated at the edge.
+
+  The update and its audit entry (`entity_type: "channel_post"`, action
+  `"quarantine_released"`, carrying the cleared reason) run in ONE transaction, so an
+  exoneration is as accountable as the detection that preceded it.
+  """
+  @spec release_post(term(), term(), keyword()) ::
+          {:ok, ChannelPost.t()} | {:error, :not_found | :audit_write_failed}
+  def release_post(tenant_id, post_id, audit \\ []) do
+    with true <- valid_uuid?(tenant_id) and valid_uuid?(post_id),
+         %ChannelPost{quarantined_at: %DateTime{}} = post <- fetch_owned_post(tenant_id, post_id) do
+      run_release(tenant_id, post, audit)
+    else
+      _ -> {:error, :not_found}
+    end
+  end
+
+  defp run_release(tenant_id, %ChannelPost{} = post, audit) do
+    reason = post.quarantine_reason
+
+    multi =
+      Multi.new()
+      |> Multi.update(:post, ChannelPost.release_changeset(post, DateTime.utc_now()))
+      |> Audit.log_in_multi(:audit, fn %{post: released} ->
+        %{
+          tenant_id: tenant_id,
+          project_id: released.project_id,
+          entity_type: "channel_post",
+          entity_id: released.id,
+          action: "quarantine_released",
+          actor_type: Keyword.get(audit, :actor_type, "api_key"),
+          actor_id: Keyword.get(audit, :actor_id),
+          actor_label: Keyword.get(audit, :actor_label),
+          # FIELD NAMES only, carried over from the quarantine — never the value.
+          metadata: %{
+            "cleared_reason" => reason,
+            "author_agent_id" => released.agent_id
+          }
+        }
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{post: released}} -> {:ok, released}
+      {:error, _step, _reason, _changes} -> {:error, :audit_write_failed}
+    end
+  end
+
+  @doc """
   Fetches ONE post by id, tenant-scoped, returning its FULL body — the public,
   shared by-id read (US-40.D1). This is the SINGLE shared by-id path: the
   oracle-safe `GET /channel/posts/:id` endpoint uses it here, and graduate
@@ -1487,6 +1626,7 @@ defmodule Loopctl.Coordination do
     multi =
       Multi.new()
       |> Multi.insert(:post, changeset, insert_opts)
+      |> secret_guard_step()
       |> maybe_supersede_step(supersedes)
       |> Audit.log_in_multi(:audit_post, fn %{post: post} ->
         audit_attrs(tenant_id, post, post_outcome(post), audit, changeset, supersedes)
@@ -1511,6 +1651,9 @@ defmodule Loopctl.Coordination do
           tap_secret_blocked({:error, failed})
         end
 
+      {:error, :secret_guard, :persisted_secret, _changes} ->
+        {:error, :unprocessable_entity, @persisted_secret_message}
+
       {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
     end
@@ -1522,6 +1665,28 @@ defmodule Loopctl.Coordination do
     # a nonexistent target returns — never a 500. Mirrors `run_delete/4` and
     # `run_claim_lifecycle/7`.
     Ecto.StaleEntryError -> {:error, :supersede_target_not_found}
+  end
+
+  # POST-WRITE INVARIANT (issue #499): no row may be left PERSISTED carrying a
+  # denylisted credential shape in ANY scanned field. `create_changeset/2` gates the
+  # INCOMING attrs, which covers every fresh insert — but a keyed UPSERT is a merge:
+  # `body`/`refs` are replaced, while `host` is set-once and `to_host`/`to_capability`
+  # are preserve-on-omit (COALESCE). So a slot quarantined for a credential in one of
+  # those PRESERVED fields would have its quarantine cleared by the ON CONFLICT DO
+  # UPDATE (which cannot know WHICH field was dirty) while the credential is still
+  # there — re-exposing it. Re-running the SHARED scan (`ChannelPost.secret_fields/1`,
+  # the same primitive and the same bounds as the write-time gate) over the PERSISTED
+  # row closes that: a dirty preserved field rolls the whole transaction back, so the
+  # slot keeps its quarantine and the caller gets an honest 422 naming the remedy,
+  # instead of a silent re-publication. On every ordinary write this is a bounded,
+  # already-clean scan that always passes.
+  defp secret_guard_step(multi) do
+    Multi.run(multi, :secret_guard, fn _repo, %{post: post} ->
+      case ChannelPost.secret_fields(post) do
+        [] -> {:ok, :clean}
+        _fields -> {:error, :persisted_secret}
+      end
+    end)
   end
 
   # US-454 (defect 3): when the post declares `supersedes: <target>`, mark the
@@ -1622,6 +1787,16 @@ defmodule Loopctl.Coordination do
     idempotency_key = Ecto.Changeset.get_field(failed, :idempotency_key)
 
     case get_post_by_idempotency_key(tenant_id, project_id, agent_id, idempotency_key) do
+      # Issue #499: the row holding this token was QUARANTINED (it carries a credential
+      # shape under the current denylist) and is hidden from every read. Reporting
+      # `:deduplicated` would tell the caller "your post is on the channel" about a row
+      # nobody can see — the same silent black hole the keyed-slot upsert avoids, except
+      # here the stored content is provably DIRTY, so it cannot simply be released.
+      # Fail LOUDLY instead, mirroring the write-time gate's contract (the caller learns
+      # the information did not land) and name the remedy.
+      %ChannelPost{quarantined_at: %DateTime{}} ->
+        {:error, :unprocessable_entity, @quarantined_idempotency_message}
+
       %ChannelPost{} = existing ->
         {:ok, existing, :deduplicated}
 
@@ -1715,6 +1890,20 @@ defmodule Loopctl.Coordination do
   # instead of NULL-wiping it (see the insert_opts/1 comment for why addressing is
   # preserve-on-omit while body is full-replace). Mirrors the `EXCLUDED`-driven
   # on_conflict query in `Loopctl.AuditChain`.
+  # Issue #499: the DO UPDATE also CLEARS the quarantine bookkeeping
+  # (`quarantined_at`/`quarantine_reason`/`quarantine_released_at`/`rescanned_at`).
+  # Without it, a quarantined keyed slot is a permanent BLACK HOLE: the partial unique
+  # index does not exclude quarantined rows, so the single most likely remediation —
+  # the same agent+session reposting that key WITHOUT the credential — takes DO UPDATE,
+  # returns 200 with `:updated`, and the row stays hidden from `recent_page/3`,
+  # `directed_handoffs_page/3` and `get_post/2` forever, carrying a
+  # `quarantine_reason` that describes content no longer present. Clearing is safe
+  # BECAUSE the incoming write already passed the write-time denylist gate in
+  # `create_changeset/2` — it is provably clean under the CURRENT pattern set, which is
+  # exactly the standard the rescan applies. `rescanned_at` is nulled (not stamped) so
+  # the new content is re-examined on the next rescan, and the operator's release marker
+  # is cleared with it so an exonerated slot never becomes a permanently scan-exempt
+  # channel for later content.
   defp keyed_slot_on_conflict do
     from(p in ChannelPost,
       update: [
@@ -1724,7 +1913,11 @@ defmodule Loopctl.Coordination do
           to_host: fragment("COALESCE(EXCLUDED.to_host, ?)", p.to_host),
           to_capability: fragment("COALESCE(EXCLUDED.to_capability, ?)", p.to_capability),
           updated_at: fragment("EXCLUDED.updated_at"),
-          expires_at: fragment("EXCLUDED.expires_at")
+          expires_at: fragment("EXCLUDED.expires_at"),
+          quarantined_at: fragment("NULL::timestamptz"),
+          quarantine_reason: fragment("NULL::text"),
+          quarantine_released_at: fragment("NULL::timestamptz"),
+          rescanned_at: fragment("NULL::timestamptz")
         ]
       ]
     )

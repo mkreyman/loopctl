@@ -19,6 +19,14 @@ defmodule LoopctlWeb.ChannelPostController do
     the action against the verified key), deliberately NOT behind
     `RequireHumanAnchor`.
 
+  - `GET /api/v1/channel/posts/quarantined` — role `:user`, the OPERATOR review read
+    for issue #499: the only path that resolves posts the retroactive secret rescan
+    quarantined (every agent-facing read hides them), returning full bodies so a
+    human can judge true vs false positive.
+  - `POST /api/v1/channel/posts/:id/release` — role `:user` + human-anchored, clears
+    a quarantine (false-positive exoneration) and permanently removes the row from
+    the rescan candidate set. The non-destructive counterpart to DELETE.
+
   ## Trust posture (owner decision #331, design brief §4)
 
   This is a COORDINATION surface, NOT chain-of-custody: posting to your own
@@ -104,6 +112,17 @@ defmodule LoopctlWeb.ChannelPostController do
   # `@read_actions` list as the RequireRole gate above — structural symmetry, so a
   # read action can never be role-gated without also being read-capped.
   plug :rate_limit_read when action in @read_actions
+
+  # Issue #499 — the OPERATOR quarantine-review surface. Deliberately NOT part of
+  # `@read_actions`: `:quarantined` returns the FULL bodies of posts the security
+  # rescan flagged as carrying a credential shape, and `:release` un-hides such a
+  # post. Both are human/operator judgement calls on a security finding, so they sit
+  # at `role: :user` (an agent must never be able to read back — or resurrect — a
+  # quarantined credential) and behind `RequireHumanAnchor`, matching the sibling
+  # operator surface `LoopctlWeb.IngestionAnomalyController.update/2` where the
+  # `:secret_detected` anomaly these posts raise is resolved.
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:quarantined, :release]
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:release]
 
   tags(["Coordination"])
 
@@ -342,6 +361,78 @@ defmodule LoopctlWeb.ChannelPostController do
       500 =>
         {"The delete could not be recorded in the audit trail and was rolled back; " <>
            "the post still exists. Retry the request.", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:quarantined,
+    summary: "List QUARANTINED coordination posts (operator review)",
+    description:
+      "Lists the tenant's quarantined posts — rows the retroactive secret rescan " <>
+        "(Loopctl.Workers.ChannelPostRescanWorker, issue #499) flagged as carrying a " <>
+        "credential shape under the CURRENT denylist, typically written before that pattern " <>
+        "existed. A quarantined post is hidden from EVERY other read (list, by-id, directed " <>
+        "handoffs) so it stops being injected into new sessions, and the matching " <>
+        "secret_detected ingestion anomaly carries FIELD NAMES only — this endpoint is the " <>
+        "ONLY way an operator can see the actual rows the alert's post_ids point at, judge " <>
+        "true vs false positive, and then either redact them (DELETE /channel/posts/:id) or " <>
+        "exonerate them (POST /channel/posts/:id/release). It therefore returns FULL bodies " <>
+        "and is role :user — never the agent-role coordination surface. Newest quarantine " <>
+        "first; optional project_id filter; limit defaults to 25 and is clamped to 100.",
+    parameters: [
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "Optional: restrict to one project channel"
+      ],
+      limit: [in: :query, type: :integer, description: "Max rows (default 25, clamped to 100)"]
+    ],
+    responses: %{
+      200 =>
+        {"Quarantined posts", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: %OpenApiSpex.Schema{type: :object}},
+             meta: %OpenApiSpex.Schema{type: :object}
+           }
+         }},
+      403 => {"Requires user role", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:release,
+    summary: "RELEASE a quarantined coordination post (false-positive exoneration)",
+    description:
+      "Clears the quarantine on a post the secret rescan flagged (issue #499), making it " <>
+        "readable on the channel again. The counterpart to the redact path: DELETE when the " <>
+        "flag was right, release when it was WRONG — the denylist is a prefix HEURISTIC, and " <>
+        "without this the only remedy for a false positive is the destructive one quarantine " <>
+        "exists to avoid. The release is durable: the post is permanently removed from the " <>
+        "rescan candidate set, so the next hourly run cannot re-flag it under the same " <>
+        "patterns. Role :user + human-anchored (an agent must never be able to un-hide a post " <>
+        "the security rescan quarantined). Audited in-transaction (action " <>
+        "\"quarantine_released\", carrying the cleared field-name reason). A nonexistent, " <>
+        "foreign-tenant, malformed, or NOT-currently-quarantined id all return a " <>
+        "byte-identical 404.",
+    parameters: [
+      id: [
+        in: :path,
+        type: :string,
+        required: true,
+        description: "The quarantined post id — must belong to the caller's tenant"
+      ]
+    ],
+    responses: %{
+      200 => {"The released post", "application/json", Schemas.ChannelPostFull},
+      403 => {"Requires user role / human anchor", "application/json", Schemas.ErrorResponse},
+      404 =>
+        {"No such quarantined post (nonexistent, malformed, another tenant, or not quarantined)",
+         "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"The release could not be recorded in the audit trail and was rolled back; the post " <>
+           "is still quarantined. Retry the request.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -814,84 +905,111 @@ defmodule LoopctlWeb.ChannelPostController do
       audit: AuditContext.from_conn(conn)
     }
 
-    case Coordination.post(tenant_id, agent_id, role, attrs) do
-      {:ok, post, :created} ->
-        conn
-        |> put_status(:created)
-        |> json(%{post: post, created: true, meta: post_write_meta(post)})
+    render_write(
+      conn,
+      Coordination.post(tenant_id, agent_id, role, attrs),
+      tenant_id,
+      agent_id,
+      params
+    )
+  end
 
-      {:ok, post, :updated} ->
-        conn
-        |> put_status(:ok)
-        |> json(%{post: post, created: true, meta: post_write_meta(post)})
+  # The write outcome → HTTP mapping, split out of `write_post/5` so the param
+  # marshalling and the (long, deliberately explicit) result mapping stay separately
+  # readable — and under the complexity gate.
+  defp render_write(conn, {:ok, post, :created}, _tenant_id, _agent_id, _params) do
+    conn
+    |> put_status(:created)
+    |> json(%{post: post, created: true, meta: post_write_meta(post)})
+  end
 
-      {:ok, post, :deduplicated} ->
-        # US-40.B2: a KEYLESS write whose client idempotency_key already exists
-        # for this (tenant, project, agent) — the EXISTING post is returned and
-        # nothing new was appended. 200 with `created: false` so the caller can
-        # tell a dedup from a fresh 201 append (TC-40.B2.2).
-        # Include meta for shape parity with created/updated responses.
-        conn
-        |> put_status(:ok)
-        |> json(%{post: post, created: false, meta: post_write_meta(post)})
+  defp render_write(conn, {:ok, post, :updated}, _tenant_id, _agent_id, _params) do
+    conn
+    |> put_status(:ok)
+    |> json(%{post: post, created: true, meta: post_write_meta(post)})
+  end
 
-      {:error, :supersede_target_not_found} ->
-        # US-454 (defect 3): the supersedes target does not exist, is cross-project,
-        # not owned by the caller, or is malformed. Same byte-identical 422 body as
-        # a missing project, but WITHOUT the :ownership_rejected security signal —
-        # preserving honest attribution (a bad supersedes target is NOT a project
-        # ownership probe).
-        {:error, :unprocessable_entity, @ownership_error_message}
+  defp render_write(conn, {:ok, post, :deduplicated}, _tenant_id, _agent_id, _params) do
+    # US-40.B2: a KEYLESS write whose client idempotency_key already exists
+    # for this (tenant, project, agent) — the EXISTING post is returned and
+    # nothing new was appended. 200 with `created: false` so the caller can
+    # tell a dedup from a fresh 201 append (TC-40.B2.2).
+    # Include meta for shape parity with created/updated responses.
+    conn
+    |> put_status(:ok)
+    |> json(%{post: post, created: false, meta: post_write_meta(post)})
+  end
 
-      {:error, :not_found} ->
-        # AC-39.2.3 + AC-40.D3.1/D3.4: missing, cross-tenant, AND cross-PROJECT
-        # (a non-member agent posting to a sibling project in its own tenant)
-        # ALL collapse to one byte-identical 422 — no oracle distinguishing them.
-        # The :ownership_rejected signal fires on every case, so a cross-project
-        # injection attempt is observable exactly like a cross-tenant probe.
-        emit_security_event(:ownership_rejected, %{
-          tenant_id: tenant_id,
-          agent_id: agent_id,
-          project_id: params["project_id"]
-        })
+  defp render_write(_conn, {:error, :supersede_target_not_found}, _tenant_id, _agent_id, _params) do
+    # US-454 (defect 3): the supersedes target does not exist, is cross-project,
+    # not owned by the caller, or is malformed. Same byte-identical 422 body as
+    # a missing project, but WITHOUT the :ownership_rejected security signal —
+    # preserving honest attribution (a bad supersedes target is NOT a project
+    # ownership probe).
+    {:error, :unprocessable_entity, @ownership_error_message}
+  end
 
-        {:error, :unprocessable_entity, @ownership_error_message}
+  defp render_write(_conn, {:error, :not_found}, tenant_id, agent_id, params) do
+    # AC-39.2.3 + AC-40.D3.1/D3.4: missing, cross-tenant, AND cross-PROJECT
+    # (a non-member agent posting to a sibling project in its own tenant)
+    # ALL collapse to one byte-identical 422 — no oracle distinguishing them.
+    # The :ownership_rejected signal fires on every case, so a cross-project
+    # injection attempt is observable exactly like a cross-tenant probe.
+    emit_security_event(:ownership_rejected, %{
+      tenant_id: tenant_id,
+      agent_id: agent_id,
+      project_id: params["project_id"]
+    })
 
-      {:error, :agent_not_found} ->
-        # Defense-in-depth: the key's server-stamped agent_id does not belong to
-        # this tenant (a misconfigured key — the agent FKs are non-composite, so
-        # the DB alone would accept the mis-attributed row). This is an IDENTITY
-        # fault, not a project probe, so it emits the :agent_identity_required
-        # signal + a 403 — never the :ownership_rejected project signal — keeping
-        # the two failure modes correctly attributed.
-        emit_security_event(:agent_identity_required, %{
-          tenant_id: tenant_id,
-          agent_id: agent_id,
-          project_id: params["project_id"]
-        })
+    {:error, :unprocessable_entity, @ownership_error_message}
+  end
 
-        conn
-        |> put_status(:forbidden)
-        |> json(%{
-          error: %{
-            status: 403,
-            code: "agent_identity_required",
-            message:
-              "This API key's agent identity is not valid for this tenant; it cannot post an attributed channel message"
-          }
-        })
+  defp render_write(conn, {:error, :agent_not_found}, tenant_id, agent_id, params) do
+    # Defense-in-depth: the key's server-stamped agent_id does not belong to
+    # this tenant (a misconfigured key — the agent FKs are non-composite, so
+    # the DB alone would accept the mis-attributed row). This is an IDENTITY
+    # fault, not a project probe, so it emits the :agent_identity_required
+    # signal + a 403 — never the :ownership_rejected project signal — keeping
+    # the two failure modes correctly attributed.
+    emit_security_event(:agent_identity_required, %{
+      tenant_id: tenant_id,
+      agent_id: agent_id,
+      project_id: params["project_id"]
+    })
 
-      {:error, :conflict} = err ->
-        # US-40.B2 rare double race: a keyless idempotent write's winning row was
-        # hard-deleted (US-39.7) between the failed insert and BOTH the recovery
-        # SELECT and the bounded re-append. The slot kept churning, so `post/4`
-        # returns a RETRYABLE 409 (not a misleading 422) — `action_fallback` maps
-        # `{:error, :conflict}` to a 409 the client can safely re-fire.
-        err
+    conn
+    |> put_status(:forbidden)
+    |> json(%{
+      error: %{
+        status: 403,
+        code: "agent_identity_required",
+        message:
+          "This API key's agent identity is not valid for this tenant; it cannot post an attributed channel message"
+      }
+    })
+  end
 
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
-    end
+  defp render_write(_conn, {:error, :unprocessable_entity, _message} = err, _t, _a, _p) do
+    # Issue #499 quarantine outcomes, both surfaced as an explicit 422 rather than
+    # a false success: (a) the idempotency token belongs to a QUARANTINED row, so
+    # reporting `deduplicated` would claim a hidden post is on the channel; (b) the
+    # keyed slot still carries a credential in a field a re-post cannot overwrite,
+    # so the write was rolled back. Also the pre-existing supersede-target case
+    # above, which returns the same shape with its own message.
+    err
+  end
+
+  defp render_write(_conn, {:error, :conflict} = err, _tenant_id, _agent_id, _params) do
+    # US-40.B2 rare double race: a keyless idempotent write's winning row was
+    # hard-deleted (US-39.7) between the failed insert and BOTH the recovery
+    # SELECT and the bounded re-append. The slot kept churning, so `post/4`
+    # returns a RETRYABLE 409 (not a misleading 422) — `action_fallback` maps
+    # `{:error, :conflict}` to a 409 the client can safely re-fire.
+    err
+  end
+
+  defp render_write(_conn, {:error, %Ecto.Changeset{} = changeset}, _t, _a, _p) do
+    {:error, changeset}
   end
 
   @doc """
@@ -1080,6 +1198,91 @@ defmodule LoopctlWeb.ChannelPostController do
         # back and the post STILL EXISTS. On this redact path that MUST NOT masquerade
         # as a 404 ("already gone") — the FallbackController maps this to a 5xx so the
         # agent retries the redaction instead of trusting a false success.
+        err
+    end
+  end
+
+  @doc """
+  GET /api/v1/channel/posts/quarantined
+
+  The OPERATOR review read for issue #499: lists the tenant's quarantined posts with
+  FULL bodies, so a human can judge whether the secret rescan's heuristic flag was a
+  true or false positive. Role `:user` — every agent-facing read hides these rows, and
+  the operator alert names FIELD names only, so this is the one path that resolves the
+  `post_ids` an open `secret_detected` anomaly points at.
+  """
+  def quarantined(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    limit = parse_limit(params["limit"])
+
+    posts =
+      Coordination.list_quarantined_posts(tenant_id,
+        project_id: params["project_id"],
+        limit: limit
+      )
+
+    json(conn, %{
+      data: Enum.map(posts, &quarantined_json/1),
+      meta: %{count: length(posts), limit: limit || Coordination.quarantined_default_limit()}
+    })
+  end
+
+  defp parse_limit(nil), do: nil
+
+  defp parse_limit(limit) when is_integer(limit), do: limit
+
+  defp parse_limit(limit) when is_binary(limit) do
+    case Integer.parse(limit) do
+      {value, ""} -> value
+      # A malformed ?limit falls back to the context default rather than 400ing an
+      # operator mid-incident; the context clamps the effective bound either way.
+      _ -> nil
+    end
+  end
+
+  defp parse_limit(_), do: nil
+
+  # The review payload: the FULL body (that is the artifact under review) plus the
+  # quarantine bookkeeping an operator needs to act — never a matched value, which the
+  # `quarantine_reason` deliberately never carries either.
+  defp quarantined_json(post) do
+    %{
+      id: post.id,
+      project_id: post.project_id,
+      agent_id: post.agent_id,
+      session_id: post.session_id,
+      host: post.host,
+      key: post.key,
+      body: post.body,
+      refs: post.refs,
+      quarantined_at: post.quarantined_at,
+      quarantine_reason: post.quarantine_reason,
+      inserted_at: post.inserted_at,
+      expires_at: post.expires_at
+    }
+  end
+
+  @doc """
+  POST /api/v1/channel/posts/:id/release
+
+  Exonerates a quarantined post (issue #499) — the non-destructive counterpart to the
+  redact path. Role `:user` + human-anchored. A nonexistent, foreign-tenant, malformed,
+  or not-currently-quarantined id all return the same 404 via `FallbackController`.
+  """
+  def release(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    case Coordination.release_post(tenant_id, params["id"], AuditContext.from_conn(conn)) do
+      {:ok, post} ->
+        json(conn, %{post: quarantined_json(post), released: true})
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+
+      {:error, :audit_write_failed} = err ->
+        # The release could not be durably audited, so it rolled back and the post is
+        # STILL quarantined. Never report success — the FallbackController maps this to
+        # a 5xx so the operator retries instead of trusting a false exoneration.
         err
     end
   end
