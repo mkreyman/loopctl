@@ -13,8 +13,9 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
   @now ~U[2026-07-21 00:00:00Z]
 
   # Two 1536-dim vectors: :query and :close point the same direction (cosine similarity 1),
-  # so both near-duplicate articles are exact ties in the semantic lane too.
-  defp query_vector, do: List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
+  # so both near-duplicate articles are exact ties in the semantic lane too. Per-test-unique
+  # via `Loopctl.DataCase.test_vec/2` (dissolves the shared-HNSW-index clique; see its @doc).
+  defp query_vector, do: test_vec(1536, :primary)
 
   defp create_article(tenant_id, attrs) do
     article =
@@ -73,8 +74,12 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
   end
 
   defp expect_query_embedding do
+    # Capture in THIS process: the embedding is generated in a spawned worker that lacks this
+    # process's :test_vec_axis, so a lazy `query_vector()` there would miss the articles' window.
+    qv = query_vector()
+
     Mox.expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
-      {:ok, query_vector()}
+      {:ok, qv}
     end)
   end
 

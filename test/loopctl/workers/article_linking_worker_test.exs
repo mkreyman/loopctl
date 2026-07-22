@@ -912,16 +912,19 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
   describe "real vector search (integration)" do
     @describetag :integration
 
-    defp similar_embedding, do: List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
+    # Per-test-unique via `Loopctl.DataCase.test_vec/2` (dissolves the shared-HNSW-index
+    # clique; see its @doc). `similar` == the source direction (cosine 1.0); `near_similar`
+    # adds a tiny orthogonal-window perturbation (cosine ~0.9999, well above the 0.6 link
+    # threshold); `dissimilar` is orthogonal (cosine 0).
+    defp similar_embedding, do: test_vec(1536, :primary)
 
     defp near_similar_embedding do
-      List.duplicate(1.0, 768)
-      |> List.update_at(0, fn _ -> 0.99 end)
-      |> List.update_at(1, fn _ -> 1.01 end)
-      |> Kernel.++(List.duplicate(0.01, 768))
+      primary = test_vec(1536, :primary)
+      orthogonal = test_vec(1536, :orthogonal)
+      Enum.zip_with(primary, orthogonal, fn p, o -> p + 0.01 * o end)
     end
 
-    defp dissimilar_embedding, do: List.duplicate(0.0, 768) ++ List.duplicate(1.0, 768)
+    defp dissimilar_embedding, do: test_vec(1536, :orthogonal)
 
     defp publish_with_embedding(tenant_id, embedding) do
       fixture(:article, %{

@@ -15,14 +15,15 @@ defmodule Loopctl.KnowledgeHybridTest do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.ArticleAccessEvent
 
-  # Two orthogonal "directions" + a midpoint, mirroring the pattern in
-  # knowledge_semantic_search_test.exs: cosine similarity of identical directions is
-  # 1.0, orthogonal directions is 0.0, and the midpoint sits at ~0.7033 to either —
-  # deterministic enough to sit safely below the 0.75 default threshold without
-  # floating-point flakiness.
-  @direction_a List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
-  @direction_b List.duplicate(0.0, 768) ++ List.duplicate(1.0, 768)
-  @direction_medium List.duplicate(0.5, 768) ++ List.duplicate(0.5, 768)
+  # Two orthogonal "directions" + a midpoint, mirroring knowledge_semantic_search_test.exs:
+  # cosine of identical directions is 1.0, orthogonal directions 0.0, and the midpoint sits
+  # at ~0.71 to `:primary` — safely below the 0.75 default threshold. Sourced per-test from
+  # `Loopctl.DataCase.test_vec/2` (compile-time module attributes can't be per-test, so these
+  # are functions), placing each test's vectors in a DISJOINT window of the shared HNSW index
+  # to dissolve the all-ties clique that flakes recall (see test_vec/2's @doc).
+  defp direction_a, do: test_vec(1536, :primary)
+  defp direction_b, do: test_vec(1536, :orthogonal)
+  defp direction_medium, do: test_vec(1536, :near)
 
   # Creates a published tenant article and marks it curated via the governed path
   # (mirrors test/loopctl/knowledge_curated_test.exs).
@@ -60,12 +61,12 @@ defmodule Loopctl.KnowledgeHybridTest do
       answering =
         tenant.id
         |> curated_article(%{title: "Refund Policy Answer"})
-        |> then(&set_embedding(tenant.id, &1, @direction_a))
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
 
       _near_but_wrong =
         tenant.id
         |> curated_article(%{title: "Shipping Refund Process"})
-        |> then(&set_embedding(tenant.id, &1, @direction_medium))
+        |> then(&set_embedding(tenant.id, &1, direction_medium()))
 
       # A non-curated distractor exactly aligned with `other_query`'s embedding —
       # the genuine best-retrieved competitor `other_query` must fall back to,
@@ -76,12 +77,12 @@ defmodule Loopctl.KnowledgeHybridTest do
           title: "Unrelated Distractor",
           status: :published
         })
-        |> then(&set_embedding(tenant.id, &1, @direction_b))
+        |> then(&set_embedding(tenant.id, &1, direction_b()))
 
       answering_query = "what is the refund policy?"
       other_query = "a query only loosely related to shipping refunds"
 
-      stub_embeddings_by_query(%{answering_query => @direction_a, other_query => @direction_b})
+      stub_embeddings_by_query(%{answering_query => direction_a(), other_query => direction_b()})
 
       assert {:ok, %{results: results1, meta: meta1}} =
                Knowledge.hybrid_search(tenant.id, answering_query,
@@ -116,10 +117,10 @@ defmodule Loopctl.KnowledgeHybridTest do
       weak_curated =
         tenant.id
         |> curated_article(%{title: "Shipping Refund Process"})
-        |> then(&set_embedding(tenant.id, &1, @direction_medium))
+        |> then(&set_embedding(tenant.id, &1, direction_medium()))
 
       query = "what is the refund policy?"
-      stub_embeddings_by_query(%{query => @direction_a})
+      stub_embeddings_by_query(%{query => direction_a()})
 
       assert {:ok, %{results: results, meta: meta}} =
                Knowledge.hybrid_search(tenant.id, query, keyword_weight: 0, semantic_weight: 1)
@@ -169,7 +170,7 @@ defmodule Loopctl.KnowledgeHybridTest do
             "Invoice generation troubleshooting steps for common invoice generation issues. " <>
               "Invoice generation troubleshooting requires careful invoice generation review."
         })
-        |> then(&set_embedding(tenant.id, &1, @direction_b))
+        |> then(&set_embedding(tenant.id, &1, direction_b()))
       end
 
       # The curated doc shares NO keyword terms with the query at all (so it never
@@ -182,9 +183,9 @@ defmodule Loopctl.KnowledgeHybridTest do
           title: "Refund Policy Definitive Answer",
           body: "Our refund policy is fully documented here with complete refund guidance."
         })
-        |> then(&set_embedding(tenant.id, &1, @direction_a))
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
 
-      stub_embeddings_by_query(%{query => @direction_a})
+      stub_embeddings_by_query(%{query => direction_a()})
 
       # Default page (limit 10, offset 0): the curated doc ranks 13th by the
       # keyword-heavy combined `:final_score` — but the resolver still finds and
@@ -230,9 +231,9 @@ defmodule Loopctl.KnowledgeHybridTest do
       Knowledge.reset_circuit_breaker(curated_tenant.id)
 
       curated = curated_article(curated_tenant.id, %{title: "Deploy Guide Curated"})
-      set_embedding(curated_tenant.id, curated, @direction_a)
+      set_embedding(curated_tenant.id, curated, direction_a())
 
-      stub_embeddings_by_query(%{"deploy guide" => @direction_a})
+      stub_embeddings_by_query(%{"deploy guide" => direction_a()})
 
       assert {:ok, %{results: [curated_result | _], meta: curated_meta}} =
                Knowledge.hybrid_search(curated_tenant.id, "deploy guide",
@@ -493,9 +494,9 @@ defmodule Loopctl.KnowledgeHybridTest do
       Knowledge.reset_circuit_breaker(tenant.id)
 
       curated = curated_article(tenant.id, %{title: "Deploy Guide Curated"})
-      set_embedding(tenant.id, curated, @direction_a)
+      set_embedding(tenant.id, curated, direction_a())
 
-      stub_embeddings_by_query(%{"deploy guide" => @direction_a})
+      stub_embeddings_by_query(%{"deploy guide" => direction_a()})
 
       assert {:ok, %{meta: %{provenance: :curated}}} =
                Knowledge.hybrid_search(tenant.id, "deploy guide",
@@ -630,8 +631,8 @@ defmodule Loopctl.KnowledgeHybridTest do
       attach_hybrid_provenance_handler(tenant.id)
 
       curated = curated_article(tenant.id, %{title: "Telemetry Deploy Guide"})
-      set_embedding(tenant.id, curated, @direction_a)
-      stub_embeddings_by_query(%{"telemetry deploy guide" => @direction_a})
+      set_embedding(tenant.id, curated, direction_a())
+      stub_embeddings_by_query(%{"telemetry deploy guide" => direction_a()})
 
       assert {:ok, %{meta: %{provenance: :curated}}} =
                Knowledge.hybrid_search(tenant.id, "telemetry deploy guide",

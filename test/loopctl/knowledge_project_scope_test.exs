@@ -16,8 +16,9 @@ defmodule Loopctl.KnowledgeProjectScopeTest do
   alias Loopctl.Knowledge
 
   # Same-direction vectors → cosine distance 0 (all match semantically), so the project
-  # filter is the only thing separating the result sets.
-  defp query_vector, do: List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
+  # filter is the only thing separating the result sets. Per-test-unique via
+  # `Loopctl.DataCase.test_vec/2` (dissolves the shared-HNSW-index clique; see its @doc).
+  defp query_vector, do: test_vec(1536, :primary)
 
   defp article(tenant_id, project_id, title) do
     article =
@@ -34,8 +35,13 @@ defmodule Loopctl.KnowledgeProjectScopeTest do
   end
 
   defp stub_query_embedding do
+    # Capture in THIS (setup/test) process: the stub is invoked from a spawned embedding
+    # worker that carries the Mox allowance but NOT this process's :test_vec_axis, so a lazy
+    # `query_vector()` there would land in axis-0's window and miss the articles.
+    qv = query_vector()
+
     Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
-      {:ok, query_vector()}
+      {:ok, qv}
     end)
   end
 
