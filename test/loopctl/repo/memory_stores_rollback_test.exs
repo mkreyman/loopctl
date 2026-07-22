@@ -12,7 +12,9 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
   HNSW indexes are gone (dropped with their table), and no `tenant_isolation` RLS
   policy is left orphaned — then re-applying `up` restores the forward state.
 
-  Three migrations are driven newest-first: the US-28.2 PARTIAL live-only HNSW index
+  FOUR migrations are driven newest-first: the US-41.1 embedding side tables
+  (20260721000100 — `memory_embeddings` carries an FK to `memories`, so `memories`
+  cannot be dropped while it stands), the US-28.2 PARTIAL live-only HNSW index
   (20260709000300), the US-28.1 full HNSW index (20260709000100), and the
   create-stores migration (20260709000000). `memories` carries TWO hnsw indexes in
   the forward state (full recall + partial live), so the invariant is 2 → 0 → 2.
@@ -50,6 +52,7 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
   @create_version 20_260_709_000_000
   @hnsw_version 20_260_709_000_100
   @partial_hnsw_version 20_260_709_000_300
+  @side_tables_version 20_260_721_000_100
 
   @migrations_dir Path.join([File.cwd!(), "priv", "repo", "migrations"])
   create_file = Path.wildcard(Path.join(@migrations_dir, "#{@create_version}_*.exs")) |> hd()
@@ -58,12 +61,17 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
   partial_file =
     Path.wildcard(Path.join(@migrations_dir, "#{@partial_hnsw_version}_*.exs")) |> hd()
 
+  side_tables_file =
+    Path.wildcard(Path.join(@migrations_dir, "#{@side_tables_version}_*.exs")) |> hd()
+
   Code.require_file(create_file)
   Code.require_file(hnsw_file)
   Code.require_file(partial_file)
+  Code.require_file(side_tables_file)
 
   alias Loopctl.Repo.Migrations.AddMemoriesEmbeddingHnswIndex
   alias Loopctl.Repo.Migrations.AddMemoriesLiveEmbeddingPartialHnswIndex
+  alias Loopctl.Repo.Migrations.CreateEmbeddingSideTables
   alias Loopctl.Repo.Migrations.CreateMemoryStores
 
   setup do
@@ -151,7 +159,11 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
     assert policy_present?("memories")
     assert policy_present?("session_memories")
 
-    # Roll all three memory migrations back, newest first.
+    # Roll all the memory-dependent migrations back, newest first. US-41.1's
+    # `memory_embeddings` FKs `memories`, so it MUST come down first — dropping it
+    # out of order is exactly the dependent_objects_still_exist error a real
+    # newest-first `mix ecto.rollback` never hits.
+    migrate(CreateEmbeddingSideTables, @side_tables_version, :down)
     migrate(AddMemoriesLiveEmbeddingPartialHnswIndex, @partial_hnsw_version, :down)
     migrate(AddMemoriesEmbeddingHnswIndex, @hnsw_version, :down)
     migrate(CreateMemoryStores, @create_version, :down)
@@ -159,6 +171,7 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
     # Both tables (and their btree indexes, which drop with the table) are gone.
     refute relation_exists?("memories")
     refute relation_exists?("session_memories")
+    refute relation_exists?("memory_embeddings")
 
     # No orphaned HNSW index (neither the full nor the partial) and no orphaned
     # tenant_isolation policy.
@@ -171,7 +184,9 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
     migrate(CreateMemoryStores, @create_version, :up)
     migrate(AddMemoriesEmbeddingHnswIndex, @hnsw_version, :up)
     migrate(AddMemoriesLiveEmbeddingPartialHnswIndex, @partial_hnsw_version, :up)
+    migrate(CreateEmbeddingSideTables, @side_tables_version, :up)
 
+    assert relation_exists?("memory_embeddings")
     assert relation_exists?("memories")
     assert relation_exists?("session_memories")
     assert hnsw_count("memories") == 2

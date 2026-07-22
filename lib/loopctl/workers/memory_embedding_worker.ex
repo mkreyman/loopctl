@@ -61,6 +61,8 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   alias Loopctl.Egress.Scope
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
+  alias Loopctl.Embeddings
+  alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -107,7 +109,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
     text = build_embedding_text(memory)
     content_hash = content_hash(text)
 
-    if already_embedded?(memory, content_hash) do
+    if already_embedded?(tenant_id, memory, content_hash) do
       # Idempotent no-op: this exact content is already embedded. Never re-call the
       # paid provider.
       :ok
@@ -213,11 +215,32 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   defp custody_outcome(_other), do: :failed
 
   defp store(tenant_id, memory_id, embedding, content_hash) do
+    # Pre-write dimension check (review): an off-dimension model otherwise surfaced as a
+    # changeset error, `perform` returned `{:error, _}`, and Oban re-billed the provider
+    # on each of five attempts. Catch it before the write and DISCARD legibly. The pin
+    # `resolve_write_dimension/1` sets is cached + idempotent, so resolving here and
+    # again inside `update_memory_embedding/4` is a no-op second read.
+    case Dimensions.check_batch_length([embedding], Embeddings.resolve_write_dimension(tenant_id)) do
+      :ok -> do_store(tenant_id, memory_id, embedding, content_hash)
+      {:error, {:dimension_mismatch, expected, actual}} -> discard_mismatch(expected, actual)
+    end
+  end
+
+  defp do_store(tenant_id, memory_id, embedding, content_hash) do
     case Memory.update_memory_embedding(tenant_id, memory_id, embedding, content_hash) do
       {:ok, _memory} -> :ok
       {:error, :not_found} -> :ok
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp discard_mismatch(expected, actual) do
+    Logger.debug(
+      "MemoryEmbeddingWorker: model returned #{inspect(actual)}-dimension vector but the tenant " <>
+        "is recorded at #{expected}; discarding rather than re-billing."
+    )
+
+    {:discard, {:dimension_mismatch, expected, actual}}
   end
 
   # Snooze interval (seconds) for the OPEN-breaker path: ~the remaining cooldown so
@@ -228,11 +251,35 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
     max(Knowledge.circuit_breaker_cooldown_remaining(tenant_id), Admission.snooze_seconds())
   end
 
-  defp already_embedded?(%{embedding: embedding, embedding_content_hash: hash}, content_hash)
+  # IDEMPOTENCY, at the ACTIVE dimension (review). The legacy `memories.embedding` /
+  # `memories.embedding_content_hash` pair is NEVER written for a non-1536 dimension
+  # (`Memory.update_memory_embedding/4` skips that step), so for exactly the 768/1024
+  # tenants this epic serves this guard was permanently `false` and every enqueue
+  # re-billed the paid provider. Behind the cutover flag it reads the hash the side
+  # table has been recording all along.
+  defp already_embedded?(tenant_id, memory, content_hash) do
+    # WRITE-dimension gated (`use_side_table_hash?/1`), not read-flag gated (review):
+    # a non-1536 tenant has no legacy hash, so the read-flag gate re-billed the provider
+    # on every enqueue until cutover.
+    if Embeddings.use_side_table_hash?(tenant_id) do
+      Embeddings.memory_embedded_hash(
+        tenant_id,
+        memory.id,
+        Embeddings.active_dimension(tenant_id)
+      ) == content_hash
+    else
+      legacy_already_embedded?(memory, content_hash)
+    end
+  end
+
+  defp legacy_already_embedded?(
+         %{embedding: embedding, embedding_content_hash: hash},
+         content_hash
+       )
        when not is_nil(embedding) and is_binary(hash),
        do: hash == content_hash
 
-  defp already_embedded?(_memory, _content_hash), do: false
+  defp legacy_already_embedded?(_memory, _content_hash), do: false
 
   defp content_hash(text) do
     # Delegates to the schema's single source of truth so the async worker hash and

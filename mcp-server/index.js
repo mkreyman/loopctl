@@ -1101,6 +1101,41 @@ async function knowledgeIndex({ project_id, story_id, category, tags, match, off
   return toContent(result);
 }
 
+// US-41.1 — the per-tenant embedding DIMENSION surface. `status` and the system-corpus
+// materialization are agent-role; the re-embed is ORCHESTRATOR-role because its completion
+// step deletes the stale-dimension rows (loopctl reserves data-removing operations for
+// higher roles), so it deliberately does NOT fall back to the agent key.
+async function embeddingStatus() {
+  const result = await apiCall("GET", "/api/v1/knowledge/embeddings", null, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
+async function embeddingMaterializeSystemCorpus() {
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/embeddings/system-corpus",
+    {},
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function embeddingReembed({ target_dimension }) {
+  if (!Number.isInteger(target_dimension) || target_dimension <= 0) {
+    return {
+      content: [{ type: "text", text: "Error: target_dimension must be a positive integer." }],
+      isError: true,
+    };
+  }
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/embeddings/reembed",
+    { target_dimension },
+    process.env.LOOPCTL_ORCH_KEY,
+  );
+  return toContent(result);
+}
+
 async function knowledgeStats({ project_id }) {
   if (project_id && !UUID_RE.test(project_id)) {
     return {
@@ -3548,6 +3583,49 @@ const TOOLS = [
     },
   },
   {
+    name: "embedding_status",
+    description:
+      "Report this tenant's EMBEDDING DIMENSION state: the active dimension, whether semantic " +
+      "recall is currently available (and the exact reason when it is not — e.g. a non-default " +
+      "dimension whose side-table reads have not been enabled yet), the instance's supported " +
+      "dimension set, whether the shared SYSTEM-scoped corpus has been materialized for this " +
+      "tenant (until it is, those articles are keyword-only), and per-dimension row counts. " +
+      "Call this when semantic search returns fewer results than expected or reports " +
+      "fallback_reason 'semantic_recall_unavailable' — it tells you WHY instead of leaving an " +
+      "empty result set to be misread as 'nothing relevant'.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "embedding_materialize_system_corpus",
+    description:
+      "Materialize the shared SYSTEM-scoped article corpus for THIS tenant at its active " +
+      "embedding dimension, using this tenant's own embedding credential. System articles " +
+      "cannot be embedded once for everyone (embeddings are BYO), so until this runs they are " +
+      "matched by keyword only for you. Idempotent and batched; safe to call repeatedly.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "embedding_reembed",
+    description:
+      "Move this tenant's WHOLE corpus (articles, per-tenant system-article materializations " +
+      "and agent memories) onto target_dimension. Recall keeps serving at the CURRENT " +
+      "dimension for the entire run; the recorded dimension is flipped and the stale-dimension " +
+      "rows dropped only once everything is present at the target. ONE-TIME and COST-BEARING — " +
+      "it re-bills your embedding provider for the entire corpus. Requires an ORCHESTRATOR key " +
+      "(the completion step deletes data). An unsupported dimension is rejected with the " +
+      "supported set named.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target_dimension: {
+          type: "integer",
+          description: "The embedding dimension to move to. Must be in the instance's supported set.",
+        },
+      },
+      required: ["target_dimension"],
+    },
+  },
+  {
     name: "knowledge_stats",
     description:
       "Get aggregate article counts for the wiki without pulling any article metadata. " +
@@ -5940,6 +6018,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Knowledge Wiki Tools
     case "knowledge_index":
       return await knowledgeIndex(args);
+
+    case "embedding_status":
+      return await embeddingStatus();
+
+    case "embedding_materialize_system_corpus":
+      return await embeddingMaterializeSystemCorpus();
+
+    case "embedding_reembed":
+      return await embeddingReembed(args);
 
     case "knowledge_stats":
       return await knowledgeStats(args);

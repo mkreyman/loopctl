@@ -108,6 +108,16 @@ defmodule Loopctl.Knowledge.CosineLintExceptions do
     },
     %{
       module: Loopctl.Knowledge,
+      function: :novelty_distance_legacy_query,
+      arity: 4,
+      rationale:
+        "US-41.1: novelty_distance_query/4 now DISPATCHES on the side-table cutover flag, so " <>
+          "the legacy MIN(embedding <=> $const::vector) literal moved into this clause; the " <>
+          "side-table clause holds no literal (it delegates to " <>
+          "VectorSearch.put_dimension_min_distance/3). Same bounded shape as before"
+    },
+    %{
+      module: Loopctl.Knowledge,
       function: :nearest_prior_distance,
       arity: 4,
       rationale:

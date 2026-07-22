@@ -138,8 +138,10 @@ defmodule Loopctl.Knowledge.VectorSearch do
 
   import Ecto.Query
 
+  alias Loopctl.Embeddings
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
 
   @typedoc "A nearest-neighbour candidate row."
@@ -178,6 +180,11 @@ defmodule Loopctl.Knowledge.VectorSearch do
   # the result before the outer post-ANN filters run.
   @default_pool_factor 5
   @default_pool_floor 100
+
+  # US-41.1 review #7: the side-table inner ANN cannot carry status/visibility (they
+  # are not in the per-dimension partial index), so it over-fetches by this factor
+  # and the outer query trims back to `pool`.
+  @default_side_table_over_fetch 4
 
   # Maximum number of tag values accepted in a `:tags` overlap filter, so a caller
   # can't pass an unbounded array literal into the index-residual `&&` predicate.
@@ -265,8 +272,39 @@ defmodule Loopctl.Knowledge.VectorSearch do
   @spec nearest(Ecto.UUID.t(), target_embedding(), pos_integer(), keyword()) ::
           [candidate()] | {:error, :heavy_read_overloaded}
   def nearest(tenant_id, target_embedding, k, opts \\ []) when is_binary(tenant_id) do
-    query = candidate_query(tenant_id, target_embedding, k, opts)
-    HeavyRead.all(tenant_id, query, heavy_read_opts(opts))
+    # Query-vector length guard (review): the side-table ANN binds the target into the
+    # per-dimension `(embedding::vector(N))` cast, so a fresh query vector whose length
+    # disagrees with the read dimension (mid-model-change / stale setting / pin conflict)
+    # would raise pgvector's "different vector dimensions" 500 on this request path. An
+    # EMPTY result is the documented graceful degrade — every caller already handles "no
+    # neighbours" (suggest-links empty, ProposalGate novel, ArticleLinkingWorker no links).
+    case Embeddings.check_query_vector(tenant_id, to_embedding_list(target_embedding)) do
+      :ok ->
+        query = candidate_query(tenant_id, target_embedding, k, opts)
+        HeavyRead.all(tenant_id, query, nearest_heavy_read_opts(k, opts))
+
+      {:error, _mismatch} ->
+        []
+    end
+  end
+
+  # On the side-table path the inner ANN over-fetches by `side_table_over_fetch/0` to
+  # offset the status/visibility filtering it cannot carry — but an HNSW scan only
+  # returns ~ef_search rows regardless of LIMIT, so the over-fetch is inert unless
+  # ef_search is raised in lockstep (review). Raise it to cover the over-fetched inner
+  # pool whenever this read hits the side table; the legacy path is unaffected.
+  defp nearest_heavy_read_opts(k, opts) do
+    base = heavy_read_opts(opts)
+
+    reads_side_table? =
+      Keyword.get_lazy(opts, :reads_side_table, &Embeddings.side_table_reads_enabled?/0)
+
+    if reads_side_table? do
+      pool = candidate_pool(clamp_k(k), Keyword.get(opts, :pool))
+      Keyword.put(base, :hnsw_ef_search, side_table_ef_search(side_table_inner_pool(pool)))
+    else
+      base
+    end
   end
 
   @doc """
@@ -398,6 +436,31 @@ defmodule Loopctl.Knowledge.VectorSearch do
           Ecto.Query.t()
   def candidate_pool_query(tenant_id, target_embedding, pool, opts \\ [])
       when is_binary(tenant_id) and is_integer(pool) do
+    # US-41.1 AC-41.1.8 (review #3): the cutover flag routes EVERY consumer of this
+    # helper — `suggest_links`, the novelty/dedup `ProposalGate`, and
+    # `ArticleLinkingWorker` — onto the dimension-tagged side table, not just
+    # `search_semantic`. Leaving them on `articles.embedding` was a CORRECTNESS
+    # regression, not a degradation: `Knowledge.update_embedding/5` skips the legacy
+    # column entirely for any non-1536 dimension, so for a 768/1024 tenant those
+    # queries matched ZERO rows — `suggest_links` returned nothing and the dedup gate
+    # saw no priors and verdicted every proposal `novel`, creating duplicates.
+    # The cutover flag is resolved ONCE per operation and threaded via `:reads_side_table`
+    # (review): re-reading `side_table_reads_enabled?/0` independently in the source-vector
+    # fetch and the candidate scan let an operator flip mid-request be observed differently
+    # by two stages of one operation (e.g. suggest_links reading the source from the side
+    # table but candidates from `articles.embedding`). The caller (suggest_links,
+    # search_semantic) resolves it once and passes it; absent, we fall back to a single read.
+    reads_side_table? =
+      Keyword.get_lazy(opts, :reads_side_table, &Embeddings.side_table_reads_enabled?/0)
+
+    if reads_side_table? do
+      dimension_candidate_pool_query(tenant_id, target_embedding, pool, opts)
+    else
+      legacy_candidate_pool_query(tenant_id, target_embedding, pool, opts)
+    end
+  end
+
+  defp legacy_candidate_pool_query(tenant_id, target_embedding, pool, opts) do
     target = to_embedding_list(target_embedding)
     exclude_id = Keyword.get(opts, :exclude_id)
     vis = Keyword.get(opts, :visibility_agent_id)
@@ -411,6 +474,157 @@ defmodule Loopctl.Knowledge.VectorSearch do
       |> maybe_filter_by_visibility(vis)
 
     pool_select(base, Keyword.get(opts, :select, :knn), target)
+  end
+
+  @doc """
+  The SIDE-TABLE form of `candidate_pool_query/4` — same output shape, same pool
+  size, dimension-scoped ANN.
+
+  ## Why the inner ANN over-fetches (review #7)
+
+  The legacy inner carried `status = :published` and the visibility predicate INSIDE
+  the index-ordered top-k, so the pool held `pool` PUBLISHED, VISIBLE rows. The side
+  table carries neither: the per-dimension partial index's only status-ish predicate
+  is `live_denorm`, which mirrors `status <> 'superseded'` — so drafts, archived and
+  other agents' private articles occupy pool slots and the real predicates can only
+  be applied on the OUTER query. At an identical inner limit that returns strictly
+  FEWER published rows than the legacy path, i.e. a silent recall regression at
+  cutover.
+
+  The inner limit is therefore multiplied by `side_table_over_fetch/0` before the
+  outer status/visibility filters trim it back to `pool`. This is the documented,
+  deliberate cost of the side table; the alternative — encoding `published` in
+  `live_denorm` — would need a second denormalized marker plus a second partial HNSW
+  index per dimension, doubling an already-expensive build.
+  """
+  @spec dimension_candidate_pool_query(
+          Ecto.UUID.t(),
+          target_embedding(),
+          pos_integer(),
+          keyword()
+        ) :: Ecto.Query.t()
+  def dimension_candidate_pool_query(tenant_id, target_embedding, pool, opts \\ []) do
+    target = to_embedding_list(target_embedding)
+    dimension = Keyword.get(opts, :dimension) || Embeddings.active_dimension(tenant_id)
+    exclude_id = Keyword.get(opts, :exclude_id)
+    vis = Keyword.get(opts, :visibility_agent_id)
+    status = Keyword.get(opts, :status, :published)
+
+    inner =
+      ArticleEmbedding
+      |> index_safe_dimension_knn_base(tenant_id, target, dimension, side_table_inner_pool(pool))
+      |> select([e], %{article_id: e.article_id})
+      |> put_dimension_distance(dimension, target)
+
+    from(c in subquery(inner),
+      join: a in Article,
+      on: a.id == c.article_id and a.tenant_id == ^tenant_id,
+      order_by: [asc: c.distance],
+      limit: ^pool
+    )
+    |> maybe_filter_by_status_on_article(status)
+    |> maybe_exclude_self_on_article(exclude_id)
+    |> maybe_filter_by_visibility_on_article(vis)
+    |> dimension_pool_select(Keyword.get(opts, :select, :knn))
+  end
+
+  @doc """
+  Inner-ANN over-fetch multiplier for the side-table pool (config
+  `:embedding_side_table_over_fetch`, default #{@default_side_table_over_fetch}).
+  """
+  @spec side_table_over_fetch() :: pos_integer()
+  def side_table_over_fetch do
+    Application.get_env(
+      :loopctl,
+      :embedding_side_table_over_fetch,
+      @default_side_table_over_fetch
+    )
+  end
+
+  @doc false
+  @spec side_table_inner_pool(pos_integer()) :: pos_integer()
+  def side_table_inner_pool(pool) when is_integer(pool) and pool > 0 do
+    pool * side_table_over_fetch()
+  end
+
+  # The largest `hnsw.ef_search` the side-table path will request per read. An HNSW
+  # scan only inspects/returns ~`ef_search` graph nodes regardless of the LIMIT, so an
+  # inner LIMIT of `pool * over_fetch` is a NO-OP unless ef_search is raised to cover it
+  # — the over-fetch's whole purpose (offsetting the status/visibility filtering the
+  # side-table inner cannot carry) is otherwise structurally unreachable (review).
+  @default_max_side_table_ef_search 1000
+
+  @doc "Cap on the per-read `hnsw.ef_search` the side-table ANN requests (config `:side_table_max_ef_search`)."
+  @spec max_side_table_ef_search() :: pos_integer()
+  def max_side_table_ef_search do
+    Application.get_env(
+      :loopctl,
+      :side_table_max_ef_search,
+      @default_max_side_table_ef_search
+    )
+  end
+
+  @doc """
+  The `hnsw.ef_search` to apply for a side-table ANN whose inner LIMIT is `inner_pool`:
+  at least `inner_pool` (so the over-fetch actually returns that many candidates),
+  capped at `max_side_table_ef_search/0`. The over-fetch is inert without this.
+  """
+  @spec side_table_ef_search(pos_integer()) :: pos_integer()
+  def side_table_ef_search(inner_pool) when is_integer(inner_pool) and inner_pool > 0 do
+    min(inner_pool, max_side_table_ef_search())
+  end
+
+  # Article-binding (second binding) forms of the inner filters. Same predicates as
+  # the legacy inner, applied over the materialized ≤(pool * over_fetch) rows.
+  defp maybe_filter_by_status_on_article(query, nil), do: query
+
+  defp maybe_filter_by_status_on_article(query, status),
+    do: where(query, [_c, a], a.status == ^status)
+
+  defp maybe_exclude_self_on_article(query, nil), do: query
+
+  defp maybe_exclude_self_on_article(query, exclude_id) when is_binary(exclude_id),
+    do: where(query, [_c, a], a.id != ^exclude_id)
+
+  defp maybe_filter_by_visibility_on_article(query, nil), do: query
+
+  defp maybe_filter_by_visibility_on_article(query, agent_id) when is_binary(agent_id) do
+    where(
+      query,
+      [_c, a],
+      fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", a.metadata) or
+        fragment("?->>'agent_id' = ?", a.metadata, ^agent_id)
+    )
+  end
+
+  # The SAME two projections `pool_select/3` emits, computed from the inner's raw
+  # `distance` instead of a second `<=>` — so this module keeps its single home for
+  # the cosine literal and the two paths cannot drift in score semantics.
+  defp dimension_pool_select(query, :knn) do
+    select(query, [c, a], %{
+      id: a.id,
+      title: a.title,
+      category: a.category,
+      tags: a.tags,
+      project_id: a.project_id,
+      similarity_score: fragment("GREATEST(0, 1 - ?)", c.distance)
+    })
+  end
+
+  defp dimension_pool_select(query, :semantic) do
+    select(query, [c, a], %{
+      id: a.id,
+      tenant_id: a.tenant_id,
+      project_id: a.project_id,
+      title: a.title,
+      category: a.category,
+      status: a.status,
+      tags: a.tags,
+      metadata: a.metadata,
+      inserted_at: a.inserted_at,
+      updated_at: a.updated_at,
+      similarity_score: fragment("1 - ?", c.distance)
+    })
   end
 
   @doc """
@@ -444,6 +658,198 @@ defmodule Loopctl.Knowledge.VectorSearch do
       order_by: [asc: fragment("? <=> ?", x.embedding, ^target)],
       limit: ^pool
     )
+  end
+
+  @doc """
+  The DIMENSION-SCOPED index-safe HNSW inner base over an embedding SIDE TABLE
+  (US-41.1 AC-41.1.5).
+
+  Same load-bearing filter-after-ANN shape as `index_safe_knn_base/4`, with two
+  differences that are both required for the per-tenant-dimension design:
+
+    * the ordering expression is the EXPLICIT CAST `(embedding::vector(N))`,
+      character-identical to the expression the per-dimension index is built over
+      (`Loopctl.Repo.HnswIndex.create_dimension_index_sql/2`). The side table's
+      `embedding` column is an UNCONSTRAINED `vector` — pgvector refuses to
+      HNSW-index that — so the cast is what supplies the typmod, and the planner
+      can only match the index if the query repeats it verbatim.
+    * the WHERE carries `dim = <literal>` (a compile-time literal per supported
+      dimension via `dimension_where/2`, NOT a bound `^dimension` param — see that
+      function) and `live_denorm`, which are EXACTLY the per-dimension index's
+      partial predicate, matched even under a Postgres GENERIC plan. Nothing else
+      may be added here:
+      a JOIN or a selective btree predicate inside the index-ordered top-k is the
+      #170/#172 production incident (cost ~57k vs ~880 at 76k rows). Subject
+      scope, project, tags, category and status all belong on an OUTER query over
+      the materialized pool.
+
+  Because the inner pool is dimension-scoped, a cross-dimension similarity
+  comparison is impossible BY CONSTRUCTION — pgvector's "different vector
+  dimensions" error is an unreachable safety net, not the mechanism.
+
+  `schema` is `Loopctl.Knowledge.ArticleEmbedding` or
+  `Loopctl.Memory.MemoryEmbedding`; `target` must already be a bound `[float()]`
+  list of exactly `dimension` components.
+
+  `:live_only` (default `true`) drops the `live_denorm` predicate when `false` — the
+  admin/oversight `include_superseded` recall path. That variant has NO matching
+  partial index by design (the per-dimension indexes carry the live predicate the AC
+  mandates, and a second full index per dimension would double an already-expensive
+  HNSW build at corpus scale), so it plans as a bounded top-k sort rather than an
+  index scan. Do NOT route interactive recall through it.
+  """
+  @spec index_safe_dimension_knn_base(
+          module(),
+          Ecto.UUID.t(),
+          [float()],
+          pos_integer(),
+          pos_integer(),
+          keyword()
+        ) :: Ecto.Query.t()
+  def index_safe_dimension_knn_base(schema, tenant_id, target, dimension, pool, opts \\ [])
+      when is_atom(schema) and is_binary(tenant_id) and is_list(target) and
+             is_integer(dimension) and is_integer(pool) do
+    from(x in schema,
+      where: x.tenant_id == ^tenant_id,
+      limit: ^pool
+    )
+    |> dimension_where(dimension)
+    |> maybe_live_denorm_only(Keyword.get(opts, :live_only, true))
+    |> dimension_order_by(dimension, target)
+  end
+
+  defp maybe_live_denorm_only(query, false), do: query
+  defp maybe_live_denorm_only(query, _true), do: where(query, [x], x.live_denorm)
+
+  # ONE clause per SUPPORTED dimension, generated at COMPILE TIME.
+  #
+  # `fragment/2` requires a literal SQL string, and the cast's typmod cannot be a
+  # bound parameter (a typmod is part of the TYPE, not a value) — so the only way to
+  # emit `(embedding::vector(768))` is to have that exact literal in the AST. Doing it
+  # per supported dimension makes the set of emittable casts a CLOSED, compile-time
+  # set drawn from `:supported_embedding_dimensions`: no request-supplied value can
+  # ever reach the SQL, and an unsupported dimension hits the raising fallback below
+  # instead of silently sequential-scanning a corpus with no matching index.
+  #
+  # Compile-time (`Application.compile_env`) rather than runtime config is correct
+  # here: adding a dimension ALSO requires a migration to build its indexes
+  # CONCURRENTLY, so it is inherently a deploy-time change, and reading it the same
+  # way at compile time makes a config/index mismatch impossible to introduce by
+  # editing runtime config alone.
+  # Fallback is [768, 1024, 1536] — NOT [..., 3072] (review). 3072 is above pgvector's
+  # 2000-dimension HNSW ceiling and is deliberately excluded from the configured set
+  # (config/config.exs), so a fallback that listed it would — if the config key were
+  # ever absent — advertise 3072 on `.well-known`, build no index for it, and let the
+  # query builder emit an unindexable `(embedding::vector(3072))` cast that
+  # sequential-scans the corpus (the #170/#172 planner incident class).
+  @supported_dimensions Application.compile_env(
+                          :loopctl,
+                          :supported_embedding_dimensions,
+                          [768, 1024, 1536]
+                        )
+
+  @doc "The compile-time supported-dimension set this module can emit a cast for."
+  @spec supported_dimensions() :: [pos_integer()]
+  def supported_dimensions, do: @supported_dimensions
+
+  for dim <- @supported_dimensions do
+    # Built here (plain Elixir) and `unquote`d so `fragment/2` receives a LITERAL.
+    # The left operand is character-identical to the indexed expression in
+    # `Loopctl.Repo.HnswIndex.create_dimension_index_sql/2`; the right operand stays a
+    # bound `^[float()]` param (never a re-interpolated `%Pgvector{}` — the #168 500)
+    # and resolves to `vector` through the `<=>` operator, which is enough for the
+    # planner to choose the per-dimension index (verified with EXPLAIN).
+    cast_fragment = "(?::vector(#{dim})) <=> ?"
+
+    defp dimension_order_by(query, unquote(dim), target) do
+      order_by(query, [x], asc: fragment(unquote(cast_fragment), x.embedding, ^target))
+    end
+  end
+
+  # NO raising fallback here (unlike `dimension_where/2`): in the ONLY caller,
+  # `index_safe_dimension_knn_base/6` runs `dimension_where/2` — the single validation
+  # gate — FIRST, which already raises for an unsupported dimension. A fallback here
+  # would be unreachable dead code (dialyzer `pattern_match_cov`), since the type is
+  # narrowed to the supported literal set by the time `dimension_order_by/3` is reached.
+
+  # ONE clause per SUPPORTED dimension, generated at COMPILE TIME — the `dim` predicate
+  # must be a LITERAL, not a bound `^dimension` param (review, finding 1).
+  #
+  # The per-dimension partial HNSW index carries a LITERAL partial predicate
+  # (`WHERE dim = 768 AND live_denorm`, `Loopctl.Repo.HnswIndex.create_dimension_index_sql/2`).
+  # Under a Postgres GENERIC plan (`plan_cache_mode=auto` flips a prepared statement to
+  # generic after ~5 executions) the planner cannot PROVE `dim = $1` implies `dim = 768`, so
+  # a bound `dim == ^dimension` disqualifies the partial index and the query reverts to a
+  # seq-scan + sort over the whole vector relation — the exact #170/#172 outage this module
+  # exists to prevent. Emitting `dim = 768` as a compile-time literal (the same closed,
+  # compile-time set `dimension_order_by/3` draws its literal cast from) makes the predicate
+  # match the index's literal predicate regardless of plan_cache_mode. An unsupported
+  # dimension hits the raising fallback rather than planning a seq scan.
+  for dim <- @supported_dimensions do
+    defp dimension_where(query, unquote(dim)) do
+      where(query, [x], x.dim == unquote(dim))
+    end
+  end
+
+  defp dimension_where(_query, dimension) do
+    raise ArgumentError,
+          "embedding dimension #{inspect(dimension)} is not supported by this instance " <>
+            "(supported: #{inspect(@supported_dimensions)}). A dimension is only supported " <>
+            "once its per-dimension HNSW indexes have been built by a migration — index DDL " <>
+            "is operator/migration plane only."
+  end
+
+  @doc """
+  Merges the raw cosine `:distance` onto a SIDE-TABLE pool query's map selection,
+  using the same explicit per-dimension cast as `index_safe_dimension_knn_base/5`.
+
+  The only other home of the `<=>` literal for the side tables, keeping the
+  single-home invariant the cosine-reintroduction lint enforces.
+  """
+  @spec put_dimension_distance(Ecto.Query.t(), pos_integer(), [float()]) :: Ecto.Query.t()
+  def put_dimension_distance(query, dimension, target)
+      when is_integer(dimension) and is_list(target) do
+    dimension_distance_select(query, dimension, target)
+  end
+
+  for dim <- @supported_dimensions do
+    distance_fragment = "(?::vector(#{dim})) <=> ?"
+
+    defp dimension_distance_select(query, unquote(dim), target) do
+      select_merge(query, [x], %{
+        distance: fragment(unquote(distance_fragment), x.embedding, ^target)
+      })
+    end
+  end
+
+  defp dimension_distance_select(_query, dimension, _target) do
+    raise ArgumentError, "embedding dimension #{inspect(dimension)} is not supported"
+  end
+
+  @doc """
+  The SIDE-TABLE form of the `MIN(embedding <=> $const)` novelty aggregate.
+
+  Postgres rewrites `MIN(x <=> $const)` into `ORDER BY (x <=> $const) LIMIT 1`, so
+  this is index-servable exactly like the ordering forms above — provided the cast
+  is character-identical to the indexed expression, which is why it is generated
+  from the same compile-time dimension set and lives here rather than in a caller.
+  """
+  @spec put_dimension_min_distance(Ecto.Query.t(), pos_integer(), [float()]) :: Ecto.Query.t()
+  def put_dimension_min_distance(query, dimension, target)
+      when is_integer(dimension) and is_list(target) do
+    dimension_min_distance_select(query, dimension, target)
+  end
+
+  for dim <- @supported_dimensions do
+    min_fragment = "MIN((?::vector(#{dim})) <=> ?)"
+
+    defp dimension_min_distance_select(query, unquote(dim), target) do
+      select(query, [x], fragment(unquote(min_fragment), x.embedding, ^target))
+    end
+  end
+
+  defp dimension_min_distance_select(_query, dimension, _target) do
+    raise ArgumentError, "embedding dimension #{inspect(dimension)} is not supported"
   end
 
   @doc """

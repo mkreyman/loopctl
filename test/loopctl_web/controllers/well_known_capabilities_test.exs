@@ -17,10 +17,14 @@ defmodule LoopctlWeb.WellKnownCapabilitiesTest do
 
     caps = body["capabilities"]
 
-    # Derived from the SAME runtime config the application validates against
-    # (`:embedding_dimensions`), not a compile-time literal that could contradict it.
-    assert caps["supported_embedding_dimensions"] ==
-             [Application.get_env(:loopctl, :embedding_dimensions, 1536)]
+    # US-41.1 AC-41.1.3: the FULL supported set — every dimension with pre-created
+    # per-dimension ANN indexes — single-sourced with those indexes and with the
+    # query builder's compile-time cast set, never a literal that could contradict
+    # what the instance can actually serve.
+    assert caps["supported_embedding_dimensions"] == Loopctl.Embeddings.supported_dimensions()
+
+    assert caps["default_embedding_dimension"] ==
+             Application.get_env(:loopctl, :embedding_dimensions, 1536)
 
     # FALSE until US-41.2 ships the tenant-configurable endpoint surface. Declaring
     # a TRUSTED endpoint (which US-41.4 does ship) changes the locality VERDICT for

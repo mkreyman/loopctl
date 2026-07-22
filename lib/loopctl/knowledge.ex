@@ -51,10 +51,12 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Egress
   alias Loopctl.Egress.Policy, as: EgressPolicy
   alias Loopctl.Egress.Scope, as: EgressScope
+  alias Loopctl.Embeddings
   alias Loopctl.HeavyRead
   alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.EmbeddingConcurrency
@@ -4702,8 +4704,14 @@ defmodule Loopctl.Knowledge do
       |> max(1)
       |> min(@max_relevance_page_size)
 
+    # Resolve the cutover flag ONCE for the whole operation and thread it (review): the
+    # source-vector fetch and the candidate scan must see the SAME value, or an operator
+    # flip mid-request makes suggest_links read the source from one table type and
+    # candidates from the other (a dimension mismatch / empty result).
+    reads_side_table? = Embeddings.side_table_reads_enabled?()
+
     with :ok <- validate_threshold(threshold) do
-      case fetch_article_embedding(tenant_id, article_id, vis) do
+      case fetch_article_embedding(tenant_id, article_id, vis, reads_side_table?) do
         nil ->
           {:error, :not_found}
 
@@ -4712,7 +4720,9 @@ defmodule Loopctl.Knowledge do
 
         %{embedding: embedding} ->
           {suggestions, meta} =
-            suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis)
+            suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis,
+              reads_side_table: reads_side_table?
+            )
 
           {:ok, suggestions, meta}
       end
@@ -4739,28 +4749,61 @@ defmodule Loopctl.Knowledge do
 
   # Lightweight fetch — only the embedding (skips body/metadata). A non-UUID or a
   # missing/non-published article yields nil → {:error, :not_found}.
-  defp fetch_article_embedding(tenant_id, article_id, vis) do
+  #
+  # US-41.1 (review): behind the cutover flag the SOURCE vector comes from the
+  # dimension-tagged side table, exactly like the CANDIDATE half already did
+  # (`VectorSearch.candidate_pool_query/4`). `update_embedding/5` never writes
+  # `articles.embedding` for a non-1536 dimension, so reading the source there
+  # returned `%{embedding: nil}` for every 768/1024 tenant and
+  # `suggest_links_with_meta/3` short-circuited to `{:ok, [], empty_suggestion_meta}`
+  # — with `pool_exhausted: false`, i.e. indistinguishable from "no neighbours
+  # exist". Migrating one half of a feature and not the other is the worst of both.
+  defp fetch_article_embedding(tenant_id, article_id, vis, reads_side_table?) do
     if valid_uuid?(article_id) do
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published,
-        select: %{embedding: a.embedding}
-      )
-      |> maybe_filter_by_visibility(vis)
-      |> AdminRepo.one()
+      if reads_side_table? do
+        fetch_side_table_article_embedding(tenant_id, article_id, vis)
+      else
+        from(a in Article,
+          where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published,
+          select: %{embedding: a.embedding}
+        )
+        |> maybe_filter_by_visibility(vis)
+        |> AdminRepo.one()
+      end
     end
   end
 
-  defp suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis) do
+  # The article must still exist, be published and be visible — so the existence
+  # half stays on `articles` (a missing row must yield `{:error, :not_found}`, NOT
+  # "no embedding"), and only the VECTOR is left-joined from the side table at the
+  # tenant's active dimension.
+  defp fetch_side_table_article_embedding(tenant_id, article_id, vis) do
+    dimension = Embeddings.active_dimension(tenant_id)
+
+    from(a in Article,
+      left_join: ae in ArticleEmbedding,
+      on:
+        ae.article_id == a.id and ae.tenant_id == ^tenant_id and ae.dim == ^dimension and
+          ae.live_denorm,
+      where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published,
+      select: %{embedding: ae.embedding}
+    )
+    |> maybe_filter_by_visibility(vis)
+    |> AdminRepo.one()
+  end
+
+  defp suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis, opts) do
     # Routed through Loopctl.HeavyRead (US-27.11): the dedicated heavy-read pool,
     # isolated from the small AdminRepo pool, with a per-read SET LOCAL
     # statement_timeout (US-27.13 — a short transaction, the connection released at
     # commit). The wrapper structurally requires a tenant_id-filtered query; the
     # tenant predicate lives in this query's inner subquery. The 15s client timeout
     # is a backstop above the server-side statement_timeout.
-    query = suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis)
+    query =
+      suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis, opts)
+
     suggestions = HeavyRead.all(tenant_id, query, heavy_read_opts(:suggested_links))
 
-    pool = suggestion_candidate_pool(limit)
     returned = length(suggestions)
 
     meta =
@@ -4771,8 +4814,8 @@ defmodule Loopctl.Knowledge do
         threshold,
         vis,
         limit,
-        pool,
-        returned
+        returned,
+        opts
       )
 
     {suggestions, meta}
@@ -4814,14 +4857,15 @@ defmodule Loopctl.Knowledge do
          threshold,
          vis,
          limit,
-         pool,
-         returned
+         returned,
+         opts
        ) do
+    pool = suggestion_candidate_pool(limit)
     base = %{requested: limit, returned: returned, pool: pool}
     not_truncated = Map.merge(base, %{pool_exhausted: false, recall_truncated: false})
 
     if returned < limit do
-      case under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool) do
+      case under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool, opts) do
         # The probe is ADVISORY: its read failing (connection drop / statement_timeout)
         # must NOT fail a request whose suggestions are already in hand. Degrade to "no
         # truncation signal" rather than discarding a valid result (security review,
@@ -4911,8 +4955,8 @@ defmodule Loopctl.Knowledge do
   # / body data. Returns `:error` (NOT raising) on a DB connectivity / timeout fault so the
   # caller can fail-soft — a genuine query bug still surfaces (we re-raise non-cancel
   # Postgrex errors).
-  defp under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool) do
-    candidates = suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool)
+  defp under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool, opts) do
+    candidates = suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool, opts)
 
     probe =
       from(c in subquery(candidates),
@@ -4974,13 +5018,26 @@ defmodule Loopctl.Knowledge do
   # the SAME `suggestion_candidate_pool/1` value as before (passed as `:pool`), so the
   # over-fetch is byte-identical to the pre-migration sizing.
   @doc false
-  def suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis) do
-    VectorSearch.candidate_query(tenant_id, embedding, limit,
-      exclude_id: article_id,
-      exclude_linked: true,
-      threshold: threshold,
-      visibility_agent_id: vis,
-      pool: suggestion_candidate_pool(limit)
+  def suggestion_candidates_query(
+        tenant_id,
+        article_id,
+        embedding,
+        threshold,
+        limit,
+        vis,
+        opts \\ []
+      ) do
+    VectorSearch.candidate_query(
+      tenant_id,
+      embedding,
+      limit,
+      [
+        exclude_id: article_id,
+        exclude_linked: true,
+        threshold: threshold,
+        visibility_agent_id: vis,
+        pool: suggestion_candidate_pool(limit)
+      ] ++ Keyword.take(opts, [:reads_side_table])
     )
   end
 
@@ -4992,10 +5049,13 @@ defmodule Loopctl.Knowledge do
   # top-`pool` nearest-by-cosine with only index-safe filters (tenant / status /
   # not-null / not-self / visibility) and the computed `similarity_score`. The
   # anti-join + threshold + final `limit` are applied by the OUTER query.
-  defp suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool) do
-    VectorSearch.candidate_pool_query(tenant_id, embedding, pool,
-      exclude_id: article_id,
-      visibility_agent_id: vis
+  defp suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool, opts) do
+    VectorSearch.candidate_pool_query(
+      tenant_id,
+      embedding,
+      pool,
+      [exclude_id: article_id, visibility_agent_id: vis] ++
+        Keyword.take(opts, [:reads_side_table])
     )
   end
 
@@ -5327,21 +5387,73 @@ defmodule Loopctl.Knowledge do
   # registered in `Loopctl.Knowledge.CosineLintExceptions`). It is bounded by the sample
   # LIMIT (NOT an O(n²) scan over the whole 80k corpus) and stays tenant-scoped
   # (`a.tenant_id`/`b.tenant_id` filtered) via HeavyRead's structural guard.
+  # The SAMPLED candidate set. US-41.1 (review #3): behind the cutover flag the
+  # vector is sourced from the dimension-tagged side table — the legacy column is
+  # never written for a non-1536 tenant, so leaving this on `articles.embedding`
+  # returned zero pairs for them. Both sources carry the conjunctive tenant equality
+  # the structural guard requires.
+  defp pair_candidates_query(tenant_id, bridge?, vis) do
+    if Embeddings.side_table_reads_enabled?() do
+      pair_candidates_side_table_query(tenant_id, bridge?, vis)
+    else
+      pair_candidates_legacy_query(tenant_id, bridge?, vis)
+    end
+  end
+
+  # Public-but-`@doc false` with an EXPLICIT dimension (review) so the AC-41.1.12(i)
+  # CI plan gate can EXPLAIN the side-table branch — the legacy gate runs with the
+  # cutover flag off and therefore only ever covered the `articles.embedding` shape.
+  @doc false
+  def pair_candidates_side_table_query(tenant_id, bridge?, vis, dimension \\ nil) do
+    dimension = dimension || Embeddings.active_dimension(tenant_id)
+
+    from(ae in ArticleEmbedding,
+      join: a in Article,
+      on: a.id == ae.article_id and a.tenant_id == ^tenant_id,
+      where: ae.tenant_id == ^tenant_id and ae.dim == ^dimension and ae.live_denorm,
+      where: a.status == :published,
+      order_by: a.id,
+      limit: ^pair_candidate_cap(bridge?),
+      select: %{
+        id: a.id,
+        tenant_id: a.tenant_id,
+        title: a.title,
+        category: a.category,
+        embedding: ae.embedding
+      }
+    )
+    |> maybe_filter_by_visibility_on_joined_article(vis)
+  end
+
+  defp pair_candidates_legacy_query(tenant_id, bridge?, vis) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding),
+      order_by: a.id,
+      limit: ^pair_candidate_cap(bridge?),
+      select: %{
+        id: a.id,
+        tenant_id: a.tenant_id,
+        title: a.title,
+        category: a.category,
+        embedding: a.embedding
+      }
+    )
+    |> maybe_filter_by_visibility(vis)
+  end
+
+  defp maybe_filter_by_visibility_on_joined_article(query, nil), do: query
+
+  defp maybe_filter_by_visibility_on_joined_article(query, agent_id) when is_binary(agent_id) do
+    where(
+      query,
+      [_ae, a],
+      fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", a.metadata) or
+        fragment("?->>'agent_id' = ?", a.metadata, ^agent_id)
+    )
+  end
+
   defp do_distant_pairs(tenant_id, min_d, max_d, limit, offset, bridge?, vis) do
-    candidates =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding),
-        order_by: a.id,
-        limit: ^pair_candidate_cap(bridge?),
-        select: %{
-          id: a.id,
-          tenant_id: a.tenant_id,
-          title: a.title,
-          category: a.category,
-          embedding: a.embedding
-        }
-      )
-      |> maybe_filter_by_visibility(vis)
+    candidates = pair_candidates_query(tenant_id, bridge?, vis)
 
     # ONE query: the paginated pairs with a `limit + 1` look-ahead. The `<=>` band
     # filter over the sampled cross-join is the whole cost, and this ordered
@@ -5633,13 +5745,23 @@ defmodule Loopctl.Knowledge do
   # compared against (matches nearest_prior_distance's filter), so it's a truthful
   # disambiguator for nil scores and never counts another agent's private priors.
   defp count_embedded_priors(tenant_id, prior_tag, vis) do
-    from(a in Article,
-      where:
-        a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding) and
-          fragment("? && ?", a.tags, ^[prior_tag])
-    )
-    |> maybe_filter_by_visibility(vis)
-    |> AdminRepo.aggregate(:count, timeout: 15_000)
+    if Embeddings.side_table_reads_enabled?() do
+      from(ae in ArticleEmbedding,
+        where:
+          ae.tenant_id == ^tenant_id and ae.dim == ^Embeddings.active_dimension(tenant_id) and
+            ae.live_denorm,
+        where: ae.article_id in subquery(prior_article_ids_query(tenant_id, prior_tag, vis))
+      )
+      |> AdminRepo.aggregate(:count, timeout: 15_000)
+    else
+      from(a in Article,
+        where:
+          a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding) and
+            fragment("? && ?", a.tags, ^[prior_tag])
+      )
+      |> maybe_filter_by_visibility(vis)
+      |> AdminRepo.aggregate(:count, timeout: 15_000)
+    end
   end
 
   defp score_idea(tenant_id, idea, prior_tag, vis) do
@@ -5700,6 +5822,18 @@ defmodule Loopctl.Knowledge do
   # (`a.tenant_id == ^tenant_id`) and is bounded by prior-tag selectivity — NEVER a
   # full-corpus read (the verified plan shape is documented on novelty_distance_query/4).
   defp nearest_prior_distance(tenant_id, embedding, prior_tag, vis) do
+    # Query-vector length guard (review): the side-table novelty aggregate binds this
+    # FRESH vector into the per-dimension `(embedding::vector(N))` cast, so a length
+    # disagreeing with the read dimension would raise pgvector's "different vector
+    # dimensions" 500 on the knowledge_create request path. `nil` is the documented
+    # no-score degrade (indistinguishable from "no comparable priors").
+    case Embeddings.check_query_vector(tenant_id, to_embedding_list(embedding)) do
+      :ok -> run_nearest_prior_distance(tenant_id, embedding, prior_tag, vis)
+      {:error, _mismatch} -> nil
+    end
+  end
+
+  defp run_nearest_prior_distance(tenant_id, embedding, prior_tag, vis) do
     query = novelty_distance_query(tenant_id, embedding, prior_tag, vis)
     # Heavy vector aggregate — dedicated pool via Loopctl.HeavyRead (US-27.11).
     # `on_overload: :tag` (US-37.5): over the tenant's HeavyRead slice the read is SHED
@@ -5734,6 +5868,19 @@ defmodule Loopctl.Knowledge do
   # accepting EITHER plan (it does NOT pin the node type).
   @doc false
   def novelty_distance_query(tenant_id, embedding, prior_tag, vis) do
+    # US-41.1 (review #3): behind the cutover flag the prior set is scanned on the
+    # dimension-tagged side table. Leaving it on `articles.embedding` meant a
+    # 768/1024 tenant — whose legacy column is NEVER written — saw ZERO priors, and
+    # the novelty/dedup gate then verdicted every proposal `novel` and created
+    # duplicates. That is a correctness regression, not a degradation.
+    if Embeddings.side_table_reads_enabled?() do
+      novelty_distance_side_table_query(tenant_id, embedding, prior_tag, vis)
+    else
+      novelty_distance_legacy_query(tenant_id, embedding, prior_tag, vis)
+    end
+  end
+
+  defp novelty_distance_legacy_query(tenant_id, embedding, prior_tag, vis) do
     target = to_embedding_list(embedding)
 
     from(a in Article,
@@ -5741,6 +5888,38 @@ defmodule Loopctl.Knowledge do
         a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding) and
           fragment("? && ?", a.tags, ^[prior_tag]),
       select: fragment("MIN(? <=> ?::vector)", a.embedding, ^target)
+    )
+    |> maybe_filter_by_visibility(vis)
+  end
+
+  # Public-but-`@doc false` with an EXPLICIT dimension (review) so the AC-41.1.12(i)
+  # CI plan gate can EXPLAIN the SIDE-TABLE branch of the novelty aggregate. The
+  # existing US-27.7b gate EXPLAINs `novelty_distance_query/4` with the cutover flag
+  # OFF, so it keeps gating the LEGACY branch only — and this branch is a materially
+  # different shape (an `IN (subquery)` semi-join over `article_embeddings` instead
+  # of an inline `tags &&` residual), i.e. exactly the #170/#172 failure class, with
+  # no guarantee that Postgres's `MIN(x <=> $const)` -> `ORDER BY ... LIMIT 1`
+  # rewrite survives. It is gated now.
+  @doc false
+  def novelty_distance_side_table_query(tenant_id, embedding, prior_tag, vis, dimension \\ nil) do
+    target = to_embedding_list(embedding)
+    dimension = dimension || Embeddings.active_dimension(tenant_id)
+
+    from(ae in ArticleEmbedding,
+      where: ae.tenant_id == ^tenant_id and ae.dim == ^dimension and ae.live_denorm,
+      where: ae.article_id in subquery(prior_article_ids_query(tenant_id, prior_tag, vis))
+    )
+    |> VectorSearch.put_dimension_min_distance(dimension, target)
+  end
+
+  # The prior-tag article id set, shared by the novelty distance and the embedded-prior
+  # count so the score and its disambiguating count are over the SAME population.
+  defp prior_article_ids_query(tenant_id, prior_tag, vis) do
+    from(a in Article,
+      where:
+        a.tenant_id == ^tenant_id and a.status == :published and
+          fragment("? && ?", a.tags, ^[prior_tag]),
+      select: a.id
     )
     |> maybe_filter_by_visibility(vis)
   end
@@ -5772,16 +5951,59 @@ defmodule Loopctl.Knowledge do
   @spec update_embedding(Ecto.UUID.t(), Ecto.UUID.t(), list(number()), String.t() | nil) ::
           {:ok, Article.t()} | {:error, Ecto.Changeset.t() | :not_found}
   def update_embedding(tenant_id, article_id, embedding_vector, content_hash \\ nil) do
+    update_embedding(
+      tenant_id,
+      article_id,
+      embedding_vector,
+      content_hash,
+      Embeddings.resolve_write_dimension(tenant_id)
+    )
+  end
+
+  @doc """
+  `update_embedding/4` with the tenant's dimension resolved BY THE CALLER.
+
+  AC-41.1.11: `update_embedding/4` resolves the dimension per CALL (a `tenants`
+  SELECT plus a settings read). The real US-37.4 batch path
+  (`Loopctl.Workers.BatchArticleEmbeddingWorker.store_all/2`) loops over ~100
+  articles, so calling the /4 form there performs ~100 tenant lookups — exactly the
+  per-item resolution the AC forbids. Batch callers resolve ONCE with
+  `Loopctl.Embeddings.resolve_write_dimension/1` and pass the result here.
+  """
+  @spec update_embedding(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          list(number()),
+          String.t() | nil,
+          pos_integer()
+        ) :: {:ok, Article.t()} | {:error, Ecto.Changeset.t() | :not_found}
+  def update_embedding(tenant_id, article_id, embedding_vector, content_hash, dimension)
+      when is_integer(dimension) do
     case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
       nil ->
         {:error, :not_found}
 
       article ->
-        changeset = Article.embedding_changeset(article, embedding_vector, content_hash)
-
+        # AC-41.1.8(i): the legacy column write, the side-table write and the audit
+        # entry all commit in ONE transaction — two transactions would leave the crash
+        # window in which the legacy row exists without its mirror, which the resumable
+        # backfill can never detect (the legacy row already exists, so it is skipped
+        # forever) and only the reconciliation pass sweeps up.
         multi =
           Multi.new()
-          |> Multi.update(:article, changeset)
+          |> Multi.run(:article, fn repo, _changes ->
+            update_legacy_embedding(repo, article, embedding_vector, content_hash, dimension)
+          end)
+          |> Multi.run(:side_table, fn repo, _changes ->
+            Embeddings.upsert_article_embedding_row(
+              repo,
+              tenant_id,
+              article,
+              embedding_vector,
+              content_hash,
+              dimension
+            )
+          end)
           |> Audit.log_in_multi(:audit, fn %{article: updated} ->
             %{
               tenant_id: tenant_id,
@@ -5792,7 +6014,7 @@ defmodule Loopctl.Knowledge do
               actor_id: nil,
               actor_label: "worker:embedding",
               new_state: %{
-                "embedding_dimensions" => embedding_dimensions(updated.embedding)
+                "embedding_dimensions" => dimension
               }
             }
           end)
@@ -5800,7 +6022,28 @@ defmodule Loopctl.Knowledge do
         case AdminRepo.transaction(multi) do
           {:ok, %{article: article}} -> {:ok, article}
           {:error, :article, changeset, _} -> {:error, changeset}
+          {:error, :side_table, changeset, _} -> {:error, changeset}
+          # The :audit step (Audit.log_in_multi) is also fallible; without this
+          # catch-all its `{:error, :audit, reason, _}` fell through to a
+          # CaseClauseError — a 500 / non-retryable crash instead of a mapped error.
+          {:error, _step, reason, _} -> {:error, reason}
         end
+    end
+  end
+
+  # The legacy `articles.embedding` half of the dual-write. It is SKIPPED entirely for
+  # any non-1536 dimension: that column is typed `vector(1536)` and pgvector
+  # HARD-ERRORS on storing a 768/1024-length value in it, so a dual-write mandate for
+  # non-default dimensions is physically unexecutable. Those tenants are
+  # side-table-ONLY (AC-41.1.8), and `Embeddings.recall_availability/1` is the
+  # tenant-facing surface that SAYS so rather than failing opaquely.
+  defp update_legacy_embedding(repo, article, embedding_vector, content_hash, dimension) do
+    if dimension == Embeddings.legacy_dimension() do
+      article
+      |> Article.embedding_changeset(embedding_vector, content_hash, dimension)
+      |> repo.update()
+    else
+      {:ok, article}
     end
   end
 
@@ -5830,6 +6073,12 @@ defmodule Loopctl.Knowledge do
         multi =
           Multi.new()
           |> Multi.update(:article, changeset)
+          # US-41.1: clearing an article's embedding must clear BOTH locations in the
+          # same transaction, at EVERY dimension — otherwise a cleared article stays
+          # semantically recallable from the side table.
+          |> Multi.run(:side_table, fn repo, _changes ->
+            Embeddings.delete_article_embeddings(repo, tenant_id, article_id)
+          end)
           |> Audit.log_in_multi(:audit, fn %{article: updated} ->
             %{
               tenant_id: tenant_id,
@@ -5846,15 +6095,12 @@ defmodule Loopctl.Knowledge do
         case AdminRepo.transaction(multi) do
           {:ok, %{article: article}} -> {:ok, article}
           {:error, :article, changeset, _} -> {:error, changeset}
+          {:error, _step, reason, _} -> {:error, reason}
         end
     end
   end
 
   # --- Private helpers ---
-
-  defp embedding_dimensions(nil), do: nil
-  defp embedding_dimensions(embedding) when is_list(embedding), do: length(embedding)
-  defp embedding_dimensions(%Pgvector{} = vector), do: length(Pgvector.to_list(vector))
 
   defp fetch_article(tenant_id, article_id, opts) do
     # Visibility scope (#163/#331): the write paths (update/archive) pass the
@@ -6316,6 +6562,68 @@ defmodule Loopctl.Knowledge do
     # degrades gracefully to KEYWORD-only fallback on overload, exactly as it does on
     # an embedding failure. Either heavy read's shed short-circuits to the tagged error
     # the callers map to keyword fallback.
+    # US-41.1 AC-41.1.5/.8: behind the explicit, REVERSIBLE cutover flag the ANN runs
+    # over the dimension-tagged side table instead of the legacy `articles.embedding`
+    # column. The flag is a SystemConfig integer so the flip and the revert are both a
+    # single operator UPDATE with no redeploy, and it may only be flipped once every
+    # node runs the dual-write code (a Fly rolling deploy otherwise has old nodes
+    # writing only the legacy column while new nodes read the side table).
+    #
+    # US-41.1 AC-41.1.8 (review #9): the query vector's LENGTH is checked against the
+    # dimension the read path will scan BEFORE binding it into the `<=>` fragment.
+    # WRITES were validated (`Dimensions.validate_vector_length/3`); READS were not,
+    # so any drift — mid-model-change, a stale cached setting — surfaced as a raw
+    # Postgrex "different vector dimensions" 500 instead of the documented keyword
+    # fallback. The moduledoc's "unreachable safety net" claim is only true with this
+    # check at the boundary.
+    target_length = length(VectorSearch.to_embedding_list(query_embedding))
+
+    if Embeddings.side_table_reads_enabled?() do
+      dimension = Embeddings.active_dimension(tenant_id)
+
+      if target_length == dimension do
+        search_semantic_side_table(
+          tenant_id,
+          query_embedding,
+          limit,
+          offset,
+          status,
+          opts,
+          dimension
+        )
+      else
+        semantic_recall_unavailable(tenant_id, target_length, dimension)
+      end
+    else
+      # The LEGACY column is `vector(1536)` unconditionally, so this needs NO tenant
+      # lookup on the hot path — the expected length is a constant. The (rare) failure
+      # branch is the only place that pays for `recall_availability/1`, which is the
+      # AC-41.1.8 surface designated to SAY why recall is unavailable.
+      if target_length == Embeddings.legacy_dimension() do
+        search_semantic_legacy(tenant_id, query_embedding, limit, offset, status, opts)
+      else
+        semantic_recall_unavailable(tenant_id, target_length, Embeddings.legacy_dimension())
+      end
+    end
+  end
+
+  # AC-41.1.8: "the surface SAYS so rather than failing opaquely". The caller
+  # (`search_combined/3` and the search controller) maps this to the keyword-only
+  # degrade with a stable `fallback_reason`, so an agent gets a labelled 200 instead
+  # of a pgvector 500 or a silent empty ranked set.
+  defp semantic_recall_unavailable(tenant_id, target_length, expected) do
+    availability = Embeddings.recall_availability(tenant_id)
+
+    Logger.warning(
+      "knowledge.semantic_recall_unavailable tenant_id=#{tenant_id} " <>
+        "query_vector_length=#{target_length} expected=#{expected} " <>
+        "reason=#{availability.reason || "query/corpus dimension mismatch"}"
+    )
+
+    {:error, :semantic_recall_unavailable}
+  end
+
+  defp search_semantic_legacy(tenant_id, query_embedding, limit, offset, status, opts) do
     results_query = semantic_results_query(tenant_id, query_embedding, opts)
 
     # COUNT — kept as a SEPARATE full-corpus filtered `count(*)` so `total_count` PRESERVES
@@ -6342,22 +6650,299 @@ defmodule Loopctl.Knowledge do
             {:ok,
              %{
                results: results,
-               meta: %{
-                 total_count: total_count,
-                 limit: limit,
-                 offset: offset,
-                 search_mode: "semantic_only",
-                 # Every EMBEDDED article passing the filters is ranked by similarity
-                 # (no relevance cutoff), so total_count is the size of that embedded
-                 # set — NOT a match count, and <= the total published count (articles
-                 # without an embedding are excluded). Use knowledge_stats for the
-                 # full wiki size.
-                 total_count_scope: "ranked_corpus",
-                 pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
-               }
+               meta:
+                 %{
+                   total_count: total_count,
+                   limit: limit,
+                   offset: offset,
+                   search_mode: "semantic_only",
+                   # Every EMBEDDED article passing the filters is ranked by similarity
+                   # (no relevance cutoff), so total_count is the size of that embedded
+                   # set — NOT a match count, and <= the total published count (articles
+                   # without an embedding are excluded). Use knowledge_stats for the
+                   # full wiki size.
+                   total_count_scope: "ranked_corpus",
+                   pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
+                 }
+                 |> Map.merge(legacy_system_corpus_meta())
              }}
         end
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # US-41.1 — the SIDE-TABLE semantic read path (AC-41.1.5 / .6 / .7 / .10)
+  # ---------------------------------------------------------------------------
+
+  # THE dimension-scoped recall, in three stages, and the split is load-bearing:
+  #
+  #   1. INNER ANN (through `HeavyRead`) — a pure index-ordered top-`pool` over
+  #      `article_embeddings` ALONE, whose WHERE carries ONLY the predicates the
+  #      per-dimension partial index carries (`tenant_id`, `dim`, `live_denorm`).
+  #      No join, no selective btree predicate: that is the #170/#172 shape that
+  #      flips the planner off HNSW (cost ~57k vs ~880 at 76k rows). One base-table
+  #      source with a conjunctive `tenant_id ==` equality, so `guard!/2` accepts it
+  #      (AC-41.1.6) with nothing relaxed.
+  #   2. HYDRATION — the ≤`pool` article ids are projected from `articles` with the
+  #      selective filters applied. This is a bounded `id IN (...)` lookup, not a
+  #      corpus scan, so no filter here can defeat anything. It carries the SAME
+  #      `tenant_id == ^tenant_id or a.scope == :system` predicate the rest of this
+  #      module uses, which is what lets AC-41.1.7's per-tenant materialization of
+  #      the SHARED system corpus surface here (the embedding row carries the
+  #      requesting tenant's `tenant_id`; the article row carries NULL).
+  #   3. RANK + PAGE in Elixir over that same ≤`pool` set.
+  #
+  # A cross-dimension comparison is impossible BY CONSTRUCTION: stage 1 is scoped to
+  # exactly one `dim`, so pgvector's "different vector dimensions" error is an
+  # unreachable safety net rather than the mechanism.
+  defp search_semantic_side_table(
+         tenant_id,
+         query_embedding,
+         limit,
+         offset,
+         status,
+         opts,
+         dimension
+       ) do
+    pool = semantic_result_pool(offset + limit)
+
+    # Review #7: the side-table inner ANN cannot carry the status/visibility
+    # predicates the legacy inner did (they are not in the per-dimension partial
+    # index — `live_denorm` only mirrors `status <> 'superseded'`), so drafts,
+    # archived and other agents' private articles occupy pool slots and the real
+    # predicates are applied in `hydrate_semantic_pool/6`. At an identical pool size
+    # that returns strictly FEWER published rows than the legacy path. The inner
+    # limit is therefore over-fetched and the hydration trims back.
+    inner_pool = VectorSearch.side_table_inner_pool(pool)
+    pool_query = semantic_side_table_pool_query(tenant_id, query_embedding, dimension, inner_pool)
+
+    count_query = semantic_side_table_count_query(tenant_id, dimension, status, opts)
+
+    # Raise `hnsw.ef_search` to cover the over-fetched inner pool (review): the HNSW
+    # scan only returns ~ef_search nodes regardless of LIMIT, so the side-table
+    # over-fetch that compensates for post-ANN status/visibility filtering does nothing
+    # unless ef_search is widened in lockstep. Piggybacks on the SET LOCAL transaction
+    # every heavy read already runs in (US-27.13) — no new pool-starvation risk.
+    pool_opts =
+      Keyword.put(
+        semantic_heavy_read_opts(),
+        :hnsw_ef_search,
+        VectorSearch.side_table_ef_search(inner_pool)
+      )
+
+    case HeavyRead.all(tenant_id, pool_query, pool_opts) do
+      {:error, :heavy_read_overloaded} = err ->
+        err
+
+      pool_rows ->
+        case HeavyRead.one(tenant_id, count_query, semantic_heavy_read_opts()) do
+          {:error, :heavy_read_overloaded} = err ->
+            err
+
+          total_count ->
+            results = hydrate_semantic_pool(tenant_id, pool_rows, status, opts, limit, offset)
+            maybe_record_search_access(tenant_id, results, nil, opts, "semantic")
+
+            {:ok,
+             %{
+               results: results,
+               meta:
+                 %{
+                   total_count: total_count,
+                   limit: limit,
+                   offset: offset,
+                   search_mode: "semantic_only",
+                   total_count_scope: "ranked_corpus",
+                   embedding_dimension: dimension,
+                   pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
+                 }
+                 |> Map.merge(semantic_disclosure_meta(tenant_id, dimension))
+             }}
+        end
+    end
+  end
+
+  # Stage 1 — the pure, dimension-scoped, index-ordered ANN. Public-but-`@doc false`
+  # so the AC-41.1.12(i) CI plan gate and the AC-41.1.6 guard test can assert the
+  # REAL request-path query rather than a hand-written lookalike.
+  @doc false
+  def semantic_side_table_pool_query(tenant_id, query_embedding, dimension, pool) do
+    target = VectorSearch.to_embedding_list(query_embedding)
+
+    ArticleEmbedding
+    |> VectorSearch.index_safe_dimension_knn_base(tenant_id, target, dimension, pool)
+    |> select([e], %{article_id: e.article_id, tenant_id: e.tenant_id})
+    |> VectorSearch.put_dimension_distance(dimension, target)
+  end
+
+  # The `total_count` for the side-table path: the size of the tenant's LIVE,
+  # embedded-at-this-dimension, filtered corpus. Joined to `articles` (both sources
+  # carry the conjunctive tenant equality, so `guard!/2` accepts it) and carrying NO
+  # `<=>` ordering — a count is order-independent, and an ORDER BY here would force a
+  # full-corpus sort for nothing.
+  #
+  # SYSTEM-scoped articles ARE counted (review #13). The previous form joined
+  # `articles` on `a.tenant_id == ^tenant_id`, which excluded them — while
+  # `hydrate_semantic_pool/6` selects `a.tenant_id == ^tenant_id or a.scope ==
+  # :system` and RETURNS them. Once a tenant materializes the system corpus
+  # (AC-41.1.7), `length(results)` could therefore exceed `total_count`, breaking the
+  # documented `total_count_scope: ranked_corpus` contract and making
+  # `semantic_pool_capped?/4` emit a wrong truncation signal (degenerately:
+  # `total_count: 0` alongside non-empty results).
+  #
+  # The join to `articles` is dropped entirely rather than OR-broadened: an
+  # `or a.scope == :system` on the join-on is exactly the disjunctive tenant
+  # predicate `guard!/2` refuses. The only remaining base-table source is
+  # `article_embeddings`, which carries the conjunctive tenant equality, and the
+  # article-side filtering happens in the `IN (subquery)` id set below — where the
+  # `scope == :system` disjunction is safe because the embedding ROW is still
+  # tenant-scoped (a system article is only counted for a tenant that has
+  # materialized its own vector for it).
+  @doc false
+  def semantic_side_table_count_query(tenant_id, dimension, status, opts) do
+    from(ae in ArticleEmbedding,
+      where: ae.tenant_id == ^tenant_id,
+      where: ae.dim == ^dimension,
+      where: ae.live_denorm
+    )
+    |> apply_search_filters_on_article(tenant_id, status, opts)
+    |> select([_ae], count())
+  end
+
+  # `apply_search_filters/3` targets the FIRST binding; here the article is not a
+  # binding at all, so the filters are re-expressed against a subquery whose single
+  # binding IS the article. Cheaper than duplicating nine filter helpers, and it
+  # cannot drift from the keyword path's filter semantics.
+  defp apply_search_filters_on_article(query, tenant_id, status, opts) do
+    # The inner id set carries the SAME `tenant_id == ^tenant_id or scope == :system`
+    # predicate `hydrate_semantic_pool/6` uses, so the count and the results are over
+    # the same population. It is never unscoped: an unscoped inner set would scan
+    # every tenant's articles to compute an id list that is then thrown away.
+    filtered_ids =
+      from(a in Article, where: a.tenant_id == ^tenant_id or a.scope == :system)
+      |> apply_search_filters(status, opts)
+      |> select([a], a.id)
+
+    where(query, [ae], ae.article_id in subquery(filtered_ids))
+  end
+
+  # Stage 2 + 3. `AdminRepo` (not `HeavyRead`) deliberately: this is a bounded
+  # `id IN (≤pool)` projection, not a heavy read, and it must be able to see
+  # system-scoped rows — whose NULL `articles.tenant_id` cannot satisfy the heavy-read
+  # guard. Isolation is preserved by construction: the ids come from stage 1, which
+  # is RLS-equivalently scoped to this tenant's OWN embedding rows, and the predicate
+  # here re-asserts `tenant_id == ^tenant_id or scope == :system` — the same explicit
+  # predicate `fetch_stub_projection/3` and the keyword path already use.
+  defp hydrate_semantic_pool(_tenant_id, [], _status, _opts, _limit, _offset), do: []
+
+  defp hydrate_semantic_pool(tenant_id, pool_rows, status, opts, limit, offset) do
+    scores =
+      Map.new(pool_rows, fn %{article_id: id, distance: distance} ->
+        {id, 1 - (distance || 0.0)}
+      end)
+
+    filtered =
+      from(a in Article,
+        where: a.id in ^Map.keys(scores),
+        where: a.tenant_id == ^tenant_id or a.scope == :system,
+        select: %{
+          id: a.id,
+          tenant_id: a.tenant_id,
+          project_id: a.project_id,
+          title: a.title,
+          category: a.category,
+          status: a.status,
+          tags: a.tags,
+          inserted_at: a.inserted_at,
+          updated_at: a.updated_at
+        }
+      )
+      |> apply_search_filters(status, opts)
+      |> AdminRepo.all()
+
+    # Under-fill observability (review): the side-table inner ANN cannot carry
+    # status/visibility, so drafts/archived/private rows occupy pool slots and are
+    # trimmed HERE. When the post-filter set shrinks below the ANN candidate pool the
+    # recall regression the fixed over-fetch is meant to offset is happening — emit it
+    # so it is measured, not silent (KB ae9a1719: silent under-fill is the failure the
+    # side-table design must avoid).
+    emit_side_table_underfill(tenant_id, length(pool_rows), length(filtered), limit)
+
+    filtered
+    |> Enum.map(&Map.put(&1, :similarity_score, Map.fetch!(scores, &1.id)))
+    |> Enum.sort_by(& &1.similarity_score, :desc)
+    |> Enum.drop(offset)
+    |> Enum.take(limit)
+  end
+
+  defp emit_side_table_underfill(tenant_id, pool_count, filtered_count, limit) do
+    if filtered_count < pool_count do
+      :telemetry.execute(
+        [:loopctl, :knowledge, :semantic_search, :side_table_underfill],
+        %{
+          pool_candidates: pool_count,
+          survived_filter: filtered_count,
+          trimmed: pool_count - filtered_count,
+          requested_limit: limit
+        },
+        %{tenant_id: tenant_id}
+      )
+    end
+
+    :ok
+  end
+
+  # The AC-41.1.7 + AC-41.1.10 disclosures every semantic response carries.
+  #
+  # Both exist so recall NEVER shrinks silently: a tenant that has not materialized
+  # the shared system corpus at its dimension gets an explicit "keyword_only" marker
+  # for that corpus (a silent absence is indistinguishable from "nothing relevant"),
+  # and a tenant mid-re-embed is told which rows are excluded from PENDING-dimension
+  # recall and why.
+  # COST GATE (review #8): on the LEGACY path none of this can change the answer —
+  # results come from `articles.embedding`, there is no per-dimension corpus to be
+  # unmaterialized and no re-embed can be observed — yet it was costing THREE extra
+  # queries (a tenants SELECT + settings read for the dimension, a NOT EXISTS
+  # anti-join over every system-scoped article, and a re-embed existence probe) on
+  # the hottest read in the product, against AC-41.1.12's "the hosted default must
+  # not regress". It is therefore emitted only on the side-table path, where the
+  # dimension is already resolved and the disclosures are actually true statements
+  # about what was scanned.
+  #
+  # MEMOIZED per (tenant, dimension) for a short TTL by
+  # `Embeddings.search_disclosure_meta/2` (review): in the STEADY state the
+  # system-corpus anti-join qualifies NO row, so its `LIMIT 1` never short-circuits
+  # and it scans every system-scoped article with a per-row index probe — a cost that
+  # grows with loopctl's own canonical wiki corpus, paid on every semantic search,
+  # against AC-41.1.12's "the hosted default must not regress".
+  # AC-41.1.7's "on demand" read-path materialization trigger now lives INSIDE
+  # `Embeddings.search_disclosure_meta/2`'s memoized cache fill (review #11), so it
+  # fires only on a DisclosureCache MISS rather than on every semantic response — the
+  # per-request unindexed `oban_jobs` scan + Oban insert it used to cost is gone. The
+  # worker is unique per `(tenant_id, dim)`, its batch query is an anti-join, and the
+  # enqueue refuses to re-drive a permanently-terminated materialization.
+  defp semantic_disclosure_meta(tenant_id, dimension) when is_integer(dimension) do
+    Embeddings.search_disclosure_meta(tenant_id, dimension)
+  end
+
+  # AC-41.1.7 mandates the system-corpus recall state be stated EXPLICITLY on every
+  # semantic response — "never a silent absence" (review, finding 3). On the LEGACY
+  # (pre-cutover) read path the shared system corpus is not semantically recallable at
+  # all: the legacy inner ANN (`index_safe_knn_base/4`) scopes `tenant_id ==
+  # ^tenant_id`, which excludes the NULL-tenant system rows, so system articles are
+  # keyword-only for EVERY tenant during the dual-write window. Emitting this static
+  # note keeps the disclosure present pre-flip too, rather than absent until the
+  # side-table path (which computes the per-tenant materialization state) takes over.
+  # This is a compile-time constant — NO query — so it does not reintroduce the hot-path
+  # cost the side-table disclosure is memoized to avoid.
+  defp legacy_system_corpus_meta do
+    %{
+      system_corpus_recall: "keyword_only",
+      system_corpus_reason:
+        "the shared system-scoped corpus is semantically recallable only on the " <>
+          "side-table read path; while this instance still serves the legacy " <>
+          "(pre-cutover) embedding column it is matched by keyword only for every tenant."
+    }
   end
 
   # US-37.5: heavy-read opts for the semantic search reads with the graceful-degrade
@@ -6670,8 +7255,12 @@ defmodule Loopctl.Knowledge do
 
             {:ok, merged}
 
-          {:error, :heavy_read_overloaded} ->
-            combined_keyword_fallback(tenant_id, kw, :heavy_read_overloaded, query_string, opts)
+          # US-41.1: `:semantic_recall_unavailable` joins `:heavy_read_overloaded`
+          # here — the query vector cannot be compared against the corpus this tenant
+          # actually has, so semantic contributes nothing and the response is
+          # LABELLED rather than silently short.
+          {:error, reason} ->
+            combined_keyword_fallback(tenant_id, kw, reason, query_string, opts)
         end
 
       {{:ok, kw}, {:error, reason}} ->
@@ -6819,6 +7408,10 @@ defmodule Loopctl.Knowledge do
   # US-37.5: the semantic heavy read was shed because the tenant is over its
   # per-tenant in-flight HeavyRead cap; search degraded to keyword-only.
   defp reason_to_tag(:heavy_read_overloaded), do: "heavy_read_overloaded"
+  # US-41.1 AC-41.1.8: the query vector's length does not match the dimension the
+  # read path scans (a non-1536 tenant before the read flag flips, or a model change
+  # mid-flight). Search degrades to keyword-only and SAYS so.
+  defp reason_to_tag(:semantic_recall_unavailable), do: "semantic_recall_unavailable"
   defp reason_to_tag(:timeout), do: "embedding_timeout"
 
   # US-37.3: the throttle 4-tuple carries a Retry-After — the tag is still status-only.
@@ -8333,7 +8926,35 @@ defmodule Loopctl.Knowledge do
       {:error, :circuit_open}
     else
       timeout = Keyword.get(opts, :timeout, @embedding_yield_ms)
-      run_embedding_task(tenant_id, egress_scope(tenant_id, opts), query_string, timeout)
+
+      run_embedding_task(
+        tenant_id,
+        egress_scope(tenant_id, opts),
+        query_string,
+        timeout,
+        embedding_model_override(tenant_id, opts)
+      )
+    end
+  end
+
+  # US-41.1 AC-41.1.10 — WHICH MODEL this embedding is generated with.
+  #
+  #   * `:active` (the DEFAULT, i.e. every ordinary caller): the model that produced
+  #     the tenant's ACTIVE corpus. `Embeddings.query_model_override/1` returns `nil`
+  #     unless the tenant's CONFIGURED model has moved away from that pin — which
+  #     happens exactly during a re-embed, when a query vector from the configured
+  #     (pending) model would disagree with every stored vector and black out recall
+  #     for the whole window. `nil` keeps the client call byte-identical to before.
+  #   * `:configured`: the tenant's current setting, pin ignored — the ONE caller is
+  #     `ReembedWorker`, whose whole job is to produce vectors at the PENDING model's
+  #     dimension.
+  #   * a binary: an explicit model (tests / operator tools).
+  defp embedding_model_override(tenant_id, opts) do
+    case Keyword.get(opts, :embedding_model, :active) do
+      :active -> Embeddings.query_model_override(tenant_id)
+      :configured -> nil
+      model when is_binary(model) -> model
+      _ -> nil
     end
   end
 
@@ -8351,11 +8972,11 @@ defmodule Loopctl.Knowledge do
   # fallback and the workers snooze on — so the interactive path degrades gracefully
   # instead of blocking, and NO circuit-breaker / provider-error signal is recorded
   # (self-imposed backpressure is not a provider failure).
-  defp run_embedding_task(tenant_id, scope, query_string, timeout) do
+  defp run_embedding_task(tenant_id, scope, query_string, timeout, model) do
     case embedding_concurrency().acquire(tenant_id) do
       :ok ->
         try do
-          run_capped_embedding_task(tenant_id, scope, query_string, timeout)
+          run_capped_embedding_task(tenant_id, scope, query_string, timeout, model)
         after
           embedding_concurrency().release(tenant_id)
         end
@@ -8365,7 +8986,7 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp run_capped_embedding_task(tenant_id, scope, query_string, timeout) do
+  defp run_capped_embedding_task(tenant_id, scope, query_string, timeout, model) do
     # Task.Supervisor.async_nolink so an embedding task crash surfaces as
     # {:exit, reason} from Task.yield (the `_ ->` clause -> {:error, :timeout})
     # rather than crashing THIS process (AC-37.2.5). The inner rescue still catches
@@ -8378,7 +8999,13 @@ defmodule Loopctl.Knowledge do
     task =
       Task.Supervisor.async_nolink(Loopctl.Knowledge.EmbeddingTaskSupervisor, fn ->
         try do
-          embedding_client().generate_embedding(scope, query_string)
+          # `/2` when there is no model override, so the overwhelmingly common path
+          # (and every existing client contract) is untouched.
+          if is_binary(model) do
+            embedding_client().generate_embedding(scope, query_string, model: model)
+          else
+            embedding_client().generate_embedding(scope, query_string)
+          end
         rescue
           e -> {:error, {:embedding_crash, Exception.message(e)}}
         end
@@ -8445,18 +9072,25 @@ defmodule Loopctl.Knowledge do
       {:error, :circuit_open}
     else
       timeout = Keyword.get(opts, :timeout, @embedding_yield_ms)
-      run_embeddings_task(tenant_id, egress_scope(tenant_id, opts), texts, timeout)
+
+      run_embeddings_task(
+        tenant_id,
+        egress_scope(tenant_id, opts),
+        texts,
+        timeout,
+        embedding_model_override(tenant_id, opts)
+      )
     end
   end
 
   # Mirrors `run_embedding_task/3`: ONE concurrency slot for the WHOLE batch
   # (US-37.2 — a batch is one outbound call, so it charges one slot), released in an
   # `after`. Over the cap → `{:error, :rate_limited_local}` (worker snoozes).
-  defp run_embeddings_task(tenant_id, scope, texts, timeout) do
+  defp run_embeddings_task(tenant_id, scope, texts, timeout, model) do
     case embedding_concurrency().acquire(tenant_id) do
       :ok ->
         try do
-          run_capped_embeddings_task(tenant_id, scope, texts, timeout)
+          run_capped_embeddings_task(tenant_id, scope, texts, timeout, model)
         after
           embedding_concurrency().release(tenant_id)
         end
@@ -8471,13 +9105,17 @@ defmodule Loopctl.Knowledge do
   # signal per batch — a batch failure counts once, not per text. UNLIKE the single
   # path it is EXEMPT from latency-based tripping (a batch's wall-clock is inherently
   # larger than one text; see the success clause below).
-  defp run_capped_embeddings_task(tenant_id, scope, texts, timeout) do
+  defp run_capped_embeddings_task(tenant_id, scope, texts, timeout, model) do
     started_ms = System.monotonic_time(:millisecond)
 
     task =
       Task.Supervisor.async_nolink(Loopctl.Knowledge.EmbeddingTaskSupervisor, fn ->
         try do
-          embedding_client().generate_embeddings(scope, texts)
+          if is_binary(model) do
+            embedding_client().generate_embeddings(scope, texts, model: model)
+          else
+            embedding_client().generate_embeddings(scope, texts)
+          end
         rescue
           e -> {:error, {:embedding_crash, Exception.message(e)}}
         end

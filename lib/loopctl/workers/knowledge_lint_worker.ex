@@ -56,6 +56,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Embeddings
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
@@ -260,7 +261,28 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
   defp embedded_ids(_tenant_id, []), do: MapSet.new()
 
+  # US-41.1 (review): behind the cutover flag the presence check reads the
+  # dimension-tagged side table. `articles.embedding` is NEVER written for a non-1536
+  # dimension, so for a 768/1024 tenant this MapSet was always empty: every orphan was
+  # classified "not embedded", the relink branch was never taken, and
+  # `orphans_embedding_enqueued` grew on every run — a structurally wrong lint report
+  # for exactly the tenants this epic serves, and a driver of the re-billing loop.
   defp embedded_ids(tenant_id, orphan_ids) do
+    # WRITE-dimension gated (`use_side_table_hash?/1`), not read-flag gated (review):
+    # a non-1536 tenant's `articles.embedding` is never written, so the read-flag gate
+    # classified every orphan "not embedded" and drove the re-billing loop.
+    if Embeddings.use_side_table_hash?(tenant_id) do
+      Embeddings.embedded_article_ids(
+        tenant_id,
+        orphan_ids,
+        Embeddings.active_dimension(tenant_id)
+      )
+    else
+      legacy_embedded_ids(tenant_id, orphan_ids)
+    end
+  end
+
+  defp legacy_embedded_ids(tenant_id, orphan_ids) do
     from(a in Article,
       where: a.tenant_id == ^tenant_id,
       where: a.id in ^orphan_ids,

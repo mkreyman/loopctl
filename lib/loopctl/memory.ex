@@ -54,11 +54,13 @@ defmodule Loopctl.Memory do
   alias Loopctl.Egress.Scope, as: EgressScope
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
+  alias Loopctl.Embeddings
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Memory.Memory, as: MemorySchema
+  alias Loopctl.Memory.MemoryEmbedding
   alias Loopctl.Memory.PromotionTelemetry
   alias Loopctl.Memory.RecallBumpCache
   alias Loopctl.Memory.Scope
@@ -704,6 +706,41 @@ defmodule Loopctl.Memory do
   defp recall_on_overload(_), do: :raise
 
   defp recall_semantic(scope, embedding, k, include_superseded?, on_overload) do
+    case recall_dimension_check(scope, embedding) do
+      :ok -> do_recall_semantic(scope, embedding, k, include_superseded?, on_overload)
+      {:error, reason} -> unavailable_memory_env(scope.tenant_id, k, reason)
+    end
+  end
+
+  # US-41.1 AC-41.1.8 (review #9): the query vector's LENGTH is checked against the
+  # dimension the read path will scan BEFORE it is bound into the per-dimension cast
+  # fragment. WRITES were validated; READS were not, so any drift produced a
+  # raw Postgrex "different vector dimensions" 500 instead of the documented graceful
+  # degrade. The legacy column is `vector(1536)` unconditionally, so the pre-flip
+  # expected length is a constant and this costs NO extra query on that path.
+  defp recall_dimension_check(scope, embedding) do
+    actual = length(VectorSearch.to_embedding_list(embedding))
+
+    expected =
+      if Embeddings.side_table_reads_enabled?() do
+        Embeddings.active_dimension(scope.tenant_id)
+      else
+        Embeddings.legacy_dimension()
+      end
+
+    if actual == expected, do: :ok, else: {:error, "embedding_dimension_mismatch"}
+  end
+
+  defp unavailable_memory_env(tenant_id, k, reason) do
+    emit_recall_degraded(tenant_id, "memory", reason)
+
+    %{
+      results: [],
+      meta: %{total_count: 0, fallback: true, reason: reason, underfilled: k > 0}
+    }
+  end
+
+  defp do_recall_semantic(scope, embedding, k, include_superseded?, on_overload) do
     query = memory_candidate_query(scope, embedding, k, include_superseded?)
 
     case HeavyRead.all_memory(
@@ -779,6 +816,94 @@ defmodule Loopctl.Memory do
   # guard REQUIRES this predicate here) + superseded exclusion over the ≤pool rows —
   # trivial filters on a tiny set that cannot defeat the index.
   defp memory_candidate_query(scope, embedding, k, include_superseded?) do
+    # US-41.1 AC-41.1.5: behind the explicit, reversible cutover flag the ANN runs over
+    # the dimension-tagged `memory_embeddings` side table so a tenant on a non-1536
+    # model is recallable at all. Same filter-after-ANN shape either way.
+    if Embeddings.side_table_reads_enabled?() do
+      memory_side_table_candidate_query(scope, embedding, k, include_superseded?)
+    else
+      memory_legacy_candidate_query(scope, embedding, k, include_superseded?)
+    end
+  end
+
+  # The DIMENSION-SCOPED side-table recall.
+  #
+  # INNER: `memory_embeddings` alone, ordered by the explicit `(embedding::vector(N))`
+  # cast the per-dimension index is built over, carrying ONLY that index's partial
+  # predicate (`tenant_id`, `dim`, `live_denorm`). No join, no subject predicate — both
+  # would flip the planner off HNSW. OUTER: the `memories` join (which carries its own
+  # conjunctive `tenant_id ==` equality, so `guard!/2` accepts both sources) plus the
+  # subject equality on the OUTPUT binding, which is exactly what `guard_memory!/3`
+  # requires — `subject_id` is DENORMALIZED onto the side table so the outer binding
+  # can carry it without a second `memories` reference inside the ANN.
+  #
+  # `include_superseded: true` drops `live_denorm`, so that ADMIN/oversight path has no
+  # matching partial index and plans as a bounded top-k sort over the tenant's rows at
+  # this dimension. That is the deliberate tradeoff: the AC mandates the LIVE-row
+  # predicate on the per-dimension index, and building a second, full index per
+  # dimension would double an already-expensive HNSW build at corpus scale for a path
+  # that is not on the interactive recall route.
+  # Public-but-`@doc false` (review #12) so the AC-41.1.12(i) CI plan gate can EXPLAIN
+  # the REAL memory-recall request-path query. Memory recall has its OWN per-dimension
+  # indexes and its own verbatim `(embedding::vector(N))` cast; asserting only the
+  # article query left a drift here invisible.
+  @doc false
+  def memory_side_table_candidate_query(scope, embedding, k, include_superseded?) do
+    target = VectorSearch.to_embedding_list(embedding)
+    pool = recall_pool_size(scope, k)
+    dimension = Embeddings.active_dimension(scope.tenant_id)
+
+    inner =
+      MemoryEmbedding
+      |> VectorSearch.index_safe_dimension_knn_base(scope.tenant_id, target, dimension, pool,
+        live_only: not include_superseded?
+      )
+      |> select([e], %{
+        memory_id: e.memory_id,
+        tenant_id: e.tenant_id,
+        subject_id: e.subject_id
+      })
+      |> VectorSearch.put_dimension_distance(dimension, target)
+
+    from(c in subquery(inner),
+      as: :embedding,
+      join: m in MemorySchema,
+      as: :memory,
+      on: m.id == c.memory_id and m.tenant_id == ^scope.tenant_id,
+      where: c.subject_id == ^scope.subject_id,
+      order_by: [asc: c.distance],
+      limit: ^k,
+      select: %{
+        id: m.id,
+        tenant_id: m.tenant_id,
+        subject_id: m.subject_id,
+        project_id: m.project_id,
+        text: m.text,
+        embedding_content_hash: m.embedding_content_hash,
+        confidence: m.confidence,
+        source: m.source,
+        source_session_id: m.source_session_id,
+        tags: m.tags,
+        metadata: m.metadata,
+        superseded_by: m.superseded_by,
+        inserted_at: m.inserted_at,
+        updated_at: m.updated_at,
+        distance: c.distance
+      }
+    )
+    |> maybe_exclude_superseded_joined(include_superseded?)
+    |> maybe_scope_project(scope.project_id)
+  end
+
+  # The superseded exclusion for the JOINED side-table shape: `memories` is the
+  # `:memory` NAMED binding here (binding 0 is the embeddings subquery), so the
+  # positional `[c]` form used by the legacy path would target the wrong source.
+  defp maybe_exclude_superseded_joined(query, true), do: query
+
+  defp maybe_exclude_superseded_joined(query, false),
+    do: where(query, [memory: m], is_nil(m.superseded_by))
+
+  defp memory_legacy_candidate_query(scope, embedding, k, include_superseded?) do
     target = VectorSearch.to_embedding_list(embedding)
     pool = recall_pool_size(scope, k)
 
@@ -2055,7 +2180,20 @@ defmodule Loopctl.Memory do
   # struct the sweep/fetch loaded — an EXPLICIT `select` overrides that and returns just
   # the vector (a cheap local read that saves an embedding API round-trip). NULL until
   # `MemoryEmbeddingWorker` has embedded the memory.
+  #
+  # US-41.1 (review): behind the cutover flag the vector is read from the
+  # dimension-tagged side table. The legacy column is NEVER written for a non-1536
+  # tenant, so for those tenants this was always nil and the graduation path silently
+  # paid the provider for a fresh embedding every time.
   defp fetch_memory_embedding(%MemorySchema{id: id, tenant_id: tenant_id}) do
+    if Embeddings.side_table_reads_enabled?() do
+      Embeddings.memory_embedding_vector(tenant_id, id, Embeddings.active_dimension(tenant_id))
+    else
+      fetch_legacy_memory_embedding(id, tenant_id)
+    end
+  end
+
+  defp fetch_legacy_memory_embedding(id, tenant_id) do
     from(m in MemorySchema,
       where: m.id == ^id and m.tenant_id == ^tenant_id,
       select: m.embedding
@@ -2506,6 +2644,16 @@ defmodule Loopctl.Memory do
   # `memory_candidate_query/4` that `recall_semantic/4` builds, so the near-dup path
   # cannot drift from ordinary recall.
   defp find_promoted_near_dup(scope, embedding) do
+    # Same AC-41.1.8 boundary check as `recall_semantic/5`: a length mismatch here
+    # would raise a raw pgvector error on the PROMOTION WRITE path. "No near-dup
+    # found" is the correct, safe degrade (the promotion proceeds as a new row).
+    case recall_dimension_check(scope, embedding) do
+      :ok -> do_find_promoted_near_dup(scope, embedding)
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp do_find_promoted_near_dup(scope, embedding) do
     query = memory_candidate_query(scope, embedding, @near_dup_recall_pool, false)
     # `on_overload: :tag` so an over-cap TenantGate shed returns
     # `{:error, :heavy_read_overloaded}` (mapped to a loss-free snooze upstream)
@@ -2631,8 +2779,37 @@ defmodule Loopctl.Memory do
   # changeset allowed to touch `:embedding`, which validates dimensions).
   defp store_promoted_embedding(repo, scope, memory, embedding, hash) do
     case reload_in_scope(repo, scope, memory.id) do
-      nil -> {:ok, :skipped}
-      row -> row |> MemorySchema.embedding_changeset(embedding, hash) |> repo.update()
+      nil ->
+        {:ok, :skipped}
+
+      row ->
+        # US-41.1: still ONE transaction (the caller's) — the legacy column and the
+        # side-table row are both written here, so the promoted row can never exist
+        # with a vector in only one location. `resolve_write_dimension/1` because
+        # this is a WRITE and must PIN (review) — see `update_memory_embedding/4`.
+        dimension = Embeddings.resolve_write_dimension(scope.tenant_id)
+
+        with {:ok, updated} <-
+               update_legacy_memory_embedding(repo, row, embedding, hash, dimension),
+             {:ok, _side} <-
+               Embeddings.upsert_memory_embedding_row(
+                 repo,
+                 scope.tenant_id,
+                 row,
+                 embedding,
+                 hash,
+                 dimension
+               ) do
+          {:ok, updated}
+        end
+    end
+  end
+
+  defp update_legacy_memory_embedding(repo, row, embedding, hash, dimension) do
+    if dimension == Embeddings.legacy_dimension() do
+      row |> MemorySchema.embedding_changeset(embedding, hash, dimension) |> repo.update()
+    else
+      {:ok, row}
     end
   end
 
@@ -2844,9 +3021,50 @@ defmodule Loopctl.Memory do
         {:error, :not_found}
 
       memory ->
-        memory
-        |> MemorySchema.embedding_changeset(embedding, content_hash)
-        |> Loopctl.AdminRepo.update()
+        # US-41.1 AC-41.1.8(i)/AC-41.1.11: dimension resolved ONCE, then the legacy
+        # `memories.embedding` column and the dimension-tagged side-table row are
+        # written in ONE transaction. For a non-1536 tenant the legacy step is skipped
+        # entirely — that column is `vector(1536)` and pgvector hard-errors on any
+        # other length, so those tenants are side-table-only.
+        #
+        # `resolve_write_dimension/1`, NOT `active_dimension/1` (review): this is a
+        # WRITE, and the pin is what stops the DERIVED leg of `active_dimension/1`
+        # from moving under a populated corpus. A tenant whose first/only embedded
+        # corpus is MEMORIES stayed unpinned on the old call, so a later
+        # `embedding_model` edit silently re-pointed recall at a dimension with zero
+        # stored vectors and `recall_dimension_check/2` turned recall into an empty
+        # `fallback: true` result set.
+        dimension = Embeddings.resolve_write_dimension(tenant_id)
+
+        Ecto.Multi.new()
+        |> Embeddings.memory_embedding_multi(
+          tenant_id,
+          memory,
+          embedding,
+          content_hash,
+          dimension
+        )
+        |> Loopctl.AdminRepo.transaction()
+        |> case do
+          {:ok, %{legacy: updated}} ->
+            {:ok, updated}
+
+          # Non-1536 path: the `:legacy` step is skipped, so returning the pre-update
+          # `memory` handed callers a STALE struct (nil `embedding`, stale
+          # `embedding_content_hash`) even though the side-table write succeeded — the
+          # wrong follow-up decision for exactly the tenants this epic serves (review).
+          # Reflect the write that actually happened onto the returned struct.
+          {:ok, %{side_table: side_row}} ->
+            {:ok,
+             %{
+               memory
+               | embedding: embedding,
+                 embedding_content_hash: side_row.embedding_content_hash
+             }}
+
+          {:error, _step, reason, _done} ->
+            {:error, reason}
+        end
     end
   end
 

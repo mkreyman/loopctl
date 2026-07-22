@@ -56,6 +56,11 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
 
   @impl true
   def generate_embedding(scope_or_tenant_id, text) do
+    generate_embedding(scope_or_tenant_id, text, [])
+  end
+
+  @impl true
+  def generate_embedding(scope_or_tenant_id, text, opts) do
     scope = Scope.coerce(scope_or_tenant_id)
 
     # Key + model resolution is TENANT-scoped (there is no project-level endpoint
@@ -67,12 +72,17 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
         {:error, :no_api_key}
 
       {:ok, %{api_key: api_key, model: model}} ->
-        post(scope, api_key, model, text)
+        post(scope, api_key, override_model(model, opts), text)
     end
   end
 
   @impl true
   def generate_embeddings(scope_or_tenant_id, texts) when is_list(texts) do
+    generate_embeddings(scope_or_tenant_id, texts, [])
+  end
+
+  @impl true
+  def generate_embeddings(scope_or_tenant_id, texts, opts) when is_list(texts) do
     scope = Scope.coerce(scope_or_tenant_id)
 
     # An empty batch never touches the provider (no admission token spent).
@@ -85,8 +95,18 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
           {:error, :no_api_key}
 
         {:ok, %{api_key: api_key, model: model}} ->
-          post_batch(scope, api_key, model, texts)
+          post_batch(scope, api_key, override_model(model, opts), texts)
       end
+    end
+  end
+
+  # US-41.1 AC-41.1.10: the KEY always stays the tenant's own (mandatory BYO); only
+  # the MODEL may be overridden, and only with the model that produced the tenant's
+  # ACTIVE corpus (or, for the re-embed worker, the pending one it is migrating to).
+  defp override_model(resolved_model, opts) do
+    case Keyword.get(opts, :model) do
+      model when is_binary(model) and model != "" -> model
+      _ -> resolved_model
     end
   end
 

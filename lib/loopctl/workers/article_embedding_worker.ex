@@ -64,6 +64,8 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   alias Loopctl.Egress.Scope
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
+  alias Loopctl.Embeddings
+  alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -111,7 +113,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
     text = build_embedding_text(article)
     content_hash = content_hash(text)
 
-    if already_embedded?(article, content_hash) do
+    if already_embedded?(tenant_id, article, content_hash) do
       # Idempotent no-op: this exact content is already embedded (review #12). Ensure
       # linking is (re-)enqueued and finish — never re-call the paid provider.
       enqueue_linking(article_id, tenant_id)
@@ -236,10 +238,33 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   end
 
   defp store(tenant_id, article_id, embedding, content_hash) do
-    with {:ok, _article} <-
-           Knowledge.update_embedding(tenant_id, article_id, embedding, content_hash) do
-      enqueue_linking(article_id, tenant_id)
-      :ok
+    # Pre-write dimension check (review): resolve the write dimension ONCE, then verify
+    # the vector length BEFORE the changeset. An off-dimension model otherwise surfaced
+    # as a changeset validation error, `perform` returned `{:error, _}`, and Oban
+    # re-billed the provider on each of five attempts. A mismatch DISCARDS legibly.
+    dimension = Embeddings.resolve_write_dimension(tenant_id)
+
+    case Dimensions.check_batch_length([embedding], dimension) do
+      :ok ->
+        with {:ok, _article} <-
+               Knowledge.update_embedding(
+                 tenant_id,
+                 article_id,
+                 embedding,
+                 content_hash,
+                 dimension
+               ) do
+          enqueue_linking(article_id, tenant_id)
+          :ok
+        end
+
+      {:error, {:dimension_mismatch, expected, actual}} ->
+        Logger.debug(
+          "ArticleEmbeddingWorker: model returned #{inspect(actual)}-dimension vector but " <>
+            "the tenant is recorded at #{expected}; discarding rather than re-billing."
+        )
+
+        {:discard, {:dimension_mismatch, expected, actual}}
     end
   end
 
@@ -251,11 +276,39 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
     max(Knowledge.circuit_breaker_cooldown_remaining(tenant_id), Admission.snooze_seconds())
   end
 
-  defp already_embedded?(%{embedding: embedding, embedding_content_hash: hash}, content_hash)
+  # IDEMPOTENCY, at the ACTIVE dimension (review).
+  #
+  # This guard used to read ONLY the legacy `articles.embedding` +
+  # `articles.embedding_content_hash`, which `Knowledge.update_embedding/5` NEVER
+  # writes for a non-1536 dimension. For exactly the 768/1024 tenants this epic
+  # exists for, both stayed NULL forever, so the guard fell through to `false` on
+  # every invocation and every enqueue re-billed the paid provider: a silent,
+  # unbounded cost loop. Behind the cutover flag the presence+hash check therefore
+  # consults the side table at the tenant's active dimension, where the hash HAS been
+  # recorded all along.
+  defp already_embedded?(tenant_id, article, content_hash) do
+    # Gated on the WRITE dimension (`use_side_table_hash?/1`), NOT the read flag
+    # (review): a non-1536 tenant NEVER has a legacy hash, so keying this on the read
+    # flag re-billed the provider on every enqueue until cutover.
+    if Embeddings.use_side_table_hash?(tenant_id) do
+      Embeddings.article_embedded_hash(
+        tenant_id,
+        article.id,
+        Embeddings.active_dimension(tenant_id)
+      ) == content_hash
+    else
+      legacy_already_embedded?(article, content_hash)
+    end
+  end
+
+  defp legacy_already_embedded?(
+         %{embedding: embedding, embedding_content_hash: hash},
+         content_hash
+       )
        when not is_nil(embedding) and is_binary(hash),
        do: hash == content_hash
 
-  defp already_embedded?(_article, _content_hash), do: false
+  defp legacy_already_embedded?(_article, _content_hash), do: false
 
   defp content_hash(text) do
     :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
