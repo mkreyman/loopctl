@@ -104,11 +104,30 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
 
     on_exit(fn ->
       unboxed(fn ->
-        AdminRepo.delete_all(from(me in MemoryEmbedding, where: me.tenant_id == ^tenant.id))
-        AdminRepo.delete_all(from(m in MemorySchema, where: m.tenant_id == ^tenant.id))
-        AdminRepo.delete_all(from(ae in ArticleEmbedding, where: ae.tenant_id == ^tenant.id))
-        AdminRepo.delete_all(from(a in Article, where: a.tenant_id == ^tenant.id))
-        AdminRepo.delete_all(from(t in Tenant, where: t.id == ^tenant.id))
+        # ScaleSeed.plan_gate_corpus_size/0 HNSW-indexed rows per relation per
+        # dimension. Deleting them runs index maintenance, and the default 15s Ecto
+        # statement timeout is not enough for a delete this size — the connection
+        # drops mid-teardown ("tcp recv (idle): closed") and ExUnit reports it as a
+        # setup_all failure that invalidates every PASSING plan assertion. Note
+        # `ownership_timeout` (raised to 30 min in config/test.exs) does NOT cover
+        # this: it bounds connection CHECKOUT, not statement execution. So each delete
+        # carries an explicit generous statement timeout.
+        del_opts = [timeout: :timer.minutes(10)]
+
+        AdminRepo.delete_all(
+          from(me in MemoryEmbedding, where: me.tenant_id == ^tenant.id),
+          del_opts
+        )
+
+        AdminRepo.delete_all(from(m in MemorySchema, where: m.tenant_id == ^tenant.id), del_opts)
+
+        AdminRepo.delete_all(
+          from(ae in ArticleEmbedding, where: ae.tenant_id == ^tenant.id),
+          del_opts
+        )
+
+        AdminRepo.delete_all(from(a in Article, where: a.tenant_id == ^tenant.id), del_opts)
+        AdminRepo.delete_all(from(t in Tenant, where: t.id == ^tenant.id), del_opts)
       end)
     end)
 
