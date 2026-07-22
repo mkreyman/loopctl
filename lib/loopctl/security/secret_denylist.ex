@@ -58,6 +58,28 @@ defmodule Loopctl.Security.SecretDenylist do
     ~r/\b[a-z][a-z0-9+.\-]*:\/\/[^\s:\/@]+:[^\s:\/@]+@/i
   ]
 
+  # The instant the pattern set above last CHANGED. Bump this to `DateTime.utc_now()`
+  # (rounded to the second) in the SAME commit that adds, removes, or loosens a pattern.
+  #
+  # It is the retroactivity lever for issue #499: `channel_posts.rescanned_at` records
+  # when a post was last examined, and `Loopctl.Workers.ChannelPostRescanWorker` treats
+  # any post scanned BEFORE this revision as eligible again. Without the bump, a newly
+  # added credential shape would only ever apply to posts written after the deploy —
+  # exactly the reactive-only behaviour #499 exists to remove. Forgetting to bump it is
+  # not a correctness fault for NEW writes (the write-time gate uses the live patterns),
+  # only a missed retroactive sweep.
+  @revision ~U[2026-07-22 00:00:00Z]
+
+  @doc """
+  The instant the denylist pattern set last changed.
+
+  Consumers that cache an "already scanned" marker (the coordination rescan) compare their
+  marker against this to decide whether a previously-scanned row must be re-examined
+  under the current patterns.
+  """
+  @spec revision() :: DateTime.t()
+  def revision, do: @revision
+
   @doc """
   Returns `true` when `value` matches any denylisted secret pattern.
 

@@ -40,6 +40,18 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
     — that stamp re-arms detection so a future stall re-fires. Recorded under the
     fixed sentinel `source_type` `IngestionHealth.sweep_source_type/0`
     (`"channel_post_sweep"`), since the sweep is not an article source_type.
+  - `secret_detected` -- the retroactive US-39.1 denylist rescan
+    (`Loopctl.Workers.ChannelPostRescanWorker`, issue #499) QUARANTINED at least one
+    live `channel_posts` row for this tenant: a post that the write-time gate admitted
+    (the pattern did not exist yet) carries a credential shape under the CURRENT
+    denylist. The freshness fields are repurposed like the other episode types:
+    `sample_count` = posts quarantined in the flagging run; `hours_stale` = 0 (a
+    detection is instantaneous — there is no staleness dimension); `last_event_at`
+    starts nil. Recorded under the fixed sentinel `source_type`
+    `IngestionHealth.rescan_source_type/0` (`"channel_post_rescan"`). Deliberately NOT
+    auto-resolved: a quarantined credential stays an open operator item until a human
+    reviews the post and either redacts it (`Coordination.delete_post/5`) or resolves
+    the anomaly — nothing about a later clean rescan means the leak was handled.
 
   ## Fields
 
@@ -69,7 +81,7 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
   # Extensible list — kept in sync with the `ingestion_anomalies_anomaly_type_check`
   # DB CHECK constraint (widened per new value via migration). A future detector can
   # be added here alongside a CHECK-widening migration.
-  @anomaly_types [:capture_silence, :high_reject_rate, :sweep_stalled]
+  @anomaly_types [:capture_silence, :high_reject_rate, :sweep_stalled, :secret_detected]
 
   @derive {Jason.Encoder,
            only: [
@@ -150,6 +162,7 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
       :capture_silence -> validate_number(changeset, :hours_stale, greater_than: 0)
       :high_reject_rate -> validate_number(changeset, :hours_stale, greater_than_or_equal_to: 0)
       :sweep_stalled -> validate_number(changeset, :hours_stale, greater_than_or_equal_to: 0)
+      :secret_detected -> validate_number(changeset, :hours_stale, greater_than_or_equal_to: 0)
       _ -> changeset
     end
   end

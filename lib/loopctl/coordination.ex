@@ -1228,6 +1228,12 @@ defmodule Loopctl.Coordination do
     if valid_uuid?(tenant_id) and valid_uuid?(post_id) do
       case fetch_owned_post(tenant_id, post_id) do
         nil -> {:error, :not_found}
+        # Issue #499: a QUARANTINED post is invisible to every READ (the by-id read
+        # included — otherwise a flagged credential is still one GET away, and
+        # graduate/2 could promote it into the durable wiki). The DELETE path
+        # deliberately still resolves it through `fetch_owned_post/2`, so an operator
+        # can redact a quarantined post.
+        %ChannelPost{quarantined_at: %DateTime{}} -> {:error, :not_found}
         post -> {:ok, post}
       end
     else
@@ -1896,6 +1902,7 @@ defmodule Loopctl.Coordination do
         ChannelPost
         |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
         |> where([p], p.expires_at > ^now)
+        |> where([p], is_nil(p.quarantined_at))
         |> apply_since(commit_lag_since(since))
         |> apply_cursor(cursor)
         |> order_recent(since)
@@ -2035,6 +2042,10 @@ defmodule Loopctl.Coordination do
         |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
         |> where([p], like(p.key, "handoff:%"))
         |> where([p], p.expires_at > ^now)
+        # Issue #499: a QUARANTINED post carries a credential shape the write-time
+        # denylist missed. It must stop being surfaced anywhere — including the
+        # pinned handoff set — or flagging it buys nothing.
+        |> where([p], is_nil(p.quarantined_at))
         # US-454 (defect 3): a superseded handoff is RETIRED — it leaves the
         # discovery set the same way a DONE claim removes one, so a reader never
         # picks up pre-supersession instructions.

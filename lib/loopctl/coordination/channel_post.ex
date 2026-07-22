@@ -185,6 +185,23 @@ defmodule Loopctl.Coordination.ChannelPost do
     # handoff discovery EXCLUDES superseded posts; the history read marks them.
     field :superseded_by, :binary_id
 
+    # Issue #499 — retroactive denylist quarantine. Set PROGRAMMATICALLY by
+    # `Loopctl.Workers.ChannelPostRescanWorker` (`quarantine_changeset/2`), never
+    # castable: a caller must not be able to quarantine (i.e. hide from every reader)
+    # an arbitrary post, nor un-quarantine its own. NULL `quarantined_at` = live;
+    # a stamped post is excluded from every coordination READ so it stops being
+    # re-injected into new sessions, but the ROW IS RETAINED — the denylist is a
+    # prefix heuristic, and silently destroying a false-positive coordination post is
+    # worse than flagging it. `quarantine_reason` names the offending FIELD names
+    # only and MUST NEVER carry the matched value.
+    field :quarantined_at, :utc_datetime_usec
+    field :quarantine_reason, :string
+
+    # The rescan cursor: when this row was last examined by the rescan worker. Older
+    # than `Loopctl.Security.SecretDenylist.revision/0` (or NULL) means "due for a
+    # scan under the current patterns".
+    field :rescanned_at, :utc_datetime_usec
+
     # US-454 (defect 1): write-path provenance markers, populated by
     # `Coordination.post/4` so the endpoint can TELL the sender when its write was
     # rescued by a server fallback (handoff key derived from the body, and/or a
@@ -287,6 +304,52 @@ defmodule Loopctl.Coordination.ChannelPost do
       name: :channel_posts_idempotency_uidx,
       message: "has already been used (idempotent keyless write)"
     )
+  end
+
+  @doc """
+  Changeset that QUARANTINES a persisted post (issue #499).
+
+  Applied only by `Loopctl.Workers.ChannelPostRescanWorker` when a retroactive scan
+  with the CURRENT `Loopctl.Security.SecretDenylist` patterns flags a post that the
+  write-time gate admitted (because the pattern did not exist yet). `fields` is the
+  list of offending field NAMES from `secret_fields/1`; only those names are recorded
+  — never the matched value, which would copy the credential into a second column.
+
+  Quarantine is deliberately NOT a delete: the row survives for operator review, and
+  `Loopctl.Coordination.delete_post/5` remains the explicit redaction path.
+  """
+  @spec quarantine_changeset(t(), [atom()], DateTime.t()) :: Ecto.Changeset.t()
+  def quarantine_changeset(%__MODULE__{} = post, fields, at) do
+    reason = "secret_denylist: " <> (fields |> Enum.map_join(",", &to_string/1))
+
+    change(post, quarantined_at: at, quarantine_reason: reason, rescanned_at: at)
+  end
+
+  @doc """
+  Changeset stamping the rescan cursor on a post that scanned CLEAN (issue #499).
+
+  Advances `rescanned_at` so successive bounded runs make progress instead of
+  re-scanning the same head batch. A `Loopctl.Security.SecretDenylist.revision/0` bump
+  makes every stamped row eligible again.
+  """
+  @spec rescanned_changeset(t(), DateTime.t()) :: Ecto.Changeset.t()
+  def rescanned_changeset(%__MODULE__{} = post, at), do: change(post, rescanned_at: at)
+
+  @doc """
+  Returns the PERSISTED fields of `post` whose value carries a denylisted credential
+  shape, in a stable order (`refs` last).
+
+  This is the SAME bounded scan the write-time gate runs inside `create_changeset/2` —
+  the identical per-field `scan_slice/1` byte cap and `refs` item-count cap — applied
+  to an already-persisted row instead of a changeset, so the retroactive rescan
+  (issue #499) can never drift from the write-time verdict or re-derive the walking
+  logic. An empty list means the post is clean under the current patterns.
+  """
+  @spec secret_fields(t()) :: [atom()]
+  def secret_fields(%__MODULE__{} = post) do
+    text = Enum.filter(@scanned_text_fields, &secret_in_text?(Map.get(post, &1)))
+
+    if secret_in_refs?(post.refs), do: text ++ [:refs], else: text
   end
 
   @doc "Maximum allowed `body` length in bytes."
@@ -525,7 +588,7 @@ defmodule Loopctl.Coordination.ChannelPost do
   # (no secret value) so an operator can see repeated credential-leak attempts.
   defp validate_no_secrets(changeset) do
     changeset
-    |> add_secret_errors(@scanned_text_fields, &(changeset |> get_field(&1) |> scan_slice()))
+    |> add_secret_errors(@scanned_text_fields, &secret_in_text?(get_field(changeset, &1)))
     |> add_secret_errors([:refs], fn :refs ->
       # Scan EVERY item field — `type`, `value`, AND `label` — not just values
       # (AC-40.A1.3): keys/labels are now attacker-writable, so a secret in a ref
@@ -538,12 +601,22 @@ defmodule Loopctl.Coordination.ChannelPost do
       # of an arbitrarily long (up to the 2MB-body) list — a per-rejected-request
       # CPU-amplification surface that the item-count cap exists precisely to bound
       # (AC-40.A1.2). `Enum.take/2` on a non-list is a no-op via `cap_refs_for_scan/1`.
-      changeset
-      |> get_field(:refs)
-      |> cap_refs_for_scan()
-      |> flatten_ref_fields()
-      |> Enum.map(&scan_slice/1)
+      secret_in_refs?(get_field(changeset, :refs))
     end)
+  end
+
+  # The two SHARED scan primitives (issue #499). Both the write-time gate above and the
+  # retroactive rescan (`secret_fields/1`) call these, so the bounds — the per-field
+  # `scan_slice/1` byte cap and the `refs` item-count cap — are defined ONCE and the two
+  # paths can never disagree about what "carries a secret" means.
+  defp secret_in_text?(value), do: value |> scan_slice() |> SecretDenylist.contains_secret?()
+
+  defp secret_in_refs?(refs) do
+    refs
+    |> cap_refs_for_scan()
+    |> flatten_ref_fields()
+    |> Enum.map(&scan_slice/1)
+    |> SecretDenylist.any_contains_secret?()
   end
 
   # Bound the fan-out of the secret scan to the same item-count cap the persist path
@@ -552,16 +625,9 @@ defmodule Loopctl.Coordination.ChannelPost do
   defp cap_refs_for_scan(refs) when is_list(refs), do: Enum.take(refs, @refs_max_items)
   defp cap_refs_for_scan(other), do: other
 
-  defp add_secret_errors(changeset, fields, extractor) do
+  defp add_secret_errors(changeset, fields, has_secret_fun) do
     Enum.reduce(fields, changeset, fn field, acc ->
-      value = extractor.(field)
-
-      has_secret? =
-        if is_list(value),
-          do: SecretDenylist.any_contains_secret?(value),
-          else: SecretDenylist.contains_secret?(value)
-
-      if has_secret? do
+      if has_secret_fun.(field) do
         add_error(acc, field, @secret_error_message)
       else
         acc
