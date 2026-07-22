@@ -231,7 +231,12 @@ config :loopctl, :ingestion_health,
   reject_rate_threshold: 0.5,
   min_attempts: 10,
   reject_window_days: 7,
-  # #498 sweep-stall detector pin (deterministic grace window for specs).
+  # #498 sweep-stall detector pins (deterministic windows for specs). The drain-capacity
+  # and scan-cap knobs deliberately keep their production defaults: a spec seeds a handful
+  # of overdue rows, which is far BELOW the capacity the sweep had over the elapsed
+  # staleness, so the specs exercise the STALL branch. The backlog-suppression and
+  # truncated-scan branches are driven by passing explicit config to
+  # detect_sweep_stalled/1 (no app-env mutation).
   sweep_staleness_hours: 6
 
 # Run the write-outcome rollup upsert INLINE in test (prod dispatches it to a

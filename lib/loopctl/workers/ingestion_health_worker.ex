@@ -22,7 +22,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   successfully alerted (`alerted: false`), in which case it re-fires the operator
   alert + webhook once (at-least-once recovery; see "Alert durability" below).
 
-  ## Third detector: retention-sweep stall (#498)
+  ## Retention-sweep stall detector (`:sweep_stalled`, #498)
 
   The same run also drives `IngestionHealth.detect_sweep_stalled/0` — the
   absence-of-success detector for the US-39.5 channel-post retention sweep
@@ -32,6 +32,25 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   persist/notify/at-least-once/recovery machinery; a parallel worker would duplicate all
   of it for one query. Its anomalies are `:sweep_stalled` rows under the reserved
   sentinel `source_type` `IngestionHealth.sweep_source_type/0`.
+
+  ### One GLOBAL cause ⇒ ONE operator alert
+
+  `ChannelPostSweeper` is a single global, tenant-independent worker, so the failure this
+  detector exists for ("the sweep is not running") is ONE event that happens to leave
+  residue in N tenants. The per-tenant anomaly ROW and the per-tenant
+  `knowledge.ingestion_anomaly_detected` webhook stay per-tenant (a tenant subscriber
+  cares about its OWN retention), but the OPERATOR alert is emitted ONCE PER RUN at
+  system scope (`fire_sweep_system_alert/1`), listing the affected tenants, instead of
+  N identical `ScaleAlertDeliveryWorker` jobs saying one thing. `notify/2` therefore
+  skips the per-tenant operator alert for `:sweep_stalled` only — every other type keeps
+  it, because for them the CAUSE really is per-tenant.
+
+  ### Isolated failure domain
+
+  `run_sweep_stalled_detection/0` is wrapped in its own rescue: its residue read is a
+  cross-tenant aggregate on the small `AdminRepo` pool, and a statement timeout or
+  checkout failure there must NOT take down capture-silence flagging, reject-rate
+  recovery, or write-stats pruning in the same hourly job.
 
   ## Recovery: auto-resolve when the outage clears
 
@@ -108,6 +127,11 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   alias Loopctl.Workers.WebhookDeliveryWorker
 
   @webhook_event_type "knowledge.ingestion_anomaly_detected"
+
+  # Bound on the `tenant_ids` sample carried in the system-scope sweep-stall alert: the
+  # blast radius is reported as an exact `affected_tenants` count, so the id list is a
+  # debugging sample, not an unbounded payload.
+  @alert_tenant_sample 50
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
@@ -208,7 +232,33 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # retries, so skip quietly and self-heal next run. Recovery is guarded TOO — an empty
   # candidate list from a skipped detection must never be read as "everything recovered"
   # and mass-close active stall anomalies.
+  #
+  # Wrapped in its OWN rescue: the residue read is an aggregate over `channel_posts` on
+  # the 3-connection AdminRepo pool, and a statement timeout / checkout failure here must
+  # not abort the whole hourly job (which would also stop capture-silence flagging,
+  # reject-rate recovery and write-stats pruning). Oban retries buy nothing for a pool
+  # that is saturated right now; the next hourly run re-detects.
   defp run_sweep_stalled_detection do
+    do_run_sweep_stalled_detection()
+  rescue
+    error ->
+      Logger.error(
+        "IngestionHealthWorker: sweep-stall detection failed (#{inspect(error.__struct__)}): " <>
+          "#{Exception.message(error)}; other detectors continue"
+      )
+
+      :ok
+  catch
+    :exit, reason ->
+      Logger.error(
+        "IngestionHealthWorker: sweep-stall detection exited (#{inspect(reason)}); " <>
+          "other detectors continue"
+      )
+
+      :ok
+  end
+
+  defp do_run_sweep_stalled_detection do
     if sweep_stalled_check_ready?() do
       candidates = IngestionHealth.detect_sweep_stalled()
 
@@ -216,13 +266,17 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
         "IngestionHealthWorker: #{length(candidates)} sweep-stalled candidate(s) detected"
       )
 
-      flag_candidates(candidates, :sweep_stalled)
+      candidates
+      |> flag_candidates(:sweep_stalled)
+      |> fire_sweep_system_alert()
 
       closed = IngestionHealth.auto_resolve_recovered_sweep_stalled(candidates)
 
       if closed > 0 do
         Logger.info("IngestionHealthWorker: auto-closed #{closed} recovered sweep-stall(s)")
       end
+
+      :ok
     else
       Logger.warning(
         "IngestionHealthWorker: ingestion_anomalies CHECK does not admit 'sweep_stalled' yet " <>
@@ -284,12 +338,17 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # (many candidates at once — the worst case this detector exists for) made the hourly
   # job O(open anomalies) on the 3-conn AdminRepo pool. Prefetching keeps the probe cost
   # constant, mirroring the set-based auto_resolve_recovered_* optimization.
-  defp flag_candidates([], _anomaly_type), do: :ok
+  #
+  # Returns the per-candidate outcomes (`{:notified, candidate}` when this run actually
+  # fired the notifications for that candidate, else `:ok`/`:suppressed`) so a caller can
+  # aggregate them — the retention-sweep path uses that to emit ONE system-scope operator
+  # alert instead of N identical per-tenant ones.
+  defp flag_candidates([], _anomaly_type), do: []
 
   defp flag_candidates(candidates, anomaly_type) do
     by_key = prefetch_anomalies(candidates, anomaly_type)
 
-    Enum.each(candidates, fn candidate ->
+    Enum.map(candidates, fn candidate ->
       rows = Map.get(by_key, {candidate.tenant_id, candidate.source_type}, [])
       flag_candidate(anomaly_type, candidate, rows)
     end)
@@ -318,13 +377,13 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # (writes rejected). Both reuse the same persist/notify/at-least-once machinery and the
   # prefetched `rows` for the candidate's (tenant, source_type) key.
   defp flag_candidate(:high_reject_rate, candidate, rows),
-    do: flag_reject_rate(candidate, rows)
+    do: flag_episode(:high_reject_rate, candidate, rows)
 
   defp flag_candidate(:capture_silence, candidate, rows),
     do: flag_capture_silence(candidate, rows)
 
   defp flag_candidate(:sweep_stalled, candidate, rows),
-    do: flag_sweep_stalled(candidate, rows)
+    do: flag_episode(:sweep_stalled, candidate, rows)
 
   defp flag_capture_silence(
          %{
@@ -384,116 +443,115 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     end)
   end
 
-  # --- High-reject-rate flagging (PR B2) ---
+  # --- EPISODE-shaped flagging (:high_reject_rate PR B2, :sweep_stalled #498) ---
 
-  # Mirrors flag_capture_silence structurally, reusing the SAME persist/notify/
-  # at-least-once machinery, but with reject-rate semantics: rejects have no natural
-  # "resumed" signal (no newer article), so recovery is defined as "no longer a
-  # candidate" and marked by stamping `last_event_at` (episode ended). A resolved
-  # reject-rate anomaly suppresses re-creation ONLY while its episode is still active
-  # (`last_event_at IS NULL`) — anti-alarm-fatigue while rejects persist — and re-arms
-  # once recovery stamps `last_event_at`, so a future storm re-fires. Archiving is the
-  # separate operator escape hatch.
-  defp flag_reject_rate(%{tenant_id: tenant_id} = candidate, rows) do
+  # ONE flag path for both EPISODE-shaped detectors. Mirrors flag_capture_silence
+  # structurally, reusing the SAME persist/notify/at-least-once machinery, but with
+  # episode semantics: neither rejects nor stalls have a natural "resumed" signal (no
+  # newer article), so recovery is defined as "no longer a candidate" and marked by
+  # stamping `last_event_at` (episode ended). A resolved episode anomaly suppresses
+  # re-creation ONLY while its episode is still active (`last_event_at IS NULL`) —
+  # anti-alarm-fatigue while the condition persists — and re-arms once recovery stamps
+  # `last_event_at`, so a future storm/stall re-fires. Archiving is the separate operator
+  # escape hatch.
+  #
+  # The two types differ ONLY in the figures/metadata they record (`episode_figures/2`),
+  # so they share this function rather than duplicating the alerted-flag ordering — the
+  # at-least-once contract — in two places.
+  #
+  # Returns `{:notified, candidate}` when THIS run fired the notifications (a genuine
+  # create, or the at-least-once re-fire), else `:ok`/`:suppressed`.
+  defp flag_episode(anomaly_type, %{tenant_id: tenant_id} = candidate, rows) do
     existing = Enum.find(rows, &(&1.resolved == false and &1.archived == false))
 
     cond do
       archived_suppression?(rows) ->
         :suppressed
 
-      existing && not existing.alerted ->
+      is_nil(existing) ->
+        create_episode_unless_suppressed(anomaly_type, tenant_id, candidate, rows)
+
+      not existing.alerted ->
         # At-least-once recovery: the row was persisted + audited atomically but its
         # post-commit alert/webhook never fired. Re-fire, then refresh figures.
         notify(tenant_id, existing)
-        update_existing_reject(existing, candidate)
-
-      existing ->
-        update_existing_reject(existing, candidate)
-
-      resolved_episode_suppression?(rows) ->
-        # Operator resolved it and rejects still persist — do not re-fire every run.
-        :suppressed
+        update_existing_episode(anomaly_type, existing, candidate)
+        {:notified, candidate}
 
       true ->
-        create_new_reject(tenant_id, candidate)
+        update_existing_episode(anomaly_type, existing, candidate)
     end
   end
 
-  # --- Retention-sweep stall flagging (#498) ---
-
-  # Structurally identical to flag_reject_rate/2 — sweep stalls are the same EPISODE
-  # shape (no natural "resumed" event; recovery means "no longer a candidate", marked by
-  # stamping `last_event_at`), so the same suppression/at-least-once machinery applies.
-  # Only the figures and metadata differ.
-  defp flag_sweep_stalled(%{tenant_id: tenant_id} = candidate, rows) do
-    existing = Enum.find(rows, &(&1.resolved == false and &1.archived == false))
-
-    cond do
-      archived_suppression?(rows) ->
-        :suppressed
-
-      existing && not existing.alerted ->
-        # At-least-once recovery: persisted + audited atomically, but the post-commit
-        # alert/webhook never fired. Re-fire, then refresh figures.
-        notify(tenant_id, existing)
-        update_existing_sweep(existing, candidate)
-
-      existing ->
-        update_existing_sweep(existing, candidate)
-
-      resolved_episode_suppression?(rows) ->
-        # Operator resolved it and the stall persists — do not re-fire every run.
-        :suppressed
-
-      true ->
-        create_new_sweep(tenant_id, candidate)
+  # No live row: create one UNLESS a resolved-but-still-active episode is suppressing
+  # (the operator resolved it while the condition persists — do not re-fire every run).
+  defp create_episode_unless_suppressed(anomaly_type, tenant_id, candidate, rows) do
+    if resolved_episode_suppression?(rows) do
+      :suppressed
+    else
+      case create_new_episode(anomaly_type, tenant_id, candidate) do
+        %IngestionAnomaly{} -> {:notified, candidate}
+        _ -> :ok
+      end
     end
   end
 
-  defp create_new_sweep(tenant_id, candidate) do
-    changeset =
-      IngestionAnomaly.create_changeset(
-        %IngestionAnomaly{tenant_id: tenant_id},
-        %{
-          source_type: candidate.source_type,
-          anomaly_type: :sweep_stalled,
-          # nil last_event_at = the stall episode is ACTIVE; recovery stamps it
-          # (IngestionHealth.auto_resolve_recovered_sweep_stalled/1), which re-arms
-          # detection for a future stall.
-          last_event_at: nil,
-          hours_stale: candidate.hours_stale,
-          sample_count: candidate.overdue_count,
-          metadata: sweep_metadata(candidate)
-        }
-      )
+  # The per-type figures an episode anomaly records. `:high_reject_rate` has no staleness
+  # dimension (its evidence is the reject ratio in metadata) so hours_stale is a
+  # non-meaningful 0 and sample_count is the window's write attempts; `:sweep_stalled`
+  # carries a real staleness (hours the oldest overdue row outlived expires_at) and counts
+  # overdue rows.
+  defp episode_figures(:high_reject_rate, candidate) do
+    %{
+      hours_stale: 0,
+      sample_count: candidate.total_attempts,
+      metadata: reject_metadata(candidate)
+    }
+  end
+
+  defp episode_figures(:sweep_stalled, candidate) do
+    %{
+      hours_stale: candidate.hours_stale,
+      sample_count: candidate.overdue_count,
+      metadata: sweep_metadata(candidate)
+    }
+  end
+
+  defp create_new_episode(anomaly_type, tenant_id, candidate) do
+    attrs =
+      Map.merge(episode_figures(anomaly_type, candidate), %{
+        source_type: candidate.source_type,
+        anomaly_type: anomaly_type,
+        # nil last_event_at = the episode is ACTIVE; recovery stamps it
+        # (IngestionHealth.auto_resolve_recovered_*), which re-arms detection.
+        last_event_at: nil
+      })
+
+    changeset = IngestionAnomaly.create_changeset(%IngestionAnomaly{tenant_id: tenant_id}, attrs)
 
     if changeset.valid? do
       insert_new_anomaly(tenant_id, changeset)
     else
       Logger.warning(
-        "IngestionHealthWorker: invalid sweep_stalled anomaly for tenant #{tenant_id}, " <>
-          "skipping: #{inspect(changeset.errors)}"
+        "IngestionHealthWorker: invalid #{anomaly_type} anomaly for tenant " <>
+          "#{tenant_id}/#{candidate.source_type}, skipping: #{inspect(changeset.errors)}"
       )
 
       nil
     end
   end
 
-  # Silently refresh the stall figures on an existing unresolved anomaly — no re-notify.
-  defp update_existing_sweep(existing, candidate) do
+  # Silently refresh the figures on an existing unresolved anomaly — no re-notify.
+  defp update_existing_episode(anomaly_type, existing, candidate) do
     case existing
-         |> IngestionAnomaly.create_changeset(%{
-           hours_stale: candidate.hours_stale,
-           sample_count: candidate.overdue_count,
-           metadata: sweep_metadata(candidate)
-         })
+         |> IngestionAnomaly.create_changeset(episode_figures(anomaly_type, candidate))
          |> AdminRepo.update() do
       {:ok, updated} ->
         updated
 
       {:error, changeset} ->
         Logger.warning(
-          "IngestionHealthWorker: failed to update sweep_stalled anomaly " <>
+          "IngestionHealthWorker: failed to update #{anomaly_type} anomaly " <>
             "#{existing.id}: #{inspect(changeset.errors)}"
         )
 
@@ -524,56 +582,6 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     Enum.any?(rows, &(&1.resolved and not &1.archived and is_nil(&1.last_event_at)))
   end
 
-  defp create_new_reject(tenant_id, candidate) do
-    changeset =
-      IngestionAnomaly.create_changeset(
-        %IngestionAnomaly{tenant_id: tenant_id},
-        %{
-          source_type: candidate.source_type,
-          anomaly_type: :high_reject_rate,
-          # No staleness dimension for a reject-rate anomaly: last_event_at nil,
-          # hours_stale 0, sample_count = total write attempts in the window.
-          last_event_at: nil,
-          hours_stale: 0,
-          sample_count: candidate.total_attempts,
-          metadata: reject_metadata(candidate)
-        }
-      )
-
-    if changeset.valid? do
-      insert_new_anomaly(tenant_id, changeset)
-    else
-      Logger.warning(
-        "IngestionHealthWorker: invalid high_reject_rate anomaly for tenant " <>
-          "#{tenant_id}/#{candidate.source_type}, skipping: #{inspect(changeset.errors)}"
-      )
-
-      nil
-    end
-  end
-
-  # Silently refresh the reject figures on an existing unresolved anomaly — no re-notify.
-  defp update_existing_reject(existing, candidate) do
-    case existing
-         |> IngestionAnomaly.create_changeset(%{
-           hours_stale: 0,
-           sample_count: candidate.total_attempts,
-           metadata: reject_metadata(candidate)
-         })
-         |> AdminRepo.update() do
-      {:ok, updated} ->
-        updated
-
-      {:error, changeset} ->
-        Logger.warning(
-          "IngestionHealthWorker: failed to update high_reject_rate anomaly " <>
-            "#{existing.id}: #{inspect(changeset.errors)}"
-        )
-
-        existing
-    end
-  end
-
   defp reject_metadata(candidate) do
     %{
       "reject_rate" => candidate.reject_rate,
@@ -596,10 +604,70 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # Fire the out-of-band operator alert + webhook, then flip `alerted` so a healthy
   # run never re-fires. Ordering makes notification at-least-once: if the process
   # dies before mark_alerted, the next run's recovery branch re-fires.
+  #
+  # `:sweep_stalled` is the ONE type whose per-tenant operator alert is deliberately
+  # skipped here: its cause (the single global `ChannelPostSweeper`) is shared across
+  # every affected tenant, so the run emits ONE system-scope alert
+  # (`fire_sweep_system_alert/1`) instead of N identical ones. The per-TENANT webhook
+  # still fires — a tenant subscriber cares about its own retention — and `alerted` is
+  # still flipped, so the at-least-once contract is unchanged.
   defp notify(tenant_id, anomaly) do
-    fire_operator_alert(tenant_id, anomaly)
+    unless anomaly.anomaly_type == :sweep_stalled do
+      fire_operator_alert(tenant_id, anomaly)
+    end
+
     fire_anomaly_webhook(tenant_id, anomaly)
     mark_alerted(anomaly)
+  end
+
+  # ONE system-scope operator alert per run for the retention-sweep stall, replacing the
+  # per-tenant fan-out. Emitted only when this run actually notified at least one tenant
+  # (a genuine create or an at-least-once re-fire), so a persistent stall does not
+  # re-page hourly. Carries the blast radius (`affected_tenants`, a BOUNDED `tenant_ids`
+  # sample) so the operator sees "the sweeper is down, N tenants affected" as one signal.
+  defp fire_sweep_system_alert(results) do
+    case Enum.flat_map(results, fn
+           {:notified, candidate} -> [candidate]
+           _ -> []
+         end) do
+      [] ->
+        :ok
+
+      notified ->
+        grace_hours = IngestionHealth.sweep_staleness_hours()
+
+        payload = %{
+          "alert" => "coordination.channel_post_sweep_stalled",
+          "metric" => "coordination.channel_post_sweep_stalled.hours_stale",
+          "value" => notified |> Enum.map(& &1.hours_stale) |> Enum.max(),
+          "threshold" => grace_hours,
+          "window_seconds" => grace_hours * 3600,
+          "scope" => "system",
+          "affected_tenants" => length(notified),
+          "tenant_ids" => notified |> Enum.map(& &1.tenant_id) |> Enum.take(@alert_tenant_sample),
+          "overdue_count" => notified |> Enum.map(& &1.overdue_count) |> Enum.sum(),
+          "at" => DateTime.utc_now() |> DateTime.to_iso8601()
+        }
+
+        Logger.error(
+          "IngestionHealthWorker: channel-post retention sweep stalled — " <>
+            "affected_tenants=#{length(notified)} max_hours_stale=#{payload["value"]}"
+        )
+
+        enqueue_system_alert(payload)
+    end
+  end
+
+  defp enqueue_system_alert(payload) do
+    case %{payload: payload} |> ScaleAlertDeliveryWorker.new() |> Oban.insert() do
+      {:ok, _job} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "IngestionHealthWorker: failed to enqueue system sweep-stall alert: #{inspect(reason)}"
+        )
+    end
   end
 
   defp mark_alerted(anomaly) do
@@ -866,26 +934,9 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     enqueue_operator_alert(payload, anomaly)
   end
 
-  defp fire_operator_alert(tenant_id, %IngestionAnomaly{anomaly_type: :sweep_stalled} = anomaly) do
-    md = anomaly.metadata || %{}
-    grace_hours = md["grace_hours"] || IngestionHealth.sweep_staleness_hours()
-
-    payload = %{
-      "alert" => "coordination.channel_post_sweep_stalled",
-      "metric" => "coordination.channel_post_sweep_stalled.hours_stale",
-      "value" => anomaly.hours_stale,
-      "threshold" => grace_hours,
-      "window_seconds" => grace_hours * 3600,
-      "tenant_id" => tenant_id,
-      "source_type" => anomaly.source_type,
-      "overdue_count" => md["overdue_count"],
-      "oldest_expires_at" => md["oldest_expires_at"],
-      "at" => DateTime.utc_now() |> DateTime.to_iso8601()
-    }
-
-    enqueue_operator_alert(payload, anomaly)
-  end
-
+  # NB: there is deliberately NO `:sweep_stalled` clause here — that type's operator
+  # alert is emitted ONCE PER RUN at system scope by `fire_sweep_system_alert/1`, since
+  # its cause is the single global sweeper rather than anything tenant-specific.
   defp fire_operator_alert(tenant_id, anomaly) do
     # Conform to the ScaleAlert operator-alert contract (%{alert, metric, value,
     # threshold, window_seconds, at}) so the shared alert channel — including

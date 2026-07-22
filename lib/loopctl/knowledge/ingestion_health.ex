@@ -80,17 +80,46 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   - `:write_stats_retention_days` -- default `90`
   - `:sweep_staleness_hours` -- default `6` (grace hours past `expires_at` after which
     a still-present `channel_posts` row means the retention sweep is not running)
+  - `:sweep_hard_stale_hours` -- default `24` (the ceiling past which an overdue row is
+    flagged REGARDLESS of drain capacity — see the retention-sweep detector below)
+  - `:sweep_drain_rate_per_hour` -- default `12_000` (rows/hour the bounded sweep can
+    delete install-wide: `@batch_size` 1000 × the `*/5 * * * *` cadence's 12 runs/hour)
+  - `:sweep_scan_limit` -- default `50_000` (hard cap on the residue rows scanned per
+    detection, so the cross-tenant read stays bounded on the small AdminRepo pool)
 
-  ## Third detector: `:sweep_stalled` (issue #498)
+  ## Retention-sweep stall detector (`:sweep_stalled`, issue #498)
 
   `detect_sweep_stalled/0` is the absence-of-success detector for the US-39.5
   channel-post retention sweep (`Loopctl.Workers.ChannelPostSweeper`). It lives here,
   next to its siblings, because it is the same detector class (the absence of expected
   success) and it reuses the whole tested `ingestion_anomalies` alert / recovery /
   webhook / operator-API path rather than inventing a parallel one. Unlike the other
-  two it reads `channel_posts`, not knowledge ingestion data — the shared machinery is
-  the reason for the placement, and the sentinel `sweep_source_type/0`
-  (`"channel_post_sweep"`) keeps it from colliding with any real article source_type.
+  two its evidence is `channel_posts` residue, not knowledge ingestion data — but it
+  never queries that table itself: the residue read is
+  `Loopctl.Coordination.retention_stall_candidates/2`, the owning context's API, so the
+  knowledge context does not build queries on a coordination schema. The sentinel
+  `sweep_source_type/0` (`"channel_post_sweep"`) keeps its anomalies from colliding with
+  any real article source_type.
+
+  ### Stalled vs merely BACKLOGGED
+
+  "Overdue rows exist past the grace window" alone does NOT mean the sweep is dead: the
+  sweeper is bounded at 1000 rows/run on a `*/5` cron (~12k rows/hour install-wide), so a
+  large expiry burst legitimately takes hours to drain and would page an operator about a
+  perfectly healthy sweep. The detector therefore compares the observed residue against
+  the sweep's own DRAIN CAPACITY over the elapsed staleness
+  (`sweep_drain_rate_per_hour * hours_stale`):
+
+    * `hours_stale >= sweep_hard_stale_hours` -> ALWAYS a candidate. This is the case the
+      capacity comparison cannot excuse: a backlog the batch bound can never drain, or a
+      sweep that is genuinely dead behind a large backlog.
+    * residue `>= capacity` (or the bounded scan was TRUNCATED, which means the residue is
+      at least `sweep_scan_limit` and therefore larger than any sub-ceiling capacity) ->
+      NOT a candidate. The backlog itself explains the age; a running sweep could not have
+      reached these rows yet.
+    * otherwise -> a candidate: the sweep had ample capacity to delete these rows in the
+      elapsed window and did not, so it is not running (or is running and deleting
+      nothing).
   """
 
   import Ecto.Query
@@ -98,7 +127,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
-  alias Loopctl.Coordination.ChannelPost
+  alias Loopctl.Coordination
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionWriteStats
@@ -122,6 +151,24 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   # any transient backlog or deploy window, and still far inside the 30-day retention
   # promise it protects.
   @default_sweep_staleness_hours 6
+
+  # Ceiling past which an overdue row is flagged regardless of drain capacity: at the
+  # default drain rate this is ~288k rows of headroom, so anything still overdue after
+  # 24h is a backlog the bounded sweep can never drain (or a dead sweep behind one).
+  # Deliberately well INSIDE the 30-day retention promise it protects: this is the worst
+  # case alarm latency for a dead sweep hiding behind a backlog larger than the scan cap.
+  @default_sweep_hard_stale_hours 24
+
+  # Install-wide rows/hour the bounded sweep can delete: `ChannelPostSweeper`'s
+  # @batch_size (1000) × the `*/5 * * * *` crontab's 12 runs/hour. Config-overridable so
+  # a changed batch size or cadence can be reflected without a code change.
+  @default_sweep_drain_rate_per_hour 12_000
+
+  # Hard cap on residue rows scanned per detection run (see
+  # `Coordination.retention_stall_candidates/2`): the residue only grows while the sweep
+  # is behind, so the scan MUST be bounded or the detector becomes most expensive exactly
+  # when the system is least healthy — on the 3-connection AdminRepo pool.
+  @default_sweep_scan_limit 50_000
 
   # Fixed sentinel `source_type` for the retention-sweep detector. `ingestion_anomalies`
   # requires a NOT NULL source_type (and the unresolved-unique partial index keys on it),
@@ -281,6 +328,34 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   @spec sweep_staleness_hours() :: pos_integer()
   def sweep_staleness_hours,
     do: Keyword.get(config(), :sweep_staleness_hours, @default_sweep_staleness_hours)
+
+  @doc """
+  Staleness ceiling (in hours) past which an overdue `channel_posts` row is flagged
+  REGARDLESS of the sweep's drain capacity. Default 24. This is the backstop for a
+  backlog the bounded sweep can never drain — the case the capacity comparison in
+  `detect_sweep_stalled/1` deliberately excuses below the ceiling.
+  """
+  @spec sweep_hard_stale_hours() :: pos_integer()
+  def sweep_hard_stale_hours,
+    do: Keyword.get(config(), :sweep_hard_stale_hours, @default_sweep_hard_stale_hours)
+
+  @doc """
+  Rows/hour the bounded US-39.5 sweep can delete install-wide (default 12_000 = the
+  worker's 1000-row batch × the `*/5` crontab's 12 runs/hour). Used to tell a STALLED
+  sweep from one that is merely BACKLOGGED.
+  """
+  @spec sweep_drain_rate_per_hour() :: pos_integer()
+  def sweep_drain_rate_per_hour,
+    do: Keyword.get(config(), :sweep_drain_rate_per_hour, @default_sweep_drain_rate_per_hour)
+
+  @doc """
+  Hard cap on residue rows scanned per stall detection (default 50_000). Keeps the
+  cross-tenant read bounded on the small AdminRepo pool; hitting the cap is itself
+  evidence of a large backlog (see `detect_sweep_stalled/1`).
+  """
+  @spec sweep_scan_limit() :: pos_integer()
+  def sweep_scan_limit,
+    do: Keyword.get(config(), :sweep_scan_limit, @default_sweep_scan_limit)
 
   @doc """
   Reserved sentinel `source_type` under which `:sweep_stalled` anomalies are recorded
@@ -545,44 +620,65 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   no DB writes.
 
   A tenant is a candidate when it still holds `channel_posts` rows whose `expires_at`
-  is more than `sweep_staleness_hours/0` in the past. That is an OUTCOME check, not a
-  liveness proxy: rows that should have been hard-deleted are still there, so the
-  30-day retention window is by construction not being enforced for that tenant —
+  is more than `sweep_staleness_hours/0` in the past AND that residue is NOT explainable
+  by the bounded sweep's own drain capacity (see the moduledoc's "Stalled vs merely
+  BACKLOGGED"). That is an OUTCOME check, not a liveness proxy: rows that should have
+  been hard-deleted are still there and the sweep had the capacity to delete them, so
+  the 30-day retention window is by construction not being enforced for that tenant —
   whether the worker crashed, stopped being scheduled, lost its permissions, or is
   running but never draining. The complementary in-band signals (a run that happened
-  and succeeded/failed) are the `channel_post_sweep_stop/exception` telemetry the
-  worker emits; this detector is the half that survives the worker never running at all.
+  and succeeded/failed) are the `channel_post_swept/channel_post_sweep_failed` telemetry
+  the worker emits; this detector is the half that survives the worker never running.
 
-  Cross-tenant and set-based: ONE grouped query on the BYPASSRLS `AdminRepo`, joined to
-  ACTIVE tenants (same shape as `detect/1`), so a suspended tenant's leftovers never
+  Cross-tenant and set-based: ONE BOUNDED grouped read via
+  `Loopctl.Coordination.retention_stall_candidates/2` (the owning context's API), joined
+  to ACTIVE tenants (same shape as `detect/1`), so a suspended tenant's leftovers never
   page anyone.
   """
   @spec detect_sweep_stalled() :: [sweep_candidate()]
   def detect_sweep_stalled do
-    detect_sweep_stalled(%{sweep_staleness_hours: sweep_staleness_hours()})
+    detect_sweep_stalled(%{
+      sweep_staleness_hours: sweep_staleness_hours(),
+      sweep_hard_stale_hours: sweep_hard_stale_hours(),
+      sweep_drain_rate_per_hour: sweep_drain_rate_per_hour(),
+      sweep_scan_limit: sweep_scan_limit()
+    })
   end
 
   @doc """
-  `detect_sweep_stalled/0` with explicit config (`:sweep_staleness_hours`). Exposed so a
-  caller can drive detection with a specific configuration without touching global app env.
+  `detect_sweep_stalled/0` with explicit config. `:sweep_staleness_hours` is required;
+  `:sweep_hard_stale_hours`, `:sweep_drain_rate_per_hour` and `:sweep_scan_limit` fall
+  back to their accessors. Exposed so a caller can drive detection with a specific
+  configuration without touching global app env.
   """
-  @spec detect_sweep_stalled(%{required(:sweep_staleness_hours) => pos_integer()}) ::
-          [sweep_candidate()]
-  def detect_sweep_stalled(%{sweep_staleness_hours: grace_hours}) do
+  @spec detect_sweep_stalled(map()) :: [sweep_candidate()]
+  def detect_sweep_stalled(%{sweep_staleness_hours: grace_hours} = opts) do
     now = DateTime.utc_now()
     cutoff = DateTime.add(now, -grace_hours * 3600, :second)
+    hard_hours = Map.get(opts, :sweep_hard_stale_hours, sweep_hard_stale_hours())
+    drain_rate = Map.get(opts, :sweep_drain_rate_per_hour, sweep_drain_rate_per_hour())
+    scan_limit = Map.get(opts, :sweep_scan_limit, sweep_scan_limit())
 
-    ChannelPost
-    |> join(:inner, [p], t in Tenant, on: t.id == p.tenant_id and t.status == :active)
-    |> where([p], p.expires_at < ^cutoff)
-    |> group_by([p], p.tenant_id)
-    |> select([p], %{
-      tenant_id: p.tenant_id,
-      overdue_count: count(p.id),
-      oldest_expires_at: min(p.expires_at)
-    })
-    |> AdminRepo.all()
+    %{rows: rows, scanned: scanned, truncated?: truncated?} =
+      Coordination.retention_stall_candidates(cutoff, scan_limit)
+
+    rows
     |> Enum.map(&sweep_candidate(&1, grace_hours, now))
+    |> Enum.filter(&stalled?(&1, scanned, truncated?, hard_hours, drain_rate))
+  end
+
+  # Tell a STALLED sweep from a merely BACKLOGGED one (#498 review). Above the hard
+  # ceiling everything is a stall — that is the backlog-the-bound-can-never-drain case.
+  # Below it, a residue at least as large as what the sweep could have deleted in the
+  # elapsed window (or a TRUNCATED scan, which proves the residue is at least
+  # `sweep_scan_limit` and therefore larger than any sub-ceiling capacity) is explained
+  # by the backlog itself, so it is NOT paged.
+  defp stalled?(candidate, scanned, truncated?, hard_hours, drain_rate) do
+    cond do
+      candidate.hours_stale >= hard_hours -> true
+      truncated? -> false
+      true -> scanned < drain_rate * max(candidate.hours_stale, 1)
+    end
   end
 
   defp sweep_candidate(
@@ -621,65 +717,57 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   auto-resolvers are anomaly_type-scoped (`:capture_silence` / `:high_reject_rate`), so
   without it a `sweep_stalled` row would freeze open forever AND keep suppressing a
   future stall. Returns the number of anomalies closed. Called by the hourly worker.
+
+  ## Only an ACTIVE tenant can "recover"
+
+  Detection inner-joins ACTIVE tenants, so SUSPENDING a tenant (or deleting the project
+  whose `channel_posts` cascade away) drops it from the candidate set even though the
+  sweep may still be dead. Closing on that would write `resolved: true` plus an audit
+  entry ASSERTING retention recovered into the append-only, hash-chained log — a false
+  claim about a release gate. So the close is gated on the anomaly's tenant still being
+  ACTIVE: a suspended tenant's stall row stays OPEN (and re-closes normally if the
+  tenant is reactivated and the backlog is genuinely gone).
   """
   @spec auto_resolve_recovered_sweep_stalled([sweep_candidate()]) :: non_neg_integer()
   def auto_resolve_recovered_sweep_stalled(current_candidates) do
-    active_tenants = MapSet.new(current_candidates, & &1.tenant_id)
+    still_stalled = MapSet.new(current_candidates, & &1.tenant_id)
     now = DateTime.utc_now()
 
-    IngestionAnomaly
-    |> where([a], a.anomaly_type == :sweep_stalled)
-    |> where([a], a.archived == false)
-    |> where([a], is_nil(a.last_event_at))
-    |> AdminRepo.all()
-    |> Enum.reduce(0, fn anomaly, acc ->
-      if MapSet.member?(active_tenants, anomaly.tenant_id),
-        do: acc,
-        else: acc + close_recovered_sweep(anomaly, now)
+    anomalies = active_episode_anomalies(:sweep_stalled)
+    active_tenants = active_tenant_ids(Enum.map(anomalies, & &1.tenant_id))
+
+    Enum.reduce(anomalies, 0, fn anomaly, acc ->
+      recovered? =
+        MapSet.member?(active_tenants, anomaly.tenant_id) and
+          not MapSet.member?(still_stalled, anomaly.tenant_id)
+
+      if recovered?,
+        do: acc + close_recovered_episode(anomaly, now, "auto_resolve_sweep_stalled"),
+        else: acc
     end)
   end
 
-  # Same locked, audit-honest close as close_recovered_reject/2 (see its comment for why
-  # the row is re-read FOR UPDATE rather than trusting the bulk-loaded snapshot).
-  defp close_recovered_sweep(%IngestionAnomaly{id: id, tenant_id: tenant_id}, now) do
-    multi =
-      Multi.new()
-      |> Multi.run(:locked, fn repo, _changes ->
-        locked =
-          IngestionAnomaly
-          |> where([a], a.id == ^id and a.tenant_id == ^tenant_id)
-          |> lock("FOR UPDATE")
-          |> repo.one()
+  # The ACTIVE-episode rows for an episode-shaped detector: not archived, and
+  # `last_event_at IS NULL` (covering both open rows and operator-resolved-but-still-
+  # active episodes). Shared by the reject-rate and sweep-stall auto-resolvers.
+  defp active_episode_anomalies(anomaly_type) do
+    IngestionAnomaly
+    |> where([a], a.anomaly_type == ^anomaly_type)
+    |> where([a], a.archived == false)
+    |> where([a], is_nil(a.last_event_at))
+    |> AdminRepo.all()
+  end
 
-        {:ok, locked}
-      end)
-      |> Multi.run(:anomaly, fn repo, %{locked: locked} ->
-        case locked do
-          nil -> {:error, :not_found}
-          row -> row |> IngestionAnomaly.sweep_recovered_changeset(now) |> repo.update()
-        end
-      end)
-      |> Multi.run(:audit, fn repo, %{locked: locked, anomaly: updated} ->
-        if locked.resolved do
-          {:ok, :skipped}
-        else
-          audit_insert(
-            repo,
-            audit_attrs(
-              tenant_id,
-              updated.id,
-              "resolved",
-              [actor_type: "system", actor_label: "ingestion_health:auto_resolve_sweep_stalled"],
-              %{old_state: %{"resolved" => false}, new_state: %{"resolved" => true}}
-            )
-          )
-        end
-      end)
+  defp active_tenant_ids([]), do: MapSet.new()
 
-    case AdminRepo.transaction(multi) do
-      {:ok, _} -> 1
-      {:error, _step, _reason, _changes} -> 0
-    end
+  defp active_tenant_ids(tenant_ids) do
+    ids = Enum.uniq(tenant_ids)
+
+    Tenant
+    |> where([t], t.id in ^ids and t.status == :active)
+    |> select([t], t.id)
+    |> AdminRepo.all()
+    |> MapSet.new()
   end
 
   @doc """
@@ -1022,30 +1110,31 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     active_keys = MapSet.new(current_candidates, &{&1.tenant_id, &1.source_type})
     now = DateTime.utc_now()
 
-    IngestionAnomaly
-    |> where([a], a.anomaly_type == :high_reject_rate)
-    |> where([a], a.archived == false)
-    |> where([a], is_nil(a.last_event_at))
-    |> AdminRepo.all()
+    :high_reject_rate
+    |> active_episode_anomalies()
     |> Enum.reduce(0, fn anomaly, acc ->
       if MapSet.member?(active_keys, {anomaly.tenant_id, anomaly.source_type}),
         do: acc,
-        else: acc + close_recovered_reject(anomaly, now)
+        else: acc + close_recovered_episode(anomaly, now, "auto_resolve_reject_rate")
     end)
   end
 
-  # Stamp the recovery time (episode ended) + mark resolved, auditing the resolve
+  # The ONE close path for both episode-shaped detectors (`:high_reject_rate`,
+  # `:sweep_stalled`) — they differ only in the audit `actor_label`, so parameterizing
+  # it keeps this audit-chain-writing transaction correct in exactly one place.
+  #
+  # Stamps the recovery time (episode ended) + marks resolved, auditing the resolve
   # transition only when the row was previously unresolved (an already-resolved row is
   # a system bookkeeping mark, not a state change worth a resolved-audit entry).
   #
-  # The candidate struct was bulk-loaded UNLOCKED in auto_resolve_recovered_reject_rate/1
-  # (AdminRepo.all, no FOR UPDATE). If an operator PATCH-resolves or archives the same
-  # anomaly between that load and this transaction, `anomaly.resolved` would be STALE
-  # (false), so trusting it would write a bogus resolved:false->true entry into the
-  # append-only, hash-chained audit log for a flip that already happened. So re-read the
-  # row FOR UPDATE inside the transaction and compute `was_resolved` from the LOCKED row
-  # — matching transition/8's locked, audit-honest flip.
-  defp close_recovered_reject(%IngestionAnomaly{id: id, tenant_id: tenant_id}, now) do
+  # The candidate struct was bulk-loaded UNLOCKED by the caller (AdminRepo.all, no FOR
+  # UPDATE). If an operator PATCH-resolves or archives the same anomaly between that load
+  # and this transaction, `anomaly.resolved` would be STALE (false), so trusting it would
+  # write a bogus resolved:false->true entry into the append-only, hash-chained audit log
+  # for a flip that already happened. So re-read the row FOR UPDATE inside the transaction
+  # and compute `was_resolved` from the LOCKED row — matching transition/8's locked,
+  # audit-honest flip.
+  defp close_recovered_episode(%IngestionAnomaly{id: id, tenant_id: tenant_id}, now, actor_label) do
     multi =
       Multi.new()
       |> Multi.run(:locked, fn repo, _changes ->
@@ -1060,7 +1149,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
       |> Multi.run(:anomaly, fn repo, %{locked: locked} ->
         case locked do
           nil -> {:error, :not_found}
-          row -> row |> IngestionAnomaly.reject_recovered_changeset(now) |> repo.update()
+          row -> row |> IngestionAnomaly.episode_recovered_changeset(now) |> repo.update()
         end
       end)
       |> Multi.run(:audit, fn repo, %{locked: locked, anomaly: updated} ->
@@ -1073,7 +1162,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
               tenant_id,
               updated.id,
               "resolved",
-              [actor_type: "system", actor_label: "ingestion_health:auto_resolve_reject_rate"],
+              [actor_type: "system", actor_label: "ingestion_health:#{actor_label}"],
               %{old_state: %{"resolved" => false}, new_state: %{"resolved" => true}}
             )
           )

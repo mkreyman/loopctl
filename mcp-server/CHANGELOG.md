@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.57.0 — 2026-07-22 (retention-sweep stall anomalies — #498)
+
+### Changed
+
+- **`get_ingestion_anomalies`** now accepts and documents the third anomaly type,
+  `sweep_stalled` — the 30-day channel-post retention sweep is no longer enforcing
+  retention for a tenant (expired coordination-bus posts still present well past
+  `expires_at`, recorded under the reserved `source_type` `channel_post_sweep`).
+  Previously the tool's `anomaly_type` enum admitted only `capture_silence` and
+  `high_reject_rate`, so a schema-validating client rejected the new value
+  client-side and a discovering agent never learned the retention alarm existed.
+
 ## 2.56.0 — 2026-07-21 (per-tenant embedding dimension — US-41.1)
 
 ### Added

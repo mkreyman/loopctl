@@ -217,7 +217,19 @@ config :loopctl, :ingestion_health,
   # #498 (retention-sweep stall detector): grace hours past `expires_at` after which a
   # still-present `channel_posts` row means the US-39.5 sweep is not being enforced for
   # that tenant. The sweep runs every 5 minutes, so 6h is ~72 consecutive missed runs.
-  sweep_staleness_hours: 6
+  sweep_staleness_hours: 6,
+  # Staleness ceiling past which residue is flagged REGARDLESS of drain capacity — the
+  # backstop for a backlog the bounded sweep can never drain (and the worst-case alarm
+  # latency for a dead sweep hiding behind a backlog larger than sweep_scan_limit).
+  sweep_hard_stale_hours: 24,
+  # Install-wide rows/hour the bounded sweep can delete (1000-row batch x 12 runs/hour).
+  # Below the hard ceiling, residue this large is BACKLOG, not a stall — flagging it
+  # would page an operator about a healthy sweep that is simply still draining.
+  sweep_drain_rate_per_hour: 12_000,
+  # Hard cap on residue rows scanned per detection: the residue only grows while the
+  # sweep is behind, so an unbounded count would be most expensive exactly when the
+  # system is least healthy — on the 3-connection AdminRepo pool.
+  sweep_scan_limit: 50_000
 
 # US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
 # defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/

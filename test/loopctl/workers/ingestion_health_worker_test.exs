@@ -559,7 +559,7 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
       assert length(sweep_anomalies(tenant.id)) == 1
     end
 
-    test "operator-alert payload conforms to the ScaleAlert contract" do
+    test "operator-alert payload conforms to the ScaleAlert contract and is SYSTEM-scoped" do
       tenant = fixture(:tenant)
       overdue_post(tenant.id, 24)
 
@@ -574,10 +574,112 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
         assert payload["value"] >= 24
         assert payload["threshold"] == IngestionHealth.sweep_staleness_hours()
         assert payload["window_seconds"] == IngestionHealth.sweep_staleness_hours() * 3600
-        assert payload["tenant_id"] == tenant.id
+        # The CAUSE is the single global sweeper, so the alert is one system-scope
+        # signal carrying the blast radius — not one alert per tenant.
+        assert payload["scope"] == "system"
+        assert payload["affected_tenants"] == 1
+        assert payload["tenant_ids"] == [tenant.id]
         assert payload["overdue_count"] == 1
         assert is_binary(payload["at"])
       end)
+    end
+
+    # A global-worker outage leaves residue in N tenants. Each gets its OWN anomaly row
+    # (its retention really is unenforced), but the operator must get ONE alert saying
+    # "the sweeper is down", not N identical ones.
+    test "N affected tenants produce N anomaly rows but exactly ONE operator alert" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      overdue_post(tenant_a.id, 24)
+      overdue_post(tenant_b.id, 30)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+        assert [job] = all_enqueued(worker: ScaleAlertDeliveryWorker)
+        payload = job.args["payload"]
+        assert payload["affected_tenants"] == 2
+        assert Enum.sort(payload["tenant_ids"]) == Enum.sort([tenant_a.id, tenant_b.id])
+        assert payload["overdue_count"] == 2
+      end)
+
+      assert length(sweep_anomalies(tenant_a.id)) == 1
+      assert length(sweep_anomalies(tenant_b.id)) == 1
+    end
+
+    # The anti-alarm-fatigue gate: an operator RESOLVED the row while the stall persists.
+    # Without it the worker would re-create + re-alert every hour forever.
+    test "an operator-resolved but still-stalled episode suppresses re-creation" do
+      tenant = fixture(:tenant)
+      overdue_post(tenant.id, 24)
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      [open] = sweep_anomalies(tenant.id)
+      {:ok, resolved} = IngestionHealth.resolve_anomaly(tenant.id, open.id, actor_type: "system")
+      # The episode is still ACTIVE (last_event_at nil) — that is what suppresses.
+      assert is_nil(resolved.last_event_at)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert all_enqueued(worker: ScaleAlertDeliveryWorker) == []
+      end)
+
+      # No SECOND row was created, and no second detected audit entry.
+      assert length(sweep_anomalies(tenant.id)) == 1
+      assert detected_audit_count(tenant.id, IngestionHealth.sweep_source_type()) == 1
+    end
+
+    # The re-arm the suppression gate depends on: once recovery stamps last_event_at, the
+    # resolved row stops suppressing, so a FRESH stall fires a second alert.
+    test "a recovered stall re-arms: a fresh stall re-fires" do
+      tenant = fixture(:tenant)
+      post = overdue_post(tenant.id, 24)
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      [open] = sweep_anomalies(tenant.id)
+      assert open.resolved == false
+
+      # The sweep recovers (backlog drained) — recovery closes and stamps last_event_at.
+      AdminRepo.delete!(post)
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      [closed] = sweep_anomalies(tenant.id)
+      assert closed.resolved == true
+      assert %DateTime{} = closed.last_event_at
+
+      # A NEW stall: the recovered row no longer suppresses, so a fresh unresolved
+      # anomaly is created AND a second operator alert fires.
+      overdue_post(tenant.id, 24)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert length(all_enqueued(worker: ScaleAlertDeliveryWorker)) == 1
+      end)
+
+      assert Enum.any?(sweep_anomalies(tenant.id), &(&1.resolved == false))
+      assert detected_audit_count(tenant.id, IngestionHealth.sweep_source_type()) == 2
+    end
+
+    # Suspending a tenant drops it from the ACTIVE-tenant candidate join, but that is not
+    # recovery — closing on it would write a false "retention recovered" entry into the
+    # append-only, hash-chained audit log while the sweeper may still be dead.
+    test "suspending a tenant does NOT auto-close its open stall as recovered" do
+      tenant = fixture(:tenant)
+      overdue_post(tenant.id, 24)
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      [open] = sweep_anomalies(tenant.id)
+      assert open.resolved == false
+
+      AdminRepo.update_all(
+        from(t in Loopctl.Tenants.Tenant, where: t.id == ^tenant.id),
+        set: [status: :suspended]
+      )
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+      [still_open] = sweep_anomalies(tenant.id)
+      assert still_open.resolved == false
+      assert is_nil(still_open.last_event_at)
     end
 
     test "fires the per-tenant anomaly webhook for a stall when subscribed" do

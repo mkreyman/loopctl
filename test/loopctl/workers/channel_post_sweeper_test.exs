@@ -20,8 +20,8 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
     :telemetry.attach_many(
       handler,
       [
-        TelemetryEvents.channel_post_sweep_stop(),
-        TelemetryEvents.channel_post_sweep_exception()
+        TelemetryEvents.channel_post_swept(),
+        TelemetryEvents.channel_post_sweep_failed()
       ],
       fn name, measurements, metadata, _ ->
         if metadata[:limit] == limit do
@@ -145,7 +145,7 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
 
       assert :ok = ChannelPostSweeper.perform(%Oban.Job{args: %{"limit" => 7}})
 
-      assert_receive {:telemetry, :stop, %{deleted: 2}, %{limit: 7}}
+      assert_receive {:telemetry, :channel_post_swept, %{deleted: 2}, %{limit: 7}}
     end
 
     # TC-39.5.7 — the load-bearing half of "success telemetry": a run that deletes
@@ -158,7 +158,7 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
 
       assert :ok = ChannelPostSweeper.perform(%Oban.Job{args: %{"limit" => 11}})
 
-      assert_receive {:telemetry, :stop, %{deleted: 0}, %{limit: 11}}
+      assert_receive {:telemetry, :channel_post_swept, %{deleted: 0}, %{limit: 11}}
     end
 
     # TC-39.5.8 — a DB failure must produce an error log AND failure telemetry AND
@@ -184,10 +184,34 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
       assert log =~ "ChannelPostSweeper failed to sweep expired channel posts"
       assert log =~ "error_class=Postgrex.Error"
 
-      assert_receive {:telemetry, :exception, %{count: 1},
+      assert_receive {:telemetry, :channel_post_sweep_failed, %{count: 1},
                       %{limit: 13, error_class: "Postgrex.Error"}}
 
-      refute_receive {:telemetry, :stop, _, _}, 50
+      refute_receive {:telemetry, :channel_post_swept, _, _}, 50
+    end
+
+    # TC-39.5.14 — `rescue` observes EXCEPTIONS only. A DBConnection ownership/connection
+    # loss or a pool checkout failure surfacing as an `exit` would otherwise bypass the
+    # whole contract above and be visible only as Oban retry churn — the assumed-healthy
+    # failure #498 exists to close. Driven through `observed/2`, the exact function
+    # `perform/1` runs its sweep under (a genuine pool exit is not reproducible under the
+    # Ecto sandbox, and a repo double would test the double, not this contract).
+    test "logs at error, emits failure telemetry, and re-EXITS on a non-exception exit" do
+      attach_sweep_telemetry(17)
+
+      log =
+        capture_log(fn ->
+          assert catch_exit(ChannelPostSweeper.observed(17, fn -> exit(:pool_dead) end)) ==
+                   :pool_dead
+        end)
+
+      assert log =~ "ChannelPostSweeper failed to sweep expired channel posts"
+      assert log =~ "error_class=exit"
+
+      assert_receive {:telemetry, :channel_post_sweep_failed, %{count: 1},
+                      %{limit: 17, error_class: "exit"}}
+
+      refute_receive {:telemetry, :channel_post_swept, _, _}, 50
     end
   end
 

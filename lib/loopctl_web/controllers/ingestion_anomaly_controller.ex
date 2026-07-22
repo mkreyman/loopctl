@@ -38,6 +38,12 @@ defmodule LoopctlWeb.IngestionAnomalyController do
         "sweep_stalled (the channel-post retention sweep is no longer enforcing the " <>
         "30-day window for this tenant, recorded under the reserved source_type " <>
         "channel_post_sweep). " <>
+        "NOTE — surface overload: sweep_stalled is a COORDINATION-BUS retention alert, " <>
+        "not a knowledge-ingestion one. It is served here (and delivered as the " <>
+        "knowledge.ingestion_anomaly_detected webhook) because it reuses the same " <>
+        "anomaly record, alerting and recovery machinery; a tenant subscribed to that " <>
+        "webhook receives coordination retention alerts too. Filter on anomaly_type to " <>
+        "separate them. " <>
         "Filterable by source_type and anomaly_type. Archived anomalies are excluded by " <>
         "default; use ?include_archived=true to include them. A malformed ?resolved value " <>
         "or an unknown ?anomaly_type is rejected with 422. The response `meta.filters` " <>

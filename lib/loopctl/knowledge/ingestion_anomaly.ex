@@ -163,30 +163,19 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
   end
 
   @doc """
-  Changeset closing a RECOVERED `:high_reject_rate` anomaly.
+  Changeset closing a RECOVERED EPISODE-shaped anomaly (`:high_reject_rate`,
+  `:sweep_stalled`).
 
-  Sets `resolved: true` (closing an open row) AND stamps `last_event_at` with the
-  recovery time. The `last_event_at` stamp marks the reject episode as ENDED so it
-  no longer suppresses re-detection — a future storm for the same source_type
-  re-fires. Applied by `IngestionHealth.auto_resolve_recovered_reject_rate/1`.
+  Both types share one episode shape — no natural "resumed" event, so recovery means
+  "no longer a candidate" — and therefore ONE close changeset. Sets `resolved: true`
+  (closing an open row) AND stamps `last_event_at` with the recovery time. The
+  `last_event_at` stamp marks the episode as ENDED so it no longer suppresses
+  re-detection — a future storm/stall re-fires. Applied by
+  `IngestionHealth.auto_resolve_recovered_reject_rate/1` and
+  `IngestionHealth.auto_resolve_recovered_sweep_stalled/1`.
   """
-  @spec reject_recovered_changeset(%__MODULE__{}, DateTime.t()) :: Ecto.Changeset.t()
-  def reject_recovered_changeset(anomaly, recovered_at) do
-    change(anomaly, resolved: true, last_event_at: recovered_at)
-  end
-
-  @doc """
-  Changeset closing a RECOVERED `:sweep_stalled` anomaly.
-
-  Structurally identical to `reject_recovered_changeset/2` (same episode shape: no
-  natural "resumed" event, so recovery means "no longer a candidate"), kept as its own
-  named function so the call sites read in the vocabulary of their detector. Sets
-  `resolved: true` AND stamps `last_event_at` with the recovery time, marking the stall
-  episode ENDED so it stops suppressing re-detection — a future stall re-fires. Applied
-  by `IngestionHealth.auto_resolve_recovered_sweep_stalled/1`.
-  """
-  @spec sweep_recovered_changeset(%__MODULE__{}, DateTime.t()) :: Ecto.Changeset.t()
-  def sweep_recovered_changeset(anomaly, recovered_at) do
+  @spec episode_recovered_changeset(%__MODULE__{}, DateTime.t()) :: Ecto.Changeset.t()
+  def episode_recovered_changeset(anomaly, recovered_at) do
     change(anomaly, resolved: true, last_event_at: recovered_at)
   end
 

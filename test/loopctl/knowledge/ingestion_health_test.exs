@@ -730,6 +730,74 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
              |> where([a], a.tenant_id == ^tenant.id)
              |> AdminRepo.all() == []
     end
+
+    # The false-page guard: the sweeper is bounded (1000 rows/run, 12 runs/hour), so
+    # residue at least as large as what it could have deleted in the elapsed window is a
+    # BACKLOG being drained, not a stall.
+    test "does not flag residue the bounded sweep could not yet have drained" do
+      tenant = fixture(:tenant)
+      channel_post(tenant.id, -12)
+
+      # 0 rows/hour of capacity => the sweep could not have removed ANY of this residue,
+      # so its age is fully explained by the backlog rather than by a dead sweep.
+      assert IngestionHealth.detect_sweep_stalled(%{
+               sweep_staleness_hours: 6,
+               sweep_hard_stale_hours: 24,
+               sweep_drain_rate_per_hour: 0,
+               sweep_scan_limit: 50_000
+             })
+             |> for_tenant(tenant.id) == []
+    end
+
+    test "flags residue the sweep had ample capacity to drain" do
+      tenant = fixture(:tenant)
+      channel_post(tenant.id, -12)
+
+      assert [_] =
+               IngestionHealth.detect_sweep_stalled(%{
+                 sweep_staleness_hours: 6,
+                 sweep_hard_stale_hours: 24,
+                 # 288k rows of capacity over 24h vs one overdue row: the sweep had ample
+                 # room to delete it and did not => it is not running.
+                 sweep_drain_rate_per_hour: 12_000,
+                 sweep_scan_limit: 50_000
+               })
+               |> for_tenant(tenant.id)
+    end
+
+    test "the hard ceiling flags an undrainable backlog regardless of drain capacity" do
+      tenant = fixture(:tenant)
+      channel_post(tenant.id, -48)
+
+      assert [candidate] =
+               IngestionHealth.detect_sweep_stalled(%{
+                 sweep_staleness_hours: 6,
+                 sweep_hard_stale_hours: 24,
+                 sweep_drain_rate_per_hour: 12_000,
+                 sweep_scan_limit: 50_000
+               })
+               |> for_tenant(tenant.id)
+
+      assert candidate.hours_stale >= 48
+    end
+
+    # A TRUNCATED scan proves the residue is at least sweep_scan_limit — larger than any
+    # sub-ceiling drain capacity — so it is backlog, not a stall. It also proves the read
+    # is BOUNDED: the cross-tenant aggregate never scans an unbounded overdue backlog on
+    # the small AdminRepo pool.
+    test "a truncated (capped) scan is treated as backlog, not a stall" do
+      tenant = fixture(:tenant)
+      channel_post(tenant.id, -12)
+
+      assert IngestionHealth.detect_sweep_stalled(%{
+               sweep_staleness_hours: 6,
+               sweep_hard_stale_hours: 24,
+               sweep_drain_rate_per_hour: 12_000,
+               # One row scanned == the cap => truncated.
+               sweep_scan_limit: 1
+             })
+             |> for_tenant(tenant.id) == []
+    end
   end
 
   describe "source_type_seen?/2" do
