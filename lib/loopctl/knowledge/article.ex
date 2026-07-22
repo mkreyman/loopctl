@@ -27,6 +27,8 @@ defmodule Loopctl.Knowledge.Article do
 
   use Loopctl.Schema
 
+  alias Loopctl.Embeddings.Dimensions
+
   @type t :: %__MODULE__{}
 
   # Canonical taxonomy lives in Loopctl.Knowledge.Categories (single source of
@@ -274,18 +276,32 @@ defmodule Loopctl.Knowledge.Article do
   ## Parameters
 
   - `article` -- an existing `%Article{}` struct
-  - `embedding` -- a list of floats (must match configured dimensions) or `nil` to clear
+  - `embedding` -- a list of floats (must match `expected_dimension`) or `nil` to clear
+  - `expected_dimension` -- US-41.1 AC-41.1.11: the dimension is RESOLVED ONCE per
+    operation/batch by `Loopctl.Embeddings.active_dimension/1` and PASSED IN, so
+    this validator stays PURE — no Repo read, no process dictionary. Defaults to
+    the deployment `:embedding_dimensions` so every pre-41.1 call site keeps its
+    exact previous behaviour.
 
   ## Returns
 
   An `Ecto.Changeset` with dimension validation applied when `embedding` is not nil.
   """
-  @spec embedding_changeset(%__MODULE__{}, list(number()) | nil, String.t() | nil) ::
-          Ecto.Changeset.t()
-  def embedding_changeset(article, embedding, content_hash \\ nil) do
+  @spec embedding_changeset(
+          %__MODULE__{},
+          list(number()) | nil,
+          String.t() | nil,
+          pos_integer()
+        ) :: Ecto.Changeset.t()
+  def embedding_changeset(
+        article,
+        embedding,
+        content_hash \\ nil,
+        expected_dimension \\ Application.get_env(:loopctl, :embedding_dimensions, 1536)
+      ) do
     article
     |> change(%{embedding: embedding, embedding_content_hash: content_hash})
-    |> validate_embedding_dimensions()
+    |> Dimensions.validate_vector_length(:embedding, expected_dimension)
   end
 
   @doc """
@@ -478,48 +494,6 @@ defmodule Loopctl.Knowledge.Article do
           type: unknown,
           validation: :source_type_advisory
         )
-    end
-  end
-
-  defp validate_embedding_dimensions(changeset) do
-    case get_change(changeset, :embedding) do
-      nil ->
-        changeset
-
-      %Pgvector{} = vector ->
-        expected = Application.get_env(:loopctl, :embedding_dimensions, 1536)
-        actual = length(Pgvector.to_list(vector))
-
-        if actual == expected do
-          changeset
-        else
-          add_error(
-            changeset,
-            :embedding,
-            "dimension mismatch: expected %{expected}, got %{actual}",
-            expected: expected,
-            actual: actual
-          )
-        end
-
-      embedding when is_list(embedding) ->
-        expected = Application.get_env(:loopctl, :embedding_dimensions, 1536)
-        actual = length(embedding)
-
-        if actual == expected do
-          changeset
-        else
-          add_error(
-            changeset,
-            :embedding,
-            "dimension mismatch: expected %{expected}, got %{actual}",
-            expected: expected,
-            actual: actual
-          )
-        end
-
-      _ ->
-        changeset
     end
   end
 

@@ -5,6 +5,22 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.56.0 — 2026-07-21 (per-tenant embedding dimension — US-41.1)
+
+### Added
+
+- **`embedding_status`** (agent) — the tenant's active embedding dimension, whether
+  semantic recall is available and the exact reason when it is not, the instance's
+  supported dimension set, the shared system corpus's materialization state, and
+  per-dimension row counts. This is what to call when semantic search under-returns
+  or reports `fallback_reason: semantic_recall_unavailable`.
+- **`embedding_materialize_system_corpus`** (agent) — embeds the shared SYSTEM-scoped
+  article corpus for THIS tenant at its active dimension with the tenant's own
+  credential. Idempotent and batched; system articles are keyword-only until it runs.
+- **`embedding_reembed`** (orchestrator) — moves the tenant's whole corpus (articles,
+  per-tenant system-article materializations AND agent memories) onto a new dimension.
+  Recall keeps serving at the current dimension for the whole run. One-time and
+  cost-bearing; orchestrator-role because completion deletes the stale-dimension rows.
 ## 2.55.0 — 2026-07-21 (witnessed egress custody claim — US-41.7)
 
 ### Added

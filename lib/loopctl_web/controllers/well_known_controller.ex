@@ -84,9 +84,12 @@ defmodule LoopctlWeb.WellKnownController do
 
   defp capabilities do
     Map.merge(@discovery_base.capabilities, %{
-      supported_embedding_dimensions: [
-        Application.get_env(:loopctl, :embedding_dimensions, 1536)
-      ],
+      # US-41.1 AC-41.1.3: the FULL supported set, not just the deployment default.
+      # Single-sourced with the per-dimension ANN indexes the migration builds and
+      # with the compile-time cast set `VectorSearch` can emit, so the document can
+      # never advertise a dimension the instance has no index (or no query) for.
+      supported_embedding_dimensions: Loopctl.Embeddings.supported_dimensions(),
+      default_embedding_dimension: Loopctl.Embeddings.default_dimension(),
       tenant_supplied_endpoints_permitted: tenant_supplied_endpoints_permitted?()
     })
   end

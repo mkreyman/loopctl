@@ -62,11 +62,13 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
 
   require Logger
 
+  import Loopctl.Egress, only: [is_egress_refusal: 1]
+
   alias Loopctl.Custody
   alias Loopctl.Egress
   alias Loopctl.Egress.Scope
-
-  import Loopctl.Egress, only: [is_egress_refusal: 1]
+  alias Loopctl.Embeddings
+  alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -121,7 +123,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
         text = build_embedding_text(article)
         {article, text, content_hash(text)}
       end)
-      |> Enum.split_with(fn {article, _text, hash} -> not already_embedded?(article, hash) end)
+      |> split_to_embed(tenant_id)
 
     Enum.each(already, fn {article, _text, _hash} -> enqueue_linking(article.id, tenant_id) end)
 
@@ -298,8 +300,36 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   # returns {:error, _} so Oban retries the whole batch; already-stored rows are
   # idempotent no-ops on the retry.
   defp store_all(tenant_id, article_vector_pairs) do
+    # AC-41.1.11: ONE dimension resolution for the WHOLE ~100-article batch, threaded
+    # into every write. `Knowledge.update_embedding/4` resolves per call (a tenants
+    # SELECT + a settings read), so the /4 form here was 100 tenant lookups per batch.
+    dimension = Embeddings.resolve_write_dimension(tenant_id)
+
+    # Pre-write batch dimension check (review), mirroring ReembedWorker /
+    # SystemCorpusEmbeddingWorker: an off-dimension model otherwise surfaced per-row as
+    # a changeset error, and Oban re-billed the provider for the whole batch on each of
+    # five attempts. Catch it ONCE, before the first write, and DISCARD.
+    case Dimensions.check_batch_length(
+           Enum.map(article_vector_pairs, fn {_entry, v} -> v end),
+           dimension
+         ) do
+      :ok -> do_store_all(tenant_id, dimension, article_vector_pairs)
+      {:error, {:dimension_mismatch, expected, actual}} -> discard_mismatch(expected, actual)
+    end
+  end
+
+  defp discard_mismatch(expected, actual) do
+    Logger.debug(
+      "BatchArticleEmbeddingWorker: model returned #{inspect(actual)}-dimension vectors but " <>
+        "the tenant is recorded at #{expected}; discarding rather than re-billing."
+    )
+
+    {:discard, {:dimension_mismatch, expected, actual}}
+  end
+
+  defp do_store_all(tenant_id, dimension, article_vector_pairs) do
     Enum.reduce_while(article_vector_pairs, :ok, fn {{article, _text, hash}, vector}, :ok ->
-      case Knowledge.update_embedding(tenant_id, article.id, vector, hash) do
+      case Knowledge.update_embedding(tenant_id, article.id, vector, hash, dimension) do
         {:ok, _updated} ->
           enqueue_linking(article.id, tenant_id)
           {:cont, :ok}
@@ -343,11 +373,50 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     {:discard, {:no_embedding_key, Enum.map(to_embed, fn {a, _t, _h} -> a.id end)}}
   end
 
-  defp already_embedded?(%{has_embedding: true, embedding_content_hash: hash}, content_hash)
+  # IDEMPOTENCY, at the ACTIVE dimension (review). `has_embedding` is
+  # `not is_nil(articles.embedding)`, a column `Knowledge.update_embedding/5` NEVER
+  # writes for a non-1536 dimension — so for exactly the 768/1024 tenants this epic
+  # serves, EVERY article of EVERY batch looked unembedded and each enqueue re-billed
+  # the provider for the whole batch. Behind the cutover flag the check reads the
+  # side table's recorded hashes instead, in ONE query for the whole batch
+  # (AC-41.1.11: no per-item lookup).
+  defp split_to_embed(entries, tenant_id) do
+    hashes = side_table_hashes(tenant_id, entries)
+
+    Enum.split_with(entries, fn {article, _text, hash} ->
+      not already_embedded?(article, hash, hashes)
+    end)
+  end
+
+  defp side_table_hashes(tenant_id, entries) do
+    # WRITE-dimension gated (`use_side_table_hash?/1`), not read-flag gated (review):
+    # a non-1536 tenant has no legacy hash, so the read-flag gate re-billed the whole
+    # batch on every enqueue until cutover.
+    if Embeddings.use_side_table_hash?(tenant_id) do
+      Embeddings.article_embedded_hashes(
+        tenant_id,
+        Enum.map(entries, fn {article, _text, _hash} -> article.id end),
+        Embeddings.active_dimension(tenant_id)
+      )
+    else
+      nil
+    end
+  end
+
+  defp already_embedded?(article, content_hash, hashes) when is_map(hashes),
+    do: Map.get(hashes, article.id) == content_hash
+
+  defp already_embedded?(article, content_hash, _hashes),
+    do: legacy_already_embedded?(article, content_hash)
+
+  defp legacy_already_embedded?(
+         %{has_embedding: true, embedding_content_hash: hash},
+         content_hash
+       )
        when is_binary(hash),
        do: hash == content_hash
 
-  defp already_embedded?(_article, _content_hash), do: false
+  defp legacy_already_embedded?(_article, _content_hash), do: false
 
   defp content_hash(text) do
     :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)

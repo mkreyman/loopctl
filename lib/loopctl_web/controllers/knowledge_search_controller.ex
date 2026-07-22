@@ -640,8 +640,13 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         # graceful fallback as a keyless tenant — instead of a 429, so a neighbour's
         # burst can't hard-fail this tenant's search.
         case Knowledge.search_semantic(tenant_id, embedding, opts) do
-          {:error, :heavy_read_overloaded} ->
-            semantic_keyword_fallback(tenant_id, q, opts, :heavy_read_overloaded)
+          # US-41.1 AC-41.1.8 joins `:semantic_recall_unavailable` to the same
+          # labelled keyword degrade: the query vector cannot be compared against the
+          # corpus this tenant actually has (non-1536 tenant pre-cutover, or a model
+          # change mid-flight), so the response says so instead of 500-ing on a raw
+          # pgvector dimension error or returning a bare empty list.
+          {:error, reason} when reason in [:heavy_read_overloaded, :semantic_recall_unavailable] ->
+            semantic_keyword_fallback(tenant_id, q, opts, reason)
 
           result ->
             result

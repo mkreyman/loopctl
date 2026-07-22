@@ -108,6 +108,218 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   @scale_source_count 800
   @scale_source_type "scale_source"
 
+  @doc """
+  US-41.1 AC-41.1.12(i) / TC-41.1.2 — seeds `count` rows into `article_embeddings`
+  for `tenant_id` at `dim`, COMMITTED (outside any sandbox transaction).
+
+  ## Why the seed size matters, and what it is calibrated against
+
+  A per-dimension HNSW index only gets CHOSEN once the corpus makes it the cheaper
+  path — "eligibility is not selection". Measured against pgvector 0.8.2 on the
+  `article_embeddings` shape: at ~3k rows/dim the planner still preferred
+  `Seq Scan + Sort` (cost 212 vs 385); at ~24k rows/dim it chose the index (cost
+  470 vs a linear-growing scan). `plan_gate_corpus_size/0` is therefore set
+  comfortably past that crossover, and the gate asserts the plan WITHOUT
+  `enable_seqscan = off`.
+
+  The parent articles are created once and REUSED across dimensions (uniqueness is
+  `(tenant_id, article_id, dim)`), so seeding two dimensions costs one article set.
+  """
+  @spec seed_embedding_side_table(Ecto.UUID.t(), pos_integer(), keyword()) ::
+          {:ok, %{rows: non_neg_integer()}}
+  def seed_embedding_side_table(tenant_id, dim, opts \\ [])
+      when is_binary(tenant_id) and is_integer(dim) do
+    count = Keyword.get(opts, :count, plan_gate_corpus_size())
+    batch_size = Keyword.get(opts, :batch_size, 1_000)
+    now = DateTime.utc_now()
+
+    article_ids = seed_plan_gate_articles(tenant_id, count, now)
+
+    article_ids
+    |> Enum.with_index()
+    |> Enum.chunk_every(batch_size)
+    |> Enum.each(fn chunk ->
+      rows =
+        Enum.map(chunk, fn {article_id, index} ->
+          %{
+            id: Ecto.UUID.bingenerate(),
+            tenant_id: Ecto.UUID.dump!(tenant_id),
+            article_id: Ecto.UUID.dump!(article_id),
+            dim: dim,
+            embedding: Pgvector.new(embedding_for(index, dim)),
+            live_denorm: true,
+            inserted_at: now,
+            updated_at: now
+          }
+        end)
+
+      AdminRepo.insert_all("article_embeddings", rows, on_conflict: :nothing)
+    end)
+
+    AdminRepo.query!("ANALYZE article_embeddings")
+
+    {:ok, %{rows: count}}
+  end
+
+  @doc """
+  The MEMORY twin of `seed_embedding_side_table/3` (review #12).
+
+  Agent-memory recall has its OWN per-dimension indexes and its own verbatim
+  `(embedding::vector(N))` cast — a cast that must match the indexed expression
+  character-for-character — yet it was never plan-gated, so a drift there was
+  invisible while the article gate stayed green.
+  """
+  @spec seed_memory_embedding_side_table(Ecto.UUID.t(), pos_integer(), keyword()) ::
+          {:ok, %{rows: non_neg_integer(), subject_id: String.t()}}
+  def seed_memory_embedding_side_table(tenant_id, dim, opts \\ [])
+      when is_binary(tenant_id) and is_integer(dim) do
+    count = Keyword.get(opts, :count, plan_gate_corpus_size())
+    batch_size = Keyword.get(opts, :batch_size, 1_000)
+    now = DateTime.utc_now()
+    subject_id = Keyword.get(opts, :subject_id, "us411-plan-gate")
+
+    memory_ids = seed_plan_gate_memories(tenant_id, subject_id, count, now)
+
+    memory_ids
+    |> Enum.with_index()
+    |> Enum.chunk_every(batch_size)
+    |> Enum.each(fn chunk ->
+      rows =
+        Enum.map(chunk, fn {memory_id, index} ->
+          %{
+            id: Ecto.UUID.bingenerate(),
+            tenant_id: Ecto.UUID.dump!(tenant_id),
+            memory_id: Ecto.UUID.dump!(memory_id),
+            subject_id: subject_id,
+            dim: dim,
+            embedding: Pgvector.new(embedding_for(index, dim)),
+            live_denorm: true,
+            inserted_at: now,
+            updated_at: now
+          }
+        end)
+
+      AdminRepo.insert_all("memory_embeddings", rows, on_conflict: :nothing)
+    end)
+
+    AdminRepo.query!("ANALYZE memory_embeddings")
+
+    {:ok, %{rows: count, subject_id: subject_id}}
+  end
+
+  defp seed_plan_gate_memories(tenant_id, subject_id, count, now) do
+    existing = plan_gate_memory_ids(tenant_id, subject_id, count)
+
+    if length(existing) >= count do
+      Enum.take(existing, count)
+    else
+      seq = System.unique_integer([:positive])
+
+      rows =
+        for i <- length(existing)..(count - 1) do
+          %{
+            id: Ecto.UUID.bingenerate(),
+            tenant_id: Ecto.UUID.dump!(tenant_id),
+            subject_id: subject_id,
+            text: "US-41.1 memory plan gate #{seq}-#{i}",
+            confidence: 1.0,
+            source: "explicit",
+            tags: [],
+            metadata: %{},
+            recall_count: 0,
+            inserted_at: now,
+            updated_at: now
+          }
+        end
+
+      rows
+      |> Enum.chunk_every(1_000)
+      |> Enum.each(&AdminRepo.insert_all("memories", &1, on_conflict: :nothing))
+
+      plan_gate_memory_ids(tenant_id, subject_id, count)
+    end
+  end
+
+  defp plan_gate_memory_ids(tenant_id, subject_id, count) do
+    AdminRepo.all(
+      from(m in Loopctl.Memory.Memory,
+        where: m.tenant_id == ^tenant_id and m.subject_id == ^subject_id,
+        select: m.id,
+        order_by: m.id,
+        limit: ^count
+      )
+    )
+  end
+
+  @doc """
+  The committed corpus size (per dimension) the AC-41.1.12(i) plan gate seeds.
+
+  Set past the measured Seq-Scan/HNSW crossover (see
+  `seed_embedding_side_table/3`), not at it, so the gate fails on a real plan
+  regression rather than on planner noise.
+  """
+  @spec plan_gate_corpus_size() :: pos_integer()
+  def plan_gate_corpus_size, do: 30_000
+
+  @plan_gate_prior_tag "us411-plan-gate-prior"
+
+  @doc "The ~2%-selective tag the AC-41.1.12(i) novelty plan gate scores against."
+  @spec plan_gate_prior_tag() :: String.t()
+  def plan_gate_prior_tag, do: @plan_gate_prior_tag
+
+  defp seed_plan_gate_articles(tenant_id, count, now) do
+    existing =
+      AdminRepo.all(
+        from(a in Loopctl.Knowledge.Article,
+          where: a.tenant_id == ^tenant_id and a.source_type == "us411_plan_gate",
+          select: a.id,
+          order_by: a.id,
+          limit: ^count
+        )
+      )
+
+    if length(existing) >= count do
+      Enum.take(existing, count)
+    else
+      seq = System.unique_integer([:positive])
+
+      rows =
+        for i <- length(existing)..(count - 1) do
+          %{
+            id: Ecto.UUID.bingenerate(),
+            tenant_id: Ecto.UUID.dump!(tenant_id),
+            title: "US-41.1 plan gate #{seq}-#{i}",
+            body: "plan gate corpus row #{i}",
+            category: "reference",
+            status: "published",
+            scope: "tenant",
+            # ~2% of the corpus carries the prior tag, so the AC-41.1.12(i) gate can
+            # EXPLAIN the SIDE-TABLE novelty aggregate against a real, SELECTIVE
+            # prior set (review): the existing US-27.7b gate only ever covered the
+            # LEGACY branch, because it runs with the cutover flag off.
+            tags: if(rem(i, 50) == 0, do: [@plan_gate_prior_tag], else: []),
+            source_type: "us411_plan_gate",
+            metadata: %{},
+            inserted_at: now,
+            updated_at: now
+          }
+        end
+
+      rows
+      |> Enum.chunk_every(1_000)
+      |> Enum.each(&AdminRepo.insert_all("articles", &1, on_conflict: :nothing))
+
+      AdminRepo.all(
+        from(a in Loopctl.Knowledge.Article,
+          where: a.tenant_id == ^tenant_id and a.source_type == "us411_plan_gate",
+          select: a.id,
+          order_by: a.id,
+          limit: ^count
+        )
+      )
+    end
+  end
+
   @doc "Returns the production article floor constant (as of 2026-06-24)."
   @spec prod_article_floor() :: pos_integer()
   def prod_article_floor, do: @prod_article_floor
@@ -438,8 +650,18 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   """
   @spec embedding_for(non_neg_integer()) :: [float()]
   def embedding_for(index) do
-    dims = Application.get_env(:loopctl, :embedding_dimensions, 1_536)
+    embedding_for(index, Application.get_env(:loopctl, :embedding_dimensions, 1_536))
+  end
 
+  @doc """
+  US-41.1: `embedding_for/1` at an EXPLICIT dimension.
+
+  The per-dimension ANN plan gate (TC-41.1.2 / AC-41.1.12(i)) seeds the SAME
+  corpus at two distinct dimensions, so the vector generator has to be
+  dimension-parameterized instead of reading the deployment default.
+  """
+  @spec embedding_for(non_neg_integer(), pos_integer()) :: [float()]
+  def embedding_for(index, dims) when is_integer(dims) and dims > 0 do
     # Smooth component: sine wave over index. The period is 1000 so that
     # articles within ~50 index positions share a dominant direction.
     # Using a per-dimension phase shift (2*pi*d/dims) distributes the

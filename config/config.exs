@@ -14,6 +14,36 @@ config :loopctl,
   env: config_env(),
   generators: [timestamp_type: :utc_datetime, binary_id: true],
   embedding_dimensions: 1536,
+  # US-41.1 AC-41.1.3: the FIXED set of embedding dimensions this instance supports.
+  # Every value here MUST have pre-created per-dimension HNSW indexes on both
+  # `article_embeddings` and `memory_embeddings` (migration
+  # `CreatePerDimensionEmbeddingHnswIndexes`), and the same set is published on
+  # `.well-known/loopctl` as `supported_embedding_dimensions`. Read at COMPILE TIME by
+  # `Loopctl.Knowledge.VectorSearch` (a per-dimension `::vector(N)` cast cannot be a
+  # bound parameter), so adding a dimension is a deploy-time change: edit this list AND
+  # ship the migration that builds its indexes CONCURRENTLY. Index DDL is
+  # operator/migration plane only — never issued from the request path.
+  # 768 = nomic-embed / bge-base, 1024 = bge-m3 / mxbai, 1536 = OpenAI 3-small (the
+  # hosted default).
+  #
+  # HARD pgvector CEILING: an hnsw index cannot be built on more than 2000
+  # dimensions ("column cannot have more than 2000 dimensions for hnsw index",
+  # verified against pgvector 0.8.2). OpenAI text-embedding-3-large's native 3072 is
+  # therefore NOT supportable as an indexed dimension on this instance — it would
+  # sequential-scan the whole corpus on every query. It is deliberately absent from
+  # this list, and `.well-known/loopctl` publishes that fact so an agent discovers
+  # the constraint BEFORE configuring a model it cannot use. (3-large can be used at
+  # a REDUCED output dimension via the API's `dimensions` parameter; picking 1024 or
+  # 1536 there brings it back inside this set.)
+  supported_embedding_dimensions: [768, 1024, 1536],
+  # US-41.1 (review): TTL (ms) for the memoized semantic-search DISCLOSURE meta
+  # (`Loopctl.Embeddings.DisclosureCache`). The system-corpus anti-join + the two
+  # re-embed existence probes ran on EVERY semantic response and, in the steady
+  # state, always answered the same thing; the answer changes only when the
+  # materialization worker runs, a system article is published, or a re-embed makes
+  # progress. `0` disables caching entirely (config/test.exs sets 0 so tests observe
+  # a disclosure change immediately).
+  embedding_disclosure_cache_ms: 5_000,
   # US-38.4: EXPLICIT pgvector HNSW build parameters for every `CREATE INDEX ... USING
   # hnsw` (`Loopctl.Repo.HnswIndex`). These EQUAL pgvector's implicit defaults (m=16,
   # ef_construction=64) — a deliberate, documented "keep the defaults" tuning outcome

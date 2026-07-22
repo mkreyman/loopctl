@@ -166,6 +166,20 @@ defmodule Loopctl.DataCase do
       {:ok, Enum.map(texts, fn _text -> deterministic_embedding(tenant_id) end)}
     end)
 
+    # US-41.1 AC-41.1.10: the `/3` arities carry an explicit `:model` override (the
+    # model that produced the tenant's ACTIVE corpus, or — for the re-embed worker —
+    # the pending one). The default stubs ignore the model and behave EXACTLY like
+    # their `/2` twins, so only a test that actually asserts on the model needs its
+    # own expectation.
+    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn scope, _text, _opts ->
+      {:ok, deterministic_embedding(EgressScope.coerce(scope).tenant_id)}
+    end)
+
+    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn scope, texts, _opts ->
+      tenant_id = EgressScope.coerce(scope).tenant_id
+      {:ok, Enum.map(texts, fn _text -> deterministic_embedding(tenant_id) end)}
+    end)
+
     # US-37.2: permissive default for the per-node embedding concurrency gate --
     # acquire/1 always grants a slot, release/1 is a no-op -- so every existing
     # embedding/search test runs under the cap unchanged. The saturation test
