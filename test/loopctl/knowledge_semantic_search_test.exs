@@ -1712,7 +1712,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       refute neighbor_b.id in ids
     end
 
-    test "a zero-signal graph neighbor never OUTRANKS a genuine single-lane top hit" do
+    test "a zero-signal graph neighbor never outranks a genuine single-lane top hit — score AND position" do
       %{tenant: tenant} = setup_tenant()
       Knowledge.reset_circuit_breaker(tenant.id)
       %{seed: seed, neighbor: neighbor} = seed_and_neighbor(tenant.id)
@@ -1728,12 +1728,20 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       neighbor_result = Enum.find(results, &(&1.id == neighbor.id))
 
       # The seed is keyword rank 1 (0.5/(k+1)); the graph-only neighbor is graph rank 1.
-      # With the graph lane weighted 0.5 to MATCH the primary lanes, the neighbor scores
-      # 0.5/(k+1) too — it TIES the top single-lane hit and never exceeds it. Under the
-      # buggy 1.0 graph weight the neighbor scored 1.0/(k+1) = DOUBLE and outranked every
-      # single-lane #1 (#470 review).
-      assert_in_delta neighbor_result.final_score, 0.5 / 61, 1.0e-9
-      assert neighbor_result.final_score <= seed_result.final_score
+      # The graph lane is weighted 0.25 — STRICTLY BELOW the 0.5 primary per-lane weight — so
+      # the neighbor scores 0.25/(k+1), strictly LESS than the seed's 0.5/(k+1). It can
+      # therefore neither tie NOR (via the deterministic {final_score, id} desc tiebreak,
+      # which a larger neighbor id would otherwise win) float ABOVE the genuine top hit in
+      # POSITION. At the old 0.5 tie-weight a larger-id neighbor could sort above the seed
+      # (#470 review).
+      assert_in_delta neighbor_result.final_score, 0.25 / 61, 1.0e-9
+      assert neighbor_result.final_score < seed_result.final_score
+
+      seed_pos = Enum.find_index(results, &(&1.id == seed.id))
+      neighbor_pos = Enum.find_index(results, &(&1.id == neighbor.id))
+
+      assert seed_pos < neighbor_pos,
+             "a zero-signal graph neighbor must never sort above a genuine single-lane top hit"
     end
 
     test "a neighbor linked from TWO seeds outranks one linked from a single seed" do
@@ -1824,6 +1832,184 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       assert meta.total_count_scope == "merged_candidates_with_graph"
     end
 
+    test "consensus counts DISTINCT seeds, not link rows — one seed via many links != multi-seed" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      seed1 =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Distinctseed One",
+          body: "The distinctseed token appears here first.",
+          status: :published
+        })
+
+      seed2 =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Distinctseed Two",
+          body: "The distinctseed token appears here again.",
+          status: :published
+        })
+
+      # single_seed_multi_link: linked from ONE seed (seed1) via TWO distinct link ROWS
+      # (different relationship_types). Row-counting would score its consensus as 2.
+      single_seed_multi_link =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Single Seed Multi Link",
+          body: "Unrelated wording, no shared query token.",
+          status: :published
+        })
+
+      # two_distinct_seeds: linked from seed1 AND seed2 via one row each — genuine
+      # cross-seed consensus of 2.
+      two_distinct_seeds =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Two Distinct Seeds",
+          body: "Also unrelated wording, no shared query token.",
+          status: :published
+        })
+
+      for {src, tgt, rel} <- [
+            {seed1, single_seed_multi_link, :relates_to},
+            {seed1, single_seed_multi_link, :derived_from},
+            {seed1, two_distinct_seeds, :relates_to},
+            {seed2, two_distinct_seeds, :relates_to}
+          ] do
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: src.id,
+          target_article_id: tgt.id,
+          relationship_type: rel
+        })
+      end
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: results}} =
+        Knowledge.search_combined(tenant.id, "distinctseed", graph_lane: true)
+
+      multi_link = Enum.find(results, &(&1.id == single_seed_multi_link.id))
+      distinct = Enum.find(results, &(&1.id == two_distinct_seeds.id))
+
+      assert multi_link
+      assert distinct
+
+      # Two link rows from ONE seed must NOT tie a genuine two-DISTINCT-seed neighbor. The
+      # distinct-seed neighbor (consensus 2 → graph rank 1) strictly outranks the
+      # multi-link single-seed neighbor (consensus 1 → graph rank 2). Row-counting (the bug)
+      # gave both consensus 2 and let the single-seed neighbor tie/outrank (#470 review).
+      assert distinct.final_score > multi_link.final_score
+
+      distinct_pos = Enum.find_index(results, &(&1.id == two_distinct_seeds.id))
+      multi_link_pos = Enum.find_index(results, &(&1.id == single_seed_multi_link.id))
+      assert distinct_pos < multi_link_pos
+    end
+
+    test "graph lane honors the caller status opt (not hardcoded :published)" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      # A DRAFT seed that matches the keyword lane under a :draft-status search, plus a DRAFT
+      # neighbor reachable only via the graph lane. Under the old hardcoded `status ==
+      # :published` the draft neighbor was silently dropped even though the primary lanes
+      # returned draft rows — an inconsistent lane (#470 review).
+      seed =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Draftlane Seed",
+          body: "The draftlane token appears here.",
+          status: :draft
+        })
+
+      neighbor =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Draft Neighbor",
+          body: "Unrelated wording, no shared query token.",
+          status: :draft
+        })
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: seed.id,
+        target_article_id: neighbor.id,
+        relationship_type: :relates_to
+      })
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: results}} =
+        Knowledge.search_combined(tenant.id, "draftlane", graph_lane: true, status: :draft)
+
+      ids = Enum.map(results, & &1.id)
+      assert seed.id in ids
+
+      assert neighbor.id in ids,
+             "a draft graph neighbor must surface under a :draft-status search"
+    end
+
+    test "graph lane never leaks another agent's private memory to an agent caller (#163)" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      seed =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Visibilitylane Seed",
+          body: "The visibilitylane token appears here.",
+          status: :published,
+          metadata: %{"visibility" => "shared"}
+        })
+
+      # A neighbor that is ANOTHER agent's PRIVATE memory — a one-hop link from a shared
+      # seed must not surface it (or leak its id/title) to a different agent caller.
+      private_neighbor =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Other Agent Private Memory",
+          body: "Unrelated wording, no shared query token.",
+          status: :published,
+          metadata: %{"visibility" => "private", "agent_id" => "agent-owner"}
+        })
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: seed.id,
+        target_article_id: private_neighbor.id,
+        relationship_type: :relates_to
+      })
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      # A DIFFERENT agent must NOT see the private neighbor.
+      {:ok, %{results: stranger_results}} =
+        Knowledge.search_combined(tenant.id, "visibilitylane",
+          graph_lane: true,
+          visibility_agent_id: "agent-stranger"
+        )
+
+      refute Enum.any?(stranger_results, &(&1.id == private_neighbor.id)),
+             "the graph lane must not leak another agent's private memory"
+
+      # The OWNER agent still reaches its own private memory via the same lane.
+      {:ok, %{results: owner_results}} =
+        Knowledge.search_combined(tenant.id, "visibilitylane",
+          graph_lane: true,
+          visibility_agent_id: "agent-owner"
+        )
+
+      assert Enum.any?(owner_results, &(&1.id == private_neighbor.id))
+    end
+
     test "graph_lane: true + fusion_strategy: :min_max injects no neighbors (lane skipped, no wasted read)" do
       %{tenant: tenant} = setup_tenant()
       Knowledge.reset_circuit_breaker(tenant.id)
@@ -1844,6 +2030,77 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       # label stays the plain merged label since nothing was folded in (#470 review).
       refute Enum.any?(results, &(&1.id == neighbor.id))
       assert meta.total_count_scope == "merged_candidates"
+    end
+  end
+
+  # --- #470: get_context relevance must read the ABSOLUTE score, not RRF final_score -----
+
+  describe "get_context/3 relevance uses the absolute per-row score (#470)" do
+    test "relevance_score is on the 0..1 absolute scale, not the ~0.008 RRF final_score" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      create_article_with_embedding(
+        tenant.id,
+        %{title: "Absolute Relevance", body: "content about absolute relevance scoring"},
+        :close
+      )
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: [first | _]}} = Knowledge.get_context(tenant.id, "absolute relevance")
+
+      # The article is a strong semantic match (query == :close), so its ABSOLUTE relevance
+      # (cosine similarity_score) is ~1.0. Post-#470 the fused RRF final_score for a rank-1
+      # hit is only ~0.5/61 ≈ 0.008; if get_context read THAT, relevance would collapse ~60x.
+      assert first.relevance_score > 0.5
+    end
+
+    test "a highly-relevant OLD article outranks an irrelevant FRESH one (recency can't dominate)" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      # Strong semantic match, but stale (90 days old → recency ≈ exp(-3) ≈ 0.05).
+      relevant_old =
+        create_article_with_embedding(
+          tenant.id,
+          %{title: "Relevant Old", body: "content about ranking relevance and recency"},
+          :close
+        )
+
+      # Poor semantic match (orthogonal embedding → similarity ≈ 0), but brand new (recency 1.0).
+      _fresh_irrelevant =
+        create_article_with_embedding(
+          tenant.id,
+          %{title: "Fresh Irrelevant", body: "content about ranking relevance and recency"},
+          :far
+        )
+
+      import Ecto.Query
+
+      ninety_days_ago = DateTime.add(DateTime.utc_now(), -90 * 86_400, :second)
+
+      Loopctl.AdminRepo.update_all(
+        from(a in Knowledge.Article, where: a.id == ^relevant_old.id),
+        set: [updated_at: ninety_days_ago]
+      )
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: results}} =
+        Knowledge.get_context(tenant.id, "ranking relevance recency", recency_weight: 0.3)
+
+      # With the fix (0.7*abs_relevance + 0.3*recency): relevant_old ≈ 0.7*1.0 + 0.3*0.05 =
+      # 0.715 beats fresh_irrelevant ≈ 0.7*0.0 + 0.3*1.0 = 0.3. With the bug (relevance =
+      # ~0.008 RRF final_score) the fresh article's recency (0.3) swamped relevance and won.
+      relevant_pos = Enum.find_index(results, &(&1.id == relevant_old.id))
+
+      assert relevant_pos == 0,
+             "a highly-relevant old article must outrank an irrelevant fresh one"
     end
   end
 end

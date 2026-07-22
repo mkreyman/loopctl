@@ -81,7 +81,8 @@ defmodule Loopctl.HeavyRead.TenantGateTest do
             :novelty,
             :suggested_links,
             :distant_pairs,
-            :distant_pairs_bridge
+            :distant_pairs_bridge,
+            :graph_lane
           ] do
         assert TenantGate.weight_for(endpoint) == heavy
       end
@@ -289,6 +290,7 @@ defmodule Loopctl.HeavyRead.TenantGateTest do
       distant_pairs: :heavy,
       distant_pairs_bridge: :heavy,
       export: :heavy,
+      graph_lane: :heavy,
       enumeration: :light,
       change_feed: :light,
       ingestion_jobs: :light,

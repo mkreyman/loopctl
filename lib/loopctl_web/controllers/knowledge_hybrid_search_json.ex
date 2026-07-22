@@ -43,6 +43,11 @@ defmodule LoopctlWeb.KnowledgeHybridSearchJSON do
   # Hybrid runs the combined pool, so results carry :final_score; a keyword-only
   # fallback carries :relevance_score instead — fall back rather than report a
   # misleading 0.0.
+  #
+  # Post-#470 :final_score is a Reciprocal Rank Fusion weight (`Σ weight/(k+rank)`, top
+  # ~0.008-0.016), NOT a 0..1 similarity — this per-result `score` reflects RANK only.
+  # The ABSOLUTE 0..1 confidence a caller should threshold on is `meta.confidence` (the
+  # provenance decision's `absolute_score/1`), not this field.
   defp extract_score(result) do
     result[:final_score] || result[:relevance_score] || result[:similarity_score] || 0.0
   end

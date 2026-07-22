@@ -735,13 +735,18 @@ config :loopctl, :knowledge_rrf_k, 60
 # score (their hybrid-resolver absolute_score stays 0.0) and never inflate
 # meta.semantic_result_count.
 config :loopctl, :knowledge_rrf_graph_lane_enabled, false
-# Weight of the graph-neighbor lane in RRF fusion when enabled. Defaults to 0.5 to
-# MATCH the keyword/semantic per-lane weights this system actually uses (search_combined
-# defaults each primary lane to 0.5, structurally summed to 1.0). A 1.0 graph weight
-# would make a zero-signal one-hop neighbor at graph-rank 1 (1.0/(k+1)) outrank every
-# single-lane rank-1 hit (0.5/(k+1)) — the graph lane carries no relevance/similarity
-# signal by design, so it must not double the primary lanes' contribution (#470 review).
-config :loopctl, :knowledge_rrf_graph_weight, 0.5
+# Weight of the graph-neighbor lane in RRF fusion when enabled. Defaults to 0.25 —
+# STRICTLY BELOW the keyword/semantic per-lane weight (0.5 each). The graph lane carries
+# NO relevance/similarity signal (a neighbor surfaces only because it is link-adjacent to
+# a seed), so it must never tie OR outrank a genuine single-lane hit. At the primary weight
+# (0.5) a graph-rank-1 neighbor scores 0.5/(k+1) — EXACTLY equal to a single-lane rank-1
+# hit — and the deterministic `{final_score, id}` desc tiebreak could then float a
+# zero-signal neighbor with a larger id ABOVE the true top hit (#470 review). At 0.25 a
+# graph-rank-1 neighbor scores 0.25/(k+1) < 0.5/(k+1), so the "never outranks a genuine
+# single-lane top hit" invariant holds by construction, in POSITION not just in score. A
+# doc that is ALSO a genuine hit still sums its primary-lane contribution, so real
+# cross-lane consensus is unaffected.
+config :loopctl, :knowledge_rrf_graph_weight, 0.25
 # Number of top merged candidates used as graph-lane seeds (bounds link fan-out).
 config :loopctl, :knowledge_rrf_graph_seed_count, 10
 # Overall cap on distinct graph-lane neighbors injected into the fusion.
