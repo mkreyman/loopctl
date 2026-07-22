@@ -137,7 +137,7 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
   # AC-39.5.5 / issue #498 — a sweep must be observable on BOTH outcomes.
   describe "perform/1 — sweep telemetry (TC-39.5.6/7/8)" do
     # TC-39.5.6
-    test "emits sweep-stop telemetry carrying the deleted count" do
+    test "emits sweep-success telemetry carrying the deleted count" do
       %{tenant: tenant, project: project, agent: agent} = setup_context()
       attach_sweep_telemetry(7)
 
@@ -150,7 +150,7 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
 
     # TC-39.5.7 — the load-bearing half of "success telemetry": a run that deletes
     # NOTHING must still emit, or "nothing to do" is indistinguishable from "never ran".
-    test "emits sweep-stop telemetry with deleted: 0 on a no-op run" do
+    test "emits sweep-success telemetry with deleted: 0 on a no-op run" do
       %{tenant: tenant, project: project, agent: agent} = setup_context()
       attach_sweep_telemetry(11)
 

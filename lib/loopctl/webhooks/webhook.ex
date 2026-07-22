@@ -47,6 +47,7 @@ defmodule Loopctl.Webhooks.Webhook do
     article_link.created
     article_link.deleted
     knowledge.ingestion_anomaly_detected
+    coordination.channel_post_sweep_stalled
   )
 
   @doc """

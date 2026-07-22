@@ -38,19 +38,36 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   `ChannelPostSweeper` is a single global, tenant-independent worker, so the failure this
   detector exists for ("the sweep is not running") is ONE event that happens to leave
   residue in N tenants. The per-tenant anomaly ROW and the per-tenant
-  `knowledge.ingestion_anomaly_detected` webhook stay per-tenant (a tenant subscriber
+  `coordination.channel_post_sweep_stalled` webhook stay per-tenant (a tenant subscriber
   cares about its OWN retention), but the OPERATOR alert is emitted ONCE PER RUN at
   system scope (`fire_sweep_system_alert/1`), listing the affected tenants, instead of
   N identical `ScaleAlertDeliveryWorker` jobs saying one thing. `notify/2` therefore
   skips the per-tenant operator alert for `:sweep_stalled` only — every other type keeps
   it, because for them the CAUSE really is per-tenant.
 
+  That webhook is a DISTINCT event type from `knowledge.ingestion_anomaly_detected`
+  (#498 review): the anomaly record and the alert machinery are reused, but a
+  coordination retention event is not a knowledge-ingestion event and must not be pushed
+  at subscribers who opted into the latter.
+
+  ### Alert durability for the ONE system alert
+
+  Because the type's only operator signal is emitted once per RUN rather than once per
+  candidate, the `alerted` flip cannot happen during flagging — that would make the alert
+  AT-MOST-once (rows committed as alerted, then an exception or a failed `Oban.insert`
+  drops the single alert, and every later run takes the silent update path). So
+  `notify/2` fires only the per-tenant webhook for `:sweep_stalled`, and
+  `commit_sweep_system_alert/2` enqueues the system alert FIRST and marks the
+  participating anomalies alerted only on success.
+
   ### Isolated failure domain
 
   `run_sweep_stalled_detection/0` is wrapped in its own rescue: its residue read is a
   cross-tenant aggregate on the small `AdminRepo` pool, and a statement timeout or
   checkout failure there must NOT take down capture-silence flagging, reject-rate
-  recovery, or write-stats pruning in the same hourly job.
+  recovery, or write-stats pruning in the same hourly job. Both failure shapes emit
+  `Loopctl.TelemetryEvents.sweep_stall_detection_failed/0` so that isolation never makes
+  the monitor's own death silent.
 
   ## Recovery: auto-resolve when the outage clears
 
@@ -121,12 +138,20 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   alias Loopctl.Audit
   alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionHealth
+  alias Loopctl.TelemetryEvents
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.Workers.ScaleAlertDeliveryWorker
   alias Loopctl.Workers.WebhookDeliveryWorker
 
   @webhook_event_type "knowledge.ingestion_anomaly_detected"
+
+  # #498 review: `:sweep_stalled` is a COORDINATION retention event, not a knowledge
+  # ingestion one. It reuses the anomaly RECORD and the alert machinery, but delivering it
+  # on the knowledge event type would push coordination events at every tenant that
+  # subscribed to watch KB ingestion, with no opt-out. It gets its own event type so a
+  # subscriber opts in explicitly (`Loopctl.Webhooks.Webhook.valid_event_types/0`).
+  @sweep_webhook_event_type "coordination.channel_post_sweep_stalled"
 
   # Bound on the `tenant_ids` sample carried in the system-scope sweep-stall alert: the
   # blast radius is reported as an exact `affected_tenants` count, so the id list is a
@@ -238,6 +263,12 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # not abort the whole hourly job (which would also stop capture-silence flagging,
   # reject-rate recovery and write-stats pruning). Oban retries buy nothing for a pool
   # that is saturated right now; the next hourly run re-detects.
+  #
+  # The isolation must not make the MONITOR's own death silent (#498 review): both
+  # failure shapes emit `TelemetryEvents.sweep_stall_detection_failed/0` alongside the
+  # error log, so a persistently failing residue read is observable outside the log
+  # stream — otherwise the dead-man's switch reproduces, one level up, the
+  # assumed-healthy failure it exists to close.
   defp run_sweep_stalled_detection do
     do_run_sweep_stalled_detection()
   rescue
@@ -247,7 +278,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
           "#{Exception.message(error)}; other detectors continue"
       )
 
-      :ok
+      observe_detection_failure(error.__struct__ |> Module.split() |> Enum.join("."))
   catch
     :exit, reason ->
       Logger.error(
@@ -255,22 +286,50 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
           "other detectors continue"
       )
 
-      :ok
+      observe_detection_failure("exit")
+  end
+
+  # Bounded `error_class` tag only — never the failure's message (which can carry SQL or
+  # bound params). Returns `:ok` so the isolated failure domain still yields `:ok`.
+  defp observe_detection_failure(error_class) do
+    :telemetry.execute(
+      TelemetryEvents.sweep_stall_detection_failed(),
+      %{count: 1},
+      %{error_class: error_class}
+    )
+
+    :ok
   end
 
   defp do_run_sweep_stalled_detection do
     if sweep_stalled_check_ready?() do
-      candidates = IngestionHealth.detect_sweep_stalled()
+      scan = IngestionHealth.detect_sweep_stalled_scan()
+      candidates = scan.candidates
 
       Logger.info(
         "IngestionHealthWorker: #{length(candidates)} sweep-stalled candidate(s) detected"
       )
 
+      # A truncated scan means DEGRADED COVERAGE, not "all clear": the LIMIT is
+      # install-wide and oldest-first, so a tenant whose residue is newer than the sample
+      # cutoff is invisible to THIS run. Recovery already refuses to close on it; say so
+      # out loud rather than letting the gap be silent.
+      if scan.truncated? do
+        Logger.warning(
+          "IngestionHealthWorker: sweep-stall residue scan TRUNCATED at " <>
+            "#{scan.scanned} rows — tenant coverage is incomplete this run and no " <>
+            "stall anomaly will be auto-closed"
+        )
+      end
+
       candidates
       |> flag_candidates(:sweep_stalled)
       |> fire_sweep_system_alert()
 
-      closed = IngestionHealth.auto_resolve_recovered_sweep_stalled(candidates)
+      # Recovery is decided on the RAW scan (residue set + truncation), never on the
+      # post-capacity-filter candidate list — see
+      # IngestionHealth.auto_resolve_recovered_sweep_stalled/1.
+      closed = IngestionHealth.auto_resolve_recovered_sweep_stalled(scan)
 
       if closed > 0 do
         Logger.info("IngestionHealthWorker: auto-closed #{closed} recovered sweep-stall(s)")
@@ -459,8 +518,10 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # so they share this function rather than duplicating the alerted-flag ordering — the
   # at-least-once contract — in two places.
   #
-  # Returns `{:notified, candidate}` when THIS run fired the notifications (a genuine
-  # create, or the at-least-once re-fire), else `:ok`/`:suppressed`.
+  # Returns `{:notified, candidate, anomaly}` when THIS run fired the notifications (a
+  # genuine create, or the at-least-once re-fire), else `:ok`/`:suppressed`. The ANOMALY
+  # rides along because `:sweep_stalled` defers its `alerted` flip until after its one
+  # system-scope alert is durably enqueued (see `fire_sweep_system_alert/1`).
   defp flag_episode(anomaly_type, %{tenant_id: tenant_id} = candidate, rows) do
     existing = Enum.find(rows, &(&1.resolved == false and &1.archived == false))
 
@@ -476,7 +537,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
         # post-commit alert/webhook never fired. Re-fire, then refresh figures.
         notify(tenant_id, existing)
         update_existing_episode(anomaly_type, existing, candidate)
-        {:notified, candidate}
+        {:notified, candidate, existing}
 
       true ->
         update_existing_episode(anomaly_type, existing, candidate)
@@ -490,7 +551,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
       :suppressed
     else
       case create_new_episode(anomaly_type, tenant_id, candidate) do
-        %IngestionAnomaly{} -> {:notified, candidate}
+        %IngestionAnomaly{} = anomaly -> {:notified, candidate, anomaly}
         _ -> :ok
       end
     end
@@ -605,17 +666,25 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # run never re-fires. Ordering makes notification at-least-once: if the process
   # dies before mark_alerted, the next run's recovery branch re-fires.
   #
-  # `:sweep_stalled` is the ONE type whose per-tenant operator alert is deliberately
-  # skipped here: its cause (the single global `ChannelPostSweeper`) is shared across
-  # every affected tenant, so the run emits ONE system-scope alert
-  # (`fire_sweep_system_alert/1`) instead of N identical ones. The per-TENANT webhook
-  # still fires — a tenant subscriber cares about its own retention — and `alerted` is
-  # still flipped, so the at-least-once contract is unchanged.
-  defp notify(tenant_id, anomaly) do
-    unless anomaly.anomaly_type == :sweep_stalled do
-      fire_operator_alert(tenant_id, anomaly)
-    end
+  # `:sweep_stalled` is the ONE type whose OPERATOR alert is not fired here: its cause
+  # (the single global `ChannelPostSweeper`) is shared across every affected tenant, so
+  # the run emits ONE system-scope alert (`fire_sweep_system_alert/1`) instead of N
+  # identical ones. The per-TENANT webhook still fires here — a tenant subscriber cares
+  # about its own retention — but `mark_alerted` is DEFERRED to that system-alert step.
+  #
+  # Flipping `alerted` here (as the first cut did) made the operator alert AT-MOST-once:
+  # `alerted: true` was committed per candidate during flagging, while the only operator
+  # alert for the type was enqueued after the whole pipe. Anything between them — the
+  # detector's own rescue/catch converting a raise to `:ok`, or a failed `Oban.insert` —
+  # left rows alerted with no alert ever emitted, and the next run took the silent
+  # update path forever. The flip now happens ONLY after a successful enqueue.
+  defp notify(tenant_id, %IngestionAnomaly{anomaly_type: :sweep_stalled} = anomaly) do
+    fire_anomaly_webhook(tenant_id, anomaly)
+    :deferred
+  end
 
+  defp notify(tenant_id, anomaly) do
+    fire_operator_alert(tenant_id, anomaly)
     fire_anomaly_webhook(tenant_id, anomaly)
     mark_alerted(anomaly)
   end
@@ -625,41 +694,80 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   # (a genuine create or an at-least-once re-fire), so a persistent stall does not
   # re-page hourly. Carries the blast radius (`affected_tenants`, a BOUNDED `tenant_ids`
   # sample) so the operator sees "the sweeper is down, N tenants affected" as one signal.
+  #
+  # ORDERING IS THE CONTRACT: the alert is enqueued FIRST and the participating anomalies
+  # are marked `alerted` only on a successful enqueue. A failed enqueue (or a crash
+  # anywhere before it) therefore leaves `alerted: false`, and the next hourly run's
+  # `not existing.alerted` branch re-fires — at-least-once, as documented.
   defp fire_sweep_system_alert(results) do
     case Enum.flat_map(results, fn
-           {:notified, candidate} -> [candidate]
+           {:notified, candidate, anomaly} -> [{candidate, anomaly}]
            _ -> []
          end) do
       [] ->
         :ok
 
       notified ->
-        grace_hours = IngestionHealth.sweep_staleness_hours()
-
-        payload = %{
-          "alert" => "coordination.channel_post_sweep_stalled",
-          "metric" => "coordination.channel_post_sweep_stalled.hours_stale",
-          "value" => notified |> Enum.map(& &1.hours_stale) |> Enum.max(),
-          "threshold" => grace_hours,
-          "window_seconds" => grace_hours * 3600,
-          "scope" => "system",
-          "affected_tenants" => length(notified),
-          "tenant_ids" => notified |> Enum.map(& &1.tenant_id) |> Enum.take(@alert_tenant_sample),
-          "overdue_count" => notified |> Enum.map(& &1.overdue_count) |> Enum.sum(),
-          "at" => DateTime.utc_now() |> DateTime.to_iso8601()
-        }
-
-        Logger.error(
-          "IngestionHealthWorker: channel-post retention sweep stalled — " <>
-            "affected_tenants=#{length(notified)} max_hours_stale=#{payload["value"]}"
-        )
-
-        enqueue_system_alert(payload)
+        commit_sweep_system_alert(notified)
     end
   end
 
-  defp enqueue_system_alert(payload) do
-    case %{payload: payload} |> ScaleAlertDeliveryWorker.new() |> Oban.insert() do
+  @doc false
+  # The enqueue-THEN-flip step, factored out of the private pipeline so a test can drive
+  # the DROPPED-ENQUEUE path with a plain function (`Oban.insert/1` cannot be made to
+  # fail under the sandbox otherwise) — same seam shape as
+  # `Loopctl.Workers.ChannelPostSweeper.observed/2`. `notified` is a list of
+  # `{candidate, anomaly}`. Not a public API; prod always uses the default insert.
+  @spec commit_sweep_system_alert([{map(), IngestionAnomaly.t()}], (Oban.Job.changeset() ->
+                                                                      {:ok, Oban.Job.t()}
+                                                                      | {:error, term()})) ::
+          :ok | :error
+  def commit_sweep_system_alert(notified, insert_fn \\ &Oban.insert/1)
+
+  def commit_sweep_system_alert([], _insert_fn), do: :ok
+
+  def commit_sweep_system_alert(notified, insert_fn) do
+    candidates = Enum.map(notified, fn {candidate, _anomaly} -> candidate end)
+    grace_hours = IngestionHealth.sweep_staleness_hours()
+
+    payload = %{
+      "alert" => "coordination.channel_post_sweep_stalled",
+      "metric" => "coordination.channel_post_sweep_stalled.hours_stale",
+      "value" => candidates |> Enum.map(& &1.hours_stale) |> Enum.max(),
+      "threshold" => grace_hours,
+      "window_seconds" => grace_hours * 3600,
+      "scope" => "system",
+      "affected_tenants" => length(candidates),
+      "tenant_ids" => candidates |> Enum.map(& &1.tenant_id) |> Enum.take(@alert_tenant_sample),
+      "overdue_count" => candidates |> Enum.map(& &1.overdue_count) |> Enum.sum(),
+      "at" => DateTime.utc_now() |> DateTime.to_iso8601()
+    }
+
+    Logger.error(
+      "IngestionHealthWorker: channel-post retention sweep stalled — " <>
+        "affected_tenants=#{length(candidates)} max_hours_stale=#{payload["value"]}"
+    )
+
+    case enqueue_system_alert(payload, insert_fn) do
+      :ok ->
+        Enum.each(notified, fn {_candidate, anomaly} -> mark_alerted(anomaly) end)
+        :ok
+
+      :error ->
+        # Deliberately leave every participating row `alerted: false`: the next hourly
+        # run re-fires instead of silently dropping the only operator signal for a dead
+        # retention sweep.
+        Logger.error(
+          "IngestionHealthWorker: sweep-stall system alert was NOT enqueued; " <>
+            "#{length(notified)} anomaly(ies) left unalerted for re-fire next run"
+        )
+
+        :error
+    end
+  end
+
+  defp enqueue_system_alert(payload, insert_fn) do
+    case %{payload: payload} |> ScaleAlertDeliveryWorker.new() |> insert_fn.() do
       {:ok, _job} ->
         :ok
 
@@ -667,7 +775,20 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
         Logger.warning(
           "IngestionHealthWorker: failed to enqueue system sweep-stall alert: #{inspect(reason)}"
         )
+
+        :error
     end
+  rescue
+    # `Oban.insert/1` RAISES on some failures (no Oban instance running, a job-args
+    # encoding fault) rather than returning an error tuple. Swallowing that raise here
+    # is safe precisely because `alerted` has not been flipped yet — the run re-fires.
+    error ->
+      Logger.warning(
+        "IngestionHealthWorker: failed to enqueue system sweep-stall alert " <>
+          "(#{inspect(error.__struct__)}): #{Exception.message(error)}"
+      )
+
+      :error
   end
 
   defp mark_alerted(anomaly) do
@@ -974,18 +1095,29 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     end
   end
 
-  # Fires a tenant-scoped knowledge.ingestion_anomaly_detected webhook. Ingestion
-  # anomalies are tenant-wide (no project), so project_id is nil — only tenant-wide
-  # webhook subscriptions match. Errors are logged, not raised (the anomaly is already
-  # persisted; losing the webhook must not lose the anomaly).
+  # Fires the tenant-scoped anomaly webhook on the event type that MATCHES the anomaly's
+  # domain (knowledge ingestion vs coordination retention). Ingestion anomalies are
+  # tenant-wide (no project), so project_id is nil — only tenant-wide webhook
+  # subscriptions match. Errors are logged, not raised (the anomaly is already persisted;
+  # losing the webhook must not lose the anomaly).
   defp fire_anomaly_webhook(tenant_id, anomaly) do
-    webhooks = EventGenerator.matching_webhooks(tenant_id, @webhook_event_type, nil)
+    event_type = webhook_event_type(anomaly)
+    webhooks = EventGenerator.matching_webhooks(tenant_id, event_type, nil)
 
     if webhooks != [] do
       payload = anomaly_webhook_payload(anomaly)
-      Enum.each(webhooks, &deliver_anomaly_event(tenant_id, &1, payload, anomaly.id))
+
+      Enum.each(
+        webhooks,
+        &deliver_anomaly_event(tenant_id, &1, event_type, payload, anomaly.id)
+      )
     end
   end
+
+  defp webhook_event_type(%IngestionAnomaly{anomaly_type: :sweep_stalled}),
+    do: @sweep_webhook_event_type
+
+  defp webhook_event_type(_anomaly), do: @webhook_event_type
 
   defp anomaly_webhook_payload(%IngestionAnomaly{anomaly_type: :high_reject_rate} = anomaly) do
     md = anomaly.metadata || %{}
@@ -1027,11 +1159,11 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     }
   end
 
-  defp deliver_anomaly_event(tenant_id, webhook, payload, anomaly_id) do
+  defp deliver_anomaly_event(tenant_id, webhook, event_type, payload, anomaly_id) do
     with {:ok, event} <-
            %WebhookEvent{tenant_id: tenant_id, webhook_id: webhook.id}
            |> WebhookEvent.create_changeset(%{
-             event_type: @webhook_event_type,
+             event_type: event_type,
              payload: payload
            })
            |> AdminRepo.insert(),
@@ -1042,7 +1174,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     else
       {:error, reason} ->
         Logger.warning(
-          "IngestionHealthWorker: failed to create #{@webhook_event_type} webhook event " <>
+          "IngestionHealthWorker: failed to create #{event_type} webhook event " <>
             "for anomaly #{anomaly_id}: #{inspect(reason)}"
         )
     end

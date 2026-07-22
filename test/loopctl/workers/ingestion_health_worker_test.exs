@@ -5,6 +5,7 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
   setup :verify_on_exit!
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
@@ -584,6 +585,108 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
       end)
     end
 
+    # The detector is deliberately isolated (its own rescue/catch) so a saturated
+    # AdminRepo pool cannot abort the sibling detectors — but with a log line as its ONLY
+    # signal, a persistently failing residue read would reproduce, one level up, the
+    # "visible only in logs / assumed healthy" failure #498 exists to close.
+    test "the detector's own failure emits telemetry AND leaves the sibling detectors running" do
+      tenant = fixture(:tenant)
+      seed_captures(tenant.id, "session_log", 5, @stale_hours)
+
+      handler = "test-#{inspect(make_ref())}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler,
+        Loopctl.TelemetryEvents.sweep_stall_detection_failed(),
+        fn name, measurements, metadata, _ ->
+          send(test_pid, {:telemetry, List.last(name), measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      # Break ONLY the residue read at the DB: a SESSION-LOCAL temp table shadows
+      # `channel_posts` on this connection (pg_temp is searched first) and lacks
+      # `expires_at`, so the detector's first statement raises. It vanishes on the
+      # sandbox rollback, so no concurrent async test can see it.
+      AdminRepo.query!("CREATE TEMP TABLE channel_posts (id uuid)")
+
+      log =
+        capture_log(fn ->
+          assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        end)
+
+      assert log =~ "sweep-stall detection failed"
+
+      assert_receive {:telemetry, :sweep_stall_detection_failed, %{count: 1},
+                      %{error_class: "Postgrex.Error"}}
+
+      # The isolation still holds: capture-silence flagging ran to completion.
+      assert Enum.any?(anomalies_for(tenant.id), &(&1.anomaly_type == :capture_silence))
+    end
+
+    # The at-MOST-once regression (#498 review): `alerted` used to be committed per
+    # candidate DURING flagging, while the only operator alert for the type was enqueued
+    # after the whole pipe. A dropped enqueue then left rows alerted with no alert ever
+    # emitted, and every later run took the silent update path — the alert was lost
+    # forever. The flip now happens ONLY after a successful enqueue.
+    test "a DROPPED system-alert enqueue leaves the anomaly unalerted so the next run re-fires" do
+      tenant = fixture(:tenant)
+      overdue_post(tenant.id, 24)
+
+      failing_insert = fn _job -> {:error, %Ecto.Changeset{valid?: false}} end
+
+      candidate = %{
+        tenant_id: tenant.id,
+        hours_stale: 24,
+        overdue_count: 1
+      }
+
+      anomaly =
+        fixture(:ingestion_anomaly, %{
+          tenant_id: tenant.id,
+          source_type: IngestionHealth.sweep_source_type(),
+          anomaly_type: :sweep_stalled,
+          last_event_at: nil,
+          hours_stale: 24,
+          sample_count: 1
+        })
+
+      log =
+        capture_log(fn ->
+          assert :error =
+                   IngestionHealthWorker.commit_sweep_system_alert(
+                     [{candidate, anomaly}],
+                     failing_insert
+                   )
+        end)
+
+      assert log =~ "left unalerted for re-fire next run"
+      refute AdminRepo.get!(IngestionAnomaly, anomaly.id).alerted
+
+      # ...and the very next hourly run re-fires it and only THEN marks it alerted.
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert [_] = all_enqueued(worker: ScaleAlertDeliveryWorker)
+      end)
+
+      assert AdminRepo.get!(IngestionAnomaly, anomaly.id).alerted
+    end
+
+    test "a SUCCESSFUL enqueue is what marks the participating anomalies alerted" do
+      tenant = fixture(:tenant)
+      overdue_post(tenant.id, 24)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert [_] = all_enqueued(worker: ScaleAlertDeliveryWorker)
+      end)
+
+      assert [%{alerted: true}] = sweep_anomalies(tenant.id)
+    end
+
     # A global-worker outage leaves residue in N tenants. Each gets its OWN anomaly row
     # (its retention really is unenforced), but the operator must get ONE alert saying
     # "the sweeper is down", not N identical ones.
@@ -682,13 +785,13 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
       assert is_nil(still_open.last_event_at)
     end
 
-    test "fires the per-tenant anomaly webhook for a stall when subscribed" do
+    test "fires the per-tenant anomaly webhook for a stall on its OWN event type" do
       tenant = fixture(:tenant)
 
       webhook =
         fixture(:webhook, %{
           tenant_id: tenant.id,
-          events: ["knowledge.ingestion_anomaly_detected"]
+          events: ["coordination.channel_post_sweep_stalled"]
         })
 
       overdue_post(tenant.id, 24)
@@ -706,6 +809,30 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
 
       assert length(events) == 1
       assert hd(events).payload["anomaly_type"] == "sweep_stalled"
+      assert hd(events).event_type == "coordination.channel_post_sweep_stalled"
+    end
+
+    # A retention event is not a knowledge-ingestion event: a tenant that subscribed to
+    # watch KB ingestion must not start receiving coordination-bus alerts (#498 review).
+    test "a knowledge.ingestion_anomaly_detected subscriber receives NO stall event" do
+      tenant = fixture(:tenant)
+
+      webhook =
+        fixture(:webhook, %{
+          tenant_id: tenant.id,
+          events: ["knowledge.ingestion_anomaly_detected"]
+        })
+
+      overdue_post(tenant.id, 24)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      assert from(e in Loopctl.Webhooks.WebhookEvent,
+               where: e.tenant_id == ^tenant.id and e.webhook_id == ^webhook.id
+             )
+             |> AdminRepo.all() == []
     end
 
     test "tenant isolation — tenant A's stalled sweep never flags tenant B" do

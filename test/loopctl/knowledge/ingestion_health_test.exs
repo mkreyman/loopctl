@@ -42,6 +42,18 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
   defp for_tenant(candidates, tenant_id),
     do: Enum.filter(candidates, &(&1.tenant_id == tenant_id))
 
+  # An OPEN (unresolved, active-episode) sweep-stall anomaly for the tenant.
+  defp open_sweep_anomaly(tenant_id) do
+    fixture(:ingestion_anomaly, %{
+      tenant_id: tenant_id,
+      source_type: IngestionHealth.sweep_source_type(),
+      anomaly_type: :sweep_stalled,
+      last_event_at: nil,
+      hours_stale: 12,
+      sample_count: 1
+    })
+  end
+
   describe "detect/0" do
     test "returns a candidate for an established + stale source_type" do
       tenant = fixture(:tenant)
@@ -781,22 +793,138 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
       assert candidate.hours_stale >= 48
     end
 
-    # A TRUNCATED scan proves the residue is at least sweep_scan_limit — larger than any
-    # sub-ceiling drain capacity — so it is backlog, not a stall. It also proves the read
-    # is BOUNDED: the cross-tenant aggregate never scans an unbounded overdue backlog on
-    # the small AdminRepo pool.
-    test "a truncated (capped) scan is treated as backlog, not a stall" do
+    # The scan is BOUNDED — the cross-tenant aggregate never reads an unbounded overdue
+    # backlog on the small AdminRepo pool — and hitting the cap is reported so recovery
+    # can refuse to close on an incomplete sample.
+    test "a capped scan reports truncation without vetoing the per-tenant decision" do
       tenant = fixture(:tenant)
       channel_post(tenant.id, -12)
 
-      assert IngestionHealth.detect_sweep_stalled(%{
-               sweep_staleness_hours: 6,
-               sweep_hard_stale_hours: 24,
-               sweep_drain_rate_per_hour: 12_000,
-               # One row scanned == the cap => truncated.
-               sweep_scan_limit: 1
-             })
-             |> for_tenant(tenant.id) == []
+      scan =
+        IngestionHealth.detect_sweep_stalled_scan(%{
+          sweep_staleness_hours: 6,
+          sweep_hard_stale_hours: 24,
+          sweep_drain_rate_per_hour: 12_000,
+          # One row scanned == the cap => truncated.
+          sweep_scan_limit: 1
+        })
+
+      assert scan.truncated?
+      assert scan.scanned <= 1
+      # A single unambiguously overdue row is still flagged: install-wide truncation
+      # (another tenant's backlog) must never blind detection for this tenant.
+      assert [_] = for_tenant(scan.candidates, tenant.id)
+    end
+
+    # The regression this replaces: `truncated?`/`scanned` were INSTALL-WIDE, so one
+    # tenant's channel_posts volume suppressed every OTHER tenant's sub-ceiling
+    # candidate — a cross-tenant denial-of-detection path against a release gate.
+    test "one tenant's saturating backlog does not blind detection for another tenant" do
+      quiet = fixture(:tenant)
+      noisy = fixture(:tenant)
+
+      # `quiet` holds the OLDEST row, so the oldest-first sample keeps it; `noisy`'s
+      # volume is what saturates the cap.
+      channel_post(quiet.id, -20)
+      for _ <- 1..3, do: channel_post(noisy.id, -12)
+
+      candidates =
+        IngestionHealth.detect_sweep_stalled(%{
+          sweep_staleness_hours: 6,
+          # Below the ceiling, so ONLY the capacity rule can decide.
+          sweep_hard_stale_hours: 240,
+          sweep_drain_rate_per_hour: 12_000,
+          # 4 rows scanned == the cap => the scan is truncated install-wide.
+          sweep_scan_limit: 4
+        })
+
+      # One unambiguously overdue row against 240k rows of drain capacity is a stall,
+      # regardless of what any other tenant is doing.
+      assert [_] = for_tenant(candidates, quiet.id)
+    end
+
+    # The capacity rule is only reachable when the bounded scan can OBSERVE a residue as
+    # large as the threshold it is compared against. Ship it violated and
+    # `sweep_drain_rate_per_hour` is an inert knob and the "merely BACKLOGGED" branch is
+    # dead code (it was, at 50_000 vs a 72_000 threshold — #498 review).
+    test "the shipped config keeps the drain-capacity rule reachable" do
+      assert IngestionHealth.sweep_scan_limit() >
+               IngestionHealth.sweep_drain_rate_per_hour() *
+                 IngestionHealth.sweep_staleness_hours()
+    end
+  end
+
+  describe "detect_sweep_stalled_scan/1 + auto_resolve_recovered_sweep_stalled/1 (#498)" do
+    test "the scan reports RAW residue tenants, including ones excused as backlogged" do
+      tenant = fixture(:tenant)
+      channel_post(tenant.id, -12)
+
+      scan =
+        IngestionHealth.detect_sweep_stalled_scan(%{
+          sweep_staleness_hours: 6,
+          sweep_hard_stale_hours: 24,
+          # 0 capacity => excused as backlog, so NOT a candidate...
+          sweep_drain_rate_per_hour: 0,
+          sweep_scan_limit: 50_000
+        })
+
+      assert for_tenant(scan.candidates, tenant.id) == []
+      # ...but the residue is still there, which is what recovery must key on.
+      assert MapSet.member?(scan.residue_tenant_ids, tenant.id)
+    end
+
+    test "a tenant excused as backlogged is NOT closed as recovered" do
+      tenant = fixture(:tenant)
+      channel_post(tenant.id, -12)
+      open = open_sweep_anomaly(tenant.id)
+
+      scan =
+        IngestionHealth.detect_sweep_stalled_scan(%{
+          sweep_staleness_hours: 6,
+          sweep_hard_stale_hours: 24,
+          sweep_drain_rate_per_hour: 0,
+          sweep_scan_limit: 50_000
+        })
+
+      assert IngestionHealth.auto_resolve_recovered_sweep_stalled(scan) == 0
+
+      reloaded = AdminRepo.get!(IngestionAnomaly, open.id)
+      refute reloaded.resolved
+      assert is_nil(reloaded.last_event_at)
+    end
+
+    test "a TRUNCATED scan closes nothing (absence in the sample is not absence on the table)" do
+      tenant = fixture(:tenant)
+      other = fixture(:tenant)
+      # `other` holds the older residue, so an oldest-first capped scan can miss `tenant`.
+      channel_post(other.id, -48)
+      open = open_sweep_anomaly(tenant.id)
+
+      scan =
+        IngestionHealth.detect_sweep_stalled_scan(%{
+          sweep_staleness_hours: 6,
+          sweep_hard_stale_hours: 24,
+          sweep_drain_rate_per_hour: 12_000,
+          sweep_scan_limit: 1
+        })
+
+      assert scan.truncated?
+      assert IngestionHealth.auto_resolve_recovered_sweep_stalled(scan) == 0
+      refute AdminRepo.get!(IngestionAnomaly, open.id).resolved
+    end
+
+    test "a genuinely drained tenant IS closed on a complete scan" do
+      tenant = fixture(:tenant)
+      open = open_sweep_anomaly(tenant.id)
+
+      scan = IngestionHealth.detect_sweep_stalled_scan()
+
+      refute scan.truncated?
+      assert IngestionHealth.auto_resolve_recovered_sweep_stalled(scan) == 1
+
+      closed = AdminRepo.get!(IngestionAnomaly, open.id)
+      assert closed.resolved
+      assert %DateTime{} = closed.last_event_at
     end
   end
 
