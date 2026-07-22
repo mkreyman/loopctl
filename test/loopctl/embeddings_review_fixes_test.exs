@@ -57,8 +57,12 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
     assert Embeddings.side_table_reads_enabled?()
   end
 
-  defp vec(dim), do: List.duplicate(1.0, div(dim, 2)) ++ List.duplicate(0.0, div(dim, 2))
-  defp far_vec(dim), do: List.duplicate(0.0, div(dim, 2)) ++ List.duplicate(1.0, div(dim, 2))
+  # Per-test-unique via `Loopctl.DataCase.test_vec/2` (dissolves the shared-HNSW-index
+  # clique; see its @doc). `vec` == `:primary` (cosine 1.0), `far_vec` == `:orthogonal`
+  # (cosine 0). NOTE: a 3072-dim vector has no supported HNSW index; test_vec still returns a
+  # valid sparse vector for the dimension-rejection tests that never index it.
+  defp vec(dim), do: test_vec(dim, :primary)
+  defp far_vec(dim), do: test_vec(dim, :orthogonal)
 
   defp content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
 
@@ -615,10 +619,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       assert is_binary(original_hash)
       assert Embeddings.stale_system_articles(tenant.id, 1536) == []
 
-      AdminRepo.query!(
-        "UPDATE articles SET body = $1, updated_at = NOW() + interval '1 second' WHERE id = $2",
-        ["a materially different body", Ecto.UUID.dump!(article.id)]
-      )
+      stamp_article_newer(article.id, body: "a materially different body")
 
       assert Enum.map(Embeddings.stale_system_articles(tenant.id, 1536), & &1.id) == [article.id]
 
@@ -636,12 +637,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
 
       assert :ok = perform_job(SystemCorpusEmbeddingWorker, %{"tenant_id" => tenant.id})
 
-      AdminRepo.query!(
-        "UPDATE articles SET updated_at = NOW() + interval '1 second' WHERE id = $1",
-        [
-          Ecto.UUID.dump!(article.id)
-        ]
-      )
+      stamp_article_newer(article.id)
 
       assert Enum.map(Embeddings.stale_system_articles(tenant.id, 1536), & &1.id) == [article.id]
 
@@ -821,6 +817,34 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   end
 
   # A SYSTEM-scoped article: `tenant_id IS NULL`, `scope: :system`.
+  # Stamp an article's `updated_at` STRICTLY after its embedding, using an app-side
+  # UTC timestamp — the SAME basis the embedding worker writes with
+  # (`DateTime.utc_now()`). Do NOT use Postgres `NOW()` here: `articles.updated_at`
+  # is `timestamp WITHOUT time zone`, and a `timestamptz` `NOW()` coerced into it is
+  # converted to the SESSION timezone and stored naive. On a non-UTC server (e.g. a
+  # dev box in America/Denver, UTC-6) that value lands HOURS behind the UTC timestamp
+  # the worker wrote, so `ae.updated_at < a.updated_at` is false and the article
+  # never looks stale — a deterministic local failure that passes on CI only because
+  # CI runs Postgres in UTC. Binding an explicit naive-UTC value removes the
+  # ambient-timezone dependency entirely.
+  defp stamp_article_newer(article_id, opts \\ []) do
+    newer = NaiveDateTime.add(NaiveDateTime.utc_now(), 1, :second)
+
+    case Keyword.fetch(opts, :body) do
+      {:ok, body} ->
+        AdminRepo.query!(
+          "UPDATE articles SET body = $1, updated_at = $2 WHERE id = $3",
+          [body, newer, Ecto.UUID.dump!(article_id)]
+        )
+
+      :error ->
+        AdminRepo.query!(
+          "UPDATE articles SET updated_at = $1 WHERE id = $2",
+          [newer, Ecto.UUID.dump!(article_id)]
+        )
+    end
+  end
+
   defp system_article(opts \\ []) do
     status = Keyword.get(opts, :status, :published)
     now = DateTime.utc_now()

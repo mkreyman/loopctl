@@ -13,31 +13,20 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
   # Vectors pointing in the same direction have cosine distance 0 (similarity 1).
   # Orthogonal vectors have cosine distance 1 (similarity 0).
 
-  # A helper that creates a 1536-dim vector with a known pattern.
-  # `direction` controls which "axis group" the vector points toward.
-  defp make_embedding(:close) do
-    # Close to query: mostly 1s in the first half, 0s elsewhere
-    List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
-  end
+  # Per-test-unique vectors via `Loopctl.DataCase.test_vec/2` (see its @doc): each test's
+  # vectors land in a DISJOINT window of the shared, cross-tenant pgvector HNSW index, so the
+  # `half_ones`/orthogonal/constant vectors these tests share no longer form the all-ties
+  # clique that flakes recall. Within a test the geometry is preserved: `:close`==`:query`
+  # (cosine 1.0), `:far`⊥query (cosine 0), `:medium` ~0.71.
+  defp make_embedding(:close), do: test_vec(1536, :primary)
+  defp make_embedding(:far), do: test_vec(1536, :orthogonal)
+  defp make_embedding(:query), do: test_vec(1536, :primary)
+  defp make_embedding(:medium), do: test_vec(1536, :near)
 
-  defp make_embedding(:far) do
-    # Far from query: mostly 0s in the first half, 1s elsewhere
-    List.duplicate(0.0, 768) ++ List.duplicate(1.0, 768)
-  end
-
-  defp make_embedding(:query) do
-    # Query vector: same direction as :close
-    List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
-  end
-
-  defp make_embedding(:medium) do
-    # In between — equal parts of both
-    List.duplicate(0.5, 768) ++ List.duplicate(0.5, 768)
-  end
-
-  defp make_embedding(:uniform) do
-    List.duplicate(0.1, 1536)
-  end
+  # The identical-score test seeds many rows with THIS one vector and queries it; keeping them
+  # all identical (now per-test-unique) preserves the equal-scores semantics while de-cliquing
+  # the old degenerate constant (`List.duplicate(0.1, 1536)` — the KB-0bdadd52 anti-pattern).
+  defp make_embedding(:uniform), do: test_vec(1536, :primary)
 
   defp setup_tenant do
     tenant = fixture(:tenant)
@@ -1558,8 +1547,12 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
           :medium
         )
 
+      # Pin the query vector to THIS process's axis (the semantic lane's embedding is
+      # generated in a spawned worker without this process's :test_vec_axis).
+      query_embedding = make_embedding(:query)
+
       Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
-        {:ok, make_embedding(:query)}
+        {:ok, query_embedding}
       end)
 
       {:ok, %{results: results}} =
@@ -2065,8 +2058,14 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
         :close
       )
 
+      # Bind the query vector in THIS process: the embedding stub is invoked from a
+      # spawned worker (Mox $callers allowance, but NOT this process's :test_vec_axis),
+      # so `make_embedding(:query)` computed lazily there would use axis 0 and miss the
+      # article's per-test window. Capturing it here pins it to the same axis.
+      query_embedding = make_embedding(:query)
+
       Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
-        {:ok, make_embedding(:query)}
+        {:ok, query_embedding}
       end)
 
       {:ok, %{results: [first | _]}} = Knowledge.get_context(tenant.id, "absolute relevance")
@@ -2106,8 +2105,12 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
         set: [updated_at: ninety_days_ago]
       )
 
+      # See the note above: pin the query vector to THIS process's axis so the
+      # spawned embedding worker returns a vector in the articles' window.
+      query_embedding = make_embedding(:query)
+
       Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
-        {:ok, make_embedding(:query)}
+        {:ok, query_embedding}
       end)
 
       {:ok, %{results: results}} =

@@ -42,14 +42,14 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
 
-  # A "direction" + a midpoint, mirroring the pattern in knowledge_hybrid_test.exs
-  # / knowledge_semantic_search_test.exs: cosine similarity of identical
-  # directions is 1.0, and the midpoint sits at ~0.7033 to it — deterministic
-  # enough to sit safely below the 0.75 default threshold without
-  # floating-point flakiness, while still representing a genuinely near
-  # (not orthogonal) chunk.
-  @direction_a List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
-  @direction_medium List.duplicate(0.5, 768) ++ List.duplicate(0.5, 768)
+  # A "direction" + a midpoint, mirroring knowledge_hybrid_test.exs /
+  # knowledge_semantic_search_test.exs: cosine of identical directions is 1.0, and the
+  # midpoint sits at ~0.71 — safely below the 0.75 default threshold while still a genuinely
+  # near (not orthogonal) chunk. Sourced per-test from `Loopctl.DataCase.test_vec/2`
+  # (functions, not compile-time attributes) so each test's vectors occupy a DISJOINT window
+  # of the shared HNSW index — dissolving the all-ties clique that flakes recall.
+  defp direction_a, do: test_vec(1536, :primary)
+  defp direction_medium, do: test_vec(1536, :near)
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
@@ -102,10 +102,10 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
           title: "Refund Policy Guide",
           body: "Our refund policy allows returns within 30 days for a full refund."
         })
-        |> then(&set_embedding(tenant.id, &1, @direction_a))
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
 
       # A fuzzy, non-curated chunk that sits NEAR the query in embedding space
-      # (@direction_medium, ~0.7033 cosine to the query — the same near-miss
+      # (direction_medium(), ~0.7033 cosine to the query — the same near-miss
       # vector used by the below-threshold test further down) rather than
       # orthogonal to it. This is what docs/knowledge-hybrid-retrieval.md:20-26
       # actually describes as the harvested failure: a chunk close enough that
@@ -121,10 +121,10 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
           body: "How long orders take to ship across different carriers.",
           status: :published
         })
-        |> then(&set_embedding(tenant.id, &1, @direction_medium))
+        |> then(&set_embedding(tenant.id, &1, direction_medium()))
 
       query = "refund policy"
-      stub_embeddings_by_query(%{query => @direction_a})
+      stub_embeddings_by_query(%{query => direction_a()})
 
       # (a) WITH the curated article present: it wins :curated, is hoisted to
       # the front, and the unrelated chunk is NOT what the caller is handed as
@@ -181,10 +181,10 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
       near_but_wrong =
         tenant.id
         |> curated_article(%{title: "Shipping Refund Process"})
-        |> then(&set_embedding(tenant.id, &1, @direction_medium))
+        |> then(&set_embedding(tenant.id, &1, direction_medium()))
 
       query = "what is the refund policy?"
-      stub_embeddings_by_query(%{query => @direction_a})
+      stub_embeddings_by_query(%{query => direction_a()})
 
       assert {:ok, %{results: results, meta: meta}} =
                Knowledge.hybrid_search(tenant.id, query, keyword_weight: 0, semantic_weight: 1)
@@ -206,8 +206,8 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
       Knowledge.reset_circuit_breaker(curated_tenant.id)
 
       curated = curated_article(curated_tenant.id, %{title: "Deploy Guide Curated"})
-      set_embedding(curated_tenant.id, curated, @direction_a)
-      stub_embeddings_by_query(%{"deploy guide" => @direction_a})
+      set_embedding(curated_tenant.id, curated, direction_a())
+      stub_embeddings_by_query(%{"deploy guide" => direction_a()})
 
       assert {:ok, %{meta: curated_meta}} =
                Knowledge.hybrid_search(curated_tenant.id, "deploy guide",
@@ -253,7 +253,7 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
           title: "Tenant A Refund Policy",
           body: "Tenant A's confidential refund policy details."
         })
-        |> then(&set_embedding(tenant_a.id, &1, @direction_a))
+        |> then(&set_embedding(tenant_a.id, &1, direction_a()))
 
       # tenant_b is seeded with its OWN decoy on the SAME axis, so this proves
       # tenant A's curated article does not intermingle into a populated tenant
@@ -268,10 +268,10 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
           title: "Tenant B Refund Policy",
           body: "Tenant B's own refund policy on the same axis as tenant A's."
         })
-        |> then(&set_embedding(tenant_b.id, &1, @direction_a))
+        |> then(&set_embedding(tenant_b.id, &1, direction_a()))
 
       query = "refund policy"
-      stub_embeddings_by_query(%{query => @direction_a})
+      stub_embeddings_by_query(%{query => direction_a()})
 
       assert {:ok, %{results: results_b, meta: meta_b}} =
                Knowledge.hybrid_search(tenant_b.id, query, keyword_weight: 0, semantic_weight: 1)
@@ -330,7 +330,7 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
           title: "Tenant A HTTP Refund Policy",
           body: "Tenant A's confidential refund policy details over HTTP."
         })
-        |> then(&set_embedding(tenant_a.id, &1, @direction_a))
+        |> then(&set_embedding(tenant_a.id, &1, direction_a()))
 
       tenant_b = fixture(:tenant)
       Knowledge.reset_circuit_breaker(tenant_b.id)
@@ -342,10 +342,10 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
           title: "Tenant B HTTP Refund Policy",
           body: "Tenant B's own refund policy over HTTP."
         })
-        |> then(&set_embedding(tenant_b.id, &1, @direction_a))
+        |> then(&set_embedding(tenant_b.id, &1, direction_a()))
 
       query = "refund policy"
-      stub_embeddings_by_query(%{query => @direction_a})
+      stub_embeddings_by_query(%{query => direction_a()})
 
       conn =
         conn
@@ -424,7 +424,7 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
       conflicted =
         tenant.id
         |> curated_article(%{title: "Conflicted Curated Answer"})
-        |> then(&set_embedding(tenant.id, &1, @direction_a))
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
 
       rival =
         fixture(:article, %{tenant_id: tenant.id, status: :published, title: "Rival Answer"})
@@ -438,7 +438,7 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
       })
 
       query = "conflicted curated answer topic"
-      stub_embeddings_by_query(%{query => @direction_a})
+      stub_embeddings_by_query(%{query => direction_a()})
 
       assert {:ok, %{results: results, meta: meta}} =
                Knowledge.hybrid_search(tenant.id, query, keyword_weight: 0, semantic_weight: 1)

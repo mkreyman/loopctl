@@ -41,6 +41,10 @@ defmodule Loopctl.DataCase do
     Loopctl.DataCase.setup_sandbox(tags)
     Mox.set_mox_from_context(tags)
     stub_all_defaults()
+    # Per-test embedding axis: every test gets a UNIQUE integer, so `test_vec/2` places
+    # this test's vectors in a disjoint window of the shared pgvector HNSW index. Setup
+    # runs in the test process, so `Process.get(:test_vec_axis)` at insert time sees it.
+    Process.put(:test_vec_axis, System.unique_integer([:positive]))
     :ok
   end
 
@@ -360,6 +364,59 @@ defmodule Loopctl.DataCase do
       end)
     end)
   end
+
+  # The per-test embedding window width. Each test claims a disjoint pair of windows
+  # (`:primary` at `base_p`, `:orthogonal` at `base_s = base_p + @test_vec_window`),
+  # so two tests are exactly ORTHOGONAL and never share coordinates.
+  @test_vec_window 8
+
+  @doc """
+  Per-test-unique embedding vector for pgvector recall tests.
+
+  The shared, cross-tenant pgvector HNSW index (`article_embeddings` / `memory_embeddings`)
+  is a single physical structure. When many tests seed the SAME fixed vector (e.g. a
+  `half_ones` `[1×768, 0×768]`), those identical rows — live in-transaction plus
+  rolled-back-but-unvacuumed dead tuples across a full suite — form an all-ties CLIQUE the
+  approximate ANN graph walk cannot navigate, so a genuinely-near neighbour is intermittently
+  evicted before the tenant filter runs. That is the shared-index recall flake (issue #421 /
+  the AC-41.1.5 side-table ranking flake).
+
+  Keying each test's vectors on its unique `:test_vec_axis` (set in setup) into DISJOINT sparse
+  windows makes different tests exactly ORTHOGONAL — no cross-test clique AND no crowding (a
+  dense per-test rotation was tried and FAILS: rotated dense vectors sit nearer the query than a
+  0.71 neighbour and fill the `ef_search` budget). Within a single test the geometry is
+  preserved: `:primary`/`:query`/`:close` are identical (cosine 1.0), `:near` overlaps half the
+  primary window (cosine ~0.71), and `:orthogonal` shares no dimension with `:primary` (cosine 0).
+
+  Kinds (aliases group by MEANING so call sites read naturally):
+
+    * `:primary` | `:query` | `:close` | `:self` | `:similar` | `:base` — the primary window
+    * `:near` — half the primary window (a strictly-worse but genuinely-near neighbour, ~0.71)
+    * `:orthogonal` | `:secondary` | `:dissimilar` | `:complement` — the disjoint window (⊥ primary)
+  """
+  @spec test_vec(pos_integer(), atom()) :: [float()]
+  def test_vec(dim, kind \\ :primary) do
+    axis = Process.get(:test_vec_axis, 0)
+    slots = max(div(dim, @test_vec_window * 2), 1)
+    base_p = rem(axis, slots) * @test_vec_window * 2
+    base_s = base_p + @test_vec_window
+
+    case kind do
+      k when k in [:primary, :query, :close, :self, :similar, :base] ->
+        test_vec_ones(dim, base_p, @test_vec_window)
+
+      :near ->
+        test_vec_ones(dim, base_p, div(@test_vec_window, 2))
+
+      k when k in [:orthogonal, :secondary, :dissimilar, :complement] ->
+        test_vec_ones(dim, base_s, @test_vec_window)
+    end
+  end
+
+  defp test_vec_ones(dim, base, ones),
+    do:
+      List.duplicate(0.0, base) ++
+        List.duplicate(1.0, ones) ++ List.duplicate(0.0, dim - base - ones)
 
   # A DETERMINISTIC per-TENANT embedding for the default MockEmbeddingClient stubs
   # (stub_all_defaults/0). Returns a 1536-dim vector that is a PURE FUNCTION of the

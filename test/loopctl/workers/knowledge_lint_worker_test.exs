@@ -35,15 +35,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
     |> AdminRepo.update!()
   end
 
-  # Two near-identical directional vectors -> cosine similarity ~1.0, above the
-  # 0.6 linking threshold. (Cosine measures direction, not magnitude.)
-  defp similar_embedding, do: List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
+  # Two near-identical directional vectors -> cosine similarity ~1.0, above the 0.6 linking
+  # threshold. Per-test-unique via `Loopctl.DataCase.test_vec/2` (dissolves the shared-HNSW-index
+  # clique; see its @doc): `near_similar` adds a tiny orthogonal-window perturbation (~0.9999).
+  defp similar_embedding, do: test_vec(1536, :primary)
 
   defp near_similar_embedding do
-    List.duplicate(1.0, 768)
-    |> List.update_at(0, fn _ -> 0.99 end)
-    |> List.update_at(1, fn _ -> 1.01 end)
-    |> Kernel.++(List.duplicate(0.01, 768))
+    primary = test_vec(1536, :primary)
+    orthogonal = test_vec(1536, :orthogonal)
+    Enum.zip_with(primary, orthogonal, fn p, o -> p + 0.01 * o end)
   end
 
   # A published orphan with NO embedding — the case a plain re-link no-ops on.

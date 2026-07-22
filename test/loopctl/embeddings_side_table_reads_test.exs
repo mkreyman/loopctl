@@ -45,38 +45,17 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
     assert Embeddings.side_table_reads_enabled?()
   end
 
-  # Deterministic, well-separated vectors: `:close` and `:query` are identical
-  # (cosine distance 0); `:far` is a STRICTLY WORSE but still genuinely NEAR
-  # neighbour (cosine similarity ~0.71 — it shares a quarter of the query's
-  # non-zero dimensions).
-  #
-  # `:far` was ORTHOGONAL (similarity 0.0, the worst rank expressible) and that made
-  # the ranking test flake ~8/10. Two independent mechanisms punish a worst-case
-  # vector, and neither is a defect:
-  #
-  #   1. HNSW is an APPROXIMATE index. Its graph traversal is not obliged to reach
-  #      the most distant point in the set, and the graph's shape depends on
-  #      insertion order, so "does the single worst match come back" is a coin flip
-  #      by construction — not something an ANN read path ever promises.
-  #   2. AC-41.1.7 makes the semantic read path materialize the SYSTEM corpus on
-  #      demand, and the Epic 26 bootstrap migrations seed a system-scoped article
-  #      set into EVERY database, CI included (20260411231009_seed_epic_26_phase_0_
-  #      articles and siblings). Under `testing: :inline` that runs SYNCHRONOUSLY
-  #      inside the search, so those rows join the pool — and every one of them
-  #      (positive similarity) outranks an orthogonal vector.
-  #
-  # Ranking is what AC-41.1.5 is about, so `:far` is now near enough that HNSW
-  # reliably finds it and it reliably sorts BELOW `:close`. Keep it a real
-  # neighbour; do not restore the orthogonal form.
-  defp vec(dim, :close), do: half_ones(dim)
-  defp vec(dim, :query), do: half_ones(dim)
-
-  defp vec(dim, :far) do
-    quarter = div(dim, 4)
-    List.duplicate(1.0, quarter) ++ List.duplicate(0.0, dim - quarter)
-  end
-
-  defp half_ones(dim), do: List.duplicate(1.0, div(dim, 2)) ++ List.duplicate(0.0, div(dim, 2))
+  # Per-test-unique vectors via `Loopctl.DataCase.test_vec/2` (see its @doc). `:close`
+  # and `:query` are identical (cosine 1.0); `:far` is a strictly-worse but genuinely
+  # NEAR neighbour (`:near`, cosine ~0.71). Keying every test's vectors into a disjoint
+  # window is what dissolves the shared-HNSW-index clique that made this ranking test
+  # flake on CI — a fixed `half_ones` vector shared across ~50 uses in this file (plus
+  # siblings) formed an all-ties clique the approximate ANN walk could not navigate, so
+  # `:far` was intermittently evicted before the tenant filter ran. Do NOT reintroduce a
+  # fixed/global vector here.
+  defp vec(dim, :close), do: test_vec(dim, :primary)
+  defp vec(dim, :query), do: test_vec(dim, :primary)
+  defp vec(dim, :far), do: test_vec(dim, :near)
 
   defp embedded_article(tenant_id, attrs, kind, dim) do
     article = fixture(:article, Map.merge(%{tenant_id: tenant_id, status: :published}, attrs))
