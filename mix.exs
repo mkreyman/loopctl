@@ -13,6 +13,29 @@ defmodule Loopctl.MixProject do
       escript: escript(),
       releases: releases(),
       listeners: [Phoenix.CodeReloader],
+      # `mix hex.audit` (hex.pm's official EEF advisory feed) is the dependency
+      # security gate, in `precommit` and the Security CI job. It caught the
+      # 2026-07 postgrex/decimal/cowlib advisories that the previously-wired
+      # mix_audit (curated GHSA mirror) missed and that its runtime clone could
+      # fail-open on. Advisories with NO reachable fix are acknowledged here;
+      # hex.audit warns when an entry stops matching, so stale ones surface.
+      hex: [
+        ignore_advisories: [
+          # cowlib 2.18.0 — no patched release exists (2.18.0 is the latest
+          # cowlib), so there is nothing to bump to. cowlib is compiled into the
+          # release as an optional transitive of phoenix / websock_adapter /
+          # open_api_spex / telemetry_metrics_prometheus, but the ONLY component
+          # that starts a Cowboy listener is the TelemetryMetricsPrometheus
+          # reporter on the internal :9568 metrics port (prod-only, Fly private
+          # 6PN). The public API serves on Bandit, never cowboy. That metrics
+          # endpoint sets no cookies and reflects no untrusted structured
+          # headers, so neither vector is reachable. Recheck when cowlib > 2.18.0.
+          # CVE-2026-43966 (GHSA-w4f7-4cxr-rv3c, MEDIUM): HTTP response splitting.
+          "CVE-2026-43966",
+          # CVE-2026-43969 (GHSA-g2wm-735q-3f56, LOW): cookie header injection.
+          "CVE-2026-43969"
+        ]
+      ],
       dialyzer: [
         plt_add_apps: [:mix, :ex_unit, :ecto, :ecto_sql],
         plt_file: {:no_warn, "priv/plts/dialyzer.plt"},
@@ -64,6 +87,11 @@ defmodule Loopctl.MixProject do
       {:phoenix_live_view, "~> 1.0"},
       {:ecto_sql, "~> 3.13"},
       {:postgrex, ">= 0.0.0"},
+      # decimal 3.x fixes CVE-2026-32686 (unbounded-exponent DoS). ecto already
+      # allows ~> 3.0; the override lifts open_api_spex's stale optional cap
+      # (~> 1.0 or ~> 2.0), which has no 3.0 support yet. open_api_spex only uses
+      # Decimal for JSON-schema number casting, a 3.x-compatible surface.
+      {:decimal, "~> 3.1", override: true},
       {:esbuild, "~> 0.8", runtime: Mix.env() == :dev},
       {:tailwind, "~> 0.2", runtime: Mix.env() == :dev},
       {:telemetry_metrics, "~> 1.0"},
@@ -124,7 +152,6 @@ defmodule Loopctl.MixProject do
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
-      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
 
       # Dev tooling — runtime introspection MCP (dev-only; mounts /tidewave/mcp)
       {:tidewave, "~> 0.6", only: :dev}
@@ -148,7 +175,7 @@ defmodule Loopctl.MixProject do
         "format --check-formatted",
         "credo --strict",
         "loopctl.check_skill_citations",
-        "deps.audit --ignore-file .mix_audit_ignore",
+        "hex.audit",
         "dialyzer",
         "test"
       ]

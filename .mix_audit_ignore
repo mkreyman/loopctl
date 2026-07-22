@@ -1,9 +1,0 @@
-# mix_audit ignore list — advisories with no in-constraint fix available.
-# Reviewed 2026-06-18. Each entry MUST stay justified; drop it the moment a
-# patched version becomes reachable. Consumed by `mix deps.audit --ignore-file`
-# (wired into the `precommit` alias in mix.exs).
-#
-# decimal 2.4.1 — Unbounded exponent in Decimal.new enables DoS. Fixed in 3.0.0,
-#   but ecto pins `decimal ~> 2.0`, so 3.0.0 is unreachable until ecto supports
-#   it. We do not call Decimal.new on untrusted input.
-GHSA-rhv4-8758-jx7v
