@@ -213,7 +213,11 @@ config :loopctl, :ingestion_health,
   # Retention (days) for the append-only `ingestion_write_stats` rollup; the hourly
   # worker prunes older rows so the table (and the cross-tenant reject-rate scan) stays
   # bounded. Only the rolling `reject_window_days` window is ever read.
-  write_stats_retention_days: 90
+  write_stats_retention_days: 90,
+  # #498 (retention-sweep stall detector): grace hours past `expires_at` after which a
+  # still-present `channel_posts` row means the US-39.5 sweep is not being enforced for
+  # that tenant. The sweep runs every 5 minutes, so 6h is ~72 consecutive missed runs.
+  sweep_staleness_hours: 6
 
 # US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
 # defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/

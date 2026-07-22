@@ -8,6 +8,7 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionHealth
   alias Loopctl.Workers.IngestionHealthWorker
@@ -414,6 +415,220 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
       assert anomaly.source_type == IngestionHealth.unstamped_source_type()
       assert anomaly.metadata["total_attempts"] == 10
       assert anomaly.metadata["rejects"] == 8
+    end
+  end
+
+  # --- Retention-sweep stall detection (issue #498, AC-39.5.5) ---------------------
+  #
+  # The absence-of-success half: a ChannelPostSweeper that stops running emits NO
+  # failure telemetry, so the only observable evidence is expired channel_posts rows
+  # that are still present. Grace window is pinned at 6h by config/test.exs.
+
+  # No channel_post fixture exists (create_post/4 always stamps expires_at at now+30d),
+  # so insert ChannelPost structs directly on the BYPASSRLS AdminRepo — the same idiom
+  # the ChannelPostSweeper spec uses — to control expires_at.
+  defp overdue_post(tenant_id, hours_overdue) do
+    project = fixture(:project, %{tenant_id: tenant_id})
+    agent = fixture(:agent, %{tenant_id: tenant_id})
+
+    %ChannelPost{
+      tenant_id: tenant_id,
+      project_id: project.id,
+      agent_id: agent.id,
+      body: "post",
+      expires_at: DateTime.add(DateTime.utc_now(), -hours_overdue, :hour)
+    }
+    |> AdminRepo.insert!()
+  end
+
+  defp sweep_anomalies(tenant_id) do
+    tenant_id |> anomalies_for() |> Enum.filter(&(&1.anomaly_type == :sweep_stalled))
+  end
+
+  describe "perform/1 — retention-sweep stall detection (TC-39.5.9+)" do
+    test "flags a tenant whose expired channel posts outlived the grace window" do
+      tenant = fixture(:tenant)
+      overdue_post(tenant.id, 24)
+      overdue_post(tenant.id, 10)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert length(all_enqueued(worker: ScaleAlertDeliveryWorker)) == 1
+      end)
+
+      [anomaly] = sweep_anomalies(tenant.id)
+      assert anomaly.source_type == IngestionHealth.sweep_source_type()
+      assert anomaly.sample_count == 2
+      assert anomaly.hours_stale >= 24
+      assert anomaly.resolved == false
+      # The stall episode is ACTIVE until recovery stamps last_event_at.
+      assert is_nil(anomaly.last_event_at)
+      assert anomaly.metadata["overdue_count"] == 2
+
+      assert detected_audit_count(tenant.id, IngestionHealth.sweep_source_type()) == 1
+    end
+
+    test "does not flag expired rows still inside the grace window" do
+      tenant = fixture(:tenant)
+      # Expired 1h ago — the sweep has 6h of grace before it counts as stalled.
+      overdue_post(tenant.id, 1)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        refute_enqueued(worker: ScaleAlertDeliveryWorker)
+      end)
+
+      assert sweep_anomalies(tenant.id) == []
+    end
+
+    test "a second run on the same stall updates in place and does NOT re-alert" do
+      tenant = fixture(:tenant)
+      overdue_post(tenant.id, 24)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+        assert length(all_enqueued(worker: ScaleAlertDeliveryWorker)) == 1
+      end)
+
+      assert length(sweep_anomalies(tenant.id)) == 1
+      assert detected_audit_count(tenant.id, IngestionHealth.sweep_source_type()) == 1
+    end
+
+    test "re-fires a lost operator alert for an unresolved-but-unalerted row" do
+      tenant = fixture(:tenant)
+      overdue_post(tenant.id, 24)
+
+      # Simulate a crash between the atomic insert and the post-commit enqueues.
+      anomaly =
+        fixture(:ingestion_anomaly, %{
+          tenant_id: tenant.id,
+          source_type: IngestionHealth.sweep_source_type(),
+          anomaly_type: :sweep_stalled,
+          last_event_at: nil,
+          hours_stale: 24,
+          sample_count: 1
+        })
+
+      refute anomaly.alerted
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert_enqueued(worker: ScaleAlertDeliveryWorker)
+      end)
+
+      [reloaded] = sweep_anomalies(tenant.id)
+      assert reloaded.alerted == true
+    end
+
+    test "auto-closes an open stall once the sweep drains the backlog" do
+      tenant = fixture(:tenant)
+      post = overdue_post(tenant.id, 24)
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      [open] = sweep_anomalies(tenant.id)
+      assert open.resolved == false
+
+      # The sweep recovers and deletes the backlog — no overdue rows remain.
+      AdminRepo.delete!(post)
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+      [closed] = sweep_anomalies(tenant.id)
+      assert closed.resolved == true
+      # Recovery stamps last_event_at (episode ended) so the row stops suppressing a
+      # FUTURE stall — without this the type would freeze open forever, since both
+      # pre-existing auto-resolvers are scoped to the other anomaly_types.
+      assert %DateTime{} = closed.last_event_at
+    end
+
+    test "an archived stall anomaly suppresses re-detection" do
+      tenant = fixture(:tenant)
+      overdue_post(tenant.id, 24)
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      [anomaly] = sweep_anomalies(tenant.id)
+      assert {:ok, _} = IngestionHealth.archive_anomaly(tenant.id, anomaly.id)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert all_enqueued(worker: ScaleAlertDeliveryWorker) == []
+      end)
+
+      assert length(sweep_anomalies(tenant.id)) == 1
+    end
+
+    test "operator-alert payload conforms to the ScaleAlert contract" do
+      tenant = fixture(:tenant)
+      overdue_post(tenant.id, 24)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+        [job] = all_enqueued(worker: ScaleAlertDeliveryWorker)
+        payload = job.args["payload"]
+
+        assert payload["alert"] == "coordination.channel_post_sweep_stalled"
+        assert payload["metric"] == "coordination.channel_post_sweep_stalled.hours_stale"
+        assert payload["value"] >= 24
+        assert payload["threshold"] == IngestionHealth.sweep_staleness_hours()
+        assert payload["window_seconds"] == IngestionHealth.sweep_staleness_hours() * 3600
+        assert payload["tenant_id"] == tenant.id
+        assert payload["overdue_count"] == 1
+        assert is_binary(payload["at"])
+      end)
+    end
+
+    test "fires the per-tenant anomaly webhook for a stall when subscribed" do
+      tenant = fixture(:tenant)
+
+      webhook =
+        fixture(:webhook, %{
+          tenant_id: tenant.id,
+          events: ["knowledge.ingestion_anomaly_detected"]
+        })
+
+      overdue_post(tenant.id, 24)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert_enqueued(worker: WebhookDeliveryWorker, args: %{tenant_id: tenant.id})
+      end)
+
+      events =
+        from(e in Loopctl.Webhooks.WebhookEvent,
+          where: e.tenant_id == ^tenant.id and e.webhook_id == ^webhook.id
+        )
+        |> AdminRepo.all()
+
+      assert length(events) == 1
+      assert hd(events).payload["anomaly_type"] == "sweep_stalled"
+    end
+
+    test "tenant isolation — tenant A's stalled sweep never flags tenant B" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      overdue_post(tenant_a.id, 24)
+      # Tenant B's posts are all live — its retention IS being enforced.
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      agent_b = fixture(:agent, %{tenant_id: tenant_b.id})
+
+      AdminRepo.insert!(%ChannelPost{
+        tenant_id: tenant_b.id,
+        project_id: project_b.id,
+        agent_id: agent_b.id,
+        body: "post",
+        expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+      })
+
+      assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+      [anomaly] = sweep_anomalies(tenant_a.id)
+      assert anomaly.tenant_id == tenant_a.id
+      assert sweep_anomalies(tenant_b.id) == []
+      assert detected_audit_count(tenant_b.id, IngestionHealth.sweep_source_type()) == 0
     end
   end
 

@@ -78,6 +78,19 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     would otherwise fall below `min_attempts` and evade high_reject_rate detection)
   - `:reject_window_days` -- default `7`
   - `:write_stats_retention_days` -- default `90`
+  - `:sweep_staleness_hours` -- default `6` (grace hours past `expires_at` after which
+    a still-present `channel_posts` row means the retention sweep is not running)
+
+  ## Third detector: `:sweep_stalled` (issue #498)
+
+  `detect_sweep_stalled/0` is the absence-of-success detector for the US-39.5
+  channel-post retention sweep (`Loopctl.Workers.ChannelPostSweeper`). It lives here,
+  next to its siblings, because it is the same detector class (the absence of expected
+  success) and it reuses the whole tested `ingestion_anomalies` alert / recovery /
+  webhook / operator-API path rather than inventing a parallel one. Unlike the other
+  two it reads `channel_posts`, not knowledge ingestion data — the shared machinery is
+  the reason for the placement, and the sentinel `sweep_source_type/0`
+  (`"channel_post_sweep"`) keeps it from colliding with any real article source_type.
   """
 
   import Ecto.Query
@@ -85,6 +98,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionWriteStats
@@ -102,6 +116,18 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   @default_min_attempts_overrides %{}
   @default_reject_window_days 7
   @default_write_stats_retention_days 90
+
+  # Channel-post retention-sweep stall detector defaults (#498). The sweep runs every
+  # 5 minutes, so 6 hours of overdue rows is ~72 consecutive missed runs — well past
+  # any transient backlog or deploy window, and still far inside the 30-day retention
+  # promise it protects.
+  @default_sweep_staleness_hours 6
+
+  # Fixed sentinel `source_type` for the retention-sweep detector. `ingestion_anomalies`
+  # requires a NOT NULL source_type (and the unresolved-unique partial index keys on it),
+  # but the sweep is not an article source_type at all — so it is recorded under this
+  # reserved, non-article sentinel (precedent: @unstamped_source_type below).
+  @sweep_source_type "channel_post_sweep"
 
   # Sentinel `source_type` for the NULL/unstamped write bucket. `source_type` on a
   # KB write is advisory + nullable, so the MAJORITY of agent captures (patterns,
@@ -130,6 +156,16 @@ defmodule Loopctl.Knowledge.IngestionHealth do
           reject_rate: float(),
           window_days: pos_integer(),
           dominant_reason: String.t()
+        }
+
+  @type sweep_candidate :: %{
+          tenant_id: Ecto.UUID.t(),
+          source_type: String.t(),
+          anomaly_type: :sweep_stalled,
+          overdue_count: pos_integer(),
+          oldest_expires_at: DateTime.t(),
+          hours_stale: non_neg_integer(),
+          grace_hours: pos_integer()
         }
 
   # --- Config accessors (documented defaults) ---
@@ -236,6 +272,23 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   """
   @spec unstamped_source_type() :: String.t()
   def unstamped_source_type, do: @unstamped_source_type
+
+  @doc """
+  Grace period (in hours) past `expires_at` after which a still-present `channel_posts`
+  row means the US-39.5 retention sweep is not being enforced. Default 6 (~72 missed
+  5-minute runs).
+  """
+  @spec sweep_staleness_hours() :: pos_integer()
+  def sweep_staleness_hours,
+    do: Keyword.get(config(), :sweep_staleness_hours, @default_sweep_staleness_hours)
+
+  @doc """
+  Reserved sentinel `source_type` under which `:sweep_stalled` anomalies are recorded
+  (`"channel_post_sweep"`). The sweep is not an article source_type; see the module
+  attribute for why a sentinel is required.
+  """
+  @spec sweep_source_type() :: String.t()
+  def sweep_source_type, do: @sweep_source_type
 
   defp config, do: Application.get_env(:loopctl, :ingestion_health, [])
 
@@ -484,6 +537,151 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   defp to_int(%Decimal{} = d), do: Decimal.to_integer(d)
   defp to_int(n) when is_integer(n), do: n
 
+  # --- Retention-sweep stall detection (#498) ---
+
+  @doc """
+  Scans for tenants whose US-39.5 channel-post retention sweep has STALLED, using the
+  configured grace window. Returns a flat list of `t:sweep_candidate/0` maps — PURE,
+  no DB writes.
+
+  A tenant is a candidate when it still holds `channel_posts` rows whose `expires_at`
+  is more than `sweep_staleness_hours/0` in the past. That is an OUTCOME check, not a
+  liveness proxy: rows that should have been hard-deleted are still there, so the
+  30-day retention window is by construction not being enforced for that tenant —
+  whether the worker crashed, stopped being scheduled, lost its permissions, or is
+  running but never draining. The complementary in-band signals (a run that happened
+  and succeeded/failed) are the `channel_post_sweep_stop/exception` telemetry the
+  worker emits; this detector is the half that survives the worker never running at all.
+
+  Cross-tenant and set-based: ONE grouped query on the BYPASSRLS `AdminRepo`, joined to
+  ACTIVE tenants (same shape as `detect/1`), so a suspended tenant's leftovers never
+  page anyone.
+  """
+  @spec detect_sweep_stalled() :: [sweep_candidate()]
+  def detect_sweep_stalled do
+    detect_sweep_stalled(%{sweep_staleness_hours: sweep_staleness_hours()})
+  end
+
+  @doc """
+  `detect_sweep_stalled/0` with explicit config (`:sweep_staleness_hours`). Exposed so a
+  caller can drive detection with a specific configuration without touching global app env.
+  """
+  @spec detect_sweep_stalled(%{required(:sweep_staleness_hours) => pos_integer()}) ::
+          [sweep_candidate()]
+  def detect_sweep_stalled(%{sweep_staleness_hours: grace_hours}) do
+    now = DateTime.utc_now()
+    cutoff = DateTime.add(now, -grace_hours * 3600, :second)
+
+    ChannelPost
+    |> join(:inner, [p], t in Tenant, on: t.id == p.tenant_id and t.status == :active)
+    |> where([p], p.expires_at < ^cutoff)
+    |> group_by([p], p.tenant_id)
+    |> select([p], %{
+      tenant_id: p.tenant_id,
+      overdue_count: count(p.id),
+      oldest_expires_at: min(p.expires_at)
+    })
+    |> AdminRepo.all()
+    |> Enum.map(&sweep_candidate(&1, grace_hours, now))
+  end
+
+  defp sweep_candidate(
+         %{tenant_id: tenant_id, overdue_count: count, oldest_expires_at: oldest},
+         grace_hours,
+         now
+       ) do
+    oldest_dt = to_utc_datetime(oldest)
+
+    %{
+      tenant_id: tenant_id,
+      source_type: @sweep_source_type,
+      anomaly_type: :sweep_stalled,
+      overdue_count: count,
+      oldest_expires_at: oldest_dt,
+      # How long retention has ACTUALLY been unenforced: whole hours the oldest overdue
+      # row has outlived its own expires_at (>= grace_hours by construction, but the
+      # figure reported is the true age, not the threshold).
+      hours_stale: max(hours_between(oldest_dt, now), 0),
+      grace_hours: grace_hours
+    }
+  end
+
+  @doc """
+  Closes `:sweep_stalled` anomalies whose sweep has RECOVERED.
+
+  Like `:high_reject_rate`, a stall has no natural "resumed" event, so recovery is
+  defined as "no longer a candidate" — the tenant holds no overdue expired
+  `channel_posts` (the sweep drained the backlog). `current_candidates` is the SAME
+  list the worker just computed, so this shares one scan.
+
+  For each ACTIVE stall anomaly (`archived == false` and `last_event_at IS NULL`,
+  covering both open rows and operator-resolved-but-still-stalled episodes) whose
+  tenant is NOT in the candidate set, it stamps `last_event_at` with the recovery time
+  and sets `resolved: true`. This is the type's OWN close path: the existing
+  auto-resolvers are anomaly_type-scoped (`:capture_silence` / `:high_reject_rate`), so
+  without it a `sweep_stalled` row would freeze open forever AND keep suppressing a
+  future stall. Returns the number of anomalies closed. Called by the hourly worker.
+  """
+  @spec auto_resolve_recovered_sweep_stalled([sweep_candidate()]) :: non_neg_integer()
+  def auto_resolve_recovered_sweep_stalled(current_candidates) do
+    active_tenants = MapSet.new(current_candidates, & &1.tenant_id)
+    now = DateTime.utc_now()
+
+    IngestionAnomaly
+    |> where([a], a.anomaly_type == :sweep_stalled)
+    |> where([a], a.archived == false)
+    |> where([a], is_nil(a.last_event_at))
+    |> AdminRepo.all()
+    |> Enum.reduce(0, fn anomaly, acc ->
+      if MapSet.member?(active_tenants, anomaly.tenant_id),
+        do: acc,
+        else: acc + close_recovered_sweep(anomaly, now)
+    end)
+  end
+
+  # Same locked, audit-honest close as close_recovered_reject/2 (see its comment for why
+  # the row is re-read FOR UPDATE rather than trusting the bulk-loaded snapshot).
+  defp close_recovered_sweep(%IngestionAnomaly{id: id, tenant_id: tenant_id}, now) do
+    multi =
+      Multi.new()
+      |> Multi.run(:locked, fn repo, _changes ->
+        locked =
+          IngestionAnomaly
+          |> where([a], a.id == ^id and a.tenant_id == ^tenant_id)
+          |> lock("FOR UPDATE")
+          |> repo.one()
+
+        {:ok, locked}
+      end)
+      |> Multi.run(:anomaly, fn repo, %{locked: locked} ->
+        case locked do
+          nil -> {:error, :not_found}
+          row -> row |> IngestionAnomaly.sweep_recovered_changeset(now) |> repo.update()
+        end
+      end)
+      |> Multi.run(:audit, fn repo, %{locked: locked, anomaly: updated} ->
+        if locked.resolved do
+          {:ok, :skipped}
+        else
+          audit_insert(
+            repo,
+            audit_attrs(
+              tenant_id,
+              updated.id,
+              "resolved",
+              [actor_type: "system", actor_label: "ingestion_health:auto_resolve_sweep_stalled"],
+              %{old_state: %{"resolved" => false}, new_state: %{"resolved" => true}}
+            )
+          )
+        end
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, _} -> 1
+      {:error, _step, _reason, _changes} -> 0
+    end
+  end
+
   @doc """
   Whether the tenant has EVER seen ingestion activity for `source_type` — either a
   recorded write-outcome (`ingestion_write_stats`, the create-path telemetry) OR a
@@ -496,8 +694,15 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   writes are stored with a NULL/empty `source_type`, so it probes those rows rather than
   matching the literal sentinel string (which no row carries) — otherwise a tenant with
   real unstamped traffic would be falsely warned "no recorded activity".
+
+  The `sweep_source_type/0` sentinel (`"channel_post_sweep"`) is likewise special-cased
+  and always reports SEEN: it names the retention-sweep detector rather than an
+  ingestion stream, so no `articles`/`ingestion_write_stats` row will ever carry it and
+  the generic probe would falsely warn on a legitimate filter.
   """
   @spec source_type_seen?(Ecto.UUID.t(), String.t()) :: boolean()
+  def source_type_seen?(_tenant_id, @sweep_source_type), do: true
+
   def source_type_seen?(tenant_id, source_type) when is_binary(source_type) do
     write_stats_seen?(tenant_id, source_type) or articles_seen?(tenant_id, source_type)
   end

@@ -30,11 +30,14 @@ defmodule LoopctlWeb.IngestionAnomalyController do
   tags(["Knowledge Wiki"])
 
   operation(:index,
-    summary: "List ingestion anomalies (capture-silence + high-reject-rate)",
+    summary: "List ingestion anomalies (capture-silence, high-reject-rate, sweep-stalled)",
     description:
-      "Returns unresolved ingestion anomalies for the tenant — both capture_silence " <>
-        "(a source_type that stopped producing articles) and high_reject_rate (writes " <>
-        "attempted but rejected at high rate, which persist no article row). " <>
+      "Returns unresolved ingestion anomalies for the tenant — capture_silence " <>
+        "(a source_type that stopped producing articles), high_reject_rate (writes " <>
+        "attempted but rejected at high rate, which persist no article row), and " <>
+        "sweep_stalled (the channel-post retention sweep is no longer enforcing the " <>
+        "30-day window for this tenant, recorded under the reserved source_type " <>
+        "channel_post_sweep). " <>
         "Filterable by source_type and anomaly_type. Archived anomalies are excluded by " <>
         "default; use ?include_archived=true to include them. A malformed ?resolved value " <>
         "or an unknown ?anomaly_type is rejected with 422. The response `meta.filters` " <>
@@ -50,7 +53,7 @@ defmodule LoopctlWeb.IngestionAnomalyController do
       anomaly_type: [
         in: :query,
         type: :string,
-        description: "Filter by anomaly type: capture_silence or high_reject_rate"
+        description: "Filter by anomaly type: capture_silence, high_reject_rate, or sweep_stalled"
       ],
       include_archived: [
         in: :query,

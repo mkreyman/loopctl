@@ -74,6 +74,8 @@ Deliberately minimal (owner decision, 2026-07-17: *"I wouldn't bother with messa
 ### 3.4 Retention — uniform 30 days
 Every post expires 30 days after its last write (`created_at`/`updated_at` + 30d). No per-type tiers — flat and simple (owner decision). A cheap Oban TTL sweep (same shape as the #411 graduation sweep) deletes expired rows.
 
+The sweep is **alerted, not assumed healthy** (issue #498): `Loopctl.Workers.ChannelPostSweeper` emits telemetry on every run (success — including a zero-delete no-op — and failure, which is logged at `error` and re-raised so Oban still retries), and `Loopctl.Knowledge.IngestionHealth.detect_sweep_stalled/0` raises a tenant-scoped `:sweep_stalled` operator alert when a tenant's expired posts survive past the configured grace window — the case where the worker stopped running entirely and therefore emits nothing.
+
 30 days is safe *because* the memory→knowledge graduation path (#411) already exists: the rare post worth keeping is promoted to the durable Knowledge plane; the rest was always disposable. This keeps the roll small and sharpens the three-plane separation instead of muddying it.
 
 ### 3.5 Schema (sketch)

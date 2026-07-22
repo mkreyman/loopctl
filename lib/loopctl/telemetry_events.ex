@@ -307,6 +307,40 @@ defmodule Loopctl.TelemetryEvents do
   """
   def article_write, do: [:loopctl, :knowledge, :article_write]
 
+  @doc """
+  The US-39.5 channel-post retention sweep (`Loopctl.Workers.ChannelPostSweeper`)
+  COMPLETED a run (issue #498). Emitted on EVERY successful run, including a run that
+  deleted nothing — a success-only-when-non-zero signal cannot distinguish "nothing to
+  do" from "never ran", which is exactly the assumed-healthy failure #428 asked to
+  close. Pair it with `channel_post_sweep_exception/0` (the failure half) and with the
+  `:sweep_stalled` ingestion anomaly (the absence-of-success half, which catches a
+  worker that stopped being SCHEDULED at all and therefore emits neither event).
+
+  ## Payload (counts + bounded ints only — never post bodies, ids, or SQL)
+
+    * `measurements`: `%{deleted: n}` — rows hard-deleted in this run (0 on a no-op).
+    * `metadata`: `%{limit: n}` — the effective per-run batch bound after the
+      `min(limit, @batch_size)` clamp. A bounded integer, not a label explosion.
+  """
+  def channel_post_sweep_stop, do: [:loopctl, :coordination, :channel_post_sweep, :stop]
+
+  @doc """
+  The US-39.5 channel-post retention sweep RAISED (issue #498). Emitted from the
+  worker's rescue clause immediately before the error is RE-RAISED, so Oban still
+  records the failure and retries (`max_attempts: 3`) — the telemetry never swallows
+  the fault, it only makes it visible outside Oban's retry churn.
+
+  ## Payload (atoms/bounded tags only — never a PG message body, SQL, or bound params)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{limit, error_class}` where `limit` is the effective per-run batch
+      bound and `error_class` is the raised exception's MODULE name (e.g.
+      `"Postgrex.Error"`, `"DBConnection.ConnectionError"`) — a bounded dimension,
+      never the exception's message.
+  """
+  def channel_post_sweep_exception,
+    do: [:loopctl, :coordination, :channel_post_sweep, :exception]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -326,7 +360,9 @@ defmodule Loopctl.TelemetryEvents do
       ingestion_backlog_gate_failed_open(),
       article_linking_corpus_size(),
       recall_context_degraded(),
-      article_write()
+      article_write(),
+      channel_post_sweep_stop(),
+      channel_post_sweep_exception()
     ]
   end
 end

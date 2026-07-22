@@ -26,6 +26,35 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   The bound is overridable via the job arg `"limit"` (a positive integer) so a
   caller can tune the per-run cap. The sweep is idempotent — with no expired rows
   it is a no-op that deletes zero.
+
+  ## Observability (issue #498)
+
+  Retention is a release gate, so a silently dead sweep silently stops enforcing the
+  30-day window. Three signals cover the three distinct failure shapes:
+
+  1. **Ran and succeeded** — `Loopctl.TelemetryEvents.channel_post_sweep_stop/0` is
+     emitted on EVERY successful run, INCLUDING a zero-delete no-op. Emitting only on
+     a non-zero delete (the pre-#498 behavior) cannot distinguish "nothing to do" from
+     "never ran".
+  2. **Ran and failed** — a raise/DB error is caught, logged at `error`, emitted as
+     `channel_post_sweep_exception/0`, and then **RE-RAISED**. The rescue is purely
+     observational: Oban must still record the failure and retry (`max_attempts: 3`).
+     Swallowing it here would hide the fault behind an `:ok`.
+  3. **Never ran at all** — the load-bearing half, since a worker that stops being
+     SCHEDULED emits neither event above. `Loopctl.Knowledge.IngestionHealth`'s
+     `:sweep_stalled` detector (an `ingestion_anomalies` type, run hourly by
+     `Loopctl.Workers.IngestionHealthWorker`) flags any tenant whose expired
+     `channel_posts` are still present beyond a grace window, and raises the operator
+     alert. That detector is deliberately **per-tenant on overdue rows** rather than a
+     global "last completed job" heartbeat over `oban_jobs`: a tenant with overdue
+     expired rows is, by construction, a tenant whose retention is NOT being enforced —
+     it observes the OUTCOME (rows that should be gone are present) rather than a proxy
+     for the mechanism, so it also catches a sweep that runs but silently deletes
+     nothing (a bad predicate, a permission regression, a backlog the batch bound can
+     never drain). The `oban_jobs` heartbeat was considered and skipped: it is
+     tenant-independent (so it could not satisfy the tenant-scoped anomaly row the
+     alerting surface uses) and it is only as durable as `Oban.Plugins.Pruner`'s
+     terminal-job retention.
   """
 
   use Oban.Worker, queue: :cleanup, max_attempts: 3
@@ -36,6 +65,7 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Coordination.ChannelPost
+  alias Loopctl.TelemetryEvents
 
   @batch_size 1000
 
@@ -45,12 +75,58 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   Reads the `"limit"` job arg (a positive integer) as the per-run batch bound,
   defaulting to `#{@batch_size}`. Returns `:ok` whether or not anything was
   deleted (idempotent); logs the count only when it is positive.
+
+  Emits `Loopctl.TelemetryEvents.channel_post_sweep_stop/0` on EVERY successful run
+  (zero-delete runs included). On a raise it logs at `error`, emits
+  `channel_post_sweep_exception/0`, and RE-RAISES so Oban records the failure and
+  retries — see the moduledoc's "Observability" section.
   """
   @impl Oban.Worker
   @spec perform(Oban.Job.t()) :: :ok
   def perform(%Oban.Job{args: args}) do
-    now = DateTime.utc_now()
     limit = batch_limit(args)
+
+    try do
+      count = sweep_batch(limit)
+
+      # Always-on success signal, INCLUDING count == 0: "swept, nothing to do" and
+      # "never ran" must be distinguishable from the outside.
+      :telemetry.execute(
+        TelemetryEvents.channel_post_sweep_stop(),
+        %{deleted: count},
+        %{limit: limit}
+      )
+
+      if count > 0 do
+        Logger.info("ChannelPostSweeper deleted #{count} expired channel posts")
+      end
+
+      :ok
+    rescue
+      error ->
+        # Observe, then RE-RAISE: Oban must still fail the job and retry
+        # (max_attempts: 3). Never convert a failed sweep into an :ok.
+        error_class = error.__struct__ |> Module.split() |> Enum.join(".")
+
+        Logger.error(
+          "ChannelPostSweeper failed to sweep expired channel posts " <>
+            "(limit=#{limit}, error_class=#{error_class}): #{Exception.message(error)}"
+        )
+
+        :telemetry.execute(
+          TelemetryEvents.channel_post_sweep_exception(),
+          %{count: 1},
+          %{limit: limit, error_class: error_class}
+        )
+
+        reraise error, __STACKTRACE__
+    end
+  end
+
+  # One bounded batch: select the expired ids (bounded by `limit`), then delete them.
+  # Returns the number of rows deleted (0 when nothing is expired).
+  defp sweep_batch(limit) do
+    now = DateTime.utc_now()
 
     ids =
       ChannelPost
@@ -61,7 +137,7 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
 
     case ids do
       [] ->
-        :ok
+        0
 
       batch_ids ->
         {count, _} =
@@ -69,11 +145,7 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
           |> where([p], p.id in ^batch_ids)
           |> AdminRepo.delete_all()
 
-        if count > 0 do
-          Logger.info("ChannelPostSweeper deleted #{count} expired channel posts")
-        end
-
-        :ok
+        count
     end
   end
 

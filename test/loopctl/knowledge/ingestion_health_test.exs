@@ -5,6 +5,7 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.Coordination.ChannelPost
   alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionHealth
 
@@ -21,6 +22,25 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
       inserted_at: DateTime.add(DateTime.utc_now(), -hours_ago, :hour)
     })
   end
+
+  # No channel_post fixture exists (create_post/4 always stamps expires_at at now+30d),
+  # so insert ChannelPost structs directly on the BYPASSRLS AdminRepo to control expires_at.
+  defp channel_post(tenant_id, hours_offset) do
+    project = fixture(:project, %{tenant_id: tenant_id})
+    agent = fixture(:agent, %{tenant_id: tenant_id})
+
+    %ChannelPost{
+      tenant_id: tenant_id,
+      project_id: project.id,
+      agent_id: agent.id,
+      body: "post",
+      expires_at: DateTime.add(DateTime.utc_now(), hours_offset, :hour)
+    }
+    |> AdminRepo.insert!()
+  end
+
+  defp for_tenant(candidates, tenant_id),
+    do: Enum.filter(candidates, &(&1.tenant_id == tenant_id))
 
   describe "detect/0" do
     test "returns a candidate for an established + stale source_type" do
@@ -649,7 +669,76 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
     end
   end
 
+  describe "detect_sweep_stalled/0,1 (#498)" do
+    test "returns a candidate per tenant holding rows expired beyond the grace window" do
+      tenant = fixture(:tenant)
+      channel_post(tenant.id, -24)
+      channel_post(tenant.id, -10)
+      # Still live — never counted.
+      channel_post(tenant.id, 24)
+
+      assert [candidate] = IngestionHealth.detect_sweep_stalled() |> for_tenant(tenant.id)
+
+      assert candidate.anomaly_type == :sweep_stalled
+      assert candidate.source_type == IngestionHealth.sweep_source_type()
+      assert candidate.overdue_count == 2
+      # hours_stale reports the TRUE age of the oldest overdue row, not the threshold.
+      assert candidate.hours_stale >= 24
+      assert candidate.grace_hours == IngestionHealth.sweep_staleness_hours()
+      assert %DateTime{} = candidate.oldest_expires_at
+    end
+
+    test "ignores rows still inside the grace window" do
+      tenant = fixture(:tenant)
+      channel_post(tenant.id, -1)
+
+      assert IngestionHealth.detect_sweep_stalled() |> for_tenant(tenant.id) == []
+    end
+
+    test "honors an explicit grace window without touching app env" do
+      tenant = fixture(:tenant)
+      channel_post(tenant.id, -3)
+
+      assert IngestionHealth.detect_sweep_stalled(%{sweep_staleness_hours: 6})
+             |> for_tenant(tenant.id) == []
+
+      assert [_] =
+               IngestionHealth.detect_sweep_stalled(%{sweep_staleness_hours: 1})
+               |> for_tenant(tenant.id)
+    end
+
+    test "skips non-active tenants and is tenant-scoped" do
+      active = fixture(:tenant)
+      suspended = fixture(:tenant, %{status: :suspended})
+
+      channel_post(active.id, -24)
+      channel_post(suspended.id, -24)
+
+      candidates = IngestionHealth.detect_sweep_stalled()
+
+      assert [_] = for_tenant(candidates, active.id)
+      assert for_tenant(candidates, suspended.id) == []
+    end
+
+    test "detection is PURE — no anomaly rows are written" do
+      tenant = fixture(:tenant)
+      channel_post(tenant.id, -24)
+
+      assert [_] = IngestionHealth.detect_sweep_stalled() |> for_tenant(tenant.id)
+
+      assert IngestionAnomaly
+             |> where([a], a.tenant_id == ^tenant.id)
+             |> AdminRepo.all() == []
+    end
+  end
+
   describe "source_type_seen?/2" do
+    test "the sweep sentinel always reports seen (it names a detector, not a stream)" do
+      tenant = fixture(:tenant)
+
+      assert IngestionHealth.source_type_seen?(tenant.id, IngestionHealth.sweep_source_type())
+    end
+
     test "true when the tenant has a write-stats row for the source_type" do
       tenant = fixture(:tenant)
       fixture(:ingestion_write_stats, %{tenant_id: tenant.id, source_type: "web_article"})

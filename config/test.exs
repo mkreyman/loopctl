@@ -230,7 +230,9 @@ config :loopctl, :ingestion_health,
   # PR B2 reject-rate detector pins (deterministic thresholds for specs).
   reject_rate_threshold: 0.5,
   min_attempts: 10,
-  reject_window_days: 7
+  reject_window_days: 7,
+  # #498 sweep-stall detector pin (deterministic grace window for specs).
+  sweep_staleness_hours: 6
 
 # Run the write-outcome rollup upsert INLINE in test (prod dispatches it to a
 # supervised task): inline shares the emitting test process's sandboxed connection, so
