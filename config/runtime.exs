@@ -528,3 +528,10 @@ if config_env() == :prod do
   #
   # Check `Plug.SSL` for all available options in `force_ssl`.
 end
+
+# Tenant secrets: opt-in file-backed adapter for non-Fly deployments
+# (FlyAdapter hard-fails signup off-platform: {:audit_key_storage_failed, :fly_not_configured}).
+# Default behavior (Fly) is unchanged unless SECRETS_ADAPTER=local_file is set.
+if System.get_env("SECRETS_ADAPTER") == "local_file" do
+  config :loopctl, :secrets_adapter, Loopctl.Secrets.LocalFileAdapter
+end
