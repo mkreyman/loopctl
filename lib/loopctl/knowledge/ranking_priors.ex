@@ -9,6 +9,16 @@ defmodule Loopctl.Knowledge.RankingPriors do
       (`recency_decay/2` is the single source of truth for both). Applied as a BOUNDED
       factor `1 - w + w * decay` on the score, so a stale document is nudged down but a
       brand-new one is never lifted above a document with materially stronger relevance.
+      > #### "Recency" is LAST-MUTATION time, not authored time {: .warning}
+      > `age_days` is measured from `updated_at`, and `updated_at` is bumped by ANY write
+      > that changes the row — including a re-embed / content-hash refresh
+      > (`Loopctl.Knowledge.update_embedding/4`). A model migration or a bulk re-embedding
+      > backfill therefore resets a years-old note's apparent freshness to "now" and, if run
+      > across the whole corpus, globally FLATTENS the recency signal. This is inherited
+      > verbatim from `knowledge_context` (#471's AC mandates reusing that exact field +
+      > decay as the single source of truth), but #471 now surfaces it on the PRIMARY search
+      > path. If you run a mass re-embed, expect ranking to shift until authored-age drift
+      > re-accumulates; there is no separate authored/source timestamp to fall back to.
     * **Source authority** — a bounded prior derived from `category` / `source_type` /
       `tags`, centered on 1.0 and clamped to a narrow band, so it re-ranks NEAR-TIES
       (which post-#470 Reciprocal Rank Fusion produces by construction) rather than
@@ -32,10 +42,14 @@ defmodule Loopctl.Knowledge.RankingPriors do
 
   Post-#470 the fused `:final_score` is `Σ_lane weight/(k + rank)`. Two docs that each top
   a single lane tie EXACTLY; a doc with cross-lane consensus scores ~2x a single-lane hit.
-  The authority band (`[0.9, 1.1]` by default) can flip an exact/near tie but can NEVER
-  flip a 2x-stronger consensus winner — which is precisely the "priors break ties, not
-  dominate strong relevance" risk the issue calls out. The recency factor is likewise
-  bounded in `[1 - w, 1]`.
+  The authority factor clamps to `[0.9, 1.1]`, but the band is ONE-SIDED in practice: every
+  category/source weight is >= 0 and `strength` >= 0, so `1 + strength*(cat+src)` is always
+  >= 1.0 and the 0.9 floor is unreachable — the EFFECTIVE range is `[1.0, 1.1]`. Authority
+  therefore only ever BOOSTS a higher-authority doc; it never demotes a low-authority raw
+  note below neutral (that demotion is the SEPARATE `demotion_factor/1` job). Even so it can
+  flip an exact/near tie but can NEVER flip a 2x-stronger consensus winner — precisely the
+  "priors break ties, not dominate strong relevance" risk the issue calls out. The recency
+  factor is likewise bounded in `[1 - w, 1]`.
 
   This module is intentionally PURE (no DB, no clock of its own — `now` is passed in) so it
   can be applied inside `Loopctl.Knowledge.merge_results/5` (which must stay DB-free) and
@@ -50,17 +64,24 @@ defmodule Loopctl.Knowledge.RankingPriors do
   # the STRING form of the category atom so a result map carrying an Ecto.Enum atom or a
   # stringified category both resolve without String.to_atom on anything.
   #
-  # Ordering rationale (verified by unit tests): curated doctrine
-  # (decision/playbook/reference/finding) > structural knowledge (pattern/insight/
+  # Ordering rationale (verified by unit tests): the issue-#471 top authority tier is
+  # `decision / playbook / finding` (its literal example: "decision / playbook / finding
+  # > idea > raw harvested atomic note"), so `finding` sits WITH decision/playbook at the
+  # top and strictly ABOVE `reference`. Ordering: top curated doctrine
+  # (decision/playbook/finding) > reference > structural knowledge (pattern/insight/
   # convention) > low-signal captured notes (entity/quote/question) > a speculative
   # `idea` > an uncategorized raw atomic note (the @default_category_authority floor).
-  # Every weight is >= the floor, so the prior only ever REORDERS ties upward by
-  # authority; dead-doctrine demotion (verdict-kill / superseded) is what pushes down.
+  # `finding >= reference` is load-bearing: when a grade-3 `finding` answer and a grade-2
+  # `reference` distractor near-tie in RRF, the higher-authority side must be the finding,
+  # or the prior would reorder the stronger-graded doc DOWN (the regression #471 review
+  # caught on q-keyword-fallback). Every weight is >= the floor, so the prior only ever
+  # REORDERS ties upward by authority; dead-doctrine demotion (verdict-kill / superseded)
+  # is what pushes down.
   @category_authority %{
     "decision" => 1.0,
     "playbook" => 1.0,
-    "reference" => 0.9,
-    "finding" => 0.8,
+    "finding" => 0.9,
+    "reference" => 0.8,
     "pattern" => 0.7,
     "convention" => 0.6,
     "insight" => 0.6,
@@ -98,6 +119,9 @@ defmodule Loopctl.Knowledge.RankingPriors do
   The recency decay `exp(-age_days / 30)` for a document last updated at `updated_at`,
   measured against `now`. Range `(0, 1]` (1.0 for a doc updated exactly now). This is the
   SINGLE SOURCE OF TRUTH for the decay — `knowledge_context` calls it too.
+
+  `updated_at` is LAST-MUTATION time, so a re-embed / content-hash refresh resets a note's
+  apparent freshness (see the module doc's warning). There is no authored-time fallback.
   """
   @spec recency_decay(DateTime.t(), DateTime.t()) :: float()
   def recency_decay(updated_at, now) do
@@ -122,6 +146,11 @@ defmodule Loopctl.Knowledge.RankingPriors do
   The bounded authority FACTOR for a result map, centered on 1.0 and clamped to
   `[floor, ceiling]`. `strength` scales the combined category + source_type prior; a
   `strength` of 0 makes authority a no-op (factor 1.0).
+
+  NOTE the band is effectively ONE-SIDED: every category/source weight is >= 0 and
+  `strength` >= 0, so `1 + strength*(cat+src)` is always >= 1.0 and the `floor` (0.9 in
+  the default config) is never hit — the reachable range is `[1.0, ceiling]`. This factor
+  only ever BOOSTS; demoting dead doctrine below neutral is `demotion_factor/1`'s job.
   """
   @spec authority_factor(map(), float(), float(), float()) :: float()
   def authority_factor(_result, strength, _floor, _ceiling) when strength <= 0.0, do: 1.0

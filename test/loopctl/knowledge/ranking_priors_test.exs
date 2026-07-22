@@ -96,6 +96,19 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
       assert f.(:decision) > raw_note
     end
 
+    test "finding is in the top authority tier, at or above reference (#471 spec + regression)" do
+      # Issue #471's literal top tier is "decision / playbook / finding". A grade-3
+      # `finding` answer near-tying a grade-2 `reference` distractor in RRF must NOT be
+      # reordered below it by authority — the regression the #471 review caught on
+      # q-keyword-fallback (nDCG@10 0.86034 -> 0.85196). finding >= reference is the fix.
+      f = fn category ->
+        RankingPriors.authority_factor(%{category: category}, 0.05, @floor, @ceiling)
+      end
+
+      assert f.(:finding) >= f.(:reference)
+      assert f.(:finding) > f.(:pattern)
+    end
+
     test "accepts a stringified category the same as the atom" do
       assert RankingPriors.authority_factor(%{category: "decision"}, 0.05, @floor, @ceiling) ==
                RankingPriors.authority_factor(%{category: :decision}, 0.05, @floor, @ceiling)

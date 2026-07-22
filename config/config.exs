@@ -759,19 +759,24 @@ config :loopctl, :knowledge_rrf_graph_max_neighbors, 20
 # RRF `Σ weight/(k+rank)` value), NOT the 0..1 relevance blend knowledge_context uses.
 # All are overridable per-call via opts (config-DI; never Application.put_env in tests).
 # Default-on in every env (no test override). The retrieval-eval baseline was regenerated
-# with them enabled; the one accepted per-question tie-break regression this caused
-# (q-keyword-fallback nDCG@10) is documented in docs/runbooks/retrieval_eval.md.
+# with them enabled; on a like-for-like golden_v2 corpus (priors OFF vs ON) they improve
+# every aggregate metric with no per-question regression — the lift is driven by recency
+# (authority is net-inert on the synthetic eval corpus). See docs/runbooks/retrieval_eval.md.
 #
 # Recency uses the SAME exp(-age_days/30) decay as knowledge_context — single source of
 # truth Loopctl.Knowledge.RankingPriors.recency_decay/2 — applied as the BOUNDED factor
 # `1 - w + w*decay` on the fused score. Default weight 0.3 matches knowledge_context.
 config :loopctl, :knowledge_recency_weight, 0.3
 # Source-authority prior: toggle + magnitude. The factor is
-# `clamp(1 + strength * (category_weight + source_type_weight), 0.9, 1.1)`, with the
-# category/source_type weight tables living in Loopctl.Knowledge.RankingPriors. Small and
-# clamped BY DESIGN so it only re-ranks near-ties (RRF ties by construction) and can never
-# flip a cross-lane-consensus winner (~2x a single-lane hit). verdict-kill ideas and
-# :superseded articles are demoted regardless of this toggle.
+# `clamp(1 + strength * (category_weight + source_type_weight), 0.9, 1.1)`. Because every
+# category/source_type weight is >= 0 and strength is >= 0, `1 + strength*(cat+src)` is
+# always >= 1.0 — so the 0.9 floor is UNREACHABLE and the EFFECTIVE range is [1.0, 1.1].
+# The band is one-sided BY DESIGN: authority only ever BOOSTS a higher-authority doc; it
+# never demotes a low-authority raw note below neutral (demotion comes solely from the
+# separate verdict-kill / :superseded 0.5 factor). The weight tables live in
+# Loopctl.Knowledge.RankingPriors. Small and clamped so it only re-ranks near-ties (RRF
+# ties by construction) and can never flip a cross-lane-consensus winner (~2x a single-lane
+# hit). verdict-kill ideas and :superseded articles are demoted regardless of this toggle.
 config :loopctl, :knowledge_authority_prior_enabled, true
 config :loopctl, :knowledge_authority_strength, 0.05
 
