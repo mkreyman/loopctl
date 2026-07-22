@@ -64,6 +64,11 @@ defmodule Loopctl.MixProject do
       {:phoenix_live_view, "~> 1.0"},
       {:ecto_sql, "~> 3.13"},
       {:postgrex, ">= 0.0.0"},
+      # decimal 3.x fixes CVE-2026-32686 (unbounded-exponent DoS). ecto already
+      # allows ~> 3.0; the override lifts open_api_spex's stale optional cap
+      # (~> 1.0 or ~> 2.0), which has no 3.0 support yet. open_api_spex only uses
+      # Decimal for JSON-schema number casting, a 3.x-compatible surface.
+      {:decimal, "~> 3.1", override: true},
       {:esbuild, "~> 0.8", runtime: Mix.env() == :dev},
       {:tailwind, "~> 0.2", runtime: Mix.env() == :dev},
       {:telemetry_metrics, "~> 1.0"},

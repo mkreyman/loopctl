@@ -287,6 +287,13 @@ jobs:
       - name: Run Sobelow
         run: mix sobelow --config
 
+      # Dependency advisory audit. Local `mix precommit` runs the same check, but
+      # it never gated CI — which is how the postgrex/decimal/cowlib advisories of
+      # 2026-07 reached master unnoticed. The ignore file carries only advisories
+      # with no reachable fix, each justified inline.
+      - name: Audit dependencies
+        run: mix deps.audit --ignore-file .mix_audit_ignore
+
   dialyzer:
     name: Dialyzer
     runs-on: ubuntu-latest
