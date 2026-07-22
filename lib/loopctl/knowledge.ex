@@ -6395,7 +6395,13 @@ defmodule Loopctl.Knowledge do
       )
 
     from(c in subquery(inner_pool),
-      order_by: [desc: c.similarity_score],
+      # Deterministic total order: cosine similarity desc, then `id` asc as a
+      # secondary key. Ties are real (two identical embeddings share similarity
+      # 1.0), and Postgres leaves tied-row order unspecified, so without the id
+      # tiebreak the RRF ranks that fusion derives from this list — and thus
+      # which candidate wins the top slot by a sub-1e-5 RRF margin — would flip
+      # run-to-run (#470 review).
+      order_by: [desc: c.similarity_score, asc: c.id],
       select: %{
         id: c.id,
         tenant_id: c.tenant_id,
@@ -6867,10 +6873,20 @@ defmodule Loopctl.Knowledge do
          limit: paginated.limit,
          offset: paginated.offset,
          search_mode: "combined",
-         # Size of the deduplicated UNION of a keyword and a semantic sub-search
-         # (each capped at 100, so up to ~200 with no overlap), NOT a corpus total
-         # or full match count. Use list mode or knowledge_stats to size the corpus.
-         total_count_scope: "merged_candidates",
+         # Names what `total_count` counts so a client can size/interpret the pool.
+         # Default `merged_candidates`: the deduplicated UNION of a keyword and a
+         # semantic sub-search (each capped at 100, so up to ~200 with no overlap),
+         # NOT a corpus total or full match count. When the opt-in graph lane
+         # actually contributes one-hop neighbors, the count folds them in, so the
+         # scope becomes `merged_candidates_with_graph` — the documented
+         # `merged_candidates` invariant (keyword ∪ semantic only) still holds for
+         # its literal value (#470 review). Use list mode or knowledge_stats to size
+         # the corpus.
+         total_count_scope:
+           if(graph_results == [],
+             do: "merged_candidates",
+             else: "merged_candidates_with_graph"
+           ),
          # Carry the semantic sub-search's relevance-pool truncation forward (US-27.7a)
          # — combined is the DEFAULT mode, so silently dropping the flag would hide
          # truncation on the most-used path. `maybe_put` keeps the key absent unless the
@@ -6888,8 +6904,9 @@ defmodule Loopctl.Knowledge do
 
   # --- Reciprocal Rank Fusion (#470) ------------------------------------------
   #
-  # `score(doc) = Σ_lane weight_lane / (k + rank_lane(doc))`, ranks 1-based, default
-  # weight 1.0, default k=60 (KB f4a10824). Rank-based fusion sidesteps the
+  # `score(doc) = Σ_lane weight_lane / (k + rank_lane(doc))`, ranks 1-based, per-lane
+  # weight 0.5 (keyword/semantic/graph all match, so no lane structurally out-votes
+  # another), default k=60 (KB f4a10824). Rank-based fusion sidesteps the
   # incommensurable-scale problem (ts_rank_cd vs cosine similarity) that made the old
   # min-max weighted-sum brittle: a doc with cross-lane CONSENSUS can outrank one that
   # is #1 in a single lane. Each lane's list is ALREADY sorted by its own relevance
@@ -6985,7 +7002,7 @@ defmodule Loopctl.Knowledge do
     Keyword.get(
       opts,
       :graph_weight,
-      Application.get_env(:loopctl, :knowledge_rrf_graph_weight, 1.0)
+      Application.get_env(:loopctl, :knowledge_rrf_graph_weight, 0.5)
     )
   end
 
@@ -7013,7 +7030,11 @@ defmodule Loopctl.Knowledge do
   # NO `:relevance_score`/`:similarity_score`, so their hybrid-resolver `absolute_score`
   # is 0.0 — a graph-only hit can never falsely win the curated-vs-retrieved decision.
   defp put_graph_lane(opts, tenant_id, kw, semantic) do
-    if graph_lane_enabled?(opts) do
+    # Only the RRF fuser consumes `:_graph_lane_results` — `fuse_min_max/4` ignores
+    # graph neighbors entirely. Gate the (DB-backed) lane build on the strategy being
+    # RRF so a `graph_lane: true` + `fusion_strategy: :min_max` caller doesn't pay the
+    # ~11 round-trip graph read only to have the result silently discarded (#470 review).
+    if graph_lane_enabled?(opts) and fusion_strategy(opts) != :min_max do
       case build_graph_lane(tenant_id, kw, semantic, opts) do
         [] -> opts
         neighbors -> Keyword.put(opts, :_graph_lane_results, neighbors)
@@ -7036,16 +7057,22 @@ defmodule Loopctl.Knowledge do
       |> Enum.take(rrf_graph_seed_count())
 
     seed_set = MapSet.new(seed_ids)
+    seed_index = seed_ids |> Enum.with_index() |> Map.new()
 
+    # ONE tenant-scoped round-trip for the WHOLE seed set (was one AdminRepo query
+    # PER seed — an N+1 that fanned up to `rrf_graph_seed_count` sequential reads
+    # onto the deliberately small BYPASSRLS AdminRepo pool). Per-seed provenance is
+    # recovered in memory from the source/target ids each link row already carries,
+    # so the consensus tally is byte-for-byte the same (#470 review).
     neighbor_stats =
-      seed_ids
-      |> Enum.with_index()
-      |> Enum.reduce(%{}, fn {seed_id, seed_idx}, acc ->
-        tenant_id
-        |> list_links_for_article(seed_id, visibility_agent_id: vis)
-        |> Enum.flat_map(&graph_neighbor_ids(&1, seed_id))
-        |> Enum.reject(&MapSet.member?(seed_set, &1))
-        |> tally_graph_neighbors(acc, seed_idx)
+      tenant_id
+      |> list_links_for_seed_set(seed_ids, vis)
+      |> Enum.reduce(%{}, fn link, acc ->
+        link
+        |> seed_neighbor_pairs(seed_set)
+        |> Enum.reduce(acc, fn {seed_id, neighbor_id}, inner ->
+          tally_graph_neighbor(inner, neighbor_id, Map.fetch!(seed_index, seed_id))
+        end)
       end)
 
     ranked_ids =
@@ -7059,23 +7086,50 @@ defmodule Loopctl.Knowledge do
     fetch_graph_lane_articles(tenant_id, ranked_ids)
   end
 
-  # Fold this seed's neighbor ids into the running `%{neighbor_id => {seed_count,
-  # best_seed_idx}}` tally, so a neighbor linked to MULTIPLE top seeds accumulates
-  # cross-seed consensus (the graph lane's rank signal).
-  defp tally_graph_neighbors(neighbor_ids, acc, seed_idx) do
-    Enum.reduce(neighbor_ids, acc, fn nid, inner ->
-      Map.update(inner, nid, {1, seed_idx}, fn {count, best} ->
-        {count + 1, min(best, seed_idx)}
-      end)
-    end)
+  # One tenant-scoped, visibility-filtered read of every link touching ANY seed in
+  # the set — the single query that replaces the per-seed N+1.
+  defp list_links_for_seed_set(_tenant_id, [], _vis), do: []
+
+  defp list_links_for_seed_set(tenant_id, seed_ids, vis) do
+    from(l in ArticleLink,
+      where: l.tenant_id == ^tenant_id,
+      where: l.source_article_id in ^seed_ids or l.target_article_id in ^seed_ids,
+      preload: [:source_article, :target_article],
+      order_by: [desc: l.inserted_at]
+    )
+    |> AdminRepo.all()
+    # Visibility (#163): drop links whose far-side article the caller can't see, so a
+    # neighbor can't leak another agent's private memory id/title — same filter the
+    # per-article `list_links_for_article/3` applies.
+    |> filter_links_by_visibility(vis)
   end
 
-  defp graph_neighbor_ids(%ArticleLink{source_article_id: src, target_article_id: tgt}, seed_id) do
+  # A link contributes AT MOST one `{seed_id, neighbor_id}` edge: the neighbor is the
+  # endpoint that is NOT itself a seed. A link between two seeds (or a self-link)
+  # contributes none — a seed is already ranked by a primary lane. This mirrors the
+  # old per-seed `graph_neighbor_ids/2` + seed-set reject, one link at a time.
+  defp seed_neighbor_pairs(
+         %ArticleLink{source_article_id: src, target_article_id: tgt},
+         seed_set
+       ) do
+    src_seed = MapSet.member?(seed_set, src)
+    tgt_seed = MapSet.member?(seed_set, tgt)
+
     cond do
-      src == seed_id and tgt != seed_id -> [tgt]
-      tgt == seed_id and src != seed_id -> [src]
+      src_seed and not tgt_seed -> [{src, tgt}]
+      tgt_seed and not src_seed -> [{tgt, src}]
       true -> []
     end
+  end
+
+  # Fold one `seed → neighbor` edge into the running `%{neighbor_id => {seed_count,
+  # best_seed_idx}}` tally, so a neighbor linked from MORE distinct top seeds
+  # accumulates cross-seed consensus (the graph lane's rank signal), with best seed
+  # position as tiebreak.
+  defp tally_graph_neighbor(acc, neighbor_id, seed_idx) do
+    Map.update(acc, neighbor_id, {1, seed_idx}, fn {count, best} ->
+      {count + 1, min(best, seed_idx)}
+    end)
   end
 
   defp fetch_graph_lane_articles(_tenant_id, []), do: []

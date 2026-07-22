@@ -735,9 +735,13 @@ config :loopctl, :knowledge_rrf_k, 60
 # score (their hybrid-resolver absolute_score stays 0.0) and never inflate
 # meta.semantic_result_count.
 config :loopctl, :knowledge_rrf_graph_lane_enabled, false
-# Weight of the graph-neighbor lane in RRF fusion when enabled (default 1.0, matching
-# the canonical per-lane weight).
-config :loopctl, :knowledge_rrf_graph_weight, 1.0
+# Weight of the graph-neighbor lane in RRF fusion when enabled. Defaults to 0.5 to
+# MATCH the keyword/semantic per-lane weights this system actually uses (search_combined
+# defaults each primary lane to 0.5, structurally summed to 1.0). A 1.0 graph weight
+# would make a zero-signal one-hop neighbor at graph-rank 1 (1.0/(k+1)) outrank every
+# single-lane rank-1 hit (0.5/(k+1)) — the graph lane carries no relevance/similarity
+# signal by design, so it must not double the primary lanes' contribution (#470 review).
+config :loopctl, :knowledge_rrf_graph_weight, 0.5
 # Number of top merged candidates used as graph-lane seeds (bounds link fan-out).
 config :loopctl, :knowledge_rrf_graph_seed_count, 10
 # Overall cap on distinct graph-lane neighbors injected into the fusion.

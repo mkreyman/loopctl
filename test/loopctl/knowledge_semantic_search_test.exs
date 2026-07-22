@@ -1537,12 +1537,18 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
           :far
         )
 
-      # Semantic-only: close embedding, no keyword match on "consensus".
+      # Semantic-only: a MEDIUM (not :close) embedding, no keyword match on "consensus".
+      # Deliberately less similar than `consensus` so `consensus` is unambiguously
+      # semantic rank 1. With two identical :close vectors the semantic tie was broken
+      # only by the now-deterministic id secondary sort, and in the branch where
+      # `consensus` fell to semantic rank 2 the keyword spike edged it out by a ~4e-6
+      # RRF margin — a real, seed-dependent flake. Widening the semantic gap makes the
+      # cross-lane advantage unconditional (#470 review).
       _sem_spike =
         create_article_with_embedding(
           tenant.id,
           %{title: "Fault Tolerance", body: "Supervisor trees prevent cascading failures."},
-          :close
+          :medium
         )
 
       Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
@@ -1704,6 +1710,140 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       ids = Enum.map(results, & &1.id)
       assert neighbor_a.id in ids
       refute neighbor_b.id in ids
+    end
+
+    test "a zero-signal graph neighbor never OUTRANKS a genuine single-lane top hit" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      %{seed: seed, neighbor: neighbor} = seed_and_neighbor(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: results}} =
+        Knowledge.search_combined(tenant.id, "graphlane", graph_lane: true)
+
+      seed_result = Enum.find(results, &(&1.id == seed.id))
+      neighbor_result = Enum.find(results, &(&1.id == neighbor.id))
+
+      # The seed is keyword rank 1 (0.5/(k+1)); the graph-only neighbor is graph rank 1.
+      # With the graph lane weighted 0.5 to MATCH the primary lanes, the neighbor scores
+      # 0.5/(k+1) too — it TIES the top single-lane hit and never exceeds it. Under the
+      # buggy 1.0 graph weight the neighbor scored 1.0/(k+1) = DOUBLE and outranked every
+      # single-lane #1 (#470 review).
+      assert_in_delta neighbor_result.final_score, 0.5 / 61, 1.0e-9
+      assert neighbor_result.final_score <= seed_result.final_score
+    end
+
+    test "a neighbor linked from TWO seeds outranks one linked from a single seed" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      # Two seeds that both match the keyword query.
+      seed1 =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Multiseed One",
+          body: "The multiseed token appears here first.",
+          status: :published
+        })
+
+      seed2 =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Multiseed Two",
+          body: "The multiseed token appears here again.",
+          status: :published
+        })
+
+      # Shared neighbor: linked from BOTH seeds (cross-seed consensus = 2).
+      shared =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Shared Neighbor",
+          body: "Unrelated wording, no shared query token.",
+          status: :published
+        })
+
+      # Lonely neighbor: linked from ONE seed only (consensus = 1).
+      lonely =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Lonely Neighbor",
+          body: "Also unrelated wording, no shared query token.",
+          status: :published
+        })
+
+      for {src, tgt} <- [{seed1, shared}, {seed2, shared}, {seed1, lonely}] do
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: src.id,
+          target_article_id: tgt.id,
+          relationship_type: :relates_to
+        })
+      end
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: results}} =
+        Knowledge.search_combined(tenant.id, "multiseed", graph_lane: true)
+
+      shared_result = Enum.find(results, &(&1.id == shared.id))
+      lonely_result = Enum.find(results, &(&1.id == lonely.id))
+
+      # Both surface via the graph lane, but the two-seed consensus neighbor ranks
+      # ahead of the one-seed neighbor (graph rank 1 vs 2) — the core `tally` signal
+      # that was previously untested (#470 review).
+      assert shared_result
+      assert lonely_result
+      assert shared_result.final_score > lonely_result.final_score
+
+      shared_pos = Enum.find_index(results, &(&1.id == shared.id))
+      lonely_pos = Enum.find_index(results, &(&1.id == lonely.id))
+      assert shared_pos < lonely_pos
+    end
+
+    test "total_count_scope is labelled 'merged_candidates_with_graph' when the lane contributes" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      seed_and_neighbor(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{meta: meta}} =
+        Knowledge.search_combined(tenant.id, "graphlane", graph_lane: true)
+
+      # When one-hop neighbors are folded into total_count, the scope label changes so a
+      # client isn't misled that the documented `merged_candidates` (keyword ∪ semantic)
+      # invariant still describes the count (#470 review).
+      assert meta.total_count_scope == "merged_candidates_with_graph"
+    end
+
+    test "graph_lane: true + fusion_strategy: :min_max injects no neighbors (lane skipped, no wasted read)" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      %{neighbor: neighbor} = seed_and_neighbor(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: results, meta: meta}} =
+        Knowledge.search_combined(tenant.id, "graphlane",
+          graph_lane: true,
+          fusion_strategy: :min_max
+        )
+
+      # min_max fusion ignores graph results entirely, so the lane is not built at all
+      # (no wasted DB read) and no neighbor leaks into the min_max output. The scope
+      # label stays the plain merged label since nothing was folded in (#470 review).
+      refute Enum.any?(results, &(&1.id == neighbor.id))
+      assert meta.total_count_scope == "merged_candidates"
     end
   end
 end
