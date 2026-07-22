@@ -3,9 +3,36 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
 
   setup :verify_on_exit!
 
+  import ExUnit.CaptureLog
+
   alias Loopctl.AdminRepo
   alias Loopctl.Coordination.ChannelPost
+  alias Loopctl.TelemetryEvents
   alias Loopctl.Workers.ChannelPostSweeper
+
+  # Telemetry handlers are GLOBAL and async tests run concurrently, so every assertion
+  # below filters on a per-test-unique `limit` (carried in the event metadata) — a
+  # concurrent emitter of the same event can never be mistaken for this test's run.
+  defp attach_sweep_telemetry(limit) do
+    handler = "test-#{inspect(make_ref())}"
+    test_pid = self()
+
+    :telemetry.attach_many(
+      handler,
+      [
+        TelemetryEvents.channel_post_swept(),
+        TelemetryEvents.channel_post_sweep_failed()
+      ],
+      fn name, measurements, metadata, _ ->
+        if metadata[:limit] == limit do
+          send(test_pid, {:telemetry, List.last(name), measurements, metadata})
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+  end
 
   # There is no channel_post fixture: create_post/4 always stamps expires_at at
   # now + 30d, so it cannot build an already-expired row. Insert ChannelPost
@@ -104,6 +131,87 @@ defmodule Loopctl.Workers.ChannelPostSweeperTest do
 
       assert is_nil(AdminRepo.get(ChannelPost, expired_a.id))
       refute is_nil(AdminRepo.get(ChannelPost, live_b.id))
+    end
+  end
+
+  # AC-39.5.5 / issue #498 — a sweep must be observable on BOTH outcomes.
+  describe "perform/1 — sweep telemetry (TC-39.5.6/7/8)" do
+    # TC-39.5.6
+    test "emits sweep-success telemetry carrying the deleted count" do
+      %{tenant: tenant, project: project, agent: agent} = setup_context()
+      attach_sweep_telemetry(7)
+
+      for _ <- 1..2, do: insert_post(tenant, project, agent, -60)
+
+      assert :ok = ChannelPostSweeper.perform(%Oban.Job{args: %{"limit" => 7}})
+
+      assert_receive {:telemetry, :channel_post_swept, %{deleted: 2}, %{limit: 7}}
+    end
+
+    # TC-39.5.7 — the load-bearing half of "success telemetry": a run that deletes
+    # NOTHING must still emit, or "nothing to do" is indistinguishable from "never ran".
+    test "emits sweep-success telemetry with deleted: 0 on a no-op run" do
+      %{tenant: tenant, project: project, agent: agent} = setup_context()
+      attach_sweep_telemetry(11)
+
+      insert_post(tenant, project, agent, 3600)
+
+      assert :ok = ChannelPostSweeper.perform(%Oban.Job{args: %{"limit" => 11}})
+
+      assert_receive {:telemetry, :channel_post_swept, %{deleted: 0}, %{limit: 11}}
+    end
+
+    # TC-39.5.8 — a DB failure must produce an error log AND failure telemetry AND
+    # still RAISE, so Oban records the failure and retries (max_attempts: 3). A rescue
+    # that returned :ok would hide a permanently dead retention sweep.
+    test "logs at error, emits failure telemetry, and re-raises on a DB failure" do
+      attach_sweep_telemetry(13)
+
+      # Break the sweep's read at the DB with NO global locks and no schema damage:
+      # a SESSION-LOCAL temp table shadows `channel_posts` on this connection only
+      # (pg_temp is searched before public), and it lacks `expires_at`, so the sweep's
+      # first statement raises Postgrex.Error. It is created inside the sandbox
+      # transaction, so it vanishes on rollback and no concurrent async test can see it.
+      AdminRepo.query!("CREATE TEMP TABLE channel_posts (id uuid)")
+
+      log =
+        capture_log(fn ->
+          assert_raise Postgrex.Error, fn ->
+            ChannelPostSweeper.perform(%Oban.Job{args: %{"limit" => 13}})
+          end
+        end)
+
+      assert log =~ "ChannelPostSweeper failed to sweep expired channel posts"
+      assert log =~ "error_class=Postgrex.Error"
+
+      assert_receive {:telemetry, :channel_post_sweep_failed, %{count: 1},
+                      %{limit: 13, error_class: "Postgrex.Error"}}
+
+      refute_receive {:telemetry, :channel_post_swept, _, _}, 50
+    end
+
+    # TC-39.5.14 — `rescue` observes EXCEPTIONS only. A DBConnection ownership/connection
+    # loss or a pool checkout failure surfacing as an `exit` would otherwise bypass the
+    # whole contract above and be visible only as Oban retry churn — the assumed-healthy
+    # failure #498 exists to close. Driven through `observed/2`, the exact function
+    # `perform/1` runs its sweep under (a genuine pool exit is not reproducible under the
+    # Ecto sandbox, and a repo double would test the double, not this contract).
+    test "logs at error, emits failure telemetry, and re-EXITS on a non-exception exit" do
+      attach_sweep_telemetry(17)
+
+      log =
+        capture_log(fn ->
+          assert catch_exit(ChannelPostSweeper.observed(17, fn -> exit(:pool_dead) end)) ==
+                   :pool_dead
+        end)
+
+      assert log =~ "ChannelPostSweeper failed to sweep expired channel posts"
+      assert log =~ "error_class=exit"
+
+      assert_receive {:telemetry, :channel_post_sweep_failed, %{count: 1},
+                      %{limit: 17, error_class: "exit"}}
+
+      refute_receive {:telemetry, :channel_post_swept, _, _}, 50
     end
   end
 

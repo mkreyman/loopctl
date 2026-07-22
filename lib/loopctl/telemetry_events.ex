@@ -307,6 +307,77 @@ defmodule Loopctl.TelemetryEvents do
   """
   def article_write, do: [:loopctl, :knowledge, :article_write]
 
+  @doc """
+  The US-39.5 channel-post retention sweep (`Loopctl.Workers.ChannelPostSweeper`)
+  COMPLETED a run (issue #498). Emitted on EVERY successful run, including a run that
+  deleted nothing — a success-only-when-non-zero signal cannot distinguish "nothing to
+  do" from "never ran", which is exactly the assumed-healthy failure #428 asked to
+  close. Pair it with `channel_post_sweep_failed/0` (the failure half) and with the
+  `:sweep_stalled` ingestion anomaly (the absence-of-success half, which catches a
+  worker that stopped being SCHEDULED at all and therefore emits neither event).
+
+  ## NOT a span
+
+  The name is FLAT (`:channel_post_swept`), deliberately not the
+  `[..., :channel_post_sweep, :stop]` span triple: there is no `:start` event and the
+  measurement is a row count, not a `:duration`. A `Telemetry.Metrics` reporter wired the
+  conventional way for a `:stop` name (`distribution(..., measurement: :duration)`) would
+  silently record nothing. Every real span in this module (`api_request_*`,
+  `webhook_delivery_*`) has a `:start` and a `:duration`; every non-span event has a flat
+  name — this follows the latter.
+
+  ## Payload (counts + bounded ints only — never post bodies, ids, or SQL)
+
+    * `measurements`: `%{deleted: n}` — rows hard-deleted in this run (0 on a no-op).
+    * `metadata`: `%{limit: n}` — the effective per-run batch bound after the
+      `min(limit, @batch_size)` clamp. A bounded integer, not a label explosion.
+  """
+  def channel_post_swept, do: [:loopctl, :coordination, :channel_post_swept]
+
+  @doc """
+  The US-39.5 channel-post retention sweep FAILED (issue #498). Emitted from the
+  worker's rescue/catch clauses immediately before the failure is RE-RAISED/RE-EXITED, so
+  Oban still records it and retries (`max_attempts: 3`) — the telemetry never swallows
+  the fault, it only makes it visible outside Oban's retry churn.
+
+  Flat name for the same reason as `channel_post_swept/0` (no span, no `:duration`).
+
+  ## Payload (atoms/bounded tags only — never a PG message body, SQL, or bound params)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{limit, error_class}` where `limit` is the effective per-run batch
+      bound and `error_class` is the raised exception's MODULE name (e.g.
+      `"Postgrex.Error"`, `"DBConnection.ConnectionError"`) or the literal `"exit"` for a
+      non-exception process exit — a bounded dimension, never the failure's message.
+  """
+  def channel_post_sweep_failed,
+    do: [:loopctl, :coordination, :channel_post_sweep_failed]
+
+  @doc """
+  The `:sweep_stalled` DETECTOR itself failed (issue #498 review) — i.e. the dead-man's
+  switch that watches the US-39.5 retention sweep is the thing that is now dead.
+
+  `Loopctl.Workers.IngestionHealthWorker` runs that detection inside its own
+  rescue/catch so a saturated 3-connection `AdminRepo` pool cannot abort the sibling
+  detectors (capture-silence flagging, reject-rate recovery, write-stats pruning). That
+  isolation is deliberate — but with a log line as its ONLY signal, a persistently
+  failing residue read (statement timeout, schema change, permission regression) would
+  reproduce at the meta level exactly the "visible only in logs / assumed healthy"
+  failure #498 exists to close. This event is the monitor's own heartbeat-of-death, so
+  the isolated-failure-domain property is kept WITHOUT the silence.
+
+  Flat name for the same reason as `channel_post_swept/0` (no span, no `:duration`).
+
+  ## Payload (atoms/bounded tags only — never a PG message body, SQL, or bound params)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{error_class}` — the raised exception's MODULE name (e.g.
+      `"Postgrex.Error"`, `"DBConnection.ConnectionError"`) or the literal `"exit"` for a
+      non-exception process exit. A bounded dimension, never the failure's message.
+  """
+  def sweep_stall_detection_failed,
+    do: [:loopctl, :knowledge, :sweep_stall_detection_failed]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -326,7 +397,10 @@ defmodule Loopctl.TelemetryEvents do
       ingestion_backlog_gate_failed_open(),
       article_linking_corpus_size(),
       recall_context_degraded(),
-      article_write()
+      article_write(),
+      channel_post_swept(),
+      channel_post_sweep_failed(),
+      sweep_stall_detection_failed()
     ]
   end
 end

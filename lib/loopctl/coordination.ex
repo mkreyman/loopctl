@@ -34,6 +34,7 @@ defmodule Loopctl.Coordination do
   alias Loopctl.Knowledge
   alias Loopctl.Projects
   alias Loopctl.Security.SecretDenylist
+  alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Story
 
   # Uniform retention for every post — one authoritative constant in code, not a
@@ -144,6 +145,91 @@ defmodule Loopctl.Coordination do
   @doc "The uniform retention window, in days, applied to every post."
   @spec retention_days() :: pos_integer()
   def retention_days, do: @retention_days
+
+  @typedoc """
+  One tenant's retention RESIDUE: expired `channel_posts` rows the US-39.5 sweep has
+  not removed. `overdue_count`/`oldest_expires_at` are computed over the BOUNDED scan
+  (see `system_retention_stall_candidates/2`).
+  """
+  @type retention_residue :: %{
+          tenant_id: binary(),
+          overdue_count: non_neg_integer(),
+          oldest_expires_at: DateTime.t() | NaiveDateTime.t()
+        }
+
+  @doc false
+  # SYSTEM/maintenance read — NOT a tenant-scoped context function.
+  #
+  # Deliberately `@doc false` and `system_`-prefixed: unlike every other function in this
+  # module it takes NO `tenant_id` and reads across ALL tenants on `AdminRepo`
+  # (BYPASSRLS). It exists solely for the install-wide `:sweep_stalled` dead-man's-switch
+  # (`Loopctl.Knowledge.IngestionHealth.detect_sweep_stalled/1`), which has no tenant to
+  # scope to — the thing it watches (`ChannelPostSweeper`) is a single global worker.
+  # NEVER call it from a controller or any tenant-facing path; a tenant-facing residue
+  # read must be written as a normal `tenant_id`-first function on `Loopctl.Repo`.
+  #
+  # Cross-tenant retention RESIDUE for the US-39.5 channel-post sweep (#498): per ACTIVE
+  # tenant, how many `channel_posts` rows are still present with `expires_at < cutoff`,
+  # and how old the oldest of them is.
+  #
+  # This lives in `Loopctl.Coordination` — the context that OWNS `channel_posts` — rather
+  # than in the detector that consumes it (`Loopctl.Knowledge.IngestionHealth`), so the
+  # knowledge context never builds a query directly on a coordination schema. The
+  # detector interprets these rows (grace window, drain-capacity, anomaly persistence);
+  # this function only reports what is on the table.
+  #
+  # ## Bounded scan (AdminRepo pool safety)
+  #
+  # The residue set only EXISTS, and only GROWS, while the sweep is not keeping up — so an
+  # unbounded `count(*)` over it would be cheap exactly when it does not matter and
+  # unbounded exactly when it does, on the 3-connection `AdminRepo` pool shared with
+  # custody/admin writes. The scan is therefore capped at `scan_limit` rows via a
+  # LIMITed subquery, and the return value reports whether the cap was HIT
+  # (`truncated?: true` ⇒ "at least `scan_limit` overdue rows exist"), so a caller can
+  # reason about a saturated backlog without ever paying for a full count.
+  #
+  # The LIMIT is install-wide and oldest-first, so under truncation a tenant's
+  # `overdue_count` is a LOWER BOUND on its residue and a tenant whose residue is newer
+  # than the cutoff sample may be ABSENT from `rows` entirely. `truncated?` is returned
+  # precisely so the consumer never reads absence-under-truncation as "this tenant has no
+  # residue" (see `IngestionHealth.auto_resolve_recovered_sweep_stalled/1`).
+  #
+  # Returns `%{rows: [retention_residue()], scanned: n, truncated?: bool}`.
+  @spec system_retention_stall_candidates(DateTime.t(), pos_integer()) :: %{
+          rows: [retention_residue()],
+          scanned: non_neg_integer(),
+          truncated?: boolean()
+        }
+  def system_retention_stall_candidates(%DateTime{} = cutoff, scan_limit)
+      when is_integer(scan_limit) and scan_limit > 0 do
+    overdue =
+      ChannelPost
+      |> join(:inner, [p], t in Tenant, on: t.id == p.tenant_id and t.status == :active)
+      |> where([p], p.expires_at < ^cutoff)
+      # OLDEST FIRST is load-bearing, not cosmetic: under truncation the sample must
+      # still contain the genuinely oldest rows, or `min(expires_at)` would UNDER-report
+      # staleness and the consumer's hard-ceiling backstop could never fire on a big
+      # backlog. The `(expires_at)` index the sweep itself uses makes this ordered read
+      # index-driven rather than a sort.
+      |> order_by([p], asc: p.expires_at)
+      |> select([p], %{tenant_id: p.tenant_id, expires_at: p.expires_at})
+      |> limit(^scan_limit)
+
+    rows =
+      from(o in subquery(overdue),
+        group_by: o.tenant_id,
+        select: %{
+          tenant_id: o.tenant_id,
+          overdue_count: count(o.tenant_id),
+          oldest_expires_at: min(o.expires_at)
+        }
+      )
+      |> AdminRepo.all()
+
+    scanned = Enum.reduce(rows, 0, &(&1.overdue_count + &2))
+
+    %{rows: rows, scanned: scanned, truncated?: scanned >= scan_limit}
+  end
 
   @doc """
   The hard safety cap on the pinned `directed_handoffs/3` set (US-40.C1). NOT a

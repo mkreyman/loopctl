@@ -78,6 +78,67 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     would otherwise fall below `min_attempts` and evade high_reject_rate detection)
   - `:reject_window_days` -- default `7`
   - `:write_stats_retention_days` -- default `90`
+  - `:sweep_staleness_hours` -- default `6` (grace hours past `expires_at` after which
+    a still-present `channel_posts` row means the retention sweep is not running)
+  - `:sweep_hard_stale_hours` -- default `24` (the ceiling past which an overdue row is
+    flagged REGARDLESS of drain capacity — see the retention-sweep detector below)
+  - `:sweep_drain_rate_per_hour` -- default `12_000` (rows/hour the bounded sweep can
+    delete install-wide: `@batch_size` 1000 × the `*/5 * * * *` cadence's 12 runs/hour)
+  - `:sweep_scan_limit` -- default `100_000` (hard cap on the residue rows scanned per
+    detection, so the cross-tenant read stays bounded on the small AdminRepo pool). MUST
+    stay above `sweep_drain_rate_per_hour * sweep_staleness_hours` or the drain-capacity
+    rule below becomes unreachable — see "Stalled vs merely BACKLOGGED".
+
+  ## Retention-sweep stall detector (`:sweep_stalled`, issue #498)
+
+  `detect_sweep_stalled/0` is the absence-of-success detector for the US-39.5
+  channel-post retention sweep (`Loopctl.Workers.ChannelPostSweeper`). It lives here,
+  next to its siblings, because it is the same detector class (the absence of expected
+  success) and it reuses the whole tested `ingestion_anomalies` alert / recovery /
+  webhook / operator-API path rather than inventing a parallel one. Unlike the other
+  two its evidence is `channel_posts` residue, not knowledge ingestion data — but it
+  never queries that table itself: the residue read is
+  `Loopctl.Coordination.system_retention_stall_candidates/2`, the owning context's API, so
+  the knowledge context does not build queries on a coordination schema. The sentinel
+  `sweep_source_type/0` (`"channel_post_sweep"`) keeps its anomalies from colliding with
+  any real article source_type.
+
+  ### Stalled vs merely BACKLOGGED
+
+  "Overdue rows exist past the grace window" alone does NOT mean the sweep is dead: the
+  sweeper is bounded at 1000 rows/run on a `*/5` cron (~12k rows/hour install-wide), so a
+  large expiry burst legitimately takes hours to drain and would page an operator about a
+  perfectly healthy sweep. The detector therefore compares the tenant's OWN observed
+  residue against the sweep's DRAIN CAPACITY over the elapsed staleness
+  (`sweep_drain_rate_per_hour * hours_stale`):
+
+    * `hours_stale >= sweep_hard_stale_hours` -> ALWAYS a candidate. This is the case the
+      capacity comparison cannot excuse: a backlog the batch bound can never drain, or a
+      sweep that is genuinely dead behind a large backlog.
+    * `overdue_count >= capacity` -> NOT a candidate. The backlog itself explains the age;
+      a running sweep could not have reached these rows yet.
+    * otherwise -> a candidate: the sweep had ample capacity to delete these rows in the
+      elapsed window and did not, so it is not running (or is running and deleting
+      nothing).
+
+  ### The comparison is PER TENANT (review of #498)
+
+  The capacity comparison uses the CANDIDATE's `overdue_count`, never the install-wide
+  `scanned` total, and the install-wide `truncated?` flag never vetoes a candidate. Both
+  were previously global, which made `channel_posts` volume a cross-tenant
+  denial-of-detection lever: one tenant's backlog saturating the scan suppressed every
+  other tenant's sub-ceiling candidate until the 24h ceiling — 4x the advertised 6h
+  window. Under truncation a tenant's `overdue_count` is a LOWER bound, so the comparison
+  can now over-flag (page) rather than under-detect during a genuine install-wide
+  backlog; that direction is the safe one for a release gate, and the rows involved are
+  by construction the OLDEST in the install.
+
+  For the capacity rule to be REACHABLE at all, `sweep_scan_limit` must exceed
+  `sweep_drain_rate_per_hour * sweep_staleness_hours` — otherwise the bounded scan can
+  never observe a residue as large as the capacity threshold and the "merely BACKLOGGED"
+  branch is dead code (it was, before this review: 50k cap vs a 72k threshold). That
+  invariant is asserted by a test; keep the three knobs consistent when tuning any of
+  them.
   """
 
   import Ecto.Query
@@ -85,6 +146,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.Coordination
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionWriteStats
@@ -102,6 +164,44 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   @default_min_attempts_overrides %{}
   @default_reject_window_days 7
   @default_write_stats_retention_days 90
+
+  # Channel-post retention-sweep stall detector defaults (#498). The sweep runs every
+  # 5 minutes, so 6 hours of overdue rows is ~72 consecutive missed runs — well past
+  # any transient backlog or deploy window, and still far inside the 30-day retention
+  # promise it protects.
+  @default_sweep_staleness_hours 6
+
+  # Ceiling past which an overdue row is flagged regardless of drain capacity: at the
+  # default drain rate this is ~288k rows of headroom, so anything still overdue after
+  # 24h is a backlog the bounded sweep can never drain (or a dead sweep behind one).
+  # Deliberately well INSIDE the 30-day retention promise it protects: this is the worst
+  # case alarm latency for a dead sweep hiding behind a backlog larger than the scan cap.
+  @default_sweep_hard_stale_hours 24
+
+  # Install-wide rows/hour the bounded sweep can delete: `ChannelPostSweeper`'s
+  # @batch_size (1000) × the `*/5 * * * *` crontab's 12 runs/hour. Config-overridable so
+  # a changed batch size or cadence can be reflected without a code change.
+  @default_sweep_drain_rate_per_hour 12_000
+
+  # Hard cap on residue rows scanned per detection run (see
+  # `Coordination.system_retention_stall_candidates/2`): the residue only grows while the
+  # sweep is behind, so the scan MUST be bounded or the detector becomes most expensive
+  # exactly when the system is least healthy — on the 3-connection AdminRepo pool.
+  #
+  # It is deliberately ABOVE `@default_sweep_drain_rate_per_hour *
+  # @default_sweep_staleness_hours` (12_000 × 6 = 72_000). At the previous 50_000 the
+  # capacity threshold could never be observed, so the "residue >= capacity ⇒ merely
+  # BACKLOGGED" rule was arithmetically unreachable and `sweep_drain_rate_per_hour` was an
+  # inert knob (#498 review). The larger cap costs nothing in a healthy install: the scan
+  # only ever touches rows ALREADY past `expires_at + grace`, of which there are zero when
+  # the sweep is running.
+  @default_sweep_scan_limit 100_000
+
+  # Fixed sentinel `source_type` for the retention-sweep detector. `ingestion_anomalies`
+  # requires a NOT NULL source_type (and the unresolved-unique partial index keys on it),
+  # but the sweep is not an article source_type at all — so it is recorded under this
+  # reserved, non-article sentinel (precedent: @unstamped_source_type below).
+  @sweep_source_type "channel_post_sweep"
 
   # Sentinel `source_type` for the NULL/unstamped write bucket. `source_type` on a
   # KB write is advisory + nullable, so the MAJORITY of agent captures (patterns,
@@ -130,6 +230,27 @@ defmodule Loopctl.Knowledge.IngestionHealth do
           reject_rate: float(),
           window_days: pos_integer(),
           dominant_reason: String.t()
+        }
+
+  @type sweep_candidate :: %{
+          tenant_id: Ecto.UUID.t(),
+          source_type: String.t(),
+          anomaly_type: :sweep_stalled,
+          overdue_count: pos_integer(),
+          oldest_expires_at: DateTime.t(),
+          hours_stale: non_neg_integer(),
+          grace_hours: pos_integer()
+        }
+
+  @typedoc """
+  One retention-residue scan: the tenants to FLAG plus the RAW facts recovery needs.
+  See `detect_sweep_stalled_scan/0`.
+  """
+  @type sweep_scan :: %{
+          candidates: [sweep_candidate()],
+          residue_tenant_ids: MapSet.t(Ecto.UUID.t()),
+          truncated?: boolean(),
+          scanned: non_neg_integer()
         }
 
   # --- Config accessors (documented defaults) ---
@@ -236,6 +357,56 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   """
   @spec unstamped_source_type() :: String.t()
   def unstamped_source_type, do: @unstamped_source_type
+
+  @doc """
+  Grace period (in hours) past `expires_at` after which a still-present `channel_posts`
+  row means the US-39.5 retention sweep is not being enforced. Default 6 (~72 missed
+  5-minute runs).
+  """
+  @spec sweep_staleness_hours() :: pos_integer()
+  def sweep_staleness_hours,
+    do: Keyword.get(config(), :sweep_staleness_hours, @default_sweep_staleness_hours)
+
+  @doc """
+  Staleness ceiling (in hours) past which an overdue `channel_posts` row is flagged
+  REGARDLESS of the sweep's drain capacity. Default 24. This is the backstop for a
+  backlog the bounded sweep can never drain — the case the capacity comparison in
+  `detect_sweep_stalled/1` deliberately excuses below the ceiling.
+  """
+  @spec sweep_hard_stale_hours() :: pos_integer()
+  def sweep_hard_stale_hours,
+    do: Keyword.get(config(), :sweep_hard_stale_hours, @default_sweep_hard_stale_hours)
+
+  @doc """
+  Rows/hour the bounded US-39.5 sweep can delete install-wide (default 12_000 = the
+  worker's 1000-row batch × the `*/5` crontab's 12 runs/hour). Used to tell a STALLED
+  sweep from one that is merely BACKLOGGED.
+  """
+  @spec sweep_drain_rate_per_hour() :: pos_integer()
+  def sweep_drain_rate_per_hour,
+    do: Keyword.get(config(), :sweep_drain_rate_per_hour, @default_sweep_drain_rate_per_hour)
+
+  @doc """
+  Hard cap on residue rows scanned per stall detection (default 100_000). Keeps the
+  cross-tenant read bounded on the small AdminRepo pool; hitting the cap is itself
+  evidence of a large backlog, and makes the scan sample INCOMPLETE — which is why a
+  truncated scan closes no anomalies (see `auto_resolve_recovered_sweep_stalled/1`).
+
+  MUST stay above `sweep_drain_rate_per_hour() * sweep_staleness_hours()`, or the
+  drain-capacity branch of `detect_sweep_stalled/1` can never be reached (a residue can
+  never be OBSERVED as large as the threshold it is compared against).
+  """
+  @spec sweep_scan_limit() :: pos_integer()
+  def sweep_scan_limit,
+    do: Keyword.get(config(), :sweep_scan_limit, @default_sweep_scan_limit)
+
+  @doc """
+  Reserved sentinel `source_type` under which `:sweep_stalled` anomalies are recorded
+  (`"channel_post_sweep"`). The sweep is not an article source_type; see the module
+  attribute for why a sentinel is required.
+  """
+  @spec sweep_source_type() :: String.t()
+  def sweep_source_type, do: @sweep_source_type
 
   defp config, do: Application.get_env(:loopctl, :ingestion_health, [])
 
@@ -484,6 +655,217 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   defp to_int(%Decimal{} = d), do: Decimal.to_integer(d)
   defp to_int(n) when is_integer(n), do: n
 
+  # --- Retention-sweep stall detection (#498) ---
+
+  @doc """
+  Scans for tenants whose US-39.5 channel-post retention sweep has STALLED, using the
+  configured grace window. Returns a flat list of `t:sweep_candidate/0` maps — PURE,
+  no DB writes.
+
+  A tenant is a candidate when it still holds `channel_posts` rows whose `expires_at`
+  is more than `sweep_staleness_hours/0` in the past AND that residue is NOT explainable
+  by the bounded sweep's own drain capacity (see the moduledoc's "Stalled vs merely
+  BACKLOGGED"). That is an OUTCOME check, not a liveness proxy: rows that should have
+  been hard-deleted are still there and the sweep had the capacity to delete them, so
+  the 30-day retention window is by construction not being enforced for that tenant —
+  whether the worker crashed, stopped being scheduled, lost its permissions, or is
+  running but never draining. The complementary in-band signals (a run that happened
+  and succeeded/failed) are the `channel_post_swept/channel_post_sweep_failed` telemetry
+  the worker emits; this detector is the half that survives the worker never running.
+
+  Cross-tenant and set-based: ONE BOUNDED grouped read via
+  `Loopctl.Coordination.system_retention_stall_candidates/2` (the owning context's API),
+  joined to ACTIVE tenants (same shape as `detect/1`), so a suspended tenant's leftovers
+  never page anyone.
+
+  Returns only the candidate list. The worker uses `detect_sweep_stalled_scan/0,1`
+  instead, because RECOVERY must be decided against the RAW residue rather than this
+  post-filter list (a suppressed-but-still-stalled tenant is not a recovered one).
+  """
+  @spec detect_sweep_stalled() :: [sweep_candidate()]
+  def detect_sweep_stalled, do: detect_sweep_stalled_scan().candidates
+
+  @doc """
+  `detect_sweep_stalled/0` with explicit config. `:sweep_staleness_hours` is required;
+  `:sweep_hard_stale_hours`, `:sweep_drain_rate_per_hour` and `:sweep_scan_limit` fall
+  back to their accessors. Exposed so a caller can drive detection with a specific
+  configuration without touching global app env.
+  """
+  @spec detect_sweep_stalled(map()) :: [sweep_candidate()]
+  def detect_sweep_stalled(%{sweep_staleness_hours: _} = opts),
+    do: detect_sweep_stalled_scan(opts).candidates
+
+  @doc """
+  `detect_sweep_stalled/0` plus the RAW scan facts recovery needs.
+
+  Returns `t:sweep_scan/0`:
+
+    * `:candidates` — exactly what `detect_sweep_stalled/0` returns (post drain-capacity
+      filter): the tenants to FLAG.
+    * `:residue_tenant_ids` — every ACTIVE tenant observed holding overdue residue,
+      BEFORE the drain-capacity filter. This is the recovery predicate: a tenant excused
+      as "merely backlogged" has NOT recovered, and closing its open anomaly would write
+      a false `resolved` claim into the append-only audit log.
+    * `:truncated?` — the bounded scan hit its cap, so `residue_tenant_ids` is INCOMPLETE
+      (the LIMIT is install-wide and oldest-first, so a tenant with newer residue can be
+      missing altogether). Recovery must not run at all on a truncated scan.
+    * `:scanned` — rows scanned (bounded by `sweep_scan_limit`), for observability.
+  """
+  @spec detect_sweep_stalled_scan() :: sweep_scan()
+  def detect_sweep_stalled_scan do
+    detect_sweep_stalled_scan(%{
+      sweep_staleness_hours: sweep_staleness_hours(),
+      sweep_hard_stale_hours: sweep_hard_stale_hours(),
+      sweep_drain_rate_per_hour: sweep_drain_rate_per_hour(),
+      sweep_scan_limit: sweep_scan_limit()
+    })
+  end
+
+  @doc """
+  `detect_sweep_stalled_scan/0` with explicit config (same option handling as
+  `detect_sweep_stalled/1`).
+  """
+  @spec detect_sweep_stalled_scan(map()) :: sweep_scan()
+  def detect_sweep_stalled_scan(%{sweep_staleness_hours: grace_hours} = opts) do
+    now = DateTime.utc_now()
+    cutoff = DateTime.add(now, -grace_hours * 3600, :second)
+    hard_hours = Map.get(opts, :sweep_hard_stale_hours, sweep_hard_stale_hours())
+    drain_rate = Map.get(opts, :sweep_drain_rate_per_hour, sweep_drain_rate_per_hour())
+    scan_limit = Map.get(opts, :sweep_scan_limit, sweep_scan_limit())
+
+    %{rows: rows, scanned: scanned, truncated?: truncated?} =
+      Coordination.system_retention_stall_candidates(cutoff, scan_limit)
+
+    observed = Enum.map(rows, &sweep_candidate(&1, grace_hours, now))
+
+    %{
+      candidates: Enum.filter(observed, &stalled?(&1, hard_hours, drain_rate)),
+      residue_tenant_ids: MapSet.new(observed, & &1.tenant_id),
+      truncated?: truncated?,
+      scanned: scanned
+    }
+  end
+
+  # Tell a STALLED sweep from a merely BACKLOGGED one (#498 review). Above the hard
+  # ceiling everything is a stall — that is the backlog-the-bound-can-never-drain case.
+  # Below it, a residue at least as large as what the sweep could have deleted in the
+  # elapsed window is explained by the backlog itself, so it is NOT paged.
+  #
+  # PER TENANT by construction: the comparison uses THIS candidate's `overdue_count`, and
+  # the install-wide `truncated?`/`scanned` figures are deliberately absent. Making them
+  # inputs (as the first cut did) let any one tenant's `channel_posts` volume veto
+  # detection for every other tenant — see the moduledoc's "The comparison is PER TENANT".
+  defp stalled?(candidate, hard_hours, drain_rate) do
+    candidate.hours_stale >= hard_hours or
+      candidate.overdue_count < drain_rate * max(candidate.hours_stale, 1)
+  end
+
+  defp sweep_candidate(
+         %{tenant_id: tenant_id, overdue_count: count, oldest_expires_at: oldest},
+         grace_hours,
+         now
+       ) do
+    oldest_dt = to_utc_datetime(oldest)
+
+    %{
+      tenant_id: tenant_id,
+      source_type: @sweep_source_type,
+      anomaly_type: :sweep_stalled,
+      overdue_count: count,
+      oldest_expires_at: oldest_dt,
+      # How long retention has ACTUALLY been unenforced: whole hours the oldest overdue
+      # row has outlived its own expires_at (>= grace_hours by construction, but the
+      # figure reported is the true age, not the threshold).
+      hours_stale: max(hours_between(oldest_dt, now), 0),
+      grace_hours: grace_hours
+    }
+  end
+
+  @doc """
+  Closes `:sweep_stalled` anomalies whose sweep has RECOVERED.
+
+  Like `:high_reject_rate`, a stall has no natural "resumed" event, so recovery is
+  defined by the RAW residue: the tenant holds no overdue expired `channel_posts` at all
+  (the sweep drained the backlog). `scan` is the SAME `t:sweep_scan/0` the worker just
+  computed, so this shares one scan.
+
+  ## Recovery is decided on the RAW residue, never the filtered candidate list
+
+  `scan.candidates` is post-`stalled?` — a tenant can drop out of it for two reasons that
+  are NOT recovery: its residue was excused as merely BACKLOGGED (drain capacity), or the
+  bounded scan truncated. Closing on those would stamp `resolved: true` + a `resolved`
+  transition into the append-only hash-chained audit log, asserting a release-gate
+  recovery that did not happen — and, because the close also stamps `last_event_at` and
+  therefore RE-ARMS detection, a residue oscillating across that boundary would
+  close/re-create/re-alert every hourly run. So:
+
+    * the predicate is `scan.residue_tenant_ids` (every tenant OBSERVED holding residue),
+      not the candidate list; and
+    * a `truncated?` scan closes NOTHING — under an install-wide, oldest-first LIMIT a
+      still-stalled tenant can be missing from the sample entirely, and absence there is
+      not evidence of absence on the table.
+
+  For each ACTIVE stall anomaly (`archived == false` and `last_event_at IS NULL`,
+  covering both open rows and operator-resolved-but-still-stalled episodes) whose
+  tenant is NOT in the residue set, it stamps `last_event_at` with the recovery time
+  and sets `resolved: true`. This is the type's OWN close path: the existing
+  auto-resolvers are anomaly_type-scoped (`:capture_silence` / `:high_reject_rate`), so
+  without it a `sweep_stalled` row would freeze open forever AND keep suppressing a
+  future stall. Returns the number of anomalies closed. Called by the hourly worker.
+
+  ## Only an ACTIVE tenant can "recover"
+
+  Detection inner-joins ACTIVE tenants, so SUSPENDING a tenant (or deleting the project
+  whose `channel_posts` cascade away) drops it from the residue set even though the
+  sweep may still be dead. Closing on that would write `resolved: true` plus an audit
+  entry ASSERTING retention recovered into the append-only, hash-chained log — a false
+  claim about a release gate. So the close is gated on the anomaly's tenant still being
+  ACTIVE: a suspended tenant's stall row stays OPEN (and re-closes normally if the
+  tenant is reactivated and the backlog is genuinely gone).
+  """
+  @spec auto_resolve_recovered_sweep_stalled(sweep_scan()) :: non_neg_integer()
+  def auto_resolve_recovered_sweep_stalled(%{truncated?: true}), do: 0
+
+  def auto_resolve_recovered_sweep_stalled(%{residue_tenant_ids: residue}) do
+    now = DateTime.utc_now()
+
+    anomalies = active_episode_anomalies(:sweep_stalled)
+    active_tenants = active_tenant_ids(Enum.map(anomalies, & &1.tenant_id))
+
+    Enum.reduce(anomalies, 0, fn anomaly, acc ->
+      recovered? =
+        MapSet.member?(active_tenants, anomaly.tenant_id) and
+          not MapSet.member?(residue, anomaly.tenant_id)
+
+      if recovered?,
+        do: acc + close_recovered_episode(anomaly, now, "auto_resolve_sweep_stalled"),
+        else: acc
+    end)
+  end
+
+  # The ACTIVE-episode rows for an episode-shaped detector: not archived, and
+  # `last_event_at IS NULL` (covering both open rows and operator-resolved-but-still-
+  # active episodes). Shared by the reject-rate and sweep-stall auto-resolvers.
+  defp active_episode_anomalies(anomaly_type) do
+    IngestionAnomaly
+    |> where([a], a.anomaly_type == ^anomaly_type)
+    |> where([a], a.archived == false)
+    |> where([a], is_nil(a.last_event_at))
+    |> AdminRepo.all()
+  end
+
+  defp active_tenant_ids([]), do: MapSet.new()
+
+  defp active_tenant_ids(tenant_ids) do
+    ids = Enum.uniq(tenant_ids)
+
+    Tenant
+    |> where([t], t.id in ^ids and t.status == :active)
+    |> select([t], t.id)
+    |> AdminRepo.all()
+    |> MapSet.new()
+  end
+
   @doc """
   Whether the tenant has EVER seen ingestion activity for `source_type` — either a
   recorded write-outcome (`ingestion_write_stats`, the create-path telemetry) OR a
@@ -496,8 +878,15 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   writes are stored with a NULL/empty `source_type`, so it probes those rows rather than
   matching the literal sentinel string (which no row carries) — otherwise a tenant with
   real unstamped traffic would be falsely warned "no recorded activity".
+
+  The `sweep_source_type/0` sentinel (`"channel_post_sweep"`) is likewise special-cased
+  and always reports SEEN: it names the retention-sweep detector rather than an
+  ingestion stream, so no `articles`/`ingestion_write_stats` row will ever carry it and
+  the generic probe would falsely warn on a legitimate filter.
   """
   @spec source_type_seen?(Ecto.UUID.t(), String.t()) :: boolean()
+  def source_type_seen?(_tenant_id, @sweep_source_type), do: true
+
   def source_type_seen?(tenant_id, source_type) when is_binary(source_type) do
     write_stats_seen?(tenant_id, source_type) or articles_seen?(tenant_id, source_type)
   end
@@ -817,30 +1206,31 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     active_keys = MapSet.new(current_candidates, &{&1.tenant_id, &1.source_type})
     now = DateTime.utc_now()
 
-    IngestionAnomaly
-    |> where([a], a.anomaly_type == :high_reject_rate)
-    |> where([a], a.archived == false)
-    |> where([a], is_nil(a.last_event_at))
-    |> AdminRepo.all()
+    :high_reject_rate
+    |> active_episode_anomalies()
     |> Enum.reduce(0, fn anomaly, acc ->
       if MapSet.member?(active_keys, {anomaly.tenant_id, anomaly.source_type}),
         do: acc,
-        else: acc + close_recovered_reject(anomaly, now)
+        else: acc + close_recovered_episode(anomaly, now, "auto_resolve_reject_rate")
     end)
   end
 
-  # Stamp the recovery time (episode ended) + mark resolved, auditing the resolve
+  # The ONE close path for both episode-shaped detectors (`:high_reject_rate`,
+  # `:sweep_stalled`) — they differ only in the audit `actor_label`, so parameterizing
+  # it keeps this audit-chain-writing transaction correct in exactly one place.
+  #
+  # Stamps the recovery time (episode ended) + marks resolved, auditing the resolve
   # transition only when the row was previously unresolved (an already-resolved row is
   # a system bookkeeping mark, not a state change worth a resolved-audit entry).
   #
-  # The candidate struct was bulk-loaded UNLOCKED in auto_resolve_recovered_reject_rate/1
-  # (AdminRepo.all, no FOR UPDATE). If an operator PATCH-resolves or archives the same
-  # anomaly between that load and this transaction, `anomaly.resolved` would be STALE
-  # (false), so trusting it would write a bogus resolved:false->true entry into the
-  # append-only, hash-chained audit log for a flip that already happened. So re-read the
-  # row FOR UPDATE inside the transaction and compute `was_resolved` from the LOCKED row
-  # — matching transition/8's locked, audit-honest flip.
-  defp close_recovered_reject(%IngestionAnomaly{id: id, tenant_id: tenant_id}, now) do
+  # The candidate struct was bulk-loaded UNLOCKED by the caller (AdminRepo.all, no FOR
+  # UPDATE). If an operator PATCH-resolves or archives the same anomaly between that load
+  # and this transaction, `anomaly.resolved` would be STALE (false), so trusting it would
+  # write a bogus resolved:false->true entry into the append-only, hash-chained audit log
+  # for a flip that already happened. So re-read the row FOR UPDATE inside the transaction
+  # and compute `was_resolved` from the LOCKED row — matching transition/8's locked,
+  # audit-honest flip.
+  defp close_recovered_episode(%IngestionAnomaly{id: id, tenant_id: tenant_id}, now, actor_label) do
     multi =
       Multi.new()
       |> Multi.run(:locked, fn repo, _changes ->
@@ -855,7 +1245,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
       |> Multi.run(:anomaly, fn repo, %{locked: locked} ->
         case locked do
           nil -> {:error, :not_found}
-          row -> row |> IngestionAnomaly.reject_recovered_changeset(now) |> repo.update()
+          row -> row |> IngestionAnomaly.episode_recovered_changeset(now) |> repo.update()
         end
       end)
       |> Multi.run(:audit, fn repo, %{locked: locked, anomaly: updated} ->
@@ -868,7 +1258,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
               tenant_id,
               updated.id,
               "resolved",
-              [actor_type: "system", actor_label: "ingestion_health:auto_resolve_reject_rate"],
+              [actor_type: "system", actor_label: "ingestion_health:#{actor_label}"],
               %{old_state: %{"resolved" => false}, new_state: %{"resolved" => true}}
             )
           )

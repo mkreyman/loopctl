@@ -3375,9 +3375,13 @@ const TOOLS = [
     name: "get_ingestion_anomalies",
     description:
       "Get ingestion-health anomalies — capture_silence (a source_type that was producing " +
-      "articles has gone silent) and high_reject_rate (writes attempted but rejected at high " +
-      "rate — 409 title_conflict / validation drops that persist no article row). Use to check " +
-      "whether knowledge capture is still landing AND being accepted. Paginated (page/page_size); " +
+      "articles has gone silent), high_reject_rate (writes attempted but rejected at high " +
+      "rate — 409 title_conflict / validation drops that persist no article row), and " +
+      "sweep_stalled (the 30-day channel-post retention sweep is no longer enforcing " +
+      "retention for this tenant — expired coordination-bus posts are still present well " +
+      "past their expires_at; recorded under the reserved source_type channel_post_sweep). " +
+      "Use to check whether knowledge capture is still landing AND being accepted, and " +
+      "whether coordination-bus retention is still being enforced. Paginated (page/page_size); " +
       "advance `page` to enumerate all. Filter by source_type, anomaly_type, resolved status, or " +
       "include archived.",
     inputSchema: {
@@ -3391,10 +3395,11 @@ const TOOLS = [
           type: "string",
           // Keep in sync with Loopctl.Knowledge.IngestionAnomaly @anomaly_types (the
           // server-side Ecto.Enum + the ingestion_anomalies_anomaly_type_check DB CHECK).
-          enum: ["capture_silence", "high_reject_rate"],
+          enum: ["capture_silence", "high_reject_rate", "sweep_stalled"],
           description:
-            'Optional: filter by anomaly type — "capture_silence" (writes stopped) or ' +
-            '"high_reject_rate" (writes rejected at high rate).',
+            'Optional: filter by anomaly type — "capture_silence" (writes stopped), ' +
+            '"high_reject_rate" (writes rejected at high rate), or "sweep_stalled" ' +
+            '(the channel-post retention sweep is not enforcing the 30-day window).',
         },
         resolved: {
           type: "string",

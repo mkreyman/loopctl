@@ -221,7 +221,7 @@ Epic 39 Repo Coordination Bus — a lightweight, tenant-isolated channel for age
 | `get_cost_summary` | orch | Get cost/token usage summary for a project, optionally broken down by `agent`, `epic`, or `model`. |
 | `get_story_token_usage` | orch | Get all token usage records for a single story. |
 | `get_cost_anomalies` | orch | Get cost anomaly alerts — stories or agents exceeding expected budgets. Optionally filter by project. |
-| `get_ingestion_anomalies` | orch | Get ingestion-health anomalies — capture_silence (a source_type stopped producing articles) and high_reject_rate (writes rejected at high rate, persisting no article row). Check whether knowledge capture is still landing AND being accepted. |
+| `get_ingestion_anomalies` | orch | Get ingestion-health anomalies — capture_silence (a source_type stopped producing articles), high_reject_rate (writes rejected at high rate, persisting no article row), and sweep_stalled (the 30-day channel-post retention sweep is no longer enforcing retention, under the reserved source_type `channel_post_sweep`). Check whether knowledge capture is still landing AND being accepted, and whether coordination-bus retention is still enforced. |
 | `set_token_budget` | orch | Set a token budget (in millicents) for a project, epic, story, or agent scope. Requires orchestrator role. |
 
 ### Knowledge Wiki Tools (agent key)

@@ -28,6 +28,18 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
     episode is ACTIVE and is stamped with the recovery time (episode ENDED) by
     `Loopctl.Knowledge.IngestionHealth.auto_resolve_recovered_reject_rate/1` — that
     stamp is what re-arms detection so a future reject storm re-fires.
+  - `sweep_stalled` -- the US-39.5 channel-post retention sweep is NOT being enforced
+    for this tenant: expired `channel_posts` rows (`expires_at` in the past) are still
+    present far beyond the configured grace window (issue #498). Detected off
+    `channel_posts`, not `articles`. The freshness fields are repurposed the same way
+    as `high_reject_rate`: `sample_count` = the number of overdue expired rows;
+    `hours_stale` = how many whole hours the OLDEST overdue row has outlived its
+    `expires_at` (how long retention has been unenforced); `last_event_at` starts nil
+    while the stall is ACTIVE and is stamped with the recovery time (no overdue rows
+    remain) by `Loopctl.Knowledge.IngestionHealth.auto_resolve_recovered_sweep_stalled/1`
+    — that stamp re-arms detection so a future stall re-fires. Recorded under the
+    fixed sentinel `source_type` `IngestionHealth.sweep_source_type/0`
+    (`"channel_post_sweep"`), since the sweep is not an article source_type.
 
   ## Fields
 
@@ -57,7 +69,7 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
   # Extensible list — kept in sync with the `ingestion_anomalies_anomaly_type_check`
   # DB CHECK constraint (widened per new value via migration). A future detector can
   # be added here alongside a CHECK-widening migration.
-  @anomaly_types [:capture_silence, :high_reject_rate]
+  @anomaly_types [:capture_silence, :high_reject_rate, :sweep_stalled]
 
   @derive {Jason.Encoder,
            only: [
@@ -128,11 +140,16 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
   # ("not actually stale") is a logically impossible anomaly, rejected at the boundary
   # even though detection already only feeds stale figures. A high_reject_rate anomaly
   # has no staleness dimension (its evidence is the reject ratio in metadata), so
-  # hours_stale is a non-meaningful 0 — allow >= 0.
+  # hours_stale is a non-meaningful 0 — allow >= 0. A sweep_stalled anomaly DOES carry a
+  # staleness dimension (hours the oldest overdue row has outlived its expires_at) but it
+  # is measured against a grace window that an operator may configure below one hour, so
+  # a genuine stall can round to 0 whole hours — allow >= 0 rather than rejecting a real
+  # retention failure at the boundary.
   defp validate_type_invariants(changeset) do
     case get_field(changeset, :anomaly_type) do
       :capture_silence -> validate_number(changeset, :hours_stale, greater_than: 0)
       :high_reject_rate -> validate_number(changeset, :hours_stale, greater_than_or_equal_to: 0)
+      :sweep_stalled -> validate_number(changeset, :hours_stale, greater_than_or_equal_to: 0)
       _ -> changeset
     end
   end
@@ -146,15 +163,19 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
   end
 
   @doc """
-  Changeset closing a RECOVERED `:high_reject_rate` anomaly.
+  Changeset closing a RECOVERED EPISODE-shaped anomaly (`:high_reject_rate`,
+  `:sweep_stalled`).
 
-  Sets `resolved: true` (closing an open row) AND stamps `last_event_at` with the
-  recovery time. The `last_event_at` stamp marks the reject episode as ENDED so it
-  no longer suppresses re-detection — a future storm for the same source_type
-  re-fires. Applied by `IngestionHealth.auto_resolve_recovered_reject_rate/1`.
+  Both types share one episode shape — no natural "resumed" event, so recovery means
+  "no longer a candidate" — and therefore ONE close changeset. Sets `resolved: true`
+  (closing an open row) AND stamps `last_event_at` with the recovery time. The
+  `last_event_at` stamp marks the episode as ENDED so it no longer suppresses
+  re-detection — a future storm/stall re-fires. Applied by
+  `IngestionHealth.auto_resolve_recovered_reject_rate/1` and
+  `IngestionHealth.auto_resolve_recovered_sweep_stalled/1`.
   """
-  @spec reject_recovered_changeset(%__MODULE__{}, DateTime.t()) :: Ecto.Changeset.t()
-  def reject_recovered_changeset(anomaly, recovered_at) do
+  @spec episode_recovered_changeset(%__MODULE__{}, DateTime.t()) :: Ecto.Changeset.t()
+  def episode_recovered_changeset(anomaly, recovered_at) do
     change(anomaly, resolved: true, last_event_at: recovered_at)
   end
 

@@ -213,7 +213,32 @@ config :loopctl, :ingestion_health,
   # Retention (days) for the append-only `ingestion_write_stats` rollup; the hourly
   # worker prunes older rows so the table (and the cross-tenant reject-rate scan) stays
   # bounded. Only the rolling `reject_window_days` window is ever read.
-  write_stats_retention_days: 90
+  write_stats_retention_days: 90,
+  # #498 (retention-sweep stall detector): grace hours past `expires_at` after which a
+  # still-present `channel_posts` row means the US-39.5 sweep is not being enforced for
+  # that tenant. The sweep runs every 5 minutes, so 6h is ~72 consecutive missed runs.
+  sweep_staleness_hours: 6,
+  # Staleness ceiling past which residue is flagged REGARDLESS of drain capacity — the
+  # backstop for a backlog the bounded sweep can never drain (and the worst-case alarm
+  # latency for a dead sweep hiding behind a backlog larger than sweep_scan_limit).
+  sweep_hard_stale_hours: 24,
+  # Install-wide rows/hour the bounded sweep can delete (1000-row batch x 12 runs/hour).
+  # Below the hard ceiling, a TENANT's own residue this large is BACKLOG, not a stall —
+  # flagging it would page an operator about a healthy sweep that is simply still
+  # draining.
+  sweep_drain_rate_per_hour: 12_000,
+  # Hard cap on residue rows scanned per detection: the residue only grows while the
+  # sweep is behind, so an unbounded count would be most expensive exactly when the
+  # system is least healthy — on the 3-connection AdminRepo pool.
+  #
+  # INVARIANT (asserted by test): this MUST stay above
+  # sweep_drain_rate_per_hour x sweep_staleness_hours (12_000 x 6 = 72_000). At the
+  # previous 50_000 a residue could never be OBSERVED as large as the capacity threshold
+  # it is compared against, so the "residue >= capacity => merely BACKLOGGED" rule was
+  # arithmetically unreachable and sweep_drain_rate_per_hour was an inert knob. The
+  # larger cap is free in a healthy install: it only ever scans rows already past
+  # expires_at + grace, of which a running sweep leaves none.
+  sweep_scan_limit: 100_000
 
 # US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
 # defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/
