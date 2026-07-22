@@ -12,19 +12,26 @@ one item that adds a new API surface. Items 1–3 are independent of each other;
 `lib/loopctl/coordination.ex` heavily, so it goes last to avoid conflicting with item 1's and
 item 2's edits to the same area.
 
+> **Amendment (2026-07-22, signed off during the #497 review).** Item 1 was planned as
+> docs-only; as delivered it also carries three behavior-neutral non-doc hunks (see Item 1's
+> amended acceptance). The ordering rationale above still holds — the hunks are a one-line
+> comment cross-reference, a one-line escaping fix in a comment, and one added test — none of
+> which touch the `coordination.ex` logic item 4 rewrites, so the conflict risk the ordering
+> was protecting against is unchanged.
+
 ---
 
 ## Item 1 — #497: correct the US-39.2 / US-39.3 story specs to match shipped code
 
-**Docs-only. No code change.**
+**Docs-first. Three behavior-neutral non-doc hunks — see the amended acceptance below.**
 
 The two refinements were implemented correctly but the story JSONs were never amended, so the
 specs still describe the pre-correction behavior. Verified present in code today:
 
 - `conflict_target` mirroring the partial unique index columns **and** its WHERE predicate —
-  `lib/loopctl/coordination.ex:1611-1626`
-- `GREATEST(inserted_at, updated_at)` for both the delta filter (`:2229`) and the delta ordering
-  (`:2287`)
+  `Coordination.insert_opts/1` + `keyed_slot_on_conflict/0`
+- `GREATEST(inserted_at, updated_at)` for both the delta filter (`apply_since/2`) and the delta
+  ordering (`order_recent/2`)
 
 ### Scope
 
@@ -38,7 +45,7 @@ specs still describe the pre-correction behavior. Verified present in code today
 ### Malformed `since` — record the as-built decision, do not change behavior
 
 #428 asked for "empty result or 400, never a 500". The shipped behavior
-(`normalize_since/1`, `lib/loopctl/coordination.ex:2212-2221`) resolves a malformed, absent, or
+(`Coordination.normalize_since/1`) resolves a malformed, absent, or
 date-only value to `nil` — a no-op filter that falls back to the newest page. The hard
 requirement (never a 500) **holds**; the "empty result or 400" wording does not.
 
@@ -47,9 +54,33 @@ optimization on a fail-open SessionStart path, and returning the newest page on 
 strictly safer for that consumer than a 400 that would blank the TEAM CHANNEL block. This is a
 deliberate as-built decision, not an unfixed finding — the spec is what is wrong here.
 
-### Acceptance
+### Acceptance (amended 2026-07-22 during the #497 review — signed off)
 
-- Both JSONs describe the shipped behavior; no code diff in this PR.
+- Both JSONs describe the shipped behavior. **Superseded:** the original bullet read "no code
+  diff in this PR". As delivered the branch carries exactly three non-doc hunks, each
+  behavior-neutral, each in service of the same spec-to-code fidelity goal, and each kept
+  deliberately rather than reverted:
+  1. `lib/loopctl/coordination.ex` — a comment cross-reference to the `unsafe_fragment`
+     precedent in `memory.ex` that pointed at the wrong line; corrected while writing the
+     AC-39.2.5 amendment that cites the same precedent. Comment only.
+  2. `lib/loopctl/coordination/channel_post.ex` — a **literal NUL byte** embedded in a source
+     comment (verified on `master` with `od -c`) replaced with the escaped text `\x00`. The
+     comment documents NUL scanning; containing a raw NUL made the file hostile to grep and to
+     any tool that reads it. Comment only.
+  3. `test/loopctl/coordination_test.exs` — the new cross-agent-clobber test backing the new
+     TC-39.2.7. This story's whole thesis is that AC-39.2.5's cross-AGENT half was unstated and
+     unguarded; adding the spec case without the guard would re-open the same drift.
+- The three hunks do **not** touch the `coordination.ex` logic Item 4 rewrites, so the
+  "sequence Item 1 before Item 4 to avoid conflicts" rationale is unaffected.
+- Also amended in the same pass: **`us_39.1.json`** (the schema-owning story — its AC-39.1.3 and
+  matching technical note still stated the pre-hardening 4-column slot tuple and a dropped
+  index, contradicting its own dependent US-39.2) and **`docs/repo-coordination-bus.md` §3.5**
+  (which had drifted further, to a 3-column project-global slot).
+- Citations across the touched specs anchor on **function/arity, index name, migration filename
+  and verbatim test name** — not line spans, which rot on every insertion (this branch alone
+  shifted every test-file line ref below 1193). The contradicting Epic 40 refs to the same
+  functions (`order_recent/2`, `recent_page/3`, `insert_opts/1`, the limit-clamp attributes)
+  were corrected the same way.
 - `mix precommit` green.
 
 ---
