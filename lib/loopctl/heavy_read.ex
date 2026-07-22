@@ -412,12 +412,75 @@ defmodule Loopctl.HeavyRead do
 
   # The per-read `hnsw.iterative_scan` mode to APPLY via `SET LOCAL`, or `nil` when OFF
   # (the default) — so the common path issues NO iterative-scan GUC round-trip and pgvector
-  # versions without the GUC are never touched.
+  # versions without the GUC are never touched. When an operator HAS enabled it, the
+  # capability probe (`iterative_scan_supported?/0`) is the second gate: on a pgvector < 0.8
+  # backend (no such GUC) it returns `nil` too, so enabling the config there is a NO-OP
+  # rather than a fleet-wide ANN outage. The `"off"` clause short-circuits BEFORE the probe,
+  # so the default path never pays for it.
   @spec iterative_scan_override() :: String.t() | nil
   defp iterative_scan_override do
     case hnsw_iterative_scan() do
       "off" -> nil
-      mode -> mode
+      mode -> if iterative_scan_supported?(), do: mode, else: nil
+    end
+  end
+
+  @iterative_scan_min_version {0, 8, 0}
+
+  @doc """
+  Whether the connected pgvector supports `hnsw.iterative_scan` (pgvector >= 0.8.0).
+
+  Probed ONCE from `pg_extension` and cached in `:persistent_term`. The probe runs only when
+  an operator has actually enabled iterative scan (`iterative_scan_override/0` short-circuits
+  at OFF), so it costs one extra round-trip on the first enabled use and nothing after.
+  FAILS CLOSED: any error / missing row / unparseable version → `false`, so no
+  `hnsw.iterative_scan` GUC is emitted against a backend that would reject it and abort the
+  heavy-read transaction. This is what makes the "safe on pgvector < 0.8" guarantee hold even
+  if the config is enabled on such a backend.
+  """
+  @spec iterative_scan_supported?() :: boolean()
+  def iterative_scan_supported? do
+    case :persistent_term.get({__MODULE__, :iterative_scan_supported}, :unknown) do
+      :unknown ->
+        supported = probe_iterative_scan_support()
+        :persistent_term.put({__MODULE__, :iterative_scan_supported}, supported)
+        supported
+
+      cached ->
+        cached
+    end
+  end
+
+  defp probe_iterative_scan_support do
+    case Loopctl.Repo.query("SELECT extversion FROM pg_extension WHERE extname = 'vector'", []) do
+      {:ok, %{rows: [[version]]}} when is_binary(version) ->
+        version_at_least?(version, @iterative_scan_min_version)
+
+      _ ->
+        false
+    end
+  rescue
+    _ -> false
+  end
+
+  @doc """
+  Compare a `"MAJOR.MINOR[.PATCH]"` pgvector extversion against a `{maj, min, patch}` floor.
+  Malformed / non-numeric versions FAIL CLOSED (`false`), never raise.
+  """
+  @spec version_at_least?(String.t(), {non_neg_integer(), non_neg_integer(), non_neg_integer()}) ::
+          boolean()
+  def version_at_least?(version, {_, _, _} = floor) when is_binary(version) do
+    case parse_version(version) do
+      {_, _, _} = parsed -> parsed >= floor
+      :error -> false
+    end
+  end
+
+  defp parse_version(version) do
+    case version |> String.split(".") |> Enum.take(3) |> Enum.map(&Integer.parse/1) do
+      [{maj, _}, {min, _}, {patch, _}] -> {maj, min, patch}
+      [{maj, _}, {min, _}] -> {maj, min, 0}
+      _ -> :error
     end
   end
 

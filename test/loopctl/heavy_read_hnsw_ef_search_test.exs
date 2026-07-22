@@ -239,6 +239,28 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       refute Enum.any?(sqls, &(&1 =~ ~r/iterative_scan|max_scan_tuples/)),
              "expected a non-ANN read to NOT touch iterative-scan GUCs, got: #{inspect(sqls)}"
     end
+
+    test "version_at_least?/2 parses pgvector versions and FAILS CLOSED on malformed input" do
+      assert HeavyRead.version_at_least?("0.8.0", {0, 8, 0})
+      assert HeavyRead.version_at_least?("0.8.5", {0, 8, 0})
+      assert HeavyRead.version_at_least?("0.9.0", {0, 8, 0})
+      assert HeavyRead.version_at_least?("1.0.0", {0, 8, 0})
+      assert HeavyRead.version_at_least?("0.8", {0, 8, 0}), "missing patch defaults to 0"
+
+      refute HeavyRead.version_at_least?("0.7.4", {0, 8, 0})
+      refute HeavyRead.version_at_least?("0.7", {0, 8, 0})
+      refute HeavyRead.version_at_least?("garbage", {0, 8, 0}), "unparseable fails closed"
+      refute HeavyRead.version_at_least?("", {0, 8, 0})
+      refute HeavyRead.version_at_least?("0.x.0", {0, 8, 0})
+    end
+
+    test "iterative_scan_supported?/0 detects the test DB's pgvector (>= 0.8) — the enable gate" do
+      # On a < 0.8 backend this returns false, so enabling the config there is a NO-OP; the
+      # deterministic decision logic is covered by version_at_least?/2 above. Here we assert
+      # the live probe succeeds against the actual test DB so the emission tests' precondition
+      # (that iterative scan CAN be enabled) is real, not assumed.
+      assert HeavyRead.iterative_scan_supported?()
+    end
   end
 
   defp prime_iterative_scan(code) do
