@@ -287,12 +287,15 @@ jobs:
       - name: Run Sobelow
         run: mix sobelow --config
 
-      # Dependency advisory audit. Local `mix precommit` runs the same check, but
-      # it never gated CI — which is how the postgrex/decimal/cowlib advisories of
-      # 2026-07 reached master unnoticed. The ignore file carries only advisories
-      # with no reachable fix, each justified inline.
+      # Dependency advisory audit via hex.pm's official EEF feed. Local
+      # `mix precommit` runs the same check, but it never gated CI — which is how
+      # the postgrex/decimal/cowlib advisories of 2026-07 reached master
+      # unnoticed. Advisories with no reachable fix are acknowledged via
+      # `hex: [ignore_advisories: [...]]` in mix.exs, each justified there. Uses
+      # the hex registry fetched by deps.get (no runtime external clone), so a
+      # feed-fetch failure fails the build rather than passing the gate empty.
       - name: Audit dependencies
-        run: mix deps.audit --ignore-file .mix_audit_ignore
+        run: mix hex.audit
 
   dialyzer:
     name: Dialyzer
