@@ -442,7 +442,7 @@ defmodule Loopctl.Coordination.ChannelPost do
           ]
 
         Enum.any?(refs, &ref_item_has_null_byte?/1) ->
-          # jsonb cannot store a NUL ( ) in a string value — Postgres raises a
+          # jsonb cannot store a NUL byte (\x00) in a string value — Postgres raises a
           # raw Postgrex.Error (500) at insert. Reject it as a 422 here, matching the
           # text-field NUL guard, so no field is a 500 vector.
           [refs: "must not contain NUL bytes"]
