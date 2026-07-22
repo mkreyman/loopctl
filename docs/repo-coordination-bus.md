@@ -85,15 +85,25 @@ channel_posts
   agent_id      uuid  (server-stamped from key identity; never from body)
   session_id    text
   host          text
-  key           text  null    -- optional; upsert on (tenant_id, project_id, key)
+  key           text  null    -- optional; upsert on the keyed slot (see index below)
   body          text  not null
   refs          jsonb null     -- optional {file,pr,branch,commit}
   expires_at    timestamptz    -- created_at/updated_at + 30d (uniform)
   created_at    timestamptz
   updated_at    timestamptz
-  -- indexes: (tenant_id, project_id, created_at desc), (expires_at) for the sweep,
-  --          unique (tenant_id, project_id, key) where key is not null
+  -- indexes (as shipped): channel_posts_recent_seq_idx
+  --            (tenant_id, project_id, inserted_at desc, seq desc),
+  --          (expires_at) for the sweep,
+  --          channel_posts_session_key_uidx -- PARTIAL unique
+  --            (tenant_id, project_id, agent_id, session_id, key) where key is not null
 ```
+
+The keyed slot is per **(tenant, project, agent, session)**, not project-global: `session_id` is
+client-supplied and spoofable, so the server-stamped `agent_id` is part of the tuple
+(`20260718000000_harden_channel_posts_slot_and_ordering.exs`) — one agent can never overwrite
+another's working-state slot. Because the index is PARTIAL, any `ON CONFLICT` against it must use
+a fragment conflict target carrying the columns **and** the `WHERE key IS NOT NULL` predicate
+(US-39.2 AC-39.2.5); a bare column list raises Postgres `42P10` at runtime.
 Ordering + tamper-evidence come from the existing audit chain + STH — no separate message-ordering system needed.
 
 ### 3.6 Tool surface

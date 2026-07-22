@@ -1190,6 +1190,44 @@ defmodule Loopctl.CoordinationTest do
       assert s1.id != s2.id
     end
 
+    test "another agent's same (session_id, key) is a distinct row (no cross-agent clobber)",
+         ctx do
+      %{tenant: tenant, project: project, agent_id: agent_a, audit: audit} = ctx
+
+      # `session_id` is CLIENT-SUPPLIED and therefore spoofable. `agent_id` is
+      # server-stamped and participates in the keyed-slot unique index
+      # (channel_posts_session_key_uidx), so agent B posting agent A's exact
+      # (session_id, key) must land in its OWN slot, never overwrite A's.
+      agent_b = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        assigned_agent_id: agent_b,
+        agent_status: :assigned
+      })
+
+      slot = %{project_id: project.id, session_id: "S1", key: "session_goal", audit: audit}
+
+      assert {:ok, post_a, :created} =
+               Coordination.post(tenant.id, agent_a, :agent, Map.put(slot, :body, "a"))
+
+      assert {:ok, post_b, :created} =
+               Coordination.post(tenant.id, agent_b, :agent, Map.put(slot, :body, "b"))
+
+      assert post_a.id != post_b.id
+      assert post_b.agent_id == agent_b
+
+      # A's slot is untouched, and both rows persist.
+      assert %ChannelPost{body: "a", agent_id: ^agent_a} = AdminRepo.get!(ChannelPost, post_a.id)
+
+      assert AdminRepo.aggregate(
+               from(p in ChannelPost, where: p.project_id == ^project.id),
+               :count,
+               :id
+             ) == 2
+    end
+
     test "a missing project returns {:error, :not_found} and writes nothing", ctx do
       %{tenant: tenant, agent_id: agent_id, audit: audit} = ctx
 
