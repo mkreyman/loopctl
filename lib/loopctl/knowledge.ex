@@ -1743,16 +1743,21 @@ defmodule Loopctl.Knowledge do
     |> AdminRepo.all()
   end
 
+  # The relevance term of the context blend MUST be the ABSOLUTE per-row score
+  # (`absolute_score/1` — raw cosine similarity, or a bounded transform of raw
+  # ts_rank_cd), NEVER the fused `:final_score`. Post-#470 the default fusion is RRF,
+  # whose `:final_score` is `Σ weight/(k+rank)` — a top value of ~0.008-0.016, ~30-60x
+  # smaller than the old min-max 0..1 scale. Blending that against the 0..1 recency_score
+  # in `build_context_results/6` (`0.7*relevance + 0.3*recency`) would let recency
+  # dominate ordering ~25x, so an irrelevant-but-fresh article would beat a
+  # highly-relevant-but-old one and `/knowledge/context` would order essentially by
+  # recency. Reading the absolute score keeps relevance on the same 0..1 scale the
+  # recency blend was calibrated for (same root fix as the hybrid resolver's
+  # `absolute_score/1`, US-31.2 — #470 review).
   defp find_relevance_score(results, article_id) do
     case Enum.find(results, fn r -> r[:id] == article_id end) do
-      nil ->
-        0.0
-
-      r ->
-        Map.get(r, :final_score) ||
-          Map.get(r, :relevance_score) ||
-          Map.get(r, :similarity_score) ||
-          0.0
+      nil -> 0.0
+      r -> absolute_score(r)
     end
   end
 
@@ -6395,7 +6400,13 @@ defmodule Loopctl.Knowledge do
       )
 
     from(c in subquery(inner_pool),
-      order_by: [desc: c.similarity_score],
+      # Deterministic total order: cosine similarity desc, then `id` asc as a
+      # secondary key. Ties are real (two identical embeddings share similarity
+      # 1.0), and Postgres leaves tied-row order unspecified, so without the id
+      # tiebreak the RRF ranks that fusion derives from this list — and thus
+      # which candidate wins the top slot by a sub-1e-5 RRF margin — would flip
+      # run-to-run (#470 review).
+      order_by: [desc: c.similarity_score, asc: c.id],
       select: %{
         id: c.id,
         tenant_id: c.tenant_id,
@@ -6620,7 +6631,14 @@ defmodule Loopctl.Knowledge do
             # alertable signal and the meta carries `semantic_result_count`.
             maybe_emit_semantic_empty(tenant_id, length(semantic.results), query_string)
 
-            {:ok, merged} = merge_results(kw, semantic, keyword_weight, semantic_weight, opts)
+            # Optional third graph-neighbor lane (#470), OFF by default. Computed here
+            # because it needs `tenant_id` (a DB read of the link graph); threaded into
+            # `merge_results/5` via opts so that function stays a pure fusion function
+            # (no DB) — its arity and public contract are unchanged.
+            merge_opts = put_graph_lane(opts, tenant_id, kw, semantic)
+
+            {:ok, merged} =
+              merge_results(kw, semantic, keyword_weight, semantic_weight, merge_opts)
 
             maybe_record_search_access(
               tenant_id,
@@ -6816,45 +6834,35 @@ defmodule Loopctl.Knowledge do
     :ok
   end
 
+  # Fuse the per-lane result lists into one ranked, deduplicated candidate set (#470).
+  #
+  # Default strategy is Reciprocal Rank Fusion (RRF); the legacy min-max weighted-sum
+  # is retained behind `:min_max` for A/B and the eval harness. Both strategies produce
+  # the IDENTICAL result/meta shape and BOTH preserve every candidate's raw, ABSOLUTE
+  # `:relevance_score` / `:similarity_score` (the hybrid resolver US-31.2 reads those
+  # raw fields via `absolute_score/1`, never the fused `:final_score`).
+  #
+  # `merge_results/5` is a PURE fusion function — the optional graph-neighbor lane
+  # (which needs a DB read) is computed by the caller and threaded in via
+  # `opts[:_graph_lane_results]`, so this arity and contract stay stable.
   defp merge_results(keyword_result, semantic_result, kw_weight, sem_weight, opts) do
-    kw_normalized = normalize_scores(keyword_result.results, :relevance_score)
-    sem_normalized = normalize_scores(semantic_result.results, :similarity_score)
+    graph_results = Keyword.get(opts, :_graph_lane_results, [])
 
-    # Build merged map by article ID
-    kw_map =
-      Map.new(kw_normalized, fn r ->
-        {r.id, Map.put(r, :final_score, kw_weight * r.normalized_score)}
-      end)
-
-    sem_map =
-      Map.new(sem_normalized, fn r ->
-        {r.id, Map.put(r, :final_score, sem_weight * r.normalized_score)}
-      end)
-
-    # For a candidate found in BOTH pools, `Map.merge(kw, sem)` keeps EACH side's
-    # exclusive raw fields (kw's raw `:relevance_score`/`:snippet`, sem's raw
-    # `:similarity_score`) instead of silently dropping one — the hybrid resolver
-    # (US-31.2) needs both raw, ABSOLUTE (non-pool-relative) scores to survive on the
-    # merged result map so it never has to fall back to the pool-normalized
-    # `:final_score` for its curated-confidence decision (see `absolute_score/1`).
-    # `:final_score` itself is explicitly overridden to the correct weighted SUM
-    # (Map.merge alone would have just taken sem's half).
-    merged =
-      Map.merge(kw_map, sem_map, fn _id, kw, sem ->
-        kw
-        |> Map.merge(sem)
-        |> Map.put(:final_score, kw.final_score + sem.final_score)
-      end)
-
-    # Sort by `final_score` desc with the article `id` as a DETERMINISTIC secondary key.
-    # `Map.values/1` order is hash-driven, and `final_score` ties are not incidental — the
-    # Reciprocal Rank Fusion scoring (#470) produces `1/(k+rank)` values that tie by
-    # construction. Without a tiebreak, which of two tied candidates survives the top-k limit
-    # (and thus recall@k / nDCG@k / MRR) would flip run-to-run. The id makes it total + stable.
     sorted =
-      merged
-      |> Map.values()
-      |> Enum.sort_by(&{&1.final_score, &1.id}, :desc)
+      case fusion_strategy(opts) do
+        :min_max ->
+          fuse_min_max(keyword_result.results, semantic_result.results, kw_weight, sem_weight)
+
+        _rrf ->
+          fuse_rrf(
+            keyword_result.results,
+            semantic_result.results,
+            graph_results,
+            kw_weight,
+            sem_weight,
+            opts
+          )
+      end
 
     paginated = paginate_results(sorted, opts)
 
@@ -6862,14 +6870,28 @@ defmodule Loopctl.Knowledge do
      %{
        results: paginated.results,
        meta: %{
+         # `total_count` = size of the full fused/deduplicated candidate set
+         # pre-pagination. When the (opt-in) graph lane is enabled it also counts the
+         # one-hop neighbors it contributed; with the lane OFF (the default) this is
+         # exactly the keyword ∪ semantic union, byte-for-byte as before.
          total_count: length(sorted),
          limit: paginated.limit,
          offset: paginated.offset,
          search_mode: "combined",
-         # Size of the deduplicated UNION of a keyword and a semantic sub-search
-         # (each capped at 100, so up to ~200 with no overlap), NOT a corpus total
-         # or full match count. Use list mode or knowledge_stats to size the corpus.
-         total_count_scope: "merged_candidates",
+         # Names what `total_count` counts so a client can size/interpret the pool.
+         # Default `merged_candidates`: the deduplicated UNION of a keyword and a
+         # semantic sub-search (each capped at 100, so up to ~200 with no overlap),
+         # NOT a corpus total or full match count. When the opt-in graph lane
+         # actually contributes one-hop neighbors, the count folds them in, so the
+         # scope becomes `merged_candidates_with_graph` — the documented
+         # `merged_candidates` invariant (keyword ∪ semantic only) still holds for
+         # its literal value (#470 review). Use list mode or knowledge_stats to size
+         # the corpus.
+         total_count_scope:
+           if(graph_results == [],
+             do: "merged_candidates",
+             else: "merged_candidates_with_graph"
+           ),
          # Carry the semantic sub-search's relevance-pool truncation forward (US-27.7a)
          # — combined is the DEFAULT mode, so silently dropping the flag would hide
          # truncation on the most-used path. `maybe_put` keeps the key absent unless the
@@ -6878,10 +6900,326 @@ defmodule Loopctl.Knowledge do
          # Observability for #297: how many rows the semantic half contributed. A
          # `0` here with `fallback: false` is the "embed worked but recall is broken"
          # signal (distinct from an embed-failure keyword_only fallback), so operators
-         # and clients can tell the two silent-degradation causes apart.
+         # and clients can tell the two silent-degradation causes apart. The graph
+         # lane NEVER inflates this — it stays the semantic lane's own row count.
          semantic_result_count: length(semantic_result.results)
        }
      }}
+  end
+
+  # --- Reciprocal Rank Fusion (#470) ------------------------------------------
+  #
+  # `score(doc) = Σ_lane weight_lane / (k + rank_lane(doc))`, ranks 1-based, keyword/
+  # semantic per-lane weight 0.5 and the opt-in graph lane STRICTLY BELOW them (0.25) so a
+  # zero-signal one-hop neighbor can never tie/outrank a genuine single-lane hit (#470
+  # review), default k=60 (KB f4a10824). Rank-based fusion sidesteps the
+  # incommensurable-scale problem (ts_rank_cd vs cosine similarity) that made the old
+  # min-max weighted-sum brittle: a doc with cross-lane CONSENSUS can outrank one that
+  # is #1 in a single lane. Each lane's list is ALREADY sorted by its own relevance
+  # (keyword desc ts_rank_cd, semantic desc cosine similarity, graph desc consensus),
+  # so its position IS its rank. Duplicate docs across lanes merge to one, summing
+  # their contributions and keeping the UNION of raw fields.
+  defp fuse_rrf(kw_results, sem_results, graph_results, kw_weight, sem_weight, opts) do
+    k = rrf_k(opts)
+    graph_weight = rrf_graph_weight(opts)
+
+    lanes = [
+      {kw_results, kw_weight},
+      {sem_results, sem_weight},
+      {graph_results, graph_weight}
+    ]
+
+    lanes
+    |> Enum.reduce(%{}, fn {results, weight}, acc ->
+      accumulate_rrf_lane(acc, results, weight, k)
+    end)
+    |> Map.values()
+    # Deterministic total order: `final_score` desc with `id` as the secondary key.
+    # RRF's `1/(k+rank)` values tie by construction, and `Map.values/1` order is
+    # hash-driven, so without the id tiebreak which tied candidate survives the top-k
+    # limit (and thus recall@k / nDCG@k / MRR) would flip run-to-run.
+    |> Enum.sort_by(&{&1.final_score, &1.id}, :desc)
+  end
+
+  defp accumulate_rrf_lane(acc, results, weight, k) do
+    results
+    |> Enum.with_index(1)
+    |> Enum.reduce(acc, fn {result, rank}, inner ->
+      contribution = weight / (k + rank)
+
+      Map.update(
+        inner,
+        result.id,
+        Map.put(result, :final_score, contribution),
+        fn existing ->
+          # Union the raw fields (a doc seen in multiple lanes keeps kw's raw
+          # `:relevance_score`/`:snippet` AND sem's raw `:similarity_score` — the
+          # hybrid resolver needs both), and ADD this lane's contribution. `result`
+          # carries no `:final_score`, so merging it in never clobbers the running sum.
+          existing
+          |> Map.merge(result)
+          |> Map.put(:final_score, existing.final_score + contribution)
+        end
+      )
+    end)
+  end
+
+  # --- Legacy min-max weighted-sum fusion (#470 A/B) --------------------------
+  #
+  # Retained behind `config :loopctl, :knowledge_fusion_strategy, :min_max` (or the
+  # per-call `fusion_strategy: :min_max` opt) so the eval harness can compare the two
+  # and an operator can roll back. Min-max normalizes each lane's raw scores into
+  # `0..1` (dominated by pool outliers/composition — the reason RRF replaced it) and
+  # weight-sums them. Graph lane is not fused here (min-max is the legacy 2-lane path).
+  defp fuse_min_max(kw_results, sem_results, kw_weight, sem_weight) do
+    kw_map =
+      kw_results
+      |> normalize_scores(:relevance_score)
+      |> Map.new(fn r -> {r.id, Map.put(r, :final_score, kw_weight * r.normalized_score)} end)
+
+    sem_map =
+      sem_results
+      |> normalize_scores(:similarity_score)
+      |> Map.new(fn r -> {r.id, Map.put(r, :final_score, sem_weight * r.normalized_score)} end)
+
+    kw_map
+    |> Map.merge(sem_map, fn _id, kw, sem ->
+      kw
+      |> Map.merge(sem)
+      |> Map.put(:final_score, kw.final_score + sem.final_score)
+    end)
+    |> Map.values()
+    |> Enum.sort_by(&{&1.final_score, &1.id}, :desc)
+  end
+
+  defp fusion_strategy(opts) do
+    Keyword.get(
+      opts,
+      :fusion_strategy,
+      Application.get_env(:loopctl, :knowledge_fusion_strategy, :rrf)
+    )
+  end
+
+  defp rrf_k(opts) do
+    Keyword.get(opts, :rrf_k, Application.get_env(:loopctl, :knowledge_rrf_k, 60))
+  end
+
+  defp rrf_graph_weight(opts) do
+    Keyword.get(
+      opts,
+      :graph_weight,
+      Application.get_env(:loopctl, :knowledge_rrf_graph_weight, 0.5)
+    )
+  end
+
+  defp graph_lane_enabled?(opts) do
+    Keyword.get(
+      opts,
+      :graph_lane,
+      Application.get_env(:loopctl, :knowledge_rrf_graph_lane_enabled, false)
+    )
+  end
+
+  defp rrf_graph_seed_count,
+    do: Application.get_env(:loopctl, :knowledge_rrf_graph_seed_count, 10)
+
+  defp rrf_graph_max_neighbors,
+    do: Application.get_env(:loopctl, :knowledge_rrf_graph_max_neighbors, 20)
+
+  # --- Graph-neighbor lane (#470) ---------------------------------------------
+  #
+  # OFF by default. When enabled, takes the top merged candidates as SEEDS, pulls their
+  # one-hop link-graph neighbors (heavy-pool-routed, tenant-scoped, visibility-filtered — a
+  # tenant B neighbor can never surface for tenant A), ranks them by cross-seed CONSENSUS
+  # (how many DISTINCT seeds link to them, best seed position as tiebreak), and returns
+  # requested-status article maps in that rank order for the fusion. The neighbor maps carry
+  # NO `:relevance_score`/`:similarity_score`, so their hybrid-resolver `absolute_score`
+  # is 0.0 — a graph-only hit can never falsely win the curated-vs-retrieved decision.
+  defp put_graph_lane(opts, tenant_id, kw, semantic) do
+    # Only the RRF fuser consumes `:_graph_lane_results` — `fuse_min_max/4` ignores
+    # graph neighbors entirely. Gate the (DB-backed) lane build on the strategy being
+    # RRF so a `graph_lane: true` + `fusion_strategy: :min_max` caller doesn't pay the
+    # ~11 round-trip graph read only to have the result silently discarded (#470 review).
+    if graph_lane_enabled?(opts) and fusion_strategy(opts) != :min_max do
+      case build_graph_lane(tenant_id, kw, semantic, opts) do
+        [] -> opts
+        neighbors -> Keyword.put(opts, :_graph_lane_results, neighbors)
+      end
+    else
+      opts
+    end
+  end
+
+  defp build_graph_lane(tenant_id, kw, semantic, opts) do
+    vis = Keyword.get(opts, :visibility_agent_id)
+    # Graph-lane neighbors honor the SAME status filter the primary lanes use (search_keyword/
+    # search_semantic both default `:published` and honor the caller opt). Hardcoding
+    # `:published` here would make a `graph_lane: true` + non-published-status search return an
+    # inconsistent lane vs. its primary lanes (#470 review).
+    status = Keyword.get(opts, :status, :published)
+
+    # Seeds: the top merged candidates by their existing lane order (keyword first,
+    # then semantic), deduped, capped. Seeds themselves are excluded from the neighbor
+    # set (a lane already ranks them; the graph lane exists to surface their neighbors).
+    seed_ids =
+      (kw.results ++ semantic.results)
+      |> Enum.map(& &1.id)
+      |> Enum.uniq()
+      |> Enum.take(rrf_graph_seed_count())
+
+    seed_set = MapSet.new(seed_ids)
+    seed_index = seed_ids |> Enum.with_index() |> Map.new()
+
+    # ONE tenant-scoped round-trip for the WHOLE seed set (was one AdminRepo query
+    # PER seed — an N+1 that fanned up to `rrf_graph_seed_count` sequential reads
+    # onto the deliberately small BYPASSRLS AdminRepo pool). Per-seed provenance is
+    # recovered in memory from the source/target ids each link row already carries.
+    # `%{neighbor_id => MapSet<seed_index>}`: a SET of DISTINCT seed indices, NOT a link-row
+    # count, so a neighbor linked from ONE seed via several rows counts that seed once (#470
+    # review — see `tally_graph_neighbor/3`).
+    neighbor_stats =
+      tenant_id
+      |> list_links_for_seed_set(seed_ids, vis)
+      |> Enum.reduce(%{}, fn link, acc ->
+        link
+        |> seed_neighbor_pairs(seed_set)
+        |> Enum.reduce(acc, fn {seed_id, neighbor_id}, inner ->
+          tally_graph_neighbor(inner, neighbor_id, Map.fetch!(seed_index, seed_id))
+        end)
+      end)
+
+    ranked_ids =
+      neighbor_stats
+      # Rank: most DISTINCT seeds (consensus) first, then best (lowest) seed position, then
+      # id for a deterministic total order.
+      |> Enum.sort_by(fn {nid, seed_idxs} ->
+        {-MapSet.size(seed_idxs), Enum.min(seed_idxs), nid}
+      end)
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.take(rrf_graph_max_neighbors())
+
+    fetch_graph_lane_articles(tenant_id, ranked_ids, status)
+  end
+
+  # Cap on link rows read per seed-set graph-lane query — bounds fan-out on a densely-linked
+  # hub, matching the per-article `list_links_for_article/3` limit (#470 review). Without it,
+  # up to `rrf_graph_seed_count` hub seeds could pull thousands of ArticleLink rows in one read.
+  @graph_lane_link_limit 200
+
+  # One tenant-scoped, visibility-filtered read of every link touching ANY seed in the set —
+  # the single query that replaces the per-seed N+1.
+  defp list_links_for_seed_set(_tenant_id, [], _vis), do: []
+
+  defp list_links_for_seed_set(tenant_id, seed_ids, vis) do
+    # Preload only the far-side fields the #163 visibility filter needs (id/tenant_id/status/
+    # metadata) — NOT the full Article body. A dense hub would otherwise materialize hundreds
+    # of full bodies just to drop them after the visibility check.
+    summary =
+      from(a in Article, select: struct(a, [:id, :tenant_id, :status, :metadata]))
+
+    query =
+      from(l in ArticleLink,
+        where: l.tenant_id == ^tenant_id,
+        where: l.source_article_id in ^seed_ids or l.target_article_id in ^seed_ids,
+        preload: [source_article: ^summary, target_article: ^summary],
+        order_by: [desc: l.inserted_at],
+        limit: @graph_lane_link_limit
+      )
+
+    # Route through Loopctl.HeavyRead (US-27.11): the dedicated heavy-read pool with a per-read
+    # SET LOCAL statement_timeout, isolated from the deliberately tiny ~3-connection BYPASSRLS
+    # AdminRepo pool. search_combined is the DEFAULT mode, so once an operator enables the graph
+    # lane EVERY combined search runs this — it must not starve light admin ops (the same reason
+    # the distant-pairs self-join was routed here). `on_overload: :tag` degrades an over-cap
+    # tenant's lane to empty (it is a purely additive recall lane) instead of raising a 429. The
+    # (unscoped) preload of far-side articles stays safe because every id comes from a
+    # tenant-scoped link row, and article links never cross tenants.
+    case heavy_read_graph_lane(tenant_id, query) do
+      {:error, :heavy_read_overloaded} ->
+        []
+
+      links ->
+        # Visibility (#163): drop links whose far-side article the caller can't see, so a
+        # neighbor can't leak another agent's private memory id/title — same filter the
+        # per-article `list_links_for_article/3` applies. The neighbor STATUS filter is applied
+        # downstream in `fetch_graph_lane_articles/3` (a link to a non-matching-status neighbor
+        # yields no lane row), so no lane result can carry a wrong-status article.
+        filter_links_by_visibility(links, vis)
+    end
+  end
+
+  # HeavyRead read for the opt-in graph lane: heavy-pool-routed, statement-timed, and shed to
+  # `{:error, :heavy_read_overloaded}` (never a 429) when the tenant is over its in-flight cap.
+  defp heavy_read_graph_lane(tenant_id, query) do
+    opts = Keyword.put(HeavyRead.opts(:graph_lane), :on_overload, :tag)
+    HeavyRead.all(tenant_id, query, opts)
+  end
+
+  # A link contributes AT MOST one `{seed_id, neighbor_id}` edge: the neighbor is the
+  # endpoint that is NOT itself a seed. A link between two seeds (or a self-link)
+  # contributes none — a seed is already ranked by a primary lane. This mirrors the
+  # old per-seed `graph_neighbor_ids/2` + seed-set reject, one link at a time.
+  defp seed_neighbor_pairs(
+         %ArticleLink{source_article_id: src, target_article_id: tgt},
+         seed_set
+       ) do
+    src_seed = MapSet.member?(seed_set, src)
+    tgt_seed = MapSet.member?(seed_set, tgt)
+
+    cond do
+      src_seed and not tgt_seed -> [{src, tgt}]
+      tgt_seed and not src_seed -> [{tgt, src}]
+      true -> []
+    end
+  end
+
+  # Fold one `seed → neighbor` edge into the running `%{neighbor_id => MapSet<seed_index>}`
+  # tally. The value is a SET of DISTINCT seed indices, so a neighbor linked from the SAME
+  # seed via several ArticleLink rows — multiple relationship_types, or a bidirectional pair
+  # whose source/target swap both map to the same {seed,neighbor} — counts that seed ONCE.
+  # Consensus is then `MapSet.size` (distinct seeds), matching the documented distinct-seed
+  # signal; counting link ROWS let a single densely-linked seed masquerade as multi-seed
+  # consensus (#470 review).
+  defp tally_graph_neighbor(acc, neighbor_id, seed_idx) do
+    Map.update(acc, neighbor_id, MapSet.new([seed_idx]), &MapSet.put(&1, seed_idx))
+  end
+
+  defp fetch_graph_lane_articles(_tenant_id, [], _status), do: []
+
+  defp fetch_graph_lane_articles(tenant_id, ranked_ids, status) do
+    query =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.id in ^ranked_ids and a.status == ^status,
+        select: %{
+          id: a.id,
+          tenant_id: a.tenant_id,
+          project_id: a.project_id,
+          title: a.title,
+          category: a.category,
+          status: a.status,
+          tags: a.tags,
+          inserted_at: a.inserted_at,
+          updated_at: a.updated_at
+        }
+      )
+
+    # Also heavy-pool-routed (US-27.11) — a bounded (`<= rrf_graph_max_neighbors`) id-set read,
+    # kept off the tiny AdminRepo pool for the same reason as the link read above.
+    rows =
+      case heavy_read_graph_lane(tenant_id, query) do
+        {:error, :heavy_read_overloaded} -> []
+        list -> list
+      end
+      |> Map.new(&{&1.id, &1})
+
+    # Preserve the consensus rank order; silently drop any neighbor that isn't in the
+    # requested status (other-status / visibility-filtered rows never join the lane).
+    Enum.flat_map(ranked_ids, fn id ->
+      case Map.fetch(rows, id) do
+        {:ok, row} -> [row]
+        :error -> []
+      end
+    end)
   end
 
   defp normalize_scores([], _score_key), do: []
@@ -7202,6 +7540,23 @@ defmodule Loopctl.Knowledge do
     do: normalize_keyword_score(score)
 
   defp absolute_score(_result), do: 0.0
+
+  @doc """
+  The ABSOLUTE (pool-independent) relevance score for a `search_combined/3` /
+  `search_semantic/3` / `search_keyword/3` result map — the raw cosine `:similarity_score`
+  (already 0..1) when present, else a bounded `raw/(raw+1)` transform of the raw keyword
+  `:relevance_score`, else `0.0`.
+
+  Public seam for CROSS-SOURCE ranking (e.g. `Loopctl.Memory.recall_context/2`), which must
+  compare a knowledge result against memory's absolute cosine similarity on the SAME 0..1
+  scale. It must NOT use the fused `:final_score`: post-#470 that is an RRF `Σ weight/(k+rank)`
+  value (top ~0.008-0.016), which — compared against a memory row's 0..1 cosine — would
+  systematically sink every knowledge row below every memory row (#470 review). This is the
+  same absolute signal `absolute_score/1` gives the hybrid resolver (US-31.2).
+  """
+  @spec absolute_result_score(map()) :: float()
+  def absolute_result_score(result) when is_map(result), do: absolute_score(result)
+  def absolute_result_score(_), do: 0.0
 
   # `ts_rank_cd` is RAW/UNBOUNDED (a short, heavily-title-weighted match can exceed
   # `1.0` — confirmed empirically up to ~2.0 for a title-exact match) — unlike cosine

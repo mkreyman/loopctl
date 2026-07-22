@@ -204,7 +204,10 @@ defmodule Loopctl.HeavyRead do
   sign, so it never runs on a lagging read replica), `:export` (the US-27.16 long
   streamed-export scans), and
   `:llm_usage` (the customer-facing LLM-usage aggregate over `llm_usage_events`, a
-  bounded indexed COUNT/GROUP BY — classified LIGHT by the gate).
+  bounded indexed COUNT/GROUP BY — classified LIGHT by the gate), and `:graph_lane` (the
+  #470 opt-in graph-neighbor lane of `search_combined/3`: a bounded, index-backed
+  `ArticleLink` seed-set read plus a bounded neighbor-article fetch — classified HEAVY by
+  the gate since it fans a preload across up to `@graph_lane_link_limit` link rows).
   """
   # US-38.4: the pgvector-ANN (kNN) endpoints whose reads run an index-ordered
   # `ORDER BY (embedding cosine-distance $const) LIMIT k` scan against the HNSW index and are
@@ -302,6 +305,7 @@ defmodule Loopctl.HeavyRead do
     sth_incremental
     export
     llm_usage
+    graph_lane
   )a
 
   @doc """
