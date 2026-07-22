@@ -1,17 +1,17 @@
 {
-  "generated_at": "2026-07-21T22:09:15Z",
-  "golden_version": "golden_v1",
+  "generated_at": "2026-07-22T01:32:11Z",
+  "golden_version": "golden_v2",
   "modes": {
     "embeddings": {
-      "answered": 21,
+      "answered": 22,
       "answered_k": 5,
-      "mrr": 0.7361111111111112,
+      "mrr": 0.7462606837606838,
       "ndcg_at_k": {
-        "10": 0.740275906533763,
-        "5": 0.7091952796902661
+        "10": 0.7499427837238238,
+        "5": 0.7203800766252558
       },
       "observed_mode": "combined",
-      "question_count": 25,
+      "question_count": 26,
       "questions": {
         "q-audit-chain-sth": {
           "mrr": 0.3333333333333333,
@@ -137,7 +137,7 @@
         "q-keyword-fallback": {
           "mrr": 1.0,
           "ndcg_at_k": {
-            "10": 0.86034433104172,
+            "10": 0.8519590445170673,
             "5": 0.7039180890341347
           },
           "recall_at_k": {
@@ -201,6 +201,17 @@
           }
         },
         "q-precommit-gate": {
+          "mrr": 1.0,
+          "ndcg_at_k": {
+            "10": 1.0,
+            "5": 1.0
+          },
+          "recall_at_k": {
+            "10": 1.0,
+            "5": 1.0
+          }
+        },
+        "q-recency-fusion": {
           "mrr": 1.0,
           "ndcg_at_k": {
             "10": 1.0,
@@ -290,20 +301,20 @@
         }
       },
       "recall_at_k": {
-        "10": 0.8,
-        "5": 0.72
+        "10": 0.8076923076923077,
+        "5": 0.7307692307692307
       }
     },
     "keyword_only": {
-      "answered": 4,
+      "answered": 5,
       "answered_k": 5,
-      "mrr": 0.16,
+      "mrr": 0.19230769230769232,
       "ndcg_at_k": {
-        "10": 0.14120610984650778,
-        "5": 0.14120610984650778
+        "10": 0.17423664408318057,
+        "5": 0.17423664408318057
       },
       "observed_mode": "keyword_only",
-      "question_count": 25,
+      "question_count": 26,
       "questions": {
         "q-audit-chain-sth": {
           "mrr": 0.0,
@@ -503,6 +514,17 @@
             "5": 0.0
           }
         },
+        "q-recency-fusion": {
+          "mrr": 1.0,
+          "ndcg_at_k": {
+            "10": 1.0,
+            "5": 1.0
+          },
+          "recall_at_k": {
+            "10": 1.0,
+            "5": 1.0
+          }
+        },
         "q-req-http": {
           "mrr": 0.0,
           "ndcg_at_k": {
@@ -582,8 +604,8 @@
         }
       },
       "recall_at_k": {
-        "10": 0.12,
-        "5": 0.12
+        "10": 0.15384615384615385,
+        "5": 0.15384615384615385
       }
     }
   },

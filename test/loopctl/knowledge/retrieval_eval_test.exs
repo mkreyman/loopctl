@@ -319,6 +319,34 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       assert Map.has_key?(baseline["modes"], "keyword_only")
     end
 
+    test "parses the optional per-doc age_days field (#471), rejecting a negative age" do
+      header = ~s({"kind":"header","version":"x"})
+
+      entry =
+        ~s({"kind":"question","id":"q","question":"q","relevant":["d"],) <>
+          ~s("corpus":[{"doc_id":"d","title":"t","body":"b","category":"pattern","age_days":400}]})
+
+      golden = GoldenSet.parse!(header <> "\n" <> entry <> "\n")
+      assert [%{age_days: 400}] = hd(golden.questions).corpus
+
+      # Absent age_days normalizes to nil (updated now — the pre-#471 default).
+      no_age =
+        ~s({"kind":"question","id":"q2","question":"q","relevant":["d2"],) <>
+          ~s("corpus":[{"doc_id":"d2","title":"t2","body":"b","category":"pattern"}]})
+
+      golden2 = GoldenSet.parse!(header <> "\n" <> no_age <> "\n")
+      assert [%{age_days: nil}] = hd(golden2.questions).corpus
+
+      # A negative age would place the doc in the future and invert the recency prior.
+      negative =
+        ~s({"kind":"question","id":"q3","question":"q","relevant":["d3"],) <>
+          ~s("corpus":[{"doc_id":"d3","title":"t3","body":"b","category":"pattern","age_days":-5}]})
+
+      assert_raise ArgumentError, ~r/age_days must be a non-negative number/, fn ->
+        GoldenSet.parse!(header <> "\n" <> negative <> "\n")
+      end
+    end
+
     test "raises with a clear message on a malformed entry" do
       valid_header = ~s({"kind":"header","version":"x"})
 
@@ -402,6 +430,75 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
 
       assert adversarial.mrr < good.mrr
       assert adversarial.recall_at_k[1] < good.recall_at_k[1]
+    end
+
+    test "the recency prior surfaces the freshest correct note among near-tie distractors (#471)" do
+      tenant = fixture(:tenant)
+
+      # Three near-identical docs — same query-term coverage, differing only in a trailing
+      # non-query word — so keyword rank and the synthetic semantic projection TIE. The only
+      # thing that separates them is age, so the recency prior alone decides the ranking.
+      question_terms = "widget lattice calibration telemetry across the sprocket"
+
+      docs = fn ages ->
+        [
+          build(:retrieval_golden_doc, %{
+            doc_id: "recency-correct",
+            title: "Sprocket telemetry current",
+            body: "#{question_terms} assembly",
+            category: :decision,
+            age_days: Keyword.fetch!(ages, :correct)
+          }),
+          build(:retrieval_golden_doc, %{
+            doc_id: "recency-legacy-a",
+            title: "Sprocket telemetry legacy a",
+            body: "#{question_terms} housing",
+            category: :decision,
+            age_days: Keyword.fetch!(ages, :distractor)
+          }),
+          build(:retrieval_golden_doc, %{
+            doc_id: "recency-legacy-b",
+            title: "Sprocket telemetry legacy b",
+            body: "#{question_terms} bearing",
+            category: :decision,
+            age_days: Keyword.fetch!(ages, :distractor)
+          })
+        ]
+      end
+
+      golden = fn ages ->
+        build(:retrieval_golden_set, %{
+          version: "recency_test_v1",
+          questions: [
+            build(:retrieval_golden_question, %{
+              id: "q-recency",
+              question: question_terms,
+              relevant: ["recency-correct"],
+              graded: %{"recency-correct" => 3},
+              corpus: docs.(ages)
+            })
+          ]
+        })
+      end
+
+      # Correct doc FRESH, distractors STALE → recency lifts it to rank 1.
+      fresh_correct =
+        RetrievalEval.compute(tenant.id,
+          golden_set: golden.(correct: 0, distractor: 500),
+          k_values: [1, 3]
+        )
+
+      # Correct doc STALE, distractors FRESH → recency demotes it below a fresh distractor.
+      stale_correct =
+        RetrievalEval.compute(tenant.id,
+          golden_set: golden.(correct: 500, distractor: 0),
+          k_values: [1, 3]
+        )
+
+      assert fresh_correct.mrr == 1.0
+      assert fresh_correct.recall_at_k[1] == 1.0
+      # Swapping the ages strictly degrades the score — the recency prior did the work.
+      assert stale_correct.mrr < fresh_correct.mrr
     end
 
     test "reports the with-retrieval vs no-retrieval spread" do

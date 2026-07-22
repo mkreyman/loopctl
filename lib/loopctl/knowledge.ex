@@ -60,6 +60,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.EmbeddingConcurrency
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.OKF
+  alias Loopctl.Knowledge.RankingPriors
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Projects.Project
@@ -1692,8 +1693,9 @@ defmodule Loopctl.Knowledge do
         articles
         |> Enum.map(fn article ->
           relevance = find_relevance_score(search.results, article.id)
-          age_days = DateTime.diff(now, article.updated_at, :second) / 86_400.0
-          recency_score = :math.exp(-age_days / 30.0)
+          # Single source of truth for the exp(-age_days/30) decay — shared with the #471
+          # search_combined priors (RankingPriors.recency_decay/2).
+          recency_score = RankingPriors.recency_decay(article.updated_at, now)
           combined = (1.0 - recency_weight) * relevance + recency_weight * recency_score
 
           linked = Map.get(linked_map, article.id, [])
@@ -1865,6 +1867,10 @@ defmodule Loopctl.Knowledge do
               category: a.category,
               status: a.status,
               tags: a.tags,
+              # source_type feeds the #471 authority prior (it is NOT projected by
+              # default elsewhere); carried on the keyword lane so the priors apply on the
+              # degraded keyword_only fallback too (AC-5).
+              source_type: a.source_type,
               inserted_at: a.inserted_at,
               updated_at: a.updated_at,
               relevance_score:
@@ -6415,6 +6421,9 @@ defmodule Loopctl.Knowledge do
         category: c.category,
         status: c.status,
         tags: c.tags,
+        # source_type feeds the #471 authority prior (see the keyword select). The inner
+        # pool_select(:semantic) must project it for this outer select to read it.
+        source_type: c.source_type,
         inserted_at: c.inserted_at,
         updated_at: c.updated_at,
         similarity_score: c.similarity_score
@@ -6544,6 +6553,17 @@ defmodule Loopctl.Knowledge do
       #{@max_relevance_page_size}, min 1); relevance top-N, capped well below the
       enumeration page size
     - `:offset` -- results to skip for pagination (default 0)
+    - `:recency_weight` -- per-call override for the bounded recency prior weight
+      (#471; default `:knowledge_recency_weight`, 0.3), clamped to `[0.0, 1.0]`. A
+      weight of 0 makes recency a no-op. See `Loopctl.Knowledge.RankingPriors`.
+    - `:authority_prior` -- per-call boolean toggle for the source/category authority
+      prior (default `:knowledge_authority_prior_enabled`, true). The dead-doctrine
+      demotion (`verdict-kill`/`:superseded`) applies regardless of this toggle.
+    - `:authority_strength` -- per-call override for the authority prior strength
+      (default `:knowledge_authority_strength`, 0.05), floored at 0.0. Scales the
+      bounded authority factor within the `[0.9, 1.1]` band.
+    - `:now` -- the `DateTime` the recency prior measures age against (default
+      `DateTime.utc_now/0`). Injected so the priors stay pure/deterministic in tests.
 
   ## Returns
 
@@ -6673,7 +6693,12 @@ defmodule Loopctl.Knowledge do
   # meta, and emits telemetry + a log so the degradation is alertable, not silent.
   defp combined_keyword_fallback(tenant_id, kw, reason, query_string, opts) do
     fallback_reason = record_semantic_fallback(tenant_id, reason, query_string)
-    paginated = paginate_results(kw.results, opts)
+    # AC-5: the degraded keyword_only path STILL applies the priors it can — recency and
+    # authority both need no embedding. The raw keyword lane has no fused `:final_score`,
+    # so re-rank over its `:relevance_score` WITHOUT mutating that raw field (the hybrid
+    # resolver reads it, and the public result shape must be preserved).
+    reranked = apply_ranking_priors_fallback(kw.results, opts)
+    paginated = paginate_results(reranked, opts)
 
     maybe_record_search_access(
       tenant_id,
@@ -6863,6 +6888,10 @@ defmodule Loopctl.Knowledge do
             opts
           )
       end
+      # #471: re-rank the fused list by the recency + source-authority priors BEFORE the
+      # top-k cut. Pure (no DB) — the result maps already carry updated_at/category/
+      # source_type/tags/status, so merge_results/5 stays a DB-free fusion function.
+      |> apply_ranking_priors_fused(opts)
 
     paginated = paginate_results(sorted, opts)
 
@@ -7002,6 +7031,86 @@ defmodule Loopctl.Knowledge do
 
   defp rrf_k(opts) do
     Keyword.get(opts, :rrf_k, Application.get_env(:loopctl, :knowledge_rrf_k, 60))
+  end
+
+  # --- Recency + source-authority priors (#471) -------------------------------
+  #
+  # Post-fusion re-ranking applied on `search_combined/3`'s fused candidate list (and,
+  # via apply_ranking_priors_fallback/2, on the degraded keyword_only path). PURE re-rank:
+  # no DB, and the clock is threaded through opts (`:now`, defaulting to utc_now here) so
+  # merge_results/5 stays DB-free and tests stay deterministic. Bounded BY DESIGN — see
+  # Loopctl.Knowledge.RankingPriors — so the priors break ties without dominating strong
+  # relevance.
+
+  # Bounds for the authority factor band. Narrow so it only re-ranks near-ties.
+  @authority_floor 0.9
+  @authority_ceiling 1.1
+
+  # Re-rank the FUSED list: multiply each candidate's fused `:final_score` by its prior
+  # multiplier, then re-sort by `{final_score, id}` desc — the SAME deterministic tiebreak
+  # fuse_rrf/fuse_min_max use, so with priors disabled (multiplier 1.0) the ordering is
+  # byte-for-byte the pre-#471 fused ordering. Only `:final_score` (a fused field) is
+  # adjusted; the raw `:relevance_score`/`:similarity_score` the hybrid resolver reads are
+  # left untouched.
+  defp apply_ranking_priors_fused(results, opts) do
+    prior_opts = ranking_prior_opts(opts)
+
+    results
+    |> Enum.map(fn r ->
+      Map.update(r, :final_score, 0.0, &(&1 * RankingPriors.multiplier(r, prior_opts)))
+    end)
+    |> Enum.sort_by(&{&1.final_score, &1.id}, :desc)
+  end
+
+  # Re-rank the degraded keyword_only list. There is no fused `:final_score`, so the sort
+  # key is `relevance_score * multiplier` computed on the fly — the raw `:relevance_score`
+  # is NEVER mutated (shape preserved; hybrid resolver safe). The two-stage stable sort
+  # preserves the keyword lane's own `id ASC` tiebreak (its DB order is
+  # `ts_rank_cd DESC, id ASC`), so with priors disabled the ordering is unchanged.
+  defp apply_ranking_priors_fallback(results, opts) do
+    prior_opts = ranking_prior_opts(opts)
+
+    results
+    |> Enum.sort_by(& &1.id, :asc)
+    |> Enum.sort_by(
+      fn r -> (Map.get(r, :relevance_score) || 0.0) * RankingPriors.multiplier(r, prior_opts) end,
+      :desc
+    )
+  end
+
+  defp ranking_prior_opts(opts) do
+    [
+      now: Keyword.get(opts, :now, DateTime.utc_now()),
+      recency_weight: recency_weight_opt(opts),
+      authority?: authority_prior_enabled?(opts),
+      strength: authority_strength_opt(opts),
+      floor: @authority_floor,
+      ceiling: @authority_ceiling
+    ]
+  end
+
+  defp recency_weight_opt(opts) do
+    opts
+    |> Keyword.get(:recency_weight, Application.get_env(:loopctl, :knowledge_recency_weight, 0.3))
+    |> max(0.0)
+    |> min(1.0)
+  end
+
+  defp authority_prior_enabled?(opts) do
+    Keyword.get(
+      opts,
+      :authority_prior,
+      Application.get_env(:loopctl, :knowledge_authority_prior_enabled, true)
+    )
+  end
+
+  defp authority_strength_opt(opts) do
+    opts
+    |> Keyword.get(
+      :authority_strength,
+      Application.get_env(:loopctl, :knowledge_authority_strength, 0.05)
+    )
+    |> max(0.0)
   end
 
   defp rrf_graph_weight(opts) do
@@ -7196,6 +7305,13 @@ defmodule Loopctl.Knowledge do
           project_id: a.project_id,
           title: a.title,
           category: a.category,
+          # source_type is projected here for symmetry with the keyword lane
+          # (knowledge.ex ~1870) and the semantic pool (vector_search.ex ~499) so
+          # RankingPriors.authority_factor reads the SAME source-authority prior no
+          # matter which lane first surfaced a doc. Without it a graph-lane-only doc
+          # would fall back to source_authority(nil) (the 0.0 neutral floor) and get a
+          # category-only authority factor — asymmetric with kw/sem (#471 review).
+          source_type: a.source_type,
           status: a.status,
           tags: a.tags,
           inserted_at: a.inserted_at,

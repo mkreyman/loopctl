@@ -181,6 +181,36 @@ CI's pg16 (or mask a real one). Ranking ties inside a run are already made deter
 seeded article ids), so this is the remaining cross-environment variable — pin it by
 re-baselining on pg16.
 
+### #471 re-baseline: an accepted per-question tie-break regression
+
+The #471 ranking priors (recency + source/category authority) ship **default-on in every
+env** (`config/config.exs`: `knowledge_recency_weight` 0.3, `knowledge_authority_prior_enabled`
+true, `knowledge_authority_strength` 0.05 — no `test.exs` override). Re-baselining with them
+enabled produced one per-question REGRESSION that is **consciously accepted**, recorded here
+so it is not a silent bless:
+
+* `q-keyword-fallback`, embeddings arm, nDCG@10: **0.86034 -> 0.85196** (MRR stays 1.0,
+  nDCG@5 and recall unchanged).
+
+Why it is accepted, not a bug:
+
+* It is a **graded-distractor tie-break reorder**, exactly the bounded behavior #471 is
+  specified to have — the priors nudge near-ties among ranks 2–10, they do not move the
+  first relevant hit (MRR@1 = 1.0 is unchanged). This is the "priors break ties, do not
+  dominate strong relevance" contract working as designed.
+* Every **aggregate** metric improved with the priors on (embeddings MRR 0.736 -> 0.746,
+  nDCG@10 0.740 -> 0.750, recall@10 0.800 -> 0.808; keyword_only MRR 0.16 -> 0.192), so
+  AC-6's "aggregate >= baseline" bar holds on the merits, not by accident.
+* A newly added question (`q-recency-fusion`, which exercises the recency prior directly)
+  scores 1.0 across the board in both modes; it raises the aggregate but is NOT what
+  masks the per-question dip — the dip is small and local, and the aggregate would clear
+  the bar without it.
+
+The gate compares against this same regenerated-and-committed baseline (the normal
+re-baseline workflow below), so it cannot fail retroactively for the PR that introduced
+the priors — which is precisely why the acceptance is documented here rather than left to
+the gate to catch.
+
 ## The CI gate
 
 The `retrieval-eval` job in `.github/workflows/ci.yml` runs

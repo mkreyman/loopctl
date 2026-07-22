@@ -495,6 +495,8 @@ defmodule Loopctl.Knowledge.VectorSearch do
       category: a.category,
       status: a.status,
       tags: a.tags,
+      # source_type feeds the #471 authority prior in Loopctl.Knowledge.search_combined/3.
+      source_type: a.source_type,
       metadata: a.metadata,
       inserted_at: a.inserted_at,
       updated_at: a.updated_at,

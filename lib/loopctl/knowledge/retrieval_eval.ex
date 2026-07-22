@@ -525,6 +525,11 @@ defmodule Loopctl.Knowledge.RetrievalEval do
 
     rows =
       Enum.map(seeded, fn {id, doc} ->
+        # Per-doc age (#471): a doc with `age_days` set is seeded as if last updated that
+        # many days ago, so the recency prior in search_combined/3 is exercisable. Absent
+        # age → `now` (the pre-#471 behavior — every doc the same age).
+        ts = seeded_timestamp(now, Map.get(doc, :age_days))
+
         %{
           id: id,
           tenant_id: tenant_id,
@@ -536,13 +541,22 @@ defmodule Loopctl.Knowledge.RetrievalEval do
           tags: doc.tags,
           metadata: %{"retrieval_eval" => true, "doc_id" => doc.doc_id},
           embedding: Pgvector.new(embedding_for_doc(doc)),
-          inserted_at: now,
-          updated_at: now
+          inserted_at: ts,
+          updated_at: ts
         }
       end)
 
     AdminRepo.insert_all(Article, rows)
     :ok
+  end
+
+  # Age a seed timestamp back by `age_days` (nil/0 → `now`). Uses whole seconds so the
+  # eval stays reproducible run-to-run.
+  defp seeded_timestamp(now, nil), do: now
+  defp seeded_timestamp(now, 0), do: now
+
+  defp seeded_timestamp(now, age_days) when is_number(age_days) do
+    DateTime.add(now, -round(age_days * 86_400), :second)
   end
 
   @doc """
