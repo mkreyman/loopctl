@@ -72,6 +72,43 @@ How to add a labeled question, re-baseline, and read the per-question winners/lo
 `docs/runbooks/retrieval_eval.md`. Its semantic lane is a SYNTHETIC (provider-free) stand-in —
 a regression instrument, not an absolute quality score.
 
+## Latency & observability — the semantic-search hot path
+
+Ranking quality is gated above; this is the LATENCY side. Semantic search / novelty / suggest-links
+are the latency-critical path — the #172 full-corpus-scan incident is why the read SHAPE, not the
+number, is the load-bearing invariant. To monitor and keep it healthy over time:
+
+- **Metric.** Prometheus histogram
+  `loopctl_heavy_read_repo_query_duration_bucket{endpoint="semantic_search"}` (buckets ms
+  10/50/100/250/500/1000/2500/5000/10000; siblings `vector_search`, `memory_recall`), defined in
+  `lib/loopctl_web/telemetry.ex`, scraped by Fly managed Prometheus off the internal port 9568
+  (`/metrics`). Metrics table + no-leak label rules: `docs/runbooks/knowledge-scale.md`.
+- **p95:** `histogram_quantile(0.95, sum by (le) (rate(<bucket>[24h])))`. Fly Prometheus auth is the
+  FlyV1-token-not-Bearer gotcha — wiki `6dd01e58`.
+- **Low-traffic caveat (READ THIS before trusting a p95).** Prod serves ~2 semantic searches/hr, so
+  ANY window's p95 is dominated by the occasional cold-cache / autostop-resume outlier on the 512MB
+  machines — one cold query swings it by seconds. Read p50 AND the bucket distribution, never the
+  sparse p95 in isolation. The CI plan-shape gate is the real regression gate; the prod p95 is an
+  observation, not a pass/fail number.
+- **Plan-shape invariant (the actual gate).** The request-path inner ANN
+  (`Knowledge.semantic_side_table_pool_query/4`) stays filter-after-ANN: a pure index-ordered top-k
+  over `article_embeddings` on the per-dimension index (`article_embeddings_hnsw_dim_<dim>_idx`), with
+  NO join or distance predicate inside it (wiki `bd4a26b6`; #172). CI asserts this on a seeded corpus
+  without `enable_seqscan=off` (`test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs`,
+  US-41.1 AC-41.1.12(i)). Re-check prod with `AdminRepo.explain(:all, Knowledge.semantic_side_table_pool_query(...))`
+  via `fly ssh console -a loopctl -C "/app/bin/loopctl rpc ..."` — the plan MUST show
+  `Index Scan using article_embeddings_hnsw_dim_<dim>_idx`, never a Seq Scan reaching the vector relation.
+- **Read-routing flag.** `SystemConfig "embedding_side_table_reads"` (read via
+  `Embeddings.side_table_reads_enabled?/0`) routes reads to the dimension-tagged side table vs the
+  legacy `articles.embedding` column. Flipping it is a single reversible `SystemConfig.put/2`;
+  changes reach every node within 60s via the per-minute `SystemConfigRefreshWorker`. The side table
+  is a NARROW relation (the ANN fetches only `article_id` from a lean heap), so it reads measurably
+  FASTER than the wide legacy column at equal recall — adding the relation IMPROVED latency, it did not
+  cost it. Cutover prod EXPLAIN + p95 artifact: GH #464.
+- **Bulk (re)embed / backfill is a live-DB hazard.** Unthrottled it 504s the live wiki — per-row HNSW
+  index maintenance saturates the small Fly Postgres and starves concurrent heavy-read searches past
+  their `statement_timeout`. Throttled id-range keyset pattern: wiki `7a4187fd`.
+
 ## Anti-patterns
 
 - Writing a private, task-local fact via `knowledge_create` (pollutes shared KB) — use `memory_remember`.
