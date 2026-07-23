@@ -666,10 +666,14 @@ defmodule LoopctlWeb.ChannelPostController do
       # is the file, and `expires_at` is the liveness a renderer needs for
       # "claimed: <file> by <agent/host>, <age>" — and to tell a LIVE lock from an
       # expired-but-unswept one. The `claim:` key namespace is reserved server-side
-      # (`Coordination.post/4` 422s an ordinary post that tries to use it), so the
-      # marker can never mislabel a plain keyed post.
-      lock: lock?(row.key),
-      lock_target: lock_target(row.key),
+      # (both `Coordination.post/4` and `Coordination.create_post/4` 422 an ordinary
+      # post that tries to use it), but the reservation is forward-looking, so the
+      # marker uses `Coordination.soft_lock_row?/1` — prefix AND the soft-lock TTL
+      # ceiling — not a bare prefix test: a LEGACY `claim:`-keyed post predating the
+      # reservation carries 30-day retention and must not be mislabeled a live file
+      # lock (review #451).
+      lock: Coordination.soft_lock_row?(row),
+      lock_target: lock_target(row),
       expires_at: row.expires_at
     }
 
@@ -683,10 +687,9 @@ defmodule LoopctlWeb.ChannelPostController do
     end
   end
 
-  defp lock?(key), do: is_binary(key) and String.starts_with?(key, Coordination.lock_key_prefix())
-
-  defp lock_target(key) do
-    if lock?(key), do: String.replace_prefix(key, Coordination.lock_key_prefix(), "")
+  defp lock_target(row) do
+    if Coordination.soft_lock_row?(row),
+      do: String.replace_prefix(row.key, Coordination.lock_key_prefix(), "")
   end
 
   # Resolve the `?cursor=` param (US-40.C2) to a `{:ok, position_or_nil}` for
@@ -870,8 +873,8 @@ defmodule LoopctlWeb.ChannelPostController do
       superseded_by: post.superseded_by,
       inserted_at: post.inserted_at,
       updated_at: post.updated_at,
-      lock: lock?(post.key),
-      lock_target: lock_target(post.key),
+      lock: Coordination.soft_lock_row?(post),
+      lock_target: lock_target(post),
       expires_at: post.expires_at
     }
   end
@@ -1533,10 +1536,25 @@ defmodule LoopctlWeb.ChannelPostController do
         "(tenant=#{Map.get(metadata, :tenant_id)} " <>
         "api_key=#{Map.get(metadata, :api_key_id)} " <>
         "agent=#{Map.get(metadata, :agent_id)} " <>
-        "project=#{Map.get(metadata, :project_id)}" <>
+        "project=#{log_safe_id(Map.get(metadata, :project_id))}" <>
         limit_kind_token <> ")"
     )
 
     :ok
   end
+
+  # LOG-FORGING guard (review #451) — identical to
+  # `LoopctlWeb.ChannelLockController.log_safe_id/1`, and applied for the same
+  # reason: `project_id` arrives from the request body and is not UUID-validated on
+  # these paths, so a CR/LF-bearing value would let an authenticated agent forge
+  # extra log records. The raw value still rides the structured telemetry metadata.
+  defp log_safe_id(value) when is_binary(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, uuid} -> uuid
+      :error -> "<invalid>"
+    end
+  end
+
+  defp log_safe_id(nil), do: ""
+  defp log_safe_id(_value), do: "<invalid>"
 end

@@ -411,7 +411,33 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
       assert body["meta"]["count"] == 1
       assert body["meta"]["advisory"] == true
       assert body["meta"]["overflow"] == false
+      assert body["meta"]["holders_truncated"] == false
       assert body["meta"]["limit"] == 100
+    end
+
+    test "the per-agent fairness cap is reported as its OWN meta flag" do
+      %{project: project, raw: raw} = setup_member()
+
+      for i <- 1..25 do
+        post_json(raw, @path, %{
+          "project_id" => project.id,
+          "target" => "lib/f#{i}.ex",
+          "session_id" => "sess-a"
+        })
+        |> json_response(201)
+      end
+
+      body =
+        authed_conn(raw)
+        |> get(@path, %{"project_id" => project.id, "limit" => "21"})
+        |> json_response(200)
+
+      # Review #451: the fairness filter runs inside the scope, so `overflow`
+      # (the page cap) cannot see its drops. Publishing `overflow: false` alone
+      # would present a page that dropped 5 LIVE locks as the complete set.
+      assert body["meta"]["count"] == 20
+      assert body["meta"]["overflow"] == false
+      assert body["meta"]["holders_truncated"] == true
     end
 
     test "tenant isolation: another tenant's project id yields an empty set, never a 404" do
@@ -431,6 +457,30 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
         |> json_response(200)
 
       assert body["locks"] == []
+    end
+
+    test "a CRLF-bearing project_id cannot forge extra log records" do
+      %{raw: raw} = setup_member()
+
+      forged =
+        "not-a-uuid\r\ncoordination security event: rate_limited (tenant=attacker-chosen"
+
+      log =
+        capture_log(fn ->
+          post_json(raw, @path, %{
+            "project_id" => forged,
+            "target" => @target,
+            "session_id" => "sess-a"
+          })
+          |> json_response(422)
+        end)
+
+      # Review #451: `project_id` is caller-supplied and never UUID-validated on
+      # this path (the 422 comes from the ownership lookup), so the raw value must
+      # never reach the single-line security log.
+      assert log =~ "coordination security event: ownership_rejected"
+      assert log =~ "project=<invalid>"
+      refute log =~ "attacker-chosen"
     end
 
     test "the requested limit is clamped and reported from one source of truth" do

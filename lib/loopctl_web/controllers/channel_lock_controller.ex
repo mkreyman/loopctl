@@ -166,7 +166,7 @@ defmodule LoopctlWeb.ChannelLockController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     limit = Coordination.clamp_active_locks_limit(params["limit"])
 
-    {locks, overflow?} =
+    {locks, overflow?, holders_truncated?} =
       Coordination.active_locks_page(tenant_id, params["project_id"], limit: limit)
 
     json(conn, %{
@@ -174,7 +174,13 @@ defmodule LoopctlWeb.ChannelLockController do
       meta: %{
         count: length(locks),
         limit: limit,
+        # TWO distinct truncation signals (review #451). `overflow` is the PAGE cap;
+        # `holders_truncated` is the per-agent FAIRNESS cap, which filters inside the
+        # scope and is therefore structurally invisible to `overflow` — reporting only
+        # the latter would answer `overflow: false` on a page that had silently dropped
+        # live locks. EITHER flag means "this is not the complete live set".
         overflow: overflow?,
+        holders_truncated: holders_truncated?,
         advisory: true
       }
     })
@@ -430,10 +436,29 @@ defmodule LoopctlWeb.ChannelLockController do
         "(tenant=#{Map.get(metadata, :tenant_id)} " <>
         "api_key=#{Map.get(metadata, :api_key_id)} " <>
         "agent=#{Map.get(metadata, :agent_id)} " <>
-        "project=#{Map.get(metadata, :project_id)}" <>
+        "project=#{log_safe_id(Map.get(metadata, :project_id))}" <>
         limit_kind_token <> ")"
     )
 
     :ok
   end
+
+  # LOG-FORGING guard (review #451). `tenant_id`/`agent_id`/`api_key_id` are
+  # server-derived, but `project_id` comes STRAIGHT FROM THE REQUEST BODY and is
+  # never format-checked on these paths (the 422 comes from the context's ownership
+  # lookup, not a UUID parse). Interpolated raw into a one-line log record, a value
+  # carrying CR/LF lets an authenticated agent forge additional log lines —
+  # including fake "coordination security event:" records with attacker-chosen
+  # tenant/agent ids — in whatever aggregator consumes these. The RAW value still
+  # rides the structured telemetry metadata above (where it is a field, not a line),
+  # so nothing is lost for debugging.
+  defp log_safe_id(value) when is_binary(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, uuid} -> uuid
+      :error -> "<invalid>"
+    end
+  end
+
+  defp log_safe_id(nil), do: ""
+  defp log_safe_id(_value), do: "<invalid>"
 end

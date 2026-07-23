@@ -436,12 +436,12 @@ defmodule Loopctl.CoordinationSoftLockTest do
                  take_lock(ctx, target: "lib/f#{n}.ex", session_id: "s#{n}")
       end
 
-      assert {locks, true} =
+      assert {locks, true, false} =
                Coordination.active_locks_page(ctx.tenant.id, ctx.project.id, limit: 2)
 
       assert length(locks) == 2
 
-      assert {all, false} = Coordination.active_locks_page(ctx.tenant.id, ctx.project.id)
+      assert {all, false, false} = Coordination.active_locks_page(ctx.tenant.id, ctx.project.id)
       assert length(all) == 3
 
       assert Coordination.clamp_active_locks_limit(1000) == 200
@@ -537,7 +537,7 @@ defmodule Loopctl.CoordinationSoftLockTest do
       assert length(plain) == 12
     end
 
-    test "the pinned lock read caps ONE (agent, session) holder so peers stay visible" do
+    test "the pinned lock read caps ONE AGENT so peers stay visible" do
       ctx = setup_member()
       quiet_agent = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
       make_member(ctx.tenant, ctx.project, quiet_agent)
@@ -550,11 +550,43 @@ defmodule Loopctl.CoordinationSoftLockTest do
         assert {:ok, _lock, :created} = take_lock(ctx, target: "lib/noisy#{i}.ex")
       end
 
-      locks = Coordination.active_locks(ctx.tenant.id, ctx.project.id, limit: 21)
-      noisy = Enum.filter(locks, &(&1.session_id == "sess-a"))
+      {locks, overflow?, holders_truncated?} =
+        Coordination.active_locks_page(ctx.tenant.id, ctx.project.id, limit: 21)
+
+      noisy = Enum.filter(locks, &(&1.agent_id == ctx.agent_id))
 
       assert length(noisy) == 20
       assert peer_lock.id in Enum.map(locks, & &1.id)
+
+      # Review #451: the fairness filter runs INSIDE the scope, so its drops are
+      # structurally invisible to the page-cap `overflow` signal. The page here is
+      # exactly `limit` rows — `overflow?` is false — yet five LIVE locks were
+      # dropped, so the distinct flag is the only honest signal.
+      refute overflow?
+      assert holders_truncated?
+    end
+
+    test "the per-agent fairness cap is NOT escapable by rotating the caller-supplied session_id" do
+      ctx = setup_member()
+      quiet_agent = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
+      make_member(ctx.tenant, ctx.project, quiet_agent)
+
+      assert {:ok, peer_lock, :created} =
+               take_lock(ctx, agent_id: quiet_agent, session_id: "sess-quiet", target: "lib/q.ex")
+
+      # A fresh session_id per write: under a (agent, session) partition every row
+      # would land in its own partition of size 1 and the bound would never bind.
+      for i <- 1..25 do
+        assert {:ok, _lock, :created} =
+                 take_lock(ctx, session_id: "rotating-#{i}", target: "lib/noisy#{i}.ex")
+      end
+
+      {locks, _overflow?, holders_truncated?} =
+        Coordination.active_locks_page(ctx.tenant.id, ctx.project.id, limit: 21)
+
+      assert Enum.count(locks, &(&1.agent_id == ctx.agent_id)) == 20
+      assert peer_lock.id in Enum.map(locks, & &1.id)
+      assert holders_truncated?
     end
   end
 
@@ -584,6 +616,202 @@ defmodule Loopctl.CoordinationSoftLockTest do
 
       assert Enum.all?(metadata, &(Map.get(&1, "soft_lock_target") == @target))
     end
+  end
+
+  # --- review #451 regressions ---
+
+  describe "target path normalization" do
+    test "different spellings of one path collapse to ONE slot" do
+      ctx = setup_member()
+
+      assert {:ok, post, :created} = take_lock(ctx, target: "lib/foo.ex")
+
+      for spelling <- ["./lib/foo.ex", "lib//foo.ex", "/lib/foo.ex", "lib/./foo.ex"] do
+        assert {:ok, same, :updated} = take_lock(ctx, target: spelling)
+        assert same.id == post.id
+      end
+
+      assert [%ChannelPost{key: "claim:lib/foo.ex"}] = lock_rows(ctx.tenant.id, ctx.project.id)
+      assert length(Coordination.active_locks(ctx.tenant.id, ctx.project.id)) == 1
+
+      # The inverse holds for release: a differently-spelled path addresses the
+      # SAME slot, so the lock is releasable however the caller spells it.
+      assert {:ok, _released} = unlock(ctx, "sess-a", target: "./lib//foo.ex")
+      assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
+    end
+
+    test "a target that normalizes to nothing is rejected" do
+      ctx = setup_member()
+      assert {:error, :invalid_target} = take_lock(ctx, target: "///")
+      assert {:error, :invalid_target} = take_lock(ctx, target: " ./ ")
+    end
+  end
+
+  describe "legacy claim:-keyed rows are not published as live locks" do
+    test "a 30-day-retention claim: post is invisible to the lock read" do
+      ctx = setup_member()
+
+      {:ok, legacy} =
+        AdminRepo.insert(%ChannelPost{
+          tenant_id: ctx.tenant.id,
+          project_id: ctx.project.id,
+          agent_id: ctx.agent_id,
+          session_id: "legacy",
+          key: "claim:story-812",
+          body: "a plain keyed post written before the namespace was reserved",
+          expires_at: DateTime.add(DateTime.utc_now(), 30 * 86_400, :second)
+        })
+
+      # It exists...
+      assert legacy.id in Enum.map(lock_rows(ctx.tenant.id, ctx.project.id), & &1.id)
+      # ...but no lock read will call it a live advisory file lock.
+      assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
+      refute Coordination.soft_lock_row?(legacy)
+
+      # A genuine lock IS one.
+      assert {:ok, real, :created} = take_lock(ctx)
+      assert Coordination.soft_lock_row?(real)
+    end
+
+    test "a lock refreshed long after it was taken is still marked a lock" do
+      now = DateTime.utc_now()
+
+      # A refresh is a keyed upsert that PRESERVES inserted_at while extending the
+      # lease, so the discriminator anchors on updated_at — anchoring on inserted_at
+      # would stop marking exactly the long-running edits the marker matters for.
+      refreshed = %{
+        key: "claim:lib/foo.ex",
+        inserted_at: DateTime.add(now, -3000, :second),
+        updated_at: now,
+        expires_at: DateTime.add(now, 900, :second)
+      }
+
+      assert Coordination.soft_lock_row?(refreshed)
+
+      legacy = %{
+        key: "claim:story-812",
+        inserted_at: now,
+        updated_at: now,
+        expires_at: DateTime.add(now, 30 * 86_400, :second)
+      }
+
+      refute Coordination.soft_lock_row?(legacy)
+    end
+
+    test "the reserved namespace is enforced by BOTH writers, not one call site" do
+      ctx = setup_member()
+
+      assert {:error, :unprocessable_entity, message} =
+               Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
+                 project_id: ctx.project.id,
+                 key: "claim:story-812",
+                 session_id: "sess-a",
+                 body: "ordinary post",
+                 audit: audit()
+               })
+
+      assert message =~ "reserved"
+
+      assert {:error, :unprocessable_entity, ^message} =
+               Coordination.create_post(ctx.tenant.id, ctx.project.id, ctx.agent_id, %{
+                 key: "claim:story-812",
+                 session_id: "sess-a",
+                 body: "ordinary post"
+               })
+    end
+  end
+
+  describe "quarantined lock rows" do
+    test "a quarantined lock can NOT be hard-deleted through the release path" do
+      ctx = setup_member()
+      assert {:ok, post, :created} = take_lock(ctx)
+
+      {:ok, _quarantined} =
+        post
+        |> ChannelPost.quarantine_changeset([:body], DateTime.utc_now())
+        |> AdminRepo.update()
+
+      # The benign `soft_lock_released` label must not become a second delete path
+      # for a security-flagged row (the operator's only reviewable artifact).
+      assert {:error, :not_found} = unlock(ctx, "sess-a")
+      assert AdminRepo.get(ChannelPost, post.id)
+
+      # ...and it is not published as a live lock either.
+      assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
+    end
+
+    test "releasing a quarantined lock restores its OWN lease, not 30-day retention" do
+      ctx = setup_member()
+      assert {:ok, post, :created} = take_lock(ctx)
+
+      {:ok, quarantined} =
+        post
+        |> ChannelPost.quarantine_changeset([:body], DateTime.utc_now())
+        |> AdminRepo.update()
+
+      {:ok, released} =
+        quarantined
+        |> ChannelPost.release_changeset(DateTime.utc_now(), Coordination.retention_days())
+        |> AdminRepo.update()
+
+      ceiling =
+        DateTime.add(released.inserted_at, Coordination.max_lock_ttl_seconds(), :second)
+
+      assert DateTime.compare(released.expires_at, ceiling) != :gt
+    end
+
+    test "the schema's mirrored soft-lock constants match the context's" do
+      # `ChannelPost` duplicates these to avoid a cyclic dependency; this is the
+      # assertion that keeps the copies honest.
+      assert Coordination.lock_key_prefix() == "claim:"
+      assert Coordination.max_lock_ttl_seconds() == 3600
+    end
+  end
+
+  describe "channel_recent lock share cap" do
+    test "cursor pages do NOT re-apply the cap, so a walk is not capped per page" do
+      ctx = setup_member()
+
+      for i <- 1..12 do
+        assert {:ok, _lock, :created} = take_lock(ctx, target: "lib/f#{i}.ex")
+      end
+
+      # With a page smaller than the cap, the walk reaches every lock: the cap is
+      # applied only to the entry page, and cursor pages are exempt (before the fix
+      # the cap re-applied per page against that page's own window, permanently
+      # skipping every lock ranked past @max_recent_locks on EVERY page).
+      seen = drain_history(ctx, nil, [])
+
+      assert length(Enum.filter(seen, &String.starts_with?(&1.key || "", "claim:"))) == 12
+    end
+
+    test "the pinned read is the complete lock set when the preview caps them" do
+      ctx = setup_member()
+
+      for i <- 1..12 do
+        assert {:ok, _lock, :created} = take_lock(ctx, target: "lib/f#{i}.ex")
+      end
+
+      # DOCUMENTED exception on this read: the recency preview admits at most
+      # @max_recent_locks locks and suppressed locks do not move `has_more`, so a
+      # consumer that needs lock visibility must call the dedicated pinned read.
+      {page, has_more, _cursor} =
+        Coordination.recent_page(ctx.tenant.id, ctx.project.id, limit: 25)
+
+      assert length(Enum.filter(page, &String.starts_with?(&1.key || "", "claim:"))) == 5
+      refute has_more
+
+      assert length(Coordination.active_locks(ctx.tenant.id, ctx.project.id)) == 12
+    end
+  end
+
+  defp drain_history(ctx, cursor, acc) do
+    {rows, _has_more, next} =
+      Coordination.recent_page(ctx.tenant.id, ctx.project.id, limit: 3, cursor: cursor)
+
+    acc = acc ++ rows
+
+    if next, do: drain_history(ctx, next, acc), else: acc
   end
 
   defp unlock(ctx, session_id, opts \\ []) do

@@ -385,11 +385,47 @@ describe("US-40.4: channel_lock / channel_unlock / channel_locks wiring", () => 
     );
   });
 
-  test("channel_locks documents the per-holder fairness bound", () => {
+  // Review #451: the fairness partition is the SERVER-STAMPED agent_id alone.
+  // Partitioning on the client-supplied session_id too would let a caller rotating
+  // session ids escape the bound entirely, so the tool description must not promise
+  // a per-(agent, session) bound the server does not enforce.
+  test("channel_locks documents the per-AGENT fairness bound", () => {
     assert.match(
       INDEX_SRC,
-      /name: "channel_locks",[\s\S]*?Fairness-bounded: a single \(agent, session\) holder contributes at most 20 rows/,
-      "channel_locks must document the per-holder fairness bound",
+      /name: "channel_locks",[\s\S]*?Fairness-bounded: a single AGENT \(server-stamped from the key, so rotating session_id does not escape it\) contributes at most 20 rows/,
+      "channel_locks must document the per-agent fairness bound",
+    );
+  });
+
+  // Review #451: the fairness cap filters INSIDE the scope, so meta.overflow (the
+  // page cap) cannot see its drops. A client told only about overflow would read
+  // `overflow: false` on a page that had silently dropped live locks.
+  test("channel_locks documents BOTH truncation flags", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_locks",[\s\S]*?meta\.overflow[\s\S]*?meta\.holders_truncated/,
+      "channel_locks must document meta.overflow AND meta.holders_truncated",
+    );
+  });
+
+  // Review #451: the reserved namespace is a behavior change on an EXISTING tool —
+  // an agent already posting key: "claim:story-812" must be forewarned in the tool
+  // it actually calls, not only in the new lock tools.
+  test("channel_post warns that the claim: key namespace is reserved", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_post",[\s\S]*?RESERVED KEY NAMESPACE: keys beginning with 'claim:'[\s\S]*?REJECTED here with a 422/,
+      "channel_post must document the reserved claim: namespace",
+    );
+  });
+
+  // Review #451: locks ride channel_recent but are capped there and do not move
+  // has_more, so the read must not be cited as evidence that a file is free.
+  test("channel_recent warns that its lock view is capped", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_recent",[\s\S]*?LOCK VISIBILITY CAVEAT[\s\S]*?call channel_locks/,
+      "channel_recent must carry the lock-visibility caveat",
     );
   });
 

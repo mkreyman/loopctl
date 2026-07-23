@@ -88,6 +88,21 @@ defmodule Loopctl.Coordination do
   # story fixed that convention before the handoff claim existed as a table.
   @lock_key_prefix "claim:"
 
+  # The SQL `LIKE` pattern for the lock namespace. It MUST stay a compile-time
+  # LITERAL in every query (review #451): Postgres only matches a partial index when
+  # it can PROVE the query predicate implies the index predicate, and that proof is
+  # Const-based — it cannot reason about a bind parameter. Written as `^(prefix <>
+  # "%")` the predicate renders `key LIKE $n` and
+  # `channel_posts_soft_lock_idx` (predicate `key LIKE 'claim:%'`) is never chosen,
+  # so the index ships dead and every lock read falls back to scan-and-filter. The
+  # US-40.C1 handoff read gets this right with a literal; so must this one.
+  @lock_key_like "claim:%"
+
+  # Compile-time tie: the literal above can never drift from the prefix.
+  if @lock_key_like != @lock_key_prefix <> "%" do
+    raise "@lock_key_like must be @lock_key_prefix <> \"%\""
+  end
+
   # The 422 a caller gets for posting into the RESERVED soft-lock key namespace via
   # the generic write path. Names the remedy explicitly: the lock endpoint owns the
   # prefix, and an ordinary keyed slot must pick a different name.
@@ -139,10 +154,20 @@ defmodule Loopctl.Coordination do
   # FAIRNESS bound on the pinned active-lock read (review #451). The page cap above
   # truncates NEWEST-first, so without this one noisy holder — the lock write cap is
   # 120/min against a 900s TTL — could fill every slot and evict every peer's lock
-  # from the very read that exists to surface peers. A single (agent, session) holder
-  # therefore contributes at most this many rows to a page; the rest of the page stays
-  # available to other holders. Well above any sane per-session working set (a session
-  # editing >20 files at once is not doing collision avoidance any more).
+  # from the very read that exists to surface peers. A single AGENT therefore
+  # contributes at most this many rows to a page; the rest of the page stays
+  # available to other agents. Well above any sane working set (an agent editing >20
+  # files at once is not doing collision avoidance any more).
+  #
+  # The partition is `agent_id` ALONE — deliberately NOT `(agent_id, session_id)`.
+  # `session_id` is CALLER-SUPPLIED (see the `unlock_file/5` trust note), so a caller
+  # that sends a fresh session_id per write lands every row in its own partition of
+  # size 1 and the bound never binds — the adversary this cap exists to stop would
+  # bypass it by construction. `agent_id` is SERVER-STAMPED from the verified key, so
+  # partitioning on it makes the published guarantee actually hold. Cost: an agent
+  # legitimately running several concurrent sessions shares one budget — acceptable,
+  # since the budget is per PAGE of an advisory hint read and the complete set is
+  # reachable via a larger `:limit` and the `holders_truncated` signal.
   @max_locks_per_holder 20
 
   # Bounded SHARE of one `recent_page/3` page that advisory locks may occupy (review
@@ -368,13 +393,21 @@ defmodule Loopctl.Coordination do
 
   Returns `{:ok, %ChannelPost{}}`, `{:error, %Ecto.Changeset{}}` (size/shape
   bound violation, a secret-denylist hit, or a session-key slot collision — the
-  caller learns the content did not land), or `{:error, :not_found}` when the
-  project or agent does not belong to the tenant.
+  caller learns the content did not land), `{:error, :not_found}` when the
+  project or agent does not belong to the tenant, or
+  `{:error, :unprocessable_entity, message}` when `key` is in the RESERVED
+  `#{@lock_key_prefix}` soft-lock namespace. That last check is the SAME
+  `reserved_key_prefix_check/1` `post/4` runs (review #451): the namespace guarantee
+  every lock read depends on must be enforced by every writer, not by one call site.
   """
   @spec create_post(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
-          {:ok, ChannelPost.t()} | {:error, Ecto.Changeset.t()} | {:error, :not_found}
+          {:ok, ChannelPost.t()}
+          | {:error, Ecto.Changeset.t()}
+          | {:error, :not_found}
+          | {:error, :unprocessable_entity, String.t()}
   def create_post(tenant_id, project_id, agent_id, attrs) do
-    with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
+    with :ok <- reserved_key_prefix_check(attrs),
+         {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- Agents.get_agent(tenant_id, agent_id) do
       %ChannelPost{
         tenant_id: tenant_id,
@@ -1001,8 +1034,12 @@ defmodule Loopctl.Coordination do
   `key LIKE` prefix approach) as `directed_handoffs_page/3` — there is deliberately
   NO `kind` column on `channel_posts`.
 
-  Surfaces every live lock: unexpired (`expires_at > now`, independent of the
-  sweep — so an expired lock disappears IMMEDIATELY, TC-40.4.2), not quarantined,
+  Surfaces every live lock, UP TO the page cap and the per-agent fairness cap —
+  both of which are reported by `active_locks_page/3` (`overflowed?` /
+  `holders_truncated?`), so a truncated page is never presented as a complete one.
+  A live lock is: unexpired (`expires_at > now`, independent of the
+  sweep — so an expired lock disappears IMMEDIATELY, TC-40.4.2), inside the soft-lock
+  TTL ceiling (see `live_locks_scope/3`), not quarantined,
   not superseded. Rows are NOT deduplicated by key: two sessions holding a lock on
   the same file is a legitimate advisory state and BOTH must be surfaced
   (AC-40.4.4) — deduping would hide exactly the collision the caller is looking for.
@@ -1016,27 +1053,40 @@ defmodule Loopctl.Coordination do
   """
   @spec active_locks(term(), term(), keyword()) :: [map()]
   def active_locks(tenant_id, project_id, opts \\ []) do
-    {locks, _overflowed?} = active_locks_page(tenant_id, project_id, opts)
+    {locks, _overflowed?, _holders_truncated?} = active_locks_page(tenant_id, project_id, opts)
     locks
   end
 
   @doc """
-  The same read as `active_locks/3`, additionally reporting whether the page cap
-  TRUNCATED the set. Returns `{[preview()], overflowed?}`.
+  The same read as `active_locks/3`, additionally reporting BOTH ways the set can be
+  truncated. Returns `{[preview()], overflowed?, holders_truncated?}`.
 
-  Detected WITHOUT a second query by fetching `limit + 1` rows. `:limit` defaults to
-  #{@default_active_locks_limit} and is clamped to #{@max_active_locks_limit}.
+    * `overflowed?` — the PAGE CAP dropped rows. Detected without a second query by
+      fetching `limit + 1` rows. `:limit` defaults to
+      #{@default_active_locks_limit} and is clamped to #{@max_active_locks_limit}.
+    * `holders_truncated?` — the per-agent FAIRNESS cap dropped rows. This is a
+      SEPARATE signal on purpose (review #451): the fairness filter runs INSIDE the
+      scope, before the `limit + 1` over-fetch, so rows it removes are structurally
+      invisible to `overflowed?`. Reporting only `overflowed?` would publish
+      `overflow: false` on a page that had silently dropped live locks — precisely
+      the "you may edit, nobody holds this file" answer this read must never give
+      wrongly. Costs one cheap aggregate over the same indexed scope.
 
-  ## Per-holder FAIRNESS (review #451)
+  A caller that sees EITHER flag must treat the page as incomplete (raise `:limit`,
+  or read the channel directly) rather than as "these are all the live locks".
+
+  ## Per-agent FAIRNESS (review #451)
 
   The page cap truncates NEWEST-first, so a single noisy holder could otherwise fill
   every slot and evict every PEER's lock from the very read that exists to surface
-  peers. Each `(agent_id, session_id)` holder therefore contributes at most
-  #{@max_locks_per_holder} rows (its newest) — enforced in SQL by a
-  `row_number() OVER (PARTITION BY agent_id, session_id)` pre-filter, so the budget
-  applies BEFORE the page cap rather than after it.
+  peers. Each AGENT therefore contributes at most #{@max_locks_per_holder} rows (its
+  newest) — enforced in SQL by a `row_number() OVER (PARTITION BY agent_id)`
+  pre-filter, so the budget applies BEFORE the page cap rather than after it. The
+  partition is the SERVER-STAMPED `agent_id` only: partitioning on the
+  caller-supplied `session_id` too would let a caller rotating session ids escape the
+  bound entirely.
   """
-  @spec active_locks_page(term(), term(), keyword()) :: {[map()], boolean()}
+  @spec active_locks_page(term(), term(), keyword()) :: {[map()], boolean(), boolean()}
   def active_locks_page(tenant_id, project_id, opts \\ []) do
     if valid_uuid?(tenant_id) and valid_uuid?(project_id) do
       now = DateTime.utc_now()
@@ -1053,26 +1103,40 @@ defmodule Loopctl.Coordination do
         |> Enum.map(&finalize_preview/1)
         |> Enum.map(&Map.put(&1, :target, lock_target(&1.key)))
 
-      {Enum.take(rows, limit), length(rows) > limit}
+      {Enum.take(rows, limit), length(rows) > limit, holders_truncated?(base)}
     else
-      {[], false}
+      {[], false, false}
     end
   end
 
   # The live-lock predicate, shared by the page read and its fairness pre-filter so
   # the two can never drift.
+  #
+  # `@lock_key_like` is a LITERAL (never `^param`) so the partial index
+  # `channel_posts_soft_lock_idx` is provably implied and actually chosen.
+  #
+  # The UPPER bound on `expires_at` is the read-side enforcement of the TTL ceiling
+  # (review #451). A genuine soft-lock is clamped to <= @max_lock_ttl_seconds at
+  # write, so it always satisfies it; a row that does NOT is not a live lock, and
+  # publishing it as one would be a lie of up to 30 days. Two real classes land there:
+  # a LEGACY `claim:`-keyed ordinary post written before the namespace was reserved
+  # (uniform 30-day retention), and a soft-lock that was quarantined and then RELEASED
+  # (`ChannelPost.release_changeset/3` restores `inserted_at + retention_days`, which
+  # for a lock is far looser than its own lease).
   defp live_locks_scope(tenant_id, project_id, now) do
+    horizon = DateTime.add(now, @max_lock_ttl_seconds, :second)
+
     ChannelPost
     |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
-    |> where([p], like(p.key, ^(@lock_key_prefix <> "%")))
-    |> where([p], p.expires_at > ^now)
+    |> where([p], like(p.key, @lock_key_like))
+    |> where([p], p.expires_at > ^now and p.expires_at <= ^horizon)
     |> where([p], is_nil(p.quarantined_at))
     |> where([p], is_nil(p.superseded_by))
   end
 
-  # The ids of the newest @max_locks_per_holder locks PER (agent, session) holder.
-  # `session_id` is NOT NULL on any keyed row (the slot index requires it), so the
-  # partition is total.
+  # The ids of the newest @max_locks_per_holder locks PER AGENT (see the attribute
+  # comment for why the partition deliberately excludes the caller-supplied
+  # `session_id`).
   defp fair_lock_ids(base) do
     ranked =
       base
@@ -1080,12 +1144,25 @@ defmodule Loopctl.Coordination do
         id: p.id,
         holder_rank:
           over(row_number(),
-            partition_by: [p.agent_id, p.session_id],
+            partition_by: [p.agent_id],
             order_by: [desc: p.inserted_at, desc: p.seq]
           )
       })
 
     from(r in subquery(ranked), where: r.holder_rank <= ^@max_locks_per_holder, select: r.id)
+  end
+
+  # Did the fairness cap drop any LIVE lock? One aggregate over the same scope: an
+  # agent holding more than the budget is exactly an agent whose overflow rows were
+  # removed before the page cap could see them.
+  defp holders_truncated?(base) do
+    base
+    |> group_by([p], p.agent_id)
+    |> having([p], count(p.id) > ^@max_locks_per_holder)
+    |> select([p], 1)
+    |> limit(1)
+    |> AdminRepo.all()
+    |> Kernel.!=([])
   end
 
   @doc """
@@ -1112,6 +1189,46 @@ defmodule Loopctl.Coordination do
   @doc "The advisory soft-lock key prefix (`#{@lock_key_prefix}`) — the ONLY routing signal (no `kind` column)."
   @spec lock_key_prefix() :: String.t()
   def lock_key_prefix, do: @lock_key_prefix
+
+  @doc "The soft-lock TTL ceiling in seconds (#{@max_lock_ttl_seconds}) — the single source of truth for every lock liveness bound."
+  @spec max_lock_ttl_seconds() :: pos_integer()
+  def max_lock_ttl_seconds, do: @max_lock_ttl_seconds
+
+  @doc """
+  Is this READ-MODEL ROW an advisory soft-lock? — the discriminator every consumer
+  must use instead of a bare key-prefix test (review #451).
+
+  The `#{@lock_key_prefix}` namespace is reserved server-side going forward, but the
+  prefix ALONE is not sufficient evidence for a row that already exists: a legacy
+  post keyed `#{@lock_key_prefix}...` (written before the reservation) carries the
+  uniform 30-day retention, and so does a soft-lock that was quarantined and then
+  released. Both would be mislabeled as live file locks. A genuine lock's lease is
+  clamped to at most #{@max_lock_ttl_seconds}s at EVERY write, so
+  `expires_at <= updated_at + #{@max_lock_ttl_seconds}s` is the bound that
+  distinguishes them.
+
+  The bound is against `updated_at`, NOT `inserted_at`: a refresh is a keyed upsert
+  that deliberately PRESERVES `inserted_at` while extending the lease, so a lock
+  refreshed 50 minutes after it was first taken legitimately has
+  `expires_at > inserted_at + #{@max_lock_ttl_seconds}s` — anchoring on `inserted_at`
+  would silently stop marking exactly the long-running edits the marker matters most
+  for. (`live_locks_scope/3` anchors its SQL bound on `now` instead, which every
+  refreshed lock also satisfies.)
+  """
+  @spec soft_lock_row?(map()) :: boolean()
+  def soft_lock_row?(%{key: key, expires_at: %DateTime{} = expires_at} = row) do
+    case Map.get(row, :updated_at) do
+      %DateTime{} = updated_at ->
+        soft_lock_key?(key) and
+          DateTime.compare(expires_at, DateTime.add(updated_at, @max_lock_ttl_seconds, :second)) !=
+            :gt
+
+      _ ->
+        false
+    end
+  end
+
+  def soft_lock_row?(_row), do: false
 
   @doc "The default page size `active_locks/3` applies, shared with the endpoint's `meta.limit`."
   @spec default_active_locks_limit() :: pos_integer()
@@ -1145,13 +1262,31 @@ defmodule Loopctl.Coordination do
   # an honest message, rather than surfacing a confusing key-length changeset error.
   @max_lock_target_bytes 200 - byte_size(@lock_key_prefix)
 
+  # The target is also PATH-NORMALIZED (review #451). The slot identity IS the
+  # derived key, so without normalization `lib/foo.ex`, `./lib/foo.ex`,
+  # `lib//foo.ex` and `/lib/foo.ex` are four DIFFERENT slots on the same file: two
+  # sessions editing it with different spellings each take a lock and each sees the
+  # other's as an unrelated target — the collision avoidance the story exists to
+  # provide silently never fires — while one session that spells the path
+  # differently across refreshes leaks an extra un-refreshable row per spelling
+  # instead of upserting in place. Normalizing makes slot identity match the thing
+  # being protected: drop `.` and empty segments (so `./a`, `a//b` and `a/./b`
+  # collapse) and RELATIVIZE a leading `/` rather than rejecting it (an absolute
+  # path is a legitimate spelling of the same repo file from a different cwd). `..`
+  # segments are left alone — resolving them without a repo root would be a guess,
+  # and the target is advisory display data, never a filesystem operation.
   defp normalize_lock_target(target) when is_binary(target) do
-    trimmed = String.trim(target)
+    normalized =
+      target
+      |> String.trim()
+      |> String.split("/")
+      |> Enum.reject(&(&1 == "" or &1 == "."))
+      |> Enum.join("/")
 
     cond do
-      trimmed == "" -> {:error, :invalid_target}
-      byte_size(trimmed) > @max_lock_target_bytes -> {:error, :invalid_target}
-      true -> {:ok, trimmed}
+      normalized == "" -> {:error, :invalid_target}
+      byte_size(normalized) > @max_lock_target_bytes -> {:error, :invalid_target}
+      true -> {:ok, normalized}
     end
   end
 
@@ -1180,6 +1315,15 @@ defmodule Loopctl.Coordination do
   # `channel_posts_session_key_uidx` makes this at most one row. Every miss (foreign
   # tenant/project/agent/session, malformed id, blank session) returns nil so the
   # caller collapses to one byte-identical `{:error, :not_found}`.
+  #
+  # QUARANTINED rows are excluded (review #451), matching `live_locks_scope/3`. Two
+  # reasons: (1) a release is a HARD DELETE recorded under the benign
+  # `#{@soft_lock_release_action}` action, so without this an author could destroy a
+  # post the secret-denylist rescan flagged — the operator's only reviewable artifact
+  # — under a routine-churn label instead of the `deleted` redaction action operators
+  # watch; (2) read/write consistency — no lock read will show a quarantined row, so
+  # no lock write may address one. `delete_post/5` remains the explicit (and
+  # explicitly-labeled) redaction path.
   defp fetch_owned_lock(tenant_id, agent_id, project_id, session_id, key) do
     if valid_uuid?(tenant_id) and valid_uuid?(agent_id) and valid_uuid?(project_id) and
          present_string?(session_id) do
@@ -1189,6 +1333,7 @@ defmodule Loopctl.Coordination do
         p.tenant_id == ^tenant_id and p.project_id == ^project_id and
           p.agent_id == ^agent_id and p.session_id == ^session_id and p.key == ^key
       )
+      |> where([p], is_nil(p.quarantined_at))
       |> AdminRepo.one()
     else
       nil
@@ -1213,7 +1358,15 @@ defmodule Loopctl.Coordination do
   # — so a caller-keyed post in that namespace would masquerade as a live file lock
   # in `active_locks_page/3` and in `channel_recent`'s lock marker. Rejecting it here
   # (rather than silently reinterpreting it, as the first cut did) keeps the prefix a
-  # sound predicate and tells the caller exactly what to do instead.
+  # sound predicate and tells the caller exactly what to do instead. Enforced by
+  # BOTH writers (`post/4` and `create_post/4`), so the namespace is not guaranteed by
+  # a single call site.
+  #
+  # The reservation is forward-looking only, so it is NOT the whole defense: rows
+  # written BEFORE it (the `claim:` key convention predates this branch) carry the
+  # uniform 30-day retention and would otherwise be published as live file locks for
+  # up to 30 days. Every lock read therefore ALSO carries the TTL-ceiling bound (see
+  # `live_locks_scope/3` and `soft_lock_row?/1`), which no such row can satisfy.
   defp reserved_key_prefix_check(attrs) do
     if soft_lock_key?(Map.get(attrs, :key)) and not Map.has_key?(attrs, @soft_lock_ttl_attr) do
       {:error, :unprocessable_entity, @reserved_key_prefix_message}
@@ -2585,14 +2738,31 @@ defmodule Loopctl.Coordination do
       the applied `:limit`. Detected by fetching `limit + 1` rows and checking for
       the overflow row (no extra COUNT query), so the endpoint surfaces an HONEST
       truncation signal rather than leaving consumers to infer it from
-      `count == limit`. TRUNCATION-DRAIN RULE (delta mode): because delta orders
+      `count == limit`. ONE STATED EXCEPTION (review #451): advisory soft-locks are
+      capped at #{@max_recent_locks} rows per page by `apply_lock_share_cap/4` in the
+      newest and delta reads, and suppressed locks do NOT contribute to `has_more` —
+      so on a channel with many live locks this read can return `has_more: false`
+      while further live LOCK rows exist. That is deliberate (locks are the bus's
+      highest-churn write and this is a recency preview), and it is why
+      **a consumer that relies on lock visibility MUST read `active_locks_page/3` /
+      `GET /api/v1/channel/locks`** — the dedicated pinned read — rather than
+      inferring the live lock set from this one. Non-lock rows are unaffected: for
+      them `has_more` is exact. TRUNCATION-DRAIN RULE (delta mode): because delta orders
       GREATEST(inserted_at, updated_at) DESC, an overflowing window truncates the
       OLDEST-touched matching rows. A consumer MUST NOT advance its `since` watermark
       while `has_more` is true — the newest-first truncation means advancing steps
       PAST the dropped older rows permanently (a lost-write gap). Instead, drain the
       backlog via the HISTORY read (`cursor:` walked to exhaustion), which returns
-      every live row including the truncated ones, then advance `since` only once a
-      delta read returns `has_more == false`. (Delta mode emits no `next_cursor`, so
+      every live NON-LOCK row including the truncated ones, then advance
+      `since` only once a delta read returns `has_more == false`. **The drain
+      guarantee covers non-lock rows only** (review #451): the entry page of a walk
+      carries no cursor, so the lock share cap applies to it and can drop live locks
+      that the subsequent (uncapped — see `apply_lock_share_cap/4`) cursor pages
+      cannot recover, because a dropped lock may sort ABOVE the entry page's cursor.
+      That is accepted rather than papered over: locks are advisory hint data with a
+      <= 1h lease and a DEDICATED complete read (`active_locks_page/3` /
+      `GET /api/v1/channel/locks`), which is what a consumer relying on lock
+      visibility must call. (Delta mode emits no `next_cursor`, so
       the drain is the keyset/history read — not a delta continuation. See
       `@commit_lag_epsilon_seconds`.)
     * `next_cursor` — the `(inserted_at, seq)` keyset position of the LAST returned
@@ -2663,7 +2833,7 @@ defmodule Loopctl.Coordination do
 
       rows =
         base
-        |> apply_lock_share_cap(base, since)
+        |> apply_lock_share_cap(base, since, cursor)
         |> order_recent(since)
         |> select_preview()
         |> limit(^(limit + 1))
@@ -2686,20 +2856,46 @@ defmodule Loopctl.Coordination do
   # `GREATEST(inserted_at, updated_at)`, so a refreshing fleet would repeatedly
   # re-float its locks to the top of the 25-row window and crowd out genuine
   # coordination posts and handoffs. Only the NEWEST @max_recent_locks locks in the
-  # same filtered scope (same `since`/cursor window, same ordering) are admitted; the
-  # COMPLETE live set is the dedicated pinned read (`active_locks_page/3`).
+  # same filtered scope (same `since` window, same ordering) are admitted; the
+  # complete live set is the dedicated pinned read (`active_locks_page/3`), which is
+  # what a lock-visibility consumer must call — suppressed locks do NOT move
+  # `has_more` here (stated on `recent_page/3`).
   #
   # Non-lock rows are never dropped — a lock displaced from this page simply frees a
-  # slot for a real post, and cursor paging still walks every non-lock row in order.
-  # `coalesce(key, '')` keeps KEYLESS posts (NULL `key`) admitted: a bare
-  # `NOT (NULL LIKE ...)` is NULL, i.e. filtered OUT, which would silently drop every
-  # plain append-only message.
-  defp apply_lock_share_cap(query, base, since) do
-    pattern = @lock_key_prefix <> "%"
+  # slot for a real post. `coalesce(key, '')` keeps KEYLESS posts (NULL `key`)
+  # admitted: a bare `NOT (NULL LIKE ...)` is NULL, i.e. filtered OUT, which would
+  # silently drop every plain append-only message.
+  #
+  # NOT APPLIED IN HISTORY (`cursor:`) MODE (review #451). The cap is a RECENCY-
+  # PREVIEW concern — it exists so churn cannot crowd the newest-N window — while a
+  # cursor walk is a deliberate backward page through history, which the cap was
+  # actively CORRUPTING: `newest_lock_ids` is computed against `base`, which already
+  # carries `apply_cursor/2`, so the cap re-applied per cursor page against that
+  # page's own window — a lock ranked 6th in page N's window was excluded from page N
+  # AND sat above page N+1's strict `< cursor` seek, i.e. skipped permanently on
+  # EVERY page. Exempting cursor mode removes that per-page re-application entirely.
+  #
+  # It does NOT make the walk lock-complete, and `recent_page/3`'s docstring says so
+  # plainly: the ENTRY page of a walk carries no cursor, so the cap applies there and
+  # a lock it drops may sort above the entry page's cursor. Locks are advisory hint
+  # data with a <= 1h lease and a DEDICATED complete read — a consumer that needs the
+  # live lock set calls `active_locks_page/3`, never this one.
+  #
+  # The lock predicate carries the SAME TTL ceiling `live_locks_scope/3` uses, so a
+  # legacy `claim:`-keyed ordinary post (30-day retention, written before the
+  # namespace was reserved) is treated as the ordinary post it is and never suppressed
+  # from the recency preview. `@lock_key_like` stays a LITERAL so the partial index
+  # is usable.
+  defp apply_lock_share_cap(query, _base, _since, cursor) when not is_nil(cursor), do: query
 
+  defp apply_lock_share_cap(query, base, since, _cursor) do
     newest_lock_ids =
       base
-      |> where([p], like(p.key, ^pattern))
+      |> where(
+        [p],
+        like(p.key, @lock_key_like) and
+          p.expires_at <= datetime_add(p.updated_at, ^@max_lock_ttl_seconds, "second")
+      )
       |> order_recent(since)
       |> limit(@max_recent_locks)
       |> select([p], p.id)
@@ -2707,7 +2903,9 @@ defmodule Loopctl.Coordination do
     where(
       query,
       [p],
-      not like(coalesce(p.key, ""), ^pattern) or p.id in subquery(newest_lock_ids)
+      not (like(coalesce(p.key, ""), @lock_key_like) and
+             p.expires_at <= datetime_add(p.updated_at, ^@max_lock_ttl_seconds, "second")) or
+        p.id in subquery(newest_lock_ids)
     )
   end
 

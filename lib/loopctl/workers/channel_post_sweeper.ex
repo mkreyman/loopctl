@@ -3,11 +3,23 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   Oban cron worker that hard-deletes expired coordination-bus posts
   (`Loopctl.Coordination.ChannelPost`), Epic 39 / US-39.5.
 
-  The coordination bus (the third memory plane) is deliberately transient: every
-  row carries a uniform 30-day `expires_at`, set server-side in
-  `Loopctl.Coordination`. Anything worth keeping longer is already graduated to
-  Knowledge, so hard-deleting expired rows loses nothing. This worker deletes
-  rows past `expires_at`. Scheduled via the Oban Cron plugin in
+  The coordination bus (the third memory plane) is deliberately transient: a row
+  carries a uniform 30-day `expires_at`, set server-side in `Loopctl.Coordination`.
+  Anything worth keeping longer is already graduated to Knowledge, so hard-deleting
+  expired rows loses nothing. This worker deletes rows past `expires_at`.
+
+  ## Two documented exceptions to the uniform window
+
+    * **US-40.4 advisory file soft-locks** (`claim:`-keyed posts) carry a SHORT,
+      caller-influenced, server-clamped TTL of 60..3600s — `Loopctl.Coordination`'s
+      `lock_file/5` is the one write path where `expires_at` is caller-influenced at
+      all. This is now the bus's dominant churn source: a lock is taken and released
+      per file edit per session and expires within the hour, so the steady-state
+      volume of EXPIRED rows this worker sees is orders of magnitude above the
+      pre-40.4 baseline. Tune `@batch_size` and the `:sweep_stalled` grace/capacity
+      knobs below against THAT rate, not against 30-day post expiry.
+    * **Quarantined posts** (issue #499) have `expires_at` EXTENDED to at least the
+      operator review window, so the evidence outlives the alert. Scheduled via the Oban Cron plugin in
   `Loopctl.ObanConfig.plugins/0` (every 5 minutes), following the existing
   cleanup-worker convention (see `Loopctl.Workers.SessionMemoryPruneWorker`).
 
@@ -30,7 +42,8 @@ defmodule Loopctl.Workers.ChannelPostSweeper do
   ## Observability (issue #498)
 
   Retention is a release gate, so a silently dead sweep silently stops enforcing the
-  30-day window. Three signals cover the three distinct failure shapes:
+  window above (30 days for a post, <= 3600s for a soft-lock). Three signals cover the
+  three distinct failure shapes:
 
   1. **Ran and succeeded** — `Loopctl.TelemetryEvents.channel_post_swept/0` is
      emitted on EVERY successful run, INCLUDING a zero-delete no-op. Emitting only on
