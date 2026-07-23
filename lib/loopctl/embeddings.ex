@@ -57,7 +57,6 @@ defmodule Loopctl.Embeddings do
   alias Loopctl.Memory.Memory
   alias Loopctl.Memory.MemoryEmbedding
   alias Loopctl.Repo
-  alias Loopctl.SystemConfig
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Workers.ReembedWorker
   alias Loopctl.Workers.SystemCorpusEmbeddingWorker
@@ -388,9 +387,26 @@ defmodule Loopctl.Embeddings do
 
   A `SystemConfig` integer (`0` = legacy, `1` = side table) so the flip and — just
   as importantly — the REVERT are a single operator UPDATE with no redeploy.
+
+  Resolved through `Loopctl.Embeddings.ReadPathBehaviour` (config-based DI), NOT
+  read from `SystemConfig` here. Production resolves to
+  `Loopctl.Embeddings.SystemConfigReadPath`, which is the exact previous
+  implementation, so operator semantics are unchanged. The seam exists because
+  the flag is cached in VM-GLOBAL `:persistent_term`: without it, a test can only
+  select the side-table path by mutating global state for the whole node, which
+  leaked across tests and produced empty-result failures that read as a vector
+  recall bug. See the behaviour's moduledoc.
   """
   @spec side_table_reads_enabled?() :: boolean()
-  def side_table_reads_enabled?, do: SystemConfig.get_int(@read_flag_key, 0) == 1
+  def side_table_reads_enabled?, do: read_path().side_table_reads_enabled?()
+
+  defp read_path do
+    Application.get_env(
+      :loopctl,
+      :embedding_read_path,
+      Loopctl.Embeddings.SystemConfigReadPath
+    )
+  end
 
   @doc "The `SystemConfig` key backing `side_table_reads_enabled?/0`."
   @spec read_flag_key() :: String.t()

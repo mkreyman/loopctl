@@ -19,6 +19,7 @@ defmodule Loopctl.DataCase do
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.Custody.Coverage
   alias Loopctl.Egress.Scope, as: EgressScope
+  alias Loopctl.Embeddings.SystemConfigReadPath
   alias Loopctl.Oban.FairShare
   alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Telemetry.ScaleMetrics
@@ -76,6 +77,14 @@ defmodule Loopctl.DataCase do
     # real `Loopctl.Custody.Coverage` behaviour; TC-41.7.8 overrides it.
     Mox.stub(Loopctl.MockCustodyCoverage, :covered_paths, fn ->
       Coverage.covered_paths()
+    end)
+
+    # US-41.1: default to the REAL SystemConfig-backed read-path decision, so every
+    # pre-existing test sees production behaviour (legacy column until an operator
+    # flips the flag). The US-41.1 read-path tests override this with a
+    # process-scoped `Mox.stub/3` instead of mutating the VM-global flag.
+    Mox.stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn ->
+      SystemConfigReadPath.side_table_reads_enabled?()
     end)
 
     Mox.stub(Loopctl.MockHealthChecker, :check, fn ->

@@ -95,3 +95,13 @@ Mox.defmock(Loopctl.MockBacklogCounter, for: Loopctl.Oban.BacklogCounterBehaviou
 # TC-41.7.8 overrides it with Mox.expect/3 to exercise BOTH configurations —
 # webhook coverage enabled and disabled — without `Application.put_env` in a test.
 Mox.defmock(Loopctl.MockCustodyCoverage, for: Loopctl.Custody.CoverageBehaviour)
+
+# US-41.1: DI seam for the embedding read-path cutover decision. The flag lives in
+# VM-GLOBAL `:persistent_term`, so before this seam a test could only exercise the
+# side-table path by mutating node-wide state and restoring it in `on_exit` — a
+# mutation that leaked between modules and surfaced as empty search results. The
+# DataCase default stub delegates to the real
+# `Loopctl.Embeddings.SystemConfigReadPath` (so every pre-existing test sees
+# production behaviour unchanged); the US-41.1 read-path tests override it with
+# `Mox.stub/3`, which is scoped to the calling process.
+Mox.defmock(Loopctl.MockEmbeddingReadPath, for: Loopctl.Embeddings.ReadPathBehaviour)

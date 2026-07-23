@@ -650,3 +650,24 @@ config :loopctl, :custody_coverage_source, Loopctl.MockCustodyCoverage
 
 # No debounce in test: a drain immediately after a write must flush the batch.
 config :loopctl, :custody_flush_debounce_seconds, 0
+
+# US-41.1: the embedding read-path cutover decision is injected (see
+# `Loopctl.Embeddings.ReadPathBehaviour`). The production implementation reads a
+# `SystemConfig` flag cached in VM-GLOBAL `:persistent_term`, so selecting the
+# side-table path in a test used to mean mutating node-wide state and restoring it
+# in `on_exit`. That mutation leaked between modules: a test that had just asserted
+# the flag was on would run its query after the value had been reset, silently take
+# the legacy path, and fail with an empty result set that looked like a vector
+# recall bug. `Loopctl.DataCase.stub_all_defaults/0` stubs this mock to delegate to
+# the real `SystemConfigReadPath`, so every other test keeps production behaviour.
+config :loopctl, :embedding_read_path, Loopctl.MockEmbeddingReadPath
+
+# #488 / US-41.1: run ANN reads the way PRODUCTION runs them — iterative scan ON
+# (1 = relaxed_order). The test HNSW indexes are SHARED across every tenant and every
+# concurrently-running test, so at the default ef_search a tenant-filtered ANN can fill
+# its entire candidate window with OTHER tenants' rows and return ZERO of its own. That
+# is the exact filtered-under-return #488 fixed, and it surfaced here as intermittent
+# empty result sets in the US-41.1 read-path tests (`left: []`), which read as a vector
+# recall bug rather than a filtering artifact. Injected via Application config so no test
+# writes the VM-global `SystemConfig` / `:persistent_term` cache to get it.
+config :loopctl, :hnsw_iterative_scan, 1

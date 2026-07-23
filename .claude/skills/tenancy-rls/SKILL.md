@@ -61,9 +61,9 @@ reads through `Loopctl.HeavyRead` (`lib/loopctl/heavy_read.ex`), which owns the 
    `subject_id` equality on the outermost query (private `guard_memory!/3`, `heavy_read.ex:825-853`), because `subject_id`
    scoping is application-level only. Always go through `Loopctl.HeavyRead`, never `HeavyReadRepo`
    directly; on `AdminRepo` there is no guard at all, so the predicate is on you.
-7. **Heavy reads can be SHED — handle `{:error, :heavy_read_overloaded}`.** `all/3` (`heavy_read.ex:525`),
-   `one/3` (`heavy_read.ex:545`) and `all_memory/4` (`heavy_read.ex:581`) are specced to return it: the
-   per-tenant cost-weighted in-flight gate (`gated/4`, `heavy_read.ex:610-624`) sheds over the cap —
+7. **Heavy reads can be SHED — handle `{:error, :heavy_read_overloaded}`.** `all/3` (`heavy_read.ex:543`),
+   `one/3` (`heavy_read.ex:563`) and `all_memory/4` (`heavy_read.ex:599`) are specced to return it: the
+   per-tenant cost-weighted in-flight gate (`gated/4`, `heavy_read.ex:628-642`) sheds over the cap —
    `on_overload: :raise` (default) raises → 429, `on_overload: :tag` returns the tuple. Binding the
    result as a list crashes exactly under the load the gate exists for.
 8. **A consistency-coupled heavy read must be PRIMARY-PINNED.** `repo_for/1` (`heavy_read.ex:112-114`,
@@ -75,7 +75,7 @@ reads through `Loopctl.HeavyRead` (`lib/loopctl/heavy_read.ex`), which owns the 
 ## The pgbouncer gotcha (US-27.13 — production outage, do not regress)
 
 `HeavyReadRepo` enforces a server-side `statement_timeout` **per-read via `SET LOCAL` inside the
-transaction** (`heavy_read.ex:525-555` — `all/3` and `one/3`, both via `with_statement_timeout/5`;
+transaction** (`heavy_read.ex:543-555` — `all/3` and `one/3`, both via `with_statement_timeout/5`;
 `heavy_read_repo.ex:19-32`) — NOT as a connection startup
 `:parameters` value. Fly MPG fronts Postgres with **pgbouncer**, which rejects a `statement_timeout`
 startup parameter with `FATAL 08P01 unsupported startup parameter`, crash-looping the whole pool so it

@@ -147,7 +147,13 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
   describe "per-query hnsw.iterative_scan (#488)" do
     test "hnsw_iterative_scan/0 maps SystemConfig int codes to modes (0/unknown => off)" do
-      assert HeavyRead.hnsw_iterative_scan() == "off", "default/missing => off"
+      # Prime 0 EXPLICITLY rather than relying on the ambient default: `config/test.exs`
+      # sets an Application-level default of 1 (#488, so the suite reads ANN the way
+      # production does and filtered searches stop under-returning on the shared test
+      # HNSW indexes). An explicit SystemConfig value always WINS over that default, which
+      # is the operator-lever contract this test exists to pin.
+      prime_iterative_scan(0)
+      assert HeavyRead.hnsw_iterative_scan() == "off", "explicit 0 => off"
 
       prime_iterative_scan(1)
       assert HeavyRead.hnsw_iterative_scan() == "relaxed_order"
@@ -170,7 +176,10 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     end
 
     test "opts/1 attaches :hnsw_iterative_scan for ANN endpoints ONLY when enabled" do
-      # OFF (default): no key on any endpoint, so pgvector < 0.8 (no such GUC) is never touched.
+      # OFF: no key on any endpoint, so pgvector < 0.8 (no such GUC) is never touched.
+      # Primed explicitly — see the mapping test above for why the ambient default is 1 here.
+      prime_iterative_scan(0)
+
       for endpoint <- HeavyRead.ann_endpoints() do
         refute Keyword.has_key?(HeavyRead.opts(endpoint), :hnsw_iterative_scan),
                "expected #{endpoint} opts to carry NO :hnsw_iterative_scan at OFF"
@@ -208,10 +217,12 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
              "expected SET LOCAL hnsw.max_scan_tuples = 50000, got: #{inspect(sqls)}"
     end
 
-    test "an ANN heavy read at OFF (default) issues NO SET LOCAL hnsw.iterative_scan" do
-      # The default must touch NOTHING iterative-scan — this is what keeps the feature
-      # inert (and safe on a pgvector < 0.8 backend without the GUC) until an operator opts in.
-      assert HeavyRead.hnsw_iterative_scan() == "off", "precondition: default OFF"
+    test "an ANN heavy read at OFF issues NO SET LOCAL hnsw.iterative_scan" do
+      # OFF must touch NOTHING iterative-scan — this is what keeps the feature inert (and
+      # safe on a pgvector < 0.8 backend without the GUC) until an operator opts in.
+      # Primed explicitly because config/test.exs defaults the suite to 1 (#488).
+      prime_iterative_scan(0)
+      assert HeavyRead.hnsw_iterative_scan() == "off", "precondition: OFF"
       tenant = fixture(:tenant)
       q = from(a in Article, where: a.tenant_id == ^tenant.id, select: %{id: a.id})
 

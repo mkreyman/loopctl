@@ -386,14 +386,33 @@ defmodule Loopctl.HeavyRead do
   (0 = off (default/missing/unknown), 1 = relaxed_order, 2 = strict_order), so an operator
   enables iterative scan fleet-wide with a single `UPDATE` — no redeploy — AFTER confirming
   the deployed pgvector is >= 0.8.
+
+  An `Application` config value (`:hnsw_iterative_scan`) takes precedence when set, so an
+  ENVIRONMENT can pin the mode without writing the VM-global `SystemConfig`
+  `:persistent_term` cache. `config/test.exs` uses this to run the suite the way production
+  runs (iterative scan ON): the test HNSW indexes are SHARED across every tenant and every
+  concurrently-running test, and at the default `ef_search` a tenant-filtered ANN can fetch
+  its whole candidate window from OTHER tenants' rows and return ZERO of its own — the
+  under-return #488 exists to fix. That surfaced as empty result sets in the US-41.1
+  read-path tests, which read as a recall bug rather than a filtering artifact.
+
+  Production is unaffected: with no `Application` value set, this resolves to the
+  `SystemConfig` key exactly as before.
   """
   @spec hnsw_iterative_scan() :: String.t()
   def hnsw_iterative_scan do
-    Map.get(
-      @hnsw_iterative_scan_modes,
-      Loopctl.SystemConfig.get_int("hnsw_iterative_scan", @default_hnsw_iterative_scan),
-      "off"
-    )
+    Map.get(@hnsw_iterative_scan_modes, iterative_scan_code(), "off")
+  end
+
+  # Precedence: an explicit `SystemConfig` value ALWAYS wins (the operator lever is
+  # never shadowed by an environment default — that is the whole point of a live-tunable
+  # key). The `Application` value only supplies the DEFAULT used when the key is unset,
+  # which is how `config/test.exs` runs the suite production-shaped without any test
+  # writing the VM-global cache. Production sets no `Application` value, so this is the
+  # pre-existing `@default_hnsw_iterative_scan` (off).
+  defp iterative_scan_code do
+    default = Application.get_env(:loopctl, :hnsw_iterative_scan, @default_hnsw_iterative_scan)
+    Loopctl.SystemConfig.get_int("hnsw_iterative_scan", default)
   end
 
   @doc """
