@@ -84,7 +84,9 @@ defmodule Loopctl.Tenants.TierCapabilities do
      "kind: kb project scopes — create/archive/restore, to partition knowledge by repo. " <>
        "This is the agent-native way to establish a project row for the repo you are on."},
     {:coordination_bus, :agent_rooted,
-     "Repo coordination bus (Epic 39/40): channel posts, claims, handoffs."},
+     "Repo coordination bus (Epic 39/40): channel posts, claims, handoffs, and redacting " <>
+       "your own post. Secret-leak quarantine triage is a separate, human-anchored " <>
+       "surface — see coordination_quarantine."},
     {:context_retriever_queries, :agent_rooted,
      "Querying declared Context Retriever entities (Epic 30) via the cr_* tools."},
     {:tenant_profile, :agent_rooted,
@@ -115,7 +117,13 @@ defmodule Loopctl.Tenants.TierCapabilities do
        "ingestion anomalies stays open."},
     {:skills, :human_anchored,
      "Skill definitions and versions (create/update/archive/new version/import) and " <>
-       "recorded skill results. Reading skills and cost-performance stays open."}
+       "recorded skill results. Reading skills and cost-performance stays open."},
+    {:coordination_quarantine, :human_anchored,
+     "Secret-leak quarantine triage on the coordination bus (US-39.1): reading the FULL " <>
+       "body of a post quarantined for a credential shape, and releasing a false positive. " <>
+       "Both handle material already suspected to be a leaked secret, which is why they sit " <>
+       "above the otherwise agent-native bus. Posting, reading, claiming and redacting your " <>
+       "own posts stays open — see coordination_bus."}
   ]
 
   # The `RequireHumanAnchor` mounts each `:human_anchored` surface covers. This is
@@ -151,7 +159,8 @@ defmodule Loopctl.Tenants.TierCapabilities do
       "LoopctlWeb.KnowledgeEmbeddingController",
       "LoopctlWeb.IngestionAnomalyController"
     ],
-    skills: ["LoopctlWeb.SkillController", "LoopctlWeb.SkillResultController"]
+    skills: ["LoopctlWeb.SkillController", "LoopctlWeb.SkillResultController"],
+    coordination_quarantine: ["LoopctlWeb.ChannelPostController"]
   }
 
   @learn_more "https://loopctl.com/wiki/chain-of-custody"
