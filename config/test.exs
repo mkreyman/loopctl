@@ -260,8 +260,18 @@ config :loopctl, Loopctl.Telemetry.IngestionWriteStats, async: false
 # message string in tests), but declare `metadata: :all` so Credo's
 # MissedMetadataKeyInLoggerConfig check knows arbitrary structured keys
 # (sqlstate, mapped_code, … — US-27.3) are permitted in this env.
+#
+# The message placeholder MUST be `:msg`, not `:message`. This is Erlang's
+# `:logger_formatter`, where `:msg` is the one atom treated specially (replaced by the
+# formatted message) and EVERY other atom is looked up as a METADATA key. `:message` is
+# the Elixir `Logger.Formatter` spelling; here it silently resolved to a nonexistent
+# metadata key, so every log line in the whole test env rendered as a bare
+# "warning: " / "error: " with the text dropped. That blanked the diagnostics for the
+# entire suite — most damagingly the nightly scale gate, whose failures are only
+# reachable through CI logs (a fail-closed streaming-export abort logs the mapped_code
+# and SQLSTATE that say WHY, and all of it was being thrown away).
 config :logger, :default_handler,
-  formatter: {:logger_formatter, %{template: [:level, ": ", :message, "\n"]}}
+  formatter: {:logger_formatter, %{template: [:level, ": ", :msg, "\n"]}}
 
 config :logger, :default_formatter,
   metadata: [

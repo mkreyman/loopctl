@@ -44,16 +44,6 @@ defmodule Loopctl.Knowledge.StreamingExportScaleTest do
   # requires `:manual` mode). Kept as a thin seam so the call sites read clearly.
   defp unboxed(fun), do: fun.()
 
-  setup do
-    # `config/test.exs` points `:embedding_read_path` at a Mox mock for the whole test
-    # env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed it.
-    # Without this, any read reaching `Embeddings.side_table_reads_enabled?/0` raises
-    # `Mox.UnexpectedCallError` in the nightly scale job.
-    Loopctl.DataCase.stub_embedding_read_path()
-
-    :ok
-  end
-
   setup_all do
     # The export is served by a REAL HTTP server whose request handlers run in
     # separate processes that check out their OWN repo connections. Sandbox `:manual`
@@ -71,6 +61,21 @@ defmodule Loopctl.Knowledge.StreamingExportScaleTest do
     # those handler processes to resolve it. `set_mox_global` is appropriate here —
     # this module is `async: false`.
     Mox.set_mox_global()
+
+    # `config/test.exs` points EVERY injected collaborator at a Mox mock for the whole
+    # test env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed
+    # them. The Bandit handler processes run the FULL authenticated pipeline, so an
+    # export request reaches far more collaborators than the clock alone (the rate
+    # limiter among them) — hand-picking mocks one at a time is how this file kept
+    # breaking. `stub_all_defaults/0` is the single source of truth and a superset,
+    # so a mock added to DataCase is covered here automatically.
+    #
+    # It MUST be here in `setup_all`, NOT a per-test `setup`: `set_mox_global/0` above
+    # makes THIS process the global owner, and in global mode Mox lets ONLY the owner
+    # register stubs — a `Mox.stub` from the per-test setup (a different process) raises
+    # ArgumentError and fails every test in the module before its body runs.
+    Loopctl.DataCase.stub_all_defaults()
+
     Mox.stub(Loopctl.MockClock, :utc_now, &DateTime.utc_now/0)
 
     # The big tenant: ~80k committed articles (prod floor). A separate SMALL tenant

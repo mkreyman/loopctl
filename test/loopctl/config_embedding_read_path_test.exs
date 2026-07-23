@@ -146,29 +146,115 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
     end
   end
 
-  describe "bare-ExUnit scale modules stub the injected read path" do
-    test "every *_scale_test.exs without DataCase/ConnCase calls stub_embedding_read_path/0" do
-      missing =
-        "test/**/*_scale_test.exs"
-        |> Path.wildcard()
-        |> Enum.reject(fn file ->
-          source = File.read!(file)
+  # These guards classify a module by what it DOES, so every pattern must match a real
+  # directive/call — never a bare substring. `source =~ "use Loopctl.DataCase"` is a trap:
+  # the standard explanatory comment in these very files reads "this module does not `use
+  # Loopctl.DataCase`", so a substring test EXCLUDED every file it was meant to police and
+  # the guard silently passed on an empty set. Anchor to line-start code instead.
+  @uses_case_template ~r/^\s*use\s+Loopctl\.(DataCase|ConnCase)\b/m
+  @calls_stub_all_defaults ~r/^\s*(Loopctl\.DataCase\.)?stub_all_defaults\(\)/m
+  @calls_set_mox_global ~r/^\s*(Mox\.)?set_mox_global\(\)/m
 
-          source =~ "use Loopctl.DataCase" or source =~ "use Loopctl.ConnCase" or
-            source =~ "stub_embedding_read_path"
-        end)
+  defp bare_exunit_scale_modules do
+    "test/**/*_scale_test.exs"
+    |> Path.wildcard()
+    |> Enum.reject(&(File.read!(&1) =~ @uses_case_template))
+  end
+
+  describe "bare-ExUnit scale modules stub the injected collaborators" do
+    test "the module classifier matches directives, not prose (the guard itself)" do
+      assert "  use Loopctl.DataCase, async: true" =~ @uses_case_template
+      assert "  use Loopctl.ConnCase" =~ @uses_case_template
+
+      refute "  # this module does not `use Loopctl.DataCase`, so nothing stubbed it" =~
+               @uses_case_template,
+             "a COMMENT mentioning the template must not be read as using it — that is the " <>
+               "exact substring bug that made this guard vacuous"
+
+      assert "    Loopctl.DataCase.stub_all_defaults()" =~ @calls_stub_all_defaults
+      assert "    stub_all_defaults()" =~ @calls_stub_all_defaults
+
+      refute "  # `stub_all_defaults/0` is the single source of truth" =~
+               @calls_stub_all_defaults,
+             "a COMMENT naming the helper must not count as calling it"
+
+      assert "    Mox.set_mox_global()" =~ @calls_set_mox_global
+
+      refute "  # `set_mox_global` makes the stub visible from any process" =~
+               @calls_set_mox_global,
+             "a COMMENT naming set_mox_global must not count as calling it"
+
+      refute bare_exunit_scale_modules() == [],
+             "the glob/classifier matched NO modules — the guards below would be vacuous"
+    end
+
+    test "every *_scale_test.exs without DataCase/ConnCase calls stub_all_defaults/0" do
+      missing =
+        bare_exunit_scale_modules()
+        |> Enum.reject(&(File.read!(&1) =~ @calls_stub_all_defaults))
 
       assert missing == [],
              """
              These scale modules are on bare `ExUnit.Case`, so `stub_all_defaults/0` never
-             runs for them, and `config/test.exs` points `:embedding_read_path` at
-             `Loopctl.MockEmbeddingReadPath` for the whole test env. Any read reaching
-             `Loopctl.Embeddings.side_table_reads_enabled?/0` therefore raises
-             `Mox.UnexpectedCallError` — and `:scale` tests are excluded from
-             `mix precommit`, so it fails ONLY in the nightly job.
+             runs for them, and `config/test.exs` points EVERY injected collaborator at a
+             Mox mock for the whole test env. Any call reaching an unstubbed mock raises
+             `Mox.UnexpectedCallError` — and `:scale`/`:scale_nightly` tests are excluded
+             from `mix precommit`, so it fails ONLY in the nightly job.
 
-             Add `Loopctl.DataCase.stub_embedding_read_path()` to each module's `setup`:
+             This guard deliberately requires the FULL `stub_all_defaults/0`, not a
+             narrower per-mock stub. Hand-picking one mock at a time is what kept the
+             nightly red: a read-path-only stub still left `MockEmbeddingConcurrency`
+             unstubbed, and the next unstubbed mock would repeat it. `stub_all_defaults/0`
+             is the single source of truth, so a mock added to DataCase is covered here
+             automatically.
+
+             Add `Loopctl.DataCase.stub_all_defaults()` to each module:
              #{Enum.join(missing, "\n")}
+             """
+    end
+
+    test "modules in Mox GLOBAL mode register the stubs in the global-owner process" do
+      offenders =
+        Enum.filter(bare_exunit_scale_modules(), fn file ->
+          source = File.read!(file)
+
+          case Regex.scan(@calls_set_mox_global, source, return: :index) do
+            [] ->
+              false
+
+            matches ->
+              # In global mode Mox lets ONLY the process that called `set_mox_global/0`
+              # register stubs. So at least one `stub_all_defaults()` must appear AFTER
+              # the last `set_mox_global()` — i.e. in that same (owner) block. A call that
+              # only appears BEFORE it is running in some other process (typically a
+              # per-test `setup` while the owner is `setup_all`) and raises ArgumentError,
+              # failing every test in the module before its body runs.
+              [{last_global, _} | _] = List.last(matches)
+
+              stub_positions =
+                @calls_stub_all_defaults
+                |> Regex.scan(source, return: :index)
+                |> Enum.map(fn [{pos, _} | _] -> pos end)
+
+              not Enum.any?(stub_positions, &(&1 > last_global))
+          end
+        end)
+
+      assert offenders == [],
+             """
+             These scale modules call `Mox.set_mox_global/0` but never call
+             `Loopctl.DataCase.stub_all_defaults()` after it, so the stubs are registered
+             from a NON-owner process. Mox raises
+
+                 cannot add expectations/stubs to <Mock> in the current process ...
+                 because Mox is in global mode
+
+             which fails every test in the module before its body runs — and only in the
+             nightly job, since these are `:scale_nightly`-tagged.
+
+             Move the `stub_all_defaults()` call into the same block as `set_mox_global()`
+             (immediately after it), not a per-test `setup`:
+             #{Enum.join(offenders, "\n")}
              """
     end
   end
