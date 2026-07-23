@@ -51,7 +51,12 @@ defmodule Loopctl.Coordination do
   # Issue #499: the 422 for the post-write invariant in `secret_guard_step/1` — the
   # write merged cleanly but the PERSISTED row still carries a credential in a field
   # the keyed upsert preserves (`host`, or an omitted `to_host`/`to_capability`).
-  @persisted_secret_message "this keyed slot still carries a credential shape in a field a re-post cannot overwrite (host or advisory addressing); the write was rolled back — have an operator redact or release the post"
+  # The remedy names REDACTION only, deliberately: `release_post/5` clears the quarantine
+  # bookkeeping but cannot change the dirty PRESERVED field, and `secret_guard_step/1` has
+  # no notion of an exonerated row — so after a release this slot would 422 on every
+  # subsequent write, permanently, while the genuinely dirty post is republished. The only
+  # remedies that actually free the slot are `delete_post/5` and a new session_id.
+  @persisted_secret_message "this keyed slot still carries a credential shape in a field a re-post cannot overwrite (host or advisory addressing); the write was rolled back — have an operator redact (delete) the post, or retry under a new session_id. Releasing the post does NOT free the slot: release cannot clear the offending field"
 
   # Issue #499: bound on one page of the operator quarantine review read.
   @quarantined_default_limit 25
@@ -1030,6 +1035,12 @@ defmodule Loopctl.Coordination do
   # Reject claiming a ref whose newest live post is already superseded — the ref
   # points to stale instructions that have been retired. This prevents an agent
   # from claiming a handoff whose correction already exists (US-454 defect 3).
+  #
+  # QUARANTINED posts are excluded (issue #499), like every other consumer: a
+  # quarantined post is invisible to `recent_page/3`, `directed_handoffs_page/3` and
+  # `get_post/2`, so letting one still permit or block a claim would let an agent claim a
+  # ref whose instructions it can no longer fetch — and the quarantine's `expires_at`
+  # extension would lengthen exactly that window.
   defp verify_ref_not_superseded(tenant_id, project_id, ref) do
     now = DateTime.utc_now()
 
@@ -1038,7 +1049,7 @@ defmodule Loopctl.Coordination do
       |> where(
         [p],
         p.tenant_id == ^tenant_id and p.project_id == ^project_id and
-          p.key == ^ref and p.expires_at > ^now
+          p.key == ^ref and p.expires_at > ^now and is_nil(p.quarantined_at)
       )
       |> order_by([p], desc: p.inserted_at, desc: p.seq)
       |> limit(1)
@@ -1234,7 +1245,7 @@ defmodule Loopctl.Coordination do
   `get_post/2`) hides them, and the `:secret_detected` anomaly + audit entry carry FIELD
   NAMES only. This is the one read that resolves them, so an operator can judge true vs
   false positive and then either redact (`delete_post/5`) or exonerate
-  (`release_post/3`) — without direct DB access.
+  (`release_post/5`) — without direct DB access.
 
   It returns the FULL body (that IS the artifact under review), which is why the endpoint
   is `role: :user`, not the agent-role coordination surface.
@@ -1277,10 +1288,21 @@ defmodule Loopctl.Coordination do
   @spec quarantined_default_limit() :: pos_integer()
   def quarantined_default_limit, do: @quarantined_default_limit
 
-  defp quarantined_limit(limit) when is_integer(limit) and limit > 0,
+  @doc """
+  The EFFECTIVE page size `list_quarantined_posts/2` will apply for a requested `limit`
+  (default #{@quarantined_default_limit}, clamped to #{@quarantined_max_limit}; anything
+  not a positive integer falls back to the default).
+
+  Public because the endpoint must report the CLAMPED value in `meta.limit`, not the
+  requested one: reporting `limit: 1000` while returning at most 100 rows (or `limit: 0`
+  / `limit: -5` while returning 25) is exactly the drift `quarantined_default_limit/0`
+  exists to prevent.
+  """
+  @spec quarantined_limit(term()) :: pos_integer()
+  def quarantined_limit(limit) when is_integer(limit) and limit > 0,
     do: min(limit, @quarantined_max_limit)
 
-  defp quarantined_limit(_), do: @quarantined_default_limit
+  def quarantined_limit(_), do: @quarantined_default_limit
 
   @doc """
   RELEASES a quarantined post — the operator's exoneration path (issue #499).
@@ -1295,32 +1317,43 @@ defmodule Loopctl.Coordination do
   re-quarantine it within the hour and the release would be cosmetic.
 
   Tenant-scoped and ORACLE-SAFE exactly like `delete_post/5`: a malformed, nonexistent,
-  foreign-tenant, or NOT-quarantined id all return `{:error, :not_found}` — byte-identical.
-  Authorization is the ROUTE's `role: :user` plug (an agent must never be able to unhide a
-  post the security rescan flagged); this function does not re-derive it, mirroring how
-  the other operator-only context calls are gated at the edge.
+  foreign-tenant, NOT-quarantined, or UNAUTHORIZED id all return `{:error, :not_found}` —
+  byte-identical.
+
+  Authorization is enforced HERE as well as at the route (`role: :user`), mirroring
+  `delete_post/5`'s in-context `authorized_to_delete?/3`: releasing un-hides a post the
+  security rescan flagged AND exempts it from the rescan for the current denylist
+  revision, so it must not have LESS defence in depth than the redaction path. `role` is
+  the caller's VERIFIED key role (never client-supplied) and must be `>= :user`; a
+  non-HTTP caller (Oban worker, mix task, a new controller action that forgets the plug)
+  therefore cannot perform an unauthorized release. `agent_id` is the caller's
+  server-stamped identity, recorded in the audit entry.
 
   The update and its audit entry (`entity_type: "channel_post"`, action
   `"quarantine_released"`, carrying the cleared reason) run in ONE transaction, so an
   exoneration is as accountable as the detection that preceded it.
   """
-  @spec release_post(term(), term(), keyword()) ::
+  @spec release_post(term(), term(), atom(), term(), keyword()) ::
           {:ok, ChannelPost.t()} | {:error, :not_found | :audit_write_failed}
-  def release_post(tenant_id, post_id, audit \\ []) do
+  def release_post(tenant_id, agent_id, role, post_id, audit \\ []) do
     with true <- valid_uuid?(tenant_id) and valid_uuid?(post_id),
+         true <- Role.role_at_least?(role, :user),
          %ChannelPost{quarantined_at: %DateTime{}} = post <- fetch_owned_post(tenant_id, post_id) do
-      run_release(tenant_id, post, audit)
+      run_release(tenant_id, agent_id, post, audit)
     else
       _ -> {:error, :not_found}
     end
   end
 
-  defp run_release(tenant_id, %ChannelPost{} = post, audit) do
+  defp run_release(tenant_id, releaser_agent_id, %ChannelPost{} = post, audit) do
     reason = post.quarantine_reason
 
     multi =
       Multi.new()
-      |> Multi.update(:post, ChannelPost.release_changeset(post, DateTime.utc_now()))
+      |> Multi.update(
+        :post,
+        ChannelPost.release_changeset(post, DateTime.utc_now(), @retention_days)
+      )
       |> Audit.log_in_multi(:audit, fn %{post: released} ->
         %{
           tenant_id: tenant_id,
@@ -1334,7 +1367,8 @@ defmodule Loopctl.Coordination do
           # FIELD NAMES only, carried over from the quarantine — never the value.
           metadata: %{
             "cleared_reason" => reason,
-            "author_agent_id" => released.agent_id
+            "author_agent_id" => released.agent_id,
+            "released_by_agent_id" => releaser_agent_id
           }
         }
       end)
@@ -1651,7 +1685,12 @@ defmodule Loopctl.Coordination do
           tap_secret_blocked({:error, failed})
         end
 
-      {:error, :secret_guard, :persisted_secret, _changes} ->
+      {:error, :secret_guard, {:persisted_secret, post, fields}, _changes} ->
+        # The STRONGEST leak signal in the module — the credential is PROVEN present on a
+        # persisted row, not merely present in incoming attrs — so it must raise the same
+        # `[:loopctl, :coordination, :secret_blocked]` counter the write-time rejection
+        # does. Without it the security counter under-reports exactly the confirmed cases.
+        ChannelPost.emit_secret_blocked_fields(post, fields)
         {:error, :unprocessable_entity, @persisted_secret_message}
 
       {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
@@ -1684,7 +1723,7 @@ defmodule Loopctl.Coordination do
     Multi.run(multi, :secret_guard, fn _repo, %{post: post} ->
       case ChannelPost.secret_fields(post) do
         [] -> {:ok, :clean}
-        _fields -> {:error, :persisted_secret}
+        fields -> {:error, {:persisted_secret, post, fields}}
       end
     end)
   end
@@ -1794,7 +1833,11 @@ defmodule Loopctl.Coordination do
       # here the stored content is provably DIRTY, so it cannot simply be released.
       # Fail LOUDLY instead, mirroring the write-time gate's contract (the caller learns
       # the information did not land) and name the remedy.
-      %ChannelPost{quarantined_at: %DateTime{}} ->
+      %ChannelPost{quarantined_at: %DateTime{}} = quarantined ->
+        # A confirmed credential-leak attempt against a row already proven dirty: raise
+        # the SAME security counter the write-time rejection does, or the signal
+        # under-reports repeated attempts on exactly the worst case.
+        ChannelPost.emit_secret_blocked_fields(quarantined, blocked_fields(quarantined))
         {:error, :unprocessable_entity, @quarantined_idempotency_message}
 
       %ChannelPost{} = existing ->
@@ -1824,6 +1867,17 @@ defmodule Loopctl.Coordination do
   end
 
   defp get_post_by_idempotency_key(_tenant_id, _project_id, _agent_id, _key), do: nil
+
+  # The fields to attribute a quarantined row's blocked write to. Re-derived from the
+  # CURRENT patterns; a row quarantined under a pattern that has since been removed no
+  # longer trips the scan, so fall back to the dedup dimension the caller actually
+  # collided with rather than emitting nothing.
+  defp blocked_fields(%ChannelPost{} = post) do
+    case ChannelPost.secret_fields(post) do
+      [] -> [:idempotency_key]
+      fields -> fields
+    end
+  end
 
   # Keyless posts are always a new append-only row. A keyed post UPSERTS on the
   # LIVE PARTIAL unique index (`... WHERE key IS NOT NULL`, index

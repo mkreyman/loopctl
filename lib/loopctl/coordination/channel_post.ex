@@ -202,11 +202,12 @@ defmodule Loopctl.Coordination.ChannelPost do
     field :quarantined_at, :utc_datetime_usec
     field :quarantine_reason, :string
 
-    # The operator's EXONERATION marker (`Loopctl.Coordination.release_post/3`, role
+    # The operator's EXONERATION marker (`Loopctl.Coordination.release_post/5`, role
     # `:user`). Non-NULL = a human reviewed the quarantine and judged it a false
-    # positive, so the row is live again AND permanently out of the rescan candidate
-    # set — without it, the next run under the same patterns would instantly re-flag
-    # the post and release would be cosmetic. Cleared when a keyed slot is overwritten
+    # positive, so the row is live again AND out of the rescan candidate set for the
+    # denylist revision they judged it against — without it, the next run under the same
+    # patterns would instantly re-flag the post and release would be cosmetic, while a
+    # PERMANENT exemption would defeat retroactivity. Cleared when a keyed slot is overwritten
     # with new content, so an exonerated slot never becomes a scan-exempt channel.
     field :quarantine_released_at, :utc_datetime_usec
 
@@ -330,7 +331,7 @@ defmodule Loopctl.Coordination.ChannelPost do
 
   Quarantine is deliberately NOT a delete: the row survives for operator review, and
   `Loopctl.Coordination.delete_post/5` remains the explicit redaction path (with
-  `Loopctl.Coordination.release_post/3` the exoneration path for a false positive).
+  `Loopctl.Coordination.release_post/5` the exoneration path for a false positive).
 
   It also EXTENDS `expires_at` to at least `#{@quarantine_review_days}` days out (never
   shortens it). The row is the operator's only reviewable artifact — the audit entry and
@@ -341,7 +342,9 @@ defmodule Loopctl.Coordination.ChannelPost do
   an open alert whose evidence no longer resolves. Extending (rather than exempting
   quarantined rows from the sweep) keeps the TTL sweep the SINGLE deleter and keeps
   retention bounded — a quarantined row is invisible to every read for the whole window,
-  so the longer life costs no exposure.
+  so the longer life costs no exposure. `release_changeset/3` ROLLS THE EXTENSION BACK,
+  because release is the one transition that makes the row visible again and therefore
+  the one transition where the extra window would cost exposure.
   """
   @spec quarantine_changeset(t(), [atom()], DateTime.t()) :: Ecto.Changeset.t()
   def quarantine_changeset(%__MODULE__{} = post, fields, at) do
@@ -372,21 +375,46 @@ defmodule Loopctl.Coordination.ChannelPost do
   @doc """
   Changeset RELEASING a quarantined post — the operator's exoneration path (issue #499).
 
-  Applied by `Loopctl.Coordination.release_post/3` (role `:user`, audited) when a human
+  Applied by `Loopctl.Coordination.release_post/5` (role `:user`, audited) when a human
   reviews a quarantine and judges it a FALSE POSITIVE. Clears `quarantined_at` /
   `quarantine_reason` so every coordination read surfaces the post again, and stamps
-  `quarantine_released_at` so the rescan worker permanently skips the row — otherwise the
-  very next run, under the SAME pattern set that flagged it, would re-quarantine it and
-  the release would be cosmetic.
+  `quarantine_released_at` so the rescan worker skips the row for the CURRENT denylist
+  revision — otherwise the very next run, under the SAME pattern set that flagged it,
+  would re-quarantine it and the release would be cosmetic. (The skip is
+  revision-scoped, not permanent — see `Loopctl.Workers.ChannelPostRescanWorker`.)
+
+  It also ROLLS BACK the quarantine TTL extension `quarantine_changeset/3` applied,
+  clamping `expires_at` to at most `inserted_at + retention_days` (`retention_days` is
+  the caller-supplied `Loopctl.Coordination.retention_days/0`, threaded in to keep the
+  single source of truth in the context and avoid a cyclic dependency). The extension is
+  argued to be costless precisely BECAUSE a quarantined row is invisible to every read
+  for the whole window — release is the exact transition that falsifies that premise. A
+  post inserted day 0, quarantined day 29 (deadline pushed to day 59) and released day 30
+  would otherwise be live and re-injected into every new session until day 59, roughly
+  DOUBLE documented retention. It never EXTENDS a TTL (a post whose own deadline is
+  already nearer keeps it).
   """
-  @spec release_changeset(t(), DateTime.t()) :: Ecto.Changeset.t()
-  def release_changeset(%__MODULE__{} = post, at) do
+  @spec release_changeset(t(), DateTime.t(), pos_integer()) :: Ecto.Changeset.t()
+  def release_changeset(%__MODULE__{} = post, at, retention_days) do
     change(post,
       quarantined_at: nil,
       quarantine_reason: nil,
       quarantine_released_at: at,
-      rescanned_at: at
+      rescanned_at: at,
+      expires_at: released_deadline(post, retention_days)
     )
+  end
+
+  defp released_deadline(%__MODULE__{expires_at: expires_at} = post, retention_days) do
+    case {post.inserted_at, expires_at} do
+      {%DateTime{} = inserted_at, %DateTime{} = current} ->
+        original = DateTime.add(inserted_at, retention_days * 86_400, :second)
+
+        if DateTime.compare(current, original) == :gt, do: original, else: current
+
+      _ ->
+        expires_at
+    end
   end
 
   @doc """
@@ -716,14 +744,48 @@ defmodule Loopctl.Coordination.ChannelPost do
     :ok
   end
 
-  defp emit_secret_blocked(changeset, field) do
-    metadata = %{
-      tenant_id: get_field(changeset, :tenant_id),
-      project_id: get_field(changeset, :project_id),
-      agent_id: get_field(changeset, :agent_id),
-      field: field
-    }
+  @doc """
+  Emits the SAME "credential blocked" security signal for a rejection driven by a
+  PERSISTED row rather than a changeset (issue #499).
 
+  Two write paths reject on evidence from a stored row instead of incoming attrs — the
+  post-write `secret_guard` invariant (a keyed upsert whose preserved `host` /
+  advisory-addressing field still carries a credential) and a keyless idempotent re-write
+  whose token is held by a QUARANTINED post. Both are at least as strong a leak signal as
+  the write-time gate (the credential is PROVEN present on a persisted row), so they must
+  raise the same counter; otherwise `[:loopctl, :coordination, :secret_blocked]`
+  under-reports exactly the confirmed cases.
+  """
+  @spec emit_secret_blocked_fields(t(), [atom()]) :: :ok
+  def emit_secret_blocked_fields(%__MODULE__{} = post, fields) do
+    for field <- fields do
+      emit_blocked(
+        %{
+          tenant_id: post.tenant_id,
+          project_id: post.project_id,
+          agent_id: post.agent_id,
+          field: field
+        },
+        field
+      )
+    end
+
+    :ok
+  end
+
+  defp emit_secret_blocked(changeset, field) do
+    emit_blocked(
+      %{
+        tenant_id: get_field(changeset, :tenant_id),
+        project_id: get_field(changeset, :project_id),
+        agent_id: get_field(changeset, :agent_id),
+        field: field
+      },
+      field
+    )
+  end
+
+  defp emit_blocked(metadata, field) do
     :telemetry.execute([:loopctl, :coordination, :secret_blocked], %{count: 1}, metadata)
 
     Logger.warning(

@@ -18,6 +18,7 @@ defmodule Loopctl.Coordination.ChannelPostQuarantineTest do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelPost
+  alias Loopctl.Security.SecretDenylist
   alias Loopctl.Workers.ChannelPostRescanWorker
 
   # A denylisted loopctl-key shape (`lc_` + >= 20 chars) — fake, but matched exactly as
@@ -160,6 +161,105 @@ defmodule Loopctl.Coordination.ChannelPostQuarantineTest do
     end
   end
 
+  describe "secret_blocked telemetry on the persisted-row rejections" do
+    setup do
+      test_pid = self()
+      handler = "secret-blocked-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:loopctl, :coordination, :secret_blocked],
+        fn _name, measurements, metadata, _ ->
+          send(test_pid, {:secret_blocked, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      :ok
+    end
+
+    # The post-write invariant has PROVEN the credential is on a persisted row — the
+    # strongest leak signal in the module. It must raise the same counter the write-time
+    # gate does, or the security metric under-reports exactly the confirmed cases.
+    test "the persisted-secret guard emits the signal", ctx do
+      insert_dirty_post(ctx, %{
+        key: "handoff:telemetry",
+        session_id: "sess-telemetry",
+        body: "ordinary chatter",
+        host: "box-#{@secret}"
+      })
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      assert {:error, :unprocessable_entity, _} =
+               Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
+                 project_id: ctx.project.id,
+                 key: "handoff:telemetry",
+                 session_id: "sess-telemetry",
+                 body: "clean body now",
+                 host: "clean-box",
+                 audit: ctx.audit
+               })
+
+      assert_receive {:secret_blocked, %{count: 1}, %{field: :host}}
+    end
+
+    test "a retry under a quarantined idempotency token emits the signal", ctx do
+      insert_dirty_post(ctx, %{idempotency_key: "tok-telemetry", body: "leak #{@secret}"})
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      assert {:error, :unprocessable_entity, _} =
+               Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
+                 project_id: ctx.project.id,
+                 body: "clean retry under the same token",
+                 idempotency_key: "tok-telemetry",
+                 audit: ctx.audit
+               })
+
+      assert_receive {:secret_blocked, %{count: 1}, %{field: :body}}
+    end
+  end
+
+  # A quarantined post is invisible to recent_page/3, directed_handoffs_page/3 and
+  # get_post/2, so letting one still gate the claim lifecycle would let an agent claim a
+  # ref whose instructions it can no longer fetch.
+  describe "claim lifecycle vs quarantine" do
+    test "a quarantined handoff post no longer blocks a claim on its ref", ctx do
+      successor = insert_dirty_post(ctx, %{body: "the correction"})
+
+      superseded =
+        insert_dirty_post(ctx, %{
+          key: "handoff:claimable",
+          session_id: "sess-claim",
+          body: "stale instructions #{@secret}",
+          superseded_by: successor.id
+        })
+
+      # Superseded AND live: the claim is refused because the ref points at retired work.
+      assert {:error, :already_claimed} =
+               Coordination.claim(
+                 ctx.tenant.id,
+                 ctx.agent_id,
+                 ctx.project.id,
+                 "handoff:claimable"
+               )
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+      assert %DateTime{} = reload(superseded).quarantined_at
+
+      # Hidden from every read ⇒ it no longer participates in the claim decision.
+      assert {:ok, _claim} =
+               Coordination.claim(
+                 ctx.tenant.id,
+                 ctx.agent_id,
+                 ctx.project.id,
+                 "handoff:claimable"
+               )
+    end
+  end
+
   describe "list_quarantined_posts/2 (operator review read)" do
     test "returns the quarantined rows every other read hides, with full bodies", ctx do
       offender = insert_dirty_post(ctx, %{})
@@ -219,14 +319,21 @@ defmodule Loopctl.Coordination.ChannelPostQuarantineTest do
     end
   end
 
-  describe "release_post/3 (operator exoneration)" do
+  describe "release_post/5 (operator exoneration)" do
     test "clears the quarantine, restores every read, and audits the release", ctx do
       offender = insert_dirty_post(ctx, %{body: "false positive #{@secret}"})
 
       assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
       assert {:error, :not_found} = Coordination.get_post(ctx.tenant.id, offender.id)
 
-      assert {:ok, released} = Coordination.release_post(ctx.tenant.id, offender.id, ctx.audit)
+      assert {:ok, released} =
+               Coordination.release_post(
+                 ctx.tenant.id,
+                 ctx.agent_id,
+                 :user,
+                 offender.id,
+                 ctx.audit
+               )
 
       assert is_nil(released.quarantined_at)
       assert is_nil(released.quarantine_reason)
@@ -252,12 +359,114 @@ defmodule Loopctl.Coordination.ChannelPostQuarantineTest do
       offender = insert_dirty_post(ctx, %{body: "false positive #{@secret}"})
 
       assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
-      assert {:ok, _} = Coordination.release_post(ctx.tenant.id, offender.id, ctx.audit)
+
+      assert {:ok, _} =
+               Coordination.release_post(
+                 ctx.tenant.id,
+                 ctx.agent_id,
+                 :user,
+                 offender.id,
+                 ctx.audit
+               )
 
       # Same patterns, next run: without the release marker this would re-flag instantly.
       assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
 
       assert is_nil(reload(offender).quarantined_at)
+    end
+
+    # ...but the exemption is REVISION-SCOPED, not permanent. The operator exonerated the
+    # row against ONE pattern set; a later revision may add a wholly unrelated credential
+    # shape the row does carry, and a permanent exemption would defeat the retroactivity
+    # #499 exists for (a KEYLESS post can never take the keyed-slot upsert that otherwise
+    # clears the marker, so the exemption would last the row's whole life).
+    test "a denylist revision bump makes a RELEASED row a candidate again", ctx do
+      offender = insert_dirty_post(ctx, %{body: "false positive #{@secret}"})
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      assert {:ok, _} =
+               Coordination.release_post(
+                 ctx.tenant.id,
+                 ctx.agent_id,
+                 :user,
+                 offender.id,
+                 ctx.audit
+               )
+
+      # Simulate "the release happened BEFORE the current revision" — the exact state a
+      # `SecretDenylist.revision/0` bump produces for every previously released row.
+      before_revision =
+        SecretDenylist.revision() |> DateTime.add(-1, :second) |> DateTime.add(-1, :microsecond)
+
+      offender
+      |> reload()
+      |> Ecto.Changeset.change(
+        quarantine_released_at: before_revision,
+        rescanned_at: before_revision
+      )
+      |> AdminRepo.update!()
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      assert %DateTime{} = reload(offender).quarantined_at
+    end
+
+    # The quarantine EXTENDS expires_at to 30 days out for review, argued costless
+    # because a quarantined row is invisible to every read. Release is the transition
+    # that falsifies that — so it rolls the extension back, or an exonerated post stays
+    # live (and re-injected into every new session) for up to ~60 days.
+    test "release rolls back the quarantine TTL extension", ctx do
+      inserted_at = DateTime.add(DateTime.utc_now(), -29 * 86_400, :second)
+
+      offender =
+        insert_dirty_post(ctx, %{
+          body: "false positive #{@secret}",
+          # Day 29 of a 30-day TTL.
+          expires_at: DateTime.add(inserted_at, 30 * 86_400, :second)
+        })
+
+      offender =
+        offender
+        |> Ecto.Changeset.change(inserted_at: inserted_at)
+        |> AdminRepo.update!()
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+      # The review deadline pushed it out to ~day 59.
+      extended = reload(offender).expires_at
+      assert DateTime.compare(extended, offender.expires_at) == :gt
+
+      assert {:ok, released} =
+               Coordination.release_post(
+                 ctx.tenant.id,
+                 ctx.agent_id,
+                 :user,
+                 offender.id,
+                 ctx.audit
+               )
+
+      original = DateTime.add(inserted_at, Coordination.retention_days() * 86_400, :second)
+      assert DateTime.compare(released.expires_at, original) != :gt
+    end
+
+    # Defence in depth mirroring delete_post/5's in-context authorized_to_delete?/3: the
+    # route plug is not the only gate, so a non-HTTP caller cannot un-hide a flagged post.
+    test "a caller below :user cannot release, and gets the same oracle-safe 404", ctx do
+      offender = insert_dirty_post(ctx, %{body: "leak #{@secret}"})
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      for role <- [:agent, :orchestrator] do
+        assert {:error, :not_found} =
+                 Coordination.release_post(
+                   ctx.tenant.id,
+                   ctx.agent_id,
+                   role,
+                   offender.id,
+                   ctx.audit
+                 )
+      end
+
+      assert %DateTime{} = reload(offender).quarantined_at
     end
 
     test "is oracle-safe: unknown, malformed, foreign-tenant and non-quarantined all 404",
@@ -266,13 +475,23 @@ defmodule Loopctl.Coordination.ChannelPostQuarantineTest do
       other_tenant = fixture(:tenant)
 
       assert {:error, :not_found} =
-               Coordination.release_post(ctx.tenant.id, Ecto.UUID.generate(), ctx.audit)
+               Coordination.release_post(
+                 ctx.tenant.id,
+                 ctx.agent_id,
+                 :user,
+                 Ecto.UUID.generate(),
+                 ctx.audit
+               )
 
-      assert {:error, :not_found} = Coordination.release_post(ctx.tenant.id, "nope", ctx.audit)
-      assert {:error, :not_found} = Coordination.release_post("nope", live.id, ctx.audit)
+      assert {:error, :not_found} =
+               Coordination.release_post(ctx.tenant.id, ctx.agent_id, :user, "nope", ctx.audit)
+
+      assert {:error, :not_found} =
+               Coordination.release_post("nope", ctx.agent_id, :user, live.id, ctx.audit)
 
       # A live (never quarantined) post cannot be "released" — nothing to clear.
-      assert {:error, :not_found} = Coordination.release_post(ctx.tenant.id, live.id, ctx.audit)
+      assert {:error, :not_found} =
+               Coordination.release_post(ctx.tenant.id, ctx.agent_id, :user, live.id, ctx.audit)
 
       # Cross-tenant is byte-identical to nonexistent.
       insert_dirty_post(ctx, %{})
@@ -280,7 +499,13 @@ defmodule Loopctl.Coordination.ChannelPostQuarantineTest do
       [quarantined] = Coordination.list_quarantined_posts(ctx.tenant.id)
 
       assert {:error, :not_found} =
-               Coordination.release_post(other_tenant.id, quarantined.id, ctx.audit)
+               Coordination.release_post(
+                 other_tenant.id,
+                 ctx.agent_id,
+                 :user,
+                 quarantined.id,
+                 ctx.audit
+               )
     end
   end
 end

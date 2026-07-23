@@ -19,13 +19,16 @@ defmodule LoopctlWeb.ChannelPostController do
     the action against the verified key), deliberately NOT behind
     `RequireHumanAnchor`.
 
-  - `GET /api/v1/channel/posts/quarantined` — role `:user`, the OPERATOR review read
-    for issue #499: the only path that resolves posts the retroactive secret rescan
-    quarantined (every agent-facing read hides them), returning full bodies so a
-    human can judge true vs false positive.
+  - `GET /api/v1/channel/posts/quarantined` — role `:user` + human-anchored, the
+    OPERATOR review read for issue #499: the only path that resolves posts the
+    retroactive secret rescan quarantined (every agent-facing read hides them),
+    returning full bodies so a human can judge true vs false positive. Anchored for
+    the same reason as `:release` — it is the one endpoint that hands back the FULL
+    body of a post confirmed to carry a credential shape.
   - `POST /api/v1/channel/posts/:id/release` — role `:user` + human-anchored, clears
-    a quarantine (false-positive exoneration) and permanently removes the row from
-    the rescan candidate set. The non-destructive counterpart to DELETE.
+    a quarantine (false-positive exoneration) and removes the row from the rescan
+    candidate set for the current denylist revision. The non-destructive counterpart
+    to DELETE.
 
   ## Trust posture (owner decision #331, design brief §4)
 
@@ -121,8 +124,12 @@ defmodule LoopctlWeb.ChannelPostController do
   # quarantined credential) and behind `RequireHumanAnchor`, matching the sibling
   # operator surface `LoopctlWeb.IngestionAnomalyController.update/2` where the
   # `:secret_detected` anomaly these posts raise is resolved.
+  # The anchor covers BOTH actions, not just the state change: `:quarantined` is the one
+  # endpoint that returns the FULL bodies of posts the rescan confirmed carry a credential
+  # shape, so anchoring only the (less sensitive) `:release` would leave the credential
+  # READ reachable by a `:user`-or-higher key in a tenant with no WebAuthn anchor.
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:quarantined, :release]
-  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:release]
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:quarantined, :release]
 
   tags(["Coordination"])
 
@@ -376,8 +383,11 @@ defmodule LoopctlWeb.ChannelPostController do
         "ONLY way an operator can see the actual rows the alert's post_ids point at, judge " <>
         "true vs false positive, and then either redact them (DELETE /channel/posts/:id) or " <>
         "exonerate them (POST /channel/posts/:id/release). It therefore returns FULL bodies " <>
-        "and is role :user — never the agent-role coordination surface. Newest quarantine " <>
-        "first; optional project_id filter; limit defaults to 25 and is clamped to 100.",
+        "and is role :user + human-anchored — never the agent-role coordination surface. It " <>
+        "returns every field the rescan scans (body, key, session_id, host, to_host, " <>
+        "to_capability, idempotency_key, refs), so a quarantine_reason naming any of them is " <>
+        "reviewable. Newest quarantine first; optional project_id filter; limit defaults to " <>
+        "25 and is clamped to 100 — meta.limit reports the CLAMPED value actually applied.",
     parameters: [
       project_id: [
         in: :query,
@@ -396,7 +406,7 @@ defmodule LoopctlWeb.ChannelPostController do
              meta: %OpenApiSpex.Schema{type: :object}
            }
          }},
-      403 => {"Requires user role", "application/json", Schemas.ErrorResponse},
+      403 => {"Requires user role / human anchor", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -408,9 +418,11 @@ defmodule LoopctlWeb.ChannelPostController do
         "readable on the channel again. The counterpart to the redact path: DELETE when the " <>
         "flag was right, release when it was WRONG — the denylist is a prefix HEURISTIC, and " <>
         "without this the only remedy for a false positive is the destructive one quarantine " <>
-        "exists to avoid. The release is durable: the post is permanently removed from the " <>
-        "rescan candidate set, so the next hourly run cannot re-flag it under the same " <>
-        "patterns. Role :user + human-anchored (an agent must never be able to un-hide a post " <>
+        "exists to avoid. The release is durable but revision-SCOPED: the post leaves the " <>
+        "rescan candidate set for the CURRENT denylist revision, so the next hourly run " <>
+        "cannot re-flag it under the same patterns, while a later revision (a new credential " <>
+        "shape) re-examines it. It also rolls back the quarantine review TTL extension, so an " <>
+        "exonerated post does not outlive normal retention. Role :user + human-anchored (an agent must never be able to un-hide a post " <>
         "the security rescan quarantined). Audited in-transaction (action " <>
         "\"quarantine_released\", carrying the cleared field-name reason). A nonexistent, " <>
         "foreign-tenant, malformed, or NOT-currently-quarantined id all return a " <>
@@ -1223,7 +1235,11 @@ defmodule LoopctlWeb.ChannelPostController do
 
     json(conn, %{
       data: Enum.map(posts, &quarantined_json/1),
-      meta: %{count: length(posts), limit: limit || Coordination.quarantined_default_limit()}
+      # The CLAMPED bound the context actually applied — never the requested value.
+      # `?limit=1000` returns at most 100 rows and `?limit=0` / `?limit=-5` return the
+      # default 25, so echoing the request here would report a page size that never
+      # existed.
+      meta: %{count: length(posts), limit: Coordination.quarantined_limit(limit)}
     })
   end
 
@@ -1245,6 +1261,12 @@ defmodule LoopctlWeb.ChannelPostController do
   # The review payload: the FULL body (that is the artifact under review) plus the
   # quarantine bookkeeping an operator needs to act — never a matched value, which the
   # `quarantine_reason` deliberately never carries either.
+  #
+  # It carries EVERY field `ChannelPost.secret_fields/1` can flag (`@scanned_text_fields`
+  # + `refs`). A `quarantine_reason` naming e.g. `to_capability` on an endpoint that never
+  # returns `to_capability` is unreviewable — the operator would be left with direct DB
+  # access or a blind release/delete. The endpoint is already `role: :user`,
+  # human-anchored, and already returns full bodies, so the extra fields add no exposure.
   defp quarantined_json(post) do
     %{
       id: post.id,
@@ -1252,6 +1274,9 @@ defmodule LoopctlWeb.ChannelPostController do
       agent_id: post.agent_id,
       session_id: post.session_id,
       host: post.host,
+      to_host: post.to_host,
+      to_capability: post.to_capability,
+      idempotency_key: post.idempotency_key,
       key: post.key,
       body: post.body,
       refs: post.refs,
@@ -1272,7 +1297,15 @@ defmodule LoopctlWeb.ChannelPostController do
   def release(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    case Coordination.release_post(tenant_id, params["id"], AuditContext.from_conn(conn)) do
+    api_key = conn.assigns.current_api_key
+
+    case Coordination.release_post(
+           tenant_id,
+           api_key.agent_id,
+           api_key.role,
+           params["id"],
+           AuditContext.from_conn(conn)
+         ) do
       {:ok, post} ->
         json(conn, %{post: quarantined_json(post), released: true})
 

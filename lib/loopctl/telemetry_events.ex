@@ -389,8 +389,11 @@ defmodule Loopctl.TelemetryEvents do
 
   ## Payload (counts + bounded ints only — never post bodies or matched values)
 
-    * `measurements`: `%{scanned: n, quarantined: n}` — posts examined and posts
-      quarantined in this run.
+    * `measurements`: `%{scanned: n, quarantined: n, backlog: n}` — posts examined and
+      posts quarantined in this run, plus the posts STILL due after it. `backlog` is the
+      starvation signal: a run whose whole budget went to a continuously refilling
+      never-scanned head, while the `rescanned_at < revision` backlog never advanced,
+      would otherwise look byte-identical to a healthy sweep that drained everything.
     * `metadata`: `%{limit: n}` — the effective per-run batch bound after the
       `min(limit, @batch_size)` clamp.
   """

@@ -75,6 +75,57 @@ defmodule LoopctlWeb.ChannelPostQuarantineControllerTest do
       assert body["meta"]["count"] == 1
     end
 
+    # The reason names a FIELD; a payload omitting that field leaves the operator unable
+    # to judge true vs false positive on the one endpoint that resolves these rows.
+    test "returns EVERY scanned field, so any quarantine reason is reviewable", %{
+      tenant: tenant,
+      project: project
+    } do
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      %ChannelPost{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        agent_id: agent.id,
+        body: "ordinary chatter",
+        to_capability: "cap-#{@secret}",
+        to_host: "peer-box",
+        idempotency_key: "tok-review",
+        expires_at: DateTime.add(DateTime.utc_now(), 30 * 86_400, :second)
+      }
+      |> AdminRepo.insert!()
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+
+      row =
+        tenant
+        |> key_for(:user)
+        |> authed_conn()
+        |> get(@list_path)
+        |> json_response(200)
+        |> Map.fetch!("data")
+        |> Enum.find(&(&1["quarantine_reason"] == "secret_denylist: to_capability"))
+
+      assert row["to_capability"] =~ @secret
+      assert row["to_host"] == "peer-box"
+      assert row["idempotency_key"] == "tok-review"
+    end
+
+    # meta.limit must report the CLAMPED bound the context applied, never the request.
+    test "meta.limit reports the clamped value, not the requested one", %{tenant: tenant} do
+      raw = key_for(tenant, :user)
+
+      for {requested, reported} <- [{"1000", 100}, {"0", 25}, {"-5", 25}, {"10", 10}] do
+        body =
+          raw
+          |> authed_conn()
+          |> get(@list_path, %{"limit" => requested})
+          |> json_response(200)
+
+        assert body["meta"]["limit"] == reported
+      end
+    end
+
     test "an agent key is 403'd — quarantined credentials are not agent-readable", %{
       tenant: tenant
     } do

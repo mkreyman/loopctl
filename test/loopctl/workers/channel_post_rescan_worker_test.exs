@@ -377,6 +377,55 @@ defmodule Loopctl.Workers.ChannelPostRescanWorkerTest do
       assert refreshed.sample_count == 2
     end
 
+    # The failure mode the `alerted` flag EXISTS for, and the one the recovery sweep
+    # closes: the enqueue failed (or crashed) on the only run that will ever flag
+    # anything for this tenant. A credential detection is DISCRETE — nothing re-produces
+    # the condition — so without a sweep independent of THIS run's offenders, the modal
+    # one-credential-one-post tenant is never paged at all.
+    test "re-fires an unalerted anomaly on a run that flags NOTHING for that tenant" do
+      ctx = setup_context()
+      insert_post(ctx, %{body: "leak #{@secret}"})
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+      [anomaly] = anomalies_for(ctx.tenant.id)
+
+      # Exactly the state a failed `Oban.insert/1` (or a crash in the persist→enqueue
+      # gap) leaves behind.
+      anomaly
+      |> Ecto.Changeset.change(alerted: false)
+      |> AdminRepo.update!()
+
+      # NO new offender: nothing about this run touches that tenant's posts.
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+        assert_enqueued(worker: ScaleAlertDeliveryWorker)
+      end)
+
+      [recovered] = anomalies_for(ctx.tenant.id)
+      assert recovered.alerted == true
+      # A pure recovery — the blast radius is NOT double-counted.
+      assert recovered.sample_count == 1
+    end
+
+    test "the recovery sweep never re-fires a RESOLVED or ARCHIVED anomaly" do
+      ctx = setup_context()
+      insert_post(ctx, %{body: "leak #{@secret}"})
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+      [anomaly] = anomalies_for(ctx.tenant.id)
+
+      anomaly
+      |> Ecto.Changeset.change(alerted: false, archived: true, resolved: true)
+      |> AdminRepo.update!()
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{}})
+        refute_enqueued(worker: ScaleAlertDeliveryWorker)
+      end)
+
+      assert [%{alerted: false}] = anomalies_for(ctx.tenant.id)
+    end
+
     test "an ARCHIVED anomaly suppresses the alert but never the quarantine + audit" do
       ctx = setup_context()
       insert_post(ctx, %{body: "leak #{@secret}"})
@@ -570,6 +619,35 @@ defmodule Loopctl.Workers.ChannelPostRescanWorkerTest do
 
       assert_receive {:telemetry, :channel_post_rescanned, %{scanned: 2, quarantined: 1},
                       %{limit: 23}}
+    end
+
+    # Starvation: never-scanned rows sort first under a single oldest-scan-first
+    # ordering, and that head REFILLS continuously (a keyed-slot upsert nulls
+    # `rescanned_at` on every repost), so the `rescanned_at < revision` backlog — exactly
+    # the population a revision bump exists to re-examine — could never advance. Half the
+    # budget is reserved for it.
+    test "reserves half the batch budget for the STALE backlog so it cannot starve" do
+      ctx = setup_context()
+      attach_rescan_telemetry(2)
+
+      stale =
+        insert_post(ctx, %{
+          body: "scanned under an OLDER revision",
+          rescanned_at: revision_offset(-3600)
+        })
+
+      # A refilling head of never-scanned rows, more than the whole budget.
+      fresh = for _ <- 1..4, do: insert_post(ctx)
+
+      assert :ok = ChannelPostRescanWorker.perform(%Oban.Job{args: %{"limit" => 2}})
+
+      # The stale row advanced in the very first run despite the never-scanned flood.
+      assert DateTime.compare(reload(stale).rescanned_at, SecretDenylist.revision()) == :gt
+      # And the budget was still spent in full (one reserved + one from the head).
+      assert Enum.count(fresh, &(not is_nil(reload(&1).rescanned_at))) == 1
+
+      # The backlog measurement makes a starved run distinguishable from a healthy one.
+      assert_receive {:telemetry, :channel_post_rescanned, %{scanned: 2, backlog: 3}, _}
     end
 
     # The load-bearing half: a run with nothing due must STILL emit, or "nothing to do"

@@ -10,11 +10,15 @@ defmodule Loopctl.Repo.Migrations.AddChannelPostsQuarantineRelease do
   delayed delete with extra steps (the row lives on, invisible to every reader, until the
   TTL sweep reclaims it).
 
-    * `quarantine_released_at` — set by `Loopctl.Coordination.release_post/4` (role
+    * `quarantine_released_at` — set by `Loopctl.Coordination.release_post/5` (role
       `:user`, audited). Clearing `quarantined_at` alone would not be durable: the next
       rescan under the SAME pattern set would immediately re-flag the row. A non-NULL
-      stamp permanently removes the row from the rescan candidate set
-      (`ChannelPostRescanWorker.due_posts/2`), so the operator's judgement sticks.
+      stamp removes the row from the rescan candidate set
+      (`ChannelPostRescanWorker.due_posts/2`) for the denylist revision the operator
+      judged it against, so their judgement sticks — but NOT forever: the worker
+      compares it to `SecretDenylist.revision/0`, so a later pattern set (a wholly
+      different credential shape) re-examines the row rather than leaving it
+      scan-exempt for life.
       It is CLEARED again when a keyed working-state slot is overwritten with new
       content, so an exonerated slot can never become a permanent scan-exempt channel.
 
