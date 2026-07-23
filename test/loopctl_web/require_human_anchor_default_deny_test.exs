@@ -237,6 +237,16 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/channel/claims"},
                {:post, "/api/v1/channel/claims/release"},
                {:post, "/api/v1/channel/claims/done"},
+               # US-40.4 Repo Coordination Bus ADVISORY FILE SOFT-LOCK surface —
+               # take/refresh and release a NON-EXCLUSIVE, never-blocking hint that a
+               # session is editing a file. Same COORDINATION posture as the channel
+               # posts and claims: agent-role, tenant_id/agent_id/role server-stamped
+               # from the verified key, project-scoped by membership, built on
+               # channel_posts with a short server-clamped TTL — NOT chain-of-custody,
+               # so deliberately outside the human-anchor tier gate (owner decision
+               # #331). It grants no authority at all: it cannot prevent an edit.
+               {:post, "/api/v1/channel/locks"},
+               {:post, "/api/v1/channel/locks/release"},
 
                # US-41.1 system-corpus materialization — embeds the SHARED
                # system-scoped article corpus for the CALLER's own tenant, with the

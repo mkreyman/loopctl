@@ -659,7 +659,22 @@ defmodule LoopctlWeb.ChannelPostController do
       # the successor's id.
       superseded_by: row.superseded_by,
       inserted_at: row.inserted_at,
-      updated_at: row.updated_at
+      updated_at: row.updated_at,
+      # US-40.4 / AC-40.4.2 (review #451): an advisory FILE soft-lock must be
+      # DISTINCT on this read, not merely present under a `claim:`-prefixed key that
+      # every consumer would have to re-derive. `lock` is the marker, `lock_target`
+      # is the file, and `expires_at` is the liveness a renderer needs for
+      # "claimed: <file> by <agent/host>, <age>" — and to tell a LIVE lock from an
+      # expired-but-unswept one. The `claim:` key namespace is reserved server-side
+      # (both `Coordination.post/4` and `Coordination.create_post/4` 422 an ordinary
+      # post that tries to use it), but the reservation is forward-looking, so the
+      # marker uses `Coordination.soft_lock_row?/1` — prefix AND the soft-lock TTL
+      # ceiling — not a bare prefix test: a LEGACY `claim:`-keyed post predating the
+      # reservation carries 30-day retention and must not be mislabeled a live file
+      # lock (review #451).
+      lock: Coordination.soft_lock_row?(row),
+      lock_target: lock_target(row),
+      expires_at: row.expires_at
     }
 
     # US-454 (defect 2): the advisory discovery label rides ONLY on the
@@ -670,6 +685,11 @@ defmodule LoopctlWeb.ChannelPostController do
     else
       base
     end
+  end
+
+  defp lock_target(row) do
+    if Coordination.soft_lock_row?(row),
+      do: String.replace_prefix(row.key, Coordination.lock_key_prefix(), "")
   end
 
   # Resolve the `?cursor=` param (US-40.C2) to a `{:ok, position_or_nil}` for
@@ -814,11 +834,11 @@ defmodule LoopctlWeb.ChannelPostController do
   narrowed field set as the list read (`channel_post_json/1`), differing ONLY in
   that the bounded `body_preview` + `truncated` pair is replaced by the verbatim
   `body` the caller explicitly fetched. It deliberately does NOT reuse the raw
-  `%ChannelPost{}` Jason encoder (which also carries `tenant_id`/`project_id`/
-  `expires_at`): a by-id read honors the same minimal read surface the list read
-  established rather than re-widening the read model on the read path. `tenant_id`
-  is always the caller's own (key-derived, redundant), and `project_id` was
-  already known from the project-scoped list the caller drilled in from.
+  `%ChannelPost{}` Jason encoder (which also carries `tenant_id`/`project_id`): a
+  by-id read honors the same minimal read surface the list read established rather
+  than re-widening the read model on the read path. `tenant_id` is always the
+  caller's own (key-derived, redundant), and `project_id` was already known from the
+  project-scoped list the caller drilled in from.
   """
   def show(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
@@ -835,9 +855,10 @@ defmodule LoopctlWeb.ChannelPostController do
   # The by-id full-body read shape (US-40.D1): the LIST read's field discipline
   # (`channel_post_json/1`) with the verbatim `body` in place of the bounded
   # `body_preview` + `truncated` pair. It deliberately mirrors the narrowed read
-  # model rather than the wider write-echo struct shape — `tenant_id`/`project_id`/
-  # `expires_at` are omitted so the read path never re-widens what the list read
-  # narrowed. See the `show/2` docstring for the rationale.
+  # model rather than the wider write-echo struct shape — `tenant_id`/`project_id`
+  # are omitted so the read path never re-widens what the list read narrowed. The
+  # US-40.4 lock marker trio rides here too, so a drill-in on a lock is as
+  # self-describing as its list row. See the `show/2` docstring for the rationale.
   defp channel_post_full_json(post) do
     %{
       id: post.id,
@@ -851,7 +872,10 @@ defmodule LoopctlWeb.ChannelPostController do
       refs: post.refs,
       superseded_by: post.superseded_by,
       inserted_at: post.inserted_at,
-      updated_at: post.updated_at
+      updated_at: post.updated_at,
+      lock: Coordination.soft_lock_row?(post),
+      lock_target: lock_target(post),
+      expires_at: post.expires_at
     }
   end
 
@@ -1512,10 +1536,25 @@ defmodule LoopctlWeb.ChannelPostController do
         "(tenant=#{Map.get(metadata, :tenant_id)} " <>
         "api_key=#{Map.get(metadata, :api_key_id)} " <>
         "agent=#{Map.get(metadata, :agent_id)} " <>
-        "project=#{Map.get(metadata, :project_id)}" <>
+        "project=#{log_safe_id(Map.get(metadata, :project_id))}" <>
         limit_kind_token <> ")"
     )
 
     :ok
   end
+
+  # LOG-FORGING guard (review #451) — identical to
+  # `LoopctlWeb.ChannelLockController.log_safe_id/1`, and applied for the same
+  # reason: `project_id` arrives from the request body and is not UUID-validated on
+  # these paths, so a CR/LF-bearing value would let an authenticated agent forge
+  # extra log records. The raw value still rides the structured telemetry metadata.
+  defp log_safe_id(value) when is_binary(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, uuid} -> uuid
+      :error -> "<invalid>"
+    end
+  end
+
+  defp log_safe_id(nil), do: ""
+  defp log_safe_id(_value), do: "<invalid>"
 end
