@@ -5,6 +5,57 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.59.0 — 2026-07-22 (advisory file soft-locks — US-40.4, #451)
+
+### Added
+
+- **`channel_lock`** (agent) — take or refresh an ADVISORY file soft-lock on a repo
+  coordination channel: "I'm editing `lib/foo.ex`". It NEVER blocks anyone, nothing
+  prevents an edit, and TWO sessions may hold a lock on the same file (both are
+  surfaced). Explicitly NOT the exactly-once handoff claim — `channel_claim` remains
+  the primitive for "exactly one agent owns this unit of work". Re-locking the same
+  target from the same session refreshes it in place (200). The lock carries a SHORT
+  server-clamped TTL (`ttl_seconds`, 60..3600 seconds, default 900) and self-expires,
+  so a crashed session can never hold a file. `host`/`session_id` stay proxy-supplied;
+  a lock write with NO `session_id` is rejected (422) rather than rescued with a
+  server-minted surrogate slot that could be neither refreshed nor released.
+- **`channel_unlock`** (agent) — release your OWN soft-lock. Addressed by your
+  `(tenant, project, agent, session)` slot; a lock you do not hold, another AGENT's,
+  one under a different session id, a cross-tenant one, or a nonexistent one all
+  return a byte-identical 404. NOTE the enforced scope is per-AGENT, not per-session:
+  `tenant`/`agent` are server-stamped, but `session_id` is client-supplied and
+  `channel_locks` publishes it, so two sessions sharing one agent key can release
+  each other's advisory locks (accepted for hint data).
+- **`channel_locks`** (agent) — the PINNED live-lock read for a channel, to call
+  BEFORE editing. The read to trust for lock visibility, while `channel_recent`
+  admits only the newest few locks so lock churn cannot crowd out real coordination
+  posts (and suppressed locks do NOT count toward its `has_more`). Each row carries
+  `target`, `agent_id`, `session_id`, `host`, `expires_at` and `inserted_at`, and one
+  AGENT contributes at most 20 rows to a page so a noisy locker cannot hide every
+  peer's lock. The page reports BOTH truncation modes — `meta.overflow` (page cap)
+  and `meta.holders_truncated` (per-agent fairness cap) — so a page that dropped live
+  locks is never presented as the complete set. The fairness partition is the
+  server-stamped `agent_id` alone: partitioning on the client-supplied `session_id`
+  too would let a caller rotating session ids escape the bound entirely.
+- Lock targets are PATH-NORMALIZED (`./lib/foo.ex`, `lib//foo.ex`, `/lib/foo.ex` and
+  `lib/foo.ex` are ONE slot), so two sessions editing the same file always collide on
+  one target instead of each holding a lock the other reads as an unrelated file.
+
+### Changed
+
+- `channel_recent` / `GET /api/v1/channel/posts` rows now carry `lock` (boolean),
+  `lock_target` and `expires_at`, so a TEAM CHANNEL renderer can mark an advisory
+  lock DISTINCTLY ("claimed: `lib/foo.ex` by beelink, 4m ago") and tell a LIVE lock
+  from an expired-but-unswept one without re-deriving the key convention. The by-id
+  read (`GET /api/v1/channel/posts/:id`) carries the same three fields.
+- The `claim:` key namespace is now RESERVED: `channel_post` with a `claim:`-prefixed
+  `key` returns 422 (the `channel_post` tool description says so up front). Previously
+  such a post was silently reinterpreted as a soft-lock (900s TTL instead of the
+  30-day retention, and surfaced as a bogus file lock). The reservation is
+  forward-looking, so the lock reads additionally bound `expires_at` by the soft-lock
+  TTL ceiling: a `claim:`-keyed row written BEFORE the reservation keeps its 30-day
+  retention and is never published as a live file lock (nor marked `lock: true`).
+
 ## 2.58.0 — 2026-07-22 (trust-tier capability discovery — #505)
 
 ### Changed

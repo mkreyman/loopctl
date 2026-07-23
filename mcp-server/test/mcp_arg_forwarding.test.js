@@ -327,6 +327,189 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
 });
 
 // ---------------------------------------------------------------------------
+// US-40.4: channel_lock / channel_unlock / channel_locks (ADVISORY file soft-locks)
+// ---------------------------------------------------------------------------
+
+describe("US-40.4: channel_lock / channel_unlock / channel_locks wiring", () => {
+  test("TOOLS declares channel_lock, channel_unlock, channel_locks", () => {
+    assert.match(INDEX_SRC, /name: "channel_lock",/, 'must declare a "channel_lock" tool');
+    assert.match(INDEX_SRC, /name: "channel_unlock",/, 'must declare a "channel_unlock" tool');
+    assert.match(INDEX_SRC, /name: "channel_locks",/, 'must declare a "channel_locks" tool');
+  });
+
+  test("channel_lock is described as ADVISORY and explicitly NOT the exactly-once claim", () => {
+    // The whole failure mode this story guards against is an agent reading the
+    // soft-lock as a mutex (or as the handoff claim). Both disclaimers are part
+    // of the tool contract, not just the docs.
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_lock",[\s\S]*?ADVISORY ONLY: it NEVER blocks anyone/,
+      "channel_lock must state it never blocks",
+    );
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_lock",[\s\S]*?Two sessions CAN hold a lock on the same file/,
+      "channel_lock must state two sessions can hold the same file",
+    );
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_lock",[\s\S]*?This is NOT the exactly-once handoff claim/,
+      "channel_lock must disclaim being the handoff claim",
+    );
+  });
+
+  test("channel_lock documents the server-clamped TTL bounds", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_lock",[\s\S]*?SERVER-CLAMPED to \[60, 3600\]/,
+      "channel_lock must document the [60, 3600] clamp",
+    );
+  });
+
+  // Review #451: the release slot's session_id is CLIENT-supplied and channel_locks
+  // publishes it, so the enforced boundary is the server-stamped agent, not the
+  // session. The tool description must not overclaim per-session isolation.
+  test("channel_unlock describes the scope as per-AGENT, not per-session", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_unlock",[\s\S]*?scoped to your AGENT', not to your session/,
+      "channel_unlock must state the guarantee is agent-scoped",
+    );
+  });
+
+  test("channel_lock states a session-less write is rejected, not surrogate-rescued", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_lock",[\s\S]*?a lock write with no session_id is REJECTED/,
+      "channel_lock must state a session-less write is rejected",
+    );
+  });
+
+  // Review #451: the fairness partition is the SERVER-STAMPED agent_id alone.
+  // Partitioning on the client-supplied session_id too would let a caller rotating
+  // session ids escape the bound entirely, so the tool description must not promise
+  // a per-(agent, session) bound the server does not enforce.
+  test("channel_locks documents the per-AGENT fairness bound", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_locks",[\s\S]*?Fairness-bounded: a single AGENT \(server-stamped from the key, so rotating session_id does not escape it\) contributes at most 20 rows/,
+      "channel_locks must document the per-agent fairness bound",
+    );
+  });
+
+  // Review #451: the fairness cap filters INSIDE the scope, so meta.overflow (the
+  // page cap) cannot see its drops. A client told only about overflow would read
+  // `overflow: false` on a page that had silently dropped live locks.
+  test("channel_locks documents BOTH truncation flags", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_locks",[\s\S]*?meta\.overflow[\s\S]*?meta\.holders_truncated/,
+      "channel_locks must document meta.overflow AND meta.holders_truncated",
+    );
+  });
+
+  // Review #451: the reserved namespace is a behavior change on an EXISTING tool —
+  // an agent already posting key: "claim:story-812" must be forewarned in the tool
+  // it actually calls, not only in the new lock tools.
+  test("channel_post warns that the claim: key namespace is reserved", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_post",[\s\S]*?RESERVED KEY NAMESPACE: keys beginning with 'claim:'[\s\S]*?REJECTED here with a 422/,
+      "channel_post must document the reserved claim: namespace",
+    );
+  });
+
+  // Review #451: locks ride channel_recent but are capped there and do not move
+  // has_more, so the read must not be cited as evidence that a file is free.
+  test("channel_recent warns that its lock view is capped", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_recent",[\s\S]*?LOCK VISIBILITY CAVEAT[\s\S]*?call channel_locks/,
+      "channel_recent must carry the lock-visibility caveat",
+    );
+  });
+
+  test("channelLock POSTs /channel/locks on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelLock\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/locks",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelLock must POST /api/v1/channel/locks with the agent key",
+    );
+  });
+
+  test("channelLock forwards ttl_seconds and note only when set", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelLock\([\s\S]*?if \(ttl_seconds\) payload\.ttl_seconds = ttl_seconds;/,
+      "channelLock must forward ttl_seconds only when set",
+    );
+    assert.match(
+      INDEX_SRC,
+      /async function channelLock\([\s\S]*?if \(note\) payload\.body = note;/,
+      "channelLock must forward the optional note as the post body",
+    );
+  });
+
+  test("host/session_id stay PROXY-supplied on the lock path (never caller args)", () => {
+    // session_id is what makes a lock refreshable in place and releasable by
+    // slot; a caller-supplied one would let a client address another session's slot.
+    assert.match(
+      INDEX_SRC,
+      /async function channelLock\([\s\S]*?payload\.host = os\.hostname\(\);[\s\S]*?payload\.session_id = CHANNEL_SESSION_ID;/,
+      "channelLock must auto-fill host and session_id",
+    );
+    assert.match(
+      INDEX_SRC,
+      /async function channelUnlock\([\s\S]*?payload\.session_id = CHANNEL_SESSION_ID;/,
+      "channelUnlock must auto-fill session_id",
+    );
+    // Neither tool schema may expose host/session_id as caller inputs.
+    const lockSchema = INDEX_SRC.match(
+      /name: "channel_lock",[\s\S]*?required: \["project_id", "target"\]/,
+    );
+    assert.ok(lockSchema, "channel_lock schema must be findable");
+    assert.ok(
+      !/session_id:/.test(lockSchema[0]) && !/\bhost:/.test(lockSchema[0]),
+      "channel_lock must NOT declare host/session_id as caller args",
+    );
+  });
+
+  test("channelUnlock POSTs /channel/locks/release on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelUnlock\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/locks\/release",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelUnlock must POST /api/v1/channel/locks/release with the agent key",
+    );
+  });
+
+  test("channelLocks GETs /channel/locks with project_id and limit on the AGENT key", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function channelLocks\([\s\S]*?params\.set\("project_id", project_id\)[\s\S]*?params\.set\("limit", limit\)[\s\S]*?"GET",\s*`\/api\/v1\/channel\/locks\?\$\{params\}`,\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelLocks must GET /api/v1/channel/locks with the agent key, forwarding project_id and limit",
+    );
+  });
+
+  test("the lock dispatch cases call the right functions", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "channel_lock":\s*\n\s*return await channelLock\(args\);/,
+      "the channel_lock dispatch case must call channelLock(args)",
+    );
+    assert.match(
+      INDEX_SRC,
+      /case "channel_unlock":\s*\n\s*return await channelUnlock\(args\);/,
+      "the channel_unlock dispatch case must call channelUnlock(args)",
+    );
+    assert.match(
+      INDEX_SRC,
+      /case "channel_locks":\s*\n\s*return await channelLocks\(args\);/,
+      "the channel_locks dispatch case must call channelLocks(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #39.7: channel_delete (Repo Coordination Bus redact path)
 // ---------------------------------------------------------------------------
 

@@ -218,6 +218,21 @@ defmodule LoopctlWeb.Router do
     post "/channel/claims/done", ChannelClaimController, :done
     post "/channel/claims/release", ChannelClaimController, :release
 
+    # Repo Coordination Bus ADVISORY FILE SOFT-LOCK surface (Epic 40, US-40.4).
+    # DISTINCT from the exactly-once handoff CLAIM above: a soft-lock is a
+    # collision-avoidance HINT on a FILE target ("I'm editing lib/foo.ex"), it NEVER
+    # blocks anyone, and TWO sessions may hold one on the same file. Built on
+    # `channel_posts` (no new table) under the `claim:<target>` key convention with a
+    # short, server-clamped TTL. Agent-role, project-scoped by membership (US-40.D3),
+    # NOT human-anchor gated (coordination surface, owner decision #331). `target` is
+    # carried in the BODY (a free file path), never the path segment, so release is a
+    # POST too — and the static /release literal cannot shadow the bare create path.
+    post "/channel/locks", ChannelLockController, :create
+    post "/channel/locks/release", ChannelLockController, :release
+    # The PINNED live-lock read: a session checks this BEFORE editing. A SEPARATE set
+    # from channel_recent so a lock is never truncated out of the newest-N preview.
+    get "/channel/locks", ChannelLockController, :index
+
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
 

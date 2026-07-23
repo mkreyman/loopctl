@@ -134,6 +134,15 @@ defmodule Loopctl.Coordination.ChannelPost do
   # least this far out — see `quarantine_changeset/3`.
   @quarantine_review_days 30
 
+  # US-40.4 advisory soft-lock shape, mirrored here ONLY so `release_changeset/3` can
+  # restore a LOCK row's own (much shorter) lease instead of the uniform post
+  # retention (review #451). `Loopctl.Coordination` remains the single source of
+  # truth — it cannot be called from the schema without a cyclic dependency, so
+  # `Loopctl.Coordination.lock_key_prefix/0` and `max_lock_ttl_seconds/0` are
+  # asserted equal to these in the test suite.
+  @soft_lock_key_prefix "claim:"
+  @max_soft_lock_ttl_seconds 3600
+
   # Text fields that must never carry a NUL byte (Postgres rejects them at insert
   # time with a raw Postgrex.Error/500) nor a denylisted credential shape.
   @scanned_text_fields [
@@ -393,6 +402,11 @@ defmodule Loopctl.Coordination.ChannelPost do
   would otherwise be live and re-injected into every new session until day 59, roughly
   DOUBLE documented retention. It never EXTENDS a TTL (a post whose own deadline is
   already nearer keeps it).
+
+  The clamp is against the row's OWN lease, not a single global window (review #451):
+  an advisory soft-lock (`claim:` key, US-40.4) is clamped to the soft-lock TTL
+  ceiling instead of `retention_days`, because `inserted_at + retention_days` is
+  ~30 days for a row whose stated maximum lease is one hour.
   """
   @spec release_changeset(t(), DateTime.t(), pos_integer()) :: Ecto.Changeset.t()
   def release_changeset(%__MODULE__{} = post, at, retention_days) do
@@ -408,12 +422,28 @@ defmodule Loopctl.Coordination.ChannelPost do
   defp released_deadline(%__MODULE__{expires_at: expires_at} = post, retention_days) do
     case {post.inserted_at, expires_at} do
       {%DateTime{} = inserted_at, %DateTime{} = current} ->
-        original = DateTime.add(inserted_at, retention_days * 86_400, :second)
+        original = DateTime.add(inserted_at, own_lease_seconds(post, retention_days), :second)
 
         if DateTime.compare(current, original) == :gt, do: original, else: current
 
       _ ->
         expires_at
+    end
+  end
+
+  # The row's OWN maximum lease. For an ordinary post that is the uniform retention
+  # window; for an advisory soft-lock it is the US-40.4 TTL ceiling (review #451).
+  # Clamping a released lock to `inserted_at + retention_days` is far LOOSER than its
+  # own 900s lease — for a lock quarantined moments after insert, the rollback would
+  # hand it a ~30-day deadline, i.e. republish it as a live file lock for a month and
+  # falsify the stated 3600s ceiling. (`Loopctl.Coordination`'s lock reads carry the
+  # same ceiling as an independent bound, so this is defense in depth, not the only
+  # guard.)
+  defp own_lease_seconds(%__MODULE__{key: key}, retention_days) do
+    if is_binary(key) and String.starts_with?(key, @soft_lock_key_prefix) do
+      @max_soft_lock_ttl_seconds
+    else
+      retention_days * 86_400
     end
   end
 
