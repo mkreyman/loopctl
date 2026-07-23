@@ -43,11 +43,17 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
   defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
 
   setup do
-    # `config/test.exs` points `:embedding_read_path` at a Mox mock for the whole test
-    # env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed it.
-    # Without this, any read reaching `Embeddings.side_table_reads_enabled?/0` raises
-    # `Mox.UnexpectedCallError` in the nightly scale job.
-    Loopctl.DataCase.stub_embedding_read_path()
+    # `config/test.exs` points EVERY injected collaborator at a Mox mock for the whole
+    # test env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed
+    # them. Any call reaching an unstubbed mock raises `Mox.UnexpectedCallError` in the
+    # nightly scale job. Install the SAME permissive default set DataCase gives every
+    # other test, rather than hand-picking one mock at a time: the narrow
+    # `stub_embedding_read_path/0` left `MockEmbeddingConcurrency` unstubbed, which is
+    # exactly how the nightly broke. `stub_all_defaults/0` is a superset of it and the
+    # single source of truth, so a mock added to DataCase is covered here automatically.
+    # The stub bodies are closures — an unused stub never executes, so this is inert for
+    # collaborators a given scale file never touches.
+    Loopctl.DataCase.stub_all_defaults()
 
     tenant =
       unboxed(fn ->
@@ -73,6 +79,13 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
     on_exit(fn ->
       try do
         unboxed(fn ->
+          # Links MUST go first: `article_links` FKs articles with `on_delete: :restrict`,
+          # so deleting articles while their links exist raises
+          # `article_links_source_article_id_fkey` — which the `rescue` below then swallows,
+          # silently leaving the whole ~80k corpus committed. CI hides that (each matrix job
+          # gets a fresh Postgres), but locally it poisons the test partition for every
+          # later run.
+          AdminRepo.delete_all(from(l in ArticleLink, where: l.tenant_id == ^tenant.id))
           AdminRepo.delete_all(from(a in Article, where: a.tenant_id == ^tenant.id))
           AdminRepo.delete_all(from(t in Tenant, where: t.id == ^tenant.id))
         end)
@@ -137,7 +150,25 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
           }
         end)
 
-      {_n, _} = AdminRepo.insert_all(ArticleLink, link_rows)
+      # `on_conflict: :nothing` is REQUIRED, not defensive. `ScaleSeed` already links every
+      # article to its `link_density` index-adjacent neighbours, and the seeded embeddings
+      # are a sine wave whose index-adjacency IS vector-adjacency — so the target's seeded
+      # links are GUARANTEED to be inside the `pool`-nearest set we are linking here. A
+      # plain insert_all therefore always trips
+      # `article_links_tenant_src_tgt_rel_index`. Skipping the already-present rows
+      # preserves the intent exactly: what matters is that the target ends up linked to
+      # ALL of its `pool` nearest neighbours (so the anti-join exhausts the pool), not
+      # which of those links this insert happened to author.
+      {_n, _} =
+        AdminRepo.insert_all(ArticleLink, link_rows,
+          on_conflict: :nothing,
+          conflict_target: [
+            :tenant_id,
+            :source_article_id,
+            :target_article_id,
+            :relationship_type
+          ]
+        )
 
       test_pid = self()
       handler_id = "under-fill-scale-#{System.unique_integer([:positive])}"

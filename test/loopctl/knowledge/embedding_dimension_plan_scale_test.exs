@@ -84,13 +84,17 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
   defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
 
   setup do
-    # `config/test.exs` points `:embedding_read_path` at a Mox mock for the whole test
-    # env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed it.
-    # Any read reaching `Embeddings.side_table_reads_enabled?/0` would otherwise raise
-    # `Mox.UnexpectedCallError` in the nightly scale job. Per-test (not `setup_all`):
-    # a Mox stub is registered against the CALLING process, and `setup_all` runs in a
-    # different one.
-    Loopctl.DataCase.stub_embedding_read_path()
+    # `config/test.exs` points EVERY injected collaborator at a Mox mock for the whole
+    # test env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed
+    # them. Any call reaching an unstubbed mock raises `Mox.UnexpectedCallError` in the
+    # nightly scale job. Install the SAME permissive default set DataCase gives every
+    # other test, rather than hand-picking one mock at a time: the narrow
+    # `stub_embedding_read_path/0` left `MockEmbeddingConcurrency` unstubbed, which is
+    # exactly how the nightly broke. `stub_all_defaults/0` is a superset of it and the
+    # single source of truth, so a mock added to DataCase is covered here automatically.
+    # Per-test (not `setup_all`): a Mox stub is registered against the CALLING process,
+    # and `setup_all` runs in a different one.
+    Loopctl.DataCase.stub_all_defaults()
     :ok
   end
 

@@ -108,15 +108,32 @@ defmodule Loopctl.Memory.ScaleRecallTest do
     # async: false) makes the stub reachable from that spawned process.
     Mox.set_mox_global()
 
+    # `config/test.exs` points EVERY injected collaborator at a Mox mock for the whole
+    # test env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed
+    # them. `Memory.recall/2` alone reaches `Embeddings.side_table_reads_enabled?/0`, but
+    # hand-picking one mock at a time is what kept the nightly red — the next unstubbed
+    # mock just repeats it. `stub_all_defaults/0` is the single source of truth, so a mock
+    # added to DataCase is covered here automatically. Registered in THIS process, which is
+    # the `set_mox_global/0` owner above (global mode lets only the owner register stubs).
+    Loopctl.DataCase.stub_all_defaults()
+
+    # The module-specific embedding stub MUST come after `stub_all_defaults/0`, which
+    # installs a generic per-tenant `generate_embedding` default — the LAST `stub` for a
+    # given mock/arity wins. This gate is ANN-sensitive: it asserts where subject A's rows
+    # land in an HNSW pool relative to seeded decoys, so it needs the exact ScaleSeed query
+    # vector, not a generic one.
+    #
+    # BOTH arities are pinned. `/3` carries the explicit `:model` override (US-41.1
+    # AC-41.1.10) and `stub_all_defaults/0` defaults it to the generic vector too, so
+    # leaving it unpinned would silently hand a wrong query vector to any caller that takes
+    # the model-override path.
     Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
       {:ok, ScaleSeed.query_embedding()}
     end)
 
-    # `config/test.exs` points `:embedding_read_path` at a Mox mock for the whole test
-    # env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed it.
-    # `Memory.recall/2` reaches `Embeddings.side_table_reads_enabled?/0`, which would
-    # otherwise raise `Mox.UnexpectedCallError` in the nightly scale job.
-    Loopctl.DataCase.stub_embedding_read_path()
+    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text, _opts ->
+      {:ok, ScaleSeed.query_embedding()}
+    end)
 
     {tenant, seed} =
       unboxed(fn ->
