@@ -17,8 +17,9 @@ defmodule LoopctlWeb.Plugs.RequireHumanAnchor do
     clause so it never falls through to a crash on a nil tenant.
   - `trust_tier: :human_anchored` passes through.
   - `trust_tier: :agent_rooted` halts with `403 custody_tier_required`.
-  - No `current_tenant` assign at all (should not happen this late in the
-    pipeline) is treated as NOT human-anchored — nil is never permissive.
+  - No `current_tenant` assign AT ALL (the key is absent — distinct from the
+    superadmin `current_tenant: nil` case above, which passes) is treated as
+    NOT human-anchored and halts.
 
   `LoopctlWeb.Plugs.Impersonate` reassigns `current_tenant` to the
   impersonated tenant BEFORE controller plugs run, so a superadmin
@@ -49,21 +50,41 @@ defmodule LoopctlWeb.Plugs.RequireHumanAnchor do
            when action in [:create]
 
   Only pass it where an alternative GENUINELY exists — an invented one is worse
-  than none. Most custody endpoints have no substitute by design, and those
-  mounts pass no opts.
+  than none, and "genuinely" is per-ACTION, not per-controller: `create_kb_scope`
+  substitutes for `POST /projects` but is no substitute for updating or deleting
+  an existing work project, so `ProjectController` mounts it `when action in
+  [:create]` and mounts a bare gate for `:update`/`:delete`. Most custody
+  endpoints have no substitute by design, and those mounts pass no opts.
+
+  `init/1` validates the opts at COMPILE time: an unknown key (a typo like
+  `alternatve:`) or a malformed `:alternative` map raises there rather than
+  silently degrading the 403 back into the pre-#505 dead end.
 
   ## Discoverability (#505)
 
   The 403 was previously a dead end: it told the caller the surface was closed
   but not which surfaces were open, so an agent-rooted tenant could only map the
   boundary by taking a 403 per endpoint. The body now embeds
-  `Loopctl.Tenants.TierCapabilities.for_tenant/1` — the SAME map advertised up front
-  on `GET /api/v1/tenants/me` — so a caller can either read it before writing or
-  recover from the 403 without a second round trip.
+  `Loopctl.Tenants.TierCapabilities.compact_for_tenant/1` — the same map advertised
+  up front on `GET /api/v1/tenants/me`, minus the static per-surface
+  `descriptions` (static prose has no business on a hot error path) — so a caller
+  can either read it before writing or recover from the 403 without a second
+  round trip.
+
+  The map covers the TIER gate only. `RequireRole` is a separate, orthogonal gate
+  that can 403 the same request with `code: "insufficient_role"`; that body
+  carries the same capability block for the same reason.
 
   This is discoverability only. The gate itself is unchanged: it is L0 of the
   trust model, and letting an agent-rooted tenant open a custody surface for
   itself is precisely the failure the product exists to prevent.
+
+  The body carries `error.remediation` AND `error.capabilities.remediation`.
+  They are not rivals: the OUTER one wins — it is the same block plus the
+  mount's `agent_native_alternative`, when one exists. The inner copy is the
+  capability map's own, unconditioned by which endpoint 403'd. This is stated
+  on `Loopctl.ApiSpec.Schemas.ErrorResponse` too, so a spec-driven client reads
+  the same rule.
   """
 
   @behaviour Plug
@@ -72,8 +93,30 @@ defmodule LoopctlWeb.Plugs.RequireHumanAnchor do
 
   alias Loopctl.Tenants.TierCapabilities
 
+  @alternative_keys [:tool, :endpoint, :description]
+
   @impl true
-  def init(opts), do: opts
+  # `is_list/1` alone would admit a NON-keyword list (`plug RequireHumanAnchor,
+  # ["create_kb_scope"]`), and `Keyword.keys/1` would then raise an opaque stdlib
+  # error instead of the guidance below. `Keyword.keyword?/1` is a function, not a
+  # guard, so the check has to happen in the body.
+  def init(opts) do
+    if not Keyword.keyword?(opts) do
+      raise ArgumentError,
+            "#{inspect(__MODULE__)} expects a keyword list of options, got: #{inspect(opts)}"
+    end
+
+    case Keyword.keys(opts) -- [:alternative] do
+      [] ->
+        validate_alternative!(Keyword.get(opts, :alternative))
+
+      unknown ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)}: unknown option(s) #{inspect(unknown)}; only :alternative is supported"
+    end
+
+    opts
+  end
 
   @impl true
   def call(%{assigns: %{current_tenant: nil}} = conn, _opts) do
@@ -105,25 +148,53 @@ defmodule LoopctlWeb.Plugs.RequireHumanAnchor do
     |> halt()
   end
 
-  # A missing `current_tenant` assign should not happen this late in the pipeline,
-  # but nil is never permissive — fall back to the most restrictive tier's map
-  # rather than crashing or omitting the block.
-  defp capabilities(conn) do
-    case conn.assigns[:current_tenant] do
-      %{trust_tier: tier} when tier in [:agent_rooted, :human_anchored] ->
-        TierCapabilities.for_tier(tier)
+  # An ABSENT `current_tenant` assign — distinct from the nil superadmin case,
+  # which the leading `call/2` clause above lets through — should not happen this
+  # late in the pipeline. If it does, `for_tenant/1` falls back to the most
+  # restrictive tier's map (flagged `unknown_tier: true`) rather than crashing or
+  # omitting the block.
+  #
+  # `compact/1`: the per-surface descriptions are static prose repeated on every
+  # denial. They are advertised once by `GET /api/v1/tenants/me`; the error path
+  # carries only what the caller branches on.
+  defp capabilities(conn),
+    do: TierCapabilities.compact_for_tenant(conn.assigns[:current_tenant])
 
-      _ ->
-        TierCapabilities.for_tier(:agent_rooted)
-    end
-  end
-
-  defp remediation(opts) do
+  defp remediation(opts) when is_list(opts) do
     base = TierCapabilities.remediation()
 
-    case Keyword.get(opts || [], :alternative) do
+    case Keyword.get(opts, :alternative) do
       nil -> base
       alternative -> Map.put(base, :agent_native_alternative, alternative)
     end
+  end
+
+  defp remediation(_opts), do: TierCapabilities.remediation()
+
+  # Compile-time opt validation: a silently-dropped alternative regresses the 403
+  # to the pre-#505 dead end with no other symptom, so a malformed mount must
+  # fail loudly at boot instead.
+  defp validate_alternative!(nil), do: :ok
+
+  defp validate_alternative!(%{} = alternative) do
+    missing =
+      Enum.reject(@alternative_keys, fn key ->
+        is_binary(Map.get(alternative, key))
+      end)
+
+    case missing do
+      [] ->
+        :ok
+
+      _ ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)}: :alternative must carry string #{inspect(@alternative_keys)}; " <>
+                "missing or non-string: #{inspect(missing)}"
+    end
+  end
+
+  defp validate_alternative!(other) do
+    raise ArgumentError,
+          "#{inspect(__MODULE__)}: :alternative must be a map, got: #{inspect(other)}"
   end
 end

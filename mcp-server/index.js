@@ -2466,9 +2466,12 @@ const TOOLS = [
       "your tenant's trust_tier includes BEFORE attempting a write. The response carries " +
       "`capabilities`: `surfaces` (each surface -> \"allowed\" | \"requires_human_anchor\"), " +
       "`allowed`/`blocked` lists, `descriptions`, and `remediation` when something is blocked. " +
-      "An agent_rooted (self-signup, KB-tier) tenant has work_breakdown / chain_of_custody / " +
-      "dispatch / token_budgets blocked and knowledge_base / agent_memory / kb_project_scopes / " +
-      "coordination_bus allowed — check this instead of probing for a 403 per endpoint.",
+      "Read the live `allowed`/`blocked` lists from the response — they are the authoritative, " +
+      "current split for your TIER — instead of probing for a 403 per endpoint. Two bounds, " +
+      "restated in the payload as `scope: trust_tier_only` and `applies_to: mutating_actions`: " +
+      "the ROLE gate is separate (an `allowed` surface can still return 403 `insufficient_role` " +
+      "if your key's role is too low), and READS stay open on every surface, including blocked " +
+      "ones — `blocked` means writes.",
     inputSchema: {
       type: "object",
       properties: {},

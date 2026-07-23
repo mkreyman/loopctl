@@ -165,6 +165,12 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
       assert enroll_resp["upgraded"] == true
       assert enroll_resp["authenticator"]["friendly_name"] == "Authenticator"
 
+      # #505 — the upgrade is the moment the tier CHANGES, so the response says
+      # what was just unlocked instead of making the caller re-fetch /tenants/me.
+      assert enroll_resp["capabilities"]["trust_tier"] == "human_anchored"
+      assert enroll_resp["capabilities"]["blocked"] == []
+      assert "work_breakdown" in enroll_resp["capabilities"]["allowed"]
+
       {:ok, tenant_reloaded} = Tenants.get_tenant(tenant.id)
       assert tenant_reloaded.trust_tier == :human_anchored
 

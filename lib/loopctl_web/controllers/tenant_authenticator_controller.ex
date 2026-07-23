@@ -44,6 +44,7 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Tenants
   alias Loopctl.Tenants.Enrollment
+  alias Loopctl.Tenants.TierCapabilities
   alias Loopctl.WebAuthn
   alias Loopctl.WebAuthn.Enrollment, as: RegistrationChallenges
   alias Loopctl.WebAuthn.Reauth
@@ -372,6 +373,10 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
             tenant_id: tenant.id,
             trust_tier: Atom.to_string(tenant.trust_tier),
             upgraded: upgraded,
+            # #505 — the enrollment upgrade is the moment the tier CHANGES, so
+            # ship the newly-unlocked surface map with it rather than making the
+            # caller re-fetch GET /tenants/me to learn what it just gained.
+            capabilities: TierCapabilities.for_tenant(tenant),
             authenticator: %{
               id: auth.id,
               friendly_name: auth.friendly_name,

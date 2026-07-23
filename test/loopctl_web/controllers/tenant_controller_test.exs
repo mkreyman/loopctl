@@ -48,7 +48,7 @@ defmodule LoopctlWeb.TenantControllerTest do
       # ...and the surface it CAN use to establish a project row for its repo.
       assert "kb_project_scopes" in caps["allowed"]
       assert "knowledge_base" in caps["allowed"]
-      assert caps["remediation"]["enrollment_upgrade"] =~ "tenant-signup"
+      assert caps["remediation"]["enrollment_upgrade"]["docs"] =~ "tenant-signup"
       assert is_binary(caps["descriptions"]["work_breakdown"])
     end
 

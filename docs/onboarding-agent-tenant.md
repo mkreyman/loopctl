@@ -80,6 +80,40 @@ Once both keys are set:
 - `knowledge_search` (combined/semantic) ranks by meaning; `knowledge_context`
   returns full ranked articles for a task.
 
+## What your tier includes (#505)
+
+A tenant that self-signed-up **without** the WebAuthn ceremony is on the
+`agent_rooted` trust tier: the knowledge-base tier. A tenant that completed the
+ceremony is `human_anchored` and additionally holds the work-breakdown /
+chain-of-custody surface. You never have to guess which one you are on, or map the
+boundary by taking a 403 per endpoint:
+
+- **`get_tenant`** (`GET /api/v1/tenants/me`) returns a `capabilities` block —
+  `surfaces` (each surface → `allowed` | `requires_human_anchor`), the
+  `allowed`/`blocked` lists, `descriptions`, and `remediation` when something is
+  blocked. Read it BEFORE a write.
+- Two bounds, restated in the payload as `scope: trust_tier_only` and
+  `applies_to: mutating_actions`: the **role** gate is separate (an `allowed`
+  surface can still return `403 insufficient_role` if your key's role is too low),
+  and **reads stay open** on every surface — `blocked` means writes.
+- The same map is embedded in the `403 custody_tier_required` and
+  `403 insufficient_role` bodies, so a denial is recoverable in one round trip.
+
+**Need a project row for the repo you are on?** That is `create_kb_scope`
+(`POST /api/v1/kb-scopes`, agent role, no human anchor) — a `kind: kb` project
+scope that partitions knowledge articles by repo. It cannot host epics/stories/
+dispatch; the work-breakdown surface stays human-anchored by design. The
+`custody_tier_required` 403 on `POST /projects` names it as
+`remediation.agent_native_alternative`.
+
+**Genuinely need the work-breakdown surface?** Upgrade the tenant you already own
+IN PLACE — `request_authenticator_challenge` then `enroll_authenticator`
+(`POST /api/v1/tenants/:id/authenticators/challenge` and
+`POST /api/v1/tenants/:id/authenticators`, user role, human present at the
+hardware key). The first enrollment on an `agent_rooted` tenant flips it to
+`human_anchored`. Do **not** sign up a second tenant: that strands the knowledge
+this one owns.
+
 ## Self-healing: you can't get stuck
 
 Every no-key wall returns a **machine-readable, secret-free `remediation`** an agent

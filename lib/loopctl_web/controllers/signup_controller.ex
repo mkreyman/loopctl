@@ -21,6 +21,7 @@ defmodule LoopctlWeb.SignupController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.RemoteIp
   alias Loopctl.Tenants
+  alias Loopctl.Tenants.TierCapabilities
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -127,6 +128,12 @@ defmodule LoopctlWeb.SignupController do
       slug: tenant.slug,
       email: tenant.email,
       trust_tier: tenant.trust_tier,
+      # #505 — signup is the highest-value discoverability moment: a brand-new
+      # agent_rooted tenant receiving its one-time root key is exactly the caller
+      # that needs the surface map, and `Schemas.SelfSignupResponse` embeds
+      # `TenantResponse`, which declares this field. Emitting it here saves a
+      # second round trip to GET /tenants/me.
+      capabilities: TierCapabilities.for_tenant(tenant),
       status: tenant.status,
       inserted_at: tenant.inserted_at
     }
