@@ -112,6 +112,12 @@ defmodule Loopctl.Memory.ScaleRecallTest do
       {:ok, ScaleSeed.query_embedding()}
     end)
 
+    # `config/test.exs` points `:embedding_read_path` at a Mox mock for the whole test
+    # env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed it.
+    # `Memory.recall/2` reaches `Embeddings.side_table_reads_enabled?/0`, which would
+    # otherwise raise `Mox.UnexpectedCallError` in the nightly scale job.
+    Loopctl.DataCase.stub_embedding_read_path()
+
     {tenant, seed} =
       unboxed(fn ->
         slug = "mem-scale-#{:erlang.phash2(Ecto.UUID.generate())}"

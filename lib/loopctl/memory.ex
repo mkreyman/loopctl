@@ -705,10 +705,21 @@ defmodule Loopctl.Memory do
   defp recall_on_overload(:tag), do: :tag
   defp recall_on_overload(_), do: :raise
 
+  # US-41.1 (review): the injected cutover decision is resolved ONCE per recall and threaded
+  # into both the dimension check and the candidate query. Resolving it twice let a live
+  # `SystemConfig` cutover (AC-41.1.8 flips against serving traffic) land BETWEEN them, so an
+  # in-flight recall could validate the query vector against the legacy 1536 and then scan the
+  # 768 side table — the raw Postgrex "different vector dimensions" 500 the dimension check
+  # exists to prevent. Mirrors `Knowledge.suggest_links_with_meta/3`.
   defp recall_semantic(scope, embedding, k, include_superseded?, on_overload) do
-    case recall_dimension_check(scope, embedding) do
-      :ok -> do_recall_semantic(scope, embedding, k, include_superseded?, on_overload)
-      {:error, reason} -> unavailable_memory_env(scope.tenant_id, k, reason)
+    side_table? = Embeddings.side_table_reads_enabled?()
+
+    case recall_dimension_check(scope, embedding, side_table?) do
+      :ok ->
+        do_recall_semantic(scope, embedding, k, include_superseded?, on_overload, side_table?)
+
+      {:error, reason} ->
+        unavailable_memory_env(scope.tenant_id, k, reason)
     end
   end
 
@@ -718,11 +729,11 @@ defmodule Loopctl.Memory do
   # raw Postgrex "different vector dimensions" 500 instead of the documented graceful
   # degrade. The legacy column is `vector(1536)` unconditionally, so the pre-flip
   # expected length is a constant and this costs NO extra query on that path.
-  defp recall_dimension_check(scope, embedding) do
+  defp recall_dimension_check(scope, embedding, side_table?) do
     actual = length(VectorSearch.to_embedding_list(embedding))
 
     expected =
-      if Embeddings.side_table_reads_enabled?() do
+      if side_table? do
         Embeddings.active_dimension(scope.tenant_id)
       else
         Embeddings.legacy_dimension()
@@ -740,8 +751,8 @@ defmodule Loopctl.Memory do
     }
   end
 
-  defp do_recall_semantic(scope, embedding, k, include_superseded?, on_overload) do
-    query = memory_candidate_query(scope, embedding, k, include_superseded?)
+  defp do_recall_semantic(scope, embedding, k, include_superseded?, on_overload, side_table?) do
+    query = memory_candidate_query(scope, embedding, k, include_superseded?, side_table?)
 
     case HeavyRead.all_memory(
            scope.tenant_id,
@@ -815,11 +826,12 @@ defmodule Loopctl.Memory do
   # selective subject flip the planner off HNSW. OUTER: subject scope (the structural
   # guard REQUIRES this predicate here) + superseded exclusion over the ≤pool rows —
   # trivial filters on a tiny set that cannot defeat the index.
-  defp memory_candidate_query(scope, embedding, k, include_superseded?) do
+  defp memory_candidate_query(scope, embedding, k, include_superseded?, side_table?) do
     # US-41.1 AC-41.1.5: behind the explicit, reversible cutover flag the ANN runs over
     # the dimension-tagged `memory_embeddings` side table so a tenant on a non-1536
-    # model is recallable at all. Same filter-after-ANN shape either way.
-    if Embeddings.side_table_reads_enabled?() do
+    # model is recallable at all. Same filter-after-ANN shape either way. The decision is
+    # RESOLVED BY THE CALLER (once per operation) so it cannot flip mid-operation.
+    if side_table? do
       memory_side_table_candidate_query(scope, embedding, k, include_superseded?)
     else
       memory_legacy_candidate_query(scope, embedding, k, include_superseded?)
@@ -2647,14 +2659,16 @@ defmodule Loopctl.Memory do
     # Same AC-41.1.8 boundary check as `recall_semantic/5`: a length mismatch here
     # would raise a raw pgvector error on the PROMOTION WRITE path. "No near-dup
     # found" is the correct, safe degrade (the promotion proceeds as a new row).
-    case recall_dimension_check(scope, embedding) do
-      :ok -> do_find_promoted_near_dup(scope, embedding)
+    side_table? = Embeddings.side_table_reads_enabled?()
+
+    case recall_dimension_check(scope, embedding, side_table?) do
+      :ok -> do_find_promoted_near_dup(scope, embedding, side_table?)
       {:error, _reason} -> nil
     end
   end
 
-  defp do_find_promoted_near_dup(scope, embedding) do
-    query = memory_candidate_query(scope, embedding, @near_dup_recall_pool, false)
+  defp do_find_promoted_near_dup(scope, embedding, side_table?) do
+    query = memory_candidate_query(scope, embedding, @near_dup_recall_pool, false, side_table?)
     # `on_overload: :tag` so an over-cap TenantGate shed returns
     # `{:error, :heavy_read_overloaded}` (mapped to a loss-free snooze upstream)
     # instead of RAISING an OverloadedError on the promotion write path (US-37.5).

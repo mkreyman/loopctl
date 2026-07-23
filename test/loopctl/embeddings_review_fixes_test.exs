@@ -21,11 +21,13 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
     * the re-embed pin moving BEFORE the completeness-gated sweep;
     * the enforced (not merely denormalized) `memory_embeddings.subject_id`.
 
-  `async: false` for the same reason as `Loopctl.EmbeddingsSideTableReadsTest`: the
-  cutover flag is a VM-global `SystemConfig` integer.
+  `async: true` for the same reason as `Loopctl.EmbeddingsSideTableReadsTest`: the
+  cutover read-path decision is injected (`Loopctl.Embeddings.ReadPathBehaviour`)
+  and stubbed per-process, never flipped VM-globally, so nothing here writes shared
+  state.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
 
   import Ecto.Query
@@ -37,7 +39,6 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Memory
   alias Loopctl.Memory.MemoryEmbedding
-  alias Loopctl.SystemConfig
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Workers.ArticleEmbeddingWorker
   alias Loopctl.Workers.BatchArticleEmbeddingWorker
@@ -47,13 +48,8 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
 
   setup :verify_on_exit!
 
-  setup do
-    on_exit(fn -> SystemConfig.put(Embeddings.read_flag_key(), 0) end)
-    :ok
-  end
-
   defp enable_side_table_reads do
-    {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 1)
+    stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
     assert Embeddings.side_table_reads_enabled?()
   end
 

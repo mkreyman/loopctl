@@ -10,16 +10,29 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   threaded into the search response `meta` (AC-41.1.7), and the re-embed
   coexistence + pending-dimension exclusion reporting (AC-41.1.10).
 
-  ## Why `async: false`
+  ## Why this is `async: true`
 
-  The cutover flag is a `SystemConfig` integer cached in `:persistent_term`, which
-  is VM-GLOBAL. Flipping it inside an async test would change the read path of
-  every other test running concurrently. That globality is not incidental — it is
-  the point of AC-41.1.8(ii)/(iii): the flag is per-NODE, flipped once every node
-  runs dual-write code, and reverted with a single operator UPDATE and no redeploy.
+  It used to be `async: false`, because selecting the side-table path meant
+  flipping the VM-GLOBAL `SystemConfig`/`:persistent_term` cutover flag for the
+  whole node. `async: false` was not enough: the mutation still leaked past this
+  module's boundary, and a test that had just asserted the flag was on could run
+  its query after the value had been reset, silently take the LEGACY path, find no
+  legacy embedding, and fail with `left: []`. Those failures looked like a vector
+  recall bug and moved between tests and runs.
+
+  The read-path decision is now an injected collaborator
+  (`Loopctl.Embeddings.ReadPathBehaviour`), so `enable_side_table_reads/0` is a
+  PROCESS-SCOPED `Mox.stub/3`. Nothing global is written, so these tests are
+  isolated and run async.
+
+  The flag's real globality is not incidental — it is the point of
+  AC-41.1.8(ii)/(iii): per-NODE, flipped once every node runs dual-write code,
+  reverted with a single operator UPDATE and no redeploy. That production
+  behaviour is covered directly in
+  `test/loopctl/embeddings/system_config_read_path_test.exs`.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
 
   alias Loopctl.AdminRepo
@@ -31,17 +44,11 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   alias Loopctl.Memory
   alias Loopctl.Memory.MemoryEmbedding
   alias Loopctl.Memory.Scope
-  alias Loopctl.SystemConfig
 
   setup :verify_on_exit!
 
-  setup do
-    on_exit(fn -> SystemConfig.put(Embeddings.read_flag_key(), 0) end)
-    :ok
-  end
-
   defp enable_side_table_reads do
-    {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 1)
+    stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
     assert Embeddings.side_table_reads_enabled?()
   end
 
@@ -71,12 +78,20 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   # ---------------------------------------------------------------------------
 
   describe "search_semantic/3 on the side table (AC-41.1.5)" do
-    test "the cutover flag switches the read path and is REVERSIBLE" do
+    # The FLAG mechanism itself (SystemConfig 0/1 -> legacy/side-table, and the
+    # revert) is covered against the real production implementation in
+    # `system_config_read_path_test.exs`. Asserting it here would only assert the
+    # injected mock. What this module covers is the READ PATH each decision selects.
+    # NB: this asserts the DI WIRING only — that `side_table_reads_enabled?/0` returns
+    # whatever the injected decision says, in both directions. The QUERY paths each
+    # decision selects are covered by the tests below (side table) and by "the legacy read
+    # path discloses keyword-only..." (legacy).
+    test "side_table_reads_enabled?/0 returns the injected decision, both ways (DI wiring)" do
       refute Embeddings.side_table_reads_enabled?()
       enable_side_table_reads()
       assert Embeddings.side_table_reads_enabled?()
 
-      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 0)
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> false end)
       refute Embeddings.side_table_reads_enabled?()
     end
 

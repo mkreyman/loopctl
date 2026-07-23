@@ -5696,7 +5696,15 @@ defmodule Loopctl.Knowledge do
   def novelty_scores(tenant_id, ideas, opts \\ []) when is_list(ideas) do
     prior_tag = Keyword.get(opts, :prior_tag, "proposal")
     vis = Keyword.get(opts, :visibility_agent_id)
-    prior_count = count_embedded_priors(tenant_id, prior_tag, vis)
+
+    # US-41.1 (review): resolve the injected cutover decision ONCE for the whole
+    # assessment and thread it. Resolving it separately for the prior COUNT and the
+    # prior DISTANCE let a live cutover (AC-41.1.8 flips against serving traffic) land
+    # between them, yielding a count from one relation and a distance from the other —
+    # which breaks the "truthful disambiguator for nil scores" contract below and can
+    # verdict a duplicate as novel. Mirrors `suggest_links_with_meta/3`.
+    side_table? = Embeddings.side_table_reads_enabled?()
+    prior_count = count_embedded_priors(tenant_id, prior_tag, vis, side_table?)
 
     scored =
       if prior_count == 0 do
@@ -5705,7 +5713,7 @@ defmodule Loopctl.Knowledge do
         Enum.map(ideas, &Map.put(&1, :novelty_score, nil))
       else
         ideas
-        |> Task.async_stream(&score_idea(tenant_id, &1, prior_tag, vis),
+        |> Task.async_stream(&score_idea(tenant_id, &1, prior_tag, vis, side_table?),
           max_concurrency: novelty_concurrency(),
           timeout: :infinity,
           ordered: true
@@ -5744,8 +5752,8 @@ defmodule Loopctl.Knowledge do
   # Count of embedded prior proposals visible to the caller — the set actually
   # compared against (matches nearest_prior_distance's filter), so it's a truthful
   # disambiguator for nil scores and never counts another agent's private priors.
-  defp count_embedded_priors(tenant_id, prior_tag, vis) do
-    if Embeddings.side_table_reads_enabled?() do
+  defp count_embedded_priors(tenant_id, prior_tag, vis, side_table?) do
+    if side_table? do
       from(ae in ArticleEmbedding,
         where:
           ae.tenant_id == ^tenant_id and ae.dim == ^Embeddings.active_dimension(tenant_id) and
@@ -5764,23 +5772,23 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp score_idea(tenant_id, idea, prior_tag, vis) do
+  defp score_idea(tenant_id, idea, prior_tag, vis, side_table?) do
     text = novelty_idea_text(idea)
 
     if String.trim(text) == "" do
       Map.put(idea, :novelty_score, nil)
     else
-      score_embedding(tenant_id, idea, text, prior_tag, vis)
+      score_embedding(tenant_id, idea, text, prior_tag, vis, side_table?)
     end
   end
 
-  defp score_embedding(tenant_id, idea, text, prior_tag, vis) do
+  defp score_embedding(tenant_id, idea, text, prior_tag, vis, side_table?) do
     case generate_embedding(tenant_id, text) do
       {:ok, embedding} ->
         Map.put(
           idea,
           :novelty_score,
-          nearest_prior_distance(tenant_id, embedding, prior_tag, vis)
+          nearest_prior_distance(tenant_id, embedding, prior_tag, vis, side_table?)
         )
 
       {:error, _} ->
@@ -5821,20 +5829,20 @@ defmodule Loopctl.Knowledge do
   # stored `%Pgvector{}` struct (the #168 production 500). The query stays tenant-scoped
   # (`a.tenant_id == ^tenant_id`) and is bounded by prior-tag selectivity — NEVER a
   # full-corpus read (the verified plan shape is documented on novelty_distance_query/4).
-  defp nearest_prior_distance(tenant_id, embedding, prior_tag, vis) do
+  defp nearest_prior_distance(tenant_id, embedding, prior_tag, vis, side_table?) do
     # Query-vector length guard (review): the side-table novelty aggregate binds this
     # FRESH vector into the per-dimension `(embedding::vector(N))` cast, so a length
     # disagreeing with the read dimension would raise pgvector's "different vector
     # dimensions" 500 on the knowledge_create request path. `nil` is the documented
     # no-score degrade (indistinguishable from "no comparable priors").
     case Embeddings.check_query_vector(tenant_id, to_embedding_list(embedding)) do
-      :ok -> run_nearest_prior_distance(tenant_id, embedding, prior_tag, vis)
+      :ok -> run_nearest_prior_distance(tenant_id, embedding, prior_tag, vis, side_table?)
       {:error, _mismatch} -> nil
     end
   end
 
-  defp run_nearest_prior_distance(tenant_id, embedding, prior_tag, vis) do
-    query = novelty_distance_query(tenant_id, embedding, prior_tag, vis)
+  defp run_nearest_prior_distance(tenant_id, embedding, prior_tag, vis, side_table?) do
+    query = novelty_distance_query(tenant_id, embedding, prior_tag, vis, side_table?)
     # Heavy vector aggregate — dedicated pool via Loopctl.HeavyRead (US-27.11).
     # `on_overload: :tag` (US-37.5): over the tenant's HeavyRead slice the read is SHED
     # and returns `{:error, :heavy_read_overloaded}` — mapped to a DELIBERATE `nil` novelty
@@ -5868,12 +5876,26 @@ defmodule Loopctl.Knowledge do
   # accepting EITHER plan (it does NOT pin the node type).
   @doc false
   def novelty_distance_query(tenant_id, embedding, prior_tag, vis) do
+    novelty_distance_query(
+      tenant_id,
+      embedding,
+      prior_tag,
+      vis,
+      Embeddings.side_table_reads_enabled?()
+    )
+  end
+
+  # `novelty_distance_query/4` with the cutover decision RESOLVED BY THE CALLER, so one
+  # novelty assessment cannot count priors on one relation and measure distance on the
+  # other when an operator flips the flag mid-request (review).
+  @doc false
+  def novelty_distance_query(tenant_id, embedding, prior_tag, vis, side_table?) do
     # US-41.1 (review #3): behind the cutover flag the prior set is scanned on the
     # dimension-tagged side table. Leaving it on `articles.embedding` meant a
     # 768/1024 tenant — whose legacy column is NEVER written — saw ZERO priors, and
     # the novelty/dedup gate then verdicted every proposal `novel` and created
     # duplicates. That is a correctness regression, not a degradation.
-    if Embeddings.side_table_reads_enabled?() do
+    if side_table? do
       novelty_distance_side_table_query(tenant_id, embedding, prior_tag, vis)
     else
       novelty_distance_legacy_query(tenant_id, embedding, prior_tag, vis)

@@ -54,6 +54,8 @@ defmodule Loopctl.HeavyRead do
   docs/runbooks/knowledge-scale.md.
   """
 
+  require Logger
+
   alias Loopctl.HeavyRead.TenantGate
 
   @doc "Resolved heavy-read repo (DI). `HeavyReadRepo` in prod/dev, `AdminRepo` in test."
@@ -386,14 +388,23 @@ defmodule Loopctl.HeavyRead do
   (0 = off (default/missing/unknown), 1 = relaxed_order, 2 = strict_order), so an operator
   enables iterative scan fleet-wide with a single `UPDATE` — no redeploy — AFTER confirming
   the deployed pgvector is >= 0.8.
+
+  There is exactly ONE source for this value: the `SystemConfig` key. There is deliberately
+  NO `Application`-level override — an environment pin would silently shadow (or be shadowed
+  by) the operator lever, and pinning it ON for the test env would make CI stop exercising
+  the shipped production configuration. Tests that need a specific mode prime the
+  `SystemConfig` cache explicitly in an `async: false` module (see
+  `test/loopctl/heavy_read_hnsw_ef_search_test.exs`).
+
+  Operator docs: `docs/hnsw-tuning-evaluation.md` and `docs/runbooks/knowledge-scale.md`.
   """
   @spec hnsw_iterative_scan() :: String.t()
   def hnsw_iterative_scan do
-    Map.get(
-      @hnsw_iterative_scan_modes,
-      Loopctl.SystemConfig.get_int("hnsw_iterative_scan", @default_hnsw_iterative_scan),
-      "off"
-    )
+    Map.get(@hnsw_iterative_scan_modes, iterative_scan_code(), "off")
+  end
+
+  defp iterative_scan_code do
+    Loopctl.SystemConfig.get_int("hnsw_iterative_scan", @default_hnsw_iterative_scan)
   end
 
   @doc """
@@ -427,41 +438,133 @@ defmodule Loopctl.HeavyRead do
 
   @iterative_scan_min_version {0, 8, 0}
 
+  # Conclusive verdicts are long-lived but NOT permanent (the backend can change under us);
+  # inconclusive verdicts are negative-cached briefly so a degraded backend costs one probe
+  # + one log line per window, not one per ANN read.
+  @iterative_scan_cache_ttl_ms 600_000
+  @iterative_scan_negative_ttl_ms 60_000
+
   @doc """
   Whether the connected pgvector supports `hnsw.iterative_scan` (pgvector >= 0.8.0).
 
-  Probed ONCE from `pg_extension` and cached in `:persistent_term`. The probe runs only when
-  an operator has actually enabled iterative scan (`iterative_scan_override/0` short-circuits
-  at OFF), so it costs one extra round-trip on the first enabled use and nothing after.
-  FAILS CLOSED: any error / missing row / unparseable version → `false`, so no
-  `hnsw.iterative_scan` GUC is emitted against a backend that would reject it and abort the
-  heavy-read transaction. This is what makes the "safe on pgvector < 0.8" guarantee hold even
-  if the config is enabled on such a backend.
+  Probed from `pg_extension` on the SAME repo the ANN read runs on (`repo/0`) and cached in
+  `:persistent_term` WITH A TTL. The probe runs only when an operator has actually enabled
+  iterative scan (`iterative_scan_override/0` short-circuits at OFF), so it costs one extra
+  round-trip per TTL window on the enabled path and nothing at all on the default path.
+
+  FAILS CLOSED: any error (including a DBConnection/Postgrex EXIT, not just a raise), missing
+  row, or unparseable version → `false`, so no `hnsw.iterative_scan` GUC is emitted against a
+  backend that would reject it and abort the heavy-read transaction. This is what makes the
+  "safe on pgvector < 0.8" guarantee hold even if the config is enabled on such a backend.
+
+  BOTH verdicts are cached, and both EXPIRE:
+
+    * a CONCLUSIVE verdict for #{div(@iterative_scan_cache_ttl_ms, 60_000)} minutes, so a backend change under the
+      node (replica failover onto an older pgvector, extension downgrade) self-heals on the
+      next window instead of pinning a stale `true` — which would keep emitting a GUC the new
+      backend rejects, 500-ing every ANN read until a redeploy;
+    * an INCONCLUSIVE probe (pool checkout timeout, sandbox ownership blip, DB restart) as a
+      short NEGATIVE cache. Not caching it at all was worse than a stale verdict: the
+      conditions that make the probe inconclusive are exactly HeavyReadRepo saturation, so an
+      uncached `:inconclusive` added one extra pool checkout AND one warning to EVERY ANN read
+      precisely during the incident. The short TTL keeps the operator's lever from being pinned
+      OFF for the VM lifetime while bounding the degraded-backend cost to one probe per window.
   """
   @spec iterative_scan_supported?() :: boolean()
   def iterative_scan_supported? do
     case :persistent_term.get({__MODULE__, :iterative_scan_supported}, :unknown) do
-      :unknown ->
-        supported = probe_iterative_scan_support()
-        :persistent_term.put({__MODULE__, :iterative_scan_supported}, supported)
+      {verdict, expires_at} when is_boolean(verdict) ->
+        if now_ms() < expires_at, do: verdict, else: probe_and_cache()
+
+      _unknown_or_expired ->
+        probe_and_cache()
+    end
+  end
+
+  defp probe_and_cache do
+    case probe_iterative_scan_support() do
+      {:ok, supported, version} ->
+        maybe_warn_unsupported(supported, version)
+        cache_iterative_scan_verdict(supported, @iterative_scan_cache_ttl_ms)
         supported
 
-      cached ->
-        cached
-    end
-  end
+      {:inconclusive, reason} ->
+        Logger.warning(
+          "hnsw.iterative_scan capability probe was inconclusive (#{reason}) — " <>
+            "failing closed and re-probing in #{div(@iterative_scan_negative_ttl_ms, 1000)}s"
+        )
 
-  defp probe_iterative_scan_support do
-    case Loopctl.Repo.query("SELECT extversion FROM pg_extension WHERE extname = 'vector'", []) do
-      {:ok, %{rows: [[version]]}} when is_binary(version) ->
-        version_at_least?(version, @iterative_scan_min_version)
-
-      _ ->
+        cache_iterative_scan_verdict(false, @iterative_scan_negative_ttl_ms)
         false
     end
-  rescue
-    _ -> false
   end
+
+  defp cache_iterative_scan_verdict(verdict, ttl_ms) do
+    :persistent_term.put({__MODULE__, :iterative_scan_supported}, {verdict, now_ms() + ttl_ms})
+  end
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+
+  defp maybe_warn_unsupported(true, _version), do: :ok
+
+  defp maybe_warn_unsupported(false, :not_installed) do
+    Logger.warning(
+      "hnsw.iterative_scan is enabled but the pgvector extension is NOT INSTALLED on the " <>
+        "connected backend — the setting is a NO-OP (this is not a version problem: " <>
+        "CREATE EXTENSION vector first)"
+    )
+  end
+
+  defp maybe_warn_unsupported(false, version) do
+    Logger.warning(
+      "hnsw.iterative_scan is enabled but the connected pgvector (#{version}) is older than " <>
+        "#{@iterative_scan_min_version |> Tuple.to_list() |> Enum.join(".")} — " <>
+        "the setting is a NO-OP until the extension is upgraded"
+    )
+  end
+
+  # `{:ok, boolean, version}` = the backend answered (`version` is the raw extversion, or
+  # `:not_installed` when the extension is absent); `{:inconclusive, reason}` = we could not
+  # tell. `reason` is a STABLE TAG, never the raw error struct — an inspected
+  # `Postgrex.Error`/`DBConnection.ConnectionError` carries backend host / database / role
+  # into the log stream for no diagnostic gain here (the probed SQL is a constant).
+  @spec probe_iterative_scan_support() ::
+          {:ok, boolean(), String.t() | :not_installed} | {:inconclusive, String.t()}
+  defp probe_iterative_scan_support do
+    # Explicit timeout like the sibling probes (`probe/0`, `replica_max_connections/0`):
+    # without it this inherits DBConnection's ~15s default and can block an ANN request
+    # BEFORE the TenantGate shed and before the SET LOCAL statement_timeout applies.
+    case repo().query("SELECT extversion FROM pg_extension WHERE extname = 'vector'", [],
+           timeout: 5_000
+         ) do
+      {:ok, %{rows: [[version]]}} when is_binary(version) ->
+        {:ok, version_at_least?(version, @iterative_scan_min_version), version}
+
+      {:ok, %{rows: []}} ->
+        # The extension is genuinely absent — conclusive, and no ANN index exists either.
+        {:ok, false, :not_installed}
+
+      other ->
+        {:inconclusive, probe_failure_tag(other)}
+    end
+  rescue
+    error -> {:inconclusive, "raised:" <> inspect(error.__struct__)}
+  catch
+    # DBConnection/Postgrex EXIT rather than raise when the pool is not started (`:noproc`)
+    # or wedged (`{:timeout, {GenServer, :call, _}}`). Without this clause the exit
+    # propagates out of `opts/1` and aborts the caller's ANN read — the OPPOSITE of the
+    # documented fail-closed guarantee.
+    :exit, reason -> {:inconclusive, "exit:" <> exit_tag(reason)}
+  end
+
+  defp probe_failure_tag({:error, %{__struct__: mod}}), do: "query_error:" <> inspect(mod)
+  defp probe_failure_tag({:error, reason}) when is_atom(reason), do: "query_error:#{reason}"
+  defp probe_failure_tag(_other), do: "unexpected_result"
+
+  defp exit_tag({:timeout, _}), do: "timeout"
+  defp exit_tag(:noproc), do: "noproc"
+  defp exit_tag(reason) when is_atom(reason), do: to_string(reason)
+  defp exit_tag(_reason), do: "other"
 
   @doc """
   Compare a `"MAJOR.MINOR[.PATCH]"` pgvector extversion against a `{maj, min, patch}` floor.

@@ -54,28 +54,28 @@ reads through `Loopctl.HeavyRead` (`lib/loopctl/heavy_read.ex`), which owns the 
 6. **On `AdminRepo`/`HeavyReadRepo`, RLS does NOTHING — the explicit `tenant_id` predicate is the only
    isolation there** (`knowledge.ex:9-14`, `heavy_read.ex:3-7`). This is the compensating invariant for
    the other two repos, and it is enforced structurally on the heavy path: the private `guard!/2`
-   (`heavy_read.ex:803-823`) RAISES unless EVERY base-table source — `from`, every join, and every
+   (`heavy_read.ex:906-924`) RAISES unless EVERY base-table source — `from`, every join, and every
    subquery, recursively — carries a conjunctive `x.tenant_id == ^tenant_id` bound to the passed
    `tenant_id`; `test/loopctl/heavy_read_guard_test.exs` additionally bars direct `HeavyReadRepo` calls.
-   Agent-memory reads need a SECOND predicate: `all_memory/4` (`:581`) also requires a conjunctive
-   `subject_id` equality on the outermost query (private `guard_memory!/3`, `heavy_read.ex:825-853`), because `subject_id`
+   Agent-memory reads need a SECOND predicate: `all_memory/4` (`:684`) also requires a conjunctive
+   `subject_id` equality on the outermost query (private `guard_memory!/3`, `heavy_read.ex:928-950`), because `subject_id`
    scoping is application-level only. Always go through `Loopctl.HeavyRead`, never `HeavyReadRepo`
    directly; on `AdminRepo` there is no guard at all, so the predicate is on you.
-7. **Heavy reads can be SHED — handle `{:error, :heavy_read_overloaded}`.** `all/3` (`heavy_read.ex:525`),
-   `one/3` (`heavy_read.ex:545`) and `all_memory/4` (`heavy_read.ex:581`) are specced to return it: the
-   per-tenant cost-weighted in-flight gate (`gated/4`, `heavy_read.ex:610-624`) sheds over the cap —
+7. **Heavy reads can be SHED — handle `{:error, :heavy_read_overloaded}`.** `all/3` (`heavy_read.ex:628`),
+   `one/3` (`heavy_read.ex:648`) and `all_memory/4` (`heavy_read.ex:684`) are specced to return it: the
+   per-tenant cost-weighted in-flight gate (`gated/4`, `heavy_read.ex:713-733`) sheds over the cap —
    `on_overload: :raise` (default) raises → 429, `on_overload: :tag` returns the tuple. Binding the
    result as a list crashes exactly under the load the gate exists for.
-8. **A consistency-coupled heavy read must be PRIMARY-PINNED.** `repo_for/1` (`heavy_read.ex:112-114`,
-   pure decision in `route_repo/4`, `heavy_read.ex:128-134`) routes an endpoint listed in
-   `primary_pinned_endpoints/0` (`heavy_read.ex:90`, today `:sth_incremental`) onto the PRIMARY pool
+8. **A consistency-coupled heavy read must be PRIMARY-PINNED.** `repo_for/1` (`heavy_read.ex:114-117`,
+   pure decision in `route_repo/4`, `heavy_read.ex:129-137`) routes an endpoint listed in
+   `primary_pinned_endpoints/0` (`heavy_read.ex:93`, today `:sth_incremental`) onto the PRIMARY pool
    whenever a distinct replica is configured — so it is NOT always `HeavyReadRepo`. Add a new endpoint
    to that list when it cannot tolerate replica lag.
 
 ## The pgbouncer gotcha (US-27.13 — production outage, do not regress)
 
 `HeavyReadRepo` enforces a server-side `statement_timeout` **per-read via `SET LOCAL` inside the
-transaction** (`heavy_read.ex:525-555` — `all/3` and `one/3`, both via `with_statement_timeout/5`;
+transaction** (`heavy_read.ex:628-652` — `all/3` and `one/3`, both via `with_statement_timeout/5`;
 `heavy_read_repo.ex:19-32`) — NOT as a connection startup
 `:parameters` value. Fly MPG fronts Postgres with **pgbouncer**, which rejects a `statement_timeout`
 startup parameter with `FATAL 08P01 unsupported startup parameter`, crash-looping the whole pool so it

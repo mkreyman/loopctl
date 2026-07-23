@@ -83,6 +83,17 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
   # Seq Scan for reasons that have nothing to do with the index.
   defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
 
+  setup do
+    # `config/test.exs` points `:embedding_read_path` at a Mox mock for the whole test
+    # env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed it.
+    # Any read reaching `Embeddings.side_table_reads_enabled?/0` would otherwise raise
+    # `Mox.UnexpectedCallError` in the nightly scale job. Per-test (not `setup_all`):
+    # a Mox stub is registered against the CALLING process, and `setup_all` runs in a
+    # different one.
+    Loopctl.DataCase.stub_embedding_read_path()
+    :ok
+  end
+
   setup_all do
     tenant =
       unboxed(fn ->

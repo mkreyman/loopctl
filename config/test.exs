@@ -650,3 +650,21 @@ config :loopctl, :custody_coverage_source, Loopctl.MockCustodyCoverage
 
 # No debounce in test: a drain immediately after a write must flush the batch.
 config :loopctl, :custody_flush_debounce_seconds, 0
+
+# US-41.1: the embedding read-path cutover decision is injected (see
+# `Loopctl.Embeddings.ReadPathBehaviour`). The production implementation reads a
+# `SystemConfig` flag cached in VM-GLOBAL `:persistent_term`, so selecting the
+# side-table path in a test used to mean mutating node-wide state and restoring it
+# in `on_exit`. That mutation leaked between modules: a test that had just asserted
+# the flag was on would run its query after the value had been reset, silently take
+# the legacy path, and fail with an empty result set that looked like a vector
+# recall bug. `Loopctl.DataCase.stub_all_defaults/0` stubs this mock to delegate to
+# the real `SystemConfigReadPath`, so every other test keeps production behaviour.
+config :loopctl, :embedding_read_path, Loopctl.MockEmbeddingReadPath
+
+# NB (#488 / US-41.1): `hnsw.iterative_scan` is deliberately NOT pinned here. It is the
+# PRODUCTION remedy for cross-tenant filtered ANN under-return, shipped config-gated OFF
+# behind the `SystemConfig` lever pending an operator flip. Turning it on suite-wide would
+# make CI stop exercising the shipped default and blind it to under-return regressions.
+# The TEST-side remedy for shared-HNSW-index recall flakes is per-test ORTHOGONAL vectors
+# (`Loopctl.DataCase.test_vec/2`, #487) — use that.
