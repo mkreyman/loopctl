@@ -20,6 +20,7 @@ defmodule Loopctl.DataCase do
   alias Loopctl.Custody.Coverage
   alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Embeddings.SystemConfigReadPath
+  alias Loopctl.Knowledge.StreamingExport.NoopBodyProbe
   alias Loopctl.Oban.FairShare
   alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Telemetry.ScaleMetrics
@@ -99,6 +100,13 @@ defmodule Loopctl.DataCase do
     end)
 
     stub_embedding_read_path()
+
+    # US-27.16: default to PRODUCTION behaviour — the streaming-export producer observes
+    # (and therefore retains) nothing. Only the bounded-memory scale gate overrides this,
+    # with a retaining closure, to prove its metric catches a materializing producer.
+    Mox.stub(Loopctl.MockStreamingExportBodyProbe, :probe, fn ->
+      &NoopBodyProbe.ignore/1
+    end)
 
     Mox.stub(Loopctl.MockHealthChecker, :check, fn ->
       {:ok,

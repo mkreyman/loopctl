@@ -18,7 +18,7 @@ defmodule Loopctl.MemoryUsage do
   Wired via config:
   `Application.compile_env(:loopctl, :memory_module, Loopctl.MemoryUsage.Default)`.
   The bounded-memory scale test injects a materializing producer (via the
-  `:export_force_materialize_for_test` flag) to PROVE the metric is load-bearing
+  `Loopctl.Knowledge.StreamingExport.BodyProbe` DI seam) to PROVE the metric is load-bearing
   (the ratio FAILS under the mutation) — mutation testing for AC-27.16.1.
   """
 

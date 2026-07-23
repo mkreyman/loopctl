@@ -114,6 +114,11 @@ config :loopctl,
   #   mid-bomb. Defaults 50 MB / 200 MB; tunable for very large knowledge bases.
   export_chunk_size: 200,
   export_max_links_per_article: 100,
+  # US-27.16: the streaming-export producer's per-body observation seam. Production
+  # observes nothing (the producer must NOT retain bodies — that is the property the
+  # bounded-memory gate protects); config/test.exs swaps in a Mox mock so the scale gate
+  # can inject a RETAINING probe and prove that metric is load-bearing.
+  streaming_export_body_probe: Loopctl.Knowledge.StreamingExport.NoopBodyProbe,
   export_max_concurrent_global: 2,
   export_max_concurrent_per_tenant: 1,
   export_max_stream_duration_ms: 600_000,

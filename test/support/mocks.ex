@@ -105,3 +105,17 @@ Mox.defmock(Loopctl.MockCustodyCoverage, for: Loopctl.Custody.CoverageBehaviour)
 # production behaviour unchanged); the US-41.1 read-path tests override it with
 # `Mox.stub/3`, which is scoped to the calling process.
 Mox.defmock(Loopctl.MockEmbeddingReadPath, for: Loopctl.Embeddings.ReadPathBehaviour)
+
+# US-27.16: DI seam for the streaming-export producer's per-body observation point. The
+# bounded-memory scale gate must prove its metric is LOAD-BEARING by turning the streaming
+# producer into a MATERIALIZING one, which needs a seam in the production emit path.
+# Before this mock that seam was an `Application.get_env` flag read ONCE PER ARTICLE, and
+# the scale test flipped it with `Application.put_env/3` — test-only branching on a
+# production hot path plus VM-wide mutation from a test (which `CLAUDE.md` forbids). The
+# DataCase default stub is a no-op (production behaviour, so every pre-existing export
+# test is unchanged); the mutation-check test overrides it with a RETAINING closure. Mox
+# stubs run in the CALLING process, so the retention lands in the producer process — where
+# the memory metric actually measures — with no production code aware of it.
+Mox.defmock(Loopctl.MockStreamingExportBodyProbe,
+  for: Loopctl.Knowledge.StreamingExport.BodyProbe
+)

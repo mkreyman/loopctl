@@ -67,50 +67,37 @@ defmodule Loopctl.CLI.ConfigTest do
     end
   end
 
+  # A map-backed env getter injected into Config.read/1. This exercises the OS-env override
+  # path WITHOUT System.put_env, which mutates BEAM-global env shared across every process —
+  # a real flake in this `async: true` suite (two of these tests both override LOOPCTL_SERVER
+  # and would race each other and any other async test reading it).
+  defp env_getter(overrides), do: fn var -> Map.get(overrides, var) end
+
   describe "environment variable overrides" do
     test "LOOPCTL_SERVER overrides file config" do
-      System.put_env("LOOPCTL_SERVER", "https://test.loopctl.io")
-
-      try do
-        config = Config.read()
-        assert config["server"] == "https://test.loopctl.io"
-      after
-        System.delete_env("LOOPCTL_SERVER")
-      end
+      config = Config.read(env_getter(%{"LOOPCTL_SERVER" => "https://test.loopctl.io"}))
+      assert config["server"] == "https://test.loopctl.io"
     end
 
     test "LOOPCTL_API_KEY overrides file config" do
-      System.put_env("LOOPCTL_API_KEY", "lc_test123")
-
-      try do
-        config = Config.read()
-        assert config["api_key"] == "lc_test123"
-      after
-        System.delete_env("LOOPCTL_API_KEY")
-      end
+      config = Config.read(env_getter(%{"LOOPCTL_API_KEY" => "lc_test123"}))
+      assert config["api_key"] == "lc_test123"
     end
 
     test "LOOPCTL_FORMAT overrides file config" do
-      System.put_env("LOOPCTL_FORMAT", "human")
-
-      try do
-        config = Config.read()
-        assert config["format"] == "human"
-      after
-        System.delete_env("LOOPCTL_FORMAT")
-      end
+      config = Config.read(env_getter(%{"LOOPCTL_FORMAT" => "human"}))
+      assert config["format"] == "human"
     end
 
     test "empty env var does not override" do
-      System.put_env("LOOPCTL_SERVER", "")
+      # Empty string must NOT override — the key stays whatever the file has.
+      config = Config.read(env_getter(%{"LOOPCTL_SERVER" => ""}))
+      refute config["server"] == ""
+    end
 
-      try do
-        config = Config.read()
-        # Empty string should not override -- the key should be whatever the file has
-        refute config["server"] == ""
-      after
-        System.delete_env("LOOPCTL_SERVER")
-      end
+    test "an unset env var (getter returns nil) does not override" do
+      config = Config.read(env_getter(%{}))
+      refute Map.has_key?(config, "server") and config["server"] == nil
     end
   end
 end
