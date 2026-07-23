@@ -5,6 +5,41 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.58.0 — 2026-07-22 (trust-tier capability discovery — #505)
+
+### Changed
+
+- **`get_tenant`** now documents (and the server now returns) a `capabilities` block:
+  which surfaces the tenant's `trust_tier` includes, as `surfaces`
+  (`"allowed"` / `"requires_human_anchor"`), `allowed`/`blocked` lists,
+  `descriptions`, and `remediation` when anything is blocked. An agent can read the
+  tier boundary UP FRONT instead of discovering it via a `403 custody_tier_required`
+  on each write.
+- **`create_project`** description now states the requirement it actually enforces —
+  orchestrator+ role AND a `human_anchored` tenant — and points an agent-rooted caller
+  at `create_kb_scope`, which establishes a repo-scoped project row for knowledge
+  without a custody surface. Previously the description promised "create a new project
+  in the current tenant" with no hint of the tier gate, so an agent-rooted tenant
+  could only learn the boundary by taking a 403.
+- The `custody_tier_required` **403 body** now embeds the same `capabilities` map (minus
+  the static per-surface `descriptions`, which belong on `get_tenant`) plus, where one
+  genuinely exists, `remediation.agent_native_alternative` naming the endpoint the caller
+  CAN use. The gate itself is unchanged.
+- The capability map states its own BOUNDS — `scope: "trust_tier_only"` and
+  `applies_to: "mutating_actions"`. The ROLE gate applies independently (an `allowed`
+  surface can still return `403 insufficient_role`), and READS stay open on every
+  surface, including blocked ones. Without those bounds the map would have relocated the
+  confident-then-403 failure onto the role axis and hidden reads a caller is entitled to.
+- The **role** 403 (`RequireRole`) now carries a stable `code: "insufficient_role"`,
+  `required_role`/`required_roles`, and the same capability block — an agent-role key on
+  an agent-rooted tenant was previously halted by the role gate BEFORE the tier gate and
+  never saw the alternative.
+- `remediation.enrollment_upgrade` is now a machine-actionable object
+  (`tools`, `endpoints`, `requires_human`, `docs`) describing the IN-PLACE upgrade —
+  enroll an authenticator against the tenant you already own. It was previously a bare
+  link to the signup ceremony, which reads as "create a second tenant" and strands the
+  knowledge the first one owns.
+
 ## 2.57.0 — 2026-07-22 (retention-sweep stall anomalies — #498)
 
 ### Changed

@@ -238,6 +238,120 @@ defmodule LoopctlWeb.ProjectControllerTest do
 
       assert json_response(conn, 403)["error"]["code"] == "custody_tier_required"
     end
+
+    # #505 — exact reproduction from the issue: an agent-rooted tenant calling
+    # create_project for its own repo. The 403 stands (it is L0 of the trust
+    # model), but it is no longer a dead end — it now says what IS open.
+    test "the 403 points at create_kb_scope and carries the tenant's capability map",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects", %{
+          "name" => "eCommerce Friendly",
+          "slug" => "ecommerce-friendly",
+          "repo_url" => "https://github.com/mkreyman/ecommerce-friendly"
+        })
+
+      error = json_response(conn, 403)["error"]
+
+      assert error["code"] == "custody_tier_required"
+
+      alternative = error["remediation"]["agent_native_alternative"]
+      assert alternative["tool"] == "create_kb_scope"
+      assert alternative["endpoint"] == "POST /api/v1/kb-scopes"
+      assert alternative["description"] =~ "kb"
+
+      assert "work_breakdown" in error["capabilities"]["blocked"]
+      assert "kb_project_scopes" in error["capabilities"]["allowed"]
+    end
+
+    # The population that FILED #505 holds an AGENT-role key (the default MCP
+    # shape, LOOPCTL_AGENT_KEY). Controller plugs run in declaration order, so
+    # with RequireRole mounted first that caller was halted by the bare role 403
+    # and never saw the alternative — the pre-#505 dead end, one plug earlier.
+    # The tier gate is therefore mounted BEFORE the role gate on :create.
+    test "an AGENT-role key on an agent-rooted tenant reaches the same actionable 403",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects", %{
+          "name" => "eCommerce Friendly",
+          "slug" => "ecommerce-friendly"
+        })
+
+      error = json_response(conn, 403)["error"]
+
+      assert error["code"] == "custody_tier_required"
+      assert error["remediation"]["agent_native_alternative"]["tool"] == "create_kb_scope"
+      assert "kb_project_scopes" in error["capabilities"]["allowed"]
+    end
+
+    # The role gate is orthogonal and still enforced — it just no longer hides the
+    # tier map behind a prose-only 403.
+    test "an AGENT-role key on a HUMAN-anchored tenant still 403s on role, with a code",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects", %{"name" => "w", "slug" => "w"})
+
+      error = json_response(conn, 403)["error"]
+
+      assert error["code"] == "insufficient_role"
+      assert error["required_role"] == "orchestrator"
+      assert error["capabilities"]["trust_tier"] == "human_anchored"
+    end
+
+    test "and that alternative actually works — the agent establishes a scope for its repo",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/kb-scopes", %{
+          "name" => "eCommerce Friendly",
+          "slug" => "ecommerce-friendly",
+          "repo_url" => "https://github.com/mkreyman/ecommerce-friendly"
+        })
+
+      assert json_response(conn, 201)["project"]["slug"] == "ecommerce-friendly"
+    end
+
+    # An alternative is only offered where it GENUINELY substitutes. Creating a
+    # kb scope is no substitute for deleting an existing work project, so the
+    # :delete mount is bare — telling an autonomous agent to create a new scope
+    # there would be invented guidance, which the plug's moduledoc forbids.
+    test "delete's 403 offers NO agent-native alternative, only the upgrade path",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> delete(~p"/api/v1/projects/#{Ecto.UUID.generate()}")
+
+      error = json_response(conn, 403)["error"]
+
+      assert error["code"] == "custody_tier_required"
+      refute Map.has_key?(error["remediation"], "agent_native_alternative")
+      assert error["remediation"]["enrollment_upgrade"]["docs"] =~ "tenant-signup"
+      # The capability map still ships — the 403 is still not a dead end.
+      assert "work_breakdown" in error["capabilities"]["blocked"]
+    end
   end
 
   describe "DELETE /api/v1/kb-scopes/:id (agent archive of own KB scope)" do

@@ -28,6 +28,46 @@ defmodule LoopctlWeb.TenantControllerTest do
       conn = get(conn, ~p"/api/v1/tenants/me")
       assert json_response(conn, 401)
     end
+
+    # #505 — an agent could previously only map its tier's boundary by taking a
+    # 403 per endpoint. get_tenant now advertises it up front.
+    test "advertises the tier's capabilities for an agent_rooted tenant", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> get(~p"/api/v1/tenants/me")
+
+      caps = json_response(conn, 200)["tenant"]["capabilities"]
+
+      assert caps["trust_tier"] == "agent_rooted"
+      assert "work_breakdown" in caps["blocked"]
+      assert "chain_of_custody" in caps["blocked"]
+      # ...and the surface it CAN use to establish a project row for its repo.
+      assert "kb_project_scopes" in caps["allowed"]
+      assert "knowledge_base" in caps["allowed"]
+      assert caps["remediation"]["enrollment_upgrade"]["docs"] =~ "tenant-signup"
+      assert is_binary(caps["descriptions"]["work_breakdown"])
+    end
+
+    test "advertises an unblocked capability set for a human_anchored tenant", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> get(~p"/api/v1/tenants/me")
+
+      caps = json_response(conn, 200)["tenant"]["capabilities"]
+
+      assert caps["trust_tier"] == "human_anchored"
+      assert caps["blocked"] == []
+      assert "work_breakdown" in caps["allowed"]
+      refute Map.has_key?(caps, "remediation")
+    end
   end
 
   describe "PATCH /api/v1/tenants/me" do

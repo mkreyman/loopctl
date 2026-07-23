@@ -22,6 +22,18 @@ defmodule LoopctlWeb.Plugs.RequireRole do
 
       plug RequireRole, [exact_role: :agent] when action in [:claim]
       plug RequireRole, [exact_role: [:orchestrator, :superadmin]] when action in [:save]
+
+  ## 403 body (#505)
+
+  Every 403 carries a stable `code` (`insufficient_role`) plus `required_role` /
+  `required_roles`, so a client branches on the code and never on the prose
+  `message` (`Loopctl.ApiSpec.Schemas.ErrorResponse`).
+
+  It also carries the tenant's TIER capability block, the same one
+  `RequireHumanAnchor` emits. Role and tier are two orthogonal gates on the same
+  endpoints and this plug is usually mounted FIRST, so an agent-role key on an
+  agent-rooted tenant would otherwise be halted here and never see the tier map
+  or the agent-native alternative — the pre-#505 dead end, one plug earlier.
   """
 
   @behaviour Plug
@@ -29,6 +41,7 @@ defmodule LoopctlWeb.Plugs.RequireRole do
   import Plug.Conn
 
   alias Loopctl.Auth.Role
+  alias Loopctl.Tenants.TierCapabilities
 
   @impl true
   def init(opts), do: Enum.into(opts, %{})
@@ -41,15 +54,11 @@ defmodule LoopctlWeb.Plugs.RequireRole do
     else
       roles_label = Enum.map_join(exact_roles, " or ", &to_string/1)
 
-      conn
-      |> put_status(:forbidden)
-      |> Phoenix.Controller.json(%{
-        error: %{
-          status: 403,
-          message: "This endpoint requires the #{roles_label} role"
-        }
-      })
-      |> halt()
+      forbid(
+        conn,
+        "This endpoint requires the #{roles_label} role",
+        %{required_roles: Enum.map(exact_roles, &to_string/1)}
+      )
     end
   end
 
@@ -57,15 +66,11 @@ defmodule LoopctlWeb.Plugs.RequireRole do
     if api_key.role == exact_role do
       conn
     else
-      conn
-      |> put_status(:forbidden)
-      |> Phoenix.Controller.json(%{
-        error: %{
-          status: 403,
-          message: "This endpoint requires the #{exact_role} role"
-        }
-      })
-      |> halt()
+      forbid(
+        conn,
+        "This endpoint requires the #{exact_role} role",
+        %{required_roles: [to_string(exact_role)]}
+      )
     end
   end
 
@@ -73,15 +78,11 @@ defmodule LoopctlWeb.Plugs.RequireRole do
     if Role.role_at_least?(api_key.role, required_role) do
       conn
     else
-      conn
-      |> put_status(:forbidden)
-      |> Phoenix.Controller.json(%{
-        error: %{
-          status: 403,
-          message: "Insufficient permissions. Required role: #{required_role}"
-        }
-      })
-      |> halt()
+      forbid(
+        conn,
+        "Insufficient permissions. Required role: #{required_role}",
+        %{required_role: to_string(required_role)}
+      )
     end
   end
 
@@ -100,6 +101,29 @@ defmodule LoopctlWeb.Plugs.RequireRole do
         message: "Authentication required"
       }
     })
+    |> halt()
+  end
+
+  # One shape for every role denial: a stable `code`, the required role(s), and
+  # the tenant's tier capability map so the caller can see what its tier DOES
+  # include without a second round trip (#505). `compact_for_tenant/1` drops the
+  # static per-surface descriptions — those belong on GET /tenants/me, not on
+  # every error.
+  defp forbid(conn, message, extra) do
+    base = Map.merge(extra, %{status: 403, code: "insufficient_role", message: message})
+
+    # No tenant assign at all means a superadmin key (or a pre-tenant pipeline):
+    # there is no tier to describe, and stamping the restrictive fallback map
+    # would assert a tier the caller is not on.
+    body =
+      case conn.assigns[:current_tenant] do
+        nil -> base
+        tenant -> Map.put(base, :capabilities, TierCapabilities.compact_for_tenant(tenant))
+      end
+
+    conn
+    |> put_status(:forbidden)
+    |> Phoenix.Controller.json(%{error: body})
     |> halt()
   end
 end

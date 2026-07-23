@@ -16,6 +16,7 @@ defmodule LoopctlWeb.TenantController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Tenants
+  alias Loopctl.Tenants.TierCapabilities
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -90,6 +91,11 @@ defmodule LoopctlWeb.TenantController do
       settings: tenant.settings,
       status: tenant.status,
       trust_tier: tenant.trust_tier,
+      # #505 — advertise the tier's surfaces UP FRONT so a caller can tell which
+      # operations its tenant includes without probing for a 403 on each write.
+      # Same map the `custody_tier_required` 403 embeds; one derivation, so the
+      # advertised set and the enforced gate cannot drift.
+      capabilities: TierCapabilities.for_tenant(tenant),
       token_data_retention_days: tenant.token_data_retention_days,
       inserted_at: tenant.inserted_at,
       updated_at: tenant.updated_at

@@ -19,6 +19,46 @@ defmodule LoopctlWeb.ProjectController do
 
   action_fallback LoopctlWeb.FallbackController
 
+  # PLUG ORDER IS LOAD-BEARING (#505). The tier gate is mounted BEFORE the role
+  # gate on purpose. Controller plugs run in declaration order and the first one
+  # to halt wins, so with the role gate first an :agent-role key — the default MCP
+  # shape, and the caller most likely to be on an agent-rooted tenant — was halted
+  # by RequireRole and never reached the tier 403 that names `create_kb_scope` as
+  # its agent-native alternative. That is the exact dead end #505 removes, one
+  # plug earlier. Both gates still apply; only which 403 the caller reads changes,
+  # and the tier 403 is the actionable one.
+  #
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  # NOTE: :create_kb_scope is deliberately NOT gated here — a :kb scope carries no
+  # chain-of-custody surface (RequireWorkProject bars work attachment), so an agent-rooted
+  # tenant may create one to partition its own knowledge. Extends owner decision #331.
+  #
+  # #505 — the 403 names `create_kb_scope` as the agent-native alternative. An
+  # agent-rooted tenant hitting this gate almost always wants "a project row for
+  # the repo I am on", which a :kb scope gives it without a custody surface; the
+  # 403 previously left it with no path forward but a human WebAuthn upgrade.
+  #
+  # :create ONLY. Creating a kb scope substitutes for creating a work project; it
+  # substitutes for NOTHING on :update/:delete of an existing work project (the
+  # kb-scope equivalents are archive_kb_scope / restore_kb_scope, which operate on
+  # a different row). The plug's moduledoc is explicit that an invented
+  # alternative is worse than none, so those two mount a bare gate.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor,
+       [
+         alternative: %{
+           tool: "create_kb_scope",
+           endpoint: "POST /api/v1/kb-scopes",
+           description:
+             "Creates a kind: kb project scope for this repo at agent role, with no " <>
+               "human anchor required. It partitions knowledge articles by repo but " <>
+               "cannot host epics/stories/dispatch — the work-breakdown surface stays " <>
+               "human-anchored by design."
+         }
+       ]
+       when action in [:create]
+
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:update, :delete]
+
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create, :update]
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
 
@@ -33,12 +73,6 @@ defmodule LoopctlWeb.ProjectController do
               :archive_kb_scope,
               :restore_kb_scope
             ]
-
-  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
-  # NOTE: :create_kb_scope is deliberately NOT gated here — a :kb scope carries no
-  # chain-of-custody surface (RequireWorkProject bars work attachment), so an agent-rooted
-  # tenant may create one to partition its own knowledge. Extends owner decision #331.
-  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :update, :delete]
 
   tags(["Projects"])
 
