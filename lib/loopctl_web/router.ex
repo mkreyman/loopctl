@@ -158,6 +158,13 @@ defmodule LoopctlWeb.Router do
     # of a project's live channel. project_id/since/limit query params; the tenant
     # is key-derived, never from params.
     get "/channel/posts", ChannelPostController, :index
+    # QUARANTINE review surface (issue #499). Declared BEFORE `get
+    # "/channel/posts/:id"` so the static path is matched first and is never
+    # swallowed by the `:id` capture. role: :user — it returns the FULL bodies of
+    # posts the secret rescan flagged, and is the ONLY read that resolves them (every
+    # agent-facing read hides a quarantined row, and the operator alert carries field
+    # NAMES only). Without it, quarantine-over-delete would be unreviewable.
+    get "/channel/posts/quarantined", ChannelPostController, :quarantined
     # channel post full-body read (US-40.D1): agent-role, tenant-scoped, oracle-safe
     # fetch of ONE post's FULL body — the explicit companion to the bounded-preview
     # list read above. Declared AFTER `get "/channel/posts"` so the static list path
@@ -191,6 +198,13 @@ defmodule LoopctlWeb.Router do
     # semantic novelty gate + an explicit secret scan — never a bypass. The static
     # `/graduate` suffix does NOT shadow `get "/channel/posts/:id"`.
     post "/channel/posts/:id/graduate", ChannelPostController, :graduate
+
+    # RELEASE a quarantined post (issue #499) — the operator's false-positive
+    # exoneration path, the non-destructive counterpart to the DELETE redact path.
+    # role: :user + RequireHumanAnchor (enforced on the action): an agent must never be
+    # able to un-hide a post the security rescan quarantined. Audited in-transaction.
+    # The static `/release` suffix does NOT shadow `get "/channel/posts/:id"`.
+    post "/channel/posts/:id/release", ChannelPostController, :release
 
     # Repo Coordination Bus CLAIM surface (Epic 40, US-40.B1) — exactly-once handoff
     # claims. INSERT-to-claim: the first inserter on (tenant_id, project_id, ref)

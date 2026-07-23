@@ -65,4 +65,36 @@ defmodule Loopctl.Security.SecretDenylistTest do
       refute SecretDenylist.any_contains_secret?([nil, "clean", 42, %{}])
     end
   end
+
+  describe "revision/0 <-> pattern-set binding (issue #499)" do
+    # The pattern set as of the DECLARED revision below. Derived mechanically from the
+    # regex sources by `SecretDenylist.fingerprint/0`.
+    @declared_fingerprint 115_481_899
+    @declared_revision ~U[2026-07-22 00:00:00Z]
+
+    # THIS TEST IS THE MECHANICAL LINK between the pattern set and the retroactivity
+    # lever. The rescan worker (issue #499) re-examines an already-scanned post ONLY
+    # when `rescanned_at < revision/0`, so a commit that adds or loosens a credential
+    # shape WITHOUT bumping @revision ships a write-time-only pattern: the retroactive
+    # sweep never happens, and telemetry still reports healthy zero-hit runs — there is
+    # no runtime signal separating "nothing to find" from "retroactivity disabled".
+    # A code comment cannot enforce that. This assertion can.
+    test "the pattern set has not changed since the declared revision" do
+      assert SecretDenylist.fingerprint() == @declared_fingerprint, """
+      The secret denylist pattern set CHANGED.
+
+      Because retroactive rescanning keys off SecretDenylist.revision/0, a pattern edit
+      without a revision bump silently applies to NEW writes only — every post written
+      before the deploy is never re-examined (issue #499).
+
+      In THIS commit:
+        1. bump @revision in lib/loopctl/security/secret_denylist.ex to the current
+           UTC instant (rounded to the second), and
+        2. update @declared_fingerprint / @declared_revision in this test to
+           #{SecretDenylist.fingerprint()} and the same instant.
+      """
+
+      assert SecretDenylist.revision() == @declared_revision
+    end
+  end
 end

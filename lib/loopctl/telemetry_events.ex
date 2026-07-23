@@ -378,6 +378,58 @@ defmodule Loopctl.TelemetryEvents do
   def sweep_stall_detection_failed,
     do: [:loopctl, :knowledge, :sweep_stall_detection_failed]
 
+  @doc """
+  The retroactive US-39.1 denylist rescan (`Loopctl.Workers.ChannelPostRescanWorker`)
+  COMPLETED a run (issue #499). Emitted on EVERY successful run, including a run that
+  scanned nothing and quarantined nothing — for the same reason as
+  `channel_post_swept/0`: a success-only-when-non-zero signal cannot distinguish
+  "nothing to do" from "never ran".
+
+  Flat name (no `:start`, no `:duration`) — see `channel_post_swept/0`.
+
+  ## Payload (counts + bounded ints only — never post bodies or matched values)
+
+    * `measurements`: `%{scanned: n, quarantined: n, backlog: n}` — posts examined and
+      posts quarantined in this run, plus the posts STILL due after it. `backlog` is the
+      starvation signal: a run whose whole budget went to a continuously refilling
+      never-scanned head, while the `rescanned_at < revision` backlog never advanced,
+      would otherwise look byte-identical to a healthy sweep that drained everything.
+    * `metadata`: `%{limit: n}` — the effective per-run batch bound after the
+      `min(limit, @batch_size)` clamp.
+  """
+  def channel_post_rescanned, do: [:loopctl, :coordination, :channel_post_rescanned]
+
+  @doc """
+  The retroactive denylist rescan FAILED (issue #499). Emitted from the worker's
+  rescue/catch clauses immediately before the failure is RE-RAISED/RE-EXITED, so Oban
+  still records it and retries — the telemetry never swallows the fault.
+
+  Flat name for the same reason as `channel_post_rescanned/0`.
+
+  ## Payload (bounded tags only — never a PG message body, SQL, or bound params)
+
+    * `measurements`: `%{count: 1}`.
+    * `metadata`: `%{limit, error_class}` where `error_class` is the raised exception's
+      MODULE name or the literal `"exit"` for a non-exception process exit.
+  """
+  def channel_post_rescan_failed, do: [:loopctl, :coordination, :channel_post_rescan_failed]
+
+  @doc """
+  ONE live channel post was QUARANTINED by the retroactive denylist rescan (#499) —
+  i.e. a credential shape that the write-time gate did not know about at write time is
+  present on a post that has been re-broadcast into every new session on that repo.
+
+  Sibling of the write-time `[:loopctl, :coordination, :secret_blocked]` signal, and
+  carries the same bounded metadata shape.
+
+  ## Payload (bounded tags only — NEVER the body, the field value, or the match)
+
+    * `measurements`: `%{count: 1}`.
+    * `metadata`: `%{tenant_id, project_id, agent_id, fields}` where `fields` is the
+      comma-joined list of offending FIELD NAMES (`"body,refs"`) — names only.
+  """
+  def channel_post_quarantined, do: [:loopctl, :coordination, :channel_post_quarantined]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -400,7 +452,10 @@ defmodule Loopctl.TelemetryEvents do
       article_write(),
       channel_post_swept(),
       channel_post_sweep_failed(),
-      sweep_stall_detection_failed()
+      sweep_stall_detection_failed(),
+      channel_post_rescanned(),
+      channel_post_rescan_failed(),
+      channel_post_quarantined()
     ]
   end
 end

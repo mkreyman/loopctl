@@ -429,6 +429,15 @@ defmodule Loopctl.ObanConfig do
          # Bounded per run on AdminRepo (BYPASSRLS). Keep in sync with the crontab
          # assertion in oban_plugins_config_test.exs.
          {"*/5 * * * *", Loopctl.Workers.ChannelClaimSweeper},
+         # Issue #499: retroactive secret rescan of LIVE channel_posts against the
+         # current SecretDenylist patterns — the write-time US-39.1 gate never
+         # re-examines a post written before a pattern existed. Quarantines hits
+         # (never auto-deletes), audits each detection, and raises the #498 operator
+         # alert. Bounded single batch per run on AdminRepo (BYPASSRLS), resumable via
+         # channel_posts.rescanned_at. Hourly is enough: the gate already blocks the
+         # known shapes at write time, so this only chases pattern-set updates. Keep in
+         # sync with the crontab assertion in oban_plugins_config_test.exs.
+         {"23 * * * *", Loopctl.Workers.ChannelPostRescanWorker},
          # US-38.2: prune expired windows from the cluster-global Postgres rate
          # limiter's counter table. A cheap index-range delete; a no-op when the
          # Postgres limiter is unselected (table empty). Keep in sync with the
