@@ -1312,9 +1312,12 @@ defmodule Loopctl.Coordination do
   quarantine-over-delete was chosen to avoid.
 
   Clears `quarantined_at`/`quarantine_reason` (so every read surfaces the post again) and
-  stamps `quarantine_released_at`, which permanently removes the row from the rescan
-  candidate set — otherwise the next run, under the SAME patterns that flagged it, would
-  re-quarantine it within the hour and the release would be cosmetic.
+  stamps `quarantine_released_at`, which removes the row from the rescan candidate set for
+  the denylist revision the operator judged it against — otherwise the next run, under the
+  SAME patterns that flagged it, would re-quarantine it within the hour and the release
+  would be cosmetic. The exemption is revision-SCOPED, not permanent: a later denylist
+  revision bump makes a released row a candidate again, since that revision may add a
+  wholly unrelated credential shape the row does carry.
 
   Tenant-scoped and ORACLE-SAFE exactly like `delete_post/5`: a malformed, nonexistent,
   foreign-tenant, NOT-quarantined, or UNAUTHORIZED id all return `{:error, :not_found}` —
