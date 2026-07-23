@@ -10,7 +10,7 @@ defmodule Loopctl.ImportExportAcNormalizationTest do
 
   alias Loopctl.ImportExport
 
-  defp base_payload(story_attrs \\ %{}) do
+  defp base_payload(story_attrs) do
     story =
       Map.merge(
         %{

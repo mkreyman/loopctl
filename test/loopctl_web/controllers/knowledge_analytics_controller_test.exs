@@ -108,7 +108,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
       assert row["access_count"] == 1
     end
 
-    test "offset pages the ranking to completeness (no imposed top-N cap)", %{conn: conn} do
+    test "offset pages the ranking to completeness (no imposed top-N cap)", %{conn: _conn} do
       tenant = fixture(:tenant)
       {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
       {_raw, agent} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
@@ -227,7 +227,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
       assert body["meta"]["days_unused"] == 7
     end
 
-    test "offset pages the full unused set to completeness (no imposed cap)", %{conn: conn} do
+    test "offset pages the full unused set to completeness (no imposed cap)", %{conn: _conn} do
       tenant = fixture(:tenant)
       {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 

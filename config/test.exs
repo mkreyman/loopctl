@@ -17,7 +17,18 @@ import Config
 test_concurrency = min(System.schedulers_online(), 8)
 test_pool_size = test_concurrency * 2
 
-config :ex_unit, max_cases: test_concurrency
+# `capture_log: true` — the suite deliberately exercises a LOT of warn/error paths
+# (fail-closed guards, shed/overload branches, degraded-dependency fallbacks), and every
+# one of those logs printed straight into the test stream. With the `[:level, ": ",
+# :message]` default-handler template configured below and metadata-only structured logs,
+# they rendered as hundreds of bare `warning:` / `error:` tokens interleaved with the
+# progress dots — noise that buries a REAL warning and makes a green run look broken.
+#
+# Capturing attaches each test's log output TO THAT TEST instead: a FAILING test still
+# prints its logs, where they are actually diagnostic; a passing one stays quiet. Tests
+# asserting on log content via `ExUnit.CaptureLog.capture_log/1` are unaffected — that
+# captures at the test level and composes with this.
+config :ex_unit, max_cases: test_concurrency, capture_log: true
 
 # Configure your database
 #

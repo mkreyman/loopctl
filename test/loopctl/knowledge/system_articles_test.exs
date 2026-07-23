@@ -13,7 +13,7 @@ defmodule Loopctl.Knowledge.SystemArticlesTest do
 
   setup :verify_on_exit!
 
-  defp create_system_article(attrs \\ %{}) do
+  defp create_system_article(attrs) do
     base = %{
       title: "System Article #{System.unique_integer([:positive])}",
       body: "System article body content for testing.",
