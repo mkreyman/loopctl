@@ -333,18 +333,17 @@ defmodule Loopctl.Knowledge.StreamingExport do
 
   defp emit_article_page(writer, tenant_id, format, _project_id, page) do
     links_by_article = load_bounded_links(tenant_id, page)
+    body_probe = body_probe()
 
     Enum.reduce_while(page, {:ok, writer}, fn row, {:ok, writer} ->
       article = to_article(row)
       {links, truncated?} = Map.get(links_by_article, row.id, {[], false})
 
-      # MUTATION-CHECK seam (#1, test-only, default OFF): when the
-      # `:export_force_materialize_for_test` flag is set, retain every article body in
-      # the producer process so the bounded-memory test can confirm its metric is
-      # LOAD-BEARING (i.e. that a materializing producer makes the ratio FAIL). The
-      # config is never set outside the mutation-check test, so prod/normal exports
-      # never retain.
-      maybe_materialize_for_test(row.body)
+      # Injected observation seam (`Loopctl.Knowledge.StreamingExport.BodyProbe`). The
+      # production impl is a no-op; the bounded-memory scale gate injects a RETAINING probe
+      # to prove that metric is load-bearing. Resolved once per page (see `body_probe/0`),
+      # so this is a plain fun call per row — no config lookup, no behaviour dispatch.
+      body_probe.(row.body)
 
       ctx = %{
         links: links,
@@ -363,21 +362,16 @@ defmodule Loopctl.Knowledge.StreamingExport do
     e -> {:error, e, writer}
   end
 
-  # MUTATION-CHECK seam (#1): default no-op. Only when the test flag is set does this
-  # accumulate bodies in the process dictionary (the producer process), turning the
-  # streaming producer into a materializing one — so the scale test can prove the
-  # bounded-memory metric actually catches it (ratio FAILS under the mutation).
-  @materialize_key {__MODULE__, :materialized_bodies}
-
-  defp maybe_materialize_for_test(body) do
-    if Application.get_env(:loopctl, :export_force_materialize_for_test, false) do
-      acc = Process.get(@materialize_key, [])
-      # Copy the binary so it's RETAINED by this process (a sub-binary of the row
-      # would be reclaimed with the row); :binary.copy forces a fresh refc binary.
-      Process.put(@materialize_key, [:binary.copy(body || <<>>) | acc])
-    end
-
-    :ok
+  # Config-based DI (`CLAUDE.md`: behaviours + `Application.get_env`, never opts, never
+  # `put_env` from a test). Production resolves to `NoopBodyProbe`; `config/test.exs`
+  # points at a Mox mock whose DEFAULT stub is equally a no-op, so only the one scale test
+  # that injects a retaining probe sees any retention.
+  defp body_probe do
+    Application.get_env(
+      :loopctl,
+      :streaming_export_body_probe,
+      Loopctl.Knowledge.StreamingExport.NoopBodyProbe
+    ).probe()
   end
 
   # --- bounded per-page link preload (AC-27.16.3/.5, #7 truncation marker) ---

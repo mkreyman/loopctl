@@ -339,6 +339,11 @@ config :loopctl, :oban_orphan_count_checker, Loopctl.MockObanOrphanCountChecker
 config :loopctl, :ingestion_backlog_counter, Loopctl.MockBacklogCounter
 
 # DI: Use mock rate limiter in tests
+# US-27.16: the streaming-export body probe (see Loopctl.Knowledge.StreamingExport.BodyProbe).
+# DataCase's default stub is a no-op, matching production, so every existing export test is
+# unchanged; only the bounded-memory scale gate injects a retaining probe.
+config :loopctl, :streaming_export_body_probe, Loopctl.MockStreamingExportBodyProbe
+
 config :loopctl, :rate_limiter, Loopctl.MockRateLimiter
 
 # Trusted-proxy range for the shared Loopctl.RemoteIp resolver in tests. Headers

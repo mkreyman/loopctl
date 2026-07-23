@@ -44,6 +44,39 @@ defmodule Loopctl.Knowledge.StreamingExportScaleTest do
   # requires `:manual` mode). Kept as a thin seam so the call sites read clearly.
   defp unboxed(fun), do: fun.()
 
+  # Mox wiring is PER-TEST, not `setup_all`, and that placement is load-bearing.
+  #
+  # The export is served by a REAL HTTP server whose handler processes are outside any
+  # per-test Mox context, so the stubs must be GLOBAL for those handlers to resolve them
+  # (`set_mox_global/0` is valid here — `async: false`). But in global mode Mox lets ONLY
+  # the OWNER process register stubs. Owning global mode from `setup_all` therefore makes
+  # the whole module read-only for stubs: the MUTATION CHECK below, which must inject a
+  # retaining body probe from the TEST BODY, raises
+  # `ArgumentError: cannot add expectations/stubs ... Mox is in global mode`.
+  #
+  # Running this per test makes EACH test process the owner for its own duration, so both
+  # `setup` and the test body can register stubs. Mox releases global mode when the owner
+  # exits, so the next test re-acquires it cleanly. Same pattern as
+  # `vector_endpoint_e2e_latency_scale_test.exs`.
+  setup do
+    Mox.set_mox_global()
+
+    # `config/test.exs` points EVERY injected collaborator at a Mox mock for the whole
+    # test env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed
+    # them. The Bandit handler processes run the FULL authenticated pipeline, so an
+    # export request reaches far more collaborators than the clock alone (the rate
+    # limiter among them) — hand-picking mocks one at a time is how this file kept
+    # breaking. `stub_all_defaults/0` is the single source of truth and a superset,
+    # so a mock added to DataCase is covered here automatically. It also installs the
+    # PRODUCTION (no-op) default for the streaming-export body probe, which the mutation
+    # check overrides.
+    Loopctl.DataCase.stub_all_defaults()
+
+    Mox.stub(Loopctl.MockClock, :utc_now, &DateTime.utc_now/0)
+
+    :ok
+  end
+
   setup_all do
     # The export is served by a REAL HTTP server whose request handlers run in
     # separate processes that check out their OWN repo connections. Sandbox `:manual`
@@ -54,29 +87,6 @@ defmodule Loopctl.Knowledge.StreamingExportScaleTest do
     Sandbox.mode(Loopctl.AdminRepo, :auto)
     Sandbox.mode(Loopctl.HeavyReadRepo, :auto)
     on_exit(fn -> Sandbox.mode(Loopctl.AdminRepo, :manual) end)
-
-    # The real HTTP server runs the request pipeline in handler processes that are
-    # OUTSIDE the per-test Mox context (which DataCase/ConnCase set up). The rate
-    # limiter plug calls the injected clock mock, so it must be GLOBALLY stubbed for
-    # those handler processes to resolve it. `set_mox_global` is appropriate here —
-    # this module is `async: false`.
-    Mox.set_mox_global()
-
-    # `config/test.exs` points EVERY injected collaborator at a Mox mock for the whole
-    # test env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed
-    # them. The Bandit handler processes run the FULL authenticated pipeline, so an
-    # export request reaches far more collaborators than the clock alone (the rate
-    # limiter among them) — hand-picking mocks one at a time is how this file kept
-    # breaking. `stub_all_defaults/0` is the single source of truth and a superset,
-    # so a mock added to DataCase is covered here automatically.
-    #
-    # It MUST be here in `setup_all`, NOT a per-test `setup`: `set_mox_global/0` above
-    # makes THIS process the global owner, and in global mode Mox lets ONLY the owner
-    # register stubs — a `Mox.stub` from the per-test setup (a different process) raises
-    # ArgumentError and fails every test in the module before its body runs.
-    Loopctl.DataCase.stub_all_defaults()
-
-    Mox.stub(Loopctl.MockClock, :utc_now, &DateTime.utc_now/0)
 
     # The big tenant: ~80k committed articles (prod floor). A separate SMALL tenant
     # gives the 500-article memory baseline for the ratio assertion.
@@ -160,15 +170,31 @@ defmodule Loopctl.Knowledge.StreamingExportScaleTest do
       normal_big = measure_export(ctx.port, ctx.user_key, "/api/v1/knowledge/okf/export")
       normal_ratio = normal_big.peak_retained / small_floor
 
-      # Force the producer to retain every body (the materializing mutation).
-      Application.put_env(:loopctl, :export_force_materialize_for_test, true)
+      # Force the producer to retain every body (the materializing mutation) by INJECTING a
+      # retaining probe, not by mutating global config. `Mox.stub/3` runs the closure in the
+      # CALLING process — here the Bandit handler running the export — so the copied binaries
+      # are retained in the producer process, which is exactly where the telemetry measures
+      # peak retained bytes.
+      #
+      # `:binary.copy/1` is required: `row.body` is a sub-binary of the DB result, which
+      # would be reclaimed along with the row. Copying forces a fresh refc binary that the
+      # producer genuinely holds — without it the "mutation" would retain nothing and the
+      # check would pass vacuously.
+      Mox.stub(Loopctl.MockStreamingExportBodyProbe, :probe, fn ->
+        key = {__MODULE__, :materialized_bodies}
 
-      mutated_big =
-        try do
-          measure_export(ctx.port, ctx.user_key, "/api/v1/knowledge/okf/export")
-        after
-          Application.delete_env(:loopctl, :export_force_materialize_for_test)
+        fn body ->
+          Process.put(key, [:binary.copy(body || <<>>) | Process.get(key, [])])
+          :ok
         end
+      end)
+
+      # No cleanup needed, and that is the point of the DI seam: the stub is scoped to THIS
+      # test's Mox global-mode ownership, which is re-established per test in `setup`, so
+      # the retaining probe cannot outlive this test even if the measurement below raises.
+      # The old `Application.put_env` + `delete_env` pair had exactly that failure mode — a
+      # raise in between left a materializing producer configured for the rest of the VM.
+      mutated_big = measure_export(ctx.port, ctx.user_key, "/api/v1/knowledge/okf/export")
 
       mutated_ratio = mutated_big.peak_retained / small_floor
 

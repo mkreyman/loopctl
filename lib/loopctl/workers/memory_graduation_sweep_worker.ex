@@ -102,9 +102,9 @@ defmodule Loopctl.Workers.MemoryGraduationSweepWorker do
   @actor_opts [actor_type: "system", actor_label: "memory_graduation_sweep"]
 
   @impl Oban.Worker
-  def perform(%Oban.Job{}) do
-    cap = Memory.graduation_max_per_run()
-    candidates = candidate_memories()
+  def perform(%Oban.Job{args: args}) do
+    cap = resolve_cap(args)
+    candidates = candidate_memories(cap)
 
     {processed, tally} =
       Enum.reduce_while(candidates, {0, %{}}, fn memory, {processed, tally} ->
@@ -199,9 +199,20 @@ defmodule Loopctl.Workers.MemoryGraduationSweepWorker do
   #      spread fairly: a tenant with few hot memories is fully served early instead of
   #      waiting behind a hotter tenant's long tail. With one active tenant the interleave
   #      is a no-op, so budget is still fully utilized.
-  defp candidate_memories do
+  # The per-run execution budget. Defaults to the configured `graduation_max_per_run/0`,
+  # but an explicit `"max_per_run"` in the Oban job args overrides it for THIS invocation.
+  # Job args are per-job and travel with the job row, so a caller (or a test) can bound a
+  # single tick WITHOUT mutating VM-global config — the async-safe alternative to
+  # `Application.put_env`, which would leak the cap into every other test/job in the VM.
+  defp resolve_cap(args) do
+    case args do
+      %{"max_per_run" => n} when is_integer(n) and n > 0 -> n
+      _ -> Memory.graduation_max_per_run()
+    end
+  end
+
+  defp candidate_memories(cap) do
     threshold = Memory.graduation_recall_threshold()
-    cap = Memory.graduation_max_per_run()
 
     # Round-robin serves >=1 memory per tenant and perform/1 processes at most `cap`
     # memories, so at most `cap` tenants can contribute in one tick — never fetch more.

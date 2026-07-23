@@ -198,11 +198,9 @@ defmodule Loopctl.Workers.MemoryGraduationSweepWorkerTest do
       _a = hot_memory(tenant.id, recall_count: 9, text: "hot A")
       _b = hot_memory(tenant.id, recall_count: 8, text: "hot B")
 
-      prev = Application.get_env(:loopctl, :memory_graduation_max_per_run)
-      Application.put_env(:loopctl, :memory_graduation_max_per_run, 1)
-      on_exit(fn -> restore(:memory_graduation_max_per_run, prev) end)
-
-      assert :ok = perform_job(MemoryGraduationSweepWorker, %{})
+      # Cap this ONE tick to 1 via job args — async-safe (per-job, no VM-global mutation),
+      # unlike the old `Application.put_env` which leaked into every concurrent test.
+      assert :ok = perform_job(MemoryGraduationSweepWorker, %{"max_per_run" => 1})
 
       # Exactly one graduated this run (the cap); the other remains for the next tick.
       assert length(articles_for(tenant.id)) == 1
@@ -227,18 +225,12 @@ defmodule Loopctl.Workers.MemoryGraduationSweepWorkerTest do
       _h2 = hot_memory(hot.id, recall_count: 8, text: "hot tenant fact B")
       cool = hot_memory(other.id, recall_count: 5, text: "other tenant fact")
 
-      prev = Application.get_env(:loopctl, :memory_graduation_max_per_run)
-      Application.put_env(:loopctl, :memory_graduation_max_per_run, 2)
-      on_exit(fn -> restore(:memory_graduation_max_per_run, prev) end)
-
-      assert :ok = perform_job(MemoryGraduationSweepWorker, %{})
+      # Cap this ONE tick to 2 via job args (per-job, async-safe — no global mutation).
+      assert :ok = perform_job(MemoryGraduationSweepWorker, %{"max_per_run" => 2})
 
       # The cooler tenant is graduated within the shared budget — not starved.
       refute is_nil(reload(cool).graduated_at)
       assert [_one] = articles_for(other.id)
     end
   end
-
-  defp restore(key, nil), do: Application.delete_env(:loopctl, key)
-  defp restore(key, val), do: Application.put_env(:loopctl, key, val)
 end
