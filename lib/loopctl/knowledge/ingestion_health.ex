@@ -203,6 +203,13 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   # reserved, non-article sentinel (precedent: @unstamped_source_type below).
   @sweep_source_type "channel_post_sweep"
 
+  # Fixed sentinel `source_type` for the retroactive denylist rescan detector (#499),
+  # for exactly the same reason as @sweep_source_type: a quarantined coordination post
+  # is not an article source_type, but `ingestion_anomalies.source_type` is NOT NULL and
+  # the unresolved-unique partial index keys on it. Distinct from @sweep_source_type so
+  # a retention stall and a credential detection never collide on that index.
+  @rescan_source_type "channel_post_rescan"
+
   # Sentinel `source_type` for the NULL/unstamped write bucket. `source_type` on a
   # KB write is advisory + nullable, so the MAJORITY of agent captures (patterns,
   # decisions, session findings) omit it — those rejected writes land in the
@@ -407,6 +414,14 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   """
   @spec sweep_source_type() :: String.t()
   def sweep_source_type, do: @sweep_source_type
+
+  @doc """
+  Reserved sentinel `source_type` under which `:secret_detected` anomalies are recorded
+  (`"channel_post_rescan"`, issue #499). A quarantined coordination post is not an
+  article source_type; see the module attribute for why a sentinel is required.
+  """
+  @spec rescan_source_type() :: String.t()
+  def rescan_source_type, do: @rescan_source_type
 
   defp config, do: Application.get_env(:loopctl, :ingestion_health, [])
 

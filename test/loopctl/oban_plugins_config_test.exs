@@ -196,6 +196,35 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "#499: ChannelPostRescanWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.ChannelPostRescanWorker} -> true
+          {_schedule, Loopctl.Workers.ChannelPostRescanWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the ChannelPostRescanWorker entry exists in the crontab", %{entry: entry} do
+      assert entry,
+             "expected a ChannelPostRescanWorker crontab entry that retroactively rescans " <>
+               "live channel_posts against the current secret denylist (#499)"
+    end
+
+    test "its schedule is the hourly rescan", %{entry: entry} do
+      schedule = elem(entry, 0)
+      assert schedule == "23 * * * *"
+    end
+  end
+
   describe "US-35.3: sth_sweep_cron/0 (config-based DI, runtime-tunable)" do
     test "defaults to a 5-minute sweep when STH_SWEEP_CRON is unset" do
       # STH_SWEEP_CRON is not set in the test environment, so the default applies.
