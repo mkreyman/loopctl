@@ -74,6 +74,44 @@ defmodule Loopctl.Coordination do
   @max_lease_seconds 86_400
   @claim_done_retention_days 7
 
+  # US-40.4 ADVISORY FILE SOFT-LOCKS — deliberately NOT the exactly-once handoff
+  # claim above. A soft-lock is a HINT ("I'm editing lib/foo.ex") surfaced on the
+  # channel; it NEVER blocks anyone and TWO sessions may hold one on the same file
+  # (AC-40.4.4). It is built entirely on `channel_posts` (no new table): a keyed
+  # post under the `claim:<target>` key convention with a SHORT, caller-influenced,
+  # SERVER-CLAMPED TTL.
+  #
+  # NAMING (load-bearing): `claim/5`, `release/5` and `done/5` are the exactly-once
+  # HANDOFF claim (US-40.B1, `channel_claims`). The soft-lock is `lock_file/5` /
+  # `unlock_file/5` / `active_locks/3` precisely so the two primitives can never be
+  # conflated — the key PREFIX is the only thing they share, and only because the
+  # story fixed that convention before the handoff claim existed as a table.
+  @lock_key_prefix "claim:"
+
+  # The soft-lock TTL clamp (AC-40.4.1). This is the ONE place `expires_at` is
+  # caller-influenced — every other post is fixed at `now + @retention_days` — so
+  # the bounds are a STATED INVARIANT, not a soft default:
+  #
+  #   * floor 60s — below a minute the lock expires before a peer's next channel
+  #     read and buys nothing;
+  #   * ceiling 3600s (60 min) — a soft-lock must NEVER outlive the editing session
+  #     that took it. A crashed/killed session's lock self-expires within the hour
+  #     via `expires_at` (reads filter it out IMMEDIATELY; `ChannelPostSweeper`
+  #     reaps the row), so no dead session can sit on a file indefinitely.
+  #
+  # The override applies ONLY on the `claim:`-prefixed key path (`soft_lock_key?/1`)
+  # so an ordinary post can never shorten (evade the audit/read window) or lengthen
+  # channel retention.
+  @min_lock_ttl_seconds 60
+  @max_lock_ttl_seconds 3600
+  @default_lock_ttl_seconds 900
+
+  # Hard safety cap on ONE page of the pinned active-lock read. Locks are short-lived
+  # (<= @max_lock_ttl_seconds) so the live set is small by construction; this bounds
+  # the pathological case (a runaway locker) without truncating a normal repo's set.
+  @default_active_locks_limit 100
+  @max_active_locks_limit 200
+
   # Read-bound convention (US-39.3): the `channel_recent` endpoint defaults to 25
   # rows and CLAMPS a larger `?limit=` to 100 (not a 400) — see AC-39.3.3. These
   # are the single source of truth for both the context primitive and the HTTP
@@ -534,7 +572,13 @@ defmodule Loopctl.Coordination do
           tenant_id: tenant_id,
           project_id: project_id,
           agent_id: agent_id,
-          expires_at: default_expires_at()
+          # US-40.4: fixed at `now + @retention_days` for EVERY post except an
+          # advisory soft-lock (`claim:` key), whose TTL is caller-influenced and
+          # server-clamped. `expires_at` is set on the STRUCT and never cast from
+          # attrs, so no request body can reach it directly; and because the keyed
+          # upsert FULL-REPLACES `expires_at` with `EXCLUDED.expires_at`, a
+          # re-lock from the same slot refreshes the short TTL automatically.
+          expires_at: resolve_expires_at(attrs)
         }
         |> ChannelPost.create_changeset(attrs)
         |> put_provenance_changes(attrs)
@@ -722,6 +766,334 @@ defmodule Loopctl.Coordination do
     )
     |> AdminRepo.exists?()
   end
+
+  # ---------------------------------------------------------------------------
+  # US-40.4 — ADVISORY FILE SOFT-LOCKS
+  #
+  # NOT the exactly-once handoff claim (`claim/5`/`release/5`/`done/5` +
+  # `channel_claims`). A soft-lock is a collision-avoidance HINT on a FILE target:
+  # it is advisory, it NEVER blocks a caller, and two sessions MAY hold one on the
+  # same file simultaneously. Never cite this primitive as the handoff-claim
+  # mechanism, and never merge the two.
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Takes (or REFRESHES) an ADVISORY soft-lock on a file `target` — US-40.4.
+
+  This posts a normal channel post carrying the `"#{@lock_key_prefix}<target>"` key
+  convention, a `refs` entry `[%{"type" => "file", "value" => target}]`, and a
+  SHORT server-clamped TTL, through the SAME `post/4` write path every other post
+  uses — so it inherits the project-membership gate, the secret denylist, the audit
+  write, and the keyed-slot upsert without a second copy of any of them.
+
+  ## Advisory — it NEVER blocks (AC-40.4.1 / AC-40.4.4)
+
+  There is NO server-side exclusion: a second session (or a second agent) locking
+  the SAME target succeeds and both locks are surfaced. This is coordination, not a
+  mutex — the reading agent decides what to do with the hint. Nothing here ever
+  prevents an edit.
+
+  ## Slot identity, refresh and release
+
+  A lock occupies the caller's HARDENED 5-column slot
+  `(tenant_id, project_id, agent_id, session_id, key)` — the
+  `channel_posts_session_key_uidx` rebuilt in migration
+  `20260718000000_harden_channel_posts_slot_and_ordering` (the server-stamped
+  `agent_id` is part of the slot key; it is NOT the old 4-column form). So the SAME
+  session re-locking the same target UPSERTS in place (one row, refreshed TTL),
+  while a different session/agent gets its own row.
+
+  `:session_id` is therefore load-bearing. When the caller supplies none, `post/4`'s
+  `maybe_surrogate_session/1` mints a per-write `srvgen-<uuid>` — which means such a
+  lock is NEITHER refreshable NOR releasable by slot (each write lands a new row and
+  `unlock_file/5` cannot address it). It still self-expires within
+  `#{@max_lock_ttl_seconds}s`, so it is bounded, not leaked. The MCP proxy and the
+  HTTP endpoint always supply a session id; a client that cannot should accept
+  expiry as its only release.
+
+  ## TTL clamp (the ONE caller-influenced `expires_at`)
+
+  `:ttl_seconds` is clamped to `[#{@min_lock_ttl_seconds}, #{@max_lock_ttl_seconds}]`
+  seconds (default `#{@default_lock_ttl_seconds}`); anything absent or non-numeric
+  falls back to the default. See `lock_ttl_seconds/1`.
+
+  `opts`: `:role` (the VERIFIED key role — membership bypass only), `:ttl_seconds`,
+  `:session_id`, `:host`, `:body` (an optional human note replacing the default
+  one-liner), `:audit`.
+
+  Returns `post/4`'s result (`{:ok, post, :created | :updated}` and its error
+  shapes), plus `{:error, :invalid_target}` for a blank/oversized/non-binary target.
+  """
+  @spec lock_file(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
+          {:ok, ChannelPost.t(), :created | :updated | :deduplicated}
+          | {:error, :invalid_target}
+          | {:error, :not_found}
+          | {:error, :agent_not_found}
+          | {:error, :conflict}
+          | {:error, :supersede_target_not_found}
+          | {:error, :unprocessable_entity, String.t()}
+          | {:error, Ecto.Changeset.t()}
+  def lock_file(tenant_id, agent_id, project_id, target, opts \\ []) do
+    with {:ok, normalized} <- normalize_lock_target(target) do
+      attrs = %{
+        project_id: project_id,
+        body: lock_body(normalized, Keyword.get(opts, :body)),
+        key: lock_key(normalized),
+        # US-40.A1 reshaped `refs` from a fixed-key map into a bounded LIST of
+        # `%{"type", "value", "label"?}` items — the story's `refs.file = target`
+        # predates that. The file target rides as a typed ref ITEM.
+        refs: [%{"type" => "file", "value" => normalized}],
+        ttl_seconds: Keyword.get(opts, :ttl_seconds),
+        session_id: Keyword.get(opts, :session_id),
+        host: Keyword.get(opts, :host),
+        audit: lock_audit(Keyword.get(opts, :audit, []), normalized)
+      }
+
+      post(tenant_id, agent_id, Keyword.get(opts, :role, :agent), attrs)
+    end
+  end
+
+  @doc """
+  RELEASES the caller's OWN advisory soft-lock on `target` — US-40.4 (AC-40.4.3).
+
+  ## Why a real DELETE by slot (and not an upsert-to-already-expired)
+
+  AC-40.4.3 admits either; this ships the DELETE. `delete_post/5` deletes by post
+  ID only, so the minimal addition is a delete addressed by the same hardened
+  5-column slot key the lock occupies. The rejected alternative — re-posting the
+  slot with `expires_at` in the past — leaves a LIVE row behind that only the sweep
+  eventually reaps, and that row still counts toward the keyed-slot uniqueness and
+  toward every `has_more`/preview read's page budget. A released lock should simply
+  be gone; the DELETE is also what makes an immediate re-lock by the same session a
+  clean `:created` rather than a resurrection of a tombstone.
+
+  A lock ALSO self-expires via its short TTL (reads filter `expires_at > now`
+  independently of the sweep, and `Loopctl.Workers.ChannelPostSweeper` reaps the
+  row), so a crashed session can never hold a file indefinitely even if it never
+  calls this.
+
+  ## Oracle-safety
+
+  Scoped to `(tenant_id, project_id, agent_id, session_id, key)` — the caller's own
+  slot. A nonexistent lock, ANOTHER session's lock on the same target, another
+  AGENT's lock, a cross-tenant/cross-project lock, a missing session id, and a
+  malformed target ALL return a byte-identical `{:error, :not_found}`: no existence
+  oracle (the same posture as `delete_post/5` and `release/5`).
+
+  The delete and its audit entry run in ONE transaction (`run_delete/4`).
+
+  `opts`: `:session_id` (required in practice — see `lock_file/5`), `:audit`.
+  """
+  @spec unlock_file(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
+          {:ok, ChannelPost.t()} | {:error, :not_found | :audit_write_failed}
+  def unlock_file(tenant_id, agent_id, project_id, target, opts \\ []) do
+    with {:ok, normalized} <- normalize_lock_target(target),
+         %ChannelPost{} = post <-
+           fetch_owned_lock(
+             tenant_id,
+             agent_id,
+             project_id,
+             Keyword.get(opts, :session_id),
+             lock_key(normalized)
+           ) do
+      run_delete(
+        tenant_id,
+        agent_id,
+        post,
+        lock_audit(Keyword.get(opts, :audit, []), normalized)
+      )
+    else
+      _ -> {:error, :not_found}
+    end
+  end
+
+  @doc """
+  The PINNED active advisory-lock read for a channel — US-40.4 (AC-40.4.2).
+
+  A DEDICATED read rather than a flag on `recent_page/3`: an active lock must be
+  visible BEFORE a session edits a file, and the newest-N recency preview can
+  truncate it away on a busy channel. Same rationale (and same left-anchored
+  `key LIKE` prefix approach) as `directed_handoffs_page/3` — there is deliberately
+  NO `kind` column on `channel_posts`.
+
+  Surfaces every live lock: unexpired (`expires_at > now`, independent of the
+  sweep — so an expired lock disappears IMMEDIATELY, TC-40.4.2), not quarantined,
+  not superseded. Rows are NOT deduplicated by key: two sessions holding a lock on
+  the same file is a legitimate advisory state and BOTH must be surfaced
+  (AC-40.4.4) — deduping would hide exactly the collision the caller is looking for.
+
+  Each row is a `select_preview/1` projection (bounded, TOAST-safe body preview)
+  plus `:target` (the key with the `#{@lock_key_prefix}` prefix stripped) and
+  `:expires_at`, so a consumer can render "claimed: <file> by <agent/host>, <age>".
+  Newest lock first.
+
+  Returns `[preview()]`; a malformed tenant/project id yields `[]` (never a raise).
+  """
+  @spec active_locks(term(), term(), keyword()) :: [map()]
+  def active_locks(tenant_id, project_id, opts \\ []) do
+    {locks, _overflowed?} = active_locks_page(tenant_id, project_id, opts)
+    locks
+  end
+
+  @doc """
+  The same read as `active_locks/3`, additionally reporting whether the page cap
+  TRUNCATED the set. Returns `{[preview()], overflowed?}`.
+
+  Detected WITHOUT a second query by fetching `limit + 1` rows. `:limit` defaults to
+  #{@default_active_locks_limit} and is clamped to #{@max_active_locks_limit}.
+  """
+  @spec active_locks_page(term(), term(), keyword()) :: {[map()], boolean()}
+  def active_locks_page(tenant_id, project_id, opts \\ []) do
+    if valid_uuid?(tenant_id) and valid_uuid?(project_id) do
+      now = DateTime.utc_now()
+      limit = opts |> Keyword.get(:limit) |> clamp_active_locks_limit()
+
+      rows =
+        ChannelPost
+        |> where([p], p.tenant_id == ^tenant_id and p.project_id == ^project_id)
+        |> where([p], like(p.key, ^(@lock_key_prefix <> "%")))
+        |> where([p], p.expires_at > ^now)
+        |> where([p], is_nil(p.quarantined_at))
+        |> where([p], is_nil(p.superseded_by))
+        |> order_by([p], desc: p.inserted_at, desc: p.seq)
+        |> limit(^(limit + 1))
+        |> select_preview()
+        |> select_merge([p], %{expires_at: p.expires_at})
+        |> AdminRepo.all()
+        |> Enum.map(&finalize_preview/1)
+        |> Enum.map(&Map.put(&1, :target, lock_target(&1.key)))
+
+      {Enum.take(rows, limit), length(rows) > limit}
+    else
+      {[], false}
+    end
+  end
+
+  @doc """
+  The EFFECTIVE soft-lock TTL, in seconds, for a requested `ttl_seconds` — clamped
+  to `[#{@min_lock_ttl_seconds}, #{@max_lock_ttl_seconds}]`, defaulting to
+  #{@default_lock_ttl_seconds} for anything absent or not integer-shaped.
+
+  Public so the endpoint can report the ACTUALLY-applied TTL from the SAME source of
+  truth the write uses, never a divergent second copy.
+  """
+  @spec lock_ttl_seconds(term()) :: pos_integer()
+  def lock_ttl_seconds(ttl) when is_integer(ttl),
+    do: ttl |> max(@min_lock_ttl_seconds) |> min(@max_lock_ttl_seconds)
+
+  def lock_ttl_seconds(ttl) when is_binary(ttl) do
+    case Integer.parse(ttl) do
+      {n, ""} -> lock_ttl_seconds(n)
+      _ -> @default_lock_ttl_seconds
+    end
+  end
+
+  def lock_ttl_seconds(_), do: @default_lock_ttl_seconds
+
+  @doc "The advisory soft-lock key prefix (`#{@lock_key_prefix}`) — the ONLY routing signal (no `kind` column)."
+  @spec lock_key_prefix() :: String.t()
+  def lock_key_prefix, do: @lock_key_prefix
+
+  @doc "The default page size `active_locks/3` applies, shared with the endpoint's `meta.limit`."
+  @spec default_active_locks_limit() :: pos_integer()
+  def default_active_locks_limit, do: @default_active_locks_limit
+
+  @doc "The EFFECTIVE `active_locks/3` page size for a requested `limit` (clamped; exposed for `meta.limit`)."
+  @spec clamp_active_locks_limit(term()) :: pos_integer()
+  def clamp_active_locks_limit(limit) when is_integer(limit) and limit > 0,
+    do: min(limit, @max_active_locks_limit)
+
+  def clamp_active_locks_limit(limit) when is_binary(limit) do
+    case Integer.parse(limit) do
+      {n, ""} when n > 0 -> clamp_active_locks_limit(n)
+      _ -> @default_active_locks_limit
+    end
+  end
+
+  def clamp_active_locks_limit(_), do: @default_active_locks_limit
+
+  # The lock's slot key. `lock_target/1` is its inverse for the read model.
+  defp lock_key(target), do: @lock_key_prefix <> target
+
+  defp lock_target(key) when is_binary(key),
+    do: String.replace_prefix(key, @lock_key_prefix, "")
+
+  defp lock_target(_), do: nil
+
+  # A soft-lock target must be a present binary that keeps the derived key within
+  # the `channel_posts.key` bound (200 bytes). A blank / oversized / non-binary
+  # target is rejected up front with a DISTINCT error so the endpoint can 422 with
+  # an honest message, rather than surfacing a confusing key-length changeset error.
+  @max_lock_target_bytes 200 - byte_size(@lock_key_prefix)
+
+  defp normalize_lock_target(target) when is_binary(target) do
+    trimmed = String.trim(target)
+
+    cond do
+      trimmed == "" -> {:error, :invalid_target}
+      byte_size(trimmed) > @max_lock_target_bytes -> {:error, :invalid_target}
+      true -> {:ok, trimmed}
+    end
+  end
+
+  defp normalize_lock_target(_target), do: {:error, :invalid_target}
+
+  # The default lock body. Deliberately terse and self-describing: it lands on the
+  # shared channel and is injected into peer sessions as untrusted DATA, so it says
+  # what the lock IS (advisory) rather than issuing an instruction.
+  defp lock_body(target, note) do
+    if is_binary(note) and String.trim(note) != "" do
+      String.trim(note)
+    else
+      "advisory soft-lock: editing #{target} (advisory only — it does not block you)"
+    end
+  end
+
+  # Carry the lock target into the audit metadata for BOTH lock and unlock so the
+  # trail names the file, not just the post id.
+  defp lock_audit(audit, target) do
+    metadata = audit |> Keyword.get(:metadata, %{}) |> Map.put("soft_lock_target", target)
+    Keyword.put(audit, :metadata, metadata)
+  end
+
+  # Fetch the caller's OWN lock by the HARDENED 5-column slot key — the delete-by-slot
+  # path AC-40.4.3 calls for (`delete_post/5` addresses by post id only). The index
+  # `channel_posts_session_key_uidx` makes this at most one row. Every miss (foreign
+  # tenant/project/agent/session, malformed id, blank session) returns nil so the
+  # caller collapses to one byte-identical `{:error, :not_found}`.
+  defp fetch_owned_lock(tenant_id, agent_id, project_id, session_id, key) do
+    if valid_uuid?(tenant_id) and valid_uuid?(agent_id) and valid_uuid?(project_id) and
+         present_string?(session_id) do
+      ChannelPost
+      |> where(
+        [p],
+        p.tenant_id == ^tenant_id and p.project_id == ^project_id and
+          p.agent_id == ^agent_id and p.session_id == ^session_id and p.key == ^key
+      )
+      |> AdminRepo.one()
+    else
+      nil
+    end
+  end
+
+  # US-40.4: the SINGLE place `expires_at` is caller-influenced. Only the advisory
+  # soft-lock path (a `claim:`-prefixed key) gets the short clamped TTL; every other
+  # post keeps the uniform `now + @retention_days` retention, so no ordinary post can
+  # shorten or extend the channel's retention through a request body.
+  defp resolve_expires_at(attrs) do
+    if soft_lock_key?(Map.get(attrs, :key)) do
+      DateTime.add(
+        DateTime.utc_now(),
+        lock_ttl_seconds(Map.get(attrs, :ttl_seconds)),
+        :second
+      )
+    else
+      default_expires_at()
+    end
+  end
+
+  defp soft_lock_key?(key) when is_binary(key), do: String.starts_with?(key, @lock_key_prefix)
+  defp soft_lock_key?(_key), do: false
 
   @doc "The retention window, in days, a DONE claim is kept before the sweep reaps it."
   @spec claim_done_retention_days() :: pos_integer()

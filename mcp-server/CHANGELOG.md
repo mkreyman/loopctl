@@ -5,6 +5,26 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.58.0 — 2026-07-22 (advisory file soft-locks — US-40.4, #451)
+
+### Added
+
+- **`channel_lock`** (agent) — take or refresh an ADVISORY file soft-lock on a repo
+  coordination channel: "I'm editing `lib/foo.ex`". It NEVER blocks anyone, nothing
+  prevents an edit, and TWO sessions may hold a lock on the same file (both are
+  surfaced). Explicitly NOT the exactly-once handoff claim — `channel_claim` remains
+  the primitive for "exactly one agent owns this unit of work". Re-locking the same
+  target from the same session refreshes it in place (200). The lock carries a SHORT
+  server-clamped TTL (`ttl_seconds`, 60..3600 seconds, default 900) and self-expires,
+  so a crashed session can never hold a file. `host`/`session_id` stay proxy-supplied.
+- **`channel_unlock`** (agent) — release your OWN soft-lock. Owner-scoped to your
+  `(tenant, project, agent, session)` slot; a lock you do not hold, another session's,
+  a cross-tenant one, or a nonexistent one all return a byte-identical 404.
+- **`channel_locks`** (agent) — the PINNED live-lock read for a channel, to call
+  BEFORE editing. A SEPARATE set from `channel_recent`, so a lock is never truncated
+  out of the newest-N preview; each row carries `target`, `agent_id`, `session_id`,
+  `host`, `expires_at` and `inserted_at`.
+
 ## 2.57.0 — 2026-07-22 (retention-sweep stall anomalies — #498)
 
 ### Changed

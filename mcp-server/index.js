@@ -610,6 +610,62 @@ async function channelDone({ project_id, ref }) {
   return toContent(result);
 }
 
+async function channelLock({ project_id, target, ttl_seconds, note }) {
+  // Repo Coordination Bus (Epic 40, US-40.4): take (or refresh) an ADVISORY file
+  // soft-lock on the AGENT key. This is NOT the exactly-once handoff claim
+  // (channel_claim): it NEVER blocks anyone, and two sessions MAY hold a lock on
+  // the same file — it is a collision-avoidance HINT surfaced on the channel.
+  // session_id + host are proxy-filled (NOT caller args), exactly as in
+  // channel_post: session_id is what makes the lock refreshable in place and
+  // releasable by slot.
+  const payload = { project_id, target };
+  if (ttl_seconds) payload.ttl_seconds = ttl_seconds;
+  if (note) payload.body = note;
+  payload.host = os.hostname();
+  payload.session_id = CHANNEL_SESSION_ID;
+  const result = await apiCall(
+    "POST",
+    "/api/v1/channel/locks",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function channelUnlock({ project_id, target }) {
+  // Repo Coordination Bus (Epic 40, US-40.4): release YOUR OWN advisory soft-lock
+  // on the AGENT key. Owner-scoped by (tenant, project, agent, session, key): a
+  // lock you do not hold / another session's / cross-tenant / nonexistent returns a
+  // byte-identical 404 (no existence oracle). A lock ALSO self-expires on its short
+  // TTL, so forgetting to unlock can never strand a file.
+  const payload = { project_id, target };
+  payload.session_id = CHANNEL_SESSION_ID;
+  const result = await apiCall(
+    "POST",
+    "/api/v1/channel/locks/release",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function channelLocks({ project_id, limit }) {
+  // Repo Coordination Bus (Epic 40, US-40.4): the PINNED live advisory-lock read on
+  // the AGENT key — call it BEFORE editing a file. ADVISORY: a returned lock is a
+  // hint that a peer session is working in that file, never a prohibition; you are
+  // free to edit anyway (and to take your own lock on the same file).
+  const params = new URLSearchParams();
+  if (project_id) params.set("project_id", project_id);
+  if (limit) params.set("limit", limit);
+  const result = await apiCall(
+    "GET",
+    `/api/v1/channel/locks?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function channelDelete({ post_id }) {
   // Repo Coordination Bus (Epic 39, US-39.7): HARD-delete a coordination post in
   // the caller's tenant — the redact path for a leaked/regretted post, before its
@@ -2796,6 +2852,68 @@ const TOOLS = [
         ref: { type: "string", description: "The claimed anchor to mark done." },
       },
       required: ["project_id", "ref"],
+    },
+  },
+  {
+    name: "channel_lock",
+    description:
+      "Take (or refresh) an ADVISORY file soft-lock on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.4), on the agent key — announce 'I'm editing lib/foo.ex' so peer sessions on the same repo can avoid colliding with you. ADVISORY ONLY: it NEVER blocks anyone and nothing prevents an edit. Two sessions CAN hold a lock on the same file at the same time — a second locker is NOT rejected, both locks are surfaced, and the agent decides what to do with the hint. This is NOT the exactly-once handoff claim: use channel_claim when exactly one agent must own a unit of work; use channel_lock only for collision avoidance on a FILE. Re-calling it with the same target from the same session REFRESHES your lock in place (200) instead of creating a second one. The lock carries a SHORT server-clamped TTL (60..3600 seconds, default 900) and self-expires, so a crashed session can never sit on a file — refresh it while you are still editing, and call channel_unlock when you are done. Read channel_locks BEFORE you start editing. session_id and host are proxy-supplied — do NOT pass them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "UUID of the channel (project) the file belongs to.",
+        },
+        target: {
+          type: "string",
+          description:
+            "The file you are editing, as a repo-relative path (e.g. 'lib/foo.ex'). <=194 bytes.",
+        },
+        ttl_seconds: {
+          type: "integer",
+          description:
+            "Optional lock lifetime in seconds. SERVER-CLAMPED to [60, 3600]; anything absent or non-numeric becomes 900. Pick roughly how long you expect to be in the file — a lock that outlives your edit is noise for everyone else.",
+        },
+        note: {
+          type: "string",
+          description:
+            "Optional human note replacing the default one-line body (e.g. 'refactoring the changeset — back in 10m').",
+        },
+      },
+      required: ["project_id", "target"],
+    },
+  },
+  {
+    name: "channel_unlock",
+    description:
+      "Release YOUR OWN advisory file soft-lock on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.4), on the agent key — call it when you finish editing the file so peers stop seeing a stale hint. Owner-scoped to your own (tenant, project, agent, session) slot: a lock you do not hold, another session's lock on the same file, one in another tenant, or one that never existed all return a byte-identical 404 (no existence oracle). Releasing is best-effort housekeeping, not a requirement — a lock also self-expires on its short TTL. session_id is proxy-supplied — do NOT pass it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "UUID of the channel (project)." },
+        target: {
+          type: "string",
+          description: "The same repo-relative file path you locked.",
+        },
+      },
+      required: ["project_id", "target"],
+    },
+  },
+  {
+    name: "channel_locks",
+    description:
+      "List the LIVE advisory file soft-locks on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.4), on the agent key — read this BEFORE you start editing so you can see 'someone is already in lib/foo.ex'. A SEPARATE, PINNED set: unlike channel_recent it is never truncated by newest-N recency, so an active lock is always visible. Each row carries target, agent_id, session_id, host, expires_at and inserted_at so you can render 'claimed: <file> by <agent/host>, <age>'. ADVISORY: a returned lock is information, NOT a prohibition — you may still edit the file, and you may take your own lock on it (both will show). Expired locks disappear immediately. Oracle-safe and tenant-scoped: a foreign/nonexistent/malformed project_id returns an empty set, never a 404.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "UUID of the channel (project)." },
+        limit: {
+          type: "integer",
+          description: "Optional page cap (default 100, max 200).",
+        },
+      },
+      required: ["project_id"],
     },
   },
   {
@@ -5941,6 +6059,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "channel_done":
       return await channelDone(args);
+
+    case "channel_lock":
+      return await channelLock(args);
+
+    case "channel_unlock":
+      return await channelUnlock(args);
+
+    case "channel_locks":
+      return await channelLocks(args);
 
     case "delete_project":
       return await deleteProject(args);
