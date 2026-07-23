@@ -186,6 +186,47 @@ defmodule Loopctl.CoordinationSoftLockTest do
 
       assert DateTime.diff(keyless.expires_at, before) > 29 * 24 * 3600
     end
+
+    # Review #451 (high): the short TTL used to be routed on the CALLER-CHOSEN key
+    # prefix, so an ordinary post innocently keyed `claim:story-812` was silently cut
+    # from 30 days to 900s AND surfaced as a bogus file lock. The prefix is now a
+    # RESERVED namespace on the generic write path, and the short TTL is driven by a
+    # private marker only `lock_file/5` stamps.
+    test "the claim: key namespace is RESERVED on the generic post path (422, not a silent 900s TTL)" do
+      ctx = setup_member()
+
+      assert {:error, :unprocessable_entity, message} =
+               Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
+                 project_id: ctx.project.id,
+                 body: "an ordinary keyed slot that happens to be named claim:...",
+                 key: "claim:story-812",
+                 session_id: "sess-a",
+                 ttl_seconds: 60,
+                 audit: audit()
+               })
+
+      assert message =~ "reserved"
+
+      # Nothing was written, so nothing can masquerade as a live lock.
+      assert lock_rows(ctx.tenant.id, ctx.project.id) == []
+      assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
+    end
+
+    test "the reserved-prefix guard does not fire for the lock path itself" do
+      ctx = setup_member()
+      assert {:ok, post, :created} = take_lock(ctx)
+      assert post.key == "claim:#{@target}"
+    end
+
+    # Review #451 (medium): a surrogate session is minted fresh per write, so a
+    # session-less lock is neither refreshable nor releasable — reject it instead.
+    test "a lock write with no session_id is REJECTED rather than given a surrogate slot" do
+      ctx = setup_member()
+
+      assert {:error, :missing_session} = take_lock(ctx, session_id: nil)
+      assert {:error, :missing_session} = take_lock(ctx, session_id: "   ")
+      assert lock_rows(ctx.tenant.id, ctx.project.id) == []
+    end
   end
 
   describe "refresh (same slot)" do
@@ -431,6 +472,92 @@ defmodule Loopctl.CoordinationSoftLockTest do
     end
   end
 
+  # Review #451 (medium): the ownership guarantee is per-AGENT, not per-session —
+  # `session_id` is caller-supplied and `active_locks/3` publishes it. This test
+  # pins the ACTUAL behaviour (the docs/tool descriptions were narrowed to match);
+  # the pre-existing negative case used "sess-zzz", a session that never existed,
+  # so it never exercised a real sibling session.
+  describe "release scope (agent-scoped, NOT session-scoped)" do
+    test "a REAL sibling session under the same agent key can release the peer's lock" do
+      ctx = setup_member()
+
+      assert {:ok, held, :created} = take_lock(ctx, session_id: "sess-a")
+
+      # Session B discovers A's session id straight from the published read.
+      assert [surfaced] = Coordination.active_locks(ctx.tenant.id, ctx.project.id)
+      assert surfaced.session_id == "sess-a"
+
+      assert {:ok, released} = unlock(ctx, surfaced.session_id)
+      assert released.id == held.id
+      assert Coordination.active_locks(ctx.tenant.id, ctx.project.id) == []
+    end
+
+    test "a DIFFERENT agent in the same tenant still cannot release it" do
+      ctx = setup_member()
+      agent_b = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
+      make_member(ctx.tenant, ctx.project, agent_b)
+
+      assert {:ok, _held, :created} = take_lock(ctx, session_id: "sess-a")
+
+      assert {:error, :not_found} =
+               Coordination.unlock_file(ctx.tenant.id, agent_b, ctx.project.id, @target,
+                 session_id: "sess-a"
+               )
+
+      assert [_still_held] = Coordination.active_locks(ctx.tenant.id, ctx.project.id)
+    end
+  end
+
+  # Review #451 (medium x2): locks are the highest-churn write on the bus, so they
+  # get a BOUNDED share of `recent_page/3` and a per-holder fairness budget on the
+  # pinned read — otherwise one noisy locker crowds out both real coordination posts
+  # and every peer's lock.
+  describe "crowding bounds" do
+    test "recent_page admits only the newest few locks, so real posts keep their budget" do
+      ctx = setup_member()
+
+      for i <- 1..12 do
+        assert {:ok, _lock, :created} = take_lock(ctx, target: "lib/f#{i}.ex")
+      end
+
+      for i <- 1..12 do
+        assert {:ok, _post, :created} =
+                 Coordination.post(ctx.tenant.id, ctx.agent_id, :agent, %{
+                   project_id: ctx.project.id,
+                   body: "genuine coordination post #{i}",
+                   audit: audit()
+                 })
+      end
+
+      page = Coordination.recent(ctx.tenant.id, ctx.project.id, limit: 25)
+      {locks, plain} = Enum.split_with(page, &String.starts_with?(&1.key || "", "claim:"))
+
+      assert length(locks) <= 5
+      # Every non-lock post still fits the page — none was crowded out.
+      assert length(plain) == 12
+    end
+
+    test "the pinned lock read caps ONE (agent, session) holder so peers stay visible" do
+      ctx = setup_member()
+      quiet_agent = fixture(:agent, %{tenant_id: ctx.tenant.id}).id
+      make_member(ctx.tenant, ctx.project, quiet_agent)
+
+      # The quiet peer locks FIRST, so a pure newest-first truncation would evict it.
+      assert {:ok, peer_lock, :created} =
+               take_lock(ctx, agent_id: quiet_agent, session_id: "sess-quiet", target: "lib/q.ex")
+
+      for i <- 1..25 do
+        assert {:ok, _lock, :created} = take_lock(ctx, target: "lib/noisy#{i}.ex")
+      end
+
+      locks = Coordination.active_locks(ctx.tenant.id, ctx.project.id, limit: 21)
+      noisy = Enum.filter(locks, &(&1.session_id == "sess-a"))
+
+      assert length(noisy) == 20
+      assert peer_lock.id in Enum.map(locks, & &1.id)
+    end
+  end
+
   describe "audit" do
     test "lock and unlock each write an audit entry naming the file target" do
       ctx = setup_member()
@@ -441,8 +568,11 @@ defmodule Loopctl.CoordinationSoftLockTest do
       assert {:ok, _refreshed, :updated} = take_lock(ctx)
       assert audit_actions(ctx.tenant.id, post.id) == ["posted", "upserted"]
 
+      # Review #451: the release action is DISTINCT from the "deleted" action the
+      # US-39.7 secret-redaction path uses, so routine lock churn cannot dilute
+      # that security signal.
       assert {:ok, _deleted} = unlock(ctx, "sess-a")
-      assert audit_actions(ctx.tenant.id, post.id) == ["posted", "upserted", "deleted"]
+      assert audit_actions(ctx.tenant.id, post.id) == ["posted", "upserted", "soft_lock_released"]
 
       metadata =
         AdminRepo.all(

@@ -16,14 +16,33 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   the primitive for "exactly one agent owns this unit of work". Re-locking the same
   target from the same session refreshes it in place (200). The lock carries a SHORT
   server-clamped TTL (`ttl_seconds`, 60..3600 seconds, default 900) and self-expires,
-  so a crashed session can never hold a file. `host`/`session_id` stay proxy-supplied.
-- **`channel_unlock`** (agent) — release your OWN soft-lock. Owner-scoped to your
-  `(tenant, project, agent, session)` slot; a lock you do not hold, another session's,
-  a cross-tenant one, or a nonexistent one all return a byte-identical 404.
+  so a crashed session can never hold a file. `host`/`session_id` stay proxy-supplied;
+  a lock write with NO `session_id` is rejected (422) rather than rescued with a
+  server-minted surrogate slot that could be neither refreshed nor released.
+- **`channel_unlock`** (agent) — release your OWN soft-lock. Addressed by your
+  `(tenant, project, agent, session)` slot; a lock you do not hold, another AGENT's,
+  one under a different session id, a cross-tenant one, or a nonexistent one all
+  return a byte-identical 404. NOTE the enforced scope is per-AGENT, not per-session:
+  `tenant`/`agent` are server-stamped, but `session_id` is client-supplied and
+  `channel_locks` publishes it, so two sessions sharing one agent key can release
+  each other's advisory locks (accepted for hint data).
 - **`channel_locks`** (agent) — the PINNED live-lock read for a channel, to call
-  BEFORE editing. A SEPARATE set from `channel_recent`, so a lock is never truncated
-  out of the newest-N preview; each row carries `target`, `agent_id`, `session_id`,
-  `host`, `expires_at` and `inserted_at`.
+  BEFORE editing. The COMPLETE live set, while `channel_recent` admits only the
+  newest few locks so lock churn cannot crowd out real coordination posts. Each row
+  carries `target`, `agent_id`, `session_id`, `host`, `expires_at` and `inserted_at`,
+  and one `(agent, session)` holder contributes at most 20 rows to a page so a noisy
+  locker cannot hide every peer's lock.
+
+### Changed
+
+- `channel_recent` / `GET /api/v1/channel/posts` rows now carry `lock` (boolean),
+  `lock_target` and `expires_at`, so a TEAM CHANNEL renderer can mark an advisory
+  lock DISTINCTLY ("claimed: `lib/foo.ex` by beelink, 4m ago") and tell a LIVE lock
+  from an expired-but-unswept one without re-deriving the key convention. The by-id
+  read (`GET /api/v1/channel/posts/:id`) carries the same three fields.
+- The `claim:` key namespace is now RESERVED: `channel_post` with a `claim:`-prefixed
+  `key` returns 422. Previously such a post was silently reinterpreted as a soft-lock
+  (900s TTL instead of the 30-day retention, and surfaced as a bogus file lock).
 
 ## 2.57.0 — 2026-07-22 (retention-sweep stall anomalies — #498)
 

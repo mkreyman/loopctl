@@ -33,12 +33,31 @@ defmodule LoopctlWeb.ChannelLockController do
   caller can lock as another agent, in another tenant, or in a project it is not a
   writable member of (the shared US-40.D3 `project_writable_by_agent/4` gate).
 
+  ## What the release scope actually enforces (review #451)
+
+  A release is addressed by `(tenant_id, project_id, agent_id, session_id, key)`.
+  `tenant_id` and `agent_id` are server-stamped and are real trust boundaries;
+  **`session_id` is caller-supplied and is NOT**, and `GET /channel/locks` publishes
+  every live lock's `session_id`. Two sessions sharing ONE agent key are therefore
+  not isolated from each other — either can release or overwrite the other's lock.
+  The enforced guarantee is "scoped to your AGENT, not to your session" (the same
+  author-scoped model `DELETE /channel/posts/:id` uses). That is acceptable for
+  advisory hint data; do not cite it as per-session isolation.
+
   ## Oracle-safety
 
   A missing / cross-tenant / cross-PROJECT (non-member) project collapses to one
   byte-identical 422 on the lock path. A release of a nonexistent lock, another
-  session's lock, another agent's lock, or a cross-tenant lock all collapse to one
-  byte-identical 404 — no existence oracle.
+  AGENT's lock, a lock held under a different session id than the one supplied, or a
+  cross-tenant lock all collapse to one byte-identical 404 — no existence oracle.
+
+  ## The READ is tenant-scoped, not membership-gated
+
+  `index/2` is deliberately uniform with `channel_recent`: it filters on the
+  key-derived `tenant_id` + the requested `project_id` only, so any agent in the
+  tenant may read any of that tenant's channels' locks (an oracle-safe empty list
+  for a nonexistent/cross-tenant project, never a 404). The US-40.D3 membership gate
+  applies to the WRITE path (`Coordination.post/4`), not to this read.
   """
 
   use LoopctlWeb, :controller
@@ -82,11 +101,20 @@ defmodule LoopctlWeb.ChannelLockController do
 
   @invalid_target_message "target must be a non-blank file path of at most 194 bytes"
 
+  # A lock write with no client session id is REJECTED rather than rescued with a
+  # server surrogate (review #451): a surrogate is minted fresh per write, so such a
+  # lock can never be refreshed in place nor released by slot — every attempt would
+  # leak another unreleasable row into the pinned read until its TTL expired.
+  @missing_session_message "session_id is required to take an advisory soft-lock: it is what makes the lock refreshable in place and releasable by slot"
+
   @doc """
   POST /api/v1/channel/locks
 
   Takes or refreshes an ADVISORY soft-lock on `target`. NEVER blocks: a peer
   holding a lock on the same target does not make this fail.
+
+  `session_id` is REQUIRED (422 otherwise) — it is what makes the lock refreshable
+  in place and releasable by slot.
   """
   def create(conn, params) do
     with_agent(conn, fn tenant_id, agent_id, role ->
@@ -188,6 +216,10 @@ defmodule LoopctlWeb.ChannelLockController do
     {:error, :unprocessable_entity, @invalid_target_message}
   end
 
+  defp render_lock(_conn, {:error, :missing_session}, _tenant_id, _agent_id, _params) do
+    {:error, :unprocessable_entity, @missing_session_message}
+  end
+
   defp render_lock(_conn, {:error, :not_found}, tenant_id, agent_id, params) do
     emit_security_event(:ownership_rejected, %{
       tenant_id: tenant_id,
@@ -235,8 +267,10 @@ defmodule LoopctlWeb.ChannelLockController do
       # infer exclusivity from a 201.
       advisory: true,
       blocking: false,
-      expires_at: post.expires_at,
-      session_id_source: post.session_id_source
+      expires_at: post.expires_at
+      # No `session_id_source`: unlike an ordinary post, a lock can NEVER be rescued
+      # by `maybe_surrogate_session/1` — a session-less lock write is rejected up
+      # front (see @missing_session_message), so the marker is always absent here.
     }
   end
 

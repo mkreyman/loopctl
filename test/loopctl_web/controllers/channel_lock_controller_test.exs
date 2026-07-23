@@ -98,6 +98,90 @@ defmodule LoopctlWeb.ChannelLockControllerTest do
       assert body["meta"]["blocking"] == false
     end
 
+    # Review #451: a session-less lock would be neither refreshable nor releasable,
+    # so it is rejected rather than rescued with a server-minted surrogate slot.
+    test "a lock write with no session_id -> 422 (never a surrogate slot)" do
+      %{project: project, raw: raw} = setup_member()
+
+      body =
+        raw
+        |> post_json(@path, %{"project_id" => project.id, "target" => @target})
+        |> json_response(422)
+
+      assert body["error"]["message"] =~ "session_id is required"
+
+      listing =
+        authed_conn(raw)
+        |> get(@path, %{"project_id" => project.id})
+        |> json_response(200)
+
+      assert listing["locks"] == []
+    end
+
+    # Review #451 (AC-40.4.2): a lock must be DISTINCT on channel_recent, not just
+    # present under a key a consumer has to re-parse.
+    test "the lock is marked DISTINCTLY on channel_recent (lock / lock_target / expires_at)" do
+      %{project: project, raw: raw} = setup_member()
+
+      lock =
+        raw
+        |> post_json(@path, %{
+          "project_id" => project.id,
+          "target" => @target,
+          "session_id" => "sess-a"
+        })
+        |> json_response(201)
+
+      raw
+      |> post_json("/api/v1/channel/posts", %{
+        "project_id" => project.id,
+        "body" => "an ordinary coordination post",
+        "session_id" => "sess-a"
+      })
+      |> json_response(201)
+
+      rows =
+        authed_conn(raw)
+        |> get("/api/v1/channel/posts", %{"project_id" => project.id})
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      lock_row = Enum.find(rows, &(&1["id"] == lock["lock"]["id"]))
+      assert lock_row["lock"] == true
+      assert lock_row["lock_target"] == @target
+      assert lock_row["expires_at"]
+
+      plain_row = Enum.find(rows, &(&1["id"] != lock["lock"]["id"]))
+      assert plain_row["lock"] == false
+      assert plain_row["lock_target"] == nil
+    end
+
+    # Review #451 (high): `claim:` is a RESERVED namespace on the generic post
+    # path — otherwise an ordinary keyed post silently got a 900s TTL and appeared
+    # as a bogus file lock.
+    test "an ordinary post using the reserved claim: key prefix -> 422" do
+      %{project: project, raw: raw} = setup_member()
+
+      body =
+        raw
+        |> post_json("/api/v1/channel/posts", %{
+          "project_id" => project.id,
+          "body" => "ordinary keyed working state",
+          "key" => "claim:story-812",
+          "session_id" => "sess-a"
+        })
+        |> json_response(422)
+
+      assert body["error"]["message"] =~ "reserved"
+
+      listing =
+        authed_conn(raw)
+        |> get(@path, %{"project_id" => project.id})
+        |> json_response(200)
+
+      assert listing["locks"] == []
+    end
+
     test "the same session re-locking the same target -> 200 (slot refreshed in place)" do
       %{project: project, raw: raw} = setup_member()
 

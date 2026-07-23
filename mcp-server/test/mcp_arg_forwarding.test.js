@@ -366,6 +366,33 @@ describe("US-40.4: channel_lock / channel_unlock / channel_locks wiring", () => 
     );
   });
 
+  // Review #451: the release slot's session_id is CLIENT-supplied and channel_locks
+  // publishes it, so the enforced boundary is the server-stamped agent, not the
+  // session. The tool description must not overclaim per-session isolation.
+  test("channel_unlock describes the scope as per-AGENT, not per-session", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_unlock",[\s\S]*?scoped to your AGENT', not to your session/,
+      "channel_unlock must state the guarantee is agent-scoped",
+    );
+  });
+
+  test("channel_lock states a session-less write is rejected, not surrogate-rescued", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_lock",[\s\S]*?a lock write with no session_id is REJECTED/,
+      "channel_lock must state a session-less write is rejected",
+    );
+  });
+
+  test("channel_locks documents the per-holder fairness bound", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "channel_locks",[\s\S]*?Fairness-bounded: a single \(agent, session\) holder contributes at most 20 rows/,
+      "channel_locks must document the per-holder fairness bound",
+    );
+  });
+
   test("channelLock POSTs /channel/locks on the AGENT key", () => {
     assert.match(
       INDEX_SRC,
