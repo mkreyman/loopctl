@@ -31,6 +31,79 @@ defmodule Loopctl.ApiSpec.Schemas do
               type: :object,
               description: "Field-level error details (optional)",
               additionalProperties: true
+            },
+            code: %Schema{
+              type: :string,
+              description:
+                "Stable machine-readable error code, when the endpoint emits one " <>
+                  "(e.g. `custody_tier_required` for the trust-tier gate, " <>
+                  "`insufficient_role` for the orthogonal role gate). Branch on this, " <>
+                  "never on `message`.",
+              example: "custody_tier_required"
+            },
+            capabilities: %Schema{
+              type: :object,
+              additionalProperties: true,
+              description:
+                "#505 — present on `custody_tier_required` and `insufficient_role` (403): " <>
+                  "the same trust-tier capability map `GET /api/v1/tenants/me` advertises, " <>
+                  "minus the static per-surface `descriptions`, so a caller can recover " <>
+                  "without a second round trip. It covers the TIER gate only — `scope` and " <>
+                  "`note` say so in the payload. See `TenantResponse.capabilities`.",
+              nullable: true
+            },
+            required_role: %Schema{
+              type: :string,
+              nullable: true,
+              description: "On `insufficient_role`: the minimum role the endpoint requires.",
+              example: "orchestrator"
+            },
+            required_roles: %Schema{
+              type: :array,
+              nullable: true,
+              items: %Schema{type: :string},
+              description:
+                "On `insufficient_role` for an exact-role gate: the roles accepted, with " <>
+                  "NO hierarchy — a higher role is rejected too.",
+              example: ["agent", "orchestrator"]
+            },
+            remediation: %Schema{
+              type: :object,
+              additionalProperties: true,
+              description:
+                "#505 — how to get unblocked: `learn_more`, `enrollment_upgrade`, and " <>
+                  "`agent_native_alternative` (the agent-role endpoint covering the " <>
+                  "adjacent non-custody need) when the gated mount names one. THIS block " <>
+                  "wins over the nested `capabilities.remediation`: it is that same block " <>
+                  "plus the endpoint-specific alternative.",
+              nullable: true,
+              properties: %{
+                learn_more: %Schema{type: :string},
+                enrollment_upgrade: %Schema{
+                  type: :object,
+                  description:
+                    "How to upgrade THIS tenant in place (enroll a WebAuthn authenticator " <>
+                      "against it) — NOT a second signup, which would strand the knowledge " <>
+                      "this tenant owns.",
+                  properties: %{
+                    summary: %Schema{type: :string},
+                    tools: %Schema{type: :array, items: %Schema{type: :string}},
+                    endpoints: %Schema{type: :array, items: %Schema{type: :string}},
+                    requires_human: %Schema{type: :boolean},
+                    requires_role: %Schema{type: :string},
+                    docs: %Schema{type: :string}
+                  }
+                },
+                agent_native_alternative: %Schema{
+                  type: :object,
+                  nullable: true,
+                  properties: %{
+                    tool: %Schema{type: :string, example: "create_kb_scope"},
+                    endpoint: %Schema{type: :string, example: "POST /api/v1/kb-scopes"},
+                    description: %Schema{type: :string}
+                  }
+                }
+              }
             }
           }
         }
@@ -238,6 +311,22 @@ defmodule Loopctl.ApiSpec.Schemas do
             "US-26.7.1 — human_anchored (WebAuthn signup) unlocks the work-breakdown " <>
               "/ chain-of-custody surface; agent_rooted (self-signup) is KB-tier only."
         },
+        capabilities: %Schema{
+          type: :object,
+          additionalProperties: true,
+          description:
+            "#505 — which surfaces this tenant's `trust_tier` includes, so a caller can " <>
+              "discover the boundary BEFORE a write instead of probing for a 403. " <>
+              "`surfaces` maps each surface to either `allowed` or `requires_human_anchor`; " <>
+              "`allowed`/`blocked` are the same split as lists; `descriptions` explains " <>
+              "each surface; `remediation` (present only when `blocked` is non-empty) " <>
+              "carries the in-place enrollment-upgrade path. `scope: trust_tier_only` and " <>
+              "`applies_to: mutating_actions` bound the claim: the ROLE gate applies " <>
+              "independently (an `allowed` surface can still 403 `insufficient_role`), and " <>
+              "READS stay open on every surface, including blocked ones. The same map " <>
+              "(minus `descriptions`) is embedded in the `custody_tier_required` and " <>
+              "`insufficient_role` 403 bodies."
+        },
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
       },
@@ -249,6 +338,12 @@ defmodule Loopctl.ApiSpec.Schemas do
         settings: %{},
         status: "active",
         trust_tier: "human_anchored",
+        capabilities: %{
+          trust_tier: "human_anchored",
+          surfaces: %{knowledge_base: "allowed", work_breakdown: "allowed"},
+          allowed: ["knowledge_base", "work_breakdown"],
+          blocked: []
+        },
         inserted_at: "2026-01-15T10:00:00Z",
         updated_at: "2026-01-15T10:00:00Z"
       }
@@ -728,6 +823,15 @@ defmodule Loopctl.ApiSpec.Schemas do
             upgraded: %Schema{
               type: :boolean,
               description: "true iff THIS call flipped the tenant to human_anchored"
+            },
+            capabilities: %Schema{
+              type: :object,
+              additionalProperties: true,
+              description:
+                "#505 — the trust-tier capability map for the tenant AS OF this call. " <>
+                  "Enrollment is the moment the tier changes, so the newly-unlocked " <>
+                  "surfaces ship with it and no re-fetch of `GET /api/v1/tenants/me` is " <>
+                  "needed. Same shape as `TenantResponse.capabilities`."
             },
             authenticator: %Schema{
               type: :object,

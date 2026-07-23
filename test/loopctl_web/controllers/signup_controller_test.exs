@@ -37,6 +37,28 @@ defmodule LoopctlWeb.SignupControllerTest do
       assert is_map(data["next_action"])
     end
 
+    # #505 — the one-time root key is the FIRST thing a brand-new agent-rooted
+    # tenant holds, so the surface map ships with it: no second round trip to
+    # GET /tenants/me just to learn the boundary. Schemas.SelfSignupResponse
+    # embeds TenantResponse, which declares this field.
+    test "the tenant payload advertises the tier's capability map", %{conn: conn} do
+      unique = System.unique_integer([:positive])
+
+      conn =
+        post(conn, ~p"/api/v1/signup", %{
+          "name" => "Stranger Agent Co",
+          "slug" => "stranger-agent-#{unique}",
+          "email" => "agent-#{unique}@stranger.example"
+        })
+
+      caps = json_response(conn, 201)["data"]["tenant"]["capabilities"]
+
+      assert caps["trust_tier"] == "agent_rooted"
+      assert "work_breakdown" in caps["blocked"]
+      assert "kb_project_scopes" in caps["allowed"]
+      assert caps["remediation"]["enrollment_upgrade"]["docs"] =~ "tenant-signup"
+    end
+
     test "does not require any Authorization header (public)", %{conn: conn} do
       unique = System.unique_integer([:positive])
 

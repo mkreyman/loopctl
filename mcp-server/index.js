@@ -2517,7 +2517,17 @@ const TOOLS = [
   // Project Tools
   {
     name: "get_tenant",
-    description: "Get current tenant info. Use to verify connectivity.",
+    description:
+      "Get current tenant info. Use to verify connectivity, AND to discover which surfaces " +
+      "your tenant's trust_tier includes BEFORE attempting a write. The response carries " +
+      "`capabilities`: `surfaces` (each surface -> \"allowed\" | \"requires_human_anchor\"), " +
+      "`allowed`/`blocked` lists, `descriptions`, and `remediation` when something is blocked. " +
+      "Read the live `allowed`/`blocked` lists from the response — they are the authoritative, " +
+      "current split for your TIER — instead of probing for a 403 per endpoint. Two bounds, " +
+      "restated in the payload as `scope: trust_tier_only` and `applies_to: mutating_actions`: " +
+      "the ROLE gate is separate (an `allowed` surface can still return 403 `insufficient_role` " +
+      "if your key's role is too low), and READS stay open on every surface, including blocked " +
+      "ones — `blocked` means writes.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -2568,7 +2578,14 @@ const TOOLS = [
   },
   {
     name: "create_project",
-    description: "Create a new project in the current tenant.",
+    description:
+      "Create a new WORK project (kind: work) in the current tenant — the container for " +
+      "epics/stories/dispatch and the chain-of-custody surface. Requires orchestrator+ role " +
+      "AND a human_anchored tenant (WebAuthn signup ceremony); an agent_rooted tenant gets " +
+      "403 custody_tier_required, by design — a tenant must not be able to open a custody " +
+      "surface for itself. If you only need a project row to scope KNOWLEDGE to the repo you " +
+      "are on, use create_kb_scope instead (agent role, no human anchor). Call get_tenant " +
+      "first and read `capabilities` to see which of the two applies to your tenant.",
     inputSchema: {
       type: "object",
       properties: {

@@ -139,10 +139,10 @@ autonomous agent) can self-remediate without a human. Full agent-tenant lifecycl
 
 | Tool | Description |
 |---|---|
-| `get_tenant` | Get current tenant info. Use to verify connectivity. |
+| `get_tenant` | Get current tenant info. Use to verify connectivity, and to read `capabilities` — which surfaces your `trust_tier` includes — before attempting a write. |
 | `list_projects` | List all projects in the current tenant. |
 | `resolve_project` | Resolve a repo to its `project_id` in one cheap call — provide any of `slug`, `repo_url` (`git@github.com:owner/repo.git`, `https://github.com/owner/repo`, and bare `owner/repo` all match), or `name`. Precedence `slug > repo_url > name`, first match wins. Use the returned `id` to scope captures/recall (`memory_*`, `recall_context`). `404` `not_found` if nothing matches, `422` `no_identifier` if none supplied, `409` if a fuzzy identifier matches more than one active project. |
-| `create_project` | Create a new project in the current tenant. |
+| `create_project` | Create a new **work** project (epics/stories/custody). Requires orchestrator+ **and** a `human_anchored` tenant; an agent-rooted tenant gets `403 custody_tier_required` and should use `create_kb_scope`. |
 | `delete_project` | **Requires `LOOPCTL_USER_KEY`.** Delete a project and all of its dependent resources (epics, stories, audit entries). Irreversible — orchestrator role is not sufficient. |
 | `get_progress` | Get progress summary for a project, including story counts by status. Pass `include_cost=true` for cost data. |
 | `import_stories` | Import stories into a project from a structured payload (Epic 12 import format). Pass `merge: true` to add stories to epics that already exist (otherwise duplicates return 409). For large payloads, use `payload_path` to read JSON from disk instead of passing it inline. |
