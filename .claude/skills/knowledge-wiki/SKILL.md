@@ -39,7 +39,7 @@ never pass `tenant_id`/`subject_id`.
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
    created (`:481-487`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:447-449`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8119`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8141`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
    (`absolute_score/1`, `:8246-8251`) clears a scale-matched threshold AND beats the best retrieved
    candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8297-8307`; the pure decision is
@@ -105,6 +105,13 @@ number, is the load-bearing invariant. To monitor and keep it healthy over time:
   is a NARROW relation (the ANN fetches only `article_id` from a lean heap), so it reads measurably
   FASTER than the wide legacy column at equal recall — adding the relation IMPROVED latency, it did not
   cost it. Cutover prod EXPLAIN + p95 artifact: GH #464.
+  Production resolves the decision through `Loopctl.Embeddings.ReadPathBehaviour` (default impl
+  `Loopctl.Embeddings.SystemConfigReadPath`, which also owns the flag-key string); `config/test.exs`
+  points it at `Loopctl.MockEmbeddingReadPath`. **Tests must stub that mock per-process**
+  (`Loopctl.DataCase.stub_embedding_read_path/0`, called for you by `stub_all_defaults/0`) and must
+  NEVER write the flag — it is `:persistent_term`-cached VM-globally, so a write leaks across the whole
+  node. `Loopctl.ConfigEmbeddingReadPathTest` fails the build on a second writer and on any
+  `:embedding_read_path` config outside `config/test.exs`.
 - **Bulk (re)embed / backfill is a live-DB hazard.** Unthrottled it 504s the live wiki — per-row HNSW
   index maintenance saturates the small Fly Postgres and starves concurrent heavy-read searches past
   their `statement_timeout`. Throttled id-range keyset pattern: wiki `7a4187fd`.

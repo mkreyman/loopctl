@@ -61,7 +61,9 @@ defmodule Loopctl.Embeddings do
   alias Loopctl.Workers.ReembedWorker
   alias Loopctl.Workers.SystemCorpusEmbeddingWorker
 
-  @read_flag_key "embedding_side_table_reads"
+  # Owned by the INJECTED read-path implementation (see its moduledoc) — read here at
+  # compile time so this module never depends back on its own collaborator at runtime.
+  @read_flag_key Loopctl.Embeddings.SystemConfigReadPath.read_flag_key()
   @default_batch_size 500
 
   # ---------------------------------------------------------------------------

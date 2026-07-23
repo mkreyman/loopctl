@@ -147,11 +147,8 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
   describe "per-query hnsw.iterative_scan (#488)" do
     test "hnsw_iterative_scan/0 maps SystemConfig int codes to modes (0/unknown => off)" do
-      # Prime 0 EXPLICITLY rather than relying on the ambient default: `config/test.exs`
-      # sets an Application-level default of 1 (#488, so the suite reads ANN the way
-      # production does and filtered searches stop under-returning on the shared test
-      # HNSW indexes). An explicit SystemConfig value always WINS over that default, which
-      # is the operator-lever contract this test exists to pin.
+      # Prime 0 EXPLICITLY rather than relying on the ambient default, so the mapping
+      # contract is pinned independently of what the shipped default happens to be.
       prime_iterative_scan(0)
       assert HeavyRead.hnsw_iterative_scan() == "off", "explicit 0 => off"
 
@@ -177,7 +174,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
     test "opts/1 attaches :hnsw_iterative_scan for ANN endpoints ONLY when enabled" do
       # OFF: no key on any endpoint, so pgvector < 0.8 (no such GUC) is never touched.
-      # Primed explicitly — see the mapping test above for why the ambient default is 1 here.
+      # Primed explicitly so the assertion does not depend on the ambient default.
       prime_iterative_scan(0)
 
       for endpoint <- HeavyRead.ann_endpoints() do
@@ -220,7 +217,9 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     test "an ANN heavy read at OFF issues NO SET LOCAL hnsw.iterative_scan" do
       # OFF must touch NOTHING iterative-scan — this is what keeps the feature inert (and
       # safe on a pgvector < 0.8 backend without the GUC) until an operator opts in.
-      # Primed explicitly because config/test.exs defaults the suite to 1 (#488).
+      # Primed explicitly so the assertion does not depend on the ambient SystemConfig
+      # default. No config pin is permitted for this key (config/test.exs sets none, and
+      # `Loopctl.ConfigEmbeddingReadPathTest` fails the build if any config file does).
       prime_iterative_scan(0)
       assert HeavyRead.hnsw_iterative_scan() == "off", "precondition: OFF"
       tenant = fixture(:tenant)
@@ -270,8 +269,64 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       # deterministic decision logic is covered by version_at_least?/2 above. Here we assert
       # the live probe succeeds against the actual test DB so the emission tests' precondition
       # (that iterative scan CAN be enabled) is real, not assumed.
-      assert HeavyRead.iterative_scan_supported?()
+      clear_iterative_scan_probe_cache()
+
+      assert HeavyRead.iterative_scan_supported?(), """
+      The live pgvector capability probe did NOT report >= 0.8 against the test database.
+
+      Either the backend's pgvector is too old (CI must run the pgvector/pgvector:pg16
+      image; check `SELECT extversion FROM pg_extension WHERE extname = 'vector'`), or the
+      probe was inconclusive (HeavyReadRepo checkout failure — see the warning above).
+
+      The SET LOCAL emission tests in this describe block depend on this precondition.
+      """
     end
+
+    test "enabled + UNSUPPORTED backend emits NO iterative-scan GUC (the < 0.8 safety gate)" do
+      # The composed guarantee the moduledoc promises: an operator flipping the lever on a
+      # pgvector < 0.8 backend is a NO-OP, not a fleet-wide ANN outage. Primed through the
+      # probe cache because the capability is a property of the connected backend.
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      for endpoint <- HeavyRead.ann_endpoints() do
+        refute Keyword.has_key?(HeavyRead.opts(endpoint), :hnsw_iterative_scan),
+               "expected #{endpoint} to carry NO :hnsw_iterative_scan on an unsupported backend"
+      end
+    end
+
+    test "an EXPIRED probe verdict is re-probed rather than pinned for the VM lifetime" do
+      # A stale `false` (e.g. negative-cached during a pool blip) must not silently no-op the
+      # operator's lever forever, and a stale `true` must not outlive a backend change.
+      prime_expired_iterative_scan_supported(false)
+
+      assert HeavyRead.iterative_scan_supported?(),
+             "expected an expired cache entry to re-probe the live backend"
+    end
+  end
+
+  @probe_cache_key {Loopctl.HeavyRead, :iterative_scan_supported}
+
+  # The probe caches a VM-global `:persistent_term` verdict. Every mutation of it — including
+  # the one the LIVE probe performs — is erased on exit, exactly like the prime_* helpers
+  # below, so the unsupported / re-probe branches stay reachable for later tests.
+  defp clear_iterative_scan_probe_cache do
+    :persistent_term.erase(@probe_cache_key)
+    on_exit(fn -> :persistent_term.erase(@probe_cache_key) end)
+  end
+
+  defp prime_iterative_scan_supported(verdict) do
+    :persistent_term.put(
+      @probe_cache_key,
+      {verdict, System.monotonic_time(:millisecond) + 60_000}
+    )
+
+    on_exit(fn -> :persistent_term.erase(@probe_cache_key) end)
+  end
+
+  defp prime_expired_iterative_scan_supported(verdict) do
+    :persistent_term.put(@probe_cache_key, {verdict, System.monotonic_time(:millisecond) - 1})
+    on_exit(fn -> :persistent_term.erase(@probe_cache_key) end)
   end
 
   defp prime_iterative_scan(code) do

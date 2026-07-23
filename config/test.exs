@@ -662,12 +662,9 @@ config :loopctl, :custody_flush_debounce_seconds, 0
 # the real `SystemConfigReadPath`, so every other test keeps production behaviour.
 config :loopctl, :embedding_read_path, Loopctl.MockEmbeddingReadPath
 
-# #488 / US-41.1: run ANN reads the way PRODUCTION runs them — iterative scan ON
-# (1 = relaxed_order). The test HNSW indexes are SHARED across every tenant and every
-# concurrently-running test, so at the default ef_search a tenant-filtered ANN can fill
-# its entire candidate window with OTHER tenants' rows and return ZERO of its own. That
-# is the exact filtered-under-return #488 fixed, and it surfaced here as intermittent
-# empty result sets in the US-41.1 read-path tests (`left: []`), which read as a vector
-# recall bug rather than a filtering artifact. Injected via Application config so no test
-# writes the VM-global `SystemConfig` / `:persistent_term` cache to get it.
-config :loopctl, :hnsw_iterative_scan, 1
+# NB (#488 / US-41.1): `hnsw.iterative_scan` is deliberately NOT pinned here. It is the
+# PRODUCTION remedy for cross-tenant filtered ANN under-return, shipped config-gated OFF
+# behind the `SystemConfig` lever pending an operator flip. Turning it on suite-wide would
+# make CI stop exercising the shipped default and blind it to under-return regressions.
+# The TEST-side remedy for shared-HNSW-index recall flakes is per-test ORTHOGONAL vectors
+# (`Loopctl.DataCase.test_vec/2`, #487) — use that.

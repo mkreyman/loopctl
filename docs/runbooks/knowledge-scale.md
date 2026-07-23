@@ -435,6 +435,56 @@ fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.HeavyRea
 fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'Loopctl.HeavyReadRepo.transaction(fn r -> r.query!(\"SET LOCAL hnsw.ef_search = #{Loopctl.HeavyRead.hnsw_ef_search()}\"); IO.inspect(r.query!(\"SHOW hnsw.ef_search\").rows) end)'"
 ```
 
+### `hnsw.iterative_scan` filtered-recall lever (#488 / #491)
+
+The sibling lever to `hnsw_ef_search`, for a DIFFERENT failure: a **filtered** ANN
+(tenant scope, dimension, category, status) applies its residual filters AFTER the index
+walk, so on a SHARED HNSW index a tenant can fill its whole `ef_search` candidate window
+with OTHER tenants' rows and return **zero** of its own — an under-return that looks like
+a recall bug. pgvector >= 0.8's `hnsw.iterative_scan` fixes it by continuing the walk until
+the `LIMIT` is filled (or `hnsw.max_scan_tuples` is hit).
+
+It ships **OFF** and is a live `SystemConfig` INT CODE (`Loopctl.HeavyRead.hnsw_iterative_scan/0`):
+
+| `hnsw_iterative_scan` | mode emitted |
+|---|---|
+| `0` (default / missing / unknown code) | `off` — no `SET LOCAL` at all |
+| `1` | `relaxed_order` |
+| `2` | `strict_order` |
+
+```sql
+-- confirm pgvector >= 0.8 FIRST: SELECT extversion FROM pg_extension WHERE extname = 'vector';
+UPDATE system_configs SET value = 1, updated_at = now() WHERE key = 'hnsw_iterative_scan';
+-- optional ceiling on how far the iterative walk may go (pgvector default 20000):
+UPDATE system_configs SET value = 50000, updated_at = now() WHERE key = 'hnsw_max_scan_tuples';
+```
+
+Contract, and the ways it can silently do nothing:
+
+- **`SystemConfig` is the ONLY source.** Unlike `ef_search` there is no `ALTER ROLE`
+  interaction to reason about and, deliberately, **no `Application` config override** — an
+  environment pin would either shadow the operator lever or (in the test env) stop CI
+  exercising the shipped default. `config_embedding_read_path_test.exs` fails the build if
+  a `:hnsw_iterative_scan` key appears in any `config/*.exs` file, in either the
+  `config :loopctl, :key, value` or the `config :loopctl, key: value` shape.
+- **Fail-closed capability probe.** On pgvector < 0.8 the GUC does not exist. Enabling the
+  key there is a **silent NO-OP**, not an outage: `Loopctl.HeavyRead.iterative_scan_supported?/0`
+  probes `pg_extension` on the heavy-read repo (cached in `:persistent_term` with a TTL) and
+  logs a warning naming the detected version — or, when the extension is not installed at
+  all, a distinct "pgvector is NOT INSTALLED" warning, so you are not sent chasing an
+  upgrade that is not the problem. A probe that could not reach a conclusion (pool timeout,
+  DB blip, wedged-pool exit) is negative-cached for 60s only, so one bad moment cannot pin
+  the lever off until a redeploy — while a sustained outage costs one probe per minute
+  instead of one per ANN read. The conclusive verdict expires after 10 min so a backend
+  change (replica failover onto an older pgvector) self-heals.
+- **Only ANN endpoints, only when enabled.** `SET LOCAL hnsw.iterative_scan = <mode>` plus
+  `SET LOCAL hnsw.max_scan_tuples = <n>` are emitted inside the same short heavy-read
+  transaction as `statement_timeout`/`ef_search`, for `Loopctl.HeavyRead.ann_endpoints/0`
+  only. At `0` no GUC round-trip happens and the probe is never paid for.
+- **Verify through the pool** the same way as `ef_search` (inside a transaction — it is a
+  `SET LOCAL`), and expect latency to rise on filtered queries: the walk is longer by
+  construction. `hnsw_max_scan_tuples` is the bound; it is clamped to `[1, 1_000_000]`.
+
 ### Recall ceiling + the under-fill signal (US-27.6b)
 
 Recall on every kNN/`suggested_links` read is bounded by **two** things: `hnsw.ef_search`

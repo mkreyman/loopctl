@@ -68,6 +68,12 @@ defmodule Loopctl.Knowledge.VectorEndpointE2eLatencyScaleTest do
   defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
 
   setup do
+    # `config/test.exs` points `:embedding_read_path` at a Mox mock for the whole test
+    # env, and this module does not `use Loopctl.DataCase`, so nothing has stubbed it.
+    # Without this, any read reaching `Embeddings.side_table_reads_enabled?/0` raises
+    # `Mox.UnexpectedCallError` in the nightly scale job.
+    Loopctl.DataCase.stub_embedding_read_path()
+
     # 1. Seed the corpus + tenant + an agent API key — all COMMITTED (unboxed) so the real
     #    conn (which reads on AdminRepo) finds them.
     {tenant, raw_key} =

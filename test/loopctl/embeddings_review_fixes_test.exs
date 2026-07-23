@@ -21,9 +21,10 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
     * the re-embed pin moving BEFORE the completeness-gated sweep;
     * the enforced (not merely denormalized) `memory_embeddings.subject_id`.
 
-  `async: false` for the same reason as `Loopctl.EmbeddingsSideTableReadsTest`: the
+  `async: true` for the same reason as `Loopctl.EmbeddingsSideTableReadsTest`: the
   cutover read-path decision is injected (`Loopctl.Embeddings.ReadPathBehaviour`)
-  and stubbed per-process, never flipped VM-globally.
+  and stubbed per-process, never flipped VM-globally, so nothing here writes shared
+  state.
   """
 
   use Loopctl.DataCase, async: true

@@ -96,6 +96,49 @@ pool"; the same evidence is now recorded for the `hnsw.ef_search` `SET LOCAL`:
   a transaction), so the first non-default use IS the recorded live round-trip check before
   reliance.
 
+### `hnsw.iterative_scan` — the FILTERED-recall lever (#488 / #491)
+
+`ef_search` widens the index walk; it does not fix a **residual-filter** under-return. A
+tenant-filtered (or dimension-/category-/status-filtered) ANN applies those predicates
+AFTER the index walk, so on a shared HNSW index the whole `ef_search` candidate window can
+belong to other tenants and the query returns **zero** rows that pass the filter. pgvector
+**>= 0.8**'s `hnsw.iterative_scan` resumes the walk until the `LIMIT` is satisfied or
+`hnsw.max_scan_tuples` is reached.
+
+Design points (`Loopctl.HeavyRead.hnsw_iterative_scan/0`, `hnsw_max_scan_tuples/0`):
+
+| `SystemConfig hnsw_iterative_scan` | emitted |
+|---|---|
+| `0` (default / missing / unrecognized code) | nothing — no `SET LOCAL`, no capability probe |
+| `1` | `SET LOCAL hnsw.iterative_scan = relaxed_order` (+ `hnsw.max_scan_tuples`) |
+| `2` | `SET LOCAL hnsw.iterative_scan = strict_order` (+ `hnsw.max_scan_tuples`) |
+
+- **Single source of truth.** `SystemConfig` only. There is deliberately **no**
+  `Application`-level override (and none may be added — `config_embedding_read_path_test.exs`
+  fails the build on one): an env pin would shadow the operator lever in prod, and pinning
+  it ON for the test env would make CI stop exercising the shipped default (`0`) and go
+  blind to exactly the filtered-under-return class this lever addresses. Tests that need a
+  mode prime the `SystemConfig` cache explicitly in an `async: false` module.
+- **Ships OFF, on purpose.** It is an operator flip made **after** confirming the deployed
+  pgvector is >= 0.8, per the runbook — not a default.
+- **Fail-closed, non-poisoning capability probe.** `iterative_scan_supported?/0` reads
+  `pg_extension` on the SAME repo the ANN read uses (`HeavyRead.repo/0`, with an explicit
+  5s timeout) and caches the answer in `:persistent_term` **with a TTL**. An old extension →
+  `false` + a warning naming the detected version; an ABSENT extension gets its own distinct
+  warning (it is not a version problem). Either way the setting is a silent no-op, NOT a
+  raise: nothing is emitted, so the ANN read is unaffected. Errors AND exits (`:noproc`, a
+  wedged-pool `{:timeout, _}`) are both caught. An INCONCLUSIVE probe (pool timeout, DB blip)
+  is negative-cached for only 60s — short enough that a transient failure cannot pin the lever
+  off VM-wide until a redeploy, bounded enough that a degraded backend costs one probe + one
+  log line per minute rather than one per ANN read. The CONCLUSIVE verdict also expires
+  (10 min), so a replica failover onto an older pgvector self-heals instead of 500-ing every
+  ANN read with a GUC the new backend rejects.
+- **Cost.** The mode string is looked up from a fixed table, so the value interpolated into
+  the `SET LOCAL` is always one of three literals — never operator text. The extra GUCs ride
+  the existing short heavy-read transaction (no new checkout). Filtered-query latency rises
+  by construction; `hnsw_max_scan_tuples` (clamped `[1, 1_000_000]`, pgvector default 20000)
+  is the bound.
+
 ### Why per-request `SET LOCAL hnsw.ef_search` is now safe (the stale objection)
 
 The moduledocs/runbook historically said per-request `SET LOCAL hnsw.ef_search`

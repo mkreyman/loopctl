@@ -42,9 +42,9 @@ defmodule Loopctl.DataCase do
     Loopctl.DataCase.setup_sandbox(tags)
     Mox.set_mox_from_context(tags)
     stub_all_defaults()
-    # Per-test embedding axis: every test gets a UNIQUE integer, so `test_vec/2` places
-    # this test's vectors in a disjoint window of the shared pgvector HNSW index. Setup
-    # runs in the test process, so `Process.get(:test_vec_axis)` at insert time sees it.
+    # Per-test embedding axis: every test gets a UNIQUE integer, so `test_vec/2` hashes
+    # this test's vectors onto its own sparse dimensions of the shared pgvector HNSW index.
+    # Setup runs in the test process, so `Process.get(:test_vec_axis)` at insert time sees it.
     Process.put(:test_vec_axis, System.unique_integer([:positive]))
     :ok
   end
@@ -66,6 +66,25 @@ defmodule Loopctl.DataCase do
   end
 
   @doc """
+  US-41.1: default the injected read-path decision to the REAL SystemConfig-backed
+  implementation, so a test sees production behaviour (legacy column until an operator
+  flips the flag). The US-41.1 read-path tests override this with a process-scoped
+  `Mox.stub/3` instead of mutating the VM-global flag.
+
+  `config/test.exs` points `:embedding_read_path` at `Loopctl.MockEmbeddingReadPath` for
+  the WHOLE test env, so ANY test that reaches `Loopctl.Embeddings.side_table_reads_enabled?/0`
+  needs this stub — including tests that do NOT `use Loopctl.DataCase`/`ConnCase` (the
+  `:scale`/`:scale_nightly` modules on bare `ExUnit.Case`), which would otherwise raise
+  `Mox.UnexpectedCallError` in the nightly job instead of reading the flag. Those modules
+  call this directly from their own `setup`; `stub_all_defaults/0` calls it for everyone else.
+  """
+  def stub_embedding_read_path do
+    Mox.stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn ->
+      SystemConfigReadPath.side_table_reads_enabled?()
+    end)
+  end
+
+  @doc """
   Sets permissive default stubs for all Mox mocks.
 
   These stubs allow tests to run without explicitly setting up
@@ -79,13 +98,7 @@ defmodule Loopctl.DataCase do
       Coverage.covered_paths()
     end)
 
-    # US-41.1: default to the REAL SystemConfig-backed read-path decision, so every
-    # pre-existing test sees production behaviour (legacy column until an operator
-    # flips the flag). The US-41.1 read-path tests override this with a
-    # process-scoped `Mox.stub/3` instead of mutating the VM-global flag.
-    Mox.stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn ->
-      SystemConfigReadPath.side_table_reads_enabled?()
-    end)
+    stub_embedding_read_path()
 
     Mox.stub(Loopctl.MockHealthChecker, :check, fn ->
       {:ok,
@@ -374,9 +387,9 @@ defmodule Loopctl.DataCase do
     end)
   end
 
-  # The per-test embedding window width. Each test claims a disjoint pair of windows
-  # (`:primary` at `base_p`, `:orthogonal` at `base_s = base_p + @test_vec_window`),
-  # so two tests are exactly ORTHOGONAL and never share coordinates.
+  # The per-test embedding window width: each test claims `@test_vec_window` hot dimensions
+  # for `:primary` and another `@test_vec_window` (disjoint) for `:orthogonal`, all selected
+  # by INDEPENDENT hashes of the test's unique axis (see `test_vec/2`).
   @test_vec_window 8
 
   @doc """
@@ -390,42 +403,79 @@ defmodule Loopctl.DataCase do
   evicted before the tenant filter runs. That is the shared-index recall flake (issue #421 /
   the AC-41.1.5 side-table ranking flake).
 
-  Keying each test's vectors on its unique `:test_vec_axis` (set in setup) into DISJOINT sparse
-  windows makes different tests exactly ORTHOGONAL — no cross-test clique AND no crowding (a
-  dense per-test rotation was tried and FAILS: rotated dense vectors sit nearer the query than a
+  Keying each test's vectors on its unique `:test_vec_axis` (set in setup) into SPARSE,
+  hash-selected dimensions is what breaks the cross-test clique — without crowding (a dense
+  per-test rotation was tried and FAILS: rotated dense vectors sit nearer the query than a
   0.71 neighbour and fill the `ef_search` budget). Within a single test the geometry is
-  preserved: `:primary`/`:query`/`:close` are identical (cosine 1.0), `:near` overlaps half the
-  primary window (cosine ~0.71), and `:orthogonal` shares no dimension with `:primary` (cosine 0).
+  preserved exactly: `:primary`/`:query`/`:close` are identical (cosine 1.0), `:near` is half
+  the primary dimensions (cosine ~0.71), and `:orthogonal` shares NO dimension with `:primary`
+  (cosine 0).
+
+  ## What the cross-test guarantee actually is
+
+  The hot dimensions are `@test_vec_window` INDEPENDENT hashes of the axis, drawn from the
+  full `dim` range — NOT `rem(axis, dim / 16)` window slots, which pigeonholed the whole suite
+  into 96 windows at 1536-dim and made byte-identical vectors (the all-ties clique) a ~25%
+  birthday event between two concurrently-running tests. Precisely:
+
+    * two tests produce IDENTICAL vectors only if all #{@test_vec_window} independent hashes collide —
+      negligible, and identity is the shape that recreates the clique;
+    * an incidental single-dimension overlap between two tests is possible (~1% per pair) and
+      is harmless: it yields cosine 1/#{@test_vec_window} = 0.125, far below the ~0.71 `:near` neighbour the
+      recall assertions rank against.
+
+  Do NOT reintroduce a fixed/global vector here, and do not "simplify" the hashing back to a
+  modular window index — dissolving the shared-HNSW-index clique is the entire point.
+
+  Requires `dim >= 2 * #{@test_vec_window}` so the primary and orthogonal dimension sets can be disjoint.
 
   Kinds (aliases group by MEANING so call sites read naturally):
 
-    * `:primary` | `:query` | `:close` | `:self` | `:similar` | `:base` — the primary window
-    * `:near` — half the primary window (a strictly-worse but genuinely-near neighbour, ~0.71)
-    * `:orthogonal` | `:secondary` | `:dissimilar` | `:complement` — the disjoint window (⊥ primary)
+    * `:primary` | `:query` | `:close` | `:self` | `:similar` | `:base` — the primary dimensions
+    * `:near` — half the primary dimensions (a strictly-worse but genuinely-near neighbour, ~0.71)
+    * `:orthogonal` | `:secondary` | `:dissimilar` | `:complement` — the disjoint set (⊥ primary)
   """
   @spec test_vec(pos_integer(), atom()) :: [float()]
-  def test_vec(dim, kind \\ :primary) do
-    axis = Process.get(:test_vec_axis, 0)
-    slots = max(div(dim, @test_vec_window * 2), 1)
-    base_p = rem(axis, slots) * @test_vec_window * 2
-    base_s = base_p + @test_vec_window
-
-    case kind do
-      k when k in [:primary, :query, :close, :self, :similar, :base] ->
-        test_vec_ones(dim, base_p, @test_vec_window)
-
-      :near ->
-        test_vec_ones(dim, base_p, div(@test_vec_window, 2))
-
-      k when k in [:orthogonal, :secondary, :dissimilar, :complement] ->
-        test_vec_ones(dim, base_s, @test_vec_window)
+  def test_vec(dim, kind \\ :primary) when is_integer(dim) do
+    if dim < @test_vec_window * 2 do
+      raise ArgumentError,
+            "test_vec/2 needs dim >= #{@test_vec_window * 2} to keep :primary and :orthogonal " <>
+              "disjoint, got #{dim}"
     end
+
+    axis = Process.get(:test_vec_axis, 0)
+    {primary, orthogonal} = Enum.split(test_vec_dims(axis, dim), @test_vec_window)
+
+    hot =
+      case kind do
+        k when k in [:primary, :query, :close, :self, :similar, :base] ->
+          primary
+
+        :near ->
+          Enum.take(primary, div(@test_vec_window, 2))
+
+        k when k in [:orthogonal, :secondary, :dissimilar, :complement] ->
+          orthogonal
+      end
+
+    test_vec_ones(dim, hot)
   end
 
-  defp test_vec_ones(dim, base, ones),
-    do:
-      List.duplicate(0.0, base) ++
-        List.duplicate(1.0, ones) ++ List.duplicate(0.0, dim - base - ones)
+  # `2 * @test_vec_window` DISTINCT dimensions, a deterministic pure function of the axis.
+  # Each is its own `:erlang.phash2/1` over `{axis, salt}`, so the sets of two different
+  # axes coincide only on a multi-way hash collision.
+  defp test_vec_dims(axis, dim) do
+    0
+    |> Stream.iterate(&(&1 + 1))
+    |> Stream.map(&rem(:erlang.phash2({:test_vec, axis, &1}), dim))
+    |> Stream.uniq()
+    |> Enum.take(@test_vec_window * 2)
+  end
+
+  defp test_vec_ones(dim, hot) do
+    set = MapSet.new(hot)
+    Enum.map(0..(dim - 1), fn i -> if MapSet.member?(set, i), do: 1.0, else: 0.0 end)
+  end
 
   # A DETERMINISTIC per-TENANT embedding for the default MockEmbeddingClient stubs
   # (stub_all_defaults/0). Returns a 1536-dim vector that is a PURE FUNCTION of the

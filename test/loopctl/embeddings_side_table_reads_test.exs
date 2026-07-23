@@ -82,7 +82,11 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
     # revert) is covered against the real production implementation in
     # `system_config_read_path_test.exs`. Asserting it here would only assert the
     # injected mock. What this module covers is the READ PATH each decision selects.
-    test "the injected read-path decision switches the query path and is REVERSIBLE" do
+    # NB: this asserts the DI WIRING only — that `side_table_reads_enabled?/0` returns
+    # whatever the injected decision says, in both directions. The QUERY paths each
+    # decision selects are covered by the tests below (side table) and by "the legacy read
+    # path discloses keyword-only..." (legacy).
+    test "side_table_reads_enabled?/0 returns the injected decision, both ways (DI wiring)" do
       refute Embeddings.side_table_reads_enabled?()
       enable_side_table_reads()
       assert Embeddings.side_table_reads_enabled?()
