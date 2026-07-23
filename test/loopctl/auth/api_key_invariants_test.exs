@@ -17,7 +17,7 @@ defmodule Loopctl.Auth.ApiKeyInvariantsTest do
 
   describe "nil identity self-check" do
     test "validate_not_self_report blocks nil agent_id" do
-      %{tenant: tenant, story: story, agent: agent} = setup_implementing_story()
+      %{tenant: tenant, story: story, agent: _agent} = setup_implementing_story()
 
       result = Progress.report_story(tenant.id, story.id, agent_id: nil)
       assert result == {:error, :self_report_blocked}
