@@ -30,6 +30,7 @@ defmodule Loopctl.Custody.SignedProfile do
 
   @attestation_domain "loopctl/dispatch-attestation/1"
   @claim_domain "loopctl/custody-claim/1"
+  @owner_rotation_domain "loopctl/owner-key-rotation/1"
 
   # The only algorithm this version defines (LCP-1 §6.1). A future
   # "secp256k1-schnorr" (Nostr interop) is an ADDITIVE entry here plus a matching
@@ -279,6 +280,12 @@ defmodule Loopctl.Custody.SignedProfile do
   Validates a `conditions` string per the LCP-1 §9.2 grammar: the empty string, or
   `&`-separated `gate=<name>` / `expires<unix-timestamp>` clauses, ASCII, no
   whitespace, no leading/trailing/double `&`, canonical base-10 timestamps.
+
+  `gate=` is SINGLE-VALUED. `conditions_met?/3` conjuncts every clause, so two
+  `gate=` clauses (e.g. `gate=report&gate=verify`) can never both be satisfied by
+  one claim's single gate — the attestation would authorize NOTHING for any gate.
+  Rather than accept an unusable attestation and let it fail silently at claim
+  time, reject more than one `gate=` clause here, at signing/enrollment time.
   """
   @spec valid_conditions?(term()) :: boolean()
   def valid_conditions?(""), do: true
@@ -289,11 +296,18 @@ defmodule Loopctl.Custody.SignedProfile do
       String.starts_with?(conditions, "&") -> false
       String.ends_with?(conditions, "&") -> false
       String.contains?(conditions, "&&") -> false
-      true -> conditions |> String.split("&") |> Enum.all?(&valid_clause?/1)
+      true -> valid_clauses?(String.split(conditions, "&"))
     end
   end
 
   def valid_conditions?(_), do: false
+
+  # Every clause must be individually valid AND there may be at most one `gate=`
+  # clause — a second one makes the conjunctive `conditions_met?/3` unsatisfiable.
+  defp valid_clauses?(clauses) do
+    Enum.all?(clauses, &valid_clause?/1) and
+      Enum.count(clauses, &String.starts_with?(&1, "gate=")) <= 1
+  end
 
   @doc """
   Evaluates the `conditions` of a verified attestation against a concrete claim.
@@ -341,6 +355,38 @@ defmodule Loopctl.Custody.SignedProfile do
 
   defp ascii_no_space?(s),
     do: s == for(<<c <- s>>, c > 32 and c < 127, into: "", do: <<c>>)
+
+  # ── Owner-key rotation proof (LCP-1 §9.2 root of trust) ───────────────────
+
+  @doc """
+  The preimage the OUTGOING owner key signs to authorize a rotation to a new owner
+  key.
+
+  `preimage = domain || LP(tenant_id) || LP(new_pubkey) || LP(new_alg)`
+
+  Rotating the §9.2 owner key re-roots the entire attestation chain, so a rotation
+  MUST prove possession of the retiring root private half — a stolen `:user` API
+  key alone cannot re-root trust. First registration (no prior key) is authorized
+  by the human-anchor + `:user` gate instead; there is no outgoing key to sign.
+  """
+  @spec owner_rotation_preimage(binary(), binary(), String.t()) :: binary()
+  def owner_rotation_preimage(tenant_id, new_pubkey, new_alg)
+      when is_binary(new_pubkey) and is_binary(new_alg) do
+    lp(@owner_rotation_domain) <>
+      lp(to_string(tenant_id)) <>
+      lp(new_pubkey) <>
+      lp(new_alg)
+  end
+
+  @doc """
+  Verifies a raw `signature` over `preimage` under `alg` and `pubkey`.
+
+  Public wrapper over the algorithm-agile signature backend, for callers (e.g.
+  owner-key rotation proofs) that build their own domain-separated preimage.
+  Returns a boolean; never raises.
+  """
+  @spec verify(String.t(), binary(), binary(), binary()) :: boolean()
+  def verify(alg, preimage, signature, pubkey), do: verify_sig(alg, preimage, signature, pubkey)
 
   # ── Signature backend (LCP-1 §6.1 algorithm agility) ──────────────────────
 

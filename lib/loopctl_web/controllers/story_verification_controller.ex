@@ -39,6 +39,12 @@ defmodule LoopctlWeb.StoryVerificationController do
   # must carry a valid signature. No-op under the default `bearer` profile.
   plug LoopctlWeb.Plugs.RequireSignedClaim, [gate: "verify"] when action in [:verify]
 
+  # The aggregate verify-all path reaches the SAME `verified` transition but cannot
+  # carry a per-item signature; under `signed` it refuses an enrolled caller rather
+  # than waiving the signature for a whole epic (LCP-1 §9.3).
+  plug LoopctlWeb.Plugs.RequireSignedClaim,
+       [gate: "verify", bulk: true] when action in [:verify_all]
+
   tags(["Progress"])
 
   operation(:verify,

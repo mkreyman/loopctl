@@ -15,6 +15,7 @@ defmodule LoopctlWeb.TenantController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Dispatches
   alias Loopctl.Tenants
   alias Loopctl.Tenants.TierCapabilities
 
@@ -71,7 +72,15 @@ defmodule LoopctlWeb.TenantController do
              type: :string,
              description: "Hex-encoded 32-byte Ed25519 public key"
            },
-           alg: %OpenApiSpex.Schema{type: :string, enum: ["ed25519"], example: "ed25519"}
+           alg: %OpenApiSpex.Schema{type: :string, enum: ["ed25519"], example: "ed25519"},
+           rotation_proof: %OpenApiSpex.Schema{
+             type: :string,
+             nullable: true,
+             description:
+               "Required only when ROTATING an existing owner key: hex Ed25519 signature " <>
+                 "by the OUTGOING owner key over owner_rotation_preimage(tenant_id, " <>
+                 "new_pubkey, new_alg). Omit on first registration."
+           }
          }
        }},
     responses: %{
@@ -123,18 +132,50 @@ defmodule LoopctlWeb.TenantController do
   """
   def register_owner_key(conn, params) do
     with {:ok, tenant} <- require_tenant(conn),
-         {:ok, pubkey} <- decode_owner_pubkey(params["owner_pubkey"]) do
+         {:ok, pubkey} <- decode_owner_pubkey(params["owner_pubkey"]),
+         {:ok, rotation_proof} <- decode_rotation_proof(params["rotation_proof"]) do
       alg = params["alg"] || "ed25519"
 
-      case Tenants.register_custody_owner_key(tenant.id, pubkey, alg) do
+      # LCP-1 §9.2: attribute the root-key registration/rotation to the ACTING key's
+      # dispatch lineage in the tamper-evident chain — re-rooting trust must not be
+      # recorded with an empty actor. `rotation_proof` (proof of possession of the
+      # OUTGOING owner key) is required by the context only when a key already
+      # exists; first registration ignores it.
+      opts =
+        [
+          actor_lineage:
+            Dispatches.lineage_for_api_key(tenant.id, conn.assigns.current_api_key.id)
+        ]
+        |> maybe_put_rotation_proof(rotation_proof)
+
+      case Tenants.register_custody_owner_key(tenant.id, pubkey, alg, opts) do
         {:ok, updated} ->
           conn |> put_status(:ok) |> json(%{tenant: tenant_json(updated)})
 
         {:error, %Ecto.Changeset{} = changeset} ->
           {:error, changeset}
+
+        {:error, reason}
+        when reason in [:owner_rotation_proof_required, :owner_rotation_proof_invalid] ->
+          {:error, :unprocessable_entity, rotation_proof_error_message(reason)}
       end
     end
   end
+
+  defp maybe_put_rotation_proof(opts, nil), do: opts
+  defp maybe_put_rotation_proof(opts, proof), do: Keyword.put(opts, :rotation_proof, proof)
+
+  defp rotation_proof_error_message(:owner_rotation_proof_required),
+    do:
+      "This tenant already has a custody owner key, so rotating it requires proof of " <>
+        "possession of the OUTGOING owner private key. Sign owner_rotation_preimage" <>
+        "(tenant_id, new_pubkey, new_alg) with the current owner key and send it as " <>
+        "`rotation_proof` (hex)."
+
+  defp rotation_proof_error_message(:owner_rotation_proof_invalid),
+    do:
+      "The `rotation_proof` did not verify against the current owner key. Re-sign the " <>
+        "exact owner_rotation_preimage(tenant_id, new_pubkey, new_alg) with the OUTGOING owner key."
 
   defp decode_owner_pubkey(hex) when is_binary(hex) do
     case Base.decode16(hex, case: :mixed) do
@@ -144,6 +185,21 @@ defmodule LoopctlWeb.TenantController do
   end
 
   defp decode_owner_pubkey(_), do: {:error, :unprocessable_entity, "owner_pubkey is required"}
+
+  # `rotation_proof` is optional (absent on first registration). When present it must
+  # decode as hex; the signature is verified server-side by the Tenants context.
+  defp decode_rotation_proof(nil), do: {:ok, nil}
+  defp decode_rotation_proof(""), do: {:ok, nil}
+
+  defp decode_rotation_proof(hex) when is_binary(hex) do
+    case Base.decode16(hex, case: :mixed) do
+      {:ok, raw} -> {:ok, raw}
+      :error -> {:error, :unprocessable_entity, "rotation_proof must be hex-encoded"}
+    end
+  end
+
+  defp decode_rotation_proof(_),
+    do: {:error, :unprocessable_entity, "rotation_proof must be a hex string"}
 
   defp tenant_json(tenant) do
     %{

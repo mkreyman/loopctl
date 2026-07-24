@@ -12,10 +12,18 @@ defmodule Loopctl.Tenants.CustodyOwnerKeyTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
+  alias Loopctl.Custody.SignedProfile
   alias Loopctl.Tenants
   alias Loopctl.Tenants.CustodyOwnerKeyHistory
 
   setup :verify_on_exit!
+
+  # A rotation must prove possession of the OUTGOING owner private key: a signature
+  # over owner_rotation_preimage(tenant_id, new_pubkey, new_alg).
+  defp rotation_proof(tenant_id, old_priv, new_pub, new_alg \\ "ed25519") do
+    preimage = SignedProfile.owner_rotation_preimage(tenant_id, new_pub, new_alg)
+    SignedProfile.sign("ed25519", preimage, old_priv)
+  end
 
   defp owner_key_events(tenant_id) do
     tenant_id
@@ -50,11 +58,15 @@ defmodule Loopctl.Tenants.CustodyOwnerKeyTest do
   describe "register_custody_owner_key/4 — rotation" do
     test "archives the prior key with a validity window and records a second event" do
       tenant = fixture(:tenant)
-      {pub1, _} = :crypto.generate_key(:eddsa, :ed25519)
+      {pub1, priv1} = :crypto.generate_key(:eddsa, :ed25519)
       {pub2, _} = :crypto.generate_key(:eddsa, :ed25519)
 
       {:ok, _} = Tenants.register_custody_owner_key(tenant.id, pub1, "ed25519")
-      {:ok, rotated} = Tenants.register_custody_owner_key(tenant.id, pub2, "ed25519")
+
+      {:ok, rotated} =
+        Tenants.register_custody_owner_key(tenant.id, pub2, "ed25519",
+          rotation_proof: rotation_proof(tenant.id, priv1, pub2)
+        )
 
       assert rotated.custody_owner_pubkey == pub2
 
@@ -71,6 +83,54 @@ defmodule Loopctl.Tenants.CustodyOwnerKeyTest do
       rotation_event = Enum.find(events, &(&1.payload["rotated"] == true))
       assert rotation_event.payload["owner_pubkey"] == Base.encode16(pub2, case: :lower)
       assert rotation_event.payload["previous_owner_pubkey"] == Base.encode16(pub1, case: :lower)
+    end
+
+    test "rotation without a rotation_proof is rejected" do
+      tenant = fixture(:tenant)
+      {pub1, _} = :crypto.generate_key(:eddsa, :ed25519)
+      {pub2, _} = :crypto.generate_key(:eddsa, :ed25519)
+
+      {:ok, _} = Tenants.register_custody_owner_key(tenant.id, pub1, "ed25519")
+
+      assert {:error, :owner_rotation_proof_required} =
+               Tenants.register_custody_owner_key(tenant.id, pub2, "ed25519")
+
+      # The owner key is unchanged and no phantom rotation was recorded.
+      assert history_rows(tenant.id) == []
+      assert length(owner_key_events(tenant.id)) == 1
+    end
+
+    test "rotation with a proof signed by the WRONG key is rejected" do
+      tenant = fixture(:tenant)
+      {pub1, _priv1} = :crypto.generate_key(:eddsa, :ed25519)
+      {pub2, _} = :crypto.generate_key(:eddsa, :ed25519)
+      {_wrong_pub, wrong_priv} = :crypto.generate_key(:eddsa, :ed25519)
+
+      {:ok, _} = Tenants.register_custody_owner_key(tenant.id, pub1, "ed25519")
+
+      assert {:error, :owner_rotation_proof_invalid} =
+               Tenants.register_custody_owner_key(tenant.id, pub2, "ed25519",
+                 rotation_proof: rotation_proof(tenant.id, wrong_priv, pub2)
+               )
+
+      assert history_rows(tenant.id) == []
+      assert length(owner_key_events(tenant.id)) == 1
+    end
+  end
+
+  describe "register_custody_owner_key/4 — idempotent re-registration" do
+    test "re-submitting the SAME key writes no history row and forges no rotation event" do
+      tenant = fixture(:tenant)
+      {pub, _} = :crypto.generate_key(:eddsa, :ed25519)
+
+      {:ok, _} = Tenants.register_custody_owner_key(tenant.id, pub, "ed25519")
+      {:ok, again} = Tenants.register_custody_owner_key(tenant.id, pub, "ed25519")
+
+      assert again.custody_owner_pubkey == pub
+      assert history_rows(tenant.id) == []
+      # Only the original registration event exists — no phantom rotation.
+      assert [event] = owner_key_events(tenant.id)
+      assert event.payload["rotated"] == false
     end
   end
 end

@@ -105,6 +105,23 @@ defmodule LoopctlWeb.WellKnownController do
     # reason as the embedding fields: a compile-time literal would advertise
     # `bearer` even on a deployment that enforces signatures.
     |> Map.put(:custody_profile, SignedProfilePolicy.profile_string())
+    # LCP-1 §2.1 enforcement SCOPE. `custody_profile: "signed"` here means
+    # "signatures accepted and REQUIRED for enrolled dispatches", NOT "every claim
+    # is signed": the gradual-rollout waiver still accepts unsigned claims from
+    # non-enrolled (bearer/legacy) dispatches. Advertise that explicitly so an
+    # offline verifier keying off `signed` does not assume ALL claims carry a
+    # signature.
+    |> Map.put(:custody_enforcement, custody_enforcement())
+  end
+
+  # `enrolled_only` while the profile is `signed`: enrolled dispatches MUST sign,
+  # bearer/legacy dispatches are still accepted unsigned (gradual rollout). `none`
+  # under the default `bearer` profile — signatures are ignored entirely.
+  defp custody_enforcement do
+    case SignedProfilePolicy.profile() do
+      :signed -> "enrolled_only"
+      :bearer -> "none"
+    end
   end
 
   defp capabilities do
@@ -176,6 +193,10 @@ defmodule LoopctlWeb.WellKnownController do
                  properties: %{
                    spec_version: %{type: "string"},
                    custody_profile: %{type: "string", enum: ["bearer", "signed"]},
+                   custody_enforcement: %{
+                     type: "string",
+                     enum: ["none", "enrolled_only"]
+                   },
                    custody_spec: %{type: "string", format: "uri"},
                    custody_gates: %{type: "array", items: %{type: "string"}},
                    audit_leaf_hash_version: %{type: "integer"},

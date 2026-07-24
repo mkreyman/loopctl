@@ -2419,11 +2419,17 @@ async function createDispatch({
 }
 
 // LCP-1 §9.2: register/rotate the tenant custody owner key (root of trust).
-async function registerCustodyOwnerKey({ owner_pubkey, alg = "ed25519" }) {
+// ROTATION (an owner key already exists) requires `rotation_proof`: a hex Ed25519
+// signature by the OUTGOING owner key over owner_rotation_preimage(tenant_id,
+// new_pubkey, new_alg). First registration omits it. Proof of possession of the
+// retiring root key is what stops a stolen :user key from re-rooting trust.
+async function registerCustodyOwnerKey({ owner_pubkey, alg = "ed25519", rotation_proof }) {
+  const body = { owner_pubkey, alg };
+  if (rotation_proof) body.rotation_proof = rotation_proof;
   const result = await apiCall(
     "POST",
     "/api/v1/tenants/me/custody-owner-key",
-    { owner_pubkey, alg },
+    body,
     process.env.LOOPCTL_USER_KEY,
   );
   return toContent(result);
@@ -2453,8 +2459,12 @@ function lcpLp(buf) {
 }
 
 function lcpPresent(strOrNull) {
-  if (strOrNull === null || strOrNull === undefined || strOrNull === "")
-    return Buffer.from([0]);
+  // Only null/undefined is ABSENT (0x00). A present-but-EMPTY string is present
+  // (0x01 || LP("")), matching Elixir SignedProfile.present/1 exactly — the Elixir
+  // suite asserts a nil optional and an empty-string optional produce DIFFERENT
+  // preimages, so collapsing "" to absent here would break that invariant and make
+  // a claim signed with capability="" fail to verify server-side.
+  if (strOrNull === null || strOrNull === undefined) return Buffer.from([0]);
   return Buffer.concat([Buffer.from([1]), lcpLp(Buffer.from(strOrNull, "utf8"))]);
 }
 
@@ -2467,6 +2477,21 @@ function lcpCanonicalJson(value) {
       "{" +
       keys.map((k) => JSON.stringify(k) + ":" + lcpCanonicalJson(value[k])).join(",") +
       "}"
+    );
+  }
+  // Elixir LeafHash.canonical_json routes EVERY number through Decimal
+  // normalization (a single full-decimal string, never scientific notation), which
+  // this canonicalizer does not replicate — JSON.stringify(1e22) yields "1e+22"
+  // while Elixir yields "10000000000000000000000". v1 signs only an empty `body`
+  // and UUID-STRING lineage paths, so numbers never appear; refuse them LOUDLY
+  // rather than emit a signature that would silently fail to verify across the
+  // JS/Elixir boundary once body signing (finding/artifact content) lands. Aligning
+  // the number handling is a prerequisite for enabling body signing.
+  if (typeof value === "number" || typeof value === "bigint") {
+    throw new Error(
+      "lcpCanonicalJson: numeric values are not supported yet — the JS canonicalizer " +
+        "does not match Elixir's Decimal number normalization (LCP-1 canonical_json). " +
+        "v1 signs an empty body; do not sign numeric fields until this is aligned.",
     );
   }
   return JSON.stringify(value);

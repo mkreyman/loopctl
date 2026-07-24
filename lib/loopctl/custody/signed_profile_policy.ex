@@ -28,10 +28,33 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
 
   The signature binds `gate + work_item_id + capability_id + claimed_at` over an
   EMPTY `body` (§9.3 preimage with `body = %{}`). This proves "agent X authorized a
-  `<gate>` claim on work item Y with capability Z at time T" — the custody-critical
+  `<gate>` claim on work item Y at time T" — the custody-critical
   identity/authorization binding. Signing the finding/artifact CONTENT is a
   forward-compatible extension (populate `body`); it is deliberately out of the
   first activation to keep the agent/server contract unambiguous.
+
+  `capability_id` is bound INTO the preimage when the caller supplies a
+  `capability`/`cap_id` param, so a signature over one capability cannot be
+  presented for another. But the v1 custody gates (`report`/`review_complete`/
+  `verify`) do NOT themselves consume a separate capability token, so in practice
+  the field is usually absent and its binding is forward-compatible rather than
+  load-bearing today — do not read the v1 claim as proving "capability Z was
+  exercised".
+
+  ## Replay window (by design, §9.3)
+
+  A signed claim is verified STATELESSLY: there is no server-issued nonce and no
+  single-use consumption record. A captured, still-valid claim signature over the
+  same `gate + work_item_id + capability_id + claimed_at` is therefore accepted
+  repeatedly until its `claimed_at` leaves the 300-second freshness window
+  (`@claim_max_age_seconds`, `check_claim_fresh/4`). This is deliberate: §9.3 delegates
+  timeliness to the caller and a claim proves AUTHORSHIP, not one-time execution.
+  Practical impact is bounded by the custody STATE MACHINE — `report`/
+  `review_complete`/`verify` are one-way transitions, so a replayed claim on an
+  already-transitioned work item is rejected (409) by the gate regardless. Binding
+  and consuming a per-claim server nonce is a future, additive tightening, not a
+  change to this contract. Capability tokens (`Loopctl.Capabilities`) remain the
+  one-time-use primitive when a gate genuinely needs single-use semantics.
   """
 
   require Logger
@@ -135,6 +158,33 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
     end
   end
 
+  @doc """
+  Signed-profile gate for SET-BASED custody actions (bulk verify, epic verify-all,
+  bulk mark-complete), which reach the same `verified` transition as single-story
+  verify but carry an unbounded set of work items and therefore CANNOT present the
+  per-item claim signature §9.3 requires for each work item.
+
+  Under the `signed` profile an ENROLLED caller is refused — it must use the
+  single-story signed path so every verified transition carries its own signature;
+  otherwise an enrolled verifier forced to sign one verify could verify an entire
+  epic unsigned, defeating the §9.3 attribution guarantee on the highest-volume
+  path. A bearer/legacy caller is unaffected, mirroring `verify_request/7`'s
+  enrolled-only gradual-rollout waiver.
+  """
+  @spec verify_bulk_request(:bearer | :signed, Ecto.UUID.t(), Ecto.UUID.t() | nil) ::
+          :ok | {:error, :bulk_signature_unsupported}
+  def verify_bulk_request(:bearer, _tenant_id, _api_key_id), do: :ok
+
+  def verify_bulk_request(:signed, tenant_id, api_key_id) do
+    case Dispatches.dispatch_for_api_key(tenant_id, api_key_id) do
+      {:ok, %{agent_pubkey: pubkey}} when is_binary(pubkey) ->
+        {:error, :bulk_signature_unsupported}
+
+      _not_enrolled ->
+        :ok
+    end
+  end
+
   defp verify_enrolled(tenant_id, dispatch, gate, work_item_id, capability_id, claim_params) do
     # `require_sig/1` distinguishes "no signature" (`:claim_signature_required`) from
     # "signature present but the claim object is malformed" (`:malformed_claim`), per
@@ -161,6 +211,20 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
          :ok <- check_claim_fresh(claimed_at, gate, work_item_id, dispatch) do
       # Last step is the with's value (`:ok` or `{:error, :claim_condition_unmet}`).
       check_attestation_conditions(dispatch, gate)
+    else
+      # The `require_sig`/`require_present`/`require_int`/`decode_sig` guards return
+      # BEFORE `normalize_verify_result`/`check_claim_fresh`/`check_attestation_conditions`
+      # have logged, so an enrolled caller repeatedly hitting "no signature" or
+      # "malformed claim" (an attacker probing the signed gate, or a misconfigured
+      # agent) would otherwise leave zero server-side signal. Emit the same
+      # `log_reject` those later branches do; the already-logged reasons are returned
+      # untouched (no double log).
+      {:error, reason} = err when reason in [:claim_signature_required, :malformed_claim] ->
+        log_reject(gate, work_item_id, dispatch, "claim rejected pre-verify (#{reason})")
+        err
+
+      {:error, _reason} = err ->
+        err
     end
   end
 

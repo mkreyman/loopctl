@@ -25,7 +25,26 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaim do
   def init(opts) do
     gate = Keyword.fetch!(opts, :gate)
     unless gate in ["report", "review_complete", "verify"], do: raise("unknown custody gate")
-    %{gate: gate}
+    %{gate: gate, bulk: Keyword.get(opts, :bulk, false)}
+  end
+
+  # Bulk/aggregate custody actions (bulk verify, epic verify-all, mark-complete)
+  # cannot carry a per-item claim signature, so under the `signed` profile an
+  # enrolled caller is refused here rather than silently waived — closing the
+  # bypass where an enrolled verifier signs one story but verifies a whole set
+  # unsigned (LCP-1 §9.3).
+  def call(conn, %{bulk: true}) do
+    tenant_id = conn.assigns[:current_api_key] && conn.assigns.current_api_key.tenant_id
+    api_key_id = conn.assigns[:current_api_key] && conn.assigns.current_api_key.id
+
+    case SignedProfilePolicy.verify_bulk_request(
+           SignedProfilePolicy.profile(),
+           tenant_id,
+           api_key_id
+         ) do
+      :ok -> conn
+      {:error, code} -> reject(conn, code)
+    end
   end
 
   def call(conn, %{gate: gate}) do
@@ -48,18 +67,22 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaim do
         conn
 
       {:error, code} ->
-        conn
-        |> put_status(:unauthorized)
-        |> Phoenix.Controller.json(%{
-          error: %{
-            status: 401,
-            code: Atom.to_string(code),
-            message: message_for(code),
-            remediation: %{learn_more: "https://loopctl.com/spec/LCP-1"}
-          }
-        })
-        |> halt()
+        reject(conn, code)
     end
+  end
+
+  defp reject(conn, code) do
+    conn
+    |> put_status(:unauthorized)
+    |> Phoenix.Controller.json(%{
+      error: %{
+        status: 401,
+        code: Atom.to_string(code),
+        message: message_for(code),
+        remediation: %{learn_more: "https://loopctl.com/spec/LCP-1"}
+      }
+    })
+    |> halt()
   end
 
   defp message_for(:claim_signature_required),
@@ -91,4 +114,11 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaim do
       "Your dispatch's owner/parent attestation does not authorize this claim: a " <>
         "§9.2 condition (`gate=<name>` or `expires<ts>`) is unmet. Use a dispatch " <>
         "whose attestation covers this gate and is unexpired."
+
+  defp message_for(:bulk_signature_unsupported),
+    do:
+      "This deployment runs the LCP-1 signed custody profile and your dispatch is " <>
+        "enrolled with an agent key. Bulk/aggregate custody actions cannot carry the " <>
+        "per-item claim signature §9.3 requires for each work item, so an enrolled " <>
+        "caller must verify each story individually via the single-story signed path."
 end

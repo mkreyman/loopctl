@@ -14,12 +14,25 @@ defmodule Loopctl.Test.CustodyEnrollment do
 
   @doc """
   Ensures the tenant has an owner key and returns `{owner_pub, owner_priv}`.
-  Idempotent per test — generates and registers on first call.
+
+  Idempotent per test PROCESS: the keypair is generated + registered on the first
+  call for a tenant and cached in the process dictionary, so repeat calls (e.g.
+  `enroll_root/2` invoked several times in one test) reuse the SAME owner key
+  instead of rotating it. Rotation now requires a proof-of-possession signature by
+  the outgoing key, so a helper that silently re-registered a fresh key on every
+  call would fail — and a single owner key per tenant is the realistic shape anyway.
   """
   def ensure_owner_key(tenant_id) do
-    {pub, priv} = :crypto.generate_key(:eddsa, :ed25519)
-    {:ok, _} = Tenants.register_custody_owner_key(tenant_id, pub, "ed25519")
-    {pub, priv}
+    case Process.get({__MODULE__, :owner_key, tenant_id}) do
+      {_pub, _priv} = cached ->
+        cached
+
+      nil ->
+        {pub, priv} = :crypto.generate_key(:eddsa, :ed25519)
+        {:ok, _} = Tenants.register_custody_owner_key(tenant_id, pub, "ed25519")
+        Process.put({__MODULE__, :owner_key, tenant_id}, {pub, priv})
+        {pub, priv}
+    end
   end
 
   @doc """

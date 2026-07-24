@@ -179,15 +179,25 @@ defmodule Loopctl.Dispatches do
       |> Multi.run(:resolve_lineage, fn _repo, _changes ->
         resolve_lineage(tenant_id, parent_id)
       end)
-      |> Multi.run(:verify_attestation, fn _repo, %{resolve_lineage: parent_lineage} ->
+      |> Multi.run(:verify_attestation, fn _repo,
+                                           %{
+                                             resolve_lineage: %{
+                                               lineage: parent_lineage,
+                                               parent: parent
+                                             }
+                                           } ->
         # LCP-1 §9.2: enrolling an agent key REQUIRES an owner/parent attestation
         # over that key, verified against a key the operator does not hold — the
         # PARENT's agent key (delegation) or the tenant OWNER key (root). This is
         # what makes the signed profile prevention, not just detection: an operator
         # cannot enroll a usable agent key without an authorizing signature.
-        verify_enrollment_attestation(tenant_id, parent_id, parent_lineage, opts)
+        #
+        # The parent struct was already loaded by `resolve_lineage`; it is threaded
+        # here so `resolve_authorizer` reads the parent's agent_pubkey/alg WITHOUT a
+        # second `active_parent` SELECT for the same row.
+        verify_enrollment_attestation(tenant_id, parent, parent_lineage, opts)
       end)
-      |> Multi.run(:create_dispatch, fn _repo, %{resolve_lineage: parent_lineage} ->
+      |> Multi.run(:create_dispatch, fn _repo, %{resolve_lineage: %{lineage: parent_lineage}} ->
         dispatch_id = Ecto.UUID.generate()
         lineage_path = parent_lineage ++ [dispatch_id]
 
@@ -202,7 +212,11 @@ defmodule Loopctl.Dispatches do
           created_at: now,
           agent_pubkey: Keyword.get(opts, :agent_pubkey),
           alg: Keyword.get(opts, :alg),
-          attestation: attestation_for_storage(Keyword.get(opts, :attestation)),
+          attestation:
+            enrolled_attestation_for_storage(
+              Keyword.get(opts, :agent_pubkey),
+              Keyword.get(opts, :attestation)
+            ),
           attestation_conditions: Keyword.get(opts, :attestation_conditions)
         })
         |> AdminRepo.insert()
@@ -355,7 +369,25 @@ defmodule Loopctl.Dispatches do
 
     %{
       data: Enum.map(page, &enrolled_key_row/1),
-      meta: %{limit: limit, has_more: has_more, next_cursor: next_cursor}
+      meta: %{
+        limit: limit,
+        has_more: has_more,
+        next_cursor: next_cursor,
+        # Per-row `integrity_ok` proves each entry's CONTENT is unaltered, but NOT
+        # that the set is COMPLETE: a REMOVED enrollment is only detectable by
+        # verifying the whole chain and cross-checking its length against the latest
+        # Signed Tree Head. Surface that to the API consumer so it does not mistake
+        # per-row integrity for a completeness proof (LCP-1 §9.1.1 / §8.5).
+        completeness: %{
+          note:
+            "Per-row integrity_ok is content-integrity only; it does NOT prove the " <>
+              "enrollment set is complete. To detect a removed enrollment, verify " <>
+              "the audit chain (AuditChain.verify_chain/1) and cross-check its " <>
+              "length against the latest Signed Tree Head.",
+          latest_sth_endpoint: "/api/v1/audit/sth/{tenant_id}",
+          inclusion_proof_endpoint: "/api/v1/audit/sth/{tenant_id}/inclusion/{position}"
+        }
+      }
     }
   end
 
@@ -626,12 +658,14 @@ defmodule Loopctl.Dispatches do
     end
   end
 
-  defp resolve_lineage(_tenant_id, nil), do: {:ok, []}
+  # Returns `{:ok, %{lineage: [uuid], parent: Dispatch.t() | nil}}` so the already-
+  # loaded parent row is threaded to `resolve_authorizer` (no redundant re-query).
+  defp resolve_lineage(_tenant_id, nil), do: {:ok, %{lineage: [], parent: nil}}
 
   defp resolve_lineage(tenant_id, parent_id) do
     case active_parent(tenant_id, parent_id) do
       nil -> {:error, :parent_not_found}
-      parent -> {:ok, parent.lineage_path}
+      parent -> {:ok, %{lineage: parent.lineage_path, parent: parent}}
     end
   end
 
@@ -674,14 +708,14 @@ defmodule Loopctl.Dispatches do
   # The authorizer signs the AUTHORIZER's lineage (`parent_lineage`), which is known
   # in advance — the new dispatch's server-generated id is NOT in the preimage, so
   # the attestation is signable before enrollment.
-  defp verify_enrollment_attestation(tenant_id, parent_id, parent_lineage, opts) do
+  defp verify_enrollment_attestation(tenant_id, parent, parent_lineage, opts) do
     case Keyword.get(opts, :agent_pubkey) do
       nil ->
         {:ok, :bearer}
 
       agent_pubkey ->
         with {:ok, sig} <- fetch_attestation(opts),
-             {:ok, authorizer} <- resolve_authorizer(tenant_id, parent_id) do
+             {:ok, authorizer} <- resolve_authorizer(tenant_id, parent) do
           verify_attestation_sig(tenant_id, agent_pubkey, authorizer, parent_lineage, opts, sig)
         end
     end
@@ -694,6 +728,14 @@ defmodule Loopctl.Dispatches do
       _ -> {:error, :attestation_required}
     end
   end
+
+  # Only persist the attestation on an ENROLLED (key-carrying) dispatch. A bearer
+  # dispatch (no agent_pubkey) has nothing to attest — verify_enrollment_attestation
+  # short-circuits to `{:ok, :bearer}` WITHOUT verifying any signature — so a
+  # caller-supplied attestation there is meaningless and must not be persisted as an
+  # unverified blob that could later be mistaken for a verified enrollment record.
+  defp enrolled_attestation_for_storage(nil, _sig), do: nil
+  defp enrolled_attestation_for_storage(_agent_pubkey, sig), do: attestation_for_storage(sig)
 
   # Only a real (binary) attestation is persisted. A malformed-encoding marker or a
   # nil (bearer dispatch) never reaches the `:binary` column — a key-carrying
@@ -708,9 +750,7 @@ defmodule Loopctl.Dispatches do
   # parent is treated as absent here (see `active_parent/2`) — but it never reaches
   # this step in practice because `resolve_lineage/2` runs first in the Multi and
   # already fails the whole enrollment closed on a non-active parent.
-  defp resolve_authorizer(tenant_id, parent_id) do
-    parent = parent_id && active_parent(tenant_id, parent_id)
-
+  defp resolve_authorizer(tenant_id, parent) do
     case parent do
       %Dispatch{agent_pubkey: pk, alg: alg} when is_binary(pk) ->
         {:ok, {pk, alg}}

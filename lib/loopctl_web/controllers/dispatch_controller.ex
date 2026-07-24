@@ -5,6 +5,7 @@ defmodule LoopctlWeb.DispatchController do
 
   use LoopctlWeb, :controller
 
+  alias Loopctl.Auth.Role
   alias Loopctl.Dispatches
 
   action_fallback LoopctlWeb.FallbackController
@@ -20,14 +21,59 @@ defmodule LoopctlWeb.DispatchController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     parent_id = params["parent_dispatch_id"]
 
-    # G6: Non-root dispatches must provide their parent's dispatch ID.
-    # The parent must be active (not revoked, not expired). Root dispatches
-    # (parent_id is nil) are only created at tenant signup.
-    if parent_id do
-      validate_parent_and_create(conn, tenant_id, parent_id, params)
+    # Role ceiling: a dispatch may not be minted at a HIGHER privilege than the
+    # caller's own key. Without this an orchestrator (or any holder of an attestation
+    # over an agent key) could mint a `:user`-role dispatch bearing that key, escaping
+    # the role hierarchy — the attestation authorizes the KEY, it must not silently
+    # elevate the key's PRIVILEGE. A higher requested role is 403'd here.
+    if role_exceeds_caller?(conn, params["role"]) do
+      reject_role_ceiling(conn, params["role"])
     else
-      do_create_dispatch(conn, tenant_id, params)
+      # G6: Non-root dispatches must provide their parent's dispatch ID.
+      # The parent must be active (not revoked, not expired). Root dispatches
+      # (parent_id is nil) are only created at tenant signup.
+      if parent_id do
+        validate_parent_and_create(conn, tenant_id, parent_id, params)
+      else
+        do_create_dispatch(conn, tenant_id, params)
+      end
     end
+  end
+
+  # True only when the requested role parses to a KNOWN role strictly above the
+  # caller's. An unparseable/absent role is left to `create_dispatch` to reject with
+  # its own `:invalid_role` error (this guard is a ceiling, not a validator).
+  defp role_exceeds_caller?(conn, requested) do
+    caller_role = conn.assigns.current_api_key.role
+
+    case parse_requested_role(requested) do
+      {:ok, role} -> not Role.role_at_least?(caller_role, role)
+      :error -> false
+    end
+  end
+
+  defp parse_requested_role(role) when role in ["agent", "orchestrator", "user", "superadmin"],
+    do: {:ok, String.to_existing_atom(role)}
+
+  defp parse_requested_role(role) when role in [:agent, :orchestrator, :user, :superadmin],
+    do: {:ok, role}
+
+  defp parse_requested_role(_), do: :error
+
+  defp reject_role_ceiling(conn, requested) do
+    conn
+    |> put_status(:forbidden)
+    |> json(%{
+      error: %{
+        status: 403,
+        code: "dispatch_role_exceeds_caller",
+        message:
+          "A dispatch cannot be minted at a higher role (#{inspect(requested)}) than the " <>
+            "caller's own key (#{conn.assigns.current_api_key.role}). Mint the dispatch at " <>
+            "the caller's role or lower.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/dispatch-lineage"}
+      }
+    })
   end
 
   defp validate_parent_and_create(conn, tenant_id, parent_id, params) do
