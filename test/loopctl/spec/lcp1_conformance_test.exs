@@ -8,14 +8,12 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
   would be worthless as a conformance check, so the construction is part of the
   assertion.
 
-  Two tests are tagged `:lcp1_gap` and excluded from the default run. They assert
-  the behaviour LCP-1 §7.5 clause three REQUIRES and that the implementation does
-  not yet provide (§10.2.1 records both as defects, not permitted variations).
-  Turning the tag off is the acceptance criterion for closing that gap — do not
-  "fix" them by weakening the assertion to match current behaviour.
-
-  Vectors are emitted from these scenarios by `mix loopctl.spec.vectors`; the
-  scenario tables below are the single source for both.
+  The two LCP-1 §7.5 clause-three cases (a declared-but-unresolvable implementer
+  dispatch must reject at `report` and `review_complete`, not fall through to
+  agent-id equality) were the one place the spec and the code diverged. They were
+  briefly tagged `:lcp1_gap` while the fix landed; the fix is in
+  `lineage_conflict?/3`, so the tests now run in the default suite. They are named
+  `§7.5 clause 3 …` below.
   """
   use Loopctl.DataCase, async: true
 
@@ -189,7 +187,6 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
       assert story.agent_status == :reported_done
     end
 
-    @tag :lcp1_gap
     test "§7.5 clause 3 — a DECLARED but unresolvable implementer dispatch must REJECT" do
       # LCP-1 §7.5: a recorded dispatch id that cannot be resolved is an
       # INTEGRITY FAILURE, not an absence of delegation. The implementation
@@ -280,7 +277,6 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
                )
     end
 
-    @tag :lcp1_gap
     test "§7.5 clause 3 — a DECLARED but unresolvable implementer dispatch must REJECT" do
       ctx = reported_story(%{implementer_dispatch_id: foreign_dispatch_id()})
       other = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})

@@ -92,10 +92,10 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
   **custody-unattributed** and fails closed with `:missing_assigned_agent` + a
   `custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2240-2243`) — it used to
   pass vacuously; then the reporter's lineage vs the implementer's (`lineage_conflict?/2`,
-  `progress.ex:2249-2256`); then plain `assigned_agent_id` equality.
-- **review-complete** — `validate_not_self_review/3` `progress.ex:2258-2288`. Custody-orphan backstop
-  first (`progress.ex:2265-2267`), then a **`nil` reviewer is deliberately PERMITTED**
-  (`progress.ex:2274-2275`) because nil means a human operator on a user-role key; then the
+  `progress.ex:2262-2276`); then plain `assigned_agent_id` equality.
+- **review-complete** — `validate_not_self_review/3` `progress.ex:2282-2312`. Custody-orphan backstop
+  first (`progress.ex:2289-2291`), then a **`nil` reviewer is deliberately PERMITTED**
+  (`progress.ex:2298-2299`) because nil means a human operator on a user-role key; then the
   reviewer's lineage; then plain equality. That nil permit has THREE parts, all of which must change
   together: (a) the `exact_role: [:orchestrator, :user]` plug (`review_record_controller.ex:22-23`),
   which 403s an agent key before the controller runs — so the `:agent` branch of the controller cond
@@ -170,7 +170,7 @@ long-lived env-var keys.
   a client-supplied lineage is self-attested and defeats the gate.
 - Trusting a `nil` identity as permissive where the code blocks it — `verify`
   (`progress.ex:1682`) and `report` (`progress.ex:2207`) fail closed on nil *caller identity*. The one
-  documented exception is `review-complete` (`progress.ex:2274-2275`, nil = human operator, paired
+  documented exception is `review-complete` (`progress.ex:2298-2299`, nil = human operator, paired
   with the exact_role plug and the controller check). Do not "fix" it without reading its comment.
 
 ## Related

@@ -613,21 +613,20 @@ gate, and writes the entry; nothing in the record distinguishes an entry produce
 real agent from one produced by the server. A tenant that does not control the server MUST
 NOT treat a `bearer`-profile custody record as evidence against the operator.
 
-### 10.2.1 Known conformance gap in the reference implementation
+### 10.2.1 Reference-implementation conformance status
 
-As of this draft, the loopctl reference implementation does not satisfy §7.5 clause three
-at the `report` and `review_complete` gates: an implementer dispatch that is declared but
-unresolvable falls through to identifier equality instead of rejecting. `verify` does
-satisfy it. Until this is closed, an adversary able to render an implementer's dispatch row
-unresolvable — by revoking it, for example — weakens those two gates to the pre-lineage
-guarantee.
+§7.5 clause three (a declared-but-unresolvable implementer dispatch fails closed at all
+three gates) is **satisfied**. `verify` satisfied it via §7.4.1 clause 1; `report` and
+`review_complete` were aligned to it in `lineage_conflict?/2`, and the alignment is pinned
+by the executable conformance suite (`test/loopctl/spec/lcp1_conformance_test.exs`). In the
+reference implementation the reachable form of this input is a dispatch id belonging to a
+different tenant (§7.5), so the clause doubles as a cross-tenant isolation check.
 
-It also does not satisfy §8.5: no code path recomputes a leaf hash from entry content, so
-the deployed chain proves linkage and inclusion but not that any hash commits to its own
-entry.
-
-Both are tracked as implementation defects against this specification, not as permitted
-variations. A deployment MUST NOT advertise conformance while either holds.
+§8.5 (independent recomputation of a leaf hash from entry content) is **not yet satisfied**:
+no code path recomputes a leaf hash, so the deployed chain proves linkage and inclusion but
+not that any hash commits to its own entry. This is tracked as an implementation defect
+against this specification, not a permitted variation. A deployment MUST NOT advertise
+conformance while it holds.
 
 ### 10.3 What neither profile guarantees
 

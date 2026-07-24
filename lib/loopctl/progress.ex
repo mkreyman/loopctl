@@ -2244,17 +2244,39 @@ defmodule Loopctl.Progress do
 
   defp custody_unattributed?(_story), do: false
 
-  # True when the caller's dispatch lineage shares a root with the implementer's.
-  # Requires BOTH sides to resolve: an unresolvable dispatch yields `[]`, which is
-  # NOT treated as "independent" — it simply falls through to the agent-id check
-  # below rather than short-circuiting it.
+  # True when the caller's dispatch lineage conflicts with the implementer's, per
+  # LCP-1 §7.5. An empty lineage path arises from three distinct situations that
+  # MUST NOT be conflated (docs/spec/LCP-1-custody-claims.md §7.5):
+  #
+  #   1. `implementer_dispatch_id` is nil        — no delegation ever recorded
+  #      (pre-dispatch story). Fall through to the agent-id equality check.
+  #   2. `caller_lineage` is []                  — the caller used a credential not
+  #      minted by a dispatch (legacy env-var key). Fall through (OQ2 deprecation).
+  #   3. the implementer dispatch is DECLARED but does not resolve — an INTEGRITY
+  #      FAILURE, not an absence of delegation. Reachable when the recorded id
+  #      belongs to ANOTHER tenant: `get_dispatch/2` scopes by `(id, tenant_id)`
+  #      while the FK is table-wide. Fail CLOSED. Resolving it to [] and relying on
+  #      `lineage_shares_prefix?([], _) = false` would read an unloadable dispatch
+  #      as independent lineage — the exact inverse of its meaning. Mirrors verify's
+  #      §7.4.1 clause 1 (`verify_lineage_separated/4`), so all three gates align.
   defp lineage_conflict?(%Story{implementer_dispatch_id: nil}, _caller_lineage), do: false
   defp lineage_conflict?(_story, []), do: false
 
   defp lineage_conflict?(story, caller_lineage) do
-    impl = get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id)
+    case get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id) do
+      [] ->
+        # Case 3 above: declared-but-unresolvable implementer dispatch.
+        Logger.warning(
+          "unresolvable_dispatch_lineage: custody gate blocked — implementer dispatch " <>
+            "could not be resolved (fail closed) story_id=#{story.id} " <>
+            "tenant_id=#{story.tenant_id} implementer_dispatch_id=#{story.implementer_dispatch_id}"
+        )
 
-    Dispatches.lineage_shares_prefix?(impl, caller_lineage)
+        true
+
+      impl ->
+        Dispatches.lineage_shares_prefix?(impl, caller_lineage)
+    end
   end
 
   defp validate_not_self_review(story, reviewer_agent_id, reviewer_lineage) do

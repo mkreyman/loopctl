@@ -170,13 +170,13 @@ Without a verifier dispatch the check degrades to plain agent-id equality.
 `implementer_dispatch_id`) fails CLOSED with `missing_assigned_agent` and a
 `custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2240-2243`) instead of
 passing vacuously; then the reporter's dispatch lineage is compared against the implementer's
-(`lineage_conflict?/2`, `progress.ex:2249-2256`), then plain `assigned_agent_id == agent_id`.
+(`lineage_conflict?/2`, `progress.ex:2262-2276`), then plain `assigned_agent_id == agent_id`.
 The DB CHECK `stories_reported_done_requires_agent` does NOT cover this — it is satisfied
 whenever `implementer_dispatch_id IS NULL` — so the code guard is the enforcement.
 
-**review-complete** — `validate_not_self_review/3` (`progress.ex:2258-2288`) — custody-orphan
-backstop first (`progress.ex:2265-2267`), then a **nil reviewer is deliberately PERMITTED**
-(`progress.ex:2274-2275`): nil means a human operator on a user-role key. That permit has
+**review-complete** — `validate_not_self_review/3` (`progress.ex:2282-2312`) — custody-orphan
+backstop first (`progress.ex:2289-2291`), then a **nil reviewer is deliberately PERMITTED**
+(`progress.ex:2298-2299`): nil means a human operator on a user-role key. That permit has
 THREE parts which must change together:
 1. the `exact_role: [:orchestrator, :user]` plug
    (`lib/loopctl_web/controllers/review_record_controller.ex:22-23`), which 403s an `:agent` key

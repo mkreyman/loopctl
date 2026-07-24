@@ -72,21 +72,7 @@ ipv6_excluded =
       [:requires_ipv6]
   end
 
-# :lcp1_gap — LCP-1 conformance tests asserting behaviour the SPEC requires and
-# the implementation does not yet provide (docs/spec/LCP-1-custody-claims.md
-# §10.2.1 records these as defects, not permitted variations). They are written
-# spec-first so the gap is executable rather than prose; they are excluded from
-# the default suite only so master stays green while the fix lands.
-#
-# Run them with `mix test --only lcp1_gap`. When the corresponding defect is
-# fixed, DELETE its tag rather than the test — and never make one pass by
-# weakening its assertion to match current behaviour, which would convert a
-# tracked defect into a documented feature.
-lcp1_gap_excluded = if System.get_env("LCP1_GAP"), do: [], else: [:lcp1_gap]
-
 ExUnit.configure(
   exclude:
-    scale_excluded ++
-      nightly_excluded ++
-      pgbouncer_excluded ++ ipv6_excluded ++ e2e_excluded ++ lcp1_gap_excluded
+    scale_excluded ++ nightly_excluded ++ pgbouncer_excluded ++ ipv6_excluded ++ e2e_excluded
 )
