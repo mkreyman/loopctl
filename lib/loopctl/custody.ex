@@ -1469,6 +1469,13 @@ defmodule Loopctl.Custody do
           chain_position: entry.chain_position,
           entry_hash: encode_hash(entry.entry_hash),
           prev_entry_hash: encode_hash(entry.prev_entry_hash),
+          # LCP-1 §8.4: the leaf-hash version identifying which construction wrote
+          # this entry (v1 and v2 differ). NOTE: this surface is NOT a full §8.5
+          # recompute surface — `payload` below is REDACTED to the requesting
+          # subject (see payload_note), so the leaf hash cannot be reproduced from
+          # it. hash_version is exposed for version-awareness/completeness; full
+          # recompute uses the unredacted entry via `AuditChain.recompute_entry_hash/1`.
+          hash_version: entry.hash_version,
           action: entry.action,
           actor_lineage: entry.actor_lineage,
           entity_type: entry.entity_type,

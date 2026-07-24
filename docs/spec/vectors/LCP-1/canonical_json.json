@@ -1,0 +1,37 @@
+{
+  "spec": "LCP-1 §8.3 canonical_json",
+  "vectors": [
+    {
+      "label": "sorted object",
+      "canonical": "{\"a\":2,\"m\":3,\"z\":1}"
+    },
+    {
+      "label": "atom keys equal string keys",
+      "canonical": "{\"a\":1,\"b\":2}"
+    },
+    {
+      "label": "octet-order uppercase before lowercase",
+      "canonical": "{\"Z\":2,\"a\":1}"
+    },
+    {
+      "label": "prefix keys",
+      "canonical": "{\"ab\":2,\"abc\":1}"
+    },
+    {
+      "label": "nested",
+      "canonical": "{\"outer\":{\"a\":2,\"z\":1}}"
+    },
+    {
+      "label": "empty object",
+      "canonical": "{}"
+    },
+    {
+      "label": "empty array",
+      "canonical": "[]"
+    },
+    {
+      "label": "ordered array",
+      "canonical": "[3,1,2]"
+    }
+  ]
+}

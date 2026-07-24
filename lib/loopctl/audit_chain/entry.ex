@@ -13,6 +13,8 @@ defmodule Loopctl.AuditChain.Entry do
 
   use Loopctl.Schema
 
+  alias Loopctl.AuditChain.LeafHash
+
   @type t :: %__MODULE__{}
 
   schema "audit_chain" do
@@ -25,6 +27,14 @@ defmodule Loopctl.AuditChain.Entry do
     field :entity_id, Ecto.UUID
     field :payload, :map, default: %{}
     field :entry_hash, :binary
+    # Single-sourced from the writer so the default version can never silently
+    # diverge from the algorithm `LeafHash.compute/2` actually uses. If this
+    # defaulted to a stale version (e.g. 1) while `current_version/0` advanced to
+    # 2, any insert path that computed a v2 hash but omitted an explicit
+    # `hash_version` would store the wrong version, and `entry_hash_valid?/1`
+    # would then recompute with the wrong construction and report a FALSE
+    # tampering positive.
+    field :hash_version, :integer, default: LeafHash.current_version()
     field :inserted_at, :utc_datetime_usec
   end
 
@@ -40,6 +50,7 @@ defmodule Loopctl.AuditChain.Entry do
       :entity_id,
       :payload,
       :entry_hash,
+      :hash_version,
       :inserted_at
     ])
     |> validate_required([
@@ -49,7 +60,8 @@ defmodule Loopctl.AuditChain.Entry do
       :actor_lineage,
       :entity_type,
       :payload,
-      :entry_hash
+      :entry_hash,
+      :hash_version
     ])
   end
 end

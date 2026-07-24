@@ -5,6 +5,8 @@ defmodule LoopctlWeb.WellKnownControllerTest do
 
   use LoopctlWeb.ConnCase, async: true
 
+  alias Loopctl.AuditChain.LeafHash
+
   setup :verify_on_exit!
 
   describe "GET /.well-known/loopctl" do
@@ -29,6 +31,24 @@ defmodule LoopctlWeb.WellKnownControllerTest do
       # public, agent-rooted self-signup path.
       assert body["signup_endpoint"] =~ "loopctl.com/api/v1/signup"
       assert is_binary(body["contact"])
+    end
+
+    test "advertises the LCP-1 §2.1 custody-profile discovery fields", %{conn: _conn} do
+      conn = Phoenix.ConnTest.build_conn()
+      conn = get(conn, "/.well-known/loopctl")
+
+      body = Jason.decode!(conn.resp_body)
+      # LCP-1 §2.1: a verifier keys off these; loopctl accepts unsigned claims so
+      # the profile is `bearer`.
+      assert body["custody_profile"] == "bearer"
+      # custody_spec points at a SERVED /wiki/* route (like the sibling *_url
+      # fields), not a /spec/* path that has no route and would 404.
+      assert body["custody_spec"] =~ "loopctl.com/wiki/chain-of-custody"
+      assert body["custody_gates"] == ["report", "review_complete", "verify"]
+      # LCP-1 §8.4: advertise the leaf-hash version currently being WRITTEN (v2),
+      # single-sourced from the writer so it cannot drift.
+      assert body["audit_leaf_hash_version"] == LeafHash.current_version()
+      assert body["audit_leaf_hash_version"] == 2
     end
 
     test "includes Cache-Control and ETag headers", %{conn: _conn} do
@@ -94,6 +114,11 @@ defmodule LoopctlWeb.WellKnownControllerTest do
       assert body["$schema"] =~ "json-schema.org"
       assert body["type"] == "object"
       assert "spec_version" in body["required"]
+      # LCP-1 §2.1 custody fields are required by the published schema too.
+      assert "custody_profile" in body["required"]
+      assert "custody_spec" in body["required"]
+      assert "custody_gates" in body["required"]
+      assert "audit_leaf_hash_version" in body["required"]
     end
   end
 end

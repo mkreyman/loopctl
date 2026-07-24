@@ -563,6 +563,9 @@ defmodule Loopctl.Progress do
     server-resolved lineage as `:reporter_lineage`)
   - `{:error, :missing_assigned_agent}` if the story has neither an assigned agent
     nor an implementer dispatch (custody-unattributed — fails closed)
+  - `{:error, :unresolvable_dispatch_lineage}` if the story's declared implementer
+    dispatch cannot be resolved (e.g. a cross-tenant id) — a lineage-integrity
+    failure that fails closed (LCP-1 §7.5)
   - `{:error, %Ecto.Changeset{}}` if artifact validation fails
   """
   @spec report_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword(), map() | nil) ::
@@ -883,6 +886,11 @@ defmodule Loopctl.Progress do
   - `{:ok, %ReviewRecord{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :story_not_reported_done}` if story is not in reported_done status
+  - `{:error, :self_review_blocked}` if the reviewer is the assigned agent or shares
+    the implementer's dispatch lineage root
+  - `{:error, :missing_assigned_agent}` on a custody-orphaned story (fails closed)
+  - `{:error, :unresolvable_dispatch_lineage}` if the story's declared implementer
+    dispatch cannot be resolved (lineage-integrity failure, fails closed — LCP-1 §7.5)
   - `{:error, %Ecto.Changeset{}}` on validation failure
   """
   @spec record_review(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
@@ -1024,6 +1032,12 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if story is not reported_done
+  - `{:error, :self_verify_blocked}` if the verifier is the assigned agent or shares
+    the implementer's dispatch lineage root
+  - `{:error, :missing_assigned_agent}` on a custody-orphaned story (fails closed)
+  - `{:error, :unresolvable_dispatch_lineage}` if a dispatch the story references
+    (implementer or verifier) cannot be resolved (lineage-integrity failure, fails
+    closed — LCP-1 §7.4.1)
   """
   @spec verify_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
@@ -1091,13 +1105,19 @@ defmodule Loopctl.Progress do
   Returns `:ok` when `orchestrator_agent_id` is permitted to verify `story`, or
   `{:error, :self_verify_blocked}` when the verifier shares dispatch lineage /
   agent identity with the implementer. A nil `orchestrator_agent_id` is treated
-  as an untrusted identity and is always blocked.
+  as an untrusted identity and is always blocked. A custody-orphaned story
+  returns `{:error, :missing_assigned_agent}`, and a story whose declared
+  implementer dispatch cannot be resolved fails CLOSED with
+  `{:error, :unresolvable_dispatch_lineage}` (passed through from
+  `verify_lineage_separated/4`).
 
   Exposed so `Loopctl.BulkOperations` enforces the SAME self-verify invariant as
   the single-story `verify_story/4` path — otherwise bulk verify is a chain-of-custody bypass.
   """
   @spec ensure_verify_allowed(Story.t(), Ecto.UUID.t() | nil) ::
-          :ok | {:error, :self_verify_blocked | :missing_assigned_agent}
+          :ok
+          | {:error,
+             :self_verify_blocked | :missing_assigned_agent | :unresolvable_dispatch_lineage}
   def ensure_verify_allowed(story, orchestrator_agent_id) do
     case validate_not_self_verify(story, orchestrator_agent_id) do
       {:ok, _} -> :ok
@@ -1733,7 +1753,7 @@ defmodule Loopctl.Progress do
             "caller_agent_id=#{inspect(orchestrator_agent_id)}"
         )
 
-        {:error, :self_verify_blocked}
+        {:error, :unresolvable_dispatch_lineage}
 
       Dispatches.lineage_shares_prefix?(impl, verifier) ->
         {:error, :self_verify_blocked}
@@ -2210,29 +2230,35 @@ defmodule Loopctl.Progress do
     do: {:error, :self_report_blocked}
 
   defp validate_not_self_report(story, agent_id, reporter_lineage) do
-    cond do
-      # INVARIANT 1 (fail closed): a story with NO assigned agent and NO
-      # implementer dispatch has no implementer to separate the reporter from, so
-      # every check below would pass VACUOUSLY and ANY agent key could mark it
-      # reported_done. The DB CHECK stories_reported_done_requires_agent does not
-      # close this (it is satisfied when implementer_dispatch_id IS NULL), so this
-      # is the enforcement, mirroring verify/review-complete.
-      custody_unattributed?(story) ->
-        log_custody_orphaned(story, agent_id, "report")
-        {:error, :missing_assigned_agent}
-
+    # INVARIANT 1 (fail closed): a story with NO assigned agent and NO implementer
+    # dispatch has no implementer to separate the reporter from, so every check
+    # below would pass VACUOUSLY and ANY agent key could mark it reported_done. The
+    # DB CHECK stories_reported_done_requires_agent does not close this (it is
+    # satisfied when implementer_dispatch_id IS NULL), so this is the enforcement,
+    # mirroring verify/review-complete.
+    if custody_unattributed?(story) do
+      log_custody_orphaned(story, agent_id, "report")
+      {:error, :missing_assigned_agent}
+    else
       # US-26.2.2 AC-2: lineage comparison (primary). The reporter's lineage is
       # derived SERVER-SIDE from the caller's dispatch (never client-supplied); a
       # sub-agent dispatched BY the implementer shares its lineage root and is
-      # blocked even though its agent_id differs.
-      lineage_conflict?(story, reporter_lineage) ->
-        {:error, :self_report_blocked}
+      # blocked even though its agent_id differs. A DECLARED-but-unresolvable
+      # implementer dispatch is an integrity failure, not a self-report — it fails
+      # closed under its own error code (see lineage_status/2).
+      case lineage_status(story, reporter_lineage) do
+        :unresolvable -> {:error, :unresolvable_dispatch_lineage}
+        :conflict -> {:error, :self_report_blocked}
+        :ok -> validate_report_not_same_agent(story, agent_id)
+      end
+    end
+  end
 
-      not is_nil(story.assigned_agent_id) and story.assigned_agent_id == agent_id ->
-        {:error, :self_report_blocked}
-
-      true ->
-        :ok
+  defp validate_report_not_same_agent(story, agent_id) do
+    if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == agent_id do
+      {:error, :self_report_blocked}
+    else
+      :ok
     end
   end
 
@@ -2244,17 +2270,51 @@ defmodule Loopctl.Progress do
 
   defp custody_unattributed?(_story), do: false
 
-  # True when the caller's dispatch lineage shares a root with the implementer's.
-  # Requires BOTH sides to resolve: an unresolvable dispatch yields `[]`, which is
-  # NOT treated as "independent" — it simply falls through to the agent-id check
-  # below rather than short-circuiting it.
-  defp lineage_conflict?(%Story{implementer_dispatch_id: nil}, _caller_lineage), do: false
-  defp lineage_conflict?(_story, []), do: false
+  # Classifies the caller's dispatch lineage against the implementer's, per LCP-1
+  # §7.5, returning one of three states (docs/spec/LCP-1-custody-claims.md §7.5):
+  #
+  #   * `:conflict`     — caller and implementer share a lineage root (a sub-agent
+  #                       dispatched BY the implementer). Blocked as a self-claim.
+  #   * `:unresolvable` — the implementer dispatch is DECLARED but does not resolve.
+  #                       An INTEGRITY failure, not an absence of delegation:
+  #                       reachable when the recorded id belongs to ANOTHER tenant
+  #                       (`get_dispatch/2` scopes by `(id, tenant_id)` while the FK
+  #                       is table-wide). Fails CLOSED — resolving it to [] and
+  #                       leaning on `lineage_shares_prefix?([], _) = false` would
+  #                       read an unloadable dispatch as INDEPENDENT lineage, the
+  #                       exact inverse of its meaning.
+  #   * `:ok`           — no lineage conflict; the agent-id equality check decides.
+  #
+  # Two absences yield `:ok` deliberately — they are NOT integrity failures:
+  #
+  #   1. `implementer_dispatch_id` is nil — no delegation ever recorded (pre-dispatch
+  #      story); the agent-id equality check is the whole gate.
+  #   2. `caller_lineage` is [] — the caller used a credential not minted by a
+  #      dispatch (legacy env-var key; OQ2 deprecation window). NOTE the intentional
+  #      asymmetry with verify: verify_lineage_separated/4 fails closed when EITHER
+  #      side's lineage is empty, but this clause matches an empty CALLER lineage
+  #      BEFORE the `:unresolvable` check runs, so a legacy-key reporter/reviewer on
+  #      a story with an unresolvable implementer dispatch is caught only by the
+  #      agent-id check, not by fail-closed. The permit is scoped to legacy keys and
+  #      the agent-id check still applies; the gates align for dispatch-minted keys.
+  defp lineage_status(%Story{implementer_dispatch_id: nil}, _caller_lineage), do: :ok
+  defp lineage_status(_story, []), do: :ok
 
-  defp lineage_conflict?(story, caller_lineage) do
-    impl = get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id)
+  defp lineage_status(story, caller_lineage) do
+    case get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id) do
+      [] ->
+        # Declared-but-unresolvable implementer dispatch — fail closed.
+        Logger.warning(
+          "unresolvable_dispatch_lineage: custody gate blocked — implementer dispatch " <>
+            "could not be resolved (fail closed) story_id=#{story.id} " <>
+            "tenant_id=#{story.tenant_id} implementer_dispatch_id=#{story.implementer_dispatch_id}"
+        )
 
-    Dispatches.lineage_shares_prefix?(impl, caller_lineage)
+        :unresolvable
+
+      impl ->
+        if Dispatches.lineage_shares_prefix?(impl, caller_lineage), do: :conflict, else: :ok
+    end
   end
 
   defp validate_not_self_review(story, reviewer_agent_id, reviewer_lineage) do
@@ -2277,15 +2337,23 @@ defmodule Loopctl.Progress do
         :ok
 
       # US-26.2.2 AC-2: lineage comparison (primary), from the caller's dispatch
-      # resolved server-side. Blocks a sub-agent dispatched by the implementer.
-      lineage_conflict?(story, reviewer_lineage) ->
-        {:error, :self_review_blocked}
-
-      not is_nil(story.assigned_agent_id) and story.assigned_agent_id == reviewer_agent_id ->
-        {:error, :self_review_blocked}
-
+      # resolved server-side. Blocks a sub-agent dispatched by the implementer; a
+      # declared-but-unresolvable implementer dispatch fails closed under its own
+      # integrity error code (see lineage_status/2).
       true ->
-        :ok
+        case lineage_status(story, reviewer_lineage) do
+          :unresolvable -> {:error, :unresolvable_dispatch_lineage}
+          :conflict -> {:error, :self_review_blocked}
+          :ok -> validate_review_not_same_agent(story, reviewer_agent_id)
+        end
+    end
+  end
+
+  defp validate_review_not_same_agent(story, reviewer_agent_id) do
+    if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == reviewer_agent_id do
+      {:error, :self_review_blocked}
+    else
+      :ok
     end
   end
 

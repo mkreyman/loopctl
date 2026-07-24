@@ -26,6 +26,7 @@ defmodule Loopctl.AuditChain do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain.Entry
+  alias Loopctl.AuditChain.LeafHash
   alias Loopctl.AuditChain.ProofCache
   alias Loopctl.AuditChain.PubSub, as: ChainPubSub
   alias Loopctl.AuditChain.SignedTreeHead
@@ -802,18 +803,22 @@ defmodule Loopctl.AuditChain do
     entity_id = Map.get(attrs, :entity_id)
     payload = Map.get(attrs, :payload, %{})
 
-    entry_hash =
-      compute_hash(%{
-        tenant_id: tenant_id,
-        position: position,
-        prev_hash: prev_hash,
-        action: action,
-        actor_lineage: actor_lineage,
-        entity_type: entity_type,
-        entity_id: entity_id,
-        payload: payload,
-        inserted_at: now
-      })
+    hash_fields = %{
+      tenant_id: tenant_id,
+      position: position,
+      prev_hash: prev_hash,
+      action: action,
+      actor_lineage: actor_lineage,
+      entity_type: entity_type,
+      entity_id: entity_id,
+      payload: payload,
+      inserted_at: now
+    }
+
+    # New entries use the current leaf-hash version (LCP-1 §8.4); the version is
+    # stored so a verifier recomputes with the exact construction that wrote it.
+    hash_version = LeafHash.current_version()
+    entry_hash = LeafHash.compute(hash_fields, hash_version)
 
     %{
       chain_position: position,
@@ -824,37 +829,204 @@ defmodule Loopctl.AuditChain do
       entity_id: entity_id,
       payload: payload,
       entry_hash: entry_hash,
+      hash_version: hash_version,
       inserted_at: now
     }
   end
 
-  defp compute_hash(%{
-         tenant_id: tenant_id,
-         position: position,
-         prev_hash: prev_hash,
-         action: action,
-         actor_lineage: actor_lineage,
-         entity_type: entity_type,
-         entity_id: entity_id,
-         payload: payload,
-         inserted_at: inserted_at
-       }) do
-    canonical =
-      Jason.encode!(%{
-        action: action,
-        actor_lineage: actor_lineage,
-        entity_id: entity_id,
-        entity_type: entity_type,
-        payload: payload
-      })
+  @doc """
+  Recomputes an entry's leaf hash from its stored content, dispatching on the
+  `hash_version` the entry was written with (LCP-1 §8.4, §8.5). Independent of
+  the stored `entry_hash`, so it can be compared against it to detect tampering.
+  """
+  @spec recompute_entry_hash(Entry.t()) :: binary()
+  def recompute_entry_hash(%Entry{} = entry) do
+    LeafHash.compute(leaf_fields(entry), entry.hash_version)
+  end
 
-    data =
-      tenant_id <>
-        Integer.to_string(position) <>
-        prev_hash <>
-        canonical <>
-        DateTime.to_iso8601(inserted_at)
+  # The content fields a leaf hash commits to, extracted from a stored entry. Shared
+  # by `recompute_entry_hash/1` (dispatches on the stored version) and the
+  # downgrade tripwire in `verify_chain_content/2` (forces a v2 recompute).
+  defp leaf_fields(%Entry{} = entry) do
+    %{
+      tenant_id: entry.tenant_id,
+      position: entry.chain_position,
+      prev_hash: entry.prev_entry_hash,
+      action: entry.action,
+      actor_lineage: entry.actor_lineage,
+      entity_type: entry.entity_type,
+      entity_id: entry.entity_id,
+      payload: entry.payload,
+      inserted_at: entry.inserted_at
+    }
+  end
 
-    :crypto.hash(:sha256, data)
+  @doc """
+  True when an entry's stored `entry_hash` matches a fresh recompute from its
+  content (LCP-1 §8.5). A `false` for a v2 entry indicates tampering; a `false`
+  for a v1 entry may instead reflect the v1 construction's non-canonical JSON
+  (LCP-1 §8.1) and is not, on its own, proof of tampering.
+  """
+  @spec entry_hash_valid?(Entry.t()) :: boolean()
+  def entry_hash_valid?(%Entry{} = entry) do
+    recompute_entry_hash(entry) == entry.entry_hash
+  end
+
+  @doc """
+  Verifies a tenant's whole chain **per entry**, dispatching on each entry's
+  stored `hash_version` (LCP-1 §8.7). A chain may mix versions once the writing
+  version advances; history is never rewritten, so a verifier reads each entry's
+  own version.
+
+  Returns `%{ok: boolean, count: n, verified: n, linkage_only: n, tampered: [pos]}`:
+
+    * a **v2** entry is content-verified — a leaf-hash mismatch is tamper evidence
+      and its position is collected in `tampered`;
+    * a **v1** entry is checked for LINKAGE only (its `prev_entry_hash` equals the
+      predecessor's stored `entry_hash`) — its content is not reliably re-derivable
+      (§8.1), so a leaf mismatch is not counted as tampering; a broken *link* is;
+    * `ok` is true iff no tampering and no broken linkage was found.
+
+  ## Completeness caveat — this does NOT detect end-truncation
+
+  This verifies the INTEGRITY of the entries present in the database (tampering,
+  broken links); it is NOT a completeness proof. Deleting the newest N entries
+  leaves a self-consistent prefix, so `verify_chain` still returns `ok: true` with
+  a smaller `count`. Detecting a truncated tail requires cross-checking the
+  returned `count`/head against a signed tree size — compare `count` (or the head
+  position) against the latest `Signed Tree Head` (`AuditChain.SignedTreeHead`)
+  tree size, which is the out-of-band commitment truncation would contradict.
+
+  ## Scale
+
+  The scan is KEYSET-PAGED through the timed `Loopctl.HeavyRead` facade
+  (`@verify_chain_page_size`-row pages, `:enumeration` endpoint), NOT a single
+  unbounded `AdminRepo.all/1` over the whole chain — that would OOM and hold a
+  connection on the deliberately tiny 3-connection admin pool for a full-table
+  scan on a large tenant, the exact anti-pattern the STH rebuild
+  (`full_rebuild_root/2`) was paged to avoid. `prev_hash` linkage state is carried
+  in the accumulator ACROSS pages internally, so the fold is resumable without
+  exposing that state to callers. Paging across transactions is safe because
+  `audit_chain` is append-only and immutable (DB triggers forbid update/delete).
+  """
+  @spec verify_chain(Ecto.UUID.t()) :: %{
+          ok: boolean(),
+          count: non_neg_integer(),
+          verified: non_neg_integer(),
+          linkage_only: non_neg_integer(),
+          tampered: [non_neg_integer()],
+          broken_links: [non_neg_integer()]
+        }
+  def verify_chain(tenant_id) do
+    initial = %{
+      ok: true,
+      count: 0,
+      verified: 0,
+      linkage_only: 0,
+      tampered: [],
+      broken_links: [],
+      prev_hash: @zero_hash
+    }
+
+    tenant_id
+    |> verify_chain_paged(-1, initial)
+    |> finalize_chain_report()
+  end
+
+  # Whole-chain verify page size. Each page is ONE bounded, tenant-scoped,
+  # statement-timeout-guarded HeavyRead statement, so no single statement's cost
+  # grows with total chain length.
+  @verify_chain_page_size 10_000
+
+  # Keyset-page the chain ascending by `chain_position`, folding each page into the
+  # accumulator. `prev_hash` linkage state lives in `acc` and threads across pages
+  # because pages are contiguous and ascending.
+  defp verify_chain_paged(tenant_id, after_pos, acc) do
+    query =
+      from(e in Entry,
+        where: e.tenant_id == ^tenant_id and e.chain_position > ^after_pos,
+        order_by: [asc: e.chain_position],
+        limit: ^@verify_chain_page_size
+      )
+
+    case HeavyRead.all(tenant_id, query, HeavyRead.opts(:enumeration)) do
+      [] ->
+        acc
+
+      entries ->
+        acc = Enum.reduce(entries, acc, &verify_chain_entry/2)
+        %Entry{chain_position: last_pos} = List.last(entries)
+
+        if length(entries) < @verify_chain_page_size do
+          acc
+        else
+          verify_chain_paged(tenant_id, last_pos, acc)
+        end
+    end
+  end
+
+  defp verify_chain_entry(%Entry{} = entry, acc) do
+    link_ok = entry.prev_entry_hash == acc.prev_hash
+
+    acc =
+      acc
+      |> Map.update!(:count, &(&1 + 1))
+      |> Map.put(:prev_hash, entry.entry_hash)
+
+    acc =
+      if link_ok,
+        do: acc,
+        else:
+          acc |> Map.update!(:broken_links, &[entry.chain_position | &1]) |> Map.put(:ok, false)
+
+    verify_chain_content(entry, acc)
+  end
+
+  # v2: content-verified — a mismatch is tamper evidence.
+  defp verify_chain_content(%Entry{hash_version: 2} = entry, acc) do
+    if entry_hash_valid?(entry) do
+      Map.update!(acc, :verified, &(&1 + 1))
+    else
+      acc |> Map.update!(:tampered, &[entry.chain_position | &1]) |> Map.put(:ok, false)
+    end
+  end
+
+  # v1 (and any pre-v2): linkage-only — content is not reliably re-derivable (§8.1).
+  #
+  # §8.7 hardening: `hash_version` is the selector that decides verification STRENGTH
+  # (v2 → content-verified, v1 → linkage-only), yet it is a mutable column. The v2
+  # leaf preimage binds the version only through its domain string
+  # ("loopctl/audit-leaf/2"), NOT a numeric field, so a `hash_version` flipped
+  # 2 → 1 by anyone who has already defeated the immutability triggers would route a
+  # genuine v2 entry here and SKIP its content check. Before accepting a sub-v2 entry
+  # as linkage-only, recompute it AS v2: a match proves the entry was authored v2 and
+  # its version column was tampered DOWN, so flag it as tampered rather than trusting
+  # the selector to weaken verification. A legitimate v1 entry (non-reproducible
+  # content, §8.1) will not match and stays linkage-only. Residual: a downgrade that
+  # ALSO rewrote content is undetectable here (v1 is content-unverifiable by design)
+  # and remains bounded by the linkage check plus the DB immutability triggers.
+  defp verify_chain_content(%Entry{} = entry, acc) do
+    if downgraded_from_v2?(entry) do
+      acc |> Map.update!(:tampered, &[entry.chain_position | &1]) |> Map.put(:ok, false)
+    else
+      Map.update!(acc, :linkage_only, &(&1 + 1))
+    end
+  end
+
+  # True when a sub-v2 entry's stored hash matches a v2 recompute of its content —
+  # i.e. it was really written as v2 and its `hash_version` was tampered downward.
+  defp downgraded_from_v2?(%Entry{} = entry) do
+    LeafHash.compute(leaf_fields(entry), 2) == entry.entry_hash
+  rescue
+    # A genuine v1 payload that v2 canonicalization rejects (e.g. an ambiguous
+    # duplicate key) is simply not a downgraded-v2 entry — stay linkage-only.
+    _ -> false
+  end
+
+  defp finalize_chain_report(acc) do
+    acc
+    |> Map.drop([:prev_hash])
+    |> Map.update!(:tampered, &Enum.reverse/1)
+    |> Map.update!(:broken_links, &Enum.reverse/1)
   end
 end

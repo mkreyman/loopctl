@@ -814,6 +814,13 @@ defmodule Loopctl.BulkOperations do
   defp format_reason(:self_verify_blocked),
     do: "cannot verify your own implemented work (chain-of-custody)"
 
+  defp format_reason(:unresolvable_dispatch_lineage),
+    do:
+      "a dispatch referenced by this story (the implementer's, or the verifier's) could not " <>
+        "be resolved, so the custody gate cannot prove the verifier's lineage is separated " <>
+        "from the implementer's and failed closed. This is a lineage-integrity failure; " <>
+        "re-establish the dispatch provenance before verifying"
+
   defp format_reason(:missing_assigned_agent),
     do:
       "story is reported_done with no assigned agent or dispatch lineage; its " <>
