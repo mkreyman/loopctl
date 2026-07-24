@@ -431,6 +431,42 @@ defmodule Loopctl.Progress do
     end
   end
 
+  # LCP-1 §9.4 audit binding: when a custody gate ran under a VERIFIED signed claim
+  # (stashed by RequireSignedClaim into `opts[:custody_claim]`), record the
+  # agent_pubkey + claim_sig in the tenant's HASH-CHAINED, STH-covered audit chain,
+  # ATOMICALLY with the gate decision. This is the durable cryptographic residue that
+  # lets a third party re-check authorship offline and prevents a malicious operator
+  # from fabricating an agent-signed record indistinguishable from a genuine one.
+  # A bearer/legacy (unsigned) gate adds no such step — nothing to bind.
+  defp maybe_chain_signed_claim(multi, tenant_id, story_id, opts) do
+    case Keyword.get(opts, :custody_claim) do
+      %{gate: gate} = claim ->
+        Multi.run(multi, :signed_claim_chain, fn _repo, _changes ->
+          Loopctl.AuditChain.append(tenant_id, %{
+            action: "signed_custody_claim",
+            actor_lineage: signed_claim_lineage(opts),
+            entity_type: "story",
+            entity_id: story_id,
+            payload: %{
+              "gate" => gate,
+              "agent_pubkey" => claim.agent_pubkey_hex,
+              "alg" => claim.alg,
+              "claim_sig" => claim.claim_sig,
+              "claimed_at" => claim.claimed_at
+            }
+          })
+        end)
+
+      _ ->
+        multi
+    end
+  end
+
+  defp signed_claim_lineage(opts) do
+    Keyword.get(opts, :reporter_lineage) || Keyword.get(opts, :reviewer_lineage) ||
+      Keyword.get(opts, :verifier_lineage) || []
+  end
+
   @doc """
   Starts work on a story.
 
@@ -645,6 +681,7 @@ defmodule Loopctl.Progress do
         }
       end)
       |> maybe_audit_token_usage(tenant_id, actor_id, actor_label, token_usage_params)
+      |> maybe_chain_signed_claim(tenant_id, story_id, opts)
       |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
         %{
           tenant_id: tenant_id,
@@ -925,6 +962,7 @@ defmodule Loopctl.Progress do
         Multi.new()
         |> Multi.insert(:review_record, changeset)
         |> enqueue_knowledge_extraction(tenant_id)
+        |> maybe_chain_signed_claim(tenant_id, story_id, opts)
 
       handle_review_transaction(
         AdminRepo.transaction(multi),
@@ -1078,6 +1116,7 @@ defmodule Loopctl.Progress do
         verification_params
       )
       |> audit_verification(tenant_id, "verified", actor_id, actor_label, orchestrator_agent_id)
+      |> maybe_chain_signed_claim(tenant_id, story_id, opts)
       |> EventGenerator.generate_events(:webhook_events_verified, fn %{story: updated} ->
         %{
           tenant_id: tenant_id,

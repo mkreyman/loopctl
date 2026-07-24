@@ -27,6 +27,13 @@ defmodule LoopctlWeb.BulkOperationsController do
   plug LoopctlWeb.Plugs.RequireHumanAnchor
        when action in [:claim, :verify, :reject, :mark_complete]
 
+  # LCP-1 §9.3: bulk verify and bulk mark-complete both reach the `verified`
+  # transition over an unbounded set of stories, which cannot carry the per-item
+  # claim signature the signed profile requires. Refuse an enrolled caller under
+  # `signed` rather than silently waiving the signature on the highest-volume path.
+  plug LoopctlWeb.Plugs.RequireSignedClaim,
+       [gate: "verify", bulk: true] when action in [:verify, :mark_complete]
+
   tags(["Progress"])
 
   operation(:claim,

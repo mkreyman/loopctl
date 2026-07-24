@@ -199,14 +199,14 @@ Epic 39 Repo Coordination Bus — a lightweight, tenant-isolated channel for age
 
 | Tool | Description |
 |---|---|
-| `report_story` | Reviewer confirms the implementation is done. Transitions implementing -> reported_done. Accepts optional `token_usage` object. |
-| `review_complete` | Record that a review has been completed for a story. Required before verify. |
+| `report_story` | Reviewer confirms the implementation is done. Transitions implementing -> reported_done. Accepts optional `token_usage` object. Under the LCP-1 §9.3 signed profile, pass the `claim` from `custody_sign_claim`. |
+| `review_complete` | Record that a review has been completed for a story. Required before verify. Under the signed profile, pass the `claim` from `custody_sign_claim`. |
 
 ### Verification Tools (orchestrator key)
 
 | Tool | Description |
 |---|---|
-| `verify_story` | Orchestrator verifies a reported_done story. Transitions reported_done -> verified. |
+| `verify_story` | Orchestrator verifies a reported_done story. Transitions reported_done -> verified. Under the signed profile, pass the `claim` from `custody_sign_claim`. |
 | `reject_story` | Orchestrator rejects a story with a reason. |
 
 ### Bulk Tools (orchestrator key)
@@ -375,7 +375,13 @@ Key distribution for the dispatch pattern (Epic 26): per-dispatch ephemeral keys
 | Tool | Description |
 |---|---|
 | `signup` | **US-26.7.1.** Create a NEW **agent-rooted (KB-tier)** tenant and mint its one-time root API key — entirely through this call, no human operator, no hardware authenticator, no existing API key required. The tenant gets the FULL knowledge-wiki surface but **cannot** perform work-breakdown / chain-of-custody operations (those require a separate human-anchored tenant via the WebAuthn ceremony at `https://loopctl.com/signup`). Rate-limited per client IP (<= 5/hour). The `raw_key` is shown ONCE — save it immediately (e.g. as `LOOPCTL_USER_KEY`). Required: `name`, `slug`, `email`. |
-| `dispatch` | Mint an ephemeral, scoped api_key for a sub-agent dispatch, carrying its lineage path. The `raw_key` is returned ONCE — pass it to the sub-agent's launch args, never store it in env vars; it expires after `expires_in_seconds` (default 3600, max 14400). Required: `role` (`agent`/`orchestrator`), `agent_id`. Optional: `parent_dispatch_id`, `story_id`. |
+| `dispatch` | Mint an ephemeral, scoped api_key for a sub-agent dispatch, carrying its lineage path. The `raw_key` is returned ONCE — pass it to the sub-agent's launch args, never store it in env vars; it expires after `expires_in_seconds` (default 3600, max 14400). Required: `role` (`agent`/`orchestrator`), `agent_id`. Optional: `parent_dispatch_id`, `story_id`. **LCP-1 §9.2 signed profile:** optionally enroll an agent key via `agent_pubkey` (hex) + `alg` + an `attestation` (from `custody_sign_attestation`) + `attestation_conditions`. |
+| `register_custody_owner_key` | **LCP-1 §9.2.** Register/rotate the tenant custody OWNER key — the root of trust the attestation chain hangs from. Private half stays with you; requires `LOOPCTL_USER_KEY` and a human-anchored tenant. Required: `owner_pubkey` (hex). ROTATION additionally requires `rotation_proof` (from `custody_sign_owner_rotation`); first registration needs none. |
+| `list_enrolled_agent_keys` | **LCP-1 §9.1.1 transparency.** List the agent public keys enrolled under your tenant, reconstructed from the tamper-evident audit chain (not a mutable listing). Compare against the keys you generated; any excess is operator-minted. Keyset-paged (`limit`, `cursor`). |
+| `custody_generate_keypair` | **LCP-1 §9.** Generate an Ed25519 keypair LOCALLY (private key never leaves the process). Returns `public_key_hex` + `private_key_hex`. |
+| `custody_sign_attestation` | **LCP-1 §9.2.** Sign an attestation over an agent key to enroll it — with the OWNER private key (root, `lineage_path: []`) or the PARENT agent private key (child, `lineage_path` = parent's). Returns the hex `attestation` for `dispatch`. |
+| `custody_sign_claim` | **LCP-1 §9.3.** Sign a custody claim with your enrolled agent private key. Returns a `claim` object to pass as the `claim` param to `report_story`/`review_complete`/`verify_story` when the deployment runs the signed profile. |
+| `custody_sign_owner_rotation` | **LCP-1 §9.2.** Sign an owner-key ROTATION proof with the OUTGOING owner private key, proving possession before it re-roots the attestation chain. Binds the old key + its set-at (Unix microseconds) so a captured proof is not replayable after a rotate-back. Returns `rotation_proof` for `register_custody_owner_key`. |
 | `recover_cap` | Re-mint a capability token for a story you're assigned to, after a session crash lost your cap. Required: `story_id`. Optional: `cap_type` (`start_cap`/`report_cap`, default `start_cap`), `lineage`. |
 | `get_sth` | Get the latest Signed Tree Head for a tenant's tamper-evident audit chain. Public — no auth required. Required: `tenant_id`. |
 | `request_authenticator_challenge` | **US-26.7.2.** Step 1 of the opt-in WebAuthn trust-tier upgrade ceremony: issues a registration challenge for enrolling a hardware authenticator against an EXISTING agent-rooted (KB-tier) tenant, promoting it to `human_anchored` on success. Requires an interactive WebAuthn client. |

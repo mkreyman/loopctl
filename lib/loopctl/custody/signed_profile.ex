@@ -30,6 +30,7 @@ defmodule Loopctl.Custody.SignedProfile do
 
   @attestation_domain "loopctl/dispatch-attestation/1"
   @claim_domain "loopctl/custody-claim/1"
+  @owner_rotation_domain "loopctl/owner-key-rotation/2"
 
   # The only algorithm this version defines (LCP-1 §6.1). A future
   # "secp256k1-schnorr" (Nostr interop) is an ADDITIVE entry here plus a matching
@@ -55,6 +56,19 @@ defmodule Loopctl.Custody.SignedProfile do
   The attestation authorizes; it does not transfer authorship (LCP-1 §9.2). It is
   authorization *evidence* over the agent's own public key — the agent stays the
   author of anything it later signs.
+
+  ## Replay scope — carry an `expires<...>` condition
+
+  The new dispatch's server-generated id is deliberately EXCLUDED from the preimage
+  so the attestation is signable in advance. The consequence is that a single owner
+  attestation over key `X` and a given `lineage_path` can be presented to enroll key
+  `X` more than once. This is bounded — every enrollment is owner-authorized and
+  recorded on the §9.1.1 transparency log, so the operator can attribute nothing to
+  a DIFFERENT key and duplicates are detectable — but an owner who wants to bound
+  re-enrollment SHOULD scope the attestation with an `expires<unix-ts>` (and/or
+  `gate=<name>`) condition. Those conditions are enforced at claim time by
+  `conditions_met?/3` (via `Loopctl.Custody.SignedProfilePolicy`), so an expired
+  attestation stops authorizing claims once its window passes.
   """
   @spec attestation_preimage(String.t(), binary(), binary(), [binary()], String.t()) :: binary()
   def attestation_preimage(alg, tenant_id, agent_pubkey, lineage_path, conditions)
@@ -266,6 +280,12 @@ defmodule Loopctl.Custody.SignedProfile do
   Validates a `conditions` string per the LCP-1 §9.2 grammar: the empty string, or
   `&`-separated `gate=<name>` / `expires<unix-timestamp>` clauses, ASCII, no
   whitespace, no leading/trailing/double `&`, canonical base-10 timestamps.
+
+  `gate=` is SINGLE-VALUED. `conditions_met?/3` conjuncts every clause, so two
+  `gate=` clauses (e.g. `gate=report&gate=verify`) can never both be satisfied by
+  one claim's single gate — the attestation would authorize NOTHING for any gate.
+  Rather than accept an unusable attestation and let it fail silently at claim
+  time, reject more than one `gate=` clause here, at signing/enrollment time.
   """
   @spec valid_conditions?(term()) :: boolean()
   def valid_conditions?(""), do: true
@@ -276,11 +296,18 @@ defmodule Loopctl.Custody.SignedProfile do
       String.starts_with?(conditions, "&") -> false
       String.ends_with?(conditions, "&") -> false
       String.contains?(conditions, "&&") -> false
-      true -> conditions |> String.split("&") |> Enum.all?(&valid_clause?/1)
+      true -> valid_clauses?(String.split(conditions, "&"))
     end
   end
 
   def valid_conditions?(_), do: false
+
+  # Every clause must be individually valid AND there may be at most one `gate=`
+  # clause — a second one makes the conjunctive `conditions_met?/3` unsatisfiable.
+  defp valid_clauses?(clauses) do
+    Enum.all?(clauses, &valid_clause?/1) and
+      Enum.count(clauses, &String.starts_with?(&1, "gate=")) <= 1
+  end
 
   @doc """
   Evaluates the `conditions` of a verified attestation against a concrete claim.
@@ -328,6 +355,49 @@ defmodule Loopctl.Custody.SignedProfile do
 
   defp ascii_no_space?(s),
     do: s == for(<<c <- s>>, c > 32 and c < 127, into: "", do: <<c>>)
+
+  # ── Owner-key rotation proof (LCP-1 §9.2 root of trust) ───────────────────
+
+  @doc """
+  The preimage the OUTGOING owner key signs to authorize a rotation to a new owner
+  key.
+
+  `preimage = LP(domain) || LP(tenant_id) || LP(old_pubkey) || uint64_be(old_set_at) ||
+              LP(new_pubkey) || LP(new_alg)`
+
+  Rotating the §9.2 owner key re-roots the entire attestation chain, so a rotation
+  MUST prove possession of the retiring root private half — a stolen `:user` API
+  key alone cannot re-root trust. First registration (no prior key) is authorized
+  by the human-anchor + `:user` gate instead; there is no outgoing key to sign.
+
+  The OUTGOING key (`old_pubkey`) and its `old_set_at` (the Unix second the retiring
+  key became current) are bound into the preimage so a captured rotation proof is
+  NOT replayable when a prior key becomes current again: after `A→B→A`, key `A`'s
+  `set_at` has advanced, so the old `Sign_A(…, A, old_set_at, B)` proof no longer
+  matches the reconstructed preimage and cannot re-root trust back to the (now
+  compromised) `B`.
+  """
+  @spec owner_rotation_preimage(binary(), binary(), integer(), binary(), String.t()) :: binary()
+  def owner_rotation_preimage(tenant_id, old_pubkey, old_set_at, new_pubkey, new_alg)
+      when is_binary(old_pubkey) and is_integer(old_set_at) and is_binary(new_pubkey) and
+             is_binary(new_alg) do
+    lp(@owner_rotation_domain) <>
+      lp(to_string(tenant_id)) <>
+      lp(old_pubkey) <>
+      <<old_set_at::unsigned-big-integer-size(64)>> <>
+      lp(new_pubkey) <>
+      lp(new_alg)
+  end
+
+  @doc """
+  Verifies a raw `signature` over `preimage` under `alg` and `pubkey`.
+
+  Public wrapper over the algorithm-agile signature backend, for callers (e.g.
+  owner-key rotation proofs) that build their own domain-separated preimage.
+  Returns a boolean; never raises.
+  """
+  @spec verify(String.t(), binary(), binary(), binary()) :: boolean()
+  def verify(alg, preimage, signature, pubkey), do: verify_sig(alg, preimage, signature, pubkey)
 
   # ── Signature backend (LCP-1 §6.1 algorithm agility) ──────────────────────
 

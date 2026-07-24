@@ -235,6 +235,8 @@ defmodule LoopctlWeb.Router do
 
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
+    # LCP-1 §9.2 — register/rotate the custody owner key (root of trust).
+    post "/tenants/me/custody-owner-key", TenantController, :register_owner_key
 
     # Per-tenant BYO Anthropic LLM config (Epic 28 residual, #179). Role :user —
     # the PATCH stores a tenant secret (enforced by the controller's RequireRole).
@@ -277,6 +279,9 @@ defmodule LoopctlWeb.Router do
     delete "/tenants/:id/authenticators/:auth_id", TenantAuthenticatorController, :delete
 
     # US-26.2.1 — Dispatch lineage
+    # LCP-1 §9.1.1 — transparency read of enrolled agent keys (before :show so it
+    # is not captured as a dispatch id).
+    get "/dispatches/enrolled-keys", DispatchController, :enrolled_keys
     resources "/dispatches", DispatchController, only: [:create, :show, :index]
 
     # API key management

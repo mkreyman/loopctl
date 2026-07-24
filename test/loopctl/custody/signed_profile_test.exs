@@ -9,6 +9,7 @@ defmodule Loopctl.Custody.SignedProfileTest do
   alias Loopctl.Custody.SignedProfile
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
+  alias Loopctl.Test.CustodyEnrollment
 
   defp keypair, do: :crypto.generate_key(:eddsa, :ed25519)
 
@@ -500,7 +501,12 @@ defmodule Loopctl.Custody.SignedProfileTest do
           expires_at: DateTime.add(now, 3600, :second),
           created_at: now,
           agent_pubkey: pub,
-          alg: "ed25519"
+          alg: "ed25519",
+          # A dummy attestation blob so the both-or-neither CHECK
+          # (dispatches_attestation_matches_enrollment) passes and the insert reaches
+          # the transparency trigger — the trigger checks for the audit entry, not the
+          # attestation's validity.
+          attestation: :binary.copy(<<0>>, 64)
         })
         |> AdminRepo.insert!()
 
@@ -512,15 +518,7 @@ defmodule Loopctl.Custody.SignedProfileTest do
       tenant: tenant
     } do
       agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
-      {pub, _} = keypair()
-
-      {:ok, _} =
-        Dispatches.create_dispatch(tenant.id, %{
-          role: :agent,
-          agent_id: agent.id,
-          agent_pubkey: pub,
-          alg: "ed25519"
-        })
+      CustodyEnrollment.enroll_root(tenant.id, %{agent_id: agent.id})
 
       # Forcing the deferred backstop to check must NOT raise — the Multi wrote the
       # matching transparency audit entry in the same transaction as the dispatch.
@@ -530,15 +528,9 @@ defmodule Loopctl.Custody.SignedProfileTest do
     test "enrolling an agent key records it on the audit chain, enumerable from the chain alone",
          %{tenant: tenant} do
       agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
-      {agent_pub, _priv} = keypair()
 
-      {:ok, %{dispatch: dispatch}} =
-        Dispatches.create_dispatch(tenant.id, %{
-          role: :agent,
-          agent_id: agent.id,
-          agent_pubkey: agent_pub,
-          alg: "ed25519"
-        })
+      %{dispatch: dispatch, agent_pub: agent_pub} =
+        CustodyEnrollment.enroll_root(tenant.id, %{agent_id: agent.id})
 
       assert dispatch.agent_pubkey == agent_pub
       assert dispatch.alg == "ed25519"
@@ -561,15 +553,7 @@ defmodule Loopctl.Custody.SignedProfileTest do
       # listing must page rather than load them all at once.
       for _ <- 1..3 do
         agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
-        {pub, _priv} = keypair()
-
-        {:ok, _} =
-          Dispatches.create_dispatch(tenant.id, %{
-            role: :agent,
-            agent_id: agent.id,
-            agent_pubkey: pub,
-            alg: "ed25519"
-          })
+        CustodyEnrollment.enroll_root(tenant.id, %{agent_id: agent.id})
       end
 
       page1 = Dispatches.enrolled_agent_keys(tenant.id, limit: 2)
@@ -608,15 +592,9 @@ defmodule Loopctl.Custody.SignedProfileTest do
     test "the full loop: enroll a key, sign a claim with the private half, server verifies it",
          %{tenant: tenant} do
       agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
-      {agent_pub, agent_priv} = keypair()
 
-      {:ok, %{dispatch: dispatch}} =
-        Dispatches.create_dispatch(tenant.id, %{
-          role: :agent,
-          agent_id: agent.id,
-          agent_pubkey: agent_pub,
-          alg: "ed25519"
-        })
+      %{dispatch: dispatch, agent_priv: agent_priv} =
+        CustodyEnrollment.enroll_root(tenant.id, %{agent_id: agent.id})
 
       # Agent side (private key never left the agent): sign the claim.
       body = %{"outcome" => "approved"}
@@ -655,14 +633,19 @@ defmodule Loopctl.Custody.SignedProfileTest do
 
     test "a malformed / wrong-length agent_pubkey is rejected at enrollment", %{tenant: tenant} do
       agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      {_owner_pub, owner_priv} = CustodyEnrollment.ensure_owner_key(tenant.id)
 
-      # 8 raw bytes hex-encoded → decodes to an 8-byte key, not a 32-byte Ed25519 key.
+      # A VALID attestation over the (malformed) key — so the rejection comes from
+      # the 32-byte length validation, not from attestation-required masking it.
+      short = :crypto.strong_rand_bytes(8)
+
       assert {:error, _} =
                Dispatches.create_dispatch(tenant.id, %{
                  role: :agent,
                  agent_id: agent.id,
-                 agent_pubkey: Base.encode16(:crypto.strong_rand_bytes(8), case: :lower),
-                 alg: "ed25519"
+                 agent_pubkey: Base.encode16(short, case: :lower),
+                 alg: "ed25519",
+                 attestation: CustodyEnrollment.root_attestation(tenant.id, short, owner_priv)
                })
 
       # An undecodable, non-hex junk string is rejected too — never persisted raw.
@@ -671,7 +654,8 @@ defmodule Loopctl.Custody.SignedProfileTest do
                  role: :agent,
                  agent_id: agent.id,
                  agent_pubkey: "notakey",
-                 alg: "ed25519"
+                 alg: "ed25519",
+                 attestation: CustodyEnrollment.root_attestation(tenant.id, "notakey", owner_priv)
                })
 
       # And nothing bogus was recorded on the transparency log.
@@ -680,9 +664,10 @@ defmodule Loopctl.Custody.SignedProfileTest do
 
     test "the both-or-neither DB CHECK rejects a half-enrolled dispatch", %{tenant: tenant} do
       agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      {_owner_pub, owner_priv} = CustodyEnrollment.ensure_owner_key(tenant.id)
       {agent_pub, _} = keypair()
 
-      # alg without a pubkey — changeset validation catches it first.
+      # alg without a pubkey — no attestation needed (bearer path), changeset catches it.
       assert {:error, _} =
                Dispatches.create_dispatch(tenant.id, %{
                  role: :agent,
@@ -690,28 +675,145 @@ defmodule Loopctl.Custody.SignedProfileTest do
                  alg: "ed25519"
                })
 
-      # pubkey with an unknown alg — rejected.
+      # pubkey with an unknown alg — rejected (a valid attestation is present so the
+      # rejection is the alg check, not attestation-required).
       assert {:error, _} =
                Dispatches.create_dispatch(tenant.id, %{
                  role: :agent,
                  agent_id: agent.id,
                  agent_pubkey: agent_pub,
-                 alg: "rsa"
+                 alg: "rsa",
+                 attestation: CustodyEnrollment.root_attestation(tenant.id, agent_pub, owner_priv)
+               })
+    end
+
+    test "enrolling an agent key with NO attestation is rejected (§9.2)", %{tenant: tenant} do
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      {agent_pub, _} = keypair()
+      CustodyEnrollment.ensure_owner_key(tenant.id)
+
+      assert {:error, :attestation_required} =
+               Dispatches.create_dispatch(tenant.id, %{
+                 role: :agent,
+                 agent_id: agent.id,
+                 agent_pubkey: agent_pub,
+                 alg: "ed25519"
+               })
+    end
+
+    test "a root enrollment with no owner key registered is rejected (§9.2 root of trust)", %{
+      tenant: tenant
+    } do
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      {agent_pub, _} = keypair()
+      # No owner key registered → cannot resolve a root authorizer.
+      assert {:error, :owner_key_not_registered} =
+               Dispatches.create_dispatch(tenant.id, %{
+                 role: :agent,
+                 agent_id: agent.id,
+                 agent_pubkey: agent_pub,
+                 alg: "ed25519",
+                 attestation: :binary.copy(<<0>>, 64)
+               })
+    end
+
+    test "a root attestation signed by the WRONG key is rejected", %{tenant: tenant} do
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      CustodyEnrollment.ensure_owner_key(tenant.id)
+      {agent_pub, _} = keypair()
+      {_wrong_pub, wrong_priv} = keypair()
+
+      assert {:error, {:attestation_invalid, _}} =
+               Dispatches.create_dispatch(tenant.id, %{
+                 role: :agent,
+                 agent_id: agent.id,
+                 agent_pubkey: agent_pub,
+                 alg: "ed25519",
+                 attestation: CustodyEnrollment.root_attestation(tenant.id, agent_pub, wrong_priv)
+               })
+    end
+
+    test "delegation: a CHILD agent key is attested by the PARENT's agent key, not the owner", %{
+      tenant: tenant
+    } do
+      # Root enrollment, owner-attested.
+      parent_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      %{dispatch: parent, agent_priv: parent_priv} =
+        CustodyEnrollment.enroll_root(tenant.id, %{
+          role: :orchestrator,
+          agent_id: parent_agent.id
+        })
+
+      # Child enrollment: the PARENT signs the attestation over the child key, over
+      # the PARENT's lineage. No owner signature involved.
+      child_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      {child_pub, _child_priv} = keypair()
+
+      child_preimage =
+        SignedProfile.attestation_preimage(
+          "ed25519",
+          tenant.id,
+          child_pub,
+          parent.lineage_path,
+          ""
+        )
+
+      child_attestation = SignedProfile.sign("ed25519", child_preimage, parent_priv)
+
+      assert {:ok, %{dispatch: child}} =
+               Dispatches.create_dispatch(tenant.id, %{
+                 role: :agent,
+                 agent_id: child_agent.id,
+                 parent_dispatch_id: parent.id,
+                 agent_pubkey: child_pub,
+                 alg: "ed25519",
+                 attestation: child_attestation
+               })
+
+      assert child.agent_pubkey == child_pub
+      assert List.first(child.lineage_path) == List.first(parent.lineage_path)
+
+      # A child attestation signed by the OWNER (not the parent) is rejected — the
+      # authorizer for a child is specifically the parent's key.
+      {_o, owner_priv} = CustodyEnrollment.ensure_owner_key(tenant.id)
+      {child2_pub, _} = keypair()
+      child2_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+      wrong_preimage =
+        SignedProfile.attestation_preimage(
+          "ed25519",
+          tenant.id,
+          child2_pub,
+          parent.lineage_path,
+          ""
+        )
+
+      assert {:error, {:attestation_invalid, _}} =
+               Dispatches.create_dispatch(tenant.id, %{
+                 role: :agent,
+                 agent_id: child2_agent.id,
+                 parent_dispatch_id: parent.id,
+                 agent_pubkey: child2_pub,
+                 alg: "ed25519",
+                 attestation: SignedProfile.sign("ed25519", wrong_preimage, owner_priv)
                })
     end
   end
 
   describe "LCP-1 §9.2 attestation-gate coupling (tripwire)" do
     test "verify_claim cannot be gated in production without verify_attestation at enrollment" do
-      # Enrollment (`Dispatches.create_dispatch`) accepts an operator-supplied
-      # `agent_pubkey` UNATTESTED today — the §9.1.1 transparency log is its only
-      # mitigation (documented deliberate scope). `SignedProfile.verify_claim` has NO
-      # production caller yet. This tripwire couples the two so the gap cannot widen
-      # silently: the moment any production module under `lib/` (other than the pure
-      # `SignedProfile` core itself) calls `verify_claim`, enrollment MUST also call
-      # `SignedProfile.verify_attestation` (LCP-1 §9.2). Otherwise an operator could
-      # forge agent-attributable claims with a keypair it generated and enrolled
-      # unattested. The scan matches a CALL (`name(`), not a docstring reference.
+      # POST-ACTIVATION invariant (the "unattested is acceptable, transparency-only"
+      # scope was OVERTURNED for owner-attested enrollment — KB 64a6aecd / f683e6f9):
+      # `Dispatches.create_dispatch` NOW verifies the owner/parent attestation
+      # (`verify_attestation`) at enrollment, and `SignedProfilePolicy` IS a
+      # production `verify_claim` caller. This tripwire keeps the two coupled so the
+      # guarantee cannot be silently REMOVED: if any production module under `lib/`
+      # (other than the pure `SignedProfile` core itself) gates `verify_claim`,
+      # enrollment MUST still call `SignedProfile.verify_attestation` (LCP-1 §9.2).
+      # Ripping verify_attestation out of enrollment while a claim gate remains would
+      # let an operator forge agent-attributable claims with a self-enrolled key. The
+      # scan matches a CALL (`name(`), not a docstring reference.
       claim_callers =
         "lib/**/*.ex"
         |> Path.wildcard()

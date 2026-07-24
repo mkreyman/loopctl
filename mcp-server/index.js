@@ -951,7 +951,7 @@ async function requestReview({ story_id }) {
 
 // --- Reviewer Tools (orch key — reviewer uses orchestrator role) ---
 
-async function reportStory({ story_id, artifact_type, artifact_path, token_usage }) {
+async function reportStory({ story_id, artifact_type, artifact_path, token_usage, claim }) {
   const body = {};
   if (artifact_type || artifact_path) {
     body.artifact = {};
@@ -961,6 +961,7 @@ async function reportStory({ story_id, artifact_type, artifact_path, token_usage
   if (token_usage) {
     body.token_usage = token_usage;
   }
+  if (claim) body.claim = claim;
 
   const result = await apiCall(
     "POST",
@@ -971,12 +972,13 @@ async function reportStory({ story_id, artifact_type, artifact_path, token_usage
   return toContent(result);
 }
 
-async function reviewComplete({ story_id, review_type, findings_count, fixes_count, disproved_count, summary }) {
+async function reviewComplete({ story_id, review_type, findings_count, fixes_count, disproved_count, summary, claim }) {
   const body = { review_type };
   if (findings_count != null) body.findings_count = findings_count;
   if (fixes_count != null) body.fixes_count = fixes_count;
   if (disproved_count != null) body.disproved_count = disproved_count;
   if (summary) body.summary = summary;
+  if (claim) body.claim = claim;
 
   const result = await apiCall(
     "POST",
@@ -989,10 +991,11 @@ async function reviewComplete({ story_id, review_type, findings_count, fixes_cou
 
 // --- Verification Tools (orch key) ---
 
-async function verifyStory({ story_id, summary, review_type }) {
+async function verifyStory({ story_id, summary, review_type, claim }) {
   const body = {};
   if (summary) body.summary = summary;
   if (review_type) body.review_type = review_type;
+  if (claim) body.claim = claim;
 
   const result = await apiCall(
     "POST",
@@ -2389,20 +2392,222 @@ async function listRoutes() {
   return toContent(result);
 }
 
-// US-26.2.3: Dispatch lineage tool
+// US-26.2.3: Dispatch lineage tool. LCP-1 §9.2: optionally enroll an agent key
+// (agent_pubkey + alg) with an owner/parent attestation over it.
 async function createDispatch({
   parent_dispatch_id,
   role,
   story_id,
   agent_id,
   expires_in_seconds = 3600,
+  agent_pubkey,
+  alg,
+  attestation,
+  attestation_conditions,
 }) {
   const body = { role, agent_id, expires_in_seconds };
   if (parent_dispatch_id) body.parent_dispatch_id = parent_dispatch_id;
   if (story_id) body.story_id = story_id;
+  // LCP-1 §9.2 signed-profile enrollment (all-or-nothing).
+  if (agent_pubkey) {
+    body.agent_pubkey = agent_pubkey;
+    body.alg = alg || "ed25519";
+    if (attestation) body.attestation = attestation;
+    if (attestation_conditions !== undefined)
+      body.attestation_conditions = attestation_conditions;
+  }
 
   const result = await apiCall("POST", "/api/v1/dispatches", body);
   return toContent(result);
+}
+
+// LCP-1 §9.2: register/rotate the tenant custody owner key (root of trust).
+// ROTATION (an owner key already exists) requires `rotation_proof`: a hex Ed25519
+// signature by the OUTGOING owner key over owner_rotation_preimage(tenant_id,
+// new_pubkey, new_alg). First registration omits it. Proof of possession of the
+// retiring root key is what stops a stolen :user key from re-rooting trust.
+async function registerCustodyOwnerKey({ owner_pubkey, alg = "ed25519", rotation_proof }) {
+  const body = { owner_pubkey, alg };
+  if (rotation_proof) body.rotation_proof = rotation_proof;
+  const result = await apiCall(
+    "POST",
+    "/api/v1/tenants/me/custody-owner-key",
+    body,
+    process.env.LOOPCTL_USER_KEY,
+  );
+  return toContent(result);
+}
+
+// LCP-1 §9.1.1: transparency read of the enrolled agent-key set from the chain.
+async function listEnrolledAgentKeys({ limit, cursor } = {}) {
+  const qs = new URLSearchParams();
+  if (limit) qs.set("limit", String(limit));
+  if (cursor) qs.set("cursor", String(cursor));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const result = await apiCall("GET", `/api/v1/dispatches/enrolled-keys${suffix}`);
+  return toContent(result);
+}
+
+// --- LCP-1 §9 client-side signing helpers (Ed25519 via node crypto) ---
+//
+// The agent's private key never leaves this local process (it is the agent's own
+// tool). These helpers generate the keypair and produce the length-prefixed,
+// domain-separated preimages of LCP-1 §9.2/§9.3, then Ed25519-sign them, so an
+// agent can enroll and sign claims without reimplementing the wire format.
+
+function lcpLp(buf) {
+  const len = Buffer.alloc(8);
+  len.writeBigUInt64BE(BigInt(buf.length));
+  return Buffer.concat([len, Buffer.from(buf)]);
+}
+
+function lcpPresent(strOrNull) {
+  // Only null/undefined is ABSENT (0x00). A present-but-EMPTY string is present
+  // (0x01 || LP("")), matching Elixir SignedProfile.present/1 exactly — the Elixir
+  // suite asserts a nil optional and an empty-string optional produce DIFFERENT
+  // preimages, so collapsing "" to absent here would break that invariant and make
+  // a claim signed with capability="" fail to verify server-side.
+  if (strOrNull === null || strOrNull === undefined) return Buffer.from([0]);
+  return Buffer.concat([Buffer.from([1]), lcpLp(Buffer.from(strOrNull, "utf8"))]);
+}
+
+function lcpCanonicalJson(value) {
+  if (Array.isArray(value))
+    return "[" + value.map(lcpCanonicalJson).join(",") + "]";
+  if (value && typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    return (
+      "{" +
+      keys.map((k) => JSON.stringify(k) + ":" + lcpCanonicalJson(value[k])).join(",") +
+      "}"
+    );
+  }
+  // Elixir LeafHash.canonical_json routes EVERY number through Decimal
+  // normalization (a single full-decimal string, never scientific notation), which
+  // this canonicalizer does not replicate — JSON.stringify(1e22) yields "1e+22"
+  // while Elixir yields "10000000000000000000000". v1 signs only an empty `body`
+  // and UUID-STRING lineage paths, so numbers never appear; refuse them LOUDLY
+  // rather than emit a signature that would silently fail to verify across the
+  // JS/Elixir boundary once body signing (finding/artifact content) lands. Aligning
+  // the number handling is a prerequisite for enabling body signing.
+  if (typeof value === "number" || typeof value === "bigint") {
+    throw new Error(
+      "lcpCanonicalJson: numeric values are not supported yet — the JS canonicalizer " +
+        "does not match Elixir's Decimal number normalization (LCP-1 canonical_json). " +
+        "v1 signs an empty body; do not sign numeric fields until this is aligned.",
+    );
+  }
+  return JSON.stringify(value);
+}
+
+function lcpSign(preimage, privateKeyObj) {
+  const digest = crypto.createHash("sha256").update(preimage).digest();
+  return crypto.sign(null, digest, privateKeyObj);
+}
+
+function lcpEd25519FromRawPrivate(hex) {
+  // Wrap a 32-byte raw Ed25519 seed as a PKCS8 key node can sign with.
+  const seed = Buffer.from(hex, "hex");
+  const pkcs8 = Buffer.concat([
+    Buffer.from("302e020100300506032b657004220420", "hex"),
+    seed,
+  ]);
+  return crypto.createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+}
+
+async function custodyGenerateKeypair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const rawPub = publicKey.export({ format: "der", type: "spki" }).slice(-32);
+  const rawPriv = privateKey.export({ format: "der", type: "pkcs8" }).slice(-32);
+  return toContent({
+    alg: "ed25519",
+    public_key_hex: rawPub.toString("hex"),
+    private_key_hex: rawPriv.toString("hex"),
+    note:
+      "Keep private_key_hex secret and local. Register public_key_hex (as an owner key " +
+      "or enroll it as an agent key with an attestation). Sign claims with custody_sign_claim.",
+  });
+}
+
+async function custodySignAttestation({
+  tenant_id,
+  agent_pubkey,
+  lineage_path = [],
+  conditions = "",
+  authorizer_private_key_hex,
+}) {
+  const preimage = Buffer.concat([
+    lcpLp(Buffer.from("loopctl/dispatch-attestation/1", "utf8")),
+    lcpLp(Buffer.from("ed25519", "utf8")),
+    lcpLp(Buffer.from(tenant_id, "utf8")),
+    lcpLp(Buffer.from(agent_pubkey, "hex")),
+    lcpLp(Buffer.from(lcpCanonicalJson(lineage_path), "utf8")),
+    lcpLp(Buffer.from(conditions, "utf8")),
+  ]);
+  const sig = lcpSign(preimage, lcpEd25519FromRawPrivate(authorizer_private_key_hex));
+  return toContent({ alg: "ed25519", attestation: sig.toString("hex") });
+}
+
+async function custodySignClaim({
+  tenant_id,
+  gate,
+  work_item_id,
+  capability_id,
+  body = {},
+  claimed_at,
+  agent_private_key_hex,
+}) {
+  const ts = claimed_at || Math.floor(Date.now() / 1000);
+  const tsBuf = Buffer.alloc(8);
+  tsBuf.writeBigUInt64BE(BigInt(ts));
+  const preimage = Buffer.concat([
+    lcpLp(Buffer.from("loopctl/custody-claim/1", "utf8")),
+    lcpLp(Buffer.from("ed25519", "utf8")),
+    lcpLp(Buffer.from(tenant_id, "utf8")),
+    lcpLp(Buffer.from(gate, "utf8")),
+    lcpPresent(work_item_id),
+    lcpLp(Buffer.from(lcpCanonicalJson(body), "utf8")),
+    lcpPresent(capability_id),
+    tsBuf,
+  ]);
+  const sig = lcpSign(preimage, lcpEd25519FromRawPrivate(agent_private_key_hex));
+  return toContent({
+    claim: { alg: "ed25519", claim_sig: sig.toString("hex"), claimed_at: ts },
+    note: "Attach `claim` to the report/review-complete/verify request body under the signed profile.",
+  });
+}
+
+async function custodySignOwnerRotation({
+  tenant_id,
+  old_pubkey_hex,
+  old_set_at_unix_micros,
+  new_pubkey_hex,
+  new_alg = "ed25519",
+  old_private_key_hex,
+}) {
+  // LCP-1 §9.2 owner-key rotation proof. Signed by the OUTGOING (retiring) owner
+  // private key to prove possession before it re-roots the attestation chain. The
+  // preimage has NO alg element after the domain (unlike attestation/claim), and
+  // binds old_set_at as a raw uint64 of MICROSECONDS so a captured proof is not
+  // replayable after a rotate-back (see SignedProfile.owner_rotation_preimage/5).
+  const setAtBuf = Buffer.alloc(8);
+  setAtBuf.writeBigUInt64BE(BigInt(old_set_at_unix_micros));
+  const preimage = Buffer.concat([
+    lcpLp(Buffer.from("loopctl/owner-key-rotation/2", "utf8")),
+    lcpLp(Buffer.from(tenant_id, "utf8")),
+    lcpLp(Buffer.from(old_pubkey_hex, "hex")),
+    setAtBuf,
+    lcpLp(Buffer.from(new_pubkey_hex, "hex")),
+    lcpLp(Buffer.from(new_alg, "utf8")),
+  ]);
+  const sig = lcpSign(preimage, lcpEd25519FromRawPrivate(old_private_key_hex));
+  return toContent({
+    rotation_proof: sig.toString("hex"),
+    note:
+      "Pass rotation_proof as `rotation_proof` to register_custody_owner_key (with the NEW " +
+      "public_key). old_set_at_unix_micros is the retiring key's set-at in Unix MICROSECONDS " +
+      "(from the tenant's custody_owner_key_set_at); a wrong unit will fail verification.",
+  });
 }
 
 // US-26.7.1: public, agent-rooted (KB-tier) self-signup. No API key required —
@@ -2512,6 +2717,24 @@ async function getAcceptanceCriteria({ story_id }) {
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
+
+// LCP-1 §9.3 signed-profile claim object. Attach to a report/review-complete/verify
+// request when the deployment runs the `signed` custody profile — produce it with
+// custody_sign_claim (gate must match the tool). Ignored under the default `bearer`
+// profile, so it is always OPTIONAL and safe to omit.
+const CLAIM_SCHEMA = {
+  type: "object",
+  description:
+    "Optional LCP-1 §9.3 signed custody claim (produced by custody_sign_claim). Required " +
+    "ONLY when this deployment runs the signed custody profile and your dispatch is enrolled " +
+    "with an agent key; ignored under the default bearer profile.",
+  properties: {
+    alg: { type: "string", description: "Signature algorithm, e.g. \"ed25519\"." },
+    claim_sig: { type: "string", description: "Lowercase hex signature over the §9.3 claim preimage." },
+    claimed_at: { type: "integer", description: "Unix seconds the claim was signed (freshness-checked)." },
+  },
+  required: ["alg", "claim_sig", "claimed_at"],
+};
 
 const TOOLS = [
   // Project Tools
@@ -3252,6 +3475,7 @@ const TOOLS = [
             cost_millicents: { type: "integer", description: "Total cost in millicents (1/1000 of a cent)." },
           },
         },
+        claim: CLAIM_SCHEMA,
       },
       required: ["story_id"],
     },
@@ -3289,6 +3513,7 @@ const TOOLS = [
           type: "string",
           description: "Optional: summary of the review outcome.",
         },
+        claim: CLAIM_SCHEMA,
       },
       required: ["story_id", "review_type"],
     },
@@ -3316,6 +3541,7 @@ const TOOLS = [
           type: "string",
           description: "Optional: review type for the verification record.",
         },
+        claim: CLAIM_SCHEMA,
       },
       required: ["story_id"],
     },
@@ -5781,8 +6007,151 @@ const TOOLS = [
           description: "Key lifetime in seconds (default 3600, max 14400).",
           default: 3600,
         },
+        agent_pubkey: {
+          type: "string",
+          description:
+            "LCP-1 §9.2 signed profile: hex-encoded 32-byte Ed25519 public key to enroll for " +
+            "this dispatch. When set, an `attestation` is REQUIRED. Generate a keypair with " +
+            "custody_generate_keypair.",
+        },
+        alg: {
+          type: "string",
+          enum: ["ed25519"],
+          description: "Signature algorithm for the enrolled key (default ed25519).",
+        },
+        attestation: {
+          type: "string",
+          description:
+            "LCP-1 §9.2 owner/parent attestation (hex) over agent_pubkey. Produce it with " +
+            "custody_sign_attestation using the tenant OWNER key (root) or the PARENT dispatch's " +
+            "agent key (delegation).",
+        },
+        attestation_conditions: {
+          type: "string",
+          description: "Optional §9.2 conditions string (e.g. gate=verify&expires<UNIX). Default empty.",
+        },
       },
       required: ["role", "agent_id"],
+    },
+  },
+
+  // LCP-1 §9 signed-profile tools
+  {
+    name: "register_custody_owner_key",
+    description:
+      "LCP-1 §9.2: register/rotate the tenant CUSTODY OWNER KEY — the root of trust the whole " +
+      "attestation chain hangs from. Its private half stays with YOU (never the server); enroll " +
+      "agent keys by signing attestations with it. Requires a user key (LOOPCTL_USER_KEY) and a " +
+      "human-anchored tenant. Generate the keypair with custody_generate_keypair, then pass its " +
+      "public_key_hex here. ROTATION (replacing an existing owner key) additionally requires " +
+      "`rotation_proof` — a possession signature by the OUTGOING key, produced with " +
+      "custody_sign_owner_rotation; first registration needs no proof.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner_pubkey: { type: "string", description: "Hex-encoded 32-byte Ed25519 public key." },
+        alg: { type: "string", enum: ["ed25519"], description: "Default ed25519." },
+        rotation_proof: {
+          type: "string",
+          description:
+            "Hex signature by the OUTGOING owner key authorizing the rotation (LCP-1 §9.2). " +
+            "Required when replacing an existing owner key; produce it with custody_sign_owner_rotation.",
+        },
+      },
+      required: ["owner_pubkey"],
+    },
+  },
+  {
+    name: "list_enrolled_agent_keys",
+    description:
+      "LCP-1 §9.1.1 transparency: list the agent public keys enrolled under your tenant, " +
+      "reconstructed from the tamper-evident audit chain (not a mutable server listing). " +
+      "Compare against the keys you generated; any excess is an operator-minted key. Keyset-paged.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max keys per page." },
+        cursor: { type: "integer", description: "Opaque cursor from a prior page's meta.next_cursor." },
+      },
+    },
+  },
+  {
+    name: "custody_generate_keypair",
+    description:
+      "LCP-1 §9: generate an Ed25519 keypair LOCALLY (the private key never leaves this process). " +
+      "Returns public_key_hex (to register/enroll) and private_key_hex (keep secret; pass to " +
+      "custody_sign_claim / custody_sign_attestation).",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "custody_sign_attestation",
+    description:
+      "LCP-1 §9.2: sign an attestation over an agent public key, to enroll it. Sign with the " +
+      "tenant OWNER private key for a root enrollment (lineage_path []), or the PARENT dispatch's " +
+      "agent private key for a child (lineage_path = the parent's lineage_path). Returns the hex " +
+      "attestation to pass to `dispatch`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tenant_id: { type: "string", description: "Your tenant UUID." },
+        agent_pubkey: { type: "string", description: "Hex agent public key being enrolled." },
+        lineage_path: {
+          type: "array",
+          items: { type: "string" },
+          description: "Authorizer's lineage: [] for owner-root, the parent's lineage_path for a child.",
+        },
+        conditions: { type: "string", description: "Optional conditions string." },
+        authorizer_private_key_hex: {
+          type: "string",
+          description: "Hex private key of the owner (root) or parent agent (child).",
+        },
+      },
+      required: ["tenant_id", "agent_pubkey", "authorizer_private_key_hex"],
+    },
+  },
+  {
+    name: "custody_sign_claim",
+    description:
+      "LCP-1 §9.3: sign a custody claim with your enrolled agent private key. Returns a `claim` " +
+      "object to attach to the report/review-complete/verify request body when the deployment " +
+      "runs the signed profile. Binds gate + work_item_id + capability + claimed_at.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tenant_id: { type: "string", description: "Your tenant UUID." },
+        gate: { type: "string", enum: ["report", "review_complete", "verify"] },
+        work_item_id: { type: "string", description: "The story UUID." },
+        capability_id: { type: "string", description: "Optional capability token id." },
+        claimed_at: { type: "integer", description: "Unix seconds (default: now)." },
+        agent_private_key_hex: { type: "string", description: "Hex agent private key." },
+      },
+      required: ["tenant_id", "gate", "work_item_id", "agent_private_key_hex"],
+    },
+  },
+  {
+    name: "custody_sign_owner_rotation",
+    description:
+      "LCP-1 §9.2: sign an owner-key ROTATION proof with the OUTGOING (retiring) owner private " +
+      "key, proving possession before it re-roots the attestation chain. Returns `rotation_proof` " +
+      "to pass to register_custody_owner_key alongside the NEW public key. Binds the old key + its " +
+      "set-at (Unix MICROSECONDS) so the proof is not replayable after a rotate-back. First " +
+      "registration needs no proof — use this only to REPLACE an existing owner key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tenant_id: { type: "string", description: "Your tenant UUID." },
+        old_pubkey_hex: { type: "string", description: "Hex public key of the OUTGOING owner key." },
+        old_set_at_unix_micros: {
+          type: "integer",
+          description:
+            "The outgoing key's set-at in Unix MICROSECONDS (the tenant's custody_owner_key_set_at). " +
+            "A wrong unit (e.g. seconds/millis) will fail server-side verification.",
+        },
+        new_pubkey_hex: { type: "string", description: "Hex public key of the NEW owner key." },
+        new_alg: { type: "string", enum: ["ed25519"], description: "New key algorithm (default ed25519)." },
+        old_private_key_hex: { type: "string", description: "Hex private key of the OUTGOING owner key." },
+      },
+      required: ["tenant_id", "old_pubkey_hex", "old_set_at_unix_micros", "new_pubkey_hex", "old_private_key_hex"],
     },
   },
 
@@ -6363,6 +6732,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "dispatch":
       return await createDispatch(args);
+
+    case "register_custody_owner_key":
+      return await registerCustodyOwnerKey(args);
+
+    case "list_enrolled_agent_keys":
+      return await listEnrolledAgentKeys(args);
+
+    case "custody_generate_keypair":
+      return await custodyGenerateKeypair(args);
+
+    case "custody_sign_attestation":
+      return await custodySignAttestation(args);
+
+    case "custody_sign_claim":
+      return await custodySignClaim(args);
+
+    case "custody_sign_owner_rotation":
+      return await custodySignOwnerRotation(args);
 
     case "signup":
       return await signup(args);

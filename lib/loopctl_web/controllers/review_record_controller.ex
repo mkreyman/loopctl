@@ -26,6 +26,10 @@ defmodule LoopctlWeb.ReviewRecordController do
   # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
   plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create]
 
+  # LCP-1 §9.3: under the `signed` custody profile, an enrolled reviewer's claim
+  # must carry a valid signature. No-op under the default `bearer` profile.
+  plug LoopctlWeb.Plugs.RequireSignedClaim, [gate: "review_complete"] when action in [:create]
+
   tags(["Progress"])
 
   operation(:create,
@@ -123,6 +127,9 @@ defmodule LoopctlWeb.ReviewRecordController do
       AuditContext.from_conn(conn)
       |> Keyword.put(:reviewer_agent_id, reviewer_agent_id)
       |> Keyword.put(:reviewer_lineage, reviewer_lineage)
+      # LCP-1 §9.4: record the verified signed claim (nil under bearer) in the
+      # hash-chained audit entry, atomically with the review record.
+      |> Keyword.put(:custody_claim, conn.assigns[:custody_signed_claim])
 
     case Progress.record_review(tenant_id, story_id, params, opts) do
       {:ok, review_record} ->

@@ -84,6 +84,26 @@ defmodule Loopctl.DispatchesTest do
       diff = DateTime.diff(dispatch.expires_at, dispatch.created_at, :second)
       assert diff <= 14_400
     end
+
+    test "a REVOKED parent cannot authorize a new child enrollment (fails closed)" do
+      %{tenant: tenant, agent: agent} = setup_dispatch_context()
+
+      {:ok, %{dispatch: parent}} =
+        Dispatches.create_dispatch(tenant.id, %{role: :orchestrator, agent_id: agent.id})
+
+      {:ok, _} = Dispatches.revoke(tenant.id, parent.id)
+
+      child_agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      # create_dispatch is the security boundary — it must reject a revoked delegator
+      # itself, not lean on the controller's direct-parent pre-check.
+      assert {:error, :parent_not_found} =
+               Dispatches.create_dispatch(tenant.id, %{
+                 parent_dispatch_id: parent.id,
+                 role: :agent,
+                 agent_id: child_agent.id
+               })
+    end
   end
 
   describe "revoke/2" do

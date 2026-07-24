@@ -18,6 +18,9 @@ defmodule Loopctl.E2E.CustodyLifecycleJourneyTest do
   @moduletag :e2e
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Custody.SignedProfile
+  alias Loopctl.Dispatches
+  alias Loopctl.Test.CustodyProfileStub
 
   setup :verify_on_exit!
 
@@ -240,6 +243,153 @@ defmodule Loopctl.E2E.CustodyLifecycleJourneyTest do
 
       body = json_response(resp, 409)
       assert body["error"]["code"] == "self_verify_blocked"
+    end
+  end
+
+  describe "LCP-1 §9 signed profile — owner-attested enrollment + signed-claim gate" do
+    test "register owner key (HTTP) -> attested enrollment -> signed report accepted, unsigned 401" do
+      tenant = fixture(:tenant)
+
+      # A human-anchored user key registers the OWNER key over HTTP (§9.2 root of trust).
+      user_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {user_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :user, agent_id: user_agent.id})
+
+      {owner_pub, owner_priv} = :crypto.generate_key(:eddsa, :ed25519)
+
+      reg =
+        build_conn()
+        |> auth_conn(user_key)
+        |> post(~p"/api/v1/tenants/me/custody-owner-key", %{
+          "owner_pubkey" => Base.encode16(owner_pub, case: :lower),
+          "alg" => "ed25519"
+        })
+
+      assert json_response(reg, 200)["tenant"]["custody_owner_pubkey"] ==
+               Base.encode16(owner_pub, case: :lower)
+
+      # Enroll the REPORTER as a signed dispatch, owner-attested (§9.2). The
+      # attestation is signed by the owner private half, over the root lineage [].
+      reporter_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+      {reporter_pub, reporter_priv} = :crypto.generate_key(:eddsa, :ed25519)
+
+      attestation =
+        SignedProfile.sign(
+          "ed25519",
+          SignedProfile.attestation_preimage("ed25519", tenant.id, reporter_pub, [], ""),
+          owner_priv
+        )
+
+      {:ok, %{dispatch: _reporter_dispatch, raw_key: reporter_key}} =
+        Dispatches.create_dispatch(tenant.id, %{
+          role: :orchestrator,
+          agent_id: reporter_agent.id,
+          agent_pubkey: reporter_pub,
+          alg: "ed25519",
+          attestation: attestation
+        })
+
+      # A story assigned to a DIFFERENT implementer, in `implementing` — so the
+      # reporter is a distinct custody identity.
+      impl_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      epic = fixture(:epic, %{tenant_id: tenant.id})
+
+      story =
+        fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+        |> Ecto.Changeset.change(%{
+          agent_status: :implementing,
+          assigned_agent_id: impl_agent.id,
+          assigned_at: DateTime.utc_now()
+        })
+        |> AdminRepo.update!()
+
+      # Activate the signed profile for THIS test process only (async-safe stub).
+      CustodyProfileStub.set_profile(:signed)
+
+      # Unsigned report by the enrolled reporter → 401 claim_signature_required.
+      unsigned =
+        build_conn()
+        |> auth_conn(reporter_key)
+        |> post(~p"/api/v1/stories/#{story.id}/report")
+
+      assert json_response(unsigned, 401)["error"]["code"] == "claim_signature_required"
+
+      # Signed report → accepted (200 reported_done). The agent signs the §9.3 claim
+      # binding gate=report + work_item + (no capability) + claimed_at.
+      claimed_at = System.system_time(:second)
+
+      claim_sig =
+        SignedProfile.sign(
+          "ed25519",
+          SignedProfile.claim_preimage(
+            "ed25519",
+            tenant.id,
+            "report",
+            story.id,
+            %{},
+            nil,
+            claimed_at
+          ),
+          reporter_priv
+        )
+
+      signed =
+        build_conn()
+        |> auth_conn(reporter_key)
+        |> post(~p"/api/v1/stories/#{story.id}/report", %{
+          "claim" => %{
+            "alg" => "ed25519",
+            "claim_sig" => Base.encode16(claim_sig, case: :lower),
+            "claimed_at" => claimed_at
+          }
+        })
+
+      assert json_response(signed, 200)["story"]["agent_status"] == "reported_done"
+
+      # LCP-1 §9.4: the verified claim signature is durably recorded in the
+      # hash-chained audit chain (offline-verifiable residue), not just checked in RAM.
+      entry =
+        Loopctl.AuditChain.list_entries(tenant.id, action: "signed_custody_claim").data
+        |> Enum.find(&(&1.entity_id == story.id))
+
+      assert entry, "expected a signed_custody_claim audit-chain entry"
+      assert entry.payload["gate"] == "report"
+      assert entry.payload["agent_pubkey"] == Base.encode16(reporter_pub, case: :lower)
+      assert entry.payload["claim_sig"] == Base.encode16(claim_sig, case: :lower)
+    end
+
+    test "the enrolled key is enumerable from the transparency endpoint (§9.1.1)" do
+      tenant = fixture(:tenant)
+      {owner_pub, owner_priv} = :crypto.generate_key(:eddsa, :ed25519)
+      {:ok, _} = Loopctl.Tenants.register_custody_owner_key(tenant.id, owner_pub, "ed25519")
+
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      {agent_pub, _} = :crypto.generate_key(:eddsa, :ed25519)
+
+      {:ok, %{raw_key: agent_key}} =
+        Dispatches.create_dispatch(tenant.id, %{
+          role: :agent,
+          agent_id: agent.id,
+          agent_pubkey: agent_pub,
+          alg: "ed25519",
+          attestation:
+            SignedProfile.sign(
+              "ed25519",
+              SignedProfile.attestation_preimage("ed25519", tenant.id, agent_pub, [], ""),
+              owner_priv
+            )
+        })
+
+      # Authenticate the transparency read with the dispatch's own ephemeral key.
+      resp =
+        build_conn()
+        |> auth_conn(agent_key)
+        |> get(~p"/api/v1/dispatches/enrolled-keys")
+
+      body = json_response(resp, 200)
+      hexes = Enum.map(body["data"], & &1["agent_pubkey_hex"])
+      assert Base.encode16(agent_pub, case: :lower) in hexes
     end
   end
 end

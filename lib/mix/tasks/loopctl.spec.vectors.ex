@@ -157,6 +157,23 @@ defmodule Mix.Tasks.Loopctl.Spec.Vectors do
 
     claim_sig = SignedProfile.sign("ed25519", claim_preimage, agent_priv)
 
+    # §9.2 owner-key rotation proof: the OUTGOING key (owner) signs a rotation to a
+    # new owner key. old_set_at is bound as Unix MICROSECONDS.
+    new_owner_seed = :binary.copy(<<3>>, 32)
+    {new_owner_pub, _} = :crypto.generate_key(:eddsa, :ed25519, new_owner_seed)
+    old_set_at = 1_760_000_000_000_000
+
+    rotation_preimage =
+      SignedProfile.owner_rotation_preimage(
+        tenant,
+        owner_pub,
+        old_set_at,
+        new_owner_pub,
+        "ed25519"
+      )
+
+    rotation_sig = SignedProfile.sign("ed25519", rotation_preimage, owner_priv)
+
     %{
       spec: "LCP-1 §9 signed profile",
       note: "hex encodings are lowercase; seeds are 32 bytes; signatures are 64 bytes",
@@ -164,7 +181,9 @@ defmodule Mix.Tasks.Loopctl.Spec.Vectors do
         owner_seed: Base.encode16(owner_seed, case: :lower),
         owner_pubkey: Base.encode16(owner_pub, case: :lower),
         agent_seed: Base.encode16(agent_seed, case: :lower),
-        agent_pubkey: Base.encode16(agent_pub, case: :lower)
+        agent_pubkey: Base.encode16(agent_pub, case: :lower),
+        new_owner_seed: Base.encode16(new_owner_seed, case: :lower),
+        new_owner_pubkey: Base.encode16(new_owner_pub, case: :lower)
       },
       attestation: %{
         alg: "ed25519",
@@ -185,6 +204,16 @@ defmodule Mix.Tasks.Loopctl.Spec.Vectors do
         claimed_at: claimed_at,
         preimage_sha256: Base.encode16(:crypto.hash(:sha256, claim_preimage), case: :lower),
         claim_sig: Base.encode16(claim_sig, case: :lower)
+      },
+      owner_rotation: %{
+        alg: "ed25519",
+        tenant_id: tenant,
+        old_pubkey: Base.encode16(owner_pub, case: :lower),
+        old_set_at_unix_micros: old_set_at,
+        new_pubkey: Base.encode16(new_owner_pub, case: :lower),
+        new_alg: "ed25519",
+        preimage_sha256: Base.encode16(:crypto.hash(:sha256, rotation_preimage), case: :lower),
+        rotation_proof: Base.encode16(rotation_sig, case: :lower)
       }
     }
   end

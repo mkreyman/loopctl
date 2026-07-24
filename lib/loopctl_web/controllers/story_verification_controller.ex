@@ -35,6 +35,16 @@ defmodule LoopctlWeb.StoryVerificationController do
   plug LoopctlWeb.Plugs.RequireHumanAnchor
        when action in [:verify, :reject, :force_unclaim, :backfill, :verify_all]
 
+  # LCP-1 §9.3: under the `signed` custody profile, an enrolled verifier's claim
+  # must carry a valid signature. No-op under the default `bearer` profile.
+  plug LoopctlWeb.Plugs.RequireSignedClaim, [gate: "verify"] when action in [:verify]
+
+  # The aggregate verify-all path reaches the SAME `verified` transition but cannot
+  # carry a per-item signature; under `signed` it refuses an enrolled caller rather
+  # than waiving the signature for a whole epic (LCP-1 §9.3).
+  plug LoopctlWeb.Plugs.RequireSignedClaim,
+       [gate: "verify", bulk: true] when action in [:verify_all]
+
   tags(["Progress"])
 
   operation(:verify,
@@ -175,7 +185,14 @@ defmodule LoopctlWeb.StoryVerificationController do
     with :ok <- validate_orchestrator_agent_linked(api_key),
          :ok <- validate_commit_sha_param(params) do
       tenant_id = api_key.tenant_id
-      opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
+
+      opts =
+        Keyword.merge(AuditContext.from_conn(conn),
+          orchestrator_agent_id: api_key.agent_id,
+          # LCP-1 §9.4: record the verified signed claim (nil under bearer) in the
+          # hash-chained audit entry, atomically with the verify decision.
+          custody_claim: conn.assigns[:custody_signed_claim]
+        )
 
       case Progress.verify_story(tenant_id, story_id, params, opts) do
         {:ok, story} ->

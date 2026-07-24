@@ -15,10 +15,13 @@ defmodule Loopctl.Tenants do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.AuditChain
   alias Loopctl.Auth
+  alias Loopctl.Custody.SignedProfile
   alias Loopctl.Secrets
   alias Loopctl.TenantKeys
   alias Loopctl.Tenants.AuditKeyHistory
+  alias Loopctl.Tenants.CustodyOwnerKeyHistory
   alias Loopctl.Tenants.RootAuthenticator
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Workers.OrphanedSecretCleanupWorker
@@ -683,6 +686,194 @@ defmodule Loopctl.Tenants do
     case AdminRepo.get(Tenant, id) do
       nil -> {:error, :not_found}
       tenant -> {:ok, tenant}
+    end
+  end
+
+  @doc """
+  Registers (or rotates) the tenant's LCP-1 §9.2 owner key — the root of the
+  custody-attestation chain. `pubkey` is the raw 32-byte ed25519 public key (the
+  private half stays with the OWNER, never the server). Human-anchored + `:user`
+  role at the controller. Returns `{:ok, tenant}` or `{:error, changeset}`.
+  """
+  @spec register_custody_owner_key(Ecto.UUID.t(), binary(), String.t(), keyword()) ::
+          {:ok, Tenant.t()} | {:error, :not_found | Ecto.Changeset.t() | term()}
+  def register_custody_owner_key(tenant_id, pubkey, alg \\ "ed25519", opts \\ []) do
+    with {:ok, tenant} <- get_tenant(tenant_id) do
+      do_register_custody_owner_key(tenant, pubkey, alg, opts)
+    end
+  end
+
+  # Registers or ROTATES the owner key ATOMICALLY, recording BOTH:
+  #
+  #   * a `custody_owner_key_registered` entry on the hash-chained, STH-covered
+  #     AuditChain — establishing/rotating the ROOT of the custody-attestation chain
+  #     is the most security-critical enrollment of all, so it must be as
+  #     tamper-evident and transparently enumerable as agent-key enrollment
+  #     (§9.1.1). Without this, a compromised `:user` key could re-root trust with
+  #     zero chain evidence.
+  #
+  #   * on a ROTATION (an owner key already existed), the retiring key in
+  #     `tenant_custody_owner_key_history` with its `[rotated_in, rotated_out)`
+  #     validity window — so ROOT attestations signed under the old key remain
+  #     offline-verifiable after the rotation (§9.2), the analogue of
+  #     `tenant_audit_key_history`.
+  #
+  # Concurrency + authorization + idempotency (review round-2):
+  #
+  #   * the tenant row is SELECT ... FOR UPDATE locked at the top of the Multi so two
+  #     concurrent rotations serialize instead of both reading the same old key and
+  #     last-write-wins silently discarding one new key + duplicating history;
+  #   * a ROTATION (a DIFFERENT key already exists) REQUIRES a `:rotation_proof`
+  #     signature by the OUTGOING owner key — a stolen `:user` API key alone cannot
+  #     re-root trust; first registration stays authorized by the user + human-anchor
+  #     controller gate;
+  #   * re-submitting the SAME key is IDEMPOTENT — no history row, no `rotated` audit
+  #     entry — so a network-timeout retry cannot forge a phantom rotation in the
+  #     tamper-evident log.
+  defp do_register_custody_owner_key(tenant, pubkey, alg, opts) do
+    now = DateTime.utc_now()
+
+    Multi.new()
+    |> Multi.run(:lock_tenant, fn repo, _ -> lock_tenant_for_update(repo, tenant.id) end)
+    |> Multi.run(:register, fn repo, %{lock_tenant: locked} ->
+      register_or_rotate_owner_key(repo, locked, pubkey, alg, now, opts)
+    end)
+    |> AdminRepo.transaction()
+    |> case do
+      {:ok, %{register: updated}} -> {:ok, updated}
+      {:error, _step, %Ecto.Changeset{} = changeset, _} -> {:error, changeset}
+      {:error, _step, reason, _} -> {:error, reason}
+    end
+  end
+
+  defp lock_tenant_for_update(repo, tenant_id) do
+    import Ecto.Query
+
+    case repo.one(from(t in Tenant, where: t.id == ^tenant_id, lock: "FOR UPDATE")) do
+      nil -> {:error, :not_found}
+      tenant -> {:ok, tenant}
+    end
+  end
+
+  # Decides register / rotate / idempotent-noop against the AUTHORITATIVE (post-lock)
+  # tenant row. Returns `{:ok, tenant}` or `{:error, reason | changeset}`.
+  defp register_or_rotate_owner_key(repo, tenant, pubkey, alg, now, opts) do
+    actor_lineage = Keyword.get(opts, :actor_lineage, [])
+    old_pubkey = tenant.custody_owner_pubkey
+    old_alg = tenant.custody_owner_alg
+    old_set_at = tenant.custody_owner_key_set_at || tenant.inserted_at
+
+    cond do
+      # Idempotent re-registration of the identical key: change nothing, forge no
+      # rotation event.
+      is_binary(old_pubkey) and old_pubkey == pubkey and old_alg == alg ->
+        {:ok, tenant}
+
+      # Rotation to a DIFFERENT key: require proof of possession of the outgoing root
+      # private half before re-rooting the chain.
+      is_binary(old_pubkey) ->
+        prev = %{pubkey: old_pubkey, alg: old_alg, set_at: old_set_at}
+
+        with :ok <- verify_owner_rotation_proof(tenant.id, prev, pubkey, alg, opts) do
+          write_owner_key(repo, tenant, {pubkey, alg}, prev, actor_lineage, now)
+        end
+
+      # First registration: authorized by the user + human-anchor controller gate.
+      true ->
+        write_owner_key(repo, tenant, {pubkey, alg}, nil, actor_lineage, now)
+    end
+  end
+
+  # A rotation must prove possession of the OUTGOING owner private key — a signature
+  # over `owner_rotation_preimage(tenant_id, new_pubkey, new_alg)` verified against
+  # the retiring public key. This is the §9.2 root-of-trust guard: neither a stolen
+  # `:user` API key nor the operator (who never holds the owner private half) can
+  # forge it.
+  defp verify_owner_rotation_proof(tenant_id, prev, new_pubkey, new_alg, opts) do
+    %{pubkey: old_pubkey, alg: old_alg, set_at: old_set_at} = prev
+
+    case Keyword.get(opts, :rotation_proof) do
+      sig when is_binary(sig) ->
+        # Bind the OUTGOING key + its set_at so a captured proof cannot be replayed
+        # after a rotate-back (see owner_rotation_preimage/5).
+        preimage =
+          SignedProfile.owner_rotation_preimage(
+            tenant_id,
+            old_pubkey,
+            # MICROSECOND precision so two rotations in the same second still bind
+            # distinct freshness values (the column is :utc_datetime_usec).
+            DateTime.to_unix(old_set_at, :microsecond),
+            new_pubkey,
+            new_alg
+          )
+
+        if SignedProfile.verify(old_alg, preimage, sig, old_pubkey),
+          do: :ok,
+          else: {:error, :owner_rotation_proof_invalid}
+
+      _ ->
+        {:error, :owner_rotation_proof_required}
+    end
+  end
+
+  # `prev` is `nil` on first registration, or `%{pubkey:, alg:, set_at:}` of the
+  # retiring key on a rotation. Archives the retiring key, writes the new one, and
+  # records ONE `custody_owner_key_registered` audit entry (`rotated` = prev != nil).
+  defp write_owner_key(repo, tenant, {pubkey, alg}, prev, actor_lineage, now) do
+    old_pubkey = prev && prev.pubkey
+
+    with {:ok, _archived} <- maybe_archive_prev_owner_key(repo, tenant, prev, now),
+         {:ok, updated} <-
+           tenant
+           |> Tenant.custody_owner_key_changeset(pubkey, alg)
+           |> Ecto.Changeset.put_change(:custody_owner_key_set_at, now)
+           |> repo.update(),
+         {:ok, _entry} <-
+           AuditChain.append(updated.id, %{
+             action: "custody_owner_key_registered",
+             actor_lineage: actor_lineage,
+             entity_type: "tenant",
+             entity_id: updated.id,
+             payload: %{
+               "owner_pubkey" => Base.encode16(pubkey, case: :lower),
+               "alg" => alg,
+               "rotated" => not is_nil(prev),
+               "previous_owner_pubkey" => old_pubkey && Base.encode16(old_pubkey, case: :lower)
+             }
+           }) do
+      {:ok, updated}
+    end
+  end
+
+  defp maybe_archive_prev_owner_key(_repo, _tenant, nil, _now), do: {:ok, :no_prev}
+
+  defp maybe_archive_prev_owner_key(
+         repo,
+         tenant,
+         %{pubkey: pubkey, alg: alg, set_at: set_at},
+         now
+       ) do
+    %CustodyOwnerKeyHistory{tenant_id: tenant.id}
+    |> CustodyOwnerKeyHistory.changeset(%{
+      public_key: pubkey,
+      alg: alg,
+      rotated_in: set_at,
+      rotated_out: now
+    })
+    |> repo.insert()
+  end
+
+  @doc """
+  Returns the tenant's owner key as `{pubkey_bytes, alg}` or `:none`.
+  """
+  @spec custody_owner_key(Ecto.UUID.t()) :: {binary(), String.t()} | :none
+  def custody_owner_key(tenant_id) do
+    case get_tenant(tenant_id) do
+      {:ok, %{custody_owner_pubkey: pk, custody_owner_alg: alg}} when is_binary(pk) ->
+        {pk, alg}
+
+      _ ->
+        :none
     end
   end
 
