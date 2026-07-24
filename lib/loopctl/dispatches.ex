@@ -86,13 +86,20 @@ defmodule Loopctl.Dispatches do
   defp get_attr(attrs, key), do: Map.get(attrs, key) || Map.get(attrs, Atom.to_string(key))
 
   # Accept raw signature bytes as-is and hex-encoded signatures from JSON callers.
+  # A raw ed25519 signature is 64 bytes; a hex-encoded one is 128 hex chars. On a
+  # decode failure we return an explicit `{:error, :malformed_attestation_encoding}`
+  # rather than the original string: an undecodable attestation must be REJECTED at
+  # the enrollment boundary with a clear encoding reason, not silently persisted as
+  # raw bytes only to resurface later as an opaque `:invalid_signature` at verify
+  # time. `fetch_attestation/1` surfaces the marker; `attestation_for_storage/1`
+  # keeps it out of the persisted changeset.
   defp normalize_sig(nil), do: nil
   defp normalize_sig(<<_::binary-size(64)>> = raw), do: raw
 
   defp normalize_sig(hex) when is_binary(hex) do
     case Base.decode16(hex, case: :mixed) do
       {:ok, raw} -> raw
-      :error -> hex
+      :error -> {:error, :malformed_attestation_encoding}
     end
   end
 
@@ -195,7 +202,7 @@ defmodule Loopctl.Dispatches do
           created_at: now,
           agent_pubkey: Keyword.get(opts, :agent_pubkey),
           alg: Keyword.get(opts, :alg),
-          attestation: Keyword.get(opts, :attestation),
+          attestation: attestation_for_storage(Keyword.get(opts, :attestation)),
           attestation_conditions: Keyword.get(opts, :attestation_conditions)
         })
         |> AdminRepo.insert()
@@ -622,10 +629,28 @@ defmodule Loopctl.Dispatches do
   defp resolve_lineage(_tenant_id, nil), do: {:ok, []}
 
   defp resolve_lineage(tenant_id, parent_id) do
-    case AdminRepo.get_by(Dispatch, id: parent_id, tenant_id: tenant_id) do
+    case active_parent(tenant_id, parent_id) do
       nil -> {:error, :parent_not_found}
       parent -> {:ok, parent.lineage_path}
     end
+  end
+
+  # Fetch a parent dispatch only if it is still an ACTIVE delegator: same tenant,
+  # not revoked, not expired. Cascade revocation (US-26.2.1) neutralizes a
+  # compromised key; enrollment must therefore fail closed when the delegator is
+  # revoked or expired, so a holder of a revoked parent's private key cannot mint
+  # NEW enrolled children through the context function. `create_dispatch` is the
+  # security boundary — it must enforce this itself and not lean on the controller's
+  # pre-check (which only guards the DIRECT parent).
+  defp active_parent(tenant_id, parent_id) do
+    now = DateTime.utc_now()
+
+    from(d in Dispatch,
+      where:
+        d.id == ^parent_id and d.tenant_id == ^tenant_id and
+          is_nil(d.revoked_at) and d.expires_at > ^now
+    )
+    |> AdminRepo.one()
   end
 
   defp normalize_role(role) when role in [:agent, :orchestrator, :user], do: role
@@ -665,15 +690,26 @@ defmodule Loopctl.Dispatches do
   defp fetch_attestation(opts) do
     case Keyword.get(opts, :attestation) do
       sig when is_binary(sig) -> {:ok, sig}
+      {:error, reason} -> {:error, reason}
       _ -> {:error, :attestation_required}
     end
   end
 
-  # Authorizer = the parent's agent key if the parent is enrolled; otherwise the
-  # tenant owner key (root of trust). Fails closed if a root enrollment is attempted
-  # with no owner key registered.
+  # Only a real (binary) attestation is persisted. A malformed-encoding marker or a
+  # nil (bearer dispatch) never reaches the `:binary` column — a key-carrying
+  # dispatch with a malformed attestation has already rolled the enrollment back at
+  # the `:verify_attestation` step.
+  defp attestation_for_storage(sig) when is_binary(sig), do: sig
+  defp attestation_for_storage(_), do: nil
+
+  # Authorizer = the parent's agent key if the parent is an ACTIVE enrolled
+  # delegator; otherwise the tenant owner key (root of trust). Fails closed if a
+  # root enrollment is attempted with no owner key registered. A revoked or expired
+  # parent is treated as absent here (see `active_parent/2`) — but it never reaches
+  # this step in practice because `resolve_lineage/2` runs first in the Multi and
+  # already fails the whole enrollment closed on a non-active parent.
   defp resolve_authorizer(tenant_id, parent_id) do
-    parent = parent_id && AdminRepo.get_by(Dispatch, id: parent_id, tenant_id: tenant_id)
+    parent = parent_id && active_parent(tenant_id, parent_id)
 
     case parent do
       %Dispatch{agent_pubkey: pk, alg: alg} when is_binary(pk) ->

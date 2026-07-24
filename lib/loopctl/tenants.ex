@@ -15,10 +15,12 @@ defmodule Loopctl.Tenants do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.AuditChain
   alias Loopctl.Auth
   alias Loopctl.Secrets
   alias Loopctl.TenantKeys
   alias Loopctl.Tenants.AuditKeyHistory
+  alias Loopctl.Tenants.CustodyOwnerKeyHistory
   alias Loopctl.Tenants.RootAuthenticator
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Workers.OrphanedSecretCleanupWorker
@@ -692,14 +694,77 @@ defmodule Loopctl.Tenants do
   private half stays with the OWNER, never the server). Human-anchored + `:user`
   role at the controller. Returns `{:ok, tenant}` or `{:error, changeset}`.
   """
-  @spec register_custody_owner_key(Ecto.UUID.t(), binary(), String.t()) ::
-          {:ok, Tenant.t()} | {:error, :not_found | Ecto.Changeset.t()}
-  def register_custody_owner_key(tenant_id, pubkey, alg \\ "ed25519") do
+  @spec register_custody_owner_key(Ecto.UUID.t(), binary(), String.t(), keyword()) ::
+          {:ok, Tenant.t()} | {:error, :not_found | Ecto.Changeset.t() | term()}
+  def register_custody_owner_key(tenant_id, pubkey, alg \\ "ed25519", opts \\ []) do
     with {:ok, tenant} <- get_tenant(tenant_id) do
-      tenant
-      |> Tenant.custody_owner_key_changeset(pubkey, alg)
-      |> AdminRepo.update()
+      do_register_custody_owner_key(tenant, pubkey, alg, opts)
     end
+  end
+
+  # Registers or ROTATES the owner key ATOMICALLY, recording BOTH:
+  #
+  #   * a `custody_owner_key_registered` entry on the hash-chained, STH-covered
+  #     AuditChain — establishing/rotating the ROOT of the custody-attestation chain
+  #     is the most security-critical enrollment of all, so it must be as
+  #     tamper-evident and transparently enumerable as agent-key enrollment
+  #     (§9.1.1). Without this, a compromised `:user` key could re-root trust with
+  #     zero chain evidence.
+  #
+  #   * on a ROTATION (an owner key already existed), the retiring key in
+  #     `tenant_custody_owner_key_history` with its `[rotated_in, rotated_out)`
+  #     validity window — so ROOT attestations signed under the old key remain
+  #     offline-verifiable after the rotation (§9.2), the analogue of
+  #     `tenant_audit_key_history`.
+  defp do_register_custody_owner_key(tenant, pubkey, alg, opts) do
+    now = DateTime.utc_now()
+    actor_lineage = Keyword.get(opts, :actor_lineage, [])
+    old_pubkey = tenant.custody_owner_pubkey
+    old_alg = tenant.custody_owner_alg
+    old_set_at = tenant.custody_owner_key_set_at || tenant.inserted_at
+
+    multi =
+      Multi.new()
+      |> maybe_archive_prev_owner_key(tenant, old_pubkey, old_alg, old_set_at, now)
+      |> Multi.update(:update_tenant, fn _ ->
+        tenant
+        |> Tenant.custody_owner_key_changeset(pubkey, alg)
+        |> Ecto.Changeset.put_change(:custody_owner_key_set_at, now)
+      end)
+      |> Multi.run(:audit, fn _repo, %{update_tenant: updated} ->
+        AuditChain.append(updated.id, %{
+          action: "custody_owner_key_registered",
+          actor_lineage: actor_lineage,
+          entity_type: "tenant",
+          entity_id: updated.id,
+          payload: %{
+            "owner_pubkey" => Base.encode16(pubkey, case: :lower),
+            "alg" => alg,
+            "rotated" => not is_nil(old_pubkey),
+            "previous_owner_pubkey" => old_pubkey && Base.encode16(old_pubkey, case: :lower)
+          }
+        })
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{update_tenant: updated}} -> {:ok, updated}
+      {:error, :update_tenant, %Ecto.Changeset{} = changeset, _} -> {:error, changeset}
+      {:error, _step, reason, _} -> {:error, reason}
+    end
+  end
+
+  defp maybe_archive_prev_owner_key(multi, _tenant, nil, _alg, _rotated_in, _now), do: multi
+
+  defp maybe_archive_prev_owner_key(multi, tenant, old_pubkey, old_alg, rotated_in, now) do
+    Multi.insert(multi, :archive_prev_owner_key, fn _ ->
+      %CustodyOwnerKeyHistory{tenant_id: tenant.id}
+      |> CustodyOwnerKeyHistory.changeset(%{
+        public_key: old_pubkey,
+        alg: old_alg,
+        rotated_in: rotated_in,
+        rotated_out: now
+      })
+    end)
   end
 
   @doc """

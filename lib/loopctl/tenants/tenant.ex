@@ -50,6 +50,10 @@ defmodule Loopctl.Tenants.Tenant do
     # human-anchored owner-key registration path.
     field :custody_owner_pubkey, :binary
     field :custody_owner_alg, :string
+    # LCP-1 §9.2: when the CURRENT owner key became active. Set alongside the key on
+    # every register/rotate so a rotation knows the retiring key's validity window.
+    # NEVER cast from user input; written only by the owner-key registration path.
+    field :custody_owner_key_set_at, :utc_datetime_usec
     # US-26.5.2: custody halt on witness divergence
     field :custody_halted_at, :utc_datetime_usec
     # US-26.7.1: capability tier — NEVER in any public changeset cast; the
@@ -76,6 +80,9 @@ defmodule Loopctl.Tenants.Tenant do
 
     has_many :root_authenticators, Loopctl.Tenants.RootAuthenticator, foreign_key: :tenant_id
     has_many :audit_key_history, Loopctl.Tenants.AuditKeyHistory, foreign_key: :tenant_id
+
+    has_many :custody_owner_key_history, Loopctl.Tenants.CustodyOwnerKeyHistory,
+      foreign_key: :tenant_id
 
     timestamps()
   end

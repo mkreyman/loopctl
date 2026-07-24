@@ -72,4 +72,23 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaim do
     do:
       "The claim signature did not verify against your dispatch's enrolled agent " <>
         "key (LCP-1 §9.3). Re-sign the exact gate/work-item/capability/claimed_at."
+
+  # §9.3 keeps "no signature" and "signature present but the claim is malformed"
+  # distinct so the client's recovery differs: fix the claim SHAPE, do not (re)sign.
+  defp message_for(:malformed_claim),
+    do:
+      "Your `claim` object is present but malformed (LCP-1 §9.3): `alg` must be a " <>
+        "non-empty string, `claimed_at` an integer (Unix seconds), and `claim_sig` " <>
+        "lowercase/mixed-case hex. Fix the claim shape and resend — do not re-sign."
+
+  defp message_for(:claim_expired),
+    do:
+      "The claim's `claimed_at` is outside the accepted freshness window (LCP-1 §9.3). " <>
+        "Re-sign the claim with a current timestamp and resend it."
+
+  defp message_for(:claim_condition_unmet),
+    do:
+      "Your dispatch's owner/parent attestation does not authorize this claim: a " <>
+        "§9.2 condition (`gate=<name>` or `expires<ts>`) is unmet. Use a dispatch " <>
+        "whose attestation covers this gate and is unexpired."
 end

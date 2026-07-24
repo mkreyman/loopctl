@@ -142,10 +142,10 @@ audit-key condition either breaks pre-v2 tenants or silently widens the bypass.
 ## Dispatch lineage (L4) — structural verifier separation
 
 `lib/loopctl/dispatches.ex`: each dispatch carries a `lineage_path` (root → self).
-`lineage_shares_prefix?/2` (`dispatches.ex:525-529`) is the primitive the self-* checks use — note it
+`lineage_shares_prefix?/2` (`dispatches.ex:532-536`) is the primitive the self-* checks use — note it
 compares lineage **ROOTS** (element 0) only, not arbitrary prefixes, and an empty list on either side
 is never a match. `select_verifier/3` (`dispatches.ex:551-588`) picks a verifier whose lineage does
-NOT share the implementer's root — rejected in SQL (`reject_same_root/2`, `dispatches.ex:596-602`)
+NOT share the implementer's root — rejected in SQL (`reject_same_root/2`, `dispatches.ex:603-609`)
 and again in Elixir — from a pool capped at `@verifier_pool_limit`, seeded deterministically by
 `sha256(tenant audit pubkey || story_id)` so the orchestrator cannot predict the pick.
 

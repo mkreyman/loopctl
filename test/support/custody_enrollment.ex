@@ -41,7 +41,11 @@ defmodule Loopctl.Test.CustodyEnrollment do
   def enroll_root(tenant_id, attrs \\ %{}) do
     {owner_pub, owner_priv} = ensure_owner_key(tenant_id)
     {agent_pub, agent_priv} = :crypto.generate_key(:eddsa, :ed25519)
-    attestation = root_attestation(tenant_id, agent_pub, owner_priv)
+    # Sign the attestation over the SAME conditions the dispatch enrolls with, so a
+    # caller can exercise `attestation_conditions` (e.g. "gate=report", "expires<T>")
+    # end-to-end without the signature failing over a conditions mismatch.
+    conditions = Map.get(attrs, :attestation_conditions, "")
+    attestation = root_attestation(tenant_id, agent_pub, owner_priv, conditions)
 
     {:ok, %{dispatch: dispatch, raw_key: raw_key}} =
       Dispatches.create_dispatch(
@@ -52,7 +56,7 @@ defmodule Loopctl.Test.CustodyEnrollment do
             agent_pubkey: agent_pub,
             alg: "ed25519",
             attestation: attestation,
-            attestation_conditions: ""
+            attestation_conditions: conditions
           },
           attrs
         )

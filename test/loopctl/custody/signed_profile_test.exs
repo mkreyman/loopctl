@@ -798,15 +798,17 @@ defmodule Loopctl.Custody.SignedProfileTest do
 
   describe "LCP-1 §9.2 attestation-gate coupling (tripwire)" do
     test "verify_claim cannot be gated in production without verify_attestation at enrollment" do
-      # Enrollment (`Dispatches.create_dispatch`) accepts an operator-supplied
-      # `agent_pubkey` UNATTESTED today — the §9.1.1 transparency log is its only
-      # mitigation (documented deliberate scope). `SignedProfile.verify_claim` has NO
-      # production caller yet. This tripwire couples the two so the gap cannot widen
-      # silently: the moment any production module under `lib/` (other than the pure
-      # `SignedProfile` core itself) calls `verify_claim`, enrollment MUST also call
-      # `SignedProfile.verify_attestation` (LCP-1 §9.2). Otherwise an operator could
-      # forge agent-attributable claims with a keypair it generated and enrolled
-      # unattested. The scan matches a CALL (`name(`), not a docstring reference.
+      # POST-ACTIVATION invariant (the "unattested is acceptable, transparency-only"
+      # scope was OVERTURNED for owner-attested enrollment — KB 64a6aecd / f683e6f9):
+      # `Dispatches.create_dispatch` NOW verifies the owner/parent attestation
+      # (`verify_attestation`) at enrollment, and `SignedProfilePolicy` IS a
+      # production `verify_claim` caller. This tripwire keeps the two coupled so the
+      # guarantee cannot be silently REMOVED: if any production module under `lib/`
+      # (other than the pure `SignedProfile` core itself) gates `verify_claim`,
+      # enrollment MUST still call `SignedProfile.verify_attestation` (LCP-1 §9.2).
+      # Ripping verify_attestation out of enrollment while a claim gate remains would
+      # let an operator forge agent-attributable claims with a self-enrolled key. The
+      # scan matches a CALL (`name(`), not a docstring reference.
       claim_callers =
         "lib/**/*.ex"
         |> Path.wildcard()

@@ -86,12 +86,85 @@ defmodule LoopctlWeb.DispatchController do
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
 
+      # LCP-1 §9.2 enrollment-attestation failures — each is a DISTINCT condition
+      # whose client recovery differs, so map them to descriptive bodies with stable
+      # codes rather than collapsing to one opaque 422 (mirrors RequireSignedClaim).
+      {:error, reason}
+      when reason in [
+             :attestation_required,
+             :owner_key_not_registered,
+             :attestation_alg_mismatch,
+             :malformed_attestation_encoding
+           ] ->
+        render_attestation_error(conn, reason)
+
+      {:error, {:attestation_invalid, _detail}} ->
+        render_attestation_error(conn, :attestation_invalid)
+
       {:error, _reason} ->
         conn
         |> put_status(:unprocessable_entity)
         |> json(%{error: %{message: "Dispatch creation failed", status: 422}})
     end
   end
+
+  # 409 when the tenant must FIRST register an owner key (a precondition the caller
+  # can fix without touching this request); 422 for the malformed/invalid/missing
+  # attestation shapes (the caller must fix the attestation it supplied).
+  defp render_attestation_error(conn, :owner_key_not_registered) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "owner_key_not_registered",
+        message:
+          "Enrolling an agent key requires a §9.2 authorizer. This tenant has no owner " <>
+            "key registered and this dispatch has no active enrolled parent to delegate " <>
+            "from. Register an owner key (POST /api/v1/tenants/me/custody-owner-key) first.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/chain-of-custody"}
+      }
+    })
+  end
+
+  defp render_attestation_error(conn, reason) do
+    {code, message} = attestation_error_detail(reason)
+
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: Atom.to_string(code),
+        message: message,
+        remediation: %{learn_more: "https://loopctl.com/wiki/chain-of-custody"}
+      }
+    })
+  end
+
+  defp attestation_error_detail(:attestation_required),
+    do:
+      {:attestation_required,
+       "Enrolling an agent key requires a §9.2 owner/parent attestation over that key. " <>
+         "Include the `attestation` (owner/parent signature) in the request."}
+
+  defp attestation_error_detail(:attestation_alg_mismatch),
+    do:
+      {:attestation_alg_mismatch,
+       "The dispatch `alg` does not match the authorizing key's algorithm (LCP-1 §6.1). " <>
+         "Sign the attestation with, and declare, the authorizer's algorithm."}
+
+  defp attestation_error_detail(:malformed_attestation_encoding),
+    do:
+      {:malformed_attestation_encoding,
+       "The `attestation` could not be decoded: send it as raw 64-byte signature " <>
+         "bytes or a 128-character hex string."}
+
+  defp attestation_error_detail(:attestation_invalid),
+    do:
+      {:attestation_invalid,
+       "The owner/parent attestation did not verify against the authorizing key " <>
+         "(LCP-1 §9.2). Re-sign the exact tenant/agent-pubkey/lineage/conditions preimage."}
 
   @doc "GET /api/v1/dispatches/:id"
   def show(conn, %{"id" => id}) do

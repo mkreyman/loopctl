@@ -29,6 +29,11 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaimTest do
   end
 
   defp signed_claim(tenant_id, priv) do
+    # `claimed_at` is enforced against a bounded freshness window (§9.3), so sign a
+    # CURRENT timestamp rather than a fixed epoch — the same value goes into both the
+    # preimage and the wire claim.
+    claimed_at = System.os_time(:second)
+
     preimage =
       SignedProfile.claim_preimage(
         "ed25519",
@@ -37,7 +42,7 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaimTest do
         @work,
         %{},
         "cap-1",
-        1_760_000_000
+        claimed_at
       )
 
     sig = SignedProfile.sign("ed25519", preimage, priv)
@@ -45,7 +50,7 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaimTest do
     %{
       "alg" => "ed25519",
       "claim_sig" => Base.encode16(sig, case: :lower),
-      "claimed_at" => 1_760_000_000
+      "claimed_at" => claimed_at
     }
   end
 

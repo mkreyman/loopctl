@@ -55,6 +55,19 @@ defmodule Loopctl.Custody.SignedProfile do
   The attestation authorizes; it does not transfer authorship (LCP-1 §9.2). It is
   authorization *evidence* over the agent's own public key — the agent stays the
   author of anything it later signs.
+
+  ## Replay scope — carry an `expires<...>` condition
+
+  The new dispatch's server-generated id is deliberately EXCLUDED from the preimage
+  so the attestation is signable in advance. The consequence is that a single owner
+  attestation over key `X` and a given `lineage_path` can be presented to enroll key
+  `X` more than once. This is bounded — every enrollment is owner-authorized and
+  recorded on the §9.1.1 transparency log, so the operator can attribute nothing to
+  a DIFFERENT key and duplicates are detectable — but an owner who wants to bound
+  re-enrollment SHOULD scope the attestation with an `expires<unix-ts>` (and/or
+  `gate=<name>`) condition. Those conditions are enforced at claim time by
+  `conditions_met?/3` (via `Loopctl.Custody.SignedProfilePolicy`), so an expired
+  attestation stops authorizing claims once its window passes.
   """
   @spec attestation_preimage(String.t(), binary(), binary(), [binary()], String.t()) :: binary()
   def attestation_preimage(alg, tenant_id, agent_pubkey, lineage_path, conditions)

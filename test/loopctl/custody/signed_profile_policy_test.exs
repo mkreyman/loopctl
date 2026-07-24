@@ -36,7 +36,9 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
     gate = Keyword.get(opts, :gate, @gate)
     work = Keyword.get(opts, :work, @work)
     cap = Keyword.get(opts, :cap, "cap-1")
-    claimed_at = Keyword.get(opts, :claimed_at, 1_760_000_000)
+    # Default to a CURRENT timestamp — `claimed_at` is enforced against a bounded
+    # freshness window (§9.3), so a fixed epoch would now be rejected as stale.
+    claimed_at = Keyword.get(opts, :claimed_at, System.os_time(:second))
 
     preimage =
       SignedProfile.claim_preimage("ed25519", tenant_id, gate, work, %{}, cap, claimed_at)
@@ -127,11 +129,13 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
                Policy.verify_request(:signed, t.id, d.api_key_id, @gate, @work, "cap-1", claim)
     end
 
-    test "a malformed (non-hex) signature is a clean required-error, not a crash", %{tenant: t} do
+    test "a present-but-undecodable signature is :malformed_claim, not a crash", %{tenant: t} do
       %{dispatch: d} = enrolled_dispatch(t)
       claim = %{"alg" => "ed25519", "claim_sig" => "nothex", "claimed_at" => 1}
 
-      assert {:error, :claim_signature_required} =
+      # A signature WAS supplied (just not decodable), so §9.3 distinguishes this
+      # from "no signature": the client must fix the claim shape, not (re)sign.
+      assert {:error, :malformed_claim} =
                Policy.verify_request(:signed, t.id, d.api_key_id, @gate, @work, "cap-1", claim)
     end
 
@@ -157,10 +161,75 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
     end
   end
 
+  describe "signed profile — claim freshness (§9.3)" do
+    test "a stale claimed_at is rejected with :claim_expired even with a valid signature", %{
+      tenant: t
+    } do
+      %{dispatch: d, priv: priv} = enrolled_dispatch(t)
+      stale = System.os_time(:second) - 10_000
+      claim = signed_claim(t.id, priv, claimed_at: stale)
+
+      assert {:error, :claim_expired} =
+               Policy.verify_request(:signed, t.id, d.api_key_id, @gate, @work, "cap-1", claim)
+    end
+
+    test "a far-future claimed_at is rejected with :claim_expired", %{tenant: t} do
+      %{dispatch: d, priv: priv} = enrolled_dispatch(t)
+      future = System.os_time(:second) + 10_000
+      claim = signed_claim(t.id, priv, claimed_at: future)
+
+      assert {:error, :claim_expired} =
+               Policy.verify_request(:signed, t.id, d.api_key_id, @gate, @work, "cap-1", claim)
+    end
+  end
+
+  describe "signed profile — attestation conditions enforced at claim time (§9.2)" do
+    test "an attestation scoped to gate=report is rejected for a verify claim", %{tenant: t} do
+      %{dispatch: d, priv: priv} =
+        enrolled_dispatch_with(t, attestation_conditions: "gate=report")
+
+      claim = signed_claim(t.id, priv, gate: "verify")
+
+      assert {:error, :claim_condition_unmet} =
+               Policy.verify_request(:signed, t.id, d.api_key_id, "verify", @work, "cap-1", claim)
+    end
+
+    test "an attestation scoped to gate=verify is accepted for a verify claim", %{tenant: t} do
+      %{dispatch: d, priv: priv} =
+        enrolled_dispatch_with(t, attestation_conditions: "gate=verify")
+
+      claim = signed_claim(t.id, priv, gate: "verify")
+
+      assert :ok =
+               Policy.verify_request(:signed, t.id, d.api_key_id, "verify", @work, "cap-1", claim)
+    end
+
+    test "an expired attestation condition is rejected with :claim_condition_unmet", %{tenant: t} do
+      past = System.os_time(:second) - 100
+
+      %{dispatch: d, priv: priv} =
+        enrolled_dispatch_with(t, attestation_conditions: "expires<#{past}")
+
+      claim = signed_claim(t.id, priv)
+
+      assert {:error, :claim_condition_unmet} =
+               Policy.verify_request(:signed, t.id, d.api_key_id, @gate, @work, "cap-1", claim)
+    end
+  end
+
   describe "profile/0 default" do
     test "defaults to :bearer when unconfigured" do
       assert Policy.profile() == :bearer
       assert Policy.profile_string() == "bearer"
     end
+  end
+
+  defp enrolled_dispatch_with(tenant, attrs) do
+    agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+    %{dispatch: dispatch, agent_pub: pub, agent_priv: priv} =
+      CustodyEnrollment.enroll_root(tenant.id, Map.merge(%{agent_id: agent.id}, Map.new(attrs)))
+
+    %{dispatch: dispatch, pub: pub, priv: priv}
   end
 end
