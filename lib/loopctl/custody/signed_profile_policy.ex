@@ -67,6 +67,10 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
 
   @profile_key "custody_signed_profile_enforcement"
 
+  @doc "The `SystemConfig` integer key backing `profile/0` (0=bearer, 1=signed)."
+  @spec profile_key() :: String.t()
+  def profile_key, do: @profile_key
+
   # Bounded freshness window for a signed claim's agent-controlled `claimed_at`
   # (§9.3 delegates timeliness to the caller). A valid signature binds `claimed_at`,
   # so enforcing it against the server clock stops a captured claim signature from
