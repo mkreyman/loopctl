@@ -112,7 +112,12 @@ defmodule Loopctl.Custody.SignedProfile do
 
   # `attestation_preimage/5` calls `canonical_json/1` on `lineage_path`, which
   # RAISES on a malformed term. Rescue it so this pure verify function always
-  # honours its `:ok | {:error, atom()}` contract.
+  # honours its `:ok | {:error, atom()}` contract. `preimage_error?/1` (below)
+  # enumerates the raises the preimage boundary can produce: a `canonical_json`
+  # `ArgumentError` (duplicate-key ambiguity), a `FunctionClauseError` (a
+  # wrong-typed arg failing an `attestation_preimage/5` guard, e.g. a non-list
+  # `lineage_path`), and a `Protocol.UndefinedError` (`to_string/1` on a value with
+  # no `String.Chars`). All collapse to `:malformed_body` rather than a 500.
   defp verify_attestation_sig(
          alg,
          tenant_id,
@@ -130,7 +135,7 @@ defmodule Loopctl.Custody.SignedProfile do
       {:error, :invalid_signature}
     end
   rescue
-    ArgumentError -> {:error, :malformed_body}
+    e -> if preimage_error?(e), do: {:error, :malformed_body}, else: reraise(e, __STACKTRACE__)
   end
 
   # ── Custody-claim signature (LCP-1 §9.3) ──────────────────────────────────
@@ -161,14 +166,22 @@ defmodule Loopctl.Custody.SignedProfile do
           integer()
         ) :: binary()
   def claim_preimage(alg, tenant_id, gate, work_item_id, body, capability_id, claimed_at)
-      when is_binary(alg) and is_binary(gate) and is_map(body) and is_integer(claimed_at) do
+      when is_binary(alg) and is_binary(gate) and is_map(body) and is_integer(claimed_at) and
+             (is_nil(work_item_id) or is_binary(work_item_id)) and
+             (is_nil(capability_id) or is_binary(capability_id)) do
+    # `work_item_id`/`capability_id` are guarded to `binary() | nil` so `present/1`
+    # receives exactly what it has clauses for. A previous `x && to_string(x)` form
+    # mapped a falsy-but-non-nil value (`false`) to `false`, which `present/1` has no
+    # clause for and would crash with a FunctionClauseError — escaping the pure
+    # `:ok | {:error, atom()}` contract of the verify functions. The guard makes any
+    # wrong-typed optional a clean guard failure that `verify_claim_sig/4` rescues.
     lp(@claim_domain) <>
       lp(alg) <>
       lp(to_string(tenant_id)) <>
       lp(gate) <>
-      present(work_item_id && to_string(work_item_id)) <>
+      present(work_item_id) <>
       lp(LeafHash.canonical_json(body)) <>
-      present(capability_id && to_string(capability_id)) <>
+      present(capability_id) <>
       <<claimed_at::unsigned-big-integer-size(64)>>
   end
 
@@ -203,9 +216,10 @@ defmodule Loopctl.Custody.SignedProfile do
   end
 
   # `claim_preimage/7` calls `canonical_json/1`, which RAISES on a malformed body
-  # (a map mixing atom and string keys of the same name). Rescue it here so this
-  # pure verify function always honours its `:ok | {:error, atom()}` contract
-  # rather than escaping as an ArgumentError to internal Elixir callers.
+  # (a map mixing atom and string keys of the same name), and its guards RAISE a
+  # `FunctionClauseError` on a wrong-typed arg (e.g. a non-map `body`). Rescue both
+  # via `preimage_error?/1` so this pure verify function always honours its
+  # `:ok | {:error, atom()}` contract rather than escaping to internal Elixir callers.
   defp verify_claim_sig(opts, alg, agent_pubkey, signature) do
     preimage =
       claim_preimage(
@@ -224,8 +238,16 @@ defmodule Loopctl.Custody.SignedProfile do
       {:error, :invalid_signature}
     end
   rescue
-    ArgumentError -> {:error, :malformed_body}
+    e -> if preimage_error?(e), do: {:error, :malformed_body}, else: reraise(e, __STACKTRACE__)
   end
+
+  # The exceptions the preimage boundary can raise on malformed/wrong-typed input,
+  # all mapped to `:malformed_body`. Anything else re-raises — we never want to
+  # swallow an unrelated bug behind the verify contract.
+  defp preimage_error?(%ArgumentError{}), do: true
+  defp preimage_error?(%FunctionClauseError{}), do: true
+  defp preimage_error?(%Protocol.UndefinedError{}), do: true
+  defp preimage_error?(_), do: false
 
   # ── Conditions grammar (LCP-1 §9.2) ───────────────────────────────────────
 

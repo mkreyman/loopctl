@@ -28,26 +28,58 @@ defmodule Loopctl.Repo.Migrations.AddAgentPubkeyToDispatches do
   never deleted) and so grows unboundedly, so a single combined ADD+validate under
   ACCESS EXCLUSIVE would briefly block every write on the dispatch/custody path
   during the scan — the repo's established pattern for unbounded tables avoids that.
+
+  ## Idempotency (re-runnable under `@disable_ddl_transaction`)
+
+  With DDL transactions disabled the three steps (ADD COLUMNs, ADD CONSTRAINT
+  NOT VALID, VALIDATE) are NOT atomic: a crash between the ADD COLUMN and the
+  `schema_migrations` insert leaves the columns present but the migration
+  unrecorded, so `mix ecto.migrate` re-runs `up/0`. Each step is therefore made
+  convergent — `add_if_not_exists/3` for the columns, a `pg_constraint` existence
+  guard around ADD CONSTRAINT, and a `VALIDATE` that is a no-op on an
+  already-valid constraint — so a re-run after a partial application succeeds
+  instead of erroring on "column already exists".
+
+  ## Algorithm coupling (LCP-1 §6.1)
+
+  The CHECK hardcodes `alg = 'ed25519'` AND `octet_length(agent_pubkey) = 32`
+  because Ed25519 is the ONLY algorithm this version defines. The application layer
+  (`SignedProfile.@algorithms`, `Dispatch.@signed_algorithms`, the pattern-matched
+  `verify_sig`) is structured for additive algorithm agility, but this SQL literal
+  is not — a future second algorithm (e.g. `secp256k1-schnorr`, whose key length
+  differs) requires a NEW migration that replaces this literal with a per-alg length
+  table (a `CASE` on `alg`). Keep the both-or-neither/length invariant real across
+  algorithms rather than dropping the length assertion when that day comes.
   """
 
   def up do
     alter table(:dispatches) do
-      add :agent_pubkey, :binary
-      add :alg, :string
+      add_if_not_exists :agent_pubkey, :binary
+      add_if_not_exists :alg, :string
     end
 
-    # Metadata-only: records the constraint without scanning existing rows.
+    # Metadata-only: records the constraint without scanning existing rows. Guarded
+    # so a re-run (partial prior application) converges instead of erroring — Postgres
+    # has no ADD CONSTRAINT IF NOT EXISTS, hence the pg_constraint existence check.
     execute("""
-    ALTER TABLE dispatches
-      ADD CONSTRAINT dispatches_signed_profile_valid
-      CHECK (
-        (agent_pubkey IS NULL AND alg IS NULL)
-        OR (agent_pubkey IS NOT NULL AND alg = 'ed25519' AND octet_length(agent_pubkey) = 32)
-      )
-      NOT VALID
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'dispatches_signed_profile_valid'
+      ) THEN
+        ALTER TABLE dispatches
+          ADD CONSTRAINT dispatches_signed_profile_valid
+          CHECK (
+            (agent_pubkey IS NULL AND alg IS NULL)
+            OR (agent_pubkey IS NOT NULL AND alg = 'ed25519' AND octet_length(agent_pubkey) = 32)
+          )
+          NOT VALID;
+      END IF;
+    END $$;
     """)
 
-    # Validates under SHARE UPDATE EXCLUSIVE (does not block concurrent writes).
+    # Validates under SHARE UPDATE EXCLUSIVE (does not block concurrent writes). A
+    # VALIDATE on an already-valid constraint is a no-op, so this is re-runnable.
     execute("ALTER TABLE dispatches VALIDATE CONSTRAINT dispatches_signed_profile_valid")
   end
 

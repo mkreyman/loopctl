@@ -153,7 +153,7 @@ in order:
    `verify_lineage_separated/4` (`progress.ex:1747-1767`): an EMPTY lineage on either side —
    which is what an unloadable/deleted dispatch row yields (`get_dispatch_lineage/2`,
    `progress.ex:1769-1774`) — fails CLOSED, a shared lineage root
-   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:399-403`) blocks, and the
+   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:468-472`) blocks, and the
    `assigned_agent_id` equality check is evaluated IN ADDITION to the lineage comparison, never
    short-circuited by it.
 4. **`assigned_agent_id` equality** as the fallback for pre-dispatch stories
@@ -193,7 +193,7 @@ THREE parts which must change together:
 Then the reviewer's dispatch lineage comparison, then plain `assigned_agent_id` equality.
 
 The reporter/reviewer lineage both come from `Dispatches.lineage_for_api_key/2`
-(`lib/loopctl/dispatches.ex:378-388`) — the dispatch that minted the calling key. A key not
+(`lib/loopctl/dispatches.ex:447-457`) — the dispatch that minted the calling key. A key not
 minted by a dispatch yields `[]`, which is inert (the agent-id checks still apply); it never
 short-circuits a gate.
 

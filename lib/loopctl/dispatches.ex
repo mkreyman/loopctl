@@ -77,24 +77,28 @@ defmodule Loopctl.Dispatches do
     }
   end
 
-  # Accept either a hex-encoded key (the JSON API form) or raw key bytes.
+  # Accept either a hex-encoded key (the JSON API form) or raw key bytes,
+  # disambiguated by LENGTH rather than by "does this parse as hex":
   #
-  # Hex decoding is tried FIRST so a hex string is always decoded to its raw bytes
-  # rather than mis-read as raw ASCII — a 32-char hex string (a 16-byte key) would
-  # otherwise match a raw-binary clause and persist as 32 ASCII bytes. A value that
-  # is not valid hex is treated as raw key bytes as-is. Either way,
-  # `Dispatch.validate_signed_profile/1` (and the DB CHECK) enforce the 32-byte
-  # Ed25519 length, so a malformed, wrong-length, or undecodable key is a clean
-  # validation error at enrollment rather than a silent persist that only fails at
-  # signature-verify time.
+  #   * 64 bytes → the JSON-API hex form of a 32-byte Ed25519 key; hex-decode it.
+  #   * anything else (notably a 32-byte value) → treated as raw key bytes as-is.
+  #
+  # Gating the hex-decode on the 64-byte length removes the former hex-FIRST
+  # ambiguity: a raw 32-byte key whose bytes happen to be all hex-ASCII no longer
+  # decodes to 16 bytes and gets rejected — a 32-byte value is unambiguously a raw
+  # key by length. `Dispatch.validate_signed_profile/1` (and the DB CHECK) still
+  # enforce the 32-octet Ed25519 length, so a wrong-length or undecodable key is a
+  # clean validation error at enrollment rather than a silent persist.
   defp normalize_pubkey(nil), do: nil
 
-  defp normalize_pubkey(value) when is_binary(value) do
-    case Base.decode16(value, case: :mixed) do
+  defp normalize_pubkey(<<_::binary-size(64)>> = hex) do
+    case Base.decode16(hex, case: :mixed) do
       {:ok, raw} -> raw
-      :error -> value
+      :error -> hex
     end
   end
+
+  defp normalize_pubkey(value) when is_binary(value), do: value
 
   defp do_create_dispatch(tenant_id, parsed, opts) do
     %{
@@ -186,6 +190,13 @@ defmodule Loopctl.Dispatches do
         # unattested and is only detectable post-hoc via the transparency log above.
         # Requiring an attestation at enrollment is deliberate follow-up work; do not
         # read the absence of that check here as an accidental gap.
+        #
+        # GUARD: a source-scanning tripwire test
+        # (`signed_profile_test.exs`, "attestation-gate coupling") FAILS the moment
+        # any production module calls `SignedProfile.verify_claim` while this path
+        # still omits `SignedProfile.verify_attestation` — so a future custody gate
+        # cannot start trusting agent-signed claims without the §9.2 attestation
+        # landing here first.
         {action, payload} =
           if dispatch.agent_pubkey do
             {"dispatch_created_with_agent_key",
@@ -228,43 +239,101 @@ defmodule Loopctl.Dispatches do
     end
   end
 
+  # One page of the enrollment-transparency listing. Bounded so a single call never
+  # materializes the whole `dispatch_created_with_agent_key` history — which grows
+  # with SIGNED-DISPATCH count (v2 mints a fresh ephemeral dispatch per task and the
+  # audit chain is append-only/immutable), NOT with the distinct-key count. Callers
+  # stream the full set by following `meta.next_cursor`, mirroring how the sibling
+  # `AuditChain.verify_chain/1` keyset-pages the same table instead of one unbounded
+  # whole-chain read that would trip the HeavyRead statement timeout or balloon the
+  # BEAM heap exactly on the tenant with the most keys to audit.
+  @enrolled_keys_default_limit 100
+  @enrolled_keys_max_limit 1_000
+
   @doc """
   Enumerates the agent public keys enrolled under a tenant, **from the audit chain
-  alone** (LCP-1 §9.1.1 enrollment transparency).
+  alone** (LCP-1 §9.1.1 enrollment transparency), one keyset-paged page at a time.
 
   This deliberately reads the hash-chained, STH-covered `audit_chain` rather than
   the `dispatches` table: the whole point of enrollment transparency is that a
   tenant can reconstruct the enrolled-key set from the tamper-evident log without
   trusting a mutable server-side listing. Each entry is a
   `dispatch_created_with_agent_key` action carrying `agent_pubkey` (hex) and `alg`.
-  Returns `[%{agent_pubkey_hex:, alg:, dispatch_id:, lineage_path:, at:}]`, newest
-  first. A tenant compares this against the keys it generated; any excess is an
-  operator-minted key.
+
+  ## Pagination
+
+  `opts`:
+    * `:limit` — page size (default #{@enrolled_keys_default_limit}, max
+      #{@enrolled_keys_max_limit}).
+    * `:cursor` — the `chain_position` returned as `meta.next_cursor` on the prior
+      page; omit for the first (newest) page.
+
+  Returns `%{data: [row], meta: %{limit:, has_more:, next_cursor:}}` ordered newest
+  first, where each `row` is
+  `%{agent_pubkey_hex:, alg:, dispatch_id:, lineage_path:, at:, chain_position:,
+  integrity_ok:}`. A tenant compares the union of pages against the keys it
+  generated; any excess is an operator-minted key.
+
+  ## Tamper-evidence — required companion checks
+
+  `integrity_ok` recomputes each entry's leaf hash from its stored content
+  (`AuditChain.entry_hash_valid?/1`, LCP-1 §8.5): a `false` means THIS row's payload
+  (e.g. its `agent_pubkey` hex) was altered. Per-row content integrity is NOT the
+  whole guarantee, though — to detect a REMOVED enrollment (completeness) the caller
+  MUST additionally run `AuditChain.verify_chain/1` and cross-check the chain length
+  against the latest Signed Tree Head. This function reports content integrity per
+  page; it does not, on its own, prove the set is complete.
   """
-  @spec enrolled_agent_keys(Ecto.UUID.t()) :: [map()]
-  def enrolled_agent_keys(tenant_id) do
-    query =
+  @spec enrolled_agent_keys(Ecto.UUID.t(), keyword()) :: %{data: [map()], meta: map()}
+  def enrolled_agent_keys(tenant_id, opts \\ []) do
+    limit =
+      opts
+      |> Keyword.get(:limit, @enrolled_keys_default_limit)
+      |> max(1)
+      |> min(@enrolled_keys_max_limit)
+
+    base =
       from(e in AuditChain.Entry,
         where: e.tenant_id == ^tenant_id and e.action == "dispatch_created_with_agent_key",
-        order_by: [desc: e.chain_position]
+        order_by: [desc: e.chain_position],
+        # Fetch one extra row to learn whether a further page exists without a count.
+        limit: ^(limit + 1)
       )
 
-    # Route the whole-chain enumeration through the timed `HeavyRead` facade (the
-    # explicit `tenant_id` predicate satisfies its structural guard) rather than the
-    # tiny 3-connection AdminRepo pool, consistent with how `AuditChain` routes its
-    # other audit-chain enumeration reads. The result set is bounded by the tenant's
-    # enrolled-key count, but the read still belongs off the admin pool.
-    tenant_id
-    |> HeavyRead.all(query, HeavyRead.opts(:enumeration))
-    |> Enum.map(fn e ->
-      %{
-        agent_pubkey_hex: e.payload["agent_pubkey"],
-        alg: e.payload["alg"],
-        dispatch_id: e.entity_id,
-        lineage_path: e.payload["lineage_path"],
-        at: e.inserted_at
-      }
-    end)
+    query =
+      case Keyword.get(opts, :cursor) do
+        nil -> base
+        pos when is_integer(pos) -> from(e in base, where: e.chain_position < ^pos)
+      end
+
+    # Route each bounded page through the timed `HeavyRead` facade (the explicit
+    # `tenant_id` predicate satisfies its structural guard) rather than the tiny
+    # 3-connection AdminRepo pool, consistent with how `AuditChain` routes its other
+    # audit-chain enumeration reads.
+    rows = HeavyRead.all(tenant_id, query, HeavyRead.opts(:enumeration))
+    {page, has_more} = split_page(rows, limit)
+    next_cursor = if has_more, do: List.last(page).chain_position
+
+    %{
+      data: Enum.map(page, &enrolled_key_row/1),
+      meta: %{limit: limit, has_more: has_more, next_cursor: next_cursor}
+    }
+  end
+
+  defp split_page(rows, limit) do
+    if length(rows) > limit, do: {Enum.take(rows, limit), true}, else: {rows, false}
+  end
+
+  defp enrolled_key_row(%AuditChain.Entry{} = e) do
+    %{
+      agent_pubkey_hex: e.payload["agent_pubkey"],
+      alg: e.payload["alg"],
+      dispatch_id: e.entity_id,
+      lineage_path: e.payload["lineage_path"],
+      at: e.inserted_at,
+      chain_position: e.chain_position,
+      integrity_ok: AuditChain.entry_hash_valid?(e)
+    }
   end
 
   @doc "Lists dispatches with optional filters."

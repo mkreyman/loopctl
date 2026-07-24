@@ -325,5 +325,80 @@ defmodule Loopctl.AuditChain.LeafHashTest do
       tampered = %{reloaded | payload: %{"amount" => 999}}
       refute AuditChain.entry_hash_valid?(tampered)
     end
+
+    test "a v2 entry whose hash_version is tampered down to v1 is flagged, not silently downgraded (§8.7)",
+         %{tenant: tenant} do
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      content = %{
+        tenant_id: tenant.id,
+        position: 0,
+        prev_hash: @prev,
+        action: "event_created",
+        actor_lineage: [],
+        entity_type: "story",
+        entity_id: nil,
+        payload: %{"amount" => 100},
+        inserted_at: now
+      }
+
+      # A genuine v2 leaf hash over the content, but STORED under a downgraded
+      # hash_version of 1 — the shape an attacker who has already defeated the
+      # immutability triggers would produce to route the entry to the linkage-only
+      # branch and skip its content check.
+      insert_raw_entry(tenant.id, content, LeafHash.compute(content, 2), 1)
+
+      report = AuditChain.verify_chain(tenant.id)
+      assert report.tampered == [0]
+      assert report.linkage_only == 0
+      refute report.ok
+    end
+
+    test "a genuine v1 entry stays linkage-only, not mis-flagged as a downgrade (§8.1)",
+         %{tenant: tenant} do
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      content = %{
+        tenant_id: tenant.id,
+        position: 0,
+        prev_hash: @prev,
+        action: "event_created",
+        actor_lineage: [],
+        entity_type: "story",
+        entity_id: nil,
+        payload: %{"amount" => 100},
+        inserted_at: now
+      }
+
+      # A real v1 entry: its stored hash is the v1 construction, which a v2 recompute
+      # will not match, so the downgrade tripwire must leave it as linkage-only.
+      insert_raw_entry(tenant.id, content, LeafHash.compute(content, 1), 1)
+
+      report = AuditChain.verify_chain(tenant.id)
+      assert report.linkage_only == 1
+      assert report.tampered == []
+      assert report.ok
+    end
+  end
+
+  # Inserts a genesis audit_chain row directly (bypassing `AuditChain.append/2`) so a
+  # test can control the stored `entry_hash`/`hash_version` independently of content —
+  # simulating a row an attacker produced after defeating the immutability triggers.
+  defp insert_raw_entry(tenant_id, content, entry_hash, hash_version) do
+    {:ok, _} =
+      %Entry{tenant_id: tenant_id}
+      |> Entry.changeset(%{
+        chain_position: content.position,
+        prev_entry_hash: content.prev_hash,
+        action: content.action,
+        actor_lineage: content.actor_lineage,
+        entity_type: content.entity_type,
+        entity_id: content.entity_id,
+        payload: content.payload,
+        entry_hash: entry_hash,
+        hash_version: hash_version,
+        inserted_at: content.inserted_at
+      })
+      |> AdminRepo.insert()
   end
 end

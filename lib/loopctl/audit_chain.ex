@@ -841,20 +841,24 @@ defmodule Loopctl.AuditChain do
   """
   @spec recompute_entry_hash(Entry.t()) :: binary()
   def recompute_entry_hash(%Entry{} = entry) do
-    LeafHash.compute(
-      %{
-        tenant_id: entry.tenant_id,
-        position: entry.chain_position,
-        prev_hash: entry.prev_entry_hash,
-        action: entry.action,
-        actor_lineage: entry.actor_lineage,
-        entity_type: entry.entity_type,
-        entity_id: entry.entity_id,
-        payload: entry.payload,
-        inserted_at: entry.inserted_at
-      },
-      entry.hash_version
-    )
+    LeafHash.compute(leaf_fields(entry), entry.hash_version)
+  end
+
+  # The content fields a leaf hash commits to, extracted from a stored entry. Shared
+  # by `recompute_entry_hash/1` (dispatches on the stored version) and the
+  # downgrade tripwire in `verify_chain_content/2` (forces a v2 recompute).
+  defp leaf_fields(%Entry{} = entry) do
+    %{
+      tenant_id: entry.tenant_id,
+      position: entry.chain_position,
+      prev_hash: entry.prev_entry_hash,
+      action: entry.action,
+      actor_lineage: entry.actor_lineage,
+      entity_type: entry.entity_type,
+      entity_id: entry.entity_id,
+      payload: entry.payload,
+      inserted_at: entry.inserted_at
+    }
   end
 
   @doc """
@@ -988,7 +992,36 @@ defmodule Loopctl.AuditChain do
   end
 
   # v1 (and any pre-v2): linkage-only — content is not reliably re-derivable (§8.1).
-  defp verify_chain_content(%Entry{}, acc), do: Map.update!(acc, :linkage_only, &(&1 + 1))
+  #
+  # §8.7 hardening: `hash_version` is the selector that decides verification STRENGTH
+  # (v2 → content-verified, v1 → linkage-only), yet it is a mutable column. The v2
+  # leaf preimage binds the version only through its domain string
+  # ("loopctl/audit-leaf/2"), NOT a numeric field, so a `hash_version` flipped
+  # 2 → 1 by anyone who has already defeated the immutability triggers would route a
+  # genuine v2 entry here and SKIP its content check. Before accepting a sub-v2 entry
+  # as linkage-only, recompute it AS v2: a match proves the entry was authored v2 and
+  # its version column was tampered DOWN, so flag it as tampered rather than trusting
+  # the selector to weaken verification. A legitimate v1 entry (non-reproducible
+  # content, §8.1) will not match and stays linkage-only. Residual: a downgrade that
+  # ALSO rewrote content is undetectable here (v1 is content-unverifiable by design)
+  # and remains bounded by the linkage check plus the DB immutability triggers.
+  defp verify_chain_content(%Entry{} = entry, acc) do
+    if downgraded_from_v2?(entry) do
+      acc |> Map.update!(:tampered, &[entry.chain_position | &1]) |> Map.put(:ok, false)
+    else
+      Map.update!(acc, :linkage_only, &(&1 + 1))
+    end
+  end
+
+  # True when a sub-v2 entry's stored hash matches a v2 recompute of its content —
+  # i.e. it was really written as v2 and its `hash_version` was tampered downward.
+  defp downgraded_from_v2?(%Entry{} = entry) do
+    LeafHash.compute(leaf_fields(entry), 2) == entry.entry_hash
+  rescue
+    # A genuine v1 payload that v2 canonicalization rejects (e.g. an ambiguous
+    # duplicate key) is simply not a downgraded-v2 entry — stay linkage-only.
+    _ -> false
+  end
 
   defp finalize_chain_report(acc) do
     acc
