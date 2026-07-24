@@ -74,6 +74,28 @@ defmodule Loopctl.AuditChain.LeafHashTest do
         LeafHash.canonical_json(%{"k" => self()})
       end
     end
+
+    test "numbers are normalized so an integral float equals the integer jsonb decodes it to" do
+      # PostgreSQL jsonb stores 1.0e22 and hands it back as the integer
+      # 10000000000000000000000. Both must canonicalize identically or a legitimate
+      # float payload becomes a FALSE tampering positive.
+      assert LeafHash.canonical_json(1.0e22) ==
+               LeafHash.canonical_json(10_000_000_000_000_000_000_000)
+
+      assert LeafHash.canonical_json(100.0) == LeafHash.canonical_json(100)
+      assert LeafHash.canonical_json(-1.5e3) == LeafHash.canonical_json(-1500)
+
+      assert LeafHash.canonical_json(1.0e23) ==
+               LeafHash.canonical_json(100_000_000_000_000_000_000_000)
+    end
+
+    test "fractional floats and Decimal scale normalize to one canonical decimal string" do
+      assert LeafHash.canonical_json(3.14) == "3.14"
+      assert LeafHash.canonical_json(1.0e-7) == "0.0000001"
+      # A Decimal with trailing-zero scale collapses to the same string as its value.
+      assert LeafHash.canonical_json(Decimal.new("100.00")) == LeafHash.canonical_json(100)
+      assert LeafHash.canonical_json(Decimal.new("3.140")) == "3.14"
+    end
   end
 
   describe "LCP-1 §8.2 v2 construction" do
@@ -128,6 +150,15 @@ defmodule Loopctl.AuditChain.LeafHashTest do
     test "current_version is 2" do
       assert LeafHash.current_version() == 2
     end
+
+    test "an unknown hash_version raises instead of crashing with a FunctionClauseError" do
+      # A tamper-detection path must fail loudly and legibly on a version it cannot
+      # construct, not raise an opaque clause error (the DB CHECK keeps this
+      # unreachable for well-formed rows).
+      assert_raise ArgumentError, ~r/unknown leaf-hash version 3/, fn ->
+        LeafHash.compute(fields(), 3)
+      end
+    end
   end
 
   describe "LCP-1 §8.5 independent recomputation across a jsonb round-trip" do
@@ -172,6 +203,31 @@ defmodule Loopctl.AuditChain.LeafHashTest do
 
       reloaded = AdminRepo.get!(Entry, second.id)
       assert reloaded.chain_position == 1
+      assert AuditChain.entry_hash_valid?(reloaded)
+    end
+
+    test "a float payload reproduces after the jsonb round-trip (no false positive)", %{
+      tenant: tenant
+    } do
+      # jsonb normalizes numbers: an integral float is decoded back as an integer,
+      # and exponent/scale forms are rewritten. Without number canonicalization the
+      # write-time and read-back preimages diverge and entry_hash_valid?/1 returns a
+      # FALSE tampering positive for a perfectly legitimate entry.
+      {:ok, entry} =
+        AuditChain.append(tenant.id, %{
+          action: "score_recorded",
+          actor_lineage: ["dispatch-root"],
+          entity_type: "story",
+          entity_id: @entity,
+          payload: %{"big" => 1.0e22, "score" => 3.14, "small" => 1.0e-7, "round" => 100.0}
+        })
+
+      reloaded = AdminRepo.get!(Entry, entry.id)
+
+      # Prove the round-trip actually changed a representation (big float -> integer),
+      # so the assertion below is not vacuous.
+      assert is_integer(reloaded.payload["big"])
+      assert AuditChain.recompute_entry_hash(reloaded) == reloaded.entry_hash
       assert AuditChain.entry_hash_valid?(reloaded)
     end
 

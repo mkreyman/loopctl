@@ -34,6 +34,18 @@ defmodule LoopctlWeb.WellKnownController do
     audit_signing_key_url: "#{@base_url}/api/v1/tenants/{tenant_id}/audit_public_key",
     capability_scheme_url: "#{@base_url}/wiki/capability-tokens",
     chain_of_custody_spec_url: "#{@base_url}/wiki/chain-of-custody",
+    # LCP-1 §2.1 — the custody-profile discovery fields a third-party verifier
+    # keys off. loopctl still accepts unsigned custody claims, so the profile is
+    # `bearer` (§2.1: a deployment emitting signatures but accepting unsigned
+    # claims is bearer, not signed). `audit_leaf_hash_version` is §8.4's "advertise
+    # what you are CURRENTLY writing", single-sourced from the writer so it can
+    # never drift from `build_entry_attrs`; §10.2.1's "end to end" caveat is a
+    # separate, stronger claim about the historical chain that this field does not
+    # make.
+    custody_profile: "bearer",
+    custody_spec: "#{@base_url}/spec/LCP-1",
+    custody_gates: ["report", "review_complete", "verify"],
+    audit_leaf_hash_version: Loopctl.AuditChain.LeafHash.current_version(),
     discovery_bootstrap_url: "#{@base_url}/wiki/agent-bootstrap",
     required_agent_pattern_url: "#{@base_url}/wiki/agent-pattern",
     system_articles_endpoint: "#{@base_url}/api/v1/articles/system",
@@ -141,11 +153,19 @@ defmodule LoopctlWeb.WellKnownController do
                    "audit_signing_key_url",
                    "capability_scheme_url",
                    "chain_of_custody_spec_url",
+                   "custody_profile",
+                   "custody_spec",
+                   "custody_gates",
+                   "audit_leaf_hash_version",
                    "system_articles_endpoint",
                    "signup_endpoint"
                  ],
                  properties: %{
                    spec_version: %{type: "string"},
+                   custody_profile: %{type: "string", enum: ["bearer", "signed"]},
+                   custody_spec: %{type: "string", format: "uri"},
+                   custody_gates: %{type: "array", items: %{type: "string"}},
+                   audit_leaf_hash_version: %{type: "integer"},
                    mcp_server: %{
                      type: "object",
                      properties: %{

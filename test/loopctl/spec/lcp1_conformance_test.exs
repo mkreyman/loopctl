@@ -189,13 +189,13 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
 
     test "§7.5 clause 3 — a DECLARED but unresolvable implementer dispatch must REJECT" do
       # LCP-1 §7.5: a recorded dispatch id that cannot be resolved is an
-      # INTEGRITY FAILURE, not an absence of delegation. The implementation
-      # currently resolves it to [] and falls through to agent-id equality,
-      # which reads an unloadable dispatch as "independent lineage".
+      # INTEGRITY FAILURE, not an absence of delegation. It fails CLOSED under its
+      # own error code (:unresolvable_dispatch_lineage) rather than being mislabeled
+      # a self-report, so the caller sees the real cause and the tenant is NOT halted.
       ctx = implementing_story(%{implementer_dispatch_id: foreign_dispatch_id()})
       other = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :implementer})
 
-      assert {:error, :self_report_blocked} =
+      assert {:error, :unresolvable_dispatch_lineage} =
                Progress.report_story(ctx.tenant.id, ctx.story.id,
                  agent_id: other.id,
                  reporter_lineage: [Ecto.UUID.generate()]
@@ -281,7 +281,7 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
       ctx = reported_story(%{implementer_dispatch_id: foreign_dispatch_id()})
       other = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
 
-      assert {:error, :self_review_blocked} =
+      assert {:error, :unresolvable_dispatch_lineage} =
                Progress.record_review(ctx.tenant.id, ctx.story.id, review_params(),
                  reviewer_agent_id: other.id,
                  reviewer_lineage: [Ecto.UUID.generate()]
@@ -329,7 +329,7 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
 
       verifier = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
 
-      assert {:error, :self_verify_blocked} =
+      assert {:error, :unresolvable_dispatch_lineage} =
                Progress.ensure_verify_allowed(ctx.story, verifier.id)
     end
 

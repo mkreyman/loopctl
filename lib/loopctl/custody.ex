@@ -1469,6 +1469,10 @@ defmodule Loopctl.Custody do
           chain_position: entry.chain_position,
           entry_hash: encode_hash(entry.entry_hash),
           prev_entry_hash: encode_hash(entry.prev_entry_hash),
+          # LCP-1 §8.4/§8.5: the leaf-hash version an external verifier MUST
+          # dispatch on to recompute this entry's hash — v1 and v2 use different
+          # constructions, so without it the recompute fields below are unusable.
+          hash_version: entry.hash_version,
           action: entry.action,
           actor_lineage: entry.actor_lineage,
           entity_type: entry.entity_type,

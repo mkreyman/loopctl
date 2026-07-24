@@ -197,8 +197,11 @@ defmodule LoopctlWeb.StoryVerificationController do
           |> put_status(:accepted)
           |> json(body)
 
-        {:error, :self_verify_blocked} ->
-          {:error, :self_verify_blocked}
+        # :self_verify_blocked — verifier is the implementer.
+        # :unresolvable_dispatch_lineage — declared dispatch does not resolve; the
+        # guard fails closed on a lineage-integrity error, not a self-verify.
+        {:error, reason} when reason in [:self_verify_blocked, :unresolvable_dispatch_lineage] ->
+          {:error, reason}
 
         {:error, :review_not_conducted} ->
           {:error, :review_not_conducted}
@@ -314,6 +317,9 @@ defmodule LoopctlWeb.StoryVerificationController do
 
         {:error, :self_verify_blocked} ->
           {:error, :self_verify_blocked}
+
+        {:error, :unresolvable_dispatch_lineage} ->
+          {:error, :unresolvable_dispatch_lineage}
 
         {:error, :missing_assigned_agent} ->
           {:error, :missing_assigned_agent}

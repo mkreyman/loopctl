@@ -90,9 +90,11 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
 - **report** — `validate_not_self_report/3` `progress.ex:2210-2235`. `nil` caller blocked
   (`progress.ex:2207`); a story with nil `assigned_agent_id` AND nil `implementer_dispatch_id` is
   **custody-unattributed** and fails closed with `:missing_assigned_agent` + a
-  `custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2240-2243`) — it used to
-  pass vacuously; then the reporter's lineage vs the implementer's (`lineage_conflict?/2`,
-  `progress.ex:2262-2276`); then plain `assigned_agent_id` equality.
+  `custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2248-2251`) — it used to
+  pass vacuously; then the reporter's lineage vs the implementer's (`lineage_status/2`,
+  `progress.ex:2280-2298`) — tri-state `:ok | :conflict | :unresolvable`, where an unresolvable
+  implementer dispatch fails CLOSED with `unresolvable_dispatch_lineage` (LCP-1 §7.5); then plain
+  `assigned_agent_id` equality.
 - **review-complete** — `validate_not_self_review/3` `progress.ex:2282-2312`. Custody-orphan backstop
   first (`progress.ex:2289-2291`), then a **`nil` reviewer is deliberately PERMITTED**
   (`progress.ex:2298-2299`) because nil means a human operator on a user-role key; then the

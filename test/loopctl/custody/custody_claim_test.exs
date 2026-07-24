@@ -19,6 +19,7 @@ defmodule Loopctl.CustodyClaimTest do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
+  alias Loopctl.AuditChain.LeafHash
   alias Loopctl.AuditChain.Verifier
   alias Loopctl.Custody
   alias Loopctl.Custody.Coverage
@@ -397,6 +398,11 @@ defmodule Loopctl.CustodyClaimTest do
       {:ok, proof} = AuditChain.inclusion_proof(tenant.id, entry.chain_position)
       assert entry.chain_entry_hash == Base.url_encode64(proof.leaf_hash, padding: false)
       assert chain_entry.entry_hash == entry.chain_entry_hash
+
+      # LCP-1 §8.4/§8.5: the claim surface exposes the leaf-hash VERSION so an
+      # external verifier can dispatch v1-vs-v2 when recomputing the hash from the
+      # recompute fields — without it those fields are unusable.
+      assert chain_entry.hash_version == LeafHash.current_version()
 
       # (b) ... and the leaf's PAYLOAD names this row's operation by a digest the
       #     reader can recompute from the posture the claim returned. Position +

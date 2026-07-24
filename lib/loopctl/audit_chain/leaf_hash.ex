@@ -17,11 +17,18 @@ defmodule Loopctl.AuditChain.LeafHash do
 
     * **v2** — the current construction (`compute_v2/1`, LCP-1 §8.2). Every field
       is length-prefixed and domain-separated; objects and arrays are serialized
-      through `canonical_json/1` (sorted, string-normalized keys); optional fields
-      carry an explicit presence tag. Because keys are normalized to strings and
-      sorted on BOTH the write and the read side, and because atoms and their
-      string forms encode identically in JSON, a v2 hash reproduces exactly after
-      a `jsonb` round-trip — which is what makes §8.5 achievable.
+      through `canonical_json/1` (sorted, string-normalized keys, decimal-normalized
+      numbers); optional fields carry an explicit presence tag. Reproducibility
+      after a `jsonb` round-trip is achieved deliberately, by neutralizing the two
+      transforms PostgreSQL applies to a stored value: keys are normalized to
+      strings and sorted on BOTH the write and the read side (atoms and their
+      string forms encode identically), and numbers are normalized to a single
+      canonical decimal string so that jsonb's numeric normalization — which
+      rewrites exponent/scale forms and decodes an integral float such as `1.0e22`
+      back as an Elixir integer — cannot change the preimage. That equivalence is
+      what makes §8.5 achievable and is exercised end-to-end in the round-trip
+      test; without the number normalization the guarantee would hold only for
+      string/integer payloads.
 
   Serialization failure is a hard error (`Jason.encode!/1` raises); a hash MUST
   never silently substitute an empty value for a payload it failed to serialize
@@ -60,6 +67,18 @@ defmodule Loopctl.AuditChain.LeafHash do
   def compute(fields, version \\ @current_version)
   def compute(fields, 1), do: compute_v1(fields)
   def compute(fields, 2), do: compute_v2(fields)
+
+  # An entry MUST carry a version this module knows how to construct. An unknown
+  # version (a future format, or a corrupted/hand-edited `hash_version`) cannot be
+  # validated, so a tamper-detection path must fail LOUDLY rather than crash with
+  # an opaque FunctionClauseError. The DB CHECK `audit_chain_hash_version_valid`
+  # keeps this unreachable for well-formed rows; this clause is the last line.
+  def compute(_fields, version) do
+    raise ArgumentError,
+          "unknown leaf-hash version #{inspect(version)} " <>
+            "(LCP-1 §8.4 defines 1 and 2) — refusing to recompute, an unrecognized " <>
+            "version cannot be validated and must be treated as invalid"
+  end
 
   # ── v1: original construction, preserved verbatim ─────────────────────────
 
@@ -138,10 +157,18 @@ defmodule Loopctl.AuditChain.LeafHash do
   object keys (LCP-1 §8.3).
 
   Object keys are normalized to strings and sorted by their UTF-8 octet sequence
-  (Elixir binary comparison is byte-wise). This is what makes a v2 hash stable
-  across a `jsonb` round-trip: `%{action: 1}` written and `%{"action" => 1}` read
-  back both serialize identically. Scalars use the standard JSON encoding;
-  serialization failure raises rather than substituting a placeholder.
+  (Elixir binary comparison is byte-wise), so `%{action: 1}` written and
+  `%{"action" => 1}` read back serialize identically.
+
+  Numbers are normalized to a single canonical decimal string via `Decimal`. This
+  is required for `jsonb` round-trip stability: PostgreSQL stores every JSON number
+  as `numeric`, so an integral float such as `1.0e22` is decoded back as an Elixir
+  INTEGER (`10000000000000000000000`), and exponent/trailing-zero forms are
+  rewritten. Routing the write-time term and the read-back term through the same
+  shortest-decimal → `Decimal.normalize/1` pipeline makes the preimage identical on
+  both sides; without it a legitimate float payload would produce a FALSE tampering
+  positive in `AuditChain.entry_hash_valid?/1`. Non-numeric scalars use the standard
+  JSON encoding; serialization failure raises rather than substituting a placeholder.
   """
   @spec canonical_json(term()) :: binary()
   def canonical_json(value) when is_map(value) and not is_struct(value) do
@@ -158,5 +185,24 @@ defmodule Loopctl.AuditChain.LeafHash do
     "[" <> Enum.map_join(value, ",", &canonical_json/1) <> "]"
   end
 
+  def canonical_json(%Decimal{} = value), do: canonical_number(value)
+  def canonical_json(value) when is_integer(value), do: canonical_number(value)
+  def canonical_json(value) when is_float(value), do: canonical_number(value)
   def canonical_json(value), do: Jason.encode!(value)
+
+  # Canonical decimal string for a number, identical for a write-time value and
+  # the value PostgreSQL hands back after a `jsonb` round-trip. A float goes
+  # through its shortest round-trip JSON text (which is exactly what jsonb parses
+  # into `numeric`) so that, e.g., a write-side float `1.0e22` and a read-side
+  # integer `10000000000000000000000` both normalize to the same string.
+  defp canonical_number(value) when is_integer(value),
+    do: value |> Decimal.new() |> normalize_decimal()
+
+  defp canonical_number(value) when is_float(value),
+    do: value |> Jason.encode!() |> Decimal.new() |> normalize_decimal()
+
+  defp canonical_number(%Decimal{} = value), do: normalize_decimal(value)
+
+  defp normalize_decimal(%Decimal{} = decimal),
+    do: decimal |> Decimal.normalize() |> Decimal.to_string(:normal)
 end

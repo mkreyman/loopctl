@@ -348,13 +348,20 @@ defmodule LoopctlWeb.StoryStatusController do
         role = conn.assigns.current_api_key.role
         json(conn, %{story: story, next_actions: StateMachine.next_actions(story, role)})
 
-      {:error, :self_report_blocked} ->
-        {:error, :self_report_blocked}
-
-      # Custody-unattributed story (no assigned agent, no implementer dispatch):
-      # the self-report guard fails closed rather than passing vacuously.
-      {:error, :missing_assigned_agent} ->
-        {:error, :missing_assigned_agent}
+      # Custody-gate failures pass through unchanged to the FallbackController:
+      #   * :self_report_blocked        — reporter is the implementer.
+      #   * :unresolvable_dispatch_lineage — declared implementer dispatch does not
+      #     resolve; the guard fails closed on a lineage-integrity error, distinct
+      #     from a self-report attempt.
+      #   * :missing_assigned_agent     — custody-unattributed story; the guard
+      #     fails closed rather than passing vacuously.
+      {:error, reason}
+      when reason in [
+             :self_report_blocked,
+             :unresolvable_dispatch_lineage,
+             :missing_assigned_agent
+           ] ->
+        {:error, reason}
 
       {:error, {:invalid_transition, _ctx} = err} ->
         {:error, err}

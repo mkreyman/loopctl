@@ -20,6 +20,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :self_report_blocked}` -> 409 (implementer tries to report their own work)
   - `{:error, :self_review_blocked}` -> 409 (implementer tries to review their own work)
   - `{:error, :missing_assigned_agent}` -> 409 (reported_done story has no assigned agent/dispatch lineage; custody chain broken)
+  - `{:error, :unresolvable_dispatch_lineage}` -> 409 (declared implementer dispatch could not be resolved; custody gate failed closed on an integrity error, tenant NOT halted)
   - `{:error, :rate_limited}` -> 429 with retry_after_seconds from header
   - `{:error, :ingestion_backlog_exceeded, retry_after}` -> 429 with `Retry-After` header and
     a machine-readable `code: "ingestion_backlog_exceeded"` (US-36.3 batch-ingest backpressure —
@@ -206,6 +207,29 @@ defmodule LoopctlWeb.FallbackController do
           "Story is reported_done but has no assigned agent or dispatch lineage. " <>
             "Its custody chain is broken, so it cannot be verified or reviewed. " <>
             "Re-establish provenance (claim/report or backfill) before proceeding.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/chain-of-custody"}
+      }
+    })
+  end
+
+  def call(conn, {:error, :unresolvable_dispatch_lineage}) do
+    # A custody gate (report/review/verify) failed CLOSED because the story's
+    # DECLARED implementer dispatch could not be resolved (e.g. it belongs to
+    # another tenant, or the row is gone). This is a lineage-INTEGRITY failure, not
+    # a byzantine self-claim attempt, so — like :missing_assigned_agent — we do NOT
+    # halt the tenant; we return a clear 409 whose code names the real cause rather
+    # than mislabeling it self_report/self_review/self_verify.
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "unresolvable_dispatch_lineage",
+        message:
+          "The story's declared implementer dispatch could not be resolved, so the " <>
+            "custody gate cannot prove the caller is distinct from the implementer. " <>
+            "This is a lineage-integrity failure; re-establish the dispatch provenance " <>
+            "before reporting, reviewing, or verifying.",
         remediation: %{learn_more: "https://loopctl.com/wiki/chain-of-custody"}
       }
     })

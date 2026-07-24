@@ -139,6 +139,9 @@ defmodule LoopctlWeb.ReviewRecordController do
       {:error, :self_review_blocked} ->
         {:error, :self_review_blocked}
 
+      {:error, :unresolvable_dispatch_lineage} ->
+        {:error, :unresolvable_dispatch_lineage}
+
       {:error, :missing_assigned_agent} ->
         {:error, :missing_assigned_agent}
 
