@@ -22,6 +22,8 @@ defmodule Loopctl.Coordination do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Agents
@@ -33,6 +35,7 @@ defmodule Loopctl.Coordination do
   alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge
   alias Loopctl.Projects
+  alias Loopctl.Projects.Project
   alias Loopctl.Security.SecretDenylist
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Story
@@ -471,8 +474,8 @@ defmodule Loopctl.Coordination do
 
   AC-40.D3.4 requires that any residual hole left by choosing the story-assignment
   membership model (rather than a full, non-self-grantable membership relation) be
-  a DELIBERATE, documented sign-off — never a silent no-op. Two residuals are
-  accepted here, both consciously, both observable:
+  a DELIBERATE, documented sign-off — never a silent no-op. Three residuals are
+  accepted here, all consciously:
 
     1. **Membership is SELF-GRANTABLE via the claim path.** `assigned_agent_id` is
        set by `Progress.claim_story/3`, and claiming is self-service for the
@@ -510,6 +513,48 @@ defmodule Loopctl.Coordination do
        write access.) These denials all collapse to the same oracle-safe 422, so they
        are unobservable to the caller — accepted under the default-deny decision-2
        model and flagged here as a heads-up for the US-40.B1 claim/release coupling.
+
+    3. **A `:kb`-kind scope is tenant-wide-writable by ANY agent (issue #517).**
+       `project_writable_by_agent/4` grants the write when the target is a
+       `:kb`-kind project in the caller's own tenant, WITHOUT a per-project
+       membership check (see path 3 in that function's moduledoc). So in a
+       multi-agent tenant an `:agent` compromised on repo-C can post into a
+       kb-scope channel that auto-injects (via the SessionStart preview) into a
+       peer agent's session working that kb-scope — the intra-tenant, cross-scope
+       injection surface US-40.D3's membership gate closes for WORK projects. This
+       is a DELIBERATE accepted residual, not an oversight: (a) a kb-scope carries
+       NO chain-of-custody surface (`RequireWorkProject` bars work attachment, so
+       it can never hold a story), so nothing custody-critical is exposed; (b) the
+       blast radius is bounded to a single tenant (the `tenant_id` predicate in
+       `kb_scope?/2` blocks cross-tenant reach) and, per post, to the 512-byte
+       SessionStart preview (`@preview_bytes`); and (c) it mirrors the #331/#505
+       trust unit that already made `create_kb_scope` and all agent-role KB
+       curation tenant-wide — a kb-scope is a shared, agent-native knowledge
+       partition whose whole point is any-agent collaboration, so gating its
+       channel by story membership (structurally unsatisfiable — see (a)) would
+       leave an agent-rooted KB-tier tenant with NO writable coordination bus at
+       all. The compensating control is the same as decision 1's: per-project /
+       per-dispatch agent keys under Chain of Custody v2. Registered here so the
+       tenant-wide kb-channel writability is a signed-off decision, not a silent
+       reopening of the D3 injection vector for `:kb` scopes.
+
+       Custody-safety is NOT injection-safety, so the injection dimension is called
+       out explicitly (review): the 512-byte SessionStart preview is same-tenant,
+       agent-controlled text auto-injected into a peer agent's context, i.e. a genuine
+       intra-tenant prompt-injection surface (OWASP ASI06 memory-poisoning / ASI01
+       goal-hijack) — a repo-C-compromised agent can attempt to steer a peer working
+       the kb-scope. What keeps this an ACCEPTED residual rather than an active exploit
+       is that the SessionStart preview CONSUMER treats channel content as untrusted
+       DATA, never instructions: it renders the preview as inert framed text (no shell
+       interpolation, control chars stripped) and does not execute or obey it. The
+       accepted risk is therefore bounded to whatever a peer MODEL might be socially
+       engineered into by 512 bytes of adversarial prose — the same intra-tenant risk
+       any shared agent-native surface carries — mitigated by per-dispatch keys under
+       Chain of Custody v2 and by the `:kb_scope_write` telemetry marker (see
+       `emit_kb_scope_write/3`) that makes member-bypass writes independently alertable.
+       Emitting the marker on this path is deliberate: it is the one path where
+       membership is bypassed, so cross-scope kb writes must be observable separately
+       from membership-backed writes.
 
   ## Coupling (US-40.B1 / US-40.E1)
 
@@ -789,7 +834,7 @@ defmodule Loopctl.Coordination do
   so a cross-project write attempt reveals no "not a member" vs "not your tenant"
   vs "does not exist" oracle.
 
-  Two ways to be authorized:
+  Three ways to be authorized:
 
     1. **Membership** — the agent is assigned to at least one story in the project
        (`stories.assigned_agent_id`, scoped by an EXPLICIT `tenant_id` filter on
@@ -808,6 +853,30 @@ defmodule Loopctl.Coordination do
        member via story assignment — the gate is enforced for every role below
        `:user`.
 
+    3. **`:kb`-kind scope in the caller's own tenant** (issue #517) — a KB scope
+       carries NO chain-of-custody surface: `RequireWorkProject` bars work
+       attachment, so a kb-scope can NEVER have a story, and membership-by-story
+       (path 1) is therefore structurally unsatisfiable for it. Without this path an
+       agent-rooted (KB-tier) tenant — which can create a kb-scope via
+       `create_kb_scope` (#331/#505) but not a work project — had NO channel it
+       could both create AND post to, making the coordination bus (its intended
+       handoff home) unreachable for a new repo. The membership gate exists to
+       isolate CUSTODY-sensitive work-project channels; a kb-scope is a shared,
+       agent-native knowledge partition with no custody weight, so any agent in the
+       OWNING tenant may write its channel. The authorization is TENANT-WIDE, not
+       creator-scoped: there is no per-scope creator/ownership tracking, so an agent
+       may write ANY `:kb`-kind scope in its own tenant, NOT merely one it created via
+       `create_kb_scope`. This is the deliberate, signed-off breadth (the tests at
+       coordination_test.exs cover a brand-new agent with NO story assignment writing
+       a kb-scope it did not create) — a kb-scope's whole point is any-agent
+       collaboration, and an agent can already `knowledge_create` tenant-wide directly,
+       so this opens no boundary the tenant trust unit did not already grant. This is
+       NOT a cross-tenant hole:
+       `kb_scope?/2` re-applies the `tenant_id` predicate (as does the `post/4`
+       `get_project/2` guard upstream), so a kb-scope in ANOTHER tenant never
+       reaches here — it is already `:not_found`. Consistent with the #331/#505
+       carve-out that made `create_kb_scope` itself agent-role.
+
   ## Coupling (keep SHARED)
 
   This is the single project-scoped-write predicate for the coordination surface.
@@ -819,12 +888,70 @@ defmodule Loopctl.Coordination do
   @spec project_writable_by_agent(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), atom()) ::
           :ok | {:error, :not_found}
   def project_writable_by_agent(tenant_id, agent_id, project_id, role) do
-    if Role.role_at_least?(role, :user) or
-         agent_member_of_project?(tenant_id, agent_id, project_id) do
-      :ok
-    else
-      {:error, :not_found}
+    # Clause order is a hot-path optimization, NOT a semantic one: kb_scope? and
+    # agent_member_of_project? are mutually exclusive (a kb-scope structurally has
+    # no stories, so it can never satisfy membership), so either order yields the
+    # same verdict. Membership is checked FIRST because the dominant write is an
+    # agent acting on a WORK project it is a member of — that resolves in a single
+    # query, and the always-false kb_scope? probe is only paid on the rare kb path.
+    cond do
+      Role.role_at_least?(role, :user) -> :ok
+      agent_member_of_project?(tenant_id, agent_id, project_id) -> :ok
+      kb_scope?(tenant_id, project_id) -> emit_kb_scope_write(tenant_id, agent_id, project_id)
+      true -> {:error, :not_found}
     end
+  end
+
+  # Issue #517 observability (review): the kb-scope branch is the ONE authorization
+  # path where the project-membership gate is INTENTIONALLY bypassed — any agent in
+  # the owning tenant may write a `:kb`-kind channel, including an agent that owns no
+  # story anywhere. A successful kb-scope write is otherwise audited exactly like an
+  # ordinary post and carries NO distinguishing security signal, so a burst of
+  # cross-scope injecting posts from a non-member agent (the residual-3 intra-tenant
+  # injection surface) is reconstructable only after the fact from the audit log — not
+  # independently observable/alertable. Emit a dedicated low-severity telemetry marker
+  # + log line so member-bypass kb writes can be monitored / rate-anomaly-detected
+  # separately from membership-backed writes, mirroring the denied-path signals
+  # (`:ownership_rejected` / `:agent_identity_required`) the controllers already fire.
+  # Runs at the SHARED predicate so it covers every caller (post / claim / graduate)
+  # in one place. Returns `:ok` so the branch stays authorized.
+  defp emit_kb_scope_write(tenant_id, agent_id, project_id) do
+    :telemetry.execute(
+      [:loopctl, :coordination, :kb_scope_write],
+      %{count: 1},
+      %{tenant_id: tenant_id, agent_id: agent_id, project_id: project_id}
+    )
+
+    Logger.info(
+      "coordination kb-scope member-bypass write " <>
+        "(tenant=#{tenant_id} agent=#{agent_id} project=#{project_id})"
+    )
+
+    :ok
+  end
+
+  # Issue #517: a `:kb`-kind scope OWNED by the caller's tenant is a shared,
+  # custody-free knowledge partition, writable by any agent in that tenant. The
+  # `tenant_id` predicate is what keeps this tenant-safe — a kb-scope in another
+  # tenant never matches. `exists?` compiles to `SELECT 1 ... LIMIT 1` and seeks the
+  # `projects` primary key, so it never materializes a row. Like the sibling
+  # `agent_member_of_project?/3`, `project_id` is assumed already validated by the
+  # upstream `get_project/2`/`get_post/2` chokepoint every caller runs first (a
+  # malformed id is `:not_found` there, long before it reaches this predicate).
+  #
+  # Lifecycle: this probe matches on `(id, tenant_id, kind)` only and DELIBERATELY
+  # does not gate on `projects.status`, so an ARCHIVED kb-scope (`archive_kb_scope`)
+  # stays writable. That is the CONSISTENT choice, not an oversight: the coordination
+  # write path is status-agnostic for work projects too (a member may post to an
+  # archived work project — `get_project/2` returns archived rows and no caller
+  # status-checks), so status-gating only the kb path would be a lone inconsistency.
+  # A tenant that wants to freeze a channel deletes/expires its posts; a blanket
+  # "reject writes to archived scopes" gate (both kinds) is a separate, deliberate
+  # product decision left out of the #517 carve-out.
+  defp kb_scope?(tenant_id, project_id) do
+    Project
+    |> where([p], p.id == ^project_id and p.tenant_id == ^tenant_id and p.kind == :kb)
+    |> AdminRepo.exists?()
   end
 
   # Membership derivation (US-40.D3): the agent is assigned to at least one story
@@ -2121,12 +2248,21 @@ defmodule Loopctl.Coordination do
   @spec graduate_post(Ecto.UUID.t(), Ecto.UUID.t(), atom(), term(), map()) ::
           {:ok, map()}
           | {:error, :not_found}
+          | {:error, :agent_not_found}
           | {:error, :unprocessable_entity, String.t()}
           | {:error, :duplicate_title, Knowledge.Article.t()}
           | {:error, :gate_unavailable}
           | {:error, Ecto.Changeset.t()}
   def graduate_post(tenant_id, agent_id, role, post_id, %{} = params) do
     with {:ok, post} <- get_post(tenant_id, post_id),
+         # Restore the agent-in-tenant binding that the membership probe used to give
+         # for free (review). `project_writable_by_agent/4` no longer implies it on the
+         # kb path — `kb_scope?/2` ignores `agent_id` entirely (#517), so a misconfigured
+         # key carrying a foreign-tenant `agent_id` (the agents/api_keys FKs are
+         # non-composite, see the comment at post/4) could otherwise graduate a kb post
+         # whose article carries a foreign agent's `visibility_agent_id`. Mirroring the
+         # sibling post/4 and claim/4 defense-in-depth closes that mis-attribution class.
+         {:ok, _agent} <- agent_owned(tenant_id, agent_id),
          :ok <- project_writable_by_agent(tenant_id, agent_id, post.project_id, role),
          :ok <- scan_graduation_content(params[:title], post.body, params[:tags]) do
       attrs = %{

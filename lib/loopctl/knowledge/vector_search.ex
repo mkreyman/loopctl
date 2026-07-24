@@ -280,6 +280,18 @@ defmodule Loopctl.Knowledge.VectorSearch do
     # neighbours" (suggest-links empty, ProposalGate novel, ArticleLinkingWorker no links).
     case Embeddings.check_query_vector(tenant_id, to_embedding_list(target_embedding)) do
       :ok ->
+        # Resolve the side-table cutover flag ONCE and thread it into `opts` before
+        # BOTH stages run (review): candidate_query (via candidate_pool_query) and
+        # nearest_heavy_read_opts each resolve `:reads_side_table` via Keyword.get_lazy
+        # when it is absent, so an unthreaded call reads Embeddings.side_table_reads_enabled?/0
+        # twice. A cutover flip (AC-41.1.8 can flip against live traffic) landing between
+        # the two reads would let the query BUILD (side table, pool*4 over-fetch) and the
+        # ef_search DECISION disagree — build side-table but not raise ef_search → transient
+        # under-recall. This is the same "resolve once and thread" invariant candidate_pool_query
+        # documents (vector_search.ex:447-452) and suggest_links honors (knowledge.ex:4711).
+        opts =
+          Keyword.put_new_lazy(opts, :reads_side_table, &Embeddings.side_table_reads_enabled?/0)
+
         query = candidate_query(tenant_id, target_embedding, k, opts)
         HeavyRead.all(tenant_id, query, nearest_heavy_read_opts(k, opts))
 

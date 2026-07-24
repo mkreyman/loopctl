@@ -2246,6 +2246,99 @@ defmodule Loopctl.CoordinationTest do
 
       assert :ok = Coordination.project_writable_by_agent(tenant.id, agent_id, project.id, :user)
     end
+
+    test "issue #517: an agent may write a :kb-kind scope in its own tenant without story membership" do
+      tenant = fixture(:tenant)
+      kb_scope = fixture(:project, %{tenant_id: tenant.id, kind: :kb})
+      # A brand-new agent with NO story assignment anywhere — a kb-scope can never
+      # carry a story, so path-1 membership is structurally unsatisfiable for it.
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      assert :ok =
+               Coordination.project_writable_by_agent(tenant.id, agent_id, kb_scope.id, :agent)
+    end
+
+    test "issue #517: the :kb allowance does NOT cross tenants" do
+      owner = fixture(:tenant)
+      kb_scope = fixture(:project, %{tenant_id: owner.id, kind: :kb})
+
+      other = fixture(:tenant)
+      other_agent = fixture(:agent, %{tenant_id: other.id}).id
+
+      # Asked under the OTHER tenant, the kb-scope is not theirs → not writable.
+      assert {:error, :not_found} =
+               Coordination.project_writable_by_agent(
+                 other.id,
+                 other_agent,
+                 kb_scope.id,
+                 :agent
+               )
+    end
+
+    test "issue #517: a :work project still requires membership (kb carve-out is kind-scoped)" do
+      tenant = fixture(:tenant)
+      work = fixture(:project, %{tenant_id: tenant.id, kind: :work})
+      stranger = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      assert {:error, :not_found} =
+               Coordination.project_writable_by_agent(tenant.id, stranger, work.id, :agent)
+    end
+  end
+
+  # Issue #517: the kb carve-out lives in the SHARED predicate, so it must flow
+  # through EVERY surface that gates on it — not just post/4. The moduledoc pins
+  # claim/4 (US-40.B1) and graduate_post/5 (US-40.E1) to that predicate; these
+  # lock that a NON-member agent can act on a :kb-kind scope through those two
+  # surfaces (and still cannot on a :work project it isn't a member of), so a
+  # future narrowing of either call site can't silently drop the carve-out.
+  describe "kb carve-out flows through the shared-predicate surfaces (issue #517)" do
+    test "claim/4: a non-member agent may claim on a :kb-kind scope, but not on a :work project" do
+      tenant = fixture(:tenant)
+      kb_scope = fixture(:project, %{tenant_id: tenant.id, kind: :kb})
+      work = fixture(:project, %{tenant_id: tenant.id, kind: :work})
+      # A brand-new agent with NO story assignment anywhere.
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      assert {:ok, _claim} =
+               Coordination.claim(tenant.id, agent_id, kb_scope.id, "handoff:kb-ref")
+
+      # Same agent on a WORK project it is not a member of collapses to the
+      # oracle-safe :not_found (the gate denies before any claim row is written).
+      assert {:error, :not_found} =
+               Coordination.claim(tenant.id, agent_id, work.id, "handoff:work-ref")
+    end
+
+    test "graduate_post/5: a non-member agent may graduate a post on a :kb-kind scope, but not on a :work project" do
+      tenant = fixture(:tenant)
+      kb_scope = fixture(:project, %{tenant_id: tenant.id, kind: :kb})
+      work = fixture(:project, %{tenant_id: tenant.id, kind: :work})
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      # A post to graduate on each scope (create_post is the raw insert, not gated).
+      {:ok, kb_post} =
+        Coordination.create_post(tenant.id, kb_scope.id, agent_id, %{
+          "body" => "A reusable kb-scope lesson worth keeping."
+        })
+
+      {:ok, work_post} =
+        Coordination.create_post(tenant.id, work.id, agent_id, %{
+          "body" => "A work-project lesson."
+        })
+
+      # kb-scope: the carve-out admits the non-member agent; the DataCase default
+      # assessor stub is :novel, so the graduation lands a durable article.
+      assert {:ok, _result} =
+               Coordination.graduate_post(tenant.id, agent_id, :agent, kb_post.id, %{
+                 title: "Reusable kb-scope Lesson"
+               })
+
+      # work-project: the non-member is denied at the shared gate → :not_found,
+      # BEFORE any article is proposed.
+      assert {:error, :not_found} =
+               Coordination.graduate_post(tenant.id, agent_id, :agent, work_post.id, %{
+                 title: "Should Not Graduate"
+               })
+    end
   end
 
   describe "delete_post/5" do

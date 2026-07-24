@@ -1196,6 +1196,30 @@ defmodule LoopctlWeb.ChannelPostController do
     })
   end
 
+  # Defense-in-depth (review): the key's server-stamped agent_id does not belong to
+  # this tenant (a misconfigured key — the agent FKs are non-composite). graduate_post/5
+  # now runs the same agent_owned/2 guard create/2 does, so this is an IDENTITY fault,
+  # not a project probe — a 403 :agent_identity_required, mirroring render_write/5.
+  defp render_graduation(conn, {:error, :agent_not_found}) do
+    api_key = conn.assigns.current_api_key
+
+    emit_security_event(:agent_identity_required, %{
+      tenant_id: api_key.tenant_id,
+      agent_id: api_key.agent_id
+    })
+
+    conn
+    |> put_status(:forbidden)
+    |> json(%{
+      error: %{
+        status: 403,
+        code: "agent_identity_required",
+        message:
+          "This API key's agent identity is not valid for this tenant; it cannot graduate a channel post to Knowledge"
+      }
+    })
+  end
+
   # {:error, :not_found} | {:error, :unprocessable_entity, msg} |
   # {:error, %Ecto.Changeset{}} → FallbackController (404 / 422).
   defp render_graduation(conn, error), do: LoopctlWeb.FallbackController.call(conn, error)

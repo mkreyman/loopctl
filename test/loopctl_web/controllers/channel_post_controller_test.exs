@@ -102,6 +102,30 @@ defmodule LoopctlWeb.ChannelPostControllerTest do
       assert_in_delta DateTime.to_unix(expires), DateTime.to_unix(expected), 120
     end
 
+    # Issue #517: an agent-rooted tenant's ONLY creatable channel is a kb-scope
+    # (create_project/work is human-anchor-gated). A kb-scope can never carry a
+    # story, so the NON-member agent that created it must still be able to post a
+    # handoff to it — previously a misleading 422. Now 201.
+    test "issue #517: a non-member agent posts a handoff to its tenant's kb-scope -> 201" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      kb_scope = fixture(:project, %{tenant_id: tenant.id, kind: :kb})
+      # A plain agent key with NO story assignment — exactly the agent-rooted shape.
+      {raw, _key, agent} = agent_key(tenant)
+
+      conn =
+        post_json(raw, %{
+          "project_id" => kb_scope.id,
+          "key" => "handoff:claude-harness-kit#review",
+          "to_host" => "beelink",
+          "body" => "HANDOFF: review claude-harness-kit against its goal"
+        })
+
+      assert %{"post" => post} = json_response(conn, 201)
+      assert post["project_id"] == kb_scope.id
+      assert post["agent_id"] == agent.id
+      assert post["key"] == "handoff:claude-harness-kit#review"
+    end
+
     # TC-40.A1.1 — a multi-item typed-open refs LIST is persisted and returned as-is.
     test "a multi-item typed-open refs list is persisted and returned -> 201" do
       tenant = fixture(:tenant)
