@@ -55,6 +55,33 @@ defmodule LoopctlWeb.TenantController do
     }
   )
 
+  operation(:register_owner_key,
+    summary: "Register the LCP-1 custody owner key",
+    description:
+      "Registers or rotates the tenant's LCP-1 §9.2 owner key — the root of the " <>
+        "custody-attestation chain. The private half stays with the owner. Requires " <>
+        "user+ role and a human-anchored tenant.",
+    request_body:
+      {"Owner key", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:owner_pubkey],
+         properties: %{
+           owner_pubkey: %OpenApiSpex.Schema{
+             type: :string,
+             description: "Hex-encoded 32-byte Ed25519 public key"
+           },
+           alg: %OpenApiSpex.Schema{type: :string, enum: ["ed25519"], example: "ed25519"}
+         }
+       }},
+    responses: %{
+      200 => {"Owner key registered", "application/json", Schemas.TenantResponse},
+      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
+      403 => {"Custody tier required", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
   @doc """
   GET /api/v1/tenants/me
 
