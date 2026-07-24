@@ -643,12 +643,20 @@ preimage  = "loopctl/custody-claim/1" ||
             LP(alg) ||
             LP(tenant_id) ||
             LP(gate) ||
-            LP(work_item_id) ||
+            PRESENT(work_item_id) ||
             LP(canonical_json(body)) ||
-            LP(capability_id) ||
+            PRESENT(capability_id) ||
             uint64_be(claimed_at)
 claim_sig = Sign(alg, agent_private_key, SHA-256(preimage))
 ```
+
+`work_item_id` and `capability_id` use `PRESENT(x)` (§8.2: `0x00` for absent, `0x01 || LP(x)`
+for present), NOT bare `LP(x)`. A claim MAY carry no capability (bearer, or a gate that
+issues none), and a naive `LP("")` for an absent field would make a nil and a literal empty
+string collapse to identical bytes — the exact field-boundary collision `PRESENT`/`LP`
+framing exists to prevent (§8.2). `claimed_at` is an unsigned 64-bit value; an implementation
+MUST reject a `claimed_at` outside `[0, 2^64)` rather than silently reducing it mod 2^64,
+so the signature uniquely binds the timestamp the record carries.
 
 A server MUST reject a claim whose signature does not verify against the `agent_pubkey`
 recorded on the caller's dispatch, **before** evaluating any clause of §7. Signature

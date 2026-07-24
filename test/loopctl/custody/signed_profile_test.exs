@@ -230,6 +230,28 @@ defmodule Loopctl.Custody.SignedProfileTest do
       refute nil_wi == empty_wi
     end
 
+    test "claimed_at outside [0, 2^64) is a clean :malformed_body, not a silently-wrapped sig", %{
+      pub: pub
+    } do
+      base = [
+        alg: "ed25519",
+        dispatch_alg: "ed25519",
+        agent_pubkey: pub,
+        tenant_id: @tenant,
+        gate: "verify",
+        work_item_id: @work,
+        body: %{},
+        capability_id: "c",
+        signature: <<0>>
+      ]
+
+      assert {:error, :malformed_body} =
+               SignedProfile.verify_claim(Keyword.put(base, :claimed_at, -1))
+
+      assert {:error, :malformed_body} =
+               SignedProfile.verify_claim(Keyword.put(base, :claimed_at, 0x1_0000_0000_0000_0000))
+    end
+
     test "the body is canonicalized, so key order does not affect verification", %{
       pub: pub,
       priv: priv
@@ -273,6 +295,84 @@ defmodule Loopctl.Custody.SignedProfileTest do
                  claimed_at: 1,
                  signature: sig
                )
+    end
+  end
+
+  describe "LCP-1 §11 published vectors reproduce against the shipped code" do
+    # This is the guard that was missing: it loads the checked-in signed_profile.json
+    # and asserts the published signatures verify. Without it, a change to the
+    # preimage construction (as happened in a review round) can silently diverge the
+    # code from the spec vectors and break offline third-party verification.
+    setup do
+      path = Path.join(File.cwd!(), "docs/spec/vectors/LCP-1/signed_profile.json")
+      %{v: path |> File.read!() |> Jason.decode!()}
+    end
+
+    defp hex(s), do: Base.decode16!(s, case: :lower)
+
+    test "the published attestation signature verifies", %{v: v} do
+      a = v["attestation"]
+
+      assert :ok =
+               SignedProfile.verify_attestation(
+                 alg: a["alg"],
+                 tenant_id: a["tenant_id"],
+                 agent_pubkey: hex(a["agent_pubkey"]),
+                 authorizer_pubkey: hex(v["keys"]["owner_pubkey"]),
+                 lineage_path: a["lineage_path"],
+                 conditions: a["conditions"],
+                 signature: hex(a["attestation_sig"])
+               )
+    end
+
+    test "the published claim signature verifies (spec §9.3 preimage matches the code)", %{v: v} do
+      c = v["claim"]
+
+      assert :ok =
+               SignedProfile.verify_claim(
+                 alg: c["alg"],
+                 dispatch_alg: c["alg"],
+                 agent_pubkey: hex(v["keys"]["agent_pubkey"]),
+                 tenant_id: c["tenant_id"],
+                 gate: c["gate"],
+                 work_item_id: c["work_item_id"],
+                 body: c["body"],
+                 capability_id: c["capability_id"],
+                 claimed_at: c["claimed_at"],
+                 signature: hex(c["claim_sig"])
+               )
+    end
+
+    test "the published preimage_sha256 values match a fresh recompute", %{v: v} do
+      a = v["attestation"]
+
+      att_preimage =
+        SignedProfile.attestation_preimage(
+          a["alg"],
+          a["tenant_id"],
+          hex(a["agent_pubkey"]),
+          a["lineage_path"],
+          a["conditions"]
+        )
+
+      assert Base.encode16(:crypto.hash(:sha256, att_preimage), case: :lower) ==
+               a["preimage_sha256"]
+
+      c = v["claim"]
+
+      claim_preimage =
+        SignedProfile.claim_preimage(
+          c["alg"],
+          c["tenant_id"],
+          c["gate"],
+          c["work_item_id"],
+          c["body"],
+          c["capability_id"],
+          c["claimed_at"]
+        )
+
+      assert Base.encode16(:crypto.hash(:sha256, claim_preimage), case: :lower) ==
+               c["preimage_sha256"]
     end
   end
 

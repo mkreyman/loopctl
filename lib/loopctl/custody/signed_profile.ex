@@ -166,9 +166,20 @@ defmodule Loopctl.Custody.SignedProfile do
           integer()
         ) :: binary()
   def claim_preimage(alg, tenant_id, gate, work_item_id, body, capability_id, claimed_at)
-      when is_binary(alg) and is_binary(gate) and is_map(body) and is_integer(claimed_at) and
-             (is_nil(work_item_id) or is_binary(work_item_id)) and
-             (is_nil(capability_id) or is_binary(capability_id)) do
+      when is_binary(tenant_id) and is_map(body) and is_integer(claimed_at) do
+    # `claimed_at` is encoded as a bare `uint64`; an out-of-range value would
+    # silently reduce mod 2^64 and let one signature verify for a different
+    # timestamp (audit-binding malleability). Reject rather than wrap. Raised as an
+    # ArgumentError so the verify path's rescue maps it to `:malformed_body`.
+    if claimed_at < 0 or claimed_at >= 0x1_0000_0000_0000_0000 do
+      raise ArgumentError, "claimed_at out of uint64 range"
+    end
+
+    # `alg`/`gate` (via `lp/1`) and `work_item_id`/`capability_id` (via `present/1`)
+    # raise a FunctionClauseError on a wrong-typed value, which the verify path's
+    # rescue maps to `:malformed_body` — so the total contract holds without a wide
+    # boolean guard here.
+
     # `work_item_id`/`capability_id` are guarded to `binary() | nil` so `present/1`
     # receives exactly what it has clauses for. A previous `x && to_string(x)` form
     # mapped a falsy-but-non-nil value (`false`) to `false`, which `present/1` has no

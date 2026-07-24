@@ -1,20 +1,20 @@
 {
   "keys": {
+    "agent_pubkey": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
     "owner_seed": "0101010101010101010101010101010101010101010101010101010101010101",
     "agent_seed": "0202020202020202020202020202020202020202020202020202020202020202",
-    "owner_pubkey": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
-    "agent_pubkey": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+    "owner_pubkey": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
   },
   "spec": "LCP-1 §9 signed profile",
   "note": "hex encodings are lowercase; seeds are 32 bytes; signatures are 64 bytes",
   "attestation": {
     "tenant_id": "33333333-3333-3333-3333-333333333333",
-    "conditions": "gate=verify&expires<1760000000",
-    "agent_pubkey": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
     "alg": "ed25519",
+    "agent_pubkey": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
     "lineage_path": [
       "11111111-1111-1111-1111-111111111111"
     ],
+    "conditions": "gate=verify&expires<1760000000",
     "preimage_sha256": "cd43c690a9ef5767f8dab54517e0ff86d78d5cef3664cb43980edd81877a1e57",
     "attestation_sig": "7205d375ffc9b166d8380e0a463fe7aa981cb5935817b68e5c9ef4f98c65b223c011c567a24b3848f43b9d12b5293191b6c6b1948f8b65cd5f45ced3cae64b07"
   },
@@ -23,12 +23,12 @@
       "outcome": "approved"
     },
     "tenant_id": "33333333-3333-3333-3333-333333333333",
-    "claimed_at": 1760000000,
-    "claim_sig": "02cccb4b29f3435c9e4628159b2be69f2cc42d0bc6c7ac935e592d4a9867431b47a1c4f3d68b4f245ef8c8d4300ef0a616b139e558a885e55681855d26890704",
     "alg": "ed25519",
-    "preimage_sha256": "aa657eee03b29be99efc5f7051a58b901935d1ae1afda9ef97e60bd8030e649f",
     "gate": "verify",
     "work_item_id": "99999999-9999-9999-9999-999999999999",
-    "capability_id": "cap-x"
+    "capability_id": "cap-x",
+    "claimed_at": 1760000000,
+    "claim_sig": "2284c3cada02735fdf695fab827b709997dc3f983c1caccf43285c6b34295f9dfca8dc62fb6f8c221f3f4b42a5da94abd0f0890f5a2847b585320fe357867208",
+    "preimage_sha256": "041b93bee21f85ed2ba569a0e36243a175f561be8778247fb14aa9600f51ac5d"
   }
 }
