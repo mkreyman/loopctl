@@ -31,22 +31,27 @@ defmodule Loopctl.CLI.Config do
     Path.join([home_dir(), @config_dir, @config_file])
   end
 
+  @typedoc """
+  Reads a single OS environment variable by name, returning its value or `nil`.
+  Defaults to `System.get_env/1`; injected in tests so env overrides can be exercised
+  WITHOUT `System.put_env`, which mutates BEAM-global OS env shared by every process
+  (a flake in an `async: true` suite — two tests overriding `LOOPCTL_SERVER` race).
+  """
+  @type env_getter :: (String.t() -> String.t() | nil)
+
   @doc """
   Reads the full configuration, merging file and environment overrides.
   Environment variables take precedence over file values.
 
-  The OS-env reader is resolved through config-based DI
-  (`Loopctl.CLI.EnvReader` behaviour, `:cli_env_reader` key), mirroring
-  `home_dir/0`. Tests inject a Mox mock so overrides can be exercised without
-  `System.put_env` (which mutates BEAM-global env shared across async tests).
+  `env_getter` is the OS-env reader (default `System.get_env/1`); pass a map-backed getter
+  in tests to inject overrides without touching BEAM-global env.
   """
-  @spec read() :: map()
-  def read do
+  @spec read(env_getter()) :: map()
+  def read(env_getter \\ &System.get_env/1) do
     file_config = read_file()
-    reader = env_reader()
 
     Enum.reduce(@env_overrides, file_config, fn {key, env_var}, acc ->
-      case reader.get_env(env_var) do
+      case env_getter.(env_var) do
         nil -> acc
         "" -> acc
         value -> Map.put(acc, key, value)
@@ -57,13 +62,17 @@ defmodule Loopctl.CLI.Config do
   @doc """
   Gets a specific configuration value by key.
   Returns `nil` if the key is not set.
+
+  `env_getter` is threaded to `read/1` (default `System.get_env/1`).
   """
-  @spec get(String.t()) :: String.t() | nil
-  def get(key) when key in @valid_keys do
-    Map.get(read(), key)
+  @spec get(String.t(), env_getter()) :: String.t() | nil
+  def get(key, env_getter \\ &System.get_env/1)
+
+  def get(key, env_getter) when key in @valid_keys do
+    Map.get(read(env_getter), key)
   end
 
-  def get(_key), do: nil
+  def get(_key, _env_getter), do: nil
 
   @doc """
   Sets a configuration value in the config file.
@@ -133,9 +142,5 @@ defmodule Loopctl.CLI.Config do
 
   defp home_dir do
     Application.get_env(:loopctl, :cli_config_dir, System.user_home!())
-  end
-
-  defp env_reader do
-    Application.get_env(:loopctl, :cli_env_reader, Loopctl.CLI.SystemEnvReader)
   end
 end

@@ -119,10 +119,6 @@ config :loopctl,
   # bounded-memory gate protects); config/test.exs swaps in a Mox mock so the scale gate
   # can inject a RETAINING probe and prove that metric is load-bearing.
   streaming_export_body_probe: Loopctl.Knowledge.StreamingExport.NoopBodyProbe,
-  # CLI config env-override source (config-based DI, `Loopctl.CLI.EnvReader`).
-  # Production reads real OS env; config/test.exs swaps in a Mox mock so overrides
-  # are exercised without System.put_env (BEAM-global, unsafe in async tests).
-  cli_env_reader: Loopctl.CLI.SystemEnvReader,
   export_max_concurrent_global: 2,
   export_max_concurrent_per_tenant: 1,
   export_max_stream_duration_ms: 600_000,
