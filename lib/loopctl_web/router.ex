@@ -235,6 +235,8 @@ defmodule LoopctlWeb.Router do
 
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
+    # LCP-1 §9.2 — register/rotate the custody owner key (root of trust).
+    post "/tenants/me/custody-owner-key", TenantController, :register_owner_key
 
     # Per-tenant BYO Anthropic LLM config (Epic 28 residual, #179). Role :user —
     # the PATCH stores a tenant secret (enforced by the controller's RequireRole).

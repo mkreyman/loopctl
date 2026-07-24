@@ -709,17 +709,34 @@ by advertising the version currently being *written* (2) and having verifiers di
 per-entry on the stored `hash_version`; there is no "rewrite the history" step, and none is
 desirable. See §8.7.
 
-§9 (`signed` profile) is **implemented as a verifiable protocol layer, not yet activated as
-a deployment default**. `Loopctl.Custody.SignedProfile` implements the §9.2 attestation and
-§9.3 claim signatures with §6.1 algorithm agility; agent-key enrollment and the §9.1.1
-transparency log + enumeration (`Dispatches.enrolled_agent_keys/1`) are complete and proven
-end to end (`test/loopctl/custody/signed_profile_test.exs`), with §11 set-5 vectors emitted
-from the implementation. What remains before a deployment can advertise
-`custody_profile: "signed"` is the operational activation step: a per-deployment setting
-that makes the custody gates REQUIRE and pre-verify a claim signature for enrolled
-dispatches (§9.3). Until an operator activates it, loopctl accepts unsigned claims and so
-correctly advertises `bearer` (§2.1). This is an activation boundary, not a defect: the
-cryptographic core an external verifier needs is present and tested.
+§9 (`signed` profile) is **implemented end to end, including gate-level enforcement**, and
+is activatable per deployment. It delivers PREVENTION, not merely detection:
+
+- **§9.2 owner-attested enrollment.** Enrolling an agent key REQUIRES an attestation over
+  that key, verified against a key the operator does not hold — the *parent* dispatch's
+  agent key (delegation) or the tenant *owner* key (root). The owner key
+  (`tenants.custody_owner_pubkey`, registered via `POST /tenants/me/custody-owner-key`,
+  human-anchored) has its private half held by the owner, never the server. So an operator
+  cannot enroll a usable agent key without an authorizing signature, and a third party can
+  re-verify the full chain (owner → root agent → child agent) offline from the transparency
+  log. Enforced in `Dispatches.create_dispatch` (`verify_enrollment_attestation`).
+- **§9.1.1 transparency** and enumeration (`Dispatches.enrolled_agent_keys/1`) plus a
+  deferred DB constraint-trigger backstop against direct-insert enrollment.
+- **§9.3 claim enforcement.** Under the `signed` profile, an enrolled caller's custody
+  claim MUST carry a valid signature, pre-verified before the gate by
+  `LoopctlWeb.Plugs.RequireSignedClaim` on report / review_complete / verify.
+
+Activation is a per-deployment setting: `SystemConfig` key
+`custody_signed_profile_enforcement` (0 = `bearer` default, 1 = `signed`), advertised at
+runtime in `custody_profile` (§2.1). The default leaves every existing deployment `bearer`
+and unchanged. Under `signed`, enforcement is **enrolled-only** (gradual rollout): a caller
+with no enrolled key is not forced to sign, so a fleet migrates agent-by-agent. The v1
+claim binds `gate + work_item_id + capability_id + claimed_at` over an empty `body`;
+signing finding/artifact content is a forward-compatible extension.
+
+The guarantee is prevention **modulo owner-key custody**: a tenant that holds its own owner
+key (not the operator) obtains custody an operator cannot forge; a self-hosted operator
+holds everything, so the distinction is moot for that deployment.
 
 ### 10.3 What neither profile guarantees
 

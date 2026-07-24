@@ -9,6 +9,8 @@ defmodule LoopctlWeb.WellKnownController do
 
   use LoopctlWeb, :controller
 
+  alias Loopctl.Custody.SignedProfilePolicy
+
   @base_url "https://loopctl.com"
 
   # Read the MCP server version from package.json at compile time.
@@ -35,13 +37,12 @@ defmodule LoopctlWeb.WellKnownController do
     capability_scheme_url: "#{@base_url}/wiki/capability-tokens",
     chain_of_custody_spec_url: "#{@base_url}/wiki/chain-of-custody",
     # LCP-1 §2.1 — the custody-profile discovery fields a third-party verifier
-    # keys off. loopctl still accepts unsigned custody claims, so the profile is
-    # `bearer` (§2.1: a deployment emitting signatures but accepting unsigned
-    # claims is bearer, not signed). `audit_leaf_hash_version` is §8.4's "advertise
-    # what you are CURRENTLY writing", single-sourced from the writer so it can
-    # never drift from `build_entry_attrs`; §10.2.1's "end to end" caveat is a
-    # separate, stronger claim about the historical chain that this field does not
-    # make.
+    # keys off. `custody_profile` here is a PLACEHOLDER: `discovery_body/0`
+    # overrides it at runtime from `SignedProfilePolicy.profile_string()`, so it
+    # reflects whether this deployment enforces signatures (bearer by default).
+    # `audit_leaf_hash_version` is §8.4's "advertise what you are CURRENTLY
+    # writing", single-sourced from the writer so it can never drift from
+    # `build_entry_attrs`.
     custody_profile: "bearer",
     # Point at a real, served route. The LCP-1 profile is documented on the
     # chain-of-custody wiki article (a seeded system article backed by the
@@ -96,7 +97,14 @@ defmodule LoopctlWeb.WellKnownController do
   """
   @spec discovery_body() :: map()
   def discovery_body do
-    put_in(@discovery_base, [:capabilities], capabilities())
+    @discovery_base
+    |> put_in([:capabilities], capabilities())
+    # LCP-1 §2.1: the advertised profile is DEPLOYMENT-DEPENDENT — it becomes
+    # `signed` when an operator activates gate-level signature enforcement
+    # (`custody_signed_profile_enforcement`). Derived at runtime for the same
+    # reason as the embedding fields: a compile-time literal would advertise
+    # `bearer` even on a deployment that enforces signatures.
+    |> Map.put(:custody_profile, SignedProfilePolicy.profile_string())
   end
 
   defp capabilities do

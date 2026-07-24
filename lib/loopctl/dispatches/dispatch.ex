@@ -30,6 +30,10 @@ defmodule Loopctl.Dispatches.Dispatch do
     # private half never reaches the server.
     field :agent_pubkey, :binary
     field :alg, :string
+    # LCP-1 §9.2: the owner/parent attestation over `agent_pubkey`, retained so a
+    # third party can re-verify the enrollment chain offline. NULL for bearer.
+    field :attestation, :binary
+    field :attestation_conditions, :string
   end
 
   @doc false
@@ -46,7 +50,9 @@ defmodule Loopctl.Dispatches.Dispatch do
       :revoked_at,
       :created_at,
       :agent_pubkey,
-      :alg
+      :alg,
+      :attestation,
+      :attestation_conditions
     ])
     |> validate_required([:role, :lineage_path, :expires_at])
     |> validate_inclusion(:role, @roles)

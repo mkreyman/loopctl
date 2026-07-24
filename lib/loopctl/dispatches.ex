@@ -14,8 +14,10 @@ defmodule Loopctl.Dispatches do
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.Auth
+  alias Loopctl.Custody.SignedProfile
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.HeavyRead
+  alias Loopctl.Tenants
 
   @max_expires_seconds 14_400
   @default_expires_seconds 3_600
@@ -63,18 +65,35 @@ defmodule Loopctl.Dispatches do
     now = DateTime.utc_now()
 
     %{
-      parent_id: Map.get(attrs, :parent_dispatch_id) || Map.get(attrs, "parent_dispatch_id"),
-      role: Map.get(attrs, :role) || Map.get(attrs, "role"),
-      agent_id: Map.get(attrs, :agent_id) || Map.get(attrs, "agent_id"),
-      story_id: Map.get(attrs, :story_id) || Map.get(attrs, "story_id"),
+      parent_id: get_attr(attrs, :parent_dispatch_id),
+      role: get_attr(attrs, :role),
+      agent_id: get_attr(attrs, :agent_id),
+      story_id: get_attr(attrs, :story_id),
       # LCP-1 §9 signed profile: the agent's own public key + algorithm. Absent for
       # a bearer dispatch. `agent_pubkey` is raw bytes; accept hex too for JSON APIs.
-      agent_pubkey:
-        normalize_pubkey(Map.get(attrs, :agent_pubkey) || Map.get(attrs, "agent_pubkey")),
-      alg: Map.get(attrs, :alg) || Map.get(attrs, "alg"),
+      agent_pubkey: normalize_pubkey(get_attr(attrs, :agent_pubkey)),
+      alg: get_attr(attrs, :alg),
+      # LCP-1 §9.2 owner/parent attestation over the agent key (raw or hex sig) and
+      # its conditions string. Required when enrolling an agent key.
+      attestation: normalize_sig(get_attr(attrs, :attestation)),
+      attestation_conditions: get_attr(attrs, :attestation_conditions) || "",
       expires_at: DateTime.add(now, expires_in, :second),
       now: now
     }
+  end
+
+  # Accept either atom or string keys (the JSON API sends strings).
+  defp get_attr(attrs, key), do: Map.get(attrs, key) || Map.get(attrs, Atom.to_string(key))
+
+  # Accept raw signature bytes as-is and hex-encoded signatures from JSON callers.
+  defp normalize_sig(nil), do: nil
+  defp normalize_sig(<<_::binary-size(64)>> = raw), do: raw
+
+  defp normalize_sig(hex) when is_binary(hex) do
+    case Base.decode16(hex, case: :mixed) do
+      {:ok, raw} -> raw
+      :error -> hex
+    end
   end
 
   # Accept either a hex-encoded key (the JSON API form) or raw key bytes,
@@ -112,7 +131,13 @@ defmodule Loopctl.Dispatches do
 
     # Carry the signed-profile fields alongside opts so the multi can enroll the
     # key and record it on the audit chain (LCP-1 §9.1.1) without a wider signature.
-    opts = Keyword.merge(opts, agent_pubkey: parsed.agent_pubkey, alg: parsed.alg)
+    opts =
+      Keyword.merge(opts,
+        agent_pubkey: parsed.agent_pubkey,
+        alg: parsed.alg,
+        attestation: parsed.attestation,
+        attestation_conditions: parsed.attestation_conditions
+      )
 
     case normalize_role(raw_role) do
       {:error, reason} ->
@@ -147,6 +172,14 @@ defmodule Loopctl.Dispatches do
       |> Multi.run(:resolve_lineage, fn _repo, _changes ->
         resolve_lineage(tenant_id, parent_id)
       end)
+      |> Multi.run(:verify_attestation, fn _repo, %{resolve_lineage: parent_lineage} ->
+        # LCP-1 §9.2: enrolling an agent key REQUIRES an owner/parent attestation
+        # over that key, verified against a key the operator does not hold — the
+        # PARENT's agent key (delegation) or the tenant OWNER key (root). This is
+        # what makes the signed profile prevention, not just detection: an operator
+        # cannot enroll a usable agent key without an authorizing signature.
+        verify_enrollment_attestation(tenant_id, parent_id, parent_lineage, opts)
+      end)
       |> Multi.run(:create_dispatch, fn _repo, %{resolve_lineage: parent_lineage} ->
         dispatch_id = Ecto.UUID.generate()
         lineage_path = parent_lineage ++ [dispatch_id]
@@ -161,7 +194,9 @@ defmodule Loopctl.Dispatches do
           expires_at: expires_at,
           created_at: now,
           agent_pubkey: Keyword.get(opts, :agent_pubkey),
-          alg: Keyword.get(opts, :alg)
+          alg: Keyword.get(opts, :alg),
+          attestation: Keyword.get(opts, :attestation),
+          attestation_conditions: Keyword.get(opts, :attestation_conditions)
         })
         |> AdminRepo.insert()
       end)
@@ -177,32 +212,29 @@ defmodule Loopctl.Dispatches do
           "expires_at" => DateTime.to_iso8601(dispatch.expires_at)
         }
 
-        # LCP-1 §9.1.1 enrollment transparency: when this dispatch enrolls an agent
-        # public key, record the key (hex) + alg on the hash-chained, STH-covered
-        # audit entry. An operator that mints an agent key therefore cannot do so
-        # invisibly or retroactively — a tenant can enumerate every enrolled key
-        # from the chain alone. The action names the enrollment so it is filterable.
+        # LCP-1 §9.1.1 enrollment transparency + §9.2 attestation: when this dispatch
+        # enrolls an agent public key, record the key (hex), alg, AND the verified
+        # owner/parent attestation on the hash-chained, STH-covered audit entry. So
+        # an operator can neither mint an agent key invisibly (transparency) nor mint
+        # one at all without an authorizing signature (attestation, verified in the
+        # `:verify_attestation` Multi step above against a key the operator does not
+        # hold). A third party can enumerate every enrolled key from the chain alone
+        # and re-verify each enrollment's attestation offline. The action names the
+        # enrollment so it is filterable.
         #
-        # SCOPE: this slice implements the §9.1.1 TRANSPARENCY control only. The
-        # §9.2 owner-attestation check (`SignedProfile.verify_attestation/1`, which
-        # proves the agent authorized the key) is a spec primitive that is NOT wired
-        # into this enrollment path — an operator-supplied `agent_pubkey` is accepted
-        # unattested and is only detectable post-hoc via the transparency log above.
-        # Requiring an attestation at enrollment is deliberate follow-up work; do not
-        # read the absence of that check here as an accidental gap.
-        #
-        # GUARD: a source-scanning tripwire test
-        # (`signed_profile_test.exs`, "attestation-gate coupling") FAILS the moment
-        # any production module calls `SignedProfile.verify_claim` while this path
-        # still omits `SignedProfile.verify_attestation` — so a future custody gate
-        # cannot start trusting agent-signed claims without the §9.2 attestation
-        # landing here first.
+        # GUARD: a source-scanning tripwire test (`signed_profile_test.exs`,
+        # "attestation-gate coupling") requires that enrollment call
+        # `SignedProfile.verify_attestation` whenever any production module gates
+        # `verify_claim` — satisfied by the `:verify_attestation` step above.
         {action, payload} =
           if dispatch.agent_pubkey do
             {"dispatch_created_with_agent_key",
              Map.merge(base_payload, %{
                "agent_pubkey" => Base.encode16(dispatch.agent_pubkey, case: :lower),
-               "alg" => dispatch.alg
+               "alg" => dispatch.alg,
+               "attestation" =>
+                 dispatch.attestation && Base.encode16(dispatch.attestation, case: :lower),
+               "attestation_conditions" => dispatch.attestation_conditions
              })}
           else
             {"dispatch_created", base_payload}
@@ -457,6 +489,31 @@ defmodule Loopctl.Dispatches do
   end
 
   @doc """
+  Resolves the active (non-revoked) dispatch that minted an API key, tenant-scoped.
+
+  Server-side identity resolution for LCP-1 §9.3 signed-profile enforcement: the
+  caller's enrolled `agent_pubkey`/`alg` live on this row, derived from the key the
+  request authenticated with, never from client input. Returns `{:ok, dispatch}`,
+  or `:none` when the key was not minted by a dispatch (legacy env-var key) or its
+  dispatch is revoked — a bearer caller with no signed identity.
+  """
+  @spec dispatch_for_api_key(Ecto.UUID.t(), Ecto.UUID.t() | nil) :: {:ok, Dispatch.t()} | :none
+  def dispatch_for_api_key(_tenant_id, nil), do: :none
+
+  def dispatch_for_api_key(tenant_id, api_key_id) do
+    from(d in Dispatch,
+      where: d.tenant_id == ^tenant_id and d.api_key_id == ^api_key_id and is_nil(d.revoked_at),
+      order_by: [desc: d.created_at],
+      limit: 1
+    )
+    |> AdminRepo.one()
+    |> case do
+      nil -> :none
+      dispatch -> {:ok, dispatch}
+    end
+  end
+
+  @doc """
   Checks if two lineage paths share a common ROOT (their first element).
 
   This is deliberately a shared-root test, not a general prefix test: every
@@ -576,4 +633,85 @@ defmodule Loopctl.Dispatches do
   defp normalize_role("orchestrator"), do: :orchestrator
   defp normalize_role("user"), do: :user
   defp normalize_role(invalid), do: {:error, {:invalid_role, invalid}}
+
+  # LCP-1 §9.2: verify the owner/parent attestation over an enrolled agent key.
+  # Returns {:ok, _} for the Multi, or {:error, reason} to roll the enrollment back.
+  #
+  # A bearer dispatch (no agent_pubkey) needs no attestation. When a key IS present,
+  # the attestation is verified against a key the OPERATOR does not hold:
+  #
+  #   * child (parent is itself enrolled) → the PARENT's agent key signs, over the
+  #     PARENT's lineage. Delegation: a parent authorizes its children.
+  #   * root (no parent, or a bearer parent) → the tenant OWNER key signs, over the
+  #     empty/parent lineage. The owner key's private half is owner-held (§9.2), so
+  #     the operator cannot mint the root attestation.
+  #
+  # The authorizer signs the AUTHORIZER's lineage (`parent_lineage`), which is known
+  # in advance — the new dispatch's server-generated id is NOT in the preimage, so
+  # the attestation is signable before enrollment.
+  defp verify_enrollment_attestation(tenant_id, parent_id, parent_lineage, opts) do
+    case Keyword.get(opts, :agent_pubkey) do
+      nil ->
+        {:ok, :bearer}
+
+      agent_pubkey ->
+        with {:ok, sig} <- fetch_attestation(opts),
+             {:ok, authorizer} <- resolve_authorizer(tenant_id, parent_id) do
+          verify_attestation_sig(tenant_id, agent_pubkey, authorizer, parent_lineage, opts, sig)
+        end
+    end
+  end
+
+  defp fetch_attestation(opts) do
+    case Keyword.get(opts, :attestation) do
+      sig when is_binary(sig) -> {:ok, sig}
+      _ -> {:error, :attestation_required}
+    end
+  end
+
+  # Authorizer = the parent's agent key if the parent is enrolled; otherwise the
+  # tenant owner key (root of trust). Fails closed if a root enrollment is attempted
+  # with no owner key registered.
+  defp resolve_authorizer(tenant_id, parent_id) do
+    parent = parent_id && AdminRepo.get_by(Dispatch, id: parent_id, tenant_id: tenant_id)
+
+    case parent do
+      %Dispatch{agent_pubkey: pk, alg: alg} when is_binary(pk) ->
+        {:ok, {pk, alg}}
+
+      _ ->
+        case Tenants.custody_owner_key(tenant_id) do
+          {pk, alg} -> {:ok, {pk, alg}}
+          :none -> {:error, :owner_key_not_registered}
+        end
+    end
+  end
+
+  defp verify_attestation_sig(
+         tenant_id,
+         agent_pubkey,
+         {authorizer_pk, authorizer_alg},
+         lineage,
+         opts,
+         sig
+       ) do
+    alg = Keyword.get(opts, :alg)
+
+    if alg != authorizer_alg do
+      {:error, :attestation_alg_mismatch}
+    else
+      case SignedProfile.verify_attestation(
+             alg: alg,
+             tenant_id: tenant_id,
+             agent_pubkey: agent_pubkey,
+             authorizer_pubkey: authorizer_pk,
+             lineage_path: lineage,
+             conditions: Keyword.get(opts, :attestation_conditions, ""),
+             signature: sig
+           ) do
+        :ok -> {:ok, :attested}
+        {:error, reason} -> {:error, {:attestation_invalid, reason}}
+      end
+    end
+  end
 end

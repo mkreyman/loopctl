@@ -35,6 +35,10 @@ defmodule LoopctlWeb.StoryVerificationController do
   plug LoopctlWeb.Plugs.RequireHumanAnchor
        when action in [:verify, :reject, :force_unclaim, :backfill, :verify_all]
 
+  # LCP-1 §9.3: under the `signed` custody profile, an enrolled verifier's claim
+  # must carry a valid signature. No-op under the default `bearer` profile.
+  plug LoopctlWeb.Plugs.RequireSignedClaim, [gate: "verify"] when action in [:verify]
+
   tags(["Progress"])
 
   operation(:verify,

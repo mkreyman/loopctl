@@ -29,6 +29,10 @@ defmodule LoopctlWeb.StoryStatusController do
   plug LoopctlWeb.Plugs.RequireRole,
        [exact_role: [:agent, :orchestrator]] when action in [:report]
 
+  # LCP-1 §9.3: under the `signed` custody profile, an enrolled caller's report
+  # claim must carry a valid signature. No-op under the default `bearer` profile.
+  plug LoopctlWeb.Plugs.RequireSignedClaim, [gate: "report"] when action in [:report]
+
   plug LoopctlWeb.Plugs.RequireRole,
        [exact_role: :agent] when action in [:claim, :start, :request_review, :unclaim]
 

@@ -21,7 +21,12 @@ defmodule LoopctlWeb.TenantController do
   action_fallback LoopctlWeb.FallbackController
 
   # Agents and orchestrators can view tenant profile but only users+ can modify settings
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:update]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:update, :register_owner_key]
+
+  # LCP-1 §9.2: registering the custody OWNER key is a root-of-trust action — it
+  # must come from a human-anchored tenant (the owner establishing the key the
+  # whole attestation chain hangs from), never a self-minted agent-rooted key.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:register_owner_key]
 
   tags(["Tenants"])
 
@@ -82,6 +87,37 @@ defmodule LoopctlWeb.TenantController do
     end
   end
 
+  @doc """
+  POST /api/v1/tenants/me/custody-owner-key
+
+  Registers or rotates the LCP-1 §9.2 owner key (root of the custody-attestation
+  chain). Body: `%{"owner_pubkey" => <hex>, "alg" => "ed25519"}`. The private half
+  stays with the owner. Human-anchored + `:user` role.
+  """
+  def register_owner_key(conn, params) do
+    with {:ok, tenant} <- require_tenant(conn),
+         {:ok, pubkey} <- decode_owner_pubkey(params["owner_pubkey"]) do
+      alg = params["alg"] || "ed25519"
+
+      case Tenants.register_custody_owner_key(tenant.id, pubkey, alg) do
+        {:ok, updated} ->
+          conn |> put_status(:ok) |> json(%{tenant: tenant_json(updated)})
+
+        {:error, %Ecto.Changeset{} = changeset} ->
+          {:error, changeset}
+      end
+    end
+  end
+
+  defp decode_owner_pubkey(hex) when is_binary(hex) do
+    case Base.decode16(hex, case: :mixed) do
+      {:ok, raw} -> {:ok, raw}
+      :error -> {:error, :unprocessable_entity, "owner_pubkey must be hex-encoded"}
+    end
+  end
+
+  defp decode_owner_pubkey(_), do: {:error, :unprocessable_entity, "owner_pubkey is required"}
+
   defp tenant_json(tenant) do
     %{
       id: tenant.id,
@@ -91,6 +127,11 @@ defmodule LoopctlWeb.TenantController do
       settings: tenant.settings,
       status: tenant.status,
       trust_tier: tenant.trust_tier,
+      # LCP-1 §9.2: the owner key (hex) so a third party can verify root
+      # enrollment attestations. Public by design; the private half is owner-held.
+      custody_owner_pubkey:
+        tenant.custody_owner_pubkey && Base.encode16(tenant.custody_owner_pubkey, case: :lower),
+      custody_owner_alg: tenant.custody_owner_alg,
       # #505 — advertise the tier's surfaces UP FRONT so a caller can tell which
       # operations its tenant includes without probing for a 403 on each write.
       # Same map the `custody_tier_required` 403 embeds; one derivation, so the

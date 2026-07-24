@@ -687,6 +687,36 @@ defmodule Loopctl.Tenants do
   end
 
   @doc """
+  Registers (or rotates) the tenant's LCP-1 §9.2 owner key — the root of the
+  custody-attestation chain. `pubkey` is the raw 32-byte ed25519 public key (the
+  private half stays with the OWNER, never the server). Human-anchored + `:user`
+  role at the controller. Returns `{:ok, tenant}` or `{:error, changeset}`.
+  """
+  @spec register_custody_owner_key(Ecto.UUID.t(), binary(), String.t()) ::
+          {:ok, Tenant.t()} | {:error, :not_found | Ecto.Changeset.t()}
+  def register_custody_owner_key(tenant_id, pubkey, alg \\ "ed25519") do
+    with {:ok, tenant} <- get_tenant(tenant_id) do
+      tenant
+      |> Tenant.custody_owner_key_changeset(pubkey, alg)
+      |> AdminRepo.update()
+    end
+  end
+
+  @doc """
+  Returns the tenant's owner key as `{pubkey_bytes, alg}` or `:none`.
+  """
+  @spec custody_owner_key(Ecto.UUID.t()) :: {binary(), String.t()} | :none
+  def custody_owner_key(tenant_id) do
+    case get_tenant(tenant_id) do
+      {:ok, %{custody_owner_pubkey: pk, custody_owner_alg: alg}} when is_binary(pk) ->
+        {pk, alg}
+
+      _ ->
+        :none
+    end
+  end
+
+  @doc """
   Counts all tenants (global, not RLS-scoped).
 
   Used by the US-27.15 metrics cardinality gate: the `tenant_id` label is allowed on

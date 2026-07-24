@@ -97,6 +97,12 @@ config :loopctl, Loopctl.TouchBuffer, flush_interval_ms: :timer.hours(1)
 # independently of the flag.
 config :loopctl, :enable_local_test_runner, false
 
+# LCP-1 §9.3 signed-profile enforcement: resolve the deployment profile from a
+# process-dictionary stub in tests (async-safe), so a test can force `signed` for
+# its own process without mutating VM-global SystemConfig. Default (no override)
+# reads as 0 = bearer, so the whole suite runs bearer unless a test opts in.
+config :loopctl, :custody_profile_source, Loopctl.Test.CustodyProfileStub
+
 # DI (US-27.11): route Loopctl.HeavyRead's heavy reads to AdminRepo in tests, so
 # they see the same sandbox transaction that fixtures write to. Prod/dev default to
 # the dedicated Loopctl.HeavyReadRepo pool.

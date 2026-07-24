@@ -43,6 +43,13 @@ defmodule Loopctl.Tenants.Tenant do
     # US-26.0.2: ed25519 public key for signing audit chain entries
     field :audit_signing_public_key, :binary
     field :audit_key_rotated_at, :utc_datetime_usec
+    # LCP-1 §9.2: the OWNER key — the root that authorizes agent-key enrollment.
+    # Unlike audit_signing_public_key (server-held private half), the owner key's
+    # private half is held by the OWNER, so a root enrollment attestation cannot be
+    # forged by the operator. NEVER in a public settings changeset; set only via the
+    # human-anchored owner-key registration path.
+    field :custody_owner_pubkey, :binary
+    field :custody_owner_alg, :string
     # US-26.5.2: custody halt on witness divergence
     field :custody_halted_at, :utc_datetime_usec
     # US-26.7.1: capability tier — NEVER in any public changeset cast; the
@@ -201,6 +208,34 @@ defmodule Loopctl.Tenants.Tenant do
   @spec status_changeset(%__MODULE__{}, atom()) :: Ecto.Changeset.t()
   def status_changeset(tenant, status) when status in @statuses do
     change(tenant, status: status)
+  end
+
+  @ed25519_pubkey_bytes 32
+
+  @doc """
+  Changeset that registers/rotates the LCP-1 §9.2 owner key. Deliberately its own
+  changeset (never the public `update_changeset`): the owner key is the root of
+  the custody-attestation chain, so it is set only through the human-anchored
+  owner-key registration path. Validates the algorithm and the 32-byte ed25519
+  length; the DB CHECK `tenants_custody_owner_key_valid` is the backstop.
+  """
+  @spec custody_owner_key_changeset(%__MODULE__{}, binary(), String.t()) :: Ecto.Changeset.t()
+  def custody_owner_key_changeset(tenant, pubkey, alg) do
+    tenant
+    |> change(custody_owner_pubkey: pubkey, custody_owner_alg: alg)
+    |> validate_inclusion(:custody_owner_alg, ["ed25519"])
+    |> validate_owner_pubkey_length()
+    |> check_constraint(:custody_owner_pubkey, name: :tenants_custody_owner_key_valid)
+  end
+
+  defp validate_owner_pubkey_length(changeset) do
+    case get_field(changeset, :custody_owner_pubkey) do
+      pk when is_binary(pk) and byte_size(pk) == @ed25519_pubkey_bytes ->
+        changeset
+
+      _ ->
+        add_error(changeset, :custody_owner_pubkey, "must be a 32-byte ed25519 public key")
+    end
   end
 
   @doc """

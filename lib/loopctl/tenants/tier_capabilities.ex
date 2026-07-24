@@ -97,8 +97,9 @@ defmodule Loopctl.Tenants.TierCapabilities do
        "EXPORT — it reads what you already own."},
     {:chain_of_custody, :human_anchored,
      "Story lifecycle WRITES (claim/start/report/review-complete/verify), bulk lifecycle " <>
-       "operations, artifact reports, capability-token recovery. Reading story status, " <>
-       "history and artifact reports stays open."},
+       "operations, artifact reports, capability-token recovery, and registering the " <>
+       "LCP-1 §9.2 custody owner key (root of trust). Reading story status, history and " <>
+       "artifact reports stays open."},
     {:dispatch, :human_anchored,
      "Minting per-dispatch ephemeral keys and lineage paths (L4). Reading your own " <>
        "dispatches stays open."},
@@ -146,7 +147,10 @@ defmodule Loopctl.Tenants.TierCapabilities do
       "LoopctlWeb.ReviewRecordController",
       "LoopctlWeb.ArtifactReportController",
       "LoopctlWeb.BulkOperationsController",
-      "LoopctlWeb.CapRecoveryController"
+      "LoopctlWeb.CapRecoveryController",
+      # LCP-1 §9.2 — TenantController mounts RequireHumanAnchor on
+      # :register_owner_key (the custody owner key is the root of trust).
+      "LoopctlWeb.TenantController"
     ],
     dispatch: ["LoopctlWeb.DispatchController"],
     token_budgets: [
