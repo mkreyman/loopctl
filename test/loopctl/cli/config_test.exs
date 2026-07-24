@@ -2,6 +2,7 @@ defmodule Loopctl.CLI.ConfigTest do
   use ExUnit.Case, async: true
 
   alias Loopctl.CLI.Config
+  alias Loopctl.Test.EnvReader
 
   @test_dir System.tmp_dir!()
 
@@ -67,36 +68,43 @@ defmodule Loopctl.CLI.ConfigTest do
     end
   end
 
-  # A map-backed env getter injected into Config.read/1. This exercises the OS-env override
-  # path WITHOUT System.put_env, which mutates BEAM-global env shared across every process —
-  # a real flake in this `async: true` suite (two of these tests both override LOOPCTL_SERVER
-  # and would race each other and any other async test reading it).
-  defp env_getter(overrides), do: fn var -> Map.get(overrides, var) end
+  # Install a process-local env-override map on the injected reader
+  # (Loopctl.Test.EnvReader). This exercises the OS-env override path WITHOUT
+  # System.put_env, which mutates BEAM-global env shared across every process — a
+  # real flake in this `async: true` suite (two of these tests both override
+  # LOOPCTL_SERVER and would race each other and any other async test reading it).
+  # The override lives in THIS test's process dictionary.
+  defp stub_env(overrides), do: EnvReader.put_overrides(overrides)
 
   describe "environment variable overrides" do
     test "LOOPCTL_SERVER overrides file config" do
-      config = Config.read(env_getter(%{"LOOPCTL_SERVER" => "https://test.loopctl.io"}))
+      stub_env(%{"LOOPCTL_SERVER" => "https://test.loopctl.io"})
+      config = Config.read()
       assert config["server"] == "https://test.loopctl.io"
     end
 
     test "LOOPCTL_API_KEY overrides file config" do
-      config = Config.read(env_getter(%{"LOOPCTL_API_KEY" => "lc_test123"}))
+      stub_env(%{"LOOPCTL_API_KEY" => "lc_test123"})
+      config = Config.read()
       assert config["api_key"] == "lc_test123"
     end
 
     test "LOOPCTL_FORMAT overrides file config" do
-      config = Config.read(env_getter(%{"LOOPCTL_FORMAT" => "human"}))
+      stub_env(%{"LOOPCTL_FORMAT" => "human"})
+      config = Config.read()
       assert config["format"] == "human"
     end
 
     test "empty env var does not override" do
       # Empty string must NOT override — the key stays whatever the file has.
-      config = Config.read(env_getter(%{"LOOPCTL_SERVER" => ""}))
+      stub_env(%{"LOOPCTL_SERVER" => ""})
+      config = Config.read()
       refute config["server"] == ""
     end
 
     test "an unset env var (getter returns nil) does not override" do
-      config = Config.read(env_getter(%{}))
+      stub_env(%{})
+      config = Config.read()
       refute Map.has_key?(config, "server") and config["server"] == nil
     end
   end

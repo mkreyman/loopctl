@@ -350,6 +350,12 @@ config :loopctl, :ingestion_backlog_counter, Loopctl.MockBacklogCounter
 # unchanged; only the bounded-memory scale gate injects a retaining probe.
 config :loopctl, :streaming_export_body_probe, Loopctl.MockStreamingExportBodyProbe
 
+# CLI config env-override source (Loopctl.CLI.EnvReader). Test double delegates to
+# real System.get_env by default (so every CLI test is unchanged); the env-override
+# tests install a process-local map via Loopctl.Test.EnvReader.put_overrides/1,
+# avoiding System.put_env (BEAM-global, unsafe in this async suite).
+config :loopctl, :cli_env_reader, Loopctl.Test.EnvReader
+
 config :loopctl, :rate_limiter, Loopctl.MockRateLimiter
 
 # Trusted-proxy range for the shared Loopctl.RemoteIp resolver in tests. Headers

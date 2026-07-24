@@ -67,18 +67,27 @@ defmodule Loopctl.Release do
   ## What flipping it CAN and CANNOT do (read before enabling)
 
   `signed` requires an ENROLLED agent (one whose dispatch carries a signing key)
-  to cryptographically sign its custody claims at the three custody gates —
-  `report`, `review-complete`, `verify` — enforced by
-  `LoopctlWeb.Plugs.RequireSignedClaim`, which is mounted ONLY on those three
-  routes. It therefore:
+  to cryptographically sign its custody claims. It is enforced by
+  `LoopctlWeb.Plugs.RequireSignedClaim`, mounted on the three single-item custody
+  gates — `report`, `review-complete`, `verify` — AND, with `bulk: true`, on the
+  SET-BASED custody actions `verify_all` (story verification) and the bulk
+  `verify` / `mark_complete` (bulk operations). It therefore:
 
     * does **NOT** gate the Knowledge Wiki, agent memory, the context retriever,
       or ANY read path — **KB access cannot be lost by enabling this**;
     * does **NOT** gate authentication, signup, or tenant access;
-    * is **enrolled-only / gradual**: a caller WITHOUT an enrolled signing key is
-      waived (proceeds), so with zero enrolled agents the switch is INERT — it
-      changes nothing observable until you register a tenant owner key and enroll
-      an agent. `:status` reports the enrolled count so you flip with eyes open.
+    * is **enrolled-only / gradual** on the three single-item gates: a caller
+      WITHOUT an enrolled signing key is waived (proceeds), so with zero enrolled
+      agents the switch is INERT — it changes nothing observable until you
+      register a tenant owner key and enroll an agent. `:status` reports the
+      enrolled count so you flip with eyes open;
+    * but on the aggregate paths (`verify_all`, bulk `verify` / `mark_complete`)
+      `signed` does NOT waive-then-sign — it HARD-REFUSES an enrolled caller with
+      `bulk_signature_unsupported` (401), because a per-story claim signature
+      cannot cover an unbounded set. **Enabling `signed` will break bulk
+      verify-all and bulk mark-complete for enrolled agents**; those agents must
+      fall back to verifying each story individually through the signed
+      single-story gate.
 
   Fully reversible (`:disable`). `:enable`/`:disable` write the DB value; every
   running node adopts it within a minute via `SystemConfigRefreshWorker` (and on
@@ -102,14 +111,21 @@ defmodule Loopctl.Release do
 
   @doc false
   def set_custody_profile(value) when value in [0, 1] do
-    {:ok, _setting} = SystemConfig.put(SignedProfilePolicy.profile_key(), value)
-    # Reflect the just-written value in THIS node's cache so the status printout
-    # below reads back the new value (running server nodes refresh via the cron).
-    SystemConfig.refresh()
+    case SystemConfig.put(SignedProfilePolicy.profile_key(), value) do
+      {:ok, _setting} ->
+        # Reflect the just-written value in THIS node's cache so the status
+        # printout below reads back the new value (running server nodes refresh
+        # via the cron).
+        SystemConfig.refresh()
 
-    IO.puts("Set custody_signed_profile_enforcement = #{value} (#{profile_label(value)}).")
-    print_custody_profile_status()
-    :ok
+        IO.puts("Set custody_signed_profile_enforcement = #{value} (#{profile_label(value)}).")
+        print_custody_profile_status()
+        :ok
+
+      {:error, reason} ->
+        IO.puts("Failed to set custody_signed_profile_enforcement = #{value}: #{inspect(reason)}")
+        {:error, reason}
+    end
   end
 
   @doc false
@@ -130,6 +146,7 @@ defmodule Loopctl.Release do
       enrolled agent keys    : #{enrolled}  (active signing keys, all tenants)
       tenants with owner key : #{owner_tenants}
       enforcement scope      : report / review-complete / verify, for ENROLLED agents only
+      bulk custody paths      : verify_all + bulk verify/mark_complete REFUSE enrolled agents under signed (bulk_signature_unsupported) — verify per-story instead
       NOT gated by this switch: Knowledge Wiki, memory, context retriever, auth, reads
     #{status_hint(code, enrolled)}\
     """)
@@ -167,6 +184,12 @@ defmodule Loopctl.Release do
 
   defp profile_label(1), do: "signed"
   defp profile_label(0), do: "bearer"
+
+  # Fail-safe for an out-of-band stored value (direct SQL, a raw SystemConfig.put/2,
+  # a future admin API): the :status diagnostic — the tool an operator reaches for
+  # to inspect a SUSPECTED bad value — must report it, not crash on it. This mirrors
+  # SignedProfilePolicy.profile/0, which fail-safes an unrecognized code to :bearer.
+  defp profile_label(other), do: "unknown(#{inspect(other)}) — treated as bearer"
 
   # Ensure AdminRepo is running for the duration of `fun`. `Ecto.Migrator.with_repo/2`
   # starts the repo if it is not already up (the eval-node case) and leaves an

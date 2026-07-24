@@ -71,6 +71,23 @@ defmodule Loopctl.ReleaseCustodyProfileTest do
       out = capture_io(fn -> Release.print_custody_profile_status() end)
       assert out =~ "INERT"
     end
+
+    test "status names the bulk-refusal footgun under signed" do
+      out = capture_io(fn -> Release.print_custody_profile_status() end)
+      assert out =~ "bulk custody paths"
+      assert out =~ "bulk_signature_unsupported"
+    end
+
+    test "status does not crash on an out-of-range stored value (fail-safe, not FunctionClauseError)" do
+      # Reachable out-of-band: direct SQL, a raw SystemConfig.put/2, a future admin
+      # API — set_custody_profile/1 guards [0,1] but the row is not otherwise pinned.
+      {:ok, _} = SystemConfig.put(SignedProfilePolicy.profile_key(), 7)
+      SystemConfig.refresh()
+
+      out = capture_io(fn -> assert Release.print_custody_profile_status() == :ok end)
+      assert out =~ "unknown"
+      assert out =~ "custody_signed_profile_enforcement=7"
+    end
   end
 
   describe "deployment counters" do
