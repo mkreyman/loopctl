@@ -883,8 +883,27 @@ defmodule Loopctl.AuditChain do
       (§8.1), so a leaf mismatch is not counted as tampering; a broken *link* is;
     * `ok` is true iff no tampering and no broken linkage was found.
 
-  This walks the chain in a bounded, tenant-scoped read; for very large chains a
-  caller may page via `list_entries/2` and fold externally.
+  ## Completeness caveat — this does NOT detect end-truncation
+
+  This verifies the INTEGRITY of the entries present in the database (tampering,
+  broken links); it is NOT a completeness proof. Deleting the newest N entries
+  leaves a self-consistent prefix, so `verify_chain` still returns `ok: true` with
+  a smaller `count`. Detecting a truncated tail requires cross-checking the
+  returned `count`/head against a signed tree size — compare `count` (or the head
+  position) against the latest `Signed Tree Head` (`AuditChain.SignedTreeHead`)
+  tree size, which is the out-of-band commitment truncation would contradict.
+
+  ## Scale
+
+  The scan is KEYSET-PAGED through the timed `Loopctl.HeavyRead` facade
+  (`@verify_chain_page_size`-row pages, `:enumeration` endpoint), NOT a single
+  unbounded `AdminRepo.all/1` over the whole chain — that would OOM and hold a
+  connection on the deliberately tiny 3-connection admin pool for a full-table
+  scan on a large tenant, the exact anti-pattern the STH rebuild
+  (`full_rebuild_root/2`) was paged to avoid. `prev_hash` linkage state is carried
+  in the accumulator ACROSS pages internally, so the fold is resumable without
+  exposing that state to callers. Paging across transactions is safe because
+  `audit_chain` is append-only and immutable (DB triggers forbid update/delete).
   """
   @spec verify_chain(Ecto.UUID.t()) :: %{
           ok: boolean(),
@@ -895,24 +914,51 @@ defmodule Loopctl.AuditChain do
           broken_links: [non_neg_integer()]
         }
   def verify_chain(tenant_id) do
-    from(e in Entry,
-      where: e.tenant_id == ^tenant_id,
-      order_by: [asc: e.chain_position]
-    )
-    |> AdminRepo.all()
-    |> Enum.reduce(
-      %{
-        ok: true,
-        count: 0,
-        verified: 0,
-        linkage_only: 0,
-        tampered: [],
-        broken_links: [],
-        prev_hash: @zero_hash
-      },
-      &verify_chain_entry/2
-    )
+    initial = %{
+      ok: true,
+      count: 0,
+      verified: 0,
+      linkage_only: 0,
+      tampered: [],
+      broken_links: [],
+      prev_hash: @zero_hash
+    }
+
+    tenant_id
+    |> verify_chain_paged(-1, initial)
     |> finalize_chain_report()
+  end
+
+  # Whole-chain verify page size. Each page is ONE bounded, tenant-scoped,
+  # statement-timeout-guarded HeavyRead statement, so no single statement's cost
+  # grows with total chain length.
+  @verify_chain_page_size 10_000
+
+  # Keyset-page the chain ascending by `chain_position`, folding each page into the
+  # accumulator. `prev_hash` linkage state lives in `acc` and threads across pages
+  # because pages are contiguous and ascending.
+  defp verify_chain_paged(tenant_id, after_pos, acc) do
+    query =
+      from(e in Entry,
+        where: e.tenant_id == ^tenant_id and e.chain_position > ^after_pos,
+        order_by: [asc: e.chain_position],
+        limit: ^@verify_chain_page_size
+      )
+
+    case HeavyRead.all(tenant_id, query, HeavyRead.opts(:enumeration)) do
+      [] ->
+        acc
+
+      entries ->
+        acc = Enum.reduce(entries, acc, &verify_chain_entry/2)
+        %Entry{chain_position: last_pos} = List.last(entries)
+
+        if length(entries) < @verify_chain_page_size do
+          acc
+        else
+          verify_chain_paged(tenant_id, last_pos, acc)
+        end
+    end
   end
 
   defp verify_chain_entry(%Entry{} = entry, acc) do

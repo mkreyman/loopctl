@@ -130,6 +130,54 @@ defmodule Loopctl.Custody.SignedProfileTest do
                )
     end
 
+    test "a bearer dispatch (no enrolled key) is rejected as :not_enrolled, not :alg_mismatch" do
+      assert {:error, :not_enrolled} =
+               SignedProfile.verify_claim(
+                 alg: "ed25519",
+                 dispatch_alg: nil,
+                 agent_pubkey: nil,
+                 tenant_id: @tenant,
+                 gate: "verify",
+                 work_item_id: @work,
+                 body: %{},
+                 capability_id: "c",
+                 claimed_at: 1,
+                 signature: <<0>>
+               )
+    end
+
+    test "a malformed body yields {:error, :malformed_body}, honoring the verify contract", %{
+      pub: pub
+    } do
+      # A map mixing an atom and a string key of the same name makes canonical_json
+      # raise; verify_claim must translate that to the error contract, not crash.
+      mixed = Map.merge(%{"k" => 1}, %{k: 2})
+
+      assert {:error, :malformed_body} =
+               SignedProfile.verify_claim(
+                 alg: "ed25519",
+                 dispatch_alg: "ed25519",
+                 agent_pubkey: pub,
+                 tenant_id: @tenant,
+                 gate: "verify",
+                 work_item_id: @work,
+                 body: mixed,
+                 capability_id: "c",
+                 claimed_at: 1,
+                 signature: <<0>>
+               )
+    end
+
+    test "claim_preimage distinguishes a nil optional field from an empty string" do
+      nil_cap = SignedProfile.claim_preimage("ed25519", @tenant, "verify", @work, %{}, nil, 1)
+      empty_cap = SignedProfile.claim_preimage("ed25519", @tenant, "verify", @work, %{}, "", 1)
+      refute nil_cap == empty_cap
+
+      nil_wi = SignedProfile.claim_preimage("ed25519", @tenant, "verify", nil, %{}, "c", 1)
+      empty_wi = SignedProfile.claim_preimage("ed25519", @tenant, "verify", "", %{}, "c", 1)
+      refute nil_wi == empty_wi
+    end
+
     test "the body is canonicalized, so key order does not affect verification", %{
       pub: pub,
       priv: priv
@@ -369,6 +417,31 @@ defmodule Loopctl.Custody.SignedProfileTest do
                  claimed_at: claimed_at,
                  signature: sig
                )
+    end
+
+    test "a malformed / wrong-length agent_pubkey is rejected at enrollment", %{tenant: tenant} do
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+      # 8 raw bytes hex-encoded → decodes to an 8-byte key, not a 32-byte Ed25519 key.
+      assert {:error, _} =
+               Dispatches.create_dispatch(tenant.id, %{
+                 role: :agent,
+                 agent_id: agent.id,
+                 agent_pubkey: Base.encode16(:crypto.strong_rand_bytes(8), case: :lower),
+                 alg: "ed25519"
+               })
+
+      # An undecodable, non-hex junk string is rejected too — never persisted raw.
+      assert {:error, _} =
+               Dispatches.create_dispatch(tenant.id, %{
+                 role: :agent,
+                 agent_id: agent.id,
+                 agent_pubkey: "notakey",
+                 alg: "ed25519"
+               })
+
+      # And nothing bogus was recorded on the transparency log.
+      assert Dispatches.enrolled_agent_keys(tenant.id) == []
     end
 
     test "the both-or-neither DB CHECK rejects a half-enrolled dispatch", %{tenant: tenant} do

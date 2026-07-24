@@ -98,14 +98,39 @@ defmodule Loopctl.Custody.SignedProfile do
         {:error, :malformed_conditions}
 
       true ->
-        preimage = attestation_preimage(alg, tenant_id, agent_pubkey, lineage_path, conditions)
-
-        if verify_sig(alg, preimage, signature, authorizer_pubkey) do
-          :ok
-        else
-          {:error, :invalid_signature}
-        end
+        verify_attestation_sig(
+          alg,
+          tenant_id,
+          agent_pubkey,
+          lineage_path,
+          conditions,
+          signature,
+          authorizer_pubkey
+        )
     end
+  end
+
+  # `attestation_preimage/5` calls `canonical_json/1` on `lineage_path`, which
+  # RAISES on a malformed term. Rescue it so this pure verify function always
+  # honours its `:ok | {:error, atom()}` contract.
+  defp verify_attestation_sig(
+         alg,
+         tenant_id,
+         agent_pubkey,
+         lineage_path,
+         conditions,
+         signature,
+         authorizer_pubkey
+       ) do
+    preimage = attestation_preimage(alg, tenant_id, agent_pubkey, lineage_path, conditions)
+
+    if verify_sig(alg, preimage, signature, authorizer_pubkey) do
+      :ok
+    else
+      {:error, :invalid_signature}
+    end
+  rescue
+    ArgumentError -> {:error, :malformed_body}
   end
 
   # ── Custody-claim signature (LCP-1 §9.3) ──────────────────────────────────
@@ -113,23 +138,37 @@ defmodule Loopctl.Custody.SignedProfile do
   @doc """
   The claim preimage an agent signs when submitting a custody claim.
 
-  `preimage = domain || LP(alg) || LP(tenant_id) || LP(gate) || LP(work_item_id) ||
-              LP(canonical_json(body)) || LP(capability_id) || uint64_be(claimed_at)`
+  `preimage = domain || LP(alg) || LP(tenant_id) || LP(gate) || present(work_item_id) ||
+              LP(canonical_json(body)) || present(capability_id) || uint64_be(claimed_at)`
+
+  The OPTIONAL fields `work_item_id` and `capability_id` carry an explicit presence
+  tag (`present/1`, mirroring `LeafHash`): `0x00` for a nil/absent value, `0x01 ||
+  LP(x)` for a present value. Mapping a nil to `LP("")` instead — as a naive `||
+  ""` would — makes a nil and a literal empty string collapse to identical bytes,
+  reintroducing the field-boundary substitution ambiguity length-prefixing exists
+  to prevent.
 
   `body` is canonicalized with the SAME `canonical_json/1` used for the audit
   leaf, so the signed bytes are stable across map key order and machines.
   """
-  @spec claim_preimage(String.t(), binary(), String.t(), binary(), map(), binary(), integer()) ::
-          binary()
+  @spec claim_preimage(
+          String.t(),
+          binary(),
+          String.t(),
+          binary() | nil,
+          map(),
+          binary() | nil,
+          integer()
+        ) :: binary()
   def claim_preimage(alg, tenant_id, gate, work_item_id, body, capability_id, claimed_at)
       when is_binary(alg) and is_binary(gate) and is_map(body) and is_integer(claimed_at) do
     lp(@claim_domain) <>
       lp(alg) <>
       lp(to_string(tenant_id)) <>
       lp(gate) <>
-      lp(to_string(work_item_id)) <>
+      present(work_item_id && to_string(work_item_id)) <>
       lp(LeafHash.canonical_json(body)) <>
-      lp(to_string(capability_id || "")) <>
+      present(capability_id && to_string(capability_id)) <>
       <<claimed_at::unsigned-big-integer-size(64)>>
   end
 
@@ -150,14 +189,23 @@ defmodule Loopctl.Custody.SignedProfile do
     agent_pubkey = Keyword.fetch!(opts, :agent_pubkey)
     signature = Keyword.fetch!(opts, :signature)
 
+    # `is_nil(agent_pubkey)` is checked BEFORE the alg comparison so an un-enrolled
+    # (bearer) dispatch surfaces the accurate `:not_enrolled` reason. If the alg
+    # check came first, a bearer dispatch (both `dispatch_alg` and `agent_pubkey`
+    # nil, per the both-or-neither DB CHECK) would fall out as `:alg_mismatch` and
+    # the `:not_enrolled` clause would be dead.
     cond do
       not known_alg?(alg) -> {:error, :unknown_alg}
-      alg != dispatch_alg -> {:error, :alg_mismatch}
       is_nil(agent_pubkey) -> {:error, :not_enrolled}
+      alg != dispatch_alg -> {:error, :alg_mismatch}
       true -> verify_claim_sig(opts, alg, agent_pubkey, signature)
     end
   end
 
+  # `claim_preimage/7` calls `canonical_json/1`, which RAISES on a malformed body
+  # (a map mixing atom and string keys of the same name). Rescue it here so this
+  # pure verify function always honours its `:ok | {:error, atom()}` contract
+  # rather than escaping as an ArgumentError to internal Elixir callers.
   defp verify_claim_sig(opts, alg, agent_pubkey, signature) do
     preimage =
       claim_preimage(
@@ -175,6 +223,8 @@ defmodule Loopctl.Custody.SignedProfile do
     else
       {:error, :invalid_signature}
     end
+  rescue
+    ArgumentError -> {:error, :malformed_body}
   end
 
   # ── Conditions grammar (LCP-1 §9.2) ───────────────────────────────────────
@@ -278,4 +328,10 @@ defmodule Loopctl.Custody.SignedProfile do
 
   defp lp(bin) when is_binary(bin),
     do: <<byte_size(bin)::unsigned-big-integer-size(64), bin::binary>>
+
+  # Presence tag for an optional field (mirrors `LeafHash.present/1`): 0x00 for an
+  # absent (nil) value, 0x01 || LP(x) for a present value. Distinguishes a nil from
+  # a present-but-empty string, which `LP("")` alone cannot.
+  defp present(nil), do: <<0>>
+  defp present(bin) when is_binary(bin), do: <<1>> <> lp(bin)
 end

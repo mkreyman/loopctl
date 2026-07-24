@@ -15,6 +15,7 @@ defmodule Loopctl.Dispatches do
   alias Loopctl.AuditChain
   alias Loopctl.Auth
   alias Loopctl.Dispatches.Dispatch
+  alias Loopctl.HeavyRead
 
   @max_expires_seconds 14_400
   @default_expires_seconds 3_600
@@ -76,14 +77,22 @@ defmodule Loopctl.Dispatches do
     }
   end
 
-  # Accept raw 32-byte keys as-is and hex-encoded keys from JSON callers.
+  # Accept either a hex-encoded key (the JSON API form) or raw key bytes.
+  #
+  # Hex decoding is tried FIRST so a hex string is always decoded to its raw bytes
+  # rather than mis-read as raw ASCII — a 32-char hex string (a 16-byte key) would
+  # otherwise match a raw-binary clause and persist as 32 ASCII bytes. A value that
+  # is not valid hex is treated as raw key bytes as-is. Either way,
+  # `Dispatch.validate_signed_profile/1` (and the DB CHECK) enforce the 32-byte
+  # Ed25519 length, so a malformed, wrong-length, or undecodable key is a clean
+  # validation error at enrollment rather than a silent persist that only fails at
+  # signature-verify time.
   defp normalize_pubkey(nil), do: nil
-  defp normalize_pubkey(<<_::binary-size(32)>> = raw), do: raw
 
-  defp normalize_pubkey(hex) when is_binary(hex) do
-    case Base.decode16(hex, case: :mixed) do
+  defp normalize_pubkey(value) when is_binary(value) do
+    case Base.decode16(value, case: :mixed) do
       {:ok, raw} -> raw
-      :error -> hex
+      :error -> value
     end
   end
 
@@ -169,6 +178,14 @@ defmodule Loopctl.Dispatches do
         # audit entry. An operator that mints an agent key therefore cannot do so
         # invisibly or retroactively — a tenant can enumerate every enrolled key
         # from the chain alone. The action names the enrollment so it is filterable.
+        #
+        # SCOPE: this slice implements the §9.1.1 TRANSPARENCY control only. The
+        # §9.2 owner-attestation check (`SignedProfile.verify_attestation/1`, which
+        # proves the agent authorized the key) is a spec primitive that is NOT wired
+        # into this enrollment path — an operator-supplied `agent_pubkey` is accepted
+        # unattested and is only detectable post-hoc via the transparency log above.
+        # Requiring an attestation at enrollment is deliberate follow-up work; do not
+        # read the absence of that check here as an accidental gap.
         {action, payload} =
           if dispatch.agent_pubkey do
             {"dispatch_created_with_agent_key",
@@ -226,11 +243,19 @@ defmodule Loopctl.Dispatches do
   """
   @spec enrolled_agent_keys(Ecto.UUID.t()) :: [map()]
   def enrolled_agent_keys(tenant_id) do
-    from(e in AuditChain.Entry,
-      where: e.tenant_id == ^tenant_id and e.action == "dispatch_created_with_agent_key",
-      order_by: [desc: e.chain_position]
-    )
-    |> AdminRepo.all()
+    query =
+      from(e in AuditChain.Entry,
+        where: e.tenant_id == ^tenant_id and e.action == "dispatch_created_with_agent_key",
+        order_by: [desc: e.chain_position]
+      )
+
+    # Route the whole-chain enumeration through the timed `HeavyRead` facade (the
+    # explicit `tenant_id` predicate satisfies its structural guard) rather than the
+    # tiny 3-connection AdminRepo pool, consistent with how `AuditChain` routes its
+    # other audit-chain enumeration reads. The result set is bounded by the tenant's
+    # enrolled-key count, but the read still belongs off the admin pool.
+    tenant_id
+    |> HeavyRead.all(query, HeavyRead.opts(:enumeration))
     |> Enum.map(fn e ->
       %{
         agent_pubkey_hex: e.payload["agent_pubkey"],
