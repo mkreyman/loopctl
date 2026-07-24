@@ -4,8 +4,13 @@ defmodule Loopctl.SystemConfig do
   (timeout/retry budgets) that were previously hardcoded module attributes.
 
   Changing a value is now an `UPDATE` of a `system_configs` row — no code change,
-  no redeploy. The change is picked up immediately on write (`put/2`), and by any
-  other node within a minute via the `SystemConfigRefreshWorker` Oban cron.
+  no redeploy. The change is picked up immediately on the WRITING node (`put/2`).
+  Other nodes refresh their node-local cache from the DB asynchronously via the
+  `SystemConfigRefreshWorker` Oban cron. That cron enqueues ONE job per tick
+  CLUSTER-WIDE (run by a single node), so "within a minute" holds for a
+  SINGLE-NODE deployment; on a MULTI-NODE cluster a given node's adoption latency
+  is unbounded (it may lag many ticks). Callers that need a per-node propagation
+  guarantee must not assume ~60s fleet-wide — confirm per node.
 
   ## Hot-path read
 
@@ -19,9 +24,12 @@ defmodule Loopctl.SystemConfig do
 
   The cache is (re)loaded from the DB via `Loopctl.AdminRepo`:
 
-    * once at boot (`Loopctl.Application.start/2`, guarded), and
-    * every minute by `Loopctl.Workers.SystemConfigRefreshWorker`, and
-    * immediately for a single key on `put/2`.
+    * once at boot (`Loopctl.Application.start/2`, guarded) — this is what primes
+      EVERY node, and
+    * every cron tick by `Loopctl.Workers.SystemConfigRefreshWorker` — but that
+      job runs on ONE node per tick, so on a multi-node cluster a given node's
+      refresh cadence is not bounded to one minute, and
+    * immediately for a single key on `put/2` (the writing node only).
 
   `refresh/0` is `try/rescue`-wrapped so a DB blip logs and no-ops — it never
   crashes boot or the cron worker; the previously-cached values simply persist.

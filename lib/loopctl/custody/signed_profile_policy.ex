@@ -67,6 +67,10 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
 
   @profile_key "custody_signed_profile_enforcement"
 
+  @doc "The `SystemConfig` integer key backing `profile/0` (0=bearer, 1=signed)."
+  @spec profile_key() :: String.t()
+  def profile_key, do: @profile_key
+
   # Bounded freshness window for a signed claim's agent-controlled `claimed_at`
   # (§9.3 delegates timeliness to the caller). A valid signature binds `claimed_at`,
   # so enforcing it against the server clock stops a captured claim signature from
@@ -110,8 +114,12 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
   `claim_params` is the caller-supplied `claim` object from the request body:
   `%{"alg" => ..., "claim_sig" => <hex>, "claimed_at" => <int>}` (string keys).
 
-    * `:bearer` profile → always `:ok` (signatures ignored).
-    * `:signed`, caller NOT enrolled → `:ok` (gradual rollout).
+  On success the resolved enrolled dispatch is returned (`{:ok, dispatch}`) so the
+  caller can persist the verified claim WITHOUT re-querying it; waived paths
+  return `{:ok, nil}` (there is no dispatch to record).
+
+    * `:bearer` profile → always `{:ok, nil}` (signatures ignored).
+    * `:signed`, caller NOT enrolled → `{:ok, nil}` (gradual rollout).
     * `:signed`, caller enrolled, no/blank signature → `{:error, :claim_signature_required}`.
     * `:signed`, caller enrolled, signature present but the claim object is malformed
       (bad `alg`/`claimed_at` type, undecodable `claim_sig`) → `{:error, :malformed_claim}`.
@@ -120,7 +128,7 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
     * `:signed`, caller enrolled, signature verifies but the attestation's §9.2
       condition (`gate=`/`expires<`) is unmet → `{:error, :claim_condition_unmet}`.
     * `:signed`, caller enrolled, signature present and well-formed → verifies it
-      (§9.3); `:ok` or `{:error, :invalid_claim_signature}`.
+      (§9.3); `{:ok, dispatch}` or `{:error, :invalid_claim_signature}`.
   """
   @spec verify_request(
           :bearer | :signed,
@@ -130,11 +138,11 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
           binary(),
           binary() | nil,
           map()
-        ) :: :ok | {:error, atom()}
+        ) :: {:ok, map() | nil} | {:error, atom()}
   # `profile` is passed in (the plug supplies `profile/0`) so the enforcement logic
   # is exercised in async tests without mutating VM-global config.
   def verify_request(:bearer, _tenant_id, _api_key_id, _gate, _work_item_id, _cap, _claim),
-    do: :ok
+    do: {:ok, nil}
 
   def verify_request(
         :signed,
@@ -158,7 +166,7 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
         if Dispatches.agent_has_enrolled_key?(tenant_id, agent_id) do
           {:error, :agent_enrollment_required}
         else
-          :ok
+          {:ok, nil}
         end
 
       _no_dispatch ->
@@ -166,7 +174,7 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
         # gradual-rollout waiver. Bounded by the role gate and the lineage self-*
         # checks, but NOT cryptographically attributable — §9.1.1 transparency is the
         # only guarantee (DETECTION, not prevention) until every key is dispatch-minted.
-        :ok
+        {:ok, nil}
     end
   end
 
@@ -223,8 +231,13 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
          :ok <- check_claim_fresh(claimed_at, gate, work_item_id, dispatch),
          :ok <- check_attestation_conditions(dispatch, gate) do
       # Final custody-separation check: the signing key must differ from the
-      # implementer's enrolled key (see check_pubkey_separation/4).
-      check_pubkey_separation(tenant_id, dispatch, gate, work_item_id)
+      # implementer's enrolled key (see check_pubkey_separation/4). On success
+      # return the resolved dispatch so the plug can stash the verified claim
+      # without a second `dispatch_for_api_key` query.
+      case check_pubkey_separation(tenant_id, dispatch, gate, work_item_id) do
+        :ok -> {:ok, dispatch}
+        {:error, _reason} = err -> err
+      end
     else
       # The `require_sig`/`require_present`/`require_int`/`decode_sig` guards return
       # BEFORE `normalize_verify_result`/`check_claim_fresh`/`check_attestation_conditions`
