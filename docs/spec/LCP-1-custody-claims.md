@@ -623,7 +623,7 @@ NOT treat a `bearer`-profile custody record as evidence against the operator.
 
 §7.5 clause three (a declared-but-unresolvable implementer dispatch fails closed at all
 three gates) is **satisfied**. `verify` satisfied it via §7.4.1 clause 1; `report` and
-`review_complete` were aligned to it in `lineage_conflict?/2`, and the alignment is pinned
+`review_complete` were aligned to it in `lineage_status/2`, and the alignment is pinned
 by the executable conformance suite (`test/loopctl/spec/lcp1_conformance_test.exs`). In the
 reference implementation the reachable form of this input is a dispatch id belonging to a
 different tenant (§7.5), so the clause doubles as a cross-tenant isolation check.

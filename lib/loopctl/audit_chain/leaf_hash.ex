@@ -129,17 +129,33 @@ defmodule Loopctl.AuditChain.LeafHash do
        }) do
     data =
       lp(@domain) <>
-        lp(to_string(tenant_id)) <>
+        lp(canonical_uuid(tenant_id)) <>
         <<position::unsigned-big-integer-size(64)>> <>
         lp(prev_hash) <>
         lp(to_string(action)) <>
         lp(canonical_json(actor_lineage)) <>
         present(entity_type && to_string(entity_type)) <>
-        present(entity_id) <>
+        present(entity_id && canonical_uuid(entity_id)) <>
         lp(canonical_json(payload)) <>
         lp(DateTime.to_iso8601(inserted_at))
 
     :crypto.hash(:sha256, data)
+  end
+
+  # Canonicalize a UUID to its stored 36-char lowercase string form (LCP-1 §8.5).
+  # The write-time hash is computed from the RAW attrs a caller passed
+  # (`build_entry_attrs`), which may be a non-canonical string (uppercase) or a
+  # 16-byte binary; the recompute-time hash reads the value back through
+  # `Ecto.UUID`, which stores the canonical lowercase string. Routing both sides
+  # through `Ecto.UUID.cast/1` makes the preimage identical regardless of caller
+  # input form, so a non-canonical UUID can no longer produce a FALSE tampering
+  # positive. A value `Ecto.UUID` cannot cast falls back to `to_string/1`,
+  # preserving prior behaviour for non-UUID inputs.
+  defp canonical_uuid(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, uuid} -> uuid
+      :error -> to_string(value)
+    end
   end
 
   # Length-prefixed encoding: uint64 big-endian length, then the bytes.

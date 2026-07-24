@@ -43,7 +43,12 @@ defmodule LoopctlWeb.WellKnownController do
     # separate, stronger claim about the historical chain that this field does not
     # make.
     custody_profile: "bearer",
-    custody_spec: "#{@base_url}/spec/LCP-1",
+    # Point at a real, served route. The LCP-1 profile is documented on the
+    # chain-of-custody wiki article (a seeded system article backed by the
+    # /wiki/:slug route), like the sibling *_url fields above. There is no
+    # /spec/* route or static file, so advertising /spec/LCP-1 here would be a
+    # 404 dead link in a security-critical discovery document.
+    custody_spec: "#{@base_url}/wiki/chain-of-custody",
     custody_gates: ["report", "review_complete", "verify"],
     audit_leaf_hash_version: Loopctl.AuditChain.LeafHash.current_version(),
     discovery_bootstrap_url: "#{@base_url}/wiki/agent-bootstrap",

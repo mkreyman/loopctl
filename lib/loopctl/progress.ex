@@ -1091,13 +1091,19 @@ defmodule Loopctl.Progress do
   Returns `:ok` when `orchestrator_agent_id` is permitted to verify `story`, or
   `{:error, :self_verify_blocked}` when the verifier shares dispatch lineage /
   agent identity with the implementer. A nil `orchestrator_agent_id` is treated
-  as an untrusted identity and is always blocked.
+  as an untrusted identity and is always blocked. A custody-orphaned story
+  returns `{:error, :missing_assigned_agent}`, and a story whose declared
+  implementer dispatch cannot be resolved fails CLOSED with
+  `{:error, :unresolvable_dispatch_lineage}` (passed through from
+  `verify_lineage_separated/4`).
 
   Exposed so `Loopctl.BulkOperations` enforces the SAME self-verify invariant as
   the single-story `verify_story/4` path — otherwise bulk verify is a chain-of-custody bypass.
   """
   @spec ensure_verify_allowed(Story.t(), Ecto.UUID.t() | nil) ::
-          :ok | {:error, :self_verify_blocked | :missing_assigned_agent}
+          :ok
+          | {:error,
+             :self_verify_blocked | :missing_assigned_agent | :unresolvable_dispatch_lineage}
   def ensure_verify_allowed(story, orchestrator_agent_id) do
     case validate_not_self_verify(story, orchestrator_agent_id) do
       {:ok, _} -> :ok

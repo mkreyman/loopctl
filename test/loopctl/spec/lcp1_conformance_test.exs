@@ -12,8 +12,8 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
   dispatch must reject at `report` and `review_complete`, not fall through to
   agent-id equality) were the one place the spec and the code diverged. They were
   briefly tagged `:lcp1_gap` while the fix landed; the fix is in
-  `lineage_conflict?/3`, so the tests now run in the default suite. They are named
-  `§7.5 clause 3 …` below.
+  `lineage_status/2` (progress.ex), so the tests now run in the default suite. They
+  are named `§7.5 clause 3 …` below.
   """
   use Loopctl.DataCase, async: true
 

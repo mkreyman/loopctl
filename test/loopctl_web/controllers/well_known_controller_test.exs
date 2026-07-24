@@ -41,7 +41,9 @@ defmodule LoopctlWeb.WellKnownControllerTest do
       # LCP-1 §2.1: a verifier keys off these; loopctl accepts unsigned claims so
       # the profile is `bearer`.
       assert body["custody_profile"] == "bearer"
-      assert body["custody_spec"] =~ "loopctl.com/spec/LCP-1"
+      # custody_spec points at a SERVED /wiki/* route (like the sibling *_url
+      # fields), not a /spec/* path that has no route and would 404.
+      assert body["custody_spec"] =~ "loopctl.com/wiki/chain-of-custody"
       assert body["custody_gates"] == ["report", "review_complete", "verify"]
       # LCP-1 §8.4: advertise the leaf-hash version currently being WRITTEN (v2),
       # single-sourced from the writer so it cannot drift.

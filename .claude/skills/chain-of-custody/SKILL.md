@@ -81,7 +81,7 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
   runs when BOTH `implementer_dispatch_id` and `verifier_dispatch_id` are set
   (`progress.ex:1702-1706`), decided by `verify_lineage_separated/4` (`progress.ex:1725-1745`).
   An EMPTY lineage on either side (what an unloadable dispatch yields,
-  `get_dispatch_lineage/2` `progress.ex:1747-1752`) fails **CLOSED**, and the `assigned_agent_id`
+  `get_dispatch_lineage/2` `progress.ex:1755-1760`) fails **CLOSED**, and the `assigned_agent_id`
   equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
   `progress.ex:363-397`); that write is result-checked, and a failure flags `verifier_needed` plus a
@@ -90,7 +90,7 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
 - **report** — `validate_not_self_report/3` `progress.ex:2210-2235`. `nil` caller blocked
   (`progress.ex:2207`); a story with nil `assigned_agent_id` AND nil `implementer_dispatch_id` is
   **custody-unattributed** and fails closed with `:missing_assigned_agent` + a
-  `custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2248-2251`) — it used to
+  `custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2254-2257`) — it used to
   pass vacuously; then the reporter's lineage vs the implementer's (`lineage_status/2`,
   `progress.ex:2280-2298`) — tri-state `:ok | :conflict | :unresolvable`, where an unresolvable
   implementer dispatch fails CLOSED with `unresolvable_dispatch_lineage` (LCP-1 §7.5); then plain
