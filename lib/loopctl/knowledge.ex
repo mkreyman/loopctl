@@ -4802,7 +4802,12 @@ defmodule Loopctl.Knowledge do
     query =
       suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis, opts)
 
-    suggestions = HeavyRead.all(tenant_id, query, heavy_read_opts(:suggested_links))
+    suggestions =
+      HeavyRead.all(
+        tenant_id,
+        query,
+        suggested_links_read_opts(suggestion_candidate_pool(limit), opts)
+      )
 
     returned = length(suggestions)
 
@@ -4967,7 +4972,7 @@ defmodule Loopctl.Knowledge do
         }
       )
 
-    case HeavyRead.one(tenant_id, probe, heavy_read_opts(:suggested_links)) do
+    case HeavyRead.one(tenant_id, probe, suggested_links_read_opts(pool, opts)) do
       %{ann_candidates: a, above_threshold: t} -> {a || 0, t || 0}
       nil -> {0, 0}
     end
@@ -5002,6 +5007,35 @@ defmodule Loopctl.Knowledge do
   # (Knowledge / Audit). Public-but-`@doc false` so the slow-query telemetry test can
   # exercise the real opts-building path (incl. the override branch) through this name.
   def heavy_read_opts(endpoint), do: HeavyRead.opts(endpoint)
+
+  # Per-read opts for the suggested-links side-table ANN (#508 review). When the read
+  # hits the dimension-tagged side table (`reads_side_table?` threaded from
+  # `suggest_links_with_meta/3`), the inner ANN over-fetches to
+  # `side_table_inner_pool(pool)` to offset the status/visibility trim the per-dimension
+  # partial index cannot carry (`live_denorm` mirrors only `status <> 'superseded'`,
+  # not draft/archived or other-agents' private). But an HNSW scan visits only
+  # ~`ef_search` nodes regardless of LIMIT, so that over-fetch is INERT unless
+  # `ef_search` is widened in lockstep — otherwise the inner returns ~ef_search rows and
+  # the outer status/visibility/anti-join trim yields FEWER published+visible links than
+  # the legacy `articles.embedding` path did (the exact silent under-return #508 fixed,
+  # on the entire non-1536-dim tenant class), and the under-fill probe counts over the
+  # same starved set. Mirrors `search_semantic_side_table/7` (`hnsw_ef_search` raise) and
+  # `VectorSearch.nearest/4`'s `nearest_heavy_read_opts/2`. On the legacy path there is no
+  # inner over-fetch, so the base opts stand. Piggybacks the SET LOCAL transaction every
+  # heavy read already runs in (US-27.13) — no new pool-starvation risk.
+  defp suggested_links_read_opts(pool, opts) do
+    base = heavy_read_opts(:suggested_links)
+
+    if Keyword.get(opts, :reads_side_table, false) do
+      Keyword.put(
+        base,
+        :hnsw_ef_search,
+        VectorSearch.side_table_ef_search(VectorSearch.side_table_inner_pool(pool))
+      )
+    else
+      base
+    end
+  end
 
   # Builds the suggested-links candidate query (returned, not executed) so a test can
   # assert its SQL shape. Public-but-`@doc false` for that structural regression guard.
