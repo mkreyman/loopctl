@@ -33,6 +33,7 @@ defmodule Loopctl.Coordination do
   alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge
   alias Loopctl.Projects
+  alias Loopctl.Projects.Project
   alias Loopctl.Security.SecretDenylist
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Story
@@ -789,7 +790,7 @@ defmodule Loopctl.Coordination do
   so a cross-project write attempt reveals no "not a member" vs "not your tenant"
   vs "does not exist" oracle.
 
-  Two ways to be authorized:
+  Three ways to be authorized:
 
     1. **Membership** — the agent is assigned to at least one story in the project
        (`stories.assigned_agent_id`, scoped by an EXPLICIT `tenant_id` filter on
@@ -808,6 +809,22 @@ defmodule Loopctl.Coordination do
        member via story assignment — the gate is enforced for every role below
        `:user`.
 
+    3. **`:kb`-kind scope in the caller's own tenant** (issue #517) — a KB scope
+       carries NO chain-of-custody surface: `RequireWorkProject` bars work
+       attachment, so a kb-scope can NEVER have a story, and membership-by-story
+       (path 1) is therefore structurally unsatisfiable for it. Without this path an
+       agent-rooted (KB-tier) tenant — which can create a kb-scope via
+       `create_kb_scope` (#331/#505) but not a work project — had NO channel it
+       could both create AND post to, making the coordination bus (its intended
+       handoff home) unreachable for a new repo. The membership gate exists to
+       isolate CUSTODY-sensitive work-project channels; a kb-scope is a shared,
+       agent-native knowledge partition with no custody weight, so any agent in the
+       OWNING tenant may write its channel. This is NOT a cross-tenant hole:
+       `kb_scope?/2` re-applies the `tenant_id` predicate (as does the `post/4`
+       `get_project/2` guard upstream), so a kb-scope in ANOTHER tenant never
+       reaches here — it is already `:not_found`. Consistent with the #331/#505
+       carve-out that made `create_kb_scope` itself agent-role.
+
   ## Coupling (keep SHARED)
 
   This is the single project-scoped-write predicate for the coordination surface.
@@ -819,12 +836,26 @@ defmodule Loopctl.Coordination do
   @spec project_writable_by_agent(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), atom()) ::
           :ok | {:error, :not_found}
   def project_writable_by_agent(tenant_id, agent_id, project_id, role) do
-    if Role.role_at_least?(role, :user) or
-         agent_member_of_project?(tenant_id, agent_id, project_id) do
-      :ok
-    else
-      {:error, :not_found}
+    cond do
+      Role.role_at_least?(role, :user) -> :ok
+      kb_scope?(tenant_id, project_id) -> :ok
+      agent_member_of_project?(tenant_id, agent_id, project_id) -> :ok
+      true -> {:error, :not_found}
     end
+  end
+
+  # Issue #517: a `:kb`-kind scope OWNED by the caller's tenant is a shared,
+  # custody-free knowledge partition, writable by any agent in that tenant. The
+  # `tenant_id` predicate is what keeps this tenant-safe — a kb-scope in another
+  # tenant never matches. `exists?` compiles to `SELECT 1 ... LIMIT 1` and seeks the
+  # `projects` primary key, so it never materializes a row. Like the sibling
+  # `agent_member_of_project?/3`, `project_id` is assumed already validated by the
+  # upstream `get_project/2`/`get_post/2` chokepoint every caller runs first (a
+  # malformed id is `:not_found` there, long before it reaches this predicate).
+  defp kb_scope?(tenant_id, project_id) do
+    Project
+    |> where([p], p.id == ^project_id and p.tenant_id == ^tenant_id and p.kind == :kb)
+    |> AdminRepo.exists?()
   end
 
   # Membership derivation (US-40.D3): the agent is assigned to at least one story

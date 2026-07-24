@@ -953,10 +953,12 @@ defmodule Loopctl.Fixtures do
           {tid, attrs}
       end
 
-    data = build(:project, attrs)
+    # `kind` is set on the struct, never cast (mirrors Projects.create_project/3) —
+    # so a `kind: :kb` attr produces a real KB scope for coordination/tier tests.
+    {kind, data} = Map.pop(build(:project, attrs), :kind, :work)
 
     changeset =
-      %Project{tenant_id: tenant_id}
+      %Project{tenant_id: tenant_id, kind: kind}
       |> Project.create_changeset(data)
 
     AdminRepo.insert!(changeset)

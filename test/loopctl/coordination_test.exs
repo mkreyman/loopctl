@@ -2246,6 +2246,43 @@ defmodule Loopctl.CoordinationTest do
 
       assert :ok = Coordination.project_writable_by_agent(tenant.id, agent_id, project.id, :user)
     end
+
+    test "issue #517: an agent may write a :kb-kind scope in its own tenant without story membership" do
+      tenant = fixture(:tenant)
+      kb_scope = fixture(:project, %{tenant_id: tenant.id, kind: :kb})
+      # A brand-new agent with NO story assignment anywhere — a kb-scope can never
+      # carry a story, so path-1 membership is structurally unsatisfiable for it.
+      agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      assert :ok =
+               Coordination.project_writable_by_agent(tenant.id, agent_id, kb_scope.id, :agent)
+    end
+
+    test "issue #517: the :kb allowance does NOT cross tenants" do
+      owner = fixture(:tenant)
+      kb_scope = fixture(:project, %{tenant_id: owner.id, kind: :kb})
+
+      other = fixture(:tenant)
+      other_agent = fixture(:agent, %{tenant_id: other.id}).id
+
+      # Asked under the OTHER tenant, the kb-scope is not theirs → not writable.
+      assert {:error, :not_found} =
+               Coordination.project_writable_by_agent(
+                 other.id,
+                 other_agent,
+                 kb_scope.id,
+                 :agent
+               )
+    end
+
+    test "issue #517: a :work project still requires membership (kb carve-out is kind-scoped)" do
+      tenant = fixture(:tenant)
+      work = fixture(:project, %{tenant_id: tenant.id, kind: :work})
+      stranger = fixture(:agent, %{tenant_id: tenant.id}).id
+
+      assert {:error, :not_found} =
+               Coordination.project_writable_by_agent(tenant.id, stranger, work.id, :agent)
+    end
   end
 
   describe "delete_post/5" do
