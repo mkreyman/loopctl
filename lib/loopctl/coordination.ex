@@ -472,8 +472,8 @@ defmodule Loopctl.Coordination do
 
   AC-40.D3.4 requires that any residual hole left by choosing the story-assignment
   membership model (rather than a full, non-self-grantable membership relation) be
-  a DELIBERATE, documented sign-off — never a silent no-op. Two residuals are
-  accepted here, both consciously, both observable:
+  a DELIBERATE, documented sign-off — never a silent no-op. Three residuals are
+  accepted here, all consciously:
 
     1. **Membership is SELF-GRANTABLE via the claim path.** `assigned_agent_id` is
        set by `Progress.claim_story/3`, and claiming is self-service for the
@@ -511,6 +511,30 @@ defmodule Loopctl.Coordination do
        write access.) These denials all collapse to the same oracle-safe 422, so they
        are unobservable to the caller — accepted under the default-deny decision-2
        model and flagged here as a heads-up for the US-40.B1 claim/release coupling.
+
+    3. **A `:kb`-kind scope is tenant-wide-writable by ANY agent (issue #517).**
+       `project_writable_by_agent/4` grants the write when the target is a
+       `:kb`-kind project in the caller's own tenant, WITHOUT a per-project
+       membership check (see path 3 in that function's moduledoc). So in a
+       multi-agent tenant an `:agent` compromised on repo-C can post into a
+       kb-scope channel that auto-injects (via the SessionStart preview) into a
+       peer agent's session working that kb-scope — the intra-tenant, cross-scope
+       injection surface US-40.D3's membership gate closes for WORK projects. This
+       is a DELIBERATE accepted residual, not an oversight: (a) a kb-scope carries
+       NO chain-of-custody surface (`RequireWorkProject` bars work attachment, so
+       it can never hold a story), so nothing custody-critical is exposed; (b) the
+       blast radius is bounded to a single tenant (the `tenant_id` predicate in
+       `kb_scope?/2` blocks cross-tenant reach) and, per post, to the 512-byte
+       SessionStart preview (`@preview_bytes`); and (c) it mirrors the #331/#505
+       trust unit that already made `create_kb_scope` and all agent-role KB
+       curation tenant-wide — a kb-scope is a shared, agent-native knowledge
+       partition whose whole point is any-agent collaboration, so gating its
+       channel by story membership (structurally unsatisfiable — see (a)) would
+       leave an agent-rooted KB-tier tenant with NO writable coordination bus at
+       all. The compensating control is the same as decision 1's: per-project /
+       per-dispatch agent keys under Chain of Custody v2. Registered here so the
+       tenant-wide kb-channel writability is a signed-off decision, not a silent
+       reopening of the D3 injection vector for `:kb` scopes.
 
   ## Coupling (US-40.B1 / US-40.E1)
 
@@ -836,10 +860,16 @@ defmodule Loopctl.Coordination do
   @spec project_writable_by_agent(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), atom()) ::
           :ok | {:error, :not_found}
   def project_writable_by_agent(tenant_id, agent_id, project_id, role) do
+    # Clause order is a hot-path optimization, NOT a semantic one: kb_scope? and
+    # agent_member_of_project? are mutually exclusive (a kb-scope structurally has
+    # no stories, so it can never satisfy membership), so either order yields the
+    # same verdict. Membership is checked FIRST because the dominant write is an
+    # agent acting on a WORK project it is a member of — that resolves in a single
+    # query, and the always-false kb_scope? probe is only paid on the rare kb path.
     cond do
       Role.role_at_least?(role, :user) -> :ok
-      kb_scope?(tenant_id, project_id) -> :ok
       agent_member_of_project?(tenant_id, agent_id, project_id) -> :ok
+      kb_scope?(tenant_id, project_id) -> :ok
       true -> {:error, :not_found}
     end
   end
@@ -852,6 +882,16 @@ defmodule Loopctl.Coordination do
   # `agent_member_of_project?/3`, `project_id` is assumed already validated by the
   # upstream `get_project/2`/`get_post/2` chokepoint every caller runs first (a
   # malformed id is `:not_found` there, long before it reaches this predicate).
+  #
+  # Lifecycle: this probe matches on `(id, tenant_id, kind)` only and DELIBERATELY
+  # does not gate on `projects.status`, so an ARCHIVED kb-scope (`archive_kb_scope`)
+  # stays writable. That is the CONSISTENT choice, not an oversight: the coordination
+  # write path is status-agnostic for work projects too (a member may post to an
+  # archived work project — `get_project/2` returns archived rows and no caller
+  # status-checks), so status-gating only the kb path would be a lone inconsistency.
+  # A tenant that wants to freeze a channel deletes/expires its posts; a blanket
+  # "reject writes to archived scopes" gate (both kinds) is a separate, deliberate
+  # product decision left out of the #517 carve-out.
   defp kb_scope?(tenant_id, project_id) do
     Project
     |> where([p], p.id == ^project_id and p.tenant_id == ^tenant_id and p.kind == :kb)
