@@ -5,6 +5,37 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.60.0 — 2026-07-24 (LCP-1 signed custody profile — §9)
+
+### Added
+
+- **`register_custody_owner_key`** (user) — register/rotate the tenant custody
+  OWNER key (LCP-1 §9.2), the root of trust for agent-key enrollment. Private half
+  stays with the owner; human-anchored.
+- **`list_enrolled_agent_keys`** (agent) — LCP-1 §9.1.1 transparency: the enrolled
+  agent-key set reconstructed from the tamper-evident audit chain, keyset-paged.
+- **`custody_generate_keypair`** (local) — generate an Ed25519 keypair locally; the
+  private key never leaves the process.
+- **`custody_sign_attestation`** (local) — sign a §9.2 enrollment attestation over
+  an agent key, with the owner key (root) or a parent agent key (delegation).
+- **`custody_sign_claim`** (local) — sign a §9.3 custody claim; returns a `claim`
+  object to attach to a report/review-complete/verify body under the signed profile.
+
+### Changed
+
+- **`dispatch`** now accepts LCP-1 §9.2 signed-profile enrollment fields
+  (`agent_pubkey`, `alg`, `attestation`, `attestation_conditions`) to enroll an
+  agent key attested by the owner/parent.
+
+### Notes
+
+- The signing helpers are byte-for-byte conformant with the Elixir server
+  (`test/custody_signing.test.js` reproduces the checked-in `docs/spec/vectors/LCP-1`
+  vectors), so claims signed here verify server-side.
+- The signed profile is OFF by default (deployments advertise `bearer`); an operator
+  activates it via `custody_signed_profile_enforcement`. These tools are usable for
+  enrollment/transparency regardless.
+
 ## 2.59.0 — 2026-07-22 (advisory file soft-locks — US-40.4, #451)
 
 ### Added

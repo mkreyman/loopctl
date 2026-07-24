@@ -10,7 +10,7 @@ defmodule LoopctlWeb.DispatchController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create]
-  plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:show, :index]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:show, :index, :enrolled_keys]
 
   # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
   plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create]
@@ -125,6 +125,26 @@ defmodule LoopctlWeb.DispatchController do
       data: Enum.map(result.data, &serialize/1),
       meta: result.meta
     })
+  end
+
+  @doc """
+  GET /api/v1/dispatches/enrolled-keys
+
+  LCP-1 §9.1.1 transparency: the enrolled agent-key set reconstructed from the
+  hash-chained audit log (not the dispatches table). Keyset-paged via `cursor`.
+  Read-only; a tenant compares this against the keys it generated to detect any
+  operator-minted key.
+  """
+  def enrolled_keys(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    opts =
+      []
+      |> maybe_add(:limit, parse_int(params["limit"]))
+      |> maybe_add(:cursor, parse_int(params["cursor"]))
+
+    result = Dispatches.enrolled_agent_keys(tenant_id, opts)
+    json(conn, result)
   end
 
   defp serialize(d) do

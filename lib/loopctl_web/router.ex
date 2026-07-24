@@ -279,6 +279,9 @@ defmodule LoopctlWeb.Router do
     delete "/tenants/:id/authenticators/:auth_id", TenantAuthenticatorController, :delete
 
     # US-26.2.1 — Dispatch lineage
+    # LCP-1 §9.1.1 — transparency read of enrolled agent keys (before :show so it
+    # is not captured as a dispatch id).
+    get "/dispatches/enrolled-keys", DispatchController, :enrolled_keys
     resources "/dispatches", DispatchController, only: [:create, :show, :index]
 
     # API key management
