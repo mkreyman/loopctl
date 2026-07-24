@@ -10,29 +10,29 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   threaded into the search response `meta` (AC-41.1.7), and the re-embed
   coexistence + pending-dimension exclusion reporting (AC-41.1.10).
 
-  ## Why this is `async: true`
+  ## Why this is `async: false` (shared HNSW index — deliberate)
 
-  It used to be `async: false`, because selecting the side-table path meant
-  flipping the VM-GLOBAL `SystemConfig`/`:persistent_term` cutover flag for the
-  whole node. `async: false` was not enough: the mutation still leaked past this
-  module's boundary, and a test that had just asserted the flag was on could run
-  its query after the value had been reset, silently take the LEGACY path, find no
-  legacy embedding, and fail with `left: []`. Those failures looked like a vector
-  recall bug and moved between tests and runs.
-
-  The read-path decision is now an injected collaborator
+  The read-path CUTOVER FLAG is no longer the reason: it is an injected collaborator
   (`Loopctl.Embeddings.ReadPathBehaviour`), so `enable_side_table_reads/0` is a
-  PROCESS-SCOPED `Mox.stub/3`. Nothing global is written, so these tests are
-  isolated and run async.
+  PROCESS-SCOPED `Mox.stub/3` and nothing VM-global is written for it. (The flag's
+  real per-node globality is covered directly in
+  `test/loopctl/embeddings/system_config_read_path_test.exs`.)
 
-  The flag's real globality is not incidental — it is the point of
-  AC-41.1.8(ii)/(iii): per-NODE, flipped once every node runs dual-write code,
-  reverted with a single operator UPDATE and no redeploy. That production
-  behaviour is covered directly in
-  `test/loopctl/embeddings/system_config_read_path_test.exs`.
+  These tests are `async: false` because they read through the pgvector HNSW indexes
+  on the SHARED per-dimension side tables (`article_embeddings_<dim>` /
+  `memory_embeddings_<dim>`). That index is one physical structure across the whole
+  suite. When OTHER async tests INSERT into it CONCURRENTLY with a read here, the
+  approximate graph walk can transiently miss a snapshot-visible, distance-0 row and
+  return `[]` — the rare CI `left: []` flake (four in-code fixes — ef_search raise,
+  exact scan, iterative_scan, retry-on-empty — each underfixed or regressed; see the
+  loopctl KB finding "side-table ANN test flake"). `async: false` makes ExUnit run
+  this module with NO concurrent tests, so nothing inserts into the index mid-read
+  and the approximate scan is deterministic — the same isolation rationale that keeps
+  `heavy_read_hnsw_ef_search_test` `async: false`. The prod read path is unchanged
+  (approximate ANN by design; prod closes the under-return with `hnsw.iterative_scan`).
   """
 
-  use Loopctl.DataCase, async: true
+  use Loopctl.DataCase, async: false
   use Oban.Testing, repo: Loopctl.Repo
 
   alias Loopctl.AdminRepo
