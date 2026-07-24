@@ -563,6 +563,9 @@ defmodule Loopctl.Progress do
     server-resolved lineage as `:reporter_lineage`)
   - `{:error, :missing_assigned_agent}` if the story has neither an assigned agent
     nor an implementer dispatch (custody-unattributed — fails closed)
+  - `{:error, :unresolvable_dispatch_lineage}` if the story's declared implementer
+    dispatch cannot be resolved (e.g. a cross-tenant id) — a lineage-integrity
+    failure that fails closed (LCP-1 §7.5)
   - `{:error, %Ecto.Changeset{}}` if artifact validation fails
   """
   @spec report_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword(), map() | nil) ::
@@ -883,6 +886,11 @@ defmodule Loopctl.Progress do
   - `{:ok, %ReviewRecord{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :story_not_reported_done}` if story is not in reported_done status
+  - `{:error, :self_review_blocked}` if the reviewer is the assigned agent or shares
+    the implementer's dispatch lineage root
+  - `{:error, :missing_assigned_agent}` on a custody-orphaned story (fails closed)
+  - `{:error, :unresolvable_dispatch_lineage}` if the story's declared implementer
+    dispatch cannot be resolved (lineage-integrity failure, fails closed — LCP-1 §7.5)
   - `{:error, %Ecto.Changeset{}}` on validation failure
   """
   @spec record_review(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
@@ -1024,6 +1032,12 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if story is not reported_done
+  - `{:error, :self_verify_blocked}` if the verifier is the assigned agent or shares
+    the implementer's dispatch lineage root
+  - `{:error, :missing_assigned_agent}` on a custody-orphaned story (fails closed)
+  - `{:error, :unresolvable_dispatch_lineage}` if a dispatch the story references
+    (implementer or verifier) cannot be resolved (lineage-integrity failure, fails
+    closed — LCP-1 §7.4.1)
   """
   @spec verify_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}

@@ -89,12 +89,34 @@ defmodule Loopctl.AuditChain.LeafHashTest do
                LeafHash.canonical_json(100_000_000_000_000_000_000_000)
     end
 
-    test "fractional floats and Decimal scale normalize to one canonical decimal string" do
+    test "fractional floats normalize to one canonical decimal string" do
       assert LeafHash.canonical_json(3.14) == "3.14"
       assert LeafHash.canonical_json(1.0e-7) == "0.0000001"
-      # A Decimal with trailing-zero scale collapses to the same string as its value.
-      assert LeafHash.canonical_json(Decimal.new("100.00")) == LeafHash.canonical_json(100)
-      assert LeafHash.canonical_json(Decimal.new("3.140")) == "3.14"
+    end
+
+    test "signed zero collapses to unsigned, matching jsonb numeric (no -0)" do
+      # PostgreSQL numeric has no signed zero, so -0.0 must canonicalize like 0.
+      assert LeafHash.canonical_json(-0.0) == LeafHash.canonical_json(0)
+      assert LeafHash.canonical_json(-0.0) == "0"
+    end
+
+    test "a Decimal payload value canonicalizes as the STRING the storage encoder writes" do
+      # The :map column dumps with Jason, which encodes a Decimal as a JSON string;
+      # jsonb returns that string on read. So a Decimal must canonicalize to the
+      # same thing as its stored string form, NOT as a bare number — otherwise a
+      # pristine Decimal-bearing row reports as tampered.
+      d = Decimal.new("1.10")
+
+      assert LeafHash.canonical_json(d) ==
+               LeafHash.canonical_json(Jason.decode!(Jason.encode!(d)))
+
+      refute LeafHash.canonical_json(d) == LeafHash.canonical_json(1.1)
+    end
+
+    test "a map mixing atom and string keys of the same name is a hard error (§8.2)" do
+      assert_raise ArgumentError, ~r/duplicate key after string normalization/, fn ->
+        LeafHash.canonical_json(%{:score => 1, "score" => 2})
+      end
     end
   end
 
@@ -228,6 +250,41 @@ defmodule Loopctl.AuditChain.LeafHashTest do
       # so the assertion below is not vacuous.
       assert is_integer(reloaded.payload["big"])
       assert AuditChain.recompute_entry_hash(reloaded) == reloaded.entry_hash
+      assert AuditChain.entry_hash_valid?(reloaded)
+    end
+
+    test "a Decimal payload reproduces after the jsonb round-trip (no false positive)", %{
+      tenant: tenant
+    } do
+      # The :map encoder stores a Decimal as a JSON string; it must recompute to
+      # match, not be treated as a bare number (Fable review #1).
+      {:ok, entry} =
+        AuditChain.append(tenant.id, %{
+          action: "cost_recorded",
+          actor_lineage: ["dispatch-root"],
+          entity_type: "story",
+          entity_id: @entity,
+          payload: %{"cost" => Decimal.new("1.10")}
+        })
+
+      reloaded = AdminRepo.get!(Entry, entry.id)
+      assert AuditChain.recompute_entry_hash(reloaded) == reloaded.entry_hash
+      assert AuditChain.entry_hash_valid?(reloaded)
+    end
+
+    test "a negative-zero float payload reproduces after the jsonb round-trip", %{tenant: tenant} do
+      # numeric has no signed zero: -0.0 stores as 0. The canonical form must
+      # collapse the sign or a pristine row reports as tampered (Fable review #2).
+      {:ok, entry} =
+        AuditChain.append(tenant.id, %{
+          action: "score_recorded",
+          actor_lineage: ["dispatch-root"],
+          entity_type: "story",
+          entity_id: @entity,
+          payload: %{"delta" => -0.0}
+        })
+
+      reloaded = AdminRepo.get!(Entry, entry.id)
       assert AuditChain.entry_hash_valid?(reloaded)
     end
 

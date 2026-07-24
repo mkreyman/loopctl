@@ -245,23 +245,31 @@ Advances `agent_status` to `reported_done`.
 
 ```
 1. caller_id = nil                        → REJECT self_report_blocked
-2. UNATTRIBUTED(w)                        → REJECT missing_assigned_agent   [log]
-3. LINEAGE_CONFLICT(w, caller_lineage)    → REJECT self_report_blocked
+2. UNATTRIBUTED(w)                        → REJECT missing_assigned_agent          [log]
+3. LINEAGE_STATUS(w, caller_lineage):
+     UNRESOLVABLE                         → REJECT unresolvable_dispatch_lineage    [log]
+     CONFLICT                             → REJECT self_report_blocked
 4. w.assigned_agent_id ≠ nil
      AND w.assigned_agent_id = caller_id  → REJECT self_report_blocked
 5. otherwise                              → PERMIT
 ```
 
-Clause 1 is normative: an unknown identity is untrusted, never permissive.
+Clause 1 is normative: an unknown identity is untrusted, never permissive. Clause 3 splits
+the two lineage outcomes deliberately (§7.5): a *conflict* (shared root) is a self-claim
+and blocks as `self_report_blocked`, whereas an *unresolvable* declared dispatch is a
+lineage-integrity failure and blocks as `unresolvable_dispatch_lineage` — a distinct code
+with distinct handling (§7.6).
 
 ### 7.3 `review_complete`
 
 Records a review outcome.
 
 ```
-1. ORPHANED(w)                            → REJECT missing_assigned_agent   [log]
-2. caller_id = nil                        → PERMIT                          [see below]
-3. LINEAGE_CONFLICT(w, caller_lineage)    → REJECT self_review_blocked
+1. ORPHANED(w)                            → REJECT missing_assigned_agent          [log]
+2. caller_id = nil                        → PERMIT                                 [see below]
+3. LINEAGE_STATUS(w, caller_lineage):
+     UNRESOLVABLE                         → REJECT unresolvable_dispatch_lineage    [log]
+     CONFLICT                             → REJECT self_review_blocked
 4. w.assigned_agent_id ≠ nil
      AND w.assigned_agent_id = caller_id  → REJECT self_review_blocked
 5. otherwise                              → PERMIT
@@ -308,7 +316,7 @@ Let `impl` and `verif` be the lineage paths resolved from
 resolves to `[]`.
 
 ```
-1. impl = [] OR verif = []                → REJECT self_verify_blocked      [log]
+1. impl = [] OR verif = []                → REJECT unresolvable_dispatch_lineage   [log]
 2. SHARES_ROOT(impl, verif)               → REJECT self_verify_blocked
 3. w.assigned_agent_id ≠ nil
      AND w.assigned_agent_id = caller_id  → REJECT self_verify_blocked
@@ -317,53 +325,77 @@ resolves to `[]`.
 
 Both halves of this clause are normative and are frequently got wrong:
 
-- Clause 1 makes an unresolvable dispatch **fail closed**. Without it, `SHARES_ROOT([], x)
-  = false` would cause a dispatch row that cannot be loaded — because it was deleted,
-  revoked, or never existed — to read as *independent lineage*, which is the opposite of
-  the truth.
+- Clause 1 makes an unresolvable dispatch **fail closed**, and does so under the distinct
+  `unresolvable_dispatch_lineage` code (§7.6), because either the implementer *or* the
+  verifier dispatch may be the unresolvable one. Without it, `SHARES_ROOT([], x) = false`
+  would cause a dispatch row that cannot be loaded — because it was deleted, belongs to
+  another tenant, or never existed — to read as *independent lineage*, which is the
+  opposite of the truth. (Note: a *revoked* dispatch is NOT unresolvable in the reference
+  implementation — dispatch resolution does not filter on `revoked_at`, so revocation is
+  handled by credential revocation, not by lineage non-resolution.)
 - Clause 3 evaluates identifier equality **in addition to** the lineage comparison, not
   instead of it. An implementation that returns PERMIT immediately upon finding separated
   lineages skips it.
 
-### 7.5 LINEAGE_CONFLICT, and the non-uniform treatment of unresolvable lineage
+### 7.5 LINEAGE_STATUS, and the non-uniform treatment of unresolvable lineage
 
 An empty lineage path arises from three distinct situations that implementations MUST NOT
 conflate, because they carry different meanings and require different outcomes:
 
 | Situation | Meaning | Required outcome |
 |-----------|---------|------------------|
-| `w.implementer_dispatch_id` is nil | no delegation was ever recorded; pre-dispatch work item | fall through to identifier equality |
-| dispatch id declared, but the row does not resolve | a delegation *was* recorded and cannot be loaded — deleted, revoked, or never existed | **REJECT** |
-| `caller_lineage = []` | the caller authenticated with a credential not minted by a dispatch | fall through to identifier equality (§5.1, §12 OQ2) |
+| `w.implementer_dispatch_id` is nil | no delegation was ever recorded; pre-dispatch work item | `:ok` — fall through to identifier equality |
+| dispatch id declared, but the row does not resolve | a delegation *was* recorded and cannot be loaded — deleted, belonging to another tenant, or never existed | `UNRESOLVABLE` — **REJECT** (§7.6) |
+| `caller_lineage = []` | the caller authenticated with a credential not minted by a dispatch | `:ok` — fall through to identifier equality (§5.1, §12 OQ2) |
 
 ```
-LINEAGE_CONFLICT(w, caller_lineage) =
-  false                                   if w.implementer_dispatch_id = nil
-  false                                   if caller_lineage = []
-  CONFLICT                                if impl = [] and
+LINEAGE_STATUS(w, caller_lineage) =
+  :ok                                     if w.implementer_dispatch_id = nil
+  :ok                                     if caller_lineage = []
+  UNRESOLVABLE                            if impl = [] and
                                              w.implementer_dispatch_id ≠ nil
-  SHARES_ROOT(impl, caller_lineage)       otherwise
+  CONFLICT                                if SHARES_ROOT(impl, caller_lineage)
+  :ok                                     otherwise
                                           where impl resolves w.implementer_dispatch_id
 ```
 
-The third clause is normative and is the one implementations get wrong. A dispatch
+The `UNRESOLVABLE` clause is normative and is the one implementations get wrong. A dispatch
 identifier recorded on the work item that cannot be resolved is an **integrity failure**,
 not an absence of delegation. Treating it as `[]` and relying on `SHARES_ROOT([], x) =
 false` causes an unloadable dispatch to read as *independent lineage*, which is the exact
-inverse of its meaning.
+inverse of its meaning — so it MUST reject, distinctly from a shared-root `CONFLICT` (§7.6).
 
-This matters beyond correctness of the predicate: revoking a dispatch is a routine,
-authorized lifecycle operation. Without this clause, revocation silently downgrades the
-`report` and `review_complete` gates to the pre-lineage guarantee — a normal operation
-acting as a security downgrade. `verify` closes the same case in §7.4.1 clause 1; the
-three gates are aligned on it.
+The reachable form of this state in the reference implementation is a dispatch id belonging
+to **another tenant**: dispatch resolution scopes by `(id, tenant_id)` while the foreign key
+is table-wide, so a cross-tenant id satisfies referential integrity yet fails to resolve.
+The gate therefore doubles as a cross-tenant isolation check. (Revocation does NOT produce
+this state — resolution does not filter `revoked_at`; a revoked dispatch still resolves, and
+its *credential* is what is rejected, elsewhere.)
 
-Note that this clause is deliberately narrower than "fail closed on any empty lineage".
+Note that `UNRESOLVABLE` is deliberately narrower than "fail closed on any empty lineage".
 Rows one and three of the table above remain fall-through: no legitimate caller is
 affected by this rejection, because a recorded-but-unloadable dispatch is already a
 corrupt record.
 
-### 7.6 Capability binding
+### 7.6 The `unresolvable_dispatch_lineage` rejection
+
+The `UNRESOLVABLE` outcome (§7.5) and §7.4.1 clause 1 both reject with a rejection code
+distinct from the `self_*_blocked` family: `unresolvable_dispatch_lineage`. The distinction
+is normative and behavioural, not cosmetic:
+
+- A `self_*_blocked` rejection means a party tried to advance its *own* work — a byzantine
+  self-claim. A deployment MAY escalate it (e.g. halt the tenant's custody operations).
+- An `unresolvable_dispatch_lineage` rejection means a referenced dispatch row could not be
+  loaded — a lineage-*integrity* failure, not an attempted self-claim. It MUST fail closed
+  (the gate does not proceed), but a deployment MUST NOT treat it as a byzantine self-claim
+  for escalation purposes; it is handled like `missing_assigned_agent` (a clear rejection,
+  no tenant halt). Conflating the two would let a data-integrity fault trigger a
+  self-claim escalation, and would hide the real cause from the caller.
+
+Implementations MUST return `unresolvable_dispatch_lineage` (not a `self_*_blocked` code)
+for this case at all three gates.
+
+### 7.7 Capability binding
 
 Where a deployment issues capability tokens, a custody gate MUST additionally require a
 valid token, and the token MUST be:

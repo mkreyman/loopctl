@@ -816,9 +816,10 @@ defmodule Loopctl.BulkOperations do
 
   defp format_reason(:unresolvable_dispatch_lineage),
     do:
-      "the story's declared implementer dispatch could not be resolved, so the custody " <>
-        "gate cannot prove the verifier is distinct from the implementer and failed closed. " <>
-        "This is a lineage-integrity failure; re-establish the dispatch provenance before verifying"
+      "a dispatch referenced by this story (the implementer's, or the verifier's) could not " <>
+        "be resolved, so the custody gate cannot prove the verifier's lineage is separated " <>
+        "from the implementer's and failed closed. This is a lineage-integrity failure; " <>
+        "re-establish the dispatch provenance before verifying"
 
   defp format_reason(:missing_assigned_agent),
     do:

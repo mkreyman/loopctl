@@ -188,9 +188,24 @@ defmodule Loopctl.AuditChain.LeafHash do
   """
   @spec canonical_json(term()) :: binary()
   def canonical_json(value) when is_map(value) and not is_struct(value) do
+    normalized = Enum.map(value, fn {k, v} -> {to_string(k), v} end)
+    keys = Enum.map(normalized, fn {k, _v} -> k end)
+
+    # A map holding both an atom and a string of the same name (e.g.
+    # `%{score: 1, "score" => 2}`) collapses to one key after `to_string/1`, and
+    # PostgreSQL `jsonb` deduplicates it on write (last wins) — so a silent emit of
+    # duplicate keys would make the recompute disagree with storage and report a
+    # FALSE tampering positive. §8.2 requires serialization ambiguity to be a hard
+    # error, so raise rather than corrupt the tamper detector (Fable review #4).
+    if length(Enum.uniq(keys)) != length(keys) do
+      raise ArgumentError,
+            "canonical_json: object has duplicate key after string normalization " <>
+              "(a map mixing atom and string keys of the same name); refusing to " <>
+              "emit an ambiguous preimage"
+    end
+
     inner =
-      value
-      |> Enum.map(fn {k, v} -> {to_string(k), v} end)
+      normalized
       |> Enum.sort_by(fn {k, _v} -> k end)
       |> Enum.map_join(",", fn {k, v} -> Jason.encode!(k) <> ":" <> canonical_json(v) end)
 
@@ -201,24 +216,42 @@ defmodule Loopctl.AuditChain.LeafHash do
     "[" <> Enum.map_join(value, ",", &canonical_json/1) <> "]"
   end
 
-  def canonical_json(%Decimal{} = value), do: canonical_number(value)
+  # A `%Decimal{}` is NOT a native JSON number to the `:map` storage encoder: the
+  # column is dumped with `Jason`, which encodes a Decimal the same way it will be
+  # stored, and PostgreSQL returns that stored form on read. Canonicalize it
+  # through the identical encode step so the write-time term and the jsonb-decoded
+  # read-back term agree — routing it through `canonical_number/1` instead would
+  # treat it as a number the storage layer never wrote and yield a FALSE tampering
+  # positive on a pristine row (Fable review #1).
+  def canonical_json(%Decimal{} = value),
+    do: value |> Jason.encode!() |> Jason.decode!() |> canonical_json()
+
   def canonical_json(value) when is_integer(value), do: canonical_number(value)
   def canonical_json(value) when is_float(value), do: canonical_number(value)
   def canonical_json(value), do: Jason.encode!(value)
 
-  # Canonical decimal string for a number, identical for a write-time value and
-  # the value PostgreSQL hands back after a `jsonb` round-trip. A float goes
-  # through its shortest round-trip JSON text (which is exactly what jsonb parses
-  # into `numeric`) so that, e.g., a write-side float `1.0e22` and a read-side
-  # integer `10000000000000000000000` both normalize to the same string.
+  # Canonical decimal string for a native JSON number, identical for a write-time
+  # value and the value PostgreSQL hands back after a `jsonb` round-trip. A float
+  # goes through its shortest round-trip JSON text (which is exactly what jsonb
+  # parses into `numeric`) so that, e.g., a write-side float `1.0e22` and a
+  # read-side integer `10000000000000000000000` both normalize to the same string.
   defp canonical_number(value) when is_integer(value),
     do: value |> Decimal.new() |> normalize_decimal()
 
   defp canonical_number(value) when is_float(value),
     do: value |> Jason.encode!() |> Decimal.new() |> normalize_decimal()
 
-  defp canonical_number(%Decimal{} = value), do: normalize_decimal(value)
+  defp normalize_decimal(%Decimal{} = decimal) do
+    normalized = Decimal.normalize(decimal)
 
-  defp normalize_decimal(%Decimal{} = decimal),
-    do: decimal |> Decimal.normalize() |> Decimal.to_string(:normal)
+    # PostgreSQL `numeric` has no signed zero: `-0.0` is stored and returned as
+    # `0`, so a write-side `-0.0` (which normalizes to "-0") must collapse to "0"
+    # to match the read-back value, else a pristine row reports as tampered
+    # (Fable review #2).
+    if Decimal.equal?(normalized, 0) do
+      "0"
+    else
+      Decimal.to_string(normalized, :normal)
+    end
+  end
 end

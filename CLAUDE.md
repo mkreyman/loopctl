@@ -149,10 +149,10 @@ in order:
    story with no assigned agent and no lineage would otherwise pass VACUOUSLY, since a
    non-nil verifier never equals a nil implementer (`progress.ex:1697-1699`).
 3. **Lineage comparison (primary)** when BOTH `implementer_dispatch_id` and
-   `verifier_dispatch_id` are set (`progress.ex:1702-1706`), decided by
-   `verify_lineage_separated/4` (`progress.ex:1725-1745`): an EMPTY lineage on either side —
+   `verifier_dispatch_id` are set (`progress.ex:1723-1728`), decided by
+   `verify_lineage_separated/4` (`progress.ex:1747-1767`): an EMPTY lineage on either side —
    which is what an unloadable/deleted dispatch row yields (`get_dispatch_lineage/2`,
-   `progress.ex:1755-1760`) — fails CLOSED, a shared lineage root
+   `progress.ex:1769-1774`) — fails CLOSED, a shared lineage root
    (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:303-307`) blocks, and the
    `assigned_agent_id` equality check is evaluated IN ADDITION to the lineage comparison, never
    short-circuited by it.
@@ -168,16 +168,16 @@ Without a verifier dispatch the check degrades to plain agent-id equality.
 **report** — `validate_not_self_report/3` (`progress.ex:2210-2235`) — nil identity is blocked
 (`progress.ex:2207`); a **custody-unattributed** story (nil `assigned_agent_id` AND nil
 `implementer_dispatch_id`) fails CLOSED with `missing_assigned_agent` and a
-`custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2254-2257`) instead of
+`custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2268-2271`) instead of
 passing vacuously; then the reporter's dispatch lineage is compared against the implementer's
-(`lineage_status/2`, `progress.ex:2280-2298`) — a tri-state `:ok | :conflict | :unresolvable`
+(`lineage_status/2`, `progress.ex:2300-2318`) — a tri-state `:ok | :conflict | :unresolvable`
 where a DECLARED-but-unresolvable implementer dispatch fails CLOSED with
 `unresolvable_dispatch_lineage` (LCP-1 §7.5), a shared lineage root yields `self_report_blocked`,
 and `:ok` falls through to plain `assigned_agent_id == agent_id`. The DB CHECK
 `stories_reported_done_requires_agent` does NOT cover this — it is satisfied whenever
 `implementer_dispatch_id IS NULL` — so the code guard is the enforcement.
 
-**review-complete** — `validate_not_self_review/3` (`progress.ex:2282-2312`) — custody-orphan
+**review-complete** — `validate_not_self_review/3` (`progress.ex:2320-2350`) — custody-orphan
 backstop first (`progress.ex:2289-2291`), then a **nil reviewer is deliberately PERMITTED**
 (`progress.ex:2298-2299`): nil means a human operator on a user-role key. That permit has
 THREE parts which must change together:
