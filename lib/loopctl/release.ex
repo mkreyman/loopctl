@@ -14,6 +14,7 @@ defmodule Loopctl.Release do
   import Ecto.Query, only: [from: 2]
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit
   alias Loopctl.Custody.SignedProfilePolicy
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.SystemConfig
@@ -77,9 +78,15 @@ defmodule Loopctl.Release do
       or ANY read path — **KB access cannot be lost by enabling this**;
     * does **NOT** gate authentication, signup, or tenant access;
     * is **enrolled-only / gradual** on the three single-item gates: a caller
-      WITHOUT an enrolled signing key is waived (proceeds), so with zero enrolled
-      agents the switch is INERT — it changes nothing observable until you
-      register a tenant owner key and enroll an agent. `:status` reports the
+      whose AGENT has NO enrolled signing key ANYWHERE is waived (proceeds), so
+      with zero enrolled agents the switch is INERT — it changes nothing
+      observable until you register a tenant owner key and enroll an agent.
+      Mind the mixed case though: the waiver is keyed on the AGENT, not the
+      dispatch. Once an agent enrolls ONE dispatch, its OTHER (bearer, unsigned)
+      dispatches are HARD-REFUSED — `agent_enrollment_required` (403), NOT waived
+      — because a bearer dispatch may not act unsigned in an already-enrolled
+      agent's name. So enabling `signed` can start failing an agent's older
+      bearer dispatch the moment it enrolls a newer one. `:status` reports the
       enrolled count so you flip with eyes open;
     * but on the aggregate paths (`verify_all`, bulk `verify` / `mark_complete`)
       `signed` does NOT waive-then-sign — it HARD-REFUSES an enrolled caller with
@@ -89,10 +96,19 @@ defmodule Loopctl.Release do
       fall back to verifying each story individually through the signed
       single-story gate.
 
-  Fully reversible (`:disable`). `:enable`/`:disable` write the DB value; every
-  running node adopts it within a minute via `SystemConfigRefreshWorker` (and on
-  next boot) — no redeploy. The `eval` node's own in-memory cache is irrelevant
-  (it exits immediately); the DB row is the source of truth.
+  Fully reversible (`:disable`). `:enable`/`:disable` write the DB value; the
+  status this command prints reflects the STORED DB row — NOT what any serving
+  node is enforcing at this instant. Serving nodes refresh their node-local
+  (`:persistent_term`) cache from the DB asynchronously: once at boot AND via the
+  `SystemConfigRefreshWorker` Oban cron. That cron enqueues ONE job per tick
+  CLUSTER-WIDE (executed by a single node), so on a MULTI-NODE deployment a given
+  node's adoption latency is NOT bounded to ~60s — it can lag many ticks, and an
+  emergency `:disable` rollback may leave some nodes enforcing `signed` (401'ing
+  enrolled agents) for an unbounded window. The ~60s guarantee holds only on a
+  SINGLE-NODE deployment. To confirm a specific node has actually adopted the
+  flip, read THAT node's `GET /.well-known/loopctl` `custody_profile` — each node
+  serves its own node-local value. The `eval` node's own cache is irrelevant (it
+  exits immediately); the DB row is the source of truth.
   """
   @spec custody_signed_profile(:status | :enable | :disable) :: :ok | {:error, term()}
   def custody_signed_profile(action \\ :status)
@@ -111,8 +127,19 @@ defmodule Loopctl.Release do
 
   @doc false
   def set_custody_profile(value) when value in [0, 1] do
+    # Capture the OLD stored value first so the audit record carries old -> new.
+    old_value = current_stored_profile()
+
     case SystemConfig.put(SignedProfilePolicy.profile_key(), value) do
-      {:ok, _setting} ->
+      {:ok, setting} ->
+        # Record the flip in the immutable, append-only audit log BEFORE reporting
+        # success. Flipping this switch is a deployment-wide security control —
+        # `:disable` in particular is a §9.3 downgrade (it drops the
+        # cryptographic-attribution requirement on report/review-complete/verify)
+        # — so its own change must leave a durable, tamper-evident record, not
+        # just ephemeral stdout on the eval node.
+        audit_custody_profile_flip(setting, old_value, value)
+
         # Reflect the just-written value in THIS node's cache so the status
         # printout below reads back the new value (running server nodes refresh
         # via the cron).
@@ -125,6 +152,50 @@ defmodule Loopctl.Release do
       {:error, reason} ->
         IO.puts("Failed to set custody_signed_profile_enforcement = #{value}: #{inspect(reason)}")
         {:error, reason}
+    end
+  end
+
+  defp current_stored_profile do
+    SystemConfig.refresh()
+    SystemConfig.get_int(SignedProfilePolicy.profile_key(), 0)
+  end
+
+  # The deployment-wide custody profile has NO tenant, so the per-tenant
+  # hash-chained `AuditChain` (which requires a tenant_id) is not the right sink.
+  # The system-scoped `Audit` log explicitly accepts a nil tenant for
+  # superadmin/system actions and is immutable + append-only (DB triggers), so it
+  # gives the flip a durable, auditable residue. The entity is the SystemConfig
+  # row that was flipped (a real, addressable UUID).
+  defp audit_custody_profile_flip(setting, old_value, new_value) do
+    action =
+      if new_value == 1,
+        do: "custody_signed_profile.enabled",
+        else: "custody_signed_profile.disabled"
+
+    attrs = %{
+      entity_type: "system_config",
+      entity_id: setting.id,
+      action: action,
+      actor_type: "system",
+      actor_label: "release:custody_signed_profile",
+      old_state: %{"value" => old_value, "profile" => profile_label(old_value)},
+      new_state: %{"value" => new_value, "profile" => profile_label(new_value)},
+      metadata: %{"key" => SignedProfilePolicy.profile_key(), "source" => "release_eval"}
+    }
+
+    case Audit.create_log_entry(nil, attrs) do
+      {:ok, _entry} ->
+        :ok
+
+      {:error, reason} ->
+        # The config write already landed; surface the audit miss loudly rather
+        # than let the flip look fully clean when its record did not persist.
+        IO.puts(
+          "WARNING: custody_signed_profile flip was NOT recorded in the audit log: " <>
+            inspect(reason)
+        )
+
+        :ok
     end
   end
 
@@ -142,12 +213,13 @@ defmodule Loopctl.Release do
 
     IO.puts("""
     LCP-1 §9 signed custody profile
-      profile                : #{profile}  (SystemConfig custody_signed_profile_enforcement=#{code})
-      enrolled agent keys    : #{enrolled}  (active signing keys, all tenants)
-      tenants with owner key : #{owner_tenants}
-      enforcement scope      : report / review-complete / verify, for ENROLLED agents only
+      profile (stored DB row) : #{profile}  (SystemConfig custody_signed_profile_enforcement=#{code})
+      enrolled dispatches     : #{enrolled}  (active agent signing keys, all tenants)
+      tenants with owner key  : #{owner_tenants}
+      enforcement scope       : report / review-complete / verify, for ENROLLED agents only
       bulk custody paths      : verify_all + bulk verify/mark_complete REFUSE enrolled agents under signed (bulk_signature_unsupported) — verify per-story instead
       NOT gated by this switch: Knowledge Wiki, memory, context retriever, auth, reads
+      value shown             : the STORED DB row, NOT per-node live enforcement — confirm a node adopted it via its GET /.well-known/loopctl custody_profile
     #{status_hint(code, enrolled)}\
     """)
 
@@ -173,14 +245,14 @@ defmodule Loopctl.Release do
 
   defp status_hint(1, 0),
     do:
-      "  hint                   : signed is ON but INERT — 0 enrolled agents, so every claim is waived."
+      "  hint                    : signed is ON but INERT — 0 enrolled dispatches, so every claim is waived."
 
   defp status_hint(1, _n),
-    do: "  hint                   : signed is ON and ENFORCED for the enrolled agents above."
+    do: "  hint                    : signed is ON and ENFORCED for the enrolled dispatches above."
 
   defp status_hint(_code, _n),
     do:
-      "  hint                   : bearer (default) — signatures are accepted but never required."
+      "  hint                    : bearer (default) — signatures are accepted but never required."
 
   defp profile_label(1), do: "signed"
   defp profile_label(0), do: "bearer"
@@ -196,8 +268,20 @@ defmodule Loopctl.Release do
   # already-started repo untouched (the test-sandbox case), so this is safe in both.
   defp with_admin_repo(fun) do
     load_app()
-    {:ok, result, _} = Ecto.Migrator.with_repo(Loopctl.AdminRepo, fn _repo -> fun.() end)
-    result
+
+    # `with_repo/2` returns `{:error, reason}` when the repo cannot start (DB
+    # unreachable / missing runtime config on the ephemeral eval node). Match it
+    # and return a clean `{:error, reason}` — the declared @spec of
+    # `custody_signed_profile/1` promises `:ok | {:error, term()}`, so a strict
+    # `{:ok, _, _} = ...` here would raise a cryptic MatchError on DB-down instead.
+    case Ecto.Migrator.with_repo(Loopctl.AdminRepo, fn _repo -> fun.() end) do
+      {:ok, result, _apps} ->
+        result
+
+      {:error, reason} ->
+        IO.puts("Could not start Loopctl.AdminRepo: #{inspect(reason)}")
+        {:error, reason}
+    end
   end
 
   defp load_app do

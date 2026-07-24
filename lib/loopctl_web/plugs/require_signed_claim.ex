@@ -71,12 +71,14 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaim do
            capability_id,
            claim_params
          ) do
-      :ok ->
+      {:ok, dispatch} ->
         # On the verified signed path, stash the claim so the custody controller can
         # persist it in the gate's HASH-CHAINED audit entry (LCP-1 §9.4). Without this
         # durable cryptographic residue the verified signature evaporates at request
         # end and a malicious operator could fabricate an "agent-signed" record.
-        stash_verified_claim(conn, profile, tenant_id, api_key_id, gate, claim_params)
+        # `verify_request/7` already resolved and returned the enrolled dispatch
+        # (`nil` on a waived path), so we reuse it instead of re-querying.
+        stash_verified_claim(conn, profile, gate, dispatch, claim_params)
 
       {:error, code} ->
         reject(conn, code)
@@ -84,33 +86,27 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaim do
   end
 
   # Only stash when a signature was actually VERIFIED — i.e. signed profile AND the
-  # caller is enrolled AND a claim_sig is present (the waived bearer/legacy path
-  # returns :ok too, with nothing to record).
+  # caller is enrolled (a non-nil resolved dispatch carrying a pubkey) AND a
+  # claim_sig is present. The waived bearer/legacy path returns `{:ok, nil}`, with
+  # nothing to record.
   defp stash_verified_claim(
          conn,
          :signed,
-         tenant_id,
-         api_key_id,
          gate,
+         %{agent_pubkey: pk, alg: alg},
          %{"claim_sig" => sig} = claim
        )
-       when is_binary(sig) do
-    case Loopctl.Dispatches.dispatch_for_api_key(tenant_id, api_key_id) do
-      {:ok, %{agent_pubkey: pk, alg: alg}} when is_binary(pk) ->
-        Plug.Conn.assign(conn, :custody_signed_claim, %{
-          gate: gate,
-          agent_pubkey_hex: Base.encode16(pk, case: :lower),
-          alg: alg,
-          claim_sig: String.downcase(sig),
-          claimed_at: claim["claimed_at"]
-        })
-
-      _ ->
-        conn
-    end
+       when is_binary(pk) and is_binary(sig) do
+    Plug.Conn.assign(conn, :custody_signed_claim, %{
+      gate: gate,
+      agent_pubkey_hex: Base.encode16(pk, case: :lower),
+      alg: alg,
+      claim_sig: String.downcase(sig),
+      claimed_at: claim["claimed_at"]
+    })
   end
 
-  defp stash_verified_claim(conn, _profile, _tenant_id, _api_key_id, _gate, _claim), do: conn
+  defp stash_verified_claim(conn, _profile, _gate, _dispatch, _claim), do: conn
 
   defp reject(conn, code) do
     {plug_status, http_status} = status_for(code)

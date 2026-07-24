@@ -60,7 +60,7 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
     test "waives the signature entirely, even for an enrolled dispatch", %{tenant: t} do
       %{dispatch: d} = enrolled_dispatch(t)
 
-      assert :ok =
+      assert {:ok, _} =
                Policy.verify_request(:bearer, t.id, d.api_key_id, @gate, @work, "cap-1", %{})
     end
   end
@@ -69,7 +69,7 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
     test "a bearer dispatch (no enrolled key) is NOT forced to sign", %{tenant: t} do
       d = bearer_dispatch(t)
 
-      assert :ok =
+      assert {:ok, _} =
                Policy.verify_request(:signed, t.id, d.api_key_id, @gate, @work, "cap-1", %{})
     end
 
@@ -93,7 +93,7 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
     end
 
     test "a legacy key with no dispatch is NOT forced to sign", %{tenant: t} do
-      assert :ok =
+      assert {:ok, _} =
                Policy.verify_request(
                  :signed,
                  t.id,
@@ -111,7 +111,7 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
       %{dispatch: d, priv: priv} = enrolled_dispatch(t)
       claim = signed_claim(t.id, priv)
 
-      assert :ok =
+      assert {:ok, _} =
                Policy.verify_request(:signed, t.id, d.api_key_id, @gate, @work, "cap-1", claim)
     end
 
@@ -167,7 +167,7 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
 
       # Under tenant B, the api_key_id does not resolve to an enrolled dispatch, so
       # the gradual-rollout waiver applies (no cross-tenant key leak).
-      assert :ok =
+      assert {:ok, _} =
                Policy.verify_request(
                  :signed,
                  other.id,
@@ -219,7 +219,7 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
 
       claim = signed_claim(t.id, priv, gate: "verify")
 
-      assert :ok =
+      assert {:ok, _} =
                Policy.verify_request(:signed, t.id, d.api_key_id, "verify", @work, "cap-1", claim)
     end
 
@@ -277,7 +277,7 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
 
       claim = signed_claim(t.id, verifier_priv, work: story.id)
 
-      assert :ok =
+      assert {:ok, _} =
                Policy.verify_request(
                  :signed,
                  t.id,
