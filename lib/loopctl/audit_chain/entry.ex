@@ -25,6 +25,7 @@ defmodule Loopctl.AuditChain.Entry do
     field :entity_id, Ecto.UUID
     field :payload, :map, default: %{}
     field :entry_hash, :binary
+    field :hash_version, :integer, default: 1
     field :inserted_at, :utc_datetime_usec
   end
 
@@ -40,6 +41,7 @@ defmodule Loopctl.AuditChain.Entry do
       :entity_id,
       :payload,
       :entry_hash,
+      :hash_version,
       :inserted_at
     ])
     |> validate_required([
@@ -49,7 +51,8 @@ defmodule Loopctl.AuditChain.Entry do
       :actor_lineage,
       :entity_type,
       :payload,
-      :entry_hash
+      :entry_hash,
+      :hash_version
     ])
   end
 end

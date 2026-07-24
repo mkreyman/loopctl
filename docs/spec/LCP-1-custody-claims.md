@@ -465,6 +465,12 @@ Each entry MUST record the leaf-hash version used to produce it. A verifier MUST
 recorded version and MUST NOT assume the current one. `/.well-known/loopctl` MUST advertise
 `audit_leaf_hash_version` for entries the deployment is currently writing.
 
+In the reference implementation the version is the `hash_version` column on `audit_chain`,
+defaulting to `1`. Existing entries carry `1` (they were written by the v1 construction);
+entries written after `Loopctl.AuditChain.LeafHash.current_version/0` moved to `2` carry
+`2`. A v2 entry chains onto a v1 predecessor with no special-casing, because linkage is by
+stored `prev_entry_hash` bytes, not by recomputation.
+
 ### 8.5 Independent recomputation
 
 A conforming deployment MUST expose sufficient data for a third party to recompute every
@@ -622,11 +628,14 @@ by the executable conformance suite (`test/loopctl/spec/lcp1_conformance_test.ex
 reference implementation the reachable form of this input is a dispatch id belonging to a
 different tenant (§7.5), so the clause doubles as a cross-tenant isolation check.
 
-§8.5 (independent recomputation of a leaf hash from entry content) is **not yet satisfied**:
-no code path recomputes a leaf hash, so the deployed chain proves linkage and inclusion but
-not that any hash commits to its own entry. This is tracked as an implementation defect
-against this specification, not a permitted variation. A deployment MUST NOT advertise
-conformance while it holds.
+§8.5 (independent recomputation of a leaf hash from entry content) is **satisfied for v2
+entries**. `AuditChain.recompute_entry_hash/1` and `entry_hash_valid?/1` recompute a leaf
+hash from stored content, dispatching on the entry's `hash_version`, and the round-trip is
+pinned by `test/loopctl/audit_chain/leaf_hash_test.exs`. v1 entries remain recomputable
+only by the v1 algorithm and, per §8.1, may not reproduce after a `jsonb` round-trip; they
+are covered by inclusion proofs and by the append-only triggers, but a v2 rewrite of the
+historical chain is out of scope here and is the remaining item before the deployment can
+advertise `audit_leaf_hash_version: 2` end to end.
 
 ### 10.3 What neither profile guarantees
 
@@ -643,12 +652,22 @@ system design.
 
 ## 11. Test Vectors
 
-> **Status: not yet generated.** Vectors MUST be produced by executing the reference
-> implementation rather than hand-derived, and committed alongside this document at
-> `docs/spec/vectors/LCP-1/`. A spec whose vectors were written by hand tests the
-> author's understanding, not the implementation.
+Vectors are produced by executing the reference implementation
+(`mix loopctl.spec.vectors`), never hand-derived, and committed at
+`docs/spec/vectors/LCP-1/`. A spec whose vectors were written by hand tests the
+author's understanding, not the implementation.
 
-The following vectors are REQUIRED before this document leaves `draft`:
+Generated so far — the pure-function sets a third party can reproduce without a database:
+
+- `shares_root.json` (set 1, §5.2)
+- `canonical_json.json` (set 3, §8.3)
+- `leaf_hash_v2.json` (set 4, §8.2)
+
+Set 2 (the gate decision matrix) is database-dependent and lives as the executable suite
+`test/loopctl/spec/lcp1_conformance_test.exs`, which asserts one vector per clause of each
+gate. Set 5 (signed profile) awaits the agent-signing work (§9).
+
+The full REQUIRED set before this document leaves `draft`:
 
 1. **`SHARES_ROOT` truth table** — every combination of empty, single-element, and
    multi-element paths with matching and non-matching roots, including the sibling case

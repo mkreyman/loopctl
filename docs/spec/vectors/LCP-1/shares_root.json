@@ -1,0 +1,94 @@
+{
+  "spec": "LCP-1 §5.2 SHARES_ROOT",
+  "note": "shared-root test, not longest-common-prefix; siblings share a root",
+  "vectors": [
+    {
+      "label": "empty vs empty",
+      "a": [],
+      "b": [],
+      "shares_root": false
+    },
+    {
+      "label": "empty vs non-empty",
+      "a": [],
+      "b": [
+        "11111111-1111-1111-1111-111111111111"
+      ],
+      "shares_root": false
+    },
+    {
+      "label": "non-empty vs empty",
+      "a": [
+        "11111111-1111-1111-1111-111111111111"
+      ],
+      "b": [],
+      "shares_root": false
+    },
+    {
+      "label": "same single root",
+      "a": [
+        "11111111-1111-1111-1111-111111111111"
+      ],
+      "b": [
+        "11111111-1111-1111-1111-111111111111"
+      ],
+      "shares_root": true
+    },
+    {
+      "label": "different single root",
+      "a": [
+        "11111111-1111-1111-1111-111111111111"
+      ],
+      "b": [
+        "22222222-2222-2222-2222-222222222222"
+      ],
+      "shares_root": false
+    },
+    {
+      "label": "siblings under one root",
+      "a": [
+        "11111111-1111-1111-1111-111111111111",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      ],
+      "b": [
+        "11111111-1111-1111-1111-111111111111",
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+      ],
+      "shares_root": true
+    },
+    {
+      "label": "same root different depth",
+      "a": [
+        "11111111-1111-1111-1111-111111111111"
+      ],
+      "b": [
+        "11111111-1111-1111-1111-111111111111",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      ],
+      "shares_root": true
+    },
+    {
+      "label": "different roots equal depth",
+      "a": [
+        "11111111-1111-1111-1111-111111111111",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      ],
+      "b": [
+        "22222222-2222-2222-2222-222222222222",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      ],
+      "shares_root": false
+    },
+    {
+      "label": "root of one equals child of other",
+      "a": [
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      ],
+      "b": [
+        "11111111-1111-1111-1111-111111111111",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      ],
+      "shares_root": false
+    }
+  ]
+}

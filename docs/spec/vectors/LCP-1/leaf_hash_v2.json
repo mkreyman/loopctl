@@ -1,0 +1,46 @@
+{
+  "spec": "LCP-1 §8.2 v2 leaf hash",
+  "note": "prev_hash is 32 zero bytes here (genesis); hashes are lowercase hex of SHA-256",
+  "vectors": [
+    {
+      "label": "genesis, entity_id absent",
+      "fields": {
+        "position": 0,
+        "action": "event_created",
+        "tenant_id": "33333333-3333-3333-3333-333333333333",
+        "payload": {
+          "a": 1,
+          "b": 2
+        },
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "actor_lineage": [
+          "dispatch-a"
+        ],
+        "entity_type": "story",
+        "entity_id": null,
+        "inserted_at": "2026-07-23T00:00:00.000000Z"
+      },
+      "leaf_hash": "d2ec67a3ee924dff943d0b821db1200f02cc8ee4828a9d6cb22249600799a6eb"
+    },
+    {
+      "label": "entity_id present",
+      "fields": {
+        "position": 0,
+        "action": "event_created",
+        "tenant_id": "33333333-3333-3333-3333-333333333333",
+        "payload": {
+          "a": 1,
+          "b": 2
+        },
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "actor_lineage": [
+          "dispatch-a"
+        ],
+        "entity_type": "story",
+        "entity_id": "44444444-4444-4444-4444-444444444444",
+        "inserted_at": "2026-07-23T00:00:00.000000Z"
+      },
+      "leaf_hash": "9f9ea5b8c119ffa6defa9b00a774b4766d48b7652db1e781336be35453c28603"
+    }
+  ]
+}

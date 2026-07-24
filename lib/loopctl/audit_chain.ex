@@ -26,6 +26,7 @@ defmodule Loopctl.AuditChain do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain.Entry
+  alias Loopctl.AuditChain.LeafHash
   alias Loopctl.AuditChain.ProofCache
   alias Loopctl.AuditChain.PubSub, as: ChainPubSub
   alias Loopctl.AuditChain.SignedTreeHead
@@ -802,18 +803,22 @@ defmodule Loopctl.AuditChain do
     entity_id = Map.get(attrs, :entity_id)
     payload = Map.get(attrs, :payload, %{})
 
-    entry_hash =
-      compute_hash(%{
-        tenant_id: tenant_id,
-        position: position,
-        prev_hash: prev_hash,
-        action: action,
-        actor_lineage: actor_lineage,
-        entity_type: entity_type,
-        entity_id: entity_id,
-        payload: payload,
-        inserted_at: now
-      })
+    hash_fields = %{
+      tenant_id: tenant_id,
+      position: position,
+      prev_hash: prev_hash,
+      action: action,
+      actor_lineage: actor_lineage,
+      entity_type: entity_type,
+      entity_id: entity_id,
+      payload: payload,
+      inserted_at: now
+    }
+
+    # New entries use the current leaf-hash version (LCP-1 §8.4); the version is
+    # stored so a verifier recomputes with the exact construction that wrote it.
+    hash_version = LeafHash.current_version()
+    entry_hash = LeafHash.compute(hash_fields, hash_version)
 
     %{
       chain_position: position,
@@ -824,37 +829,42 @@ defmodule Loopctl.AuditChain do
       entity_id: entity_id,
       payload: payload,
       entry_hash: entry_hash,
+      hash_version: hash_version,
       inserted_at: now
     }
   end
 
-  defp compute_hash(%{
-         tenant_id: tenant_id,
-         position: position,
-         prev_hash: prev_hash,
-         action: action,
-         actor_lineage: actor_lineage,
-         entity_type: entity_type,
-         entity_id: entity_id,
-         payload: payload,
-         inserted_at: inserted_at
-       }) do
-    canonical =
-      Jason.encode!(%{
-        action: action,
-        actor_lineage: actor_lineage,
-        entity_id: entity_id,
-        entity_type: entity_type,
-        payload: payload
-      })
+  @doc """
+  Recomputes an entry's leaf hash from its stored content, dispatching on the
+  `hash_version` the entry was written with (LCP-1 §8.4, §8.5). Independent of
+  the stored `entry_hash`, so it can be compared against it to detect tampering.
+  """
+  @spec recompute_entry_hash(Entry.t()) :: binary()
+  def recompute_entry_hash(%Entry{} = entry) do
+    LeafHash.compute(
+      %{
+        tenant_id: entry.tenant_id,
+        position: entry.chain_position,
+        prev_hash: entry.prev_entry_hash,
+        action: entry.action,
+        actor_lineage: entry.actor_lineage,
+        entity_type: entry.entity_type,
+        entity_id: entry.entity_id,
+        payload: entry.payload,
+        inserted_at: entry.inserted_at
+      },
+      entry.hash_version
+    )
+  end
 
-    data =
-      tenant_id <>
-        Integer.to_string(position) <>
-        prev_hash <>
-        canonical <>
-        DateTime.to_iso8601(inserted_at)
-
-    :crypto.hash(:sha256, data)
+  @doc """
+  True when an entry's stored `entry_hash` matches a fresh recompute from its
+  content (LCP-1 §8.5). A `false` for a v2 entry indicates tampering; a `false`
+  for a v1 entry may instead reflect the v1 construction's non-canonical JSON
+  (LCP-1 §8.1) and is not, on its own, proof of tampering.
+  """
+  @spec entry_hash_valid?(Entry.t()) :: boolean()
+  def entry_hash_valid?(%Entry{} = entry) do
+    recompute_entry_hash(entry) == entry.entry_hash
   end
 end
