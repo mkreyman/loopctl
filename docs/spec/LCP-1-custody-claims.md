@@ -528,6 +528,35 @@ computed from leaf hashes that nobody can reproduce from content authenticates t
 server's bookkeeping, not the events. Deployments MUST NOT describe an STH as evidence of
 event integrity unless §8.5 holds.
 
+### 8.7 Mixed-version chains; history is not rewritten
+
+A chain will contain entries of more than one leaf-hash version once a deployment moves its
+writing version forward (v1 → v2). Implementations MUST NOT attempt to "upgrade" historical
+entries to the new version. The chain is append-only and immutable (in the reference
+implementation, enforced by `BEFORE UPDATE`/`BEFORE DELETE` triggers); rewriting a leaf hash
+would break the very immutability the chain's guarantee rests on, and would invalidate every
+Signed Tree Head that already committed to the old roots. There is no rewrite step, and none
+is desirable.
+
+A verifier therefore MUST verify a chain **per entry**, dispatching on each entry's stored
+version:
+
+- A **v2** entry is fully content-verifiable: recompute its leaf hash from stored content
+  (§8.5) and compare. A mismatch is tamper evidence.
+- A **v1** entry is verifiable for *linkage and inclusion* — its `prev_entry_hash` chains to
+  its predecessor's stored `entry_hash`, and its stored hash participates in the Merkle root
+  under a published STH — but its content is not reliably re-derivable (§8.1). A v1 leaf-hash
+  mismatch on recompute is therefore NOT, on its own, tamper evidence.
+
+A deployment MAY strengthen assurance over a v1 prefix without mutating it by *appending* a
+v2 checkpoint entry that commits, canonically, to the content of the v1 range — an additive,
+immutability-preserving alternative to a rewrite. This is OPTIONAL and not required for
+conformance.
+
+`GET /.well-known/loopctl` advertises `audit_leaf_hash_version` as the version currently
+being **written**, not a claim that every historical entry uses it (§8.4). A verifier reads
+the per-entry version, never the discovery value, when recomputing.
+
 ## 9. Signed Profile
 
 This section applies only to deployments advertising `custody_profile: "signed"`.
@@ -665,9 +694,24 @@ entries**. `AuditChain.recompute_entry_hash/1` and `entry_hash_valid?/1` recompu
 hash from stored content, dispatching on the entry's `hash_version`, and the round-trip is
 pinned by `test/loopctl/audit_chain/leaf_hash_test.exs`. v1 entries remain recomputable
 only by the v1 algorithm and, per §8.1, may not reproduce after a `jsonb` round-trip; they
-are covered by inclusion proofs and by the append-only triggers, but a v2 rewrite of the
-historical chain is out of scope here and is the remaining item before the deployment can
-advertise `audit_leaf_hash_version: 2` end to end.
+are covered by inclusion proofs and by the append-only triggers. Because the chain is
+append-only and immutable by DB trigger, historical v1 entries are NOT rewritten to v2 —
+that would violate the immutability the whole chain rests on. §8.4 is therefore satisfied
+by advertising the version currently being *written* (2) and having verifiers dispatch
+per-entry on the stored `hash_version`; there is no "rewrite the history" step, and none is
+desirable. See §8.7.
+
+§9 (`signed` profile) is **implemented as a verifiable protocol layer, not yet activated as
+a deployment default**. `Loopctl.Custody.SignedProfile` implements the §9.2 attestation and
+§9.3 claim signatures with §6.1 algorithm agility; agent-key enrollment and the §9.1.1
+transparency log + enumeration (`Dispatches.enrolled_agent_keys/1`) are complete and proven
+end to end (`test/loopctl/custody/signed_profile_test.exs`), with §11 set-5 vectors emitted
+from the implementation. What remains before a deployment can advertise
+`custody_profile: "signed"` is the operational activation step: a per-deployment setting
+that makes the custody gates REQUIRE and pre-verify a claim signature for enrolled
+dispatches (§9.3). Until an operator activates it, loopctl accepts unsigned claims and so
+correctly advertises `bearer` (§2.1). This is an activation boundary, not a defect: the
+cryptographic core an external verifier needs is present and tested.
 
 ### 10.3 What neither profile guarantees
 

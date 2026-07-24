@@ -66,9 +66,25 @@ defmodule Loopctl.Dispatches do
       role: Map.get(attrs, :role) || Map.get(attrs, "role"),
       agent_id: Map.get(attrs, :agent_id) || Map.get(attrs, "agent_id"),
       story_id: Map.get(attrs, :story_id) || Map.get(attrs, "story_id"),
+      # LCP-1 §9 signed profile: the agent's own public key + algorithm. Absent for
+      # a bearer dispatch. `agent_pubkey` is raw bytes; accept hex too for JSON APIs.
+      agent_pubkey:
+        normalize_pubkey(Map.get(attrs, :agent_pubkey) || Map.get(attrs, "agent_pubkey")),
+      alg: Map.get(attrs, :alg) || Map.get(attrs, "alg"),
       expires_at: DateTime.add(now, expires_in, :second),
       now: now
     }
+  end
+
+  # Accept raw 32-byte keys as-is and hex-encoded keys from JSON callers.
+  defp normalize_pubkey(nil), do: nil
+  defp normalize_pubkey(<<_::binary-size(32)>> = raw), do: raw
+
+  defp normalize_pubkey(hex) when is_binary(hex) do
+    case Base.decode16(hex, case: :mixed) do
+      {:ok, raw} -> raw
+      :error -> hex
+    end
   end
 
   defp do_create_dispatch(tenant_id, parsed, opts) do
@@ -80,6 +96,10 @@ defmodule Loopctl.Dispatches do
       expires_at: expires_at,
       now: now
     } = parsed
+
+    # Carry the signed-profile fields alongside opts so the multi can enroll the
+    # key and record it on the audit chain (LCP-1 §9.1.1) without a wider signature.
+    opts = Keyword.merge(opts, agent_pubkey: parsed.agent_pubkey, alg: parsed.alg)
 
     case normalize_role(raw_role) do
       {:error, reason} ->
@@ -126,7 +146,9 @@ defmodule Loopctl.Dispatches do
           role: role,
           lineage_path: lineage_path,
           expires_at: expires_at,
-          created_at: now
+          created_at: now,
+          agent_pubkey: Keyword.get(opts, :agent_pubkey),
+          alg: Keyword.get(opts, :alg)
         })
         |> AdminRepo.insert()
       end)
@@ -136,16 +158,34 @@ defmodule Loopctl.Dispatches do
       |> Multi.run(:audit, fn _repo, %{mint_key: %{dispatch: dispatch}} ->
         actor_lineage = Keyword.get(opts, :actor_lineage, [])
 
+        base_payload = %{
+          "lineage_path" => dispatch.lineage_path,
+          "role" => to_string(dispatch.role),
+          "expires_at" => DateTime.to_iso8601(dispatch.expires_at)
+        }
+
+        # LCP-1 §9.1.1 enrollment transparency: when this dispatch enrolls an agent
+        # public key, record the key (hex) + alg on the hash-chained, STH-covered
+        # audit entry. An operator that mints an agent key therefore cannot do so
+        # invisibly or retroactively — a tenant can enumerate every enrolled key
+        # from the chain alone. The action names the enrollment so it is filterable.
+        {action, payload} =
+          if dispatch.agent_pubkey do
+            {"dispatch_created_with_agent_key",
+             Map.merge(base_payload, %{
+               "agent_pubkey" => Base.encode16(dispatch.agent_pubkey, case: :lower),
+               "alg" => dispatch.alg
+             })}
+          else
+            {"dispatch_created", base_payload}
+          end
+
         AuditChain.append(tenant_id, %{
-          action: "dispatch_created",
+          action: action,
           actor_lineage: actor_lineage,
           entity_type: "dispatch",
           entity_id: dispatch.id,
-          payload: %{
-            "lineage_path" => dispatch.lineage_path,
-            "role" => to_string(dispatch.role),
-            "expires_at" => DateTime.to_iso8601(dispatch.expires_at)
-          }
+          payload: payload
         })
       end)
 
@@ -169,6 +209,37 @@ defmodule Loopctl.Dispatches do
       nil -> {:error, :not_found}
       dispatch -> {:ok, dispatch}
     end
+  end
+
+  @doc """
+  Enumerates the agent public keys enrolled under a tenant, **from the audit chain
+  alone** (LCP-1 §9.1.1 enrollment transparency).
+
+  This deliberately reads the hash-chained, STH-covered `audit_chain` rather than
+  the `dispatches` table: the whole point of enrollment transparency is that a
+  tenant can reconstruct the enrolled-key set from the tamper-evident log without
+  trusting a mutable server-side listing. Each entry is a
+  `dispatch_created_with_agent_key` action carrying `agent_pubkey` (hex) and `alg`.
+  Returns `[%{agent_pubkey_hex:, alg:, dispatch_id:, lineage_path:, at:}]`, newest
+  first. A tenant compares this against the keys it generated; any excess is an
+  operator-minted key.
+  """
+  @spec enrolled_agent_keys(Ecto.UUID.t()) :: [map()]
+  def enrolled_agent_keys(tenant_id) do
+    from(e in AuditChain.Entry,
+      where: e.tenant_id == ^tenant_id and e.action == "dispatch_created_with_agent_key",
+      order_by: [desc: e.chain_position]
+    )
+    |> AdminRepo.all()
+    |> Enum.map(fn e ->
+      %{
+        agent_pubkey_hex: e.payload["agent_pubkey"],
+        alg: e.payload["alg"],
+        dispatch_id: e.entity_id,
+        lineage_path: e.payload["lineage_path"],
+        at: e.inserted_at
+      }
+    end)
   end
 
   @doc "Lists dispatches with optional filters."

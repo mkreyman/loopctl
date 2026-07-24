@@ -288,6 +288,26 @@ defmodule Loopctl.AuditChain.LeafHashTest do
       assert AuditChain.entry_hash_valid?(reloaded)
     end
 
+    test "verify_chain reports a clean multi-entry v2 chain (§8.7)", %{tenant: tenant} do
+      for i <- 1..3 do
+        {:ok, _} =
+          AuditChain.append(tenant.id, %{
+            action: "event_created",
+            actor_lineage: [],
+            entity_type: "story",
+            payload: %{"i" => i}
+          })
+      end
+
+      report = AuditChain.verify_chain(tenant.id)
+      assert report.ok
+      assert report.count == 3
+      assert report.verified == 3
+      assert report.linkage_only == 0
+      assert report.tampered == []
+      assert report.broken_links == []
+    end
+
     test "recompute detects a tampered payload", %{tenant: tenant} do
       {:ok, entry} =
         AuditChain.append(tenant.id, %{

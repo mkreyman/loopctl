@@ -867,4 +867,87 @@ defmodule Loopctl.AuditChain do
   def entry_hash_valid?(%Entry{} = entry) do
     recompute_entry_hash(entry) == entry.entry_hash
   end
+
+  @doc """
+  Verifies a tenant's whole chain **per entry**, dispatching on each entry's
+  stored `hash_version` (LCP-1 §8.7). A chain may mix versions once the writing
+  version advances; history is never rewritten, so a verifier reads each entry's
+  own version.
+
+  Returns `%{ok: boolean, count: n, verified: n, linkage_only: n, tampered: [pos]}`:
+
+    * a **v2** entry is content-verified — a leaf-hash mismatch is tamper evidence
+      and its position is collected in `tampered`;
+    * a **v1** entry is checked for LINKAGE only (its `prev_entry_hash` equals the
+      predecessor's stored `entry_hash`) — its content is not reliably re-derivable
+      (§8.1), so a leaf mismatch is not counted as tampering; a broken *link* is;
+    * `ok` is true iff no tampering and no broken linkage was found.
+
+  This walks the chain in a bounded, tenant-scoped read; for very large chains a
+  caller may page via `list_entries/2` and fold externally.
+  """
+  @spec verify_chain(Ecto.UUID.t()) :: %{
+          ok: boolean(),
+          count: non_neg_integer(),
+          verified: non_neg_integer(),
+          linkage_only: non_neg_integer(),
+          tampered: [non_neg_integer()],
+          broken_links: [non_neg_integer()]
+        }
+  def verify_chain(tenant_id) do
+    from(e in Entry,
+      where: e.tenant_id == ^tenant_id,
+      order_by: [asc: e.chain_position]
+    )
+    |> AdminRepo.all()
+    |> Enum.reduce(
+      %{
+        ok: true,
+        count: 0,
+        verified: 0,
+        linkage_only: 0,
+        tampered: [],
+        broken_links: [],
+        prev_hash: @zero_hash
+      },
+      &verify_chain_entry/2
+    )
+    |> finalize_chain_report()
+  end
+
+  defp verify_chain_entry(%Entry{} = entry, acc) do
+    link_ok = entry.prev_entry_hash == acc.prev_hash
+
+    acc =
+      acc
+      |> Map.update!(:count, &(&1 + 1))
+      |> Map.put(:prev_hash, entry.entry_hash)
+
+    acc =
+      if link_ok,
+        do: acc,
+        else:
+          acc |> Map.update!(:broken_links, &[entry.chain_position | &1]) |> Map.put(:ok, false)
+
+    verify_chain_content(entry, acc)
+  end
+
+  # v2: content-verified — a mismatch is tamper evidence.
+  defp verify_chain_content(%Entry{hash_version: 2} = entry, acc) do
+    if entry_hash_valid?(entry) do
+      Map.update!(acc, :verified, &(&1 + 1))
+    else
+      acc |> Map.update!(:tampered, &[entry.chain_position | &1]) |> Map.put(:ok, false)
+    end
+  end
+
+  # v1 (and any pre-v2): linkage-only — content is not reliably re-derivable (§8.1).
+  defp verify_chain_content(%Entry{}, acc), do: Map.update!(acc, :linkage_only, &(&1 + 1))
+
+  defp finalize_chain_report(acc) do
+    acc
+    |> Map.drop([:prev_hash])
+    |> Map.update!(:tampered, &Enum.reverse/1)
+    |> Map.update!(:broken_links, &Enum.reverse/1)
+  end
 end

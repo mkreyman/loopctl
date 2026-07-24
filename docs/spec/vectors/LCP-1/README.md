@@ -10,9 +10,13 @@ hand-edit — regenerate with:
 | `shares_root.json` | 1 | §5.2 SHARES_ROOT | yes |
 | `canonical_json.json` | 3 | §8.3 canonical JSON | yes |
 | `leaf_hash_v2.json` | 4 | §8.2 v2 leaf hash | yes |
+| `signed_profile.json` | 5 | §9 attestation + claim signatures | yes |
 
 Set 2 (gate decision matrix, §11) is database-dependent and lives as the
-executable suite `test/loopctl/spec/lcp1_conformance_test.exs`. Set 5 (signed
-profile, §9) awaits the agent-signing work.
+executable suite `test/loopctl/spec/lcp1_conformance_test.exs`.
 
-Hashes are lowercase hex of SHA-256 over the LCP-1 §8.2 preimage.
+`signed_profile.json` uses published fixed Ed25519 seeds (`01…01`, `02…02`) so a
+third party can reproduce the attestation and claim signatures byte for byte.
+
+Hashes are lowercase hex of SHA-256 over the relevant LCP-1 preimage (§8.2 for
+leaves, §9.2/§9.3 for signatures).

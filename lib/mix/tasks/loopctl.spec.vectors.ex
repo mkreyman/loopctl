@@ -10,14 +10,15 @@ defmodule Mix.Tasks.Loopctl.Spec.Vectors do
       mix loopctl.spec.vectors
 
   Emits the pure-function sets that a third party can reproduce without a
-  database: SHARES_ROOT (§5.2), canonical_json (§8.3), and the v2 leaf hash
-  (§8.2). The gate decision matrix (§11 set 2) is database-dependent and lives as
-  the executable suite `test/loopctl/spec/lcp1_conformance_test.exs`; the signed
-  profile (§11 set 5) awaits the agent-signing work.
+  database: SHARES_ROOT (§5.2), canonical_json (§8.3), the v2 leaf hash (§8.2),
+  and the signed profile (§9, using published fixed Ed25519 seeds). The gate
+  decision matrix (§11 set 2) is database-dependent and lives as the executable
+  suite `test/loopctl/spec/lcp1_conformance_test.exs`.
   """
   use Mix.Task
 
   alias Loopctl.AuditChain.LeafHash
+  alias Loopctl.Custody.SignedProfile
   alias Loopctl.Dispatches
 
   @out "docs/spec/vectors/LCP-1"
@@ -35,6 +36,7 @@ defmodule Mix.Tasks.Loopctl.Spec.Vectors do
     write("shares_root.json", shares_root())
     write("canonical_json.json", canonical_json())
     write("leaf_hash_v2.json", leaf_hash_v2())
+    write("signed_profile.json", signed_profile())
 
     Mix.shell().info("Wrote LCP-1 vectors to #{@out}/")
   end
@@ -124,6 +126,66 @@ defmodule Mix.Tasks.Loopctl.Spec.Vectors do
         inserted_at: DateTime.to_iso8601(fields.inserted_at)
       },
       leaf_hash: Base.encode16(LeafHash.compute(fields, 2), case: :lower)
+    }
+  end
+
+  # LCP-1 §11 set 5 — signed profile. Uses published fixed Ed25519 seeds so a
+  # third party can reproduce the attestation and claim signatures byte for byte.
+  defp signed_profile do
+    owner_seed = :binary.copy(<<1>>, 32)
+    agent_seed = :binary.copy(<<2>>, 32)
+    {owner_pub, _} = :crypto.generate_key(:eddsa, :ed25519, owner_seed)
+    {agent_pub, agent_priv} = :crypto.generate_key(:eddsa, :ed25519, agent_seed)
+    # For Ed25519 the Erlang private key IS the 32-byte seed.
+    owner_priv = owner_seed
+
+    tenant = "33333333-3333-3333-3333-333333333333"
+    work = "99999999-9999-9999-9999-999999999999"
+    lineage = ["11111111-1111-1111-1111-111111111111"]
+    conditions = "gate=verify&expires<1760000000"
+
+    att_preimage =
+      SignedProfile.attestation_preimage("ed25519", tenant, agent_pub, lineage, conditions)
+
+    att_sig = SignedProfile.sign("ed25519", att_preimage, owner_priv)
+
+    body = %{"outcome" => "approved"}
+    claimed_at = 1_760_000_000
+
+    claim_preimage =
+      SignedProfile.claim_preimage("ed25519", tenant, "verify", work, body, "cap-x", claimed_at)
+
+    claim_sig = SignedProfile.sign("ed25519", claim_preimage, agent_priv)
+
+    %{
+      spec: "LCP-1 §9 signed profile",
+      note: "hex encodings are lowercase; seeds are 32 bytes; signatures are 64 bytes",
+      keys: %{
+        owner_seed: Base.encode16(owner_seed, case: :lower),
+        owner_pubkey: Base.encode16(owner_pub, case: :lower),
+        agent_seed: Base.encode16(agent_seed, case: :lower),
+        agent_pubkey: Base.encode16(agent_pub, case: :lower)
+      },
+      attestation: %{
+        alg: "ed25519",
+        tenant_id: tenant,
+        agent_pubkey: Base.encode16(agent_pub, case: :lower),
+        lineage_path: lineage,
+        conditions: conditions,
+        preimage_sha256: Base.encode16(:crypto.hash(:sha256, att_preimage), case: :lower),
+        attestation_sig: Base.encode16(att_sig, case: :lower)
+      },
+      claim: %{
+        alg: "ed25519",
+        tenant_id: tenant,
+        gate: "verify",
+        work_item_id: work,
+        body: body,
+        capability_id: "cap-x",
+        claimed_at: claimed_at,
+        preimage_sha256: Base.encode16(:crypto.hash(:sha256, claim_preimage), case: :lower),
+        claim_sig: Base.encode16(claim_sig, case: :lower)
+      }
     }
   end
 
