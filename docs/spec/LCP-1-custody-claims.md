@@ -186,14 +186,32 @@ Every custody claim is submitted as an envelope:
   "work_item_id": "<uuid>",
   "capability": "<capability token id>",
   "body": { },
+  "alg": "ed25519",
   "claim_sig": "<base64url, signed profile only>",
   "agent_pubkey": "<base64url, signed profile only>"
 }
 ```
 
-In the `bearer` profile `claim_sig` and `agent_pubkey` MUST be absent, and a server
-receiving them MUST reject the request rather than ignoring the fields. In the `signed`
-profile both are REQUIRED and are specified in §9.
+In the `bearer` profile `alg`, `claim_sig`, and `agent_pubkey` MUST be absent, and a
+server receiving them MUST reject the request rather than ignoring the fields. In the
+`signed` profile all three are REQUIRED and are specified in §9.
+
+### 6.1 Algorithm agility
+
+`alg` names the signature algorithm. This version defines exactly one value, `ed25519`,
+and a server MUST reject any other value. The field is nonetheless REQUIRED rather than
+implied, for two reasons:
+
+1. `alg` is part of every signed preimage (§9.2, §9.3). Omitting it from the signed bytes
+   would permit an algorithm-substitution attack once a second algorithm exists, in which a
+   signature valid under a weaker algorithm is presented as one under a stronger.
+2. Adding an algorithm later is then additive rather than a breaking revision. A future
+   `secp256k1-schnorr` value would let one keypair serve as both a loopctl agent identity
+   and a Nostr identity, which is the plausible interoperability direction; that option is
+   worth preserving and costs one field to preserve.
+
+Implementations MUST NOT infer the algorithm from key length, and MUST NOT accept a claim
+whose `alg` differs from the `alg` recorded on the caller's dispatch enrollment (§9.1).
 
 ## 7. The Custody Gates
 
@@ -309,27 +327,41 @@ Both halves of this clause are normative and are frequently got wrong:
 
 ### 7.5 LINEAGE_CONFLICT, and the non-uniform treatment of unresolvable lineage
 
+An empty lineage path arises from three distinct situations that implementations MUST NOT
+conflate, because they carry different meanings and require different outcomes:
+
+| Situation | Meaning | Required outcome |
+|-----------|---------|------------------|
+| `w.implementer_dispatch_id` is nil | no delegation was ever recorded; pre-dispatch work item | fall through to identifier equality |
+| dispatch id declared, but the row does not resolve | a delegation *was* recorded and cannot be loaded — deleted, revoked, or never existed | **REJECT** |
+| `caller_lineage = []` | the caller authenticated with a credential not minted by a dispatch | fall through to identifier equality (§5.1, §12 OQ2) |
+
 ```
 LINEAGE_CONFLICT(w, caller_lineage) =
   false                                   if w.implementer_dispatch_id = nil
   false                                   if caller_lineage = []
-  SHARES_ROOT(impl, caller_lineage)       otherwise, where impl resolves
-                                          w.implementer_dispatch_id, [] if unresolvable
+  CONFLICT                                if impl = [] and
+                                             w.implementer_dispatch_id ≠ nil
+  SHARES_ROOT(impl, caller_lineage)       otherwise
+                                          where impl resolves w.implementer_dispatch_id
 ```
 
-**Implementations MUST NOT assume the three gates treat an unresolvable lineage
-identically.** They do not:
+The third clause is normative and is the one implementations get wrong. A dispatch
+identifier recorded on the work item that cannot be resolved is an **integrity failure**,
+not an absence of delegation. Treating it as `[]` and relying on `SHARES_ROOT([], x) =
+false` causes an unloadable dispatch to read as *independent lineage*, which is the exact
+inverse of its meaning.
 
-| Situation | `verify` | `report` / `review_complete` |
-|-----------|----------|------------------------------|
-| Caller lineage `[]` (legacy or revoked credential) | n/a — verify compares stored dispatch rows | falls through to identifier equality (clause 4) |
-| Implementer dispatch unresolvable | **rejects** (§7.4.1 clause 1) | falls through to identifier equality (clause 4) |
+This matters beyond correctness of the predicate: revoking a dispatch is a routine,
+authorized lifecycle operation. Without this clause, revocation silently downgrades the
+`report` and `review_complete` gates to the pre-lineage guarantee — a normal operation
+acting as a security downgrade. `verify` closes the same case in §7.4.1 clause 1; the
+three gates are aligned on it.
 
-At `report` and `review_complete` an unresolvable or revoked lineage therefore degrades
-the gate to plain identifier equality rather than blocking. This is weaker than `verify`.
-It is specified here as the current normative behaviour so that a verifier does not
-over-rely on it; see §10.2 for what this means for the guarantee, and §12 for the open
-question of whether to align the three.
+Note that this clause is deliberately narrower than "fail closed on any empty lineage".
+Rows one and three of the table above remain fall-through: no legitimate caller is
+affected by this rejection, because a recorded-but-unloadable dispatch is already a
+corrupt record.
 
 ### 7.6 Capability binding
 
@@ -462,14 +494,49 @@ event integrity unless §8.5 holds.
 
 This section applies only to deployments advertising `custody_profile: "signed"`.
 
-### 9.1 Keys
+### 9.1 Keys and enrollment
 
-Each agent MUST hold an Ed25519 keypair whose private half is never transmitted to the
-server and never leaves the agent's execution environment. The agent's public key is
-recorded on its dispatch.
+Each agent MUST hold an Ed25519 keypair. The keypair MUST be generated within the agent's
+own execution environment. The private half MUST NOT be transmitted to the server, and the
+protocol MUST NOT define any endpoint, field, or flow capable of carrying it. Enrollment
+carries the public half only.
 
 Compromise of an agent private key MUST NOT imply compromise of any other key. In
 particular it MUST NOT imply compromise of the credential that authorized the dispatch.
+
+#### 9.1.1 Enrollment transparency
+
+A server can always generate a keypair and enroll it as though it were an agent's. No
+protocol rule can prevent this, because the server is the party that records enrollments.
+This specification therefore does not attempt prevention; it requires **detectability**,
+following the design of Certificate Transparency and of the append-only key logs used for
+messaging identity.
+
+Every agent key enrollment MUST be appended to the tenant's audit chain (§8) as an entry
+whose payload includes `agent_pubkey`, `alg`, the lineage path the key is enrolled
+against, and the enrolling party's identity. Enrollment entries are therefore covered by
+the tenant's signed tree heads and are immutable and non-retroactive on the same terms as
+every other entry.
+
+A tenant MUST be able to enumerate the complete set of agent public keys enrolled under
+its tenant from the chain alone, without trusting a server-side listing endpoint. A
+conforming client SHOULD compare that set against the set of keys it generated and SHOULD
+treat any excess as an operator-minted key.
+
+This yields the property the profile actually needs: an operator that mints an agent key
+cannot do so invisibly, cannot do so retroactively, and cannot later deny it. Deployments
+MUST NOT describe the `signed` profile as preventing operator key minting; the guarantee
+is detection, and it is sufficient because an undeniable public record is what constrains
+the operator.
+
+#### 9.1.2 Hardware-attested keys (optional)
+
+A deployment MAY additionally support keys generated in hardware that can produce an
+attestation of non-exportability, and MAY advertise this as a distinct profile value. This
+is OPTIONAL: agents commonly execute as ephemeral processes in environments without
+attestable hardware, and requiring it would make the `signed` profile unimplementable for
+the majority of deployments. Where supported, it upgrades §9.1.1 from detection to
+prevention.
 
 ### 9.2 Dispatch attestation
 
@@ -478,11 +545,12 @@ public key, not a bearer token issued in place of one. The authorizing party sig
 
 ```
 preimage = "loopctl/dispatch-attestation/1" ||
+           LP(alg) ||
            LP(tenant_id) ||
            LP(agent_pubkey) ||
            LP(canonical_json(lineage_path)) ||
            LP(conditions)
-attestation = Ed25519(authorizer_private_key, SHA-256(preimage))
+attestation = Sign(alg, authorizer_private_key, SHA-256(preimage))
 ```
 
 `conditions` is a UTF-8 string of zero or more `&`-separated clauses, each of the form
@@ -505,13 +573,14 @@ attribute the claim to the authorizer or merge it into the authorizer's activity
 
 ```
 preimage  = "loopctl/custody-claim/1" ||
+            LP(alg) ||
             LP(tenant_id) ||
             LP(gate) ||
             LP(work_item_id) ||
             LP(canonical_json(body)) ||
             LP(capability_id) ||
             uint64_be(claimed_at)
-claim_sig = Ed25519(agent_private_key, SHA-256(preimage))
+claim_sig = Sign(alg, agent_private_key, SHA-256(preimage))
 ```
 
 A server MUST reject a claim whose signature does not verify against the `agent_pubkey`
@@ -544,10 +613,21 @@ gate, and writes the entry; nothing in the record distinguishes an entry produce
 real agent from one produced by the server. A tenant that does not control the server MUST
 NOT treat a `bearer`-profile custody record as evidence against the operator.
 
-Additionally, per §7.5, the `report` and `review_complete` gates degrade to identifier
-equality when a lineage cannot be resolved. An adversary able to cause an implementer's
-dispatch row to become unresolvable — by revoking it, for example — weakens those two
-gates to the pre-lineage guarantee. `verify` is not affected.
+### 10.2.1 Known conformance gap in the reference implementation
+
+As of this draft, the loopctl reference implementation does not satisfy §7.5 clause three
+at the `report` and `review_complete` gates: an implementer dispatch that is declared but
+unresolvable falls through to identifier equality instead of rejecting. `verify` does
+satisfy it. Until this is closed, an adversary able to render an implementer's dispatch row
+unresolvable — by revoking it, for example — weakens those two gates to the pre-lineage
+guarantee.
+
+It also does not satisfy §8.5: no code path recomputes a leaf hash from entry content, so
+the deployed chain proves linkage and inclusion but not that any hash commits to its own
+entry.
+
+Both are tracked as implementation defects against this specification, not as permitted
+variations. A deployment MUST NOT advertise conformance while either holds.
 
 ### 10.3 What neither profile guarantees
 
@@ -593,7 +673,12 @@ The following vectors are REQUIRED before this document leaves `draft`:
 Verifiers MUST reject each of the following. These are REQUIRED as executable negative
 tests, not prose.
 
-- A claim carrying `claim_sig` or `agent_pubkey` in a `bearer`-profile deployment.
+- A claim carrying `alg`, `claim_sig`, or `agent_pubkey` in a `bearer`-profile deployment.
+- A claim whose `alg` is absent, unrecognised, or differs from the `alg` recorded on the
+  caller's dispatch enrollment.
+- A claim whose signature verifies over a preimage omitting `alg` — the
+  algorithm-substitution case §6.1 exists to prevent.
+- An agent key enrollment that does not appear as an entry in the tenant's audit chain.
 - A dispatch attestation whose authorizer public key equals `agent_pubkey`.
 - An attestation `conditions` string of `gate=verify&` (trailing delimiter).
 - An attestation `conditions` string containing `expires<01` (non-canonical decimal).
@@ -615,24 +700,38 @@ tests, not prose.
 
 These MUST be resolved before this document leaves `draft`.
 
-1. **Should `report` and `review_complete` fail closed on an unresolvable lineage, as
-   `verify` does (§7.5)?** Aligning them strengthens the guarantee and removes a
-   documented asymmetry that implementers will otherwise get wrong. It also means a
-   revoked dispatch begins blocking operations that previously succeeded, which is a
-   behavioural change for existing deployments and needs a migration story.
-2. **Where does an agent private key live in practice, and what is the threat model for
-   its storage?** §9.1 states the requirement and not the mechanism. A key sitting in a
-   file next to the credential it replaces defeats much of the point against a local
-   attacker, though not against a dishonest operator, which is the threat §9 exists to
-   address.
-3. **Should capability-token message construction adopt the §1 `LP` framing?** The
+1. **Should capability-token message construction adopt the §1 `LP` framing?** The
    currently deployed construction concatenates variable-length fields without separation,
    which is the same defect §8.1 documents for leaf hashes and should be fixed in the same
    pass rather than separately.
-4. **Does `signed` profile require the *operator* to hold no agent private keys, and if so
-   how is that attested?** Without an answer, a deployment can advertise `signed` while
-   generating agent keys server-side, which reduces the profile to `bearer` with extra
-   steps.
+2. **On what schedule does an empty *caller* lineage stop being permitted (§5.1, §7.5 row
+   three)?** A credential not minted by a dispatch resolves to `[]` and falls through to
+   identifier equality. This is the legacy pre-dispatch credential case, and closing it is
+   a deprecation decision with a migration story, distinct from the integrity case closed
+   in §7.5 clause three.
+3. **Where does an agent private key live within the agent's environment?** §9.1 requires
+   agent-side generation and non-transmission; it does not specify storage. A key in a file
+   beside the credential it replaces is adequate against the dishonest-operator threat §9
+   addresses, and inadequate against a local attacker. Deployments with the latter in scope
+   need §9.1.2.
+
+### 12.1 Resolved
+
+- **Do the three gates treat an unresolvable lineage identically?** Resolved: they must,
+  and the alignment point is *declared-but-unresolvable*, not "any empty lineage" (§7.5).
+  A recorded dispatch identifier that fails to resolve is an integrity failure and MUST
+  reject at all three gates. The nil-dispatch and empty-caller-lineage cases remain
+  fall-through and are separate questions (OQ2).
+- **Does `signed` forbid operator-held agent keys, and how is that attested?** Resolved:
+  agent-side generation is REQUIRED and the protocol carries no path for a private key
+  (§9.1), but the enforcement is **detection, not prevention** — every enrollment is an
+  audit-chain entry, so an operator-minted key is visible, non-retroactive, and undeniable
+  (§9.1.1). Prevention is available only via optional hardware attestation (§9.1.2) and is
+  not required.
+- **Is the signature algorithm fixed?** Resolved: `ed25519` is the only value this version
+  defines, but `alg` is a REQUIRED field carried inside every signed preimage (§6.1), so a
+  future algorithm — `secp256k1-schnorr` being the plausible interoperability target — is
+  additive rather than a breaking revision.
 
 ## 13. Relationship to Other Documents
 
