@@ -611,7 +611,7 @@ A dispatch in the `signed` profile is an authorization credential over the agent
 public key, not a bearer token issued in place of one. The authorizing party signs:
 
 ```
-preimage = "loopctl/dispatch-attestation/1" ||
+preimage = LP("loopctl/dispatch-attestation/1") ||
            LP(alg) ||
            LP(tenant_id) ||
            LP(agent_pubkey) ||
@@ -636,10 +636,39 @@ The attestation authorizes; it does not transfer authorship. A verifier MUST tre
 `agent_pubkey` as the sole author of any claim carrying the attestation, and MUST NOT
 attribute the claim to the authorizer or merge it into the authorizer's activity.
 
+#### 9.2.1 Owner-key rotation
+
+The tenant owner key is the root the attestation chain hangs from. FIRST registration of
+an owner key is authorized by the human anchor and the `user`-role gate — there is no
+outgoing key to prove possession of. ROTATION (replacing an existing owner key) MUST
+additionally carry a proof-of-possession signature by the OUTGOING key:
+
+```
+preimage       = LP("loopctl/owner-key-rotation/2") ||
+                 LP(tenant_id) ||
+                 LP(old_pubkey) ||
+                 uint64_be(old_set_at) ||
+                 LP(new_pubkey) ||
+                 LP(new_alg)
+rotation_proof = Sign(old_alg, old_private_key, SHA-256(preimage))
+```
+
+Unlike §9.2/§9.3, the rotation preimage carries NO `alg` element after the domain: the
+signing algorithm is that of the OUTGOING key, recorded on the tenant, not a claim-carried
+field. `old_set_at` is the Unix-**microsecond** instant the retiring key became current
+(the tenant's recorded owner-key set-at), bound as an unsigned 64-bit big-endian value.
+Binding both the outgoing key AND its `old_set_at` makes a captured rotation proof
+non-replayable across a rotate-back: after `A→B→A`, key `A`'s `set_at` has advanced, so a
+prior `Sign_A(…, A, old_set_at, B)` no longer reconstructs and cannot re-root trust back to
+a compromised `B`. A server MUST verify `rotation_proof` against the currently-recorded
+owner key before adopting `new_pubkey`, and MUST reject a rotation whose proof does not
+verify. This is domain `/2`; a `/1` predecessor that bound only the new key (replayable) is
+retired and MUST NOT be accepted.
+
 ### 9.3 Claim signature
 
 ```
-preimage  = "loopctl/custody-claim/1" ||
+preimage  = LP("loopctl/custody-claim/1") ||
             LP(alg) ||
             LP(tenant_id) ||
             LP(gate) ||
@@ -724,7 +753,20 @@ is activatable per deployment. It delivers PREVENTION, not merely detection:
   deferred DB constraint-trigger backstop against direct-insert enrollment.
 - **§9.3 claim enforcement.** Under the `signed` profile, an enrolled caller's custody
   claim MUST carry a valid signature, pre-verified before the gate by
-  `LoopctlWeb.Plugs.RequireSignedClaim` on report / review_complete / verify.
+  `LoopctlWeb.Plugs.RequireSignedClaim` on report / review_complete / verify. A caller
+  signing with the SAME enrolled key that implemented the work is rejected
+  (`self_signed_claim`) — cryptographic-identity custody separation, not merely lineage.
+  A bearer dispatch for an agent that enrolled a signing key elsewhere is likewise refused
+  (`agent_enrollment_required`), so a migrated agent cannot be impersonated by an unsigned
+  dispatch in its name.
+- **§9.4 audit binding.** A verified signed-profile gate decision persists `agent_pubkey`
+  and `claim_sig` inside the hash-chained audit entry's `payload`, atomically with the gate
+  transition, so a chain replay re-checks authorship offline. Wired into `Progress`
+  report / review_complete / verify.
+- **§9.2.1 owner-key rotation.** Replacing the owner key REQUIRES a proof-of-possession
+  signature by the outgoing key (`Tenants.register_or_rotate_owner_key`), binding the old
+  key and its microsecond set-at so a captured proof is non-replayable after a rotate-back.
+  First registration is human-anchor + `user`-gated with no proof.
 
 Activation is a per-deployment setting: `SystemConfig` key
 `custody_signed_profile_enforcement` (0 = `bearer` default, 1 = `signed`), advertised at
@@ -763,10 +805,14 @@ Generated so far — the pure-function sets a third party can reproduce without 
 - `shares_root.json` (set 1, §5.2)
 - `canonical_json.json` (set 3, §8.3)
 - `leaf_hash_v2.json` (set 4, §8.2)
+- `signed_profile.json` (set 5, §9) — attestation (§9.2), claim (§9.3), and owner-key
+  rotation proof (§9.2.1), with published fixed Ed25519 seeds. Reproduced byte-for-byte by
+  the MCP client helpers in `mcp-server/test/custody_signing.test.js`, proving JS↔Elixir
+  preimage parity.
 
 Set 2 (the gate decision matrix) is database-dependent and lives as the executable suite
 `test/loopctl/spec/lcp1_conformance_test.exs`, which asserts one vector per clause of each
-gate. Set 5 (signed profile) awaits the agent-signing work (§9).
+gate.
 
 The full REQUIRED set before this document leaves `draft`:
 
@@ -784,8 +830,9 @@ The full REQUIRED set before this document leaves `draft`:
    symbol keys and with string keys, which MUST produce identical output.
 4. **Leaf hash v2** — a genesis entry and its successor, with absent and present optional
    fields, demonstrating that `PRESENT` distinguishes absent from empty.
-5. **Signed profile** — a dispatch attestation and a claim signature with published
-   private keys, in the style of the worked example in §9.
+5. **Signed profile** — a dispatch attestation, a claim signature, and an owner-key
+   rotation proof (§9.2.1) with published private keys, in the style of the worked example
+   in §9. Generated as `signed_profile.json`.
 
 ### 11.1 Invalid Vectors
 

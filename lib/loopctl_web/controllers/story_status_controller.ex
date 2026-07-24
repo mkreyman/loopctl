@@ -341,7 +341,10 @@ defmodule LoopctlWeb.StoryStatusController do
         agent_id: api_key.agent_id,
         # Chain of custody: the reporter's lineage is resolved SERVER-SIDE from
         # the authenticating key's dispatch — never taken from the request body.
-        reporter_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+        reporter_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id),
+        # LCP-1 §9.4: the RequireSignedClaim plug stashed the verified signed claim
+        # (nil under bearer); Progress records it in the hash-chained audit entry.
+        custody_claim: conn.assigns[:custody_signed_claim]
       )
       |> maybe_add_token_usage(params)
 

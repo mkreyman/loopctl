@@ -96,4 +96,23 @@ describe("LCP-1 §9 MCP signing reproduces the Elixir vectors", () => {
     assert.equal(digest.toString("hex"), a.preimage_sha256);
     assert.equal(sig.toString("hex"), a.attestation_sig);
   });
+
+  test("owner-key rotation proof (§9.2) is byte-identical", () => {
+    // NOTE: no `alg` element after the domain (unlike claim/attestation); old_set_at
+    // is a raw uint64 of MICROSECONDS. Signed by the OUTGOING (owner) key.
+    const r = vectors.owner_rotation;
+    const setAt = Buffer.alloc(8);
+    setAt.writeBigUInt64BE(BigInt(r.old_set_at_unix_micros));
+    const preimage = Buffer.concat([
+      lp(Buffer.from("loopctl/owner-key-rotation/2", "utf8")),
+      lp(Buffer.from(r.tenant_id, "utf8")),
+      lp(Buffer.from(r.old_pubkey, "hex")),
+      setAt,
+      lp(Buffer.from(r.new_pubkey, "hex")),
+      lp(Buffer.from(r.new_alg, "utf8")),
+    ]);
+    const { sig, digest } = sign(preimage, vectors.keys.owner_seed);
+    assert.equal(digest.toString("hex"), r.preimage_sha256);
+    assert.equal(sig.toString("hex"), r.rotation_proof);
+  });
 });

@@ -127,6 +127,9 @@ defmodule LoopctlWeb.ReviewRecordController do
       AuditContext.from_conn(conn)
       |> Keyword.put(:reviewer_agent_id, reviewer_agent_id)
       |> Keyword.put(:reviewer_lineage, reviewer_lineage)
+      # LCP-1 §9.4: record the verified signed claim (nil under bearer) in the
+      # hash-chained audit entry, atomically with the review record.
+      |> Keyword.put(:custody_claim, conn.assigns[:custody_signed_claim])
 
     case Progress.record_review(tenant_id, story_id, params, opts) do
       {:ok, review_record} ->

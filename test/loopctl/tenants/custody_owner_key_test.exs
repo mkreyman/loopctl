@@ -19,9 +19,20 @@ defmodule Loopctl.Tenants.CustodyOwnerKeyTest do
   setup :verify_on_exit!
 
   # A rotation must prove possession of the OUTGOING owner private key: a signature
-  # over owner_rotation_preimage(tenant_id, new_pubkey, new_alg).
+  # over owner_rotation_preimage(tenant_id, OLD_pubkey, OLD_set_at, new_pubkey, new_alg).
+  # The outgoing key + its set_at are read from the CURRENT tenant row.
   defp rotation_proof(tenant_id, old_priv, new_pub, new_alg \\ "ed25519") do
-    preimage = SignedProfile.owner_rotation_preimage(tenant_id, new_pub, new_alg)
+    {:ok, tenant} = Tenants.get_tenant(tenant_id)
+
+    preimage =
+      SignedProfile.owner_rotation_preimage(
+        tenant_id,
+        tenant.custody_owner_pubkey,
+        DateTime.to_unix(tenant.custody_owner_key_set_at, :microsecond),
+        new_pub,
+        new_alg
+      )
+
     SignedProfile.sign("ed25519", preimage, old_priv)
   end
 
@@ -115,6 +126,38 @@ defmodule Loopctl.Tenants.CustodyOwnerKeyTest do
 
       assert history_rows(tenant.id) == []
       assert length(owner_key_events(tenant.id)) == 1
+    end
+
+    test "a captured rotation proof cannot be REPLAYED after a rotate-back (freshness bound)" do
+      tenant = fixture(:tenant)
+      {pub_a, priv_a} = :crypto.generate_key(:eddsa, :ed25519)
+      {pub_b, priv_b} = :crypto.generate_key(:eddsa, :ed25519)
+
+      # A -> B: capture the A-signed proof.
+      {:ok, _} = Tenants.register_custody_owner_key(tenant.id, pub_a, "ed25519")
+      proof_a_to_b = rotation_proof(tenant.id, priv_a, pub_b)
+
+      {:ok, _} =
+        Tenants.register_custody_owner_key(tenant.id, pub_b, "ed25519",
+          rotation_proof: proof_a_to_b
+        )
+
+      # B -> A (B is later "compromised", so the owner rotates back to A).
+      {:ok, _} =
+        Tenants.register_custody_owner_key(tenant.id, pub_a, "ed25519",
+          rotation_proof: rotation_proof(tenant.id, priv_b, pub_a)
+        )
+
+      # Attacker holding compromised B replays the OLD A->B proof. Current key is A
+      # again, but A's set_at has advanced, so the captured proof no longer matches
+      # the reconstructed preimage → rejected. Trust is NOT re-rooted to B.
+      assert {:error, :owner_rotation_proof_invalid} =
+               Tenants.register_custody_owner_key(tenant.id, pub_b, "ed25519",
+                 rotation_proof: proof_a_to_b
+               )
+
+      {:ok, final} = Tenants.get_tenant(tenant.id)
+      assert final.custody_owner_pubkey == pub_a
     end
   end
 

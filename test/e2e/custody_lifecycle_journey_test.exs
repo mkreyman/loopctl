@@ -346,6 +346,17 @@ defmodule Loopctl.E2E.CustodyLifecycleJourneyTest do
         })
 
       assert json_response(signed, 200)["story"]["agent_status"] == "reported_done"
+
+      # LCP-1 §9.4: the verified claim signature is durably recorded in the
+      # hash-chained audit chain (offline-verifiable residue), not just checked in RAM.
+      entry =
+        Loopctl.AuditChain.list_entries(tenant.id, action: "signed_custody_claim").data
+        |> Enum.find(&(&1.entity_id == story.id))
+
+      assert entry, "expected a signed_custody_claim audit-chain entry"
+      assert entry.payload["gate"] == "report"
+      assert entry.payload["agent_pubkey"] == Base.encode16(reporter_pub, case: :lower)
+      assert entry.payload["claim_sig"] == Base.encode16(claim_sig, case: :lower)
     end
 
     test "the enrolled key is enumerable from the transparency endpoint (§9.1.1)" do

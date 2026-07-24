@@ -57,10 +57,13 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
   one-time-use primitive when a gate genuinely needs single-use semantics.
   """
 
+  import Ecto.Query, only: [from: 2]
   require Logger
 
+  alias Loopctl.AdminRepo
   alias Loopctl.Custody.SignedProfile
   alias Loopctl.Dispatches
+  alias Loopctl.WorkBreakdown.Story
 
   @profile_key "custody_signed_profile_enforcement"
 
@@ -146,14 +149,23 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
       {:ok, %{agent_pubkey: pubkey} = dispatch} when is_binary(pubkey) ->
         verify_enrolled(tenant_id, dispatch, gate, work_item_id, capability_id, claim_params)
 
-      _not_enrolled ->
-        # No enrolled key: the enrolled-only gradual-rollout waiver. A legacy/bearer
-        # caller is NOT forced to sign — it stays bounded by the role gate and the
-        # lineage self-* custody checks, but its claims are NOT cryptographically
-        # attributable. For un-enrolled work the §9.1.1 transparency layer is the
-        # only guarantee (DETECTION, not prevention). Tightening this to "every
-        # dispatch must be enrolled + signed" is a future, stricter config value —
-        # an ADDITIVE posture, not a change to this contract (see the moduledoc).
+      {:ok, %{agent_id: agent_id}} when is_binary(agent_id) ->
+        # A BEARER dispatch (no enrolled key). Normally waived (gradual rollout) — BUT
+        # if this AGENT has opted into signing elsewhere (an active enrolled dispatch),
+        # a bearer dispatch for the same agent_id must NOT make unsigned claims in its
+        # name, or it impersonates precisely the agents that migrated. Close that gap;
+        # otherwise apply the waiver.
+        if Dispatches.agent_has_enrolled_key?(tenant_id, agent_id) do
+          {:error, :agent_enrollment_required}
+        else
+          :ok
+        end
+
+      _no_dispatch ->
+        # A legacy env-var key with no dispatch at all: the enrolled-only
+        # gradual-rollout waiver. Bounded by the role gate and the lineage self-*
+        # checks, but NOT cryptographically attributable — §9.1.1 transparency is the
+        # only guarantee (DETECTION, not prevention) until every key is dispatch-minted.
         :ok
     end
   end
@@ -208,9 +220,11 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
              signature: signature
            )
            |> normalize_verify_result(gate, work_item_id, dispatch),
-         :ok <- check_claim_fresh(claimed_at, gate, work_item_id, dispatch) do
-      # Last step is the with's value (`:ok` or `{:error, :claim_condition_unmet}`).
-      check_attestation_conditions(dispatch, gate)
+         :ok <- check_claim_fresh(claimed_at, gate, work_item_id, dispatch),
+         :ok <- check_attestation_conditions(dispatch, gate) do
+      # Final custody-separation check: the signing key must differ from the
+      # implementer's enrolled key (see check_pubkey_separation/4).
+      check_pubkey_separation(tenant_id, dispatch, gate, work_item_id)
     else
       # The `require_sig`/`require_present`/`require_int`/`decode_sig` guards return
       # BEFORE `normalize_verify_result`/`check_claim_fresh`/`check_attestation_conditions`
@@ -247,6 +261,51 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
         :ok
     end
   end
+
+  # LCP-1 custody separation at the CRYPTOGRAPHIC-identity level. The lineage/agent-id
+  # self-checks (`Progress.validate_not_self_*`) compare dispatch lineages and agent
+  # ids, but NEVER the enrolled public keys — so one keypair enrolled on two
+  # independently-rooted dispatches (distinct agent ids) could sign BOTH the
+  # implementer's report AND the verifier's claim, defeating the separation the
+  # product exists to enforce. On `verify`/`review_complete`, reject when the signing
+  # (caller) key equals the implementer dispatch's enrolled key. Only meaningful when
+  # the story has a dispatched, enrolled implementer; otherwise the lineage/agent-id
+  # gates apply and this is a no-op.
+  defp check_pubkey_separation(tenant_id, dispatch, gate, work_item_id)
+       when gate in ["verify", "review_complete"] do
+    case implementer_pubkey(tenant_id, work_item_id) do
+      pk when is_binary(pk) and pk == dispatch.agent_pubkey ->
+        log_reject(
+          gate,
+          work_item_id,
+          dispatch,
+          "signing key equals the implementer's enrolled key"
+        )
+
+        {:error, :self_signed_claim}
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp check_pubkey_separation(_tenant_id, _dispatch, _gate, _work_item_id), do: :ok
+
+  defp implementer_pubkey(tenant_id, story_id) when is_binary(story_id) do
+    impl_dispatch_id =
+      from(s in Story,
+        where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+        select: s.implementer_dispatch_id
+      )
+      |> AdminRepo.one()
+
+    case impl_dispatch_id && Dispatches.get_dispatch(tenant_id, impl_dispatch_id) do
+      {:ok, %{agent_pubkey: pk}} -> pk
+      _ -> nil
+    end
+  end
+
+  defp implementer_pubkey(_tenant_id, _story_id), do: nil
 
   # Enforce the verified attestation's §9.2 conditions (`gate=<name>` / `expires<ts>`)
   # at claim time. Without this an owner attestation scoped to `gate=report` would be

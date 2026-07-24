@@ -501,7 +501,12 @@ defmodule Loopctl.Custody.SignedProfileTest do
           expires_at: DateTime.add(now, 3600, :second),
           created_at: now,
           agent_pubkey: pub,
-          alg: "ed25519"
+          alg: "ed25519",
+          # A dummy attestation blob so the both-or-neither CHECK
+          # (dispatches_attestation_matches_enrollment) passes and the insert reaches
+          # the transparency trigger — the trigger checks for the audit entry, not the
+          # attestation's validity.
+          attestation: :binary.copy(<<0>>, 64)
         })
         |> AdminRepo.insert!()
 

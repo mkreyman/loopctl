@@ -52,10 +52,18 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaim do
     api_key_id = conn.assigns[:current_api_key] && conn.assigns.current_api_key.id
     work_item_id = conn.params["id"]
     capability_id = conn.params["capability"] || conn.params["cap_id"]
-    claim_params = conn.params["claim"] || %{}
+    # A non-map `claim` (a stray string/list) must yield the plug's own
+    # malformed/required rejection, never a BadMapError 500 downstream.
+    claim_params =
+      case conn.params["claim"] do
+        %{} = c -> c
+        _ -> %{}
+      end
+
+    profile = SignedProfilePolicy.profile()
 
     case SignedProfilePolicy.verify_request(
-           SignedProfilePolicy.profile(),
+           profile,
            tenant_id,
            api_key_id,
            gate,
@@ -64,19 +72,54 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaim do
            claim_params
          ) do
       :ok ->
-        conn
+        # On the verified signed path, stash the claim so the custody controller can
+        # persist it in the gate's HASH-CHAINED audit entry (LCP-1 §9.4). Without this
+        # durable cryptographic residue the verified signature evaporates at request
+        # end and a malicious operator could fabricate an "agent-signed" record.
+        stash_verified_claim(conn, profile, tenant_id, api_key_id, gate, claim_params)
 
       {:error, code} ->
         reject(conn, code)
     end
   end
 
+  # Only stash when a signature was actually VERIFIED — i.e. signed profile AND the
+  # caller is enrolled AND a claim_sig is present (the waived bearer/legacy path
+  # returns :ok too, with nothing to record).
+  defp stash_verified_claim(
+         conn,
+         :signed,
+         tenant_id,
+         api_key_id,
+         gate,
+         %{"claim_sig" => sig} = claim
+       )
+       when is_binary(sig) do
+    case Loopctl.Dispatches.dispatch_for_api_key(tenant_id, api_key_id) do
+      {:ok, %{agent_pubkey: pk, alg: alg}} when is_binary(pk) ->
+        Plug.Conn.assign(conn, :custody_signed_claim, %{
+          gate: gate,
+          agent_pubkey_hex: Base.encode16(pk, case: :lower),
+          alg: alg,
+          claim_sig: String.downcase(sig),
+          claimed_at: claim["claimed_at"]
+        })
+
+      _ ->
+        conn
+    end
+  end
+
+  defp stash_verified_claim(conn, _profile, _tenant_id, _api_key_id, _gate, _claim), do: conn
+
   defp reject(conn, code) do
+    {plug_status, http_status} = status_for(code)
+
     conn
-    |> put_status(:unauthorized)
+    |> put_status(plug_status)
     |> Phoenix.Controller.json(%{
       error: %{
-        status: 401,
+        status: http_status,
         code: Atom.to_string(code),
         message: message_for(code),
         remediation: %{learn_more: "https://loopctl.com/spec/LCP-1"}
@@ -84,6 +127,13 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaim do
     })
     |> halt()
   end
+
+  # A signature/auth failure is 401. A custody-SEPARATION failure — the signing key
+  # is the implementer's own key — is a 403: the caller authenticated fine, but this
+  # key may not verify this work.
+  defp status_for(:self_signed_claim), do: {:forbidden, 403}
+  defp status_for(:agent_enrollment_required), do: {:forbidden, 403}
+  defp status_for(_), do: {:unauthorized, 401}
 
   defp message_for(:claim_signature_required),
     do:
@@ -114,6 +164,18 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaim do
       "Your dispatch's owner/parent attestation does not authorize this claim: a " <>
         "§9.2 condition (`gate=<name>` or `expires<ts>`) is unmet. Use a dispatch " <>
         "whose attestation covers this gate and is unexpired."
+
+  defp message_for(:agent_enrollment_required),
+    do:
+      "This agent has an enrolled signing key (LCP-1 §9), but you are calling on a " <>
+        "BEARER dispatch that carries none. Use the agent's ENROLLED dispatch (which can " <>
+        "sign the claim); an unsigned bearer dispatch may not act in an enrolled agent's name."
+
+  defp message_for(:self_signed_claim),
+    do:
+      "The key signing this claim is the SAME key that implemented the work (LCP-1 " <>
+        "custody separation). An independent verifier — a different enrolled key — " <>
+        "must sign the verify/review claim; you cannot verify your own implementation."
 
   defp message_for(:bulk_signature_unsupported),
     do:

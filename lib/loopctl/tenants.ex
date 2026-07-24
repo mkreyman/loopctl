@@ -774,7 +774,7 @@ defmodule Loopctl.Tenants do
       is_binary(old_pubkey) ->
         prev = %{pubkey: old_pubkey, alg: old_alg, set_at: old_set_at}
 
-        with :ok <- verify_owner_rotation_proof(tenant.id, old_pubkey, old_alg, pubkey, alg, opts) do
+        with :ok <- verify_owner_rotation_proof(tenant.id, prev, pubkey, alg, opts) do
           write_owner_key(repo, tenant, {pubkey, alg}, prev, actor_lineage, now)
         end
 
@@ -789,10 +789,23 @@ defmodule Loopctl.Tenants do
   # the retiring public key. This is the §9.2 root-of-trust guard: neither a stolen
   # `:user` API key nor the operator (who never holds the owner private half) can
   # forge it.
-  defp verify_owner_rotation_proof(tenant_id, old_pubkey, old_alg, new_pubkey, new_alg, opts) do
+  defp verify_owner_rotation_proof(tenant_id, prev, new_pubkey, new_alg, opts) do
+    %{pubkey: old_pubkey, alg: old_alg, set_at: old_set_at} = prev
+
     case Keyword.get(opts, :rotation_proof) do
       sig when is_binary(sig) ->
-        preimage = SignedProfile.owner_rotation_preimage(tenant_id, new_pubkey, new_alg)
+        # Bind the OUTGOING key + its set_at so a captured proof cannot be replayed
+        # after a rotate-back (see owner_rotation_preimage/5).
+        preimage =
+          SignedProfile.owner_rotation_preimage(
+            tenant_id,
+            old_pubkey,
+            # MICROSECOND precision so two rotations in the same second still bind
+            # distinct freshness values (the column is :utc_datetime_usec).
+            DateTime.to_unix(old_set_at, :microsecond),
+            new_pubkey,
+            new_alg
+          )
 
         if SignedProfile.verify(old_alg, preimage, sig, old_pubkey),
           do: :ok,

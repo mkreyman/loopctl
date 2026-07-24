@@ -30,7 +30,7 @@ defmodule Loopctl.Custody.SignedProfile do
 
   @attestation_domain "loopctl/dispatch-attestation/1"
   @claim_domain "loopctl/custody-claim/1"
-  @owner_rotation_domain "loopctl/owner-key-rotation/1"
+  @owner_rotation_domain "loopctl/owner-key-rotation/2"
 
   # The only algorithm this version defines (LCP-1 §6.1). A future
   # "secp256k1-schnorr" (Nostr interop) is an ADDITIVE entry here plus a matching
@@ -362,18 +362,29 @@ defmodule Loopctl.Custody.SignedProfile do
   The preimage the OUTGOING owner key signs to authorize a rotation to a new owner
   key.
 
-  `preimage = domain || LP(tenant_id) || LP(new_pubkey) || LP(new_alg)`
+  `preimage = LP(domain) || LP(tenant_id) || LP(old_pubkey) || uint64_be(old_set_at) ||
+              LP(new_pubkey) || LP(new_alg)`
 
   Rotating the §9.2 owner key re-roots the entire attestation chain, so a rotation
   MUST prove possession of the retiring root private half — a stolen `:user` API
   key alone cannot re-root trust. First registration (no prior key) is authorized
   by the human-anchor + `:user` gate instead; there is no outgoing key to sign.
+
+  The OUTGOING key (`old_pubkey`) and its `old_set_at` (the Unix second the retiring
+  key became current) are bound into the preimage so a captured rotation proof is
+  NOT replayable when a prior key becomes current again: after `A→B→A`, key `A`'s
+  `set_at` has advanced, so the old `Sign_A(…, A, old_set_at, B)` proof no longer
+  matches the reconstructed preimage and cannot re-root trust back to the (now
+  compromised) `B`.
   """
-  @spec owner_rotation_preimage(binary(), binary(), String.t()) :: binary()
-  def owner_rotation_preimage(tenant_id, new_pubkey, new_alg)
-      when is_binary(new_pubkey) and is_binary(new_alg) do
+  @spec owner_rotation_preimage(binary(), binary(), integer(), binary(), String.t()) :: binary()
+  def owner_rotation_preimage(tenant_id, old_pubkey, old_set_at, new_pubkey, new_alg)
+      when is_binary(old_pubkey) and is_integer(old_set_at) and is_binary(new_pubkey) and
+             is_binary(new_alg) do
     lp(@owner_rotation_domain) <>
       lp(to_string(tenant_id)) <>
+      lp(old_pubkey) <>
+      <<old_set_at::unsigned-big-integer-size(64)>> <>
       lp(new_pubkey) <>
       lp(new_alg)
   end

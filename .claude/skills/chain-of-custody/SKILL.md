@@ -73,31 +73,31 @@ If yes, the change is wrong.
 Enforced in `lib/loopctl/progress.ex`. The three gates are NOT one implementation, but ALL THREE now
 compare dispatch lineage and all three fail closed on a story with no custody provenance. The
 caller's lineage is always resolved SERVER-SIDE from the authenticating key
-(`Dispatches.lineage_for_api_key/2`, `dispatches.ex:517-527`) — never read from the request body.
+(`Dispatches.lineage_for_api_key/2`, `dispatches.ex:518-528`) — never read from the request body.
 
-- **verify** — `validate_not_self_verify/2` `progress.ex:1684-1715`. `nil` orchestrator identity is
-  untrusted (`progress.ex:1682`); a custody-orphaned story fails closed with
-  `:missing_assigned_agent` (`progress.ex:1697-1699`, "nil is never permissive"); the lineage clause
+- **verify** — `validate_not_self_verify/2` `progress.ex:1743-1776`. `nil` orchestrator identity is
+  untrusted (`progress.ex:1743`); a custody-orphaned story fails closed with
+  `:missing_assigned_agent` (`progress.ex:1758-1760`, "nil is never permissive"); the lineage clause
   runs when BOTH `implementer_dispatch_id` and `verifier_dispatch_id` are set
-  (`progress.ex:1723-1728`), decided by `verify_lineage_separated/4` (`progress.ex:1747-1767`).
+  (`progress.ex:1763-1767`), decided by `verify_lineage_separated/4` (`progress.ex:1786-1806`).
   An EMPTY lineage on either side (what an unloadable dispatch yields,
-  `get_dispatch_lineage/2` `progress.ex:1769-1774`) fails **CLOSED**, and the `assigned_agent_id`
+  `get_dispatch_lineage/2` `progress.ex:1808-1813`) fails **CLOSED**, and the `assigned_agent_id`
   equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
-  `progress.ex:363-397`); that write is result-checked, and a failure flags `verifier_needed` plus a
-  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:399-423`) instead of
+  `progress.ex:363-396`); that write is result-checked, and a failure flags `verifier_needed` plus a
+  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:401-425`) instead of
   silently leaving the field nil. With no verifier dispatch the gate is agent-id equality.
-- **report** — `validate_not_self_report/3` `progress.ex:2229-2255`. `nil` caller blocked
-  (`progress.ex:2229`); a story with nil `assigned_agent_id` AND nil `implementer_dispatch_id` is
+- **report** — `validate_not_self_report/3` `progress.ex:2268-2294`. `nil` caller blocked
+  (`progress.ex:2268`); a story with nil `assigned_agent_id` AND nil `implementer_dispatch_id` is
   **custody-unattributed** and fails closed with `:missing_assigned_agent` + a
-  `custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2268-2271`) — it used to
+  `custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2307-2310`) — it used to
   pass vacuously; then the reporter's lineage vs the implementer's (`lineage_status/2`,
-  `progress.ex:2300-2318`) — tri-state `:ok | :conflict | :unresolvable`, where an unresolvable
+  `progress.ex:2339-2357`) — tri-state `:ok | :conflict | :unresolvable`, where an unresolvable
   implementer dispatch fails CLOSED with `unresolvable_dispatch_lineage` (LCP-1 §7.5); then plain
   `assigned_agent_id` equality.
-- **review-complete** — `validate_not_self_review/3` `progress.ex:2320-2350`. Custody-orphan backstop
-  first (`progress.ex:2327-2329`), then a **`nil` reviewer is deliberately PERMITTED**
-  (`progress.ex:2336-2337`) because nil means a human operator on a user-role key; then the
+- **review-complete** — `validate_not_self_review/3` `progress.ex:2359-2389`. Custody-orphan backstop
+  first (`progress.ex:2366-2368`), then a **`nil` reviewer is deliberately PERMITTED**
+  (`progress.ex:2375-2376`) because nil means a human operator on a user-role key; then the
   reviewer's lineage; then plain equality. That nil permit has THREE parts, all of which must change
   together: (a) the `exact_role: [:orchestrator, :user]` plug (`review_record_controller.ex:22-23`),
   which 403s an agent key before the controller runs — so the `:agent` branch of the controller cond
@@ -142,10 +142,10 @@ audit-key condition either breaks pre-v2 tenants or silently widens the bypass.
 ## Dispatch lineage (L4) — structural verifier separation
 
 `lib/loopctl/dispatches.ex`: each dispatch carries a `lineage_path` (root → self).
-`lineage_shares_prefix?/2` (`dispatches.ex:563-568`) is the primitive the self-* checks use — note it
+`lineage_shares_prefix?/2` (`dispatches.ex:587-591`) is the primitive the self-* checks use — note it
 compares lineage **ROOTS** (element 0) only, not arbitrary prefixes, and an empty list on either side
-is never a match. `select_verifier/3` (`dispatches.ex:588-625`) picks a verifier whose lineage does
-NOT share the implementer's root — rejected in SQL (`reject_same_root/2`, `dispatches.ex:635-637`)
+is never a match. `select_verifier/3` (`dispatches.ex:613-650`) picks a verifier whose lineage does
+NOT share the implementer's root — rejected in SQL (`reject_same_root/2`, `dispatches.ex:658-664`)
 and again in Elixir — from a pool capped at `@verifier_pool_limit`, seeded deterministically by
 `sha256(tenant audit pubkey || story_id)` so the orchestrator cannot predict the pick.
 
@@ -171,8 +171,8 @@ long-lived env-var keys.
 - Taking the caller's lineage from request params instead of `Dispatches.lineage_for_api_key/2` —
   a client-supplied lineage is self-attested and defeats the gate.
 - Trusting a `nil` identity as permissive where the code blocks it — `verify`
-  (`progress.ex:1682`) and `report` (`progress.ex:2229`) fail closed on nil *caller identity*. The one
-  documented exception is `review-complete` (`progress.ex:2336-2337`, nil = human operator, paired
+  (`progress.ex:1743`) and `report` (`progress.ex:2268`) fail closed on nil *caller identity*. The one
+  documented exception is `review-complete` (`progress.ex:2375-2376`, nil = human operator, paired
   with the exact_role plug and the controller check). Do not "fix" it without reading its comment.
 
 ## Related

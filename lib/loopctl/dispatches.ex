@@ -553,6 +553,29 @@ defmodule Loopctl.Dispatches do
   end
 
   @doc """
+  True when `agent_id` has ANY active (non-revoked, unexpired) ENROLLED (key-carrying)
+  dispatch under the tenant. Used to close the LCP-1 §9.3 per-agent impersonation gap:
+  once an agent has opted into signing (an enrolled dispatch), a BEARER dispatch minted
+  for the same `agent_id` must not make unsigned custody claims in that agent's name.
+  """
+  @spec agent_has_enrolled_key?(Ecto.UUID.t(), Ecto.UUID.t() | nil) :: boolean()
+  def agent_has_enrolled_key?(_tenant_id, nil), do: false
+
+  def agent_has_enrolled_key?(tenant_id, agent_id) do
+    now = DateTime.utc_now()
+
+    from(d in Dispatch,
+      where:
+        d.tenant_id == ^tenant_id and d.agent_id == ^agent_id and not is_nil(d.agent_pubkey) and
+          is_nil(d.revoked_at) and d.expires_at > ^now,
+      select: 1,
+      limit: 1
+    )
+    |> AdminRepo.one()
+    |> is_integer()
+  end
+
+  @doc """
   Checks if two lineage paths share a common ROOT (their first element).
 
   This is deliberately a shared-root test, not a general prefix test: every

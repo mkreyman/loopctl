@@ -5,6 +5,21 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.61.0 — 2026-07-24 (LCP-1 §9 review hardening — signed-claim delivery + owner rotation)
+
+### Added
+
+- **`custody_sign_owner_rotation`** (local) — sign an owner-key ROTATION proof with
+  the OUTGOING owner private key (LCP-1 §9.2), proving possession before it re-roots
+  the attestation chain. Binds the old key + its set-at (Unix MICROSECONDS) so the
+  proof is not replayable after a rotate-back. Pair with `register_custody_owner_key`'s
+  new `rotation_proof` param.
+- **`claim` param** on `report_story`, `review_complete`, and `verify_story` — attach
+  the signed custody claim from `custody_sign_claim` so it reaches the gate under the
+  signed profile (LCP-1 §9.3/§9.4). Optional; ignored under the default bearer profile.
+- **`rotation_proof` param** on `register_custody_owner_key` — the outgoing-key
+  possession signature required to ROTATE (not first-register) the owner key.
+
 ## 2.60.0 — 2026-07-24 (LCP-1 signed custody profile — §9)
 
 ### Added

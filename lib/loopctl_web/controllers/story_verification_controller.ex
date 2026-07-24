@@ -185,7 +185,14 @@ defmodule LoopctlWeb.StoryVerificationController do
     with :ok <- validate_orchestrator_agent_linked(api_key),
          :ok <- validate_commit_sha_param(params) do
       tenant_id = api_key.tenant_id
-      opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
+
+      opts =
+        Keyword.merge(AuditContext.from_conn(conn),
+          orchestrator_agent_id: api_key.agent_id,
+          # LCP-1 §9.4: record the verified signed claim (nil under bearer) in the
+          # hash-chained audit entry, atomically with the verify decision.
+          custody_claim: conn.assigns[:custody_signed_claim]
+        )
 
       case Progress.verify_story(tenant_id, story_id, params, opts) do
         {:ok, story} ->

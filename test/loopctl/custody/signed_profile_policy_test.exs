@@ -73,6 +73,25 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
                Policy.verify_request(:signed, t.id, d.api_key_id, @gate, @work, "cap-1", %{})
     end
 
+    test "a bearer dispatch for an agent that enrolled a signing key elsewhere is refused (§9.3 impersonation)",
+         %{tenant: t} do
+      # An agent enrolls a signing key at ONE role (here :agent). The
+      # `api_keys_one_role_per_agent_idx` unique index already blocks a second
+      # ACTIVE bearer key at that SAME role — so the same-role gap is closed by the
+      # DB invariant. The residual reachable vector is cross-role: a bearer dispatch
+      # at a DIFFERENT role for the same agent_id. `agent_has_enrolled_key?` ignores
+      # role by design — once an agent commits to signing anywhere, none of its
+      # bearer dispatches may make unsigned custody claims in its name.
+      agent = fixture(:agent, %{tenant_id: t.id, agent_type: :implementer})
+      CustodyEnrollment.enroll_root(t.id, %{agent_id: agent.id, role: :agent})
+
+      {:ok, %{dispatch: bearer}} =
+        Dispatches.create_dispatch(t.id, %{role: :orchestrator, agent_id: agent.id})
+
+      assert {:error, :agent_enrollment_required} =
+               Policy.verify_request(:signed, t.id, bearer.api_key_id, @gate, @work, "cap-1", %{})
+    end
+
     test "a legacy key with no dispatch is NOT forced to sign", %{tenant: t} do
       assert :ok =
                Policy.verify_request(
@@ -214,6 +233,60 @@ defmodule Loopctl.Custody.SignedProfilePolicyTest do
 
       assert {:error, :claim_condition_unmet} =
                Policy.verify_request(:signed, t.id, d.api_key_id, @gate, @work, "cap-1", claim)
+    end
+  end
+
+  describe "signed profile — cryptographic-identity custody separation" do
+    test "a verify claim signed by the IMPLEMENTER's own enrolled key is rejected", %{tenant: t} do
+      %{dispatch: d, priv: priv} = enrolled_dispatch(t)
+
+      # The story was implemented under THIS enrolled dispatch.
+      epic = fixture(:epic, %{tenant_id: t.id})
+
+      story =
+        fixture(:story, %{tenant_id: t.id, epic_id: epic.id})
+        |> Ecto.Changeset.change(%{implementer_dispatch_id: d.id})
+        |> Loopctl.AdminRepo.update!()
+
+      claim = signed_claim(t.id, priv, work: story.id)
+
+      # Verifying with the SAME key that implemented it: the signature is valid, but
+      # the signing key equals the implementer's enrolled key → custody separation.
+      assert {:error, :self_signed_claim} =
+               Policy.verify_request(
+                 :signed,
+                 t.id,
+                 d.api_key_id,
+                 "verify",
+                 story.id,
+                 "cap-1",
+                 claim
+               )
+    end
+
+    test "a verify claim signed by a DIFFERENT enrolled key passes separation", %{tenant: t} do
+      %{dispatch: impl} = enrolled_dispatch(t)
+      %{dispatch: verifier, priv: verifier_priv} = enrolled_dispatch(t)
+
+      epic = fixture(:epic, %{tenant_id: t.id})
+
+      story =
+        fixture(:story, %{tenant_id: t.id, epic_id: epic.id})
+        |> Ecto.Changeset.change(%{implementer_dispatch_id: impl.id})
+        |> Loopctl.AdminRepo.update!()
+
+      claim = signed_claim(t.id, verifier_priv, work: story.id)
+
+      assert :ok =
+               Policy.verify_request(
+                 :signed,
+                 t.id,
+                 verifier.api_key_id,
+                 "verify",
+                 story.id,
+                 "cap-1",
+                 claim
+               )
     end
   end
 
