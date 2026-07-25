@@ -30,6 +30,7 @@ import {
   createGeneratedToolsRuntime,
   GENERATED_TOOL_PREFIX,
 } from "./lib/generated-tools.js";
+import { createHandoff } from "./lib/handoff.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -377,20 +378,27 @@ async function listProjects(args = {}) {
   return toContent(result);
 }
 
-async function resolveProject({ slug, repo_url, name } = {}) {
+// The `*Raw` variants return the apiCall result UNWRAPPED so they can be composed by
+// another tool (the `handoff` composition, #528) without re-declaring paths or key
+// selection. The public tool functions are thin toContent wrappers over them, so there is
+// exactly ONE definition of each request and no drift is possible.
+async function resolveProjectRaw({ slug, repo_url, name } = {}) {
   // Cheap repo -> project_id resolution (loopctl #411 Gap 1). Server tries
   // slug -> repo_url -> name and returns the first match; agent-role read.
   const params = new URLSearchParams();
   if (slug) params.set("slug", slug);
   if (repo_url) params.set("repo_url", repo_url);
   if (name) params.set("name", name);
-  const result = await apiCall(
+  return await apiCall(
     "GET",
     `/api/v1/projects/resolve?${params}`,
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
-  return toContent(result);
+}
+
+async function resolveProject(args = {}) {
+  return toContent(await resolveProjectRaw(args));
 }
 
 async function createProject({ name, slug, repo_url, description, tech_stack, mission }) {
@@ -403,15 +411,18 @@ async function createProject({ name, slug, repo_url, description, tech_stack, mi
   return toContent(result);
 }
 
-async function createKbScope({ name, slug, repo_url, description, tech_stack }) {
+async function createKbScopeRaw({ name, slug, repo_url, description, tech_stack }) {
   const body = { name, slug };
   if (repo_url) body.repo_url = repo_url;
   if (description) body.description = description;
   if (tech_stack) body.tech_stack = tech_stack;
   // Uses the AGENT key (not ORCH): a KB scope is agent-createable on the KB tier — that is
   // the whole point. The server forces kind: :kb; a body-supplied kind is ignored.
-  const result = await apiCall("POST", "/api/v1/kb-scopes", body, process.env.LOOPCTL_AGENT_KEY);
-  return toContent(result);
+  return await apiCall("POST", "/api/v1/kb-scopes", body, process.env.LOOPCTL_AGENT_KEY);
+}
+
+async function createKbScope(args) {
+  return toContent(await createKbScopeRaw(args));
 }
 
 async function archiveKbScope({ project_id }) {
@@ -444,7 +455,7 @@ async function restoreKbScope({ project_id }) {
 // (handoff) write path works even when the env var never reached this process.
 const CHANNEL_SESSION_ID = process.env.CLAUDE_SESSION_ID || crypto.randomUUID();
 
-async function channelPost({
+async function channelPostRaw({
   project_id,
   body,
   key,
@@ -490,13 +501,35 @@ async function channelPost({
   // clients that still send none.
   payload.host = os.hostname();
   payload.session_id = CHANNEL_SESSION_ID;
-  const result = await apiCall(
+  return await apiCall(
     "POST",
     "/api/v1/channel/posts",
     payload,
     process.env.LOOPCTL_AGENT_KEY,
   );
-  return toContent(result);
+}
+
+async function channelPost(args) {
+  return toContent(await channelPostRaw(args));
+}
+
+/**
+ * One-call SENDER-side handoff (#528, follow-up to #517): resolve-or-create the repo's
+ * channel, then post a correctly-keyed `handoff:<anchor>` pointer.
+ *
+ * All composition/derivation logic lives in lib/handoff.js and is unit-tested with
+ * injected fakes; this wiring only supplies the three RAW request functions, so the
+ * composed calls are byte-identical to what resolve_project / create_kb_scope /
+ * channel_post send on their own.
+ */
+async function handoff(args = {}) {
+  return toContent(
+    await createHandoff(args, {
+      resolveProject: resolveProjectRaw,
+      createKbScope: createKbScopeRaw,
+      channelPost: channelPostRaw,
+    }),
+  );
 }
 
 async function channelRecent({ project_id, since, limit }) {
@@ -2867,6 +2900,84 @@ const TOOLS = [
         project_id: { type: "string", description: "UUID of the archived :kb scope to restore." },
       },
       required: ["project_id"],
+    },
+  },
+  {
+    name: "handoff",
+    description:
+      "Hand work off to another session/machine on this repo in ONE call — the sender side of the coordination bus (issue #528). Use this instead of hand-assembling resolve_project + create_kb_scope + channel_post: it resolves the repo's channel, CREATES one (a kind: kb scope) if the repo has none yet, and posts with the stable `handoff:<anchor>` key that makes the result discoverable to channel_handoffs, claimable via channel_claim, and idempotent on retry. Pass repo_url (from `git remote get-url origin`) — slug or an already-known project_id also work. POINTER, NOT PAYLOAD: `body` must be a one-line TL;DR plus where the FULL context lives (a GitHub issue/PR comment, a docs/ file, or a knowledge article) — the bus is a coordination signal, not a document store, the body is capped at 16 KB, and the receiver sees only a bounded preview. Choose a STABLE anchor (e.g. 'home_care_billing#812' or 'my-repo:review-vs-goal'): re-running with the same anchor UPDATES that handoff in place instead of duplicating it. Optional advisory addressing — prefer to_capability (e.g. 'fly-auth') over to_host ('mac-mini'); both are SURFACING hints only, never authorization or a delivery guarantee, and an unaddressed handoff is a broadcast any session on the repo may claim. Never attempts create_project (human-anchor-gated by design), so an agent-rooted tenant gets a working channel rather than a 403 wall. The response reports channel.created so you can tell the user a kb scope was created, and receiver_next spells out the three calls the receiving session runs. THE RECEIVER SIDE IS NOT WRAPPED: to pick up a handoff use channel_handoffs -> channel_claim (always claim before acting; that is the anti-double-work gate) -> channel_done.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        anchor: {
+          type: "string",
+          description:
+            "Stable, durable id for this handoff — becomes the channel key 'handoff:<anchor>'. Derive it from the durable home (e.g. 'repo#812' for a GitHub issue, or 'repo:short-slug'). Re-using an anchor updates that handoff in place. Max 192 bytes (the key cap is 200).",
+        },
+        body: {
+          type: "string",
+          description:
+            "The coordination signal: a one-line TL;DR plus a pointer to where the full context lives. NOT the full context itself.",
+        },
+        repo_url: {
+          type: "string",
+          description:
+            "The repo's git remote (git@github.com:owner/repo.git, https://github.com/owner/repo, or bare owner/repo). The usual way to name the channel; also used to derive the kb-scope slug/name if one must be created.",
+        },
+        slug: {
+          type: "string",
+          description:
+            "Explicit project slug, if you know it or want to override the slug derived from repo_url (lowercase alphanumerics and hyphens, 2-63 chars).",
+        },
+        project_id: {
+          type: "string",
+          description:
+            "UUID of an already-known channel (work project or kb scope). Skips resolution entirely.",
+        },
+        to_capability: {
+          type: "string",
+          description:
+            "ADVISORY target capability the receiver needs, e.g. 'fly-auth'. Preferred over to_host. Surfacing hint only — spoofable, gates nothing.",
+        },
+        to_host: {
+          type: "string",
+          description:
+            "ADVISORY target machine, e.g. 'mac-mini'. Surfacing hint only — prefer to_capability when the real requirement is a capability rather than a specific box.",
+        },
+        refs: {
+          type: "array",
+          description:
+            "Optional structured pointers to the durable home (max ~50). One item per reference: { type, value, label? } — e.g. { type: 'issue', value: '#812', label: 'full context' }.",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", description: "Free-form ref type (<=64 bytes)." },
+              value: { type: "string", description: "Ref value/pointer (<=512 bytes)." },
+              label: { type: "string", description: "Optional human label (<=128 bytes)." },
+            },
+            required: ["type", "value"],
+          },
+        },
+        create_channel: {
+          type: "boolean",
+          description:
+            "Default true: create a kind: kb scope when the repo has no project yet (this is what makes a handoff possible on a fresh repo; it consumes one max_projects slot, and the response reports channel.created). Pass false to fail with an actionable error instead of creating anything.",
+        },
+        name: {
+          type: "string",
+          description:
+            "Scope name, used ONLY if a channel must be created. Defaults to the repo basename.",
+        },
+        description: {
+          type: "string",
+          description: "Scope description, used ONLY if a channel must be created.",
+        },
+        tech_stack: {
+          type: "string",
+          description: "Scope tech stack, used ONLY if a channel must be created.",
+        },
+      },
+      required: ["anchor", "body"],
     },
   },
   {
@@ -6419,6 +6530,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "restore_kb_scope":
       return await restoreKbScope(args);
+
+    case "handoff":
+      return await handoff(args);
 
     case "channel_post":
       return await channelPost(args);

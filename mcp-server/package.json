@@ -1,6 +1,6 @@
 {
   "name": "loopctl-mcp-server",
-  "version": "2.61.0",
+  "version": "2.62.0",
   "description": "MCP server for loopctl \u2014 structural trust for AI development loops",
   "type": "module",
   "main": "index.js",

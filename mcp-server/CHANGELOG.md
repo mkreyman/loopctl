@@ -5,6 +5,32 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.62.0 — 2026-07-25 (one-call handoff affordance)
+
+### Added
+
+- **`handoff`** (agent) — the SENDER side of a cross-session/cross-machine handoff in one
+  call (issue #528, follow-up to #517). Resolves the repo's coordination channel from
+  `repo_url`/`slug`/`project_id`, creates a `kind: kb` scope when the repo has no project
+  yet, and posts with the stable `handoff:<anchor>` key that makes the handoff
+  discoverable, claimable, and idempotent. Never attempts `create_project`, so an
+  agent-rooted tenant reaches the bus instead of a `403 custody_tier_required` wall.
+  Reports `channel.created` and the receiver's next three calls.
+
+  Before this, a handoff on a repo with no channel meant hand-assembling
+  `resolve_project` → `create_kb_scope` → `channel_post` with the key convention
+  documented only at the tail of `channel_post`'s description — the affordance gap #517
+  reported and #518 explicitly left out of scope. The receiver flow
+  (`channel_handoffs` → `channel_claim` → `channel_done`) is unchanged and deliberately
+  not wrapped.
+
+### Changed
+
+- `resolve_project`, `create_kb_scope`, and `channel_post` now delegate to internal
+  `*Raw` request functions that `handoff` composes. No behavior change — the composed
+  calls are byte-identical to the standalone tools, and each request path is declared
+  exactly once.
+
 ## 2.61.0 — 2026-07-24 (LCP-1 §9 review hardening — signed-claim delivery + owner rotation)
 
 ### Added
