@@ -36,6 +36,30 @@ const INDEX_SRC = readFileSync(
   "utf8",
 );
 
+/**
+ * The source of ONE top-level async function, bounded at the next top-level
+ * `async function` declaration.
+ *
+ * Source-scan assertions of the form /async function foo\([\s\S]*?<needle>/ span
+ * FORWARD without limit, so they can be satisfied by a LATER function's body — e.g. a
+ * `channelPost` assertion passing on `channelLock`, which also sets `payload.host` and
+ * `payload.session_id`. That is a vacuous pass: the guard survives even when the function
+ * it names loses the behavior. Slicing the function out FIRST makes every assertion below
+ * provably about the named function.
+ */
+function functionSource(name) {
+  const declaration = `async function ${name}(`;
+  const start = INDEX_SRC.indexOf(declaration);
+  assert.notEqual(start, -1, `index.js must define ${declaration}`);
+  const rest = INDEX_SRC.slice(start + declaration.length);
+  const next = rest.indexOf("\nasync function ");
+  const body = next === -1 ? rest : rest.slice(0, next);
+  // Non-empty by construction, but assert it so a future refactor that empties the
+  // function cannot make the slice-based assertions pass on "".
+  assert.ok(body.trim().length > 0, `${name} must have a body`);
+  return body;
+}
+
 // ---------------------------------------------------------------------------
 // buildQuery — the shared primitive
 // ---------------------------------------------------------------------------
@@ -95,10 +119,18 @@ describe("#411 gap1: resolve_project wiring", () => {
   });
 
   test("resolveProject GETs /projects/resolve with slug/repo_url/name on the agent key", () => {
+    // The request lives in resolveProjectRaw so the `handoff` composition (#528) can
+    // reuse it; resolveProject is a toContent wrapper over it (asserted below).
+    const src = functionSource("resolveProjectRaw");
     assert.match(
-      INDEX_SRC,
-      /async function resolveProject\(\{ slug, repo_url, name \} = \{\}\) \{[\s\S]*?\/api\/v1\/projects\/resolve\?\$\{params\}[\s\S]*?LOOPCTL_AGENT_KEY/,
-      "resolveProject must GET /api/v1/projects/resolve with a query string on the agent key",
+      src,
+      /\{ slug, repo_url, name \} = \{\}\) \{[\s\S]*?\/api\/v1\/projects\/resolve\?\$\{params\}[\s\S]*?LOOPCTL_AGENT_KEY/,
+      "resolveProjectRaw must GET /api/v1/projects/resolve with a query string on the agent key",
+    );
+    assert.match(
+      functionSource("resolveProject"),
+      /return toContent\(await resolveProjectRaw\(args\)\);/,
+      "resolveProject must delegate to resolveProjectRaw",
     );
     assert.match(INDEX_SRC, /if \(slug\) params\.set\("slug", slug\);/);
     assert.match(INDEX_SRC, /if \(repo_url\) params\.set\("repo_url", repo_url\);/);
@@ -125,9 +157,14 @@ describe("#418: create_kb_scope wiring", () => {
 
   test("createKbScope POSTs /kb-scopes on the AGENT key (not the orch key)", () => {
     assert.match(
-      INDEX_SRC,
-      /async function createKbScope\([\s\S]*?"POST",\s*"\/api\/v1\/kb-scopes",\s*body,\s*process\.env\.LOOPCTL_AGENT_KEY/,
-      "createKbScope must POST /api/v1/kb-scopes with the agent key",
+      functionSource("createKbScopeRaw"),
+      /"POST",\s*"\/api\/v1\/kb-scopes",\s*body,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "createKbScopeRaw must POST /api/v1/kb-scopes with the agent key",
+    );
+    assert.match(
+      functionSource("createKbScope"),
+      /return toContent\(await createKbScopeRaw\(args\)\);/,
+      "createKbScope must delegate to createKbScopeRaw",
     );
   });
 
@@ -151,18 +188,25 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
   });
 
   test("channelPost POSTs /channel/posts on the AGENT key", () => {
+    // The request lives in channelPostRaw (reused by the `handoff` composition, #528);
+    // channelPost is a toContent wrapper over it.
     assert.match(
-      INDEX_SRC,
-      /async function channelPost\([\s\S]*?"POST",\s*"\/api\/v1\/channel\/posts",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
-      "channelPost must POST /api/v1/channel/posts with the agent key",
+      functionSource("channelPostRaw"),
+      /"POST",\s*"\/api\/v1\/channel\/posts",\s*payload,\s*process\.env\.LOOPCTL_AGENT_KEY/,
+      "channelPostRaw must POST /api/v1/channel/posts with the agent key",
+    );
+    assert.match(
+      functionSource("channelPost"),
+      /return toContent\(await channelPostRaw\(args\)\);/,
+      "channelPost must delegate to channelPostRaw",
     );
   });
 
   test("channelPost auto-fills host from os.hostname()", () => {
     assert.match(
-      INDEX_SRC,
-      /async function channelPost\([\s\S]*?payload\.host = os\.hostname\(\)/,
-      "channelPost must set host from os.hostname()",
+      functionSource("channelPostRaw"),
+      /payload\.host = os\.hostname\(\)/,
+      "channelPostRaw must set host from os.hostname()",
     );
   });
 
@@ -178,9 +222,9 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
       "must define CHANNEL_SESSION_ID as CLAUDE_SESSION_ID with a randomUUID fallback",
     );
     assert.match(
-      INDEX_SRC,
-      /async function channelPost\([\s\S]*?payload\.session_id = CHANNEL_SESSION_ID;/,
-      "channelPost must always send CHANNEL_SESSION_ID",
+      functionSource("channelPostRaw"),
+      /payload\.session_id = CHANNEL_SESSION_ID;/,
+      "channelPostRaw must always send CHANNEL_SESSION_ID",
     );
   });
 
@@ -188,33 +232,38 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
     // to_host/to_capability are caller args (unlike auto-filled host/session_id),
     // conditionally added to the payload so an unset addressing field is omitted
     // rather than sent as undefined. AC-40.A5.4 requires them settable via MCP.
+    const src = functionSource("channelPostRaw");
     assert.match(
-      INDEX_SRC,
-      /async function channelPost\([\s\S]*?if \(to_host\) payload\.to_host = to_host;/,
-      "channelPost must forward to_host only when set",
+      src,
+      /if \(to_host\) payload\.to_host = to_host;/,
+      "channelPostRaw must forward to_host only when set",
     );
     assert.match(
-      INDEX_SRC,
-      /async function channelPost\([\s\S]*?if \(to_capability\) payload\.to_capability = to_capability;/,
-      "channelPost must forward to_capability only when set",
+      src,
+      /if \(to_capability\) payload\.to_capability = to_capability;/,
+      "channelPostRaw must forward to_capability only when set",
     );
     assert.match(
-      INDEX_SRC,
-      /async function channelPost\(\{[^}]*\bto_host\b[^}]*\bto_capability\b[^}]*\}\)/,
-      "channelPost must destructure to_host and to_capability from its args",
+      src,
+      /^\{[^}]*\bto_host\b[^}]*\bto_capability\b[^}]*\}\)/,
+      "channelPostRaw must destructure to_host and to_capability from its args",
     );
+    // The composed one-call route (#528) must forward advisory addressing too; that is
+    // covered BEHAVIORALLY in test/handoff_tool.test.js (asserting the post args), which
+    // is stronger than a source scan.
   });
 
   test("channelPost forwards supersedes only when set (US-454 defect 3)", () => {
+    const src = functionSource("channelPostRaw");
     assert.match(
-      INDEX_SRC,
-      /async function channelPost\([\s\S]*?if \(supersedes\) payload\.supersedes = supersedes;/,
-      "channelPost must forward supersedes only when set",
+      src,
+      /if \(supersedes\) payload\.supersedes = supersedes;/,
+      "channelPostRaw must forward supersedes only when set",
     );
     assert.match(
-      INDEX_SRC,
-      /async function channelPost\(\{[^}]*\bsupersedes\b[^}]*\}\)/,
-      "channelPost must destructure supersedes from its args",
+      src,
+      /^\{[^}]*\bsupersedes\b[^}]*\}\)/,
+      "channelPostRaw must destructure supersedes from its args",
     );
   });
 
