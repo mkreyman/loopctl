@@ -320,6 +320,31 @@ tally — e.g. AdminRepo's 3-connection pool (`config/runtime.exs:190`), which i
 *why* a heavy read starves the admin pool. Cite it at `file:line` so it can be
 re-checked.
 
+### Doc hygiene: ALWAYS document a new env var or API constraint
+
+The inverse rule, and the one that actually bit us. Two things are easy to ship
+and impossible for a user to discover — both are required in the SAME PR:
+
+1. **A new environment variable** → document it in `deploy/FLY_SECRETS.md` with
+   its DEFAULT and what breaks if it is wrong. `mix loopctl.check_env_docs`
+   (in `mix precommit`) fails the build otherwise.
+2. **A new/changed API constraint** — a size cap, a new 4xx, changed field
+   semantics, what is or is not encrypted at rest → the endpoint's `operation/2`
+   OpenAPI spec, not just the controller guard. When a limit is both enforced and
+   documented, reference ONE module attribute from both sites so they cannot drift
+   (see `@max_inline_content_bytes` in `knowledge_ingestion_controller.ex`).
+
+Why this is a rule and not a nicety: this failure is SILENT. Nothing in review
+flags a `System.get_env/1` with no doc line, so it accumulated to 24 undocumented
+variables — including `SECRETS_ADAPTER` and `FTS_REGCONFIG`, without which a
+self-hoster literally cannot run the app. The audience who needs these is the one
+audience that cannot read our source tree.
+
+`CHANGELOG.md` is operator-facing changes ONLY (env vars, deploy ordering,
+migrations with manual steps, breaking API changes, security-relevant storage
+changes). Refactors, test fixes, and internal hardening stay out — `git log
+--first-parent` is the full history. See `CONTRIBUTING.md`.
+
 ### Domain skill routing
 
 | You are touching... | Load |
