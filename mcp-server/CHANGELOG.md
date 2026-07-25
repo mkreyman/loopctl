@@ -13,7 +13,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   call (issue #528, follow-up to #517). Resolves the repo's coordination channel from
   `repo_url`/`slug`/`project_id`, creates a `kind: kb` scope when the repo has no project
   yet, and posts with the stable `handoff:<anchor>` key that makes the handoff
-  discoverable, claimable, and idempotent. Never attempts `create_project`, so an
+  discoverable and claimable (a same-session repost refreshes the slot in place; the slot
+  is keyed per session, so it is not a cross-session singleton). Never attempts
+  `create_project`, so an
   agent-rooted tenant reaches the bus instead of a `403 custody_tier_required` wall.
   Reports `channel.created` and the receiver's next three calls.
 

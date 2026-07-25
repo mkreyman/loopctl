@@ -382,6 +382,54 @@ describe("createHandoff — failure passthrough (AC6)", () => {
     assert.equal(result.channel.project_id, KB_PROJECT.id);
   });
 
+  test("a 422 on post names the not-a-member cause the server's message cannot (#517 wrinkle 5)", async () => {
+    // The server returns one deliberately non-specific message for not-a-member /
+    // not-eligible / absent so it leaks no existence oracle. We know which channel we
+    // resolved, so we can name the likely cause without leaking anything.
+    const workChannel = { id: "work-1", kind: "work", slug: "loopctl", name: "loopctl" };
+    const { deps } = fakes({
+      resolve: [{ project: workChannel }],
+      post: {
+        error: true,
+        status: 422,
+        body: { error: { message: "project_id does not exist or does not belong to your tenant" } },
+      },
+    });
+
+    const result = await createHandoff({ anchor: "a#1", body: "tldr", repo_url: REPO_URL }, deps);
+
+    assert.equal(result.stage, "post");
+    assert.match(result.remediation, /not a member/i);
+    assert.match(result.remediation, /WORK project/);
+    assert.match(result.remediation, /non-specific/, "must warn against misreading the message");
+    assert.match(result.remediation, /16 KB/);
+  });
+
+  test("a 422 on post to a kb channel skips the work-membership cause", async () => {
+    const { deps } = fakes({
+      resolve: [{ project: KB_PROJECT }],
+      post: { error: true, status: 422, body: {} },
+    });
+
+    const result = await createHandoff({ anchor: "a#1", body: "tldr", repo_url: REPO_URL }, deps);
+
+    assert.ok(!/not a member/i.test(result.remediation), "a kb scope has no membership gate");
+    assert.match(result.remediation, /16 KB/);
+  });
+
+  test("a non-422 post failure carries no remediation guesswork", async () => {
+    const { deps } = fakes({
+      resolve: [{ project: KB_PROJECT }],
+      post: { error: true, status: 500, body: "upstream" },
+    });
+
+    const result = await createHandoff({ anchor: "a#1", body: "tldr", repo_url: REPO_URL }, deps);
+
+    assert.equal(result.stage, "post");
+    assert.equal(result.remediation, undefined);
+    assert.equal(result.body, "upstream");
+  });
+
   test("a 2xx resolve with no project refuses to create rather than guessing", async () => {
     const { deps, calls } = fakes({ resolve: [{ matched_by: "slug" }] });
 
@@ -484,6 +532,19 @@ describe("index.js wiring (#528)", () => {
     assert.match(declaration, /POINTER, NOT PAYLOAD/i, "must state pointer-not-payload");
     assert.match(declaration, /channel_claim/, "must point at the receiver flow");
     assert.match(declaration, /required: \["anchor", "body"\]/);
+
+    // The keyed slot is unique per (tenant, project, agent, SESSION, key)
+    // — channel_posts_session_key_uidx. Claiming a bare "idempotent" / "updates in place"
+    // would overpromise: another session reposting the same anchor appends its own handoff.
+    assert.match(
+      declaration,
+      /SAME session/,
+      "the refresh-in-place claim must be scoped to the same session",
+    );
+    assert.ok(
+      !/\bidempotent on retry\b/.test(declaration),
+      "must not claim unqualified cross-session idempotency",
+    );
   });
 
   test("dispatches the handoff tool", () => {

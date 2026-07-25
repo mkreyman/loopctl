@@ -70,6 +70,14 @@ function failure(stage, status, body, extra = {}) {
  * Idempotent on the prefix: an agent that passes "handoff:repo#812" gets that key back
  * unchanged rather than "handoff:handoff:repo#812". Returns `{ key, anchor }` or
  * `{ error }`.
+ *
+ * SCOPE OF THE KEY'S DEDUP: the keyed slot is unique on
+ * `(tenant_id, project_id, agent_id, session_id, key)`
+ * (`channel_posts_session_key_uidx`, priv/repo/migrations/20260718000000_*.exs:22), so a
+ * repeat post refreshes the slot IN PLACE only within the SAME session. A different
+ * session posting the same anchor appends its OWN handoff post — by design (two sessions
+ * genuinely have two working states), but it means the anchor is not a global singleton.
+ * Say "same-session retry" and never plain "idempotent" when documenting this.
  */
 export function handoffKey(anchor) {
   if (typeof anchor !== "string" || !anchor.trim()) {
@@ -172,6 +180,33 @@ function channelSummary(project, { created, raced = false, source }) {
     ...(raced && { raced: true }),
     source,
   };
+}
+
+/**
+ * Remediation for a failed POST. A 422 here is the one #517 called out as
+ * non-actionable: the server deliberately returns a single
+ * "project_id does not exist or does not belong to your tenant" for
+ * not-a-member / not-eligible / truly-absent so it leaks no existence oracle. That is
+ * correct server behavior AND a dead end for the caller, so name the possibilities
+ * client-side, where we already know which channel we resolved.
+ */
+function postRemediation(status, channel) {
+  if (status !== 422) return null;
+
+  const workProject =
+    channel?.kind === "work"
+      ? "The channel is a WORK project, so the most likely cause is that you are not a " +
+        "member of it: channel writes on a work project require an agent assigned to a " +
+        "story there. The server's 'does not exist or does not belong to your tenant' " +
+        "wording is deliberately non-specific (it must not leak an existence oracle), so " +
+        "do NOT read it as the project being missing. "
+      : "";
+
+  return (
+    workProject +
+    "Otherwise check the payload limits: body is capped at 16 KB, refs at ~50 items, and a " +
+    "secret-shaped string in the body or any ref field is rejected outright."
+  );
 }
 
 /**
@@ -354,7 +389,11 @@ export async function createHandoff(args = {}, deps = {}) {
   if (posted?.error === true) {
     // Report the channel we resolved/created alongside the post failure — otherwise a
     // freshly created scope looks like it never happened and the retry creates another.
-    return failure("post", posted.status, posted.body, { channel });
+    const remediation = postRemediation(posted.status, channel);
+    return failure("post", posted.status, posted.body, {
+      channel,
+      ...(remediation && { remediation }),
+    });
   }
 
   return {
