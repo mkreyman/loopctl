@@ -112,6 +112,7 @@ defmodule Loopctl.ContextRetriever.Executor do
   alias Loopctl.ContextRetriever.Scope
   alias Loopctl.Projects.Project
   alias Loopctl.Repo
+  alias Loopctl.Search.Regconfig
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
 
@@ -435,9 +436,20 @@ defmodule Loopctl.ContextRetriever.Executor do
   end
 
   defp base_query(schema, tenant_id, %{kind: :search, query_string: query_string}) do
+    # #492: match the deployment regconfig the CR backing-table triggers stored the
+    # search_vector with; `?::text::regconfig` bind param (never interpolated). The `::text`
+    # is required — a bare `?::regconfig` makes Postgrex demand the regconfig OID (integer)
+    # and reject the string name at encode time.
+    regconfig = Regconfig.get()
+
     from(q in schema,
       where: q.tenant_id == ^tenant_id,
-      where: fragment("search_vector @@ websearch_to_tsquery('english', ?)", ^query_string)
+      where:
+        fragment(
+          "search_vector @@ websearch_to_tsquery(?::text::regconfig, ?)",
+          ^regconfig,
+          ^query_string
+        )
     )
   end
 

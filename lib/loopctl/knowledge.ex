@@ -67,6 +67,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Projects.Project
   alias Loopctl.Provider.RetryAfter
+  alias Loopctl.Search.Regconfig
   alias Loopctl.SystemConfig
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Workers.ArticleEmbeddingWorker
@@ -1856,11 +1857,24 @@ defmodule Loopctl.Knowledge do
         limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_relevance_page_size)
         offset = opts |> Keyword.get(:offset, 0) |> max(0)
         status = Keyword.get(opts, :status, :published)
+        # #492: the deployment regconfig — MUST match the one the stored `search_vector`
+        # was built with (the article generated column / the CR triggers), or a
+        # differently-stemmed query matches nothing. Passed as a `?::text::regconfig` bind
+        # param (never interpolated) — the `::text` is REQUIRED: a bare `?::regconfig` makes
+        # Postgrex describe the param as the `regconfig` OID type and demand an integer, so a
+        # string name raises at encode time. `::text::regconfig` keeps the param text and lets
+        # PG cast it, with no injection surface even though it reaches SQL.
+        regconfig = Regconfig.get()
 
         base_query =
           from(a in Article,
             where: a.tenant_id == ^tenant_id,
-            where: fragment("search_vector @@ websearch_to_tsquery('english', ?)", ^query_string),
+            where:
+              fragment(
+                "search_vector @@ websearch_to_tsquery(?::text::regconfig, ?)",
+                ^regconfig,
+                ^query_string
+              ),
             select: %{
               id: a.id,
               tenant_id: a.tenant_id,
@@ -1877,19 +1891,23 @@ defmodule Loopctl.Knowledge do
               updated_at: a.updated_at,
               relevance_score:
                 fragment(
-                  "ts_rank_cd(search_vector, websearch_to_tsquery('english', ?))",
+                  "ts_rank_cd(search_vector, websearch_to_tsquery(?::text::regconfig, ?))",
+                  ^regconfig,
                   ^query_string
                 ),
               snippet:
                 fragment(
-                  "ts_headline('english', body, websearch_to_tsquery('english', ?), 'StartSel=**, StopSel=**, MaxWords=35, MinWords=15')",
+                  "ts_headline(?::text::regconfig, body, websearch_to_tsquery(?::text::regconfig, ?), 'StartSel=**, StopSel=**, MaxWords=35, MinWords=15')",
+                  ^regconfig,
+                  ^regconfig,
                   ^query_string
                 )
             },
             order_by: [
               desc:
                 fragment(
-                  "ts_rank_cd(search_vector, websearch_to_tsquery('english', ?))",
+                  "ts_rank_cd(search_vector, websearch_to_tsquery(?::text::regconfig, ?))",
+                  ^regconfig,
                   ^query_string
                 ),
               # DETERMINISTIC secondary key: `ts_rank_cd` ties (common on short/overlapping

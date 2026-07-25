@@ -58,6 +58,18 @@ if System.get_env("SECRETS_ADAPTER") == "local_file" do
   config :loopctl, :secrets_file, System.get_env("SECRETS_FILE") || "/data/loopctl/secrets.json"
 end
 
+# #492: per-deployment Postgres text-search config (regconfig) for keyword FTS. UNSET
+# is "english" — byte-for-byte unchanged for the hosted instance. A non-English
+# self-host sets FTS_REGCONFIG (e.g. "russian", "simple") so the STORED search_vectors
+# AND the query sites use the same stemmer; otherwise combined/keyword search silently
+# English-tokenizes non-Latin content. The value is validated in Loopctl.Search.Regconfig
+# and by the apply_fts_regconfig migration (which rebuilds the vectors on a non-english
+# deployment). Set it BEFORE the first migrate on a fresh install; changing it on an
+# already-migrated corpus does NOT re-run that migration (a rebuild is a separate op).
+if regconfig = System.get_env("FTS_REGCONFIG") do
+  config :loopctl, :fts_regconfig, regconfig
+end
+
 # sec-4: OPT-IN override of the node-local Hammer poolboy pool that fronts EVERY
 # `check_rate/3`. The base sizing lives in config/config.exs (20 / 10, up from
 # Hammer's 4 / 0 defaults) to keep the fail-CLOSED `AuthPathThrottle` from
