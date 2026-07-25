@@ -44,6 +44,24 @@ defmodule Loopctl.Ingestion.ContentEnvelope do
   end
 
   @doc """
+  Probes the vault, raising the SAME boot-level fault `wrap/1` raises on a
+  misconfiguration (missing/invalid `CLOAK_KEY`) — but without a document in hand.
+
+  Callers that encrypt inline content inside a crash-isolated boundary — e.g. the
+  batch ingest path's `Task.Supervisor.async_stream_nolink`, where a `wrap/1` raise
+  is caught as an opaque per-item `{:exit, reason}` and would otherwise be flattened
+  into a generic "validation_failed" per-item error — probe the vault ONCE up front
+  so a real key-provisioning failure surfaces LOUDLY (propagating as a 500) instead
+  of being masked behind a per-item result. The fault is global and deterministic,
+  so one probe suffices for the whole batch.
+  """
+  @spec ensure_ready!() :: :ok
+  def ensure_ready! do
+    _ = Vault.encrypt!("")
+    :ok
+  end
+
+  @doc """
   Decrypts an envelope produced by `wrap/1`.
 
   Returns `{:ok, content}` or, on ANY malformed/tampered input (bad Base64, wrong

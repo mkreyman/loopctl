@@ -361,6 +361,16 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # relied on); Ecto Sandbox + Mox resolve via the `$callers` chain that
   # Task.Supervisor.async_stream_nolink propagates.
   defp process_batch_items(tenant_id, items) do
+    # #493 fail-loud: ContentEnvelope's contract states a vault misconfiguration
+    # (missing CLOAK_KEY) is a boot-level fault the caller must never mask. Per-item
+    # encryption below runs inside async_stream_nolink, where a Vault.encrypt! raise
+    # is caught as {:exit, reason} and flattened into an opaque per-item
+    # "validation_failed" — hiding a real key-provisioning failure. The fault is
+    # global and deterministic, so probe the vault ONCE here (request process, before
+    # the async boundary) when any item carries inline content; a misconfig then
+    # propagates as a 500 exactly as it does on the single-item path.
+    if Enum.any?(items, &inline_content_item?/1), do: ContentEnvelope.ensure_ready!()
+
     Loopctl.TaskSupervisor
     |> Task.Supervisor.async_stream_nolink(
       items,
@@ -655,6 +665,14 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # encrypted at rest before it ever reaches `oban_jobs.args`.
   defp encrypt_inline_content(nil), do: nil
   defp encrypt_inline_content(content) when is_binary(content), do: ContentEnvelope.wrap(content)
+
+  # Does this batch item carry inline document content (vs a URL-only item)?
+  # Used to gate the pre-async vault readiness probe so a URL-only batch does no
+  # needless crypto work.
+  defp inline_content_item?(%{"content" => content}) when is_binary(content) and content != "",
+    do: true
+
+  defp inline_content_item?(_), do: false
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

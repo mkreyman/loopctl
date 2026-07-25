@@ -15,6 +15,7 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.Ingestion.ContentEnvelope
   alias Loopctl.Knowledge
   alias Loopctl.Test.AllowlistSource
   alias Loopctl.Workers.ContentIngestionWorker
@@ -1565,6 +1566,38 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
     test "a URL job (unknown size pre-fetch) is granted the full capped budget" do
       job = %Oban.Job{args: %{"url" => "https://example.com/x", "source_type" => "x"}}
+      assert ContentIngestionWorker.timeout(job) == :timer.minutes(6)
+    end
+
+    # #493: new inline jobs carry content_encrypted, NOT plaintext content. The
+    # timeout must scale off the DECRYPTED chunk count, identically to the legacy
+    # plaintext path — otherwise every encrypted multi-chunk document silently
+    # regresses to the flat 60s (one-chunk) budget #264 was written to prevent.
+    test "an encrypted multi-chunk job scales exactly like its plaintext twin" do
+      plaintext = multi_chunk_content(4)
+
+      plain = %Oban.Job{args: %{"content" => plaintext, "source_type" => "x"}}
+
+      encrypted = %Oban.Job{
+        args: %{
+          "content_encrypted" => ContentEnvelope.wrap(plaintext),
+          "source_type" => "x"
+        }
+      }
+
+      # 4 chunks * 60s = 240s, under the 6-min cap — and NOT the 60s catch-all.
+      assert ContentIngestionWorker.timeout(encrypted) == 4 * :timer.seconds(60)
+      assert ContentIngestionWorker.timeout(encrypted) == ContentIngestionWorker.timeout(plain)
+      assert ContentIngestionWorker.timeout(encrypted) > :timer.seconds(60)
+    end
+
+    test "a corrupt encrypted envelope gets the full capped budget, never the 60s floor" do
+      job = %Oban.Job{
+        args: %{"content_encrypted" => "not-a-valid-base64-envelope!!!", "source_type" => "x"}
+      }
+
+      # A poison-pill envelope can't be chunked; perform/1 {:discard}s it, so grant
+      # the full capped budget rather than let a 60s timeout cut it off first.
       assert ContentIngestionWorker.timeout(job) == :timer.minutes(6)
     end
   end

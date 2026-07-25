@@ -287,6 +287,21 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     content |> ContentChunker.chunk() |> length()
   end
 
+  # #493: new inline jobs carry the document as an ENCRYPTED envelope, not
+  # plaintext `content`. Without this clause an encrypted multi-chunk document
+  # falls through to the `_ -> 1` catch-all and gets a flat one-chunk (60s)
+  # budget, re-introducing the exact multi-chunk Oban.TimeoutError kill #264
+  # fixed. Decrypt is cheap (once per attempt) and lets timeout/1 scale exactly
+  # as it does for legacy plaintext. A corrupt envelope is a poison pill perform/1
+  # {:discard}s anyway; grant it the full capped budget (max_chunks/0) so the
+  # timeout is never the thing that kills it first.
+  defp chunk_count_for_timeout(%{"content_encrypted" => envelope}) when is_binary(envelope) do
+    case ContentEnvelope.unwrap(envelope) do
+      {:ok, content} -> content |> ContentChunker.chunk() |> length()
+      {:error, _reason} -> max_chunks()
+    end
+  end
+
   defp chunk_count_for_timeout(%{"url" => url}) when is_binary(url) and url != "" do
     max_chunks()
   end
