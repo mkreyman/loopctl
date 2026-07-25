@@ -2,7 +2,58 @@
 
 All notable changes to loopctl are documented here.
 
-## [Unreleased] — 2026-07-16 — Agent-memory substrate: project scope, merged recall, graduation (#411)
+## [Unreleased] — 2026-07-24 — Self-hosting: fresh-install fixes, multilingual search, at-rest ingestion encryption
+
+Operator-facing changes for deployments outside the hosted instance.
+
+### Added
+
+- **`FTS_REGCONFIG` — per-deployment keyword-search language (#492).** Keyword FTS
+  was hardwired to the `english` stemmer, so a non-English corpus silently degraded
+  (Russian «отчёты» never matched «отчёт»). `Loopctl.Search.Regconfig` is now the
+  single source of truth, set from `FTS_REGCONFIG` (default `english`, so the hosted
+  instance is unchanged). **Set it before the first `migrate`** — the
+  `apply_fts_regconfig` migration bakes the value into the stored `search_vector`s
+  and is a no-op on the default. A well-formed but uninstalled config (e.g.
+  `ukrainian`) fails the migration loudly rather than building an unusable index.
+- **`SECRETS_ADAPTER=local_file` + `SECRETS_FILE` — signup off Fly (#496).** Tenant
+  signup stores a per-tenant Ed25519 audit key via `Loopctl.Secrets`, which defaulted
+  to the Fly secrets API — so signup was impossible on any other host. The local
+  adapter writes `0600` with fsync and atomic tmp+rename under a write lock. Put
+  `SECRETS_FILE` on a persistent volume and back it up with the database.
+- **Browser signup mints a usable root API key (#500).** The HTML signup ceremony
+  previously completed without issuing credentials, leaving a browser-onboarded
+  tenant with no authenticated path forward. The key is surfaced exactly once, in
+  LiveView memory only — never in a URL, session, or persisted record.
+
+### Changed
+
+- **Ingestion document content is encrypted at rest (#493).** Raw `content` posted to
+  `POST /api/v1/knowledge/ingest` was persisted as plaintext JSON in `oban_jobs.args`
+  (including `retryable`/`discarded` rows) until pruning — the one at-rest exposure
+  Epic 41 did not cover. It is now Cloak AES-256-GCM encrypted via
+  `Loopctl.Ingestion.ContentEnvelope`. `url`, `source_type`, and `metadata` are **not**
+  encrypted. Inline `content` is capped at 1,000,000 bytes (`422` over cap).
+  `content_hash` changed from `sha256(plaintext)` to a per-tenant HMAC blind index —
+  still an opaque deterministic string (dedup unaffected), but no longer an offline
+  confirmation oracle for a DB-read attacker.
+  **Operational:** when rotating `CLOAK_KEY`, keep the outgoing cipher in
+  `retired_ciphers` until the `:ingestion` queue drains, or in-flight jobs discard.
+
+### Fixed
+
+- **Fresh installs no longer break in the Epic-41 migrations (#495).** The pgvector
+  guard silently skipped embedding columns that a later migration then required. The
+  migration now tolerates and heals the skipped state (idempotent, `IF NOT EXISTS`).
+- **`/signup` rendered unstyled and non-functional on a fresh self-hosted install
+  (#494)** — the browser pipeline was missing `put_root_layout`. Fixed at the
+  `live_session` level so the `layout: false` marketing pages do not double-wrap.
+
+> **Note on this file's coverage.** Entries below predate a sustained run of merges
+> that were not recorded here. `git log --first-parent` is the authoritative history;
+> this file is best-effort for operator-facing changes.
+
+## [Earlier] — 2026-07-16 — Agent-memory substrate: project scope, merged recall, graduation (#411)
 
 ### Added
 

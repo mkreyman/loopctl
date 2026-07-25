@@ -29,6 +29,11 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
                         "loopctl is BYO — provision it ONCE via the set_llm_config MCP tool " <>
                         "(user role), or PATCH /api/v1/tenants/me/llm-config. See the response " <>
                         "`remediation` for the exact call."
+
+  # Inline-content ceiling (#493 review, findings 5/7). Declared HERE, above the
+  # `operation/2` specs, so the published OpenAPI `maxLength` and the enforcing
+  # `validate_content_length/1` read the SAME number and cannot drift.
+  @max_inline_content_bytes 1_000_000
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.ProjectId
 
@@ -46,7 +51,10 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
         "articles via LLM, and inserts them. Extracted articles are created as " <>
         "**drafts by default** (lower-trust LLM output, staged for review) — unlike " <>
         "direct POST /articles which publishes by default. Pass `publish: true` to " <>
-        "publish them on extraction instead. Role: orchestrator+.",
+        "publish them on extraction instead. Role: orchestrator+.\n\n" <>
+        "**At rest:** inline `content` is encrypted (AES-256-GCM) in the job record " <>
+        "and is never persisted in the clear. `url`, `source_type`, and `metadata` " <>
+        "are NOT encrypted — do not put sensitive values in `metadata`.",
     request_body:
       {"Ingestion request", "application/json",
        %OpenApiSpex.Schema{
@@ -58,7 +66,11 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
            },
            content: %OpenApiSpex.Schema{
              type: :string,
-             description: "Raw content to extract from (exactly one of url or content required)"
+             maxLength: @max_inline_content_bytes,
+             description:
+               "Raw content to extract from (exactly one of url or content required). " <>
+                 "Capped at #{@max_inline_content_bytes} bytes — a larger body is rejected " <>
+                 "with 422; fetch bigger documents via `url` instead. Encrypted at rest."
            },
            source_type: %OpenApiSpex.Schema{
              type: :string,
@@ -202,7 +214,9 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
                "Array of ingestion items (max 50). Each item has the same shape as " <>
                  "POST /knowledge/ingest: url or content, source_type (required), " <>
                  "project_id (optional), publish (optional, default false → draft), " <>
-                 "metadata (optional).",
+                 "metadata (optional). Per-item `content` obeys the same " <>
+                 "#{@max_inline_content_bytes}-byte cap and is encrypted at rest; " <>
+                 "`metadata` is not encrypted.",
              maxItems: 50
            }
          },
@@ -716,7 +730,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # and per-attempt CPU/memory. Reject an over-cap body as a clean 422 here (before any
   # crypto or enqueue) rather than after. Sized well above a large document (an ~87KB
   # newsletter) but bounded. URL-only ingests (content nil) skip this.
-  @max_inline_content_bytes 1_000_000
+  # (@max_inline_content_bytes is declared at the top of the module so the OpenAPI
+  # `maxLength` and this guard share one source of truth.)
   defp validate_content_length(content) when is_binary(content) do
     if byte_size(content) > @max_inline_content_bytes do
       {:error, :unprocessable_entity,

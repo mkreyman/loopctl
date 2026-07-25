@@ -23,7 +23,15 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `DATABASE_URL`     | Yes      | Ecto URL for `Loopctl.Repo` (loopctl_app role, RLS enforced) |
 | `ADMIN_DATABASE_URL` | Yes    | Ecto URL for `Loopctl.AdminRepo` (loopctl_admin role, BYPASSRLS) |
 | `SECRET_KEY_BASE`  | Yes      | Phoenix cookie signing/encryption key               |
-| `CLOAK_KEY`        | Yes      | AES-256-GCM encryption key for API key hashing      |
+| `CLOAK_KEY`        | Yes      | AES-256-GCM key for every field encrypted at rest: API key hashing, tenant LLM keys, webhook signing secrets, and ingestion document content |
+
+> **Rotating `CLOAK_KEY`:** keep the OUTGOING cipher in `Loopctl.Vault`'s
+> `retired_ciphers` (see `config/config.exs`) until the `:ingestion` queue has
+> drained. Ingestion jobs carry their document encrypted in `oban_jobs.args` and
+> live up to the 3600s uniqueness window (longer under snooze); a rotation that
+> drops the old cipher first makes those in-flight jobs undecryptable, and they
+> discard. The worker logs a distinct warning on every decrypt failure — alert on
+> it, since the same signal also means at-rest tampering.
 
 ### Environment Variables (set in fly.toml, not secrets)
 
@@ -41,6 +49,49 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `ADMIN_POOL_SIZE`   | `3`     | AdminRepo connection pool size           |
 | `ECTO_IPV6`         | -       | Set to `true` to enable IPv6 for DB     |
 | `DNS_CLUSTER_QUERY` | -       | DNS query for clustering (not needed for single machine) |
+| `SECRETS_ADAPTER`   | Fly GraphQL | Set to `local_file` to store the per-tenant audit keypairs on disk instead of in Fly secrets — REQUIRED when self-hosting off Fly (see below) |
+| `SECRETS_FILE`      | `/data/loopctl/secrets.json` | Path for the `local_file` adapter. Put it on a PERSISTENT volume |
+| `FTS_REGCONFIG`     | `english` | Postgres text-search config for keyword FTS (see below) |
+
+#### Self-hosting off Fly: `SECRETS_ADAPTER=local_file`
+
+Tenant signup mints a per-tenant Ed25519 audit keypair and stores the private key
+through `Loopctl.Secrets`. The default adapter writes to **Fly secrets**, so on a
+non-Fly host signup fails and no tenant can be created. Switch it:
+
+```bash
+SECRETS_ADAPTER=local_file
+SECRETS_FILE=/data/loopctl/secrets.json   # must be on a persistent volume
+```
+
+The local adapter writes `0600`, fsyncs, and uses an atomic tmp+rename under a
+write lock. **Back this file up with the database** — losing it breaks audit-chain
+signature verification for every tenant it holds a key for.
+
+#### Non-English knowledge bases: `FTS_REGCONFIG`
+
+Keyword full-text search ships hardwired to the `english` stemmer, which does not
+unify inflected forms in other languages (Russian «отчёты» never matches «отчёт»)
+and applies the wrong stop-words. Set the deployment's Postgres text-search
+configuration:
+
+```bash
+FTS_REGCONFIG=russian   # any name in pg_ts_config: simple, french, german, ...
+```
+
+**Set it BEFORE the first `migrate` on a fresh install.** The `apply_fts_regconfig`
+migration bakes the value into the stored `search_vector`s (a generated column cannot
+read runtime config), and it is a no-op on the `english` default. Changing the value
+on an already-migrated corpus does NOT re-run that migration — rebuilding a populated
+corpus's vectors is a separate operator action.
+
+A name that is well-formed but **not installed** (e.g. `ukrainian`, which stock
+Postgres does not ship) fails the migration loudly rather than silently building an
+unusable index — install the dictionary first. Verify with:
+
+```sql
+SELECT cfgname FROM pg_ts_config ORDER BY cfgname;
+```
 
 ## Database Setup
 
