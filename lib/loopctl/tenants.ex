@@ -70,19 +70,36 @@ defmodule Loopctl.Tenants do
 
   ## Returns
 
-  - `{:ok, %{tenant: %Tenant{}, root_authenticators: [%RootAuthenticator{}]}}`
+  - `{:ok, %{tenant: %Tenant{}, root_authenticators: [%RootAuthenticator{}], raw_key: String.t()}}`
+    — `raw_key` is the tenant's root `:user` API key, returned ONCE and never persisted
+    in plaintext (#500).
   - `{:error, :no_authenticators}` — empty list
   - `{:error, :too_many_authenticators}` — more than 5
   - `{:error, :slug_taken}` | `{:error, :email_taken}`
+  - `{:error, {:audit_key_storage_failed, term()}}` — the secret store rejected the audit
+    key (e.g. off Fly with no `SECRETS_ADAPTER`); the whole signup rolled back (#496)
+  - `{:error, :root_key_mint_failed}` — the root `:user` API key could not be minted
+    (an internal DB failure, not fixable input); the whole signup rolled back
   - `{:error, %Ecto.Changeset{}}` — validation failure
   """
   @spec signup(map()) ::
-          {:ok, %{tenant: Tenant.t(), root_authenticators: [RootAuthenticator.t()]}}
+          {:ok,
+           %{
+             tenant: Tenant.t(),
+             root_authenticators: [RootAuthenticator.t()],
+             raw_key: String.t()
+           }}
           | {:error, :no_authenticators}
           | {:error, :too_many_authenticators}
           | {:error, :slug_taken}
           | {:error, :email_taken}
+          | {:error, {:audit_key_storage_failed, term()}}
+          | {:error, :root_key_mint_failed}
           | {:error, Ecto.Changeset.t()}
+          # do_signup/2's generic branch (`{:error, _step, reason, _changes} ->
+          # {:error, reason}`) can surface any bare term from an unexpected Multi
+          # step failure. Declared so callers must handle it (LiveView catch-all).
+          | {:error, term()}
   def signup(attrs) when is_map(attrs) do
     authenticators = Map.get(attrs, :authenticators) || Map.get(attrs, "authenticators") || []
 
@@ -115,6 +132,25 @@ defmodule Loopctl.Tenants do
       Multi.new()
       |> Multi.insert(:tenant, Tenant.signup_changeset(tenant_attrs))
       |> insert_authenticators(authenticators)
+      # #500: mint the tenant's root `:user` API key in the SAME transaction, mirroring
+      # `self_signup/2`. Without it a browser-onboarded tenant has an anchored tenant but
+      # an empty `api_keys` — no authenticated path forward (the onboarding page tells you
+      # to call `set_llm_config`, but you have no key to authenticate that call). The raw
+      # key is returned ONCE (never persisted in plaintext) for the LiveView to surface;
+      # agent/orchestrator keys are minted later, after registering an agent identity.
+      #
+      # Ordered BEFORE append_keypair_and_genesis (which does the external
+      # `:store_secret` write) so this pure DB insert's validation runs while a failure
+      # can still roll back without touching the secret store — the module's documented
+      # "all DB validation precedes the irreversible external write" invariant.
+      |> Multi.run(:root_api_key, fn _repo, %{tenant: tenant} ->
+        Auth.generate_api_key(%{
+          tenant_id: tenant.id,
+          name: "root",
+          role: :user,
+          agent_id: nil
+        })
+      end)
       |> append_keypair_and_genesis(
         secret_name,
         priv,
@@ -130,14 +166,27 @@ defmodule Loopctl.Tenants do
       end)
 
     case result do
-      {:ok, %{activate: tenant, authenticators: authenticators}} ->
-        {:ok, %{tenant: tenant, root_authenticators: authenticators}}
+      {:ok,
+       %{activate: tenant, authenticators: authenticators, root_api_key: {raw_key, _api_key}}} ->
+        {:ok, %{tenant: tenant, root_authenticators: authenticators, raw_key: raw_key}}
 
       {:error, :tenant, %Ecto.Changeset{} = changeset, _changes} ->
         signup_changeset_error(changeset)
 
       {:error, {:authenticator, _index}, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
+
+      # A root-key mint failure is an INTERNAL failure (a DB constraint on the
+      # api_keys insert), not operator input the form can fix. Tag it distinctly so
+      # the LiveView surfaces a "signup failed internally, no tenant created" banner
+      # instead of rendering the ApiKey changeset as bogus tenant-field validation
+      # errors ("Please correct the highlighted fields" pointing at nothing).
+      # Log the discarded reason (no secret material is present in a root-key
+      # changeset) so an operator can diagnose the underlying DB/constraint cause —
+      # the collapsed atom alone is undebuggable from the logs.
+      {:error, :root_api_key, reason, _changes} ->
+        Logger.error("Tenants.signup: root :user API key mint failed: #{inspect(reason)}")
+        {:error, :root_key_mint_failed}
 
       {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
@@ -187,13 +236,16 @@ defmodule Loopctl.Tenants do
   - `{:ok, %{tenant: %Tenant{}, raw_key: String.t()}}` — `raw_key` is
     returned exactly once and is never persisted in plaintext.
   - `{:error, :slug_taken} | {:error, :email_taken}`
+  - `{:error, :root_key_mint_failed}` — the root `:user` API key could not be
+    minted (an internal DB failure, not fixable input); the whole signup rolled back
   - `{:error, %Ecto.Changeset{}}` — validation failure
-  - `{:error, term()}` — keypair storage or root-key-minting failure
+  - `{:error, term()}` — keypair storage failure
   """
   @spec self_signup(map()) ::
           {:ok, %{tenant: Tenant.t(), raw_key: String.t()}}
           | {:error, :slug_taken}
           | {:error, :email_taken}
+          | {:error, :root_key_mint_failed}
           | {:error, Ecto.Changeset.t()}
           | {:error, term()}
   def self_signup(attrs) when is_map(attrs) do
@@ -204,6 +256,17 @@ defmodule Loopctl.Tenants do
     multi =
       Multi.new()
       |> Multi.insert(:tenant, Tenant.self_signup_changeset(attrs))
+      # Ordered BEFORE append_keypair_and_genesis so this pure DB insert's validation
+      # runs while a failure can still roll back without touching the external secret
+      # store (matches do_signup/2 and the module's documented ordering invariant).
+      |> Multi.run(:root_api_key, fn _repo, %{tenant: tenant} ->
+        Auth.generate_api_key(%{
+          tenant_id: tenant.id,
+          name: "root",
+          role: :user,
+          agent_id: nil
+        })
+      end)
       |> append_keypair_and_genesis(
         secret_name,
         priv,
@@ -212,14 +275,6 @@ defmodule Loopctl.Tenants do
         "agent:self-signup",
         &self_signup_new_state/2
       )
-      |> Multi.run(:root_api_key, fn _repo, %{activate: tenant} ->
-        Auth.generate_api_key(%{
-          tenant_id: tenant.id,
-          name: "root",
-          role: :user,
-          agent_id: nil
-        })
-      end)
 
     result =
       with_secret_compensation({:delete, secret_name}, :store_secret, fn ->
@@ -232,6 +287,14 @@ defmodule Loopctl.Tenants do
 
       {:error, :tenant, %Ecto.Changeset{} = changeset, _changes} ->
         signup_changeset_error(changeset)
+
+      # Mirror do_signup/2: a root-key mint failure is an INTERNAL DB failure, not
+      # fixable input. Collapse it to a distinct atom (logged first) so the API
+      # SignupController renders a 500 "internal failure" instead of the raw ApiKey
+      # changeset as bogus 422 tenant-field validation errors.
+      {:error, :root_api_key, reason, _changes} ->
+        Logger.error("Tenants.self_signup: root :user API key mint failed: #{inspect(reason)}")
+        {:error, :root_key_mint_failed}
 
       {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
@@ -270,6 +333,18 @@ defmodule Loopctl.Tenants do
   # `:store_secret` runs AFTER `:tenant` (and, for signup, `:authenticators`)
   # so a duplicate-slug / validation failure never reaches the external write —
   # the compensation `write_step` guard keys on this step name.
+  #
+  # RESOURCE COUPLING (accepted at current scale): `:store_secret` runs the
+  # `Secrets.set/2` write INSIDE the enclosing `AdminRepo.transaction/1`, so it
+  # holds one of AdminRepo's scarce connections (3-conn pool,
+  # config/runtime.exs) for the duration of the secret write. On the self-host
+  # `LocalFileAdapter`, that write also does blocking file I/O + fsync and
+  # acquires a node-wide `:global.trans/2` lock — so under concurrent signups a
+  # slow disk or global-lock contention pins an admin connection. This is
+  # acceptable because signups are rare (single-operator self-host) and the Fly
+  # adapter already does an in-transaction external call. If signup concurrency
+  # ever grows, move the secret write OUT of the DB transaction (write-then-verify
+  # with compensation) so disk/lock stalls cannot back-pressure the admin pool.
   defp append_keypair_and_genesis(
          multi,
          secret_name,

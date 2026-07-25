@@ -56,6 +56,23 @@ defmodule LoopctlWeb.SignupLiveTest do
       assert has_element?(view, "#webauthn-hook")
       assert has_element?(view, "#signup-learn-more")
     end
+
+    test "#494: the DEAD render carries the root layout (head + assets) so WebAuthn JS loads", %{
+      conn: conn
+    } do
+      # The plain HTTP (disconnected) response — NOT the connected socket render `live/2`
+      # exercises. Before #494 the :browser pipeline had no put_root_layout, so this came
+      # back bare: no <!DOCTYPE>, no <head>, and app.js never loaded — bricking the ceremony.
+      html = conn |> get(~p"/signup") |> html_response(200)
+
+      assert html =~ "<!DOCTYPE html>"
+      assert html =~ "<head>"
+      # app.js runs the LiveView socket AND the WebAuthn credential hook.
+      assert html =~ "/assets/app.js"
+      assert html =~ "/assets/app.css"
+      # The LiveView content is present inside that layout.
+      assert html =~ ~s(id="signup-page")
+    end
   end
 
   describe "WebAuthn enrollment round-trip" do
@@ -137,7 +154,8 @@ defmodule LoopctlWeb.SignupLiveTest do
       refute AdminRepo.get_by(Tenant, slug: "skippy")
     end
 
-    test "successful signup redirects to /tenants/:id/onboarding", %{conn: conn} do
+    test "successful signup surfaces the root API key once + a continue-to-onboarding link (#500)",
+         %{conn: conn} do
       {:ok, view, _html} = live(conn, ~p"/signup")
 
       view
@@ -155,21 +173,65 @@ defmodule LoopctlWeb.SignupLiveTest do
         "credential_id" => "Y3JlZC1pZA"
       })
 
-      assert {:error, {:live_redirect, %{to: redirect_to}}} =
-               view
-               |> form("#signup-form", %{
-                 "tenant" => %{
-                   "name" => "Successful Corp",
-                   "slug" => "successful-corp",
-                   "email" => "admin@successful.example"
-                 }
-               })
-               |> render_submit()
+      # #500: no redirect — the raw key is shown once in-page (never a URL / the session).
+      html =
+        view
+        |> form("#signup-form", %{
+          "tenant" => %{
+            "name" => "Successful Corp",
+            "slug" => "successful-corp",
+            "email" => "admin@successful.example"
+          }
+        })
+        |> render_submit()
 
-      assert redirect_to =~ "/tenants/"
-      assert redirect_to =~ "/onboarding"
+      assert has_element?(view, "#signup-complete")
+      assert has_element?(view, "#root-api-key")
+      # The continue link carries the onboarding path (with the signed token); no key in the URL.
+      assert has_element?(view, "#continue-to-onboarding")
+      refute html =~ "signup-form"
 
-      assert AdminRepo.get_by(Tenant, slug: "successful-corp")
+      tenant = AdminRepo.get_by(Tenant, slug: "successful-corp")
+      assert tenant
+
+      # #500: a real, usable root user-role key was minted for the new tenant.
+      key = AdminRepo.get_by(Loopctl.Auth.ApiKey, tenant_id: tenant.id, role: :user)
+      assert key
+      assert is_nil(key.agent_id)
+      # The rendered key must be the actual minted key (its prefix is stored).
+      assert html =~ key.key_prefix
+    end
+
+    test "audit-key storage failure surfaces a banner and creates no tenant, not a crash (#496)",
+         %{conn: conn} do
+      # Off Fly with no local adapter, Secrets.set fails; the signup multi rolls back.
+      stub(Loopctl.MockSecrets, :set, fn _name, _value -> {:error, :fly_not_configured} end)
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      view |> element("#enroll-authenticator-btn") |> render_click()
+
+      render_hook(view, "attestation_captured", %{
+        "attestation_object" => "YWJjZA",
+        "client_data_json" => "eyJmb28iOiJiYXIifQ",
+        "credential_id" => "Y3JlZC1pZA"
+      })
+
+      html =
+        view
+        |> form("#signup-form", %{
+          "tenant" => %{
+            "name" => "Offline Corp",
+            "slug" => "offline-corp",
+            "email" => "admin@offline.example"
+          }
+        })
+        |> render_submit()
+
+      # Actionable banner (the old behaviour was a CaseClauseError crash / dead button).
+      assert html =~ "SECRETS_ADAPTER=local_file"
+      refute has_element?(view, "#signup-complete")
+      refute AdminRepo.get_by(Tenant, slug: "offline-corp")
     end
 
     test "duplicate slug surfaces a stable error code (TC-26.0.1.3 via LV)", %{conn: conn} do
@@ -291,18 +353,19 @@ defmodule LoopctlWeb.SignupLiveTest do
       {:ok, victim_view, _html} = live(fly_conn(conn, "203.0.113.9"), ~p"/signup")
       enroll_authenticator(victim_view)
 
-      assert {:error, {:live_redirect, %{to: redirect_to}}} =
-               victim_view
-               |> form("#signup-form", %{
-                 "tenant" => %{
-                   "name" => "Victim Corp",
-                   "slug" => "victim-corp",
-                   "email" => "victim@corp.example"
-                 }
-               })
-               |> render_submit()
+      victim_view
+      |> form("#signup-form", %{
+        "tenant" => %{
+          "name" => "Victim Corp",
+          "slug" => "victim-corp",
+          "email" => "victim@corp.example"
+        }
+      })
+      |> render_submit()
 
-      assert redirect_to =~ "/onboarding"
+      # #500: success now surfaces the one-time key panel in-page (no redirect).
+      assert has_element?(victim_view, "#signup-complete")
+      assert has_element?(victim_view, "#continue-to-onboarding")
       assert AdminRepo.get_by(Tenant, slug: "victim-corp")
     end
 

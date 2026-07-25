@@ -46,6 +46,18 @@ if System.get_env("RATE_LIMITER") == "postgres" do
   config :loopctl, :rate_limiter, Loopctl.RateLimiter.Postgres
 end
 
+# #496: self-hosted (non-Fly) secret storage. The default `Loopctl.Secrets.FlyAdapter`
+# reads secrets from process env (Fly injects them) and writes via the Fly GraphQL API —
+# both unavailable off Fly, so signup's audit-key storage returns `:fly_not_configured`
+# and tenant creation is impossible. `SECRETS_ADAPTER=local_file` selects a 0600 JSON
+# file-backed adapter (read the threat model in `Loopctl.Secrets.LocalFileAdapter` before
+# using). The file defaults to a persistent-volume path; override with `SECRETS_FILE`.
+# Anything other than "local_file" (incl. unset) leaves the Fly default in place.
+if System.get_env("SECRETS_ADAPTER") == "local_file" do
+  config :loopctl, :secrets_adapter, Loopctl.Secrets.LocalFileAdapter
+  config :loopctl, :secrets_file, System.get_env("SECRETS_FILE") || "/data/loopctl/secrets.json"
+end
+
 # sec-4: OPT-IN override of the node-local Hammer poolboy pool that fronts EVERY
 # `check_rate/3`. The base sizing lives in config/config.exs (20 / 10, up from
 # Hammer's 4 / 0 defaults) to keep the fail-CLOSED `AuthPathThrottle` from

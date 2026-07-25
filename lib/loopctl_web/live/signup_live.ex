@@ -124,6 +124,9 @@ defmodule LoopctlWeb.SignupLive do
      |> assign(:learn_more_url, @learn_more_url)
      |> assign(:friendly_name_draft, "")
      |> assign(:rate_key, signup_rate_key(session, socket))
+     # #500: nil until signup completes; then holds %{tenant, raw_key, onboarding_path}
+     # and the render switches from the form to the one-time "save your key" panel.
+     |> assign(:completed, nil)
      |> assign(:error, nil)}
   end
 
@@ -337,6 +340,16 @@ defmodule LoopctlWeb.SignupLive do
   # with/else could run, and an oversized index would crash Integer.parse.
   def handle_event("remove_authenticator", _params, socket), do: {:noreply, socket}
 
+  # Idempotency guard: once signup has succeeded (@completed is set) the form and
+  # submit button are hidden, but a replayed/stale "signup" websocket frame would
+  # still re-enter the full flow — burning rate-limit budget on a rollback-destined
+  # DB transaction + secret-store write. No-op instead.
+  @impl true
+  def handle_event("signup", _params, %{assigns: %{completed: completed}} = socket)
+      when not is_nil(completed) do
+    {:noreply, socket}
+  end
+
   @impl true
   def handle_event("signup", %{"tenant" => params}, socket) when is_map(params) do
     # `is_map(params)` guards a crafted non-map "tenant"; anything else falls to
@@ -479,49 +492,130 @@ defmodule LoopctlWeb.SignupLive do
     attrs = Map.put(params, "authenticators", auths)
 
     case Tenants.signup(attrs) do
-      {:ok, %{tenant: tenant}} ->
+      {:ok, %{tenant: tenant, raw_key: raw_key}} ->
         token = Phoenix.Token.sign(LoopctlWeb.Endpoint, "onboarding", tenant.id)
 
+        # #500: DON'T navigate away yet — the root API key (`raw_key`) is shown ONCE and
+        # is never persisted in plaintext. Hold it in this connected LiveView's memory
+        # (never a URL, never the session) and render the "save your key" panel; the
+        # operator copies it, then follows the onboarding link. Navigating immediately
+        # would drop the only copy of the key on the floor.
         {:noreply,
-         socket
-         |> put_flash(:info, "Tenant signup complete — welcome to loopctl")
-         |> push_navigate(to: ~p"/tenants/#{tenant.id}/onboarding?token=#{token}")}
+         assign(socket, :completed, %{
+           tenant: tenant,
+           raw_key: raw_key,
+           onboarding_path: ~p"/tenants/#{tenant.id}/onboarding?token=#{token}"
+         })}
 
-      {:error, :slug_taken} ->
-        {:noreply,
-         assign(
-           socket,
-           :form,
-           to_form(params, as: :tenant, errors: [slug: {"slug_taken", []}])
-         )
-         |> assign(:error, "That slug is already in use")}
-
-      {:error, :email_taken} ->
-        {:noreply,
-         assign(
-           socket,
-           :form,
-           to_form(params, as: :tenant, errors: [email: {"email_taken", []}])
-         )
-         |> assign(:error, "That email is already associated with a tenant")}
-
-      {:error, :no_authenticators} ->
-        {:noreply, assign(socket, :error, "Enroll at least one authenticator")}
-
-      {:error, :too_many_authenticators} ->
-        {:noreply,
-         assign(
-           socket,
-           :error,
-           "At most #{socket.assigns.max_authenticators} authenticators can be enrolled"
-         )}
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:noreply,
-         socket
-         |> assign(:form, to_form(changeset, as: :tenant))
-         |> assign(:error, "Please correct the highlighted fields")}
+      {:error, reason} ->
+        handle_signup_error(reason, params, socket)
     end
+  end
+
+  # #496: audit-key storage failed (e.g. off Fly with no SECRETS_ADAPTER). The signup
+  # transaction rolled back, so no tenant exists — surface an actionable banner instead
+  # of crashing the LiveView with a CaseClauseError (the old silent "button does nothing").
+  defp handle_signup_error({:audit_key_storage_failed, reason}, _params, socket) do
+    # Log the underlying store reason (no secret material — it's a store/adapter
+    # error term, e.g. :fly_not_configured or {:secrets_file_write_failed, :enospc})
+    # so an operator whose signups fail has something to diagnose from the logs.
+    Logger.error("SignupLive: audit-key storage failed: #{inspect(reason)}")
+    {:noreply, assign(socket, :error, audit_key_storage_error_message(reason))}
+  end
+
+  # Internal mint failure (a DB constraint on the root api_key), NOT operator
+  # input the form can fix. The signup transaction rolled back — no tenant exists —
+  # so surface a distinct "internal failure" banner rather than the misleading
+  # "correct the highlighted fields" form-validation message.
+  defp handle_signup_error(:root_key_mint_failed, _params, socket) do
+    {:noreply,
+     assign(
+       socket,
+       :error,
+       "Signup failed internally while provisioning your root API key. " <>
+         "No tenant was created — please try again."
+     )}
+  end
+
+  defp handle_signup_error(:slug_taken, params, socket) do
+    {:noreply,
+     assign(
+       socket,
+       :form,
+       to_form(params, as: :tenant, errors: [slug: {"slug_taken", []}])
+     )
+     |> assign(:error, "That slug is already in use")}
+  end
+
+  defp handle_signup_error(:email_taken, params, socket) do
+    {:noreply,
+     assign(
+       socket,
+       :form,
+       to_form(params, as: :tenant, errors: [email: {"email_taken", []}])
+     )
+     |> assign(:error, "That email is already associated with a tenant")}
+  end
+
+  defp handle_signup_error(:no_authenticators, _params, socket) do
+    {:noreply, assign(socket, :error, "Enroll at least one authenticator")}
+  end
+
+  defp handle_signup_error(:too_many_authenticators, _params, socket) do
+    {:noreply,
+     assign(
+       socket,
+       :error,
+       "At most #{socket.assigns.max_authenticators} authenticators can be enrolled"
+     )}
+  end
+
+  defp handle_signup_error(%Ecto.Changeset{} = changeset, _params, socket) do
+    {:noreply,
+     socket
+     |> assign(:form, to_form(changeset, as: :tenant))
+     |> assign(:error, "Please correct the highlighted fields")}
+  end
+
+  # Defensive catch-all. `Tenants.signup/1`'s own generic branch
+  # (`{:error, _step, reason, _changes} -> {:error, reason}`) can surface any
+  # non-changeset, non-mapped error term from an unexpected Multi step failure
+  # (e.g. :set_public_key / :activate / :audit_genesis returning a bare term).
+  # Without this clause such a term would raise CaseClauseError and crash the
+  # LiveView — reintroducing the exact silent "button does nothing" failure #496
+  # set out to eliminate. Surface a generic internal-failure banner instead.
+  defp handle_signup_error(reason, _params, socket) do
+    Logger.error("SignupLive: signup failed with unexpected reason: #{inspect(reason)}")
+
+    {:noreply,
+     assign(
+       socket,
+       :error,
+       "Signup failed internally and no tenant was created — please try again."
+     )}
+  end
+
+  # #496: turn an audit-key storage failure into an actionable operator message. The most
+  # common cause on a fresh self-hosted (non-Fly) install is the default FlyAdapter having
+  # no Fly API access; the fix is the file-backed adapter.
+  defp audit_key_storage_error_message(:fly_not_configured) do
+    "Could not store this tenant's audit signing key: the secret store is not configured. " <>
+      "On a self-hosted (non-Fly) install, set SECRETS_ADAPTER=local_file (and optionally " <>
+      "SECRETS_FILE to the secrets file path) and restart. No tenant was created; retry after configuring it."
+  end
+
+  # Local-file adapter write failure (disk full, read-only volume, bad permissions).
+  # The secret store IS configured here — pointing the operator at "configuration" would
+  # misdirect triage — so name the actual cause: the SECRETS_FILE volume.
+  defp audit_key_storage_error_message({:secrets_file_write_failed, _reason}) do
+    "Could not write this tenant's audit signing key to the local secret store, so signup was " <>
+      "rolled back and no tenant was created. Check that the SECRETS_FILE volume has free disk " <>
+      "space and is writable by the app user, then try again."
+  end
+
+  defp audit_key_storage_error_message(_reason) do
+    "Could not store this tenant's audit signing key, so signup was rolled back and no tenant " <>
+      "was created. Check the secret store configuration and try again."
   end
 
   defp new_challenge do
@@ -622,145 +716,210 @@ defmodule LoopctlWeb.SignupLive do
         </div>
       </header>
 
-      <.form
-        for={@form}
-        id="signup-form"
-        phx-change="validate"
-        phx-submit="signup"
-        class="space-y-8"
-      >
-        <div class="space-y-6 rounded-md border border-slate-800 bg-slate-900/60 p-6">
-          <h2 class="font-display text-sm uppercase tracking-wide text-slate-400">
-            Tenant metadata
-          </h2>
-
-          <.input
-            field={@form[:name]}
-            type="text"
-            label="Display name"
-            placeholder="Acme Robotics"
-            required
-            id="tenant-name-input"
-          />
-
-          <.input
-            field={@form[:slug]}
-            type="text"
-            label="Slug"
-            placeholder="acme-robotics"
-            required
-            id="tenant-slug-input"
-          />
-
-          <.input
-            field={@form[:email]}
-            type="email"
-            label="Contact email"
-            placeholder="admin@acme.example"
-            required
-            id="tenant-email-input"
-          />
-        </div>
-
-        <div class="space-y-4 rounded-md border border-slate-800 bg-slate-900/60 p-6">
-          <div class="flex items-start justify-between gap-4">
-            <div>
-              <h2 class="font-display text-sm uppercase tracking-wide text-slate-400">
-                Root authenticators
+      <%= if @completed do %>
+        <div id="signup-complete" class="space-y-6">
+          <div class="rounded-md border border-accent-500/40 bg-slate-900/60 p-6">
+            <div class="flex items-center gap-3">
+              <.icon name="hero-check-circle" class="h-6 w-6 text-accent-400" />
+              <h2 class="font-display text-lg font-semibold text-slate-100">
+                Tenant <span class="font-mono text-accent-300">{@completed.tenant.slug}</span> created
               </h2>
-              <p class="mt-1 text-xs text-slate-500">
-                Enroll at least one FIDO2 authenticator ({length(@authenticators)} of {@max_authenticators} used).
-                YubiKeys, Touch ID, Windows Hello, and other platform keys all work.
-              </p>
             </div>
-            <.icon name="hero-key" class="h-10 w-10 text-accent-400" />
+            <p class="mt-2 text-sm text-slate-400">
+              This is your root <span class="font-mono text-slate-300">user</span>-role API key. It
+              is shown <strong class="text-rose-300">once</strong> and is never stored in a form you
+              can recover — copy it now and keep it somewhere safe.
+            </p>
           </div>
-
-          <ul id="enrolled-authenticators" class="space-y-2">
-            <li
-              :for={{auth, index} <- Enum.with_index(@authenticators)}
-              id={"authenticator-#{index}"}
-              class="flex items-center justify-between rounded-md border border-accent-500/40 bg-slate-950 px-4 py-3 text-sm"
-            >
-              <div class="flex items-center gap-3">
-                <.icon name="hero-check-circle" class="h-5 w-5 text-accent-400" />
-                <span class="font-mono text-xs uppercase tracking-wide text-slate-300">
-                  {auth.friendly_name}
-                </span>
-                <span class="font-mono text-[10px] text-slate-600">
-                  {auth.attestation_result.attestation_format}
-                </span>
-              </div>
-              <button
-                type="button"
-                phx-click="remove_authenticator"
-                phx-value-index={index}
-                class="rounded-md px-2 py-1 text-xs text-slate-500 hover:text-rose-300"
-              >
-                <.icon name="hero-x-mark" class="h-4 w-4" />
-              </button>
-            </li>
-          </ul>
 
           <div
-            id="webauthn-hook"
-            phx-hook="WebAuthn"
-            phx-update="ignore"
-            data-challenge={@challenge_payload}
-            data-rp-id={Keyword.get(WebAuthn.rp_opts(), :rp_id, "loopctl.com")}
-            data-rp-name="loopctl"
+            id="root-key-loss-warning"
+            role="alert"
+            class="rounded-md border border-rose-500/60 bg-rose-950/40 p-4"
           >
+            <div class="flex items-start gap-3">
+              <.icon name="hero-exclamation-triangle" class="mt-0.5 h-5 w-5 shrink-0 text-rose-300" />
+              <p class="text-sm text-rose-100">
+                <strong>Do not refresh or close this tab until you have copied the key.</strong>
+                This is the tenant's only credential and it is not stored anywhere. If this page
+                reloads or the connection drops before you save it, the key is
+                <strong class="text-rose-200">gone permanently</strong>
+                and the tenant can only be recovered by a superadmin. Save it first, then click continue.
+              </p>
+            </div>
           </div>
 
-          <div class="flex flex-col gap-3 sm:flex-row" id="enrollment-controls">
-            <input
-              id="authenticator-friendly-name"
-              type="text"
-              name="friendly_name"
-              form="signup-form"
-              value={@friendly_name_draft}
-              placeholder="Primary YubiKey"
-              class="block flex-1 rounded-md border border-slate-800 bg-slate-900 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-600 focus:border-accent-500 focus:outline-none focus:ring-1 focus:ring-accent-500"
-            />
-            <button
-              id="enroll-authenticator-btn"
-              type="button"
-              phx-click="request_attestation"
-              disabled={length(@authenticators) >= @max_authenticators}
-              class="inline-flex items-center justify-center gap-2 rounded-md border border-accent-500 bg-accent-600/20 px-4 py-2 font-mono text-xs uppercase tracking-wide text-accent-100 hover:bg-accent-600/40 disabled:cursor-not-allowed disabled:opacity-50"
+          <div class="rounded-md border border-rose-500/40 bg-rose-950/20 p-6">
+            <label
+              for="root-api-key"
+              class="block font-mono text-[10px] uppercase tracking-wide text-slate-500"
             >
-              <.icon name="hero-key" class="h-4 w-4" /> Enroll authenticator
+              LOOPCTL_USER_KEY
+            </label>
+            <code
+              id="root-api-key"
+              class="mt-2 block w-full select-all break-all rounded-md border border-slate-800 bg-slate-950 px-3 py-3 font-mono text-sm text-accent-200"
+            >
+              {@completed.raw_key}
+            </code>
+            <p class="mt-3 text-xs text-slate-500">
+              Use it as your user-role key (e.g. <span class="font-mono">LOOPCTL_USER_KEY</span>
+              in <span class="font-mono">.mcp.json</span>). Provision your BYO LLM keys, then register
+              an agent to mint agent / orchestrator keys.
+            </p>
+          </div>
+
+          <div class="flex items-center justify-end">
+            <a
+              href={@completed.onboarding_path}
+              id="continue-to-onboarding"
+              class="inline-flex items-center justify-center gap-2 rounded-md border border-accent-500 bg-accent-600 px-6 py-2 font-mono text-sm uppercase tracking-wide text-slate-50 hover:bg-accent-500"
+            >
+              I saved my key — continue →
+            </a>
+          </div>
+        </div>
+      <% else %>
+        <.form
+          for={@form}
+          id="signup-form"
+          phx-change="validate"
+          phx-submit="signup"
+          class="space-y-8"
+        >
+          <div class="space-y-6 rounded-md border border-slate-800 bg-slate-900/60 p-6">
+            <h2 class="font-display text-sm uppercase tracking-wide text-slate-400">
+              Tenant metadata
+            </h2>
+
+            <.input
+              field={@form[:name]}
+              type="text"
+              label="Display name"
+              placeholder="Acme Robotics"
+              required
+              id="tenant-name-input"
+            />
+
+            <.input
+              field={@form[:slug]}
+              type="text"
+              label="Slug"
+              placeholder="acme-robotics"
+              required
+              id="tenant-slug-input"
+            />
+
+            <.input
+              field={@form[:email]}
+              type="email"
+              label="Contact email"
+              placeholder="admin@acme.example"
+              required
+              id="tenant-email-input"
+            />
+          </div>
+
+          <div class="space-y-4 rounded-md border border-slate-800 bg-slate-900/60 p-6">
+            <div class="flex items-start justify-between gap-4">
+              <div>
+                <h2 class="font-display text-sm uppercase tracking-wide text-slate-400">
+                  Root authenticators
+                </h2>
+                <p class="mt-1 text-xs text-slate-500">
+                  Enroll at least one FIDO2 authenticator ({length(@authenticators)} of {@max_authenticators} used).
+                  YubiKeys, Touch ID, Windows Hello, and other platform keys all work.
+                </p>
+              </div>
+              <.icon name="hero-key" class="h-10 w-10 text-accent-400" />
+            </div>
+
+            <ul id="enrolled-authenticators" class="space-y-2">
+              <li
+                :for={{auth, index} <- Enum.with_index(@authenticators)}
+                id={"authenticator-#{index}"}
+                class="flex items-center justify-between rounded-md border border-accent-500/40 bg-slate-950 px-4 py-3 text-sm"
+              >
+                <div class="flex items-center gap-3">
+                  <.icon name="hero-check-circle" class="h-5 w-5 text-accent-400" />
+                  <span class="font-mono text-xs uppercase tracking-wide text-slate-300">
+                    {auth.friendly_name}
+                  </span>
+                  <span class="font-mono text-[10px] text-slate-600">
+                    {auth.attestation_result.attestation_format}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  phx-click="remove_authenticator"
+                  phx-value-index={index}
+                  class="rounded-md px-2 py-1 text-xs text-slate-500 hover:text-rose-300"
+                >
+                  <.icon name="hero-x-mark" class="h-4 w-4" />
+                </button>
+              </li>
+            </ul>
+
+            <div
+              id="webauthn-hook"
+              phx-hook="WebAuthn"
+              phx-update="ignore"
+              data-challenge={@challenge_payload}
+              data-rp-id={Keyword.get(WebAuthn.rp_opts(), :rp_id, "loopctl.com")}
+              data-rp-name="loopctl"
+            >
+            </div>
+
+            <div class="flex flex-col gap-3 sm:flex-row" id="enrollment-controls">
+              <input
+                id="authenticator-friendly-name"
+                type="text"
+                name="friendly_name"
+                form="signup-form"
+                value={@friendly_name_draft}
+                placeholder="Primary YubiKey"
+                class="block flex-1 rounded-md border border-slate-800 bg-slate-900 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-600 focus:border-accent-500 focus:outline-none focus:ring-1 focus:ring-accent-500"
+              />
+              <button
+                id="enroll-authenticator-btn"
+                type="button"
+                phx-click="request_attestation"
+                disabled={length(@authenticators) >= @max_authenticators}
+                class="inline-flex items-center justify-center gap-2 rounded-md border border-accent-500 bg-accent-600/20 px-4 py-2 font-mono text-xs uppercase tracking-wide text-accent-100 hover:bg-accent-600/40 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <.icon name="hero-key" class="h-4 w-4" /> Enroll authenticator
+              </button>
+            </div>
+          </div>
+
+          <div
+            :if={@error}
+            id="signup-error"
+            role="alert"
+            class="rounded-md border border-rose-500/40 bg-rose-950/30 px-4 py-3 text-sm text-rose-200"
+          >
+            {@error}
+          </div>
+
+          <div class="flex items-center justify-between gap-4">
+            <a
+              href={@learn_more_url}
+              class="font-mono text-xs uppercase tracking-wide text-slate-500 hover:text-accent-400"
+              id="signup-learn-more"
+            >
+              learn more about the ceremony →
+            </a>
+            <button
+              id="signup-submit-btn"
+              type="submit"
+              class="inline-flex items-center justify-center gap-2 rounded-md border border-accent-500 bg-accent-600 px-6 py-2 font-mono text-sm uppercase tracking-wide text-slate-50 hover:bg-accent-500 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={@authenticators == []}
+            >
+              Complete signup
             </button>
           </div>
-        </div>
-
-        <div
-          :if={@error}
-          id="signup-error"
-          role="alert"
-          class="rounded-md border border-rose-500/40 bg-rose-950/30 px-4 py-3 text-sm text-rose-200"
-        >
-          {@error}
-        </div>
-
-        <div class="flex items-center justify-between gap-4">
-          <a
-            href={@learn_more_url}
-            class="font-mono text-xs uppercase tracking-wide text-slate-500 hover:text-accent-400"
-            id="signup-learn-more"
-          >
-            learn more about the ceremony →
-          </a>
-          <button
-            id="signup-submit-btn"
-            type="submit"
-            class="inline-flex items-center justify-center gap-2 rounded-md border border-accent-500 bg-accent-600 px-6 py-2 font-mono text-sm uppercase tracking-wide text-slate-50 hover:bg-accent-500 disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={@authenticators == []}
-          >
-            Complete signup
-          </button>
-        </div>
-      </.form>
+        </.form>
+      <% end %>
     </section>
     """
   end

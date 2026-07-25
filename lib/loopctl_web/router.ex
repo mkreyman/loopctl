@@ -4,6 +4,20 @@ defmodule LoopctlWeb.Router do
   pipeline :browser do
     plug :accepts, ["html"]
     plug :fetch_session
+    # `fetch_live_flash` is required by the app layout's <.flash_group> on the
+    # LiveView routes below.
+    #
+    # #494/#516: the ROOT layout is deliberately NOT set here. A LiveView renders its
+    # DEAD (first HTTP) response through the ROOT layout, which carries <head> +
+    # app.css/app.js; `use LiveView, layout:` sets only the APP (inner) layout. But
+    # PageController (/, /docs, /terms, /privacy) shares this pipeline and renders
+    # SELF-CONTAINED full HTML documents with `layout: false` — and `layout: false`
+    # disables only the inner layout, NOT the root, so a pipeline-wide root layout
+    # double-wrapped those pages (two <!DOCTYPE>, two <head>, assets loaded twice).
+    # The root layout is therefore scoped to the `:public_signup` and `:public_wiki`
+    # live_sessions instead (see `root_layout:` below), which is where the dead-render
+    # <head>/asset injection is actually needed.
+    plug :fetch_live_flash
     plug :protect_from_forgery
 
     plug :put_secure_browser_headers, %{
@@ -57,13 +71,14 @@ defmodule LoopctlWeb.Router do
     # the session, so SignupLive gets an unspoofable per-IP rate-limit key on
     # both the disconnected and connected mount. See SignupLive.signup_session/1.
     live_session :public_signup,
-      session: {LoopctlWeb.SignupLive, :signup_session, []} do
+      session: {LoopctlWeb.SignupLive, :signup_session, []},
+      root_layout: {LoopctlWeb.Layouts, :root} do
       live "/signup", SignupLive, :index
       live "/tenants/:id/onboarding", TenantOnboardingLive, :index
     end
 
     # US-26.0.3 — public wiki rendering for system-scoped articles
-    live_session :public_wiki do
+    live_session :public_wiki, root_layout: {LoopctlWeb.Layouts, :root} do
       live "/wiki", WikiIndexLive, :index
       live "/wiki/:slug", WikiShowLive, :show
     end

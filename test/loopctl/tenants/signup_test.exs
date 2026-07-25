@@ -43,13 +43,23 @@ defmodule Loopctl.Tenants.SignupTest do
         authenticators: [valid_attestation()]
       }
 
-      assert {:ok, %{tenant: tenant, root_authenticators: [auth]}} = Tenants.signup(attrs)
+      assert {:ok, %{tenant: tenant, root_authenticators: [auth], raw_key: raw_key}} =
+               Tenants.signup(attrs)
+
       assert tenant.status == :active
       assert tenant.slug == "test-signup"
       assert tenant.email == "admin@test-signup.example"
       assert auth.tenant_id == tenant.id
       assert auth.friendly_name == "Primary YubiKey"
       assert auth.attestation_format == "none"
+
+      # #500: signup mints a usable root user-role key and returns it ONCE, so a
+      # browser-onboarded tenant has an authenticated path forward (was: empty api_keys).
+      assert is_binary(raw_key) and raw_key != ""
+      assert {:ok, verified} = Auth.verify_api_key(raw_key)
+      assert verified.tenant_id == tenant.id
+      assert verified.role == :user
+      assert is_nil(verified.agent_id)
 
       # Idempotent persistence: re-reading surfaces the same row.
       [persisted] = RootAuthenticators.list_by_tenant(tenant.id)
