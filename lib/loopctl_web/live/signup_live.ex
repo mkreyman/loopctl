@@ -340,6 +340,16 @@ defmodule LoopctlWeb.SignupLive do
   # with/else could run, and an oversized index would crash Integer.parse.
   def handle_event("remove_authenticator", _params, socket), do: {:noreply, socket}
 
+  # Idempotency guard: once signup has succeeded (@completed is set) the form and
+  # submit button are hidden, but a replayed/stale "signup" websocket frame would
+  # still re-enter the full flow — burning rate-limit budget on a rollback-destined
+  # DB transaction + secret-store write. No-op instead.
+  @impl true
+  def handle_event("signup", _params, %{assigns: %{completed: completed}} = socket)
+      when not is_nil(completed) do
+    {:noreply, socket}
+  end
+
   @impl true
   def handle_event("signup", %{"tenant" => params}, socket) when is_map(params) do
     # `is_map(params)` guards a crafted non-map "tenant"; anything else falls to
@@ -497,60 +507,92 @@ defmodule LoopctlWeb.SignupLive do
            onboarding_path: ~p"/tenants/#{tenant.id}/onboarding?token=#{token}"
          })}
 
-      # #496: audit-key storage failed (e.g. off Fly with no SECRETS_ADAPTER). The signup
-      # transaction rolled back, so no tenant exists — surface an actionable banner instead
-      # of crashing the LiveView with a CaseClauseError (the old silent "button does nothing").
-      {:error, {:audit_key_storage_failed, reason}} ->
-        {:noreply, assign(socket, :error, audit_key_storage_error_message(reason))}
-
-      # Internal mint failure (a DB constraint on the root api_key), NOT operator
-      # input the form can fix. The signup transaction rolled back — no tenant exists —
-      # so surface a distinct "internal failure" banner rather than the misleading
-      # "correct the highlighted fields" form-validation message.
-      {:error, :root_key_mint_failed} ->
-        {:noreply,
-         assign(
-           socket,
-           :error,
-           "Signup failed internally while provisioning your root API key. " <>
-             "No tenant was created — please try again."
-         )}
-
-      {:error, :slug_taken} ->
-        {:noreply,
-         assign(
-           socket,
-           :form,
-           to_form(params, as: :tenant, errors: [slug: {"slug_taken", []}])
-         )
-         |> assign(:error, "That slug is already in use")}
-
-      {:error, :email_taken} ->
-        {:noreply,
-         assign(
-           socket,
-           :form,
-           to_form(params, as: :tenant, errors: [email: {"email_taken", []}])
-         )
-         |> assign(:error, "That email is already associated with a tenant")}
-
-      {:error, :no_authenticators} ->
-        {:noreply, assign(socket, :error, "Enroll at least one authenticator")}
-
-      {:error, :too_many_authenticators} ->
-        {:noreply,
-         assign(
-           socket,
-           :error,
-           "At most #{socket.assigns.max_authenticators} authenticators can be enrolled"
-         )}
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:noreply,
-         socket
-         |> assign(:form, to_form(changeset, as: :tenant))
-         |> assign(:error, "Please correct the highlighted fields")}
+      {:error, reason} ->
+        handle_signup_error(reason, params, socket)
     end
+  end
+
+  # #496: audit-key storage failed (e.g. off Fly with no SECRETS_ADAPTER). The signup
+  # transaction rolled back, so no tenant exists — surface an actionable banner instead
+  # of crashing the LiveView with a CaseClauseError (the old silent "button does nothing").
+  defp handle_signup_error({:audit_key_storage_failed, reason}, _params, socket) do
+    # Log the underlying store reason (no secret material — it's a store/adapter
+    # error term, e.g. :fly_not_configured or {:secrets_file_write_failed, :enospc})
+    # so an operator whose signups fail has something to diagnose from the logs.
+    Logger.error("SignupLive: audit-key storage failed: #{inspect(reason)}")
+    {:noreply, assign(socket, :error, audit_key_storage_error_message(reason))}
+  end
+
+  # Internal mint failure (a DB constraint on the root api_key), NOT operator
+  # input the form can fix. The signup transaction rolled back — no tenant exists —
+  # so surface a distinct "internal failure" banner rather than the misleading
+  # "correct the highlighted fields" form-validation message.
+  defp handle_signup_error(:root_key_mint_failed, _params, socket) do
+    {:noreply,
+     assign(
+       socket,
+       :error,
+       "Signup failed internally while provisioning your root API key. " <>
+         "No tenant was created — please try again."
+     )}
+  end
+
+  defp handle_signup_error(:slug_taken, params, socket) do
+    {:noreply,
+     assign(
+       socket,
+       :form,
+       to_form(params, as: :tenant, errors: [slug: {"slug_taken", []}])
+     )
+     |> assign(:error, "That slug is already in use")}
+  end
+
+  defp handle_signup_error(:email_taken, params, socket) do
+    {:noreply,
+     assign(
+       socket,
+       :form,
+       to_form(params, as: :tenant, errors: [email: {"email_taken", []}])
+     )
+     |> assign(:error, "That email is already associated with a tenant")}
+  end
+
+  defp handle_signup_error(:no_authenticators, _params, socket) do
+    {:noreply, assign(socket, :error, "Enroll at least one authenticator")}
+  end
+
+  defp handle_signup_error(:too_many_authenticators, _params, socket) do
+    {:noreply,
+     assign(
+       socket,
+       :error,
+       "At most #{socket.assigns.max_authenticators} authenticators can be enrolled"
+     )}
+  end
+
+  defp handle_signup_error(%Ecto.Changeset{} = changeset, _params, socket) do
+    {:noreply,
+     socket
+     |> assign(:form, to_form(changeset, as: :tenant))
+     |> assign(:error, "Please correct the highlighted fields")}
+  end
+
+  # Defensive catch-all. `Tenants.signup/1`'s own generic branch
+  # (`{:error, _step, reason, _changes} -> {:error, reason}`) can surface any
+  # non-changeset, non-mapped error term from an unexpected Multi step failure
+  # (e.g. :set_public_key / :activate / :audit_genesis returning a bare term).
+  # Without this clause such a term would raise CaseClauseError and crash the
+  # LiveView — reintroducing the exact silent "button does nothing" failure #496
+  # set out to eliminate. Surface a generic internal-failure banner instead.
+  defp handle_signup_error(reason, _params, socket) do
+    Logger.error("SignupLive: signup failed with unexpected reason: #{inspect(reason)}")
+
+    {:noreply,
+     assign(
+       socket,
+       :error,
+       "Signup failed internally and no tenant was created — please try again."
+     )}
   end
 
   # #496: turn an audit-key storage failure into an actionable operator message. The most
@@ -560,6 +602,15 @@ defmodule LoopctlWeb.SignupLive do
     "Could not store this tenant's audit signing key: the secret store is not configured. " <>
       "On a self-hosted (non-Fly) install, set SECRETS_ADAPTER=local_file (and optionally " <>
       "SECRETS_FILE to the secrets file path) and restart. No tenant was created; retry after configuring it."
+  end
+
+  # Local-file adapter write failure (disk full, read-only volume, bad permissions).
+  # The secret store IS configured here — pointing the operator at "configuration" would
+  # misdirect triage — so name the actual cause: the SECRETS_FILE volume.
+  defp audit_key_storage_error_message({:secrets_file_write_failed, _reason}) do
+    "Could not write this tenant's audit signing key to the local secret store, so signup was " <>
+      "rolled back and no tenant was created. Check that the SECRETS_FILE volume has free disk " <>
+      "space and is writable by the app user, then try again."
   end
 
   defp audit_key_storage_error_message(_reason) do
@@ -679,6 +730,23 @@ defmodule LoopctlWeb.SignupLive do
               is shown <strong class="text-rose-300">once</strong> and is never stored in a form you
               can recover — copy it now and keep it somewhere safe.
             </p>
+          </div>
+
+          <div
+            id="root-key-loss-warning"
+            role="alert"
+            class="rounded-md border border-rose-500/60 bg-rose-950/40 p-4"
+          >
+            <div class="flex items-start gap-3">
+              <.icon name="hero-exclamation-triangle" class="mt-0.5 h-5 w-5 shrink-0 text-rose-300" />
+              <p class="text-sm text-rose-100">
+                <strong>Do not refresh or close this tab until you have copied the key.</strong>
+                This is the tenant's only credential and it is not stored anywhere. If this page
+                reloads or the connection drops before you save it, the key is
+                <strong class="text-rose-200">gone permanently</strong>
+                and the tenant can only be recovered by a superadmin. Save it first, then click continue.
+              </p>
+            </div>
           </div>
 
           <div class="rounded-md border border-rose-500/40 bg-rose-950/20 p-6">

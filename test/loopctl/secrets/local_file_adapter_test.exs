@@ -56,4 +56,33 @@ defmodule Loopctl.Secrets.LocalFileAdapterTest do
     File.write!(path, "this is not json{")
     assert {:error, :corrupt_secrets_file} = LocalFileAdapter.get("K")
   end
+
+  test "a non-string JSON value is reported as corrupt, not a FunctionClauseError crash", %{
+    path: path
+  } do
+    # A hand-corrupted secrets.json where a value is a number (not base64 string).
+    File.write!(path, Jason.encode!(%{"AUDIT_KEY" => 123}))
+    assert {:error, :corrupt_secret} = LocalFileAdapter.get("AUDIT_KEY")
+  end
+
+  test "concurrent set/2 with distinct names never loses a key (write-lock serialization)" do
+    # This is the load-bearing property of the `:global.trans/2` write lock: without
+    # it, two concurrent read-modify-write cycles last-rename-wins-drop each other's
+    # key — permanently breaking the losing tenant's audit-chain signing. Spawn many
+    # concurrent writers of DISTINCT keys and assert every key survives.
+    names = for n <- 1..25, do: "CONCURRENT_KEY_#{n}"
+
+    names
+    |> Task.async_stream(
+      fn name -> :ok = LocalFileAdapter.set(name, "value-#{name}") end,
+      max_concurrency: 25,
+      timeout: 30_000
+    )
+    |> Stream.run()
+
+    for name <- names do
+      assert {:ok, value} = LocalFileAdapter.get(name)
+      assert value == "value-#{name}"
+    end
+  end
 end

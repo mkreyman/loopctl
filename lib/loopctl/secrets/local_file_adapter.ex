@@ -24,6 +24,11 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
   filesystems, revert to the pre-rename state. Keep the file on a journaled filesystem
   and backed up (see the threat model below).
 
+  A hard crash BETWEEN creating the temp file and the rename leaks a `<path>.tmp.<n>`
+  sibling (the same-invocation error path never runs on a SIGKILL/power loss). To bound
+  that accumulation, each write first sweeps any orphaned `.tmp.` siblings — safe
+  because it runs under the write lock, so no concurrent write owns a temp file.
+
   ## Threat model — read before using in production
 
   This is for a TRUSTED, SINGLE-MACHINE deployment (one operator, one host). Secret
@@ -103,7 +108,12 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
     end
   end
 
-  defp decode(b64, name) do
+  # A hand-corrupted secrets.json may hold a non-string value (number/array/object)
+  # under a secret name — `decode_json/2` only validates the TOP level is a map. Guard
+  # on `is_binary/1` so such a value returns `{:error, :corrupt_secret}` (like invalid
+  # base64) instead of crashing `Base.decode64/1` with a FunctionClauseError on the
+  # audit-key read path.
+  defp decode(b64, name) when is_binary(b64) do
     case Base.decode64(b64) do
       {:ok, value} ->
         {:ok, value}
@@ -112,6 +122,11 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
         Logger.error("Secrets.LocalFileAdapter: secret #{inspect(name)} is not valid base64")
         {:error, :corrupt_secret}
     end
+  end
+
+  defp decode(_b64, name) do
+    Logger.error("Secrets.LocalFileAdapter: secret #{inspect(name)} is not a string value")
+    {:error, :corrupt_secret}
   end
 
   # A MISSING file is an empty store, not an error — first write creates it.
@@ -141,6 +156,13 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
     path = path()
     tmp = path <> ".tmp.#{System.unique_integer([:positive])}"
 
+    # Bound the temp-file leak: a hard crash (power loss / SIGKILL) between
+    # `File.touch/1` and `File.rename/2` leaves a `.tmp.N` sibling that the
+    # same-invocation error path never reaches. This runs under `with_write_lock/1`,
+    # so no other write is in flight and every existing sibling temp is a genuine
+    # orphan — best-effort remove them before creating our own.
+    sweep_stale_temps(path)
+
     with :ok <- ensure_dir(path),
          :ok <- write_private_tmp(tmp, Jason.encode!(map)),
          :ok <- File.rename(tmp, path) do
@@ -150,6 +172,25 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
         _ = File.rm(tmp)
         Logger.error("Secrets.LocalFileAdapter: write to #{path} failed: #{inspect(reason)}")
         {:error, {:secrets_file_write_failed, reason}}
+    end
+  end
+
+  # Best-effort cleanup of orphaned `<path>.tmp.<n>` siblings left by a hard crash
+  # mid-write. Safe under the write lock (no concurrent write owns a temp file). Any
+  # failure to list/remove is ignored — this only bounds an accumulation, it is never
+  # on the correctness path.
+  defp sweep_stale_temps(path) do
+    dir = Path.dirname(path)
+    prefix = Path.basename(path) <> ".tmp."
+
+    case File.ls(dir) do
+      {:ok, entries} ->
+        entries
+        |> Enum.filter(&String.starts_with?(&1, prefix))
+        |> Enum.each(fn name -> _ = File.rm(Path.join(dir, name)) end)
+
+      {:error, _reason} ->
+        :ok
     end
   end
 
