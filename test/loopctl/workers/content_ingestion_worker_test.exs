@@ -15,6 +15,7 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.Ingestion.ContentEnvelope
   alias Loopctl.Knowledge
   alias Loopctl.Test.AllowlistSource
   alias Loopctl.Workers.ContentIngestionWorker
@@ -200,6 +201,84 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       calls = drain_batch_calls([])
       assert length(calls) == 3
       assert Enum.sort(calls, :desc) == [2, 2, 1]
+    end
+  end
+
+  # --- #493: encrypted-at-rest inline content (content_encrypted) ---
+
+  describe "perform/1 with encrypted inline content (#493)" do
+    alias Loopctl.Ingestion.ContentEnvelope
+
+    test "decrypts content_encrypted and extracts from the plaintext" do
+      %{tenant: tenant} = setup_tenant()
+      plaintext = "Некоторый секретный документ about Elixir patterns"
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, content, opts ->
+        # The extractor must see the DECRYPTED plaintext, never the envelope.
+        assert content == plaintext
+        assert opts[:source_type] == "newsletter"
+
+        {:ok,
+         [%{title: "From encrypted", body: "Decrypted fine.", category: :pattern, tags: ["x"]}]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 4930,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content_encrypted" => ContentEnvelope.wrap(plaintext),
+                   "content_hash" => "enc123",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      %{data: [article]} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      assert article.title == "From encrypted"
+    end
+
+    test "discards cleanly (no crash, no retry) on a corrupt/tampered envelope" do
+      %{tenant: tenant} = setup_tenant()
+
+      # A well-formed job whose envelope is not decryptable is a poison pill: no
+      # retry can heal it, so it must {:discard} — never reach the extractor.
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _t, _c, _o ->
+        flunk("extractor must not run on a corrupt content envelope")
+      end)
+
+      assert {:discard, {:corrupt_content_envelope, _msg}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 4931,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content_encrypted" => "not-a-valid-base64-envelope!!!",
+                   "content_hash" => "corrupt123",
+                   "source_type" => "newsletter"
+                 }
+               })
+    end
+
+    test "legacy plaintext content arg (pre-#493 in-flight job) still ingests" do
+      %{tenant: tenant} = setup_tenant()
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _t, content, _o ->
+        assert content == "legacy plaintext still accepted"
+        {:ok, [%{title: "Legacy", body: "ok", category: :pattern, tags: []}]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 4932,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "legacy plaintext still accepted",
+                   "content_hash" => "legacy123",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      %{data: [article]} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      assert article.title == "Legacy"
     end
   end
 
@@ -1487,6 +1566,38 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
     test "a URL job (unknown size pre-fetch) is granted the full capped budget" do
       job = %Oban.Job{args: %{"url" => "https://example.com/x", "source_type" => "x"}}
+      assert ContentIngestionWorker.timeout(job) == :timer.minutes(6)
+    end
+
+    # #493: new inline jobs carry content_encrypted, NOT plaintext content. The
+    # timeout must scale off the DECRYPTED chunk count, identically to the legacy
+    # plaintext path — otherwise every encrypted multi-chunk document silently
+    # regresses to the flat 60s (one-chunk) budget #264 was written to prevent.
+    test "an encrypted multi-chunk job scales exactly like its plaintext twin" do
+      plaintext = multi_chunk_content(4)
+
+      plain = %Oban.Job{args: %{"content" => plaintext, "source_type" => "x"}}
+
+      encrypted = %Oban.Job{
+        args: %{
+          "content_encrypted" => ContentEnvelope.wrap(plaintext),
+          "source_type" => "x"
+        }
+      }
+
+      # 4 chunks * 60s = 240s, under the 6-min cap — and NOT the 60s catch-all.
+      assert ContentIngestionWorker.timeout(encrypted) == 4 * :timer.seconds(60)
+      assert ContentIngestionWorker.timeout(encrypted) == ContentIngestionWorker.timeout(plain)
+      assert ContentIngestionWorker.timeout(encrypted) > :timer.seconds(60)
+    end
+
+    test "a corrupt encrypted envelope gets the full capped budget, never the 60s floor" do
+      job = %Oban.Job{
+        args: %{"content_encrypted" => "not-a-valid-base64-envelope!!!", "source_type" => "x"}
+      }
+
+      # A poison-pill envelope can't be chunked; perform/1 {:discard}s it, so grant
+      # the full capped budget rather than let a 60s timeout cut it off first.
       assert ContentIngestionWorker.timeout(job) == :timer.minutes(6)
     end
   end

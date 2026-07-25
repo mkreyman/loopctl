@@ -13,6 +13,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.HeavyRead
+  alias Loopctl.Ingestion.ContentEnvelope
+  alias Loopctl.Knowledge.ContentChunker
   alias Loopctl.Llm
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Oban.FairShare
@@ -360,6 +362,16 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # relied on); Ecto Sandbox + Mox resolve via the `$callers` chain that
   # Task.Supervisor.async_stream_nolink propagates.
   defp process_batch_items(tenant_id, items) do
+    # #493 fail-loud: ContentEnvelope's contract states a vault misconfiguration
+    # (missing CLOAK_KEY) is a boot-level fault the caller must never mask. Per-item
+    # encryption below runs inside async_stream_nolink, where a Vault.encrypt! raise
+    # is caught as {:exit, reason} and flattened into an opaque per-item
+    # "validation_failed" — hiding a real key-provisioning failure. The fault is
+    # global and deterministic, so probe the vault ONCE here (request process, before
+    # the async boundary) when any item carries inline content; a misconfig then
+    # propagates as a 500 exactly as it does on the single-item path.
+    if Enum.any?(items, &inline_content_item?/1), do: ContentEnvelope.ensure_ready!()
+
     Loopctl.TaskSupervisor
     |> Task.Supervisor.async_stream_nolink(
       items,
@@ -496,10 +508,19 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     # the uniqueness key excludes project_id, crash-loop as a poison pill.
     with :ok <- validate_ingest_project_id(project_id),
          :ok <- validate_content_source(url, content),
+         :ok <- validate_content_length(content),
          :ok <- validate_source_type(source_type),
          :ok <- validate_url_egress(url) do
-      content_hash = compute_content_hash(url || content)
+      content_hash = compute_content_hash(tenant_id, url || content)
 
+      # #493: inline document content is encrypted at rest (Cloak AES-256-GCM) BEFORE it
+      # is written to `oban_jobs.args` — never plaintext in the jobs table. The URL path
+      # carries no inline content (nil), so `maybe_put` drops the key exactly as before;
+      # `content_hash` (a per-tenant HMAC blind index over url||content) still keys
+      # uniqueness. `content_chunk_count` is the CLEARTEXT chunk count computed here from
+      # the plaintext (a coarse size hint that leaks no content) so the worker's
+      # `timeout/1` can size its budget WITHOUT decrypting+chunking the envelope on every
+      # attempt (#493 review, finding 6).
       job_args =
         %{
           "tenant_id" => tenant_id,
@@ -507,7 +528,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
           "source_type" => source_type
         }
         |> maybe_put("url", url)
-        |> maybe_put("content", content)
+        |> maybe_put("content_encrypted", encrypt_inline_content(content))
+        |> maybe_put("content_chunk_count", inline_chunk_count(content))
         |> maybe_put("project_id", project_id)
         |> maybe_put("metadata", metadata)
         |> maybe_put("publish", if(publish, do: true))
@@ -587,8 +609,17 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     {:error, :unprocessable_entity, "Exactly one of 'url' or 'content' is required"}
   end
 
-  defp validate_content_source(_url, nil), do: :ok
-  defp validate_content_source(nil, _content), do: :ok
+  defp validate_content_source(url, nil) when is_binary(url), do: :ok
+  defp validate_content_source(nil, content) when is_binary(content), do: :ok
+
+  # A non-string `url`/`content` (e.g. a JSON object/array/number in the body) would
+  # slip past the nil-checks above but then raise FunctionClauseError in
+  # compute_content_hash/2 or encrypt_inline_content/1 (both is_binary-guarded),
+  # turning adversarial/malformed input into a 500. Reject it as a clean 422 at the
+  # write-path boundary instead (#493 review, finding 4).
+  defp validate_content_source(_url, _content) do
+    {:error, :unprocessable_entity, "'url' and 'content' must be strings"}
+  end
 
   # Ingestion is a WRITE path: a non-UUID project_id becomes a poison-pill job, so
   # be strict — nil/"" is absent (:ok), a valid UUID is :ok, and anything else
@@ -642,9 +673,79 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     end
   end
 
-  defp compute_content_hash(input) when is_binary(input) do
-    :crypto.hash(:sha256, input) |> Base.encode16(case: :lower)
+  # #493 review: `content_hash` is a KEYED BLIND INDEX (HMAC-SHA256 under the app
+  # secret, per tenant), NOT a bare SHA256 of the plaintext. A bare digest of the
+  # document sitting in cleartext next to the ciphertext is an offline confirmation
+  # oracle: a DB-read attacker could compute sha256(known_document) and match-to-
+  # confirm whether that exact content was ingested — partially defeating #493's
+  # "encrypted at rest" guarantee. Keying it under a server secret keeps the value
+  # DETERMINISTIC (so Oban's [content_hash, tenant_id] dedup and the worker's derived
+  # source_id still work) while making it uncomputable without the secret, and the
+  # per-tenant key also stops correlation of identical documents across tenants.
+  # Mirrors the `Loopctl.KeysetCursor` per-tenant HMAC-from-secret_key_base pattern.
+  defp compute_content_hash(tenant_id, input) when is_binary(input) do
+    :hmac
+    |> :crypto.mac(:sha256, content_hash_secret(tenant_id), input)
+    |> Base.encode16(case: :lower)
   end
+
+  # Per-tenant HMAC key for the content_hash blind index: app secret_key_base +
+  # a namespace infix + tenant_id. Stable across nodes without storing a per-tenant
+  # secret. FAIL CLOSED: secret_key_base is fetched (not defaulted) — signing with a
+  # guessable constant would defeat the blind index; runtime.exs requires
+  # SECRET_KEY_BASE in prod and the test/dev configs set it, so this raise is a guard,
+  # not a path.
+  defp content_hash_secret(tenant_id) do
+    base =
+      :loopctl
+      |> Application.fetch_env!(LoopctlWeb.Endpoint)
+      |> Keyword.fetch!(:secret_key_base)
+
+    base <> ":knowledge_ingest_content_hash:" <> to_string(tenant_id)
+  end
+
+  # #493: nil (URL path) stays nil so `maybe_put` omits the key; inline content is
+  # encrypted at rest before it ever reaches `oban_jobs.args`.
+  defp encrypt_inline_content(nil), do: nil
+  defp encrypt_inline_content(content) when is_binary(content), do: ContentEnvelope.wrap(content)
+
+  # Cap inline `content` at the controller boundary (#493 review, findings 5/7).
+  # Inline content is otherwise bounded only by the HTTP body limit; #493 now ENCRYPTS
+  # + Base64-wraps it (~+33%) into oban_jobs.args JSONB, and the worker decrypts +
+  # chunks the full body on EVERY attempt — so an oversized body amplifies both storage
+  # and per-attempt CPU/memory. Reject an over-cap body as a clean 422 here (before any
+  # crypto or enqueue) rather than after. Sized well above a large document (an ~87KB
+  # newsletter) but bounded. URL-only ingests (content nil) skip this.
+  @max_inline_content_bytes 1_000_000
+  defp validate_content_length(content) when is_binary(content) do
+    if byte_size(content) > @max_inline_content_bytes do
+      {:error, :unprocessable_entity,
+       "'content' exceeds the #{@max_inline_content_bytes}-byte inline limit; " <>
+         "fetch larger documents via 'url' instead"}
+    else
+      :ok
+    end
+  end
+
+  defp validate_content_length(_), do: :ok
+
+  # #493 review (finding 6): compute the chunk count from the PLAINTEXT once, here at
+  # enqueue, and persist it as a cleartext job arg so `ContentIngestionWorker.timeout/1`
+  # can scale its wall-clock budget WITHOUT decrypting + chunking the envelope on every
+  # attempt. The count is a coarse size hint that leaks no content. nil (URL path) omits
+  # the arg via `maybe_put`.
+  defp inline_chunk_count(nil), do: nil
+
+  defp inline_chunk_count(content) when is_binary(content),
+    do: content |> ContentChunker.chunk() |> length()
+
+  # Does this batch item carry inline document content (vs a URL-only item)?
+  # Used to gate the pre-async vault readiness probe so a URL-only batch does no
+  # needless crypto work.
+  defp inline_content_item?(%{"content" => content}) when is_binary(content) and content != "",
+    do: true
+
+  defp inline_content_item?(_), do: false
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
