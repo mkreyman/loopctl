@@ -58,6 +58,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   import Loopctl.Llm.ShapeError, only: [is_shape_error: 1]
   alias Loopctl.Egress.Scope, as: EgressScope
+  alias Loopctl.Ingestion.ContentEnvelope
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ContentChunker
@@ -189,7 +190,6 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   defp ingest(tenant_id, source_type, content_hash, args) do
     url = args["url"]
-    raw_content = args["content"]
     # Normalize "" -> nil (a blank project_id is "tenant-wide", not a value to dump
     # against the :binary_id column).
     project_id = normalize_project_id(args["project_id"])
@@ -209,6 +209,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     # the controller boundary 422s before enqueue, this is defense in depth.
     with :ok <- validate_project_id(project_id),
          :ok <- require_tenant_llm_key(tenant_id),
+         {:ok, raw_content} <- inline_content(args),
          {:ok, content} <- resolve_content(egress_scope(tenant_id, project_id), url, raw_content) do
       ctx = %{
         tenant_id: tenant_id,
@@ -654,6 +655,26 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # otherwise. `Loopctl.Egress.Policy` resolves the effective marking as
   # MOST-RESTRICTIVE (project OR tenant).
   defp egress_scope(tenant_id, project_id), do: EgressScope.new(tenant_id, project_id)
+
+  # #493: inline document content is stored in job args ENCRYPTED at rest
+  # (`content_encrypted`: Cloak AES-256-GCM + Base64) — never plaintext in `oban_jobs`.
+  # Decrypt it here. A pre-#493 job still in flight at deploy carries legacy plaintext
+  # `content`; accept it too so the queue drains without loss. The URL path has neither,
+  # so inline content is nil and `resolve_content` fetches. A tampered/corrupt envelope
+  # is a poison pill no retry can heal — {:discard} it cleanly, mirroring the project_id
+  # and no-key guards, rather than crash-looping to max_attempts.
+  defp inline_content(%{"content_encrypted" => envelope}) when is_binary(envelope) do
+    case ContentEnvelope.unwrap(envelope) do
+      {:ok, content} ->
+        {:ok, content}
+
+      {:error, reason} ->
+        {:discard, {reason, "ingestion content envelope could not be decrypted"}}
+    end
+  end
+
+  defp inline_content(%{"content" => content}) when is_binary(content), do: {:ok, content}
+  defp inline_content(_args), do: {:ok, nil}
 
   defp resolve_content(_scope, nil, content) when is_binary(content) and content != "" do
     # Direct-content path: no Content-Type to consult, so the UTF-8 validity

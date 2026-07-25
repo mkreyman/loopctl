@@ -2,9 +2,11 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Ingestion.ContentEnvelope
   alias Loopctl.Knowledge
   alias Loopctl.Oban.FairShare
   alias Loopctl.ObanConfig
+  alias Loopctl.Repo
 
   setup :verify_on_exit!
 
@@ -38,6 +40,22 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
+  end
+
+  # The single persisted ContentIngestionWorker row for a tenant. Oban.insert writes
+  # through `Loopctl.Repo` in the test process, so read it back via the SAME repo (a
+  # cross-repo AdminRepo read would miss the sandbox-scoped row); oban_jobs has no RLS.
+  # Asserts exactly one, so a stray/duplicate enqueue fails loudly.
+  defp ingestion_job_for(tenant_id) do
+    [job] =
+      Oban.Job
+      |> Repo.all()
+      |> Enum.filter(
+        &(&1.worker == "Loopctl.Workers.ContentIngestionWorker" and
+            &1.args["tenant_id"] == tenant_id)
+      )
+
+    job
   end
 
   # Mandatory BYO (Epic 28, #179): ingest requires the tenant to have configured an
@@ -165,6 +183,54 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       body = json_response(conn, 202)
       assert body["data"]["status"] == "queued"
       assert body["data"]["source_type"] == "newsletter"
+    end
+
+    test "#493: inline content is encrypted at rest in oban_jobs args (never plaintext)",
+         %{conn: conn} do
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      plaintext = "confidential document body that must never sit plaintext in oban_jobs"
+
+      # :manual so the job is PERSISTED (not run inline), letting us inspect the args
+      # actually written to oban_jobs. No extractor stub — the worker never runs here.
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{content: plaintext, source_type: "newsletter"})
+        |> json_response(202)
+      end)
+
+      job = ingestion_job_for(tenant.id)
+
+      # The plaintext appears NOWHERE in the persisted args JSON.
+      refute Map.has_key?(job.args, "content")
+      refute String.contains?(Jason.encode!(job.args), "confidential document body")
+
+      # The encrypted envelope is present and decrypts back to the original plaintext.
+      assert is_binary(job.args["content_encrypted"])
+      refute job.args["content_encrypted"] == plaintext
+      assert {:ok, ^plaintext} = ContentEnvelope.unwrap(job.args["content_encrypted"])
+    end
+
+    test "URL ingests carry no inline content key in args (#493)", %{conn: conn} do
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          url: "https://example.com/article",
+          source_type: "web_article"
+        })
+        |> json_response(202)
+      end)
+
+      job = ingestion_job_for(tenant.id)
+
+      refute Map.has_key?(job.args, "content")
+      refute Map.has_key?(job.args, "content_encrypted")
+      assert job.args["url"] == "https://example.com/article"
     end
 
     test "extracted articles default to draft", %{conn: conn} do

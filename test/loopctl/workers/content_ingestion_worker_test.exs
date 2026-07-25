@@ -203,6 +203,84 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     end
   end
 
+  # --- #493: encrypted-at-rest inline content (content_encrypted) ---
+
+  describe "perform/1 with encrypted inline content (#493)" do
+    alias Loopctl.Ingestion.ContentEnvelope
+
+    test "decrypts content_encrypted and extracts from the plaintext" do
+      %{tenant: tenant} = setup_tenant()
+      plaintext = "Некоторый секретный документ about Elixir patterns"
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, content, opts ->
+        # The extractor must see the DECRYPTED plaintext, never the envelope.
+        assert content == plaintext
+        assert opts[:source_type] == "newsletter"
+
+        {:ok,
+         [%{title: "From encrypted", body: "Decrypted fine.", category: :pattern, tags: ["x"]}]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 4930,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content_encrypted" => ContentEnvelope.wrap(plaintext),
+                   "content_hash" => "enc123",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      %{data: [article]} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      assert article.title == "From encrypted"
+    end
+
+    test "discards cleanly (no crash, no retry) on a corrupt/tampered envelope" do
+      %{tenant: tenant} = setup_tenant()
+
+      # A well-formed job whose envelope is not decryptable is a poison pill: no
+      # retry can heal it, so it must {:discard} — never reach the extractor.
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _t, _c, _o ->
+        flunk("extractor must not run on a corrupt content envelope")
+      end)
+
+      assert {:discard, {:corrupt_content_envelope, _msg}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 4931,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content_encrypted" => "not-a-valid-base64-envelope!!!",
+                   "content_hash" => "corrupt123",
+                   "source_type" => "newsletter"
+                 }
+               })
+    end
+
+    test "legacy plaintext content arg (pre-#493 in-flight job) still ingests" do
+      %{tenant: tenant} = setup_tenant()
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _t, content, _o ->
+        assert content == "legacy plaintext still accepted"
+        {:ok, [%{title: "Legacy", body: "ok", category: :pattern, tags: []}]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 4932,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "legacy plaintext still accepted",
+                   "content_hash" => "legacy123",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      %{data: [article]} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      assert article.title == "Legacy"
+    end
+  end
+
   # Collect all {:batch_call, n} messages currently in the mailbox (batch workers ran
   # inline before perform/1 returned, so they're all already delivered).
   defp drain_batch_calls(acc) do

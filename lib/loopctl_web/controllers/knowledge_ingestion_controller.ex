@@ -13,6 +13,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.HeavyRead
+  alias Loopctl.Ingestion.ContentEnvelope
   alias Loopctl.Llm
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Oban.FairShare
@@ -500,6 +501,10 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
          :ok <- validate_url_egress(url) do
       content_hash = compute_content_hash(url || content)
 
+      # #493: inline document content is encrypted at rest (Cloak AES-256-GCM) BEFORE it
+      # is written to `oban_jobs.args` — never plaintext in the jobs table. The URL path
+      # carries no inline content (nil), so `maybe_put` drops the key exactly as before;
+      # `content_hash` (over url||content) is unchanged and still keys uniqueness.
       job_args =
         %{
           "tenant_id" => tenant_id,
@@ -507,7 +512,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
           "source_type" => source_type
         }
         |> maybe_put("url", url)
-        |> maybe_put("content", content)
+        |> maybe_put("content_encrypted", encrypt_inline_content(content))
         |> maybe_put("project_id", project_id)
         |> maybe_put("metadata", metadata)
         |> maybe_put("publish", if(publish, do: true))
@@ -645,6 +650,11 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   defp compute_content_hash(input) when is_binary(input) do
     :crypto.hash(:sha256, input) |> Base.encode16(case: :lower)
   end
+
+  # #493: nil (URL path) stays nil so `maybe_put` omits the key; inline content is
+  # encrypted at rest before it ever reaches `oban_jobs.args`.
+  defp encrypt_inline_content(nil), do: nil
+  defp encrypt_inline_content(content) when is_binary(content), do: ContentEnvelope.wrap(content)
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
