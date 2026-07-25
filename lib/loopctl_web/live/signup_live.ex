@@ -503,6 +503,19 @@ defmodule LoopctlWeb.SignupLive do
       {:error, {:audit_key_storage_failed, reason}} ->
         {:noreply, assign(socket, :error, audit_key_storage_error_message(reason))}
 
+      # Internal mint failure (a DB constraint on the root api_key), NOT operator
+      # input the form can fix. The signup transaction rolled back — no tenant exists —
+      # so surface a distinct "internal failure" banner rather than the misleading
+      # "correct the highlighted fields" form-validation message.
+      {:error, :root_key_mint_failed} ->
+        {:noreply,
+         assign(
+           socket,
+           :error,
+           "Signup failed internally while provisioning your root API key. " <>
+             "No tenant was created — please try again."
+         )}
+
       {:error, :slug_taken} ->
         {:noreply,
          assign(
@@ -546,7 +559,7 @@ defmodule LoopctlWeb.SignupLive do
   defp audit_key_storage_error_message(:fly_not_configured) do
     "Could not store this tenant's audit signing key: the secret store is not configured. " <>
       "On a self-hosted (non-Fly) install, set SECRETS_ADAPTER=local_file (and optionally " <>
-      "SECRETS_FILE) and restart — see docs/self-hosting.md. No tenant was created; retry after configuring it."
+      "SECRETS_FILE to the secrets file path) and restart. No tenant was created; retry after configuring it."
   end
 
   defp audit_key_storage_error_message(_reason) do

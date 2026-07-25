@@ -154,6 +154,28 @@ defmodule LoopctlWeb.PageControllerTest do
     end
   end
 
+  # #516 regression guard: PageController pages render self-contained full HTML
+  # documents with `layout: false`. A pipeline-wide root layout would double-wrap
+  # them (two <!DOCTYPE>, two <html>, two <head>, assets loaded twice). The existing
+  # `=~` assertions all survive a double-wrapped document, so these count occurrences
+  # to fail if the root layout ever leaks back onto the shared :browser pipeline.
+  describe "single HTML document (no root-layout double-wrap)" do
+    for path <- ["/", "/docs", "/terms", "/privacy"] do
+      test "GET #{path} returns exactly one HTML document", %{conn: conn} do
+        body = conn |> get(unquote(path)) |> html_response(200)
+
+        assert count_occurrences(body, "<!DOCTYPE html>") == 1
+        assert count_occurrences(body, "<html") == 1
+        assert count_occurrences(body, "<head>") == 1
+        assert count_occurrences(body, "<body") == 1
+      end
+    end
+  end
+
+  defp count_occurrences(string, substring) do
+    string |> String.split(substring) |> length() |> Kernel.-(1)
+  end
+
   # TC-18.1.5: GET /nonexistent-page returns 404 HTML
   describe "error pages" do
     test "GET /nonexistent-page returns 404 HTML", %{conn: conn} do

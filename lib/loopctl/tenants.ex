@@ -78,6 +78,8 @@ defmodule Loopctl.Tenants do
   - `{:error, :slug_taken}` | `{:error, :email_taken}`
   - `{:error, {:audit_key_storage_failed, term()}}` — the secret store rejected the audit
     key (e.g. off Fly with no `SECRETS_ADAPTER`); the whole signup rolled back (#496)
+  - `{:error, :root_key_mint_failed}` — the root `:user` API key could not be minted
+    (an internal DB failure, not fixable input); the whole signup rolled back
   - `{:error, %Ecto.Changeset{}}` — validation failure
   """
   @spec signup(map()) ::
@@ -92,6 +94,7 @@ defmodule Loopctl.Tenants do
           | {:error, :slug_taken}
           | {:error, :email_taken}
           | {:error, {:audit_key_storage_failed, term()}}
+          | {:error, :root_key_mint_failed}
           | {:error, Ecto.Changeset.t()}
   def signup(attrs) when is_map(attrs) do
     authenticators = Map.get(attrs, :authenticators) || Map.get(attrs, "authenticators") || []
@@ -125,6 +128,25 @@ defmodule Loopctl.Tenants do
       Multi.new()
       |> Multi.insert(:tenant, Tenant.signup_changeset(tenant_attrs))
       |> insert_authenticators(authenticators)
+      # #500: mint the tenant's root `:user` API key in the SAME transaction, mirroring
+      # `self_signup/2`. Without it a browser-onboarded tenant has an anchored tenant but
+      # an empty `api_keys` — no authenticated path forward (the onboarding page tells you
+      # to call `set_llm_config`, but you have no key to authenticate that call). The raw
+      # key is returned ONCE (never persisted in plaintext) for the LiveView to surface;
+      # agent/orchestrator keys are minted later, after registering an agent identity.
+      #
+      # Ordered BEFORE append_keypair_and_genesis (which does the external
+      # `:store_secret` write) so this pure DB insert's validation runs while a failure
+      # can still roll back without touching the secret store — the module's documented
+      # "all DB validation precedes the irreversible external write" invariant.
+      |> Multi.run(:root_api_key, fn _repo, %{tenant: tenant} ->
+        Auth.generate_api_key(%{
+          tenant_id: tenant.id,
+          name: "root",
+          role: :user,
+          agent_id: nil
+        })
+      end)
       |> append_keypair_and_genesis(
         secret_name,
         priv,
@@ -133,20 +155,6 @@ defmodule Loopctl.Tenants do
         "human:webauthn",
         &signup_new_state/2
       )
-      # #500: mint the tenant's root `:user` API key in the SAME transaction, mirroring
-      # `self_signup/2`. Without it a browser-onboarded tenant has an anchored tenant but
-      # an empty `api_keys` — no authenticated path forward (the onboarding page tells you
-      # to call `set_llm_config`, but you have no key to authenticate that call). The raw
-      # key is returned ONCE (never persisted in plaintext) for the LiveView to surface;
-      # agent/orchestrator keys are minted later, after registering an agent identity.
-      |> Multi.run(:root_api_key, fn _repo, %{activate: tenant} ->
-        Auth.generate_api_key(%{
-          tenant_id: tenant.id,
-          name: "root",
-          role: :user,
-          agent_id: nil
-        })
-      end)
 
     result =
       with_secret_compensation({:delete, secret_name}, :store_secret, fn ->
@@ -163,6 +171,14 @@ defmodule Loopctl.Tenants do
 
       {:error, {:authenticator, _index}, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
+
+      # A root-key mint failure is an INTERNAL failure (a DB constraint on the
+      # api_keys insert), not operator input the form can fix. Tag it distinctly so
+      # the LiveView surfaces a "signup failed internally, no tenant created" banner
+      # instead of rendering the ApiKey changeset as bogus tenant-field validation
+      # errors ("Please correct the highlighted fields" pointing at nothing).
+      {:error, :root_api_key, _reason, _changes} ->
+        {:error, :root_key_mint_failed}
 
       {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
@@ -229,6 +245,17 @@ defmodule Loopctl.Tenants do
     multi =
       Multi.new()
       |> Multi.insert(:tenant, Tenant.self_signup_changeset(attrs))
+      # Ordered BEFORE append_keypair_and_genesis so this pure DB insert's validation
+      # runs while a failure can still roll back without touching the external secret
+      # store (matches do_signup/2 and the module's documented ordering invariant).
+      |> Multi.run(:root_api_key, fn _repo, %{tenant: tenant} ->
+        Auth.generate_api_key(%{
+          tenant_id: tenant.id,
+          name: "root",
+          role: :user,
+          agent_id: nil
+        })
+      end)
       |> append_keypair_and_genesis(
         secret_name,
         priv,
@@ -237,14 +264,6 @@ defmodule Loopctl.Tenants do
         "agent:self-signup",
         &self_signup_new_state/2
       )
-      |> Multi.run(:root_api_key, fn _repo, %{activate: tenant} ->
-        Auth.generate_api_key(%{
-          tenant_id: tenant.id,
-          name: "root",
-          role: :user,
-          agent_id: nil
-        })
-      end)
 
     result =
       with_secret_compensation({:delete, secret_name}, :store_secret, fn ->

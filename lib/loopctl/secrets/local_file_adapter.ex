@@ -6,10 +6,23 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
   `runtime.exs`).
 
   Secrets (currently only the per-tenant audit signing private keys) are stored as a
-  single JSON object `{name => base64(value)}` on disk. Writes are ATOMIC — a sibling
-  temp file is written then `rename/2`d over the target (a same-directory rename is
-  atomic on POSIX) — and the file is created `0600` (owner read/write only), so a
-  crash mid-write never leaves a torn file and other local users cannot read it.
+  single JSON object `{name => base64(value)}` on disk.
+
+  ## Atomicity, permissions, and durability
+
+  Writes are ATOMIC — a sibling temp file is written then `rename/2`d over the target
+  (a same-directory rename is atomic on POSIX), so a crash mid-write never leaves a
+  torn file. The temp file is created and `chmod 0600` (owner read/write only) BEFORE
+  any secret bytes are written into it, and the containing directory is `chmod 0700`,
+  so at no point is a file holding secret material group/other-readable.
+
+  For DURABILITY the temp file is `fsync`'d before the rename, so a committed secret's
+  bytes reach stable storage before it becomes the live file. Note that fsync of the
+  parent DIRECTORY (which is what guarantees the rename itself survives a power loss)
+  is NOT reachable from the BEAM — `:file.open/2` on a directory returns `:eisdir` —
+  so on a hard crash immediately after a rename the directory entry may, on some
+  filesystems, revert to the pre-rename state. Keep the file on a journaled filesystem
+  and backed up (see the threat model below).
 
   ## Threat model — read before using in production
 
@@ -24,11 +37,15 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
 
   ## Concurrency
 
-  `set/2` and `delete/1` are read-modify-write. Two writes to DIFFERENT names racing
-  can lose one update (last atomic rename wins). Acceptable for the single-operator
-  model — the only writer today is tenant signup, which is rare and operator-driven —
-  and documented rather than papered over. A KMS adapter or a serializing GenServer
-  is the path if concurrent secret writes ever become common.
+  `set/2` and `delete/1` are read-modify-write over the whole file. A lost update here
+  is NOT cosmetic: the losing tenant is already COMMITTED with its public audit key,
+  so silently dropping its private key from disk permanently breaks that tenant's
+  audit-chain signing/verification (a custody invariant). Both mutating paths are
+  therefore serialized through a cluster-/node-wide lock (`:global.trans/2` keyed on
+  the file path) so two concurrent signups apply their writes one-after-another
+  instead of last-rename-wins. `get/1` is not locked — the atomic rename means a read
+  always sees a complete old-or-new file. A KMS/HSM adapter remains the path for
+  hardened deployments.
   """
 
   @behaviour Loopctl.Secrets.Behaviour
@@ -47,24 +64,37 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
   @impl true
   @spec set(String.t(), binary()) :: :ok | {:error, term()}
   def set(name, value) when is_binary(name) and is_binary(value) do
-    with {:ok, map} <- read_all() do
-      map
-      |> Map.put(name, Base.encode64(value))
-      |> write_all()
-    end
+    with_write_lock(fn ->
+      with {:ok, map} <- read_all() do
+        map
+        |> Map.put(name, Base.encode64(value))
+        |> write_all()
+      end
+    end)
   end
 
   @impl true
   @spec delete(String.t()) :: :ok | {:error, term()}
   def delete(name) when is_binary(name) do
-    with {:ok, map} <- read_all() do
-      map
-      |> Map.delete(name)
-      |> write_all()
-    end
+    with_write_lock(fn ->
+      with {:ok, map} <- read_all() do
+        map
+        |> Map.delete(name)
+        |> write_all()
+      end
+    end)
   end
 
   # --- internals ---
+
+  # Serialize the read-modify-write so two concurrent signups cannot both read the
+  # pre-write map and last-rename-wins-drop one tenant's audit key. `:global.trans/2`
+  # defaults to infinite retries, so it blocks until the lock is acquired and then
+  # returns the function's own result. The lock id is keyed on the target path so
+  # distinct files (should there ever be more than one) don't contend.
+  defp with_write_lock(fun) do
+    :global.trans({{__MODULE__, path()}, self()}, fun)
+  end
 
   defp fetch(map, name) do
     case Map.fetch(map, name) do
@@ -112,8 +142,7 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
     tmp = path <> ".tmp.#{System.unique_integer([:positive])}"
 
     with :ok <- ensure_dir(path),
-         :ok <- File.write(tmp, Jason.encode!(map)),
-         :ok <- File.chmod(tmp, 0o600),
+         :ok <- write_private_tmp(tmp, Jason.encode!(map)),
          :ok <- File.rename(tmp, path) do
       :ok
     else
@@ -124,12 +153,33 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
     end
   end
 
+  # Create the temp file and lock it down to 0600 BEFORE writing any secret bytes, so
+  # the plaintext-adjacent base64 is never present in a group/other-readable file (the
+  # old order — File.write then chmod — left a readable window). Then fsync the bytes
+  # to stable storage before the caller renames it into place.
+  defp write_private_tmp(tmp, content) do
+    with :ok <- File.touch(tmp),
+         :ok <- File.chmod(tmp, 0o600),
+         {:ok, io} <- File.open(tmp, [:write, :binary, :raw]) do
+      try do
+        with :ok <- IO.binwrite(io, content) do
+          :file.sync(io)
+        end
+      after
+        File.close(io)
+      end
+    end
+  end
+
   defp ensure_dir(path) do
     dir = Path.dirname(path)
 
-    case File.mkdir_p(dir) do
-      :ok -> :ok
-      {:error, reason} -> {:error, reason}
+    with :ok <- File.mkdir_p(dir) do
+      # Owner-only on the secrets directory so a newly created temp file can never be
+      # listed/traversed by other local users even for the instant before its own
+      # 0600 is applied. Best-effort on a pre-existing operator-owned dir.
+      _ = File.chmod(dir, 0o700)
+      :ok
     end
   end
 
