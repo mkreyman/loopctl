@@ -53,6 +53,60 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `SECRETS_FILE`      | `/data/loopctl/secrets.json` | Path for the `local_file` adapter. Put it on a PERSISTENT volume |
 | `FTS_REGCONFIG`     | `english` | Postgres text-search config for keyword FTS (see below) |
 
+#### Connection pools and query budgets
+
+| Variable                          | Default | Description |
+|-----------------------------------|---------|-------------|
+| `REPLICA_DATABASE_URL`            | -       | Read DSN for the `HeavyReadRepo` pool (US-38.1). **Defaults off** — unset, heavy reads run against the primary. Pointing this at a replica is a deliberate, gated infra operation: verify replication lag before enabling, since heavy/vector reads then serve possibly-stale rows |
+| `HEAVY_READ_POOL_SIZE`            | `8`     | `HeavyReadRepo` pool size. This pool exists so a heavy analytical/vector read cannot starve the 3-connection AdminRepo pool |
+| `HEAVY_READ_STATEMENT_TIMEOUT_MS` | `10000` | Per-statement timeout on the heavy-read pool — the backstop that keeps one pathological vector scan from pinning a connection |
+| `SLOW_QUERY_THRESHOLD_MS`         | `1000`  | Queries slower than this are logged for diagnosis |
+
+#### Rate limiting and auth-path throttle
+
+| Variable                            | Default | Description |
+|-------------------------------------|---------|-------------|
+| `RATE_LIMITER`                      | node-local ETS | Set to `postgres` to select the shared Postgres-backed limiter so a MULTI-NODE deployment enforces one cluster-wide budget instead of `limit × node_count`. Provisions nothing (the counter table ships in a migration). Any other value keeps the node-local ETS behaviour |
+| `AUTH_THROTTLE_MAX_REQUESTS_PER_IP` | `3000`  | Per-IP request cap on the API-key auth path, per window. Raise it for a shared-egress/NAT deployment where many legitimate keys share one outbound IP |
+| `AUTH_THROTTLE_WINDOW_MS`           | `60000` | Window for the per-IP auth throttle |
+| `HAMMER_POOL_SIZE`                  | `20`    | Poolboy worker pool fronting every rate-limit check. Sized above Hammer's default of 4 so the fail-CLOSED auth throttle cannot saturate the pool under a single-IP flood |
+| `HAMMER_POOL_MAX_OVERFLOW`          | `10`    | Overflow workers for that pool |
+
+> All five accept only a **positive integer** (where numeric). An unset, blank, or
+> malformed value leaves the compiled default in place rather than crashing release
+> boot — a deliberate choice after the `STH_SWEEP_CRON` incident, so a bad
+> placeholder can never take the app down at startup.
+
+#### Metrics and scale alerting
+
+| Variable                    | Default | Description |
+|-----------------------------|---------|-------------|
+| `METRICS_PORT`              | `9568`  | INTERNAL Prometheus listener (never the public `8080` service); scraped over Fly's private 6PN network. **Must stay in lockstep with the `[metrics]` block in `fly.toml`** |
+| `METRICS_TENANT_LABEL_CAP`  | `1000`  | Max distinct tenant label values before the per-tenant metric dimension is collapsed — bounds Prometheus cardinality |
+| `SCALE_ALERT_WEBHOOK_URL`   | -       | **Alerting is opt-in until this is set.** With no URL, threshold breaches are only logged, never POSTed. Point it at a Slack / PagerDuty / generic webhook |
+| `SCALE_ALERT_CHECK_INTERVAL_MS`         | `60000`  | How often thresholds are evaluated |
+| `SCALE_ALERT_RENOTIFY_INTERVAL_MS`      | `900000` | Re-notify interval for a breach that stays open (15 min) |
+| `SCALE_ALERT_P95_LATENCY_MS`            | `2000`   | Request p95 latency breach threshold |
+| `SCALE_ALERT_QUEUE_TIME_P95_MS`         | `500`    | Oban queue-time p95 breach threshold |
+| `SCALE_ALERT_TIMEOUT_RATE_PER_MIN`      | `5`      | Request-timeout rate breach threshold |
+| `SCALE_ALERT_OBAN_DISCARD_RATE_PER_MIN` | `10`     | Oban job-discard rate breach threshold |
+| `SCALE_ALERT_PROVIDER_ERROR_RATE_PER_MIN` | `10`   | LLM/embedding provider error rate breach threshold |
+| `SCALE_ALERT_UNDER_FILL_RATE_PER_MIN`   | `30`     | Under-fill rate breach threshold |
+
+#### LLM / embedding provider
+
+| Variable                  | Default | Description |
+|---------------------------|---------|-------------|
+| `OPENAI_BASE_URL`         | `https://api.openai.com/v1` | Override to point embeddings at an OpenAI-compatible endpoint (e.g. a local Ollama / vLLM server) |
+| `OPENAI_EMBEDDING_MODEL`  | `text-embedding-3-small` | Embedding model name |
+| `LOCAL_ENDPOINT_ALLOWLIST` | -      | Comma-separated hosts/CIDRs that the egress guard may reach despite being private/loopback — e.g. `127.0.0.1,localhost,ollama.internal,10.1.0.0/16`. Required to use a LOCAL model endpoint, since the SSRF denylist otherwise refuses private addresses |
+
+#### Feature flags
+
+| Variable                               | Default | Description |
+|----------------------------------------|---------|-------------|
+| `RLS_REROUTE_LIST_STORIES_BY_PROJECT`  | `false` | Set to `true`/`1` to route `list_stories` through the project-scoped RLS path |
+
 #### Self-hosting off Fly: `SECRETS_ADAPTER=local_file`
 
 Tenant signup mints a per-tenant Ed25519 audit keypair and stores the private key

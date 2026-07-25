@@ -181,6 +181,7 @@ defmodule Loopctl.MixProject do
         "format --check-formatted",
         "credo --strict",
         "loopctl.check_skill_citations",
+        "loopctl.check_env_docs",
         "dialyzer",
         "test"
       ]

@@ -49,9 +49,14 @@ Operator-facing changes for deployments outside the hosted instance.
   (#494)** — the browser pipeline was missing `put_root_layout`. Fixed at the
   `live_session` level so the `layout: false` marketing pages do not double-wrap.
 
-> **Note on this file's coverage.** Entries below predate a sustained run of merges
-> that were not recorded here. `git log --first-parent` is the authoritative history;
-> this file is best-effort for operator-facing changes.
+> **Scope of this file.** loopctl's changelog records **operator-facing** changes
+> only: environment variables, deploy ordering, migrations with manual steps,
+> breaking or behaviour-changing API changes, and security-relevant changes to how
+> data is stored. Refactors, test fixes, internal hardening, and dependency bumps
+> are deliberately out of scope — `git log --first-parent` is the complete history.
+> The trigger is narrow on purpose: a changelog that tries to record every merge
+> is the kind that stops being written, which is what happened to the stretch of
+> entries between this line and the one below it. See `CONTRIBUTING.md`.
 
 ## [Earlier] — 2026-07-16 — Agent-memory substrate: project scope, merged recall, graduation (#411)
 
