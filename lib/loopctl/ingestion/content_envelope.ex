@@ -14,20 +14,44 @@ defmodule Loopctl.Ingestion.ContentEnvelope do
   Base64-wraps it for JSON transport; `unwrap/1` reverses it. This mirrors
   `Loopctl.Workers.OrphanedSecretCleanupWorker`'s restore-value handling and the
   app's other Cloak-encrypted secrets (tenant LLM keys, webhook signing secrets) —
-  content is never plaintext in `oban_jobs`, and when the job is pruned the
-  ciphertext goes with it.
+  the document `content` is never plaintext in `oban_jobs`, and when the job is
+  pruned the ciphertext goes with it.
 
   Encryption is UNCONDITIONAL (every ingested inline document, not only private-tier
   scopes): the cost is negligible against a ~6-minute LLM ingestion job, and a
   uniform path is simpler and strictly safer than branching on the scope's marking.
+
+  ## `content_hash` is a keyed blind index, not a plaintext fingerprint
+
   Uniqueness/fair-share key off `content_hash` and `tenant_id` (never the content),
-  so the non-deterministic AES-GCM ciphertext does not perturb them.
+  so the non-deterministic AES-GCM ciphertext does not perturb them. `content_hash`
+  itself is a per-tenant HMAC-SHA256 blind index (see
+  `LoopctlWeb.KnowledgeIngestionController.compute_content_hash/2`), NOT a bare
+  SHA256 of the plaintext: a bare digest beside the ciphertext would be an offline
+  confirmation oracle (a DB-read attacker could hash a known/guessable document and
+  match). The HMAC keeps dedup deterministic while making the value uncomputable
+  without the app secret, and its per-tenant key also prevents correlating identical
+  documents across tenants.
+
+  ## Decrypt failure: tamper OR key-config, fail closed + alert
 
   AES-GCM is AUTHENTICATED: a tampered, truncated, or non-Base64 envelope fails
   `unwrap/1` CLOSED with `{:error, :corrupt_content_envelope}` rather than yielding
-  garbage plaintext. The worker maps that to `{:discard, ...}` — a corrupt envelope
-  is a poison pill no retry can heal — consistent with the worker's other
-  discard-don't-crash-loop guards.
+  garbage plaintext, and the worker maps that to `{:discard, ...}` — consistent with
+  its other discard-don't-crash-loop guards. AES-GCM CANNOT distinguish tampering
+  from a wrong/rotated key, so this same failure also fires when `CLOAK_KEY` is
+  rotated and the outgoing cipher is dropped while ingestion jobs are still queued
+  (they live up to the 3600s unique window, longer under snooze). That case is
+  RECOVERABLE — re-adding the prior cipher to `Loopctl.Vault`'s `retired_ciphers`
+  (see `config/config.exs`) lets the queued jobs decrypt — so a decrypt failure is
+  NOT unconditionally "a poison pill no retry can heal".
+
+  OPERATIONAL RULE: when rotating `CLOAK_KEY`, keep the outgoing cipher in
+  `retired_ciphers` until the `:ingestion` queue has drained, or in-flight jobs will
+  silently discard. The worker logs a distinct `Logger.warning` on every decrypt
+  failure (with tenant_id + content_hash, never the envelope) so a tampering or
+  mis-sequenced-rotation incident is an alertable signal, not buried in
+  `oban_jobs.errors`.
   """
 
   alias Loopctl.Vault

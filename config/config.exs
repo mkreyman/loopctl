@@ -553,6 +553,14 @@ config :loopctl, Loopctl.Vault,
   retired_ciphers: [
     # Add previous keys here during key rotation, e.g.:
     # {Cloak.Ciphers.AES.GCM, tag: "AES.GCM.V0", key: Base.decode64!("OLD_KEY"), iv_length: 12}
+    #
+    # ROTATION RUNBOOK (#493): ingestion document content is encrypted into
+    # oban_jobs.args (Loopctl.Ingestion.ContentEnvelope). Queued :ingestion jobs live
+    # up to the 3600s unique window (longer under snooze). When rotating CLOAK_KEY,
+    # keep the OUTGOING cipher listed here until the :ingestion queue has drained —
+    # otherwise every in-flight ingestion job fails AES-GCM decrypt and is silently
+    # {:discard}ed. ContentIngestionWorker logs a Logger.warning on each such failure
+    # so a mis-sequenced rotation is alertable.
   ]
 
 # DI: Content extractor for knowledge ingestion.

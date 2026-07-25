@@ -212,6 +212,78 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert {:ok, ^plaintext} = ContentEnvelope.unwrap(job.args["content_encrypted"])
     end
 
+    test "#493 finding 4: a non-string content is a clean 422, not a 500", %{conn: conn} do
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          "content" => %{"x" => 1},
+          "source_type" => "newsletter"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "must be strings"
+    end
+
+    test "#493 findings 5/7: oversized inline content is rejected with 422", %{conn: conn} do
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      oversized = String.duplicate("a", 1_000_001)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          content: oversized,
+          source_type: "newsletter"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "inline limit"
+    end
+
+    test "#493 finding 6: encrypted inline job carries a cleartext content_chunk_count",
+         %{conn: conn} do
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          content: "Some raw content about patterns.",
+          source_type: "newsletter"
+        })
+        |> json_response(202)
+      end)
+
+      job = ingestion_job_for(tenant.id)
+      assert is_integer(job.args["content_chunk_count"])
+      assert job.args["content_chunk_count"] >= 1
+    end
+
+    test "#493 findings 1/8: content_hash is a keyed blind index, not sha256(plaintext)",
+         %{conn: conn} do
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      plaintext = "guessable memo content"
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{content: plaintext, source_type: "newsletter"})
+
+      content_hash = json_response(conn, 202)["data"]["content_hash"]
+      bare_sha256 = :crypto.hash(:sha256, plaintext) |> Base.encode16(case: :lower)
+
+      # An attacker with DB read access must NOT be able to confirm-by-match with a
+      # plain sha256 of the known plaintext.
+      refute content_hash == bare_sha256
+    end
+
     test "URL ingests carry no inline content key in args (#493)", %{conn: conn} do
       tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})

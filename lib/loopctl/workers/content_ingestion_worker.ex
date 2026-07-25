@@ -282,19 +282,27 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     |> min(max_job_timeout_ms())
   end
 
+  # #493 review (finding 6): new inline jobs carry a CLEARTEXT `content_chunk_count`
+  # computed from the plaintext at enqueue time. Prefer it so timeout/1 sizes the
+  # budget WITHOUT decrypting + chunking the envelope (the encrypted clause below did
+  # a full decrypt + full chunk on every attempt, redundant with perform/1's own
+  # decrypt + chunk). The count leaks no content. Placed FIRST so it wins over the
+  # `content_encrypted` fallback when both keys are present.
+  defp chunk_count_for_timeout(%{"content_chunk_count" => n}) when is_integer(n) and n > 0, do: n
+
   defp chunk_count_for_timeout(%{"content" => content})
        when is_binary(content) and content != "" do
     content |> ContentChunker.chunk() |> length()
   end
 
-  # #493: new inline jobs carry the document as an ENCRYPTED envelope, not
-  # plaintext `content`. Without this clause an encrypted multi-chunk document
-  # falls through to the `_ -> 1` catch-all and gets a flat one-chunk (60s)
-  # budget, re-introducing the exact multi-chunk Oban.TimeoutError kill #264
-  # fixed. Decrypt is cheap (once per attempt) and lets timeout/1 scale exactly
-  # as it does for legacy plaintext. A corrupt envelope is a poison pill perform/1
-  # {:discard}s anyway; grant it the full capped budget (max_chunks/0) so the
-  # timeout is never the thing that kills it first.
+  # #493: a pre-review or in-flight inline job may carry the ENCRYPTED envelope
+  # WITHOUT the cleartext `content_chunk_count` (jobs enqueued before finding 6's fix,
+  # still queued at deploy). Without this fallback such a job falls through to the
+  # `_ -> 1` catch-all and gets a flat one-chunk (60s) budget, re-introducing the exact
+  # multi-chunk Oban.TimeoutError kill #264 fixed. Decrypt is cheap (once per attempt)
+  # and lets timeout/1 scale as it does for legacy plaintext. A corrupt envelope is a
+  # poison pill perform/1 {:discard}s anyway; grant it the full capped budget
+  # (max_chunks/0) so the timeout is never the thing that kills it first.
   defp chunk_count_for_timeout(%{"content_encrypted" => envelope}) when is_binary(envelope) do
     case ContentEnvelope.unwrap(envelope) do
       {:ok, content} -> content |> ContentChunker.chunk() |> length()
@@ -675,15 +683,32 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # (`content_encrypted`: Cloak AES-256-GCM + Base64) — never plaintext in `oban_jobs`.
   # Decrypt it here. A pre-#493 job still in flight at deploy carries legacy plaintext
   # `content`; accept it too so the queue drains without loss. The URL path has neither,
-  # so inline content is nil and `resolve_content` fetches. A tampered/corrupt envelope
-  # is a poison pill no retry can heal — {:discard} it cleanly, mirroring the project_id
-  # and no-key guards, rather than crash-looping to max_attempts.
-  defp inline_content(%{"content_encrypted" => envelope}) when is_binary(envelope) do
+  # so inline content is nil and `resolve_content` fetches.
+  #
+  # A decrypt failure is {:discard}ed cleanly (no crash-loop to max_attempts), mirroring
+  # the project_id and no-key guards. AES-GCM is authenticated but CANNOT distinguish
+  # tampering from a WRONG/ROTATED key: this branch fires both for at-rest tampering of
+  # the args row AND for a CLOAK_KEY rotation that dropped the outgoing cipher before the
+  # ingestion queue drained (in which case re-adding it to `retired_ciphers` heals the
+  # job — so it is NOT unconditionally "a poison pill no retry can heal"). Because it is
+  # security-relevant either way, and the sibling {:discard} guards
+  # (unsupported_content_discard, require_tenant_llm_key) log before discarding, emit an
+  # explicit Logger.warning here: a distinct, alertable signal so a tampering or
+  # key-config incident is observable rather than buried in oban_jobs.errors (#493
+  # review, findings 2/3/9/10). Log tenant_id + content_hash, NEVER the envelope.
+  defp inline_content(%{"content_encrypted" => envelope} = args) when is_binary(envelope) do
     case ContentEnvelope.unwrap(envelope) do
       {:ok, content} ->
         {:ok, content}
 
       {:error, reason} ->
+        Logger.warning(
+          "ContentIngestionWorker: discarding job — content envelope decrypt failed " <>
+            "(#{reason}); indicates at-rest tampering OR a CLOAK_KEY rotation that " <>
+            "dropped the prior cipher before the ingestion queue drained. " <>
+            "tenant=#{args["tenant_id"]} content_hash=#{args["content_hash"]}"
+        )
+
         {:discard, {reason, "ingestion content envelope could not be decrypted"}}
     end
   end
