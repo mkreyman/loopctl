@@ -4,6 +4,14 @@ defmodule LoopctlWeb.Router do
   pipeline :browser do
     plug :accepts, ["html"]
     plug :fetch_session
+    # #494: a LiveView renders its DEAD (first HTTP) response through the ROOT layout,
+    # which is what carries <head> + the app.css/app.js links. `use LiveView, layout:`
+    # sets only the APP (inner) layout, so without an explicit root layout the /signup
+    # dead render came out bare — no <!DOCTYPE>, no assets, WebAuthn JS never loaded —
+    # bricking self-hosted onboarding. `fetch_live_flash` is required by the layout's
+    # <.flash_group>.
+    plug :fetch_live_flash
+    plug :put_root_layout, html: {LoopctlWeb.Layouts, :root}
     plug :protect_from_forgery
 
     plug :put_secure_browser_headers, %{

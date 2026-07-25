@@ -70,18 +70,28 @@ defmodule Loopctl.Tenants do
 
   ## Returns
 
-  - `{:ok, %{tenant: %Tenant{}, root_authenticators: [%RootAuthenticator{}]}}`
+  - `{:ok, %{tenant: %Tenant{}, root_authenticators: [%RootAuthenticator{}], raw_key: String.t()}}`
+    — `raw_key` is the tenant's root `:user` API key, returned ONCE and never persisted
+    in plaintext (#500).
   - `{:error, :no_authenticators}` — empty list
   - `{:error, :too_many_authenticators}` — more than 5
   - `{:error, :slug_taken}` | `{:error, :email_taken}`
+  - `{:error, {:audit_key_storage_failed, term()}}` — the secret store rejected the audit
+    key (e.g. off Fly with no `SECRETS_ADAPTER`); the whole signup rolled back (#496)
   - `{:error, %Ecto.Changeset{}}` — validation failure
   """
   @spec signup(map()) ::
-          {:ok, %{tenant: Tenant.t(), root_authenticators: [RootAuthenticator.t()]}}
+          {:ok,
+           %{
+             tenant: Tenant.t(),
+             root_authenticators: [RootAuthenticator.t()],
+             raw_key: String.t()
+           }}
           | {:error, :no_authenticators}
           | {:error, :too_many_authenticators}
           | {:error, :slug_taken}
           | {:error, :email_taken}
+          | {:error, {:audit_key_storage_failed, term()}}
           | {:error, Ecto.Changeset.t()}
   def signup(attrs) when is_map(attrs) do
     authenticators = Map.get(attrs, :authenticators) || Map.get(attrs, "authenticators") || []
@@ -123,6 +133,20 @@ defmodule Loopctl.Tenants do
         "human:webauthn",
         &signup_new_state/2
       )
+      # #500: mint the tenant's root `:user` API key in the SAME transaction, mirroring
+      # `self_signup/2`. Without it a browser-onboarded tenant has an anchored tenant but
+      # an empty `api_keys` — no authenticated path forward (the onboarding page tells you
+      # to call `set_llm_config`, but you have no key to authenticate that call). The raw
+      # key is returned ONCE (never persisted in plaintext) for the LiveView to surface;
+      # agent/orchestrator keys are minted later, after registering an agent identity.
+      |> Multi.run(:root_api_key, fn _repo, %{activate: tenant} ->
+        Auth.generate_api_key(%{
+          tenant_id: tenant.id,
+          name: "root",
+          role: :user,
+          agent_id: nil
+        })
+      end)
 
     result =
       with_secret_compensation({:delete, secret_name}, :store_secret, fn ->
@@ -130,8 +154,9 @@ defmodule Loopctl.Tenants do
       end)
 
     case result do
-      {:ok, %{activate: tenant, authenticators: authenticators}} ->
-        {:ok, %{tenant: tenant, root_authenticators: authenticators}}
+      {:ok,
+       %{activate: tenant, authenticators: authenticators, root_api_key: {raw_key, _api_key}}} ->
+        {:ok, %{tenant: tenant, root_authenticators: authenticators, raw_key: raw_key}}
 
       {:error, :tenant, %Ecto.Changeset{} = changeset, _changes} ->
         signup_changeset_error(changeset)

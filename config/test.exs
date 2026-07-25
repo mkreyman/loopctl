@@ -527,6 +527,17 @@ config :loopctl, :webauthn,
 # DI: Use mock secrets adapter in tests
 config :loopctl, :secrets_adapter, Loopctl.MockSecrets
 
+# #496: file path for the SELF-HOST `Loopctl.Secrets.LocalFileAdapter`. Unused by the
+# suite at large (`:secrets_adapter` is the mock above); only its own async:false unit
+# test exercises the adapter, and reads this path. Partition-suffixed so parallel CI
+# partitions never share the file.
+config :loopctl,
+       :secrets_file,
+       Path.join(
+         System.tmp_dir!(),
+         "loopctl_local_secrets_test#{System.get_env("MIX_TEST_PARTITION")}.json"
+       )
+
 # DI (US-27.3): suggested-links executor. The default stub in
 # DataCase.stub_all_defaults/0 delegates to the real Loopctl.Knowledge, so
 # existing tests exercise the genuine query; the DB-error-surfacing test

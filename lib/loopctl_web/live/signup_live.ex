@@ -124,6 +124,9 @@ defmodule LoopctlWeb.SignupLive do
      |> assign(:learn_more_url, @learn_more_url)
      |> assign(:friendly_name_draft, "")
      |> assign(:rate_key, signup_rate_key(session, socket))
+     # #500: nil until signup completes; then holds %{tenant, raw_key, onboarding_path}
+     # and the render switches from the form to the one-time "save your key" panel.
+     |> assign(:completed, nil)
      |> assign(:error, nil)}
   end
 
@@ -479,13 +482,26 @@ defmodule LoopctlWeb.SignupLive do
     attrs = Map.put(params, "authenticators", auths)
 
     case Tenants.signup(attrs) do
-      {:ok, %{tenant: tenant}} ->
+      {:ok, %{tenant: tenant, raw_key: raw_key}} ->
         token = Phoenix.Token.sign(LoopctlWeb.Endpoint, "onboarding", tenant.id)
 
+        # #500: DON'T navigate away yet — the root API key (`raw_key`) is shown ONCE and
+        # is never persisted in plaintext. Hold it in this connected LiveView's memory
+        # (never a URL, never the session) and render the "save your key" panel; the
+        # operator copies it, then follows the onboarding link. Navigating immediately
+        # would drop the only copy of the key on the floor.
         {:noreply,
-         socket
-         |> put_flash(:info, "Tenant signup complete — welcome to loopctl")
-         |> push_navigate(to: ~p"/tenants/#{tenant.id}/onboarding?token=#{token}")}
+         assign(socket, :completed, %{
+           tenant: tenant,
+           raw_key: raw_key,
+           onboarding_path: ~p"/tenants/#{tenant.id}/onboarding?token=#{token}"
+         })}
+
+      # #496: audit-key storage failed (e.g. off Fly with no SECRETS_ADAPTER). The signup
+      # transaction rolled back, so no tenant exists — surface an actionable banner instead
+      # of crashing the LiveView with a CaseClauseError (the old silent "button does nothing").
+      {:error, {:audit_key_storage_failed, reason}} ->
+        {:noreply, assign(socket, :error, audit_key_storage_error_message(reason))}
 
       {:error, :slug_taken} ->
         {:noreply,
@@ -522,6 +538,20 @@ defmodule LoopctlWeb.SignupLive do
          |> assign(:form, to_form(changeset, as: :tenant))
          |> assign(:error, "Please correct the highlighted fields")}
     end
+  end
+
+  # #496: turn an audit-key storage failure into an actionable operator message. The most
+  # common cause on a fresh self-hosted (non-Fly) install is the default FlyAdapter having
+  # no Fly API access; the fix is the file-backed adapter.
+  defp audit_key_storage_error_message(:fly_not_configured) do
+    "Could not store this tenant's audit signing key: the secret store is not configured. " <>
+      "On a self-hosted (non-Fly) install, set SECRETS_ADAPTER=local_file (and optionally " <>
+      "SECRETS_FILE) and restart — see docs/self-hosting.md. No tenant was created; retry after configuring it."
+  end
+
+  defp audit_key_storage_error_message(_reason) do
+    "Could not store this tenant's audit signing key, so signup was rolled back and no tenant " <>
+      "was created. Check the secret store configuration and try again."
   end
 
   defp new_challenge do
@@ -622,145 +652,193 @@ defmodule LoopctlWeb.SignupLive do
         </div>
       </header>
 
-      <.form
-        for={@form}
-        id="signup-form"
-        phx-change="validate"
-        phx-submit="signup"
-        class="space-y-8"
-      >
-        <div class="space-y-6 rounded-md border border-slate-800 bg-slate-900/60 p-6">
-          <h2 class="font-display text-sm uppercase tracking-wide text-slate-400">
-            Tenant metadata
-          </h2>
-
-          <.input
-            field={@form[:name]}
-            type="text"
-            label="Display name"
-            placeholder="Acme Robotics"
-            required
-            id="tenant-name-input"
-          />
-
-          <.input
-            field={@form[:slug]}
-            type="text"
-            label="Slug"
-            placeholder="acme-robotics"
-            required
-            id="tenant-slug-input"
-          />
-
-          <.input
-            field={@form[:email]}
-            type="email"
-            label="Contact email"
-            placeholder="admin@acme.example"
-            required
-            id="tenant-email-input"
-          />
-        </div>
-
-        <div class="space-y-4 rounded-md border border-slate-800 bg-slate-900/60 p-6">
-          <div class="flex items-start justify-between gap-4">
-            <div>
-              <h2 class="font-display text-sm uppercase tracking-wide text-slate-400">
-                Root authenticators
+      <%= if @completed do %>
+        <div id="signup-complete" class="space-y-6">
+          <div class="rounded-md border border-accent-500/40 bg-slate-900/60 p-6">
+            <div class="flex items-center gap-3">
+              <.icon name="hero-check-circle" class="h-6 w-6 text-accent-400" />
+              <h2 class="font-display text-lg font-semibold text-slate-100">
+                Tenant <span class="font-mono text-accent-300">{@completed.tenant.slug}</span> created
               </h2>
-              <p class="mt-1 text-xs text-slate-500">
-                Enroll at least one FIDO2 authenticator ({length(@authenticators)} of {@max_authenticators} used).
-                YubiKeys, Touch ID, Windows Hello, and other platform keys all work.
-              </p>
             </div>
-            <.icon name="hero-key" class="h-10 w-10 text-accent-400" />
+            <p class="mt-2 text-sm text-slate-400">
+              This is your root <span class="font-mono text-slate-300">user</span>-role API key. It
+              is shown <strong class="text-rose-300">once</strong> and is never stored in a form you
+              can recover — copy it now and keep it somewhere safe.
+            </p>
           </div>
 
-          <ul id="enrolled-authenticators" class="space-y-2">
-            <li
-              :for={{auth, index} <- Enum.with_index(@authenticators)}
-              id={"authenticator-#{index}"}
-              class="flex items-center justify-between rounded-md border border-accent-500/40 bg-slate-950 px-4 py-3 text-sm"
+          <div class="rounded-md border border-rose-500/40 bg-rose-950/20 p-6">
+            <label
+              for="root-api-key"
+              class="block font-mono text-[10px] uppercase tracking-wide text-slate-500"
             >
-              <div class="flex items-center gap-3">
-                <.icon name="hero-check-circle" class="h-5 w-5 text-accent-400" />
-                <span class="font-mono text-xs uppercase tracking-wide text-slate-300">
-                  {auth.friendly_name}
-                </span>
-                <span class="font-mono text-[10px] text-slate-600">
-                  {auth.attestation_result.attestation_format}
-                </span>
+              LOOPCTL_USER_KEY
+            </label>
+            <code
+              id="root-api-key"
+              class="mt-2 block w-full select-all break-all rounded-md border border-slate-800 bg-slate-950 px-3 py-3 font-mono text-sm text-accent-200"
+            >
+              {@completed.raw_key}
+            </code>
+            <p class="mt-3 text-xs text-slate-500">
+              Use it as your user-role key (e.g. <span class="font-mono">LOOPCTL_USER_KEY</span>
+              in <span class="font-mono">.mcp.json</span>). Provision your BYO LLM keys, then register
+              an agent to mint agent / orchestrator keys.
+            </p>
+          </div>
+
+          <div class="flex items-center justify-end">
+            <a
+              href={@completed.onboarding_path}
+              id="continue-to-onboarding"
+              class="inline-flex items-center justify-center gap-2 rounded-md border border-accent-500 bg-accent-600 px-6 py-2 font-mono text-sm uppercase tracking-wide text-slate-50 hover:bg-accent-500"
+            >
+              I saved my key — continue →
+            </a>
+          </div>
+        </div>
+      <% else %>
+        <.form
+          for={@form}
+          id="signup-form"
+          phx-change="validate"
+          phx-submit="signup"
+          class="space-y-8"
+        >
+          <div class="space-y-6 rounded-md border border-slate-800 bg-slate-900/60 p-6">
+            <h2 class="font-display text-sm uppercase tracking-wide text-slate-400">
+              Tenant metadata
+            </h2>
+
+            <.input
+              field={@form[:name]}
+              type="text"
+              label="Display name"
+              placeholder="Acme Robotics"
+              required
+              id="tenant-name-input"
+            />
+
+            <.input
+              field={@form[:slug]}
+              type="text"
+              label="Slug"
+              placeholder="acme-robotics"
+              required
+              id="tenant-slug-input"
+            />
+
+            <.input
+              field={@form[:email]}
+              type="email"
+              label="Contact email"
+              placeholder="admin@acme.example"
+              required
+              id="tenant-email-input"
+            />
+          </div>
+
+          <div class="space-y-4 rounded-md border border-slate-800 bg-slate-900/60 p-6">
+            <div class="flex items-start justify-between gap-4">
+              <div>
+                <h2 class="font-display text-sm uppercase tracking-wide text-slate-400">
+                  Root authenticators
+                </h2>
+                <p class="mt-1 text-xs text-slate-500">
+                  Enroll at least one FIDO2 authenticator ({length(@authenticators)} of {@max_authenticators} used).
+                  YubiKeys, Touch ID, Windows Hello, and other platform keys all work.
+                </p>
               </div>
-              <button
-                type="button"
-                phx-click="remove_authenticator"
-                phx-value-index={index}
-                class="rounded-md px-2 py-1 text-xs text-slate-500 hover:text-rose-300"
+              <.icon name="hero-key" class="h-10 w-10 text-accent-400" />
+            </div>
+
+            <ul id="enrolled-authenticators" class="space-y-2">
+              <li
+                :for={{auth, index} <- Enum.with_index(@authenticators)}
+                id={"authenticator-#{index}"}
+                class="flex items-center justify-between rounded-md border border-accent-500/40 bg-slate-950 px-4 py-3 text-sm"
               >
-                <.icon name="hero-x-mark" class="h-4 w-4" />
+                <div class="flex items-center gap-3">
+                  <.icon name="hero-check-circle" class="h-5 w-5 text-accent-400" />
+                  <span class="font-mono text-xs uppercase tracking-wide text-slate-300">
+                    {auth.friendly_name}
+                  </span>
+                  <span class="font-mono text-[10px] text-slate-600">
+                    {auth.attestation_result.attestation_format}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  phx-click="remove_authenticator"
+                  phx-value-index={index}
+                  class="rounded-md px-2 py-1 text-xs text-slate-500 hover:text-rose-300"
+                >
+                  <.icon name="hero-x-mark" class="h-4 w-4" />
+                </button>
+              </li>
+            </ul>
+
+            <div
+              id="webauthn-hook"
+              phx-hook="WebAuthn"
+              phx-update="ignore"
+              data-challenge={@challenge_payload}
+              data-rp-id={Keyword.get(WebAuthn.rp_opts(), :rp_id, "loopctl.com")}
+              data-rp-name="loopctl"
+            >
+            </div>
+
+            <div class="flex flex-col gap-3 sm:flex-row" id="enrollment-controls">
+              <input
+                id="authenticator-friendly-name"
+                type="text"
+                name="friendly_name"
+                form="signup-form"
+                value={@friendly_name_draft}
+                placeholder="Primary YubiKey"
+                class="block flex-1 rounded-md border border-slate-800 bg-slate-900 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-600 focus:border-accent-500 focus:outline-none focus:ring-1 focus:ring-accent-500"
+              />
+              <button
+                id="enroll-authenticator-btn"
+                type="button"
+                phx-click="request_attestation"
+                disabled={length(@authenticators) >= @max_authenticators}
+                class="inline-flex items-center justify-center gap-2 rounded-md border border-accent-500 bg-accent-600/20 px-4 py-2 font-mono text-xs uppercase tracking-wide text-accent-100 hover:bg-accent-600/40 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <.icon name="hero-key" class="h-4 w-4" /> Enroll authenticator
               </button>
-            </li>
-          </ul>
+            </div>
+          </div>
 
           <div
-            id="webauthn-hook"
-            phx-hook="WebAuthn"
-            phx-update="ignore"
-            data-challenge={@challenge_payload}
-            data-rp-id={Keyword.get(WebAuthn.rp_opts(), :rp_id, "loopctl.com")}
-            data-rp-name="loopctl"
+            :if={@error}
+            id="signup-error"
+            role="alert"
+            class="rounded-md border border-rose-500/40 bg-rose-950/30 px-4 py-3 text-sm text-rose-200"
           >
+            {@error}
           </div>
 
-          <div class="flex flex-col gap-3 sm:flex-row" id="enrollment-controls">
-            <input
-              id="authenticator-friendly-name"
-              type="text"
-              name="friendly_name"
-              form="signup-form"
-              value={@friendly_name_draft}
-              placeholder="Primary YubiKey"
-              class="block flex-1 rounded-md border border-slate-800 bg-slate-900 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-600 focus:border-accent-500 focus:outline-none focus:ring-1 focus:ring-accent-500"
-            />
-            <button
-              id="enroll-authenticator-btn"
-              type="button"
-              phx-click="request_attestation"
-              disabled={length(@authenticators) >= @max_authenticators}
-              class="inline-flex items-center justify-center gap-2 rounded-md border border-accent-500 bg-accent-600/20 px-4 py-2 font-mono text-xs uppercase tracking-wide text-accent-100 hover:bg-accent-600/40 disabled:cursor-not-allowed disabled:opacity-50"
+          <div class="flex items-center justify-between gap-4">
+            <a
+              href={@learn_more_url}
+              class="font-mono text-xs uppercase tracking-wide text-slate-500 hover:text-accent-400"
+              id="signup-learn-more"
             >
-              <.icon name="hero-key" class="h-4 w-4" /> Enroll authenticator
+              learn more about the ceremony →
+            </a>
+            <button
+              id="signup-submit-btn"
+              type="submit"
+              class="inline-flex items-center justify-center gap-2 rounded-md border border-accent-500 bg-accent-600 px-6 py-2 font-mono text-sm uppercase tracking-wide text-slate-50 hover:bg-accent-500 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={@authenticators == []}
+            >
+              Complete signup
             </button>
           </div>
-        </div>
-
-        <div
-          :if={@error}
-          id="signup-error"
-          role="alert"
-          class="rounded-md border border-rose-500/40 bg-rose-950/30 px-4 py-3 text-sm text-rose-200"
-        >
-          {@error}
-        </div>
-
-        <div class="flex items-center justify-between gap-4">
-          <a
-            href={@learn_more_url}
-            class="font-mono text-xs uppercase tracking-wide text-slate-500 hover:text-accent-400"
-            id="signup-learn-more"
-          >
-            learn more about the ceremony →
-          </a>
-          <button
-            id="signup-submit-btn"
-            type="submit"
-            class="inline-flex items-center justify-center gap-2 rounded-md border border-accent-500 bg-accent-600 px-6 py-2 font-mono text-sm uppercase tracking-wide text-slate-50 hover:bg-accent-500 disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={@authenticators == []}
-          >
-            Complete signup
-          </button>
-        </div>
-      </.form>
+        </.form>
+      <% end %>
     </section>
     """
   end
