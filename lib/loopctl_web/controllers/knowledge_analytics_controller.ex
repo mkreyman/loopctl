@@ -334,7 +334,10 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       kind: [
         in: :query,
         type: :string,
-        description: "Filter by kind (gate_duplicate|gate_draft|supersede|merge|dismiss)",
+        description:
+          "Filter by kind (gate_duplicate|gate_draft|gate_skip|supersede|merge|dismiss). " <>
+            "`gate_skip` is the novelty gate DISCARDING a high-overlap proposal under " <>
+            "on_low_novelty=skip — the audit trail for captures that were dropped, not stored.",
         required: false
       ],
       since: [

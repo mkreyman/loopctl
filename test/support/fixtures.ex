@@ -574,6 +574,7 @@ defmodule Loopctl.Fixtures do
         created_count: 0,
         deduplicated_count: 0,
         drafted_count: 0,
+        skipped_count: 0,
         title_conflict_count: 0,
         validation_error_count: 0
       },

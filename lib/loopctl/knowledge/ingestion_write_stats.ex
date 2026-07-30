@@ -15,17 +15,24 @@ defmodule Loopctl.Knowledge.IngestionWriteStats do
 
   ## Outcome -> column mapping
 
-  - `:created`          -> `created_count`
-  - `:deduplicated`     -> `deduplicated_count`
-  - `:gated_to_draft`   -> `drafted_count`
-  - `:title_conflict`   -> `title_conflict_count`
-  - `:validation_error` -> `validation_error_count`
-  - `:forbidden`        -> `forbidden_count`
+  - `:created`              -> `created_count`
+  - `:deduplicated`         -> `deduplicated_count`
+  - `:gated_to_draft`       -> `drafted_count`
+  - `:skipped_low_novelty`  -> `skipped_count`
+  - `:title_conflict`       -> `title_conflict_count`
+  - `:validation_error`     -> `validation_error_count`
+  - `:forbidden`            -> `forbidden_count`
+
+  `:skipped_low_novelty` counts high-overlap proposals DISCARDED by
+  `on_low_novelty: :skip` — no row, and no article reference handed back. It is
+  deliberately NOT folded into `deduplicated_count` (which means "the content already
+  exists as a row you were pointed at"): a drop storm must not read as a healthy
+  dedup-heavy day.
 
   `:forbidden` counts UPFRONT AUTHORIZATION rejections (a 403 — wrong scope/role or a
   missing agent identity). It is tracked for observability but is DELIBERATELY EXCLUDED
   from the high_reject_rate detector's reject numerator AND denominator
-  (`IngestionHealth.detect_high_reject_rate/1` selects only the five ingestion outcomes):
+  (`IngestionHealth.detect_high_reject_rate/1` selects only the ingestion outcomes):
   a caller merely mis-using scope/identity (a 403 storm) is permission misuse, NOT an
   ingestion-pipeline outage, and must not page the operator with a `high_reject_rate`
   alert nor dilute a genuine `title_conflict`/`validation_error` reject signal.
@@ -39,11 +46,12 @@ defmodule Loopctl.Knowledge.IngestionWriteStats do
 
   @type t :: %__MODULE__{}
 
-  # The five INGESTION-pipeline outcome counters the high_reject_rate detector reads.
+  # The INGESTION-pipeline outcome counters the high_reject_rate detector reads.
   @counter_fields [
     :created_count,
     :deduplicated_count,
     :drafted_count,
+    :skipped_count,
     :title_conflict_count,
     :validation_error_count
   ]
@@ -62,6 +70,7 @@ defmodule Loopctl.Knowledge.IngestionWriteStats do
     created: :created_count,
     deduplicated: :deduplicated_count,
     gated_to_draft: :drafted_count,
+    skipped_low_novelty: :skipped_count,
     title_conflict: :title_conflict_count,
     validation_error: :validation_error_count,
     forbidden: :forbidden_count
@@ -85,6 +94,7 @@ defmodule Loopctl.Knowledge.IngestionWriteStats do
     field :created_count, :integer, default: 0
     field :deduplicated_count, :integer, default: 0
     field :drafted_count, :integer, default: 0
+    field :skipped_count, :integer, default: 0
     field :title_conflict_count, :integer, default: 0
     field :validation_error_count, :integer, default: 0
     field :forbidden_count, :integer, default: 0
@@ -92,7 +102,7 @@ defmodule Loopctl.Knowledge.IngestionWriteStats do
     timestamps(type: :utc_datetime_usec)
   end
 
-  @doc "The five INGESTION-outcome counter column names read by the reject-rate detector."
+  @doc "The INGESTION-outcome counter column names read by the reject-rate detector."
   @spec counter_fields() :: [atom()]
   def counter_fields, do: @counter_fields
 

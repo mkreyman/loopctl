@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.63.0 — 2026-07-30 (never bank a near-duplicate)
+
+### Added
+
+- **`knowledge_create` gains `skip_low_novelty`** (issue #536). A high-overlap capture is
+  normally staged as a DRAFT for review; an UNATTENDED writer has no reviewer, so those
+  drafts pile up as corpus debris. Pass `skip_low_novelty: true` and the proposal is
+  DROPPED instead — nothing is created, the response reports `skipped: true` with the
+  near-neighbour it lost to. Errors are unaffected: an invalid payload, an
+  `idempotency_key` retry or a title collision still answer exactly as they do without
+  the flag. Mutually exclusive with `force`.
+
 ## 2.62.0 — 2026-07-25 (one-call handoff affordance)
 
 ### Added

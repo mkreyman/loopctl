@@ -1504,6 +1504,7 @@ async function knowledgeCreate({
   project_id,
   draft,
   force,
+  skip_low_novelty,
   source_type,
   source_id,
   idempotency_key,
@@ -1525,8 +1526,10 @@ async function knowledgeCreate({
   if (draft) payload.draft = true;
 
   // The server-side novelty gate dedups the proposal against the corpus (verdict in
-  // the response `gate`). force:true bypasses it.
+  // the response `gate`). force:true bypasses it; skip_low_novelty:true drops a
+  // high-overlap proposal instead of banking it as a draft. Mutually exclusive (422).
   if (force) payload.force = true;
+  if (skip_low_novelty) payload.skip_low_novelty = true;
 
   const result = await apiCall(
     "POST",
@@ -4601,7 +4604,9 @@ const TOOLS = [
       "so NOTHING was created (HTTP 200, `deduplicated: true`); read/update the article at `data.id` " +
       "instead (its `gate.similarity` ~1.0). `gated_to_draft` means high overlap, so the article was " +
       "created as a DRAFT (not published) with the near-neighbors in metadata.proposal_novelty for you " +
-      "to merge or publish. `created` means it was novel and went through normally. Pass force: true to " +
+      "to merge or publish — unless you passed skip_low_novelty: true, in which case the verdict is " +
+      "`skipped_low_novelty` and NOTHING was created (HTTP 200, `skipped: true`, `data: null`). " +
+      "`created` means it was novel and went through normally. Pass force: true to " +
       "bypass the gate when you intentionally want an article near an existing one. " +
       "Concurrency-safe: if a create races/retries against an " +
       "existing article with the same title AND an identical body (ignoring surrounding whitespace), the " +
@@ -4644,6 +4649,15 @@ const TOOLS = [
             "Optional: bypass the novelty gate (default false). When true, the server skips " +
             "semantic dedup and creates on the requested path even if a near-duplicate exists. " +
             "Use only when you've already checked and intend an article close to an existing one.",
+        },
+        skip_low_novelty: {
+          type: "boolean",
+          description:
+            "Optional: on high overlap, create NOTHING instead of staging a draft (default " +
+            "false → gated_to_draft). For an UNATTENDED writer with no reviewer behind it, " +
+            "whose gated drafts would pile up unresolved; you get verdict skipped_low_novelty " +
+            "with data:null. Mutually exclusive with force (422). An idempotency_key match or " +
+            "an exact title collision is still answered as a dedup/409, never dropped.",
         },
         idempotency_key: {
           type: "string",
@@ -5905,7 +5919,7 @@ const TOOLS = [
     name: "knowledge_curation_log",
     description:
       "The concise, human-readable log of KB CURATION adjustments — novelty-gate decisions " +
-      "(gate_duplicate/gate_draft) and conflict resolutions (supersede/merge/dismiss) — for " +
+      "(gate_duplicate/gate_draft/gate_skip) and conflict resolutions (supersede/merge/dismiss) — for " +
       "analyzing the agents'-KB rollout, distinct from the verbose audit log. Each entry is a " +
       "one-liner: {at, kind, summary, refs, actor, confidence}. RECORDED ONLY while the tenant " +
       "has the toggle on: settings.kb_curation_log (flip via the admin tenant API, " +
@@ -5917,7 +5931,8 @@ const TOOLS = [
         kind: {
           type: "string",
           description:
-            "Optional: filter by kind (gate_duplicate | gate_draft | supersede | merge | dismiss).",
+            "Optional: filter by kind (gate_duplicate | gate_draft | gate_skip | supersede | merge | dismiss). " +
+            "gate_skip = a high-overlap proposal DISCARDED under skip_low_novelty (dropped, not stored).",
         },
         since: {
           type: "string",

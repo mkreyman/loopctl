@@ -77,6 +77,22 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
       assert IngestionHealth.detect() |> Enum.filter(&(&1.tenant_id == tenant.id)) == []
     end
 
+    test "returns no candidate when the rollup shows row-less writes in the window" do
+      tenant = fixture(:tenant)
+      for _ <- 1..5, do: captured(tenant.id, "session_log", @stale_hours)
+
+      # Every recent write was DISCARDED by on_low_novelty: :skip — no article row, but
+      # the source is writing all day. The articles table alone would page the operator.
+      fixture(:ingestion_write_stats, %{
+        tenant_id: tenant.id,
+        source_type: "session_log",
+        day: Date.utc_today(),
+        skipped_count: 20
+      })
+
+      assert IngestionHealth.detect() |> for_tenant(tenant.id) == []
+    end
+
     test "returns no candidate below the established threshold" do
       tenant = fixture(:tenant)
       for _ <- 1..4, do: captured(tenant.id, "session_log", @stale_hours)

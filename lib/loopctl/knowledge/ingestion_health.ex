@@ -13,9 +13,11 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   For a source_type that is **recently established** (has produced at least
   `established_threshold` articles WITHIN `establishment_window_hours`) but whose
   most recent article is older than `staleness_threshold_hours`, it emits a
-  `:capture_silence` candidate. A tenant that never produced captures of a
-  source_type is never flagged (it was never established), so this fires only on
-  genuine *went-silent* regressions.
+  `:capture_silence` candidate — UNLESS the write-outcome rollup shows a row-less
+  write (an idempotent dedup, or an `on_low_novelty: :skip` discard) inside the same
+  window, which is a live pipeline the articles table cannot see. A tenant that never
+  produced captures of a source_type is never flagged (it was never established), so
+  this fires only on genuine *went-silent* regressions.
 
   ## Index / scan cost
 
@@ -499,6 +501,41 @@ defmodule Loopctl.Knowledge.IngestionHealth do
       threshold = Map.get(overrides, st, established)
       candidate_or_skip(tid, st, count, last, threshold, staleness_hours, now)
     end)
+    |> reject_rowless_but_live(source_types, staleness_hours)
+  end
+
+  # Not every healthy write leaves an article row. A saturated capture source running
+  # `on_low_novelty: :skip` can spend most of its writes on high-overlap proposals that
+  # are DISCARDED, and `max(articles.inserted_at)` cannot see them, so this dead-man's
+  # switch would page the operator for a pipeline that is writing all day. The
+  # write-outcome rollup is the complementary liveness signal: a (tenant, source_type)
+  # with a skipped write inside the staleness window is NOT silent.
+  #
+  # `deduplicated` deliberately does NOT count as liveness. An idempotent re-post is a
+  # replay of content captured long ago — a source whose every write dedups is producing
+  # NO new knowledge, which is precisely the regression this switch exists to page for;
+  # letting it suppress the alert would silence the outage forever.
+  #
+  # The rollup's grain is a DAY, so the lookback rounds staleness UP to whole days —
+  # deliberately generous. A dead-man's switch must under-page rather than false-page;
+  # a genuinely stopped source clears the window a day later and is flagged then.
+  defp reject_rowless_but_live([], _source_types, _staleness_hours), do: []
+
+  defp reject_rowless_but_live(candidates, source_types, staleness_hours) do
+    since_day = Date.add(Date.utc_today(), -ceil(staleness_hours / 24))
+
+    live =
+      IngestionWriteStats
+      |> join(:inner, [s], t in Tenant, on: t.id == s.tenant_id and t.status == :active)
+      |> where([s], not is_nil(s.source_type))
+      |> where([s], s.day >= ^since_day)
+      |> where([s], s.skipped_count > 0)
+      |> filter_source_types(source_types)
+      |> select([s], {s.tenant_id, s.source_type})
+      |> AdminRepo.all()
+      |> MapSet.new()
+
+    Enum.reject(candidates, &MapSet.member?(live, {&1.tenant_id, &1.source_type}))
   end
 
   # `:all` monitors every source_type; a list narrows to the given source_types.
@@ -617,17 +654,21 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     title_conflict = to_int(row.title_conflict)
     validation_error = to_int(row.validation_error)
 
-    # Denominator = ALL five write outcomes, including the SUCCESSFUL deduplicated
-    # and drafted outcomes. `reject_rate` is therefore "fraction of ALL write attempts
-    # rejected", not "fraction of new-content-CREATE attempts rejected". This is
-    # deliberate (tenant-wide, a pipeline that mostly dedups is largely working), but
-    # it is a KNOWN blind spot: a genuine title_conflict/validation reject storm on a
-    # source_type that ALSO carries heavy legitimate idempotent-dedup traffic can be
-    # diluted below `reject_rate_threshold` and evade this detector
-    # (e.g. 600 rejects / (1000 dedup + 600) = 0.375 < 0.5). If a source with high
-    # idempotent-dedup volume needs coverage, prefer a create+reject-only denominator
-    # or an absolute rejects/window rate for it rather than widening this ratio.
+    # Denominator = ALL ingestion write outcomes EXCEPT `skipped`, so it includes the
+    # SUCCESSFUL deduplicated and drafted ones. `reject_rate` is therefore "fraction of
+    # ALL write attempts rejected", not "fraction of new-content-CREATE attempts
+    # rejected". That is deliberate (tenant-wide, a pipeline that mostly dedups is
+    # largely working), but it is a KNOWN blind spot: a genuine title_conflict/validation
+    # reject storm on a source_type that ALSO carries heavy legitimate idempotent-dedup
+    # traffic can be diluted below `reject_rate_threshold` and evade this detector
+    # (e.g. 600 rejects / (1000 dedup + 600) = 0.375 < 0.5). `skipped` is excluded (like
+    # `:forbidden`) precisely so the blind spot is not WIDENED by an outcome designed to
+    # be high-volume: a writer running `on_low_novelty: :skip` is expected to skip the
+    # majority of its captures, which would swamp any reject signal on that tenant. If a
+    # source with high idempotent-dedup volume needs coverage, prefer a
+    # create+reject-only denominator or an absolute rejects/window rate for it.
     total_attempts = created + deduplicated + drafted + title_conflict + validation_error
+
     rejects = title_conflict + validation_error
     reject_rate = if total_attempts > 0, do: rejects / total_attempts, else: 0.0
 
