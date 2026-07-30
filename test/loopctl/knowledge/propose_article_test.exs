@@ -128,6 +128,70 @@ defmodule Loopctl.Knowledge.ProposeArticleTest do
       assert id == existing.id
     end
 
+    test "on_low_novelty: :skip creates nothing and returns the neighbor", %{tenant: tenant} do
+      existing =
+        fixture(:article, %{tenant_id: tenant.id, title: "Already covered", status: :published})
+
+      assessor(:low_novelty, [neighbor(existing, 0.93)], 0.93)
+      before = count_articles(tenant.id)
+
+      assert {:ok, %{verdict: :skipped_low_novelty, created: false, article: article}} =
+               Knowledge.propose_article(
+                 tenant.id,
+                 %{
+                   "title" => "A near-duplicate nobody would review",
+                   "body" => "Mostly covered by an adjacent article.",
+                   "category" => "finding",
+                   "status" => "published"
+                 },
+                 on_low_novelty: :skip
+               )
+
+      # The whole point: no row was written, not even a draft.
+      assert count_articles(tenant.id) == before
+      assert article.id == existing.id
+    end
+
+    test "on_low_novelty: :skip tolerates a neighbor that vanished after assess", %{
+      tenant: tenant
+    } do
+      # Same shape as the :duplicate path's ghost test — an id that no longer resolves.
+      ghost = %{id: Ecto.UUID.generate(), title: "Ghost"}
+      assessor(:low_novelty, [%{id: ghost.id, title: ghost.title, similarity_score: 0.93}], 0.93)
+      before = count_articles(tenant.id)
+
+      # Unlike the :duplicate path, a vanished neighbor must NOT fall back to creating —
+      # the caller asked never to create on high overlap.
+      assert {:ok, %{verdict: :skipped_low_novelty, created: false, article: nil}} =
+               Knowledge.propose_article(
+                 tenant.id,
+                 %{
+                   "title" => "Still skipped",
+                   "body" => "Body.",
+                   "category" => "finding",
+                   "status" => "published"
+                 },
+                 on_low_novelty: :skip
+               )
+
+      assert count_articles(tenant.id) == before
+    end
+
+    test "defaults to drafting when on_low_novelty is not passed", %{tenant: tenant} do
+      existing =
+        fixture(:article, %{tenant_id: tenant.id, title: "Adjacent2", status: :published})
+
+      assessor(:low_novelty, [neighbor(existing, 0.9)], 0.9)
+
+      assert {:ok, %{verdict: :gated_to_draft, created: true}} =
+               Knowledge.propose_article(tenant.id, %{
+                 "title" => "Interactive caller keeps the review queue",
+                 "body" => "Body.",
+                 "category" => "finding",
+                 "status" => "published"
+               })
+    end
+
     test "preserves caller metadata while stamping novelty", %{tenant: tenant} do
       existing = fixture(:article, %{tenant_id: tenant.id, title: "Near", status: :published})
       assessor(:low_novelty, [neighbor(existing, 0.9)], 0.9)

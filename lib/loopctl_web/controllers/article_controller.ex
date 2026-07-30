@@ -392,7 +392,7 @@ defmodule LoopctlWeb.ArticleController do
   defp create_article(conn, tenant_id, attrs, audit_opts, draft?, gate?) do
     # Pass the caller's visibility scope so idempotency dedup can't echo a private
     # memory the agent can't see (#163).
-    opts = audit_opts ++ Visibility.scope_opts(conn)
+    opts = audit_opts ++ Visibility.scope_opts(conn) ++ low_novelty_opts(attrs)
 
     if gate? do
       render_proposal(conn, Knowledge.propose_article(tenant_id, attrs, opts), attrs, draft?)
@@ -401,9 +401,48 @@ defmodule LoopctlWeb.ArticleController do
     end
   end
 
+  # `on_low_novelty=skip` — create nothing on high overlap instead of drafting. For an
+  # unattended writer (session capture) whose drafts nothing would ever review; see
+  # `Knowledge.propose_article/3`. Accepted as a request field so the DEFAULT stays
+  # draft-and-review for interactive callers.
+  defp low_novelty_opts(attrs) do
+    if truthy?(attrs["skip_low_novelty"]) or attrs["on_low_novelty"] == "skip" do
+      [on_low_novelty: :skip]
+    else
+      []
+    end
+  end
+
   # Novelty-gated path: render by verdict. A near-duplicate is NOT created — the
   # caller is pointed at the canonical article. A low-novelty proposal is created as
   # a draft with the near-neighbors surfaced so a reviewer/consumer can merge.
+
+  # High overlap and the caller opted out of drafting — nothing was created. Report the
+  # neighbour it lost to so the caller can count and attribute the drop.
+  defp render_proposal(conn, {:ok, %{verdict: :skipped_low_novelty} = result}, attrs, _draft?) do
+    %{article: neighbor, assessment: assessment} = result
+
+    # Counted as :deduplicated, not a new outcome. Nothing was created BECAUSE the content
+    # already exists — that is what the deduplicated counter means, and IngestionWriteStats
+    # maps only known outcomes (@outcome_columns), so a bespoke atom would fall through
+    # uncounted and make a dedup-heavy day read as an ingestion outage to the reject-rate
+    # detector. The caller still gets the finer-grained `skipped: true` in the response.
+    emit_write_telemetry(conn, attrs, :deduplicated)
+
+    conn
+    |> put_status(:ok)
+    |> json(%{
+      data: nil,
+      skipped: true,
+      gate: gate_meta(:skipped_low_novelty, assessment),
+      note:
+        "High overlap with existing knowledge (similarity " <>
+          "#{format_score(assessment.score)}) — nothing was created, per " <>
+          "on_low_novelty=skip." <>
+          if(neighbor, do: " Nearest existing article: #{neighbor.id}.", else: "")
+    })
+  end
+
   defp render_proposal(conn, {:ok, %{verdict: :duplicate} = result}, attrs, _draft?) do
     %{article: existing, assessment: assessment} = result
 
