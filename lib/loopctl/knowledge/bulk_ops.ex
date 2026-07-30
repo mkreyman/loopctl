@@ -113,6 +113,7 @@ defmodule Loopctl.Knowledge.BulkOps do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.BulkDeleteToken
+  alias Loopctl.LocalGuc
 
   @archivable_statuses [:draft, :published]
   @unpublishable_statuses [:published]
@@ -592,10 +593,13 @@ defmodule Loopctl.Knowledge.BulkOps do
   # First step of every op's Multi: scope a SET LOCAL statement_timeout to THIS
   # transaction (blast-radius bound, AC-27.12.5). Issued inside the tx via the
   # repo handed to the Multi so the GUC override holds for the whole transaction.
+  # The prior value is captured and put back by `run_multi/2`'s last step, because
+  # `SET LOCAL` outlives a COMMITTED savepoint (see `Loopctl.LocalGuc`).
   defp timeout_multi do
     Multi.run(Multi.new(), :set_timeout, fn repo, _changes ->
+      prior = LocalGuc.capture(repo, ["statement_timeout"])
       repo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
-      {:ok, :set}
+      {:ok, prior}
     end)
   end
 
@@ -605,6 +609,11 @@ defmodule Loopctl.Knowledge.BulkOps do
   # the transaction is already rolled back, and we map it to `{:error, exception}`
   # so callers get the atomicity guarantee without a leaked stacktrace.
   defp run_multi(multi, resolved_count \\ nil) do
+    multi =
+      Multi.run(multi, :restore_timeout, fn repo, %{set_timeout: prior} ->
+        {:ok, LocalGuc.restore(repo, prior)}
+      end)
+
     case AdminRepo.transaction(multi, timeout: transaction_timeout_ms()) do
       {:ok, %{articles: {affected, _}}} ->
         {:ok, %{affected: affected, resolved_count: resolved_count || affected}}

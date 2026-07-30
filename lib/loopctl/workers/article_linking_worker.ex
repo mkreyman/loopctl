@@ -82,6 +82,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.VectorSearch
+  alias Loopctl.LocalGuc
   alias Loopctl.Oban.FairShare
   alias Loopctl.TelemetryEvents
 
@@ -338,9 +339,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   # large corpus can never hold an AdminRepo connection indefinitely.
   defp corpus_count(article, tenant_id) do
     {:ok, total} =
-      AdminRepo.transaction(fn ->
-        AdminRepo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
-
+      LocalGuc.timed_transaction(AdminRepo, statement_timeout_ms(), fn ->
         article
         |> corpus_count_query(tenant_id)
         |> scope_by_project(article.project_id)
@@ -457,9 +456,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
       end)
 
     {:ok, created} =
-      AdminRepo.transaction(fn ->
-        AdminRepo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
-
+      LocalGuc.timed_transaction(AdminRepo, statement_timeout_ms(), fn ->
         rows
         |> reject_vanished_endpoints(tenant_id)
         |> Enum.chunk_every(insert_chunk_size())

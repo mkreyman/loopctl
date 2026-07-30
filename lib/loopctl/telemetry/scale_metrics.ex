@@ -356,6 +356,7 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   require Logger
 
+  alias Loopctl.LocalGuc
   alias Loopctl.Repo
   alias Loopctl.Tenants
 
@@ -1098,9 +1099,7 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
     active_states = Enum.map(oban_active_states(), &Atom.to_string/1)
 
     {:ok, rows} =
-      Repo.transaction(fn ->
-        Repo.query!("SET LOCAL statement_timeout = #{timeout_ms}")
-
+      LocalGuc.timed_transaction(Repo, timeout_ms, fn ->
         %{rows: rows} =
           Repo.query!(
             "SELECT state, queue, count(*) FROM oban_jobs WHERE state = ANY($1) GROUP BY state, queue",
@@ -1177,10 +1176,10 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
     # the moduledoc above. `statement_timeout` (SET LOCAL below) only bounds the
     # query itself, AFTER a connection is already checked out.
     {:ok, count} =
-      Repo.transaction(
+      LocalGuc.timed_transaction(
+        Repo,
+        timeout_ms,
         fn ->
-          Repo.query!("SET LOCAL statement_timeout = #{timeout_ms}")
-
           # `attempted_at` is a `timestamp without time zone` column populated by
           # Ecto's `:utc_datetime_usec` dump — i.e. it holds a UTC wall-clock reading
           # with no tz attached. `now()` is `timestamptz`; comparing it directly

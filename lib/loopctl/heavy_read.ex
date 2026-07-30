@@ -57,6 +57,7 @@ defmodule Loopctl.HeavyRead do
   require Logger
 
   alias Loopctl.HeavyRead.TenantGate
+  alias Loopctl.LocalGuc
 
   @doc "Resolved heavy-read repo (DI). `HeavyReadRepo` in prod/dev, `AdminRepo` in test."
   @spec repo() :: module()
@@ -404,7 +405,22 @@ defmodule Loopctl.HeavyRead do
   end
 
   defp iterative_scan_code do
-    Loopctl.SystemConfig.get_int("hnsw_iterative_scan", @default_hnsw_iterative_scan)
+    Loopctl.SystemConfig.get_int("hnsw_iterative_scan", default_iterative_scan_code())
+  end
+
+  # `SystemConfig` stays the single operator lever; this is only the FALLBACK applied when no
+  # operator has set that row. It is config-injected (rather than hard-coded 0) so an
+  # environment can start from a different baseline without any test mutating VM-global
+  # state. Only `config/test.exs` sets it — pinned ON there because PROD runs iterative scan
+  # ON, so an unpinned test env asserted exact recall against a configuration nobody runs.
+  # Every NON-test config is still barred from setting it by
+  # `test/loopctl/config_embedding_read_path_test.exs`, which is the case that matters: an
+  # Application pin in prod would shadow the operator lever.
+  defp default_iterative_scan_code do
+    case Application.get_env(:loopctl, :hnsw_iterative_scan_default, @default_hnsw_iterative_scan) do
+      code when is_integer(code) -> code
+      _ -> @default_hnsw_iterative_scan
+    end
   end
 
   @doc """
@@ -771,12 +787,33 @@ defmodule Loopctl.HeavyRead do
   # public `transaction/2` SET LOCAL, but pinned to the caller-resolved read repo so a
   # primary-pinned read (US-38.1) both times AND executes on the primary.
   defp run_timed_transaction(read_repo, ms, ef, iter, fun) do
+    # NESTED-CALL LEAK (the long-running embedding-test flake). `SET LOCAL` is scoped to the
+    # TOP-LEVEL transaction, not to a savepoint, so a nested read's savepoint COMMIT merges
+    # its aggressive `statement_timeout` into the enclosing transaction and 57014s unrelated
+    # later statements. `LocalGuc.scoped/3` captures and puts the GUCs back — see its
+    # moduledoc for why capture is `current_setting/2` and restore runs in an `after`.
+    #
+    # Deliberately UNCONDITIONAL: `read_repo.in_transaction?/0` cannot see the nesting that
+    # matters. It reads a per-repo process-dict entry set only by `Repo.transaction`/
+    # `Repo.checkout`, which `Sandbox.start_owner!` never sets — so gating on it made this
+    # restore dead code in exactly the sandboxed nesting it was written for. The cost when
+    # NOT nested is two round trips on a transaction that already does three or more.
     read_repo.transaction(fn ->
-      read_repo.query!("SET LOCAL statement_timeout = #{ms}")
-      maybe_set_ef_search(read_repo, ef)
-      maybe_set_iterative_scan(read_repo, iter)
-      fun.()
+      LocalGuc.scoped(read_repo, captured_gucs(ef, iter), fn ->
+        read_repo.query!("SET LOCAL statement_timeout = #{ms}")
+        maybe_set_ef_search(read_repo, ef)
+        maybe_set_iterative_scan(read_repo, iter)
+        fun.()
+      end)
     end)
+  end
+
+  # Capture exactly the GUCs this read is about to `SET LOCAL` — a non-ANN read must not
+  # pay for (or restore) a pgvector knob it never touches.
+  defp captured_gucs(ef, iter) do
+    ["statement_timeout"] ++
+      if(is_integer(ef), do: ["hnsw.ef_search"], else: []) ++
+      if(is_binary(iter), do: ["hnsw.iterative_scan", "hnsw.max_scan_tuples"], else: [])
   end
 
   # `SET LOCAL hnsw.ef_search = N` for an ANN read (US-38.4). Only fired when the caller
@@ -883,13 +920,9 @@ defmodule Loopctl.HeavyRead do
       {ms, opts}
       when is_integer(ms) and ms > 0 and
              (is_function(fun_or_multi, 0) or is_function(fun_or_multi, 1)) ->
-        repo().transaction(
-          fn ->
-            repo().query!("SET LOCAL statement_timeout = #{ms}")
-            invoke(fun_or_multi)
-          end,
-          opts
-        )
+        # Same nested-savepoint leak as `run_timed_transaction/5` — one mechanism, one
+        # implementation (`Loopctl.LocalGuc`).
+        LocalGuc.timed_transaction(repo(), ms, fn -> invoke(fun_or_multi) end, opts)
 
       {ms, _opts} ->
         raise ArgumentError,

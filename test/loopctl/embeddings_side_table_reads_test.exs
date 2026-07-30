@@ -18,18 +18,43 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   real per-node globality is covered directly in
   `test/loopctl/embeddings/system_config_read_path_test.exs`.)
 
-  These tests are `async: false` because they read through the pgvector HNSW indexes
-  on the SHARED per-dimension side tables (`article_embeddings_<dim>` /
-  `memory_embeddings_<dim>`). That index is one physical structure across the whole
-  suite. When OTHER async tests INSERT into it CONCURRENTLY with a read here, the
-  approximate graph walk can transiently miss a snapshot-visible, distance-0 row and
-  return `[]` — the rare CI `left: []` flake (four in-code fixes — ef_search raise,
-  exact scan, iterative_scan, retry-on-empty — each underfixed or regressed; see the
-  loopctl KB finding "side-table ANN test flake"). `async: false` makes ExUnit run
-  this module with NO concurrent tests, so nothing inserts into the index mid-read
-  and the approximate scan is deterministic — the same isolation rationale that keeps
-  `heavy_read_hnsw_ef_search_test` `async: false`. The prod read path is unchanged
-  (approximate ANN by design; prod closes the under-return with `hnsw.iterative_scan`).
+  `async: false` is kept here as cheap insurance — these are the suite's heaviest ANN
+  reads and serializing them lowers DB contention — but be clear that IT IS NOT WHAT
+  FIXED THE `left: []` FLAKE, and the concurrency story this docstring used to tell was
+  wrong. Recording that, because the wrong story cost four fixes.
+
+  The old claim was: OTHER async tests insert into the shared per-dimension HNSW index
+  concurrently, so the graph walk transiently misses a visible distance-0 row. That
+  cannot be the mechanism — ExUnit runs every async module to completion BEFORE any
+  sync one, so nothing else is running while this module executes. (A probe also
+  confirmed pgvector happily returns a live row past 2000 rolled-back distance-0 ties:
+  it skips invisible tuples and keeps scanning, so "dead tuples crowd out the row" was
+  wrong too.) That is why `async: false` (#519) did not hold and the SAME failure simply
+  reappeared in `system_config_read_path_test.exs`.
+
+  The defect is load-sensitive, which is why it only ever showed up in full-suite runs:
+  `SET LOCAL` leaks out of a committed SAVEPOINT. Under Sandbox every heavy read is
+  nested in the test's transaction, so one successful read left its 250ms
+  `statement_timeout` armed over the REST of the test — cancelling unrelated statements
+  later (a plain `INSERT INTO audit_log` 57014'd) and blanking result sets far from the
+  read that set it. Closed in `Loopctl.LocalGuc`, which `HeavyRead` now routes every
+  per-read `SET LOCAL` through.
+
+  That leak was real but was NOT the whole story: a 30-run loop on the post-fix tree
+  still reproduced `left: []` here once. The residual mechanism is candidate-slot
+  starvation — at the default `limit: 10` the index-ordered ANN can spend its slots on
+  rows a post-ANN filter then discards — which is why every ranking assertion in this
+  file passes a page wider than its candidate set. Treat a recurrence as a MISSING
+  `limit:`, not as an invitation to a fifth pgvector-recall fix: `hnsw.ef_search`,
+  exact scan, `hnsw.iterative_scan` and retry-on-empty have each been tried and each
+  regressed something else.
+
+  The cross-tenant residual filter (the ANN applies `tenant_id` AFTER the index returns
+  its top-`ef_search` batch) is a real, SEPARATE production concern, and `hnsw.iterative_scan`
+  is its remedy — but it stays a `SystemConfig`-only operator lever, deliberately NOT pinned
+  in `config/test.exs`, so CI keeps exercising the shipped default (see
+  `test/loopctl/config_embedding_read_path_test.exs`). The test-side remedy is orthogonal
+  vectors and a page size wider than the candidate set (below).
   """
 
   use Loopctl.DataCase, async: false
@@ -218,8 +243,16 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
       enable_side_table_reads()
 
+      # `limit: 50` for the reason spelled out on "ranks by similarity ..." above, and it
+      # matters MORE here than there: this is the one test whose filter is applied AFTER
+      # the index-ordered ANN, so any candidate slot the default `limit: 10` spends on a
+      # row that the `category` filter then discards is a slot the pattern row needed.
+      # That yields `left: []` — the exact recorded signature of this file's flake.
       assert {:ok, %{results: results}} =
-               Knowledge.search_semantic(tenant.id, vec(1536, :query), category: :pattern)
+               Knowledge.search_semantic(tenant.id, vec(1536, :query),
+                 category: :pattern,
+                 limit: 50
+               )
 
       assert Enum.map(results, & &1.id) == [pattern.id]
     end
@@ -366,7 +399,17 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
       enable_side_table_reads()
 
-      assert {:ok, %{results: results}} = Knowledge.search_semantic(tenant.id, vec(1536, :query))
+      # PAGE SIZE IS LOAD-BEARING here for the same reason it is on the ranking test above:
+      # this tenant's candidate set is NOT just the row materialized above — the on-demand
+      # system-corpus materialization puts every other seeded system row in the pool too,
+      # and HOW MANY of those exist at this instant depends on what the rest of the suite
+      # has already materialized. At the default `limit: 10` that made this assert on POOL
+      # CAPACITY against a load-dependent candidate set, which is the residual ~3% flake.
+      # AC-41.1.7 promises the system article is RECALLABLE, not that it beats an unbounded
+      # set of competitors into a 10-row page, so widen the page past the candidate set.
+      assert {:ok, %{results: results}} =
+               Knowledge.search_semantic(tenant.id, vec(1536, :query), limit: 50)
+
       assert article.id in Enum.map(results, & &1.id)
     end
 

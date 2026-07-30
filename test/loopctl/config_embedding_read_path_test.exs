@@ -94,7 +94,7 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
     end
 
     test ":hnsw_iterative_scan is not set in ANY config file" do
-      for file <- config_files(), key <- @forbidden_keys do
+      for file <- non_test_config_files(), key <- @forbidden_keys do
         refute config_key_set?(file, key),
                """
                config/#{file} sets `:loopctl, #{inspect(key)}`.
