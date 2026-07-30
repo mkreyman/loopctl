@@ -153,6 +153,7 @@ defmodule Loopctl.Oban.FairShare do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.LocalGuc
   alias Loopctl.ObanConfig
 
   # `in_flight_ingestion_backlog/1` is the worker-scoped, index-backed backlog count
@@ -335,8 +336,7 @@ defmodule Loopctl.Oban.FairShare do
     query = base |> apply_scope(scope) |> apply_id_predicate(id_predicate)
 
     {:ok, result} =
-      AdminRepo.transaction(fn ->
-        AdminRepo.query!("SET LOCAL statement_timeout = #{@count_statement_timeout_ms}")
+      LocalGuc.timed_transaction(AdminRepo, @count_statement_timeout_ms, fn ->
         AdminRepo.one(query)
       end)
 

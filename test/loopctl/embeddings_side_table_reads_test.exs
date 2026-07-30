@@ -32,23 +32,20 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   wrong too.) That is why `async: false` (#519) did not hold and the SAME failure simply
   reappeared in `system_config_read_path_test.exs`.
 
-  There were really TWO defects, both load-sensitive, which is why it only ever showed
-  up in full-suite runs:
+  The defect is load-sensitive, which is why it only ever showed up in full-suite runs:
+  `SET LOCAL` leaks out of a committed SAVEPOINT. Under Sandbox every heavy read is
+  nested in the test's transaction, so one successful read left its 250ms
+  `statement_timeout` armed over the REST of the test — cancelling unrelated statements
+  later (a plain `INSERT INTO audit_log` 57014'd) and blanking result sets far from the
+  read that set it. Fixed in `Loopctl.LocalGuc`, which `HeavyRead` now routes every
+  per-read `SET LOCAL` through.
 
-    1. `SET LOCAL` leaking out of a committed SAVEPOINT. Under Sandbox every heavy read
-       is nested in the test's transaction, so one successful read left its 250ms
-       `statement_timeout` armed over the REST of the test — cancelling unrelated
-       statements later (a plain `INSERT INTO audit_log` 57014'd) and blanking result
-       sets far from the read that set it. Fixed in `HeavyRead.run_timed_transaction/5`,
-       which now restores the GUCs when nested.
-    2. The cross-tenant residual filter. The ANN applies `tenant_id` AFTER the index
-       returns its top-`ef_search` batch, so a tenant whose rows fall outside that batch
-       is silently under-returned. Closed by running the test env with
-       `hnsw.iterative_scan` ON (`config/test.exs`), which is what PROD already runs
-       (#488/#491) — so the suite now matches production instead of asserting against a
-       configuration nothing runs.
-
-  Measured on beelink: 7 failures / 25 full-suite runs before, 0 / 25 after.
+  The cross-tenant residual filter (the ANN applies `tenant_id` AFTER the index returns
+  its top-`ef_search` batch) is a real, SEPARATE production concern, and `hnsw.iterative_scan`
+  is its remedy — but it stays a `SystemConfig`-only operator lever, deliberately NOT pinned
+  in `config/test.exs`, so CI keeps exercising the shipped default (see
+  `test/loopctl/config_embedding_read_path_test.exs`). The test-side remedy is orthogonal
+  vectors and a page size wider than the candidate set (below).
   """
 
   use Loopctl.DataCase, async: false

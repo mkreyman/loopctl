@@ -44,7 +44,9 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
   use ExUnit.Case, async: true
 
   @test_only_keys [:embedding_read_path]
-  @forbidden_keys [:hnsw_iterative_scan]
+  # Both the plain key and the `..._default` fallback spelling: a rename is the same
+  # Application-level pin and must not slip past this guard.
+  @forbidden_keys [:hnsw_iterative_scan, :hnsw_iterative_scan_default]
 
   @flag_writer "test/loopctl/embeddings/system_config_read_path_test.exs"
   @self_path "test/loopctl/config_embedding_read_path_test.exs"

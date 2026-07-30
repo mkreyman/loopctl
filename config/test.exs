@@ -710,20 +710,5 @@ config :loopctl, :embedding_read_path, Loopctl.MockEmbeddingReadPath
 # behind the `SystemConfig` lever pending an operator flip. Turning it on suite-wide would
 # make CI stop exercising the shipped default and blind it to under-return regressions.
 # The TEST-side remedy for shared-HNSW-index recall flakes is per-test ORTHOGONAL vectors
-# (`Loopctl.DataCase.test_vec/2`, #487) — use that.
-
-# HNSW iterative scan ON in test (the #488 machinery, default OFF in config.exs).
-#
-# Not a test-only knob for its own sake: the pgvector ANN applies `tenant_id` as a
-# POST-index residual filter over a CROSS-TENANT index, so a tenant whose rows fall outside
-# the global top-`ef_search` batch is silently under-returned. Under full-suite load the
-# shared side-table index carries enough competing rows that the side-table read-path tests
-# intermittently recalled NOTHING (`left: []`) — the long-running flake that four successive
-# "recall" fixes (ef_search raise, exact scan, iterative_scan-as-global, retry-on-empty)
-# failed to close. Iterative scan makes HNSW keep scanning past the first batch until the
-# LIMIT is filled with rows that survive the residual filter, which is exactly the missing
-# guarantee. PROD RUNS WITH THIS ON (SystemConfig hnsw_iterative_scan = 1, enabled after
-# #488/#491), so this makes the suite match production instead of asserting against a
-# configuration nothing runs. Requires pgvector >= 0.8 — guarded by
-# `HeavyRead.iterative_scan_supported?/0`, which no-ops on older backends.
-config :loopctl, :hnsw_iterative_scan_default, 1
+# (`Loopctl.DataCase.test_vec/2`, #487) — use that. A renamed key (`..._default`) is the same
+# pin and is barred by the same guard (`test/loopctl/config_embedding_read_path_test.exs`).

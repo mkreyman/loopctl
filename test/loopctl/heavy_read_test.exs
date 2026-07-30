@@ -423,6 +423,22 @@ defmodule Loopctl.HeavyReadTest do
       assert {:ok, 42} = HeavyRead.transaction(fn -> 42 end, statement_timeout: 5_000)
     end
 
+    test "a nested heavy read does NOT leak its statement_timeout to the enclosing txn" do
+      # `SET LOCAL` scopes to the TOP-LEVEL transaction: a savepoint that COMMITS merges
+      # the override into the enclosing transaction, arming this read's aggressive deadline
+      # over every later statement there. Under Sandbox that is EVERY heavy read. Deleting
+      # the `Loopctl.LocalGuc` restore must fail here.
+      repo = HeavyRead.repo()
+      before = show_statement_timeout(repo)
+      tenant = fixture(:tenant)
+
+      HeavyRead.all(tenant.id, from(a in Article, where: a.tenant_id == ^tenant.id),
+        statement_timeout: 1_234
+      )
+
+      assert show_statement_timeout(repo) == before
+    end
+
     test "transaction/2 rejects :statement_timeout that is non-integer, zero, or a Multi" do
       for bad <- ["nope", 0, -1] do
         assert_raise ArgumentError, ~r/statement_timeout/, fn ->
@@ -434,6 +450,11 @@ defmodule Loopctl.HeavyReadTest do
         HeavyRead.transaction(Ecto.Multi.new(), statement_timeout: 1_000)
       end
     end
+  end
+
+  defp show_statement_timeout(repo) do
+    %{rows: [[value]]} = repo.query!("SHOW statement_timeout")
+    value
   end
 
   # NOTE (US-38.4): the per-query `hnsw.ef_search` tests that PRIME the VM-global
