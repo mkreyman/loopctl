@@ -145,30 +145,51 @@ jobs:
               END IF;
             END \$\$;
           "
-          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
-            GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
-            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
+
+      # These steps target "loopctl_test$MIX_TEST_PARTITION", NOT a hardcoded
+      # loopctl_test, and that is a FIX rather than a tidy-up.
+      #
+      # MIX_TEST_PARTITION is `ci` for this job, so config/test.exs points all three repos
+      # at loopctl_testci while these psql steps were still hardcoded to loopctl_test.
+      # On the hosted runner that was merely useless (the container's only database was
+      # loopctl_test). On the self-hosted box loopctl_test is the DEVELOPER'S local test
+      # database, so every CI run was issuing GRANT and ALTER DEFAULT PRIVILEGES against
+      # it while the database the suite actually used never received them.
+      #
+      # Observed before this change: loopctl_testci had USAGE but not CREATE on schema
+      # public and one default-ACL entry, while the local loopctl_test had two — CI's
+      # grants, landed on the wrong database. The suite passed anyway, which is what made
+      # this invisible: nothing in it currently needs loopctl_app to hold CREATE.
+      #
+      # Order matters for the same reason as in scale-nightly: on a fresh machine the
+      # database does not exist until ecto.create, and ALTER DEFAULT PRIVILEGES only
+      # affects tables created after it runs, so it has to sit between create and migrate.
+      - name: Create the database
+        run: mix ecto.create
+
+      - name: Grant RLS roles on the schema, before any table exists
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d "loopctl_test${MIX_TEST_PARTITION}" -c "
             GRANT USAGE, CREATE ON SCHEMA public TO loopctl_app;
             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO loopctl_app;
             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO loopctl_app;
           "
 
-      - name: Setup database
-        run: mix ecto.create && mix ecto.migrate
-        env:
-          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
+      - name: Migrate
+        run: mix ecto.migrate
 
       - name: Grant RLS roles access to tables
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
+          PGPASSWORD=postgres psql -h localhost -U postgres -d "loopctl_test${MIX_TEST_PARTITION}" -c "
             GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
             GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
           "
 
+      # No DATABASE_URL: config/runtime.exs reads it only under
+      # `if config_env() == :prod`, so in MIX_ENV=test it was dead config that looked
+      # like it selected the database. config/test.exs selects it, from MIX_TEST_PARTITION.
       - name: Run tests
         run: mix test
-        env:
-          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
       # The cross-context journeys (test/e2e/*) are @moduletag :e2e and excluded
       # from the default `mix test` above (keeps it fast). Run them here in the
@@ -571,10 +592,22 @@ jobs:
     # (unboxed) rows and cleans up only its own tenant. Running them in one process
     # against one DB lets a leaked corpus (best-effort cleanup) poison the next file's
     # GLOBAL planner stats — a "small tenant in a large corpus" flip that fails
-    # assert_hnsw_index, a false RED. A matrix gives each file a FRESH Postgres service,
-    # so cross-file pollution is impossible by construction, and wall-clock is max(file)
-    # not sum(files). Adding a :scale_nightly test? Add its file here or it won't gate.
-    runs-on: ubuntu-latest
+    # assert_hnsw_index, a false RED. Isolation per matrix job is therefore LOAD-BEARING,
+    # not tidiness. Adding a :scale_nightly test? Add its file here or it won't gate.
+    #
+    # This was the single largest GitHub-hosted line item: ~143 min of billed runner
+    # time per night across the 14 files, roughly 4,300 min/month, dwarfing every other
+    # hosted job combined. Moved to beelink.
+    #
+    # The isolation used to come from a FRESH Postgres service container per matrix job.
+    # On the self-hosted box there is one long-lived Postgres, so isolation comes from a
+    # PER-MATRIX-FILE DATABASE instead (see "Derive this matrix file's database" below).
+    # That is equivalent for the property that matters: planner statistics live in the
+    # per-database pg_statistic/pg_class, so two databases in one cluster cannot see each
+    # other's ANALYZE results any more than two containers could. What a shared cluster
+    # DOES share is CPU, shared_buffers and disk — which affects timing, not the plan
+    # CHOICE these tests assert on, and the matrix runs serially on one runner anyway.
+    runs-on: [self-hosted, beelink]
     # Schedule (nightly) OR manual dispatch (pre-merge validation on a branch). Not
     # every-PR: the 4×80k seed is too slow for every push, so the enforced pre-merge
     # step for a Theme-2/3/4 (query/index) change is `gh workflow run CI --ref <branch>`
@@ -604,23 +637,42 @@ jobs:
           - test/loopctl/knowledge/vector_endpoint_e2e_latency_scale_test.exs
           - test/loopctl/knowledge/remediation_matrix_scale_test.exs
           - test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: loopctl_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
+    # NO `services:` block on self-hosted. beelink already runs a long-lived Postgres 16
+    # publishing 0.0.0.0:5432, so a service container declaring 5432:5432 cannot bind and
+    # the job dies at "Initialize containers" before its first step. That host instance
+    # has pgvector 0.8.2 available, which is what the pgvector/pgvector:pg16 image was
+    # supplying, so the image is not needed — only its port was ever in the way.
     steps:
       - uses: actions/checkout@v4
+
+      # Isolation, replacing the per-job fresh container (see the note on `runs-on`).
+      #
+      # config/test.exs builds the database name as "loopctl_test" <> MIX_TEST_PARTITION,
+      # so setting that variable is the supported way to move a run onto its own database
+      # for all three repos (Repo, AdminRepo, HeavyReadRepo) at once.
+      #
+      # It is safe to put a NON-INTEGER here only because this job selects tests with
+      # `--only scale_nightly` and never passes `mix test --partitions N`. Under
+      # `--partitions`, Mix validates MIX_TEST_PARTITION as an integer in 1..N and aborts
+      # on anything else — which is why home_care_billing needed a separate TEST_DB_BASE
+      # variable and this job does not.
+      #
+      # Derived from the file name rather than a bare index so a leftover database names
+      # the file that made it. Longest result is 40 chars, well inside Postgres's 63-byte
+      # identifier limit.
+      # Sanitised with bash parameter expansion rather than `basename ... | tr`: piping into
+      # tr feeds it basename's trailing NEWLINE, which is itself a non-alphanumeric byte and
+      # so becomes a trailing underscore in the database name. Verified — the first run of
+      # this produced loopctl_test_sn_scale_calibration_mismatch_scale_test_ with the stray
+      # underscore. Expansion operates on the already-stripped substitution result.
+      - name: Derive this matrix file's database
+        run: |
+          set -euo pipefail
+          suffix=$(basename '${{ matrix.scale_file }}' .exs)
+          suffix=${suffix//[^a-zA-Z0-9]/_}
+          echo "MIX_TEST_PARTITION=_sn_${suffix}" >> "$GITHUB_ENV"
+          echo "SCALE_DB=loopctl_test_sn_${suffix}" >> "$GITHUB_ENV"
+          echo "This job's database: loopctl_test_sn_${suffix} (${#suffix} char suffix)"
 
       - uses: erlef/setup-beam@v1
         with:
@@ -658,22 +710,37 @@ jobs:
               END IF;
             END \$\$;
           "
-          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
-            GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
-            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
+
+      # ORDER IS LOAD-BEARING, and it differs from the hosted version this replaced.
+      #
+      # The service container pre-created its database via POSTGRES_DB, so the old job
+      # could grant on that database before ever running ecto.create. Here the
+      # per-matrix-file database does not exist until ecto.create makes it, so granting
+      # first would fail with "database does not exist". Hence create, grant, migrate.
+      #
+      # ALTER DEFAULT PRIVILEGES must still land BETWEEN create and migrate: it applies
+      # only to tables created AFTER it runs, so deferring it until after ecto.migrate
+      # would leave every migrated table ungranted and fail the RLS tests for a reason
+      # that reads like a policy bug rather than a privilege one.
+      - name: Create this job's database
+        run: mix ecto.create
+
+      - name: Grant RLS roles on the schema, before any table exists
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d "$SCALE_DB" -c "
             GRANT USAGE, CREATE ON SCHEMA public TO loopctl_app;
             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO loopctl_app;
             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO loopctl_app;
           "
 
-      - name: Setup database
-        run: mix ecto.create && mix ecto.migrate
-        env:
-          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
+      - name: Migrate
+        run: mix ecto.migrate
 
+      # Belt and braces over ALTER DEFAULT PRIVILEGES above, which should already cover
+      # every table the migrations created.
       - name: Grant RLS roles access to tables
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
+          PGPASSWORD=postgres psql -h localhost -U postgres -d "$SCALE_DB" -c "
             GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
             GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
           "
@@ -691,14 +758,46 @@ jobs:
       # but `--only` overrides the exclude regardless). Do NOT "simplify" by dropping
       # `--only` and trusting the env: without it the normal suite runs and exits 0 — a
       # false-green where the gate silently never ran.
+      #
+      # No DATABASE_URL here (the hosted version set one). config/runtime.exs reads that
+      # variable only inside `if config_env() == :prod`, so in MIX_ENV=test it was dead
+      # config that merely LOOKED like it chose the database — config/test.exs does, from
+      # MIX_TEST_PARTITION. Leaving it in place next to a per-matrix-file database would
+      # actively mislead the next reader about which one wins.
       - name: Run nightly scale gate (US-27.1 prod-floor + US-27.2 plan assertions at scale)
         run: SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly ${{ matrix.scale_file }}
-        env:
-          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
         # 45 > the per-test ExUnit `@moduletag timeout: 30 min`, so ExUnit's timer always
         # binds first and a slow run fails with a legible test error, not an opaque
         # GitHub step cancel. One 80k seed + assertions; the old 45 covered all four.
         timeout-minutes: 45
+
+      # The disposable service container used to make cleanup free. On a long-lived
+      # Postgres it is mandatory: each of these databases holds an ~80k-article
+      # prod-floor corpus with its vectors and HNSW index. Observed live during the first
+      # beelink run: 1345 MB for remediation_matrix alone (they vary widely — the
+      # calibration file needs only ~14 MB). A full matrix left un-dropped is therefore
+      # on the order of 10 GB added to the box EVERY NIGHT until it filled.
+      #
+      # `if: always()` so a failed or cancelled gate still reclaims its space — an
+      # abandoned corpus is exactly what a timed-out 40-minute seed leaves behind.
+      #
+      # WITH (FORCE) terminates any connection still attached (Postgres 13+); without it
+      # a lingering pool connection makes DROP fail with "database is being accessed by
+      # other users" and the space is never reclaimed. Failure here must not redden a
+      # green gate, so the step reports and swallows.
+      - name: Drop this job's database
+        if: always()
+        run: |
+          if [ -z "${SCALE_DB:-}" ]; then
+            echo "::warning::SCALE_DB unset (the derive step never ran) — nothing to drop."
+            exit 0
+          fi
+          if PGPASSWORD=postgres psql -h localhost -U postgres -c \
+               "DROP DATABASE IF EXISTS \"$SCALE_DB\" WITH (FORCE);"; then
+            echo "Dropped $SCALE_DB."
+          else
+            echo "::warning::could not drop $SCALE_DB — reclaim it by hand."
+          fi
 
   deploy:
     name: Deploy
