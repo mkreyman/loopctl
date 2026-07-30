@@ -478,6 +478,38 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["note"] =~ "DRAFT"
     end
 
+    test "skip_low_novelty: true creates nothing on high overlap", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      existing = fixture(:article, %{tenant_id: tenant.id, title: "Covered", status: :published})
+
+      gate_verdict(
+        :low_novelty,
+        [%{id: existing.id, title: existing.title, similarity_score: 0.92}],
+        0.92
+      )
+
+      before = Loopctl.Repo.aggregate(Loopctl.Knowledge.Article, :count)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Would have been a draft",
+          "body" => "Mostly covered already.",
+          "category" => "finding",
+          "skip_low_novelty" => true
+        })
+
+      body = json_response(conn, 200)
+      assert body["skipped"] == true
+      assert body["data"] == nil
+      assert body["gate"]["verdict"] == "skipped_low_novelty"
+      assert body["note"] =~ existing.id
+      # No row at all — not even the draft the default path would have created.
+      assert Loopctl.Repo.aggregate(Loopctl.Knowledge.Article, :count) == before
+    end
+
     test "force: true bypasses the gate and publishes", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
