@@ -24,14 +24,36 @@ env:
   OTP_VERSION: "28.5.0.2"
 
 # SELF-HOSTED SPLIT (beelink). lint / test / security / dialyzer moved; the rest
-# stay on ubuntu-latest for specific reasons, not by omission:
+# stay on ubuntu-latest for specific reasons, not by omission. Measured job times
+# (2026-07-30) are recorded per entry, because the whole point of the split is
+# billed minutes and an unmeasured "it is rare" claim is how cost hides:
 #
-#   pgbouncer-e2e   Needs a pgbouncer service container in front of Postgres;
-#                   the port topology has to be reworked for a shared host DB.
-#   scale-test      Schedule/dispatch-gated prod-floor HNSW checks. Rare, heavy,
-#   scale-nightly   and not worth the blast radius until the above are settled.
+#   pgbouncer-e2e   1.4-2.4 min, EVERY push and PR. Needs pgbouncer in front of
+#                   Postgres; the port topology has to be reworked for a shared
+#                   host DB. Also GATES deploy, so it cannot simply be dropped.
+#   scale-test      3.1-5.1 min, EVERY push and PR -- its `if:` is
+#                   schedule || push || pull_request, i.e. effectively always.
+#                   (An earlier version of this comment called it
+#                   "schedule/dispatch-gated ... rare". That was wrong: only
+#                   scale-nightly is schedule-gated. The mistake understated the
+#                   recurring cost, which is exactly the number this block exists
+#                   to make visible.)
+#   scale-nightly   ~143 min per night across the 14-file matrix (one outlier,
+#                   streaming_export, is 40 min on its own) => ~4,300 min/month,
+#                   which is the LARGEST remaining hosted-minutes line item by a
+#                   wide margin. Schedule/dispatch only. Porting it needs a
+#                   per-matrix-file database rather than a per-job fresh
+#                   container: planner stats live in the per-database
+#                   pg_statistic, so distinct DBs on one cluster give the same
+#                   cross-file isolation the fresh service container gives today.
+#                   beelink can host it (PostgreSQL 16.13, pgvector 0.8.2
+#                   available, matching the pgvector/pgvector:pg16 service).
 #   deploy          Holds Fly deploy credentials and needs flyctl. Keeping release
-#   smoke           authority on GitHub-hosted runners is deliberate.
+#   smoke           authority on GitHub-hosted runners is deliberate and should
+#                   NOT be "optimised" onto beelink: that box holds Mark's SSH
+#                   key and the Hetzner API token, so putting deploy credentials
+#                   on it widens the blast radius of any compromised dependency
+#                   far more than the ~0.8 min/month of billed time is worth.
 jobs:
   lint:
     name: Lint
