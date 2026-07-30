@@ -299,12 +299,9 @@ defmodule Loopctl.Knowledge do
           | {:error, :duplicate_title, Article.t()}
           | {:error, Ecto.Changeset.t()}
   def create_article(tenant_id, attrs, opts \\ []) do
-    scope = attrs[:scope] || attrs["scope"] || :tenant
     project_id = attrs[:project_id] || attrs["project_id"]
     vis = Keyword.get(opts, :visibility_agent_id)
-
-    # System articles have no tenant — set tenant_id to nil
-    effective_tenant_id = if scope in [:system, "system"], do: nil, else: tenant_id
+    effective_tenant_id = effective_tenant_id(tenant_id, attrs)
 
     with :ok <- validate_project_ownership(tenant_id, project_id),
          # Idempotent fast path: a prior capture with the same idempotency_key is
@@ -407,6 +404,10 @@ defmodule Loopctl.Knowledge do
 
     * `:duplicate` — a near-identical article already exists. Nothing is created;
       the canonical article is returned so the caller can read/update it instead.
+      If that canonical article vanished between assess and now the proposal is
+      created on the normal path — except under `on_low_novelty: :skip`, which is
+      honoured here too (`:duplicate` is the HIGHER-overlap band, so falling through
+      would create exactly what the caller opted out of).
     * `:low_novelty` — high overlap with existing knowledge. The article is created
       as a **draft** (downgraded from publish if needed) with the near-neighbors
       stamped into `metadata.proposal_novelty`, so the smarter consuming agent (or a
@@ -414,7 +415,11 @@ defmodule Loopctl.Knowledge do
       `on_low_novelty: :skip` to create **nothing** instead — for an UNATTENDED writer
       with no reviewer behind it, whose drafts would otherwise pile up as corpus debris.
       The verdict is then `:skipped_low_novelty` with the near-neighbor in `:article`
-      (or `nil` if it vanished), and `created: false`.
+      (or `nil` if it vanished), and `created: false`. A skip is decided LAST: an
+      invalid `project_id` or a payload the create changeset rejects still errors, and a
+      proposal naming an existing row by IDENTITY (`idempotency_key`, or an exact active
+      title) is still answered as `:deduplicated` / `{:error, :duplicate_title, _}`
+      rather than dropped.
     * `:novel` / `:unknown` (gate fell open) — created on the requested path.
 
   The gate is mechanical and non-destructive: it never edits or deletes existing
@@ -431,8 +436,9 @@ defmodule Loopctl.Knowledge do
 
       %{
         verdict: :created | :gated_to_draft | :skipped_low_novelty | :duplicate | :deduplicated,
-        article: %Article{},        # the created article, or the canonical existing one
-        created: boolean(),         # false for :duplicate / :deduplicated
+        article: %Article{} | nil,  # the created article, or the canonical existing one;
+                                    # nil only for :skipped_low_novelty (neighbor vanished)
+        created: boolean(),         # false for :duplicate / :deduplicated / :skipped_low_novelty
         assessment: %{verdict:, score:, neighbors:}
       }
 
@@ -461,38 +467,29 @@ defmodule Loopctl.Knowledge do
         {:ok, %{verdict: :duplicate, article: existing, created: false, assessment: assessment}}
 
       # The canonical neighbor vanished (deleted/unpublished) between assess and now —
-      # there is nothing to dedup against, so create on the normal path.
+      # there is nothing to dedup against, so create on the normal path. EXCEPT under
+      # `on_low_novelty: :skip`: `:duplicate` is the higher-overlap band, so creating
+      # here would publish for a caller that opted out of creating at LESS overlap —
+      # inverting the option's own contract on the rarer, harder-to-notice branch.
       :error ->
-        create_proposal(tenant_id, attrs, %{assessment | verdict: :novel}, opts, :created)
+        if Keyword.get(opts, :on_low_novelty, :draft) == :skip do
+          skip_low_novelty(tenant_id, attrs, assessment, opts)
+        else
+          create_proposal(tenant_id, attrs, %{assessment | verdict: :novel}, opts, :created)
+        end
     end
   end
 
   defp gate_proposal(tenant_id, attrs, %{verdict: :low_novelty} = assessment, opts) do
-    neighbor = List.first(assessment.neighbors)
-
-    # `on_low_novelty: :skip` (default `:draft`) — create NOTHING for a high-overlap
-    # proposal, mirroring `on_gate_unavailable: :skip` above. The default drafts it so a
-    # human or a smarter agent can resolve merge-vs-keep from the drafts queue; but an
-    # UNATTENDED writer (session capture) has no such reviewer, so its drafts accumulate
-    # as invisible corpus debris that nothing ever resolves. Such a caller would rather
-    # drop the near-duplicate than bank it — the knowledge is by definition already in the
-    # corpus, and the neighbour is returned so the drop can be counted and attributed.
     if Keyword.get(opts, :on_low_novelty, :draft) == :skip do
-      log_gate(tenant_id, "gate_skip", "skipped (high overlap)", neighbor, assessment, opts)
-
-      {:ok,
-       %{
-         verdict: :skipped_low_novelty,
-         article: skipped_neighbor(tenant_id, assessment, opts),
-         created: false,
-         assessment: assessment
-       }}
+      skip_low_novelty(tenant_id, attrs, assessment, opts)
     else
       gated_attrs =
         attrs
         |> Map.put("status", "draft")
         |> stamp_proposal_metadata(assessment)
 
+      neighbor = List.first(assessment.neighbors)
       log_gate(tenant_id, "gate_draft", "drafted (high overlap)", neighbor, assessment, opts)
       create_proposal(tenant_id, gated_attrs, assessment, opts, :gated_to_draft)
     end
@@ -515,6 +512,103 @@ defmodule Loopctl.Knowledge do
   # :novel — the gate assessed the proposal as genuinely new; create on the requested path.
   defp gate_proposal(tenant_id, attrs, assessment, opts) do
     create_proposal(tenant_id, attrs, assessment, opts, :created)
+  end
+
+  # `on_low_novelty: :skip` (default `:draft`) — create NOTHING for a high-overlap
+  # proposal, mirroring `on_gate_unavailable: :skip` above. The default drafts it so a
+  # human or a smarter agent can resolve merge-vs-keep from the drafts queue; but an
+  # UNATTENDED writer (session capture) has no such reviewer, so its drafts accumulate
+  # as invisible corpus debris that nothing ever resolves. Such a caller would rather
+  # drop the near-duplicate than bank it — the knowledge is by definition already in the
+  # corpus, and the neighbour is returned so the drop can be counted and attributed.
+  #
+  # The drop is decided LAST, after EVERY check `create_article/3` resolves ahead of its
+  # insert — project ownership, the idempotency-key identity, the full create changeset,
+  # then the active-title identity, in that order and against the SAME
+  # `effective_tenant_id` (nil for system scope) — so opting into skip never converts a
+  # caller ERROR into a success-shaped no-op: an invalid/foreign `project_id`, an
+  # over-long title, an unknown category/source_type or an oversized body still answers
+  # the same 422 it would answer without the flag. A proposal naming an existing row BY
+  # IDENTITY is answered FROM THAT ROW — `:deduplicated`, or `:duplicate_title` so the
+  # client can retry with a disambiguated title — and never re-enters the insert path, so
+  # no vanishing-row race can turn an opted-out proposal into a published article.
+  defp skip_low_novelty(tenant_id, attrs, assessment, opts) do
+    eff_tenant_id = effective_tenant_id(tenant_id, attrs)
+    vis = Keyword.get(opts, :visibility_agent_id)
+
+    with :ok <- validate_project_ownership(tenant_id, attrs["project_id"]),
+         nil <-
+           get_article_by_idempotency_key(eff_tenant_id, idempotency_key_from_attrs(attrs), vis),
+         %{valid?: true} <- Article.create_changeset(%Article{tenant_id: eff_tenant_id}, attrs),
+         nil <- title_identity(eff_tenant_id, attrs, vis) do
+      drop_proposal(tenant_id, attrs, assessment, opts)
+    else
+      {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
+      %Ecto.Changeset{} = changeset -> {:error, changeset}
+      {:duplicate_title, existing} -> {:error, :duplicate_title, existing}
+      # An idempotency_key match is the identity REGARDLESS of body (the key IS the
+      # identity), exactly as on the create path.
+      %Article{} = existing -> deduplicated_result(existing, assessment)
+    end
+  end
+
+  # The same identity `create_article/3` resolves from its insert's unique violation: an
+  # identical body is the idempotent no-op, a different one the 409 the client must
+  # disambiguate.
+  defp title_identity(tenant_id, attrs, vis) do
+    case get_active_article_by_title(tenant_id, attrs["title"], vis) do
+      %Article{} = existing ->
+        if same_content?(existing, attrs), do: existing, else: {:duplicate_title, existing}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp deduplicated_result(existing, assessment),
+    do:
+      {:ok, %{verdict: :deduplicated, article: existing, created: false, assessment: assessment}}
+
+  defp drop_proposal(tenant_id, attrs, assessment, opts) do
+    # Resolved ONCE: the curation-log ref, the returned article and the `nearest` the
+    # caller renders from the assessment must all name rows that still exist, or the
+    # audit trail and the API answer disagree about the same drop.
+    resolved = resolve_neighbors(tenant_id, assessment, opts)
+
+    neighbor =
+      case resolved do
+        [{_raw, article} | _] -> article
+        [] -> nil
+      end
+
+    assessment = Map.put(assessment, :neighbors, Enum.map(resolved, &elem(&1, 0)))
+    log_gate(tenant_id, "gate_skip", "skipped (high overlap)", neighbor, assessment, opts)
+
+    # The ONLY per-drop record that does not depend on the tenant's optional
+    # kb_curation_log: the content is destroyed here, so "where did my capture go?"
+    # must be answerable from the logs alone. The aggregate is the
+    # `:skipped_low_novelty` write-stats counter the controller emits. The title is
+    # truncated: a log line is not a content store, and it is attacker-supplied.
+    Logger.info(
+      "kb gate skipped low-novelty proposal tenant=#{inspect(tenant_id)} " <>
+        "title=#{inspect(String.slice(to_string(attrs["title"]), 0, 200))} " <>
+        "neighbor=#{inspect(neighbor && neighbor.id)} score=#{inspect(assessment.score)}"
+    )
+
+    {:ok,
+     %{
+       verdict: :skipped_low_novelty,
+       article: neighbor,
+       created: false,
+       assessment: assessment
+     }}
+  end
+
+  # System articles have no tenant — identity, uniqueness and dedup all resolve against
+  # NULL, so every path mirroring `create_article/3` must resolve against THIS, not the
+  # caller's tenant_id, or the two disagree about what already exists.
+  defp effective_tenant_id(tenant_id, attrs) do
+    if (attrs[:scope] || attrs["scope"]) in [:system, "system"], do: nil, else: tenant_id
   end
 
   defp create_proposal(tenant_id, attrs, assessment, opts, verdict) do
@@ -575,15 +669,21 @@ defmodule Loopctl.Knowledge do
 
   defp canonical_neighbor(_tenant_id, _assessment, _opts), do: :error
 
-  # The near-neighbour a `:skipped_low_novelty` proposal was dropped in favour of, so the
-  # caller can attribute the drop. Unlike the `:duplicate` path this is advisory only — a
-  # neighbour that vanished between assess and now yields `nil` rather than falling back to
-  # creating, because the caller explicitly asked never to create on high overlap.
-  defp skipped_neighbor(tenant_id, assessment, opts) do
-    case canonical_neighbor(tenant_id, assessment, opts) do
-      {:ok, article} -> article
-      :error -> nil
-    end
+  # The near-neighbours a `:skipped_low_novelty` proposal was dropped in favour of, paired
+  # with the rows they still resolve to. Unlike the `:duplicate` path this is advisory
+  # only — a neighbour archived/deleted between assess and now is dropped rather than
+  # falling back to creating, because the caller explicitly asked never to create on high
+  # overlap. Only the VANISHED ones are dropped (not the whole list), so a skip stays as
+  # attributable as a `gated_to_draft` for the same assessment.
+  defp resolve_neighbors(tenant_id, assessment, opts) do
+    vis = Keyword.take(opts, [:visibility_agent_id])
+
+    Enum.flat_map(Map.get(assessment, :neighbors) || [], fn neighbor ->
+      case get_article(tenant_id, neighbor.id, vis) do
+        {:ok, article} -> [{neighbor, article}]
+        _ -> []
+      end
+    end)
   end
 
   defp stamp_proposal_metadata(attrs, %{score: score, neighbors: neighbors}) do
