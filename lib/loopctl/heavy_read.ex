@@ -403,8 +403,23 @@ defmodule Loopctl.HeavyRead do
     Map.get(@hnsw_iterative_scan_modes, iterative_scan_code(), "off")
   end
 
+  # The SystemConfig row stays the operator's live, no-redeploy lever; the compiled-in
+  # fallback is what applies when no operator has set one. That fallback is config-based DI
+  # (`:hnsw_iterative_scan_default`) rather than a hard-coded 0 so an ENVIRONMENT can start
+  # from a different baseline without any test writing VM-global state per test.
+  #
+  # `config/test.exs` starts the test env at relaxed_order for a REAL reason: the ANN applies
+  # `tenant_id` as a POST-index residual over a cross-tenant index, so a tenant whose rows
+  # fall outside the global top-`ef_search` is silently under-returned — which is what
+  # produced the intermittent empty result sets in the side-table read-path tests. Prod runs
+  # with iterative scan ON (#488), so this makes the suite match production rather than
+  # asserting against a configuration nothing actually runs.
   defp iterative_scan_code do
-    Loopctl.SystemConfig.get_int("hnsw_iterative_scan", @default_hnsw_iterative_scan)
+    Loopctl.SystemConfig.get_int("hnsw_iterative_scan", default_iterative_scan_code())
+  end
+
+  defp default_iterative_scan_code do
+    Application.get_env(:loopctl, :hnsw_iterative_scan_default, @default_hnsw_iterative_scan)
   end
 
   @doc """
@@ -771,12 +786,75 @@ defmodule Loopctl.HeavyRead do
   # public `transaction/2` SET LOCAL, but pinned to the caller-resolved read repo so a
   # primary-pinned read (US-38.1) both times AND executes on the primary.
   defp run_timed_transaction(read_repo, ms, ef, iter, fun) do
+    # NESTED-CALL LEAK (the fix for the long-running embedding-test flake). `SET LOCAL` is
+    # scoped to the TOP-LEVEL transaction, not to a savepoint. When this read is already
+    # inside an enclosing transaction, `read_repo.transaction/1` opens a SAVEPOINT — and a
+    # savepoint that COMMITS leaves our `SET LOCAL statement_timeout` applied to the rest of
+    # the enclosing transaction. Every later statement there (a plain INSERT, an inline-Oban
+    # write, another ANN read) then silently inherits this read's aggressive deadline and
+    # 57014s under load, far from the heavy read that set it.
+    #
+    # That is not a test-only hazard, but it is where it bites hardest: under
+    # `Ecto.Adapters.SQL.Sandbox` EVERY heavy read is nested inside the test's transaction,
+    # so with a 250ms pool default (config/test.exs) one successful heavy read armed a 250ms
+    # deadline over the remainder of the test. It produced `query_canceled` on unrelated
+    # inserts and empty ANN result sets that read as a pgvector recall bug, and four
+    # successive "recall" fixes (ef_search raise, exact scan, iterative_scan, retry-on-empty)
+    # were aimed at that misreading. Restoring on the way out is what actually closes it.
+    #
+    # Only the SUCCESS path needs restoring: if `fun` raises, the savepoint ROLLS BACK and
+    # Postgres restores the GUCs with it. When NOT nested (production: no enclosing
+    # transaction) the COMMIT resets them anyway, so this costs zero extra round trips there.
+    restore? = read_repo.in_transaction?()
+    prior = if restore?, do: capture_guc_state(read_repo, ef, iter), else: nil
+
     read_repo.transaction(fn ->
       read_repo.query!("SET LOCAL statement_timeout = #{ms}")
       maybe_set_ef_search(read_repo, ef)
       maybe_set_iterative_scan(read_repo, iter)
-      fun.()
+      result = fun.()
+      if restore?, do: restore_guc_state(read_repo, prior)
+      result
     end)
+  end
+
+  # Read back exactly the GUCs this read is about to `SET LOCAL`, so they can be put back
+  # verbatim. The pgvector GUCs are only probed when this read actually sets them — a
+  # `SHOW hnsw.ef_search` against a backend that has never loaded pgvector would itself
+  # raise, and a non-ANN read must not pay for (or fail on) a knob it never touches.
+  defp capture_guc_state(read_repo, ef, iter) do
+    %{
+      statement_timeout: show_guc(read_repo, "statement_timeout"),
+      ef_search: if(is_integer(ef), do: show_guc(read_repo, "hnsw.ef_search")),
+      iterative_scan: if(is_binary(iter), do: show_guc(read_repo, "hnsw.iterative_scan")),
+      max_scan_tuples: if(is_binary(iter), do: show_guc(read_repo, "hnsw.max_scan_tuples"))
+    }
+  end
+
+  defp show_guc(read_repo, name) do
+    case read_repo.query!("SHOW #{name}") do
+      %{rows: [[value]]} -> value
+      _ -> nil
+    end
+  end
+
+  # Restore via `SET LOCAL` (not `RESET`): RESET would drop to the session/role default and
+  # so would CLOBBER a deliberate outer `SET LOCAL` — e.g. a caller that wrapped several
+  # reads in one transaction under its own deadline. Values come from `SHOW`, i.e. Postgres'
+  # own rendering of a GUC it accepted, and are quoted as literals.
+  defp restore_guc_state(read_repo, prior) do
+    put_guc(read_repo, "statement_timeout", prior.statement_timeout)
+    put_guc(read_repo, "hnsw.ef_search", prior.ef_search)
+    put_guc(read_repo, "hnsw.iterative_scan", prior.iterative_scan)
+    put_guc(read_repo, "hnsw.max_scan_tuples", prior.max_scan_tuples)
+    :ok
+  end
+
+  defp put_guc(_read_repo, _name, nil), do: :ok
+
+  defp put_guc(read_repo, name, value) do
+    read_repo.query!("SET LOCAL #{name} = '#{value}'")
+    :ok
   end
 
   # `SET LOCAL hnsw.ef_search = N` for an ANN read (US-38.4). Only fired when the caller
