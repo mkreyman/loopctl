@@ -10,6 +10,7 @@ defmodule Loopctl.MixProject do
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps(),
+      usage_rules: usage_rules(),
       escript: escript(),
       releases: releases(),
       listeners: [Phoenix.CodeReloader],
@@ -154,7 +155,31 @@ defmodule Loopctl.MixProject do
       {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
 
       # Dev tooling — runtime introspection MCP (dev-only; mounts /tidewave/mcp)
-      {:tidewave, "~> 0.6", only: :dev}
+      {:tidewave, "~> 0.6", only: :dev},
+
+      # Keeps the managed block in AGENTS.md in sync with the usage-rules our
+      # dependencies actually ship. That block was written once by phx.new and
+      # then froze. Dev-only — never ships.
+      {:usage_rules, "~> 1.1", only: :dev, runtime: false}
+    ]
+  end
+
+  # Which dependency usage-rules get synced into AGENTS.md, and how.
+  #
+  # INLINE rather than `link:` on purpose. Claude Code hardcodes AGENTS.md
+  # discovery, so this content is already loaded into every session and every
+  # subagent — linking would save context but only by making the rules
+  # conditional on an agent choosing to go read them. These are the "what the
+  # model gets wrong" rules; they are the last thing to make optional.
+  #
+  # NOTE: `mix usage_rules.sync` owns everything between the
+  # usage-rules-start/end markers and rewrites that region wholesale. Never put
+  # hand-written content inside it — in cron_books a hand-written migration-safety
+  # section had been placed there and the first sync silently deleted it.
+  defp usage_rules do
+    [
+      file: "AGENTS.md",
+      usage_rules: [:usage_rules, :phoenix]
     ]
   end
 
