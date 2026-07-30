@@ -452,6 +452,26 @@ defmodule Loopctl.HeavyReadTest do
     end
   end
 
+  # A repo whose round trip EXITS, which is how DBConnection/Postgrex report a pool that
+  # is not started (`:noproc`) or wedged — they do not raise, so a `rescue` alone misses
+  # them and the exit escapes `scoped/3`'s `after`.
+  defmodule ExitingRepo do
+    def query!(_sql, _params \\ []), do: exit(:noproc)
+  end
+
+  describe "LocalGuc best-effort bookkeeping" do
+    test "capture degrades to [] instead of aborting the caller's read" do
+      assert Loopctl.LocalGuc.capture(ExitingRepo, ["statement_timeout"]) == []
+    end
+
+    test "restore swallows an exit, so it cannot destroy a successful result" do
+      assert Loopctl.LocalGuc.restore(ExitingRepo, [{"statement_timeout", "1234ms"}]) == :ok
+
+      assert Loopctl.LocalGuc.scoped(ExitingRepo, ["statement_timeout"], fn -> :the_result end) ==
+               :the_result
+    end
+  end
+
   defp show_statement_timeout(repo) do
     %{rows: [[value]]} = repo.query!("SHOW statement_timeout")
     value

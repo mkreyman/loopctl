@@ -37,8 +37,17 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   nested in the test's transaction, so one successful read left its 250ms
   `statement_timeout` armed over the REST of the test — cancelling unrelated statements
   later (a plain `INSERT INTO audit_log` 57014'd) and blanking result sets far from the
-  read that set it. Fixed in `Loopctl.LocalGuc`, which `HeavyRead` now routes every
+  read that set it. Closed in `Loopctl.LocalGuc`, which `HeavyRead` now routes every
   per-read `SET LOCAL` through.
+
+  That leak was real but was NOT the whole story: a 30-run loop on the post-fix tree
+  still reproduced `left: []` here once. The residual mechanism is candidate-slot
+  starvation — at the default `limit: 10` the index-ordered ANN can spend its slots on
+  rows a post-ANN filter then discards — which is why every ranking assertion in this
+  file passes a page wider than its candidate set. Treat a recurrence as a MISSING
+  `limit:`, not as an invitation to a fifth pgvector-recall fix: `hnsw.ef_search`,
+  exact scan, `hnsw.iterative_scan` and retry-on-empty have each been tried and each
+  regressed something else.
 
   The cross-tenant residual filter (the ANN applies `tenant_id` AFTER the index returns
   its top-`ef_search` batch) is a real, SEPARATE production concern, and `hnsw.iterative_scan`
@@ -234,8 +243,16 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
       enable_side_table_reads()
 
+      # `limit: 50` for the reason spelled out on "ranks by similarity ..." above, and it
+      # matters MORE here than there: this is the one test whose filter is applied AFTER
+      # the index-ordered ANN, so any candidate slot the default `limit: 10` spends on a
+      # row that the `category` filter then discards is a slot the pattern row needed.
+      # That yields `left: []` — the exact recorded signature of this file's flake.
       assert {:ok, %{results: results}} =
-               Knowledge.search_semantic(tenant.id, vec(1536, :query), category: :pattern)
+               Knowledge.search_semantic(tenant.id, vec(1536, :query),
+                 category: :pattern,
+                 limit: 50
+               )
 
       assert Enum.map(results, & &1.id) == [pattern.id]
     end
