@@ -26,7 +26,7 @@ never pass `tenant_id`/`subject_id`.
 ## Invariants (cited)
 
 1. **Novelty / dedup gate on create** — `Knowledge.propose_article/3` → the private `gate_proposal/4`
-   (`propose_article/3` at `knowledge.ex:441`; the four `gate_proposal/4` clauses at `:451-492`).
+   (`propose_article/3` at `knowledge.ex:447`; the four `gate_proposal/4` clauses at `:457-518`).
    **FIVE outcomes, not four** — `:duplicate`, `:low_novelty`, `:unknown`, `:novel`, and
    `:deduplicated` (`created: false`, returned when `create_article` hits the idempotency-key path,
    `knowledge.ex:507-508`). A caller matching only the first four falls through on a reachable
@@ -39,7 +39,7 @@ never pass `tenant_id`/`subject_id`.
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
    created (`:481-487`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:447-449`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8193`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8228`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
    (`absolute_score/1`, `:8320-8325`) clears a scale-matched threshold AND beats the best retrieved
    candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8297-8307`; the pure decision is

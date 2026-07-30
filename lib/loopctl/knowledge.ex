@@ -410,7 +410,11 @@ defmodule Loopctl.Knowledge do
     * `:low_novelty` — high overlap with existing knowledge. The article is created
       as a **draft** (downgraded from publish if needed) with the near-neighbors
       stamped into `metadata.proposal_novelty`, so the smarter consuming agent (or a
-      human) resolves merge-vs-keep from the drafts review queue.
+      human) resolves merge-vs-keep from the drafts review queue. Pass
+      `on_low_novelty: :skip` to create **nothing** instead — for an UNATTENDED writer
+      with no reviewer behind it, whose drafts would otherwise pile up as corpus debris.
+      The verdict is then `:skipped_low_novelty` with the near-neighbor in `:article`
+      (or `nil` if it vanished), and `created: false`.
     * `:novel` / `:unknown` (gate fell open) — created on the requested path.
 
   The gate is mechanical and non-destructive: it never edits or deletes existing
@@ -426,7 +430,7 @@ defmodule Loopctl.Knowledge do
   Returns `{:ok, result}` where `result` is a map:
 
       %{
-        verdict: :created | :gated_to_draft | :duplicate | :deduplicated,
+        verdict: :created | :gated_to_draft | :skipped_low_novelty | :duplicate | :deduplicated,
         article: %Article{},        # the created article, or the canonical existing one
         created: boolean(),         # false for :duplicate / :deduplicated
         assessment: %{verdict:, score:, neighbors:}
@@ -464,14 +468,34 @@ defmodule Loopctl.Knowledge do
   end
 
   defp gate_proposal(tenant_id, attrs, %{verdict: :low_novelty} = assessment, opts) do
-    gated_attrs =
-      attrs
-      |> Map.put("status", "draft")
-      |> stamp_proposal_metadata(assessment)
-
     neighbor = List.first(assessment.neighbors)
-    log_gate(tenant_id, "gate_draft", "drafted (high overlap)", neighbor, assessment, opts)
-    create_proposal(tenant_id, gated_attrs, assessment, opts, :gated_to_draft)
+
+    # `on_low_novelty: :skip` (default `:draft`) — create NOTHING for a high-overlap
+    # proposal, mirroring `on_gate_unavailable: :skip` above. The default drafts it so a
+    # human or a smarter agent can resolve merge-vs-keep from the drafts queue; but an
+    # UNATTENDED writer (session capture) has no such reviewer, so its drafts accumulate
+    # as invisible corpus debris that nothing ever resolves. Such a caller would rather
+    # drop the near-duplicate than bank it — the knowledge is by definition already in the
+    # corpus, and the neighbour is returned so the drop can be counted and attributed.
+    if Keyword.get(opts, :on_low_novelty, :draft) == :skip do
+      log_gate(tenant_id, "gate_skip", "skipped (high overlap)", neighbor, assessment, opts)
+
+      {:ok,
+       %{
+         verdict: :skipped_low_novelty,
+         article: skipped_neighbor(tenant_id, assessment, opts),
+         created: false,
+         assessment: assessment
+       }}
+    else
+      gated_attrs =
+        attrs
+        |> Map.put("status", "draft")
+        |> stamp_proposal_metadata(assessment)
+
+      log_gate(tenant_id, "gate_draft", "drafted (high overlap)", neighbor, assessment, opts)
+      create_proposal(tenant_id, gated_attrs, assessment, opts, :gated_to_draft)
+    end
   end
 
   # :unknown — the gate FELL OPEN (embedding backend unavailable; it could not actually
@@ -550,6 +574,17 @@ defmodule Loopctl.Knowledge do
   end
 
   defp canonical_neighbor(_tenant_id, _assessment, _opts), do: :error
+
+  # The near-neighbour a `:skipped_low_novelty` proposal was dropped in favour of, so the
+  # caller can attribute the drop. Unlike the `:duplicate` path this is advisory only — a
+  # neighbour that vanished between assess and now yields `nil` rather than falling back to
+  # creating, because the caller explicitly asked never to create on high overlap.
+  defp skipped_neighbor(tenant_id, assessment, opts) do
+    case canonical_neighbor(tenant_id, assessment, opts) do
+      {:ok, article} -> article
+      :error -> nil
+    end
+  end
 
   defp stamp_proposal_metadata(attrs, %{score: score, neighbors: neighbors}) do
     existing = stringify_top_keys(attrs["metadata"] || %{})
