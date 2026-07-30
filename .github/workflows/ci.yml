@@ -773,8 +773,10 @@ jobs:
 
       # The disposable service container used to make cleanup free. On a long-lived
       # Postgres it is mandatory: each of these databases holds an ~80k-article
-      # prod-floor corpus with its vectors and HNSW index, measured at roughly 850 MB, so
-      # 14 of them left behind would add ~12 GB to the box EVERY NIGHT until it filled.
+      # prod-floor corpus with its vectors and HNSW index. Observed live during the first
+      # beelink run: 1345 MB for remediation_matrix alone (they vary widely — the
+      # calibration file needs only ~14 MB). A full matrix left un-dropped is therefore
+      # on the order of 10 GB added to the box EVERY NIGHT until it filled.
       #
       # `if: always()` so a failed or cancelled gate still reclaims its space — an
       # abandoned corpus is exactly what a timed-out 40-minute seed leaves behind.
