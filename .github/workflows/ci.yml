@@ -15,15 +15,6 @@ on:
 
 env:
   MIX_ENV: test
-  # SELF-HOSTED RUNNER (beelink). erlef/setup-beam picks its precompiled OTP
-  # tarball by reading ImageOS; GitHub's hosted images export it and a
-  # self-hosted runner does not, so without it setup-beam fails instantly with
-  # "Tried to map a target OS from env. variable 'ImageOS' (got undefined)".
-  # beelink is Ubuntu 26.04 — bump on OS upgrade. Harmless on hosted jobs.
-  ImageOS: ubuntu26
-  # /tmp on beelink is a 14 GB tmpfs; native binaries that self-extract into
-  # TMPDIR fail confusingly when it fills.
-  TMPDIR: /home/github-runner/.tmpbuild
   ELIXIR_VERSION: "1.19.5"
   # OTP 28.5.0.2 (latest 28.x). Hex 2.5.0 calls :re.import/2, which only exists on
   # OTP >= 28.1; on the previous pin (28.0) `mix deps.get` crashed with an :undef
@@ -35,10 +26,6 @@ env:
 # SELF-HOSTED SPLIT (beelink). lint / test / security / dialyzer moved; the rest
 # stay on ubuntu-latest for specific reasons, not by omission:
 #
-#   retrieval-eval  MIX_ENV=dev, and config/dev.exs hardcodes `loopctl_dev` with
-#                   no env override. On beelink that is the DEVELOPER'S live local
-#                   dev database (it exists). Moving this job would point CI at it.
-#                   Needs a dev-DB name override before it can move.
 #   pgbouncer-e2e   Needs a pgbouncer service container in front of Postgres;
 #                   the port topology has to be reworked for a shared host DB.
 #   scale-test      Schedule/dispatch-gated prod-floor HNSW checks. Rare, heavy,
@@ -173,7 +160,7 @@ jobs:
 
   retrieval-eval:
     name: Retrieval Eval
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     # MIX_ENV=dev on purpose (the workflow-level default is test): `mix
     # loopctl.retrieval.eval` opens its OWN DB connections, and config/test.exs puts all
     # three repos behind Ecto.Adapters.SQL.Sandbox, where a non-checked-out process has no
@@ -181,21 +168,10 @@ jobs:
     # the task in, so CI exercises the real invocation.
     env:
       MIX_ENV: dev
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: loopctl_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
+    # No services block: beelink's Postgres already publishes 5432 and has
+    # pgvector 0.8.2 available, so a service container could not bind that port
+    # and is not needed. MIX_ENV=dev here resolves to loopctl_dev, which Mark
+    # confirmed is disposable on beelink.
     steps:
       - uses: actions/checkout@v4
 
