@@ -510,6 +510,48 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert Loopctl.Repo.aggregate(Loopctl.Knowledge.Article, :count) == before
     end
 
+    test "a mis-spelled on_low_novelty is rejected, not defaulted to draft", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      before = Loopctl.Repo.aggregate(Loopctl.Knowledge.Article, :count)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Typo in the opt-out",
+          "body" => "Body.",
+          "category" => "finding",
+          "on_low_novelty" => "Skip"
+        })
+
+      # Silently defaulting an unrecognised value to draft banks exactly the drafts the
+      # caller was trying to opt out of, behind a 201 that reads as success.
+      assert json_response(conn, 422)["error"]["message"] =~ "on_low_novelty"
+      assert Loopctl.Repo.aggregate(Loopctl.Knowledge.Article, :count) == before
+    end
+
+    test "force + skip_low_novelty is rejected instead of silently publishing", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      before = Loopctl.Repo.aggregate(Loopctl.Knowledge.Article, :count)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Contradictory flags",
+          "body" => "Body.",
+          "category" => "finding",
+          "force" => true,
+          "skip_low_novelty" => true
+        })
+
+      assert json_response(conn, 422)["error"]["message"] =~ "mutually exclusive"
+      # force would have PUBLISHED the near-duplicate the skip flag asked never to create.
+      assert Loopctl.Repo.aggregate(Loopctl.Knowledge.Article, :count) == before
+    end
+
     test "force: true bypasses the gate and publishes", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

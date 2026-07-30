@@ -156,17 +156,127 @@ defmodule Loopctl.Knowledge.ProposeArticleTest do
       tenant: tenant
     } do
       # Same shape as the :duplicate path's ghost test — an id that no longer resolves.
-      ghost = %{id: Ecto.UUID.generate(), title: "Ghost"}
-      assessor(:low_novelty, [%{id: ghost.id, title: ghost.title, similarity_score: 0.93}], 0.93)
+      ghost = %{id: Ecto.UUID.generate(), title: "Ghost", similarity_score: 0.93}
+      live = fixture(:article, %{tenant_id: tenant.id, title: "Survivor", status: :published})
+      assessor(:low_novelty, [ghost, neighbor(live, 0.9)], 0.93)
       before = count_articles(tenant.id)
 
       # Unlike the :duplicate path, a vanished neighbor must NOT fall back to creating —
       # the caller asked never to create on high overlap.
-      assert {:ok, %{verdict: :skipped_low_novelty, created: false, article: nil}} =
+      assert {:ok, %{verdict: :skipped_low_novelty, created: false} = result} =
                Knowledge.propose_article(
                  tenant.id,
                  %{
                    "title" => "Still skipped",
+                   "body" => "Body.",
+                   "category" => "finding",
+                   "status" => "published"
+                 },
+                 on_low_novelty: :skip
+               )
+
+      # Only the VANISHED neighbor is dropped: the drop stays attributable to the ones
+      # the caller can still fetch.
+      assert result.article.id == live.id
+      assert Enum.map(result.assessment.neighbors, & &1.id) == [live.id]
+      assert count_articles(tenant.id) == before
+    end
+
+    test "on_low_novelty: :skip still honours an idempotency_key match", %{tenant: tenant} do
+      existing =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Banked earlier",
+          status: :published,
+          idempotency_key: "capture-42"
+        })
+
+      assessor(:low_novelty, [neighbor(existing, 0.93)], 0.93)
+
+      attrs = %{
+        "title" => "Banked earlier (retry)",
+        "body" => "Body.",
+        "category" => "finding",
+        "idempotency_key" => "capture-42"
+      }
+
+      # A retry must still get its OWN article id back, not be dropped against it.
+      assert {:ok, %{verdict: :deduplicated, created: false, article: %{id: id}}} =
+               Knowledge.propose_article(tenant.id, attrs, on_low_novelty: :skip)
+
+      assert id == existing.id
+    end
+
+    test "on_low_novelty: :skip errors on a foreign project_id instead of reporting a skip", %{
+      tenant: tenant
+    } do
+      assessor(:low_novelty, [], 0.93)
+
+      attrs = %{
+        "title" => "Misconfigured writer",
+        "body" => "Body.",
+        "category" => "finding",
+        "project_id" => Ecto.UUID.generate()
+      }
+
+      assert {:error, %Ecto.Changeset{errors: [project_id: _]}} =
+               Knowledge.propose_article(tenant.id, attrs, on_low_novelty: :skip)
+    end
+
+    test "on_low_novelty: :skip errors on an invalid payload instead of reporting a skip", %{
+      tenant: tenant
+    } do
+      assessor(:low_novelty, [], 0.93)
+
+      attrs = %{
+        "title" => "Misconfigured writer",
+        "body" => "Body.",
+        "source_type" => "session-capture"
+      }
+
+      # A permanently broken writer must learn its payloads are invalid — a 422, not a
+      # success-shaped drop it would read as a healthy pipeline forever.
+      assert {:error, %Ecto.Changeset{valid?: false} = changeset} =
+               Knowledge.propose_article(tenant.id, attrs, on_low_novelty: :skip)
+
+      assert Keyword.has_key?(changeset.errors, :category)
+      assert Keyword.has_key?(changeset.errors, :source_type)
+    end
+
+    test "on_low_novelty: :skip answers an exact active-title collision, never a drop", %{
+      tenant: tenant
+    } do
+      existing =
+        fixture(:article, %{tenant_id: tenant.id, title: "Taken title", status: :published})
+
+      assessor(:low_novelty, [neighbor(existing, 0.93)], 0.93)
+
+      attrs = %{
+        "title" => "Taken title",
+        "body" => "A different body entirely.",
+        "category" => "finding"
+      }
+
+      # 409, so the client can retry with a disambiguated title — the same answer it
+      # would get without the flag.
+      assert {:error, :duplicate_title, %{id: id}} =
+               Knowledge.propose_article(tenant.id, attrs, on_low_novelty: :skip)
+
+      assert id == existing.id
+    end
+
+    test "on_low_novelty: :skip drops a :duplicate whose neighbor vanished", %{tenant: tenant} do
+      ghost_id = Ecto.UUID.generate()
+      assessor(:duplicate, [%{id: ghost_id, title: "Ghost", similarity_score: 0.99}], 0.99)
+      before = count_articles(tenant.id)
+
+      # :duplicate is the HIGHER-overlap band, so a vanished canonical must not fall back
+      # to creating for a caller that opted out of creating at LESS overlap.
+      assert {:ok, %{verdict: :skipped_low_novelty, created: false, article: nil}} =
+               Knowledge.propose_article(
+                 tenant.id,
+                 %{
+                   "title" => "Would have been published",
                    "body" => "Body.",
                    "category" => "finding",
                    "status" => "published"

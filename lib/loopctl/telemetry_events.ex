@@ -279,8 +279,8 @@ defmodule Loopctl.TelemetryEvents do
   @doc """
   A KB article WRITE OUTCOME was rendered (PR B2). Emitted from EVERY outcome path of
   `LoopctlWeb.ArticleController.create` — both the create-path renderers (created,
-  deduplicated, gated_to_draft, title_conflict, validation_error) AND the upfront
-  rejection paths that return before a create is attempted (system-scope 403 and
+  deduplicated, gated_to_draft, skipped_low_novelty, title_conflict, validation_error) AND the
+  upfront rejection paths that return before a create is attempted (system-scope 403 and
   agent-identity-required 403 counted as `:forbidden` — excluded from the
   high_reject_rate detector; malformed project_id 422 as `:validation_error`) — so
   write outcomes are observable even when NOTHING is
@@ -299,7 +299,10 @@ defmodule Loopctl.TelemetryEvents do
       `nil`, i.e. the unstamped bucket, so rollup cardinality stays bounded), and
       `outcome` is a BOUNDED atom: `:created` (novel/forced create), `:deduplicated`
       (200 idempotent/near-dup dedup), `:gated_to_draft` (novelty gate staged a
-      draft), `:title_conflict` (409 title taken), `:validation_error`
+      draft), `:skipped_low_novelty` (novelty gate DISCARDED a high-overlap proposal
+      under `on_low_novelty: :skip` — no row and no article reference, so it is
+      counted apart from `:deduplicated` or a drop storm reads as a dedup-heavy day),
+      `:title_conflict` (409 title taken), `:validation_error`
       (changeset/other 4xx, including the upfront malformed-param 422), or `:forbidden`
       (upfront 403 authz rejection — wrong scope/role or missing agent identity;
       tracked separately and EXCLUDED from the high_reject_rate detector so authz

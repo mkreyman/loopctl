@@ -106,6 +106,19 @@ defmodule LoopctlWeb.ArticleController do
                  "source_id, which identify a shared source. Set at create time only " <>
                  "(ignored by PATCH); applies to tenant-scoped articles."
            },
+           skip_low_novelty: %OpenApiSpex.Schema{
+             type: :boolean,
+             description:
+               "Create NOTHING when the novelty gate finds high overlap, instead of " <>
+                 "staging a draft (default false). For an UNATTENDED writer with no " <>
+                 "reviewer behind it, whose gated drafts would pile up unresolved. The " <>
+                 "response is 200 with `data: null`, `skipped: true` and the gate " <>
+                 "metadata. Equivalent alias: on_low_novelty: \"skip\". Mutually " <>
+                 "exclusive with force (422) — force bypasses the gate entirely. An " <>
+                 "idempotency_key match or an exact title collision is still answered " <>
+                 "as a dedup/409, and an invalid payload still 422s — never dropped."
+           },
+           on_low_novelty: %OpenApiSpex.Schema{type: :string, enum: ["draft", "skip"]},
            metadata: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
          }
        }},
@@ -117,10 +130,13 @@ defmodule LoopctlWeb.ArticleController do
         {"System scope requested without superadmin role", "application/json",
          Schemas.ErrorResponse},
       200 =>
-        {"Idempotent dedup, returned unchanged with `deduplicated: true`: either an " <>
-           "active article with the same title and an identical body exists, OR an " <>
-           "article with the same `idempotency_key` exists (in which case a changed " <>
-           "title/body is NOT applied). The `note` says which.", "application/json",
+        {"Nothing was created. Either an idempotent dedup returned unchanged with " <>
+           "`deduplicated: true` (an active article with the same title and an " <>
+           "identical body exists, OR an article with the same `idempotency_key` " <>
+           "exists — in which case a changed title/body is NOT applied), or, with " <>
+           "`skip_low_novelty: true`, a high-overlap proposal DISCARDED with " <>
+           "`skipped: true` and `data: null` (no article reference — read `gate` and " <>
+           "`note` for the near-neighbour). The `note` says which.", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       409 =>
         {"Title taken by an article with different content", "application/json",
@@ -304,7 +320,7 @@ defmodule LoopctlWeb.ArticleController do
       # Validate project_id (path segment or JSON body) up front so a non-UUID
       # value returns a clean 422 instead of reaching validate_project_ownership/2
       # and raising Ecto.Query.CastError (500).
-      case ProjectId.validate(params["project_id"]) do
+      case validate_create_params(params, gate?) do
         :ok ->
           create_validated(conn, api_key, params, draft?, gate?)
 
@@ -315,6 +331,34 @@ defmodule LoopctlWeb.ArticleController do
           error
       end
     end
+  end
+
+  # Up-front request validation shared by both create routes. `force` bypasses the gate
+  # entirely (ungated `create_article/3` never reads `:on_low_novelty`), so combining it
+  # with `skip_low_novelty` would silently PUBLISH the near-duplicate the caller asked to
+  # never create — the exact outcome both flags exist to prevent. Reject the pair instead
+  # of picking a winner: only the caller knows which one it meant.
+  defp validate_create_params(params, gate?) do
+    cond do
+      not valid_low_novelty_opt?(params) ->
+        {:error, :unprocessable_entity,
+         "on_low_novelty must be draft or skip, and skip_low_novelty must be a boolean. " <>
+           "A value that is neither is a typo, and defaulting it to draft would bank " <>
+           "exactly the drafts the caller asked never to create."}
+
+      not gate? and skip_low_novelty?(params) ->
+        {:error, :unprocessable_entity,
+         "force and skip_low_novelty are mutually exclusive: force bypasses the novelty " <>
+           "gate, so there is no overlap decision left to skip. Send one, not both."}
+
+      true ->
+        ProjectId.validate(params["project_id"])
+    end
+  end
+
+  defp valid_low_novelty_opt?(params) do
+    params["on_low_novelty"] in [nil, "", "draft", "skip"] and
+      params["skip_low_novelty"] in [nil, "", true, false, "true", "false"]
   end
 
   defp create_validated(conn, api_key, params, draft?, gate?) do
@@ -406,11 +450,11 @@ defmodule LoopctlWeb.ArticleController do
   # `Knowledge.propose_article/3`. Accepted as a request field so the DEFAULT stays
   # draft-and-review for interactive callers.
   defp low_novelty_opts(attrs) do
-    if truthy?(attrs["skip_low_novelty"]) or attrs["on_low_novelty"] == "skip" do
-      [on_low_novelty: :skip]
-    else
-      []
-    end
+    if skip_low_novelty?(attrs), do: [on_low_novelty: :skip], else: []
+  end
+
+  defp skip_low_novelty?(attrs) do
+    truthy?(attrs["skip_low_novelty"]) or attrs["on_low_novelty"] == "skip"
   end
 
   # Novelty-gated path: render by verdict. A near-duplicate is NOT created — the
@@ -422,18 +466,24 @@ defmodule LoopctlWeb.ArticleController do
   defp render_proposal(conn, {:ok, %{verdict: :skipped_low_novelty} = result}, attrs, _draft?) do
     %{article: neighbor, assessment: assessment} = result
 
-    # Counted as :deduplicated, not a new outcome. Nothing was created BECAUSE the content
-    # already exists — that is what the deduplicated counter means, and IngestionWriteStats
-    # maps only known outcomes (@outcome_columns), so a bespoke atom would fall through
-    # uncounted and make a dedup-heavy day read as an ingestion outage to the reject-rate
-    # detector. The caller still gets the finer-grained `skipped: true` in the response.
-    emit_write_telemetry(conn, attrs, :deduplicated)
+    # Counted under its OWN outcome, not folded into :deduplicated. A dedup means the
+    # content already exists AS A ROW the caller was handed; a skip means it was
+    # DISCARDED and exists nowhere — folding them together would let a drop storm (a
+    # mis-tuned threshold, or a writer whose every capture now scores high) read as a
+    # healthy dedup-heavy day. It is tracked for observability but kept OUT of the
+    # high_reject_rate ratio entirely (like :forbidden): a writer running
+    # on_low_novelty=skip is EXPECTED to skip most captures, so counting skips in the
+    # denominator would dilute a genuine reject storm below the threshold.
+    emit_write_telemetry(conn, attrs, :skipped_low_novelty)
 
     conn
     |> put_status(:ok)
     |> json(%{
       data: nil,
       skipped: true,
+      # `assessment.neighbors` has already been narrowed by the context to the rows that
+      # still resolve, so `nearest`, `note` and the curation-log ref all name the same
+      # live rows — a caller attributing the drop can fetch every id it is handed.
       gate: gate_meta(:skipped_low_novelty, assessment),
       note:
         "High overlap with existing knowledge (similarity " <>

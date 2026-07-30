@@ -228,6 +228,16 @@ defmodule Loopctl.Custody do
   (`gate_embedded`), never assumed: a proposal that REUSED a caller-supplied
   vector made no call, and recording an endpoint that was not called would be a
   falsehood in the other direction.
+
+  **Scope limit — read this before quoting an egress total.** The ledger is
+  PER-ROW: an entry hangs off an article, so a gate verdict that creates NO row
+  (`:duplicate`, and `:skipped_low_novelty` under `on_low_novelty: :skip`) records
+  nothing, even though the gate embedded that proposal's title and body first. A
+  claim over the ledger is therefore "every provider call made ON BEHALF OF THE
+  ROWS THAT EXIST", never "every provider call this tenant's content ever caused".
+  Row-less gate egress is bounded by the `skipped`/`deduplicated` counters in
+  `Loopctl.Knowledge.IngestionWriteStats`; count those alongside if the question
+  being asked is about egress volume rather than a row's history.
   """
   @spec endpoint_kinds(atom()) :: [atom()]
   def endpoint_kinds(:create), do: []
