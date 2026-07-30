@@ -23,10 +23,19 @@ env:
   # mix.exs `~> 1.18`); only the OTP line moves forward to a working, current patch.
   OTP_VERSION: "28.5.0.2"
 
+# SELF-HOSTED SPLIT (beelink). lint / test / security / dialyzer moved; the rest
+# stay on ubuntu-latest for specific reasons, not by omission:
+#
+#   pgbouncer-e2e   Needs a pgbouncer service container in front of Postgres;
+#                   the port topology has to be reworked for a shared host DB.
+#   scale-test      Schedule/dispatch-gated prod-floor HNSW checks. Rare, heavy,
+#   scale-nightly   and not worth the blast radius until the above are settled.
+#   deploy          Holds Fly deploy credentials and needs flyctl. Keeping release
+#   smoke           authority on GitHub-hosted runners is deliberate.
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +57,7 @@ jobs:
           # our own defimpl and fails `mix compile --warnings-as-errors`. No loose
           # restore-keys for the same reason — a config change must not silently
           # reuse a _build compiled under the old config.
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -64,21 +73,17 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: loopctl_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    runs-on: [self-hosted, beelink]
+    # NO `services:` block on self-hosted. beelink already runs a long-lived
+    # Postgres 16 publishing 0.0.0.0:5432 — the same database local `mix test`
+    # uses — so a service container declaring 5432:5432 cannot bind and the job
+    # would die before its first step. Verified that host instance has pgvector
+    # 0.8.2 available, which is why the pgvector image is not needed here.
+    # config/test.exs hardcodes localhost + postgres/postgres for all three repos.
+    env:
+      # CI gets loopctl_testci, so a CI run and a local `mix test` do not fight
+      # over loopctl_test. config/test.exs builds the name from this.
+      MIX_TEST_PARTITION: ci
 
     steps:
       - uses: actions/checkout@v4
@@ -97,7 +102,7 @@ jobs:
           # See lint job: config/*.exs is part of the key so a config-only change
           # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
           # config-sensitive deps instead of reusing a stale dep beam.
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -155,7 +160,7 @@ jobs:
 
   retrieval-eval:
     name: Retrieval Eval
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     # MIX_ENV=dev on purpose (the workflow-level default is test): `mix
     # loopctl.retrieval.eval` opens its OWN DB connections, and config/test.exs puts all
     # three repos behind Ecto.Adapters.SQL.Sandbox, where a non-checked-out process has no
@@ -163,21 +168,10 @@ jobs:
     # the task in, so CI exercises the real invocation.
     env:
       MIX_ENV: dev
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: loopctl_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
+    # No services block: beelink's Postgres already publishes 5432 and has
+    # pgvector 0.8.2 available, so a service container could not bind that port
+    # and is not needed. MIX_ENV=dev here resolves to loopctl_dev, which Mark
+    # confirmed is disposable on beelink.
     steps:
       - uses: actions/checkout@v4
 
@@ -202,7 +196,7 @@ jobs:
           # only _build/dev and every test job then restores a tree with no test artifacts
           # and recompiles. A distinct key keeps the dev and test build trees from
           # clobbering each other in the cache.
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}-dev
+          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}-dev
 
       - name: Install dependencies
         run: mix deps.get
@@ -261,7 +255,7 @@ jobs:
 
   security:
     name: Security
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     steps:
       - uses: actions/checkout@v4
 
@@ -279,7 +273,7 @@ jobs:
           # See lint job: config/*.exs is part of the key so a config-only change
           # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
           # config-sensitive deps instead of reusing a stale dep beam.
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -299,7 +293,7 @@ jobs:
 
   dialyzer:
     name: Dialyzer
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     steps:
       - uses: actions/checkout@v4
 
@@ -317,15 +311,15 @@ jobs:
           # See lint job: config/*.exs is part of the key so a config-only change
           # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
           # config-sensitive deps instead of reusing a stale dep beam.
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Restore PLT cache
         uses: actions/cache@v4
         with:
           path: priv/plts/
-          key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            ${{ runner.os }}-${{ runner.environment }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
       - name: Install dependencies
         run: mix deps.get
@@ -377,7 +371,7 @@ jobs:
           # restore would reuse a _build compiled under the old config, keeping a stale
           # dep beam (phoenix_ecto's Plug.Exception.Postgrex.Error) that collides with our
           # own defimpl and fails `mix compile --warnings-as-errors`. Matches the other jobs.
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -487,7 +481,7 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -621,7 +615,7 @@ jobs:
           # restore would reuse a _build compiled under the old config, keeping a stale
           # dep beam (phoenix_ecto's Plug.Exception.Postgrex.Error) that collides with our
           # own defimpl and fails `mix compile --warnings-as-errors`. Matches the other jobs.
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
