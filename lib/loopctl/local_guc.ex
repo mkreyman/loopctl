@@ -21,14 +21,9 @@ defmodule Loopctl.LocalGuc do
       would CLOBBER a deliberate outer `SET LOCAL` — e.g. a caller that wrapped several
       reads in one transaction under its own deadline. A GUC that had no value (NULL) is
       left alone.
-    * restore runs in an `after`, and is BEST-EFFORT: on the failure path the transaction
-      is already aborted (or rolling back, which restores the GUCs itself), so a failing
-      restore must never mask the real error or destroy a successful result. It therefore
-      catches EXITs as well as raises — DBConnection/Postgrex exits rather than raising
-      when the pool is down or wedged, and an `after` block propagates that exit.
-    * capture is equally best-effort, and for the same reason in reverse: it runs BEFORE
-      the `try`, so a failed capture degrades to "captured nothing" instead of aborting
-      the caller's read.
+    * restore runs in an `after` and capture BEFORE the `try`. Both are BEST-EFFORT and
+      catch EXITs as well as raises (Postgrex EXITs when the pool is down or wedged), so
+      neither can abort the caller's read, mask an error, or destroy a successful result.
   """
 
   require Logger
@@ -67,8 +62,8 @@ defmodule Loopctl.LocalGuc do
   end
 
   @doc """
-  The prior values of `names`, as `[{name, value_or_nil}]`. One round trip. Never raises:
-  a failure degrades to `[]` (nothing captured, so `restore/2` is a no-op).
+  The prior values of `names`, as `[{name, value_or_nil}]`. One round trip; never raises —
+  a failure degrades to `[]`, which makes `restore/2` a no-op.
   """
   @spec capture(module(), [String.t()]) :: [{String.t(), String.t() | nil}]
   def capture(_repo, []), do: []
@@ -84,12 +79,7 @@ defmodule Loopctl.LocalGuc do
     :exit, reason -> capture_failed(names, reason)
   end
 
-  # `current_setting(_, true)` cannot raise on an unknown GUC, but the ROUND TRIP still
-  # can — a connection blip, a DBConnection/Postgrex EXIT, or an enclosing transaction
-  # already in a failed state — and capture runs BEFORE the `try`, so an unhandled failure
-  # aborts a read that would otherwise have executed. Degrade instead: `[]` means nothing
-  # was captured and nothing is restored. Closing the GUC leak is worth less than the
-  # caller's read.
+  # The unknown-GUC case cannot raise, but the ROUND TRIP can, before the `try` protects it.
   defp capture_failed(names, reason) do
     Logger.warning("LocalGuc: could not capture #{inspect(names)} (#{inspect(reason)})")
     []
@@ -118,12 +108,6 @@ defmodule Loopctl.LocalGuc do
   rescue
     _ -> :ok
   catch
-    # DBConnection/Postgrex EXIT rather than raise when the pool is not started
-    # (`:noproc`) or is wedged (`{:timeout, {GenServer, :call, _}}`) — see
-    # `HeavyRead.probe_iterative_scan_support/0`, which catches the same two. Without this
-    # clause such an exit escapes the `after` block in `scoped/3` and destroys an
-    # otherwise-successful read, which is exactly what the moduledoc promises cannot
-    # happen.
     :exit, _ -> :ok
   end
 end
