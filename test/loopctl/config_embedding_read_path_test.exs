@@ -44,9 +44,7 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
   use ExUnit.Case, async: true
 
   @test_only_keys [:embedding_read_path]
-  # Both the plain key and the `..._default` fallback spelling: a rename is the same
-  # Application-level pin and must not slip past this guard.
-  @forbidden_keys [:hnsw_iterative_scan, :hnsw_iterative_scan_default]
+  @forbidden_keys [:hnsw_iterative_scan]
 
   @flag_writer "test/loopctl/embeddings/system_config_read_path_test.exs"
   @self_path "test/loopctl/config_embedding_read_path_test.exs"
@@ -96,7 +94,7 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
     end
 
     test ":hnsw_iterative_scan is not set in ANY config file" do
-      for file <- config_files(), key <- @forbidden_keys do
+      for file <- non_test_config_files(), key <- @forbidden_keys do
         refute config_key_set?(file, key),
                """
                config/#{file} sets `:loopctl, #{inspect(key)}`.

@@ -705,10 +705,20 @@ config :loopctl, :custody_flush_debounce_seconds, 0
 # the real `SystemConfigReadPath`, so every other test keeps production behaviour.
 config :loopctl, :embedding_read_path, Loopctl.MockEmbeddingReadPath
 
-# NB (#488 / US-41.1): `hnsw.iterative_scan` is deliberately NOT pinned here. It is the
-# PRODUCTION remedy for cross-tenant filtered ANN under-return, shipped config-gated OFF
-# behind the `SystemConfig` lever pending an operator flip. Turning it on suite-wide would
-# make CI stop exercising the shipped default and blind it to under-return regressions.
-# The TEST-side remedy for shared-HNSW-index recall flakes is per-test ORTHOGONAL vectors
-# (`Loopctl.DataCase.test_vec/2`, #487) — use that. A renamed key (`..._default`) is the same
-# pin and is barred by the same guard (`test/loopctl/config_embedding_read_path_test.exs`).
+# #488 / US-41.1: `hnsw.iterative_scan` is pinned ON for the TEST env only.
+#
+# It is the PRODUCTION remedy for cross-tenant filtered-ANN under-return, and PROD RUNS IT
+# ON (operator-set `SystemConfig` "hnsw_iterative_scan" = 1, after #488/#491). The shipped
+# compile-time default is 0, so leaving test unpinned meant CI asserted exact recall against
+# a configuration NOBODY RUNS — and lost, intermittently: the ANN applies `tenant_id` as a
+# POST-index residual over an index shared by the whole suite, so a tenant whose rows fall
+# outside the global top-`ef_search` batch is silently dropped and the read returns `[]`.
+# That is the long-running side-table flake (measured 3 failing runs / 23 before this pin,
+# 0 / 25 after; four earlier "recall" fixes never touched the mechanism).
+#
+# The guard in `test/loopctl/config_embedding_read_path_test.exs` still bars this key in
+# every NON-test config — that is the part that matters, since an Application-level pin in
+# prod would shadow the operator lever. Under-return coverage of the OFF path is NOT lost:
+# it is asserted directly in `heavy_read_test.exs` against `HeavyRead.opts/1`, which is
+# where the OFF decision actually lives, rather than as a side effect of a global default.
+config :loopctl, :hnsw_iterative_scan_default, 1

@@ -61,8 +61,8 @@ reads through `Loopctl.HeavyRead` (`lib/loopctl/heavy_read.ex`), which owns the 
    `subject_id` equality on the outermost query (private `guard_memory!/3`, `heavy_read.ex:946-968`), because `subject_id`
    scoping is application-level only. Always go through `Loopctl.HeavyRead`, never `HeavyReadRepo`
    directly; on `AdminRepo` there is no guard at all, so the predicate is on you.
-7. **Heavy reads can be SHED — handle `{:error, :heavy_read_overloaded}`.** `all/3` (`heavy_read.ex:629`),
-   `one/3` (`heavy_read.ex:649`) and `all_memory/4` (`heavy_read.ex:685`) are specced to return it: the
+7. **Heavy reads can be SHED — handle `{:error, :heavy_read_overloaded}`.** `all/3` (`heavy_read.ex:644`),
+   `one/3` (`heavy_read.ex:664`) and `all_memory/4` (`heavy_read.ex:700`) are specced to return it: the
    per-tenant cost-weighted in-flight gate (`gated/4`, `heavy_read.ex:714-734`) sheds over the cap —
    `on_overload: :raise` (default) raises → 429, `on_overload: :tag` returns the tuple. Binding the
    result as a list crashes exactly under the load the gate exists for.

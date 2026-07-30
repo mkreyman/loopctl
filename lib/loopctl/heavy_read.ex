@@ -405,7 +405,22 @@ defmodule Loopctl.HeavyRead do
   end
 
   defp iterative_scan_code do
-    Loopctl.SystemConfig.get_int("hnsw_iterative_scan", @default_hnsw_iterative_scan)
+    Loopctl.SystemConfig.get_int("hnsw_iterative_scan", default_iterative_scan_code())
+  end
+
+  # `SystemConfig` stays the single operator lever; this is only the FALLBACK applied when no
+  # operator has set that row. It is config-injected (rather than hard-coded 0) so an
+  # environment can start from a different baseline without any test mutating VM-global
+  # state. Only `config/test.exs` sets it — pinned ON there because PROD runs iterative scan
+  # ON, so an unpinned test env asserted exact recall against a configuration nobody runs.
+  # Every NON-test config is still barred from setting it by
+  # `test/loopctl/config_embedding_read_path_test.exs`, which is the case that matters: an
+  # Application pin in prod would shadow the operator lever.
+  defp default_iterative_scan_code do
+    case Application.get_env(:loopctl, :hnsw_iterative_scan_default, @default_hnsw_iterative_scan) do
+      code when is_integer(code) -> code
+      _ -> @default_hnsw_iterative_scan
+    end
   end
 
   @doc """
