@@ -64,7 +64,7 @@ need an 80k corpus. It is recorded here for completeness, not run in the scale m
 ## AC-27.17.2 — Remediation of the scale failure found in this pass
 
 The terminal pass caught the ONE failure the per-PR CI structurally cannot (the
-`:scale_nightly` matrix is schedule/dispatch-only, so a scale test merges on code+unit+review
+`:scale_nightly` matrix is dispatch-only, so a scale test merges on code+unit+review
 without ever running in per-PR CI):
 
 - **`remediation_matrix`'s `by_source_keyset` endpoint** failed in CI's planner while passing

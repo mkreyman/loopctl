@@ -122,12 +122,12 @@ which is the distinction that produced the false-green in #172.
 
 It runs in two places:
 
-- **CI, on manual dispatch or the WEEKLY cron** (`.github/workflows/ci.yml`, job
-  `Scale Nightly` — the name predates the trigger change). `gh workflow run CI --ref
-  <branch>` is the pre-merge gate; the Sunday 03:00 UTC cron (`0 3 * * 0`, matched
-  exactly by the job's `if:`) is a backstop for plan drift that arrives with no PR —
-  a Postgres/pgvector upgrade, an ANALYZE shift. **It does NOT run on the 02:00 nightly
-  cron** the rest of CI uses. It is a **matrix — one isolated job per scale file**, each
+- **CI, on MANUAL DISPATCH ONLY** (`.github/workflows/ci.yml`, job `Scale Nightly` — the
+  name predates the trigger change). `gh workflow run CI --ref <branch>` is the pre-merge
+  gate and the ONLY thing that starts this matrix. **It runs on no cron at all** — not the
+  02:00 one the rest of CI uses, and not any other. So plan drift that arrives with no PR
+  (a Postgres/pgvector upgrade, an ANALYZE shift) is NOT caught automatically: dispatch the
+  matrix yourself after any such infrastructure change. It is a **matrix — one isolated job per scale file**, each
   on its own database (`loopctl_test_sn_<file>`, derived in the job; beelink has one
   long-lived Postgres, and planner stats live in the per-database `pg_statistic`) so a
   committed-row corpus from one file can't pollute another's global planner stats. A
@@ -143,9 +143,9 @@ It runs in two places:
   `--only scale .../scale_seed_test.exs`: it proves the seed/fixture machinery (and its
   `OwnershipError`-class regressions) still works, NOT the 80k planner paths. The
   `:scale_nightly` plan gate (index-backed shape, per-request timeout, e2e latency,
-  calibration) is **dispatch-or-weekly-cron only** — a green `Scale Tests ✓` on your PR is **not**
-  evidence the plan gates ran, and neither is "it will run overnight": the next automatic run is
-  Sunday. Tag discipline: a new 80k plan assertion must be `:scale_nightly`
+  calibration) is **dispatch-only** — a green `Scale Tests ✓` on your PR is **not**
+  evidence the plan gates ran, and neither is "it will run overnight": there is no
+  automatic run, ever. Tag discipline: a new 80k plan assertion must be `:scale_nightly`
   (so the matrix + set-equality test pick it up), not `:scale`.
 - **Before merging any Theme 2/3/4 (vector / timeout / pagination) PR** — the plan gate never
   runs on your PR (each leg reseeds ~80k committed rows — too slow for every PR, and there
@@ -167,7 +167,7 @@ It runs in two places:
 
   This pre-merge run is **required**, not optional, for a query/index change. Nothing in CI
   can enforce it — there is no status check for "you dispatched the matrix", so the reviewer
-  asks for the run id — and the weekly cron only tells you AFTER merge, on master.
+  asks for the run id. Nothing else will tell you, before merge or after.
   (Likewise: any change to the `scale-nightly`
   matrix job itself must be `workflow_dispatch`-validated on its branch before merge,
   since the job does not run on the PR.)
@@ -218,7 +218,7 @@ evidence (plan excerpts, timings, HTTP codes) onto the issue/PR before closing:
 
 - [ ] **Plan-assertion green at scale** — the relevant `:scale_nightly` gate test
       passes against the ~80k `ScaleSeed` corpus — locally, or via a manual
-      `gh workflow run CI --ref <branch>` (the matrix is dispatch-or-weekly, not nightly,
+      `gh workflow run CI --ref <branch>` (the matrix is dispatch-only, on no cron,
       so a green PR is never evidence it ran).
 - [ ] **`EXPLAIN ANALYZE` under the timeout on the LIVE build** — the deployed
       release's plan for the exact endpoint query is index-backed and its

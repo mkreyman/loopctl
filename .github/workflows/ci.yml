@@ -8,20 +8,12 @@ on:
   schedule:
     # Nightly at 02:00 UTC — the ordinary jobs (lint / test / retrieval-eval / security /
     # dialyzer / scale-test / pgbouncer-e2e). Explicitly NOT scale-nightly: that matrix is
-    # gated on the weekly cron below and would otherwise hold the one self-hosted runner
+    # gated to manual dispatch and would otherwise hold the one self-hosted runner
     # for hours every night, queued ahead of ordinary PR checks.
     - cron: "0 2 * * *"
-    # Sundays at 03:00 UTC — the ONLY scheduled run of the scale-nightly matrix, which
-    # matches on this exact cron string. A weekly backstop, not a per-night watch: what it
-    # guards (planner/index CHOICE at the 80k prod floor) mostly moves when a query/index/
-    # corpus change lands, but it ALSO drifts from things no PR touches — a Postgres or
-    # pgvector upgrade, an ANALYZE shift, a migration that fails to build an HNSW index —
-    # and the pre-merge dispatch below never fires for those. The ordinary jobs run on this
-    # cron too (one extra pass a week, cheaper than an exclusion on every other job).
-    - cron: "0 3 * * 0"
   # Manual trigger so the scale-nightly matrix can be RUN and validated on a branch BEFORE
   # merge — `gh workflow run CI --ref <branch>` (US-27.5). This is the PRIMARY trigger for a
-  # Theme-2/3/4 change; the weekly cron backstops it, it does not replace the pre-merge run.
+  # Theme-2/3/4 change, and since there is no cron it is the ONLY thing that runs the matrix.
   # Without this the matrix change is never exercised by its own PR.
   workflow_dispatch:
 
@@ -54,7 +46,7 @@ env:
 #                   DONE -- see the per-matrix-file database note on the job) and
 #                   it no longer runs nightly. ~143 min of beelink wall clock per
 #                   full 14-file matrix (one outlier, streaming_export, is 40 min
-#                   on its own), now once a week on the "0 3 * * 0" cron plus any
+#                   on its own), now only on an explicit dispatch plus any
 #                   manual dispatch -- so ~620 min/month (143 x 52/12) of self-hosted time in
 #                   place of the ~4,300 billed min/month it used to be, when it
 #                   was the largest hosted line item by a wide margin.
@@ -481,7 +473,7 @@ jobs:
       # seeding the whole supported set on every push is not worth the wall clock. The
       # FULL supported set (768 / 1024 / 1536) runs in the scale-nightly matrix, which
       # leaves EMBEDDING_PLAN_GATE_DIMENSIONS unset — so 768 and 1024 keep an AUTOMATIC
-      # plan assertion (weekly cron, plus any pre-merge dispatch), not a manual-only one.
+      # plan assertion, which now runs only on an explicit pre-merge dispatch.
       # This step is the gate; AC-41.1.12(ii)'s production EXPLAIN is an artifact report,
       # not CI.
       - name: Run per-dimension ANN plan gate (TC-41.1.2, AC-41.1.12(i))
@@ -600,13 +592,13 @@ jobs:
     # US-27.5 (AC-27.5.3): this is the scale GATE — it covers every :scale_nightly test
     # (HNSW ANN, keyset enumeration, shared plan assertions), not just scale_seed.
     #
-    # NO LONGER RUNS EVERY NIGHT — WEEKLY ("0 3 * * 0") PLUS MANUAL DISPATCH (the "nightly"
+    # NO LONGER RUNS ON ANY SCHEDULE — MANUAL DISPATCH ONLY (the "nightly"
     # in the name is kept because the tag, the job and the runbooks all use it). It was a
     # prod-scale PROOF, not a per-night regression watch, and as a NIGHTLY job it stopped
     # paying for itself: 14 matrix jobs, each seeding ~80k committed rows, serially on ONE
     # self-hosted runner — hours of beelink every night, QUEUED AHEAD of ordinary PR checks,
     # so a routine PR could sit unmergeable behind a scale run nobody asked for.
-    # The weekly arm is deliberately kept rather than dropped: most planner/index CHOICE
+    # No schedule arm is kept. The trade is stated plainly: most planner/index CHOICE
     # drift arrives with a query/index/corpus change (covered by the pre-merge dispatch),
     # but a Postgres/pgvector upgrade, an ANALYZE shift or a migration that fails to build
     # an HNSW index moves it with NO PR to hang a gate on, and this matrix is the only
@@ -639,17 +631,22 @@ jobs:
     # Theme-2/3/4 (query/index) change is `gh workflow run CI --ref <branch>` or the local
     # run in docs/runbooks/knowledge_scale_verification.md.
     #
-    # The schedule arm matches the WEEKLY cron string exactly, so the 02:00 nightly cron —
-    # which the other CI jobs still run on — never starts this matrix. Change the cron in
-    # the `on:` block and you must change it here too; a mismatch silently disables the
-    # only automatic run this gate has, with every CI run still green. That is not left to
-    # a comment: test/loopctl/ci_scale_nightly_cron_test.exs fails the build if the string
-    # below is not one of the `on.schedule` crons.
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 3 * * 0'
+    # NO schedule arm, deliberately — this matrix does not run on ANY cron. That is the
+    # repo owner's decision, not an oversight, and it is the whole point of the change that
+    # introduced this condition: 14 jobs x an 80k seed, serially on one self-hosted runner,
+    # queued ahead of ordinary PR checks. `test/loopctl/ci_scale_nightly_cron_test.exs`
+    # fails the build if a schedule trigger reappears here or a cron is added for it, so
+    # re-adding one is a deliberate act with the owner, not a quiet edit.
+    #
+    # KNOWN CONSEQUENCE, stated rather than hidden: nothing now runs this gate
+    # automatically. Drift that no PR touches — a Postgres/pgvector upgrade, an ANALYZE
+    # shift, a migration that fails to build an HNSW index — will not be caught until
+    # somebody dispatches it. Dispatch it after any such infrastructure change.
+    if: github.event_name == 'workflow_dispatch'
     # The derived database is named from the scale FILE alone (loopctl_test_sn_<file>, no
     # run id — a leftover has to name the file that made it, and run_id would push the
     # identifier past Postgres's 63-byte limit). So two runs of the same leg would SHARE
-    # one database: the weekly cron now overlaps pre-merge dispatches unattended, and the
+    # one database: two pre-merge dispatches can overlap, and the
     # first leg to finish DROPs ... WITH (FORCE), killing the other's connections mid-seed
     # for a false RED. Serialise per file rather than cancel — the queued run is usually
     # the one a human is waiting on.
@@ -830,7 +827,7 @@ jobs:
       #
       # A failed drop is REPORTED AND SWALLOWED on a dispatch, where the person who fired
       # the run is reading the log — cleanup must not redden a gate they are watching. On
-      # the weekly cron nobody is: a warning on an unattended run is read by no one, and
+      # an unattended run nobody watches: a warning there is read by no one, and
       # the orphaned corpus (1345 MB observed for remediation_matrix) accumulates every
       # week until the box fills. So the schedule arm FAILS instead.
       - name: Drop this job's database
