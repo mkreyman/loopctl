@@ -120,17 +120,31 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
       pool = VectorSearch.pool_size(5)
       target_vec = VectorSearch.to_embedding_list(target.embedding)
 
-      # The target's top-`pool` nearest neighbor ids (the exact rows the inner ANN draws
-      # on) — a raw index-ordered scan (NOT `nearest/4`, whose k is clamped to max_k=100,
-      # which would leave most of the 500-pool unlinked). Then link the target to ALL of
-      # them so the anti-join exhausts the full pool.
+      # EVERY eligible article in the tenant, not just the top-`pool` nearest.
+      #
+      # Linking only the `pool`-nearest was sufficient while the ANN's reachable candidate
+      # set was bounded by one `ef_search` batch. Since #535 pinned
+      # `:hnsw_iterative_scan_default` ON in `config/test.exs` — matching prod — that is no
+      # longer true: iterative scan is PRECISELY the feature that keeps scanning past the
+      # first batch until the limit is filled, so the ANN simply reached past the 500
+      # linked neighbours, found unlinked ones, and returned 5 of 5. The test did not
+      # become flaky; its premise was repealed by the configuration, and it failed on the
+      # nightly for exactly that reason.
+      #
+      # Exhausting the WHOLE eligible set restores the acceptance criterion under the
+      # configuration production actually runs: no unlinked candidate exists at any scan
+      # depth, so the anti-join must under-fill whether iterative scan is on or off. It is
+      # also the stronger statement of AC-27.6b.2 — "filters exhausted the pool" — rather
+      # than a statement about how far one ef_search batch happens to reach.
+      #
+      # `target_vec` still orders the insert so the nearest are linked first; the ordering
+      # is now cosmetic for the assertion but keeps the rows deterministic.
       nearest_ids =
         AdminRepo.all(
           from(a in Article,
             where: a.tenant_id == ^tenant.id and a.status == :published,
             where: not is_nil(a.embedding) and a.id != ^target.id,
             order_by: [asc: fragment("? <=> ?", a.embedding, ^target_vec)],
-            limit: ^pool,
             select: a.id
           )
         )
@@ -151,24 +165,29 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
         end)
 
       # `on_conflict: :nothing` is REQUIRED, not defensive. `ScaleSeed` already links every
-      # article to its `link_density` index-adjacent neighbours, and the seeded embeddings
-      # are a sine wave whose index-adjacency IS vector-adjacency — so the target's seeded
-      # links are GUARANTEED to be inside the `pool`-nearest set we are linking here. A
-      # plain insert_all therefore always trips
-      # `article_links_tenant_src_tgt_rel_index`. Skipping the already-present rows
-      # preserves the intent exactly: what matters is that the target ends up linked to
-      # ALL of its `pool` nearest neighbours (so the anti-join exhausts the pool), not
-      # which of those links this insert happened to author.
-      {_n, _} =
-        AdminRepo.insert_all(ArticleLink, link_rows,
-          on_conflict: :nothing,
-          conflict_target: [
-            :tenant_id,
-            :source_article_id,
-            :target_article_id,
-            :relationship_type
-          ]
-        )
+      # article to its `link_density` index-adjacent neighbours, so a plain insert_all
+      # always trips `article_links_tenant_src_tgt_rel_index`. Skipping the already-present
+      # rows preserves the intent exactly: what matters is that the target ends up linked
+      # to every eligible article (so the anti-join has nothing left to return at ANY scan
+      # depth), not which of those links this insert happened to author.
+      #
+      # CHUNKED because the eligible set is the whole prod-floor corpus (~80k): `insert_all`
+      # binds one parameter per field per row, so a single call would blow past Postgres's
+      # 65535-parameter limit. 5_000 rows x 7 fields = 35_000 bindings, comfortably under.
+      link_rows
+      |> Enum.chunk_every(5_000)
+      |> Enum.each(fn chunk ->
+        {_n, _} =
+          AdminRepo.insert_all(ArticleLink, chunk,
+            on_conflict: :nothing,
+            conflict_target: [
+              :tenant_id,
+              :source_article_id,
+              :target_article_id,
+              :relationship_type
+            ]
+          )
+      end)
 
       test_pid = self()
       handler_id = "under-fill-scale-#{System.unique_integer([:positive])}"

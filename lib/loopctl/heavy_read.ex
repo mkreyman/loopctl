@@ -413,9 +413,12 @@ defmodule Loopctl.HeavyRead do
   # environment can start from a different baseline without any test mutating VM-global
   # state. Only `config/test.exs` sets it — pinned ON there because PROD runs iterative scan
   # ON, so an unpinned test env asserted exact recall against a configuration nobody runs.
-  # Every NON-test config is still barred from setting it by
-  # `test/loopctl/config_embedding_read_path_test.exs`, which is the case that matters: an
-  # Application pin in prod would shadow the operator lever.
+  # Every NON-test config is barred from setting `:hnsw_iterative_scan_default` — the key
+  # read RIGHT BELOW — by `test/loopctl/config_embedding_read_path_test.exs`, which also
+  # asserts `config/test.exs` still sets it. That is the case that matters: an Application
+  # pin in prod would shadow the operator lever. (Name the key exactly: the guard policed
+  # only the pre-rename `:hnsw_iterative_scan` for a while, so this comment claimed a
+  # control that did not cover the key the function actually reads.)
   defp default_iterative_scan_code do
     case Application.get_env(:loopctl, :hnsw_iterative_scan_default, @default_hnsw_iterative_scan) do
       code when is_integer(code) -> code
@@ -505,14 +508,38 @@ defmodule Loopctl.HeavyRead do
         supported
 
       {:inconclusive, reason} ->
-        Logger.warning(
-          "hnsw.iterative_scan capability probe was inconclusive (#{reason}) — " <>
-            "failing closed and re-probing in #{div(@iterative_scan_negative_ttl_ms, 1000)}s"
-        )
+        if cacheable_inconclusive?(reason) do
+          Logger.warning(
+            "hnsw.iterative_scan capability probe was inconclusive (#{reason}) — " <>
+              "failing closed and re-probing in #{div(@iterative_scan_negative_ttl_ms, 1000)}s"
+          )
 
-        cache_iterative_scan_verdict(false, @iterative_scan_negative_ttl_ms)
+          cache_iterative_scan_verdict(false, @iterative_scan_negative_ttl_ms)
+        else
+          Logger.warning(
+            "hnsw.iterative_scan capability probe was inconclusive (#{reason}) — " <>
+              "failing closed for THIS read only, not cached"
+          )
+        end
+
         false
     end
+  end
+
+  # The negative cache defends against HeavyReadRepo SATURATION: under load the probe is
+  # inconclusive precisely when the pool is exhausted, so re-probing every read would add a
+  # checkout and a warning per ANN read during the incident. That reasoning applies to pool
+  # and connection failures — and to nothing else.
+  #
+  # A sandbox OWNERSHIP error is not backend pressure at all; it is a test-harness artifact
+  # that cannot occur in prod, and it says nothing about the connected pgvector's version.
+  # Caching it as `false` pins iterative scan OFF for the whole VM for 60s — which, now that
+  # `config/test.exs` pins iterative scan ON so the suite matches prod, means one transient
+  # ownership blip silently reconfigures every ANN read in the run and re-arms the `left: []`
+  # recall flake this pin exists to prevent. One un-cached extra probe in a test process is a
+  # far cheaper thing to pay than a suite-wide, silently-wrong configuration.
+  defp cacheable_inconclusive?(reason) when is_binary(reason) do
+    not String.contains?(reason, "OwnershipError")
   end
 
   defp cache_iterative_scan_verdict(verdict, ttl_ms) do

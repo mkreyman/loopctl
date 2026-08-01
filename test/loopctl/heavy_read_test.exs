@@ -470,6 +470,61 @@ defmodule Loopctl.HeavyReadTest do
       assert Loopctl.LocalGuc.scoped(ExitingRepo, ["statement_timeout"], fn -> :the_result end) ==
                :the_result
     end
+
+    test "restore logs a STABLE TAG on failure — never the raw error, which carries the backend host/database/role" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert Loopctl.LocalGuc.restore(ExitingRepo, [{"statement_timeout", "1234ms"}]) == :ok
+        end)
+
+      assert log =~ "LocalGuc: restore failed"
+      assert log =~ "noproc"
+      # The whole point of swallowing it loudly rather than silently: a reopened leak has
+      # to be diagnosable from the logs, not only from a distant 57014 in another query.
+      assert log =~ "leak"
+    end
+  end
+
+  # The defect these cover: a GUC captured as NULL used to be SKIPPED by `restore/2`, so
+  # the body's `SET LOCAL` survived the enclosing transaction. NULL from
+  # `current_setting(name, true)` means the GUC is UNKNOWN to the backend — which is
+  # exactly the state of the pgvector `hnsw.*` knobs until the extension loads — so in
+  # practice every `hnsw` override leaked. A synthetic namespaced GUC is used rather than
+  # `hnsw.ef_search` so the test does not depend on whether pgvector happens to be loaded
+  # into this backend yet.
+  describe "LocalGuc restores a GUC that had NO prior value" do
+    @probe "loopctl_test.leak_probe"
+
+    defp current_probe do
+      %{rows: [[v]]} = Repo.query!("SELECT current_setting($1, true)", [@probe])
+      v
+    end
+
+    test "an unset GUC does not leak out of scoped/3" do
+      # The sandbox already has us inside a transaction, which IS the savepoint-commit
+      # situation this module exists for.
+      assert current_probe() in [nil, ""], "precondition: the probe GUC is unset"
+
+      Loopctl.LocalGuc.scoped(Repo, [@probe], fn ->
+        Repo.query!("SET LOCAL #{@probe} = 'inner'")
+        assert current_probe() == "inner"
+      end)
+
+      refute current_probe() == "inner",
+             "the override survived scoped/3 — this is the leak LocalGuc exists to prevent"
+    end
+
+    test "a GUC that DID have a prior value is put back to that value, not to the default" do
+      Repo.query!("SET LOCAL #{@probe} = 'outer'")
+      assert current_probe() == "outer"
+
+      Loopctl.LocalGuc.scoped(Repo, [@probe], fn ->
+        Repo.query!("SET LOCAL #{@probe} = 'inner'")
+      end)
+
+      assert current_probe() == "outer",
+             "restore must not clobber a deliberate outer SET LOCAL"
+    end
   end
 
   defp show_statement_timeout(repo) do
