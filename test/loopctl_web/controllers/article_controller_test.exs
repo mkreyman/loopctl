@@ -1218,8 +1218,359 @@ defmodule LoopctlWeb.ArticleControllerTest do
 
       outgoing = hd(body["data"]["outgoing_links"])
       assert outgoing["relationship_type"] == "relates_to"
-      assert outgoing["target_article"]["id"] == article_b.id
-      assert outgoing["target_article"]["title"] == "Article B"
+
+      # #538: only the FAR side is serialized. The near side was always the requested
+      # article, with an always-null title (Knowledge preloads one side per direction).
+      assert outgoing["article"]["id"] == article_b.id
+      assert outgoing["article"]["title"] == "Article B"
+      refute Map.has_key?(outgoing, "source_article")
+      refute Map.has_key?(outgoing, "target_article")
+
+      assert body["data"]["links_total"] == 1
+      assert body["data"]["links_truncated"] == false
+    end
+
+    test "links=count returns links_total without either array", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+      out = fixture(:article, %{tenant_id: tenant.id, title: "Out"})
+      inbound = fixture(:article, %{tenant_id: tenant.id, title: "In"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: hub.id,
+        target_article_id: out.id,
+        relationship_type: :relates_to
+      })
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: inbound.id,
+        target_article_id: hub.id,
+        relationship_type: :relates_to
+      })
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=count")
+        |> json_response(200)
+
+      # The count spans BOTH directions — it is the number an agent needs to decide
+      # whether a second links=full fetch is worth paying for.
+      assert body["data"]["links_total"] == 2
+      # The whole point of `count` is sizing a possible `full` fetch, and that decision
+      # needs to know whether the cap will bite — otherwise the caller learns it only by
+      # paying for the fetch.
+      assert body["data"]["links_truncated"] == false
+      refute Map.has_key?(body["data"], "outgoing_links")
+      refute Map.has_key?(body["data"], "incoming_links")
+      # Still a complete article otherwise.
+      assert body["data"]["body"] == hub.body
+    end
+
+    test "links=count reports links_truncated when the cap will bite", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+
+      for i <- 1..26 do
+        target = fixture(:article, %{tenant_id: tenant.id, title: "Target #{i}"})
+
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: hub.id,
+          target_article_id: target.id,
+          relationship_type: :relates_to
+        })
+      end
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=count")
+        |> json_response(200)
+
+      assert body["data"]["links_total"] == 26
+      assert body["data"]["links_truncated"] == true
+
+      # None of these links is scored (only the auto-linker records a score, and
+      # create_link strips a caller-supplied one), so the tie-break decides the whole
+      # set: oldest-first, i.e. the neighbourhood established earliest — not an
+      # arbitrary UUID order.
+      full =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}")
+        |> json_response(200)
+
+      titles = Enum.map(full["data"]["outgoing_links"], & &1["article"]["title"])
+      assert titles == Enum.map(1..25, &"Target #{&1}")
+    end
+
+    # potential_conflicts is returned in every mode, so an uncapped array would let a
+    # conflict-heavy hub make the CHEAP modes expensive — the exact cost the cap exists
+    # to bound.
+    test "potential_conflicts is capped, with conflicts_total reporting the true size",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+
+      # Ascending similarity, so a cap that ignored ranking would drop the strongest.
+      for i <- 1..26 do
+        peer = fixture(:article, %{tenant_id: tenant.id, title: "Peer #{i}"})
+
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: peer.id,
+          target_article_id: hub.id,
+          relationship_type: :potential_conflict,
+          metadata: %{"similarity_score" => 0.90 + i / 1000}
+        })
+      end
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=none")
+        |> json_response(200)
+
+      conflicts = body["data"]["potential_conflicts"]
+      assert length(conflicts) == 25
+      assert body["data"]["conflicts_total"] == 26
+      assert body["data"]["conflicts_truncated"] == true
+
+      scores = Enum.map(conflicts, & &1["similarity"])
+      assert scores == Enum.sort(scores, :desc)
+      assert hd(scores) == 0.926
+    end
+
+    # Only the system writers record a similarity_score, so a hand-created or imported
+    # conflict set ties at 0.0 — the cap must then keep the earliest-flagged pairs, not
+    # whichever 25 an arbitrary peer-UUID order puts first.
+    test "unscored conflicts are capped oldest-first, not by peer UUID", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+
+      for i <- 1..26 do
+        peer = fixture(:article, %{tenant_id: tenant.id, title: "Peer #{i}"})
+
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: peer.id,
+          target_article_id: hub.id,
+          relationship_type: :potential_conflict
+        })
+      end
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=none")
+        |> json_response(200)
+
+      conflicts = body["data"]["potential_conflicts"]
+      assert Enum.map(conflicts, & &1["title"]) == Enum.map(1..25, &"Peer #{&1}")
+      # An unscored conflict omits `similarity` entirely, exactly like the same link's
+      # entry in the direction arrays.
+      refute Map.has_key?(hd(conflicts), "similarity")
+    end
+
+    test "project_id/story_id query params attribute the read", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      story = fixture(:story, %{tenant_id: tenant.id, project_id: project.id})
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Attributed"})
+
+      conn
+      |> auth_conn(raw_key)
+      |> get(~p"/api/v1/articles/#{article.id}?project_id=#{project.id}&story_id=#{story.id}")
+      |> json_response(200)
+
+      # Analytics runs synchronously in test. The MCP tool advertises both params "for
+      # attribution"; ignoring them recorded every wiki read as unattributed.
+      event =
+        Loopctl.Knowledge.ArticleAccessEvent
+        |> AdminRepo.all()
+        |> Enum.find(&(&1.article_id == article.id and &1.api_key_id == api_key.id))
+
+      assert event.project_id == project.id
+      assert event.story_id == story.id
+    end
+
+    test "a malformed project_id is a 422, and an empty one is absent rather than explicit",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      story = fixture(:story, %{tenant_id: tenant.id, project_id: project.id})
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Attributed"})
+
+      assert conn
+             |> auth_conn(raw_key)
+             |> get(~p"/api/v1/articles/#{article.id}?project_id=not-a-uuid")
+             |> json_response(422)
+
+      # An empty value must not take the explicit-project branch: that drops it as
+      # malformed and suppresses the project the story would have supplied.
+      conn
+      |> auth_conn(raw_key)
+      |> get(~p"/api/v1/articles/#{article.id}?project_id=&story_id=#{story.id}")
+      |> json_response(200)
+
+      event =
+        Loopctl.Knowledge.ArticleAccessEvent
+        |> AdminRepo.all()
+        |> Enum.find(&(&1.article_id == article.id and &1.api_key_id == api_key.id))
+
+      assert event.project_id == project.id
+      assert event.story_id == story.id
+    end
+
+    test "links=none omits the link fields entirely", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+      other = fixture(:article, %{tenant_id: tenant.id, title: "Other"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: hub.id,
+        target_article_id: other.id,
+        relationship_type: :relates_to
+      })
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=none")
+        |> json_response(200)
+
+      refute Map.has_key?(body["data"], "outgoing_links")
+      refute Map.has_key?(body["data"], "incoming_links")
+      refute Map.has_key?(body["data"], "links_total")
+      assert body["data"]["id"] == hub.id
+    end
+
+    # The one link field that must survive every cheaper mode: agents are told to act on
+    # an unresolved conflict, so opting out of the bulk link list must not silently opt
+    # out of conflict discovery.
+    test "potential_conflicts is returned in all three link modes", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+      peer = fixture(:article, %{tenant_id: tenant.id, title: "Near Duplicate"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: hub.id,
+        target_article_id: peer.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"similarity_score" => 0.97}
+      })
+
+      for mode <- ["full", "count", "none"] do
+        body =
+          conn
+          |> auth_conn(raw_key)
+          |> get(~p"/api/v1/articles/#{hub.id}?links=#{mode}")
+          |> json_response(200)
+
+        assert [conflict] = body["data"]["potential_conflicts"],
+               "expected potential_conflicts under links=#{mode}"
+
+        assert conflict["article_id"] == peer.id
+        assert conflict["similarity"] == 0.97
+      end
+    end
+
+    test "an unrecognized links value degrades to full rather than failing the read",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+      other = fixture(:article, %{tenant_id: tenant.id, title: "Other"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: hub.id,
+        target_article_id: other.id,
+        relationship_type: :relates_to
+      })
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=sure-why-not")
+        |> json_response(200)
+
+      assert length(body["data"]["outgoing_links"]) == 1
+    end
+
+    test "links are ranked and capped, with links_total reporting the true size",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+
+      # 30 outgoing links > the 25/direction cap, with ASCENDING similarity so the
+      # strongest neighbours are the ones created LAST — if ranking were a no-op and the
+      # cap just took insertion order, the top scores would be exactly what got dropped.
+      for i <- 1..30 do
+        target = fixture(:article, %{tenant_id: tenant.id, title: "Target #{i}"})
+
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: hub.id,
+          target_article_id: target.id,
+          relationship_type: :relates_to,
+          metadata: %{"similarity_score" => i / 100}
+        })
+      end
+
+      # One open conflict, deliberately the WEAKEST score, to prove type outranks score.
+      conflict_peer = fixture(:article, %{tenant_id: tenant.id, title: "Conflict Peer"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: hub.id,
+        target_article_id: conflict_peer.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"similarity_score" => 0.001}
+      })
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}")
+        |> json_response(200)
+
+      links = body["data"]["outgoing_links"]
+
+      assert length(links) == 25
+      assert body["data"]["links_total"] == 31
+      assert body["data"]["links_truncated"] == true
+
+      # The conflict leads despite the lowest similarity in the set.
+      assert hd(links)["relationship_type"] == "potential_conflict"
+      assert hd(links)["article"]["id"] == conflict_peer.id
+
+      # The rest descend by similarity, and the strongest survived the cap.
+      scores = links |> tl() |> Enum.map(& &1["similarity"])
+      assert scores == Enum.sort(scores, :desc)
+      assert hd(scores) == 0.3
     end
 
     test "returns 404 for non-existent article", %{conn: conn} do
