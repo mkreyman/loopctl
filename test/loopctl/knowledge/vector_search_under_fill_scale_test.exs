@@ -118,7 +118,6 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
         )
 
       pool = VectorSearch.pool_size(5)
-      target_vec = VectorSearch.to_embedding_list(target.embedding)
 
       # EVERY eligible article in the tenant, not just the top-`pool` nearest.
       #
@@ -137,14 +136,16 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
       # also the stronger statement of AC-27.6b.2 — "filters exhausted the pool" — rather
       # than a statement about how far one ef_search batch happens to reach.
       #
-      # `target_vec` still orders the insert so the nearest are linked first; the ordering
-      # is now cosmetic for the assertion but keeps the rows deterministic.
+      # Ordered by `id`, deliberately NOT by vector distance. Every eligible article gets
+      # linked either way, so the distance ordering became cosmetic once the `limit: pool`
+      # came off — and it is not free: ordering the WHOLE prod-floor corpus by `<=>` is an
+      # unbounded sort / index walk paid on every nightly run for no assertion value.
       nearest_ids =
         AdminRepo.all(
           from(a in Article,
             where: a.tenant_id == ^tenant.id and a.status == :published,
             where: not is_nil(a.embedding) and a.id != ^target.id,
-            order_by: [asc: fragment("? <=> ?", a.embedding, ^target_vec)],
+            order_by: [asc: a.id],
             select: a.id
           )
         )
@@ -221,8 +222,11 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
         assert measurements.requested == 5
         assert measurements.returned < 5
         assert measurements.pool == pool
-        # The ANN delivered candidates (bounded by ef_search ~40, so typically < pool —
-        # which is exactly why the old `>= pool` pool-full gate was degenerate and is gone).
+        # The ANN delivered candidates. Under the iterative scan `config/test.exs` pins ON
+        # (see the comment above) the reachable set is NOT bounded by one ef_search batch —
+        # it is bounded by the `LIMIT pool` / `hnsw.max_scan_tuples` the scan stops at — so
+        # asserting anything about its SIZE is asserting a scan-depth accident, which is
+        # exactly why the old `>= pool` pool-full gate was degenerate and is gone.
         assert measurements.ann_candidates > 0
         # Near neighbors genuinely EXIST among what the ANN surfaced (threshold 0.0 → the
         # nearest are all above the bar) but the anti-join hid them — this is what separates

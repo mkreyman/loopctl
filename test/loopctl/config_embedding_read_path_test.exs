@@ -187,11 +187,20 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
   @uses_case_template ~r/^\s*use\s+Loopctl\.(DataCase|ConnCase)\b/m
   @calls_stub_all_defaults ~r/^\s*(Loopctl\.DataCase\.)?stub_all_defaults\(\)/m
   @calls_set_mox_global ~r/^\s*(Mox\.)?set_mox_global\(\)/m
+  # Classified by the TAG that makes a module skip `mix precommit`, not by its filename:
+  # three `:scale` modules (scale_recall_test.exs, scale_seed_test.exs,
+  # scale_seed_nightly_test.exs) do not end in `_scale_test.exs`, so the old glob left them
+  # unpoliced — the same "the guard went blind because the name moved" failure this file's
+  # other guards warn about.
+  @scale_moduletag ~r/^\s*@moduletag\s+:scale(_nightly)?\b/m
 
   defp bare_exunit_scale_modules do
-    "test/**/*_scale_test.exs"
+    "test/**/*_test.exs"
     |> Path.wildcard()
-    |> Enum.reject(&(File.read!(&1) =~ @uses_case_template))
+    |> Enum.filter(fn file ->
+      source = File.read!(file)
+      source =~ @scale_moduletag and not (source =~ @uses_case_template)
+    end)
   end
 
   describe "bare-ExUnit scale modules stub the injected collaborators" do
@@ -211,6 +220,12 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
                @calls_stub_all_defaults,
              "a COMMENT naming the helper must not count as calling it"
 
+      assert "  @moduletag :scale" =~ @scale_moduletag
+      assert "  @moduletag :scale_nightly" =~ @scale_moduletag
+
+      refute "  # tagged `@moduletag :scale` so precommit skips it" =~ @scale_moduletag,
+             "a COMMENT naming the tag must not count as carrying it"
+
       assert "    Mox.set_mox_global()" =~ @calls_set_mox_global
 
       refute "  # `set_mox_global` makes the stub visible from any process" =~
@@ -221,7 +236,7 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
              "the glob/classifier matched NO modules — the guards below would be vacuous"
     end
 
-    test "every *_scale_test.exs without DataCase/ConnCase calls stub_all_defaults/0" do
+    test "every :scale-tagged module without DataCase/ConnCase calls stub_all_defaults/0" do
       missing =
         bare_exunit_scale_modules()
         |> Enum.reject(&(File.read!(&1) =~ @calls_stub_all_defaults))
