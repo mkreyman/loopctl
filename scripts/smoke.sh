@@ -263,7 +263,12 @@ fi
 #
 # `ready` is read with the documented fallback to `.status == "ok"` for a
 # :health_checker implementation that omits the field (LoopctlWeb.HealthController.ready/2
-# does the same). The endpoint answers 503 when not ready, so any OTHER code is a fail.
+# does the same). Such an implementation also omits `checks.scale_alerts`, so an ABSENT
+# guard is a WARN — the hard gate needs an explicit non-"ok" value, not a missing key,
+# or an alternative checker reddens the deploy for a non-regression (the #363 lesson).
+# The endpoint answers 200 when ready and 503 when not, so any other code — and any
+# code/flag DISAGREEMENT (503 with ready:true, or 200 with ready:false) — is a
+# regression in the status mapping itself and fails hard.
 http GET "$BASE_URL/health/ready"
 ready_scale="$(jq -r '.checks.scale_alerts // "missing"' "$BODY" 2>/dev/null || echo missing)"
 ready_flag="$(jq -r 'if has("ready") then (.ready | tostring) else (.status == "ok" | tostring) end' \
@@ -275,9 +280,18 @@ if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "503" ]; then
 elif [ "$TIME_MS" -gt "$SMOKE_MAX_MS" ]; then
   fail "readiness (scale-alerts config-guard, US-32.4)" \
     "latency ${TIME_MS}ms exceeds budget ${SMOKE_MAX_MS}ms"
-elif [ "$ready_scale" != "ok" ]; then
+elif [ "$ready_scale" != "ok" ] && [ "$ready_scale" != "missing" ]; then
   fail "readiness (scale-alerts config-guard, US-32.4)" \
     "checks.scale_alerts='${ready_scale}' — $(jq -r '.reasons.scale_alerts // "no reason given"' "$BODY" 2>/dev/null || echo unknown)"
+elif [ "$HTTP_CODE" = "200" ] && [ "$ready_flag" != "true" ]; then
+  fail "readiness (scale-alerts config-guard, US-32.4)" \
+    "HTTP 200 with ready='${ready_flag}' — status/flag disagreement, the endpoint must answer 503 when not ready"
+elif [ "$HTTP_CODE" = "503" ] && [ "$ready_flag" = "true" ]; then
+  fail "readiness (scale-alerts config-guard, US-32.4)" \
+    "HTTP 503 with ready=true — status/flag disagreement, the endpoint must answer 200 when ready"
+elif [ "$ready_scale" = "missing" ]; then
+  warn "readiness (US-32.4)" \
+    "no checks.scale_alerts in the body (ready='${ready_flag}') — the config guard was not evaluated, so this deploy is unchecked rather than clean"
 elif [ "$ready_flag" = "true" ]; then
   pass "readiness (scale-alerts config-guard, US-32.4)"
 else

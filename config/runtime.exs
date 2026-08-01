@@ -413,10 +413,13 @@ if config_env() == :prod do
   # ENABLED, where the readiness guard is still watching — the failure mode of a
   # mistyped value must never be silently-no-alerting. That asymmetry is pinned by
   # test/loopctl/config_test.exs, since this prod-only file is never evaluated by the
-  # suite (same in-lib-so-it-is-testable shape as Loopctl.ObanConfig above).
+  # suite (same in-lib-so-it-is-testable shape as Loopctl.ObanConfig above). The
+  # System.get_env/1 read stays HERE and the helper takes the VALUE: mix
+  # loopctl.check_env_docs scans this file textually for System.get_env("NAME"), so a
+  # name passed into lib/ would drop the variable out of the undocumented-var guard.
   config :loopctl,
          :scale_alerts_enabled,
-         Loopctl.Config.opt_out_flag("SCALE_ALERTS_ENABLED")
+         Loopctl.Config.opt_out_enabled?(System.get_env("SCALE_ALERTS_ENABLED"))
 
   config :loopctl, :scale_alert_webhook_url, System.get_env("SCALE_ALERT_WEBHOOK_URL")
 
