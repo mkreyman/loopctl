@@ -16,9 +16,13 @@ Operator-facing changes for deployments outside the hosted instance.
   `human_anchored`, a self-hosted deployment could never reach the chain-of-custody
   surface at all. `dev.exs`/`test.exs` already overrode this for localhost; only a prod
   release had no way to. Unset, the hosted deployment is byte-for-byte unchanged.
-  `WEBAUTHN_ORIGIN` defaults to `https://$WEBAUTHN_RP_ID`; set it explicitly for localhost
-  or a non-standard port, since WebAuthn runs only in a secure context (localhost being
-  the one `http://` exception).
+  Each var applies independently. `WEBAUTHN_ORIGIN` defaults to `https://$PHX_HOST` — the
+  page host, not the `rp_id`, since `rp_id` may legally be a registrable parent domain of
+  it — and must be set explicitly for localhost or a non-standard port, since WebAuthn runs
+  only in a secure context (localhost being the one `http://` exception). A blank or
+  non-host-shaped `WEBAUTHN_RP_ID` is ignored rather than applied. Set `WEBAUTHN_RP_ID`
+  before the first enrollment: credentials are bound to it, so changing it later
+  invalidates every enrolled authenticator.
 - **`SCALE_ALERTS_ENABLED` — off switch for a deployment with no alert receiver (#376).**
   Defaults to `true`, so an existing deployment is unchanged. The parse is deliberately
   opt-OUT and asymmetric with loopctl's other boolean env vars: only `false` or `0`

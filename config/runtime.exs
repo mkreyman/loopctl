@@ -542,19 +542,48 @@ if config_env() == :prod do
   # and test settings — including during `mix test`, where it would break the WebAuthn
   # suite in a way that looks nothing like its cause.
   #
-  # `rp_id` unset leaves `config.exs` untouched, so the hosted deployment is unaffected.
+  # All three vars apply INDEPENDENTLY — `Config` deep-merges keyword lists onto the
+  # `config.exs` block, so setting only WEBAUTHN_ORIGIN (e.g. a www-serving edge on the
+  # hosted default) takes effect. Unset leaves `config.exs` untouched.
   #
-  # The origin defaults to `https://<rp_id>` rather than being derived with a scheme and
-  # port: WebAuthn only runs in a secure context (https, or localhost as the one
-  # exception), so an http:// default can never work for a real domain — it would fail the
-  # ceremony with a browser-side error rather than a configuration one. A localhost or
-  # non-standard-port deployment must set WEBAUTHN_ORIGIN explicitly.
-  if webauthn_rp_id = System.get_env("WEBAUTHN_RP_ID") do
-    config :loopctl, :webauthn,
+  # A BLANK value is treated as unset, and an `rp_id` that is not bare-host-shaped (a
+  # scheme, port, path or whitespace) is ignored: an empty string is truthy in Elixir, so
+  # the naive `if System.get_env(...)` set `rp_id: ""` and broke every ceremony while the
+  # release booted clean. A bad value leaves the compiled default in place rather than
+  # crashing boot (epic_35 STH_SWEEP_CRON lesson).
+  #
+  # The origin defaults to `https://<PHX_HOST>` — the page host — NOT to `https://<rp_id>`:
+  # `rp_id` need only be a registrable SUFFIX of the origin, so a parent-domain `rp_id`
+  # (`example.com` while serving `app.example.com`) is legal and common, and deriving the
+  # origin from it makes Wax reject an attestation the browser was happy to produce. There
+  # is no http:// default: WebAuthn runs only in a secure context (localhost the one
+  # exception), so localhost or a non-standard port must set WEBAUTHN_ORIGIN explicitly.
+  #
+  # WEBAUTHN_RP_ID is effectively WRITE-ONCE: stored credentials are bound to it via
+  # rpIdHash, so changing it after any enrollment fails every later assertion closed.
+  webauthn_env = fn name ->
+    case String.trim(System.get_env(name) || "") do
+      "" -> nil
+      value -> value
+    end
+  end
+
+  webauthn_rp_id =
+    case webauthn_env.("WEBAUTHN_RP_ID") do
+      nil -> nil
+      value -> if Regex.match?(~r/^[a-zA-Z0-9.-]+$/, value), do: value
+    end
+
+  webauthn_opts =
+    [
       rp_id: webauthn_rp_id,
-      rp_name: System.get_env("WEBAUTHN_RP_NAME") || "loopctl",
-      origin: System.get_env("WEBAUTHN_ORIGIN") || "https://#{webauthn_rp_id}",
-      user_verification: "preferred"
+      rp_name: webauthn_env.("WEBAUTHN_RP_NAME"),
+      origin: webauthn_env.("WEBAUTHN_ORIGIN") || (webauthn_rp_id && "https://#{host}")
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+
+  if webauthn_opts != [] do
+    config :loopctl, :webauthn, webauthn_opts
   end
 
   config :loopctl, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
