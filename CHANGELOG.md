@@ -8,6 +8,17 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Added
 
+- **`SCALE_ALERTS_ENABLED` — off switch for a deployment with no alert receiver (#376).**
+  Defaults to `true`, so an existing deployment is unchanged. The parse is deliberately
+  opt-OUT and asymmetric with loopctl's other boolean env vars: only `false` or `0`
+  disable (trimmed, case-insensitive), so a typo leaves alerting **on**, where its guard
+  is still watching, rather than silently off. **Disabled stops the whole checker** — the
+  supervised `ScaleAlerts` child is not started, so nothing is evaluated, logged *or*
+  POSTed; the Prometheus series on `METRICS_PORT` are unaffected and remain the
+  degradation signal. Enabling alerting is now a two-part change (`SCALE_ALERT_WEBHOOK_URL`
+  **and** this flag) and `/health/ready` reports `checks.scale_alerts: "error"` for either
+  half-done direction, naming the setting to fix. The hosted deployment ships this `false`
+  via `fly.toml` until an operator webhook receiver exists.
 - **`FTS_REGCONFIG` — per-deployment keyword-search language (#492).** Keyword FTS
   was hardwired to the `english` stemmer, so a non-English corpus silently degraded
   (Russian «отчёты» never matched «отчёт»). `Loopctl.Search.Regconfig` is now the

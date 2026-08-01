@@ -248,20 +248,58 @@ fi
 # EXCLUDES this so a benign config-only issue never depools an otherwise-healthy
 # node from Fly's load-balancer check.
 #
-# In post-deploy smoke, a readiness miss is surfaced as a WARN, not a hard FAIL:
-# an unconfigured alert webhook is an ops-completeness gap, NOT a regression
-# introduced by the deploy under test. Real outages are already hard-gated above
-# (db+oban liveness) and below (KB count/retrieval/memory/auth); reddening every
-# deploy on a pre-existing config gap would only train us to ignore a red smoke
-# run and would mask a genuine regression. The readiness ENDPOINT stays strict
-# for orchestration probes. Prod alerting is configured in Epic 2 (#349); once
-# SCALE_ALERT_WEBHOOK_URL is set, /health/ready returns 200 and this WARN clears.
+# This was DOWNGRADED to a non-blocking WARN (#363) because prod sat in a state the
+# guard flags permanently: scale alerts enabled with no SCALE_ALERT_WEBHOOK_URL. A
+# check that is red on every single deploy trains everyone to ignore it, which is worse
+# than not having it. #376 removed that state instead of tolerating it — prod now sets
+# SCALE_ALERTS_ENABLED=false (fly.toml) while no receiver exists.
+#
+# So the HARD gate is re-armed on the CONFIG GUARD ONLY (checks.scale_alerts), the one
+# input that a bad deploy actually introduces. `ready` also folds in oban_orphans
+# (US-34.2) and liveness, which are pre-existing RUNTIME state: a standing orphan
+# backlog would otherwise redden every deploy and recreate the #363 alarm fatigue
+# through a different signal — and it would contradict the /health check above, which
+# deliberately WARNs on Oban-only degradation. Those stay a WARN here too.
+#
+# `ready` is read with the documented fallback to `.status == "ok"` for a
+# :health_checker implementation that omits the field (LoopctlWeb.HealthController.ready/2
+# does the same). Such an implementation also omits `checks.scale_alerts`, so an ABSENT
+# guard is a WARN — the hard gate needs an explicit non-"ok" value, not a missing key,
+# or an alternative checker reddens the deploy for a non-regression (the #363 lesson).
+# The endpoint answers 200 when ready and 503 when not, so any other code — and any
+# code/flag DISAGREEMENT (503 with ready:true, or 200 with ready:false) — is a
+# regression in the status mapping itself and fails hard.
 http GET "$BASE_URL/health/ready"
-if [ "$HTTP_CODE" = "200" ]; then
-  printf '%s readiness (US-32.4) (%sms)\n' "$OK" "$TIME_MS"
+ready_scale="$(jq -r '.checks.scale_alerts // "missing"' "$BODY" 2>/dev/null || echo missing)"
+ready_flag="$(jq -r 'if has("ready") then (.ready | tostring) else (.status == "ok" | tostring) end' \
+  "$BODY" 2>/dev/null || echo missing)"
+
+if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "503" ]; then
+  fail "readiness (scale-alerts config-guard, US-32.4)" \
+    "expected HTTP 200 or 503, got $HTTP_CODE ($(head -c 200 "$BODY" 2>/dev/null | tr '\n' ' '))"
+elif [ "$TIME_MS" -gt "$SMOKE_MAX_MS" ]; then
+  fail "readiness (scale-alerts config-guard, US-32.4)" \
+    "latency ${TIME_MS}ms exceeds budget ${SMOKE_MAX_MS}ms"
+elif [ "$ready_scale" != "ok" ] && [ "$ready_scale" != "warn" ] && [ "$ready_scale" != "missing" ]; then
+  fail "readiness (scale-alerts config-guard, US-32.4)" \
+    "checks.scale_alerts='${ready_scale}' — $(jq -r '.reasons.scale_alerts // "no reason given"' "$BODY" 2>/dev/null || echo unknown)"
+elif [ "$HTTP_CODE" = "200" ] && [ "$ready_flag" != "true" ]; then
+  fail "readiness (scale-alerts config-guard, US-32.4)" \
+    "HTTP 200 with ready='${ready_flag}' — status/flag disagreement, the endpoint must answer 503 when not ready"
+elif [ "$HTTP_CODE" = "503" ] && [ "$ready_flag" = "true" ]; then
+  fail "readiness (scale-alerts config-guard, US-32.4)" \
+    "HTTP 503 with ready=true — status/flag disagreement, the endpoint must answer 200 when ready"
+elif [ "$ready_scale" = "missing" ]; then
+  warn "readiness (US-32.4)" \
+    "no checks.scale_alerts in the body (ready='${ready_flag}') — the config guard was not evaluated, so this deploy is unchecked rather than clean"
+elif [ "$ready_scale" = "warn" ]; then
+  warn "readiness (scale-alerts config, US-32.4)" \
+    "$(jq -r '.reasons.scale_alerts // "no reason given"' "$BODY" 2>/dev/null || echo unknown) — alerting is configured incoherently but the deployment is otherwise healthy; fix the config, do not roll back"
+elif [ "$ready_flag" = "true" ]; then
+  pass "readiness (scale-alerts config-guard, US-32.4)"
 else
-  warn "readiness (scale-alerts config-guard, US-32.4)" \
-    "HTTP $HTTP_CODE — $(head -c 200 "$BODY" 2>/dev/null | tr '\n' ' ') [non-blocking: ops config gap, not a deploy regression; alerting configured in Epic 2 #349]"
+  warn "readiness (US-32.4)" \
+    "not ready with scale_alerts=ok (oban_orphans='$(jq -r '.checks.oban_orphans // "missing"' "$BODY" 2>/dev/null || echo missing)', status='$(jq -r '.status // "missing"' "$BODY" 2>/dev/null || echo missing)') — pre-existing runtime state, not a deploy config regression"
 fi
 
 # --- KB retrieval crown jewels (authed, read-only) -----------------------------

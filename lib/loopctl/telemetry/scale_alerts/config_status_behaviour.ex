@@ -8,7 +8,12 @@ defmodule Loopctl.Telemetry.ScaleAlerts.ConfigStatusBehaviour do
   without the forbidden `Application.put_env`. The default resolution
   (`Loopctl.Telemetry.ScaleAlerts`, which already implements `config_status/0`) is
   untouched in dev/prod.
+
+  `{:warn, reason}` (#376) is the third state: an incoherent-but-legitimate configuration
+  (a webhook URL set while the checker is disabled) that is surfaced in
+  `checks`/`reasons` but deliberately does NOT block `ready`. See
+  `ScaleAlerts.config_status/2` for why that one is graded below `{:error, _}`.
   """
 
-  @callback config_status() :: :ok | {:error, String.t()}
+  @callback config_status() :: :ok | {:warn, String.t()} | {:error, String.t()}
 end

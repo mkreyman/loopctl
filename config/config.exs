@@ -154,10 +154,15 @@ config :loopctl,
   # breach POSTs a small id-only alert to an operator webhook via the SAME
   # `:webhook_delivery` DI the webhook worker uses (no tenant content / vectors / SQL).
   # - scale_alerts_enabled: start the SUPERVISED ScaleAlerts child. OFF by default (so
-  #   :test never runs its timers / owns its ETS table); turned ON in prod (runtime.exs).
+  #   :test never runs its timers / owns its ETS table). runtime.exs defaults it ON in
+  #   prod, but it is an env toggle (SCALE_ALERTS_ENABLED, #376) and the hosted
+  #   deployment currently ships it "false" via fly.toml, so the child is NOT started
+  #   there today. OFF means the whole checker is absent — nothing evaluated or logged,
+  #   not merely nothing POSTed.
   # - scale_alert_webhook_url: the operator webhook (Slack/PagerDuty/generic). nil =
   #   alerting OFF (opt-in) — a breach is logged, nothing is POSTed. Set in runtime.exs
-  #   from SCALE_ALERT_WEBHOOK_URL.
+  #   from SCALE_ALERT_WEBHOOK_URL. The two settings must AGREE: either combination of
+  #   one-without-the-other is flagged by ScaleAlerts.config_status/2.
   # - scale_alert_check_interval_ms: how often the tumbling window is evaluated + reset.
   # - scale_alert_window_ms: the window length (defaults to the check interval) — used to
   #   turn counts into per-minute rates and to report window_seconds in the payload.

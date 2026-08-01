@@ -19,6 +19,15 @@ primary_region = "lax"
   PHX_HOST = "loopctl.com"
   PORT = "8080"
   PHX_SERVER = "true"
+  # #376: alerting is OFF until an operator webhook receiver exists. OFF means OFF, not
+  # log-only: LoopctlWeb.Telemetry.scale_alerts_children/0 omits the ScaleAlerts child
+  # entirely, so no telemetry handlers are attached, no threshold is evaluated and no
+  # breach is logged. The Prometheus series (ScaleMetrics, the [metrics] port below) are
+  # unaffected and remain the degradation signal while this is "false". Delete this line
+  # (or set "true") in the SAME change that sets the SCALE_ALERT_WEBHOOK_URL secret —
+  # ScaleAlerts.config_status/2 flags BOTH half-done directions, so doing one without the
+  # other turns /health/ready red with a reason naming the setting to fix.
+  SCALE_ALERTS_ENABLED = "false"
 
 [http_service]
   internal_port = 8080

@@ -32,8 +32,30 @@ defmodule Loopctl.Telemetry.ScaleAlertsConfigTest do
       assert ScaleAlerts.config_status(false, nil) == :ok
     end
 
-    test "disabled + missing url regardless of url value stays ok (opt-out is clean)" do
-      assert ScaleAlerts.config_status(false, "anything") == :ok
+    test "disabled + blank url is a clean opt-out" do
+      for blank <- ["", "   ", :not_a_string] do
+        assert ScaleAlerts.config_status(false, blank) == :ok
+      end
+    end
+
+    # #376 made this combination reachable in prod: before SCALE_ALERTS_ENABLED existed
+    # prod was always enabled, so "URL set but disabled" could not happen there and
+    # `config_status(false, _)` returned :ok unconditionally. It is now the likelier half
+    # of a forgotten two-part enable, and the worse one in effect — disabled omits the
+    # supervised child entirely, so unlike enabled-without-a-URL there is not even a
+    # breach log.
+    test "disabled + a url present WARNS, naming the flag that is off" do
+      assert {:warn, reason} = ScaleAlerts.config_status(false, "https://hooks.example.test/a")
+      assert reason =~ "SCALE_ALERTS_ENABLED"
+      assert reason =~ "SCALE_ALERT_WEBHOOK_URL"
+    end
+
+    test "the disabled-with-url reason never includes the URL value" do
+      assert {:warn, reason} =
+               ScaleAlerts.config_status(false, "https://hooks.example.test/secret-path")
+
+      refute reason =~ "hooks.example.test"
+      refute reason =~ "secret-path"
     end
 
     test "AC-32.4.5: the error reason never includes a URL value" do

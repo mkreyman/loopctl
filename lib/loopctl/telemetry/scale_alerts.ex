@@ -157,9 +157,13 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
 
   ## Test-env gate
 
-  Started in prod (`:scale_alerts_enabled` true in `runtime.exs`); in `:test` it is NOT
-  auto-started (default `false`) so the suite never runs background timers, owns the ETS
-  table, or binds anything. Tests start it directly with a short window and drive
+  `runtime.exs` defaults `:scale_alerts_enabled` to true in prod, but the value is an env
+  toggle (`SCALE_ALERTS_ENABLED`, #376) and the hosted deployment currently ships it
+  **`false`** via `fly.toml`'s `[env]` block, because no operator webhook receiver exists
+  yet. Disabled means this child is never started at all — no window, no handlers, no
+  tick — so nothing here runs in the hosted deployment today. In `:test` it is likewise
+  NOT auto-started (default `false`) so the suite never runs background timers, owns the
+  ETS table, or binds anything. Tests start it directly with a short window and drive
   `evaluate/0`.
   """
   use GenServer
@@ -358,13 +362,31 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   def webhook_url, do: Application.get_env(:loopctl, :scale_alert_webhook_url)
 
   @doc """
-  Pure config-guard (US-32.4): validates that a webhook URL is configured whenever
-  scale alerts are enabled. A misconfigured deploy (`scale_alerts_enabled: true` with no
-  `SCALE_ALERT_WEBHOOK_URL`) silently disables the firing path — the breach is only
-  logged, never delivered — so an operator believes alerting is on when it is not. This
-  function is the pure guard surfaced by `Loopctl.HealthCheck.Default` so a misconfigured
-  deploy fails a READINESS signal (readiness-flag approach, NOT a boot-raise: raising in
-  `runtime.exs` could take a live fleet down on a bad deploy).
+  Pure config-guard (US-32.4): validates that alerting is configured COHERENTLY — the
+  enable flag and the webhook URL must agree. The failure it exists to catch is one an
+  operator cannot see: **believing alerting is on when it is not.** This function is the
+  pure guard surfaced by `Loopctl.HealthCheck.Default` so a misconfigured deploy fails a
+  READINESS signal (readiness-flag approach, NOT a boot-raise: raising in `runtime.exs`
+  could take a live fleet down on a bad deploy).
+
+  The two incoherent combinations are NOT equally severe, and the guard grades them:
+
+    * **enabled, no URL → `{:error, _}`** (blocks `ready`). The checker runs and breaches
+      are logged, but nothing is ever POSTed. Unambiguously wrong: enabling alerting is a
+      positive act, so there is no reading under which the operator wanted this.
+    * **URL set, disabled → `{:warn, _}`** (surfaced, does NOT block `ready`, #376). Since
+      `SCALE_ALERTS_ENABLED` exists this is reachable, and it is the likelier half of a
+      forgotten two-part enable — worse in effect, too, since `LoopctlWeb.Telemetry` omits
+      the child entirely (no window, no handler, no tick, not even a breach log). But it
+      is ALSO a legitimate standing configuration: `config/test.exs` sets a URL for the
+      delivery tests while leaving the checker off, and an operator may deliberately pause
+      alerting without tearing out the secret. A configuration a healthy deployment
+      genuinely uses must not fail a deploy gate — so it is reported, loudly and by name,
+      and left for a human to read.
+
+  That asymmetry is the point: a signal that reds a legitimate setup gets suppressed, and
+  then it is worth nothing in the case it was built for (this is the #363 lesson — see
+  `scripts/smoke.sh`).
 
   IMPORTANT (post-review correction): this guard does NOT flip `/health`'s top-level
   `status` — `fly.toml` wires plain `GET /health` as the CONTINUOUS load-balancer
@@ -380,8 +402,16 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   treated as unset. The error reason names the env var only — never a URL value (no
   secret is logged).
   """
-  @spec config_status(boolean(), String.t() | nil) :: :ok | {:error, String.t()}
-  def config_status(false, _url), do: :ok
+  @spec config_status(boolean(), String.t() | nil) ::
+          :ok | {:warn, String.t()} | {:error, String.t()}
+  def config_status(false, url) do
+    if blank?(url) do
+      :ok
+    else
+      {:warn,
+       "SCALE_ALERT_WEBHOOK_URL is set but scale alerts are disabled (SCALE_ALERTS_ENABLED)"}
+    end
+  end
 
   def config_status(true, url) do
     if blank?(url) do
@@ -393,7 +423,7 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
 
   @doc "Zero-arg convenience: `config_status/2` fed from the live app env."
   @impl Loopctl.Telemetry.ScaleAlerts.ConfigStatusBehaviour
-  @spec config_status() :: :ok | {:error, String.t()}
+  @spec config_status() :: :ok | {:warn, String.t()} | {:error, String.t()}
   def config_status do
     config_status(Application.get_env(:loopctl, :scale_alerts_enabled, false), webhook_url())
   end

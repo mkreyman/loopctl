@@ -682,7 +682,7 @@ Alertmanager is required.
 
 | Key | Env var | Default | Meaning |
 | --- | --- | --- | --- |
-| `:scale_alerts_enabled` | — | `false` (prod `true`) | Start the supervised checker. OFF in `:test` so the suite never runs its timers / owns its ETS table. |
+| `:scale_alerts_enabled` | `SCALE_ALERTS_ENABLED` | `false` (runtime.exs prod default `true`; **hosted prod ships `false`** via `fly.toml:31`) | Start the supervised checker. Opt-OUT parse — only `false`/`0` disable, so a typo leaves it ON. OFF means the child is never started: nothing evaluated, logged **or** POSTed. OFF in `:test` so the suite never runs its timers / owns its ETS table. |
 | `:scale_alert_webhook_url` | `SCALE_ALERT_WEBHOOK_URL` | `nil` | Operator webhook (Slack/PagerDuty/generic). `nil` = alerting off (log-only). |
 | `:scale_alert_check_interval_ms` | `SCALE_ALERT_CHECK_INTERVAL_MS` | `60000` | Window evaluate-and-reset cadence. |
 | `:scale_alert_window_ms` | — | = check interval | Window length for rate math / `window_seconds`. |
@@ -690,8 +690,12 @@ Alertmanager is required.
 | `:scale_alert_p95_latency_ms` | `SCALE_ALERT_P95_LATENCY_MS` | `2000` | p95 heavy-read latency threshold (ms). |
 | `:scale_alert_under_fill_rate_per_min` | `SCALE_ALERT_UNDER_FILL_RATE_PER_MIN` | `30` | Under-fill rate threshold (events/min). |
 
-To enable alerting in prod: set `SCALE_ALERT_WEBHOOK_URL` to a Slack/PagerDuty/generic
-incoming webhook. Tune the three thresholds per environment via their env vars.
+To enable alerting in prod, do **both** halves in one change (#376): set
+`SCALE_ALERT_WEBHOOK_URL` to a Slack/PagerDuty/generic incoming webhook **and** set
+`SCALE_ALERTS_ENABLED = "true"` in `fly.toml` (or delete the line — `true` is the runtime
+default). Either half alone is an incoherent config, and `ScaleAlerts.config_status/2`
+turns `/health/ready` red for both directions with a reason naming the setting to fix.
+Tune the thresholds per environment via their env vars.
 
 ### Optional self-hosted alert rules (PromQL — requires YOUR OWN Grafana/Alertmanager)
 
