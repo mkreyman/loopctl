@@ -6,10 +6,14 @@ on:
   pull_request:
     branches: [master]
   schedule:
-    # Nightly at 02:00 UTC — runs scale-nightly job (TC-27.1.5, prod-floor HNSW plan check)
+    # Nightly at 02:00 UTC — the ordinary jobs (lint / test / retrieval-eval / security /
+    # dialyzer / scale-test / pgbouncer-e2e). Explicitly NOT scale-nightly: that matrix is
+    # gated to manual dispatch and would otherwise hold the one self-hosted runner
+    # for hours every night, queued ahead of ordinary PR checks.
     - cron: "0 2 * * *"
-  # Manual trigger so the (otherwise schedule-only) scale-nightly matrix can be RUN and
-  # validated on a branch BEFORE merge — `gh workflow run CI --ref <branch>` (US-27.5).
+  # Manual trigger so the scale-nightly matrix can be RUN and validated on a branch BEFORE
+  # merge — `gh workflow run CI --ref <branch>` (US-27.5). This is the PRIMARY trigger for a
+  # Theme-2/3/4 change, and since there is no cron it is the ONLY thing that runs the matrix.
   # Without this the matrix change is never exercised by its own PR.
   workflow_dispatch:
 
@@ -34,20 +38,18 @@ env:
 #   scale-test      3.1-5.1 min, EVERY push and PR -- its `if:` is
 #                   schedule || push || pull_request, i.e. effectively always.
 #                   (An earlier version of this comment called it
-#                   "schedule/dispatch-gated ... rare". That was wrong: only
-#                   scale-nightly is schedule-gated. The mistake understated the
-#                   recurring cost, which is exactly the number this block exists
-#                   to make visible.)
-#   scale-nightly   ~143 min per night across the 14-file matrix (one outlier,
-#                   streaming_export, is 40 min on its own) => ~4,300 min/month,
-#                   which is the LARGEST remaining hosted-minutes line item by a
-#                   wide margin. Schedule/dispatch only. Porting it needs a
-#                   per-matrix-file database rather than a per-job fresh
-#                   container: planner stats live in the per-database
-#                   pg_statistic, so distinct DBs on one cluster give the same
-#                   cross-file isolation the fresh service container gives today.
-#                   beelink can host it (PostgreSQL 16.13, pgvector 0.8.2
-#                   available, matching the pgvector/pgvector:pg16 service).
+#                   "schedule/dispatch-gated ... rare". That was wrong: it is the
+#                   narrowly-gated scale-NIGHTLY matrix that is rare. The mistake
+#                   understated the recurring cost, which is exactly the number
+#                   this block exists to make visible.)
+#   scale-nightly   ZERO billed hosted minutes: it moved to beelink (the port is
+#                   DONE -- see the per-matrix-file database note on the job) and
+#                   it no longer runs nightly. ~143 min of beelink wall clock per
+#                   full 14-file matrix (one outlier, streaming_export, is 40 min
+#                   on its own), now only on an explicit dispatch plus any
+#                   manual dispatch -- so ~620 min/month (143 x 52/12) of self-hosted time in
+#                   place of the ~4,300 billed min/month it used to be, when it
+#                   was the largest hosted line item by a wide margin.
 #   deploy          Holds Fly deploy credentials and needs flyctl. Keeping release
 #   smoke           authority on GitHub-hosted runners is deliberate and should
 #                   NOT be "optimised" onto beelink: that box holds Mark's SSH
@@ -469,9 +471,11 @@ jobs:
       # ON EVERY PR it runs ONE dimension — the hosted default, 1536 — because each
       # dimension seeds ~30k HNSW-indexed article rows PLUS ~30k memory rows, and
       # seeding the whole supported set on every push is not worth the wall clock. The
-      # FULL supported set (768 / 1024 / 1536) runs in the schedule-only scale-nightly
-      # matrix, which leaves EMBEDDING_PLAN_GATE_DIMENSIONS unset. This step is the
-      # gate; AC-41.1.12(ii)'s production EXPLAIN is an artifact report, not CI.
+      # FULL supported set (768 / 1024 / 1536) runs in the scale-nightly matrix, which
+      # leaves EMBEDDING_PLAN_GATE_DIMENSIONS unset — so 768 and 1024 keep an AUTOMATIC
+      # plan assertion, which now runs only on an explicit pre-merge dispatch.
+      # This step is the gate; AC-41.1.12(ii)'s production EXPLAIN is an artifact report,
+      # not CI.
       - name: Run per-dimension ANN plan gate (TC-41.1.2, AC-41.1.12(i))
         run: |
           SCALE_TESTS=true mix test --only scale \
@@ -583,10 +587,24 @@ jobs:
 
   scale-nightly:
     name: Scale Nightly (${{ matrix.scale_file }})
-    # Runs nightly to assert every heavy endpoint's planner path at PROD_ARTICLE_FLOOR
-    # (~80k articles) — the cost-based choices that only appear at production scale.
-    # US-27.5 (AC-27.5.3): this is the scale GATE — it runs every :scale_nightly test
+    # Asserts every heavy endpoint's planner path at PROD_ARTICLE_FLOOR (~80k articles) —
+    # the cost-based choices that only appear at production scale.
+    # US-27.5 (AC-27.5.3): this is the scale GATE — it covers every :scale_nightly test
     # (HNSW ANN, keyset enumeration, shared plan assertions), not just scale_seed.
+    #
+    # NO LONGER RUNS ON ANY SCHEDULE — MANUAL DISPATCH ONLY (the "nightly"
+    # in the name is kept because the tag, the job and the runbooks all use it). It was a
+    # prod-scale PROOF, not a per-night regression watch, and as a NIGHTLY job it stopped
+    # paying for itself: 14 matrix jobs, each seeding ~80k committed rows, serially on ONE
+    # self-hosted runner — hours of beelink every night, QUEUED AHEAD of ordinary PR checks,
+    # so a routine PR could sit unmergeable behind a scale run nobody asked for.
+    # No schedule arm is kept. The trade is stated plainly: most planner/index CHOICE
+    # drift arrives with a query/index/corpus change (covered by the pre-merge dispatch),
+    # but a Postgres/pgvector upgrade, an ANALYZE shift or a migration that fails to build
+    # an HNSW index moves it with NO PR to hang a gate on, and this matrix is the only
+    # place any plan-choice assertion runs at the 80k prod floor.
+    # Run it deliberately: `gh workflow run CI --ref <branch>`, or per-file locally via
+    # docs/runbooks/knowledge_scale_verification.md.
     #
     # MATRIX, one isolated job per scale file: each scale test seeds ~80k COMMITTED
     # (unboxed) rows and cleans up only its own tenant. Running them in one process
@@ -597,7 +615,7 @@ jobs:
     #
     # This was the single largest GitHub-hosted line item: ~143 min of billed runner
     # time per night across the 14 files, roughly 4,300 min/month, dwarfing every other
-    # hosted job combined. Moved to beelink.
+    # hosted job combined. Moved to beelink, and off the nightly cron — see above.
     #
     # The isolation used to come from a FRESH Postgres service container per matrix job.
     # On the self-hosted box there is one long-lived Postgres, so isolation comes from a
@@ -608,11 +626,33 @@ jobs:
     # DOES share is CPU, shared_buffers and disk — which affects timing, not the plan
     # CHOICE these tests assert on, and the matrix runs serially on one runner anyway.
     runs-on: [self-hosted, beelink]
-    # Schedule (nightly) OR manual dispatch (pre-merge validation on a branch). Not
-    # every-PR: the 4×80k seed is too slow for every push, so the enforced pre-merge
-    # step for a Theme-2/3/4 (query/index) change is `gh workflow run CI --ref <branch>`
-    # or the local run in docs/runbooks/knowledge_scale_verification.md.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # MANUAL DISPATCH, PLUS THE WEEKLY CRON ONLY. Not every-PR (the 80k seed per file is far
+    # too slow for every push) and no longer every night. The enforced pre-merge step for a
+    # Theme-2/3/4 (query/index) change is `gh workflow run CI --ref <branch>` or the local
+    # run in docs/runbooks/knowledge_scale_verification.md.
+    #
+    # NO schedule arm, deliberately — this matrix does not run on ANY cron. That is the
+    # repo owner's decision, not an oversight, and it is the whole point of the change that
+    # introduced this condition: 14 jobs x an 80k seed, serially on one self-hosted runner,
+    # queued ahead of ordinary PR checks. `test/loopctl/ci_scale_nightly_cron_test.exs`
+    # fails the build if a schedule trigger reappears here or a cron is added for it, so
+    # re-adding one is a deliberate act with the owner, not a quiet edit.
+    #
+    # KNOWN CONSEQUENCE, stated rather than hidden: nothing now runs this gate
+    # automatically. Drift that no PR touches — a Postgres/pgvector upgrade, an ANALYZE
+    # shift, a migration that fails to build an HNSW index — will not be caught until
+    # somebody dispatches it. Dispatch it after any such infrastructure change.
+    if: github.event_name == 'workflow_dispatch'
+    # The derived database is named from the scale FILE alone (loopctl_test_sn_<file>, no
+    # run id — a leftover has to name the file that made it, and run_id would push the
+    # identifier past Postgres's 63-byte limit). So two runs of the same leg would SHARE
+    # one database: two pre-merge dispatches can overlap, and the
+    # first leg to finish DROPs ... WITH (FORCE), killing the other's connections mid-seed
+    # for a false RED. Serialise per file rather than cancel — the queued run is usually
+    # the one a human is waiting on.
+    concurrency:
+      group: scale-nightly-${{ matrix.scale_file }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -776,15 +816,20 @@ jobs:
       # prod-floor corpus with its vectors and HNSW index. Observed live during the first
       # beelink run: 1345 MB for remediation_matrix alone (they vary widely — the
       # calibration file needs only ~14 MB). A full matrix left un-dropped is therefore
-      # on the order of 10 GB added to the box EVERY NIGHT until it filled.
+      # on the order of 10 GB added to the box PER FULL RUN until it filled.
       #
       # `if: always()` so a failed or cancelled gate still reclaims its space — an
       # abandoned corpus is exactly what a timed-out 40-minute seed leaves behind.
       #
       # WITH (FORCE) terminates any connection still attached (Postgres 13+); without it
       # a lingering pool connection makes DROP fail with "database is being accessed by
-      # other users" and the space is never reclaimed. Failure here must not redden a
-      # green gate, so the step reports and swallows.
+      # other users" and the space is never reclaimed.
+      #
+      # A failed drop is REPORTED AND SWALLOWED on a dispatch, where the person who fired
+      # the run is reading the log — cleanup must not redden a gate they are watching. On
+      # an unattended run nobody watches: a warning there is read by no one, and
+      # the orphaned corpus (1345 MB observed for remediation_matrix) accumulates every
+      # week until the box fills. So the schedule arm FAILS instead.
       - name: Drop this job's database
         if: always()
         run: |
@@ -795,6 +840,9 @@ jobs:
           if PGPASSWORD=postgres psql -h localhost -U postgres -c \
                "DROP DATABASE IF EXISTS \"$SCALE_DB\" WITH (FORCE);"; then
             echo "Dropped $SCALE_DB."
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "::error::could not drop $SCALE_DB on an unattended run — reclaim it by hand."
+            exit 1
           else
             echo "::warning::could not drop $SCALE_DB — reclaim it by hand."
           fi
