@@ -55,7 +55,7 @@ env:
 #                   it no longer runs nightly. ~143 min of beelink wall clock per
 #                   full 14-file matrix (one outlier, streaming_export, is 40 min
 #                   on its own), now once a week on the "0 3 * * 0" cron plus any
-#                   manual dispatch -- so ~570 min/month of self-hosted time in
+#                   manual dispatch -- so ~620 min/month (143 x 52/12) of self-hosted time in
 #                   place of the ~4,300 billed min/month it used to be, when it
 #                   was the largest hosted line item by a wide margin.
 #   deploy          Holds Fly deploy credentials and needs flyctl. Keeping release
@@ -642,8 +642,20 @@ jobs:
     # The schedule arm matches the WEEKLY cron string exactly, so the 02:00 nightly cron —
     # which the other CI jobs still run on — never starts this matrix. Change the cron in
     # the `on:` block and you must change it here too; a mismatch silently disables the
-    # only automatic run this gate has.
+    # only automatic run this gate has, with every CI run still green. That is not left to
+    # a comment: test/loopctl/ci_scale_nightly_cron_test.exs fails the build if the string
+    # below is not one of the `on.schedule` crons.
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 3 * * 0'
+    # The derived database is named from the scale FILE alone (loopctl_test_sn_<file>, no
+    # run id — a leftover has to name the file that made it, and run_id would push the
+    # identifier past Postgres's 63-byte limit). So two runs of the same leg would SHARE
+    # one database: the weekly cron now overlaps pre-merge dispatches unattended, and the
+    # first leg to finish DROPs ... WITH (FORCE), killing the other's connections mid-seed
+    # for a false RED. Serialise per file rather than cancel — the queued run is usually
+    # the one a human is waiting on.
+    concurrency:
+      group: scale-nightly-${{ matrix.scale_file }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -814,8 +826,13 @@ jobs:
       #
       # WITH (FORCE) terminates any connection still attached (Postgres 13+); without it
       # a lingering pool connection makes DROP fail with "database is being accessed by
-      # other users" and the space is never reclaimed. Failure here must not redden a
-      # green gate, so the step reports and swallows.
+      # other users" and the space is never reclaimed.
+      #
+      # A failed drop is REPORTED AND SWALLOWED on a dispatch, where the person who fired
+      # the run is reading the log — cleanup must not redden a gate they are watching. On
+      # the weekly cron nobody is: a warning on an unattended run is read by no one, and
+      # the orphaned corpus (1345 MB observed for remediation_matrix) accumulates every
+      # week until the box fills. So the schedule arm FAILS instead.
       - name: Drop this job's database
         if: always()
         run: |
@@ -826,6 +843,9 @@ jobs:
           if PGPASSWORD=postgres psql -h localhost -U postgres -c \
                "DROP DATABASE IF EXISTS \"$SCALE_DB\" WITH (FORCE);"; then
             echo "Dropped $SCALE_DB."
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "::error::could not drop $SCALE_DB on an unattended run — reclaim it by hand."
+            exit 1
           else
             echo "::warning::could not drop $SCALE_DB — reclaim it by hand."
           fi
