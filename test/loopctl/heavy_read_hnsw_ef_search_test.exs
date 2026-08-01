@@ -396,17 +396,31 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     @last_conclusive_key {Loopctl.HeavyRead, :iterative_scan_last_conclusive}
 
     test "a conclusive probe records its verdict for later inconclusive reads to fall back on" do
-      :persistent_term.erase(@probe_cache_key)
+      # `clear_iterative_scan_probe_cache/0` (not a bare erase) so the entry the LIVE probe
+      # below writes is erased on exit too — otherwise it pins a 10-minute verdict for every
+      # later test in the run.
+      clear_iterative_scan_probe_cache()
       :persistent_term.erase(@last_conclusive_key)
       on_exit(fn -> :persistent_term.erase(@last_conclusive_key) end)
 
-      # Drives a real probe against the test backend.
+      # Drives a real probe against the test backend. An INCONCLUSIVE probe (a HeavyReadRepo
+      # checkout blip — the documented flake of the sibling test above) records NOTHING, so
+      # each outcome is asserted on its own terms: asserting the record unconditionally would
+      # report a pool blip as a fallback regression.
       verdict = HeavyRead.iterative_scan_supported?()
 
-      assert :persistent_term.get(@last_conclusive_key, :none) == verdict,
-             "a conclusive probe must record what the backend actually said, so a later " <>
-               "probe BLIP reuses it instead of silently reconfiguring the ANN read to the " <>
-               "pgvector default OFF"
+      case :persistent_term.get(@last_conclusive_key, :none) do
+        {recorded, recorded_at} when is_integer(recorded_at) ->
+          assert recorded == verdict,
+                 "a conclusive probe must record what the backend actually said, so a later " <>
+                   "probe BLIP reuses it instead of silently reconfiguring the ANN read to " <>
+                   "the pgvector default OFF"
+
+        :none ->
+          refute verdict,
+                 "with nothing recorded the probe was inconclusive, and an inconclusive " <>
+                   "probe with no verdict to reuse MUST fail closed"
+      end
     end
   end
 end

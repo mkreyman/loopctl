@@ -607,6 +607,12 @@ defmodule Loopctl.Knowledge.BulkOps do
   # cannot take back. Failing the bulk op is the right side to err on: a capture that could
   # not complete means the connection is already in trouble, and the alternative — running
   # unbounded — silently drops the blast-radius bound of AC-27.12.5.
+  #
+  # The abort reason is a `DBConnection.ConnectionError`, NOT a bespoke atom: `run_multi/2`
+  # surfaces a `Multi.run` error verbatim and the bulk controllers pass an unrecognised one
+  # straight to `LoopctlWeb.FallbackController`, which has no catch-all — a new atom there is
+  # a `FunctionClauseError` (an unstructured 500) instead of a mapped response. This IS a
+  # connection failure, so the US-27.3 mapping already renders it as 503 + Retry-After.
   defp timeout_multi do
     Multi.run(Multi.new(), :set_timeout, fn repo, _changes ->
       case LocalGuc.capture(repo, ["statement_timeout"]) do
@@ -615,7 +621,10 @@ defmodule Loopctl.Knowledge.BulkOps do
           {:ok, prior}
 
         [] ->
-          {:error, :statement_timeout_capture_failed}
+          {:error,
+           %DBConnection.ConnectionError{
+             message: "could not capture statement_timeout for this bulk operation"
+           }}
       end
     end)
   end

@@ -605,15 +605,41 @@ defmodule Loopctl.HeavyReadTest do
              "a failed capture left the override in the enclosing transaction"
     end
 
-    test "a nested failed capture leaves an ENCLOSING scope's GUC to its owner" do
+    test "a nested failed capture ABORTS instead of clobbering or leaking the owner's GUC" do
       Loopctl.LocalGuc.scoped(Repo, [@probe], fn ->
         Repo.query!("SET LOCAL #{@probe} = 'outer'")
 
-        Loopctl.LocalGuc.scoped(CaptureFailingRepo, [@probe], fn -> :ok end)
+        # With no captured values the fallback could only RESET (clobbering the value the
+        # enclosing scope deliberately set — we never learn it: its own `fun` issued that SET
+        # LOCAL) or do nothing (leaking the inner override into the rest of the outer body).
+        # It does neither. It raises BEFORE the body sets anything, and the caller's rollback
+        # is then the thing that discards every SET LOCAL made inside the transaction.
+        assert_raise RuntimeError, ~r/could not capture/, fn ->
+          Loopctl.LocalGuc.scoped(CaptureFailingRepo, [@probe], fn ->
+            Repo.query!("SET LOCAL #{@probe} = 'inner'")
+          end)
+        end
 
         assert current_probe() == "outer",
-               "the inner reset clobbered the enclosing scope's deliberate SET LOCAL"
+               "the enclosing scope's deliberate SET LOCAL must survive the inner abort"
       end)
+    end
+
+    test "the hand-paired capture/restore form registers on the active-scope stack" do
+      # `Knowledge.BulkOps` holds its AC-27.12.5 `statement_timeout` bound ACROSS Multi steps,
+      # so it cannot wrap the work in a `scoped/3` — but the bound is only safe from a nested
+      # scope's reset fallback if `capture/2` publishes the name the way `scoped/3` does.
+      prior = Loopctl.LocalGuc.capture(Repo, [@probe])
+      Repo.query!("SET LOCAL #{@probe} = 'bulk'")
+
+      assert_raise RuntimeError, ~r/could not capture/, fn ->
+        Loopctl.LocalGuc.scoped(CaptureFailingRepo, [@probe], fn -> :ok end)
+      end
+
+      assert current_probe() == "bulk",
+             "a nested capture failure reset the bulk op's deliberate bound"
+
+      Loopctl.LocalGuc.restore(Repo, prior)
     end
 
     test "an invalid GUC name is rejected before it can reach the interpolated SQL" do
