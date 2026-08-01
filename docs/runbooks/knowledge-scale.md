@@ -772,7 +772,13 @@ sanctioned helper `Loopctl.Knowledge.VectorSearch` and **not** in the auditable 
   function STILL fails `refute_full_scan`/`refute_seq_scan` at 80k (proven by
   `cosine_lint_vs_scale_gate_scale_test.exs`).
 
-### 2. The per-endpoint scale gates (run in the `Scale Nightly` matrix)
+### 2. The per-endpoint scale gates (the `Scale Nightly` matrix — MANUAL DISPATCH)
+
+> The matrix no longer runs on the nightly cron. It is a prod-scale PROOF you invoke
+> for a query/index/corpus-shape change — `gh workflow run CI --ref <branch>` — not a
+> per-night watch. 14 jobs x an 80k seed, serially on one self-hosted runner, queued
+> ahead of ordinary PR checks every night for a plan choice that only moves when such
+> a change lands.
 
 Every vector path carries an 80k index-usage gate on its REAL request-path query:
 `suggested_links` + `search_semantic` (results + count) + the auto-link worker

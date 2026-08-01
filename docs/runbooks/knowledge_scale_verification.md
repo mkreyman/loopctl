@@ -207,7 +207,8 @@ A scale/perf issue is **NOT "verified-in-prod"** until ALL of these pass. Paste 
 evidence (plan excerpts, timings, HTTP codes) onto the issue/PR before closing:
 
 - [ ] **Plan-assertion green at scale** — the relevant `:scale_nightly` gate test
-      passes against the ~80k `ScaleSeed` corpus (locally and/or in the nightly job).
+      passes against the ~80k `ScaleSeed` corpus — locally, or via a manual
+      `gh workflow run CI --ref <branch>` (the matrix is dispatch-only, not nightly).
 - [ ] **`EXPLAIN ANALYZE` under the timeout on the LIVE build** — the deployed
       release's plan for the exact endpoint query is index-backed and its
       `Execution Time` is below the endpoint `statement_timeout` (US-27.4).

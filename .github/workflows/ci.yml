@@ -583,10 +583,22 @@ jobs:
 
   scale-nightly:
     name: Scale Nightly (${{ matrix.scale_file }})
-    # Runs nightly to assert every heavy endpoint's planner path at PROD_ARTICLE_FLOOR
-    # (~80k articles) — the cost-based choices that only appear at production scale.
-    # US-27.5 (AC-27.5.3): this is the scale GATE — it runs every :scale_nightly test
+    # Asserts every heavy endpoint's planner path at PROD_ARTICLE_FLOOR (~80k articles) —
+    # the cost-based choices that only appear at production scale.
+    # US-27.5 (AC-27.5.3): this is the scale GATE — it covers every :scale_nightly test
     # (HNSW ANN, keyset enumeration, shared plan assertions), not just scale_seed.
+    #
+    # NO LONGER RUNS ON THE NIGHTLY CRON (the name is kept because the tag, the job and the
+    # runbooks all use it). It was a prod-scale PROOF, not a per-night regression watch, and
+    # as a recurring job it stopped paying for itself:
+    #   * 14 matrix jobs, each seeding ~80k committed rows, serially on ONE self-hosted
+    #     runner — hours of beelink every night, and it QUEUES ahead of ordinary PR checks,
+    #     so a routine PR can sit unmergeable behind a scale run nobody asked for;
+    #   * what it guards — planner/index CHOICE — only moves when a query, index or
+    #     corpus-shape change lands, which is exactly when the manual dispatch below is
+    #     already the documented pre-merge step.
+    # Run it deliberately: `gh workflow run CI --ref <branch>`, or per-file locally via
+    # docs/runbooks/knowledge_scale_verification.md.
     #
     # MATRIX, one isolated job per scale file: each scale test seeds ~80k COMMITTED
     # (unboxed) rows and cleans up only its own tenant. Running them in one process
@@ -608,11 +620,14 @@ jobs:
     # DOES share is CPU, shared_buffers and disk — which affects timing, not the plan
     # CHOICE these tests assert on, and the matrix runs serially on one runner anyway.
     runs-on: [self-hosted, beelink]
-    # Schedule (nightly) OR manual dispatch (pre-merge validation on a branch). Not
-    # every-PR: the 4×80k seed is too slow for every push, so the enforced pre-merge
+    # MANUAL DISPATCH ONLY. Not every-PR (the 80k seed per file is far too slow for every
+    # push) and no longer on the nightly cron either — see above. The enforced pre-merge
     # step for a Theme-2/3/4 (query/index) change is `gh workflow run CI --ref <branch>`
     # or the local run in docs/runbooks/knowledge_scale_verification.md.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    #
+    # `schedule` is deliberately absent from this condition; the rest of the CI jobs still
+    # run on the nightly cron, which is what that cron is for.
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
