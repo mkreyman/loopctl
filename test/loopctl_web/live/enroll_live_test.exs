@@ -53,13 +53,19 @@ defmodule LoopctlWeb.EnrollLiveTest do
       assert has_element?(view, ~s(#enroll-app[phx-update="ignore"]))
     end
 
-    test "the key field is a password input that browsers will not autofill or store",
+    test "the key field is a password input the browser will not offer to save",
          %{conn: conn} do
       {:ok, view, _html} = live(conn, ~p"/enroll")
 
       assert has_element?(view, ~s(input#enroll-api-key[type="password"]))
-      assert has_element?(view, ~s(input#enroll-api-key[autocomplete="off"]))
       assert has_element?(view, ~s(input#enroll-api-key[spellcheck="false"]))
+
+      # NOT autocomplete="off": Chrome and Firefox deliberately ignore it on
+      # password fields and will persist the value — here a live, long-lived
+      # user-role key — into the password manager. "one-time-code" is the value
+      # browsers actually treat as never-persist.
+      assert has_element?(view, ~s(input#enroll-api-key[autocomplete="one-time-code"]))
+      refute has_element?(view, ~s(input#enroll-api-key[autocomplete="off"]))
     end
 
     test "renders NO form element — a native GET submit would put the key in the URL",
@@ -121,6 +127,23 @@ defmodule LoopctlWeb.EnrollLiveTest do
 
       assert source =~ "export default AuthenticatorEnroll"
       assert source =~ "mounted()"
+    end
+  end
+
+  describe "the hook's silent-failure guards" do
+    test "create() excludes already-enrolled credentials and the hook unbinds on destroy" do
+      source = File.read!(@hook_path)
+
+      # Without excludeCredentials a "backup" authenticator can be the SAME
+      # physical device: the second credential gets a fresh credential_id, so
+      # the (tenant_id, credential_id) unique index never sees a duplicate and
+      # the tenant believes in redundancy it does not have.
+      assert source =~ "excludeCredentials"
+
+      # #enroll-app is phx-update="ignore", so its DOM outlives the hook across
+      # a LiveView reconnect. No destroyed() means the old instance's listeners
+      # stay bound and one click runs two concurrent ceremonies.
+      assert source =~ "destroyed()"
     end
   end
 

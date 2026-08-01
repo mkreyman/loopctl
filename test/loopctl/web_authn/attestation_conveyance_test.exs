@@ -24,10 +24,12 @@ defmodule Loopctl.WebAuthn.AttestationConveyanceTest do
 
   use ExUnit.Case, async: true
 
+  alias Loopctl.WebAuthn.RpConfig
+
   @hooks ["assets/js/hooks/webauthn.js", "assets/js/hooks/authenticator_enroll.js"]
 
   describe "client/server attestation conveyance agreement" do
-    test "the app configures no :attestation override, so the effective policy is Wax's \"none\"" do
+    test "no :attestation override reaches the config, compiled OR resolved at boot" do
       configured = :loopctl |> Application.get_env(:webauthn, []) |> Keyword.get(:attestation)
 
       assert is_nil(configured),
@@ -35,6 +37,26 @@ defmodule Loopctl.WebAuthn.AttestationConveyanceTest do
                "The browser hooks (#{Enum.join(@hooks, ", ")}) hard-code the conveyance " <>
                "they request and must be updated to match, or every registration will " <>
                "fail with :invalid_attestation_conveyance_preference."
+
+      # config/test.exs is only half the surface. Production ASSEMBLES `:webauthn`
+      # at boot from `RpConfig.resolve/1` (config/runtime.exs), which no test env
+      # can observe — so an override added there would leave this file green while
+      # every real registration failed. Drive the resolver directly, both with a
+      # fully-populated operator env and with none, so the prod path is covered too.
+      for env <- [
+            [rp_id: "loopctl.com", rp_name: "loopctl", origin: "https://loopctl.com"],
+            [rp_id: nil, rp_name: nil, origin: nil, phx_host: "loopctl.com"]
+          ] do
+        {opts, _warnings} = RpConfig.resolve(env)
+
+        refute Keyword.has_key?(opts, :attestation),
+               "RpConfig.resolve/1 now emits attestation: " <>
+                 "#{inspect(Keyword.get(opts, :attestation))} for #{inspect(env)}. " <>
+                 "That reaches `config :loopctl, :webauthn` in production only, where " <>
+                 "the hooks' hard-coded \"none\" no longer matches and Wax.register/3 " <>
+                 "rejects every attestation with " <>
+                 ":invalid_attestation_conveyance_preference."
+      end
     end
 
     test "every hook requests attestation: \"none\"" do

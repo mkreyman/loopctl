@@ -101,7 +101,9 @@ defmodule LoopctlWeb.EnrollLive do
             <p class="mt-1 text-xs text-slate-500">
               Paste a <span class="font-mono">user</span>-role API key for the tenant you are
               anchoring. It is sent straight to the loopctl API as a bearer token from your
-              browser — this page never transmits it over its own connection, and never stores it.
+              browser — this page never transmits it over its own connection, never stores it,
+              and clears the field once the ceremony succeeds. Your browser's password manager
+              is outside our reach: decline if it offers to save the key.
             </p>
           </div>
 
@@ -112,10 +114,16 @@ defmodule LoopctlWeb.EnrollLive do
             >
               User-role API key
             </label>
+            <%!-- autocomplete="one-time-code", NOT "off": Chrome and Firefox
+            deliberately ignore autocomplete="off" on password fields and will offer
+            to save the value to the password manager. This field holds a live,
+            long-lived user-role credential — the one that can anchor the tenant's
+            root of trust — and one-time-code is the only value browsers treat as
+            never-persist. --%>
             <input
               id="enroll-api-key"
               type="password"
-              autocomplete="off"
+              autocomplete="one-time-code"
               autocapitalize="off"
               autocorrect="off"
               spellcheck="false"
