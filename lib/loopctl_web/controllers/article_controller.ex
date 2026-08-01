@@ -227,8 +227,29 @@ defmodule LoopctlWeb.ArticleController do
   operation(:show,
     summary: "Get article",
     description:
-      "Returns article detail with outgoing and incoming links preloaded. Role: agent+.",
-    parameters: [id: [in: :path, type: :string, description: "Article UUID"]],
+      "Returns article detail with outgoing and incoming links preloaded. Role: agent+.\n\n" <>
+        "**Link payload (#538).** Each link carries only its FAR side, as " <>
+        "`article: {id, title}` — for an outgoing link the source is always the requested " <>
+        "article and for an incoming link the target is, so that side was a constant echo " <>
+        "of the URL with an always-`null` title. A link also carries `similarity` when the " <>
+        "auto-linker recorded one. Both direction arrays are ranked (open " <>
+        "`potential_conflict` first, then descending similarity) and capped at 25 entries " <>
+        "each; `links_total` reports the true count and `links_truncated` says whether the " <>
+        "cap bit. Use `knowledge_graph` to traverse the full graph.\n\n" <>
+        "`links` selects the detail level: `full` (default), `count` (omits both arrays, " <>
+        "keeps `links_total`), or `none` (omits the link fields entirely). An unrecognized " <>
+        "value is treated as `full`. `potential_conflicts` is returned in ALL THREE modes.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Article UUID"],
+      links: [
+        in: :query,
+        type: %OpenApiSpex.Schema{type: :string, enum: ["full", "count", "none"]},
+        required: false,
+        description:
+          "Link detail level (default `full`). `count` returns only `links_total`; " <>
+            "`none` omits the link fields. `potential_conflicts` is always returned."
+      ]
+    ],
     responses: %{
       200 =>
         {"Article detail", "application/json",
@@ -702,17 +723,29 @@ defmodule LoopctlWeb.ArticleController do
   end
 
   @doc "GET /api/v1/articles/:id"
-  def show(conn, %{"id" => article_id}) do
+  def show(conn, %{"id" => article_id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
     api_key_id = conn.assigns.current_api_key.id
     opts = Keyword.merge([api_key_id: api_key_id], Visibility.scope_opts(conn))
 
     case Knowledge.get_article(tenant_id, article_id, opts) do
       {:ok, article} ->
-        json(conn, ArticleJSON.show(%{article: article}))
+        json(conn, ArticleJSON.show(%{article: article, links: links_mode(params)}))
 
       {:error, :not_found} ->
         {:error, :not_found}
+    end
+  end
+
+  # #538. Defaults to `:full` so an existing caller sees no change, and an unrecognized
+  # value degrades to `:full` rather than 422-ing: this is a presentation knob on a READ,
+  # so the cost of a typo should be a fatter response, never a failed knowledge lookup in
+  # the middle of an agent's task.
+  defp links_mode(params) do
+    case params["links"] do
+      "none" -> :none
+      "count" -> :count
+      _ -> :full
     end
   end
 

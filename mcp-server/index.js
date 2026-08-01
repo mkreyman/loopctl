@@ -1461,10 +1461,11 @@ async function knowledgeList({
   return toContent(result);
 }
 
-async function knowledgeGet({ article_id, project_id, story_id }) {
+async function knowledgeGet({ article_id, project_id, story_id, links }) {
   const params = new URLSearchParams();
   if (project_id) params.set("project_id", project_id);
   if (story_id) params.set("story_id", story_id);
+  if (links) params.set("links", links);
   const qs = params.toString();
   const path = qs ? `/api/v1/articles/${article_id}?${qs}` : `/api/v1/articles/${article_id}`;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
@@ -4511,7 +4512,17 @@ const TOOLS = [
       "material to your current task, act on it: read the peer, judge redundant/complementary/" +
       "contradictory against the live system, and knowledge_resolve_conflict (dismiss a false " +
       "positive, supersede when one clearly wins, merge when both should combine). If you can't " +
-      "tell which is right, leave it. See the 'Resolving knowledge conflicts' wiki playbook.",
+      "tell which is right, leave it. See the 'Resolving knowledge conflicts' wiki playbook.\n\n" +
+      "LINKS: each link carries only its FAR side as `article: {id, title}` (plus " +
+      "`similarity` when the auto-linker scored it) — direction is already given by which " +
+      "array it is in. Both arrays are ranked (open conflicts first, then descending " +
+      "similarity) and capped at 25 per direction; read `links_total` for the true count " +
+      "and `links_truncated` to know the cap bit. When you only want the article's TEXT, " +
+      "pass links: 'count' (or 'none') — on a well-linked hub the link block is several " +
+      "times the size of the body, and you are paying for it on every read. " +
+      "`potential_conflicts` is returned in all three modes, so opting out of the link " +
+      "list never hides a conflict from you. To actually traverse the graph, use " +
+      "knowledge_graph rather than raising this cap.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4519,6 +4530,14 @@ const TOOLS = [
           type: "string",
           format: "uuid",
           description: "The UUID of the article.",
+        },
+        links: {
+          type: "string",
+          enum: ["full", "count", "none"],
+          description:
+            "Optional: how much of the link graph to return. 'full' (default) = ranked, " +
+            "capped arrays; 'count' = just links_total; 'none' = omit link fields. " +
+            "potential_conflicts is always returned.",
         },
         project_id: {
           type: "string",

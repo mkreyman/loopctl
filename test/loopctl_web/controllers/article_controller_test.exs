@@ -1218,8 +1218,191 @@ defmodule LoopctlWeb.ArticleControllerTest do
 
       outgoing = hd(body["data"]["outgoing_links"])
       assert outgoing["relationship_type"] == "relates_to"
-      assert outgoing["target_article"]["id"] == article_b.id
-      assert outgoing["target_article"]["title"] == "Article B"
+
+      # #538: only the FAR side is serialized. The near side was always the requested
+      # article, with an always-null title (Knowledge preloads one side per direction).
+      assert outgoing["article"]["id"] == article_b.id
+      assert outgoing["article"]["title"] == "Article B"
+      refute Map.has_key?(outgoing, "source_article")
+      refute Map.has_key?(outgoing, "target_article")
+
+      assert body["data"]["links_total"] == 1
+      assert body["data"]["links_truncated"] == false
+    end
+
+    test "links=count returns links_total without either array", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+      out = fixture(:article, %{tenant_id: tenant.id, title: "Out"})
+      inbound = fixture(:article, %{tenant_id: tenant.id, title: "In"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: hub.id,
+        target_article_id: out.id,
+        relationship_type: :relates_to
+      })
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: inbound.id,
+        target_article_id: hub.id,
+        relationship_type: :relates_to
+      })
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=count")
+        |> json_response(200)
+
+      # The count spans BOTH directions — it is the number an agent needs to decide
+      # whether a second links=full fetch is worth paying for.
+      assert body["data"]["links_total"] == 2
+      refute Map.has_key?(body["data"], "outgoing_links")
+      refute Map.has_key?(body["data"], "incoming_links")
+      # Still a complete article otherwise.
+      assert body["data"]["body"] == hub.body
+    end
+
+    test "links=none omits the link fields entirely", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+      other = fixture(:article, %{tenant_id: tenant.id, title: "Other"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: hub.id,
+        target_article_id: other.id,
+        relationship_type: :relates_to
+      })
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=none")
+        |> json_response(200)
+
+      refute Map.has_key?(body["data"], "outgoing_links")
+      refute Map.has_key?(body["data"], "incoming_links")
+      refute Map.has_key?(body["data"], "links_total")
+      assert body["data"]["id"] == hub.id
+    end
+
+    # The one link field that must survive every cheaper mode: agents are told to act on
+    # an unresolved conflict, so opting out of the bulk link list must not silently opt
+    # out of conflict discovery.
+    test "potential_conflicts is returned in all three link modes", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+      peer = fixture(:article, %{tenant_id: tenant.id, title: "Near Duplicate"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: hub.id,
+        target_article_id: peer.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"similarity_score" => 0.97}
+      })
+
+      for mode <- ["full", "count", "none"] do
+        body =
+          conn
+          |> auth_conn(raw_key)
+          |> get(~p"/api/v1/articles/#{hub.id}?links=#{mode}")
+          |> json_response(200)
+
+        assert [conflict] = body["data"]["potential_conflicts"],
+               "expected potential_conflicts under links=#{mode}"
+
+        assert conflict["article_id"] == peer.id
+        assert conflict["similarity"] == 0.97
+      end
+    end
+
+    test "an unrecognized links value degrades to full rather than failing the read",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+      other = fixture(:article, %{tenant_id: tenant.id, title: "Other"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: hub.id,
+        target_article_id: other.id,
+        relationship_type: :relates_to
+      })
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=sure-why-not")
+        |> json_response(200)
+
+      assert length(body["data"]["outgoing_links"]) == 1
+    end
+
+    test "links are ranked and capped, with links_total reporting the true size",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+
+      # 30 outgoing links > the 25/direction cap, with ASCENDING similarity so the
+      # strongest neighbours are the ones created LAST — if ranking were a no-op and the
+      # cap just took insertion order, the top scores would be exactly what got dropped.
+      for i <- 1..30 do
+        target = fixture(:article, %{tenant_id: tenant.id, title: "Target #{i}"})
+
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: hub.id,
+          target_article_id: target.id,
+          relationship_type: :relates_to,
+          metadata: %{"similarity_score" => i / 100}
+        })
+      end
+
+      # One open conflict, deliberately the WEAKEST score, to prove type outranks score.
+      conflict_peer = fixture(:article, %{tenant_id: tenant.id, title: "Conflict Peer"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: hub.id,
+        target_article_id: conflict_peer.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"similarity_score" => 0.001}
+      })
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}")
+        |> json_response(200)
+
+      links = body["data"]["outgoing_links"]
+
+      assert length(links) == 25
+      assert body["data"]["links_total"] == 31
+      assert body["data"]["links_truncated"] == true
+
+      # The conflict leads despite the lowest similarity in the set.
+      assert hd(links)["relationship_type"] == "potential_conflict"
+      assert hd(links)["article"]["id"] == conflict_peer.id
+
+      # The rest descend by similarity, and the strongest survived the cap.
+      scores = links |> tl() |> Enum.map(& &1["similarity"])
+      assert scores == Enum.sort(scores, :desc)
+      assert hd(scores) == 0.3
     end
 
     test "returns 404 for non-existent article", %{conn: conn} do

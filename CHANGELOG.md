@@ -28,6 +28,25 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **`GET /api/v1/articles/:id` link payload trimmed, ranked and capped (#538) — BREAKING
+  for anything reading `source_article` / `target_article`.** Each link object now carries
+  only its FAR side, as `article: {id, title}`. The near side was a constant echo of the
+  id already in the request URL, and — because only the far side is preloaded — its
+  `title` was always `null`; it cost 14% of a typical response and carried nothing.
+  Direction is unchanged and still given by which array the link is in. Links now also
+  carry `similarity` when the auto-linker recorded one.
+  Both arrays are **ranked** (open `potential_conflict` first, then descending similarity)
+  and **capped at 25 per direction**, with new `links_total` and `links_truncated` fields
+  reporting the true size. Use `knowledge_graph` to traverse the whole graph.
+  A new `links` query parameter selects the detail level — `full` (default, so an
+  untouched caller keeps working), `count` (just `links_total`), `none` (no link fields).
+  An unrecognized value degrades to `full` rather than 422-ing a read.
+  `potential_conflicts` is returned in **all three** modes, so a cheaper read never
+  silently turns off conflict discovery.
+  Why: agents are instructed to open every search hit with `knowledge_get`, so this
+  response is paid on essentially every wiki read in every session. On a measured hub
+  article the links were 12,564 of 16,189 bytes — about 4,000 tokens to read 735 tokens
+  of body.
 - **Ingestion document content is encrypted at rest (#493).** Raw `content` posted to
   `POST /api/v1/knowledge/ingest` was persisted as plaintext JSON in `oban_jobs.args`
   (including `retryable`/`discarded` rows) until pruning — the one at-rest exposure
