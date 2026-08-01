@@ -68,6 +68,21 @@ defmodule Loopctl.Tenants.TierCapabilitiesTest do
       refute upgrade.summary =~ "signup"
     end
 
+    test "names the browser page, since the endpoints alone cannot be walked (#541)" do
+      upgrade = TierCapabilities.for_tier(:agent_rooted).remediation.enrollment_upgrade
+
+      # `requires_human: true` is not advice — `navigator.credentials.create()`
+      # is unreachable from an agent or curl, so naming only the endpoints left
+      # the caller at a dead end. The page is the actionable half.
+      assert upgrade.enrollment_page == "/enroll"
+
+      # Relative, not absolute: the page is per-deployment (a self-hosted
+      # instance serves its own, bound to its own WEBAUTHN_RP_ID). An absolute
+      # loopctl.com URL would send a self-hoster's operator to anchor a tenant
+      # on the wrong instance — where their key does not even exist.
+      refute upgrade.enrollment_page =~ "http"
+    end
+
     test "states that the map is tier-scoped and covers mutating actions only" do
       # The map derives from trust_tier ALONE and every RequireHumanAnchor mount
       # is per-action. Advertising a bare "allowed" would relocate the

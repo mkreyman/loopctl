@@ -75,6 +75,15 @@ defmodule LoopctlWeb.Router do
       root_layout: {LoopctlWeb.Layouts, :root} do
       live "/signup", SignupLive, :index
       live "/tenants/:id/onboarding", TenantOnboardingLive, :index
+
+      # #541 — the browser half of the trust-tier upgrade for an EXISTING
+      # tenant. Shares this live_session for its root layout (and therefore
+      # app.js, which carries the ceremony hook) and, like signup, sits
+      # outside any authenticated pipeline: loopctl has no browser session
+      # auth. The page holds no secret and decides nothing — the operator's
+      # API key is presented per-request to the API by the hook, never to
+      # this LiveView. See LoopctlWeb.EnrollLive.
+      live "/enroll", EnrollLive, :index
     end
 
     # US-26.0.3 — public wiki rendering for system-scoped articles

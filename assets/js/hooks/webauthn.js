@@ -5,29 +5,7 @@
 // base64url-encoded challenge; we feed it to the browser's WebAuthn API
 // and ship the resulting attestation back via `pushEvent`.
 
-const base64urlEncode = (buffer) => {
-  const bytes = new Uint8Array(buffer);
-  let str = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    str += String.fromCharCode(bytes[i]);
-  }
-  return btoa(str)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-};
-
-const base64urlDecode = (value) => {
-  if (!value) return new Uint8Array();
-  const padding = "=".repeat((4 - (value.length % 4)) % 4);
-  const base64 = (value + padding).replace(/-/g, "+").replace(/_/g, "/");
-  const raw = atob(base64);
-  const output = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) {
-    output[i] = raw.charCodeAt(i);
-  }
-  return output;
-};
+import { base64urlEncode, base64urlDecode } from "../webauthn/base64url";
 
 const WebAuthn = {
   mounted() {
@@ -58,7 +36,17 @@ const WebAuthn = {
               residentKey: "preferred",
               userVerification: "preferred",
             },
-            attestation: "direct",
+            // "none", not "direct" — must match the server's conveyance
+            // preference. Wax defaults to "none" and the app configures no
+            // override, so a "direct" request yields a packed attestation
+            // statement that `Wax.register/3` rejects outright with
+            // :invalid_attestation_conveyance_preference. This silently
+            // worked for platform authenticators (Touch ID / Windows Hello
+            // typically return fmt "none" regardless) and failed for exactly
+            // the hardware keys the signup page recommends — a YubiKey
+            // returns a packed statement. Bound by
+            // webauthn_attestation_conveyance_test.exs.
+            attestation: "none",
             timeout: 60000,
           },
         });
