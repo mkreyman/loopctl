@@ -42,11 +42,25 @@ import { base64urlEncode, base64urlDecode } from "../webauthn/base64url";
 const API = "/api/v1";
 const CEREMONY_TIMEOUT_MS = 60000;
 const FETCH_TIMEOUT_MS = 20000;
+// The completing POST is the one-way door: the server can COMMIT the tier
+// upgrade and still be slow to answer, so it gets a longer deadline than the
+// reads — and a timeout there is reported as an unknown outcome, never as a
+// failure, because "it failed, try again" is a false statement about an
+// irreversible change that may well have happened.
+const COMMIT_TIMEOUT_MS = 60000;
+const TIMEOUT_MESSAGE = "The loopctl API did not respond in time — try again.";
+const COMMIT_TIMEOUT_MESSAGE =
+  "The loopctl API did not answer in time. The enrollment may ALREADY have completed — reload and check the tenant's trust tier before enrolling again.";
 // Mirrors @max_friendly_name_bytes in TenantAuthenticatorController.
 const MAX_FRIENDLY_NAME_BYTES = 120;
 // A prepared challenge carries a 5-minute server TTL; re-request past this
 // rather than spend a touch on one that expires mid-ceremony.
 const PREPARED_TTL_MS = 120000;
+// Pre-resolution spends one of the tenant's 30-per-hour enroll actions for each
+// DISTINCT key committed (@max_enroll_actions_per_window), so unbounded
+// speculation on `change` can 429 a tenant out of its own ceremony. Cap it;
+// past the cap the click still prepares — slower on WebKit, never blocked.
+const MAX_SPECULATIVE_PREPARES = 3;
 
 // Only the witness plug's OWN rejections are safely replayable — it halts
 // before the operation runs, so nothing committed. See request().
@@ -57,12 +71,19 @@ const WITNESS_CODES = ["witness_divergence", "witness_bootstrap_already_consumed
 // that matter: a refused already-enrolled device (excludeCredentials working),
 // and the activation/timeout refusal — on WebKit that also covers a click whose
 // user activation expired across an await.
-const CEREMONY_ERRORS = {
+//
+// The maps are per-ceremony on purpose. InvalidStateError during create() means
+// excludeCredentials matched; during the reauth get() the already-enrolled
+// device is the REQUIRED one, so the same wording would tell the operator to
+// fetch a different device and abandon a ceremony that was about to succeed.
+const NOT_ALLOWED =
+  "The browser refused or timed out the ceremony. Click Enroll again and touch the device when prompted.";
+const CREATE_ERRORS = {
   InvalidStateError:
     "That authenticator is already enrolled on this tenant — use a DIFFERENT device as a backup.",
-  NotAllowedError:
-    "The browser refused or timed out the ceremony. Click Enroll again and touch the device when prompted.",
+  NotAllowedError: NOT_ALLOWED,
 };
+const ASSERT_ERRORS = { NotAllowedError: NOT_ALLOWED };
 
 const describe = (t) => (t.slug ? `${t.name} (${t.slug})` : t.name);
 const byteLength = (value) => new TextEncoder().encode(value).length;
@@ -82,6 +103,10 @@ const AuthenticatorEnroll = {
     // concurrent ceremonies — `this.running` cannot help, since each stale
     // listener closes over its own `this`. destroyed() cuts them.
     this.listeners = new AbortController();
+    this.speculated = 0;
+    // Bumped whenever a prepared result is deliberately invalidated, so a
+    // prepare() still in flight cannot re-cache the credential afterwards.
+    this.epoch = 0;
     const signal = this.listeners.signal;
 
     this.button.addEventListener("click", () => this.run(), { signal });
@@ -103,11 +128,20 @@ const AuthenticatorEnroll = {
 
     // Resolve tenant + challenge as soon as the key is committed, not on the
     // click — see prepare().
-    this.keyInput.addEventListener(
-      "change",
-      () => this.running || this.prepare().catch((e) => this.fail(reason(e))),
-      { signal }
-    );
+    this.keyInput.addEventListener("change", () => this.speculate(), { signal });
+  },
+
+  // The `change` entry point into prepare(). Unlike run() it must stay silent
+  // on an empty field: blurring a CLEARED key sends an empty bearer token whose
+  // 401 would fail() away the success box that is the ceremony's only on-screen
+  // record of which tenant got anchored.
+  speculate() {
+    const key = (this.keyInput.value || "").trim();
+
+    if (this.running || !key || this.speculated >= MAX_SPECULATIVE_PREPARES) return;
+
+    this.speculated += 1;
+    this.prepare(key).catch((error) => this.fail(reason(error)));
   },
 
   destroyed() {
@@ -172,18 +206,21 @@ const AuthenticatorEnroll = {
 
       if (reauthAssertion) body.reauth_assertion = reauthAssertion;
 
-      const enrolled = await this.post(path, apiKey, body);
+      const enrolled = await this.post(path, apiKey, body, {
+        deadlineMs: COMMIT_TIMEOUT_MS,
+        timeoutMessage: COMMIT_TIMEOUT_MESSAGE,
+      });
 
       // The key is a live credential and the ceremony is over: drop it from
       // the DOM rather than leaving it in a field on an unattended screen.
       // Only on success — clearing after a failure would force a re-paste
       // for a retry that is usually a typo in the friendly name.
-      this.prepared = null;
+      this.invalidate();
       this.keyInput.value = "";
       this.succeed(enrolled, tenant);
     } catch (error) {
       // Whatever failed, the challenge is spent or suspect — force a fresh one.
-      this.prepared = null;
+      this.invalidate();
       this.fail(reason(error));
     } finally {
       this.busy(false);
@@ -195,15 +232,37 @@ const AuthenticatorEnroll = {
   // to be the first await after the button press or Safari answers
   // NotAllowedError. And it NAMES the tenant on screen ahead of a one-way door
   // that a mis-pasted key otherwise walks through irreversibly, unconfirmed.
-  async prepare(apiKey) {
+  //
+  // Deduped on the IN-FLIGHT promise, not just the result: the field's `change`
+  // fires on the same mousedown that produces the click, so a paste-then-click
+  // has run() calling prepare() while the listener's prepare() is still
+  // awaiting. Memoising only the result would issue a second tenant+challenge
+  // round trip — two ticks of the enroll budget, and run() awaiting network
+  // work again, which is exactly the WebKit activation loss this pre-resolution
+  // exists to avoid.
+  prepare(apiKey) {
     const key = apiKey || (this.keyInput.value || "").trim();
     const cached = this.prepared;
 
     if (cached && cached.apiKey === key && Date.now() - cached.at < PREPARED_TTL_MS) {
-      return cached;
+      return Promise.resolve(cached);
     }
 
+    if (!key) return Promise.resolve(null);
+    if (this.preparing && this.preparing.key === key) return this.preparing.promise;
+
     this.prepared = null;
+
+    const promise = this.resolvePrepared(key).finally(() => {
+      if (this.preparing && this.preparing.promise === promise) this.preparing = null;
+    });
+
+    this.preparing = { key, promise };
+    return promise;
+  },
+
+  async resolvePrepared(key) {
+    const epoch = this.epoch;
 
     this.status("Resolving tenant…");
     const tenant = await this.getTenant(key);
@@ -213,8 +272,18 @@ const AuthenticatorEnroll = {
     const challenge = await this.post(`${path}/challenge`, key, {});
 
     this.status(`Ready — this will anchor ${describe(tenant)}. Click Enroll and touch.`);
-    this.prepared = { apiKey: key, tenant, path, challenge, at: Date.now() };
-    return this.prepared;
+    const prepared = { apiKey: key, tenant, path, challenge, at: Date.now() };
+
+    // Never re-cache a credential that was invalidated while this was in
+    // flight: run() clears the key on success precisely because it is live.
+    if (epoch === this.epoch) this.prepared = prepared;
+
+    return prepared;
+  },
+
+  invalidate() {
+    this.prepared = null;
+    this.epoch += 1;
   },
 
   // --- API calls ---
@@ -233,11 +302,12 @@ const AuthenticatorEnroll = {
     return tenant;
   },
 
-  async post(url, apiKey, payload) {
+  async post(url, apiKey, payload, opts = {}) {
     const response = await this.request(url, {
       method: "POST",
       headers: { ...this.headers(apiKey), "content-type": "application/json" },
       body: JSON.stringify(payload),
+      ...opts,
     });
 
     return response.data;
@@ -255,31 +325,42 @@ const AuthenticatorEnroll = {
   // response, and on a WITNESS rejection adopt the STH it hands back and replay
   // ONCE. That is the documented resync contract (#298), not a workaround.
   async request(url, options, retried = false) {
+    const {
+      deadlineMs = FETCH_TIMEOUT_MS,
+      timeoutMessage = TIMEOUT_MESSAGE,
+      ...init
+    } = options;
+
     const witness = this.sth
       ? { "x-loopctl-last-known-sth": this.sth }
       : { "x-loopctl-sth-bootstrap": "true" };
 
     // Without a deadline an API that accepts the connection and never answers
     // leaves the page busy forever, with a live credential in a disabled field
-    // on an unattended screen and no cancel path but a reload.
+    // on an unattended screen and no cancel path but a reload. It has to span
+    // the BODY read as well: fetch() resolves when the response HEADERS arrive,
+    // so clearing the timer there just moves the unbounded wait into json().
     const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(), FETCH_TIMEOUT_MS);
+    const timer = setTimeout(() => deadline.abort(), deadlineMs);
 
     let response;
+    let body;
 
     try {
       response = await fetch(url, {
-        ...options,
+        ...init,
         credentials: "omit",
         signal: deadline.signal,
-        headers: { ...options.headers, ...witness },
+        headers: { ...init.headers, ...witness },
       });
+
+      body = await this.parseJson(response, deadline);
     } catch (_error) {
-      // Network-level failure: no response was produced, so there is
-      // nothing server-side to report.
+      // Network-level failure, or a response that never finished arriving:
+      // there is nothing server-side to report either way.
       throw new Error(
         deadline.signal.aborted
-          ? "The loopctl API did not respond in time — try again."
+          ? timeoutMessage
           : "Could not reach the loopctl API — check your connection."
       );
     } finally {
@@ -288,8 +369,6 @@ const AuthenticatorEnroll = {
 
     const currentSth = response.headers.get("x-loopctl-current-sth");
     if (currentSth) this.sth = currentSth;
-
-    const body = await this.parseJson(response);
 
     if (response.ok) return body || {};
 
@@ -312,10 +391,14 @@ const AuthenticatorEnroll = {
     return { authorization: `Bearer ${apiKey}`, accept: "application/json" };
   },
 
-  async parseJson(response) {
+  // A body that is not JSON (an HTML error page, an empty 204) is not fatal —
+  // apiError() falls back to the status. An ABORT here IS the deadline firing,
+  // so it must propagate rather than be read as "no body".
+  async parseJson(response, deadline) {
     try {
       return await response.json();
-    } catch (_error) {
+    } catch (error) {
+      if (deadline.signal.aborted) throw error;
       return null;
     }
   },
@@ -336,12 +419,14 @@ const AuthenticatorEnroll = {
 
   // --- WebAuthn ceremonies ---
 
-  // Translates the DOMExceptions worth translating — see CEREMONY_ERRORS.
-  async ceremony(fun) {
+  // Translates the DOMExceptions worth translating — see CREATE_ERRORS /
+  // ASSERT_ERRORS. The map is a parameter because the SAME DOMException name
+  // means different things in the two ceremonies.
+  async ceremony(errors, fun) {
     try {
       return await fun();
     } catch (error) {
-      const known = CEREMONY_ERRORS[error && error.name];
+      const known = errors[error && error.name];
       if (known) throw new Error(known);
       throw error;
     }
@@ -357,7 +442,7 @@ const AuthenticatorEnroll = {
       (id) => ({ type: "public-key", id: base64urlDecode(id) })
     );
 
-    const credential = await this.ceremony(() =>
+    const credential = await this.ceremony(CREATE_ERRORS, () =>
       navigator.credentials.create({
         publicKey: {
           challenge: base64urlDecode(challenge.challenge),
@@ -408,7 +493,7 @@ const AuthenticatorEnroll = {
       );
     }
 
-    const credential = await this.ceremony(() =>
+    const credential = await this.ceremony(ASSERT_ERRORS, () =>
       navigator.credentials.get({
         publicKey: {
           challenge: base64urlDecode(reauth.challenge),

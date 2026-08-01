@@ -57,6 +57,19 @@ defmodule Loopctl.WebAuthn.AttestationConveyanceTest do
                  "rejects every attestation with " <>
                  ":invalid_attestation_conveyance_preference."
       end
+
+      # The resolver is not the only writer: runtime.exs MERGES its output into
+      # `config :loopctl, :webauthn` (config/runtime.exs:568), so an
+      # `attestation:` key appended at THAT call site — or in prod.exs — is
+      # outside both surfaces above and would leave this file green. Scan the
+      # config sources the way the test below scans the hooks.
+      for path <- ["config/runtime.exs", "config/prod.exs"] do
+        refute File.read!(path) =~ ~r/attestation:/,
+               "#{path} now sets an attestation conveyance preference. The browser " <>
+                 "hooks hard-code \"none\" and must be updated to match, or every " <>
+                 "production registration fails with " <>
+                 ":invalid_attestation_conveyance_preference."
+      end
     end
 
     test "every hook requests attestation: \"none\"" do

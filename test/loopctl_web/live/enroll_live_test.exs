@@ -134,16 +134,35 @@ defmodule LoopctlWeb.EnrollLiveTest do
     test "create() excludes already-enrolled credentials and the hook unbinds on destroy" do
       source = File.read!(@hook_path)
 
-      # Without excludeCredentials a "backup" authenticator can be the SAME
-      # physical device: the second credential gets a fresh credential_id, so
-      # the (tenant_id, credential_id) unique index never sees a duplicate and
-      # the tenant believes in redundancy it does not have.
-      assert source =~ "excludeCredentials"
+      # Anchored to the load-bearing expressions, not the identifiers: a guard
+      # reduced to `excludeCredentials: []` or an empty `destroyed() {}` is
+      # exactly the regression these tests exist to catch, and a bare substring
+      # scan passes on both.
+      #
+      # Without a POPULATED excludeCredentials a "backup" authenticator can be
+      # the SAME physical device: the second credential gets a fresh
+      # credential_id, so the (tenant_id, credential_id) unique index never sees
+      # a duplicate and the tenant believes in redundancy it does not have.
+      assert source =~ ~r/const enrolled = [^;]{0,200}allowed_credentials/
+      assert source =~ ~r/excludeCredentials: enrolled/
 
       # #enroll-app is phx-update="ignore", so its DOM outlives the hook across
-      # a LiveView reconnect. No destroyed() means the old instance's listeners
-      # stay bound and one click runs two concurrent ceremonies.
-      assert source =~ "destroyed()"
+      # a LiveView reconnect. A destroyed() that does not ABORT the listener
+      # controller leaves the old instance bound and one click runs two
+      # concurrent ceremonies.
+      assert source =~ ~r/destroyed\(\)\s*\{[^}]*this\.listeners\.abort\(\)/
+    end
+
+    test "the fetch deadline spans the response BODY, not just its headers" do
+      source = File.read!(@hook_path)
+
+      # fetch() resolves when the HEADERS arrive. Clearing the abort timer there
+      # moves the unbounded wait into response.json(), which is the same hang
+      # the deadline exists to close — so the body read must happen inside the
+      # timer's try, and an abort during it must propagate rather than be read
+      # as "no body".
+      assert source =~ ~r/body = await this\.parseJson\(response, deadline\);\s*\}\s*catch/
+      assert source =~ ~r/if \(deadline\.signal\.aborted\) throw error;/
     end
   end
 
