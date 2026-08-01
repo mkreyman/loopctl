@@ -390,11 +390,14 @@ defmodule Loopctl.HeavyRead do
   enables iterative scan fleet-wide with a single `UPDATE` — no redeploy — AFTER confirming
   the deployed pgvector is >= 0.8.
 
-  There is exactly ONE source for this value: the `SystemConfig` key. There is deliberately
-  NO `Application`-level override — an environment pin would silently shadow (or be shadowed
-  by) the operator lever, and pinning it ON for the test env would make CI stop exercising
-  the shipped production configuration. Tests that need a specific mode prime the
-  `SystemConfig` cache explicitly in an `async: false` module (see
+  `SystemConfig` is the operator lever and the only RUNTIME source. When no operator has set
+  that row, the fallback code comes from the config key `:hnsw_iterative_scan_default`
+  (`default_iterative_scan_code/0`), which ONLY `config/test.exs` sets — pinned ON there
+  because prod runs iterative scan ON, so an unpinned test env asserted recall against a
+  configuration nobody runs. Every NON-test config is barred from setting that key by
+  `test/loopctl/config_embedding_read_path_test.exs`; an `Application` pin in prod would
+  shadow the operator lever. Tests that need a specific mode prime the `SystemConfig` cache
+  explicitly in an `async: false` module (see
   `test/loopctl/heavy_read_hnsw_ef_search_test.exs`).
 
   Operator docs: `docs/hnsw-tuning-evaluation.md` and `docs/runbooks/knowledge-scale.md`.
@@ -413,9 +416,12 @@ defmodule Loopctl.HeavyRead do
   # environment can start from a different baseline without any test mutating VM-global
   # state. Only `config/test.exs` sets it — pinned ON there because PROD runs iterative scan
   # ON, so an unpinned test env asserted exact recall against a configuration nobody runs.
-  # Every NON-test config is still barred from setting it by
-  # `test/loopctl/config_embedding_read_path_test.exs`, which is the case that matters: an
-  # Application pin in prod would shadow the operator lever.
+  # Every NON-test config is barred from setting `:hnsw_iterative_scan_default` — the key
+  # read RIGHT BELOW — by `test/loopctl/config_embedding_read_path_test.exs`, which also
+  # asserts `config/test.exs` still sets it. That is the case that matters: an Application
+  # pin in prod would shadow the operator lever. (Name the key exactly: the guard policed
+  # only the pre-rename `:hnsw_iterative_scan` for a while, so this comment claimed a
+  # control that did not cover the key the function actually reads.)
   defp default_iterative_scan_code do
     case Application.get_env(:loopctl, :hnsw_iterative_scan_default, @default_hnsw_iterative_scan) do
       code when is_integer(code) -> code
@@ -459,6 +465,10 @@ defmodule Loopctl.HeavyRead do
   # + one log line per window, not one per ANN read.
   @iterative_scan_cache_ttl_ms 600_000
   @iterative_scan_negative_ttl_ms 60_000
+
+  # See `probe_iterative_scan_support/0`: this bounds the pre-gate checkout, not just the
+  # query, so it is deliberately far below the sibling probes' budget.
+  @probe_timeout_ms 500
 
   @doc """
   Whether the connected pgvector supports `hnsw.iterative_scan` (pgvector >= 0.8.0).
@@ -504,15 +514,54 @@ defmodule Loopctl.HeavyRead do
         cache_iterative_scan_verdict(supported, @iterative_scan_cache_ttl_ms)
         supported
 
-      {:inconclusive, reason} ->
-        Logger.warning(
-          "hnsw.iterative_scan capability probe was inconclusive (#{reason}) — " <>
-            "failing closed and re-probing in #{div(@iterative_scan_negative_ttl_ms, 1000)}s"
-        )
+      {:inconclusive, reason, class} ->
+        if cacheable_inconclusive?(class) do
+          Logger.warning(
+            "hnsw.iterative_scan capability probe was inconclusive (#{reason}) — " <>
+              "failing closed and re-probing in #{div(@iterative_scan_negative_ttl_ms, 1000)}s"
+          )
 
-        cache_iterative_scan_verdict(false, @iterative_scan_negative_ttl_ms)
+          cache_iterative_scan_verdict(false, @iterative_scan_negative_ttl_ms)
+        else
+          Logger.warning(
+            "hnsw.iterative_scan capability probe was inconclusive (#{reason}) — " <>
+              "failing closed for THIS read only, not cached"
+          )
+        end
+
         false
     end
+  end
+
+  # The negative cache defends against HeavyReadRepo SATURATION: under load the probe is
+  # inconclusive precisely when the pool is exhausted, so re-probing every read would add a
+  # checkout and a warning per ANN read during the incident. That reasoning applies to pool
+  # and connection failures — and to nothing else.
+  #
+  # Two classes are therefore NEVER cached, and for one shared reason: caching `false` pins
+  # iterative scan OFF for the whole VM for 60s, and now that `config/test.exs` pins it ON so
+  # the suite matches prod, a single blip silently reconfigures every ANN read in the run and
+  # re-arms the `left: []` recall flake that pin exists to prevent.
+  #
+  #   * `:ownership` — a sandbox test-harness artifact that cannot occur in prod and says
+  #     nothing about the connected pgvector's version.
+  #   * `:transaction` — the backend ANSWERED but the connection was poisoned (25P02 after a
+  #     deliberate constraint-violation or 57014 test). Also not backend pressure, and also
+  #     silent about the version.
+  #
+  # `:pool` (checkout timeouts, connection errors) IS the saturation case the negative cache
+  # was built for, so it stays cached in prod — but NOT under the sandbox pool, where routine
+  # full-suite connection exhaustion is documented and would produce exactly the suite-wide,
+  # silently-wrong configuration above rather than the incident-cost saving it buys in prod.
+  #
+  # Decided on the CLASS the probe returns, never on a substring of the formatted log tag:
+  # that coupling was invisible from both sites and would have failed OPEN (silently
+  # re-enabling the negative cache) the moment the tag's wording moved.
+  defp cacheable_inconclusive?(:pool), do: not sandbox_pool?()
+  defp cacheable_inconclusive?(_class), do: false
+
+  defp sandbox_pool? do
+    Application.get_env(:loopctl, repo(), [])[:pool] == Ecto.Adapters.SQL.Sandbox
   end
 
   defp cache_iterative_scan_verdict(verdict, ttl_ms) do
@@ -540,18 +589,26 @@ defmodule Loopctl.HeavyRead do
   end
 
   # `{:ok, boolean, version}` = the backend answered (`version` is the raw extversion, or
-  # `:not_installed` when the extension is absent); `{:inconclusive, reason}` = we could not
-  # tell. `reason` is a STABLE TAG, never the raw error struct — an inspected
-  # `Postgrex.Error`/`DBConnection.ConnectionError` carries backend host / database / role
-  # into the log stream for no diagnostic gain here (the probed SQL is a constant).
+  # `:not_installed` when the extension is absent); `{:inconclusive, reason, class}` = we
+  # could not tell. `reason` is a STABLE TAG for the LOG, never the raw error struct — an
+  # inspected `Postgrex.Error`/`DBConnection.ConnectionError` carries backend host / database
+  # / role into the log stream for no diagnostic gain here (the probed SQL is a constant).
+  # `class` is what `cacheable_inconclusive?/1` DECIDES on, so the caching policy never
+  # depends on how the tag happens to be worded.
   @spec probe_iterative_scan_support() ::
-          {:ok, boolean(), String.t() | :not_installed} | {:inconclusive, String.t()}
+          {:ok, boolean(), String.t() | :not_installed}
+          | {:inconclusive, String.t(), :ownership | :transaction | :pool}
   defp probe_iterative_scan_support do
-    # Explicit timeout like the sibling probes (`probe/0`, `replica_max_connections/0`):
-    # without it this inherits DBConnection's ~15s default and can block an ANN request
-    # BEFORE the TenantGate shed and before the SET LOCAL statement_timeout applies.
+    # TIGHT timeout, because this round trip runs from `opts/1` — i.e. BEFORE `TenantGate`
+    # can shed and before any `SET LOCAL statement_timeout` applies. DBConnection derives the
+    # checkout DEADLINE from this same `:timeout` (`Holder.abs_timeout/2`), so it is exactly
+    # the bound on how long a probe may queue on a saturated heavy-read pool ahead of the
+    # gate whose whole job is to shed before the checkout. A `pg_extension` lookup is
+    # sub-millisecond on a healthy pool; needing more than #{@probe_timeout_ms}ms IS the
+    # saturation signal, and failing closed there (iterative scan off for this read) is
+    # cheaper than every concurrent ANN request queueing for seconds in front of the shed.
     case repo().query("SELECT extversion FROM pg_extension WHERE extname = 'vector'", [],
-           timeout: 5_000
+           timeout: @probe_timeout_ms
          ) do
       {:ok, %{rows: [[version]]}} when is_binary(version) ->
         {:ok, version_at_least?(version, @iterative_scan_min_version), version}
@@ -561,17 +618,23 @@ defmodule Loopctl.HeavyRead do
         {:ok, false, :not_installed}
 
       other ->
-        {:inconclusive, probe_failure_tag(other)}
+        {:inconclusive, probe_failure_tag(other), inconclusive_class(other)}
     end
   rescue
-    error -> {:inconclusive, "raised:" <> inspect(error.__struct__)}
+    error ->
+      {:inconclusive, "raised:" <> inspect(error.__struct__), inconclusive_class(error)}
   catch
     # DBConnection/Postgrex EXIT rather than raise when the pool is not started (`:noproc`)
     # or wedged (`{:timeout, {GenServer, :call, _}}`). Without this clause the exit
     # propagates out of `opts/1` and aborts the caller's ANN read — the OPPOSITE of the
     # documented fail-closed guarantee.
-    :exit, reason -> {:inconclusive, "exit:" <> exit_tag(reason)}
+    :exit, reason -> {:inconclusive, "exit:" <> exit_tag(reason), :pool}
   end
+
+  defp inconclusive_class({:error, error}), do: inconclusive_class(error)
+  defp inconclusive_class(%DBConnection.OwnershipError{}), do: :ownership
+  defp inconclusive_class(%Postgrex.Error{}), do: :transaction
+  defp inconclusive_class(_error), do: :pool
 
   defp probe_failure_tag({:error, %{__struct__: mod}}), do: "query_error:" <> inspect(mod)
   defp probe_failure_tag({:error, reason}) when is_atom(reason), do: "query_error:#{reason}"

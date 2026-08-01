@@ -217,9 +217,13 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     test "an ANN heavy read at OFF issues NO SET LOCAL hnsw.iterative_scan" do
       # OFF must touch NOTHING iterative-scan — this is what keeps the feature inert (and
       # safe on a pgvector < 0.8 backend without the GUC) until an operator opts in.
-      # Primed explicitly so the assertion does not depend on the ambient SystemConfig
-      # default. No config pin is permitted for this key (config/test.exs sets none, and
-      # `Loopctl.ConfigEmbeddingReadPathTest` fails the build if any config file does).
+      # Primed explicitly so the assertion does not depend on the ambient default — which
+      # matters MORE since #535, not less: `config/test.exs` now pins
+      # `:hnsw_iterative_scan_default` to 1, so the ambient value is ON and this OFF-path
+      # test would assert nothing without the explicit prime. `Loopctl.ConfigEmbeddingReadPathTest`
+      # bars that pin from every NON-test config and asserts it stays in `config/test.exs`.
+      # These assertions are the compensating coverage `config/test.exs` cites for the OFF
+      # path — if this test moves, update that citation.
       prime_iterative_scan(0)
       assert HeavyRead.hnsw_iterative_scan() == "off", "precondition: OFF"
       tenant = fixture(:tenant)

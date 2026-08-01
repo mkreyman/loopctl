@@ -12,10 +12,22 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
        for a Mox mock that does not exist outside the test env. Production correctness
        depends entirely on that key being absent everywhere else.
 
-    2. `config :loopctl, :hnsw_iterative_scan` must not exist AT ALL. #488's iterative-scan
-       remedy is deliberately a `SystemConfig`-only operator lever (see
-       `Loopctl.HeavyRead.hnsw_iterative_scan/0`); an `Application`-level pin would either
-       shadow the operator or make the test suite stop exercising the shipped default.
+    2. The Application-level iterative-scan pin must exist in `config/test.exs` and
+       NOWHERE else. #488's iterative-scan remedy is a `SystemConfig` operator lever (see
+       `Loopctl.HeavyRead.hnsw_iterative_scan/0`); an `Application` pin in a NON-test env
+       would shadow that operator lever in prod.
+
+       The live key is **`:hnsw_iterative_scan_default`** — the fallback
+       `Loopctl.HeavyRead.default_iterative_scan_code/0` reads when no operator has set the
+       `SystemConfig` row. `config/test.exs` pins it ON deliberately, because prod runs
+       iterative scan ON and an unpinned test env asserted exact recall against a
+       configuration nobody runs.
+
+       `:hnsw_iterative_scan` (no suffix) is the PRE-RENAME spelling and is read by nothing
+       today. It stays in the forbidden list so a revert to the old name is caught too —
+       and because the rename is exactly how this guard went blind: the key moved, the
+       guard did not follow, and for a while the only policed key was a dead one while the
+       live pin was unpoliced in every environment.
 
   Both are parsed from the config SOURCE (`config/runtime.exs` in particular is never
   reflected by `Application.get_env/2` during `mix test`), same technique as
@@ -44,7 +56,13 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
   use ExUnit.Case, async: true
 
   @test_only_keys [:embedding_read_path]
-  @forbidden_keys [:hnsw_iterative_scan]
+
+  # `:hnsw_iterative_scan_default` is the key `HeavyRead.default_iterative_scan_code/0`
+  # actually reads; `:hnsw_iterative_scan` is its pre-rename spelling, retained so a revert
+  # is caught. Both are barred from every NON-test config; `config/test.exs` sets the live
+  # one on purpose and the test below asserts that it still does.
+  @forbidden_keys [:hnsw_iterative_scan, :hnsw_iterative_scan_default]
+  @test_pinned_key :hnsw_iterative_scan_default
 
   @flag_writer "test/loopctl/embeddings/system_config_read_path_test.exs"
   @self_path "test/loopctl/config_embedding_read_path_test.exs"
@@ -93,19 +111,34 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
              )
     end
 
-    test ":hnsw_iterative_scan is not set in ANY config file" do
+    test "no iterative-scan Application pin exists in any NON-test config file" do
       for file <- non_test_config_files(), key <- @forbidden_keys do
         refute config_key_set?(file, key),
                """
                config/#{file} sets `:loopctl, #{inspect(key)}`.
 
-               #488's iterative-scan mode has exactly one source: the `SystemConfig` key
-               "hnsw_iterative_scan" (see `Loopctl.HeavyRead.hnsw_iterative_scan/0`). An
-               Application-level pin would shadow the operator lever in prod, and in the
-               test env it would stop CI exercising the shipped default — blinding it to
-               filtered-ANN under-return regressions.
+               #488's iterative-scan mode has exactly one operator source: the
+               `SystemConfig` key "hnsw_iterative_scan" (see
+               `Loopctl.HeavyRead.hnsw_iterative_scan/0`). An Application-level pin outside
+               the test env would SHADOW that lever in prod, so an operator flipping the
+               row would see no effect.
                """
       end
+    end
+
+    # The positive half. Without it the guard is one-sided: deleting the test pin would
+    # silently return the suite to asserting recall against a configuration prod does not
+    # run, which is the state #535 changed and is not visible from the forbidden list.
+    test "config/test.exs DOES pin the live iterative-scan key" do
+      assert config_key_set?("test.exs", @test_pinned_key),
+             """
+             config/test.exs no longer sets `:loopctl, #{inspect(@test_pinned_key)}`.
+
+             It is pinned there ON PURPOSE: prod runs iterative scan ON, so an unpinned
+             test env asserts exact ANN recall against a configuration nobody runs. If the
+             pin was removed deliberately, re-derive the recall expectations in the
+             embedding/ANN suites in the same change — do not just delete this assertion.
+             """
     end
   end
 
@@ -154,11 +187,20 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
   @uses_case_template ~r/^\s*use\s+Loopctl\.(DataCase|ConnCase)\b/m
   @calls_stub_all_defaults ~r/^\s*(Loopctl\.DataCase\.)?stub_all_defaults\(\)/m
   @calls_set_mox_global ~r/^\s*(Mox\.)?set_mox_global\(\)/m
+  # Classified by the TAG that makes a module skip `mix precommit`, not by its filename:
+  # three `:scale` modules (scale_recall_test.exs, scale_seed_test.exs,
+  # scale_seed_nightly_test.exs) do not end in `_scale_test.exs`, so the old glob left them
+  # unpoliced — the same "the guard went blind because the name moved" failure this file's
+  # other guards warn about.
+  @scale_moduletag ~r/^\s*@moduletag\s+:scale(_nightly)?\b/m
 
   defp bare_exunit_scale_modules do
-    "test/**/*_scale_test.exs"
+    "test/**/*_test.exs"
     |> Path.wildcard()
-    |> Enum.reject(&(File.read!(&1) =~ @uses_case_template))
+    |> Enum.filter(fn file ->
+      source = File.read!(file)
+      source =~ @scale_moduletag and not (source =~ @uses_case_template)
+    end)
   end
 
   describe "bare-ExUnit scale modules stub the injected collaborators" do
@@ -178,6 +220,12 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
                @calls_stub_all_defaults,
              "a COMMENT naming the helper must not count as calling it"
 
+      assert "  @moduletag :scale" =~ @scale_moduletag
+      assert "  @moduletag :scale_nightly" =~ @scale_moduletag
+
+      refute "  # tagged `@moduletag :scale` so precommit skips it" =~ @scale_moduletag,
+             "a COMMENT naming the tag must not count as carrying it"
+
       assert "    Mox.set_mox_global()" =~ @calls_set_mox_global
 
       refute "  # `set_mox_global` makes the stub visible from any process" =~
@@ -188,7 +236,7 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
              "the glob/classifier matched NO modules — the guards below would be vacuous"
     end
 
-    test "every *_scale_test.exs without DataCase/ConnCase calls stub_all_defaults/0" do
+    test "every :scale-tagged module without DataCase/ConnCase calls stub_all_defaults/0" do
       missing =
         bare_exunit_scale_modules()
         |> Enum.reject(&(File.read!(&1) =~ @calls_stub_all_defaults))

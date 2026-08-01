@@ -43,6 +43,11 @@ defmodule Loopctl.Knowledge.ScaleSeedNightlyTest do
   end
 
   setup do
+    # This module is on bare `ExUnit.Case`, so nothing else stubs the injected
+    # collaborators `config/test.exs` points at Mox mocks (see
+    # `test/loopctl/config_embedding_read_path_test.exs`).
+    Loopctl.DataCase.stub_all_defaults()
+
     tenant =
       with_unboxed_db(fn ->
         tenant_id = Ecto.UUID.generate()

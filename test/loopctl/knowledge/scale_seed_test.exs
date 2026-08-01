@@ -71,6 +71,11 @@ defmodule Loopctl.Knowledge.ScaleSeedTest do
   # ---------------------------------------------------------------------------
 
   setup do
+    # This module is on bare `ExUnit.Case`, so nothing else stubs the injected
+    # collaborators `config/test.exs` points at Mox mocks (see
+    # `test/loopctl/config_embedding_read_path_test.exs`).
+    Loopctl.DataCase.stub_all_defaults()
+
     # We cannot use the sandbox here — we need committed rows for ANALYZE.
     # Use unboxed_run to get a real connection that commits rows.
     tenant =
