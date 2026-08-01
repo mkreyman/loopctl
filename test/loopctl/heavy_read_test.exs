@@ -485,9 +485,36 @@ defmodule Loopctl.HeavyReadTest do
     end
   end
 
+  # Records the opts each statement was issued with, then delegates to the real Repo so the
+  # queries still behave. Asserting on `mode:` needs the call itself, not its result.
+  defmodule OptsRecordingRepo do
+    def query!(sql, params \\ [], opts \\ []) do
+      send(self(), {:issued, sql, opts})
+      Loopctl.Repo.query!(sql, params, opts)
+    end
+  end
+
   describe "LocalGuc best-effort bookkeeping" do
     test "capture degrades to [] instead of aborting the caller's read" do
       assert Loopctl.LocalGuc.capture(ExitingRepo, ["statement_timeout"]) == []
+    end
+
+    test "capture runs under mode: :savepoint, like restore" do
+      # Without it, a failure on the capture round trip aborts the ENCLOSING transaction
+      # (25P02) before the caller's work has run at all — so every later statement in the
+      # caller's Multi fails citing a query it never issued, and `capture_failed/2` returns
+      # its tidy `:error` into a transaction that is already unusable. restore/2 has always
+      # passed it; capture is the side that runs first and needs it more.
+      Loopctl.Repo.transaction(fn ->
+        assert [{"statement_timeout", _}] =
+                 Loopctl.LocalGuc.capture(OptsRecordingRepo, ["statement_timeout"])
+      end)
+
+      assert_received {:issued, "SELECT current_setting" <> _, opts}
+
+      assert Keyword.get(opts, :mode) == :savepoint,
+             "the capture SELECT must be savepoint-scoped so its failure cannot poison " <>
+               "the caller's transaction"
     end
 
     test "restore swallows an exit, so it cannot destroy a successful result" do

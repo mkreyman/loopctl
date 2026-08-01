@@ -512,24 +512,77 @@ defmodule Loopctl.HeavyRead do
       {:ok, supported, version} ->
         maybe_warn_unsupported(supported, version)
         cache_iterative_scan_verdict(supported, @iterative_scan_cache_ttl_ms)
+        :persistent_term.put({__MODULE__, :iterative_scan_last_conclusive}, supported)
         supported
 
       {:inconclusive, reason, class} ->
-        if cacheable_inconclusive?(class) do
-          Logger.warning(
-            "hnsw.iterative_scan capability probe was inconclusive (#{reason}) — " <>
-              "failing closed and re-probing in #{div(@iterative_scan_negative_ttl_ms, 1000)}s"
-          )
+        inconclusive_verdict(reason, class)
+    end
+  end
 
+  # An inconclusive probe answers "I could not ask", never "the extension is missing".
+  # Collapsing it to `false` was wrong in the one direction that is silent: the operator
+  # has iterative scan ON, a probe blips, and the ANN read runs at the pgvector default OFF
+  # — under-returning rows with nothing in the response saying so. The pgvector VERSION
+  # cannot change between two reads on the same backend, so the last CONCLUSIVE verdict is
+  # a far better answer than a fresh guess.
+  #
+  # `false` remains the answer only when we have never once succeeded, which is the genuine
+  # unknown and the only place fail-closed is the safe reading.
+  defp inconclusive_verdict(reason, class) do
+    case last_conclusive_verdict() do
+      {:ok, verdict} ->
+        maybe_log_inconclusive(
+          class,
+          "hnsw.iterative_scan capability probe was inconclusive (#{reason}) — " <>
+            "reusing the last CONCLUSIVE verdict (#{verdict})"
+        )
+
+        if cacheable_inconclusive?(class) do
+          cache_iterative_scan_verdict(verdict, @iterative_scan_negative_ttl_ms)
+        end
+
+        verdict
+
+      :none ->
+        maybe_log_inconclusive(
+          class,
+          "hnsw.iterative_scan capability probe was inconclusive (#{reason}) and no " <>
+            "conclusive verdict has ever been recorded — failing closed"
+        )
+
+        if cacheable_inconclusive?(class) do
           cache_iterative_scan_verdict(false, @iterative_scan_negative_ttl_ms)
-        else
-          Logger.warning(
-            "hnsw.iterative_scan capability probe was inconclusive (#{reason}) — " <>
-              "failing closed for THIS read only, not cached"
-          )
         end
 
         false
+    end
+  end
+
+  # Bound the log cost on the ANN hot path. An UNCACHEABLE class re-probes on every read, so
+  # logging unconditionally put one warning per ANN read into the incident it was meant to
+  # describe — the storm the negative cache exists to prevent, reintroduced through the
+  # logger. One line per class per window is enough to see it in the logs.
+  defp maybe_log_inconclusive(class, message) do
+    key = {__MODULE__, :iterative_scan_warned, class}
+
+    if now_ms() >= :persistent_term.get(key, 0) do
+      :persistent_term.put(key, now_ms() + @iterative_scan_negative_ttl_ms)
+      Logger.warning(message)
+    end
+
+    :ok
+  end
+
+  # Written ONLY by a conclusive probe, and never expired: it records what the backend
+  # actually said, which is the fact we want to fall back to precisely when we cannot ask
+  # again. The live cache above still expires, so a genuine backend change is still picked
+  # up by the next window — this is the fallback for "the probe failed", not a second
+  # source of truth for "what is supported".
+  defp last_conclusive_verdict do
+    case :persistent_term.get({__MODULE__, :iterative_scan_last_conclusive}, :none) do
+      verdict when is_boolean(verdict) -> {:ok, verdict}
+      _none -> :none
     end
   end
 
@@ -631,10 +684,27 @@ defmodule Loopctl.HeavyRead do
     :exit, reason -> {:inconclusive, "exit:" <> exit_tag(reason), :pool}
   end
 
-  defp inconclusive_class({:error, error}), do: inconclusive_class(error)
-  defp inconclusive_class(%DBConnection.OwnershipError{}), do: :ownership
-  defp inconclusive_class(%Postgrex.Error{}), do: :transaction
-  defp inconclusive_class(_error), do: :pool
+  # Public only so the negative-cache decision is directly testable: it is a pure function
+  # of the probe's error, and getting it wrong is silent — the cost shows up as a re-probe
+  # storm during an incident, which is exactly when nobody is reading this code.
+  @doc false
+  @spec inconclusive_class(term()) :: :ownership | :transaction | :pool
+  def inconclusive_class({:error, error}), do: inconclusive_class(error)
+  def inconclusive_class(%DBConnection.OwnershipError{}), do: :ownership
+
+  # Classify on the SQLSTATE, not on the struct module. `:transaction` means one specific
+  # thing — the connection was already poisoned by an EARLIER statement (25P02), which is a
+  # test-harness artifact of a deliberate constraint-violation or cancellation test and says
+  # nothing about backend pressure. Every OTHER Postgrex error IS the pressure case the
+  # negative cache was built for: 57014 statement timeout, 53300 too_many_connections,
+  # 57P01 admin shutdown. Matching the whole struct swept all of them into the one class
+  # that is never cached, so a real production incident re-probed on every ANN read — the
+  # exact storm the cache exists to bound.
+  def inconclusive_class(%Postgrex.Error{postgres: %{code: :in_failed_sql_transaction}}),
+    do: :transaction
+
+  def inconclusive_class(%Postgrex.Error{}), do: :pool
+  def inconclusive_class(_error), do: :pool
 
   defp probe_failure_tag({:error, %{__struct__: mod}}), do: "query_error:" <> inspect(mod)
   defp probe_failure_tag({:error, reason}) when is_atom(reason), do: "query_error:#{reason}"

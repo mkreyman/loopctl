@@ -595,11 +595,28 @@ defmodule Loopctl.Knowledge.BulkOps do
   # repo handed to the Multi so the GUC override holds for the whole transaction.
   # The prior value is captured and put back by `run_multi/2`'s last step, because
   # `SET LOCAL` outlives a COMMITTED savepoint (see `Loopctl.LocalGuc`).
+  # `LocalGuc`'s own docs name the hand-paired capture/restore form as the open leak, and
+  # this was the last call site still using it: `capture/2` degrades a backend failure to
+  # `[]`, the `SET LOCAL` below was issued regardless, and `restore/2` on `[]` is a silent
+  # no-op — so the override outlived the COMMITTED savepoint and leaked onto the pooled
+  # connection for whatever ran next.
+  #
+  # We ask for exactly one GUC, and `statement_timeout` always exists, so a successful
+  # capture ALWAYS yields one pair. An empty list is therefore unambiguously a failed
+  # capture, and the Multi aborts BEFORE the override is set rather than setting one it
+  # cannot take back. Failing the bulk op is the right side to err on: a capture that could
+  # not complete means the connection is already in trouble, and the alternative — running
+  # unbounded — silently drops the blast-radius bound of AC-27.12.5.
   defp timeout_multi do
     Multi.run(Multi.new(), :set_timeout, fn repo, _changes ->
-      prior = LocalGuc.capture(repo, ["statement_timeout"])
-      repo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
-      {:ok, prior}
+      case LocalGuc.capture(repo, ["statement_timeout"]) do
+        [_ | _] = prior ->
+          repo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
+          {:ok, prior}
+
+        [] ->
+          {:error, :statement_timeout_capture_failed}
+      end
     end)
   end
 

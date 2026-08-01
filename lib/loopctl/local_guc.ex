@@ -148,7 +148,14 @@ defmodule Loopctl.LocalGuc do
     # Names are interpolated (an identifier cannot be bound), so both public entry points
     # ran them through `validate_names!/1` first.
     selects = Enum.map_join(names, ", ", &"current_setting('#{&1}', true)")
-    %{rows: [values]} = repo.query!("SELECT #{selects}")
+
+    # `mode: :savepoint`, matching `restore/2` — and for the same reason, which applies
+    # even harder here because this runs BEFORE the caller's work. Without it a failure on
+    # this round trip leaves the enclosing transaction aborted (25P02), so every later
+    # statement in the caller's Multi fails with an error about a query it never issued.
+    # With it, the failure rolls back to its own savepoint and `capture_failed/2` can
+    # return `:error` to a transaction that is still usable.
+    %{rows: [values]} = repo.query!("SELECT #{selects}", [], mode: :savepoint)
     {:ok, Enum.zip(names, values)}
   rescue
     error -> capture_failed(names, error)

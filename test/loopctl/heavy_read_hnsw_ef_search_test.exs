@@ -359,4 +359,54 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     :persistent_term.put(pt_key, value)
     on_exit(fn -> :persistent_term.erase(pt_key) end)
   end
+
+  describe "inconclusive probe classification (negative-cache eligibility)" do
+    # The class decides whether an inconclusive probe is negative-cached. Sweeping every
+    # Postgrex.Error into :transaction (the never-cached class) meant a REAL production
+    # incident — statement timeouts, connection exhaustion, an admin shutdown — re-probed
+    # and re-warned on every ANN read, which is the storm the cache exists to bound.
+    test "only a poisoned-transaction SQLSTATE is :transaction; other backend errors are :pool" do
+      poisoned = %Postgrex.Error{postgres: %{code: :in_failed_sql_transaction}}
+
+      assert HeavyRead.inconclusive_class(poisoned) == :transaction,
+             "25P02 is a harness artifact of an earlier failed statement, not backend pressure"
+
+      for code <- [:query_canceled, :too_many_connections, :admin_shutdown, :crash_shutdown] do
+        error = %Postgrex.Error{postgres: %{code: code}}
+
+        assert HeavyRead.inconclusive_class(error) == :pool,
+               "#{code} is backend pressure and MUST stay negative-cacheable"
+      end
+    end
+
+    test "ownership errors keep their own class, and unknown failures default to :pool" do
+      assert HeavyRead.inconclusive_class(%DBConnection.OwnershipError{}) == :ownership
+      assert HeavyRead.inconclusive_class(%DBConnection.ConnectionError{}) == :pool
+      assert HeavyRead.inconclusive_class(:some_exit_reason) == :pool
+    end
+
+    test "an {:error, _} tuple is unwrapped before classifying" do
+      wrapped = {:error, %Postgrex.Error{postgres: %{code: :too_many_connections}}}
+
+      assert HeavyRead.inconclusive_class(wrapped) == :pool
+    end
+  end
+
+  describe "last conclusive verdict (probe-blip fallback)" do
+    @last_conclusive_key {Loopctl.HeavyRead, :iterative_scan_last_conclusive}
+
+    test "a conclusive probe records its verdict for later inconclusive reads to fall back on" do
+      :persistent_term.erase(@probe_cache_key)
+      :persistent_term.erase(@last_conclusive_key)
+      on_exit(fn -> :persistent_term.erase(@last_conclusive_key) end)
+
+      # Drives a real probe against the test backend.
+      verdict = HeavyRead.iterative_scan_supported?()
+
+      assert :persistent_term.get(@last_conclusive_key, :none) == verdict,
+             "a conclusive probe must record what the backend actually said, so a later " <>
+               "probe BLIP reuses it instead of silently reconfiguring the ANN read to the " <>
+               "pgvector default OFF"
+    end
+  end
 end
