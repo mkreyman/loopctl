@@ -866,7 +866,7 @@ defmodule LoopctlWeb.SignupLive do
               phx-update="ignore"
               data-challenge={@challenge_payload}
               data-rp-id={Keyword.get(WebAuthn.rp_opts(), :rp_id, "loopctl.com")}
-              data-rp-name="loopctl"
+              data-rp-name={Keyword.get(WebAuthn.rp_opts(), :rp_name, "loopctl")}
             >
             </div>
 
