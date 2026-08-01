@@ -29,8 +29,8 @@ defmodule Loopctl.LocalGuc do
       default in the same single round trip as the valued ones (verified against PG 18:
       `hnsw.ef_search` "123" -> "" and `statement_timeout` restored, one statement). That
       proof comes from the capture; when the capture round trip itself FAILS we have no
-      such proof, so the fallback RESETS every name this scope is about to set EXCEPT the
-      ones an enclosing `scoped/3` already owns — see `active_names/0`.
+      such proof, so the fallback RESETS every name this scope sets — and ABORTS instead when
+      an enclosing `scoped/3` owns one, where reset clobbers and silence leaks (`active_names/0`).
     * GUC names cannot be bound as query parameters, so they are interpolated — and
       therefore validated against `@guc_name` first. Values always go through as parameters.
     * restore runs in an `after` and capture BEFORE the `try`. Both are BEST-EFFORT and
@@ -55,7 +55,7 @@ defmodule Loopctl.LocalGuc do
     prior =
       case do_capture(repo, names) do
         {:ok, pairs} -> pairs
-        :error -> Enum.map(names -- enclosing, &{&1, nil})
+        :error -> capture_fallback!(names, enclosing)
       end
 
     put_active_names(enclosing ++ names)
@@ -63,30 +63,48 @@ defmodule Loopctl.LocalGuc do
     try do
       fun.()
     after
-      put_active_names(enclosing)
+      # `restore/2` pops what `capture/2` pushed (the hand-paired form), so it runs FIRST and
+      # the reset to `enclosing` is the final word — an inner pop must not erase an outer
+      # scope's ownership of the same name.
       restore(repo, prior)
+      put_active_names(enclosing)
     end
   end
 
-  # The names an ENCLOSING `scoped/3` is already holding an override for. A capture failure
-  # leaves us no prior values, so the fallback RESETS (`set_config(name, NULL, true)` → the
-  # backend default) rather than restores — and a reset must never fire on an outer scope's
-  # name, or an inner failure strips the outer read's deliberate `statement_timeout` bound
-  # (`HeavyRead.transaction/2`) or its elevated `hnsw.ef_search` for the rest of its body.
-  # This stack is that guard, and it is EXACT: every `SET LOCAL` these callers issue is
-  # wrapped in a `scoped/3`, so a name absent from the stack has no outer owner to clobber
-  # and IS safe to reset — core GUC or not. Filtering by "namespaced only" instead was both
-  # unsound (it clobbered a nested `hnsw.ef_search`) and incomplete (it left the
-  # `statement_timeout` leak open on every NON-ANN heavy read, its only captured name).
-  #
-  # Process-dictionary state is deliberate: the nesting is dynamic through an opaque `fun`,
-  # so there is nothing to thread it through, and it must be per-process exactly like the
-  # connection checkout whose transaction it shadows.
+  # A capture failure leaves us no prior values, so the fallback cannot RESTORE. For a name
+  # nobody else owns, RESETTING it (`set_config(name, NULL, true)` → the backend default) is
+  # sound. For a name an ENCLOSING scope owns it is not: we do not know the value that scope
+  # set (its `fun` issued the `SET LOCAL`, not us), so a reset strips the outer read's
+  # deliberate `statement_timeout` bound or its elevated `hnsw.ef_search`, while silence leaks
+  # OUR value into the rest of its body — the 57014-far-from-the-query failure this module
+  # exists to prevent. `capture_fallback!/2` takes neither branch: it aborts before the body
+  # sets anything, and the rollback discards every `SET LOCAL` the transaction made. A wedged
+  # capture means a wedged connection anyway; `Knowledge.BulkOps.timeout_multi/0` errs alike.
+  # This stack records every name a LIVE scope holds: `scoped/3` pushes for its body; the
+  # hand-paired form pushes in `capture/2` and pops in `restore/2` — or in `forget/1` on an
+  # abort path `restore/2` can never reach, which is why `BulkOps` counts too. It is a
+  # per-PROCESS approximation of a per-CONNECTION fact (a dynamic nesting through an opaque
+  # `fun` can observe nothing finer) and diverges only CONSERVATIVELY or vanishingly rarely:
+  # an owner on ANOTHER repo's connection makes us abort a read we could have reset (safe,
+  # never a leak), and a sandbox-allowed `Task` sharing the owner's checkout sees an empty
+  # stack (it would reset a name the owner holds — only if that Task's capture also fails).
   @active_names_key {__MODULE__, :active_names}
 
   defp active_names, do: Process.get(@active_names_key, [])
   defp put_active_names([]), do: Process.delete(@active_names_key)
   defp put_active_names(names), do: Process.put(@active_names_key, names)
+
+  defp capture_fallback!(names, enclosing) do
+    case Enum.filter(names, &(&1 in enclosing)) do
+      [] ->
+        Enum.map(names, &{&1, nil})
+
+      owned ->
+        raise "LocalGuc: could not capture #{inspect(owned)}, which an enclosing scope " <>
+                "already overrode — refusing to set an override this transaction cannot " <>
+                "take back (see the moduledoc)"
+    end
+  end
 
   # A GUC name is INTERPOLATED (Postgres will not bind an identifier as a parameter), so it
   # is checked against Postgres's own GUC shape first. Every caller passes a module-local
@@ -121,9 +139,14 @@ defmodule Loopctl.LocalGuc do
   end
 
   @doc """
-  The prior values of `names`, as `[{name, value_or_nil}]`. One round trip; a BACKEND
-  failure never raises, it degrades to `[]`, which makes `restore/2` a no-op. An invalid
-  GUC name is a programmer error and DOES raise `ArgumentError`.
+  The prior values of `names`, as `[{name, value_or_nil}]`. MUST be called inside a
+  transaction on `repo`: the round trip runs `mode: :savepoint`, which Postgrex refuses on
+  an idle connection, so an out-of-transaction call degrades to `[]` like any other failure.
+  One round trip; a BACKEND failure never raises, it degrades to `[]`, which makes `restore/2`
+  a no-op. An invalid GUC name is a programmer error and DOES raise `ArgumentError`.
+
+  A successful capture registers `names` on the active-scope stack, popped by `restore/2` or
+  `forget/1` (see `active_names/0`), so a nested `scoped/3` sees this scope's overrides.
 
   Prefer `scoped/3`: a caller that pairs this with `restore/2` by hand gets NO restoration
   when the capture fails, which is the leak `scoped/3`'s fallback exists to close.
@@ -133,9 +156,28 @@ defmodule Loopctl.LocalGuc do
     validate_names!(names)
 
     case do_capture(repo, names) do
-      {:ok, pairs} -> pairs
-      :error -> []
+      {:ok, pairs} ->
+        put_active_names(active_names() ++ names)
+        pairs
+
+      :error ->
+        []
     end
+  end
+
+  @doc """
+  Drop `names` from the active-scope stack: no round trip, nothing restored, and a no-op for
+  a name `restore/2` already popped.
+
+  For the hand-paired form on an abort path `restore/2` can never reach (an `Ecto.Multi` whose
+  restore step is skipped because an earlier one errored). The rollback already discarded every
+  `SET LOCAL`, so only the bookkeeping is left — and it MUST be cleared, or a later `scoped/3`
+  on that reused process sees a phantom owner and ABORTS a read it could safely have reset.
+  """
+  @spec forget([String.t()]) :: :ok
+  def forget(names) when is_list(names) do
+    put_active_names(active_names() -- names)
+    :ok
   end
 
   # `{:ok, pairs} | :error`, so `scoped/3` can tell "nothing to capture" apart from "the
@@ -148,7 +190,13 @@ defmodule Loopctl.LocalGuc do
     # Names are interpolated (an identifier cannot be bound), so both public entry points
     # ran them through `validate_names!/1` first.
     selects = Enum.map_join(names, ", ", &"current_setting('#{&1}', true)")
-    %{rows: [values]} = repo.query!("SELECT #{selects}")
+
+    # `mode: :savepoint`, matching `restore/2` and for the same reason, harder here because
+    # this runs BEFORE the caller's work: without it a failure on this round trip leaves the
+    # enclosing transaction aborted (25P02), so every later statement in the caller's Multi
+    # fails over a query it never issued. With it, the failure rolls back to its own savepoint
+    # and `capture_failed/2` returns `:error` to a transaction that is still usable.
+    %{rows: [values]} = repo.query!("SELECT #{selects}", [], mode: :savepoint)
     {:ok, Enum.zip(names, values)}
   rescue
     error -> capture_failed(names, error)
@@ -175,6 +223,7 @@ defmodule Loopctl.LocalGuc do
 
   def restore(repo, prior) do
     validate_names!(names_of(prior))
+    put_active_names(active_names() -- names_of(prior))
 
     # A nil value is passed THROUGH as a NULL parameter, which resets the GUC to its
     # default. See the moduledoc: nil means "unknown to this backend", so resetting is
