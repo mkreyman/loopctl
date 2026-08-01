@@ -251,16 +251,39 @@ fi
 # This was DOWNGRADED to a non-blocking WARN (#363) because prod sat in a state the
 # guard flags permanently: scale alerts enabled with no SCALE_ALERT_WEBHOOK_URL. A
 # check that is red on every single deploy trains everyone to ignore it, which is worse
-# than not having it.
+# than not having it. #376 removed that state instead of tolerating it — prod now sets
+# SCALE_ALERTS_ENABLED=false (fly.toml) while no receiver exists.
 #
-# #376 removed that state instead of tolerating it — prod now sets
-# SCALE_ALERTS_ENABLED=false (fly.toml) while no receiver exists, so /health/ready is
-# genuinely 200 and this is a HARD GATE again. A miss here now means a real
-# misconfiguration introduced by the deploy under test (alerting switched on without a
-# URL, or a broken guard), which is exactly what US-32.4 was built to catch.
+# So the HARD gate is re-armed on the CONFIG GUARD ONLY (checks.scale_alerts), the one
+# input that a bad deploy actually introduces. `ready` also folds in oban_orphans
+# (US-34.2) and liveness, which are pre-existing RUNTIME state: a standing orphan
+# backlog would otherwise redden every deploy and recreate the #363 alarm fatigue
+# through a different signal — and it would contradict the /health check above, which
+# deliberately WARNs on Oban-only degradation. Those stay a WARN here too.
+#
+# `ready` is read with the documented fallback to `.status == "ok"` for a
+# :health_checker implementation that omits the field (LoopctlWeb.HealthController.ready/2
+# does the same). The endpoint answers 503 when not ready, so any OTHER code is a fail.
 http GET "$BASE_URL/health/ready"
-assert "readiness (scale-alerts config-guard, US-32.4)" 200 \
-  '.ready == true' 'ready is true'
+ready_scale="$(jq -r '.checks.scale_alerts // "missing"' "$BODY" 2>/dev/null || echo missing)"
+ready_flag="$(jq -r 'if has("ready") then (.ready | tostring) else (.status == "ok" | tostring) end' \
+  "$BODY" 2>/dev/null || echo missing)"
+
+if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "503" ]; then
+  fail "readiness (scale-alerts config-guard, US-32.4)" \
+    "expected HTTP 200 or 503, got $HTTP_CODE ($(head -c 200 "$BODY" 2>/dev/null | tr '\n' ' '))"
+elif [ "$TIME_MS" -gt "$SMOKE_MAX_MS" ]; then
+  fail "readiness (scale-alerts config-guard, US-32.4)" \
+    "latency ${TIME_MS}ms exceeds budget ${SMOKE_MAX_MS}ms"
+elif [ "$ready_scale" != "ok" ]; then
+  fail "readiness (scale-alerts config-guard, US-32.4)" \
+    "checks.scale_alerts='${ready_scale}' — $(jq -r '.reasons.scale_alerts // "no reason given"' "$BODY" 2>/dev/null || echo unknown)"
+elif [ "$ready_flag" = "true" ]; then
+  pass "readiness (scale-alerts config-guard, US-32.4)"
+else
+  warn "readiness (US-32.4)" \
+    "not ready with scale_alerts=ok (oban_orphans='$(jq -r '.checks.oban_orphans // "missing"' "$BODY" 2>/dev/null || echo missing)', status='$(jq -r '.status // "missing"' "$BODY" 2>/dev/null || echo missing)') — pre-existing runtime state, not a deploy config regression"
+fi
 
 # --- KB retrieval crown jewels (authed, read-only) -----------------------------
 #

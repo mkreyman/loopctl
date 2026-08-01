@@ -402,15 +402,21 @@ if config_env() == :prod do
   # a URL" and "on with no URL" — and the second permanently fails the US-32.4 readiness
   # guard, which exists to catch a MISCONFIGURED deploy, not to nag about an alerting
   # channel nobody has chosen. Turning alerting off makes /health/ready honest: alerting
-  # is off, and it says so, instead of claiming a broken firing path forever.
+  # is off, and it says so, instead of claiming a broken firing path forever. OFF means
+  # OFF, not log-only: LoopctlWeb.Telemetry omits the ScaleAlerts child, so nothing is
+  # evaluated or logged either (the Prometheus series are unaffected). The inverse
+  # mistake — SCALE_ALERT_WEBHOOK_URL set while this stays false — is NOT caught by the
+  # readiness guard, which only checks enabled-without-a-URL.
   #
   # The parse is opt-OUT (default true) and asymmetric with the `in ~w(true 1)` opt-IN
-  # vars above, ON PURPOSE: only an exact `false`/`0` disables. A typo ("flase") leaves
-  # alerting ENABLED, where the readiness guard is still watching — the failure mode of
-  # a mistyped value must never be silently-no-alerting.
+  # vars above, ON PURPOSE: only `false`/`0` disables. A typo ("flase") leaves alerting
+  # ENABLED, where the readiness guard is still watching — the failure mode of a
+  # mistyped value must never be silently-no-alerting. That asymmetry is pinned by
+  # test/loopctl/config_test.exs, since this prod-only file is never evaluated by the
+  # suite (same in-lib-so-it-is-testable shape as Loopctl.ObanConfig above).
   config :loopctl,
          :scale_alerts_enabled,
-         System.get_env("SCALE_ALERTS_ENABLED", "true") not in ~w(false 0)
+         Loopctl.Config.opt_out_flag("SCALE_ALERTS_ENABLED")
 
   config :loopctl, :scale_alert_webhook_url, System.get_env("SCALE_ALERT_WEBHOOK_URL")
 
