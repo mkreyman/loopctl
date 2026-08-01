@@ -29,7 +29,7 @@ Total wall time stays well under 30 s.
 | # | Check | Asserts | Budget | Why |
 |---|-------|---------|--------|-----|
 | 1 | `GET /health` | 200 **and** `.checks.database == "ok"`; Oban-only degradation is a WARN (pass) | 5 s | App up + DB healthy (liveness only — never depooled by the scale-alerts config-guard) |
-| 1.5 | `GET /health/ready` | 200, `.ready == true` (falls back to `.status=="ok"` for an implementation that omits `ready`) | 5 s | **US-32.4 readiness gate**: fails loud (hard RED, not a warn) if scale alerts are enabled but `SCALE_ALERT_WEBHOOK_URL` is unset — the automated consumer of the readiness signal so the misconfig is caught at deploy time instead of during the incident it should have warned about |
+| 1.5 | `GET /health/ready` | HTTP 200 or 503 **and** `.checks.scale_alerts == "ok"` **and** the code agrees with the ready flag (`ready` falls back to `.status=="ok"` when the field is omitted). A false `ready` caused by anything else is a WARN | 5 s | **US-32.4 readiness gate**, scoped (#376) to the config guard it is named for: hard RED when the alerting config is incoherent in EITHER direction — enabled with no `SCALE_ALERT_WEBHOOK_URL`, or the URL set while `SCALE_ALERTS_ENABLED` is false. `oban_orphans`/liveness also move `ready` but are pre-existing runtime state, not a deploy regression, so they warn. See "Reading a RED result" below |
 | 2 | `GET /api/v1/knowledge/count` (authed) | 200, `.count` int > 1000 | 5 s | KB not wiped (prod baseline ~83k) |
 | 3a | `GET /api/v1/knowledge/search?q=elixir&mode=keyword&limit=3` (authed) | 200, `.data` non-empty | 5 s | **Keyword retrieval floor** (deterministic DB path, no embedding) |
 | 3b | `GET /api/v1/knowledge/search?q=elixir&limit=3` (authed, combined) | 200, `.data` non-empty **and** `.meta.fallback != true` | 8 s | **Semantic retrieval healthy** — fails if the embedding provider is down (combined silently keyword-falls-back otherwise) |
@@ -50,11 +50,28 @@ Exit code is non-zero if ANY check fails. A WARN (⚠) does not fail the run.
   EITHER the DB or the Oban `:default` queue check fails. A transient Oban blip
   with a healthy DB + KB is **not** a rollback trigger, so the script warns and
   passes. Only a DB failure or a non-200 is a hard FAIL on check 1.
-- **1.5 RED (`/health/ready` 503 or `.ready == false`)** — this is a **config**
-  problem, not a code regression: `:scale_alerts_enabled` is true but
-  `SCALE_ALERT_WEBHOOK_URL` is unset (or blank) on the deployed release. Fix is
-  to set the Fly secret/env var, not to roll back the code. `.reasons.scale_alerts`
-  in the response body names the missing env var (never a value).
+- **1.5 — read the CAUSE before deciding.** Since #376 this check no longer keys on
+  `.ready` alone, because `ready` folds in three independent inputs and only one of
+  them is a deploy-introduced config fault. Branch on what the body says:
+  - **`checks.scale_alerts != "ok"` → hard RED, and it is a config problem, not a code
+    regression.** The two incoherent combinations are `SCALE_ALERTS_ENABLED` on with
+    `SCALE_ALERT_WEBHOOK_URL` unset, and the URL set while `SCALE_ALERTS_ENABLED` is
+    `false` (the likelier half-done change — `fly.toml` ships it `false`).
+    `.reasons.scale_alerts` names the setting to fix, never a value. Fix the config;
+    do not roll back the code.
+  - **`ready == false` with `checks.scale_alerts == "ok"` → WARN, passes.** The cause is
+    `oban_orphans` (US-34.2 — a standing backlog of `:executing` orphans, watch the
+    `loopctl.oban.jobs.executing_orphan.count` gauge) or liveness. Both are pre-existing
+    RUNTIME state rather than something this deploy introduced, and reddening on them
+    would recreate the #363 chronic-red fatigue through a different signal. It is also
+    consistent with check 1 above, which already treats Oban-only degradation as a WARN.
+  - **`checks.scale_alerts` absent → WARN.** A bespoke `:health_checker` may omit it;
+    that must not RED a healthy deploy.
+  - **Any HTTP code other than 200 or 503, or a code/flag disagreement** (503 with
+    `ready: true`, 200 with `ready: false`) **→ hard RED.** The endpoint's contract is
+    broken, which would otherwise let an inverted `put_status` report a green pass.
+  - `ready` is read with a documented fallback to `.status == "ok"` for an
+    implementation that omits the field, matching `LoopctlWeb.HealthController.ready/2`.
 - **2 RED (count ≤ 1000)** — see the visibility invariant below; a wiped corpus or
   a changed smoke-key tenant both show up here.
 
