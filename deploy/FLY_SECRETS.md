@@ -49,6 +49,9 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `ADMIN_POOL_SIZE`   | `3`     | AdminRepo connection pool size           |
 | `ECTO_IPV6`         | -       | Set to `true` to enable IPv6 for DB     |
 | `DNS_CLUSTER_QUERY` | -       | DNS query for clustering (not needed for single machine) |
+| `WEBAUTHN_RP_ID`    | `loopctl.com` | **Required for any self-hosted deployment on its own domain (#511).** The WebAuthn relying-party id. The spec requires it to be a registrable domain suffix of the page's origin, so while it says `loopctl.com` the browser REFUSES the enrollment ceremony anywhere else — and without enrollment a tenant can never become `human_anchored`, which gates the whole chain-of-custody surface. Set it to your bare domain (`wiki.example.com`), no scheme, no port. Unset leaves the hosted default untouched |
+| `WEBAUTHN_ORIGIN`   | `https://$WEBAUTHN_RP_ID` | The exact page origin the ceremony is served from, scheme included. The default is correct for a normal https deployment. **Set it explicitly** for localhost or a non-standard port (`http://localhost:4000`) — WebAuthn only runs in a secure context, with localhost as the sole `http://` exception, so any other `http://` origin fails in the browser regardless of what is configured here |
+| `WEBAUTHN_RP_NAME`  | `loopctl`   | Display name the authenticator shows during enrollment. Cosmetic |
 | `SECRETS_ADAPTER`   | Fly GraphQL | Set to `local_file` to store the per-tenant audit keypairs on disk instead of in Fly secrets — REQUIRED when self-hosting off Fly (see below) |
 | `SECRETS_FILE`      | `/data/loopctl/secrets.json` | Path for the `local_file` adapter. Put it on a PERSISTENT volume |
 | `FTS_REGCONFIG`     | `english` | Postgres text-search config for keyword FTS (see below) |

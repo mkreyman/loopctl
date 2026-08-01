@@ -530,6 +530,33 @@ if config_env() == :prod do
 
   host = System.get_env("PHX_HOST") || "example.com"
 
+  # WebAuthn relying party for a SELF-HOSTED deployment (#511, refs #494). `config.exs`
+  # hardcodes `loopctl.com`, and the WebAuthn spec requires `rp_id` to be a registrable
+  # domain suffix of the page's origin — so on any other domain the browser rejects the
+  # enrollment ceremony outright and a self-hoster cannot create a human-anchored tenant
+  # at all. `dev.exs` and `test.exs` already override this for localhost; only a prod
+  # RELEASE had no way to.
+  #
+  # Inside the prod block ON PURPOSE. The original patch placed it at the file's top level,
+  # where a `WEBAUTHN_RP_ID` merely present in the shell would silently override the dev
+  # and test settings — including during `mix test`, where it would break the WebAuthn
+  # suite in a way that looks nothing like its cause.
+  #
+  # `rp_id` unset leaves `config.exs` untouched, so the hosted deployment is unaffected.
+  #
+  # The origin defaults to `https://<rp_id>` rather than being derived with a scheme and
+  # port: WebAuthn only runs in a secure context (https, or localhost as the one
+  # exception), so an http:// default can never work for a real domain — it would fail the
+  # ceremony with a browser-side error rather than a configuration one. A localhost or
+  # non-standard-port deployment must set WEBAUTHN_ORIGIN explicitly.
+  if webauthn_rp_id = System.get_env("WEBAUTHN_RP_ID") do
+    config :loopctl, :webauthn,
+      rp_id: webauthn_rp_id,
+      rp_name: System.get_env("WEBAUTHN_RP_NAME") || "loopctl",
+      origin: System.get_env("WEBAUTHN_ORIGIN") || "https://#{webauthn_rp_id}",
+      user_verification: "preferred"
+  end
+
   config :loopctl, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
 
   config :loopctl, LoopctlWeb.Endpoint,
@@ -574,15 +601,4 @@ if config_env() == :prod do
   #       force_ssl: [hsts: true]
   #
   # Check `Plug.SSL` for all available options in `force_ssl`.
-end
-
-# WebAuthn relying-party is configurable via env for non-loopctl.com deployments
-# (config.exs hardcodes loopctl.com, which breaks the enrollment ceremony on
-# localhost/self-hosted origins). Without the env var, behaviour is unchanged.
-if webauthn_rp_id = System.get_env("WEBAUTHN_RP_ID") do
-  config :loopctl, :webauthn,
-    rp_id: webauthn_rp_id,
-    rp_name: "loopctl",
-    origin: System.get_env("WEBAUTHN_ORIGIN") || "http://#{webauthn_rp_id}:4030",
-    user_verification: "preferred"
 end
