@@ -280,7 +280,7 @@ if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "503" ]; then
 elif [ "$TIME_MS" -gt "$SMOKE_MAX_MS" ]; then
   fail "readiness (scale-alerts config-guard, US-32.4)" \
     "latency ${TIME_MS}ms exceeds budget ${SMOKE_MAX_MS}ms"
-elif [ "$ready_scale" != "ok" ] && [ "$ready_scale" != "missing" ]; then
+elif [ "$ready_scale" != "ok" ] && [ "$ready_scale" != "warn" ] && [ "$ready_scale" != "missing" ]; then
   fail "readiness (scale-alerts config-guard, US-32.4)" \
     "checks.scale_alerts='${ready_scale}' — $(jq -r '.reasons.scale_alerts // "no reason given"' "$BODY" 2>/dev/null || echo unknown)"
 elif [ "$HTTP_CODE" = "200" ] && [ "$ready_flag" != "true" ]; then
@@ -292,6 +292,9 @@ elif [ "$HTTP_CODE" = "503" ] && [ "$ready_flag" = "true" ]; then
 elif [ "$ready_scale" = "missing" ]; then
   warn "readiness (US-32.4)" \
     "no checks.scale_alerts in the body (ready='${ready_flag}') — the config guard was not evaluated, so this deploy is unchecked rather than clean"
+elif [ "$ready_scale" = "warn" ]; then
+  warn "readiness (scale-alerts config, US-32.4)" \
+    "$(jq -r '.reasons.scale_alerts // "no reason given"' "$BODY" 2>/dev/null || echo unknown) — alerting is configured incoherently but the deployment is otherwise healthy; fix the config, do not roll back"
 elif [ "$ready_flag" = "true" ]; then
   pass "readiness (scale-alerts config-guard, US-32.4)"
 else

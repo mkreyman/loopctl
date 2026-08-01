@@ -119,10 +119,14 @@ It windows the same three signals via atomic ETS counters, evaluates them on a t
 (`:scale_alert_check_interval_ms`, default 60 s), and on an **edge-triggered** breach POSTs
 an id-only JSON payload to `:scale_alert_webhook_url` (Slack / PagerDuty / generic). Its
 thresholds are the SAME numbers the dashboard draws (5 timeouts/min, p95 2000 ms, 30
-under-fills/min). Enable it in prod by setting `SCALE_ALERT_WEBHOOK_URL`; full config table
-in [`knowledge-scale.md`](../runbooks/knowledge-scale.md#the-firing-alert-path-loopctltelemetryscalealerts).
+under-fills/min). Enabling it in prod is a **two-part** change (#376): set
+`SCALE_ALERT_WEBHOOK_URL` **and** `SCALE_ALERTS_ENABLED = "true"` in `fly.toml`. Full
+config table in [`knowledge-scale.md`](../runbooks/knowledge-scale.md#the-firing-alert-path-loopctltelemetryscalealerts).
 
-The dashboard is for a human watching the trend; ScaleAlerts is the thing that pages.
+**Hosted prod currently ships `SCALE_ALERTS_ENABLED = "false"`** — no receiver exists yet,
+so the checker is not started and nothing pages. Until that changes, this dashboard (and
+the Prometheus series behind it, which are unaffected by the flag) is the degradation
+signal: a human watching the trend, with nothing watching on their behalf.
 
 ## Assumptions a reviewer / importer should check
 

@@ -105,8 +105,14 @@ defmodule Loopctl.HealthCheck.Default do
     # Readiness: liveness AND the scale-alerts config-guard AND the oban-orphans
     # backlog guard. Only `/health/ready` acts on this — it is the deploy-time smoke
     # signal, not the traffic-routing one.
+    #
+    # `scale_alerts` blocks readiness only on a hard "error". Its third state, "warn"
+    # (#376 — a webhook URL configured while `SCALE_ALERTS_ENABLED` is false), is a
+    # configuration a healthy deployment legitimately runs, `config/test.exs` among them;
+    # blocking on it would red every deploy of a perfectly good release, which is the
+    # #363 failure this readiness signal was just rescued from.
     ready =
-      status == "ok" and checks.scale_alerts == "ok" and checks.oban_orphans == "ok"
+      status == "ok" and checks.scale_alerts != "error" and checks.oban_orphans == "ok"
 
     # #461 item 5: the app version is deliberately NOT included in this response.
     # Both `/health` (continuous, unauthenticated, hit by Fly's LB every 10s AND
@@ -155,9 +161,13 @@ defmodule Loopctl.HealthCheck.Default do
   # Self-rescuing like its `check_database`/`check_oban` siblings: an unexpected raise
   # (e.g. a non-string config value reaching `ScaleAlerts.config_status/0`) must degrade
   # cleanly to an "error" check, never crash the whole endpoint into a 500.
+  # `warn` (#376) is surfaced in `checks`/`reasons` but does NOT block `ready` — see
+  # `ready` above and `ScaleAlerts.config_status/2` for why the URL-set-while-disabled
+  # combination is graded below a hard error.
   defp check_scale_alerts do
     case scale_alerts_config_checker().config_status() do
       :ok -> {"ok"}
+      {:warn, reason} -> {"warn", reason}
       {:error, reason} -> {"error", reason}
     end
   rescue
@@ -249,7 +259,10 @@ defmodule Loopctl.HealthCheck.Default do
   # previously-added one (e.g. both scale_alerts and oban_orphans can fail at once). No
   # secret is included: reason strings name only the env var (scale_alerts) or the
   # orphan count/threshold (oban_orphans).
-  defp maybe_put_reason(result, key, {"error", reason}) do
+  # "warn" (#376) carries a reason exactly like "error" does — the grade decides whether
+  # `ready` is blocked, not whether the operator gets told why. A surfaced check with no
+  # reason would be strictly worse than no check: visible, and unactionable.
+  defp maybe_put_reason(result, key, {grade, reason}) when grade in ["error", "warn"] do
     Map.update(result, :reasons, %{key => reason}, &Map.put(&1, key, reason))
   end
 

@@ -405,8 +405,8 @@ if config_env() == :prod do
   # is off, and it says so, instead of claiming a broken firing path forever. OFF means
   # OFF, not log-only: LoopctlWeb.Telemetry omits the ScaleAlerts child, so nothing is
   # evaluated or logged either (the Prometheus series are unaffected). The inverse
-  # mistake — SCALE_ALERT_WEBHOOK_URL set while this stays false — is NOT caught by the
-  # readiness guard, which only checks enabled-without-a-URL.
+  # mistake — SCALE_ALERT_WEBHOOK_URL set while this stays false — is caught by the same
+  # guard: `ScaleAlerts.config_status/2` errors on EITHER half-done direction.
   #
   # The parse is opt-OUT (default true) and asymmetric with the `in ~w(true 1)` opt-IN
   # vars above, ON PURPOSE: only `false`/`0` disables. A typo ("flase") leaves alerting

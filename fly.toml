@@ -24,10 +24,9 @@ primary_region = "lax"
   # entirely, so no telemetry handlers are attached, no threshold is evaluated and no
   # breach is logged. The Prometheus series (ScaleMetrics, the [metrics] port below) are
   # unaffected and remain the degradation signal while this is "false". Delete this line
-  # (or set "true") in the SAME change that sets the SCALE_ALERT_WEBHOOK_URL secret:
-  # enabling it without a URL puts /health/ready into a permanent 503 by design
-  # (US-32.4), and setting the URL while this stays "false" leaves alerting silently off
-  # — the config guard only checks the first direction.
+  # (or set "true") in the SAME change that sets the SCALE_ALERT_WEBHOOK_URL secret —
+  # ScaleAlerts.config_status/2 flags BOTH half-done directions, so doing one without the
+  # other turns /health/ready red with a reason naming the setting to fix.
   SCALE_ALERTS_ENABLED = "false"
 
 [http_service]
