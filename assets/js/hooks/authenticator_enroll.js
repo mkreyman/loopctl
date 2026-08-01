@@ -78,10 +78,21 @@ const WITNESS_CODES = ["witness_divergence", "witness_bootstrap_already_consumed
 // fetch a different device and abandon a ceremony that was about to succeed.
 const NOT_ALLOWED =
   "The browser refused or timed out the ceremony. Click Enroll again and touch the device when prompted.";
+const ALREADY_ENROLLED =
+  "That authenticator is already enrolled on this tenant — use a DIFFERENT device as a backup.";
 const CREATE_ERRORS = {
-  InvalidStateError:
-    "That authenticator is already enrolled on this tenant — use a DIFFERENT device as a backup.",
-  NotAllowedError: NOT_ALLOWED,
+  InvalidStateError: ALREADY_ENROLLED,
+  // NOT the bare NOT_ALLOWED text. An excludeCredentials match is only
+  // SOMETIMES reported as InvalidStateError: Chrome raises NotAllowedError for a
+  // CTAP2 roaming key (observed against a virtual authenticator), and the spec
+  // lets a browser collapse the two to avoid disclosing which credentials the RP
+  // excluded. Telling that operator to "click Enroll again" sends them into a
+  // loop that cannot succeed, on a one-way-door operation — so this path has to
+  // name both causes.
+  NotAllowedError:
+    "The browser refused the ceremony. Either this authenticator is ALREADY enrolled " +
+    "on this tenant — try a different device — or the touch timed out, in which case " +
+    "click Enroll again.",
 };
 const ASSERT_ERRORS = { NotAllowedError: NOT_ALLOWED };
 
@@ -486,6 +497,16 @@ const AuthenticatorEnroll = {
     };
   },
 
+  // Testing note, so the next person does not re-derive it: this ceremony
+  // CANNOT be exercised end to end with Chrome's CDP virtual authenticator.
+  // `WebAuthn.addVirtualAuthenticator` fails a `get()` whose `allowCredentials`
+  // names the very rawId its own `create()` just returned (NotAllowedError),
+  // while a discoverable `get()` with no allow-list succeeds and returns a
+  // DIFFERENT id — reproducible in a bare page with no loopctl code, and
+  // `WebAuthn.getCredentials` likewise reports an internal id rather than the
+  // RP-visible one. The server side of this gate IS verifiable without a
+  // browser: POST the enroll endpoint on a human_anchored tenant with no
+  // `reauth_assertion` and it must answer 401 `reauth_required`.
   async assert(reauth) {
     if (!reauth) {
       throw new Error(
