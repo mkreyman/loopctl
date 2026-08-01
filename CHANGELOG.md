@@ -39,6 +39,34 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **`GET /api/v1/articles/:id` link payload trimmed, ranked and capped (#538) — BREAKING
+  for anything reading `source_article` / `target_article`.** Each link object now carries
+  only its FAR side, as `article: {id, title}`. The near side was a constant echo of the
+  id already in the request URL, and — because only the far side is preloaded — its
+  `title` was always `null`; it cost 14% of a typical response and carried nothing.
+  Direction is unchanged and still given by which array the link is in. Links now also
+  carry `similarity` when the auto-linker recorded one.
+  Both arrays are **ranked** (open `potential_conflict` first, then descending similarity,
+  then oldest-first for links with no recorded score — only the auto-linker records one,
+  so a hand-created or imported corpus ranks entirely on that fallback) and **capped at 25
+  per direction**, with new `links_total` and `links_truncated` fields
+  reporting the true size. Use `knowledge_graph` to traverse the whole graph.
+  A new `links` query parameter selects the detail level — `full` (default, so an
+  untouched caller keeps working), `count` (`links_total` + `links_truncated`, so one
+  cheap call answers whether the full fetch is capped), `none` (no link fields).
+  An unrecognized value degrades to `full` rather than 422-ing a read.
+  `potential_conflicts` is returned in **all three** modes, so a cheaper read never
+  silently turns off conflict discovery; it is itself capped at 25 (highest similarity
+  first) with `conflicts_total` / `conflicts_truncated`, so a conflict-heavy hub cannot
+  make a cheap mode expensive.
+  `GET /articles/:id` now also reads the `project_id` / `story_id` query params the MCP
+  tool has always advertised, so article-access events are attributed instead of nil.
+  As on every sibling knowledge read, a malformed `project_id` there returns **422**
+  rather than silently discarding the attribution, and an empty one counts as absent.
+  Why: agents are instructed to open every search hit with `knowledge_get`, so this
+  response is paid on essentially every wiki read in every session. On a measured hub
+  article the links were 12,564 of 16,189 bytes — about 4,000 tokens to read 735 tokens
+  of body.
 - **Ingestion document content is encrypted at rest (#493).** Raw `content` posted to
   `POST /api/v1/knowledge/ingest` was persisted as plaintext JSON in `oban_jobs.args`
   (including `retryable`/`discarded` rows) until pruning — the one at-rest exposure
