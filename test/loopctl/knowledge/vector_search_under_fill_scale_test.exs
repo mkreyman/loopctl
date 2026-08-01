@@ -220,7 +220,7 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
         assert_received {:under_fill, measurements, metadata}
         assert measurements.requested == 5
         assert measurements.returned < 5
-        assert measurements.pool == VectorSearch.pool_size(5)
+        assert measurements.pool == pool
         # The ANN delivered candidates (bounded by ef_search ~40, so typically < pool —
         # which is exactly why the old `>= pool` pool-full gate was degenerate and is gone).
         assert measurements.ann_candidates > 0
