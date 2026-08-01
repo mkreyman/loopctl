@@ -91,6 +91,18 @@ defmodule Loopctl.ApiSpec.Schemas do
                     endpoints: %Schema{type: :array, items: %Schema{type: :string}},
                     requires_human: %Schema{type: :boolean},
                     requires_role: %Schema{type: :string},
+                    # #541 — the endpoints above need a browser
+                    # (navigator.credentials.create), so the machine-actionable
+                    # fields alone are a dead end for the agent reading this.
+                    # RELATIVE: the page is per-deployment, bound to that
+                    # instance's WEBAUTHN_RP_ID, unlike `docs`.
+                    enrollment_page: %Schema{
+                      type: :string,
+                      example: "/enroll",
+                      description:
+                        "Relative path to THIS deployment's browser enrollment page — the " <>
+                          "only way to run the WebAuthn ceremony the endpoints above require."
+                    },
                     docs: %Schema{type: :string}
                   }
                 },
