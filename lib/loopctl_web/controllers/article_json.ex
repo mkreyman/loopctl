@@ -93,6 +93,9 @@ defmodule LoopctlWeb.ArticleJSON do
   @doc "The per-direction link cap enforced by `:full`. Read by the OpenAPI spec so the two cannot drift."
   def max_links_per_direction, do: @max_links_per_direction
 
+  @doc "The `potential_conflicts` cap, enforced in every mode. Read by the OpenAPI spec so the two cannot drift."
+  def max_conflicts, do: @max_conflicts
+
   @doc """
   Serializes an article with its link graph, at one of three levels of detail.
 
@@ -183,14 +186,21 @@ defmodule LoopctlWeb.ArticleJSON do
   # every mode, because `:none`/`:count` exist to make the read CHEAP and an uncapped
   # array of incoming conflict edges would defeat exactly that on the hub articles the
   # cap was introduced for. Strongest similarity first, so what survives is the pair most
-  # worth merging.
+  # worth merging — then the SAME tie-break as `rank_and_cap/1`, because an unscored
+  # (hand-created or imported) conflict set ties at 0.0 and would otherwise be cut by an
+  # arbitrary peer-UUID order. Sorting the links, not the rendered peers, is what keeps
+  # `inserted_at` reachable here.
   defp put_conflicts(data, article) do
-    all = potential_conflicts(article)
+    all = conflict_links(article)
 
     kept =
       all
-      |> Enum.sort_by(&{-(&1.similarity || 0.0), &1.article_id})
+      |> Enum.sort_by(fn {link, _peer, peer_id} ->
+        {-(link_similarity(link) || 0.0), DateTime.to_unix(link.inserted_at, :microsecond),
+         peer_id}
+      end)
       |> Enum.take(@max_conflicts)
+      |> Enum.map(fn {link, peer, peer_id} -> conflict_peer(link, peer, peer_id) end)
 
     data
     |> Map.put(:potential_conflicts, kept)
@@ -198,37 +208,38 @@ defmodule LoopctlWeb.ArticleJSON do
     |> Map.put(:conflicts_truncated, length(kept) < length(all))
   end
 
-  # Route-the-findings (#4): a flattened, actionable view of the article's
-  # `:potential_conflict` links (in either direction) — the PEER article + the
-  # similarity that flagged it. Empty list when none. A conflict that fits under the
+  # Route-the-findings (#4): the article's `:potential_conflict` links (in either
+  # direction) paired with the PEER end, ready to rank and then render. Empty list when
+  # none. A conflict that fits under the
   # per-direction cap also appears in incoming/outgoing_links, but past that cap this is
   # the ONLY place it is surfaced — so an agent reading the article still trips over
   # "too similar to coexist" pairs and can merge the redundancy or reconcile.
-  defp potential_conflicts(article) do
+  defp conflict_links(article) do
     out =
       article.outgoing_links
       |> loaded_links()
       |> Enum.filter(&(&1.relationship_type == :potential_conflict))
-      |> Enum.map(&conflict_peer(&1, &1.target_article, &1.target_article_id))
+      |> Enum.map(&{&1, &1.target_article, &1.target_article_id})
 
     inc =
       article.incoming_links
       |> loaded_links()
       |> Enum.filter(&(&1.relationship_type == :potential_conflict))
-      |> Enum.map(&conflict_peer(&1, &1.source_article, &1.source_article_id))
+      |> Enum.map(&{&1, &1.source_article, &1.source_article_id})
 
     out ++ inc
   end
 
+  # Same guarded accessor AND same key-presence contract as `link_data/3`: an unscored
+  # link omits `similarity` in both places, so a caller branching on key presence cannot
+  # get two answers about the same link inside one response.
   defp conflict_peer(link, peer_article, peer_id) do
-    %{
-      article_id: peer_id,
-      title: loaded_title(peer_article),
-      # Same guarded accessor as `link_data/3` — reading the metadata key raw here let one
-      # response report a non-numeric score in `potential_conflicts` while omitting it
-      # from the very same link's entry in the direction arrays.
-      similarity: link_similarity(link)
-    }
+    base = %{article_id: peer_id, title: loaded_title(peer_article)}
+
+    case link_similarity(link) do
+      nil -> base
+      score -> Map.put(base, :similarity, score)
+    end
   end
 
   # `far_id`/`far_article` are the OTHER end of the link — the target for an outgoing

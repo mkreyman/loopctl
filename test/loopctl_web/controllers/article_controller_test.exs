@@ -1350,6 +1350,39 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert hd(scores) == 0.926
     end
 
+    # Only the system writers record a similarity_score, so a hand-created or imported
+    # conflict set ties at 0.0 — the cap must then keep the earliest-flagged pairs, not
+    # whichever 25 an arbitrary peer-UUID order puts first.
+    test "unscored conflicts are capped oldest-first, not by peer UUID", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+
+      for i <- 1..26 do
+        peer = fixture(:article, %{tenant_id: tenant.id, title: "Peer #{i}"})
+
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: peer.id,
+          target_article_id: hub.id,
+          relationship_type: :potential_conflict
+        })
+      end
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=none")
+        |> json_response(200)
+
+      conflicts = body["data"]["potential_conflicts"]
+      assert Enum.map(conflicts, & &1["title"]) == Enum.map(1..25, &"Peer #{&1}")
+      # An unscored conflict omits `similarity` entirely, exactly like the same link's
+      # entry in the direction arrays.
+      refute Map.has_key?(hd(conflicts), "similarity")
+    end
+
     test "project_id/story_id query params attribute the read", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
@@ -1364,6 +1397,35 @@ defmodule LoopctlWeb.ArticleControllerTest do
 
       # Analytics runs synchronously in test. The MCP tool advertises both params "for
       # attribution"; ignoring them recorded every wiki read as unattributed.
+      event =
+        Loopctl.Knowledge.ArticleAccessEvent
+        |> AdminRepo.all()
+        |> Enum.find(&(&1.article_id == article.id and &1.api_key_id == api_key.id))
+
+      assert event.project_id == project.id
+      assert event.story_id == story.id
+    end
+
+    test "a malformed project_id is a 422, and an empty one is absent rather than explicit",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      story = fixture(:story, %{tenant_id: tenant.id, project_id: project.id})
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Attributed"})
+
+      assert conn
+             |> auth_conn(raw_key)
+             |> get(~p"/api/v1/articles/#{article.id}?project_id=not-a-uuid")
+             |> json_response(422)
+
+      # An empty value must not take the explicit-project branch: that drops it as
+      # malformed and suppresses the project the story would have supplied.
+      conn
+      |> auth_conn(raw_key)
+      |> get(~p"/api/v1/articles/#{article.id}?project_id=&story_id=#{story.id}")
+      |> json_response(200)
+
       event =
         Loopctl.Knowledge.ArticleAccessEvent
         |> AdminRepo.all()

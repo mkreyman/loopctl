@@ -50,6 +50,8 @@ Operator-facing changes for deployments outside the hosted instance.
   make a cheap mode expensive.
   `GET /articles/:id` now also reads the `project_id` / `story_id` query params the MCP
   tool has always advertised, so article-access events are attributed instead of nil.
+  As on every sibling knowledge read, a malformed `project_id` there returns **422**
+  rather than silently discarding the attribution, and an empty one counts as absent.
   Why: agents are instructed to open every search hit with `knowledge_get`, so this
   response is paid on essentially every wiki read in every session. On a measured hub
   article the links were 12,564 of 16,189 bytes — about 4,000 tokens to read 735 tokens
