@@ -19,6 +19,12 @@ primary_region = "lax"
   PHX_HOST = "loopctl.com"
   PORT = "8080"
   PHX_SERVER = "true"
+  # #376: alerting is OFF until an operator webhook receiver exists. The firing path is
+  # fully built (US-27.15 / Epic 2 #349) and every threshold still evaluates in-process
+  # and logs; only the POST is disabled. Delete this line (or set "true") in the SAME
+  # change that sets the SCALE_ALERT_WEBHOOK_URL secret — enabling it without a URL puts
+  # /health/ready back into a permanent 503 by design (US-32.4).
+  SCALE_ALERTS_ENABLED = "false"
 
 [http_service]
   internal_port = 8080

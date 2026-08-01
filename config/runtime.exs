@@ -391,13 +391,27 @@ if config_env() == :prod do
          String.to_integer(System.get_env("METRICS_TENANT_LABEL_CAP") || "1000")
 
   # US-27.15 (AC-27.15.2): the FIRING alert path. ScaleAlerts is cheap (it only POSTs
-  # when a webhook URL is set AND a threshold breaches), so start it in prod always; it
-  # is opt-in until SCALE_ALERT_WEBHOOK_URL is configured (no URL → breaches are logged,
-  # nothing is POSTed). Point SCALE_ALERT_WEBHOOK_URL at a Slack/PagerDuty/generic
-  # incoming webhook. Thresholds default to the documented values and are tunable per
-  # environment via env vars (per-minute rates / ms). The alert payload is id-only — no
-  # tenant content / vectors / SQL.
-  config :loopctl, :scale_alerts_enabled, true
+  # when a webhook URL is set AND a threshold breaches), so it stays ON by default in
+  # prod. Point SCALE_ALERT_WEBHOOK_URL at a Slack/PagerDuty/generic incoming webhook.
+  # Thresholds default to the documented values and are tunable per environment via env
+  # vars (per-minute rates / ms). The alert payload is id-only — no tenant content /
+  # vectors / SQL.
+  #
+  # SCALE_ALERTS_ENABLED (#376) is the deliberate OFF switch for a deployment that has
+  # not stood up a receiver yet. Without it the only two reachable states were "on with
+  # a URL" and "on with no URL" — and the second permanently fails the US-32.4 readiness
+  # guard, which exists to catch a MISCONFIGURED deploy, not to nag about an alerting
+  # channel nobody has chosen. Turning alerting off makes /health/ready honest: alerting
+  # is off, and it says so, instead of claiming a broken firing path forever.
+  #
+  # The parse is opt-OUT (default true) and asymmetric with the `in ~w(true 1)` opt-IN
+  # vars above, ON PURPOSE: only an exact `false`/`0` disables. A typo ("flase") leaves
+  # alerting ENABLED, where the readiness guard is still watching — the failure mode of
+  # a mistyped value must never be silently-no-alerting.
+  config :loopctl,
+         :scale_alerts_enabled,
+         System.get_env("SCALE_ALERTS_ENABLED", "true") not in ~w(false 0)
+
   config :loopctl, :scale_alert_webhook_url, System.get_env("SCALE_ALERT_WEBHOOK_URL")
 
   config :loopctl,

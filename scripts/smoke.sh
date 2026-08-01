@@ -248,21 +248,19 @@ fi
 # EXCLUDES this so a benign config-only issue never depools an otherwise-healthy
 # node from Fly's load-balancer check.
 #
-# In post-deploy smoke, a readiness miss is surfaced as a WARN, not a hard FAIL:
-# an unconfigured alert webhook is an ops-completeness gap, NOT a regression
-# introduced by the deploy under test. Real outages are already hard-gated above
-# (db+oban liveness) and below (KB count/retrieval/memory/auth); reddening every
-# deploy on a pre-existing config gap would only train us to ignore a red smoke
-# run and would mask a genuine regression. The readiness ENDPOINT stays strict
-# for orchestration probes. Prod alerting is configured in Epic 2 (#349); once
-# SCALE_ALERT_WEBHOOK_URL is set, /health/ready returns 200 and this WARN clears.
+# This was DOWNGRADED to a non-blocking WARN (#363) because prod sat in a state the
+# guard flags permanently: scale alerts enabled with no SCALE_ALERT_WEBHOOK_URL. A
+# check that is red on every single deploy trains everyone to ignore it, which is worse
+# than not having it.
+#
+# #376 removed that state instead of tolerating it — prod now sets
+# SCALE_ALERTS_ENABLED=false (fly.toml) while no receiver exists, so /health/ready is
+# genuinely 200 and this is a HARD GATE again. A miss here now means a real
+# misconfiguration introduced by the deploy under test (alerting switched on without a
+# URL, or a broken guard), which is exactly what US-32.4 was built to catch.
 http GET "$BASE_URL/health/ready"
-if [ "$HTTP_CODE" = "200" ]; then
-  printf '%s readiness (US-32.4) (%sms)\n' "$OK" "$TIME_MS"
-else
-  warn "readiness (scale-alerts config-guard, US-32.4)" \
-    "HTTP $HTTP_CODE — $(head -c 200 "$BODY" 2>/dev/null | tr '\n' ' ') [non-blocking: ops config gap, not a deploy regression; alerting configured in Epic 2 #349]"
-fi
+assert "readiness (scale-alerts config-guard, US-32.4)" 200 \
+  '.ready == true' 'ready is true'
 
 # --- KB retrieval crown jewels (authed, read-only) -----------------------------
 #

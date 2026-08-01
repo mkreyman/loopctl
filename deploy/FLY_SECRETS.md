@@ -83,7 +83,8 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 |-----------------------------|---------|-------------|
 | `METRICS_PORT`              | `9568`  | INTERNAL Prometheus listener (never the public `8080` service); scraped over Fly's private 6PN network. **Must stay in lockstep with the `[metrics]` block in `fly.toml`** |
 | `METRICS_TENANT_LABEL_CAP`  | `1000`  | Max distinct tenant label values before the per-tenant metric dimension is collapsed — bounds Prometheus cardinality |
-| `SCALE_ALERT_WEBHOOK_URL`   | -       | **Alerting is opt-in until this is set.** With no URL, threshold breaches are only logged, never POSTed. Point it at a Slack / PagerDuty / generic webhook |
+| `SCALE_ALERTS_ENABLED`      | `true`  | The OFF switch for a deployment with no alert receiver yet (#376). Only an exact `false` or `0` disables — any other value (including a typo) leaves alerting ON, so a mistyped value can never silently mean no-alerting. Disabled means the threshold checker still evaluates and logs breaches; only the POST and the US-32.4 readiness guard stand down. **Set it to `false` whenever `SCALE_ALERT_WEBHOOK_URL` is unset**, or `/health/ready` returns 503 forever |
+| `SCALE_ALERT_WEBHOOK_URL`   | -       | **Alerting is opt-in until this is set.** With no URL, threshold breaches are only logged, never POSTed. Point it at a Slack / PagerDuty / generic webhook. Setting this is a two-part change: the secret AND `SCALE_ALERTS_ENABLED=true` (in `fly.toml`) |
 | `SCALE_ALERT_CHECK_INTERVAL_MS`         | `60000`  | How often thresholds are evaluated |
 | `SCALE_ALERT_RENOTIFY_INTERVAL_MS`      | `900000` | Re-notify interval for a breach that stays open (15 min) |
 | `SCALE_ALERT_P95_LATENCY_MS`            | `2000`   | Request p95 latency breach threshold |
