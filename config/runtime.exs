@@ -546,41 +546,24 @@ if config_env() == :prod do
   # `config.exs` block, so setting only WEBAUTHN_ORIGIN (e.g. a www-serving edge on the
   # hosted default) takes effect. Unset leaves `config.exs` untouched.
   #
-  # A BLANK value is treated as unset, and an `rp_id` that is not bare-host-shaped (a
-  # scheme, port, path or whitespace) is ignored: an empty string is truthy in Elixir, so
-  # the naive `if System.get_env(...)` set `rp_id: ""` and broke every ceremony while the
-  # release booted clean. A bad value leaves the compiled default in place rather than
-  # crashing boot (epic_35 STH_SWEEP_CRON lesson).
-  #
-  # The origin defaults to `https://<PHX_HOST>` — the page host — NOT to `https://<rp_id>`:
-  # `rp_id` need only be a registrable SUFFIX of the origin, so a parent-domain `rp_id`
-  # (`example.com` while serving `app.example.com`) is legal and common, and deriving the
-  # origin from it makes Wax reject an attestation the browser was happy to produce. There
-  # is no http:// default: WebAuthn runs only in a secure context (localhost the one
-  # exception), so localhost or a non-standard port must set WEBAUTHN_ORIGIN explicitly.
+  # The blank/shape/default rules live in `Loopctl.WebAuthn.RpConfig` so they are
+  # unit-testable — this block is unreachable from the suite (the `Loopctl.Search.Regconfig`
+  # precedent). Each var is still read HERE by literal name so `mix loopctl.check_env_docs`
+  # keeps enforcing that it is documented; a value the module rejects is warned about and
+  # dropped rather than crashing boot (epic_35 STH_SWEEP_CRON lesson). `IO.warn/2` and not
+  # `Logger`: logging is not started yet when a release evaluates this file.
   #
   # WEBAUTHN_RP_ID is effectively WRITE-ONCE: stored credentials are bound to it via
   # rpIdHash, so changing it after any enrollment fails every later assertion closed.
-  webauthn_env = fn name ->
-    case String.trim(System.get_env(name) || "") do
-      "" -> nil
-      value -> value
-    end
-  end
+  {webauthn_opts, webauthn_warnings} =
+    Loopctl.WebAuthn.RpConfig.resolve(
+      rp_id: System.get_env("WEBAUTHN_RP_ID"),
+      rp_name: System.get_env("WEBAUTHN_RP_NAME"),
+      origin: System.get_env("WEBAUTHN_ORIGIN"),
+      phx_host: System.get_env("PHX_HOST")
+    )
 
-  webauthn_rp_id =
-    case webauthn_env.("WEBAUTHN_RP_ID") do
-      nil -> nil
-      value -> if Regex.match?(~r/^[a-zA-Z0-9.-]+$/, value), do: value
-    end
-
-  webauthn_opts =
-    [
-      rp_id: webauthn_rp_id,
-      rp_name: webauthn_env.("WEBAUTHN_RP_NAME"),
-      origin: webauthn_env.("WEBAUTHN_ORIGIN") || (webauthn_rp_id && "https://#{host}")
-    ]
-    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  Enum.each(webauthn_warnings, &IO.warn(&1, []))
 
   if webauthn_opts != [] do
     config :loopctl, :webauthn, webauthn_opts
