@@ -707,22 +707,18 @@ config :loopctl, :embedding_read_path, Loopctl.MockEmbeddingReadPath
 
 # #488 / US-41.1: `hnsw.iterative_scan` is pinned ON for the TEST env only.
 #
-# It is the PRODUCTION remedy for cross-tenant filtered-ANN under-return, and PROD RUNS IT
-# ON (operator-set `SystemConfig` "hnsw_iterative_scan" = 1, after #488/#491).
+# It is the PRODUCTION remedy for cross-tenant filtered-ANN under-return, and it is now the
+# SHIPPED default too (`Loopctl.HeavyRead`'s `@default_hnsw_iterative_scan` = 1), so this pin
+# asserts against the configuration a fresh install actually runs. It used to rest instead on
+# a hand-verified premise — that prod carries an operator-set `SystemConfig`
+# "hnsw_iterative_scan" = 1 — which nothing in the repo maintained: a database restored from
+# before #488, or a fresh self-hosted install, has no such row, so CI stayed green while the
+# deployment silently ran the OFF path. Changing the shipped default is what closed that, not
+# this line. `SystemConfig` remains the operator lever, and setting the row to 0 still turns
+# iterative scan off fleet-wide with no redeploy.
 #
-# That premise is load-bearing and no test can see prod, so it is VERIFIED BY HAND rather
-# than asserted. Last confirmed 2026-08-01 = 1, via:
-#
-#     fly ssh console -a loopctl -C '/app/bin/loopctl rpc "IO.puts(inspect(
-#       Loopctl.SystemConfig.get_int(\"hnsw_iterative_scan\", -1)))"'
-#
-# It is an operator-set row, not a migration, so nothing in the repo keeps it true — a
-# database restored from before #488, or a fresh self-hosted install, has the compile-time
-# default 0 and this pin then makes CI assert against a configuration that deployment does
-# NOT run. Re-check it after any restore, major-version upgrade, or migration to new
-# infrastructure. The shipped
-# compile-time default is 0, so leaving test unpinned meant CI asserted exact recall against
-# a configuration NOBODY RUNS — and lost, intermittently: the ANN applies `tenant_id` as a
+# Leaving test unpinned meant CI asserted exact recall against a configuration NOBODY RUNS
+# — and lost, intermittently: the ANN applies `tenant_id` as a
 # POST-index residual over an index shared by the whole suite, so a tenant whose rows fall
 # outside the global top-`ef_search` batch is silently dropped and the read returns `[]`.
 # That is the long-running side-table flake (measured 3 failing runs / 23 before this pin,

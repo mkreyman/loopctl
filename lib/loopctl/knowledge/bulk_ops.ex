@@ -613,9 +613,13 @@ defmodule Loopctl.Knowledge.BulkOps do
   # straight to `LoopctlWeb.FallbackController`, which has no catch-all — a new atom there is
   # a `FunctionClauseError` (an unstructured 500) instead of a mapped response. This IS a
   # connection failure, so the US-27.3 mapping already renders it as 503 + Retry-After.
+  #
+  # Named once, so the capture here and the unconditional pop in `run_multi/2` cannot drift.
+  @timeout_guc ["statement_timeout"]
+
   defp timeout_multi do
     Multi.run(Multi.new(), :set_timeout, fn repo, _changes ->
-      case LocalGuc.capture(repo, ["statement_timeout"]) do
+      case LocalGuc.capture(repo, @timeout_guc) do
         [_ | _] = prior ->
           repo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
           {:ok, prior}
@@ -649,6 +653,14 @@ defmodule Loopctl.Knowledge.BulkOps do
     end
   rescue
     e in [Postgrex.Error, DBConnection.ConnectionError] -> {:error, e}
+  after
+    # `:restore_timeout` is the LAST step, so `Ecto.Multi` SKIPS it the moment an earlier one
+    # errors (an invalid token, an FK abort), and a raising `delete_all` bypasses it entirely.
+    # The rollback discards the `SET LOCAL` itself, so nothing needs putting back — but the
+    # ownership entry `capture/2` pushed would OUTLIVE the transaction on this process, which
+    # Bandit reuses across keep-alive requests, and make a later `LocalGuc.scoped/3` abort a
+    # read over an enclosing scope that no longer exists. Pop it where every exit path passes.
+    LocalGuc.forget(@timeout_guc)
   end
 
   defp bulk_audit_attrs(tenant_id, action, selector_summary, affected, audit_opts) do

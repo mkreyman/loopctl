@@ -377,7 +377,14 @@ defmodule Loopctl.HeavyRead do
   # the same single-UPDATE operator lever ef_search uses. The mode string is looked up from
   # a fixed table, so the value interpolated into `SET LOCAL hnsw.iterative_scan = <mode>`
   # is ALWAYS one of the three literals below, never operator/attacker text.
-  @default_hnsw_iterative_scan 0
+  # The SHIPPED fallback, matching what prod runs and what `config/test.exs` pins. It is 1,
+  # not pgvector's own 0, because 0 was a premise nothing in the repo maintained: the ON state
+  # lives in an operator-set `SystemConfig` row, so a fresh self-hosted install or a database
+  # restored from before #488 silently ran the configuration the suite does NOT assert — the
+  # cross-tenant post-ANN-filter under-return (`left: []`) #488 exists to close. Safe by
+  # construction on an old extension: `iterative_scan_supported?/0` gates it to a NO-OP below
+  # pgvector 0.8, and `hnsw_max_scan_tuples/0` bounds the walk.
+  @default_hnsw_iterative_scan 1
   @hnsw_iterative_scan_modes %{1 => "relaxed_order", 2 => "strict_order"}
   @default_hnsw_max_scan_tuples 20_000
 
@@ -386,15 +393,15 @@ defmodule Loopctl.HeavyRead do
   or `"strict_order"`.
 
   Read from the live-tunable `SystemConfig` key `"hnsw_iterative_scan"` as an INT CODE
-  (0 = off (default/missing/unknown), 1 = relaxed_order, 2 = strict_order), so an operator
-  enables iterative scan fleet-wide with a single `UPDATE` — no redeploy — AFTER confirming
-  the deployed pgvector is >= 0.8.
+  (0 = off, 1 = relaxed_order — the shipped default — 2 = strict_order, unknown = the shipped
+  default), so an operator turns iterative scan off or up fleet-wide with a single `UPDATE`
+  — no redeploy.
 
   `SystemConfig` is the operator lever and the only RUNTIME source. When no operator has set
   that row, the fallback code comes from the config key `:hnsw_iterative_scan_default`
-  (`default_iterative_scan_code/0`), which ONLY `config/test.exs` sets — pinned ON there
-  because prod runs iterative scan ON, so an unpinned test env asserted recall against a
-  configuration nobody runs. Every NON-test config is barred from setting that key by
+  (`default_iterative_scan_code/0`), which ONLY `config/test.exs` sets — pinned to the same
+  value the shipped `@default_hnsw_iterative_scan` carries, so the pin cannot drift out from
+  under the suite unnoticed. Every NON-test config is barred from setting that key by
   `test/loopctl/config_embedding_read_path_test.exs`; an `Application` pin in prod would
   shadow the operator lever. Tests that need a specific mode prime the `SystemConfig` cache
   explicitly in an `async: false` module (see
@@ -412,10 +419,10 @@ defmodule Loopctl.HeavyRead do
   end
 
   # `SystemConfig` stays the single operator lever; this is only the FALLBACK applied when no
-  # operator has set that row. It is config-injected (rather than hard-coded 0) so an
-  # environment can start from a different baseline without any test mutating VM-global
-  # state. Only `config/test.exs` sets it — pinned ON there because PROD runs iterative scan
-  # ON, so an unpinned test env asserted exact recall against a configuration nobody runs.
+  # operator has set that row. It is config-injected (rather than read straight off the module
+  # attribute) so an environment can start from a different baseline without any test mutating
+  # VM-global state. Only `config/test.exs` sets it, to the SAME value the shipped attribute
+  # carries — the suite must assert against the configuration a fresh install actually runs.
   # Every NON-test config is barred from setting `:hnsw_iterative_scan_default` — the key
   # read RIGHT BELOW — by `test/loopctl/config_embedding_read_path_test.exs`, which also
   # asserts `config/test.exs` still sets it. That is the case that matters: an Application
@@ -466,11 +473,15 @@ defmodule Loopctl.HeavyRead do
   @iterative_scan_cache_ttl_ms 600_000
   @iterative_scan_negative_ttl_ms 60_000
 
-  # A fail-closed GUESS (inconclusive probe, no conclusive verdict to reuse) is cached for
-  # far less: at boot the very first ANN read's probe can hit 53300/57014 on a saturated
-  # pool, and negative-caching that for a full minute pins iterative scan OFF fleet-wide on
-  # the node, silently re-arming the cross-tenant post-ANN-filter under-return (`left: []`)
-  # this feature exists to close. One second still bounds a re-probe storm.
+  # A fail-closed GUESS (inconclusive probe, no conclusive verdict to reuse) starts far
+  # SHORTER and BACKS OFF from there. At boot the very first ANN read's probe can hit
+  # 53300/57014 on a saturated pool, and negative-caching that for a full minute pins
+  # iterative scan OFF fleet-wide on the node, silently re-arming the cross-tenant
+  # post-ANN-filter under-return (`left: []`) this feature exists to close. But a FIXED one
+  # second is the opposite failure: a SUSTAINED saturation then costs a probe checkout every
+  # ~1.5s, landing ahead of `TenantGate`'s shed — the storm the negative cache exists to
+  # bound. Doubling per CONSECUTIVE guess buys both: a boot blip self-heals in a second, a
+  # real incident converges on the full negative window.
   @iterative_scan_unknown_ttl_ms 1_000
 
   # How long a CONCLUSIVE verdict stays usable as the inconclusive fallback. Longer than the
@@ -512,10 +523,11 @@ defmodule Loopctl.HeavyRead do
       short NEGATIVE cache. Not caching it at all was worse than a stale verdict: the
       conditions that make the probe inconclusive are exactly HeavyReadRepo saturation, so an
       uncached `:inconclusive` added one extra pool checkout AND one warning to EVERY ANN read
-      precisely during the incident. The TTL is #{@iterative_scan_unknown_ttl_ms}ms while the
-      verdict is a fail-closed guess (no conclusive probe to reuse), so a single boot-time blip
-      cannot pin the operator's lever OFF for a whole minute, and the full window once there is
-      a real verdict behind it.
+      precisely during the incident. The TTL is the full window once a real verdict is behind
+      it; while the verdict is a fail-closed GUESS (no conclusive probe to reuse) it starts at
+      #{@iterative_scan_unknown_ttl_ms}ms and DOUBLES per consecutive guess up to that window,
+      so a single boot-time blip cannot pin the operator's lever OFF for a whole minute and a
+      sustained incident still converges on one probe per window.
   """
   @spec iterative_scan_supported?() :: boolean()
   def iterative_scan_supported? do
@@ -528,16 +540,27 @@ defmodule Loopctl.HeavyRead do
     end
   end
 
-  # Best-effort single-flight: hold the EXPIRED verdict for one probe budget BEFORE probing,
-  # so the concurrent ANN reads that also see it expire read that stale value instead of each
-  # taking their own checkout on the small heavy-read pool — a stampede that lands ahead of
-  # `TenantGate`'s shed (see `probe_iterative_scan_support/0`). The herd window shrinks from
-  # the whole probe to the gap between the read above and this write. A cold VM (no entry at
-  # all) still probes concurrently; that is once per boot, with no verdict to hold.
-  defp reprobe(stale_verdict) do
-    cache_iterative_scan_verdict(stale_verdict, @probe_timeout_ms)
+  # Best-effort single-flight: hold an expired FAIL-CLOSED verdict for one probe budget BEFORE
+  # probing, so the concurrent ANN reads that also see it expire read that value instead of
+  # each taking their own checkout on the small heavy-read pool — a stampede that lands ahead
+  # of `TenantGate`'s shed (see `probe_iterative_scan_support/0`). That is the case worth
+  # suppressing: an expired verdict is `false` precisely when the pool is saturated.
+  #
+  # An expired `true` is NOT republished. Re-serving it emits `SET LOCAL hnsw.iterative_scan`
+  # for that window against a backend that may have CHANGED under us (replica failover onto
+  # pgvector < 0.8, extension downgrade), which raises inside `run_timed_transaction/5` and
+  # 500s every concurrent ANN read — reopening, through the suppression, the exact window the
+  # verdict's TTL exists to close, and bypassing the recency bound `inconclusive_verdict/2`
+  # applies on the slow path. A healthy backend is also where the stampede costs least: the
+  # probe is a sub-millisecond `pg_extension` lookup there.
+  #
+  # A cold VM (no entry at all) still probes concurrently; that is once per boot.
+  defp reprobe(false) do
+    cache_iterative_scan_verdict(false, @probe_timeout_ms)
     probe_and_cache()
   end
+
+  defp reprobe(true), do: probe_and_cache()
 
   defp probe_and_cache do
     case probe_iterative_scan_support() do
@@ -545,6 +568,7 @@ defmodule Loopctl.HeavyRead do
         maybe_warn_unsupported(supported, version)
         cache_iterative_scan_verdict(supported, @iterative_scan_cache_ttl_ms)
         :persistent_term.put({__MODULE__, :iterative_scan_last_conclusive}, {supported, now_ms()})
+        reset_guess_ttl()
         supported
 
       {:inconclusive, reason, class} ->
@@ -585,11 +609,31 @@ defmodule Loopctl.HeavyRead do
         )
 
         if cacheable_inconclusive?(class) do
-          cache_iterative_scan_verdict(false, @iterative_scan_unknown_ttl_ms)
+          cache_iterative_scan_verdict(false, next_guess_ttl_ms())
         end
 
         false
     end
+  end
+
+  @guess_ttl_key {__MODULE__, :iterative_scan_guess_ttl}
+
+  # The TTL for THIS fail-closed guess, doubling the one after it up to the full negative
+  # window. The write is skipped once the cap is reached, because `:persistent_term.put/2`
+  # triggers a VM-global GC whenever it REPLACES a value — the cost that makes a hot guess
+  # cadence expensive in the first place.
+  defp next_guess_ttl_ms do
+    ttl = :persistent_term.get(@guess_ttl_key, @iterative_scan_unknown_ttl_ms)
+    next = min(ttl * 2, @iterative_scan_negative_ttl_ms)
+    if next != ttl, do: :persistent_term.put(@guess_ttl_key, next)
+    ttl
+  end
+
+  # A CONCLUSIVE probe means the node recovered, so the short window is available again to
+  # the next blip. Erase only when set, for the same global-GC reason.
+  defp reset_guess_ttl do
+    if :persistent_term.get(@guess_ttl_key, nil), do: :persistent_term.erase(@guess_ttl_key)
+    :ok
   end
 
   # Bound the log cost on the ANN hot path. An UNCACHEABLE class re-probes on every read, so
@@ -703,8 +747,24 @@ defmodule Loopctl.HeavyRead do
     # sub-millisecond on a healthy pool; needing more than #{@probe_timeout_ms}ms IS the
     # saturation signal, and failing closed there (iterative scan off for this read) is
     # cheaper than every concurrent ANN request queueing for seconds in front of the shed.
-    case repo().query("SELECT extversion FROM pg_extension WHERE extname = 'vector'", [],
-           timeout: @probe_timeout_ms
+    #
+    # `mode: :savepoint` WHEN the caller is already inside a transaction on this repo (the
+    # normal shape under the test sandbox): without it a server-side error here — a 57014
+    # cancel at the tight timeout above — aborts the ENCLOSING transaction (25P02), so every
+    # later statement fails over a query it never issued while the `rescue`/`catch` below
+    # report a clean `:inconclusive`. That is the hazard `LocalGuc.do_capture/2` guards
+    # against, on the same hot path. It is CONDITIONAL because Postgrex refuses savepoint
+    # mode on an idle connection, which is the prod shape (`opts/1` runs outside any
+    # transaction) and would otherwise make every prod probe fail.
+    query_opts =
+      if repo().in_transaction?(),
+        do: [timeout: @probe_timeout_ms, mode: :savepoint],
+        else: [timeout: @probe_timeout_ms]
+
+    case repo().query(
+           "SELECT extversion FROM pg_extension WHERE extname = 'vector'",
+           [],
+           query_opts
          ) do
       {:ok, %{rows: [[version]]}} when is_binary(version) ->
         {:ok, version_at_least?(version, @iterative_scan_min_version), version}

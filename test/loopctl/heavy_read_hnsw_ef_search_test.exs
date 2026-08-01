@@ -310,13 +310,18 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
   end
 
   @probe_cache_key {Loopctl.HeavyRead, :iterative_scan_supported}
+  @last_conclusive_key {Loopctl.HeavyRead, :iterative_scan_last_conclusive}
 
-  # The probe caches a VM-global `:persistent_term` verdict. Every mutation of it — including
-  # the one the LIVE probe performs — is erased on exit, exactly like the prime_* helpers
-  # below, so the unsupported / re-probe branches stay reachable for later tests.
+  # A live probe writes TWO VM-global `:persistent_term` keys: the live cache AND the
+  # last-conclusive record it falls back on (a ONE-HOUR reuse window). Both are erased here and
+  # on exit, like the prime_* helpers below — restoring only the live cache left the recorded
+  # verdict standing, so a later test's inconclusive probe REUSED it instead of failing closed.
   defp clear_iterative_scan_probe_cache do
-    :persistent_term.erase(@probe_cache_key)
-    on_exit(fn -> :persistent_term.erase(@probe_cache_key) end)
+    for key <- [@probe_cache_key, @last_conclusive_key], do: :persistent_term.erase(key)
+
+    on_exit(fn ->
+      for key <- [@probe_cache_key, @last_conclusive_key], do: :persistent_term.erase(key)
+    end)
   end
 
   defp prime_iterative_scan_supported(verdict) do
@@ -393,15 +398,11 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
   end
 
   describe "last conclusive verdict (probe-blip fallback)" do
-    @last_conclusive_key {Loopctl.HeavyRead, :iterative_scan_last_conclusive}
-
     test "a conclusive probe records its verdict for later inconclusive reads to fall back on" do
-      # `clear_iterative_scan_probe_cache/0` (not a bare erase) so the entry the LIVE probe
-      # below writes is erased on exit too — otherwise it pins a 10-minute verdict for every
-      # later test in the run.
+      # `clear_iterative_scan_probe_cache/0` (not a bare erase) so BOTH entries the LIVE probe
+      # below writes are erased on exit — otherwise it pins a 10-minute verdict, and a
+      # one-hour fallback, for every later test in the run.
       clear_iterative_scan_probe_cache()
-      :persistent_term.erase(@last_conclusive_key)
-      on_exit(fn -> :persistent_term.erase(@last_conclusive_key) end)
 
       # Drives a real probe against the test backend. An INCONCLUSIVE probe (a HeavyReadRepo
       # checkout blip — the documented flake of the sibling test above) records NOTHING, so
@@ -417,6 +418,13 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
                    "the pgvector default OFF"
 
         :none ->
+          # Fail-closed is still required here, so assert it — but SAY SO loudly: a green run
+          # that silently took this arm never exercised the recording the test exists to
+          # prove, and an assertion that quietly absorbs its own flake rots into a no-op.
+          IO.warn(
+            "probe was INCONCLUSIVE: the last-conclusive RECORDING was not exercised in this run"
+          )
+
           refute verdict,
                  "with nothing recorded the probe was inconclusive, and an inconclusive " <>
                    "probe with no verdict to reuse MUST fail closed"
