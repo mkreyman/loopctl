@@ -4516,12 +4516,15 @@ const TOOLS = [
       "LINKS: each link carries only its FAR side as `article: {id, title}` (plus " +
       "`similarity` when the auto-linker scored it) — direction is already given by which " +
       "array it is in. Both arrays are ranked (open conflicts first, then descending " +
-      "similarity) and capped at 25 per direction; read `links_total` for the true count " +
-      "and `links_truncated` to know the cap bit. When you only want the article's TEXT, " +
+      "similarity, then oldest-first for the unscored) and capped at 25 per direction; " +
+      "read `links_total` for the true count and `links_truncated` to know the cap bit — " +
+      "both are returned by links: 'count' too, so one cheap call tells you whether the " +
+      "full fetch is even complete. When you only want the article's TEXT, " +
       "pass links: 'count' (or 'none') — on a well-linked hub the link block is several " +
       "times the size of the body, and you are paying for it on every read. " +
       "`potential_conflicts` is returned in all three modes, so opting out of the link " +
-      "list never hides a conflict from you. To actually traverse the graph, use " +
+      "list never hides a conflict from you; it is capped at 25 (strongest first) with " +
+      "`conflicts_total` / `conflicts_truncated`. To actually traverse the graph, use " +
       "knowledge_graph rather than raising this cap.",
     inputSchema: {
       type: "object",
@@ -4536,8 +4539,9 @@ const TOOLS = [
           enum: ["full", "count", "none"],
           description:
             "Optional: how much of the link graph to return. 'full' (default) = ranked, " +
-            "capped arrays; 'count' = just links_total; 'none' = omit link fields. " +
-            "potential_conflicts is always returned.",
+            "capped arrays; 'count' = just links_total + links_truncated; 'none' = omit " +
+            "link fields. potential_conflicts (capped, with conflicts_total) is always " +
+            "returned.",
         },
         project_id: {
           type: "string",

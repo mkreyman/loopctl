@@ -42,6 +42,10 @@ defmodule LoopctlWeb.ArticleController do
 
   action_fallback LoopctlWeb.FallbackController
 
+  # Read from the module that ENFORCES it, so the published spec cannot drift from the
+  # cap (same discipline as `@max_inline_content_bytes` in the ingestion controller).
+  @max_links_per_direction ArticleJSON.max_links_per_direction()
+
   @valid_statuses Article |> Ecto.Enum.values(:status) |> Enum.map(&to_string/1)
   @valid_categories Article |> Ecto.Enum.values(:category) |> Enum.map(&to_string/1)
 
@@ -233,12 +237,15 @@ defmodule LoopctlWeb.ArticleController do
         "article and for an incoming link the target is, so that side was a constant echo " <>
         "of the URL with an always-`null` title. A link also carries `similarity` when the " <>
         "auto-linker recorded one. Both direction arrays are ranked (open " <>
-        "`potential_conflict` first, then descending similarity) and capped at 25 entries " <>
+        "`potential_conflict` first, then descending similarity, then oldest-first for " <>
+        "the unscored) and capped at #{@max_links_per_direction} entries " <>
         "each; `links_total` reports the true count and `links_truncated` says whether the " <>
         "cap bit. Use `knowledge_graph` to traverse the full graph.\n\n" <>
         "`links` selects the detail level: `full` (default), `count` (omits both arrays, " <>
-        "keeps `links_total`), or `none` (omits the link fields entirely). An unrecognized " <>
-        "value is treated as `full`. `potential_conflicts` is returned in ALL THREE modes.",
+        "keeps `links_total` and `links_truncated`), or `none` (omits the link fields " <>
+        "entirely). An unrecognized value is treated as `full`. `potential_conflicts` is " <>
+        "returned in ALL THREE modes, itself capped at #{@max_links_per_direction} " <>
+        "(highest similarity first) with `conflicts_total` / `conflicts_truncated`.",
     parameters: [
       id: [in: :path, type: :string, description: "Article UUID"],
       links: [
@@ -246,8 +253,21 @@ defmodule LoopctlWeb.ArticleController do
         type: %OpenApiSpex.Schema{type: :string, enum: ["full", "count", "none"]},
         required: false,
         description:
-          "Link detail level (default `full`). `count` returns only `links_total`; " <>
-            "`none` omits the link fields. `potential_conflicts` is always returned."
+          "Link detail level (default `full`). `count` returns `links_total` and " <>
+            "`links_truncated`; `none` omits the link fields. `potential_conflicts` " <>
+            "(capped, with `conflicts_total`) is always returned."
+      ],
+      project_id: [
+        in: :query,
+        type: :string,
+        required: false,
+        description: "Attribution only — recorded on the article-access event."
+      ],
+      story_id: [
+        in: :query,
+        type: :string,
+        required: false,
+        description: "Attribution only — recorded on the article-access event."
       ]
     ],
     responses: %{
@@ -726,7 +746,18 @@ defmodule LoopctlWeb.ArticleController do
   def show(conn, %{"id" => article_id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
     api_key_id = conn.assigns.current_api_key.id
-    opts = Keyword.merge([api_key_id: api_key_id], Visibility.scope_opts(conn))
+    # `project_id`/`story_id` are advertised by the MCP tool "for attribution" and feed
+    # `Knowledge.finalize_article_read/3`'s attribution_context — not reading them here
+    # recorded every access on the wiki's most-used endpoint as unattributed.
+    opts =
+      Keyword.merge(
+        [
+          api_key_id: api_key_id,
+          project_id: params["project_id"],
+          story_id: params["story_id"]
+        ],
+        Visibility.scope_opts(conn)
+      )
 
     case Knowledge.get_article(tenant_id, article_id, opts) do
       {:ok, article} ->

@@ -19,16 +19,19 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
     unchanged and still given by which array the link is in.
   - Links carry `similarity` when the auto-linker scored them, so a list of otherwise
     identical `relates_to` edges can be ranked or thresholded instead of guessed at.
-  - Both arrays are ranked (open `potential_conflict` first, then descending similarity)
-    and capped at 25 per direction. `links_total` and `links_truncated` report the truth.
-    Use `knowledge_graph` to traverse the full graph.
+  - Both arrays are ranked (open `potential_conflict` first, then descending similarity,
+    then oldest-first for links the auto-linker never scored — which is every link on a
+    hand-created or imported corpus) and capped at 25 per direction. `links_total` and
+    `links_truncated` report the truth. Use `knowledge_graph` to traverse the full graph.
 
 ### Added
 
-- **`knowledge_get` gains `links`** — `full` (default), `count` (just `links_total`), or
+- **`knowledge_get` gains `links`** — `full` (default), `count` (`links_total` +
+  `links_truncated`, so one cheap call answers whether the full fetch is capped), or
   `none`. Pass `count`/`none` when you only want the article's text.
   `potential_conflicts` is returned in **all three** modes, so a cheaper read never
-  silently turns off conflict discovery.
+  silently turns off conflict discovery; it is itself capped at 25 (strongest first) and
+  reports `conflicts_total` / `conflicts_truncated`.
 
 ## 2.63.0 — 2026-07-30 (never bank a near-duplicate)
 

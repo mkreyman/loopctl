@@ -1261,10 +1261,116 @@ defmodule LoopctlWeb.ArticleControllerTest do
       # The count spans BOTH directions — it is the number an agent needs to decide
       # whether a second links=full fetch is worth paying for.
       assert body["data"]["links_total"] == 2
+      # The whole point of `count` is sizing a possible `full` fetch, and that decision
+      # needs to know whether the cap will bite — otherwise the caller learns it only by
+      # paying for the fetch.
+      assert body["data"]["links_truncated"] == false
       refute Map.has_key?(body["data"], "outgoing_links")
       refute Map.has_key?(body["data"], "incoming_links")
       # Still a complete article otherwise.
       assert body["data"]["body"] == hub.body
+    end
+
+    test "links=count reports links_truncated when the cap will bite", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+
+      for i <- 1..26 do
+        target = fixture(:article, %{tenant_id: tenant.id, title: "Target #{i}"})
+
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: hub.id,
+          target_article_id: target.id,
+          relationship_type: :relates_to
+        })
+      end
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=count")
+        |> json_response(200)
+
+      assert body["data"]["links_total"] == 26
+      assert body["data"]["links_truncated"] == true
+
+      # None of these links is scored (only the auto-linker records a score, and
+      # create_link strips a caller-supplied one), so the tie-break decides the whole
+      # set: oldest-first, i.e. the neighbourhood established earliest — not an
+      # arbitrary UUID order.
+      full =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}")
+        |> json_response(200)
+
+      titles = Enum.map(full["data"]["outgoing_links"], & &1["article"]["title"])
+      assert titles == Enum.map(1..25, &"Target #{&1}")
+    end
+
+    # potential_conflicts is returned in every mode, so an uncapped array would let a
+    # conflict-heavy hub make the CHEAP modes expensive — the exact cost the cap exists
+    # to bound.
+    test "potential_conflicts is capped, with conflicts_total reporting the true size",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      hub = fixture(:article, %{tenant_id: tenant.id, title: "Hub"})
+
+      # Ascending similarity, so a cap that ignored ranking would drop the strongest.
+      for i <- 1..26 do
+        peer = fixture(:article, %{tenant_id: tenant.id, title: "Peer #{i}"})
+
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: peer.id,
+          target_article_id: hub.id,
+          relationship_type: :potential_conflict,
+          metadata: %{"similarity_score" => 0.90 + i / 1000}
+        })
+      end
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{hub.id}?links=none")
+        |> json_response(200)
+
+      conflicts = body["data"]["potential_conflicts"]
+      assert length(conflicts) == 25
+      assert body["data"]["conflicts_total"] == 26
+      assert body["data"]["conflicts_truncated"] == true
+
+      scores = Enum.map(conflicts, & &1["similarity"])
+      assert scores == Enum.sort(scores, :desc)
+      assert hd(scores) == 0.926
+    end
+
+    test "project_id/story_id query params attribute the read", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      story = fixture(:story, %{tenant_id: tenant.id, project_id: project.id})
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Attributed"})
+
+      conn
+      |> auth_conn(raw_key)
+      |> get(~p"/api/v1/articles/#{article.id}?project_id=#{project.id}&story_id=#{story.id}")
+      |> json_response(200)
+
+      # Analytics runs synchronously in test. The MCP tool advertises both params "for
+      # attribution"; ignoring them recorded every wiki read as unattributed.
+      event =
+        Loopctl.Knowledge.ArticleAccessEvent
+        |> AdminRepo.all()
+        |> Enum.find(&(&1.article_id == article.id and &1.api_key_id == api_key.id))
+
+      assert event.project_id == project.id
+      assert event.story_id == story.id
     end
 
     test "links=none omits the link fields entirely", %{conn: conn} do

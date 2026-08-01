@@ -35,14 +35,21 @@ Operator-facing changes for deployments outside the hosted instance.
   `title` was always `null`; it cost 14% of a typical response and carried nothing.
   Direction is unchanged and still given by which array the link is in. Links now also
   carry `similarity` when the auto-linker recorded one.
-  Both arrays are **ranked** (open `potential_conflict` first, then descending similarity)
-  and **capped at 25 per direction**, with new `links_total` and `links_truncated` fields
+  Both arrays are **ranked** (open `potential_conflict` first, then descending similarity,
+  then oldest-first for links with no recorded score — only the auto-linker records one,
+  so a hand-created or imported corpus ranks entirely on that fallback) and **capped at 25
+  per direction**, with new `links_total` and `links_truncated` fields
   reporting the true size. Use `knowledge_graph` to traverse the whole graph.
   A new `links` query parameter selects the detail level — `full` (default, so an
-  untouched caller keeps working), `count` (just `links_total`), `none` (no link fields).
+  untouched caller keeps working), `count` (`links_total` + `links_truncated`, so one
+  cheap call answers whether the full fetch is capped), `none` (no link fields).
   An unrecognized value degrades to `full` rather than 422-ing a read.
   `potential_conflicts` is returned in **all three** modes, so a cheaper read never
-  silently turns off conflict discovery.
+  silently turns off conflict discovery; it is itself capped at 25 (highest similarity
+  first) with `conflicts_total` / `conflicts_truncated`, so a conflict-heavy hub cannot
+  make a cheap mode expensive.
+  `GET /articles/:id` now also reads the `project_id` / `story_id` query params the MCP
+  tool has always advertised, so article-access events are attributed instead of nil.
   Why: agents are instructed to open every search hit with `knowledge_get`, so this
   response is paid on essentially every wiki read in every session. On a measured hub
   article the links were 12,564 of 16,189 bytes — about 4,000 tokens to read 735 tokens
