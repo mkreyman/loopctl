@@ -8,6 +8,24 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Added
 
+- **`WEBAUTHN_RP_ID` / `WEBAUTHN_ORIGIN` / `WEBAUTHN_RP_NAME` — WebAuthn on a self-hosted
+  domain (#511, contributed by @FinanceAlex; refs #494).** `config.exs` hardcoded the
+  relying party to `loopctl.com`, and the WebAuthn spec requires `rp_id` to be a
+  registrable domain suffix of the page's origin — so on any other domain the browser
+  refused the enrollment ceremony. Since enrollment is the only way a tenant becomes
+  `human_anchored`, a self-hosted deployment could never reach the chain-of-custody
+  surface at all. `dev.exs`/`test.exs` already overrode this for localhost; only a prod
+  release had no way to. Unset, the hosted deployment is byte-for-byte unchanged.
+  Each var applies independently. `WEBAUTHN_ORIGIN` defaults to `https://$PHX_HOST` whenever
+  `PHX_HOST` is set — the page host, not the `rp_id`, since `rp_id` may legally be a
+  registrable parent domain of it — and must be set explicitly for localhost or a
+  non-standard port, since WebAuthn runs only in a secure context (localhost being the one
+  `http://` exception). A blank, non-host-shaped `WEBAUTHN_RP_ID` or a `WEBAUTHN_ORIGIN`
+  that is not `scheme://host[:port]` is named in the boot log and ignored rather than
+  applied; an `rp_id` that is not a registrable suffix of the origin is warned about too.
+  Set `WEBAUTHN_RP_ID`
+  before the first enrollment: credentials are bound to it, so changing it later
+  invalidates every enrolled authenticator.
 - **`SCALE_ALERTS_ENABLED` — off switch for a deployment with no alert receiver (#376).**
   Defaults to `true`, so an existing deployment is unchanged. The parse is deliberately
   opt-OUT and asymmetric with loopctl's other boolean env vars: only `false` or `0`

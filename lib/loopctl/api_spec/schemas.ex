@@ -474,7 +474,11 @@ defmodule Loopctl.ApiSpec.Schemas do
         },
         rp_id: %Schema{
           type: :string,
-          description: "Relying party id — `loopctl.com` in prod, `localhost` in dev"
+          description:
+            "Relying party id, deployment-configured (`WEBAUTHN_RP_ID`) — the hosted " <>
+              "instance serves `loopctl.com`, a self-hosted one its own domain, `localhost` " <>
+              "in dev. It must be a registrable domain suffix of the page's origin or the " <>
+              "browser refuses the ceremony."
         },
         rp_name: %Schema{type: :string, example: "loopctl"},
         user_verification: %Schema{

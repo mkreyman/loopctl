@@ -530,6 +530,45 @@ if config_env() == :prod do
 
   host = System.get_env("PHX_HOST") || "example.com"
 
+  # WebAuthn relying party for a SELF-HOSTED deployment (#511, refs #494). `config.exs`
+  # hardcodes `loopctl.com`, and the WebAuthn spec requires `rp_id` to be a registrable
+  # domain suffix of the page's origin — so on any other domain the browser rejects the
+  # enrollment ceremony outright and a self-hoster cannot create a human-anchored tenant
+  # at all. `dev.exs` and `test.exs` already override this for localhost; only a prod
+  # RELEASE had no way to.
+  #
+  # Inside the prod block ON PURPOSE. The original patch placed it at the file's top level,
+  # where a `WEBAUTHN_RP_ID` merely present in the shell would silently override the dev
+  # and test settings — including during `mix test`, where it would break the WebAuthn
+  # suite in a way that looks nothing like its cause.
+  #
+  # All three vars apply INDEPENDENTLY — `Config` deep-merges keyword lists onto the
+  # `config.exs` block, so setting only WEBAUTHN_ORIGIN (e.g. a www-serving edge on the
+  # hosted default) takes effect. Unset leaves `config.exs` untouched.
+  #
+  # The blank/shape/default rules live in `Loopctl.WebAuthn.RpConfig` so they are
+  # unit-testable — this block is unreachable from the suite (the `Loopctl.Search.Regconfig`
+  # precedent). Each var is still read HERE by literal name so `mix loopctl.check_env_docs`
+  # keeps enforcing that it is documented; a value the module rejects is warned about and
+  # dropped rather than crashing boot (epic_35 STH_SWEEP_CRON lesson). `IO.warn/2` and not
+  # `Logger`: logging is not started yet when a release evaluates this file.
+  #
+  # WEBAUTHN_RP_ID is effectively WRITE-ONCE: stored credentials are bound to it via
+  # rpIdHash, so changing it after any enrollment fails every later assertion closed.
+  {webauthn_opts, webauthn_warnings} =
+    Loopctl.WebAuthn.RpConfig.resolve(
+      rp_id: System.get_env("WEBAUTHN_RP_ID"),
+      rp_name: System.get_env("WEBAUTHN_RP_NAME"),
+      origin: System.get_env("WEBAUTHN_ORIGIN"),
+      phx_host: System.get_env("PHX_HOST")
+    )
+
+  Enum.each(webauthn_warnings, &IO.warn(&1, []))
+
+  if webauthn_opts != [] do
+    config :loopctl, :webauthn, webauthn_opts
+  end
+
   config :loopctl, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
 
   config :loopctl, LoopctlWeb.Endpoint,
