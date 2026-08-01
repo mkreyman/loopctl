@@ -51,9 +51,14 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
   The cross-tenant residual filter (the ANN applies `tenant_id` AFTER the index returns
   its top-`ef_search` batch) is a real, SEPARATE production concern, and `hnsw.iterative_scan`
-  is its remedy — but it stays a `SystemConfig`-only operator lever, deliberately NOT pinned
-  in `config/test.exs`, so CI keeps exercising the shipped default (see
-  `test/loopctl/config_embedding_read_path_test.exs`). The test-side remedy is orthogonal
+  is its remedy. It remains a `SystemConfig`-only lever for the OPERATOR, but as of #535
+  `config/test.exs` DOES pin the Application-level fallback (`:hnsw_iterative_scan_default`)
+  ON — because prod runs iterative scan ON, so an unpinned test env was asserting exact
+  recall against a configuration nobody runs. `test/loopctl/config_embedding_read_path_test.exs`
+  enforces both halves: the pin exists in `config/test.exs` and in no other config file.
+
+  That pin is NOT a fifth recall fix and does not repeal the warning above — it aligns the
+  test env with prod. The test-side remedy for THIS file's flake is still orthogonal
   vectors and a page size wider than the candidate set (below).
   """
 

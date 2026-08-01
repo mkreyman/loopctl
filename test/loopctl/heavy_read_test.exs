@@ -456,7 +456,33 @@ defmodule Loopctl.HeavyReadTest do
   # is not started (`:noproc`) or wedged — they do not raise, so a `rescue` alone misses
   # them and the exit escapes `scoped/3`'s `after`.
   defmodule ExitingRepo do
-    def query!(_sql, _params \\ []), do: exit(:noproc)
+    # The REAL shape DBConnection/Postgrex exits with when the pool is not started: a
+    # `{reason, call}` TUPLE, not a bare atom. A fake that exits with `:noproc` would let a
+    # tagger that only handles atoms look correct while degrading every production exit to
+    # "unknown".
+    def query!(_sql, _params \\ [], _opts \\ []),
+      do: exit({:noproc, {DBConnection, :execute, []}})
+  end
+
+  # Only the CAPTURE round trip fails; the body's `SET LOCAL` and restore's `set_config` go
+  # to the real Repo. That split is what makes the capture-failure FALLBACK observable — with
+  # a repo that fails everything, restore fails too and the reset can never be asserted.
+  defmodule CaptureFailingRepo do
+    def query!(sql, params \\ [], opts \\ [])
+
+    def query!("SELECT current_setting" <> _, _params, _opts),
+      do: exit({:noproc, {DBConnection, :execute, []}})
+
+    def query!(sql, params, opts), do: Loopctl.Repo.query!(sql, params, opts)
+  end
+
+  defmodule AbortedTxnRepo do
+    # What Postgres answers once the CALLER's transaction is already aborted: the body
+    # raised (most often a 57014 cancel), so every later statement — including restore's —
+    # comes back 25P02.
+    def query!(_sql, _params \\ [], _opts \\ []) do
+      raise %Postgrex.Error{postgres: %{code: :in_failed_sql_transaction}}
+    end
   end
 
   describe "LocalGuc best-effort bookkeeping" do
@@ -469,6 +495,110 @@ defmodule Loopctl.HeavyReadTest do
 
       assert Loopctl.LocalGuc.scoped(ExitingRepo, ["statement_timeout"], fn -> :the_result end) ==
                :the_result
+    end
+
+    test "restore logs a STABLE TAG on failure — never the raw error, which carries the backend host/database/role" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert Loopctl.LocalGuc.restore(ExitingRepo, [{"statement_timeout", "1234ms"}]) == :ok
+        end)
+
+      assert log =~ "LocalGuc: restore failed"
+      assert log =~ "noproc"
+      # The whole point of swallowing it loudly rather than silently: a reopened leak has
+      # to be diagnosable from the logs, not only from a distant 57014 in another query.
+      assert log =~ "leak"
+    end
+
+    test "an ALREADY-ABORTED (25P02) transaction is NOT reported as a leak" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert Loopctl.LocalGuc.restore(AbortedTxnRepo, [{"statement_timeout", "1234ms"}]) ==
+                   :ok
+        end)
+
+      # The enclosing rollback discards the body's `SET LOCAL` anyway, so nothing can leak.
+      # Warning here fires once per failed read during exactly the 57014 storm an operator
+      # is triaging, and points at the wrong subsystem.
+      refute log =~ "leak"
+    end
+  end
+
+  # The defect these cover: a GUC captured as NULL used to be SKIPPED by `restore/2`, so
+  # the body's `SET LOCAL` survived the enclosing transaction. NULL from
+  # `current_setting(name, true)` means the GUC is UNKNOWN to the backend — which is
+  # exactly the state of the pgvector `hnsw.*` knobs until the extension loads — so in
+  # practice every `hnsw` override leaked. A synthetic namespaced GUC is used rather than
+  # `hnsw.ef_search` so the test does not depend on whether pgvector happens to be loaded
+  # into this backend yet.
+  describe "LocalGuc restores a GUC that had NO prior value" do
+    @probe "loopctl_test.leak_probe"
+
+    defp current_probe do
+      %{rows: [[v]]} = Repo.query!("SELECT current_setting($1, true)", [@probe])
+      v
+    end
+
+    test "an unset GUC does not leak out of scoped/3" do
+      # The sandbox already has us inside a transaction, which IS the savepoint-commit
+      # situation this module exists for.
+      assert current_probe() in [nil, ""], "precondition: the probe GUC is unset"
+
+      Loopctl.LocalGuc.scoped(Repo, [@probe], fn ->
+        Repo.query!("SET LOCAL #{@probe} = 'inner'")
+        assert current_probe() == "inner"
+      end)
+
+      refute current_probe() == "inner",
+             "the override survived scoped/3 — this is the leak LocalGuc exists to prevent"
+    end
+
+    test "a GUC that DID have a prior value is put back to that value, not to the default" do
+      Repo.query!("SET LOCAL #{@probe} = 'outer'")
+      assert current_probe() == "outer"
+
+      Loopctl.LocalGuc.scoped(Repo, [@probe], fn ->
+        Repo.query!("SET LOCAL #{@probe} = 'inner'")
+      end)
+
+      assert current_probe() == "outer",
+             "restore must not clobber a deliberate outer SET LOCAL"
+    end
+
+    test "a FAILED capture still resets the GUCs the body is about to set" do
+      # The fallback branch: with no captured values we cannot restore, but leaving the
+      # body's override in the enclosing transaction is the leak this module exists to
+      # prevent. Degrading to `[]` here (which `restore/2` treats as a no-op) is the
+      # regression this asserts against.
+      Loopctl.LocalGuc.scoped(CaptureFailingRepo, [@probe], fn ->
+        Repo.query!("SET LOCAL #{@probe} = 'inner'")
+      end)
+
+      refute current_probe() == "inner",
+             "a failed capture left the override in the enclosing transaction"
+    end
+
+    test "a nested failed capture leaves an ENCLOSING scope's GUC to its owner" do
+      Loopctl.LocalGuc.scoped(Repo, [@probe], fn ->
+        Repo.query!("SET LOCAL #{@probe} = 'outer'")
+
+        Loopctl.LocalGuc.scoped(CaptureFailingRepo, [@probe], fn -> :ok end)
+
+        assert current_probe() == "outer",
+               "the inner reset clobbered the enclosing scope's deliberate SET LOCAL"
+      end)
+    end
+
+    test "an invalid GUC name is rejected before it can reach the interpolated SQL" do
+      for bad <- ["statement_timeout'; SELECT 1; --", "Foo", "a.b.c", :statement_timeout] do
+        assert_raise ArgumentError, ~r/invalid GUC name/, fn ->
+          Loopctl.LocalGuc.capture(Repo, [bad])
+        end
+
+        assert_raise ArgumentError, ~r/invalid GUC name/, fn ->
+          Loopctl.LocalGuc.scoped(Repo, [bad], fn -> :ok end)
+        end
+      end
     end
   end
 

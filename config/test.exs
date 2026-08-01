@@ -716,9 +716,16 @@ config :loopctl, :embedding_read_path, Loopctl.MockEmbeddingReadPath
 # That is the long-running side-table flake (measured 3 failing runs / 23 before this pin,
 # 0 / 25 after; four earlier "recall" fixes never touched the mechanism).
 #
-# The guard in `test/loopctl/config_embedding_read_path_test.exs` still bars this key in
-# every NON-test config — that is the part that matters, since an Application-level pin in
-# prod would shadow the operator lever. Under-return coverage of the OFF path is NOT lost:
-# it is asserted directly in `heavy_read_test.exs` against `HeavyRead.opts/1`, which is
-# where the OFF decision actually lives, rather than as a side effect of a global default.
+# The guard in `test/loopctl/config_embedding_read_path_test.exs` bars this key in every
+# NON-test config — that is the part that matters, since an Application-level pin in prod
+# would shadow the operator lever — and asserts that this line still exists, so removing
+# the pin cannot silently return the suite to asserting recall against a configuration
+# prod does not run.
+#
+# Under-return coverage of the OFF path is NOT lost: it is asserted directly against
+# `HeavyRead.opts/1` (where the OFF decision actually lives, rather than as a side effect
+# of a global default) in `test/loopctl/heavy_read_hnsw_ef_search_test.exs:175-197`.
+# Cite that file, not `heavy_read_test.exs`, which contains no iterative-scan assertions
+# at all — a mis-cited compensating control is how the real one gets deleted later as
+# "already covered elsewhere".
 config :loopctl, :hnsw_iterative_scan_default, 1

@@ -5,6 +5,34 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.64.0 — 2026-08-01 (stop paying 4k tokens to read a 735-token article)
+
+### Changed
+
+- **`knowledge_get` link payload trimmed, ranked and capped** (issue #538). Agents are
+  told to open every search hit with this tool, so its response is paid on essentially
+  every wiki read in every session — and on a measured hub article the links were 12,564
+  of 16,189 bytes, roughly 4,000 tokens to read 735 tokens of body.
+  - Each link now carries only its **far** side, as `article: {id, title}`. The near side
+    was a constant echo of the `article_id` you passed in, with an always-`null` title.
+    **Breaking** for anything reading `source_article` / `target_article`; direction is
+    unchanged and still given by which array the link is in.
+  - Links carry `similarity` when the auto-linker scored them, so a list of otherwise
+    identical `relates_to` edges can be ranked or thresholded instead of guessed at.
+  - Both arrays are ranked (open `potential_conflict` first, then descending similarity,
+    then oldest-first for links the auto-linker never scored — which is every link on a
+    hand-created or imported corpus) and capped at 25 per direction. `links_total` and
+    `links_truncated` report the truth. Use `knowledge_graph` to traverse the full graph.
+
+### Added
+
+- **`knowledge_get` gains `links`** — `full` (default), `count` (`links_total` +
+  `links_truncated`, so one cheap call answers whether the full fetch is capped), or
+  `none`. Pass `count`/`none` when you only want the article's text.
+  `potential_conflicts` is returned in **all three** modes, so a cheaper read never
+  silently turns off conflict discovery; it is itself capped at 25 (strongest first) and
+  reports `conflicts_total` / `conflicts_truncated`.
+
 ## 2.63.0 — 2026-07-30 (never bank a near-duplicate)
 
 ### Added
