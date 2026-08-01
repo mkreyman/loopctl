@@ -95,6 +95,18 @@ jobs:
       - name: Run Credo
         run: mix credo --strict
 
+      # #541 — nothing in CI compiled assets/js before this. A syntax or import
+      # error in a LiveView hook therefore surfaced only in the Docker build at
+      # DEPLOY time (Dockerfile runs `mix assets.deploy`), long after review.
+      # That gap stopped being tolerable once /enroll shipped a ceremony that is
+      # entirely client-side: for that page, broken JS is a broken feature with a
+      # green build. esbuild and tailwind are standalone binaries — no Node.js.
+      - name: Install asset toolchain
+        run: mix assets.setup
+
+      - name: Build assets
+        run: mix assets.deploy
+
   test:
     name: Test
     runs-on: [self-hosted, beelink]

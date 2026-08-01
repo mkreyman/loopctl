@@ -8,6 +8,29 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Added
 
+- **`GET /enroll` — a browser page that anchors an EXISTING tenant (#541).** The API
+  advertised an `enrollment_upgrade` path out of `agent_rooted`, but nobody could walk it:
+  `navigator.credentials.create()` needs a browser, and the only page running a WebAuthn
+  ceremony was `/signup`, which creates a NEW tenant. Every tenant predating the signup
+  ceremony was therefore permanently locked out of chain-of-custody, work-breakdown,
+  dispatch, and token-budget writes. Paste a `user`-role API key, touch an authenticator,
+  and the tier flips in place. The key is sent only as a bearer token from your browser to
+  the same API you would curl — the page holds no server-side state and enforces nothing;
+  every gate stays in `TenantAuthenticatorController`. `GET /api/v1/tenants/me` now names
+  the page in `remediation.enrollment_upgrade.enrollment_page` (relative, since a
+  self-hosted instance serves its own).
+
+### Fixed
+
+- **WebAuthn registration rejected hardware security keys.** Both browser hooks requested
+  `attestation: "direct"` while the server built its challenge with Wax's default of
+  `"none"`, so `Wax.register/3` refused any real attestation statement with
+  `:invalid_attestation_conveyance_preference`. This was invisible on laptops — Touch ID
+  and Windows Hello return `fmt: "none"` regardless — and broke exactly the roaming keys
+  (YubiKey and similar) that the signup page recommends. Affects `/signup` as well as the
+  new `/enroll`. No configuration change is needed; existing enrolled authenticators are
+  unaffected.
+
 - **`WEBAUTHN_RP_ID` / `WEBAUTHN_ORIGIN` / `WEBAUTHN_RP_NAME` — WebAuthn on a self-hosted
   domain (#511, contributed by @FinanceAlex; refs #494).** `config.exs` hardcoded the
   relying party to `loopctl.com`, and the WebAuthn spec requires `rp_id` to be a

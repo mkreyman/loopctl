@@ -186,6 +186,16 @@ defmodule Loopctl.Tenants.TierCapabilities do
       "POST /api/v1/tenants/:id/authenticators/challenge",
       "POST /api/v1/tenants/:id/authenticators"
     ],
+    # #541 — the endpoints above cannot be driven by the caller reading this.
+    # `navigator.credentials.create()` needs a browser, so an agent or a curl
+    # user hit a wall precisely here: the remediation named a path it could not
+    # walk. This is the page that walks it.
+    #
+    # RELATIVE on purpose. The enrollment page is per-DEPLOYMENT (a self-hosted
+    # instance serves its own, and its WebAuthn relying party is its own host —
+    # see WEBAUTHN_RP_ID), unlike `docs`, which points at this project's wiki
+    # for everyone. A caller reading this already knows which host it asked.
+    enrollment_page: "/enroll",
     requires_human: true,
     requires_role: "user",
     docs: "https://loopctl.com/wiki/tenant-signup"

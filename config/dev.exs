@@ -102,9 +102,16 @@ config :loopctl, :webauthn,
 # If you need to inspect SQL via get_logs, temporarily set this back to :debug.
 config :logger, level: :info
 
-# Do not include metadata nor timestamps in development logs
+# Do not include metadata nor timestamps in development logs.
+#
+# The template key is `:msg`, NOT `:message`. Erlang's `:logger_formatter`
+# treats any atom outside its three specials (`:level`, `:time`, `:msg`) as a
+# METADATA key, so `:message` resolved to absent metadata and rendered as ""
+# — every dev log line printed as a bare "info: " with no content, silently,
+# for every environment that used this template. Nothing errors; the logs just
+# go blank, which is only noticed when you need them.
 config :logger, :default_handler,
-  formatter: {:logger_formatter, %{template: [:level, ": ", :message, "\n"]}}
+  formatter: {:logger_formatter, %{template: [:level, ": ", :msg, "\n"]}}
 
 # Declare the structured metadata keys the app emits (US-27.3 DB-error fields,
 # request/tenant context). The dev handler above prints only level + message,
