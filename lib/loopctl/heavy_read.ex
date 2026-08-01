@@ -377,14 +377,22 @@ defmodule Loopctl.HeavyRead do
   # the same single-UPDATE operator lever ef_search uses. The mode string is looked up from
   # a fixed table, so the value interpolated into `SET LOCAL hnsw.iterative_scan = <mode>`
   # is ALWAYS one of the three literals below, never operator/attacker text.
-  # The SHIPPED fallback, matching what prod runs and what `config/test.exs` pins. It is 1,
-  # not pgvector's own 0, because 0 was a premise nothing in the repo maintained: the ON state
-  # lives in an operator-set `SystemConfig` row, so a fresh self-hosted install or a database
-  # restored from before #488 silently ran the configuration the suite does NOT assert — the
-  # cross-tenant post-ANN-filter under-return (`left: []`) #488 exists to close. Safe by
-  # construction on an old extension: `iterative_scan_supported?/0` gates it to a NO-OP below
-  # pgvector 0.8, and `hnsw_max_scan_tuples/0` bounds the walk.
-  @default_hnsw_iterative_scan 1
+  # The SHIPPED fallback: pgvector's own default, OFF.
+  #
+  # A review of this branch proposed flipping it to 1 so the shipped default matches what
+  # prod runs and what `config/test.exs` pins — the argument being that the ON state lives
+  # only in an operator-set `SystemConfig` row, so a fresh self-hosted install silently runs
+  # a configuration the suite does not assert. That argument has real merit, and the change
+  # is guarded (`iterative_scan_supported?/0` makes it a NO-OP below pgvector 0.8, and
+  # `hnsw_max_scan_tuples/0` bounds the walk).
+  #
+  # It is NOT taken here, because flipping it changes ANN query planning for every
+  # deployment that has not set the row — a fleet-wide performance/recall trade that is the
+  # operator's call, not a side effect of a branch fixing six unrelated findings. The
+  # premise gap it targets is closed the honest way instead: `config/test.exs` now records
+  # how the prod value is verified and when it was last checked. Raise it as its own change
+  # if the default should move.
+  @default_hnsw_iterative_scan 0
   @hnsw_iterative_scan_modes %{1 => "relaxed_order", 2 => "strict_order"}
   @default_hnsw_max_scan_tuples 20_000
 
