@@ -87,6 +87,23 @@ defmodule LoopctlWeb.EnrollLiveTest do
         |> Enum.filter(&(&1 =~ "slate-500" and not (&1 =~ "placeholder:")))
 
       assert offenders == [], "low-contrast slate-500 body text on /enroll: #{inspect(offenders)}"
+
+      # The rendered HTML is only HALF the page. Everything the operator reads
+      # DURING and AFTER the ceremony — the status line, the result panel, the
+      # per-surface capability rows — is written by the hook at runtime and
+      # never passes through this render, so a scan of `html` alone would
+      # report a clean page while the ceremony's own output stayed unreadable.
+      # That is exactly the state this test shipped in until the review caught
+      # it. Scan the hook source too.
+      hook_offenders =
+        @hook_path
+        |> File.read!()
+        |> String.split(~r/\s+/)
+        |> Enum.filter(&(&1 =~ "slate-500"))
+
+      assert hook_offenders == [],
+             "low-contrast slate-500 injected at runtime by #{@hook_path}: " <>
+               inspect(hook_offenders)
     end
 
     test "mounts the AuthenticatorEnroll hook and lets it own its DOM", %{conn: conn} do

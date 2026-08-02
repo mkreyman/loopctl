@@ -557,7 +557,7 @@ const AuthenticatorEnroll = {
 
   status(message) {
     this.statusEl.textContent = message;
-    this.statusEl.className = "mt-4 font-mono text-xs text-slate-400";
+    this.statusEl.className = "mt-4 font-mono text-sm text-slate-300";
   },
 
   clearResult() {
@@ -599,17 +599,17 @@ const AuthenticatorEnroll = {
     // can confirm the one-way door closed on the tenant they meant.
     const anchored = document.createElement("p");
     anchored.id = "enroll-tenant";
-    anchored.className = "font-mono text-xs text-slate-400";
+    anchored.className = "font-mono text-sm text-slate-300";
     anchored.textContent = `tenant: ${describe(tenant)}`;
     box.appendChild(anchored);
 
     const tier = document.createElement("p");
-    tier.className = "font-mono text-xs text-slate-400";
+    tier.className = "font-mono text-sm text-slate-300";
     tier.textContent = `trust_tier: ${enrolled.trust_tier}`;
     box.appendChild(tier);
 
     const name = document.createElement("p");
-    name.className = "font-mono text-xs text-slate-400";
+    name.className = "font-mono text-sm text-slate-300";
     name.textContent = `authenticator: ${enrolled.authenticator.friendly_name} (${enrolled.authenticator.attestation_format})`;
     box.appendChild(name);
 
@@ -618,7 +618,7 @@ const AuthenticatorEnroll = {
 
     if (names.length > 0) {
       const label = document.createElement("p");
-      label.className = "pt-2 font-display text-xs uppercase tracking-wide text-slate-500";
+      label.className = "pt-2 font-display text-xs uppercase tracking-wide text-slate-400";
       label.textContent = "Surfaces";
       box.appendChild(label);
 
@@ -629,7 +629,7 @@ const AuthenticatorEnroll = {
       names.forEach((surface) => {
         const item = document.createElement("li");
         const allowed = surfaces[surface] === "allowed";
-        item.className = `font-mono text-xs ${allowed ? "text-accent-200" : "text-slate-500"}`;
+        item.className = `font-mono text-sm ${allowed ? "text-accent-200" : "text-slate-400"}`;
         item.textContent = `${allowed ? "✓" : "·"} ${surface}: ${surfaces[surface]}`;
         list.appendChild(item);
       });
