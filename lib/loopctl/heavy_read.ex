@@ -389,9 +389,10 @@ defmodule Loopctl.HeavyRead do
   # It is NOT taken here, because flipping it changes ANN query planning for every
   # deployment that has not set the row — a fleet-wide performance/recall trade that is the
   # operator's call, not a side effect of a branch fixing six unrelated findings. The
-  # premise gap it targets is closed the honest way instead: `config/test.exs` now records
-  # how the prod value is verified and when it was last checked. Raise it as its own change
-  # if the default should move.
+  # premise gap it targets is closed the honest way instead: `hnsw_iterative_scan/0`'s @doc
+  # below states all three values and records how the prod one is verified and when it was
+  # last checked (`docs/hnsw-tuning-evaluation.md` carries the operator-facing copy). Raise
+  # it as its own change if the default should move.
   @default_hnsw_iterative_scan 0
   @hnsw_iterative_scan_modes %{1 => "relaxed_order", 2 => "strict_order"}
   @default_hnsw_max_scan_tuples 20_000
@@ -529,7 +530,9 @@ defmodule Loopctl.HeavyRead do
   @doc """
   Whether the connected pgvector supports `hnsw.iterative_scan` (pgvector >= 0.8.0).
 
-  Probed from `pg_extension` on the SAME repo the ANN read runs on (`repo/0`) and cached in
+  Probed from `pg_extension` on the SAME repo the ANN read runs on (`repo/0`) under a
+  #{@probe_timeout_ms}ms timeout (`@probe_timeout_ms`, which bounds the pre-gate CHECKOUT,
+  not just the query) and cached in
   `:persistent_term` WITH A TTL. The probe runs only when an operator has actually enabled
   iterative scan (`iterative_scan_override/0` short-circuits at OFF), so it costs one extra
   round-trip per TTL window on the enabled path and nothing at all on the default path.
@@ -778,36 +781,20 @@ defmodule Loopctl.HeavyRead do
     # saturation signal, and failing closed there (iterative scan off for this read) is
     # cheaper than every concurrent ANN request queueing for seconds in front of the shed.
     #
-    # `mode: :savepoint` WHEN the caller is already inside a transaction on this repo (the
-    # normal shape under the test sandbox): without it a server-side error here — a 57014
-    # cancel at the tight timeout above — aborts the ENCLOSING transaction (25P02), so every
-    # later statement fails over a query it never issued while the `rescue`/`catch` below
-    # report a clean `:inconclusive`. That is the hazard `LocalGuc.do_capture/2` guards
-    # against, on the same hot path. It is CONDITIONAL because DBConnection refuses savepoint
-    # mode on an idle connection, which is the prod shape (`opts/1` runs outside any
-    # transaction) and would otherwise make every prod probe fail.
+    # `mode: :savepoint` WHENEVER the connection is inside a transaction (the normal shape
+    # under the test sandbox): without it a server-side error here — a 57014 cancel at the
+    # tight timeout above — aborts the ENCLOSING transaction (25P02), so every later statement
+    # fails over a query it never issued while the `rescue`/`catch` below report a clean
+    # `:inconclusive`. That is the hazard `LocalGuc.do_capture/2` guards against, on the same
+    # hot path.
     #
-    # DO NOT "simplify" this to an unconditional `mode: :savepoint` to match
-    # `LocalGuc.do_capture/2`. That sibling is unconditional because it only ever runs INSIDE
-    # a transaction; this one does not. A review round proposed exactly that change, on the
-    # theory that #535 had disproved the idle-refusal premise. It had not: measured on an idle
-    # `HeavyReadRepo` connection, `mode: :savepoint` returns
-    # `{:error, %DBConnection.TransactionError{status: :idle}}`. That is an ERROR TUPLE, so it
-    # would fall to the `other ->` branch below and report `:inconclusive` — on EVERY prod
-    # probe — which `inconclusive_verdict/2` then resolves without a conclusive verdict to
-    # reuse, silently disabling iterative scan fleet-wide. Precisely the failure #535 fixed.
-    # `test/loopctl/heavy_read_savepoint_probe_test.exs` pins the refusal so the premise
-    # cannot be re-litigated from memory.
-    query_opts =
-      if repo().in_transaction?(),
-        do: [timeout: @probe_timeout_ms, mode: :savepoint],
-        else: [timeout: @probe_timeout_ms]
-
-    case repo().query(
-           "SELECT extversion FROM pg_extension WHERE extname = 'vector'",
-           [],
-           query_opts
-         ) do
+    # The question is put to the CONNECTION (`savepoint_first_probe/0`), not to
+    # `repo().in_transaction?()`: that reads a per-process dict entry set only by
+    # `Repo.transaction`/`Repo.checkout`, which `Sandbox.start_owner!` never sets — the same
+    # blindness documented at `run_timed_transaction/5` — so gating on it left the protection
+    # DEAD in the one shape that has an enclosing transaction to poison, while prod (`opts/1`
+    # runs outside any transaction) took the plain branch either way.
+    case savepoint_first_probe() do
       {:ok, %{rows: [[version]]}} when is_binary(version) ->
         {:ok, version_at_least?(version, @iterative_scan_min_version), version}
 
@@ -827,6 +814,32 @@ defmodule Loopctl.HeavyRead do
     # propagates out of `opts/1` and aborts the caller's ANN read — the OPPOSITE of the
     # documented fail-closed guarantee.
     :exit, reason -> {:inconclusive, "exit:" <> exit_tag(reason), :pool}
+  end
+
+  @probe_sql "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+
+  # Ask for the savepoint, and retry PLAINLY on the one refusal that means there was no
+  # transaction to protect. Postgrex refuses savepoint mode on an idle connection
+  # (`Postgrex.Protocol.transaction_error/2`) with `%DBConnection.TransactionError{status:
+  # :idle}` and no round trip, so prod's shape costs a checkout, never a query.
+  #
+  # DO NOT drop the retry and pass `mode: :savepoint` alone to match `LocalGuc.do_capture/2`.
+  # That sibling needs no retry because it only ever runs INSIDE a transaction; this one does
+  # not. A review round proposed exactly that, on the theory that #535 had disproved the
+  # idle-refusal premise. It had not: the refusal is an ERROR TUPLE, so without the retry it
+  # falls to the caller's `other ->` branch and reports `:inconclusive` — on EVERY prod probe
+  # — which `inconclusive_verdict/2` then resolves with no conclusive verdict to reuse,
+  # silently disabling iterative scan fleet-wide. Precisely the failure #535 fixed.
+  # `test/loopctl/heavy_read_savepoint_probe_test.exs` pins the refusal AND the sandbox shape
+  # where `in_transaction?/0` lies, so neither premise can be re-litigated from memory.
+  defp savepoint_first_probe do
+    case repo().query(@probe_sql, [], timeout: @probe_timeout_ms, mode: :savepoint) do
+      {:error, %DBConnection.TransactionError{status: :idle}} ->
+        repo().query(@probe_sql, [], timeout: @probe_timeout_ms)
+
+      result ->
+        result
+    end
   end
 
   # Public only so the negative-cache decision is directly testable: it is a pure function

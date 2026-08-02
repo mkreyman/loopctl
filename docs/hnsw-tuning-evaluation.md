@@ -109,7 +109,7 @@ Design points (`Loopctl.HeavyRead.hnsw_iterative_scan/0`, `hnsw_max_scan_tuples/
 
 | `SystemConfig hnsw_iterative_scan` | emitted |
 |---|---|
-| `0` (default / missing / unrecognized code) | nothing — no `SET LOCAL`, no capability probe |
+| `0` — explicit, unrecognized, or the MISSING-row fallback (`default_iterative_scan_code/0`: shipped `0`, **test `1`**) | nothing — no `SET LOCAL`, no capability probe |
 | `1` | `SET LOCAL hnsw.iterative_scan = relaxed_order` (+ `hnsw.max_scan_tuples`) |
 | `2` | `SET LOCAL hnsw.iterative_scan = strict_order` (+ `hnsw.max_scan_tuples`) |
 
@@ -136,8 +136,9 @@ Design points (`Loopctl.HeavyRead.hnsw_iterative_scan/0`, `hnsw_max_scan_tuples/
   purpose. Whether the shipped default should move to `1` is an open operator decision and is
   deliberately not settled in code; raise it as its own change with a benchmark.
 - **Fail-closed, non-poisoning capability probe.** `iterative_scan_supported?/0` reads
-  `pg_extension` on the SAME repo the ANN read uses (`HeavyRead.repo/0`, with an explicit
-  5s timeout) and caches the answer in `:persistent_term` **with a TTL**. An old extension →
+  `pg_extension` on the SAME repo the ANN read uses (`HeavyRead.repo/0`, under
+  `@probe_timeout_ms` — 500ms, which bounds the pre-gate CHECKOUT, not just the query, so a
+  saturated pool goes inconclusive fast instead of queueing ahead of the shed) and caches the answer in `:persistent_term` **with a TTL**. An old extension →
   `false` + a warning naming the detected version; an ABSENT extension gets its own distinct
   warning (it is not a version problem). Either way the setting is a silent no-op, NOT a
   raise: nothing is emitted, so the ANN read is unaffected. Errors AND exits (`:noproc`, a

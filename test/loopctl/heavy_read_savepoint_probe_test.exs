@@ -1,15 +1,16 @@
 defmodule Loopctl.HeavyReadSavepointProbeTest do
   @moduledoc """
-  Pins the premise `HeavyRead.probe_iterative_scan_support/0` gates its
-  `mode: :savepoint` on: DBConnection REFUSES savepoint mode on an idle
-  connection.
+  Pins both premises `HeavyRead.probe_iterative_scan_support/0`'s savepoint
+  handling rests on: Postgrex REFUSES `mode: :savepoint` on an idle connection
+  (so the probe must retry plainly), and `in_transaction?/0` CANNOT be used to
+  decide that, because it reports false under the sandbox — where the backend
+  genuinely is in a transaction.
 
-  This exists because the premise was challenged and the challenge was wrong.
-  A review round proposed dropping the `repo().in_transaction?()` gate and
-  passing `mode: :savepoint` unconditionally, to match `LocalGuc.do_capture/2`
-  — which is unconditional because it only ever runs inside a transaction.
-  `probe_iterative_scan_support/0` does not: `HeavyRead.opts/1` runs OUTSIDE any
-  transaction in production.
+  The first exists because the premise was challenged and the challenge was
+  wrong. A review round proposed passing `mode: :savepoint` unconditionally, to
+  match `LocalGuc.do_capture/2` — which is unconditional because it only ever
+  runs inside a transaction. `probe_iterative_scan_support/0` does not:
+  `HeavyRead.opts/1` runs OUTSIDE any transaction in production.
 
   The failure that change would cause is silent, which is why it earns a test
   rather than a comment. Savepoint-on-idle returns an ERROR TUPLE, not a raise,
@@ -32,14 +33,15 @@ defmodule Loopctl.HeavyReadSavepointProbeTest do
 
   describe "savepoint mode on an idle connection" do
     test "is refused with a TransactionError, not silently accepted" do
-      # The sandbox checks out a connection inside a transaction for async
-      # cases; this module is async: false and uses a dedicated non-sandboxed
-      # checkout so the connection is genuinely idle, matching the prod shape of
-      # HeavyRead.opts/1.
-      Sandbox.checkout(HeavyReadRepo, sandbox: false)
-
-      refute HeavyReadRepo.in_transaction?(),
-             "this test is meaningless unless the connection is idle"
+      # The sandbox checks out a connection inside a transaction; this module is
+      # async: false so a dedicated non-sandboxed checkout still wins ownership
+      # for this process, leaving the connection genuinely idle — the prod shape
+      # of HeavyRead.opts/1. Assert it TOOK: checkout/2 returns
+      # `{:already, :owner | :allowed}` instead of raising when the process is
+      # already bound to a sandboxed connection, and the query would then run
+      # inside the sandbox transaction, testing nothing. `in_transaction?/0`
+      # cannot stand in for this check (see the test below).
+      assert :ok = Sandbox.checkout(HeavyReadRepo, sandbox: false)
 
       result = HeavyReadRepo.query("SELECT 1", [], timeout: 2_000, mode: :savepoint)
 
@@ -52,9 +54,23 @@ defmodule Loopctl.HeavyReadSavepointProbeTest do
       # Establishes that the refusal above is caused by `mode: :savepoint` and
       # not by the connection being unusable — without this, the assertion could
       # pass for the wrong reason and keep passing after the premise changed.
-      Sandbox.checkout(HeavyReadRepo, sandbox: false)
+      assert :ok = Sandbox.checkout(HeavyReadRepo, sandbox: false)
 
       assert {:ok, %{rows: [[1]]}} = HeavyReadRepo.query("SELECT 1", [], timeout: 2_000)
+    end
+  end
+
+  describe "savepoint mode inside the sandbox transaction" do
+    test "succeeds while in_transaction?/0 reports false" do
+      # No `sandbox: false` checkout: this is the SANDBOXED shape, where the
+      # backend is inside a transaction that a probe error would poison (25P02).
+      # `in_transaction?/0` still says false — it reads a per-process key that
+      # `Sandbox.start_owner!/2` never sets — so gating the probe's
+      # `mode: :savepoint` on it made the protection dead exactly here.
+      refute HeavyReadRepo.in_transaction?()
+
+      assert {:ok, %{rows: [[1]]}} =
+               HeavyReadRepo.query("SELECT 1", [], timeout: 2_000, mode: :savepoint)
     end
   end
 end

@@ -107,6 +107,16 @@ defmodule Loopctl.LocalGuc do
         # `Retry-After` rather than an unstructured 500. Two call sites reaching the same
         # conclusion about the same failure should not hand the client two different answers,
         # one of which tells it never to retry something that is purely transient.
+        #
+        # KNOWN CONSEQUENCE of the shared struct: `DBConnection.ConnectionError` carries no
+        # field to discriminate on (`defexception [:message]`), so the fail-soft rescues that
+        # classify it as a degraded dependency swallow this abort too — the ingestion backlog
+        # gate (`LoopctlWeb.KnowledgeIngestionController.in_flight_ingestion_backlog/1`) fails
+        # OPEN at 0, and `Knowledge`'s under-fill probe degrades to `:error`. Both are reached
+        # only when the capture ROUND TRIP itself failed, i.e. the connection is already in
+        # trouble, which is the condition those rescues exist for — but they cannot tell this
+        # abort from a pool blip, so narrowing them (re-raise on this message/struct) is the
+        # follow-up if that distinction ever has to be made.
         raise DBConnection.ConnectionError,
               "LocalGuc: could not capture #{inspect(owned)}, which an enclosing scope " <>
                 "already overrode — refusing to set an override this transaction cannot " <>
