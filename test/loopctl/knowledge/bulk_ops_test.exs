@@ -25,6 +25,60 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
     |> AdminRepo.all()
   end
 
+  # --- LocalGuc ownership accounting (PR #549 review follow-up) ---
+
+  describe "LocalGuc active-names ownership across a bulk op" do
+    # `LocalGuc` tracks which GUC names a LIVE scope owns in the process dictionary, and
+    # `capture_fallback!/2` reads it to decide whether a FAILED capture may reset a name
+    # (nobody owns it) or must abort (an enclosing scope does). Both `restore/2` and
+    # `forget/1` pop with `list -- names`, which removes ONE occurrence — so a bulk op that
+    # pops twice silently steals an ENCLOSING scope's entry. That scope then looks unowned,
+    # and the next nested capture failure clobbers its deliberate `statement_timeout`
+    # instead of refusing: the exact leak LocalGuc exists to prevent.
+    #
+    # Asserted on the tracking state itself because there is no other observable: the
+    # damage only materialises on a LATER, unrelated read whose capture happens to fail.
+    @active_names_key {Loopctl.LocalGuc, :active_names}
+
+    defp enclosing_owner(names), do: Process.put(@active_names_key, names)
+    defp owned_names, do: Process.get(@active_names_key, [])
+
+    setup do
+      on_exit(fn -> Process.delete(@active_names_key) end)
+      :ok
+    end
+
+    test "a SUCCEEDING bulk op leaves an enclosing scope's ownership intact" do
+      tenant = fixture(:tenant)
+      fixture(:article, tenant_id: tenant.id, tags: ["ownership"], status: :published)
+
+      enclosing_owner(["statement_timeout"])
+
+      assert {:ok, %{affected: 1}} =
+               BulkOps.archive(tenant.id, {:tag, "ownership"}, audit_opts())
+
+      # Before the fix this was [] — :restore_timeout popped the bulk op's own entry and the
+      # unconditional `after` pop then took the enclosing scope's.
+      assert owned_names() == ["statement_timeout"],
+             "the bulk op popped an enclosing scope's LocalGuc ownership entry"
+    end
+
+    test "a FAILING bulk op still releases its own ownership entry" do
+      tenant = fixture(:tenant)
+
+      enclosing_owner(["statement_timeout"])
+
+      # An invalid delete token errors a step AFTER :set_timeout, so :restore_timeout is
+      # skipped and the entry this call pushed is never popped by it — the case the
+      # `after` cleanup exists for. It must still not over-pop.
+      assert {:error, :invalid_token} =
+               BulkOps.delete_with_token(tenant.id, Ecto.UUID.generate(), audit_opts())
+
+      assert owned_names() == ["statement_timeout"],
+             "a failed bulk op must release exactly its own entry, no more and no fewer"
+    end
+  end
+
   # --- TC-27.12.1: archive by tag is set-based and tenant-scoped ---
 
   describe "archive/3 by tag (TC-27.12.1, AC-27.12.1/.6/.8)" do

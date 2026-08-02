@@ -65,6 +65,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.RankingPriors
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm.ProviderError
+  alias Loopctl.LocalGuc
   alias Loopctl.Projects.Project
   alias Loopctl.Provider.RetryAfter
   alias Loopctl.Search.Regconfig
@@ -5131,6 +5132,14 @@ defmodule Loopctl.Knowledge do
     end
   rescue
     e in DBConnection.ConnectionError ->
+      # `LocalGuc`'s capture ABORT shares this struct with the transient pool faults this
+      # clause degrades on, but it is a deliberate refusal to override a GUC an enclosing
+      # scope owns — not a degraded dependency. Degrading on it would turn a connection
+      # already known to be mis-scoped into a silently missing signal, which is the same
+      # mistake as the `query_canceled` narrowing directly below. Re-raise; the US-27.3
+      # backstop maps it to a 503.
+      if LocalGuc.capture_abort?(e), do: reraise(e, __STACKTRACE__)
+
       Logger.warning(
         "knowledge.vector_search under_fill probe degraded (connection); suggestions returned: " <>
           Exception.message(e)

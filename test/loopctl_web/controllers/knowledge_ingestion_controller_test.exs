@@ -993,6 +993,57 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert metadata.error_class == "connection"
     end
 
+    test "a LocalGuc capture ABORT propagates as 503 — it is not a transient pool fault",
+         %{conn: conn} do
+      # `LocalGuc`'s capture abort shares `DBConnection.ConnectionError` with the transient
+      # pool faults the clause above deliberately fails open on — but it is raised on
+      # PURPOSE, after LocalGuc refused to override a GUC an enclosing scope owns. Failing
+      # open on it would admit the batch on a connection already known to be mis-scoped and
+      # swallow a refusal whose whole point is to be noticed. It must reach the US-27.3 503
+      # instead, and it must NOT emit the fail-open telemetry.
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      test_pid = self()
+      handler_id = "backlog-abort-#{System.unique_integer([:positive])}"
+      event = [:loopctl, :ingestion, :backlog_gate, :failed_open]
+
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn ^event, _m, metadata, _ ->
+          if metadata.tenant_id == tenant.id, do: send(test_pid, :wrongly_failed_open)
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      # Raised with the real module's own message prefix, so the test binds to
+      # `LocalGuc.capture_abort?/1`'s actual discriminator rather than a copy of it.
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        raise DBConnection.ConnectionError,
+              ~s(LocalGuc: could not capture ["statement_timeout"], which an enclosing ) <>
+                "scope already overrode"
+      end)
+
+      # DBErrorBackstop logs the sanitized structured line and RE-RAISES a
+      # `SanitizedDBError` (so the web server's crash log can never echo the raw query);
+      # `Plug.Exception` is what turns that into the response status, which is why this
+      # asserts the raised exception's status rather than a rendered body.
+      error =
+        assert_raise LoopctlWeb.SanitizedDBError, fn ->
+          conn
+          |> auth_conn(raw_key)
+          |> post(~p"/api/v1/knowledge/ingest/batch", %{
+            items: [%{content: "Capture abort item", source_type: "newsletter"}]
+          })
+        end
+
+      assert Plug.Exception.status(error) == 503
+      refute_receive :wrongly_failed_open, 100
+    end
+
     test "TC-36.3.7: a NON-DB error in the backlog count propagates (500), not fail-open",
          %{conn: conn} do
       # A programming error in the count path must NOT be silently swallowed into a

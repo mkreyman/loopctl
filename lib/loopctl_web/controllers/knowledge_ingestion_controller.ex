@@ -16,6 +16,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   alias Loopctl.Ingestion.ContentEnvelope
   alias Loopctl.Knowledge.ContentChunker
   alias Loopctl.Llm
+  alias Loopctl.LocalGuc
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Oban.FairShare
   alias Loopctl.ObanConfig
@@ -312,19 +313,34 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   defp in_flight_ingestion_backlog(tenant_id) do
     backlog_counter().in_flight_ingestion_backlog(tenant_id)
   rescue
-    e in [DBConnection.ConnectionError, Postgrex.Error] ->
-      Logger.warning(
-        "ingestion backlog gate failed open for tenant=#{tenant_id}: " <>
-          Exception.message(e)
-      )
+    # `LocalGuc`'s capture ABORT shares `DBConnection.ConnectionError` with the transient
+    # pool faults this clause is for, but it is not one: it is raised DELIBERATELY, after
+    # `LocalGuc` decided it could not safely override a GUC an enclosing scope owns. Failing
+    # open on it would swallow a refusal whose entire purpose is to be noticed, and would do
+    # so on exactly the request whose connection is already mis-scoped. Re-raise it — the
+    # US-27.3 backstop maps it to a 503 with `Retry-After`, which is the honest answer. See
+    # `Loopctl.LocalGuc.capture_abort?/1`.
+    e in DBConnection.ConnectionError ->
+      if LocalGuc.capture_abort?(e), do: reraise(e, __STACKTRACE__)
+      fail_open(tenant_id, e)
 
-      :telemetry.execute(
-        TelemetryEvents.ingestion_backlog_gate_failed_open(),
-        %{count: 1},
-        %{tenant_id: tenant_id, error_class: fail_open_class(e)}
-      )
+    e in Postgrex.Error ->
+      fail_open(tenant_id, e)
+  end
 
-      0
+  defp fail_open(tenant_id, e) do
+    Logger.warning(
+      "ingestion backlog gate failed open for tenant=#{tenant_id}: " <>
+        Exception.message(e)
+    )
+
+    :telemetry.execute(
+      TelemetryEvents.ingestion_backlog_gate_failed_open(),
+      %{count: 1},
+      %{tenant_id: tenant_id, error_class: fail_open_class(e)}
+    )
+
+    0
   end
 
   defp fail_open_class(%DBConnection.ConnectionError{}), do: "connection"

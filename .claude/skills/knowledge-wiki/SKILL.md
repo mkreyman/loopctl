@@ -44,9 +44,9 @@ never pass `tenant_id`/`subject_id`.
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
    created (`:499-505`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:461-463`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8328`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8337`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
-   (`absolute_score/1`, `:8402-8407`) clears a scale-matched threshold AND beats the best retrieved
+   (`absolute_score/1`, `:8464-8469`) clears a scale-matched threshold AND beats the best retrieved
    candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8453-8463`; the pure decision is
    `resolve_provenance/4`, `:8508-8518`) AND is authoritative (not superseded/conflicted — the caller
    passes only `list_curated_sources/2`-filtered scores). Otherwise `:retrieved`. Both branches return identical `results`/`meta`
