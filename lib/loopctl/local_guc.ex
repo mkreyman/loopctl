@@ -101,8 +101,21 @@ defmodule Loopctl.LocalGuc do
   raised by `scoped/3` when it refused to override a GUC an enclosing scope owns — rather
   than the generic pool/connection failure that shares the struct (and the US-27.3 503).
 
-  The discriminator a fail-soft rescue needs to re-raise this abort instead of classifying it
-  as a degraded dependency.
+  The discriminator a fail-soft rescue needs to NAME the refusal — its own `error_class` tag
+  on the telemetry it already emits, its own log tag — while STILL degrading. It is not a
+  signal to re-raise.
+
+  That distinction was settled the expensive way. An abort here means one read refused to set
+  an override it could not take back; it does not mean the caller's own work is unsound, and
+  `capture_fallback!/2` raises BEFORE setting anything, so the rollback leaves nothing behind.
+  Re-raising it out of a fail-soft path therefore converts "this diagnostic could not be
+  measured" into a failed request — which is exactly what those paths exist to prevent. The
+  ingestion backlog gate must admit an innocent, under-threshold tenant when the count is
+  unmeasurable, and an abort IS unmeasurable; the vector-search under-fill probe must not
+  destroy an already-computed suggestions response.
+
+  Call sites: `LoopctlWeb.KnowledgeIngestionController`'s backlog gate and
+  `Loopctl.Knowledge`'s under-fill probe, both tagging `guc_capture_abort` and failing soft.
   """
   @spec capture_abort?(term()) :: boolean()
   def capture_abort?(%DBConnection.ConnectionError{message: message}) when is_binary(message),
