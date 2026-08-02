@@ -28,8 +28,10 @@ defmodule LoopctlWeb.EnrollLive do
     * **The operator's API key never reaches this process.** It is sent only as
       an `Authorization: Bearer` header on same-origin `fetch` calls from the
       hook. It is never a `handle_event` parameter, so it cannot land in socket
-      assigns, Phoenix's event logging, a crash dump, or telemetry. There is
-      deliberately no `handle_event/3` clause on this module at all.
+      assigns, Phoenix's event logging, a crash dump, or telemetry. The only
+      `handle_event/3` clause is a terminal no-op: this LiveView consumes no
+      client events, but `/enroll` is public, so a crafted event frame would
+      otherwise raise and kill the channel (mirrors `SignupLive`).
 
     * **There is exactly one enrollment implementation.** Re-implementing the
       ceremony behind the LiveView socket would have duplicated the reauth gate
@@ -68,6 +70,13 @@ defmodule LoopctlWeb.EnrollLive do
      |> assign(:docs_url, @docs_url)}
   end
 
+  # Catch-all for malformed / unknown client events on this public LiveView.
+  # This module consumes no events, so it is also the ONLY clause — without it
+  # LiveView raises on any pushed frame and kills the channel process (mirrors
+  # `SignupLive`'s terminal clause).
+  @impl true
+  def handle_event(_event, _params, socket), do: {:noreply, socket}
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -78,8 +87,13 @@ defmodule LoopctlWeb.EnrollLive do
           <h1 class="font-display text-2xl font-semibold text-slate-100">
             Enroll an authenticator
           </h1>
-          <p class="mt-1 text-sm text-slate-400">
-            Anchor an existing tenant to hardware. This upgrades its trust tier from
+          <p class="mt-1 text-sm text-slate-300">
+            Prove a human controls this tenant by registering a device you can unlock —
+            a fingerprint or face sensor, your phone, or a plug-in security key. It takes
+            one touch.
+          </p>
+          <p class="mt-2 text-sm text-slate-400">
+            Doing so upgrades the tenant's trust tier from
             <span class="font-mono text-slate-300">agent_rooted</span>
             to <span class="font-mono text-slate-300">human_anchored</span>, which unlocks the
             chain-of-custody, work-breakdown, dispatch, and token-budget surfaces.
@@ -98,7 +112,7 @@ defmodule LoopctlWeb.EnrollLive do
             <h2 class="font-display text-sm uppercase tracking-wide text-slate-400">
               Authorize
             </h2>
-            <p class="mt-1 text-xs text-slate-500">
+            <p class="mt-2 text-sm text-slate-300">
               Paste a <span class="font-mono">user</span>-role API key for the tenant you are
               anchoring. It is sent straight to the loopctl API as a bearer token from your
               browser — this page never transmits it over its own connection, never stores it,
@@ -110,7 +124,7 @@ defmodule LoopctlWeb.EnrollLive do
           <div>
             <label
               for="enroll-api-key"
-              class="block font-mono text-xs uppercase tracking-wide text-slate-500"
+              class="block font-mono text-xs uppercase tracking-wide text-slate-400"
             >
               User-role API key
             </label>
@@ -135,14 +149,19 @@ defmodule LoopctlWeb.EnrollLive do
           <div>
             <label
               for="enroll-friendly-name"
-              class="block font-mono text-xs uppercase tracking-wide text-slate-500"
+              class="block font-mono text-xs uppercase tracking-wide text-slate-400"
             >
               Authenticator name
             </label>
+            <p class="mt-1 text-sm text-slate-400">
+              Name it after the DEVICE, not yourself — this label is what you pick from when
+              revoking one later, and a wrong name there means revoking the wrong device.
+              Good: "mac-mini Touch ID", "iPhone passkey", "backup YubiKey".
+            </p>
             <input
               id="enroll-friendly-name"
               type="text"
-              placeholder="Primary YubiKey"
+              placeholder="mac-mini Touch ID"
               class="mt-2 block w-full rounded-md border border-slate-800 bg-slate-900 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-600 focus:border-accent-500 focus:outline-none focus:ring-1 focus:ring-accent-500"
             />
           </div>
@@ -155,21 +174,55 @@ defmodule LoopctlWeb.EnrollLive do
             <.icon name="hero-key" class="h-4 w-4" /> Enroll authenticator
           </button>
 
-          <p id="enroll-status" role="status" class="mt-4 font-mono text-xs text-slate-400"></p>
+          <p id="enroll-status" role="status" class="mt-4 font-mono text-sm text-slate-300"></p>
         </div>
 
         <div id="enroll-result"></div>
 
-        <div class="rounded-md border border-slate-800 bg-slate-900/40 p-6 text-xs text-slate-500">
+        <div class="rounded-md border border-slate-800 bg-slate-900/40 p-6 text-sm text-slate-300">
+          <p class="font-display uppercase tracking-wide text-slate-400">
+            What happens when you click Enroll
+          </p>
+          <p class="mt-3">
+            Your browser — not this page — asks you to confirm with a device. What it offers
+            depends on the machine you are on:
+          </p>
+          <ul class="mt-3 space-y-2">
+            <li>
+              <span class="font-mono text-slate-100">Built-in sensor</span>
+              — Touch ID on a Mac, Windows Hello on a PC. You confirm with your fingerprint
+              or face. This is the usual case on a laptop or an iMac.
+            </li>
+            <li>
+              <span class="font-mono text-slate-100">Your phone</span>
+              — choose "Use a phone or tablet" and the browser shows a QR code. Scan it with
+              your phone's camera and confirm there. Both devices need Bluetooth switched on.
+              This is the option to pick on a desktop with no built-in sensor, and the
+              passkey syncs, so it survives losing any one machine.
+            </li>
+            <li>
+              <span class="font-mono text-slate-100">Security key</span>
+              — plug in a USB key such as a YubiKey and press the metal disc on it. That
+              press is all "touch" means: proof a person is physically present.
+            </li>
+          </ul>
+          <p class="mt-4">
+            Nothing secret leaves your device. The key pair is generated inside the
+            authenticator and only its public half is sent to loopctl, so there is no
+            shared secret and no code to copy anywhere.
+          </p>
+        </div>
+
+        <div class="rounded-md border border-slate-800 bg-slate-900/40 p-6 text-sm text-slate-300">
           <p class="font-display uppercase tracking-wide text-slate-400">Before you start</p>
           <ul class="mt-3 space-y-2">
             <li>
-              The key must be <span class="font-mono text-slate-400">user</span>
+              The key must be <span class="font-mono text-slate-100">user</span>
               role and belong to the tenant being anchored. Agent and orchestrator keys are
               refused — trust-tier operations are not delegable.
             </li>
             <li>
-              Enrolling on an <span class="font-mono text-slate-400">agent_rooted</span>
+              Enrolling on an <span class="font-mono text-slate-100">agent_rooted</span>
               tenant needs only the key and a touch. Adding a SECOND authenticator to an
               already-anchored tenant additionally requires a touch from one that is already
               enrolled, so keep the existing device to hand.

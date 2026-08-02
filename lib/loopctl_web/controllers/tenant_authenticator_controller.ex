@@ -3,9 +3,17 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
   US-26.7.2 — opt-in WebAuthn trust-tier upgrade ceremony
   (agent_rooted -> human_anchored) and authenticator revocation.
 
-  Four endpoints, mirroring `LoopctlWeb.TenantAuditKeyController`'s
+  Endpoints, mirroring `LoopctlWeb.TenantAuditKeyController`'s
   challenge/act shape:
 
+    0. `GET /tenants/:id/authenticators` — lists the tenant's enrolled
+       authenticators (id, label, credential FINGERPRINT, format, timestamps —
+       never credential material). The row id is the handle the rename and
+       revoke endpoints key on, and a browser ceremony discards the 201 body, so
+       without this index an operator has no way to discover it. The fingerprint
+       is what a revoke should be confirmed against: it is credential-derived
+       and no endpoint can write it, whereas `friendly_name` is rewritable by
+       any user-role bearer key (see `rename/2`).
     1. `POST /tenants/:id/authenticators/challenge` — issues a registration
        challenge (AC-26.7.2.1/.2). If the tenant is already `human_anchored`,
        ALSO issues a fresh-assertion (reauth) challenge for an existing
@@ -34,7 +42,7 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
   audience for the FIRST enrollment. `revoke-challenge`/`delete` and any
   SUBSEQUENT enrollment are protected by fresh, per-operation WebAuthn
   assertions (`Loopctl.WebAuthn.Reauth`), a STRONGER control than the tier
-  gate. All four require `role: :user` + tenant ownership
+  gate. All of them require `role: :user` + tenant ownership
   (`owns_tenant?/2`, mirroring `TenantAuditKeyController`).
   """
 
@@ -44,6 +52,7 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Tenants
   alias Loopctl.Tenants.Enrollment
+  alias Loopctl.Tenants.RootAuthenticators
   alias Loopctl.Tenants.TierCapabilities
   alias Loopctl.WebAuthn
   alias Loopctl.WebAuthn.Enrollment, as: RegistrationChallenges
@@ -58,7 +67,10 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
   # under 8 KB.
   @max_attestation_field_bytes 8 * 1024
 
-  # Matches RootAuthenticator's `validate_length(:friendly_name, max: 120)`.
+  # Matches RootAuthenticator's
+  # `validate_length(:friendly_name, max: 120, count: :bytes)` — same unit on
+  # both layers, so a multi-byte label can never be accepted by one and refused
+  # by the other.
   @max_friendly_name_bytes 120
 
   # WebAuthn verification (and, for revoke, the assertion verify) is
@@ -66,6 +78,12 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
   # blanket RateLimiter plug, mirroring signup_live.ex's ensure_action_budget/1.
   @enroll_rate_window_ms 60_000 * 60
   @max_enroll_actions_per_window 30
+
+  # Rename does no crypto, so it gets its own far looser bucket rather than
+  # spending the ceremony budget. It still needs a per-tenant ceiling: each
+  # rename appends to the hash-chained audit log, and that append serializes
+  # per tenant against genuine custody writes.
+  @max_rename_actions_per_window 300
 
   @pub_key_cred_params [
     %{type: "public-key", alg: -7},
@@ -75,9 +93,58 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
   # Authenticator enrollment/revocation requires user role — agents must not
   # perform trust-tier operations.
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :user] when action in [:challenge, :create, :revoke_challenge, :delete]
+       [role: :user]
+       when action in [:index, :challenge, :create, :revoke_challenge, :delete, :rename]
 
   tags(["Tenants"])
+
+  operation(:index,
+    summary: "List a tenant's enrolled authenticators",
+    description:
+      "Returns the enrolled authenticators' ids and display labels — the handle " <>
+        "the rename (PATCH) and revoke (DELETE) endpoints key on. NO credential " <>
+        "material (credential_id, public_key) is ever returned; " <>
+        "`credential_fingerprint` is a truncated SHA-256 of the credential id, the " <>
+        "SAME value the audit chain records, and is the identifier to confirm " <>
+        "before revoking — `friendly_name` is rewritable by any bearer key with " <>
+        "user role, the fingerprint is not. Requires user role and tenant ownership.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    responses: %{
+      200 => {"Enrolled authenticators", "application/json", Schemas.AuthenticatorListResponse},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc """
+  GET /api/v1/tenants/:id/authenticators
+  """
+  def index(conn, %{"id" => tenant_id}) do
+    if owns_tenant?(conn, tenant_id) do
+      data =
+        tenant_id
+        |> RootAuthenticators.list_by_tenant()
+        |> Enum.map(
+          &%{
+            id: &1.id,
+            friendly_name: &1.friendly_name,
+            # An enumerable id plus an assertion-free rename means a stolen
+            # user-role key can relabel every device a tenant owns, and the label
+            # is what an operator steers a WebAuthn-gated revoke by. The
+            # fingerprint is derived from the credential and cannot be edited by
+            # any endpoint, so it — not the label — is the stable identity, and
+            # it matches the audit chain's enroll/rename/revoke entries.
+            credential_fingerprint: Tenants.fingerprint(&1.credential_id),
+            attestation_format: &1.attestation_format,
+            inserted_at: &1.inserted_at,
+            last_used_at: &1.last_used_at
+          }
+        )
+
+      conn |> put_status(:ok) |> json(%{data: data})
+    else
+      forbidden(conn)
+    end
+  end
 
   operation(:challenge,
     summary: "Issue a WebAuthn enrollment registration challenge",
@@ -230,6 +297,9 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
       {:error, :friendly_name_too_long} ->
         friendly_name_too_long(conn)
 
+      {:error, :friendly_name_invalid} ->
+        friendly_name_invalid(conn)
+
       {:error, :not_found} ->
         not_found(conn)
 
@@ -347,6 +417,7 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
 
         cond do
           trimmed == "" -> {:ok, "Authenticator"}
+          not String.valid?(trimmed) -> {:error, :friendly_name_invalid}
           byte_size(trimmed) > @max_friendly_name_bytes -> {:error, :friendly_name_too_long}
           true -> {:ok, trimmed}
         end
@@ -400,6 +471,12 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
 
       {:error, :too_many_authenticators} ->
         too_many_authenticators(conn)
+
+      {:error, :audit_failed} ->
+        internal_error(conn, "Failed to record the enrollment in the audit log")
+
+      {:error, :internal_error} ->
+        internal_error(conn, "Failed to enroll the authenticator")
 
       {:error, %Ecto.Changeset{} = changeset} ->
         changeset_error(conn, changeset)
@@ -522,6 +599,12 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
 
           {:error, :last_authenticator} ->
             last_authenticator(conn)
+
+          {:error, :audit_failed} ->
+            internal_error(conn, "Failed to record the revocation in the audit log")
+
+          {:error, :internal_error} ->
+            internal_error(conn, "Failed to revoke the authenticator")
         end
 
       {:error, _reason} ->
@@ -529,22 +612,149 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
     end
   end
 
+  operation(:rename,
+    summary: "Rename an enrolled authenticator",
+    description:
+      "Updates the operator-facing display label of an enrolled authenticator. " <>
+        "Requires user role and tenant ownership. Unlike revocation this needs NO " <>
+        "WebAuthn assertion: a rename is reversible, destroys nothing, and changes " <>
+        "no credential material — only `friendly_name` is writable. The change is " <>
+        "recorded in the append-only audit chain, stamped with the CALLING KEY " <>
+        "(actor_type api_key) and the old and new label. `friendly_name` is " <>
+        "trimmed, must be non-blank (422 friendly_name_blank), must be valid UTF-8 " <>
+        "(422 friendly_name_invalid) and is capped at #{@max_friendly_name_bytes} " <>
+        "bytes (422 friendly_name_too_long) — the same byte unit the schema " <>
+        "validates, so a multi-byte label is never accepted by one layer and " <>
+        "refused by the other.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Tenant UUID"],
+      auth_id: [in: :path, type: :string, description: "Authenticator UUID"]
+    ],
+    request_body:
+      {"Rename request", "application/json", Schemas.RenameAuthenticatorRequest, required: true},
+    responses: %{
+      200 => {"Authenticator renamed", "application/json", Schemas.RenameAuthenticatorResponse},
+      400 => {"Bad request", "application/json", Schemas.ErrorResponse},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation failed", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limited", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc """
+  PATCH /api/v1/tenants/:id/authenticators/:auth_id
+
+  Relabels an enrolled authenticator. Deliberately NOT behind the
+  `@max_enroll_actions_per_window` budget that the ceremony endpoints share:
+  that budget bounds CPU-bound WebAuthn verification, and spending one of a
+  tenant's 30 hourly enroll actions on a label edit could 429 an operator out
+  of their own enrollment ceremony. It gets its own, far looser per-tenant
+  bucket instead — every rename appends to the hash-chained audit log, whose
+  per-tenant append serializes against genuine custody writes, so "no
+  tenant-scoped ceiling at all" is not an option either.
+
+  `friendly_name` is TRIMMED before validation, mirroring the enroll path's
+  `friendly_name/1`, so the two write paths agree on what a label is.
+  """
+  def rename(conn, %{"id" => tenant_id, "auth_id" => auth_id} = params) do
+    raw = Map.get(params, "friendly_name")
+    friendly_name = if is_binary(raw), do: String.trim(raw), else: raw
+
+    cond do
+      not owns_tenant?(conn, tenant_id) ->
+        forbidden(conn)
+
+      not is_binary(friendly_name) ->
+        bad_request(conn, "friendly_name is required and must be a string")
+
+      friendly_name == "" ->
+        friendly_name_blank(conn)
+
+      # A urlencoded body can carry bytes that are not valid UTF-8 (the JSON
+      # parser rejects them first, that parser does not). Without this they reach
+      # the UPDATE, Postgres refuses the encoding, and hostile input gets a 500.
+      not String.valid?(friendly_name) ->
+        friendly_name_invalid(conn)
+
+      byte_size(friendly_name) > @max_friendly_name_bytes ->
+        friendly_name_too_long(conn)
+
+      true ->
+        do_rename(conn, tenant_id, auth_id, friendly_name)
+    end
+  end
+
+  defp do_rename(conn, tenant_id, auth_id, friendly_name) do
+    case check_rename_rate_limit(tenant_id) do
+      :ok ->
+        complete_rename(conn, tenant_id, auth_id, friendly_name)
+
+      # Names the RENAME bucket, not the ceremony one: rename has its own,
+      # far looser budget, so telling an operator their enrollment actions are
+      # spent would send them away from a ceremony that is still available.
+      {:error, :rate_limited} ->
+        rate_limited(conn, "Too many authenticator rename actions. Please try again later.")
+    end
+  end
+
+  defp complete_rename(conn, tenant_id, auth_id, friendly_name) do
+    case Enrollment.rename(tenant_id, auth_id, friendly_name, audit_actor(conn)) do
+      {:ok, auth} ->
+        conn
+        |> put_status(:ok)
+        |> json(%{
+          data: %{
+            tenant_id: tenant_id,
+            authenticator_id: auth.id,
+            friendly_name: auth.friendly_name
+          }
+        })
+
+      {:error, :not_found} ->
+        not_found(conn)
+
+      {:error, :audit_failed} ->
+        internal_error(conn, "Failed to record the rename in the audit log")
+
+      {:error, :internal_error} ->
+        internal_error(conn, "Failed to rename the authenticator")
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        changeset_error(conn, changeset)
+    end
+  end
+
   # --- Shared helpers ---
 
   defp check_rate_limit(tenant_id) do
-    bucket = "enroll:actions:#{tenant_id}"
+    gate("enroll:actions:#{tenant_id}", @max_enroll_actions_per_window)
+  end
 
+  defp check_rename_rate_limit(tenant_id) do
+    gate("rename:actions:#{tenant_id}", @max_rename_actions_per_window)
+  end
+
+  defp gate(bucket, max) do
     # FAIL-CLOSED anti-abuse gate (WebAuthn enroll/revoke is CPU-bound): on a
     # limiter fault deny rather than unlock the throttle. `gate_ok?/3` also
     # absorbs the behaviour's `{:error, _}` shape so a soft-error can't raise.
-    if Loopctl.RateLimiter.gate_ok?(
-         bucket,
-         @enroll_rate_window_ms,
-         @max_enroll_actions_per_window
-       ) do
+    if Loopctl.RateLimiter.gate_ok?(bucket, @enroll_rate_window_ms, max) do
       :ok
     else
       {:error, :rate_limited}
+    end
+  end
+
+  # Rename proves no device possession, so the acting key IS the evidence.
+  # Mirrors egress_controller.ex:420's audit-actor shape.
+  defp audit_actor(conn) do
+    case conn.assigns do
+      %{current_api_key: %{id: id, role: role, name: name}} ->
+        [actor_id: id, actor_label: "#{role}:#{name}"]
+
+      _ ->
+        []
     end
   end
 
@@ -565,16 +775,13 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
     conn |> put_status(:not_found) |> json(%{error: %{status: 404, message: "Not found"}})
   end
 
-  defp rate_limited(conn) do
+  defp rate_limited(
+         conn,
+         message \\ "Too many authenticator enrollment actions. Please try again later."
+       ) do
     conn
     |> put_status(:too_many_requests)
-    |> json(%{
-      error: %{
-        status: 429,
-        code: "rate_limited",
-        message: "Too many authenticator enrollment actions. Please try again later."
-      }
-    })
+    |> json(%{error: %{status: 429, code: "rate_limited", message: message}})
   end
 
   defp challenge_invalid(conn) do
@@ -616,6 +823,30 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
         status: 422,
         code: "friendly_name_too_long",
         message: "friendly_name must be at most #{@max_friendly_name_bytes} bytes"
+      }
+    })
+  end
+
+  defp friendly_name_invalid(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "friendly_name_invalid",
+        message: "friendly_name must be valid UTF-8"
+      }
+    })
+  end
+
+  defp friendly_name_blank(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "friendly_name_blank",
+        message: "friendly_name must not be blank"
       }
     })
   end

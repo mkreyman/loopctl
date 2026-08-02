@@ -58,12 +58,35 @@ defmodule Loopctl.Tenants.RootAuthenticator do
       :attestation_format,
       :friendly_name
     ])
-    |> validate_length(:friendly_name, min: 1, max: 120)
+    # count: :bytes, NOT the default grapheme count — the write paths
+    # (TenantAuthenticatorController, signup_live) cap the label with
+    # byte_size/1, and a grapheme-counting schema is looser than they are for
+    # every non-ASCII label, so the two layers would disagree on what "120"
+    # means. One unit, stated in bytes everywhere including the OpenAPI spec.
+    |> validate_length(:friendly_name, min: 1, max: 120, count: :bytes)
     |> validate_length(:attestation_format, min: 1, max: 32)
     |> validate_number(:sign_count, greater_than_or_equal_to: 0)
     |> unique_constraint(:credential_id,
       name: :tenant_root_authenticators_tenant_id_credential_id_index
     )
+  end
+
+  @doc """
+  Changeset for relabelling an enrolled authenticator.
+
+  Casts ONLY `friendly_name`. The credential material (`credential_id`,
+  `public_key`, `attestation_format`) and the clone-detection counter are
+  deliberately outside this changeset: a rename is a display-label edit, and
+  routing it through `create_changeset/2` would put a live rename endpoint one
+  forgotten `Map.take/2` away from letting a caller swap the credential a
+  tenant's root of trust hangs on.
+  """
+  @spec rename_changeset(t(), map()) :: Ecto.Changeset.t()
+  def rename_changeset(%__MODULE__{} = authenticator, attrs) do
+    authenticator
+    |> cast(attrs, [:friendly_name])
+    |> validate_required([:friendly_name])
+    |> validate_length(:friendly_name, min: 1, max: 120, count: :bytes)
   end
 
   @doc """

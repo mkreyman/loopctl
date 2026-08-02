@@ -814,7 +814,9 @@ defmodule Loopctl.ApiSpec.Schemas do
         credential_id: %Schema{type: :string, description: "Base64url credential id"},
         friendly_name: %Schema{
           type: :string,
-          description: "Operator-supplied label (1..120 chars, default \"Authenticator\")"
+          description:
+            "Operator-supplied label (1..120 BYTES — the same unit the schema " <>
+              "validates — default \"Authenticator\")"
         },
         reauth_assertion: WebAuthnAssertion
       }
@@ -897,6 +899,90 @@ defmodule Loopctl.ApiSpec.Schemas do
             tenant_id: %Schema{type: :string, format: :uuid},
             authenticator_id: %Schema{type: :string, format: :uuid},
             revoked: %Schema{type: :boolean}
+          }
+        }
+      }
+    })
+  end
+
+  defmodule AuthenticatorListResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "AuthenticatorListResponse",
+      description:
+        "The tenant's enrolled authenticators. Credential material " <>
+          "(credential_id, public_key) is deliberately never returned — only the " <>
+          "non-reversible credential_fingerprint.",
+      type: :object,
+      required: [:data],
+      properties: %{
+        data: %Schema{
+          type: :array,
+          items: %Schema{
+            type: :object,
+            properties: %{
+              id: %Schema{type: :string, format: :uuid},
+              friendly_name: %Schema{type: :string},
+              credential_fingerprint: %Schema{
+                type: :string,
+                description:
+                  "Truncated SHA-256 of the credential id, as recorded in the audit " <>
+                    "chain. Credential-derived and not writable by any endpoint, unlike " <>
+                    "friendly_name — confirm a revocation target against this."
+              },
+              attestation_format: %Schema{type: :string},
+              inserted_at: %Schema{type: :string, format: :"date-time"},
+              last_used_at: %Schema{type: :string, format: :"date-time", nullable: true}
+            }
+          }
+        }
+      }
+    })
+  end
+
+  defmodule RenameAuthenticatorRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RenameAuthenticatorRequest",
+      description:
+        "Request body for relabelling an enrolled authenticator. Only the display " <>
+          "label is writable — credential material cannot be changed by this endpoint.",
+      type: :object,
+      required: [:friendly_name],
+      properties: %{
+        friendly_name: %Schema{
+          type: :string,
+          description:
+            "New operator-facing label. Capped at 120 bytes (the same unit the schema " <>
+              "validates); an over-long value is rejected with 422 " <>
+              "friendly_name_too_long, a non-UTF-8 one with 422 friendly_name_invalid.",
+          minLength: 1,
+          example: "mac-mini Touch ID"
+        }
+      }
+    })
+  end
+
+  defmodule RenameAuthenticatorResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RenameAuthenticatorResponse",
+      description: "Result of a successful authenticator rename.",
+      type: :object,
+      required: [:data],
+      properties: %{
+        data: %Schema{
+          type: :object,
+          properties: %{
+            tenant_id: %Schema{type: :string, format: :uuid},
+            authenticator_id: %Schema{type: :string, format: :uuid},
+            friendly_name: %Schema{type: :string}
           }
         }
       }

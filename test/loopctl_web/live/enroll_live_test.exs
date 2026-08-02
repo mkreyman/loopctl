@@ -8,8 +8,8 @@ defmodule LoopctlWeb.EnrollLiveTest do
   for, is the set of structural properties that make that split safe:
 
     * the page reaches an unauthenticated visitor at all;
-    * it cannot receive the operator's API key, because it handles no
-      events;
+    * it cannot receive the operator's API key, because its only event
+      handler is a terminal no-op;
     * it cannot leak the key into a URL, because it has no form;
     * the hook that does the work is actually wired into the bundle; and
     * the hook takes the WebAuthn user handle from the server rather than
@@ -28,8 +28,18 @@ defmodule LoopctlWeb.EnrollLiveTest do
 
   @hook_path "assets/js/hooks/authenticator_enroll.js"
   @app_js_path "assets/js/app.js"
+  @live_path "lib/loopctl_web/live/enroll_live.ex"
 
   setup :verify_on_exit!
+
+  # `:__changed__` is render bookkeeping, not retained state.
+  defp socket_assigns(view) do
+    view.pid
+    |> :sys.get_state()
+    |> Map.fetch!(:socket)
+    |> Map.fetch!(:assigns)
+    |> Map.delete(:__changed__)
+  end
 
   describe "GET /enroll" do
     test "renders unauthenticated, with the ceremony controls", %{conn: conn} do
@@ -41,6 +51,59 @@ defmodule LoopctlWeb.EnrollLiveTest do
       assert html =~ ~s(id="enroll-submit")
       assert html =~ ~s(id="enroll-status")
       assert html =~ ~s(id="enroll-result")
+    end
+
+    test "explains the PHYSICAL action, naming all three authenticator kinds", %{conn: conn} do
+      # The first version of this page described the trust-tier semantics and
+      # never said what the operator would be asked to DO, which sent a real
+      # operator looking for a QR code that loopctl does not issue. Each of the
+      # three device classes behaves differently enough that omitting one
+      # strands whoever is on that hardware.
+      {:ok, _view, html} = live(conn, ~p"/enroll")
+
+      assert html =~ "Touch ID"
+      assert html =~ "Windows Hello"
+      assert html =~ "QR code"
+      assert html =~ "YubiKey"
+
+      # The QR path silently fails without Bluetooth on both ends, and that is
+      # invisible in the browser's own dialog.
+      assert html =~ "Bluetooth"
+
+      # Name-the-device guidance: a label naming the PERSON becomes a
+      # revoke-the-wrong-device trap once a backup is enrolled.
+      assert html =~ "Name it after the DEVICE"
+    end
+
+    test "body copy is not rendered at the failing slate-500 contrast", %{conn: conn} do
+      # slate-500 on this page's near-black panels measures ~4.3:1, under the
+      # 4.5:1 WCAG AA floor, and it was previously paired with text-xs for the
+      # whole instructions block. Placeholder text is exempt (it is not content).
+      {:ok, _view, html} = live(conn, ~p"/enroll")
+
+      offenders =
+        html
+        |> String.split(~r/\s+/)
+        |> Enum.filter(&(&1 =~ "slate-500" and not (&1 =~ "placeholder:")))
+
+      assert offenders == [], "low-contrast slate-500 body text on /enroll: #{inspect(offenders)}"
+
+      # The rendered HTML is only HALF the page. Everything the operator reads
+      # DURING and AFTER the ceremony — the status line, the result panel, the
+      # per-surface capability rows — is written by the hook at runtime and
+      # never passes through this render, so a scan of `html` alone would
+      # report a clean page while the ceremony's own output stayed unreadable.
+      # That is exactly the state this test shipped in until the review caught
+      # it. Scan the hook source too.
+      hook_offenders =
+        @hook_path
+        |> File.read!()
+        |> String.split(~r/\s+/)
+        |> Enum.filter(&(&1 =~ "slate-500"))
+
+      assert hook_offenders == [],
+             "low-contrast slate-500 injected at runtime by #{@hook_path}: " <>
+               inspect(hook_offenders)
     end
 
     test "mounts the AuthenticatorEnroll hook and lets it own its DOM", %{conn: conn} do
@@ -81,16 +144,42 @@ defmodule LoopctlWeb.EnrollLiveTest do
   end
 
   describe "the LiveView cannot receive the API key" do
-    test "EnrollLive defines no handle_event/3 at all" do
-      Code.ensure_loaded!(LoopctlWeb.EnrollLive)
-
+    test "its only handle_event/3 is a terminal no-op that stores nothing", %{conn: conn} do
       # This is the whole security argument for the page's shape, expressed as
-      # a property rather than a comment: with no event handler, there is no
-      # path by which a pasted credential reaches socket assigns, Phoenix's
-      # event parameter logging, a crash dump, or telemetry. If a future change
-      # adds an event handler, this test fails and that argument has to be
-      # re-made deliberately rather than eroded by accident.
-      refute function_exported?(LoopctlWeb.EnrollLive, :handle_event, 3)
+      # a property rather than a comment: no event handler RETAINS anything, so
+      # there is no path by which a pasted credential reaches socket assigns,
+      # Phoenix's event parameter logging, a crash dump, or telemetry.
+      #
+      # It is a no-op rather than ABSENT because /enroll is public and outside
+      # any authenticated pipeline: with no clause at all, LiveView raises on
+      # any pushed frame and a visitor can kill the channel process at will
+      # (the same hardening SignupLive already carries).
+      {:ok, view, _html} = live(conn, ~p"/enroll")
+      assigns_before = socket_assigns(view)
+
+      # Survives the frame (no FunctionClauseError killing the channel)...
+      assert render_hook(view, "junk", %{"api_key" => "lc_user_leaked_secret"}) =~
+               ~s(id="enroll-page")
+
+      assert Process.alive?(view.pid)
+
+      # ...and retained nothing from it. Asserted on the ASSIGNS, not the
+      # rendered HTML: assigns are what reaches a crash dump and telemetry, and
+      # a handler that stashes the key without rendering it leaks just as badly.
+      assert socket_assigns(view) == assigns_before
+
+      # A pushed frame can only exercise the event names it names. The property
+      # the page's security argument actually rests on — the one the deleted
+      # `refute function_exported?(EnrollLive, :handle_event, 3)` guard covered —
+      # is that there is EXACTLY ONE clause and it binds nothing. A future
+      # `handle_event("submit", params, socket)` added above the catch-all would
+      # pass every runtime assertion here.
+      source = File.read!(@live_path)
+
+      assert length(Regex.scan(~r/^\s*def handle_event\(/m, source)) == 1,
+             "EnrollLive must have exactly one handle_event/3 clause: the terminal no-op"
+
+      assert source =~ "def handle_event(_event, _params, socket), do: {:noreply, socket}"
     end
 
     test "the hook never pushes anything over the LiveView socket" do

@@ -622,6 +622,395 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
     end
   end
 
+  describe "GET /api/v1/tenants/:id/authenticators — index" do
+    test "lists ids and labels, and never credential material", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+
+      auth =
+        fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "mac-mini Touch ID")
+
+      [row] =
+        conn
+        |> authed(raw_key)
+        |> get(~p"/api/v1/tenants/#{tenant.id}/authenticators")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      # The id is the ONLY handle rename/revoke key on, and a browser ceremony
+      # discards the 201 body — this endpoint is how an operator gets it back.
+      assert row["id"] == auth.id
+      assert row["friendly_name"] == "mac-mini Touch ID"
+      refute Map.has_key?(row, "credential_id")
+      refute Map.has_key?(row, "public_key")
+
+      # Enumerable ids + an assertion-free rename mean a stolen user-role key can
+      # relabel every device a tenant owns, and the label is what an operator
+      # steers a WebAuthn-gated revoke by. The fingerprint is credential-derived,
+      # no endpoint writes it, and it is the same value the audit chain records —
+      # so a mislabel cannot make the wrong credential look like the right one.
+      assert row["credential_fingerprint"] == Tenants.fingerprint(auth.credential_id)
+    end
+
+    test "403s a caller addressing a tenant it does not own", %{conn: conn} do
+      tenant_a = fixture(:tenant, %{trust_tier: :human_anchored})
+      tenant_b = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant_a.id, role: :user)
+      fixture(:root_authenticator, tenant_id: tenant_b.id)
+
+      assert conn
+             |> authed(raw_key)
+             |> get(~p"/api/v1/tenants/#{tenant_b.id}/authenticators")
+             |> json_response(403)
+    end
+
+    test "403s an agent-role key", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :agent)
+
+      assert conn
+             |> authed(raw_key)
+             |> get(~p"/api/v1/tenants/#{tenant.id}/authenticators")
+             |> json_response(403)
+    end
+  end
+
+  describe "PATCH /api/v1/tenants/:id/authenticators/:auth_id — rename" do
+    test "renames an enrolled authenticator and leaves credential material untouched", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "Mark's phone")
+
+      body =
+        conn
+        |> authed(raw_key)
+        |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+          "friendly_name" => "mac-mini Touch ID"
+        })
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      assert body["friendly_name"] == "mac-mini Touch ID"
+      assert body["authenticator_id"] == auth.id
+
+      reloaded = AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id)
+      assert reloaded.friendly_name == "mac-mini Touch ID"
+
+      # The whole point of a dedicated rename_changeset: a rename must not be a
+      # vector for swapping the credential the root of trust hangs on.
+      assert reloaded.credential_id == auth.credential_id
+      assert reloaded.public_key == auth.public_key
+      assert reloaded.attestation_format == auth.attestation_format
+      assert reloaded.sign_count == auth.sign_count
+    end
+
+    test "ignores credential fields even when a caller supplies them", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id)
+
+      conn
+      |> authed(raw_key)
+      |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+        "friendly_name" => "renamed",
+        "credential_id" => Base.url_encode64("attacker-credential", padding: false),
+        "public_key" => Base.url_encode64("attacker-key", padding: false),
+        "sign_count" => 999_999
+      })
+      |> json_response(200)
+
+      reloaded = AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id)
+      assert reloaded.friendly_name == "renamed"
+      assert reloaded.credential_id == auth.credential_id
+      assert reloaded.public_key == auth.public_key
+      assert reloaded.sign_count == auth.sign_count
+    end
+
+    test "records the rename in the audit log with the acting key and both labels", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, key} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "old label")
+
+      conn
+      |> authed(raw_key)
+      |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+        "friendly_name" => "new label"
+      })
+      |> json_response(200)
+
+      {:ok, %{data: events}} = Audit.list_entries(tenant.id, entity_type: "tenant")
+      entry = Enum.find(events, &(&1.action == "authenticator_renamed"))
+
+      assert entry, "expected an authenticator_renamed audit event"
+      assert entry.old_state["friendly_name"] == "old label"
+      assert entry.new_state["friendly_name"] == "new label"
+
+      # Rename proves NO device possession (unlike enroll/revoke), so the acting
+      # key is the only evidence there is — stamping it "human" with a nil
+      # actor_id would assert a presence nothing verified and leave every
+      # relabel indistinguishable from every other.
+      assert entry.actor_type == "api_key"
+      assert entry.actor_id == key.id
+      assert entry.actor_label == "user:#{key.name}"
+    end
+
+    test "rejects a friendly_name over the byte cap with 422", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "keep me")
+
+      response =
+        conn
+        |> authed(raw_key)
+        |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+          "friendly_name" => String.duplicate("x", 121)
+        })
+        |> json_response(422)
+
+      assert response["error"]["code"] == "friendly_name_too_long"
+      assert AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id).friendly_name == "keep me"
+    end
+
+    test "rejects a missing or non-string friendly_name with 400", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id)
+      client = authed(conn, raw_key)
+
+      assert client
+             |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{})
+             |> json_response(400)
+
+      assert client
+             |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+               "friendly_name" => 42
+             })
+             |> json_response(400)
+    end
+
+    test "trims the label, and rejects a blank or whitespace-only one with 422", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "keep me")
+      client = authed(conn, raw_key)
+
+      # Whitespace-only clears validate_length(min: 1) on byte count alone, so
+      # without the trim it persists a blank-LOOKING label — and the label is
+      # the only thing distinguishing devices at revoke time.
+      for blank <- ["", "   ", "\n\n"] do
+        assert client
+               |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+                 "friendly_name" => blank
+               })
+               |> json_response(422)
+      end
+
+      assert AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id).friendly_name == "keep me"
+
+      # Matching the enroll path's friendly_name/1, padding is stripped rather
+      # than persisted verbatim.
+      client
+      |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+        "friendly_name" => "  mac-mini  "
+      })
+      |> json_response(200)
+
+      assert AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id).friendly_name ==
+               "mac-mini"
+    end
+
+    test "rejects a non-UTF-8 friendly_name with 422 instead of 500ing on the UPDATE",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "keep me")
+
+      # A urlencoded body can carry bytes the JSON parser would have refused.
+      # Without the validity check these reach Postgres, which rejects the
+      # encoding — hostile input then gets an unstructured 500.
+      response =
+        conn
+        |> authed(raw_key)
+        |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+          "friendly_name" => <<0xFF, 0xFE>>
+        })
+        |> json_response(422)
+
+      assert response["error"]["code"] == "friendly_name_invalid"
+      assert AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id).friendly_name == "keep me"
+    end
+
+    test "renaming to the CURRENT label still touches the row", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "same label")
+
+      conn
+      |> authed(raw_key)
+      |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+        "friendly_name" => "same label"
+      })
+      |> json_response(200)
+
+      # A no-change changeset makes Ecto skip the UPDATE entirely and return
+      # {:ok, struct} — so Ecto.StaleEntryError could never fire, and a rename
+      # racing a revoke would 200 (and append an audit entry) for a row that no
+      # longer exists. `force: true` is what keeps that guard live; a bumped
+      # updated_at is the observable proof the statement was issued.
+      assert DateTime.compare(
+               AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id).updated_at,
+               auth.updated_at
+             ) == :gt
+    end
+
+    test "429s with the RENAME bucket named, not the enrollment budget", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id)
+
+      # Deny ONLY the controller's own rename bucket, so the inbound RPM plug
+      # still lets the request through to the action under test.
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "rename:actions:" <> _tenant, _window, _limit -> {:deny, 0}
+        _bucket, _window, _limit -> {:allow, 1}
+      end)
+
+      response =
+        conn
+        |> authed(raw_key)
+        |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+          "friendly_name" => "throttled"
+        })
+        |> json_response(429)
+
+      assert response["error"]["code"] == "rate_limited"
+
+      # Rename has its own far looser budget; reporting the ceremony budget as
+      # spent would send an operator away from an enrollment still available.
+      assert response["error"]["message"] =~ "rename"
+      refute response["error"]["message"] =~ "enrollment"
+    end
+
+    test "404s a malformed auth_id instead of raising Ecto.Query.CastError", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+
+      assert conn
+             |> authed(raw_key)
+             |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/not-a-uuid", %{
+               "friendly_name" => "x"
+             })
+             |> json_response(404)
+    end
+
+    test "404s an authenticator id that does not exist", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+
+      conn
+      |> authed(raw_key)
+      |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{Ecto.UUID.generate()}", %{
+        "friendly_name" => "nope"
+      })
+      |> json_response(404)
+    end
+
+    test "cannot rename another tenant's authenticator", %{conn: conn} do
+      tenant_a = fixture(:tenant, %{trust_tier: :human_anchored})
+      tenant_b = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant_a.id, role: :user)
+      victim = fixture(:root_authenticator, tenant_id: tenant_b.id, friendly_name: "b device")
+
+      # Addressed under tenant A's own path, so owns_tenant? passes and the
+      # tenant-scoped lookup is what has to refuse it.
+      conn
+      |> authed(raw_key)
+      |> patch(~p"/api/v1/tenants/#{tenant_a.id}/authenticators/#{victim.id}", %{
+        "friendly_name" => "hijacked"
+      })
+      |> json_response(404)
+
+      assert AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, victim.id).friendly_name ==
+               "b device"
+    end
+
+    test "403s a caller addressing a tenant it does not own", %{conn: conn} do
+      tenant_a = fixture(:tenant, %{trust_tier: :human_anchored})
+      tenant_b = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant_a.id, role: :user)
+      victim = fixture(:root_authenticator, tenant_id: tenant_b.id, friendly_name: "b device")
+
+      conn
+      |> authed(raw_key)
+      |> patch(~p"/api/v1/tenants/#{tenant_b.id}/authenticators/#{victim.id}", %{
+        "friendly_name" => "hijacked"
+      })
+      |> json_response(403)
+
+      assert AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, victim.id).friendly_name ==
+               "b device"
+    end
+
+    test "403s an agent-role key — trust-tier operations are not delegable", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :agent)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "keep me")
+
+      conn
+      |> authed(raw_key)
+      |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+        "friendly_name" => "agent rename"
+      })
+      |> json_response(403)
+
+      assert AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id).friendly_name == "keep me"
+    end
+
+    test "is unreachable for an agent-rooted tenant — the human-anchor exemption's premise",
+         %{conn: conn} do
+      # require_human_anchor_default_deny_test.exs exempts this route from the
+      # tier gate on the grounds that an agent-rooted tenant has ZERO
+      # authenticators by construction, so there is nothing for it to rename.
+      # Guard that premise behaviourally: if a downgrade path is ever added,
+      # this fails and the exemption has to be revisited rather than silently
+      # becoming a hole.
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+
+      assert RootAuthenticators.count_by_tenant(tenant.id) == 0
+
+      conn
+      |> authed(raw_key)
+      |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{Ecto.UUID.generate()}", %{
+        "friendly_name" => "nothing to rename"
+      })
+      |> json_response(404)
+    end
+
+    test "needs NO WebAuthn assertion, unlike revoke", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id)
+
+      # DELETE on the same resource demands an assertion; PATCH deliberately
+      # does not. Assert the contrast so a future change that adds a reauth gate
+      # to rename (or drops it from revoke) has to come here and say so.
+      assert conn
+             |> authed(raw_key)
+             |> delete(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}")
+             |> json_response(401)
+
+      assert conn
+             |> authed(raw_key)
+             |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+               "friendly_name" => "no touch needed"
+             })
+             |> json_response(200)
+    end
+  end
+
   # review #1 regression — the residual double-first-enroll race: two concurrent
   # first-enrollments on an agent_rooted tenant must result in EXACTLY ONE 201
   # (flip to human_anchored + enroll) with the loser rejected :reauth_required by
