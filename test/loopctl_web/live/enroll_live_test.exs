@@ -43,6 +43,42 @@ defmodule LoopctlWeb.EnrollLiveTest do
       assert html =~ ~s(id="enroll-result")
     end
 
+    test "explains the PHYSICAL action, naming all three authenticator kinds", %{conn: conn} do
+      # The first version of this page described the trust-tier semantics and
+      # never said what the operator would be asked to DO, which sent a real
+      # operator looking for a QR code that loopctl does not issue. Each of the
+      # three device classes behaves differently enough that omitting one
+      # strands whoever is on that hardware.
+      {:ok, _view, html} = live(conn, ~p"/enroll")
+
+      assert html =~ "Touch ID"
+      assert html =~ "Windows Hello"
+      assert html =~ "QR code"
+      assert html =~ "YubiKey"
+
+      # The QR path silently fails without Bluetooth on both ends, and that is
+      # invisible in the browser's own dialog.
+      assert html =~ "Bluetooth"
+
+      # Name-the-device guidance: a label naming the PERSON becomes a
+      # revoke-the-wrong-device trap once a backup is enrolled.
+      assert html =~ "Name it after the DEVICE"
+    end
+
+    test "body copy is not rendered at the failing slate-500 contrast", %{conn: conn} do
+      # slate-500 on this page's near-black panels measures ~4.3:1, under the
+      # 4.5:1 WCAG AA floor, and it was previously paired with text-xs for the
+      # whole instructions block. Placeholder text is exempt (it is not content).
+      {:ok, _view, html} = live(conn, ~p"/enroll")
+
+      offenders =
+        html
+        |> String.split(~r/\s+/)
+        |> Enum.filter(&(&1 =~ "slate-500" and not (&1 =~ "placeholder:")))
+
+      assert offenders == [], "low-contrast slate-500 body text on /enroll: #{inspect(offenders)}"
+    end
+
     test "mounts the AuthenticatorEnroll hook and lets it own its DOM", %{conn: conn} do
       {:ok, view, _html} = live(conn, ~p"/enroll")
 

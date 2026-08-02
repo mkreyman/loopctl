@@ -83,6 +83,19 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/tenants/:id/authenticators"},
                {:post, "/api/v1/tenants/:id/authenticators/revoke-challenge"},
                {:delete, "/api/v1/tenants/:id/authenticators/:auth_id"},
+               # PATCH (rename) is UNREACHABLE for an agent-rooted tenant rather
+               # than under-gated: such a tenant has ZERO authenticators BY
+               # CONSTRUCTION, so the tenant-scoped lookup 404s and there is no
+               # state for the tier gate to protect. The only production writes
+               # to `trust_tier` are the one-way `agent_rooted -> human_anchored`
+               # flip inside the enroll transaction (`Enrollment.enroll/3`, via
+               # `flip_query/1`) and the `:agent_rooted` default stamped at
+               # self-signup (`Tenant.self_signup_changeset/2`) — there is no
+               # downgrade path, and `revoke/2` refuses the last authenticator on
+               # a human_anchored tenant rather than auto-downgrading. If a
+               # downgrade is ever introduced, this exemption stops being sound
+               # and the route must move behind the tier gate.
+               {:patch, "/api/v1/tenants/:id/authenticators/:auth_id"},
 
                # /api_keys management — explicitly excluded (AC-26.7.1.7).
                {:post, "/api/v1/api_keys"},

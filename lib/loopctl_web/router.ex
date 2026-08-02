@@ -301,6 +301,7 @@ defmodule LoopctlWeb.Router do
          :revoke_challenge
 
     delete "/tenants/:id/authenticators/:auth_id", TenantAuthenticatorController, :delete
+    patch "/tenants/:id/authenticators/:auth_id", TenantAuthenticatorController, :rename
 
     # US-26.2.1 — Dispatch lineage
     # LCP-1 §9.1.1 — transparency read of enrolled agent keys (before :show so it

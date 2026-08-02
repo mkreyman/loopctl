@@ -232,6 +232,69 @@ defmodule Loopctl.Tenants.Enrollment do
     end
   end
 
+  @doc """
+  Renames an enrolled authenticator's operator-facing label.
+
+  Deliberately does NOT take the tenant `FOR UPDATE` lock that `enroll/3` and
+  `revoke/2` share. That lock exists to serialize mutations that can violate an
+  invariant — the per-tenant authenticator cap, the trust-tier flip, and the
+  last-authenticator guard. A rename touches none of them: it cannot change how
+  many authenticators a tenant has, nor its tier, so the worst outcome of two
+  concurrent renames is last-write-wins on a display string. Taking the tenant
+  lock anyway would let a label edit block an in-flight enrollment ceremony.
+
+  No reauth assertion is required either, unlike `revoke/2`. A rename is
+  reversible, destroys nothing, and is already bounded by the `user` role gate
+  and the human-anchor tier gate; demanding a touch would price a typo fix at
+  the same cost as destroying a root-of-trust credential. The change is still
+  recorded in the append-only audit chain with both the old and new label.
+  """
+  @spec rename(Ecto.UUID.t(), Ecto.UUID.t(), String.t()) ::
+          {:ok, RootAuthenticator.t()}
+          | {:error, :not_found}
+          | {:error, Ecto.Changeset.t()}
+  def rename(tenant_id, authenticator_id, friendly_name)
+      when is_binary(tenant_id) and is_binary(authenticator_id) and is_binary(friendly_name) do
+    multi =
+      Multi.new()
+      |> Multi.run(:target, fn repo, _changes ->
+        find_authenticator(repo, tenant_id, authenticator_id)
+      end)
+      |> Multi.update(:renamed, fn %{target: auth} ->
+        RootAuthenticator.rename_changeset(auth, %{friendly_name: friendly_name})
+      end)
+      |> Audit.log_in_multi(:audit, fn %{target: old, renamed: auth} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "tenant",
+          entity_id: tenant_id,
+          action: "authenticator_renamed",
+          actor_type: "human",
+          actor_id: nil,
+          actor_label: "human:api",
+          old_state: %{
+            "authenticator_fingerprint" => Tenants.fingerprint(old.credential_id),
+            "friendly_name" => old.friendly_name
+          },
+          new_state: %{"friendly_name" => auth.friendly_name}
+        }
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{renamed: auth}} ->
+        {:ok, auth}
+
+      {:error, :target, :not_found, _changes} ->
+        {:error, :not_found}
+
+      {:error, :renamed, %Ecto.Changeset{} = changeset, _changes} ->
+        {:error, changeset}
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
+    end
+  end
+
   # Locks the tenant row for the duration of the enclosing transaction —
   # the single mechanism serializing every authenticator mutation
   # (enroll AND revoke) for this tenant, including the zero-row first-enroll

@@ -903,6 +903,52 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule RenameAuthenticatorRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RenameAuthenticatorRequest",
+      description:
+        "Request body for relabelling an enrolled authenticator. Only the display " <>
+          "label is writable — credential material cannot be changed by this endpoint.",
+      type: :object,
+      required: [:friendly_name],
+      properties: %{
+        friendly_name: %Schema{
+          type: :string,
+          description:
+            "New operator-facing label. Capped at 120 bytes; an over-long value is " <>
+              "rejected with 422 friendly_name_too_long.",
+          minLength: 1,
+          example: "mac-mini Touch ID"
+        }
+      }
+    })
+  end
+
+  defmodule RenameAuthenticatorResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RenameAuthenticatorResponse",
+      description: "Result of a successful authenticator rename.",
+      type: :object,
+      required: [:data],
+      properties: %{
+        data: %Schema{
+          type: :object,
+          properties: %{
+            tenant_id: %Schema{type: :string, format: :uuid},
+            authenticator_id: %Schema{type: :string, format: :uuid},
+            friendly_name: %Schema{type: :string}
+          }
+        }
+      }
+    })
+  end
+
   # ---------- API Keys ----------
 
   defmodule ApiKeyCreateRequest do

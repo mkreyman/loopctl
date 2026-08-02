@@ -67,6 +67,24 @@ defmodule Loopctl.Tenants.RootAuthenticator do
   end
 
   @doc """
+  Changeset for relabelling an enrolled authenticator.
+
+  Casts ONLY `friendly_name`. The credential material (`credential_id`,
+  `public_key`, `attestation_format`) and the clone-detection counter are
+  deliberately outside this changeset: a rename is a display-label edit, and
+  routing it through `create_changeset/2` would put a live rename endpoint one
+  forgotten `Map.take/2` away from letting a caller swap the credential a
+  tenant's root of trust hangs on.
+  """
+  @spec rename_changeset(t(), map()) :: Ecto.Changeset.t()
+  def rename_changeset(%__MODULE__{} = authenticator, attrs) do
+    authenticator
+    |> cast(attrs, [:friendly_name])
+    |> validate_required([:friendly_name])
+    |> validate_length(:friendly_name, min: 1, max: 120)
+  end
+
+  @doc """
   Changeset for bumping the sign counter after a successful assertion.
   """
   @spec touch_changeset(t(), non_neg_integer()) :: Ecto.Changeset.t()

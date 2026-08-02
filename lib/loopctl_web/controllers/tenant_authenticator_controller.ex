@@ -75,7 +75,7 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
   # Authenticator enrollment/revocation requires user role — agents must not
   # perform trust-tier operations.
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :user] when action in [:challenge, :create, :revoke_challenge, :delete]
+       [role: :user] when action in [:challenge, :create, :revoke_challenge, :delete, :rename]
 
   tags(["Tenants"])
 
@@ -526,6 +526,78 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
 
       {:error, _reason} ->
         unauthorized(conn, "webauthn_failed", "WebAuthn assertion verification failed")
+    end
+  end
+
+  operation(:rename,
+    summary: "Rename an enrolled authenticator",
+    description:
+      "Updates the operator-facing display label of an enrolled authenticator. " <>
+        "Requires user role and tenant ownership. Unlike revocation this needs NO " <>
+        "WebAuthn assertion: a rename is reversible, destroys nothing, and changes " <>
+        "no credential material — only `friendly_name` is writable. The change is " <>
+        "recorded in the append-only audit chain with the old and new label. " <>
+        "`friendly_name` is capped at #{@max_friendly_name_bytes} bytes.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Tenant UUID"],
+      auth_id: [in: :path, type: :string, description: "Authenticator UUID"]
+    ],
+    request_body:
+      {"Rename request", "application/json", Schemas.RenameAuthenticatorRequest, required: true},
+    responses: %{
+      200 => {"Authenticator renamed", "application/json", Schemas.RenameAuthenticatorResponse},
+      400 => {"Bad request", "application/json", Schemas.ErrorResponse},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation failed", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc """
+  PATCH /api/v1/tenants/:id/authenticators/:auth_id
+
+  Relabels an enrolled authenticator. Deliberately NOT behind the
+  `@max_enroll_actions_per_window` budget that the ceremony endpoints share:
+  that budget bounds CPU-bound WebAuthn verification, and spending one of a
+  tenant's 30 hourly enroll actions on a label edit could 429 an operator out
+  of their own enrollment ceremony. The blanket `RateLimiter` plug still applies.
+  """
+  def rename(conn, %{"id" => tenant_id, "auth_id" => auth_id} = params) do
+    friendly_name = Map.get(params, "friendly_name")
+
+    cond do
+      not owns_tenant?(conn, tenant_id) ->
+        forbidden(conn)
+
+      not is_binary(friendly_name) ->
+        bad_request(conn, "friendly_name is required and must be a string")
+
+      byte_size(friendly_name) > @max_friendly_name_bytes ->
+        friendly_name_too_long(conn)
+
+      true ->
+        do_rename(conn, tenant_id, auth_id, friendly_name)
+    end
+  end
+
+  defp do_rename(conn, tenant_id, auth_id, friendly_name) do
+    case Enrollment.rename(tenant_id, auth_id, friendly_name) do
+      {:ok, auth} ->
+        conn
+        |> put_status(:ok)
+        |> json(%{
+          data: %{
+            tenant_id: tenant_id,
+            authenticator_id: auth.id,
+            friendly_name: auth.friendly_name
+          }
+        })
+
+      {:error, :not_found} ->
+        not_found(conn)
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        changeset_error(conn, changeset)
     end
   end
 
