@@ -11,6 +11,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.BulkDeleteToken
   alias Loopctl.Knowledge.BulkOps
+  alias Loopctl.LocalGuc
 
   defp audit_opts do
     [actor_type: "api_key", actor_id: Ecto.UUID.generate(), actor_label: "user:tester"]
@@ -48,6 +49,20 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       :ok
     end
 
+    test "the key above is the one LocalGuc actually pushes to" do
+      # `@active_names_key` duplicates a PRIVATE `LocalGuc` detail, which is how a guard test
+      # goes vacuous: seed and read one unrelated key and every assertion below holds
+      # trivially while the accounting it guards goes unverified. Bind the literal to the
+      # real thing — a real capture must land under it — so a rename fails HERE, loudly,
+      # instead of quietly neutering the two tests that follow.
+      AdminRepo.transaction(fn ->
+        prior = LocalGuc.capture(AdminRepo, ["statement_timeout"])
+        assert owned_names() == ["statement_timeout"]
+        LocalGuc.restore(AdminRepo, prior)
+        assert owned_names() == []
+      end)
+    end
+
     test "a SUCCEEDING bulk op leaves an enclosing scope's ownership intact" do
       tenant = fixture(:tenant)
       fixture(:article, tenant_id: tenant.id, tags: ["ownership"], status: :published)
@@ -76,6 +91,24 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
 
       assert owned_names() == ["statement_timeout"],
              "a failed bulk op must release exactly its own entry, no more and no fewer"
+    end
+
+    test "a bulk op that RAISES outside the rescued DB structs still releases its own entry" do
+      tenant = fixture(:tenant)
+      fixture(:article, tenant_id: tenant.id, tags: ["ownership"], status: :published)
+
+      enclosing_owner(["statement_timeout"])
+
+      # A non-keyword `audit_opts` raises `FunctionClauseError` inside the audit step's
+      # changeset fun — an exception neither `rescue` clause names, so it unwinds straight
+      # out of `run_multi/2`. Only an `after` runs on that path; a try/rescue over two DB
+      # structs leaves this call's entry behind for whatever the process serves next.
+      assert_raise FunctionClauseError, fn ->
+        BulkOps.archive(tenant.id, {:tag, "ownership"}, %{actor_type: "api_key"})
+      end
+
+      assert owned_names() == ["statement_timeout"],
+             "a raising bulk op leaked its LocalGuc ownership entry onto this process"
     end
   end
 

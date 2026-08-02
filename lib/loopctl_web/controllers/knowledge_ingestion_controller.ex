@@ -314,17 +314,13 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     backlog_counter().in_flight_ingestion_backlog(tenant_id)
   rescue
     # `LocalGuc`'s capture ABORT shares `DBConnection.ConnectionError` with the transient
-    # pool faults this clause is for, but it is not one: it is raised DELIBERATELY, after
-    # `LocalGuc` decided it could not safely override a GUC an enclosing scope owns. Failing
-    # open on it would swallow a refusal whose entire purpose is to be noticed, and would do
-    # so on exactly the request whose connection is already mis-scoped. Re-raise it — the
-    # US-27.3 backstop maps it to a 503 with `Retry-After`, which is the honest answer. See
+    # pool faults this clause is for. It is raised DELIBERATELY, so it gets its OWN
+    # `error_class` (`fail_open_class/1`) rather than hiding inside "connection" — a refusal
+    # whose purpose is to be noticed stays alertable. It still fails OPEN: an abort IS an
+    # unmeasurable count, and this gate exists so an innocent, under-threshold tenant never
+    # eats an error because the count path is momentarily degraded. See
     # `Loopctl.LocalGuc.capture_abort?/1`.
-    e in DBConnection.ConnectionError ->
-      if LocalGuc.capture_abort?(e), do: reraise(e, __STACKTRACE__)
-      fail_open(tenant_id, e)
-
-    e in Postgrex.Error ->
+    e in [DBConnection.ConnectionError, Postgrex.Error] ->
       fail_open(tenant_id, e)
   end
 
@@ -343,7 +339,10 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     0
   end
 
-  defp fail_open_class(%DBConnection.ConnectionError{}), do: "connection"
+  defp fail_open_class(%DBConnection.ConnectionError{} = e) do
+    if LocalGuc.capture_abort?(e), do: "guc_capture_abort", else: "connection"
+  end
+
   defp fail_open_class(%Postgrex.Error{}), do: "timeout"
 
   defp backlog_counter do

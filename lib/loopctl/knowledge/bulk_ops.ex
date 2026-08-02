@@ -614,13 +614,21 @@ defmodule Loopctl.Knowledge.BulkOps do
   # a `FunctionClauseError` (an unstructured 500) instead of a mapped response. This IS a
   # connection failure, so the US-27.3 mapping already renders it as 503 + Retry-After.
   #
-  # Named once, so the capture here and the unconditional pop in `run_multi/2` cannot drift.
+  # Named once, so the capture here and the pop in `run_multi/2` cannot drift.
   @timeout_guc ["statement_timeout"]
+
+  # Whether THIS call pushed an ownership entry that nothing has popped yet. Set here (where
+  # `capture/2` pushes, and ONLY on success) and cleared by `:restore_timeout` (whose
+  # `restore/2` pops), so `run_multi/2` decides from OBSERVED state rather than from the
+  # outcome shape — a raise can land BEFORE the push (pool checkout, BEGIN) or AFTER the pop
+  # (COMMIT), and popping in either case takes an ENCLOSING scope's entry.
+  @timeout_pushed_key {__MODULE__, :timeout_guc_pushed}
 
   defp timeout_multi do
     Multi.run(Multi.new(), :set_timeout, fn repo, _changes ->
       case LocalGuc.capture(repo, @timeout_guc) do
         [_ | _] = prior ->
+          Process.put(@timeout_pushed_key, true)
           repo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
           {:ok, prior}
 
@@ -641,55 +649,45 @@ defmodule Loopctl.Knowledge.BulkOps do
   defp run_multi(multi, resolved_count \\ nil) do
     multi =
       Multi.run(multi, :restore_timeout, fn repo, %{set_timeout: prior} ->
-        {:ok, LocalGuc.restore(repo, prior)}
+        restored = LocalGuc.restore(repo, prior)
+        Process.delete(@timeout_pushed_key)
+        {:ok, restored}
       end)
 
-    outcome =
-      try do
-        {:completed, AdminRepo.transaction(multi, timeout: transaction_timeout_ms())}
-      rescue
-        e in [Postgrex.Error, DBConnection.ConnectionError] -> {:raised, e}
+    try do
+      case AdminRepo.transaction(multi, timeout: transaction_timeout_ms()) do
+        {:ok, %{articles: {affected, _}}} ->
+          {:ok, %{affected: affected, resolved_count: resolved_count || affected}}
+
+        {:error, _step, reason, _changes} ->
+          {:error, reason}
       end
-
-    # `:restore_timeout` is the LAST step, so `Ecto.Multi` SKIPS it the moment an earlier one
-    # errors (an invalid token, an FK abort), and a raising `delete_all` bypasses it entirely.
-    # The rollback discards the `SET LOCAL` itself, so nothing needs putting back — but the
-    # ownership entry `capture/2` pushed would OUTLIVE the transaction on this process, which
-    # Bandit reuses across keep-alive requests, and make a later `LocalGuc.scoped/3` abort a
-    # read over an enclosing scope that no longer exists.
-    #
-    # CONDITIONAL, not unconditional. `restore/2` and `forget/1` both pop via `list -- names`,
-    # which removes ONE occurrence — so popping again after `:restore_timeout` already ran
-    # takes an ENCLOSING scope's entry instead. That scope then looks unowned, and a later
-    # nested capture failure takes `capture_fallback!/2`'s RESET branch rather than its ABORT
-    # branch: it clobbers the outer read's deliberate `statement_timeout` instead of refusing,
-    # which is the exact leak `LocalGuc` exists to prevent. The `:set_timeout` failure path is
-    # the mirror image — `capture/2` pushes ONLY on success, so a `[]` capture pushed nothing
-    # and popping there would steal an enclosing entry too.
-    if pop_timeout_ownership?(outcome), do: LocalGuc.forget(@timeout_guc)
-
-    case outcome do
-      {:completed, {:ok, %{articles: {affected, _}}}} ->
-        {:ok, %{affected: affected, resolved_count: resolved_count || affected}}
-
-      {:completed, {:error, _step, reason, _changes}} ->
-        {:error, reason}
-
-      {:raised, e} ->
-        {:error, e}
+    rescue
+      e in [Postgrex.Error, DBConnection.ConnectionError] -> {:error, e}
+    after
+      # `:restore_timeout` is the LAST step, so `Ecto.Multi` SKIPS it the moment an earlier one
+      # errors (an invalid token, an FK abort), and a raising `delete_all` bypasses it entirely.
+      # The rollback discards the `SET LOCAL` itself, so nothing needs putting back — but the
+      # ownership entry `capture/2` pushed would OUTLIVE the transaction on this process, which
+      # Bandit reuses across keep-alive requests, and make a later `LocalGuc.scoped/3` abort a
+      # read over an enclosing scope that no longer exists.
+      #
+      # In an `after`, so EVERY exit path passes: the two rescued structs, an exception outside
+      # them (a changeset raise in the audit step, a `MatchError` in a `Multi.run` body), a
+      # Postgrex EXIT from a wedged pool, a throw.
+      #
+      # `Process.delete/1` reads AND clears the marker, so the pop happens exactly once and
+      # only when this call pushed. Both "pushed nothing" (a `[]` capture; a raise at checkout
+      # or BEGIN, before `:set_timeout` ran) and "already popped" (`:restore_timeout` ran —
+      # including when the COMMIT itself then failed) read as nil. Popping in either case
+      # would take an ENCLOSING scope's entry, since `restore/2` and `forget/1` both pop via
+      # `list -- names`, one occurrence. That scope would then look unowned, and a later
+      # nested capture failure would take `capture_fallback!/2`'s RESET branch rather than its
+      # ABORT branch — clobbering the outer read's deliberate `statement_timeout` instead of
+      # refusing, the exact leak `LocalGuc` exists to prevent.
+      if Process.delete(@timeout_pushed_key), do: LocalGuc.forget(@timeout_guc)
     end
   end
-
-  # Own the pop only when THIS call pushed and did not already pop:
-  #   * success -> `:restore_timeout` ran and popped -> do NOT pop again
-  #   * `:set_timeout` errored -> `capture/2` returned `[]` and pushed nothing -> do NOT pop
-  #   * any other step errored, or the transaction raised -> pushed, never popped -> POP
-  defp pop_timeout_ownership?({:completed, {:ok, changes}}),
-    do: not Map.has_key?(changes, :restore_timeout)
-
-  defp pop_timeout_ownership?({:completed, {:error, :set_timeout, _reason, _changes}}), do: false
-  defp pop_timeout_ownership?({:completed, {:error, _step, _reason, _changes}}), do: true
-  defp pop_timeout_ownership?({:raised, _e}), do: true
 
   defp bulk_audit_attrs(tenant_id, action, selector_summary, affected, audit_opts) do
     %{

@@ -993,14 +993,13 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert metadata.error_class == "connection"
     end
 
-    test "a LocalGuc capture ABORT propagates as 503 — it is not a transient pool fault",
+    test "a LocalGuc capture ABORT fails open too, under its OWN error_class",
          %{conn: conn} do
       # `LocalGuc`'s capture abort shares `DBConnection.ConnectionError` with the transient
-      # pool faults the clause above deliberately fails open on — but it is raised on
-      # PURPOSE, after LocalGuc refused to override a GUC an enclosing scope owns. Failing
-      # open on it would admit the batch on a connection already known to be mis-scoped and
-      # swallow a refusal whose whole point is to be noticed. It must reach the US-27.3 503
-      # instead, and it must NOT emit the fail-open telemetry.
+      # pool faults the clause above fails open on, and is raised on PURPOSE — but it is
+      # still an UNMEASURABLE count, and this gate exists so that never blocks an innocent,
+      # under-threshold tenant. It therefore admits, and stays alertable through a distinct
+      # `error_class` rather than through a 503 the tenant did nothing to earn.
       tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
@@ -1011,8 +1010,9 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       :telemetry.attach(
         handler_id,
         event,
-        fn ^event, _m, metadata, _ ->
-          if metadata.tenant_id == tenant.id, do: send(test_pid, :wrongly_failed_open)
+        fn ^event, measurements, metadata, _ ->
+          if metadata.tenant_id == tenant.id,
+            do: send(test_pid, {:backlog_failed_open, measurements, metadata})
         end,
         nil
       )
@@ -1027,21 +1027,18 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
                 "scope already overrode"
       end)
 
-      # DBErrorBackstop logs the sanitized structured line and RE-RAISES a
-      # `SanitizedDBError` (so the web server's crash log can never echo the raw query);
-      # `Plug.Exception` is what turns that into the response status, which is why this
-      # asserts the raised exception's status rather than a rendered body.
-      error =
-        assert_raise LoopctlWeb.SanitizedDBError, fn ->
-          conn
-          |> auth_conn(raw_key)
-          |> post(~p"/api/v1/knowledge/ingest/batch", %{
-            items: [%{content: "Capture abort item", source_type: "newsletter"}]
-          })
-        end
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "Capture abort item", source_type: "newsletter"}]
+        })
 
-      assert Plug.Exception.status(error) == 503
-      refute_receive :wrongly_failed_open, 100
+      assert length(json_response(conn, 200)["data"]) == 1
+
+      # Not "connection": an abort must be distinguishable from a pool blip on the dashboard.
+      assert_receive {:backlog_failed_open, %{count: 1}, metadata}
+      assert metadata.error_class == "guc_capture_abort"
     end
 
     test "TC-36.3.7: a NON-DB error in the backlog count propagates (500), not fail-open",

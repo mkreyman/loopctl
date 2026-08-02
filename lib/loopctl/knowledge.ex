@@ -5132,16 +5132,16 @@ defmodule Loopctl.Knowledge do
     end
   rescue
     e in DBConnection.ConnectionError ->
-      # `LocalGuc`'s capture ABORT shares this struct with the transient pool faults this
-      # clause degrades on, but it is a deliberate refusal to override a GUC an enclosing
-      # scope owns — not a degraded dependency. Degrading on it would turn a connection
-      # already known to be mis-scoped into a silently missing signal, which is the same
-      # mistake as the `query_canceled` narrowing directly below. Re-raise; the US-27.3
-      # backstop maps it to a 503.
-      if LocalGuc.capture_abort?(e), do: reraise(e, __STACKTRACE__)
+      # `LocalGuc`'s capture ABORT shares this struct with a transient pool fault and is a
+      # different animal — a deliberate refusal to override a GUC an enclosing scope owns —
+      # so it is NAMED distinctly in the log. It still degrades: this probe runs only after
+      # the suggestions are already in hand and produces telemetry alone, so re-raising would
+      # trade a valid response for a 503 over a diagnostic read, which is precisely what the
+      # AREA-5 fail-soft contract at `maybe_signal_under_fill/8` forbids.
+      tag = if LocalGuc.capture_abort?(e), do: "guc_capture_abort", else: "connection"
 
       Logger.warning(
-        "knowledge.vector_search under_fill probe degraded (connection); suggestions returned: " <>
+        "knowledge.vector_search under_fill probe degraded (#{tag}); suggestions returned: " <>
           Exception.message(e)
       )
 
