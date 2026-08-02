@@ -230,9 +230,12 @@ defmodule Loopctl.TelemetryEvents do
   ## Payload (id/atom only — never a query, key, or PG message body)
 
     * `measurements`: `%{count: 1}` — a pure increment.
-    * `metadata`: `%{tenant_id, error_class}` where `error_class` is a BOUNDED 2-value
-      tag (`"timeout"` for the `Postgrex.Error` statement_timeout, `"connection"` for the
-      `DBConnection.ConnectionError` pool-checkout timeout). `tenant_id` is an id, and is
+    * `metadata`: `%{tenant_id, error_class}` where `error_class` is a BOUNDED 4-value
+      tag: `"timeout"` (57014 query_canceled — the count's own statement_timeout),
+      `"db_error"` (any OTHER `Postgrex.Error` SQLSTATE — a query bug in the count path,
+      NOT a timeout), `"connection"` (`DBConnection.ConnectionError` pool-checkout
+      timeout), `"guc_capture_abort"` (`Loopctl.LocalGuc` REFUSED to override a GUC an
+      enclosing scope owns — deliberate, not a blip). `tenant_id` is an id, and is
       cap-gated to a sentinel in the metric's `tag_values` so label cardinality stays
       bounded (same convention as the other scale counters).
 
