@@ -389,9 +389,10 @@ defmodule Loopctl.HeavyRead do
   # It is NOT taken here, because flipping it changes ANN query planning for every
   # deployment that has not set the row — a fleet-wide performance/recall trade that is the
   # operator's call, not a side effect of a branch fixing six unrelated findings. The
-  # premise gap it targets is closed the honest way instead: `config/test.exs` now records
-  # how the prod value is verified and when it was last checked. Raise it as its own change
-  # if the default should move.
+  # premise gap it targets is closed the honest way instead: `hnsw_iterative_scan/0`'s @doc
+  # below states all three values and records how the prod one is verified and when it was
+  # last checked (`docs/hnsw-tuning-evaluation.md` carries the operator-facing copy). Raise
+  # it as its own change if the default should move.
   @default_hnsw_iterative_scan 0
   @hnsw_iterative_scan_modes %{1 => "relaxed_order", 2 => "strict_order"}
   @default_hnsw_max_scan_tuples 20_000
@@ -401,15 +402,33 @@ defmodule Loopctl.HeavyRead do
   or `"strict_order"`.
 
   Read from the live-tunable `SystemConfig` key `"hnsw_iterative_scan"` as an INT CODE
-  (0 = off, 1 = relaxed_order — the shipped default — 2 = strict_order, unknown = the shipped
-  default), so an operator turns iterative scan off or up fleet-wide with a single `UPDATE`
-  — no redeploy.
+  (0 = off — **the shipped default** — 1 = relaxed_order, 2 = strict_order, unknown = the
+  shipped default), so an operator turns iterative scan off or up fleet-wide with a single
+  `UPDATE` — no redeploy.
+
+  ## Three values, deliberately not all the same
+
+  | Where | Value | Why |
+  |---|---|---|
+  | shipped `@default_hnsw_iterative_scan` | `0` (off) | a fresh install makes no latency/recall trade it did not ask for |
+  | prod `SystemConfig` row | `1` (relaxed_order) | operator-set in #488; verified against the live app 2026-08-01 |
+  | `config/test.exs` pin | `1` | the suite asserts recall against WHAT PROD RUNS, not against the shipped default |
+
+  The test pin therefore does NOT match the shipped attribute, and must not be "corrected"
+  to: leaving test unpinned is what made CI assert exact recall against a configuration
+  nobody runs, which is the long-running side-table `left: []` flake
+  (`config/test.exs`, and see `test/loopctl/embeddings_side_table_reads_test.exs`).
+
+  Whether the SHIPPED default should move to `1` is an open operator decision — a fleet-wide
+  latency-for-recall trade — and is deliberately not settled here. What is settled is that
+  this doc states all three values, because an earlier revision claimed `1` was the shipped
+  default and that the test pin matched it; both were false, and a reader reasoning from
+  either would have mis-predicted what a fresh install does.
 
   `SystemConfig` is the operator lever and the only RUNTIME source. When no operator has set
   that row, the fallback code comes from the config key `:hnsw_iterative_scan_default`
-  (`default_iterative_scan_code/0`), which ONLY `config/test.exs` sets — pinned to the same
-  value the shipped `@default_hnsw_iterative_scan` carries, so the pin cannot drift out from
-  under the suite unnoticed. Every NON-test config is barred from setting that key by
+  (`default_iterative_scan_code/0`), which ONLY `config/test.exs` sets. Every NON-test config
+  is barred from setting that key by
   `test/loopctl/config_embedding_read_path_test.exs`; an `Application` pin in prod would
   shadow the operator lever. Tests that need a specific mode prime the `SystemConfig` cache
   explicitly in an `async: false` module (see
@@ -429,8 +448,12 @@ defmodule Loopctl.HeavyRead do
   # `SystemConfig` stays the single operator lever; this is only the FALLBACK applied when no
   # operator has set that row. It is config-injected (rather than read straight off the module
   # attribute) so an environment can start from a different baseline without any test mutating
-  # VM-global state. Only `config/test.exs` sets it, to the SAME value the shipped attribute
-  # carries — the suite must assert against the configuration a fresh install actually runs.
+  # VM-global state. Only `config/test.exs` sets it, and DELIBERATELY NOT to the shipped
+  # attribute's value: the suite asserts recall against what PROD runs (the operator-set
+  # `SystemConfig` row, 1) rather than against the shipped default (0). See the
+  # `hnsw_iterative_scan/0` @doc's table — an earlier revision of this comment claimed the two
+  # matched, which would send whoever next reads it to "fix" the pin and reopen the
+  # side-table flake.
   # Every NON-test config is barred from setting `:hnsw_iterative_scan_default` — the key
   # read RIGHT BELOW — by `test/loopctl/config_embedding_read_path_test.exs`, which also
   # asserts `config/test.exs` still sets it. That is the case that matters: an Application
@@ -501,13 +524,19 @@ defmodule Loopctl.HeavyRead do
   @iterative_scan_last_conclusive_ttl_ms 3_600_000
 
   # See `probe_iterative_scan_support/0`: this bounds the pre-gate checkout, not just the
-  # query, so it is deliberately far below the sibling probes' budget.
+  # query, so it is deliberately far below the sibling probes' budget. It is the TOTAL
+  # budget for the probe, and `savepoint_first_probe/0` takes TWO checkouts on prod's idle
+  # shape (the refused savepoint, then the plain retry), so each ATTEMPT gets half and the
+  # pair still fits the bound this attribute — and the operator docs — state.
   @probe_timeout_ms 500
+  @probe_attempt_timeout_ms div(@probe_timeout_ms, 2)
 
   @doc """
   Whether the connected pgvector supports `hnsw.iterative_scan` (pgvector >= 0.8.0).
 
-  Probed from `pg_extension` on the SAME repo the ANN read runs on (`repo/0`) and cached in
+  Probed from `pg_extension` on the SAME repo the ANN read runs on (`repo/0`) under a
+  #{@probe_timeout_ms}ms TOTAL budget (`@probe_timeout_ms`, which bounds the pre-gate
+  CHECKOUT, not just the query, and is split across the probe's two attempts) and cached in
   `:persistent_term` WITH A TTL. The probe runs only when an operator has actually enabled
   iterative scan (`iterative_scan_override/0` short-circuits at OFF), so it costs one extra
   round-trip per TTL window on the enabled path and nothing at all on the default path.
@@ -749,31 +778,33 @@ defmodule Loopctl.HeavyRead do
   defp probe_iterative_scan_support do
     # TIGHT timeout, because this round trip runs from `opts/1` — i.e. BEFORE `TenantGate`
     # can shed and before any `SET LOCAL statement_timeout` applies. DBConnection derives the
-    # checkout DEADLINE from this same `:timeout` (`Holder.abs_timeout/2`), so it is exactly
-    # the bound on how long a probe may queue on a saturated heavy-read pool ahead of the
-    # gate whose whole job is to shed before the checkout. A `pg_extension` lookup is
-    # sub-millisecond on a healthy pool; needing more than #{@probe_timeout_ms}ms IS the
-    # saturation signal, and failing closed there (iterative scan off for this read) is
-    # cheaper than every concurrent ANN request queueing for seconds in front of the shed.
+    # checkout DEADLINE from PER-ATTEMPT `:timeout` (`Holder.abs_timeout/2`), and
+    # `savepoint_first_probe/0` can take two attempts, so each gets HALF
+    # (#{@probe_attempt_timeout_ms}ms) and `@probe_timeout_ms` stays exactly the bound on how
+    # long a probe may queue on a saturated heavy-read pool ahead of the gate whose whole job
+    # is to shed before the checkout. A `pg_extension` lookup is sub-millisecond on a healthy
+    # pool; needing more than that IS the saturation signal, and failing closed there
+    # (iterative scan off for this read) is cheaper than every concurrent ANN request
+    # queueing for seconds in front of the shed.
     #
-    # `mode: :savepoint` WHEN the caller is already inside a transaction on this repo (the
-    # normal shape under the test sandbox): without it a server-side error here — a 57014
-    # cancel at the tight timeout above — aborts the ENCLOSING transaction (25P02), so every
-    # later statement fails over a query it never issued while the `rescue`/`catch` below
-    # report a clean `:inconclusive`. That is the hazard `LocalGuc.do_capture/2` guards
-    # against, on the same hot path. It is CONDITIONAL because Postgrex refuses savepoint
-    # mode on an idle connection, which is the prod shape (`opts/1` runs outside any
-    # transaction) and would otherwise make every prod probe fail.
-    query_opts =
-      if repo().in_transaction?(),
-        do: [timeout: @probe_timeout_ms, mode: :savepoint],
-        else: [timeout: @probe_timeout_ms]
-
-    case repo().query(
-           "SELECT extversion FROM pg_extension WHERE extname = 'vector'",
-           [],
-           query_opts
-         ) do
+    # `mode: :savepoint` WHENEVER the connection is inside a transaction (the normal shape
+    # under the test sandbox): without it a SERVER-RETURNED error here — a 57014 cancel from a
+    # leaked `SET LOCAL statement_timeout`, or any other `Postgrex.Error` — aborts the
+    # ENCLOSING transaction (25P02), so every later statement fails over a query it never
+    # issued while the `rescue`/`catch` below report a clean `:inconclusive`. That is the
+    # hazard `LocalGuc.do_capture/2` guards against, on the same hot path. What savepoint mode
+    # does NOT cover is the CLIENT-side deadline above: an `@probe_attempt_timeout_ms` expiry
+    # is a DBConnection deadline, and Postgrex DISCONNECTS the connection on it
+    # (`Postgrex.Protocol.msg_recv/3`) — there is no 57014 and no `ROLLBACK TO SAVEPOINT`; the
+    # enclosing transaction dies with the connection.
+    #
+    # The question is put to the CONNECTION (`savepoint_first_probe/0`), not to
+    # `repo().in_transaction?()`: that reads a per-process dict entry set only by
+    # `Repo.transaction`/`Repo.checkout`, which `Sandbox.start_owner!` never sets — the same
+    # blindness documented at `run_timed_transaction/5` — so gating on it left the protection
+    # DEAD in the one shape that has an enclosing transaction to poison, while prod (`opts/1`
+    # runs outside any transaction) took the plain branch either way.
+    case savepoint_first_probe() do
       {:ok, %{rows: [[version]]}} when is_binary(version) ->
         {:ok, version_at_least?(version, @iterative_scan_min_version), version}
 
@@ -795,6 +826,38 @@ defmodule Loopctl.HeavyRead do
     :exit, reason -> {:inconclusive, "exit:" <> exit_tag(reason), :pool}
   end
 
+  @probe_sql "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+
+  # Ask for the savepoint, and retry PLAINLY on the one refusal that means there was no
+  # transaction to protect. Postgrex refuses savepoint mode on an idle connection
+  # (`Postgrex.Protocol.transaction_error/2`) with `%DBConnection.TransactionError{status:
+  # :idle}` and no round trip, so prod's shape costs TWO CHECKOUTS and never a query — which
+  # is why each attempt gets `@probe_attempt_timeout_ms` (half the budget) rather than the
+  # whole of `@probe_timeout_ms`: the PAIR is what queues ahead of `TenantGate`'s shed.
+  #
+  # The OTHER refusal (`status: :error`, a connection already poisoned by an earlier
+  # statement) is NOT retried: the plain query would only return the 25P02 it replaces.
+  # `inconclusive_class/1` classifies it `:transaction` for exactly that reason.
+  #
+  # DO NOT drop the retry and pass `mode: :savepoint` alone to match `LocalGuc.do_capture/2`.
+  # That sibling needs no retry because it only ever runs INSIDE a transaction; this one does
+  # not. A review round proposed exactly that, on the theory that #535 had disproved the
+  # idle-refusal premise. It had not: the refusal is an ERROR TUPLE, so without the retry it
+  # falls to the caller's `other ->` branch and reports `:inconclusive` — on EVERY prod probe
+  # — which `inconclusive_verdict/2` then resolves with no conclusive verdict to reuse,
+  # silently disabling iterative scan fleet-wide. Precisely the failure #535 fixed.
+  # `test/loopctl/heavy_read_savepoint_probe_test.exs` pins the refusal AND the sandbox shape
+  # where `in_transaction?/0` lies, so neither premise can be re-litigated from memory.
+  defp savepoint_first_probe do
+    case repo().query(@probe_sql, [], timeout: @probe_attempt_timeout_ms, mode: :savepoint) do
+      {:error, %DBConnection.TransactionError{status: :idle}} ->
+        repo().query(@probe_sql, [], timeout: @probe_attempt_timeout_ms)
+
+      result ->
+        result
+    end
+  end
+
   # Public only so the negative-cache decision is directly testable: it is a pure function
   # of the probe's error, and getting it wrong is silent — the cost shows up as a re-probe
   # storm during an incident, which is exactly when nobody is reading this code.
@@ -813,6 +876,15 @@ defmodule Loopctl.HeavyRead do
   # exact storm the cache exists to bound.
   def inconclusive_class(%Postgrex.Error{postgres: %{code: :in_failed_sql_transaction}}),
     do: :transaction
+
+  # The SAME poisoned-connection fact, in the shape `savepoint_first_probe/0` now surfaces it:
+  # Postgrex refuses `mode: :savepoint` on an ABORTED connection before sending anything
+  # (`Postgrex.Protocol.parse_describe/3`), so the 25P02 above never reaches us there. Without
+  # this clause that refusal fell to the `:pool` catch-all and got NEGATIVE-CACHED in prod —
+  # a fail-closed verdict from a test-harness artifact pinning iterative scan off VM-wide,
+  # which is precisely what the `:transaction` class exists to prevent. (`status: :idle` never
+  # reaches here: it is the retried refusal.)
+  def inconclusive_class(%DBConnection.TransactionError{status: :error}), do: :transaction
 
   def inconclusive_class(%Postgrex.Error{}), do: :pool
   def inconclusive_class(_error), do: :pool

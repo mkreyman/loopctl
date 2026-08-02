@@ -448,7 +448,7 @@ It ships **OFF** and is a live `SystemConfig` INT CODE (`Loopctl.HeavyRead.hnsw_
 
 | `hnsw_iterative_scan` | mode emitted |
 |---|---|
-| `0` (default / missing / unknown code) | `off` — no `SET LOCAL` at all |
+| `0` — explicit, unrecognized, or the MISSING-row fallback (shipped `0`, **test env `1`**) | `off` — no `SET LOCAL` at all |
 | `1` | `relaxed_order` |
 | `2` | `strict_order` |
 
@@ -461,22 +461,32 @@ UPDATE system_configs SET value = 50000, updated_at = now() WHERE key = 'hnsw_ma
 
 Contract, and the ways it can silently do nothing:
 
-- **`SystemConfig` is the ONLY source.** Unlike `ef_search` there is no `ALTER ROLE`
-  interaction to reason about and, deliberately, **no `Application` config override** — an
-  environment pin would either shadow the operator lever or (in the test env) stop CI
-  exercising the shipped default. `config_embedding_read_path_test.exs` fails the build if
-  a `:hnsw_iterative_scan` key appears in any `config/*.exs` file, in either the
-  `config :loopctl, :key, value` or the `config :loopctl, key: value` shape.
+- **`SystemConfig` is the only RUNTIME source.** Unlike `ef_search` there is no `ALTER ROLE`
+  interaction to reason about. The `Application` key `:hnsw_iterative_scan_default` supplies
+  only the fallback used when no `SystemConfig` row exists, and
+  `config_embedding_read_path_test.exs` bars it from every **NON-test** config — that is the
+  case that matters, since an environment pin in prod would shadow the operator lever.
+  **`config/test.exs` DOES set it, to `1`, on purpose**, and a separate assertion positively
+  requires that pin to still be there. An earlier revision of this bullet said no override
+  existed anywhere and that CI exercised the shipped default; both stopped being true when the
+  pin landed. Three values are in play — shipped `0`, prod `SystemConfig` `1`, test pin `1`
+  matching prod — and `Loopctl.HeavyRead.hnsw_iterative_scan/0`'s @doc is the canonical table.
 - **Fail-closed capability probe.** On pgvector < 0.8 the GUC does not exist. Enabling the
   key there is a **silent NO-OP**, not an outage: `Loopctl.HeavyRead.iterative_scan_supported?/0`
   probes `pg_extension` on the heavy-read repo (cached in `:persistent_term` with a TTL) and
   logs a warning naming the detected version — or, when the extension is not installed at
   all, a distinct "pgvector is NOT INSTALLED" warning, so you are not sent chasing an
-  upgrade that is not the problem. A probe that could not reach a conclusion (pool timeout,
-  DB blip, wedged-pool exit) is negative-cached for 60s only, so one bad moment cannot pin
-  the lever off until a redeploy — while a sustained outage costs one probe per minute
-  instead of one per ANN read. The conclusive verdict expires after 10 min so a backend
-  change (replica failover onto an older pgvector) self-heals.
+  upgrade that is not the problem. An INCONCLUSIVE probe (pool timeout, DB blip, wedged-pool
+  exit) does NOT flatly negative-cache for 60s — that description predates the current policy.
+  What actually happens: the last CONCLUSIVE verdict is reused when it is recent (up to 60
+  min), since the deployed pgvector version cannot change between two reads on the same
+  backend; with no such verdict it fails closed to a GUESS, cached for 1s initially and
+  DOUBLING per consecutive guess to a 60s ceiling, so one bad moment cannot pin the lever off
+  while a sustained outage still costs one probe per minute rather than one per ANN read.
+  `:ownership` and `:transaction` failures are never cached at all (they are harness
+  artifacts, not backend pressure), and `:pool` is not cached under a sandbox pool. The
+  conclusive verdict's own 60-min expiry is what lets a real backend change (replica failover
+  onto an older pgvector) self-heal.
 - **Only ANN endpoints, only when enabled.** `SET LOCAL hnsw.iterative_scan = <mode>` plus
   `SET LOCAL hnsw.max_scan_tuples = <n>` are emitted inside the same short heavy-read
   transaction as `statement_timeout`/`ef_search`, for `Loopctl.HeavyRead.ann_endpoints/0`

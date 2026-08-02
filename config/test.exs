@@ -707,15 +707,22 @@ config :loopctl, :embedding_read_path, Loopctl.MockEmbeddingReadPath
 
 # #488 / US-41.1: `hnsw.iterative_scan` is pinned ON for the TEST env only.
 #
-# It is the PRODUCTION remedy for cross-tenant filtered-ANN under-return, and it is now the
-# SHIPPED default too (`Loopctl.HeavyRead`'s `@default_hnsw_iterative_scan` = 1), so this pin
-# asserts against the configuration a fresh install actually runs. It used to rest instead on
-# a hand-verified premise — that prod carries an operator-set `SystemConfig`
-# "hnsw_iterative_scan" = 1 — which nothing in the repo maintained: a database restored from
-# before #488, or a fresh self-hosted install, has no such row, so CI stayed green while the
-# deployment silently ran the OFF path. Changing the shipped default is what closed that, not
-# this line. `SystemConfig` remains the operator lever, and setting the row to 0 still turns
-# iterative scan off fleet-wide with no redeploy.
+# It is the PRODUCTION remedy for cross-tenant filtered-ANN under-return. THREE values are in
+# play and they are deliberately NOT all the same (the table in
+# `Loopctl.HeavyRead.hnsw_iterative_scan/0`'s @doc is the canonical statement):
+#
+#   * shipped `Loopctl.HeavyRead`'s `@default_hnsw_iterative_scan` = 0 (off) — a fresh install
+#     makes no latency-for-recall trade it did not ask for;
+#   * the `loopctl` prod `SystemConfig` row = 1 (relaxed_order), operator-set in #488 and
+#     verified against the live app 2026-08-01;
+#   * this pin = 1, matching PROD — NOT the shipped default.
+#
+# An earlier revision of this comment claimed 1 was also the shipped default. It was not, and
+# the claim outlived a reverted attribute flip. Do not "reconcile" this pin down to the shipped
+# 0: the pin exists so CI asserts recall against what prod actually runs, and dropping it
+# reopens the flake described below. Whether the SHIPPED default should move to 1 is an open
+# operator decision, tracked in that @doc, not settled here. `SystemConfig` remains the operator
+# lever, and setting the row to 0 still turns iterative scan off fleet-wide with no redeploy.
 #
 # Leaving test unpinned meant CI asserted exact recall against a configuration NOBODY RUNS
 # — and lost, intermittently: the ANN applies `tenant_id` as a
@@ -732,7 +739,11 @@ config :loopctl, :embedding_read_path, Loopctl.MockEmbeddingReadPath
 #
 # Under-return coverage of the OFF path is NOT lost: it is asserted directly against
 # `HeavyRead.opts/1` (where the OFF decision actually lives, rather than as a side effect
-# of a global default) in `test/loopctl/heavy_read_hnsw_ef_search_test.exs:175-197`.
+# of a global default) by the test named
+# "opts/1 attaches :hnsw_iterative_scan for ANN endpoints ONLY when enabled" in
+# `test/loopctl/heavy_read_hnsw_ef_search_test.exs`. Cite it BY NAME, not by line range: a
+# range silently rots into pointing at unrelated code, and a compensating control nobody can
+# find is a compensating control that gets deleted.
 # Cite that file, not `heavy_read_test.exs`, which contains no iterative-scan assertions
 # at all — a mis-cited compensating control is how the real one gets deleted later as
 # "already covered elsewhere".
