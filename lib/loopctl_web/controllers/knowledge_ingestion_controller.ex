@@ -16,6 +16,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   alias Loopctl.Ingestion.ContentEnvelope
   alias Loopctl.Knowledge.ContentChunker
   alias Loopctl.Llm
+  alias Loopctl.LocalGuc
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Oban.FairShare
   alias Loopctl.ObanConfig
@@ -299,10 +300,11 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # because the count path is momentarily degraded). The count runs under a 2s
   # `SET LOCAL statement_timeout`; a raised statement_timeout surfaces as `Postgrex.Error`
   # (57014 query_canceled) and a pool-checkout timeout as `DBConnection.ConnectionError`,
-  # so we rescue ONLY those two classes — NOT a bare `rescue e ->`. A programming error
-  # in the count path (e.g. a bad query change) must therefore propagate and 500, LOUD,
-  # rather than be silently swallowed into a fleet-wide disabling of backpressure that
-  # looks healthy. On the fail-open path we ALSO emit a telemetry counter
+  # so we rescue ONLY those two classes — NOT a bare `rescue e ->`. A NON-DB programming
+  # error in the count path therefore propagates and 500s, LOUD, rather than being silently
+  # swallowed into a fleet-wide disabling of backpressure that looks healthy; a SQL-level one
+  # (a bad query change) is still rescued, and gets its own `db_error` class so it is not
+  # mistaken for a timeout. On the fail-open path we ALSO emit a telemetry counter
   # (`[:loopctl, :ingestion, :backlog_gate, :failed_open]`) so "the backpressure valve is
   # currently admitting because it can't measure" is an alertable signal, not just a
   # warning-log line, and a sustained per-request timeout under a real flood is visible on
@@ -312,23 +314,45 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   defp in_flight_ingestion_backlog(tenant_id) do
     backlog_counter().in_flight_ingestion_backlog(tenant_id)
   rescue
+    # `LocalGuc`'s capture ABORT shares `DBConnection.ConnectionError` with the transient
+    # pool faults this clause is for. It is raised DELIBERATELY, so it gets its OWN
+    # `error_class` (`fail_open_class/1`) rather than hiding inside "connection" — a refusal
+    # whose purpose is to be noticed stays alertable. It still fails OPEN: an abort IS an
+    # unmeasurable count, and this gate exists so an innocent, under-threshold tenant never
+    # eats an error because the count path is momentarily degraded. See
+    # `Loopctl.LocalGuc.capture_abort?/1`.
     e in [DBConnection.ConnectionError, Postgrex.Error] ->
-      Logger.warning(
-        "ingestion backlog gate failed open for tenant=#{tenant_id}: " <>
-          Exception.message(e)
-      )
-
-      :telemetry.execute(
-        TelemetryEvents.ingestion_backlog_gate_failed_open(),
-        %{count: 1},
-        %{tenant_id: tenant_id, error_class: fail_open_class(e)}
-      )
-
-      0
+      fail_open(tenant_id, e)
   end
 
-  defp fail_open_class(%DBConnection.ConnectionError{}), do: "connection"
-  defp fail_open_class(%Postgrex.Error{}), do: "timeout"
+  defp fail_open(tenant_id, e) do
+    error_class = fail_open_class(e)
+
+    # The bounded CLASS tag only, never `Exception.message/1`: a `Postgrex.Error` /
+    # `DBConnection.ConnectionError` message names the backend host, database and role
+    # ("tcp connect (host:port): ..."), and this line is reachable from any wedged-pool
+    # moment on an ordinary ingest. Same policy as `Loopctl.LocalGuc`'s own failure log.
+    Logger.warning("ingestion backlog gate failed open for tenant=#{tenant_id} (#{error_class})")
+
+    :telemetry.execute(
+      TelemetryEvents.ingestion_backlog_gate_failed_open(),
+      %{count: 1},
+      %{tenant_id: tenant_id, error_class: error_class}
+    )
+
+    0
+  end
+
+  # BOUNDED, and every value must be TRUE. The rescue above catches EVERY `Postgrex.Error`,
+  # not just 57014 query_canceled, so a flat "timeout" would report a query bug in the count
+  # path (e.g. 42703 undefined_column after a `FairShare` change) as a timeout — sending a
+  # triaging operator after the pool instead of the query that broke.
+  defp fail_open_class(%DBConnection.ConnectionError{} = e) do
+    if LocalGuc.capture_abort?(e), do: "guc_capture_abort", else: "connection"
+  end
+
+  defp fail_open_class(%Postgrex.Error{postgres: %{code: :query_canceled}}), do: "timeout"
+  defp fail_open_class(%Postgrex.Error{}), do: "db_error"
 
   defp backlog_counter do
     Application.get_env(:loopctl, :ingestion_backlog_counter, FairShare)

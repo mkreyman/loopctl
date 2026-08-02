@@ -614,13 +614,30 @@ defmodule Loopctl.Knowledge.BulkOps do
   # a `FunctionClauseError` (an unstructured 500) instead of a mapped response. This IS a
   # connection failure, so the US-27.3 mapping already renders it as 503 + Retry-After.
   #
-  # Named once, so the capture here and the unconditional pop in `run_multi/2` cannot drift.
+  # Named once, so the capture here and the pop in `run_multi/2` cannot drift.
   @timeout_guc ["statement_timeout"]
+
+  # How many ownership entries bulk ops have pushed on THIS process and not yet popped.
+  # Incremented here (where `capture/2` pushes, and ONLY on success) and decremented by
+  # `:restore_timeout` (whose `restore/2` pops), so `run_multi/2` decides from OBSERVED state
+  # rather than from the outcome shape — a raise can land BEFORE the push (pool checkout,
+  # BEGIN) or AFTER the pop (COMMIT), and popping in either case takes an ENCLOSING scope's
+  # entry. A DEPTH, not a boolean: a boolean cannot represent nesting, so a bulk op running
+  # inside another's Multi on the same process would have its inner cleanup consume the flag
+  # and leave the outer's entry alive forever. `run_multi/2` compares against the depth it
+  # observed on entry, so each call pops exactly its own.
+  @timeout_pushed_key {__MODULE__, :timeout_guc_depth}
+
+  defp pushed_depth, do: Process.get(@timeout_pushed_key, 0)
+
+  defp put_pushed_depth(depth) when depth <= 0, do: Process.delete(@timeout_pushed_key)
+  defp put_pushed_depth(depth), do: Process.put(@timeout_pushed_key, depth)
 
   defp timeout_multi do
     Multi.run(Multi.new(), :set_timeout, fn repo, _changes ->
       case LocalGuc.capture(repo, @timeout_guc) do
         [_ | _] = prior ->
+          put_pushed_depth(pushed_depth() + 1)
           repo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
           {:ok, prior}
 
@@ -641,26 +658,51 @@ defmodule Loopctl.Knowledge.BulkOps do
   defp run_multi(multi, resolved_count \\ nil) do
     multi =
       Multi.run(multi, :restore_timeout, fn repo, %{set_timeout: prior} ->
-        {:ok, LocalGuc.restore(repo, prior)}
+        restored = LocalGuc.restore(repo, prior)
+        put_pushed_depth(pushed_depth() - 1)
+        {:ok, restored}
       end)
 
-    case AdminRepo.transaction(multi, timeout: transaction_timeout_ms()) do
-      {:ok, %{articles: {affected, _}}} ->
-        {:ok, %{affected: affected, resolved_count: resolved_count || affected}}
+    depth_before = pushed_depth()
 
-      {:error, _step, reason, _changes} ->
-        {:error, reason}
+    try do
+      case AdminRepo.transaction(multi, timeout: transaction_timeout_ms()) do
+        {:ok, %{articles: {affected, _}}} ->
+          {:ok, %{affected: affected, resolved_count: resolved_count || affected}}
+
+        {:error, _step, reason, _changes} ->
+          {:error, reason}
+      end
+    rescue
+      e in [Postgrex.Error, DBConnection.ConnectionError] -> {:error, e}
+    after
+      # `:restore_timeout` is the LAST step, so `Ecto.Multi` SKIPS it the moment an earlier one
+      # errors (an invalid token, an FK abort), and a raising `delete_all` bypasses it entirely.
+      # The rollback discards the `SET LOCAL` itself, so nothing needs putting back — but the
+      # ownership entry `capture/2` pushed would OUTLIVE the transaction on this process, which
+      # Bandit reuses across keep-alive requests, and make a later `LocalGuc.scoped/3` abort a
+      # read over an enclosing scope that no longer exists.
+      #
+      # In an `after`, so EVERY exit path passes: the two rescued structs, an exception outside
+      # them (a changeset raise in the audit step, a `MatchError` in a `Multi.run` body), a
+      # Postgrex EXIT from a wedged pool, a throw.
+      #
+      # The depth is compared against `depth_before` (read on entry), so the pop happens
+      # exactly once and only when THIS call's push is still outstanding — correct whether or
+      # not another bulk op encloses this one. Both "pushed nothing" (a `[]` capture; a raise
+      # at checkout or BEGIN, before `:set_timeout` ran) and "already popped"
+      # (`:restore_timeout` ran — including when the COMMIT itself then failed) leave the depth
+      # back at `depth_before`. Popping in either case would take an ENCLOSING scope's entry,
+      # since `restore/2` and `forget/1` both pop via `list -- names`, one occurrence. That
+      # scope would then look unowned, and a later nested capture failure would take
+      # `capture_fallback!/2`'s RESET branch rather than its ABORT branch — clobbering the
+      # outer read's deliberate `statement_timeout` instead of refusing, the exact leak
+      # `LocalGuc` exists to prevent.
+      if pushed_depth() > depth_before do
+        LocalGuc.forget(@timeout_guc)
+        put_pushed_depth(depth_before)
+      end
     end
-  rescue
-    e in [Postgrex.Error, DBConnection.ConnectionError] -> {:error, e}
-  after
-    # `:restore_timeout` is the LAST step, so `Ecto.Multi` SKIPS it the moment an earlier one
-    # errors (an invalid token, an FK abort), and a raising `delete_all` bypasses it entirely.
-    # The rollback discards the `SET LOCAL` itself, so nothing needs putting back — but the
-    # ownership entry `capture/2` pushed would OUTLIVE the transaction on this process, which
-    # Bandit reuses across keep-alive requests, and make a later `LocalGuc.scoped/3` abort a
-    # read over an enclosing scope that no longer exists. Pop it where every exit path passes.
-    LocalGuc.forget(@timeout_guc)
   end
 
   defp bulk_audit_attrs(tenant_id, action, selector_summary, affected, audit_opts) do

@@ -317,9 +317,18 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
       # pre-US-36.4 count, which had no statement_timeout and so never crashed the job).
       # Rescue here — mirroring `ScaleMetrics`' poll rescues — so a slow/failed count degrades
       # only the optional corpus-size signal while the linking it merely observes proceeds.
+      # `LocalGuc`'s capture ABORT arrives here as a `DBConnection.ConnectionError` like any
+      # wedged-pool fault, but it is a deliberate refusal to override a GUC an enclosing scope
+      # owns. It gets its own tag so it stays greppable/alertable rather than hiding inside a
+      # generic count failure — and, like the ingestion backlog gate and the under-fill probe,
+      # it still degrades SOFTLY. Re-raising here would abort a linking job over an
+      # observational signal, which is the precise regression this rescue exists to prevent.
+      tag = if LocalGuc.capture_abort?(e), do: "guc_capture_abort", else: "count_failed"
+
       Logger.warning(
-        "Article linking: corpus-size count failed (#{inspect(e.__struct__)}) for article " <>
-          "#{article.id}; skipping the observational corpus_size signal — linking proceeds"
+        "Article linking: corpus-size count failed (#{tag}: #{inspect(e.__struct__)}) for " <>
+          "article #{article.id}; skipping the observational corpus_size signal — " <>
+          "linking proceeds"
       )
 
       :ok
