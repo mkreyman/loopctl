@@ -137,8 +137,10 @@ Design points (`Loopctl.HeavyRead.hnsw_iterative_scan/0`, `hnsw_max_scan_tuples/
   deliberately not settled in code; raise it as its own change with a benchmark.
 - **Fail-closed, non-poisoning capability probe.** `iterative_scan_supported?/0` reads
   `pg_extension` on the SAME repo the ANN read uses (`HeavyRead.repo/0`, under
-  `@probe_timeout_ms` — 500ms, which bounds the pre-gate CHECKOUT, not just the query, so a
-  saturated pool goes inconclusive fast instead of queueing ahead of the shed) and caches the answer in `:persistent_term` **with a TTL**. An old extension →
+  `@probe_timeout_ms` — 500ms TOTAL, which bounds the pre-gate CHECKOUT, not just the query,
+  and is split in half across the probe's two attempts (a refused `mode: :savepoint`, then the
+  plain retry), so a saturated pool goes inconclusive fast instead of queueing ahead of the
+  shed) and caches the answer in `:persistent_term` **with a TTL**. An old extension →
   `false` + a warning naming the detected version; an ABSENT extension gets its own distinct
   warning (it is not a version problem). Either way the setting is a silent no-op, NOT a
   raise: nothing is emitted, so the ANN read is unaffected. Errors AND exits (`:noproc`, a

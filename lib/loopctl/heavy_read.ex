@@ -524,15 +524,19 @@ defmodule Loopctl.HeavyRead do
   @iterative_scan_last_conclusive_ttl_ms 3_600_000
 
   # See `probe_iterative_scan_support/0`: this bounds the pre-gate checkout, not just the
-  # query, so it is deliberately far below the sibling probes' budget.
+  # query, so it is deliberately far below the sibling probes' budget. It is the TOTAL
+  # budget for the probe, and `savepoint_first_probe/0` takes TWO checkouts on prod's idle
+  # shape (the refused savepoint, then the plain retry), so each ATTEMPT gets half and the
+  # pair still fits the bound this attribute — and the operator docs — state.
   @probe_timeout_ms 500
+  @probe_attempt_timeout_ms div(@probe_timeout_ms, 2)
 
   @doc """
   Whether the connected pgvector supports `hnsw.iterative_scan` (pgvector >= 0.8.0).
 
   Probed from `pg_extension` on the SAME repo the ANN read runs on (`repo/0`) under a
-  #{@probe_timeout_ms}ms timeout (`@probe_timeout_ms`, which bounds the pre-gate CHECKOUT,
-  not just the query) and cached in
+  #{@probe_timeout_ms}ms TOTAL budget (`@probe_timeout_ms`, which bounds the pre-gate
+  CHECKOUT, not just the query, and is split across the probe's two attempts) and cached in
   `:persistent_term` WITH A TTL. The probe runs only when an operator has actually enabled
   iterative scan (`iterative_scan_override/0` short-circuits at OFF), so it costs one extra
   round-trip per TTL window on the enabled path and nothing at all on the default path.
@@ -774,19 +778,25 @@ defmodule Loopctl.HeavyRead do
   defp probe_iterative_scan_support do
     # TIGHT timeout, because this round trip runs from `opts/1` — i.e. BEFORE `TenantGate`
     # can shed and before any `SET LOCAL statement_timeout` applies. DBConnection derives the
-    # checkout DEADLINE from this same `:timeout` (`Holder.abs_timeout/2`), so it is exactly
-    # the bound on how long a probe may queue on a saturated heavy-read pool ahead of the
-    # gate whose whole job is to shed before the checkout. A `pg_extension` lookup is
-    # sub-millisecond on a healthy pool; needing more than #{@probe_timeout_ms}ms IS the
-    # saturation signal, and failing closed there (iterative scan off for this read) is
-    # cheaper than every concurrent ANN request queueing for seconds in front of the shed.
+    # checkout DEADLINE from PER-ATTEMPT `:timeout` (`Holder.abs_timeout/2`), and
+    # `savepoint_first_probe/0` can take two attempts, so each gets HALF
+    # (#{@probe_attempt_timeout_ms}ms) and `@probe_timeout_ms` stays exactly the bound on how
+    # long a probe may queue on a saturated heavy-read pool ahead of the gate whose whole job
+    # is to shed before the checkout. A `pg_extension` lookup is sub-millisecond on a healthy
+    # pool; needing more than that IS the saturation signal, and failing closed there
+    # (iterative scan off for this read) is cheaper than every concurrent ANN request
+    # queueing for seconds in front of the shed.
     #
     # `mode: :savepoint` WHENEVER the connection is inside a transaction (the normal shape
-    # under the test sandbox): without it a server-side error here — a 57014 cancel at the
-    # tight timeout above — aborts the ENCLOSING transaction (25P02), so every later statement
-    # fails over a query it never issued while the `rescue`/`catch` below report a clean
-    # `:inconclusive`. That is the hazard `LocalGuc.do_capture/2` guards against, on the same
-    # hot path.
+    # under the test sandbox): without it a SERVER-RETURNED error here — a 57014 cancel from a
+    # leaked `SET LOCAL statement_timeout`, or any other `Postgrex.Error` — aborts the
+    # ENCLOSING transaction (25P02), so every later statement fails over a query it never
+    # issued while the `rescue`/`catch` below report a clean `:inconclusive`. That is the
+    # hazard `LocalGuc.do_capture/2` guards against, on the same hot path. What savepoint mode
+    # does NOT cover is the CLIENT-side deadline above: an `@probe_attempt_timeout_ms` expiry
+    # is a DBConnection deadline, and Postgrex DISCONNECTS the connection on it
+    # (`Postgrex.Protocol.msg_recv/3`) — there is no 57014 and no `ROLLBACK TO SAVEPOINT`; the
+    # enclosing transaction dies with the connection.
     #
     # The question is put to the CONNECTION (`savepoint_first_probe/0`), not to
     # `repo().in_transaction?()`: that reads a per-process dict entry set only by
@@ -821,7 +831,13 @@ defmodule Loopctl.HeavyRead do
   # Ask for the savepoint, and retry PLAINLY on the one refusal that means there was no
   # transaction to protect. Postgrex refuses savepoint mode on an idle connection
   # (`Postgrex.Protocol.transaction_error/2`) with `%DBConnection.TransactionError{status:
-  # :idle}` and no round trip, so prod's shape costs a checkout, never a query.
+  # :idle}` and no round trip, so prod's shape costs TWO CHECKOUTS and never a query — which
+  # is why each attempt gets `@probe_attempt_timeout_ms` (half the budget) rather than the
+  # whole of `@probe_timeout_ms`: the PAIR is what queues ahead of `TenantGate`'s shed.
+  #
+  # The OTHER refusal (`status: :error`, a connection already poisoned by an earlier
+  # statement) is NOT retried: the plain query would only return the 25P02 it replaces.
+  # `inconclusive_class/1` classifies it `:transaction` for exactly that reason.
   #
   # DO NOT drop the retry and pass `mode: :savepoint` alone to match `LocalGuc.do_capture/2`.
   # That sibling needs no retry because it only ever runs INSIDE a transaction; this one does
@@ -833,9 +849,9 @@ defmodule Loopctl.HeavyRead do
   # `test/loopctl/heavy_read_savepoint_probe_test.exs` pins the refusal AND the sandbox shape
   # where `in_transaction?/0` lies, so neither premise can be re-litigated from memory.
   defp savepoint_first_probe do
-    case repo().query(@probe_sql, [], timeout: @probe_timeout_ms, mode: :savepoint) do
+    case repo().query(@probe_sql, [], timeout: @probe_attempt_timeout_ms, mode: :savepoint) do
       {:error, %DBConnection.TransactionError{status: :idle}} ->
-        repo().query(@probe_sql, [], timeout: @probe_timeout_ms)
+        repo().query(@probe_sql, [], timeout: @probe_attempt_timeout_ms)
 
       result ->
         result
@@ -860,6 +876,15 @@ defmodule Loopctl.HeavyRead do
   # exact storm the cache exists to bound.
   def inconclusive_class(%Postgrex.Error{postgres: %{code: :in_failed_sql_transaction}}),
     do: :transaction
+
+  # The SAME poisoned-connection fact, in the shape `savepoint_first_probe/0` now surfaces it:
+  # Postgrex refuses `mode: :savepoint` on an ABORTED connection before sending anything
+  # (`Postgrex.Protocol.parse_describe/3`), so the 25P02 above never reaches us there. Without
+  # this clause that refusal fell to the `:pool` catch-all and got NEGATIVE-CACHED in prod —
+  # a fail-closed verdict from a test-harness artifact pinning iterative scan off VM-wide,
+  # which is precisely what the `:transaction` class exists to prevent. (`status: :idle` never
+  # reaches here: it is the retried refusal.)
+  def inconclusive_class(%DBConnection.TransactionError{status: :error}), do: :transaction
 
   def inconclusive_class(%Postgrex.Error{}), do: :pool
   def inconclusive_class(_error), do: :pool

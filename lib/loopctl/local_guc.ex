@@ -94,6 +94,22 @@ defmodule Loopctl.LocalGuc do
   defp put_active_names([]), do: Process.delete(@active_names_key)
   defp put_active_names(names), do: Process.put(@active_names_key, names)
 
+  @capture_abort_tag "LocalGuc: could not capture"
+
+  @doc """
+  Whether `error` is THIS module's capture abort — the one `DBConnection.ConnectionError`
+  raised by `scoped/3` when it refused to override a GUC an enclosing scope owns — rather
+  than the generic pool/connection failure that shares the struct (and the US-27.3 503).
+
+  The discriminator a fail-soft rescue needs to re-raise this abort instead of classifying it
+  as a degraded dependency.
+  """
+  @spec capture_abort?(term()) :: boolean()
+  def capture_abort?(%DBConnection.ConnectionError{message: message}) when is_binary(message),
+    do: String.starts_with?(message, @capture_abort_tag)
+
+  def capture_abort?(_error), do: false
+
   defp capture_fallback!(names, enclosing) do
     case Enum.filter(names, &(&1 in enclosing)) do
       [] ->
@@ -108,17 +124,17 @@ defmodule Loopctl.LocalGuc do
         # conclusion about the same failure should not hand the client two different answers,
         # one of which tells it never to retry something that is purely transient.
         #
-        # KNOWN CONSEQUENCE of the shared struct: `DBConnection.ConnectionError` carries no
-        # field to discriminate on (`defexception [:message]`), so the fail-soft rescues that
-        # classify it as a degraded dependency swallow this abort too — the ingestion backlog
-        # gate (`LoopctlWeb.KnowledgeIngestionController.in_flight_ingestion_backlog/1`) fails
-        # OPEN at 0, and `Knowledge`'s under-fill probe degrades to `:error`. Both are reached
-        # only when the capture ROUND TRIP itself failed, i.e. the connection is already in
-        # trouble, which is the condition those rescues exist for — but they cannot tell this
-        # abort from a pool blip, so narrowing them (re-raise on this message/struct) is the
-        # follow-up if that distinction ever has to be made.
+        # Sharing the struct does NOT make this abort indistinguishable from a pool blip:
+        # `capture_abort?/1` below matches it on the stable `@capture_abort_tag` prefix, so any
+        # fail-soft rescue that must tell the two apart re-raises on it instead of swallowing
+        # it. Today's rescues deliberately do not — the ingestion backlog gate
+        # (`LoopctlWeb.KnowledgeIngestionController.in_flight_ingestion_backlog/1`) fails OPEN
+        # at 0 and `Knowledge`'s under-fill probe degrades to `:error` — and that is the right
+        # reading there: this path is reached ONLY when the capture round trip itself failed,
+        # i.e. the connection is already in trouble, which is the condition those rescues exist
+        # for.
         raise DBConnection.ConnectionError,
-              "LocalGuc: could not capture #{inspect(owned)}, which an enclosing scope " <>
+              "#{@capture_abort_tag} #{inspect(owned)}, which an enclosing scope " <>
                 "already overrode — refusing to set an override this transaction cannot " <>
                 "take back (see the moduledoc)"
     end
