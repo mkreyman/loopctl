@@ -76,6 +76,23 @@ defmodule Loopctl.TelemetryEvents do
   def vector_search_under_fill, do: [:loopctl, :knowledge, :vector_search, :under_fill]
 
   @doc """
+  The bounded under-fill PROBE (`Loopctl.Knowledge.under_fill_probe_degraded/2`) failed its
+  read and degraded to "no truncation signal" rather than sinking a request whose suggestions
+  were already in hand. The response is a valid 200, so without this counter the refusal is
+  invisible to a dashboard and `under_fill/0` just silently stops firing.
+
+  ## Payload (bounded tags only — NEVER the query, the vector, or a PG message body)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{tenant_id, endpoint, error_class}` where `error_class` is a BOUNDED tag:
+      `"guc_capture_abort"` (`Loopctl.LocalGuc` REFUSED to override a GUC an enclosing scope
+      owns — deliberate, not a blip) | `"connection"` (pool/connection fault) | `"timeout"`
+      (57014 server-side cancel).
+  """
+  def vector_search_under_fill_probe_degraded,
+    do: [:loopctl, :knowledge, :vector_search, :under_fill_probe_degraded]
+
+  @doc """
   A mapped DB error was surfaced to a client (US-27.15). Emitted by
   `LoopctlWeb.DBErrorLogger.log/3` after it logs the sanitized structured line, so
   EVERY controller (both the FallbackController rescue path and the uncaught
@@ -445,6 +462,7 @@ defmodule Loopctl.TelemetryEvents do
       webhook_delivery_exception(),
       audit_log_write(),
       vector_search_under_fill(),
+      vector_search_under_fill_probe_degraded(),
       db_error(),
       knowledge_semantic_fallback(),
       knowledge_hybrid_provenance(),

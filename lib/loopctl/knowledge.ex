@@ -5134,34 +5134,54 @@ defmodule Loopctl.Knowledge do
     e in DBConnection.ConnectionError ->
       # `LocalGuc`'s capture ABORT shares this struct with a transient pool fault and is a
       # different animal — a deliberate refusal to override a GUC an enclosing scope owns —
-      # so it is NAMED distinctly in the log. It still degrades: this probe runs only after
-      # the suggestions are already in hand and produces telemetry alone, so re-raising would
+      # so it is NAMED distinctly. It still degrades: this probe runs only after the
+      # suggestions are already in hand and feeds a diagnostic signal, so re-raising would
       # trade a valid response for a 503 over a diagnostic read, which is precisely what the
       # AREA-5 fail-soft contract at `maybe_signal_under_fill/8` forbids.
-      tag = if LocalGuc.capture_abort?(e), do: "guc_capture_abort", else: "connection"
-
-      Logger.warning(
-        "knowledge.vector_search under_fill probe degraded (#{tag}); suggestions returned: " <>
-          Exception.message(e)
-      )
-
-      :error
+      under_fill_probe_degraded(tenant_id, e)
 
     e in Postgrex.Error ->
       # Degrade ONLY on a server-side cancel (statement_timeout); re-raise anything else
       # (e.g. a malformed query) so genuine bugs surface in tests instead of silently
       # becoming a missing signal.
       if match?(%{postgres: %{code: :query_canceled}}, e) do
-        Logger.warning(
-          "knowledge.vector_search under_fill probe degraded (timeout); suggestions returned: " <>
-            Exception.message(e)
-        )
-
-        :error
+        under_fill_probe_degraded(tenant_id, e)
       else
         reraise(e, __STACKTRACE__)
       end
   end
+
+  @doc false
+  # The probe's ONE fail-soft exit. A degraded probe used to be a 503; it is now a 200 whose
+  # truncation signal is silently absent, so the refusal must stay ALERTABLE — a log line
+  # alone is invisible to a dashboard. Emits the bounded counter
+  # (`TelemetryEvents.vector_search_under_fill_probe_degraded/0`) and logs the CLASS TAG only:
+  # `Exception.message/1` on a Postgrex/DBConnection struct names the backend host, database
+  # and role. Public-but-`@doc false` so the degradation contract is testable through the real
+  # path (see `heavy_read_opts/1` for the same precedent).
+  def under_fill_probe_degraded(tenant_id, error) do
+    error_class = probe_error_class(error)
+
+    :telemetry.execute(
+      Loopctl.TelemetryEvents.vector_search_under_fill_probe_degraded(),
+      %{count: 1},
+      %{tenant_id: tenant_id, endpoint: :suggested_links, error_class: error_class}
+    )
+
+    Logger.warning(
+      "knowledge.vector_search under_fill probe degraded (#{error_class}) " <>
+        "tenant_id=#{tenant_id}; suggestions returned"
+    )
+
+    :error
+  end
+
+  defp probe_error_class(%DBConnection.ConnectionError{} = e) do
+    if LocalGuc.capture_abort?(e), do: "guc_capture_abort", else: "connection"
+  end
+
+  # Only reachable for 57014 — the caller re-raises every other SQLSTATE.
+  defp probe_error_class(%Postgrex.Error{}), do: "timeout"
 
   @doc false
   # Per-read options for a heavy endpoint (US-27.4). Delegates to the single source of

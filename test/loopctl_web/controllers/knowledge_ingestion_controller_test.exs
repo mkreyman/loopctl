@@ -824,6 +824,26 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
   # --- US-36.3: batch-ingest backlog backpressure (429) ---
 
+  # Forward the fail-open counter for THIS tenant to the test process, with guaranteed
+  # detach. Scoped by tenant because the handler is process-GLOBAL and the suite is async.
+  defp attach_failed_open(tenant_id) do
+    test_pid = self()
+    handler_id = "backlog-failopen-#{System.unique_integer([:positive])}"
+    event = [:loopctl, :ingestion, :backlog_gate, :failed_open]
+
+    :telemetry.attach(
+      handler_id,
+      event,
+      fn ^event, measurements, metadata, _ ->
+        if metadata.tenant_id == tenant_id,
+          do: send(test_pid, {:backlog_failed_open, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
   describe "POST /api/v1/knowledge/ingest/batch backlog backpressure (US-36.3)" do
     test "TC-36.3.1: tenant over threshold -> 429 + Retry-After + coded error; ZERO jobs enqueued",
          %{conn: conn} do
@@ -952,21 +972,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
       # The fail-open path emits an alertable telemetry counter so "the valve is currently
       # admitting because it can't measure" is observable, not just a warning log.
-      test_pid = self()
-      handler_id = "backlog-failopen-#{System.unique_integer([:positive])}"
-      event = [:loopctl, :ingestion, :backlog_gate, :failed_open]
-
-      :telemetry.attach(
-        handler_id,
-        event,
-        fn ^event, measurements, metadata, _ ->
-          if metadata.tenant_id == tenant.id,
-            do: send(test_pid, {:backlog_failed_open, measurements, metadata})
-        end,
-        nil
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
+      attach_failed_open(tenant.id)
 
       # Simulate a statement_timeout / transient DB error from the backlog count via the
       # DI seam (overrides the DataCase default that delegates to the real count). The
@@ -1003,21 +1009,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
-      test_pid = self()
-      handler_id = "backlog-abort-#{System.unique_integer([:positive])}"
-      event = [:loopctl, :ingestion, :backlog_gate, :failed_open]
-
-      :telemetry.attach(
-        handler_id,
-        event,
-        fn ^event, measurements, metadata, _ ->
-          if metadata.tenant_id == tenant.id,
-            do: send(test_pid, {:backlog_failed_open, measurements, metadata})
-        end,
-        nil
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
+      attach_failed_open(tenant.id)
 
       # Raised with the real module's own message prefix, so the test binds to
       # `LocalGuc.capture_abort?/1`'s actual discriminator rather than a copy of it.
@@ -1039,6 +1031,60 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       # Not "connection": an abort must be distinguishable from a pool blip on the dashboard.
       assert_receive {:backlog_failed_open, %{count: 1}, metadata}
       assert metadata.error_class == "guc_capture_abort"
+    end
+
+    test "a NON-timeout SQLSTATE is not reported as a timeout", %{conn: conn} do
+      # The rescue catches EVERY `Postgrex.Error`, not only 57014, so a query bug in the
+      # count path (a column renamed out from under `FairShare`) also fails open. It must
+      # say so: labelling it "timeout" sends a triaging operator after the pool instead of
+      # the query that broke.
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      attach_failed_open(tenant.id)
+
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        raise %Postgrex.Error{
+          postgres: %{code: :undefined_column, message: "column j.args does not exist"}
+        }
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "Query-bug batch item", source_type: "newsletter"}]
+        })
+
+      assert length(json_response(conn, 200)["data"]) == 1
+
+      assert_receive {:backlog_failed_open, %{count: 1}, metadata}
+      assert metadata.error_class == "db_error"
+    end
+
+    test "a 57014 cancel IS reported as a timeout", %{conn: conn} do
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      attach_failed_open(tenant.id)
+
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        raise %Postgrex.Error{
+          postgres: %{code: :query_canceled, message: "canceling statement due to timeout"}
+        }
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "Timeout batch item", source_type: "newsletter"}]
+        })
+
+      assert length(json_response(conn, 200)["data"]) == 1
+
+      assert_receive {:backlog_failed_open, %{count: 1}, metadata}
+      assert metadata.error_class == "timeout"
     end
 
     test "TC-36.3.7: a NON-DB error in the backlog count propagates (500), not fail-open",

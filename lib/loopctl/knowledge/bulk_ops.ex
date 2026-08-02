@@ -617,18 +617,27 @@ defmodule Loopctl.Knowledge.BulkOps do
   # Named once, so the capture here and the pop in `run_multi/2` cannot drift.
   @timeout_guc ["statement_timeout"]
 
-  # Whether THIS call pushed an ownership entry that nothing has popped yet. Set here (where
-  # `capture/2` pushes, and ONLY on success) and cleared by `:restore_timeout` (whose
-  # `restore/2` pops), so `run_multi/2` decides from OBSERVED state rather than from the
-  # outcome shape — a raise can land BEFORE the push (pool checkout, BEGIN) or AFTER the pop
-  # (COMMIT), and popping in either case takes an ENCLOSING scope's entry.
-  @timeout_pushed_key {__MODULE__, :timeout_guc_pushed}
+  # How many ownership entries bulk ops have pushed on THIS process and not yet popped.
+  # Incremented here (where `capture/2` pushes, and ONLY on success) and decremented by
+  # `:restore_timeout` (whose `restore/2` pops), so `run_multi/2` decides from OBSERVED state
+  # rather than from the outcome shape — a raise can land BEFORE the push (pool checkout,
+  # BEGIN) or AFTER the pop (COMMIT), and popping in either case takes an ENCLOSING scope's
+  # entry. A DEPTH, not a boolean: a boolean cannot represent nesting, so a bulk op running
+  # inside another's Multi on the same process would have its inner cleanup consume the flag
+  # and leave the outer's entry alive forever. `run_multi/2` compares against the depth it
+  # observed on entry, so each call pops exactly its own.
+  @timeout_pushed_key {__MODULE__, :timeout_guc_depth}
+
+  defp pushed_depth, do: Process.get(@timeout_pushed_key, 0)
+
+  defp put_pushed_depth(depth) when depth <= 0, do: Process.delete(@timeout_pushed_key)
+  defp put_pushed_depth(depth), do: Process.put(@timeout_pushed_key, depth)
 
   defp timeout_multi do
     Multi.run(Multi.new(), :set_timeout, fn repo, _changes ->
       case LocalGuc.capture(repo, @timeout_guc) do
         [_ | _] = prior ->
-          Process.put(@timeout_pushed_key, true)
+          put_pushed_depth(pushed_depth() + 1)
           repo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
           {:ok, prior}
 
@@ -650,9 +659,11 @@ defmodule Loopctl.Knowledge.BulkOps do
     multi =
       Multi.run(multi, :restore_timeout, fn repo, %{set_timeout: prior} ->
         restored = LocalGuc.restore(repo, prior)
-        Process.delete(@timeout_pushed_key)
+        put_pushed_depth(pushed_depth() - 1)
         {:ok, restored}
       end)
+
+    depth_before = pushed_depth()
 
     try do
       case AdminRepo.transaction(multi, timeout: transaction_timeout_ms()) do
@@ -676,16 +687,21 @@ defmodule Loopctl.Knowledge.BulkOps do
       # them (a changeset raise in the audit step, a `MatchError` in a `Multi.run` body), a
       # Postgrex EXIT from a wedged pool, a throw.
       #
-      # `Process.delete/1` reads AND clears the marker, so the pop happens exactly once and
-      # only when this call pushed. Both "pushed nothing" (a `[]` capture; a raise at checkout
-      # or BEGIN, before `:set_timeout` ran) and "already popped" (`:restore_timeout` ran —
-      # including when the COMMIT itself then failed) read as nil. Popping in either case
-      # would take an ENCLOSING scope's entry, since `restore/2` and `forget/1` both pop via
-      # `list -- names`, one occurrence. That scope would then look unowned, and a later
-      # nested capture failure would take `capture_fallback!/2`'s RESET branch rather than its
-      # ABORT branch — clobbering the outer read's deliberate `statement_timeout` instead of
-      # refusing, the exact leak `LocalGuc` exists to prevent.
-      if Process.delete(@timeout_pushed_key), do: LocalGuc.forget(@timeout_guc)
+      # The depth is compared against `depth_before` (read on entry), so the pop happens
+      # exactly once and only when THIS call's push is still outstanding — correct whether or
+      # not another bulk op encloses this one. Both "pushed nothing" (a `[]` capture; a raise
+      # at checkout or BEGIN, before `:set_timeout` ran) and "already popped"
+      # (`:restore_timeout` ran — including when the COMMIT itself then failed) leave the depth
+      # back at `depth_before`. Popping in either case would take an ENCLOSING scope's entry,
+      # since `restore/2` and `forget/1` both pop via `list -- names`, one occurrence. That
+      # scope would then look unowned, and a later nested capture failure would take
+      # `capture_fallback!/2`'s RESET branch rather than its ABORT branch — clobbering the
+      # outer read's deliberate `statement_timeout` instead of refusing, the exact leak
+      # `LocalGuc` exists to prevent.
+      if pushed_depth() > depth_before do
+        LocalGuc.forget(@timeout_guc)
+        put_pushed_depth(depth_before)
+      end
     end
   end
 
