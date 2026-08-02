@@ -622,8 +622,52 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
     end
   end
 
-  # review #1 regression — the residual double-first-enroll race: two concurrent
-  # first-enrollments on an agent_rooted tenant must result in EXACTLY ONE 201
+  describe "GET /api/v1/tenants/:id/authenticators — index" do
+    test "lists ids and labels, and never credential material", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+
+      auth =
+        fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "mac-mini Touch ID")
+
+      [row] =
+        conn
+        |> authed(raw_key)
+        |> get(~p"/api/v1/tenants/#{tenant.id}/authenticators")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      # The id is the ONLY handle rename/revoke key on, and a browser ceremony
+      # discards the 201 body — this endpoint is how an operator gets it back.
+      assert row["id"] == auth.id
+      assert row["friendly_name"] == "mac-mini Touch ID"
+      refute Map.has_key?(row, "credential_id")
+      refute Map.has_key?(row, "public_key")
+    end
+
+    test "403s a caller addressing a tenant it does not own", %{conn: conn} do
+      tenant_a = fixture(:tenant, %{trust_tier: :human_anchored})
+      tenant_b = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant_a.id, role: :user)
+      fixture(:root_authenticator, tenant_id: tenant_b.id)
+
+      assert conn
+             |> authed(raw_key)
+             |> get(~p"/api/v1/tenants/#{tenant_b.id}/authenticators")
+             |> json_response(403)
+    end
+
+    test "403s an agent-role key", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :agent)
+
+      assert conn
+             |> authed(raw_key)
+             |> get(~p"/api/v1/tenants/#{tenant.id}/authenticators")
+             |> json_response(403)
+    end
+  end
+
   describe "PATCH /api/v1/tenants/:id/authenticators/:auth_id — rename" do
     test "renames an enrolled authenticator and leaves credential material untouched", %{
       conn: conn
@@ -677,9 +721,9 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
       assert reloaded.sign_count == auth.sign_count
     end
 
-    test "records the rename in the audit log with the old and new label", %{conn: conn} do
+    test "records the rename in the audit log with the acting key and both labels", %{conn: conn} do
       tenant = fixture(:tenant, %{trust_tier: :human_anchored})
-      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      {raw_key, key} = fixture(:api_key, tenant_id: tenant.id, role: :user)
       auth = fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "old label")
 
       conn
@@ -695,6 +739,14 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
       assert entry, "expected an authenticator_renamed audit event"
       assert entry.old_state["friendly_name"] == "old label"
       assert entry.new_state["friendly_name"] == "new label"
+
+      # Rename proves NO device possession (unlike enroll/revoke), so the acting
+      # key is the only evidence there is — stamping it "human" with a nil
+      # actor_id would assert a presence nothing verified and leave every
+      # relabel indistinguishable from every other.
+      assert entry.actor_type == "api_key"
+      assert entry.actor_id == key.id
+      assert entry.actor_label == "user:#{key.name}"
     end
 
     test "rejects a friendly_name over the byte cap with 422", %{conn: conn} do
@@ -731,19 +783,47 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
              |> json_response(400)
     end
 
-    test "rejects a blank friendly_name with 422", %{conn: conn} do
+    test "trims the label, and rejects a blank or whitespace-only one with 422", %{conn: conn} do
       tenant = fixture(:tenant, %{trust_tier: :human_anchored})
       {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
       auth = fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "keep me")
+      client = authed(conn, raw_key)
 
-      conn
-      |> authed(raw_key)
-      |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
-        "friendly_name" => ""
-      })
-      |> json_response(422)
+      # Whitespace-only clears validate_length(min: 1) on byte count alone, so
+      # without the trim it persists a blank-LOOKING label — and the label is
+      # the only thing distinguishing devices at revoke time.
+      for blank <- ["", "   ", "\n\n"] do
+        assert client
+               |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+                 "friendly_name" => blank
+               })
+               |> json_response(422)
+      end
 
       assert AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id).friendly_name == "keep me"
+
+      # Matching the enroll path's friendly_name/1, padding is stripped rather
+      # than persisted verbatim.
+      client
+      |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+        "friendly_name" => "  mac-mini  "
+      })
+      |> json_response(200)
+
+      assert AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id).friendly_name ==
+               "mac-mini"
+    end
+
+    test "404s a malformed auth_id instead of raising Ecto.Query.CastError", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+
+      assert conn
+             |> authed(raw_key)
+             |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/not-a-uuid", %{
+               "friendly_name" => "x"
+             })
+             |> json_response(404)
     end
 
     test "404s an authenticator id that does not exist", %{conn: conn} do
@@ -852,6 +932,8 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
     end
   end
 
+  # review #1 regression — the residual double-first-enroll race: two concurrent
+  # first-enrollments on an agent_rooted tenant must result in EXACTLY ONE 201
   # (flip to human_anchored + enroll) with the loser rejected :reauth_required by
   # the under-lock gate, never a second possession-unproven device grafted on.
   #

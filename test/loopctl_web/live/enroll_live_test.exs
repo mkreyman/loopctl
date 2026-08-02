@@ -8,8 +8,8 @@ defmodule LoopctlWeb.EnrollLiveTest do
   for, is the set of structural properties that make that split safe:
 
     * the page reaches an unauthenticated visitor at all;
-    * it cannot receive the operator's API key, because it handles no
-      events;
+    * it cannot receive the operator's API key, because its only event
+      handler is a terminal no-op;
     * it cannot leak the key into a URL, because it has no form;
     * the hook that does the work is actually wired into the bundle; and
     * the hook takes the WebAuthn user handle from the server rather than
@@ -117,16 +117,26 @@ defmodule LoopctlWeb.EnrollLiveTest do
   end
 
   describe "the LiveView cannot receive the API key" do
-    test "EnrollLive defines no handle_event/3 at all" do
-      Code.ensure_loaded!(LoopctlWeb.EnrollLive)
-
+    test "its only handle_event/3 is a terminal no-op that stores nothing", %{conn: conn} do
       # This is the whole security argument for the page's shape, expressed as
-      # a property rather than a comment: with no event handler, there is no
-      # path by which a pasted credential reaches socket assigns, Phoenix's
-      # event parameter logging, a crash dump, or telemetry. If a future change
-      # adds an event handler, this test fails and that argument has to be
-      # re-made deliberately rather than eroded by accident.
-      refute function_exported?(LoopctlWeb.EnrollLive, :handle_event, 3)
+      # a property rather than a comment: no event handler RETAINS anything, so
+      # there is no path by which a pasted credential reaches socket assigns,
+      # Phoenix's event parameter logging, a crash dump, or telemetry.
+      #
+      # It is a no-op rather than ABSENT because /enroll is public and outside
+      # any authenticated pipeline: with no clause at all, LiveView raises on
+      # any pushed frame and a visitor can kill the channel process at will
+      # (the same hardening SignupLive already carries).
+      {:ok, view, _html} = live(conn, ~p"/enroll")
+
+      # Survives the frame (no FunctionClauseError killing the channel)...
+      assert render_hook(view, "junk", %{"api_key" => "lc_user_leaked_secret"}) =~
+               ~s(id="enroll-page")
+
+      assert Process.alive?(view.pid)
+
+      # ...and retained nothing from it.
+      refute render(view) =~ "lc_user_leaked_secret"
     end
 
     test "the hook never pushes anything over the LiveView socket" do

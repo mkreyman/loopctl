@@ -903,6 +903,35 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule AuthenticatorListResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "AuthenticatorListResponse",
+      description:
+        "The tenant's enrolled authenticators. Credential material " <>
+          "(credential_id, public_key) is deliberately never returned.",
+      type: :object,
+      required: [:data],
+      properties: %{
+        data: %Schema{
+          type: :array,
+          items: %Schema{
+            type: :object,
+            properties: %{
+              id: %Schema{type: :string, format: :uuid},
+              friendly_name: %Schema{type: :string},
+              attestation_format: %Schema{type: :string},
+              inserted_at: %Schema{type: :string, format: :"date-time"},
+              last_used_at: %Schema{type: :string, format: :"date-time", nullable: true}
+            }
+          }
+        }
+      }
+    })
+  end
+
   defmodule RenameAuthenticatorRequest do
     @moduledoc false
     require OpenApiSpex

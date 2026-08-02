@@ -28,8 +28,10 @@ defmodule LoopctlWeb.EnrollLive do
     * **The operator's API key never reaches this process.** It is sent only as
       an `Authorization: Bearer` header on same-origin `fetch` calls from the
       hook. It is never a `handle_event` parameter, so it cannot land in socket
-      assigns, Phoenix's event logging, a crash dump, or telemetry. There is
-      deliberately no `handle_event/3` clause on this module at all.
+      assigns, Phoenix's event logging, a crash dump, or telemetry. The only
+      `handle_event/3` clause is a terminal no-op: this LiveView consumes no
+      client events, but `/enroll` is public, so a crafted event frame would
+      otherwise raise and kill the channel (mirrors `SignupLive`).
 
     * **There is exactly one enrollment implementation.** Re-implementing the
       ceremony behind the LiveView socket would have duplicated the reauth gate
@@ -67,6 +69,13 @@ defmodule LoopctlWeb.EnrollLive do
      |> assign(:page_title, "Enroll an authenticator")
      |> assign(:docs_url, @docs_url)}
   end
+
+  # Catch-all for malformed / unknown client events on this public LiveView.
+  # This module consumes no events, so it is also the ONLY clause — without it
+  # LiveView raises on any pushed frame and kills the channel process (mirrors
+  # `SignupLive`'s terminal clause).
+  @impl true
+  def handle_event(_event, _params, socket), do: {:noreply, socket}
 
   @impl true
   def render(assigns) do

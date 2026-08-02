@@ -244,24 +244,43 @@ defmodule Loopctl.Tenants.Enrollment do
   lock anyway would let a label edit block an in-flight enrollment ceremony.
 
   No reauth assertion is required either, unlike `revoke/2`. A rename is
-  reversible, destroys nothing, and is already bounded by the `user` role gate
-  and the human-anchor tier gate; demanding a touch would price a typo fix at
-  the same cost as destroying a root-of-trust credential. The change is still
-  recorded in the append-only audit chain with both the old and new label.
+  reversible, destroys nothing, and is bounded by the `user` role gate plus
+  `owns_tenant?/2` and the tenant-scoped lookup below — NOT by the human-anchor
+  tier gate, which `LoopctlWeb.TenantAuthenticatorController` deliberately does
+  not mount (the route is an explicit exemption in
+  `test/loopctl_web/require_human_anchor_default_deny_test.exs`, sound only
+  because an agent-rooted tenant owns zero authenticators by construction and
+  there is no downgrade path). Demanding a touch would price a typo fix at the
+  same cost as destroying a root-of-trust credential.
+
+  Because possession of a device is therefore NEVER proved here, after-the-fact
+  attribution is the compensating control: `opts` carries the calling key's
+  `:actor_id`/`:actor_label`, and the entry is stamped `actor_type: "api_key"`
+  (matching every other bearer-key-driven mutation) rather than claiming a human
+  presence nothing verified. The old and new label are both recorded.
   """
-  @spec rename(Ecto.UUID.t(), Ecto.UUID.t(), String.t()) ::
+  @spec rename(Ecto.UUID.t(), Ecto.UUID.t(), String.t(), keyword()) ::
           {:ok, RootAuthenticator.t()}
           | {:error, :not_found}
+          | {:error, :audit_failed}
           | {:error, Ecto.Changeset.t()}
-  def rename(tenant_id, authenticator_id, friendly_name)
+  def rename(tenant_id, authenticator_id, friendly_name, opts \\ [])
       when is_binary(tenant_id) and is_binary(authenticator_id) and is_binary(friendly_name) do
     multi =
       Multi.new()
       |> Multi.run(:target, fn repo, _changes ->
         find_authenticator(repo, tenant_id, authenticator_id)
       end)
-      |> Multi.update(:renamed, fn %{target: auth} ->
-        RootAuthenticator.rename_changeset(auth, %{friendly_name: friendly_name})
+      |> Multi.run(:renamed, fn repo, %{target: auth} ->
+        # A concurrent revoke can delete the row between the :target read and
+        # this UPDATE. Ecto RAISES Ecto.StaleEntryError on a zero-row update
+        # rather than returning an error tuple, which would escape the
+        # transaction as a 500 instead of the 404 the endpoint documents.
+        try do
+          repo.update(RootAuthenticator.rename_changeset(auth, %{friendly_name: friendly_name}))
+        rescue
+          Ecto.StaleEntryError -> {:error, :not_found}
+        end
       end)
       |> Audit.log_in_multi(:audit, fn %{target: old, renamed: auth} ->
         %{
@@ -269,9 +288,9 @@ defmodule Loopctl.Tenants.Enrollment do
           entity_type: "tenant",
           entity_id: tenant_id,
           action: "authenticator_renamed",
-          actor_type: "human",
-          actor_id: nil,
-          actor_label: "human:api",
+          actor_type: "api_key",
+          actor_id: Keyword.get(opts, :actor_id),
+          actor_label: Keyword.get(opts, :actor_label),
           old_state: %{
             "authenticator_fingerprint" => Tenants.fingerprint(old.credential_id),
             "friendly_name" => old.friendly_name
@@ -284,14 +303,17 @@ defmodule Loopctl.Tenants.Enrollment do
       {:ok, %{renamed: auth}} ->
         {:ok, auth}
 
-      {:error, :target, :not_found, _changes} ->
+      {:error, step, :not_found, _changes} when step in [:target, :renamed] ->
         {:error, :not_found}
 
       {:error, :renamed, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
 
-      {:error, _step, reason, _changes} ->
-        {:error, reason}
+      # Anything left is the :audit step — an INTERNAL fault, not a caller
+      # mistake. Returning its changeset here would render the operator a 422
+      # blaming their friendly_name for an audit-chain append failure.
+      {:error, _step, _reason, _changes} ->
+        {:error, :audit_failed}
     end
   end
 
@@ -322,14 +344,21 @@ defmodule Loopctl.Tenants.Enrollment do
     from(t in Tenant, where: t.id == ^tenant_id and t.trust_tier == :agent_rooted)
   end
 
+  # A malformed id must 404, not 500: binding a non-UUID to the :binary_id
+  # column raises Ecto.Query.CastError, which carries no plug_status (same
+  # guard as projects.ex:108 / agents.ex:120).
   defp find_authenticator(repo, tenant_id, authenticator_id) do
-    query =
-      from a in RootAuthenticator,
-        where: a.tenant_id == ^tenant_id and a.id == ^authenticator_id
+    case Ecto.UUID.cast(authenticator_id) do
+      :error ->
+        {:error, :not_found}
 
-    case repo.one(query) do
-      nil -> {:error, :not_found}
-      authenticator -> {:ok, authenticator}
+      {:ok, id} ->
+        query = from a in RootAuthenticator, where: a.tenant_id == ^tenant_id and a.id == ^id
+
+        case repo.one(query) do
+          nil -> {:error, :not_found}
+          authenticator -> {:ok, authenticator}
+        end
     end
   end
 

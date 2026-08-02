@@ -293,6 +293,10 @@ defmodule LoopctlWeb.Router do
     # + authenticator revocation. Not tier-gated (enroll IS the upgrade path;
     # revoke + subsequent-enroll are protected by fresh WebAuthn assertions instead —
     # see require_human_anchor_default_deny_test.exs).
+    # The index is what makes :auth_id discoverable — a browser ceremony
+    # discards the 201 body, so without it an operator holds no handle to
+    # rename or revoke with.
+    get "/tenants/:id/authenticators", TenantAuthenticatorController, :index
     post "/tenants/:id/authenticators/challenge", TenantAuthenticatorController, :challenge
     post "/tenants/:id/authenticators", TenantAuthenticatorController, :create
 
