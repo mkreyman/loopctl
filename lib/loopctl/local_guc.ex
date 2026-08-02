@@ -100,7 +100,15 @@ defmodule Loopctl.LocalGuc do
         Enum.map(names, &{&1, nil})
 
       owned ->
-        raise "LocalGuc: could not capture #{inspect(owned)}, which an enclosing scope " <>
+        # A `DBConnection.ConnectionError`, NOT a bare RuntimeError. This path fires only
+        # when the capture round-trip itself failed, which means the connection is already
+        # wedged — the same condition `Knowledge.BulkOps.timeout_multi/0` raises this exact
+        # struct for, and which `LoopctlWeb.FallbackController` maps to the US-27.3 503 +
+        # `Retry-After` rather than an unstructured 500. Two call sites reaching the same
+        # conclusion about the same failure should not hand the client two different answers,
+        # one of which tells it never to retry something that is purely transient.
+        raise DBConnection.ConnectionError,
+              "LocalGuc: could not capture #{inspect(owned)}, which an enclosing scope " <>
                 "already overrode — refusing to set an override this transaction cannot " <>
                 "take back (see the moduledoc)"
     end

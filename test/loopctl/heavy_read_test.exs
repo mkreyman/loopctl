@@ -614,7 +614,7 @@ defmodule Loopctl.HeavyReadTest do
         # LOCAL) or do nothing (leaking the inner override into the rest of the outer body).
         # It does neither. It raises BEFORE the body sets anything, and the caller's rollback
         # is then the thing that discards every SET LOCAL made inside the transaction.
-        assert_raise RuntimeError, ~r/could not capture/, fn ->
+        assert_raise DBConnection.ConnectionError, ~r/could not capture/, fn ->
           Loopctl.LocalGuc.scoped(CaptureFailingRepo, [@probe], fn ->
             Repo.query!("SET LOCAL #{@probe} = 'inner'")
           end)
@@ -632,7 +632,7 @@ defmodule Loopctl.HeavyReadTest do
       prior = Loopctl.LocalGuc.capture(Repo, [@probe])
       Repo.query!("SET LOCAL #{@probe} = 'bulk'")
 
-      assert_raise RuntimeError, ~r/could not capture/, fn ->
+      assert_raise DBConnection.ConnectionError, ~r/could not capture/, fn ->
         Loopctl.LocalGuc.scoped(CaptureFailingRepo, [@probe], fn -> :ok end)
       end
 

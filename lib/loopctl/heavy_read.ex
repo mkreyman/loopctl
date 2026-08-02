@@ -401,15 +401,33 @@ defmodule Loopctl.HeavyRead do
   or `"strict_order"`.
 
   Read from the live-tunable `SystemConfig` key `"hnsw_iterative_scan"` as an INT CODE
-  (0 = off, 1 = relaxed_order — the shipped default — 2 = strict_order, unknown = the shipped
-  default), so an operator turns iterative scan off or up fleet-wide with a single `UPDATE`
-  — no redeploy.
+  (0 = off — **the shipped default** — 1 = relaxed_order, 2 = strict_order, unknown = the
+  shipped default), so an operator turns iterative scan off or up fleet-wide with a single
+  `UPDATE` — no redeploy.
+
+  ## Three values, deliberately not all the same
+
+  | Where | Value | Why |
+  |---|---|---|
+  | shipped `@default_hnsw_iterative_scan` | `0` (off) | a fresh install makes no latency/recall trade it did not ask for |
+  | prod `SystemConfig` row | `1` (relaxed_order) | operator-set in #488; verified against the live app 2026-08-01 |
+  | `config/test.exs` pin | `1` | the suite asserts recall against WHAT PROD RUNS, not against the shipped default |
+
+  The test pin therefore does NOT match the shipped attribute, and must not be "corrected"
+  to: leaving test unpinned is what made CI assert exact recall against a configuration
+  nobody runs, which is the long-running side-table `left: []` flake
+  (`config/test.exs`, and see `test/loopctl/embeddings_side_table_reads_test.exs`).
+
+  Whether the SHIPPED default should move to `1` is an open operator decision — a fleet-wide
+  latency-for-recall trade — and is deliberately not settled here. What is settled is that
+  this doc states all three values, because an earlier revision claimed `1` was the shipped
+  default and that the test pin matched it; both were false, and a reader reasoning from
+  either would have mis-predicted what a fresh install does.
 
   `SystemConfig` is the operator lever and the only RUNTIME source. When no operator has set
   that row, the fallback code comes from the config key `:hnsw_iterative_scan_default`
-  (`default_iterative_scan_code/0`), which ONLY `config/test.exs` sets — pinned to the same
-  value the shipped `@default_hnsw_iterative_scan` carries, so the pin cannot drift out from
-  under the suite unnoticed. Every NON-test config is barred from setting that key by
+  (`default_iterative_scan_code/0`), which ONLY `config/test.exs` sets. Every NON-test config
+  is barred from setting that key by
   `test/loopctl/config_embedding_read_path_test.exs`; an `Application` pin in prod would
   shadow the operator lever. Tests that need a specific mode prime the `SystemConfig` cache
   explicitly in an `async: false` module (see
@@ -429,8 +447,12 @@ defmodule Loopctl.HeavyRead do
   # `SystemConfig` stays the single operator lever; this is only the FALLBACK applied when no
   # operator has set that row. It is config-injected (rather than read straight off the module
   # attribute) so an environment can start from a different baseline without any test mutating
-  # VM-global state. Only `config/test.exs` sets it, to the SAME value the shipped attribute
-  # carries — the suite must assert against the configuration a fresh install actually runs.
+  # VM-global state. Only `config/test.exs` sets it, and DELIBERATELY NOT to the shipped
+  # attribute's value: the suite asserts recall against what PROD runs (the operator-set
+  # `SystemConfig` row, 1) rather than against the shipped default (0). See the
+  # `hnsw_iterative_scan/0` @doc's table — an earlier revision of this comment claimed the two
+  # matched, which would send whoever next reads it to "fix" the pin and reopen the
+  # side-table flake.
   # Every NON-test config is barred from setting `:hnsw_iterative_scan_default` — the key
   # read RIGHT BELOW — by `test/loopctl/config_embedding_read_path_test.exs`, which also
   # asserts `config/test.exs` still sets it. That is the case that matters: an Application
@@ -761,9 +783,21 @@ defmodule Loopctl.HeavyRead do
     # cancel at the tight timeout above — aborts the ENCLOSING transaction (25P02), so every
     # later statement fails over a query it never issued while the `rescue`/`catch` below
     # report a clean `:inconclusive`. That is the hazard `LocalGuc.do_capture/2` guards
-    # against, on the same hot path. It is CONDITIONAL because Postgrex refuses savepoint
+    # against, on the same hot path. It is CONDITIONAL because DBConnection refuses savepoint
     # mode on an idle connection, which is the prod shape (`opts/1` runs outside any
     # transaction) and would otherwise make every prod probe fail.
+    #
+    # DO NOT "simplify" this to an unconditional `mode: :savepoint` to match
+    # `LocalGuc.do_capture/2`. That sibling is unconditional because it only ever runs INSIDE
+    # a transaction; this one does not. A review round proposed exactly that change, on the
+    # theory that #535 had disproved the idle-refusal premise. It had not: measured on an idle
+    # `HeavyReadRepo` connection, `mode: :savepoint` returns
+    # `{:error, %DBConnection.TransactionError{status: :idle}}`. That is an ERROR TUPLE, so it
+    # would fall to the `other ->` branch below and report `:inconclusive` — on EVERY prod
+    # probe — which `inconclusive_verdict/2` then resolves without a conclusive verdict to
+    # reuse, silently disabling iterative scan fleet-wide. Precisely the failure #535 fixed.
+    # `test/loopctl/heavy_read_savepoint_probe_test.exs` pins the refusal so the premise
+    # cannot be re-litigated from memory.
     query_opts =
       if repo().in_transaction?(),
         do: [timeout: @probe_timeout_ms, mode: :savepoint],

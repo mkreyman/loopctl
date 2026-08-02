@@ -113,14 +113,28 @@ Design points (`Loopctl.HeavyRead.hnsw_iterative_scan/0`, `hnsw_max_scan_tuples/
 | `1` | `SET LOCAL hnsw.iterative_scan = relaxed_order` (+ `hnsw.max_scan_tuples`) |
 | `2` | `SET LOCAL hnsw.iterative_scan = strict_order` (+ `hnsw.max_scan_tuples`) |
 
-- **Single source of truth.** `SystemConfig` only. There is deliberately **no**
-  `Application`-level override (and none may be added — `config_embedding_read_path_test.exs`
-  fails the build on one): an env pin would shadow the operator lever in prod, and pinning
-  it ON for the test env would make CI stop exercising the shipped default (`0`) and go
-  blind to exactly the filtered-under-return class this lever addresses. Tests that need a
-  mode prime the `SystemConfig` cache explicitly in an `async: false` module.
-- **Ships OFF, on purpose.** It is an operator flip made **after** confirming the deployed
-  pgvector is >= 0.8, per the runbook — not a default.
+- **Single source of truth at RUNTIME.** `SystemConfig` only. No `Application`-level override
+  may be set in any NON-test config — `config_embedding_read_path_test.exs` fails the build
+  on one — because an env pin would shadow the operator lever in prod. Tests that need a
+  specific mode prime the `SystemConfig` cache explicitly in an `async: false` module.
+- **The test env IS pinned, and that is not a contradiction of the line above.**
+  `config/test.exs` sets `:hnsw_iterative_scan_default` to `1`. An earlier revision of this
+  section said no override existed anywhere and that CI exercised the shipped `0`; both were
+  false once the pin landed, and the guard test it cites bars the key only outside test.
+  The pin exists because leaving test unpinned made CI assert exact recall against a
+  configuration **nobody runs**: the ANN applies `tenant_id` as a post-index residual, so a
+  tenant whose rows fall outside the global top-`ef_search` batch is silently dropped and the
+  read returns `[]`. That is the long-running side-table flake (3 failing runs / 23 before the
+  pin, 0 / 25 after; four earlier "recall" fixes never touched the mechanism). Under-return
+  coverage of the OFF path is asserted directly against `HeavyRead.opts/1` in
+  `test/loopctl/heavy_read_hnsw_ef_search_test.exs` instead, where the OFF decision actually
+  lives.
+- **Ships OFF; prod runs ON.** The shipped `@default_hnsw_iterative_scan` is `0`, so a fresh
+  install makes no latency-for-recall trade it did not ask for. The `loopctl` production
+  deployment has the operator-set row at `1` (relaxed_order) since #488, verified against the
+  live app 2026-08-01. The test pin matches PROD, not the shipped default — three values, on
+  purpose. Whether the shipped default should move to `1` is an open operator decision and is
+  deliberately not settled in code; raise it as its own change with a benchmark.
 - **Fail-closed, non-poisoning capability probe.** `iterative_scan_supported?/0` reads
   `pg_extension` on the SAME repo the ANN read uses (`HeavyRead.repo/0`, with an explicit
   5s timeout) and caches the answer in `:persistent_term` **with a TTL**. An old extension →
