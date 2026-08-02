@@ -814,7 +814,9 @@ defmodule Loopctl.ApiSpec.Schemas do
         credential_id: %Schema{type: :string, description: "Base64url credential id"},
         friendly_name: %Schema{
           type: :string,
-          description: "Operator-supplied label (1..120 chars, default \"Authenticator\")"
+          description:
+            "Operator-supplied label (1..120 BYTES — the same unit the schema " <>
+              "validates — default \"Authenticator\")"
         },
         reauth_assertion: WebAuthnAssertion
       }
@@ -911,7 +913,8 @@ defmodule Loopctl.ApiSpec.Schemas do
       title: "AuthenticatorListResponse",
       description:
         "The tenant's enrolled authenticators. Credential material " <>
-          "(credential_id, public_key) is deliberately never returned.",
+          "(credential_id, public_key) is deliberately never returned — only the " <>
+          "non-reversible credential_fingerprint.",
       type: :object,
       required: [:data],
       properties: %{
@@ -922,6 +925,13 @@ defmodule Loopctl.ApiSpec.Schemas do
             properties: %{
               id: %Schema{type: :string, format: :uuid},
               friendly_name: %Schema{type: :string},
+              credential_fingerprint: %Schema{
+                type: :string,
+                description:
+                  "Truncated SHA-256 of the credential id, as recorded in the audit " <>
+                    "chain. Credential-derived and not writable by any endpoint, unlike " <>
+                    "friendly_name — confirm a revocation target against this."
+              },
               attestation_format: %Schema{type: :string},
               inserted_at: %Schema{type: :string, format: :"date-time"},
               last_used_at: %Schema{type: :string, format: :"date-time", nullable: true}
@@ -947,8 +957,9 @@ defmodule Loopctl.ApiSpec.Schemas do
         friendly_name: %Schema{
           type: :string,
           description:
-            "New operator-facing label. Capped at 120 bytes; an over-long value is " <>
-              "rejected with 422 friendly_name_too_long.",
+            "New operator-facing label. Capped at 120 bytes (the same unit the schema " <>
+              "validates); an over-long value is rejected with 422 " <>
+              "friendly_name_too_long, a non-UTF-8 one with 422 friendly_name_invalid.",
           minLength: 1,
           example: "mac-mini Touch ID"
         }

@@ -643,6 +643,13 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
       assert row["friendly_name"] == "mac-mini Touch ID"
       refute Map.has_key?(row, "credential_id")
       refute Map.has_key?(row, "public_key")
+
+      # Enumerable ids + an assertion-free rename mean a stolen user-role key can
+      # relabel every device a tenant owns, and the label is what an operator
+      # steers a WebAuthn-gated revoke by. The fingerprint is credential-derived,
+      # no endpoint writes it, and it is the same value the audit chain records —
+      # so a mislabel cannot make the wrong credential look like the right one.
+      assert row["credential_fingerprint"] == Tenants.fingerprint(auth.credential_id)
     end
 
     test "403s a caller addressing a tenant it does not own", %{conn: conn} do
@@ -812,6 +819,78 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
 
       assert AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id).friendly_name ==
                "mac-mini"
+    end
+
+    test "rejects a non-UTF-8 friendly_name with 422 instead of 500ing on the UPDATE",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "keep me")
+
+      # A urlencoded body can carry bytes the JSON parser would have refused.
+      # Without the validity check these reach Postgres, which rejects the
+      # encoding — hostile input then gets an unstructured 500.
+      response =
+        conn
+        |> authed(raw_key)
+        |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+          "friendly_name" => <<0xFF, 0xFE>>
+        })
+        |> json_response(422)
+
+      assert response["error"]["code"] == "friendly_name_invalid"
+      assert AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id).friendly_name == "keep me"
+    end
+
+    test "renaming to the CURRENT label still touches the row", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, friendly_name: "same label")
+
+      conn
+      |> authed(raw_key)
+      |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+        "friendly_name" => "same label"
+      })
+      |> json_response(200)
+
+      # A no-change changeset makes Ecto skip the UPDATE entirely and return
+      # {:ok, struct} — so Ecto.StaleEntryError could never fire, and a rename
+      # racing a revoke would 200 (and append an audit entry) for a row that no
+      # longer exists. `force: true` is what keeps that guard live; a bumped
+      # updated_at is the observable proof the statement was issued.
+      assert DateTime.compare(
+               AdminRepo.get!(Loopctl.Tenants.RootAuthenticator, auth.id).updated_at,
+               auth.updated_at
+             ) == :gt
+    end
+
+    test "429s with the RENAME bucket named, not the enrollment budget", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id)
+
+      # Deny ONLY the controller's own rename bucket, so the inbound RPM plug
+      # still lets the request through to the action under test.
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "rename:actions:" <> _tenant, _window, _limit -> {:deny, 0}
+        _bucket, _window, _limit -> {:allow, 1}
+      end)
+
+      response =
+        conn
+        |> authed(raw_key)
+        |> patch(~p"/api/v1/tenants/#{tenant.id}/authenticators/#{auth.id}", %{
+          "friendly_name" => "throttled"
+        })
+        |> json_response(429)
+
+      assert response["error"]["code"] == "rate_limited"
+
+      # Rename has its own far looser budget; reporting the ceremony budget as
+      # spent would send an operator away from an enrollment still available.
+      assert response["error"]["message"] =~ "rename"
+      refute response["error"]["message"] =~ "enrollment"
     end
 
     test "404s a malformed auth_id instead of raising Ecto.Query.CastError", %{conn: conn} do

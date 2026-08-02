@@ -28,8 +28,18 @@ defmodule LoopctlWeb.EnrollLiveTest do
 
   @hook_path "assets/js/hooks/authenticator_enroll.js"
   @app_js_path "assets/js/app.js"
+  @live_path "lib/loopctl_web/live/enroll_live.ex"
 
   setup :verify_on_exit!
+
+  # `:__changed__` is render bookkeeping, not retained state.
+  defp socket_assigns(view) do
+    view.pid
+    |> :sys.get_state()
+    |> Map.fetch!(:socket)
+    |> Map.fetch!(:assigns)
+    |> Map.delete(:__changed__)
+  end
 
   describe "GET /enroll" do
     test "renders unauthenticated, with the ceremony controls", %{conn: conn} do
@@ -128,6 +138,7 @@ defmodule LoopctlWeb.EnrollLiveTest do
       # any pushed frame and a visitor can kill the channel process at will
       # (the same hardening SignupLive already carries).
       {:ok, view, _html} = live(conn, ~p"/enroll")
+      assigns_before = socket_assigns(view)
 
       # Survives the frame (no FunctionClauseError killing the channel)...
       assert render_hook(view, "junk", %{"api_key" => "lc_user_leaked_secret"}) =~
@@ -135,8 +146,23 @@ defmodule LoopctlWeb.EnrollLiveTest do
 
       assert Process.alive?(view.pid)
 
-      # ...and retained nothing from it.
-      refute render(view) =~ "lc_user_leaked_secret"
+      # ...and retained nothing from it. Asserted on the ASSIGNS, not the
+      # rendered HTML: assigns are what reaches a crash dump and telemetry, and
+      # a handler that stashes the key without rendering it leaks just as badly.
+      assert socket_assigns(view) == assigns_before
+
+      # A pushed frame can only exercise the event names it names. The property
+      # the page's security argument actually rests on — the one the deleted
+      # `refute function_exported?(EnrollLive, :handle_event, 3)` guard covered —
+      # is that there is EXACTLY ONE clause and it binds nothing. A future
+      # `handle_event("submit", params, socket)` added above the catch-all would
+      # pass every runtime assertion here.
+      source = File.read!(@live_path)
+
+      assert length(Regex.scan(~r/^\s*def handle_event\(/m, source)) == 1,
+             "EnrollLive must have exactly one handle_event/3 clause: the terminal no-op"
+
+      assert source =~ "def handle_event(_event, _params, socket), do: {:noreply, socket}"
     end
 
     test "the hook never pushes anything over the LiveView socket" do

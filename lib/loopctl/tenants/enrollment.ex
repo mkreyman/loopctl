@@ -111,6 +111,8 @@ defmodule Loopctl.Tenants.Enrollment do
           | {:error, :not_found}
           | {:error, :reauth_required}
           | {:error, :too_many_authenticators}
+          | {:error, :audit_failed}
+          | {:error, :internal_error}
           | {:error, Ecto.Changeset.t()}
   def enroll(tenant_id, attrs, assertion_verified?)
       when is_binary(tenant_id) and is_map(attrs) and is_boolean(assertion_verified?) do
@@ -128,26 +130,37 @@ defmodule Loopctl.Tenants.Enrollment do
       |> Multi.run(:reloaded_tenant, fn repo, _changes -> {:ok, repo.get!(Tenant, tenant_id)} end)
       |> Audit.log_in_multi(:audit, &build_enroll_audit_attrs(tenant_id, &1))
 
-    case AdminRepo.transaction(multi) do
-      {:ok, %{authenticator: auth, reloaded_tenant: tenant, flip_tier: {flipped, _}}} ->
-        on_enroll_success(tenant_id, tenant, auth, flipped)
-
-      {:error, :tenant, :not_found, _changes} ->
-        {:error, :not_found}
-
-      {:error, :assert_gate, :reauth_required, _changes} ->
-        {:error, :reauth_required}
-
-      {:error, :check_cap, :too_many_authenticators, _changes} ->
-        {:error, :too_many_authenticators}
-
-      {:error, :authenticator, %Ecto.Changeset{} = changeset, _changes} ->
-        {:error, changeset}
-
-      {:error, _step, reason, _changes} ->
-        {:error, reason}
-    end
+    multi |> AdminRepo.transaction() |> enroll_result(tenant_id)
   end
+
+  defp enroll_result({:ok, changes}, tenant_id) do
+    %{authenticator: auth, reloaded_tenant: tenant, flip_tier: {flipped, _}} = changes
+    on_enroll_success(tenant_id, tenant, auth, flipped)
+  end
+
+  defp enroll_result({:error, :tenant, :not_found, _changes}, _tenant_id),
+    do: {:error, :not_found}
+
+  defp enroll_result({:error, :assert_gate, :reauth_required, _changes}, _tenant_id),
+    do: {:error, :reauth_required}
+
+  defp enroll_result({:error, :check_cap, :too_many_authenticators, _changes}, _tenant_id),
+    do: {:error, :too_many_authenticators}
+
+  defp enroll_result(
+         {:error, :authenticator, %Ecto.Changeset{} = changeset, _changes},
+         _tenant_id
+       ),
+       do: {:error, changeset}
+
+  # Same split rename/4 makes: an audit-chain append failure is an internal
+  # fault, and returning its changeset would render a 422 blaming the caller's
+  # enrollment payload for it. Everything else is an unmatched Multi failure and
+  # must not be reported as an audit-log fault either.
+  defp enroll_result({:error, :audit, _reason, _changes}, _tenant_id), do: {:error, :audit_failed}
+
+  defp enroll_result({:error, _step, _reason, _changes}, _tenant_id),
+    do: {:error, :internal_error}
 
   # US-33.3: a first-device enrollment flips the tenant to :human_anchored. The
   # api-key cache stores each key WITH its :tenant preloaded (trust_tier is read by
@@ -184,6 +197,8 @@ defmodule Loopctl.Tenants.Enrollment do
           {:ok, RootAuthenticator.t()}
           | {:error, :not_found}
           | {:error, :last_authenticator}
+          | {:error, :audit_failed}
+          | {:error, :internal_error}
   def revoke(tenant_id, authenticator_id)
       when is_binary(tenant_id) and is_binary(authenticator_id) do
     multi =
@@ -227,8 +242,14 @@ defmodule Loopctl.Tenants.Enrollment do
       {:error, :guard_last, :last_authenticator, _changes} ->
         {:error, :last_authenticator}
 
-      {:error, _step, reason, _changes} ->
-        {:error, reason}
+      {:error, :audit, _reason, _changes} ->
+        {:error, :audit_failed}
+
+      # Never leak an unmatched Multi reason to the caller: `do_revoke/4` has no
+      # clause for a changeset, so returning one crashed with a CaseClauseError
+      # instead of a structured 500.
+      {:error, _step, _reason, _changes} ->
+        {:error, :internal_error}
     end
   end
 
@@ -263,6 +284,7 @@ defmodule Loopctl.Tenants.Enrollment do
           {:ok, RootAuthenticator.t()}
           | {:error, :not_found}
           | {:error, :audit_failed}
+          | {:error, :internal_error}
           | {:error, Ecto.Changeset.t()}
   def rename(tenant_id, authenticator_id, friendly_name, opts \\ [])
       when is_binary(tenant_id) and is_binary(authenticator_id) and is_binary(friendly_name) do
@@ -276,8 +298,16 @@ defmodule Loopctl.Tenants.Enrollment do
         # this UPDATE. Ecto RAISES Ecto.StaleEntryError on a zero-row update
         # rather than returning an error tuple, which would escape the
         # transaction as a 500 instead of the 404 the endpoint documents.
+        #
+        # `force: true` is load-bearing: renaming a label to its CURRENT value
+        # yields a changeset with no changes, and Ecto then returns {:ok, struct}
+        # WITHOUT issuing any SQL — so the row is never touched, StaleEntryError
+        # can never fire, and a rename racing a revoke would 200 (and audit) a
+        # row that no longer exists. Forcing the UPDATE makes every rename hit
+        # the row, so the stale case is always detected.
         try do
-          repo.update(RootAuthenticator.rename_changeset(auth, %{friendly_name: friendly_name}))
+          RootAuthenticator.rename_changeset(auth, %{friendly_name: friendly_name})
+          |> repo.update(force: true)
         rescue
           Ecto.StaleEntryError -> {:error, :not_found}
         end
@@ -309,11 +339,16 @@ defmodule Loopctl.Tenants.Enrollment do
       {:error, :renamed, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
 
-      # Anything left is the :audit step — an INTERNAL fault, not a caller
-      # mistake. Returning its changeset here would render the operator a 422
-      # blaming their friendly_name for an audit-chain append failure.
-      {:error, _step, _reason, _changes} ->
+      # The :audit step is an INTERNAL fault, not a caller mistake. Returning its
+      # changeset here would render the operator a 422 blaming their
+      # friendly_name for an audit-chain append failure. Matched BY STEP NAME: a
+      # Postgrex fault on the :renamed UPDATE is not an audit-log failure, and
+      # reporting it as one points whoever triages it at the wrong subsystem.
+      {:error, :audit, _reason, _changes} ->
         {:error, :audit_failed}
+
+      {:error, _step, _reason, _changes} ->
+        {:error, :internal_error}
     end
   end
 
