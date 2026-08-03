@@ -1075,9 +1075,9 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
-      # The counter means "the valve is currently ADMITTING because it can't measure", so a
-      # REFUSAL must not fire it — otherwise it over-reports admissions during exactly the
-      # incident an operator alerts on.
+      # The counter means "the gate could not MEASURE the backlog", so the REFUSAL must fire
+      # it too, tagged `outcome: :exhausted` — emitting only on admits made the sole alertable
+      # signal go silent at the moment the fault stopped being a blip and became the wedge.
       attach_failed_open(tenant.id)
 
       expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
@@ -1116,7 +1116,10 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert_receive {:fail_open_bucket, bucket}
       assert bucket =~ tenant.id
 
-      refute_receive {:backlog_failed_open, _measurements, _metadata}, 20
+      # Still alertable AFTER the allowance is spent, and distinguishable from an admission.
+      assert_receive {:backlog_failed_open, %{count: 1, jobs: 1}, metadata}
+      assert metadata.outcome == :exhausted
+      assert metadata.error_class == "exit:noproc"
     end
 
     test "the fail-open allowance is charged per ITEM, not per request", %{conn: conn} do
@@ -1126,6 +1129,8 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       # must spend one token, so the meter is in the same unit as the threshold.
       tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      attach_failed_open(tenant.id)
 
       expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
         exit({:noproc, {DBConnection, :execute, []}})
@@ -1157,6 +1162,12 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert_receive :fail_open_token
       assert_receive :fail_open_token
       refute_receive :fail_open_token, 20
+
+      # The telemetry measurement is in the SAME unit as the allowance and the threshold. A
+      # per-REQUEST `count` alone under-read the admitted work of a batch by up to @batch_max,
+      # so a dashboard could not tell how close a tenant sat to the bound.
+      assert_receive {:backlog_failed_open, %{count: 1, jobs: 3}, metadata}
+      assert metadata.outcome == :admitted
     end
 
     test "a NON-timeout SQLSTATE is not reported as a timeout", %{conn: conn} do
@@ -1195,6 +1206,60 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
       assert_receive {:backlog_failed_open, %{count: 1}, metadata}
       assert metadata.error_class == "db_error"
+    end
+
+    test "a resource-exhaustion SQLSTATE is METERED, not waved through as a query bug",
+         %{conn: conn} do
+      # 53300 too_many_connections (and 57P03 / 08xxx) arrive as a Postgrex server ERROR, not
+      # a `DBConnection` exit — the normal presentation of a saturated pool behind pgbouncer.
+      # Lumping them into the unmetered `db_error` class meant the MOST LIKELY shape of the
+      # sustained pool fault kept the unconditional admit this bound exists to remove.
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      attach_failed_open(tenant.id)
+
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        raise %Postgrex.Error{
+          postgres: %{
+            code: :too_many_connections,
+            pg_code: "53300",
+            message: "sorry, too many clients already"
+          }
+        }
+      end)
+
+      test_pid = self()
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, limit ->
+        if String.starts_with?(bucket, "ingest_backlog_fail_open:") do
+          send(test_pid, :fail_open_token)
+          {:deny, limit}
+        else
+          {:allow, 1}
+        end
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [
+            %{content: "Pool pressure item one", source_type: "newsletter"},
+            %{content: "Pool pressure item two", source_type: "newsletter"}
+          ]
+        })
+
+      assert json_response(conn, 429)["error"]["code"] == "ingestion_backlog_exceeded"
+
+      # ONE token check for a 2-item batch: charging on past the first denial would queue
+      # more checkouts onto the very pool that is already starved.
+      assert_receive :fail_open_token
+      refute_receive :fail_open_token, 20
+
+      assert_receive {:backlog_failed_open, %{count: 1, jobs: 2}, metadata}
+      assert metadata.error_class == "db_pressure"
+      assert metadata.outcome == :exhausted
     end
 
     test "a 57014 cancel IS reported as a timeout", %{conn: conn} do
