@@ -106,6 +106,14 @@ Mox.defmock(Loopctl.MockCustodyCoverage, for: Loopctl.Custody.CoverageBehaviour)
 # `Mox.stub/3`, which is scoped to the calling process.
 Mox.defmock(Loopctl.MockEmbeddingReadPath, for: Loopctl.Embeddings.ReadPathBehaviour)
 
+# GH #551: DI seam for the US-41.1 legacy-column retirement trigger. It exists for one
+# branch — `LegacyEmbeddingRetirementWorker`'s fail-closed handling of a probe that
+# cannot read the catalog — which is unreachable otherwise, because the test database
+# always answers that query. An untested fail-closed path is indistinguishable from an
+# absent one, and the absent one is exactly the #551 defect. The DataCase default stub
+# delegates to the real `Loopctl.Embeddings.LegacyRetirement`.
+Mox.defmock(Loopctl.MockLegacyRetirement, for: Loopctl.Embeddings.LegacyRetirementBehaviour)
+
 # US-27.16: DI seam for the streaming-export producer's per-body observation point. The
 # bounded-memory scale gate must prove its metric is LOAD-BEARING by turning the streaming
 # producer into a MATERIALIZING one, which needs a seam in the production emit path.
