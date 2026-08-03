@@ -44,6 +44,25 @@ config :loopctl,
   # progress. `0` disables caching entirely (config/test.exs sets 0 so tests observe
   # a disclosure change immediately).
   embedding_disclosure_cache_ms: 5_000,
+  # GH #551: the US-41.1 legacy-column RETIREMENT trigger
+  # (`Loopctl.Embeddings.LegacyRetirement`). Nothing here drops a column — these two
+  # values decide only when the system starts SAYING the drop is owed.
+  #
+  # - required_clear_days: consecutive UTC days that must show `embedding_side_table_reads
+  #   = 1` and zero movement in any legacy index's `idx_scan` before the evidence trigger
+  #   fires. 30 is chosen to span the slowest recurring workload that could still touch
+  #   the legacy path (the weekly MOC fan-out, the monthly-ish scale runs), so a clear
+  #   window means clear, not merely "nothing ran".
+  # - review_by: the date past which retirement is owed REGARDLESS of the evidence. Set
+  #   six months after the 2026-07-22 read-flag flip. This is the part that makes the
+  #   check fail closed: a probe that errors forever, or an `idx_scan` that never settles,
+  #   is indistinguishable from "not due yet", so an evidence-only trigger decays
+  #   silently back into the prose it replaced. Moving this date out is a legitimate
+  #   operator decision — making it moot by accident is not.
+  embedding_legacy_retirement: [
+    required_clear_days: 30,
+    review_by: ~D[2027-01-22]
+  ],
   # US-38.4: EXPLICIT pgvector HNSW build parameters for every `CREATE INDEX ... USING
   # hnsw` (`Loopctl.Repo.HnswIndex`). These EQUAL pgvector's implicit defaults (m=16,
   # ef_construction=64) — a deliberate, documented "keep the defaults" tuning outcome

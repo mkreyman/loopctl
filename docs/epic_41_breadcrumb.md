@@ -1,6 +1,15 @@
-# Epic 41 — Private/Local Knowledge Tier (Draft, Needs Review)
+# Epic 41 — Private/Local Knowledge Tier
 
-**Status:** Draft in PR #410; awaiting enhanced review before implementation
+**Status:** PARTLY SHIPPED — 5 of 7 stories merged. See the story table in
+[`docs/user_stories/epic_41_private_local_tier/README.md`](user_stories/epic_41_private_local_tier/README.md)
+for the per-story state and merge PR; this file records the DESIGN decisions that got
+the epic here and is not re-verified per merge.
+
+Everything below the "Re-scope" heading is the 2026-07-20 draft's reasoning, preserved
+as written. It describes what was TRUE THEN — treat its present tense as historical.
+**Grounded current state** in particular was verified against master 2026-07-20 and has
+since been overtaken by the merges the story table lists.
+
 **Filed:** GH issue #409 (a loopctl user's self-host blocker + privacy concern)
 **Companion:** GH issue #331 (agent-usable KB curation) — SHIPPED. Together the two
 define the real gap: agent-native curation of PRIVATE data.
@@ -56,7 +65,7 @@ repo-coordination-bus epic, and 40 is the coordination-bus v2 epic.
 - `private`/`owner` visibility is a metadata string filtered ONLY for agent-role
   callers (`coordination.ex:1021-1022`); memories have no visibility field at all
 
-## Next Steps
+## Next Steps (as planned on 2026-07-20 — steps 1-2 and most of 3 are DONE)
 1. `/review:enhanced-review-workflow` on PR #410 (README + 7 stories)
 2. Fix confirmed findings — no deferrals
 3. Implement **41.4 first** -> 41.1 -> 41.2 -> 41.3 -> 41.5, then 41.6 / 41.7.

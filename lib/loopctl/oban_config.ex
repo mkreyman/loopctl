@@ -492,7 +492,18 @@ defmodule Loopctl.ObanConfig do
          # IEx call. Bounded per run; a backlog drains over successive hourly runs.
          # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
          {"15 * * * *", Loopctl.Workers.EmbeddingReconciliationWorker,
-          args: %{"mode" => "all_tenants"}}
+          args: %{"mode" => "all_tenants"}},
+         # GH #551: the RETIREMENT trigger for the US-41.1 legacy embedding columns.
+         # Records one observation per UTC day (the `idx_scan` deltas that "zero scans
+         # over N days" is made of) and raises an operator alert once retirement is
+         # owed — by evidence, or by the `review_by` deadline if the evidence never
+         # settles. Never drops anything. DAILY and HARDCODED (no env var), like
+         # IngestionHealthWorker: the interval is a latency knob on a decision measured
+         # in months, so app boot must not gain a dependency on a new env var for it.
+         # 03:40 UTC sits between the 03:00 webhook/token cleanups and the 04:00
+         # knowledge-lint fan-out rather than piling onto either. Keep in sync with the
+         # crontab assertion in oban_plugins_config_test.exs.
+         {"40 3 * * *", Loopctl.Workers.LegacyEmbeddingRetirementWorker}
        ]},
       # Rescue jobs orphaned in :executing when a node dies mid-run (e.g. a deploy).
       # Without Lifeline these rows stay `executing` forever — 110 such orphans (from

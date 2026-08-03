@@ -705,6 +705,23 @@ config :loopctl, :custody_flush_debounce_seconds, 0
 # the real `SystemConfigReadPath`, so every other test keeps production behaviour.
 config :loopctl, :embedding_read_path, Loopctl.MockEmbeddingReadPath
 
+# GH #551: the legacy-column retirement trigger is injected (see
+# `Loopctl.Embeddings.LegacyRetirementBehaviour`) so the worker's fail-closed probe-error
+# branch is reachable from a test — the test database never fails the catalog read that
+# would produce it in production. `Loopctl.DataCase.stub_all_defaults/0` stubs this mock
+# to the real `Loopctl.Embeddings.LegacyRetirement`, so every other test sees production
+# behaviour.
+config :loopctl, :legacy_retirement, Loopctl.MockLegacyRetirement
+
+# GH #551: a SHORT evidence window in tests. The production bar is 30 days; asserting
+# against it would mean fabricating 30 observation rows per test to say something that
+# is true at 3. The window LENGTH is not what the tests are checking — the gate logic
+# over a window of that length is — and `required_clear_days` is threaded through
+# `evaluate/2` opts, so the tests that DO care state their own.
+config :loopctl, :embedding_legacy_retirement,
+  required_clear_days: 3,
+  review_by: ~D[2027-01-22]
+
 # #488 / US-41.1: `hnsw.iterative_scan` is pinned ON for the TEST env only.
 #
 # It is the PRODUCTION remedy for cross-tenant filtered-ANN under-return. THREE values are in

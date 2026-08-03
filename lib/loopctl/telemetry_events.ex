@@ -453,6 +453,26 @@ defmodule Loopctl.TelemetryEvents do
   """
   def channel_post_quarantined, do: [:loopctl, :coordination, :channel_post_quarantined]
 
+  @doc """
+  The US-41.1 legacy-column retirement probe
+  (`Loopctl.Embeddings.LegacyRetirement.probe/0`, GH #551) could NOT read the live
+  legacy embedding footprint.
+
+  Worth its own signal because of what the failure looks like from outside: a probe
+  that errors every run is indistinguishable from a probe that keeps finding nothing
+  to retire. Without this event the monitor's own death is silent, and a silent
+  retirement monitor is the exact failure #551 exists to close.
+
+  ## Payload (bounded tags only)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{error_class}` — the raised exception's MODULE name (e.g.
+      `"Postgrex.Error"`, `"DBConnection.ConnectionError"`) or `"rollback"` for a
+      returned error tuple. A bounded dimension, never the failure's message.
+  """
+  def legacy_retirement_probe_failed,
+    do: [:loopctl, :embeddings, :legacy_retirement_probe_failed]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -479,7 +499,8 @@ defmodule Loopctl.TelemetryEvents do
       sweep_stall_detection_failed(),
       channel_post_rescanned(),
       channel_post_rescan_failed(),
-      channel_post_quarantined()
+      channel_post_quarantined(),
+      legacy_retirement_probe_failed()
     ]
   end
 end
