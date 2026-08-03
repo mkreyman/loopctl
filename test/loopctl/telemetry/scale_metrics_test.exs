@@ -47,6 +47,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.db.error.count",
     "loopctl.heavy_read_repo.query.duration",
     "loopctl.knowledge.vector_search.under_fill.count",
+    "loopctl.knowledge.vector_search.under_fill_probe_degraded.count",
     "loopctl.knowledge.semantic_fallback.count",
     "loopctl.knowledge.hybrid_provenance.count",
     "loopctl.repo.checkout.queue_time",
@@ -83,8 +84,9 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   # `:purpose`/`:state` (index_health.invalid — three bounded fixed sets), `:op`
   # (secrets.orphan_cleanup_failed — normalized `:delete`/`:restore`/`:unknown`), and
   # `:stage` (memory_promotion.failed — bounded `:compile`/`:persist`/`:enqueue`). US-34.1
-  # adds `:poller` (oban.poll.error.count — bounded `:queue_state`/`:executing_orphans`)
-  # and `:error_class` (oban.poll.error.count — CLASSIFIED, never a raw exception).
+  # adds `:poller` (oban.poll.error.count — bounded, one value per entry in
+  # `LoopctlWeb.Telemetry.periodic_measurements/0`) and `:error_class` (CLASSIFIED, never a
+  # raw exception or exit reason — also carried by the two degraded-read counters).
   @allowed_tags MapSet.new([
                   :endpoint,
                   :mapped_code,
@@ -981,14 +983,20 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                exception: %RuntimeError{}
              }) == %{poller: :queue_state, error_class: "other"}
 
-      # An EXIT is not an exception, so the pollers' `catch :exit` clauses hand it over
-      # wrapped. Without its own class a wedged-pool checkout — which exits rather than
-      # raising — would report as the generic "other" bucket, or (before the catch clauses
-      # existed) not report at all, because telemetry_poller had already dropped the MFA.
+      # An EXIT/THROW is not an exception, so `guarded_measurement/5` hands it over wrapped
+      # (with a BOUNDED tag, never the raw reason). Without its own class a wedged-pool
+      # checkout — which exits rather than raising — would report as the generic "other"
+      # bucket, or (before the catch clause existed) not report at all, because
+      # telemetry_poller had already dropped the MFA.
       assert ScaleMetrics.oban_poll_error_tags(%{
                poller: :executing_orphans,
-               exception: {:exit, {:noproc, {DBConnection, :execute, []}}}
+               exception: {:exit, "noproc"}
              }) == %{poller: :executing_orphans, error_class: "exit"}
+
+      assert ScaleMetrics.oban_poll_error_tags(%{
+               poller: :cluster_readiness,
+               exception: {:throw, "unknown"}
+             }) == %{poller: :cluster_readiness, error_class: "throw"}
     end
 
     test "oban_poll_error_tags/1 defaults missing keys to \"unknown\", never raises" do
@@ -1005,13 +1013,149 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert counter.event_name == [:loopctl, :oban, :poll, :error]
       assert MapSet.new(counter.tags) == MapSet.new([:poller, :error_class])
     end
+  end
 
-    # The DB-backed zero-fill / drain-to-zero behavior of poll_oban_queue_state/0
-    # itself is covered in oban_metrics_poller_test.exs (TC-34.1.1b/c), which uses
-    # `Loopctl.DataCase` for `Loopctl.Repo` sandbox isolation — this file is
-    # intentionally pure/no-DB (see moduledoc), so it only covers the fixed
-    # matrix inputs (`oban_states/0`/`oban_active_states/0`/`oban_queues/0`) here.
+  # R2 review finding: the four measurement guards were four hand-written copies that NO
+  # test drove — deleting every `catch` clause left the suite green, and a poller cannot be
+  # made to exit on demand through Ecto (which raises on every lookup/ownership failure), so
+  # nothing was ever going to. They are now ONE guard, and this is the test that fails if its
+  # `catch`/`rescue` is removed.
+  describe "guarded_measurement/5 — the one periodic-measurement guard" do
+    setup do
+      test_pid = self()
+      handler_id = "test-guarded-measurement-#{System.unique_integer([:positive])}"
 
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :oban, :poll, :error],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:poll_error, metadata, measurements})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+      :ok
+    end
+
+    defp guarded(fun),
+      do: ScaleMetrics.guarded_measurement(:queue_state, "Probe poll", "consequence", :held, fun)
+
+    test "an EXITING body returns the fallback, logs a BOUNDED tag, and fires the counter" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert guarded(fn -> exit({:noproc, {DBConnection, :execute, []}}) end) == :held
+        end)
+
+      # The production exit shape is a TUPLE, not a bare atom; and neither the log nor the
+      # telemetry metadata may carry the raw reason (it holds the DBConnection call tuple,
+      # module and args).
+      assert log =~ "Probe poll aborted (exit: noproc); consequence"
+      refute log =~ "DBConnection"
+
+      assert_receive {:poll_error, %{poller: :queue_state, exception: exception}, %{count: 1}},
+                     500
+
+      refute inspect(exception) =~ "DBConnection"
+
+      assert ScaleMetrics.oban_poll_error_tags(%{poller: :queue_state, exception: exception}) ==
+               %{poller: :queue_state, error_class: "exit"}
+    end
+
+    test "a THROWING body is guarded too — telemetry_poller drops an MFA on all three kinds" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert guarded(fn -> throw(:boom) end) == :held
+        end)
+
+      assert log =~ "Probe poll aborted (throw: boom)"
+
+      assert_receive {:poll_error, %{poller: :queue_state, exception: exception}, %{count: 1}},
+                     500
+
+      assert ScaleMetrics.oban_poll_error_tags(%{poller: :queue_state, exception: exception}) ==
+               %{poller: :queue_state, error_class: "throw"}
+    end
+
+    test "a RAISING body keeps its own message and passes the struct through for classification" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert guarded(fn -> raise ArgumentError, "bad tunable" end) == :held
+        end)
+
+      assert log =~ "Probe poll failed (ArgumentError); consequence"
+      refute log =~ "bad tunable"
+
+      assert_receive {:poll_error, %{poller: :queue_state, exception: %ArgumentError{}},
+                      %{count: 1}},
+                     500
+    end
+
+    test "a SUCCEEDING body returns its own value and fires no counter" do
+      assert guarded(fn -> :ok end) == :ok
+      refute_receive {:poll_error, _metadata, _measurements}, 200
+    end
+  end
+
+  describe "tenant-label gate — one grace cycle before a failed count flips it" do
+    setup do
+      original = :persistent_term.get({ScaleMetrics, :tenant_label?}, :unset)
+      on_exit(fn -> :persistent_term.put({ScaleMetrics, :tenant_label?}, original) end)
+
+      # Make `Tenants.count()` fail DETERMINISTICALLY and without a DB: an Ecto dynamic repo
+      # that was never started raises on lookup. Process-local, so it dies with this test.
+      Loopctl.AdminRepo.put_dynamic_repo(:scale_metrics_unstarted_repo)
+      :ok
+    end
+
+    test "the first failure HOLDS the gate; the second consecutive failure forces it OFF" do
+      :persistent_term.put({ScaleMetrics, :tenant_label?}, true)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          # Cycle 1: held. An intermittently wedged pool used to flip the gate (and every
+          # per-tenant series' label) OFF here, then back ON the next cycle, paying the
+          # global `:persistent_term.put/2` term-table scan on each flap.
+          assert ScaleMetrics.refresh_tenant_label_gate()
+          assert ScaleMetrics.tenant_label?()
+
+          # Cycle 2: a PERSISTENTLY unmeasurable count can never leave an unbounded tenant
+          # label live (AC-27.15.3), so the grace is exactly one cycle.
+          refute ScaleMetrics.refresh_tenant_label_gate()
+          refute ScaleMetrics.tenant_label?()
+        end)
+
+      assert log =~ "tenant-label gate refresh failed"
+      assert log =~ "holding the gate for one cycle"
+    end
+
+    test "a failed refresh is alertable: it fires the poll-failure counter like every other measurement" do
+      test_pid = self()
+      handler_id = "test-gate-poll-error-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :oban, :poll, :error],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:poll_error, metadata, measurements})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      ExUnit.CaptureLog.capture_log(fn -> ScaleMetrics.refresh_tenant_label_gate() end)
+
+      assert_receive {:poll_error, %{poller: :tenant_label_gate}, %{count: 1}}, 500
+    end
+  end
+
+  # The DB-backed zero-fill / drain-to-zero behavior of poll_oban_queue_state/0
+  # itself is covered in oban_metrics_poller_test.exs (TC-34.1.1b/c), which uses
+  # `Loopctl.DataCase` for `Loopctl.Repo` sandbox isolation — this file is
+  # intentionally pure/no-DB (see moduledoc), so it only covers the fixed
+  # matrix inputs (`oban_states/0`/`oban_active_states/0`/`oban_queues/0`) here.
+  describe "Oban gauges — reporter round-trip (US-34.1)" do
     test "the reporter round-trip: both gauges record and scrape end to end" do
       reporter_name = :"scale_metrics_oban_gauges_test_#{System.unique_integer([:positive])}"
 

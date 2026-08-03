@@ -77,6 +77,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Embeddings
+  alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleEmbedding
@@ -344,13 +345,12 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     #
     # `:throw` is caught alongside `:exit` because "every way this call can fail" has three
     # kinds, not two — the same pairing the fail-soft rate-limiter taggers use. Tagged, not
-    # swallowed untagged, so the degraded signal stays greppable. `exit_tag/1` below is a
-    # local mirror of `HeavyRead`'s and `LocalGuc.failure_tag/1`'s exit clauses: both are
-    # `defp`, and this module following the same per-module convention is cheaper than
-    # promoting one to a public API for a third caller.
+    # swallowed untagged, so the degraded signal stays greppable, via the ONE shared
+    # `Loopctl.ExitTag` (four private copies of that clause list had already diverged on the
+    # crash-propagation shape).
     :exit, reason ->
       Logger.warning(
-        "Article linking: corpus-size count exited (#{exit_tag(reason)}) for " <>
+        "Article linking: corpus-size count exited (#{ExitTag.tag(reason)}) for " <>
           "article #{article.id}; skipping the observational corpus_size signal — " <>
           "linking proceeds"
       )
@@ -359,34 +359,13 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
     :throw, value ->
       Logger.warning(
-        "Article linking: corpus-size count threw (#{exit_tag(value)}) for " <>
+        "Article linking: corpus-size count threw (#{ExitTag.tag(value)}) for " <>
           "article #{article.id}; skipping the observational corpus_size signal — " <>
           "linking proceeds"
       )
 
       :ok
   end
-
-  # Bounded classification of an exit reason — a small closed set, never the raw reason
-  # (which carries the full DBConnection call tuple, module and args).
-  #
-  # The `{reason, call}` TUPLE clause is the load-bearing one, and it is modelled on
-  # `LocalGuc.failure_tag/1` rather than on `HeavyRead.exit_tag/1`. DBConnection reports a
-  # wedged or unstarted pool as `{:noproc, {DBConnection, :execute, []}}`, NOT as a bare
-  # `:noproc` — a tagger with only an atom clause therefore looks right against a hand-rolled
-  # `exit(:noproc)` while degrading every REAL production exit to "other". This module's test
-  # exits with the production shape for exactly that reason.
-  #
-  # The same argument covers CRASH PROPAGATION: when a called process dies of an exception
-  # rather than being absent, the reason is `{{exception_or_atom, stacktrace}, call}` — at
-  # least as common as `:noproc` for a supervised pool, and a shape the two clauses above
-  # degrade to "unknown". Both inner shapes stay bounded: an atom, or the exception MODULE
-  # (never its message).
-  defp exit_tag(reason) when is_atom(reason), do: to_string(reason)
-  defp exit_tag({reason, _call}) when is_atom(reason), do: to_string(reason)
-  defp exit_tag({{%module{}, _stack}, _call}), do: inspect(module)
-  defp exit_tag({{reason, _stack}, _call}) when is_atom(reason), do: to_string(reason)
-  defp exit_tag(_reason), do: "unknown"
 
   # Deterministic-by-id sampling so the same article always makes the same decision (stable
   # across a job's retries). `phash2(id, 1) == 0` always, so a rate of 1 samples every job;

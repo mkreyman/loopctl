@@ -43,6 +43,8 @@ defmodule Loopctl.LocalGuc do
 
   require Logger
 
+  alias Loopctl.ExitTag
+
   @doc """
   Capture `names`, run `fun`, then restore the captured values. MUST be called inside a
   transaction on `repo`; `fun` issues its own `SET LOCAL`s.
@@ -346,11 +348,11 @@ defmodule Loopctl.LocalGuc do
   defp failure_tag(%DBConnection.ConnectionError{}), do: "connection_error"
   defp failure_tag(%DBConnection.OwnershipError{}), do: "ownership_error"
   defp failure_tag(%{__exception__: true} = e), do: "exception_#{inspect(e.__struct__)}"
-  defp failure_tag(reason) when is_atom(reason), do: to_string(reason)
-  # DBConnection/Postgrex EXIT with a TUPLE — `{:timeout, {GenServer, :call, _}}` when the
-  # pool is wedged, `{:noproc, _}` when it is not started — which IS the wedged-pool moment
-  # this tag exists for. Without these the real shapes all degraded to "unknown". Mirrors
-  # `HeavyRead.exit_tag/1`.
-  defp failure_tag({reason, _details}) when is_atom(reason), do: to_string(reason)
-  defp failure_tag(_reason), do: "unknown"
+  # Everything else is an EXIT reason, classified by the ONE shared tagger: DBConnection
+  # exits with a TUPLE — `{:timeout, {GenServer, :call, _}}` when the pool is wedged,
+  # `{:noproc, _}` when it is not started, `{{exception, stack}, call}` when the pool process
+  # dies of a crash — and this module's own clause list handled only two of those three, so
+  # crash propagation degraded to "unknown" here while the same shape tagged correctly
+  # elsewhere.
+  defp failure_tag(reason), do: ExitTag.tag(reason)
 end
