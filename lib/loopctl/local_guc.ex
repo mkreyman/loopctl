@@ -153,13 +153,18 @@ defmodule Loopctl.LocalGuc do
         # is a RAISE, and therefore exactly what a `rescue` clause sees — the ingestion backlog
         # gate (`LoopctlWeb.KnowledgeIngestionController`) fails OPEN at 0, `Knowledge`'s
         # under-fill probe degrades to `:error`, and `ArticleLinkingWorker` skips its
-        # observational count — all tagging, none re-raising. That is a claim about the abort,
-        # NOT about the separate EXIT shape of a wedged pool checkout: only
-        # `ArticleLinkingWorker` and the `ScaleMetrics` pollers catch that today; the first two
-        # still let an exit escape their class-restricted rescue. An earlier revision of this
-        # comment said such rescues "re-raise ... Today's rescues deliberately do not", which
-        # read as an aspiration the call sites had not caught up with. They had; the sentence
-        # was wrong, and it contradicted the @doc twenty lines above it.
+        # observational count — all tagging, none re-raising.
+        #
+        # The separate EXIT shape of a wedged pool checkout is now covered at every one of
+        # those sites too (plus the `ScaleMetrics` pollers, via `guarded_measurement/5`), so
+        # the abort and the exit degrade the same way and differ only in their tag. They did
+        # not always: an earlier revision of this comment carried a qualifier naming the two
+        # sites that still let an exit escape a class-restricted `rescue`, which is what
+        # closing that gap removed.
+        #
+        # Further back, this comment claimed such rescues "re-raise ... Today's rescues
+        # deliberately do not", which read as an aspiration the call sites had not caught up
+        # with. They had; the sentence was wrong, and it contradicted the @doc above it.
         raise DBConnection.ConnectionError,
               "#{@capture_abort_tag} #{inspect(owned)}, which an enclosing scope " <>
                 "already overrode — refusing to set an override this transaction cannot " <>

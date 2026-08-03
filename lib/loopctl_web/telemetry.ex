@@ -154,13 +154,21 @@ defmodule LoopctlWeb.Telemetry do
     # poller or the other measurements (including the gate refresh). What it DOES do
     # is worse for the raising measurement specifically: telemetry_poller logs the
     # raise once and PERMANENTLY DROPS that MFA from the poll rotation until the next
-    # app restart — the gauge/effect goes dark forever, silently. So EVERY measurement
-    # added here MUST still be self-rescuing (a catch-all rescue, not just the DB-fault
-    # classes) so it is never itself the one that goes dark. `refresh_tenant_label_gate/0`
-    # guards its only raising op (the DB count) with try/rescue (fail-soft to a bounded
-    # gate); the two Oban pollers below use a catch-all rescue (US-34.1, review finding)
-    # plus a poll-failure counter so a stale gauge is detectable. Keep that invariant
-    # for future additions.
+    # app restart — the gauge/effect goes dark forever, silently.
+    #
+    # So EVERY measurement added here MUST run its body under
+    # `ScaleMetrics.guarded_measurement/5`, which covers ALL THREE non-local exit kinds:
+    # `rescue` + `catch :exit` + `catch :throw`, each degrading to a caller-supplied
+    # fallback and firing the `loopctl.oban.poll.error.count` counter so a stale gauge is
+    # detectable.
+    #
+    # An earlier version of this note asked only for "a catch-all rescue", and that
+    # wording is exactly how this bug reached production: a DBConnection checkout against
+    # a wedged, saturated or unstarted pool EXITS rather than raising, so every
+    # measurement here satisfied the stated invariant and still went permanently dark on
+    # the most likely fault. telemetry_poller drops the MFA on an exit and a throw the
+    # same way it does on a raise — enumerating one of the three is not a partial
+    # guarantee, it is none. Do not weaken this back to "rescue".
     [
       # US-27.15: refresh the metrics tenant-label cardinality gate (Tenants.count()
       # <= cap), caching the boolean in :persistent_term so the per-emit tag_values
@@ -168,19 +176,19 @@ defmodule LoopctlWeb.Telemetry do
       {ScaleMetrics, :refresh_tenant_label_gate, []},
 
       # US-34.1 (AC-34.1.1/.3): per-{state, queue} poll of the GLOBAL `oban_jobs`
-      # table, feeding the `loopctl.oban.jobs.count` gauge. Self-rescuing
-      # (catch-all rescue, per the note above) and reports failures via the
+      # table, feeding the `loopctl.oban.jobs.count` gauge. Guarded per the note
+      # above (`guarded_measurement/5`) and reports failures via the
       # `loopctl.oban.poll.error.count` counter.
       {ScaleMetrics, :poll_oban_queue_state, []},
 
       # US-34.1 (AC-34.1.2/.3): the `:executing`-older-than-N-min orphan poll,
       # feeding the `loopctl.oban.jobs.executing_orphan.count` gauge. Same
-      # self-rescuing contract.
+      # guarded-measurement contract.
       {ScaleMetrics, :poll_oban_executing_orphans, []},
 
       # US-38.3 (AC-38.3.2): the clustering-readiness peer poll, feeding the
       # `loopctl.cluster.peers.count` gauge from `Loopctl.ClusterReadiness.readiness/0`
-      # (peer COUNT + bounded `status`, never node names). Self-rescuing, same contract.
+      # (peer COUNT + bounded `status`, never node names). Same guarded contract.
       {ScaleMetrics, :poll_cluster_readiness, []}
     ]
   end

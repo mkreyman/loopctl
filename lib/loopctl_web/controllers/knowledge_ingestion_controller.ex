@@ -12,6 +12,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   require Logger
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.ExitClass
+  alias Loopctl.ExitTag
   alias Loopctl.HeavyRead
   alias Loopctl.Ingestion.ContentEnvelope
   alias Loopctl.Knowledge.ContentChunker
@@ -35,6 +37,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # `operation/2` specs, so the published OpenAPI `maxLength` and the enforcing
   # `validate_content_length/1` read the SAME number and cannot drift.
   @max_inline_content_bytes 1_000_000
+
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.ProjectId
 
@@ -288,10 +291,15 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   defp check_ingestion_backlog(tenant_id) do
     max = ObanConfig.ingest_backlog_max()
 
-    if in_flight_ingestion_backlog(tenant_id) >= max do
-      {:error, :ingestion_backlog_exceeded, backlog_retry_after_seconds()}
-    else
-      :ok
+    case in_flight_ingestion_backlog(tenant_id) do
+      {:unmeasurable, error_class} ->
+        fail_open_admitted(tenant_id, error_class)
+
+      count when count >= max ->
+        {:error, :ingestion_backlog_exceeded, backlog_retry_after_seconds()}
+
+      _count ->
+        :ok
     end
   end
 
@@ -304,11 +312,11 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # error in the count path therefore propagates and 500s, LOUD, rather than being silently
   # swallowed into a fleet-wide disabling of backpressure that looks healthy; a SQL-level one
   # (a bad query change) is still rescued, and gets its own `db_error` class so it is not
-  # mistaken for a timeout. On the fail-open path we ALSO emit a telemetry counter
-  # (`[:loopctl, :ingestion, :backlog_gate, :failed_open]`) so "the backpressure valve is
-  # currently admitting because it can't measure" is an alertable signal, not just a
-  # warning-log line, and a sustained per-request timeout under a real flood is visible on
-  # a dashboard instead of only as log spam. The count is resolved through a
+  # mistaken for a timeout. Every admitted fail-open ALSO emits a telemetry counter
+  # (`fail_open_admitted/2`) so "the backpressure valve is currently admitting because it
+  # can't measure" is an alertable signal, not just a warning-log line, and a sustained
+  # per-request timeout under a real flood is visible on a dashboard instead of only as log
+  # spam. The count is resolved through a
   # config-swappable DI seam (`Loopctl.Oban.FairShare` in prod, a Mox mock in test) so
   # this fail-open path is deterministically covered.
   defp in_flight_ingestion_backlog(tenant_id) do
@@ -322,16 +330,30 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     # eats an error because the count path is momentarily degraded. See
     # `Loopctl.LocalGuc.capture_abort?/1`.
     e in [DBConnection.ConnectionError, Postgrex.Error] ->
-      fail_open(tenant_id, e)
+      {:unmeasurable, fail_open_class(e)}
+  catch
+    # The rescue above covers only the RAISE shape, and a DBConnection checkout against a
+    # wedged, saturated or unstarted pool EXITS instead. So the one failure this gate exists
+    # for — "the count path is momentarily degraded" — walked straight past it and 500'd an
+    # ordinary ingest, which is the opposite of failing open. `:throw` is folded in for the
+    # same reason `ScaleMetrics.guarded_measurement/5` folds it in: it is the third non-local
+    # exit kind, and enumerating two of three is how this class of hole keeps reappearing.
+    # Returns `{:unmeasurable, class}` rather than `0` ("an empty backlog") so the caller
+    # can tell "nothing queued" from "could not look", and so the fail-open is an explicit
+    # decision at one site instead of a magic zero flowing into a threshold comparison.
+    kind, reason when kind in [:exit, :throw] ->
+      {:unmeasurable, fail_open_class({kind, ExitTag.tag(reason)})}
   end
 
-  defp fail_open(tenant_id, e) do
-    error_class = fail_open_class(e)
-
-    # The bounded CLASS tag only, never `Exception.message/1`: a `Postgrex.Error` /
-    # `DBConnection.ConnectionError` message names the backend host, database and role
-    # ("tcp connect (host:port): ..."), and this line is reachable from any wedged-pool
-    # moment on an ordinary ingest. Same policy as `Loopctl.LocalGuc`'s own failure log.
+  # The ADMIT branch: `TelemetryEvents.ingestion_backlog_gate_failed_open/0` documents
+  # itself as "the valve is currently ADMITTING because it can't measure", so the counter
+  # and the warning belong here, where that is exactly what happened.
+  #
+  # The bounded CLASS tag only, never `Exception.message/1`: a `Postgrex.Error` /
+  # `DBConnection.ConnectionError` message names the backend host, database and role
+  # ("tcp connect (host:port): ..."), and this line is reachable from any wedged-pool
+  # moment on an ordinary ingest. Same policy as `Loopctl.LocalGuc`'s own failure log.
+  defp fail_open_admitted(tenant_id, error_class) do
     Logger.warning("ingestion backlog gate failed open for tenant=#{tenant_id} (#{error_class})")
 
     :telemetry.execute(
@@ -340,7 +362,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
       %{tenant_id: tenant_id, error_class: error_class}
     )
 
-    0
+    :ok
   end
 
   # BOUNDED, and every value must be TRUE. The rescue above catches EVERY `Postgrex.Error`,
@@ -353,6 +375,15 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
 
   defp fail_open_class(%Postgrex.Error{postgres: %{code: :query_canceled}}), do: "timeout"
   defp fail_open_class(%Postgrex.Error{}), do: "db_error"
+
+  # The non-local-exit shapes, already tagged by `Loopctl.ExitTag` at the catch site.
+  # Prefixed by KIND so a triaging operator can tell a dead pool (`exit:noproc`) from a
+  # throw escaping the counter, and closed by `ExitClass` so the value set stays ENUMERABLE:
+  # this string is a Prometheus label multiplied by `tenant_id`, and `ExitTag` names any exit
+  # atom or exception MODULE — bounded away from the raw reason (host, database, role, query
+  # args) but not bounded as a label.
+  defp fail_open_class({kind, tag}) when kind in [:exit, :throw] and is_binary(tag),
+    do: ExitClass.bounded(kind, tag)
 
   defp backlog_counter do
     Application.get_env(:loopctl, :ingestion_backlog_counter, FairShare)
