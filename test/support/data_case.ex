@@ -102,6 +102,16 @@ defmodule Loopctl.DataCase do
 
     stub_embedding_read_path()
 
+    # #558: default to the REAL count, so every existing fair-share test (which seeds real
+    # oban_jobs rows in its own sandboxed transaction) is unaffected. Only the fail-open test
+    # overrides it to EXIT — the one shape a sandboxed pool cannot produce, and the reason
+    # this gate shipped failing CLOSED.
+    Mox.stub(
+      Loopctl.MockFairShareCounter,
+      :lower_ranked_executing_count,
+      &FairShare.lower_ranked_executing_count/3
+    )
+
     # GH #551: production behaviour by default — the retirement trigger really probes,
     # records and evaluates. Only the worker's fail-closed test overrides `probe/0` to
     # return an error, which is the one shape the test database cannot produce.

@@ -28,9 +28,13 @@ defmodule Loopctl.Oban.FairShare do
   The cap (`Loopctl.ObanConfig.tenant_fair_share_cap/1`) is ALWAYS `>= 1`, so a
   tenant may always hold at least one slot and (with the rank decision below) the
   gate can never drive every job to snooze forever — even at jitter=0. The gate
-  FAILS OPEN on the COUNT only: if the executing-count query errors or times out,
-  `over_fair_share?/3` returns `false` (the job proceeds) rather than blocking — an
-  unmeasurable count must never stall work.
+  FAILS OPEN on the COUNT only, and only on the shapes that mean the count was
+  UNMEASURABLE: a `Postgrex.Error` / `DBConnection.{ConnectionError,EncodeError,
+  OwnershipError}` raise (a rolled-back count transaction is normalised into the first
+  of those by `count/4`), or a non-local EXIT. Then `over_fair_share?/3` returns `false`
+  (the job proceeds) rather than blocking — an unmeasurable count must never stall work.
+  A throw and any other raise are NOT count faults and fail LOUD, so a broken counter is
+  never mistaken for a wedged pool.
 
   The CAP, by contrast, FAILS LOUD. It is read in `over_fair_share?/3` OUTSIDE the
   count's rescue (in `over_cap?/4`), so a malformed `OBAN_TENANT_FAIRSHARE_<QUEUE>`
@@ -153,6 +157,8 @@ defmodule Loopctl.Oban.FairShare do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.ExitClass
+  alias Loopctl.ExitTag
   alias Loopctl.LocalGuc
   alias Loopctl.ObanConfig
 
@@ -211,8 +217,10 @@ defmodule Loopctl.Oban.FairShare do
   The CAP is read here, OUTSIDE the fail-open rescue below, so a malformed
   `OBAN_TENANT_FAIRSHARE_<QUEUE>` fails LOUD (crashes the job → visible) exactly like
   the snooze knobs, rather than being swallowed into a silent fail-open that disables
-  fairness. Only the COUNT query FAILS OPEN (`false`) on error/timeout so the gate can
-  never wedge a queue. `ObanConfig.fair_share_config/0` also validates every cap at
+  fairness. Only the COUNT query FAILS OPEN (`false`), and only on the shapes an
+  unmeasurable count actually produces — a `Postgrex.Error`/`DBConnection.{ConnectionError,
+  EncodeError,OwnershipError}` raise, or a non-local exit — so the gate can never wedge a
+  queue while a broken counter still fails loud. `ObanConfig.fair_share_config/0` validates every cap at
   BOOT, so at runtime this parse cannot fail anyway.
   """
   @spec over_fair_share?(binary(), atom(), pos_integer() | nil) :: boolean()
@@ -222,20 +230,53 @@ defmodule Loopctl.Oban.FairShare do
     over_cap?(tenant_id, queue, job_id, cap)
   end
 
-  # The count-bearing half of the decision. FAILS OPEN (`false`) on any count
-  # error/timeout — an unmeasurable count must NEVER block a job (SECURITY note: the
+  # The count-bearing half of the decision. FAILS OPEN (`false`) on a DB-layer raise or a
+  # non-local exit — an unmeasurable count must NEVER block a job (SECURITY note: the
   # gate must not be able to wedge a queue). A malformed CAP is deliberately NOT caught
   # here (it is read in `over_fair_share?/3`, above this rescue) so it fails loud.
   defp over_cap?(tenant_id, queue, job_id, cap) do
-    lower_ranked_executing_count(tenant_id, queue, job_id) >= cap
+    counter().lower_ranked_executing_count(tenant_id, queue, job_id) >= cap
   rescue
-    e ->
-      Logger.warning(
-        "FairShare gate failed open on queue=#{queue} tenant=#{tenant_id}: " <>
-          Exception.message(e)
-      )
+    e in [
+      Postgrex.Error,
+      DBConnection.ConnectionError,
+      DBConnection.EncodeError,
+      DBConnection.OwnershipError
+    ] ->
+      # The bounded CLASS, never `Exception.message/1`: a Postgrex/DBConnection message names
+      # the backend host, database and role, and this line is reachable from any wedged-pool
+      # moment on an ordinary job.
+      #
+      # The DB-LAYER shapes only — the ones that mean "the count was unmeasurable", including
+      # the encode/ownership failures `LocalGuc.failure_tag/1` already treats as first-class,
+      # and the `ConnectionError` `count/4` normalises a rolled-back count transaction into.
+      # A catch-all `e ->` also swallowed a broken DI seam: in `:test` the count resolves to a
+      # Mox mock, and a call from a process holding no stub raises `Mox.UnexpectedCallError` —
+      # which degraded into a silent admit, so every fair-share assertion made from such a
+      # process passed for the wrong reason. That is not a count error, and the fail-open
+      # promise does not cover it: it fails loud.
+      fair_share_degraded(tenant_id, queue, ExitTag.tag(e))
+  catch
+    # #558: the rescue above covers only the RAISE shape, so this gate — which DOCUMENTS
+    # failing open on any count error — failed CLOSED on the fault most likely to trigger it.
+    # A DBConnection checkout against a wedged, saturated or unstarted pool EXITS, escaping
+    # the rescue entirely, and the escape kills the Oban job rather than admitting it. The
+    # gate exists so a counting problem never blocks work; on an exit it did the opposite.
+    #
+    # `:exit` ONLY, matching `KnowledgeSuggestLinksController`'s guard: a THROW is a
+    # deterministic fault in the counter itself, not an unmeasurable count, and blanket-catching
+    # it reopened for throws exactly the silent admit the narrowed rescue closed for raises.
+    # The class comes from `ExitClass` rather than a hand-rolled `"#{kind}:#{tag}"` — that
+    # spelling is the thing `ExitClass` was extracted to stop each guard re-deriving.
+    :exit, reason ->
+      fair_share_degraded(tenant_id, queue, ExitClass.classify(:exit, reason))
+  end
 
-      false
+  # One degrade path for both shapes, so the fail-open promise cannot drift between them.
+  defp fair_share_degraded(tenant_id, queue, class) do
+    Logger.warning("FairShare gate failed open on queue=#{queue} tenant=#{tenant_id} (#{class})")
+
+    false
   end
 
   @doc """
@@ -284,11 +325,22 @@ defmodule Loopctl.Oban.FairShare do
   # moduledoc). A `nil` job_id (bare `perform/1` struct in a test — off the real
   # dispatch path) has no rank, so we fall back to the plain unscoped executing count
   # (counts every executing job, including the caller).
-  defp lower_ranked_executing_count(tenant_id, queue, job_id) when is_integer(job_id) do
+  # Injected (`Loopctl.Oban.FairShareCounterBehaviour`) so the fail-open EXIT branch above is
+  # reachable from a test; production resolves to this module.
+  defp counter do
+    Application.get_env(:loopctl, :fair_share_counter, __MODULE__)
+  end
+
+  @behaviour Loopctl.Oban.FairShareCounterBehaviour
+
+  @impl Loopctl.Oban.FairShareCounterBehaviour
+  def lower_ranked_executing_count(tenant_id, queue, job_id)
+
+  def lower_ranked_executing_count(tenant_id, queue, job_id) when is_integer(job_id) do
     count(tenant_id, {:queue, to_string(queue)}, ["executing"], {:lower_than, job_id})
   end
 
-  defp lower_ranked_executing_count(tenant_id, queue, nil) do
+  def lower_ranked_executing_count(tenant_id, queue, nil) do
     count(tenant_id, {:queue, to_string(queue)}, ["executing"], :all)
   end
 
@@ -335,12 +387,22 @@ defmodule Loopctl.Oban.FairShare do
 
     query = base |> apply_scope(scope) |> apply_id_predicate(id_predicate)
 
-    {:ok, result} =
-      LocalGuc.timed_transaction(AdminRepo, @count_statement_timeout_ms, fn ->
-        AdminRepo.one(query)
-      end)
+    # The transaction result is handled EXPLICITLY. A bare `{:ok, result} =` raised a
+    # `MatchError` on `{:error, _}` (a mid-transaction disconnect rolls the count back), which
+    # is neither a rescued DB shape nor an exit — so it escaped `over_cap?/4`'s fail-open
+    # entirely and killed the job, the exact inverse of this gate's contract. An unmeasurable
+    # count IS a connection failure, so it is normalised into the shape every caller of this
+    # helper already handles. The reason is a BOUNDED tag, never the raw term.
+    case LocalGuc.timed_transaction(AdminRepo, @count_statement_timeout_ms, fn ->
+           AdminRepo.one(query)
+         end) do
+      {:ok, result} ->
+        result || 0
 
-    result || 0
+      {:error, reason} ->
+        raise DBConnection.ConnectionError,
+              "oban_jobs count transaction failed (#{ExitTag.tag(reason)})"
+    end
   end
 
   defp apply_scope(query, {:queue, queue_str}) do

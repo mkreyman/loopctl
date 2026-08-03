@@ -345,8 +345,11 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         measurement in `LoopctlWeb.Telemetry.periodic_measurements/0`:
         `"queue_state"`/`"executing_orphans"`/`"cluster_readiness"`/`"tenant_label_gate"`;
         `error_class` is CLASSIFIED via `oban_poll_error_class/1` into
-        `"db_error"`/`"guc_capture_abort"`/`"config_error"`/`"exit"`/`"throw"`/
-        `"other"`/`"unknown"`, never the raw exception message or exit reason).
+        `"db_error"`/`"guc_capture_abort"`/`"config_error"`/`"other"`/`"unknown"`,
+        or — for a non-local exit/throw — `"<kind>:<tag>"` over `Loopctl.ExitClass`'s
+        closed tag set (`"exit:noproc"`, `"exit:timeout"`, `"throw:other"`, …; #558
+        replaced the bare `"exit"`/`"throw"` labels, so re-point any selector on
+        those), never the raw exception message or exit reason).
         Emitted from `guarded_measurement/5` — the ONE guard every periodic
         measurement runs under — on the `rescue` AND the `catch :exit`/`:throw` path
         alike, so a frozen gauge (metrics 18/19/23 retaining their last value, or the
@@ -362,6 +365,7 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   require Logger
 
+  alias Loopctl.ExitClass
   alias Loopctl.ExitTag
   alias Loopctl.LocalGuc
   alias Loopctl.Repo
@@ -1472,7 +1476,18 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   # An EXIT/THROW is not an exception, so it can never be a struct above:
   # `guarded_measurement/5` hands it over wrapped as `{kind, bounded_tag}`. Its own class
   # because a pool checkout that exits has a different remedy from one that raises.
-  defp oban_poll_error_class({kind, _reason}) when kind in [:exit, :throw], do: to_string(kind)
+  #
+  # #558: routed through `ExitClass.bounded/2` so the label reads `exit:noproc`, matching the
+  # ingest-gate and under-fill-probe counters. It previously emitted a bare `"exit"`, which
+  # made three coexisting encodings of one concept across three counters — an operator
+  # correlating them had to know which series used which spelling, and the bare form threw
+  # away the discriminator (`noproc` vs `timeout`) that decides where to look.
+  defp oban_poll_error_class({kind, tag}) when kind in [:exit, :throw] and is_binary(tag),
+    do: ExitClass.bounded(kind, tag)
+
+  defp oban_poll_error_class({kind, reason}) when kind in [:exit, :throw],
+    do: ExitClass.classify(kind, reason)
+
   defp oban_poll_error_class(nil), do: "unknown"
   defp oban_poll_error_class(_other), do: "other"
 

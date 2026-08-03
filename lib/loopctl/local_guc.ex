@@ -65,11 +65,37 @@ defmodule Loopctl.LocalGuc do
     try do
       fun.()
     after
-      # `restore/2` pops what `capture/2` pushed (the hand-paired form), so it runs FIRST and
-      # the reset to `enclosing` is the final word — an inner pop must not erase an outer
-      # scope's ownership of the same name.
+      # #558: `restore/2` ALREADY pops exactly `names` (`prior` is `names` on BOTH capture
+      # paths), so this is this scope's ONE and ONLY pop — pop exactly once.
+      #
+      # Not a reset to the `enclosing` snapshot: that snapshot predates `fun`, so restoring it
+      # DISCARDS ownership the body pushed through the hand-paired `capture/2` and has not yet
+      # popped. Not a second `-- names` either: `--` removes one occurrence per element, so
+      # with same-name nesting the extra subtraction steals the ENCLOSING scope's entry.
+      # Both mistakes end the same way — a later nested `scoped/3` reads a still-held name as
+      # unowned and, on a capture failure, takes the RESET branch for a GUC an outer scope is
+      # actively holding, the clobber `capture_fallback!/2` aborts to prevent.
       restore(repo, prior)
-      put_active_names(enclosing)
+      warn_unpopped(enclosing)
+    end
+  end
+
+  # The other side of popping exactly once: an occurrence the BODY pushed via the hand-paired
+  # `capture/2` and never popped survives this scope. Popping it here is not an option (that is
+  # the second-`--` bug above), and on a per-request/per-job process that dies it is harmless —
+  # but on a long-lived one (the shared `ScaleMetrics` poller) it is permanent, and a phantom
+  # owner makes every later capture failure for that name ABORT a read it could safely have
+  # RESET. So make the missing `forget/1` VISIBLE instead of silently sticky.
+  defp warn_unpopped(enclosing) do
+    case active_names() -- enclosing do
+      [] ->
+        :ok
+
+      leaked ->
+        Logger.warning(
+          "LocalGuc: #{inspect(leaked)} still held after scope exit — a capture/2 without a " <>
+            "matching restore/2 or forget/1; later scopes will abort rather than reset it"
+        )
     end
   end
 
@@ -151,7 +177,11 @@ defmodule Loopctl.LocalGuc do
         # fail-soft path converts "this diagnostic could not be measured" into a failed
         # request, which is the thing those paths exist to prevent. So ON THIS ABORT — which
         # is a RAISE, and therefore exactly what a `rescue` clause sees — the ingestion backlog
-        # gate (`LoopctlWeb.KnowledgeIngestionController`) fails OPEN at 0, `Knowledge`'s
+        # gate (`LoopctlWeb.KnowledgeIngestionController`) returns `{:unmeasurable,
+        # "guc_capture_abort"}` for `backlog_fail_open_verdict/3` to adjudicate — and that
+        # class is now METERED, since this abort is raised only once the connection is already
+        # wedged. It formerly read "fails OPEN at 0" here, which described the unconditional
+        # admit that metering closed; a `0` count is the bug, not the behaviour. `Knowledge`'s
         # under-fill probe degrades to `:error`, and `ArticleLinkingWorker` skips its
         # observational count — all tagging, none re-raising.
         #

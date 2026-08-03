@@ -96,6 +96,98 @@ defmodule Loopctl.Oban.FairShareTest do
     end
   end
 
+  describe "#558: the gate fails OPEN on a count that EXITS, not just one that raises" do
+    setup do
+      # Mox comes from `Loopctl.DataCase`'s `using` block; the stubs live in the test bodies.
+      %{tenant: fixture(:tenant)}
+    end
+
+    test "a wedged-pool EXIT admits the job instead of killing it", %{tenant: tenant} do
+      # `over_cap?/4` DOCUMENTS failing open on any count error, and delivered that with a
+      # `rescue` alone. A DBConnection checkout against a wedged, saturated or unstarted pool
+      # EXITS — it does not raise — so the escape killed the Oban job rather than admitting
+      # it: the exact inverse of the contract, on the fault most likely to trigger the gate.
+      #
+      # The production exit shape, not a bare atom: an atom-only handler would pass here and
+      # still miss every real one.
+      stub(Loopctl.MockFairShareCounter, :lower_ranked_executing_count, fn _t, _q, _j ->
+        exit({:noproc, {DBConnection, :execute, []}})
+      end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert FairShare.gate(tenant.id, :knowledge, 1) == :ok
+        end)
+
+      assert log =~ "FairShare gate failed open"
+      # BOUNDED class, never the raw reason — which carries the DBConnection call tuple.
+      assert log =~ "exit:noproc"
+      refute log =~ "DBConnection.execute"
+    end
+
+    test "a THROW is NOT swallowed — it is a broken counter, not an unmeasurable count", %{
+      tenant: tenant
+    } do
+      # #559: blanket-catching `:throw` reopened for throws the same silent admit the narrowed
+      # rescue closed for raises — a counter that throws for control flow degraded into `:ok`
+      # and every fair-share assertion made through it passed for the wrong reason. The
+      # sibling guard in `KnowledgeSuggestLinksController` makes the same call.
+      stub(Loopctl.MockFairShareCounter, :lower_ranked_executing_count, fn _t, _q, _j ->
+        throw(:boom)
+      end)
+
+      assert catch_throw(FairShare.gate(tenant.id, :knowledge, 1)) == :boom
+    end
+
+    test "a DB-layer OwnershipError still fails open", %{tenant: tenant} do
+      stub(Loopctl.MockFairShareCounter, :lower_ranked_executing_count, fn _t, _q, _j ->
+        raise DBConnection.OwnershipError, "owner exited"
+      end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert FairShare.gate(tenant.id, :knowledge, 1) == :ok
+        end)
+
+      assert log =~ "FairShare gate failed open"
+      assert log =~ "DBConnection.OwnershipError"
+    end
+
+    test "a RAISE still fails open, with its own bounded class", %{tenant: tenant} do
+      stub(Loopctl.MockFairShareCounter, :lower_ranked_executing_count, fn _t, _q, _j ->
+        raise %DBConnection.ConnectionError{message: "tcp connect (db.internal:5432): timeout"}
+      end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert FairShare.gate(tenant.id, :knowledge, 1) == :ok
+        end)
+
+      assert log =~ "FairShare gate failed open"
+
+      # Assert the CLASS positively. The first version of this test only did the `refute`
+      # below, which "unknown" satisfies just as well as a correct tag — and that is exactly
+      # what shipped: `ExitTag.tag/1` had no clause for a bare exception struct, so every
+      # raise degraded to "unknown" and the test passed anyway.
+      assert log =~ "DBConnection.ConnectionError"
+      # The pre-existing rescue logged Exception.message/1, which names the backend host.
+      refute log =~ "db.internal"
+    end
+
+    test "a NON-DB raise is not swallowed — the fail-open covers count faults only", %{
+      tenant: tenant
+    } do
+      # The catch-all `e ->` this narrowed also ate `Mox.UnexpectedCallError`, so a gate
+      # reached from a process holding no stub silently admitted every job and any assertion
+      # of `:ok` there passed for the wrong reason.
+      stub(Loopctl.MockFairShareCounter, :lower_ranked_executing_count, fn _t, _q, _j ->
+        raise ArgumentError, "broken seam"
+      end)
+
+      assert_raise ArgumentError, fn -> FairShare.gate(tenant.id, :knowledge, 1) end
+    end
+  end
+
   describe "tenant isolation (AC-36.2.6)" do
     test "tenant A's count never includes tenant B's jobs" do
       tenant_a = Ecto.UUID.generate()

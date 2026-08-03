@@ -13,6 +13,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.ExitClass
   alias Loopctl.Knowledge
   alias LoopctlWeb.Helpers.Visibility
 
@@ -133,8 +134,9 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
 
   # Run the (possibly slow) vector-similarity query, translating a raised DB
   # exception into an `{:error, %Postgrex.Error{}}` / `{:error,
-  # %DBConnection.ConnectionError{}}` tuple. Only DB exceptions are caught;
-  # anything else is re-raised (let-it-crash). The suggest_links query runs on the
+  # %DBConnection.ConnectionError{}}` tuple. Only DB exceptions and the pool EXIT
+  # shapes `Loopctl.ExitClass` recognises are caught; anything else — an unclassifiable
+  # exit, a throw, any other raise — propagates (let-it-crash). The suggest_links query runs on the
   # dedicated HeavyReadRepo pool (via Loopctl.HeavyRead) — rescuing here does NOT
   # change which tenant's data is touched.
   #
@@ -149,6 +151,39 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
     knowledge().suggest_links_with_meta(tenant_id, article_id, opts)
   rescue
     e in [Postgrex.Error, DBConnection.ConnectionError] -> {:error, e}
+  catch
+    # #558: the rescue covers only the RAISE shape. A checkout against a wedged, saturated or
+    # unstarted pool EXITS, so it escaped this guard entirely and became a blanket 500 whose
+    # crash log carried the raw exit reason — which on this endpoint means the query text and
+    # its vector literals. That is both the unpinned status US-27.3 exists to prevent and an
+    # information-disclosure path the pinned response does not have.
+    #
+    # Classified as a `DBConnection.ConnectionError` deliberately rather than a new shape: a
+    # pool exit IS a connection failure, and this maps it onto the SAME pinned 503 +
+    # Retry-After the caller already understands. The message is the BOUNDED `ExitClass`
+    # class, never the reason itself.
+    #
+    # ONLY an exit `ExitClass.pool_exit?/1` places on the POOL — i.e. one whose call tuple
+    # names a pool module. Not `classify/2`: that keys on the exit REASON, so a non-DB
+    # `{:timeout, {GenServer, :call, _}}` lands in its closed tag set and a blanket
+    # `kind in [:exit, :throw]` catch (or a tag-based one) still told the client to retry a
+    # DETERMINISTIC fault as a transient database outage, swallowing the crash report that
+    # would have named it. A throw is left alone entirely.
+    #
+    # An unplaceable exit is re-raised as a WRAPPED, SANITISED exit. Wrapped because a benign
+    # reason (`:normal`) re-exited verbatim is not a crash: the request process would just end,
+    # with no crash report and no status line — a closed connection instead of a 500. Sanitised
+    # because the raw reason is exactly what the comment above says must never reach a log on
+    # this endpoint: a DBConnection reason's call element carries the `%Postgrex.Query{}`
+    # statement and its bound vector literals, and `Plugs.DBErrorBackstop` rescues only, so
+    # nothing downstream would redact it.
+    :exit, reason ->
+      if ExitClass.pool_exit?(reason) do
+        class = ExitClass.classify(:exit, reason)
+        {:error, %DBConnection.ConnectionError{message: "suggest_links unavailable (#{class})"}}
+      else
+        exit({:suggest_links_unclassified_exit, ExitClass.classify(:exit, reason)})
+      end
   end
 
   defp knowledge do

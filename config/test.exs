@@ -340,7 +340,7 @@ config :loopctl, :scale_alerts_config_checker, Loopctl.MockScaleAlertsConfigChec
 config :loopctl, :oban_orphan_count_checker, Loopctl.MockObanOrphanCountChecker
 
 # US-36.3: batch-ingest backlog admission gate's count DI seam. Default stub in
-# DataCase.stub_all_defaults/0 delegates to the real FairShare.in_flight_count/2;
+# DataCase.stub_all_defaults/0 delegates to the real FairShare.in_flight_ingestion_backlog/1;
 # the fail-open test overrides it to raise.
 config :loopctl, :ingestion_backlog_counter, Loopctl.MockBacklogCounter
 
@@ -712,6 +712,11 @@ config :loopctl, :embedding_read_path, Loopctl.MockEmbeddingReadPath
 # to the real `Loopctl.Embeddings.LegacyRetirement`, so every other test sees production
 # behaviour.
 config :loopctl, :legacy_retirement, Loopctl.MockLegacyRetirement
+
+# #558: FairShare's count is injected so the gate's fail-open EXIT branch is reachable.
+# DataCase stubs it back to the real `Loopctl.Oban.FairShare`, so every other test — including
+# the ones that seed real oban_jobs rows — exercises the real count unchanged.
+config :loopctl, :fair_share_counter, Loopctl.MockFairShareCounter
 
 # GH #551: a SHORT evidence window in tests. The production bar is 30 days; asserting
 # against it would mean fabricating 30 observation rows per test to say something that

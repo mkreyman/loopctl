@@ -1038,12 +1038,16 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert ScaleMetrics.oban_poll_error_tags(%{
                poller: :executing_orphans,
                exception: {:exit, "noproc"}
-             }) == %{poller: :executing_orphans, error_class: "exit"}
+             }) == %{poller: :executing_orphans, error_class: "exit:noproc"}
 
       assert ScaleMetrics.oban_poll_error_tags(%{
                poller: :cluster_readiness,
                exception: {:throw, "unknown"}
-             }) == %{poller: :cluster_readiness, error_class: "throw"}
+             }) == %{poller: :cluster_readiness, error_class: "throw:other"}
+
+      # `ExitTag`'s own catch-all is the string "unknown"; `ExitClass`'s is "other". They
+      # mean the same thing, and the metric deliberately keeps ONE catch-all label rather
+      # than two spellings of it — so an ExitTag "unknown" lands on "other" here by design.
     end
 
     test "oban_poll_error_tags/1 defaults missing keys to \"unknown\", never raises" do
@@ -1105,8 +1109,11 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       refute inspect(exception) =~ "DBConnection"
 
+      # #558: the label carries the DISCRIMINATOR (`exit:noproc`), not a bare kind. A bare
+      # "exit" threw away the one bit that says where to look — a dead pool vs a checkout
+      # timeout — and spelled the same concept three different ways across three counters.
       assert ScaleMetrics.oban_poll_error_tags(%{poller: :queue_state, exception: exception}) ==
-               %{poller: :queue_state, error_class: "exit"}
+               %{poller: :queue_state, error_class: "exit:noproc"}
     end
 
     test "a THROWING body is guarded too — telemetry_poller drops an MFA on all three kinds" do
@@ -1121,7 +1128,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                      500
 
       assert ScaleMetrics.oban_poll_error_tags(%{poller: :queue_state, exception: exception}) ==
-               %{poller: :queue_state, error_class: "throw"}
+               %{poller: :queue_state, error_class: "throw:other"}
     end
 
     test "a RAISING body keeps its own message and passes the struct through for classification" do
@@ -1140,7 +1147,13 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
     test "a SUCCEEDING body returns its own value and fires no counter" do
       assert guarded(fn -> :ok end) == :ok
-      refute_receive {:poll_error, _metadata, _measurements}, 200
+
+      # #558: SCOPED to this poller, like every sibling in the block. Unscoped, it also
+      # matched the APP's real 10s telemetry_poller, which shares the VM and legitimately
+      # emits poll errors of its own while the suite runs — so this asserted "nothing else
+      # in the system failed a poll", which is not this test's claim and reddens CI at
+      # random.
+      refute_receive {:poll_error, %{poller: :queue_state}, _measurements}, 200
     end
   end
 
