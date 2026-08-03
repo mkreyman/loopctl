@@ -211,7 +211,8 @@ defmodule Loopctl.MixProject do
         # alias runs under `preferred_envs: [precommit: :test]` and `usage_rules` is
         # `only: :dev`, so `mix usage_rules.sync --check` would fail with "task could not
         # be found" — the same breakage the hex.audit note above records. It runs in the
-        # CI Lint job instead, which has no MIX_ENV and therefore has the dep.
+        # CI Retrieval Eval job instead — the only job that sets MIX_ENV=dev, and so the
+        # only one where the task exists.
         "dialyzer",
         "test"
       ]
