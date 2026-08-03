@@ -150,6 +150,12 @@ defmodule Loopctl.Oban.FairShareTest do
         end)
 
       assert log =~ "FairShare gate failed open"
+
+      # Assert the CLASS positively. The first version of this test only did the `refute`
+      # below, which "unknown" satisfies just as well as a correct tag — and that is exactly
+      # what shipped: `ExitTag.tag/1` had no clause for a bare exception struct, so every
+      # raise degraded to "unknown" and the test passed anyway.
+      assert log =~ "DBConnection.ConnectionError"
       # The pre-existing rescue logged Exception.message/1, which names the backend host.
       refute log =~ "db.internal"
     end

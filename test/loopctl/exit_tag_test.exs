@@ -44,6 +44,27 @@ defmodule Loopctl.ExitTagTest do
     end
   end
 
+  describe "a BARE exception struct" do
+    test "is tagged by module — the shape a rescue branch hands in directly" do
+      # Regression: `FairShare.over_cap?/4`'s rescue passes the exception itself, and with
+      # no clause for it every raise degraded to "unknown". The test that was supposed to
+      # catch that asserted only `refute log =~ "db.internal"`, which "unknown" satisfies —
+      # a guard test passing for the wrong reason.
+      assert ExitTag.tag(%DBConnection.ConnectionError{message: "tcp connect (h:5432)"}) ==
+               "DBConnection.ConnectionError"
+
+      assert ExitTag.tag(%Postgrex.Error{}) == "Postgrex.Error"
+      assert ExitTag.tag(%ArgumentError{message: "bad"}) == "ArgumentError"
+    end
+
+    test "never carries the message" do
+      tag = ExitTag.tag(%DBConnection.ConnectionError{message: "tcp connect (db.internal:5432)"})
+
+      refute tag =~ "db.internal"
+      refute tag =~ "5432"
+    end
+  end
+
   describe "the ordinary shapes" do
     test "a bare atom is its own tag" do
       assert ExitTag.tag(:noproc) == "noproc"

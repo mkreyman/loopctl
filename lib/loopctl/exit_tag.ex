@@ -20,6 +20,13 @@ defmodule Loopctl.ExitTag do
 
   @spec tag(term()) :: String.t()
   def tag(reason) when is_atom(reason), do: to_string(reason)
+
+  # A BARE exception struct, not wrapped in an exit reason. `FairShare.over_cap?/4`'s rescue
+  # branch hands one straight in, and without this clause it fell to the catch-all — so every
+  # raise logged "unknown" and the class was lost at exactly the site that needed it. The
+  # MODULE name only, never `Exception.message/1`, which on a Postgrex/DBConnection struct
+  # names the backend host, database and role.
+  def tag(%module{} = reason) when is_exception(reason), do: inspect(module)
   def tag({reason, _call}) when is_atom(reason), do: to_string(reason)
   def tag({{%module{}, _stack}, _call}), do: inspect(module)
   def tag({{reason, _stack}, _call}) when is_atom(reason), do: to_string(reason)
