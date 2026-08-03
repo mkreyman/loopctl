@@ -111,6 +111,21 @@ defmodule Loopctl.Embeddings.LegacyRetirementTest do
       stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> false end)
       assert {:ok, %{side_table_reads: 0}} = LegacyRetirement.probe()
     end
+
+    test "a live 0 that the STORED row contradicts fails the probe instead of reading as a revert" do
+      # `SystemConfig.get_int/2` returns its default (0) on a `:persistent_term` MISS and
+      # even rescues to it, so an unprimed node is shaped exactly like a deliberate revert
+      # — and a revert vetoes the DEADLINE, the one trigger that fires when everything else
+      # has gone quiet. Silently, forever. It must be a loud, retried probe failure.
+      AdminRepo.insert!(%Loopctl.SystemConfig.Setting{
+        key: Loopctl.Embeddings.read_flag_key(),
+        value: 1
+      })
+
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> false end)
+
+      assert {:error, {:read_flag_cache_stale, _key}} = LegacyRetirement.probe()
+    end
   end
 
   describe "record/2" do
@@ -161,6 +176,25 @@ defmodule Loopctl.Embeddings.LegacyRetirementTest do
 
       assert verdict.verdict == :retired
       assert verdict.trigger == nil
+    end
+
+    test "a dropped column the read path was reverted TO carries the contradiction" do
+      # `:retired` short-circuits `decide/4`, so the live read-flag veto never sees this
+      # case — and a request path pointing at a column that no longer exists is a broken
+      # deployment, not a finished retirement.
+      verdict = evaluate(probe(%{legacy_columns: [], side_table_reads: 0}))
+
+      assert verdict.verdict == :retired
+      assert Enum.any?(verdict.reasons, &(&1 =~ "ACTIVE read path"))
+    end
+
+    test "deadline_passed? agrees with days_past_review_by on EVERY branch" do
+      # Two readings of one fact in one map: the `:retired` branch hard-coded its own
+      # `false` while inheriting a positive `days_past_review_by`.
+      verdict = evaluate(probe(%{legacy_columns: []}), review_by: Date.add(@today, -1))
+
+      assert verdict.days_past_review_by > 0
+      assert verdict.deadline_passed?
     end
   end
 
@@ -280,6 +314,25 @@ defmodule Loopctl.Embeddings.LegacyRetirementTest do
 
       assert verdict.verdict == :not_due
       assert Enum.any?(verdict.reasons, &(&1 =~ "articles_embedding_hnsw_idx (+16)"))
+    end
+
+    test "a counter that went BACKWARDS is a rebuilt index, not a quiet one" do
+      clear_window()
+
+      # REINDEX CONCURRENTLY (or a drop and recreate under the same name) restarts
+      # `idx_scan` at 0 WITHOUT touching `pg_stat_database.stats_reset`, so neither the
+      # reset check nor a peak-only comparison can see it: the baseline is itself in the
+      # window, so the peak never falls below it and a rebuilt-then-scanned index reads
+      # as perfectly still.
+      AdminRepo.update_all(
+        from(o in RetirementObservation, where: o.observed_on == ^@today),
+        set: [legacy_index_scans: %{"articles_embedding_hnsw_idx" => 12}]
+      )
+
+      verdict = evaluate(probe())
+
+      assert verdict.verdict == :not_due
+      assert Enum.any?(verdict.reasons, &(&1 =~ "went BACKWARDS"))
     end
 
     test "a degenerate required_clear_days falls back rather than clearing vacuously" do

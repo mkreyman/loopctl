@@ -149,16 +149,16 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorkerTest do
       assert payload["legacy_index_scans"] == %{"articles_embedding_hnsw_idx" => 674}
     end
 
-    test "the DEADLINE alert reports a metric that crosses its threshold upward" do
-      # `clear_days` is 0 by construction on the deadline path, so shipping it as the
-      # breach pair renders "0 of 30" — which any consumer comparing value to threshold
-      # reads as healthy, for the one trigger that exists to be un-ignorable.
+    test "the DEADLINE alert breaches its threshold on the review_by day ITSELF" do
+      # `clear_days` is 0 by construction here, so shipping it renders "0 of 30" — healthy
+      # to a consumer comparing value to threshold. So is "0 past review_by" on the day the
+      # deadline FIRST fires: hence days AT OR past it, over a window describing a date check.
       stub(Loopctl.MockLegacyRetirement, :evaluate, fn _probe, _opts ->
         verdict(%{
           verdict: :due,
           trigger: :deadline,
           deadline_passed?: true,
-          days_past_review_by: 4
+          days_past_review_by: 0
         })
       end)
 
@@ -167,14 +167,58 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorkerTest do
       assert [job] = all_enqueued(worker: ScaleAlertDeliveryWorker)
       payload = job.args["payload"]
 
-      assert payload["metric"] == "embeddings.legacy_retirement.days_past_review_by"
-      assert payload["value"] == 4
+      assert payload["metric"] == "embeddings.legacy_retirement.days_at_or_past_review_by"
+      assert payload["value"] == 1
       assert payload["threshold"] == 0
-      assert payload["side_table_reads"] == 1
+      assert payload["window_seconds"] == 86_400
     end
   end
 
   describe "fail closed" do
+    test "a BLOCKED deadline alerts too, under its own name" do
+      # More urgent than a plain :not_due (the deadline DID pass) and it re-fires daily, so
+      # the log channel alone was the one passed deadline that reached no operator. The
+      # distinct name keeps it from reading as a drop instruction.
+      stub(Loopctl.MockLegacyRetirement, :evaluate, fn _probe, _opts ->
+        verdict(%{trigger: :deadline_blocked, deadline_passed?: true, days_past_review_by: 0})
+      end)
+
+      capture_log(fn -> assert :ok = run_job() end)
+
+      assert [job] = all_enqueued(worker: ScaleAlertDeliveryWorker)
+      assert job.args["payload"]["alert"] == "embeddings.legacy_retirement_blocked"
+      assert job.args["payload"]["value"] > job.args["payload"]["threshold"]
+    end
+
+    test "a dropped column the read path still points AT logs at :error, not :info" do
+      # `:retired` short-circuits the live read-flag veto, so this contradiction reaches
+      # the worker as a satisfied trigger unless the worker itself says otherwise.
+      stub(Loopctl.MockLegacyRetirement, :evaluate, fn _probe, _opts ->
+        verdict(%{verdict: :retired, legacy_columns: [], side_table_reads: 0})
+      end)
+
+      log = capture_log(fn -> assert :ok = run_job() end)
+
+      assert log =~ "[error]"
+      assert log =~ "BROKEN read path"
+    end
+
+    test "an evidence window that RAISES is a monitor failure, not a quiet :not_due" do
+      # An unreadable observation log (saturated pool, statement timeout, permission) must
+      # not render as the routine ":not_due" a genuinely empty log does — and the log line
+      # must carry the bounded class, never a message embedding host/database/role.
+      stub(Loopctl.MockLegacyRetirement, :evaluate, fn _probe, _opts ->
+        raise %Postgrex.Error{message: "connection not available"}
+      end)
+
+      log = capture_log(fn -> assert {:error, _} = run_job() end)
+
+      refute_enqueued(worker: ScaleAlertDeliveryWorker)
+      assert log =~ "could not evaluate the evidence window"
+      assert log =~ "Postgrex.Error"
+      refute log =~ "connection not available"
+    end
+
     test "a probe error returns {:error, _} and enqueues NOTHING" do
       error = %Postgrex.Error{message: "permission denied for view pg_stat_user_indexes"}
 
@@ -236,7 +280,12 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorkerTest do
       end)
 
       stub(Loopctl.MockLegacyRetirement, :evaluate, fn _probe, _opts ->
-        verdict(%{verdict: :due, trigger: :deadline, deadline_passed?: true})
+        verdict(%{
+          verdict: :due,
+          trigger: :deadline,
+          deadline_passed?: true,
+          days_past_review_by: 0
+        })
       end)
 
       capture_log(fn ->

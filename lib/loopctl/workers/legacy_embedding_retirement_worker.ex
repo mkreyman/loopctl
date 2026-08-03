@@ -36,7 +36,6 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorker do
 
   require Logger
 
-  alias Loopctl.AdminRepo
   alias Loopctl.Embeddings.LegacyRetirement
   alias Loopctl.TelemetryEvents
   alias Loopctl.Workers.ScaleAlertDeliveryWorker
@@ -46,10 +45,24 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorker do
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
-    case observations_table_ready?() do
+    case guarded(fn -> retirement().observations_table_ready?() end) do
       {:ok, record?} -> run(record?)
       {:error, reason} -> monitor_failed(reason, "could not probe the observation table")
     end
+  end
+
+  # A raise or an EXIT would otherwise escape `perform/1` without ever reaching
+  # `monitor_failed/2`, so the telemetry this monitor's own death is supposed to be visible
+  # through never fires. Both shapes are live here: a wedged AdminRepo pool EXITs with
+  # `{:timeout, {GenServer, :call, _}}` or `{:noproc, _}`, and an unreadable observation log
+  # raises — which is exactly what `LegacyRetirement.observations/2` now lets propagate
+  # rather than folding into a routine `:not_due`.
+  defp guarded(fun) do
+    fun.()
+  rescue
+    error -> {:error, error}
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   # Injected (`Loopctl.Embeddings.LegacyRetirementBehaviour`) for ONE reason: the
@@ -62,29 +75,36 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorker do
   # means a run straddling UTC midnight (a manual run, a delayed retry) records day D then
   # evaluates a window ending D+1 — a deficit that never happened.
   defp run(record?) do
-    case retirement().probe() do
+    case guarded(fn -> retirement().probe() end) do
       {:ok, probe} ->
         now = DateTime.utc_now()
         today = DateTime.to_date(now)
 
         maybe_record(record?, probe, now: now, today: today)
-
-        probe
-        |> retirement().evaluate(today: today)
-        |> react()
+        evaluate(probe, today)
 
       {:error, reason} ->
         monitor_failed(reason, "could not read the legacy embedding footprint")
     end
   end
 
+  defp evaluate(probe, today) do
+    case guarded(fn -> {:ok, retirement().evaluate(probe, today: today)} end) do
+      {:ok, verdict} -> react(verdict)
+      {:error, reason} -> monitor_failed(reason, "could not evaluate the evidence window")
+    end
+  end
+
+  # The message carries the BOUNDED `error_class/1` tag, never `inspect(reason)`: a
+  # Postgrex/DBConnection error's message embeds the backend host, database and role
+  # (the reason `LocalGuc.failure_tag/1` exists). The raw reason still rides back to Oban.
   defp monitor_failed(reason, what) do
     :telemetry.execute(TelemetryEvents.legacy_retirement_probe_failed(), %{count: 1}, %{
       error_class: error_class(reason)
     })
 
     Logger.error(
-      "LegacyEmbeddingRetirementWorker: #{what}: #{inspect(reason)}. This is NOT " <>
+      "LegacyEmbeddingRetirementWorker: #{what} (#{error_class(reason)}). This is NOT " <>
         "evidence that the columns are gone — the retirement check did not run."
     )
 
@@ -123,6 +143,17 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorker do
     end
   end
 
+  # The columns are gone AND the read path points back at them: a broken deployment, not a
+  # satisfied trigger. Nothing is droppable, so the verdict stays `:retired` — but at :error.
+  defp react(%{verdict: :retired, side_table_reads: reads} = verdict) when reads != 1 do
+    Logger.error(
+      "LegacyEmbeddingRetirementWorker: BROKEN read path — " <>
+        reasons(verdict) <> ". The request path cannot serve a column that no longer exists."
+    )
+
+    :ok
+  end
+
   # Logged, not silent: `:retired` is also what a MIS-SCOPED or under-privileged probe
   # produces, and a permanently disabled monitor must not look like a satisfied one.
   defp react(%{verdict: :retired} = verdict) do
@@ -131,13 +162,18 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorker do
   end
 
   # The deadline DID pass, so louder than a plain :not_due — but deliberately not a :due:
-  # acting on it would drop the column the request path is reading right now.
+  # acting on it would drop the column the request path is reading right now. It still
+  # ALERTS: this condition re-fires every day and is strictly more urgent than a plain
+  # :not_due, so leaving it on the log channel alone was the one branch where a passed
+  # deadline reached no operator. A distinct `alert` name keeps it from reading as a drop
+  # instruction.
   defp react(%{verdict: :not_due, trigger: :deadline_blocked} = verdict) do
     Logger.warning(
       "LegacyEmbeddingRetirementWorker: retirement BLOCKED for legacy embedding " <>
         "column(s) #{inspect(verdict.legacy_columns)} — " <> reasons(verdict)
     )
 
+    enqueue_alert(verdict, "embeddings.legacy_retirement_blocked")
     :ok
   end
 
@@ -177,15 +213,15 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorker do
   # threshold, window_seconds, at}) so the channel — including ScaleAlertDeliveryWorker's
   # no-URL skip log, which renders metric=value — stays meaningful. Extra context rides
   # alongside; consumers branch on `alert`.
-  defp enqueue_alert(verdict) do
-    {metric, value, threshold} = alert_metric(verdict)
+  defp enqueue_alert(verdict, alert \\ "embeddings.legacy_retirement_due") do
+    {metric, value, threshold, window_seconds} = alert_metric(verdict)
 
     payload = %{
-      "alert" => "embeddings.legacy_retirement_due",
+      "alert" => alert,
       "metric" => metric,
       "value" => value,
       "threshold" => threshold,
-      "window_seconds" => verdict.required_clear_days * 86_400,
+      "window_seconds" => window_seconds,
       "trigger" => to_string(verdict.trigger),
       "side_table_reads" => verdict.side_table_reads,
       "legacy_columns" => verdict.legacy_columns,
@@ -218,25 +254,23 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorker do
       :ok
   end
 
-  # On the DEADLINE trigger `clear_days` is 0 BY CONSTRUCTION, so shipping it as the breach
+  # The whole breach triple (plus its window) comes from ONE place, so value, threshold and
+  # window_seconds always describe each other.
+  #
+  # On the DEADLINE triggers `clear_days` is 0 BY CONSTRUCTION, so shipping it as the breach
   # pair renders "0 of 30" — which any consumer comparing value to threshold (including the
-  # no-URL skip log) reads as healthy, the exact inversion of what the alert means.
-  defp alert_metric(%{trigger: :deadline} = v),
-    do: {"embeddings.legacy_retirement.days_past_review_by", v.days_past_review_by, 0}
+  # no-URL skip log) reads as healthy, the exact inversion of what the alert means. The
+  # metric counts days AT OR PAST review_by (`diff + 1`), not days past it: on the review
+  # date itself the diff is 0, so "days past" would ship 0 against 0 and read as at-threshold
+  # on the first — and most actionable — day it fires. The window is the DAILY cadence: this
+  # is a point-in-time date breach, not a count measured over the 30-day evidence window.
+  defp alert_metric(%{trigger: trigger} = v) when trigger in [:deadline, :deadline_blocked],
+    do:
+      {"embeddings.legacy_retirement.days_at_or_past_review_by", v.days_past_review_by + 1, 0,
+       86_400}
 
   defp alert_metric(v),
-    do: {"embeddings.legacy_retirement.clear_days", v.clear_days, v.required_clear_days}
-
-  # An error is NOT folded into "absent": a saturated AdminRepo pool (3 connections) would
-  # answer with the same `false` a pending migration does, and returning `:ok` from a run
-  # that measured nothing — under a log naming an untrue cause — is the fail-open this
-  # worker exists to prevent.
-  defp observations_table_ready? do
-    case AdminRepo.query("SELECT to_regclass('embedding_retirement_observations')", []) do
-      {:ok, %{rows: [[nil]]}} -> {:ok, false}
-      {:ok, %{rows: [[_oid]]}} -> {:ok, true}
-      {:ok, %{rows: rows}} -> {:error, {:unexpected_table_probe_result, length(rows)}}
-      {:error, reason} -> {:error, reason}
-    end
-  end
+    do:
+      {"embeddings.legacy_retirement.clear_days", v.clear_days, v.required_clear_days,
+       v.required_clear_days * 86_400}
 end

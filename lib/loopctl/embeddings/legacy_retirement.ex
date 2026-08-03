@@ -46,7 +46,10 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
       rows and NO error — a silent `:retired` indistinguishable from a real one.
     * The LIVE `side_table_reads` reading vetoes both triggers while it is 0: the legacy
       column is then the active read path (the revert in progress), and the deadline
-      degrades to `:deadline_blocked` rather than naming it for deletion.
+      degrades to `:deadline_blocked` (still ALERTED, never silent) rather than naming it
+      for deletion. A `0` that is merely UNREADABLE — a cold `:persistent_term` cache,
+      whose default is also 0 — is not a revert and must not veto anything, so `probe/0`
+      resolves it against the stored row and fails whole instead (see `side_table_reads/0`).
     * A gap in the daily observations breaks the streak (`length(rows) == n` over a
       window of `n` distinct days is exactly the contiguity check, since
       `observed_on` is unique).
@@ -167,16 +170,13 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
   @impl Loopctl.Embeddings.LegacyRetirementBehaviour
   @spec probe() :: {:ok, probe()} | {:error, term()}
   def probe do
-    with {:ok, columns} <- legacy_columns(),
+    with {:ok, reads} <- side_table_reads(),
+         {:ok, columns} <- legacy_columns(),
          {:ok, scans} <- legacy_index_scans(),
          {:ok, stats_reset_at} <- stats_reset_at() do
       {:ok,
        %{
-         # Deliberately the INJECTED read path (`Embeddings.side_table_reads_enabled?/0`),
-         # not a fresh `SystemConfig.get_int/2`: the question is what the request path
-         # is actually doing, and re-deriving it from the underlying row would let the
-         # two disagree at exactly the moment that disagreement matters.
-         side_table_reads: if(Embeddings.side_table_reads_enabled?(), do: 1, else: 0),
+         side_table_reads: reads,
          legacy_columns: columns,
          legacy_index_scans: scans,
          stats_reset_at: stats_reset_at
@@ -184,6 +184,28 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
     end
   rescue
     error -> {:error, error}
+  end
+
+  # The reading is the INJECTED read path (`Embeddings.side_table_reads_enabled?/0`), not a
+  # fresh `SystemConfig.get_int/2`: the question is what the request path is actually doing.
+  #
+  # But a `0` from it has TWO causes that must not render alike. One is an operator who
+  # deliberately reverted — a real revert, which correctly vetoes the drop. The other is a
+  # node whose `:persistent_term` cache never primed: `SystemConfig.get_int/2` returns its
+  # default on a MISS and even rescues to it, so an unreadable flag is shaped exactly like a
+  # revert and would veto the DEADLINE — the one trigger that exists to fire when everything
+  # else has gone quiet — silently and forever. So a live `0` is resolved against the STORED
+  # row, and a disagreement is a probe FAILURE (loud, retried), never a verdict.
+  defp side_table_reads do
+    if Embeddings.side_table_reads_enabled?() do
+      {:ok, 1}
+    else
+      case query("SELECT value FROM system_configs WHERE key = $1", [Embeddings.read_flag_key()]) do
+        {:ok, %{rows: [[1]]}} -> {:error, {:read_flag_cache_stale, Embeddings.read_flag_key()}}
+        {:ok, %{rows: _}} -> {:ok, 0}
+        {:error, reason} -> {:error, reason}
+      end
+    end
   end
 
   # Read from `pg_attribute`/`pg_class`, NOT `information_schema.columns`: the latter is
@@ -266,6 +288,29 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
     end)
   end
 
+  @doc """
+  Whether the observation log table exists.
+
+  `{:ok, false}` is a GENUINE absence (a crontab entry deployed ahead of its migration).
+  An unreadable catalog is `{:error, _}` and never folded into `false`: a saturated
+  AdminRepo pool would otherwise answer exactly the way a pending migration does.
+
+  It lives here, behind the same guarded `query/2` as every other catalog read, so both
+  share ONE 5s statement_timeout and one owner — an unbounded probe against AdminRepo's
+  3-connection pool is precisely the starvation that timeout exists to prevent, and this
+  is the read that runs first on every job.
+  """
+  @impl Loopctl.Embeddings.LegacyRetirementBehaviour
+  @spec observations_table_ready?() :: {:ok, boolean()} | {:error, term()}
+  def observations_table_ready? do
+    case query("SELECT to_regclass($1::text)", ["embedding_retirement_observations"]) do
+      {:ok, %{rows: [[nil]]}} -> {:ok, false}
+      {:ok, %{rows: [[_oid]]}} -> {:ok, true}
+      {:ok, %{rows: rows}} -> {:error, {:unexpected_table_probe_result, length(rows)}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp to_utc(%DateTime{} = dt), do: dt
   defp to_utc(%NaiveDateTime{} = ndt), do: DateTime.from_naive!(ndt, "Etc/UTC")
   defp to_utc(_), do: nil
@@ -335,23 +380,21 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
         :error -> required_clear_days()
       end
 
+    # `deadline_passed?` is derived ONCE, here, and inherited by every branch: it and
+    # `days_past_review_by` are two readings of one fact, and a branch that hard-coded its
+    # own copy (the `:retired` one did) shipped a verdict map that contradicted itself.
     base = %{
       legacy_columns: probe.legacy_columns,
       required_clear_days: required,
       review_by: review_by,
       days_past_review_by: Date.diff(today, review_by),
+      deadline_passed?: Date.compare(today, review_by) != :lt,
       side_table_reads: probe.side_table_reads,
       legacy_index_scans: probe.legacy_index_scans
     }
 
     if probe.legacy_columns == [] do
-      Map.merge(base, %{
-        verdict: :retired,
-        trigger: nil,
-        reasons: ["no legacy embedding column remains"],
-        clear_days: 0,
-        deadline_passed?: false
-      })
+      retired(base)
     else
       decide(base, today, required, review_by)
     end
@@ -359,15 +402,28 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
 
   @revert_reason "side_table_reads is currently 0 — the legacy column is the ACTIVE read path"
 
+  # `evaluate/2` short-circuits here BEFORE `decide/4`, so the live read-flag veto never
+  # sees this case — and "the column is gone while the read path points back AT it" is a
+  # broken deployment, not a finished retirement. The verdict stays `:retired` (nothing is
+  # droppable), but it carries the contradiction so the worker can log it at :error.
+  defp retired(base) do
+    reasons =
+      if reads_side_table?(base),
+        do: ["no legacy embedding column remains"],
+        else: ["no legacy embedding column remains, yet #{@revert_reason}"]
+
+    Map.merge(base, %{verdict: :retired, trigger: nil, reasons: reasons, clear_days: 0})
+  end
+
   # The LIVE reading vetoes BOTH triggers. The stored window can only speak for days
   # already past, so a revert flipped after the last observation is invisible to it — and
   # a revert is precisely what these columns are kept for. Firing `:due` then would name
   # the live read path for deletion, so the deadline degrades to `:deadline_blocked`
-  # (still surfaced, never acted on) rather than to silence.
+  # (still surfaced and still ALERTED, never acted on) rather than to silence.
   defp decide(base, today, required, review_by) do
     {streak, window_reasons} = clear_streak(today, required)
-    deadline_passed? = Date.compare(today, review_by) != :lt
-    reverting? = base.side_table_reads != 1
+    deadline_passed? = base.deadline_passed?
+    reverting? = not reads_side_table?(base)
     clear_days = if reverting?, do: 0, else: streak
     reasons = if reverting?, do: [@revert_reason | window_reasons], else: window_reasons
 
@@ -396,8 +452,7 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
       verdict: verdict,
       trigger: trigger,
       reasons: reasons,
-      clear_days: clear_days,
-      deadline_passed?: deadline_passed?
+      clear_days: clear_days
     })
   end
 
@@ -418,8 +473,14 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
   end
 
   # The log can be genuinely ABSENT — a crontab entry deployed ahead of its migration —
-  # and unreadable must cost the EVIDENCE path without costing the deadline, which is the
-  # one trigger designed to fire with no observations at all.
+  # and that must cost the EVIDENCE path without costing the deadline, which is the one
+  # trigger designed to fire with no observations at all.
+  #
+  # ONLY that case is rescued. A blanket rescue here folded a saturated pool, a statement
+  # timeout and a permission error into the same routine `:not_due` at :info — a
+  # permanently wedged evidence path rendered as a monitor that keeps finding nothing,
+  # which is the failure this module exists to prevent. Everything else propagates, and
+  # the worker turns it into a probe failure (telemetry, `{:error, _}`, Oban retry).
   defp observations(from_day, today) do
     {:ok,
      RetirementObservation
@@ -427,7 +488,14 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
      |> order_by([o], asc: o.observed_on)
      |> AdminRepo.all()}
   rescue
-    error -> {:error, inspect(error.__struct__)}
+    error in Postgrex.Error ->
+      case error do
+        %Postgrex.Error{postgres: %{code: :undefined_table}} ->
+          {:error, "the table does not exist"}
+
+        _ ->
+          reraise error, __STACKTRACE__
+      end
   end
 
   defp window_defects(rows, required) do
@@ -441,8 +509,13 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
     coverage ++ flag_defects(rows) ++ reset_defects(rows) ++ scan_defects(rows)
   end
 
+  # ONE definition of "the side table is the read path", shared by the stored-row check
+  # below, `decide/4`'s live veto and `retired/1` — so the predicate cannot drift between
+  # the three sites that have to agree on it.
+  defp reads_side_table?(%{side_table_reads: reads}), do: reads == 1
+
   defp flag_defects(rows) do
-    case Enum.filter(rows, &(&1.side_table_reads != 1)) do
+    case Enum.reject(rows, &reads_side_table?/1) do
       [] ->
         []
 
@@ -466,11 +539,17 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
   defp same_instant?(_, nil), do: false
   defp same_instant?(a, b), do: DateTime.compare(a, b) == :eq
 
-  # Counters only ever increase (a reset is excluded above), so comparing each index's
-  # window PEAK to its baseline is exactly "no scan happened in between". Every index seen
-  # ANYWHERE in the window counts, not just at its endpoints: one created on day 5,
-  # scanned hard, and dropped on day 25 appears at neither end, and an endpoint-only
-  # comparison never examined it at all.
+  # Comparing each index's window PEAK to its baseline is exactly "no scan happened in
+  # between". Every index seen ANYWHERE in the window counts, not just at its endpoints:
+  # one created on day 5, scanned hard, and dropped on day 25 appears at neither end, and
+  # an endpoint-only comparison never examined it at all.
+  #
+  # The peak alone cannot see a counter going BACKWARDS, and the baseline is itself in the
+  # window, so the peak can never fall below it. A per-index reset — `REINDEX CONCURRENTLY`,
+  # or a drop and recreate under the same name — zeroes `idx_scan` without touching
+  # `pg_stat_database.stats_reset`, so `reset_defects/1` does not cover it either: a rebuilt
+  # index scanned back to just under its old total would read as perfectly still. Any
+  # reading below its baseline is therefore its own defect.
   defp scan_defects(rows) when length(rows) < 2, do: []
 
   defp scan_defects(rows) do
@@ -479,35 +558,36 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
 
     missing = seen |> Enum.reject(&Map.has_key?(first, &1)) |> Enum.sort()
 
-    scanned =
+    tracked =
       for index <- seen -- missing,
           baseline = Map.get(first, index),
           is_integer(baseline),
-          peak = peak_scans(rows, index, baseline),
-          peak != baseline,
+          do: {index, baseline, window_scans(rows, index)}
+
+    scanned =
+      for {index, baseline, values} <- tracked,
+          peak = Enum.max(values, fn -> baseline end),
+          peak > baseline,
           do: "#{index} (+#{peak - baseline})"
 
-    missing_reason =
-      if missing == [],
-        do: [],
-        else: ["index(es) absent at the start of the window: #{Enum.join(missing, ", ")}"]
+    rebuilt =
+      for {index, baseline, values} <- tracked,
+          Enum.min(values, fn -> baseline end) < baseline,
+          do: index
 
-    scanned_reason =
-      if scanned == [],
-        do: [],
-        else: [
-          "legacy index scans inside the window: #{scanned |> Enum.sort() |> Enum.join(", ")}"
-        ]
-
-    missing_reason ++ scanned_reason
+    reason("index(es) absent at the start of the window", missing) ++
+      reason("index(es) whose scan counter went BACKWARDS inside the window (rebuilt)", rebuilt) ++
+      reason("legacy index scans inside the window", scanned)
   end
+
+  defp reason(_prefix, []), do: []
+  defp reason(prefix, items), do: ["#{prefix}: #{items |> Enum.sort() |> Enum.join(", ")}"]
 
   defp scans(row), do: row.legacy_index_scans || %{}
 
-  defp peak_scans(rows, index, baseline) do
+  defp window_scans(rows, index) do
     rows
     |> Enum.map(&Map.get(scans(&1), index))
     |> Enum.filter(&is_integer/1)
-    |> Enum.max(fn -> baseline end)
   end
 end

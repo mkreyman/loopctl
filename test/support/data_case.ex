@@ -106,6 +106,11 @@ defmodule Loopctl.DataCase do
     # records and evaluates. Only the worker's fail-closed test overrides `probe/0` to
     # return an error, which is the one shape the test database cannot produce.
     Mox.stub(Loopctl.MockLegacyRetirement, :probe, fn -> LegacyRetirement.probe() end)
+
+    Mox.stub(Loopctl.MockLegacyRetirement, :observations_table_ready?, fn ->
+      LegacyRetirement.observations_table_ready?()
+    end)
+
     Mox.stub(Loopctl.MockLegacyRetirement, :record, &LegacyRetirement.record/2)
     Mox.stub(Loopctl.MockLegacyRetirement, :evaluate, &LegacyRetirement.evaluate/2)
 

@@ -21,6 +21,9 @@ defmodule Loopctl.Embeddings.LegacyRetirementBehaviour do
   @doc "Read the live legacy-embedding footprint. Whole, or `{:error, _}`."
   @callback probe() :: {:ok, map()} | {:error, term()}
 
+  @doc "Whether the observation log exists. `{:error, _}` for an unreadable catalog."
+  @callback observations_table_ready?() :: {:ok, boolean()} | {:error, term()}
+
   @doc "Upsert today's observation from a probe reading."
   @callback record(probe :: map(), opts :: keyword()) ::
               {:ok, struct()} | {:error, Ecto.Changeset.t()}

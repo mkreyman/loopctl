@@ -14,7 +14,9 @@ Operator-facing changes for deployments outside the hosted instance.
   survive, and the cumulative `idx_scan` of every index over them — and once retirement is
   owed it logs at `error` every run and enqueues an operator alert
   (`embeddings.legacy_retirement_due`) through the existing `SCALE_ALERT_WEBHOOK_URL`
-  channel, which stays a no-op when that is unset.
+  channel, which stays a no-op when that is unset. A passed deadline that a revert in
+  progress is BLOCKING alerts on the same channel under `embeddings.legacy_retirement_blocked`
+  — it names a condition to resolve, not a column to drop.
 
   **It drops nothing.** Dropping `articles.embedding` / `memories.embedding` remains a
   deliberate, reviewed migration; this only decides when the system starts asking for one.
