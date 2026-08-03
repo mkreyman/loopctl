@@ -1,6 +1,19 @@
 # Epic 41 — Private / Local-Only Knowledge & Memory (data sovereignty)
 
-**Status: DRAFT — re-scoped 2026-07-20 from the parked epic 39 draft (2026-07-15).
+**Status: PARTLY SHIPPED. US-41.1, 41.3, 41.4, 41.5 and 41.7 are merged; US-41.2 and
+US-41.6 are not started.** The per-story state and its merge PR live in the Stories
+table below — that table is the single source of truth for what is done, and this
+header is the only place that summarises it. Everything in the prose below (the
+motivation, the audit table, the "Grounded current state" table, the decisions) was
+written against master 2026-07-20 and is the epic's DESIGN record: read its present
+tense as "at design time", not as a claim about master today.
+
+Recording this mattered enough to fix: GH #551 was filed against a stale reading of
+this header and asserted that five stories were open when three of those five had
+already merged. A status line nobody updates is worse than no status line, because it
+gets cited.
+
+**Re-scoped 2026-07-20 from the parked epic 39 draft (2026-07-15).
 Renumbered 39 -> 41 because epic 39 was reused by the shipped repo-coordination-bus
 epic. Every story MUST go through the enhanced-review workflow (against the story
 text AND the diff) before/at implementation.
@@ -172,15 +185,23 @@ requires the `.well-known` capability publication from AC-41.4.10 — so 41.2, 4
 41.1 all depend on 41.4. **Implementation order: 41.4 -> 41.1 -> 41.2 -> 41.3 -> 41.5,
 then 41.6 / 41.7.**
 
-| Story | Title | Axis | Depends |
-|-------|-------|------|---------|
-| US-41.1 | Per-tenant embedding dimension via an `article_embeddings` / `memory_embeddings` side table | B | US-41.4 (`.well-known` capability publication, AC-41.4.10) |
-| US-41.2 | Per-tenant embedding **endpoint** + config-time dimension probe with legible remediation | A | US-41.1, US-41.4 (egress policy module, AC-41.4.9) |
-| US-41.3 | Pluggable extraction/classification/merge endpoint (OpenAI-compatible local chat) | A | US-41.4 (egress policy module, AC-41.4.9) |
-| US-41.4 | **Fail-closed** no-egress guard + `local_only` scope marking + tenant-declared trusted endpoints + `egress_posture` MCP tool + `.well-known` capability publication | A | — |
-| US-41.5 | Extend the egress guard to non-provider egress (webhook delivery) | A | US-41.4 |
-| US-41.6 | Encrypted private-tier bodies at rest + vector-only recall + honest threat model | B | US-41.1, US-41.4 |
-| US-41.7 | Egress posture as a **witnessed custody claim** in the audit chain / STH | A | US-41.4, US-41.5 |
+| Story | Title | Axis | Depends | State |
+|-------|-------|------|---------|-------|
+| US-41.1 | Per-tenant embedding dimension via an `article_embeddings` / `memory_embeddings` side table | B | US-41.4 (`.well-known` capability publication, AC-41.4.10) | SHIPPED (PR #482) |
+| US-41.2 | Per-tenant embedding **endpoint** + config-time dimension probe with legible remediation | A | US-41.1, US-41.4 (egress policy module, AC-41.4.9) | NOT STARTED |
+| US-41.3 | Pluggable extraction/classification/merge endpoint (OpenAI-compatible local chat) | A | US-41.4 (egress policy module, AC-41.4.9) | SHIPPED (PR #472) |
+| US-41.4 | **Fail-closed** no-egress guard + `local_only` scope marking + tenant-declared trusted endpoints + `egress_posture` MCP tool + `.well-known` capability publication | A | — | SHIPPED (PR #457) |
+| US-41.5 | Extend the egress guard to non-provider egress (webhook delivery) | A | US-41.4 | SHIPPED (PR #477) |
+| US-41.6 | Encrypted private-tier bodies at rest + vector-only recall + honest threat model | B | US-41.1, US-41.4 | NOT STARTED |
+| US-41.7 | Egress posture as a **witnessed custody claim** in the audit chain / STH | A | US-41.4, US-41.5 | SHIPPED (PR #481) |
+
+The two open stories are load-bearing on OTHER work and are cheap to re-verify in code
+rather than by trusting this table: US-41.2 is unstarted iff `tenant_llm_settings` has
+no `embedding_base_url` field (`lib/loopctl/llm/tenant_llm_settings.ex`) and
+`EmbeddingClient` still resolves `base_url` from runtime config
+(`lib/loopctl/knowledge/embedding_client.ex`); US-41.6 is unstarted iff
+`Loopctl.Egress` still hardcodes `encrypt_body: false` with a "ships in US-41.6"
+comment (`lib/loopctl/egress.ex`). Both hold as of 2026-08-02.
 
 ## Decisions
 

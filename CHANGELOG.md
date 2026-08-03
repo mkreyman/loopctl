@@ -8,6 +8,23 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Added
 
+- **A retirement trigger for the US-41.1 legacy embedding columns (#551).** New migration
+  (`embedding_retirement_observations`, a global non-tenant table) and a new daily job at
+  03:40 UTC. It records one observation per UTC day — the read flag, which legacy columns
+  survive, and the cumulative `idx_scan` of every index over them — and once retirement is
+  owed it logs at `error` every run and enqueues an operator alert
+  (`embeddings.legacy_retirement_due`) through the existing `SCALE_ALERT_WEBHOOK_URL`
+  channel, which stays a no-op when that is unset.
+
+  **It drops nothing.** Dropping `articles.embedding` / `memories.embedding` remains a
+  deliberate, reviewed migration; this only decides when the system starts asking for one.
+  Two triggers, both requiring the columns to still exist: 30 consecutive clear days
+  (`embedding_side_table_reads = 1`, no movement on any legacy index), or the `review_by`
+  date passing — `2027-01-22`, six months after the cutover. The deadline is what keeps
+  the check honest: a probe that errors forever looks exactly like a probe that keeps
+  finding nothing. Both values are `config :loopctl, :embedding_legacy_retirement` — no
+  new environment variable, and moving the date out is a supported operator decision.
+
 - **`GET /enroll` — a browser page that anchors an EXISTING tenant (#541).** The API
   advertised an `enrollment_upgrade` path out of `agent_rooted`, but nobody could walk it:
   `navigator.credentials.create()` needs a browser, and the only page running a WebAuthn

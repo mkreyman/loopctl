@@ -19,6 +19,7 @@ defmodule Loopctl.DataCase do
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.Custody.Coverage
   alias Loopctl.Egress.Scope, as: EgressScope
+  alias Loopctl.Embeddings.LegacyRetirement
   alias Loopctl.Embeddings.SystemConfigReadPath
   alias Loopctl.Knowledge.StreamingExport.NoopBodyProbe
   alias Loopctl.Oban.FairShare
@@ -100,6 +101,13 @@ defmodule Loopctl.DataCase do
     end)
 
     stub_embedding_read_path()
+
+    # GH #551: production behaviour by default — the retirement trigger really probes,
+    # records and evaluates. Only the worker's fail-closed test overrides `probe/0` to
+    # return an error, which is the one shape the test database cannot produce.
+    Mox.stub(Loopctl.MockLegacyRetirement, :probe, fn -> LegacyRetirement.probe() end)
+    Mox.stub(Loopctl.MockLegacyRetirement, :record, &LegacyRetirement.record/2)
+    Mox.stub(Loopctl.MockLegacyRetirement, :evaluate, &LegacyRetirement.evaluate/2)
 
     # US-27.16: default to PRODUCTION behaviour — the streaming-export producer observes
     # (and therefore retains) nothing. Only the bounded-memory scale gate overrides this,
