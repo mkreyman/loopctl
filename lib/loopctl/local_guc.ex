@@ -76,6 +76,26 @@ defmodule Loopctl.LocalGuc do
       # unowned and, on a capture failure, takes the RESET branch for a GUC an outer scope is
       # actively holding, the clobber `capture_fallback!/2` aborts to prevent.
       restore(repo, prior)
+      warn_unpopped(enclosing)
+    end
+  end
+
+  # The other side of popping exactly once: an occurrence the BODY pushed via the hand-paired
+  # `capture/2` and never popped survives this scope. Popping it here is not an option (that is
+  # the second-`--` bug above), and on a per-request/per-job process that dies it is harmless —
+  # but on a long-lived one (the shared `ScaleMetrics` poller) it is permanent, and a phantom
+  # owner makes every later capture failure for that name ABORT a read it could safely have
+  # RESET. So make the missing `forget/1` VISIBLE instead of silently sticky.
+  defp warn_unpopped(enclosing) do
+    case active_names() -- enclosing do
+      [] ->
+        :ok
+
+      leaked ->
+        Logger.warning(
+          "LocalGuc: #{inspect(leaked)} still held after scope exit — a capture/2 without a " <>
+            "matching restore/2 or forget/1; later scopes will abort rather than reset it"
+        )
     end
   end
 

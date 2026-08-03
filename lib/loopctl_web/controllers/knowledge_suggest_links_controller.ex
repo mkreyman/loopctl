@@ -19,9 +19,6 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  # `ExitClass`'s catch-all bucket: the exits it could NOT place on a pool shape.
-  @unclassified_exit "exit:other"
-
   plug LoopctlWeb.Plugs.RequireRole, role: :agent
 
   tags(["Knowledge Wiki"])
@@ -166,18 +163,26 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
     # Retry-After the caller already understands. The message is the BOUNDED `ExitClass`
     # class, never the reason itself.
     #
-    # ONLY the exits `ExitClass` recognises as pool shapes. A blanket `kind in [:exit,
-    # :throw]` told the client to retry a DETERMINISTIC fault (a throw, a non-DB `GenServer`
-    # timeout) as a transient database outage, and swallowed the crash report that would have
-    # named it. An unclassifiable exit is re-exited, and a throw is left alone, keeping the
-    # let-it-crash contract this guard narrows rather than replaces.
+    # ONLY an exit `ExitClass.pool_exit?/1` places on the POOL — i.e. one whose call tuple
+    # names a pool module. Not `classify/2`: that keys on the exit REASON, so a non-DB
+    # `{:timeout, {GenServer, :call, _}}` lands in its closed tag set and a blanket
+    # `kind in [:exit, :throw]` catch (or a tag-based one) still told the client to retry a
+    # DETERMINISTIC fault as a transient database outage, swallowing the crash report that
+    # would have named it. A throw is left alone entirely.
+    #
+    # An unplaceable exit is re-raised as a WRAPPED, SANITISED exit. Wrapped because a benign
+    # reason (`:normal`) re-exited verbatim is not a crash: the request process would just end,
+    # with no crash report and no status line — a closed connection instead of a 500. Sanitised
+    # because the raw reason is exactly what the comment above says must never reach a log on
+    # this endpoint: a DBConnection reason's call element carries the `%Postgrex.Query{}`
+    # statement and its bound vector literals, and `Plugs.DBErrorBackstop` rescues only, so
+    # nothing downstream would redact it.
     :exit, reason ->
-      case ExitClass.classify(:exit, reason) do
-        @unclassified_exit ->
-          exit(reason)
-
-        class ->
-          {:error, %DBConnection.ConnectionError{message: "suggest_links unavailable (#{class})"}}
+      if ExitClass.pool_exit?(reason) do
+        class = ExitClass.classify(:exit, reason)
+        {:error, %DBConnection.ConnectionError{message: "suggest_links unavailable (#{class})"}}
+      else
+        exit({:suggest_links_unclassified_exit, ExitClass.classify(:exit, reason)})
       end
   end
 

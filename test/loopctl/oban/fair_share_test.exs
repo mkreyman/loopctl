@@ -125,9 +125,23 @@ defmodule Loopctl.Oban.FairShareTest do
       refute log =~ "DBConnection.execute"
     end
 
-    test "a THROW admits too — the third non-local kind", %{tenant: tenant} do
+    test "a THROW is NOT swallowed — it is a broken counter, not an unmeasurable count", %{
+      tenant: tenant
+    } do
+      # #559: blanket-catching `:throw` reopened for throws the same silent admit the narrowed
+      # rescue closed for raises — a counter that throws for control flow degraded into `:ok`
+      # and every fair-share assertion made through it passed for the wrong reason. The
+      # sibling guard in `KnowledgeSuggestLinksController` makes the same call.
       stub(Loopctl.MockFairShareCounter, :lower_ranked_executing_count, fn _t, _q, _j ->
         throw(:boom)
+      end)
+
+      assert catch_throw(FairShare.gate(tenant.id, :knowledge, 1)) == :boom
+    end
+
+    test "a DB-layer OwnershipError still fails open", %{tenant: tenant} do
+      stub(Loopctl.MockFairShareCounter, :lower_ranked_executing_count, fn _t, _q, _j ->
+        raise DBConnection.OwnershipError, "owner exited"
       end)
 
       log =
@@ -135,7 +149,8 @@ defmodule Loopctl.Oban.FairShareTest do
           assert FairShare.gate(tenant.id, :knowledge, 1) == :ok
         end)
 
-      assert log =~ "throw:"
+      assert log =~ "FairShare gate failed open"
+      assert log =~ "DBConnection.OwnershipError"
     end
 
     test "a RAISE still fails open, with its own bounded class", %{tenant: tenant} do
