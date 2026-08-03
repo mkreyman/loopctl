@@ -215,29 +215,47 @@ defmodule Loopctl.TelemetryEvents do
   def llm_provider_error, do: [:loopctl, :llm, :provider_error]
 
   @doc """
-  The US-36.3 batch/single ingest backlog admission gate FAILED OPEN — it could not
-  measure the calling tenant's in-flight `:ingestion` backlog (the count raised a
-  `Postgrex.Error` statement_timeout or a `DBConnection.ConnectionError` pool-checkout
-  timeout) and therefore ADMITTED the request rather than 429-ing it. While this fires,
-  the backpressure valve is effectively OFF for that request: a genuine flood deep
-  enough to time the count out will admit instead of shed.
+  The US-36.3 batch/single ingest backlog admission gate could not MEASURE the calling
+  tenant's in-flight `:ingestion` backlog. Read the OUTCOME, not the event name: the
+  event no longer implies an admission.
 
-  Turns an otherwise silent `:warning` log line into an alertable signal so operators
-  can see "the ingestion backpressure valve is currently admitting because it can't
-  measure" on a dashboard. Distinct from a valve that is simply BELOW threshold (that
-  path emits nothing). Fires once per failed-open admission check.
+  It fires on every unmeasurable-count outcome — admitted, admitted-because-the-meter
+  itself was unconsultable, and REFUSED once the bounded fail-open allowance is spent.
+  Emitting only on the admitting branch made the signal go silent exactly when the fault
+  turned sustained, which is when an operator needs it; so the branch is now in the
+  payload rather than in whether the payload exists.
+
+  Distinct from a valve that is simply BELOW threshold (that path emits nothing).
 
   ## Payload (id/atom only — never a query, key, or PG message body)
 
-    * `measurements`: `%{count: 1}` — a pure increment.
-    * `metadata`: `%{tenant_id, error_class}` where `error_class` is a BOUNDED 4-value
-      tag: `"timeout"` (57014 query_canceled — the count's own statement_timeout),
-      `"db_error"` (any OTHER `Postgrex.Error` SQLSTATE — a query bug in the count path,
-      NOT a timeout), `"connection"` (`DBConnection.ConnectionError` pool-checkout
-      timeout), `"guc_capture_abort"` (`Loopctl.LocalGuc` REFUSED to override a GUC an
-      enclosing scope owns — deliberate, not a blip). `tenant_id` is an id, and is
-      cap-gated to a sentinel in the metric's `tag_values` so label cardinality stays
-      bounded (same convention as the other scale counters).
+    * `measurements`: `%{count: 1, jobs: n}` — one increment per gate check, plus the
+      JOBS that check covered (a 50-item batch is one check and fifty jobs). Both are
+      exported; a per-request count alone cannot distinguish a burst of large batches
+      from a trickle of single ingests.
+    * `metadata`: `%{tenant_id, error_class, outcome}`.
+
+      `outcome` is a BOUNDED 3-value atom: `:admitted` (unmetered fault class, or within
+      allowance), `:unmetered` (the METER was unconsultable — under `RATE_LIMITER=postgres`
+      its store is the same wedged pool — so the request was admitted rather than 429-ing a
+      tenant whose backlog was neither measured nor metered), `:exhausted` (allowance spent;
+      the request got the ordinary backlog 429).
+
+      `error_class` is a BOUNDED 5-value tag: `"timeout"` (57014 query_canceled — the
+      count's own statement_timeout), `"db_pressure"` (SQLSTATE class 53/57/08 — the
+      exhaustion/connection classes a saturated pool raises behind pgbouncer), `"db_error"`
+      (any OTHER `Postgrex.Error` SQLSTATE — a query bug in the count path, and `08P01`
+      protocol_violation, which is a driver bug rather than pressure), `"connection"`
+      (`DBConnection.ConnectionError` pool-checkout timeout), `"guc_capture_abort"`
+      (`Loopctl.LocalGuc` REFUSED to override a GUC an enclosing scope owns — raised only
+      once the connection is ALREADY wedged, hence metered), plus the `exit:<t>` / `throw:<t>`
+      families from `Loopctl.ExitClass`.
+
+      METERED classes (bounded allowance, then 429): `connection`, `timeout`, `db_pressure`,
+      `guc_capture_abort`, `exit:*`, `throw:*`. UNMETERED (always admits): `db_error`.
+
+      `tenant_id` is an id, cap-gated to a sentinel in the metric's `tag_values`
+      (`ScaleMetrics.backlog_gate_tags/1`) so label cardinality stays bounded.
 
   Aggregated by `Loopctl.Telemetry.ScaleMetrics` as a counter tagged by
   `[:error_class, :tenant_id]`.
