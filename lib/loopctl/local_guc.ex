@@ -43,6 +43,8 @@ defmodule Loopctl.LocalGuc do
 
   require Logger
 
+  alias Loopctl.ExitTag
+
   @doc """
   Capture `names`, run `fun`, then restore the captured values. MUST be called inside a
   transaction on `repo`; `fun` issues its own `SET LOCAL`s.
@@ -138,14 +140,26 @@ defmodule Loopctl.LocalGuc do
         # one of which tells it never to retry something that is purely transient.
         #
         # Sharing the struct does NOT make this abort indistinguishable from a pool blip:
-        # `capture_abort?/1` below matches it on the stable `@capture_abort_tag` prefix, so any
-        # fail-soft rescue that must tell the two apart re-raises on it instead of swallowing
-        # it. Today's rescues deliberately do not — the ingestion backlog gate
-        # (`LoopctlWeb.KnowledgeIngestionController.in_flight_ingestion_backlog/1`) fails OPEN
-        # at 0 and `Knowledge`'s under-fill probe degrades to `:error` — and that is the right
-        # reading there: this path is reached ONLY when the capture round trip itself failed,
-        # i.e. the connection is already in trouble, which is the condition those rescues exist
-        # for.
+        # `capture_abort?/1` above matches it on the stable `@capture_abort_tag` prefix, so a
+        # fail-soft rescue that must tell the two apart TAGS it — `guc_capture_abort` rather
+        # than a generic connection failure — and then degrades exactly as it would for any
+        # other unmeasurable diagnostic. Telling them apart is a LOGGING distinction, never a
+        # control-flow one.
+        #
+        # Specifically: recognising the tag is NOT a signal to re-raise. `capture_abort?/1`'s
+        # @doc settles that (it was settled the expensive way, in #550) — re-raising out of a
+        # fail-soft path converts "this diagnostic could not be measured" into a failed
+        # request, which is the thing those paths exist to prevent. So ON THIS ABORT — which
+        # is a RAISE, and therefore exactly what a `rescue` clause sees — the ingestion backlog
+        # gate (`LoopctlWeb.KnowledgeIngestionController`) fails OPEN at 0, `Knowledge`'s
+        # under-fill probe degrades to `:error`, and `ArticleLinkingWorker` skips its
+        # observational count — all tagging, none re-raising. That is a claim about the abort,
+        # NOT about the separate EXIT shape of a wedged pool checkout: only
+        # `ArticleLinkingWorker` and the `ScaleMetrics` pollers catch that today; the first two
+        # still let an exit escape their class-restricted rescue. An earlier revision of this
+        # comment said such rescues "re-raise ... Today's rescues deliberately do not", which
+        # read as an aspiration the call sites had not caught up with. They had; the sentence
+        # was wrong, and it contradicted the @doc twenty lines above it.
         raise DBConnection.ConnectionError,
               "#{@capture_abort_tag} #{inspect(owned)}, which an enclosing scope " <>
                 "already overrode — refusing to set an override this transaction cannot " <>
@@ -334,11 +348,11 @@ defmodule Loopctl.LocalGuc do
   defp failure_tag(%DBConnection.ConnectionError{}), do: "connection_error"
   defp failure_tag(%DBConnection.OwnershipError{}), do: "ownership_error"
   defp failure_tag(%{__exception__: true} = e), do: "exception_#{inspect(e.__struct__)}"
-  defp failure_tag(reason) when is_atom(reason), do: to_string(reason)
-  # DBConnection/Postgrex EXIT with a TUPLE — `{:timeout, {GenServer, :call, _}}` when the
-  # pool is wedged, `{:noproc, _}` when it is not started — which IS the wedged-pool moment
-  # this tag exists for. Without these the real shapes all degraded to "unknown". Mirrors
-  # `HeavyRead.exit_tag/1`.
-  defp failure_tag({reason, _details}) when is_atom(reason), do: to_string(reason)
-  defp failure_tag(_reason), do: "unknown"
+  # Everything else is an EXIT reason, classified by the ONE shared tagger: DBConnection
+  # exits with a TUPLE — `{:timeout, {GenServer, :call, _}}` when the pool is wedged,
+  # `{:noproc, _}` when it is not started, `{{exception, stack}, call}` when the pool process
+  # dies of a crash — and this module's own clause list handled only two of those three, so
+  # crash propagation degraded to "unknown" here while the same shape tagged correctly
+  # elsewhere.
+  defp failure_tag(reason), do: ExitTag.tag(reason)
 end

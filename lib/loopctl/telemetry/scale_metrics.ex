@@ -35,8 +35,8 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   US-36.4 adds the article-linking corpus-size gauge (metric 22 below). US-38.3 adds
   the clustering-readiness peer gauge (metric 23 below — `loopctl.cluster.peers.count`,
   a `last_value/2` gauge of `length(Node.list/0)` tagged by the bounded readiness
-  `status`, fed by `poll_cluster_readiness/0`), so `scale_metrics/0` now returns 23
-  metrics total.
+  `status`, fed by `poll_cluster_readiness/0`). `scale_metrics/0` itself is the
+  inventory — never a count repeated here.
 
   ## The metrics (23 total)
 
@@ -338,15 +338,21 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         genuinely wedged past Lifeline's own rescue point, not merely mid-flight).
         `EXPLAIN` confirms this query is already an `Index Scan` over the tiny
         `executing` partition — unaffected by the Seq Scan risk metric 18 fixes.
-    20. **Oban poll-failure counter** (US-34.1, review finding) —
-        `loopctl.oban.poll.error.count`, keyed by `[:poller, :error_class]` — BOTH
-        bounded, fixed sets (`poller` is `"queue_state"`/`"executing_orphans"`;
+    20. **Periodic-measurement poll-failure counter** (US-34.1, review finding) —
+        `loopctl.oban.poll.error.count` (the `oban.` name predates the other
+        measurements adopting it; renaming would break existing dashboards), keyed by
+        `[:poller, :error_class]` — BOTH bounded, fixed sets (`poller` is one per
+        measurement in `LoopctlWeb.Telemetry.periodic_measurements/0`:
+        `"queue_state"`/`"executing_orphans"`/`"cluster_readiness"`/`"tenant_label_gate"`;
         `error_class` is CLASSIFIED via `oban_poll_error_class/1` into
-        `"db_error"`/`"config_error"`/`"other"`, never the raw exception message).
-        Emitted from BOTH pollers' catch-all `rescue` clause, so a frozen gauge
-        (metrics 18/19 retaining their last value because a poll cycle failed) is
-        now distinguishable in Prometheus from a genuinely stable reading — a
-        non-zero, incrementing rate on this counter means the OTHER two gauges are
+        `"db_error"`/`"guc_capture_abort"`/`"config_error"`/`"exit"`/`"throw"`/
+        `"other"`/`"unknown"`, never the raw exception message or exit reason).
+        Emitted from `guarded_measurement/5` — the ONE guard every periodic
+        measurement runs under — on the `rescue` AND the `catch :exit`/`:throw` path
+        alike, so a frozen gauge (metrics 18/19/23 retaining their last value, or the
+        tenant-label gate holding/forcing OFF, because a cycle failed) is
+        distinguishable in Prometheus from a genuinely stable reading — a
+        non-zero, incrementing rate on this counter means the corresponding gauge is
         stale, not that the system is actually quiet.
   """
 
@@ -356,11 +362,16 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   require Logger
 
+  alias Loopctl.ExitTag
   alias Loopctl.LocalGuc
   alias Loopctl.Repo
   alias Loopctl.Tenants
 
   @persistent_term_key {__MODULE__, :tenant_label?}
+
+  # Process-dictionary key for the tenant-label gate's consecutive-failure streak — see
+  # `resolve_gate/1`.
+  @gate_failure_key {__MODULE__, :tenant_label_gate_failed?}
 
   # US-34.2 (review finding): the `:persistent_term` slot `poll_oban_executing_orphans/0`
   # writes on every SUCCESSFUL poll, and `cached_executing_orphan_count/0` reads —
@@ -399,7 +410,7 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   @oban_terminal_states [:completed, :discarded, :cancelled]
 
   @doc """
-  All 23 scale metrics: the original US-27.15 trio, #297's semantic-fallback
+  The scale metrics: the original US-27.15 trio, #297's semantic-fallback
   counter, US-31.2's hybrid-provenance counter, US-33.1's two per-pool checkout
   `queue_time` distributions, US-34.4's ten emitted-but-dead-event counters
   (LLM/embedding-blocked, index-health, secrets/witness/memory-promotion
@@ -447,6 +458,22 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         tag_values: &scale_tags/1
       ),
 
+      # 3b. Under-fill PROBE degradation counter (#550 review). The probe's fail-soft exit
+      #     turns a would-be 503 into a valid 200 whose truncation signal is simply ABSENT,
+      #     so metric 3 above just stops firing — a log line alone is invisible to a
+      #     dashboard (`TelemetryEvents.vector_search_under_fill_probe_degraded/0` says as
+      #     much), and without this definition the emitted event terminated in a
+      #     handler-less no-op. `error_class` is the same bounded set as the fail-open
+      #     counter below; `tenant_id` is cap-gated to the sentinel.
+      counter("loopctl.knowledge.vector_search.under_fill_probe_degraded.count",
+        event_name: [:loopctl, :knowledge, :vector_search, :under_fill_probe_degraded],
+        measurement: :count,
+        description:
+          "Vector-search under-fill PROBE degraded (no truncation signal), by error_class and tenant.",
+        tags: [:error_class, :tenant_id],
+        tag_values: &degraded_read_tags/1
+      ),
+
       # 4. Semantic-fallback counter (#297), by REASON only. Turns the silent
       #    semantic→keyword degradation into an alertable trend. `reason` is a
       #    BOUNDED, sanitized tag set (no api key / provider body / raw query ever
@@ -481,8 +508,9 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       # it could not measure the tenant's in-flight :ingestion backlog (count timed out /
       # lost its connection) and ADMITTED the request rather than shedding it. Makes "the
       # ingestion backpressure valve is currently admitting because it can't measure" an
-      # alertable signal instead of a silent warning log. `error_class` is a bounded
-      # 2-value tag; `tenant_id` is cap-gated to a sentinel (same convention as the other
+      # alertable signal instead of a silent warning log. `error_class` is a bounded tag —
+      # `TelemetryEvents.ingestion_backlog_gate_failed_open/0` is the source of truth for
+      # its value set; `tenant_id` is cap-gated to a sentinel (same convention as the other
       # scale counters).
       counter("loopctl.ingestion.backlog_gate.failed_open.count",
         event_name: [:loopctl, :ingestion, :backlog_gate, :failed_open],
@@ -490,7 +518,7 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         description:
           "Ingestion backlog admission gate failed open (unmeasurable backlog count), by error_class and tenant.",
         tags: [:error_class, :tenant_id],
-        tag_values: &ingestion_backlog_failed_open_tags/1
+        tag_values: &degraded_read_tags/1
       ),
 
       # 6. Per-pool checkout queue_time (US-33.1): the RLS `Loopctl.Repo` pool (size
@@ -676,15 +704,18 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         tags: []
       ),
 
-      # 20. Oban poll-failure counter (US-34.1, review finding). Emitted from BOTH
-      #     pollers' catch-all rescue clause so a stale (frozen) gauge above is
-      #     distinguishable in Prometheus from a genuinely stable reading. `poller`
-      #     identifies which poll failed; `error_class` is CLASSIFIED (never the raw
-      #     exception message/struct) into a small bounded set.
+      # 20. Periodic-measurement poll-failure counter (US-34.1, review finding). Emitted
+      #     from `guarded_measurement/5` — the single guard EVERY periodic measurement
+      #     runs under — so a stale (frozen) gauge above is distinguishable in Prometheus
+      #     from a genuinely stable reading. `poller` identifies which measurement failed
+      #     (bounded, one per entry in `periodic_measurements/0`); `error_class` is
+      #     CLASSIFIED (never the raw exception message or exit reason) into a small
+      #     bounded set. The `oban.` in the name predates the non-Oban measurements
+      #     adopting the counter; it is kept so existing dashboards keep working.
       counter("loopctl.oban.poll.error.count",
         event_name: [:loopctl, :oban, :poll, :error],
         measurement: :count,
-        description: "Oban metrics poll failures, by poller and classified error class.",
+        description: "Periodic-measurement poll failures, by poller and classified error class.",
         tags: [:poller, :error_class],
         tag_values: &oban_poll_error_tags/1
       ),
@@ -819,13 +850,20 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   end
 
   @doc """
-  `tag_values` for the ingestion backlog gate fail-open counter (US-36.3 review).
-  `error_class` is a small fixed-cardinality tag (`"timeout"` | `"connection"`, default
-  `"unknown"`); `tenant_id` reuses the same cap-gated sentinel collapse as the other
-  scale counters to keep cardinality bounded.
+  `tag_values` for the two DEGRADED-READ counters — the ingestion backlog gate fail-open
+  (US-36.3 review) and the under-fill probe degradation — which share the same
+  `(error_class, tenant_id)` shape.
+
+  `error_class` is a small fixed-cardinality tag, defaulting to `"unknown"`. Its value set
+  is NOT enumerated here — it is per-emitter, and enumerating it twice is how this doc came
+  to claim a "2-value" tag long after a fourth value shipped: see
+  `Loopctl.TelemetryEvents.ingestion_backlog_gate_failed_open/0` and
+  `vector_search_under_fill_probe_degraded/0`, which document their own bounded sets.
+  `tenant_id` reuses the same cap-gated sentinel collapse as the other scale counters to
+  keep cardinality bounded.
   """
-  @spec ingestion_backlog_failed_open_tags(map()) :: map()
-  def ingestion_backlog_failed_open_tags(metadata) do
+  @spec degraded_read_tags(map()) :: map()
+  def degraded_read_tags(metadata) do
     %{
       error_class: Map.get(metadata, :error_class, "unknown"),
       tenant_id: gated_tenant_id(metadata)
@@ -1095,6 +1133,16 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   """
   @spec poll_oban_queue_state() :: :ok
   def poll_oban_queue_state do
+    guarded_measurement(
+      :queue_state,
+      "Oban queue/state poll",
+      "the oban.jobs.count gauge simply keeps its last-recorded value until the next poll",
+      :ok,
+      &collect_oban_queue_state/0
+    )
+  end
+
+  defp collect_oban_queue_state do
     timeout_ms = oban_metrics_poll_statement_timeout_ms()
     active_states = Enum.map(oban_active_states(), &Atom.to_string/1)
 
@@ -1123,16 +1171,6 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
     end
 
     :ok
-  rescue
-    e ->
-      Logger.warning(
-        "Oban queue/state poll failed (#{inspect(e.__struct__)}); skipping this cycle — " <>
-          "the oban.jobs.count gauge simply keeps its last-recorded value until the next poll"
-      )
-
-      emit_oban_poll_error(:queue_state, e)
-
-      :ok
   end
 
   @doc """
@@ -1243,24 +1281,26 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   @spec poll_oban_executing_orphans() :: :ok
   def poll_oban_executing_orphans do
-    count = count_oban_executing_orphans()
+    guarded_measurement(
+      :executing_orphans,
+      "Oban executing-orphan poll",
+      "the executing_orphan gauge AND the health-check cache simply keep their last-recorded " <>
+        "value until the next successful poll",
+      :ok,
+      fn ->
+        count = count_oban_executing_orphans()
 
-    :persistent_term.put(@executing_orphan_cache_key, count)
+        :persistent_term.put(@executing_orphan_cache_key, count)
 
-    :telemetry.execute([:loopctl, :oban, :jobs, :executing_orphan, :count], %{count: count}, %{})
+        :telemetry.execute(
+          [:loopctl, :oban, :jobs, :executing_orphan, :count],
+          %{count: count},
+          %{}
+        )
 
-    :ok
-  rescue
-    e ->
-      Logger.warning(
-        "Oban executing-orphan poll failed (#{inspect(e.__struct__)}); skipping this cycle — " <>
-          "the executing_orphan gauge AND the health-check cache simply keep their last-recorded " <>
-          "value until the next successful poll"
-      )
-
-      emit_oban_poll_error(:executing_orphans, e)
-
-      :ok
+        :ok
+      end
+    )
   end
 
   @doc """
@@ -1269,36 +1309,80 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   connected BEAM peer COUNT with the bounded readiness `status` as the sole tag —
   NEVER a node name or the DNS query string. Wired into
   `LoopctlWeb.Telemetry.periodic_measurements/0` (the same 10s poller as the Oban
-  gauges). Self-rescuing (catch-all, per the periodic-measurements invariant): a
-  raise here must never let `telemetry_poller` permanently drop this MFA — the gauge
-  simply keeps its last value for one cycle. On a single node it reads
-  `{status="single_node", count=0}`.
+  gauges). Runs under `guarded_measurement/5` like every other periodic measurement,
+  so neither a raise nor an exit/throw can let `telemetry_poller` permanently drop
+  this MFA, and a failed cycle increments the poll-failure counter (metric 20,
+  `poller="cluster_readiness"`) instead of freezing this gauge silently.
+  `ClusterReadiness.readiness/0` makes no inter-process call today (env reads,
+  `Node.list/0`, pure classification), so only its RAISE path is reachable — the
+  exit/throw half is the uniform guard, not a claim that a readiness process exists
+  to die. On a single node it reads `{status="single_node", count=0}`.
   """
   @spec poll_cluster_readiness() :: :ok
   def poll_cluster_readiness do
-    readiness = Loopctl.ClusterReadiness.readiness()
+    guarded_measurement(
+      :cluster_readiness,
+      "Clustering-readiness poll",
+      "the cluster.peers gauge keeps its last-recorded value until the next successful poll",
+      :ok,
+      fn ->
+        readiness = Loopctl.ClusterReadiness.readiness()
 
-    :telemetry.execute([:loopctl, :cluster, :peers], %{count: readiness.peers}, %{
-      status: readiness.status
-    })
+        :telemetry.execute([:loopctl, :cluster, :peers], %{count: readiness.peers}, %{
+          status: readiness.status
+        })
 
-    :ok
-  rescue
-    e ->
-      Logger.warning(
-        "Clustering-readiness poll failed (#{inspect(e.__struct__)}); skipping this cycle — " <>
-          "the cluster.peers gauge keeps its last-recorded value until the next successful poll"
-      )
-
-      :ok
+        :ok
+      end
+    )
   end
 
-  # Emits the poll-failure counter (metric 20) from a poller's catch-all rescue.
-  # The RAW exception struct is passed through in metadata (like
-  # `secrets_orphan_cleanup_tags/1`'s raw `{:error, term()}`) — classification into
-  # the bounded `error_class` tag happens at `tag_values` time (`oban_poll_error_tags/1`),
-  # not here, so any other handler attached to this event still sees the real error.
-  defp emit_oban_poll_error(poller, exception) do
+  @doc false
+  # Runs a periodic measurement's body under the guard `telemetry_poller` requires, and
+  # returns `fallback` if it fails.
+  #
+  # ONE implementation for all four measurements (`LoopctlWeb.Telemetry.periodic_measurements/0`):
+  # telemetry_poller PERMANENTLY drops a measurement MFA that escapes, so an unguarded gauge
+  # goes dark for the life of the node — and it drops it on ALL THREE non-local exit kinds,
+  # which is why this catches `:exit` and `:throw` alongside the catch-all `rescue` (a pool
+  # checkout against a saturated/wedged pool EXITS rather than raising; four hand-written
+  # copies of that guard had already diverged). Every failure also emits the poll-failure
+  # counter (metric 20), so a frozen gauge stays distinguishable from a genuinely stable one.
+  #
+  # Public-but-`@doc false`: not API, but the seam that lets the guard be tested ONCE,
+  # directly, with a body that exits/throws — no poller can be made to exit on demand through
+  # Ecto (which raises on every lookup/ownership failure), which is how four copies of this
+  # shipped unexercised.
+  @spec guarded_measurement(atom(), String.t(), String.t(), term(), (-> term())) :: term()
+  def guarded_measurement(poller, subject, consequence, fallback, fun) do
+    fun.()
+  rescue
+    e ->
+      Logger.warning("#{subject} failed (#{inspect(e.__struct__)}); #{consequence}")
+
+      emit_poll_error(poller, e)
+
+      fallback
+  catch
+    kind, reason when kind in [:exit, :throw] ->
+      tag = ExitTag.tag(reason)
+
+      Logger.warning("#{subject} aborted (#{kind}: #{tag}); #{consequence}")
+
+      emit_poll_error(poller, {kind, tag})
+
+      fallback
+  end
+
+  # Emits the poll-failure counter (metric 20) from `guarded_measurement/5`.
+  # `metadata.exception` is a UNION: the RAW exception struct on the rescue path (like
+  # `secrets_orphan_cleanup_tags/1`'s raw `{:error, term()}`, so another attached handler
+  # still sees the real error), or `{:exit | :throw, bounded_tag}` on the catch path — an
+  # exit is not an exception, and its raw reason carries the whole DBConnection call tuple,
+  # module and args, so only `ExitTag.tag/1`'s bounded class travels. A consumer must NOT
+  # assume a struct. Classification into the bounded `error_class` tag happens at
+  # `tag_values` time (`oban_poll_error_tags/1`), never here.
+  defp emit_poll_error(poller, exception) do
     :telemetry.execute([:loopctl, :oban, :poll, :error], %{count: 1}, %{
       poller: poller,
       exception: exception
@@ -1306,9 +1390,11 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   end
 
   @doc """
-  `tag_values` for the Oban poll-failure counter (US-34.1, metric 20). `poller`
-  passes through as a bounded atom (`:queue_state`/`:executing_orphans`);
-  `error_class` CLASSIFIES the raw `metadata.exception` into a small bounded set
+  `tag_values` for the periodic-measurement poll-failure counter (US-34.1, metric 20).
+  `poller` passes through as a bounded atom (one per measurement in
+  `LoopctlWeb.Telemetry.periodic_measurements/0`: `:queue_state`/`:executing_orphans`/
+  `:cluster_readiness`/`:tenant_label_gate`);
+  `error_class` CLASSIFIES `metadata.exception` into a small bounded set
   (never the raw exception message/struct) — the same "mapped_code"/
   `secrets_reason_class/1` classification precedent used elsewhere in this
   module. Defaults missing keys to `"unknown"` so this can never raise.
@@ -1322,10 +1408,31 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   end
 
   defp oban_poll_error_class(%Postgrex.Error{}), do: "db_error"
-  defp oban_poll_error_class(%DBConnection.ConnectionError{}), do: "db_error"
+
+  # A LocalGuc capture abort must be classified BEFORE the generic ConnectionError clause
+  # below: it is raised as a `DBConnection.ConnectionError` (deliberately — see
+  # `LocalGuc.capture_fallback!/2`), so without this branch it lands as `"db_error"` and
+  # reads as a pool fault. It is not one: it is this poller declining to override a GUC an
+  # enclosing scope owns, which is a correctness-preserving refusal with a completely
+  # different remedy. Reachability, precisely: `capture_fallback!/2` aborts only when an
+  # ENCLOSING scope in the SAME process already owns the name, and each poller opens the
+  # OUTERMOST `LocalGuc.timed_transaction/3` on the shared poller process — so no poller can
+  # abort today. The branch exists for uniform classification with the three sites that DO
+  # discriminate it, and to keep a future nested caller out of the `"db_error"` bucket, not
+  # because these two pollers can reach it. Matches those three sites —
+  # `Loopctl.Knowledge`, `LoopctlWeb.KnowledgeIngestionController` and
+  # `Loopctl.Workers.ArticleLinkingWorker` — on the same `"guc_capture_abort"` tag.
+  defp oban_poll_error_class(%DBConnection.ConnectionError{} = e) do
+    if LocalGuc.capture_abort?(e), do: "guc_capture_abort", else: "db_error"
+  end
+
   defp oban_poll_error_class(%DBConnection.OwnershipError{}), do: "db_error"
   defp oban_poll_error_class(%ArgumentError{}), do: "config_error"
   defp oban_poll_error_class(%FunctionClauseError{}), do: "config_error"
+  # An EXIT/THROW is not an exception, so it can never be a struct above:
+  # `guarded_measurement/5` hands it over wrapped as `{kind, bounded_tag}`. Its own class
+  # because a pool checkout that exits has a different remedy from one that raises.
+  defp oban_poll_error_class({kind, _reason}) when kind in [:exit, :throw], do: to_string(kind)
   defp oban_poll_error_class(nil), do: "unknown"
   defp oban_poll_error_class(_other), do: "other"
 
@@ -1414,9 +1521,11 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   This is the `telemetry_poller` periodic measurement (wired in
   `LoopctlWeb.Telemetry`). It performs the ONLY DB read in the gating mechanism — one
   cheap `Tenants.count()` per poll interval — so the per-emit `tag_values` path never
-  touches the DB. A DB fault during the count is fail-soft: the gate is forced OFF
-  (aggregate to the sentinel) rather than crashing the poller, keeping cardinality
-  bounded. Returns the boolean it stored.
+  touches the DB. A failed count is fail-soft: the gate holds its current value for ONE
+  cycle and is forced OFF (aggregate to the sentinel) from the second CONSECUTIVE failure
+  on, rather than crashing the poller — bounded cardinality without flapping the gate
+  (and the label) every 10s through an intermittent pool incident. Returns the boolean it
+  stored.
 
   Note: this returns the gate boolean rather than calling `:telemetry.execute/3`
   itself — the poller only needs the side effect of refreshing the cached gate, and
@@ -1424,25 +1533,23 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   """
   @spec refresh_tenant_label_gate() :: boolean()
   def refresh_tenant_label_gate do
+    # Fail-soft for EVERY failure shape — this is a `telemetry_poller` measurement, and
+    # telemetry_poller PERMANENTLY drops an MFA that escapes. A narrow rescue (DB exceptions
+    # only, everything else re-raised) did not surface a programmer error here: it froze the
+    # gate at whatever boolean `:persistent_term` last held, with nothing left to re-evaluate
+    # it. If that value was `true`, `tenant_id` stays a live label after the fleet crosses the
+    # cap — the unbounded cardinality AC-27.15.3 forbids. Visibility comes from the :warning
+    # log and metric 20, not from crashing the poller.
     allowed? =
-      try do
-        Tenants.count() <= tenant_label_cap()
-      rescue
-        # Fail-soft to a BOUNDED gate (force OFF → aggregate to the sentinel) ONLY for DB
-        # faults — a transient connection / ownership / Postgres error must not crash the
-        # shared poller. But the rescue is NARROW (security AREA-6): a persistently-failing
-        # gate (schema drift / misconfig that always raises) would otherwise stay silently
-        # stuck OFF, so we LOG it at :warning to make it visible. A genuine programmer
-        # error (anything outside the DB-exception set) is re-raised so it still surfaces
-        # rather than being masked as "gate off".
-        e in [Postgrex.Error, DBConnection.ConnectionError, DBConnection.OwnershipError] ->
-          Logger.warning(
-            "tenant-label gate refresh failed (#{inspect(e.__struct__)}); forcing gate OFF " <>
-              "(tenant_id label aggregates to the sentinel until the count succeeds)"
-          )
-
-          false
-      end
+      :tenant_label_gate
+      |> guarded_measurement(
+        "tenant-label gate refresh",
+        "holding the gate for one cycle, then forcing it OFF (tenant_id label aggregates to " <>
+          "the sentinel until the count succeeds)",
+        :failed,
+        fn -> Tenants.count() <= tenant_label_cap() end
+      )
+      |> resolve_gate()
 
     # Put ONLY on an actual transition (team review F3). `:persistent_term.put/2` triggers
     # a global term-table scan, so writing the unchanged steady-state value every 10s is
@@ -1452,6 +1559,24 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       :persistent_term.put(@persistent_term_key, allowed?)
     end
 
+    allowed?
+  end
+
+  # One GRACE cycle before a failed count flips the gate (review finding): an intermittently
+  # wedged pool otherwise alternates OFF/ON every 10s, and each flip pays the global
+  # `:persistent_term.put/2` term-table scan the transition check above exists to avoid —
+  # during the incident when the node can least afford it, while every per-tenant series
+  # alternates between the real `tenant_id` and the sentinel and gaps the dashboards. TWO
+  # CONSECUTIVE failures still force the gate OFF, so a persistently-failing count can never
+  # leave an unbounded label live (AC-27.15.3). The streak lives in the poller PROCESS's
+  # dictionary — this measurement always runs in the single `telemetry_poller` process, so it
+  # costs no global write and needs no extra term.
+  defp resolve_gate(:failed) do
+    if Process.put(@gate_failure_key, true), do: false, else: tenant_label?()
+  end
+
+  defp resolve_gate(allowed?) do
+    Process.delete(@gate_failure_key)
     allowed?
   end
 

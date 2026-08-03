@@ -77,6 +77,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Embeddings
+  alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleEmbedding
@@ -327,6 +328,38 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
       Logger.warning(
         "Article linking: corpus-size count failed (#{tag}: #{inspect(e.__struct__)}) for " <>
+          "article #{article.id}; skipping the observational corpus_size signal — " <>
+          "linking proceeds"
+      )
+
+      :ok
+  catch
+    # `rescue` alone left the non-exception half open. A pool checkout against a wedged,
+    # saturated or unstarted `AdminRepo` EXITS (`{:timeout, {DBConnection, ...}}`, `:noproc`)
+    # rather than raising, so it walked straight past the clause above and aborted `perform/1`
+    # over a purely observational count. Scope of the guarantee, exactly: a failure CONFINED
+    # TO THE COUNT — of any of the three kinds — no longer aborts linking. A pool fault that
+    # OUTLIVES the count still aborts the job at the next unguarded `AdminRepo` call
+    # (`get_existing_link_pairs/3`, the batched insert); that one is a genuine linking failure
+    # and belongs to Oban's retries, not to this block.
+    #
+    # `:throw` is caught alongside `:exit` because "every way this call can fail" has three
+    # kinds, not two — the same pairing the fail-soft rate-limiter taggers use. Tagged, not
+    # swallowed untagged, so the degraded signal stays greppable, via the ONE shared
+    # `Loopctl.ExitTag` (four private copies of that clause list had already diverged on the
+    # crash-propagation shape).
+    :exit, reason ->
+      Logger.warning(
+        "Article linking: corpus-size count exited (#{ExitTag.tag(reason)}) for " <>
+          "article #{article.id}; skipping the observational corpus_size signal — " <>
+          "linking proceeds"
+      )
+
+      :ok
+
+    :throw, value ->
+      Logger.warning(
+        "Article linking: corpus-size count threw (#{ExitTag.tag(value)}) for " <>
           "article #{article.id}; skipping the observational corpus_size signal — " <>
           "linking proceeds"
       )

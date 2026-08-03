@@ -2,6 +2,8 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
   use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
 
+  import ExUnit.CaptureLog
+
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
@@ -534,6 +536,109 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       assert measurements.limit == 50
       assert metadata.tenant_id == tenant.id
       assert metadata.article_id == source.id
+    end
+  end
+
+  describe "corpus-size count degradation (AC-36.4.3)" do
+    test "an EXIT from the observational count degrades softly and still links" do
+      # The count's rescue clause was `rescue`-only, so it caught the raise shape
+      # (`Postgrex.Error` 57014) and missed the other one. A pool checkout against a wedged,
+      # saturated or unstarted `AdminRepo` EXITS rather than raising — `{:noproc, {DBConnection,
+      # ...}}` — which walked straight past it and aborted `perform/1`. Because sampling is
+      # deterministic by `article_id`, all three Oban attempts re-sampled and re-exited, so the
+      # article was left permanently unlinked: the exact regression the rescue exists to
+      # prevent, reached by the other of the two ways this call can fail.
+      #
+      # `corpus_count_query/2` consults the injected read path and is the ONLY caller of it in
+      # this module, so stubbing that to exit puts a production-shaped exit precisely inside
+      # the observational block and nowhere else.
+      %{tenant: tenant} = setup_tenant()
+      source = create_article_in_bucket(tenant.id, true)
+      target = create_published_article(tenant.id)
+
+      ref = attach_corpus_telemetry(source.id)
+
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn ->
+        exit({:noproc, {DBConnection, :execute, []}})
+      end)
+
+      stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(target, 0.88)]
+      end)
+
+      log =
+        capture_log(fn ->
+          assert :ok =
+                   ArticleLinkingWorker.perform(%Oban.Job{
+                     args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+                   })
+        end)
+
+      # The observational signal is the ONLY casualty...
+      refute_received {^ref, :corpus_size, _measurements, _metadata}
+      assert log =~ "corpus-size count exited"
+
+      # ...tagged, not swallowed anonymously: a bounded class, never the raw exit reason
+      # (which carries the whole DBConnection call tuple).
+      assert log =~ "(noproc)"
+      refute log =~ "DBConnection"
+
+      # ...and the linking it merely observes still happened. That is the whole point.
+      assert [_] = links_of_type(tenant.id, source.id, target.id, :relates_to)
+    end
+
+    test "a propagated CRASH exit is tagged by exception module, not degraded to \"unknown\"" do
+      # A pool process that dies of an exception (rather than being absent) propagates
+      # `{{exception, stacktrace}, call}`. An atom-only tagger degrades that — at least as
+      # common as `:noproc` — to the catch-all, costing the operator the usable class.
+      %{tenant: tenant} = setup_tenant()
+      source = create_article_in_bucket(tenant.id, true)
+      target = create_published_article(tenant.id)
+
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn ->
+        exit({{%RuntimeError{message: "pool died"}, []}, {GenServer, :call, [self(), :req]}})
+      end)
+
+      stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(target, 0.88)]
+      end)
+
+      log =
+        capture_log(fn ->
+          assert :ok =
+                   ArticleLinkingWorker.perform(%Oban.Job{
+                     args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+                   })
+        end)
+
+      assert log =~ "corpus-size count exited (RuntimeError)"
+      refute log =~ "pool died"
+      assert [_] = links_of_type(tenant.id, source.id, target.id, :relates_to)
+    end
+
+    test "a THROW from the observational count degrades softly and still links" do
+      # The third non-local exit kind. `rescue` + `catch :exit` alone still let it abort
+      # `perform/1` over a signal the job does not depend on.
+      %{tenant: tenant} = setup_tenant()
+      source = create_article_in_bucket(tenant.id, true)
+      target = create_published_article(tenant.id)
+
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> throw(:boom) end)
+
+      stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(target, 0.88)]
+      end)
+
+      log =
+        capture_log(fn ->
+          assert :ok =
+                   ArticleLinkingWorker.perform(%Oban.Job{
+                     args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+                   })
+        end)
+
+      assert log =~ "corpus-size count threw (boom)"
+      assert [_] = links_of_type(tenant.id, source.id, target.id, :relates_to)
     end
   end
 
