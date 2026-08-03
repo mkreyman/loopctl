@@ -21,9 +21,11 @@ defmodule LoopctlWeb.KnowledgeProgressiveJSON do
       meta: %{
         top_k: meta.top_k,
         returned: meta.returned,
+        truncated: meta.truncated,
         char_budget: meta.char_budget,
         chars: meta.chars,
         heat_window: meta.heat_window,
+        counted_access_types: meta.counted_access_types,
         drill: meta.drill
       }
     }

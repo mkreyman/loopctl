@@ -112,16 +112,20 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
   operation(:heat_index,
     summary: "Heat-ranked topic index (no query)",
     description:
-      "A bounded, top-K-capped stub list of the corpus ordered by HEAT — the cumulative " <>
-        "number of times each article has actually been read. Takes NO query, which is the " <>
+      "A bounded, top-K-capped stub list of the corpus (tenant articles plus published " <>
+        "system canonicals) ordered by HEAT — the number of times each article's BODY was " <>
+        "read. Only the read access types are counted (`meta.counted_access_types`, i.e. " <>
+        "get/context); a search result is an impression, not a read, so it does not add " <>
+        "heat. Takes NO query, which is the " <>
         "point: every other retrieval route starts from one, so they all miss the same way " <>
         "on a paraphrase or on material that is topically central but lexically dissimilar. " <>
         "This route's failures are uncorrelated with embedding similarity.\n\n" <>
         "Stubs only (id/title/category/heat/one-line summary) — never a body — so it is cheap " <>
         "enough to keep in a cached prefix rather than fetch per turn. The response states " <>
-        "which tool to call with which parameter to read a listed article. Visibility-scoped: " <>
-        "an agent key never sees another agent's private/owner memory, not even as a stub. " <>
-        "Role: agent+.",
+        "which tool to call with which parameter to read a listed article, and states " <>
+        "`meta.truncated` when more articles were hot than the cap returned. " <>
+        "Visibility-scoped: an agent key never sees another agent's private/owner memory, " <>
+        "not even as a stub. Role: agent+.",
     parameters: [
       limit: [
         in: :query,
@@ -137,9 +141,10 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
         in: :query,
         type: :string,
         description:
-          "ISO-8601 timestamp. Count only accesses at/after it. Omitted means ALL-TIME, " <>
-            "which is the definition of heat — a window would make a long-valuable article " <>
-            "indistinguishable from a never-read one during a quiet period."
+          "ISO-8601 timestamp. Count only accesses at/after it. Omitted means the last 90 " <>
+            "days, which bounds the request-path aggregate over an ever-growing read " <>
+            "history; pass an older timestamp to widen the window deliberately. The " <>
+            "effective window is echoed as `meta.heat_window`."
       ]
     ],
     responses: %{
@@ -183,9 +188,17 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
   defp validate_since(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
       {:ok, dt, _offset} -> {:ok, dt}
-      _ -> {:error, :bad_request, "Query parameter 'since' must be an ISO-8601 timestamp"}
+      _ -> invalid_since()
     end
   end
+
+  # `?since[]=x` makes Plug parse the param as a list — without this clause that is a
+  # FunctionClauseError -> 500, the same transport-boundary failure `coerce_topic/1` and
+  # `validate_category/1` already guard.
+  defp validate_since(_), do: invalid_since()
+
+  defp invalid_since,
+    do: {:error, :bad_request, "Query parameter 'since' must be an ISO-8601 timestamp"}
 
   operation(:drill,
     summary: "Progressive-disclosure drill",

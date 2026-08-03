@@ -31,11 +31,11 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
     |> AdminRepo.update!()
   end
 
-  # `heat` is a COUNT of access events, so heat is produced by inserting N of them.
-  defp heat(tenant_id, article, n) do
-    for _ <- 1..n do
-      fixture(:article_access_event, %{tenant_id: tenant_id, article_id: article.id})
-    end
+  # `heat` is a COUNT of read access events, so heat is produced by inserting N of them.
+  # `attrs` overrides the event shape (its `access_type`, its `accessed_at`).
+  defp heat(tenant_id, article, n, attrs \\ %{}) do
+    base = %{tenant_id: tenant_id, article_id: article.id}
+    for _ <- 1..n, do: fixture(:article_access_event, Map.merge(base, attrs))
 
     article
   end
@@ -73,30 +73,53 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert Enum.map(results, & &1.title) == ["Read"]
     end
 
-    test ":since narrows the window; the default is all-time" do
+    test ":since moves the window; the default one is bounded, not all-time" do
       tenant = fixture(:tenant)
       article = published_article(tenant.id, %{title: "Old favourite"})
 
-      old = DateTime.add(DateTime.utc_now(), -30, :day)
+      ancient = DateTime.add(DateTime.utc_now(), -400, :day)
+      heat(tenant.id, article, 5, %{accessed_at: ancient})
 
-      for _ <- 1..5 do
-        fixture(:article_access_event, %{
-          tenant_id: tenant.id,
-          article_id: article.id,
-          accessed_at: old
-        })
-      end
+      # The default window bounds the request-path aggregate, so reads older than it are not
+      # counted — the endpoint degrades to a shorter list rather than to a statement timeout.
+      assert {:ok, %{results: [], meta: %{heat_window: window}}} = Knowledge.heat_index(tenant.id)
+      assert {:ok, _, _} = DateTime.from_iso8601(window)
 
-      # All-time (the default) counts the old reads — this is what makes heat "cumulative"
-      # rather than "recently popular", and it is why a long-valuable article survives a
-      # quiet week.
-      assert {:ok, %{results: [%{heat: 5}], meta: %{heat_window: "all_time"}}} =
-               Knowledge.heat_index(tenant.id)
+      # An explicit older `:since` widens it back deliberately.
+      wide = DateTime.add(DateTime.utc_now(), -500, :day)
+      assert {:ok, %{results: [%{heat: 5}]}} = Knowledge.heat_index(tenant.id, since: wide)
+    end
 
-      # A window excludes them.
-      since = DateTime.add(DateTime.utc_now(), -1, :day)
-      assert {:ok, %{results: [], meta: meta}} = Knowledge.heat_index(tenant.id, since: since)
-      assert meta.heat_window != "all_time"
+    test "a search impression is not a read, so it adds no heat" do
+      # Counting `search` rows (one per RESULT of one query) would make the ordering a running
+      # tally of past ranker output — the correlation with embedding similarity this route
+      # exists to be free of.
+      tenant = fixture(:tenant)
+      impressions = published_article(tenant.id, %{title: "Only ever matched"})
+      read = published_article(tenant.id, %{title: "Actually read"})
+
+      heat(tenant.id, impressions, 20, %{access_type: "search"})
+      heat(tenant.id, read, 1)
+
+      assert {:ok, %{results: results}} = Knowledge.heat_index(tenant.id)
+      assert Enum.map(results, & &1.title) == ["Actually read"]
+    end
+
+    test "a published system canonical is indexed, not silently dropped" do
+      tenant = fixture(:tenant)
+
+      canonical =
+        published_article(tenant.id, %{title: "Canon"})
+        |> Ecto.Changeset.change(%{scope: :system, tenant_id: nil})
+        |> AdminRepo.update!()
+
+      own = published_article(tenant.id, %{title: "Own"})
+
+      heat(tenant.id, canonical, 5)
+      heat(tenant.id, own, 1)
+
+      assert {:ok, %{results: results}} = Knowledge.heat_index(tenant.id)
+      assert Enum.map(results, & &1.title) == ["Canon", "Own"]
     end
   end
 
@@ -208,6 +231,34 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert meta.drill.note =~ "usage"
       assert is_integer(meta.char_budget)
       assert is_integer(meta.chars)
+      assert meta.counted_access_types == ["get", "context"]
+    end
+
+    test "char_budget tracks the effective top_k and actually bounds the payload" do
+      tenant = fixture(:tenant)
+
+      # A title at the schema's 500-char ceiling: the budget is only a budget if the widest
+      # legal stub still fits under it.
+      article = published_article(tenant.id, %{title: String.duplicate("t", 500)})
+      heat(tenant.id, article, 1)
+
+      assert {:ok, %{results: [stub], meta: meta}} = Knowledge.heat_index(tenant.id, limit: 5)
+
+      assert String.length(stub.title) <= 100
+      assert meta.chars <= meta.char_budget
+      # Derived from the ASKED-FOR cap, not the ceiling — limit: 5 must not advertise 100.
+      assert {:ok, %{meta: %{char_budget: wider}}} = Knowledge.heat_index(tenant.id, limit: 50)
+      assert wider == meta.char_budget * 10
+    end
+
+    test "truncated says the list is partial, since nothing else in the payload would" do
+      tenant = fixture(:tenant)
+
+      for i <- 1..3,
+          do: tenant.id |> published_article(%{title: "A#{i}"}) |> then(&heat(tenant.id, &1, i))
+
+      assert {:ok, %{meta: %{truncated: true}}} = Knowledge.heat_index(tenant.id, limit: 2)
+      assert {:ok, %{meta: %{truncated: false}}} = Knowledge.heat_index(tenant.id, limit: 3)
     end
 
     test "a summary is one line and bounded, whatever the body looks like" do
@@ -300,16 +351,27 @@ defmodule Loopctl.Knowledge.HeatIndexEndpointTest do
     assert Enum.map(body["data"], & &1["heat"]) == [7, 1]
     # Self-describing: the payload says how to act on an id.
     assert body["meta"]["drill"]["tool"] == "knowledge_get"
-    assert body["meta"]["heat_window"] == "all_time"
+    assert {:ok, _, _} = DateTime.from_iso8601(body["meta"]["heat_window"])
+    assert body["meta"]["counted_access_types"] == ["get", "context"]
   end
 
-  test "a malformed `since` is a 400, not a silent widening to all-time", %{conn: conn} do
+  test "a malformed `since` is a 400, not a silent widening of the window", %{conn: conn} do
     tenant = fixture(:tenant)
     {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
     conn
     |> put_req_header("authorization", "Bearer #{raw_key}")
     |> get(~p"/api/v1/knowledge/heat_index?since=not-a-date")
+    |> json_response(400)
+  end
+
+  test "a list-shaped `since` is a 400, not a FunctionClauseError 500", %{conn: conn} do
+    tenant = fixture(:tenant)
+    {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+    conn
+    |> put_req_header("authorization", "Bearer #{raw_key}")
+    |> get("/api/v1/knowledge/heat_index?since[]=2026-01-01T00:00:00Z")
     |> json_response(400)
   end
 

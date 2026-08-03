@@ -159,9 +159,10 @@ defmodule Loopctl.HeavyRead.TenantGate do
   # `tenant_gate_test.exs`'s endpoint-weight guard — so a NEW heavy endpoint a caller
   # adds (registered in `known_endpoints/0`) cannot silently fall through
   # `weight_for/1` to light weight and under-charge a genuinely heavy read.
-  # `heat_index` (#554) is HEAVY, and the choice is asymmetric rather than close. It is a full
-  # aggregate (group-by + count) over `article_access_events` joined to `articles`, so its cost
-  # grows with the READ HISTORY, not the corpus — the one table that only ever gets longer.
+  # `heat_index` (#554) is HEAVY, and the choice is asymmetric rather than close. It is a
+  # group-by + count over `article_access_events`, so its cost grows with the READ HISTORY,
+  # not the corpus — the one table that only ever gets longer. A default window bounds the
+  # scan; it does not make the read cheap.
   #
   # The tie-break is what each error costs. Marked light and actually expensive, concurrent
   # calls starve genuine request-path reads. Marked heavy and actually cheap, it just sheds
