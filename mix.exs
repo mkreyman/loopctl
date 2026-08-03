@@ -176,6 +176,11 @@ defmodule Loopctl.MixProject do
   # usage-rules-start/end markers and rewrites that region wholesale. Never put
   # hand-written content inside it — in cron_books a hand-written migration-safety
   # section had been placed there and the first sync silently deleted it.
+  #
+  # This is an EXPLICIT package list, not `:all`, and the CI drift gate (#556) can only
+  # ever be as wide as it is: adding a dependency that ships usage-rules (igniter and
+  # mdex both do) changes nothing here and the gate stays green. Widen this list to widen
+  # the gate.
   defp usage_rules do
     [
       file: "AGENTS.md",

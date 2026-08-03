@@ -95,8 +95,7 @@ jobs:
       - name: Run Credo
         run: mix credo --strict
 
-
-      # #541 — nothing in CI compiled assets/js before this. A syntax or import
+      # #541— nothing in CI compiled assets/js before this. A syntax or import
       # error in a LiveView hook therefore surfaced only in the Docker build at
       # DEPLOY time (Dockerfile runs `mix assets.deploy`), long after review.
       # That gap stopped being tolerable once /enroll shipped a ceremony that is
@@ -259,10 +258,14 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
-      # #556: AGENTS.md's usage-rules block is GENERATED from the dependency set, so it
-      # goes stale the moment a dep is added, removed or upgraded — silently, because
-      # nothing regenerates or verifies it. Same failure shape as the undocumented-env-var
-      # problem already gated by `mix loopctl.check_env_docs`.
+      # #556: AGENTS.md's usage-rules block is GENERATED, and nothing regenerates or
+      # verifies it — same failure shape as the undocumented-env-var problem already gated
+      # by `mix loopctl.check_env_docs`. SCOPE, stated so nobody over-trusts this gate:
+      # mix.exs `usage_rules/0` names an EXPLICIT package list, not `:all`, so drift is
+      # caught for those packages (an upgrade that rewrites their rules text, a hand edit
+      # inside the markers, a change to the list itself). Adding an unrelated dependency
+      # produces no drift and stays green — even one shipping usage-rules, as igniter and
+      # mdex already do.
       #
       # It rides THIS job, whose subject is otherwise unrelated, for one reason:
       # `usage_rules` is `only: :dev` and the workflow-level default is `MIX_ENV: test`,
