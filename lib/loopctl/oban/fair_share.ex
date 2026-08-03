@@ -212,8 +212,10 @@ defmodule Loopctl.Oban.FairShare do
   The CAP is read here, OUTSIDE the fail-open rescue below, so a malformed
   `OBAN_TENANT_FAIRSHARE_<QUEUE>` fails LOUD (crashes the job → visible) exactly like
   the snooze knobs, rather than being swallowed into a silent fail-open that disables
-  fairness. Only the COUNT query FAILS OPEN (`false`) on error/timeout so the gate can
-  never wedge a queue. `ObanConfig.fair_share_config/0` also validates every cap at
+  fairness. Only the COUNT query FAILS OPEN (`false`), and only on the shapes a wedged
+  pool actually produces — a `Postgrex.Error`/`DBConnection.ConnectionError` raise, or a
+  non-local exit/throw — so the gate can never wedge a queue while a broken caller still
+  fails loud. `ObanConfig.fair_share_config/0` also validates every cap at
   BOOT, so at runtime this parse cannot fail anyway.
   """
   @spec over_fair_share?(binary(), atom(), pos_integer() | nil) :: boolean()
@@ -223,17 +225,23 @@ defmodule Loopctl.Oban.FairShare do
     over_cap?(tenant_id, queue, job_id, cap)
   end
 
-  # The count-bearing half of the decision. FAILS OPEN (`false`) on any count
-  # error/timeout — an unmeasurable count must NEVER block a job (SECURITY note: the
+  # The count-bearing half of the decision. FAILS OPEN (`false`) on a DB error/timeout or a
+  # non-local exit — an unmeasurable count must NEVER block a job (SECURITY note: the
   # gate must not be able to wedge a queue). A malformed CAP is deliberately NOT caught
   # here (it is read in `over_fair_share?/3`, above this rescue) so it fails loud.
   defp over_cap?(tenant_id, queue, job_id, cap) do
     counter().lower_ranked_executing_count(tenant_id, queue, job_id) >= cap
   rescue
-    e ->
+    e in [Postgrex.Error, DBConnection.ConnectionError] ->
       # The bounded CLASS, never `Exception.message/1`: a Postgrex/DBConnection message names
       # the backend host, database and role, and this line is reachable from any wedged-pool
       # moment on an ordinary job.
+      #
+      # The DB shapes ONLY. A catch-all `e ->` also swallowed a broken DI seam: in `:test` the
+      # count resolves to a Mox mock, and a call from a process holding no stub raises
+      # `Mox.UnexpectedCallError` — which degraded into a silent admit, so every fair-share
+      # assertion made from such a process passed for the wrong reason. A non-DB raise is not
+      # a count error, and the fail-open promise does not cover it: it fails loud.
       fair_share_degraded(tenant_id, queue, ExitTag.tag(e))
   catch
     # #558: the rescue above covers only the RAISE shape, so this gate — which DOCUMENTS

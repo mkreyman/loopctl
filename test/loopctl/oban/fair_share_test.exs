@@ -98,9 +98,8 @@ defmodule Loopctl.Oban.FairShareTest do
 
   describe "#558: the gate fails OPEN on a count that EXITS, not just one that raises" do
     setup do
-      import Mox
-      setup_test_tenant = fixture(:tenant)
-      %{tenant: setup_test_tenant}
+      # Mox comes from `Loopctl.DataCase`'s `using` block; the stubs live in the test bodies.
+      %{tenant: fixture(:tenant)}
     end
 
     test "a wedged-pool EXIT admits the job instead of killing it", %{tenant: tenant} do
@@ -158,6 +157,19 @@ defmodule Loopctl.Oban.FairShareTest do
       assert log =~ "DBConnection.ConnectionError"
       # The pre-existing rescue logged Exception.message/1, which names the backend host.
       refute log =~ "db.internal"
+    end
+
+    test "a NON-DB raise is not swallowed — the fail-open covers count faults only", %{
+      tenant: tenant
+    } do
+      # The catch-all `e ->` this narrowed also ate `Mox.UnexpectedCallError`, so a gate
+      # reached from a process holding no stub silently admitted every job and any assertion
+      # of `:ok` there passed for the wrong reason.
+      stub(Loopctl.MockFairShareCounter, :lower_ranked_executing_count, fn _t, _q, _j ->
+        raise ArgumentError, "broken seam"
+      end)
+
+      assert_raise ArgumentError, fn -> FairShare.gate(tenant.id, :knowledge, 1) end
     end
   end
 

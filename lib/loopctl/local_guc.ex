@@ -65,23 +65,17 @@ defmodule Loopctl.LocalGuc do
     try do
       fun.()
     after
-      # `restore/2` pops what `capture/2` pushed (the hand-paired form), so it runs FIRST.
+      # #558: `restore/2` ALREADY pops exactly `names` (`prior` is `names` on BOTH capture
+      # paths), so this is this scope's ONE and ONLY pop — pop exactly once.
+      #
+      # Not a reset to the `enclosing` snapshot: that snapshot predates `fun`, so restoring it
+      # DISCARDS ownership the body pushed through the hand-paired `capture/2` and has not yet
+      # popped. Not a second `-- names` either: `--` removes one occurrence per element, so
+      # with same-name nesting the extra subtraction steals the ENCLOSING scope's entry.
+      # Both mistakes end the same way — a later nested `scoped/3` reads a still-held name as
+      # unowned and, on a capture failure, takes the RESET branch for a GUC an outer scope is
+      # actively holding, the clobber `capture_fallback!/2` aborts to prevent.
       restore(repo, prior)
-
-      # #558: remove OUR names, rather than resetting to the `enclosing` snapshot.
-      #
-      # The snapshot was taken before `fun` ran, so restoring it DISCARDS any ownership the
-      # body pushed through the hand-paired `capture/2` and has not yet popped. Those names
-      # are still held on the connection, so erasing them tells a later nested `scoped/3`
-      # that nobody owns them — and on a capture failure that sends it down the RESET branch
-      # for a name an outer scope is actively holding, which is exactly the clobber
-      # `capture_fallback!/2` aborts to prevent.
-      #
-      # Subtracting our own names instead is correct in both directions: a body that pushed
-      # and popped symmetrically lands back on `enclosing`, and a body still holding a name
-      # keeps it. `--` removes one occurrence per element, which matches the push of
-      # `enclosing ++ names` even when an inner scope legitimately re-owns the same name.
-      put_active_names(active_names() -- names)
     end
   end
 

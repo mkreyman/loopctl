@@ -13,11 +13,14 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
-  alias Loopctl.ExitTag
+  alias Loopctl.ExitClass
   alias Loopctl.Knowledge
   alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
+
+  # `ExitClass`'s catch-all bucket: the exits it could NOT place on a pool shape.
+  @unclassified_exit "exit:other"
 
   plug LoopctlWeb.Plugs.RequireRole, role: :agent
 
@@ -134,8 +137,9 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
 
   # Run the (possibly slow) vector-similarity query, translating a raised DB
   # exception into an `{:error, %Postgrex.Error{}}` / `{:error,
-  # %DBConnection.ConnectionError{}}` tuple. Only DB exceptions are caught;
-  # anything else is re-raised (let-it-crash). The suggest_links query runs on the
+  # %DBConnection.ConnectionError{}}` tuple. Only DB exceptions and the pool EXIT
+  # shapes `Loopctl.ExitClass` recognises are caught; anything else — an unclassifiable
+  # exit, a throw, any other raise — propagates (let-it-crash). The suggest_links query runs on the
   # dedicated HeavyReadRepo pool (via Loopctl.HeavyRead) — rescuing here does NOT
   # change which tenant's data is touched.
   #
@@ -159,13 +163,22 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
     #
     # Classified as a `DBConnection.ConnectionError` deliberately rather than a new shape: a
     # pool exit IS a connection failure, and this maps it onto the SAME pinned 503 +
-    # Retry-After the caller already understands. The message is the BOUNDED `ExitTag` class,
-    # never the reason itself.
-    kind, reason when kind in [:exit, :throw] ->
-      {:error,
-       %DBConnection.ConnectionError{
-         message: "suggest_links unavailable (#{kind}:#{ExitTag.tag(reason)})"
-       }}
+    # Retry-After the caller already understands. The message is the BOUNDED `ExitClass`
+    # class, never the reason itself.
+    #
+    # ONLY the exits `ExitClass` recognises as pool shapes. A blanket `kind in [:exit,
+    # :throw]` told the client to retry a DETERMINISTIC fault (a throw, a non-DB `GenServer`
+    # timeout) as a transient database outage, and swallowed the crash report that would have
+    # named it. An unclassifiable exit is re-exited, and a throw is left alone, keeping the
+    # let-it-crash contract this guard narrows rather than replaces.
+    :exit, reason ->
+      case ExitClass.classify(:exit, reason) do
+        @unclassified_exit ->
+          exit(reason)
+
+        class ->
+          {:error, %DBConnection.ConnectionError{message: "suggest_links unavailable (#{class})"}}
+      end
   end
 
   defp knowledge do
