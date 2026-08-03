@@ -363,10 +363,16 @@ defmodule LoopctlWeb.FallbackController do
       error: %{
         status: 429,
         code: "ingestion_backlog_exceeded",
+        # #558: does NOT assert a measured backlog. This code now has TWO causes — the
+        # backlog is genuinely at/over threshold, OR the server could not measure it and
+        # the bounded fail-open allowance is spent. On the second, nothing was counted and
+        # the real backlog may be zero, so the old copy ("already has too many ... once the
+        # backlog drains") told the client a fact the server does not have, and pointed it
+        # at a remedy that may not apply.
         message:
-          "This tenant already has too many in-flight ingestion jobs queued. " <>
-            "No items from this batch were enqueued. Retry after #{retry_after} seconds " <>
-            "once the backlog drains.",
+          "Ingestion is shedding for this tenant: the in-flight backlog is at or over the " <>
+            "threshold, or it could not be measured. No items from this batch were " <>
+            "enqueued. Retry after #{retry_after} seconds.",
         retry_after_seconds: retry_after
       }
     })

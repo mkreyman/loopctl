@@ -65,11 +65,23 @@ defmodule Loopctl.LocalGuc do
     try do
       fun.()
     after
-      # `restore/2` pops what `capture/2` pushed (the hand-paired form), so it runs FIRST and
-      # the reset to `enclosing` is the final word — an inner pop must not erase an outer
-      # scope's ownership of the same name.
+      # `restore/2` pops what `capture/2` pushed (the hand-paired form), so it runs FIRST.
       restore(repo, prior)
-      put_active_names(enclosing)
+
+      # #558: remove OUR names, rather than resetting to the `enclosing` snapshot.
+      #
+      # The snapshot was taken before `fun` ran, so restoring it DISCARDS any ownership the
+      # body pushed through the hand-paired `capture/2` and has not yet popped. Those names
+      # are still held on the connection, so erasing them tells a later nested `scoped/3`
+      # that nobody owns them — and on a capture failure that sends it down the RESET branch
+      # for a name an outer scope is actively holding, which is exactly the clobber
+      # `capture_fallback!/2` aborts to prevent.
+      #
+      # Subtracting our own names instead is correct in both directions: a body that pushed
+      # and popped symmetrically lands back on `enclosing`, and a body still holding a name
+      # keeps it. `--` removes one occurrence per element, which matches the push of
+      # `enclosing ++ names` even when an inner scope legitimately re-owns the same name.
+      put_active_names(active_names() -- names)
     end
   end
 
@@ -151,7 +163,11 @@ defmodule Loopctl.LocalGuc do
         # fail-soft path converts "this diagnostic could not be measured" into a failed
         # request, which is the thing those paths exist to prevent. So ON THIS ABORT — which
         # is a RAISE, and therefore exactly what a `rescue` clause sees — the ingestion backlog
-        # gate (`LoopctlWeb.KnowledgeIngestionController`) fails OPEN at 0, `Knowledge`'s
+        # gate (`LoopctlWeb.KnowledgeIngestionController`) returns `{:unmeasurable,
+        # "guc_capture_abort"}` for `backlog_fail_open_verdict/3` to adjudicate — and that
+        # class is now METERED, since this abort is raised only once the connection is already
+        # wedged. It formerly read "fails OPEN at 0" here, which described the unconditional
+        # admit that metering closed; a `0` count is the bug, not the behaviour. `Knowledge`'s
         # under-fill probe degrades to `:error`, and `ArticleLinkingWorker` skips its
         # observational count — all tagging, none re-raising.
         #

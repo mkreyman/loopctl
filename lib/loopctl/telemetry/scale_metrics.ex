@@ -362,6 +362,7 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   require Logger
 
+  alias Loopctl.ExitClass
   alias Loopctl.ExitTag
   alias Loopctl.LocalGuc
   alias Loopctl.Repo
@@ -1472,7 +1473,18 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   # An EXIT/THROW is not an exception, so it can never be a struct above:
   # `guarded_measurement/5` hands it over wrapped as `{kind, bounded_tag}`. Its own class
   # because a pool checkout that exits has a different remedy from one that raises.
-  defp oban_poll_error_class({kind, _reason}) when kind in [:exit, :throw], do: to_string(kind)
+  #
+  # #558: routed through `ExitClass.bounded/2` so the label reads `exit:noproc`, matching the
+  # ingest-gate and under-fill-probe counters. It previously emitted a bare `"exit"`, which
+  # made three coexisting encodings of one concept across three counters — an operator
+  # correlating them had to know which series used which spelling, and the bare form threw
+  # away the discriminator (`noproc` vs `timeout`) that decides where to look.
+  defp oban_poll_error_class({kind, tag}) when kind in [:exit, :throw] and is_binary(tag),
+    do: ExitClass.bounded(kind, tag)
+
+  defp oban_poll_error_class({kind, reason}) when kind in [:exit, :throw],
+    do: ExitClass.classify(kind, reason)
+
   defp oban_poll_error_class(nil), do: "unknown"
   defp oban_poll_error_class(_other), do: "other"
 

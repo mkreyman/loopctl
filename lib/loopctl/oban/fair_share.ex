@@ -153,6 +153,7 @@ defmodule Loopctl.Oban.FairShare do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.ExitTag
   alias Loopctl.LocalGuc
   alias Loopctl.ObanConfig
 
@@ -227,15 +228,28 @@ defmodule Loopctl.Oban.FairShare do
   # gate must not be able to wedge a queue). A malformed CAP is deliberately NOT caught
   # here (it is read in `over_fair_share?/3`, above this rescue) so it fails loud.
   defp over_cap?(tenant_id, queue, job_id, cap) do
-    lower_ranked_executing_count(tenant_id, queue, job_id) >= cap
+    counter().lower_ranked_executing_count(tenant_id, queue, job_id) >= cap
   rescue
     e ->
-      Logger.warning(
-        "FairShare gate failed open on queue=#{queue} tenant=#{tenant_id}: " <>
-          Exception.message(e)
-      )
+      # The bounded CLASS, never `Exception.message/1`: a Postgrex/DBConnection message names
+      # the backend host, database and role, and this line is reachable from any wedged-pool
+      # moment on an ordinary job.
+      fair_share_degraded(tenant_id, queue, ExitTag.tag(e))
+  catch
+    # #558: the rescue above covers only the RAISE shape, so this gate — which DOCUMENTS
+    # failing open on any count error — failed CLOSED on the fault most likely to trigger it.
+    # A DBConnection checkout against a wedged, saturated or unstarted pool EXITS, escaping
+    # the rescue entirely, and the escape kills the Oban job rather than admitting it. The
+    # gate exists so a counting problem never blocks work; on an exit it did the opposite.
+    kind, reason when kind in [:exit, :throw] ->
+      fair_share_degraded(tenant_id, queue, "#{kind}:#{ExitTag.tag(reason)}")
+  end
 
-      false
+  # One degrade path for both shapes, so the fail-open promise cannot drift between them.
+  defp fair_share_degraded(tenant_id, queue, class) do
+    Logger.warning("FairShare gate failed open on queue=#{queue} tenant=#{tenant_id} (#{class})")
+
+    false
   end
 
   @doc """
@@ -284,11 +298,22 @@ defmodule Loopctl.Oban.FairShare do
   # moduledoc). A `nil` job_id (bare `perform/1` struct in a test — off the real
   # dispatch path) has no rank, so we fall back to the plain unscoped executing count
   # (counts every executing job, including the caller).
-  defp lower_ranked_executing_count(tenant_id, queue, job_id) when is_integer(job_id) do
+  # Injected (`Loopctl.Oban.FairShareCounterBehaviour`) so the fail-open EXIT branch above is
+  # reachable from a test; production resolves to this module.
+  defp counter do
+    Application.get_env(:loopctl, :fair_share_counter, __MODULE__)
+  end
+
+  @behaviour Loopctl.Oban.FairShareCounterBehaviour
+
+  @impl Loopctl.Oban.FairShareCounterBehaviour
+  def lower_ranked_executing_count(tenant_id, queue, job_id)
+
+  def lower_ranked_executing_count(tenant_id, queue, job_id) when is_integer(job_id) do
     count(tenant_id, {:queue, to_string(queue)}, ["executing"], {:lower_than, job_id})
   end
 
-  defp lower_ranked_executing_count(tenant_id, queue, nil) do
+  def lower_ranked_executing_count(tenant_id, queue, nil) do
     count(tenant_id, {:queue, to_string(queue)}, ["executing"], :all)
   end
 

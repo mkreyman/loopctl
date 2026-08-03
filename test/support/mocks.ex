@@ -114,6 +114,12 @@ Mox.defmock(Loopctl.MockEmbeddingReadPath, for: Loopctl.Embeddings.ReadPathBehav
 # delegates to the real `Loopctl.Embeddings.LegacyRetirement`.
 Mox.defmock(Loopctl.MockLegacyRetirement, for: Loopctl.Embeddings.LegacyRetirementBehaviour)
 
+# #558: DI seam for FairShare's fair-share count. It exists for one branch — the gate's
+# fail-open handling of a count that EXITS — which the sandboxed pool cannot produce, and
+# which shipped BACKWARDS (fail-closed, killing the Oban job) precisely because nothing
+# could test it.
+Mox.defmock(Loopctl.MockFairShareCounter, for: Loopctl.Oban.FairShareCounterBehaviour)
+
 # US-27.16: DI seam for the streaming-export producer's per-body observation point. The
 # bounded-memory scale gate must prove its metric is LOAD-BEARING by turning the streaming
 # producer into a MATERIALIZING one, which needs a seam in the production emit path.

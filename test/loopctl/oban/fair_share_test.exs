@@ -96,6 +96,65 @@ defmodule Loopctl.Oban.FairShareTest do
     end
   end
 
+  describe "#558: the gate fails OPEN on a count that EXITS, not just one that raises" do
+    setup do
+      import Mox
+      setup_test_tenant = fixture(:tenant)
+      %{tenant: setup_test_tenant}
+    end
+
+    test "a wedged-pool EXIT admits the job instead of killing it", %{tenant: tenant} do
+      # `over_cap?/4` DOCUMENTS failing open on any count error, and delivered that with a
+      # `rescue` alone. A DBConnection checkout against a wedged, saturated or unstarted pool
+      # EXITS — it does not raise — so the escape killed the Oban job rather than admitting
+      # it: the exact inverse of the contract, on the fault most likely to trigger the gate.
+      #
+      # The production exit shape, not a bare atom: an atom-only handler would pass here and
+      # still miss every real one.
+      stub(Loopctl.MockFairShareCounter, :lower_ranked_executing_count, fn _t, _q, _j ->
+        exit({:noproc, {DBConnection, :execute, []}})
+      end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert FairShare.gate(tenant.id, :knowledge, 1) == :ok
+        end)
+
+      assert log =~ "FairShare gate failed open"
+      # BOUNDED class, never the raw reason — which carries the DBConnection call tuple.
+      assert log =~ "exit:noproc"
+      refute log =~ "DBConnection.execute"
+    end
+
+    test "a THROW admits too — the third non-local kind", %{tenant: tenant} do
+      stub(Loopctl.MockFairShareCounter, :lower_ranked_executing_count, fn _t, _q, _j ->
+        throw(:boom)
+      end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert FairShare.gate(tenant.id, :knowledge, 1) == :ok
+        end)
+
+      assert log =~ "throw:"
+    end
+
+    test "a RAISE still fails open, with its own bounded class", %{tenant: tenant} do
+      stub(Loopctl.MockFairShareCounter, :lower_ranked_executing_count, fn _t, _q, _j ->
+        raise %DBConnection.ConnectionError{message: "tcp connect (db.internal:5432): timeout"}
+      end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert FairShare.gate(tenant.id, :knowledge, 1) == :ok
+        end)
+
+      assert log =~ "FairShare gate failed open"
+      # The pre-existing rescue logged Exception.message/1, which names the backend host.
+      refute log =~ "db.internal"
+    end
+  end
+
   describe "tenant isolation (AC-36.2.6)" do
     test "tenant A's count never includes tenant B's jobs" do
       tenant_a = Ecto.UUID.generate()

@@ -13,6 +13,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias LoopctlWeb.Helpers.Visibility
 
@@ -149,6 +150,22 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
     knowledge().suggest_links_with_meta(tenant_id, article_id, opts)
   rescue
     e in [Postgrex.Error, DBConnection.ConnectionError] -> {:error, e}
+  catch
+    # #558: the rescue covers only the RAISE shape. A checkout against a wedged, saturated or
+    # unstarted pool EXITS, so it escaped this guard entirely and became a blanket 500 whose
+    # crash log carried the raw exit reason — which on this endpoint means the query text and
+    # its vector literals. That is both the unpinned status US-27.3 exists to prevent and an
+    # information-disclosure path the pinned response does not have.
+    #
+    # Classified as a `DBConnection.ConnectionError` deliberately rather than a new shape: a
+    # pool exit IS a connection failure, and this maps it onto the SAME pinned 503 +
+    # Retry-After the caller already understands. The message is the BOUNDED `ExitTag` class,
+    # never the reason itself.
+    kind, reason when kind in [:exit, :throw] ->
+      {:error,
+       %DBConnection.ConnectionError{
+         message: "suggest_links unavailable (#{kind}:#{ExitTag.tag(reason)})"
+       }}
   end
 
   defp knowledge do

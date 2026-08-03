@@ -39,5 +39,10 @@ defmodule Loopctl.ExitClass do
   def classify(kind, reason), do: bounded(kind, ExitTag.tag(reason))
 
   defp closed(tag) when tag in @tags, do: tag
+
+  # Everything else, INCLUDING `ExitTag`'s own catch-all string "unknown". The two mean the
+  # same thing ("could not classify"), and a metric wants ONE label for that, not two
+  # spellings an operator has to know are synonyms. A log line may still say `unknown` — that
+  # is `ExitTag`'s vocabulary, and the translation is deliberate rather than drift.
   defp closed(_tag), do: "other"
 end
