@@ -332,7 +332,41 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
       )
 
       :ok
+  catch
+    # `rescue` alone left the hole this whole block exists to close. A pool checkout against
+    # a wedged, saturated or unstarted `AdminRepo` EXITS (`{:timeout, {DBConnection, ...}}`,
+    # `:noproc`) rather than raising, so it walks straight past the clause above and aborts
+    # `perform/1` — and because sampling is deterministic by `article_id`, all three Oban
+    # attempts re-sample, re-exit and discard, leaving that article permanently unlinked.
+    # That is the exact regression the rescue was written to prevent, reached by the other
+    # of the two ways this call can fail.
+    #
+    # Tagged, not swallowed untagged, so the degraded signal stays greppable. `exit_tag/1`
+    # below is a local mirror of `HeavyRead`'s and `LocalGuc.failure_tag/1`'s exit clauses:
+    # both are `defp`, and this module following the same per-module convention is cheaper
+    # than promoting one to a public API for a third caller.
+    :exit, reason ->
+      Logger.warning(
+        "Article linking: corpus-size count exited (#{exit_tag(reason)}) for " <>
+          "article #{article.id}; skipping the observational corpus_size signal — " <>
+          "linking proceeds"
+      )
+
+      :ok
   end
+
+  # Bounded classification of an exit reason — a small closed set, never the raw reason
+  # (which carries the full DBConnection call tuple, module and args).
+  #
+  # The `{reason, call}` TUPLE clause is the load-bearing one, and it is modelled on
+  # `LocalGuc.failure_tag/1` rather than on `HeavyRead.exit_tag/1`. DBConnection reports a
+  # wedged or unstarted pool as `{:noproc, {DBConnection, :execute, []}}`, NOT as a bare
+  # `:noproc` — a tagger with only an atom clause therefore looks right against a hand-rolled
+  # `exit(:noproc)` while degrading every REAL production exit to "other". This module's test
+  # exits with the production shape for exactly that reason.
+  defp exit_tag(reason) when is_atom(reason), do: to_string(reason)
+  defp exit_tag({reason, _call}) when is_atom(reason), do: to_string(reason)
+  defp exit_tag(_reason), do: "unknown"
 
   # Deterministic-by-id sampling so the same article always makes the same decision (stable
   # across a job's retries). `phash2(id, 1) == 0` always, so a rate of 1 samples every job;

@@ -951,6 +951,20 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                exception: %DBConnection.OwnershipError{}
              }) == %{poller: :queue_state, error_class: "db_error"}
 
+      # A LocalGuc capture ABORT is raised AS a DBConnection.ConnectionError on purpose, so
+      # without its own branch it landed in the clause above and read as a pool fault. It is
+      # not one: it is the poller declining to override a GUC an enclosing scope owns — a
+      # correctness-preserving refusal with a completely different remedy. Both Oban pollers
+      # run inside `LocalGuc.timed_transaction/3`, so this is reachable, and the three sites
+      # that already discriminate it (`Knowledge`, `KnowledgeIngestionController`,
+      # `ArticleLinkingWorker`) all use this same tag.
+      assert ScaleMetrics.oban_poll_error_tags(%{
+               poller: :queue_state,
+               exception: %DBConnection.ConnectionError{
+                 message: "LocalGuc: could not capture [\"statement_timeout\"]"
+               }
+             }) == %{poller: :queue_state, error_class: "guc_capture_abort"}
+
       assert ScaleMetrics.oban_poll_error_tags(%{
                poller: :queue_state,
                exception: %ArgumentError{}

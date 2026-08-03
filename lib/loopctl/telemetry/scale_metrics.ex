@@ -1322,7 +1322,21 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   end
 
   defp oban_poll_error_class(%Postgrex.Error{}), do: "db_error"
-  defp oban_poll_error_class(%DBConnection.ConnectionError{}), do: "db_error"
+
+  # A LocalGuc capture abort must be classified BEFORE the generic ConnectionError clause
+  # below: it is raised as a `DBConnection.ConnectionError` (deliberately — see
+  # `LocalGuc.capture_fallback!/2`), so without this branch it lands as `"db_error"` and
+  # reads as a pool fault. It is not one: it is this poller declining to override a GUC an
+  # enclosing scope owns, which is a correctness-preserving refusal with a completely
+  # different remedy. Both Oban pollers run inside `LocalGuc.timed_transaction/3` (see
+  # `poll_oban_queue_state/0` and `count_oban_executing_orphans/0`), so this is reachable,
+  # not defensive. Matches the three sites that already discriminate it —
+  # `Loopctl.Knowledge`, `LoopctlWeb.KnowledgeIngestionController` and
+  # `Loopctl.Workers.ArticleLinkingWorker` — on the same `"guc_capture_abort"` tag.
+  defp oban_poll_error_class(%DBConnection.ConnectionError{} = e) do
+    if LocalGuc.capture_abort?(e), do: "guc_capture_abort", else: "db_error"
+  end
+
   defp oban_poll_error_class(%DBConnection.OwnershipError{}), do: "db_error"
   defp oban_poll_error_class(%ArgumentError{}), do: "config_error"
   defp oban_poll_error_class(%FunctionClauseError{}), do: "config_error"
