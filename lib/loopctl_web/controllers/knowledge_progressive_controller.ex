@@ -109,6 +109,84 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
     end
   end
 
+  operation(:heat_index,
+    summary: "Heat-ranked topic index (no query)",
+    description:
+      "A bounded, top-K-capped stub list of the corpus ordered by HEAT — the cumulative " <>
+        "number of times each article has actually been read. Takes NO query, which is the " <>
+        "point: every other retrieval route starts from one, so they all miss the same way " <>
+        "on a paraphrase or on material that is topically central but lexically dissimilar. " <>
+        "This route's failures are uncorrelated with embedding similarity.\n\n" <>
+        "Stubs only (id/title/category/heat/one-line summary) — never a body — so it is cheap " <>
+        "enough to keep in a cached prefix rather than fetch per turn. The response states " <>
+        "which tool to call with which parameter to read a listed article. Visibility-scoped: " <>
+        "an agent key never sees another agent's private/owner memory, not even as a stub. " <>
+        "Role: agent+.",
+    parameters: [
+      limit: [
+        in: :query,
+        type: :integer,
+        description: "Top-K stubs, clamped to 1..100. Defaults to the progressive top-K."
+      ],
+      category: [
+        in: :query,
+        type: :string,
+        description: "Restrict the index to a single category."
+      ],
+      since: [
+        in: :query,
+        type: :string,
+        description:
+          "ISO-8601 timestamp. Count only accesses at/after it. Omitted means ALL-TIME, " <>
+            "which is the definition of heat — a window would make a long-valuable article " <>
+            "indistinguishable from a never-read one during a quiet period."
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Heat-ranked stubs", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: %OpenApiSpex.Schema{type: :object}},
+             meta: %OpenApiSpex.Schema{type: :object}
+           }
+         }},
+      400 => {"Invalid parameter", "application/json", Schemas.ErrorResponse},
+      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc "GET /api/v1/knowledge/heat_index"
+  def heat_index(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    with {:ok, category} <- validate_category(params["category"]),
+         {:ok, since} <- validate_since(params["since"]) do
+      opts =
+        []
+        |> maybe_add_opt(:category, category)
+        |> maybe_add_opt(:since, since)
+        |> maybe_add_limit(params["limit"])
+        |> Keyword.merge(Visibility.scope_opts(conn))
+
+      {:ok, result} = Knowledge.heat_index(tenant_id, opts)
+      json(conn, LoopctlWeb.KnowledgeProgressiveJSON.heat_index(result))
+    end
+  end
+
+  # A malformed timestamp is a 400, never a silent all-time fallback: silently widening the
+  # window a caller explicitly narrowed would hand back more than it asked for and look correct.
+  defp validate_since(nil), do: {:ok, nil}
+  defp validate_since(""), do: {:ok, nil}
+
+  defp validate_since(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _offset} -> {:ok, dt}
+      _ -> {:error, :bad_request, "Query parameter 'since' must be an ISO-8601 timestamp"}
+    end
+  end
+
   operation(:drill,
     summary: "Progressive-disclosure drill",
     description:

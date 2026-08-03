@@ -159,6 +159,14 @@ defmodule Loopctl.HeavyRead.TenantGate do
   # `tenant_gate_test.exs`'s endpoint-weight guard — so a NEW heavy endpoint a caller
   # adds (registered in `known_endpoints/0`) cannot silently fall through
   # `weight_for/1` to light weight and under-charge a genuinely heavy read.
+  # `heat_index` (#554) is HEAVY, and the choice is asymmetric rather than close. It is a full
+  # aggregate (group-by + count) over `article_access_events` joined to `articles`, so its cost
+  # grows with the READ HISTORY, not the corpus — the one table that only ever gets longer.
+  #
+  # The tie-break is what each error costs. Marked light and actually expensive, concurrent
+  # calls starve genuine request-path reads. Marked heavy and actually cheap, it just sheds
+  # earlier under load — and this surface is a cadence-refreshed navigation index, so a STALE
+  # index costs nothing while a starved semantic search costs a request.
   @heavy_endpoints ~w(
     vector_search
     semantic_search
@@ -169,6 +177,7 @@ defmodule Loopctl.HeavyRead.TenantGate do
     distant_pairs_bridge
     export
     graph_lane
+    heat_index
   )a
 
   # --- Client API ---

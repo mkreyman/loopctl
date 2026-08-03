@@ -331,6 +331,7 @@ defmodule Loopctl.HeavyRead do
     export
     llm_usage
     graph_lane
+    heat_index
   )a
 
   @doc """

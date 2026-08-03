@@ -58,6 +58,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
@@ -8860,6 +8861,152 @@ defmodule Loopctl.Knowledge do
          }
        }}
     end
+  end
+
+  # Bound on a single stub's summary so the whole index stays paste-able into a cached prefix.
+  # The cap is per-stub rather than a running total: truncating the LAST stub of a top-K list
+  # would silently drop the tail, and a partially-listed index is worse than a shorter one
+  # because nothing signals the omission.
+  @heat_summary_chars 120
+  @heat_index_char_budget @max_relevance_page_size * (@heat_summary_chars + 80)
+
+  @doc """
+  A HEAT-ranked, topic-less stub index of the corpus (#554).
+
+  The second retrieval route. `search_semantic/3` and `progressive_index/3` both start from a
+  QUERY, so they share a failure mode: a paraphrase, or material that is topically central but
+  lexically dissimilar to the question, comes back empty — and an empty result reads as "the KB
+  has nothing" rather than "I asked badly", with nothing in context to contradict it. This route
+  takes no query at all, so its misses are uncorrelated with embedding similarity.
+
+  Ordering is by HEAT — the cumulative count of `article_access_events` rows for the article,
+  i.e. how often it has actually proved worth reading. Usage is treated as the authority on
+  importance, so material that has repeatedly landed floats to the top of every future index
+  regardless of what today's query happens to embed near.
+
+  ## Why this is NOT an option on `progressive_index/3`
+
+  That function is topic-SEEDED: it begins with `search_keyword/3` over the caller's topic and
+  enriches from there. Heat has no topic to seed from, so folding it in would mean a `topic ==
+  nil` branch that skips the entire body — a second function wearing the first one's name. They
+  share the clamping and visibility helpers instead.
+
+  ## Options
+
+    - `:limit` -- top-K, clamped to `1..#{@max_relevance_page_size}` exactly like
+      `progressive_index/3`, so an explicit override cannot flood context either.
+    - `:since` -- count only accesses at/after this `DateTime`. Default is ALL-TIME:
+      heat is defined as cumulative, and a window would make a long-valuable article
+      indistinguishable from a never-read one during a quiet week.
+    - `:category` -- restrict to one category atom.
+    - `:visibility_agent_id` -- the calling agent's id (#163). An index is exactly the surface
+      where a leak is easy and invisible, because a stub looks innocuous and nobody reads an
+      index the way they read a body. Applied as a WHERE on the joined article, so another
+      agent's `private`/`owner` memory can never appear even as a title.
+
+  Returns `{:ok, %{results: [stub], meta: map}}`. Each stub carries `id`, `title`, `category`,
+  `heat` and a one-line `summary`; `meta` states the character budget, the cap, and — per the
+  Tencent navigation-index property — WHICH TOOL to call with WHICH PARAMETER to drill, so the
+  payload is self-describing rather than relying on the reader to infer that an id is actionable.
+  """
+  @spec heat_index(Ecto.UUID.t(), keyword()) :: {:ok, map()}
+  def heat_index(tenant_id, opts \\ []) when is_binary(tenant_id) do
+    top_k =
+      opts |> Keyword.get(:limit, progressive_top_k()) |> max(1) |> min(@max_relevance_page_size)
+
+    vis = Keyword.get(opts, :visibility_agent_id)
+    since = Keyword.get(opts, :since)
+    category = Keyword.get(opts, :category)
+
+    rows =
+      tenant_id
+      |> heat_index_query(top_k, since, category)
+      |> maybe_filter_by_visibility_on_joined_article(vis)
+      |> then(&HeavyRead.all(tenant_id, &1, HeavyRead.opts(:heat_index)))
+
+    stubs = Enum.map(rows, &heat_stub/1)
+
+    {:ok,
+     %{
+       results: stubs,
+       meta: %{
+         top_k: top_k,
+         returned: length(stubs),
+         # A STATED budget, not an implied one: the caller is expected to paste this into a
+         # cached prefix, so it needs to know the cost before it does.
+         char_budget: @heat_index_char_budget,
+         chars: stubs |> Enum.map(&heat_stub_chars/1) |> Enum.sum(),
+         heat_window: if(since, do: DateTime.to_iso8601(since), else: "all_time"),
+         # The read instruction rides IN the payload (#554): an index that lists ids without
+         # saying they are actionable gets read as prose.
+         drill: %{
+           tool: "knowledge_get",
+           parameter: "article_id",
+           note:
+             "Pass a listed id to read the full article. Ordering is cumulative usage, not relevance to any query."
+         }
+       }
+     }}
+  end
+
+  defp heat_index_query(tenant_id, top_k, since, category) do
+    base =
+      from(e in ArticleAccessEvent,
+        join: a in Article,
+        on: a.id == e.article_id and a.tenant_id == ^tenant_id,
+        where: e.tenant_id == ^tenant_id,
+        where: a.status == :published,
+        group_by: [a.id, a.title, a.category, a.body],
+        # `asc: a.id` after the count keeps the order TOTAL, so a page is stable across calls
+        # when several articles tie on heat — an index that reshuffles on every refresh cannot
+        # be cached, which is the whole point of this surface.
+        order_by: [desc: count(e.id), asc: a.id],
+        limit: ^top_k,
+        select: %{
+          id: a.id,
+          title: a.title,
+          category: a.category,
+          body: a.body,
+          heat: count(e.id)
+        }
+      )
+
+    base
+    |> heat_filter_since(since)
+    |> heat_filter_category(category)
+  end
+
+  defp heat_filter_since(query, nil), do: query
+
+  defp heat_filter_since(query, %DateTime{} = since),
+    do: where(query, [e], e.accessed_at >= ^since)
+
+  defp heat_filter_category(query, nil), do: query
+  defp heat_filter_category(query, category), do: where(query, [_e, a], a.category == ^category)
+
+  defp heat_stub(row) do
+    %{
+      id: row.id,
+      title: row.title,
+      category: to_string(row.category),
+      heat: row.heat,
+      summary: heat_summary(row.body)
+    }
+  end
+
+  # ONE line, always. A body's first paragraph can be arbitrarily long and can contain newlines
+  # that would break a line-oriented consumer's parsing of the index.
+  defp heat_summary(nil), do: ""
+
+  defp heat_summary(body) do
+    body
+    |> String.replace(~r/\s+/u, " ")
+    |> String.trim()
+    |> String.slice(0, @heat_summary_chars)
+  end
+
+  defp heat_stub_chars(stub) do
+    String.length(stub.title) + String.length(stub.summary) + String.length(stub.category) + 40
   end
 
   # Hub-enrichment neighbor discovery (AC-31.3.4): finds which of the seed

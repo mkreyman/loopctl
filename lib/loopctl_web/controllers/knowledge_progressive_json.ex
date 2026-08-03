@@ -7,6 +7,38 @@ defmodule LoopctlWeb.KnowledgeProgressiveJSON do
   a stable wire shape.
   """
 
+  @doc """
+  Renders the HEAT index (#554).
+
+  Distinct from `index/1` because the payloads differ where it matters: a heat stub carries
+  `heat` (the cumulative access count that produced its rank), and the meta carries the DRILL
+  INSTRUCTION. The instruction is part of the wire shape on purpose — an index that lists ids
+  without saying they are actionable gets read as prose.
+  """
+  def heat_index(%{results: results, meta: meta}) do
+    %{
+      data: Enum.map(results, &render_heat_stub/1),
+      meta: %{
+        top_k: meta.top_k,
+        returned: meta.returned,
+        char_budget: meta.char_budget,
+        chars: meta.chars,
+        heat_window: meta.heat_window,
+        drill: meta.drill
+      }
+    }
+  end
+
+  defp render_heat_stub(stub) do
+    %{
+      id: stub.id,
+      title: stub.title,
+      category: stub.category,
+      heat: stub.heat,
+      summary: stub.summary
+    }
+  end
+
   @doc "Renders the capped index stubs plus its meta (top_k/candidate_count/truncated)."
   def index(%{stubs: stubs, meta: meta}) do
     %{
