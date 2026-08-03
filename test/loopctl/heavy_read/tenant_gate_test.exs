@@ -295,7 +295,10 @@ defmodule Loopctl.HeavyRead.TenantGateTest do
       change_feed: :light,
       ingestion_jobs: :light,
       sth_incremental: :light,
-      llm_usage: :light
+      llm_usage: :light,
+      # #554: heavy — its cost tracks the read-history table, and shedding a cadence-refreshed
+      # navigation index is far cheaper than starving a request-path search.
+      heat_index: :heavy
     }
 
     test "every @heavy_endpoints atom is a known HeavyRead endpoint (no orphan/typo)" do

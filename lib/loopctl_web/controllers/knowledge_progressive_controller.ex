@@ -31,6 +31,11 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
 
   @valid_categories Ecto.Enum.values(Article, :category)
 
+  # The published description and the ENFORCED bound read the same value, so tuning the window
+  # cannot silently make the docs promise history the server no longer scans.
+  @heat_default_window_days Knowledge.heat_default_window_days()
+  @heat_max_window_days Knowledge.heat_max_window_days()
+
   operation(:index,
     summary: "Progressive-disclosure index",
     description:
@@ -108,6 +113,100 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
       end
     end
   end
+
+  operation(:heat_index,
+    summary: "Heat-ranked topic index (no query)",
+    description:
+      "A bounded, top-K-capped stub list of the corpus (tenant articles plus published " <>
+        "system canonicals) ordered by HEAT — the number of times each article's BODY was " <>
+        "read directly. Only caller-chosen fetches are counted " <>
+        "(`meta.counted_access_types`); list-shaped ranker output (a search hit, a context " <>
+        "pack) is one row per RESULT, not a read, so it adds no heat. Takes NO query, " <>
+        "which is the " <>
+        "point: every other retrieval route starts from one, so they all miss the same way " <>
+        "on a paraphrase or on material that is topically central but lexically dissimilar. " <>
+        "This route's failures are uncorrelated with embedding similarity.\n\n" <>
+        "Stubs only (id/title/category/heat/one-line summary) — never a body — so it is cheap " <>
+        "enough to keep in a cached prefix rather than fetch per turn. The response states " <>
+        "which tool to call with which parameter to read a listed article, and states " <>
+        "`meta.truncated` when more articles were hot than the cap returned. " <>
+        "Visibility-scoped: an agent key never sees another agent's private/owner memory, " <>
+        "not even as a stub. Role: agent+.",
+    parameters: [
+      limit: [
+        in: :query,
+        type: :integer,
+        description: "Top-K stubs, clamped to 1..100. Defaults to the progressive top-K."
+      ],
+      category: [
+        in: :query,
+        type: :string,
+        description: "Restrict the index to a single category."
+      ],
+      since: [
+        in: :query,
+        type: :string,
+        description:
+          "ISO-8601 timestamp. Count only accesses at/after it. Omitted means the last " <>
+            "#{@heat_default_window_days} days, and a lookback longer than " <>
+            "#{@heat_max_window_days} days is CLAMPED to that ceiling — both bound the " <>
+            "request-path aggregate over an ever-growing read history. Pass an older " <>
+            "timestamp to widen the window deliberately; the effective window is echoed " <>
+            "as `meta.heat_window`."
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Heat-ranked stubs", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: %OpenApiSpex.Schema{type: :object}},
+             meta: %OpenApiSpex.Schema{type: :object}
+           }
+         }},
+      400 => {"Invalid parameter", "application/json", Schemas.ErrorResponse},
+      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc "GET /api/v1/knowledge/heat_index"
+  def heat_index(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    with {:ok, category} <- validate_category(params["category"]),
+         {:ok, since} <- validate_since(params["since"]) do
+      opts =
+        []
+        |> maybe_add_opt(:category, category)
+        |> maybe_add_opt(:since, since)
+        |> maybe_add_limit(params["limit"])
+        |> Keyword.merge(Visibility.scope_opts(conn))
+
+      {:ok, result} = Knowledge.heat_index(tenant_id, opts)
+      json(conn, LoopctlWeb.KnowledgeProgressiveJSON.heat_index(result))
+    end
+  end
+
+  # A malformed timestamp is a 400, never a silent all-time fallback: silently widening the
+  # window a caller explicitly narrowed would hand back more than it asked for and look correct.
+  defp validate_since(nil), do: {:ok, nil}
+  defp validate_since(""), do: {:ok, nil}
+
+  defp validate_since(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _offset} -> {:ok, dt}
+      _ -> invalid_since()
+    end
+  end
+
+  # `?since[]=x` makes Plug parse the param as a list — without this clause that is a
+  # FunctionClauseError -> 500, the same transport-boundary failure `coerce_topic/1` and
+  # `validate_category/1` already guard.
+  defp validate_since(_), do: invalid_since()
+
+  defp invalid_since,
+    do: {:error, :bad_request, "Query parameter 'since' must be an ISO-8601 timestamp"}
 
   operation(:drill,
     summary: "Progressive-disclosure drill",

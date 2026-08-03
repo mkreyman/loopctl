@@ -571,6 +571,12 @@ defmodule LoopctlWeb.Router do
     # article's body. The literal `progressive_index` path is registered BEFORE the
     # parameterized `progressive/:id` drill so it can never be shadowed.
     get "/knowledge/progressive_index", KnowledgeProgressiveController, :index
+
+    # #554: the topic-LESS sibling. Registered next to progressive_index because it is the
+    # same family (bounded stub list), but it takes no query at all — that is the point:
+    # its misses are uncorrelated with embedding similarity, so it is the route that still
+    # works when a semantic query has silently missed.
+    get "/knowledge/heat_index", KnowledgeProgressiveController, :heat_index
     get "/knowledge/progressive/:id", KnowledgeProgressiveController, :drill
 
     # Knowledge Context (deep-read with recency scoring and linked refs)
