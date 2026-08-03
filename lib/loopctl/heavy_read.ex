@@ -716,7 +716,7 @@ defmodule Loopctl.HeavyRead do
   # checkout and a warning per ANN read during the incident. That reasoning applies to pool
   # and connection failures — and to nothing else.
   #
-  # Two classes are therefore NEVER cached, and for one shared reason: caching `false` pins
+  # Three classes are therefore NEVER cached, and for one shared reason: caching `false` pins
   # iterative scan OFF for the whole VM for a window, and now that `config/test.exs` pins it ON so
   # the suite matches prod, a single blip silently reconfigures every ANN read in the run and
   # re-arms the `left: []` recall flake that pin exists to prevent.
@@ -726,6 +726,8 @@ defmodule Loopctl.HeavyRead do
   #   * `:transaction` — the backend ANSWERED but the connection was poisoned (25P02 after a
   #     deliberate constraint-violation or 57014 test). Also not backend pressure, and also
   #     silent about the version.
+  #   * `:unexpected` — a THROW escaping the probe. A code bug, so it must stay loud and
+  #     re-probe rather than be pinned into the negative cache.
   #
   # `:pool` (checkout timeouts, connection errors) IS the saturation case the negative cache
   # was built for, so it stays cached in prod — but NOT under the sandbox pool, where routine
@@ -775,7 +777,7 @@ defmodule Loopctl.HeavyRead do
   # depends on how the tag happens to be worded.
   @spec probe_iterative_scan_support() ::
           {:ok, boolean(), String.t() | :not_installed}
-          | {:inconclusive, String.t(), :ownership | :transaction | :pool}
+          | {:inconclusive, String.t(), :ownership | :transaction | :pool | :unexpected}
   defp probe_iterative_scan_support do
     # TIGHT timeout, because this round trip runs from `opts/1` — i.e. BEFORE `TenantGate`
     # can shed and before any `SET LOCAL statement_timeout` applies. DBConnection derives the
@@ -823,11 +825,18 @@ defmodule Loopctl.HeavyRead do
     # DBConnection/Postgrex EXIT rather than raise when the pool is not started (`:noproc`)
     # or wedged (`{:timeout, {GenServer, :call, _}}`). Without this clause the exit
     # propagates out of `opts/1` and aborts the caller's ANN read — the OPPOSITE of the
-    # documented fail-closed guarantee. `:throw` is folded in for the same reason
-    # `ScaleMetrics.guarded_measurement/5` folds it in: it is the third non-local exit kind,
-    # and enumerating two of three is how this class of hole keeps reappearing.
-    kind, reason when kind in [:exit, :throw] ->
-      {:inconclusive, "#{kind}:" <> exit_tag(reason), :pool}
+    # documented fail-closed guarantee. That IS the saturation case, so it keeps `:pool`.
+    :exit, reason ->
+      {:inconclusive, "exit:" <> exit_tag(reason), :pool}
+
+    # A THROW is caught for the same reason (it is the third non-local exit kind, and
+    # enumerating two of three is how this class of hole keeps reappearing) but NOT
+    # classified `:pool`: nothing on this path throws today, so a thrown term is a CODE bug,
+    # not backend pressure, and `:pool` is the one class `cacheable_inconclusive?/1` lets
+    # into the negative cache — which would pin iterative scan OFF VM-wide for the negative
+    # TTL over a bug, the exact silent fleet-wide disabling that cache is fenced against.
+    :throw, value ->
+      {:inconclusive, "throw:" <> exit_tag(value), :unexpected}
   end
 
   @probe_sql "SELECT extversion FROM pg_extension WHERE extname = 'vector'"

@@ -1075,6 +1075,11 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
+      # The counter means "the valve is currently ADMITTING because it can't measure", so a
+      # REFUSAL must not fire it — otherwise it over-reports admissions during exactly the
+      # incident an operator alerts on.
+      attach_failed_open(tenant.id)
+
       expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
         exit({:noproc, {DBConnection, :execute, []}})
       end)
@@ -1110,6 +1115,48 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       # everyone else.
       assert_receive {:fail_open_bucket, bucket}
       assert bucket =~ tenant.id
+
+      refute_receive {:backlog_failed_open, _measurements, _metadata}, 20
+    end
+
+    test "the fail-open allowance is charged per ITEM, not per request", %{conn: conn} do
+      # A REQUEST-denominated allowance was the wrong unit: one batch request enqueues up to
+      # @batch_max (50) jobs, so metering requests let a sustained fault admit 50x the bound
+      # it advertised — above `OBAN_INGEST_BACKLOG_MAX` instead of far below it. Each item
+      # must spend one token, so the meter is in the same unit as the threshold.
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        exit({:noproc, {DBConnection, :execute, []}})
+      end)
+
+      test_pid = self()
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
+        if String.starts_with?(bucket, "ingest_backlog_fail_open:"),
+          do: send(test_pid, :fail_open_token)
+
+        {:allow, 1}
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [
+            %{content: "Metered item one", source_type: "newsletter"},
+            %{content: "Metered item two", source_type: "newsletter"},
+            %{content: "Metered item three", source_type: "newsletter"}
+          ]
+        })
+
+      assert length(json_response(conn, 200)["data"]) == 3
+
+      assert_receive :fail_open_token
+      assert_receive :fail_open_token
+      assert_receive :fail_open_token
+      refute_receive :fail_open_token, 20
     end
 
     test "a NON-timeout SQLSTATE is not reported as a timeout", %{conn: conn} do
@@ -1126,6 +1173,15 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
         raise %Postgrex.Error{
           postgres: %{code: :undefined_column, message: "column j.args does not exist"}
         }
+      end)
+
+      # ...and it is NOT metered: a broken count QUERY is not backlog pressure, so capping it
+      # would 429 an under-threshold tenant with a backlog code it has not earned. Even with
+      # the fail-open allowance fully spent, this class still admits.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, limit ->
+        if String.starts_with?(bucket, "ingest_backlog_fail_open:"),
+          do: {:deny, limit},
+          else: {:allow, 1}
       end)
 
       conn =

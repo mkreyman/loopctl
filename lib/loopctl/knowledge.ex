@@ -5117,13 +5117,27 @@ defmodule Loopctl.Knowledge do
   # caller can fail-soft — a genuine query bug still surfaces (we re-raise non-cancel
   # Postgrex errors).
   #
-  # Public-but-`@doc false` (same precedent as `under_fill_probe_degraded/2` below) and the
-  # read is taken from `opts[:probe_read]` — a CLOSURE seam, defaulting to `HeavyRead.one/3`
-  # — so a test can drive a real pool EXIT through THIS function and the `catch` below is
-  # verified where it lives, instead of only its classifier being asserted from a hand-built
-  # tuple (an inert guard passes that test either way).
+  # Public-but-`@doc false` (same precedent as `under_fill_probe_degraded/2` below) with the
+  # read as a DEFAULTED trailing ARGUMENT — so a test can drive a real pool EXIT through THIS
+  # function and the `catch` below is verified where it lives, instead of only its classifier
+  # being asserted from a hand-built tuple (an inert guard passes that test either way).
+  # Deliberately NOT read from `opts`: `opts` is threaded down from the public
+  # `suggest_links_with_meta/3`, so a stray `:probe_read` key would silently replace
+  # `HeavyRead.one/3` — and with it `HeavyRead.guard!/2`'s structural tenant-scoping — for
+  # anyone who ever passes caller-influenced opts through. A positional argument no public
+  # caller supplies cannot be reached that way.
   @doc false
-  def under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool, opts) do
+  def under_fill_probe(
+        tenant_id,
+        article_id,
+        embedding,
+        threshold,
+        vis,
+        pool,
+        opts,
+        read \\ &HeavyRead.one/3
+      )
+      when is_function(read, 3) do
     candidates = suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool, opts)
 
     probe =
@@ -5134,8 +5148,6 @@ defmodule Loopctl.Knowledge do
             fragment("COUNT(*) FILTER (WHERE ? > ?)", c.similarity_score, ^threshold)
         }
       )
-
-    read = Keyword.get(opts, :probe_read, &HeavyRead.one/3)
 
     case read.(tenant_id, probe, probe_read_opts(pool, opts)) do
       %{ann_candidates: a, above_threshold: t} ->

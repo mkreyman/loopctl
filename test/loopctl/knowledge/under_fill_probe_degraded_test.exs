@@ -82,15 +82,15 @@ defmodule Loopctl.Knowledge.UnderFillProbeDegradedTest do
     assert_receive {:probe_degraded, %{count: 1}, %{error_class: "timeout"}}
   end
 
-  # Drives the REAL `under_fill_probe/7` — its `catch`, not just the classifier it feeds —
-  # through the `:probe_read` closure seam (default `HeavyRead.one/3`), because a wedged pool
+  # Drives the REAL `under_fill_probe/8` — its `catch`, not just the classifier it feeds —
+  # through the trailing read ARGUMENT (default `HeavyRead.one/3`), because a wedged pool
   # cannot be conjured in a sandboxed async test. Without it, deleting the catch left green.
+  # A positional argument, never an `opts` key: `opts` is caller-threaded, and a seam that
+  # can be reached from there can displace `HeavyRead`'s tenant guard.
   defp probe(tenant_id, read) do
     embedding = List.duplicate(0.0, 1536)
 
-    Knowledge.under_fill_probe(tenant_id, Ecto.UUID.generate(), embedding, 0.5, nil, 10,
-      probe_read: read
-    )
+    Knowledge.under_fill_probe(tenant_id, Ecto.UUID.generate(), embedding, 0.5, nil, 10, [], read)
   end
 
   test "an EXIT escaping the probe's read degrades, under a CLOSED label set" do
