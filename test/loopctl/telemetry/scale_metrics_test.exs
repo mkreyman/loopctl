@@ -66,6 +66,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.oban.jobs.executing_orphan.count",
     "loopctl.oban.poll.error.count",
     "loopctl.ingestion.backlog_gate.failed_open.count",
+    "loopctl.ingestion.backlog_gate.failed_open.jobs",
     "loopctl.knowledge.article_linking.corpus_size",
     "loopctl.cluster.peers.count",
     "loopctl.egress.blocked.count"
@@ -109,7 +110,16 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                   :error_class,
                   # US-38.3: clustering-readiness peer gauge — bounded 3-value status
                   # (`:single_node`/`:clustered`/`:expected_peers_missing`), never a node name.
-                  :status
+                  :status,
+                  # #559: ingestion backlog-gate outcome — a bounded 3-value atom
+                  # (`:admitted`/`:unmetered`/`:exhausted`) set by the gate itself, never
+                  # derived from input. Carried ONLY by the two backlog_gate counters (via
+                  # `backlog_gate_tags/1`, deliberately not the shared `degraded_read_tags/1`).
+                  # Load-bearing rather than decorative: the gate's event fires on refusals as
+                  # well as admissions, so without this label a refusal increments the same
+                  # series as an admission and the counter over-reports admissions during
+                  # exactly the sustained incident it is alerted on.
+                  :outcome
                 ])
 
   defp scale_metrics, do: ScaleMetrics.scale_metrics()
@@ -151,6 +161,43 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert hist.tags == [:endpoint]
       refute :tenant_id in hist.tags
       refute :mapped_code in hist.tags
+    end
+
+    test "#559: the backlog-gate counters carry :outcome, so a REFUSAL is not counted as an admission" do
+      # The gate's event fires on every unmeasurable-count outcome, admissions and refusals
+      # alike. Without this label both land on one series and the counter over-reports
+      # admissions during exactly the sustained incident an operator alerts on — the silence
+      # the refusal-branch emit was added to prevent, reintroduced one layer up.
+      for name <- [
+            "loopctl.ingestion.backlog_gate.failed_open.count",
+            "loopctl.ingestion.backlog_gate.failed_open.jobs"
+          ] do
+        m = metric(name)
+        assert :outcome in m.tags, "#{name} must slice by :outcome"
+        assert :error_class in m.tags
+        assert :tenant_id in m.tags
+      end
+
+      # The jobs series is JOB-denominated: a 50-item batch is one check but fifty jobs.
+      assert %Telemetry.Metrics.Sum{measurement: :jobs} =
+               metric("loopctl.ingestion.backlog_gate.failed_open.jobs")
+    end
+
+    test "#559: backlog_gate_tags/1 bounds :outcome and leaves the shared probe tags alone" do
+      assert %{outcome: :exhausted, error_class: "connection"} =
+               ScaleMetrics.backlog_gate_tags(%{
+                 error_class: "connection",
+                 outcome: :exhausted,
+                 tenant_id: Ecto.UUID.generate()
+               })
+
+      # Defaults to :admitted so an emitter that has not been updated keeps its meaning.
+      assert %{outcome: :admitted} = ScaleMetrics.backlog_gate_tags(%{error_class: "timeout"})
+
+      # Deliberately NOT folded into degraded_read_tags/1 — the under-fill probe shares that
+      # one and has no outcome, so widening it would bolt a permanently-"admitted" label onto
+      # an unrelated series.
+      refute Map.has_key?(ScaleMetrics.degraded_read_tags(%{error_class: "timeout"}), :outcome)
     end
 
     test "the two counters DO admit tenant_id as a (cap-gated) tag" do

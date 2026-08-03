@@ -22,6 +22,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Oban.FairShare
   alias Loopctl.ObanConfig
+  alias Loopctl.RateLimiter
+  alias Loopctl.RateLimiter.FailOpenLog
   alias Loopctl.TelemetryEvents
   alias Loopctl.Workers.ContentIngestionWorker
 
@@ -38,6 +40,34 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # `validate_content_length/1` read the SAME number and cannot drift.
   @max_inline_content_bytes 1_000_000
 
+  # Ceiling on FAIL-OPEN admissions per tenant per window (see `backlog_fail_open_verdict/3`),
+  # charged one token per SUBMITTED ITEM — an upper bound on the jobs the request can enqueue,
+  # so the meter is in the same unit as `OBAN_INGEST_BACKLOG_MAX` and errs CONSERVATIVELY (an
+  # item that 422s or dedupes still spends its token; the bound is never under-charged).
+  # A REQUEST-denominated allowance was the wrong unit: `create_batch/2` admits up to
+  # @batch_max (50) items in ONE request, so 30 requests/min was really 1500 jobs/min.
+  #
+  # The WINDOW is the :ingestion queue's DRAIN cadence (hours — width 2, ~6-min LLM jobs),
+  # NOT a request cadence. A 60s window made the ceiling "100 jobs per MINUTE", which REFILLS
+  # to ~6000/hour/node against a ~20/hour drain: bounded for the transient blip, unbounded for
+  # the SUSTAINED wedge this meter exists for.
+  #
+  # The per-node allowance is DERIVED from the very threshold it must sit under, because the
+  # default limiter (`Loopctl.RateLimiter.Hammer`) is node-local ETS and the FLEET allowance
+  # is therefore per-node x web-node count — at a flat 100 that silently multiplied PAST the
+  # threshold from ~5 nodes up. Dividing the threshold by @fail_open_fleet_nodes holds the
+  # FLEET allowance at or under one `OBAN_INGEST_BACKLOG_MAX` per hour per tenant for any
+  # fleet up to that many web nodes, and retuning the threshold retunes this with it. It is
+  # FLOORED at @batch_max because charging is incremental with no reservation or refund: an
+  # allowance smaller than one batch converts the whole window into nothing the first time a
+  # batch is refused mid-charge, and integer division floors to 0 (clamping to a useless 1
+  # job/hour) for any OBAN_INGEST_BACKLOG_MAX under @fail_open_fleet_nodes.
+  @fail_open_window_ms 3_600_000
+  @fail_open_fleet_nodes 10
+
+  # Max batch size for POST /knowledge/ingest/batch. Declared HERE, above
+  # `fail_open_jobs_per_window/0`, which floors the fail-open allowance at one full batch.
+  @batch_max 50
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.ProjectId
 
@@ -138,8 +168,12 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
            "\"ingestion_backlog_exceeded\"`, sets `Retry-After`) — the single-item path " <>
            "is gated on the SAME per-tenant backlog threshold as /ingest/batch so it " <>
            "cannot be looped to bypass the valve — or (2) the generic shared Hammer " <>
-           "request-rate limiter (NO `error.code`). Branch on the presence of `error.code`.",
-         "application/json",
+           "request-rate limiter (NO `error.code`). Branch on the presence of `error.code`." <>
+           "\n\n`ingestion_backlog_exceeded` covers TWO causes: your backlog is at/over the " <>
+           "threshold, OR the server could not MEASURE it (transient count-path fault) and " <>
+           "the bounded fail-open allowance for that fault is spent. The second is a " <>
+           "server-side condition, not a quota you can drain — honour `Retry-After` either " <>
+           "way.", "application/json",
          %OpenApiSpex.Schema{
            oneOf: [Schemas.IngestionBacklogError, Schemas.RateLimitError]
          }}
@@ -157,7 +191,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     # which endpoint the flood comes through. Checked AFTER require_llm_key so a keyless
     # tenant still gets the clearer 422 first.
     with :ok <- require_llm_key(tenant_id),
-         :ok <- check_ingestion_backlog(tenant_id) do
+         :ok <- check_ingestion_backlog(tenant_id, 1) do
       handle_create(conn, tenant_id, params)
     end
   end
@@ -245,7 +279,12 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
            "US-36.3 ingestion-backlog backpressure (`error.code: " <>
            "\"ingestion_backlog_exceeded\"`, sets `Retry-After`), or (2) the generic " <>
            "shared Hammer request-rate limiter (NO `error.code`; `error.message: " <>
-           "\"Rate limit exceeded\"`). Branch on the presence of `error.code`.",
+           "\"Rate limit exceeded\"`). Branch on the presence of `error.code`." <>
+           "\n\n`ingestion_backlog_exceeded` covers TWO causes: your backlog is at/over the " <>
+           "threshold, OR the server could not MEASURE it (transient count-path fault) and " <>
+           "the bounded fail-open allowance for that fault is spent — the allowance is " <>
+           "charged per ITEM, so a large batch spends it faster. The second is a server-side " <>
+           "condition, not a quota you can drain — honour `Retry-After` either way.",
          "application/json",
          %OpenApiSpex.Schema{
            oneOf: [Schemas.IngestionBacklogError, Schemas.RateLimitError]
@@ -264,7 +303,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     # all-or-nothing, no partial pile-up). US-36.3.
     with :ok <- require_llm_key(tenant_id),
          :ok <- validate_batch_items(items),
-         :ok <- check_ingestion_backlog(tenant_id) do
+         :ok <- check_ingestion_backlog(tenant_id, length(items)) do
       results = process_batch_items(tenant_id, items)
       json(conn, LoopctlWeb.KnowledgeIngestionJSON.batch(results))
     end
@@ -288,12 +327,12 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # is by design — this is a backpressure VALVE to stop runaway monopolization, not a
   # guaranteed ceiling. Operators tuning OBAN_INGEST_BACKLOG_MAX should read it as a
   # "start shedding around here" floor, not an enforced maximum.
-  defp check_ingestion_backlog(tenant_id) do
+  defp check_ingestion_backlog(tenant_id, jobs) do
     max = ObanConfig.ingest_backlog_max()
 
     case in_flight_ingestion_backlog(tenant_id) do
       {:unmeasurable, error_class} ->
-        fail_open_admitted(tenant_id, error_class)
+        backlog_fail_open_verdict(tenant_id, error_class, jobs)
 
       count when count >= max ->
         {:error, :ingestion_backlog_exceeded, backlog_retry_after_seconds()}
@@ -301,6 +340,90 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
       _count ->
         :ok
     end
+  end
+
+  # Fail open, but BOUNDED for the SUSTAINED faults. Admitting on an unmeasurable count is
+  # right for the transient blip it was written for; the trouble is that the dominant fault
+  # here — a saturated or wedged AdminRepo pool (3 connections, `config/runtime.exs`) — is
+  # SUSTAINED, so an unconditional admit makes "no backpressure at all" the steady state
+  # during exactly the overload the valve exists to bound. (Before the exit shape was caught
+  # at all, the 500 at least shed the flood incidentally.) So those admissions are metered
+  # (`fail_open_jobs_per_window/0` per tenant per `@fail_open_window_ms`), and the rest get
+  # the ordinary backlog 429 with its Retry-After — no new status code, no new error code.
+  # EVERY outcome emits `fail_open_event/4`: the only signal that the backlog is UNMEASURABLE
+  # must not go silent at the moment the fault stops being a blip and becomes the wedge.
+  defp backlog_fail_open_verdict(tenant_id, error_class, jobs) do
+    outcome =
+      if metered_fail_open?(error_class),
+        do: consume_fail_open_allowance(tenant_id, jobs),
+        else: :admitted
+
+    fail_open_event(tenant_id, error_class, outcome, jobs)
+
+    if outcome == :exhausted,
+      do: {:error, :ingestion_backlog_exceeded, backlog_retry_after_seconds()},
+      else: :ok
+  end
+
+  # Meter every class that means the POOL is under pressure, including `guc_capture_abort`:
+  # `LocalGuc` raises that abort only after the capture round-trip ITSELF failed, i.e. the
+  # connection is already wedged, which is exactly the sustained pressure this bound exists
+  # for — leaving it unmetered let the wedge keep its unconditional admit under any nested
+  # scope. Only a broken count QUERY (`db_error`, e.g. 42703 after a `FairShare` change)
+  # stays unmetered: it is not backlog pressure at all, and capping it would 429 an
+  # under-threshold tenant with a backlog error code it has not earned.
+  defp metered_fail_open?("connection"), do: true
+  defp metered_fail_open?("db_pressure"), do: true
+  defp metered_fail_open?("timeout"), do: true
+  defp metered_fail_open?("guc_capture_abort"), do: true
+  defp metered_fail_open?("exit:" <> _tag), do: true
+  defp metered_fail_open?("throw:" <> _tag), do: true
+  defp metered_fail_open?(_class), do: false
+
+  # ONE token per SUBMITTED ITEM (an upper bound on the jobs this request would enqueue),
+  # halting on the first REFUSAL so a doomed request does not queue up to @batch_max more
+  # checkouts onto an already-starved pool. Tokens charged before the halt are not refunded
+  # (the limiter has no reservation), which is why `fail_open_jobs_per_window/0` is floored
+  # at one full batch: an allowance smaller than a batch would be converted into nothing.
+  #
+  # TRI-STATE, because a limiter FAULT is not a spent allowance and neither
+  # `RateLimiter.within_limit?/3` (fail-OPEN) nor `gate_ok?/3` (fail-CLOSED) can tell them
+  # apart. That distinction is load-bearing here: under `RATE_LIMITER=postgres` the limiter
+  # store IS `AdminRepo`, the same pool whose exhaustion produced this unmeasurable count, so
+  # the two faults are perfectly correlated. Fail-CLOSED 429s an innocent tenant on the FIRST
+  # transient blip with a backlog code it has not earned — the very thing this gate exists to
+  # prevent — while fail-OPEN goes silently inert in the wedge it bounds. So an unconsultable
+  # meter ADMITS (availability wins on a capacity gate) and reports `:unmetered`, which keeps
+  # "the valve is admitting because its METER is unreachable" alertable rather than silent.
+  defp consume_fail_open_allowance(tenant_id, jobs) do
+    bucket = "ingest_backlog_fail_open:#{tenant_id}"
+    limit = fail_open_jobs_per_window()
+
+    Enum.reduce_while(1..jobs//1, :admitted, fn _item, outcome ->
+      case allowance_token(bucket, limit) do
+        :exhausted -> {:halt, :exhausted}
+        :unmetered -> {:cont, :unmetered}
+        :admitted -> {:cont, outcome}
+      end
+    end)
+  end
+
+  # `{:allow, 0}` is the Postgres impl's own fail-open sentinel and `{:error, _}` is a Hammer
+  # soft-error: both mean UNCONSULTABLE, never "denied". Raise/exit/throw likewise.
+  defp allowance_token(bucket, limit) do
+    case RateLimiter.impl().check_rate(bucket, @fail_open_window_ms, limit) do
+      {:allow, count} when is_integer(count) and count > 0 -> :admitted
+      {:deny, _limit} -> :exhausted
+      _other -> :unmetered
+    end
+  rescue
+    _e -> :unmetered
+  catch
+    kind, _reason when kind in [:exit, :throw] -> :unmetered
+  end
+
+  defp fail_open_jobs_per_window do
+    max(@batch_max, div(ObanConfig.ingest_backlog_max(), @fail_open_fleet_nodes))
   end
 
   # FAIL OPEN on an UNMEASURABLE count only: an unreachable/timed-out backlog count must
@@ -312,11 +435,11 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # error in the count path therefore propagates and 500s, LOUD, rather than being silently
   # swallowed into a fleet-wide disabling of backpressure that looks healthy; a SQL-level one
   # (a bad query change) is still rescued, and gets its own `db_error` class so it is not
-  # mistaken for a timeout. Every admitted fail-open ALSO emits a telemetry counter
-  # (`fail_open_admitted/2`) so "the backpressure valve is currently admitting because it
-  # can't measure" is an alertable signal, not just a warning-log line, and a sustained
-  # per-request timeout under a real flood is visible on a dashboard instead of only as log
-  # spam. The count is resolved through a
+  # mistaken for a timeout. EVERY unmeasurable count ALSO emits a telemetry counter
+  # (`fail_open_event/4`, on every outcome — admitted, unmetered and refused) so "the
+  # backpressure valve currently can't measure" is an alertable signal, not just a
+  # warning-log line, and a sustained per-request timeout under a real flood is visible on a
+  # dashboard instead of only as log spam. The count is resolved through a
   # config-swappable DI seam (`Loopctl.Oban.FairShare` in prod, a Mox mock in test) so
   # this fail-open path is deterministically covered.
   defp in_flight_ingestion_backlog(tenant_id) do
@@ -325,9 +448,10 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     # `LocalGuc`'s capture ABORT shares `DBConnection.ConnectionError` with the transient
     # pool faults this clause is for. It is raised DELIBERATELY, so it gets its OWN
     # `error_class` (`fail_open_class/1`) rather than hiding inside "connection" — a refusal
-    # whose purpose is to be noticed stays alertable. It still fails OPEN: an abort IS an
+    # whose purpose is to be noticed stays alertable. It still fails OPEN — an abort IS an
     # unmeasurable count, and this gate exists so an innocent, under-threshold tenant never
-    # eats an error because the count path is momentarily degraded. See
+    # eats an error because the count path is momentarily degraded — but METERED like the
+    # other pool faults, since it is raised only once the connection is already wedged. See
     # `Loopctl.LocalGuc.capture_abort?/1`.
     e in [DBConnection.ConnectionError, Postgrex.Error] ->
       {:unmeasurable, fail_open_class(e)}
@@ -338,31 +462,46 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     # ordinary ingest, which is the opposite of failing open. `:throw` is folded in for the
     # same reason `ScaleMetrics.guarded_measurement/5` folds it in: it is the third non-local
     # exit kind, and enumerating two of three is how this class of hole keeps reappearing.
-    # Returns `{:unmeasurable, class}` rather than `0` ("an empty backlog") so the caller
-    # can tell "nothing queued" from "could not look", and so the fail-open is an explicit
-    # decision at one site instead of a magic zero flowing into a threshold comparison.
+    # NOT `0` ("an empty backlog"), which admitted unconditionally and forever. The count is
+    # UNMEASURABLE, and `backlog_fail_open_verdict/3` decides how many such admissions a
+    # tenant gets before the valve closes again.
     kind, reason when kind in [:exit, :throw] ->
       {:unmeasurable, fail_open_class({kind, ExitTag.tag(reason)})}
   end
 
-  # The ADMIT branch: `TelemetryEvents.ingestion_backlog_gate_failed_open/0` documents
-  # itself as "the valve is currently ADMITTING because it can't measure", so the counter
-  # and the warning belong here, where that is exactly what happened.
+  # EVERY outcome (`:admitted` | `:unmetered` | `:exhausted`). The event means "the gate could
+  # not MEASURE the backlog"; admissions are the `:admitted` slice. Emitting it on the admit
+  # branch ALONE made the only alertable signal for an unmeasurable count go SILENT exactly
+  # when the fault stopped being a blip and became the sustained wedge — the operator's alert
+  # auto-resolved while the pool was still wedged, and the resulting 429s were
+  # indistinguishable in metrics from an ordinary over-threshold backlog 429.
+  # `jobs` is the JOB-denominated measurement, the same unit as the allowance and
+  # `OBAN_INGEST_BACKLOG_MAX`; `count` alone is per-REQUEST and under-reads the admitted work
+  # of a batch by up to @batch_max. `jobs` is raw-payload-only until `ScaleMetrics` sums it —
+  # the exported counter is still `count`.
+  #
+  # THROTTLED through `RateLimiter.FailOpenLog` (one line per bucket family per node per
+  # minute) rather than a bare `Logger.warning`: refusals are unbounded — the meter bounds
+  # ADMISSIONS, not requests — so a wedged pool plus a client retry loop wrote one warning per
+  # request during exactly the incident that already stresses disk. The telemetry above is
+  # unthrottled and stays the alertable signal.
   #
   # The bounded CLASS tag only, never `Exception.message/1`: a `Postgrex.Error` /
   # `DBConnection.ConnectionError` message names the backend host, database and role
   # ("tcp connect (host:port): ..."), and this line is reachable from any wedged-pool
   # moment on an ordinary ingest. Same policy as `Loopctl.LocalGuc`'s own failure log.
-  defp fail_open_admitted(tenant_id, error_class) do
-    Logger.warning("ingestion backlog gate failed open for tenant=#{tenant_id} (#{error_class})")
+  defp fail_open_event(tenant_id, error_class, outcome, jobs) do
+    FailOpenLog.warn(
+      :ingest_backlog,
+      "ingest_backlog_fail_open:#{tenant_id}",
+      "backlog unmeasurable (#{error_class}, outcome=#{outcome}, jobs=#{jobs})"
+    )
 
     :telemetry.execute(
       TelemetryEvents.ingestion_backlog_gate_failed_open(),
-      %{count: 1},
-      %{tenant_id: tenant_id, error_class: error_class}
+      %{count: 1, jobs: jobs},
+      %{tenant_id: tenant_id, error_class: error_class, outcome: outcome}
     )
-
-    :ok
   end
 
   # BOUNDED, and every value must be TRUE. The rescue above catches EVERY `Postgrex.Error`,
@@ -374,6 +513,23 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   end
 
   defp fail_open_class(%Postgrex.Error{postgres: %{code: :query_canceled}}), do: "timeout"
+
+  # 08P01 protocol_violation is a driver / query-shape bug that happens to live in the
+  # connection-exception class — not saturation. Metering it would cap an under-threshold
+  # tenant over a fault that is not its backlog, so it is excluded from `db_pressure` BEFORE
+  # the class match below.
+  defp fail_open_class(%Postgrex.Error{postgres: %{pg_code: "08P01"}}), do: "db_error"
+
+  # Resource exhaustion (SQLSTATE class 53, e.g. 53300 too_many_connections), operator
+  # intervention (57, e.g. 57P03 cannot_connect_now) and connection exceptions (08) arrive as
+  # a server ERROR, not a `DBConnection` exit — the NORMAL presentation of pool saturation
+  # behind pgbouncer. They ARE the sustained pressure the meter bounds, so they must not slip
+  # into the unmetered `db_error` bucket (and escape it unconditionally) merely because of the
+  # struct they travel in. Only a genuine query-shape error (42xxx et al) stays `db_error`.
+  defp fail_open_class(%Postgrex.Error{postgres: %{pg_code: <<class::binary-2, _::binary>>}})
+       when class in ~w(53 57 08),
+       do: "db_pressure"
+
   defp fail_open_class(%Postgrex.Error{}), do: "db_error"
 
   # The non-local-exit shapes, already tagged by `Loopctl.ExitTag` at the catch site.
@@ -534,9 +690,6 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   end
 
   # --- Private ---
-
-  # Max batch size for POST /knowledge/ingest/batch
-  @batch_max 50
 
   defp validate_batch_items(items) when is_list(items) and items != [] do
     if length(items) > @batch_max do

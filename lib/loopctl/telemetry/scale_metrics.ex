@@ -516,9 +516,23 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         event_name: [:loopctl, :ingestion, :backlog_gate, :failed_open],
         measurement: :count,
         description:
-          "Ingestion backlog admission gate failed open (unmeasurable backlog count), by error_class and tenant.",
-        tags: [:error_class, :tenant_id],
-        tag_values: &degraded_read_tags/1
+          "Ingestion backlog admission gate could not MEASURE the backlog, sliced by outcome " <>
+            "(admitted / unmetered / exhausted), error_class and tenant.",
+        tags: [:error_class, :outcome, :tenant_id],
+        tag_values: &backlog_gate_tags/1
+      ),
+      # The event is JOB-denominated as well as per-request: one 50-item batch is ONE
+      # increment above but fifty jobs' worth of admission. Without this sum a burst of
+      # large batches and a trickle of single-item ingests look identical on the
+      # dashboard, which is the opposite of what an operator watching a wedged pool needs.
+      sum("loopctl.ingestion.backlog_gate.failed_open.jobs",
+        event_name: [:loopctl, :ingestion, :backlog_gate, :failed_open],
+        measurement: :jobs,
+        description:
+          "Jobs' worth of ingestion admitted or refused while the backlog was unmeasurable, " <>
+            "sliced by outcome, error_class and tenant.",
+        tags: [:error_class, :outcome, :tenant_id],
+        tag_values: &backlog_gate_tags/1
       ),
 
       # 6. Per-pool checkout queue_time (US-33.1): the RLS `Loopctl.Repo` pool (size
@@ -866,6 +880,32 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   def degraded_read_tags(metadata) do
     %{
       error_class: Map.get(metadata, :error_class, "unknown"),
+      tenant_id: gated_tenant_id(metadata)
+    }
+  end
+
+  @doc """
+  `tag_values` for the ingestion backlog-gate counters ONLY.
+
+  Deliberately NOT an extension of `degraded_read_tags/1`: the under-fill probe shares that
+  function and has no `:outcome`, so widening it would add a permanently-`admitted` label to
+  an unrelated series.
+
+  `:outcome` exists because the gate's event now fires on EVERY unmeasurable-count outcome,
+  not just the admitting one. Without the label a REFUSAL increments the same counter as an
+  admission, so the series would over-report admissions during precisely the sustained
+  incident an operator alerts on — the failure the refusal-branch emit was added to prevent,
+  reintroduced one layer up. It defaults to `:admitted` so the pre-existing series keeps its
+  meaning for any emitter that has not been updated.
+
+  Bounded at three values (`:admitted | :unmetered | :exhausted`);
+  `Loopctl.TelemetryEvents.ingestion_backlog_gate_failed_open/0` is the source of truth.
+  """
+  @spec backlog_gate_tags(map()) :: map()
+  def backlog_gate_tags(metadata) do
+    %{
+      error_class: Map.get(metadata, :error_class, "unknown"),
+      outcome: Map.get(metadata, :outcome, :admitted),
       tenant_id: gated_tenant_id(metadata)
     }
   end
