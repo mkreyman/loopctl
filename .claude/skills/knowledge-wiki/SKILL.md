@@ -26,29 +26,29 @@ never pass `tenant_id`/`subject_id`.
 ## Invariants (cited)
 
 1. **Novelty / dedup gate on create** — `Knowledge.propose_article/3` → the private `gate_proposal/4`
-   (`propose_article/3` at `knowledge.ex:453`; the four `gate_proposal/4` clauses at `:463-515`).
+   (`propose_article/3` at `knowledge.ex:456`; the four `gate_proposal/4` clauses at `:466-518`).
    **SIX outcomes, not four** — `:duplicate`, `:low_novelty`, `:unknown`, `:novel`,
    `:deduplicated` (`created: false`, returned when `create_article` hits the idempotency-key path,
-   `knowledge.ex:580-581`), and `:skipped_low_novelty` (`created: false`, `article` may be `nil`).
+   `knowledge.ex:571-573`), and `:skipped_low_novelty` (`created: false`, `article` may be `nil`).
    A caller matching only the first four falls through on either of the last two, both reachable.
    `:duplicate` returns the canonical neighbor without creating; `:low_novelty`
-   is created but **forced to `status: "draft"`** (`:484`) with novelty stamped into
-   `metadata.proposal_novelty` (`stamp_proposal_metadata/2`, `:636-649`) so a smarter consumer decides
+   is created but **forced to `status: "draft"`** (`:492`) with novelty stamped into
+   `metadata.proposal_novelty` (`stamp_proposal_metadata/2`, `:692-705`) so a smarter consumer decides
    — UNLESS the caller passes `on_low_novelty: :skip` (for an UNATTENDED writer whose drafts nothing
    would review), which creates NOTHING and returns `:skipped_low_novelty` with the near-neighbor
-   (`skip_low_novelty/4`, `:512-556`). That skip is decided LAST: an invalid `project_id`, an
+   (`skip_low_novelty/4`, `:538-556`). That skip is decided LAST: an invalid `project_id`, an
    `idempotency_key` match, and an exact active-title collision are all still answered normally
    rather than dropped.
    Two branches that are easy to miss: `:duplicate` **falls through to create** if the canonical
-   neighbor vanished between assess and now (`:465-474`), and `:unknown` creates only BY DEFAULT — a
+   neighbor vanished between assess and now (`:472-480`), and `:unknown` creates only BY DEFAULT — a
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
-   created (`:499-505`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:461-463`)
+   created (`:507-513`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:462-464`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8376`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8407`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
-   (`absolute_score/1`, `:8484-8489`) clears a scale-matched threshold AND beats the best retrieved
-   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8535-8545`; the pure decision is
-   `resolve_provenance/4`, `:8588-8600`) AND is authoritative (not superseded/conflicted — the caller
+   (`absolute_score/1`, `:8534-8539`) clears a scale-matched threshold AND beats the best retrieved
+   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8585-8595`; the pure decision is
+   `resolve_provenance/4`, `:8638-8650`) AND is authoritative (not superseded/conflicted — the caller
    passes only `list_curated_sources/2`-filtered scores). Otherwise `:retrieved`. Both branches return identical `results`/`meta`
    key sets — callers branch on `meta.provenance` alone. A sparse pool must never let a near-but-wrong
    curated doc win.

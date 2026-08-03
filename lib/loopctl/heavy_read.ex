@@ -823,8 +823,11 @@ defmodule Loopctl.HeavyRead do
     # DBConnection/Postgrex EXIT rather than raise when the pool is not started (`:noproc`)
     # or wedged (`{:timeout, {GenServer, :call, _}}`). Without this clause the exit
     # propagates out of `opts/1` and aborts the caller's ANN read — the OPPOSITE of the
-    # documented fail-closed guarantee.
-    :exit, reason -> {:inconclusive, "exit:" <> exit_tag(reason), :pool}
+    # documented fail-closed guarantee. `:throw` is folded in for the same reason
+    # `ScaleMetrics.guarded_measurement/5` folds it in: it is the third non-local exit kind,
+    # and enumerating two of three is how this class of hole keeps reappearing.
+    kind, reason when kind in [:exit, :throw] ->
+      {:inconclusive, "#{kind}:" <> exit_tag(reason), :pool}
   end
 
   @probe_sql "SELECT extversion FROM pg_extension WHERE extname = 'vector'"

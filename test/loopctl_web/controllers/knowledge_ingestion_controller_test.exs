@@ -1067,6 +1067,51 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       refute metadata.error_class =~ "DBConnection"
     end
 
+    test "the fail-open admissions are BOUNDED, not unconditional", %{conn: conn} do
+      # A wedged AdminRepo pool is SUSTAINED, so admitting on every unmeasurable count made
+      # "no backpressure at all" the steady state during exactly the overload the valve
+      # exists to bound. The admissions are now metered: past the per-tenant allowance the
+      # request gets the ordinary backlog 429 instead of enqueuing.
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        exit({:noproc, {DBConnection, :execute, []}})
+      end)
+
+      # The allowance is spent — the limiter, not the (unmeasurable) count, is the decider.
+      # Scoped to the fail-open bucket alone: the auth pipeline shares this limiter, and
+      # denying THAT would 429 the request for an unrelated reason and prove nothing.
+      test_pid = self()
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, limit ->
+        if String.starts_with?(bucket, "ingest_backlog_fail_open:") do
+          send(test_pid, {:fail_open_bucket, bucket})
+          {:deny, limit}
+        else
+          {:allow, 1}
+        end
+      end)
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, 0, fn _t, _c, _o ->
+        flunk("nothing may be enqueued once the fail-open allowance is spent")
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "Beyond the fail-open allowance", source_type: "newsletter"}]
+        })
+
+      assert json_response(conn, 429)["error"]["code"] == "ingestion_backlog_exceeded"
+
+      # Per-TENANT: one flooding tenant spending its allowance must not close the valve on
+      # everyone else.
+      assert_receive {:fail_open_bucket, bucket}
+      assert bucket =~ tenant.id
+    end
+
     test "a NON-timeout SQLSTATE is not reported as a timeout", %{conn: conn} do
       # The rescue catches EVERY `Postgrex.Error`, not only 57014, so a query bug in the
       # count path (a column renamed out from under `FairShare`) also fails open. It must

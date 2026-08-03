@@ -12,6 +12,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   require Logger
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.ExitClass
   alias Loopctl.ExitTag
   alias Loopctl.HeavyRead
   alias Loopctl.Ingestion.ContentEnvelope
@@ -21,6 +22,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Oban.FairShare
   alias Loopctl.ObanConfig
+  alias Loopctl.RateLimiter
   alias Loopctl.TelemetryEvents
   alias Loopctl.Workers.ContentIngestionWorker
 
@@ -36,6 +38,12 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # `operation/2` specs, so the published OpenAPI `maxLength` and the enforcing
   # `validate_content_length/1` read the SAME number and cannot drift.
   @max_inline_content_bytes 1_000_000
+
+  # Ceiling on FAIL-OPEN admissions per tenant per window (see `backlog_fail_open_verdict/1`).
+  # Deliberately a constant, not an env var: it is a safety bound on a degraded mode, not a
+  # capacity knob, and `OBAN_INGEST_BACKLOG_MAX` (default 500) remains the tunable one.
+  @fail_open_admissions_per_window 30
+  @fail_open_window_ms 60_000
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.ProjectId
 
@@ -289,10 +297,38 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   defp check_ingestion_backlog(tenant_id) do
     max = ObanConfig.ingest_backlog_max()
 
-    if in_flight_ingestion_backlog(tenant_id) >= max do
-      {:error, :ingestion_backlog_exceeded, backlog_retry_after_seconds()}
-    else
+    case in_flight_ingestion_backlog(tenant_id) do
+      :unmeasurable ->
+        backlog_fail_open_verdict(tenant_id)
+
+      count when count >= max ->
+        {:error, :ingestion_backlog_exceeded, backlog_retry_after_seconds()}
+
+      _count ->
+        :ok
+    end
+  end
+
+  # Fail open, but BOUNDED. Admitting on an unmeasurable count is right for the transient
+  # blip it was written for; the trouble is that the dominant fault here — a saturated or
+  # wedged AdminRepo pool (3 connections, `config/runtime.exs`) — is SUSTAINED, so an
+  # unconditional admit makes "no backpressure at all" the steady state during exactly the
+  # overload the valve exists to bound. (Before the exit shape was caught at all, the 500 at
+  # least shed the flood incidentally.) So the fail-open ADMISSIONS are themselves metered:
+  # `@fail_open_admissions_per_window` per tenant per `@fail_open_window_ms` pass, and the
+  # rest get the ordinary backlog 429 with its Retry-After — no new status code, no new error
+  # code. The allowance sits far below `OBAN_INGEST_BACKLOG_MAX` (default 500), so a real blip
+  # costs a legitimate client nothing. `within_limit?/3` is the fail-OPEN limiter helper, so a
+  # limiter fault cannot invert this into a fail-CLOSED gate.
+  defp backlog_fail_open_verdict(tenant_id) do
+    if RateLimiter.within_limit?(
+         "ingest_backlog_fail_open:#{tenant_id}",
+         @fail_open_window_ms,
+         @fail_open_admissions_per_window
+       ) do
       :ok
+    else
+      {:error, :ingestion_backlog_exceeded, backlog_retry_after_seconds()}
     end
   end
 
@@ -350,7 +386,10 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
       %{tenant_id: tenant_id, error_class: error_class}
     )
 
-    0
+    # NOT `0` ("an empty backlog"), which admitted unconditionally and forever. The count is
+    # UNMEASURABLE, and `backlog_fail_open_verdict/1` decides how many such admissions a
+    # tenant gets before the valve closes again.
+    :unmeasurable
   end
 
   # BOUNDED, and every value must be TRUE. The rescue above catches EVERY `Postgrex.Error`,
@@ -364,12 +403,14 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   defp fail_open_class(%Postgrex.Error{postgres: %{code: :query_canceled}}), do: "timeout"
   defp fail_open_class(%Postgrex.Error{}), do: "db_error"
 
-  # The non-local-exit shapes, already classified by `Loopctl.ExitTag` at the catch site.
+  # The non-local-exit shapes, already tagged by `Loopctl.ExitTag` at the catch site.
   # Prefixed by KIND so a triaging operator can tell a dead pool (`exit:noproc`) from a
-  # throw escaping the counter, and still BOUNDED — `ExitTag` yields an atom or an
-  # exception module name, never a message carrying host, database, role or query args.
+  # throw escaping the counter, and closed by `ExitClass` so the value set stays ENUMERABLE:
+  # this string is a Prometheus label multiplied by `tenant_id`, and `ExitTag` names any exit
+  # atom or exception MODULE — bounded away from the raw reason (host, database, role, query
+  # args) but not bounded as a label.
   defp fail_open_class({kind, tag}) when kind in [:exit, :throw] and is_binary(tag),
-    do: "#{kind}:#{tag}"
+    do: ExitClass.bounded(kind, tag)
 
   defp backlog_counter do
     Application.get_env(:loopctl, :ingestion_backlog_counter, FairShare)

@@ -16,7 +16,6 @@ defmodule Loopctl.Knowledge.UnderFillProbeDegradedTest do
 
   import ExUnit.CaptureLog
 
-  alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.LocalGuc
   alias Loopctl.TelemetryEvents
@@ -83,26 +82,47 @@ defmodule Loopctl.Knowledge.UnderFillProbeDegradedTest do
     assert_receive {:probe_degraded, %{count: 1}, %{error_class: "timeout"}}
   end
 
-  test "a pool EXIT degrades under a kind-prefixed, bounded class" do
-    # The probe's two rescue clauses cover only the RAISE shape. A DBConnection checkout
-    # against a wedged or unstarted pool EXITS, escaping them entirely and destroying an
-    # ALREADY-COMPUTED suggestions response — turning a diagnostic read into a failed
-    # request, which is the trade the `DBConnection.ConnectionError` clause exists to
-    # prevent. `Loopctl.ExitTag` classifies the reason; the kind prefix keeps a dead pool
-    # distinguishable from a throw.
+  # Drives the REAL `under_fill_probe/7` — its `catch`, not just the classifier it feeds —
+  # through the `:probe_read` closure seam (default `HeavyRead.one/3`), because a wedged pool
+  # cannot be conjured in a sandboxed async test. Without it, deleting the catch left green.
+  defp probe(tenant_id, read) do
+    embedding = List.duplicate(0.0, 1536)
+
+    Knowledge.under_fill_probe(tenant_id, Ecto.UUID.generate(), embedding, 0.5, nil, 10,
+      probe_read: read
+    )
+  end
+
+  test "an EXIT escaping the probe's read degrades, under a CLOSED label set" do
+    tenant_id = Ecto.UUID.generate()
+    attach_degraded(tenant_id)
+
+    # The REAL shape DBConnection exits with when the pool is gone — `{reason, call}`.
+    assert :error =
+             probe(tenant_id, fn _t, _q, _o -> exit({:noproc, {DBConnection, :execute, []}}) end)
+
+    assert_receive {:probe_degraded, %{count: 1}, %{error_class: "exit:noproc"}}
+
+    # `error_class` is a Prometheus label multiplied by `tenant_id`, and `ExitTag` alone names
+    # ANY exit atom or exception MODULE, so an unrecognised reason must collapse.
+    assert :error = probe(tenant_id, fn _t, _q, _o -> exit(:some_novel_reason) end)
+    assert_receive {:probe_degraded, %{count: 1}, %{error_class: "exit:other"}}
+  end
+
+  test "a tenant-gate shed is TAGGED and degraded, never raised past the guards" do
+    # `HeavyRead.one/3` defaults to `on_overload: :raise`, and `OverloadedError` is named by
+    # neither rescue clause nor the `:exit`/`:throw` catch — so it escaped at exactly the load
+    # the gate exists for, 429ing a response already in hand.
     tenant_id = Ecto.UUID.generate()
     attach_degraded(tenant_id)
 
     assert :error =
-             Knowledge.under_fill_probe_degraded(
-               tenant_id,
-               {:exit, ExitTag.tag({:noproc, {DBConnection, :execute, []}})}
-             )
+             probe(tenant_id, fn _t, _q, opts ->
+               assert Keyword.fetch!(opts, :on_overload) == :tag
+               {:error, :heavy_read_overloaded}
+             end)
 
-    assert_receive {:probe_degraded, %{count: 1}, metadata}
-    assert metadata.error_class == "exit:noproc"
-    # Bounded: never the raw reason, which carries the DBConnection call tuple.
-    refute metadata.error_class =~ "DBConnection"
+    assert_receive {:probe_degraded, %{count: 1}, %{error_class: "overloaded"}}
   end
 
   test "the log carries the class tag, never the backend host from the exception message" do

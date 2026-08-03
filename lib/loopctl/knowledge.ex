@@ -52,6 +52,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Egress.Policy, as: EgressPolicy
   alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Embeddings
+  alias Loopctl.ExitClass
   alias Loopctl.ExitTag
   alias Loopctl.HeavyRead
   alias Loopctl.KeysetSeek
@@ -5115,7 +5116,14 @@ defmodule Loopctl.Knowledge do
   # / body data. Returns `:error` (NOT raising) on a DB connectivity / timeout fault so the
   # caller can fail-soft — a genuine query bug still surfaces (we re-raise non-cancel
   # Postgrex errors).
-  defp under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool, opts) do
+  #
+  # Public-but-`@doc false` (same precedent as `under_fill_probe_degraded/2` below) and the
+  # read is taken from `opts[:probe_read]` — a CLOSURE seam, defaulting to `HeavyRead.one/3`
+  # — so a test can drive a real pool EXIT through THIS function and the `catch` below is
+  # verified where it lives, instead of only its classifier being asserted from a hand-built
+  # tuple (an inert guard passes that test either way).
+  @doc false
+  def under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool, opts) do
     candidates = suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool, opts)
 
     probe =
@@ -5127,9 +5135,17 @@ defmodule Loopctl.Knowledge do
         }
       )
 
-    case HeavyRead.one(tenant_id, probe, suggested_links_read_opts(pool, opts)) do
-      %{ann_candidates: a, above_threshold: t} -> {a || 0, t || 0}
-      nil -> {0, 0}
+    read = Keyword.get(opts, :probe_read, &HeavyRead.one/3)
+
+    case read.(tenant_id, probe, probe_read_opts(pool, opts)) do
+      %{ann_candidates: a, above_threshold: t} ->
+        {a || 0, t || 0}
+
+      nil ->
+        {0, 0}
+
+      {:error, :heavy_read_overloaded} ->
+        under_fill_probe_degraded(tenant_id, :heavy_read_overloaded)
     end
   rescue
     e in DBConnection.ConnectionError ->
@@ -5196,11 +5212,26 @@ defmodule Loopctl.Knowledge do
   # Only reachable for 57014 — the caller re-raises every other SQLSTATE.
   defp probe_error_class(%Postgrex.Error{}), do: "timeout"
 
+  # The per-tenant heavy-read gate SHEDDING this advisory read (`on_overload: :tag`, see
+  # `probe_read_opts/2`) — its own class, because "the tenant is at its in-flight cap" is a
+  # different operator action from a pool fault.
+  defp probe_error_class(:heavy_read_overloaded), do: "overloaded"
+
   # The non-local-exit shapes, classified by `Loopctl.ExitTag` at the catch site and prefixed
   # by KIND so a dead pool (`exit:noproc`) is distinguishable from a throw escaping the probe.
-  # Bounded: an atom or an exception MODULE name, never a message naming host/database/role.
+  # `ExitClass` closes the tag set: this is a Prometheus label multiplied by `tenant_id`, and
+  # `ExitTag` names ANY exit atom or exception MODULE, which is a log answer, not a label one.
   defp probe_error_class({kind, tag}) when kind in [:exit, :throw] and is_binary(tag),
-    do: "#{kind}:#{tag}"
+    do: ExitClass.bounded(kind, tag)
+
+  # The probe's read opts: the suggested-links opts plus `on_overload: :tag`. The API default
+  # (`:raise`) turns a `TenantGate` shed into `Loopctl.HeavyRead.OverloadedError` — an
+  # `:error`-kind raise named by neither `rescue` clause above nor the `:exit`/`:throw`
+  # `catch` — so at exactly the load the gate exists for it escaped and sank an
+  # ALREADY-COMPUTED 200 into a 429, the AREA-5 trade `maybe_signal_under_fill/8` forbids.
+  defp probe_read_opts(pool, opts) do
+    Keyword.put(suggested_links_read_opts(pool, opts), :on_overload, :tag)
+  end
 
   @doc false
   # Per-read options for a heavy endpoint (US-27.4). Delegates to the single source of
