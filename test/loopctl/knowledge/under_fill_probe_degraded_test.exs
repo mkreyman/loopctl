@@ -16,6 +16,7 @@ defmodule Loopctl.Knowledge.UnderFillProbeDegradedTest do
 
   import ExUnit.CaptureLog
 
+  alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.LocalGuc
   alias Loopctl.TelemetryEvents
@@ -80,6 +81,28 @@ defmodule Loopctl.Knowledge.UnderFillProbeDegradedTest do
 
     assert :error = Knowledge.under_fill_probe_degraded(tenant_id, cancel)
     assert_receive {:probe_degraded, %{count: 1}, %{error_class: "timeout"}}
+  end
+
+  test "a pool EXIT degrades under a kind-prefixed, bounded class" do
+    # The probe's two rescue clauses cover only the RAISE shape. A DBConnection checkout
+    # against a wedged or unstarted pool EXITS, escaping them entirely and destroying an
+    # ALREADY-COMPUTED suggestions response — turning a diagnostic read into a failed
+    # request, which is the trade the `DBConnection.ConnectionError` clause exists to
+    # prevent. `Loopctl.ExitTag` classifies the reason; the kind prefix keeps a dead pool
+    # distinguishable from a throw.
+    tenant_id = Ecto.UUID.generate()
+    attach_degraded(tenant_id)
+
+    assert :error =
+             Knowledge.under_fill_probe_degraded(
+               tenant_id,
+               {:exit, ExitTag.tag({:noproc, {DBConnection, :execute, []}})}
+             )
+
+    assert_receive {:probe_degraded, %{count: 1}, metadata}
+    assert metadata.error_class == "exit:noproc"
+    # Bounded: never the raw reason, which carries the DBConnection call tuple.
+    refute metadata.error_class =~ "DBConnection"
   end
 
   test "the log carries the class tag, never the backend host from the exception message" do

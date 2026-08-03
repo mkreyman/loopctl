@@ -1033,6 +1033,40 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert metadata.error_class == "guc_capture_abort"
     end
 
+    test "a pool EXIT fails open too, instead of 500ing the ingest", %{conn: conn} do
+      # The gate rescued only the RAISE shape, but a DBConnection checkout against a wedged,
+      # saturated or unstarted pool EXITS. So the single failure this gate exists for — an
+      # unmeasurable count — walked past the rescue and 500'd an ordinary ingest, which is
+      # the exact opposite of failing open. The exit shape is the MORE likely one under real
+      # pool pressure, so this was the common case, not the exotic one.
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      attach_failed_open(tenant.id)
+
+      # The REAL shape DBConnection exits with when the pool is gone — a `{reason, call}`
+      # tuple, never a bare atom. A tagger with only an atom clause would pass against
+      # `exit(:noproc)` while degrading every production exit to a catch-all.
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        exit({:noproc, {DBConnection, :execute, []}})
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "Pool exit item", source_type: "newsletter"}]
+        })
+
+      assert length(json_response(conn, 200)["data"]) == 1
+
+      # Kind-prefixed and BOUNDED: an operator can tell a dead pool from a throw, and the
+      # tag can never carry the DBConnection call tuple (host, database, role, query args).
+      assert_receive {:backlog_failed_open, %{count: 1}, metadata}
+      assert metadata.error_class == "exit:noproc"
+      refute metadata.error_class =~ "DBConnection"
+    end
+
     test "a NON-timeout SQLSTATE is not reported as a timeout", %{conn: conn} do
       # The rescue catches EVERY `Postgrex.Error`, not only 57014, so a query bug in the
       # count path (a column renamed out from under `FairShare`) also fails open. It must

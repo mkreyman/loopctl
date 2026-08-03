@@ -61,8 +61,8 @@ reads through `Loopctl.HeavyRead` (`lib/loopctl/heavy_read.ex`), which owns the 
    `subject_id` equality on the outermost query (private `guard_memory!/3`, `heavy_read.ex:1277-1300`), because `subject_id`
    scoping is application-level only. Always go through `Loopctl.HeavyRead`, never `HeavyReadRepo`
    directly; on `AdminRepo` there is no guard at all, so the predicate is on you.
-7. **Heavy reads can be SHED — handle `{:error, :heavy_read_overloaded}`.** `all/3` (`heavy_read.ex:960`),
-   `one/3` (`heavy_read.ex:980`) and `all_memory/4` (`heavy_read.ex:1016`) are specced to return it: the
+7. **Heavy reads can be SHED — handle `{:error, :heavy_read_overloaded}`.** `all/3` (`heavy_read.ex:965`),
+   `one/3` (`heavy_read.ex:985`) and `all_memory/4` (`heavy_read.ex:1021`) are specced to return it: the
    per-tenant cost-weighted in-flight gate (`gated/4`, `heavy_read.ex:1045-1065`) sheds over the cap —
    `on_overload: :raise` (default) raises → 429, `on_overload: :tag` returns the tuple. Binding the
    result as a list crashes exactly under the load the gate exists for.
@@ -75,7 +75,7 @@ reads through `Loopctl.HeavyRead` (`lib/loopctl/heavy_read.ex`), which owns the 
 ## The pgbouncer gotcha (US-27.13 — production outage, do not regress)
 
 `HeavyReadRepo` enforces a server-side `statement_timeout` **per-read via `SET LOCAL` inside the
-transaction** (`all/3` at `heavy_read.ex:960` and `one/3` at `:980`, both via
+transaction** (`all/3` at `heavy_read.ex:965` and `one/3` at `:985`, both via
 `with_statement_timeout/5` at `:1081`;
 `heavy_read_repo.ex:19-32`) — NOT as a connection startup
 `:parameters` value. Fly MPG fronts Postgres with **pgbouncer**, which rejects a `statement_timeout`

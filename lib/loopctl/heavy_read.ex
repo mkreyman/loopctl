@@ -56,6 +56,7 @@ defmodule Loopctl.HeavyRead do
 
   require Logger
 
+  alias Loopctl.ExitTag
   alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.LocalGuc
 
@@ -893,10 +894,14 @@ defmodule Loopctl.HeavyRead do
   defp probe_failure_tag({:error, reason}) when is_atom(reason), do: "query_error:#{reason}"
   defp probe_failure_tag(_other), do: "unexpected_result"
 
-  defp exit_tag({:timeout, _}), do: "timeout"
-  defp exit_tag(:noproc), do: "noproc"
-  defp exit_tag(reason) when is_atom(reason), do: to_string(reason)
-  defp exit_tag(_reason), do: "other"
+  # The LAST private copy of the exit tagger, now delegating to the shared
+  # `Loopctl.ExitTag`. The four clauses this replaces produced the same string for every
+  # shape they actually named (`{:timeout, _}`, `:noproc`, any atom); they differed only in
+  # lacking the crash-PROPAGATION clause — a pooled process that died of an exception rather
+  # than being absent, which they degraded to the catch-all. The catch-all string moves
+  # `"other"` -> `"unknown"`; nothing asserts either, and this tag reaches only the cached
+  # inconclusive-reason string, never a metric label.
+  defp exit_tag(reason), do: ExitTag.tag(reason)
 
   @doc """
   Compare a `"MAJOR.MINOR[.PATCH]"` pgvector extversion against a `{maj, min, patch}` floor.

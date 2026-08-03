@@ -52,6 +52,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Egress.Policy, as: EgressPolicy
   alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Embeddings
+  alias Loopctl.ExitTag
   alias Loopctl.HeavyRead
   alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge.Analytics
@@ -5149,6 +5150,18 @@ defmodule Loopctl.Knowledge do
       else
         reraise(e, __STACKTRACE__)
       end
+  catch
+    # Both clauses above cover only the RAISE shape. A DBConnection checkout against a wedged
+    # or unstarted pool EXITS, so it escaped the rescue entirely and destroyed an
+    # ALREADY-COMPUTED suggestions response — turning a diagnostic read into a failed request,
+    # the exact trade the AREA-5 fail-soft contract at `maybe_signal_under_fill/8` forbids and
+    # that the `DBConnection.ConnectionError` clause above was written to prevent.
+    #
+    # Unlike the Postgrex clause there is no re-raise branch here: an exit carries no SQLSTATE
+    # to tell a genuine query bug from a pool fault, and this probe runs after the response is
+    # in hand, so degrading is the only answer that keeps the contract.
+    kind, reason when kind in [:exit, :throw] ->
+      under_fill_probe_degraded(tenant_id, {kind, ExitTag.tag(reason)})
   end
 
   @doc false
@@ -5182,6 +5195,12 @@ defmodule Loopctl.Knowledge do
 
   # Only reachable for 57014 — the caller re-raises every other SQLSTATE.
   defp probe_error_class(%Postgrex.Error{}), do: "timeout"
+
+  # The non-local-exit shapes, classified by `Loopctl.ExitTag` at the catch site and prefixed
+  # by KIND so a dead pool (`exit:noproc`) is distinguishable from a throw escaping the probe.
+  # Bounded: an atom or an exception MODULE name, never a message naming host/database/role.
+  defp probe_error_class({kind, tag}) when kind in [:exit, :throw] and is_binary(tag),
+    do: "#{kind}:#{tag}"
 
   @doc false
   # Per-read options for a heavy endpoint (US-27.4). Delegates to the single source of

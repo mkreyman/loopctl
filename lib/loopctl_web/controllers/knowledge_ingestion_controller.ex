@@ -12,6 +12,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   require Logger
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.ExitTag
   alias Loopctl.HeavyRead
   alias Loopctl.Ingestion.ContentEnvelope
   alias Loopctl.Knowledge.ContentChunker
@@ -323,6 +324,15 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     # `Loopctl.LocalGuc.capture_abort?/1`.
     e in [DBConnection.ConnectionError, Postgrex.Error] ->
       fail_open(tenant_id, e)
+  catch
+    # The rescue above covers only the RAISE shape, and a DBConnection checkout against a
+    # wedged, saturated or unstarted pool EXITS instead. So the one failure this gate exists
+    # for — "the count path is momentarily degraded" — walked straight past it and 500'd an
+    # ordinary ingest, which is the opposite of failing open. `:throw` is folded in for the
+    # same reason `ScaleMetrics.guarded_measurement/5` folds it in: it is the third non-local
+    # exit kind, and enumerating two of three is how this class of hole keeps reappearing.
+    kind, reason when kind in [:exit, :throw] ->
+      fail_open(tenant_id, {kind, ExitTag.tag(reason)})
   end
 
   defp fail_open(tenant_id, e) do
@@ -353,6 +363,13 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
 
   defp fail_open_class(%Postgrex.Error{postgres: %{code: :query_canceled}}), do: "timeout"
   defp fail_open_class(%Postgrex.Error{}), do: "db_error"
+
+  # The non-local-exit shapes, already classified by `Loopctl.ExitTag` at the catch site.
+  # Prefixed by KIND so a triaging operator can tell a dead pool (`exit:noproc`) from a
+  # throw escaping the counter, and still BOUNDED — `ExitTag` yields an atom or an
+  # exception module name, never a message carrying host, database, role or query args.
+  defp fail_open_class({kind, tag}) when kind in [:exit, :throw] and is_binary(tag),
+    do: "#{kind}:#{tag}"
 
   defp backlog_counter do
     Application.get_env(:loopctl, :ingestion_backlog_counter, FairShare)
