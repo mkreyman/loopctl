@@ -237,7 +237,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
         "Max 50 items per batch. Role: orchestrator+.\n\n" <>
         "**Backpressure (429):** before enqueuing anything, the endpoint checks the " <>
         "calling tenant's in-flight `:ingestion` backlog. If it is at/over the " <>
-        "`OBAN_INGEST_BACKLOG_MAX` threshold, the WHOLE request is rejected " <>
+        "`OBAN_INGEST_BACKLOG_MAX` threshold — or could not be MEASURED and the bounded " <>
+        "fail-open allowance for that fault is spent — the WHOLE request is rejected " <>
         "all-or-nothing with 429 + `Retry-After` and `error.code: " <>
         "\"ingestion_backlog_exceeded\"` — zero jobs are enqueued. This is distinct " <>
         "from the generic Hammer request-rate 429 (which has no `error.code`).",
@@ -378,35 +379,33 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   defp metered_fail_open?("guc_capture_abort"), do: true
   defp metered_fail_open?("exit:" <> _tag), do: true
 
-  # #558: a THROW is NOT metered, and deliberately not symmetric with `exit:`. An exit here
-  # means the pool process was absent or wedged — sustained, and exactly what the allowance
-  # exists to bound. A throw is a DETERMINISTIC fault in the counting code: it recurs on every
-  # request, at the same rate, no matter how much capacity the pool has. Metering it therefore
-  # drains the tenant's per-window allowance and then 429s an under-threshold tenant with a
-  # backlog error code, over a fault that is not its backlog and that waiting will not clear.
-  #
-  # It still ADMITS (the count is genuinely unmeasurable, and this gate must never block work
-  # over its own defect) and still emits the counter, so the fault stays alertable rather than
-  # silent — it just does not consume the budget reserved for real pool pressure. Same
-  # reasoning as `db_error` below.
-  defp metered_fail_open?("throw:" <> _tag), do: false
+  # A THROW is metered, SYMMETRIC with `exit:`. Un-metering it on the premise that a throw is
+  # always a deterministic counting-code defect restored, for that class, precisely the
+  # unbounded fail-open this allowance exists to close: an admit with no bound, forever. The
+  # premise does not hold either — Ecto/DBConnection re-raise a throw out of a transaction
+  # fun, so a throw is not structurally capacity-independent. And when the count is
+  # unmeasurable the server does not know the tenant IS under threshold, which is the whole
+  # reason admissions are bounded rather than free. The counter (`fail_open_event/4`) is what
+  # keeps a deterministic defect alertable; the allowance is not the alerting mechanism.
+  defp metered_fail_open?("throw:" <> _tag), do: true
   defp metered_fail_open?(_class), do: false
 
   # ONE token per SUBMITTED ITEM (an upper bound on the jobs this request would enqueue),
-  # halting on the first REFUSAL so a doomed request does not queue up to @batch_max more
-  # checkouts onto an already-starved pool. Tokens charged before the halt are not refunded
+  # halting on the first NON-ADMIT — a refusal OR an unconsultable meter — so a doomed request
+  # does not queue up to @batch_max more checkouts onto an already-starved pool. Halting on
+  # `:unmetered` too is load-bearing: an unconsultable meter recurs for the rest of the
+  # request, so continuing meant up to @batch_max sequential doomed checkouts on the web
+  # request process during exactly the wedge this gate bounds. Tokens charged before the halt
+  # are not refunded
   # (the limiter has no reservation), which is why `fail_open_jobs_per_window/0` is floored
   # at one full batch: an allowance smaller than a batch would be converted into nothing.
   #
   # TRI-STATE, because a limiter FAULT is not a spent allowance and neither
   # `RateLimiter.within_limit?/3` (fail-OPEN) nor `gate_ok?/3` (fail-CLOSED) can tell them
-  # apart. That distinction is load-bearing here: under `RATE_LIMITER=postgres` the limiter
-  # store IS `AdminRepo`, the same pool whose exhaustion produced this unmeasurable count, so
-  # the two faults are perfectly correlated. Fail-CLOSED 429s an innocent tenant on the FIRST
-  # transient blip with a backlog code it has not earned — the very thing this gate exists to
-  # prevent — while fail-OPEN goes silently inert in the wedge it bounds. So an unconsultable
-  # meter ADMITS (availability wins on a capacity gate) and reports `:unmetered`, which keeps
-  # "the valve is admitting because its METER is unreachable" alertable rather than silent.
+  # apart. An unconsultable meter ADMITS (availability wins on a capacity gate) and reports
+  # `:unmetered`, which keeps "the valve is admitting because its METER is unreachable"
+  # alertable rather than silent; fail-CLOSED would 429 an innocent tenant on the FIRST
+  # transient blip with a backlog code it has not earned.
   defp consume_fail_open_allowance(tenant_id, jobs) do
     bucket = "ingest_backlog_fail_open:#{tenant_id}"
     limit = fail_open_jobs_per_window()
@@ -414,16 +413,30 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     Enum.reduce_while(1..jobs//1, :admitted, fn _item, outcome ->
       case allowance_token(bucket, limit) do
         :exhausted -> {:halt, :exhausted}
-        :unmetered -> {:cont, :unmetered}
+        :unmetered -> {:halt, :unmetered}
         :admitted -> {:cont, outcome}
       end
     end)
   end
 
+  # The METER must not share a FAILURE DOMAIN with the count it bounds. `RateLimiter.impl/0`
+  # is honoured except for one case: under `RATE_LIMITER=postgres` the limiter store IS
+  # `AdminRepo` — the same 3-connection pool whose exhaustion produced the unmeasurable count —
+  # so every token would be unconsultable for exactly the fault the allowance exists to bound,
+  # and the bound would go inert in the sustained wedge instead of closing the valve. This
+  # bucket therefore pins to the node-local ETS limiter there, which is already the unit
+  # `fail_open_jobs_per_window/0` derives for (@fail_open_fleet_nodes) — not a compromise.
+  defp fail_open_meter do
+    case RateLimiter.impl() do
+      RateLimiter.Postgres -> RateLimiter.default_impl()
+      impl -> impl
+    end
+  end
+
   # `{:allow, 0}` is the Postgres impl's own fail-open sentinel and `{:error, _}` is a Hammer
   # soft-error: both mean UNCONSULTABLE, never "denied". Raise/exit/throw likewise.
   defp allowance_token(bucket, limit) do
-    case RateLimiter.impl().check_rate(bucket, @fail_open_window_ms, limit) do
+    case fail_open_meter().check_rate(bucket, @fail_open_window_ms, limit) do
       {:allow, count} when is_integer(count) and count > 0 -> :admitted
       {:deny, _limit} -> :exhausted
       _other -> :unmetered
@@ -542,7 +555,15 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
        when class in ~w(53 57 08),
        do: "db_pressure"
 
-  defp fail_open_class(%Postgrex.Error{}), do: "db_error"
+  # UNMETERED `db_error` is restricted to an error that actually carries a server SQLSTATE —
+  # i.e. a query-shape bug, which is not backlog pressure. A `Postgrex.Error` with NO
+  # `postgres` map is a CLIENT-side driver fault (protocol/decode failure on a degrading
+  # connection), which is pool pressure; letting it fall into the catch-all admitted it
+  # unconditionally and forever, charging nothing.
+  defp fail_open_class(%Postgrex.Error{postgres: %{pg_code: pg_code}}) when is_binary(pg_code),
+    do: "db_error"
+
+  defp fail_open_class(%Postgrex.Error{}), do: "db_pressure"
 
   # The non-local-exit shapes, already tagged by `Loopctl.ExitTag` at the catch site.
   # Prefixed by KIND so a triaging operator can tell a dead pool (`exit:noproc`) from a

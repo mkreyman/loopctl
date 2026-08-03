@@ -47,13 +47,14 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstop do
       the query, so any subsequent crash log is leak-free while the pinned
       504/503/500 status is preserved.
 
-  It wraps the router so it sees the dispatched `conn` (controller/action/assigns
-  populated) carried on the `Plug.Conn.WrapperError`. Non-DB exceptions are
-  re-raised untouched (let-it-crash) — this plug only translates recognized DB
-  error classes.
-  """
+  Both hold for a DB fault that arrives as an EXIT (crash PROPAGATION from a
+  pooled process) rather than a raise — see `handle_exit/4`.
 
-  require Logger
+  It wraps the router so it sees the dispatched `conn` (controller/action/assigns
+  populated) carried on the `Plug.Conn.WrapperError`. Non-DB exceptions, and exits
+  this plug cannot place in the DB pool, are re-raised/re-exited untouched
+  (let-it-crash) — this plug only translates recognized DB error classes.
+  """
 
   alias Loopctl.ExitClass
   alias LoopctlWeb.{DBError, DBErrorLogger, SanitizedDBError}
@@ -71,25 +72,41 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstop do
     wrapper in WrapperError ->
       handle(wrapper.conn || conn, wrapper.reason, wrapper, __STACKTRACE__)
   catch
-    # #558: a rescue sees only the RAISE shape. Crash PROPAGATION from a pooled process —
-    # `exit({{%Postgrex.Error{}, stacktrace}, {DBConnection, :execute, args}})` — is an EXIT,
-    # so it walked past this backstop entirely and reached the crash log RAW: the Postgrex
-    # struct carries the failing statement, and `args` carries its bound parameters, which on
-    # this app's read paths means query text and vector literals.
-    #
-    # This does NOT translate the response. The backstop's contract is that a DB exception
-    # gets a pinned status, and an exit is not something we can turn into one here without
-    # guessing at the request's state. It logs the BOUNDED class so the fault is attributable,
-    # then re-exits unchanged so supervision and the crash report behave exactly as before.
-    # The only thing that changes is that the raw reason stops being the first record of it.
     kind, reason when kind in [:exit, :throw] ->
-      Logger.error(
-        "DBErrorBackstop: request #{kind} (#{ExitClass.classify(kind, reason)}) " <>
-          "on #{conn.method} #{conn.request_path}"
-      )
-
-      :erlang.raise(kind, reason, __STACKTRACE__)
+      handle_exit(conn, kind, reason, __STACKTRACE__)
   end
+
+  # #558: a rescue sees only the RAISE shape, so crash PROPAGATION from a pooled process —
+  # `exit({{%Postgrex.Error{}, stack}, {DBConnection, :execute, args}})` — walked past this
+  # backstop into the crash log RAW (the struct carries the failing statement, `args` its
+  # bound parameters: query text and vector literals on this app's read paths).
+  #
+  # A DEMONSTRABLE pool exit (`ExitClass.pool_exit?/1`) is not a status we must guess at — it
+  # is the same DB fault the raise path maps — so it takes the same route: structured SQLSTATE
+  # line, `[:loopctl, :db, :error]` counter, pinned 504/503/500, sanitized reason. Re-exiting
+  # it unchanged left the leak open AND under-counted DB faults during exactly the wedge that
+  # counter is read in. Anything else is FOREIGN: re-exited untouched and NOT logged here (the
+  # crash report already records it, and a per-request line would spam a wedge while pointing
+  # a triaging operator at the database for someone else's `{:timeout, {GenServer, :call, _}}`).
+  @spec handle_exit(Plug.Conn.t(), :exit | :throw, term(), Exception.stacktrace()) :: no_return()
+  defp handle_exit(conn, kind, reason, stack) do
+    if kind == :exit and ExitClass.pool_exit?(reason) do
+      sanitize(conn, pool_exception(reason, kind), stack)
+    end
+
+    :erlang.raise(kind, reason, stack)
+  end
+
+  # The mappable DB exception a pool exit carries. The crash-PROPAGATION shape nests the
+  # original; a bare pool exit (`{:noproc, {DBConnection, :execute, _}}`) carries none and IS
+  # connection unavailability, described by its BOUNDED class — never the raw reason, which is
+  # the thing holding the bound parameters.
+  defp pool_exception({{%struct{} = exception, _stack}, _call}, _kind)
+       when struct in [Postgrex.Error, DBConnection.ConnectionError],
+       do: exception
+
+  defp pool_exception(reason, kind),
+    do: %DBConnection.ConnectionError{message: "pool #{ExitClass.classify(kind, reason)}"}
 
   # Config-based DI (CLAUDE.md convention) so a test can inject a router that
   # raises a DB exception uncaught, exercising the backstop's catch/log/sanitize
@@ -104,6 +121,16 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstop do
   @spec handle(Plug.Conn.t(), term(), Exception.t(), Exception.stacktrace()) :: no_return()
   defp handle(conn, %struct{} = reason, wrapper, stack)
        when struct in [Postgrex.Error, DBConnection.ConnectionError] do
+    sanitize(conn, reason, stack)
+    reraise(wrapper, stack)
+  end
+
+  defp handle(_conn, _reason, wrapper, stack), do: reraise(wrapper, stack)
+
+  # Log the structured SQLSTATE line and re-raise the scrubbed stand-in — shared by the raise
+  # and pool-EXIT paths. Returns `:unmapped` (without raising) for an unrecognized error.
+  @spec sanitize(Plug.Conn.t(), term(), Exception.stacktrace()) :: :unmapped | no_return()
+  defp sanitize(conn, reason, stack) do
     case DBError.map(reason) do
       {:ok, mapping} ->
         DBErrorLogger.log(conn, reason, mapping)
@@ -120,9 +147,7 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstop do
         WrapperError.reraise(conn, :error, sanitized, stack)
 
       :unmapped ->
-        reraise(wrapper, stack)
+        :unmapped
     end
   end
-
-  defp handle(_conn, _reason, wrapper, stack), do: reraise(wrapper, stack)
 end

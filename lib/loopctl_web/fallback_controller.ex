@@ -23,8 +23,9 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :unresolvable_dispatch_lineage}` -> 409 (a dispatch the story references — implementer, or verifier on verify — could not be resolved; custody gate failed closed on an integrity error, tenant NOT halted)
   - `{:error, :rate_limited}` -> 429 with retry_after_seconds from header
   - `{:error, :ingestion_backlog_exceeded, retry_after}` -> 429 with `Retry-After` header and
-    a machine-readable `code: "ingestion_backlog_exceeded"` (US-36.3 batch-ingest backpressure —
-    distinct from the generic Hammer request-rate 429, which has no `code`)
+    a machine-readable `code: "ingestion_backlog_exceeded"` (US-36.3 ingest backpressure —
+    the backlog is at/over threshold OR it could not be measured and the bounded fail-open
+    allowance is spent; distinct from the generic Hammer request-rate 429, which has no `code`)
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message
   - `{:error, :unprocessable_entity, message}` -> 422 with custom message

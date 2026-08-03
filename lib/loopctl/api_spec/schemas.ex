@@ -219,16 +219,19 @@ defmodule Loopctl.ApiSpec.Schemas do
     OpenApiSpex.schema(%{
       title: "IngestionBacklogError",
       description:
-        "Batch-ingest backlog backpressure (HTTP 429). Distinct from the generic " <>
-          "request RateLimitError: this is triggered BEFORE any item is enqueued when " <>
-          "the calling tenant's in-flight `:ingestion` backlog (non-terminal Oban jobs) " <>
-          "is at/over the `OBAN_INGEST_BACKLOG_MAX` threshold. The rejection is " <>
-          "all-or-nothing — NO jobs from the request are enqueued (no partial pile-up). " <>
-          "The check is tenant-scoped: only the caller's own backlog counts. Unlike the " <>
-          "Hammer request-rate limiter, this response carries a machine-readable " <>
-          "`error.code` of `ingestion_backlog_exceeded`, so dashboards/clients can tell " <>
-          "backlog backpressure apart from the request-rate 429. It DOES set " <>
-          "`Retry-After` (seconds) — back off and retry once the backlog drains.",
+        "Ingest backpressure (HTTP 429). Distinct from the generic request " <>
+          "RateLimitError: this is triggered BEFORE any item is enqueued, for one of TWO " <>
+          "causes — the calling tenant's in-flight `:ingestion` backlog (non-terminal Oban " <>
+          "jobs) is at/over the `OBAN_INGEST_BACKLOG_MAX` threshold, OR that backlog could " <>
+          "not be MEASURED (transient count-path fault) and the bounded fail-open allowance " <>
+          "for that fault is spent. On the second the backlog was never counted and may be " <>
+          "zero, so waiting for it to drain is not necessarily the remedy — it is a " <>
+          "server-side condition. The rejection is all-or-nothing — NO jobs from the " <>
+          "request are enqueued (no partial pile-up). The check is tenant-scoped: only the " <>
+          "caller's own backlog counts. Unlike the Hammer request-rate limiter, this " <>
+          "response carries a machine-readable `error.code` of `ingestion_backlog_exceeded`, " <>
+          "so dashboards/clients can tell it apart from the request-rate 429. It DOES set " <>
+          "`Retry-After` (seconds) — honour it either way.",
       type: :object,
       required: [:error],
       properties: %{

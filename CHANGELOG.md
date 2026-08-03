@@ -22,10 +22,19 @@ Operator-facing changes for deployments outside the hosted instance.
   incident it is alerted on; slice by `outcome` (`admitted` / `unmetered` / `exhausted`). The
   `jobs` series is job-denominated — one 50-item batch is one check but fifty jobs.
 
-- **A `throw` from the ingestion backlog count no longer consumes a tenant's fail-open
-  allowance.** It still admits and still emits the counter; it is simply not treated as pool
-  pressure, because a deterministic counting fault recurs regardless of capacity and would
-  otherwise drain the window and 429 an under-threshold tenant.
+- **A DB pool fault that arrives as an EXIT now renders the pinned 503/504 instead of a bare
+  500, and counts in `loopctl.db.error.count`.** Crash propagation from a pooled process is an
+  exit, not a raise, so it previously escaped the endpoint backstop untranslated: no
+  structured SQLSTATE line, no counter increment (the aggregate under-counted DB faults during
+  exactly the pool wedge it is read in), and the raw reason — the failing statement plus the
+  call's bound parameters — reached the web-server crash log. Exits the backstop cannot place
+  in the pool are still re-exited untouched.
+
+- **The ingestion fail-open allowance is metered on the node-local limiter even under
+  `RATE_LIMITER=postgres`.** The Postgres limiter store is `AdminRepo` — the same pool whose
+  exhaustion makes the backlog unmeasurable — so the allowance was unconsultable for exactly
+  the fault it bounds and admission stayed unbounded during a sustained wedge. Every other
+  limiter bucket still follows `RATE_LIMITER`.
 
 ### Added
 

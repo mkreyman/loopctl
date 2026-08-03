@@ -22,6 +22,8 @@ defmodule Loopctl.Test.BackstopRouter do
     * `"42P01"` — `Postgrex.Error` `:undefined_table` (catch-all → 500)
     * `"conn"`  — `DBConnection.ConnectionError` (→ 503)
     * `"runtime"` — a plain `RuntimeError` (non-DB → let-it-crash, unchanged)
+    * `"exit-propagation"` — a pooled-process crash EXIT nesting a `Postgrex.Error`
+    * `"exit-foreign"` — an exit with no pool module in its call element
 
   The 57014 exception deliberately carries `query:` with SQL + a vector literal
   that WOULD leak if anything called `Exception.message/1` on it, so tests can
@@ -51,7 +53,7 @@ defmodule Loopctl.Test.BackstopRouter do
   # #558: crash PROPAGATION from a pooled process is an EXIT, not a raise, so it needs its
   # own shape here — a `rescue`-only backstop never sees it. The reason carries the failing
   # Postgrex struct (statement text) and the call's bound args, which is exactly what must not
-  # reach the crash log raw.
+  # reach the crash log raw: the backstop translates it to a SanitizedDBError instead.
   defp raise_uncaught(_conn, "exit-propagation") do
     exit(
       {{%Postgrex.Error{
@@ -59,6 +61,11 @@ defmodule Loopctl.Test.BackstopRouter do
           query: "SELECT id FROM things ORDER BY embedding <=> '[0.123,0.456]'::vector LIMIT 5"
         }, []}, {DBConnection, :execute, [:secret_bound_param]}}
     )
+  end
+
+  # A NON-pool exit: the backstop must leave it alone (no translation, no DB attribution).
+  defp raise_uncaught(_conn, "exit-foreign") do
+    exit({:timeout, {GenServer, :call, [:some_other_server, :ping]}})
   end
 
   defp raise_uncaught(conn, kind) do

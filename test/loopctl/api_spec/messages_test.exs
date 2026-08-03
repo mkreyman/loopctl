@@ -34,4 +34,14 @@ defmodule Loopctl.ApiSpec.MessagesTest do
     assert msg =~ "could not be measured"
     assert msg =~ "Retry after 5 seconds"
   end
+
+  test "the schema DESCRIPTION states both causes, not just the measured one" do
+    # The prose one level up from the example is what an API consumer actually reads; it
+    # carried the single-cause claim and the "wait for the drain" remedy long after the
+    # message stopped making them.
+    description = IngestionBacklogError.schema().description
+
+    refute description =~ "once the backlog drains"
+    assert description =~ "could not be MEASURED"
+  end
 end

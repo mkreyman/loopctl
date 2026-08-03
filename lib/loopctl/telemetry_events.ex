@@ -250,22 +250,22 @@ defmodule Loopctl.TelemetryEvents do
 
       `error_class` is a BOUNDED 5-value tag: `"timeout"` (57014 query_canceled — the
       count's own statement_timeout), `"db_pressure"` (SQLSTATE class 53/57/08 — the
-      exhaustion/connection classes a saturated pool raises behind pgbouncer), `"db_error"`
-      (any OTHER `Postgrex.Error` SQLSTATE — a query bug in the count path, and `08P01`
-      protocol_violation, which is a driver bug rather than pressure), `"connection"`
+      exhaustion/connection classes a saturated pool raises behind pgbouncer — plus a
+      `Postgrex.Error` carrying NO server SQLSTATE, i.e. a client-side driver fault on a
+      degrading connection), `"db_error"` (any OTHER SERVER SQLSTATE — a query bug in the
+      count path, and `08P01` protocol_violation, a driver bug rather than pressure),
+      `"connection"`
       (`DBConnection.ConnectionError` pool-checkout timeout), `"guc_capture_abort"`
       (`Loopctl.LocalGuc` REFUSED to override a GUC an enclosing scope owns — raised only
       once the connection is ALREADY wedged, hence metered), plus the `exit:<t>` / `throw:<t>`
       families from `Loopctl.ExitClass`.
 
       METERED classes (bounded allowance, then 429): `connection`, `timeout`, `db_pressure`,
-      `guc_capture_abort`, `exit:*`. UNMETERED (always admits): `db_error` and `throw:*`.
-
-      `throw:*` is deliberately NOT symmetric with `exit:*` (#558). An exit means the pool
-      process was absent or wedged — sustained, and what the allowance exists to bound. A
-      throw is a DETERMINISTIC fault in the counting code: it recurs at the same rate however
-      much capacity the pool has, so metering it drains the window and then 429s an
-      under-threshold tenant over something waiting will not clear.
+      `guc_capture_abort`, `exit:*`, `throw:*`. UNMETERED (always admits): `db_error` ONLY —
+      a query-shape bug in the count path is not backlog pressure, and capping it would 429 an
+      under-threshold tenant with a code it has not earned. Every other class leaves the
+      backlog UNMEASURED, and an unmeasured backlog is not evidence of an under-threshold
+      tenant, so its admissions stay bounded.
 
       `tenant_id` is an id, cap-gated to a sentinel in the metric's `tag_values`
       (`ScaleMetrics.backlog_gate_tags/1`) so label cardinality stays bounded.

@@ -120,25 +120,47 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
   end
 
   describe "#558: crash propagation is an EXIT, not a raise" do
-    test "the backstop logs a BOUNDED class and re-exits unchanged", %{conn: conn} do
+    test "a pool exit is translated exactly like the raise path", %{conn: conn} do
       # A `rescue`-only backstop never saw this shape, so the raw reason reached the crash
       # log — carrying the failing statement and its bound parameters.
-      {conn, _tenant} = authed_conn(conn)
+      {conn, tenant} = authed_conn(conn)
       conn = put_req_header(conn, "x-test-raise-db-error", "exit-propagation")
 
-      {reason, log} =
+      {_, log} =
         with_log(fn ->
-          catch_exit(LoopctlWeb.Endpoint.call(conn, []))
+          error =
+            assert_raise LoopctlWeb.SanitizedDBError, fn ->
+              LoopctlWeb.Endpoint.call(conn, [])
+            end
+
+          # AC-27.3.8: the REASON that reaches the crash log is now the sanitized stand-in, so
+          # `Exception.format/3` cannot render the nested struct's statement or the bound args.
+          # Asserting on the backstop's own log line would be vacuous — it never carried them.
+          message = Exception.message(error)
+          refute message =~ "secret_bound_param"
+          refute message =~ "embedding <=>"
+          refute message =~ "0.123"
+          assert Plug.Exception.status(error) == 500
         end)
 
-      # Re-exited UNCHANGED — the backstop attributes, it does not swallow or translate.
-      assert {{%Postgrex.Error{}, _stack}, {DBConnection, :execute, _args}} = reason
+      # AC-27.3.3: the exit shape gets the SAME structured SQLSTATE line (and the
+      # [:loopctl, :db, :error] counter DBErrorLogger emits with it).
+      assert log =~ "sqlstate=42P01"
+      assert log =~ "mapped_code=db_error"
+      assert log =~ "tenant_id=#{tenant.id}"
+    end
 
-      assert log =~ "DBErrorBackstop: request exit"
-      # The CLASS, from the closed ExitClass set — never the reason itself.
-      assert log =~ "exit:Postgrex.Error"
-      refute log =~ "secret_bound_param"
-      refute log =~ "0.123"
+    test "a FOREIGN exit is re-exited untouched and not attributed to the database",
+         %{conn: conn} do
+      {conn, _tenant} = authed_conn(conn)
+      conn = put_req_header(conn, "x-test-raise-db-error", "exit-foreign")
+
+      {reason, log} =
+        with_log(fn -> catch_exit(LoopctlWeb.Endpoint.call(conn, [])) end)
+
+      assert {:timeout, {GenServer, :call, _args}} = reason
+      refute log =~ "DBErrorBackstop"
+      refute log =~ "db_error mapped to HTTP"
     end
   end
 end
