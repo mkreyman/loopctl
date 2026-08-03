@@ -84,10 +84,17 @@ defmodule Loopctl.TelemetryEvents do
   ## Payload (bounded tags only — NEVER the query, the vector, or a PG message body)
 
     * `measurements`: `%{count: 1}` — a pure increment.
-    * `metadata`: `%{tenant_id, endpoint, error_class}` where `error_class` is a BOUNDED tag:
+    * `metadata`: `%{tenant_id, endpoint, error_class}` where `error_class` is BOUNDED:
       `"guc_capture_abort"` (`Loopctl.LocalGuc` REFUSED to override a GUC an enclosing scope
       owns — deliberate, not a blip) | `"connection"` (pool/connection fault) | `"timeout"`
-      (57014 server-side cancel).
+      (57014 server-side cancel) | `"overloaded"` (a `HeavyRead` TenantGate shed — added with
+      the exit guard, because an overload escaping the probe turned an already-computed 200
+      into a 429) | `exit:<t>` / `throw:<t>` over `Loopctl.ExitClass`'s CLOSED tag set (a pool
+      that exits rather than raises).
+
+  This list is the DECLARED source of truth that `ScaleMetrics.degraded_read_tags/1` points
+  at, so a stale entry here is how an unbounded label reaches Prometheus unnoticed. It has
+  gone stale twice; update it in the same change that adds a class.
   """
   def vector_search_under_fill_probe_degraded,
     do: [:loopctl, :knowledge, :vector_search, :under_fill_probe_degraded]
@@ -236,29 +243,44 @@ defmodule Loopctl.TelemetryEvents do
     * `metadata`: `%{tenant_id, error_class, outcome}`.
 
       `outcome` is a BOUNDED 3-value atom: `:admitted` (unmetered fault class, or within
-      allowance), `:unmetered` (the METER was unconsultable — under `RATE_LIMITER=postgres`
-      its store is the same wedged pool — so the request was admitted rather than 429-ing a
-      tenant whose backlog was neither measured nor metered), `:exhausted` (allowance spent;
-      the request got the ordinary backlog 429).
+      allowance), `:unmetered` (the METER was unconsultable — this ONE bucket is metered on
+      the node-local ETS limiter whatever `RATE_LIMITER` says, precisely so the meter does not
+      share a failure domain with the count it bounds, so `:unmetered` means an ETS/Hammer
+      fault, NOT a DB-pool one — the request was admitted rather than refusing a tenant whose
+      backlog was neither measured nor metered), `:exhausted` (allowance spent; the request was
+      refused — the backlog 429 for a pressure class, otherwise a 503 that claims no backlog).
 
-      `error_class` is a BOUNDED 5-value tag: `"timeout"` (57014 query_canceled — the
+      `error_class` is a BOUNDED tag: `"timeout"` (57014 query_canceled — the
       count's own statement_timeout), `"db_pressure"` (SQLSTATE class 53/57/08 — the
-      exhaustion/connection classes a saturated pool raises behind pgbouncer), `"db_error"`
-      (any OTHER `Postgrex.Error` SQLSTATE — a query bug in the count path, and `08P01`
-      protocol_violation, which is a driver bug rather than pressure), `"connection"`
+      exhaustion/connection classes a saturated pool raises behind pgbouncer),
+      `"driver_fault"` (a `Postgrex.Error` carrying NO server SQLSTATE — a client-side
+      protocol/decode fault, or a PERMANENT ssl/config one; metered, but never attributed to
+      backlog), `"db_error"` (any OTHER SERVER SQLSTATE — a query bug in the
+      count path, and `08P01` protocol_violation, a driver bug rather than pressure),
+      `"connection"`
       (`DBConnection.ConnectionError` pool-checkout timeout), `"guc_capture_abort"`
       (`Loopctl.LocalGuc` REFUSED to override a GUC an enclosing scope owns — raised only
       once the connection is ALREADY wedged, hence metered), plus the `exit:<t>` / `throw:<t>`
       families from `Loopctl.ExitClass`.
 
-      METERED classes (bounded allowance, then 429): `connection`, `timeout`, `db_pressure`,
-      `guc_capture_abort`, `exit:*`, `throw:*`. UNMETERED (always admits): `db_error`.
+      METERED classes (bounded allowance, then a refusal): `connection`, `timeout`,
+      `db_pressure`, `driver_fault`, `guc_capture_abort`, `exit:*`, `throw:*`. Of those,
+      `driver_fault` and `throw:*` are refused as a 503 `ingestion_gate_unavailable` rather
+      than the backlog 429 — metered so admissions stay bounded, but not backlog-attributable,
+      so a deterministic fault never tells an under-threshold tenant its backlog is full.
+      UNMETERED (always admits): `db_error` ONLY —
+      a query-shape bug in the count path is not backlog pressure, and capping it would 429 an
+      under-threshold tenant with a code it has not earned. Every other class leaves the
+      backlog UNMEASURED, and an unmeasured backlog is not evidence of an under-threshold
+      tenant, so its admissions stay bounded.
 
       `tenant_id` is an id, cap-gated to a sentinel in the metric's `tag_values`
       (`ScaleMetrics.backlog_gate_tags/1`) so label cardinality stays bounded.
 
-  Aggregated by `Loopctl.Telemetry.ScaleMetrics` as a counter tagged by
-  `[:error_class, :tenant_id]`.
+  Aggregated by `Loopctl.Telemetry.ScaleMetrics` as TWO series — a counter on `count` and a
+  sum on `jobs` — both tagged `[:error_class, :outcome, :tenant_id]`. The `:outcome` label is
+  load-bearing: this event fires on refusals as well as admissions, so without it a refusal
+  increments the same series as an admission.
   """
   def ingestion_backlog_gate_failed_open,
     do: [:loopctl, :ingestion, :backlog_gate, :failed_open]

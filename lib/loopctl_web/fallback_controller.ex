@@ -23,8 +23,12 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :unresolvable_dispatch_lineage}` -> 409 (a dispatch the story references — implementer, or verifier on verify — could not be resolved; custody gate failed closed on an integrity error, tenant NOT halted)
   - `{:error, :rate_limited}` -> 429 with retry_after_seconds from header
   - `{:error, :ingestion_backlog_exceeded, retry_after}` -> 429 with `Retry-After` header and
-    a machine-readable `code: "ingestion_backlog_exceeded"` (US-36.3 batch-ingest backpressure —
-    distinct from the generic Hammer request-rate 429, which has no `code`)
+    a machine-readable `code: "ingestion_backlog_exceeded"` (US-36.3 ingest backpressure —
+    the backlog is at/over threshold OR it could not be measured and the bounded fail-open
+    allowance is spent; distinct from the generic Hammer request-rate 429, which has no `code`)
+  - `{:error, :ingestion_gate_unavailable, retry_after}` -> 503 with `Retry-After` and
+    `code: "ingestion_gate_unavailable"` (the same gate refusing for a fault that is NOT
+    backlog pressure, so the refusal does not claim a backlog nobody measured)
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message
   - `{:error, :unprocessable_entity, message}` -> 422 with custom message
@@ -37,6 +41,7 @@ defmodule LoopctlWeb.FallbackController do
   use LoopctlWeb, :controller
 
   alias Ecto.Changeset
+  alias Loopctl.ApiSpec.Messages
   alias Loopctl.Llm.Remediation
   alias LoopctlWeb.DBError
   alias LoopctlWeb.DBErrorLogger
@@ -369,10 +374,34 @@ defmodule LoopctlWeb.FallbackController do
         # the real backlog may be zero, so the old copy ("already has too many ... once the
         # backlog drains") told the client a fact the server does not have, and pointed it
         # at a remedy that may not apply.
+        # ONE definition, shared with the published OpenAPI example/body (#558) so the spec
+        # cannot keep telling clients something this response stopped saying.
+        message: Messages.ingestion_backlog_exceeded(retry_after),
+        retry_after_seconds: retry_after
+      }
+    })
+  end
+
+  # #558: the SAME admission gate, refusing for a fault that is NOT backlog pressure — the
+  # backlog could not be measured (a driver/config fault, or a defect in the counting code)
+  # and the bounded fail-open allowance for it is spent. Answering `429
+  # ingestion_backlog_exceeded` there asserted a backlog nobody counted and pointed the client
+  # at a drain that a deterministic fault never reaches; this is a server-side condition, so it
+  # gets the server-side status. `Retry-After` is still set — retrying is all the client can do.
+  def call(conn, {:error, :ingestion_gate_unavailable, retry_after})
+      when is_integer(retry_after) and retry_after > 0 do
+    conn
+    |> put_resp_header("retry-after", Integer.to_string(retry_after))
+    |> put_status(:service_unavailable)
+    |> json(%{
+      error: %{
+        status: 503,
+        code: "ingestion_gate_unavailable",
         message:
-          "Ingestion is shedding for this tenant: the in-flight backlog is at or over the " <>
-            "threshold, or it could not be measured. No items from this batch were " <>
-            "enqueued. Retry after #{retry_after} seconds.",
+          "Ingestion is shedding for this tenant: the in-flight backlog could not be " <>
+            "measured, and the bounded allowance for admitting unmeasured work is spent. " <>
+            "This is a server-side condition, not your backlog. Nothing from this request " <>
+            "was enqueued. Retry after #{retry_after} seconds.",
         retry_after_seconds: retry_after
       }
     })
