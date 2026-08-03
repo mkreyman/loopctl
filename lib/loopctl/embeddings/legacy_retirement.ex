@@ -38,10 +38,15 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
   "Fail closed" here means an inconclusive reading must never render as *already
   cleaned up* or *nothing to do*:
 
-    * A probe that cannot read `information_schema` reports NO columns... which would
-      read as retired. So `probe/0` returns `{:error, _}` as a whole rather than a
-      partial map, and the worker treats that as a monitor failure (loud, retried) —
-      never as a verdict.
+    * A probe that cannot read the catalog reports NO columns... which would read as
+      retired. So `probe/0` returns `{:error, _}` as a whole rather than a partial map,
+      and the worker treats that as a monitor failure (loud, retried) — never as a
+      verdict. It reads `pg_attribute`, not `information_schema.columns`, for the same
+      reason: the latter is privilege-FILTERED, so an under-privileged role gets zero
+      rows and NO error — a silent `:retired` indistinguishable from a real one.
+    * The LIVE `side_table_reads` reading vetoes both triggers while it is 0: the legacy
+      column is then the active read path (the revert in progress), and the deadline
+      degrades to `:deadline_blocked` rather than naming it for deletion.
     * A gap in the daily observations breaks the streak (`length(rows) == n` over a
       window of `n` distinct days is exactly the contiguity check, since
       `observed_on` is unique).
@@ -78,6 +83,7 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
   alias Loopctl.AdminRepo
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.RetirementObservation
+  alias Loopctl.LocalGuc
 
   # The tables whose legacy `embedding` column this trigger is about. The side
   # tables (`article_embeddings` / `memory_embeddings`) are deliberately absent —
@@ -106,20 +112,37 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
 
   @type verdict :: %{
           verdict: :due | :not_due | :retired,
-          trigger: :evidence | :deadline | nil,
+          trigger: :evidence | :deadline | :deadline_blocked | nil,
           reasons: [String.t()],
           legacy_columns: [String.t()],
           clear_days: non_neg_integer(),
           required_clear_days: pos_integer(),
           review_by: Date.t(),
           deadline_passed?: boolean(),
+          days_past_review_by: integer(),
+          side_table_reads: integer(),
           legacy_index_scans: %{optional(String.t()) => integer()}
         }
 
   @doc "Consecutive clear days required before the evidence trigger fires."
   @spec required_clear_days() :: pos_integer()
-  def required_clear_days do
-    config()[:required_clear_days] || @default_required_clear_days
+  def required_clear_days, do: normalize_required(config()[:required_clear_days])
+
+  # `||` only rejects nil/false, and BOTH degenerate values are truthy: `0` makes the
+  # window empty, so every check passes over no rows and `:due` is asserted from no
+  # evidence at all, and `1` makes `scan_defects/1` (which needs two readings for a
+  # delta) return unconditionally — deleting the core of the evidence path. The
+  # `pos_integer()` spec never enforced either, so the value is validated, not defaulted.
+  defp normalize_required(value) when is_integer(value) and value >= 2, do: value
+  defp normalize_required(nil), do: @default_required_clear_days
+
+  defp normalize_required(value) do
+    Logger.warning(
+      "LegacyRetirement: required_clear_days #{inspect(value)} is not an integer >= 2; " <>
+        "using #{@default_required_clear_days}"
+    )
+
+    @default_required_clear_days
   end
 
   @doc "The date past which retirement is owed regardless of what the evidence shows."
@@ -163,14 +186,27 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
     error -> {:error, error}
   end
 
+  # Read from `pg_attribute`/`pg_class`, NOT `information_schema.columns`: the latter is
+  # privilege-FILTERED by design, so a role without privileges on these tables gets zero
+  # rows and no error — indistinguishable from "the columns are gone", which `evaluate/2`
+  # would turn straight into a silent `:retired`. Scoped to the whole search path
+  # (`current_schemas(false)`) rather than `current_schema()`, for the reason
+  # `ChannelPostRescanWorker`'s probes spell out: `current_schema()` is only the FIRST
+  # entry, so a deployment whose search_path resolves elsewhere probes the wrong schema
+  # and disables the trigger permanently.
   defp legacy_columns do
     sql = """
-    SELECT table_name
-    FROM information_schema.columns
-    WHERE table_schema = current_schema()
-      AND column_name = $1
-      AND table_name = ANY($2)
-    ORDER BY table_name
+    SELECT c.relname
+    FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = ANY(current_schemas(false))
+      AND a.attname = $1
+      AND c.relname = ANY($2)
+      AND c.relkind = 'r'
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+    ORDER BY c.relname
     """
 
     case query(sql, [@legacy_column, @legacy_tables]) do
@@ -189,7 +225,7 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
     FROM pg_stat_user_indexes s
     JOIN pg_index i ON i.indexrelid = s.indexrelid
     JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-    WHERE s.schemaname = current_schema()
+    WHERE s.schemaname = ANY(current_schemas(false))
       AND s.relname = ANY($1)
       AND a.attname = $2
     GROUP BY s.indexrelname, s.idx_scan
@@ -215,13 +251,14 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
     end
   end
 
-  # A short SET LOCAL statement_timeout keeps these catalog reads from ever pinning
-  # a connection in AdminRepo's small (3-connection) pool — the US-27.11 starvation
-  # class. They are cheap catalog/stat reads, so 5s is generous, not tight.
+  # A short statement_timeout keeps these catalog reads from ever pinning a connection in
+  # AdminRepo's small (3-connection) pool — the US-27.11 starvation class. They are cheap
+  # catalog/stat reads, so 5s is generous, not tight. Via `LocalGuc.timed_transaction/4`,
+  # never a raw `SET LOCAL`: `SET LOCAL` is scoped to the TOP-LEVEL transaction, so a
+  # nested one (every call under `Ecto.Adapters.SQL.Sandbox`) merges the 5s deadline into
+  # the enclosing transaction on savepoint commit.
   defp query(sql, params) do
-    AdminRepo.transaction(fn ->
-      AdminRepo.query!("SET LOCAL statement_timeout = '5s'", [])
-
+    LocalGuc.timed_transaction(AdminRepo, 5_000, fn ->
       case AdminRepo.query(sql, params) do
         {:ok, result} -> result
         {:error, reason} -> AdminRepo.rollback(reason)
@@ -290,13 +327,20 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
   @spec evaluate(probe(), Keyword.t()) :: verdict()
   def evaluate(probe, opts \\ []) do
     today = Keyword.get(opts, :today, Date.utc_today())
-    required = Keyword.get(opts, :required_clear_days, required_clear_days())
     review_by = Keyword.get(opts, :review_by, review_by())
+
+    required =
+      case Keyword.fetch(opts, :required_clear_days) do
+        {:ok, value} -> normalize_required(value)
+        :error -> required_clear_days()
+      end
 
     base = %{
       legacy_columns: probe.legacy_columns,
       required_clear_days: required,
       review_by: review_by,
+      days_past_review_by: Date.diff(today, review_by),
+      side_table_reads: probe.side_table_reads,
       legacy_index_scans: probe.legacy_index_scans
     }
 
@@ -313,23 +357,39 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
     end
   end
 
+  @revert_reason "side_table_reads is currently 0 — the legacy column is the ACTIVE read path"
+
+  # The LIVE reading vetoes BOTH triggers. The stored window can only speak for days
+  # already past, so a revert flipped after the last observation is invisible to it — and
+  # a revert is precisely what these columns are kept for. Firing `:due` then would name
+  # the live read path for deletion, so the deadline degrades to `:deadline_blocked`
+  # (still surfaced, never acted on) rather than to silence.
   defp decide(base, today, required, review_by) do
-    {clear_days, evidence_reasons} = clear_streak(today, required)
+    {streak, window_reasons} = clear_streak(today, required)
     deadline_passed? = Date.compare(today, review_by) != :lt
-    evidence? = clear_days >= required
+    reverting? = base.side_table_reads != 1
+    clear_days = if reverting?, do: 0, else: streak
+    reasons = if reverting?, do: [@revert_reason | window_reasons], else: window_reasons
 
     {verdict, trigger, reasons} =
       cond do
-        evidence? ->
+        clear_days >= required ->
           {:due, :evidence,
            ["#{clear_days} consecutive clear day(s) at or above the #{required}-day bar"]}
 
+        deadline_passed? and reverting? ->
+          {:not_due, :deadline_blocked,
+           [
+             "review_by #{Date.to_iso8601(review_by)} has passed, but retirement is " <>
+               "BLOCKED"
+             | reasons
+           ]}
+
         deadline_passed? ->
-          {:due, :deadline,
-           ["review_by #{Date.to_iso8601(review_by)} has passed" | evidence_reasons]}
+          {:due, :deadline, ["review_by #{Date.to_iso8601(review_by)} has passed" | reasons]}
 
         true ->
-          {:not_due, nil, evidence_reasons}
+          {:not_due, nil, reasons}
       end
 
     Map.merge(base, %{
@@ -347,17 +407,27 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
   # reporting none. The reasons are what an operator actually needs — WHY the window
   # is not clear.
   defp clear_streak(today, required) do
-    from_day = Date.add(today, -(required - 1))
+    case observations(Date.add(today, -(required - 1)), today) do
+      {:ok, rows} ->
+        reasons = window_defects(rows, required)
+        if reasons == [], do: {required, []}, else: {0, reasons}
 
-    rows =
-      RetirementObservation
-      |> where([o], o.observed_on >= ^from_day and o.observed_on <= ^today)
-      |> order_by([o], asc: o.observed_on)
-      |> AdminRepo.all()
+      {:error, tag} ->
+        {0, ["the observation log is unreadable (#{tag}); there is no evidence window"]}
+    end
+  end
 
-    reasons = window_defects(rows, required)
-
-    if reasons == [], do: {required, []}, else: {0, reasons}
+  # The log can be genuinely ABSENT — a crontab entry deployed ahead of its migration —
+  # and unreadable must cost the EVIDENCE path without costing the deadline, which is the
+  # one trigger designed to fire with no observations at all.
+  defp observations(from_day, today) do
+    {:ok,
+     RetirementObservation
+     |> where([o], o.observed_on >= ^from_day and o.observed_on <= ^today)
+     |> order_by([o], asc: o.observed_on)
+     |> AdminRepo.all()}
+  rescue
+    error -> {:error, inspect(error.__struct__)}
   end
 
   defp window_defects(rows, required) do
@@ -396,23 +466,26 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
   defp same_instant?(_, nil), do: false
   defp same_instant?(a, b), do: DateTime.compare(a, b) == :eq
 
-  # Counters only ever increase (a reset is excluded above), so first == last across
-  # the window is exactly "no scan happened in between" — no need to walk the middle.
+  # Counters only ever increase (a reset is excluded above), so comparing each index's
+  # window PEAK to its baseline is exactly "no scan happened in between". Every index seen
+  # ANYWHERE in the window counts, not just at its endpoints: one created on day 5,
+  # scanned hard, and dropped on day 25 appears at neither end, and an endpoint-only
+  # comparison never examined it at all.
   defp scan_defects(rows) when length(rows) < 2, do: []
 
   defp scan_defects(rows) do
-    first = List.first(rows).legacy_index_scans || %{}
-    last = List.last(rows).legacy_index_scans || %{}
+    first = scans(List.first(rows))
+    seen = rows |> Enum.flat_map(&Map.keys(scans(&1))) |> Enum.uniq()
 
-    missing =
-      last |> Map.keys() |> Enum.reject(&Map.has_key?(first, &1)) |> Enum.sort()
+    missing = seen |> Enum.reject(&Map.has_key?(first, &1)) |> Enum.sort()
 
     scanned =
-      for {index, last_count} <- last,
+      for index <- seen -- missing,
           baseline = Map.get(first, index),
           is_integer(baseline),
-          last_count != baseline,
-          do: "#{index} (+#{last_count - baseline})"
+          peak = peak_scans(rows, index, baseline),
+          peak != baseline,
+          do: "#{index} (+#{peak - baseline})"
 
     missing_reason =
       if missing == [],
@@ -427,5 +500,14 @@ defmodule Loopctl.Embeddings.LegacyRetirement do
         ]
 
     missing_reason ++ scanned_reason
+  end
+
+  defp scans(row), do: row.legacy_index_scans || %{}
+
+  defp peak_scans(rows, index, baseline) do
+    rows
+    |> Enum.map(&Map.get(scans(&1), index))
+    |> Enum.filter(&is_integer/1)
+    |> Enum.max(fn -> baseline end)
   end
 end

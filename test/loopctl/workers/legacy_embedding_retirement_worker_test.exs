@@ -45,6 +45,8 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorkerTest do
         required_clear_days: 30,
         review_by: ~D[2027-01-22],
         deadline_passed?: false,
+        days_past_review_by: -173,
+        side_table_reads: 1,
         legacy_index_scans: %{"articles_embedding_hnsw_idx" => 674}
       },
       overrides
@@ -145,6 +147,30 @@ defmodule Loopctl.Workers.LegacyEmbeddingRetirementWorkerTest do
       assert payload["legacy_columns"] == ["articles", "memories"]
       assert payload["review_by"] == "2027-01-22"
       assert payload["legacy_index_scans"] == %{"articles_embedding_hnsw_idx" => 674}
+    end
+
+    test "the DEADLINE alert reports a metric that crosses its threshold upward" do
+      # `clear_days` is 0 by construction on the deadline path, so shipping it as the
+      # breach pair renders "0 of 30" — which any consumer comparing value to threshold
+      # reads as healthy, for the one trigger that exists to be un-ignorable.
+      stub(Loopctl.MockLegacyRetirement, :evaluate, fn _probe, _opts ->
+        verdict(%{
+          verdict: :due,
+          trigger: :deadline,
+          deadline_passed?: true,
+          days_past_review_by: 4
+        })
+      end)
+
+      capture_log(fn -> assert :ok = run_job() end)
+
+      assert [job] = all_enqueued(worker: ScaleAlertDeliveryWorker)
+      payload = job.args["payload"]
+
+      assert payload["metric"] == "embeddings.legacy_retirement.days_past_review_by"
+      assert payload["value"] == 4
+      assert payload["threshold"] == 0
+      assert payload["side_table_reads"] == 1
     end
   end
 

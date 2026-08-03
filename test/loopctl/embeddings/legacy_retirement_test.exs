@@ -121,6 +121,20 @@ defmodule Loopctl.Embeddings.LegacyRetirementTest do
       assert first.legacy_columns_present == ["articles", "memories"]
     end
 
+    test "an observation that never states the columns or the counters is rejected" do
+      # A schema `default:` reads as a stated value to `validate_required/2`, so an
+      # OMITTED field inserted cleanly and then cleared the scan check trivially.
+      changeset =
+        RetirementObservation.changeset(%RetirementObservation{}, %{
+          observed_on: @today,
+          observed_at: DateTime.utc_now(),
+          side_table_reads: 1
+        })
+
+      refute changeset.valid?
+      assert %{legacy_columns_present: _, legacy_index_scans: _} = errors_on(changeset)
+    end
+
     test "a same-day re-run UPDATES rather than adding a second row for the day" do
       {:ok, first} = LegacyRetirement.record(probe(), today: @today)
 
@@ -250,6 +264,33 @@ defmodule Loopctl.Embeddings.LegacyRetirementTest do
              )
     end
 
+    test "an index scanned only in the MIDDLE of the window is :not_due" do
+      clear_window()
+
+      # Created, scanned and dropped strictly inside the window: it appears at neither
+      # endpoint, so an endpoint-only comparison never examined it at all.
+      AdminRepo.update_all(
+        from(o in RetirementObservation, where: o.observed_on == ^Date.add(@today, -1)),
+        set: [
+          legacy_index_scans: %{"articles_embedding_hnsw_idx" => 690}
+        ]
+      )
+
+      verdict = evaluate(probe())
+
+      assert verdict.verdict == :not_due
+      assert Enum.any?(verdict.reasons, &(&1 =~ "articles_embedding_hnsw_idx (+16)"))
+    end
+
+    test "a degenerate required_clear_days falls back rather than clearing vacuously" do
+      # 0 is truthy, so `||` never rejected it: the window became empty, every check
+      # passed over no rows, and `:due` was asserted from literally no evidence.
+      verdict = evaluate(probe(), required_clear_days: 0)
+
+      assert verdict.verdict == :not_due
+      assert verdict.required_clear_days == 30
+    end
+
     test "a surviving column with NO index over it still clears — deliberately" do
       # Documented as a correct vacuous pass, not a hole: an unindexed legacy column is
       # already past the expensive half of retirement. The flag and the full window
@@ -287,6 +328,18 @@ defmodule Loopctl.Embeddings.LegacyRetirementTest do
 
       assert verdict.verdict == :not_due
       refute verdict.deadline_passed?
+    end
+
+    test "a LIVE read-flag revert blocks the deadline instead of naming the read path" do
+      # The columns exist FOR this rollback. A `:due` here tells an operator to drop the
+      # column the request path is reading from right now.
+      verdict =
+        evaluate(probe(%{side_table_reads: 0}), review_by: Date.add(@today, -1))
+
+      assert verdict.verdict == :not_due
+      assert verdict.trigger == :deadline_blocked
+      assert verdict.side_table_reads == 0
+      assert Enum.any?(verdict.reasons, &(&1 =~ "ACTIVE read path"))
     end
 
     test "the deadline NEVER fires once the columns are gone" do

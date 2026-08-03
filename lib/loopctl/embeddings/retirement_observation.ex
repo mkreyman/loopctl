@@ -19,8 +19,13 @@ defmodule Loopctl.Embeddings.RetirementObservation do
     field :observed_on, :date
     field :observed_at, :utc_datetime_usec
     field :side_table_reads, :integer
-    field :legacy_columns_present, {:array, :string}, default: []
-    field :legacy_index_scans, :map, default: %{}
+    # No schema `default:` on either, deliberately: `validate_required/2` reads a struct
+    # default as a STATED value, so defaulting them to `[]`/`%{}` let a writer that never
+    # said which columns survived (or what the counters were) insert a row that then
+    # cleared the scan check trivially. An explicit `[]`/`%{}` still passes — the
+    # requirement is that the reading was taken, not that it found something.
+    field :legacy_columns_present, {:array, :string}
+    field :legacy_index_scans, :map
     field :stats_reset_at, :utc_datetime_usec
 
     timestamps()
