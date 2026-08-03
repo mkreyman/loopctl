@@ -23,17 +23,26 @@ defmodule Loopctl.Test.BackstopRouter do
     * `"conn"`  — `DBConnection.ConnectionError` (→ 503)
     * `"runtime"` — a plain `RuntimeError` (non-DB → let-it-crash, unchanged)
     * `"exit-propagation"` — a pooled-process crash EXIT nesting a `Postgrex.Error`
+    * `"exit-task"` — the same nested `Postgrex.Error` through a `Task` call element
+    * `"exit-nested-runtime"` — a NON-DB exception under a pool call element
     * `"exit-foreign"` — an exit with no pool module in its call element
 
-  The 57014 exception deliberately carries `query:` with SQL + a vector literal
-  that WOULD leak if anything called `Exception.message/1` on it, so tests can
-  prove neither the response, the structured log, nor the sanitized re-raise
-  echoes it.
+  It first runs the REAL identity plugs, so the tenant is established INSIDE the router as in
+  production: pre-assigning it on the endpoint conn proves nothing about the EXIT path, which
+  unwinds that frame and recovers only what the plugs left behind.
+
+  The 57014 exception deliberately carries `query:` with SQL + a vector literal that WOULD
+  leak if anything called `Exception.message/1` on it, so tests can prove neither the
+  response, the structured log, nor the sanitized re-raise echoes it.
   """
 
   @behaviour Plug
 
+  alias LoopctlWeb.Plugs.{ExtractApiKey, ResolveApiKey, SeedTenantMetadata}
+
   @header "x-test-raise-db-error"
+
+  @identity_plugs [ExtractApiKey, ResolveApiKey, SeedTenantMetadata]
 
   @impl true
   def init(opts), do: LoopctlWeb.Router.init(opts)
@@ -41,26 +50,34 @@ defmodule Loopctl.Test.BackstopRouter do
   @impl true
   def call(conn, opts) do
     case Plug.Conn.get_req_header(conn, @header) do
-      [kind | _] -> raise_uncaught(conn, kind)
+      [kind | _] -> conn |> authenticate() |> raise_uncaught(kind)
       [] -> LoopctlWeb.Router.call(conn, opts)
     end
   end
 
-  # Raise the way a controller action does: wrapped in a Plug.Conn.WrapperError
-  # carrying the dispatched conn so controller/action/assigns are populated for
-  # the structured log. We stamp a phoenix_controller so the log line has a
-  # controller field, mirroring a real dispatched request.
-  # #558: crash PROPAGATION from a pooled process is an EXIT, not a raise, so it needs its
-  # own shape here — a `rescue`-only backstop never sees it. The reason carries the failing
-  # Postgrex struct (statement text) and the call's bound args, which is exactly what must not
-  # reach the crash log raw: the backstop translates it to a SanitizedDBError instead.
+  defp authenticate(conn) do
+    Enum.reduce(@identity_plugs, conn, fn p, acc -> p.call(acc, p.init([])) end)
+  end
+
+  # Raise the way a controller action does: wrapped in a Plug.Conn.WrapperError carrying the
+  # dispatched conn so controller/action/assigns are populated for the structured log.
+  # #558: crash PROPAGATION from a pooled process is an EXIT, not a raise, so it needs its own
+  # shape here — a `rescue`-only backstop never sees it. The reason carries the failing Postgrex
+  # struct (statement text) and the call's bound args, exactly what must not reach the crash log
+  # raw: the backstop translates it to a SanitizedDBError instead.
   defp raise_uncaught(_conn, "exit-propagation") do
-    exit(
-      {{%Postgrex.Error{
-          postgres: %{code: :undefined_table, pg_code: "42P01", severity: "ERROR", message: "x"},
-          query: "SELECT id FROM things ORDER BY embedding <=> '[0.123,0.456]'::vector LIMIT 5"
-        }, []}, {DBConnection, :execute, [:secret_bound_param]}}
-    )
+    exit({{nested_postgrex_error(), []}, {DBConnection, :execute, [:secret_bound_param]}})
+  end
+
+  # The SAME nested payload through a NON-pool call element (`Knowledge.novelty_scores/3` reads
+  # inside a `Task.async_stream`): classifying by the call element alone left this shape raw.
+  defp raise_uncaught(_conn, "exit-task") do
+    exit({{nested_postgrex_error(), []}, {Task, :stream, [:secret_bound_param]}})
+  end
+
+  # A NON-DB exception under a POOL call element: a real fault that must keep its identity.
+  defp raise_uncaught(_conn, "exit-nested-runtime") do
+    exit({{%RuntimeError{message: "pool process defect"}, []}, {DBConnection, :run, []}})
   end
 
   # A NON-pool exit: the backstop must leave it alone (no translation, no DB attribution).
@@ -76,6 +93,13 @@ defmodule Loopctl.Test.BackstopRouter do
       kind: :error,
       reason: exception_for(kind),
       stack: []
+  end
+
+  defp nested_postgrex_error do
+    %Postgrex.Error{
+      postgres: %{code: :undefined_table, pg_code: "42P01", severity: "ERROR", message: "x"},
+      query: "SELECT id FROM things ORDER BY embedding <=> '[0.123,0.456]'::vector LIMIT 5"
+    }
   end
 
   defp exception_for("57014") do

@@ -65,6 +65,18 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   @fail_open_window_ms 3_600_000
   @fail_open_fleet_nodes 10
 
+  # The OTHER refusal the same admission gate can return, shared by both routes' specs so the
+  # documented status set matches `backlog_fail_open_verdict/3` (CLAUDE.md: a new API
+  # constraint is documented in the `operation/2` spec, not just enforced in the controller).
+  @gate_unavailable_description "Service Unavailable — the ingest admission gate could not " <>
+                                  "MEASURE your in-flight backlog, the fault is not pool " <>
+                                  "pressure (a driver/config fault, or a defect in the " <>
+                                  "counting code), and the bounded allowance for admitting " <>
+                                  "unmeasured work is spent. `error.code: " <>
+                                  "\"ingestion_gate_unavailable\"`, sets `Retry-After`. Zero " <>
+                                  "jobs are enqueued. Distinct from the 429s: this one does " <>
+                                  "NOT assert anything about your backlog."
+
   # Max batch size for POST /knowledge/ingest/batch. Declared HERE, above
   # `fail_open_jobs_per_window/0`, which floors the fail-open allowance at one full batch.
   @batch_max 50
@@ -176,7 +188,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
            "way.", "application/json",
          %OpenApiSpex.Schema{
            oneOf: [Schemas.IngestionBacklogError, Schemas.RateLimitError]
-         }}
+         }},
+      503 => {@gate_unavailable_description, "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -289,7 +302,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
          "application/json",
          %OpenApiSpex.Schema{
            oneOf: [Schemas.IngestionBacklogError, Schemas.RateLimitError]
-         }}
+         }},
+      503 => {@gate_unavailable_description, "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -349,8 +363,9 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # SUSTAINED, so an unconditional admit makes "no backpressure at all" the steady state
   # during exactly the overload the valve exists to bound. (Before the exit shape was caught
   # at all, the 500 at least shed the flood incidentally.) So those admissions are metered
-  # (`fail_open_jobs_per_window/0` per tenant per `@fail_open_window_ms`), and the rest get
-  # the ordinary backlog 429 with its Retry-After — no new status code, no new error code.
+  # (`fail_open_jobs_per_window/0` per tenant per `@fail_open_window_ms`), and the rest are
+  # refused — as the backlog 429 where the fault IS pool pressure, otherwise as the
+  # server-side 503 (`backlog_attributable?/1`).
   # EVERY outcome emits `fail_open_event/4`: the only signal that the backlog is UNMEASURABLE
   # must not go silent at the moment the fault stops being a blip and becomes the wedge.
   defp backlog_fail_open_verdict(tenant_id, error_class, jobs) do
@@ -360,11 +375,26 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
         else: :admitted
 
     fail_open_event(tenant_id, error_class, outcome, jobs)
+    retry_after = backlog_retry_after_seconds()
 
-    if outcome == :exhausted,
-      do: {:error, :ingestion_backlog_exceeded, backlog_retry_after_seconds()},
-      else: :ok
+    cond do
+      outcome != :exhausted -> :ok
+      backlog_attributable?(error_class) -> {:error, :ingestion_backlog_exceeded, retry_after}
+      true -> {:error, :ingestion_gate_unavailable, retry_after}
+    end
   end
+
+  # WHAT A REFUSAL MAY CLAIM — a different question from whether admissions are BOUNDED. A
+  # class that is not demonstrable pool pressure — a counting-code `throw:*`, or a
+  # `Postgrex.Error` carrying no server SQLSTATE (`driver_fault`, which covers the PERMANENT
+  # ssl/protocol/status faults as well as a decode fault on a degrading connection) — still
+  # leaves the backlog UNMEASURED, so its admissions stay metered. But answering
+  # `429 ingestion_backlog_exceeded` there asserts a backlog nobody counted and advertises a
+  # remedy (wait for the drain) that a deterministic fault never reaches: the tenant may be at
+  # zero backlog and is refused for the whole window. Those get the server-side 503 instead.
+  defp backlog_attributable?("throw:" <> _tag), do: false
+  defp backlog_attributable?("driver_fault"), do: false
+  defp backlog_attributable?(_class), do: true
 
   # Meter every class that means the POOL is under pressure, including `guc_capture_abort`:
   # `LocalGuc` raises that abort only after the capture round-trip ITSELF failed, i.e. the
@@ -375,6 +405,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # under-threshold tenant with a backlog error code it has not earned.
   defp metered_fail_open?("connection"), do: true
   defp metered_fail_open?("db_pressure"), do: true
+  defp metered_fail_open?("driver_fault"), do: true
   defp metered_fail_open?("timeout"), do: true
   defp metered_fail_open?("guc_capture_abort"), do: true
   defp metered_fail_open?("exit:" <> _tag), do: true
@@ -387,16 +418,20 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # unmeasurable the server does not know the tenant IS under threshold, which is the whole
   # reason admissions are bounded rather than free. The counter (`fail_open_event/4`) is what
   # keeps a deterministic defect alertable; the allowance is not the alerting mechanism.
+  # What the round-tripping of this decision was actually about — a client told "your backlog
+  # is too big, wait" for a counting-code defect — is settled in `backlog_attributable?/1`:
+  # metered here, refused as a 503 there. Metering and the error CODE are separate questions.
   defp metered_fail_open?("throw:" <> _tag), do: true
   defp metered_fail_open?(_class), do: false
 
   # ONE token per SUBMITTED ITEM (an upper bound on the jobs this request would enqueue),
-  # halting on the first NON-ADMIT — a refusal OR an unconsultable meter — so a doomed request
-  # does not queue up to @batch_max more checkouts onto an already-starved pool. Halting on
-  # `:unmetered` too is load-bearing: an unconsultable meter recurs for the rest of the
-  # request, so continuing meant up to @batch_max sequential doomed checkouts on the web
-  # request process during exactly the wedge this gate bounds. Tokens charged before the halt
-  # are not refunded
+  # halting on a REFUSAL so a doomed request does not queue up to @batch_max more checks. An
+  # unconsultable meter does NOT halt: `fail_open_meter/1` pins this bucket to the node-local
+  # ETS limiter, so a remaining token is a microsecond ETS read, not a pool checkout — and
+  # halting on it converted ONE transient soft-error into a whole batch admitted with ZERO
+  # tokens charged, so an ALREADY-SPENT allowance stopped refusing. The `:unmetered` verdict is
+  # carried forward instead (it is what keeps the unconsultable meter alertable), and a later
+  # `{:deny, _}` still refuses. Tokens charged before the halt are not refunded
   # (the limiter has no reservation), which is why `fail_open_jobs_per_window/0` is floored
   # at one full batch: an allowance smaller than a batch would be converted into nothing.
   #
@@ -413,7 +448,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     Enum.reduce_while(1..jobs//1, :admitted, fn _item, outcome ->
       case allowance_token(bucket, limit) do
         :exhausted -> {:halt, :exhausted}
-        :unmetered -> {:halt, :unmetered}
+        :unmetered -> {:cont, :unmetered}
         :admitted -> {:cont, outcome}
       end
     end)
@@ -426,12 +461,15 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # and the bound would go inert in the sustained wedge instead of closing the valve. This
   # bucket therefore pins to the node-local ETS limiter there, which is already the unit
   # `fail_open_jobs_per_window/0` derives for (@fail_open_fleet_nodes) — not a compromise.
-  defp fail_open_meter do
-    case RateLimiter.impl() do
-      RateLimiter.Postgres -> RateLimiter.default_impl()
-      impl -> impl
-    end
-  end
+  # Resolution is a PUBLIC pure function of the configured impl so the pin is testable: in the
+  # test env `RateLimiter.impl/0` is always the Mox mock, so the `Postgres` clause would
+  # otherwise be dead code that a later edit could invert with a green suite.
+  @doc false
+  @spec fail_open_meter(module()) :: module()
+  def fail_open_meter(RateLimiter.Postgres), do: RateLimiter.default_impl()
+  def fail_open_meter(impl), do: impl
+
+  defp fail_open_meter, do: fail_open_meter(RateLimiter.impl())
 
   # `{:allow, 0}` is the Postgres impl's own fail-open sentinel and `{:error, _}` is a Hammer
   # soft-error: both mean UNCONSULTABLE, never "denied". Raise/exit/throw likewise.
@@ -558,12 +596,16 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # UNMETERED `db_error` is restricted to an error that actually carries a server SQLSTATE —
   # i.e. a query-shape bug, which is not backlog pressure. A `Postgrex.Error` with NO
   # `postgres` map is a CLIENT-side driver fault (protocol/decode failure on a degrading
-  # connection), which is pool pressure; letting it fall into the catch-all admitted it
-  # unconditionally and forever, charging nothing.
+  # connection); letting it fall into the catch-all admitted it unconditionally and forever,
+  # charging nothing. It gets its OWN class rather than `db_pressure`, because the same shape
+  # also carries PERMANENT config faults ("ssl not available", "unexpected postgres status"):
+  # metered, so admissions stay bounded, but NOT backlog-attributable, so exhausting the
+  # allowance on one never answers an under-threshold tenant with a backlog code
+  # (`backlog_attributable?/1`).
   defp fail_open_class(%Postgrex.Error{postgres: %{pg_code: pg_code}}) when is_binary(pg_code),
     do: "db_error"
 
-  defp fail_open_class(%Postgrex.Error{}), do: "db_pressure"
+  defp fail_open_class(%Postgrex.Error{}), do: "driver_fault"
 
   # The non-local-exit shapes, already tagged by `Loopctl.ExitTag` at the catch site.
   # Prefixed by KIND so a triaging operator can tell a dead pool (`exit:noproc`) from a

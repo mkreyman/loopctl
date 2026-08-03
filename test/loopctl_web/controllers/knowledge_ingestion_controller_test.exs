@@ -873,7 +873,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       body = json_response(conn, 429)
       assert body["error"]["code"] == "ingestion_backlog_exceeded"
       assert body["error"]["status"] == 429
-      assert body["error"]["message"] =~ "No items from this batch were enqueued"
+      assert body["error"]["message"] =~ "Nothing from this request was enqueued"
 
       # Retry-After header is a positive integer string, tied to the ingestion drain
       # cadence (NOT the sub-second fair-share snooze base) so a compliant client does
@@ -1202,7 +1202,12 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
           items: [%{content: "Throwing counter item", source_type: "newsletter"}]
         })
 
-      assert json_response(conn, 429)["error"]["code"] == "ingestion_backlog_exceeded"
+      # ...but the REFUSAL does not claim a backlog nobody counted: a counting-code defect is
+      # not pool pressure, and "wait for the drain" is a remedy it never reaches.
+      body = json_response(conn, 503)
+      assert body["error"]["code"] == "ingestion_gate_unavailable"
+      refute body["error"]["message"] =~ "at or over the"
+      assert [_retry_after] = get_resp_header(conn, "retry-after")
 
       # Still ALERTABLE — a deterministic defect must not go silent either way.
       assert_receive {:backlog_failed_open, _measurements, metadata}
@@ -1210,12 +1215,12 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert metadata.outcome == :exhausted
     end
 
-    test "an UNCONSULTABLE meter halts the charge loop instead of re-checking per item",
+    test "an UNCONSULTABLE meter keeps charging, so an already-spent allowance still refuses",
          %{conn: conn} do
-      # The meter is unconsultable for the rest of the request once it is unconsultable at
-      # all, and under RATE_LIMITER=postgres each check is an AdminRepo checkout — the same
-      # starved pool that produced the unmeasurable count. Continuing meant up to @batch_max
-      # sequential doomed checkouts on the web request process during that very wedge.
+      # Halting the loop on the FIRST soft-error converted one transient blip into a whole
+      # batch admitted with ZERO tokens charged — an already-exhausted allowance stopped
+      # refusing. The remaining checks are node-local ETS reads (`fail_open_meter/1`), not
+      # pool checkouts, so continuing costs nothing worth buying that regression for.
       tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
@@ -1227,11 +1232,15 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
       test_pid = self()
 
-      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
+      # Unconsultable on the FIRST token, spent on every later one.
+      counter = :counters.new(1, [])
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, limit ->
         if String.starts_with?(bucket, "ingest_backlog_fail_open:") do
+          :counters.add(counter, 1, 1)
           send(test_pid, :fail_open_token)
           # The Postgres impl's own fail-open sentinel: unconsultable, never "denied".
-          {:allow, 0}
+          if :counters.get(counter, 1) == 1, do: {:allow, 0}, else: {:deny, limit}
         else
           {:allow, 1}
         end
@@ -1248,14 +1257,63 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
           ]
         })
 
-      # Availability still wins on a capacity gate — it admits, it just stops re-asking.
-      assert length(json_response(conn, 200)["data"]) == 3
+      # One blip does NOT buy the whole batch a free pass: the loop keeps asking and the
+      # spent allowance still closes the valve.
+      assert json_response(conn, 429)["error"]["code"] == "ingestion_backlog_exceeded"
 
       assert_receive :fail_open_token
-      refute_receive :fail_open_token, 20
+      assert_receive :fail_open_token
 
       assert_receive {:backlog_failed_open, %{count: 1, jobs: 3}, metadata}
+      assert metadata.outcome == :exhausted
+    end
+
+    test "an UNCONSULTABLE meter alone still ADMITS and reports `:unmetered`", %{conn: conn} do
+      # Availability wins on a capacity gate: a limiter fault is not a spent allowance, and
+      # the `:unmetered` outcome is what keeps "the valve is admitting because its METER is
+      # unreachable" alertable rather than silent.
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      attach_failed_open(tenant.id)
+
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        exit({:noproc, {DBConnection, :execute, []}})
+      end)
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
+        if String.starts_with?(bucket, "ingest_backlog_fail_open:"),
+          do: {:allow, 0},
+          else: {:allow, 1}
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "Unmetered admit item", source_type: "newsletter"}]
+        })
+
+      assert length(json_response(conn, 200)["data"]) == 1
+
+      assert_receive {:backlog_failed_open, %{count: 1, jobs: 1}, metadata}
       assert metadata.outcome == :unmetered
+    end
+
+    test "the fail-open meter is pinned to the node-local ETS limiter under RATE_LIMITER=postgres",
+         %{conn: _conn} do
+      # The meter must not share a FAILURE DOMAIN with the count it bounds: the Postgres
+      # limiter store IS the AdminRepo pool whose exhaustion produced the unmeasurable count,
+      # so every token would be unconsultable for exactly the fault the allowance bounds.
+      # Asserted directly because `RateLimiter.impl/0` is the Mox mock in every test, which
+      # would leave this pin dead code that a later edit could invert with a green suite.
+      alias LoopctlWeb.KnowledgeIngestionController, as: Ctl
+
+      assert Ctl.fail_open_meter(Loopctl.RateLimiter.Postgres) ==
+               Loopctl.RateLimiter.default_impl()
+
+      # Every other configured limiter is honoured untouched.
+      assert Ctl.fail_open_meter(Loopctl.MockRateLimiter) == Loopctl.MockRateLimiter
     end
 
     test "a NON-timeout SQLSTATE is not reported as a timeout", %{conn: conn} do
@@ -1390,11 +1448,13 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert metadata.outcome == :admitted
     end
 
-    test "a Postgrex error with NO server SQLSTATE is METERED, not waved through as a query bug",
+    test "a Postgrex error with NO server SQLSTATE is METERED, but never claims a backlog",
          %{conn: conn} do
       # A client-side driver fault (protocol/decode failure on a degrading connection) carries
       # no `postgres` map. Falling into the unmetered `db_error` catch-all admitted it
-      # unconditionally and forever, over a shape that IS the pool degrading.
+      # unconditionally and forever. The SAME shape also carries PERMANENT faults ("ssl not
+      # available"), so it is metered — admissions bounded — under its own class, and its
+      # refusal is the 503, not a backlog 429 the tenant has not earned.
       tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
@@ -1417,10 +1477,10 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
           items: [%{content: "Driver fault item", source_type: "newsletter"}]
         })
 
-      assert json_response(conn, 429)["error"]["code"] == "ingestion_backlog_exceeded"
+      assert json_response(conn, 503)["error"]["code"] == "ingestion_gate_unavailable"
 
       assert_receive {:backlog_failed_open, %{count: 1}, metadata}
-      assert metadata.error_class == "db_pressure"
+      assert metadata.error_class == "driver_fault"
       assert metadata.outcome == :exhausted
     end
 

@@ -36,6 +36,14 @@ Operator-facing changes for deployments outside the hosted instance.
   the fault it bounds and admission stayed unbounded during a sustained wedge. Every other
   limiter bucket still follows `RATE_LIMITER`.
 
+- **`POST /knowledge/ingest[/batch]` can now answer `503 ingestion_gate_unavailable` where it
+  previously answered `429 ingestion_backlog_exceeded`.** Only for the refusals that are NOT
+  backlog pressure: the gate could not MEASURE the backlog because of a driver/config fault or
+  a defect in the counting code, and the bounded allowance for admitting unmeasured work is
+  spent. The 429 asserted a backlog nobody counted and advised waiting for a drain that a
+  deterministic fault never reaches. `Retry-After` is set on both; a client branching on
+  `error.code` needs no change, one branching on the status does.
+
 ### Added
 
 - **A retirement trigger for the US-41.1 legacy embedding columns (#551).** New migration

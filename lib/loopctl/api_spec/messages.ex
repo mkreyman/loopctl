@@ -21,11 +21,14 @@ defmodule Loopctl.ApiSpec.Messages do
   is spent. On the second, nothing was counted and the real backlog may be zero, so the older
   wording ("already has too many … once the backlog drains") stated a fact the server does not
   have and pointed the client at a remedy that may not apply.
+
+  Route-NEUTRAL wording: the single-item route (`POST /knowledge/ingest`) renders this same
+  string, so it must not speak of "this batch" to a client that submitted one item.
   """
   @spec ingestion_backlog_exceeded(pos_integer()) :: String.t()
   def ingestion_backlog_exceeded(retry_after_seconds) do
     "Ingestion is shedding for this tenant: the in-flight backlog is at or over the " <>
-      "threshold, or it could not be measured. No items from this batch were " <>
+      "threshold, or it could not be measured. Nothing from this request was " <>
       "enqueued. Retry after #{retry_after_seconds} seconds."
   end
 end

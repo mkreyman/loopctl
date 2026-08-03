@@ -243,16 +243,19 @@ defmodule Loopctl.TelemetryEvents do
     * `metadata`: `%{tenant_id, error_class, outcome}`.
 
       `outcome` is a BOUNDED 3-value atom: `:admitted` (unmetered fault class, or within
-      allowance), `:unmetered` (the METER was unconsultable — under `RATE_LIMITER=postgres`
-      its store is the same wedged pool — so the request was admitted rather than 429-ing a
-      tenant whose backlog was neither measured nor metered), `:exhausted` (allowance spent;
-      the request got the ordinary backlog 429).
+      allowance), `:unmetered` (the METER was unconsultable — this ONE bucket is metered on
+      the node-local ETS limiter whatever `RATE_LIMITER` says, precisely so the meter does not
+      share a failure domain with the count it bounds, so `:unmetered` means an ETS/Hammer
+      fault, NOT a DB-pool one — the request was admitted rather than refusing a tenant whose
+      backlog was neither measured nor metered), `:exhausted` (allowance spent; the request was
+      refused — the backlog 429 for a pressure class, otherwise a 503 that claims no backlog).
 
-      `error_class` is a BOUNDED 5-value tag: `"timeout"` (57014 query_canceled — the
+      `error_class` is a BOUNDED tag: `"timeout"` (57014 query_canceled — the
       count's own statement_timeout), `"db_pressure"` (SQLSTATE class 53/57/08 — the
-      exhaustion/connection classes a saturated pool raises behind pgbouncer — plus a
-      `Postgrex.Error` carrying NO server SQLSTATE, i.e. a client-side driver fault on a
-      degrading connection), `"db_error"` (any OTHER SERVER SQLSTATE — a query bug in the
+      exhaustion/connection classes a saturated pool raises behind pgbouncer),
+      `"driver_fault"` (a `Postgrex.Error` carrying NO server SQLSTATE — a client-side
+      protocol/decode fault, or a PERMANENT ssl/config one; metered, but never attributed to
+      backlog), `"db_error"` (any OTHER SERVER SQLSTATE — a query bug in the
       count path, and `08P01` protocol_violation, a driver bug rather than pressure),
       `"connection"`
       (`DBConnection.ConnectionError` pool-checkout timeout), `"guc_capture_abort"`
@@ -260,8 +263,12 @@ defmodule Loopctl.TelemetryEvents do
       once the connection is ALREADY wedged, hence metered), plus the `exit:<t>` / `throw:<t>`
       families from `Loopctl.ExitClass`.
 
-      METERED classes (bounded allowance, then 429): `connection`, `timeout`, `db_pressure`,
-      `guc_capture_abort`, `exit:*`, `throw:*`. UNMETERED (always admits): `db_error` ONLY —
+      METERED classes (bounded allowance, then a refusal): `connection`, `timeout`,
+      `db_pressure`, `driver_fault`, `guc_capture_abort`, `exit:*`, `throw:*`. Of those,
+      `driver_fault` and `throw:*` are refused as a 503 `ingestion_gate_unavailable` rather
+      than the backlog 429 — metered so admissions stay bounded, but not backlog-attributable,
+      so a deterministic fault never tells an under-threshold tenant its backlog is full.
+      UNMETERED (always admits): `db_error` ONLY —
       a query-shape bug in the count path is not backlog pressure, and capping it would 429 an
       under-threshold tenant with a code it has not earned. Every other class leaves the
       backlog UNMEASURED, and an unmeasured backlog is not evidence of an under-threshold

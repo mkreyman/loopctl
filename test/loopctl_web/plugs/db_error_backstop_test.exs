@@ -27,16 +27,14 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
     end)
   end
 
+  # Only the Bearer key — the identity is resolved by the REAL auth plugs INSIDE the test
+  # router. Pre-assigning `:current_api_key` on the endpoint conn would make the tenant_id
+  # assertions vacuous for the EXIT path, which unwinds the router frame in production.
   defp authed_conn(conn) do
     tenant = fixture(:tenant)
     {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
-    conn =
-      conn
-      |> put_req_header("authorization", "Bearer #{raw_key}")
-      |> Plug.Conn.assign(:current_api_key, %{tenant_id: tenant.id})
-
-    {conn, tenant}
+    {put_req_header(conn, "authorization", "Bearer #{raw_key}"), tenant}
   end
 
   describe "uncaught DB exception in ANY controller (AC-27.3.3 + AC-27.3.8)" do
@@ -148,6 +146,40 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
       assert log =~ "sqlstate=42P01"
       assert log =~ "mapped_code=db_error"
       assert log =~ "tenant_id=#{tenant.id}"
+    end
+
+    test "the same nested DB error through a Task call element is sanitized too", %{conn: conn} do
+      # The leak is a property of the nested struct (statement + bound args), not of WHICH
+      # process called the pool, so classifying by the call element alone left this shape raw.
+      {conn, tenant} = authed_conn(conn)
+      conn = put_req_header(conn, "x-test-raise-db-error", "exit-task")
+
+      {_, log} =
+        with_log(fn ->
+          error =
+            assert_raise LoopctlWeb.SanitizedDBError, fn -> LoopctlWeb.Endpoint.call(conn, []) end
+
+          refute Exception.message(error) =~ "embedding <=>"
+        end)
+
+      assert log =~ "sqlstate=42P01"
+      # The exit path attributes the fault WITHOUT the router frame (Logger metadata).
+      assert log =~ "tenant_id=#{tenant.id}"
+    end
+
+    test "a NON-DB exception nested under a pool call element keeps its identity",
+         %{conn: conn} do
+      # Dressing it as a `DBConnection.ConnectionError` advertised a permanent defect as a
+      # retryable 503 and erased the only record of what actually failed.
+      {conn, _tenant} = authed_conn(conn)
+      conn = put_req_header(conn, "x-test-raise-db-error", "exit-nested-runtime")
+
+      {reason, log} = with_log(fn -> catch_exit(LoopctlWeb.Endpoint.call(conn, [])) end)
+
+      assert {{%RuntimeError{message: "pool process defect"}, []}, {DBConnection, :run, []}} =
+               reason
+
+      refute log =~ "db_error mapped to HTTP"
     end
 
     test "a FOREIGN exit is re-exited untouched and not attributed to the database",

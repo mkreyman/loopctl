@@ -35,6 +35,12 @@ defmodule Loopctl.ApiSpec.MessagesTest do
     assert msg =~ "Retry after 5 seconds"
   end
 
+  test "the message is route-neutral — the single-item route renders it too" do
+    # `POST /knowledge/ingest` submits ONE item and shares this definition, so batch-specific
+    # copy ("this batch") tells that client about a batch it never sent.
+    refute Messages.ingestion_backlog_exceeded(5) =~ "batch"
+  end
+
   test "the schema DESCRIPTION states both causes, not just the measured one" do
     # The prose one level up from the example is what an API consumer actually reads; it
     # carried the single-cause claim and the "wait for the drain" remedy long after the
