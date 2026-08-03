@@ -342,8 +342,10 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         `loopctl.oban.poll.error.count`, keyed by `[:poller, :error_class]` — BOTH
         bounded, fixed sets (`poller` is `"queue_state"`/`"executing_orphans"`;
         `error_class` is CLASSIFIED via `oban_poll_error_class/1` into
-        `"db_error"`/`"config_error"`/`"other"`, never the raw exception message).
-        Emitted from BOTH pollers' catch-all `rescue` clause, so a frozen gauge
+        `"db_error"`/`"guc_capture_abort"`/`"config_error"`/`"exit"`/`"other"`/
+        `"unknown"`, never the raw exception message).
+        Emitted from BOTH pollers' catch-all `rescue` AND `catch :exit` clauses
+        (a pool checkout against a wedged pool EXITS rather than raising), so a frozen gauge
         (metrics 18/19 retaining their last value because a poll cycle failed) is
         now distinguishable in Prometheus from a genuinely stable reading — a
         non-zero, incrementing rate on this counter means the OTHER two gauges are
@@ -1133,6 +1135,22 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       emit_oban_poll_error(:queue_state, e)
 
       :ok
+  catch
+    # `rescue` alone left this gauge's own hole open. A `Repo` checkout against a saturated,
+    # wedged or restarting pool EXITS (`{:timeout, {DBConnection, :checkout, ...}}`,
+    # `{:noproc, ...}`) rather than raising, so it walks past the clause above — and
+    # `telemetry_poller` PERMANENTLY drops a measurement MFA that escapes, so this gauge
+    # would go dark for the life of the node with metric 20 (whose whole purpose is making a
+    # frozen gauge distinguishable from a stable one) never firing on that path.
+    :exit, reason ->
+      Logger.warning(
+        "Oban queue/state poll exited (#{poll_exit_tag(reason)}); skipping this cycle — " <>
+          "the oban.jobs.count gauge simply keeps its last-recorded value until the next poll"
+      )
+
+      emit_oban_poll_error(:queue_state, {:exit, reason})
+
+      :ok
   end
 
   @doc """
@@ -1261,6 +1279,20 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       emit_oban_poll_error(:executing_orphans, e)
 
       :ok
+  catch
+    # Same exit shape as `poll_oban_queue_state/0` above, with one extra consequence: an
+    # escaping exit permanently drops this measurement, so `cached_executing_orphan_count/0`
+    # would hand `HealthCheck.Default` a frozen `:persistent_term` orphan count forever.
+    :exit, reason ->
+      Logger.warning(
+        "Oban executing-orphan poll exited (#{poll_exit_tag(reason)}); skipping this cycle — " <>
+          "the executing_orphan gauge AND the health-check cache simply keep their " <>
+          "last-recorded value until the next successful poll"
+      )
+
+      emit_oban_poll_error(:executing_orphans, {:exit, reason})
+
+      :ok
   end
 
   @doc """
@@ -1269,8 +1301,9 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   connected BEAM peer COUNT with the bounded readiness `status` as the sole tag —
   NEVER a node name or the DNS query string. Wired into
   `LoopctlWeb.Telemetry.periodic_measurements/0` (the same 10s poller as the Oban
-  gauges). Self-rescuing (catch-all, per the periodic-measurements invariant): a
-  raise here must never let `telemetry_poller` permanently drop this MFA — the gauge
+  gauges). Self-contained (catch-all `rescue` AND `catch :exit`, per the
+  periodic-measurements invariant): neither a raise NOR an exit here may let
+  `telemetry_poller` permanently drop this MFA — the gauge
   simply keeps its last value for one cycle. On a single node it reads
   `{status="single_node", count=0}`.
   """
@@ -1291,7 +1324,27 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       )
 
       :ok
+  catch
+    # A readiness read that EXITS (a DNS/cluster helper process that is down mid-call) escapes
+    # the `rescue` above and would permanently drop this MFA from the poll rotation.
+    :exit, reason ->
+      Logger.warning(
+        "Clustering-readiness poll exited (#{poll_exit_tag(reason)}); skipping this cycle — " <>
+          "the cluster.peers gauge keeps its last-recorded value until the next successful poll"
+      )
+
+      :ok
   end
+
+  # Bounded classification of an exit reason for the poller logs — a small closed set, never
+  # the raw reason (which carries the full DBConnection call tuple, module and args). Mirrors
+  # `Loopctl.Workers.ArticleLinkingWorker.exit_tag/1`, including the crash-propagation shape
+  # (`{{reason_or_exception, stacktrace}, call}`) an atom-only tagger degrades to "unknown".
+  defp poll_exit_tag(reason) when is_atom(reason), do: to_string(reason)
+  defp poll_exit_tag({reason, _call}) when is_atom(reason), do: to_string(reason)
+  defp poll_exit_tag({{%module{}, _stack}, _call}), do: inspect(module)
+  defp poll_exit_tag({{reason, _stack}, _call}) when is_atom(reason), do: to_string(reason)
+  defp poll_exit_tag(_reason), do: "unknown"
 
   # Emits the poll-failure counter (metric 20) from a poller's catch-all rescue.
   # The RAW exception struct is passed through in metadata (like
@@ -1328,9 +1381,12 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   # `LocalGuc.capture_fallback!/2`), so without this branch it lands as `"db_error"` and
   # reads as a pool fault. It is not one: it is this poller declining to override a GUC an
   # enclosing scope owns, which is a correctness-preserving refusal with a completely
-  # different remedy. Both Oban pollers run inside `LocalGuc.timed_transaction/3` (see
-  # `poll_oban_queue_state/0` and `count_oban_executing_orphans/0`), so this is reachable,
-  # not defensive. Matches the three sites that already discriminate it —
+  # different remedy. Reachability, precisely: `capture_fallback!/2` aborts only when an
+  # ENCLOSING scope in the SAME process already owns the name, and each poller opens the
+  # OUTERMOST `LocalGuc.timed_transaction/3` on the shared poller process — so no poller can
+  # abort today. The branch exists for uniform classification with the three sites that DO
+  # discriminate it, and to keep a future nested caller out of the `"db_error"` bucket, not
+  # because these two pollers can reach it. Matches those three sites —
   # `Loopctl.Knowledge`, `LoopctlWeb.KnowledgeIngestionController` and
   # `Loopctl.Workers.ArticleLinkingWorker` — on the same `"guc_capture_abort"` tag.
   defp oban_poll_error_class(%DBConnection.ConnectionError{} = e) do
@@ -1340,6 +1396,10 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   defp oban_poll_error_class(%DBConnection.OwnershipError{}), do: "db_error"
   defp oban_poll_error_class(%ArgumentError{}), do: "config_error"
   defp oban_poll_error_class(%FunctionClauseError{}), do: "config_error"
+  # An EXIT is not an exception, so it can never be a struct above: the pollers' `catch :exit`
+  # clauses hand it over wrapped as `{:exit, reason}`. Its own class because a pool checkout
+  # that exits has a different remedy from one that raises.
+  defp oban_poll_error_class({:exit, _reason}), do: "exit"
   defp oban_poll_error_class(nil), do: "unknown"
   defp oban_poll_error_class(_other), do: "other"
 
@@ -1442,16 +1502,27 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       try do
         Tenants.count() <= tenant_label_cap()
       rescue
-        # Fail-soft to a BOUNDED gate (force OFF → aggregate to the sentinel) ONLY for DB
-        # faults — a transient connection / ownership / Postgres error must not crash the
-        # shared poller. But the rescue is NARROW (security AREA-6): a persistently-failing
-        # gate (schema drift / misconfig that always raises) would otherwise stay silently
-        # stuck OFF, so we LOG it at :warning to make it visible. A genuine programmer
-        # error (anything outside the DB-exception set) is re-raised so it still surfaces
-        # rather than being masked as "gate off".
-        e in [Postgrex.Error, DBConnection.ConnectionError, DBConnection.OwnershipError] ->
+        # Fail-soft to a BOUNDED gate (force OFF → aggregate to the sentinel), for EVERY
+        # failure shape — this is a `telemetry_poller` measurement, and telemetry_poller
+        # PERMANENTLY drops an MFA that escapes. A narrow rescue (DB exceptions only, everything
+        # else re-raised) did not surface a programmer error here: it froze the gate at whatever
+        # boolean `:persistent_term` last held, with nothing left to re-evaluate it. If that
+        # value was `true`, `tenant_id` stays a live label after the fleet crosses the cap —
+        # the unbounded cardinality AC-27.15.3 forbids. Visibility comes from the :warning log
+        # (a persistently-failing gate is loud, not silent), not from crashing the poller.
+        e ->
           Logger.warning(
             "tenant-label gate refresh failed (#{inspect(e.__struct__)}); forcing gate OFF " <>
+              "(tenant_id label aggregates to the sentinel until the count succeeds)"
+          )
+
+          false
+      catch
+        # A pool checkout against a saturated/wedged pool EXITS rather than raising, so the
+        # clause above cannot see it.
+        :exit, reason ->
+          Logger.warning(
+            "tenant-label gate refresh exited (#{poll_exit_tag(reason)}); forcing gate OFF " <>
               "(tenant_id label aggregates to the sentinel until the count succeeds)"
           )
 

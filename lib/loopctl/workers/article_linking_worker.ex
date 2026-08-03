@@ -333,21 +333,33 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
       :ok
   catch
-    # `rescue` alone left the hole this whole block exists to close. A pool checkout against
-    # a wedged, saturated or unstarted `AdminRepo` EXITS (`{:timeout, {DBConnection, ...}}`,
-    # `:noproc`) rather than raising, so it walks straight past the clause above and aborts
-    # `perform/1` — and because sampling is deterministic by `article_id`, all three Oban
-    # attempts re-sample, re-exit and discard, leaving that article permanently unlinked.
-    # That is the exact regression the rescue was written to prevent, reached by the other
-    # of the two ways this call can fail.
+    # `rescue` alone left the non-exception half open. A pool checkout against a wedged,
+    # saturated or unstarted `AdminRepo` EXITS (`{:timeout, {DBConnection, ...}}`, `:noproc`)
+    # rather than raising, so it walked straight past the clause above and aborted `perform/1`
+    # over a purely observational count. Scope of the guarantee, exactly: a failure CONFINED
+    # TO THE COUNT — of any of the three kinds — no longer aborts linking. A pool fault that
+    # OUTLIVES the count still aborts the job at the next unguarded `AdminRepo` call
+    # (`get_existing_link_pairs/3`, the batched insert); that one is a genuine linking failure
+    # and belongs to Oban's retries, not to this block.
     #
-    # Tagged, not swallowed untagged, so the degraded signal stays greppable. `exit_tag/1`
-    # below is a local mirror of `HeavyRead`'s and `LocalGuc.failure_tag/1`'s exit clauses:
-    # both are `defp`, and this module following the same per-module convention is cheaper
-    # than promoting one to a public API for a third caller.
+    # `:throw` is caught alongside `:exit` because "every way this call can fail" has three
+    # kinds, not two — the same pairing the fail-soft rate-limiter taggers use. Tagged, not
+    # swallowed untagged, so the degraded signal stays greppable. `exit_tag/1` below is a
+    # local mirror of `HeavyRead`'s and `LocalGuc.failure_tag/1`'s exit clauses: both are
+    # `defp`, and this module following the same per-module convention is cheaper than
+    # promoting one to a public API for a third caller.
     :exit, reason ->
       Logger.warning(
         "Article linking: corpus-size count exited (#{exit_tag(reason)}) for " <>
+          "article #{article.id}; skipping the observational corpus_size signal — " <>
+          "linking proceeds"
+      )
+
+      :ok
+
+    :throw, value ->
+      Logger.warning(
+        "Article linking: corpus-size count threw (#{exit_tag(value)}) for " <>
           "article #{article.id}; skipping the observational corpus_size signal — " <>
           "linking proceeds"
       )
@@ -364,8 +376,16 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   # `:noproc` — a tagger with only an atom clause therefore looks right against a hand-rolled
   # `exit(:noproc)` while degrading every REAL production exit to "other". This module's test
   # exits with the production shape for exactly that reason.
+  #
+  # The same argument covers CRASH PROPAGATION: when a called process dies of an exception
+  # rather than being absent, the reason is `{{exception_or_atom, stacktrace}, call}` — at
+  # least as common as `:noproc` for a supervised pool, and a shape the two clauses above
+  # degrade to "unknown". Both inner shapes stay bounded: an atom, or the exception MODULE
+  # (never its message).
   defp exit_tag(reason) when is_atom(reason), do: to_string(reason)
   defp exit_tag({reason, _call}) when is_atom(reason), do: to_string(reason)
+  defp exit_tag({{%module{}, _stack}, _call}), do: inspect(module)
+  defp exit_tag({{reason, _stack}, _call}) when is_atom(reason), do: to_string(reason)
   defp exit_tag(_reason), do: "unknown"
 
   # Deterministic-by-id sampling so the same article always makes the same decision (stable

@@ -586,6 +586,60 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       # ...and the linking it merely observes still happened. That is the whole point.
       assert [_] = links_of_type(tenant.id, source.id, target.id, :relates_to)
     end
+
+    test "a propagated CRASH exit is tagged by exception module, not degraded to \"unknown\"" do
+      # A pool process that dies of an exception (rather than being absent) propagates
+      # `{{exception, stacktrace}, call}`. An atom-only tagger degrades that — at least as
+      # common as `:noproc` — to the catch-all, costing the operator the usable class.
+      %{tenant: tenant} = setup_tenant()
+      source = create_article_in_bucket(tenant.id, true)
+      target = create_published_article(tenant.id)
+
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn ->
+        exit({{%RuntimeError{message: "pool died"}, []}, {GenServer, :call, [self(), :req]}})
+      end)
+
+      stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(target, 0.88)]
+      end)
+
+      log =
+        capture_log(fn ->
+          assert :ok =
+                   ArticleLinkingWorker.perform(%Oban.Job{
+                     args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+                   })
+        end)
+
+      assert log =~ "corpus-size count exited (RuntimeError)"
+      refute log =~ "pool died"
+      assert [_] = links_of_type(tenant.id, source.id, target.id, :relates_to)
+    end
+
+    test "a THROW from the observational count degrades softly and still links" do
+      # The third non-local exit kind. `rescue` + `catch :exit` alone still let it abort
+      # `perform/1` over a signal the job does not depend on.
+      %{tenant: tenant} = setup_tenant()
+      source = create_article_in_bucket(tenant.id, true)
+      target = create_published_article(tenant.id)
+
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> throw(:boom) end)
+
+      stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(target, 0.88)]
+      end)
+
+      log =
+        capture_log(fn ->
+          assert :ok =
+                   ArticleLinkingWorker.perform(%Oban.Job{
+                     args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+                   })
+        end)
+
+      assert log =~ "corpus-size count threw (boom)"
+      assert [_] = links_of_type(tenant.id, source.id, target.id, :relates_to)
+    end
   end
 
   describe "batched insert_all (AC-36.4.2 / AC-36.4.3)" do

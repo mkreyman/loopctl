@@ -147,10 +147,14 @@ defmodule Loopctl.LocalGuc do
         # Specifically: recognising the tag is NOT a signal to re-raise. `capture_abort?/1`'s
         # @doc settles that (it was settled the expensive way, in #550) — re-raising out of a
         # fail-soft path converts "this diagnostic could not be measured" into a failed
-        # request, which is the thing those paths exist to prevent. So the ingestion backlog
+        # request, which is the thing those paths exist to prevent. So ON THIS ABORT — which
+        # is a RAISE, and therefore exactly what a `rescue` clause sees — the ingestion backlog
         # gate (`LoopctlWeb.KnowledgeIngestionController`) fails OPEN at 0, `Knowledge`'s
         # under-fill probe degrades to `:error`, and `ArticleLinkingWorker` skips its
-        # observational count — all tagging, none re-raising. An earlier revision of this
+        # observational count — all tagging, none re-raising. That is a claim about the abort,
+        # NOT about the separate EXIT shape of a wedged pool checkout: only
+        # `ArticleLinkingWorker` and the `ScaleMetrics` pollers catch that today; the first two
+        # still let an exit escape their class-restricted rescue. An earlier revision of this
         # comment said such rescues "re-raise ... Today's rescues deliberately do not", which
         # read as an aspiration the call sites had not caught up with. They had; the sentence
         # was wrong, and it contradicted the @doc twenty lines above it.

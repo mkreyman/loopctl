@@ -953,11 +953,12 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       # A LocalGuc capture ABORT is raised AS a DBConnection.ConnectionError on purpose, so
       # without its own branch it landed in the clause above and read as a pool fault. It is
-      # not one: it is the poller declining to override a GUC an enclosing scope owns — a
-      # correctness-preserving refusal with a completely different remedy. Both Oban pollers
-      # run inside `LocalGuc.timed_transaction/3`, so this is reachable, and the three sites
-      # that already discriminate it (`Knowledge`, `KnowledgeIngestionController`,
-      # `ArticleLinkingWorker`) all use this same tag.
+      # not one: it is a caller declining to override a GUC an enclosing scope owns — a
+      # correctness-preserving refusal with a completely different remedy. Neither poller can
+      # currently reach it (each opens the OUTERMOST scope on the poller process, and the abort
+      # needs an enclosing owner), so this branch is uniform classification with the three sites
+      # that DO discriminate it (`Knowledge`, `KnowledgeIngestionController`,
+      # `ArticleLinkingWorker`), which all use this same tag.
       assert ScaleMetrics.oban_poll_error_tags(%{
                poller: :queue_state,
                exception: %DBConnection.ConnectionError{
@@ -979,6 +980,15 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                poller: :queue_state,
                exception: %RuntimeError{}
              }) == %{poller: :queue_state, error_class: "other"}
+
+      # An EXIT is not an exception, so the pollers' `catch :exit` clauses hand it over
+      # wrapped. Without its own class a wedged-pool checkout — which exits rather than
+      # raising — would report as the generic "other" bucket, or (before the catch clauses
+      # existed) not report at all, because telemetry_poller had already dropped the MFA.
+      assert ScaleMetrics.oban_poll_error_tags(%{
+               poller: :executing_orphans,
+               exception: {:exit, {:noproc, {DBConnection, :execute, []}}}
+             }) == %{poller: :executing_orphans, error_class: "exit"}
     end
 
     test "oban_poll_error_tags/1 defaults missing keys to \"unknown\", never raises" do
