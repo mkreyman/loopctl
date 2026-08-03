@@ -207,6 +207,11 @@ defmodule Loopctl.MixProject do
         "credo --strict",
         "loopctl.check_skill_citations",
         "loopctl.check_env_docs",
+        # NB (#556): the AGENTS.md usage-rules drift check is deliberately NOT here. This
+        # alias runs under `preferred_envs: [precommit: :test]` and `usage_rules` is
+        # `only: :dev`, so `mix usage_rules.sync --check` would fail with "task could not
+        # be found" — the same breakage the hex.audit note above records. It runs in the
+        # CI Lint job instead, which has no MIX_ENV and therefore has the dep.
         "dialyzer",
         "test"
       ]

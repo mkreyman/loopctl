@@ -95,6 +95,22 @@ jobs:
       - name: Run Credo
         run: mix credo --strict
 
+      # #556: AGENTS.md's usage-rules block is GENERATED from the dependency set, so it
+      # goes stale the moment a dep is added, removed or upgraded — silently, because
+      # nothing regenerates or verifies it. Same failure shape as the undocumented-env-var
+      # problem already gated by `mix loopctl.check_env_docs`.
+      #
+      # Lives HERE and not in `mix precommit` for a concrete reason: `usage_rules` is
+      # `only: :dev`, and `precommit` runs under `preferred_envs: [precommit: :test]`, so
+      # the task does not exist there — adding it to that alias fails every local
+      # precommit with "task could not be found", which is the exact breakage the
+      # hex.audit comment in mix.exs records having already happened once. This job has no
+      # MIX_ENV, so it is dev and the dep is present. Offline, ~0.8s warm.
+      #
+      # `--check` reports drift and exits non-zero WITHOUT rewriting the file (verified).
+      - name: Check AGENTS.md usage-rules block is not stale
+        run: mix usage_rules.sync --check
+
       # #541 — nothing in CI compiled assets/js before this. A syntax or import
       # error in a LiveView hook therefore surfaced only in the Docker build at
       # DEPLOY time (Dockerfile runs `mix assets.deploy`), long after review.
