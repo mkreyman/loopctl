@@ -11,7 +11,7 @@ defmodule LoopctlWeb.KnowledgeProgressiveJSON do
   Renders the HEAT index (#554).
 
   Distinct from `index/1` because the payloads differ where it matters: a heat stub carries
-  `heat` (the cumulative access count that produced its rank), and the meta carries the DRILL
+  `heat` (the windowed body-read count that produced its rank), and the meta carries the DRILL
   INSTRUCTION. The instruction is part of the wire shape on purpose — an index that lists ids
   without saying they are actionable gets read as prose.
   """
@@ -21,6 +21,7 @@ defmodule LoopctlWeb.KnowledgeProgressiveJSON do
       meta: %{
         top_k: meta.top_k,
         returned: meta.returned,
+        unresolved: meta.unresolved,
         truncated: meta.truncated,
         char_budget: meta.char_budget,
         chars: meta.chars,

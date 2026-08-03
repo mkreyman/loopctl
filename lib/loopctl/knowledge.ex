@@ -8871,27 +8871,42 @@ defmodule Loopctl.Knowledge do
   # the payload could exceed several-fold.
   @heat_summary_chars 120
   @heat_title_chars 100
-  # The fixed per-stub cost the caller actually pays: the 36-char UUID, the heat integer, and
-  # the JSON keys/punctuation around the five fields. Counted so `chars` does not under-report
-  # what lands in the prefix.
-  @heat_stub_fixed_chars 90
+  # The fixed per-stub cost the caller actually pays, MEASURED off the wire shape
+  # `{"id":"<36-char uuid>","title":"","category":"","heat":,"summary":""}`: the UUID plus the
+  # JSON keys and punctuation around the five fields. The heat integer is variable-width, so it
+  # is counted per stub in `heat_stub_chars/1` instead of being folded in here — `chars` is the
+  # number a caller budgets a cached prefix against and must not under-report it.
+  @heat_stub_fixed_chars 91
   # `category` is a closed enum whose longest member is far under this.
   @heat_category_chars 24
+  # Digits allotted to `heat` in the ADVERTISED budget; an access count cannot exceed them.
+  @heat_count_chars 10
   @heat_stub_char_cap @heat_title_chars + @heat_summary_chars + @heat_category_chars +
-                        @heat_stub_fixed_chars
+                        @heat_stub_fixed_chars + @heat_count_chars
 
-  # Heat counts BODY READS only. `"search"` (and the reserved `"index"`) rows are
-  # IMPRESSIONS — `Analytics.record_search_access/6` writes one per RESULT of one query — so
-  # counting them would make heat a running tally of past ranker output, re-coupling this
-  # route to the embedding similarity it exists to be uncorrelated with. `"get"` is a direct
-  # body fetch and `"context"` is a full-body context pack; both are reads.
-  @heat_read_access_types ~w(get context)
+  # Heat counts CALLER-CHOSEN body fetches only. `"search"`, the reserved `"index"` AND
+  # `"context"` are all LIST-shaped — `Analytics.record_search_access/6` and
+  # `record_context_access/5` each write one row per RESULT of one ranker-run query — so
+  # counting any of them would make heat a running tally of past ranker output, re-coupling
+  # this route to the embedding similarity it exists to be uncorrelated with. A context pack
+  # does ship bodies, but the caller asked ONE question and the ranker picked the N articles,
+  # so one query would out-vote N deliberate reads. `"get"` is the only per-article fetch a
+  # reader names. Deliberately NARROWER than the read set in
+  # `RetrievalMetrics.compute_followed_through/2`, which asks a different question (was a body
+  # DELIVERED, ranker-chosen or not) — the two sets must not be unified.
+  @heat_read_access_types ~w(get)
 
   # The aggregate runs on the request path over `article_access_events`, the one table that
   # only ever grows, under a 10s statement timeout. An unbounded all-time scan therefore fails
   # (500) rather than degrades on exactly the tenant with the most history. A default window
-  # bounds it; `:since` moves it either way.
+  # bounds it; `:since` moves it either way, up to the ceiling below.
   @heat_default_window_days 90
+
+  # The ceiling. `:since` is caller-supplied, so without a floor on the lookback the unbounded
+  # all-time scan the default exists to prevent is one query parameter away. An older `:since`
+  # is CLAMPED (not rejected — the caller still gets the widest window that can be served) and
+  # `meta.heat_window` echoes what it actually got.
+  @heat_max_window_days 365
 
   @doc """
   A HEAT-ranked, topic-less stub index of the corpus (#554).
@@ -8902,11 +8917,12 @@ defmodule Loopctl.Knowledge do
   has nothing" rather than "I asked badly", with nothing in context to contradict it. This route
   takes no query at all, so its misses are uncorrelated with embedding similarity.
 
-  Ordering is by HEAT — the count of BODY-READ `article_access_events` rows for the article
-  (`#{Enum.join(@heat_read_access_types, "/")}`; search impressions are deliberately NOT
-  counted, see `@heat_read_access_types`), i.e. how often it has actually proved worth
-  reading. Usage is treated as the authority on importance, so material that has repeatedly
-  landed floats to the top of every future index regardless of what today's query embeds near.
+  Ordering is by HEAT — the count of CALLER-CHOSEN body reads
+  (`#{Enum.join(@heat_read_access_types, "/")}`) inside the window; list-shaped ranker output
+  (`search`, `context`) is deliberately NOT counted, see `@heat_read_access_types`. Usage is
+  treated as the authority on importance, so material that keeps proving worth reading holds
+  its rank regardless of what today's query embeds near. Heat is WINDOWED, not cumulative: an
+  empty result means "nothing was read within `meta.heat_window`", NOT "the corpus is empty".
 
   System-scoped published canonicals participate, exactly as they do in
   `list_curated_sources/2` and `progressive_drill/3` — a tenant whose most-read material is
@@ -8924,8 +8940,9 @@ defmodule Loopctl.Knowledge do
     - `:limit` -- top-K, clamped to `1..#{@max_relevance_page_size}` exactly like
       `progressive_index/3`, so an explicit override cannot flood context either.
     - `:since` -- count only accesses at/after this `DateTime`. Defaults to the last
-      #{@heat_default_window_days} days, which BOUNDS the request-path aggregate; pass an
-      older `DateTime` to widen it deliberately and accept the scan.
+      #{@heat_default_window_days} days and is CLAMPED to at most #{@heat_max_window_days}
+      days of lookback, so the request-path aggregate stays bounded either way; pass an older
+      `DateTime` to widen it deliberately and read `meta.heat_window` for what you got.
     - `:category` -- restrict to one category atom.
     - `:visibility_agent_id` -- the calling agent's id (#163). An index is exactly the surface
       where a leak is easy and invisible, because a stub looks innocuous and nobody reads an
@@ -8945,7 +8962,7 @@ defmodule Loopctl.Knowledge do
       opts |> Keyword.get(:limit, progressive_top_k()) |> max(1) |> min(@max_relevance_page_size)
 
     vis = Keyword.get(opts, :visibility_agent_id)
-    since = Keyword.get(opts, :since) || default_heat_since()
+    since = opts |> Keyword.get(:since) |> heat_since()
     category = Keyword.get(opts, :category)
 
     # `top_k + 1` look-ahead: it costs one row and turns "you got exactly the cap" into a
@@ -8956,7 +8973,8 @@ defmodule Loopctl.Knowledge do
       |> heat_counts_query(top_k + 1, since, category, vis)
       |> then(&HeavyRead.all(tenant_id, &1, HeavyRead.opts(:heat_index)))
 
-    stubs = tenant_id |> heat_stubs(Enum.take(counted, top_k), vis)
+    ranked = Enum.take(counted, top_k)
+    stubs = heat_stubs(tenant_id, ranked, vis)
 
     {:ok,
      %{
@@ -8964,6 +8982,11 @@ defmodule Loopctl.Knowledge do
        meta: %{
          top_k: top_k,
          returned: length(stubs),
+         # A ranked id that no longer resolves (archived, unpublished or deleted between the
+         # aggregate and the projection — separate connections, no shared transaction) is
+         # dropped, which would otherwise make a SHORT list indistinguishable from an
+         # exhausted one. `truncated` is about the cap; this is about the drop.
+         unresolved: length(ranked) - length(stubs),
          truncated: length(counted) > top_k,
          # A STATED budget, not an implied one: the caller is expected to paste this into a
          # cached prefix, so it needs to know the cost before it does. Derived from the
@@ -8974,24 +8997,42 @@ defmodule Loopctl.Knowledge do
          counted_access_types: @heat_read_access_types,
          # The read instruction rides IN the payload (#554): an index that lists ids without
          # saying they are actionable gets read as prose.
+         # `knowledge_progressive_drill`, NOT `knowledge_get`: this index also lists published
+         # system canonicals, whose tenant_id is NULL, and `get_article/3` filters on
+         # tenant_id, so following a canon stub into `knowledge_get` 404s.
          drill: %{
-           tool: "knowledge_get",
+           tool: "knowledge_progressive_drill",
            parameter: "article_id",
            note:
-             "Pass a listed id to read the full article. Ordering is cumulative usage (body reads), not relevance to any query."
+             "Pass a listed id to read the full article; this tool also opens the system canonicals listed here, which knowledge_get cannot. Ordering is body reads within meta.heat_window, not relevance to any query."
          }
        }
      }}
   end
 
-  defp default_heat_since,
+  @doc "The default heat window, in days. Single source for the API description (#554)."
+  @spec heat_default_window_days() :: pos_integer()
+  def heat_default_window_days, do: @heat_default_window_days
+
+  @doc "The maximum heat lookback, in days; an older `:since` is clamped to it."
+  @spec heat_max_window_days() :: pos_integer()
+  def heat_max_window_days, do: @heat_max_window_days
+
+  defp heat_since(nil),
     do: DateTime.add(DateTime.utc_now(), -@heat_default_window_days, :day)
+
+  defp heat_since(%DateTime{} = since) do
+    floor = DateTime.add(DateTime.utc_now(), -@heat_max_window_days, :day)
+    if DateTime.compare(since, floor) == :lt, do: floor, else: since
+  end
 
   # Aggregate over the EVENTS alone: no join to `articles`, so no article column (least of all
   # the unbounded body) enters the group key, and the article-side predicates ride in a bounded
-  # `IN (subquery)` id set. That subquery is where the `or a.scope == :system` disjunction is
-  # safe — `HeavyRead.guard!/2` refuses it on a base-table source, and the event row is still
-  # conjunctively tenant-scoped. Same shape `apply_search_filters_on_article/4` uses.
+  # `IN (subquery)` id set. `HeavyRead.guard!/2` does NOT walk a subquery that appears in a
+  # WHERE expression (only `from`/join sources), so the `or a.scope == :system` disjunction
+  # inside it is reasoned about HERE rather than proved: the rows being aggregated are
+  # conjunctively tenant-scoped events, so the id set can only NARROW what this tenant already
+  # generated. Same shape `apply_search_filters_on_article/4` uses.
   defp heat_counts_query(tenant_id, limit, since, category, vis) do
     from(e in ArticleAccessEvent,
       where: e.tenant_id == ^tenant_id,
@@ -9023,9 +9064,12 @@ defmodule Loopctl.Knowledge do
 
   # Bounded projection for the ≤top_k ranked ids only, on `AdminRepo` for the same reason
   # `hydrate_semantic_pool/6` is: a system canonical's NULL `tenant_id` cannot satisfy the
-  # heavy-read guard. `left(body, ...)` keeps the full body off the wire — only enough text to
-  # build a one-line summary is ever shipped. Visibility is re-applied here as the last line of
-  # defence: this is the query that actually reads a title.
+  # heavy-read guard. It runs AFTER the gated aggregate released the heavy-read gate, on the
+  # small admin pool — acceptable HERE because it is a primary-key lookup of at most
+  # `@max_relevance_page_size` ids with `left(body, ...)` clipping the body, i.e. bounded work
+  # with no scan, unlike the aggregate it follows. `status` and visibility are re-applied
+  # rather than trusted from the ranking query: the two run on separate connections, so an
+  # article can be unpublished in between, and this is the query that actually reads a title.
   defp heat_stubs(_tenant_id, [], _vis), do: []
 
   defp heat_stubs(tenant_id, rows, vis) do
@@ -9035,6 +9079,7 @@ defmodule Loopctl.Knowledge do
       from(a in Article,
         where: a.id in ^ids,
         where: a.tenant_id == ^tenant_id or a.scope == :system,
+        where: a.status == :published,
         select: %{
           id: a.id,
           title: a.title,
@@ -9080,7 +9125,7 @@ defmodule Loopctl.Knowledge do
 
   defp heat_stub_chars(stub) do
     String.length(stub.title) + String.length(stub.summary) + String.length(stub.category) +
-      @heat_stub_fixed_chars
+      String.length(Integer.to_string(stub.heat)) + @heat_stub_fixed_chars
   end
 
   # Hub-enrichment neighbor discovery (AC-31.3.4): finds which of the seed

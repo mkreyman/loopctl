@@ -77,8 +77,8 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       tenant = fixture(:tenant)
       article = published_article(tenant.id, %{title: "Old favourite"})
 
-      ancient = DateTime.add(DateTime.utc_now(), -400, :day)
-      heat(tenant.id, article, 5, %{accessed_at: ancient})
+      old = DateTime.add(DateTime.utc_now(), -200, :day)
+      heat(tenant.id, article, 5, %{accessed_at: old})
 
       # The default window bounds the request-path aggregate, so reads older than it are not
       # counted — the endpoint degrades to a shorter list rather than to a statement timeout.
@@ -86,19 +86,37 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert {:ok, _, _} = DateTime.from_iso8601(window)
 
       # An explicit older `:since` widens it back deliberately.
-      wide = DateTime.add(DateTime.utc_now(), -500, :day)
+      wide = DateTime.add(DateTime.utc_now(), -300, :day)
       assert {:ok, %{results: [%{heat: 5}]}} = Knowledge.heat_index(tenant.id, since: wide)
     end
 
-    test "a search impression is not a read, so it adds no heat" do
-      # Counting `search` rows (one per RESULT of one query) would make the ordering a running
-      # tally of past ranker output — the correlation with embedding similarity this route
-      # exists to be free of.
+    test ":since is clamped to the ceiling, so it cannot reinstate the all-time scan" do
+      # The default window is only a bound if a caller cannot widen past what the aggregate can
+      # serve: an arbitrary `since` would otherwise scan the whole read history under the
+      # heavy-read statement timeout and 500 on exactly the tenant with the most of it.
+      tenant = fixture(:tenant)
+      ceiling = Knowledge.heat_max_window_days()
+
+      assert {:ok, %{meta: %{heat_window: window}}} =
+               Knowledge.heat_index(tenant.id,
+                 since: DateTime.add(DateTime.utc_now(), -(ceiling * 3), :day)
+               )
+
+      assert {:ok, effective, _} = DateTime.from_iso8601(window)
+      assert DateTime.diff(DateTime.utc_now(), effective, :day) <= ceiling
+    end
+
+    test "ranker output is not a read, so a search hit or a context pack adds no heat" do
+      # Both `search` and `context` write one row per RESULT of one query, so counting either
+      # would make the ordering a running tally of past ranker output — the correlation with
+      # embedding similarity this route exists to be free of.
       tenant = fixture(:tenant)
       impressions = published_article(tenant.id, %{title: "Only ever matched"})
+      packed = published_article(tenant.id, %{title: "Only ever packed"})
       read = published_article(tenant.id, %{title: "Actually read"})
 
       heat(tenant.id, impressions, 20, %{access_type: "search"})
+      heat(tenant.id, packed, 20, %{access_type: "context"})
       heat(tenant.id, read, 1)
 
       assert {:ok, %{results: results}} = Knowledge.heat_index(tenant.id)
@@ -225,13 +243,19 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
 
       assert {:ok, %{meta: meta}} = Knowledge.heat_index(tenant.id)
 
-      assert meta.drill.tool == "knowledge_get"
+      # `knowledge_get` filters by tenant_id, so it 404s on the published system canonicals
+      # this index also lists — the named tool has to be one that opens every listed id.
+      assert meta.drill.tool == "knowledge_progressive_drill"
       assert meta.drill.parameter == "article_id"
       # The ordering basis is stated, so a reader does not mistake heat for relevance.
-      assert meta.drill.note =~ "usage"
+      assert meta.drill.note =~ "heat_window"
       assert is_integer(meta.char_budget)
       assert is_integer(meta.chars)
-      assert meta.counted_access_types == ["get", "context"]
+      assert meta.counted_access_types == ["get"]
+      # The ranking and the projection run on separate connections, so a ranked article can
+      # vanish between them. The count of dropped ids is STATED, because a short list with
+      # `truncated: false` would otherwise read as an exhausted one.
+      assert meta.unresolved == 0
     end
 
     test "char_budget tracks the effective top_k and actually bounds the payload" do
@@ -350,9 +374,10 @@ defmodule Loopctl.Knowledge.HeatIndexEndpointTest do
     assert Enum.map(body["data"], & &1["title"]) == ["Hot", "Cold"]
     assert Enum.map(body["data"], & &1["heat"]) == [7, 1]
     # Self-describing: the payload says how to act on an id.
-    assert body["meta"]["drill"]["tool"] == "knowledge_get"
+    assert body["meta"]["drill"]["tool"] == "knowledge_progressive_drill"
     assert {:ok, _, _} = DateTime.from_iso8601(body["meta"]["heat_window"])
-    assert body["meta"]["counted_access_types"] == ["get", "context"]
+    assert body["meta"]["counted_access_types"] == ["get"]
+    assert body["meta"]["unresolved"] == 0
   end
 
   test "a malformed `since` is a 400, not a silent widening of the window", %{conn: conn} do

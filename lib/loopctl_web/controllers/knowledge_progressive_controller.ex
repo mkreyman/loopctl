@@ -31,6 +31,11 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
 
   @valid_categories Ecto.Enum.values(Article, :category)
 
+  # The published description and the ENFORCED bound read the same value, so tuning the window
+  # cannot silently make the docs promise history the server no longer scans.
+  @heat_default_window_days Knowledge.heat_default_window_days()
+  @heat_max_window_days Knowledge.heat_max_window_days()
+
   operation(:index,
     summary: "Progressive-disclosure index",
     description:
@@ -114,9 +119,10 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
     description:
       "A bounded, top-K-capped stub list of the corpus (tenant articles plus published " <>
         "system canonicals) ordered by HEAT — the number of times each article's BODY was " <>
-        "read. Only the read access types are counted (`meta.counted_access_types`, i.e. " <>
-        "get/context); a search result is an impression, not a read, so it does not add " <>
-        "heat. Takes NO query, which is the " <>
+        "read directly. Only caller-chosen fetches are counted " <>
+        "(`meta.counted_access_types`); list-shaped ranker output (a search hit, a context " <>
+        "pack) is one row per RESULT, not a read, so it adds no heat. Takes NO query, " <>
+        "which is the " <>
         "point: every other retrieval route starts from one, so they all miss the same way " <>
         "on a paraphrase or on material that is topically central but lexically dissimilar. " <>
         "This route's failures are uncorrelated with embedding similarity.\n\n" <>
@@ -141,10 +147,12 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
         in: :query,
         type: :string,
         description:
-          "ISO-8601 timestamp. Count only accesses at/after it. Omitted means the last 90 " <>
-            "days, which bounds the request-path aggregate over an ever-growing read " <>
-            "history; pass an older timestamp to widen the window deliberately. The " <>
-            "effective window is echoed as `meta.heat_window`."
+          "ISO-8601 timestamp. Count only accesses at/after it. Omitted means the last " <>
+            "#{@heat_default_window_days} days, and a lookback longer than " <>
+            "#{@heat_max_window_days} days is CLAMPED to that ceiling — both bound the " <>
+            "request-path aggregate over an ever-growing read history. Pass an older " <>
+            "timestamp to widen the window deliberately; the effective window is echoed " <>
+            "as `meta.heat_window`."
       ]
     ],
     responses: %{

@@ -11,8 +11,8 @@ defmodule Loopctl.HeavyRead do
   A query is accepted only if EVERY base-table source it reads from — the `from`
   table AND every joined table — is constrained by a CONJUNCTIVE
   `x.tenant_id == ^tenant_id` equality on THAT source's binding, bound to the
-  `tenant_id` argument passed in; subquery sources (from/join/where-in) are
-  required to be scoped the same way, recursively. Concretely this rejects:
+  `tenant_id` argument passed in; `from`/`join` SUBQUERY sources are required to
+  be scoped the same way, recursively. Concretely this rejects:
 
     * an unscoped `from` (the primary table read without a tenant filter), even
       if a *joined* table is scoped;
@@ -27,11 +27,11 @@ defmodule Loopctl.HeavyRead do
 
   This is a strong necessary gate, not a proof of full query correctness. The
   tenant predicate MUST be an Ecto field comparison `x.tenant_id == ^id` (a raw
-  `fragment("tenant_id = ?", ^id)` is not recognized and will be rejected — scope
-  through the schema field). Sources that are neither a schema table nor a
-  subquery (a raw `fragment` from, or a CTE reference) are not structurally
-  validated — express tenant scoping in the outer query or a from/join subquery
-  rather than a CTE source.
+  `fragment("tenant_id = ?", ^id)` is rejected — scope through the schema field).
+  A source that is neither a schema table nor a from/join subquery (a raw
+  `fragment` from, a CTE reference) is not structurally validated, and NEITHER is a
+  subquery in a WHERE/HAVING expression (`where: x.id in subquery(q)`): only `from`
+  and joins are walked, so reason about what such a subquery reads at the call site.
 
   A companion build guard (`test/loopctl/heavy_read_guard_test.exs`) fails if any
   `lib/` module other than this one reaches `Loopctl.HeavyReadRepo` directly, so
