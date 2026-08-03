@@ -37,6 +37,7 @@ defmodule LoopctlWeb.FallbackController do
   use LoopctlWeb, :controller
 
   alias Ecto.Changeset
+  alias Loopctl.ApiSpec.Messages
   alias Loopctl.Llm.Remediation
   alias LoopctlWeb.DBError
   alias LoopctlWeb.DBErrorLogger
@@ -369,10 +370,9 @@ defmodule LoopctlWeb.FallbackController do
         # the real backlog may be zero, so the old copy ("already has too many ... once the
         # backlog drains") told the client a fact the server does not have, and pointed it
         # at a remedy that may not apply.
-        message:
-          "Ingestion is shedding for this tenant: the in-flight backlog is at or over the " <>
-            "threshold, or it could not be measured. No items from this batch were " <>
-            "enqueued. Retry after #{retry_after} seconds.",
+        # ONE definition, shared with the published OpenAPI example/body (#558) so the spec
+        # cannot keep telling clients something this response stopped saying.
+        message: Messages.ingestion_backlog_exceeded(retry_after),
         retry_after_seconds: retry_after
       }
     })

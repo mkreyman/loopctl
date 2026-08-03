@@ -55,6 +55,7 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstop do
 
   require Logger
 
+  alias Loopctl.ExitClass
   alias LoopctlWeb.{DBError, DBErrorLogger, SanitizedDBError}
   alias Plug.Conn.WrapperError
 
@@ -69,6 +70,25 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstop do
   rescue
     wrapper in WrapperError ->
       handle(wrapper.conn || conn, wrapper.reason, wrapper, __STACKTRACE__)
+  catch
+    # #558: a rescue sees only the RAISE shape. Crash PROPAGATION from a pooled process —
+    # `exit({{%Postgrex.Error{}, stacktrace}, {DBConnection, :execute, args}})` — is an EXIT,
+    # so it walked past this backstop entirely and reached the crash log RAW: the Postgrex
+    # struct carries the failing statement, and `args` carries its bound parameters, which on
+    # this app's read paths means query text and vector literals.
+    #
+    # This does NOT translate the response. The backstop's contract is that a DB exception
+    # gets a pinned status, and an exit is not something we can turn into one here without
+    # guessing at the request's state. It logs the BOUNDED class so the fault is attributable,
+    # then re-exits unchanged so supervision and the crash report behave exactly as before.
+    # The only thing that changes is that the raw reason stops being the first record of it.
+    kind, reason when kind in [:exit, :throw] ->
+      Logger.error(
+        "DBErrorBackstop: request #{kind} (#{ExitClass.classify(kind, reason)}) " <>
+          "on #{conn.method} #{conn.request_path}"
+      )
+
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
   # Config-based DI (CLAUDE.md convention) so a test can inject a router that

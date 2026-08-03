@@ -6,6 +6,27 @@ All notable changes to loopctl are documented here.
 
 Operator-facing changes for deployments outside the hosted instance.
 
+### Changed
+
+- **`loopctl.oban.poll.error.count` label values changed — re-point any Prometheus selector
+  or Grafana panel (#558).** The `error_class` label moved from a bare `exit` / `throw` to the
+  kind-prefixed, closed set produced by `Loopctl.ExitClass` — `exit:noproc`, `exit:timeout`,
+  `exit:Postgrex.Error`, `throw:other`, and so on. A selector matching the old bare values
+  **silently stops firing** rather than erroring, which is the worst failure mode an alert
+  has. The same vocabulary is now shared by the ingestion backlog-gate and vector-search
+  under-fill counters, so one query shape works across all three.
+
+- **`loopctl.ingestion.backlog_gate.failed_open.*` gained an `:outcome` label, and a `jobs`
+  sum alongside the counter.** The event now fires on refusals as well as admissions, so a
+  dashboard reading the counter alone over-reports admissions during exactly the sustained
+  incident it is alerted on; slice by `outcome` (`admitted` / `unmetered` / `exhausted`). The
+  `jobs` series is job-denominated — one 50-item batch is one check but fifty jobs.
+
+- **A `throw` from the ingestion backlog count no longer consumes a tenant's fail-open
+  allowance.** It still admits and still emits the counter; it is simply not treated as pool
+  pressure, because a deterministic counting fault recurs regardless of capacity and would
+  otherwise drain the window and 429 an under-threshold tenant.
+
 ### Added
 
 - **A retirement trigger for the US-41.1 legacy embedding columns (#551).** New migration

@@ -1,4 +1,6 @@
 defmodule Loopctl.ApiSpec.Schemas do
+  alias Loopctl.ApiSpec.Messages
+
   @moduledoc """
   Reusable OpenAPI schema definitions for loopctl API request/response shapes.
   """
@@ -242,10 +244,7 @@ defmodule Loopctl.ApiSpec.Schemas do
             },
             message: %Schema{
               type: :string,
-              example:
-                "This tenant already has too many in-flight ingestion jobs queued. " <>
-                  "No items from this batch were enqueued. Retry after 5 seconds " <>
-                  "once the backlog drains."
+              example: Messages.ingestion_backlog_exceeded(5)
             },
             retry_after_seconds: %Schema{type: :integer, example: 5}
           }
@@ -255,10 +254,7 @@ defmodule Loopctl.ApiSpec.Schemas do
         error: %{
           status: 429,
           code: "ingestion_backlog_exceeded",
-          message:
-            "This tenant already has too many in-flight ingestion jobs queued. " <>
-              "No items from this batch were enqueued. Retry after 5 seconds " <>
-              "once the backlog drains.",
+          message: Messages.ingestion_backlog_exceeded(5),
           retry_after_seconds: 5
         }
       }

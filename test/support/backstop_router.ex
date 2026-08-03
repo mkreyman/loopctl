@@ -48,6 +48,19 @@ defmodule Loopctl.Test.BackstopRouter do
   # carrying the dispatched conn so controller/action/assigns are populated for
   # the structured log. We stamp a phoenix_controller so the log line has a
   # controller field, mirroring a real dispatched request.
+  # #558: crash PROPAGATION from a pooled process is an EXIT, not a raise, so it needs its
+  # own shape here — a `rescue`-only backstop never sees it. The reason carries the failing
+  # Postgrex struct (statement text) and the call's bound args, which is exactly what must not
+  # reach the crash log raw.
+  defp raise_uncaught(_conn, "exit-propagation") do
+    exit(
+      {{%Postgrex.Error{
+          postgres: %{code: :undefined_table, pg_code: "42P01", severity: "ERROR", message: "x"},
+          query: "SELECT id FROM things ORDER BY embedding <=> '[0.123,0.456]'::vector LIMIT 5"
+        }, []}, {DBConnection, :execute, [:secret_bound_param]}}
+    )
+  end
+
   defp raise_uncaught(conn, kind) do
     dispatched = %{conn | private: Map.put(conn.private, :phoenix_controller, SomeCtl)}
 

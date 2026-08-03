@@ -377,7 +377,19 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   defp metered_fail_open?("timeout"), do: true
   defp metered_fail_open?("guc_capture_abort"), do: true
   defp metered_fail_open?("exit:" <> _tag), do: true
-  defp metered_fail_open?("throw:" <> _tag), do: true
+
+  # #558: a THROW is NOT metered, and deliberately not symmetric with `exit:`. An exit here
+  # means the pool process was absent or wedged — sustained, and exactly what the allowance
+  # exists to bound. A throw is a DETERMINISTIC fault in the counting code: it recurs on every
+  # request, at the same rate, no matter how much capacity the pool has. Metering it therefore
+  # drains the tenant's per-window allowance and then 429s an under-threshold tenant with a
+  # backlog error code, over a fault that is not its backlog and that waiting will not clear.
+  #
+  # It still ADMITS (the count is genuinely unmeasurable, and this gate must never block work
+  # over its own defect) and still emits the counter, so the fault stays alertable rather than
+  # silent — it just does not consume the budget reserved for real pool pressure. Same
+  # reasoning as `db_error` below.
+  defp metered_fail_open?("throw:" <> _tag), do: false
   defp metered_fail_open?(_class), do: false
 
   # ONE token per SUBMITTED ITEM (an upper bound on the jobs this request would enqueue),

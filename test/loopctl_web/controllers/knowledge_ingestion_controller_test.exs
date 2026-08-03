@@ -1175,6 +1175,42 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert metadata.outcome == :admitted
     end
 
+    test "#558: a THROW admits but is NOT metered — it is not pool pressure", %{conn: conn} do
+      # An exit means the pool was absent or wedged: sustained, and what the allowance exists
+      # to bound. A throw is a deterministic fault in the counting code — it recurs at the same
+      # rate regardless of capacity, so metering it drains the budget and then 429s an
+      # under-threshold tenant over a fault that waiting will never clear.
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      attach_failed_open(tenant.id)
+
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        throw(:boom)
+      end)
+
+      # Allowance fully spent: a METERED class would 429 here. This one must still admit.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, limit ->
+        if String.starts_with?(bucket, "ingest_backlog_fail_open:"),
+          do: {:deny, limit},
+          else: {:allow, 1}
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "Throwing counter item", source_type: "newsletter"}]
+        })
+
+      assert length(json_response(conn, 200)["data"]) == 1
+
+      # Still ALERTABLE — admitting silently would hide a deterministic defect.
+      assert_receive {:backlog_failed_open, _measurements, metadata}
+      assert metadata.error_class == "throw:other"
+      assert metadata.outcome == :admitted
+    end
+
     test "a NON-timeout SQLSTATE is not reported as a timeout", %{conn: conn} do
       # The rescue catches EVERY `Postgrex.Error`, not only 57014, so a query bug in the
       # count path (a column renamed out from under `FairShare`) also fails open. It must

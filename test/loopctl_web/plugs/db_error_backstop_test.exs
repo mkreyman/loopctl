@@ -118,4 +118,27 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
       assert_raise RuntimeError, "boom", fn -> LoopctlWeb.Endpoint.call(conn, []) end
     end
   end
+
+  describe "#558: crash propagation is an EXIT, not a raise" do
+    test "the backstop logs a BOUNDED class and re-exits unchanged", %{conn: conn} do
+      # A `rescue`-only backstop never saw this shape, so the raw reason reached the crash
+      # log — carrying the failing statement and its bound parameters.
+      {conn, _tenant} = authed_conn(conn)
+      conn = put_req_header(conn, "x-test-raise-db-error", "exit-propagation")
+
+      {reason, log} =
+        with_log(fn ->
+          catch_exit(LoopctlWeb.Endpoint.call(conn, []))
+        end)
+
+      # Re-exited UNCHANGED — the backstop attributes, it does not swallow or translate.
+      assert {{%Postgrex.Error{}, _stack}, {DBConnection, :execute, _args}} = reason
+
+      assert log =~ "DBErrorBackstop: request exit"
+      # The CLASS, from the closed ExitClass set — never the reason itself.
+      assert log =~ "exit:Postgrex.Error"
+      refute log =~ "secret_bound_param"
+      refute log =~ "0.123"
+    end
+  end
 end

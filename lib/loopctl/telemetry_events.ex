@@ -84,10 +84,17 @@ defmodule Loopctl.TelemetryEvents do
   ## Payload (bounded tags only — NEVER the query, the vector, or a PG message body)
 
     * `measurements`: `%{count: 1}` — a pure increment.
-    * `metadata`: `%{tenant_id, endpoint, error_class}` where `error_class` is a BOUNDED tag:
+    * `metadata`: `%{tenant_id, endpoint, error_class}` where `error_class` is BOUNDED:
       `"guc_capture_abort"` (`Loopctl.LocalGuc` REFUSED to override a GUC an enclosing scope
       owns — deliberate, not a blip) | `"connection"` (pool/connection fault) | `"timeout"`
-      (57014 server-side cancel).
+      (57014 server-side cancel) | `"overloaded"` (a `HeavyRead` TenantGate shed — added with
+      the exit guard, because an overload escaping the probe turned an already-computed 200
+      into a 429) | `exit:<t>` / `throw:<t>` over `Loopctl.ExitClass`'s CLOSED tag set (a pool
+      that exits rather than raises).
+
+  This list is the DECLARED source of truth that `ScaleMetrics.degraded_read_tags/1` points
+  at, so a stale entry here is how an unbounded label reaches Prometheus unnoticed. It has
+  gone stale twice; update it in the same change that adds a class.
   """
   def vector_search_under_fill_probe_degraded,
     do: [:loopctl, :knowledge, :vector_search, :under_fill_probe_degraded]
@@ -252,13 +259,21 @@ defmodule Loopctl.TelemetryEvents do
       families from `Loopctl.ExitClass`.
 
       METERED classes (bounded allowance, then 429): `connection`, `timeout`, `db_pressure`,
-      `guc_capture_abort`, `exit:*`, `throw:*`. UNMETERED (always admits): `db_error`.
+      `guc_capture_abort`, `exit:*`. UNMETERED (always admits): `db_error` and `throw:*`.
+
+      `throw:*` is deliberately NOT symmetric with `exit:*` (#558). An exit means the pool
+      process was absent or wedged — sustained, and what the allowance exists to bound. A
+      throw is a DETERMINISTIC fault in the counting code: it recurs at the same rate however
+      much capacity the pool has, so metering it drains the window and then 429s an
+      under-threshold tenant over something waiting will not clear.
 
       `tenant_id` is an id, cap-gated to a sentinel in the metric's `tag_values`
       (`ScaleMetrics.backlog_gate_tags/1`) so label cardinality stays bounded.
 
-  Aggregated by `Loopctl.Telemetry.ScaleMetrics` as a counter tagged by
-  `[:error_class, :tenant_id]`.
+  Aggregated by `Loopctl.Telemetry.ScaleMetrics` as TWO series — a counter on `count` and a
+  sum on `jobs` — both tagged `[:error_class, :outcome, :tenant_id]`. The `:outcome` label is
+  load-bearing: this event fires on refusals as well as admissions, so without it a refusal
+  increments the same series as an admission.
   """
   def ingestion_backlog_gate_failed_open,
     do: [:loopctl, :ingestion, :backlog_gate, :failed_open]
