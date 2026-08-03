@@ -44,6 +44,29 @@ Operator-facing changes for deployments outside the hosted instance.
   deterministic fault never reaches. `Retry-After` is set on both; a client branching on
   `error.code` needs no change, one branching on the status does.
 
+- **Tightening `OBAN_INGEST_BACKLOG_MAX` now tightens the ingest fail-open allowance with it
+  (#564).** That allowance — how many jobs a tenant may have admitted while the gate cannot
+  MEASURE its backlog — is `max(1, OBAN_INGEST_BACKLOG_MAX / 10)` per web node, sized so a
+  10-node fleet stays at or under one threshold per hour. A floor at one full batch (50)
+  previously took over for any threshold below 500, so lowering the knob to e.g. `100` left
+  the allowance pinned at 50/node — a fleet admitting 500/hour against a threshold of 100,
+  silently, and in the direction an operator assumes is the safer one. Effect at the default
+  of 500 is unchanged. Below a threshold of 10 the allowance floors at 1 rather than 0, so
+  the valve can never fail CLOSED on the first transient blip. `OBAN_INGEST_BACKLOG_MAX` and
+  `OBAN_INGEST_BACKLOG_RETRY_AFTER` are now documented in `deploy/FLY_SECRETS.md`, where
+  they should have been all along.
+
+- **`POST /knowledge/ingest[/batch]` can answer `503 ingestion_gate_unavailable` for a
+  `db_error` too (#564).** It was the last unmeasurable-count class still admitting
+  UNCONDITIONALLY — on the reasoning that a broken count query is our defect, not the
+  tenant's backlog. That is a correct argument about the error CODE (and is kept: the refusal
+  is the 503, never a backlog 429) but it left the class unbounded, and a deterministic
+  query-shape fault recurs on every request — so the backpressure valve was simply OFF for as
+  long as the bug existed. Every class is now metered. Operator-visible as ingest requests
+  that previously succeeded during a counting-code fault now being refused once the hourly
+  allowance is spent; the `loopctl.ingestion.backlog_gate.failed_open.*` series with
+  `error_class="db_error"` is the signal to fix the query.
+
 ### Added
 
 - **A retirement trigger for the US-41.1 legacy embedding columns (#551).** New migration

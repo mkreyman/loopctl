@@ -57,11 +57,19 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # is therefore per-node x web-node count — at a flat 100 that silently multiplied PAST the
   # threshold from ~5 nodes up. Dividing the threshold by @fail_open_fleet_nodes holds the
   # FLEET allowance at or under one `OBAN_INGEST_BACKLOG_MAX` per hour per tenant for any
-  # fleet up to that many web nodes, and retuning the threshold retunes this with it. It is
-  # FLOORED at @batch_max because charging is incremental with no reservation or refund: an
-  # allowance smaller than one batch converts the whole window into nothing the first time a
-  # batch is refused mid-charge, and integer division floors to 0 (clamping to a useless 1
-  # job/hour) for any OBAN_INGEST_BACKLOG_MAX under @fail_open_fleet_nodes.
+  # fleet up to that many web nodes, and retuning the threshold retunes this with it.
+  #
+  # FLOORED at 1, NOT at one full batch. A @batch_max floor was the one thing that could
+  # break the fleet bound stated just above: it took over whenever the threshold divided to
+  # less than a batch, so TIGHTENING `OBAN_INGEST_BACKLOG_MAX` stopped tightening the
+  # allowance and pinned it at 50/node — a 10-node fleet admitting 500 jobs/hour against a
+  # threshold of 100 — quietly, and in exactly the direction an operator assumes is the safe
+  # one. The floor exists only to stop integer division producing 0, which would make the
+  # valve fail CLOSED and refuse an innocent tenant on the first transient blip. Residual and
+  # accepted: for a threshold below @fail_open_fleet_nodes the fleet may admit up to
+  # @fail_open_fleet_nodes jobs/hour against a smaller threshold. That is unavoidable without
+  # shared (non-node-local) limiter state, and it is the bound documented for every
+  # node-local limit divided by node count — over-admission when node_count > limit.
   @fail_open_window_ms 3_600_000
   @fail_open_fleet_nodes 10
 
@@ -77,8 +85,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
                                   "jobs are enqueued. Distinct from the 429s: this one does " <>
                                   "NOT assert anything about your backlog."
 
-  # Max batch size for POST /knowledge/ingest/batch. Declared HERE, above
-  # `fail_open_jobs_per_window/0`, which floors the fail-open allowance at one full batch.
+  # Max batch size for POST /knowledge/ingest/batch.
   @batch_max 50
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.ProjectId
@@ -363,16 +370,31 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # SUSTAINED, so an unconditional admit makes "no backpressure at all" the steady state
   # during exactly the overload the valve exists to bound. (Before the exit shape was caught
   # at all, the 500 at least shed the flood incidentally.) So those admissions are metered
-  # (`fail_open_jobs_per_window/0` per tenant per `@fail_open_window_ms`), and the rest are
-  # refused — as the backlog 429 where the fault IS pool pressure, otherwise as the
-  # server-side 503 (`backlog_attributable?/1`).
+  # (`fail_open_jobs_per_window/0` per tenant per `@fail_open_window_ms`), and past the
+  # allowance the request is refused — as the backlog 429 where the fault IS pool pressure,
+  # otherwise as the server-side 503 (`backlog_attributable?/1`).
+  #
+  # EVERY class is metered, unconditionally. There used to be a `metered_fail_open?/1`
+  # predicate carving out the classes believed to be capacity-INDEPENDENT (a counting-code
+  # defect rather than backlog pressure), so those admitted for free. It was whittled down one
+  # finding at a time — `db_pressure`, `driver_fault`, `guc_capture_abort`, `throw:*` — until
+  # `db_error` was the last class still exempt, and exempt is precisely "unbounded fail-open,
+  # forever": a deterministic query-shape fault (42703 after a `FairShare` change) recurs on
+  # every single request, so the valve is simply OFF for as long as the bug exists.
+  #
+  # The predicate is gone rather than extended, because the exemption cannot be right for ANY
+  # class. It always rested on two claims, and the second never holds here: that the fault is
+  # not capacity-related, AND that the tenant is under threshold — which is unknowable exactly
+  # when the count is UNMEASURABLE. The objection the carve-out actually encoded (do not tell
+  # an under-threshold tenant its backlog is too big over a defect in our counting code) is a
+  # question about the error CODE, and it is answered in `backlog_attributable?/1`: metered
+  # here, refused as a 503 there. Removing the branch makes "admissions are bounded" a
+  # property of the gate instead of a per-class opinion a later edit can quietly invert.
+  #
   # EVERY outcome emits `fail_open_event/4`: the only signal that the backlog is UNMEASURABLE
   # must not go silent at the moment the fault stops being a blip and becomes the wedge.
   defp backlog_fail_open_verdict(tenant_id, error_class, jobs) do
-    outcome =
-      if metered_fail_open?(error_class),
-        do: consume_fail_open_allowance(tenant_id, jobs),
-        else: :admitted
+    outcome = consume_fail_open_allowance(tenant_id, jobs)
 
     fail_open_event(tenant_id, error_class, outcome, jobs)
     retry_after = backlog_retry_after_seconds()
@@ -392,37 +414,15 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # `429 ingestion_backlog_exceeded` there asserts a backlog nobody counted and advertises a
   # remedy (wait for the drain) that a deterministic fault never reaches: the tenant may be at
   # zero backlog and is refused for the whole window. Those get the server-side 503 instead.
+  # `db_error` joins them. It is the class for a fault carrying a server SQLSTATE that is
+  # neither saturation (53/57/08) nor a timeout — i.e. a query-shape bug in OUR counting code
+  # (42703 after a `FairShare` change, 08P01 protocol_violation). The tenant's backlog is
+  # unknown and unrelated, so a 429 would name a backlog nobody counted and advertise a remedy
+  # — wait for the drain — that a deterministic defect never reaches.
   defp backlog_attributable?("throw:" <> _tag), do: false
   defp backlog_attributable?("driver_fault"), do: false
+  defp backlog_attributable?("db_error"), do: false
   defp backlog_attributable?(_class), do: true
-
-  # Meter every class that means the POOL is under pressure, including `guc_capture_abort`:
-  # `LocalGuc` raises that abort only after the capture round-trip ITSELF failed, i.e. the
-  # connection is already wedged, which is exactly the sustained pressure this bound exists
-  # for — leaving it unmetered let the wedge keep its unconditional admit under any nested
-  # scope. Only a broken count QUERY (`db_error`, e.g. 42703 after a `FairShare` change)
-  # stays unmetered: it is not backlog pressure at all, and capping it would 429 an
-  # under-threshold tenant with a backlog error code it has not earned.
-  defp metered_fail_open?("connection"), do: true
-  defp metered_fail_open?("db_pressure"), do: true
-  defp metered_fail_open?("driver_fault"), do: true
-  defp metered_fail_open?("timeout"), do: true
-  defp metered_fail_open?("guc_capture_abort"), do: true
-  defp metered_fail_open?("exit:" <> _tag), do: true
-
-  # A THROW is metered, SYMMETRIC with `exit:`. Un-metering it on the premise that a throw is
-  # always a deterministic counting-code defect restored, for that class, precisely the
-  # unbounded fail-open this allowance exists to close: an admit with no bound, forever. The
-  # premise does not hold either — Ecto/DBConnection re-raise a throw out of a transaction
-  # fun, so a throw is not structurally capacity-independent. And when the count is
-  # unmeasurable the server does not know the tenant IS under threshold, which is the whole
-  # reason admissions are bounded rather than free. The counter (`fail_open_event/4`) is what
-  # keeps a deterministic defect alertable; the allowance is not the alerting mechanism.
-  # What the round-tripping of this decision was actually about — a client told "your backlog
-  # is too big, wait" for a counting-code defect — is settled in `backlog_attributable?/1`:
-  # metered here, refused as a 503 there. Metering and the error CODE are separate questions.
-  defp metered_fail_open?("throw:" <> _tag), do: true
-  defp metered_fail_open?(_class), do: false
 
   # ONE token per SUBMITTED ITEM (an upper bound on the jobs this request would enqueue),
   # halting on a REFUSAL so a doomed request does not queue up to @batch_max more checks. An
@@ -431,9 +431,11 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # halting on it converted ONE transient soft-error into a whole batch admitted with ZERO
   # tokens charged, so an ALREADY-SPENT allowance stopped refusing. The `:unmetered` verdict is
   # carried forward instead (it is what keeps the unconsultable meter alertable), and a later
-  # `{:deny, _}` still refuses. Tokens charged before the halt are not refunded
-  # (the limiter has no reservation), which is why `fail_open_jobs_per_window/0` is floored
-  # at one full batch: an allowance smaller than a batch would be converted into nothing.
+  # `{:deny, _}` still refuses. Tokens charged before the halt are NOT refunded (the limiter
+  # has no reservation), so a batch bigger than the remaining allowance burns what is left and
+  # is refused anyway — bounded waste, on the safe side of a valve that is already admitting
+  # blind. The allowance is deliberately NOT inflated to one full batch to compensate: that
+  # floor is what broke the fleet bound `fail_open_jobs_per_window/0` derives.
   #
   # TRI-STATE, because a limiter FAULT is not a spent allowance and neither
   # `RateLimiter.within_limit?/3` (fail-OPEN) nor `gate_ok?/3` (fail-CLOSED) can tell them
@@ -485,9 +487,18 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     kind, _reason when kind in [:exit, :throw] -> :unmetered
   end
 
-  defp fail_open_jobs_per_window do
-    max(@batch_max, div(ObanConfig.ingest_backlog_max(), @fail_open_fleet_nodes))
+  # PUBLIC as a pure function of the threshold, for the same reason `fail_open_meter/1` is:
+  # the property that matters — TIGHTENING `OBAN_INGEST_BACKLOG_MAX` tightens the allowance —
+  # is invisible at the one threshold a test run happens to have configured (the default 500
+  # divides to exactly @batch_max, which is why the old floor could sit there breaking the
+  # fleet bound at every OTHER value with a green suite).
+  @doc false
+  @spec fail_open_jobs_per_window(pos_integer()) :: pos_integer()
+  def fail_open_jobs_per_window(max_backlog) when is_integer(max_backlog) and max_backlog > 0 do
+    max(1, div(max_backlog, @fail_open_fleet_nodes))
   end
+
+  defp fail_open_jobs_per_window, do: fail_open_jobs_per_window(ObanConfig.ingest_backlog_max())
 
   # FAIL OPEN on an UNMEASURABLE count only: an unreachable/timed-out backlog count must
   # never block work (an innocent, under-threshold tenant must never eat a generic 500
@@ -578,30 +589,31 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   defp fail_open_class(%Postgrex.Error{postgres: %{code: :query_canceled}}), do: "timeout"
 
   # 08P01 protocol_violation is a driver / query-shape bug that happens to live in the
-  # connection-exception class — not saturation. Metering it would cap an under-threshold
-  # tenant over a fault that is not its backlog, so it is excluded from `db_pressure` BEFORE
-  # the class match below.
+  # connection-exception class — not saturation. Classing it as `db_pressure` would answer an
+  # under-threshold tenant with a backlog 429 over a fault that is not its backlog, so it is
+  # excluded BEFORE the class match below. Every class is metered either way; what this
+  # split decides is the error CODE (`backlog_attributable?/1`) and what an operator triages.
   defp fail_open_class(%Postgrex.Error{postgres: %{pg_code: "08P01"}}), do: "db_error"
 
   # Resource exhaustion (SQLSTATE class 53, e.g. 53300 too_many_connections), operator
   # intervention (57, e.g. 57P03 cannot_connect_now) and connection exceptions (08) arrive as
   # a server ERROR, not a `DBConnection` exit — the NORMAL presentation of pool saturation
-  # behind pgbouncer. They ARE the sustained pressure the meter bounds, so they must not slip
-  # into the unmetered `db_error` bucket (and escape it unconditionally) merely because of the
-  # struct they travel in. Only a genuine query-shape error (42xxx et al) stays `db_error`.
+  # behind pgbouncer. They ARE backlog pressure, and a tenant refused over them has genuinely
+  # earned `429 ingestion_backlog_exceeded` — so they must not slip into the `db_error` bucket
+  # (refused as a 503 that asserts nothing about a backlog) merely because of the struct they
+  # travel in. Only a genuine query-shape error (42xxx et al) stays `db_error`.
   defp fail_open_class(%Postgrex.Error{postgres: %{pg_code: <<class::binary-2, _::binary>>}})
        when class in ~w(53 57 08),
        do: "db_pressure"
 
-  # UNMETERED `db_error` is restricted to an error that actually carries a server SQLSTATE —
-  # i.e. a query-shape bug, which is not backlog pressure. A `Postgrex.Error` with NO
-  # `postgres` map is a CLIENT-side driver fault (protocol/decode failure on a degrading
-  # connection); letting it fall into the catch-all admitted it unconditionally and forever,
-  # charging nothing. It gets its OWN class rather than `db_pressure`, because the same shape
-  # also carries PERMANENT config faults ("ssl not available", "unexpected postgres status"):
-  # metered, so admissions stay bounded, but NOT backlog-attributable, so exhausting the
-  # allowance on one never answers an under-threshold tenant with a backlog code
-  # (`backlog_attributable?/1`).
+  # `db_error` is restricted to an error that actually carries a server SQLSTATE — i.e. a
+  # query-shape bug, which is not backlog pressure. A `Postgrex.Error` with NO `postgres` map
+  # is a CLIENT-side driver fault (protocol/decode failure on a degrading connection). It gets
+  # its OWN class rather than `db_pressure`, because the same shape also carries PERMANENT
+  # config faults ("ssl not available", "unexpected postgres status"), so exhausting the
+  # allowance on one must not answer an under-threshold tenant with a backlog code. Both land
+  # on the same side of `backlog_attributable?/1`; they stay separate classes because the
+  # telemetry label is what sends a triaging operator at the query or at the driver.
   defp fail_open_class(%Postgrex.Error{postgres: %{pg_code: pg_code}}) when is_binary(pg_code),
     do: "db_error"
 

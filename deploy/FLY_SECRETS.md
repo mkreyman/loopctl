@@ -80,6 +80,32 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 > boot — a deliberate choice after the `STH_SWEEP_CRON` incident, so a bad
 > placeholder can never take the app down at startup.
 
+#### Ingestion backlog gate
+
+Per-tenant backpressure on `POST /api/v1/knowledge/ingest` and `/ingest/batch`, so one
+tenant cannot monopolise the `:ingestion` queue. Read at call time, so both are tunable
+during an incident with `fly secrets set … && fly apps restart` — no deploy.
+
+| Variable                          | Default | Description |
+|-----------------------------------|---------|-------------|
+| `OBAN_INGEST_BACKLOG_MAX`         | `500`   | In-flight `:ingestion` jobs at/above which a tenant's ingest requests get `429 ingestion_backlog_exceeded`. A SOFT admission floor, not a hard cap — the check is a lock-free read-then-enqueue, so concurrent requests can overshoot it by the in-flight request concurrency. Read it as "start shedding around here". **It also derives the fail-open allowance** (see below), so tightening it tightens both |
+| `OBAN_INGEST_BACKLOG_RETRY_AFTER` | `60`    | Seconds advised in `Retry-After` on a backlog refusal. Scaled to the queue's DRAIN cadence (jobs are multi-minute LLM calls on a width-2 queue), not to a request cadence — a few-second hint just hot-loops a compliant client into a stream of 429s |
+
+> **When the gate cannot MEASURE the backlog** (wedged/saturated `AdminRepo` pool, driver
+> fault, or a defect in the counting query) it fails OPEN — an innocent tenant must not be
+> refused because the count path is degraded — but only for a bounded number of jobs per
+> tenant per hour: `max(1, OBAN_INGEST_BACKLOG_MAX / 10)` per web node. The `/ 10` holds the
+> FLEET allowance at or under one `OBAN_INGEST_BACKLOG_MAX` per hour for a fleet up to 10 web
+> nodes, because the default limiter is node-local ETS. Past that allowance the request is
+> refused — `429 ingestion_backlog_exceeded` when the fault IS pool pressure, otherwise
+> `503 ingestion_gate_unavailable`, which asserts nothing about the tenant's backlog. Watch
+> `loopctl.ingestion.backlog_gate.failed_open.*` sliced by `outcome` and `error_class`; a
+> sustained non-zero rate means the valve is admitting or refusing blind.
+
+> Both accept only a **positive integer**, and unlike the rate-limit knobs above they are
+> validated at BOOT (`config/runtime.exs` evaluates them), so a malformed value aborts the
+> node LOUD at startup rather than surfacing as per-request 500s on the ingest endpoints.
+
 #### Metrics and scale alerting
 
 | Variable                    | Default | Description |

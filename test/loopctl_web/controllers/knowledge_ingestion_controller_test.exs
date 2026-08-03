@@ -1160,10 +1160,10 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
       # ...over the :ingestion queue's DRAIN cadence (an hour — a 60s window refills to ~60x
       # the threshold against a ~20/hour drain), against a limit DERIVED from
-      # OBAN_INGEST_BACKLOG_MAX and floored at one full batch: integer division floors to 0
-      # for a small threshold, and charging is incremental with no refund.
+      # OBAN_INGEST_BACKLOG_MAX and floored only at 1, so integer division cannot produce a
+      # 0 that would make the valve fail CLOSED (#564).
       assert_receive {:fail_open_token, 3_600_000, limit}
-      assert limit == max(50, div(ObanConfig.ingest_backlog_max(), 10))
+      assert limit == max(1, div(ObanConfig.ingest_backlog_max(), 10))
       assert_receive {:fail_open_token, _, _}
       assert_receive {:fail_open_token, _, _}
       refute_receive {:fail_open_token, _, _}, 20
@@ -1316,6 +1316,39 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert Ctl.fail_open_meter(Loopctl.MockRateLimiter) == Loopctl.MockRateLimiter
     end
 
+    test "#564: tightening OBAN_INGEST_BACKLOG_MAX tightens the fail-open allowance with it" do
+      alias LoopctlWeb.KnowledgeIngestionController, as: Ctl
+
+      # The limiter is node-local ETS, so the FLEET allowance is per-node x web nodes. The
+      # derivation exists to hold that at or under ONE OBAN_INGEST_BACKLOG_MAX per hour per
+      # tenant for a fleet up to @fail_open_fleet_nodes (10).
+      fleet_nodes = 10
+
+      for threshold <- [10, 50, 100, 250, 500, 1000, 5000] do
+        allowance = Ctl.fail_open_jobs_per_window(threshold)
+
+        assert allowance * fleet_nodes <= threshold,
+               "fleet allowance #{allowance * fleet_nodes} exceeds threshold #{threshold}"
+      end
+
+      # The specific regression: a @batch_max (50) floor pinned the allowance there for every
+      # threshold under 500, so TIGHTENING the knob stopped tightening the allowance — a
+      # 10-node fleet still admitting 500/hour against a threshold of 100, quietly, and in the
+      # direction an operator assumes is the safer one.
+      assert Ctl.fail_open_jobs_per_window(100) == 10
+      assert Ctl.fail_open_jobs_per_window(500) == 50
+
+      # Monotonic: a smaller threshold never buys a larger allowance.
+      assert Ctl.fail_open_jobs_per_window(100) < Ctl.fail_open_jobs_per_window(500)
+
+      # Floored at 1, never 0: integer division below the fleet-node count would otherwise
+      # make the valve fail CLOSED and refuse an innocent tenant on the first transient blip.
+      # This is where the bound is knowingly given up — documented residual, since a
+      # node-local limiter has no fleet-wide counter.
+      assert Ctl.fail_open_jobs_per_window(1) == 1
+      assert Ctl.fail_open_jobs_per_window(9) == 1
+    end
+
     test "a NON-timeout SQLSTATE is not reported as a timeout", %{conn: conn} do
       # The rescue catches EVERY `Postgrex.Error`, not only 57014, so a query bug in the
       # count path (a column renamed out from under `FairShare`) also fails open. It must
@@ -1336,14 +1369,9 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
         }
       end)
 
-      # ...and it is NOT metered: a broken count QUERY is not backlog pressure, so capping it
-      # would 429 an under-threshold tenant with a backlog code it has not earned. Even with
-      # the fail-open allowance fully spent, this class still admits.
-      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, limit ->
-        if String.starts_with?(bucket, "ingest_backlog_fail_open:"),
-          do: {:deny, limit},
-          else: {:allow, 1}
-      end)
+      # Allowance available, so this is about the CLASS LABEL alone: it admits, tagged
+      # `db_error` rather than `timeout`.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit -> {:allow, 1} end)
 
       conn =
         conn
@@ -1356,6 +1384,66 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
       assert_receive {:backlog_failed_open, %{count: 1}, metadata}
       assert metadata.error_class == "db_error"
+      assert metadata.outcome == :admitted
+    end
+
+    test "#564: `db_error` is METERED — the last unbounded fail-open class", %{conn: conn} do
+      # It was the only class left admitting unconditionally, on the premise that a broken
+      # count QUERY is not backlog pressure so capping it would 429 a tenant over our defect.
+      # The premise about the CODE was right and is kept (`backlog_attributable?/1` answers
+      # the 503, not a backlog 429); the conclusion about the BOUND was wrong. A deterministic
+      # query-shape fault recurs on every request at the same rate, so "admit unconditionally"
+      # means the valve is simply OFF for as long as the bug exists — the exact unbounded
+      # fail-open this allowance was built to close.
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      attach_failed_open(tenant.id)
+
+      expect(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        raise %Postgrex.Error{
+          postgres: %{
+            code: :undefined_column,
+            pg_code: "42703",
+            message: "column j.args does not exist"
+          }
+        }
+      end)
+
+      test_pid = self()
+
+      # The allowance is spent. Scoped to the fail-open bucket alone: the auth pipeline shares
+      # this limiter, and denying THAT would refuse the request for an unrelated reason.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, limit ->
+        if String.starts_with?(bucket, "ingest_backlog_fail_open:") do
+          send(test_pid, {:fail_open_bucket, bucket})
+          {:deny, limit}
+        else
+          {:allow, 1}
+        end
+      end)
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, 0, fn _t, _c, _o ->
+        flunk("nothing may be enqueued once the fail-open allowance is spent")
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "Query-bug beyond the allowance", source_type: "newsletter"}]
+        })
+
+      # The 503, NOT the backlog 429: the count was never taken, so nothing may claim the
+      # tenant's backlog is too big over a defect in our own counting code.
+      assert json_response(conn, 503)["error"]["code"] == "ingestion_gate_unavailable"
+
+      assert_receive {:fail_open_bucket, bucket}
+      assert bucket =~ tenant.id
+
+      assert_receive {:backlog_failed_open, %{count: 1, jobs: 1}, metadata}
+      assert metadata.error_class == "db_error"
+      assert metadata.outcome == :exhausted
     end
 
     test "a resource-exhaustion SQLSTATE is METERED, not waved through as a query bug",
@@ -1412,10 +1500,12 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert metadata.outcome == :exhausted
     end
 
-    test "08P01 protocol_violation is a query bug, not pool pressure (unmetered)",
+    test "08P01 protocol_violation is a query bug, not pool pressure (503, not a backlog 429)",
          %{conn: conn} do
       # SQLSTATE class 08 is matched as pool pressure, but 08P01 is a driver/query-shape bug.
-      # Metering it would 429 an under-threshold tenant over a fault that is not its backlog.
+      # Classing it as `db_pressure` would 429 an under-threshold tenant over a fault that is
+      # not its backlog. It is metered like every other class; what the split decides is the
+      # error CODE.
       tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
@@ -1427,7 +1517,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
         }
       end)
 
-      # Allowance fully spent: an unmetered class must still admit.
+      # Allowance fully spent, so the refusal CODE is what this asserts.
       stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, limit ->
         if String.starts_with?(bucket, "ingest_backlog_fail_open:"),
           do: {:deny, limit},
@@ -1441,11 +1531,11 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
           items: [%{content: "Protocol violation item", source_type: "newsletter"}]
         })
 
-      assert length(json_response(conn, 200)["data"]) == 1
+      assert json_response(conn, 503)["error"]["code"] == "ingestion_gate_unavailable"
 
       assert_receive {:backlog_failed_open, %{count: 1}, metadata}
       assert metadata.error_class == "db_error"
-      assert metadata.outcome == :admitted
+      assert metadata.outcome == :exhausted
     end
 
     test "a Postgrex error with NO server SQLSTATE is METERED, but never claims a backlog",
