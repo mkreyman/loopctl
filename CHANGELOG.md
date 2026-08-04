@@ -100,10 +100,14 @@ Operator-facing changes for deployments outside the hosted instance.
   Heat was `count(*)` over access-event rows, so any agent could pin its own article at rank 1 by
   calling `knowledge_get` on it in a loop — and because this index is meant to be pasted into a
   cached prefix, that ranking then propagated into every other agent's context. A signal the
-  ranked party controls is not a signal. One api key now contributes at most 1 however many times
-  it reads. Existing `heat` values will DROP (they become readership size, not traffic) and the
+  ranked party controls is not a signal. A reader is `coalesce(agent_id, api_key_id)` of the key
+  that read — NOT the key row, since v2 mints a fresh ephemeral key per dispatch and counting
+  keys would count dispatches — so one agent now contributes at most 1 however many times, and
+  from however many dispatches, it reads; raw read count breaks ties before the article id does.
+  Existing `heat` values will DROP (they become readership size, not traffic) and the
   ordering will change wherever traffic and readership disagreed. Two further contract fixes on
-  the same route: `meta.heat_window` is floored to the UTC day, so two calls with no intervening
+  the same route: `meta.heat_window` is snapped to a UTC day boundary in the NARROWING direction
+  (an explicit `since` is never widened, and the 365-day ceiling is never exceeded), so two calls with no intervening
   read return a byte-identical payload (it previously carried a microsecond timestamp, making the
   "cacheable prefix" a guaranteed cache miss); and a FUTURE `since` is clamped to now instead of
   returning 200 with an empty list and a window that has not happened yet. `meta.chars` is now

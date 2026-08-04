@@ -231,20 +231,26 @@ contradict it. `heat_index/2` takes no query at all, so its misses are
 uncorrelated with embedding similarity. Reach for it when a search came back
 empty or thin, or before you know what to ask.
 
-Ordering is **usage, not relevance**: the number of DISTINCT READERS (api keys)
-that opened each article inside `meta.heat_window`. Distinct readers rather than
+Ordering is **usage, not relevance**: the number of DISTINCT READERS —
+`coalesce(agent_id, api_key_id)` of the key that read — that opened each article
+inside `meta.heat_window`, ties broken by raw read count before the article id.
+Distinct readers rather than
 raw reads is a correctness property, not a refinement — counting event rows let
 any agent pin its own article at rank 1 by calling `knowledge_get` in a loop, and
 because this index is meant to be pasted into a cached prefix, that ranking then
-propagated into every other agent's context. Only `get`-shaped reads count;
+propagated into every other agent's context. It is the AGENT, not the key row:
+v2 mints a fresh ephemeral key per dispatch, so counting keys would count
+dispatches and re-open the same pinning. Only `get`-shaped reads count;
 `search` and `context` write one row per RESULT of one ranked query, so counting
 them would re-couple this route to the embedding similarity it exists to be free
 of.
 
-The window is floored to the UTC day, so two calls with no intervening read
+The window is snapped to a UTC day boundary, so two calls with no intervening read
 return a byte-identical payload — which is what makes it safe in a cached prefix.
-It defaults to 90 days and is clamped to at most 365 days of lookback and to no
-later than now; `meta.heat_window` always echoes the window actually used.
+The snap always NARROWS: an explicit `since` is never widened back, and the
+ceiling is never overshot. It defaults to 90 days and is clamped to at most 365
+days of lookback and to no later than today; `meta.heat_window` always echoes the
+window actually used.
 
 Drill a heat stub with `progressive_drill/3`, **not** `get_article/3`: the heat
 index also lists published system canonicals, whose `tenant_id` is NULL, and

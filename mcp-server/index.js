@@ -4502,7 +4502,9 @@ const TOOLS = [
     description:
       "Browse the corpus with NO query — a capped list of compact stubs " +
       "(id/title/category/heat/summary, NO bodies) ranked by how many DISTINCT readers " +
-      "actually opened each article inside a window. Every other retrieval tool starts from " +
+      "(agents, not key rows — repeat reads by one reader count once, ties broken by raw " +
+      "read count) actually opened each article inside a window. " +
+      "Every other retrieval tool starts from " +
       "a query, so they share one failure mode: a paraphrase, or material that is topically " +
       "central but lexically dissimilar to your question, comes back empty and reads as 'the " +
       "KB has nothing' rather than 'I asked badly'. Reach for this when a search came back " +
@@ -4526,7 +4528,8 @@ const TOOLS = [
           description:
             "Optional: ISO-8601 timestamp; count only reads at/after it. Defaults to the " +
             "last 90 days, clamped to at most 365 days of lookback and to no later than " +
-            "now. Floored to the UTC day, and meta.heat_window echoes what you got.",
+            "today. Snapped to a UTC day boundary in the NARROWING direction (never wider " +
+            "than you asked for), and meta.heat_window echoes what you got.",
         },
       },
       required: [],

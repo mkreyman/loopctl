@@ -47,6 +47,7 @@ defmodule Loopctl.Knowledge do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Auth.ApiKey
   alias Loopctl.Custody
   alias Loopctl.Egress
   alias Loopctl.Egress.Policy, as: EgressPolicy
@@ -8908,6 +8909,10 @@ defmodule Loopctl.Knowledge do
   # `meta.heat_window` echoes what it actually got.
   @heat_max_window_days 365
 
+  # The stub projection runs on the 3-connection `AdminRepo` pool WHILE holding this tenant's
+  # heavy-read slot, so its wait has to be bounded well under the 15s Ecto default.
+  @heat_stub_timeout_ms 5_000
+
   @doc """
   A HEAT-ranked, topic-less stub index of the corpus (#554).
 
@@ -8917,7 +8922,7 @@ defmodule Loopctl.Knowledge do
   has nothing" rather than "I asked badly", with nothing in context to contradict it. This route
   takes no query at all, so its misses are uncorrelated with embedding similarity.
 
-  Ordering is by HEAT — the number of DISTINCT READERS (api keys) that made a CALLER-CHOSEN
+  Ordering is by HEAT — the number of DISTINCT READERS (agents) that made a CALLER-CHOSEN
   body read (`#{Enum.join(@heat_read_access_types, "/")}`) inside the window; list-shaped
   ranker output (`search`, `context`) is deliberately NOT counted, see
   `@heat_read_access_types`. Usage is treated as the authority on importance, so material that
@@ -8930,13 +8935,16 @@ defmodule Loopctl.Knowledge do
   Counting event rows made the ranking self-serve: any agent could pin its own article at
   rank 1 by calling `knowledge_get` on it in a loop, and — because this index is meant to be
   pasted into a cached prefix — that ranking then propagates into every OTHER agent's context.
-  A signal the ranked party controls is not a signal. One key contributes at most 1 no matter
-  how many times it reads, so pinning an article now requires actually persuading N distinct
-  keys to read it, which is the thing heat is supposed to measure.
+  A signal the ranked party controls is not a signal. A READER is `coalesce(agent_id,
+  api_key_id)` of the key that read, NOT the key row: v2 mints a fresh ephemeral key per
+  dispatch, so counting KEYS would count DISPATCHES — an agent that re-dispatches N times
+  votes N times, the same pinning one cheap API call away. One agent contributes at most 1
+  however many times, and from however many dispatches, it reads.
 
-  The trade is deliberate: an article read 50 times by 3 agents ranks below one read once by
-  4. For an index whose job is "what has the fleet found worth reading", breadth is the better
-  signal AND the one that cannot be manufactured from a single key.
+  Breadth is a SMALL integer (fleet size), so ties are the common case — and a fleet sharing
+  one key ties every article at 1. Raw reads break the tie BEFORE the id does, so the ranking
+  degrades to traffic rather than to UUID order. The trade is deliberate: an article read 50
+  times by 3 agents ranks below one read once by 4 readers.
 
   System-scoped published canonicals participate, exactly as they do in
   `list_curated_sources/2` and `progressive_drill/3` — a tenant whose most-read material is
@@ -8956,7 +8964,8 @@ defmodule Loopctl.Knowledge do
     - `:since` -- count only accesses at/after this `DateTime`. Defaults to the last
       #{@heat_default_window_days} days and is CLAMPED to at most #{@heat_max_window_days}
       days of lookback, so the request-path aggregate stays bounded either way; pass an older
-      `DateTime` to widen it deliberately and read `meta.heat_window` for what you got.
+      `DateTime` to widen it deliberately and read `meta.heat_window` for what you got. The
+      effective cutoff is SNAPPED to a UTC day boundary, always in the narrowing direction.
     - `:category` -- restrict to one category atom.
     - `:visibility_agent_id` -- the calling agent's id (#163). An index is exactly the surface
       where a leak is easy and invisible, because a stub looks innocuous and nobody reads an
@@ -9028,7 +9037,7 @@ defmodule Loopctl.Knowledge do
            tool: "knowledge_progressive_drill",
            parameter: "article_id",
            note:
-             "Pass a listed id to read the full article; this tool also opens the system canonicals listed here, which knowledge_get cannot. Ordering is body reads within meta.heat_window, not relevance to any query."
+             "Pass a listed id to read the full article; this tool also opens the system canonicals listed here, which knowledge_get cannot. Ordering is distinct readers within meta.heat_window, not relevance to any query."
          }
        }
      }}
@@ -9042,8 +9051,8 @@ defmodule Loopctl.Knowledge do
   @spec heat_max_window_days() :: pos_integer()
   def heat_max_window_days, do: @heat_max_window_days
 
-  # FLOORED TO THE UTC DAY, and the same floored value is both the aggregate cutoff and the
-  # echoed `meta.heat_window` (#567). The window was `utc_now() - 90d` at microsecond
+  # SNAPPED TO A UTC DAY BOUNDARY, and the same snapped value is both the aggregate cutoff and
+  # the echoed `meta.heat_window` (#567). The window was `utc_now() - 90d` at microsecond
   # precision, so no two calls shared a cutoff and `meta.heat_window` differed on every
   # request — which defeats the one property this surface is built for. A caller is expected
   # to paste this index into a CACHED PREFIX, and a prefix that differs by a microsecond field
@@ -9058,6 +9067,14 @@ defmodule Loopctl.Knowledge do
   # misreading this route exists to prevent, self-inflicted. Clamping rather than 400-ing
   # matches what the lower bound already does: the caller still gets the widest window that
   # can be served, and `meta.heat_window` says what it actually got.
+  #
+  # The snap NARROWS, never widens: every lower bound is rounded UP to the next day boundary,
+  # only the upper clamp floors. Flooring the caller's `:since` silently WIDENED the window it
+  # explicitly narrowed (a 09:00 `:since` counted reads from 00:00 — more than was asked for,
+  # and it looks correct), and flooring AFTER the clamp pushed the `@heat_max_window_days`
+  # ceiling out by up to a day, so the served scan exceeded the bound the route advertises.
+  # Flooring the UPPER clamp is the narrowing direction there, and it lands a future `:since`
+  # on today's start rather than tomorrow's — an empty index is the misreading to avoid.
   defp heat_since(since) do
     now = DateTime.utc_now()
 
@@ -9066,8 +9083,11 @@ defmodule Loopctl.Knowledge do
       nil -> DateTime.add(now, -@heat_default_window_days, :day)
       %DateTime{} = given -> given
     end
-    |> clamp_between(DateTime.add(now, -@heat_max_window_days, :day), now)
-    |> floor_to_utc_day()
+    |> ceil_to_utc_day()
+    |> clamp_between(
+      ceil_to_utc_day(DateTime.add(now, -@heat_max_window_days, :day)),
+      floor_to_utc_day(now)
+    )
   end
 
   defp clamp_between(dt, lower, upper) do
@@ -9080,6 +9100,11 @@ defmodule Loopctl.Knowledge do
 
   defp floor_to_utc_day(%DateTime{} = dt),
     do: DateTime.new!(DateTime.to_date(dt), ~T[00:00:00], "Etc/UTC")
+
+  defp ceil_to_utc_day(%DateTime{} = dt) do
+    floored = floor_to_utc_day(dt)
+    if DateTime.compare(floored, dt) == :eq, do: floored, else: DateTime.add(floored, 1, :day)
+  end
 
   # Aggregate over the EVENTS alone: no join to `articles`, so no article column (least of all
   # the unbounded body) enters the group key, and the article-side predicates ride in a bounded
@@ -9103,19 +9128,37 @@ defmodule Loopctl.Knowledge do
   # SURVIVE the ranking instead of which COMPETE for it, so a category-filtered call would
   # rank the whole corpus, take `top_k + 1`, and keep only the few that happen to match.
   # A supporting partial index is equally unnecessary — the plan uses the primary key.
+  #
+  # A READER is `coalesce(k.agent_id, e.api_key_id)`, not the key row (#567 round 2). v2 mints
+  # a fresh ephemeral key per dispatch, so distinct api_key_id counted DISPATCHES: an agent
+  # re-dispatching N times voted N times, which is the pinning the distinct count exists to
+  # prevent. LEFT join so a key this tenant cannot see (revoked-and-gone, superadmin, another
+  # tenant) falls back to the key id — the old behaviour as a floor, never a dropped event.
   defp heat_counts_query(tenant_id, limit, since, category, vis) do
     from(e in ArticleAccessEvent,
+      left_join: k in ApiKey,
+      on: k.id == e.api_key_id and k.tenant_id == ^tenant_id,
       where: e.tenant_id == ^tenant_id,
       where: e.access_type in @heat_read_access_types,
       where: e.accessed_at >= ^since,
       where: e.article_id in subquery(heat_article_ids(tenant_id, category, vis)),
       group_by: e.article_id,
-      # `asc: e.article_id` after the count keeps the order TOTAL, so a page is stable across
-      # calls when several articles tie on heat — an index that reshuffles on every refresh
-      # cannot be cached, which is the whole point of this surface.
-      order_by: [desc: count(e.api_key_id, :distinct), asc: e.article_id],
+      # Readership is a SMALL integer (fleet size), so ties are the common case — under a
+      # fleet sharing one key EVERY article ties at 1, and ordering straight to
+      # `asc: e.article_id` made this index UUID order wearing heat's name. Raw reads break
+      # the tie first, so it degrades to traffic; the id still keeps the order TOTAL, so a
+      # page is stable across calls — an index that reshuffles on every refresh cannot be
+      # cached, which is the whole point of this surface.
+      order_by: [
+        desc: count(fragment("coalesce(?, ?)", k.agent_id, e.api_key_id), :distinct),
+        desc: count(e.id),
+        asc: e.article_id
+      ],
       limit: ^limit,
-      select: %{article_id: e.article_id, heat: count(e.api_key_id, :distinct)}
+      select: %{
+        article_id: e.article_id,
+        heat: count(fragment("coalesce(?, ?)", k.agent_id, e.api_key_id), :distinct)
+      }
     )
   end
 
@@ -9134,10 +9177,13 @@ defmodule Loopctl.Knowledge do
 
   # Bounded projection for the ≤top_k ranked ids only, on `AdminRepo` for the same reason
   # `hydrate_semantic_pool/6` is: a system canonical's NULL `tenant_id` cannot satisfy the
-  # heavy-read guard. It runs AFTER the gated aggregate released the heavy-read gate, on the
-  # small admin pool — acceptable HERE because it is a primary-key lookup of at most
-  # `@max_relevance_page_size` ids with `left(body, ...)` clipping the body, i.e. bounded work
-  # with no scan, unlike the aggregate it follows. `status` and visibility are re-applied
+  # heavy-read guard. It runs INSIDE the `with_slot/3` admission `heat_index/2` holds, so it
+  # carries an EXPLICIT short `:timeout`: this tenant's heavy-read slot is held for its whole
+  # duration on the 3-connection admin pool that custody writes share, and at the 15s Ecto
+  # default admin-pool contention would convert into shed (429) heavy reads for that tenant on
+  # unrelated endpoints. The work itself is bounded — a primary-key lookup of at most
+  # `@max_relevance_page_size` ids with `left(body, ...)` clipping the body, i.e. no scan,
+  # unlike the aggregate it follows. `status` and visibility are re-applied
   # rather than trusted from the ranking query: the two run on separate connections, so an
   # article can be unpublished in between, and this is the query that actually reads a title.
   defp heat_stubs(_tenant_id, [], _vis), do: []
@@ -9158,7 +9204,7 @@ defmodule Loopctl.Knowledge do
         }
       )
       |> maybe_filter_by_visibility(vis)
-      |> AdminRepo.all()
+      |> AdminRepo.all(timeout: @heat_stub_timeout_ms)
       |> Map.new(&{&1.id, &1})
 
     Enum.flat_map(rows, fn %{article_id: id, heat: heat} ->

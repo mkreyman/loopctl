@@ -110,6 +110,58 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert {:ok, %{results: [%{heat: 2}]}} = Knowledge.heat_index(tenant.id)
     end
 
+    test "#567: one agent's many dispatch keys are ONE reader" do
+      # v2 mints a fresh ephemeral key per dispatch, so counting KEYS counted DISPATCHES:
+      # re-dispatching N times was N votes — the pinning distinct counting exists to prevent,
+      # one cheap API call away. A reader is the AGENT behind the key.
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      churned = published_article(tenant.id, %{title: "Churned"})
+      genuine = published_article(tenant.id, %{title: "Genuine"})
+
+      # One active key per (agent, role) at a time, so this is the real dispatch lifecycle:
+      # mint, read, revoke, mint again. Six dispatches leave six key rows behind.
+      for _ <- 1..6 do
+        {_raw, key} =
+          fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+
+        fixture(:article_access_event, %{
+          tenant_id: tenant.id,
+          article_id: churned.id,
+          api_key_id: key.id
+        })
+
+        key
+        |> Ecto.Changeset.change(%{revoked_at: DateTime.utc_now()})
+        |> AdminRepo.update!()
+      end
+
+      heat(tenant.id, genuine, 2)
+
+      assert {:ok, %{results: results}} = Knowledge.heat_index(tenant.id)
+
+      assert Enum.map(results, & &1.title) == ["Genuine", "Churned"]
+      assert Enum.map(results, & &1.heat) == [2, 1]
+    end
+
+    test "#567: articles tied on readership are ordered by reads, not by article id" do
+      # Readership is a small integer (fleet size), so ties are the norm — and a fleet reading
+      # through one shared MCP key ties EVERY article at 1, which made the id fallback the
+      # real ranking: UUID order wearing heat's name.
+      tenant = fixture(:tenant)
+      busy = published_article(tenant.id, %{title: "Busy"})
+      quiet = published_article(tenant.id, %{title: "Quiet"})
+
+      reads_from_one_key(tenant.id, quiet, 1)
+      reads_from_one_key(tenant.id, busy, 9)
+
+      assert {:ok, %{results: results}} = Knowledge.heat_index(tenant.id)
+
+      assert Enum.map(results, & &1.title) == ["Busy", "Quiet"]
+      assert Enum.map(results, & &1.heat) == [1, 1]
+    end
+
     test "an article nobody has read does not appear at all" do
       # Heat comes from a JOIN on access events, so a never-read article has no row. Asserted
       # explicitly because "absent" and "present with heat 0" are different contracts and a
@@ -158,7 +210,28 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert DateTime.diff(DateTime.utc_now(), effective, :day) <= ceiling
     end
 
-    test "#567: the window is floored to the UTC day, so the payload is byte-identical" do
+    test "#567: an explicit :since is never widened back to the start of its UTC day" do
+      # The snap ran AFTER the clamp and always floored, so a caller that narrowed the window
+      # silently got up to 24 hours MORE history than it asked for — and it looks correct.
+      # The snap narrows instead, which also keeps the 365-day ceiling from being overshot.
+      tenant = fixture(:tenant)
+      article = published_article(tenant.id, %{title: "Excluded"})
+
+      given = DateTime.add(DateTime.utc_now(), -30, :day)
+      heat(tenant.id, article, 2, %{accessed_at: DateTime.add(given, -1, :second)})
+
+      assert {:ok, %{results: results, meta: %{heat_window: window}}} =
+               Knowledge.heat_index(tenant.id, since: given)
+
+      assert {:ok, effective, _} = DateTime.from_iso8601(window)
+
+      assert DateTime.compare(effective, given) != :lt,
+             "the served window must never start earlier than the caller asked for"
+
+      assert results == [], "a read the caller's :since excluded must not be counted"
+    end
+
+    test "#567: the window is snapped to a UTC day boundary, so the payload is byte-identical" do
       # This index exists to be pasted into a CACHED PREFIX. The window was
       # `utc_now() - 90d` at microsecond precision, so `meta.heat_window` differed on every
       # single call and no two responses were ever byte-identical — the route advertised
