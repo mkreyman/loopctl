@@ -124,10 +124,12 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
         "Only caller-chosen fetches are counted " <>
         "(`meta.counted_access_types`); list-shaped ranker output (a search hit, a context " <>
         "pack) is one row per RESULT, not a read, so it adds no heat. Neither does drilling " <>
-        "a listed tenant article (GET /knowledge/progressive/:id) — that read is recorded " <>
-        "under its own access type, so this index does not feed the ranking that surfaced " <>
-        "the article; a plain knowledge_get of the same id does count. `char_budget`/`chars` " <>
-        "size the stub array only, exclusive of `meta`. Takes NO query, " <>
+        "a listed article of ANY scope (GET /knowledge/progressive/:id) — tenant-owned or " <>
+        "system canonical, that read is recorded under its own access type, so this index " <>
+        "never feeds the ranking that surfaced the article; a plain knowledge_get of the " <>
+        "same id does count, and resolves canonicals too. `char_budget`/`chars` " <>
+        "are BYTES of the encoded stub array (framing included), exclusive of `meta`. " <>
+        "Takes NO query, " <>
         "which is the " <>
         "point: every other retrieval route starts from one, so they all miss the same way " <>
         "on a paraphrase or on material that is topically central but lexically dissimilar. " <>
@@ -157,9 +159,9 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
             "#{@heat_default_window_days} days, and a lookback longer than " <>
             "#{@heat_max_window_days} days is CLAMPED to that ceiling — both bound the " <>
             "request-path aggregate over an ever-growing read history. A future timestamp " <>
-            "is clamped to today. The effective cutoff is snapped to a UTC day boundary in " <>
-            "the NARROWING direction and is never earlier than what you asked for; a " <>
-            "timestamp inside the current UTC day is used exactly as given. Pass an older " <>
+            "is clamped to the start of today. An explicit timestamp is otherwise used " <>
+            "VERBATIM; only the omitted default and the ceiling are anchored at the start " <>
+            "of today, which is what keeps a default refresh byte-identical. Pass an older " <>
             "timestamp to widen the window deliberately; the effective window is echoed " <>
             "as `meta.heat_window`."
       ]
@@ -176,7 +178,16 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
          }},
       400 => {"Invalid parameter", "application/json", Schemas.ErrorResponse},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 =>
+        {"Rate limit exceeded, or the read was SHED — a heavy-read slot or an admin-pool " <>
+           "checkout was unavailable. Retryable; only saturation degrades this way.",
+         "application/json", Schemas.RateLimitError},
+      500 =>
+        {"A deterministic database fault (not saturation) — retrying will not clear it",
+         "application/json", Schemas.ErrorResponse},
+      503 =>
+        {"The database is unreachable (connection refused/rejected)", "application/json",
+         Schemas.ErrorResponse}
     }
   )
 

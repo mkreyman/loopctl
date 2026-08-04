@@ -97,8 +97,9 @@ Operator-facing changes for deployments outside the hosted instance.
   25/node.
 
 - **New `article_access_events.access_type` value: `drill` (#569).** `GET
-  /api/v1/knowledge/progressive/:id` records `drill` instead of `get` when it resolves a
-  TENANT-OWNED article; a published system canonical still records `get`. No request
+  /api/v1/knowledge/progressive/:id` records `drill` instead of `get`, at EVERY scope — the
+  canonical carve-out this entry originally described was reversed by #572 below before
+  release, so no drill records `get`. No request
   parameter is involved — the server derives it from the read path, so every client is
   covered. Operator-visible in
   two places. **Analytics filters on `access_type=get` will stop seeing those reads** —
@@ -110,9 +111,8 @@ Operator-facing changes for deployments outside the hosted instance.
   Why: `heat_index` ranks on `get`, and the drill tool its own `meta.drill` payload tells
   callers to use recorded a `get` — so an article gained heat from having been *shown* by the
   index. Visibility produced reads, reads produced rank, rank produced visibility, and
-  material that never surfaced could not overtake material that already had. The canonical
-  branch keeps `get` because that drill is the ONLY path to a system canonical's body, so
-  excluding it would freeze every canonical at heat 0 rather than merely undercount it.
+  material that never surfaced could not overtake material that already had. #572 gave the
+  canon a `knowledge_get` read path instead of exempting its drill, so no scope is exempt.
   Retrieval
   follow-through (`RetrievalMetrics`) deliberately DOES count `drill`, so precision figures
   are unaffected by the split.
@@ -132,9 +132,8 @@ Operator-facing changes for deployments outside the hosted instance.
   does, never on raw read count — that counter is the one a loop inflates.
   Existing `heat` values will DROP (they become readership size, not traffic) and the
   ordering will change wherever traffic and readership disagreed. Two further contract fixes on
-  the same route: `meta.heat_window` is snapped to a UTC day boundary in the NARROWING direction
-  (an explicit `since` is never widened — one inside the current UTC day is used exactly as
-  given — and the default/ceiling are whole days back from today's start), so two calls with no intervening
+  the same route: `meta.heat_window`'s system-derived bounds sit at the start of today
+  (an explicit `since` is served verbatim, per #572 below), so two calls with no intervening
   read return a byte-identical payload (it previously carried a microsecond timestamp, making the
   "cacheable prefix" a guaranteed cache miss); and a FUTURE `since` is clamped to now instead of
   returning 200 with an empty list and a window that has not happened yet. `meta.chars` is now
@@ -145,6 +144,43 @@ Operator-facing changes for deployments outside the hosted instance.
   per distinct article read, 11 ms against a 79,025-article corpus.
 
 ### Added
+
+- **`knowledge_get` now resolves published SYSTEM CANONICALS, and drilling never adds heat at
+  any scope (#572).** #569 stopped `knowledge_heat_index` ranking on its own drill hop, but for
+  tenant-owned articles only: a canonical's drill stayed counted, because `get_article/3`
+  filtered on `tenant_id` and the drill was therefore the sole path to its body. That left the
+  index ranking a counted class against an uncounted one on one `heat` number, and since
+  drilling is the path the payload itself recommends, following the documentation drove the
+  ranking monotonically toward the shared canon. Fixed by giving the canon the read path it
+  lacked rather than counting the one it had. **Operator-visible effects:** a canon stub is now
+  openable with `knowledge_get` instead of 404ing, and **no backfill runs** — measured on the
+  hosted deployment before deciding, not assumed: across 56,033 access events and 23 published
+  canonicals there are ZERO `get` (and zero `drill`) rows against a system-scoped article, so
+  the migration would have had an empty subject. Before this change no path could emit a `get`
+  for a canonical at all, which makes any such row you DO find on your own deployment
+  drill-origin and safe to relabel; the rolling window (90 days by default) ages the rest out.
+
+- **`meta.chars` / `meta.char_budget` on `heat_index` are BYTES of the encoded stub array**,
+  array framing included. They were graphemes summed per stub, so a CJK or emoji payload was
+  under-reported several-fold and the brackets and commas were omitted — both in the unsafe
+  direction for the one number callers are told to size a cached prefix against. A client that
+  sized a buffer off the old figure should re-check it.
+
+- **An explicit `since` on `heat_index` is served verbatim**, where it was rounded up to the
+  next UTC day boundary and silently dropped up to 24h of requested reads. The system-derived
+  default is still day-snapped, which is what keeps the payload byte-identical between
+  refreshes.
+
+- **A heat-projection fault no longer logs raw DB fault text, and only a demonstrable pool exit
+  degrades to 429.** The log carried the backend host/port and the failing statement's bound
+  parameters; the blanket exit handler reported a node shutdown or any foreign timeout as
+  "this tenant is reading too much". Saturation now fails soft as the documented 429 — a pool
+  checkout that waited past its deadline, plus the server-side statement timeout (`57014`),
+  an exhausted backend (`53xxx`) and one going away or refusing the connection (`57P0x`,
+  `08xxx`, including the `08P01` pgbouncer rejects with). Everything else surfaces as what it
+  is: a deterministic query fault as a 500, an unreachable database as the 503
+  `db_unavailable` every other route already returns. `GET /knowledge/heat_index` documents
+  all three.
 
 - **Operator knobs that were live but undiscoverable are now documented (#566):**
   `EXPECTED_APP_NODES`, `STH_SWEEP_CRON`, the fair-share snooze pair

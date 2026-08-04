@@ -863,10 +863,22 @@ defmodule Loopctl.Knowledge do
   Preloads outgoing links (with target articles) and incoming links
   (with source articles).
 
-  Records an access event when an `:api_key_id` is supplied via `opts` —
-  `"get"` unless `:access_type` overrides it, which only `progressive_drill/3`
-  does (it records the uncounted `"drill"` for a tenant-owned article, #569).
-  Recording is fire-and-forget and never affects the read.
+  Resolves a TENANT-OWNED article first, then falls back to a PUBLISHED SYSTEM CANONICAL
+  (#572). The fallback only ever widens what a tenant-scoped `:not_found` was allowed to
+  catch, onto the same public canon the wiki serves unauthenticated at `/wiki/<slug>` and
+  `heat_index/2` already lists — a tenant-owned row can never match it (`scope: :system`),
+  so tenant isolation is untouched, and a draft or archived canonical stays invisible.
+
+  That fallback used to live only in `progressive_drill/3`, and the split is what made the
+  heat accounting incoherent: a canonical had NO caller-named read path, so its drill had
+  to be counted while a tenant article's was not, and `heat_index/2` then ranked the two
+  classes on one number that meant different things. Every article now earns heat the same
+  way — through a `get` where the caller names an id the ranker did not just hand it.
+
+  Records an access event when an `:api_key_id` is supplied via `opts` — `"get"` unless
+  `:access_type` overrides it, which only `progressive_drill/3` does (the uncounted
+  `"drill"`, #569). Recording is fire-and-forget, never affects the read, and no-ops without
+  an `:api_key_id` — which is how a caller resolves an id without registering a read.
 
   ## Parameters
 
@@ -881,22 +893,37 @@ defmodule Loopctl.Knowledge do
   ## Returns
 
   - `{:ok, %Article{}}` with preloaded links
-  - `{:error, :not_found}` if not found or belongs to another tenant
+  - `{:error, :not_found}` if no tenant-owned article and no published system canonical
+    has that id
   """
   @spec get_article(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Article.t()} | {:error, :not_found}
   def get_article(tenant_id, article_id, opts \\ []) do
     case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
+      nil -> get_system_canonical(tenant_id, article_id, opts)
+      article -> finalize_article_read(tenant_id, article, opts)
+    end
+  end
+
+  # `status == :published` mirrors `get_system_article_by_slug/1` and `list_system_articles/1`.
+  # This is a TENANT-FACING by-id path, not the privileged curation one
+  # (`fetch_curatable_article/2`, which legitimately needs drafts), so it must never expose a
+  # draft or archived canonical.
+  defp get_system_canonical(tenant_id, article_id, opts) do
+    case AdminRepo.one(
+           from(a in Article,
+             where: a.id == ^article_id and a.scope == :system and a.status == :published
+           )
+         ) do
       nil -> {:error, :not_found}
       article -> finalize_article_read(tenant_id, article, opts)
     end
   end
 
-  # Shared visibility/preload/access-tracking tail of an article fetch, once the
-  # row itself has been located (tenant-owned or, via `progressive_drill/3`'s
-  # system fallback, a system canonical). Factored out so BOTH scopes get
-  # identical visibility enforcement, link preloading, conflict-link filtering,
-  # and access recording — never duplicated ad hoc per caller.
+  # Shared visibility/preload/access-tracking tail of an article fetch, once the row itself
+  # has been located (tenant-owned or a system canonical). Factored out so BOTH scopes get
+  # identical visibility enforcement, link preloading, conflict-link filtering, and access
+  # recording — never duplicated ad hoc per caller.
   defp finalize_article_read(tenant_id, article, opts) do
     # Visibility enforcement (#163): a private/owner memory the caller doesn't
     # own resolves to :not_found — no existence leak, no access recorded.
@@ -913,9 +940,13 @@ defmodule Loopctl.Knowledge do
         |> drop_resolved_conflict_links(tenant_id)
 
       # `:access_type` defaults to `"get"` — this function is shared by `get_article/3` and
-      # `progressive_drill/3`, and only the latter overrides it, to the uncounted `"drill"` on
-      # its tenant-owned branch (#569). That override is what stops the heat index ranking on
-      # reads it caused itself; see `@heat_read_access_types`.
+      # `progressive_drill/3`, and only the latter overrides it, to the uncounted `"drill"`
+      # (#569, now on BOTH branches — #572). That override is what stops the heat index
+      # ranking on reads it caused itself; see `@heat_read_access_types`.
+      #
+      # A lookup that delivers no BODY must not register as one. There is no flag for that:
+      # `Analytics.record_access/6` no-ops on a nil `api_key_id`, so a caller that wants a
+      # silent resolve simply omits it — which is what `article_stats` does.
       Analytics.record_access(
         tenant_id,
         article.id,
@@ -6095,9 +6126,11 @@ defmodule Loopctl.Knowledge do
           |> Enum.join(" ")
       end
 
-    # Truncate to max bytes to prevent unbounded embedding input DoS
+    # Truncate to max BYTES to prevent unbounded embedding input DoS. Measured AND cut in the
+    # same unit (#572): `String.slice/3` counts GRAPHEMES, so a CJK idea that tripped the
+    # 4 MiB byte guard was cut to 4M graphemes — up to ~12 MB, straight through the bound.
     if byte_size(text) > @max_idea_text_bytes do
-      String.slice(text, 0, @max_idea_text_bytes)
+      take_bytes(text, @max_idea_text_bytes)
     else
       text
     end
@@ -8876,6 +8909,11 @@ defmodule Loopctl.Knowledge do
   # because nothing signals the omission. EVERY variable-length field is capped — a title is
   # validated only to 500 chars, so leaving it uncapped made the advertised budget a number
   # the payload could exceed several-fold.
+  #
+  # Every cap below is in BYTES — the unit `heat_stub_chars/1` measures and `fit_stub_to_cap/1`
+  # enforces. Slicing a field by GRAPHEME while enforcing the total in bytes was the same
+  # mixed-unit defect one level down: a CJK stub arrived 3x over the cap, so the fitter shrank
+  # its summary to "" and then ate its title, and a non-Latin corpus got a title-only index.
   @heat_summary_chars 120
   @heat_title_chars 100
   # The fixed per-stub cost the caller actually pays, MEASURED off the wire shape
@@ -8909,18 +8947,27 @@ defmodule Loopctl.Knowledge do
   # `"search"` and `"context"` — so it is not its SHAPE that disqualifies it, it is the HOP
   # FROM THIS INDEX: shown -> read -> ranked -> shown, a loop in which material that never
   # surfaced could not overtake material that already had, and `knowledge_progressive_drill`
-  # is the very tool `meta.drill` names. The label is therefore derived from WHICH READ PATH
-  # resolved the article, never from a caller-declared origin — a declaration only binds the
-  # clients that send it, leaving every older MCP release and every raw HTTP call feeding the
-  # loop. A tenant-owned drill records `"drill"` and does not count (that article still earns
-  # heat through `knowledge_get`, the per-article read a reader names for itself); a system
-  # canonical's records `"get"` and does. The canon is the one case where the loop is the
-  # lesser evil: `get_article/3` filters on `tenant_id` and a canon row's is NULL, so the
-  # drill is the ONLY path to its body, and excluding it would make the "canonicals
-  # participate" invariant below unreachable rather than merely undercounted. What bounds
-  # that residual loop is the distinct-reader count (#567), which holds however a read is
-  # labelled. Same rule as #563 (search impressions) and #567 (one key's loop): heat must not
-  # rank on a signal heat produces.
+  # is the very tool `meta.drill` names. The label is derived from WHICH READ PATH resolved
+  # the article, never from a caller-declared origin — a declaration only binds the clients
+  # that send it, leaving every older MCP release and every raw HTTP call feeding the loop.
+  #
+  # The exclusion is UNIFORM across scopes (#572), and the first attempt at it was not. A
+  # system canonical's drill used to record a counted `"get"`, because `get_article/3` filtered
+  # on `tenant_id` and a canon row's is NULL, so the drill was the only path to its body and
+  # excluding it would have frozen the canon at heat 0. That reasoning was sound about the
+  # canon and wrong about the INDEX: ranking a counted class against an uncounted one on a
+  # single `heat` number means the number measures different things per row, and since drilling
+  # is the DOCUMENTED path (`meta.drill`, the MCP tool text), following the docs raised only
+  # canonicals. Monotonic drift toward the shared canon, self-reinforcing — a canon shown at
+  # rank 1 got drilled, which held it at rank 1. The distinct-reader count (#567) bounds ONE
+  # agent's loop, not a fleet all following the same instruction.
+  #
+  # The fix was to give the canon the read path it lacked rather than to count the one it had:
+  # `get_article/3` now resolves published canonicals too, so every article earns heat the same
+  # way and `knowledge_get` no longer 404s on a canon stub. Same rule as #563 (search
+  # impressions) and #567 (one key's loop): heat must not rank on a signal heat produces —
+  # and, now stated once rather than learned four times, it must not rank counted and uncounted
+  # read paths on one number.
   @heat_read_access_types ~w(get)
 
   # The aggregate runs on the request path over `article_access_events`, the one table that
@@ -8938,6 +8985,25 @@ defmodule Loopctl.Knowledge do
   # The stub projection runs on the 3-connection `AdminRepo` pool WHILE holding this tenant's
   # heavy-read slot, so its wait has to be bounded well under the 15s Ecto default.
   @heat_stub_timeout_ms 5_000
+
+  # The SQLSTATEs on which a server-side fault IS the saturation this route degrades to a 429
+  # for. Everything else a `Postgrex.Error` can carry is a deterministic query fault and must
+  # surface as a 500 instead of being retried forever behind an overload label.
+  #
+  # The three classes, enumerated in full rather than described — a list that is narrower than
+  # the prose above it is how the next reader gets this wrong: the statement timeout (57014),
+  # an exhausted backend (ALL of 53xxx), and a backend going away or refusing the connection
+  # (57P01/57P02/57P03 and ALL of 08xxx — pgbouncer rejects with 08P01, which the earlier
+  # three-code 08 list dropped into the 500 this rescue exists to prevent).
+  @heat_saturation_sqlstates ~w(
+    query_canceled
+    insufficient_resources disk_full out_of_memory too_many_connections
+    configuration_limit_exceeded
+    admin_shutdown crash_shutdown cannot_connect_now
+    connection_exception sqlclient_unable_to_establish_sqlconnection
+    connection_does_not_exist sqlserver_rejected_establishment_of_sqlconnection
+    connection_failure transaction_resolution_unknown protocol_violation
+  )a
 
   @doc """
   A HEAT-ranked, topic-less stub index of the corpus (#554).
@@ -8973,6 +9039,16 @@ defmodule Loopctl.Knowledge do
   surface and the effect stops inside that tenant's own index, but it is NOT the one-vote
   guarantee above and must not be restated as one.
 
+  What the guarantee IS bounded by, stated exactly (#572): `api_keys.agent_id` carries a
+  FOREIGN KEY to `agents(id)` (`api_keys_agent_id_fkey`, ON DELETE RESTRICT) plus a partial
+  unique index of one active key per agent per role
+  (`api_keys_one_role_per_agent_idx`), so a vote resolves to a row in the tenant's REGISTERED
+  agent set — it is not a free-form string a dispatch can invent. The remaining lever is
+  therefore registering agents, not minting keys or re-dispatching: N registered agents buy N
+  votes. That is a bounded, audited, tenant-local surface rather than the one cheap API call
+  the distinct-key count left open, which is the whole distance #567 moved. Do not describe
+  this as "one agent, one vote" without the registration caveat.
+
   Breadth is a SMALL integer (fleet size), so ties are the common case — and a fleet sharing
   one key ties every article at 1. The tie is broken on DISTINCT READ DAYS, never on raw event
   rows: raw rows are the counter a loop inflates, so breaking the tie on them handed the whole
@@ -8982,10 +9058,12 @@ defmodule Loopctl.Knowledge do
 
   System-scoped published canonicals participate, exactly as they do in
   `list_curated_sources/2` and `progressive_drill/3` — a tenant whose most-read material is
-  the shared canon would otherwise get an index that omits precisely what it reads most. That
-  participation is what makes a canonical drill COUNT while a tenant-owned one does not: the
-  drill is the only path to a canon's body at all, so labelling it uncounted would leave every
-  canonical permanently at heat 0 and this claim false.
+  the shared canon would otherwise get an index that omits precisely what it reads most. They
+  participate on the SAME terms as tenant-owned articles (#572): `get_article/3` resolves a
+  published canonical, so a canon earns heat from a caller-named `get` and its drill is
+  uncounted like any other. Making a canon's drill count instead — the first attempt at this
+  — left the ranking comparing a counted class against an uncounted one, which is what
+  `@heat_read_access_types` now forbids outright.
 
   ## Why this is NOT an option on `progressive_index/3`
 
@@ -9001,10 +9079,10 @@ defmodule Loopctl.Knowledge do
     - `:since` -- count only accesses at/after this `DateTime`. Defaults to the last
       #{@heat_default_window_days} days and is CLAMPED to at most #{@heat_max_window_days}
       days of lookback, so the request-path aggregate stays bounded either way; pass an older
-      `DateTime` to widen it deliberately and read `meta.heat_window` for what you got. The
-      effective cutoff is SNAPPED to a UTC day boundary in the narrowing direction and is
-      NEVER moved earlier than what you passed; a `:since` inside the current UTC day is used
-      exactly as given, since its next boundary has not happened yet.
+      `DateTime` to widen it deliberately and read `meta.heat_window` for what you got. An
+      explicit `:since` is served VERBATIM (#572); only the SYSTEM-derived bounds (the default
+      lookback and the ceiling) are anchored at the start of today, which is what makes a
+      default refresh byte-identical. A FUTURE `:since` is clamped to today's start.
     - `:category` -- restrict to one category atom.
     - `:visibility_agent_id` -- the calling agent's id (#163). An index is exactly the surface
       where a leak is easy and invisible, because a stub looks innocuous and nobody reads an
@@ -9064,20 +9142,27 @@ defmodule Loopctl.Knowledge do
          # A STATED budget, not an implied one: the caller is expected to paste this into a
          # cached prefix, so it needs to know the cost before it does. Derived from the
          # effective top-K (not the cap), so `limit: 5` does not advertise 100 stubs' worth.
-         char_budget: top_k * @heat_stub_char_cap,
-         chars: stubs |> Enum.map(&heat_stub_chars/1) |> Enum.sum(),
+         char_budget: heat_array_budget(top_k),
+         # The WHOLE encoded array, not the sum of its stubs (#572). Summing per-stub sizes
+         # omitted the framing the caller actually receives — the two brackets and the N-1
+         # commas — so the number advertised as an ENFORCED budget was under by N+1 on every
+         # response, and `char_budget` had the same hole. Encoding the array measures what
+         # goes on the wire, with no framing constant to keep in sync.
+         chars: stubs |> Jason.encode!() |> byte_size(),
          heat_window: DateTime.to_iso8601(since),
          counted_access_types: @heat_read_access_types,
          # The read instruction rides IN the payload (#554): an index that lists ids without
          # saying they are actionable gets read as prose.
-         # `knowledge_progressive_drill`, NOT `knowledge_get`: this index also lists published
-         # system canonicals, whose tenant_id is NULL, and `get_article/3` filters on
-         # tenant_id, so following a canon stub into `knowledge_get` 404s.
+         #
+         # The note's heat-neutrality claim is now unconditional in FACT, not just in wording
+         # (#572). It previously read as absolute while being false for the system canonicals
+         # the same payload lists — their drill was counted — and nothing marked which stubs
+         # those were, so a caller had no way to tell which half the sentence applied to.
          drill: %{
            tool: "knowledge_progressive_drill",
            parameter: "article_id",
            note:
-             "Pass a listed id to read the full article; that read adds no heat to a tenant article, so this index does not feed the ranking that surfaced the stub. This tool also opens the system canonicals listed here, which knowledge_get cannot. Ordering is distinct readers within meta.heat_window, not relevance to any query."
+             "Pass a listed id to read the full article; that read adds no heat to any article, tenant-owned or system canonical, so this index never feeds the ranking that surfaced the stub. knowledge_get opens the same ids and DOES count as a read. Ordering is distinct readers within meta.heat_window, not relevance to any query."
          }
        }
      }}
@@ -9103,14 +9188,18 @@ defmodule Loopctl.Knowledge do
   # FLOORED at `@heat_max_window_days` — without it the unbounded all-time scan the default
   # exists to prevent is one query parameter away.
   #
-  # A caller's `:since` is NEVER moved EARLIER. It is rounded UP to the next day boundary
-  # while that boundary is already past — flooring it silently WIDENED the window the caller
-  # explicitly narrowed (a 09:00 `:since` counted reads from 00:00: more than was asked for,
-  # and it looks correct). A `:since` INSIDE the current day is used AS GIVEN rather than
-  # snapped: its next boundary has not happened yet, so snapping it advertised a future
-  # `meta.heat_window` over an empty index — and clamping that back down to today's start,
-  # which is what an upper clamp does, reinstated the very widening the snap fixed. Such a
-  # caller passes a per-call timestamp anyway, so there is no cacheable prefix to protect.
+  # A caller's explicit `:since` is used VERBATIM (#572). It used to be rounded UP to the next
+  # past day boundary, on the reasoning that flooring would silently WIDEN a window the caller
+  # narrowed — true, but the fix inherited the same defect mirrored: ceiling silently NARROWED
+  # it instead, dropping up to 24h of reads the caller explicitly asked for, and the guarding
+  # test could not see it because it only asserted that reads BEFORE `:since` were excluded.
+  # Neither rounding is honest when the exact value is available and costs nothing.
+  #
+  # The cacheability the snap protects belongs to the SYSTEM-derived bounds, and only there:
+  # a caller passing an explicit timestamp is passing a per-call value, so there is no
+  # byte-identical prefix to preserve — as the old comment already conceded for the
+  # inside-today case, without following the concession to its conclusion. `meta.heat_window`
+  # echoes whatever was served either way, so a verbatim value stays self-describing.
   #
   # The SYSTEM-derived bounds (the default lookback and the `@heat_max_window_days` ceiling)
   # are anchored at the START of today instead, so they serve the whole number of days the
@@ -9132,14 +9221,12 @@ defmodule Loopctl.Knowledge do
     |> at_least(DateTime.add(today, -@heat_max_window_days, :day))
   end
 
+  # Only a FUTURE `:since` is repaired, down to today's start: it is degenerate (200 + empty
+  # list + a window that has not happened yet reads as "the corpus is empty", the exact
+  # misreading this route exists to prevent), and clamping rather than 400-ing matches what
+  # the lower bound already does.
   defp heat_snap(given, now, today) do
-    ceiled = ceil_to_utc_day(given)
-
-    cond do
-      DateTime.compare(given, now) == :gt -> today
-      DateTime.compare(ceiled, now) == :gt -> given
-      true -> ceiled
-    end
+    if DateTime.compare(given, now) == :gt, do: today, else: given
   end
 
   defp at_least(dt, lower),
@@ -9147,11 +9234,6 @@ defmodule Loopctl.Knowledge do
 
   defp floor_to_utc_day(%DateTime{} = dt),
     do: DateTime.new!(DateTime.to_date(dt), ~T[00:00:00], "Etc/UTC")
-
-  defp ceil_to_utc_day(%DateTime{} = dt) do
-    floored = floor_to_utc_day(dt)
-    if DateTime.compare(floored, dt) == :eq, do: floored, else: DateTime.add(floored, 1, :day)
-  end
 
   # Aggregate over the EVENTS alone: no join to `articles`, so no article column (least of all
   # the unbounded body) enters the group key, and the article-side predicates ride in a bounded
@@ -9246,6 +9328,12 @@ defmodule Loopctl.Knowledge do
   # unlike the aggregate it follows. `status` and visibility are re-applied
   # rather than trusted from the ranking query: the two run on separate connections, so an
   # article can be unpublished in between, and this is the query that actually reads a title.
+  # The budget for a FULL page: `n` stubs at the per-stub cap, plus the JSON array framing
+  # `chars` now measures — `[`, `]`, and the `n - 1` commas between stubs. An empty page
+  # encodes as `[]`, hence the floor of 2.
+  defp heat_array_budget(0), do: 2
+  defp heat_array_budget(n), do: n * @heat_stub_char_cap + 2 + (n - 1)
+
   defp heat_stubs(_tenant_id, [], _vis), do: []
 
   defp heat_stubs(tenant_id, rows, vis) do
@@ -9292,19 +9380,120 @@ defmodule Loopctl.Knowledge do
   defp heat_stub_projection(query, tenant_id) do
     AdminRepo.all(query, timeout: @heat_stub_timeout_ms)
   rescue
-    e in DBConnection.ConnectionError ->
-      Logger.warning(
-        "heat_stub_projection: admin_pool_checkout_failed tenant_id=#{tenant_id} #{Exception.message(e)}"
-      )
-
-      reraise Loopctl.HeavyRead.OverloadedError, [tenant_id: tenant_id], __STACKTRACE__
+    e in [DBConnection.ConnectionError, Postgrex.Error] ->
+      heat_projection_raise(tenant_id, e, __STACKTRACE__)
   catch
-    :exit, reason ->
-      Logger.warning(
-        "heat_stub_projection: admin_pool_exit tenant_id=#{tenant_id} #{inspect(reason)}"
-      )
+    :exit, reason -> heat_projection_exit(tenant_id, reason)
+  end
 
+  @doc false
+  # `Exception.message/1` on either rescued module carries the fault VERBATIM — a
+  # ConnectionError names the backend host and port, a Postgrex.Error carries the failing
+  # statement and its bound parameters. #562 sanitised exactly this one module over
+  # (`HeavyRead.probe_failure_tag/1`); the heat path was written after and did not inherit it.
+  # Only `tenant_id`, the exception MODULE and the SQLSTATE are interpolated — the code is a
+  # closed Postgrex vocabulary and names nothing about the statement.
+  #
+  # `Postgrex.Error` is rescued alongside because the same saturation arrives from the SERVER
+  # as often as from the pool — and an unrescued one escaped `heat_index/2`'s `{:ok, _}`
+  # contract as a 500 on a per-turn endpoint whose declared degradation is 429. But only a
+  # SATURATION fault degrades: both classes also carry permanent, deterministic faults (a
+  # column a not-yet-run migration adds; a rotated credential), so rescuing them wholesale
+  # dressed those as transient load shedding — the caller retries forever and the operator
+  # sees ordinary gate shedding. Same conservatism `heat_projection_exit/2` applies on the
+  # exit side; anything unplaceable is re-raised to surface as the 500/503 it is.
+  #
+  # It LOGS BEFORE it branches, like the exit side: the fault that must NOT wear the overload
+  # label is exactly the one whose class has to reach the log rather than be re-raised in
+  # silence, leaving nothing to say the admin-pool projection — not the aggregate — failed.
+  #
+  # `:raise`, not `exit:` — `ExitClass`'s kind prefix exists because a dead pool and a fault
+  # raised out of a live one are different investigations, and both arms of this guard
+  # reporting `exit:` collapsed exactly that distinction. The tag is bounded by the rescue's
+  # own two-module clause list.
+  #
+  # Public (`@doc false`) purely as a test seam, for the reason `heat_projection_exit/2` is:
+  # a real query cannot be made to raise a chosen SQLSTATE, so left inline BOTH arms would be
+  # guards nothing ever exercises.
+  @spec heat_projection_raise(Ecto.UUID.t(), Exception.t(), Exception.stacktrace()) :: no_return()
+  def heat_projection_raise(tenant_id, e, stacktrace) do
+    Logger.warning(
+      "heat_stub_projection: admin_pool_read_failed tenant_id=#{tenant_id} " <>
+        "error_class=#{ExitClass.classify(:raise, e)} sqlstate=#{heat_sqlstate(e)}"
+    )
+
+    if heat_saturation?(e) do
+      reraise Loopctl.HeavyRead.OverloadedError, [tenant_id: tenant_id], stacktrace
+    else
+      reraise e, stacktrace
+    end
+  end
+
+  # A pool-side failure is saturation only when the pool actually SHED the checkout —
+  # `:queue_timeout`, a request that waited past the queue deadline. `reason: :error` is every
+  # OTHER connection fault (econnrefused, a credential rotated mid-deploy, a TLS failure), and
+  # those are outages, not this tenant reading too much; re-raised, the backstop renders them
+  # as the 503 `db_unavailable` every other DB path in the app returns for a ConnectionError.
+  #
+  # A SERVER-side fault is only saturation on `@heat_saturation_sqlstates`. A `Postgrex.Error`
+  # carrying no SQLSTATE at all is a client-side encode/decode fault — a code bug, never load.
+  #
+  # The two arms are ASYMMETRIC on purpose, and narrowing this one to match its Postgrex twin
+  # is a regression that has already been made once. A `Postgrex.Error` carries a precise,
+  # machine-readable SQLSTATE, so splitting load from a permanent fault is exact. A
+  # `DBConnection.ConnectionError` carries no such thing: its `:reason` is documented as
+  # `:error | :queue_timeout`, `:error` is the DEFAULT that a connect failure and a deadline
+  # share, and Postgrex sets a third value the typespec does not even list. MEASURED, by
+  # driving `AdminRepo.query!(…, timeout: 30)` past a `pg_sleep`: the timeout THIS path exists
+  # to impose (`@heat_stub_timeout_ms`) surfaces as `reason: :closed`, message "tcp send:
+  # closed (the connection was closed by the pool, possibly due to a timeout …)". Matching
+  # `:queue_timeout` alone therefore misses the dominant, BY-DESIGN case and answers 500 where
+  # the endpoint documents 429.
+  #
+  # So this arm follows the shape the code deliberately produces rather than guessing from a
+  # field that cannot carry the distinction. A connect/auth failure being shed as 429 here is
+  # the accepted cost: it is rarer, and over-shedding a read-only index is a smaller error
+  # than 500-ing the bounded wait this whole function exists to bound.
+  defp heat_saturation?(%DBConnection.ConnectionError{}), do: true
+
+  defp heat_saturation?(%Postgrex.Error{postgres: %{code: code}}),
+    do: code in @heat_saturation_sqlstates
+
+  defp heat_saturation?(_e), do: false
+
+  # The NUMERIC SQLSTATE (`"53300"`), which is what `LoopctlWeb.DBError.sqlstate/1` reads and
+  # `LoopctlWeb.DBErrorLogger` emits under this key on every other DB path. `postgres.code` is
+  # Postgrex's atom NAME, so logging that would put two value spaces under one field and miss
+  # every operator alert keyed on the number.
+  defp heat_sqlstate(%Postgrex.Error{postgres: %{pg_code: pg_code}}) when is_binary(pg_code),
+    do: pg_code
+
+  defp heat_sqlstate(_e), do: "none"
+
+  @doc false
+  # Only a DEMONSTRABLE pool exit becomes an overload. The blanket clause translated EVERY
+  # exit into a 429 — a node `:shutdown` during a deploy, a sandbox ownership exit in tests,
+  # a `{:timeout, {GenServer, :call, _}}` from something that is not the pool — so an
+  # unrelated fault was reported to the caller as "you are reading too much" and to the
+  # operator as ordinary gate shedding. `ExitClass.pool_exit?/1` is deliberately conservative
+  # (what it cannot place is NOT a pool exit), so anything unplaceable is re-exited untouched
+  # to whoever actually owns it. Same call `HeavyRead` makes.
+  #
+  # Public (`@doc false`) purely as a test seam: the branch that must NOT raise an overload is
+  # unreachable from a real query, so left inline it would be a guard nothing ever exercises.
+  @spec heat_projection_exit(Ecto.UUID.t(), term()) :: no_return()
+  def heat_projection_exit(tenant_id, reason) do
+    Logger.warning(
+      "heat_stub_projection: admin_pool_exit tenant_id=#{tenant_id} " <>
+        "error_class=#{ExitClass.classify(:exit, reason)} " <>
+        "pool=#{ExitClass.pool_exit?(reason)}"
+    )
+
+    if ExitClass.pool_exit?(reason) do
       raise Loopctl.HeavyRead.OverloadedError, tenant_id: tenant_id
+    else
+      exit(reason)
+    end
   end
 
   defp heat_stub(article, heat) do
@@ -9336,10 +9525,32 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp shrink_by(value, by), do: String.slice(value, 0, max(String.length(value) - by, 0))
+  # Drop whole GRAPHEMES from the end until at least `by` BYTES are gone (#572). Now that the
+  # overage is measured in bytes, the old `String.length(value) - by` mixed units the other
+  # way: for a CJK value one byte of overage removed one grapheme, i.e. up to three bytes, so
+  # a summary that was slightly over got shredded — and a large enough overage sliced it to
+  # "".
+  defp shrink_by(value, by), do: take_bytes(value, max(byte_size(value) - by, 0))
+
+  # Keep at most `max` BYTES, dropping whole GRAPHEMES. Slicing at a byte OFFSET would split a
+  # multibyte grapheme and put invalid UTF-8 on the wire, so the walk is per grapheme with a
+  # byte target. This is also what makes the per-field caps enforceable in the unit the stub
+  # cap is expressed in — `String.slice/3` counted graphemes and blew the byte budget on
+  # arrival for any non-Latin script.
+  defp take_bytes(value, max) do
+    value
+    |> String.graphemes()
+    |> Enum.reduce_while({[], 0}, fn grapheme, {acc, size} ->
+      next = size + byte_size(grapheme)
+      if next > max, do: {:halt, {acc, size}}, else: {:cont, {[grapheme | acc], next}}
+    end)
+    |> elem(0)
+    |> Enum.reverse()
+    |> IO.iodata_to_binary()
+  end
 
   defp heat_title(nil), do: ""
-  defp heat_title(title), do: String.slice(title, 0, @heat_title_chars)
+  defp heat_title(title), do: take_bytes(title, @heat_title_chars)
 
   # ONE line, always. A body's first paragraph can be arbitrarily long and can contain newlines
   # that would break a line-oriented consumer's parsing of the index.
@@ -9349,7 +9560,7 @@ defmodule Loopctl.Knowledge do
     body
     |> String.replace(~r/\s+/u, " ")
     |> String.trim()
-    |> String.slice(0, @heat_summary_chars)
+    |> take_bytes(@heat_summary_chars)
   end
 
   # Measured off the ENCODED stub, which is what actually goes on the wire (#567). Summing
@@ -9359,7 +9570,14 @@ defmodule Loopctl.Knowledge do
   # or a control character encodes longer than it measures, so `meta.chars` under-reported the
   # wire size — and it under-reported it in the UNSAFE direction, for the one number a caller
   # is told to budget a cached prefix against.
-  defp heat_stub_chars(stub), do: stub |> Jason.encode!() |> String.length()
+  #
+  # BYTES, not graphemes (#572). `String.length/1` counts graphemes, so a CJK or emoji title
+  # under-reported the wire size by 3-4x — the same unsafe direction, on the same number, one
+  # unit down. The budget exists so a caller can size a cached prefix, and every consumer of
+  # that number (an HTTP body, a token estimate, a context window) is byte- or codepoint-
+  # denominated; nothing downstream counts graphemes. `fit_stub_to_cap/1` enforces through
+  # this same function, so the cap moves with it and is now a real byte bound.
+  defp heat_stub_chars(stub), do: stub |> Jason.encode!() |> byte_size()
 
   # Hub-enrichment neighbor discovery (AC-31.3.4): finds which of the seed
   # articles are operational hubs (>= min_hub_relates_to/0 outgoing :relates_to
@@ -9505,59 +9723,30 @@ defmodule Loopctl.Knowledge do
   system-scope fallback (system articles require `scope: :system`), so tenant
   isolation is unaffected — the fallback only ever *widens* what a tenant-scoped
   `:not_found` was allowed to catch, onto the same system-canonical set the
-  index already surfaces.
+  index already surfaces. That fallback now lives in `get_article/3` itself
+  (#572), so both read tools resolve the same set and this one is a thin
+  access-type wrapper.
 
-  The access type is derived from WHICH of those two branches answers, never from anything the
-  caller says (#569). A tenant-owned article records `"drill"`, which `heat_index/2` does NOT
-  count, so that index cannot feed the ranking that surfaced the stub — and it holds for every
-  caller, including ones that predate the rule. A system canonical records a counted `"get"`,
-  because this function is the only path to its body.
+  EVERY drill records the uncounted `"drill"`, whichever scope answers, and the type is
+  derived from the read PATH rather than from anything the caller says (#569) — a declared
+  origin binds only the clients that send it, leaving older releases and raw HTTP calls
+  feeding the loop. Making it uniform is #572: while a canonical's drill was counted and a
+  tenant article's was not, `heat_index/2` ranked both classes on one number that meant
+  different things, so following the documented path raised only the canon.
   """
   @spec progressive_drill(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Article.t()} | {:error, :not_found}
   def progressive_drill(tenant_id, article_id, opts \\ []) do
     # `"drill"` is the UNCOUNTED type (#569): this is the tool `heat_index/2`'s own
     # `meta.drill` names, so counting the hop let being SHOWN produce the rank that showed it.
-    # A caller-declared origin cannot carry that rule — it binds only the clients that send it
-    # — so the branch that resolves the article decides.
     #
     # Excluding EVERY drill, not just one from the heat index, is the consistent rule rather
     # than the blunt one: a drill always follows a list THIS SYSTEM just produced (a heat stub
     # or a `progressive_index` stub), so it is list-ORIGINATED by construction — the same
     # property that excludes `"search"` and `"context"`. `knowledge_get` is the only read where
     # the caller names an id without the ranker having just handed it over, which is exactly
-    # what "caller-chosen" was always supposed to mean. A tenant article therefore keeps the
-    # read that signals a reader's own judgement and loses the ones a list handed it.
-    case get_article(tenant_id, article_id, Keyword.put(opts, :access_type, "drill")) do
-      # A canon's `tenant_id` is NULL, so `get_article/3` can never return one and this branch
-      # is exactly "the article has no other body-read path". Counting it re-enters the loop
-      # for canonicals ALONE, deliberately: the alternative is a canon frozen at heat 0, which
-      # makes `heat_index/2`'s "canonicals participate" invariant false rather than imprecise.
-      # The distinct-reader count (#567) is what bounds it.
-      {:error, :not_found} ->
-        drill_system_canonical(tenant_id, article_id, Keyword.put(opts, :access_type, "get"))
-
-      result ->
-        result
-    end
-  end
-
-  defp drill_system_canonical(tenant_id, article_id, opts) do
-    # `status == :published` (mirrors `get_system_article_by_slug/1` and
-    # `list_system_articles/1`) -- this is the ONLY tenant-facing read path for
-    # a system canonical's body (get_article/2 requires a tenant_id match,
-    # which nil-tenant system rows never satisfy), so unlike
-    # `fetch_curatable_article/2` (the privileged, role-gated curation path
-    # that legitimately needs drafts), this must never expose a draft or
-    # archived system canonical by id.
-    case AdminRepo.one(
-           from(a in Article,
-             where: a.id == ^article_id and a.scope == :system and a.status == :published
-           )
-         ) do
-      nil -> {:error, :not_found}
-      article -> finalize_article_read(tenant_id, article, opts)
-    end
+    # what "caller-chosen" was always supposed to mean.
+    get_article(tenant_id, article_id, Keyword.put(opts, :access_type, "drill"))
   end
 
   # --- Circuit breaker for embedding generation ---

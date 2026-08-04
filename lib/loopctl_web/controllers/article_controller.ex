@@ -235,6 +235,13 @@ defmodule LoopctlWeb.ArticleController do
     summary: "Get article",
     description:
       "Returns article detail with outgoing and incoming links preloaded. Role: agent+.\n\n" <>
+        "**Scope (#572).** Resolves tenant-owned articles AND published SYSTEM CANONICALS — " <>
+        "the same public set the wiki serves at `/wiki/<slug>` and `heat_index` lists, so a " <>
+        "canonical stub no longer 404s here. A DRAFT or ARCHIVED canonical still 404s, and a " <>
+        "tenant-owned article can never match the canonical fallback (it requires " <>
+        "`scope: :system`), so tenant isolation is unchanged. This read is COUNTED by the " <>
+        "heat index; drill via `GET /knowledge/progressive/:id` when you are merely " <>
+        "following an index this system produced.\n\n" <>
         "**Link payload (#538).** Each link carries only its FAR side, as " <>
         "`article: {id, title}` — for an outgoing link the source is always the requested " <>
         "article and for an incoming link the target is, so that side was a constant echo " <>

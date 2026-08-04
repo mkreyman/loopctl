@@ -4511,10 +4511,11 @@ const TOOLS = [
       "KB has nothing' rather than 'I asked badly'. Reach for this when a search came back " +
       "empty or thin, or to survey what the fleet actually reads before you know what to " +
       "ask. Ordering is usage, NOT relevance to any query. Open a stub with " +
-      "knowledge_progressive_drill (not knowledge_get — this index also lists published " +
-      "system canonicals, which knowledge_get cannot resolve). Drilling a tenant article " +
-      "adds NO heat to what you opened, so this index cannot feed the ranking that showed " +
-      "you the stub; a knowledge_get of the same id does count.",
+      "knowledge_progressive_drill: drilling adds NO heat to what you opened, whatever its " +
+      "scope, so this index can never feed the ranking that showed you the stub. " +
+      "knowledge_get resolves the same ids (published system canonicals included) and DOES " +
+      "count as a read — use it when you are deliberately voting for an article's " +
+      "usefulness, not when you are just following this list.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4531,9 +4532,9 @@ const TOOLS = [
           description:
             "Optional: ISO-8601 timestamp; count only reads at/after it. Defaults to the " +
             "last 90 days, clamped to at most 365 days of lookback and to no later than " +
-            "today. Snapped to a UTC day boundary in the NARROWING direction (never wider " +
-            "than you asked for; a timestamp inside the current UTC day is used exactly as " +
-            "given), and meta.heat_window echoes what you got.",
+            "the start of today. An explicit timestamp is otherwise served VERBATIM; only " +
+            "the default and the ceiling are anchored at the start of today, which is what " +
+            "keeps a default refresh byte-identical. meta.heat_window echoes what you got.",
         },
       },
       required: [],
@@ -4547,8 +4548,12 @@ const TOOLS = [
       "body for the given id, scope-enforced. Resolves both tenant-owned articles and " +
       "published system canonicals (the same set the index surfaces). This is the drill " +
       "half of progressive disclosure: index cheaply, then open only the article(s) you " +
-      "need. (knowledge_get works for tenant articles too; use this to also reach the " +
-      "system canonicals the progressive index can surface.)",
+      "need.\n\n" +
+      "Pick between this and knowledge_get by what the read MEANS, not by what it can " +
+      "reach — both resolve the same ids now. A drill records an UNCOUNTED read, so " +
+      "following an index never raises the heat of what that index just showed you; " +
+      "knowledge_get records a counted one, which is a vote that the article was worth " +
+      "opening on its own. Following a list is not a vote.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4565,6 +4570,9 @@ const TOOLS = [
     name: "knowledge_get",
     description:
       "Get full article content by ID. Use after search to read an article in detail. " +
+      "Resolves tenant-owned articles AND published system canonicals. Records a COUNTED " +
+      "read (it feeds knowledge_heat_index); use knowledge_progressive_drill instead when " +
+      "you are merely following an index this system just handed you. " +
       "Pass story_id when working on a loopctl story so reads attribute correctly. " +
       "If the response carries a non-empty `potential_conflicts` array AND the conflict is " +
       "material to your current task, act on it: read the peer, judge redundant/complementary/" +

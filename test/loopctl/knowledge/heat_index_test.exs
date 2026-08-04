@@ -251,6 +251,31 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert results == [], "a read the caller's :since excluded must not be counted"
     end
 
+    test "#572: an explicit :since is not NARROWED either — it is served verbatim" do
+      # The other half, and the half that had no coverage: the test above only asserts that
+      # reads BEFORE `:since` stay excluded, which a window that starts LATER than asked also
+      # satisfies. So ceiling to the next day boundary — #567's fix for the widening — passed
+      # it while silently dropping up to 24h of reads the caller explicitly asked for.
+      # Rounding in either direction is dishonest when the exact value costs nothing.
+      tenant = fixture(:tenant)
+      article = published_article(tenant.id, %{title: "Inside the asked-for window"})
+
+      # Mid-day, comfortably inside the window but AFTER the start of its own UTC day, so a
+      # ceil moves it forward a whole day and a floor moves it back several hours.
+      given = DateTime.add(DateTime.utc_now(), -30, :day)
+      heat(tenant.id, article, 2, %{accessed_at: DateTime.add(given, 1, :hour)})
+
+      assert {:ok, %{results: results, meta: %{heat_window: window}}} =
+               Knowledge.heat_index(tenant.id, since: given)
+
+      assert {:ok, effective, _} = DateTime.from_iso8601(window)
+
+      assert DateTime.compare(effective, given) == :eq,
+             "an explicit :since must be echoed exactly, neither floored nor ceiled"
+
+      assert [%{heat: 2}] = results
+    end
+
     test "#567: a :since inside the current UTC day is not widened back to 00:00" do
       # The snap ceiled the caller's value and an upper clamp then pulled it back to today's
       # start, so a 09:00 `:since` counted reads from 00:00 again — the same widening the snap
@@ -366,12 +391,16 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert Enum.map(results, & &1.title) == ["Actually sought out"]
     end
 
-    test "#569: the uncounted label is derived from the read path, not from the caller" do
+    test "#572: the uncounted label is derived from the read path, and is UNIFORM across scopes" do
       # Two halves of the same rule. The read still matters for analytics and follow-through,
       # so a fix that just dropped the event would pass the test above and lose data. And a
       # caller-declared origin cannot carry the rule — it binds only the clients that send it
-      # — so a drill that says NOTHING must still be excluded, while the canon's drill (the
-      # only path to its body) must still count or it can never rank at all.
+      # — so a drill that says NOTHING must still be excluded.
+      #
+      # #569 shipped this for tenant-owned articles only: a canon's drill recorded a counted
+      # `get`, because the drill was then its ONLY body path. That left `heat_index/2` ranking
+      # a counted class against an uncounted one on one `heat` number, and since drilling is
+      # the DOCUMENTED path, following the docs raised only canonicals.
       tenant = fixture(:tenant)
       {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
       own = published_article(tenant.id, %{title: "Tenant-owned, drilled"})
@@ -387,14 +416,20 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       # `config/test.exs` sets `:analytics_recording_mode, :sync`, so the events are already
       # written when the calls return — no drain needed.
       assert recorded_types(tenant.id, own.id) == ["drill"]
-      assert recorded_types(tenant.id, canon.id) == ["get"]
+
+      assert recorded_types(tenant.id, canon.id) == ["drill"],
+             "a canonical's drill must be uncounted like any other, or heat ranks two units"
     end
 
-    test "a published system canonical earns heat from the only read path it has" do
-      # A canon's body is readable ONLY through progressive_drill (get_article filters on
-      # tenant_id, and a canon row's is NULL), so this drives that path rather than inserting
-      # events: fabricated `get` rows would keep passing even if no production call could ever
-      # produce one, which is exactly how the canon silently fell out of this index.
+    test "#572: a canonical earns heat the same way a tenant article does — a caller-named get" do
+      # The canon must still PARTICIPATE, which is what made counting its drill tempting. The
+      # fix gives it the read path it lacked instead of counting the one it had: get_article/3
+      # now resolves a published canonical, so `knowledge_get` is a real caller-named read for
+      # it and no longer 404s on a canon stub.
+      #
+      # Driven through the public API rather than by inserting events: fabricated `get` rows
+      # would keep passing even if no production call could produce one, which is exactly how
+      # the canon silently fell out of this index in the first place.
       tenant = fixture(:tenant)
 
       canonical =
@@ -406,7 +441,7 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
 
       for _ <- 1..2 do
         {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
-        assert {:ok, _} = Knowledge.progressive_drill(tenant.id, canonical.id, api_key_id: key.id)
+        assert {:ok, _} = Knowledge.get_article(tenant.id, canonical.id, api_key_id: key.id)
       end
 
       heat(tenant.id, own, 1)
@@ -414,6 +449,28 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert {:ok, %{results: results}} = Knowledge.heat_index(tenant.id)
       assert Enum.map(results, & &1.title) == ["Canon", "Own"]
       assert Enum.map(results, & &1.heat) == [2, 1]
+    end
+
+    test "#572: drilling every article leaves the ranking EMPTY — no class accrues" do
+      # The regression the split created, stated directly: with a canonical counted and a
+      # tenant article not, a fleet following `meta.drill` drove the index monotonically
+      # toward the shared canon, self-reinforcingly (shown -> drilled -> still shown). The
+      # invariant is that the documented path moves NOTHING, whatever the scope.
+      tenant = fixture(:tenant)
+      own = published_article(tenant.id, %{title: "Own"})
+
+      canon =
+        published_article(tenant.id, %{title: "Canon"})
+        |> Ecto.Changeset.change(%{scope: :system, tenant_id: nil})
+        |> AdminRepo.update!()
+
+      for _ <- 1..5 do
+        {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+        assert {:ok, _} = Knowledge.progressive_drill(tenant.id, canon.id, api_key_id: key.id)
+        assert {:ok, _} = Knowledge.progressive_drill(tenant.id, own.id, api_key_id: key.id)
+      end
+
+      assert {:ok, %{results: []}} = Knowledge.heat_index(tenant.id)
     end
   end
 
@@ -559,8 +616,57 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert String.length(stub.title) <= 100
       assert meta.chars <= meta.char_budget
       # Derived from the ASKED-FOR cap, not the ceiling — limit: 5 must not advertise 100.
+      # Not an exact 10x: the budget now includes the JSON array framing `chars` measures
+      # (two brackets plus n-1 commas), which does not scale linearly with n (#572).
       assert {:ok, %{meta: %{char_budget: wider}}} = Knowledge.heat_index(tenant.id, limit: 50)
-      assert wider == meta.char_budget * 10
+      assert wider == meta.char_budget * 10 - 9
+    end
+
+    test "#572: char_budget covers the array FRAMING, not just the stubs" do
+      # `chars` summed per-stub sizes, so it omitted the two brackets and the n-1 commas the
+      # caller actually receives: the number advertised as an ENFORCED budget was under by
+      # n+1 on every response, and `char_budget` had the same hole. A budget that is wrong by
+      # a predictable amount is worse than no budget, because it is trusted.
+      tenant = fixture(:tenant)
+
+      for i <- 1..3,
+          do: tenant.id |> published_article(%{title: "A#{i}"}) |> then(&heat(tenant.id, &1, i))
+
+      assert {:ok, %{results: stubs, meta: meta}} = Knowledge.heat_index(tenant.id, limit: 3)
+      assert length(stubs) == 3
+
+      # The reported figure is the whole encoded array, framing included.
+      assert meta.chars == stubs |> Jason.encode!() |> byte_size()
+      assert meta.chars > stubs |> Enum.map(&(&1 |> Jason.encode!() |> byte_size())) |> Enum.sum()
+      assert meta.chars <= meta.char_budget
+    end
+
+    test "#572: chars is measured in BYTES, so multibyte content is not under-reported" do
+      # `String.length/1` counts graphemes, so a CJK or emoji title under-reported the wire
+      # size by 3-4x — the unsafe direction, on the one number a caller sizes a cached prefix
+      # against, and nothing downstream of it (HTTP body, token estimate, context window)
+      # counts graphemes.
+      tenant = fixture(:tenant)
+
+      multibyte = String.duplicate("日本語", 100)
+      article = published_article(tenant.id, %{title: multibyte, body: multibyte})
+      heat(tenant.id, article, 1)
+
+      assert {:ok, %{results: [stub], meta: meta}} = Knowledge.heat_index(tenant.id, limit: 1)
+
+      encoded = Jason.encode!([stub])
+      assert meta.chars == byte_size(encoded)
+      assert byte_size(encoded) > String.length(encoded), "the fixture must be multibyte"
+      assert meta.chars <= meta.char_budget
+
+      # The cap is a real BYTE bound now, so trimming must not shred the value to nothing
+      # either — a byte overage used to be spent one grapheme (up to 3 bytes) at a time.
+      # The SUMMARY is the assertion that matters: it is the padding `fit_stub_to_cap/1`
+      # spends first, so grapheme-sliced fields against a byte cap emptied it outright while
+      # a title-only check still passed.
+      assert stub.title != ""
+      assert stub.summary != "", "a multibyte stub must keep its summary, not just its title"
+      assert String.valid?(stub.title) and String.valid?(stub.summary)
     end
 
     test "#567: chars is the ENCODED size, and the budget still bounds escape-heavy content" do
@@ -577,11 +683,103 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
 
       assert {:ok, %{results: [stub], meta: meta}} = Knowledge.heat_index(tenant.id, limit: 1)
 
-      # The reported figure IS the wire size of what was returned.
-      assert meta.chars == stub |> Jason.encode!() |> String.length()
+      # The reported figure IS the wire size of what was returned — the whole array, in bytes.
+      assert meta.chars == [stub] |> Jason.encode!() |> byte_size()
 
       # ...and the budget still holds, which is what it claims to do.
       assert meta.chars <= meta.char_budget
+    end
+
+    test "#572: only a DEMONSTRABLE pool exit degrades to an overload" do
+      # The blanket `catch :exit` translated every exit into the gate's 429. A node
+      # :shutdown mid-deploy, a sandbox ownership exit, a {:timeout, {GenServer, :call, _}}
+      # from something that is not the pool — each was reported to the caller as "you are
+      # reading too much" and to the operator as ordinary shedding, so a systemic fault wore
+      # the costume of one tenant reading hard.
+      tenant = fixture(:tenant)
+      pool_reason = {:noproc, {DBConnection, :execute, []}}
+
+      # Each call warns by design; capture so the deliberate log stays out of suite output.
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert_raise Loopctl.HeavyRead.OverloadedError, fn ->
+          Knowledge.heat_projection_exit(tenant.id, pool_reason)
+        end
+
+        # Anything unplaceable is re-exited untouched to whoever actually owns it.
+        for foreign <- [:shutdown, {:timeout, {GenServer, :call, [:some_pid, :req]}}, :killed] do
+          assert catch_exit(Knowledge.heat_projection_exit(tenant.id, foreign)) == foreign
+        end
+      end)
+    end
+
+    test "#572: a projection fault is logged by CLASS, never by raw reason" do
+      # #562 sanitised exactly this one module over; the heat path was written after and did
+      # not inherit it. A DBConnection.ConnectionError message names the backend host and
+      # port, and inspect/1 on an exit reason leaks the checkout tuple — both into a log
+      # stream that is not the place for backend topology.
+      import ExUnit.CaptureLog
+
+      tenant = fixture(:tenant)
+      reason = {:noproc, {DBConnection, :execute, ["SELECT secret FROM t", ["bound-param"]]}}
+
+      log =
+        capture_log(fn ->
+          assert_raise Loopctl.HeavyRead.OverloadedError, fn ->
+            Knowledge.heat_projection_exit(tenant.id, reason)
+          end
+        end)
+
+      assert log =~ "error_class=exit:noproc"
+      assert log =~ tenant.id
+      refute log =~ "bound-param", "bound parameters must never reach the log"
+      refute log =~ "SELECT secret", "the failing statement must never reach the log"
+    end
+
+    test "#572: only a SATURATION fault degrades to an overload, and it logs the numeric code" do
+      # The exit arm got a seam and two tests; the raise arm shipped with neither. Both rescued
+      # classes carry permanent faults as well as load — a rotated credential is not "you are
+      # reading too much", and neither is a column a not-yet-run migration adds. 08P01 is what
+      # pgbouncer rejects with, and the earlier three-code 08 list dropped it into a 500.
+      tenant = fixture(:tenant)
+      pg = &Postgrex.Error.exception(postgres: %{code: &1, severity: "ERROR", message: "x"})
+
+      # EVERY ConnectionError sheds, including the `:closed` and default-`:error` reasons.
+      # This was briefly narrowed to `reason: :queue_timeout`, which misses the shape this
+      # path produces BY DESIGN: driving `AdminRepo.query!(…, timeout: 30)` past a `pg_sleep`
+      # raises `reason: :closed` ("tcp send: closed … possibly due to a timeout"), a value the
+      # struct's own `:error | :queue_timeout` typespec does not list. The bounded wait
+      # `@heat_stub_timeout_ms` imposes then answered 500 against a documented 429 — the one
+      # case the rescue exists for. A Postgrex.Error carries an exact SQLSTATE and IS split;
+      # a ConnectionError carries nothing that can carry the distinction.
+      shed = [
+        %DBConnection.ConnectionError{message: "checkout", reason: :queue_timeout},
+        %DBConnection.ConnectionError{message: "tcp send: closed", reason: :closed},
+        %DBConnection.ConnectionError{message: "econnrefused", reason: :error},
+        pg.("53300"),
+        pg.("08P01")
+      ]
+
+      permanent = [pg.("42703")]
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          for e <- shed do
+            assert_raise Loopctl.HeavyRead.OverloadedError, fn ->
+              Knowledge.heat_projection_raise(tenant.id, e, [])
+            end
+          end
+
+          for e <- permanent do
+            assert_raise e.__struct__, fn -> Knowledge.heat_projection_raise(tenant.id, e, []) end
+          end
+        end)
+
+      # BOTH arms log, under the SQLSTATE spelling every other DB line uses — `postgres.code`
+      # is Postgrex's atom NAME, which no operator alert is keyed on.
+      assert log =~ "error_class=raise:Postgrex.Error"
+      assert log =~ "sqlstate=53300"
+      assert log =~ "sqlstate=42703"
+      refute log =~ "sqlstate=too_many_connections"
     end
 
     test "truncated says the list is partial, since nothing else in the payload would" do

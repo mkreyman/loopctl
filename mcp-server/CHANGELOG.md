@@ -5,6 +5,35 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.67.0 — 2026-08-04 (one accounting rule for every scope)
+
+### Changed
+
+- **Drilling never adds heat now, at any scope** (issue #572). 2.66.0 exempted tenant-owned
+  articles only: a published system canonical's drill still recorded a counted read, because
+  the drill was the sole path to its body and excluding it would have frozen every canonical
+  at heat 0. That was right about the canon and wrong about the index — `knowledge_heat_index`
+  then ranked a counted class against an uncounted one on a single `heat` number, and since
+  drilling is the path the payload itself recommends, following the documentation raised only
+  canonicals, self-reinforcingly.
+
+- **`knowledge_get` now resolves published system canonicals**, which is what made the
+  uniform rule possible: the canon earns heat through a caller-named read like everything
+  else, and following a canon stub into `knowledge_get` no longer 404s. **Pick your read tool
+  by what it MEANS, not by what it can reach** — both resolve the same ids. A drill is
+  uncounted, so following an index never feeds the ranking that produced it; a `get` is a
+  counted vote that the article was worth opening on its own. The tool descriptions for
+  `knowledge_get`, `knowledge_progressive_drill` and `knowledge_heat_index` all say so.
+
+- **`meta.chars` / `meta.char_budget` are BYTES of the encoded stub array**, array framing
+  included. They were graphemes summed per stub, so a CJK or emoji payload was under-reported
+  several-fold and the brackets and commas were omitted entirely — both in the unsafe
+  direction, for the one number you are told to size a cached prefix against. A budget that is
+  wrong by a predictable amount is worse than none, because it is trusted.
+
+- **An explicit `since` on `knowledge_heat_index` is served verbatim.** It was rounded up to
+  the next UTC day boundary, silently dropping up to 24h of reads you asked for.
+
 ## 2.66.0 — 2026-08-04 (the heat index stops feeding its own ranking)
 
 ### Changed

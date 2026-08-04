@@ -468,18 +468,25 @@ semantic/keyword **retrieval** result, on one uniform shape carrying
   let any agent pin its own article at rank 1 with a `knowledge_get` loop, and
   counting KEYS would count DISPATCHES (v2 mints one key per dispatch); this
   index is designed to be pasted into a cached prefix, so that ranking
-  propagated into every other agent's context (#567). A drill of a TENANT-OWNED
-  article is recorded under its own access_type and is NOT counted — counting it
-  let the index feed its own ranking, shown produced read, read produced rank
-  (#569). The label is derived from the read path, never from a caller-supplied
-  origin, so it binds every client; a system canonical's drill still records a
-  counted `get`, since it is the only path to that body. The rule behind all
-  three fixes on this route: heat must not rank on a signal heat produces.
-  Window is snapped to a UTC day boundary (narrowing only) so refreshes are
-  byte-identical. Drill a stub
-  with `knowledge_progressive_drill`, NOT `knowledge_get` — the index lists
-  published system canonicals (NULL `tenant_id`) that `get_article/3` cannot
-  resolve.
+  propagated into every other agent's context (#567). A drill is recorded under
+  its own access_type and is NOT counted, for EVERY scope — counting it let the
+  index feed its own ranking, shown produced read, read produced rank (#569).
+  The label is derived from the read path, never from a caller-supplied origin,
+  so it binds every client. #569 first exempted tenant articles only, leaving a
+  canonical's drill counted because the drill was then its only body path; that
+  left the ranking comparing a counted class against an uncounted one, and since
+  drilling is the DOCUMENTED path, following the docs drifted the index toward
+  the shared canon (#572). Fixed by giving the canon the read path it lacked:
+  `get_article/3` now resolves published system canonicals, so `knowledge_get`
+  works on any stub and every article earns heat the same way. **The rule behind
+  all four fixes: heat must not rank on a signal heat produces — and must never
+  rank counted and uncounted read paths on one number.** Window: the SYSTEM
+  default is snapped to a UTC day boundary so refreshes are byte-identical; an
+  explicit `:since` is served verbatim (rounding it either way silently changed
+  the window a caller asked for). `meta.chars`/`char_budget` are BYTES of the
+  encoded stub array, framing included. Drill with
+  `knowledge_progressive_drill` when following the index; `knowledge_get` when
+  the read is a deliberate vote.
 - **#305/#306 are the same feature** (this epic implements both) — recommend
   closing one as a duplicate of the other rather than tracking them separately.
 
