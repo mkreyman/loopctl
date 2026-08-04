@@ -241,10 +241,34 @@ any agent pin its own article at rank 1 by calling `knowledge_get` in a loop, an
 because this index is meant to be pasted into a cached prefix, that ranking then
 propagated into every other agent's context. It is the AGENT, not the key row:
 v2 mints a fresh ephemeral key per dispatch, so counting keys would count
-dispatches and re-open the same pinning. Only `get`-shaped reads count;
+dispatches and re-open the same pinning. Only `get`-shaped reads count.
 `search` and `context` write one row per RESULT of one ranked query, so counting
 them would re-couple this route to the embedding similarity it exists to be free
-of.
+of. `drill` is excluded for a different reason (#569): a drill IS a genuine
+single-article body read, but `knowledge_progressive_drill` is the tool this
+index's own `meta.drill` names, so counting it closed a loop — the index showed an
+article, a caller drilled it *because* it was shown, and the drill fed the rank
+that showed it. Material that never surfaced could not overtake material that
+already had. The general rule behind all three exclusions: **heat must not rank on
+a signal heat produces.**
+
+Which access type a drill records is derived from the branch that resolves the
+article, never from anything the caller sends: a tenant-owned article records the
+uncounted `drill`, a published system canonical records a counted `get`. A
+caller-declared origin was tried and is wrong — it binds only the clients that send
+it, so every older MCP release and every raw HTTP call re-opens the loop by
+default. The canonical branch is the deliberate exception: `get_article/3` filters
+on `tenant_id` and a canon row's is NULL, so that drill is the only path to its
+body, and excluding it would freeze every canonical at heat 0 and make the
+"canonicals participate" property false. A tenant article loses nothing — a plain
+`knowledge_get` of a listed id still counts, and that is the read a reader names for
+itself. What bounds the residual canonical loop, and any *deliberate*
+manipulation, is the distinct-reader count, not this label.
+
+`drill` still counts as follow-through in
+`RetrievalMetrics.compute_followed_through/2`, which asks a different question —
+was a body *delivered* after a search. The two access-type sets diverge on
+purpose and must not be unified.
 
 The window is snapped to a UTC day boundary, so two calls with no intervening read
 return a byte-identical payload — which is what makes it safe in a cached prefix.

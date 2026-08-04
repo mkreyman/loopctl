@@ -42,6 +42,26 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
       assert m.precision == 0.5
     end
 
+    test "#569: a DRILL is follow-through — the heat-index split must not regress precision",
+         ctx do
+      # `"drill"` was carved out of `"get"` so `heat_index/2` cannot rank on reads it caused
+      # itself. That split is about the RANKING; this metric asks a different question — was a
+      # body DELIVERED after a search — and a drill delivers one. Omitting it here would
+      # silently under-report follow-through by exactly the reads that changed type, and it
+      # would look like a precision regression on the day the split shipped rather than a
+      # definition change. The two access-type sets diverge on purpose; this pins the
+      # divergence in the direction that is easy to get wrong by omission.
+      %{tenant: t, key: k, x: x, y: y} = ctx
+      event(t.id, k.id, x.id, "search", ~T[12:00:00])
+      event(t.id, k.id, x.id, "drill", ~T[12:10:00])
+      event(t.id, k.id, y.id, "search", ~T[12:00:00])
+
+      m = RetrievalMetrics.compute(t.id, @day, 1800)
+      assert m.searched == 2
+      assert m.followed_through == 1
+      assert m.precision == 0.5
+    end
+
     test "an open OUTSIDE the window does not count", ctx do
       %{tenant: t, key: k, x: x} = ctx
       event(t.id, k.id, x.id, "search", ~T[12:00:00])

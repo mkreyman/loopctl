@@ -4512,7 +4512,9 @@ const TOOLS = [
       "empty or thin, or to survey what the fleet actually reads before you know what to " +
       "ask. Ordering is usage, NOT relevance to any query. Open a stub with " +
       "knowledge_progressive_drill (not knowledge_get — this index also lists published " +
-      "system canonicals, which knowledge_get cannot resolve).",
+      "system canonicals, which knowledge_get cannot resolve). Drilling a tenant article " +
+      "adds NO heat to what you opened, so this index cannot feed the ranking that showed " +
+      "you the stub; a knowledge_get of the same id does count.",
     inputSchema: {
       type: "object",
       properties: {
@@ -6081,7 +6083,7 @@ const TOOLS = [
         },
         access_type: {
           type: "string",
-          enum: ["search", "get", "context", "index"],
+          enum: ["search", "get", "context", "index", "drill"],
           description: "Optional: restrict to a single access type.",
         },
       },

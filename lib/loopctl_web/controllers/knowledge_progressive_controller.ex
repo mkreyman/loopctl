@@ -123,7 +123,11 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
         "article's BODY directly. Repeat reads by one reader count once. " <>
         "Only caller-chosen fetches are counted " <>
         "(`meta.counted_access_types`); list-shaped ranker output (a search hit, a context " <>
-        "pack) is one row per RESULT, not a read, so it adds no heat. Takes NO query, " <>
+        "pack) is one row per RESULT, not a read, so it adds no heat. Neither does drilling " <>
+        "a listed tenant article (GET /knowledge/progressive/:id) — that read is recorded " <>
+        "under its own access type, so this index does not feed the ranking that surfaced " <>
+        "the article; a plain knowledge_get of the same id does count. `char_budget`/`chars` " <>
+        "size the stub array only, exclusive of `meta`. Takes NO query, " <>
         "which is the " <>
         "point: every other retrieval route starts from one, so they all miss the same way " <>
         "on a paraphrase or on material that is topically central but lexically dissimilar. " <>
@@ -254,6 +258,9 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
     # Thread api_key_id so finalize_article_read/Analytics.record_access attributes
     # the body read (parity with ArticleController.show and the hybrid endpoint) —
     # without it, every progressive-drill read is an audit/analytics blind spot.
+    # No origin parameter: which access type the read records is derived server-side from the
+    # branch that resolves the article (#569), so the heat-index exclusion binds every caller
+    # rather than only the ones that opt in.
     opts = Keyword.merge([api_key_id: api_key_id], Visibility.scope_opts(conn))
 
     with {:ok, article} <-

@@ -3,6 +3,7 @@ defmodule Loopctl.Knowledge.ArticleAccessEventTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.ArticleAccessEvent
 
   describe "create_changeset/2" do
@@ -74,7 +75,36 @@ defmodule Loopctl.Knowledge.ArticleAccessEventTest do
 
   describe "access_types/0" do
     test "returns all supported types" do
-      assert ArticleAccessEvent.access_types() == ~w(search get context index)
+      assert ArticleAccessEvent.access_types() == ~w(search get context index drill)
+    end
+
+    test "#569: the schema allowlist and the Analytics write guard do not drift" do
+      # Two allowlists over one column, and there is NO DB CHECK — these are the enforcement.
+      # A value in the schema but not in Analytics is silently unwritable (`record_access/6`
+      # falls through to its catch-all `:ok` and drops the event); a value in Analytics but not
+      # the schema fails `validate_inclusion` at insert, inside a fire-and-forget task where
+      # nobody sees it. Both failures are SILENT, which is why this is asserted rather than
+      # left to review.
+      schema_types = ArticleAccessEvent.access_types()
+      analytics_types = Analytics.valid_access_types()
+
+      assert Enum.sort(schema_types) == Enum.sort(analytics_types)
+      assert "drill" in schema_types, "the guard is vacuous if the sets are empty"
+    end
+
+    test "#569: the analytics READ surface enumerates no list of its own" do
+      # There was a THIRD copy, in `KnowledgeAnalyticsController`, and it went stale the moment
+      # `drill` was added to the other two — silently, because its filter DROPPED an
+      # unrecognised value rather than rejecting it, so `?access_type=drill` returned the
+      # UNFILTERED top articles labelled as if the filter had applied. A drift test that binds
+      # two of three lists reads like coverage while the third is free, so this asserts the
+      # controller holds no independent list at all: it must be the SAME term, not an equal one.
+      source = File.read!("lib/loopctl_web/controllers/knowledge_analytics_controller.ex")
+
+      assert source =~ "@valid_access_types Analytics.valid_access_types()"
+
+      refute source =~ ~r/@valid_access_types\s+~w\(/,
+             "the analytics controller must DERIVE the access types, never re-list them"
     end
   end
 end

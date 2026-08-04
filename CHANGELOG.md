@@ -96,6 +96,31 @@ Operator-facing changes for deployments outside the hosted instance.
   there is **no multiplier to apply on top**. At the default of 500 the per-lane allowance is
   25/node.
 
+- **New `article_access_events.access_type` value: `drill` (#569).** `GET
+  /api/v1/knowledge/progressive/:id` records `drill` instead of `get` when it resolves a
+  TENANT-OWNED article; a published system canonical still records `get`. No request
+  parameter is involved — the server derives it from the read path, so every client is
+  covered. Operator-visible in
+  two places. **Analytics filters on `access_type=get` will stop seeing those reads** —
+  `GET /api/v1/knowledge/analytics/*` and anything grouping by access type must add `drill` to
+  keep the same population. And the value set that column can hold has grown, though there is
+  no DB CHECK to migrate: the allowlists are `ArticleAccessEvent.@access_types` and
+  `Analytics.@valid_access_types`.
+
+  Why: `heat_index` ranks on `get`, and the drill tool its own `meta.drill` payload tells
+  callers to use recorded a `get` — so an article gained heat from having been *shown* by the
+  index. Visibility produced reads, reads produced rank, rank produced visibility, and
+  material that never surfaced could not overtake material that already had. The canonical
+  branch keeps `get` because that drill is the ONLY path to a system canonical's body, so
+  excluding it would freeze every canonical at heat 0 rather than merely undercount it.
+  Retrieval
+  follow-through (`RetrievalMetrics`) deliberately DOES count `drill`, so precision figures
+  are unaffected by the split.
+
+  Nothing is back-filled: reads taken before this deploy are `get` rows and keep feeding heat
+  until they age out of the window (90 days by default, up to 365 with `since`), so heat
+  rankings stay partly loop-contaminated for one window after the upgrade.
+
 - **`GET /api/v1/knowledge/heat_index` ranks by DISTINCT READERS, not by read count (#567).**
   Heat was `count(*)` over access-event rows, so any agent could pin its own article at rank 1 by
   calling `knowledge_get` on it in a loop — and because this index is meant to be pasted into a

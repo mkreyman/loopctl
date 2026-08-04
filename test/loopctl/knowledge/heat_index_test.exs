@@ -346,7 +346,55 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert Enum.map(results, & &1.title) == ["Actually read"]
     end
 
-    test "a published system canonical is indexed, not silently dropped" do
+    test "#569: a DRILL adds no heat, so the index cannot feed its own ranking" do
+      # The loop this closes: heat ranks on `get`, and the tool the payload's own `meta.drill`
+      # names recorded a `get` — so an article gained heat from having been SHOWN here.
+      # Visibility produced reads, reads rank, rank visibility, and material that never
+      # surfaced could not overtake material that already had. Unlike `search`/`context`, a
+      # drill IS a genuine single-article body read; it is excluded because of where it comes
+      # FROM, not what shape it is.
+      tenant = fixture(:tenant)
+      shown = published_article(tenant.id, %{title: "Kept getting shown"})
+      read = published_article(tenant.id, %{title: "Actually sought out"})
+
+      # 20 drills by 20 different readers — the strongest form of the loop, since distinct
+      # readers is exactly what heat counts.
+      heat(tenant.id, shown, 20, %{access_type: "drill"})
+      heat(tenant.id, read, 1)
+
+      assert {:ok, %{results: results}} = Knowledge.heat_index(tenant.id)
+      assert Enum.map(results, & &1.title) == ["Actually sought out"]
+    end
+
+    test "#569: the uncounted label is derived from the read path, not from the caller" do
+      # Two halves of the same rule. The read still matters for analytics and follow-through,
+      # so a fix that just dropped the event would pass the test above and lose data. And a
+      # caller-declared origin cannot carry the rule — it binds only the clients that send it
+      # — so a drill that says NOTHING must still be excluded, while the canon's drill (the
+      # only path to its body) must still count or it can never rank at all.
+      tenant = fixture(:tenant)
+      {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      own = published_article(tenant.id, %{title: "Tenant-owned, drilled"})
+
+      canon =
+        published_article(tenant.id, %{title: "Canon"})
+        |> Ecto.Changeset.change(%{scope: :system, tenant_id: nil})
+        |> AdminRepo.update!()
+
+      assert {:ok, _} = Knowledge.progressive_drill(tenant.id, own.id, api_key_id: key.id)
+      assert {:ok, _} = Knowledge.progressive_drill(tenant.id, canon.id, api_key_id: key.id)
+
+      # `config/test.exs` sets `:analytics_recording_mode, :sync`, so the events are already
+      # written when the calls return — no drain needed.
+      assert recorded_types(tenant.id, own.id) == ["drill"]
+      assert recorded_types(tenant.id, canon.id) == ["get"]
+    end
+
+    test "a published system canonical earns heat from the only read path it has" do
+      # A canon's body is readable ONLY through progressive_drill (get_article filters on
+      # tenant_id, and a canon row's is NULL), so this drives that path rather than inserting
+      # events: fabricated `get` rows would keep passing even if no production call could ever
+      # produce one, which is exactly how the canon silently fell out of this index.
       tenant = fixture(:tenant)
 
       canonical =
@@ -356,12 +404,26 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
 
       own = published_article(tenant.id, %{title: "Own"})
 
-      heat(tenant.id, canonical, 5)
+      for _ <- 1..2 do
+        {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+        assert {:ok, _} = Knowledge.progressive_drill(tenant.id, canonical.id, api_key_id: key.id)
+      end
+
       heat(tenant.id, own, 1)
 
       assert {:ok, %{results: results}} = Knowledge.heat_index(tenant.id)
       assert Enum.map(results, & &1.title) == ["Canon", "Own"]
+      assert Enum.map(results, & &1.heat) == [2, 1]
     end
+  end
+
+  defp recorded_types(tenant_id, article_id) do
+    Loopctl.AdminRepo.all(
+      from(e in Loopctl.Knowledge.ArticleAccessEvent,
+        where: e.tenant_id == ^tenant_id and e.article_id == ^article_id,
+        select: e.access_type
+      )
+    )
   end
 
   describe "visibility scoping (#163) — the leak this surface makes easy" do
@@ -472,6 +534,9 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert meta.drill.parameter == "article_id"
       # The ordering basis is stated, so a reader does not mistake heat for relevance.
       assert meta.drill.note =~ "heat_window"
+      # And the note does NOT ask the caller to declare an origin: the exclusion is derived
+      # server-side, so an instruction to opt in would misdescribe it (and bind nobody).
+      refute meta.drill.note =~ "from="
       assert is_integer(meta.char_budget)
       assert is_integer(meta.chars)
       assert meta.counted_access_types == ["get"]

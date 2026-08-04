@@ -5,6 +5,21 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.66.0 — 2026-08-04 (the heat index stops feeding its own ranking)
+
+### Changed
+
+- **`knowledge_heat_index` no longer gains heat from its own drills** (issue #569). The index
+  ranks on caller-chosen body reads, and `knowledge_progressive_drill` — the tool this index's
+  own payload tells you to use — recorded one. Being shown therefore produced the rank that
+  showed it, and material that never surfaced could not overtake material that already had.
+  No tool argument changed: the server decides from which read path resolved the article, so
+  the exclusion holds for older client releases and for raw HTTP callers too. Drilling a
+  tenant article adds no heat (a `knowledge_get` of the same id still does); drilling a
+  published system canonical does, because that drill is the only path to its body and
+  labelling it uncounted would leave every canonical permanently unrankable. Tool
+  descriptions for `knowledge_heat_index` and `knowledge_progressive_drill` now state this.
+
 ## 2.65.0 — 2026-08-04 (the query-less retrieval route becomes reachable)
 
 ### Added

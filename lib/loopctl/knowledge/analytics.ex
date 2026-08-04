@@ -47,7 +47,21 @@ defmodule Loopctl.Knowledge.Analytics do
   alias Loopctl.Projects.Project
   alias Loopctl.WorkBreakdown.Stories
 
-  @valid_access_types ~w(search get context index)
+  # Must stay identical to `ArticleAccessEvent`'s `@access_types` — see the note there for why
+  # `"drill"` exists and why the two allowlists move together (#569).
+  @valid_access_types ~w(search get context index drill)
+
+  @doc """
+  The access types `record_access/6` will write.
+
+  Exposed so the drift between this list and `ArticleAccessEvent.access_types/0` is
+  ASSERTABLE. There is no DB CHECK on the column, so those two lists are the whole
+  enforcement, and both directions of drift fail silently: a type missing here is
+  dropped by `record_access/6`'s catch-all clause, and a type missing there fails
+  `validate_inclusion` inside a fire-and-forget task nobody is watching.
+  """
+  @spec valid_access_types() :: [String.t()]
+  def valid_access_types, do: @valid_access_types
 
   @typedoc """
   Optional metadata stored alongside the access event. Free-form map.
