@@ -321,7 +321,7 @@ it is enforced server-side and a no-op for a non-superadmin key — see below.)
 
 | Tool | Description |
 |---|---|
-| `knowledge_analytics_top` | Top accessed knowledge articles for the tenant. Optional: `limit` (default 20, max 100), `since_days` (default 7), `access_type` (`search`, `get`, `context`, `index`). |
+| `knowledge_analytics_top` | Top accessed knowledge articles for the tenant. Optional: `limit` (default 20, max 100), `since_days` (default 7), `access_type` (`search`, `get`, `context`, `index`, `drill` — `drill` is a body opened from a progressive/heat stub, recorded separately so the heat index cannot rank on reads it caused; an unrecognised value is a 400). |
 | `knowledge_article_stats` | Per-article usage stats: total accesses, unique agents, by-type breakdown, recent events. Required: `article_id`. |
 | `knowledge_agent_usage` | Per-agent knowledge usage: total reads, unique articles, top read articles. Required: exactly one of `api_key_id` (credential) or `agent_id` (logical identity). Optional: `limit`, `since_days`. See Wiki Attribution section. |
 | `knowledge_unused_articles` | Published articles with zero accesses in the window. Optional: `days_unused` (default 30), `limit` (default 50, max 200). |

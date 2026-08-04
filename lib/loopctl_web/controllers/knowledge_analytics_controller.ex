@@ -17,6 +17,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.RetrievalMetrics
 
@@ -28,7 +29,15 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
 
   @max_limit 100
   @max_unused_limit 200
-  @valid_access_types ~w(search get context index)
+  # DERIVED, never re-listed (#569). This was the THIRD hand-maintained copy of the
+  # `article_access_events.access_type` enum, and it went stale the moment `"drill"` was added
+  # to the other two — silently, because `put_access_type/2`'s catch-all DROPPED an unrecognised
+  # value instead of rejecting it, so `?access_type=drill` returned the UNFILTERED top articles
+  # under a heading that said otherwise. Wrong numbers presented as the right ones is the worst
+  # shape an analytics bug can take. `Analytics.valid_access_types/0` is the one list; the
+  # OpenAPI description below is interpolated from it so the published contract cannot drift
+  # from the enforced one either.
+  @valid_access_types Analytics.valid_access_types()
   @valid_group_by ~w(article project agent)
 
   operation(:top_articles,
@@ -59,7 +68,9 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       access_type: [
         in: :query,
         type: :string,
-        description: "Restrict to a single access type (search, get, context, index)",
+        description:
+          "Restrict to a single access type (#{Enum.join(@valid_access_types, ", ")}). " <>
+            "An unrecognised value is a 400, never a silently unfiltered result.",
         required: false
       ],
       project_id: [
@@ -90,17 +101,19 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     group_by = parse_group_by(params["group_by"])
 
-    opts =
-      []
-      |> put_limit(params["limit"], 20, @max_limit)
-      |> put_offset(params["offset"])
-      |> put_since(params["since_days"], 7)
-      |> put_access_type(params["access_type"])
-      |> put_project_id(params["project_id"])
-      |> Keyword.put(:group_by, group_by)
+    with :ok <- validate_access_type(params["access_type"]) do
+      opts =
+        []
+        |> put_limit(params["limit"], 20, @max_limit)
+        |> put_offset(params["offset"])
+        |> put_since(params["since_days"], 7)
+        |> put_access_type(params["access_type"])
+        |> put_project_id(params["project_id"])
+        |> Keyword.put(:group_by, group_by)
 
-    rows = Knowledge.list_top_articles(tenant_id, opts)
-    json(conn, LoopctlWeb.KnowledgeAnalyticsJSON.top_articles(rows, opts))
+      rows = Knowledge.list_top_articles(tenant_id, opts)
+      json(conn, LoopctlWeb.KnowledgeAnalyticsJSON.top_articles(rows, opts))
+    end
   end
 
   operation(:article_stats,
@@ -431,6 +444,22 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   end
 
   defp put_access_type(opts, _), do: opts
+
+  # REJECT an unrecognised value rather than ignoring it. `put_access_type/2`'s catch-all
+  # exists so the opts pipeline stays total, but on its own it turned a typo — or a type this
+  # deployment does not know yet — into a 200 carrying the unfiltered set, labelled as if the
+  # filter had applied. A caller cannot tell that from a real answer.
+  defp validate_access_type(nil), do: :ok
+  defp validate_access_type(""), do: :ok
+  defp validate_access_type(value) when value in @valid_access_types, do: :ok
+
+  defp validate_access_type(value) when is_binary(value) do
+    {:error, :bad_request,
+     "Invalid access_type #{inspect(value)}. Valid values: #{Enum.join(@valid_access_types, ", ")}"}
+  end
+
+  defp validate_access_type(_value),
+    do: {:error, :bad_request, "Invalid access_type: expected a string"}
 
   defp put_project_id(opts, nil), do: opts
   defp put_project_id(opts, ""), do: opts

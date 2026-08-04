@@ -6083,7 +6083,7 @@ const TOOLS = [
         },
         access_type: {
           type: "string",
-          enum: ["search", "get", "context", "index"],
+          enum: ["search", "get", "context", "index", "drill"],
           description: "Optional: restrict to a single access type.",
         },
       },

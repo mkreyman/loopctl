@@ -9519,8 +9519,15 @@ defmodule Loopctl.Knowledge do
     # `"drill"` is the UNCOUNTED type (#569): this is the tool `heat_index/2`'s own
     # `meta.drill` names, so counting the hop let being SHOWN produce the rank that showed it.
     # A caller-declared origin cannot carry that rule — it binds only the clients that send it
-    # — so the branch that resolves the article decides. A tenant article loses nothing: the
-    # read a reader names for itself, `knowledge_get`, still counts.
+    # — so the branch that resolves the article decides.
+    #
+    # Excluding EVERY drill, not just one from the heat index, is the consistent rule rather
+    # than the blunt one: a drill always follows a list THIS SYSTEM just produced (a heat stub
+    # or a `progressive_index` stub), so it is list-ORIGINATED by construction — the same
+    # property that excludes `"search"` and `"context"`. `knowledge_get` is the only read where
+    # the caller names an id without the ranker having just handed it over, which is exactly
+    # what "caller-chosen" was always supposed to mean. A tenant article therefore keeps the
+    # read that signals a reader's own judgement and loses the ones a list handed it.
     case get_article(tenant_id, article_id, Keyword.put(opts, :access_type, "drill")) do
       # A canon's `tenant_id` is NULL, so `get_article/3` can never return one and this branch
       # is exactly "the article has no other body-read path". Counting it re-enters the loop
