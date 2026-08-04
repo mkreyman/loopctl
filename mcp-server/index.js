@@ -4532,9 +4532,9 @@ const TOOLS = [
           description:
             "Optional: ISO-8601 timestamp; count only reads at/after it. Defaults to the " +
             "last 90 days, clamped to at most 365 days of lookback and to no later than " +
-            "today. Snapped to a UTC day boundary in the NARROWING direction (never wider " +
-            "than you asked for; a timestamp inside the current UTC day is used exactly as " +
-            "given), and meta.heat_window echoes what you got.",
+            "the start of today. An explicit timestamp is otherwise served VERBATIM; only " +
+            "the default and the ceiling are anchored at the start of today, which is what " +
+            "keeps a default refresh byte-identical. meta.heat_window echoes what you got.",
         },
       },
       required: [],

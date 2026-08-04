@@ -97,8 +97,9 @@ Operator-facing changes for deployments outside the hosted instance.
   25/node.
 
 - **New `article_access_events.access_type` value: `drill` (#569).** `GET
-  /api/v1/knowledge/progressive/:id` records `drill` instead of `get` when it resolves a
-  TENANT-OWNED article; a published system canonical still records `get`. No request
+  /api/v1/knowledge/progressive/:id` records `drill` instead of `get`, at EVERY scope — the
+  canonical carve-out this entry originally described was reversed by #572 below before
+  release, so no drill records `get`. No request
   parameter is involved — the server derives it from the read path, so every client is
   covered. Operator-visible in
   two places. **Analytics filters on `access_type=get` will stop seeing those reads** —
@@ -110,9 +111,8 @@ Operator-facing changes for deployments outside the hosted instance.
   Why: `heat_index` ranks on `get`, and the drill tool its own `meta.drill` payload tells
   callers to use recorded a `get` — so an article gained heat from having been *shown* by the
   index. Visibility produced reads, reads produced rank, rank produced visibility, and
-  material that never surfaced could not overtake material that already had. The canonical
-  branch keeps `get` because that drill is the ONLY path to a system canonical's body, so
-  excluding it would freeze every canonical at heat 0 rather than merely undercount it.
+  material that never surfaced could not overtake material that already had. #572 gave the
+  canon a `knowledge_get` read path instead of exempting its drill, so no scope is exempt.
   Retrieval
   follow-through (`RetrievalMetrics`) deliberately DOES count `drill`, so precision figures
   are unaffected by the split.
@@ -132,9 +132,8 @@ Operator-facing changes for deployments outside the hosted instance.
   does, never on raw read count — that counter is the one a loop inflates.
   Existing `heat` values will DROP (they become readership size, not traffic) and the
   ordering will change wherever traffic and readership disagreed. Two further contract fixes on
-  the same route: `meta.heat_window` is snapped to a UTC day boundary in the NARROWING direction
-  (an explicit `since` is never widened — one inside the current UTC day is used exactly as
-  given — and the default/ceiling are whole days back from today's start), so two calls with no intervening
+  the same route: `meta.heat_window`'s system-derived bounds sit at the start of today
+  (an explicit `since` is served verbatim, per #572 below), so two calls with no intervening
   read return a byte-identical payload (it previously carried a microsecond timestamp, making the
   "cacheable prefix" a guaranteed cache miss); and a FUTURE `since` is clamped to now instead of
   returning 200 with an empty list and a window that has not happened yet. `meta.chars` is now

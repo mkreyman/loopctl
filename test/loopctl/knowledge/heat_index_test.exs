@@ -661,7 +661,12 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
 
       # The cap is a real BYTE bound now, so trimming must not shred the value to nothing
       # either — a byte overage used to be spent one grapheme (up to 3 bytes) at a time.
+      # The SUMMARY is the assertion that matters: it is the padding `fit_stub_to_cap/1`
+      # spends first, so grapheme-sliced fields against a byte cap emptied it outright while
+      # a title-only check still passed.
       assert stub.title != ""
+      assert stub.summary != "", "a multibyte stub must keep its summary, not just its title"
+      assert String.valid?(stub.title) and String.valid?(stub.summary)
     end
 
     test "#567: chars is the ENCODED size, and the budget still bounds escape-heavy content" do
@@ -691,19 +696,20 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       # from something that is not the pool — each was reported to the caller as "you are
       # reading too much" and to the operator as ordinary shedding, so a systemic fault wore
       # the costume of one tenant reading hard.
-      import ExUnit.CaptureLog
-
       tenant = fixture(:tenant)
       pool_reason = {:noproc, {DBConnection, :execute, []}}
 
-      assert_raise Loopctl.HeavyRead.OverloadedError, fn ->
-        Knowledge.heat_projection_exit(tenant.id, pool_reason)
-      end
+      # Each call warns by design; capture so the deliberate log stays out of suite output.
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert_raise Loopctl.HeavyRead.OverloadedError, fn ->
+          Knowledge.heat_projection_exit(tenant.id, pool_reason)
+        end
 
-      # Anything unplaceable is re-exited untouched to whoever actually owns it.
-      for foreign <- [:shutdown, {:timeout, {GenServer, :call, [:some_pid, :req]}}, :killed] do
-        assert catch_exit(Knowledge.heat_projection_exit(tenant.id, foreign)) == foreign
-      end
+        # Anything unplaceable is re-exited untouched to whoever actually owns it.
+        for foreign <- [:shutdown, {:timeout, {GenServer, :call, [:some_pid, :req]}}, :killed] do
+          assert catch_exit(Knowledge.heat_projection_exit(tenant.id, foreign)) == foreign
+        end
+      end)
     end
 
     test "#572: a projection fault is logged by CLASS, never by raw reason" do

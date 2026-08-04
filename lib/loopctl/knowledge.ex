@@ -8907,6 +8907,11 @@ defmodule Loopctl.Knowledge do
   # because nothing signals the omission. EVERY variable-length field is capped — a title is
   # validated only to 500 chars, so leaving it uncapped made the advertised budget a number
   # the payload could exceed several-fold.
+  #
+  # Every cap below is in BYTES — the unit `heat_stub_chars/1` measures and `fit_stub_to_cap/1`
+  # enforces. Slicing a field by GRAPHEME while enforcing the total in bytes was the same
+  # mixed-unit defect one level down: a CJK stub arrived 3x over the cap, so the fitter shrank
+  # its summary to "" and then ate its title, and a non-Latin corpus got a title-only index.
   @heat_summary_chars 120
   @heat_title_chars 100
   # The fixed per-stub cost the caller actually pays, MEASURED off the wire shape
@@ -8978,6 +8983,14 @@ defmodule Loopctl.Knowledge do
   # The stub projection runs on the 3-connection `AdminRepo` pool WHILE holding this tenant's
   # heavy-read slot, so its wait has to be bounded well under the 15s Ecto default.
   @heat_stub_timeout_ms 5_000
+
+  # The SQLSTATEs on which a server-side fault IS the saturation this route degrades to a 429
+  # for. Everything else a `Postgrex.Error` can carry is a deterministic query fault and must
+  # surface as a 500 instead of being retried forever behind an overload label.
+  @heat_saturation_sqlstates ~w(
+    query_canceled too_many_connections out_of_memory admin_shutdown crash_shutdown
+    cannot_connect_now connection_exception connection_failure connection_does_not_exist
+  )a
 
   @doc """
   A HEAT-ranked, topic-less stub index of the corpus (#554).
@@ -9053,10 +9066,10 @@ defmodule Loopctl.Knowledge do
     - `:since` -- count only accesses at/after this `DateTime`. Defaults to the last
       #{@heat_default_window_days} days and is CLAMPED to at most #{@heat_max_window_days}
       days of lookback, so the request-path aggregate stays bounded either way; pass an older
-      `DateTime` to widen it deliberately and read `meta.heat_window` for what you got. The
-      effective cutoff is SNAPPED to a UTC day boundary in the narrowing direction and is
-      NEVER moved earlier than what you passed; a `:since` inside the current UTC day is used
-      exactly as given, since its next boundary has not happened yet.
+      `DateTime` to widen it deliberately and read `meta.heat_window` for what you got. An
+      explicit `:since` is served VERBATIM (#572); only the SYSTEM-derived bounds (the default
+      lookback and the ceiling) are anchored at the start of today, which is what makes a
+      default refresh byte-identical. A FUTURE `:since` is clamped to today's start.
     - `:category` -- restrict to one category atom.
     - `:visibility_agent_id` -- the calling agent's id (#163). An index is exactly the surface
       where a leak is easy and invisible, because a stub looks innocuous and nobody reads an
@@ -9359,21 +9372,50 @@ defmodule Loopctl.Knowledge do
       # ConnectionError names the backend host and port, a Postgrex.Error carries the failing
       # statement and its bound parameters. #562 sanitised exactly this one module over
       # (`HeavyRead.probe_failure_tag/1`); the heat path was written after and did not inherit
-      # it. Only `tenant_id` and the exception MODULE are interpolated.
+      # it. Only `tenant_id`, the exception MODULE and the SQLSTATE are interpolated — the
+      # code is a closed Postgrex vocabulary and names nothing about the statement.
       #
       # `Postgrex.Error` is rescued alongside because the same saturation arrives from the
-      # SERVER as often as from the pool — 53300 too_many_connections, 57P01 admin shutdown,
-      # 57014 on the statement timeout above — and an unrescued one escaped `heat_index/2`'s
+      # SERVER as often as from the pool — and an unrescued one escaped `heat_index/2`'s
       # `{:ok, _}` contract as a 500 on a per-turn endpoint whose declared degradation is 429.
-      Logger.warning(
-        "heat_stub_projection: admin_pool_read_failed tenant_id=#{tenant_id} " <>
-          "error_class=#{ExitClass.classify(:exit, e)}"
-      )
+      # But only a SATURATION SQLSTATE degrades: the class covers every failed statement, so
+      # rescuing it wholesale dressed a permanent, deterministic fault (a column a not-yet-run
+      # migration adds, any query bug) as transient load shedding — the caller retries it
+      # forever and the operator sees ordinary gate shedding. Same conservatism
+      # `heat_projection_exit/2` applies on the exit side; anything unplaceable is re-raised
+      # to surface as the 500 it is.
+      #
+      # `:raise`, not `exit:` — `ExitClass`'s kind prefix exists because a dead pool and a
+      # fault raised out of a live one are different investigations, and both arms of this
+      # guard reporting `exit:` collapsed exactly that distinction. The tag is bounded by the
+      # rescue's own two-module clause list.
+      if heat_saturation?(e) do
+        Logger.warning(
+          "heat_stub_projection: admin_pool_read_failed tenant_id=#{tenant_id} " <>
+            "error_class=raise:#{ExitTag.tag(e)} sqlstate=#{heat_sqlstate(e)}"
+        )
 
-      reraise Loopctl.HeavyRead.OverloadedError, [tenant_id: tenant_id], __STACKTRACE__
+        reraise Loopctl.HeavyRead.OverloadedError, [tenant_id: tenant_id], __STACKTRACE__
+      else
+        reraise e, __STACKTRACE__
+      end
   catch
     :exit, reason -> heat_projection_exit(tenant_id, reason)
   end
+
+  # A pool-side failure is saturation by construction. A SERVER-side one is only saturation on
+  # a closed set of SQLSTATEs: the statement timeout above (57014), a full backend (53300,
+  # 53200) and a backend going away (57P01/57P02/57P03, 08xxx). A `Postgrex.Error` carrying no
+  # SQLSTATE at all is a client-side encode/decode fault — a code bug, never load.
+  defp heat_saturation?(%DBConnection.ConnectionError{}), do: true
+
+  defp heat_saturation?(%Postgrex.Error{postgres: %{code: code}}),
+    do: code in @heat_saturation_sqlstates
+
+  defp heat_saturation?(_e), do: false
+
+  defp heat_sqlstate(%Postgrex.Error{postgres: %{code: code}}), do: to_string(code)
+  defp heat_sqlstate(_e), do: "none"
 
   @doc false
   # Only a DEMONSTRABLE pool exit becomes an overload. The blanket clause translated EVERY
@@ -9434,16 +9476,20 @@ defmodule Loopctl.Knowledge do
   # overage is measured in bytes, the old `String.length(value) - by` mixed units the other
   # way: for a CJK value one byte of overage removed one grapheme, i.e. up to three bytes, so
   # a summary that was slightly over got shredded — and a large enough overage sliced it to
-  # "". Slicing by BYTE offset instead would split a multibyte grapheme and put invalid UTF-8
-  # on the wire, so the walk is per grapheme with a byte target.
-  defp shrink_by(value, by) do
-    target = max(byte_size(value) - by, 0)
+  # "".
+  defp shrink_by(value, by), do: take_bytes(value, max(byte_size(value) - by, 0))
 
+  # Keep at most `max` BYTES, dropping whole GRAPHEMES. Slicing at a byte OFFSET would split a
+  # multibyte grapheme and put invalid UTF-8 on the wire, so the walk is per grapheme with a
+  # byte target. This is also what makes the per-field caps enforceable in the unit the stub
+  # cap is expressed in — `String.slice/3` counted graphemes and blew the byte budget on
+  # arrival for any non-Latin script.
+  defp take_bytes(value, max) do
     value
     |> String.graphemes()
     |> Enum.reduce_while({[], 0}, fn grapheme, {acc, size} ->
       next = size + byte_size(grapheme)
-      if next > target, do: {:halt, {acc, size}}, else: {:cont, {[grapheme | acc], next}}
+      if next > max, do: {:halt, {acc, size}}, else: {:cont, {[grapheme | acc], next}}
     end)
     |> elem(0)
     |> Enum.reverse()
@@ -9451,7 +9497,7 @@ defmodule Loopctl.Knowledge do
   end
 
   defp heat_title(nil), do: ""
-  defp heat_title(title), do: String.slice(title, 0, @heat_title_chars)
+  defp heat_title(title), do: take_bytes(title, @heat_title_chars)
 
   # ONE line, always. A body's first paragraph can be arbitrarily long and can contain newlines
   # that would break a line-oriented consumer's parsing of the index.
@@ -9461,7 +9507,7 @@ defmodule Loopctl.Knowledge do
     body
     |> String.replace(~r/\s+/u, " ")
     |> String.trim()
-    |> String.slice(0, @heat_summary_chars)
+    |> take_bytes(@heat_summary_chars)
   end
 
   # Measured off the ENCODED stub, which is what actually goes on the wire (#567). Summing
