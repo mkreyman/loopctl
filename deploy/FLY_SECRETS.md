@@ -94,14 +94,15 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 > **When the gate cannot MEASURE the backlog** (wedged/saturated `AdminRepo` pool, driver
 > fault, or a defect in the counting query) it fails OPEN — an innocent tenant must not be
 > refused because the count path is degraded — but only for a bounded number of jobs per
-> tenant per hour: `max(1, OBAN_INGEST_BACKLOG_MAX / 10)` per web node, **per fault lane**.
-> The `/ 10` holds the FLEET allowance to one `OBAN_INGEST_BACKLOG_MAX` per hour per lane for a
-> fleet up to 10 web nodes, because the default limiter is node-local ETS. **Size against 2x
-> that**: pressure faults and non-pressure faults are metered in SEPARATE buckets (so a defect
-> in the counting query cannot spend the allowance a genuine pool fault is then refused on), and
-> a tenant hitting both families inside one window admits from both. Second residual, below a
-> threshold of **10**: the per-node allowance floors at 1 rather than 0, so a 10-node fleet can
-> admit up to 10 jobs/hour/lane against a smaller threshold. A request asking for MORE items
+> tenant per hour: `max(1, OBAN_INGEST_BACKLOG_MAX / 20)` per web node **per fault lane**,
+> which totals one `OBAN_INGEST_BACKLOG_MAX` per hour per tenant across a fleet of up to 10 web
+> nodes. **That total is the number to size against — there is no multiplier to apply on top.**
+> The divisor is 10 nodes x 2 lanes: pressure faults and non-pressure faults are metered in
+> SEPARATE buckets (so a defect in the counting query cannot spend the allowance a genuine pool
+> fault is then refused on), and the two lanes SPLIT one threshold's worth rather than each
+> getting one. Residual, below a threshold of **20**: the per-lane allowance floors at 1 rather
+> than 0 — so the valve cannot fail closed on the first transient blip — and a 10-node fleet can
+> then admit up to 20 jobs/hour against a smaller threshold. A request asking for MORE items
 > than one window's allowance can never fit it and is refused after a single token. Past that
 > allowance the request is refused — `429 ingestion_backlog_exceeded` only when the fault is
 > DEMONSTRABLE pool pressure (a wedged/saturated pool, an exit the driver's own pool raised, a

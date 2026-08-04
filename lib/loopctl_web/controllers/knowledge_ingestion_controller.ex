@@ -23,6 +23,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   alias Loopctl.Oban.FairShare
   alias Loopctl.ObanConfig
   alias Loopctl.RateLimiter
+  alias Loopctl.RateLimiter.FailOpenBackstop
   alias Loopctl.RateLimiter.FailOpenLog
   alias Loopctl.TelemetryEvents
   alias Loopctl.Workers.ContentIngestionWorker
@@ -56,11 +57,17 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # default limiter (`Loopctl.RateLimiter.Hammer`) is node-local ETS and the FLEET allowance
   # is therefore per-node x web-node count — at a flat 100 that silently multiplied PAST the
   # threshold from ~5 nodes up. Dividing the threshold by @fail_open_fleet_nodes holds the
-  # FLEET allowance to one `OBAN_INGEST_BACKLOG_MAX` per hour per tenant PER LANE for any
-  # fleet up to that many web nodes, and retuning the threshold retunes this with it. LANE,
-  # not total: `fail_open_bucket/2` meters the pressure and fault families separately, so a
-  # tenant hitting BOTH inside one window admits up to 2x that (stated in full there, and in
-  # `deploy/FLY_SECRETS.md` — an operator sizing the threshold must read the 2x, not the 1x).
+  # FLEET allowance at or under one `OBAN_INGEST_BACKLOG_MAX` per hour per tenant for any
+  # fleet up to that many web nodes, and retuning the threshold retunes this with it.
+  #
+  # The divisor counts LANES as well as nodes. `fail_open_bucket/2` meters the pressure and
+  # fault families in separate buckets (for a real reason — see there), and a per-LANE
+  # allowance sized as if it were the only one puts a tenant hitting both families inside one
+  # window at 2x the threshold it is derived from. Dividing by @fail_open_fleet_nodes x
+  # @fail_open_lanes keeps the TOTAL at the stated 1x, which is the only number an operator
+  # should ever have to size against: a bound that holds only per-lane, with a 2x footnote, is
+  # the same defect as the @batch_max floor below — an effective allowance larger than the
+  # derivation advertises. Adding a third lane must extend @fail_open_lanes with it.
   #
   # FLOORED at 1, NOT at one full batch. A @batch_max floor was the one thing that could
   # break the fleet bound stated just above: it took over whenever the threshold divided to
@@ -79,6 +86,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # node-local limit divided by node count — over-admission when node_count > limit.
   @fail_open_window_ms 3_600_000
   @fail_open_fleet_nodes 10
+  @fail_open_lanes 2
 
   # The OTHER refusal the same admission gate can return, shared by both routes' specs so the
   # documented status set matches `backlog_fail_open_verdict/3` (CLAUDE.md: a new API
@@ -467,12 +475,11 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # apart. An unconsultable meter ADMITS (availability wins on a capacity gate) and reports
   # `:unmetered`, which keeps "the valve is admitting because its METER is unreachable"
   # alertable rather than silent; fail-CLOSED would 429 an innocent tenant on the FIRST
-  # transient blip with a backlog code it has not earned. KNOWN RESIDUAL, not a property the
-  # gate has: while the meter itself is unconsultable, admissions are bounded PER REQUEST (by
-  # the fit guard above) but not across requests, so a flood that saturates the limiter's own
-  # pool as well as `AdminRepo` admits for as long as it lasts. `outcome: :unmetered` is the
-  # only signal — alert on it; a cross-request bound there needs limiter state this gate does
-  # not own.
+  # transient blip with a backlog code it has not earned. The admission it grants is bounded
+  # ACROSS requests too, by `FailOpenBackstop` (see `allowance_token/2`) — without it, a flood
+  # that saturated the limiter's own pool as well as `AdminRepo` admitted freely for as long as
+  # it lasted, which made "admissions are bounded" true only per request. `:unmetered` remains
+  # the outcome on that path precisely so the degraded meter stays alertable.
   defp consume_fail_open_allowance(tenant_id, fault, jobs) do
     charge_fail_open_allowance(
       fail_open_bucket(tenant_id, fault),
@@ -502,11 +509,16 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # per tenant let a fault the code explicitly declares NOT backlog-attributable spend the
   # allowance a later, pressure-classed request was then refused on — so the careful code split
   # above was decided by tokens a different fault burned, and an at-zero-backlog tenant got a
-  # `429 ingestion_backlog_exceeded` paid for by a counting-code defect. Residual, and the
-  # ACTUAL bound an operator sizes against: a tenant hitting BOTH fault families inside one
-  # window may admit up to 2x `fail_open_jobs_per_window/0` per node — stated at the top of
-  # this module and in `deploy/FLY_SECRETS.md` so the one bound is documented once. A bounded
-  # over-admission is the cheaper error than a refusal that names the wrong cause.
+  # `429 ingestion_backlog_exceeded` paid for by a counting-code defect.
+  #
+  # The lanes are PAID FOR, not added on top: @fail_open_lanes is part of the divisor in
+  # `fail_open_jobs_per_window/1`, so the two lanes SPLIT one threshold's worth of allowance
+  # instead of each getting one. Sizing each lane as if it were the only one would leave a
+  # tenant that hits both families in a window admitting 2x the threshold the allowance is
+  # derived from — an effective bound larger than the advertised one, which is precisely the
+  # `@batch_max`-floor defect this PR exists to remove, re-introduced from the other side. The
+  # isolation is worth having; doubling the bound to buy it is not, and an operator should
+  # never have to read a footnote to learn the real number.
   defp fail_open_bucket(tenant_id, {_class, pressure?}) do
     lane = if pressure?, do: "pressure", else: "fault"
     "ingest_backlog_fail_open:#{lane}:#{tenant_id}"
@@ -531,16 +543,41 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
 
   # `{:allow, 0}` is the Postgres impl's own fail-open sentinel and `{:error, _}` is a Hammer
   # soft-error: both mean UNCONSULTABLE, never "denied". Raise/exit/throw likewise.
+  #
+  # An unconsultable meter falls through to `FailOpenBackstop`, which is the difference between
+  # "bounded per request" and "bounded". Pinning away from the Postgres limiter removed ONE
+  # shared failure domain; the default Hammer path has another, and `config/config.exs` names
+  # it in its own comment — every check goes through a poolboy pool that a single-source flood
+  # can saturate until a checkout times out. Under a flood big enough to take BOTH `AdminRepo`
+  # (count unmeasurable) and that pool (allowance unconsultable), the valve admitted without
+  # limit for as long as the flood lasted — the exact state this gate exists to prevent,
+  # arriving by the meter instead of by the count. The backstop is a bare
+  # `:ets.update_counter/4` against a table its own GenServer owns: no pool, no checkout, so it
+  # cannot be taken out by the traffic it is counting.
+  #
+  # It is a BACKSTOP, not a second meter — consulted only when the primary could not answer, so
+  # it counts the unmetered period alone and a meter that dies mid-window restarts it from
+  # zero. Approximate in the admitting direction by less than one window is the acceptable
+  # error here; unbounded is not. `:unmetered` is still the reported outcome when the backstop
+  # admits, so "the valve is admitting because its METER is unreachable" stays the alertable
+  # signal it was.
   defp allowance_token(bucket, limit) do
     case fail_open_meter().check_rate(bucket, @fail_open_window_ms, limit) do
       {:allow, count} when is_integer(count) and count > 0 -> {:admitted, count}
       {:deny, _limit} -> :exhausted
-      _other -> :unmetered
+      _other -> unmetered_token(bucket, limit)
     end
   rescue
-    _e -> :unmetered
+    _e -> unmetered_token(bucket, limit)
   catch
-    kind, _reason when kind in [:exit, :throw] -> :unmetered
+    kind, _reason when kind in [:exit, :throw] -> unmetered_token(bucket, limit)
+  end
+
+  defp unmetered_token(bucket, limit) do
+    case FailOpenBackstop.charge(bucket, @fail_open_window_ms, limit) do
+      :exhausted -> :exhausted
+      :admitted -> :unmetered
+    end
   end
 
   # PUBLIC as a pure function of the threshold, for the same reason `fail_open_meter/1` is:
@@ -551,7 +588,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   @doc false
   @spec fail_open_jobs_per_window(pos_integer()) :: pos_integer()
   def fail_open_jobs_per_window(max_backlog) when is_integer(max_backlog) and max_backlog > 0 do
-    max(1, div(max_backlog, @fail_open_fleet_nodes))
+    max(1, div(max_backlog, @fail_open_fleet_nodes * @fail_open_lanes))
   end
 
   defp fail_open_jobs_per_window, do: fail_open_jobs_per_window(ObanConfig.ingest_backlog_max())

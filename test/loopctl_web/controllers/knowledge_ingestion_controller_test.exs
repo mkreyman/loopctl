@@ -1166,7 +1166,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       # OBAN_INGEST_BACKLOG_MAX and floored only at 1, so integer division cannot produce a
       # 0 that would make the valve fail CLOSED (#564).
       assert_receive {:fail_open_token, 3_600_000, limit}
-      assert limit == max(1, div(ObanConfig.ingest_backlog_max(), 10))
+      assert limit == max(1, div(ObanConfig.ingest_backlog_max(), 10 * 2))
       assert_receive {:fail_open_token, _, _}
       assert_receive {:fail_open_token, _, _}
       refute_receive {:fail_open_token, _, _}, 20
@@ -1314,6 +1314,61 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert metadata.outcome == :unmetered
     end
 
+    test "#564: an unconsultable meter is still BOUNDED across requests, not just within one",
+         %{conn: conn} do
+      # The bound the PR claims was true per-request only. Under a flood big enough to take
+      # AdminRepo (count unmeasurable) AND the limiter's own poolboy pool (allowance
+      # unconsultable — `config/config.exs` documents that saturation), every request took the
+      # `:unmetered` admit and the valve was open for as long as the flood lasted. That is the
+      # state this gate exists to prevent, arriving via the meter instead of via the count.
+      tenant = keyed_tenant()
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      attach_failed_open(tenant.id)
+
+      # A sustained fault: every request, count unmeasurable, meter unconsultable.
+      stub(Loopctl.MockBacklogCounter, :in_flight_ingestion_backlog, fn _tenant_id ->
+        exit({:noproc, {DBConnection, :execute, []}})
+      end)
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
+        if String.starts_with?(bucket, "ingest_backlog_fail_open:"),
+          do: {:error, :pool_timeout},
+          else: {:allow, 1}
+      end)
+
+      # The backstop is node-local and this tenant is fresh, so its allowance starts full.
+      allowance =
+        LoopctlWeb.KnowledgeIngestionController.fail_open_jobs_per_window(
+          ObanConfig.ingest_backlog_max()
+        )
+
+      statuses =
+        for _ <- 1..(allowance + 5) do
+          conn
+          |> auth_conn(raw_key)
+          |> post(~p"/api/v1/knowledge/ingest", %{
+            content: "Flood item",
+            source_type: "newsletter"
+          })
+          |> Map.fetch!(:status)
+        end
+
+      # It admits while the backstop has headroom, then closes — the point is that it CLOSES.
+      # Exactly the allowance is admitted, then it closes — not "eventually closes".
+      assert Enum.count(statuses, &(&1 == 202)) == allowance
+      assert 429 in statuses, "an unconsultable meter must not admit without limit"
+
+      # Once closed it STAYS closed for the window: a bound that refilled per request would be
+      # no bound at all under exactly the sustained flood it exists for.
+      assert List.last(statuses) == 429
+
+      # Still reported as `:unmetered` while admitting, so "the valve is admitting because its
+      # METER is unreachable" remains the alertable signal rather than looking like a healthy
+      # metered admit.
+      assert_receive {:backlog_failed_open, _measurements, %{outcome: :unmetered}}
+    end
+
     test "the fail-open meter is pinned to the node-local ETS limiter under RATE_LIMITER=postgres",
          %{conn: _conn} do
       # The meter must not share a FAILURE DOMAIN with the count it bounds: the Postgres
@@ -1333,34 +1388,41 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     test "#564: tightening OBAN_INGEST_BACKLOG_MAX tightens the fail-open allowance with it" do
       alias LoopctlWeb.KnowledgeIngestionController, as: Ctl
 
-      # The limiter is node-local ETS, so the FLEET allowance is per-node x web nodes. The
-      # derivation exists to hold that at or under ONE OBAN_INGEST_BACKLOG_MAX per hour per
-      # tenant for a fleet up to @fail_open_fleet_nodes (10).
+      # The limiter is node-local ETS, so the WORST-CASE fleet exposure is
+      # per-node x web nodes x LANES — `fail_open_bucket/2` meters the pressure and fault
+      # families in separate buckets, and a tenant can hit both inside one window. The
+      # derivation exists to hold that TOTAL at or under ONE OBAN_INGEST_BACKLOG_MAX per hour
+      # per tenant. Asserting it per-lane instead is how the 2x got in: the old form of this
+      # loop multiplied by nodes ALONE, so it kept passing while the real exposure doubled.
       fleet_nodes = 10
+      lanes = 2
 
-      for threshold <- [10, 50, 100, 250, 500, 1000, 5000] do
+      for threshold <- [20, 50, 100, 250, 500, 1000, 5000] do
         allowance = Ctl.fail_open_jobs_per_window(threshold)
+        fleet_total = allowance * fleet_nodes * lanes
 
-        assert allowance * fleet_nodes <= threshold,
-               "fleet allowance #{allowance * fleet_nodes} exceeds threshold #{threshold}"
+        assert fleet_total <= threshold,
+               "fleet allowance #{fleet_total} (#{allowance}/node x #{fleet_nodes} nodes x " <>
+                 "#{lanes} lanes) exceeds threshold #{threshold}"
       end
 
-      # The specific regression: a @batch_max (50) floor pinned the allowance there for every
+      # The original regression: a @batch_max (50) floor pinned the allowance there for every
       # threshold under 500, so TIGHTENING the knob stopped tightening the allowance — a
       # 10-node fleet still admitting 500/hour against a threshold of 100, quietly, and in the
       # direction an operator assumes is the safer one.
-      assert Ctl.fail_open_jobs_per_window(100) == 10
-      assert Ctl.fail_open_jobs_per_window(500) == 50
+      assert Ctl.fail_open_jobs_per_window(100) == 5
+      assert Ctl.fail_open_jobs_per_window(500) == 25
 
       # Monotonic: a smaller threshold never buys a larger allowance.
       assert Ctl.fail_open_jobs_per_window(100) < Ctl.fail_open_jobs_per_window(500)
 
-      # Floored at 1, never 0: integer division below the fleet-node count would otherwise
-      # make the valve fail CLOSED and refuse an innocent tenant on the first transient blip.
-      # This is where the bound is knowingly given up — documented residual, since a
-      # node-local limiter has no fleet-wide counter.
+      # Floored at 1, never 0: integer division below nodes x lanes would otherwise make the
+      # valve fail CLOSED and refuse an innocent tenant on the first transient blip. This is
+      # the one place the bound is knowingly given up — a node-local limiter has no fleet-wide
+      # counter — so it is asserted rather than left to be rediscovered.
       assert Ctl.fail_open_jobs_per_window(1) == 1
-      assert Ctl.fail_open_jobs_per_window(9) == 1
+      assert Ctl.fail_open_jobs_per_window(19) == 1
+      assert Ctl.fail_open_jobs_per_window(19) * fleet_nodes * lanes > 19
     end
 
     test "#565: a WEDGED-pool exit still earns the backlog 429", %{conn: conn} do

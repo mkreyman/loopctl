@@ -89,9 +89,12 @@ Operator-facing changes for deployments outside the hosted instance.
   the backlog count ~60 times per window against the pool the gate is protecting — capped at 5x
   that variable so a cleared blip cannot stall a client for a whole window. The fail-open
   allowance is also now metered in two per-tenant lanes (pressure vs non-pressure), so a
-  counting-code defect can no longer spend the tokens a genuine pool fault is then refused on;
-  size `OBAN_INGEST_BACKLOG_MAX` against **2x** the per-lane allowance, as
-  `deploy/FLY_SECRETS.md` now states.
+  counting-code defect can no longer spend the tokens a genuine pool fault is then refused on.
+  The lanes SPLIT one threshold's worth rather than each getting one — the per-lane allowance
+  is `max(1, OBAN_INGEST_BACKLOG_MAX / 20)` per web node (10 nodes x 2 lanes), so the total a
+  tenant can have admitted while unmeasured stays at one `OBAN_INGEST_BACKLOG_MAX` per hour and
+  there is **no multiplier to apply on top**. At the default of 500 the per-lane allowance is
+  25/node.
 
 ### Added
 
