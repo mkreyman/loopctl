@@ -366,29 +366,28 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert Enum.map(results, & &1.title) == ["Actually sought out"]
     end
 
-    test "#569: only a drill FROM this index is uncounted; the read is always recorded" do
+    test "#569: the uncounted label is derived from the read path, not from the caller" do
       # Two halves of the same rule. The read still matters for analytics and follow-through,
-      # so a fix that just dropped the event would pass the test above and lose data. And the
-      # exclusion is the index HOP, not the tool: labelling every drill made the topic-seeded
-      # route silent and left the canon (drilled below) with no way to earn heat at all.
+      # so a fix that just dropped the event would pass the test above and lose data. And a
+      # caller-declared origin cannot carry the rule — it binds only the clients that send it
+      # — so a drill that says NOTHING must still be excluded, while the canon's drill (the
+      # only path to its body) must still count or it can never rank at all.
       tenant = fixture(:tenant)
       {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
-      from_index = published_article(tenant.id, %{title: "Drilled from the index"})
-      from_topic = published_article(tenant.id, %{title: "Drilled from a topic"})
+      own = published_article(tenant.id, %{title: "Tenant-owned, drilled"})
 
-      assert {:ok, _} =
-               Knowledge.progressive_drill(tenant.id, from_index.id,
-                 api_key_id: key.id,
-                 from: :heat_index
-               )
+      canon =
+        published_article(tenant.id, %{title: "Canon"})
+        |> Ecto.Changeset.change(%{scope: :system, tenant_id: nil})
+        |> AdminRepo.update!()
 
-      assert {:ok, _} =
-               Knowledge.progressive_drill(tenant.id, from_topic.id, api_key_id: key.id)
+      assert {:ok, _} = Knowledge.progressive_drill(tenant.id, own.id, api_key_id: key.id)
+      assert {:ok, _} = Knowledge.progressive_drill(tenant.id, canon.id, api_key_id: key.id)
 
       # `config/test.exs` sets `:analytics_recording_mode, :sync`, so the events are already
       # written when the calls return — no drain needed.
-      assert recorded_types(tenant.id, from_index.id) == ["drill"]
-      assert recorded_types(tenant.id, from_topic.id) == ["get"]
+      assert recorded_types(tenant.id, own.id) == ["drill"]
+      assert recorded_types(tenant.id, canon.id) == ["get"]
     end
 
     test "a published system canonical earns heat from the only read path it has" do
@@ -535,9 +534,9 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert meta.drill.parameter == "article_id"
       # The ordering basis is stated, so a reader does not mistake heat for relevance.
       assert meta.drill.note =~ "heat_window"
-      # And the parameter that keeps this index out of its own ranking is NAMED — the
-      # exclusion is cooperative, so an instruction nobody can read is no exclusion at all.
-      assert meta.drill.note =~ "from=heat_index"
+      # And the note does NOT ask the caller to declare an origin: the exclusion is derived
+      # server-side, so an instruction to opt in would misdescribe it (and bind nobody).
+      refute meta.drill.note =~ "from="
       assert is_integer(meta.char_budget)
       assert is_integer(meta.chars)
       assert meta.counted_access_types == ["get"]

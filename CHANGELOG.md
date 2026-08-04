@@ -97,8 +97,10 @@ Operator-facing changes for deployments outside the hosted instance.
   25/node.
 
 - **New `article_access_events.access_type` value: `drill` (#569).** `GET
-  /api/v1/knowledge/progressive/:id` takes a new optional `from` parameter; with
-  `from=heat_index` the body read is recorded as `drill` instead of `get`. Operator-visible in
+  /api/v1/knowledge/progressive/:id` records `drill` instead of `get` when it resolves a
+  TENANT-OWNED article; a published system canonical still records `get`. No request
+  parameter is involved — the server derives it from the read path, so every client is
+  covered. Operator-visible in
   two places. **Analytics filters on `access_type=get` will stop seeing those reads** —
   `GET /api/v1/knowledge/analytics/*` and anything grouping by access type must add `drill` to
   keep the same population. And the value set that column can hold has grown, though there is
@@ -108,9 +110,10 @@ Operator-facing changes for deployments outside the hosted instance.
   Why: `heat_index` ranks on `get`, and the drill tool its own `meta.drill` payload tells
   callers to use recorded a `get` — so an article gained heat from having been *shown* by the
   index. Visibility produced reads, reads produced rank, rank produced visibility, and
-  material that never surfaced could not overtake material that already had. Only the
-  index-declared hop is split off: every other drill still records `get`, because published
-  system canonicals have no other body-read path and would otherwise be unrankable. Retrieval
+  material that never surfaced could not overtake material that already had. The canonical
+  branch keeps `get` because that drill is the ONLY path to a system canonical's body, so
+  excluding it would freeze every canonical at heat 0 rather than merely undercount it.
+  Retrieval
   follow-through (`RetrievalMetrics`) deliberately DOES count `drill`, so precision figures
   are unaffected by the split.
 

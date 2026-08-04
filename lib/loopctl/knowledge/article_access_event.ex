@@ -13,9 +13,9 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
   - `"get"` -- recorded for direct GET /articles/:id reads
   - `"context"` -- recorded for each article returned by GET /knowledge/context
   - `"index"` -- reserved (currently NOT recorded; index listings are too noisy)
-  - `"drill"` -- a body read via `knowledge_progressive_drill` that declares it came
-    from `heat_index/2`; a body read like `"get"`, split out only so the heat ranking
-    cannot count the reads it caused itself (#569)
+  - `"drill"` -- a TENANT-OWNED article's body read via `knowledge_progressive_drill`;
+    a body read like `"get"`, split out only so the heat ranking cannot count the reads
+    it caused itself (#569)
 
   ## Fields
 
@@ -50,10 +50,10 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
   # `"drill"` is a body read like `"get"`, split out ONLY so the heat index cannot rank on a
   # signal it generates itself (#569). `heat_index/2` orders on `"get"`, and the tool its own
   # `meta.drill` tells callers to use — `knowledge_progressive_drill` — recorded a `"get"`,
-  # so an article gained heat from HAVING BEEN SHOWN by the index. It is written ONLY for a
-  # drill that declares `from: :heat_index`: labelling every drill this way starved the system
-  # canonicals (whose bodies have no other read path) of heat entirely. The read is still
-  # recorded; it just is not the signal the ranking consumes. Keep `"drill"` OUT of
+  # so an article gained heat from HAVING BEEN SHOWN by the index. It is written for a drill
+  # that resolves a TENANT-OWNED article; a system canonical's drill stays `"get"`, since it
+  # is the only path to that body and labelling it this way froze every canonical at heat 0.
+  # The read is still recorded; it just is not the signal the ranking consumes. Keep `"drill"` OUT of
   # `@heat_read_access_types` and IN anything asking "was a body delivered"
   # (`RetrievalMetrics.compute_followed_through/2`).
   #

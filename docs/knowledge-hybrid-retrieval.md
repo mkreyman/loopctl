@@ -252,14 +252,18 @@ that showed it. Material that never surfaced could not overtake material that
 already had. The general rule behind all three exclusions: **heat must not rank on
 a signal heat produces.**
 
-Only the hop *from this index* is excluded, and only when the caller declares it
-(`from=heat_index` on the drill). A drill that follows `progressive_index/3` is an
-ordinary caller-chosen read and records a `get`; so does a drill of a published
-system canonical, whose body has no other read path — labelling every drill as an
-index drill left the canon unrankable and silenced topic-seeded reads. The
-declaration is cooperative, so an undeclared drill or a plain `knowledge_get` of a
-listed id still counts; what bounds a *deliberate* manipulation is the
-distinct-reader count, not this label.
+Which access type a drill records is derived from the branch that resolves the
+article, never from anything the caller sends: a tenant-owned article records the
+uncounted `drill`, a published system canonical records a counted `get`. A
+caller-declared origin was tried and is wrong — it binds only the clients that send
+it, so every older MCP release and every raw HTTP call re-opens the loop by
+default. The canonical branch is the deliberate exception: `get_article/3` filters
+on `tenant_id` and a canon row's is NULL, so that drill is the only path to its
+body, and excluding it would freeze every canonical at heat 0 and make the
+"canonicals participate" property false. A tenant article loses nothing — a plain
+`knowledge_get` of a listed id still counts, and that is the read a reader names for
+itself. What bounds the residual canonical loop, and any *deliberate*
+manipulation, is the distinct-reader count, not this label.
 
 `drill` still counts as follow-through in
 `RetrievalMetrics.compute_followed_through/2`, which asks a different question —

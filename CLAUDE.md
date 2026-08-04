@@ -467,13 +467,13 @@ semantic/keyword **retrieval** result, on one uniform shape carrying
   let any agent pin its own article at rank 1 with a `knowledge_get` loop, and
   counting KEYS would count DISPATCHES (v2 mints one key per dispatch); this
   index is designed to be pasted into a cached prefix, so that ranking
-  propagated into every other agent's context (#567). A drill that DECLARES it
-  came from this index (`from: :heat_index`) is recorded under its own
-  access_type and is NOT counted — counting it let the index feed its own
-  ranking, shown produced read, read produced rank (#569); every other drill
-  still records a `get`, since a system canonical has no other body-read path.
-  The rule behind all three fixes on this route: heat must not rank on a signal
-  heat produces.
+  propagated into every other agent's context (#567). A drill of a TENANT-OWNED
+  article is recorded under its own access_type and is NOT counted — counting it
+  let the index feed its own ranking, shown produced read, read produced rank
+  (#569). The label is derived from the read path, never from a caller-supplied
+  origin, so it binds every client; a system canonical's drill still records a
+  counted `get`, since it is the only path to that body. The rule behind all
+  three fixes on this route: heat must not rank on a signal heat produces.
   Window is snapped to a UTC day boundary (narrowing only) so refreshes are
   byte-identical. Drill a stub
   with `knowledge_progressive_drill`, NOT `knowledge_get` — the index lists
