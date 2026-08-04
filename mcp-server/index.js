@@ -4510,7 +4510,9 @@ const TOOLS = [
       "central but lexically dissimilar to your question, comes back empty and reads as 'the " +
       "KB has nothing' rather than 'I asked badly'. Reach for this when a search came back " +
       "empty or thin, or to survey what the fleet actually reads before you know what to " +
-      "ask. Ordering is usage, NOT relevance to any query. Open a stub with " +
+      "ask. Ordering is usage, NOT relevance to any query — and drilling a stub from here " +
+      "does NOT add heat to what you opened, so the index cannot feed its own ranking. " +
+      "Open a stub with " +
       "knowledge_progressive_drill (not knowledge_get — this index also lists published " +
       "system canonicals, which knowledge_get cannot resolve).",
     inputSchema: {

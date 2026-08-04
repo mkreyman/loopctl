@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.66.0 — 2026-08-04 (the heat index stops feeding its own ranking)
+
+### Changed
+
+- **`knowledge_heat_index` no longer gains heat from its own drills** (issue #569). The index
+  ranks on caller-chosen body reads, and `knowledge_progressive_drill` — the tool this index's
+  own payload tells you to use — recorded one. Being shown therefore produced the rank that
+  showed it, and material that never surfaced could not overtake material that already had.
+  A drill is now recorded under its own access type and excluded from the ranking; the read is
+  still recorded, and still counts as retrieval follow-through. Tool descriptions updated to
+  say so.
+
 ## 2.65.0 — 2026-08-04 (the query-less retrieval route becomes reachable)
 
 ### Added

@@ -123,7 +123,10 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
         "article's BODY directly. Repeat reads by one reader count once. " <>
         "Only caller-chosen fetches are counted " <>
         "(`meta.counted_access_types`); list-shaped ranker output (a search hit, a context " <>
-        "pack) is one row per RESULT, not a read, so it adds no heat. Takes NO query, " <>
+        "pack) is one row per RESULT, not a read, so it adds no heat. Neither does a DRILL " <>
+        "opened from this index — that read is recorded under its own access type, because " <>
+        "counting it would let the index feed the ranking that surfaced the article. " <>
+        "Takes NO query, " <>
         "which is the " <>
         "point: every other retrieval route starts from one, so they all miss the same way " <>
         "on a paraphrase or on material that is topically central but lexically dissimilar. " <>

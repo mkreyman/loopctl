@@ -44,7 +44,20 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
 
   @type t :: %__MODULE__{}
 
-  @access_types ~w(search get context index)
+  # `"drill"` is a body read like `"get"`, split out ONLY so the heat index cannot rank on a
+  # signal it generates itself (#569). `heat_index/2` orders on `"get"`, and the tool its own
+  # `meta.drill` tells callers to use — `knowledge_progressive_drill` — recorded a `"get"`,
+  # so an article gained heat from HAVING BEEN SHOWN by the index. Visibility produced reads,
+  # reads produced rank, rank produced visibility, and material that never surfaced could not
+  # overtake material that already had. The read is still recorded; it just is not the signal
+  # the ranking consumes. Keep `"drill"` OUT of `@heat_read_access_types` and IN anything
+  # asking "was a body delivered" (`RetrievalMetrics.compute_followed_through/2`).
+  #
+  # This list and `Loopctl.Knowledge.Analytics`'s `@valid_access_types` are two allowlists over
+  # one column and MUST move together: this one is the changeset's `validate_inclusion`, that
+  # one is the write guard in `record_access/6` — a value in only one is silently unwritable
+  # or silently unvalidated. There is no DB CHECK, so these two ARE the enforcement.
+  @access_types ~w(search get context index drill)
 
   schema "article_access_events" do
     tenant_field()

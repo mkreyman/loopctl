@@ -86,6 +86,15 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # Shared "searched -> followed-through within window" correlated-exists count, reused
   # for the aggregate AND each provenance bucket so the follow-through definition can
   # never drift between the three.
+  #
+  # `"drill"` counts here, DELIBERATELY, and this is the one place the #569 split reverses.
+  # That access type exists so `heat_index/2` cannot rank on reads it caused itself, but this
+  # metric asks a different question — was a body DELIVERED after a search — and a drill
+  # delivers one. Omitting it would silently under-report follow-through by exactly the reads
+  # that moved to the new type, which looks like a precision regression on the day #569 ships
+  # rather than a definition change. This is why the two access-type sets stay separate and
+  # are NOT unified: they answer different questions and diverge on purpose (see the note at
+  # `@heat_read_access_types`).
   defp compute_followed_through(searched_q, window_seconds) do
     searched_q
     |> where(
@@ -96,7 +105,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
             o.tenant_id == parent_as(:s).tenant_id and
               o.api_key_id == parent_as(:s).api_key_id and
               o.article_id == parent_as(:s).article_id and
-              o.access_type in ["get", "context"] and
+              o.access_type in ["get", "context", "drill"] and
               o.accessed_at > parent_as(:s).accessed_at and
               fragment(
                 "? <= ? + (? * interval '1 second')",

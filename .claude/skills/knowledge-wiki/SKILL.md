@@ -44,7 +44,7 @@ never pass `tenant_id`/`subject_id`.
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
    created (`:507-513`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:462-464`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8419`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8424`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
    (`absolute_score/1`, `:8546-8551`) clears a scale-matched threshold AND beats the best retrieved
    candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8597-8607`; the pure decision is
@@ -66,6 +66,23 @@ never pass `tenant_id`/`subject_id`.
    reversible + audited, so never drop reversibility when reasoning about a new op.
    `drafts`/`publish` are `:orchestrator` (`:33`).
    Agent edits are visibility-scoped: an agent can only touch an article it can see. (See `chain-of-custody`.)
+5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
+   (`knowledge.ex:9000`; the counted set is `@heat_read_access_types`, `:8911`). The heat index is the one retrieval route that
+   takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
+   if its ordering is something a caller or the route itself generates. This has been violated THREE
+   times, each differently, so treat any new input to the ranking as guilty until checked:
+   - **#563** counted `search`/`context` — one row per RESULT of a ranked query, so heat became a
+     tally of past ranker output and re-coupled to the embedding similarity it exists to escape.
+   - **#567** counted raw event rows, so one key could pin its own article with a `knowledge_get`
+     loop; then counted DISTINCT KEYS, which under v2's per-dispatch ephemeral keys counted
+     DISPATCHES. A reader is `coalesce(k.agent_id, e.api_key_id)`, and ties break on distinct read
+     DAYS — never `count(e.id)`, which hands the tie straight back to the counter a loop inflates.
+   - **#569** counted `drill`, the access type recorded by `knowledge_progressive_drill` — the tool
+     this index's own `meta.drill` names — so being SHOWN produced the rank that showed it.
+   `drill` still counts in `RetrievalMetrics.compute_followed_through/2`, which asks whether a body
+   was DELIVERED. The two access-type sets diverge on purpose; do not unify them. Adding a value to
+   `ArticleAccessEvent.@access_types` requires the same value in `Analytics.@valid_access_types` —
+   there is no DB CHECK, those two allowlists ARE the enforcement.
 
 ## Ranking changes are gated by the golden-question eval (#469)
 

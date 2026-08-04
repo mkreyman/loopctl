@@ -346,6 +346,50 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert Enum.map(results, & &1.title) == ["Actually read"]
     end
 
+    test "#569: a DRILL adds no heat, so the index cannot feed its own ranking" do
+      # The loop this closes: heat ranks on `get`, and the tool the payload's own `meta.drill`
+      # names recorded a `get` — so an article gained heat from having been SHOWN here.
+      # Visibility produced reads, reads rank, rank visibility, and material that never
+      # surfaced could not overtake material that already had. Unlike `search`/`context`, a
+      # drill IS a genuine single-article body read; it is excluded because of where it comes
+      # FROM, not what shape it is.
+      tenant = fixture(:tenant)
+      shown = published_article(tenant.id, %{title: "Kept getting shown"})
+      read = published_article(tenant.id, %{title: "Actually sought out"})
+
+      # 20 drills by 20 different readers — the strongest form of the loop, since distinct
+      # readers is exactly what heat counts.
+      heat(tenant.id, shown, 20, %{access_type: "drill"})
+      heat(tenant.id, read, 1)
+
+      assert {:ok, %{results: results}} = Knowledge.heat_index(tenant.id)
+      assert Enum.map(results, & &1.title) == ["Actually sought out"]
+    end
+
+    test "#569: progressive_drill RECORDS the drill, it does not silently drop the read" do
+      # The read still matters for analytics and follow-through — the fix separates the
+      # SIGNAL, it does not stop recording. A fix that just dropped the event would pass the
+      # test above and lose data.
+      tenant = fixture(:tenant)
+      {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = published_article(tenant.id, %{title: "Drilled"})
+
+      assert {:ok, _} =
+               Knowledge.progressive_drill(tenant.id, article.id, api_key_id: key.id)
+
+      # `config/test.exs` sets `:analytics_recording_mode, :sync`, so the event is already
+      # written when the call returns — no drain needed.
+      events =
+        Loopctl.AdminRepo.all(
+          from(e in Loopctl.Knowledge.ArticleAccessEvent,
+            where: e.tenant_id == ^tenant.id and e.article_id == ^article.id,
+            select: e.access_type
+          )
+        )
+
+      assert events == ["drill"]
+    end
+
     test "a published system canonical is indexed, not silently dropped" do
       tenant = fixture(:tenant)
 

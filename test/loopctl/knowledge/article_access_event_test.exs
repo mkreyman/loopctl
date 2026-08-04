@@ -3,6 +3,7 @@ defmodule Loopctl.Knowledge.ArticleAccessEventTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.ArticleAccessEvent
 
   describe "create_changeset/2" do
@@ -74,7 +75,21 @@ defmodule Loopctl.Knowledge.ArticleAccessEventTest do
 
   describe "access_types/0" do
     test "returns all supported types" do
-      assert ArticleAccessEvent.access_types() == ~w(search get context index)
+      assert ArticleAccessEvent.access_types() == ~w(search get context index drill)
+    end
+
+    test "#569: the schema allowlist and the Analytics write guard do not drift" do
+      # Two allowlists over one column, and there is NO DB CHECK — these are the enforcement.
+      # A value in the schema but not in Analytics is silently unwritable (`record_access/6`
+      # falls through to its catch-all `:ok` and drops the event); a value in Analytics but not
+      # the schema fails `validate_inclusion` at insert, inside a fire-and-forget task where
+      # nobody sees it. Both failures are SILENT, which is why this is asserted rather than
+      # left to review.
+      schema_types = ArticleAccessEvent.access_types()
+      analytics_types = Analytics.valid_access_types()
+
+      assert Enum.sort(schema_types) == Enum.sort(analytics_types)
+      assert "drill" in schema_types, "the guard is vacuous if the sets are empty"
     end
   end
 end

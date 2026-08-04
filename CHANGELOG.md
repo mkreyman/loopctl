@@ -96,6 +96,22 @@ Operator-facing changes for deployments outside the hosted instance.
   there is **no multiplier to apply on top**. At the default of 500 the per-lane allowance is
   25/node.
 
+- **New `article_access_events.access_type` value: `drill` (#569).** A body opened via
+  `knowledge_progressive_drill` is now recorded as `drill` instead of `get`. Operator-visible
+  in two places. **Analytics filters on `access_type=get` will stop seeing drill reads** —
+  `GET /api/v1/knowledge/analytics/*` and anything grouping by access type must add `drill` to
+  keep the same population. And the value set that column can hold has grown, though there is
+  no DB CHECK to migrate: the allowlists are `ArticleAccessEvent.@access_types` and
+  `Analytics.@valid_access_types`. Nothing is back-filled, so historical drill reads stay
+  recorded as `get`.
+
+  Why: `heat_index` ranks on `get`, and the drill tool its own `meta.drill` payload tells
+  callers to use recorded a `get` — so an article gained heat from having been *shown* by the
+  index. Visibility produced reads, reads produced rank, rank produced visibility, and
+  material that never surfaced could not overtake material that already had. Retrieval
+  follow-through (`RetrievalMetrics`) deliberately DOES count `drill`, so precision figures
+  are unaffected by the split.
+
 - **`GET /api/v1/knowledge/heat_index` ranks by DISTINCT READERS, not by read count (#567).**
   Heat was `count(*)` over access-event rows, so any agent could pin its own article at rank 1 by
   calling `knowledge_get` on it in a loop — and because this index is meant to be pasted into a

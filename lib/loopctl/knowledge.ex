@@ -910,11 +910,14 @@ defmodule Loopctl.Knowledge do
         |> filter_visible_links(vis)
         |> drop_resolved_conflict_links(tenant_id)
 
+      # `:access_type` defaults to `"get"` — this function is shared by `get_article/3` and
+      # `progressive_drill/3`, and only the latter overrides it (#569). The override is what
+      # stops `heat_index/2` ranking on reads it caused itself; see `@heat_read_access_types`.
       Analytics.record_access(
         tenant_id,
         article.id,
         Keyword.get(opts, :api_key_id),
-        "get",
+        Keyword.get(opts, :access_type, "get"),
         Keyword.get(opts, :access_metadata, %{}),
         attribution_context(opts)
       )
@@ -8895,6 +8898,16 @@ defmodule Loopctl.Knowledge do
   # reader names. Deliberately NARROWER than the read set in
   # `RetrievalMetrics.compute_followed_through/2`, which asks a different question (was a body
   # DELIVERED, ranker-chosen or not) — the two sets must not be unified.
+  #
+  # `"drill"` is excluded for a THIRD reason, distinct from the list-shape one above (#569).
+  # `knowledge_progressive_drill` is the tool `meta.drill` below tells callers to use, and it
+  # is a genuine single-article body read — it fails none of the tests that exclude `"search"`
+  # and `"context"`. It is excluded because counting it closes a LOOP: this index shows an
+  # article, a caller drills it because it was shown, and the drill feeds the rank that showed
+  # it. Visibility would produce reads, reads rank, rank visibility — and material that never
+  # surfaced could not overtake material that already had. That is the same defect this route
+  # has now had three times (#563 counted search impressions, #567 counted one key's loop) and
+  # the general rule behind all three: heat must not rank on a signal heat produces.
   @heat_read_access_types ~w(get)
 
   # The aggregate runs on the request path over `article_access_events`, the one table that
@@ -9459,6 +9472,15 @@ defmodule Loopctl.Knowledge do
   @spec progressive_drill(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Article.t()} | {:error, :not_found}
   def progressive_drill(tenant_id, article_id, opts \\ []) do
+    # Records `"drill"`, not `"get"` (#569). This is the tool `heat_index/2`'s own `meta.drill`
+    # names, and heat ranks on `"get"` — so recording one here meant an article gained heat
+    # from having been SHOWN by the index, and material that never surfaced could not overtake
+    # material that already had. A caller-forced `:access_type` is overridden, not honoured:
+    # the point is that this PATH cannot feed the ranking, and letting the opts decide would
+    # hand that back to the caller. Set on BOTH branches — a system canonical reached through
+    # the fallback is the same read.
+    opts = Keyword.put(opts, :access_type, "drill")
+
     case get_article(tenant_id, article_id, opts) do
       {:error, :not_found} -> drill_system_canonical(tenant_id, article_id, opts)
       result -> result
