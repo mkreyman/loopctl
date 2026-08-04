@@ -96,6 +96,29 @@ Operator-facing changes for deployments outside the hosted instance.
   there is **no multiplier to apply on top**. At the default of 500 the per-lane allowance is
   25/node.
 
+- **`GET /api/v1/knowledge/heat_index` ranks by DISTINCT READERS, not by read count (#567).**
+  Heat was `count(*)` over access-event rows, so any agent could pin its own article at rank 1 by
+  calling `knowledge_get` on it in a loop — and because this index is meant to be pasted into a
+  cached prefix, that ranking then propagated into every other agent's context. A signal the
+  ranked party controls is not a signal. A reader is `coalesce(agent_id, api_key_id)` of the key
+  that read — NOT the key row, since v2 mints a fresh ephemeral key per dispatch and counting
+  keys would count dispatches — so one agent now contributes at most 1 however many times, and
+  from however many dispatches, it reads; ties break on distinct read DAYS before the article id
+  does, never on raw read count — that counter is the one a loop inflates.
+  Existing `heat` values will DROP (they become readership size, not traffic) and the
+  ordering will change wherever traffic and readership disagreed. Two further contract fixes on
+  the same route: `meta.heat_window` is snapped to a UTC day boundary in the NARROWING direction
+  (an explicit `since` is never widened — one inside the current UTC day is used exactly as
+  given — and the default/ceiling are whole days back from today's start), so two calls with no intervening
+  read return a byte-identical payload (it previously carried a microsecond timestamp, making the
+  "cacheable prefix" a guaranteed cache miss); and a FUTURE `since` is clamped to now instead of
+  returning 200 with an empty list and a window that has not happened yet. `meta.chars` is now
+  measured off the ENCODED stub, so escape-heavy titles no longer under-report the wire size a
+  caller budgets against. No migration and no index change: the route's published-id subquery
+  was suspected of scanning the corpus, and `EXPLAIN (ANALYZE, BUFFERS)` on production
+  disproved it — the planner drives from the windowed event index and probes `articles_pkey`
+  per distinct article read, 11 ms against a 79,025-article corpus.
+
 ### Added
 
 - **A retirement trigger for the US-41.1 legacy embedding columns (#551).** New migration

@@ -118,8 +118,10 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
     summary: "Heat-ranked topic index (no query)",
     description:
       "A bounded, top-K-capped stub list of the corpus (tenant articles plus published " <>
-        "system canonicals) ordered by HEAT — the number of times each article's BODY was " <>
-        "read directly. Only caller-chosen fetches are counted " <>
+        "system canonicals) ordered by HEAT — the number of DISTINCT READERS (the agent " <>
+        "behind the calling key, or the key itself when it has no agent) that read each " <>
+        "article's BODY directly. Repeat reads by one reader count once. " <>
+        "Only caller-chosen fetches are counted " <>
         "(`meta.counted_access_types`); list-shaped ranker output (a search hit, a context " <>
         "pack) is one row per RESULT, not a read, so it adds no heat. Takes NO query, " <>
         "which is the " <>
@@ -150,7 +152,10 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
           "ISO-8601 timestamp. Count only accesses at/after it. Omitted means the last " <>
             "#{@heat_default_window_days} days, and a lookback longer than " <>
             "#{@heat_max_window_days} days is CLAMPED to that ceiling — both bound the " <>
-            "request-path aggregate over an ever-growing read history. Pass an older " <>
+            "request-path aggregate over an ever-growing read history. A future timestamp " <>
+            "is clamped to today. The effective cutoff is snapped to a UTC day boundary in " <>
+            "the NARROWING direction and is never earlier than what you asked for; a " <>
+            "timestamp inside the current UTC day is used exactly as given. Pass an older " <>
             "timestamp to widen the window deliberately; the effective window is echoed " <>
             "as `meta.heat_window`."
       ]
@@ -166,7 +171,8 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
            }
          }},
       400 => {"Invalid parameter", "application/json", Schemas.ErrorResponse},
-      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse}
+      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

@@ -215,10 +215,48 @@ private, full-corpus artifact, not the progressive-disclosure seed.
 |-----------|-------------------------------|----------|----------|
 | Hybrid search | `hybrid_search/3` | `POST /api/v1/knowledge/hybrid_search` | `knowledge_hybrid_search` |
 | Progressive index | `progressive_index/3` | `GET /api/v1/knowledge/progressive_index` | `knowledge_progressive_index` |
+| Heat index | `heat_index/2` | `GET /api/v1/knowledge/heat_index` | `knowledge_heat_index` |
 | Progressive drill | `progressive_drill/3` | `GET /api/v1/knowledge/progressive/:id` | `knowledge_progressive_drill` |
 
-All three endpoints render at `GET /swaggerui` (loopctl's self-documenting
+All of these endpoints render at `GET /swaggerui` (loopctl's self-documenting
 OpenAPI 3.0 surface) alongside every other API route.
+
+### The heat index is the one route that takes no query (#554, #567)
+
+Hybrid search and the progressive index both begin from a QUERY, so they share a
+failure mode: a paraphrase, or material topically central but lexically
+dissimilar to the question, comes back empty — and an empty result reads as *"the
+KB has nothing"* rather than *"I asked badly"*, with nothing in the payload to
+contradict it. `heat_index/2` takes no query at all, so its misses are
+uncorrelated with embedding similarity. Reach for it when a search came back
+empty or thin, or before you know what to ask.
+
+Ordering is **usage, not relevance**: the number of DISTINCT READERS —
+`coalesce(agent_id, api_key_id)` of the key that read — that opened each article
+inside `meta.heat_window`, ties broken by distinct read DAYS before the article
+id — never by raw read count, which is the one counter a loop inflates.
+Distinct readers rather than
+raw reads is a correctness property, not a refinement — counting event rows let
+any agent pin its own article at rank 1 by calling `knowledge_get` in a loop, and
+because this index is meant to be pasted into a cached prefix, that ranking then
+propagated into every other agent's context. It is the AGENT, not the key row:
+v2 mints a fresh ephemeral key per dispatch, so counting keys would count
+dispatches and re-open the same pinning. Only `get`-shaped reads count;
+`search` and `context` write one row per RESULT of one ranked query, so counting
+them would re-couple this route to the embedding similarity it exists to be free
+of.
+
+The window is snapped to a UTC day boundary, so two calls with no intervening read
+return a byte-identical payload — which is what makes it safe in a cached prefix.
+The snap always NARROWS: an explicit `since` is never widened back — one inside
+the current UTC day is used exactly as given, since its next boundary has not
+happened yet. It defaults to 90 days and is clamped to at most 365 days of
+lookback and to no later than today; `meta.heat_window` always echoes the window
+actually used.
+
+Drill a heat stub with `progressive_drill/3`, **not** `get_article/3`: the heat
+index also lists published system canonicals, whose `tenant_id` is NULL, and
+`get_article/3` filters on `tenant_id`. `meta.drill` states this in the payload.
 
 `hybrid_search/3`'s `opts` forward directly to `search_combined/3`:
 `:keyword_weight`, `:semantic_weight`, `:project_id`, `:category`, `:status`,
@@ -245,9 +283,11 @@ Rule of thumb, extended for hybrid search: *asking a question that MIGHT have a
 governed answer, and you want to know whether the answer is authoritative or "our
 best guess"?* → `knowledge_hybrid_search` (reads `meta.provenance`). *Just
 browsing/enumerating a topic cheaply?* → `knowledge_progressive_index` +
-`knowledge_progressive_drill`. *A fact only you need to recall about your own
-work?* → `memory_remember`. *A live structured row (a story, a project)?* →
-`retrieve_*`.
+`knowledge_progressive_drill`. *A query-shaped route came back empty, or you
+don't yet know what to ask?* → `knowledge_heat_index` (no query, so its misses
+are uncorrelated with the ones that just failed you). *A fact only you need to
+recall about your own work?* → `memory_remember`. *A live structured row (a
+story, a project)?* → `retrieve_*`.
 
 ---
 

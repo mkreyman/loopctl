@@ -11,9 +11,13 @@ defmodule LoopctlWeb.KnowledgeProgressiveJSON do
   Renders the HEAT index (#554).
 
   Distinct from `index/1` because the payloads differ where it matters: a heat stub carries
-  `heat` (the windowed body-read count that produced its rank), and the meta carries the DRILL
-  INSTRUCTION. The instruction is part of the wire shape on purpose — an index that lists ids
-  without saying they are actionable gets read as prose.
+  `heat`, and the meta carries the DRILL INSTRUCTION. The instruction is part of the wire shape
+  on purpose — an index that lists ids without saying they are actionable gets read as prose.
+
+  `heat` is the number of DISTINCT READERS — `coalesce(agent_id, api_key_id)` of the key that
+  read it — within `meta.heat_window`, with ties broken by distinct read DAYS. NOT a read
+  count: counting reads let one key pin its own article by looping, and this module owns the
+  wire shape, so this docstring is what the next reader of the renderer trusts (#567).
   """
   def heat_index(%{results: results, meta: meta}) do
     %{

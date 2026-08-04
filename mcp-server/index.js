@@ -1414,6 +1414,21 @@ async function knowledgeProgressiveIndex({ topic, category, limit }) {
   return toContent(result);
 }
 
+async function knowledgeHeatIndex({ category, limit, since }) {
+  const params = new URLSearchParams();
+  if (category) params.set("category", category);
+  if (limit != null) params.set("limit", String(limit));
+  if (since) params.set("since", since);
+
+  const result = await apiCall(
+    "GET",
+    `/api/v1/knowledge/heat_index?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function knowledgeProgressiveDrill({ article_id }) {
   const result = await apiCall(
     "GET",
@@ -4483,9 +4498,50 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_heat_index",
+    description:
+      "Browse the corpus with NO query — a capped list of compact stubs " +
+      "(id/title/category/heat/summary, NO bodies) ranked by how many DISTINCT readers " +
+      "(agents, not key rows — repeat reads by one reader count once, ties broken by the " +
+      "number of distinct days read, never by raw read count) actually opened each article " +
+      "inside a window. " +
+      "Every other retrieval tool starts from " +
+      "a query, so they share one failure mode: a paraphrase, or material that is topically " +
+      "central but lexically dissimilar to your question, comes back empty and reads as 'the " +
+      "KB has nothing' rather than 'I asked badly'. Reach for this when a search came back " +
+      "empty or thin, or to survey what the fleet actually reads before you know what to " +
+      "ask. Ordering is usage, NOT relevance to any query. Open a stub with " +
+      "knowledge_progressive_drill (not knowledge_get — this index also lists published " +
+      "system canonicals, which knowledge_get cannot resolve).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        category: {
+          type: "string",
+          description: "Optional: restrict to one category.",
+        },
+        limit: {
+          type: "integer",
+          description: "Optional: top-K override (clamped to the configured cap).",
+        },
+        since: {
+          type: "string",
+          description:
+            "Optional: ISO-8601 timestamp; count only reads at/after it. Defaults to the " +
+            "last 90 days, clamped to at most 365 days of lookback and to no later than " +
+            "today. Snapped to a UTC day boundary in the NARROWING direction (never wider " +
+            "than you asked for; a timestamp inside the current UTC day is used exactly as " +
+            "given), and meta.heat_window echoes what you got.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "knowledge_progressive_drill",
     description:
-      "Drill into one stub from knowledge_progressive_index — returns the FULL article " +
+      "Drill into one stub from knowledge_progressive_index or knowledge_heat_index — " +
+      "returns the FULL article " +
       "body for the given id, scope-enforced. Resolves both tenant-owned articles and " +
       "published system canonicals (the same set the index surfaces). This is the drill " +
       "half of progressive disclosure: index cheaply, then open only the article(s) you " +
@@ -6730,6 +6786,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_progressive_index":
       return await knowledgeProgressiveIndex(args);
+
+    case "knowledge_heat_index":
+      return await knowledgeHeatIndex(args);
 
     case "knowledge_progressive_drill":
       return await knowledgeProgressiveDrill(args);
