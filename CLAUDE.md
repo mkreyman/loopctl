@@ -462,7 +462,8 @@ semantic/keyword **retrieval** result, on one uniform shape carrying
   lexically-dissimilar-but-central article comes back empty, and the agent reads
   that as "the KB has nothing". Ranked by DISTINCT READERS — `coalesce(agent_id,
   api_key_id)` of the key that made a `get`-shaped read inside
-  `meta.heat_window`, ties broken by raw reads — because counting raw event rows
+  `meta.heat_window`, ties broken by distinct read DAYS (never raw reads, the
+  counter a loop inflates) — because counting raw event rows
   let any agent pin its own article at rank 1 with a `knowledge_get` loop, and
   counting KEYS would count DISPATCHES (v2 mints one key per dispatch); this
   index is designed to be pasted into a cached prefix, so that ranking

@@ -233,7 +233,8 @@ empty or thin, or before you know what to ask.
 
 Ordering is **usage, not relevance**: the number of DISTINCT READERS —
 `coalesce(agent_id, api_key_id)` of the key that read — that opened each article
-inside `meta.heat_window`, ties broken by raw read count before the article id.
+inside `meta.heat_window`, ties broken by distinct read DAYS before the article
+id — never by raw read count, which is the one counter a loop inflates.
 Distinct readers rather than
 raw reads is a correctness property, not a refinement — counting event rows let
 any agent pin its own article at rank 1 by calling `knowledge_get` in a loop, and
@@ -247,10 +248,11 @@ of.
 
 The window is snapped to a UTC day boundary, so two calls with no intervening read
 return a byte-identical payload — which is what makes it safe in a cached prefix.
-The snap always NARROWS: an explicit `since` is never widened back, and the
-ceiling is never overshot. It defaults to 90 days and is clamped to at most 365
-days of lookback and to no later than today; `meta.heat_window` always echoes the
-window actually used.
+The snap always NARROWS: an explicit `since` is never widened back — one inside
+the current UTC day is used exactly as given, since its next boundary has not
+happened yet. It defaults to 90 days and is clamped to at most 365 days of
+lookback and to no later than today; `meta.heat_window` always echoes the window
+actually used.
 
 Drill a heat stub with `progressive_drill/3`, **not** `get_article/3`: the heat
 index also lists published system canonicals, whose `tenant_id` is NULL, and

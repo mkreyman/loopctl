@@ -103,11 +103,13 @@ Operator-facing changes for deployments outside the hosted instance.
   ranked party controls is not a signal. A reader is `coalesce(agent_id, api_key_id)` of the key
   that read — NOT the key row, since v2 mints a fresh ephemeral key per dispatch and counting
   keys would count dispatches — so one agent now contributes at most 1 however many times, and
-  from however many dispatches, it reads; raw read count breaks ties before the article id does.
+  from however many dispatches, it reads; ties break on distinct read DAYS before the article id
+  does, never on raw read count — that counter is the one a loop inflates.
   Existing `heat` values will DROP (they become readership size, not traffic) and the
   ordering will change wherever traffic and readership disagreed. Two further contract fixes on
   the same route: `meta.heat_window` is snapped to a UTC day boundary in the NARROWING direction
-  (an explicit `since` is never widened, and the 365-day ceiling is never exceeded), so two calls with no intervening
+  (an explicit `since` is never widened — one inside the current UTC day is used exactly as
+  given — and the default/ceiling are whole days back from today's start), so two calls with no intervening
   read return a byte-identical payload (it previously carried a microsecond timestamp, making the
   "cacheable prefix" a guaranteed cache miss); and a FUTURE `since` is clamped to now instead of
   returning 200 with an empty list and a window that has not happened yet. `meta.chars` is now

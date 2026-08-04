@@ -145,20 +145,40 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert Enum.map(results, & &1.heat) == [2, 1]
     end
 
-    test "#567: articles tied on readership are ordered by reads, not by article id" do
+    test "#567: a tie is broken by distinct read DAYS, which a loop cannot inflate" do
       # Readership is a small integer (fleet size), so ties are the norm — and a fleet reading
-      # through one shared MCP key ties EVERY article at 1, which made the id fallback the
-      # real ranking: UUID order wearing heat's name.
+      # through one shared MCP key ties EVERY article at 1, which makes the tie-break the real
+      # ranking. Breaking it on raw event rows handed that ranking straight back to the ranked
+      # party: 9 knowledge_get calls in a loop outrank an article read on 3 separate days.
       tenant = fixture(:tenant)
-      busy = published_article(tenant.id, %{title: "Busy"})
-      quiet = published_article(tenant.id, %{title: "Quiet"})
+      looped = published_article(tenant.id, %{title: "Looped"})
+      sustained = published_article(tenant.id, %{title: "Sustained"})
 
-      reads_from_one_key(tenant.id, quiet, 1)
-      reads_from_one_key(tenant.id, busy, 9)
+      {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      now = DateTime.utc_now()
+
+      # 9 reads, all today, from one key vs 3 reads on 3 different days from the same key.
+      for _ <- 1..9,
+          do:
+            fixture(:article_access_event, %{
+              tenant_id: tenant.id,
+              article_id: looped.id,
+              api_key_id: key.id,
+              accessed_at: now
+            })
+
+      for d <- 1..3,
+          do:
+            fixture(:article_access_event, %{
+              tenant_id: tenant.id,
+              article_id: sustained.id,
+              api_key_id: key.id,
+              accessed_at: DateTime.add(now, -d, :day)
+            })
 
       assert {:ok, %{results: results}} = Knowledge.heat_index(tenant.id)
 
-      assert Enum.map(results, & &1.title) == ["Busy", "Quiet"]
+      assert Enum.map(results, & &1.title) == ["Sustained", "Looped"]
       assert Enum.map(results, & &1.heat) == [1, 1]
     end
 
@@ -229,6 +249,42 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
              "the served window must never start earlier than the caller asked for"
 
       assert results == [], "a read the caller's :since excluded must not be counted"
+    end
+
+    test "#567: a :since inside the current UTC day is not widened back to 00:00" do
+      # The snap ceiled the caller's value and an upper clamp then pulled it back to today's
+      # start, so a 09:00 `:since` counted reads from 00:00 again — the same widening the snap
+      # was added to remove, relocated from the floor to the clamp. Inside the current day the
+      # next boundary has not happened yet, so the caller's timestamp is used as given.
+      tenant = fixture(:tenant)
+      article = published_article(tenant.id, %{title: "Excluded"})
+
+      today = DateTime.new!(Date.utc_today(), ~T[00:00:00], "Etc/UTC")
+      heat(tenant.id, article, 2, %{accessed_at: today})
+
+      given = DateTime.add(DateTime.utc_now(), -1, :second)
+
+      assert {:ok, %{results: results, meta: %{heat_window: window}}} =
+               Knowledge.heat_index(tenant.id, since: given)
+
+      assert {:ok, effective, _} = DateTime.from_iso8601(window)
+
+      assert DateTime.compare(effective, given) != :lt,
+             "an intra-day :since must not be pulled back to the start of its UTC day"
+
+      assert results == [], "reads before the caller's :since must not be counted"
+    end
+
+    test "#567: the default window is the advertised number of whole days" do
+      # Ceiling the SYSTEM-derived bounds served 89 days under a 90-day constant that the
+      # OpenAPI and MCP copy are generated from. They are anchored at today's start instead.
+      tenant = fixture(:tenant)
+      article = published_article(tenant.id, %{title: "Old"})
+
+      edge = DateTime.add(DateTime.utc_now(), -Knowledge.heat_default_window_days(), :day)
+      heat(tenant.id, article, 1, %{accessed_at: edge})
+
+      assert {:ok, %{results: [%{title: "Old"}]}} = Knowledge.heat_index(tenant.id)
     end
 
     test "#567: the window is snapped to a UTC day boundary, so the payload is byte-identical" do

@@ -153,9 +153,9 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
             "#{@heat_default_window_days} days, and a lookback longer than " <>
             "#{@heat_max_window_days} days is CLAMPED to that ceiling — both bound the " <>
             "request-path aggregate over an ever-growing read history. A future timestamp " <>
-            "is clamped to today. The effective cutoff is snapped to a UTC day boundary, " <>
-            "always in the NARROWING direction, so it is never earlier than what you asked " <>
-            "for nor past the ceiling. Pass an older " <>
+            "is clamped to today. The effective cutoff is snapped to a UTC day boundary in " <>
+            "the NARROWING direction and is never earlier than what you asked for; a " <>
+            "timestamp inside the current UTC day is used exactly as given. Pass an older " <>
             "timestamp to widen the window deliberately; the effective window is echoed " <>
             "as `meta.heat_window`."
       ]

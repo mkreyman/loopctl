@@ -8942,9 +8942,11 @@ defmodule Loopctl.Knowledge do
   however many times, and from however many dispatches, it reads.
 
   Breadth is a SMALL integer (fleet size), so ties are the common case — and a fleet sharing
-  one key ties every article at 1. Raw reads break the tie BEFORE the id does, so the ranking
-  degrades to traffic rather than to UUID order. The trade is deliberate: an article read 50
-  times by 3 agents ranks below one read once by 4 readers.
+  one key ties every article at 1. The tie is broken on DISTINCT READ DAYS, never on raw event
+  rows: raw rows are the counter a loop inflates, so breaking the tie on them handed the whole
+  ranking back to the ranked party in precisely the shared-key deployment where everything
+  ties. A day counts once however long the loop runs, so sustained use outranks a burst, and
+  the article id still keeps the order TOTAL.
 
   System-scoped published canonicals participate, exactly as they do in
   `list_curated_sources/2` and `progressive_drill/3` — a tenant whose most-read material is
@@ -8965,7 +8967,9 @@ defmodule Loopctl.Knowledge do
       #{@heat_default_window_days} days and is CLAMPED to at most #{@heat_max_window_days}
       days of lookback, so the request-path aggregate stays bounded either way; pass an older
       `DateTime` to widen it deliberately and read `meta.heat_window` for what you got. The
-      effective cutoff is SNAPPED to a UTC day boundary, always in the narrowing direction.
+      effective cutoff is SNAPPED to a UTC day boundary in the narrowing direction and is
+      NEVER moved earlier than what you passed; a `:since` inside the current UTC day is used
+      exactly as given, since its next boundary has not happened yet.
     - `:category` -- restrict to one category atom.
     - `:visibility_agent_id` -- the calling agent's id (#163). An index is exactly the surface
       where a leak is easy and invisible, because a stub looks innocuous and nobody reads an
@@ -9060,43 +9064,50 @@ defmodule Loopctl.Knowledge do
   # opposite. Day granularity is the coarsest boundary that still honours a `:since`, and it
   # makes the whole payload byte-identical between refreshes when nothing was read.
   #
-  # CLAMPED AT BOTH ENDS. The floor (`@heat_max_window_days`) was there from the start —
-  # without it the unbounded all-time scan the default exists to prevent is one query
-  # parameter away. The CEILING was not: a future `:since` produced a 200 with an empty index
-  # and a future `meta.heat_window`, which reads as "the corpus is empty" — the exact
-  # misreading this route exists to prevent, self-inflicted. Clamping rather than 400-ing
-  # matches what the lower bound already does: the caller still gets the widest window that
-  # can be served, and `meta.heat_window` says what it actually got.
+  # FLOORED at `@heat_max_window_days` — without it the unbounded all-time scan the default
+  # exists to prevent is one query parameter away.
   #
-  # The snap NARROWS, never widens: every lower bound is rounded UP to the next day boundary,
-  # only the upper clamp floors. Flooring the caller's `:since` silently WIDENED the window it
-  # explicitly narrowed (a 09:00 `:since` counted reads from 00:00 — more than was asked for,
-  # and it looks correct), and flooring AFTER the clamp pushed the `@heat_max_window_days`
-  # ceiling out by up to a day, so the served scan exceeded the bound the route advertises.
-  # Flooring the UPPER clamp is the narrowing direction there, and it lands a future `:since`
-  # on today's start rather than tomorrow's — an empty index is the misreading to avoid.
+  # A caller's `:since` is NEVER moved EARLIER. It is rounded UP to the next day boundary
+  # while that boundary is already past — flooring it silently WIDENED the window the caller
+  # explicitly narrowed (a 09:00 `:since` counted reads from 00:00: more than was asked for,
+  # and it looks correct). A `:since` INSIDE the current day is used AS GIVEN rather than
+  # snapped: its next boundary has not happened yet, so snapping it advertised a future
+  # `meta.heat_window` over an empty index — and clamping that back down to today's start,
+  # which is what an upper clamp does, reinstated the very widening the snap fixed. Such a
+  # caller passes a per-call timestamp anyway, so there is no cacheable prefix to protect.
+  #
+  # The SYSTEM-derived bounds (the default lookback and the `@heat_max_window_days` ceiling)
+  # are anchored at the START of today instead, so they serve the whole number of days the
+  # route advertises — ceiling them served one day less than the constants the API description
+  # is generated from — and stay byte-identical all day, which is what makes the payload
+  # cacheable. Only a FUTURE `:since` is repaired downward, to today's start: it is degenerate
+  # (200 + empty list + a window that has not happened yet reads as "the corpus is empty", the
+  # exact misreading this route exists to prevent), and clamping rather than 400-ing matches
+  # what the lower bound already does — `meta.heat_window` says what was actually served.
   defp heat_since(since) do
     now = DateTime.utc_now()
+    today = floor_to_utc_day(now)
 
     since
     |> case do
-      nil -> DateTime.add(now, -@heat_default_window_days, :day)
-      %DateTime{} = given -> given
+      nil -> DateTime.add(today, -@heat_default_window_days, :day)
+      %DateTime{} = given -> heat_snap(given, now, today)
     end
-    |> ceil_to_utc_day()
-    |> clamp_between(
-      ceil_to_utc_day(DateTime.add(now, -@heat_max_window_days, :day)),
-      floor_to_utc_day(now)
-    )
+    |> at_least(DateTime.add(today, -@heat_max_window_days, :day))
   end
 
-  defp clamp_between(dt, lower, upper) do
+  defp heat_snap(given, now, today) do
+    ceiled = ceil_to_utc_day(given)
+
     cond do
-      DateTime.compare(dt, lower) == :lt -> lower
-      DateTime.compare(dt, upper) == :gt -> upper
-      true -> dt
+      DateTime.compare(given, now) == :gt -> today
+      DateTime.compare(ceiled, now) == :gt -> given
+      true -> ceiled
     end
   end
+
+  defp at_least(dt, lower),
+    do: if(DateTime.compare(dt, lower) == :lt, do: lower, else: dt)
 
   defp floor_to_utc_day(%DateTime{} = dt),
     do: DateTime.new!(DateTime.to_date(dt), ~T[00:00:00], "Etc/UTC")
@@ -9127,7 +9138,12 @@ defmodule Loopctl.Knowledge do
   # being unnecessary, it inverts the meaning: the predicates would decide which articles
   # SURVIVE the ranking instead of which COMPETE for it, so a category-filtered call would
   # rank the whole corpus, take `top_k + 1`, and keep only the few that happen to match.
-  # A supporting partial index is equally unnecessary — the plan uses the primary key.
+  #
+  # SCOPE OF THAT MEASUREMENT: it was taken BEFORE the `api_keys` left join below, so it
+  # proves the id-set subquery is not a corpus scan and nothing about the join's cost. The
+  # join is a per-event probe on `api_keys.id` (the primary key, no fan-out) and the read is
+  # statement-timed, so no index was added for it — but that is REASONING, not the plan above.
+  # Re-measure the joined shape before treating "no supporting index" as still proven.
   #
   # A READER is `coalesce(k.agent_id, e.api_key_id)`, not the key row (#567 round 2). v2 mints
   # a fresh ephemeral key per dispatch, so distinct api_key_id counted DISPATCHES: an agent
@@ -9145,13 +9161,16 @@ defmodule Loopctl.Knowledge do
       group_by: e.article_id,
       # Readership is a SMALL integer (fleet size), so ties are the common case — under a
       # fleet sharing one key EVERY article ties at 1, and ordering straight to
-      # `asc: e.article_id` made this index UUID order wearing heat's name. Raw reads break
-      # the tie first, so it degrades to traffic; the id still keeps the order TOTAL, so a
-      # page is stable across calls — an index that reshuffles on every refresh cannot be
-      # cached, which is the whole point of this surface.
+      # `asc: e.article_id` made this index UUID order wearing heat's name. The tie-break is
+      # DISTINCT READ DAYS: raw `count(e.id)` here re-opened the pinning the distinct count
+      # exists to close, since inside a tie the ranking WOULD BE the row counter a loop
+      # inflates. A day counts once however many times the loop runs, so the tie degrades to
+      # sustained use rather than to traffic; the id still keeps the order TOTAL, so a page is
+      # stable across calls — an index that reshuffles on every refresh cannot be cached,
+      # which is the whole point of this surface.
       order_by: [
         desc: count(fragment("coalesce(?, ?)", k.agent_id, e.api_key_id), :distinct),
-        desc: count(e.id),
+        desc: count(fragment("(?)::date", e.accessed_at), :distinct),
         asc: e.article_id
       ],
       limit: ^limit,
@@ -9204,7 +9223,7 @@ defmodule Loopctl.Knowledge do
         }
       )
       |> maybe_filter_by_visibility(vis)
-      |> AdminRepo.all(timeout: @heat_stub_timeout_ms)
+      |> heat_stub_projection(tenant_id)
       |> Map.new(&{&1.id, &1})
 
     Enum.flat_map(rows, fn %{article_id: id, heat: heat} ->
@@ -9213,6 +9232,23 @@ defmodule Loopctl.Knowledge do
         :error -> []
       end
     end)
+  end
+
+  # The bounded wait is a SHED, not a 500. `@heat_stub_timeout_ms` bounds the projection so
+  # admin-pool contention cannot hold this tenant's heavy-read slot for 15s — but the fault it
+  # raises (a checkout/query deadline, which is exit-shaped as often as it is raised) escaped
+  # `heat_index/2`'s `{:ok, _}` contract and the controller's match, so the SAME contention
+  # that used to answer slowly now answered 500 on a per-turn endpoint whose declared
+  # degradation is a 429. Re-raise it as the gate's own overload, which `HeavyReadOverloadHandler`
+  # already maps to that 429 — no new error shape, and nothing of the fault is interpolated.
+  defp heat_stub_projection(query, tenant_id) do
+    AdminRepo.all(query, timeout: @heat_stub_timeout_ms)
+  rescue
+    DBConnection.ConnectionError ->
+      reraise Loopctl.HeavyRead.OverloadedError, [tenant_id: tenant_id], __STACKTRACE__
+  catch
+    :exit, _reason ->
+      raise Loopctl.HeavyRead.OverloadedError, tenant_id: tenant_id
   end
 
   defp heat_stub(article, heat) do
