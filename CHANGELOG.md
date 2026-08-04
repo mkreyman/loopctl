@@ -53,8 +53,8 @@ Operator-facing changes for deployments outside the hosted instance.
   silently, and in the direction an operator assumes is the safer one. Effect at the default
   of 500 is unchanged. Below a threshold of 10 the allowance floors at 1 rather than 0, so a
   transient blip cannot refuse EVERY request — but a request asking for more items than one
-  window's allowance still cannot fit it, and is refused (without spending the allowance on
-  jobs it will not enqueue). `OBAN_INGEST_BACKLOG_MAX` and
+  window's allowance still cannot fit it, and is refused after a single token rather than
+  burning the remainder on jobs it will not enqueue. `OBAN_INGEST_BACKLOG_MAX` and
   `OBAN_INGEST_BACKLOG_RETRY_AFTER` are now documented in `deploy/FLY_SECRETS.md`, where
   they should have been all along.
 
@@ -70,22 +70,28 @@ Operator-facing changes for deployments outside the hosted instance.
   `error_class="db_error"` is the signal to fix the query.
 
 - **Which ingest fail-open refusals carry `429` vs `503` changed again, and the `Retry-After`
-  on them is now window-scaled (#565).** `429 ingestion_backlog_exceeded` is now an
-  ALLOWLIST — only a fault that is demonstrable pool pressure earns it (`connection`,
-  `timeout`, `db_pressure`, `guc_capture_abort`, and the two pool-shaped exits
-  `exit:timeout` / `exit:DBConnection.ConnectionError`). Every other exit class —
-  `exit:noproc` (an ABSENT pool), `exit:shutdown`, `exit:killed`, `exit:other`,
-  `exit:Postgrex.Error` — now answers `503 ingestion_gate_unavailable` like `db_error` and
-  `driver_fault` already did, because none of them is evidence that the refused tenant has a
-  backlog. In the other direction, the CONTENTION SQLSTATEs (class `40`, e.g. 40P01
-  deadlock_detected; class `55`, e.g. 55P03 lock_not_available) now classify as `db_pressure`
-  rather than `db_error`, so heavy `oban_jobs` churn reads as load on the dashboard instead
-  of as a defect in the counting query. The `Retry-After` on an allowance-exhausted refusal
-  now advises the time left in the hourly allowance window instead of
-  `OBAN_INGEST_BACKLOG_RETRY_AFTER` (~60s), which had a compliant client re-running the
-  backlog count ~60 times per window against the pool the gate is protecting. The fail-open
+  on them is now window-scaled but capped (#565, #566).** `429 ingestion_backlog_exceeded` is
+  now reserved for a fault that is demonstrable pool pressure: the SQLSTATE/exception classes
+  `connection`, `timeout`, `db_pressure`, `guc_capture_abort`, plus any EXIT the driver's own
+  pool raised. Pool-ness of an exit is decided from the raw exit reason
+  (`ExitClass.pool_exit?/1`), not from its metric label, so a foreign `{:timeout, {GenServer,
+  :call, _}}` escaping the counter takes the `503 ingestion_gate_unavailable` while a
+  `{:noproc, {DBConnection, :execute, []}}` keeps the 429 — the label alone cannot tell them
+  apart. A `throw:*` and every exit the gate cannot place at the pool answer the 503, like
+  `db_error` and `driver_fault` already did, because none of them is evidence that the refused
+  tenant has a backlog. In the other direction, the CONTENTION SQLSTATEs (40001, 40P01
+  deadlock_detected, 55P03 lock_not_available) now classify as `db_pressure` rather than
+  `db_error`, so heavy `oban_jobs` churn reads as load on the dashboard instead of as a defect
+  in the counting query; the rest of classes 40 and 55 (55P02 cant_change_runtime_param and
+  friends) stay `db_error`, since a deterministic config fault never drains. The `Retry-After`
+  on an allowance-exhausted refusal now advises the time left in the hourly allowance window
+  instead of `OBAN_INGEST_BACKLOG_RETRY_AFTER` (~60s) — which had a compliant client re-running
+  the backlog count ~60 times per window against the pool the gate is protecting — capped at 5x
+  that variable so a cleared blip cannot stall a client for a whole window. The fail-open
   allowance is also now metered in two per-tenant lanes (pressure vs non-pressure), so a
-  counting-code defect can no longer spend the tokens a genuine pool fault is then refused on.
+  counting-code defect can no longer spend the tokens a genuine pool fault is then refused on;
+  size `OBAN_INGEST_BACKLOG_MAX` against **2x** the per-lane allowance, as
+  `deploy/FLY_SECRETS.md` now states.
 
 ### Added
 

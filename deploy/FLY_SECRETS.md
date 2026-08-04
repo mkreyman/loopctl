@@ -89,21 +89,24 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 | Variable                          | Default | Description |
 |-----------------------------------|---------|-------------|
 | `OBAN_INGEST_BACKLOG_MAX`         | `500`   | In-flight `:ingestion` jobs at/above which a tenant's ingest requests get `429 ingestion_backlog_exceeded`. A SOFT admission floor, not a hard cap — the check is a lock-free read-then-enqueue, so concurrent requests can overshoot it by the in-flight request concurrency. Read it as "start shedding around here". **It also derives the fail-open allowance** (see below), so tightening it tightens both |
-| `OBAN_INGEST_BACKLOG_RETRY_AFTER` | `60`    | Seconds advised in `Retry-After` on an OVER-THRESHOLD backlog refusal. Scaled to the queue's DRAIN cadence (jobs are multi-minute LLM calls on a width-2 queue), not to a request cadence — a few-second hint just hot-loops a compliant client into a stream of 429s. A refusal for a spent FAIL-OPEN allowance (below) ignores this and advises the time left in the hourly allowance window instead, which is the clock that one waits on |
+| `OBAN_INGEST_BACKLOG_RETRY_AFTER` | `60`    | Seconds advised in `Retry-After` on an OVER-THRESHOLD backlog refusal. Scaled to the queue's DRAIN cadence (jobs are multi-minute LLM calls on a width-2 queue), not to a request cadence — a few-second hint just hot-loops a compliant client into a stream of 429s. A refusal for a spent FAIL-OPEN allowance (below) advises the time left in the hourly allowance window instead, CAPPED at 5x this value — the allowance binds only while the count is unmeasurable, so a cleared blip must not cost a compliant client a whole window |
 
 > **When the gate cannot MEASURE the backlog** (wedged/saturated `AdminRepo` pool, driver
 > fault, or a defect in the counting query) it fails OPEN — an innocent tenant must not be
 > refused because the count path is degraded — but only for a bounded number of jobs per
-> tenant per hour: `max(1, OBAN_INGEST_BACKLOG_MAX / 10)` per web node. The `/ 10` holds the
-> FLEET allowance at or under one `OBAN_INGEST_BACKLOG_MAX` per hour for a fleet up to 10 web
-> nodes, because the default limiter is node-local ETS — with one residual below a threshold
-> of **10**, where the per-node allowance floors at 1 rather than 0, so a 10-node fleet can
-> admit up to 10 jobs/hour against a smaller threshold. A request asking for MORE items than
-> one window's allowance can never fit it and is refused without spending it. Past that
+> tenant per hour: `max(1, OBAN_INGEST_BACKLOG_MAX / 10)` per web node, **per fault lane**.
+> The `/ 10` holds the FLEET allowance to one `OBAN_INGEST_BACKLOG_MAX` per hour per lane for a
+> fleet up to 10 web nodes, because the default limiter is node-local ETS. **Size against 2x
+> that**: pressure faults and non-pressure faults are metered in SEPARATE buckets (so a defect
+> in the counting query cannot spend the allowance a genuine pool fault is then refused on), and
+> a tenant hitting both families inside one window admits from both. Second residual, below a
+> threshold of **10**: the per-node allowance floors at 1 rather than 0, so a 10-node fleet can
+> admit up to 10 jobs/hour/lane against a smaller threshold. A request asking for MORE items
+> than one window's allowance can never fit it and is refused after a single token. Past that
 > allowance the request is refused — `429 ingestion_backlog_exceeded` only when the fault is
-> DEMONSTRABLE pool pressure (a wedged/saturated pool, a contention or resource-exhaustion
-> SQLSTATE), otherwise `503 ingestion_gate_unavailable`, which asserts nothing about the
-> tenant's backlog. Watch
+> DEMONSTRABLE pool pressure (a wedged/saturated pool, an exit the driver's own pool raised, a
+> contention or resource-exhaustion SQLSTATE), otherwise `503 ingestion_gate_unavailable`, which
+> asserts nothing about the tenant's backlog. Watch
 > `loopctl.ingestion.backlog_gate.failed_open.*` sliced by `outcome` and `error_class`; a
 > sustained non-zero rate means the valve is admitting or refusing blind.
 
