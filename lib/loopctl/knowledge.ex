@@ -8917,12 +8917,26 @@ defmodule Loopctl.Knowledge do
   has nothing" rather than "I asked badly", with nothing in context to contradict it. This route
   takes no query at all, so its misses are uncorrelated with embedding similarity.
 
-  Ordering is by HEAT — the count of CALLER-CHOSEN body reads
-  (`#{Enum.join(@heat_read_access_types, "/")}`) inside the window; list-shaped ranker output
-  (`search`, `context`) is deliberately NOT counted, see `@heat_read_access_types`. Usage is
-  treated as the authority on importance, so material that keeps proving worth reading holds
-  its rank regardless of what today's query embeds near. Heat is WINDOWED, not cumulative: an
-  empty result means "nothing was read within `meta.heat_window`", NOT "the corpus is empty".
+  Ordering is by HEAT — the number of DISTINCT READERS (api keys) that made a CALLER-CHOSEN
+  body read (`#{Enum.join(@heat_read_access_types, "/")}`) inside the window; list-shaped
+  ranker output (`search`, `context`) is deliberately NOT counted, see
+  `@heat_read_access_types`. Usage is treated as the authority on importance, so material that
+  keeps proving worth reading holds its rank regardless of what today's query embeds near.
+  Heat is WINDOWED, not cumulative: an empty result means "nothing was read within
+  `meta.heat_window`", NOT "the corpus is empty".
+
+  ## Why DISTINCT readers, not raw reads (#567)
+
+  Counting event rows made the ranking self-serve: any agent could pin its own article at
+  rank 1 by calling `knowledge_get` on it in a loop, and — because this index is meant to be
+  pasted into a cached prefix — that ranking then propagates into every OTHER agent's context.
+  A signal the ranked party controls is not a signal. One key contributes at most 1 no matter
+  how many times it reads, so pinning an article now requires actually persuading N distinct
+  keys to read it, which is the thing heat is supposed to measure.
+
+  The trade is deliberate: an article read 50 times by 3 agents ranks below one read once by
+  4. For an index whose job is "what has the fleet found worth reading", breadth is the better
+  signal AND the one that cannot be manufactured from a single key.
 
   System-scoped published canonicals participate, exactly as they do in
   `list_curated_sources/2` and `progressive_drill/3` — a tenant whose most-read material is
@@ -8968,13 +8982,23 @@ defmodule Loopctl.Knowledge do
     # `top_k + 1` look-ahead: it costs one row and turns "you got exactly the cap" into a
     # stated `truncated`, which `progressive_index/3` already carries and a cacheable index
     # needs more, since nothing else in the payload signals the omission.
-    counted =
-      tenant_id
-      |> heat_counts_query(top_k + 1, since, category, vis)
-      |> then(&HeavyRead.all(tenant_id, &1, HeavyRead.opts(:heat_index)))
+    # ONE gate slot across BOTH round trips (#567). The projection runs on `AdminRepo` — a
+    # system canonical's NULL `tenant_id` cannot satisfy the heavy-read guard — which is a
+    # 3-connection pool shared with custody writes. Acquiring per query released the slot
+    # between them, so the aggregate was admitted and the projection then competed with the
+    # request path ungated, on the smallest pool in the system, from a per-turn endpoint.
+    # Nested `HeavyRead.all/3` for this tenant reuses this slot rather than taking a second.
+    {counted, stubs} =
+      HeavyRead.with_slot(tenant_id, HeavyRead.opts(:heat_index), fn ->
+        counted =
+          tenant_id
+          |> heat_counts_query(top_k + 1, since, category, vis)
+          |> then(&HeavyRead.all(tenant_id, &1, HeavyRead.opts(:heat_index)))
+
+        {counted, heat_stubs(tenant_id, Enum.take(counted, top_k), vis)}
+      end)
 
     ranked = Enum.take(counted, top_k)
-    stubs = heat_stubs(tenant_id, ranked, vis)
 
     {:ok,
      %{
@@ -9018,13 +9042,44 @@ defmodule Loopctl.Knowledge do
   @spec heat_max_window_days() :: pos_integer()
   def heat_max_window_days, do: @heat_max_window_days
 
-  defp heat_since(nil),
-    do: DateTime.add(DateTime.utc_now(), -@heat_default_window_days, :day)
+  # FLOORED TO THE UTC DAY, and the same floored value is both the aggregate cutoff and the
+  # echoed `meta.heat_window` (#567). The window was `utc_now() - 90d` at microsecond
+  # precision, so no two calls shared a cutoff and `meta.heat_window` differed on every
+  # request — which defeats the one property this surface is built for. A caller is expected
+  # to paste this index into a CACHED PREFIX, and a prefix that differs by a microsecond field
+  # is a cache miss every time, so the route advertised cacheability while guaranteeing the
+  # opposite. Day granularity is the coarsest boundary that still honours a `:since`, and it
+  # makes the whole payload byte-identical between refreshes when nothing was read.
+  #
+  # CLAMPED AT BOTH ENDS. The floor (`@heat_max_window_days`) was there from the start —
+  # without it the unbounded all-time scan the default exists to prevent is one query
+  # parameter away. The CEILING was not: a future `:since` produced a 200 with an empty index
+  # and a future `meta.heat_window`, which reads as "the corpus is empty" — the exact
+  # misreading this route exists to prevent, self-inflicted. Clamping rather than 400-ing
+  # matches what the lower bound already does: the caller still gets the widest window that
+  # can be served, and `meta.heat_window` says what it actually got.
+  defp heat_since(since) do
+    now = DateTime.utc_now()
 
-  defp heat_since(%DateTime{} = since) do
-    floor = DateTime.add(DateTime.utc_now(), -@heat_max_window_days, :day)
-    if DateTime.compare(since, floor) == :lt, do: floor, else: since
+    since
+    |> case do
+      nil -> DateTime.add(now, -@heat_default_window_days, :day)
+      %DateTime{} = given -> given
+    end
+    |> clamp_between(DateTime.add(now, -@heat_max_window_days, :day), now)
+    |> floor_to_utc_day()
   end
+
+  defp clamp_between(dt, lower, upper) do
+    cond do
+      DateTime.compare(dt, lower) == :lt -> lower
+      DateTime.compare(dt, upper) == :gt -> upper
+      true -> dt
+    end
+  end
+
+  defp floor_to_utc_day(%DateTime{} = dt),
+    do: DateTime.new!(DateTime.to_date(dt), ~T[00:00:00], "Etc/UTC")
 
   # Aggregate over the EVENTS alone: no join to `articles`, so no article column (least of all
   # the unbounded body) enters the group key, and the article-side predicates ride in a bounded
@@ -9043,9 +9098,9 @@ defmodule Loopctl.Knowledge do
       # `asc: e.article_id` after the count keeps the order TOTAL, so a page is stable across
       # calls when several articles tie on heat — an index that reshuffles on every refresh
       # cannot be cached, which is the whole point of this surface.
-      order_by: [desc: count(e.id), asc: e.article_id],
+      order_by: [desc: count(e.api_key_id, :distinct), asc: e.article_id],
       limit: ^limit,
-      select: %{article_id: e.article_id, heat: count(e.id)}
+      select: %{article_id: e.article_id, heat: count(e.api_key_id, :distinct)}
     )
   end
 
@@ -9107,7 +9162,28 @@ defmodule Loopctl.Knowledge do
       heat: heat,
       summary: heat_summary(article.summary_source)
     }
+    |> fit_stub_to_cap()
   end
+
+  # `meta.char_budget` is documented as ENFORCED, so it has to be a real bound and not a
+  # nominal one (#567). Slicing each field to its own character cap bounds the RAW value, but
+  # the caller receives the ENCODED one, and a title carrying quotes, backslashes or control
+  # characters encodes longer than it slices. Trim against the encoded length until the stub
+  # actually fits: summary first (it is the padding), then title, so a stub whose title alone
+  # escapes past the cap still cannot break the budget the caller sized its prefix on.
+  defp fit_stub_to_cap(stub) do
+    over = heat_stub_chars(stub) - @heat_stub_char_cap
+
+    cond do
+      over <= 0 -> stub
+      stub.summary != "" -> fit_stub_to_cap(%{stub | summary: shrink_by(stub.summary, over)})
+      stub.title != "" -> fit_stub_to_cap(%{stub | title: shrink_by(stub.title, over)})
+      # id, category and heat alone; already under the cap by construction.
+      true -> stub
+    end
+  end
+
+  defp shrink_by(value, by), do: String.slice(value, 0, max(String.length(value) - by, 0))
 
   defp heat_title(nil), do: ""
   defp heat_title(title), do: String.slice(title, 0, @heat_title_chars)
@@ -9123,10 +9199,14 @@ defmodule Loopctl.Knowledge do
     |> String.slice(0, @heat_summary_chars)
   end
 
-  defp heat_stub_chars(stub) do
-    String.length(stub.title) + String.length(stub.summary) + String.length(stub.category) +
-      String.length(Integer.to_string(stub.heat)) + @heat_stub_fixed_chars
-  end
+  # Measured off the ENCODED stub, which is what actually goes on the wire (#567). Summing
+  # `String.length/1` over the RAW fields and adding `@heat_stub_fixed_chars` mixed two units:
+  # the fixed constant was measured off the encoded shape (the keys, braces, quotes and
+  # commas), while the values were counted unescaped. A title containing a quote, a backslash
+  # or a control character encodes longer than it measures, so `meta.chars` under-reported the
+  # wire size — and it under-reported it in the UNSAFE direction, for the one number a caller
+  # is told to budget a cached prefix against.
+  defp heat_stub_chars(stub), do: stub |> Jason.encode!() |> String.length()
 
   # Hub-enrichment neighbor discovery (AC-31.3.4): finds which of the seed
   # articles are operational hubs (>= min_hub_relates_to/0 outgoing :relates_to

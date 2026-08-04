@@ -54,20 +54,26 @@ reads through `Loopctl.HeavyRead` (`lib/loopctl/heavy_read.ex`), which owns the 
 6. **On `AdminRepo`/`HeavyReadRepo`, RLS does NOTHING — the explicit `tenant_id` predicate is the only
    isolation there** (`knowledge.ex:9-14`, `heavy_read.ex:3-7`). This is the compensating invariant for
    the other two repos, and it is enforced structurally on the heavy path: the private `guard!/2`
-   (`heavy_read.ex:1272-1290`) RAISES unless EVERY base-table source — `from`, every join, and every
+   (`heavy_read.ex:1320-1338`) RAISES unless EVERY base-table source — `from`, every join, and every
    subquery, recursively — carries a conjunctive `x.tenant_id == ^tenant_id` bound to the passed
    `tenant_id`; `test/loopctl/heavy_read_guard_test.exs` additionally bars direct `HeavyReadRepo` calls.
    Agent-memory reads need a SECOND predicate: `all_memory/4` (`:1033`) also requires a conjunctive
-   `subject_id` equality on the outermost query (private `guard_memory!/3`, `heavy_read.ex:1294-1316`), because `subject_id`
+   `subject_id` equality on the outermost query (private `guard_memory!/3`, `heavy_read.ex:1342-1374`), because `subject_id`
    scoping is application-level only. Always go through `Loopctl.HeavyRead`, never `HeavyReadRepo`
    directly; on `AdminRepo` there is no guard at all, so the predicate is on you.
 7. **Heavy reads can be SHED — handle `{:error, :heavy_read_overloaded}`.** `all/3` (`heavy_read.ex:977`),
    `one/3` (`heavy_read.ex:997`) and `all_memory/4` (`heavy_read.ex:1033`) are specced to return it: the
-   per-tenant cost-weighted in-flight gate (`gated/4`, `heavy_read.ex:1062-1076`) sheds over the cap —
+   per-tenant cost-weighted in-flight gate (`gated/4`, `heavy_read.ex:1096-1102`) sheds over the cap —
    `on_overload: :raise` (default) raises → 429, `on_overload: :tag` returns the tuple. Binding the
    result as a list crashes exactly under the load the gate exists for. An ADVISORY read (a diagnostic
    probe running after the response is computed) must ask for `:tag` — a raising shed there trades a
    valid 200 for a 429.
+   A read that is logically ONE operation but takes two round trips — rank, then project the ranked
+   ids — must wrap both in `with_slot/3` (`heavy_read.ex:1080`). Acquiring per query releases the slot
+   between them, so the cheap half runs UNGATED against the request path, and on `AdminRepo` that is a
+   3-connection pool shared with custody writes (`Knowledge.heat_index/2` is the worked example).
+   Nested `all/3` for the SAME tenant reuses the held slot rather than taking a second — re-entrant
+   only in the safe direction, since the skip requires already holding admission.
 8. **A consistency-coupled heavy read must be PRIMARY-PINNED.** `repo_for/1` (`heavy_read.ex:117-119`,
    pure decision in `route_repo/4`, `heavy_read.ex:132-138`) routes an endpoint listed in
    `primary_pinned_endpoints/0` (`heavy_read.ex:95`, today `:sth_incremental`) onto the PRIMARY pool

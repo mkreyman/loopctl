@@ -1060,14 +1060,57 @@ defmodule Loopctl.HeavyRead do
   # callers that keyword-fall-back) returns `{:error, :heavy_read_overloaded}`. The
   # gate itself FAILS OPEN on a limiter fault (allows the read), so a broken gate never
   # blocks all heavy reads.
+  @doc """
+  Hold ONE gate slot across a multi-query read unit.
+
+  A read that is logically one operation but takes two round trips — rank, then project the
+  ranked ids — otherwise acquires and releases per query, so the work between them runs
+  UNGATED. That is the window where the expensive half has already been admitted and the
+  cheap half competes with the request path on whatever pool it happens to use.
+
+  Nested `all/3` / `one/3` calls for the SAME tenant inside `fun` reuse the slot this
+  acquires rather than acquiring a second one (see `gated/4`), so weight is counted once and
+  an inner call cannot be shed while the outer holds admission.
+
+  Sheds like `all/3`: raises `Loopctl.HeavyRead.OverloadedError` unless `on_overload: :tag`.
+  """
+  @spec with_slot(binary(), keyword(), (-> result)) ::
+          result | {:error, :heavy_read_overloaded}
+        when result: term()
+  def with_slot(tenant_id, opts, fun) when is_binary(tenant_id) and is_function(fun, 0) do
+    {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
+    gated(tenant_id, opts, on_overload, fun)
+  end
+
+  # RE-ENTRANT, and only in the safe direction: the slot is skipped ONLY when this process
+  # already holds one for this tenant. That is not a bypass — it is the same admission,
+  # reused — and it is what lets `with_slot/3` wrap a read unit whose inner calls go through
+  # the ordinary `all/3` path. Acquiring again instead would double-count the weight and let
+  # an inner call be shed while the outer already holds admission, which deadlocks the unit
+  # against its own cap.
+  #
+  # Keyed by TENANT, so a read for a different tenant inside the block still acquires its own
+  # slot. Process-scoped: a request is its own process and the `after` clears the key on every
+  # exit path, so the flag cannot outlive the block; a Task spawned inside does not inherit it
+  # and correctly acquires its own.
   defp gated(tenant_id, opts, on_overload, fun) do
+    if slot_held?(tenant_id) do
+      fun.()
+    else
+      acquire_and_run(tenant_id, opts, on_overload, fun)
+    end
+  end
+
+  defp acquire_and_run(tenant_id, opts, on_overload, fun) do
     weight = TenantGate.weight_for(endpoint(opts))
 
     case TenantGate.acquire(tenant_id, weight, TenantGate.cap()) do
       :ok ->
         try do
+          Process.put(slot_key(tenant_id), true)
           fun.()
         after
+          Process.delete(slot_key(tenant_id))
           TenantGate.release(tenant_id, weight)
         end
 
@@ -1075,6 +1118,10 @@ defmodule Loopctl.HeavyRead do
         shed(on_overload, err, tenant_id)
     end
   end
+
+  defp slot_held?(tenant_id), do: Process.get(slot_key(tenant_id)) == true
+
+  defp slot_key(tenant_id), do: {__MODULE__, :slot, tenant_id}
 
   defp shed(:tag, err, _tenant_id), do: err
 

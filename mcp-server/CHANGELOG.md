@@ -5,6 +5,27 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.65.0 — 2026-08-04 (the query-less retrieval route becomes reachable)
+
+### Added
+
+- **`knowledge_heat_index`** (issue #567). The server shipped a `GET /api/v1/knowledge/heat_index`
+  route with no tool in front of it, so the one retrieval path that still works after a silent
+  semantic miss was unreachable from the sanctioned client — while the route's own payload told
+  the reader to drill with `knowledge_progressive_drill`, an MCP tool.
+
+  Every other retrieval tool starts from a QUERY, so they share one failure mode: a paraphrase,
+  or material topically central but lexically dissimilar to the question, comes back empty and
+  reads as "the KB has nothing" rather than "I asked badly". This one takes no query at all.
+  Optional `category`, `limit`, `since`. Ordering is usage — the number of DISTINCT readers that
+  opened each article inside `meta.heat_window` — not relevance to any query.
+
+### Changed
+
+- **`knowledge_progressive_drill`'s description names both indexes it opens.** It said stubs came
+  from `knowledge_progressive_index`; it is equally the drill half of `knowledge_heat_index`, and
+  a reader who arrived from the heat index had no reason to believe this tool applied to it.
+
 ## 2.64.0 — 2026-08-01 (stop paying 4k tokens to read a 735-token article)
 
 ### Changed

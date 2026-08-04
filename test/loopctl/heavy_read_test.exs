@@ -667,4 +667,84 @@ defmodule Loopctl.HeavyReadTest do
   # files (dual_index_recall_test, vector_search_test), so priming it from an async module
   # would let a concurrent cross-file reader observe the primed value. This file stays
   # `async: true` — it mutates no global state.
+
+  describe "with_slot/3 (#567) — one gate slot across a multi-query read unit" do
+    alias Loopctl.HeavyRead.TenantGate
+
+    test "the slot is held for the whole block, not per query" do
+      # A read that ranks then projects the ranked ids is ONE operation in two round trips.
+      # Acquiring per query released the slot in between, so the second half competed with the
+      # request path ungated — on `AdminRepo`, a 3-connection pool shared with custody writes.
+      tenant = fixture(:tenant)
+
+      assert TenantGate.count(tenant.id) == 0
+
+      inside =
+        HeavyRead.with_slot(tenant.id, HeavyRead.opts(:heat_index), fn ->
+          TenantGate.count(tenant.id)
+        end)
+
+      assert inside > 0, "the slot must be held while the block runs"
+      assert TenantGate.count(tenant.id) == 0, "and released when it returns"
+    end
+
+    test "a nested read for the SAME tenant reuses the slot instead of taking a second" do
+      # Acquiring again would double-count the weight and let an inner call be shed while the
+      # outer already holds admission — a unit deadlocking against its own cap.
+      tenant = fixture(:tenant)
+
+      {outer, inner} =
+        HeavyRead.with_slot(tenant.id, HeavyRead.opts(:heat_index), fn ->
+          outer = TenantGate.count(tenant.id)
+
+          inner =
+            HeavyRead.with_slot(tenant.id, HeavyRead.opts(:heat_index), fn ->
+              TenantGate.count(tenant.id)
+            end)
+
+          {outer, inner}
+        end)
+
+      assert inner == outer, "a nested acquire must not add weight"
+      assert TenantGate.count(tenant.id) == 0
+    end
+
+    test "a nested read for a DIFFERENT tenant still acquires its own slot" do
+      # The re-entrancy is keyed by tenant, so holding one tenant's slot must never wave
+      # another tenant's read through the gate.
+      a = fixture(:tenant)
+      b = fixture(:tenant)
+
+      inner_b =
+        HeavyRead.with_slot(a.id, HeavyRead.opts(:heat_index), fn ->
+          HeavyRead.with_slot(b.id, HeavyRead.opts(:heat_index), fn ->
+            TenantGate.count(b.id)
+          end)
+        end)
+
+      assert inner_b > 0
+      assert TenantGate.count(a.id) == 0
+      assert TenantGate.count(b.id) == 0
+    end
+
+    test "the slot is released when the block RAISES" do
+      # An `after` that only ran on the happy path would leak a slot per failed read and wedge
+      # the tenant's gate closed — a fail-closed leak under exactly the errors it must survive.
+      tenant = fixture(:tenant)
+
+      assert_raise RuntimeError, "boom", fn ->
+        HeavyRead.with_slot(tenant.id, HeavyRead.opts(:heat_index), fn -> raise "boom" end)
+      end
+
+      assert TenantGate.count(tenant.id) == 0
+
+      # And the re-entrancy flag went with it — the next read must really acquire.
+      held =
+        HeavyRead.with_slot(tenant.id, HeavyRead.opts(:heat_index), fn ->
+          TenantGate.count(tenant.id)
+        end)
+
+      assert held > 0
+    end
+  end
 end

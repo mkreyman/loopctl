@@ -166,7 +166,8 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
            }
          }},
       400 => {"Invalid parameter", "application/json", Schemas.ErrorResponse},
-      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse}
+      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

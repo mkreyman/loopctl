@@ -455,6 +455,20 @@ semantic/keyword **retrieval** result, on one uniform shape carrying
   hub enrichment, then a full-body drill into a chosen stub. A fuzzy/paraphrased
   topic can miss a lexically-dissimilar curated article — use `hybrid_search/3`
   when you need the governed provenance decision instead.
+- **Heat index** (`Knowledge.heat_index/2`, `knowledge_heat_index`,
+  `GET /api/v1/knowledge/heat_index`) — the one retrieval route that takes NO
+  query, so its misses are uncorrelated with embedding similarity. Every other
+  route starts from a query and shares one failure mode: a paraphrase or a
+  lexically-dissimilar-but-central article comes back empty, and the agent reads
+  that as "the KB has nothing". Ranked by DISTINCT READERS (api keys) that made a
+  `get`-shaped read inside `meta.heat_window` — distinct readers, because
+  counting raw event rows let any agent pin its own article at rank 1 with a
+  `knowledge_get` loop, and this index is designed to be pasted into a cached
+  prefix, so that ranking propagated into every other agent's context (#567).
+  Window is floored to the UTC day so refreshes are byte-identical. Drill a stub
+  with `knowledge_progressive_drill`, NOT `knowledge_get` — the index lists
+  published system canonicals (NULL `tenant_id`) that `get_article/3` cannot
+  resolve.
 - **#305/#306 are the same feature** (this epic implements both) — recommend
   closing one as a duplicate of the other rather than tracking them separately.
 
