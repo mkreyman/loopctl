@@ -15,10 +15,11 @@ defmodule Loopctl.Repo.Migrations.AddArticleLinksConflictPartialIndexes do
   and `contradicts` is 0, against `relates_to`'s 98.9% — a partial index earns its keep
   exactly when its predicate is selective.
 
-  Applied out-of-band with CREATE INDEX CONCURRENTLY on prod first (the migration runner wraps
-  each migration in one transaction, and Postgres forbids CONCURRENTLY inside one), then
-  codified here in the guarded plain form: a no-op where the catalog already matches, instant
-  on a fresh/CI database.
+  Built CONCURRENTLY (`@disable_ddl_transaction`/`@disable_migration_lock`, the repo's
+  convention — 20260719120000_add_stories_assigned_agent_project_index.exs) so no environment
+  pays a write-blocking SHARE lock on 1,417,624 rows, and each CREATE is preceded by an
+  unconditional DROP: IF NOT EXISTS matches the index NAME only, so prod's out-of-band build,
+  a NULLS LAST hotfix, or an INVALID leftover from an interrupted build survives it silently.
 
   Measured on production, before -> after:
 
@@ -30,27 +31,37 @@ defmodule Loopctl.Repo.Migrations.AddArticleLinksConflictPartialIndexes do
   id` matches what the query's `order_by` emits (`desc:` renders as `DESC`, i.e. DESC NULLS
   FIRST, and PostgreSQL's index `DESC` defaults to NULLS FIRST too). Build it any other way —
   notably `NULLS LAST` — and the planner silently will not use it for the ordering, falling
-  back to a sort over the whole filtered set.
+  back to a sort over the whole filtered set. Indexing that cast also makes it a WRITE-PATH
+  invariant: an `auto_generated` `potential_conflict` row whose `metadata.similarity_score` is
+  non-numeric now fails the write with `invalid input syntax for type double precision`, and
+  nothing in `ArticleLink.changeset/2` enforces it.
   """
   use Ecto.Migration
 
+  @disable_ddl_transaction true
+  @disable_migration_lock true
+
   def up do
+    execute("DROP INDEX CONCURRENTLY IF EXISTS article_links_potential_conflict_idx")
+
     execute("""
-    CREATE INDEX IF NOT EXISTS article_links_potential_conflict_idx
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS article_links_potential_conflict_idx
       ON article_links (tenant_id, ((metadata->>'similarity_score')::float) DESC, id)
       WHERE relationship_type = 'potential_conflict'
         AND (metadata->>'auto_generated') = 'true'
     """)
 
+    execute("DROP INDEX CONCURRENTLY IF EXISTS article_links_contradicts_idx")
+
     execute("""
-    CREATE INDEX IF NOT EXISTS article_links_contradicts_idx
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS article_links_contradicts_idx
       ON article_links (tenant_id, source_article_id, target_article_id)
       WHERE relationship_type = 'contradicts'
     """)
   end
 
   def down do
-    execute("DROP INDEX IF EXISTS article_links_potential_conflict_idx")
-    execute("DROP INDEX IF EXISTS article_links_contradicts_idx")
+    execute("DROP INDEX CONCURRENTLY IF EXISTS article_links_potential_conflict_idx")
+    execute("DROP INDEX CONCURRENTLY IF EXISTS article_links_contradicts_idx")
   end
 end
