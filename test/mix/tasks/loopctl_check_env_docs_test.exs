@@ -22,10 +22,11 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocsTest do
                MapSet.new(["DATABASE_URL", "SECRET_KEY_BASE"])
     end
 
-    test "skips full-line comments (the commented-out phx.new TLS boilerplate)" do
+    test "skips comments — whole-line (phx.new TLS boilerplate) and TRAILING alike" do
       source = """
       #         keyfile: System.get_env("SOME_APP_SSL_KEY_PATH"),
         # certfile: System.get_env("SOME_APP_SSL_CERT_PATH")
+      cap = default() # override with System.get_env("EXAMPLE_KNOB")
       real = System.get_env("METRICS_PORT")
       """
 
@@ -39,6 +40,14 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocsTest do
       """
 
       assert CheckEnvDocs.scan_env_vars(source) == MapSet.new(["FTS_REGCONFIG"])
+    end
+
+    test "finds a read the formatter wrapped onto the next line" do
+      # A per-LINE match sees nothing here: the variable is read at runtime, absent from
+      # the docs, and reported as fine — #566's vacuous pass, one level down.
+      source = "base =\n  System.get_env(\n    \"METRICS_PORT\"\n  )\n"
+
+      assert CheckEnvDocs.scan_env_vars(source) == MapSet.new(["METRICS_PORT"])
     end
 
     test "ignores non-literal and lowercase reads" do
@@ -89,6 +98,14 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocsTest do
              ) == []
     end
 
+    test "a row with a blank default or description does not count as documented" do
+      # The cheapest way past a failing guard is a bare row, which teaches an operator
+      # neither the default nor what breaks — so the anchor requires both cells.
+      assert CheckEnvDocs.undocumented(["NEW_VAR"], "| `NEW_VAR` |  |  |") == ["NEW_VAR"]
+      assert CheckEnvDocs.undocumented(["NEW_VAR"], "| `NEW_VAR` | `7` |  |") == ["NEW_VAR"]
+      assert CheckEnvDocs.undocumented(["NEW_VAR"], "| `NEW_VAR` | `7` | Does a thing |") == []
+    end
+
     test "returns every missing variable, sorted" do
       vars = ["ZED_VAR", "ALPHA_VAR", "MID_VAR"]
       assert CheckEnvDocs.undocumented(vars, "nothing here") == ~w(ALPHA_VAR MID_VAR ZED_VAR)
@@ -132,11 +149,24 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocsTest do
       #
       # `OBAN_*` is the family that motivated #566: runtime.exs does evaluate it at boot,
       # but via `Loopctl.ObanConfig`, so the literal name never appears in the config file
-      # and eight variables sat outside a green guard.
+      # and the family sat outside a green guard.
       assert "OBAN_TENANT_FAIRSHARE_SNOOZE_SECONDS" in vars,
              "lib/ is no longer scanned — the #566 blind spot is back"
 
       assert "DATABASE_URL" in vars, "config/runtime.exs is no longer scanned"
+    end
+  end
+
+  describe "dynamic_read?/1" do
+    test "flags a runtime-built name, which the literal scan cannot resolve" do
+      # The residual #566 shape: an OBAN_QUEUE_ name built at runtime is an operator knob
+      # no textual scan can name, so it must FAIL the guard, not pass over in silence.
+      assert CheckEnvDocs.dynamic_read?(~S|System.get_env("OBAN_QUEUE_" <> name)|)
+      assert CheckEnvDocs.dynamic_read?(~S|System.get_env(env_var)|)
+      assert CheckEnvDocs.dynamic_read?(~S|System.get_env("#{prefix}_URL")|)
+      refute CheckEnvDocs.dynamic_read?(~S|System.get_env("FTS_REGCONFIG")|)
+      refute CheckEnvDocs.dynamic_read?("x =\n  System.get_env(\n    \"A_VAR\"\n  )\n")
+      refute CheckEnvDocs.dynamic_read?(~S|# was System.get_env(name)|)
     end
   end
 

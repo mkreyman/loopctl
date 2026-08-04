@@ -55,7 +55,7 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `SECRETS_ADAPTER`   | Fly GraphQL | Set to `local_file` to store the per-tenant audit keypairs on disk instead of in Fly secrets — REQUIRED when self-hosting off Fly (see below) |
 | `SECRETS_FILE`      | `/data/loopctl/secrets.json` | Path for the `local_file` adapter. Put it on a PERSISTENT volume |
 | `FLY_APP_NAME`      | injected by Fly | The app the DEFAULT (Fly GraphQL) secrets adapter writes tenant audit keys to. Fly Machines set this for you, so it only needs setting when running the Fly adapter off Fly — a case better served by `SECRETS_ADAPTER=local_file` |
-| `FLY_API_TOKEN`     | -       | API token the Fly secrets adapter authenticates with (`fly tokens create deploy`). **Not injected** — with it or `FLY_APP_NAME` missing the adapter refuses every write with `fly_not_configured`, and since tenant signup mints and stores a per-tenant Ed25519 audit keypair, no tenant can be created. Unset it and use `local_file` when self-hosting |
+| `FLY_API_TOKEN`     | -       | API token the Fly secrets adapter authenticates with (`fly tokens create deploy`). **Not injected** — with either it or `FLY_APP_NAME` missing, the adapter refuses every write with `fly_not_configured`, and since tenant signup mints and stores a per-tenant Ed25519 audit keypair, no tenant can be created. Unset it and use `local_file` when self-hosting |
 | `FTS_REGCONFIG`     | `english` | Postgres text-search config for keyword FTS (see below) |
 
 #### Connection pools and query budgets
@@ -66,7 +66,7 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `HEAVY_READ_POOL_SIZE`            | `8`     | `HeavyReadRepo` pool size. This pool exists so a heavy analytical/vector read cannot starve the 3-connection AdminRepo pool |
 | `HEAVY_READ_STATEMENT_TIMEOUT_MS` | `10000` | Per-statement timeout on the heavy-read pool — the backstop that keeps one pathological vector scan from pinning a connection |
 | `SLOW_QUERY_THRESHOLD_MS`         | `1000`  | Queries slower than this are logged for diagnosis |
-| `EXPECTED_APP_NODES`              | `2`     | How many app nodes the boot-time connection-budget check assumes when it multiplies the per-node pools out against Postgres `max_connections`. Advisory — it only logs, and never blocks boot — but it is the one place that notices a pool sizing that works on one node and exhausts the server on a scaled-out fleet, so **set it to the real machine count** when you scale past two. A non-integer value raises at boot |
+| `EXPECTED_APP_NODES`              | `2`     | How many app nodes the boot-time connection-budget check assumes when it multiplies the per-node pools out against Postgres `max_connections`. Advisory — it only logs, and never blocks boot — but it is the one place that notices a pool sizing that works on one node and exhausts the server on a scaled-out fleet, so **set it to the real machine count** when you scale past two. A non-integer value raises at boot; `0` or a negative parses cleanly and then DISABLES the check (it is logged as `DbCapacity boot check skipped`), so never template it from a scale-to-zero machine count |
 
 #### Rate limiting and auth-path throttle
 
@@ -78,10 +78,12 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `HAMMER_POOL_SIZE`                  | `20`    | Poolboy worker pool fronting every rate-limit check. Sized above Hammer's default of 4 so the fail-CLOSED auth throttle cannot saturate the pool under a single-IP flood |
 | `HAMMER_POOL_MAX_OVERFLOW`          | `10`    | Overflow workers for that pool |
 
-> All five accept only a **positive integer** (where numeric). An unset, blank, or
-> malformed value leaves the compiled default in place rather than crashing release
-> boot — a deliberate choice after the `STH_SWEEP_CRON` incident, so a bad
-> placeholder can never take the app down at startup.
+> The four numeric knobs in the table directly above (`AUTH_THROTTLE_MAX_REQUESTS_PER_IP`,
+> `AUTH_THROTTLE_WINDOW_MS`, `HAMMER_POOL_SIZE`, `HAMMER_POOL_MAX_OVERFLOW`) accept only a
+> **positive integer**. An unset, blank, or malformed value leaves the compiled default in
+> place rather than crashing release boot — a deliberate choice after the `STH_SWEEP_CRON`
+> incident, so a bad placeholder can never take *those* down at startup. The Oban knobs
+> below do NOT share that behaviour: each raises on a malformed value.
 
 #### Oban scheduling and fair-share yield
 
@@ -90,6 +92,8 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `STH_SWEEP_CRON`                       | `*/5 * * * *` | Cron for the all-tenants Signed-Tree-Head safety sweep. A load/latency knob only: every job it fans out self-gates on whether an STH is actually needed, so slowing it delays (never corrupts) an STH for a tenant the event path also missed, by at most one interval. Accepts anything Oban's own Cron parser accepts, `@`-nicknames included. Unlike the knobs above, a present-but-malformed value **raises at boot** rather than falling back — the fallback is what made the original incident silent |
 | `OBAN_TENANT_FAIRSHARE_SNOOZE_SECONDS` | `5`           | Base snooze, in seconds, for a job that yields its slot to a tenant with less work executing. Positive integer, else raises. Raise it to cut re-check churn on a busy queue; too high starves the yielding tenant, since a snoozed job re-competes only after it elapses |
 | `OBAN_TENANT_FAIRSHARE_SNOOZE_JITTER`  | `5`           | Span added on top as `base + rand(0..jitter)`, so a batch of jobs snoozed together does not re-check in lockstep. Non-negative integer — `0` disables jitter and is the thundering-herd shape; else raises |
+| `OBAN_QUEUE_<QUEUE>`                   | per queue     | Width (concurrency) of one Oban queue, one variable per queue — `OBAN_QUEUE_EMBEDDINGS=8` and restart, no deploy. Defaults: `DEFAULT` 9, `WEBHOOKS` 5, `EMBEDDINGS` 5, `ANALYTICS`/`KNOWLEDGE`/`MEMORY`/`AUDIT` 3, `CLEANUP`/`MAINTENANCE`/`INGESTION` 2, `VERIFICATION` 1. Positive integer, else raises at boot — a `0` would starve the queue silently |
+| `OBAN_TENANT_FAIRSHARE_<QUEUE>`        | `ceil(width/2)` | Per-tenant cap on a queue's EXECUTING slots before that tenant's next job snoozes, one variable per queue (same names as above), so one tenant cannot monopolise a contended queue. DERIVED from the current width, so retuning `OBAN_QUEUE_<QUEUE>` rescales it — set this only to loosen fairness mid-incident. Positive integer, else raises at boot; the effective value is never below 1, or the gate could wedge the queue |
 
 #### Ingestion backlog gate
 
@@ -155,7 +159,7 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 
 | Variable       | Default | Description |
 |----------------|---------|-------------|
-| `GITHUB_TOKEN` | -       | Bearer token for the CI status/test-result lookups that back independent story verification. Optional: unset, the calls go out unauthenticated, which works for PUBLIC repos until GitHub's 60-requests/hour/IP anonymous limit bites — after that verification reports a `github_api_error` rather than a real CI verdict. Required for a private repo, where unauthenticated lookups 404. Needs only read access to checks |
+| `GITHUB_TOKEN` | -       | Bearer token for the CI status/test-result lookups that back independent story verification. Optional: unset, the calls go out unauthenticated, which works for PUBLIC repos until GitHub's 60-requests/hour/IP anonymous limit bites — after that verification reports a `github_api_error` rather than a real CI verdict. Required for a private repo, where unauthenticated lookups 404. Needs only read access to checks. **Leave it UNSET rather than blank** — an empty string is truthy in Elixir, so a blanked value sends `Bearer ` with nothing after it and GitHub 401s every lookup, which is strictly worse than the anonymous path |
 
 #### Feature flags
 

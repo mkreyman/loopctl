@@ -3,14 +3,12 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
   Guards operator-facing environment variables against being shipped undocumented.
 
   An env var that exists only in our source is effectively invisible: the audience who
-  needs it (someone deploying loopctl) is exactly the audience who cannot read our
-  source tree. This failure is silent — nothing in review flags a `System.get_env/1`
-  with no matching doc line — and it accumulated to 24 undocumented variables before
-  anyone noticed, including the two self-hosting knobs (`SECRETS_ADAPTER`,
-  `FTS_REGCONFIG`) that a self-hoster could not run the app without.
-
-  Same guardrail idea as `mix loopctl.check_skill_citations` and
-  `mix loopctl.check_wiki_links`, applied to operator configuration.
+  needs it (someone deploying loopctl) is exactly the audience who cannot read our source
+  tree. This failure is silent — nothing in review flags a `System.get_env/1` with no
+  matching doc line — and it accumulated to 24 undocumented variables before anyone
+  noticed, including the two self-hosting knobs (`SECRETS_ADAPTER`, `FTS_REGCONFIG`) that
+  a self-hoster could not run the app without. Same guardrail idea as
+  `mix loopctl.check_skill_citations`, applied to operator configuration.
 
   ## What is checked
 
@@ -18,40 +16,37 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
   every file matched by `sources/0` — `config/runtime.exs` **and** `lib/**/*.ex` — must
   have a table row in `deploy/FLY_SECRETS.md`.
 
-  `lib/` is scanned because reading the config file alone left a blind spot the size of
-  the whole `OBAN_*` family (#566): `runtime.exs` does evaluate those at boot, but it
-  does so by calling `Loopctl.ObanConfig`, so the literal name never appears in the
-  scanned file. The guard reported "42 runtime env var(s) documented" and exited 0
-  while eight variables it had never looked at were undocumented.
+  `lib/` is scanned because reading the config file alone left the `OBAN_*` family
+  outside the guard (#566): `runtime.exs` does evaluate those at boot, but it does so by
+  calling `Loopctl.ObanConfig`, so the literal name never appears in the scanned file.
 
   ### Why a table ROW, and not a mention
 
-  `STH_SWEEP_CRON` passed a whole-word text match for months on the strength of one
-  prose aside — "a deliberate choice after the `STH_SWEEP_CRON` incident" — which tells
-  an operator neither its default nor what it does. Naming a variable while explaining
+  `STH_SWEEP_CRON` passed a whole-word text match for months on the strength of one prose
+  aside — "a deliberate choice after the `STH_SWEEP_CRON` incident" — which tells an
+  operator neither its default nor what it does. Naming a variable while explaining
   something else is not documenting it, so the match is anchored to the name heading a
-  markdown table row, where a default and a description are structurally adjacent.
+  markdown table row that also carries a NON-BLANK default and description cell.
 
   ### Limits of a textual scan
 
-  The scan is textual, not an AST walk. Two consequences, both accepted:
+  The scan is textual, not an AST walk, so a name BUILT at runtime
+  (`"OBAN_QUEUE_" <> queue`) cannot be resolved. Such a name is still an operator knob —
+  `OBAN_QUEUE_<QUEUE>` and `OBAN_TENANT_FAIRSHARE_<QUEUE>` are retuned mid-incident — so a
+  dynamic read is not ignored: its file must be listed in `@dynamic_read_sources` with a
+  reason, and the family documented by hand.
 
-    * a name built by interpolation is not detected — fine, because operator knobs are
-      read by literal name;
-    * a literal read written inside a `@moduledoc` is detected, because a docstring is
-      not a comment line. Name variables in prose (or as `System.get_env/1`) rather
-      than writing a fake call with a placeholder name, or the guard will demand that
-      the placeholder be documented.
-
-  Lines that are entirely a `#` comment are skipped, so the commented-out `phx.new` TLS
-  boilerplate (`SOME_APP_SSL_KEY_PATH`) is not demanded to be documented.
+  A literal read inside a `@moduledoc` IS detected (a docstring is not a comment), so name
+  variables in prose or as `System.get_env/1` rather than writing a fake call with a
+  placeholder name. Comments — whole-line and trailing alike — are stripped first, so the
+  commented-out `phx.new` TLS boilerplate is not demanded.
 
   ## Adding a variable
 
-  Give it a row in the appropriate table in `deploy/FLY_SECRETS.md` with its DEFAULT
-  and what breaks if it is wrong. If a variable is genuinely internal (never set by an
-  operator), add it to `@exempt` WITH a reason — an exemption without a rationale is
-  how the undocumented set grew in the first place.
+  Give it a row in the appropriate table in `deploy/FLY_SECRETS.md` with its DEFAULT and
+  what breaks if it is wrong. If a variable is genuinely internal (never set by an
+  operator), add it to `@exempt` WITH a reason — an exemption without a rationale is how
+  the undocumented set grew in the first place.
 
   ## Usage
 
@@ -69,11 +64,12 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
   # {wildcard, minimum vars expected from THAT wildcard}.
   #
   # The floor is per-source on purpose. One floor over the union cannot detect a broken
-  # `lib/**/*.ex` glob at all: runtime.exs alone contributes ~42 vars, so the union
-  # clears any sane threshold while the second source silently contributes nothing —
-  # which is precisely the vacuous-guard shape this task exists to prevent, reintroduced
-  # one level up. Each floor sits below its current count with room to delete a knob or
-  # two, and far above zero.
+  # `lib/**/*.ex` glob at all: runtime.exs alone clears any sane threshold while the second
+  # source silently contributes nothing — the vacuous-guard shape this task exists to
+  # prevent, one level up. Each floor sits below its current count and far above zero.
+  # Lowering one is legitimate in exactly one case: a change that deliberately MOVES reads
+  # to another scanned source (`Loopctl.Config` blesses either placement now that both are
+  # scanned) — then both floors move in that same commit. An unexplained drop is a break.
   @sources [
     {"config/runtime.exs", 20},
     {"lib/**/*.ex", 6}
@@ -82,6 +78,16 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
   # Variables deliberately NOT in the operator docs. Each needs a reason.
   # (Empty today — every scanned variable is documented.)
   @exempt %{}
+
+  # Files that read env by a name built at RUNTIME, which no textual scan can resolve. Not
+  # a free pass: a built name is still an operator knob, so each entry says where the
+  # FAMILY is documented. Any OTHER file's dynamic read FAILS the guard — #566, one down.
+  @dynamic_read_sources %{
+    "lib/loopctl/oban_config.ex" =>
+      "OBAN_QUEUE_<QUEUE> / OBAN_TENANT_FAIRSHARE_<QUEUE> — documented as families",
+    "lib/loopctl/secrets/fly_adapter.ex" =>
+      "per-tenant audit key names the app itself mints; never an operator knob"
+  }
 
   @impl Mix.Task
   def run(_args) do
@@ -120,7 +126,11 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
 
       files ->
         files
-        |> Enum.map(&(&1 |> File.read!() |> scan_env_vars()))
+        |> Enum.map(fn path ->
+          source = File.read!(path)
+          check_dynamic_reads(path, source)
+          scan_env_vars(source)
+        end)
         |> Enum.reduce(MapSet.new(), &MapSet.union/2)
     end
   end
@@ -139,42 +149,72 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
   end
 
   @doc """
-  The env var names read (outside full-line comments) in the given source text.
+  The env var names read (outside comments) in the given source text.
+
+  Matched over the WHOLE source, not line by line: `mix format` wraps a long argument onto
+  its own line, and a per-line match then sees no read at all — reporting a variable that
+  is read at runtime, and absent from the docs, as fine.
   """
   @spec scan_env_vars(binary()) :: MapSet.t(binary())
   def scan_env_vars(source) do
-    source
-    |> String.split("\n")
-    |> Enum.reject(&comment_line?/1)
-    |> Enum.flat_map(fn line ->
-      ~r/System\.(?:get_env|fetch_env!)\(\s*"([A-Z][A-Z0-9_]*)"/
-      |> Regex.scan(line, capture: :all_but_first)
-      |> List.flatten()
-    end)
+    ~r/System\.(?:get_env|fetch_env!)\(\s*"([A-Z][A-Z0-9_]*)"/
+    |> Regex.scan(strip_comments(source), capture: :all_but_first)
+    |> List.flatten()
     |> MapSet.new()
+  end
+
+  @doc """
+  Whether `source` passes `System.get_env/1` a name the scan cannot resolve — a variable,
+  a concatenation, or a literal carrying interpolation.
+  """
+  @spec dynamic_read?(binary()) :: boolean()
+  def dynamic_read?(source) do
+    # Anything that is not a complete uppercase literal argument. The `\s*` is atomic so
+    # the engine cannot backtrack into a wrapped-but-literal call; `...` is prose.
+    String.match?(
+      strip_comments(source),
+      ~r/System\.(?:get_env|fetch_env!)\((?>\s*)(?!(?:"[A-Z][A-Z0-9_]*"\s*[,)]|\.\.\.))/
+    )
+  end
+
+  defp check_dynamic_reads(path, source) do
+    if dynamic_read?(source) and not Map.has_key?(@dynamic_read_sources, path) do
+      Mix.raise(
+        "check_env_docs: #{path} reads an env var by a name built at runtime, which no " <>
+          "textual scan can resolve — so the guard would pass over it in silence (#566). " <>
+          "Document the FAMILY in #{@docs_file} (members and defaults), then add " <>
+          "#{path} to @dynamic_read_sources with that reason."
+      )
+    end
   end
 
   defp check_not_vacuous(vars, pattern, min) do
     if MapSet.size(vars) < min do
       Mix.raise(
         "check_env_docs scanned #{pattern} and found only #{MapSet.size(vars)} env " <>
-          "var(s), expected at least #{min}. That source's scan is broken — fix it " <>
-          "rather than lowering the floor, or this guard passes vacuously for #{pattern}."
+          "var(s), expected at least #{min}. Unless this change deliberately MOVED " <>
+          "reads to another scanned source (lower both floors together, in this same " <>
+          "commit), that source's scan is broken — fix it rather than lowering the " <>
+          "floor, or this guard passes vacuously for #{pattern}."
       )
     end
 
     vars
   end
 
-  defp comment_line?(line), do: String.match?(line, ~r/^\s*#/)
+  # Everything from a `#` to end of line, EXCEPT interpolation. A TRAILING comment matters
+  # as much as a whole-line one now that all of lib/ is scanned: an aside like
+  # `cap = default() # override with System.get_env("EXAMPLE")` would otherwise fail the
+  # build demanding a row for a variable nothing reads.
+  defp strip_comments(source), do: String.replace(source, ~r/\#(?!\{)[^\n]*/, "")
 
-  # The name must head a markdown table row. Anchoring to the row (rather than to any
-  # whole-word mention) is what keeps a passing mention from standing in for a default
-  # and a description — see the `STH_SWEEP_CRON` note in the moduledoc. Anchoring to a
-  # whole word within the row also keeps `POOL_SIZE` from being satisfied by an
-  # unrelated `ADMIN_POOL_SIZE` row.
+  # The name must head a markdown table row whose next two cells are non-blank: the row
+  # anchor keeps a passing mention from standing in for a default and a description (the
+  # `STH_SWEEP_CRON` note in the moduledoc), and the cells having to carry something keeps
+  # a bare `| `VAR` |  |  |` from being the cheapest way past a failing guard. Whole-word
+  # anchoring also keeps `POOL_SIZE` off an unrelated `ADMIN_POOL_SIZE` row.
   defp documented?(docs, var) do
-    String.match?(docs, ~r/^\|\s*`#{Regex.escape(var)}`/m)
+    String.match?(docs, ~r/^\|\s*`#{Regex.escape(var)}`\s*\|\s*[^|\s][^|]*\|\s*[^|\s]/m)
   end
 
   defp report([], scanned) do
