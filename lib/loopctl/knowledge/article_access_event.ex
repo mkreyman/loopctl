@@ -13,9 +13,9 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
   - `"get"` -- recorded for direct GET /articles/:id reads
   - `"context"` -- recorded for each article returned by GET /knowledge/context
   - `"index"` -- reserved (currently NOT recorded; index listings are too noisy)
-  - `"drill"` -- a TENANT-OWNED article's body read via `knowledge_progressive_drill`;
-    a body read like `"get"`, split out only so the heat ranking cannot count the reads
-    it caused itself (#569)
+  - `"drill"` -- ANY article's body read via `knowledge_progressive_drill`, tenant-owned
+    and system canonical alike (#572); a body read like `"get"`, split out only so the
+    heat ranking cannot count the reads it caused itself (#569)
 
   ## Fields
 

@@ -171,8 +171,13 @@ Operator-facing changes for deployments outside the hosted instance.
 - **A heat-projection fault no longer logs raw DB fault text, and only a demonstrable pool exit
   degrades to 429.** The log carried the backend host/port and the failing statement's bound
   parameters; the blanket exit handler reported a node shutdown or any foreign timeout as
-  "this tenant is reading too much". Server-side saturation (`53300`, `57P01`, statement
-  timeout) now fails soft as the documented 429 instead of escaping as a 500.
+  "this tenant is reading too much". Saturation now fails soft as the documented 429 — a pool
+  checkout that waited past its deadline, plus the server-side statement timeout (`57014`),
+  an exhausted backend (`53xxx`) and one going away or refusing the connection (`57P0x`,
+  `08xxx`, including the `08P01` pgbouncer rejects with). Everything else surfaces as what it
+  is: a deterministic query fault as a 500, an unreachable database as the 503
+  `db_unavailable` every other route already returns. `GET /knowledge/heat_index` documents
+  all three.
 
 - **Operator knobs that were live but undiscoverable are now documented (#566):**
   `EXPECTED_APP_NODES`, `STH_SWEEP_CRON`, the fair-share snooze pair

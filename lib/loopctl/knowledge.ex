@@ -6126,9 +6126,11 @@ defmodule Loopctl.Knowledge do
           |> Enum.join(" ")
       end
 
-    # Truncate to max bytes to prevent unbounded embedding input DoS
+    # Truncate to max BYTES to prevent unbounded embedding input DoS. Measured AND cut in the
+    # same unit (#572): `String.slice/3` counts GRAPHEMES, so a CJK idea that tripped the
+    # 4 MiB byte guard was cut to 4M graphemes — up to ~12 MB, straight through the bound.
     if byte_size(text) > @max_idea_text_bytes do
-      String.slice(text, 0, @max_idea_text_bytes)
+      take_bytes(text, @max_idea_text_bytes)
     else
       text
     end
@@ -8987,9 +8989,20 @@ defmodule Loopctl.Knowledge do
   # The SQLSTATEs on which a server-side fault IS the saturation this route degrades to a 429
   # for. Everything else a `Postgrex.Error` can carry is a deterministic query fault and must
   # surface as a 500 instead of being retried forever behind an overload label.
+  #
+  # The three classes, enumerated in full rather than described — a list that is narrower than
+  # the prose above it is how the next reader gets this wrong: the statement timeout (57014),
+  # an exhausted backend (ALL of 53xxx), and a backend going away or refusing the connection
+  # (57P01/57P02/57P03 and ALL of 08xxx — pgbouncer rejects with 08P01, which the earlier
+  # three-code 08 list dropped into the 500 this rescue exists to prevent).
   @heat_saturation_sqlstates ~w(
-    query_canceled too_many_connections out_of_memory admin_shutdown crash_shutdown
-    cannot_connect_now connection_exception connection_failure connection_does_not_exist
+    query_canceled
+    insufficient_resources disk_full out_of_memory too_many_connections
+    configuration_limit_exceeded
+    admin_shutdown crash_shutdown cannot_connect_now
+    connection_exception sqlclient_unable_to_establish_sqlconnection
+    connection_does_not_exist sqlserver_rejected_establishment_of_sqlconnection
+    connection_failure transaction_resolution_unknown protocol_violation
   )a
 
   @doc """
@@ -9368,53 +9381,76 @@ defmodule Loopctl.Knowledge do
     AdminRepo.all(query, timeout: @heat_stub_timeout_ms)
   rescue
     e in [DBConnection.ConnectionError, Postgrex.Error] ->
-      # `Exception.message/1` on either of these carries the fault VERBATIM — a
-      # ConnectionError names the backend host and port, a Postgrex.Error carries the failing
-      # statement and its bound parameters. #562 sanitised exactly this one module over
-      # (`HeavyRead.probe_failure_tag/1`); the heat path was written after and did not inherit
-      # it. Only `tenant_id`, the exception MODULE and the SQLSTATE are interpolated — the
-      # code is a closed Postgrex vocabulary and names nothing about the statement.
-      #
-      # `Postgrex.Error` is rescued alongside because the same saturation arrives from the
-      # SERVER as often as from the pool — and an unrescued one escaped `heat_index/2`'s
-      # `{:ok, _}` contract as a 500 on a per-turn endpoint whose declared degradation is 429.
-      # But only a SATURATION SQLSTATE degrades: the class covers every failed statement, so
-      # rescuing it wholesale dressed a permanent, deterministic fault (a column a not-yet-run
-      # migration adds, any query bug) as transient load shedding — the caller retries it
-      # forever and the operator sees ordinary gate shedding. Same conservatism
-      # `heat_projection_exit/2` applies on the exit side; anything unplaceable is re-raised
-      # to surface as the 500 it is.
-      #
-      # `:raise`, not `exit:` — `ExitClass`'s kind prefix exists because a dead pool and a
-      # fault raised out of a live one are different investigations, and both arms of this
-      # guard reporting `exit:` collapsed exactly that distinction. The tag is bounded by the
-      # rescue's own two-module clause list.
-      if heat_saturation?(e) do
-        Logger.warning(
-          "heat_stub_projection: admin_pool_read_failed tenant_id=#{tenant_id} " <>
-            "error_class=raise:#{ExitTag.tag(e)} sqlstate=#{heat_sqlstate(e)}"
-        )
-
-        reraise Loopctl.HeavyRead.OverloadedError, [tenant_id: tenant_id], __STACKTRACE__
-      else
-        reraise e, __STACKTRACE__
-      end
+      heat_projection_raise(tenant_id, e, __STACKTRACE__)
   catch
     :exit, reason -> heat_projection_exit(tenant_id, reason)
   end
 
-  # A pool-side failure is saturation by construction. A SERVER-side one is only saturation on
-  # a closed set of SQLSTATEs: the statement timeout above (57014), a full backend (53300,
-  # 53200) and a backend going away (57P01/57P02/57P03, 08xxx). A `Postgrex.Error` carrying no
-  # SQLSTATE at all is a client-side encode/decode fault — a code bug, never load.
-  defp heat_saturation?(%DBConnection.ConnectionError{}), do: true
+  @doc false
+  # `Exception.message/1` on either rescued module carries the fault VERBATIM — a
+  # ConnectionError names the backend host and port, a Postgrex.Error carries the failing
+  # statement and its bound parameters. #562 sanitised exactly this one module over
+  # (`HeavyRead.probe_failure_tag/1`); the heat path was written after and did not inherit it.
+  # Only `tenant_id`, the exception MODULE and the SQLSTATE are interpolated — the code is a
+  # closed Postgrex vocabulary and names nothing about the statement.
+  #
+  # `Postgrex.Error` is rescued alongside because the same saturation arrives from the SERVER
+  # as often as from the pool — and an unrescued one escaped `heat_index/2`'s `{:ok, _}`
+  # contract as a 500 on a per-turn endpoint whose declared degradation is 429. But only a
+  # SATURATION fault degrades: both classes also carry permanent, deterministic faults (a
+  # column a not-yet-run migration adds; a rotated credential), so rescuing them wholesale
+  # dressed those as transient load shedding — the caller retries forever and the operator
+  # sees ordinary gate shedding. Same conservatism `heat_projection_exit/2` applies on the
+  # exit side; anything unplaceable is re-raised to surface as the 500/503 it is.
+  #
+  # It LOGS BEFORE it branches, like the exit side: the fault that must NOT wear the overload
+  # label is exactly the one whose class has to reach the log rather than be re-raised in
+  # silence, leaving nothing to say the admin-pool projection — not the aggregate — failed.
+  #
+  # `:raise`, not `exit:` — `ExitClass`'s kind prefix exists because a dead pool and a fault
+  # raised out of a live one are different investigations, and both arms of this guard
+  # reporting `exit:` collapsed exactly that distinction. The tag is bounded by the rescue's
+  # own two-module clause list.
+  #
+  # Public (`@doc false`) purely as a test seam, for the reason `heat_projection_exit/2` is:
+  # a real query cannot be made to raise a chosen SQLSTATE, so left inline BOTH arms would be
+  # guards nothing ever exercises.
+  @spec heat_projection_raise(Ecto.UUID.t(), Exception.t(), Exception.stacktrace()) :: no_return()
+  def heat_projection_raise(tenant_id, e, stacktrace) do
+    Logger.warning(
+      "heat_stub_projection: admin_pool_read_failed tenant_id=#{tenant_id} " <>
+        "error_class=raise:#{ExitTag.tag(e)} sqlstate=#{heat_sqlstate(e)}"
+    )
+
+    if heat_saturation?(e) do
+      reraise Loopctl.HeavyRead.OverloadedError, [tenant_id: tenant_id], stacktrace
+    else
+      reraise e, stacktrace
+    end
+  end
+
+  # A pool-side failure is saturation only when the pool actually SHED the checkout —
+  # `:queue_timeout`, a request that waited past the queue deadline. `reason: :error` is every
+  # OTHER connection fault (econnrefused, a credential rotated mid-deploy, a TLS failure), and
+  # those are outages, not this tenant reading too much; re-raised, the backstop renders them
+  # as the 503 `db_unavailable` every other DB path in the app returns for a ConnectionError.
+  #
+  # A SERVER-side fault is only saturation on `@heat_saturation_sqlstates`. A `Postgrex.Error`
+  # carrying no SQLSTATE at all is a client-side encode/decode fault — a code bug, never load.
+  defp heat_saturation?(%DBConnection.ConnectionError{reason: :queue_timeout}), do: true
 
   defp heat_saturation?(%Postgrex.Error{postgres: %{code: code}}),
     do: code in @heat_saturation_sqlstates
 
   defp heat_saturation?(_e), do: false
 
-  defp heat_sqlstate(%Postgrex.Error{postgres: %{code: code}}), do: to_string(code)
+  # The NUMERIC SQLSTATE (`"53300"`), which is what `LoopctlWeb.DBError.sqlstate/1` reads and
+  # `LoopctlWeb.DBErrorLogger` emits under this key on every other DB path. `postgres.code` is
+  # Postgrex's atom NAME, so logging that would put two value spaces under one field and miss
+  # every operator alert keyed on the number.
+  defp heat_sqlstate(%Postgrex.Error{postgres: %{pg_code: pg_code}}) when is_binary(pg_code),
+    do: pg_code
+
   defp heat_sqlstate(_e), do: "none"
 
   @doc false

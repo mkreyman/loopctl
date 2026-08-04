@@ -735,6 +735,46 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       refute log =~ "SELECT secret", "the failing statement must never reach the log"
     end
 
+    test "#572: only a SATURATION fault degrades to an overload, and it logs the numeric code" do
+      # The exit arm got a seam and two tests; the raise arm shipped with neither. Both rescued
+      # classes carry permanent faults as well as load — a rotated credential is not "you are
+      # reading too much", and neither is a column a not-yet-run migration adds. 08P01 is what
+      # pgbouncer rejects with, and the earlier three-code 08 list dropped it into a 500.
+      tenant = fixture(:tenant)
+      pg = &Postgrex.Error.exception(postgres: %{code: &1, severity: "ERROR", message: "x"})
+
+      shed = [
+        %DBConnection.ConnectionError{message: "checkout", reason: :queue_timeout},
+        pg.("53300"),
+        pg.("08P01")
+      ]
+
+      permanent = [
+        %DBConnection.ConnectionError{message: "econnrefused", reason: :error},
+        pg.("42703")
+      ]
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          for e <- shed do
+            assert_raise Loopctl.HeavyRead.OverloadedError, fn ->
+              Knowledge.heat_projection_raise(tenant.id, e, [])
+            end
+          end
+
+          for e <- permanent do
+            assert_raise e.__struct__, fn -> Knowledge.heat_projection_raise(tenant.id, e, []) end
+          end
+        end)
+
+      # BOTH arms log, under the SQLSTATE spelling every other DB line uses — `postgres.code`
+      # is Postgrex's atom NAME, which no operator alert is keyed on.
+      assert log =~ "error_class=raise:Postgrex.Error"
+      assert log =~ "sqlstate=53300"
+      assert log =~ "sqlstate=42703"
+      refute log =~ "sqlstate=too_many_connections"
+    end
+
     test "truncated says the list is partial, since nothing else in the payload would" do
       tenant = fixture(:tenant)
 

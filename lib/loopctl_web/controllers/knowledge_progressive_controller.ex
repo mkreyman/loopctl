@@ -178,7 +178,16 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
          }},
       400 => {"Invalid parameter", "application/json", Schemas.ErrorResponse},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 =>
+        {"Rate limit exceeded, or the read was SHED — a heavy-read slot or an admin-pool " <>
+           "checkout was unavailable. Retryable; only saturation degrades this way.",
+         "application/json", Schemas.RateLimitError},
+      500 =>
+        {"A deterministic database fault (not saturation) — retrying will not clear it",
+         "application/json", Schemas.ErrorResponse},
+      503 =>
+        {"The database is unreachable (connection refused/rejected)", "application/json",
+         Schemas.ErrorResponse}
     }
   )
 
