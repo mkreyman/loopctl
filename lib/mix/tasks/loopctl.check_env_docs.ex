@@ -31,15 +31,15 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
   ### Limits of a textual scan
 
   The scan is textual, not an AST walk, so a name BUILT at runtime
-  (`"OBAN_QUEUE_" <> queue`) cannot be resolved. Such a name is still an operator knob —
-  `OBAN_QUEUE_<QUEUE>` and `OBAN_TENANT_FAIRSHARE_<QUEUE>` are retuned mid-incident — so a
-  dynamic read is not ignored: its file must be listed in `@dynamic_read_sources` with a
-  reason, and the family documented by hand.
+  (`"OBAN_QUEUE_" <> queue`), or read through a captured getter, cannot be resolved. Such a
+  name is still an operator knob, so a dynamic read is not ignored: its file must be listed
+  in `@dynamic_read_sources` NAMING the knobs it reads, and those names go through the same
+  doc check as a literal — a whitelist carrying only a prose promise is #566 again.
 
   A literal read inside a `@moduledoc` IS detected (a docstring is not a comment), so name
-  variables in prose or as `System.get_env/1` rather than writing a fake call with a
-  placeholder name. Comments — whole-line and trailing alike — are stripped first, so the
-  commented-out `phx.new` TLS boilerplate is not demanded.
+  variables in prose as `System.get_env/1`, not as a fake call; the DYNAMIC check skips
+  heredocs. Comments are stripped first — whole-line and trailing alike — but a `#` inside
+  a string literal is NOT one, or the rest of that line would go unscanned.
 
   ## Adding a variable
 
@@ -79,14 +79,18 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
   # (Empty today — every scanned variable is documented.)
   @exempt %{}
 
-  # Files that read env by a name built at RUNTIME, which no textual scan can resolve. Not
-  # a free pass: a built name is still an operator knob, so each entry says where the
-  # FAMILY is documented. Any OTHER file's dynamic read FAILS the guard — #566, one down.
+  # Files that read env by a name built at RUNTIME (or through a captured getter), which no
+  # textual scan can resolve. `{names, reason}` — each entry NAMES the knobs it reads and
+  # those go through `documented?/2` like any literal, since a whitelist whose only content
+  # is a prose claim is the unenforced promise #566 was. Any OTHER file's read FAILS.
   @dynamic_read_sources %{
     "lib/loopctl/oban_config.ex" =>
-      "OBAN_QUEUE_<QUEUE> / OBAN_TENANT_FAIRSHARE_<QUEUE> — documented as families",
+      {["OBAN_QUEUE_<QUEUE>", "OBAN_TENANT_FAIRSHARE_<QUEUE>"], "per-queue families"},
+    "lib/loopctl/cli/config.ex" =>
+      {["LOOPCTL_SERVER", "LOOPCTL_API_KEY", "LOOPCTL_FORMAT"],
+       "names live in @env_overrides, read through an injected getter capture"},
     "lib/loopctl/secrets/fly_adapter.ex" =>
-      "per-tenant audit key names the app itself mints; never an operator knob"
+      {[], "per-tenant audit key names the app itself mints; never an operator knob"}
   }
 
   @impl Mix.Task
@@ -95,11 +99,19 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
       Mix.raise("check_env_docs: #{@docs_file} not found. Run from the repo root.")
 
     vars =
-      Enum.reduce(@sources, MapSet.new(), fn {pattern, min}, acc ->
+      Enum.reduce(@sources, dynamic_families(), fn {pattern, min}, acc ->
         pattern |> scan_paths() |> check_not_vacuous(pattern, min) |> MapSet.union(acc)
       end)
 
     report(undocumented(vars, File.read!(@docs_file)), MapSet.size(vars))
+  end
+
+  @doc "Declared dynamic-read names, doc-checked like literals so deleting their row fails."
+  @spec dynamic_families() :: MapSet.t(binary())
+  def dynamic_families do
+    @dynamic_read_sources
+    |> Enum.flat_map(fn {_path, {names, _reason}} -> names end)
+    |> MapSet.new()
   end
 
   @doc """
@@ -164,28 +176,40 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
   end
 
   @doc """
-  Whether `source` passes `System.get_env/1` a name the scan cannot resolve — a variable,
-  a concatenation, or a literal carrying interpolation.
+  Whether `source` reads env by a name the scan cannot resolve — a variable, a
+  concatenation, an interpolated literal, or a captured getter argued elsewhere. Heredocs
+  are stripped: prose DESCRIBING a call is not one. A literal of ANY case resolves, matching
+  `scan_env_vars/1` — the two must agree or the build names a cause that is untrue.
   """
   @spec dynamic_read?(binary()) :: boolean()
   def dynamic_read?(source) do
-    # Anything that is not a complete uppercase literal argument. The `\s*` is atomic so
-    # the engine cannot backtrack into a wrapped-but-literal call; `...` is prose.
+    # `\s*` is atomic so the engine cannot backtrack into a wrapped-but-literal call.
+    # A bare `)` is the zero-arity whole-environment read, which names no knob.
+    stripped = source |> strip_comments() |> String.replace(~r/"""[\s\S]*?"""/, "")
+
     String.match?(
-      strip_comments(source),
-      ~r/System\.(?:get_env|fetch_env!)\((?>\s*)(?!(?:"[A-Z][A-Z0-9_]*"\s*[,)]|\.\.\.))/
-    )
+      stripped,
+      ~r/System\.(?:get_env|fetch_env!)\((?>\s*)(?!(?:"[A-Za-z][A-Za-z0-9_]*"\s*[,)]|\)))/
+    ) or String.match?(stripped, ~r{&System\.(?:get_env|fetch_env!)/1})
   end
 
-  defp check_dynamic_reads(path, source) do
+  @doc """
+  Raises unless a file with a dynamic read is declared in `@dynamic_read_sources`. Public
+  so the RAISE is exercised: every real file with one is declared, so a guard driven through
+  `scan_paths/1` alone is never observed failing.
+  """
+  @spec check_dynamic_reads(binary(), binary()) :: :ok
+  def check_dynamic_reads(path, source) do
     if dynamic_read?(source) and not Map.has_key?(@dynamic_read_sources, path) do
       Mix.raise(
         "check_env_docs: #{path} reads an env var by a name built at runtime, which no " <>
           "textual scan can resolve — so the guard would pass over it in silence (#566). " <>
-          "Document the FAMILY in #{@docs_file} (members and defaults), then add " <>
-          "#{path} to @dynamic_read_sources with that reason."
+          "Document the name(s) in #{@docs_file} (defaults and effect), then add " <>
+          "#{path} to @dynamic_read_sources naming them."
       )
     end
+
+    :ok
   end
 
   defp check_not_vacuous(vars, pattern, min) do
@@ -202,19 +226,43 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
     vars
   end
 
-  # Everything from a `#` to end of line, EXCEPT interpolation. A TRAILING comment matters
-  # as much as a whole-line one now that all of lib/ is scanned: an aside like
-  # `cap = default() # override with System.get_env("EXAMPLE")` would otherwise fail the
-  # build demanding a row for a variable nothing reads.
-  defp strip_comments(source), do: String.replace(source, ~r/\#(?!\{)[^\n]*/, "")
+  # Everything from a comment `#` to end of line, TRAILING as well as whole-line. A blanket
+  # `#`-to-EOL replace cuts a line short at a `#` inside a literal (`"https://x/#/app"`)
+  # and hides any read AFTER it — a silent miss, the shape this task exists to prevent. So
+  # a `#` is a comment only OUTSIDE a string and at a token boundary (sparing `~r/…#…/`).
+  defp strip_comments(source) do
+    source
+    |> String.split("\n")
+    |> Enum.map_join("\n", fn line ->
+      if String.contains?(line, "#"), do: strip_line(line, false, ""), else: line
+    end)
+  end
+
+  defp strip_line(<<>>, _in_string, acc), do: acc
+
+  defp strip_line(<<"\\", c::utf8, rest::binary>>, true, acc),
+    do: strip_line(rest, true, <<acc::binary, "\\", c::utf8>>)
+
+  defp strip_line(<<"\"", rest::binary>>, in_str, acc),
+    do: strip_line(rest, not in_str, <<acc::binary, "\"">>)
+
+  defp strip_line(<<"#", rest::binary>>, false, acc) do
+    if acc == "" or String.last(acc) in [" ", "\t"],
+      do: acc,
+      else: strip_line(rest, false, <<acc::binary, "#">>)
+  end
+
+  defp strip_line(<<c::utf8, rest::binary>>, in_string, acc),
+    do: strip_line(rest, in_string, <<acc::binary, c::utf8>>)
 
   # The name must head a markdown table row whose next two cells are non-blank: the row
   # anchor keeps a passing mention from standing in for a default and a description (the
   # `STH_SWEEP_CRON` note in the moduledoc), and the cells having to carry something keeps
   # a bare `| `VAR` |  |  |` from being the cheapest way past a failing guard. Whole-word
-  # anchoring also keeps `POOL_SIZE` off an unrelated `ADMIN_POOL_SIZE` row.
+  # anchoring also keeps `POOL_SIZE` off an unrelated `ADMIN_POOL_SIZE` row. Cells exclude
+  # `\n`: `[^|]` crosses rows, letting a row with no description borrow the next row's.
   defp documented?(docs, var) do
-    String.match?(docs, ~r/^\|\s*`#{Regex.escape(var)}`\s*\|\s*[^|\s][^|]*\|\s*[^|\s]/m)
+    String.match?(docs, ~r/^\|\s*`#{Regex.escape(var)}`\s*\|\s*[^|\s][^|\n]*\|\s*[^|\s]/m)
   end
 
   defp report([], scanned) do

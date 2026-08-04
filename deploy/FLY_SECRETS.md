@@ -66,7 +66,7 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `HEAVY_READ_POOL_SIZE`            | `8`     | `HeavyReadRepo` pool size. This pool exists so a heavy analytical/vector read cannot starve the 3-connection AdminRepo pool |
 | `HEAVY_READ_STATEMENT_TIMEOUT_MS` | `10000` | Per-statement timeout on the heavy-read pool — the backstop that keeps one pathological vector scan from pinning a connection |
 | `SLOW_QUERY_THRESHOLD_MS`         | `1000`  | Queries slower than this are logged for diagnosis |
-| `EXPECTED_APP_NODES`              | `2`     | How many app nodes the boot-time connection-budget check assumes when it multiplies the per-node pools out against Postgres `max_connections`. Advisory — it only logs, and never blocks boot — but it is the one place that notices a pool sizing that works on one node and exhausts the server on a scaled-out fleet, so **set it to the real machine count** when you scale past two. A non-integer value raises at boot; `0` or a negative parses cleanly and then DISABLES the check (it is logged as `DbCapacity boot check skipped`), so never template it from a scale-to-zero machine count |
+| `EXPECTED_APP_NODES`              | `2`     | How many app nodes the boot-time connection-budget check assumes when it multiplies the per-node pools out against Postgres `max_connections`. Advisory — it only logs, and never blocks boot — but it is the one place that notices a pool sizing that works on one node and exhausts the server on a scaled-out fleet, so **set it to the real machine count** when you scale past two. Must be a POSITIVE integer: a non-integer raises at boot, and `0` or a negative degrades to a skipped check on the primary but crashes boot on the replica half (`warn_if_replica_over_budget/1` has no fallback) whenever a distinct `REPLICA_DATABASE_URL` is set — so never template it from a scale-to-zero machine count |
 
 #### Rate limiting and auth-path throttle
 
@@ -160,6 +160,18 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 | Variable       | Default | Description |
 |----------------|---------|-------------|
 | `GITHUB_TOKEN` | -       | Bearer token for the CI status/test-result lookups that back independent story verification. Optional: unset, the calls go out unauthenticated, which works for PUBLIC repos until GitHub's 60-requests/hour/IP anonymous limit bites — after that verification reports a `github_api_error` rather than a real CI verdict. Required for a private repo, where unauthenticated lookups 404. Needs only read access to checks. **Leave it UNSET rather than blank** — an empty string is truthy in Elixir, so a blanked value sends `Bearer ` with nothing after it and GitHub 401s every lookup, which is strictly worse than the anonymous path |
+
+#### CLI client (`loopctl` command, not the server)
+
+Read by `Loopctl.CLI.Config` through an injected `&System.get_env/1`, so each overrides the
+matching key in `~/.loopctl/config.json` for that shell only. A blank value is ignored (the
+file value stands) rather than blanking the setting.
+
+| Variable          | Default | Description |
+|-------------------|---------|-------------|
+| `LOOPCTL_SERVER`  | config file, else the CLI's built-in default | Base URL the CLI talks to — point it at a self-hosted deployment |
+| `LOOPCTL_API_KEY` | config file value | API key the CLI authenticates with. Prefer this over `loopctl config set api_key` in CI, so the key never lands on disk |
+| `LOOPCTL_FORMAT`  | `json`  | Default output format: `json`, `human`, or `csv` |
 
 #### Feature flags
 

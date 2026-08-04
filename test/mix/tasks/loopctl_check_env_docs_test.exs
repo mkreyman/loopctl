@@ -31,6 +31,11 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocsTest do
       """
 
       assert CheckEnvDocs.scan_env_vars(source) == MapSet.new(["METRICS_PORT"])
+
+      # A `#` inside a STRING is not a comment: cutting the line there hides the read after
+      # it — the silent pass this task exists to prevent, from the stripper itself.
+      assert CheckEnvDocs.scan_env_vars(~S|u = "https://x/#/a"; System.get_env("A_VAR")|) ==
+               MapSet.new(["A_VAR"])
     end
 
     test "tolerates whitespace inside the call and dedupes repeats" do
@@ -104,6 +109,11 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocsTest do
       assert CheckEnvDocs.undocumented(["NEW_VAR"], "| `NEW_VAR` |  |  |") == ["NEW_VAR"]
       assert CheckEnvDocs.undocumented(["NEW_VAR"], "| `NEW_VAR` | `7` |  |") == ["NEW_VAR"]
       assert CheckEnvDocs.undocumented(["NEW_VAR"], "| `NEW_VAR` | `7` | Does a thing |") == []
+
+      # Same hole in a second shape: a cell pattern matching newlines runs past the end of
+      # the row and takes "has a description" from whatever row FOLLOWS.
+      borrowed = "| `NEW_VAR` | 7\n| `OTHER_VAR` | 1 | Does a thing |"
+      assert CheckEnvDocs.undocumented(["NEW_VAR"], borrowed) == ["NEW_VAR"]
     end
 
     test "returns every missing variable, sorted" do
@@ -119,21 +129,24 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocsTest do
 
   describe "the live repo" do
     setup do
-      %{
-        vars:
-          Enum.reduce(CheckEnvDocs.sources(), MapSet.new(), fn {pattern, min}, acc ->
-            found = CheckEnvDocs.scan_paths(pattern)
+      # Seeded with the declared dynamic-read names: no scan can find them, so without this
+      # the whitelist's claim that they are documented is #566's unenforced promise again.
+      vars =
+        Enum.reduce(CheckEnvDocs.sources(), CheckEnvDocs.dynamic_families(), fn {pattern, min},
+                                                                                acc ->
+          found = CheckEnvDocs.scan_paths(pattern)
 
-            # Per-source non-vacuity, asserted per source for the same reason the task
-            # enforces it per source: over the UNION, runtime.exs's ~42 vars would clear
-            # any sane floor on their own, so a `lib/**/*.ex` glob that silently matched
-            # nothing would still look healthy.
-            assert MapSet.size(found) >= min,
-                   "scan of #{pattern} found only #{MapSet.size(found)} vars — it is broken"
+          # Per-source non-vacuity, asserted per source for the same reason the task
+          # enforces it per source: over the UNION, runtime.exs's ~42 vars would clear
+          # any sane floor on their own, so a `lib/**/*.ex` glob that silently matched
+          # nothing would still look healthy.
+          assert MapSet.size(found) >= min,
+                 "scan of #{pattern} found only #{MapSet.size(found)} vars — it is broken"
 
-            MapSet.union(acc, found)
-          end)
-      }
+          MapSet.union(acc, found)
+        end)
+
+      %{vars: vars}
     end
 
     test "every scanned env var is documented", %{vars: vars} do
@@ -157,16 +170,39 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocsTest do
     end
   end
 
-  describe "dynamic_read?/1" do
+  describe "dynamic_read?/1 and check_dynamic_reads/2" do
     test "flags a runtime-built name, which the literal scan cannot resolve" do
       # The residual #566 shape: an OBAN_QUEUE_ name built at runtime is an operator knob
       # no textual scan can name, so it must FAIL the guard, not pass over in silence.
       assert CheckEnvDocs.dynamic_read?(~S|System.get_env("OBAN_QUEUE_" <> name)|)
       assert CheckEnvDocs.dynamic_read?(~S|System.get_env(env_var)|)
       assert CheckEnvDocs.dynamic_read?(~S|System.get_env("#{prefix}_URL")|)
+      assert CheckEnvDocs.dynamic_read?(~S|def read(get \\ &System.get_env/1), do: get.(v)|)
       refute CheckEnvDocs.dynamic_read?(~S|System.get_env("FTS_REGCONFIG")|)
       refute CheckEnvDocs.dynamic_read?("x =\n  System.get_env(\n    \"A_VAR\"\n  )\n")
+      refute CheckEnvDocs.dynamic_read?(~S|u = "https://x/#/a"; System.get_env("A_VAR")|)
       refute CheckEnvDocs.dynamic_read?(~S|# was System.get_env(name)|)
+
+      # Each of these failed the build naming a cause that is not true: a lowercase literal
+      # (which `scan_env_vars/1` ignores — the two must agree about one input), the
+      # zero-arity whole-environment read, and PROSE describing a call rather than making
+      # one, which turned a docs-only change red.
+      refute CheckEnvDocs.dynamic_read?(~S|System.get_env("https_proxy")|)
+      refute CheckEnvDocs.dynamic_read?(~S|all = System.get_env()|)
+      refute CheckEnvDocs.dynamic_read?(~s|@doc """\nReads System.get_env(env_var).\n"""|)
+    end
+
+    test "check_dynamic_reads/2 raises for an undeclared file, passes for a declared one" do
+      # The enforcement half: every file that reads dynamically today is already declared,
+      # so driving it through the real tree alone never observes it failing.
+      assert_raise Mix.Error, ~r/built at runtime/, fn ->
+        CheckEnvDocs.check_dynamic_reads("lib/loopctl/new_thing.ex", "System.get_env(name)")
+      end
+
+      assert CheckEnvDocs.check_dynamic_reads(
+               "lib/loopctl/oban_config.ex",
+               ~S|System.get_env("OBAN_QUEUE_" <> queue)|
+             ) == :ok
     end
   end
 
