@@ -9139,11 +9139,16 @@ defmodule Loopctl.Knowledge do
   # SURVIVE the ranking instead of which COMPETE for it, so a category-filtered call would
   # rank the whole corpus, take `top_k + 1`, and keep only the few that happen to match.
   #
-  # SCOPE OF THAT MEASUREMENT: it was taken BEFORE the `api_keys` left join below, so it
-  # proves the id-set subquery is not a corpus scan and nothing about the join's cost. The
-  # join is a per-event probe on `api_keys.id` (the primary key, no fan-out) and the read is
-  # statement-timed, so no index was added for it — but that is REASONING, not the plan above.
-  # Re-measure the joined shape before treating "no supporting index" as still proven.
+  # The JOINED shape was then measured too, on the same production tenant: 11.9 ms, against
+  # 11.3 ms without the join. The events/articles side plans identically (Nested Loop +
+  # Memoized `articles_pkey`); the join is a Hash Left Join whose hash is the tenant's ENTIRE
+  # key set — 10 rows, 0.02 ms to build — because `api_keys` is per-tenant tiny, and the
+  # `count(DISTINCT ...)` turns the HashAggregate into a Sort + GroupAggregate over the 2,001
+  # matched rows (220 kB quicksort). Still no supporting index needed, now as a plan rather
+  # than an argument. Note the mechanism, since the obvious guess is wrong: this is NOT a
+  # per-event primary-key probe on `api_keys`, so its cost tracks the tenant's KEY COUNT, not
+  # its event count. A tenant that accumulates keys without bound is the shape that would
+  # change this plan — re-measure there, not on event volume.
   #
   # A READER is `coalesce(k.agent_id, e.api_key_id)`, not the key row (#567 round 2). v2 mints
   # a fresh ephemeral key per dispatch, so distinct api_key_id counted DISPATCHES: an agent
