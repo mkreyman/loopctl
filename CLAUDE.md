@@ -325,9 +325,10 @@ re-checked.
 The inverse rule, and the one that actually bit us. Two things are easy to ship
 and impossible for a user to discover — both are required in the SAME PR:
 
-1. **A new environment variable** → document it in `deploy/FLY_SECRETS.md` with
-   its DEFAULT and what breaks if it is wrong. `mix loopctl.check_env_docs`
-   (in `mix precommit`) fails the build otherwise.
+1. **A new environment variable** → give it a table ROW in `deploy/FLY_SECRETS.md`
+   with its DEFAULT and what breaks if it is wrong. `mix loopctl.check_env_docs`
+   (in `mix precommit`) fails the build otherwise — it scans `config/runtime.exs`
+   AND `lib/**/*.ex`, and a passing mention in prose does not satisfy it (#566).
 2. **A new/changed API constraint** — a size cap, a new 4xx, changed field
    semantics, what is or is not encrypted at rest → the endpoint's `operation/2`
    OpenAPI spec, not just the controller guard. When a limit is both enforced and

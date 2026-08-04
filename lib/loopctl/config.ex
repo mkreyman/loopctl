@@ -14,8 +14,10 @@ defmodule Loopctl.Config do
   Parses an opt-OUT boolean env VALUE: `true` unless the value is `false` or `0`
   (surrounding whitespace trimmed, case-insensitive). `nil` (unset) is `true`.
 
-  Takes the VALUE, not the variable NAME: `mix loopctl.check_env_docs` scans `runtime.exs`
-  textually for `System.get_env("NAME")`, so the read must stay there to stay guarded.
+  Takes the VALUE, not the variable name — the caller keeps the `System.get_env/1` read.
+  That used to be load-bearing (`mix loopctl.check_env_docs` scanned only `runtime.exs`,
+  so a read moved in here fell out of the guard); since #566 the guard scans `lib/` too,
+  and either placement stays guarded.
 
   Deliberately ASYMMETRIC with the `in ~w(true 1)` opt-IN vars in `runtime.exs`. It is
   for switches whose safe failure mode is ON (`SCALE_ALERTS_ENABLED`, #376): an unset,
