@@ -42,14 +42,28 @@ defmodule Loopctl.Verification.GitHubActions do
   end
 
   defp github_headers do
-    token = System.get_env("GITHUB_TOKEN")
+    auth_headers(System.get_env("GITHUB_TOKEN")) ++
+      [{"accept", "application/vnd.github+json"}, {"user-agent", "loopctl-verification"}]
+  end
 
-    headers = [{"accept", "application/vnd.github+json"}, {"user-agent", "loopctl-verification"}]
+  @doc """
+  The `Authorization` header for `token`, or none when there is no usable token.
 
-    if token do
-      [{"authorization", "Bearer #{token}"} | headers]
-    else
-      headers
+  Takes the VALUE so the rule is unit-testable. A BLANK value is not a token, and used to
+  be treated as one: `if token do` is truthy for `""`, so a variable set-but-empty (the
+  shape a templated deploy config produces) sent `Authorization: Bearer ` and GitHub 401'd
+  every lookup. Verification then reported `github_api_error` instead of a CI verdict —
+  strictly WORSE than sending nothing, which at least works for a public repo.
+  """
+  @spec auth_headers(String.t() | nil) :: [{String.t(), String.t()}]
+  def auth_headers(token)
+
+  def auth_headers(nil), do: []
+
+  def auth_headers(token) when is_binary(token) do
+    case String.trim(token) do
+      "" -> []
+      trimmed -> [{"authorization", "Bearer #{trimmed}"}]
     end
   end
 

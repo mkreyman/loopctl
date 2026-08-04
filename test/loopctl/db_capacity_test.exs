@@ -210,4 +210,40 @@ defmodule Loopctl.DbCapacityTest do
       assert :ok = DbCapacity.budget_status(100, nodes, primary_only)
     end
   end
+
+  describe "parse_expected_app_nodes/1" do
+    import ExUnit.CaptureLog
+
+    test "a usable positive integer is taken verbatim" do
+      assert DbCapacity.parse_expected_app_nodes("6") == 6
+      assert DbCapacity.parse_expected_app_nodes(" 6\n") == 6
+    end
+
+    test "unset falls back to the compiled default" do
+      assert DbCapacity.parse_expected_app_nodes(nil) == 2
+    end
+
+    test "an unusable value degrades to the default rather than crashing BOOT" do
+      # Both callers take this as a DEFAULT ARGUMENT, which is evaluated in the generated
+      # zero-arity clause — outside warn_if_over_budget/1's `rescue`. So a raise here came
+      # straight out of Application.start/2. `0` and negatives got past the old
+      # String.to_integer/1 entirely and then hit replica_budget_status/2's `nodes > 0`
+      # guard inside warn_if_replica_over_budget/1, which has no rescue at all. An
+      # advisory, log-only capacity check must not be able to take the node down.
+      for bad <- ["0", "-1", "abc", "", "2.5", "6 nodes"] do
+        assert capture_log(fn ->
+                 assert DbCapacity.parse_expected_app_nodes(bad) == 2
+               end) =~ "EXPECTED_APP_NODES"
+      end
+    end
+
+    test "the degraded value is one every downstream guard accepts" do
+      # The point of the clamp is not "some number" — it is a number that clears the
+      # `nodes > 0` guards, which is what the crash was.
+      nodes = DbCapacity.parse_expected_app_nodes("0")
+
+      assert :ok = DbCapacity.replica_budget_status(100, nodes)
+      assert DbCapacity.peak_total(nodes) > 0
+    end
+  end
 end

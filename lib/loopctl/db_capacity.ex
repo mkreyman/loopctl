@@ -80,6 +80,10 @@ defmodule Loopctl.DbCapacity do
   @notifier_per_node 1
   @fixed_ops 2
 
+  # Fallback node count when EXPECTED_APP_NODES is unset or unusable — see
+  # `parse_expected_app_nodes/1` for why an unusable value must not raise.
+  @default_expected_app_nodes 2
+
   # Verified live against fly mpg on 2026-06-24: `SHOW max_connections` = 100.
   # Re-verify post-deploy per docs/runbooks/knowledge-scale.md.
   @verified_live_max_connections 100
@@ -412,16 +416,49 @@ defmodule Loopctl.DbCapacity do
   defp log_replica_budget({:over, message}, _live_max, _nodes), do: Logger.warning(message)
 
   @doc """
-  The expected app node count (env `EXPECTED_APP_NODES`, default 2) used as the
-  default `nodes` argument to `warn_if_over_budget/1`. Public so tests (and any
-  other caller wanting the SAME env-derived node count) don't have to
-  hand-duplicate the parsing/default.
+  The expected app node count (env `EXPECTED_APP_NODES`, default
+  #{@default_expected_app_nodes}) used as the default `nodes` argument to
+  `warn_if_over_budget/1`. Public so tests (and any other caller wanting the SAME
+  env-derived node count) don't have to hand-duplicate the parsing/default.
   """
   @spec expected_app_nodes() :: pos_integer()
-  def expected_app_nodes do
-    case System.get_env("EXPECTED_APP_NODES") do
-      nil -> 2
-      v -> String.to_integer(v)
+  def expected_app_nodes, do: parse_expected_app_nodes(System.get_env("EXPECTED_APP_NODES"))
+
+  @doc """
+  Parses an `EXPECTED_APP_NODES` VALUE to a positive node count, falling back to
+  #{@default_expected_app_nodes} with a warning for anything else.
+
+  Takes the VALUE, not the variable name (the `Loopctl.Config` precedent), so the parsing
+  rules are unit-testable — this module's callers run only at prod boot.
+
+  **A bad value must never crash boot**, which is what it used to do. Both callers take
+  this as a DEFAULT ARGUMENT, and a default argument is evaluated in the generated
+  zero-arity clause — outside the `rescue` in `warn_if_over_budget/1`'s body — so a
+  non-integer raised straight out of `Application.start/2`. `0` or a negative parsed
+  fine and then hit `replica_budget_status/2`'s `nodes > 0` guard with a
+  `FunctionClauseError`, in `warn_if_replica_over_budget/1`, which has no rescue at all.
+  Both are advisory log-only checks; neither is worth a boot failure, least of all one
+  reachable by templating this from a scale-to-zero machine count.
+  """
+  @spec parse_expected_app_nodes(String.t() | nil) :: pos_integer()
+  def parse_expected_app_nodes(value)
+
+  def parse_expected_app_nodes(nil), do: @default_expected_app_nodes
+
+  def parse_expected_app_nodes(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {nodes, ""} when nodes > 0 ->
+        nodes
+
+      _ ->
+        Logger.warning(
+          "EXPECTED_APP_NODES=#{inspect(value)} is not a positive integer — using " <>
+            "#{@default_expected_app_nodes}. The connection-budget check is advisory, " <>
+            "so this degrades its accuracy rather than blocking boot; set it to the " <>
+            "real machine count."
+        )
+
+        @default_expected_app_nodes
     end
   end
 end

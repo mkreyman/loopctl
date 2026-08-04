@@ -66,7 +66,7 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `HEAVY_READ_POOL_SIZE`            | `8`     | `HeavyReadRepo` pool size. This pool exists so a heavy analytical/vector read cannot starve the 3-connection AdminRepo pool |
 | `HEAVY_READ_STATEMENT_TIMEOUT_MS` | `10000` | Per-statement timeout on the heavy-read pool — the backstop that keeps one pathological vector scan from pinning a connection |
 | `SLOW_QUERY_THRESHOLD_MS`         | `1000`  | Queries slower than this are logged for diagnosis |
-| `EXPECTED_APP_NODES`              | `2`     | How many app nodes the boot-time connection-budget check assumes when it multiplies the per-node pools out against Postgres `max_connections`. Advisory — it only logs, and never blocks boot — but it is the one place that notices a pool sizing that works on one node and exhausts the server on a scaled-out fleet, so **set it to the real machine count** when you scale past two. Must be a POSITIVE integer: a non-integer raises at boot, and `0` or a negative degrades to a skipped check on the primary but crashes boot on the replica half (`warn_if_replica_over_budget/1` has no fallback) whenever a distinct `REPLICA_DATABASE_URL` is set — so never template it from a scale-to-zero machine count |
+| `EXPECTED_APP_NODES`              | `2`     | How many app nodes the boot-time connection-budget check assumes when it multiplies the per-node pools out against Postgres `max_connections`. Advisory — it only logs, and never blocks boot — but it is the one place that notices a pool sizing that works on one node and exhausts the server on a scaled-out fleet, so **set it to the real machine count** when you scale past two. Anything that is not a positive integer — including a `0` templated from a scale-to-zero machine count — is named in the boot log and falls back to the default, which costs you the accuracy of the check but never the boot |
 
 #### Rate limiting and auth-path throttle
 
@@ -159,7 +159,7 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 
 | Variable       | Default | Description |
 |----------------|---------|-------------|
-| `GITHUB_TOKEN` | -       | Bearer token for the CI status/test-result lookups that back independent story verification. Optional: unset, the calls go out unauthenticated, which works for PUBLIC repos until GitHub's 60-requests/hour/IP anonymous limit bites — after that verification reports a `github_api_error` rather than a real CI verdict. Required for a private repo, where unauthenticated lookups 404. Needs only read access to checks. **Leave it UNSET rather than blank** — an empty string is truthy in Elixir, so a blanked value sends `Bearer ` with nothing after it and GitHub 401s every lookup, which is strictly worse than the anonymous path |
+| `GITHUB_TOKEN` | -       | Bearer token for the CI status/test-result lookups that back independent story verification. Optional: unset, the calls go out unauthenticated, which works for PUBLIC repos until GitHub's 60-requests/hour/IP anonymous limit bites — after that verification reports a `github_api_error` rather than a real CI verdict. Required for a private repo, where unauthenticated lookups 404. Needs only read access to checks. A blank value is treated as unset (it is trimmed), so a templated-but-empty secret degrades to the anonymous path rather than sending an empty bearer that GitHub 401s |
 
 #### CLI client (`loopctl` command, not the server)
 
