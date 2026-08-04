@@ -79,6 +79,7 @@ defmodule Loopctl.Application do
       # (and never writes client IPs into the logs). Node-local; pure ETS owner
       # with no other dependency.
       Loopctl.RateLimiter.FailOpenLog,
+      Loopctl.RateLimiter.FailOpenBackstop,
       {Oban, Application.fetch_env!(:loopctl, Oban)},
       # US-35.2 / US-38.3: supervised, CLUSTER-WIDE singleton (leadership via
       # :global, negotiated in init) that subscribes to the fixed audit-chain

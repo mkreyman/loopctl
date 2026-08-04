@@ -80,6 +80,41 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 > boot — a deliberate choice after the `STH_SWEEP_CRON` incident, so a bad
 > placeholder can never take the app down at startup.
 
+#### Ingestion backlog gate
+
+Per-tenant backpressure on `POST /api/v1/knowledge/ingest` and `/ingest/batch`, so one
+tenant cannot monopolise the `:ingestion` queue. Read at call time, so both are tunable
+during an incident with `fly secrets set … && fly apps restart` — no deploy.
+
+| Variable                          | Default | Description |
+|-----------------------------------|---------|-------------|
+| `OBAN_INGEST_BACKLOG_MAX`         | `500`   | In-flight `:ingestion` jobs at/above which a tenant's ingest requests get `429 ingestion_backlog_exceeded`. A SOFT admission floor, not a hard cap — the check is a lock-free read-then-enqueue, so concurrent requests can overshoot it by the in-flight request concurrency. Read it as "start shedding around here". **It also derives the fail-open allowance** (see below), so tightening it tightens both |
+| `OBAN_INGEST_BACKLOG_RETRY_AFTER` | `60`    | Seconds advised in `Retry-After` on an OVER-THRESHOLD backlog refusal. Scaled to the queue's DRAIN cadence (jobs are multi-minute LLM calls on a width-2 queue), not to a request cadence — a few-second hint just hot-loops a compliant client into a stream of 429s. A refusal for a spent FAIL-OPEN allowance (below) advises the time left in the hourly allowance window instead, CAPPED at 5x this value — the allowance binds only while the count is unmeasurable, so a cleared blip must not cost a compliant client a whole window |
+
+> **When the gate cannot MEASURE the backlog** (wedged/saturated `AdminRepo` pool, driver
+> fault, or a defect in the counting query) it fails OPEN — an innocent tenant must not be
+> refused because the count path is degraded — but only for a bounded number of jobs per
+> tenant per hour: `max(1, OBAN_INGEST_BACKLOG_MAX / 20)` per web node **per fault lane**,
+> which totals one `OBAN_INGEST_BACKLOG_MAX` per hour per tenant across a fleet of up to 10 web
+> nodes. **That total is the number to size against — there is no multiplier to apply on top.**
+> The divisor is 10 nodes x 2 lanes: pressure faults and non-pressure faults are metered in
+> SEPARATE buckets (so a defect in the counting query cannot spend the allowance a genuine pool
+> fault is then refused on), and the two lanes SPLIT one threshold's worth rather than each
+> getting one. Residual, below a threshold of **20**: the per-lane allowance floors at 1 rather
+> than 0 — so the valve cannot fail closed on the first transient blip — and a 10-node fleet can
+> then admit up to 20 jobs/hour against a smaller threshold. A request asking for MORE items
+> than one window's allowance can never fit it and is refused after a single token. Past that
+> allowance the request is refused — `429 ingestion_backlog_exceeded` only when the fault is
+> DEMONSTRABLE pool pressure (a wedged/saturated pool, an exit the driver's own pool raised, a
+> contention or resource-exhaustion SQLSTATE), otherwise `503 ingestion_gate_unavailable`, which
+> asserts nothing about the tenant's backlog. Watch
+> `loopctl.ingestion.backlog_gate.failed_open.*` sliced by `outcome` and `error_class`; a
+> sustained non-zero rate means the valve is admitting or refusing blind.
+
+> Both accept only a **positive integer**, and unlike the rate-limit knobs above they are
+> validated at BOOT (`config/runtime.exs` evaluates them), so a malformed value aborts the
+> node LOUD at startup rather than surfacing as per-request 500s on the ingest endpoints.
+
 #### Metrics and scale alerting
 
 | Variable                    | Default | Description |
