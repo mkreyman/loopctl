@@ -9419,7 +9419,7 @@ defmodule Loopctl.Knowledge do
   def heat_projection_raise(tenant_id, e, stacktrace) do
     Logger.warning(
       "heat_stub_projection: admin_pool_read_failed tenant_id=#{tenant_id} " <>
-        "error_class=raise:#{ExitTag.tag(e)} sqlstate=#{heat_sqlstate(e)}"
+        "error_class=#{ExitClass.classify(:raise, e)} sqlstate=#{heat_sqlstate(e)}"
     )
 
     if heat_saturation?(e) do
@@ -9437,7 +9437,24 @@ defmodule Loopctl.Knowledge do
   #
   # A SERVER-side fault is only saturation on `@heat_saturation_sqlstates`. A `Postgrex.Error`
   # carrying no SQLSTATE at all is a client-side encode/decode fault — a code bug, never load.
-  defp heat_saturation?(%DBConnection.ConnectionError{reason: :queue_timeout}), do: true
+  #
+  # The two arms are ASYMMETRIC on purpose, and narrowing this one to match its Postgrex twin
+  # is a regression that has already been made once. A `Postgrex.Error` carries a precise,
+  # machine-readable SQLSTATE, so splitting load from a permanent fault is exact. A
+  # `DBConnection.ConnectionError` carries no such thing: its `:reason` is documented as
+  # `:error | :queue_timeout`, `:error` is the DEFAULT that a connect failure and a deadline
+  # share, and Postgrex sets a third value the typespec does not even list. MEASURED, by
+  # driving `AdminRepo.query!(…, timeout: 30)` past a `pg_sleep`: the timeout THIS path exists
+  # to impose (`@heat_stub_timeout_ms`) surfaces as `reason: :closed`, message "tcp send:
+  # closed (the connection was closed by the pool, possibly due to a timeout …)". Matching
+  # `:queue_timeout` alone therefore misses the dominant, BY-DESIGN case and answers 500 where
+  # the endpoint documents 429.
+  #
+  # So this arm follows the shape the code deliberately produces rather than guessing from a
+  # field that cannot carry the distinction. A connect/auth failure being shed as 429 here is
+  # the accepted cost: it is rarer, and over-shedding a read-only index is a smaller error
+  # than 500-ing the bounded wait this whole function exists to bound.
+  defp heat_saturation?(%DBConnection.ConnectionError{}), do: true
 
   defp heat_saturation?(%Postgrex.Error{postgres: %{code: code}}),
     do: code in @heat_saturation_sqlstates

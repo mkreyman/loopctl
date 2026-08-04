@@ -743,16 +743,23 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       tenant = fixture(:tenant)
       pg = &Postgrex.Error.exception(postgres: %{code: &1, severity: "ERROR", message: "x"})
 
+      # EVERY ConnectionError sheds, including the `:closed` and default-`:error` reasons.
+      # This was briefly narrowed to `reason: :queue_timeout`, which misses the shape this
+      # path produces BY DESIGN: driving `AdminRepo.query!(…, timeout: 30)` past a `pg_sleep`
+      # raises `reason: :closed` ("tcp send: closed … possibly due to a timeout"), a value the
+      # struct's own `:error | :queue_timeout` typespec does not list. The bounded wait
+      # `@heat_stub_timeout_ms` imposes then answered 500 against a documented 429 — the one
+      # case the rescue exists for. A Postgrex.Error carries an exact SQLSTATE and IS split;
+      # a ConnectionError carries nothing that can carry the distinction.
       shed = [
         %DBConnection.ConnectionError{message: "checkout", reason: :queue_timeout},
+        %DBConnection.ConnectionError{message: "tcp send: closed", reason: :closed},
+        %DBConnection.ConnectionError{message: "econnrefused", reason: :error},
         pg.("53300"),
         pg.("08P01")
       ]
 
-      permanent = [
-        %DBConnection.ConnectionError{message: "econnrefused", reason: :error},
-        pg.("42703")
-      ]
+      permanent = [pg.("42703")]
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->

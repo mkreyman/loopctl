@@ -23,17 +23,27 @@ defmodule Loopctl.ExitClass do
 
   alias Loopctl.ExitTag
 
+  @typedoc """
+  The non-local-exit KIND a class is prefixed with. `:raise` joined the two originals
+  (#572) because a rescue arm hand-rolled `"raise:" <> ExitTag.tag(e)` rather than come
+  through here — which is how the closed vocabulary springs a leak: the prefix looks
+  identical in a log line while the TAG behind it is unbounded, so `error_class` (a metric
+  label multiplied by `tenant_id`) silently regains the cardinality this module exists to
+  cap.
+  """
+  @type kind() :: :exit | :throw | :raise
+
   @tags ~w(noproc timeout shutdown killed Postgrex.Error DBConnection.ConnectionError)
 
   @doc """
   Bound an already-`ExitTag`-tagged reason to `"<kind>:<tag>"` over the closed tag set.
   """
-  @spec bounded(:exit | :throw, String.t()) :: String.t()
-  def bounded(kind, tag) when kind in [:exit, :throw] and is_binary(tag),
+  @spec bounded(kind(), String.t()) :: String.t()
+  def bounded(kind, tag) when kind in [:exit, :throw, :raise] and is_binary(tag),
     do: "#{kind}:#{closed(tag)}"
 
-  @doc "Tag a raw exit/throw reason and bound it in one step."
-  @spec classify(:exit | :throw, term()) :: String.t()
+  @doc "Tag a raw exit/throw/raise reason and bound it in one step."
+  @spec classify(kind(), term()) :: String.t()
   def classify(kind, reason), do: bounded(kind, ExitTag.tag(reason))
 
   @pool_modules [DBConnection, DBConnection.Holder, DBConnection.Ownership, Postgrex]
