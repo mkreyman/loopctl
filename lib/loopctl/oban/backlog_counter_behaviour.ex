@@ -11,18 +11,27 @@ defmodule Loopctl.Oban.BacklogCounterBehaviour do
   `Mox.expect/3` to RAISE a DB error, or to EXIT the way a wedged pool checkout really
   does — deterministically driving the gate's fail-open path.
 
-  What "fail open" means here depends on the fault, not on the tenant:
+  "Fail open" means BOUNDED admission, for every fault without exception (#564). Whatever
+  the shape, the count is unmeasurable, and an unmeasurable count is not evidence that the
+  tenant is under threshold — so every class admits only up to a bounded per-tenant JOB
+  allowance and is then refused. What the fault decides is the refusal CODE, not whether the
+  admissions are bounded:
 
-    * not backlog pressure — a query-shape SQLSTATE (`db_error`, incl. 08P01
-      protocol_violation) — ADMITS unconditionally;
-    * POOL pressure (`connection`, `timeout`, `exit:*`, `throw:*`, `guc_capture_abort`
-      — raised only once the connection is already wedged — and `db_pressure`, the
-      exhaustion/connection SQLSTATEs a saturated pool raises behind pgbouncer) admits
-      up to a bounded per-tenant JOB allowance, then returns the ordinary backlog 429:
-      unbounded admission here made "no backpressure at all" the steady state;
+    * DEMONSTRABLE pool pressure — `connection`, `timeout`, `guc_capture_abort` (raised
+      only once the connection is already wedged), `db_pressure` (the
+      exhaustion/connection/contention SQLSTATEs a saturated pool raises behind pgbouncer),
+      and any exit the gate can place at the DB pool (`ExitClass.pool_exit?/1` on the raw
+      reason, not on its metric label) — is refused with the ordinary backlog 429;
+    * everything else — a query-shape SQLSTATE (`db_error`, incl. 08P01 protocol_violation),
+      a `driver_fault`, a counting-code `throw:*`, and any exit that CANNOT be placed at the
+      pool — is refused with a 503 `ingestion_gate_unavailable`, which claims no backlog. A
+      deterministic defect in our own counting code must not be reported to a tenant as its
+      backlog being too big;
     * the METER itself unreachable (under `RATE_LIMITER=postgres` its store is the same
-      `AdminRepo` pool) admits as `:unmetered` — 429-ing a tenant whose backlog was
-      neither measured nor metered is a code it has not earned — and says so.
+      `AdminRepo` pool; on the node-local path, its poolboy pool saturating) admits as
+      `:unmetered` — 429-ing a tenant whose backlog was neither measured nor metered is a
+      code it has not earned — and says so. Those admissions are still bounded, by
+      `Loopctl.RateLimiter.FailOpenBackstop`, which shares no pool with either.
 
   No outcome may ever return a generic 500, and EVERY unmeasurable count stays
   telemetry-visible — admitted, unmetered or refused — so the alert cannot go silent.

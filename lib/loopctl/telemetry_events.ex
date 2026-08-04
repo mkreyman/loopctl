@@ -242,17 +242,21 @@ defmodule Loopctl.TelemetryEvents do
       from a trickle of single ingests.
     * `metadata`: `%{tenant_id, error_class, outcome}`.
 
-      `outcome` is a BOUNDED 3-value atom: `:admitted` (unmetered fault class, or within
-      allowance), `:unmetered` (the METER was unconsultable — this ONE bucket is metered on
-      the node-local ETS limiter whatever `RATE_LIMITER` says, precisely so the meter does not
-      share a failure domain with the count it bounds, so `:unmetered` means an ETS/Hammer
-      fault, NOT a DB-pool one — the request was admitted rather than refusing a tenant whose
-      backlog was neither measured nor metered), `:exhausted` (allowance spent; the request was
-      refused — the backlog 429 for a pressure class, otherwise a 503 that claims no backlog).
+      `outcome` is a BOUNDED 3-value atom: `:admitted` (within allowance), `:unmetered` (the
+      METER was unconsultable — this ONE bucket is metered on the node-local ETS limiter
+      whatever `RATE_LIMITER` says, precisely so the meter does not share a failure domain with
+      the count it bounds, so `:unmetered` means an ETS/Hammer fault, NOT a DB-pool one — the
+      request was admitted, bounded by `RateLimiter.FailOpenBackstop` rather than refusing a
+      tenant whose backlog was neither measured nor metered), `:exhausted` (the meter was
+      consulted and the remaining allowance could not cover this request — either spent, or
+      smaller than the items asked for; the request was refused — the backlog 429 for a
+      pressure class, otherwise a 503 that claims no backlog).
 
       `error_class` is a BOUNDED tag: `"timeout"` (57014 query_canceled — the
-      count's own statement_timeout), `"db_pressure"` (SQLSTATE class 53/57/08 — the
-      exhaustion/connection classes a saturated pool raises behind pgbouncer),
+      count's own statement_timeout), `"db_pressure"` (SQLSTATE classes 53/57/08 — the
+      exhaustion/connection classes a saturated pool raises behind pgbouncer — plus the
+      CONTENTION codes 40001, 40P01 deadlock_detected and 55P03 lock_not_available, which are
+      load on `oban_jobs` rather than a defect in the counting query),
       `"driver_fault"` (a `Postgrex.Error` carrying NO server SQLSTATE — a client-side
       protocol/decode fault, or a PERMANENT ssl/config one; metered, but never attributed to
       backlog), `"db_error"` (any OTHER SERVER SQLSTATE — a query bug in the
@@ -263,16 +267,21 @@ defmodule Loopctl.TelemetryEvents do
       once the connection is ALREADY wedged, hence metered), plus the `exit:<t>` / `throw:<t>`
       families from `Loopctl.ExitClass`.
 
-      METERED classes (bounded allowance, then a refusal): `connection`, `timeout`,
-      `db_pressure`, `driver_fault`, `guc_capture_abort`, `exit:*`, `throw:*`. Of those,
-      `driver_fault` and `throw:*` are refused as a 503 `ingestion_gate_unavailable` rather
-      than the backlog 429 — metered so admissions stay bounded, but not backlog-attributable,
-      so a deterministic fault never tells an under-threshold tenant its backlog is full.
-      UNMETERED (always admits): `db_error` ONLY —
-      a query-shape bug in the count path is not backlog pressure, and capping it would 429 an
-      under-threshold tenant with a code it has not earned. Every other class leaves the
-      backlog UNMEASURED, and an unmeasured backlog is not evidence of an under-threshold
-      tenant, so its admissions stay bounded.
+      EVERY class is METERED (bounded allowance, then a refusal) — there is no unmetered
+      class. An unmeasured backlog is not evidence of an under-threshold tenant, whatever
+      shape the fault arrived in, so no class earns free admission (#564).
+
+      What DOES vary is the refusal CODE, and it is an allowlist: the backlog 429 is reserved
+      for `connection`, `timeout`, `db_pressure`, `guc_capture_abort`, plus any `exit:*` the
+      gate can place at the DB pool. Everything else — `driver_fault`, `db_error`, `throw:*`,
+      and any exit it CANNOT place at the pool — is refused as a 503
+      `ingestion_gate_unavailable`, which asserts nothing about a backlog: a deterministic
+      fault must never tell an under-threshold tenant its backlog is full.
+
+      An `exit:*` class alone therefore implies NEITHER code. The tag is derived from the exit
+      reason and cannot name which process died, so pool-ness is decided at the catch site
+      with `ExitClass.pool_exit?/1` while the raw reason is still in scope. Source of truth for
+      the split: `@backlog_attributable_classes` in `LoopctlWeb.KnowledgeIngestionController`.
 
       `tenant_id` is an id, cap-gated to a sentinel in the metric's `tag_values`
       (`ScaleMetrics.backlog_gate_tags/1`) so label cardinality stays bounded.
