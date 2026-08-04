@@ -10626,8 +10626,12 @@ defmodule Loopctl.Knowledge do
      }}
   end
 
+  # `as: :article` names the binding so `find_orphan_articles/3` can correlate a
+  # `not exists` subquery back to it via `parent_as/1`. Naming a binding is inert for every
+  # other consumer that re-composes this query.
   defp published_base_query(tenant_id, nil) do
     from(a in Article,
+      as: :article,
       where: a.tenant_id == ^tenant_id,
       where: a.status == :published
     )
@@ -10636,6 +10640,7 @@ defmodule Loopctl.Knowledge do
   defp published_base_query(tenant_id, project_id) do
     base =
       from(a in Article,
+        as: :article,
         where: a.tenant_id == ^tenant_id,
         where: a.status == :published
       )
@@ -10682,26 +10687,45 @@ defmodule Loopctl.Knowledge do
     end)
   end
 
-  defp find_orphan_articles(base, tenant_id, project_id) do
-    # Subquery: article IDs that appear in any link (source or target)
-    linked_ids_subquery =
-      from(al in ArticleLink,
-        where: al.tenant_id == ^tenant_id,
-        select: %{id: al.source_article_id}
-      )
-      |> maybe_scope_links_to_project(project_id)
-
-    linked_target_ids_subquery =
-      from(al in ArticleLink,
-        where: al.tenant_id == ^tenant_id,
-        select: %{id: al.target_article_id}
-      )
-      |> maybe_scope_links_to_project(project_id)
-
+  # An orphan is an article that appears in NO link, in either direction.
+  #
+  # Expressed as two correlated `not exists` rather than `id not in subquery(...)` (#574).
+  # That difference is not stylistic: PostgreSQL CANNOT turn `NOT IN (subquery)` into an
+  # anti-join, because of three-valued NULL semantics — a single NULL in the subquery makes
+  # the whole predicate NULL, so the planner has to keep the entire set. It therefore
+  # materialised all 1.4M `article_links` rows TWICE and re-scanned that tuplestore once per
+  # candidate article: a measured plan cost of 2.21 BILLION, six sequential scans per
+  # execution across the parallel workers, and the single largest source of the 1.65 billion
+  # `seq_tup_read` this table had accumulated.
+  #
+  # It did not merely run slowly — the nightly `KnowledgeLintWorker` for the only tenant with
+  # a real corpus was DISCARDED after 3 attempts every night (a pool timeout inside this
+  # query), so the lint had never once succeeded there. `NOT EXISTS` is anti-join-able, so
+  # each candidate becomes an index probe on `article_links_source_article_id_index` /
+  # `_target_article_id_index`.
+  #
+  # No index would have rescued the old shape: one tenant owns 100% of `article_links`, so
+  # the `tenant_id` predicate those subqueries filtered on is entirely non-selective. The
+  # SHAPE was the defect.
+  defp find_orphan_articles(base, tenant_id, _project_id) do
     query =
       from(a in base,
-        where: a.id not in subquery(linked_ids_subquery),
-        where: a.id not in subquery(linked_target_ids_subquery),
+        where:
+          not exists(
+            from(l in ArticleLink,
+              where: l.tenant_id == ^tenant_id,
+              where: l.source_article_id == parent_as(:article).id,
+              select: 1
+            )
+          ),
+        where:
+          not exists(
+            from(l in ArticleLink,
+              where: l.tenant_id == ^tenant_id,
+              where: l.target_article_id == parent_as(:article).id,
+              select: 1
+            )
+          ),
         select: %{
           id: a.id,
           title: a.title,
@@ -10720,16 +10744,6 @@ defmodule Loopctl.Knowledge do
         suggested_action: "Consider linking to related articles or reviewing for relevance"
       }
     end)
-  end
-
-  defp maybe_scope_links_to_project(query, nil), do: query
-
-  defp maybe_scope_links_to_project(query, _project_id) do
-    # Links don't have project_id — we keep all links within the tenant.
-    # The orphan check is scoped via the base query (published articles for
-    # the project). A link to/from articles outside this project scope is
-    # still valid and means the article is NOT orphaned.
-    query
   end
 
   defp find_contradiction_clusters(tenant_id, project_id) do

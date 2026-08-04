@@ -120,6 +120,35 @@ defmodule Loopctl.KnowledgeLintTest do
       refute other.id in orphan_ids
     end
 
+    test "#574: the orphan check is an ANTI-JOIN, never `id not in subquery`" do
+      # The tests above are correctness-only, and correctness is exactly what BOTH shapes
+      # satisfy — which is why this defect survived: `id not in subquery(...)` returned the
+      # right orphans while being unable to complete on real data. PostgreSQL cannot convert
+      # `NOT IN (subquery)` into an anti-join (a single NULL makes the predicate NULL, so the
+      # whole set must be kept), so it materialised all 1.4M `article_links` rows TWICE and
+      # re-scanned them per candidate: plan cost 2.21 BILLION, and the nightly lint job was
+      # DISCARDED after 3 attempts every night on a pool timeout. Measured on production after
+      # the rewrite: cost 44,695 and 504 ms.
+      #
+      # A plan-shape assertion cannot run here (test data is tiny, so the planner seq-scans
+      # whatever we write), so this anchors to the CODE. Both directions are asserted, and the
+      # positive one is counted, so the guard cannot pass by matching nothing.
+      source = File.read!("lib/loopctl/knowledge.ex")
+
+      [_ | _] = orphan_fn = Regex.run(~r/defp find_orphan_articles.*?\n  end\n/s, source)
+      body = hd(orphan_fn)
+
+      correlated = Regex.scan(~r/not exists\(/, body)
+
+      assert length(correlated) == 2,
+             "expected two correlated NOT EXISTS (source + target), got #{length(correlated)}"
+
+      assert body =~ "parent_as(:article)", "the subqueries must correlate to the outer row"
+
+      refute body =~ "not in subquery",
+             "`id not in subquery(...)` blocks the anti-join and cannot complete on prod data"
+    end
+
     test "orphan_articles excludes draft articles" do
       tenant = fixture(:tenant)
 
