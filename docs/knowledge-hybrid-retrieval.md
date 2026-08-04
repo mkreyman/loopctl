@@ -249,38 +249,60 @@ single-article body read, but `knowledge_progressive_drill` is the tool this
 index's own `meta.drill` names, so counting it closed a loop — the index showed an
 article, a caller drilled it *because* it was shown, and the drill fed the rank
 that showed it. Material that never surfaced could not overtake material that
-already had. The general rule behind all three exclusions: **heat must not rank on
-a signal heat produces.**
+already had.
 
 Which access type a drill records is derived from the branch that resolves the
-article, never from anything the caller sends: a tenant-owned article records the
-uncounted `drill`, a published system canonical records a counted `get`. A
-caller-declared origin was tried and is wrong — it binds only the clients that send
-it, so every older MCP release and every raw HTTP call re-opens the loop by
-default. The canonical branch is the deliberate exception: `get_article/3` filters
-on `tenant_id` and a canon row's is NULL, so that drill is the only path to its
-body, and excluding it would freeze every canonical at heat 0 and make the
-"canonicals participate" property false. A tenant article loses nothing — a plain
-`knowledge_get` of a listed id still counts, and that is the read a reader names for
-itself. What bounds the residual canonical loop, and any *deliberate*
-manipulation, is the distinct-reader count, not this label.
+article, never from anything the caller sends — a caller-declared origin was
+tried and is wrong, since it binds only the clients that send it, leaving every
+older MCP release and every raw HTTP call re-opening the loop by default. Every
+drill records the uncounted `drill`, at every scope.
+
+That uniformity is #572, and the first attempt lacked it. A published system
+canonical's drill used to record a counted `get`, because `get_article/3`
+filtered on `tenant_id`, a canon row's is NULL, and the drill was therefore the
+only path to its body — excluding it would have frozen every canonical at heat 0
+and made the "canonicals participate" property false. Sound about the canon,
+wrong about the index: `heat_index/2` then ranked a counted class against an
+uncounted one on a single `heat` number, so the number meant different things per
+row. And because drilling is the *documented* path — `meta.drill`, the MCP tool
+text — following the documentation raised only canonicals, self-reinforcingly (a
+canon shown at rank 1 got drilled, which kept it at rank 1). The distinct-reader
+count bounds ONE agent's loop, not a fleet all following the same instruction.
+
+The fix gives the canon the read path it lacked rather than counting the one it
+had: `get_article/3` now resolves published system canonicals too, so every
+article earns heat the same way — a caller-named `get` — and `knowledge_get` no
+longer 404s on a canon stub. The general rule behind all four fixes: **heat must
+not rank on a signal heat produces, and must never rank counted and uncounted
+read paths on one number.**
 
 `drill` still counts as follow-through in
 `RetrievalMetrics.compute_followed_through/2`, which asks a different question —
 was a body *delivered* after a search. The two access-type sets diverge on
 purpose and must not be unified.
 
-The window is snapped to a UTC day boundary, so two calls with no intervening read
-return a byte-identical payload — which is what makes it safe in a cached prefix.
-The snap always NARROWS: an explicit `since` is never widened back — one inside
-the current UTC day is used exactly as given, since its next boundary has not
-happened yet. It defaults to 90 days and is clamped to at most 365 days of
-lookback and to no later than today; `meta.heat_window` always echoes the window
-actually used.
+The SYSTEM-derived window is snapped to a UTC day boundary, so two calls with no
+intervening read return a byte-identical payload — which is what makes it safe in
+a cached prefix. An **explicit `since` is served verbatim** (#572): it was
+briefly floored, which silently widened a window the caller had narrowed, then
+ceiled, which silently narrowed it by up to 24h instead — the same defect
+mirrored, and the guarding test could not see the second one because it asserted
+only that reads *before* `since` stayed excluded. A caller passing an explicit
+timestamp is passing a per-call value, so there is no cacheable prefix to
+protect. It defaults to 90 days and is clamped to at most 365 days of lookback
+and to no later than today; `meta.heat_window` always echoes the window actually
+used.
 
-Drill a heat stub with `progressive_drill/3`, **not** `get_article/3`: the heat
-index also lists published system canonicals, whose `tenant_id` is NULL, and
-`get_article/3` filters on `tenant_id`. `meta.drill` states this in the payload.
+`meta.chars` and `meta.char_budget` are **bytes of the encoded stub array**,
+array framing included. Both were briefly graphemes summed per stub, which
+under-reported a CJK or emoji payload several-fold and omitted the brackets and
+commas — in the unsafe direction, for the one number a caller sizes a cached
+prefix against.
+
+Both `progressive_drill/3` and `get_article/3` resolve a heat stub, canonicals
+included. Choose by what the read MEANS: a drill is uncounted, so following this
+index never feeds it; a `get` is a counted vote that the article was worth
+opening on its own. `meta.drill` states this in the payload.
 
 `hybrid_search/3`'s `opts` forward directly to `search_combined/3`:
 `:keyword_weight`, `:semantic_weight`, `:project_id`, `:category`, `:status`,

@@ -135,6 +135,11 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   def article_stats(conn, %{"id" => article_id}) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
+    # Deliberately NO `:api_key_id`: this resolves the id to shape a STATS response and
+    # delivers no body, and `Analytics.record_access/6` no-ops on a nil api_key_id
+    # (`analytics.ex:119`), so nothing is recorded. Do NOT add one for attribution — opening
+    # an article's analytics would then register as a read of it, inflating the very number
+    # this endpoint reports and feeding `heat_index/2` a read it caused.
     case Knowledge.get_article(tenant_id, article_id) do
       {:ok, article} ->
         stats = Knowledge.get_article_stats(tenant_id, article.id)

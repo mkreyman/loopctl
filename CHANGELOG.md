@@ -146,6 +146,35 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Added
 
+- **`knowledge_get` now resolves published SYSTEM CANONICALS, and drilling never adds heat at
+  any scope (#572).** #569 stopped `knowledge_heat_index` ranking on its own drill hop, but for
+  tenant-owned articles only: a canonical's drill stayed counted, because `get_article/3`
+  filtered on `tenant_id` and the drill was therefore the sole path to its body. That left the
+  index ranking a counted class against an uncounted one on one `heat` number, and since
+  drilling is the path the payload itself recommends, following the documentation drove the
+  ranking monotonically toward the shared canon. Fixed by giving the canon the read path it
+  lacked rather than counting the one it had. **Operator-visible effects:** a canon stub is now
+  openable with `knowledge_get` instead of 404ing, and existing `article_access_events` rows
+  where a canonical drill was recorded as `get` are left as they are — they sit inside a
+  rolling window and age out, so no backfill runs.
+
+- **`meta.chars` / `meta.char_budget` on `heat_index` are BYTES of the encoded stub array**,
+  array framing included. They were graphemes summed per stub, so a CJK or emoji payload was
+  under-reported several-fold and the brackets and commas were omitted — both in the unsafe
+  direction for the one number callers are told to size a cached prefix against. A client that
+  sized a buffer off the old figure should re-check it.
+
+- **An explicit `since` on `heat_index` is served verbatim**, where it was rounded up to the
+  next UTC day boundary and silently dropped up to 24h of requested reads. The system-derived
+  default is still day-snapped, which is what keeps the payload byte-identical between
+  refreshes.
+
+- **A heat-projection fault no longer logs raw DB fault text, and only a demonstrable pool exit
+  degrades to 429.** The log carried the backend host/port and the failing statement's bound
+  parameters; the blanket exit handler reported a node shutdown or any foreign timeout as
+  "this tenant is reading too much". Server-side saturation (`53300`, `57P01`, statement
+  timeout) now fails soft as the documented 429 instead of escaping as a 500.
+
 - **Operator knobs that were live but undiscoverable are now documented (#566):**
   `EXPECTED_APP_NODES`, `STH_SWEEP_CRON`, the fair-share snooze pair
   (`OBAN_TENANT_FAIRSHARE_SNOOZE_SECONDS` / `_JITTER`), the per-queue families

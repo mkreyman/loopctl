@@ -124,10 +124,12 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
         "Only caller-chosen fetches are counted " <>
         "(`meta.counted_access_types`); list-shaped ranker output (a search hit, a context " <>
         "pack) is one row per RESULT, not a read, so it adds no heat. Neither does drilling " <>
-        "a listed tenant article (GET /knowledge/progressive/:id) — that read is recorded " <>
-        "under its own access type, so this index does not feed the ranking that surfaced " <>
-        "the article; a plain knowledge_get of the same id does count. `char_budget`/`chars` " <>
-        "size the stub array only, exclusive of `meta`. Takes NO query, " <>
+        "a listed article of ANY scope (GET /knowledge/progressive/:id) — tenant-owned or " <>
+        "system canonical, that read is recorded under its own access type, so this index " <>
+        "never feeds the ranking that surfaced the article; a plain knowledge_get of the " <>
+        "same id does count, and resolves canonicals too. `char_budget`/`chars` " <>
+        "are BYTES of the encoded stub array (framing included), exclusive of `meta`. " <>
+        "Takes NO query, " <>
         "which is the " <>
         "point: every other retrieval route starts from one, so they all miss the same way " <>
         "on a paraphrase or on material that is topically central but lexically dissimilar. " <>

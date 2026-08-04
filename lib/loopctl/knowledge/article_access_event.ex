@@ -50,17 +50,20 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
   # `"drill"` is a body read like `"get"`, split out ONLY so the heat index cannot rank on a
   # signal it generates itself (#569). `heat_index/2` orders on `"get"`, and the tool its own
   # `meta.drill` tells callers to use — `knowledge_progressive_drill` — recorded a `"get"`,
-  # so an article gained heat from HAVING BEEN SHOWN by the index. It is written for a drill
-  # that resolves a TENANT-OWNED article; a system canonical's drill stays `"get"`, since it
-  # is the only path to that body and labelling it this way froze every canonical at heat 0.
-  # The read is still recorded; it just is not the signal the ranking consumes. Keep `"drill"` OUT of
-  # `@heat_read_access_types` and IN anything asking "was a body delivered"
+  # so an article gained heat from HAVING BEEN SHOWN by the index. EVERY drill records this
+  # type, tenant-owned and system canonical alike (#572); the read is still recorded, it just
+  # is not the signal the ranking consumes. Keep `"drill"` OUT of `@heat_read_access_types`
+  # and IN anything asking "was a body delivered"
   # (`RetrievalMetrics.compute_followed_through/2`).
   #
   # This list and `Loopctl.Knowledge.Analytics`'s `@valid_access_types` are two allowlists over
-  # one column and MUST move together: this one is the changeset's `validate_inclusion`, that
-  # one is the write guard in `record_access/6` — a value in only one is silently unwritable
-  # or silently unvalidated. There is no DB CHECK, so these two ARE the enforcement.
+  # one column and MUST move together, but they are NOT peers, and calling them both "the
+  # enforcement" was wrong (#572). The ENFORCEMENT is `Analytics.record_access/6`'s guard
+  # clause: every write reaches the DB through `do_record_sync/5`'s `AdminRepo.insert_all`,
+  # which builds no changeset, so the `validate_inclusion` below never runs on a production
+  # write — it covers only callers that construct a changeset directly. There is no DB CHECK
+  # either. The drift test binding the two lists still earns its keep (a value in only one is
+  # silently unwritable or silently unvalidated), but do not read this list as a gate.
   @access_types ~w(search get context index drill)
 
   schema "article_access_events" do
