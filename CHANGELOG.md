@@ -108,8 +108,10 @@ Operator-facing changes for deployments outside the hosted instance.
   "cacheable prefix" a guaranteed cache miss); and a FUTURE `since` is clamped to now instead of
   returning 200 with an empty list and a window that has not happened yet. `meta.chars` is now
   measured off the ENCODED stub, so escape-heavy titles no longer under-report the wire size a
-  caller budgets against. New migration adds two partial indexes on `articles` supporting the
-  route's published-id subquery; both are created `CONCURRENTLY` and need no downtime.
+  caller budgets against. No migration and no index change: the route's published-id subquery
+  was suspected of scanning the corpus, and `EXPLAIN (ANALYZE, BUFFERS)` on production
+  disproved it — the planner drives from the windowed event index and probes `articles_pkey`
+  per distinct article read, 11 ms against a 79,025-article corpus.
 
 ### Added
 

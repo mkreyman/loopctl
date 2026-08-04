@@ -9088,6 +9088,21 @@ defmodule Loopctl.Knowledge do
   # inside it is reasoned about HERE rather than proved: the rows being aggregated are
   # conjunctively tenant-scoped events, so the id set can only NARROW what this tenant already
   # generated. Same shape `apply_search_filters_on_article/4` uses.
+  #
+  # The `IN (subquery)` is NOT an unbounded corpus scan, and this was MEASURED rather than
+  # argued (#567). `EXPLAIN (ANALYZE, BUFFERS)` on production, tenant `0abd22c2` with 79,025
+  # published articles: the planner never enumerates the corpus. It drives from
+  # `article_access_events_tenant_type_time_idx` (the windowed, tenant+access_type-scoped
+  # event set) and resolves the subquery as a Memoized `articles_pkey` probe per DISTINCT
+  # article seen in the window — 2,035 event rows, 1,256 probes, 779 memoize hits, 11.3 ms at
+  # the 90-day default and 6.9 ms at the 365-day ceiling with a category filter. Cost scales
+  # with articles READ in the window, not with the corpus.
+  #
+  # So do NOT "fix" this by aggregating first and filtering the top-K afterwards. Besides
+  # being unnecessary, it inverts the meaning: the predicates would decide which articles
+  # SURVIVE the ranking instead of which COMPETE for it, so a category-filtered call would
+  # rank the whole corpus, take `top_k + 1`, and keep only the few that happen to match.
+  # A supporting partial index is equally unnecessary — the plan uses the primary key.
   defp heat_counts_query(tenant_id, limit, since, category, vis) do
     from(e in ArticleAccessEvent,
       where: e.tenant_id == ^tenant_id,
