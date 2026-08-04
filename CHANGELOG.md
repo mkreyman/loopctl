@@ -146,6 +146,22 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Added
 
+- **Six operator knobs that were live but undiscoverable are now documented (#566):**
+  `EXPECTED_APP_NODES`, `STH_SWEEP_CRON`, `OBAN_TENANT_FAIRSHARE_SNOOZE_SECONDS`,
+  `OBAN_TENANT_FAIRSHARE_SNOOZE_JITTER`, `GITHUB_TOKEN`, and the Fly secrets-adapter pair
+  `FLY_APP_NAME` / `FLY_API_TOKEN`. Nothing about their behaviour changed — they simply
+  could not be found without reading our source. The two that most affect a self-hosted
+  install: **`FLY_API_TOKEN` is not injected by anything**, and without it (or off Fly
+  entirely) the default secrets adapter refuses every write, which fails tenant signup —
+  use `SECRETS_ADAPTER=local_file`; and `GITHUB_TOKEN` left unset caps CI-status lookups
+  at GitHub's 60/hour anonymous limit, past which story verification reports an API error
+  rather than a CI verdict.
+
+  `mix loopctl.check_env_docs` now scans `lib/**/*.ex` alongside `config/runtime.exs` and
+  requires a documentation table ROW rather than any mention, so the next such knob cannot
+  ship undiscoverable. It had reported "42 runtime env var(s) documented" while never
+  looking at these.
+
 - **A retirement trigger for the US-41.1 legacy embedding columns (#551).** New migration
   (`embedding_retirement_observations`, a global non-tenant table) and a new daily job at
   03:40 UTC. It records one observation per UTC day — the read flag, which legacy columns

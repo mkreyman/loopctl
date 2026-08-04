@@ -69,6 +69,26 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocsTest do
       assert CheckEnvDocs.undocumented(["ADMIN_POOL_SIZE"], docs) == []
     end
 
+    test "#566: a passing MENTION in prose does not count as documented" do
+      # How the guard went quietly vacuous for `STH_SWEEP_CRON`: it was named once, in an
+      # aside explaining a DIFFERENT decision ("after the STH_SWEEP_CRON incident"), and a
+      # whole-word text match read that as documentation. An operator learns neither the
+      # default nor what the knob does from a sentence about something else, so the match
+      # is anchored to a table row — where a default and a description sit structurally
+      # adjacent and cannot be omitted by accident.
+      docs = """
+      > A deliberate choice after the `STH_SWEEP_CRON` incident, so a bad placeholder
+      > can never take the app down at startup.
+      """
+
+      assert CheckEnvDocs.undocumented(["STH_SWEEP_CRON"], docs) == ["STH_SWEEP_CRON"]
+
+      assert CheckEnvDocs.undocumented(
+               ["STH_SWEEP_CRON"],
+               docs <> "\n| `STH_SWEEP_CRON` | `*/5 * * * *` | STH safety sweep cron |"
+             ) == []
+    end
+
     test "returns every missing variable, sorted" do
       vars = ["ZED_VAR", "ALPHA_VAR", "MID_VAR"]
       assert CheckEnvDocs.undocumented(vars, "nothing here") == ~w(ALPHA_VAR MID_VAR ZED_VAR)
@@ -81,16 +101,53 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocsTest do
   end
 
   describe "the live repo" do
-    test "every runtime.exs env var is documented, and the scan is not vacuous" do
-      vars = CheckEnvDocs.scan_env_vars(File.read!("config/runtime.exs"))
+    setup do
+      %{
+        vars:
+          Enum.reduce(CheckEnvDocs.sources(), MapSet.new(), fn {pattern, min}, acc ->
+            found = CheckEnvDocs.scan_paths(pattern)
 
-      # Non-vacuity: assert the scan actually matched a substantial set. Without
-      # this, a broken regex would make the assertion below trivially true.
-      assert MapSet.size(vars) >= 20,
-             "scan found only #{MapSet.size(vars)} vars in runtime.exs — the scan is broken"
+            # Per-source non-vacuity, asserted per source for the same reason the task
+            # enforces it per source: over the UNION, runtime.exs's ~42 vars would clear
+            # any sane floor on their own, so a `lib/**/*.ex` glob that silently matched
+            # nothing would still look healthy.
+            assert MapSet.size(found) >= min,
+                   "scan of #{pattern} found only #{MapSet.size(found)} vars — it is broken"
 
+            MapSet.union(acc, found)
+          end)
+      }
+    end
+
+    test "every scanned env var is documented", %{vars: vars} do
       assert CheckEnvDocs.undocumented(vars, File.read!("deploy/FLY_SECRETS.md")) == [],
              "undocumented operator env vars — run: mix loopctl.check_env_docs"
+    end
+
+    test "#566: the scan covers lib/ as well as config/runtime.exs", %{vars: vars} do
+      # Iterating `sources/0` above means the assertion above cannot notice a source being
+      # DROPPED from that list — it would simply iterate one fewer and pass. These anchors
+      # are named because each can only come from one source, which is what makes removing
+      # either source a test failure rather than a quieter guard.
+      #
+      # `OBAN_*` is the family that motivated #566: runtime.exs does evaluate it at boot,
+      # but via `Loopctl.ObanConfig`, so the literal name never appears in the config file
+      # and eight variables sat outside a green guard.
+      assert "OBAN_TENANT_FAIRSHARE_SNOOZE_SECONDS" in vars,
+             "lib/ is no longer scanned — the #566 blind spot is back"
+
+      assert "DATABASE_URL" in vars, "config/runtime.exs is no longer scanned"
+    end
+  end
+
+  describe "scan_paths/1" do
+    test "raises rather than reporting zero when a wildcard matches nothing" do
+      # A wildcard that matches no file yields an empty set, which is indistinguishable
+      # from a source that genuinely reads no env vars — and a mistyped path is by far the
+      # likelier cause. Fail loud instead.
+      assert_raise Mix.Error, ~r/matched no files/, fn ->
+        CheckEnvDocs.scan_paths("lib/no/such/directory/**/*.ex")
+      end
     end
   end
 end

@@ -25,8 +25,11 @@ defmodule Loopctl.ConfigTest do
       end
     end
 
-    # The read stays a literal System.get_env("NAME") in runtime.exs so
-    # mix loopctl.check_env_docs (a textual scan of that file) keeps seeing the var.
+    # The read stays a LITERAL name (not one built by interpolation) so the textual
+    # scan behind mix loopctl.check_env_docs keeps seeing the var. Since #566 that
+    # guard scans lib/ as well, so this no longer pins the read to runtime.exs — but
+    # the read IS there, and a scan that stopped finding it would mean the literal
+    # shape had been refactored away, which is the half still worth pinning.
     test "SCALE_ALERTS_ENABLED is read literally in runtime.exs, under the env-docs guard" do
       assert "config/runtime.exs"
              |> File.read!()
