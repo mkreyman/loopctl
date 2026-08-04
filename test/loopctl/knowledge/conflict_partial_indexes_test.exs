@@ -4,8 +4,9 @@ defmodule Loopctl.Knowledge.ConflictPartialIndexesTest do
 
   These assert the index DEFINITION, not query results, because the defect they prevent is
   invisible to a correctness test: the queries return the right rows with or without an
-  index. What changes is whether the plan is an index scan or a walk of all 1,417,624
-  entries, and test data is far too small for the planner to reveal that.
+  index. What changes is whether the plan is an index scan or a walk of the whole composite
+  index (the migration carries the measured figures), and test data is far too small for the
+  planner to reveal that.
   """
   use Loopctl.DataCase, async: true
 
@@ -14,10 +15,13 @@ defmodule Loopctl.Knowledge.ConflictPartialIndexesTest do
   # `pg_indexes` renders an indexdef for an INVALID index too, so validity has to be read
   # separately: an interrupted CONCURRENTLY build leaves a definition the planner ignores.
   defp indexdef(name) do
+    # Schema-qualified to `public` (the reconcile migration's canonical detection SQL): a
+    # same-named index in another visible schema would otherwise return two rows.
     sql = """
     SELECT pg_get_indexdef(c.oid), x.indisvalid FROM pg_class c
       JOIN pg_index x ON x.indexrelid = c.oid
-     WHERE c.relname = $1 AND c.relkind = 'i'
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = $1 AND c.relkind = 'i' AND n.nspname = 'public'
     """
 
     case AdminRepo.query!(sql, [name]).rows do
@@ -27,8 +31,6 @@ defmodule Loopctl.Knowledge.ConflictPartialIndexesTest do
   end
 
   test "#577: the contradicts partial index exists and is scoped to that relationship" do
-    # `contradicts` is 0 rows in production, so this index costs 8 kB and turns a 313 ms walk
-    # of the whole composite index into 0.131 ms.
     {def_sql, valid} = indexdef("article_links_contradicts_idx")
 
     assert def_sql, "article_links_contradicts_idx is missing — see the #577 migration"
@@ -53,11 +55,12 @@ defmodule Loopctl.Knowledge.ConflictPartialIndexesTest do
     assert def_sql, "article_links_potential_conflict_idx is missing — see the #576 migration"
     assert valid, "article_links_potential_conflict_idx is INVALID — the planner will ignore it"
 
-    # The whole key list as ONE literal, pinning DESC to the score EXPRESSION plus the
-    # tenant_id-first / id-last order. A loose `similarity_score.*DESC` regex also matches
-    # `(tenant_id, (…score…), id DESC)`; `NULLS LAST` would render inside this literal too.
-    assert def_sql =~
-             "USING btree (tenant_id, (((metadata ->> 'similarity_score'::text))::double precision) DESC, id)",
+    # The ordered key list, pinning DESC to the score EXPRESSION plus tenant_id-first /
+    # id-last. Not one verbatim catalog string: `pg_get_indexdef`'s parenthesisation and cast
+    # spelling are the deparser's, and vary by PostgreSQL major. Still exact where it counts —
+    # a bare `similarity_score.*DESC` would also match `(tenant_id, (…score…), id DESC)`, and
+    # `DESC NULLS LAST` does not match `DESC, id)`.
+    assert def_sql =~ ~r/USING btree \(tenant_id, .*similarity_score.*DESC, id\)/,
            "the score column must be DESC (NULLS FIRST) with tenant_id first and id last: #{def_sql}"
 
     assert def_sql =~ ~r/WHERE \(\(\(relationship_type\)::text = 'potential_conflict'/,
