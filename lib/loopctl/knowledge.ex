@@ -863,8 +863,10 @@ defmodule Loopctl.Knowledge do
   Preloads outgoing links (with target articles) and incoming links
   (with source articles).
 
-  Records a `"get"` access event when an `:api_key_id` is supplied
-  via `opts`. Recording is fire-and-forget and never affects the read.
+  Records an access event when an `:api_key_id` is supplied via `opts` —
+  `"get"` unless `:access_type` overrides it, which only `progressive_drill/3`
+  does (it records `"drill"` for a stub opened from `heat_index/2`, #569).
+  Recording is fire-and-forget and never affects the read.
 
   ## Parameters
 
@@ -911,8 +913,9 @@ defmodule Loopctl.Knowledge do
         |> drop_resolved_conflict_links(tenant_id)
 
       # `:access_type` defaults to `"get"` — this function is shared by `get_article/3` and
-      # `progressive_drill/3`, and only the latter overrides it (#569). The override is what
-      # stops `heat_index/2` ranking on reads it caused itself; see `@heat_read_access_types`.
+      # `progressive_drill/3`, and only the latter overrides it, only for a drill that declares
+      # it came from `heat_index/2` (#569). That override is what stops the index ranking on
+      # reads it caused itself; see `@heat_read_access_types`.
       Analytics.record_access(
         tenant_id,
         article.id,
@@ -8900,14 +8903,17 @@ defmodule Loopctl.Knowledge do
   # DELIVERED, ranker-chosen or not) — the two sets must not be unified.
   #
   # `"drill"` is excluded for a THIRD reason, distinct from the list-shape one above (#569).
-  # `knowledge_progressive_drill` is the tool `meta.drill` below tells callers to use, and it
-  # is a genuine single-article body read — it fails none of the tests that exclude `"search"`
-  # and `"context"`. It is excluded because counting it closes a LOOP: this index shows an
-  # article, a caller drills it because it was shown, and the drill feeds the rank that showed
-  # it. Visibility would produce reads, reads rank, rank visibility — and material that never
-  # surfaced could not overtake material that already had. That is the same defect this route
-  # has now had three times (#563 counted search impressions, #567 counted one key's loop) and
-  # the general rule behind all three: heat must not rank on a signal heat produces.
+  # A drill IS a genuine single-article body read — it fails none of the tests that exclude
+  # `"search"` and `"context"` — so it is NOT the tool that is excluded, it is the HOP FROM
+  # THIS INDEX: shown -> read -> ranked -> shown, a loop in which material that never surfaced
+  # could not overtake material that already had. `progressive_drill/3` therefore records
+  # `"drill"` only for a caller that DECLARES `from: :heat_index`, and a plain `"get"`
+  # otherwise; excluding the whole drill path instead made the "canonicals participate"
+  # invariant below unreachable (a canon's body has no other read path) and silenced every
+  # topic-seeded drill. That declaration is cooperative, not enforced — the adversarial bound
+  # on this ranking is the distinct-reader count (#567), which holds however a read is
+  # labelled. Same rule as #563 (search impressions) and #567 (one key's loop): heat must not
+  # rank on a signal heat produces.
   @heat_read_access_types ~w(get)
 
   # The aggregate runs on the request path over `article_access_events`, the one table that
@@ -8937,8 +8943,8 @@ defmodule Loopctl.Knowledge do
 
   Ordering is by HEAT — the number of DISTINCT READERS (agents) that made a CALLER-CHOSEN
   body read (`#{Enum.join(@heat_read_access_types, "/")}`) inside the window; list-shaped
-  ranker output (`search`, `context`) is deliberately NOT counted, see
-  `@heat_read_access_types`. Usage is treated as the authority on importance, so material that
+  ranker output (`search`, `context`) and a drill that DECLARES it came from this index are
+  deliberately NOT counted, see `@heat_read_access_types`. Usage is treated as the authority on importance, so material that
   keeps proving worth reading holds its rank regardless of what today's query embeds near.
   Heat is WINDOWED, not cumulative: an empty result means "nothing was read within
   `meta.heat_window`", NOT "the corpus is empty".
@@ -8951,8 +8957,14 @@ defmodule Loopctl.Knowledge do
   A signal the ranked party controls is not a signal. A READER is `coalesce(agent_id,
   api_key_id)` of the key that read, NOT the key row: v2 mints a fresh ephemeral key per
   dispatch, so counting KEYS would count DISPATCHES — an agent that re-dispatches N times
-  votes N times, the same pinning one cheap API call away. One agent contributes at most 1
+  votes N times, the same pinning one cheap API call away. One AGENT contributes at most 1
   however many times, and from however many dispatches, it reads.
+
+  That collapse needs an `agent_id` to collapse ONTO, so it is a claim about agent-bearing
+  keys only. A key with none — a user/orchestrator key — votes as itself, so a tenant that
+  mints N of them can lift its own article to heat N. Minting is a `:user`-role, audited
+  surface and the effect stops inside that tenant's own index, but it is NOT the one-vote
+  guarantee above and must not be restated as one.
 
   Breadth is a SMALL integer (fleet size), so ties are the common case — and a fleet sharing
   one key ties every article at 1. The tie is broken on DISTINCT READ DAYS, never on raw event
@@ -9054,7 +9066,7 @@ defmodule Loopctl.Knowledge do
            tool: "knowledge_progressive_drill",
            parameter: "article_id",
            note:
-             "Pass a listed id to read the full article; this tool also opens the system canonicals listed here, which knowledge_get cannot. Ordering is distinct readers within meta.heat_window, not relevance to any query."
+             "Pass a listed id to read the full article, with from=heat_index so the read is not counted as heat — otherwise this index feeds the ranking that surfaced the stub. This tool also opens the system canonicals listed here, which knowledge_get cannot. Ordering is distinct readers within meta.heat_window, not relevance to any query."
          }
        }
      }}
@@ -9259,13 +9271,28 @@ defmodule Loopctl.Knowledge do
   # that used to answer slowly now answered 500 on a per-turn endpoint whose declared
   # degradation is a 429. Re-raise it as the gate's own overload, which `HeavyReadOverloadHandler`
   # already maps to that 429 — no new error shape, and nothing of the fault is interpolated.
+  #
+  # It is LOGGED first, under a stable tag per fault class. Re-raising silently made this 429
+  # indistinguishable from ordinary gate shedding, so saturation of the 3-connection admin pool
+  # that custody writes share — a systemic fault — looked like one tenant reading too much, and
+  # nothing in the logs said otherwise. The `:exit` clause also catches exits that are not pool
+  # pressure at all (a shutdown, a sandbox ownership exit), which is exactly why its reason has
+  # to reach the log rather than be discarded into an overload label.
   defp heat_stub_projection(query, tenant_id) do
     AdminRepo.all(query, timeout: @heat_stub_timeout_ms)
   rescue
-    DBConnection.ConnectionError ->
+    e in DBConnection.ConnectionError ->
+      Logger.warning(
+        "heat_stub_projection: admin_pool_checkout_failed tenant_id=#{tenant_id} #{Exception.message(e)}"
+      )
+
       reraise Loopctl.HeavyRead.OverloadedError, [tenant_id: tenant_id], __STACKTRACE__
   catch
-    :exit, _reason ->
+    :exit, reason ->
+      Logger.warning(
+        "heat_stub_projection: admin_pool_exit tenant_id=#{tenant_id} #{inspect(reason)}"
+      )
+
       raise Loopctl.HeavyRead.OverloadedError, tenant_id: tenant_id
   end
 
@@ -9468,23 +9495,36 @@ defmodule Loopctl.Knowledge do
   isolation is unaffected — the fallback only ever *widens* what a tenant-scoped
   `:not_found` was allowed to catch, onto the same system-canonical set the
   index already surfaces.
+
+  Pass `from: :heat_index` when the stub came from `heat_index/2`: that read is then recorded
+  as `"drill"`, which heat does NOT count, so the index cannot feed the ranking that surfaced
+  the stub (#569). Any other drill records a plain `"get"` and counts like any body read.
   """
   @spec progressive_drill(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Article.t()} | {:error, :not_found}
   def progressive_drill(tenant_id, article_id, opts \\ []) do
-    # Records `"drill"`, not `"get"` (#569). This is the tool `heat_index/2`'s own `meta.drill`
-    # names, and heat ranks on `"get"` — so recording one here meant an article gained heat
-    # from having been SHOWN by the index, and material that never surfaced could not overtake
-    # material that already had. A caller-forced `:access_type` is overridden, not honoured:
-    # the point is that this PATH cannot feed the ranking, and letting the opts decide would
-    # hand that back to the caller. Set on BOTH branches — a system canonical reached through
-    # the fallback is the same read.
-    opts = Keyword.put(opts, :access_type, "drill")
+    opts = Keyword.put(opts, :access_type, drill_access_type(opts))
 
     case get_article(tenant_id, article_id, opts) do
       {:error, :not_found} -> drill_system_canonical(tenant_id, article_id, opts)
       result -> result
     end
+  end
+
+  # A drill records the UNCOUNTED `"drill"` type only when the caller says the stub came FROM
+  # `heat_index/2` (`from: :heat_index`); every other drill records a plain `"get"` (#569).
+  # Excluding the whole PATH excluded far too much: a system canonical's body is readable ONLY
+  # through this function (`get_article/3` filters on `tenant_id`, and a canon row's is NULL),
+  # so no production event could give one heat and `heat_index/2`'s "canonicals participate"
+  # invariant became unreachable — while every topic-seeded `progressive_index/3` drill, a
+  # caller-chosen read heat exists to measure, went silent too. Only the heat-index hop closes
+  # a loop (shown -> read -> ranked -> shown), so only that hop is excluded. The origin is
+  # DECLARED by the caller — nothing server-side ties a drill to a prior index call — so this
+  # bounds the ACCIDENTAL loop a cooperative fleet creates; it is not an adversarial control,
+  # and the docs must not claim otherwise. The adversarial bound is the distinct-reader count
+  # (#567), which holds however the read is labelled.
+  defp drill_access_type(opts) do
+    if Keyword.get(opts, :from) in [:heat_index, "heat_index"], do: "drill", else: "get"
   end
 
   defp drill_system_canonical(tenant_id, article_id, opts) do

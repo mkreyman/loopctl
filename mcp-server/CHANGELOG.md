@@ -13,9 +13,16 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   ranks on caller-chosen body reads, and `knowledge_progressive_drill` — the tool this index's
   own payload tells you to use — recorded one. Being shown therefore produced the rank that
   showed it, and material that never surfaced could not overtake material that already had.
-  A drill is now recorded under its own access type and excluded from the ranking; the read is
-  still recorded, and still counts as retrieval follow-through. Tool descriptions updated to
-  say so.
+
+### Added
+
+- **`knowledge_progressive_drill` takes an optional `from`.** Pass `from: "heat_index"` when
+  the stub came from `knowledge_heat_index`: that read is recorded under its own access type
+  and excluded from the ranking (the read is still recorded, and still counts as retrieval
+  follow-through). Every other drill records an ordinary body read and counts — labelling all
+  of them as index drills would silence topic-seeded reads and leave the published system
+  canonicals, whose bodies have no other read path, unrankable. The exclusion is therefore
+  cooperative: a `knowledge_get` of a listed id still counts.
 
 ## 2.65.0 — 2026-08-04 (the query-less retrieval route becomes reachable)
 

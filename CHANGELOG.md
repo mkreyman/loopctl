@@ -96,21 +96,27 @@ Operator-facing changes for deployments outside the hosted instance.
   there is **no multiplier to apply on top**. At the default of 500 the per-lane allowance is
   25/node.
 
-- **New `article_access_events.access_type` value: `drill` (#569).** A body opened via
-  `knowledge_progressive_drill` is now recorded as `drill` instead of `get`. Operator-visible
-  in two places. **Analytics filters on `access_type=get` will stop seeing drill reads** —
+- **New `article_access_events.access_type` value: `drill` (#569).** `GET
+  /api/v1/knowledge/progressive/:id` takes a new optional `from` parameter; with
+  `from=heat_index` the body read is recorded as `drill` instead of `get`. Operator-visible in
+  two places. **Analytics filters on `access_type=get` will stop seeing those reads** —
   `GET /api/v1/knowledge/analytics/*` and anything grouping by access type must add `drill` to
   keep the same population. And the value set that column can hold has grown, though there is
   no DB CHECK to migrate: the allowlists are `ArticleAccessEvent.@access_types` and
-  `Analytics.@valid_access_types`. Nothing is back-filled, so historical drill reads stay
-  recorded as `get`.
+  `Analytics.@valid_access_types`.
 
   Why: `heat_index` ranks on `get`, and the drill tool its own `meta.drill` payload tells
   callers to use recorded a `get` — so an article gained heat from having been *shown* by the
   index. Visibility produced reads, reads produced rank, rank produced visibility, and
-  material that never surfaced could not overtake material that already had. Retrieval
+  material that never surfaced could not overtake material that already had. Only the
+  index-declared hop is split off: every other drill still records `get`, because published
+  system canonicals have no other body-read path and would otherwise be unrankable. Retrieval
   follow-through (`RetrievalMetrics`) deliberately DOES count `drill`, so precision figures
   are unaffected by the split.
+
+  Nothing is back-filled: reads taken before this deploy are `get` rows and keep feeding heat
+  until they age out of the window (90 days by default, up to 365 with `since`), so heat
+  rankings stay partly loop-contaminated for one window after the upgrade.
 
 - **`GET /api/v1/knowledge/heat_index` ranks by DISTINCT READERS, not by read count (#567).**
   Heat was `count(*)` over access-event rows, so any agent could pin its own article at rank 1 by

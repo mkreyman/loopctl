@@ -123,10 +123,11 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
         "article's BODY directly. Repeat reads by one reader count once. " <>
         "Only caller-chosen fetches are counted " <>
         "(`meta.counted_access_types`); list-shaped ranker output (a search hit, a context " <>
-        "pack) is one row per RESULT, not a read, so it adds no heat. Neither does a DRILL " <>
-        "opened from this index — that read is recorded under its own access type, because " <>
-        "counting it would let the index feed the ranking that surfaced the article. " <>
-        "Takes NO query, " <>
+        "pack) is one row per RESULT, not a read, so it adds no heat. Neither does a drill " <>
+        "that declares it came from here (GET /knowledge/progressive/:id?from=heat_index) — " <>
+        "that read is recorded under its own access type, so this index does not feed the " <>
+        "ranking that surfaced the article. Any other body read, including a plain " <>
+        "knowledge_get of a listed id, does count. Takes NO query, " <>
         "which is the " <>
         "point: every other retrieval route starts from one, so they all miss the same way " <>
         "on a paraphrase or on material that is topically central but lexically dissimilar. " <>
@@ -230,6 +231,16 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
         type: :string,
         description: "Article UUID to drill into.",
         required: true
+      ],
+      from: [
+        in: :query,
+        type: :string,
+        description:
+          "Where the stub came from. Pass `heat_index` when it came from " <>
+            "GET /knowledge/heat_index: the read is then recorded under an access type that " <>
+            "heat does NOT count, so the index cannot feed the ranking that surfaced the " <>
+            "stub. Any other value (or none) records an ordinary body read, which counts.",
+        required: false
       ]
     ],
     responses: %{
@@ -250,14 +261,17 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
   )
 
   @doc "GET /api/v1/knowledge/progressive/:id"
-  def drill(conn, %{"id" => article_id}) do
+  def drill(conn, %{"id" => article_id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
     api_key_id = conn.assigns.current_api_key.id
 
     # Thread api_key_id so finalize_article_read/Analytics.record_access attributes
     # the body read (parity with ArticleController.show and the hybrid endpoint) —
     # without it, every progressive-drill read is an audit/analytics blind spot.
-    opts = Keyword.merge([api_key_id: api_key_id], Visibility.scope_opts(conn))
+    opts =
+      [api_key_id: api_key_id]
+      |> maybe_add_opt(:from, drill_origin(params["from"]))
+      |> Keyword.merge(Visibility.scope_opts(conn))
 
     with {:ok, article} <-
            Knowledge.progressive_drill(tenant_id, article_id, opts) do
@@ -273,6 +287,13 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
   # `{:error, :empty_query}` -> 400 instead.
   defp coerce_topic(topic) when is_binary(topic), do: topic
   defp coerce_topic(_), do: ""
+
+  # The ONE recognised origin, matched as a literal so no atom is ever built from user input.
+  # Anything else is nil (an ordinary, counted body read) rather than a 400: the parameter only
+  # ever REMOVES this read from the heat ranking, so a typo costs the caller nothing it was
+  # entitled to and must not fail a body fetch.
+  defp drill_origin("heat_index"), do: :heat_index
+  defp drill_origin(_), do: nil
 
   # Only ever called with a validated `:category` (nil or an atom), so no
   # empty-string clause is needed here.

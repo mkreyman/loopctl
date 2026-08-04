@@ -1429,10 +1429,14 @@ async function knowledgeHeatIndex({ category, limit, since }) {
   return toContent(result);
 }
 
-async function knowledgeProgressiveDrill({ article_id }) {
+async function knowledgeProgressiveDrill({ article_id, from }) {
+  const params = new URLSearchParams();
+  if (from) params.set("from", from);
+  const query = params.toString();
+
   const result = await apiCall(
     "GET",
-    `/api/v1/knowledge/progressive/${article_id}`,
+    `/api/v1/knowledge/progressive/${article_id}${query ? `?${query}` : ""}`,
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
@@ -4510,11 +4514,12 @@ const TOOLS = [
       "central but lexically dissimilar to your question, comes back empty and reads as 'the " +
       "KB has nothing' rather than 'I asked badly'. Reach for this when a search came back " +
       "empty or thin, or to survey what the fleet actually reads before you know what to " +
-      "ask. Ordering is usage, NOT relevance to any query — and drilling a stub from here " +
-      "does NOT add heat to what you opened, so the index cannot feed its own ranking. " +
-      "Open a stub with " +
-      "knowledge_progressive_drill (not knowledge_get — this index also lists published " +
-      "system canonicals, which knowledge_get cannot resolve).",
+      "ask. Ordering is usage, NOT relevance to any query. Open a stub with " +
+      "knowledge_progressive_drill and from: 'heat_index' (not knowledge_get — this index " +
+      "also lists published system canonicals, which knowledge_get cannot resolve). That " +
+      "from marks the read so it adds NO heat to what you opened; without it — or via " +
+      "knowledge_get — the read counts, and this index feeds the ranking that showed you the " +
+      "stub.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4556,6 +4561,15 @@ const TOOLS = [
           type: "string",
           format: "uuid",
           description: "The UUID of the article to open (from a progressive index stub).",
+        },
+        from: {
+          type: "string",
+          enum: ["heat_index"],
+          description:
+            "Pass 'heat_index' when the stub came from knowledge_heat_index: the read is then " +
+            "recorded under an access type heat does NOT count, so that index cannot feed the " +
+            "ranking that surfaced the stub. Omit it for every other drill — those reads count " +
+            "as ordinary usage, which is what heat is meant to measure.",
         },
       },
       required: ["article_id"],

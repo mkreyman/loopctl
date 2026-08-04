@@ -67,7 +67,7 @@ never pass `tenant_id`/`subject_id`.
    `drafts`/`publish` are `:orchestrator` (`:33`).
    Agent edits are visibility-scoped: an agent can only touch an article it can see. (See `chain-of-custody`.)
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:9000`; the counted set is `@heat_read_access_types`, `:8911`). The heat index is the one retrieval route that
+   (`knowledge.ex:9012`; the counted set is `@heat_read_access_types`, `:8917`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. This has been violated THREE
    times, each differently, so treat any new input to the ranking as guilty until checked:
@@ -77,8 +77,11 @@ never pass `tenant_id`/`subject_id`.
      loop; then counted DISTINCT KEYS, which under v2's per-dispatch ephemeral keys counted
      DISPATCHES. A reader is `coalesce(k.agent_id, e.api_key_id)`, and ties break on distinct read
      DAYS — never `count(e.id)`, which hands the tie straight back to the counter a loop inflates.
-   - **#569** counted `drill`, the access type recorded by `knowledge_progressive_drill` — the tool
-     this index's own `meta.drill` names — so being SHOWN produced the rank that showed it.
+   - **#569** counted the hop `knowledge_progressive_drill` makes FROM this index — the tool its
+     own `meta.drill` names — so being SHOWN produced the rank that showed it. Only a drill that
+     declares `from: :heat_index` records the uncounted `drill` type; excluding the whole path
+     instead left system canonicals (no other body-read path) unrankable and silenced every
+     topic-seeded drill. Cooperative, not enforced — the adversarial bound is the reader count.
    `drill` still counts in `RetrievalMetrics.compute_followed_through/2`, which asks whether a body
    was DELIVERED. The two access-type sets diverge on purpose; do not unify them. Adding a value to
    `ArticleAccessEvent.@access_types` requires the same value in `Analytics.@valid_access_types` —
