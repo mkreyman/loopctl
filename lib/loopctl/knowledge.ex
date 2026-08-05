@@ -9130,7 +9130,7 @@ defmodule Loopctl.Knowledge do
           |> heat_counts_query(top_k + 1, since, category, vis)
           |> then(&HeavyRead.all(tenant_id, &1, HeavyRead.opts(:heat_index)))
 
-        {counted, heat_stubs(tenant_id, Enum.take(counted, top_k), vis)}
+        {counted, heat_stubs(tenant_id, Enum.take(counted, top_k), category, vis)}
       end)
 
     ranked = Enum.take(counted, top_k)
@@ -9333,18 +9333,22 @@ defmodule Loopctl.Knowledge do
   # default admin-pool contention would convert into shed (429) heavy reads for that tenant on
   # unrelated endpoints. The work itself is bounded — a primary-key lookup of at most
   # `@max_relevance_page_size` ids with `left(body, ...)` clipping the body, i.e. no scan,
-  # unlike the aggregate it follows. `status` and visibility are re-applied
+  # unlike the aggregate it follows. `status`, visibility AND `category` are all re-applied
   # rather than trusted from the ranking query: the two run on separate connections, so an
-  # article can be unpublished in between, and this is the query that actually reads a title.
+  # article can be unpublished — or RE-CATEGORISED — in between, and this is the query that
+  # actually reads a title. Category was the one predicate omitted here, so a
+  # `category:`-filtered index could return a stub that had since moved out of that category;
+  # every filter the aggregate applies must be re-applied here or the invariant is only
+  # partial, which is worse than not claiming it.
   # The budget for a FULL page: `n` stubs at the per-stub cap, plus the JSON array framing
   # `chars` now measures — `[`, `]`, and the `n - 1` commas between stubs. An empty page
   # encodes as `[]`, hence the floor of 2.
   defp heat_array_budget(0), do: 2
   defp heat_array_budget(n), do: n * @heat_stub_char_cap + 2 + (n - 1)
 
-  defp heat_stubs(_tenant_id, [], _vis), do: []
+  defp heat_stubs(_tenant_id, [], _category, _vis), do: []
 
-  defp heat_stubs(tenant_id, rows, vis) do
+  defp heat_stubs(tenant_id, rows, category, vis) do
     ids = Enum.map(rows, & &1.article_id)
 
     by_id =
@@ -9359,6 +9363,7 @@ defmodule Loopctl.Knowledge do
           summary_source: fragment("left(?, ?)", a.body, ^(@heat_summary_chars * 8))
         }
       )
+      |> heat_filter_category(category)
       |> maybe_filter_by_visibility(vis)
       |> heat_stub_projection(tenant_id)
       |> Map.new(&{&1.id, &1})
@@ -9437,11 +9442,13 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  # A pool-side failure is saturation only when the pool actually SHED the checkout —
-  # `:queue_timeout`, a request that waited past the queue deadline. `reason: :error` is every
-  # OTHER connection fault (econnrefused, a credential rotated mid-deploy, a TLS failure), and
-  # those are outages, not this tenant reading too much; re-raised, the backstop renders them
-  # as the 503 `db_unavailable` every other DB path in the app returns for a ConnectionError.
+  # A pool-side failure — ANY `DBConnection.ConnectionError`, whatever its `:reason` — is
+  # treated as saturation and shed as a 429. That is deliberate and the paragraph below gives
+  # the measurement behind it. (An earlier version of this comment claimed the opposite: that
+  # only `:queue_timeout` sheds and `reason: :error` re-raises into a 503. It described a
+  # narrowing that was made once, measured to be wrong, and reverted — the code never matched
+  # it, and the test at heat_index_test.exs asserts all three of `:queue_timeout`, `:closed`
+  # and `:error` shed.)
   #
   # A SERVER-side fault is only saturation on `@heat_saturation_sqlstates`. A `Postgrex.Error`
   # carrying no SQLSTATE at all is a client-side encode/decode fault — a code bug, never load.

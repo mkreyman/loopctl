@@ -288,9 +288,10 @@ Operator-facing changes for deployments outside the hosted instance.
   openable with `knowledge_get` instead of 404ing, and **no backfill runs** — measured on the
   hosted deployment before deciding, not assumed: across 56,033 access events and 23 published
   canonicals there are ZERO `get` (and zero `drill`) rows against a system-scoped article, so
-  the migration would have had an empty subject. Before this change no path could emit a `get`
-  for a canonical at all, which makes any such row you DO find on your own deployment
-  drill-origin and safe to relabel; the rolling window (90 days by default) ages the rest out.
+  the migration would have had an empty subject. Before this change the DRILL was the only path
+  that could emit a `get` for a canonical, which makes any such row you DO find on your own
+  deployment drill-origin and safe to relabel; the rolling window (90 days by default) ages the
+  rest out.
 
 - **`meta.chars` / `meta.char_budget` on `heat_index` are BYTES of the encoded stub array**,
   array framing included. They were graphemes summed per stub, so a CJK or emoji payload was
