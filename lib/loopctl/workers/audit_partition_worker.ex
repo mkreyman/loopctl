@@ -22,6 +22,14 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
   @default_retention_days 90
   @future_months 3
 
+  # Autovacuum tuning stamped onto every partition (#579). Append-only leaves accumulate
+  # rather than churn, so the INSERT-driven trigger is the knob — the update-churn
+  # `vacuum_scale_factor` would wait on dead tuples that never arrive. Kept in lockstep with
+  # `20260804230000_tune_autovacuum_on_append_heavy_tables.exs`, which stamps the partitions
+  # that already existed; a partitioned PARENT has no heap and rejects these params entirely.
+  @analyze_scale_factor "0.05"
+  @vacuum_insert_scale_factor "0.1"
+
   @impl Oban.Worker
   def perform(_job) do
     create_future_partitions()
@@ -68,15 +76,64 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
 
       case SQL.query(Loopctl.Repo, sql, []) do
         {:ok, _} ->
-          :ok
+          stamp_autovacuum(partition_name)
 
         {:error, %{postgres: %{code: :duplicate_table}}} ->
-          :ok
+          stamp_autovacuum(partition_name)
 
         {:error, reason} ->
           Logger.warning("Failed to create partition #{partition_name}: #{inspect(reason)}")
       end
     end
+  end
+
+  # `CREATE TABLE ... PARTITION OF` does NOT inherit the parent's reloptions — and the parent
+  # cannot carry storage autovacuum params at all (no heap). So every partition must be
+  # stamped individually or it is created with the global defaults, which is how the whole
+  # corpus went un-analyzed until #579.
+  #
+  # SELF-HEALING, and stamped on the duplicate_table branch too: that covers a partition
+  # created before this code existed, and one created untuned during a deploy window. Guarded
+  # on the reloption being ABSENT rather than stamped unconditionally, because `ALTER TABLE`
+  # takes a SHARE UPDATE EXCLUSIVE lock and would fight the very autovacuum it is enabling.
+  defp stamp_autovacuum(partition_name) do
+    # Two statements rather than one `DO $$` block: a DO block takes no bind parameters
+    # (`$1` inside it is procedural, not a placeholder), so the name would have to be
+    # interpolated into the anonymous block anyway. This way the LOOKUP is parameterised and
+    # only the ALTER interpolates — and that name is generated from a year/month integer pair
+    # by `partition_name/2`, never from caller input.
+    already_tuned =
+      SQL.query(
+        Loopctl.Repo,
+        "SELECT 1 FROM pg_class WHERE relname = $1 AND $2 = ANY(reloptions)",
+        [partition_name, "autovacuum_analyze_scale_factor=#{@analyze_scale_factor}"]
+      )
+
+    case already_tuned do
+      {:ok, %{num_rows: 0}} -> apply_autovacuum_opts(partition_name)
+      {:ok, _} -> :ok
+      {:error, reason} -> log_tuning_failure(partition_name, reason)
+    end
+  end
+
+  defp apply_autovacuum_opts(partition_name) do
+    sql = """
+    ALTER TABLE #{partition_name} SET (
+      autovacuum_analyze_scale_factor = #{@analyze_scale_factor},
+      autovacuum_vacuum_insert_scale_factor = #{@vacuum_insert_scale_factor}
+    )
+    """
+
+    case SQL.query(Loopctl.Repo, sql, []) do
+      {:ok, _} -> :ok
+      {:error, reason} -> log_tuning_failure(partition_name, reason)
+    end
+  end
+
+  # Never fail partition creation over tuning — an untuned partition still accepts writes,
+  # and the next run re-attempts the stamp.
+  defp log_tuning_failure(partition_name, reason) do
+    Logger.warning("Failed to tune partition #{partition_name}: #{inspect(reason)}")
   end
 
   defp drop_expired_partitions do
