@@ -4,7 +4,8 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorker do
   the cutover runbook calls for, made executable and scheduled rather than an IEx-only
   library call.
 
-  Two classes of drift, swept every run:
+  THREE classes of drift, swept every run. The first two both presuppose a PARTIAL write;
+  the third exists because that assumption left total absence unrepairable:
 
     * **The dual-write crash window** — a legacy `articles.embedding` /
       `memories.embedding` written without its dim-1536 side-table mirror (the process
@@ -23,11 +24,28 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorker do
       rows; re-enqueuing the ordinary embedding workers re-embeds them at the active
       dimension.
 
+    * **Never embedded at all** — a published article with NO side-table row at ANY
+      dimension. It matches neither class above (no legacy column to mirror, no row at
+      another dimension to re-point), so before this it had no repair path and was simply
+      absent from every semantic search, silently and permanently.
+      `Embeddings.unembedded_articles/2` enumerates them oldest-first.
+
+      Measured on the hosted corpus 2026-08-05: **81 published articles**, oldest
+      2026-06-19, all with real bodies, none carrying a legacy embedding and none carrying
+      a side-table row — six weeks unsearchable while this worker ran hourly and reported
+      healthy. That is the shape of a reconciler that reconciles DRIFT BETWEEN two
+      representations but cannot see that both are missing.
+
   ## Scheduling
 
-  Runs `mode: "all_tenants"` from the Oban crontab (hourly). It fans out one
-  per-tenant job for every tenant that has embedding rows, each bounded per run, so a
-  large backlog drains over successive runs rather than in one long transaction.
+  Runs `mode: "all_tenants"` from the Oban crontab (hourly). It fans out one per-tenant job
+  for every tenant with embedding rows **or with published articles**, each bounded per run,
+  so a large backlog drains over successive runs rather than in one long transaction.
+
+  That second condition is load-bearing: keying the fan-out only on existing embedding rows
+  made the sweep structurally unable to reach the tenant that most needed it — one whose
+  articles were never embedded has no rows, so it was never enqueued, so it was never
+  repaired. A fan-out keyed on the artifact you are trying to create can never create it.
   """
 
   use Oban.Worker, queue: :knowledge, max_attempts: 3
@@ -38,6 +56,7 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorker do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Embeddings
+  alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Memory.MemoryEmbedding
   alias Loopctl.Workers.ArticleEmbeddingWorker
@@ -72,7 +91,42 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorker do
     # step that actually reads a tenant argument. The global backfill / live_denorm
     # repair ran once in the `all_tenants` branch above.
     reenqueue_active_dimension_gaps(tenant_id)
+    reenqueue_unembedded(tenant_id)
     :ok
+  end
+
+  # The THIRD drift class: never embedded at all. Both classes above presuppose a PARTIAL
+  # write — one needs the legacy column populated, the other needs a row at some other
+  # dimension — so an article with no embedding row anywhere matched neither and had no
+  # repair path. Measured 2026-08-05: 81 published articles unsearchable since June while
+  # this worker ran hourly and reported healthy.
+  defp reenqueue_unembedded(tenant_id) do
+    batch = 100
+
+    case Embeddings.unembedded_articles(tenant_id, batch) do
+      [] ->
+        :ok
+
+      articles ->
+        Enum.each(articles, fn article ->
+          %{tenant_id: tenant_id, article_id: article.id}
+          |> ArticleEmbeddingWorker.new()
+          |> Oban.insert()
+        end)
+
+        # Logged at :warning, not :info. A dimension gap is an expected race; an article
+        # that was never embedded means an embedding job was lost or permanently discarded,
+        # and the only reason the previous 81 went unnoticed for six weeks is that nothing
+        # ever said so out loud.
+        Logger.warning(
+          "EmbeddingReconciliationWorker: tenant=#{tenant_id} found #{length(articles)} " <>
+            "published article(s) with NO embedding at any dimension — invisible to semantic " <>
+            "search until re-embedded. Re-enqueued (batch cap #{batch}); a persistent count " <>
+            "here means the embedding jobs are failing, not that the backlog is draining."
+        )
+
+        :ok
+    end
   end
 
   # Re-embed the rows the completion sweep could have stranded at a dropped dimension.
@@ -107,7 +161,14 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorker do
     :ok
   end
 
-  # Every tenant that carries ANY embedding side-table row (article OR memory).
+  # Every tenant that carries any embedding side-table row, PLUS every tenant that has
+  # published articles at all.
+  #
+  # The second half is load-bearing and was missing. Selecting only tenants that already
+  # HAVE embedding rows makes the sweep unable to reach precisely the tenant it most needs
+  # to: one whose articles were never embedded has no rows, so it was never enqueued, so it
+  # was never repaired — the failure is self-concealing, and a fan-out keyed on the artifact
+  # you are trying to create can never produce it.
   defp tenant_ids do
     article_tenants =
       AdminRepo.all(from(ae in ArticleEmbedding, distinct: true, select: ae.tenant_id))
@@ -115,6 +176,16 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorker do
     memory_tenants =
       AdminRepo.all(from(me in MemoryEmbedding, distinct: true, select: me.tenant_id))
 
-    (article_tenants ++ memory_tenants) |> Enum.uniq()
+    published_article_tenants =
+      AdminRepo.all(
+        from(a in Article,
+          where: a.status == :published,
+          where: not is_nil(a.tenant_id),
+          distinct: true,
+          select: a.tenant_id
+        )
+      )
+
+    (article_tenants ++ memory_tenants ++ published_article_tenants) |> Enum.uniq()
   end
 end
