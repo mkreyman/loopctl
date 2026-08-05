@@ -2185,8 +2185,22 @@ defmodule Loopctl.Memory do
   # impersonated_at / effective_role) for a superadmin-impersonated graduation; forward it
   # so the graduated article's audit entry records WHO impersonated, not just the SA key
   # id — a silent gap in a custody-relevant write path otherwise.
+  # `on_low_novelty: :skip`, NOT the `:draft` default. Graduation is an UNATTENDED writer —
+  # no reviewer stands behind it — and `propose_article/3`'s own comment predicts what the
+  # default does here: the gated drafts "accumulate as invisible corpus debris that nothing
+  # ever resolves". Measured 2026-08-05: 26 such drafts on the hosted corpus, seven producing
+  # paths and ZERO automatic consumers (publish is orchestrator/user-gated and no worker
+  # calls it), two of them arriving during the very session that audited the backlog.
+  #
+  # Skipping loses nothing a draft would have kept: a low-novelty proposal means a
+  # near-identical article is ALREADY published, so the knowledge is in the corpus either
+  # way. The only difference is whether an unreadable copy of it also accumulates.
+  #
+  # This is deliberately not solved by auto-publishing the drafts instead. "No human in the
+  # loop" must mean "do not create the queue", never "approve unvetted content into the
+  # corpus every agent reads".
   defp propose_opts(%MemorySchema{subject_id: subject_id} = memory, opts) do
-    [visibility_agent_id: subject_id, on_gate_unavailable: :skip]
+    [visibility_agent_id: subject_id, on_gate_unavailable: :skip, on_low_novelty: :skip]
     |> maybe_put_embedding(memory)
     |> Keyword.merge(Keyword.take(opts, [:actor_id, :actor_label, :actor_type, :metadata]))
   end

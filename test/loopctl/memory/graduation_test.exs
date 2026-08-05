@@ -109,11 +109,49 @@ defmodule Loopctl.Memory.GraduationTest do
         )
 
       assert {:ok, verdict, article} = Memory.graduate_memory(scope, memory.id)
-      assert verdict in [:created, :gated_to_draft, :duplicate, :deduplicated]
+      # `:gated_to_draft` is deliberately absent: graduation is an unattended writer and now
+      # passes `on_low_novelty: :skip`, so it can never produce a draft. Leaving it in the
+      # allowed set would let a regression back to the `:draft` default pass silently.
+      assert verdict in [:created, :duplicate, :deduplicated]
       assert article.project_id == project.id
       assert article.body == "runbook: restart the worker pool"
       assert article.category == :finding
       refute is_nil(reload(memory).graduated_at)
+    end
+
+    test "a LOW-NOVELTY graduation creates nothing at all, rather than a stranded draft", %{
+      scope: scope,
+      project: project
+    } do
+      # Graduation is an UNATTENDED writer. The novelty gate's `:draft` default hands it a
+      # queue with no consumer: publishing is orchestrator/user-gated and no worker calls it,
+      # so a gated draft is invisible forever. `propose_article/3`'s own comment predicts
+      # exactly this, and it was measured — 26 stranded drafts on the hosted corpus across
+      # seven producing paths and zero automatic consumers.
+      #
+      # Skipping loses nothing a draft would have kept: low novelty MEANS a near-identical
+      # article is already published, so the knowledge is in the corpus either way.
+      expect(Loopctl.MockProposalAssessor, :assess, fn _tenant_id, _attrs, _opts ->
+        %{verdict: :low_novelty, score: 0.91, neighbors: []}
+      end)
+
+      memory =
+        fixture(:memory,
+          tenant_id: scope.tenant_id,
+          subject_id: scope.subject_id,
+          project_id: project.id,
+          text: "a near-duplicate of something already published"
+        )
+
+      before = AdminRepo.aggregate(Article, :count, :id)
+
+      assert {:ok, :skipped_low_novelty, nil} = Memory.graduate_memory(scope, memory.id)
+
+      assert AdminRepo.aggregate(Article, :count, :id) == before,
+             "a low-novelty graduation must create NO article row — not even a draft"
+
+      refute AdminRepo.exists?(from(a in Article, where: a.status == :draft)),
+             "the whole point is that no draft is produced for an unattended writer"
     end
 
     test "re_scope: :global promotes a PROJECT memory to a tenant-wide (project_id nil) article",

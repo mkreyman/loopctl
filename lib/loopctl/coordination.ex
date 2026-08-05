@@ -2309,9 +2309,16 @@ defmodule Loopctl.Coordination do
   #     inject an un-deduplicated published article during an embedding outage; it
   #     returns `{:error, :gate_unavailable}` so the caller retries once embeddings
   #     recover. Matches the reviewed Memory graduation posture (Memory.propose_opts/2).
+  # `on_low_novelty: :skip` for the same reason as `Memory.propose_opts/2`: channel-post
+  # graduation is an UNATTENDED writer, so the gate's `:draft` default produces articles
+  # nobody will ever publish. `propose_article/3`'s own comment names this failure, and it
+  # was measured — 26 stranded drafts, seven producers, zero automatic consumers. A
+  # low-novelty proposal means the knowledge is already published somewhere; skipping loses
+  # only the duplicate.
   defp propose_opts(agent_id, role, params) do
     (params[:audit] || [])
     |> Keyword.put(:on_gate_unavailable, :skip)
+    |> Keyword.put(:on_low_novelty, :skip)
     |> Keyword.merge(visibility_opts(agent_id, role))
   end
 
