@@ -43,6 +43,12 @@ defmodule Loopctl.Knowledge.ConsolidationProposal do
 
   @type t :: %__MODULE__{}
 
+  # `:contradiction_candidate` is RETIRED as of #605 — no longer produced by
+  # `Consolidation.analyze/3`, because `KnowledgeLintWorker.judge_redundant_conflicts/1`
+  # now owns that pile and resolves it automatically. The value STAYS in this enum: reports
+  # persisted before the change carry proposals with that class, and dropping the value
+  # would make `Ecto.Enum` fail to LOAD those historical rows. A retired class and a deleted
+  # one are different things, and only one of them is safe on a table with history.
   @classes [:duplicate_capture, :contradiction_candidate, :generic_title, :stale_entry]
   @review_statuses [:pending, :approved, :rejected]
 

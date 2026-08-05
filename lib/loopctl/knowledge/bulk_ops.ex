@@ -27,9 +27,16 @@ defmodule Loopctl.Knowledge.BulkOps do
 
   ## Operations
 
-  - `archive/3` — `:draft`/`:published` → `:archived` (reversible; links left
-    intact but inert in published-only graph traversal, AC-27.12.3).
-  - `unpublish/3` — `:published` → `:draft` (reversible).
+  - `archive/3` — `:draft`/`:published` → `:archived`. **NOT reversible in code.** The row
+    is retained and links are left intact but inert in published-only graph traversal
+    (AC-27.12.3), so nothing is destroyed — but `Article`'s `@valid_transitions` has no
+    `{:archived, _}` entry and there is no unarchive function, so the ONLY way back is a
+    `user+` PATCH carrying an explicit status. An earlier version of this line called it
+    "reversible"; that was wrong for articles and is exactly the sentence an unattended
+    caller would rely on before archiving something it cannot restore.
+  - `unpublish/3` — `:published` → `:draft`. Genuinely reversible: `{:draft, :published}`
+    is a valid transition, so `publish/3` restores it. This is the primitive to reach for
+    when something automated needs to retract an article.
   - `delete/3` / `delete_with_token/3` — irreversible HARD delete. FK-correct:
     `article_links` (both directions, tenant-scoped) are deleted FIRST in the
     same transaction or the `:restrict` FK aborts; `article_access_events`

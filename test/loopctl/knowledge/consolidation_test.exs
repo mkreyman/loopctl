@@ -226,116 +226,34 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
     end
   end
 
-  describe "analyze/3 — contradiction_candidate" do
-    test "proposes a conflict-flagged pair that carries no recorded verdict" do
+  describe "analyze/3 — contradiction_candidate is RETIRED (#605)" do
+    test "a conflict-flagged pair with no verdict is NOT proposed — the lint judge owns it" do
+      # This class used to be produced here. It is not any more: the nightly lint now
+      # resolves these pairs automatically (`judge_redundant_conflicts/1`, capped above the
+      # promotion rate so the queue converges), and proposing them here as well put two
+      # subsystems on one pile — one resolving it, the other re-reporting it nightly.
+      #
+      # Measured on the hosted corpus in the run that settled it: 15,588 of 16,340 proposals
+      # were this class, crowding the report's other 752 out of the per-class caps.
       tenant = fixture(:tenant)
       a = published(tenant.id, %{title: "Use Ecto.Multi", body: "Always wrap writes in Multi."})
-
-      b =
-        published(tenant.id, %{title: "Avoid Ecto.Multi", body: "Never wrap writes in Multi."})
-
+      b = published(tenant.id, %{title: "Avoid Ecto.Multi", body: "Multi is usually overkill."})
       system_conflict_link(tenant.id, a, b)
 
       {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
 
-      assert [proposal] = proposals_of(analysis, :contradiction_candidate)
-      assert Enum.sort(proposal.article_ids) == Enum.sort([a.id, b.id])
-      excerpts = Enum.map(proposal.evidence, & &1["excerpt"])
-      assert Enum.any?(excerpts, &(&1 =~ "Always wrap writes"))
-      assert Enum.any?(excerpts, &(&1 =~ "Never wrap writes"))
-      assert proposal.suggested_action =~ "conflict resolution"
+      assert proposals_of(analysis, :contradiction_candidate) == [],
+             "the lint judge owns this pile; a second proposer re-reports what it resolves"
+
+      refute Map.has_key?(analysis.summary.by_class, "contradiction_candidate"),
+             "a retired class must not keep occupying a slot in by_class"
     end
 
-    test "does not propose a pair an agent already judged (either link direction)" do
-      tenant = fixture(:tenant)
-      a = published(tenant.id, %{title: "Use Ecto.Multi"})
-      b = published(tenant.id, %{title: "Avoid Ecto.Multi"})
-
-      system_conflict_link(tenant.id, a, b)
-
-      [source_id, target_id] = Enum.sort([a.id, b.id])
-
-      %ConflictResolution{tenant_id: tenant.id}
-      |> ConflictResolution.changeset(%{
-        source_article_id: source_id,
-        target_article_id: target_id,
-        classification: :contradictory,
-        disposition: :dismiss,
-        confidence: :high,
-        evidence: "Judged already.",
-        annotated_by: "agent-1",
-        annotated_at: DateTime.utc_now()
-      })
-      |> AdminRepo.insert!()
-
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
-
-      assert proposals_of(analysis, :contradiction_candidate) == []
-    end
-
-    # An agent-created `contradicts` link is NOT a pair the conflict-resolution surface
-    # accepts (`validate_potential_conflict_exists/3` 422s it), so a proposal naming it
-    # would instruct the reviewer to make a call that always fails — and, since no verdict
-    # can ever be recorded, would be re-derived every night forever.
-    test "does not propose an agent-creatable contradicts link" do
-      tenant = fixture(:tenant)
-      a = published(tenant.id, %{title: "Use Ecto.Multi"})
-      b = published(tenant.id, %{title: "Avoid Ecto.Multi"})
-
-      fixture(:article_link, %{
-        tenant_id: tenant.id,
-        source_article_id: a.id,
-        target_article_id: b.id,
-        relationship_type: :contradicts
-      })
-
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
-
-      assert proposals_of(analysis, :contradiction_candidate) == []
-      assert analysis.summary.by_class["contradiction_candidate"] == 0
-    end
-
-    # Same dead end for a stray / legacy potential_conflict with no system stamp — which is
-    # exactly what `Knowledge.list_potential_conflicts/2` refuses to surface (kb-02).
-    test "does not propose a potential_conflict link that is not SYSTEM-flagged" do
-      tenant = fixture(:tenant)
-      a = published(tenant.id, %{title: "Use Ecto.Multi"})
-      b = published(tenant.id, %{title: "Avoid Ecto.Multi"})
-
-      fixture(:article_link, %{
-        tenant_id: tenant.id,
-        source_article_id: a.id,
-        target_article_id: b.id,
-        relationship_type: :potential_conflict,
-        metadata: %{}
-      })
-
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
-
-      assert proposals_of(analysis, :contradiction_candidate) == []
-    end
-
-    # Archiving retains article_links by design, so without a status join the pass kept
-    # proposing over an archived article — and quoting its body — while `corpus_size`
-    # excluded it from the denominator the same report states.
-    test "does not propose a pair whose endpoint is archived, and never quotes its body" do
-      tenant = fixture(:tenant)
-      a = published(tenant.id, %{title: "Use Ecto.Multi", body: "Always wrap writes in Multi."})
-
-      b =
-        published(tenant.id, %{title: "Avoid Ecto.Multi", body: "SECRET archived reasoning."})
-
-      system_conflict_link(tenant.id, a, b)
-
-      b |> Ecto.Changeset.change(%{status: :archived}) |> AdminRepo.update!()
-
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
-
-      assert proposals_of(analysis, :contradiction_candidate) == []
-
-      refute Enum.any?(analysis.proposals, fn p ->
-               Enum.any?(p.evidence, &(&1["excerpt"] =~ "SECRET archived"))
-             end)
+    test "the class VALUE survives in the schema enum, so historical rows still load" do
+      # Retiring a class and deleting it are different things. Reports persisted before #605
+      # carry proposals with this class, and dropping the value from the Ecto.Enum would make
+      # those rows fail to LOAD — turning a docs change into a read outage on history.
+      assert :contradiction_candidate in ConsolidationProposal.classes()
     end
   end
 

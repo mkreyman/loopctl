@@ -40,10 +40,9 @@ defmodule LoopctlWeb.KnowledgeConsolidationController do
         "normalized away, or idempotency keys that collide under the same normalization " <>
         "while differing verbatim: capture tag-format drift, which the novelty gate does " <>
         "not catch because novelty scoring and idempotency are separate paths); " <>
-        "`contradiction_candidate` (a SYSTEM-flagged `potential_conflict` pair of PUBLISHED " <>
-        "articles with no recorded verdict — the same predicates the conflict-resolution " <>
-        "surface itself requires, so a proposal never names a pair that surface would " <>
-        "refuse; reported into that surface, not a parallel store); " <>
+        "`contradiction_candidate` (RETIRED as of #605 and no longer produced — the nightly " <>
+        "lint now judges those pairs automatically; historical reports may still carry the " <>
+        "class); " <>
         "`generic_title` (a placeholder title that collides on active-title uniqueness " <>
         "and blocks hub creation); `stale_entry` (past the lint staleness threshold and " <>
         "never reconciled).\n\n" <>
