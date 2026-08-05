@@ -1,12 +1,17 @@
 defmodule Loopctl.Knowledge.Consolidation do
   @moduledoc """
-  The nightly consolidation ("dream") pass over a tenant's PUBLISHED corpus — #584,
-  stage 1 of 3: **report only, writes nothing**.
+  The nightly consolidation ("dream") pass over a tenant's PUBLISHED corpus (#584, #605).
+
+  It REPORTS on three defect classes, and APPLIES exactly one of them — `:duplicate_capture`,
+  and only as `unpublish`, and only where two consecutive runs agree. Everything else is
+  report-only. See `apply_confirmed_duplicates/2` for why those three restrictions are the
+  whole safety model.
 
   The pass reconciles the corpus and emits NUMBERED proposals, each naming the
   articles involved and carrying a QUOTED excerpt from each as evidence. It writes
-  its findings to `consolidation_reports` / `consolidation_proposals` and NOTHING
-  else — no `articles`, `article_links` or `conflict_resolutions` write happens here.
+  its findings to `consolidation_reports` / `consolidation_proposals`. The only other
+  write it can make is the confirmed-duplicate unpublish above; it never writes
+  `article_links` or `conflict_resolutions` (the nightly lint judge owns conflicts).
   There is no human approve/reject stage and there will not be one (#605 supersedes
   #594): a queue whose only consumer is a human nobody staffs is the failure this
   codebase has hit three separate times. Auto-apply is gated on REVERSIBILITY instead —
@@ -77,6 +82,7 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   alias Loopctl.AdminRepo
   alias Loopctl.HeavyRead
+  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ConsolidationProposal
   alias Loopctl.Knowledge.ConsolidationReport
@@ -97,6 +103,11 @@ defmodule Loopctl.Knowledge.Consolidation do
   @generic_title_pattern "^(untitled|untitled document|new article|new document|document|draft|no title|untitled note)( [0-9]+)?$"
   # The heavy-read endpoint every whole-corpus enumeration in this module runs under.
   @heavy_endpoint :consolidation
+
+  # How many CONFIRMED duplicate groups one nightly run may apply. Bounded because each
+  # apply is a write on the shared admin pool, and because a bug that mis-picks winners
+  # should be visible after one night rather than after the whole corpus.
+  @default_max_applies 25
 
   @doc "Default per-class proposal cap."
   @spec default_max_per_class() :: pos_integer()
@@ -207,6 +218,145 @@ defmodule Loopctl.Knowledge.Consolidation do
       end)
 
     {:ok, report}
+  end
+
+  @doc """
+  Applies the `:duplicate_capture` proposals that TWO consecutive runs agree on.
+
+  The only class this pass applies by itself, and the only action it will take: keep the
+  richest article of a duplicate group and UNPUBLISH the rest.
+
+  ## Why unpublish and never archive
+
+  `:archived` is TERMINAL for an article — `Article`'s transition table has no
+  `{:archived, _}` and there is no unarchive function, so the only way back is a `user+`
+  PATCH. `{:published, :draft}` and `{:draft, :published}` are both real transitions, so
+  unpublish is the one retraction an unattended pass can undo. A class earns auto-apply by
+  being REVERSIBLE, not by being confident.
+
+  ## Why two runs must agree
+
+  This replaces the human approve/reject stage (#605 supersedes #594) with something that
+  works without anyone: a proposal applies only if the SAME fingerprint appeared in the
+  PREVIOUS report as well. Anything transient — a duplicate created and cleaned up between
+  runs, a title edited mid-scan, a half-finished import — is gone by the next night and is
+  never acted on. It costs one night of latency and removes the entire class of "acted on a
+  state that was already resolving itself", which is most of what a human reviewer catches.
+
+  It is deliberately NOT a confidence score. Confidence is the machine grading its own
+  homework; agreement across two independent observations of a moving corpus is evidence.
+
+  ## Why the winner is recomputed here, not read from the proposal
+
+  The corpus moves between the scan and the write. Every article in the group is re-checked
+  as still published and still colliding at apply time; a group that no longer holds is
+  skipped, not forced. Reading a winner chosen hours ago would be applying a decision to a
+  corpus that no longer matches it.
+  """
+  @spec apply_confirmed_duplicates(Ecto.UUID.t(), keyword()) :: %{
+          applied: non_neg_integer(),
+          skipped: non_neg_integer()
+        }
+  def apply_confirmed_duplicates(tenant_id, opts \\ []) do
+    cap = Keyword.get(opts, :max_applies, @default_max_applies)
+
+    tenant_id
+    |> confirmed_duplicate_proposals(cap)
+    |> Enum.reduce(%{applied: 0, skipped: 0}, &tally_apply(tenant_id, &1, &2))
+  end
+
+  defp tally_apply(tenant_id, proposal, acc) do
+    case apply_duplicate_group(tenant_id, proposal) do
+      {:ok, n} -> %{acc | applied: acc.applied + n}
+      :skip -> %{acc | skipped: acc.skipped + 1}
+    end
+  end
+
+  # Proposals present in BOTH the newest report and the one before it, matched on
+  # `fingerprint` — which is derived from the class plus the sorted article-id set, so it is
+  # stable across runs precisely when the same group is still being found.
+  defp confirmed_duplicate_proposals(tenant_id, cap) do
+    case recent_report_ids(tenant_id) do
+      [newest, previous] ->
+        previous_fingerprints =
+          from(p in ConsolidationProposal,
+            where: p.tenant_id == ^tenant_id and p.report_id == ^previous,
+            where: p.proposal_class == :duplicate_capture,
+            select: p.fingerprint
+          )
+          |> AdminRepo.all()
+
+        from(p in ConsolidationProposal,
+          where: p.tenant_id == ^tenant_id and p.report_id == ^newest,
+          where: p.proposal_class == :duplicate_capture,
+          where: p.fingerprint in ^previous_fingerprints,
+          order_by: [asc: p.number],
+          limit: ^cap
+        )
+        |> AdminRepo.all()
+
+      _fewer_than_two_reports ->
+        # First ever run, or only one report so far: nothing has been confirmed twice, so
+        # nothing applies. The pass is silent rather than eager on a fresh install.
+        []
+    end
+  end
+
+  defp recent_report_ids(tenant_id) do
+    from(r in ConsolidationReport,
+      where: r.tenant_id == ^tenant_id,
+      order_by: [desc: r.day],
+      limit: 2,
+      select: r.id
+    )
+    |> AdminRepo.all()
+  end
+
+  defp apply_duplicate_group(tenant_id, proposal) do
+    live =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.id in ^proposal.article_ids,
+        where: a.status == :published,
+        select: %{
+          id: a.id,
+          body_len: fragment("length(coalesce(?, ''))", a.body),
+          updated_at: a.updated_at
+        }
+      )
+      |> AdminRepo.all()
+
+    # Re-verification, not trust. The group must STILL be a group: fewer than two live
+    # published members means it resolved itself between the scan and now, and applying
+    # would unpublish the last copy of something.
+    if length(live) < 2 do
+      :skip
+    else
+      [winner | losers] =
+        Enum.sort_by(live, fn a ->
+          {-a.body_len, -DateTime.to_unix(a.updated_at, :microsecond), a.id}
+        end)
+
+      applied = Enum.count(losers, &unpublish_duplicate(tenant_id, &1))
+
+      Logger.info(
+        "Consolidation: tenant=#{tenant_id} applied duplicate_capture proposal " <>
+          "##{proposal.number} — kept #{winner.id}, unpublished #{applied} of " <>
+          "#{length(losers)} duplicate(s). Reversible via publish."
+      )
+
+      {:ok, applied}
+    end
+  end
+
+  defp unpublish_duplicate(tenant_id, loser) do
+    case Knowledge.unpublish_article(tenant_id, loser.id,
+           actor_type: "system",
+           actor_label: "worker:consolidation"
+         ) do
+      {:ok, _} -> true
+      {:error, _} -> false
+    end
   end
 
   @doc """

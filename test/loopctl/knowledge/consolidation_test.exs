@@ -6,6 +6,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
@@ -632,6 +633,102 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert [%{evidence: [entry]}] = result.proposals
       assert entry["excerpt"] =~ "Still published"
       refute Map.has_key?(entry, "redacted")
+    end
+  end
+
+  describe "apply_confirmed_duplicates/2 (#605 — the one class that applies itself)" do
+    # Two published articles whose titles collide once punctuation/case are normalized away.
+    defp duplicate_pair(tenant_id) do
+      a =
+        published(tenant_id, %{
+          title: "AWS CodeDeploy: Traffic Control",
+          body: String.duplicate("long winner body ", 20)
+        })
+
+      b = published(tenant_id, %{title: "AWS CodeDeploy Traffic Control", body: "short"})
+      {a, b}
+    end
+
+    defp status(id), do: AdminRepo.get!(Article, id).status
+
+    test "applies NOTHING after a single run — one observation is not confirmation" do
+      # This is what replaces human approve/reject. A duplicate that appears once and is gone
+      # by the next run (a half-finished import, a title edited mid-scan) is never acted on,
+      # and it costs one night of latency to get that.
+      tenant = fixture(:tenant)
+      {a, b} = duplicate_pair(tenant.id)
+
+      {:ok, _} = Consolidation.run(tenant.id, %{})
+
+      assert %{applied: 0, skipped: 0} = Consolidation.apply_confirmed_duplicates(tenant.id)
+      assert status(a.id) == :published
+      assert status(b.id) == :published
+    end
+
+    test "a duplicate that appeared only in the NEWEST run is not applied" do
+      # The real confirmation test. Two reports exist, so the fewer-than-two short-circuit
+      # does not fire — the proposal is excluded because its fingerprint is absent from the
+      # PREVIOUS report. Without this, the sibling test above passes for the wrong reason.
+      tenant = fixture(:tenant)
+      published(tenant.id, %{title: "Something Else Entirely", body: "unrelated"})
+
+      # Night one: no duplicates exist yet.
+      {:ok, _} = Consolidation.run(tenant.id, %{}, day: Date.add(Date.utc_today(), -1))
+
+      # The duplicate is created AFTER that run.
+      {a, b} = duplicate_pair(tenant.id)
+
+      # Night two: the proposal appears for the first time.
+      {:ok, _} = Consolidation.run(tenant.id, %{})
+
+      assert %{applied: 0, skipped: 0} = Consolidation.apply_confirmed_duplicates(tenant.id)
+      assert status(a.id) == :published
+      assert status(b.id) == :published
+    end
+
+    test "applies once TWO consecutive runs agree, unpublishing the losers and keeping the richest" do
+      tenant = fixture(:tenant)
+      {a, b} = duplicate_pair(tenant.id)
+
+      {:ok, _} = Consolidation.run(tenant.id, %{}, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id, %{})
+
+      assert %{applied: 1, skipped: 0} = Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      # The richest (longest body) survives; the duplicate is UNPUBLISHED, never archived —
+      # :archived is terminal for an article, so it is the one retraction that cannot be
+      # undone in code.
+      assert status(a.id) == :published
+      assert status(b.id) == :draft
+    end
+
+    test "SKIPS a group that no longer holds at apply time" do
+      # The corpus moves between the scan and the write. If the group resolved itself in
+      # between, applying would unpublish the last remaining copy.
+      tenant = fixture(:tenant)
+      {a, b} = duplicate_pair(tenant.id)
+
+      {:ok, _} = Consolidation.run(tenant.id, %{}, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id, %{})
+
+      # Someone (or something) already unpublished one of them.
+      {:ok, _} = Knowledge.unpublish_article(tenant.id, b.id)
+
+      assert %{applied: 0, skipped: 1} = Consolidation.apply_confirmed_duplicates(tenant.id)
+      assert status(a.id) == :published, "the survivor must never be unpublished"
+    end
+
+    test "the unpublish is REVERSIBLE, which is the whole reason this class may auto-apply" do
+      tenant = fixture(:tenant)
+      {_a, b} = duplicate_pair(tenant.id)
+
+      {:ok, _} = Consolidation.run(tenant.id, %{}, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id, %{})
+      assert %{applied: 1} = Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert status(b.id) == :draft
+      assert {:ok, _} = Knowledge.publish_article(tenant.id, b.id)
+      assert status(b.id) == :published
     end
   end
 end

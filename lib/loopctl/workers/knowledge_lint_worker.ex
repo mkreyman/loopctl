@@ -137,6 +137,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     judged = judge_redundant_conflicts(tenant_id)
     resolutions_applied = Knowledge.execute_conflict_resolutions(tenant_id)
     consolidation = consolidate(tenant_id, report)
+    # Apply AFTER consolidate/2 wrote tonight's report, so the two-run confirmation compares
+    # tonight against last night rather than last night against the night before.
+    applied = apply_consolidation(tenant_id)
 
     log_audit_event(
       tenant_id,
@@ -153,6 +156,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
         "conflicts_promoted=#{promoted} conflicts_judged_redundant=#{judged} " <>
         "resolutions_applied=#{resolutions_applied} " <>
+        "duplicates_unpublished=#{applied.applied} duplicate_groups_skipped=#{applied.skipped} " <>
         consolidation_log(consolidation)
     )
 
@@ -480,6 +484,30 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # lose the pre-existing pass's observability permanently. The failure is recorded in
   # the audit event instead, as a low-cardinality TAG (never the raw error, which carries
   # backend host / database / role).
+  # FAIL-SOFT like consolidate/2 above, and for the same reason: this is the first thing in
+  # the nightly run that WRITES to `articles`, and a raise here must not abort a pass whose
+  # other steps already succeeded. A failure costs one night of duplicate cleanup, which is
+  # the cheapest thing in the run to lose.
+  defp apply_consolidation(tenant_id) do
+    Consolidation.apply_confirmed_duplicates(tenant_id)
+  rescue
+    e ->
+      Logger.error(
+        "KnowledgeLintWorker: tenant=#{tenant_id} consolidation apply failed " <>
+          "(#{ExitTag.tag(e)}); no duplicates unpublished this run."
+      )
+
+      %{applied: 0, skipped: 0}
+  catch
+    :exit, reason ->
+      Logger.error(
+        "KnowledgeLintWorker: tenant=#{tenant_id} consolidation apply exited " <>
+          "(#{"exit:" <> ExitTag.tag(reason)}); no duplicates unpublished this run."
+      )
+
+      %{applied: 0, skipped: 0}
+  end
+
   defp consolidate(tenant_id, report) do
     max_per_class =
       Application.get_env(
