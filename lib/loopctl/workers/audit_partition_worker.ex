@@ -24,12 +24,19 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
   @future_months 3
 
   # Every statement here is DDL, and `CREATE ... PARTITION OF`, `DROP TABLE` and
-  # `ALTER TABLE ... SET (...)` all require OWNERSHIP of the relation. In production
-  # `Loopctl.Repo` connects as `loopctl_app`, which holds only SELECT/INSERT/UPDATE/DELETE
-  # grants (deploy/FLY_SECRETS.md); migrations — and therefore the partitions they create —
-  # run as `loopctl_admin`, the owner, which is AdminRepo's role. Through Repo every
-  # statement below would fail in prod and be swallowed by the fail-soft warning, leaving
-  # the tuning real only in the dev/test superuser DBs.
+  # `ALTER TABLE ... SET (...)` all require OWNERSHIP of the relation — a grant is not
+  # enough. AdminRepo is the repo whose role owns them: migrations run through it
+  # (`Loopctl.Release.migrate/0`), so it created every partition and every table this touches.
+  #
+  # This is correctness against the DOCUMENTED split (`deploy/FLY_SECRETS.md`: `DATABASE_URL`
+  # is the grants-only `loopctl_app`, `ADMIN_DATABASE_URL` the owner `loopctl_admin`), NOT a
+  # repair of a live outage — measured 2026-08-04, the hosted deployment does not currently
+  # run that split. Its `DATABASE_URL` connects as `loopctl`, `ADMIN_DATABASE_URL` is UNSET so
+  # `config/runtime.exs` falls it back to the same URL, and the partitions are owned by
+  # `loopctl` — so Repo did own them and the DDL was succeeding. Do not "simplify" this back
+  # to Repo on the strength of that: the moment the documented split is actually deployed,
+  # every statement below starts failing into the fail-soft warning and the tuning silently
+  # stops being applied, which is exactly the undetected shape #579 was.
   @ddl_repo Loopctl.AdminRepo
 
   # Autovacuum tuning stamped onto every partition (#579). Append-only leaves accumulate
