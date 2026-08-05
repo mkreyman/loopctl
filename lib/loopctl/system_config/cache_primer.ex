@@ -40,6 +40,15 @@ defmodule Loopctl.SystemConfig.CachePrimer do
   log-only, and crashing every deploy on a transient DB blip is a worse failure
   than the one being fixed: boot proceeds on the in-code defaults, exactly as it
   did before this child existed.
+
+  That guarantee rests entirely on `SystemConfig.refresh/0` returning rather than
+  escaping, for EVERY fault shape — which is why its guard catches exits and
+  throws as well as raises. A DB pool that is unstarted, wedged, or dying
+  mid-query EXITS; a `rescue`-only guard would let that exit escape into
+  `start_link/1`, and a supervisor converts an exiting child start into
+  `{:error, {:shutdown, {:failed_to_start_child, ...}}}` — so the node would fail
+  to boot on precisely the "DB blip at boot" scenario this section promises to
+  survive.
   """
 
   require Logger

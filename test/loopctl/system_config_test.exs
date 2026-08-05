@@ -1,6 +1,8 @@
 defmodule Loopctl.SystemConfigTest do
   use Loopctl.DataCase, async: true
 
+  import ExUnit.CaptureLog
+
   alias Loopctl.SystemConfig
   alias Loopctl.SystemConfig.Setting
   alias Loopctl.Workers.ContentIngestionWorker
@@ -64,6 +66,90 @@ defmodule Loopctl.SystemConfigTest do
 
       assert :ok = SystemConfig.refresh()
       assert SystemConfig.get_int(setting.key, -1) == 9001
+    end
+  end
+
+  # #588 review: the boot primer is a SUPERVISION CHILD, and its documented contract is
+  # "a failed prime is loud but NEVER blocks boot". That contract is delivered entirely by
+  # refresh/0's guard returning rather than escaping. A `rescue`-only guard delivered it for
+  # a RAISE and missed every EXIT — and an exit escaping start_link/1 is converted by the
+  # supervisor into a failed child start, so the node never boots at all: the inverse of the
+  # contract, on the "DB blip at boot" scenario the contract names.
+  #
+  # The seam exists because the test database always answers AdminRepo.all/1 successfully;
+  # refresh/0 itself is proven wired to refresh_from/1 by the describe block above and by
+  # `Loopctl.SystemConfig.CachePrimerTest`.
+  describe "refresh_from/1 guard: a DB fault that EXITS, not just one that raises" do
+    test "a pool EXIT is caught and reported as an error tuple instead of escaping" do
+      # The REAL shape DBConnection/Postgrex exits with — a `{reason, call}` tuple, not a
+      # bare atom. A guard tested against `exit(:noproc)` would look correct while missing
+      # every production exit.
+      reason = {:noproc, {DBConnection, :execute, []}}
+
+      log =
+        capture_log(fn ->
+          assert SystemConfig.refresh_from(fn -> exit(reason) end) == {:error, {:exit, reason}}
+        end)
+
+      assert log =~ "error_class=exit:noproc"
+    end
+
+    test "the crash-propagation shape (pool died mid-query) is caught too" do
+      # What a pooled connection dying WHILE the query is checked out produces — the shape
+      # `Loopctl.ExitClass`/`DbErrorBackstop` were written for (#558).
+      reason = {{%Postgrex.Error{message: "boom"}, []}, {DBConnection, :execute, []}}
+
+      log =
+        capture_log(fn ->
+          assert SystemConfig.refresh_from(fn -> exit(reason) end) == {:error, {:exit, reason}}
+        end)
+
+      assert log =~ "error_class=exit:Postgrex.Error"
+    end
+
+    test "the exit reason is logged by BOUNDED class only — never the statement or its params" do
+      reason = {:noproc, {DBConnection, :execute, ["SELECT secret FROM t", ["bound-param"]]}}
+
+      log = capture_log(fn -> SystemConfig.refresh_from(fn -> exit(reason) end) end)
+
+      assert log =~ "error_class=exit:noproc"
+      refute log =~ "bound-param", "bound parameters must never reach the log"
+      refute log =~ "SELECT secret", "the failing statement must never reach the log"
+    end
+
+    test "a THROW is caught for the same reason (three non-local kinds, not two)" do
+      log =
+        capture_log(fn ->
+          assert SystemConfig.refresh_from(fn -> throw(:boom) end) == {:error, {:throw, :boom}}
+        end)
+
+      assert log =~ "error_class=throw:other"
+    end
+
+    test "a RAISE is still caught (the pre-existing arm keeps its {:error, exception} shape)" do
+      log =
+        capture_log(fn ->
+          assert {:error, %RuntimeError{}} = SystemConfig.refresh_from(fn -> raise "db down" end)
+        end)
+
+      assert log =~ "keeping existing cache"
+    end
+
+    test "an already-cached value SURVIVES a failed refresh of any kind" do
+      key = unique_key()
+      assert {:ok, _} = SystemConfig.put(key, 77)
+
+      capture_log(fn ->
+        for fail <- [
+              fn -> exit({:noproc, {DBConnection, :execute, []}}) end,
+              fn -> throw(:boom) end,
+              fn -> raise "db down" end
+            ] do
+          assert {:error, _} = SystemConfig.refresh_from(fail)
+        end
+      end)
+
+      assert SystemConfig.get_int(key, -1) == 77
     end
   end
 

@@ -45,6 +45,11 @@ defmodule Loopctl.SystemConfig.CachePrimerTest do
     end
   end
 
+  # The failing shape below is a RAISE (a sandbox ownership error). The EXIT shape — the one
+  # a `rescue`-only guard misses, and the one that would abort the whole supervision-tree
+  # start from here — is covered one level down, in `Loopctl.SystemConfigTest`'s
+  # "refresh_from/1 guard" block: `refresh/0` is what converts it into the `{:error, reason}`
+  # this branch handles, and the branch itself is shape-agnostic.
   describe "start_link/1 when the prime FAILS" do
     test "logs at :error, emits prime_failed telemetry, and STILL returns :ignore" do
       {handler_id, ref} = attach_prime_failed_handler()

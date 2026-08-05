@@ -44,11 +44,15 @@ defmodule Loopctl.SystemConfig do
       refresh cadence is not bounded to one minute, and
     * immediately for a single key on `put/2` (the writing node only).
 
-  `refresh/0` is `try/rescue`-wrapped so a DB blip can never crash boot or the
-  cron worker; the previously-cached values simply persist. It REPORTS the
-  failure as `{:error, reason}` (rather than swallowing it into `:ok`) so the
-  primer can make a failed boot prime loud — a silently empty cache is what turns
-  a bounded startup window into an unbounded one.
+  `refresh/0` guards the DB read with `rescue` AND `catch :exit, :throw` so a DB
+  blip can never crash boot or the cron worker; the previously-cached values
+  simply persist. Both kinds are required: a DBConnection/Postgrex fault against
+  an unstarted (`:noproc`), wedged (`{:timeout, _}`) or dying pool EXITS rather
+  than raises, and a `rescue`-only guard would let that exit escape — which, from
+  the supervised primer, aborts the whole tree start instead of degrading. It
+  REPORTS the failure as `{:error, reason}` (rather than swallowing it into `:ok`)
+  so the primer can make a failed boot prime loud — a silently empty cache is what
+  turns a bounded startup window into an unbounded one.
 
   The `:persistent_term` key is `{__MODULE__, key_string}` — string keys are used
   verbatim (never `String.to_atom/1` on them).
@@ -59,6 +63,7 @@ defmodule Loopctl.SystemConfig do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.ExitClass
   alias Loopctl.SystemConfig.Setting
 
   @doc """
@@ -80,16 +85,24 @@ defmodule Loopctl.SystemConfig do
   @doc """
   Loads ALL settings from the DB (via `AdminRepo`) into `:persistent_term`.
 
-  Wrapped in `try/rescue`: a DB error logs and returns `{:error, reason}` — it
-  never raises, so it can never crash boot or the refresh cron, and the existing
-  cache is left untouched. Callers that must react to a failed prime (see
-  `Loopctl.SystemConfig.CachePrimer`) match on the error tuple; callers that only
-  want best-effort propagation (the cron worker, `Loopctl.Release`) ignore it.
+  Guarded by `rescue` AND `catch`: a DB error logs and returns `{:error, reason}`
+  — it never raises AND never exits, so it can never crash boot or the refresh
+  cron, and the existing cache is left untouched. Callers that must react to a
+  failed prime (see `Loopctl.SystemConfig.CachePrimer`) match on the error tuple;
+  callers that only want best-effort propagation (the cron worker,
+  `Loopctl.Release`) ignore it.
   """
   @spec refresh() :: :ok | {:error, term()}
-  def refresh do
-    Setting
-    |> AdminRepo.all()
+  def refresh, do: refresh_from(fn -> AdminRepo.all(Setting) end)
+
+  @doc false
+  # Public ONLY as a seam for the guard's own tests: the test database always answers
+  # `AdminRepo.all/1` successfully, so left inline the `catch` arm below would be a guard
+  # nothing ever exercises — the same reason `Knowledge.heat_projection_exit/2` is public.
+  # `refresh/0` is the sole production caller and passes the real read.
+  @spec refresh_from((-> [Setting.t()])) :: :ok | {:error, term()}
+  def refresh_from(load) when is_function(load, 0) do
+    load.()
     |> Enum.each(fn %Setting{key: key, value: value} ->
       :persistent_term.put(pt_key(key), value)
     end)
@@ -103,6 +116,26 @@ defmodule Loopctl.SystemConfig do
       )
 
       {:error, e}
+  catch
+    # DBConnection/Postgrex EXIT rather than raise when the pool is not started
+    # (`{:noproc, {DBConnection, ...}}`), is wedged (`{:timeout, {GenServer, :call, _}}`),
+    # or dies mid-query (`{{%Postgrex.Error{}, stack}, {DBConnection, :execute, _}}`).
+    # `rescue` alone MISSES all three, and the boot primer is a supervision child: an
+    # escaping exit is converted by the supervisor into a failed child start, so the node
+    # never boots — the exact inverse of "a failed prime NEVER blocks boot". A `throw` is
+    # caught for the same reason (enumerating two of the three non-local exit kinds is how
+    # this hole keeps reappearing).
+    #
+    # Logged by BOUNDED class, never the raw reason: an exit reason carries the checkout
+    # tuple, which on the crash-propagation shape carries the failing statement and its
+    # bound parameters (#562).
+    kind, reason when kind in [:exit, :throw] ->
+      Logger.warning(
+        "Loopctl.SystemConfig.refresh/0 failed; keeping existing cache: " <>
+          "error_class=#{ExitClass.classify(kind, reason)}"
+      )
+
+      {:error, {kind, reason}}
   end
 
   @doc """

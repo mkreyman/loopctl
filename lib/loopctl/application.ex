@@ -31,7 +31,15 @@ defmodule Loopctl.Application do
     opts = [strategy: :one_for_one, name: Loopctl.Supervisor]
     result = Supervisor.start_link(children(), opts)
 
-    post_boot_checks()
+    # ONLY on a successful start: these checks need the tree RUNNING, and one of them
+    # (ReplicaReadiness) raises by design. On a failed start every already-started child
+    # has been torn down, so running them there replaces the real
+    # `{:error, {:shutdown, {:failed_to_start_child, ...}}}` — the diagnosis — with an
+    # unrelated crash from a check querying a repo that no longer exists.
+    case result do
+      {:ok, _pid} -> post_boot_checks()
+      _error -> :ok
+    end
 
     result
   end
