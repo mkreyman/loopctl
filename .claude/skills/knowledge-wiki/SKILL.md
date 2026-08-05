@@ -176,7 +176,9 @@ number, is the load-bearing invariant. To monitor and keep it healthy over time:
   in its scan map. The executable surface enforces this: `mix loopctl.embeddings revert` REFUSES while
   the legacy index is absent (capability-detected, `--force` to override) and `mix loopctl.embeddings
   status` reports its presence. Operator procedure:
-  `docs/runbooks/embedding-dimension-cutover.md` (Reverting).
+  `docs/runbooks/embedding-dimension-cutover.md` — Retiring the legacy articles ANN index (the
+  drop, the baseline above, and the `pg_stat_statements` query for the AFTER reading) and
+  Reverting.
 - **Bulk (re)embed / backfill is a live-DB hazard.** Unthrottled it 504s the live wiki — per-row HNSW
   index maintenance saturates the small Fly Postgres and starves concurrent heavy-read searches past
   their `statement_timeout`. Throttled id-range keyset pattern: wiki `7a4187fd`.

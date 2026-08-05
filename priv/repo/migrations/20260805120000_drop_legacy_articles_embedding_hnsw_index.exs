@@ -21,6 +21,10 @@ defmodule Loopctl.Repo.Migrations.DropLegacyArticlesEmbeddingHnswIndex do
   # (`article_embeddings`) on 2026-07-22, so the legacy index buys nothing on a
   # cut-over install and costs the live index its cache residency.
   #
+  # Those are the BEFORE figures. The matching AFTER reading is taken by
+  # `docs/runbooks/embedding-dimension-cutover.md` (Retiring the legacy articles ANN
+  # index) — same `pg_stat_statements` statement, per call, with `track_io_timing` on.
+  #
   # The 26 scans were NOT a stray consumer: they were the boot window GH #588 narrowed,
   # in which the `SystemConfig` cache had not been primed before the Endpoint started
   # and `embedding_side_table_reads` read its in-code default `0` (= legacy column).

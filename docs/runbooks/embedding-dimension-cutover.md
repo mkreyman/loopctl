@@ -28,6 +28,70 @@ reading the side table would miss its writes.
 
        mix loopctl.embeddings cutover
 
+## Retiring the legacy `articles` ANN index (GH #578)
+
+**Cut-over installs only** — i.e. only where `embedding_side_table_reads` is already `1`.
+On an install still reading the legacy column that index IS the live read path, dropping it
+there causes the outage described under Reverting, and the drop is one-way. Migration
+`20260805120000_drop_legacy_articles_embedding_hnsw_index.exs` performs the drop itself,
+guarded on that flag; run it out-of-band ahead of the deploy only if you want the space back
+without waiting on the migrator (`IF EXISTS` then makes the migration a no-op):
+
+    DROP INDEX CONCURRENTLY articles_embedding_hnsw_idx;
+
+### Recorded baseline — hosted instance, 2026-08-04, PRE-drop
+
+The fixed point the after-reading is compared against. `shared_buffers` was 1536 MB and the
+two indexes were large enough to evict each other:
+
+| index | size | scans |
+|---|---:|---:|
+| `articles_embedding_hnsw_idx` (legacy column) | 657 MB | 26 |
+| `article_embeddings_hnsw_dim_1536_idx` (live path) | 658 MB | 1,695 |
+
+A **cold** vector search on the live path measured **8,044 ms, of which 7,926 ms (98.5%) was
+`blk_read_time`**; the same statement warm measured 0 ms. Freeing the legacy 657 MB is
+supposed to leave the live index resident, so the after-reading should show that read-I/O
+share collapse.
+
+### Re-measuring afterwards
+
+Check both prerequisites first — with `track_io_timing` off every read-time column is
+identically `0`, which reads exactly like a total win:
+
+    SHOW track_io_timing;   -- must be 'on', or the measurement below is meaningless
+    SHOW server_version;    -- picks the column name
+
+`pg_stat_statements` renamed `blk_read_time` to `shared_blk_read_time` in **PG 17** (when the
+separate `local_blk_*` counters arrived). Use the name your server has — the wrong one errors,
+it does not silently return zero:
+
+    SELECT calls,
+           round(mean_exec_time::numeric, 1) AS mean_ms,
+           round(max_exec_time::numeric, 1)  AS max_ms,
+           round(shared_blk_read_time::numeric, 1) AS read_io_ms, -- PG <= 16: blk_read_time
+           shared_blks_read,
+           shared_blks_hit
+    FROM pg_stat_statements
+    WHERE query ILIKE '%article_embeddings%' AND query ILIKE '%<=>%'
+    ORDER BY calls DESC;
+
+Read it PER CALL, never in total: the counters are cumulative since the last
+`pg_stat_statements_reset()` and the before/after windows will not share a `calls` value.
+`max_exec_time` and `shared_blks_read` are the cold-read proxies — the 8,044 ms above was one
+cold call whose mean was buried by warm ones, and a resident index reads few blocks. Record
+the counters (or reset the view) immediately before the drop so the after window is clean.
+
+This is a dated OBSERVATION on a shared instance, not an attribution: the two readings are
+separated in time, so anything else that moved the working set moves them too — a p95 gate on
+this same cutover once fired on instance drift rather than on the change (wiki `b4af5f18`).
+Record both readings with their dates instead of a single verdict.
+
+Then confirm the STRUCTURAL half — that the live index is present, VALID and actually chosen —
+with the `pg_index.indisvalid` check and the EXPLAIN plan-node assertion in
+[`knowledge_scale_verification.md`](knowledge_scale_verification.md) (Index drift). On a
+cut-over install the plan must read `Index Scan using article_embeddings_hnsw_dim_<dim>_idx`.
+
 ## Reverting
 
 **Read this before reverting — since GH #578 a revert is an INCIDENT action, not a

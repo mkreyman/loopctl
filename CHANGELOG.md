@@ -38,8 +38,10 @@ Operator-facing changes for deployments outside the hosted instance.
   `mix loopctl.embeddings revert` now REFUSES while that index is absent (detected by
   capability, not by name) and prints the rebuild above; `mix loopctl.embeddings revert
   --force` overrides the refusal, and `mix loopctl.embeddings status` reports the index as
-  `legacy articles.embedding HNSW index:`. The revert procedure is
-  `docs/runbooks/embedding-dimension-cutover.md` (Reverting). A rollback rebuilds it too —
+  `legacy articles.embedding HNSW index:`. The retirement procedure — the out-of-band drop,
+  the baseline above as a fixed point, and the `pg_stat_statements` query that takes the
+  matching AFTER reading — is `docs/runbooks/embedding-dimension-cutover.md` (Retiring the
+  legacy articles ANN index); the revert procedure is the Reverting section of the same file. A rollback rebuilds it too —
   `bin/loopctl eval "Loopctl.Release.rollback(20260805120000)"` (there is no `mix` in a
   release) — but Ecto's `:to` is INCLUSIVE, so that reverts every migration at or after that
   version; once anything newer has shipped, use the explicit `CREATE INDEX`. If you do roll
