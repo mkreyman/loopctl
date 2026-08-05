@@ -83,6 +83,10 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   @default_max_per_class 100
   @hard_max_per_class 500
+  # Page-depth ceiling. A report holds at most one cap's worth of proposals per class, so
+  # this is well past the end of any real page — it exists so an unbounded `offset` cannot
+  # reach Postgrex as an out-of-bigint-range integer and 500 the read endpoint.
+  @max_offset 100_000
   # Excerpt length (graphemes) of the QUOTED evidence carried per article.
   @excerpt_chars 240
   # Bodies are fetched pre-truncated in SQL so a whole-corpus pass can never pull
@@ -101,6 +105,10 @@ defmodule Loopctl.Knowledge.Consolidation do
   @doc "Hard ceiling for the per-class proposal cap."
   @spec hard_max_per_class() :: pos_integer()
   def hard_max_per_class, do: @hard_max_per_class
+
+  @doc "Page-depth ceiling for `:offset` on the read path."
+  @spec max_offset() :: pos_integer()
+  def max_offset, do: @max_offset
 
   @doc "Length (graphemes) of the quoted evidence excerpt carried per article."
   @spec excerpt_chars() :: pos_integer()
@@ -198,8 +206,12 @@ defmodule Loopctl.Knowledge.Consolidation do
   @doc """
   Reads a persisted report and its proposals. Never recomputes.
 
+  Evidence is re-checked against the live published corpus on the way out: an entry whose
+  article has since been hard-deleted, archived or unpublished is redacted to its id
+  (`"redacted" => true`), so the stored excerpt never outlives the article it quotes.
+
   Opts: `:day` (defaults to the tenant's most recent report), `:class`, `:limit`
-  (default 50, max #{@hard_max_per_class}), `:offset`.
+  (default 50, max #{@hard_max_per_class}), `:offset` (clamped to #{@max_offset}).
   """
   @spec latest(Ecto.UUID.t(), keyword()) :: {:ok, map()}
   def latest(tenant_id, opts \\ []) do
@@ -221,7 +233,11 @@ defmodule Loopctl.Knowledge.Consolidation do
           end
 
         limit = opts |> Keyword.get(:limit, 50) |> max(1) |> min(@hard_max_per_class)
-        offset = opts |> Keyword.get(:offset, 0) |> max(0)
+        # Clamped at BOTH ends. A report carries at most one cap's worth of proposals per
+        # class, so any offset past @max_offset is already past the end — while an
+        # unclamped one reaches Postgrex as an arbitrary-precision integer and raises
+        # DBConnection.EncodeError (a 500) for anything over a bigint.
+        offset = opts |> Keyword.get(:offset, 0) |> max(0) |> min(@max_offset)
 
         proposals =
           base
@@ -233,7 +249,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         {:ok,
          %{
            report: report,
-           proposals: proposals,
+           proposals: redact_stale_evidence(tenant_id, proposals),
            total_count: AdminRepo.aggregate(base, :count, :id)
          }}
     end
@@ -258,13 +274,21 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   # Two format-drift signals, merged and de-duplicated by the article set they name.
+  #
+  # The merge is a ROUND-ROBIN interleave, not a sort on the reason string. Sorting put
+  # every "idempotency-tag" group ahead of every "title" group, so a tenant with at least
+  # `cap` idempotency-drift groups emitted ZERO title-drift proposals — one of the two
+  # signals starved entirely rather than the cap being shared between them, and
+  # `summary.truncated` carries one boolean per CLASS, so nothing said a whole signal was
+  # missing. Interleaving keeps both signals represented in every run and stays
+  # deterministic (each side is sorted by its article-id set first).
   defp duplicate_captures(tenant_id, cap) do
-    groups = title_drift_groups(tenant_id) ++ idempotency_drift_groups(tenant_id)
-
     groups =
-      groups
+      interleave(
+        Enum.sort_by(title_drift_groups(tenant_id), fn {_r, ids} -> Enum.sort(ids) end),
+        Enum.sort_by(idempotency_drift_groups(tenant_id), fn {_r, ids} -> Enum.sort(ids) end)
+      )
       |> Enum.uniq_by(fn {_reason, ids} -> Enum.sort(ids) end)
-      |> Enum.sort_by(fn {reason, ids} -> {reason, Enum.sort(ids)} end)
 
     selected = Enum.take(groups, cap)
     evidence_by_id = evidence_map(tenant_id, Enum.flat_map(selected, fn {_r, ids} -> ids end))
@@ -284,20 +308,30 @@ defmodule Loopctl.Knowledge.Consolidation do
     {length(groups), items}
   end
 
+  defp interleave([], rest), do: rest
+  defp interleave(rest, []), do: rest
+  defp interleave([a | as], [b | bs]), do: [a, b | interleave(as, bs)]
+
   # Titles that collide once case and punctuation are normalized away. The exact
   # active-title uniqueness check cannot see these — that is why they got published.
   #
-  # The EMPTY normalized key is excluded, and that exclusion is load-bearing: the
-  # normalization strips everything outside `[a-z0-9]`, so every title made only of
-  # non-ASCII script or symbols ("日本語ガイド", "中文指南", "🚀", "!!!") normalizes to the
-  # SAME empty string. Without the guard they land in one group and are asserted to be
-  # "the same capture under title drift" — a deterministic false positive in the class
-  # #584 names as the likely first auto-apply candidate, which would poison exactly the
-  # calibration signal stage 2 exists to collect.
+  # The separator class is the UNICODE-AWARE `[^[:alnum:]]`, never `[^a-z0-9]`. The
+  # ASCII-only class deletes every non-Latin codepoint, so a title collapses onto
+  # whatever incidental ASCII it carries — "日本語ガイド v2" and "中文指南 v2" both become
+  # "v2", and "Паттерн Retry" and "Обзор Retry" both become "retry". Unrelated articles
+  # then group as "the same capture under title drift", a deterministic false positive in
+  # the class #584 names as the likely first auto-apply candidate, which would poison
+  # exactly the calibration signal stage 2 exists to collect. ASCII behaviour is
+  # identical under both classes ("Retry  Pattern!!" -> "retry pattern").
+  #
+  # The EMPTY normalized key is still excluded, and that exclusion is still load-bearing:
+  # a title made only of symbols or emoji ("🚀", "!!!") normalizes to the empty string
+  # under either class, and without the guard those all land in one group.
   defp title_drift_groups(tenant_id) do
     from(a in published_base(tenant_id),
-      where: fragment("btrim(regexp_replace(lower(?), '[^a-z0-9]+', ' ', 'g')) <> ''", a.title),
-      group_by: fragment("btrim(regexp_replace(lower(?), '[^a-z0-9]+', ' ', 'g'))", a.title),
+      where:
+        fragment("btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g')) <> ''", a.title),
+      group_by: fragment("btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g'))", a.title),
       having: count(a.id) > 1,
       select: %{ids: fragment("array_agg(?::text ORDER BY ?)", a.id, a.inserted_at)}
     )
@@ -306,19 +340,18 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   # The same idempotency key written under two different tag FORMATS (#583) — the
-  # normalized keys collide while the verbatim keys differ. Same empty-key guard as
-  # `title_drift_groups/1`, for the same reason: keys with no ASCII alphanumerics all
-  # normalize together.
+  # normalized keys collide while the verbatim keys differ. Same Unicode-aware separator
+  # class and same empty-key guard as `title_drift_groups/1`, for the same reasons.
   defp idempotency_drift_groups(tenant_id) do
     from(a in published_base(tenant_id),
       where: not is_nil(a.idempotency_key),
       where:
         fragment(
-          "btrim(regexp_replace(lower(?), '[^a-z0-9]+', ' ', 'g')) <> ''",
+          "btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g')) <> ''",
           a.idempotency_key
         ),
       group_by:
-        fragment("btrim(regexp_replace(lower(?), '[^a-z0-9]+', ' ', 'g'))", a.idempotency_key),
+        fragment("btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g'))", a.idempotency_key),
       having: count(a.id) > 1 and count(a.idempotency_key, :distinct) > 1,
       select: %{ids: fragment("array_agg(?::text ORDER BY ?)", a.id, a.inserted_at)}
     )
@@ -401,12 +434,16 @@ defmodule Loopctl.Knowledge.Consolidation do
     |> MapSet.new()
   end
 
+  # Same Unicode-aware normalization as the drift groups: under the ASCII-only class
+  # "設計ドキュメント Draft" normalized to "draft" and was flagged as a placeholder title.
+  # The ASCII-only `@generic_title_pattern` is anchored, so it still matches exactly the
+  # placeholder titles against an `[[:alnum:]]`-normalized key.
   defp generic_titles(tenant_id, cap) do
     ids =
       from(a in published_base(tenant_id),
         where:
           fragment(
-            "btrim(regexp_replace(lower(?), '[^a-z0-9]+', ' ', 'g')) ~ ?",
+            "btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g')) ~ ?",
             a.title,
             ^@generic_title_pattern
           ),
@@ -520,6 +557,55 @@ defmodule Loopctl.Knowledge.Consolidation do
     end)
   end
 
+  # Evidence is a COPY — title, idempotency key and a truncated body excerpt — taken
+  # when the proposal was derived, and `article_ids` deliberately carries
+  # no FK to `articles`. So nothing in the article lifecycle reaches into it: the
+  # IRREVERSIBLE hard delete (`Knowledge.BulkOps`) removes the row, and archive/unpublish
+  # removes it from every other read surface, while the excerpt sits in
+  # `consolidation_proposals.evidence` — and prior-day reports are addressable forever via
+  # `?day=`, so the copy outlives the article indefinitely. This module states its own
+  # motivation as keeping sensitive source material off the server; a hard delete that
+  # does not remove the quoted body contradicts it.
+  #
+  # The copy is therefore RE-CHECKED at read time against the live published corpus, and
+  # any entry whose article no longer resolves is redacted down to its id. Read-time is
+  # the right seam: it also covers the article that was archived after the pass ran, and
+  # it needs no reaper for reports nobody reads.
+  defp redact_stale_evidence(_tenant_id, []), do: []
+
+  defp redact_stale_evidence(tenant_id, proposals) do
+    live = live_published_ids(tenant_id, Enum.flat_map(proposals, & &1.article_ids))
+
+    Enum.map(proposals, fn proposal ->
+      %{proposal | evidence: Enum.map(proposal.evidence, &redact_entry(&1, live))}
+    end)
+  end
+
+  defp redact_entry(%{"article_id" => id} = entry, live) do
+    if MapSet.member?(live, id) do
+      entry
+    else
+      %{"article_id" => id, "title" => nil, "excerpt" => "", "redacted" => true}
+    end
+  end
+
+  defp redact_entry(entry, _live), do: entry
+
+  defp live_published_ids(_tenant_id, []), do: MapSet.new()
+
+  defp live_published_ids(tenant_id, article_ids) do
+    ids = Enum.uniq(article_ids)
+
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id,
+      where: a.status == :published,
+      where: a.id in ^ids,
+      select: a.id
+    )
+    |> AdminRepo.all()
+    |> MapSet.new()
+  end
+
   defp excerpt(nil), do: ""
 
   defp excerpt(body) do
@@ -616,15 +702,22 @@ defmodule Loopctl.Knowledge.Consolidation do
     )
   end
 
-  # Over-cap is never a silent drop: the class, the cap, and the TRUE total are logged
-  # so an operator can see a backlog remains for the next run.
+  # Over-cap is never a silent drop: the class, the cap, and the TRUE total are logged.
+  #
+  # The message must NOT promise the remainder next run. Every class derives its
+  # selection deterministically (the drift groups by article-id set, the conflict pairs by
+  # sorted id, the placeholder titles oldest-first) and the pass consumes nothing, so a
+  # re-run re-derives the SAME leading N. The overflow surfaces only as the emitted
+  # proposals stop being derived — i.e. once they are actioned at the source.
   defp log_truncation(tenant_id, summary) do
     Enum.each(summary.truncated, fn
       {class, true} ->
         Logger.warning(
           "Consolidation: tenant=#{tenant_id} class=#{class} has " <>
             "#{Map.fetch!(summary.by_class, class)} proposals; emitting " <>
-            "#{summary.max_per_class} this run (cap=max_per_class). Remainder next run."
+            "#{summary.max_per_class} this run (cap=max_per_class). The remainder stays " <>
+            "hidden until these are actioned at the source — a re-run re-derives the same " <>
+            "leading #{summary.max_per_class}."
         )
 
       {_class, false} ->

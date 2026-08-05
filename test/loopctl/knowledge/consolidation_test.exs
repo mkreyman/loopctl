@@ -159,6 +159,71 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
 
       assert proposals_of(analysis, :duplicate_capture) == []
     end
+
+    # The other half of the same failure: an ASCII-only separator class does not only
+    # empty a non-Latin title, it collapses it onto whatever incidental ASCII it carries,
+    # so unrelated articles group on a shared version token or a shared Latin word.
+    test "does not group non-Latin titles that share only an incidental ASCII token" do
+      tenant = fixture(:tenant)
+      published(tenant.id, %{title: "日本語ガイド v2", body: "Japanese guide."})
+      published(tenant.id, %{title: "中文指南 v2", body: "Chinese guide."})
+      published(tenant.id, %{title: "Паттерн Retry", body: "Retry pattern."})
+      published(tenant.id, %{title: "Обзор Retry", body: "Retry overview."})
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+
+      assert proposals_of(analysis, :duplicate_capture) == []
+      assert analysis.summary.by_class["duplicate_capture"] == 0
+    end
+
+    test "still groups two non-Latin titles that DO normalize to the same key" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, %{title: "Паттерн Retry", body: "Retry pattern."})
+      b = published(tenant.id, %{title: "  паттерн — retry!", body: "Retry pattern again."})
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+
+      assert [proposal] = proposals_of(analysis, :duplicate_capture)
+      assert Enum.sort(proposal.article_ids) == Enum.sort([a.id, b.id])
+    end
+
+    test "does not group non-Latin idempotency keys sharing only an incidental ASCII token" do
+      tenant = fixture(:tenant)
+      published(tenant.id, %{title: "Harvest A", idempotency_key: "сессия:harvest"})
+      published(tenant.id, %{title: "Harvest B", idempotency_key: "セッション_HARVEST"})
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+
+      assert proposals_of(analysis, :duplicate_capture) == []
+    end
+
+    # "idempotency-tag" sorts before "title", so sorting on the reason string starved the
+    # title signal entirely under the cap instead of sharing it between the two signals.
+    test "gives BOTH drift signals representation under the per-class cap" do
+      tenant = fixture(:tenant)
+
+      for n <- 1..3 do
+        published(tenant.id, %{title: "Key Drift #{n} A", idempotency_key: "harvest:#{n}"})
+        published(tenant.id, %{title: "Key Drift #{n} B", idempotency_key: "HARVEST_#{n}"})
+      end
+
+      published(tenant.id, %{title: "Retry Policy", body: "Retry with jitter."})
+      published(tenant.id, %{title: "retry-policy!", body: "Retry with jitter."})
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id, %{}, max_per_class: 2)
+
+      assert analysis.summary.by_class["duplicate_capture"] == 4
+      assert analysis.summary.truncated["duplicate_capture"] == true
+
+      reasons =
+        analysis
+        |> proposals_of(:duplicate_capture)
+        |> Enum.map(fn p -> if p.rationale =~ "title drift", do: :title, else: :idempotency end)
+
+      assert length(reasons) == 2
+      assert :title in reasons
+      assert :idempotency in reasons
+    end
   end
 
   describe "analyze/3 — contradiction_candidate" do
@@ -293,6 +358,19 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert [evidence] = proposal.evidence
       assert evidence["excerpt"] =~ "hub that could not be created"
       assert proposal.rationale =~ "409"
+    end
+
+    # Under an ASCII-only separator class these normalized to "draft" / "document 2" and
+    # were flagged as placeholders, telling the reviewer a perfectly specific title is one.
+    test "does not flag a specific non-Latin title whose ASCII residue is a placeholder word" do
+      tenant = fixture(:tenant)
+      published(tenant.id, %{title: "設計ドキュメント Draft", body: "Design doc."})
+      published(tenant.id, %{title: "Черновик Document 2", body: "Draft doc."})
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+
+      assert proposals_of(analysis, :generic_title) == []
+      assert analysis.summary.by_class["generic_title"] == 0
     end
   end
 
@@ -551,6 +629,91 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
 
       {:ok, newest} = Consolidation.latest(tenant.id)
       assert newest.report.day == Date.utc_today()
+    end
+
+    # An unclamped offset reaches Postgrex as an arbitrary-precision integer and raises
+    # DBConnection.EncodeError — a 500 on a parameter the endpoint documents as clamped.
+    test "clamps an out-of-bigint-range offset instead of raising" do
+      tenant = fixture(:tenant)
+      published(tenant.id, %{title: "Untitled Document"})
+
+      {:ok, _} = Consolidation.run(tenant.id, %{})
+
+      assert {:ok, result} = Consolidation.latest(tenant.id, offset: 99_999_999_999_999_999_999)
+      assert result.proposals == []
+      assert result.total_count == 1
+    end
+  end
+
+  describe "latest/2 — evidence never outlives the article it quotes" do
+    test "redacts the excerpt of an article that was HARD-deleted after the pass ran" do
+      tenant = fixture(:tenant)
+
+      article =
+        published(tenant.id, %{title: "Untitled Document", body: "SECRET harvested material."})
+
+      {:ok, _} = Consolidation.run(tenant.id, %{})
+
+      {:ok, before} = Consolidation.latest(tenant.id)
+      assert [%{evidence: [entry]}] = before.proposals
+      assert entry["excerpt"] =~ "SECRET harvested"
+
+      AdminRepo.delete!(article)
+
+      {:ok, after_delete} = Consolidation.latest(tenant.id)
+      assert [%{evidence: [redacted]}] = after_delete.proposals
+      assert redacted["article_id"] == article.id
+      assert redacted["excerpt"] == ""
+      assert redacted["title"] == nil
+      assert redacted["redacted"] == true
+      refute Map.has_key?(redacted, "idempotency_key")
+    end
+
+    test "redacts the excerpt of an article archived after the pass ran" do
+      tenant = fixture(:tenant)
+
+      article =
+        published(tenant.id, %{title: "Untitled Document", body: "SECRET harvested material."})
+
+      {:ok, _} = Consolidation.run(tenant.id, %{})
+
+      article |> Ecto.Changeset.change(%{status: :archived}) |> AdminRepo.update!()
+
+      {:ok, result} = Consolidation.latest(tenant.id)
+      assert [%{evidence: [redacted]}] = result.proposals
+      assert redacted["redacted"] == true
+      assert redacted["excerpt"] == ""
+    end
+
+    # Prior-day reports are addressable forever via `day`, which is exactly where the
+    # stale copy used to survive: nothing prunes them and the pass never revisits them.
+    test "redacts in a PRIOR-DAY report read back by day" do
+      tenant = fixture(:tenant)
+
+      article =
+        published(tenant.id, %{title: "Untitled Document", body: "SECRET harvested material."})
+
+      yesterday = Date.add(Date.utc_today(), -1)
+      {:ok, _} = Consolidation.run(tenant.id, %{}, day: yesterday)
+
+      AdminRepo.delete!(article)
+
+      {:ok, older} = Consolidation.latest(tenant.id, day: yesterday)
+      assert [%{evidence: [redacted]}] = older.proposals
+      assert redacted["redacted"] == true
+      assert redacted["excerpt"] == ""
+    end
+
+    test "leaves the evidence of a still-published article untouched" do
+      tenant = fixture(:tenant)
+      published(tenant.id, %{title: "Untitled Document", body: "Still published."})
+
+      {:ok, _} = Consolidation.run(tenant.id, %{})
+
+      {:ok, result} = Consolidation.latest(tenant.id)
+      assert [%{evidence: [entry]}] = result.proposals
+      assert entry["excerpt"] =~ "Still published"
+      refute Map.has_key?(entry, "redacted")
     end
   end
 end

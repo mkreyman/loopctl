@@ -58,7 +58,13 @@ defmodule LoopctlWeb.KnowledgeConsolidationController do
         "`persisted_count`, never by `proposal_count`.\n\n" <>
         "REVIEW STATE — `review_status` / `reviewed_by` / `reviewed_at` are reset to " <>
         "`pending` / null whenever the nightly pass re-derives a proposal: refreshed " <>
-        "machine output must earn review again and never inherits an earlier approval.",
+        "machine output must earn review again and never inherits an earlier approval.\n\n" <>
+        "EVIDENCE FRESHNESS — each evidence entry is a COPY taken when the proposal was " <>
+        "derived, and it is re-checked against the live published corpus on every read. " <>
+        "If the article has since been hard-deleted, archived or unpublished, the entry " <>
+        "comes back as `article_id` with a null title, an empty excerpt and " <>
+        "`redacted: true` — a quoted excerpt never outlives the article it quotes, " <>
+        "including in prior-day reports read via `day`.",
     parameters: [
       day: [
         in: :query,
@@ -83,7 +89,9 @@ defmodule LoopctlWeb.KnowledgeConsolidationController do
       offset: [
         in: :query,
         type: :integer,
-        description: "Proposals to skip (default 0)",
+        description:
+          "Proposals to skip (default 0, max #{Consolidation.max_offset()}). " <>
+            "Clamped, never rejected.",
         required: false
       ]
     ],

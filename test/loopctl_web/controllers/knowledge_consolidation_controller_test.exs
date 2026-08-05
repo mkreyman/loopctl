@@ -129,5 +129,45 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       assert body["data"] == nil
       assert body["meta"]["report_available"] == false
     end
+
+    # The endpoint documents offset as clamped, never rejected; unclamped it reached
+    # Postgrex as an out-of-bigint-range integer and 500'd.
+    test "clamps an absurd offset instead of 500ing", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      published(tenant.id, %{title: "Untitled Document", body: "Needs a real title."})
+      {:ok, _} = Consolidation.run(tenant.id, %{})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/consolidation?offset=99999999999999999999")
+        |> json_response(200)
+
+      assert body["data"]["proposals"] == []
+      assert body["meta"]["total_count"] == 1
+    end
+
+    test "redacts the evidence of an article deleted after the report was written",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      article = published(tenant.id, %{title: "Untitled Document", body: "SECRET material."})
+      {:ok, _} = Consolidation.run(tenant.id, %{})
+
+      AdminRepo.delete!(article)
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/consolidation")
+        |> json_response(200)
+
+      assert [proposal] = body["data"]["proposals"]
+      assert [evidence] = proposal["evidence"]
+      assert evidence["redacted"] == true
+      assert evidence["excerpt"] == ""
+      refute body |> Jason.encode!() |> String.contains?("SECRET material")
+    end
   end
 end
