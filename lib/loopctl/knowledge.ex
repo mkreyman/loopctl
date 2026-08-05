@@ -9125,14 +9125,17 @@ defmodule Loopctl.Knowledge do
     # between them, so the aggregate was admitted and the projection then competed with the
     # request path ungated, on the smallest pool in the system, from a per-turn endpoint.
     # Nested `HeavyRead.all/3` for this tenant reuses this slot rather than taking a second.
+    # `with_heat_admission/2` is the NODE-level bound outside it, taken before any query runs.
     {counted, stubs} =
-      HeavyRead.with_slot(tenant_id, HeavyRead.opts(:heat_index), fn ->
-        counted =
-          tenant_id
-          |> heat_counts_query(top_k + 1, since, category, vis)
-          |> then(&HeavyRead.all(tenant_id, &1, HeavyRead.opts(:heat_index)))
+      with_heat_admission(tenant_id, fn ->
+        HeavyRead.with_slot(tenant_id, HeavyRead.opts(:heat_index), fn ->
+          counted =
+            tenant_id
+            |> heat_counts_query(top_k + 1, since, category, vis)
+            |> then(&HeavyRead.all(tenant_id, &1, HeavyRead.opts(:heat_index)))
 
-        {counted, heat_stubs(tenant_id, Enum.take(counted, top_k), category, vis)}
+          {counted, heat_stubs(tenant_id, Enum.take(counted, top_k), category, vis)}
+        end)
       end)
 
     ranked = Enum.take(counted, top_k)
@@ -9301,9 +9304,14 @@ defmodule Loopctl.Knowledge do
       # sustained use rather than to traffic; the id still keeps the order TOTAL, so a page is
       # stable across calls — an index that reshuffles on every refresh cannot be cached,
       # which is the whole point of this surface.
+      #
+      # The day is cut in UTC EXPLICITLY: a bare `::date` cast resolves in the connection's
+      # `TimeZone` GUC, so on a backend whose session timezone is not UTC the tie-break counted
+      # days on a boundary the UTC-day-snapped `meta.heat_window` does not use — the payload
+      # would state one window and rank on another.
       order_by: [
         desc: count(fragment("coalesce(?, ?)", k.agent_id, e.api_key_id), :distinct),
-        desc: count(fragment("(?)::date", e.accessed_at), :distinct),
+        desc: count(fragment("((? at time zone 'UTC'))::date", e.accessed_at), :distinct),
         asc: e.article_id
       ],
       limit: ^limit,
@@ -9347,6 +9355,154 @@ defmodule Loopctl.Knowledge do
   # encodes as `[]`, hence the floor of 2.
   defp heat_array_budget(0), do: 2
   defp heat_array_budget(n), do: n * @heat_stub_char_cap + 2 + (n - 1)
+
+  # NODE-level admission on top of the per-tenant one. `HeavyRead.with_slot/3` bounds how many
+  # of THIS tenant's heat reads are in flight; nothing bounded the AGGREGATE across tenants.
+  # `TenantGate` counts per key, so N tenants each admitted at their own cap queue up to N
+  # concurrent checkouts on `AdminRepo` — a 3-connection pool (`ADMIN_POOL_SIZE || "3"`,
+  # config/runtime.exs) that custody writes and the per-request auth SELECT also use. The
+  # per-read `:timeout` bounds how long each waiter blocks, not how many waiters there are.
+  #
+  # It wraps the WHOLE call, not just the projection: deciding admission after the group-by
+  # aggregate meant every shed request first paid that history-growing scan AND held this
+  # tenant's heavy-read slot for it. A shed that costs the work it is shedding sheds nothing.
+  #
+  # TWO keys, one permit each. The GLOBAL key is a FIXED string, not a tenant id — that is what
+  # makes the count node-wide (`TenantGate.acquire/3` only guards `is_binary/1`, so a non-UUID
+  # key is legal and cannot collide with a real tenant). The PER-TENANT key holds `cap - 1`,
+  # mirroring the `pool - 1` ceiling `TenantGate.clamp_cap/1` already uses to keep a slot for
+  # neighbours: the node cap equals one tenant's OWN heat ceiling (per-tenant cap 4 at heavy
+  # weight 2), so without it a single looping tenant could hold every node permit and 429 every
+  # other tenant on the node — the cross-tenant denial the per-tenant gate exists to prevent,
+  # reintroduced one level up.
+  @heat_admin_gate_key "knowledge.heat_stub_projection"
+  @heat_shed_log_window_ms 60_000
+
+  @doc false
+  # The node cap as a pure function of the admin pool, so the BOUND itself is testable and not
+  # merely the gate's existence. `pool - 1` so heat can never take the LAST admin connection
+  # out from under a custody write — and 0 (admit nothing) below 2, because a floor of 1 broke
+  # exactly that claim at the two configurations that reach it: a pool of 1, and an unreadable
+  # repo config, which `DbCapacity.pool_size/1` reports as 0.
+  @spec heat_node_cap(non_neg_integer()) :: non_neg_integer()
+  def heat_node_cap(admin_pool) when is_integer(admin_pool), do: max(0, admin_pool - 1)
+
+  defp with_heat_admission(tenant_id, fun) do
+    cap = heat_node_cap(DbCapacity.runtime_pool_sizes().admin_repo)
+    keys = [@heat_admin_gate_key, @heat_admin_gate_key <> ":" <> tenant_id]
+
+    case heat_acquire(keys, cap) do
+      :ok ->
+        reclaimer = heat_permit_reclaimer(keys)
+
+        try do
+          fun.()
+        after
+          heat_await_release(reclaimer)
+        end
+
+      :shed ->
+        heat_log_shed(tenant_id, cap)
+
+        raise HeavyRead.OverloadedError,
+          tenant_id: tenant_id,
+          message: "heat index shed at the node-level admin-pool bound"
+    end
+  end
+
+  defp heat_acquire(_keys, cap) when cap < 1, do: :shed
+
+  defp heat_acquire([global, per_tenant], cap) do
+    case TenantGate.acquire(global, 1, cap) do
+      :ok -> heat_acquire_tenant(global, per_tenant, max(1, cap - 1))
+      {:error, :heavy_read_overloaded} -> :shed
+    end
+  end
+
+  defp heat_acquire_tenant(global, per_tenant, tenant_cap) do
+    case TenantGate.acquire(per_tenant, 1, tenant_cap) do
+      :ok ->
+        :ok
+
+      {:error, :heavy_read_overloaded} ->
+        TenantGate.release(global, 1)
+        :shed
+    end
+  end
+
+  # A permit must not outlive the process holding it. `try/after` does not run when a process
+  # is KILLED (a brutal shutdown drain, a `max_heap_size` kill), and `TenantGate` never sweeps
+  # or reaps — a limitation its moduledoc accepts for a PER-TENANT counter, where the drift is
+  # one tenant's. On a node-wide key capped at 2 the same drift is permanent and fleet-wide:
+  # two kills over a node's life would shed heat_index for every tenant on it, forever.
+  #
+  # So an unlinked reclaimer MONITORS the holder and performs the release itself — on `:done`
+  # or on `:DOWN`, whichever arrives first, so the release is exactly-once by construction.
+  # That is the reclaim guarantee `Knowledge.ExportConcurrency` gets from its GenServer's
+  # monitors, without standing up a second registry for a permit held across one bounded call.
+  #
+  # Public (`@doc false`) for the same reason `heat_projection_exit/2` is: the `:DOWN` path is
+  # the one this exists for, and it cannot be driven through `heat_index/2` deterministically.
+  @doc false
+  @spec heat_permit_reclaimer([binary()]) :: pid()
+  def heat_permit_reclaimer(keys) when is_list(keys) do
+    holder = self()
+
+    spawn(fn ->
+      ref = Process.monitor(holder)
+
+      caller =
+        receive do
+          {:done, ^holder} ->
+            Process.demonitor(ref, [:flush])
+            holder
+
+          {:DOWN, ^ref, :process, ^holder, _reason} ->
+            nil
+        end
+
+      Enum.each(keys, &TenantGate.release(&1, 1))
+      if caller, do: send(caller, {:released, self()})
+    end)
+  end
+
+  # The normal path WAITS for the release rather than firing and forgetting it: the per-tenant
+  # node permit is 1 in production, so a caller that returned before its own permit came back
+  # would shed its NEXT sequential call. The monitor makes the wait terminate either way — the
+  # reclaimer replies or it dies.
+  defp heat_await_release(reclaimer) do
+    ref = Process.monitor(reclaimer)
+    send(reclaimer, {:done, self()})
+
+    receive do
+      {:released, ^reclaimer} -> Process.demonitor(ref, [:flush])
+      {:DOWN, ^ref, :process, ^reclaimer, _reason} -> :ok
+    end
+  end
+
+  # ONE line per window, not one per shed. heat_index is a per-turn endpoint, so a sustained
+  # node-wide shed would otherwise put one warning per request per tenant into the incident the
+  # warning exists to describe — the shape `HeavyRead.maybe_log_inconclusive/2` was written to
+  # prevent. `:never` rather than a `0` default: `System.monotonic_time/1` starts at a large
+  # NEGATIVE value, so a `0` default would not throttle the line, it would delete it.
+  #
+  # The line deliberately does NOT wear the per-tenant label. This bound is node-wide, so
+  # `OverloadedError`'s default message ("the per-tenant in-flight capacity for this tenant")
+  # would attribute saturation of the SHARED admin pool to whichever tenant happened to arrive
+  # last — the systemic-fault-dressed-as-one-noisy-tenant confusion the rescue arms below exist
+  # to prevent. The client-facing 429 body comes from `LoopctlWeb.ErrorJSON`.
+  defp heat_log_shed(tenant_id, cap) do
+    key = {__MODULE__, :heat_node_gate_shed_warned}
+    deadline = :persistent_term.get(key, :never)
+    now = System.monotonic_time(:millisecond)
+
+    if deadline == :never or now >= deadline do
+      :persistent_term.put(key, now + @heat_shed_log_window_ms)
+      Logger.warning("heat_index: admin_pool_node_gate_shed tenant_id=#{tenant_id} cap=#{cap}")
+    end
+
+    :ok
+  end
 
   defp heat_stubs(_tenant_id, [], _category, _vis), do: []
 
@@ -9392,49 +9548,7 @@ defmodule Loopctl.Knowledge do
   # nothing in the logs said otherwise. The `:exit` clause also catches exits that are not pool
   # pressure at all (a shutdown, a sandbox ownership exit), which is exactly why its reason has
   # to reach the log rather than be discarded into an overload label.
-  # NODE-level admission on top of the per-tenant one. `HeavyRead.with_slot/3` in
-  # `heat_index/2` bounds how many of THIS tenant's heat reads are in flight; nothing bounded
-  # the AGGREGATE across tenants. `TenantGate` counts per key, so N tenants each admitted at
-  # their own cap queue up to N concurrent checkouts on `AdminRepo` — a 3-connection pool
-  # (`ADMIN_POOL_SIZE || "3"`, config/runtime.exs) that custody writes and the per-request auth
-  # SELECT also use. The per-read `:timeout` bounds how long each waiter blocks; it does not
-  # bound how many waiters there are.
-  #
-  # The key is a FIXED string, not a tenant id — that is what makes the count node-wide.
-  # `TenantGate.acquire/3` only guards `is_binary/1`, so a non-UUID key is legal and cannot
-  # collide with a real tenant. Capped at `admin_repo - 1` so heat can never take the LAST
-  # admin connection out from under a custody write.
-  @heat_admin_gate_key "knowledge.heat_stub_projection"
-
   defp heat_stub_projection(query, tenant_id) do
-    cap = max(1, DbCapacity.runtime_pool_sizes().admin_repo - 1)
-
-    case TenantGate.acquire(@heat_admin_gate_key, 1, cap) do
-      :ok ->
-        try do
-          heat_admin_read(query, tenant_id)
-        after
-          TenantGate.release(@heat_admin_gate_key, 1)
-        end
-
-      {:error, :heavy_read_overloaded} ->
-        # Logged under its OWN tag and deliberately not wearing the per-tenant label. This
-        # bound is node-wide, so `OverloadedError`'s default message ("the per-tenant in-flight
-        # capacity for this tenant") would attribute saturation of the SHARED admin pool to
-        # whichever tenant happened to arrive last — the same systemic-fault-dressed-as-one-
-        # noisy-tenant confusion the rescue arms below exist to prevent. The client-facing 429
-        # body comes from `LoopctlWeb.ErrorJSON`, not from this message.
-        Logger.warning(
-          "heat_stub_projection: admin_pool_node_gate_shed tenant_id=#{tenant_id} cap=#{cap}"
-        )
-
-        raise HeavyRead.OverloadedError,
-          tenant_id: tenant_id,
-          message: "heat stub projection shed at the node-level admin-pool bound"
-    end
-  end
-
-  defp heat_admin_read(query, tenant_id) do
     AdminRepo.all(query, timeout: @heat_stub_timeout_ms)
   rescue
     e in [DBConnection.ConnectionError, Postgrex.Error] ->

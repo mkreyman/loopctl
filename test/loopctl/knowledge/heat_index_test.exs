@@ -790,23 +790,27 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       # connections, which custody writes and the per-request auth SELECT share. Saturate it
       # from outside and the endpoint must shed rather than queue behind them.
       #
-      # Non-vacuous by construction: delete the gate from `heat_stub_projection/2` and
-      # `heat_index/2` succeeds here instead of raising, so this test fails.
+      # Saturated on the admission's TENANT-scoped key, never the node-wide one: the counters
+      # are VM-wide public ETS, and TenantGate's documented async protocol is that the suite's
+      # caps stay high so the wired gate is a no-op across incidental parallel reads. Holding
+      # the node key here would shed — and make the final count assertion race — any other
+      # async test that reads a heat index.
+      #
+      # Non-vacuous by construction: delete the gate from `heat_index/2` and the call succeeds
+      # here instead of raising, so this test fails.
       tenant = fixture(:tenant)
       article = published_article(tenant.id, %{title: "Readable"})
       heat(tenant.id, article, 2)
 
-      key = "knowledge.heat_stub_projection"
-      cap = max(1, DbCapacity.runtime_pool_sizes().admin_repo - 1)
+      key = "knowledge.heat_stub_projection:" <> tenant.id
+      :ok = TenantGate.acquire(key, 1_000, 1_000)
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          :ok = TenantGate.acquire(key, cap, cap)
-
           try do
             assert_raise HeavyRead.OverloadedError, fn -> Knowledge.heat_index(tenant.id) end
           after
-            TenantGate.release(key, cap)
+            TenantGate.release(key, 1_000)
           end
         end)
 
@@ -814,9 +818,52 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       # saturation of a shared pool gets mistaken for ordinary per-tenant backpressure.
       assert log =~ "admin_pool_node_gate_shed"
 
-      # And the slot comes back on BOTH paths: the index answers again, and the node-wide
-      # counter is back to zero rather than leaking a permit per shed.
+      # And the permit comes back on BOTH paths: the index answers again, and the counter is
+      # back to zero rather than leaking one per shed. The release is awaited, not fired and
+      # forgotten, so this is a fact rather than a timing window.
       assert {:ok, %{results: [%{title: "Readable"}]}} = Knowledge.heat_index(tenant.id)
+      assert TenantGate.count(key) == 0
+    end
+
+    test "the node cap never admits heat onto the last admin connection" do
+      # The cap is asserted as a RELATIONSHIP, not recomputed from the implementation's own
+      # expression — a test that copies `admin_repo - 1` pins the gate's existence and nothing
+      # about the bound, which is where the safety claim lives.
+      pool = DbCapacity.runtime_pool_sizes().admin_repo
+
+      assert Knowledge.heat_node_cap(pool) < pool
+      assert Knowledge.heat_node_cap(3) == 2
+
+      # A pool of 1 — or a repo config with no `:pool_size`, which `DbCapacity` reports as 0 —
+      # must shed outright. Clamping the cap UP to 1 there admitted heat onto the only admin
+      # connection, the exact state `pool - 1` exists to make impossible.
+      assert Knowledge.heat_node_cap(1) == 0
+      assert Knowledge.heat_node_cap(0) == 0
+    end
+
+    test "a KILLED holder's node permit is reclaimed, not leaked node-wide forever" do
+      # `try/after` does not run on `Process.exit(pid, :kill)`, and TenantGate never sweeps or
+      # reaps. On a node-wide key capped at 2 in production, two such kills would shed
+      # heat_index for EVERY tenant on the node until it restarts — so the permit is released
+      # by a monitoring reclaimer rather than by the holder's own `after`.
+      key = "heat-permit-reclaim-" <> Ecto.UUID.generate()
+      parent = self()
+
+      holder =
+        spawn(fn ->
+          :ok = TenantGate.acquire(key, 1, 2)
+          send(parent, {:held, Knowledge.heat_permit_reclaimer([key])})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:held, reclaimer}
+      assert TenantGate.count(key) == 1
+
+      ref = Process.monitor(reclaimer)
+      Process.exit(holder, :kill)
+
+      # The reclaimer exits once it has released, so this is deterministic rather than a poll.
+      assert_receive {:DOWN, ^ref, :process, ^reclaimer, _}
       assert TenantGate.count(key) == 0
     end
 
