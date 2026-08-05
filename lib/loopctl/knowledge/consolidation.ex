@@ -7,8 +7,11 @@ defmodule Loopctl.Knowledge.Consolidation do
   articles involved and carrying a QUOTED excerpt from each as evidence. It writes
   its findings to `consolidation_reports` / `consolidation_proposals` and NOTHING
   else — no `articles`, `article_links` or `conflict_resolutions` write happens here.
-  Stage 2 runs it nightly with human approve/reject for calibration; stage 3 will
-  auto-apply only the class with a clean record.
+  There is no human approve/reject stage and there will not be one (#605 supersedes
+  #594): a queue whose only consumer is a human nobody staffs is the failure this
+  codebase has hit three separate times. Auto-apply is gated on REVERSIBILITY instead —
+  a class may apply itself when its write can be undone in code, which is checkable
+  without accumulating anyone's approvals.
 
   ## Why it consolidates published ARTICLES, not transcripts
 
@@ -26,12 +29,11 @@ defmodule Loopctl.Knowledge.Consolidation do
   re-scanning, and it never runs in a request path: the API endpoint reads the
   persisted rows.
 
-  ## The four defect classes
+  ## The three defect classes
 
   | Class | Signal |
   |---|---|
   | `:duplicate_capture` | two published articles whose titles collide once case/punctuation are normalized away, or whose `idempotency_key`s collide under the same normalization while differing verbatim (tag-format drift — novelty scoring and idempotency are separate paths, so the novelty gate does not catch it) |
-  | `:contradiction_candidate` | a SYSTEM-flagged (`auto_generated`) `potential_conflict` link between two PUBLISHED articles with no `conflict_resolutions` verdict yet — reported INTO the existing conflict machinery, never a parallel store |
   | `:generic_title` | a placeholder title, which collides on per-tenant active-title uniqueness and blocks hub creation |
   | `:stale_entry` | past the lint staleness threshold and never reconciled |
 
@@ -58,7 +60,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   ## Where the reads run
 
   Every whole-corpus ENUMERATION here (the corpus count, the two normalization GROUP BYs,
-  the conflict-link scan, the judged-pair set, the placeholder-title regex scan) goes
+  the placeholder-title regex scan) goes
   through `Loopctl.HeavyRead` on the `:consolidation` endpoint, not straight through
   `AdminRepo`: those scans are unindexable by construction (they group on a
   `regexp_replace` expression) and `AdminRepo`'s pool is 3 connections shared with every
@@ -76,8 +78,6 @@ defmodule Loopctl.Knowledge.Consolidation do
   alias Loopctl.AdminRepo
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge.Article
-  alias Loopctl.Knowledge.ArticleLink
-  alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.ConsolidationProposal
   alias Loopctl.Knowledge.ConsolidationReport
 
@@ -142,7 +142,6 @@ defmodule Loopctl.Knowledge.Consolidation do
         {corpus_size(tenant_id),
          %{
            duplicate_capture: duplicate_captures(tenant_id, cap),
-           contradiction_candidate: contradiction_candidates(tenant_id, cap),
            generic_title: generic_titles(tenant_id, cap),
            stale_entry: stale_entries(tenant_id, lint_report, cap)
          }}
@@ -153,8 +152,15 @@ defmodule Loopctl.Knowledge.Consolidation do
     truncated =
       Map.new(found, fn {class, {total, items}} -> {to_string(class), total > length(items)} end)
 
+    # Drive the ORDER from the schema enum, but only over classes this pass still PRODUCES.
+    # The enum deliberately retains `:contradiction_candidate` so historical rows still load
+    # (see `ConsolidationProposal`), and a `Map.fetch!` over the full enum would raise on
+    # every run now that the class is retired. `Map.fetch!` is kept for the classes that ARE
+    # present, so a genuinely missing producer still fails loudly rather than silently
+    # emitting a short report.
     proposals =
       ConsolidationProposal.classes()
+      |> Enum.filter(&Map.has_key?(found, &1))
       |> Enum.flat_map(fn class -> found |> Map.fetch!(class) |> elem(1) end)
       |> Enum.with_index(1)
       |> Enum.map(fn {proposal, number} -> Map.put(proposal, :number, number) end)
@@ -301,7 +307,12 @@ defmodule Loopctl.Knowledge.Consolidation do
             "#{length(ids)} published articles are the same capture under #{reason} drift. " <>
               "The novelty gate does not catch this: novelty scoring and idempotency are separate paths.",
           suggested_action:
-            "Review the excerpts; keep the richest article and archive the rest, or merge them."
+            "Keep the richest article and UNPUBLISH the rest — do not archive them. " <>
+              "`:archived` is TERMINAL for an article: `Article`'s transition table has no " <>
+              "`{:archived, _}` and there is no unarchive function, so the only way back is a " <>
+              "`user+` PATCH carrying an explicit status. `{:published, :draft}` and " <>
+              "`{:draft, :published}` are both real transitions, so unpublish is the " <>
+              "reversible primitive and the only one an unattended pass may ever apply."
         )
       end)
 
@@ -359,80 +370,26 @@ defmodule Loopctl.Knowledge.Consolidation do
     |> Enum.map(fn %{ids: ids} -> {"idempotency-tag", ids} end)
   end
 
-  # Conflict-flagged pairs no agent has judged yet. Canonical (sorted) pair, matching
-  # how `conflict_resolutions` stores its verdicts, so an existing verdict in either
-  # link direction suppresses the proposal.
+  # `:contradiction_candidate` WAS a class here. It is not any more, and the reason is
+  # ownership rather than value.
   #
-  # The predicates MIRROR the conflict-resolution surface this proposal points at, because
-  # a proposal whose `suggested_action` the surface would refuse is a dead end the pass
-  # re-derives every night (nothing can record a verdict for it, so `judged_pairs/1` never
-  # suppresses it, and it permanently occupies one of the per-class slots):
+  # `Loopctl.Workers.KnowledgeLintWorker.judge_redundant_conflicts/1` now resolves exactly
+  # these pairs automatically, recording `classification: :redundant, disposition: :dismiss`
+  # — capped ABOVE the promotion rate so the queue converges. Proposing them here as well
+  # put two subsystems on one pile: one resolving it, the other re-reporting it nightly.
+  # That is the "second scheduler over the same corpus" failure #584 named, arrived at from
+  # the other direction.
   #
-  #   * `:potential_conflict` ONLY, and only SYSTEM-flagged (`auto_generated`) — the same
-  #     two predicates `Knowledge.validate_potential_conflict_exists/3` requires (else
-  #     `422 no_potential_conflict`) and `Knowledge.list_potential_conflicts/2` applies.
-  #     `:contradicts` is PUBLICLY creatable by an `:agent` key, so including it also let
-  #     an agent manufacture orchestrator-facing proposals at will.
-  #   * BOTH endpoints PUBLISHED — every other class derives from `published_base/1`, and
-  #     `archive_article/3` deliberately retains `article_links`, so without this an
-  #     archived article kept producing proposals (quoting its body) while `corpus_size`
-  #     excluded it: a proposal citing an article outside its own stated denominator.
-  defp contradiction_candidates(tenant_id, cap) do
-    pairs =
-      from(l in ArticleLink,
-        join: s in Article,
-        on: s.id == l.source_article_id,
-        join: t in Article,
-        on: t.id == l.target_article_id,
-        where: l.tenant_id == ^tenant_id,
-        where: s.tenant_id == ^tenant_id,
-        where: t.tenant_id == ^tenant_id,
-        where: l.relationship_type == :potential_conflict,
-        where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
-        where: s.status == :published,
-        where: t.status == :published,
-        select: %{
-          source_article_id: l.source_article_id,
-          target_article_id: l.target_article_id
-        }
-      )
-      |> heavy_all(tenant_id)
-      |> Enum.map(fn %{source_article_id: s, target_article_id: t} -> Enum.sort([s, t]) end)
-      |> Enum.uniq()
-      |> Enum.sort()
-
-    judged = judged_pairs(tenant_id)
-    unjudged = Enum.reject(pairs, &MapSet.member?(judged, &1))
-
-    selected = Enum.take(unjudged, cap)
-    evidence_by_id = evidence_map(tenant_id, List.flatten(selected))
-
-    items =
-      Enum.map(selected, fn ids ->
-        build_proposal(:contradiction_candidate, ids, evidence_by_id,
-          severity: "warning",
-          rationale:
-            "These two articles are flagged as conflicting but carry no recorded verdict. " <>
-              "Compare the excerpts: a wrong rationale attached to a right conclusion reads as " <>
-              "correct until the two are quoted side by side.",
-          suggested_action:
-            "Record a conflict resolution for the pair (dismiss / supersede / merge) via the " <>
-              "existing conflict-resolution surface — this pass records no verdict."
-        )
-      end)
-
-    {length(unjudged), items}
-  end
-
-  defp judged_pairs(tenant_id) do
-    from(r in ConflictResolution,
-      where: r.tenant_id == ^tenant_id,
-      select: {r.source_article_id, r.target_article_id}
-    )
-    |> heavy_all(tenant_id)
-    |> Enum.map(fn {s, t} -> Enum.sort([s, t]) end)
-    |> MapSet.new()
-  end
+  # MEASURED on the hosted corpus 2026-08-05, in the run that settled this: of 16,340
+  # proposals emitted, 15,588 were `:contradiction_candidate` — 95% of the report was a
+  # re-derivation of the set the judge drains, truncated at the per-class cap and
+  # re-derived identically the next night. The remaining classes (390 duplicate_capture,
+  # 361 stale_entry, 1 generic_title) are consolidation's actual work and were being
+  # crowded out of the report by it.
+  #
+  # If a future change wants consolidation to own conflicts again, MOVE the judge here
+  # rather than adding a second proposer: the invariant is one writer per pile, not one
+  # location.
 
   # Same Unicode-aware normalization as the drift groups: under the ASCII-only class
   # "設計ドキュメント Draft" normalized to "draft" and was flagged as a placeholder title.

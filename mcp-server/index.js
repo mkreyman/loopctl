@@ -5201,11 +5201,15 @@ const TOOLS = [
   {
     name: "knowledge_archive",
     description:
-      "Archive an article (soft delete). The article is hidden from search, context, " +
-      "and the index but the row is retained for audit/history (reversible — re-publish " +
-      "or edit it back). Works for drafts and published articles. Agent role — KB-content " +
-      "curation. Visibility-scoped: you can only archive an article you can see, so " +
-      "another agent's private/owner memory returns 404.",
+      "Archive an article (soft delete). The article is hidden from search, context, and " +
+      "the index but the row is retained for audit/history. NOT reversible by you: " +
+      "`:archived` is a TERMINAL article status — there is no unarchive call and no " +
+      "{archived -> anything} transition, so restoring one needs a user-role PATCH with an " +
+      "explicit status. Nothing is destroyed, but do not reach for this as an undoable " +
+      "action. If you want a RETRACTION you can undo, use knowledge_unpublish (published " +
+      "-> draft) and knowledge_publish to put it back. Works for drafts and published " +
+      "articles. Agent role — KB-content curation. Visibility-scoped: you can only archive " +
+      "an article you can see, so another agent's private/owner memory returns 404.",
     inputSchema: {
       type: "object",
       properties: {
