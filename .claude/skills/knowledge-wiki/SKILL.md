@@ -140,7 +140,12 @@ number, is the load-bearing invariant. To monitor and keep it healthy over time:
   changes reach every node within 60s via the per-minute `SystemConfigRefreshWorker`. The side table
   is a NARROW relation (the ANN fetches only `article_id` from a lean heap), so it reads measurably
   FASTER than the wide legacy column at equal recall — adding the relation IMPROVED latency, it did not
-  cost it. Cutover prod EXPLAIN + p95 artifact: GH #464.
+  cost it. Cutover prod EXPLAIN + p95 artifact: GH #464. A cache MISS answers the in-code default
+  `0` = the LEGACY column, so the boot prime is ORDERED, not merely fast: the supervised one-shot
+  `Loopctl.SystemConfig.CachePrimer` primes synchronously inside its `start_link/1` and is listed in
+  `Loopctl.Application.children/0` after `Loopctl.AdminRepo` and before `Oban` and the Endpoint
+  (GH #588). Never make it a `Task` child or a `handle_continue/2` — both return to the supervisor
+  immediately and restore the boot window in which every vector read silently used the legacy column.
   Production resolves the decision through `Loopctl.Embeddings.ReadPathBehaviour` (default impl
   `Loopctl.Embeddings.SystemConfigReadPath`, which also owns the flag-key string); `config/test.exs`
   points it at `Loopctl.MockEmbeddingReadPath`. **Tests must stub that mock per-process**

@@ -357,6 +357,18 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         distinguishable in Prometheus from a genuinely stable reading — a
         non-zero, incrementing rate on this counter means the corresponding gauge is
         stale, not that the system is actually quiet.
+    25. **Boot-cache-prime-failure counter** (#588) —
+        `loopctl.system_config.prime_failed.count`, keyed by `[:error_class]` only
+        (the already-CLASSIFIED closed set from `Loopctl.ExitClass`, plus
+        `"unclassified"` — never a raw exit reason). Sourced from
+        `[:loopctl, :system_config, :prime_failed]`
+        (`Loopctl.SystemConfig.CachePrimer`). Wired for the same reason as metrics
+        8-17: emitted-but-dead is invisible to Prometheus. It matters more here
+        because the degradation it reports is UNBOUNDED — a node that missed its boot
+        prime keeps answering `SystemConfig.get_int/2` with in-code defaults (the
+        RETIRED legacy column for the embeddings read flag) until a
+        `SystemConfigRefreshWorker` tick lands on it, and one `Logger.error` line in
+        the log stream is not something a rolling deploy can be alerted on.
   """
 
   import Telemetry.Metrics
@@ -421,8 +433,9 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   degradation signals), US-34.1's three Oban metrics (per-{state, queue}
   gauge over the non-terminal states, the `:executing` orphan gauge, and a
   poll-failure counter), US-36.3's ingestion backlog-gate fail-open counter,
-  US-36.4's article-linking corpus-size gauge, and US-38.3's clustering-readiness
-  peer gauge. Appended to `LoopctlWeb.Telemetry.metrics/0`.
+  US-36.4's article-linking corpus-size gauge, US-38.3's clustering-readiness
+  peer gauge, and #588's boot-cache-prime-failure counter. Appended to
+  `LoopctlWeb.Telemetry.metrics/0`.
   """
   @spec scale_metrics() :: [Telemetry.Metrics.t()]
   def scale_metrics do
@@ -801,8 +814,47 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
           "Outbound provider calls refused by the fail-closed egress guard, by reason and tenant.",
         tags: [:reason, :tenant_id],
         tag_values: &egress_blocked_tags/1
+      ),
+
+      # 25. Boot-cache-prime-failure counter (#588). `Loopctl.SystemConfig.CachePrimer`
+      #     emits `[:loopctl, :system_config, :prime_failed]` when the boot prime fails;
+      #     without this definition that event terminates in a handler-less no-op (the
+      #     emitted-but-dead class above), leaving ONE `Logger.error` line as the only
+      #     trace of an unbounded degradation: a node that missed its prime answers
+      #     `SystemConfig.get_int/2` with the caller's in-code default — for the
+      #     embeddings read flag, the RETIRED legacy column — until a
+      #     `SystemConfigRefreshWorker` tick happens to land on that node. A log line in
+      #     the Fly stream is not alertable and is easy to miss on a rolling deploy; the
+      #     counter is.
+      #
+      #     `error_class` is the already-CLASSIFIED string `CachePrimer.error_class/1`
+      #     produces — `Loopctl.ExitClass`'s closed `"<kind>:<tag>"` set plus the
+      #     `"unclassified"` catch-all — never the raw exit reason (which carries the
+      #     failing statement and its bound parameters, #562) or an inspected Postgrex
+      #     struct (which names the backend host, database and role). UNTAGGED by
+      #     tenant: `system_configs` is a global, non-tenant table.
+      counter("loopctl.system_config.prime_failed.count",
+        event_name: [:loopctl, :system_config, :prime_failed],
+        measurement: :count,
+        description:
+          "Boot-time SystemConfig cache primes that failed (node serves in-code defaults), " <>
+            "by classified error class.",
+        tags: [:error_class],
+        tag_values: &system_config_prime_failed_tags/1
       )
     ]
+  end
+
+  @doc """
+  `tag_values` for the boot-cache-prime-failure counter (#588). Passes through the
+  BOUNDED `error_class` `Loopctl.SystemConfig.CachePrimer.error_class/1` already
+  produced (`Loopctl.ExitClass`'s closed set, or `"unclassified"`) and NOTHING else —
+  the raw reason never reaches a label. A missing key defaults to `"unknown"` so a
+  direct `:telemetry.execute/3` with a partial map never emits a blank label.
+  """
+  @spec system_config_prime_failed_tags(map()) :: map()
+  def system_config_prime_failed_tags(metadata) do
+    %{error_class: Map.get(metadata, :error_class) || "unknown"}
   end
 
   @doc """
