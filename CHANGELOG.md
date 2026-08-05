@@ -34,7 +34,12 @@ Operator-facing changes for deployments outside the hosted instance.
   `CREATE INDEX CONCURRENTLY articles_embedding_hnsw_idx ON articles USING hnsw (embedding vector_cosine_ops)`
   plus the same `WITH (m, ef_construction)` the migration builds with, and raise
   `maintenance_work_mem` well above the 64 MB default or the ~657 MB HNSW build silently falls
-  back to the slow on-disk path. A rollback rebuilds it too —
+  back to the slow on-disk path.
+  `mix loopctl.embeddings revert` now REFUSES while that index is absent (detected by
+  capability, not by name) and prints the rebuild above; `mix loopctl.embeddings revert
+  --force` overrides the refusal, and `mix loopctl.embeddings status` reports the index as
+  `legacy articles.embedding HNSW index:`. The revert procedure is
+  `docs/runbooks/embedding-dimension-cutover.md` (Reverting). A rollback rebuilds it too —
   `bin/loopctl eval "Loopctl.Release.rollback(20260805120000)"` (there is no `mix` in a
   release) — but Ecto's `:to` is INCLUSIVE, so that reverts every migration at or after that
   version; once anything newer has shipped, use the explicit `CREATE INDEX`. If you do roll

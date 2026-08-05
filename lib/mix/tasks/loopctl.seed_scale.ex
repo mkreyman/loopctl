@@ -135,8 +135,10 @@ defmodule Mix.Tasks.Loopctl.SeedScale do
 
     unless ScaleSeed.hnsw_index_present?() do
       Mix.raise(
-        "No HNSW index detected on articles.embedding. " <>
-          "Run `mix ecto.migrate` before seeding at scale."
+        "No HNSW index detected on articles.embedding or article_embeddings. " <>
+          "Run `mix ecto.migrate` before seeding at scale; if migrations have run, " <>
+          "check the embedding_side_table_reads flag — a cut-over install retires the " <>
+          "legacy articles index by design (GH #578)."
       )
     end
 

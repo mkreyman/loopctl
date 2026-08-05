@@ -29,8 +29,24 @@ defmodule Loopctl.Embeddings do
   Step 4 may only happen after step 1 has reached EVERY node: during a Fly rolling
   deploy an old node writes the legacy column only, so a node reading the side
   table would miss its writes. The flag is a `SystemConfig` integer precisely so
-  reverting it is a single `UPDATE system_configs` with no redeploy — reverting is
-  a SUPPORTED operation for the whole dual-write window (AC-41.1.8(iii)).
+  reverting it is a single `UPDATE system_configs` with no redeploy — reverting
+  stays MECHANICALLY available for the whole dual-write window (AC-41.1.8(iii)).
+
+  ## The revert is no longer free (GH #578)
+
+  Migration `20260805120000_drop_legacy_articles_embedding_hnsw_index.exs` RETIRES
+  the HNSW index over `articles.embedding` on installs whose flag already reads
+  `1`. On such an install the revert target is an UNINDEXED column: a seq scan +
+  top-N sort that trips `HeavyRead`'s per-read `SET LOCAL statement_timeout`, and
+  that cancel is a raised `Postgrex.Error` (57014) rendered `504
+  db_statement_timeout` — NOT `{:error, :heavy_read_overloaded}`, which only the
+  `TenantGate` shed produces and which is the ONLY tuple the keyword degrade
+  matches. So semantic search returns nothing tenant-wide until the index is
+  rebuilt. The COLUMN is untouched and still dual-written, so the revert remains
+  CORRECT; it is the ANN index that has to come back first. `mix
+  loopctl.embeddings revert` refuses while that index is absent and prints the
+  rebuild; `docs/runbooks/embedding-dimension-cutover.md` (Reverting) is the
+  operator procedure.
 
   ## Dual-write is dim-1536-ONLY, and why
 
@@ -388,7 +404,10 @@ defmodule Loopctl.Embeddings do
   Whether recall reads the SIDE TABLE (`true`) or the legacy column (`false`).
 
   A `SystemConfig` integer (`0` = legacy, `1` = side table) so the flip and — just
-  as importantly — the REVERT are a single operator UPDATE with no redeploy.
+  as importantly — the REVERT are a single operator UPDATE with no redeploy. Cheap
+  to EXECUTE is not the same as cheap to LIVE WITH: since GH #578 the legacy ANN
+  index is retired on a cut-over install, so a revert there must be preceded by an
+  index rebuild. See the moduledoc section "The revert is no longer free".
 
   Resolved through `Loopctl.Embeddings.ReadPathBehaviour` (config-based DI), NOT
   read from `SystemConfig` here. Production resolves to

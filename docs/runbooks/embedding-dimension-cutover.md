@@ -30,10 +30,64 @@ reading the side table would miss its writes.
 
 ## Reverting
 
-The flag is a `SystemConfig` integer precisely so the revert is a single UPDATE with
-no redeploy, supported for the whole dual-write window:
+**Read this before reverting — since GH #578 a revert is an INCIDENT action, not a
+routine toggle.** The flag is still a `SystemConfig` integer, so the flip itself is a
+single UPDATE with no redeploy, and the `articles.embedding` COLUMN is still
+dual-written, so the legacy read path is still CORRECT. What changed is its cost:
+migration `20260805120000_drop_legacy_articles_embedding_hnsw_index.exs` retires
+`articles_embedding_hnsw_idx` on any install whose `embedding_side_table_reads` is
+already `1` — i.e. on exactly the installs that can reach a revert.
 
-    mix loopctl.embeddings revert
+With that index gone, flipping back to `0` puts every semantic read on an UNINDEXED
+column: a seq scan + top-N sort that trips the heavy-read `statement_timeout`. The
+cancel surfaces as `504 db_statement_timeout` — **not** `503`/`heavy_read_overloaded`,
+which only the per-tenant concurrency shed produces, and which is the only thing the
+labelled keyword degrade matches. There is no graceful fall-back on that path today:
+semantic search returns no results tenant-wide.
+
+So, in order:
+
+1. **Check whether the legacy ANN index is still there** — by capability, never by
+   name (the retirement and a broken deploy are indistinguishable to a name check):
+
+       SELECT idx.relname, i.indisvalid
+       FROM pg_index i
+       JOIN pg_class idx ON idx.oid = i.indexrelid
+       JOIN pg_class tbl ON tbl.oid = i.indrelid
+       JOIN pg_am am ON am.oid = idx.relam
+       JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+       WHERE tbl.relname = 'articles' AND a.attname = 'embedding' AND am.amname = 'hnsw';
+
+   `mix loopctl.embeddings status` reports the same thing as
+   `legacy articles.embedding HNSW index:`.
+
+2. **If it is absent, rebuild it FIRST.** Raise `maintenance_work_mem` well above the
+   64 MB default or the ~657 MB HNSW build silently falls back to the slow on-disk
+   path. Use the same `WITH` parameters every other HNSW index is built with
+   (`Loopctl.Repo.HnswIndex.with_params_clause/0` — `m = 16, ef_construction = 64`
+   unless the instance overrides `:hnsw_m` / `:hnsw_ef_construction`):
+
+       SET maintenance_work_mem = '2GB';
+       CREATE INDEX CONCURRENTLY articles_embedding_hnsw_idx
+         ON articles USING hnsw (embedding vector_cosine_ops)
+         WITH (m = 16, ef_construction = 64);
+
+   Prefer this explicit `CREATE INDEX` over rolling the migration back: Ecto's `:to`
+   is INCLUSIVE, so `Loopctl.Release.rollback(20260805120000)` reverts every migration
+   at or after that version, and it leaves the migration PENDING so the next deploy
+   re-drops what you just rebuilt.
+
+3. **Then revert the flag:**
+
+       mix loopctl.embeddings revert
+
+   The task performs check (1) itself and REFUSES while the index is absent, printing
+   the rebuild above. `mix loopctl.embeddings revert --force` overrides that refusal —
+   take it only when a slow-or-dead legacy path is deliberately preferable to the
+   side-table one, and expect semantic search to be down until the rebuild lands.
+
+The `memories` legacy indexes are untouched, so a memory-recall revert carries none
+of this.
 
 ## Standing reconciliation
 

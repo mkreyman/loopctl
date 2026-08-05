@@ -9,6 +9,12 @@ defmodule Loopctl.Embeddings.SystemConfigReadPath do
   with no redeploy (AC-41.1.8(ii)/(iii)), and the read stays a near-zero-cost
   `:persistent_term` lookup on the request path.
 
+  That claim is about REDEPLOY, and only about redeploy. Since GH #578 a revert
+  on a cut-over install also needs the retired `articles.embedding` HNSW index
+  rebuilt first, or every semantic read lands unindexed — see the
+  `Loopctl.Embeddings` moduledoc section "The revert is no longer free" and
+  `docs/runbooks/embedding-dimension-cutover.md`.
+
   The flag KEY lives here, not in `Loopctl.Embeddings`: this module is the
   INJECTED collaborator, so depending back on the module it is injected into
   (just to fetch a string constant) would defeat the seam and make it

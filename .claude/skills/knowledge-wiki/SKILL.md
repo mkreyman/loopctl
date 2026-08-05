@@ -173,7 +173,10 @@ number, is the load-bearing invariant. To monitor and keep it healthy over time:
   straight from `system_configs`, so an install still reading the legacy column keeps its index and a
   fresh self-hosted install is unaffected. `Loopctl.Embeddings.LegacyRetirement` discovers legacy
   indexes BY COLUMN, so an install that cuts over AFTER the migration ran still gets the leftover named
-  in its scan map.
+  in its scan map. The executable surface enforces this: `mix loopctl.embeddings revert` REFUSES while
+  the legacy index is absent (capability-detected, `--force` to override) and `mix loopctl.embeddings
+  status` reports its presence. Operator procedure:
+  `docs/runbooks/embedding-dimension-cutover.md` (Reverting).
 - **Bulk (re)embed / backfill is a live-DB hazard.** Unthrottled it 504s the live wiki — per-row HNSW
   index maintenance saturates the small Fly Postgres and starves concurrent heavy-read searches past
   their `statement_timeout`. Throttled id-range keyset pattern: wiki `7a4187fd`.

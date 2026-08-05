@@ -249,9 +249,14 @@ fixture in CI **plus** the live prod `EXPLAIN`/logs confirmation.
 > SELECT value FROM system_configs WHERE key = 'embedding_side_table_reads';
 > ```
 >
-> Everything below is about detecting whichever HNSW index an install DOES have. The
-> capability-detection rule is unchanged and is the reason a name-based check would have
-> read the #578 retirement as a broken deploy.
+> **Everything below detects the LEGACY index only.** The canonical query is scoped to
+> the `articles` TABLE, so on a cut-over install after the retirement it returns zero
+> rows — the live index is `article_embeddings_hnsw_dim_<dim>_idx`, on a different
+> relation, and must be checked THERE (see the per-dimension section below). Capability
+> detection does not rescue that: the table scope, not the index name, is what makes the
+> query blind here. Read a zero-row result against the flag above — `1` means the
+> retirement, `0` means real drift — and re-scope the query to `article_embeddings`
+> before concluding anything on a cut-over install.
 
 The HNSW index on `articles(embedding)` exists under **two names** historically: the
 migration created `articles_embedding_idx`, but the **live prod index was created
