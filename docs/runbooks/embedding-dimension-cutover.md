@@ -150,6 +150,11 @@ So, in order:
    take it only when a slow-or-dead legacy path is deliberately preferable to the
    side-table one, and expect semantic search to be down until the rebuild lands.
 
+   **That refusal only binds where `mix` exists.** A release ships no `mix`, so on the
+   hosted instance the revert is the plain `system_configs` UPDATE via `bin/loopctl eval`
+   or `psql` and nothing stops it. There, steps 1 and 2 above are not a convenience — they
+   are the whole guard, and skipping them takes semantic search down tenant-wide.
+
 The `memories` legacy indexes are untouched, so a memory-recall revert carries none
 of this.
 

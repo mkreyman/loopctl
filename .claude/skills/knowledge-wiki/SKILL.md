@@ -173,9 +173,12 @@ number, is the load-bearing invariant. To monitor and keep it healthy over time:
   straight from `system_configs`, so an install still reading the legacy column keeps its index and a
   fresh self-hosted install is unaffected. `Loopctl.Embeddings.LegacyRetirement` discovers legacy
   indexes BY COLUMN, so an install that cuts over AFTER the migration ran still gets the leftover named
-  in its scan map. The executable surface enforces this: `mix loopctl.embeddings revert` REFUSES while
-  the legacy index is absent (capability-detected, `--force` to override) and `mix loopctl.embeddings
-  status` reports its presence. Operator procedure:
+  in its scan map. `mix loopctl.embeddings revert` REFUSES while the legacy index is absent
+  (capability-detected, `--force` to override) and `mix loopctl.embeddings status` reports its
+  presence — but that refusal binds only where `mix` exists (source checkout / self-hosted from
+  source). **A release ships no `mix`**, so on the hosted instance a revert goes through
+  `bin/loopctl eval` or plain SQL and the guard never runs; there the runbook's rebuild-first
+  ordering is the only thing standing between you and a tenant-wide semantic-search outage. Operator procedure:
   `docs/runbooks/embedding-dimension-cutover.md` — Retiring the legacy articles ANN index (the
   drop, the baseline above, and the `pg_stat_statements` query for the AFTER reading) and
   Reverting.

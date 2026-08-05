@@ -218,20 +218,29 @@ defmodule Loopctl.KnowledgeEmbeddingTest do
       # means — indistinguishable, and the migration guards on the row.
       legacy_column_is_live? = not match?([[1]], rows)
 
-      if legacy_column_is_live? do
-        assert index_valid?("articles_embedding_hnsw_idx"),
-               "the legacy articles.embedding column is still this install's read path, " <>
-                 "so its HNSW index must NOT have been dropped — an unindexed legacy " <>
-                 "read path is a full seq scan + top-N sort over the corpus"
+      # Non-vacuity: every assertion below is conditioned on this premise, so a test DB
+      # that ever seeded the flag to `1` would turn the whole test into a silent pass.
+      # The flag defaults to `0` IN CODE and no migration seeds the row, so the premise
+      # is asserted rather than branched on — a deliberate change to it has to come back
+      # here and decide what this test should check instead of quietly disabling it.
+      assert legacy_column_is_live?,
+             "#{Embeddings.read_flag_key()} is 1 in the test DB, which makes this test " <>
+               "assert nothing. Nothing may write that flag (it is :persistent_term-cached " <>
+               "VM-globally); if the shipped default genuinely changed, rewrite this test " <>
+               "for the side-table read path rather than leaving it vacuous"
 
-        %{rows: [[indexdef]]} =
-          AdminRepo.query!(
-            "SELECT indexdef FROM pg_indexes WHERE tablename = 'articles' AND indexname = 'articles_embedding_hnsw_idx'"
-          )
+      assert index_valid?("articles_embedding_hnsw_idx"),
+             "the legacy articles.embedding column is still this install's read path, " <>
+               "so its HNSW index must NOT have been dropped — an unindexed legacy " <>
+               "read path is a full seq scan + top-N sort over the corpus"
 
-        assert indexdef =~ "hnsw"
-        assert indexdef =~ "vector_cosine_ops"
-      end
+      %{rows: [[indexdef]]} =
+        AdminRepo.query!(
+          "SELECT indexdef FROM pg_indexes WHERE tablename = 'articles' AND indexname = 'articles_embedding_hnsw_idx'"
+        )
+
+      assert indexdef =~ "hnsw"
+      assert indexdef =~ "vector_cosine_ops"
     end
   end
 

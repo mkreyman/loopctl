@@ -38,7 +38,10 @@ Operator-facing changes for deployments outside the hosted instance.
   `mix loopctl.embeddings revert` now REFUSES while that index is absent (detected by
   capability, not by name) and prints the rebuild above; `mix loopctl.embeddings revert
   --force` overrides the refusal, and `mix loopctl.embeddings status` reports the index as
-  `legacy articles.embedding HNSW index:`. The retirement procedure — the out-of-band drop,
+  `legacy articles.embedding HNSW index:`. **That refusal only protects installs that run
+  from source** — a release ships no `mix`, so if you revert with `bin/loopctl eval` or a
+  `psql` UPDATE, nothing checks the index for you and the rebuild-first ordering below is
+  the only guard. The retirement procedure — the out-of-band drop,
   the baseline above as a fixed point, and the `pg_stat_statements` query that takes the
   matching AFTER reading — is `docs/runbooks/embedding-dimension-cutover.md` (Retiring the
   legacy articles ANN index); the revert procedure is the Reverting section of the same file. A rollback rebuilds it too —
