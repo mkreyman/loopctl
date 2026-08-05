@@ -136,6 +136,37 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTagsTest do
     end
   end
 
+  # The sweep is a read-modify-write of the WHOLE tags array against a live corpus:
+  # a page is read, rows are processed one at a time, and each write replaces the
+  # array. Without a compare-and-set, a knowledge_update landing in that window is
+  # silently clobbered by the stale snapshot.
+  describe "write_tags/2 (compare-and-set)" do
+    test "writes when the row still holds the tags the page read", %{tenant: tenant} do
+      article = fixture(:article, tenant_id: tenant.id, tags: ["url-#{@hex12}"])
+      row = %{id: article.id, tags: ["url-#{@hex12}"]}
+
+      assert 1 = Task.write_tags(row, ["url-#{@hex12}", "idem-url-#{@hex12}"])
+      assert tags_of(article) == ["url-#{@hex12}", "idem-url-#{@hex12}"]
+    end
+
+    test "refuses to write when the row's tags changed since the page read", %{tenant: tenant} do
+      article = fixture(:article, tenant_id: tenant.id, tags: ["url-#{@hex12}"])
+
+      # The snapshot the sweep took...
+      row = %{id: article.id, tags: ["url-#{@hex12}"]}
+
+      # ...then a concurrent agent retag replaces the whole array.
+      concurrent = ["url-#{@hex12}", "hand-curated"]
+
+      Article
+      |> Ecto.Query.where([a], a.id == ^article.id)
+      |> AdminRepo.update_all(set: [tags: concurrent])
+
+      assert 0 = Task.write_tags(row, ["url-#{@hex12}", "idem-url-#{@hex12}"])
+      assert tags_of(article) == concurrent
+    end
+  end
+
   describe "run/1 argument validation" do
     # A discarded --tenant leaves the sweep unscoped, and the task runs on
     # AdminRepo (BYPASSRLS) where that predicate is the only scoping there is.

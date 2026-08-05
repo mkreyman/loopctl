@@ -180,7 +180,7 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTags do
         state
 
       true ->
-        if state.applied?, do: write_tags(row.id, promoted)
+        if state.applied?, do: write_tags(row, promoted)
         %{state | changed: state.changed + 1}
     end
   end
@@ -189,9 +189,30 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTags do
   # article field is untouched, so there is nothing left for a changeset to
   # validate — and `updated_at` deliberately stays put, because promoting a tag
   # is not a content edit and must not re-trigger embedding/linking.
-  defp write_tags(id, tags) do
-    Article
-    |> where([a], a.id == ^id)
-    |> AdminRepo.update_all(set: [tags: tags])
+  #
+  # `a.tags == ^row.tags` makes this a compare-and-set against the value the page
+  # read. This is a read-modify-write of a whole array over a live corpus, and a
+  # `knowledge_update` (which REPLACES the tags array) landing between the page
+  # read and this row's write would otherwise be silently clobbered by the stale
+  # set. Losing the race is now a no-op the sweep reports and a re-run fixes,
+  # rather than an agent's retag disappearing.
+  #
+  # Public (like `backfill/1`) only so the compare-and-set is testable with a stale
+  # snapshot: the sweep's own read/write window cannot be hit from a test without
+  # adding an injection seam to the sweep itself.
+  @doc false
+  @spec write_tags(%{id: Ecto.UUID.t(), tags: [String.t()] | nil}, [String.t()]) ::
+          non_neg_integer()
+  def write_tags(row, tags) do
+    {count, _} =
+      Article
+      |> where([a], a.id == ^row.id and a.tags == ^(row.tags || []))
+      |> AdminRepo.update_all(set: [tags: tags])
+
+    if count == 0 do
+      Mix.shell().info("skip #{row.id}: tags changed concurrently, not promoted (re-run to fix)")
+    end
+
+    count
   end
 end

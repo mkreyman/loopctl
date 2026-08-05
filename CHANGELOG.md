@@ -38,12 +38,15 @@ Operator-facing changes for deployments outside the hosted instance.
   truncated. Anything else claiming the prefix — `idem-design`, `idem-url-notahex` — is now
   rejected `422` on `POST /api/v1/articles` and `PATCH /api/v1/articles/:id`, and by the
   changeset underneath every other writer, so nothing is ever silently re-prefixed and a
-  caller always knows what was stored. **The two MACHINE paths drop instead of failing**, on
+  caller always knows what was stored. **The MACHINE paths drop the tag instead of failing**, on
   purpose: OKF import drops a foreign tag that sanitizes into the reserved namespace (the
   original string is preserved under `metadata["okf"]["tags"]`, and a well-formed reserved tag
-  that arrives unchanged — every loopctl-native bundle — round-trips intact), and the review
-  worker strips a malformed reserved tag out of extractor output before insert, because all of
-  a review's extracted articles share one transaction. Script against a `422` only on the two
+  that arrives unchanged — every loopctl-native bundle — round-trips intact), the review worker
+  and the content-ingestion worker strip a malformed reserved tag out of extractor output before
+  insert (all of a review's extracted articles share one transaction, and an ingested article
+  whose changeset is invalid is dropped whole, body included), and memory graduation filters one
+  out of a memory's tags so a hot memory can never burn its one-shot graduation on an article
+  that fails to insert. Script against a `422` only on the two
   API endpoints. Topical tags outside the prefix are unaffected, and the bare pre-reservation
   form (`url-<hex>`) is still accepted so existing sourcers keep working. For
   server-guaranteed idempotency prefer the `idempotency_key` field, which has a per-tenant

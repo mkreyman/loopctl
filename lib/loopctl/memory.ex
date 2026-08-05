@@ -57,6 +57,7 @@ defmodule Loopctl.Memory do
   alias Loopctl.Embeddings
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.IdempotencyTag
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Memory.Memory, as: MemorySchema
@@ -2120,10 +2121,18 @@ defmodule Loopctl.Memory do
   end
 
   # Article tag constraints (mirror `Loopctl.Knowledge.Article`'s @max_tags/@max_tag_length/
-  # @tag_pattern). Memory tags are unbounded/unvalidated, so clamp+filter to what the Article
-  # changeset accepts: drop non-binary, empty, over-long, and format-invalid tags, then cap
-  # the count. Keeping only ALREADY-VALID tags (rather than mangling) guarantees the article
-  # changeset's tag validation cannot fail on a graduated memory.
+  # @tag_pattern, plus its reserved-namespace rule). Memory tags are unbounded/unvalidated —
+  # `Loopctl.Memory.Memory.create_changeset/2` casts :tags with no format validation — so
+  # clamp+filter to what the Article changeset accepts: drop non-binary, empty, over-long,
+  # format-invalid, and reserved-but-malformed tags, then cap the count. Keeping only
+  # ALREADY-VALID tags (rather than mangling) guarantees the article changeset's tag
+  # validation cannot fail on a graduated memory.
+  #
+  # That guarantee is load-bearing, not tidiness: an invalid changeset makes
+  # `do_graduate_memory_record/2` take its structural-error branch, which STAMPS the memory
+  # as graduated, and `resolve_existing_graduation/2` then returns `:already_graduated`
+  # forever — a memory tagged `idem-design` would burn its one-shot graduation with no
+  # article created. Every rule this mirrors must move when the Article changeset does.
   @graduation_max_tags 50
   @graduation_max_tag_length 100
   @graduation_tag_pattern ~r/^[a-zA-Z0-9_-]+$/
@@ -2132,7 +2141,8 @@ defmodule Loopctl.Memory do
     |> Enum.filter(fn tag ->
       is_binary(tag) and byte_size(tag) > 0 and
         String.length(tag) <= @graduation_max_tag_length and
-        Regex.match?(@graduation_tag_pattern, tag)
+        Regex.match?(@graduation_tag_pattern, tag) and
+        not (IdempotencyTag.reserved?(tag) and not IdempotencyTag.well_formed?(tag))
     end)
     |> Enum.take(@graduation_max_tags)
   end
