@@ -5471,8 +5471,9 @@ const TOOLS = [
       "Classes: `duplicate_capture` (titles that collide once case/punctuation normalize away, " +
       "or idempotency keys that collide under the same normalization while differing verbatim — " +
       "capture tag-format drift, which the novelty gate does not catch because novelty scoring " +
-      "and idempotency are separate paths); `contradiction_candidate` (a conflict-flagged pair " +
-      "with no recorded verdict — record one via knowledge_resolve_conflict, this report writes " +
+      "and idempotency are separate paths); `contradiction_candidate` (a SYSTEM-flagged " +
+      "potential_conflict pair of PUBLISHED articles with no recorded verdict — record one via " +
+      "knowledge_resolve_conflict, which accepts exactly these pairs; this report writes " +
       "none); `generic_title` (a placeholder title that collides on active-title uniqueness and " +
       "blocks hub creation); `stale_entry` (past the lint staleness threshold, never reconciled).\n\n" +
       "Denominators: `corpus_size` counts PUBLISHED articles owned by the tenant at scan time, " +

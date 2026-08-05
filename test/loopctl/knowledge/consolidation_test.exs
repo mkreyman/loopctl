@@ -32,6 +32,18 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
     |> AdminRepo.update!()
   end
 
+  # A SYSTEM-flagged conflict link — the ONLY shape `contradiction_candidate` proposes on,
+  # because it is the only shape `Knowledge.annotate_conflict/3` will accept a verdict for.
+  defp system_conflict_link(tenant_id, source, target) do
+    fixture(:article_link, %{
+      tenant_id: tenant_id,
+      source_article_id: source.id,
+      target_article_id: target.id,
+      relationship_type: :potential_conflict,
+      metadata: %{"auto_generated" => true, "similarity_score" => 0.97}
+    })
+  end
+
   defp proposals_of(analysis, class) do
     Enum.filter(analysis.proposals, &(&1.proposal_class == class))
   end
@@ -119,6 +131,34 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert proposals_of(analysis, :duplicate_capture) == []
       assert analysis.summary.by_class["duplicate_capture"] == 0
     end
+
+    # The normalization strips everything outside [a-z0-9], so titles in a non-Latin script
+    # or made only of symbols ALL collapse to the empty string and would be emitted as one
+    # "same capture under title drift" group. Deterministic false positive in the class #584
+    # names as the likely first auto-apply candidate.
+    test "does not group titles that share only an EMPTY normalized form" do
+      tenant = fixture(:tenant)
+      published(tenant.id, %{title: "日本語ガイド", body: "Japanese guide."})
+      published(tenant.id, %{title: "中文指南", body: "Chinese guide."})
+      published(tenant.id, %{title: "!!!", body: "Symbols only."})
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+
+      assert proposals_of(analysis, :duplicate_capture) == []
+      assert analysis.summary.by_class["duplicate_capture"] == 0
+      # Nor does the empty bucket fall through to the placeholder-title class.
+      assert proposals_of(analysis, :generic_title) == []
+    end
+
+    test "does not group idempotency keys that share only an EMPTY normalized form" do
+      tenant = fixture(:tenant)
+      published(tenant.id, %{title: "Harvest A", idempotency_key: "***"})
+      published(tenant.id, %{title: "Harvest B", idempotency_key: "///"})
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+
+      assert proposals_of(analysis, :duplicate_capture) == []
+    end
   end
 
   describe "analyze/3 — contradiction_candidate" do
@@ -129,12 +169,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       b =
         published(tenant.id, %{title: "Avoid Ecto.Multi", body: "Never wrap writes in Multi."})
 
-      fixture(:article_link, %{
-        tenant_id: tenant.id,
-        source_article_id: a.id,
-        target_article_id: b.id,
-        relationship_type: :potential_conflict
-      })
+      system_conflict_link(tenant.id, a, b)
 
       {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
 
@@ -151,12 +186,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       a = published(tenant.id, %{title: "Use Ecto.Multi"})
       b = published(tenant.id, %{title: "Avoid Ecto.Multi"})
 
-      fixture(:article_link, %{
-        tenant_id: tenant.id,
-        source_article_id: a.id,
-        target_article_id: b.id,
-        relationship_type: :potential_conflict
-      })
+      system_conflict_link(tenant.id, a, b)
 
       [source_id, target_id] = Enum.sort([a.id, b.id])
 
@@ -176,6 +206,71 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
 
       assert proposals_of(analysis, :contradiction_candidate) == []
+    end
+
+    # An agent-created `contradicts` link is NOT a pair the conflict-resolution surface
+    # accepts (`validate_potential_conflict_exists/3` 422s it), so a proposal naming it
+    # would instruct the reviewer to make a call that always fails — and, since no verdict
+    # can ever be recorded, would be re-derived every night forever.
+    test "does not propose an agent-creatable contradicts link" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, %{title: "Use Ecto.Multi"})
+      b = published(tenant.id, %{title: "Avoid Ecto.Multi"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: a.id,
+        target_article_id: b.id,
+        relationship_type: :contradicts
+      })
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+
+      assert proposals_of(analysis, :contradiction_candidate) == []
+      assert analysis.summary.by_class["contradiction_candidate"] == 0
+    end
+
+    # Same dead end for a stray / legacy potential_conflict with no system stamp — which is
+    # exactly what `Knowledge.list_potential_conflicts/2` refuses to surface (kb-02).
+    test "does not propose a potential_conflict link that is not SYSTEM-flagged" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, %{title: "Use Ecto.Multi"})
+      b = published(tenant.id, %{title: "Avoid Ecto.Multi"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: a.id,
+        target_article_id: b.id,
+        relationship_type: :potential_conflict,
+        metadata: %{}
+      })
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+
+      assert proposals_of(analysis, :contradiction_candidate) == []
+    end
+
+    # Archiving retains article_links by design, so without a status join the pass kept
+    # proposing over an archived article — and quoting its body — while `corpus_size`
+    # excluded it from the denominator the same report states.
+    test "does not propose a pair whose endpoint is archived, and never quotes its body" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, %{title: "Use Ecto.Multi", body: "Always wrap writes in Multi."})
+
+      b =
+        published(tenant.id, %{title: "Avoid Ecto.Multi", body: "SECRET archived reasoning."})
+
+      system_conflict_link(tenant.id, a, b)
+
+      b |> Ecto.Changeset.change(%{status: :archived}) |> AdminRepo.update!()
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+
+      assert proposals_of(analysis, :contradiction_candidate) == []
+
+      refute Enum.any?(analysis.proposals, fn p ->
+               Enum.any?(p.evidence, &(&1["excerpt"] =~ "SECRET archived"))
+             end)
     end
   end
 
@@ -275,12 +370,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       b = published(tenant.id, %{title: "retry-policy", body: "Retry with jitter."})
       published(tenant.id, %{title: "Untitled Document", body: "No title here."})
 
-      fixture(:article_link, %{
-        tenant_id: tenant.id,
-        source_article_id: a.id,
-        target_article_id: b.id,
-        relationship_type: :potential_conflict
-      })
+      system_conflict_link(tenant.id, a, b)
 
       lint_report = %{
         stale_articles: [

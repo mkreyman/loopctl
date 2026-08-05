@@ -35,7 +35,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      classes and persists them as the tenant's report for the day. It writes
      NOTHING to `articles` / `article_links` / `conflict_resolutions`. This runs
      inside the existing nightly pass on purpose: a second scheduler over the same
-     corpus is the specific failure #584 names.
+     corpus is the specific failure #584 names. It is also FAIL-SOFT: a raise or a
+     pool exit inside it is recorded in the audit event and never aborts the run
+     (see `consolidate/2`).
   4. **Surfaces all findings** via an immutable audit event
      (`knowledge.lint_completed`) carrying the full lint summary, so
      contradictions / coverage gaps / broken sources / stale counts are
@@ -64,6 +66,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Embeddings
+  alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
@@ -123,8 +126,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
         "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
         "conflicts_promoted=#{promoted} resolutions_applied=#{resolutions_applied} " <>
-        "consolidation_proposals=#{consolidation.proposal_count} " <>
-        "consolidation_persisted=#{consolidation.persisted_count}"
+        consolidation_log(consolidation)
     )
 
     :ok
@@ -307,6 +309,18 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # #584 stage 1: REPORT ONLY. Reuses the lint report already computed above (one
   # corpus scan per night, one scheduler) and writes only the consolidation report +
   # its proposal rows.
+  #
+  # FAIL-SOFT, and that is the whole point of the rescue/catch: by the time this runs,
+  # `lint_tenant/1` has ALREADY taken its effectful steps (orphan re-link enqueues,
+  # conflict promotions, applied resolutions) and has NOT yet written its audit event.
+  # Letting a raise out of the report-only stage — a statement timeout on a large
+  # corpus, an in-flight shed, an AdminRepo checkout exit — would skip
+  # `log_audit_event/6` entirely, so the change feed would show NO lint for that tenant
+  # that night even though state changed, and Oban's retries would redo the effectful
+  # steps each time. A tenant whose corpus deterministically times out these scans would
+  # lose the pre-existing pass's observability permanently. The failure is recorded in
+  # the audit event instead, as a low-cardinality TAG (never the raw error, which carries
+  # backend host / database / role).
   defp consolidate(tenant_id, report) do
     max_per_class =
       Application.get_env(
@@ -316,8 +330,44 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       )
 
     {:ok, consolidation} = Consolidation.run(tenant_id, report, max_per_class: max_per_class)
-    consolidation
+    {:ok, consolidation}
+  rescue
+    error -> consolidation_failed(tenant_id, ExitTag.tag(error))
+  catch
+    :exit, reason -> consolidation_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
   end
+
+  defp consolidation_failed(tenant_id, tag) do
+    Logger.error(
+      "KnowledgeLintWorker: tenant=#{tenant_id} consolidation FAILED (#{tag}) — the lint " <>
+        "pass and its audit event still complete; the consolidation report was not written."
+    )
+
+    {:error, tag}
+  end
+
+  defp consolidation_log({:ok, consolidation}) do
+    "consolidation_proposals=#{consolidation.proposal_count} " <>
+      "consolidation_persisted=#{consolidation.persisted_count}"
+  end
+
+  defp consolidation_log({:error, tag}), do: "consolidation=failed:#{tag}"
+
+  # Counts of PROPOSALS (not articles): `proposal_count` is the true pre-cap total
+  # across classes, `persisted_count` the rows actually written (lower only when a class
+  # hit its cap). Nothing was applied — stage 1 is report-only.
+  defp consolidation_state({:ok, consolidation}) do
+    %{
+      "status" => "ok",
+      "day" => Date.to_iso8601(consolidation.day),
+      "proposal_count" => consolidation.proposal_count,
+      "persisted_count" => consolidation.persisted_count,
+      "by_class" => consolidation.proposals_by_class,
+      "truncated" => consolidation.truncated
+    }
+  end
+
+  defp consolidation_state({:error, tag}), do: %{"status" => "failed", "error" => tag}
 
   defp log_audit_event(tenant_id, report, action, promoted, resolutions_applied, consolidation) do
     Audit.create_log_entry(tenant_id, %{
@@ -333,16 +383,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "orphans_embedding_enqueued" => action.embedding_enqueued,
         "conflicts_promoted" => promoted,
         "resolutions_applied" => resolutions_applied,
-        # Counts of PROPOSALS (not articles): `proposal_count` is the true pre-cap
-        # total across classes, `persisted_count` the rows actually written (lower
-        # only when a class hit its cap). Nothing was applied — stage 1 is report-only.
-        "consolidation" => %{
-          "day" => Date.to_iso8601(consolidation.day),
-          "proposal_count" => consolidation.proposal_count,
-          "persisted_count" => consolidation.persisted_count,
-          "by_class" => consolidation.proposals_by_class,
-          "truncated" => consolidation.truncated
-        }
+        "consolidation" => consolidation_state(consolidation)
       }
     })
   end

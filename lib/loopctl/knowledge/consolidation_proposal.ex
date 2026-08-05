@@ -9,15 +9,20 @@ defmodule Loopctl.Knowledge.ConsolidationProposal do
 
   ## Classes
 
-  - `:duplicate_capture` — the same material captured twice. Two signals feed it:
-    titles that collide once punctuation/case are normalized away, and two published
-    articles sharing a `(source_type, source_id)` under DIFFERENT `idempotency_key`s
-    (the tag-format drift of #583, which the novelty scorer does not catch because
-    novelty scoring and idempotency are separate paths).
-  - `:contradiction_candidate` — a `potential_conflict` / `contradicts` link pair with
-    NO `conflict_resolutions` verdict yet. This class deliberately reports INTO the
-    existing conflict machinery rather than replacing it; the proposal is a pointer to
-    a pair an agent still has to judge.
+  - `:duplicate_capture` — the same material captured twice. Two signals feed it, and
+    BOTH are the same lower/strip-punctuation normalization: titles that collide once
+    punctuation and case are normalized away, and `idempotency_key`s that collide under
+    that normalization while differing VERBATIM (the tag-format drift of #583, which the
+    novelty scorer does not catch because novelty scoring and idempotency are separate
+    paths). It is deliberately NOT a `(source_type, source_id)` match: `source_id` is not
+    per-article unique (#137 — that is why `idempotency_key` exists as its own column), so
+    a shared source is not evidence of a duplicate capture.
+  - `:contradiction_candidate` — a SYSTEM-flagged (`auto_generated`) `potential_conflict`
+    link between two PUBLISHED articles with NO `conflict_resolutions` verdict yet. This
+    class deliberately reports INTO the existing conflict machinery rather than replacing
+    it; the proposal is a pointer to a pair an agent still has to judge. The predicates
+    mirror that surface's own (`Knowledge.validate_potential_conflict_exists/3`) so a
+    proposal never names a pair the surface would refuse with `422 no_potential_conflict`.
   - `:generic_title` — a placeholder title ("Untitled Document", "New Article", …).
     These collide on the per-tenant active-title uniqueness and block hub creation.
   - `:stale_entry` — an article past the lint staleness threshold, never reconciled.

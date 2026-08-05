@@ -31,7 +31,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   | Class | Signal |
   |---|---|
   | `:duplicate_capture` | two published articles whose titles collide once case/punctuation are normalized away, or whose `idempotency_key`s collide under the same normalization while differing verbatim (tag-format drift — novelty scoring and idempotency are separate paths, so the novelty gate does not catch it) |
-  | `:contradiction_candidate` | a `potential_conflict` / `contradicts` link pair with no `conflict_resolutions` verdict yet — reported INTO the existing conflict machinery, never a parallel store |
+  | `:contradiction_candidate` | a SYSTEM-flagged (`auto_generated`) `potential_conflict` link between two PUBLISHED articles with no `conflict_resolutions` verdict yet — reported INTO the existing conflict machinery, never a parallel store |
   | `:generic_title` | a placeholder title, which collides on per-tenant active-title uniqueness and blocks hub creation |
   | `:stale_entry` | past the lint staleness threshold and never reconciled |
 
@@ -51,9 +51,22 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   ## Reads never touch the heat index
 
-  Article bodies are read straight through `AdminRepo`, never `Knowledge.get_article/3`,
+  Article bodies are read straight through the repo, never `Knowledge.get_article/3`,
   which records a heat-counted `get` event. A whole-corpus nightly pass reading through
   the public path would make the pass itself rank the corpus.
+
+  ## Where the reads run
+
+  Every whole-corpus ENUMERATION here (the corpus count, the two normalization GROUP BYs,
+  the conflict-link scan, the judged-pair set, the placeholder-title regex scan) goes
+  through `Loopctl.HeavyRead` on the `:consolidation` endpoint, not straight through
+  `AdminRepo`: those scans are unindexable by construction (they group on a
+  `regexp_replace` expression) and `AdminRepo`'s pool is 3 connections shared with every
+  other admin op, so an all-tenants nightly fan-out on the shared `:knowledge` queue can
+  starve it. `HeavyRead` also gives each scan a `SET LOCAL statement_timeout` and the
+  per-tenant in-flight shed. `analyze/3` holds ONE gate slot across the whole set
+  (`with_slot/3`). The evidence fetch stays on `AdminRepo` — it is keyed by a bounded id
+  list, not an enumeration — and so do the report/proposal WRITES.
   """
 
   import Ecto.Query
@@ -61,6 +74,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.HeavyRead
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
@@ -77,7 +91,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   # Placeholder titles that block hub creation (the "Untitled Document" 409). ONE
   # definition, referenced by both the query and the endpoint documentation.
   @generic_title_pattern "^(untitled|untitled document|new article|new document|document|draft|no title|untitled note)( [0-9]+)?$"
-  @conflict_link_types [:potential_conflict, :contradicts]
+  # The heavy-read endpoint every whole-corpus enumeration in this module runs under.
+  @heavy_endpoint :consolidation
 
   @doc "Default per-class proposal cap."
   @spec default_max_per_class() :: pos_integer()
@@ -112,12 +127,18 @@ defmodule Loopctl.Knowledge.Consolidation do
       |> max(1)
       |> min(@hard_max_per_class)
 
-    found = %{
-      duplicate_capture: duplicate_captures(tenant_id, cap),
-      contradiction_candidate: contradiction_candidates(tenant_id, cap),
-      generic_title: generic_titles(tenant_id, cap),
-      stale_entry: stale_entries(tenant_id, lint_report, cap)
-    }
+    # ONE gate slot for the whole read unit: the scans below are logically one pass, and
+    # acquiring per query would let the cheap halves run ungated between the expensive ones.
+    {corpus_size, found} =
+      HeavyRead.with_slot(tenant_id, heavy_opts(), fn ->
+        {corpus_size(tenant_id),
+         %{
+           duplicate_capture: duplicate_captures(tenant_id, cap),
+           contradiction_candidate: contradiction_candidates(tenant_id, cap),
+           generic_title: generic_titles(tenant_id, cap),
+           stale_entry: stale_entries(tenant_id, lint_report, cap)
+         }}
+      end)
 
     by_class = Map.new(found, fn {class, {total, _items}} -> {to_string(class), total} end)
 
@@ -136,7 +157,7 @@ defmodule Loopctl.Knowledge.Consolidation do
      %{
        proposals: proposals,
        summary: %{
-         corpus_size: corpus_size(tenant_id),
+         corpus_size: corpus_size,
          total_proposals: total_proposals,
          emitted: length(proposals),
          by_class: by_class,
@@ -224,8 +245,16 @@ defmodule Loopctl.Knowledge.Consolidation do
     from(a in Article, where: a.tenant_id == ^tenant_id, where: a.status == :published)
   end
 
+  defp heavy_opts, do: HeavyRead.opts(@heavy_endpoint)
+
+  defp heavy_all(query, tenant_id), do: HeavyRead.all(tenant_id, query, heavy_opts())
+
   defp corpus_size(tenant_id) do
-    AdminRepo.aggregate(published_base(tenant_id), :count, :id)
+    HeavyRead.one(
+      tenant_id,
+      from(a in published_base(tenant_id), select: count(a.id)),
+      heavy_opts()
+    )
   end
 
   # Two format-drift signals, merged and de-duplicated by the article set they name.
@@ -257,44 +286,84 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   # Titles that collide once case and punctuation are normalized away. The exact
   # active-title uniqueness check cannot see these — that is why they got published.
+  #
+  # The EMPTY normalized key is excluded, and that exclusion is load-bearing: the
+  # normalization strips everything outside `[a-z0-9]`, so every title made only of
+  # non-ASCII script or symbols ("日本語ガイド", "中文指南", "🚀", "!!!") normalizes to the
+  # SAME empty string. Without the guard they land in one group and are asserted to be
+  # "the same capture under title drift" — a deterministic false positive in the class
+  # #584 names as the likely first auto-apply candidate, which would poison exactly the
+  # calibration signal stage 2 exists to collect.
   defp title_drift_groups(tenant_id) do
     from(a in published_base(tenant_id),
+      where: fragment("btrim(regexp_replace(lower(?), '[^a-z0-9]+', ' ', 'g')) <> ''", a.title),
       group_by: fragment("btrim(regexp_replace(lower(?), '[^a-z0-9]+', ' ', 'g'))", a.title),
       having: count(a.id) > 1,
       select: %{ids: fragment("array_agg(?::text ORDER BY ?)", a.id, a.inserted_at)}
     )
-    |> AdminRepo.all()
+    |> heavy_all(tenant_id)
     |> Enum.map(fn %{ids: ids} -> {"title", ids} end)
   end
 
   # The same idempotency key written under two different tag FORMATS (#583) — the
-  # normalized keys collide while the verbatim keys differ.
+  # normalized keys collide while the verbatim keys differ. Same empty-key guard as
+  # `title_drift_groups/1`, for the same reason: keys with no ASCII alphanumerics all
+  # normalize together.
   defp idempotency_drift_groups(tenant_id) do
     from(a in published_base(tenant_id),
       where: not is_nil(a.idempotency_key),
+      where:
+        fragment(
+          "btrim(regexp_replace(lower(?), '[^a-z0-9]+', ' ', 'g')) <> ''",
+          a.idempotency_key
+        ),
       group_by:
         fragment("btrim(regexp_replace(lower(?), '[^a-z0-9]+', ' ', 'g'))", a.idempotency_key),
       having: count(a.id) > 1 and count(a.idempotency_key, :distinct) > 1,
       select: %{ids: fragment("array_agg(?::text ORDER BY ?)", a.id, a.inserted_at)}
     )
-    |> AdminRepo.all()
+    |> heavy_all(tenant_id)
     |> Enum.map(fn %{ids: ids} -> {"idempotency-tag", ids} end)
   end
 
   # Conflict-flagged pairs no agent has judged yet. Canonical (sorted) pair, matching
   # how `conflict_resolutions` stores its verdicts, so an existing verdict in either
   # link direction suppresses the proposal.
+  #
+  # The predicates MIRROR the conflict-resolution surface this proposal points at, because
+  # a proposal whose `suggested_action` the surface would refuse is a dead end the pass
+  # re-derives every night (nothing can record a verdict for it, so `judged_pairs/1` never
+  # suppresses it, and it permanently occupies one of the per-class slots):
+  #
+  #   * `:potential_conflict` ONLY, and only SYSTEM-flagged (`auto_generated`) — the same
+  #     two predicates `Knowledge.validate_potential_conflict_exists/3` requires (else
+  #     `422 no_potential_conflict`) and `Knowledge.list_potential_conflicts/2` applies.
+  #     `:contradicts` is PUBLICLY creatable by an `:agent` key, so including it also let
+  #     an agent manufacture orchestrator-facing proposals at will.
+  #   * BOTH endpoints PUBLISHED — every other class derives from `published_base/1`, and
+  #     `archive_article/3` deliberately retains `article_links`, so without this an
+  #     archived article kept producing proposals (quoting its body) while `corpus_size`
+  #     excluded it: a proposal citing an article outside its own stated denominator.
   defp contradiction_candidates(tenant_id, cap) do
     pairs =
       from(l in ArticleLink,
+        join: s in Article,
+        on: s.id == l.source_article_id,
+        join: t in Article,
+        on: t.id == l.target_article_id,
         where: l.tenant_id == ^tenant_id,
-        where: l.relationship_type in ^@conflict_link_types,
+        where: s.tenant_id == ^tenant_id,
+        where: t.tenant_id == ^tenant_id,
+        where: l.relationship_type == :potential_conflict,
+        where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
+        where: s.status == :published,
+        where: t.status == :published,
         select: %{
           source_article_id: l.source_article_id,
           target_article_id: l.target_article_id
         }
       )
-      |> AdminRepo.all()
+      |> heavy_all(tenant_id)
       |> Enum.map(fn %{source_article_id: s, target_article_id: t} -> Enum.sort([s, t]) end)
       |> Enum.uniq()
       |> Enum.sort()
@@ -327,7 +396,7 @@ defmodule Loopctl.Knowledge.Consolidation do
       where: r.tenant_id == ^tenant_id,
       select: {r.source_article_id, r.target_article_id}
     )
-    |> AdminRepo.all()
+    |> heavy_all(tenant_id)
     |> Enum.map(fn {s, t} -> Enum.sort([s, t]) end)
     |> MapSet.new()
   end
@@ -344,7 +413,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         order_by: [asc: a.inserted_at, asc: a.id],
         select: a.id
       )
-      |> AdminRepo.all()
+      |> heavy_all(tenant_id)
 
     selected = Enum.take(ids, cap)
     evidence_by_id = evidence_map(tenant_id, selected)
@@ -416,7 +485,13 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   # Bodies come straight from AdminRepo (never `Knowledge.get_article/3`, which records
-  # a heat-counted read) and are truncated in SQL before they reach the VM.
+  # a heat-counted read) and are truncated in SQL before they reach the VM. Bounded by a
+  # concrete id list, so this is not an enumeration and stays off the heavy-read pool.
+  #
+  # PUBLISHED-scoped as defence in depth: this is the BODY-QUOTING path, and the whole
+  # pass is documented to operate on the published corpus. An id that is not published
+  # falls back to `blank_evidence/1` rather than persisting an archived article's excerpt
+  # into `consolidation_proposals.evidence` and serving it from the API.
   defp evidence_map(_tenant_id, []), do: %{}
 
   defp evidence_map(tenant_id, article_ids) do
@@ -424,6 +499,7 @@ defmodule Loopctl.Knowledge.Consolidation do
 
     from(a in Article,
       where: a.tenant_id == ^tenant_id,
+      where: a.status == :published,
       where: a.id in ^ids,
       select: %{
         id: a.id,

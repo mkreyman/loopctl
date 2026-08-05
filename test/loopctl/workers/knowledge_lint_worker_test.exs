@@ -8,6 +8,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.MockArticleSimilaritySearch
   alias Loopctl.Workers.KnowledgeLintWorker
@@ -214,9 +215,42 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
 
       # The single audit event carries the consolidation counts alongside the lint summary.
       assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["consolidation"]["status"] == "ok"
       assert entry.new_state["consolidation"]["proposal_count"] == 1
       assert entry.new_state["consolidation"]["persisted_count"] == 1
       assert entry.new_state["consolidation"]["day"] == Date.to_iso8601(Date.utc_today())
+    end
+
+    # The consolidation stage runs AFTER the effectful steps (orphan re-link, conflict
+    # promotion, applied resolutions) and BEFORE the audit event. If it could abort the run,
+    # a tenant whose corpus deterministically fails those scans would lose the pre-existing
+    # lint pass's observability entirely while Oban redid the effectful steps each retry.
+    # Forced here through a REAL failure mode: the tenant's whole HeavyRead in-flight budget
+    # is already reserved, so the pass's `with_slot/3` sheds and raises.
+    test "#584: a consolidation failure does NOT abort the lint run or suppress its audit event" do
+      tenant = fixture(:tenant)
+      published_article_with_embedding(tenant.id, similar_embedding(), %{title: "Retry Policy"})
+      published_article_with_embedding(tenant.id, similar_embedding(), %{title: "retry-policy!"})
+
+      cap = TenantGate.cap()
+      assert TenantGate.acquire(tenant.id, cap, cap) == :ok
+
+      try do
+        assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      after
+        TenantGate.release(tenant.id, cap)
+      end
+
+      # No consolidation report was written...
+      assert AdminRepo.all(
+               from(r in Loopctl.Knowledge.ConsolidationReport, where: r.tenant_id == ^tenant.id)
+             ) == []
+
+      # ...but the lint pass's own audit event still is, and it NAMES the failure.
+      assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["summary"]["total_articles"] == 2
+      assert entry.new_state["consolidation"]["status"] == "failed"
+      assert is_binary(entry.new_state["consolidation"]["error"])
     end
 
     test "handles a tenant with no published articles" do

@@ -168,6 +168,10 @@ defmodule Loopctl.HeavyRead.TenantGate do
   # calls starve genuine request-path reads. Marked heavy and actually cheap, it just sheds
   # earlier under load — and this surface is a cadence-refreshed navigation index, so a STALE
   # index costs nothing while a starved semantic search costs a request.
+  # `consolidation` (#584) is HEAVY for the same shape of reason: its scans GROUP BY a
+  # `regexp_replace` expression over every published article, so no index can serve them and
+  # their cost grows with the corpus. It is a nightly report-only pass, so shedding it costs
+  # one night of a proposal list; starving the request path costs requests.
   @heavy_endpoints ~w(
     vector_search
     semantic_search
@@ -179,6 +183,7 @@ defmodule Loopctl.HeavyRead.TenantGate do
     export
     graph_lane
     heat_index
+    consolidation
   )a
 
   # --- Client API ---

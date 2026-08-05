@@ -12,8 +12,9 @@ Operator-facing changes for deployments outside the hosted instance.
   REPORT-ONLY (#584, stage 1 of 3).** The existing nightly knowledge pass (04:00 UTC,
   `KnowledgeLintWorker`) now also reconciles the tenant's published corpus and emits numbered
   proposals, each naming the articles involved and quoting an excerpt from each as evidence:
-  duplicate captures from title/idempotency-tag format drift, conflict-flagged pairs with no
-  recorded verdict, placeholder titles, and stale entries. **It writes nothing** to `articles`,
+  duplicate captures from title/idempotency-tag format drift, SYSTEM-flagged conflict pairs of
+  published articles with no recorded verdict (the same pairs the conflict-resolution endpoint
+  accepts, so a proposal never names one it would refuse), placeholder titles, and stale entries. **It writes nothing** to `articles`,
   `article_links` or `conflict_resolutions` — the only writes are the report itself. Deliberately
   NOT a second scheduler: it reuses the lint report from the same run, so there is still one
   nightly job per tenant over the corpus. Migration

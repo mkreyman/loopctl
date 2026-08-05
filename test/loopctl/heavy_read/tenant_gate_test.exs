@@ -298,7 +298,10 @@ defmodule Loopctl.HeavyRead.TenantGateTest do
       llm_usage: :light,
       # #554: heavy — its cost tracks the read-history table, and shedding a cadence-refreshed
       # navigation index is far cheaper than starving a request-path search.
-      heat_index: :heavy
+      heat_index: :heavy,
+      # #584: heavy — GROUP BY over a regexp_replace normalization of every published
+      # article; unindexable by construction and growing with the corpus.
+      consolidation: :heavy
     }
 
     test "every @heavy_endpoints atom is a known HeavyRead endpoint (no orphan/typo)" do
