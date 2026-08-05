@@ -855,6 +855,26 @@ defmodule Loopctl.Knowledge.Analytics do
   # Unused articles
   # ---------------------------------------------------------------------------
 
+  # "Not accessed since the cutoff" is a correlated `not exists`, never
+  # `a.id not in subquery(accessed_ids)` (#585). Same shape as the orphan check in
+  # `Loopctl.Knowledge.find_orphan_articles/3` (#574), but for a different reason: this
+  # one was HEALTHY in production, so the rewrite removes a cliff rather than a fire.
+  #
+  # PostgreSQL never converts `NOT IN (subquery)` into an anti-join — three-valued NULL
+  # semantics forbid it, and it does not use a NOT NULL constraint to enable the
+  # transformation (verified: `article_access_events.article_id` is NOT NULL and the
+  # transformation still does not happen). What it does instead depends purely on SIZE.
+  # If the subquery result fits `work_mem` it builds a hashed SubPlan (measured on prod:
+  # work_mem 4 MB, 8,797 distinct accessed articles in the 30-day window, total plan cost
+  # 2,663 — fine). If it does not fit, it silently degrades to Materialize plus one
+  # re-scan per outer row, which is exactly what cost #574 2.21 BILLION. There is no
+  # error and no warning at the crossover: the endpoint just goes from milliseconds to
+  # unusable. Growth drivers here are articles read per window, the caller-supplied
+  # `days_unused` (up to 365 via the controller), and raw event volume.
+  #
+  # A correlated `NOT EXISTS` is anti-join-able, so each candidate article becomes one
+  # index probe on `article_access_events_tenant_article_time_idx`
+  # (tenant_id, article_id, accessed_at) regardless of how large the accessed set gets.
   @doc """
   Returns published articles with zero accesses in the configured window.
 
@@ -870,20 +890,20 @@ defmodule Loopctl.Knowledge.Analytics do
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
     cutoff = DateTime.add(DateTime.utc_now(), -days_unused * 86_400, :second)
 
-    # Subquery: article ids that HAVE been accessed since the cutoff
-    accessed_ids =
-      from(e in ArticleAccessEvent,
-        where: e.tenant_id == ^tenant_id,
-        where: e.accessed_at >= ^cutoff,
-        distinct: true,
-        select: e.article_id
-      )
-
     query =
       from(a in Article,
+        as: :article,
         where: a.tenant_id == ^tenant_id,
         where: a.status == :published,
-        where: a.id not in subquery(accessed_ids),
+        where:
+          not exists(
+            from(e in ArticleAccessEvent,
+              where: e.tenant_id == ^tenant_id,
+              where: e.accessed_at >= ^cutoff,
+              where: e.article_id == parent_as(:article).id,
+              select: 1
+            )
+          ),
         order_by: [asc: a.inserted_at, asc: a.id],
         limit: ^limit,
         offset: ^offset,

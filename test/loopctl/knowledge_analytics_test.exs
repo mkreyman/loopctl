@@ -258,6 +258,43 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
       rows = Knowledge.list_unused_articles(tenant.id, days_unused: 30)
       assert Enum.any?(rows, &(&1.article_id == article.id))
     end
+
+    test "#585: the unused check is an ANTI-JOIN, never `id not in subquery`" do
+      # The two correctness tests above pass under BOTH shapes — which is why this class
+      # of defect keeps surviving review. `NOT IN (subquery)` is never converted to an
+      # anti-join by PostgreSQL (three-valued NULL semantics; a NOT NULL column does not
+      # enable it either). Below `work_mem` it builds a hashed SubPlan and looks fine;
+      # above it, it silently falls back to Materialize plus a re-scan per outer row —
+      # the plan that cost #574 2.21 BILLION. On prod this query is currently on the good
+      # side of that line (work_mem 4 MB, 8,797 distinct accessed articles), so nothing is
+      # broken today; the rewrite removes the cliff.
+      #
+      # A plan-shape assertion cannot be the guard here: at test-data scale the planner
+      # picks whatever it likes, so this anchors to the CODE. The function body is sliced
+      # by a BOUNDED regex (an unbounded span would silently match a later function), the
+      # slice is asserted non-empty, and the positive assertion is COUNTED so the guard
+      # cannot pass by matching nothing.
+      source = File.read!("lib/loopctl/knowledge/analytics.ex")
+
+      [_ | _] = unused_fn = Regex.run(~r/\n  def list_unused_articles.*?\n  end\n/s, source)
+      body = hd(unused_fn)
+
+      assert body =~ "AdminRepo.all()",
+             "the regex slice must cover the whole function body, not a prefix of it"
+
+      correlated = Regex.scan(~r/not exists\(/, body)
+
+      assert length(correlated) == 1,
+             "expected exactly one correlated NOT EXISTS, got #{length(correlated)}"
+
+      assert body =~ "parent_as(:article)", "the subquery must correlate to the outer row"
+
+      assert body =~ "e.tenant_id == ^tenant_id",
+             "AdminRepo is BYPASSRLS, so the correlated subquery must stay tenant-scoped"
+
+      refute body =~ "not in subquery",
+             "`id not in subquery(...)` blocks the anti-join and has a silent work_mem cliff"
+    end
   end
 
   describe "tenant isolation" do
