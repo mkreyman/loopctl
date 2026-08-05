@@ -49,11 +49,12 @@ defmodule Loopctl.Workers.RetrievalMetricsWorker do
 
     case RetrievalMetrics.snapshot(tenant_id, day) do
       {:ok, snap} ->
-        # `searched` is SURFACED RESULTS and `searches` is search CALLS (#582) — both
-        # are logged with their own ratio so the line cannot be read as one number.
+        # `searched` is RECORDED SURFACED RESULTS (capped per call) and `searches` is
+        # search CALLS (#582) — both are logged with their own ratio so the line cannot
+        # be read as one number.
         Logger.info(
           "RetrievalMetricsWorker: tenant=#{tenant_id} day=#{day} " <>
-            "results_surfaced=#{snap.searched} results_returned=#{snap.results_returned} " <>
+            "results_recorded=#{snap.searched} results_returned=#{snap.results_returned} " <>
             "followed=#{snap.followed_through} " <>
             "precision=#{Float.round(snap.precision, 3)} " <>
             "searches=#{snap.searches} " <>

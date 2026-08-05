@@ -308,18 +308,21 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   operation(:retrieval_metrics,
     summary: "Retrieval precision time series",
     description:
-      "Daily retrieval PRECISION (agents' KB #3): the share of a day's search RESULTS the " <>
-        "agent then opened (search → get/context within a window). A proxy for retrieval " <>
-        "quality that trends up as the corpus is de-duplicated and better navigated. Most " <>
-        "recent day first. Role: orchestrator+.\n\n" <>
+      "Daily retrieval PRECISION (agents' KB #3): the share of a day's RECORDED search " <>
+        "RESULTS the agent then opened (search → get/context within a window). A proxy " <>
+        "for retrieval quality that trends up as the corpus is de-duplicated and better " <>
+        "navigated. Most recent day first. Role: orchestrator+.\n\n" <>
         "DENOMINATORS (#582) — `precision` = `followed_through` / `searched`, and " <>
-        "`searched` counts SURFACED RESULTS (one row per result a search put in front of " <>
-        "an agent), NOT search calls; `results_surfaced` is the same number named for its " <>
-        "unit. The per-CALL rate is reported separately as `search_follow_through` = " <>
+        "`searched` counts RECORDED SURFACED RESULTS (one row per result a search put in " <>
+        "front of an agent, capped at the first #{@max_recorded_search_results} per " <>
+        "call), NOT search calls; `results_recorded` is the same number named for its " <>
+        "unit. Because of that cap `precision` is precision@#{@max_recorded_search_results}: " <>
+        "a call returning more results contributes only #{@max_recorded_search_results} to " <>
+        "`searched`, and an open of a result ranked beyond the cap appears in neither " <>
+        "term. The per-CALL rate is reported separately as `search_follow_through` = " <>
         "`searches_with_follow_through` / `searches` (distinct QUERY-BEARING search " <>
         "calls) — that is the 'share of searches that led to an open'. " <>
-        "`results_returned` is the true un-truncated result count for those same calls; " <>
-        "only the first #{@max_recorded_search_results} results per search are recorded, " <>
+        "`results_returned` is the true un-truncated result count for those same calls, " <>
         "so it exceeds the rows those calls wrote whenever a page hit that cap.\n\n" <>
         "CALL-LEVEL POPULATION — the four call-level fields are computed per ROW, not " <>
         "per day: a row counts only if it carries a search identity (nothing recorded " <>
@@ -334,7 +337,11 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "are structurally unrecordable and appear in NO denominator, so every ratio here " <>
         "is an upper bound. Both ratios also rise when a search simply returns FEWER " <>
         "results, with no better retrieval: never optimise them alone — read them with " <>
-        "the absolute `followed_through` and the volume fields.",
+        "the absolute `followed_through` and the volume fields. `search_follow_through` " <>
+        "carries two further biases pointing OPPOSITE ways: the recording cap hides opens " <>
+        "of results ranked beyond it (biases it DOWN on large pages), while one open " <>
+        "credits EVERY search in the window that surfaced that article, not just the " <>
+        "preceding one (biases it UP when an agent refines and re-searches).",
     parameters: [
       limit: [
         in: :query,

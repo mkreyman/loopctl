@@ -1538,9 +1538,14 @@ describe("US-31.4: ListTools — new tools present, existing knowledge tools unc
     // call-level field, or the same misreading recurs.
     const idx = indexSource.indexOf('name: "knowledge_retrieval_metrics"');
     assert.ok(idx > 0);
-    const block = indexSource.slice(idx, idx + 2500);
+    const block = indexSource.slice(idx, idx + 4000);
     assert.ok(/surfaced/i.test(block), "names the surfaced-RESULTS unit of `searched`");
     assert.ok(/not search calls/i.test(block), "states what `searched` is NOT");
+    assert.ok(
+      /capped at[\s\S]{0,40}the first 20 per call/i.test(block),
+      "states the recording cap AT the denominator, not only at results_returned",
+    );
+    assert.ok(/precision@20/i.test(block), "names precision as precision@cap");
     assert.ok(/search_follow_through/.test(block), "names the per-CALL rate");
     assert.ok(/results_returned/.test(block), "names the true un-truncated count");
     assert.ok(/upper bound/i.test(block), "states the ratios are upper bounds");

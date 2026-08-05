@@ -123,7 +123,7 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
                day: @day,
                window_seconds: 1800,
                searched: 0,
-               results_surfaced: 0,
+               results_recorded: 0,
                followed_through: 0,
                precision: 0.0,
                searches: 0,
@@ -156,7 +156,7 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
       m = RetrievalMetrics.compute(t.id, @day, 1800)
 
       assert m.searched == 3
-      assert m.results_surfaced == 3
+      assert m.results_recorded == 3
       assert m.followed_through == 1
       assert m.precision == 1 / 3
 
@@ -219,9 +219,55 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
       m = RetrievalMetrics.compute(t.id, @day, 1800)
 
       assert m.searched == 20
+      # `results_recorded` is named for the CAPPED slice, not the full surfaced set —
+      # naming it `results_surfaced` here would restate the same false denominator #582
+      # exists to remove.
+      assert m.results_recorded == 20
       assert m.results_returned == 57
       assert m.searched < m.results_returned
       assert m.searches == 1
+    end
+
+    test "the recording cap biases search_follow_through DOWN — an open beyond the cap is invisible",
+         ctx do
+      # Disclosed in the moduledoc ("Two more biases"). A call returns 25 results; only the
+      # first 20 get rows. The agent opens the result at rank 21, which correlates to no
+      # recorded row: the call counts in `searches` but can never reach
+      # `searches_with_follow_through`. Pinned so the disclosure cannot silently go stale.
+      %{tenant: t, key: k} = ctx
+
+      ids =
+        for _ <- 1..20, do: fixture(:article, %{tenant_id: t.id, status: :published}).id
+
+      beyond_cap = fixture(:article, %{tenant_id: t.id, status: :published})
+
+      search_call(t.id, k.id, ids, ~T[12:00:00], results_returned: 25)
+      event(t.id, k.id, beyond_cap.id, "get", ~T[12:10:00])
+
+      m = RetrievalMetrics.compute(t.id, @day, 1800)
+
+      assert m.searches == 1
+      assert m.followed_through == 0
+      assert m.searches_with_follow_through == 0
+      assert m.search_follow_through == 0.0
+    end
+
+    test "one open credits EVERY overlapping search in the window — search_follow_through biased UP",
+         ctx do
+      # The other disclosed bias, pointing the other way. `with_follow_through/2` correlates
+      # on (tenant, api_key, article, window) and NOT on `search_id`, so the refine-and-
+      # re-search flow credits the missed search as well as the successful one.
+      %{tenant: t, key: k, x: x} = ctx
+
+      search_call(t.id, k.id, [x.id], ~T[12:00:00])
+      search_call(t.id, k.id, [x.id], ~T[12:03:00])
+      event(t.id, k.id, x.id, "get", ~T[12:05:00])
+
+      m = RetrievalMetrics.compute(t.id, @day, 1800)
+
+      assert m.searches == 2
+      assert m.searches_with_follow_through == 2
+      assert m.search_follow_through == 1.0
     end
 
     test "results_returned is summed PER CALL, not per surfaced row", ctx do
@@ -498,8 +544,9 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
 
       %{data: [row]} = RetrievalMetrics.list_snapshots(t.id)
       assert row.searched == 3
-      # The self-describing twin of `searched` — same number, states its unit (#582).
-      assert row.results_surfaced == 3
+      # The self-describing twin of `searched` — same number, states its unit: RECORDED
+      # surfaced results, capped per call (#582).
+      assert row.results_recorded == 3
       assert row.searches == 2
       assert row.searches_with_follow_through == 1
       assert row.search_follow_through == 0.5

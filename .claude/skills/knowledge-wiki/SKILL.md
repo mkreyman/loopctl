@@ -46,9 +46,9 @@ never pass `tenant_id`/`subject_id`.
    — do not hardcode it.
 2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8468`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
-   (`absolute_score/1`, `:8559-8564`) clears a scale-matched threshold AND beats the best retrieved
-   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8610-8620`; the pure decision is
-   `resolve_provenance/4`, `:8663-8675`) AND is authoritative (not superseded/conflicted — the caller
+   (`absolute_score/1`, `:8595-8600`) clears a scale-matched threshold AND beats the best retrieved
+   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8646-8656`; the pure decision is
+   `resolve_provenance/4`, `:8699-8710`) AND is authoritative (not superseded/conflicted — the caller
    passes only `list_curated_sources/2`-filtered scores). Otherwise `:retrieved`. Both branches return identical `results`/`meta`
    key sets — callers branch on `meta.provenance` alone. A sparse pool must never let a near-but-wrong
    curated doc win.

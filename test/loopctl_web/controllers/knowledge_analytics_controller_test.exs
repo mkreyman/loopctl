@@ -797,7 +797,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
       assert [row] = json_response(conn, 200)["data"]
 
       assert row["searched"] == 2
-      assert row["results_surfaced"] == 2
+      assert row["results_recorded"] == 2
       assert row["followed_through"] == 1
       assert row["precision"] == 0.5
 

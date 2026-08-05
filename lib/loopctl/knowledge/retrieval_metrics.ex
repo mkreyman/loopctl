@@ -3,9 +3,11 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   Retrieval-precision metric (agents' KB #3) — closes the loop on whether retrieval is
   actually improving.
 
-  The signal: of the articles a search SURFACED on a given day, how many did the agent
-  then OPEN (a `get`/`context` on the same article, by the same api_key, within a
-  follow-through window)? That share is `precision`. It's a mechanical proxy, computed
+  The signal: of the articles a search SURFACED on a given day — the first
+  #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} of each call, which is all
+  that gets recorded — how many did the agent then OPEN (a `get`/`context` on the same
+  article, by the same api_key, within a follow-through window)? That share is
+  `precision`. It's a mechanical proxy, computed
   purely from `article_access_events` — no LLM, no labels — and it should trend UP as
   dedup (#1), navigation (#5) and conflict resolution (#4) make the corpus cleaner and
   the top results more on-target.
@@ -16,12 +18,19 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
 
   ## What each denominator is (#582)
 
-  `searched` counts SURFACED RESULTS — one `article_access_events` row per result a
-  search put in front of the agent — NOT search calls. `precision` is therefore
-  `followed_through / searched`: "the share of surfaced results the agent then opened".
-  The name reads like a count of searches, which is exactly how it got misreported, so
-  the payload also carries `results_surfaced` (the same number, named for its unit) and
-  the per-CALL series alongside it:
+  `searched` counts RECORDED SURFACED RESULTS — one `article_access_events` row per
+  result a search put in front of the agent, capped at the first
+  #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} results of each search
+  (`Knowledge.maybe_record_search_access/5` writes no more than that per call) — NOT
+  search calls. `precision` is therefore
+  `followed_through / searched`: "the share of the RECORDED surfaced results the agent
+  then opened", i.e. precision@#{Loopctl.Knowledge.Analytics.max_recorded_search_results()},
+  not precision over the full result set. A call that returned 50 results contributes
+  #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} to `searched`, and an open
+  of its rank-35 result correlates to no recorded row and counts in neither term. The
+  name reads like a count of searches, which is exactly how it got misreported, so the
+  payload also carries `results_recorded` (the same number, named for the unit it
+  actually has) and the per-CALL series alongside it:
 
   - `searches` — distinct `metadata->>'search_id'` values, i.e. actual QUERY-bearing
     search calls. Query-less enumeration (`list` / `list_keyset`) records `"search"`
@@ -31,6 +40,8 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   - `searches_with_follow_through` / `search_follow_through` — the share of SEARCHES
     that led to at least one open. This is the quantity a reader who misreads
     `precision` has in mind; it is now computable instead of being confused for it.
+    It carries two biases of its own, in OPPOSITE directions — see "Two more biases"
+    below — so read it as an indicator, never as an exact rate.
   - `results_returned` — the true, un-truncated number of results those same counted
     calls returned. Only the first
     #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} results per search get
@@ -60,13 +71,29 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   invariant exists to prevent. `Loopctl.TelemetryEvents.knowledge_hybrid_provenance/0`
   is where hit/miss including empties is observable.
 
+  ## Two more biases on `search_follow_through` — they point OPPOSITE ways
+
+  1. The #{Loopctl.Knowledge.Analytics.max_recorded_search_results()}-row recording cap
+     biases it DOWN. A call that returned more results than the cap still counts in
+     `searches`, but an open of a result beyond the cap correlates to no recorded row, so
+     that call can never reach `searches_with_follow_through`. Bigger pages ⇒ more of the
+     followed-through set is invisible.
+  2. Crediting biases it UP: an open is credited to EVERY search in the window that
+     surfaced that article, not only the one that immediately preceded it.
+     `with_follow_through/2` correlates on (tenant, api_key, article, window) and
+     deliberately NOT on `search_id`, so refine-and-re-search over an overlapping result
+     set — the modal agent flow — credits the missed search as well as the successful
+     one, in exactly the repeated-near-miss case this metric exists to surface.
+
   ## The proxy is gameable in one direction — never optimise it alone
 
   `precision` rises when a search returns FEWER results, with no better retrieval
-  whatsoever: shrink the denominator and the ratio climbs. Read it WITH the absolute
-  `followed_through` and the volume figures (`searched`, `searches`,
-  `results_returned`) — a real improvement raises follow-through while volume holds;
-  a gamed one shows the ratio up and the volume collapsing.
+  whatsoever: shrink the denominator and the ratio climbs. (Above the recording cap the
+  denominator saturates, so returning MORE results stops lowering it — the gaming
+  direction bites under the cap only.) Read it WITH the absolute `followed_through` and
+  the volume figures (`searched`, `searches`, `results_returned`) — a real improvement
+  raises follow-through while volume holds; a gamed one shows the ratio up and the volume
+  collapsing.
   """
 
   import Ecto.Query
@@ -90,16 +117,19 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   @doc """
   Compute precision for a single `day` (a `Date`) and follow-through `window_seconds`.
 
-  Returns `%{searched, results_surfaced, followed_through, precision, searches,
+  Returns `%{searched, results_recorded, followed_through, precision, searches,
   searches_with_follow_through, search_follow_through, results_returned, day,
   window_seconds, curated_searched, curated_followed_through, curated_precision,
   retrieved_searched, retrieved_followed_through, retrieved_precision}`.
 
-  `searched` (and its self-describing twin `results_surfaced`) is a count of SURFACED
-  RESULTS; `searches` is a count of QUERY-BEARING search CALLS (enumeration pages and
-  pre-#582 rows carry no call identity and are excluded — the filter is per ROW, so a
-  mixed day reports a partial figure, not `0`). See the moduledoc for why both are
-  reported and why neither ratio may be optimised alone.
+  `searched` (and its self-describing twin `results_recorded`) is a count of RECORDED
+  SURFACED RESULTS — capped at the first
+  #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} per call, so `precision`
+  is precision@that-cap; `searches` is a count of QUERY-BEARING search CALLS (enumeration
+  pages and pre-#582 rows carry no call identity and are excluded — the filter is per
+  ROW, so a mixed day reports a partial figure, not `0`). See the moduledoc for why both
+  are reported, for the cap's opposite-signed effects on `search_follow_through`, and for
+  why neither ratio may be optimised alone.
 
   The `curated_*`/`retrieved_*` fields (US-31.2, AC-31.2.5) are the SAME
   searched/followed_through/precision computation, restricted to `"search"` events
@@ -145,7 +175,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       day: day,
       window_seconds: window_seconds,
       searched: searched,
-      results_surfaced: searched,
+      results_recorded: searched,
       followed_through: followed,
       precision: precision,
       searches: call.searches,
@@ -173,6 +203,12 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # rather than a definition change. This is why the two access-type sets stay separate and
   # are NOT unified: they answer different questions and diverge on purpose (see the note at
   # `@heat_read_access_types`).
+  #
+  # The correlation is (tenant, api_key, article, window) and NOT `search_id`, so one open
+  # credits EVERY search in the window that surfaced that article. That is a documented
+  # upward bias on `search_follow_through` (moduledoc, "Two more biases"), not an oversight:
+  # binding on `search_id` would attribute nothing to a search whose result the agent opened
+  # after re-running the query, which is the same open read a different way.
   defp compute_followed_through(searched_q, window_seconds) do
     searched_q
     |> with_follow_through(window_seconds)
@@ -344,10 +380,13 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
           day: s.day,
           window_seconds: s.window_seconds,
           searched: s.searched,
-          # Same number as `searched`, named for its UNIT (surfaced results, not search
-          # calls). The misreading #582 records happened at exactly this boundary, so
-          # the payload states the denominator instead of relying on a doc elsewhere.
-          results_surfaced: s.searched,
+          # Same number as `searched`, named for its UNIT: RECORDED surfaced results
+          # (capped per call by `Analytics.max_recorded_search_results/0`), not search
+          # calls. The misreading #582 records happened at exactly this boundary, so the
+          # payload states the denominator instead of relying on a doc elsewhere — and it
+          # says "recorded", because naming it for the full surfaced set would restate
+          # the same class of false denominator this fix exists to remove.
+          results_recorded: s.searched,
           followed_through: s.followed_through,
           precision: s.precision,
           searches: s.searches,

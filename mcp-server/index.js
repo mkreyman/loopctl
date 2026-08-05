@@ -6042,19 +6042,21 @@ const TOOLS = [
     name: "knowledge_retrieval_metrics",
     description:
       "Return the daily retrieval-PRECISION time series (agents' KB #3): for each day, the " +
-      "share of surfaced search RESULTS the agent then opened (search → get/context within a " +
-      "window). A proxy for whether retrieval is improving — watch it trend up as the corpus " +
-      "is de-duplicated, better navigated (MOCs), and conflict-resolved. Most recent day " +
-      "first. Requires orchestrator role.\n\n" +
-      "Denominators (#582): precision = followed_through / searched, and `searched` counts " +
-      "surfaced RESULTS, not search calls (`results_surfaced` is the same number, named for " +
-      "its unit). The per-CALL rate is separate: `search_follow_through` = " +
-      "searches_with_follow_through / searches — the share of QUERY-BEARING SEARCHES that " +
+      "share of RECORDED surfaced search RESULTS the agent then opened (search → get/context " +
+      "within a window). A proxy for whether retrieval is improving — watch it trend up as " +
+      "the corpus is de-duplicated, better navigated (MOCs), and conflict-resolved. Most " +
+      "recent day first. Requires orchestrator role.\n\n" +
       // The cap is enforced by Loopctl.Knowledge.Analytics.max_recorded_search_results/0
       // (Elixir); this JS string cannot interpolate it, so change both together.
+      "Denominators (#582): precision = followed_through / searched, and `searched` counts " +
+      "RECORDED surfaced RESULTS — one row per result put in front of the agent, capped at " +
+      "the first 20 per call — not search calls (`results_recorded` is the same number, " +
+      "named for its unit). Because of that cap precision is precision@20: a call returning " +
+      "more results contributes only 20 to `searched`, and an open of a result ranked beyond " +
+      "the cap is in neither term. The per-CALL rate is separate: `search_follow_through` = " +
+      "searches_with_follow_through / searches — the share of QUERY-BEARING SEARCHES that " +
       "led to an open. `results_returned` is the true un-truncated result count for those " +
-      "same calls (only the first 20 results per search are recorded, so it exceeds the " +
-      "rows those calls wrote whenever a page hit that cap).\n\n" +
+      "same calls, so it exceeds the rows those calls wrote whenever a page hit the cap.\n\n" +
       "Call-level population: the four call-level fields are filtered per ROW, not per day " +
       "— a row counts only if it carries a search identity (nothing recorded before #582 " +
       "does) and is not a query-less enumeration page (list / list_keyset; browsing is not " +
@@ -6065,7 +6067,11 @@ const TOOLS = [
       "Caveats: zero-result searches and keyless searches are structurally unrecordable and " +
       "sit in NO denominator, so both ratios are upper bounds; and both rise if a search " +
       "simply returns FEWER results, with no better retrieval. Never optimise either alone — " +
-      "read them with the absolute followed_through and the volume fields.",
+      "read them with the absolute followed_through and the volume fields. " +
+      "search_follow_through carries two further biases pointing OPPOSITE ways: the 20-row " +
+      "recording cap hides opens of results ranked beyond it (DOWN on large pages), while " +
+      "one open credits EVERY search in the window that surfaced that article, not just the " +
+      "preceding one (UP when an agent refines and re-searches).",
     inputSchema: {
       type: "object",
       properties: {

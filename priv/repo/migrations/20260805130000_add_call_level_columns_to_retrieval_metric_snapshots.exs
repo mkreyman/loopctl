@@ -10,8 +10,11 @@ defmodule Loopctl.Repo.Migrations.AddCallLevelColumnsToRetrievalMetricSnapshots 
   # would make every historical row incomparable. The per-CALL quantity is added
   # ALONGSIDE it (`searches`, `searches_with_follow_through`, `search_follow_through`)
   # so the two can be told apart instead of confused, plus `results_returned` — the true
-  # un-truncated result count — so the 20-rows-per-search recording cap is visible as
-  # `searched < results_returned` rather than silently shrinking the denominator.
+  # un-truncated result count for the counted CALLS, so the per-search recording cap is
+  # reported instead of silently shrinking the denominator. Do NOT read the cap off
+  # `searched` vs `results_returned`: the two aggregate different row populations (the
+  # call-level filter is per ROW), so `results_returned < searched` is the normal shape of
+  # a legacy-heavy or browse-heavy day, not a truncation signal.
   #
   # Rows written before this migration carry 0/0.0: the source events have no
   # `search_id` in metadata, so no call-level figure can be reconstructed for them.
