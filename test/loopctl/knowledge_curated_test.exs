@@ -293,6 +293,53 @@ defmodule Loopctl.KnowledgeCuratedTest do
       refute curated.id in ids(Knowledge.list_curated_sources(tenant.id))
     end
 
+    test "an UNJUDGED conflict stops suppressing once it ages past the window" do
+      # Suppression is premised on the conflict being judged SOON, not on it being judged
+      # ever. Unbounded it becomes silent corpus deletion: measured on the hosted deployment
+      # 2026-08-05, 16,117 open auto-generated conflicts growing +500/night with no automatic
+      # drain, each withholding BOTH its articles from every curated answer.
+      #
+      # Both predicates are asserted, because they are separate implementations of one
+      # invariant — `authoritative_curated?/1` and `list_curated_sources/1`. Fixing one and
+      # not the other is how a half-applied invariant ships.
+      tenant = fixture(:tenant)
+      curated = curated_article(tenant.id, %{title: "Aged Conflict"})
+      other = fixture(:article, %{tenant_id: tenant.id, status: :published, title: "Rival"})
+
+      link =
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: curated.id,
+          target_article_id: other.id,
+          relationship_type: :potential_conflict,
+          metadata: %{"auto_generated" => true, "similarity_score" => 0.95}
+        })
+
+      # Fresh: suppressed, exactly as the sibling test above asserts.
+      refute Knowledge.authoritative_curated?(curated)
+      refute curated.id in ids(Knowledge.list_curated_sources(tenant.id))
+
+      # Age it one day past the window. `article_links` is deliberately immutable (no update
+      # changeset, `updated_at: false`), so backdate through the repo directly.
+      aged_at =
+        DateTime.add(
+          DateTime.utc_now(),
+          -(Knowledge.conflict_suppression_window_days() + 1),
+          :day
+        )
+
+      link
+      |> Ecto.Changeset.change(%{inserted_at: aged_at})
+      |> AdminRepo.update!()
+
+      # Still unjudged — no conflict_resolutions row was written — but no longer suppressing.
+      assert Knowledge.authoritative_curated?(curated),
+             "an aged unjudged conflict must stop suppressing the per-article authority check"
+
+      assert curated.id in ids(Knowledge.list_curated_sources(tenant.id)),
+             "an aged unjudged conflict must stop suppressing the curated-sources list"
+    end
+
     test "authoritative_curated?/1 does not crash on a system canonical (tenant_id nil)" do
       tenant = fixture(:tenant)
       system = curated_system_article(%{title: "System Canonical"}, tenant.id)
