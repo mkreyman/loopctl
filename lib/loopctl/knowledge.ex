@@ -3066,8 +3066,14 @@ defmodule Loopctl.Knowledge do
   # shared system canonical (article ids are global) cannot retract that canonical
   # from ANOTHER tenant's list. For a tenant's own article the link necessarily
   # lives under that same tenant, so this predicate is a no-op restriction there.
-  # Mirrors the open-conflict definition in list_potential_conflicts/2.
+  # DELIBERATELY NO LONGER identical to `list_potential_conflicts/2`'s definition. The two
+  # answer different questions and the divergence is the point: the QUEUE must keep showing
+  # an unjudged conflict forever (it is still unjudged, and hiding it would strand it), while
+  # SUPPRESSION must expire (see the window below). Keep both in mind when editing either —
+  # re-unifying them would silently restore the unbounded suppression this exists to stop.
   defp open_conflict_subquery(tenant_id) do
+    cutoff = DateTime.add(DateTime.utc_now(), -conflict_suppression_window_days(), :day)
+
     from(l in ArticleLink,
       as: :link,
       where: l.tenant_id == ^tenant_id,
@@ -3076,9 +3082,40 @@ defmodule Loopctl.Knowledge do
       where:
         l.source_article_id == parent_as(:article).id or
           l.target_article_id == parent_as(:article).id,
+      # FAIL OPEN past the window. Suppression is a safety measure premised on the
+      # conflict being JUDGED soon; it is not premised on it being judged EVER. Left
+      # unbounded it degrades into silent corpus deletion — measured on the hosted
+      # deployment 2026-08-05: 16,117 open auto-generated conflicts, growing +500 every
+      # night with no automatic drain, each removing BOTH of its articles from every
+      # curated answer. That is up to ~32k article-slots withheld indefinitely to guard
+      # against a contradiction nobody has confirmed exists.
+      #
+      # The trade, stated plainly: past the window a genuinely contradictory pair can be
+      # cited again. That is the lesser harm. An unjudged flag is a SUSPICION raised by
+      # cosine similarity >= 0.93 — which measures "these say similar things", not "these
+      # disagree" — and withholding the corpus forever on an unconfirmed suspicion fails
+      # the route's own purpose more reliably than the contradiction would.
+      #
+      # This is the backstop, not the mechanism. The drain is the automatic judge; this
+      # exists so a stalled or crashed judge cannot silently empty curated retrieval
+      # again. If you find yourself widening the window to mask a judge that is not
+      # keeping up, fix the judge.
+      where: l.inserted_at > ^cutoff,
       where: not exists(conflict_unresolved_subquery()),
       select: 1
     )
+  end
+
+  @doc """
+  How long an UNJUDGED auto-generated `potential_conflict` suppresses its articles from
+  curated sources.
+
+  Public so the suppression window and the tests that pin it read one number. Override with
+  `config :loopctl, :conflict_suppression_window_days, n`.
+  """
+  @spec conflict_suppression_window_days() :: pos_integer()
+  def conflict_suppression_window_days do
+    Application.get_env(:loopctl, :conflict_suppression_window_days, 14)
   end
 
   # THE single authority for "this potential_conflict link is still unresolved":
@@ -3148,12 +3185,21 @@ defmodule Loopctl.Knowledge do
   # filter would be while also participating for system articles (AC-31.1.3). Mirrors
   # open_conflict_subquery/0 and shares conflict_unresolved_subquery/0.
   defp article_in_open_conflict?(%Article{id: article_id}) do
+    # The SAME fail-open window as `open_conflict_subquery/1` — see the long note there for
+    # why suppression expires. These are two separate predicates serving one invariant (the
+    # per-article authority check and the list query), so the window MUST be applied to both
+    # or the invariant is only half true: a stale conflict would keep an article out of
+    # `authoritative_curated?/1` while the list happily returned it, which is worse than
+    # either behaviour consistently applied.
+    cutoff = DateTime.add(DateTime.utc_now(), -conflict_suppression_window_days(), :day)
+
     query =
       from(l in ArticleLink,
         as: :link,
         where: l.relationship_type == :potential_conflict,
         where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
         where: l.source_article_id == ^article_id or l.target_article_id == ^article_id,
+        where: l.inserted_at > ^cutoff,
         where: not exists(conflict_unresolved_subquery())
       )
 
