@@ -19,15 +19,28 @@ Operator-facing changes for deployments outside the hosted instance.
   `migrations/20260805120000_drop_legacy_articles_embedding_hnsw_index.exs` performs the drop
   **only when `system_configs.embedding_side_table_reads` is `1`**; the flag defaults to `0`
   (= the legacy `articles.embedding` column) and no migration seeds it, so a fresh install and
-  any install that has not cut over KEEP the index and are unaffected. Run
-  `DROP INDEX CONCURRENTLY articles_embedding_hnsw_idx` out-of-band ahead of the deploy if you
-  want the space back without waiting on the migrator — `IF EXISTS` makes the migration a
-  no-op afterwards. **Operator consequence:** on an install where the drop has run, setting
-  the flag back to `0` puts every semantic read on an unindexed column (seq scan + top-N sort,
-  surfacing as `503`/`heavy_read_overloaded` under the heavy-read statement timeout). Rebuild
-  the index first — `mix ecto.rollback` on that migration, or the equivalent
-  `CREATE INDEX CONCURRENTLY` — and raise `maintenance_work_mem` well above the 64 MB default
-  or the ~657 MB HNSW build silently falls back to the slow on-disk path. The
+  any install that has not cut over KEEP the index and are unaffected. **On a cut-over
+  install** you may run `DROP INDEX CONCURRENTLY articles_embedding_hnsw_idx` out-of-band
+  ahead of the deploy if you want the space back without waiting on the migrator — `IF EXISTS`
+  makes the migration a no-op afterwards. Do NOT run that by hand on an install that has not
+  cut over: it destroys the index serving your live read path, and the migration only ever
+  drops, so it cannot give it back. **Operator consequence:** on an install where the drop has
+  run, setting the flag back to `0` puts every semantic read on an unindexed column (seq scan +
+  top-N sort). That trips the heavy-read `statement_timeout`, and the cancel surfaces as a hard
+  `504`/`db_statement_timeout` — NOT `503`/`heavy_read_overloaded`, which only the per-tenant
+  concurrency shed produces, and NOT the labelled keyword fall-back, which matches that shed
+  alone. There is no graceful degrade on this path today: semantic search returns no results.
+  Rebuild the index FIRST with an explicit
+  `CREATE INDEX CONCURRENTLY articles_embedding_hnsw_idx ON articles USING hnsw (embedding vector_cosine_ops)`
+  plus the same `WITH (m, ef_construction)` the migration builds with, and raise
+  `maintenance_work_mem` well above the 64 MB default or the ~657 MB HNSW build silently falls
+  back to the slow on-disk path. A rollback rebuilds it too —
+  `bin/loopctl eval "Loopctl.Release.rollback(20260805120000)"` (there is no `mix` in a
+  release) — but Ecto's `:to` is INCLUSIVE, so that reverts every migration at or after that
+  version; once anything newer has shipped, use the explicit `CREATE INDEX`. If you do roll
+  back, flip `embedding_side_table_reads` to `0` BEFORE the next
+  `bin/loopctl eval "Loopctl.Release.migrate()"`: the rollback makes the migration PENDING
+  again, and a deploy in that gap re-runs it and re-drops the index you just rebuilt. The
   `articles.embedding` **column is unchanged**: still dual-written, still the
   backfill/reconciliation source. `memories` keeps both of its legacy-column indexes
   (deliberate — one serves `include_superseded: true` recall, the other default live recall).

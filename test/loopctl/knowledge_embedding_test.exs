@@ -182,12 +182,20 @@ defmodule Loopctl.KnowledgeEmbeddingTest do
   # column) in code and no migration seeds the row.
   #
   # So "the legacy index exists" is no longer an invariant, and its negation is not one
-  # either. The invariant that survives #578 — and the one worth a test — is that the
+  # either. The invariants that survive #578 — and the ones worth a test — are that the
   # index serving the LIVE read path is present and USABLE, and that the legacy index is
-  # present exactly when the legacy column is still the live read path. That is
-  # mechanically the same condition the drop migration guards on
+  # still present WHENEVER the legacy column is still the live read path. That second one
+  # is mechanically the same condition the drop migration guards on
   # (`20260805120000_drop_legacy_articles_embedding_hnsw_index.exs`), so a migration
   # that dropped unconditionally would fail here.
+  #
+  # The CONVERSE is deliberately NOT asserted. The documented cutover order
+  # (`Loopctl.Embeddings` moduledoc) is: deploy the code — running the drop migration
+  # while the flag is still `0`, so the index is KEPT — backfill, reconcile, and only
+  # THEN flip the flag to `1`. Every install that cuts over from here on therefore has
+  # the flag at `1` AND the legacy index still present, which the migration states
+  # explicitly ("a migration does not re-run"). Asserting `flag = 1 => no index` would
+  # red on exactly the installs that followed the documented procedure.
   describe "HNSW index" do
     test "the live ANN index is present and VALID" do
       # `pg_indexes` also lists INVALID indexes — the leftover a failed
@@ -199,7 +207,7 @@ defmodule Loopctl.KnowledgeEmbeddingTest do
              "the per-dimension side-table ANN index #{live} must exist and be valid"
     end
 
-    test "the legacy index exists exactly when the legacy column is the live read path" do
+    test "the legacy index is present while the legacy column is the live read path" do
       %{rows: rows} =
         AdminRepo.query!("SELECT value FROM system_configs WHERE key = $1", [
           Embeddings.read_flag_key()
@@ -223,10 +231,6 @@ defmodule Loopctl.KnowledgeEmbeddingTest do
 
         assert indexdef =~ "hnsw"
         assert indexdef =~ "vector_cosine_ops"
-      else
-        refute index_valid?("articles_embedding_hnsw_idx"),
-               "reads are cut over to the side table, so the legacy 657 MB index is " <>
-                 "retired (GH #578) — it only evicts the live index from shared_buffers"
       end
     end
   end

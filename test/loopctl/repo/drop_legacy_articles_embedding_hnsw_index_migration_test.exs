@@ -9,9 +9,11 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
 
   That conditional is the load-bearing behaviour here, so it is tested in BOTH
   directions: an unconditional drop would leave the SHIPPED-DEFAULT read path with no
-  index at all — a seq scan + top-N sort over the whole corpus, which under
-  `HeavyRead`'s per-read `SET LOCAL statement_timeout` surfaces as
-  `{:error, :heavy_read_overloaded}`.
+  index at all — a seq scan + top-N sort over the whole corpus, which trips
+  `HeavyRead`'s per-read `SET LOCAL statement_timeout`. That cancel is a raised
+  `Postgrex.Error` (57014) rendering `504 db_statement_timeout`, NOT
+  `{:error, :heavy_read_overloaded}` (only the `TenantGate` concurrency shed produces
+  that tuple), so it does not reach the controller's labelled keyword degrade either.
 
   ## How the migration is driven — CONCURRENTLY, so OUTSIDE the sandbox
 
@@ -25,13 +27,17 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
   connection the production migrator uses. `Ecto.Migration.Runner.run/8` (the entry
   point `Ecto.Migrator.attempt/7` uses for an explicit `up/0`/`down/0`) opens no
   transaction of its own; the DDL-transaction wrapper lives in `Ecto.Migrator`, which
-  `@disable_ddl_transaction true` disables in production. So the SHIPPED code runs
-  here exactly as it runs at deploy, and a defect edited into the migration file WILL
-  fail these tests.
+  `@disable_ddl_transaction true` disables in production. So the SHIPPED `up/0`/`down/0`
+  BODIES run here exactly as they run at deploy.
+
+  What that harness canNOT see is the two module attributes themselves: `Runner` reads
+  neither, only `Ecto.Migrator` does. Deleting either would leave every behavioural test
+  below green while failing the real deploy, so they are asserted directly in the
+  "migration attributes" describe.
 
   Because these tests commit real index changes to the SHARED `articles` catalog — and
-  briefly commit a `system_configs` row — an `on_exit` restores the canonical state
-  after every test.
+  briefly commit a `system_configs` row — the canonical state is restored both before
+  and after every test.
 
   ## The read flag is read from the ROW, never through `SystemConfig`
 
@@ -73,24 +79,44 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
 
   @index "articles_embedding_hnsw_idx"
 
-  # Restore the canonical state after every test. The applied-migration baseline in the
-  # test DB is: read flag ABSENT (so the legacy column is the live read path) and the
-  # legacy index PRESENT. Both directions of every test below can leave either off.
+  # Restore the canonical state BEFORE and AFTER every test. The applied-migration
+  # baseline in the test DB is: read flag ABSENT (so the legacy column is the live read
+  # path) and the legacy index PRESENT AND VALID. Both directions of every test below can
+  # leave either off.
+  #
+  # BEFORE as well as after, because these mutations are COMMITTED through `unboxed_run`:
+  # no sandbox rollback undoes them, and an abnormal exit (Ctrl-C, a CI timeout kill, a
+  # VM crash) skips `on_exit` entirely — leaving the SHARED test DB without an index that
+  # `test/loopctl/knowledge_embedding_test.exs` and
+  # `test/loopctl_web/controllers/knowledge_suggest_links_controller_test.exs` both
+  # assert on. The setup-time pass heals a DB poisoned that way instead of requiring a
+  # hand-rebuild or `mix ecto.reset`.
   setup do
-    on_exit(fn ->
-      Sandbox.unboxed_run(AdminRepo, fn ->
-        AdminRepo.query!("DELETE FROM system_configs WHERE key = $1", [
-          Embeddings.read_flag_key()
-        ])
-
-        AdminRepo.query!("""
-        CREATE INDEX CONCURRENTLY IF NOT EXISTS #{@index}
-        ON articles USING hnsw (embedding vector_cosine_ops) #{HnswIndex.with_params_clause()}
-        """)
-      end)
-    end)
+    restore_canonical_state()
+    on_exit(&restore_canonical_state/0)
 
     :ok
+  end
+
+  # `CREATE INDEX CONCURRENTLY IF NOT EXISTS` alone CANNOT repair an INVALID leftover: it
+  # sees the relation, emits a NOTICE and skips forever (wiki `ed00911b`) — and an
+  # INVALID leftover is exactly what a killed `CREATE INDEX CONCURRENTLY` produces,
+  # including this one. So clear it first, mirroring the migration's own `down/0`.
+  defp restore_canonical_state do
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      AdminRepo.query!("DELETE FROM system_configs WHERE key = $1", [
+        Embeddings.read_flag_key()
+      ])
+
+      if index_present?(@index) and not index_valid?(@index) do
+        AdminRepo.query!("DROP INDEX CONCURRENTLY IF EXISTS #{@index}")
+      end
+
+      AdminRepo.query!("""
+      CREATE INDEX CONCURRENTLY IF NOT EXISTS #{@index}
+      ON articles USING hnsw (embedding vector_cosine_ops) #{HnswIndex.with_params_clause()}
+      """)
+    end)
   end
 
   defp with_unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
@@ -157,6 +183,23 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
       )
 
     rows == [[true]]
+  end
+
+  describe "migration attributes" do
+    # `Ecto.Migration.Runner` — what every test below drives — reads NEITHER attribute.
+    # `disable_ddl_transaction` is consulted only in `Ecto.Migrator` (where the DDL
+    # transaction wrapper lives) and `disable_migration_lock` only where it takes the
+    # transaction-scoped advisory lock. So deleting either from the migration file leaves
+    # the behavioural tests green while the real deploy through `Loopctl.Release.migrate/0`
+    # fails with `ERROR 25001: DROP INDEX CONCURRENTLY cannot run inside a transaction
+    # block`, or hangs on the migration lock (wiki `ed00911b`).
+    test "disables the DDL transaction — CONCURRENTLY is illegal inside one" do
+      assert DropLegacyArticlesEmbeddingHnswIndex.__migration__()[:disable_ddl_transaction]
+    end
+
+    test "disables the migration lock — it is itself transaction-scoped" do
+      assert DropLegacyArticlesEmbeddingHnswIndex.__migration__()[:disable_migration_lock]
+    end
   end
 
   describe "up/0 on a cut-over install (embedding_side_table_reads = 1)" do

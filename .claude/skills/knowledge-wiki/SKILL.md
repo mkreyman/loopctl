@@ -160,11 +160,16 @@ number, is the load-bearing invariant. To monitor and keep it healthy over time:
   `blk_read_time`. `articles.embedding` is still dual-WRITTEN — it stays the backfill/reconciliation
   source, and the column was NOT dropped — but on an install where the drop has run, setting the flag
   back to `0` puts reads on a column with no ANN index: a seq scan + top-N sort over the corpus, which
-  under `HeavyRead`'s per-read `SET LOCAL statement_timeout` surfaces as
-  `{:error, :heavy_read_overloaded}`. A revert is therefore an INCIDENT action, not a routine toggle —
-  rebuild the index first (`down/0` of `20260805120000_drop_legacy_articles_embedding_hnsw_index.exs`,
-  and raise `maintenance_work_mem` well above the 64 MB default or the ~657 MB build silently falls back
-  to the slow on-disk path, wiki `753fbf69`). The drop migration is GUARDED on that same flag read
+  trips `HeavyRead`'s per-read `SET LOCAL statement_timeout`. That cancel is a raised `Postgrex.Error`
+  (57014) rendering `504 db_statement_timeout` — NOT `{:error, :heavy_read_overloaded}` (only the
+  `TenantGate` concurrency shed produces that tuple) and so NOT the labelled keyword degrade, which
+  matches the shed alone. Semantic search returns no results at all. A revert is therefore an INCIDENT
+  action, not a routine toggle — rebuild the index FIRST (an explicit `CREATE INDEX CONCURRENTLY`, or
+  `down/0` of `20260805120000_drop_legacy_articles_embedding_hnsw_index.exs`; raise
+  `maintenance_work_mem` well above the 64 MB default or the ~657 MB build silently falls back
+  to the slow on-disk path, wiki `753fbf69`) — and if you rebuilt via a rollback, flip the flag to `0`
+  BEFORE the next migrate runs, since the rollback makes that migration PENDING again and the next
+  deploy would re-drop the index you just rebuilt. The drop migration is GUARDED on that same flag read
   straight from `system_configs`, so an install still reading the legacy column keeps its index and a
   fresh self-hosted install is unaffected. `Loopctl.Embeddings.LegacyRetirement` discovers legacy
   indexes BY COLUMN, so an install that cuts over AFTER the migration ran still gets the leftover named

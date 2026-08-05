@@ -21,11 +21,23 @@ defmodule Loopctl.Repo.Migrations.DropLegacyArticlesEmbeddingHnswIndex do
   # (`article_embeddings`) on 2026-07-22, so the legacy index buys nothing on a
   # cut-over install and costs the live index its cache residency.
   #
-  # The 26 scans were NOT a stray consumer: they were the boot window GH #588 closed,
+  # The 26 scans were NOT a stray consumer: they were the boot window GH #588 narrowed,
   # in which the `SystemConfig` cache had not been primed before the Endpoint started
   # and `embedding_side_table_reads` read its in-code default `0` (= legacy column).
-  # `Loopctl.SystemConfig.CachePrimer` is now a supervised one-shot child ordered
-  # after `AdminRepo` and before `Oban`/`Endpoint`, so that window is gone.
+  # `Loopctl.SystemConfig.CachePrimer` is now a supervised one-shot child ordered after
+  # `AdminRepo` and before `Oban`/`Endpoint` — which closed the ORDERING window, but NOT
+  # the PRIME-FAILURE one, deliberately: `CachePrimer.start_link/1` returns `:ignore` on
+  # failure rather than aborting boot, and such a node serves the in-code default (= the
+  # LEGACY column) until a `SystemConfigRefreshWorker` tick lands ON IT — unbounded on a
+  # multi-node deploy, since the per-minute cron enqueues one job per tick cluster-wide
+  # (`Loopctl.Telemetry.ScaleMetrics` already documents that residual as UNBOUNDED).
+  #
+  # This drop changes the COST of that residual window on a CUT-OVER install: before it,
+  # a node that missed its prime served slow-but-correct results off this index; after
+  # it, the same node seq-scans an unindexed column past the heavy-read statement
+  # timeout — a semantic-search OUTAGE on that node (504 `db_statement_timeout`, see
+  # below), not a slowdown. That makes `loopctl.system_config.prime_failed.count`
+  # (scale metric 25) page-worthy on a cut-over install rather than informational.
   #
   # SCOPE: the INDEX only. `articles.embedding` is still dual-WRITTEN and is read as
   # the backfill/reconciliation source AND as the documented revert target, so
@@ -47,9 +59,14 @@ defmodule Loopctl.Repo.Migrations.DropLegacyArticlesEmbeddingHnswIndex do
   # row. So on a FRESH self-hosted install — and in the test DB — the shipped read
   # path is still the legacy `articles.embedding` column. An UNCONDITIONAL drop would
   # leave that shipped-default path with no index at all: a seq scan + top-N sort over
-  # the whole corpus, which under `HeavyRead`'s per-read `SET LOCAL statement_timeout`
-  # surfaces as `{:error, :heavy_read_overloaded}`. That is the GH #588 failure
-  # re-introduced through configuration instead of ordering.
+  # the whole corpus, which trips `HeavyRead`'s per-read `SET LOCAL statement_timeout`.
+  # That CANCEL is a raised `Postgrex.Error` (SQLSTATE 57014) propagating to the
+  # `DBErrorBackstop`, which renders `504 db_statement_timeout` — it is NOT
+  # `{:error, :heavy_read_overloaded}`, a tuple only the `TenantGate` concurrency shed
+  # produces, and it therefore does NOT reach `KnowledgeSearchController`'s labelled
+  # keyword degrade (that clause matches the shed tuple only). There is no graceful
+  # fall-back on this path today: semantic search returns no results at all. That is the
+  # GH #588 failure re-introduced through configuration instead of ordering.
   #
   # So this migration retires the index for the read path an install no longer uses,
   # and leaves it in place for one that still does. The condition is read straight
@@ -80,6 +97,15 @@ defmodule Loopctl.Repo.Migrations.DropLegacyArticlesEmbeddingHnswIndex do
   # ROLLBACK COST: `down/0` rebuilds a ~657 MB HNSW index. At prod scale that needs
   # `maintenance_work_mem` well above the 64 MB default or the build silently falls
   # back to the slow on-disk path (wiki `753fbf69`). Raise it on the session first.
+  #
+  # ROLLBACK ORDER: a rollback DELETES this version from `schema_migrations`, so the
+  # migration is PENDING again. Flip `embedding_side_table_reads` back to `0` BEFORE the
+  # next `Loopctl.Release.migrate()` runs — otherwise that deploy re-executes `up/0`, the
+  # guard still reads `1`, and the index just rebuilt at the `maintenance_work_mem` cost
+  # above is dropped again. Once the flag is `0`, the pending migration is a no-op.
+  # (Note `Loopctl.Release.rollback/1` passes `to: version`, which Ecto treats as
+  # INCLUSIVE — it rolls back every migration at or after this one. Once anything newer
+  # has shipped, rebuild with an explicit `CREATE INDEX CONCURRENTLY` instead.)
 
   @index "articles_embedding_hnsw_idx"
   @read_flag_key "embedding_side_table_reads"
@@ -107,23 +133,19 @@ defmodule Loopctl.Repo.Migrations.DropLegacyArticlesEmbeddingHnswIndex do
   # Postgres leaves an INVALID index behind under the same name, which `IF NOT EXISTS`
   # then treats as present and skips forever (wiki `ed00911b`). It drops ONLY when the
   # index is invalid — an unconditional drop-then-create would destroy and rebuild a
-  # perfectly good 657 MB index on every rollback. A plain (non-concurrent) DROP inside
-  # the DO block is fine: an INVALID index serves no scans.
+  # perfectly good 657 MB index on every rollback.
+  #
+  # The validity test is done HERE in Elixir, not in a `DO $$` block, so the drop can be
+  # CONCURRENTLY: a DO block IS a transaction and `DROP INDEX CONCURRENTLY` is illegal
+  # inside one, which leaves only a plain `DROP INDEX` — and that takes ACCESS EXCLUSIVE
+  # on `articles` ITSELF, not just the index. Behind one long-running `SELECT ... FROM
+  # articles` the lock request queues, and every subsequent read and write on `articles`
+  # (the whole wiki read path, not just vector search) queues behind it. This branch runs
+  # on the documented revert path — i.e. during an incident — so that is not affordable.
   def down do
-    execute("""
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1
-        FROM pg_class c
-        JOIN pg_index i ON i.indexrelid = c.oid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relname = '#{@index}' AND n.nspname = 'public' AND NOT i.indisvalid
-      ) THEN
-        EXECUTE 'DROP INDEX #{@index}';
-      END IF;
-    END $$;
-    """)
+    if invalid_index_leftover?() do
+      execute("DROP INDEX CONCURRENTLY IF EXISTS #{@index}")
+    end
 
     # The WITH (m, ef_construction) clause is single-sourced from Loopctl.Repo.HnswIndex
     # so a rebuild can never drift from the params every other HNSW index is built with.
@@ -131,6 +153,25 @@ defmodule Loopctl.Repo.Migrations.DropLegacyArticlesEmbeddingHnswIndex do
     CREATE INDEX CONCURRENTLY IF NOT EXISTS #{@index}
     ON articles USING hnsw (embedding vector_cosine_ops) #{HnswIndex.with_params_clause()}
     """)
+  end
+
+  # A leftover from a FAILED `CREATE INDEX CONCURRENTLY`: present in the catalog under
+  # this name and marked NOT valid. Read directly, the same shape as
+  # `side_table_reads_live?/0` below.
+  defp invalid_index_leftover? do
+    %{rows: rows} =
+      repo().query!(
+        """
+        SELECT 1
+        FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = $1 AND n.nspname = 'public' AND NOT i.indisvalid
+        """,
+        [@index]
+      )
+
+    rows != []
   end
 
   # The install's OWN cutover state, read from the row rather than the cache. A missing
