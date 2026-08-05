@@ -114,5 +114,47 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTagsTest do
       assert "idem-url-#{@hex12}" in tags_of(mine)
       assert tags_of(theirs) == ["url-#{@hex12}"]
     end
+
+    test "leaves a hex-shaped tag under an unknown family alone", %{tenant: tenant} do
+      tags = ["commit-a94a8fe5ccb1", "release-202604150930", "elixir"]
+      article = fixture(:article, tenant_id: tenant.id, tags: tags)
+
+      assert %{changed: 0} =
+               Task.backfill(apply: true, drop_legacy: true, tenant: tenant.id, throttle: 0)
+
+      assert tags_of(article) == tags
+    end
+
+    test "a duplicated topical tag is neither counted nor rewritten", %{tenant: tenant} do
+      dupes = ["elixir", "elixir", "ecto"]
+      article = fixture(:article, tenant_id: tenant.id, tags: dupes)
+
+      assert %{scanned: 1, changed: 0} =
+               Task.backfill(apply: true, tenant: tenant.id, throttle: 0)
+
+      assert tags_of(article) == dupes
+    end
+  end
+
+  describe "run/1 argument validation" do
+    # A discarded --tenant leaves the sweep unscoped, and the task runs on
+    # AdminRepo (BYPASSRLS) where that predicate is the only scoping there is.
+    test "a mistyped --tenant aborts instead of silently sweeping every tenant", %{
+      tenant: tenant
+    } do
+      article = fixture(:article, tenant_id: tenant.id, tags: ["url-#{@hex12}"])
+
+      assert_raise Mix.Error, ~r/--tenat/, fn ->
+        Task.run(["--apply", "--tenat", tenant.id])
+      end
+
+      assert tags_of(article) == ["url-#{@hex12}"]
+    end
+
+    test "a leftover positional argument aborts" do
+      assert_raise Mix.Error, ~r/deadbeef/, fn ->
+        Task.run(["--apply", "deadbeef"])
+      end
+    end
   end
 end

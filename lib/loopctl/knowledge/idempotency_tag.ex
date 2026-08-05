@@ -44,8 +44,10 @@ defmodule Loopctl.Knowledge.IdempotencyTag do
   The reservation is FORWARD-looking. Articles captured before it carry the bare
   `<family>-<digest>` form, which is indistinguishable-by-prefix from a topic
   tag and so needs an independent read-side discriminator: `legacy?/1` matches
-  the bare form by SHAPE. `promote_tags/2` moves a tag list to the reserved
-  form; `mix loopctl.reserve_idempotency_tags` applies it across the corpus.
+  the bare form by SHAPE, restricted to the known source families — see its
+  docs for why that restriction is load-bearing rather than cosmetic.
+  `promote_tags/2` moves a tag list to the reserved form;
+  `mix loopctl.reserve_idempotency_tags` applies it across the corpus.
 
   Writing the bare legacy form is still ALLOWED — rejecting it would break the
   sourcers before the client half (mkreyman/claude-config#222) can adopt the
@@ -60,6 +62,21 @@ defmodule Loopctl.Knowledge.IdempotencyTag do
   @family_source "[a-z][a-z0-9]{1,15}"
   @digest_source "[0-9a-f]{12}|[0-9a-f]{40}"
 
+  # The source families the harvest sourcers actually emit, mirroring the
+  # provenance-id prefixes `Loopctl.Workers.KnowledgeMocWorker` already excludes
+  # from hub topics. This allowlist constrains the LEGACY matcher only, and the
+  # asymmetry is the point: the reserved form is EXPLICITLY claimed by its
+  # writer, so any family is legal there, while the legacy form is INFERRED by
+  # shape from an unprefixed tag and so must be conservative. A bare
+  # `<anything>-<12|40 hex>` also describes a git object id (`commit-<sha>`), a
+  # timestamp (`release-202604150930`) and a zero-padded id
+  # (`ticket-000000012345`) — promoting one of those fabricates a capture
+  # identity, and `--drop-legacy` would then DELETE the original. An unknown
+  # family is left alone instead, which costs only an unpromoted tag that still
+  # reads exactly as it did before.
+  @legacy_families ~w(url doc book yt repo img file vid web)
+  @legacy_family_source "(?:" <> Enum.join(@legacy_families, "|") <> ")"
+
   @reserved_regex Regex.compile!(
                     "^" <>
                       @reserved_prefix <>
@@ -68,7 +85,7 @@ defmodule Loopctl.Knowledge.IdempotencyTag do
                       ")-(" <>
                       @digest_source <> ")$"
                   )
-  @legacy_regex Regex.compile!("^(" <> @family_source <> ")-(" <> @digest_source <> ")$")
+  @legacy_regex Regex.compile!("^(" <> @legacy_family_source <> ")-(" <> @digest_source <> ")$")
 
   @shape "#{@reserved_prefix}<family>-<digest>"
   @example "#{@reserved_prefix}url-7ebe1ca33431"
@@ -104,8 +121,17 @@ defmodule Loopctl.Knowledge.IdempotencyTag do
   Whether `tag` is a PRE-reservation idempotency tag: the bare `<family>-<digest>`
   form, matched by shape because it carries no prefix to match on.
 
-  A topical tag never matches — the digest must be 12 or 40 lowercase hex
-  characters, so `url-design` and `url-normalization` are not legacy tags.
+  Deliberately conservative on BOTH halves, because the only consumer is a
+  promotion that adds a reserved tag (and, on the second pass, deletes this one):
+
+    * `<digest>` must be 12 or 40 lowercase hex characters, so `url-design` and
+      `url-normalization` are not legacy tags;
+    * `<family>` must be one of the families the sourcers emit
+      (#{Enum.join(@legacy_families, ", ")}), so a hex-shaped suffix under some
+      other family — `commit-<sha>`, `release-202604150930`,
+      `ticket-000000012345` — is NOT a legacy tag either. Shape alone cannot
+      tell those apart from a capture id, and guessing wrong invents a capture
+      identity the article does not have.
   """
   @spec legacy?(term()) :: boolean()
   def legacy?(tag) when is_binary(tag), do: Regex.match?(@legacy_regex, tag)

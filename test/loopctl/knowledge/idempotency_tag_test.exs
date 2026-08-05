@@ -66,6 +66,30 @@ defmodule Loopctl.Knowledge.IdempotencyTagTest do
     test "never matches an already-reserved tag — this is what keeps promotion idempotent" do
       refute Tag.legacy?("idem-url-#{@hex12}")
     end
+
+    test "a hex-shaped suffix under an UNKNOWN family is not a legacy tag" do
+      # These all satisfy <word>-<12|40 hex> but are not capture ids: a git
+      # object id, a yyyymmddhhmm stamp and a zero-padded numeric id. Promoting
+      # one fabricates a capture identity, and --drop-legacy then deletes the
+      # original — so shape alone is not enough, the family must be known.
+      for tag <- [
+            "commit-a94a8fe5ccb1",
+            "commit-#{@hex40}",
+            "sha-a94a8fe5ccb1",
+            "release-202604150930",
+            "ticket-000000012345"
+          ] do
+        refute Tag.legacy?(tag), tag
+        assert Tag.promote(tag) == :error, tag
+        assert Tag.promote_tags([tag], drop_legacy: true) == [tag], tag
+      end
+    end
+
+    test "matches every family the sourcers emit" do
+      for family <- ~w(url doc book yt repo img file vid web) do
+        assert Tag.legacy?("#{family}-#{@hex12}"), family
+      end
+    end
   end
 
   describe "promote/1" do

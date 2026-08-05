@@ -107,10 +107,21 @@ never pass `tenant_id`/`subject_id`.
    the sourcers' suffix was truncated from a full sha1 to 12 and a rule that knew only the current
    form is the drift bug that made pre-truncation captures invisible. Malformed → 422 naming the
    remedy; **never** a silent re-prefix (rewriting a caller's tags makes the response body a lie).
+   The 422 is what a CALLER sees on `POST`/`PATCH /api/v1/articles`. The two MACHINE paths drop
+   the tag instead, because a whole batch must not die on one string a model or a foreign
+   document produced: OKF `sanitize_tags/1` drops a tag that sanitizing COERCED into the
+   namespace (discriminating on whether the string CHANGED — a well-formed reserved tag arriving
+   byte-identical is the article's own capture identity and MUST survive, or a native bundle's
+   round trip and the merge path silently delete it), and `ReviewKnowledgeWorker` strips a
+   malformed reserved tag from extractor output pre-insert, since all of a review's articles
+   share one `Multi` and an `:insert_failed` changeset discards the job permanently.
    The reservation is FORWARD-looking: pre-reservation tags carry the bare `<family>-<digest>` form
    with no prefix to match on, so reads need the independent shape discriminator `legacy?/1`, and
    the bare form is still WRITABLE until the client half (mkreyman/claude-config#222) adopts the
-   reserved form. `mix loopctl.reserve_idempotency_tags` promotes the corpus (dry-run default;
+   reserved form. `legacy?/1` requires BOTH a known source family and a hex digest — a bare
+   `<anything>-<hex>` also describes `commit-<sha>` and `release-202604150930`, and promoting one
+   of those fabricates a capture identity that `--drop-legacy` then makes irreversible.
+   `mix loopctl.reserve_idempotency_tags` promotes the corpus (dry-run default;
    `--drop-legacy` is the second pass, only after clients switch).
    **What this is not:** a tag is caller-controlled data, so reserving its namespace is defense in
    depth, not authority. The server-guaranteed key is the `articles.idempotency_key` column with

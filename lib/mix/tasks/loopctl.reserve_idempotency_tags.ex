@@ -4,9 +4,12 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTags do
 
   Articles captured before the namespace was reserved carry the bare
   `<family>-<digest>` form (`url-7ebe1ca33431`). This task adds each one's
-  reserved counterpart (`idem-url-7ebe1ca33431`), leaving genuine topical tags
-  (`url-design`, `url-routing`) untouched — they are recognised by shape, not by
-  prefix, because the bare form has no prefix to recognise.
+  reserved counterpart (`idem-url-7ebe1ca33431`), leaving every other tag
+  untouched — the bare form has no prefix to recognise, so it is recognised by
+  shape: a known source family plus a 12- or 40-char lowercase hex digest.
+  Both halves must match, so `url-design` is left alone (not a digest) and so is
+  `commit-<sha>` or `release-202604150930` (not a source family) — see
+  `Loopctl.Knowledge.IdempotencyTag.legacy?/1`.
 
   ## Usage
 
@@ -53,7 +56,7 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTags do
   def run(argv) do
     Mix.Task.run("app.start")
 
-    {opts, _rest, _invalid} =
+    {opts, rest, invalid} =
       OptionParser.parse(argv,
         strict: [
           apply: :boolean,
@@ -63,6 +66,8 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTags do
           throttle: :integer
         ]
       )
+
+    abort_on_bad_argv!(rest, invalid)
 
     report = backfill(opts)
 
@@ -74,6 +79,26 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTags do
     )
 
     report
+  end
+
+  # A discarded switch silently WIDENS this task: `--tenat <uuid>` leaves
+  # `tenant_id` nil, page/2 omits the tenant predicate, and because the sweep
+  # runs on AdminRepo (BYPASSRLS) that predicate is the only scoping there is —
+  # so a typo turns a one-tenant promotion into a whole-install rewrite, and
+  # with --drop-legacy a destructive one. Same for a mistyped --batch-size or
+  # --throttle, which would silently fall back to the default.
+  defp abort_on_bad_argv!(rest, invalid) do
+    bad = Enum.map(invalid, fn {switch, _value} -> switch end) ++ rest
+
+    if bad == [] do
+      :ok
+    else
+      Mix.raise(
+        "unrecognised argument(s): #{Enum.join(bad, ", ")}. Refusing to run — an " <>
+          "ignored --tenant would sweep every tenant. Valid switches: --apply, " <>
+          "--tenant <uuid>, --drop-legacy, --batch-size <n>, --throttle <ms>."
+      )
+    end
   end
 
   @doc """
@@ -136,7 +161,12 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTags do
     promoted = IdempotencyTag.promote_tags(tags, drop_legacy: state.drop_legacy?)
 
     cond do
-      promoted == tags ->
+      # Compared against the DEDUPED list, not the raw one: promote_tags/2 ends
+      # in Enum.uniq/1 and nothing dedupes tags on write, so an article legally
+      # holding ["elixir", "elixir"] and NO idempotency tag at all differs from
+      # its promotion — which had this task rewrite a row it was never asked to
+      # touch and count it under "with legacy idempotency tags".
+      promoted == Enum.uniq(tags) ->
         state
 
       length(promoted) > Article.max_tags() ->

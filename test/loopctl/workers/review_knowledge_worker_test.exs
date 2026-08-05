@@ -376,6 +376,102 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       assert hd(articles).title == "Valid"
     end
 
+    test "#583: a malformed reserved tag is stripped, not allowed to kill the batch" do
+      %{tenant: tenant} = setup_tenant()
+      review_record = create_review_record(tenant.id)
+
+      # "idem-design" is plausible free text on a review about idempotency, and
+      # it passes every other tag rule — but the schema rejects it, and all the
+      # extracted articles share ONE Multi, so it used to discard the lot.
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
+        {:ok,
+         [
+           %{
+             title: "Idempotency",
+             body: "Body.",
+             category: :pattern,
+             tags: ["idem-design", "idempotency"]
+           },
+           %{title: "Sibling", body: "Body.", category: :pattern, tags: ["ecto"]}
+         ]}
+      end)
+
+      assert :ok =
+               ReviewKnowledgeWorker.perform(%Oban.Job{
+                 args: %{
+                   "review_record_id" => review_record.id,
+                   "tenant_id" => tenant.id
+                 }
+               })
+
+      %{data: articles} =
+        Knowledge.list_articles(tenant.id, source_type: "review_finding")
+
+      assert length(articles) == 2
+      idempotency = Enum.find(articles, &(&1.title == "Idempotency"))
+      assert idempotency.tags == ["idempotency"]
+    end
+
+    test "#583: a well-formed reserved tag from the extractor is left alone" do
+      %{tenant: tenant} = setup_tenant()
+      review_record = create_review_record(tenant.id)
+
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
+        {:ok,
+         [
+           %{
+             title: "Captured",
+             body: "Body.",
+             category: :pattern,
+             tags: ["idem-url-7ebe1ca33431"]
+           }
+         ]}
+      end)
+
+      assert :ok =
+               ReviewKnowledgeWorker.perform(%Oban.Job{
+                 args: %{
+                   "review_record_id" => review_record.id,
+                   "tenant_id" => tenant.id
+                 }
+               })
+
+      %{data: [article]} =
+        Knowledge.list_articles(tenant.id, source_type: "review_finding")
+
+      assert article.tags == ["idem-url-7ebe1ca33431"]
+    end
+
+    test "#583: a malformed reserved tag under STRING keys is stripped too" do
+      %{tenant: tenant} = setup_tenant()
+      review_record = create_review_record(tenant.id)
+
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
+        {:ok,
+         [
+           %{
+             "title" => "String keys",
+             "body" => "Body.",
+             "category" => "pattern",
+             "tags" => ["idem-key", "caching"]
+           }
+         ]}
+      end)
+
+      assert :ok =
+               ReviewKnowledgeWorker.perform(%Oban.Job{
+                 args: %{
+                   "review_record_id" => review_record.id,
+                   "tenant_id" => tenant.id
+                 }
+               })
+
+      %{data: [article]} =
+        Knowledge.list_articles(tenant.id, source_type: "review_finding")
+
+      assert article.tags == ["caching"]
+    end
+
     test "skips articles with title exceeding 500 characters" do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)
