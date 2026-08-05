@@ -53,6 +53,7 @@ defmodule Loopctl.SystemConfig.CachePrimer do
 
   require Logger
 
+  alias Loopctl.ExitClass
   alias Loopctl.SystemConfig
 
   @doc false
@@ -81,19 +82,46 @@ defmodule Loopctl.SystemConfig.CachePrimer do
         :ignore
 
       {:error, reason} ->
+        class = error_class(reason)
+
         Logger.error(
           "Loopctl.SystemConfig.CachePrimer: boot prime FAILED; this node serves in-code " <>
             "defaults (for the embeddings read flag that is the LEGACY column) until a " <>
-            "SystemConfigRefreshWorker tick lands on it: #{inspect(reason)}"
+            "SystemConfigRefreshWorker tick lands on it: error_class=#{class}"
         )
 
         :telemetry.execute(
           [:loopctl, :system_config, :prime_failed],
           %{count: 1},
-          %{reason: reason}
+          %{error_class: class}
         )
 
         :ignore
     end
   end
+
+  @doc false
+  # Public ONLY as a seam for this classifier's own tests (the same reason
+  # `SystemConfig.refresh_from/1` is): the test database always answers `AdminRepo.all/1`,
+  # so the EXIT shape — the one whose raw reason actually carries a payload — cannot be
+  # driven through `start_link/1` at all, and left private the clause that sanitizes it
+  # would be unexercised.
+  #
+  # `refresh_from/1` returns TWO error shapes, and BOTH reach a log line and telemetry
+  # metadata here, so both are reduced to the bounded class first: an exit reason carries
+  # the DBConnection checkout tuple, which on the crash-propagation shape carries the
+  # failing statement and its bound parameters (#562), and an inspected Postgrex /
+  # DBConnection struct names the backend host, database and role (`ExitTag`). Emitting
+  # the raw term one frame up would undo the sanitization `refresh_from/1`'s guard exists
+  # to perform.
+  @spec error_class(term()) :: String.t()
+  def error_class({kind, reason}) when kind in [:exit, :throw],
+    do: ExitClass.classify(kind, reason)
+
+  def error_class(e) when is_exception(e), do: ExitClass.classify(:raise, e)
+
+  # An unforeseen shape must not raise: a FunctionClauseError here would escape
+  # `start_link/1`, and a supervisor converts an exiting child start into a failed boot —
+  # the exact outcome "a failed prime NEVER blocks boot" promises to avoid.
+  def error_class(_reason), do: "unclassified"
 end

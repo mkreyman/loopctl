@@ -49,7 +49,8 @@ defmodule Loopctl.SystemConfig.CachePrimerTest do
   # a `rescue`-only guard misses, and the one that would abort the whole supervision-tree
   # start from here — is covered one level down, in `Loopctl.SystemConfigTest`'s
   # "refresh_from/1 guard" block: `refresh/0` is what converts it into the `{:error, reason}`
-  # this branch handles, and the branch itself is shape-agnostic.
+  # this branch handles. How THIS branch then reduces each shape to a bounded class is
+  # covered by the `error_class/1` block below.
   describe "start_link/1 when the prime FAILS" do
     test "logs at :error, emits prime_failed telemetry, and STILL returns :ignore" do
       {handler_id, ref} = attach_prime_failed_handler()
@@ -67,7 +68,59 @@ defmodule Loopctl.SystemConfig.CachePrimerTest do
         end)
 
       assert log =~ "boot prime FAILED"
-      assert_received {^ref, %{reason: _reason}}
+
+      # The RAISE shape's bounded class, never the exception's own message — which on a
+      # Postgrex/DBConnection struct names the backend host, database and role.
+      assert log =~ "error_class=raise:"
+      assert_received {^ref, %{error_class: class}}
+      assert is_binary(class)
+      assert String.starts_with?(class, "raise:")
+    end
+  end
+
+  # #588 review: `refresh_from/1`'s catch arm logs the exit by BOUNDED class precisely
+  # because the raw reason carries the DBConnection checkout tuple — statement and bound
+  # parameters (#562). This branch is one frame UP from that guard, and it logs and emits
+  # the same reason, so it has to sanitize it too or the guard buys nothing.
+  #
+  # Driven through the seam rather than `start_link/1`: the test database always answers
+  # `AdminRepo.all/1` successfully, so no prime can be made to EXIT — and the exit is the
+  # shape whose raw reason actually carries a payload.
+  describe "error_class/1" do
+    test "an exit reason is reduced to its bounded class, dropping statement and params" do
+      reason = {:noproc, {DBConnection, :execute, ["SELECT secret FROM t", ["bound-param"]]}}
+
+      class = CachePrimer.error_class({:exit, reason})
+
+      assert class == "exit:noproc"
+      refute class =~ "bound-param"
+      refute class =~ "SELECT secret"
+    end
+
+    test "the crash-propagation shape reports the exception MODULE, not its message" do
+      reason =
+        {{%Postgrex.Error{message: "host=db user=secret"}, []}, {DBConnection, :execute, []}}
+
+      class = CachePrimer.error_class({:exit, reason})
+
+      assert class == "exit:Postgrex.Error"
+      refute class =~ "secret"
+    end
+
+    test "a throw keeps its kind prefix" do
+      assert CachePrimer.error_class({:throw, :boom}) == "throw:other"
+    end
+
+    test "the rescue arm's bare exception struct is classified as a :raise" do
+      assert CachePrimer.error_class(%Postgrex.Error{message: "host=db user=secret"}) ==
+               "raise:Postgrex.Error"
+
+      assert CachePrimer.error_class(%RuntimeError{message: "db down"}) == "raise:other"
+    end
+
+    test "an unforeseen shape is labelled, never raised — a crash here would abort boot" do
+      assert CachePrimer.error_class(:something_else) == "unclassified"
+      assert CachePrimer.error_class({:not_a_kind, :whatever}) == "unclassified"
     end
   end
 
