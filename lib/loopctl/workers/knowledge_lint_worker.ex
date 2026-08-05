@@ -246,6 +246,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
           target_article_id: l.target_article_id,
           metadata: l.metadata
         },
+        # A capped query with no ORDER BY takes an ARBITRARY `cap` rows — whichever the
+        # planner happens to emit first. That made the nightly 500 a random sample of the
+        # candidate set rather than the 500 most-similar pairs, so the strongest redundancy
+        # signals could sit unpromoted for weeks behind weaker ones. Ordering costs nothing
+        # here: `article_links_potential_conflict_idx` already covers this expression.
+        order_by: [desc: fragment("(?->>'similarity_score')::float", l.metadata)],
         limit: ^cap
       )
       |> AdminRepo.all()
