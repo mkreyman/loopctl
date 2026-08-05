@@ -20,19 +20,35 @@ defmodule Loopctl.SystemConfig do
   DB the cache was never primed from) behaves exactly like the pre-existing
   in-code default.
 
+  That fallback is NOT neutral for every key. For the US-41.1 embeddings
+  read-routing flag (`"embedding_side_table_reads"`, see
+  `Loopctl.Embeddings.SystemConfigReadPath`) the in-code default is `0` = the
+  RETIRED legacy `articles.embedding` column, so an unprimed cache silently
+  reverts a completed cutover for as long as it stays unprimed. That is why the
+  boot prime is now ORDERED ahead of every consumer rather than run after the
+  supervision tree is up (GH #588).
+
   ## Refresh lifecycle
 
   The cache is (re)loaded from the DB via `Loopctl.AdminRepo`:
 
-    * once at boot (`Loopctl.Application.start/2`, guarded) — this is what primes
-      EVERY node, and
+    * once at boot by the supervised one-shot child
+      `Loopctl.SystemConfig.CachePrimer`, which primes SYNCHRONOUSLY inside its
+      `start_link/1` and then returns `:ignore`. It is listed in
+      `Loopctl.Application.children/0` after `Loopctl.AdminRepo` (its data
+      source) and before `Oban` and `LoopctlWeb.Endpoint` — because a supervisor
+      starts children synchronously in list order, that placement GUARANTEES the
+      cache is authoritative before either of those consumers accepts work, and
     * every cron tick by `Loopctl.Workers.SystemConfigRefreshWorker` — but that
       job runs on ONE node per tick, so on a multi-node cluster a given node's
       refresh cadence is not bounded to one minute, and
     * immediately for a single key on `put/2` (the writing node only).
 
-  `refresh/0` is `try/rescue`-wrapped so a DB blip logs and no-ops — it never
-  crashes boot or the cron worker; the previously-cached values simply persist.
+  `refresh/0` is `try/rescue`-wrapped so a DB blip can never crash boot or the
+  cron worker; the previously-cached values simply persist. It REPORTS the
+  failure as `{:error, reason}` (rather than swallowing it into `:ok`) so the
+  primer can make a failed boot prime loud — a silently empty cache is what turns
+  a bounded startup window into an unbounded one.
 
   The `:persistent_term` key is `{__MODULE__, key_string}` — string keys are used
   verbatim (never `String.to_atom/1` on them).
@@ -64,10 +80,13 @@ defmodule Loopctl.SystemConfig do
   @doc """
   Loads ALL settings from the DB (via `AdminRepo`) into `:persistent_term`.
 
-  Wrapped in `try/rescue`: a DB error logs and no-ops (returns `:ok`) so it can
-  never crash boot or the refresh cron. The existing cache is left untouched.
+  Wrapped in `try/rescue`: a DB error logs and returns `{:error, reason}` — it
+  never raises, so it can never crash boot or the refresh cron, and the existing
+  cache is left untouched. Callers that must react to a failed prime (see
+  `Loopctl.SystemConfig.CachePrimer`) match on the error tuple; callers that only
+  want best-effort propagation (the cron worker, `Loopctl.Release`) ignore it.
   """
-  @spec refresh() :: :ok
+  @spec refresh() :: :ok | {:error, term()}
   def refresh do
     Setting
     |> AdminRepo.all()
@@ -83,7 +102,7 @@ defmodule Loopctl.SystemConfig do
           Exception.message(e)
       )
 
-      :ok
+      {:error, e}
   end
 
   @doc """

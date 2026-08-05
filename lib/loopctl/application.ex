@@ -26,12 +26,46 @@ defmodule Loopctl.Application do
     # write it observes.
     IngestionWriteStats.attach()
 
-    children = [
+    # See https://hexdocs.pm/elixir/Supervisor.html
+    # for other strategies and supported options
+    opts = [strategy: :one_for_one, name: Loopctl.Supervisor]
+    result = Supervisor.start_link(children(), opts)
+
+    post_boot_checks()
+
+    result
+  end
+
+  # The supervision-tree child list, extracted so its ORDER can be asserted
+  # statically (GH #588) without booting anything — a supervisor starts children
+  # synchronously in list order, so the order in this list IS the guarantee.
+  @doc false
+  @spec children() :: [Supervisor.child_spec() | {module(), term()} | module()]
+  def children do
+    [
       LoopctlWeb.Telemetry,
       Loopctl.Vault,
       Loopctl.Repo,
       Loopctl.AdminRepo,
       Loopctl.HeavyReadRepo,
+      # GH #588: primes the SystemConfig :persistent_term cache from the DB
+      # SYNCHRONOUSLY (inside its start_link/1, then returns :ignore), so the
+      # cache is authoritative before ANY consumer starts. Placement is the whole
+      # point: a supervisor starts children in list order, so sitting AFTER
+      # Loopctl.AdminRepo (which refresh/0 reads through) and BEFORE {Oban, ...}
+      # and LoopctlWeb.Endpoint is what makes "primed before work is accepted" a
+      # guarantee rather than a race. This replaces a post-`start_link` prime,
+      # under which both consumers served requests against an EMPTY cache for a
+      # startup window — and a miss returns the caller's in-code default, which
+      # for the embeddings read-routing flag ("embedding_side_table_reads") is
+      # the RETIRED legacy `articles.embedding` column. Every boot therefore
+      # silently reverted the completed cutover on semantic search, suggest-links
+      # and the novelty gate. Never make this a Task child or a
+      # handle_continue/2: both return to the supervisor immediately and
+      # reproduce the race. A failed prime is loud (log + telemetry) but NEVER
+      # blocks boot — the in-code defaults apply until the per-minute
+      # SystemConfigRefreshWorker succeeds.
+      Loopctl.SystemConfig.CachePrimer,
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
       {Task.Supervisor, name: Loopctl.TaskSupervisor},
@@ -158,19 +192,11 @@ defmodule Loopctl.Application do
       Loopctl.AuditChain.ProofCache,
       LoopctlWeb.Endpoint
     ]
+  end
 
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
-    opts = [strategy: :one_for_one, name: Loopctl.Supervisor]
-    result = Supervisor.start_link(children, opts)
-
-    # Prime the SystemConfig :persistent_term cache from the DB now that the repos
-    # are started, so the ingestion/extraction hot path reads live values from the
-    # first request. refresh/0 is rescue-wrapped (a DB blip logs and no-ops), so a
-    # failed prime NEVER blocks boot — the in-code defaults simply apply until the
-    # per-minute refresh cron succeeds.
-    Loopctl.SystemConfig.refresh()
-
+  # Boot-time observability checks that need the tree running. Log/telemetry only,
+  # with the single deliberate exception noted below.
+  defp post_boot_checks do
     # US-27.11 (AC-27.11.5): warn if the actual configured pools would exceed the live
     # DB max_connections at the expected node count. Prod only (dev/test pools differ),
     # log-only, never blocks boot.
@@ -203,7 +229,7 @@ defmodule Loopctl.Application do
     if Application.get_env(:loopctl, :env) == :prod,
       do: Loopctl.ClusterReadiness.warn_if_expected_peers_missing()
 
-    result
+    :ok
   end
 
   # Tell Phoenix to update the endpoint configuration
