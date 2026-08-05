@@ -70,6 +70,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.Consolidation
   alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
@@ -86,6 +87,18 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # isolated article connects to its closest relative rather than dangling.
   @default_orphan_link_threshold 0.5
   @default_max_conflict_promotions 500
+
+  # The DRAIN for auto-generated `potential_conflict` links, and it is deliberately LARGER
+  # than the promotion cap above so the queue converges instead of oscillating. At 500
+  # promoted and 2000 judged per night the backlog falls by 1500/night; equal caps would
+  # merely hold the line at whatever level it had already reached.
+  @default_max_conflict_judgements 2000
+
+  # Similarity at or above this is treated as high-confidence redundancy. Below it the pair
+  # is still redundant enough to have been promoted, just less certainly so — the
+  # `confidence` field records which, so a future reader can re-judge the weak ones without
+  # re-deriving the set.
+  @high_confidence_similarity 0.95
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
@@ -118,14 +131,28 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
     action = act_on_orphans(tenant_id, report)
     promoted = promote_conflicts(tenant_id)
+    # The judge runs AFTER promotion so a pair flagged tonight is also judged tonight and
+    # never spends a night suppressing its two articles. It is bounded above the promotion
+    # cap, so the same pass also eats into the backlog.
+    judged = judge_redundant_conflicts(tenant_id)
     resolutions_applied = Knowledge.execute_conflict_resolutions(tenant_id)
     consolidation = consolidate(tenant_id, report)
-    log_audit_event(tenant_id, report, action, promoted, resolutions_applied, consolidation)
+
+    log_audit_event(
+      tenant_id,
+      report,
+      action,
+      promoted,
+      judged,
+      resolutions_applied,
+      consolidation
+    )
 
     Logger.info(
       "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
         "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
-        "conflicts_promoted=#{promoted} resolutions_applied=#{resolutions_applied} " <>
+        "conflicts_promoted=#{promoted} conflicts_judged_redundant=#{judged} " <>
+        "resolutions_applied=#{resolutions_applied} " <>
         consolidation_log(consolidation)
     )
 
@@ -272,6 +299,132 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     end)
   end
 
+  # ---------------------------------------------------------------------------
+  # The automatic judge — the drain this queue never had
+  # ---------------------------------------------------------------------------
+  #
+  # WHAT THE SIGNAL ACTUALLY MEASURES. `potential_conflict` is promoted on cosine
+  # similarity >= 0.93. Similarity says "these two say the same thing"; contradiction says
+  # "these two disagree." Those are ORTHOGONAL — a flat contradiction scores high, but so
+  # does every honest restatement, so a similarity threshold cannot separate them and this
+  # class was never measuring disagreement.
+  #
+  # MEASURED on the hosted corpus 2026-08-05, across all 16,117 flagged pairs:
+  #   * 0 identical bodies, 0 shared source_id — so not byte-identical re-captures
+  #   * 261 identical NORMALISED titles
+  #   * 8,697 (54%) with body lengths within 10% of each other
+  #   * a 20-pair sample spanning 0.93–0.99 contained ZERO contradictions; the top matches
+  #     differ by a colon ("AWS CodeDeploy: Traffic Control" vs "AWS CodeDeploy Traffic
+  #     Control"), a hyphen ("Per Share" vs "Per-Share"), a percent sign ("75–90%" vs
+  #     "75%–90%") and a plural ("Formula" vs "Formulas").
+  #
+  # It is REDUNDANCY — the same knowledge captured twice and worded differently. So the
+  # verdict recorded here is `classification: :redundant`, which is what the evidence
+  # supports, NOT a fabricated finding about a contradiction nobody evaluated. The schema
+  # already carried the right vocabulary (`redundant | complementary | contradictory`); the
+  # promoter simply never used it.
+  #
+  # WHY DISMISS RATHER THAN SUPERSEDE. Dismiss keeps both articles and touches no article
+  # row, so a wrong verdict costs nothing and is undone by re-annotating the same pair
+  # (the table is a last-write-wins upsert on the canonical pair). Supersede retires an
+  # article, and choosing WHICH one to retire needs a judgement about authority that
+  # similarity cannot supply. With no human in the loop, the reversible verdict is the only
+  # defensible default.
+  #
+  # WHY THIS EXISTS AT ALL. Before it, nothing in the system ever closed a
+  # `potential_conflict`: the count was monotone by construction, and every open one
+  # withheld BOTH its articles from curated answers. The suppression window is the backstop
+  # for a judge that stalls; this is the judge.
+  defp judge_redundant_conflicts(tenant_id) do
+    cap =
+      Application.get_env(
+        :loopctl,
+        :knowledge_lint_max_conflict_judgements,
+        @default_max_conflict_judgements
+      )
+
+    unjudged =
+      from(l in ArticleLink,
+        as: :link,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :potential_conflict,
+        where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
+        where: not exists(judged_pair_subquery()),
+        # Highest similarity first: the most certainly-redundant pairs are judged before a
+        # bounded run runs out of budget. The promoter's own candidate query has no
+        # ORDER BY and takes an arbitrary 500; this one is deliberate.
+        order_by: [desc: fragment("(?->>'similarity_score')::float", l.metadata)],
+        limit: ^cap,
+        select: %{
+          source_article_id: l.source_article_id,
+          target_article_id: l.target_article_id,
+          similarity: fragment("(?->>'similarity_score')::float", l.metadata)
+        }
+      )
+      |> AdminRepo.all()
+
+    Enum.reduce(unjudged, 0, fn pair, count ->
+      case insert_redundancy_verdict(tenant_id, pair) do
+        {:ok, _} -> count + 1
+        {:error, _} -> count
+      end
+    end)
+  end
+
+  # Correlated on the enclosing `as: :link`, TRUE when a `conflict_resolutions` row already
+  # exists for the pair in EITHER direction. Mirrors `Knowledge.conflict_unresolved_subquery/0`
+  # — the pair is stored canonically (source <= target) but links are not, so both
+  # orientations must be checked or a judged pair is judged again every night.
+  defp judged_pair_subquery do
+    from(r in "conflict_resolutions",
+      where: r.tenant_id == parent_as(:link).tenant_id,
+      where:
+        (r.source_article_id == parent_as(:link).source_article_id and
+           r.target_article_id == parent_as(:link).target_article_id) or
+          (r.source_article_id == parent_as(:link).target_article_id and
+             r.target_article_id == parent_as(:link).source_article_id),
+      select: 1
+    )
+  end
+
+  defp insert_redundancy_verdict(tenant_id, %{similarity: similarity} = pair) do
+    # `validate_pair_order/1` requires source <= target by UUID string; links carry no such
+    # guarantee, so canonicalise here rather than letting the changeset reject half of them.
+    {src, tgt} =
+      if pair.source_article_id <= pair.target_article_id,
+        do: {pair.source_article_id, pair.target_article_id},
+        else: {pair.target_article_id, pair.source_article_id}
+
+    now = DateTime.utc_now()
+    sim = similarity || 0.0
+
+    attrs = %{
+      source_article_id: src,
+      target_article_id: tgt,
+      classification: :redundant,
+      disposition: :dismiss,
+      confidence: if(sim >= @high_confidence_similarity, do: :high, else: :medium),
+      evidence:
+        "Auto-judged by the nightly lint: cosine similarity #{Float.round(sim, 4)} indicates " <>
+          "REDUNDANCY (the same knowledge stated twice), not contradiction. Similarity cannot " <>
+          "distinguish agreement from disagreement, so this pair was never evidence of a " <>
+          "conflict. Both articles are retained; re-annotate this pair to override.",
+      annotated_by: "worker:knowledge_lint",
+      annotated_at: now,
+      # Dismiss has nothing to execute — mark it done so it never enters the executor's
+      # pending set (which would leave it in the same limbo this drain exists to end).
+      executed_at: now,
+      execution_result: %{"action" => "noop", "reason" => "auto_dismissed_redundant"}
+    }
+
+    %ConflictResolution{tenant_id: tenant_id}
+    |> ConflictResolution.changeset(attrs)
+    |> AdminRepo.insert(
+      on_conflict: :nothing,
+      conflict_target: [:tenant_id, :source_article_id, :target_article_id]
+    )
+  end
+
   defp embedded_ids(_tenant_id, []), do: MapSet.new()
 
   # US-41.1 (review): behind the cutover flag the presence check reads the
@@ -369,7 +522,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
   defp consolidation_state({:error, tag}), do: %{"status" => "failed", "error" => tag}
 
-  defp log_audit_event(tenant_id, report, action, promoted, resolutions_applied, consolidation) do
+  defp log_audit_event(
+         tenant_id,
+         report,
+         action,
+         promoted,
+         judged,
+         resolutions_applied,
+         consolidation
+       ) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "knowledge_lint",
       entity_id: tenant_id,
@@ -382,6 +543,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "orphans_relinked" => action.relinked,
         "orphans_embedding_enqueued" => action.embedding_enqueued,
         "conflicts_promoted" => promoted,
+        # Both numbers are recorded because the DIFFERENCE is the convergence signal: while
+        # judged > promoted the backlog is draining. If a future reading shows them equal
+        # over several nights, the drain is merely holding the line and the caps need
+        # revisiting — that is not visible from either number alone.
+        "conflicts_judged_redundant" => judged,
         "resolutions_applied" => resolutions_applied,
         "consolidation" => consolidation_state(consolidation)
       }
