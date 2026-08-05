@@ -330,6 +330,77 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       |> AdminRepo.all()
     end
 
+    defp resolutions(tenant_id, a_id, b_id) do
+      from(r in Loopctl.Knowledge.ConflictResolution,
+        where: r.tenant_id == ^tenant_id,
+        where:
+          (r.source_article_id == ^a_id and r.target_article_id == ^b_id) or
+            (r.source_article_id == ^b_id and r.target_article_id == ^a_id)
+      )
+      |> AdminRepo.all()
+    end
+
+    test "a promoted conflict is JUDGED the same night, as redundant rather than contradictory" do
+      # Before this, nothing ever closed a potential_conflict: the count was monotone by
+      # construction and every open one withheld BOTH articles from curated answers. With no
+      # human in the loop that is permanent.
+      #
+      # The verdict is `:redundant`, not a contradiction finding, because that is what the
+      # signal measures. Cosine similarity says "these say the same thing"; contradiction
+      # says "these disagree". Measured across all 16,117 flagged pairs on the hosted corpus:
+      # 0 identical bodies, 261 identical normalised titles, and a 20-pair sample spanning
+      # 0.93-0.99 with ZERO contradictions — the top matches differ by a colon, a hyphen, a
+      # percent sign and a plural.
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      relates_link(tenant.id, a.id, b.id, 0.96)
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      assert [conflict] = conflict_links(tenant.id, a.id, b.id)
+      assert conflict.metadata["promoted_from"] == "relates_to"
+
+      assert [verdict] = resolutions(tenant.id, a.id, b.id)
+      assert verdict.classification == :redundant
+      assert verdict.disposition == :dismiss
+      assert verdict.annotated_by == "worker:knowledge_lint"
+      # 0.96 >= the high-confidence cutoff.
+      assert verdict.confidence == :high
+      # Dismiss has nothing to execute; marking it done keeps it out of the executor's
+      # pending set, which is the limbo this drain exists to end.
+      refute is_nil(verdict.executed_at)
+      assert verdict.execution_result["action"] == "noop"
+
+      # The pair is stored canonically (source <= target) regardless of link orientation.
+      assert verdict.source_article_id <= verdict.target_article_id
+
+      # And the audit event carries BOTH counters, because their difference is the
+      # convergence signal.
+      assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["conflicts_promoted"] == 1
+      assert entry.new_state["conflicts_judged_redundant"] == 1
+    end
+
+    test "judging is idempotent — a second night does not re-judge an already-judged pair" do
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      relates_link(tenant.id, a.id, b.id, 0.94)
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      assert [_one] = resolutions(tenant.id, a.id, b.id)
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      # Still exactly one row, and the second run reports nothing new to judge — otherwise
+      # the "judged" counter would climb every night on a static corpus and the convergence
+      # signal in the audit event would be meaningless.
+      assert [_still_one] = resolutions(tenant.id, a.id, b.id)
+      assert [_first, second] = lint_audit_entries(tenant.id)
+      assert second.new_state["conflicts_judged_redundant"] == 0
+    end
+
     test "promotes a high-similarity relates_to link to a :potential_conflict flag" do
       tenant = fixture(:tenant)
       a = published_article_with_embedding(tenant.id, similar_embedding())
