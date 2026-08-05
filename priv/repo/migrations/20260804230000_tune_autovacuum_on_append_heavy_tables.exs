@@ -24,8 +24,12 @@ defmodule Loopctl.Repo.Migrations.TuneAutovacuumOnAppendHeavyTables do
   NOT applied to the `audit_log` PARENT: a partitioned parent has no heap and rejects storage
   autovacuum params. Partitions are stamped individually here, and — because a
   `CREATE TABLE ... PARTITION OF` child does NOT inherit reloptions —
-  `Loopctl.Workers.AuditPartitionWorker` stamps every partition it creates, self-healingly.
-  A table REBUILD also silently drops reloptions, so re-apply after any copy-swap.
+  `Loopctl.Workers.AuditPartitionWorker` re-stamps every partition inside the retention
+  window on each daily run, which also repairs the reloptions a table REBUILD silently drops.
+  The corollary: `down/0` does NOT stick for the partitions — the next worker run restores
+  them within a day. Rolling back to diagnose an autovacuum problem means stopping that
+  worker's cron entry (or changing its constants) as well; the RESET is durable only for the
+  four plain tables.
   """
   use Ecto.Migration
 

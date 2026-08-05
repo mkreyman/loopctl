@@ -7,8 +7,9 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
   1. **Creates future partitions** — ensures partitions exist for the current
      month plus 3 months ahead, preventing insert failures.
 
-  2. **Drops old partitions** — removes partitions older than the configured
-     retention period (default: 90 days) to prevent unbounded table growth.
+  2. **Sweeps existing partitions** — drops those older than the configured retention
+     period (default: 90 days) to prevent unbounded table growth, and re-stamps the
+     autovacuum tuning on every partition it retains.
 
   Partition naming convention: `audit_log_yYYYYmMM`
   """
@@ -29,11 +30,15 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
   # that already existed; a partitioned PARENT has no heap and rejects these params entirely.
   @analyze_scale_factor "0.05"
   @vacuum_insert_scale_factor "0.1"
+  @reloptions [
+    "autovacuum_analyze_scale_factor=#{@analyze_scale_factor}",
+    "autovacuum_vacuum_insert_scale_factor=#{@vacuum_insert_scale_factor}"
+  ]
 
   @impl Oban.Worker
   def perform(_job) do
     create_future_partitions()
-    drop_expired_partitions()
+    sweep_existing_partitions()
     :ok
   end
 
@@ -92,21 +97,29 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
   # stamped individually or it is created with the global defaults, which is how the whole
   # corpus went un-analyzed until #579.
   #
-  # SELF-HEALING, and stamped on the duplicate_table branch too: that covers a partition
-  # created before this code existed, and one created untuned during a deploy window. Guarded
-  # on the reloption being ABSENT rather than stamped unconditionally, because `ALTER TABLE`
-  # takes a SHARE UPDATE EXCLUSIVE lock and would fight the very autovacuum it is enabling.
+  # SELF-HEALING over the whole RETENTION window, not just the create window: stamped on the
+  # duplicate_table branch, and again from the retention sweep, so a partition created before
+  # this code existed, created untuned during a deploy window, or rebuilt by a copy-swap that
+  # silently drops reloptions is repaired on the next run wherever it sits in the window.
+  # Guarded on the reloptions being ABSENT rather than stamped unconditionally, because
+  # `ALTER TABLE` takes a SHARE UPDATE EXCLUSIVE lock and would fight the very autovacuum it
+  # is enabling.
   defp stamp_autovacuum(partition_name) do
     # Two statements rather than one `DO $$` block: a DO block takes no bind parameters
     # (`$1` inside it is procedural, not a placeholder), so the name would have to be
     # interpolated into the anonymous block anyway. This way the LOOKUP is parameterised and
     # only the ALTER interpolates — and that name is generated from a year/month integer pair
     # by `partition_name/2`, never from caller input.
+    #
+    # `to_regclass` resolves through the same search_path the ALTER below binds to, so the
+    # check and the write can never mean two different same-named relations. `<@` requires
+    # BOTH reloptions: keying on the analyze factor alone would read a partition that lost
+    # only `vacuum_insert` as tuned and never restore the insert-driven trigger.
     already_tuned =
       SQL.query(
         Loopctl.Repo,
-        "SELECT 1 FROM pg_class WHERE relname = $1 AND $2 = ANY(reloptions)",
-        [partition_name, "autovacuum_analyze_scale_factor=#{@analyze_scale_factor}"]
+        "SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND $2 <@ reloptions",
+        [partition_name, @reloptions]
       )
 
     case already_tuned do
@@ -136,7 +149,7 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
     Logger.warning("Failed to tune partition #{partition_name}: #{inspect(reason)}")
   end
 
-  defp drop_expired_partitions do
+  defp sweep_existing_partitions do
     retention_days = Application.get_env(:loopctl, :audit_retention_days, @default_retention_days)
     cutoff = DateTime.utc_now() |> DateTime.add(-retention_days * 86_400, :second)
     cutoff_year = cutoff.year
@@ -165,8 +178,12 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
 
           Logger.info("AuditPartitionWorker dropped expired partition: #{partition_name}")
 
+        # Retained: heal here, so the healing scope is the RETENTION window rather than the
+        # create window. A past-month partition that lost its reloptions to a rebuild is
+        # still read (audit history, STH verification) and is never revisited by the create
+        # loop, which only walks the current month forward.
         _ ->
-          :ok
+          stamp_autovacuum(partition_name)
       end
     end
   end
