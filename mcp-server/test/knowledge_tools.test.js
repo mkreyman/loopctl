@@ -1530,4 +1530,25 @@ describe("US-31.4: ListTools — new tools present, existing knowledge tools unc
     assert.ok(/retrieved/i.test(block), "mentions retrieved provenance");
     assert.ok(/knowledge_search/.test(block), "explains preference vs knowledge_search");
   });
+
+  test("#582: retrieval_metrics docstring names its denominator and the per-CALL rate", () => {
+    // The tool DESCRIPTION is the artifact #582 is about: it said "the share of search
+    // results the agent then opened", which reads as a per-search rate while `searched`
+    // counts surfaced RESULTS. The description must name both units and the separate
+    // call-level field, or the same misreading recurs.
+    const idx = indexSource.indexOf('name: "knowledge_retrieval_metrics"');
+    assert.ok(idx > 0);
+    const block = indexSource.slice(idx, idx + 4000);
+    assert.ok(/surfaced/i.test(block), "names the surfaced-RESULTS unit of `searched`");
+    assert.ok(/not search calls/i.test(block), "states what `searched` is NOT");
+    assert.ok(
+      /capped at[\s\S]{0,40}the first 20 per call/i.test(block),
+      "states the recording cap AT the denominator, not only at results_returned",
+    );
+    assert.ok(/precision@20/i.test(block), "names precision as precision@cap");
+    assert.ok(/search_follow_through/.test(block), "names the per-CALL rate");
+    assert.ok(/results_returned/.test(block), "names the true un-truncated count");
+    assert.ok(/upper bound/i.test(block), "states the ratios are upper bounds");
+    assert.ok(/FEWER results/i.test(block), "warns the proxy is gameable by shrinking it");
+  });
 });

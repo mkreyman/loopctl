@@ -26,29 +26,29 @@ never pass `tenant_id`/`subject_id`.
 ## Invariants (cited)
 
 1. **Novelty / dedup gate on create** — `Knowledge.propose_article/3` → the private `gate_proposal/4`
-   (`propose_article/3` at `knowledge.ex:456`; the four `gate_proposal/4` clauses at `:466-518`).
+   (`propose_article/3` at `knowledge.ex:458`; the four `gate_proposal/4` clauses at `:468-520`).
    **SIX outcomes, not four** — `:duplicate`, `:low_novelty`, `:unknown`, `:novel`,
    `:deduplicated` (`created: false`, returned when `create_article` hits the idempotency-key path,
-   `knowledge.ex:571-573`), and `:skipped_low_novelty` (`created: false`, `article` may be `nil`).
+   `knowledge.ex:573-575`), and `:skipped_low_novelty` (`created: false`, `article` may be `nil`).
    A caller matching only the first four falls through on either of the last two, both reachable.
    `:duplicate` returns the canonical neighbor without creating; `:low_novelty`
-   is created but **forced to `status: "draft"`** (`:492`) with novelty stamped into
-   `metadata.proposal_novelty` (`stamp_proposal_metadata/2`, `:692-705`) so a smarter consumer decides
+   is created but **forced to `status: "draft"`** (`:494`) with novelty stamped into
+   `metadata.proposal_novelty` (`stamp_proposal_metadata/2`, `:694-707`) so a smarter consumer decides
    — UNLESS the caller passes `on_low_novelty: :skip` (for an UNATTENDED writer whose drafts nothing
    would review), which creates NOTHING and returns `:skipped_low_novelty` with the near-neighbor
-   (`skip_low_novelty/4`, `:538-556`). That skip is decided LAST: an invalid `project_id`, an
+   (`skip_low_novelty/4`, `:540-562`). That skip is decided LAST: an invalid `project_id`, an
    `idempotency_key` match, and an exact active-title collision are all still answered normally
    rather than dropped.
    Two branches that are easy to miss: `:duplicate` **falls through to create** if the canonical
-   neighbor vanished between assess and now (`:472-480`), and `:unknown` creates only BY DEFAULT — a
+   neighbor vanished between assess and now (`:474-482`), and `:unknown` creates only BY DEFAULT — a
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
-   created (`:507-513`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:462-464`)
+   created (`:509-515`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:463-466`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8458`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8468`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
-   (`absolute_score/1`, `:8546-8551`) clears a scale-matched threshold AND beats the best retrieved
-   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8597-8607`; the pure decision is
-   `resolve_provenance/4`, `:8650-8662`) AND is authoritative (not superseded/conflicted — the caller
+   (`absolute_score/1`, `:8595-8600`) clears a scale-matched threshold AND beats the best retrieved
+   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8646-8656`; the pure decision is
+   `resolve_provenance/4`, `:8699-8710`) AND is authoritative (not superseded/conflicted — the caller
    passes only `list_curated_sources/2`-filtered scores). Otherwise `:retrieved`. Both branches return identical `results`/`meta`
    key sets — callers branch on `meta.provenance` alone. A sparse pool must never let a near-but-wrong
    curated doc win.
@@ -67,7 +67,7 @@ never pass `tenant_id`/`subject_id`.
    `drafts`/`publish` are `:orchestrator` (`:33`).
    Agent edits are visibility-scoped: an agent can only touch an article it can see. (See `chain-of-custody`.)
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:9101`; the counted set is `@heat_read_access_types`, `:8969`). The heat index is the one retrieval route that
+   (`knowledge.ex:9109`; the counted set is `@heat_read_access_types`, `:8979`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to

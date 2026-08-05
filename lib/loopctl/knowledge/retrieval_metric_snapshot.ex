@@ -1,8 +1,40 @@
 defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
   @moduledoc """
   A daily retrieval-precision snapshot (agents' KB #3). `precision` is the share of a
-  day's search results the agent then opened (search → get/context within
+  day's RECORDED search RESULTS the agent then opened (search → get/context within
   `window_seconds`) — a mechanical proxy for retrieval quality, tracked over time.
+
+  `searched` counts RECORDED SURFACED RESULTS (one row per result a search put in front
+  of an agent, capped at the first
+  #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} per call), never search
+  calls — reading it as the latter is #582. Because of that cap `precision` is
+  precision@#{Loopctl.Knowledge.Analytics.max_recorded_search_results()}, not precision
+  over a call's full result set, and an open of a result ranked beyond the cap is in
+  neither term. The call-level series added by that fix answers the other question
+  without redefining this one:
+  `searches` (distinct QUERY-BEARING search calls), `searches_with_follow_through` /
+  `search_follow_through` (the share of CALLS that led to an open), and
+  `results_returned` (the true un-truncated result count for those same calls, since
+  only the first
+  #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} results per search are
+  recorded).
+
+  The four call-level columns are computed over a per-ROW subset: a row counts only if
+  it carries a `search_id` (nothing written before #582 does) and its `mode` is not a
+  query-less enumeration (`list` / `list_keyset`, written by the browse paths). So a day
+  that MIXES qualifying and non-qualifying rows — every day spanning the #582 deploy
+  does — carries a PARTIAL figure, not `0`; only a day with no qualifying row at all
+  reads `0`/`0.0`. For the same reason `results_returned` is NOT comparable to
+  `searched`: they aggregate different row populations, and `results_returned <
+  searched` is the normal shape of a legacy-heavy or browse-heavy day.
+
+  Both ratios are gameable in the same direction — returning fewer results raises them
+  with no better retrieval — so read them with the absolute `followed_through` and the
+  volume columns, never alone. `search_follow_through` additionally carries two biases
+  that point OPPOSITE ways: the recording cap hides opens of results ranked beyond it
+  (DOWN), and one open credits every search in the window that surfaced that article
+  (UP). Full derivation, those biases, and the two structural exclusions (zero-result and
+  keyless searches) are in `Loopctl.Knowledge.RetrievalMetrics`.
 
   The `curated_*`/`retrieved_*` columns (US-31.2, AC-31.2.5) are the SAME searched /
   followed_through / precision breakdown, restricted to `article_access_events` whose
@@ -29,6 +61,10 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     field :searched, :integer, default: 0
     field :followed_through, :integer, default: 0
     field :precision, :float, default: 0.0
+    field :searches, :integer, default: 0
+    field :searches_with_follow_through, :integer, default: 0
+    field :search_follow_through, :float, default: 0.0
+    field :results_returned, :integer, default: 0
     field :curated_searched, :integer, default: 0
     field :curated_followed_through, :integer, default: 0
     field :curated_precision, :float, default: 0.0
@@ -46,6 +82,10 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     :searched,
     :followed_through,
     :precision,
+    :searches,
+    :searches_with_follow_through,
+    :search_follow_through,
+    :results_returned,
     :curated_searched,
     :curated_followed_through,
     :curated_precision,
@@ -66,6 +106,10 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
       :searched,
       :followed_through,
       :precision,
+      :searches,
+      :searches_with_follow_through,
+      :search_follow_through,
+      :results_returned,
       :curated_searched,
       :curated_followed_through,
       :curated_precision,

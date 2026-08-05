@@ -5,6 +5,43 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.68.0 — 2026-08-05 (the precision denominator says what it counts)
+
+### Changed
+
+- **`knowledge_retrieval_metrics` now states its denominator, and reports the per-CALL rate
+  separately** (issue #582). The tool said `precision` was "the share of search results the
+  agent then opened", and it is — `searched` counts one row per surfaced result, up to the
+  20-per-call recording cap. But the name
+  reads like a count of searches, and it was read that way: the number was reported as "agents
+  open N% of what they find" when the reader meant "N% of searches led to an open", and that
+  misreading reached a draft public post. The two are different quantities, so both are now
+  reported instead of one being mistaken for the other. `precision` and its `searched`
+  denominator are UNCHANGED — redefining a persisted daily series would make every historical
+  row incomparable.
+
+- **New response fields**: `results_recorded` (the same number as `searched`, named for its
+  unit), `searches` (distinct QUERY-BEARING search CALLS), `searches_with_follow_through` and
+  `search_follow_through` (the share of SEARCHES that led to an open — the quantity the
+  misreading had in mind), and `results_returned` (the true un-truncated result count for those
+  same calls). Only the first 20 results of a search are recorded, so `searched` /
+  `results_recorded` is that capped slice — `precision` is precision@20 and an open of a
+  result ranked beyond the cap is in neither term — and `results_returned`
+  exceeds the rows those calls wrote whenever a page hit that cap. The four call-level fields
+  are filtered per ROW, not per day: a row counts only if it carries a search identity (nothing
+  recorded before this release does) and is not a query-less enumeration page (`list` /
+  `list_keyset` — browsing is not searching), so a day mixing both kinds reports a PARTIAL
+  figure rather than 0, and `results_returned` must not be compared against `searched`.
+
+- **The two structural exclusions are documented**: a search returning ZERO results and a
+  search made without an api key are unrecordable (an access event requires both an article
+  and a key), so they sit in NO denominator and every ratio here is an upper bound. And the
+  gaming direction is named: both ratios rise when a search simply returns FEWER results, with
+  no better retrieval — read them with the absolute `followed_through` and the volume fields,
+  never alone. `search_follow_through` carries two further biases pointing OPPOSITE ways: the
+  recording cap hides opens of results ranked beyond it (DOWN), while one open credits EVERY
+  search in the window that surfaced that article, not just the preceding one (UP).
+
 ## 2.67.0 — 2026-08-04 (one accounting rule for every scope)
 
 ### Changed

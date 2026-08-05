@@ -637,7 +637,9 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         path: "/api/v1/knowledge/analytics/retrieval-metrics",
         description:
           "Daily retrieval-precision time series (search → open follow-through). " <>
-            "Role: orchestrator+. MCP tool: knowledge_retrieval_metrics"
+            "`precision` is per RECORDED surfaced RESULT (capped per call); " <>
+            "`search_follow_through` is per search CALL (#582). Role: orchestrator+. " <>
+            "MCP tool: knowledge_retrieval_metrics"
       },
       %{
         method: "GET",

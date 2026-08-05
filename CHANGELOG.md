@@ -8,6 +8,35 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **`GET /api/v1/knowledge/analytics/retrieval-metrics` gained four fields and a stated
+  denominator (#582).** `precision` and its `searched` denominator are UNCHANGED — `searched`
+  has always counted RECORDED SURFACED RESULTS (one `article_access_events` row per result a
+  search put in front of an agent, capped at the first 20 results of each call), so
+  `precision` has always been "the share of the recorded surfaced results that were opened",
+  i.e. precision@20: a call returning more results contributes only 20 to `searched`, and an
+  open of a result ranked beyond the cap appears in neither term. What changed is that the
+  payload now says so and reports the per-CALL quantity separately, because the field name
+  reads like a count of searches and was consumed that way. New fields: `results_recorded`
+  (same number as `searched`, named for its unit), `searches`, `searches_with_follow_through`,
+  `search_follow_through` (the share of QUERY-BEARING search CALLS that led to an open), and
+  `results_returned` (the true un-truncated result count for those same calls, so it exceeds
+  the rows those calls wrote whenever a page hit that cap). The four call-level fields are filtered per ROW, not per day: a row counts
+  only if it carries a search identity (nothing recorded before this release does) and is not
+  a query-less enumeration page (`list` / `list_keyset`, written by the browse endpoints —
+  browsing is not searching). So a day that MIXES qualifying and non-qualifying rows reports a
+  PARTIAL figure rather than `0`, and `results_returned` must NOT be compared against
+  `searched`: they aggregate different row populations. Migration
+  `20260805130000_add_call_level_columns_to_retrieval_metric_snapshots.exs` adds the four
+  backing columns with `default 0`; no manual step, and no backfill is possible — snapshots
+  recorded before this release read `0` because their source events carry no search identity.
+  Both ratios are UPPER BOUNDS: zero-result and keyless searches cannot be recorded and sit in
+  no denominator; and both rise if a search simply returns fewer results, so pair them with
+  the absolute `followed_through` rather than optimising either alone. `search_follow_through`
+  carries two further biases pointing OPPOSITE ways: the 20-row recording cap hides opens of
+  results ranked beyond it (biases it DOWN on large pages), while one open credits EVERY
+  search in the window that surfaced that article, not just the preceding one (biases it UP
+  when an agent refines and re-searches).
+
 - **The legacy `articles_embedding_hnsw_idx` is retired on installs whose reads are cut over
   to the embedding side table, and reverting `embedding_side_table_reads` to `0` there is now
   an UNINDEXED read path (#578).** Measured on the hosted instance 2026-08-04

@@ -846,7 +846,7 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `knowledge_agent_usage` | Per-agent knowledge usage | orchestrator |
 | `knowledge_unused_articles` | Published articles with zero accesses | orchestrator |
 | `knowledge_curation_log` | Human-readable feed of KB curation adjustments (gate/supersede/merge/dismiss); recorded only while tenant `settings.kb_curation_log` is on | orchestrator |
-| `knowledge_retrieval_metrics` | Daily retrieval-precision time series (search → open follow-through) | orchestrator |
+| `knowledge_retrieval_metrics` | Daily retrieval-precision time series (search → open follow-through); `precision` is per surfaced RESULT, `search_follow_through` is per search CALL | orchestrator |
 | `knowledge_hybrid_search` | Resolve a query to a governed **curated** answer when one genuinely answers it, else falls back to semantic/keyword **retrieval** — one shape with `meta.provenance` (`curated`/`retrieved`), `confidence`, `curated_article_id`. See [`docs/knowledge-hybrid-retrieval.md`](docs/knowledge-hybrid-retrieval.md). | agent |
 | `knowledge_progressive_index` | Compact, top-K-capped topic stubs (id/title/category/summary, no bodies), curated-preferred, hub-linked one hop via `:relates_to`. Follow up with `knowledge_progressive_drill`. | agent |
 | `knowledge_progressive_drill` | Fetch the full body of one stub returned by `knowledge_progressive_index`. | agent |

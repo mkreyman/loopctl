@@ -2519,6 +2519,14 @@ defmodule Loopctl.Knowledge do
   # Fire-and-forget recording of search access for the result list.
   # Skips when there is no api_key_id, no results, or the caller passed
   # `_skip_record_access: true` (used by combined search to dedupe).
+  #
+  # #582: only the first `Analytics.max_recorded_search_results/0` results get a row, so
+  # the count of recorded rows is NOT the count of results returned. The true,
+  # un-truncated figure is carried in `"results_returned"` so `RetrievalMetrics` can
+  # expose the gap instead of silently reporting a truncated denominator as if it were
+  # the whole result set. The cap lives in `Analytics` — the module that writes the rows
+  # and documents the key — so the enforcement here and every doc that publishes the
+  # number read ONE constant.
   defp maybe_record_search_access(tenant_id, results, query_string, opts, mode) do
     cond do
       Keyword.get(opts, :_skip_record_access, false) ->
@@ -2537,14 +2545,14 @@ defmodule Loopctl.Knowledge do
           results
           |> Enum.map(fn r -> r[:id] || Map.get(r, :id) end)
           |> Enum.reject(&is_nil/1)
-          |> Enum.take(20)
+          |> Enum.take(Analytics.max_recorded_search_results())
 
         Analytics.record_search_access(
           tenant_id,
           article_ids,
           api_key_id,
           query_string,
-          %{"mode" => mode},
+          %{"mode" => mode, "results_returned" => length(results)},
           attribution_context(opts)
         )
     end

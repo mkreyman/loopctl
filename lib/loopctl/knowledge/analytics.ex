@@ -63,6 +63,24 @@ defmodule Loopctl.Knowledge.Analytics do
   @spec valid_access_types() :: [String.t()]
   def valid_access_types, do: @valid_access_types
 
+  # How many of a search's results get an `article_access_events` row (#582). Rows are
+  # written per SURFACED RESULT, so an uncapped search would write an unbounded batch on
+  # every call. The cap makes the recorded row count an UNDERCOUNT of the results a search
+  # returned whenever a page exceeds it, which is why every batch also carries the true
+  # `"results_returned"` figure.
+  @max_recorded_search_results 20
+
+  @doc """
+  The cap on how many of a search's results are RECORDED as access events.
+
+  Public so the ENFORCING call site (`Knowledge.maybe_record_search_access/5`) and every
+  doc that publishes the cap (`RetrievalMetrics`, `RetrievalMetricSnapshot`, and the
+  `GET /knowledge/analytics/retrieval-metrics` OpenAPI description) read ONE number and
+  cannot drift — same discipline as `ArticleJSON.max_links_per_direction/0`.
+  """
+  @spec max_recorded_search_results() :: pos_integer()
+  def max_recorded_search_results, do: @max_recorded_search_results
+
   @typedoc """
   Optional metadata stored alongside the access event. Free-form map.
   Common keys: `"query"`, `"rank"`, `"score"`, `"mode"`.
@@ -135,6 +153,20 @@ defmodule Loopctl.Knowledge.Analytics do
   receives a `"rank"` key (1-based) reflecting the position in the
   results list.
 
+  ONE ROW PER SURFACED RESULT, not one row per search call — this is the unit
+  `RetrievalMetrics.compute/3` counts as `searched`, and mistaking it for a count of
+  search CALLS is what produced #582. Two metadata keys make the distinction
+  auditable downstream:
+
+  - `"search_id"` — a UUID generated HERE, once per call, shared by every row in the
+    batch. It is the only reliable search-call identity: the pre-#582 proxy
+    (`api_key_id` + a shared `accessed_at`) collides across concurrent searches by one
+    key. Never accept one from a caller — a call-level denominator a caller can forge
+    is a metric a caller can game.
+  - `"results_returned"` — how many results the search actually returned to its caller,
+    which may exceed the number of rows written (callers cap what they record). Defaults
+    to the batch size when the caller does not supply it.
+
   The optional `context` map attributes all rows in the batch to the
   same project and/or story. Cross-tenant values are silently dropped.
   """
@@ -164,6 +196,8 @@ defmodule Loopctl.Knowledge.Analytics do
       metadata
       |> ensure_map()
       |> maybe_put_query(query)
+      |> Map.put("search_id", Ecto.UUID.generate())
+      |> Map.put_new("results_returned", length(article_ids))
 
     items =
       article_ids

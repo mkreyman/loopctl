@@ -38,6 +38,11 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   # OpenAPI description below is interpolated from it so the published contract cannot drift
   # from the enforced one either.
   @valid_access_types Analytics.valid_access_types()
+
+  # Same discipline as the line above: the published cap is READ from the module that
+  # enforces it (`Knowledge.maybe_record_search_access/5` takes exactly this many), so
+  # raising the cap cannot leave the API description stating the old number.
+  @max_recorded_search_results Analytics.max_recorded_search_results()
   @valid_group_by ~w(article project agent)
 
   operation(:top_articles,
@@ -303,10 +308,40 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   operation(:retrieval_metrics,
     summary: "Retrieval precision time series",
     description:
-      "Daily retrieval PRECISION (agents' KB #3): the share of a day's search results the " <>
-        "agent then opened (search → get/context within a window). A proxy for retrieval " <>
-        "quality that trends up as the corpus is de-duplicated and better navigated. Most " <>
-        "recent day first. Role: orchestrator+.",
+      "Daily retrieval PRECISION (agents' KB #3): the share of a day's RECORDED search " <>
+        "RESULTS the agent then opened (search → get/context within a window). A proxy " <>
+        "for retrieval quality that trends up as the corpus is de-duplicated and better " <>
+        "navigated. Most recent day first. Role: orchestrator+.\n\n" <>
+        "DENOMINATORS (#582) — `precision` = `followed_through` / `searched`, and " <>
+        "`searched` counts RECORDED SURFACED RESULTS (one row per result a search put in " <>
+        "front of an agent, capped at the first #{@max_recorded_search_results} per " <>
+        "call), NOT search calls; `results_recorded` is the same number named for its " <>
+        "unit. Because of that cap `precision` is precision@#{@max_recorded_search_results}: " <>
+        "a call returning more results contributes only #{@max_recorded_search_results} to " <>
+        "`searched`, and an open of a result ranked beyond the cap appears in neither " <>
+        "term. The per-CALL rate is reported separately as `search_follow_through` = " <>
+        "`searches_with_follow_through` / `searches` (distinct QUERY-BEARING search " <>
+        "calls) — that is the 'share of searches that led to an open'. " <>
+        "`results_returned` is the true un-truncated result count for those same calls, " <>
+        "so it exceeds the rows those calls wrote whenever a page hit that cap.\n\n" <>
+        "CALL-LEVEL POPULATION — the four call-level fields are computed per ROW, not " <>
+        "per day: a row counts only if it carries a search identity (nothing recorded " <>
+        "before #582 does) and is not a query-less enumeration page (`list` / " <>
+        "`list_keyset`, written by the browse endpoints — browsing is not searching). A " <>
+        "day that MIXES qualifying and non-qualifying rows therefore reports a PARTIAL " <>
+        "`searches` / `results_returned`, not 0; only a day with no qualifying row reads " <>
+        "0. Do NOT compare `results_returned` against `searched` — they aggregate " <>
+        "different row populations, so `results_returned` < `searched` is the normal " <>
+        "shape of a legacy-heavy or browse-heavy day.\n\n" <>
+        "CAVEATS — searches returning ZERO results and searches made without an api key " <>
+        "are structurally unrecordable and appear in NO denominator, so every ratio here " <>
+        "is an upper bound. Both ratios also rise when a search simply returns FEWER " <>
+        "results, with no better retrieval: never optimise them alone — read them with " <>
+        "the absolute `followed_through` and the volume fields. `search_follow_through` " <>
+        "carries two further biases pointing OPPOSITE ways: the recording cap hides opens " <>
+        "of results ranked beyond it (biases it DOWN on large pages), while one open " <>
+        "credits EVERY search in the window that surfaced that article, not just the " <>
+        "preceding one (biases it UP when an agent refines and re-searches).",
     parameters: [
       limit: [
         in: :query,
