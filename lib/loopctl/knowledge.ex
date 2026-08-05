@@ -115,13 +115,6 @@ defmodule Loopctl.Knowledge do
   # a silent oversized response).
   @max_include_body_page 25
 
-  # How many of a search's results get an `article_access_events` row (#582). Analytics
-  # rows are written per surfaced result, so an uncapped search would write an unbounded
-  # batch on every call. The cap means the recorded row count is an UNDERCOUNT of the
-  # results returned whenever a page exceeds it, which is why every batch also carries
-  # the true `"results_returned"` figure — see `maybe_record_search_access/5`.
-  @max_recorded_search_results 20
-
   @doc """
   The maximum page size (`limit`) honored by the **enumeration** paths
   (`list_articles/2`, `list_filtered/2`, `list_keyset/2`, `list_drafts/2`,
@@ -2527,11 +2520,13 @@ defmodule Loopctl.Knowledge do
   # Skips when there is no api_key_id, no results, or the caller passed
   # `_skip_record_access: true` (used by combined search to dedupe).
   #
-  # #582: only the first `@max_recorded_search_results` results get a row, so the count of
-  # recorded rows is NOT the count of results returned. The true, un-truncated figure is
-  # carried in `"results_returned"` so `RetrievalMetrics` can expose the gap
-  # (`searched < results_returned`) instead of silently reporting a truncated denominator
-  # as if it were the whole result set.
+  # #582: only the first `Analytics.max_recorded_search_results/0` results get a row, so
+  # the count of recorded rows is NOT the count of results returned. The true,
+  # un-truncated figure is carried in `"results_returned"` so `RetrievalMetrics` can
+  # expose the gap instead of silently reporting a truncated denominator as if it were
+  # the whole result set. The cap lives in `Analytics` — the module that writes the rows
+  # and documents the key — so the enforcement here and every doc that publishes the
+  # number read ONE constant.
   defp maybe_record_search_access(tenant_id, results, query_string, opts, mode) do
     cond do
       Keyword.get(opts, :_skip_record_access, false) ->
@@ -2550,7 +2545,7 @@ defmodule Loopctl.Knowledge do
           results
           |> Enum.map(fn r -> r[:id] || Map.get(r, :id) end)
           |> Enum.reject(&is_nil/1)
-          |> Enum.take(@max_recorded_search_results)
+          |> Enum.take(Analytics.max_recorded_search_results())
 
         Analytics.record_search_access(
           tenant_id,

@@ -25,6 +25,7 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
   defp search_call(tenant_id, api_key_id, article_ids, time, opts \\ []) do
     search_id = Keyword.get(opts, :search_id, Ecto.UUID.generate())
     results_returned = Keyword.get(opts, :results_returned, length(article_ids))
+    mode = Keyword.get(opts, :mode, "combined")
 
     Enum.each(article_ids, fn article_id ->
       fixture(:article_access_event, %{
@@ -32,7 +33,11 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
         api_key_id: api_key_id,
         article_id: article_id,
         access_type: "search",
-        metadata: %{"search_id" => search_id, "results_returned" => results_returned},
+        metadata: %{
+          "search_id" => search_id,
+          "results_returned" => results_returned,
+          "mode" => mode
+        },
         accessed_at: at(time)
       })
     end)
@@ -254,6 +259,60 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
       assert m.searches_with_follow_through == 0
       assert m.search_follow_through == 0.0
       assert m.results_returned == 0
+    end
+
+    test "a query-less enumeration page is NOT a search call", ctx do
+      # `list_filtered/2` (mode "list") and `list_keyset/2` (mode "list_keyset") write
+      # `"search"` rows too, and since #582 every batch carries a `search_id`. Counting a
+      # browse page as a search inflates `searches` and drags `search_follow_through`
+      # toward zero without a single search having missed — the exact undisclosed
+      # denominator this field exists to state. They still surface results, so they stay
+      # in `searched`/`precision`.
+      %{tenant: t, key: k, x: x, y: y} = ctx
+
+      search_call(t.id, k.id, [x.id, y.id], ~T[12:00:00],
+        mode: "list_keyset",
+        results_returned: 40
+      )
+
+      search_call(t.id, k.id, [x.id], ~T[13:00:00], mode: "list", results_returned: 7)
+
+      m = RetrievalMetrics.compute(t.id, @day, 1800)
+
+      assert m.searched == 3
+      assert m.searches == 0
+      assert m.searches_with_follow_through == 0
+      assert m.search_follow_through == 0.0
+      assert m.results_returned == 0
+    end
+
+    test "a MIXED day reports PARTIAL call-level figures, not 0", ctx do
+      # The call-level filter is per ROW, not per day: the first day after deploy always
+      # mixes pre-#582 rows (no search_id) with post-deploy ones, and browse pages mix in
+      # on any day. Only the real search must reach the call-level series — and the day
+      # must NOT read 0 just because most of its rows do not qualify.
+      %{tenant: t, key: k, x: x, y: y} = ctx
+
+      # Legacy row: no search_id.
+      event(t.id, k.id, y.id, "search", ~T[11:00:00])
+      # Browse page.
+      search_call(t.id, k.id, [y.id], ~T[11:30:00], mode: "list", results_returned: 90)
+      # One real search returning one result, followed through.
+      search_call(t.id, k.id, [x.id], ~T[12:00:00], mode: "combined", results_returned: 1)
+      event(t.id, k.id, x.id, "get", ~T[12:05:00])
+
+      m = RetrievalMetrics.compute(t.id, @day, 1800)
+
+      assert m.searched == 3
+      assert m.searches == 1
+      assert m.searches_with_follow_through == 1
+      assert m.search_follow_through == 1.0
+      assert m.results_returned == 1
+
+      # `results_returned >= searched` was documented as a property of the field and is
+      # FALSE on any mixed day: the two aggregate different row populations, so a
+      # consumer encoding it as a truncation check would misread this day.
+      assert m.results_returned < m.searched
     end
 
     test "a malformed results_returned value contributes 0 instead of crashing the snapshot",

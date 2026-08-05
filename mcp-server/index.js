@@ -6049,10 +6049,19 @@ const TOOLS = [
       "Denominators (#582): precision = followed_through / searched, and `searched` counts " +
       "surfaced RESULTS, not search calls (`results_surfaced` is the same number, named for " +
       "its unit). The per-CALL rate is separate: `search_follow_through` = " +
-      "searches_with_follow_through / searches — the share of SEARCHES that led to an open. " +
-      "`results_returned` is the true un-truncated result count (only the first 20 results " +
-      "per search are recorded, so searched < results_returned shows that cap). Days before " +
-      "#582 carry 0 in the call-level fields.\n\n" +
+      "searches_with_follow_through / searches — the share of QUERY-BEARING SEARCHES that " +
+      // The cap is enforced by Loopctl.Knowledge.Analytics.max_recorded_search_results/0
+      // (Elixir); this JS string cannot interpolate it, so change both together.
+      "led to an open. `results_returned` is the true un-truncated result count for those " +
+      "same calls (only the first 20 results per search are recorded, so it exceeds the " +
+      "rows those calls wrote whenever a page hit that cap).\n\n" +
+      "Call-level population: the four call-level fields are filtered per ROW, not per day " +
+      "— a row counts only if it carries a search identity (nothing recorded before #582 " +
+      "does) and is not a query-less enumeration page (list / list_keyset; browsing is not " +
+      "searching). A day that mixes qualifying and non-qualifying rows reports a PARTIAL " +
+      "searches / results_returned, not 0. Do NOT compare results_returned against " +
+      "searched: different row populations, so results_returned < searched is normal on a " +
+      "legacy-heavy or browse-heavy day.\n\n" +
       "Caveats: zero-result searches and keyless searches are structurally unrecordable and " +
       "sit in NO denominator, so both ratios are upper bounds; and both rise if a search " +
       "simply returns FEWER results, with no better retrieval. Never optimise either alone — " +

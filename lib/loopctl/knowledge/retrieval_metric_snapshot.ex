@@ -7,11 +7,21 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
   `searched` counts SURFACED RESULTS (one row per result a search put in front of an
   agent), never search calls — reading it as the latter is #582. The call-level series
   added by that fix answers the other question without redefining this one:
-  `searches` (distinct search calls), `searches_with_follow_through` /
+  `searches` (distinct QUERY-BEARING search calls), `searches_with_follow_through` /
   `search_follow_through` (the share of CALLS that led to an open), and
-  `results_returned` (the true un-truncated result count, ≥ `searched`, since only the
-  first 20 results per search are recorded). Days recorded before #582 carry `0`/`0.0`
-  in the four call-level columns.
+  `results_returned` (the true un-truncated result count for those same calls, since
+  only the first
+  #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} results per search are
+  recorded).
+
+  The four call-level columns are computed over a per-ROW subset: a row counts only if
+  it carries a `search_id` (nothing written before #582 does) and its `mode` is not a
+  query-less enumeration (`list` / `list_keyset`, written by the browse paths). So a day
+  that MIXES qualifying and non-qualifying rows — every day spanning the #582 deploy
+  does — carries a PARTIAL figure, not `0`; only a day with no qualifying row at all
+  reads `0`/`0.0`. For the same reason `results_returned` is NOT comparable to
+  `searched`: they aggregate different row populations, and `results_returned <
+  searched` is the normal shape of a legacy-heavy or browse-heavy day.
 
   Both ratios are gameable in the same direction — returning fewer results raises them
   with no better retrieval — so read them with the absolute `followed_through` and the

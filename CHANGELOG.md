@@ -16,9 +16,15 @@ Operator-facing changes for deployments outside the hosted instance.
   reports the per-CALL quantity separately, because the field name reads like a count of
   searches and was consumed that way. New fields: `results_surfaced` (same number as
   `searched`, named for its unit), `searches`, `searches_with_follow_through`,
-  `search_follow_through` (the share of search CALLS that led to an open), and
-  `results_returned` (the true un-truncated result count — only the first 20 results per
-  search are recorded, so `searched < results_returned` exposes that cap). Migration
+  `search_follow_through` (the share of QUERY-BEARING search CALLS that led to an open), and
+  `results_returned` (the true un-truncated result count for those same calls — only the first
+  20 results per search are recorded, so it exceeds the rows those calls wrote whenever a page
+  hit that cap). The four call-level fields are filtered per ROW, not per day: a row counts
+  only if it carries a search identity (nothing recorded before this release does) and is not
+  a query-less enumeration page (`list` / `list_keyset`, written by the browse endpoints —
+  browsing is not searching). So a day that MIXES qualifying and non-qualifying rows reports a
+  PARTIAL figure rather than `0`, and `results_returned` must NOT be compared against
+  `searched`: they aggregate different row populations. Migration
   `20260805130000_add_call_level_columns_to_retrieval_metric_snapshots.exs` adds the four
   backing columns with `default 0`; no manual step, and no backfill is possible — snapshots
   recorded before this release read `0` because their source events carry no search identity.

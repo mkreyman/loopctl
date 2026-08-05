@@ -63,6 +63,24 @@ defmodule Loopctl.Knowledge.Analytics do
   @spec valid_access_types() :: [String.t()]
   def valid_access_types, do: @valid_access_types
 
+  # How many of a search's results get an `article_access_events` row (#582). Rows are
+  # written per SURFACED RESULT, so an uncapped search would write an unbounded batch on
+  # every call. The cap makes the recorded row count an UNDERCOUNT of the results a search
+  # returned whenever a page exceeds it, which is why every batch also carries the true
+  # `"results_returned"` figure.
+  @max_recorded_search_results 20
+
+  @doc """
+  The cap on how many of a search's results are RECORDED as access events.
+
+  Public so the ENFORCING call site (`Knowledge.maybe_record_search_access/5`) and every
+  doc that publishes the cap (`RetrievalMetrics`, `RetrievalMetricSnapshot`, and the
+  `GET /knowledge/analytics/retrieval-metrics` OpenAPI description) read ONE number and
+  cannot drift — same discipline as `ArticleJSON.max_links_per_direction/0`.
+  """
+  @spec max_recorded_search_results() :: pos_integer()
+  def max_recorded_search_results, do: @max_recorded_search_results
+
   @typedoc """
   Optional metadata stored alongside the access event. Free-form map.
   Common keys: `"query"`, `"rank"`, `"score"`, `"mode"`.

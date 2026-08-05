@@ -20,13 +20,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   row incomparable.
 
 - **New response fields**: `results_surfaced` (the same number as `searched`, named for its
-  unit), `searches` (distinct search CALLS), `searches_with_follow_through` and
+  unit), `searches` (distinct QUERY-BEARING search CALLS), `searches_with_follow_through` and
   `search_follow_through` (the share of SEARCHES that led to an open — the quantity the
-  misreading had in mind), and `results_returned` (the true un-truncated result count). Only
-  the first 20 results of a search are recorded, so `searched < results_returned` now shows
-  where that cap bit instead of a truncated denominator passing as the whole result set. Days
-  recorded before this release carry 0 in the four call-level fields — their source events
-  have no search identity to reconstruct one from.
+  misreading had in mind), and `results_returned` (the true un-truncated result count for those
+  same calls). Only the first 20 results of a search are recorded, so `results_returned`
+  exceeds the rows those calls wrote whenever a page hit that cap. The four call-level fields
+  are filtered per ROW, not per day: a row counts only if it carries a search identity (nothing
+  recorded before this release does) and is not a query-less enumeration page (`list` /
+  `list_keyset` — browsing is not searching), so a day mixing both kinds reports a PARTIAL
+  figure rather than 0, and `results_returned` must not be compared against `searched`.
 
 - **The two structural exclusions are documented**: a search returning ZERO results and a
   search made without an api key are unrecordable (an access event requires both an article

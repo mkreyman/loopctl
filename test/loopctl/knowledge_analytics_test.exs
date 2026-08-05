@@ -5,6 +5,7 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.ArticleAccessEvent
 
   defp setup_tenant_with_agent do
@@ -155,24 +156,31 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
       assert Enum.all?(events, &(&1.metadata["results_returned"] == 2))
     end
 
-    test "#582: a search path records at most 20 rows but reports the TRUE results_returned" do
+    test "#582: a search path records at most `max_recorded_search_results` rows but reports the TRUE results_returned" do
       # The recording cap makes the row count an UNDERCOUNT of what the search returned.
       # If this figure were derived from the recorded rows it would just echo the cap;
       # it has to be threaded from the un-truncated result list at the search site.
+      #
+      # The expectation reads the cap from the module that OWNS it rather than repeating
+      # the literal, so raising the cap cannot leave this test asserting the old number
+      # while every doc that publishes it moves.
+      cap = Analytics.max_recorded_search_results()
+      over_cap = cap + 5
+
       {tenant, api_key} = setup_tenant_with_agent()
 
-      for _ <- 1..25 do
+      for _ <- 1..over_cap do
         fixture(:article, %{tenant_id: tenant.id, status: :published})
       end
 
       assert {:ok, %{results: results}} =
-               Knowledge.list_filtered(tenant.id, limit: 25, api_key_id: api_key.id)
+               Knowledge.list_filtered(tenant.id, limit: over_cap, api_key_id: api_key.id)
 
-      assert length(results) == 25
+      assert length(results) == over_cap
 
       events = AdminRepo.all(ArticleAccessEvent)
-      assert length(events) == 20
-      assert Enum.all?(events, &(&1.metadata["results_returned"] == 25))
+      assert length(events) == cap
+      assert Enum.all?(events, &(&1.metadata["results_returned"] == over_cap))
     end
   end
 

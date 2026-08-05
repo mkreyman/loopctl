@@ -38,6 +38,11 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   # OpenAPI description below is interpolated from it so the published contract cannot drift
   # from the enforced one either.
   @valid_access_types Analytics.valid_access_types()
+
+  # Same discipline as the line above: the published cap is READ from the module that
+  # enforces it (`Knowledge.maybe_record_search_access/5` takes exactly this many), so
+  # raising the cap cannot leave the API description stating the old number.
+  @max_recorded_search_results Analytics.max_recorded_search_results()
   @valid_group_by ~w(article project agent)
 
   operation(:top_articles,
@@ -311,11 +316,20 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "`searched` counts SURFACED RESULTS (one row per result a search put in front of " <>
         "an agent), NOT search calls; `results_surfaced` is the same number named for its " <>
         "unit. The per-CALL rate is reported separately as `search_follow_through` = " <>
-        "`searches_with_follow_through` / `searches` (distinct search calls) — that is " <>
-        "the 'share of searches that led to an open'. `results_returned` is the true " <>
-        "un-truncated result count; only the first 20 results per search are recorded, so " <>
-        "`searched` < `results_returned` shows where that cap bit. Days recorded before " <>
-        "#582 carry 0 in the four call-level fields.\n\n" <>
+        "`searches_with_follow_through` / `searches` (distinct QUERY-BEARING search " <>
+        "calls) — that is the 'share of searches that led to an open'. " <>
+        "`results_returned` is the true un-truncated result count for those same calls; " <>
+        "only the first #{@max_recorded_search_results} results per search are recorded, " <>
+        "so it exceeds the rows those calls wrote whenever a page hit that cap.\n\n" <>
+        "CALL-LEVEL POPULATION — the four call-level fields are computed per ROW, not " <>
+        "per day: a row counts only if it carries a search identity (nothing recorded " <>
+        "before #582 does) and is not a query-less enumeration page (`list` / " <>
+        "`list_keyset`, written by the browse endpoints — browsing is not searching). A " <>
+        "day that MIXES qualifying and non-qualifying rows therefore reports a PARTIAL " <>
+        "`searches` / `results_returned`, not 0; only a day with no qualifying row reads " <>
+        "0. Do NOT compare `results_returned` against `searched` — they aggregate " <>
+        "different row populations, so `results_returned` < `searched` is the normal " <>
+        "shape of a legacy-heavy or browse-heavy day.\n\n" <>
         "CAVEATS — searches returning ZERO results and searches made without an api key " <>
         "are structurally unrecordable and appear in NO denominator, so every ratio here " <>
         "is an upper bound. Both ratios also rise when a search simply returns FEWER " <>

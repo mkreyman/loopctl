@@ -23,17 +23,28 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   the payload also carries `results_surfaced` (the same number, named for its unit) and
   the per-CALL series alongside it:
 
-  - `searches` — distinct `metadata->>'search_id'` values, i.e. actual search calls.
+  - `searches` — distinct `metadata->>'search_id'` values, i.e. actual QUERY-bearing
+    search calls. Query-less enumeration (`list` / `list_keyset`) records `"search"`
+    rows too, and is EXCLUDED here: paging the corpus is browsing, not searching, and
+    counting a page as a search inflates the denominator with calls that were never
+    going to be "answered" by an open.
   - `searches_with_follow_through` / `search_follow_through` — the share of SEARCHES
     that led to at least one open. This is the quantity a reader who misreads
     `precision` has in mind; it is now computable instead of being confused for it.
-  - `results_returned` — the true, un-truncated number of results those searches
-    returned. Only the first 20 results per search get a row
-    (`Knowledge.maybe_record_search_access/5`), so `searched < results_returned` makes
-    that truncation visible rather than silent.
+  - `results_returned` — the true, un-truncated number of results those same counted
+    calls returned. Only the first
+    #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} results per search get
+    a row (`Knowledge.maybe_record_search_access/5`), so this exceeds the number of rows
+    those calls recorded whenever a page hit the cap.
 
-  Search calls recorded before #582 carry no `search_id` and contribute `0` to all four
-  call-level fields; they still contribute to `searched`/`precision` exactly as before.
+  The call-level filter is per ROW, not per day. A row qualifies only if it carries a
+  `search_id` (nothing written before #582 does) and a non-enumeration `mode`, so a day
+  that MIXES qualifying and non-qualifying rows — the first day after deploy always
+  does — reports a PARTIAL `searches`/`results_returned` rather than `0`. For the same
+  reason `results_returned` is NOT comparable to `searched`: the two are computed over
+  different row populations, and `results_returned < searched` is the normal reading of
+  a day whose rows are mostly legacy or enumeration. Compare `results_returned` against
+  the rows the COUNTED calls wrote, never against the day-wide `searched`.
 
   ## Two structural exclusions — precision is an UPPER BOUND
 
@@ -66,6 +77,16 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
 
   @default_window_seconds 1800
 
+  # `"search"` access rows are ALSO written by the query-less enumeration paths —
+  # `Knowledge.list_filtered/2` (mode `"list"`) and `Knowledge.list_keyset/2` (mode
+  # `"list_keyset"`). They belong in `searched` (they did surface results) but NOT in the
+  # per-CALL series, which is documented as counting search calls: an agent paging the
+  # corpus would otherwise add one "search" per page and drag `search_follow_through`
+  # toward zero without a single search having missed. Every other mode
+  # (`keyword`/`semantic`/`combined`/`combined_fallback`/`hybrid_*`) carries a query and
+  # is counted.
+  @enumeration_modes ~w(list list_keyset)
+
   @doc """
   Compute precision for a single `day` (a `Date`) and follow-through `window_seconds`.
 
@@ -75,7 +96,9 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   retrieved_searched, retrieved_followed_through, retrieved_precision}`.
 
   `searched` (and its self-describing twin `results_surfaced`) is a count of SURFACED
-  RESULTS; `searches` is a count of search CALLS. See the moduledoc for why both are
+  RESULTS; `searches` is a count of QUERY-BEARING search CALLS (enumeration pages and
+  pre-#582 rows carry no call identity and are excluded — the filter is per ROW, so a
+  mixed day reports a partial figure, not `0`). See the moduledoc for why both are
   reported and why neither ratio may be optimised alone.
 
   The `curated_*`/`retrieved_*` fields (US-31.2, AC-31.2.5) are the SAME
@@ -187,8 +210,18 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # and grouping on a NULL key would collapse every one of them into a single phantom
   # "search" — a fabricated denominator is worse than a missing one, so they contribute
   # 0 here and remain fully counted in `searched`/`precision`.
+  #
+  # Enumeration modes are excluded too (see `@enumeration_modes`): the row filter is per
+  # ROW, so a day mixing browse pages, legacy rows and real searches reports only the
+  # real searches here rather than an all-or-nothing 0.
   defp compute_call_level(searched_q, window_seconds) do
-    with_id = where(searched_q, [s], not is_nil(fragment("?->>'search_id'", s.metadata)))
+    with_id =
+      searched_q
+      |> where([s], not is_nil(fragment("?->>'search_id'", s.metadata)))
+      |> where(
+        [s],
+        fragment("coalesce(?->>'mode', '')", s.metadata) not in ^@enumeration_modes
+      )
 
     searches = count_distinct_searches(with_id)
     with_ft = with_id |> with_follow_through(window_seconds) |> count_distinct_searches()
