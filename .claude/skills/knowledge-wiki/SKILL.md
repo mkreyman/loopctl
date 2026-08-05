@@ -98,6 +98,24 @@ never pass `tenant_id`/`subject_id`.
    `ArticleAccessEvent.@access_types` requires the same value in `Analytics.@valid_access_types` —
    there is no DB CHECK, those two allowlists ARE the enforcement.
 
+6. **The `idem-` tag namespace is reserved, enforced at write time, and is NOT an idempotency
+   mechanism** — `Loopctl.Knowledge.IdempotencyTag`, enforced from the one place both changesets
+   converge (`validate_tag_format/2` in `article.ex`), so it binds every writer (API controllers,
+   `ContentIngestionWorker`, `ReviewKnowledgeWorker`, OKF import) rather than one call site — the
+   same reasoning as `Coordination`'s reserved `claim:` key prefix. A tag claiming the prefix must
+   be `idem-<family>-<digest>` with a **12- or 40-char** lowercase hex digest: both eras, because
+   the sourcers' suffix was truncated from a full sha1 to 12 and a rule that knew only the current
+   form is the drift bug that made pre-truncation captures invisible. Malformed → 422 naming the
+   remedy; **never** a silent re-prefix (rewriting a caller's tags makes the response body a lie).
+   The reservation is FORWARD-looking: pre-reservation tags carry the bare `<family>-<digest>` form
+   with no prefix to match on, so reads need the independent shape discriminator `legacy?/1`, and
+   the bare form is still WRITABLE until the client half (mkreyman/claude-config#222) adopts the
+   reserved form. `mix loopctl.reserve_idempotency_tags` promotes the corpus (dry-run default;
+   `--drop-legacy` is the second pass, only after clients switch).
+   **What this is not:** a tag is caller-controlled data, so reserving its namespace is defense in
+   depth, not authority. The server-guaranteed key is the `articles.idempotency_key` column with
+   its per-tenant unique index — prefer it, and do not treat a tag as proof of capture identity.
+
 ## Ranking changes are gated by the golden-question eval (#469)
 
 Any change to `search_combined/3` ranking (weights, fusion, recency/authority) must ship with a

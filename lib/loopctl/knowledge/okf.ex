@@ -51,6 +51,7 @@ defmodule Loopctl.Knowledge.OKF do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.IdempotencyTag
 
   @okf_version "0.1"
 
@@ -709,10 +710,17 @@ defmodule Loopctl.Knowledge.OKF do
   # loopctl tags must match ~r/^[a-zA-Z0-9_-]+$/ (<=50 tags, <=100 chars). OKF
   # tags are free strings, so sanitize foreign tags to fit; the originals are
   # preserved under metadata["okf"]["tags"] for lossless re-export.
+  #
+  # A foreign tag can sanitize INTO the reserved idempotency namespace (#583) —
+  # "idem url 7ebe1ca33431" becomes "idem-url-7ebe1ca33431". Those are DROPPED,
+  # well-formed ones included: an imported document must never claim a capture
+  # identity it does not own, and this path coerces rather than fails (a whole
+  # import must not die on one foreign tag). The drop is lossless — the original
+  # string is retained under metadata["okf"]["tags"].
   defp sanitize_tags(tags) do
     tags
     |> Enum.map(&sanitize_tag/1)
-    |> Enum.reject(&(&1 == ""))
+    |> Enum.reject(&(&1 == "" or IdempotencyTag.reserved?(&1)))
     |> Enum.uniq()
     |> Enum.take(20)
   end

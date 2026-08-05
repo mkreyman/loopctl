@@ -13,7 +13,9 @@ defmodule Loopctl.Knowledge.Article do
   - `body` -- full article content (text, max 100KB)
   - `category` -- knowledge type; see `Loopctl.Knowledge.Categories`
   - `status` -- lifecycle state: draft, published, archived, superseded
-  - `tags` -- array of alphanumeric tag strings for categorization
+  - `tags` -- array of alphanumeric tag strings for categorization. The
+    `Loopctl.Knowledge.IdempotencyTag.reserved_prefix/0` namespace is reserved
+    for per-source idempotency keys and is validated by shape (#583)
   - `source_type` -- advisory origin type: "review_finding", "manual", "agent", "session_log"
   - `source_id` -- optional FK to the originating entity
   - `project_id` -- optional FK to projects (null = tenant-wide)
@@ -28,6 +30,7 @@ defmodule Loopctl.Knowledge.Article do
   use Loopctl.Schema
 
   alias Loopctl.Embeddings.Dimensions
+  alias Loopctl.Knowledge.IdempotencyTag
 
   @type t :: %__MODULE__{}
 
@@ -397,6 +400,13 @@ defmodule Loopctl.Knowledge.Article do
 
         not Regex.match?(@tag_pattern, tag) ->
           add_error(cs, :tags, "tag %{tag} contains invalid characters", tag: tag)
+
+        # The reserved idempotency namespace (#583). Enforced HERE, in the one
+        # validation both create_changeset/2 and update_changeset/2 run, because
+        # the namespace guarantee every idempotency read depends on must be
+        # enforced by every writer, not by one call site.
+        IdempotencyTag.reserved?(tag) and not IdempotencyTag.well_formed?(tag) ->
+          add_error(cs, :tags, IdempotencyTag.reserved_violation_message(), tag: tag)
 
         true ->
           cs

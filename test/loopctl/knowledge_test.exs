@@ -9,6 +9,7 @@ defmodule Loopctl.KnowledgeTest do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.Categories
+  alias Loopctl.Knowledge.IdempotencyTag
 
   defp setup_tenant do
     tenant = fixture(:tenant)
@@ -161,6 +162,98 @@ defmodule Loopctl.KnowledgeTest do
       refute Enum.any?(changeset.constraints, fn c ->
                c.field == :tenant_id and c.constraint == "articles_tenant_title_active_idx"
              end)
+    end
+  end
+
+  describe "reserved idempotency tag namespace binds every context writer (#583)" do
+    # The guard lives on the two changesets, which is the ONE point every writer
+    # converges on — the API controllers, ContentIngestionWorker,
+    # ReviewKnowledgeWorker and OKF all reach the DB through create_article/3 or
+    # update_article/4. These tests pin that chokepoint at the context level.
+    test "create_article/3 rejects free text in the reserved namespace" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Reserved Ctx",
+                 body: "body",
+                 category: :reference,
+                 tags: ["idem-design"]
+               })
+
+      errors = errors_on(changeset)[:tags]
+      assert errors != nil and errors != []
+      assert Enum.any?(errors, &String.contains?(&1, IdempotencyTag.reserved_prefix()))
+    end
+
+    test "create_article/3 accepts a well-formed reserved tag" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, article} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Reserved Ctx OK",
+                 body: "body",
+                 category: :reference,
+                 tags: ["idem-url-7ebe1ca33431", "url-design"]
+               })
+
+      assert "idem-url-7ebe1ca33431" in article.tags
+    end
+
+    test "update_article/4 rejects free text in the reserved namespace" do
+      %{tenant: tenant} = setup_tenant()
+      article = fixture(:article, %{tenant_id: tenant.id, tags: ["url-design"]})
+
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Knowledge.update_article(tenant.id, article.id, %{tags: ["idem-nope"]})
+
+      assert errors_on(changeset)[:tags] != []
+      assert AdminRepo.get!(Article, article.id).tags == ["url-design"]
+    end
+
+    test "tenant isolation: the guard applies per tenant and neither tenant's tags leak" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      assert {:error, _} =
+               Knowledge.create_article(tenant_a.id, %{
+                 title: "A reserved",
+                 body: "b",
+                 category: :reference,
+                 tags: ["idem-oops"]
+               })
+
+      assert {:error, _} =
+               Knowledge.create_article(tenant_b.id, %{
+                 title: "B reserved",
+                 body: "b",
+                 category: :reference,
+                 tags: ["idem-oops"]
+               })
+
+      # A well-formed reserved tag is per-tenant free text: both tenants may hold
+      # the same one, and neither can read the other's.
+      assert {:ok, _} =
+               Knowledge.create_article(tenant_a.id, %{
+                 title: "A ok",
+                 body: "b",
+                 category: :reference,
+                 tags: ["idem-url-7ebe1ca33431"]
+               })
+
+      assert {:ok, _} =
+               Knowledge.create_article(tenant_b.id, %{
+                 title: "B ok",
+                 body: "b",
+                 category: :reference,
+                 tags: ["idem-url-7ebe1ca33431"]
+               })
+
+      %{data: a_articles} = Knowledge.list_articles(tenant_a.id, tags: ["idem-url-7ebe1ca33431"])
+      %{data: b_articles} = Knowledge.list_articles(tenant_b.id, tags: ["idem-url-7ebe1ca33431"])
+
+      assert Enum.map(a_articles, & &1.title) == ["A ok"]
+      assert Enum.map(b_articles, & &1.title) == ["B ok"]
     end
   end
 

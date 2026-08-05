@@ -4,6 +4,7 @@ defmodule Loopctl.Knowledge.OKFTest do
   setup :verify_on_exit!
 
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.IdempotencyTag
   alias Loopctl.Knowledge.OKF
 
   @fixtures_root Path.join([File.cwd!(), "test", "support", "okf_fixtures"])
@@ -338,6 +339,39 @@ defmodule Loopctl.Knowledge.OKFTest do
       extra = okf_meta["extra"] || %{}
       refute Map.has_key?(extra, "loopctl_links_truncated")
       refute Map.has_key?(okf_meta, "loopctl_links_truncated")
+    end
+  end
+
+  describe "#583: a foreign tag that sanitizes into the reserved namespace is dropped" do
+    test "the import succeeds, the reserved-shaped tag is not stored, and the original survives" do
+      tenant = fixture(:tenant)
+
+      # OKF tags are free strings. Sanitization maps runs of illegal characters to
+      # "-", so these two foreign tags land on "idem-url-7ebe1ca33431" (well-formed)
+      # and "idem-design" (free text) — one of each side of the guard.
+      frontmatter =
+        ~s(---\ntype: pattern\ntitle: Foreign Tags\n) <>
+          ~s(tags: ["idem url 7ebe1ca33431", "idem design", "url design", "ecto"]\n) <>
+          ~s(---\n\nbody\n)
+
+      files = %{"pattern/x.md" => frontmatter}
+
+      assert {:ok, report} = OKF.import_files(tenant.id, files)
+      assert report.created == 1
+      assert report.errors == []
+
+      %{data: [a]} = Knowledge.list_articles(tenant.id, category: :pattern)
+
+      reserved =
+        Enum.filter(a.tags, &String.starts_with?(&1, IdempotencyTag.reserved_prefix()))
+
+      assert reserved == []
+      # The import is not gutted: topical tags still make it through.
+      assert "url-design" in a.tags
+      assert "ecto" in a.tags
+
+      # And the drop is lossless — the originals stay under metadata["okf"]["tags"].
+      assert "idem url 7ebe1ca33431" in a.metadata["okf"]["tags"]
     end
   end
 
