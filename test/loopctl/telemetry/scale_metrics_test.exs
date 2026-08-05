@@ -1078,11 +1078,23 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       test_pid = self()
       handler_id = "test-guarded-measurement-#{System.unique_integer([:positive])}"
 
+      # `:telemetry.execute/3` runs handlers in the EMITTING process, so `self()` inside this
+      # handler is whoever fired the event. Forward only what THIS test process emitted.
+      #
+      # Scoping by the `poller:` NAME is not enough and #558 already tried it: the app's own
+      # 10s `telemetry_poller` shares this VM and emits the SAME `poller: :queue_state`
+      # events. When its sandbox owner terminates mid-suite it fires a
+      # `DBConnection.OwnershipError` poll error, which matched the `refute_receive` below
+      # and reddened CI at random — observed on run 31001046231, on a branch whose diff
+      # touched neither this file nor telemetry.
+      #
+      # It also silently weakened the `assert_receive`s: app noise carrying the right poller
+      # name could satisfy them without this module's guard having fired at all.
       :telemetry.attach(
         handler_id,
         [:loopctl, :oban, :poll, :error],
         fn _event, measurements, metadata, _config ->
-          send(test_pid, {:poll_error, metadata, measurements})
+          if self() == test_pid, do: send(test_pid, {:poll_error, metadata, measurements})
         end,
         nil
       )
@@ -1195,11 +1207,14 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       test_pid = self()
       handler_id = "test-gate-poll-error-#{System.unique_integer([:positive])}"
 
+      # Same emitter scoping as the guarded_measurement setup above — the app's real poller
+      # emits `poller: :tenant_label_gate` too, and its OwnershipError noise appeared in the
+      # very failure that prompted this fix.
       :telemetry.attach(
         handler_id,
         [:loopctl, :oban, :poll, :error],
         fn _event, measurements, metadata, _config ->
-          send(test_pid, {:poll_error, metadata, measurements})
+          if self() == test_pid, do: send(test_pid, {:poll_error, metadata, measurements})
         end,
         nil
       )
