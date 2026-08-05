@@ -524,8 +524,15 @@ defmodule Loopctl.EmbeddingsTest do
 
     test "no lib/ module outside a migration issues CREATE INDEX" do
       # `repo/hnsw_index.ex` BUILDS the SQL but is only ever CALLED from a migration
-      # (asserted below); `index_health.ex` only ever RENDERS remediation advice.
-      allowed = ["lib/loopctl/repo/hnsw_index.ex", "lib/loopctl/index_health.ex"]
+      # (asserted below); `index_health.ex` only ever RENDERS remediation advice; the
+      # `loopctl.embeddings` mix task is the OPERATOR plane and likewise only renders —
+      # its GH #578 revert refusal prints the rebuild for a human to run (asserted
+      # below: it never hands the DDL to a repo).
+      allowed = [
+        "lib/loopctl/repo/hnsw_index.ex",
+        "lib/loopctl/index_health.ex",
+        "lib/mix/tasks/loopctl.embeddings.ex"
+      ]
 
       offenders =
         Path.wildcard("lib/**/*.ex")
@@ -536,6 +543,21 @@ defmodule Loopctl.EmbeddingsTest do
 
       assert offenders == [],
              "index DDL is migration/operator plane only, found in: #{inspect(offenders)}"
+
+      # "Operator plane" must not become a blanket exemption for a file that could
+      # quietly grow a LIVE `CREATE INDEX`. The task renders the rebuild into a string
+      # for a human to run; every repo call it makes is a catalog SELECT.
+      task_source = File.read!("lib/mix/tasks/loopctl.embeddings.ex")
+
+      verbs =
+        ~r/(?:query!?|execute)\(\s*"{0,3}\s*\n?\s*([A-Za-z]+)/
+        |> Regex.scan(task_source)
+        |> Enum.map(fn [_full, verb] -> String.upcase(verb) end)
+
+      refute verbs == [], "expected the operator task to make at least one repo call"
+
+      assert Enum.all?(verbs, &(&1 == "SELECT")),
+             "the operator task must RENDER index DDL, never execute it; found: #{inspect(verbs)}"
 
       # And no REQUEST-PATH module reaches the DDL builder at all.
       callers =

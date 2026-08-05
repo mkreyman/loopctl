@@ -423,8 +423,14 @@ defmodule Loopctl.Memory.ScaleSeed do
   end
 
   # The recall inner ANN is served by the partial HNSW index
-  # `memories_live_embedding_hnsw_idx` (WHERE superseded_by IS NULL). Scale
-  # assertions are meaningless without it — fail loudly if migrations weren't run.
+  # `memories_live_embedding_hnsw_idx` (WHERE superseded_by IS NULL), or — on an
+  # install cut over to the side table — by `memory_embeddings_hnsw_dim_<dim>_idx`.
+  # Both count (GH #578): which one serves reads is install-dependent on
+  # `embedding_side_table_reads`, so scoping this to `memories` alone would abort the
+  # scale gate on a cut-over install with a remedy that had already been applied.
+  # `memories` keeps both of its legacy indexes today, so only the message matters
+  # here — the widened scope is the same correction applied to the articles check.
+  # Scale assertions are meaningless without an index — fail loudly.
   defp assert_hnsw_index_present! do
     %{rows: rows} =
       AdminRepo.query!("""
@@ -432,13 +438,15 @@ defmodule Loopctl.Memory.ScaleSeed do
       FROM pg_indexes idx
       JOIN pg_class cls ON cls.relname = idx.indexname
       JOIN pg_am am ON am.oid = cls.relam
-      WHERE idx.tablename = 'memories'
+      WHERE idx.tablename IN ('memories', 'memory_embeddings')
         AND am.amname = 'hnsw'
       LIMIT 1
       """)
 
     if rows == [] do
-      raise "No HNSW index on memories.embedding detected. Run mix ecto.migrate before seeding at scale."
+      raise "No HNSW index on memories.embedding or memory_embeddings detected. " <>
+              "Run mix ecto.migrate before seeding at scale; if migrations have run, " <>
+              "check the embedding_side_table_reads flag (GH #578)."
     end
 
     :ok

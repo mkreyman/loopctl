@@ -598,12 +598,19 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   end
 
   @doc """
-  Returns `true` if an HNSW index on `articles.embedding` is present,
-  detected by capability rather than by a hard-coded index name.
+  Returns `true` if an HNSW index serves the article ANN read path, on EITHER
+  relation that can carry it, detected by capability rather than by a hard-coded
+  index name.
 
-  Queries `pg_indexes JOIN pg_am` for `amname = 'hnsw'` to tolerate
-  index-name drift between environments (e.g. `articles_embedding_idx`
-  in test vs `articles_embedding_hnsw_idx` in prod).
+  Queries `pg_indexes JOIN pg_am` for `amname = 'hnsw'` to tolerate index-name
+  drift between environments (e.g. `articles_embedding_idx` in test vs
+  `articles_embedding_hnsw_idx` in prod).
+
+  Both `articles` and `article_embeddings` count (GH #578): which one serves reads
+  is install-dependent on the `embedding_side_table_reads` flag, and a cut-over
+  install has its legacy `articles` index RETIRED by design. Scoping this to
+  `articles` alone made the scale gate abort on exactly that install — with a
+  "run migrations" remedy that had already run.
   """
   @spec hnsw_index_present?() :: boolean()
   def hnsw_index_present? do
@@ -613,7 +620,7 @@ defmodule Loopctl.Knowledge.ScaleSeed do
       FROM pg_indexes idx
       JOIN pg_class cls ON cls.relname = idx.indexname
       JOIN pg_am am ON am.oid = cls.relam
-      WHERE idx.tablename = 'articles'
+      WHERE idx.tablename IN ('articles', 'article_embeddings')
         AND am.amname = 'hnsw'
       LIMIT 1
       """)
@@ -696,9 +703,12 @@ defmodule Loopctl.Knowledge.ScaleSeed do
       :ok
     else
       {:error,
-       "No HNSW index on articles.embedding detected via pg_indexes/pg_am. " <>
-         "Run migrations (mix ecto.migrate) before seeding at scale. " <>
-         "Scale assertions are meaningless without the index."}
+       "No HNSW index on articles.embedding or article_embeddings detected via " <>
+         "pg_indexes/pg_am. Run migrations (mix ecto.migrate) before seeding at scale; " <>
+         "if they HAVE run, check the embedding_side_table_reads flag — the legacy " <>
+         "articles index is retired on a cut-over install (GH #578) and the live index " <>
+         "is article_embeddings_hnsw_dim_<dim>_idx. Scale assertions are meaningless " <>
+         "without an index."}
     end
   end
 
