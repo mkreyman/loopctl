@@ -1917,6 +1917,11 @@ defmodule Loopctl.Embeddings do
         where:
           not exists(
             from(ae in ArticleEmbedding,
+              # Tenant-scoped like every sibling anti-join here. Not exploitable today (the
+              # outer scan is already tenant-owned articles), but the failure direction is a
+              # FALSE NEGATIVE — an article wrongly classed "already embedded" and left
+              # unsearchable, which is the exact defect this function exists to close.
+              where: ae.tenant_id == ^tenant_id,
               where: ae.article_id == parent_as(:article).id,
               select: 1
             )

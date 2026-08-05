@@ -54,7 +54,12 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   use Oban.Worker,
     queue: :embeddings,
     max_attempts: 4,
-    unique: [keys: [:article_id], period: 300],
+    # `:tenant_id` is part of the key, not just `:article_id`. Article ids are GLOBAL, and a
+    # SYSTEM canonical is enumerated for re-embedding by EVERY tenant — so keying on the id
+    # alone made two tenants' repair jobs collide inside the 300s window, deduping one away
+    # or (with `replace:` below) overwriting its args. `SystemCorpusEmbeddingWorker` already
+    # keys on `[:tenant_id, :dim]` for the same reason.
+    unique: [keys: [:tenant_id, :article_id], period: 300],
     replace: [scheduled: [:args, :scheduled_at]]
 
   require Logger

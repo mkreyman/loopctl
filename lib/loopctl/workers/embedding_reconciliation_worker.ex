@@ -136,8 +136,33 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorker do
     active = Embeddings.active_dimension(tenant_id)
     batch = 100
 
-    articles = Embeddings.pending_reembed_articles(tenant_id, active, batch)
+    # System canonicals are FILTERED OUT, not enqueued. `pending_reembed_articles/3`
+    # deliberately returns them (a canonical is materialized per tenant on the EMBEDDING
+    # row, so it is genuinely this tenant's gap) — but `ArticleEmbeddingWorker` resolves its
+    # article with `a.tenant_id == ^tenant_id`, which a canonical's NULL tenant can never
+    # satisfy. It returned `{:error, :not_found}`, which `embed/2` maps to `:ok` as "article
+    # deleted", so the job SUCCEEDED, repaired nothing, and re-enqueued every hour forever.
+    #
+    # That is precisely the failure this worker's own moduledoc describes closing — ran
+    # hourly, reported healthy, fixed nothing — reproduced one class over. Canonicals have
+    # their own repair path (`SystemCorpusEmbeddingWorker` /
+    # `Embeddings.stale_system_articles/3`); routing them there is correct, and widening
+    # `get_article_with_embedding/2` instead would re-open the global-slot clobber that
+    # `own_tenant_article?/2` exists to prevent.
+    {articles, canonicals} =
+      tenant_id
+      |> Embeddings.pending_reembed_articles(active, batch)
+      |> Enum.split_with(&(&1.scope != :system))
+
     memories = Embeddings.pending_reembed_memories(tenant_id, active, batch)
+
+    if canonicals != [] do
+      Logger.info(
+        "EmbeddingReconciliationWorker: tenant=#{tenant_id} skipped #{length(canonicals)} " <>
+          "system canonical(s) at the active-dimension gap — they are repaired by " <>
+          "SystemCorpusEmbeddingWorker, not by the per-tenant article worker."
+      )
+    end
 
     Enum.each(articles, fn article ->
       %{tenant_id: tenant_id, article_id: article.id}
