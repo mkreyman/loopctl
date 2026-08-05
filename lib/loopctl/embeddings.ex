@@ -1883,6 +1883,53 @@ defmodule Loopctl.Embeddings do
     end
   end
 
+  @doc """
+  Published articles for a tenant that have NO side-table embedding row **at any dimension**.
+
+  The third drift class, and the one the reconciliation sweep was blind to. Its two existing
+  classes both presuppose a PARTIAL write:
+
+    * the dual-write crash window needs `articles.embedding` populated without its mirror;
+    * the active-dimension gap needs a row at SOME dimension but not the active one.
+
+  An article that was never embedded at all matches neither, so it had no repair path
+  whatsoever — it is simply absent from every semantic search, silently and permanently.
+  Measured on the hosted corpus 2026-08-05: **81 published articles**, oldest 2026-06-19,
+  newest 2026-07-22, all with real bodies, none carrying a legacy `articles.embedding` and
+  none carrying a side-table row of any dimension. Six weeks unsearchable while an hourly
+  reconciler reported healthy.
+
+  Deliberately NOT keyed to the active dimension: the question here is existence, not
+  currency. A row at the wrong dimension is the OTHER class's business, and asking about the
+  active dimension here would re-introduce the same blindness one level down.
+
+  Empty bodies are excluded — they cannot produce a meaningful embedding, so enqueuing them
+  would generate a permanent retry loop against the provider rather than a repair.
+  """
+  @spec unembedded_articles(Ecto.UUID.t(), pos_integer()) :: [Article.t()]
+  def unembedded_articles(tenant_id, limit) when is_binary(tenant_id) and is_integer(limit) do
+    AdminRepo.all(
+      from(a in Article,
+        as: :article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.status == :published,
+        where: not is_nil(a.body) and fragment("length(btrim(?)) > 0", a.body),
+        where:
+          not exists(
+            from(ae in ArticleEmbedding,
+              where: ae.article_id == parent_as(:article).id,
+              select: 1
+            )
+          ),
+        # Oldest first: an article unsearchable since June has been failing longer than one
+        # ingested this morning, and a bounded run should repair the longest-standing gap
+        # first rather than an arbitrary slice.
+        order_by: [asc: a.inserted_at],
+        limit: ^limit
+      )
+    )
+  end
+
   @doc "The memories twin of `pending_reembed_articles/3`."
   @spec pending_reembed_memories(Ecto.UUID.t(), pos_integer(), pos_integer()) :: [Memory.t()]
   def pending_reembed_memories(tenant_id, target_dim, limit)
