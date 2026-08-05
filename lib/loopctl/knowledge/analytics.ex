@@ -365,11 +365,19 @@ defmodule Loopctl.Knowledge.Analytics do
   # vector scan — so deep offset is safe). A secondary `a.id` order keeps paging
   # stable across rows with equal counts.
   defp list_top_by_article(tenant_id, since, access_type, project_id, limit, offset) do
+    # The join admits SYSTEM canonicals as well as this tenant's own articles, matching
+    # `heat_counts_query`/`heat_article_ids` in `Loopctl.Knowledge`. A canonical has a NULL
+    # `tenant_id`, so `a.tenant_id == ^tenant_id` silently dropped every read of one — the
+    # EVENT rows were tenant-scoped and counted, the ARTICLE join then threw them away. Since
+    # #572 made canonicals readable through `knowledge_get`, that meant heat_index ranked reads
+    # this surface reported as never having happened, for the same tenant on the same corpus.
+    # The `e.tenant_id == ^tenant_id` predicate below is what scopes the data; this join is
+    # resolving a title, and it must not narrow the set a second time.
     query =
       from(e in ArticleAccessEvent,
         as: :event,
         join: a in Article,
-        on: a.id == e.article_id and a.tenant_id == ^tenant_id,
+        on: a.id == e.article_id and (a.tenant_id == ^tenant_id or a.scope == :system),
         where: e.tenant_id == ^tenant_id,
         where: e.accessed_at >= ^since,
         group_by: [a.id, a.title, a.category],
@@ -624,7 +632,7 @@ defmodule Loopctl.Knowledge.Analytics do
     top_articles =
       from(e in ArticleAccessEvent,
         join: a in Article,
-        on: a.id == e.article_id and a.tenant_id == ^tenant_id,
+        on: a.id == e.article_id and (a.tenant_id == ^tenant_id or a.scope == :system),
         where: e.tenant_id == ^tenant_id,
         where: e.api_key_id == ^api_key_id,
         where: e.accessed_at >= ^since,
@@ -709,7 +717,7 @@ defmodule Loopctl.Knowledge.Analytics do
     top_articles =
       from(e in ArticleAccessEvent,
         join: a in Article,
-        on: a.id == e.article_id and a.tenant_id == ^tenant_id,
+        on: a.id == e.article_id and (a.tenant_id == ^tenant_id or a.scope == :system),
         where: e.tenant_id == ^tenant_id,
         where: e.api_key_id in subquery(live_keys),
         where: e.accessed_at >= ^since,
@@ -823,7 +831,7 @@ defmodule Loopctl.Knowledge.Analytics do
     top_articles =
       from(e in ArticleAccessEvent,
         join: a in Article,
-        on: a.id == e.article_id and a.tenant_id == ^tenant_id,
+        on: a.id == e.article_id and (a.tenant_id == ^tenant_id or a.scope == :system),
         where: e.tenant_id == ^tenant_id,
         where: e.project_id == ^project.id,
         where: e.accessed_at >= ^since,

@@ -180,7 +180,10 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
       429 =>
         {"Rate limit exceeded, or the read was SHED — a heavy-read slot or an admin-pool " <>
-           "checkout was unavailable. Retryable; only saturation degrades this way.",
+           "checkout was unavailable. Usually saturation and retryable. One cause is NOT: " <>
+           "with ADMIN_POOL_SIZE < 2 the node-wide admin bound (pool - 1) admits nothing and " <>
+           "this endpoint 429s permanently on an idle node. That is operator config, not " <>
+           "backpressure, and retrying will not clear it — see deploy/FLY_SECRETS.md.",
          "application/json", Schemas.RateLimitError},
       500 =>
         {"A deterministic database fault (not saturation) — retrying will not clear it",

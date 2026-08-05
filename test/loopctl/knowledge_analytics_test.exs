@@ -242,6 +242,37 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
       assert "Cold" in titles
     end
 
+    test "a read of a SYSTEM canonical is reported, not silently dropped by the join" do
+      # A canonical has a NULL tenant_id, so joining on `a.tenant_id == ^tenant_id` threw away
+      # every read of one: the EVENT rows were tenant-scoped and counted, the ARTICLE join then
+      # discarded them. Since #572 made canonicals readable via knowledge_get, heat_index
+      # ranked reads this surface reported as never having happened — same tenant, same corpus,
+      # two answers. Non-vacuous: narrow the join back and this test fails, because "Canon"
+      # disappears from the rows entirely.
+      tenant = fixture(:tenant)
+      {_raw, agent} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      own = fixture(:article, %{tenant_id: tenant.id, title: "Own", status: :published})
+
+      canon =
+        fixture(:article, %{tenant_id: tenant.id, title: "Canon", status: :published})
+        |> Ecto.Changeset.change(%{scope: :system, tenant_id: nil})
+        |> AdminRepo.update!()
+
+      Knowledge.record_access(tenant.id, own.id, agent.id, "get")
+
+      for _ <- 1..2 do
+        Knowledge.record_access(tenant.id, canon.id, agent.id, "get")
+      end
+
+      rows = Knowledge.list_top_articles(tenant.id, since: hours_ago(1))
+      titles = Enum.map(rows, & &1.title)
+
+      assert "Canon" in titles, "a system canonical's reads were dropped by the article join"
+      assert "Own" in titles
+      assert Enum.find(rows, &(&1.title == "Canon")).access_count == 2
+    end
+
     test "filters by access_type" do
       tenant = fixture(:tenant)
       {_raw, agent} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
