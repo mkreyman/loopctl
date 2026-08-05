@@ -3,8 +3,11 @@ defmodule Loopctl.KnowledgeEmbeddingTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.AdminRepo
+  alias Loopctl.Embeddings
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Repo.HnswIndex
 
   defp setup_tenant do
     tenant = fixture(:tenant)
@@ -170,22 +173,77 @@ defmodule Loopctl.KnowledgeEmbeddingTest do
     end
   end
 
-  # TC-20.2.7: HNSW index exists
-  # US-27.14: reconciled to the single canonical name `articles_embedding_hnsw_idx`
-  # (matches prod). The reconcile migration renames the old migration's
-  # `articles_embedding_idx` to this name in every env, so the assertion is now
-  # exact rather than name-agnostic (still asserting the hnsw access method).
+  # TC-20.2.7: the ANN index that serves THIS install's read path exists.
+  #
+  # US-27.14 reconciled the legacy index to the single canonical name
+  # `articles_embedding_hnsw_idx`. GH #578 then RETIRED it — but only on installs whose
+  # reads have been cut over to the `article_embeddings` side table, because
+  # `embedding_side_table_reads` defaults to `0` (= the legacy `articles.embedding`
+  # column) in code and no migration seeds the row.
+  #
+  # So "the legacy index exists" is no longer an invariant, and its negation is not one
+  # either. The invariant that survives #578 — and the one worth a test — is that the
+  # index serving the LIVE read path is present and USABLE, and that the legacy index is
+  # present exactly when the legacy column is still the live read path. That is
+  # mechanically the same condition the drop migration guards on
+  # (`20260805120000_drop_legacy_articles_embedding_hnsw_index.exs`), so a migration
+  # that dropped unconditionally would fail here.
   describe "HNSW index" do
-    test "articles_embedding_hnsw_idx exists on articles table" do
-      result =
-        Loopctl.AdminRepo.query!(
-          "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'articles' AND indexname = 'articles_embedding_hnsw_idx'"
-        )
+    test "the live ANN index is present and VALID" do
+      # `pg_indexes` also lists INVALID indexes — the leftover a failed
+      # `CREATE INDEX CONCURRENTLY` produces (wiki ed00911b) — so presence is checked
+      # via `pg_index.indisvalid`, never by name alone (wiki 753fbf69).
+      live = HnswIndex.dimension_index_name("article_embeddings", 1536)
 
-      assert length(result.rows) == 1
-      [[_name, indexdef]] = result.rows
-      assert indexdef =~ "hnsw"
-      assert indexdef =~ "vector_cosine_ops"
+      assert index_valid?(live),
+             "the per-dimension side-table ANN index #{live} must exist and be valid"
     end
+
+    test "the legacy index exists exactly when the legacy column is the live read path" do
+      %{rows: rows} =
+        AdminRepo.query!("SELECT value FROM system_configs WHERE key = $1", [
+          Embeddings.read_flag_key()
+        ])
+
+      # Read from the ROW, not `SystemConfig.get_int/2`: the `:persistent_term` cache
+      # answers the in-code default on a miss, which is the same value an absent row
+      # means — indistinguishable, and the migration guards on the row.
+      legacy_column_is_live? = not match?([[1]], rows)
+
+      if legacy_column_is_live? do
+        assert index_valid?("articles_embedding_hnsw_idx"),
+               "the legacy articles.embedding column is still this install's read path, " <>
+                 "so its HNSW index must NOT have been dropped — an unindexed legacy " <>
+                 "read path is a full seq scan + top-N sort over the corpus"
+
+        %{rows: [[indexdef]]} =
+          AdminRepo.query!(
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'articles' AND indexname = 'articles_embedding_hnsw_idx'"
+          )
+
+        assert indexdef =~ "hnsw"
+        assert indexdef =~ "vector_cosine_ops"
+      else
+        refute index_valid?("articles_embedding_hnsw_idx"),
+               "reads are cut over to the side table, so the legacy 657 MB index is " <>
+                 "retired (GH #578) — it only evicts the live index from shared_buffers"
+      end
+    end
+  end
+
+  defp index_valid?(name) do
+    %{rows: rows} =
+      AdminRepo.query!(
+        """
+        SELECT i.indisvalid
+        FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = $1 AND n.nspname = 'public'
+        """,
+        [name]
+      )
+
+    rows == [[true]]
   end
 end

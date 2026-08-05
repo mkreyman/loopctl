@@ -335,6 +335,65 @@ defmodule Loopctl.Embeddings.LegacyRetirementTest do
       assert Enum.any?(verdict.reasons, &(&1 =~ "went BACKWARDS"))
     end
 
+    # GH #578 acceptance bullet 3 — "the observer keeps reporting side_table_reads = 1
+    # with the legacy index GONE from its scan map." Retiring
+    # `articles_embedding_hnsw_idx` produces a shape no other test here covers: an index
+    # PRESENT at the start of the window and ABSENT afterwards. Every existing guard is
+    # about an index APPEARING (`absent at the start`) or a counter MOVING; a
+    # disappearing one is neither, and must not be mistaken for either — an absence read
+    # as a counter would look like `0`, i.e. a counter that went BACKWARDS, and would
+    # jam the trigger at `:not_due` forever on exactly the installs that completed the
+    # retirement. (`window_scans/2` filters non-integers, which is what makes this hold.)
+    test "the ARTICLES index dropped mid-window is still :due — a retired index is not a rebuilt one" do
+      # Both legacy indexes present throughout; `memories` deliberately keeps its two
+      # (US-38.4 / TC-38.4.3), so a real post-#578 window is never empty.
+      clear_window(
+        scans: %{"articles_embedding_hnsw_idx" => 674, "memories_live_embedding_hnsw_idx" => 0}
+      )
+
+      # The drop lands on the last day.
+      AdminRepo.update_all(
+        from(o in RetirementObservation, where: o.observed_on == ^@today),
+        set: [legacy_index_scans: %{"memories_live_embedding_hnsw_idx" => 0}]
+      )
+
+      verdict = evaluate(probe())
+
+      assert verdict.verdict == :due
+      assert verdict.trigger == :evidence
+      assert verdict.clear_days == @required
+
+      # The disappearance contributed NO defect of its own: not a scan, not a rebuild,
+      # not an index that was absent at the start.
+      refute Enum.any?(verdict.reasons, &(&1 =~ "went BACKWARDS"))
+      refute Enum.any?(verdict.reasons, &(&1 =~ "legacy index scans inside the window"))
+      refute Enum.any?(verdict.reasons, &(&1 =~ "absent at the start of the window"))
+    end
+
+    test "a dropped index does not mask a REAL scan on one that survived it" do
+      # The companion to the test above: the disappearance must not turn the scan check
+      # vacuous for the indexes still there. Same window, same drop — but the surviving
+      # `memories` index moved.
+      clear_window(
+        scans: %{"articles_embedding_hnsw_idx" => 674, "memories_live_embedding_hnsw_idx" => 0}
+      )
+
+      AdminRepo.update_all(
+        from(o in RetirementObservation, where: o.observed_on == ^@today),
+        set: [legacy_index_scans: %{"memories_live_embedding_hnsw_idx" => 9}]
+      )
+
+      verdict = evaluate(probe())
+
+      assert verdict.verdict == :not_due
+
+      assert Enum.any?(
+               verdict.reasons,
+               &(&1 =~
+                   "legacy index scans inside the window: memories_live_embedding_hnsw_idx (+9)")
+             )
+    end
+
     test "a degenerate required_clear_days falls back rather than clearing vacuously" do
       # 0 is truthy, so `||` never rejected it: the window became empty, every check
       # passed over no rows, and `:due` was asserted from literally no evidence.

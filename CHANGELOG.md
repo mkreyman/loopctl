@@ -8,6 +8,31 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **The legacy `articles_embedding_hnsw_idx` is retired on installs whose reads are cut over
+  to the embedding side table, and reverting `embedding_side_table_reads` to `0` there is now
+  an UNINDEXED read path (#578).** Measured on the hosted instance 2026-08-04
+  (`pg_stat_user_indexes` / `pg_stat_statements`): the legacy index held 657 MB for 26 scans
+  while the live `article_embeddings_hnsw_dim_1536_idx` held 658 MB for 1,695 — and with
+  `shared_buffers` at 1536 MB the two evicted each other, so a cold vector search took
+  8,044 ms of which 7,926 ms (98.5%) was `blk_read_time` against 0 ms warm. Dropping the
+  legacy index frees roughly that 657 MB and leaves the live index resident.
+  `migrations/20260805120000_drop_legacy_articles_embedding_hnsw_index.exs` performs the drop
+  **only when `system_configs.embedding_side_table_reads` is `1`**; the flag defaults to `0`
+  (= the legacy `articles.embedding` column) and no migration seeds it, so a fresh install and
+  any install that has not cut over KEEP the index and are unaffected. Run
+  `DROP INDEX CONCURRENTLY articles_embedding_hnsw_idx` out-of-band ahead of the deploy if you
+  want the space back without waiting on the migrator — `IF EXISTS` makes the migration a
+  no-op afterwards. **Operator consequence:** on an install where the drop has run, setting
+  the flag back to `0` puts every semantic read on an unindexed column (seq scan + top-N sort,
+  surfacing as `503`/`heavy_read_overloaded` under the heavy-read statement timeout). Rebuild
+  the index first — `mix ecto.rollback` on that migration, or the equivalent
+  `CREATE INDEX CONCURRENTLY` — and raise `maintenance_work_mem` well above the 64 MB default
+  or the ~657 MB HNSW build silently falls back to the slow on-disk path. The
+  `articles.embedding` **column is unchanged**: still dual-written, still the
+  backfill/reconciliation source. `memories` keeps both of its legacy-column indexes
+  (deliberate — one serves `include_superseded: true` recall, the other default live recall).
+  No new environment variables.
+
 - **`loopctl.oban.poll.error.count` label values changed — re-point any Prometheus selector
   or Grafana panel (#558).** The `error_class` label moved from a bare `exit` / `throw` to the
   kind-prefixed, closed set produced by `Loopctl.ExitClass` — `exit:noproc`, `exit:timeout`,

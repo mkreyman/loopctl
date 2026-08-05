@@ -235,6 +235,24 @@ fixture in CI **plus** the live prod `EXPLAIN`/logs confirmation.
 
 ## Index drift
 
+> **Which index serves reads is now install-dependent (GH #578).** The ANN read path
+> moved to the `article_embeddings` side table on 2026-07-22, gated on
+> `SystemConfig "embedding_side_table_reads"`. On a **cut-over** install (prod) the live
+> index is `article_embeddings_hnsw_dim_<dim>_idx` and the legacy
+> `articles_embedding_hnsw_idx` has been retired; on an install still reading the legacy
+> column — the shipped default, since the flag defaults to `0` in code and no migration
+> seeds the row — the legacy index is **deliberately kept**, and
+> `20260805120000_drop_legacy_articles_embedding_hnsw_index.exs` skips its drop there.
+> Check the flag before concluding a missing index is drift:
+>
+> ```sql
+> SELECT value FROM system_configs WHERE key = 'embedding_side_table_reads';
+> ```
+>
+> Everything below is about detecting whichever HNSW index an install DOES have. The
+> capability-detection rule is unchanged and is the reason a name-based check would have
+> read the #578 retirement as a broken deploy.
+
 The HNSW index on `articles(embedding)` exists under **two names** historically: the
 migration created `articles_embedding_idx`, but the **live prod index was created
 out-of-band as `articles_embedding_hnsw_idx`**. This drift is a known foot-gun (see
@@ -268,6 +286,16 @@ remediated** to detect by `amname='hnsw'` (US-27.14;
 so this is the *rationale* for the capability-detection rule, not an open bug in the
 migrations — but the trap still bites any ad-hoc `psql` `DROP` you type by name.
 Always drop/inspect HNSW indexes by `amname='hnsw'` detection, not by an assumed name.
+
+**The one place a name is correct is the #578 retirement**, and only because it is
+paired with a validity check. `DROP INDEX CONCURRENTLY` cannot run inside a `DO` block,
+so the retirement names `articles_embedding_hnsw_idx` directly — which is safe *there*
+because US-27.14 already reconciled every environment onto that name. When verifying
+the outcome, assert on `pg_index.indisvalid` and the EXPLAIN plan node, never on
+`pg_indexes` name presence: `pg_indexes` lists INVALID indexes too, and
+`ORDER BY embedding <=> $1 LIMIT k` returns k rows identically with or without an index.
+On a cut-over install the plan must read
+`Index Scan using article_embeddings_hnsw_dim_<dim>_idx`.
 The same `IF NOT EXISTS`/`IF EXISTS` name-blindness applies to the keyset index
 recovery in
 [`knowledge-scale.md`](knowledge-scale.md) — verify with `pg_index.indisvalid`, not by

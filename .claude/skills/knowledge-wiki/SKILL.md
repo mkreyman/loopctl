@@ -153,6 +153,22 @@ number, is the load-bearing invariant. To monitor and keep it healthy over time:
   NEVER write the flag — it is `:persistent_term`-cached VM-globally, so a write leaks across the whole
   node. `Loopctl.ConfigEmbeddingReadPathTest` fails the build on a second writer and on any
   `:embedding_read_path` config outside `config/test.exs`.
+- **Reverting the flag is now an UNINDEXED read path on a cut-over install (GH #578).** The legacy
+  `articles_embedding_hnsw_idx` (657 MB / 26 scans on prod 2026-08-04, vs 658 MB / 1,695 scans for the
+  live side-table index, `pg_stat_user_indexes`) is retired: with `shared_buffers` at 1536 MB the two
+  ~657 MB indexes evicted each other, and a cold vector search measured 8,044 ms of which 7,926 ms was
+  `blk_read_time`. `articles.embedding` is still dual-WRITTEN — it stays the backfill/reconciliation
+  source, and the column was NOT dropped — but on an install where the drop has run, setting the flag
+  back to `0` puts reads on a column with no ANN index: a seq scan + top-N sort over the corpus, which
+  under `HeavyRead`'s per-read `SET LOCAL statement_timeout` surfaces as
+  `{:error, :heavy_read_overloaded}`. A revert is therefore an INCIDENT action, not a routine toggle —
+  rebuild the index first (`down/0` of `20260805120000_drop_legacy_articles_embedding_hnsw_index.exs`,
+  and raise `maintenance_work_mem` well above the 64 MB default or the ~657 MB build silently falls back
+  to the slow on-disk path, wiki `753fbf69`). The drop migration is GUARDED on that same flag read
+  straight from `system_configs`, so an install still reading the legacy column keeps its index and a
+  fresh self-hosted install is unaffected. `Loopctl.Embeddings.LegacyRetirement` discovers legacy
+  indexes BY COLUMN, so an install that cuts over AFTER the migration ran still gets the leftover named
+  in its scan map.
 - **Bulk (re)embed / backfill is a live-DB hazard.** Unthrottled it 504s the live wiki — per-row HNSW
   index maintenance saturates the small Fly Postgres and starves concurrent heavy-read searches past
   their `statement_timeout`. Throttled id-range keyset pattern: wiki `7a4187fd`.
