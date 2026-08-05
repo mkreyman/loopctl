@@ -31,7 +31,12 @@ defmodule Loopctl.SystemConfig.CachePrimer do
   ## Failure is loud, never fatal
 
   A failed prime is logged at `:error` and emitted as
-  `[:loopctl, :system_config, :prime_failed]` telemetry, because a silently empty
+  `[:loopctl, :system_config, :prime_failed]` telemetry — which
+  `Loopctl.Telemetry.ScaleMetrics.scale_metrics/0` consumes as the
+  `loopctl.system_config.prime_failed.count` Prometheus counter (metric 25), keyed by
+  the classified `error_class`. An emitted event with no metric definition would be a
+  handler-less no-op, leaving the log line as the only trace — not alertable, and easy
+  to miss on a rolling deploy. Telemetry is claimed here because a silently empty
   cache is what turns a bounded startup window into an unbounded one (a node that
   missed its prime keeps serving in-code defaults until a cron tick happens to
   land on it — and the cron enqueues one job per tick CLUSTER-WIDE).

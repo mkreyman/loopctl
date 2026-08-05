@@ -41,6 +41,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   """
   use ExUnit.Case, async: false
 
+  alias Loopctl.SystemConfig.CachePrimer
   alias Loopctl.Telemetry.ScaleMetrics
 
   @scale_metric_names [
@@ -69,7 +70,8 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.ingestion.backlog_gate.failed_open.jobs",
     "loopctl.knowledge.article_linking.corpus_size",
     "loopctl.cluster.peers.count",
-    "loopctl.egress.blocked.count"
+    "loopctl.egress.blocked.count",
+    "loopctl.system_config.prime_failed.count"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this
@@ -1388,6 +1390,66 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       # peer COUNT (never a node-name list) and a bounded status.
       assert is_integer(count)
       assert status in [:single_node, :clustered, :expected_peers_missing]
+    end
+  end
+
+  describe "system_config.prime_failed counter (#588)" do
+    test "the counter consumes exactly the event CachePrimer emits, tagged by error_class only" do
+      counter = metric("loopctl.system_config.prime_failed.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert counter.event_name == [:loopctl, :system_config, :prime_failed]
+      assert counter.measurement == :count
+      # The raw reason carries the failing statement + bound parameters (#562) and the
+      # backend host/database/role; only the CLASSIFIED class is ever a label, and there
+      # is no tenant dimension (`system_configs` is a global, non-tenant table).
+      assert counter.tags == [:error_class]
+      refute :tenant_id in counter.tags
+      refute :reason in counter.tags
+    end
+
+    test "system_config_prime_failed_tags/1 passes the class through and drops everything else" do
+      tags =
+        ScaleMetrics.system_config_prime_failed_tags(%{
+          error_class: "exit:noproc",
+          reason: {:noproc, {DBConnection, :execute, ["SELECT 1", ["secret-param"]]}}
+        })
+
+      assert tags == %{error_class: "exit:noproc"}
+      assert ScaleMetrics.system_config_prime_failed_tags(%{}) == %{error_class: "unknown"}
+    end
+
+    test "a failed boot prime reaches a real Prometheus scrape, labeled by the closed class" do
+      reporter_name = :"system_config_prime_failed_test_#{System.unique_integer([:positive])}"
+      counter = metric("loopctl.system_config.prime_failed.count")
+
+      start_supervised!(
+        {TelemetryMetricsPrometheus.Core,
+         [metrics: [counter], name: reporter_name, start_async: false]}
+      )
+
+      # Drive the label through the PRODUCER's own classifier rather than a literal, so a
+      # change to the closed vocabulary shows up here instead of silently re-labeling the
+      # series. This is the real production exit shape (an unstarted/wedged pool).
+      class =
+        CachePrimer.error_class(
+          {:exit, {:noproc, {DBConnection, :execute, ["SELECT 1", ["bound-param"]]}}}
+        )
+
+      for _i <- 1..2 do
+        :telemetry.execute([:loopctl, :system_config, :prime_failed], %{count: 1}, %{
+          error_class: class
+        })
+      end
+
+      scrape = TelemetryMetricsPrometheus.Core.scrape(reporter_name)
+
+      assert scrape =~ "loopctl_system_config_prime_failed_count"
+      assert scrape =~ ~s(error_class="exit:noproc")
+      assert scrape =~ ~r/loopctl_system_config_prime_failed_count\{[^}]*\} 2/
+      # The sanitization the classifier exists for must survive the metric path too.
+      refute scrape =~ "SELECT 1"
+      refute scrape =~ "bound-param"
     end
   end
 end
