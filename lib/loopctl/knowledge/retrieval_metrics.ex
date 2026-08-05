@@ -13,6 +13,49 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   Honest caveat: it measures search → *open*, not search → *useful*. An agent that uses
   a snippet without opening the article counts as a miss, so the absolute number
   undercounts precision. The bias is consistent, so the TREND is the meaningful thing.
+
+  ## What each denominator is (#582)
+
+  `searched` counts SURFACED RESULTS — one `article_access_events` row per result a
+  search put in front of the agent — NOT search calls. `precision` is therefore
+  `followed_through / searched`: "the share of surfaced results the agent then opened".
+  The name reads like a count of searches, which is exactly how it got misreported, so
+  the payload also carries `results_surfaced` (the same number, named for its unit) and
+  the per-CALL series alongside it:
+
+  - `searches` — distinct `metadata->>'search_id'` values, i.e. actual search calls.
+  - `searches_with_follow_through` / `search_follow_through` — the share of SEARCHES
+    that led to at least one open. This is the quantity a reader who misreads
+    `precision` has in mind; it is now computable instead of being confused for it.
+  - `results_returned` — the true, un-truncated number of results those searches
+    returned. Only the first 20 results per search get a row
+    (`Knowledge.maybe_record_search_access/5`), so `searched < results_returned` makes
+    that truncation visible rather than silent.
+
+  Search calls recorded before #582 carry no `search_id` and contribute `0` to all four
+  call-level fields; they still contribute to `searched`/`precision` exactly as before.
+
+  ## Two structural exclusions — precision is an UPPER BOUND
+
+  `article_access_events.article_id` is NOT NULL and every row needs an `api_key_id`, so
+  two classes of search are unrecordable and appear in NO denominator here:
+
+  1. a search that returned ZERO results (the purest miss), and
+  2. a search made without an api key.
+
+  Both are excluded from numerator and denominator alike, which biases every ratio on
+  this surface UP. Do not close the gap by inventing a null-`article_id` row: that would
+  put a counted class and an uncounted class on one number, the failure the heat-index
+  invariant exists to prevent. `Loopctl.TelemetryEvents.knowledge_hybrid_provenance/0`
+  is where hit/miss including empties is observable.
+
+  ## The proxy is gameable in one direction — never optimise it alone
+
+  `precision` rises when a search returns FEWER results, with no better retrieval
+  whatsoever: shrink the denominator and the ratio climbs. Read it WITH the absolute
+  `followed_through` and the volume figures (`searched`, `searches`,
+  `results_returned`) — a real improvement raises follow-through while volume holds;
+  a gamed one shows the ratio up and the volume collapsing.
   """
 
   import Ecto.Query
@@ -26,9 +69,14 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   @doc """
   Compute precision for a single `day` (a `Date`) and follow-through `window_seconds`.
 
-  Returns `%{searched, followed_through, precision, day, window_seconds,
-  curated_searched, curated_followed_through, curated_precision, retrieved_searched,
-  retrieved_followed_through, retrieved_precision}`.
+  Returns `%{searched, results_surfaced, followed_through, precision, searches,
+  searches_with_follow_through, search_follow_through, results_returned, day,
+  window_seconds, curated_searched, curated_followed_through, curated_precision,
+  retrieved_searched, retrieved_followed_through, retrieved_precision}`.
+
+  `searched` (and its self-describing twin `results_surfaced`) is a count of SURFACED
+  RESULTS; `searches` is a count of search CALLS. See the moduledoc for why both are
+  reported and why neither ratio may be optimised alone.
 
   The `curated_*`/`retrieved_*` fields (US-31.2, AC-31.2.5) are the SAME
   searched/followed_through/precision computation, restricted to `"search"` events
@@ -68,12 +116,19 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
     retrieved_followed = compute_followed_through(retrieved_q, window_seconds)
     retrieved_precision = safe_precision(retrieved_followed, retrieved_searched)
 
+    call = compute_call_level(searched_q, window_seconds)
+
     %{
       day: day,
       window_seconds: window_seconds,
       searched: searched,
+      results_surfaced: searched,
       followed_through: followed,
       precision: precision,
+      searches: call.searches,
+      searches_with_follow_through: call.searches_with_follow_through,
+      search_follow_through: call.search_follow_through,
+      results_returned: call.results_returned,
       curated_searched: curated_searched,
       curated_followed_through: curated_followed,
       curated_precision: curated_precision,
@@ -97,6 +152,12 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # `@heat_read_access_types`).
   defp compute_followed_through(searched_q, window_seconds) do
     searched_q
+    |> with_follow_through(window_seconds)
+    |> AdminRepo.aggregate(:count, :id)
+  end
+
+  defp with_follow_through(searched_q, window_seconds) do
+    searched_q
     |> where(
       [s],
       exists(
@@ -116,7 +177,60 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
         )
       )
     )
-    |> AdminRepo.aggregate(:count, :id)
+  end
+
+  # Per-SEARCH-CALL aggregates (#582). `searched` above counts surfaced RESULTS; these
+  # count the calls that surfaced them, so "share of results opened" and "share of
+  # searches that led to an open" stop being the same number read two ways.
+  #
+  # Only rows carrying a `search_id` participate. Rows written before #582 have none,
+  # and grouping on a NULL key would collapse every one of them into a single phantom
+  # "search" — a fabricated denominator is worse than a missing one, so they contribute
+  # 0 here and remain fully counted in `searched`/`precision`.
+  defp compute_call_level(searched_q, window_seconds) do
+    with_id = where(searched_q, [s], not is_nil(fragment("?->>'search_id'", s.metadata)))
+
+    searches = count_distinct_searches(with_id)
+    with_ft = with_id |> with_follow_through(window_seconds) |> count_distinct_searches()
+
+    %{
+      searches: searches,
+      searches_with_follow_through: with_ft,
+      search_follow_through: safe_precision(with_ft, searches),
+      results_returned: sum_results_returned(with_id)
+    }
+  end
+
+  defp count_distinct_searches(query) do
+    from(s in query, select: count(fragment("?->>'search_id'", s.metadata), :distinct))
+    |> AdminRepo.one()
+    |> Kernel.||(0)
+  end
+
+  # Every row in a search's batch carries that search's OWN `results_returned`, so the
+  # figure is per-call and must be de-duplicated by `search_id` before summing —
+  # summing the rows would multiply it by the batch size. The regex guard keeps a
+  # malformed metadata value from turning an analytics read into a cast error; a bad
+  # value contributes 0 rather than crashing the daily snapshot.
+  defp sum_results_returned(with_id) do
+    per_call =
+      from(s in with_id,
+        group_by: fragment("?->>'search_id'", s.metadata),
+        select: %{
+          n:
+            max(
+              fragment(
+                "CASE WHEN ?->>'results_returned' ~ '^[0-9]+$' THEN (?->>'results_returned')::int ELSE 0 END",
+                s.metadata,
+                s.metadata
+              )
+            )
+        }
+      )
+
+    from(p in subquery(per_call), select: coalesce(sum(p.n), 0))
+    |> AdminRepo.one()
+    |> Kernel.||(0)
   end
 
   defp safe_precision(_followed, 0), do: 0.0
@@ -137,6 +251,10 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       searched: m.searched,
       followed_through: m.followed_through,
       precision: m.precision,
+      searches: m.searches,
+      searches_with_follow_through: m.searches_with_follow_through,
+      search_follow_through: m.search_follow_through,
+      results_returned: m.results_returned,
       curated_searched: m.curated_searched,
       curated_followed_through: m.curated_followed_through,
       curated_precision: m.curated_precision,
@@ -155,6 +273,10 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
            :searched,
            :followed_through,
            :precision,
+           :searches,
+           :searches_with_follow_through,
+           :search_follow_through,
+           :results_returned,
            :curated_searched,
            :curated_followed_through,
            :curated_precision,
@@ -189,8 +311,16 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
           day: s.day,
           window_seconds: s.window_seconds,
           searched: s.searched,
+          # Same number as `searched`, named for its UNIT (surfaced results, not search
+          # calls). The misreading #582 records happened at exactly this boundary, so
+          # the payload states the denominator instead of relying on a doc elsewhere.
+          results_surfaced: s.searched,
           followed_through: s.followed_through,
           precision: s.precision,
+          searches: s.searches,
+          searches_with_follow_through: s.searches_with_follow_through,
+          search_follow_through: s.search_follow_through,
+          results_returned: s.results_returned,
           curated_searched: s.curated_searched,
           curated_followed_through: s.curated_followed_through,
           curated_precision: s.curated_precision,

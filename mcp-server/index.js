@@ -6042,10 +6042,21 @@ const TOOLS = [
     name: "knowledge_retrieval_metrics",
     description:
       "Return the daily retrieval-PRECISION time series (agents' KB #3): for each day, the " +
-      "share of search results the agent then opened (search → get/context within a window). " +
-      "A proxy for whether retrieval is improving — watch it trend up as the corpus is " +
-      "de-duplicated, better navigated (MOCs), and conflict-resolved. Most recent day first. " +
-      "Requires orchestrator role.",
+      "share of surfaced search RESULTS the agent then opened (search → get/context within a " +
+      "window). A proxy for whether retrieval is improving — watch it trend up as the corpus " +
+      "is de-duplicated, better navigated (MOCs), and conflict-resolved. Most recent day " +
+      "first. Requires orchestrator role.\n\n" +
+      "Denominators (#582): precision = followed_through / searched, and `searched` counts " +
+      "surfaced RESULTS, not search calls (`results_surfaced` is the same number, named for " +
+      "its unit). The per-CALL rate is separate: `search_follow_through` = " +
+      "searches_with_follow_through / searches — the share of SEARCHES that led to an open. " +
+      "`results_returned` is the true un-truncated result count (only the first 20 results " +
+      "per search are recorded, so searched < results_returned shows that cap). Days before " +
+      "#582 carry 0 in the call-level fields.\n\n" +
+      "Caveats: zero-result searches and keyless searches are structurally unrecordable and " +
+      "sit in NO denominator, so both ratios are upper bounds; and both rise if a search " +
+      "simply returns FEWER results, with no better retrieval. Never optimise either alone — " +
+      "read them with the absolute followed_through and the volume fields.",
     inputSchema: {
       type: "object",
       properties: {

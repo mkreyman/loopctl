@@ -5,6 +5,36 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.68.0 — 2026-08-05 (the precision denominator says what it counts)
+
+### Changed
+
+- **`knowledge_retrieval_metrics` now states its denominator, and reports the per-CALL rate
+  separately** (issue #582). The tool said `precision` was "the share of search results the
+  agent then opened", and it is — `searched` counts one row per SURFACED RESULT. But the name
+  reads like a count of searches, and it was read that way: the number was reported as "agents
+  open N% of what they find" when the reader meant "N% of searches led to an open", and that
+  misreading reached a draft public post. The two are different quantities, so both are now
+  reported instead of one being mistaken for the other. `precision` and its `searched`
+  denominator are UNCHANGED — redefining a persisted daily series would make every historical
+  row incomparable.
+
+- **New response fields**: `results_surfaced` (the same number as `searched`, named for its
+  unit), `searches` (distinct search CALLS), `searches_with_follow_through` and
+  `search_follow_through` (the share of SEARCHES that led to an open — the quantity the
+  misreading had in mind), and `results_returned` (the true un-truncated result count). Only
+  the first 20 results of a search are recorded, so `searched < results_returned` now shows
+  where that cap bit instead of a truncated denominator passing as the whole result set. Days
+  recorded before this release carry 0 in the four call-level fields — their source events
+  have no search identity to reconstruct one from.
+
+- **The two structural exclusions are documented**: a search returning ZERO results and a
+  search made without an api key are unrecordable (an access event requires both an article
+  and a key), so they sit in NO denominator and every ratio here is an upper bound. And the
+  gaming direction is named: both ratios rise when a search simply returns FEWER results, with
+  no better retrieval — read them with the absolute `followed_through` and the volume fields,
+  never alone.
+
 ## 2.67.0 — 2026-08-04 (one accounting rule for every scope)
 
 ### Changed

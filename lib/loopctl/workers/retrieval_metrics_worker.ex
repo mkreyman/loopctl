@@ -1,9 +1,10 @@
 defmodule Loopctl.Workers.RetrievalMetricsWorker do
   @moduledoc """
   Daily snapshot of retrieval precision (agents' KB #3). Fans out over active tenants and
-  records yesterday's `RetrievalMetrics.snapshot/3` — the share of surfaced search results
-  the agent then opened. Additive/idempotent (upsert per tenant/day/window); computes the
-  previous FULL day so the window is complete.
+  records yesterday's `RetrievalMetrics.snapshot/3` — the share of surfaced search RESULTS
+  the agent then opened, plus the separate per-CALL follow-through rate (#582). Additive/
+  idempotent (upsert per tenant/day/window); computes the previous FULL day so the window
+  is complete.
 
   Scheduled daily via the Oban Cron plugin.
   """
@@ -48,10 +49,15 @@ defmodule Loopctl.Workers.RetrievalMetricsWorker do
 
     case RetrievalMetrics.snapshot(tenant_id, day) do
       {:ok, snap} ->
+        # `searched` is SURFACED RESULTS and `searches` is search CALLS (#582) — both
+        # are logged with their own ratio so the line cannot be read as one number.
         Logger.info(
           "RetrievalMetricsWorker: tenant=#{tenant_id} day=#{day} " <>
-            "searched=#{snap.searched} followed=#{snap.followed_through} " <>
-            "precision=#{Float.round(snap.precision, 3)}"
+            "results_surfaced=#{snap.searched} results_returned=#{snap.results_returned} " <>
+            "followed=#{snap.followed_through} " <>
+            "precision=#{Float.round(snap.precision, 3)} " <>
+            "searches=#{snap.searches} " <>
+            "search_follow_through=#{Float.round(snap.search_follow_through, 3)}"
         )
 
         :ok

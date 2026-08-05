@@ -303,10 +303,24 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   operation(:retrieval_metrics,
     summary: "Retrieval precision time series",
     description:
-      "Daily retrieval PRECISION (agents' KB #3): the share of a day's search results the " <>
+      "Daily retrieval PRECISION (agents' KB #3): the share of a day's search RESULTS the " <>
         "agent then opened (search → get/context within a window). A proxy for retrieval " <>
         "quality that trends up as the corpus is de-duplicated and better navigated. Most " <>
-        "recent day first. Role: orchestrator+.",
+        "recent day first. Role: orchestrator+.\n\n" <>
+        "DENOMINATORS (#582) — `precision` = `followed_through` / `searched`, and " <>
+        "`searched` counts SURFACED RESULTS (one row per result a search put in front of " <>
+        "an agent), NOT search calls; `results_surfaced` is the same number named for its " <>
+        "unit. The per-CALL rate is reported separately as `search_follow_through` = " <>
+        "`searches_with_follow_through` / `searches` (distinct search calls) — that is " <>
+        "the 'share of searches that led to an open'. `results_returned` is the true " <>
+        "un-truncated result count; only the first 20 results per search are recorded, so " <>
+        "`searched` < `results_returned` shows where that cap bit. Days recorded before " <>
+        "#582 carry 0 in the four call-level fields.\n\n" <>
+        "CAVEATS — searches returning ZERO results and searches made without an api key " <>
+        "are structurally unrecordable and appear in NO denominator, so every ratio here " <>
+        "is an upper bound. Both ratios also rise when a search simply returns FEWER " <>
+        "results, with no better retrieval: never optimise them alone — read them with " <>
+        "the absolute `followed_through` and the volume fields.",
     parameters: [
       limit: [
         in: :query,

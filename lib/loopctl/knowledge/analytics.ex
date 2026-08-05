@@ -135,6 +135,20 @@ defmodule Loopctl.Knowledge.Analytics do
   receives a `"rank"` key (1-based) reflecting the position in the
   results list.
 
+  ONE ROW PER SURFACED RESULT, not one row per search call — this is the unit
+  `RetrievalMetrics.compute/3` counts as `searched`, and mistaking it for a count of
+  search CALLS is what produced #582. Two metadata keys make the distinction
+  auditable downstream:
+
+  - `"search_id"` — a UUID generated HERE, once per call, shared by every row in the
+    batch. It is the only reliable search-call identity: the pre-#582 proxy
+    (`api_key_id` + a shared `accessed_at`) collides across concurrent searches by one
+    key. Never accept one from a caller — a call-level denominator a caller can forge
+    is a metric a caller can game.
+  - `"results_returned"` — how many results the search actually returned to its caller,
+    which may exceed the number of rows written (callers cap what they record). Defaults
+    to the batch size when the caller does not supply it.
+
   The optional `context` map attributes all rows in the batch to the
   same project and/or story. Cross-tenant values are silently dropped.
   """
@@ -164,6 +178,8 @@ defmodule Loopctl.Knowledge.Analytics do
       metadata
       |> ensure_map()
       |> maybe_put_query(query)
+      |> Map.put("search_id", Ecto.UUID.generate())
+      |> Map.put_new("results_returned", length(article_ids))
 
     items =
       article_ids

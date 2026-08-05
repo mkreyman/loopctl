@@ -109,6 +109,71 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
       assert :ok = Knowledge.record_search_access(tenant.id, [], api_key.id, "anything")
       assert AdminRepo.aggregate(ArticleAccessEvent, :count, :id) == 0
     end
+
+    test "#582: every row in one batch shares ONE search_id, and two calls get different ones" do
+      # The search-call identity `RetrievalMetrics` counts as `searches`. Before #582 the
+      # only grouping proxy was (api_key_id, accessed_at) — exact only because a batch
+      # shares one `now`, and it collides across concurrent searches by the same key.
+      {tenant, api_key} = setup_tenant_with_agent()
+      a1 = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      a2 = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      assert :ok = Knowledge.record_search_access(tenant.id, [a1.id, a2.id], api_key.id, "q")
+      first = AdminRepo.all(ArticleAccessEvent)
+      assert [search_id] = first |> Enum.map(& &1.metadata["search_id"]) |> Enum.uniq()
+      assert {:ok, _} = Ecto.UUID.cast(search_id)
+
+      assert :ok = Knowledge.record_search_access(tenant.id, [a1.id], api_key.id, "q")
+
+      assert 2 ==
+               ArticleAccessEvent
+               |> AdminRepo.all()
+               |> Enum.map(& &1.metadata["search_id"])
+               |> Enum.uniq()
+               |> length()
+    end
+
+    test "#582: results_returned defaults to the batch size and is never overridden by a caller-supplied search_id" do
+      {tenant, api_key} = setup_tenant_with_agent()
+      a1 = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      a2 = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      # A caller-supplied `search_id` MUST be discarded: a call-level denominator the
+      # caller controls is a metric the caller can game (pin every row to one id and
+      # `searches` collapses to 1).
+      assert :ok =
+               Knowledge.record_search_access(
+                 tenant.id,
+                 [a1.id, a2.id],
+                 api_key.id,
+                 "q",
+                 %{"search_id" => "forged-by-caller"}
+               )
+
+      events = AdminRepo.all(ArticleAccessEvent)
+      assert Enum.all?(events, &(&1.metadata["search_id"] != "forged-by-caller"))
+      assert Enum.all?(events, &(&1.metadata["results_returned"] == 2))
+    end
+
+    test "#582: a search path records at most 20 rows but reports the TRUE results_returned" do
+      # The recording cap makes the row count an UNDERCOUNT of what the search returned.
+      # If this figure were derived from the recorded rows it would just echo the cap;
+      # it has to be threaded from the un-truncated result list at the search site.
+      {tenant, api_key} = setup_tenant_with_agent()
+
+      for _ <- 1..25 do
+        fixture(:article, %{tenant_id: tenant.id, status: :published})
+      end
+
+      assert {:ok, %{results: results}} =
+               Knowledge.list_filtered(tenant.id, limit: 25, api_key_id: api_key.id)
+
+      assert length(results) == 25
+
+      events = AdminRepo.all(ArticleAccessEvent)
+      assert length(events) == 20
+      assert Enum.all?(events, &(&1.metadata["results_returned"] == 25))
+    end
   end
 
   describe "get_article_stats/2" do
