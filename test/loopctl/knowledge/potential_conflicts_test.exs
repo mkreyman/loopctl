@@ -127,6 +127,47 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       assert %{meta: %{total_count: 0}, data: []} = Knowledge.list_potential_conflicts(t.id)
     end
 
+    test "a supersede BELOW high confidence is closed, not left invisible forever", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      # The silent black hole: the executor requires :high confidence, so a medium-confidence
+      # supersede never executes — yet because the ROW EXISTS it also drops out of the queue
+      # and out of Consolidation's judged pairs. It vanished from every surface while
+      # changing nothing: not pending, not applied, not visible. Survivable only if a human
+      # might one day re-annotate it, which is exactly what will not happen here.
+      assert {:ok, res} =
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => a.id,
+                   "target_article_id" => b.id,
+                   "disposition" => "supersede",
+                   "classification" => "redundant",
+                   "confidence" => "medium",
+                   "authoritative_article_id" => a.id
+                 },
+                 actor_label: "agent:x"
+               )
+
+      assert res.confidence == :medium
+      assert is_nil(res.executed_at), "precondition: it starts unexecuted"
+
+      assert 0 = Knowledge.execute_conflict_resolutions(t.id)
+
+      reloaded = AdminRepo.get!(Loopctl.Knowledge.ConflictResolution, res.id)
+
+      # Closed rather than executed: it no longer sits unexecuted forever.
+      refute is_nil(reloaded.executed_at)
+      assert reloaded.execution_result["action"] == "skipped"
+      assert reloaded.execution_result["reason"] == "insufficient_confidence"
+
+      # And BOTH articles survive. Lowering the executor's bar to :medium instead would let a
+      # judgement the annotator did not trust retire an article; the reversible outcome is
+      # the only defensible default with nobody to adjudicate.
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, a.id).status == :published
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, b.id).status == :published
+    end
+
     test "supersede at high confidence is applied by the executor (loser retired)", ctx do
       %{tenant: t, a: a, b: b} = ctx
 

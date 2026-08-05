@@ -4502,18 +4502,80 @@ defmodule Loopctl.Knowledge do
       )
       |> AdminRepo.all()
 
-    Enum.reduce_while(rows, 0, fn r, count ->
-      if System.monotonic_time(:millisecond) >= deadline do
-        Logger.info(
-          "ConflictExecutor: tenant=#{tenant_id} hit the #{budget_ms}ms execute budget " <>
-            "after #{count} resolution(s); remainder left for the next run."
-        )
+    executed =
+      Enum.reduce_while(rows, 0, fn r, count ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          Logger.info(
+            "ConflictExecutor: tenant=#{tenant_id} hit the #{budget_ms}ms execute budget " <>
+              "after #{count} resolution(s); remainder left for the next run."
+          )
 
-        {:halt, count}
-      else
-        {:cont, if(apply_resolution(tenant_id, r), do: count + 1, else: count)}
-      end
-    end)
+          {:halt, count}
+        else
+          {:cont, if(apply_resolution(tenant_id, r), do: count + 1, else: count)}
+        end
+      end)
+
+    close_unexecutable_resolutions(tenant_id)
+    executed
+  end
+
+  # The SILENT BLACK HOLE, closed.
+  #
+  # The executor above requires `confidence == :high`. A `:supersede` or `:merge` recorded at
+  # `:medium` or `:low` therefore never executes — and because the ROW EXISTS it also drops
+  # out of `list_potential_conflicts/2` (which excludes any pair with a resolution) and out of
+  # Consolidation's `judged_pairs/1`. So it vanishes from every surface while changing
+  # nothing: not pending, not applied, not visible, forever.
+  #
+  # That was survivable when a human might one day re-annotate it at high confidence. With no
+  # human in the loop it is a permanent leak, and permanent leaks are exactly what a system
+  # expected to run unattended cannot have.
+  #
+  # These are closed as DISMISSED rather than executed. The alternative — lowering the
+  # executor's bar to `:medium` — would let a low-confidence judgement RETIRE an article, and
+  # the confidence field exists precisely to say that judgement was not trusted. Dismissing
+  # keeps both articles, touches no article row, and is undone by re-annotating the pair at
+  # high confidence, which then executes normally. The reversible outcome is the only
+  # defensible default when nobody is going to adjudicate.
+  #
+  # Logged at :warning, with the count: a steady stream here means something upstream is
+  # emitting judgements it does not believe, which is worth knowing about.
+  defp close_unexecutable_resolutions(tenant_id) do
+    now = DateTime.utc_now()
+
+    {closed, _} =
+      from(r in ConflictResolution,
+        where: r.tenant_id == ^tenant_id,
+        where: is_nil(r.executed_at),
+        where: r.disposition in [:supersede, :merge],
+        where: r.confidence != :high
+      )
+      |> AdminRepo.update_all(
+        set: [
+          executed_at: now,
+          updated_at: now,
+          execution_result: %{
+            "action" => "skipped",
+            "reason" => "insufficient_confidence",
+            "detail" =>
+              "A supersede/merge below :high confidence is never executed by design. It was " <>
+                "closed as dismissed so it cannot sit invisible and unapplied forever; both " <>
+                "articles are retained. Re-annotate the pair at :high confidence to apply it."
+          }
+        ]
+      )
+
+    if closed > 0 do
+      Logger.warning(
+        "ConflictExecutor: tenant=#{tenant_id} closed #{closed} unexecutable resolution(s) " <>
+          "(supersede/merge below :high confidence). Both articles retained in each case. A " <>
+          "persistent count here means something upstream is recording judgements it does " <>
+          "not believe."
+      )
+    end
+
+    closed
   end
 
   defp execute_budget_ms do
