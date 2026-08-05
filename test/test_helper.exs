@@ -18,7 +18,8 @@ Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)
 # (Prod is unaffected: the nightly AuditPartitionWorker keeps the window ahead.) Ensure a
 # generous window here. It must be COMMITTED DDL, so run it unboxed — a plain query would
 # execute inside the sandbox transaction and be rolled back before any test sees it.
-Ecto.Adapters.SQL.Sandbox.unboxed_run(Loopctl.Repo, fn ->
+# AdminRepo, because the worker issues its DDL through AdminRepo (it owns the partitions).
+Ecto.Adapters.SQL.Sandbox.unboxed_run(Loopctl.AdminRepo, fn ->
   Loopctl.Workers.AuditPartitionWorker.ensure_partitions(back: 12)
 end)
 
