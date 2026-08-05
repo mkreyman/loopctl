@@ -289,7 +289,7 @@ defmodule Loopctl.KnowledgeCuratedTest do
 
       # Pure predicate still true (status + marker), but authoritative check excludes it.
       assert Knowledge.curated?(curated)
-      refute Knowledge.authoritative_curated?(curated)
+      refute Knowledge.authoritative_curated?(curated, tenant.id)
       refute curated.id in ids(Knowledge.list_curated_sources(tenant.id))
     end
 
@@ -316,7 +316,7 @@ defmodule Loopctl.KnowledgeCuratedTest do
         })
 
       # Fresh: suppressed, exactly as the sibling test above asserts.
-      refute Knowledge.authoritative_curated?(curated)
+      refute Knowledge.authoritative_curated?(curated, tenant.id)
       refute curated.id in ids(Knowledge.list_curated_sources(tenant.id))
 
       # Age it one day past the window. `article_links` is deliberately immutable (no update
@@ -333,14 +333,45 @@ defmodule Loopctl.KnowledgeCuratedTest do
       |> AdminRepo.update!()
 
       # Still unjudged — no conflict_resolutions row was written — but no longer suppressing.
-      assert Knowledge.authoritative_curated?(curated),
+      assert Knowledge.authoritative_curated?(curated, tenant.id),
              "an aged unjudged conflict must stop suppressing the per-article authority check"
 
       assert curated.id in ids(Knowledge.list_curated_sources(tenant.id)),
              "an aged unjudged conflict must stop suppressing the curated-sources list"
     end
 
-    test "authoritative_curated?/1 does not crash on a system canonical (tenant_id nil)" do
+    test "one tenant's conflict on a SHARED CANONICAL cannot suppress it for another tenant" do
+      # Article ids are GLOBAL, so correlating the open-conflict lookup on the id alone let
+      # ANY tenant's link answer the question. For a shared system canonical that is a live
+      # cross-tenant suppression: tenant A flags it, tenant B silently loses it from every
+      # authoritative answer for the whole window, with no audit event and no error.
+      #
+      # The sibling `open_conflict_subquery/1` has always been tenant-scoped, and its comment
+      # says exactly why. This is the same invariant, enforced in the other predicate.
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      canon = curated_system_article(%{title: "Shared Canon"}, tenant_a.id)
+      rival = fixture(:article, %{tenant_id: tenant_a.id, status: :published, title: "Rival"})
+
+      # Tenant A raises a conflict against the shared canonical.
+      fixture(:article_link, %{
+        tenant_id: tenant_a.id,
+        source_article_id: canon.id,
+        target_article_id: rival.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"auto_generated" => true, "similarity_score" => 0.95}
+      })
+
+      # A sees the suppression — that is A's own dispute, correctly applied.
+      refute Knowledge.authoritative_curated?(canon, tenant_a.id)
+
+      # B must be entirely unaffected. Without the tenant predicate this returns false and
+      # the shared canon silently disappears from B's authoritative answers.
+      assert Knowledge.authoritative_curated?(canon, tenant_b.id),
+             "a conflict raised by one tenant must never retract the shared canon from another"
+    end
+
+    test "authoritative_curated?/2 does not crash on a system canonical (tenant_id nil)" do
       tenant = fixture(:tenant)
       system = curated_system_article(%{title: "System Canonical"}, tenant.id)
 
@@ -349,7 +380,7 @@ defmodule Loopctl.KnowledgeCuratedTest do
       # be authoritative (AC-31.1.3) rather than raising.
       assert is_nil(system.tenant_id)
       assert Knowledge.curated?(system)
-      assert Knowledge.authoritative_curated?(system)
+      assert Knowledge.authoritative_curated?(system, tenant.id)
     end
 
     test "a system canonical in an OPEN potential_conflict is not authoritative" do
@@ -370,7 +401,7 @@ defmodule Loopctl.KnowledgeCuratedTest do
       })
 
       assert Knowledge.curated?(system)
-      refute Knowledge.authoritative_curated?(system)
+      refute Knowledge.authoritative_curated?(system, tenant.id)
       refute system.id in ids(Knowledge.list_curated_sources(tenant.id))
     end
 

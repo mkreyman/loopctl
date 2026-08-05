@@ -3162,18 +3162,22 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
-  Authoritative-curated check for a single article (AC-31.1.4).
+  Authoritative-curated check for a single article (AC-31.1.4), from ONE tenant's view.
 
-  Unlike the pure `curated?/1` (status + marker only), this additionally excludes
-  an article that is in an OPEN `:potential_conflict` — such an article is NOT
-  treated as authoritative until the conflict is surfaced/resolved. Does a DB lookup
-  for the open conflict, correlated on the article's globally-unique id. Works for
-  BOTH tenant articles and system canonicals (`tenant_id == nil`) — the latter is the
-  exact input AC-31.1.3 requires to participate as curated.
+  Unlike the pure `curated?/1` (status + marker only), this additionally excludes an article
+  that is in an OPEN `:potential_conflict` — such an article is NOT treated as authoritative
+  until the conflict is resolved. Works for BOTH tenant articles and system canonicals
+  (`tenant_id == nil`), which AC-31.1.3 requires to participate as curated.
+
+  `tenant_id` is the tenant ASKING, and it is required rather than derived from the article
+  because for a system canonical there is nothing to derive it from — the canonical is shared
+  and its own `tenant_id` is NULL. "Is this authoritative?" is only answerable relative to a
+  viewer: a conflict raised by one tenant must never change what another tenant sees of the
+  shared canon.
   """
-  @spec authoritative_curated?(Article.t()) :: boolean()
-  def authoritative_curated?(%Article{} = article) do
-    curated?(article) and not article_in_open_conflict?(article)
+  @spec authoritative_curated?(Article.t(), Ecto.UUID.t()) :: boolean()
+  def authoritative_curated?(%Article{} = article, tenant_id) when is_binary(tenant_id) do
+    curated?(article) and not article_in_open_conflict?(article, tenant_id)
   end
 
   # TRUE when the article is a member of an unresolved auto-generated
@@ -3184,7 +3188,7 @@ defmodule Loopctl.Knowledge do
   # unique across tenants, so id-only correlation is exactly as scoped as an id+tenant
   # filter would be while also participating for system articles (AC-31.1.3). Mirrors
   # open_conflict_subquery/0 and shares conflict_unresolved_subquery/0.
-  defp article_in_open_conflict?(%Article{id: article_id}) do
+  defp article_in_open_conflict?(%Article{id: article_id}, tenant_id) do
     # The SAME fail-open window as `open_conflict_subquery/1` — see the long note there for
     # why suppression expires. These are two separate predicates serving one invariant (the
     # per-article authority check and the list query), so the window MUST be applied to both
@@ -3196,6 +3200,18 @@ defmodule Loopctl.Knowledge do
     query =
       from(l in ArticleLink,
         as: :link,
+        # SCOPED TO THE ASKING TENANT, matching `open_conflict_subquery/1`. Article ids are
+        # GLOBAL, so correlating on the id alone let ANY tenant's conflict link answer this
+        # question — and for a shared system canonical that is a live cross-tenant
+        # suppression: one tenant flags the canonical, every other tenant loses it from
+        # authoritative answers for the whole window, silently and with no audit event.
+        #
+        # The earlier comment claimed the scope could not be added because pinning a nil
+        # `tenant_id` trips Ecto's nil-comparison guard. That confused two different things:
+        # the NULL is on the shared ARTICLE, never on the LINK. A link always belongs to
+        # exactly one tenant, so scoping the link is unblocked — which is why the sibling
+        # subquery has always done it.
+        where: l.tenant_id == ^tenant_id,
         where: l.relationship_type == :potential_conflict,
         where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
         where: l.source_article_id == ^article_id or l.target_article_id == ^article_id,
