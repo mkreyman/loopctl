@@ -26,6 +26,10 @@ defmodule Loopctl.Repo.Migrations.TuneAutovacuumOnAppendHeavyTables do
   `CREATE TABLE ... PARTITION OF` child does NOT inherit reloptions —
   `Loopctl.Workers.AuditPartitionWorker` re-stamps every partition inside the retention
   window on each daily run, which also repairs the reloptions a table REBUILD silently drops.
+  That self-heal covers the `audit_log` partitions ONLY: the four plain tables above are
+  stamped exactly once, here, and a REBUILD (pg_repack, copy-swap, `CREATE TABLE ... LIKE`)
+  silently drops their reloptions with nothing to restore them — re-apply `@opts` by hand
+  after any such rebuild, or #579 comes back unnoticed.
   The corollary: `down/0` does NOT stick for the partitions — the next worker run restores
   them within a day. Rolling back to diagnose an autovacuum problem means stopping that
   worker's cron entry (or changing its constants) as well; the RESET is durable only for the

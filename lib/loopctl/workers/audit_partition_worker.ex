@@ -23,6 +23,15 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
   @default_retention_days 90
   @future_months 3
 
+  # Every statement here is DDL, and `CREATE ... PARTITION OF`, `DROP TABLE` and
+  # `ALTER TABLE ... SET (...)` all require OWNERSHIP of the relation. In production
+  # `Loopctl.Repo` connects as `loopctl_app`, which holds only SELECT/INSERT/UPDATE/DELETE
+  # grants (deploy/FLY_SECRETS.md); migrations — and therefore the partitions they create —
+  # run as `loopctl_admin`, the owner, which is AdminRepo's role. Through Repo every
+  # statement below would fail in prod and be swallowed by the fail-soft warning, leaving
+  # the tuning real only in the dev/test superuser DBs.
+  @ddl_repo Loopctl.AdminRepo
+
   # Autovacuum tuning stamped onto every partition (#579). Append-only leaves accumulate
   # rather than churn, so the INSERT-driven trigger is the knob — the update-churn
   # `vacuum_scale_factor` would wait on dead tuples that never arrive. Kept in lockstep with
@@ -34,6 +43,11 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
     "autovacuum_analyze_scale_factor=#{@analyze_scale_factor}",
     "autovacuum_vacuum_insert_scale_factor=#{@vacuum_insert_scale_factor}"
   ]
+  # The ALTER's SET list is DERIVED from the guard's expected set, never spelled out a second
+  # time: a third reloption added to only one of them would leave the containment check
+  # permanently unsatisfiable, and the worker would re-take the SHARE UPDATE EXCLUSIVE lock
+  # on every retained partition every day — the exact lock the guard exists to avoid.
+  @reloptions_sql Enum.join(@reloptions, ", ")
 
   @impl Oban.Worker
   def perform(_job) do
@@ -79,7 +93,7 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
         FOR VALUES FROM ('#{from_date}') TO ('#{to_date}')
       """
 
-      case SQL.query(Loopctl.Repo, sql, []) do
+      case SQL.query(@ddl_repo, sql, []) do
         {:ok, _} ->
           stamp_autovacuum(partition_name)
 
@@ -108,16 +122,21 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
     # Two statements rather than one `DO $$` block: a DO block takes no bind parameters
     # (`$1` inside it is procedural, not a placeholder), so the name would have to be
     # interpolated into the anonymous block anyway. This way the LOOKUP is parameterised and
-    # only the ALTER interpolates — and that name is generated from a year/month integer pair
-    # by `partition_name/2`, never from caller input.
+    # only the ALTER interpolates. The name is never caller input: the create loop generates
+    # it from a year/month integer pair via `partition_name/2`, and the retention sweep —
+    # which passes a `pg_class.relname`, i.e. database data — only reaches here through the
+    # anchored `~r/^audit_log_y\d{4}m\d{2}$/` filter in `sweep_existing_partitions/0`. Drop
+    # that regex and this interpolation becomes an injection sink.
     #
-    # `to_regclass` resolves through the same search_path the ALTER below binds to, so the
-    # check and the write can never mean two different same-named relations. `<@` requires
-    # BOTH reloptions: keying on the analyze factor alone would read a partition that lost
-    # only `vacuum_insert` as tuned and never restore the insert-driven trigger.
+    # `to_regclass` narrows the check to ONE relation, where the old `relname = $1` could
+    # match same-named relations in several schemas; it resolves through the connection's
+    # search_path, as the unqualified ALTER below does, but nothing in this code BINDS the
+    # two statements to one session — they rely on a uniform search_path config. `<@`
+    # requires BOTH reloptions: keying on the analyze factor alone would read a partition
+    # that lost only `vacuum_insert` as tuned and never restore the insert-driven trigger.
     already_tuned =
       SQL.query(
-        Loopctl.Repo,
+        @ddl_repo,
         "SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND $2 <@ reloptions",
         [partition_name, @reloptions]
       )
@@ -130,14 +149,9 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
   end
 
   defp apply_autovacuum_opts(partition_name) do
-    sql = """
-    ALTER TABLE #{partition_name} SET (
-      autovacuum_analyze_scale_factor = #{@analyze_scale_factor},
-      autovacuum_vacuum_insert_scale_factor = #{@vacuum_insert_scale_factor}
-    )
-    """
+    sql = "ALTER TABLE #{partition_name} SET (#{@reloptions_sql})"
 
-    case SQL.query(Loopctl.Repo, sql, []) do
+    case SQL.query(@ddl_repo, sql, []) do
       {:ok, _} -> :ok
       {:error, reason} -> log_tuning_failure(partition_name, reason)
     end
@@ -155,16 +169,18 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
     cutoff_year = cutoff.year
     cutoff_month = cutoff.month
 
-    # Query pg_inherits for existing partition tables
+    # Query pg_inherits for existing partition LEAVES. `relkind = 'r'` matches the migration
+    # and the test helper: a sub-partitioned child ('p') has no heap and would reject the
+    # ALTER the retained branch now issues.
     {:ok, %{rows: rows}} =
       SQL.query(
-        Loopctl.Repo,
+        @ddl_repo,
         """
         SELECT child.relname
         FROM pg_inherits
         JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
         JOIN pg_class child ON pg_inherits.inhrelid = child.oid
-        WHERE parent.relname = 'audit_log'
+        WHERE parent.relname = 'audit_log' AND child.relkind = 'r'
         ORDER BY child.relname
         """,
         []
@@ -174,7 +190,7 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
         partition_name =~ ~r/^audit_log_y\d{4}m\d{2}$/ do
       case parse_partition_date(partition_name) do
         {year, month} when year < cutoff_year or (year == cutoff_year and month < cutoff_month) ->
-          SQL.query(Loopctl.Repo, "DROP TABLE IF EXISTS #{partition_name}", [])
+          SQL.query(@ddl_repo, "DROP TABLE IF EXISTS #{partition_name}", [])
 
           Logger.info("AuditPartitionWorker dropped expired partition: #{partition_name}")
 
