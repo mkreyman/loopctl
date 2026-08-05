@@ -51,6 +51,7 @@ defmodule Loopctl.Knowledge.OKF do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.IdempotencyTag
 
   @okf_version "0.1"
 
@@ -709,12 +710,36 @@ defmodule Loopctl.Knowledge.OKF do
   # loopctl tags must match ~r/^[a-zA-Z0-9_-]+$/ (<=50 tags, <=100 chars). OKF
   # tags are free strings, so sanitize foreign tags to fit; the originals are
   # preserved under metadata["okf"]["tags"] for lossless re-export.
+  #
+  # A foreign tag can sanitize INTO the reserved idempotency namespace (#583) —
+  # "idem url 7ebe1ca33431" becomes "idem-url-7ebe1ca33431". Those are DROPPED:
+  # an imported document must never GAIN a capture identity it did not write,
+  # and this path coerces rather than fails (a whole import must not die on one
+  # foreign tag). The drop is lossless — the original string is retained under
+  # metadata["okf"]["tags"].
+  #
+  # The discriminator is whether sanitizing CHANGED the string, not whether the
+  # result is reserved. A well-formed reserved tag that arrives byte-identical
+  # is a capture identity the bundle already carries — that is every
+  # loopctl-native bundle, whose frontmatter is this system's own tags — and
+  # dropping it deleted the identity on cross-tenant import and, on the merge
+  # path, off the LIVE row (do_update/5 replaces the whole tags array). The
+  # "captured already?" query then missed and the corpus was re-extracted:
+  # precisely the failure the reservation exists to prevent.
   defp sanitize_tags(tags) do
     tags
-    |> Enum.map(&sanitize_tag/1)
-    |> Enum.reject(&(&1 == ""))
+    |> Enum.map(fn tag -> {tag, sanitize_tag(tag)} end)
+    |> Enum.reject(fn {raw, sanitized} -> drop_tag?(raw, sanitized) end)
+    |> Enum.map(fn {_raw, sanitized} -> sanitized end)
     |> Enum.uniq()
     |> Enum.take(20)
+  end
+
+  defp drop_tag?(_raw, ""), do: true
+
+  defp drop_tag?(raw, sanitized) do
+    IdempotencyTag.reserved?(sanitized) and
+      (raw != sanitized or not IdempotencyTag.well_formed?(sanitized))
   end
 
   defp sanitize_tag(tag) when is_binary(tag) do

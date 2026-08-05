@@ -4,6 +4,7 @@ defmodule Loopctl.Knowledge.OKFTest do
   setup :verify_on_exit!
 
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.IdempotencyTag
   alias Loopctl.Knowledge.OKF
 
   @fixtures_root Path.join([File.cwd!(), "test", "support", "okf_fixtures"])
@@ -338,6 +339,118 @@ defmodule Loopctl.Knowledge.OKFTest do
       extra = okf_meta["extra"] || %{}
       refute Map.has_key?(extra, "loopctl_links_truncated")
       refute Map.has_key?(okf_meta, "loopctl_links_truncated")
+    end
+  end
+
+  describe "#583: a foreign tag that sanitizes into the reserved namespace is dropped" do
+    test "the import succeeds, the reserved-shaped tag is not stored, and the original survives" do
+      tenant = fixture(:tenant)
+
+      # OKF tags are free strings. Sanitization maps runs of illegal characters to
+      # "-", so these two foreign tags land on "idem-url-7ebe1ca33431" (well-formed)
+      # and "idem-design" (free text) — one of each side of the guard.
+      frontmatter =
+        ~s(---\ntype: pattern\ntitle: Foreign Tags\n) <>
+          ~s(tags: ["idem url 7ebe1ca33431", "idem design", "url design", "ecto"]\n) <>
+          ~s(---\n\nbody\n)
+
+      files = %{"pattern/x.md" => frontmatter}
+
+      assert {:ok, report} = OKF.import_files(tenant.id, files)
+      assert report.created == 1
+      assert report.errors == []
+
+      %{data: [a]} = Knowledge.list_articles(tenant.id, category: :pattern)
+
+      reserved =
+        Enum.filter(a.tags, &String.starts_with?(&1, IdempotencyTag.reserved_prefix()))
+
+      assert reserved == []
+      # The import is not gutted: topical tags still make it through.
+      assert "url-design" in a.tags
+      assert "ecto" in a.tags
+
+      # And the drop is lossless — the originals stay under metadata["okf"]["tags"].
+      assert "idem url 7ebe1ca33431" in a.metadata["okf"]["tags"]
+    end
+
+    test "a malformed reserved tag that arrives byte-identical is dropped, not 422'd" do
+      tenant = fixture(:tenant)
+
+      # "idem-design" needs no sanitizing, so it would reach the changeset and
+      # fail the whole file. This path coerces rather than fails.
+      frontmatter =
+        ~s(---\ntype: pattern\ntitle: Literal Reserved\n) <>
+          ~s(tags: ["idem-design", "ecto"]\n---\n\nbody\n)
+
+      assert {:ok, report} = OKF.import_files(tenant.id, %{"pattern/x.md" => frontmatter})
+      assert report.created == 1
+      assert report.errors == []
+
+      %{data: [a]} = Knowledge.list_articles(tenant.id, category: :pattern)
+      refute "idem-design" in a.tags
+      assert "ecto" in a.tags
+    end
+
+    test "a WELL-FORMED reserved tag that arrives byte-identical survives the import" do
+      tenant = fixture(:tenant)
+
+      frontmatter =
+        ~s(---\ntype: pattern\ntitle: Own Identity\n) <>
+          ~s(tags: ["idem-url-7ebe1ca33431", "ecto"]\n---\n\nbody\n)
+
+      assert {:ok, report} = OKF.import_files(tenant.id, %{"pattern/x.md" => frontmatter})
+      assert report.created == 1
+      assert report.errors == []
+
+      %{data: [a]} = Knowledge.list_articles(tenant.id, category: :pattern)
+      assert "idem-url-7ebe1ca33431" in a.tags
+    end
+  end
+
+  describe "#583: a bundle's own capture identity survives the OKF round trip" do
+    test "cross-tenant import keeps the reserved tag on the destination article" do
+      source = fixture(:tenant)
+
+      published(source.id, %{
+        title: "Captured Article",
+        category: :reference,
+        tags: ["idem-url-7ebe1ca33431", "postgres"],
+        body: "captured body"
+      })
+
+      {:ok, %{files: files}} = OKF.build_bundle(source.id, max_articles: 10_000)
+
+      dest = fixture(:tenant)
+      assert {:ok, report} = OKF.import_files(dest.id, files)
+      assert report.created == 1
+      assert report.errors == []
+
+      %{data: [a]} = Knowledge.list_articles(dest.id, category: :reference)
+      assert "idem-url-7ebe1ca33431" in a.tags
+      assert "postgres" in a.tags
+    end
+
+    test "same-tenant merge does not strip the reserved tag off the LIVE row" do
+      tenant = fixture(:tenant)
+
+      article =
+        published(tenant.id, %{
+          title: "Captured Article",
+          category: :reference,
+          tags: ["idem-url-7ebe1ca33431", "url-design"],
+          body: "captured body"
+        })
+
+      {:ok, %{files: files}} = OKF.build_bundle(tenant.id, max_articles: 10_000)
+
+      assert {:ok, report} = OKF.import_files(tenant.id, files, merge: true)
+      assert report.updated == 1
+      assert report.errors == []
+
+      {:ok, reloaded} = Knowledge.get_article(tenant.id, article.id)
+      assert "idem-url-7ebe1ca33431" in reloaded.tags
+      assert "url-design" in reloaded.tags
     end
   end
 

@@ -5,6 +5,20 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.70.0 — 2026-08-05 (the idem- tag namespace is reserved)
+
+### Changed
+
+- **`knowledge_create` / `knowledge_update` — the `idem-` tag prefix is RESERVED** (loopctl
+  issue #583). A tag starting with `idem-` must be `idem-<family>-<digest>`, where `<digest>`
+  is a 12- or 40-character lowercase hex digest (e.g. `idem-url-7ebe1ca33431`); both lengths
+  are accepted because the harvest sourcers' suffix was truncated from a full sha1 to 12.
+  Anything else claiming the prefix — `idem-design`, `idem-url-notahex` — is rejected with a
+  422, and is NEVER silently re-prefixed, so you always know what was stored. Topical tags
+  outside the prefix are unaffected. For idempotent capture use the `idempotency_key` field:
+  it has a per-tenant unique index and is server-guaranteed, whereas a tag is caller-controlled
+  data. Tool descriptions updated; no schema or transport change.
+
 ## 2.69.0 — 2026-08-05 (read the nightly consolidation report)
 
 ### Added

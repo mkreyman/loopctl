@@ -155,6 +155,28 @@ defmodule Loopctl.Workers.KnowledgeMocWorkerTest do
       assert moc_hub(tenant.id, "rust")
       assert moc_hub(tenant.id, "separation-of-concerns")
     end
+
+    # #583: capture ids moved into the reserved `idem-` namespace. The exclusion above
+    # matches by PREFIX, and `url-` is not a prefix of `idem-url-…`, so the reserved form
+    # would otherwise clear every filter (3 segments, hex tail, not structural) and get
+    # PUBLISHED as `Index: idem-url-<digest>` — one junk hub per source digest.
+    test "excludes RESERVED idempotency tags — a capture id never becomes a hub topic" do
+      tenant = fixture(:tenant)
+
+      for n <- 1..3 do
+        published(tenant.id, "Chunk #{n}", ["idem-url-7ebe1ca33431"])
+        published(tenant.id, "Book chunk #{n}", ["idem-book-7ebe1ca33431"])
+        published(tenant.id, "Legacy chunk #{n}", ["url-7ebe1ca33431"])
+        published(tenant.id, "Real topic #{n}", ["otp"])
+      end
+
+      assert :ok = run(tenant.id)
+
+      refute moc_hub(tenant.id, "idem-url-7ebe1ca33431")
+      refute moc_hub(tenant.id, "idem-book-7ebe1ca33431")
+      refute moc_hub(tenant.id, "url-7ebe1ca33431")
+      assert moc_hub(tenant.id, "otp")
+    end
   end
 
   describe "all_tenants fan-out" do

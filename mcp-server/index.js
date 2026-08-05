@@ -4734,7 +4734,14 @@ const TOOLS = [
         tags: {
           type: "array",
           items: { type: "string" },
-          description: "Optional: list of tags.",
+          description:
+            "Optional: list of TOPICAL tags. RESERVED NAMESPACE: the 'idem-' prefix belongs " +
+            "to per-source idempotency keys — a tag starting with it must be " +
+            "idem-<family>-<digest> where <digest> is a 12- or 40-character lowercase hex " +
+            "digest (e.g. idem-url-7ebe1ca33431), or the write is REJECTED with a 422. It is " +
+            "never silently rewritten. Do not put a topic in that prefix. For idempotent " +
+            "capture use the idempotency_key field, which is server-guaranteed unique per " +
+            "tenant — a tag is not.",
         },
         project_id: {
           type: "string",
@@ -4836,7 +4843,11 @@ const TOOLS = [
         tags: {
           type: "array",
           items: { type: "string" },
-          description: "Optional: REPLACES the whole tags array (send the full desired set).",
+          description:
+            "Optional: REPLACES the whole tags array (send the full desired set). RESERVED " +
+            "NAMESPACE: a tag starting with 'idem-' must be idem-<family>-<digest> " +
+            "(<digest> = 12 or 40 lowercase hex chars, e.g. idem-url-7ebe1ca33431) or the " +
+            "update is REJECTED with a 422 — it is never silently rewritten.",
         },
         metadata: {
           type: "object",

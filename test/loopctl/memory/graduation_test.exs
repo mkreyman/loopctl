@@ -236,5 +236,44 @@ defmodule Loopctl.Memory.GraduationTest do
 
       assert count == 1
     end
+
+    # #583: the graduation tag sanitizer is a declared MIRROR of the Article changeset's
+    # tag rules, and the reserved idempotency namespace added a rule to that changeset.
+    # If the mirror falls behind, the article insert fails, the structural-error branch
+    # STAMPS the memory graduated, and the memory's one-shot graduation is consumed with
+    # no article ever created — an unrecoverable silent loss.
+    test "a memory carrying a malformed RESERVED tag still graduates (the tag is dropped, not the memory)",
+         %{scope: scope, tenant: tenant} do
+      memory =
+        fixture(:memory,
+          tenant_id: scope.tenant_id,
+          subject_id: scope.subject_id,
+          text: "hot memory the extractor tagged with a reserved-looking topic",
+          tags: ["idem-design", "elixir"]
+        )
+
+      assert {:ok, _verdict, article} = Memory.graduate_memory(scope, memory.id)
+      assert "elixir" in article.tags
+      refute "idem-design" in article.tags
+
+      count =
+        from(a in Article, where: a.tenant_id == ^tenant.id) |> AdminRepo.aggregate(:count, :id)
+
+      assert count == 1
+    end
+
+    test "a WELL-FORMED reserved capture tag survives graduation (the capture identity is kept)",
+         %{scope: scope} do
+      memory =
+        fixture(:memory,
+          tenant_id: scope.tenant_id,
+          subject_id: scope.subject_id,
+          text: "a memory that carries a real capture identity",
+          tags: ["idem-url-7ebe1ca33431"]
+        )
+
+      assert {:ok, _verdict, article} = Memory.graduate_memory(scope, memory.id)
+      assert "idem-url-7ebe1ca33431" in article.tags
+    end
   end
 end

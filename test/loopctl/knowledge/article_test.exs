@@ -5,6 +5,7 @@ defmodule Loopctl.Knowledge.ArticleTest do
 
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.Categories
+  alias Loopctl.Knowledge.IdempotencyTag
 
   describe "agent-memory metadata conventions (#151)" do
     defp memory_changeset(metadata) do
@@ -413,6 +414,93 @@ defmodule Loopctl.Knowledge.ArticleTest do
 
       refute changeset.valid?
       assert "each tag must be a string" in errors_on(changeset)[:tags]
+    end
+  end
+
+  describe "reserved idempotency tag namespace (#583)" do
+    defp tag_changeset(tags) do
+      Article.create_changeset(%Article{}, %{
+        title: "Reserved #{System.unique_integer([:positive])}",
+        body: "Content",
+        category: :pattern,
+        tags: tags
+      })
+    end
+
+    defp reserved_errors(changeset) do
+      changeset
+      |> errors_on()
+      |> Map.get(:tags, [])
+      |> Enum.filter(&String.contains?(&1, IdempotencyTag.reserved_prefix()))
+    end
+
+    test "rejects free text in the reserved namespace on create" do
+      changeset = tag_changeset(["idem-design"])
+
+      refute changeset.valid?
+      errors = reserved_errors(changeset)
+      assert errors != []
+      assert Enum.any?(errors, &String.contains?(&1, "idem-design"))
+      # The message names the remedy, not just the rule.
+      assert Enum.any?(errors, &String.contains?(&1, IdempotencyTag.example()))
+    end
+
+    test "rejects free text in the reserved namespace on update" do
+      changeset = Article.update_changeset(%Article{tags: []}, %{tags: ["idem-url-notahex"]})
+
+      refute changeset.valid?
+      assert reserved_errors(changeset) != []
+    end
+
+    test "rejects a reserved-prefixed tag with a wrong-length digest" do
+      # 11 hex chars: neither the 12-char era nor the 40-char era.
+      changeset = tag_changeset(["idem-url-7ebe1ca3343"])
+
+      refute changeset.valid?
+      assert reserved_errors(changeset) != []
+    end
+
+    test "accepts a well-formed reserved tag in the 12-hex era" do
+      assert tag_changeset(["idem-url-7ebe1ca33431"]).valid?
+    end
+
+    test "accepts a well-formed reserved tag in the 40-hex era" do
+      assert tag_changeset(["idem-url-" <> String.duplicate("a1b2", 10)]).valid?
+    end
+
+    test "accepts well-formed reserved tags for every source family" do
+      assert tag_changeset([
+               "idem-url-7ebe1ca33431",
+               "idem-doc-0123456789ab",
+               "idem-book-abcdef012345",
+               "idem-yt-fedcba987654"
+             ]).valid?
+    end
+
+    test "still accepts the topical tags that collided with the old namespace" do
+      assert tag_changeset([
+               "url-design",
+               "url-generation",
+               "url-encoding",
+               "url-routing",
+               "url-normalization",
+               "url-management"
+             ]).valid?
+    end
+
+    test "still accepts the legacy bare idempotency form (client half not shipped yet)" do
+      assert tag_changeset(["url-7ebe1ca33431"]).valid?
+    end
+
+    test "leaves the tag count, length and character rules unchanged" do
+      over_cap = Enum.map(1..(Article.max_tags() + 1), &"tag-#{&1}")
+
+      assert "must not exceed #{Article.max_tags()} tags" in errors_on(tag_changeset(over_cap))[
+               :tags
+             ]
+
+      assert errors_on(tag_changeset([String.duplicate("a", 101)]))[:tags]
+      assert errors_on(tag_changeset(["invalid tag!"]))[:tags]
     end
   end
 

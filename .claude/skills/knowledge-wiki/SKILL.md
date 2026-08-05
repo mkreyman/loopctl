@@ -98,6 +98,42 @@ never pass `tenant_id`/`subject_id`.
    `ArticleAccessEvent.@access_types` requires the same value in `Analytics.@valid_access_types` —
    there is no DB CHECK, those two allowlists ARE the enforcement.
 
+6. **The `idem-` tag namespace is reserved, enforced at write time, and is NOT an idempotency
+   mechanism** — `Loopctl.Knowledge.IdempotencyTag`, enforced from the one place both changesets
+   converge (`validate_tag_format/2` in `article.ex`), so it binds every writer (API controllers,
+   `ContentIngestionWorker`, `ReviewKnowledgeWorker`, OKF import) rather than one call site — the
+   same reasoning as `Coordination`'s reserved `claim:` key prefix. A tag claiming the prefix must
+   be `idem-<family>-<digest>` with a **12- or 40-char** lowercase hex digest: both eras, because
+   the sourcers' suffix was truncated from a full sha1 to 12 and a rule that knew only the current
+   form is the drift bug that made pre-truncation captures invisible. Malformed → 422 naming the
+   remedy; **never** a silent re-prefix (rewriting a caller's tags makes the response body a lie).
+   The 422 is what a CALLER sees on `POST`/`PATCH /api/v1/articles`. Every MACHINE path drops
+   the tag instead, because a whole batch must not die on one string a model or a foreign
+   document produced: OKF `sanitize_tags/1` drops a tag that sanitizing COERCED into the
+   namespace (discriminating on whether the string CHANGED — a well-formed reserved tag arriving
+   byte-identical is the article's own capture identity and MUST survive, or a native bundle's
+   round trip and the merge path silently delete it); `ReviewKnowledgeWorker` and
+   `ContentIngestionWorker` strip a malformed reserved tag from extractor output pre-insert
+   (a review's articles share one `Multi` whose `:insert_failed` changeset discards the job
+   permanently, and an ingested article whose changeset is invalid is dropped WHOLE — body and
+   all — before `insert_all`); and `Memory.sanitize_graduation_tags/1` filters one out, since a
+   failed graduation insert still STAMPS the memory graduated and burns its one shot.
+   **Any new tag rule on the Article changeset must be mirrored in those four**, and in
+   `KnowledgeMocWorker`'s `@excluded_prefixes`, which suppresses `idem-` so a capture id can
+   never become a published `Index:` hub (its match is by PREFIX: `url-` does NOT cover
+   `idem-url-…`).
+   The reservation is FORWARD-looking: pre-reservation tags carry the bare `<family>-<digest>` form
+   with no prefix to match on, so reads need the independent shape discriminator `legacy?/1`, and
+   the bare form is still WRITABLE until the client half (mkreyman/claude-config#222) adopts the
+   reserved form. `legacy?/1` requires BOTH a known source family and a hex digest — a bare
+   `<anything>-<hex>` also describes `commit-<sha>` and `release-202604150930`, and promoting one
+   of those fabricates a capture identity that `--drop-legacy` then makes irreversible.
+   `mix loopctl.reserve_idempotency_tags` promotes the corpus (dry-run default;
+   `--drop-legacy` is the second pass, only after clients switch).
+   **What this is not:** a tag is caller-controlled data, so reserving its namespace is defense in
+   depth, not authority. The server-guaranteed key is the `articles.idempotency_key` column with
+   its per-tenant unique index — prefer it, and do not treat a tag as proof of capture identity.
+
 ## Ranking changes are gated by the golden-question eval (#469)
 
 Any change to `search_combined/3` ranking (weights, fusion, recency/authority) must ship with a

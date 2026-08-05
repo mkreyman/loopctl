@@ -31,6 +31,38 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **BREAKING (tags): the `idem-` tag prefix is now RESERVED for per-source idempotency keys
+  (#583).** A tag starting with `idem-` must be `idem-<family>-<digest>` where `<digest>` is a
+  12- or 40-character lowercase hex digest (e.g. `idem-url-7ebe1ca33431`); both digest lengths
+  are accepted because the harvest sourcers' suffix used to be a full sha1 and is now
+  truncated. Anything else claiming the prefix — `idem-design`, `idem-url-notahex` — is now
+  rejected `422` on `POST /api/v1/articles` and `PATCH /api/v1/articles/:id`, and by the
+  changeset underneath every other writer, so nothing is ever silently re-prefixed and a
+  caller always knows what was stored. **The MACHINE paths drop the tag instead of failing**, on
+  purpose: OKF import drops a foreign tag that sanitizes into the reserved namespace (the
+  original string is preserved under `metadata["okf"]["tags"]`, and a well-formed reserved tag
+  that arrives unchanged — every loopctl-native bundle — round-trips intact), the review worker
+  and the content-ingestion worker strip a malformed reserved tag out of extractor output before
+  insert (all of a review's extracted articles share one transaction, and an ingested article
+  whose changeset is invalid is dropped whole, body included), and memory graduation filters one
+  out of a memory's tags so a hot memory can never burn its one-shot graduation on an article
+  that fails to insert. Script against a `422` only on the two
+  API endpoints. Topical tags outside the prefix are unaffected, and the bare pre-reservation
+  form (`url-<hex>`) is still accepted so existing sourcers keep working. For
+  server-guaranteed idempotency prefer the `idempotency_key` field, which has a per-tenant
+  unique index — a tag is caller-controlled data.
+- **Manual step (optional, operator-run): `mix loopctl.reserve_idempotency_tags` (#583).**
+  Promotes pre-reservation `<family>-<digest>` tags to their reserved counterpart across the
+  corpus. Dry-run by default; `--apply` writes, `--tenant <uuid>` restricts scope. The first
+  pass ADDS `idem-url-<hex>` alongside the existing `url-<hex>` so current dedup reads keep
+  working; run it again with `--drop-legacy` to remove the bare form only after every client
+  has switched to the reserved tag. Re-running is a no-op — a tag is never double-prefixed.
+  Promotion requires BOTH halves of the shape: a known source family (`url`, `doc`, `book`,
+  `yt`, `repo`, `img`, `file`, `vid`, `web`) AND a 12- or 40-char lowercase hex digest. So
+  `url-design` is left alone (no digest), and so is `commit-<sha>` or `release-202604150930`
+  (not a source family) — an unknown family is never promoted, because promoting it would
+  fabricate a capture identity and `--drop-legacy` would then delete the original tag. An
+  unrecognised switch aborts the run rather than being ignored.
 - **`GET /api/v1/knowledge/analytics/retrieval-metrics` gained four fields and a stated
   denominator (#582).** `precision` and its `searched` denominator are UNCHANGED — `searched`
   has always counted RECORDED SURFACED RESULTS (one `article_access_events` row per result a

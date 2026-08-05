@@ -6,6 +6,7 @@ defmodule LoopctlWeb.ArticleControllerTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.IdempotencyTag
   alias Loopctl.Knowledge.IngestionWriteStats
 
   import Ecto.Query
@@ -2058,6 +2059,86 @@ defmodule LoopctlWeb.ArticleControllerTest do
 
       body = json_response(conn, 200)
       assert body["data"]["project_id"] == project.id
+    end
+  end
+
+  describe "reserved idempotency tag namespace (#583)" do
+    @hex12 "7ebe1ca33431"
+
+    defp tag_details(body) do
+      get_in(body, ["error", "details", "tags"]) || []
+    end
+
+    test "POST rejects free text in the reserved namespace with a 422 naming the remedy", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Reserved Namespace Probe",
+          "body" => "Body content for the reserved namespace probe.",
+          "category" => "pattern",
+          "tags" => ["idem-design"]
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+
+      details = tag_details(body)
+      assert details != []
+      assert Enum.any?(details, &(&1 =~ "idem-design"))
+      assert Enum.any?(details, &(&1 =~ IdempotencyTag.example()))
+
+      refute AdminRepo.exists?(
+               from(a in Article,
+                 where: a.tenant_id == ^tenant.id and a.title == "Reserved Namespace Probe"
+               )
+             )
+    end
+
+    test "POST accepts a well-formed reserved tag and the colliding topical tags", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Reserved Namespace Accepted",
+          "body" => "Body content for the accepted reserved tag.",
+          "category" => "pattern",
+          "tags" => ["idem-url-#{@hex12}", "url-design", "url-#{@hex12}"]
+        })
+
+      body = json_response(conn, 201)
+      assert "idem-url-#{@hex12}" in body["data"]["tags"]
+      assert "url-design" in body["data"]["tags"]
+    end
+
+    test "PATCH rejects free text in the reserved namespace and leaves the tags unchanged", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      article =
+        fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["url-design"]})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/articles/#{article.id}", %{"tags" => ["idem-url-notahex"]})
+
+      body = json_response(conn, 422)
+      details = tag_details(body)
+      assert details != []
+      assert Enum.any?(details, &(&1 =~ IdempotencyTag.reserved_prefix()))
+
+      assert AdminRepo.get!(Article, article.id).tags == ["url-design"]
     end
   end
 end

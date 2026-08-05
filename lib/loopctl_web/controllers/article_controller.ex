@@ -32,6 +32,7 @@ defmodule LoopctlWeb.ArticleController do
   alias Loopctl.Auth.Role
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.IdempotencyTag
   alias Loopctl.TelemetryEvents
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.AuditContext
@@ -95,7 +96,11 @@ defmodule LoopctlWeb.ArticleController do
                  "ingestion path has the OPPOSITE polarity — POST /knowledge/ingest is " <>
                  "draft-by-default; pass publish: true there.)"
            },
-           tags: %OpenApiSpex.Schema{type: :array, items: %OpenApiSpex.Schema{type: :string}},
+           tags: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{type: :string},
+             description: IdempotencyTag.contract_description()
+           },
            project_id: %OpenApiSpex.Schema{type: :string, format: :uuid, nullable: true},
            source_type: %OpenApiSpex.Schema{type: :string, nullable: true},
            source_id: %OpenApiSpex.Schema{type: :string, format: :uuid, nullable: true},
@@ -148,7 +153,10 @@ defmodule LoopctlWeb.ArticleController do
       409 =>
         {"Title taken by an article with different content", "application/json",
          Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error — includes a tag claiming the reserved idempotency " <>
+           "namespace without matching its shape. " <> IdempotencyTag.contract_description(),
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -318,7 +326,10 @@ defmodule LoopctlWeb.ArticleController do
            "status_change_forbidden); use the lifecycle endpoints instead", "application/json",
          Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error — includes a tag claiming the reserved idempotency " <>
+           "namespace without matching its shape. " <> IdempotencyTag.contract_description(),
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )

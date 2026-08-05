@@ -45,6 +45,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   import Loopctl.Llm.ShapeError, only: [is_shape_error: 1]
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.IdempotencyTag
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Llm.ShapeError
@@ -274,7 +275,36 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   defp validate_and_filter(raw_articles) do
     raw_articles
     |> Enum.take(@max_articles)
+    |> Enum.map(&drop_reserved_namespace_tags/1)
     |> Enum.filter(&valid_article?/1)
+  end
+
+  # The reserved idempotency namespace (#583) is a create_changeset/2 rule, and
+  # every extracted article of a review goes into ONE Multi — so a single
+  # model-invented "idem-design" (free text: the extractor is only asked for
+  # "short lowercase strings", and that string passes @tag_pattern and the
+  # length/count checks below) would fail its insert, and an :insert_failed
+  # changeset classifies as a PERMANENT error, discarding the whole review's
+  # extraction on the first attempt.
+  #
+  # Strip the offending tag rather than fail the article or the batch — the same
+  # polarity the OKF import path takes for a machine-produced tag it cannot
+  # accept. A WELL-FORMED reserved tag is left alone: it is writable, and this
+  # is a filter for what the schema rejects, not a second opinion about it.
+  defp drop_reserved_namespace_tags(attrs) when is_map(attrs) do
+    case Enum.find([:tags, "tags"], fn key -> is_list(Map.get(attrs, key)) end) do
+      nil ->
+        attrs
+
+      key ->
+        Map.put(attrs, key, Enum.reject(Map.get(attrs, key), &reserved_namespace_violation?/1))
+    end
+  end
+
+  defp drop_reserved_namespace_tags(attrs), do: attrs
+
+  defp reserved_namespace_violation?(tag) do
+    IdempotencyTag.reserved?(tag) and not IdempotencyTag.well_formed?(tag)
   end
 
   defp valid_article?(attrs) when is_map(attrs) do

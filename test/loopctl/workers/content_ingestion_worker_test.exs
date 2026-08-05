@@ -630,6 +630,82 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "ingestion")
       assert length(articles) == 10
     end
+
+    # #583: the reserved namespace is a create_changeset/2 rule, and build_rows/3 drops
+    # an article whose changeset is invalid — silently, before insert_all. The extractor
+    # is asked for "short lowercase strings" and knows nothing of the namespace, so a
+    # model-invented "idem-design" would cost the whole article, body and all. Strip the
+    # tag instead, matching ReviewKnowledgeWorker and the OKF import.
+    test "strips a malformed RESERVED tag instead of discarding the whole extracted article" do
+      %{tenant: tenant} = setup_tenant()
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
+        {:ok,
+         [
+           %{
+             title: "Reserved-tagged",
+             body: "Body worth keeping.",
+             category: :pattern,
+             tags: ["idem-design", "otp"]
+           }
+         ]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 104,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "Content",
+                   "content_hash" => "reserved_tag_test",
+                   "source_type" => "ingestion"
+                 }
+               })
+
+      %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "ingestion")
+      assert [article] = articles
+      assert article.title == "Reserved-tagged"
+      assert article.tags == ["otp"]
+
+      # The whole article survived, body and all — the stripped tag cost only the tag.
+      assert {:ok, full} = Knowledge.get_article(tenant.id, article.id)
+      assert full.body == "Body worth keeping."
+    end
+
+    test "keeps a WELL-FORMED reserved capture tag on an ingested article" do
+      %{tenant: tenant} = setup_tenant()
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
+        {:ok,
+         [
+           %{
+             title: "Captured",
+             body: "Body.",
+             category: :pattern,
+             tags: ["idem-url-7ebe1ca33431", "otp"]
+           }
+         ]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 105,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "Content",
+                   "content_hash" => "reserved_tag_keep_test",
+                   "source_type" => "ingestion"
+                 }
+               })
+
+      %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "ingestion")
+      assert [article] = articles
+      assert article.tags == ["idem-url-7ebe1ca33431", "otp"]
+    end
   end
 
   # --- Empty extractor output ---
