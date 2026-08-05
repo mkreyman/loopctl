@@ -295,6 +295,10 @@ mix ecto.reset         # Drop, create, migrate
 ## Key Documents
 
 - **PRD**: `docs/prd.md` — full product requirements
+- **Research notes**: `docs/research/*.md` — the reasoning behind a design, kept because it
+  outlives the code. Prior art, what was measured, and what was rejected and why. Read the
+  relevant one before redesigning a subsystem it covers; a decision reversed without its
+  rationale tends to get re-reversed.
 - **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — one file per story, one folder per epic
 - **Orchestration skills**: `skills/loopctl-*.md` — the orchestration LOOP itself (dispatch, review, verify)
 - **Domain skills**: `.claude/skills/<domain>/SKILL.md` — code-map + invariants skills, loaded when you touch that domain (routing table below). Distinct from the `skills/loopctl-*.md` orchestration skills above.
