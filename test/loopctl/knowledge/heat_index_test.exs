@@ -13,6 +13,9 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
   use Loopctl.DataCase, async: true
 
   alias Loopctl.AdminRepo
+  alias Loopctl.DbCapacity
+  alias Loopctl.HeavyRead
+  alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge
 
   setup :verify_on_exit!
@@ -780,6 +783,41 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert log =~ "sqlstate=53300"
       assert log =~ "sqlstate=42703"
       refute log =~ "sqlstate=too_many_connections"
+    end
+
+    test "the node-level admin gate sheds at its cap, and gives the slot back either way" do
+      # This gate is the only thing keeping a per-turn endpoint off the LAST of AdminRepo's 3
+      # connections, which custody writes and the per-request auth SELECT share. Saturate it
+      # from outside and the endpoint must shed rather than queue behind them.
+      #
+      # Non-vacuous by construction: delete the gate from `heat_stub_projection/2` and
+      # `heat_index/2` succeeds here instead of raising, so this test fails.
+      tenant = fixture(:tenant)
+      article = published_article(tenant.id, %{title: "Readable"})
+      heat(tenant.id, article, 2)
+
+      key = "knowledge.heat_stub_projection"
+      cap = max(1, DbCapacity.runtime_pool_sizes().admin_repo - 1)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          :ok = TenantGate.acquire(key, cap, cap)
+
+          try do
+            assert_raise HeavyRead.OverloadedError, fn -> Knowledge.heat_index(tenant.id) end
+          after
+            TenantGate.release(key, cap)
+          end
+        end)
+
+      # A NODE-wide shed must not be logged as one tenant reading too much — that is how
+      # saturation of a shared pool gets mistaken for ordinary per-tenant backpressure.
+      assert log =~ "admin_pool_node_gate_shed"
+
+      # And the slot comes back on BOTH paths: the index answers again, and the node-wide
+      # counter is back to zero rather than leaking a permit per shed.
+      assert {:ok, %{results: [%{title: "Readable"}]}} = Knowledge.heat_index(tenant.id)
+      assert TenantGate.count(key) == 0
     end
 
     test "truncated says the list is partial, since nothing else in the payload would" do

@@ -49,6 +49,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Audit
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Custody
+  alias Loopctl.DbCapacity
   alias Loopctl.Egress
   alias Loopctl.Egress.Policy, as: EgressPolicy
   alias Loopctl.Egress.Scope, as: EgressScope
@@ -56,6 +57,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.ExitClass
   alias Loopctl.ExitTag
   alias Loopctl.HeavyRead
+  alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
@@ -9390,7 +9392,49 @@ defmodule Loopctl.Knowledge do
   # nothing in the logs said otherwise. The `:exit` clause also catches exits that are not pool
   # pressure at all (a shutdown, a sandbox ownership exit), which is exactly why its reason has
   # to reach the log rather than be discarded into an overload label.
+  # NODE-level admission on top of the per-tenant one. `HeavyRead.with_slot/3` in
+  # `heat_index/2` bounds how many of THIS tenant's heat reads are in flight; nothing bounded
+  # the AGGREGATE across tenants. `TenantGate` counts per key, so N tenants each admitted at
+  # their own cap queue up to N concurrent checkouts on `AdminRepo` — a 3-connection pool
+  # (`ADMIN_POOL_SIZE || "3"`, config/runtime.exs) that custody writes and the per-request auth
+  # SELECT also use. The per-read `:timeout` bounds how long each waiter blocks; it does not
+  # bound how many waiters there are.
+  #
+  # The key is a FIXED string, not a tenant id — that is what makes the count node-wide.
+  # `TenantGate.acquire/3` only guards `is_binary/1`, so a non-UUID key is legal and cannot
+  # collide with a real tenant. Capped at `admin_repo - 1` so heat can never take the LAST
+  # admin connection out from under a custody write.
+  @heat_admin_gate_key "knowledge.heat_stub_projection"
+
   defp heat_stub_projection(query, tenant_id) do
+    cap = max(1, DbCapacity.runtime_pool_sizes().admin_repo - 1)
+
+    case TenantGate.acquire(@heat_admin_gate_key, 1, cap) do
+      :ok ->
+        try do
+          heat_admin_read(query, tenant_id)
+        after
+          TenantGate.release(@heat_admin_gate_key, 1)
+        end
+
+      {:error, :heavy_read_overloaded} ->
+        # Logged under its OWN tag and deliberately not wearing the per-tenant label. This
+        # bound is node-wide, so `OverloadedError`'s default message ("the per-tenant in-flight
+        # capacity for this tenant") would attribute saturation of the SHARED admin pool to
+        # whichever tenant happened to arrive last — the same systemic-fault-dressed-as-one-
+        # noisy-tenant confusion the rescue arms below exist to prevent. The client-facing 429
+        # body comes from `LoopctlWeb.ErrorJSON`, not from this message.
+        Logger.warning(
+          "heat_stub_projection: admin_pool_node_gate_shed tenant_id=#{tenant_id} cap=#{cap}"
+        )
+
+        raise HeavyRead.OverloadedError,
+          tenant_id: tenant_id,
+          message: "heat stub projection shed at the node-level admin-pool bound"
+    end
+  end
+
+  defp heat_admin_read(query, tenant_id) do
     AdminRepo.all(query, timeout: @heat_stub_timeout_ms)
   rescue
     e in [DBConnection.ConnectionError, Postgrex.Error] ->
