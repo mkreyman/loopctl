@@ -5,6 +5,22 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.69.0 — 2026-08-05 (read the nightly consolidation report)
+
+### Added
+
+- **`knowledge_consolidation`** (issue #584, stage 1 of 3) — reads the nightly consolidation
+  ("dream") report: numbered proposals for reconciling the corpus, each naming the articles
+  involved and quoting an excerpt from each as evidence. Four classes: `duplicate_capture`
+  (title or idempotency-tag format drift — the novelty gate does not catch it because novelty
+  scoring and idempotency are separate paths), `contradiction_candidate` (a conflict-flagged
+  pair with no recorded verdict — record one with `knowledge_resolve_conflict`),
+  `generic_title`, `stale_entry`. **Report only:** the pass writes no articles, links or
+  conflict resolutions, every proposal is `pending`, and this tool applies nothing.
+  `proposal_count` counts PROPOSALS, not articles — one duplicate group of three articles is
+  one proposal — and `persisted_count` is lower exactly when a class hit its per-class cap.
+  Requires an orchestrator key. Optional `day`, `class`, `limit`, `offset`.
+
 ## 2.68.0 — 2026-08-05 (the precision denominator says what it counts)
 
 ### Changed

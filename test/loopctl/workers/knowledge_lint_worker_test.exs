@@ -182,6 +182,43 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert entry.new_state["orphans_embedding_enqueued"] == 3
     end
 
+    test "#584: runs the consolidation pass inside the SAME nightly run, report-only" do
+      tenant = fixture(:tenant)
+      published_article_with_embedding(tenant.id, similar_embedding(), %{title: "Retry Policy"})
+      published_article_with_embedding(tenant.id, similar_embedding(), %{title: "retry-policy!"})
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      # One consolidation report for the tenant, produced by the lint run — no second
+      # scheduler, no second corpus scan.
+      assert [report] =
+               AdminRepo.all(
+                 from(r in Loopctl.Knowledge.ConsolidationReport,
+                   where: r.tenant_id == ^tenant.id
+                 )
+               )
+
+      assert report.day == Date.utc_today()
+      assert report.proposals_by_class["duplicate_capture"] == 1
+
+      assert [proposal] =
+               AdminRepo.all(
+                 from(p in Loopctl.Knowledge.ConsolidationProposal,
+                   where: p.tenant_id == ^tenant.id
+                 )
+               )
+
+      assert proposal.proposal_class == :duplicate_capture
+      assert proposal.review_status == :pending
+      assert length(proposal.evidence) == 2
+
+      # The single audit event carries the consolidation counts alongside the lint summary.
+      assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["consolidation"]["proposal_count"] == 1
+      assert entry.new_state["consolidation"]["persisted_count"] == 1
+      assert entry.new_state["consolidation"]["day"] == Date.to_iso8601(Date.utc_today())
+    end
+
     test "handles a tenant with no published articles" do
       tenant = fixture(:tenant)
 

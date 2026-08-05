@@ -29,7 +29,14 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      cheap, and makes **no** embedding-API calls (orphans missing an embedding
      simply no-op in the linking worker — backfilling those is a separate
      concern, out of scope here).
-  3. **Surfaces all findings** via an immutable audit event
+  3. **Consolidates the corpus, report-only** (#584 stage 1) — reuses the lint
+     report just computed and runs `Loopctl.Knowledge.Consolidation.run/3`, which
+     emits numbered, evidence-carrying proposals for the four observed defect
+     classes and persists them as the tenant's report for the day. It writes
+     NOTHING to `articles` / `article_links` / `conflict_resolutions`. This runs
+     inside the existing nightly pass on purpose: a second scheduler over the same
+     corpus is the specific failure #584 names.
+  4. **Surfaces all findings** via an immutable audit event
      (`knowledge.lint_completed`) carrying the full lint summary, so
      contradictions / coverage gaps / broken sources / stale counts are
      observable in the change feed even though they are not auto-repaired
@@ -60,6 +67,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.Consolidation
   alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Workers.ArticleLinkingWorker
@@ -108,12 +116,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     action = act_on_orphans(tenant_id, report)
     promoted = promote_conflicts(tenant_id)
     resolutions_applied = Knowledge.execute_conflict_resolutions(tenant_id)
-    log_audit_event(tenant_id, report, action, promoted, resolutions_applied)
+    consolidation = consolidate(tenant_id, report)
+    log_audit_event(tenant_id, report, action, promoted, resolutions_applied, consolidation)
 
     Logger.info(
       "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
         "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
-        "conflicts_promoted=#{promoted} resolutions_applied=#{resolutions_applied}"
+        "conflicts_promoted=#{promoted} resolutions_applied=#{resolutions_applied} " <>
+        "consolidation_proposals=#{consolidation.proposal_count} " <>
+        "consolidation_persisted=#{consolidation.persisted_count}"
     )
 
     :ok
@@ -293,7 +304,22 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     |> MapSet.new()
   end
 
-  defp log_audit_event(tenant_id, report, action, promoted, resolutions_applied) do
+  # #584 stage 1: REPORT ONLY. Reuses the lint report already computed above (one
+  # corpus scan per night, one scheduler) and writes only the consolidation report +
+  # its proposal rows.
+  defp consolidate(tenant_id, report) do
+    max_per_class =
+      Application.get_env(
+        :loopctl,
+        :knowledge_consolidation_max_per_class,
+        Consolidation.default_max_per_class()
+      )
+
+    {:ok, consolidation} = Consolidation.run(tenant_id, report, max_per_class: max_per_class)
+    consolidation
+  end
+
+  defp log_audit_event(tenant_id, report, action, promoted, resolutions_applied, consolidation) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "knowledge_lint",
       entity_id: tenant_id,
@@ -306,7 +332,17 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "orphans_relinked" => action.relinked,
         "orphans_embedding_enqueued" => action.embedding_enqueued,
         "conflicts_promoted" => promoted,
-        "resolutions_applied" => resolutions_applied
+        "resolutions_applied" => resolutions_applied,
+        # Counts of PROPOSALS (not articles): `proposal_count` is the true pre-cap
+        # total across classes, `persisted_count` the rows actually written (lower
+        # only when a class hit its cap). Nothing was applied — stage 1 is report-only.
+        "consolidation" => %{
+          "day" => Date.to_iso8601(consolidation.day),
+          "proposal_count" => consolidation.proposal_count,
+          "persisted_count" => consolidation.persisted_count,
+          "by_class" => consolidation.proposals_by_class,
+          "truncated" => consolidation.truncated
+        }
       }
     })
   end
