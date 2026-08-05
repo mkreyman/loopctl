@@ -13,6 +13,9 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
   use Loopctl.DataCase, async: true
 
   alias Loopctl.AdminRepo
+  alias Loopctl.DbCapacity
+  alias Loopctl.HeavyRead
+  alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge
 
   setup :verify_on_exit!
@@ -585,8 +588,10 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
 
       assert {:ok, %{meta: meta}} = Knowledge.heat_index(tenant.id)
 
-      # `knowledge_get` filters by tenant_id, so it 404s on the published system canonicals
-      # this index also lists — the named tool has to be one that opens every listed id.
+      # Following the index must record the UNCOUNTED read type, so the index cannot feed the
+      # ranking it just published — that, not reachability, is why the named tool is the drill.
+      # `knowledge_get` opens every listed id too (a published canonical included, #572), and
+      # DOES count, which is why it is named separately in the note as a deliberate vote.
       assert meta.drill.tool == "knowledge_progressive_drill"
       assert meta.drill.parameter == "article_id"
       # The ordering basis is stated, so a reader does not mistake heat for relevance.
@@ -780,6 +785,136 @@ defmodule Loopctl.Knowledge.HeatIndexTest do
       assert log =~ "sqlstate=53300"
       assert log =~ "sqlstate=42703"
       refute log =~ "sqlstate=too_many_connections"
+    end
+
+    test "the node-level admin gate sheds at its cap, and gives the slot back either way" do
+      # This gate is the only thing keeping a per-turn endpoint off the LAST of AdminRepo's 3
+      # connections, which custody writes and the per-request auth SELECT share. Saturate it
+      # from outside and the endpoint must shed rather than queue behind them.
+      #
+      # Saturated on the admission's TENANT-scoped key, never the node-wide one: the counters
+      # are VM-wide public ETS, and TenantGate's documented async protocol is that the suite's
+      # caps stay high so the wired gate is a no-op across incidental parallel reads. Holding
+      # the node key here would shed — and make the final count assertion race — any other
+      # async test that reads a heat index.
+      #
+      # Non-vacuous by construction: delete the gate from `heat_index/2` and the call succeeds
+      # here instead of raising, so this test fails.
+      tenant = fixture(:tenant)
+      article = published_article(tenant.id, %{title: "Readable"})
+      heat(tenant.id, article, 2)
+
+      key = "knowledge.heat_stub_projection:" <> tenant.id
+      :ok = TenantGate.acquire(key, 1_000, 1_000)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          try do
+            assert_raise HeavyRead.OverloadedError, fn -> Knowledge.heat_index(tenant.id) end
+          after
+            TenantGate.release(key, 1_000)
+          end
+        end)
+
+      # A NODE-wide shed must not be logged as one tenant reading too much — that is how
+      # saturation of a shared pool gets mistaken for ordinary per-tenant backpressure.
+      assert log =~ "admin_pool_node_gate_shed"
+
+      # And the permit comes back on the ADMITTED path: the index answers again, and the
+      # counter is back to zero rather than leaking one. The release is awaited, not fired and
+      # forgotten, so this is a fact rather than a timing window. (The SHED path releases in
+      # the node-wide test below — here the shed is decided by the non-reserving precheck that
+      # runs ahead of the aggregate, so no permit is taken to give back.)
+      assert {:ok, %{results: [%{title: "Readable"}]}} = Knowledge.heat_index(tenant.id)
+      assert TenantGate.count(key) == 0
+    end
+
+    test "the node cap never admits heat onto the last admin connection" do
+      # The cap is asserted as a RELATIONSHIP, not recomputed from the implementation's own
+      # expression — a test that copies `admin_repo - 1` pins the gate's existence and nothing
+      # about the bound, which is where the safety claim lives.
+      pool = DbCapacity.runtime_pool_sizes().admin_repo
+
+      assert Knowledge.heat_node_cap(pool) < pool
+      assert Knowledge.heat_node_cap(3) == 2
+
+      # A pool of 1 must shed outright. Clamping the cap UP to 1 there admitted heat onto the
+      # only admin connection, the exact state `pool - 1` exists to make impossible.
+      assert Knowledge.heat_node_cap(1) == 0
+
+      # But 0 is an UNREADABLE repo config, not a pool of zero (`DbCapacity.pool_size/1`
+      # reports a missing key as 0), and a limiter that cannot read its own bound fails OPEN
+      # (AC-37.5.5) rather than turning a config read into a permanent outage of the endpoint.
+      assert Knowledge.heat_node_cap(0) == Knowledge.heat_node_cap(3)
+
+      # The per-tenant sub-cap keeps a node permit reachable by a neighbour, but never at the
+      # price of making a per-turn endpoint serial for one tenant: at the cap production
+      # reaches, `cap - 1` was 1, so a fleet's second concurrent call 429'd on an idle node.
+      assert Knowledge.heat_tenant_cap(2) == 2
+      assert Knowledge.heat_tenant_cap(3) == 2
+      assert Knowledge.heat_tenant_cap(4) == 3
+      assert Knowledge.heat_tenant_cap(0) == 0
+    end
+
+    test "the node-wide permit is the node bound, and comes back when the tenant sub-cap sheds" do
+      # The saturation test above drives the TENANT-scoped key, because the node-wide counter is
+      # VM-wide ETS and holding it would shed every parallel async heat read. That leaves the
+      # node-wide acquire — the bound this gate is named for — and the release-on-tenant-shed
+      # path undriven, and a missed release there leaks one node permit per shed, permanently.
+      # So drive `heat_acquire/2` directly on private keys: same code, no shared counter.
+      global = "heat-node-gate-" <> Ecto.UUID.generate()
+      keys = [global, global <> ":tenant"]
+
+      # cap 3 -> tenant sub-cap 2, so the third acquire sheds on the TENANT key while the node
+      # key still has room. The node permit it took to get there must be given back.
+      assert Knowledge.heat_acquire(keys, 3) == :ok
+      assert Knowledge.heat_acquire(keys, 3) == :ok
+      assert TenantGate.count(global) == 2
+      assert Knowledge.heat_acquire(keys, 3) == :shed
+      assert TenantGate.count(global) == 2
+
+      # And once the NODE key is full it decides, whatever a fresh tenant's own count is.
+      assert Knowledge.heat_acquire([global, global <> ":other"], 2) == :shed
+      assert TenantGate.count(global) == 2
+      assert TenantGate.count(global <> ":other") == 0
+
+      for _ <- 1..2 do
+        TenantGate.release(global, 1)
+        TenantGate.release(global <> ":tenant", 1)
+      end
+
+      assert TenantGate.count(global) == 0
+    end
+
+    test "a KILLED holder's node permit is reclaimed, not leaked node-wide forever" do
+      # `try/after` does not run on `Process.exit(pid, :kill)`, and TenantGate never sweeps or
+      # reaps. On a node-wide key capped at 2 in production, two such kills would shed
+      # heat_index for EVERY tenant on the node until it restarts — so the permit is released
+      # by a monitoring reclaimer rather than by the holder's own `after`.
+      #
+      # The reclaimer ACQUIRES too, after its monitor is installed, so there is no instant at
+      # which a permit exists uncovered — a kill in that window used to leak one forever.
+      key = "heat-permit-reclaim-" <> Ecto.UUID.generate()
+      parent = self()
+
+      holder =
+        spawn(fn ->
+          reclaimer = Knowledge.heat_permit_reclaimer([key, key <> ":t"], 2)
+          receive do: ({:heat_permit, ^reclaimer, :ok} -> :ok)
+          send(parent, {:held, reclaimer})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:held, reclaimer}
+      assert TenantGate.count(key) == 1
+
+      ref = Process.monitor(reclaimer)
+      Process.exit(holder, :kill)
+
+      # The reclaimer exits once it has released, so this is deterministic rather than a poll.
+      assert_receive {:DOWN, ^ref, :process, ^reclaimer, _}
+      assert TenantGate.count(key) == 0
+      assert TenantGate.count(key <> ":t") == 0
     end
 
     test "truncated says the list is partial, since nothing else in the payload would" do
