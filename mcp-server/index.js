@@ -1927,6 +1927,20 @@ async function knowledgeLint({ project_id, stale_days, min_coverage, max_per_cat
   return toContent(result);
 }
 
+async function knowledgeConsolidation({ day, class: klass, limit, offset } = {}) {
+  const params = new URLSearchParams();
+  if (day) params.set("day", String(day));
+  if (klass) params.set("class", String(klass));
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+  const qs = params.toString();
+  const path = qs
+    ? `/api/v1/knowledge/consolidation?${qs}`
+    : "/api/v1/knowledge/consolidation";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
 async function knowledgeIngest({ url, content, source_type, project_id, publish }) {
   const body = { source_type };
   if (url) body.url = url;
@@ -5448,6 +5462,63 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_consolidation",
+    description:
+      "Read the nightly consolidation (\"dream\") report: NUMBERED proposals for reconciling " +
+      "the corpus, each naming the articles involved and quoting an excerpt from each as " +
+      "evidence. REPORT ONLY — the pass writes no articles, links or conflict resolutions, " +
+      "every proposal is `pending`, and this tool applies nothing. Requires orchestrator role.\n\n" +
+      "Classes: `duplicate_capture` (titles that collide once case/punctuation normalize away, " +
+      "or idempotency keys that collide under the same normalization while differing verbatim — " +
+      "capture tag-format drift, which the novelty gate does not catch because novelty scoring " +
+      "and idempotency are separate paths); `contradiction_candidate` (a SYSTEM-flagged " +
+      "potential_conflict pair of PUBLISHED articles with no recorded verdict — record one via " +
+      "knowledge_resolve_conflict, which accepts exactly these pairs; this report writes " +
+      "none); `generic_title` (a placeholder title that collides on active-title uniqueness and " +
+      "blocks hub creation); `stale_entry` (past the lint staleness threshold, never reconciled).\n\n" +
+      "Denominators: `corpus_size` counts PUBLISHED articles owned by the tenant at scan time, " +
+      "not its total article count. `proposal_count` is the TRUE pre-cap count of PROPOSALS, not " +
+      "of articles — one duplicate group of three articles is ONE proposal, and one article can " +
+      "appear in proposals of several classes. `persisted_count` is how many proposal ROWS the " +
+      "report carries, lower than `proposal_count` exactly when a class hit `max_per_class` " +
+      "(`truncated` flags which). `meta.total_count` counts persisted proposals matching the " +
+      "`class` filter, so it is bounded by `persisted_count`, never by `proposal_count`.\n\n" +
+      "Review state (`review_status`/`reviewed_by`/`reviewed_at`) RESETS to pending/null whenever " +
+      "the nightly pass re-derives a proposal: refreshed machine output never inherits an approval.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        day: {
+          type: "string",
+          description:
+            "Optional ISO8601 date (YYYY-MM-DD, UTC) of the report to read. Defaults to the most recent report.",
+        },
+        class: {
+          type: "string",
+          enum: [
+            "duplicate_capture",
+            "contradiction_candidate",
+            "generic_title",
+            "stale_entry",
+          ],
+          description: "Optional: return only proposals of this class.",
+        },
+        limit: {
+          type: "integer",
+          description: "Proposals per page. Default 50, max 500 (clamped, never rejected).",
+          default: 50,
+          minimum: 1,
+        },
+        offset: {
+          type: "integer",
+          description: "Proposals to skip. Default 0.",
+          minimum: 0,
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "knowledge_export",
     description:
       "Export all knowledge articles as an OKF v0.1 bundle — gzipped tar archive, unbounded, bounded-memory streaming, " +
@@ -6898,6 +6969,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_lint":
       return await knowledgeLint(args);
+
+    case "knowledge_consolidation":
+      return await knowledgeConsolidation(args);
 
     case "knowledge_export":
       return await knowledgeExport(args);

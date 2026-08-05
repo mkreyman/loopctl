@@ -592,6 +592,9 @@ defmodule LoopctlWeb.Router do
     # Knowledge Lint (quality analysis report)
     get "/knowledge/lint", KnowledgeLintController, :lint
 
+    # Nightly consolidation ("dream") report — report-only proposals (#584)
+    get "/knowledge/consolidation", KnowledgeConsolidationController, :show
+
     # Knowledge Pipeline (self-learning pipeline status)
     get "/knowledge/pipeline", KnowledgePipelineController, :status
 

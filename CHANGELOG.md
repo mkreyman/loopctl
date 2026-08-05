@@ -6,6 +6,29 @@ All notable changes to loopctl are documented here.
 
 Operator-facing changes for deployments outside the hosted instance.
 
+### Added
+
+- **`GET /api/v1/knowledge/consolidation` — the nightly consolidation ("dream") report,
+  REPORT-ONLY (#584, stage 1 of 3).** The existing nightly knowledge pass (04:00 UTC,
+  `KnowledgeLintWorker`) now also reconciles the tenant's published corpus and emits numbered
+  proposals, each naming the articles involved and quoting an excerpt from each as evidence:
+  duplicate captures from title/idempotency-tag format drift, SYSTEM-flagged conflict pairs of
+  published articles with no recorded verdict (the same pairs the conflict-resolution endpoint
+  accepts, so a proposal never names one it would refuse), placeholder titles, and stale entries. **It writes nothing** to `articles`,
+  `article_links` or `conflict_resolutions` — the only writes are the report itself. Deliberately
+  NOT a second scheduler: it reuses the lint report from the same run, so there is still one
+  nightly job per tenant over the corpus. Migration
+  `20260805140000_create_consolidation_reports.exs` adds `consolidation_reports` and
+  `consolidation_proposals` (both RLS-enabled, tenant-scoped, cascading on tenant delete); no
+  manual step. Note for operators: proposal rows persist a 240-character excerpt of each
+  cited article body alongside the article ids, so the report inherits the sensitivity of the
+  articles it cites — it is tenant-scoped and orchestrator-gated like every other knowledge
+  read. That inheritance does NOT outlive the article: evidence is re-checked against the live
+  published corpus on every read, and an entry whose article has since been hard-deleted,
+  archived or unpublished comes back redacted (title null, empty excerpt, `redacted: true`),
+  including in prior-day reports read via `?day=`. Per-class proposal cap is configurable via `:knowledge_consolidation_max_per_class`
+  (default 100, hard max 500); over-cap is logged with the true total, never silently dropped.
+
 ### Changed
 
 - **`GET /api/v1/knowledge/analytics/retrieval-metrics` gained four fields and a stated
