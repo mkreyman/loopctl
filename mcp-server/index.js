@@ -4818,8 +4818,9 @@ const TOOLS = [
       "project CLAUDE.mds and cross-links). Send only the fields you want to change; every " +
       "field is optional except article_id. `tags` REPLACES the whole array (send the full " +
       "desired set, not a delta). A changed body/tags re-triggers embedding + auto-linking. " +
-      "Agent role — this is KB-content curation (non-destructive + audited; an in-place edit " +
-      "overwrites the prior body, so it is not reversible either). Visibility-scoped: " +
+      "Agent role — this is KB-content curation (non-destructive + audited: the edit is in " +
+      "place and there is no version-restore endpoint, but the prior body is retained in the " +
+      "article.updated audit entry). Visibility-scoped: " +
       "you can only edit an article you can see, so another agent's private/owner memory " +
       "returns 404. `tenant_id` is never accepted. Returns the full updated article. To " +
       "instead retire/replace an article, use knowledge_archive or knowledge_resolve_conflict.",

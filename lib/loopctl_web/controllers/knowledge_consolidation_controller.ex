@@ -72,8 +72,8 @@ defmodule LoopctlWeb.KnowledgeConsolidationController do
         "to `pending` / null whenever the nightly pass re-derives a proposal, so refreshed " <>
         "machine output can never inherit an earlier verdict.\n\n" <>
         "EVIDENCE FRESHNESS — each evidence entry is a COPY taken when the proposal was " <>
-        "derived, and it is re-checked against the live published corpus on every read. " <>
-        "If the article has since been hard-deleted, archived or unpublished, the entry " <>
+        "derived, and it is re-checked against the live corpus on every read. " <>
+        "If the article has since been hard-deleted or archived, the entry " <>
         "comes back as `article_id` with a null title, an empty excerpt and " <>
         "`redacted: true` — a quoted excerpt never outlives the article it quotes, " <>
         "including in prior-day reports read via `day`.",

@@ -188,6 +188,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "conflicts_promoted=#{promoted} conflicts_judged_redundant=#{judged} " <>
         "resolutions_applied=#{resolutions_applied} " <>
         "duplicates_unpublished=#{applied.applied} duplicate_groups_skipped=#{applied.skipped} " <>
+        "duplicates_unpublish_failed=#{applied.failed} " <>
         consolidation_log(consolidation)
     )
 
@@ -507,26 +508,29 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # the nightly run that WRITES to `articles`, and a raise here must not abort a pass whose
   # other steps already succeeded. A failure costs one night of duplicate cleanup, which is
   # the cheapest thing in the run to lose.
-  defp apply_consolidation(_tenant_id, {:error, _tag}), do: %{applied: 0, skipped: 0}
+  #
+  # Per-group failures are contained inside `apply_confirmed_duplicates/2` itself (that
+  # reduce is not transactional, so an escaping raise would discard the tally of groups
+  # whose unpublishes had already committed). What reaches this rescue is a failure BEFORE
+  # any write — the confirmed-set SELECT — so a zero tally here is true; it carries an
+  # `:error` tag so the audit event still separates it from a night with nothing to apply.
+  defp apply_consolidation(_tenant_id, {:error, _tag}), do: %{applied: 0, skipped: 0, failed: 0}
 
   defp apply_consolidation(tenant_id, {:ok, _report}) do
     Consolidation.apply_confirmed_duplicates(tenant_id)
   rescue
-    e ->
-      Logger.error(
-        "KnowledgeLintWorker: tenant=#{tenant_id} consolidation apply failed " <>
-          "(#{ExitTag.tag(e)}); no duplicates unpublished this run."
-      )
-
-      %{applied: 0, skipped: 0}
+    e -> apply_failed(tenant_id, ExitTag.tag(e))
   catch
-    :exit, reason ->
-      Logger.error(
-        "KnowledgeLintWorker: tenant=#{tenant_id} consolidation apply exited " <>
-          "(#{"exit:" <> ExitTag.tag(reason)}); no duplicates unpublished this run."
-      )
+    :exit, reason -> apply_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
+  end
 
-      %{applied: 0, skipped: 0}
+  defp apply_failed(tenant_id, tag) do
+    Logger.error(
+      "KnowledgeLintWorker: tenant=#{tenant_id} consolidation apply failed " <>
+        "(#{tag}); no duplicates unpublished this run."
+    )
+
+    %{applied: 0, skipped: 0, failed: 0, error: tag}
   end
 
   # Writes the consolidation report + its proposal rows and nothing else. The APPLY is a
@@ -582,10 +586,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # across classes, `persisted_count` the rows actually written (lower only when a class
   # hit its cap). A proposal counted here may or may not have been applied tonight, since
   # applying also requires last night's report to have agreed — so the APPLY carries its own
-  # tally (`duplicates_unpublished` / `duplicate_groups_skipped`) in this same event, which
-  # is the surface an auditor reads. Without it, a systematically failing apply is
-  # indistinguishable from a night with nothing to apply. Each individual unpublish also
-  # writes its own audit event through `Knowledge.unpublish_article/3`
+  # tally in this same event, which is the surface an auditor reads. All four keys are load-
+  # bearing together: `duplicates_unpublished` alone reads 0 both on a quiet night and on a
+  # night where every confirmed group was attempted and every write was rejected, so
+  # `duplicates_unpublish_failed` (loser articles left published) and `apply_error` (the
+  # apply never got past its SELECT) are what tell those apart. Each individual unpublish
+  # also writes its own audit event through `Knowledge.unpublish_article/3`
   # (`actor_label: "worker:consolidation"`).
   defp consolidation_state({:ok, consolidation}, applied) do
     %{
@@ -596,7 +602,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       "by_class" => consolidation.proposals_by_class,
       "truncated" => consolidation.truncated,
       "duplicates_unpublished" => applied.applied,
-      "duplicate_groups_skipped" => applied.skipped
+      "duplicate_groups_skipped" => applied.skipped,
+      "duplicates_unpublish_failed" => applied.failed,
+      "apply_error" => Map.get(applied, :error)
     }
   end
 

@@ -674,6 +674,24 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert entry["excerpt"] =~ "Still published"
       refute Map.has_key?(entry, "redacted")
     end
+
+    # The pass's own unpublish must not blank the evidence for the action it just took:
+    # the excerpt is the only surface carrying WHY the loser was retracted, and a draft is
+    # fully recoverable. Redaction is for the one-way doors (hard delete, archive).
+    test "keeps the evidence of an article this pass UNPUBLISHED" do
+      tenant = fixture(:tenant)
+      published(tenant.id, %{title: "Untitled Document", body: "Unpublished, not archived."})
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      {:ok, result} = Consolidation.latest(tenant.id)
+      assert [%{evidence: [entry]}] = result.proposals
+      {:ok, _} = Knowledge.unpublish_article(tenant.id, entry["article_id"])
+
+      {:ok, after_unpublish} = Consolidation.latest(tenant.id)
+      assert [%{evidence: [kept]}] = after_unpublish.proposals
+      assert kept["excerpt"] =~ "Unpublished, not archived"
+      refute Map.has_key?(kept, "redacted")
+    end
   end
 
   describe "apply_confirmed_duplicates/2 (#605 — the one class that applies itself)" do
@@ -733,7 +751,8 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
       {:ok, _} = Consolidation.run(tenant.id)
 
-      assert %{applied: 1, skipped: 0} = Consolidation.apply_confirmed_duplicates(tenant.id)
+      assert %{applied: 1, skipped: 0, failed: 0} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
 
       # The richest (longest body) survives; the duplicate is UNPUBLISHED, never archived —
       # :archived is terminal for an article, so it is the one retraction that cannot be
@@ -781,6 +800,23 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       {:ok, _} = Consolidation.run(tenant.id)
 
       assert %{applied: 0, skipped: 0} = Consolidation.apply_confirmed_duplicates(tenant.id)
+      assert status(a.id) == :published
+      assert status(b.id) == :published
+    end
+
+    test "two reports that are not ADJACENT do not confirm each other" do
+      # The gate advertises "tonight agreed with last night". On a tenant whose scans failed
+      # for a fortnight the two most recent reports straddle the outage, and agreement across
+      # that gap is not the transience filter this claims to be.
+      tenant = fixture(:tenant)
+      {a, b} = duplicate_pair(tenant.id)
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -14))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{applied: 0, skipped: 0, failed: 0} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
       assert status(a.id) == :published
       assert status(b.id) == :published
     end
