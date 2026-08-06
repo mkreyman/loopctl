@@ -258,6 +258,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert entry.new_state["summary"]["total_articles"] == 2
       assert entry.new_state["consolidation"]["status"] == "failed"
       assert is_binary(entry.new_state["consolidation"]["error"])
+
+      # The gate key is the one an auditor parses to learn WHY nothing applied, so it is
+      # recorded on the failing nights too — absent-on-failure is the one answer it must not
+      # give. This also guards the `:apply_failed` tally: both come from the same zero-tally
+      # constructor, and it was a constructor missing `:gate` that raised a KeyError one line
+      # after the rescue swallowed the original error, making Oban re-run the whole night.
+      assert entry.new_state["consolidation"]["duplicate_apply_gate"] == "scan_failed"
     end
 
     # The apply reads the two most recent reports. If a failed scan could fall through to it,

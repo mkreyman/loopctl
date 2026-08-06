@@ -139,10 +139,13 @@ defmodule Loopctl.Knowledge.Consolidation do
   @default_max_unpublishes 100
 
   # Hard ceilings for the two operator-configurable apply caps, mirroring
-  # `@hard_max_per_class`. Both knobs are clamped to `1..ceiling`: an unclamped negative
-  # `:max_applies` reached `limit: ^cap` as a Postgrex error, and an unclamped `0`/negative
-  # `:max_unpublishes` skipped every group every night while the audit event read like a
-  # quiet one. Pausing the drain is the schedule's job, not a zero here.
+  # `@hard_max_per_class`. Both knobs are clamped to `0..ceiling`, and only an INTEGER is
+  # clamped: an unclamped negative `:max_applies` reached `limit: ^cap` as a Postgrex error,
+  # while Erlang term order puts a `nil` or a `"500"` ABOVE every integer, so `min/2` would
+  # resolve a config typo to the ceiling — the largest blast radius available — instead of to
+  # the default. `0` is honoured as an explicit PAUSE (`gate: :drain_disabled`) rather than
+  # rounded up to 1: an operator halting the drain mid-incident must not still get a night of
+  # unpublishes out of it.
   @hard_max_applies 500
   @hard_max_unpublishes 500
 
@@ -305,13 +308,24 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   ## What bounds one night
 
-  Two caps, in different units, each clamped to `1..500`. `:max_applies` (default
-  `#{@default_max_applies}`) bounds how many PROPOSALS are considered;
-  `:max_unpublishes` (default `#{@default_max_unpublishes}`)
-  bounds how many loser ARTICLES actually leave the published set. The second is the one that
-  matters — a group can carry many members, so a group cap alone is not an article cap — and
-  a group that would cross it is skipped WHOLE, never applied part-way, because a group with
-  no winner is the one state neither the next run nor a reader can interpret.
+  Two caps, in different units, each clamped to `0..500` — `0` PAUSES the drain and records
+  `gate: :drain_disabled`, and a non-integer falls back to the module default rather than to
+  the ceiling. `:max_applies` bounds how many PROPOSALS are considered; `:max_unpublishes`
+  bounds how many loser ARTICLES actually leave the published set, and it is the one that
+  matters, because a group can carry many members. The EFFECTIVE defaults are the shipped
+  `config/config.exs` values (`knowledge_consolidation_max_applies` /
+  `_max_unpublishes`, both 500); `#{@default_max_applies}` / `#{@default_max_unpublishes}`
+  are only the module fallbacks for a config that omits them.
+
+  A group larger than the remaining budget is drained AS FAR AS the budget goes, not skipped
+  whole. The winner is never a candidate for unpublishing, so a part-drained group is
+  winner-plus-leftovers — the shape the next scan re-derives — never the winnerless state a
+  whole-group rule was written to avoid. Skipping whole made any group with more losers than
+  the cap permanently unappliable, and with the cap itself ceilinged at 500 the "raise the
+  cap" remedy was unreachable: the backlog converged to a floor, which is the failure this
+  pass exists to fix. The budget is charged on the LIVE loser count at write time and only
+  for articles that actually LEFT the published set — a rejected unpublish is counted in
+  `failed`, never spent.
 
   It is deliberately NOT a confidence score. Confidence is the machine grading its own
   homework; agreement across two independent observations of a moving corpus is evidence.
@@ -333,18 +347,46 @@ defmodule Loopctl.Knowledge.Consolidation do
           applied: non_neg_integer(),
           skipped: non_neg_integer(),
           failed: non_neg_integer(),
-          gate: :open | :report_gap | :insufficient_history
+          gate: :open | :report_gap | :insufficient_history | :drain_disabled
         }
   def apply_confirmed_duplicates(tenant_id, opts \\ []) do
     cap =
-      opts |> Keyword.get(:max_applies, @default_max_applies) |> max(1) |> min(@hard_max_applies)
+      clamp_cap(
+        Keyword.get(opts, :max_applies, @default_max_applies),
+        @default_max_applies,
+        @hard_max_applies
+      )
 
     unpublish_cap =
-      opts
-      |> Keyword.get(:max_unpublishes, @default_max_unpublishes)
-      |> max(1)
-      |> min(@hard_max_unpublishes)
+      clamp_cap(
+        Keyword.get(opts, :max_unpublishes, @default_max_unpublishes),
+        @default_max_unpublishes,
+        @hard_max_unpublishes
+      )
 
+    if min(cap, unpublish_cap) == 0 do
+      log_gate_blocked(tenant_id, :drain_disabled)
+      %{applied: 0, skipped: 0, failed: 0, gate: :drain_disabled}
+    else
+      run_confirmed_duplicates(tenant_id, cap, unpublish_cap)
+    end
+  end
+
+  # Only an integer is clamped. A `nil` or a `"500"` from a hand-rolled env read sorts ABOVE
+  # every integer in Erlang term order, so `min/2` would hand a config typo the ceiling — the
+  # largest blast radius available — rather than the default it meant to fall back to.
+  defp clamp_cap(value, _default, hard_max) when is_integer(value),
+    do: value |> max(0) |> min(hard_max)
+
+  defp clamp_cap(value, default, _hard_max) do
+    Logger.warning(
+      "Consolidation: ignoring non-integer apply cap #{inspect(value)}; using #{default}."
+    )
+
+    default
+  end
+
+  defp run_confirmed_duplicates(tenant_id, cap, unpublish_cap) do
     case confirmed_duplicate_proposals(tenant_id, cap) do
       {:error, reason} ->
         log_gate_blocked(tenant_id, reason)
@@ -380,26 +422,15 @@ defmodule Loopctl.Knowledge.Consolidation do
   # to the worker discarded the tally of groups that had ALREADY committed and reported zero
   # unpublishes that really happened. A crashed group applied nothing, so it counts as one
   # failure and the reduce carries on.
+  #
+  # The remaining budget is spent INSIDE `apply_duplicate_group/3`, after the live re-fetch,
+  # and only `acc.applied` is charged. Two reasons, both of which cost the pass real drain:
+  # `acc.failed` counts loser articles that STAYED published, and this cap counts articles
+  # that LEAVE the published set; and the proposal's `article_ids` is a scan-time snapshot, so
+  # charging its length skipped groups for budget they would never have spent (the same reason
+  # the winner is recomputed from live rows).
   defp tally_apply(tenant_id, proposal, acc, unpublish_cap) do
-    # The group cap bounds how many PROPOSALS are considered; this bounds how many ARTICLES
-    # actually leave the published set tonight. A group is skipped WHOLE rather than applied
-    # part-way, because a half-applied group has no winner and is the one state neither the
-    # next run nor a reader can interpret.
-    #
-    # The group's OWN loser count is charged against the remaining budget, not just the
-    # budget spent so far: testing only "already exhausted" let the last admitted group run
-    # unbounded, so the effective ceiling was `cap - 1 + group_size` and the operator knob
-    # was advisory rather than a bound. A group whose losers exceed the whole budget is
-    # therefore never applied — raise the cap above the largest group to drain it.
-    if acc.applied + acc.failed + losers(proposal) > unpublish_cap do
-      %{acc | skipped: acc.skipped + 1}
-    else
-      do_tally_apply(tenant_id, proposal, acc)
-    end
-  end
-
-  defp do_tally_apply(tenant_id, proposal, acc) do
-    case apply_duplicate_group(tenant_id, proposal) do
+    case apply_duplicate_group(tenant_id, proposal, unpublish_cap - acc.applied) do
       {:ok, applied, failed} ->
         %{acc | applied: acc.applied + applied, failed: acc.failed + failed}
 
@@ -427,8 +458,9 @@ defmodule Loopctl.Knowledge.Consolidation do
     %{acc | failed: acc.failed + losers}
   end
 
-  # Every member but the winner. Floored at 1 so a malformed single-member group still
-  # charges the budget and still counts as one failure rather than as nothing.
+  # Every member but the winner, from the SCAN-time id set — a crashed group never reached
+  # the live re-fetch, so this is the only count it has. Floored at 1 so a malformed
+  # single-member group still counts as one failure rather than as nothing.
   defp losers(proposal), do: max(length(proposal.article_ids) - 1, 1)
 
   # Proposals present in BOTH the newest report and the one before it, matched on
@@ -489,7 +521,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     |> AdminRepo.all()
   end
 
-  defp apply_duplicate_group(tenant_id, proposal) do
+  defp apply_duplicate_group(tenant_id, proposal, budget) do
     live =
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
@@ -506,21 +538,27 @@ defmodule Loopctl.Knowledge.Consolidation do
 
     # Re-verification, not trust. The group must STILL be a group: fewer than two live
     # published members means it resolved itself between the scan and now, and applying
-    # would unpublish the last copy of something.
-    if length(live) < 2 do
+    # would unpublish the last copy of something. No budget left is the other skip.
+    if length(live) < 2 or budget < 1 do
       :skip
     else
-      [winner | losers] =
+      [winner | all_losers] =
         Enum.sort_by(live, fn a ->
           {-a.body_len, -DateTime.to_unix(a.updated_at, :microsecond), a.id}
         end)
 
+      # Drained as far as the budget goes, not skipped whole: the winner is never a candidate
+      # here, so what is left behind is winner-plus-leftovers — the group the next scan
+      # re-derives — never a winnerless set. Skipping whole made a group with more losers
+      # than the cap unappliable on EVERY run, with no reachable remedy once the cap itself
+      # is ceilinged.
+      losers = Enum.take(all_losers, budget)
       applied = Enum.count(losers, &unpublish_duplicate(tenant_id, &1))
 
       Logger.info(
         "Consolidation: tenant=#{tenant_id} applied duplicate_capture proposal " <>
           "##{proposal.number} — kept #{winner.id}, unpublished #{applied} of " <>
-          "#{length(losers)} duplicate(s). Reversible via publish."
+          "#{length(all_losers)} duplicate(s) (budget #{budget}). Reversible via publish."
       )
 
       {:ok, applied, length(losers) - applied}
@@ -631,7 +669,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   # Excludes agent-PRIVATE articles from everything this pass does. Composed into EVERY
   # place that decides whether an article of this tenant is in scope — the scans
   # (`published_base/1`), the evidence fetch (`evidence_map/2`), the apply-time live
-  # re-check (`apply_duplicate_group/2`) and the read-time redaction liveness
+  # re-check (`apply_duplicate_group/3`) and the read-time redaction liveness
   # (`live_evidence_ids/2`) — because a guard that lives in only some of them is a guard
   # the next reader adds one more path around.
   #

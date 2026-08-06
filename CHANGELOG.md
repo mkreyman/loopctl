@@ -29,6 +29,15 @@ Operator-facing changes for deployments outside the hosted instance.
   112 loser articles on the hosted corpus, and **all 112 were verified to still have a
   surviving published twin**, with zero private articles touched.
 
+  Both apply caps are clamped to **0..500**: 500 is a hard ceiling, so raising a value above
+  it has no effect, and a non-integer value is ignored in favour of the built-in default.
+  Setting either to **0 pauses the auto-unpublish drain** — nothing is applied and the audit
+  event records `duplicate_apply_gate=drain_disabled`, so a paused night is distinguishable
+  from a clean one. That is the supported way to halt the drain during an incident. A
+  duplicate group with more losers than the cap is now drained as far as the cap allows
+  (the surviving winner is never touched) instead of being skipped whole, which had made any
+  group larger than the cap permanently unappliable.
+
 - **The nightly knowledge pass now PRUNES the `relates_to` graph to a bounded degree, which
   DELETES rows (#611 stage 0).** Read this before upgrading if you run a large corpus: on
   first run the pass will delete a large number of `article_links` rows, and it is the only

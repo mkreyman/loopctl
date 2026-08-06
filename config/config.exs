@@ -769,6 +769,12 @@ config :loopctl,
 # than to zero.
 #
 # Unpublish is reversible by publishing, which is what licenses a bound this size at all.
+#
+# Both apply caps are clamped to 0..500 (500 is the hard ceiling — raising a value above it
+# has no effect), and a non-integer value is ignored in favour of the module default. Setting
+# either to 0 PAUSES the auto-unpublish drain for that run: nothing is applied and the audit
+# event records duplicate_apply_gate=drain_disabled, so a paused night is not mistaken for a
+# clean one. That is the supported way to halt the drain during an incident.
 config :loopctl,
   knowledge_consolidation_max_per_class: 500,
   knowledge_consolidation_max_applies: 500,
