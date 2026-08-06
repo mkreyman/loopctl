@@ -1027,6 +1027,38 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert status(b.id) == :draft
     end
 
+    test "keeps the idempotency exemption when BOTH signals name the same group" do
+      # One capture written twice under two tag formats carries the SAME title too, so both
+      # signals find it. The label used to be decided by which entry the interleave met
+      # first — the title one — which then held the group to the embedding gate the
+      # idempotency signal is exempt from, forever on a tenant with no vectors.
+      tenant = fixture(:tenant)
+
+      a =
+        published(tenant.id, %{
+          title: "Retry Policy",
+          body: String.duplicate("winner ", 30),
+          idempotency_key: "repo#src/retry.ex"
+        })
+
+      b =
+        published(tenant.id, %{
+          title: "retry policy!",
+          body: "short",
+          idempotency_key: "repo:src/retry.ex"
+        })
+
+      # No embeddings at all, so a title-labelled group could never be corroborated.
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{applied: 1, uncorroborated: 0} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert status(a.id) == :published
+      assert status(b.id) == :draft
+    end
+
     defp embed!(tenant_id, article, vector) do
       {:ok, _} = Knowledge.update_embedding(tenant_id, article.id, vector, nil)
     end

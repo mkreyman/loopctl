@@ -127,15 +127,16 @@ defmodule Loopctl.Knowledge.CosineLintExceptions do
     },
     %{
       module: Loopctl.Knowledge.Consolidation,
-      function: :pairwise_similarity_by_group,
+      function: :score_pairs,
       arity: 2,
       rationale:
         "BOTH exempt shapes at once: a column-to-column self-join (a1 vs a2, no $const " <>
           "target, so HNSW cannot apply) under a MIN aggregate. It asks the opposite of " <>
           "top-k — not 'what is nearest' but 'is the WORST pair in this group still close " <>
           "enough' — and a top-k helper cannot answer that: the outlier it must find is " <>
-          "precisely the row top-k drops. Bounded by the id list of the few hundred articles " <>
-          "that already collided on a normalized title, never a corpus scan"
+          "precisely the row top-k drops. Called only by pairwise_similarity_by_group/2, " <>
+          "which bounds it to the id list of the few hundred articles that already collided " <>
+          "on a normalized title, never a corpus scan"
     }
     # NB: `Loopctl.Memory.memory_candidate_query/4` (US-28.2 agent-memory HNSW recall) is
     # DELIBERATELY NOT registered here — it holds NO hand-rolled cosine literal. It builds
