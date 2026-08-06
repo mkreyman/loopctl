@@ -65,13 +65,15 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   articles**, 59% of them between 0.60 and 0.70, and 56% of articles carrying 21+ edges.
   A graph that dense relates nearly everything to everything and so distinguishes nothing.
 
-  `relates_to` is now capped at the top `:article_max_relates_to_links` (default 10) nearest
-  candidates per article. `:potential_conflict` is NOT capped — it has its own threshold and
-  its own draining consumer, and a second cap there would withhold pairs from a queue
-  designed to converge.
+  `relates_to` is now capped at `:article_max_relates_to_links` (default 10) STORED edges per
+  article, counting edges INCIDENT to it in either direction: the cut runs AFTER the
+  already-linked rejection, so a re-link (nightly orphan pass, a re-embed) tops the article up
+  to K rather than adding K more. `:potential_conflict` is NOT capped — it has its own
+  threshold and its own draining consumer, and a second cap there would withhold pairs from a
+  queue designed to converge.
 
-  The cap bounds what this worker WRITES. Total degree is still unbounded from the inbound
-  side, which is why #611 stage 0 also prunes the standing backlog; see
+  The cap bounds what this worker WRITES; it cannot retract the edges written before it
+  existed, which is why #611 stage 0 also prunes the standing backlog. See
   `Loopctl.Knowledge.LinkPruning`.
 
   ## Retry Strategy (AC-21.2.13)
@@ -219,13 +221,24 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
         # drains it, capped above the promotion rate — so a second cap would silently withhold
         # pairs from a queue that is already designed to converge.
         relates =
-          article.id
-          |> build_links(top_k(candidates), tenant_id, :relates_to, fn _sim -> true end)
+          build_links(
+            article.id,
+            candidates,
+            tenant_id,
+            :relates_to,
+            fn _sim -> true end,
+            max_relates_to_links()
+          )
 
         conflicts =
-          build_links(article.id, candidates, tenant_id, :potential_conflict, fn sim ->
-            sim >= conflict_threshold
-          end)
+          build_links(
+            article.id,
+            candidates,
+            tenant_id,
+            :potential_conflict,
+            fn sim -> sim >= conflict_threshold end,
+            :infinity
+          )
 
         created_count = create_links(relates ++ conflicts, tenant_id)
         log_audit_event(article.id, tenant_id, created_count)
@@ -233,25 +246,35 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     end
   end
 
-  # The K nearest candidates, by similarity. `find_similar_articles/4` returns them in
-  # kNN order already, but that ordering is the vector index's and this cut must not depend
+  # The `headroom` nearest candidates, by similarity. `find_similar_articles/4` returns them
+  # in kNN order already, but that ordering is the vector index's and this cut must not depend
   # on it: an explicit sort makes the bound a property of THIS function, so a future change
   # to the search path cannot silently turn "the best K" into "whichever K arrived first".
   # Ties break on id so the cut is deterministic across re-runs — a re-link that kept a
   # different arbitrary half each night would churn the graph forever.
-  defp top_k(candidates) do
+  defp top_k(candidates, :infinity), do: candidates
+
+  defp top_k(candidates, headroom) do
     candidates
     |> Enum.sort_by(fn %{similarity: sim, id: id} -> {-sim, id} end)
-    |> Enum.take(max_relates_to_links())
+    |> Enum.take(headroom)
   end
 
-  # Per-article outbound cap for `relates_to`. Kept well under `max_comparisons` (50) —
+  # K minus what this article ALREADY holds, which is what makes the cap a bound on STORED
+  # degree rather than on one run's writes. The cut used to run on the candidate list BEFORE
+  # the already-linked rejection below, so existing edges cost nothing against K and every
+  # re-link (nightly orphan pass, a re-embed) could add K MORE — degree grew without bound
+  # between prunes, and the write-side cap the moduledoc claims held per run only.
+  defp headroom(:infinity, _existing), do: :infinity
+  defp headroom(cap, existing), do: max(cap - existing, 0)
+
+  # Per-article cap for `relates_to`. Kept well under `max_comparisons` (50) —
   # a cap at or above the candidate count is not a cap.
   defp max_relates_to_links do
     Application.get_env(:loopctl, :article_max_relates_to_links, 10)
   end
 
-  defp build_links(article_id, candidates, tenant_id, type, keep?) do
+  defp build_links(article_id, candidates, tenant_id, type, keep?, cap) do
     existing = get_existing_link_pairs(article_id, tenant_id, type)
 
     candidates
@@ -266,6 +289,8 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
       cid == article_id or MapSet.member?(existing, {article_id, cid}) or
         MapSet.member?(existing, {cid, article_id})
     end)
+    # AFTER the rejection, so an already-linked pair does not consume a slot it already holds.
+    |> top_k(headroom(cap, MapSet.size(existing)))
     |> Enum.map(fn %{id: target_id, similarity: score} ->
       %{
         source_article_id: article_id,

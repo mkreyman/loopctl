@@ -139,20 +139,32 @@ defmodule Loopctl.Knowledge.LinkPruningTest do
   end
 
   describe "prune/2 — what it refuses to touch" do
+    # Each test below varies EXACTLY ONE clause of `prunable_predicate/0` away from a
+    # doomed edge, so deleting that clause makes the test fail. A guarded edge that a
+    # SECOND guard would also have saved proves nothing about the first — that is how all
+    # three of these passed vacuously before.
     test "never deletes a potential_conflict edge" do
       # That pile has its own threshold and its own draining consumer
       # (`judge_redundant_conflicts/1`, capped above the promotion rate). Pruning it would
       # withhold pairs from a queue designed to empty itself.
       tenant = fixture(:tenant)
       hub = published(tenant.id)
-      targets = for _i <- 1..5, do: published(tenant.id)
+      targets = for _i <- 1..3, do: published(tenant.id)
+
+      link(tenant.id, hub, published(tenant.id), 0.92)
+      link(tenant.id, hub, published(tenant.id), 0.91)
 
       conflicts =
         for {t, i} <- Enum.with_index(targets) do
-          typed_link(tenant.id, hub, t, 0.99 - i * 0.001, :potential_conflict)
+          # Deliberately BELOW the conflict threshold. A promoted conflict link sits above
+          # it and would be spared by the conflict-band guard too, so a test built from one
+          # could not tell the `relationship_type` clause from that one.
+          link(tenant.id, t, published(tenant.id), 0.92)
+          link(tenant.id, t, published(tenant.id), 0.91)
+          typed_link(tenant.id, hub, t, 0.70 - i * 0.01, :potential_conflict)
         end
 
-      assert {:ok, _} = LinkPruning.prune(tenant.id, target_degree: 1, max_per_run: 1000)
+      assert {:ok, _} = LinkPruning.prune(tenant.id, target_degree: 2, max_per_run: 1000)
 
       surviving = edge_ids(tenant.id, :potential_conflict)
 
@@ -172,12 +184,12 @@ defmodule Loopctl.Knowledge.LinkPruningTest do
       hand_target = published(tenant.id)
       other = published(tenant.id)
 
-      link(tenant.id, hub, strong_a, 0.99)
-      link(tenant.id, hub, strong_b, 0.98)
+      link(tenant.id, hub, strong_a, 0.92)
+      link(tenant.id, hub, strong_b, 0.91)
       # Give hand_target strong edges of its own so the hand-made edge is outside BOTH
       # endpoints' top-K — the only condition under which it could be deleted.
-      link(tenant.id, hand_target, other, 0.99)
-      link(tenant.id, hand_target, published(tenant.id), 0.985)
+      link(tenant.id, hand_target, other, 0.92)
+      link(tenant.id, hand_target, published(tenant.id), 0.915)
 
       handmade =
         fixture(:article_link, %{
@@ -185,7 +197,10 @@ defmodule Loopctl.Knowledge.LinkPruningTest do
           source_article_id: hub.id,
           target_article_id: hand_target.id,
           relationship_type: :relates_to,
-          metadata: %{"note" => "curated by hand"}
+          # Carries a SCORE but no `auto_generated` flag, so the `auto_generated` clause is
+          # the only thing between it and deletion. With no score the scoreless clause would
+          # have saved it too and this test would pass with the guard removed.
+          metadata: %{"note" => "curated by hand", "similarity_score" => 0.61}
         })
 
       assert {:ok, _} = LinkPruning.prune(tenant.id, target_degree: 2, max_per_run: 1000)
@@ -195,16 +210,19 @@ defmodule Loopctl.Knowledge.LinkPruningTest do
     end
 
     test "never deletes an edge with no similarity_score — unrankable means unprunable" do
+      # The ranking sorts `DESC NULLS LAST` and the conflict band compares
+      # `coalesce(sim, 0)`, so a scoreless edge ranks WORST and is not band-protected: this
+      # clause is the only one holding it, and removing it deletes the edge below.
       tenant = fixture(:tenant)
       hub = published(tenant.id)
       strong_a = published(tenant.id)
       strong_b = published(tenant.id)
       scoreless_target = published(tenant.id)
 
-      link(tenant.id, hub, strong_a, 0.99)
-      link(tenant.id, hub, strong_b, 0.98)
-      link(tenant.id, scoreless_target, published(tenant.id), 0.99)
-      link(tenant.id, scoreless_target, published(tenant.id), 0.985)
+      link(tenant.id, hub, strong_a, 0.92)
+      link(tenant.id, hub, strong_b, 0.91)
+      link(tenant.id, scoreless_target, published(tenant.id), 0.92)
+      link(tenant.id, scoreless_target, published(tenant.id), 0.915)
 
       scoreless =
         fixture(:article_link, %{
@@ -220,9 +238,36 @@ defmodule Loopctl.Knowledge.LinkPruningTest do
       assert MapSet.member?(edge_ids(tenant.id), scoreless.id)
     end
 
-    test "the delete and the count share ONE predicate" do
-      # If they drifted, the worker would report a backlog it is structurally unable to
-      # drain — a `remaining` that never reaches zero and no way to tell why.
+    test "never deletes a relates_to edge in the conflict band" do
+      # `KnowledgeLintWorker.promote_conflicts/1` sources its candidates EXCLUSIVELY from
+      # these rows and is capped at 500/night against a much larger backlog, and the prune
+      # runs in the same nightly pass. Deleting one before the promoter reached it would
+      # make that pair permanently invisible to conflict detection — a cap on the conflict
+      # queue's inflow, imposed sideways.
+      tenant = fixture(:tenant)
+      band = Application.get_env(:loopctl, :knowledge_conflict_threshold, 0.93)
+      hub = published(tenant.id)
+      target = published(tenant.id)
+
+      # Both endpoints hold two NEARER edges, so the band edge is outside both top-2s and
+      # only the band guard can save it.
+      link(tenant.id, hub, published(tenant.id), band + 0.05)
+      link(tenant.id, hub, published(tenant.id), band + 0.04)
+      link(tenant.id, target, published(tenant.id), band + 0.05)
+      link(tenant.id, target, published(tenant.id), band + 0.04)
+
+      in_band = link(tenant.id, hub, target, band)
+
+      assert {:ok, %{remaining: 0}} =
+               LinkPruning.prune(tenant.id, target_degree: 2, max_per_run: 1000)
+
+      assert MapSet.member?(edge_ids(tenant.id), in_band.id)
+    end
+
+    test "the prune is ONE statement, and it carries the predicate" do
+      # The delete and the remainder count used to be two statements, so the guard could
+      # drift between them and the worker would report a backlog it was structurally unable
+      # to drain. They are one statement now; this is what keeps that true.
       predicate = LinkPruning.prunable_predicate()
 
       assert predicate =~ "relates_to"
@@ -231,24 +276,15 @@ defmodule Loopctl.Knowledge.LinkPruningTest do
 
       source = File.read!("lib/loopctl/knowledge/link_pruning.ex")
 
-      # Exactly two SQL statements exist (the delete and the count) and BOTH interpolate
-      # the shared function rather than inlining a copy. Anchored to code, not prose: a
-      # third statement, or one that hand-writes its own WHERE, fails here.
       interpolations =
         source
         |> String.split("WHERE tenant_id = $1 \#{prunable_predicate()}")
         |> length()
         |> Kernel.-(1)
 
-      assert interpolations == 2,
-             "expected both SQL statements to interpolate prunable_predicate/0, found " <>
+      assert interpolations == 1,
+             "expected exactly ONE SQL statement interpolating prunable_predicate/0, found " <>
                "#{interpolations}"
-
-      # That count is the whole check: inlining the guard into either statement drops the
-      # interpolation count to 1, and adding a third statement raises it to 3. There is no
-      # separate "no inline copy" assertion because a literal in the moduledoc — which
-      # documents exactly this predicate — is not a copy, and a check that cannot tell
-      # those apart fails on correct code.
     end
   end
 

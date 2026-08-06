@@ -52,7 +52,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      graph relates nearly everything to everything and distinguishes nothing.
      Union-kNN (an edge survives if it is in EITHER endpoint's top-K) guarantees
      every article keeps its own K nearest, which is also why the prune can never
-     create an orphan. Bounded per run, worst-first, and FAIL-SOFT.
+     create an orphan. An edge at or above the conflict threshold is ranked but never
+     deleted, so step 4's promoter keeps every candidate it has not reached yet.
+     Bounded per run, worst-first, and FAIL-SOFT.
   4. **Promotes, judges and executes conflicts**, in that order and in one pass
      (#601, #606). `promote_conflicts/1` flags high-similarity pairs;
      `judge_redundant_conflicts/1` then records a verdict on them —
@@ -174,11 +176,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     {:ok, report} = Knowledge.lint(tenant_id, max_per_category: @lint_max_per_category)
 
     action = act_on_orphans(tenant_id, report)
-    # Prune BEFORE the orphan count above is acted on? No — deliberately after. Union-kNN
-    # keeps every article's own top-K, so an article holding at least one edge holds it at
-    # rank 1 and the prune cannot create an orphan; ordering the two is therefore a matter
-    # of cost, not correctness, and pruning second keeps the lint report describing the
-    # graph the rest of this run reasons about.
+    # Ordering the prune against its neighbours is a matter of cost, not correctness, and both
+    # halves of that are structural rather than positional. Union-kNN keeps every article's own
+    # top-K, so an article holding at least one edge holds it at rank 1 and the prune cannot
+    # create an orphan. And a `relates_to` edge at or above the conflict threshold is RANKED but
+    # never DELETED, so the prune cannot take a candidate out from under `promote_conflicts/1`
+    # below — which is capped at 500/night against a much larger backlog, so a pair deleted
+    # before it was reached would be lost to conflict detection permanently.
     pruned = prune_links(tenant_id)
     promoted = promote_conflicts(tenant_id)
     # The judge runs AFTER promotion so a pair flagged tonight is also judged tonight and
@@ -545,8 +549,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # A failed prune is reported as `remaining: -1` — distinguishable from "nothing left to
   # prune" (0), because a zero here would read as a converged graph.
   defp prune_links(tenant_id) do
-    {:ok, result} = LinkPruning.prune(tenant_id)
-    result
+    case LinkPruning.prune(tenant_id) do
+      {:ok, result} -> result
+      # NOT a bare `{:ok, _} =` match: `prune/2` returns `{:error, _}` when a batch rolls back
+      # before anything committed, and a MatchError there would reach the rescue below as a
+      # made-up exception class rather than the reason the prune actually failed.
+      {:error, reason} -> prune_failed(tenant_id, ExitTag.tag(reason))
+    end
   rescue
     e -> prune_failed(tenant_id, ExitTag.tag(e))
   catch

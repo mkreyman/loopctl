@@ -23,17 +23,20 @@ Operator-facing changes for deployments outside the hosted instance.
   nothing — which also means the one-hop enrichment in progressive disclosure was spending
   its budget on noise.
 
-  What changes: `ArticleLinkingWorker` now writes at most `article_max_relates_to_links`
-  (**new setting, default 10**) edges per article, and `Loopctl.Knowledge.LinkPruning` drains
+  What changes: `ArticleLinkingWorker` now holds each article at `article_max_relates_to_links`
+  (**new setting, default 10**) STORED `relates_to` edges — a re-link tops it up to that number
+  rather than adding that many more — and `Loopctl.Knowledge.LinkPruning` drains
   the existing backlog at up to `knowledge_link_prune_max_per_run` (**new setting, default
   250,000**) edges per nightly run, worst-first, reporting the remainder on the
   `knowledge.lint_completed` audit event as `links_pruned` / `links_prunable_remaining`.
   On the hosted corpus the target state is 499,058 edges (~12.6 average degree).
 
   What is NOT touched: `potential_conflict` edges (own threshold, own draining consumer),
-  any `relates_to` link without `auto_generated: true`, and any link without a recorded
-  `similarity_score`. A hand-made link is structurally out of reach, and an edge that cannot
-  be ranked cannot be shown to be prunable.
+  any `relates_to` link without `auto_generated: true`, any link without a recorded
+  `similarity_score`, and any `relates_to` edge at or above `knowledge_conflict_threshold`
+  (those rows are the conflict promoter's only input, and it drains them far slower than the
+  prune would delete them). A hand-made link is structurally out of reach, and an edge that
+  cannot be ranked cannot be shown to be prunable.
 
   Why deleting is safe unattended, when every other automated step in that worker is gated on
   reversibility: an auto-generated edge is a *derived artifact*, not a record — a pure

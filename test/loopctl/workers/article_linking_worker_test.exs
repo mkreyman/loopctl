@@ -510,6 +510,46 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       end
     end
 
+    test "tops an already-linked article UP to K rather than adding K more" do
+      # The cut used to run on the candidate list BEFORE the already-linked rejection, so
+      # stored edges cost nothing against K: every re-link (nightly orphan pass, a re-embed)
+      # could add K MORE and outbound degree grew without bound between prunes.
+      %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      first = for _i <- 1..14, do: create_published_article(tenant.id)
+      second = for _i <- 1..14, do: create_published_article(tenant.id)
+
+      run = fn ->
+        ArticleLinkingWorker.perform(%Oban.Job{
+          args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+        })
+      end
+
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        Enum.map(first, &candidate(&1, 0.90))
+      end)
+
+      assert :ok = run.()
+
+      # A later run whose candidate set has shifted: all NEW pairs, all nearer than the
+      # stored ones. The article is already at K, so it may write none of them.
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        Enum.map(second, &candidate(&1, 0.92))
+      end)
+
+      assert :ok = run.()
+
+      degree =
+        from(l in ArticleLink,
+          where: l.tenant_id == ^tenant.id,
+          where: l.relationship_type == :relates_to,
+          where: l.source_article_id == ^source.id or l.target_article_id == ^source.id
+        )
+        |> AdminRepo.aggregate(:count)
+
+      assert degree == Application.get_env(:loopctl, :article_max_relates_to_links, 10)
+    end
+
     test "does NOT cap potential_conflict — that queue has its own draining consumer" do
       # `judge_redundant_conflicts/1` drains this pile capped ABOVE the promotion rate, so
       # it converges by arithmetic. Capping the producer here as well would silently

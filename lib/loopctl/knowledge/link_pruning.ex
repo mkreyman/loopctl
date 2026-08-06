@@ -59,12 +59,22 @@ defmodule Loopctl.Knowledge.LinkPruning do
   - `metadata->>'similarity_score' IS NOT NULL` — an edge with no recorded similarity cannot be
     ranked, so it cannot be shown to be outside anyone's top-K. Unrankable means unprunable.
 
+  One further class is RANKED but never DELETED: a `relates_to` edge at or above
+  `:knowledge_conflict_threshold`. `KnowledgeLintWorker.promote_conflicts/1` sources its
+  candidates EXCLUSIVELY from those rows, capped at 500/night against a much larger backlog, so
+  deleting one before the promoter reaches it makes that pair permanently invisible to conflict
+  detection. They still occupy top-K slots, so protecting them costs the degree bound nothing.
+
   ## Bounding
 
   One run deletes at most `:knowledge_link_prune_max_per_run` (default 250,000) edges,
-  WORST-FIRST by similarity, inside a `SET LOCAL statement_timeout` transaction. The remainder
-  is returned and logged rather than silently dropped, and the pass converges: the write-side
-  cap means the producer no longer outruns it.
+  WORST-FIRST by similarity, in BATCHES — each its own short transaction whose CLIENT deadline
+  is set ABOVE its `SET LOCAL statement_timeout`, so the server bound is the one that fires
+  and no single AdminRepo connection (pool of 3) is held for minutes while the nightly fan-out
+  runs. Each batch deletes and counts the remainder in ONE statement, so the ranking is never
+  re-derived for a number the delete already knows. A batch that fails after earlier ones
+  committed still reports what they deleted (`remaining: -1`). The pass converges: the
+  write-side cap means the producer no longer outruns it.
   """
 
   import Ecto.Query
@@ -72,13 +82,18 @@ defmodule Loopctl.Knowledge.LinkPruning do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.ExitTag
   alias Loopctl.LocalGuc
 
   @default_max_per_run 250_000
-  # Generous: the ranking CTE over the whole hosted corpus measured 3.7 s, and the delete is
-  # keyed on primary keys. The timeout exists so a pathological plan cannot hold an AdminRepo
-  # connection (pool of 3) for the rest of the night, not to bound the normal case.
-  @statement_timeout_ms 120_000
+  # Rows per statement: re-deriving the ranking per batch (3.7 s on the hosted corpus) is the
+  # price of RELEASING one of AdminRepo's three connections between batches.
+  @batch_size 50_000
+  # SERVER bound on one batch. The CLIENT deadline must EXCEED it or DBConnection aborts the
+  # checkout first and the server bound can never fire — the pairing that
+  # `:bulk_op_transaction_timeout_ms` exists for elsewhere.
+  @statement_timeout_ms 30_000
+  @transaction_timeout_ms @statement_timeout_ms + 5_000
 
   @doc "Per-article `relates_to` degree target — the K in top-K."
   @spec target_degree() :: pos_integer()
@@ -95,108 +110,133 @@ defmodule Loopctl.Knowledge.LinkPruning do
   @doc """
   Prunes this tenant's `relates_to` edges to union-kNN top-K.
 
-  Returns `{:ok, %{pruned: n, remaining: n}}`. `remaining` is how many prunable edges were
-  still over the cap when the run stopped — zero means the graph is at its target degree.
+  Returns `{:ok, %{pruned: n, remaining: n}}`, or `{:error, reason}` when the FIRST batch
+  failed and nothing committed. `remaining` is how many prunable edges were still over the cap
+  when the run stopped — zero means the graph is at its target degree, `-1` means unmeasured.
 
   Opts: `:target_degree`, `:max_per_run` (both default to the config values above).
   """
   @spec prune(Ecto.UUID.t(), keyword()) ::
-          {:ok, %{pruned: non_neg_integer(), remaining: integer()}}
+          {:ok, %{pruned: non_neg_integer(), remaining: integer()}} | {:error, term()}
   def prune(tenant_id, opts \\ []) do
     k = Keyword.get(opts, :target_degree, target_degree())
     cap = Keyword.get(opts, :max_per_run, max_per_run())
 
-    {:ok, pruned} =
-      LocalGuc.timed_transaction(AdminRepo, @statement_timeout_ms, fn ->
-        delete_prunable(tenant_id, k, cap)
-      end)
-
-    remaining = count_prunable(tenant_id, k)
-
-    if pruned > 0 or remaining > 0 do
-      Logger.info(
-        "LinkPruning: tenant=#{tenant_id} relates_to pruned=#{pruned} remaining=#{remaining} " <>
-          "target_degree=#{k} cap=#{cap}"
-      )
-    end
-
-    {:ok, %{pruned: pruned, remaining: remaining}}
-  end
-
-  # The ranking is over edges INCIDENT to a node, which means each edge is ranked twice —
-  # once from each endpoint. `union all` materializes both sides; `rn <= k` on either keeps
-  # the edge. Deleting worst-first (`order by sim`) makes a capped run drop the least
-  # defensible edges first, so a partially-drained graph is always better than it was.
-  defp delete_prunable(tenant_id, k, cap) do
-    %{num_rows: n} =
-      AdminRepo.query!(
-        """
-        WITH e AS (
-          SELECT id, source_article_id AS a, target_article_id AS b,
-                 (metadata->>'similarity_score')::float AS sim
-          FROM article_links
-          WHERE tenant_id = $1 #{prunable_predicate()}
-        ),
-        sided AS (
-          SELECT id, a AS node, sim FROM e
-          UNION ALL
-          SELECT id, b AS node, sim FROM e
-        ),
-        ranked AS (
-          SELECT id, row_number() OVER (PARTITION BY node ORDER BY sim DESC, id) AS rn
-          FROM sided
-        ),
-        keep AS (SELECT DISTINCT id FROM ranked WHERE rn <= $2),
-        doomed AS (
-          SELECT e.id FROM e
-          LEFT JOIN keep ON keep.id = e.id
-          WHERE keep.id IS NULL
-          ORDER BY e.sim ASC, e.id
-          LIMIT $3
+    with {:ok, %{pruned: pruned, remaining: remaining} = result} <- drain(tenant_id, k, cap, 0) do
+      if pruned > 0 or remaining != 0 do
+        Logger.info(
+          "LinkPruning: tenant=#{tenant_id} relates_to pruned=#{pruned} remaining=#{remaining} " <>
+            "target_degree=#{k} cap=#{cap}"
         )
-        DELETE FROM article_links WHERE id IN (SELECT id FROM doomed)
-        """,
-        [Ecto.UUID.dump!(tenant_id), k, cap]
-      )
+      end
 
-    n
+      {:ok, result}
+    end
   end
 
-  defp count_prunable(tenant_id, k) do
-    %{rows: [[n]]} =
-      AdminRepo.query!(
-        """
-        WITH e AS (
-          SELECT id, source_article_id AS a, target_article_id AS b,
-                 (metadata->>'similarity_score')::float AS sim
-          FROM article_links
-          WHERE tenant_id = $1 #{prunable_predicate()}
-        ),
-        sided AS (
-          SELECT id, a AS node, sim FROM e
-          UNION ALL
-          SELECT id, b AS node, sim FROM e
-        ),
-        ranked AS (
-          SELECT id, row_number() OVER (PARTITION BY node ORDER BY sim DESC, id) AS rn
-          FROM sided
-        ),
-        keep AS (SELECT DISTINCT id FROM ranked WHERE rn <= $2)
-        SELECT count(*) FROM e LEFT JOIN keep ON keep.id = e.id WHERE keep.id IS NULL
-        """,
-        [Ecto.UUID.dump!(tenant_id), k]
-      )
+  # A batch that fails AFTER earlier ones committed must not discard their tally: the caller
+  # would then record `pruned: 0` for a night that really deleted rows, and this is the one
+  # step in the nightly pass that deletes anything.
+  defp drain(tenant_id, k, cap, pruned) do
+    case delete_batch(tenant_id, k, min(@batch_size, cap - pruned)) do
+      {:ok, {deleted, prunable}} ->
+        pruned = pruned + deleted
+        remaining = prunable - deleted
 
-    n
+        if deleted == 0 or remaining == 0 or pruned >= cap do
+          {:ok, %{pruned: pruned, remaining: remaining}}
+        else
+          drain(tenant_id, k, cap, pruned)
+        end
+
+      {:error, reason} ->
+        partial(tenant_id, pruned, reason)
+    end
   end
+
+  defp partial(_tenant_id, 0, reason), do: {:error, reason}
+
+  defp partial(tenant_id, pruned, reason) do
+    Logger.error(
+      "LinkPruning: tenant=#{tenant_id} batch failed (#{ExitTag.tag(reason)}) after #{pruned} " <>
+        "edges were already committed; reporting those, with remaining=-1 (unmeasured)."
+    )
+
+    {:ok, %{pruned: pruned, remaining: -1}}
+  end
+
+  # The ranking is over edges INCIDENT to a node, so each edge is ranked twice — once from each
+  # endpoint. `union all` materializes both sides; `rn <= k` on either keeps the edge. Deleting
+  # worst-first makes a capped run drop the least defensible edges first.
+  #
+  # Delete AND remainder in ONE statement: the ranking is the expensive part (3.7 s over the
+  # whole hosted corpus) and a separate count re-ran all of it for a number this statement
+  # already holds. `doomed` is evaluated on the statement's snapshot, so `prunable - deleted`
+  # is exact — every deleted edge was outside EVERY partition's top-K, so removing it cannot
+  # promote another doomed edge into one.
+  #
+  # `NULLS LAST` and the `coalesce` are not decoration: `DESC` defaults to NULLS FIRST and
+  # `NULL < 0.93` is NULL, so if the scoreless guard were ever loosened an UNRANKABLE edge
+  # would rank BEST and be spared by the band — the most protected row rather than the least.
+  defp delete_batch(tenant_id, k, limit) do
+    LocalGuc.timed_transaction(
+      AdminRepo,
+      @statement_timeout_ms,
+      fn ->
+        %{rows: [[deleted, prunable]]} =
+          AdminRepo.query!(
+            """
+            WITH e AS (
+              SELECT id, source_article_id AS a, target_article_id AS b,
+                     (metadata->>'similarity_score')::float AS sim
+              FROM article_links
+              WHERE tenant_id = $1 #{prunable_predicate()}
+            ),
+            sided AS (
+              SELECT id, a AS node, sim FROM e
+              UNION ALL
+              SELECT id, b AS node, sim FROM e
+            ),
+            ranked AS (
+              SELECT id, row_number() OVER (PARTITION BY node ORDER BY sim DESC NULLS LAST, id) AS rn
+              FROM sided
+            ),
+            keep AS (SELECT DISTINCT id FROM ranked WHERE rn <= $2),
+            doomed AS (
+              SELECT e.id, e.sim FROM e
+              LEFT JOIN keep ON keep.id = e.id
+              WHERE keep.id IS NULL AND coalesce(e.sim, 0) < #{conflict_band()}
+            ),
+            deleted AS (
+              DELETE FROM article_links
+              WHERE id IN (SELECT id FROM doomed ORDER BY sim ASC, id LIMIT $3)
+              RETURNING 1
+            )
+            SELECT (SELECT count(*) FROM deleted), (SELECT count(*) FROM doomed)
+            """,
+            [Ecto.UUID.dump!(tenant_id), k, limit]
+          )
+
+        {deleted, prunable}
+      end,
+      timeout: @transaction_timeout_ms
+    )
+  rescue
+    e -> {:error, e}
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  # A numeric SQL literal by construction, never caller input.
+  defp conflict_band, do: Float.to_string(conflict_threshold())
+
+  defp conflict_threshold,
+    do: Application.get_env(:loopctl, :knowledge_conflict_threshold, 0.93) * 1.0
 
   @doc """
-  The SQL predicate selecting edges this module may delete — machine-derived, rankable
-  `relates_to` only.
-
-  Exposed so the test can assert the guard is present in BOTH statements above rather than
-  in whichever one it happened to read: a predicate that drifts between the delete and the
-  count would report a backlog it is not allowed to drain, forever.
+  The SQL predicate selecting the edges this module RANKS — machine-derived, rankable
+  `relates_to` only; the delete additionally spares the conflict band (see the moduledoc).
+  Exposed so the test can assert the guard is in the STATEMENT, not in whichever prose it read.
   """
   @spec prunable_predicate() :: String.t()
   def prunable_predicate do
@@ -211,11 +251,14 @@ defmodule Loopctl.Knowledge.LinkPruning do
   """
   @spec prunable_query(Ecto.UUID.t()) :: Ecto.Query.t()
   def prunable_query(tenant_id) do
+    band = conflict_threshold()
+
     from(l in Loopctl.Knowledge.ArticleLink,
       where: l.tenant_id == ^tenant_id,
       where: l.relationship_type == :relates_to,
       where: fragment("?->>'auto_generated' = 'true'", l.metadata),
-      where: not is_nil(fragment("?->>'similarity_score'", l.metadata))
+      where: not is_nil(fragment("?->>'similarity_score'", l.metadata)),
+      where: fragment("(?->>'similarity_score')::float < ?", l.metadata, ^band)
     )
   end
 end
