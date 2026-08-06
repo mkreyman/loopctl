@@ -494,14 +494,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     |> MapSet.new()
   end
 
-  # #584 stage 1: REPORT ONLY. Reuses the lint report already computed above (one
-  # corpus scan per night, one scheduler) and writes only the consolidation report +
-  # its proposal rows.
+  # Writes the consolidation report + its proposal rows and nothing else. The APPLY is a
+  # separate step (`apply_consolidation/1`, below) on purpose: this one must run first so
+  # the two-run agreement gate compares tonight against last night. It scans the corpus
+  # itself and takes no input from the lint report above — `:stale_entry` was the only
+  # class that needed one, and #605 retired it.
   #
   # FAIL-SOFT, and that is the whole point of the rescue/catch: by the time this runs,
   # `lint_tenant/1` has ALREADY taken its effectful steps (orphan re-link enqueues,
   # conflict promotions, applied resolutions) and has NOT yet written its audit event.
-  # Letting a raise out of the report-only stage — a statement timeout on a large
+  # Letting a raise out of this stage — a statement timeout on a large
   # corpus, an in-flight shed, an AdminRepo checkout exit — would skip
   # `log_audit_event/6` entirely, so the change feed would show NO lint for that tenant
   # that night even though state changed, and Oban's retries would redo the effectful
@@ -567,7 +569,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
   # Counts of PROPOSALS (not articles): `proposal_count` is the true pre-cap total
   # across classes, `persisted_count` the rows actually written (lower only when a class
-  # hit its cap). Nothing was applied — stage 1 is report-only.
+  # hit its cap). These are PROPOSAL counts only — a proposal here may or may not have been
+  # applied tonight, since applying also requires last night's report to have agreed. The
+  # apply's own tally rides the summary log line (`duplicates_unpublished` /
+  # `duplicate_groups_skipped`), and each individual unpublish writes its own audit event
+  # through `Knowledge.unpublish_article/3` (`actor_label: "worker:consolidation"`).
   defp consolidation_state({:ok, consolidation}) do
     %{
       "status" => "ok",

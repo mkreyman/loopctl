@@ -1786,8 +1786,9 @@ async function knowledgeUnpublish({ article_id }) {
   return toContent(result);
 }
 
-// #331: single-article archive is agent-role KB curation (reversible soft delete,
-// audited, visibility-scoped server-side).
+// #331: single-article archive is agent-role KB curation (non-destructive soft delete,
+// audited, visibility-scoped server-side). NOT reversible in code — #606/#605: `:archived`
+// is a terminal status. The row survives; nothing automated brings it back.
 async function knowledgeArchive({ article_id }) {
   const result = await apiCall(
     "POST",
@@ -5225,10 +5226,13 @@ const TOOLS = [
     name: "knowledge_delete",
     description:
       "Delete an article. Under the hood this performs the same soft-delete (archive) " +
-      "as knowledge_archive — use whichever name is clearer at the call site. The row " +
-      "is retained for audit; there is no hard delete (that is knowledge_bulk_delete " +
-      "hard:true, which stays user-gated). Agent role — KB-content curation, reversible + " +
-      "audited, visibility-scoped (another agent's private/owner memory 404s).",
+      "as knowledge_archive — use whichever name is clearer at the call site, and note " +
+      "that it inherits archive's terminality: the row is retained for audit, but " +
+      "`:archived` has no outbound transition, so NOTHING you can call restores it. " +
+      "For a retraction you can undo, use knowledge_unpublish instead. There is no hard " +
+      "delete here (that is knowledge_bulk_delete hard:true, which stays user-gated). " +
+      "Agent role — KB-content curation: non-destructive + audited, visibility-scoped " +
+      "(another agent's private/owner memory 404s).",
     inputSchema: {
       type: "object",
       properties: {
@@ -5243,7 +5247,9 @@ const TOOLS = [
   {
     name: "knowledge_bulk_delete",
     description:
-      "Bulk archive (default, reversible) or IRREVERSIBLE hard-delete of articles by selector. " +
+      "Bulk archive (default, non-destructive but NOT reversible by any call you can make — " +
+      "`:archived` is terminal; restoring needs a user-role PATCH) or IRREVERSIBLE hard-delete " +
+      "of articles by selector. " +
       "REQUIRES LOOPCTL_USER_KEY (user role — orchestrator is NOT sufficient). Provide EXACTLY ONE " +
       "selector: article_ids (explicit list), source_type + source_id (every active article from " +
       "that source), or tag + confirm:true (every active article carrying the tag — high blast " +

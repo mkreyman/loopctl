@@ -55,15 +55,21 @@ never pass `tenant_id`/`subject_id`.
 3. **All heavy KB reads route through `Loopctl.HeavyRead`** — semantic search, novelty, suggest-links,
    distant-pairs, enumeration (`knowledge.ex:12`). See the `tenancy-rls` skill for the pool/pgbouncer
    reasoning; never run these on `Repo`/`AdminRepo`.
-4. **KB-content curation is agent-role and reversible (#331)** — `knowledge_create`, `knowledge_update`
-   (ID-preserving in-place edit), `knowledge_archive`/`knowledge_delete` (soft delete → `status:
-   :archived`, row retained), and `knowledge_resolve_conflict` in all dispositions are agent-role because
-   each is reversible + audited. The `:user` set is single-article `unpublish` plus ALL the SET-BASED
-   bulk ops — `bulk_publish`, `bulk_unpublish` and the ENTIRE `bulk_delete` action, soft path included
-   (`article_workflow_controller.ex:37-39`). **Both criteria matter**: set-based blast radius (one call
-   mutates an unbounded set) AND irreversibility (`bulk_delete` carries a hard-delete path) — see the
-   controller `@moduledoc` (`:9-18`). Single-article ops are agent-role precisely BECAUSE they are
-   reversible + audited, so never drop reversibility when reasoning about a new op.
+4. **KB-content curation is agent-role because it is NON-DESTRUCTIVE + audited (#331)** —
+   `knowledge_create`, `knowledge_update` (ID-preserving in-place edit),
+   `knowledge_archive`/`knowledge_delete` (soft delete → `status: :archived`, row retained), and
+   `knowledge_resolve_conflict` in all dispositions. **Non-destructive is not the same as reversible,
+   and archive is the case that separates them (#605/#606):** `:archived` is TERMINAL — `Article`'s
+   `@valid_transitions` has no `{:archived, _}` and there is no unarchive function, so the only way
+   back is a `user+` PATCH with an explicit status. Nothing is destroyed and everything is audited,
+   which is what earns agent role; nothing automated restores it, which is why an unattended writer
+   must reach for `unpublish` (`{:published, :draft}`, undone by `publish`) instead. The `:user` set
+   is single-article `unpublish` plus ALL the SET-BASED bulk ops — `bulk_publish`, `bulk_unpublish`
+   and the ENTIRE `bulk_delete` action, soft path included (`article_workflow_controller.ex:37-39`).
+   **Both criteria matter**: set-based blast radius (one call mutates an unbounded set) AND
+   irreversibility (`bulk_delete` carries a hard-delete path) — see the controller `@moduledoc`
+   (`:9-18`). Single-article ops are agent-role precisely BECAUSE nothing they do destroys a row, so
+   never drop that property when reasoning about a new op.
    `drafts`/`publish` are `:orchestrator` (`:33`).
    Agent edits are visibility-scoped: an agent can only touch an article it can see. (See `chain-of-custody`.)
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`

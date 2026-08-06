@@ -1,9 +1,17 @@
 defmodule Loopctl.Knowledge.ConsolidationReport do
   @moduledoc """
-  One nightly consolidation ("dream") run for a tenant, on a UTC day (#584 stage 1).
+  One nightly consolidation ("dream") run for a tenant, on a UTC day (#584, #605).
 
-  The run is REPORT-ONLY: it writes this row and its `ConsolidationProposal` children
-  and nothing else — no `articles`, `article_links` or `conflict_resolutions` write.
+  THIS ROW is a record of what the run proposed, and the run writes it plus its
+  `ConsolidationProposal` children. The run itself is no longer report-only: since #608 it
+  also UNPUBLISHES the losers of each `:duplicate_capture` group that this report and the
+  previous one both propose (`Consolidation.apply_confirmed_duplicates/2`). That is its only
+  `articles` write, it is an unpublish and never an archive, and it still writes no
+  `article_links` and no `conflict_resolutions`.
+
+  Nothing here records the apply: the counts below are what was PROPOSED, and a proposal in
+  this report may or may not have been acted on tonight depending on whether last night's
+  report agreed. The apply's own tally goes to the worker's audit event.
 
   ## Denominators (state them, do not infer them — #582/#1faa4808)
 
@@ -11,7 +19,8 @@ defmodule Loopctl.Knowledge.ConsolidationReport do
     scan time. Draft/archived/superseded articles and the shared system canon are
     outside it, so it is NOT the tenant's total article count.
   - `proposal_count` — the TRUE, pre-cap number of proposals the pass derived across
-    all four classes. It is a count of PROPOSALS, not of articles: one duplicate
+    every class it still PRODUCES (two of the four enum values are retired and are
+    never counted here). It is a count of PROPOSALS, not of articles: one duplicate
     group of three articles is one proposal, and one article can appear in several
     proposals of different classes.
   - `persisted_count` — how many proposal ROWS this report actually carries. It is
