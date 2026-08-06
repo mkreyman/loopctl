@@ -8,7 +8,9 @@ defmodule LoopctlWeb.KnowledgeConsolidationController do
   THIS ENDPOINT applies nothing and reads persisted rows only. It never runs the pass:
   consolidation is a whole-corpus job and belongs in the nightly worker, not in a
   request path. The PASS it reports on does write: since #608 it UNPUBLISHES the losers
-  of each `duplicate_capture` group two consecutive reports both propose. `review_status`
+  of each `duplicate_capture` group two consecutive reports both propose — consecutive
+  meaning the previous report is at most 2 days older, so one skipped run is tolerated and a
+  longer outage is not. `review_status`
   is vestigial — there is no approve/reject surface and there will not be one (#605
   supersedes #594); auto-apply is gated on reversibility and two-run agreement.
   """
@@ -38,7 +40,8 @@ defmodule LoopctlWeb.KnowledgeConsolidationController do
         "THIS ENDPOINT is read-only: it returns persisted rows, never recomputes, and " <>
         "applies nothing. The PASS it reports on is not: since #608 the nightly run " <>
         "UNPUBLISHES the losers of each `duplicate_capture` group that two consecutive " <>
-        "reports both propose. That is the only write it makes to `articles`, it is an " <>
+        "reports both propose — consecutive meaning the previous report is at most 2 days " <>
+        "older, so one skipped nightly run is tolerated and a longer outage is not. That is the only write it makes to `articles`, it is an " <>
         "unpublish and never an archive (archive is terminal for an article), and it " <>
         "still writes no links or conflict resolutions. Role: orchestrator+.\n\n" <>
         "CLASSES — `duplicate_capture` (titles that collide once case/punctuation are " <>

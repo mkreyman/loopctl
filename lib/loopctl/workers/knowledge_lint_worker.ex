@@ -219,6 +219,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "links_pruned=#{pruned.pruned} links_prunable_remaining=#{pruned.remaining} " <>
         "resolutions_applied=#{resolutions_applied} " <>
         "duplicates_unpublished=#{applied.applied} duplicate_groups_skipped=#{applied.skipped} " <>
+        "duplicate_apply_gate=#{applied.gate} " <>
         "duplicates_unpublish_failed=#{applied.failed} " <>
         consolidation_log(consolidation)
     )
@@ -573,7 +574,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     %{pruned: 0, remaining: -1}
   end
 
-  defp apply_consolidation(_tenant_id, {:error, _tag}), do: %{applied: 0, skipped: 0, failed: 0}
+  defp apply_consolidation(_tenant_id, {:error, _tag}),
+    do: %{applied: 0, skipped: 0, failed: 0, gate: :scan_failed}
 
   defp apply_consolidation(tenant_id, {:ok, _report}) do
     Consolidation.apply_confirmed_duplicates(tenant_id)
@@ -663,6 +665,10 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       "duplicates_unpublished" => applied.applied,
       "duplicate_groups_skipped" => applied.skipped,
       "duplicates_unpublish_failed" => applied.failed,
+      # WHY nothing was applied, when nothing was. `:open` with zeroes is a clean corpus;
+      # `:report_gap` / `:insufficient_history` mean the agreement gate refused to run and
+      # `:apply_failed` means it ran and crashed. All four used to be the same three zeroes.
+      "duplicate_apply_gate" => to_string(Map.get(applied, :gate, :open)),
       "apply_error" => Map.get(applied, :error)
     }
   end

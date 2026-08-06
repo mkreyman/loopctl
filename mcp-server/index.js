@@ -5492,7 +5492,9 @@ const TOOLS = [
       "the corpus, each naming the articles involved and quoting an excerpt from each as " +
       "evidence. THIS TOOL applies nothing and recomputes nothing — it returns persisted rows. " +
       "The PASS it reports on does write: since #608 the nightly run UNPUBLISHES the losers of " +
-      "each `duplicate_capture` group that two consecutive reports both propose. That is its " +
+      "each `duplicate_capture` group that two consecutive reports both propose — consecutive " +
+      "meaning the previous report is at most 2 days older, so ONE skipped nightly run is " +
+      "tolerated and a longer outage is not. That is its " +
       "only write to articles, it is an unpublish and never an archive (archive is terminal for " +
       "an article), and it still writes no links or conflict resolutions. Requires orchestrator " +
       "role.\n\n" +

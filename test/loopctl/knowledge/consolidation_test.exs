@@ -112,6 +112,8 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
     test "proposes idempotency keys that collide under normalization but differ verbatim" do
       tenant = fixture(:tenant)
 
+      # SEPARATOR drift with case held constant — that is the #583 shape: one writer used
+      # colons, another underscores, for the same key.
       a =
         published(tenant.id, %{
           title: "Harvest A",
@@ -123,7 +125,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
         published(tenant.id, %{
           title: "Harvest B",
           body: "Harvested from the 2026-08-04 session.",
-          idempotency_key: "SESSION_2026_08_04_HARVEST"
+          idempotency_key: "session_2026_08_04_harvest"
         })
 
       {:ok, analysis} = Consolidation.analyze(tenant.id)
@@ -131,6 +133,22 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert [proposal] = proposals_of(analysis, :duplicate_capture)
       assert Enum.sort(proposal.article_ids) == Enum.sort([a.id, b.id])
       assert Enum.all?(proposal.evidence, &(&1["excerpt"] != ""))
+    end
+
+    test "does NOT group idempotency keys that differ only by CASE" do
+      # An `idempotency_key` is an opaque token chosen by the writer, so case can be the only
+      # thing distinguishing two of them — unlike a title, which is prose. Folding case here
+      # would be a collision rather than a normalization, and this class AUTO-APPLIES: a
+      # deterministic false grouping is confirmed by the two-run gate on night two and the
+      # loser is unpublished. Titles keep their case folding; keys do not.
+      tenant = fixture(:tenant)
+      published(tenant.id, %{title: "Harvest A", idempotency_key: "session:AB12:harvest"})
+      published(tenant.id, %{title: "Harvest B", idempotency_key: "session:ab12:harvest"})
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
+
+      assert proposals_of(analysis, :duplicate_capture) == []
+      assert analysis.summary.by_class["duplicate_capture"] == 0
     end
 
     test "does not propose distinct articles that share neither a title nor a key shape" do
@@ -216,7 +234,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
 
       for n <- 1..3 do
         published(tenant.id, %{title: "Key Drift #{n} A", idempotency_key: "harvest:#{n}"})
-        published(tenant.id, %{title: "Key Drift #{n} B", idempotency_key: "HARVEST_#{n}"})
+        published(tenant.id, %{title: "Key Drift #{n} B", idempotency_key: "harvest_#{n}"})
       end
 
       published(tenant.id, %{title: "Retry Policy", body: "Retry with jitter."})
@@ -625,7 +643,10 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert redacted["excerpt"] == ""
       assert redacted["title"] == nil
       assert redacted["redacted"] == true
-      refute Map.has_key?(redacted, "idempotency_key")
+      # Uniform key set across every evidence branch — a redacted entry carries the key with
+      # a nil value rather than omitting it, so a caller never has to ask which branch it got.
+      assert Map.has_key?(redacted, "idempotency_key")
+      assert redacted["idempotency_key"] == nil
     end
 
     test "redacts the excerpt of an article archived after the pass ran" do
@@ -708,6 +729,82 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
     end
 
     defp status(id), do: AdminRepo.get!(Article, id).status
+
+    # Runs the pass on two adjacent days so the agreement gate is satisfied.
+    defp confirm_over_two_nights(tenant_id) do
+      {:ok, _} = Consolidation.run(tenant_id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant_id)
+    end
+
+    test "bounds LOSER ARTICLES per run, not just duplicate groups" do
+      # A group cap is not an article cap: one group can carry many members, so 25 groups is
+      # an unbounded number of unpublishes. A group that would cross the article budget is
+      # skipped WHOLE — a half-applied group has no winner, which is the one state neither
+      # the next run nor a reader can interpret.
+      tenant = fixture(:tenant)
+
+      for n <- 1..4 do
+        published(tenant.id, %{title: "Group #{n} Doc", body: String.duplicate("long ", 30)})
+        published(tenant.id, %{title: "group-#{n}-doc!", body: "short"})
+      end
+
+      confirm_over_two_nights(tenant.id)
+
+      # Budget of 3 loser articles against 4 groups of 1 loser each: three groups apply,
+      # the fourth is skipped rather than partially applied.
+      assert %{applied: 3, skipped: 1} =
+               Consolidation.apply_confirmed_duplicates(tenant.id, max_unpublishes: 3)
+    end
+
+    test "reports WHY nothing applied — a closed gate is not a quiet night" do
+      # `applied: 0, skipped: 0` used to be byte-identical for a fresh install, a tenant
+      # mid-outage, and a genuinely clean corpus. The audit event is the surface an auditor
+      # reads; without a reason it cannot tell a blocked pass from a healthy one.
+      tenant = fixture(:tenant)
+      {_a, _b} = duplicate_pair(tenant.id)
+
+      # One report only.
+      {:ok, _} = Consolidation.run(tenant.id)
+      assert %{gate: :insufficient_history} = Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      # Two reports, but further apart than the confirmation window allows.
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -30))
+      assert %{gate: :report_gap} = Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      # Adjacent reports: the gate is open, and it says so even when it applies.
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      assert %{gate: :open} = Consolidation.apply_confirmed_duplicates(tenant.id)
+    end
+
+    test "never unpublishes an agent's PRIVATE article, however its title collides" do
+      # The pass runs as the SYSTEM and holds no agent identity, so it can never be the owner
+      # a private article would be visible to. Two harms, and the quieter one is worse: the
+      # loud one is unpublishing another agent's memory, the quiet one is quoting a private
+      # body into a report any orchestrator key can read.
+      tenant = fixture(:tenant)
+
+      published(tenant.id, %{
+        title: "Deploy Runbook",
+        body: String.duplicate("shared body ", 20)
+      })
+
+      private =
+        published(tenant.id, %{
+          title: "deploy-runbook!",
+          body: "PRIVATE agent memory",
+          metadata: %{"visibility" => "private", "agent_id" => Ecto.UUID.generate()}
+        })
+
+      confirm_over_two_nights(tenant.id)
+
+      assert %{applied: 0} = Consolidation.apply_confirmed_duplicates(tenant.id)
+      assert status(private.id) == :published
+
+      # And the private body never reached the report at all.
+      {:ok, report} = Consolidation.latest(tenant.id)
+      excerpts = report.proposals |> Enum.flat_map(& &1.evidence) |> Enum.map(& &1["excerpt"])
+      refute Enum.any?(excerpts, &(&1 =~ "PRIVATE agent memory"))
+    end
 
     test "applies NOTHING after a single run — one observation is not confirmation" do
       # This is what replaces human approve/reject. A duplicate that appears once and is gone

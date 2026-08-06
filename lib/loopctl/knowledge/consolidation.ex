@@ -133,6 +133,16 @@ defmodule Loopctl.Knowledge.Consolidation do
   # should be visible after one night rather than after the whole corpus.
   @default_max_applies 25
 
+  # A GROUP cap is not an ARTICLE cap: one duplicate group can carry many members, so 25
+  # groups is an unbounded number of unpublishes. This bounds the thing that is actually
+  # irreversible-adjacent — loser articles pulled out of the published set in one night.
+  @default_max_unpublishes 100
+
+  # The classes `analyze/2` still PRODUCES, in the order proposals are numbered in. Distinct
+  # from `ConsolidationProposal.classes()`, which is the schema enum and additionally carries
+  # the retired values so historical rows load. Assembly iterates THIS list.
+  @live_classes [:duplicate_capture, :generic_title]
+
   # How far apart the two agreeing reports may be, in days. One night's gap is normal (a
   # skipped run); anything wider is not the "two consecutive runs" the gate advertises.
   @max_confirmation_gap 2
@@ -187,15 +197,16 @@ defmodule Loopctl.Knowledge.Consolidation do
     truncated =
       Map.new(found, fn {class, {total, items}} -> {to_string(class), total > length(items)} end)
 
-    # Drive the ORDER from the schema enum, but only over classes this pass still PRODUCES.
-    # The enum deliberately retains `:contradiction_candidate` and `:stale_entry` so
-    # historical rows still load (see `ConsolidationProposal`), and a `Map.fetch!` over the
-    # full enum would raise on every run now that both are retired. `Map.fetch!` is kept for
-    # the classes that ARE present, so a genuinely missing producer still fails loudly rather
-    # than silently emitting a short report.
+    # Drive the ORDER from `@live_classes` — the classes this pass still PRODUCES — and
+    # `Map.fetch!` over THAT list, so a dropped producer raises.
+    #
+    # This used to iterate the schema enum and `Enum.filter(&Map.has_key?(found, &1))` in
+    # front of the fetch, which made the "fails loudly" guarantee unreachable: the filter
+    # removed exactly the keys `Map.fetch!` would have raised on, so deleting a producer
+    # silently shortened the report and its `by_class` instead. A guard whose precondition
+    # is established by the line above it is not a guard.
     proposals =
-      ConsolidationProposal.classes()
-      |> Enum.filter(&Map.has_key?(found, &1))
+      @live_classes
       |> Enum.flat_map(fn class -> found |> Map.fetch!(class) |> elem(1) end)
       |> Enum.with_index(1)
       |> Enum.map(fn {proposal, number} -> Map.put(proposal, :number, number) end)
@@ -267,6 +278,24 @@ defmodule Loopctl.Knowledge.Consolidation do
   never acted on. It costs one night of latency and removes the entire class of "acted on a
   state that was already resolving itself", which is most of what a human reviewer catches.
 
+  "Consecutive" means the previous report is at most `#{@max_confirmation_gap}` days older,
+  so ONE skipped run is tolerated and a longer outage is not. On a tenant whose scans failed
+  for a fortnight the two most recent reports are tonight and a report from before the
+  outage, and agreement across that gap is not the transience filter this claims to be. When
+  the window is exceeded the whole apply is skipped and the return carries
+  `gate: :report_gap`; a tenant with fewer than two reports carries
+  `gate: :insufficient_history`. Both are distinct from `gate: :open` with nothing confirmed,
+  which is what a clean corpus looks like.
+
+  ## What bounds one night
+
+  Two caps, in different units. `:max_applies` (default `#{@default_max_applies}`) bounds how
+  many PROPOSALS are considered; `:max_unpublishes` (default `#{@default_max_unpublishes}`)
+  bounds how many loser ARTICLES actually leave the published set. The second is the one that
+  matters — a group can carry many members, so a group cap alone is not an article cap — and
+  a group that would cross it is skipped WHOLE, never applied part-way, because a group with
+  no winner is the one state neither the next run nor a reader can interpret.
+
   It is deliberately NOT a confidence score. Confidence is the machine grading its own
   homework; agreement across two independent observations of a moving corpus is evidence.
 
@@ -286,14 +315,36 @@ defmodule Loopctl.Knowledge.Consolidation do
   @spec apply_confirmed_duplicates(Ecto.UUID.t(), keyword()) :: %{
           applied: non_neg_integer(),
           skipped: non_neg_integer(),
-          failed: non_neg_integer()
+          failed: non_neg_integer(),
+          gate: :open | :report_gap | :insufficient_history
         }
   def apply_confirmed_duplicates(tenant_id, opts \\ []) do
     cap = Keyword.get(opts, :max_applies, @default_max_applies)
+    unpublish_cap = Keyword.get(opts, :max_unpublishes, @default_max_unpublishes)
 
-    tenant_id
-    |> confirmed_duplicate_proposals(cap)
-    |> Enum.reduce(%{applied: 0, skipped: 0, failed: 0}, &tally_apply(tenant_id, &1, &2))
+    case confirmed_duplicate_proposals(tenant_id, cap) do
+      {:error, reason} ->
+        log_gate_blocked(tenant_id, reason)
+        %{applied: 0, skipped: 0, failed: 0, gate: reason}
+
+      {:ok, proposals} ->
+        proposals
+        |> Enum.reduce(
+          %{applied: 0, skipped: 0, failed: 0, gate: :open},
+          &tally_apply(tenant_id, &1, &2, unpublish_cap)
+        )
+    end
+  end
+
+  # "The gate was shut" and "the gate was open and confirmed nothing" both used to return an
+  # empty list, so `applied: 0, skipped: 0` in the audit event was byte-identical for a fresh
+  # install, a tenant mid-outage, and a genuinely clean corpus. The reason tag is what lets an
+  # auditor tell a quiet night from a blocked one without reading the reports table.
+  defp log_gate_blocked(tenant_id, reason) do
+    Logger.info(
+      "Consolidation: tenant=#{tenant_id} duplicate apply gate CLOSED (#{reason}); " <>
+        "nothing applied this run."
+    )
   end
 
   # `:failed` counts LOSER ARTICLES left published — the counter that separates "nothing was
@@ -306,7 +357,19 @@ defmodule Loopctl.Knowledge.Consolidation do
   # to the worker discarded the tally of groups that had ALREADY committed and reported zero
   # unpublishes that really happened. A crashed group applied nothing, so it counts as one
   # failure and the reduce carries on.
-  defp tally_apply(tenant_id, proposal, acc) do
+  defp tally_apply(tenant_id, proposal, acc, unpublish_cap) do
+    # The group cap bounds how many PROPOSALS are considered; this bounds how many ARTICLES
+    # actually leave the published set tonight. A group is skipped WHOLE rather than applied
+    # part-way, because a half-applied group has no winner and is the one state neither the
+    # next run nor a reader can interpret.
+    if acc.applied + acc.failed >= unpublish_cap do
+      %{acc | skipped: acc.skipped + 1}
+    else
+      do_tally_apply(tenant_id, proposal, acc)
+    end
+  end
+
+  defp do_tally_apply(tenant_id, proposal, acc) do
     case apply_duplicate_group(tenant_id, proposal) do
       {:ok, applied, failed} ->
         %{acc | applied: acc.applied + applied, failed: acc.failed + failed}
@@ -320,13 +383,19 @@ defmodule Loopctl.Knowledge.Consolidation do
     :exit, reason -> group_failed(tenant_id, proposal, "exit:" <> ExitTag.tag(reason), acc)
   end
 
+  # `:failed` is counted in LOSER ARTICLES everywhere else, so a crashed group contributes
+  # its loser count — every member but the winner — rather than a flat 1. Mixing units in one
+  # field makes the number unreadable on exactly the night it matters: a systematic failure
+  # across 25 groups of four would have reported 25 while 75 articles stayed published.
   defp group_failed(tenant_id, proposal, tag, acc) do
+    losers = max(length(proposal.article_ids) - 1, 1)
+
     Logger.error(
       "Consolidation: tenant=#{tenant_id} duplicate_capture proposal ##{proposal.number} " <>
-        "could not be applied (#{tag}); group left published."
+        "could not be applied (#{tag}); #{losers} loser article(s) left published."
     )
 
-    %{acc | failed: acc.failed + 1}
+    %{acc | failed: acc.failed + losers}
   end
 
   # Proposals present in BOTH the newest report and the one before it, matched on
@@ -341,15 +410,15 @@ defmodule Loopctl.Knowledge.Consolidation do
     case recent_reports(tenant_id) do
       [newest, previous] ->
         if Date.diff(newest.day, previous.day) <= @max_confirmation_gap do
-          confirmed_against(tenant_id, newest, previous, cap)
+          {:ok, confirmed_against(tenant_id, newest, previous, cap)}
         else
-          []
+          {:error, :report_gap}
         end
 
       _fewer_than_two_reports ->
         # First ever run, or only one report so far: nothing has been confirmed twice, so
         # nothing applies. The pass is silent rather than eager on a fresh install.
-        []
+        {:error, :insufficient_history}
     end
   end
 
@@ -399,6 +468,7 @@ defmodule Loopctl.Knowledge.Consolidation do
           updated_at: a.updated_at
         }
       )
+      |> shared_only()
       |> AdminRepo.all()
 
     # Re-verification, not trust. The group must STILL be a group: fewer than two live
@@ -521,6 +591,33 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   defp published_base(tenant_id) do
     from(a in Article, where: a.tenant_id == ^tenant_id, where: a.status == :published)
+    |> shared_only()
+  end
+
+  @doc false
+  # Excludes agent-PRIVATE articles from everything this pass does. Composed into all THREE
+  # places that build a "published article of this tenant" predicate — the scans
+  # (`published_base/1`), the evidence fetch (`evidence_map/2`) and the apply-time live
+  # re-check (`apply_duplicate_group/2`) — because a guard that lives in only one of them is
+  # a guard the next reader adds a fourth path around.
+  #
+  # Two distinct harms, and the quieter one is worse. The LOUD one: `:duplicate_capture`
+  # auto-applies (#608), so without this the pass could unpublish one agent's private memory
+  # on the strength of a title it shares with another agent's. The QUIET one: every proposal
+  # carries a QUOTED #{@excerpt_chars}-character excerpt of each article's body into a report
+  # any orchestrator key can read — so an unguarded scan republishes private bodies into a
+  # shared surface whether or not anything is ever applied.
+  #
+  # The pass runs as the SYSTEM. It holds no agent identity, so it can never be the owner
+  # that `Knowledge`'s read paths let through; "not visible to this caller" is total here,
+  # not conditional. Same `COALESCE(..., 'shared')` spelling as those paths
+  # (`knowledge.ex:5902` and friends) so an article with no `visibility` key stays in scope.
+  defp shared_only(query) do
+    where(
+      query,
+      [a],
+      fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", a.metadata)
+    )
   end
 
   defp heavy_opts, do: HeavyRead.opts(@heavy_endpoint)
@@ -631,16 +728,25 @@ defmodule Loopctl.Knowledge.Consolidation do
   # The same idempotency key written under two different tag FORMATS (#583) — the
   # normalized keys collide while the verbatim keys differ. Same Unicode-aware separator
   # class and same empty-key guard as `title_drift_groups/1`, for the same reasons.
+  #
+  # But NOT the same case handling, and the asymmetry is deliberate. A TITLE is prose, so
+  # "Retry Policy" and "retry policy" are the same title written twice. An `idempotency_key`
+  # is an OPAQUE token chosen by the writer, and case can be the only thing distinguishing
+  # two of them — `session:AB12` and `session:ab12` are different keys, not one key under
+  # format drift. Folding case here is therefore a collision rather than a normalization,
+  # and this class now AUTO-APPLIES (#608): a deterministic false grouping is confirmed by
+  # the two-run agreement gate on night two and the loser is unpublished. Separators and
+  # punctuation are still stripped, which is the actual drift #583 described.
   defp idempotency_drift_groups(tenant_id) do
     from(a in published_base(tenant_id),
       where: not is_nil(a.idempotency_key),
       where:
         fragment(
-          "btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g')) <> ''",
+          "btrim(regexp_replace(?, '[^[:alnum:]]+', ' ', 'g')) <> ''",
           a.idempotency_key
         ),
       group_by:
-        fragment("btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g'))", a.idempotency_key),
+        fragment("btrim(regexp_replace(?, '[^[:alnum:]]+', ' ', 'g'))", a.idempotency_key),
       having: count(a.id) > 1 and count(a.idempotency_key, :distinct) > 1,
       select: %{ids: fragment("array_agg(?::text ORDER BY ?)", a.id, a.inserted_at)}
     )
@@ -749,8 +855,17 @@ defmodule Loopctl.Knowledge.Consolidation do
     :crypto.hash(:sha256, payload) |> Base.encode16(case: :lower)
   end
 
+  # Every evidence entry carries the SAME key set, whichever branch produced it — the full
+  # one from `evidence_map/2`, this blank, or a redaction. A caller reading
+  # `entry["idempotency_key"]` should get `nil` for an unresolvable article, not a
+  # KeyError-shaped absence that varies by which article in one response it asked about.
   defp blank_evidence(article_id) do
-    %{"article_id" => article_id, "title" => nil, "excerpt" => ""}
+    %{
+      "article_id" => article_id,
+      "title" => nil,
+      "idempotency_key" => nil,
+      "excerpt" => ""
+    }
   end
 
   # Bodies come straight from AdminRepo (never `Knowledge.get_article/3`, which records
@@ -777,6 +892,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         body: fragment("left(?, ?)", a.body, ^@excerpt_source_chars)
       }
     )
+    |> shared_only()
     |> AdminRepo.all()
     |> Map.new(fn row ->
       {row.id,
@@ -817,7 +933,13 @@ defmodule Loopctl.Knowledge.Consolidation do
     if MapSet.member?(live, id) do
       entry
     else
-      %{"article_id" => id, "title" => nil, "excerpt" => "", "redacted" => true}
+      %{
+        "article_id" => id,
+        "title" => nil,
+        "idempotency_key" => nil,
+        "excerpt" => "",
+        "redacted" => true
+      }
     end
   end
 
