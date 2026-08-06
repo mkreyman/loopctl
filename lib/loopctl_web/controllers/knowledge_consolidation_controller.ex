@@ -33,19 +33,27 @@ defmodule LoopctlWeb.KnowledgeConsolidationController do
       "The tenant's most recent nightly consolidation (\"dream\") report and its NUMBERED " <>
         "proposals, each naming the articles involved and quoting an excerpt " <>
         "(#{Consolidation.excerpt_chars()} characters) from each as evidence. " <>
-        "REPORT ONLY (#584 stage 1): the pass writes no articles, links or conflict " <>
-        "resolutions, every proposal is `pending`, and nothing here applies one. " <>
-        "Read-only; returns persisted rows and never recomputes. Role: orchestrator+.\n\n" <>
+        "THIS ENDPOINT is read-only: it returns persisted rows, never recomputes, and " <>
+        "applies nothing. The PASS it reports on is not: since #608 the nightly run " <>
+        "UNPUBLISHES the losers of each `duplicate_capture` group that two consecutive " <>
+        "reports both propose. That is the only write it makes to `articles`, it is an " <>
+        "unpublish and never an archive (archive is terminal for an article), and it " <>
+        "still writes no links or conflict resolutions. Role: orchestrator+.\n\n" <>
         "CLASSES — `duplicate_capture` (titles that collide once case/punctuation are " <>
         "normalized away, or idempotency keys that collide under the same normalization " <>
         "while differing verbatim: capture tag-format drift, which the novelty gate does " <>
         "not catch because novelty scoring and idempotency are separate paths); " <>
-        "`contradiction_candidate` (RETIRED as of #605 and no longer produced — the nightly " <>
-        "lint now judges those pairs automatically; historical reports may still carry the " <>
-        "class); " <>
         "`generic_title` (a placeholder title that collides on active-title uniqueness " <>
-        "and blocks hub creation); `stale_entry` (past the lint staleness threshold and " <>
-        "never reconciled).\n\n" <>
+        "and blocks hub creation). Both RETIRED classes are still accepted by the `class` " <>
+        "filter so historical reports stay readable, and neither is produced any more: " <>
+        "`contradiction_candidate` (#605 — the nightly lint judges those pairs itself) and " <>
+        "`stale_entry` (#605 — age is not a defect signal; for stale articles use " <>
+        "`GET /api/v1/knowledge/lint`, which computes them with a caller-chosen " <>
+        "`stale_days`).\n\n" <>
+        "REVIEW STATE is vestigial for the same reason. `review_status` exists on every " <>
+        "proposal and nothing reads it to decide anything: there is no approve/reject " <>
+        "surface and there will not be one (#605 supersedes #594). Auto-apply is gated on " <>
+        "REVERSIBILITY and two-run agreement, not on an approval.\n\n" <>
         "DENOMINATORS — `report.corpus_size` counts PUBLISHED articles owned by this " <>
         "tenant at scan time, not its total article count. `report.proposal_count` is the " <>
         "TRUE pre-cap count of PROPOSALS, not of articles: one duplicate group of three " <>
@@ -55,9 +63,9 @@ defmodule LoopctlWeb.KnowledgeConsolidationController do
         "which `report.truncated` flags per class. `meta.total_count` is the number of " <>
         "persisted proposals matching the `class` filter, so it is bounded by " <>
         "`persisted_count`, never by `proposal_count`.\n\n" <>
-        "REVIEW STATE — `review_status` / `reviewed_by` / `reviewed_at` are reset to " <>
-        "`pending` / null whenever the nightly pass re-derives a proposal: refreshed " <>
-        "machine output must earn review again and never inherits an earlier approval.\n\n" <>
+        "REVIEW STATE RESET — `review_status` / `reviewed_by` / `reviewed_at` are reset " <>
+        "to `pending` / null whenever the nightly pass re-derives a proposal, so refreshed " <>
+        "machine output can never inherit an earlier verdict.\n\n" <>
         "EVIDENCE FRESHNESS — each evidence entry is a COPY taken when the proposal was " <>
         "derived, and it is re-checked against the live published corpus on every read. " <>
         "If the article has since been hard-deleted, archived or unpublished, the entry " <>

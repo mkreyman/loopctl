@@ -193,15 +193,40 @@ perfectly consistent prose and similarity cannot see it.
 across episodes. Our pass removes duplicates and closes conflicts; nothing reads N related
 articles and produces the abstraction they share. That is the actual dream, still unbuilt.
 
-**The scan is un-prioritised.** 79,250 articles scanned nightly to find ~750 things, two of
-the three scans `GROUP BY regexp_replace(...)` and therefore unindexable. Prioritised replay
-says scan the *delta* and what is surprising — which would turn a 79k scan into roughly 250
-rows and stop the cost growing with the corpus.
+**The scan is un-prioritised — and that turned out not to matter.** This section previously
+argued the opposite, and the correction is worth keeping because it is the cleanest example
+in the whole exercise of a fix that reasoned beautifully and measured to nothing.
 
-**A time threshold is not a correctness signal.** `:stale_entry` produces hundreds of
-proposals a night that nothing can ever act on: "nobody edited this in N days" says nothing
-about whether it is wrong, and auto-archiving on age would silently delete the corpus. It is
-a fourth queue with no consumer, just slower to notice.
+The argument was: 79,250 articles scanned nightly to find ~750 things, two of the three scans
+`GROUP BY regexp_replace(...)` and therefore unindexable, and only ~20 articles changed that
+day. Prioritised replay says scan the *delta*. Every step of that is true. Then it was timed
+on the hosted corpus: title drift 1,955 ms, idempotency drift 13 ms, placeholder titles 920
+ms — **~2.9 seconds, once a night**, on a pool provisioned for exactly this. There is no cost
+to recover.
+
+Worse, building it would have *cost* correctness. Auto-apply requires two consecutive runs to
+propose the same group; a delta scan drops any group whose articles did not change between
+runs, so the confirmation gate could never close unless the delta window exceeded the run
+interval. And a duplicate pair nobody has touched in a year — the bulk of what the class
+finds — would never be scanned again at all.
+
+The generalisable part: **"this scan is O(corpus) and the corpus is large" is an argument
+about shape, not about cost.** It feels like a finding because the asymptotics are real. It
+is only a finding once a stopwatch agrees. If the scan does become slow, the answer is an
+expression index on the normalisation, not a narrower scan — the plan is a sequential scan
+plus a 9 MB external-merge sort, both of which an index removes without touching semantics.
+
+**A time threshold is not a correctness signal — so the class was cut.** `:stale_entry`
+produced hundreds of proposals a night that nothing could ever act on: "nobody edited this in
+N days" says nothing about whether it is wrong, and auto-archiving on age would silently
+delete the corpus. It was a fourth queue with no consumer, just slower to notice.
+
+It is now retired. The deciding argument was not that it was useless but that it was
+*redundant*: the lint engine computes stale articles itself and publishes them on its own
+endpoint with a caller-chosen threshold, so consolidation was re-rendering one signal into a
+capped report whose other slots go to classes something can act on. Removing it cost no
+information at all — which is the easiest kind of queue to close, and worth looking for
+before arguing about the hard ones.
 
 ---
 
@@ -214,11 +239,14 @@ a fourth queue with no consumer, just slower to notice.
 3. **Make the act reversible and the approval becomes optional.** Reach for the reversible
    primitive even when the terminal one is more satisfying.
 4. **Two independent observations beat one confident one**, and cost only latency.
-5. **Measure before fixing.** In one session, measurement killed three fixes that were
+5. **Measure before fixing.** In one session, measurement killed four fixes that were
    confidently designed and would have been shipped: a lint result-set bound (the "unbounded"
-   scan was ~500 rows), a producer throttle (its output never reached the consumer), and a
-   claim that 32k article-slots were being actively withheld (the curated set was empty, so
-   the harm was latent rather than live).
+   scan was ~500 rows), a producer throttle (its output never reached the consumer), a claim
+   that 32k article-slots were being actively withheld (the curated set was empty, so the harm
+   was latent rather than live), and the delta scan above (2.9 s/night, and it would have
+   broken the confirmation gate). The pattern in all four: a defect argued from *shape* —
+   unbounded, uncapped, O(n), redundant — that a stopwatch or a `count(*)` then declined to
+   confirm. Shape tells you where to point the instrument, never what it will read.
 
 ---
 

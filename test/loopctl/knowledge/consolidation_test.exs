@@ -77,13 +77,24 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
     {articles, links, resolutions}
   end
 
-  describe "analyze/3 — duplicate_capture" do
+  # Ages an article past any staleness threshold. Written straight through AdminRepo because
+  # `updated_at` is what a changeset would refresh.
+  defp backdate(article, days: days) do
+    at = DateTime.add(DateTime.utc_now(), -days * 86_400, :second)
+
+    from(a in Article, where: a.id == ^article.id, update: [set: [updated_at: ^at]])
+    |> AdminRepo.update_all([])
+
+    article
+  end
+
+  describe "analyze/2 — duplicate_capture" do
     test "proposes a group whose titles collide once case and punctuation normalize away" do
       tenant = fixture(:tenant)
       a = published(tenant.id, %{title: "Retry Policy", body: "Retry with jitter, always."})
       b = published(tenant.id, %{title: "retry-policy!", body: "Retry with jitter, always."})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert [proposal] = proposals_of(analysis, :duplicate_capture)
       assert Enum.sort(proposal.article_ids) == Enum.sort([a.id, b.id])
@@ -115,7 +126,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
           idempotency_key: "SESSION_2026_08_04_HARVEST"
         })
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert [proposal] = proposals_of(analysis, :duplicate_capture)
       assert Enum.sort(proposal.article_ids) == Enum.sort([a.id, b.id])
@@ -127,7 +138,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant.id, %{title: "Retry Policy", idempotency_key: "a-1"})
       published(tenant.id, %{title: "Backoff Policy", idempotency_key: "b-2"})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert proposals_of(analysis, :duplicate_capture) == []
       assert analysis.summary.by_class["duplicate_capture"] == 0
@@ -135,15 +146,15 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
 
     # The normalization strips everything outside [a-z0-9], so titles in a non-Latin script
     # or made only of symbols ALL collapse to the empty string and would be emitted as one
-    # "same capture under title drift" group. Deterministic false positive in the class #584
-    # names as the likely first auto-apply candidate.
+    # "same capture under title drift" group — a deterministic false positive in the one class
+    # that applies itself, so the two-run agreement gate would confirm it and unpublish them.
     test "does not group titles that share only an EMPTY normalized form" do
       tenant = fixture(:tenant)
       published(tenant.id, %{title: "日本語ガイド", body: "Japanese guide."})
       published(tenant.id, %{title: "中文指南", body: "Chinese guide."})
       published(tenant.id, %{title: "!!!", body: "Symbols only."})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert proposals_of(analysis, :duplicate_capture) == []
       assert analysis.summary.by_class["duplicate_capture"] == 0
@@ -156,7 +167,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant.id, %{title: "Harvest A", idempotency_key: "***"})
       published(tenant.id, %{title: "Harvest B", idempotency_key: "///"})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert proposals_of(analysis, :duplicate_capture) == []
     end
@@ -171,7 +182,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant.id, %{title: "Паттерн Retry", body: "Retry pattern."})
       published(tenant.id, %{title: "Обзор Retry", body: "Retry overview."})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert proposals_of(analysis, :duplicate_capture) == []
       assert analysis.summary.by_class["duplicate_capture"] == 0
@@ -182,7 +193,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       a = published(tenant.id, %{title: "Паттерн Retry", body: "Retry pattern."})
       b = published(tenant.id, %{title: "  паттерн — retry!", body: "Retry pattern again."})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert [proposal] = proposals_of(analysis, :duplicate_capture)
       assert Enum.sort(proposal.article_ids) == Enum.sort([a.id, b.id])
@@ -193,7 +204,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant.id, %{title: "Harvest A", idempotency_key: "сессия:harvest"})
       published(tenant.id, %{title: "Harvest B", idempotency_key: "セッション_HARVEST"})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert proposals_of(analysis, :duplicate_capture) == []
     end
@@ -211,7 +222,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant.id, %{title: "Retry Policy", body: "Retry with jitter."})
       published(tenant.id, %{title: "retry-policy!", body: "Retry with jitter."})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{}, max_per_class: 2)
+      {:ok, analysis} = Consolidation.analyze(tenant.id, max_per_class: 2)
 
       assert analysis.summary.by_class["duplicate_capture"] == 4
       assert analysis.summary.truncated["duplicate_capture"] == true
@@ -227,7 +238,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
     end
   end
 
-  describe "analyze/3 — contradiction_candidate is RETIRED (#605)" do
+  describe "analyze/2 — contradiction_candidate is RETIRED (#605)" do
     test "a conflict-flagged pair with no verdict is NOT proposed — the lint judge owns it" do
       # This class used to be produced here. It is not any more: the nightly lint now
       # resolves these pairs automatically (`judge_redundant_conflicts/1`, capped above the
@@ -241,7 +252,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       b = published(tenant.id, %{title: "Avoid Ecto.Multi", body: "Multi is usually overkill."})
       system_conflict_link(tenant.id, a, b)
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert proposals_of(analysis, :contradiction_candidate) == [],
              "the lint judge owns this pile; a second proposer re-reports what it resolves"
@@ -258,7 +269,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
     end
   end
 
-  describe "analyze/3 — generic_title" do
+  describe "analyze/2 — generic_title" do
     test "proposes a placeholder title with the article opening as evidence" do
       tenant = fixture(:tenant)
 
@@ -270,7 +281,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
 
       published(tenant.id, %{title: "A Perfectly Good Title", body: "Fine."})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert [proposal] = proposals_of(analysis, :generic_title)
       assert proposal.article_ids == [article.id]
@@ -286,48 +297,84 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant.id, %{title: "設計ドキュメント Draft", body: "Design doc."})
       published(tenant.id, %{title: "Черновик Document 2", body: "Draft doc."})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert proposals_of(analysis, :generic_title) == []
       assert analysis.summary.by_class["generic_title"] == 0
     end
   end
 
-  describe "analyze/3 — stale_entry" do
-    test "proposes stale articles from the lint report it is handed" do
+  describe "analyze/2 — stale_entry is RETIRED (#605)" do
+    test "an article far past any staleness threshold is NOT proposed" do
+      # Age is not a correctness signal: "nobody edited this in N days" says nothing about
+      # whether the article is wrong, so the class could never earn an apply path — and
+      # auto-archiving on age would silently delete the corpus, irreversibly. It was a queue
+      # whose only consumer was a human nobody staffs.
+      #
+      # Removing it also cost nothing: `Knowledge.lint/2` computes stale articles itself and
+      # publishes them on its own endpoint with a caller-chosen `stale_days`, so this class
+      # was a second rendering of one signal occupying a per-class cap slot.
       tenant = fixture(:tenant)
-      article = published(tenant.id, %{title: "Ancient", body: "Written a long time ago."})
+      ancient = published(tenant.id, %{title: "Ancient", body: "Written a long time ago."})
+      backdate(ancient, days: 400)
 
-      lint_report = %{
-        stale_articles: [
-          %{
-            article_id: article.id,
-            title: article.title,
-            days_since_update: 400,
-            severity: "warning"
-          }
-        ],
-        summary: %{total_per_category: %{stale_articles: 1}}
-      }
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, lint_report)
+      assert proposals_of(analysis, :stale_entry) == [],
+             "age is not a defect signal; GET /knowledge/lint owns staleness"
 
-      assert [proposal] = proposals_of(analysis, :stale_entry)
-      assert proposal.article_ids == [article.id]
-      assert proposal.rationale =~ "400 days"
-      assert [evidence] = proposal.evidence
-      assert evidence["excerpt"] =~ "a long time ago"
+      refute Map.has_key?(analysis.summary.by_class, "stale_entry"),
+             "a retired class must not keep occupying a slot in by_class"
+
+      refute Map.has_key?(analysis.summary.truncated, "stale_entry")
+    end
+
+    test "the class VALUE survives in the schema enum, so historical rows still load" do
+      assert :stale_entry in ConsolidationProposal.classes()
+    end
+
+    test "the pass takes no lint report, so staleness cannot leak back in through one" do
+      # `analyze/2` used to accept the nightly lint report purely to source this class.
+      # Dropping the parameter is what makes the retirement structural rather than a
+      # promise: there is no longer an input that could carry stale articles in.
+      assert function_exported?(Consolidation, :analyze, 1)
+      assert function_exported?(Consolidation, :analyze, 2)
+      refute function_exported?(Consolidation, :analyze, 3)
     end
   end
 
-  describe "analyze/3 — numbering and bounding" do
+  describe "analyze/2 — the live class set" do
+    test "produces ONLY the two live classes, with both retired signals present" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, %{title: "Retry Policy", body: "Retry with jitter."})
+      b = published(tenant.id, %{title: "retry-policy", body: "Retry with jitter."})
+      published(tenant.id, %{title: "Untitled Document", body: "No title here."})
+      # Both retired classes have a live SIGNAL in this corpus — a system-flagged conflict
+      # pair and an ancient article — so a re-added producer would have something to emit
+      # and this assertion would fail rather than pass vacuously.
+      system_conflict_link(tenant.id, a, b)
+      backdate(a, days: 400)
+
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
+
+      assert Enum.sort(Map.keys(analysis.summary.by_class)) ==
+               ["duplicate_capture", "generic_title"]
+
+      # The live classes still fired, so the assertion above is not passing because the pass
+      # returned nothing at all.
+      assert length(proposals_of(analysis, :duplicate_capture)) == 1
+      assert length(proposals_of(analysis, :generic_title)) == 1
+    end
+  end
+
+  describe "analyze/2 — numbering and bounding" do
     test "numbers proposals contiguously from 1 across classes" do
       tenant = fixture(:tenant)
       published(tenant.id, %{title: "Retry Policy"})
       published(tenant.id, %{title: "retry policy"})
       published(tenant.id, %{title: "Untitled Document"})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       numbers = Enum.map(analysis.proposals, & &1.number)
       assert numbers == Enum.to_list(1..length(analysis.proposals))
@@ -340,7 +387,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant.id, %{title: "untitled document!"})
       published(tenant.id, %{title: "New Article"})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{}, max_per_class: 1)
+      {:ok, analysis} = Consolidation.analyze(tenant.id, max_per_class: 1)
 
       generic = proposals_of(analysis, :generic_title)
       assert length(generic) == 1
@@ -354,13 +401,13 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant.id, %{title: "Published One"})
       fixture(:article, %{tenant_id: tenant.id, title: "Still A Draft", category: :pattern})
 
-      {:ok, analysis} = Consolidation.analyze(tenant.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
 
       assert analysis.summary.corpus_size == 1
     end
   end
 
-  describe "run/3 — report only" do
+  describe "run/2 — report only" do
     test "writes NOTHING to articles, article_links or conflict_resolutions" do
       tenant = fixture(:tenant)
       a = published(tenant.id, %{title: "Retry Policy", body: "Retry with jitter."})
@@ -369,16 +416,9 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
 
       system_conflict_link(tenant.id, a, b)
 
-      lint_report = %{
-        stale_articles: [
-          %{article_id: a.id, title: a.title, days_since_update: 200, severity: "warning"}
-        ],
-        summary: %{total_per_category: %{stale_articles: 1}}
-      }
-
       before = corpus_snapshot(tenant.id)
 
-      assert {:ok, report} = Consolidation.run(tenant.id, lint_report)
+      assert {:ok, report} = Consolidation.run(tenant.id)
 
       assert corpus_snapshot(tenant.id) == before
       assert report.persisted_count > 0
@@ -388,7 +428,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       tenant = fixture(:tenant)
       published(tenant.id, %{title: "Untitled Document", body: "Needs a real title."})
 
-      assert {:ok, report} = Consolidation.run(tenant.id, %{})
+      assert {:ok, report} = Consolidation.run(tenant.id)
 
       assert report.day == Date.utc_today()
       assert report.corpus_size == 1
@@ -411,8 +451,8 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       tenant = fixture(:tenant)
       published(tenant.id, %{title: "Untitled Document"})
 
-      {:ok, first} = Consolidation.run(tenant.id, %{})
-      {:ok, second} = Consolidation.run(tenant.id, %{})
+      {:ok, first} = Consolidation.run(tenant.id)
+      {:ok, second} = Consolidation.run(tenant.id)
 
       assert first.id == second.id
 
@@ -433,7 +473,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       tenant = fixture(:tenant)
       published(tenant.id, %{title: "Untitled Document"})
 
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       [proposal] =
         AdminRepo.all(from(p in ConsolidationProposal, where: p.tenant_id == ^tenant.id))
@@ -446,7 +486,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       })
       |> AdminRepo.update!()
 
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       [refreshed] =
         AdminRepo.all(from(p in ConsolidationProposal, where: p.tenant_id == ^tenant.id))
@@ -461,14 +501,14 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       tenant = fixture(:tenant)
       article = published(tenant.id, %{title: "Untitled Document"})
 
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       assert [_] =
                AdminRepo.all(from(p in ConsolidationProposal, where: p.tenant_id == ^tenant.id))
 
       article |> Ecto.Changeset.change(%{title: "A Real Title Now"}) |> AdminRepo.update!()
 
-      {:ok, report} = Consolidation.run(tenant.id, %{})
+      {:ok, report} = Consolidation.run(tenant.id)
 
       assert report.persisted_count == 0
 
@@ -487,7 +527,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant_b.id, %{title: "Retry Policy"})
       published(tenant_b.id, %{title: "retry policy"})
 
-      {:ok, analysis} = Consolidation.analyze(tenant_a.id, %{})
+      {:ok, analysis} = Consolidation.analyze(tenant_a.id)
 
       assert analysis.summary.corpus_size == 1
       assert [proposal] = analysis.proposals
@@ -495,7 +535,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert [evidence] = proposal.evidence
       assert evidence["excerpt"] == "A's placeholder."
 
-      {:ok, report_a} = Consolidation.run(tenant_a.id, %{})
+      {:ok, report_a} = Consolidation.run(tenant_a.id)
 
       proposals_a =
         AdminRepo.all(from(p in ConsolidationProposal, where: p.report_id == ^report_a.id))
@@ -523,7 +563,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant.id, %{title: "Retry Policy"})
       published(tenant.id, %{title: "retry policy"})
 
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       {:ok, all} = Consolidation.latest(tenant.id)
       assert all.total_count == 2
@@ -539,8 +579,8 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant.id, %{title: "Untitled Document"})
 
       yesterday = Date.add(Date.utc_today(), -1)
-      {:ok, _} = Consolidation.run(tenant.id, %{}, day: yesterday)
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id, day: yesterday)
+      {:ok, _} = Consolidation.run(tenant.id)
 
       {:ok, older} = Consolidation.latest(tenant.id, day: yesterday)
       assert older.report.day == yesterday
@@ -556,7 +596,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       tenant = fixture(:tenant)
       published(tenant.id, %{title: "Untitled Document"})
 
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       assert {:ok, result} = Consolidation.latest(tenant.id, offset: 99_999_999_999_999_999_999)
       assert result.proposals == []
@@ -571,7 +611,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       article =
         published(tenant.id, %{title: "Untitled Document", body: "SECRET harvested material."})
 
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       {:ok, before} = Consolidation.latest(tenant.id)
       assert [%{evidence: [entry]}] = before.proposals
@@ -594,7 +634,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       article =
         published(tenant.id, %{title: "Untitled Document", body: "SECRET harvested material."})
 
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       article |> Ecto.Changeset.change(%{status: :archived}) |> AdminRepo.update!()
 
@@ -613,7 +653,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
         published(tenant.id, %{title: "Untitled Document", body: "SECRET harvested material."})
 
       yesterday = Date.add(Date.utc_today(), -1)
-      {:ok, _} = Consolidation.run(tenant.id, %{}, day: yesterday)
+      {:ok, _} = Consolidation.run(tenant.id, day: yesterday)
 
       AdminRepo.delete!(article)
 
@@ -627,7 +667,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       tenant = fixture(:tenant)
       published(tenant.id, %{title: "Untitled Document", body: "Still published."})
 
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       {:ok, result} = Consolidation.latest(tenant.id)
       assert [%{evidence: [entry]}] = result.proposals
@@ -658,7 +698,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       tenant = fixture(:tenant)
       {a, b} = duplicate_pair(tenant.id)
 
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       assert %{applied: 0, skipped: 0} = Consolidation.apply_confirmed_duplicates(tenant.id)
       assert status(a.id) == :published
@@ -673,13 +713,13 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       published(tenant.id, %{title: "Something Else Entirely", body: "unrelated"})
 
       # Night one: no duplicates exist yet.
-      {:ok, _} = Consolidation.run(tenant.id, %{}, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
 
       # The duplicate is created AFTER that run.
       {a, b} = duplicate_pair(tenant.id)
 
       # Night two: the proposal appears for the first time.
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       assert %{applied: 0, skipped: 0} = Consolidation.apply_confirmed_duplicates(tenant.id)
       assert status(a.id) == :published
@@ -690,8 +730,8 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       tenant = fixture(:tenant)
       {a, b} = duplicate_pair(tenant.id)
 
-      {:ok, _} = Consolidation.run(tenant.id, %{}, day: Date.add(Date.utc_today(), -1))
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
 
       assert %{applied: 1, skipped: 0} = Consolidation.apply_confirmed_duplicates(tenant.id)
 
@@ -708,8 +748,8 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       tenant = fixture(:tenant)
       {a, b} = duplicate_pair(tenant.id)
 
-      {:ok, _} = Consolidation.run(tenant.id, %{}, day: Date.add(Date.utc_today(), -1))
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
 
       # Someone (or something) already unpublished one of them.
       {:ok, _} = Knowledge.unpublish_article(tenant.id, b.id)
@@ -722,8 +762,8 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       tenant = fixture(:tenant)
       {_a, b} = duplicate_pair(tenant.id)
 
-      {:ok, _} = Consolidation.run(tenant.id, %{}, day: Date.add(Date.utc_today(), -1))
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
       assert %{applied: 1} = Consolidation.apply_confirmed_duplicates(tenant.id)
 
       assert status(b.id) == :draft

@@ -5,8 +5,14 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   This is the "nightly refinement" loop that both the Karpathy `llm-wiki`
   pattern (lint-and-act) and the Dan Martell second-brain workflow converge on:
   the lint *engine* already exists (`Loopctl.Knowledge.lint/2`); this worker is
-  the orchestration that RUNS it on a schedule and takes a safe, automated
-  repair action on the one finding that can be auto-repaired — orphans.
+  the orchestration that RUNS it on a schedule and takes the automated repair
+  actions that are safe to take unattended.
+
+  What makes a repair safe here is REVERSIBILITY, not confidence (#605). Every
+  automated write below can be undone in code — a re-linked orphan, a conflict
+  verdict re-annotated, an unpublished duplicate re-published. Nothing on this
+  path archives, deletes, or otherwise takes a one-way door, and no step waits
+  on a human verdict that will never arrive.
 
   ## Scheduling
 
@@ -29,20 +35,39 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      cheap, and makes **no** embedding-API calls (orphans missing an embedding
      simply no-op in the linking worker — backfilling those is a separate
      concern, out of scope here).
-  3. **Consolidates the corpus, report-only** (#584 stage 1) — reuses the lint
-     report just computed and runs `Loopctl.Knowledge.Consolidation.run/3`, which
-     emits numbered, evidence-carrying proposals for the four observed defect
-     classes and persists them as the tenant's report for the day. It writes
-     NOTHING to `articles` / `article_links` / `conflict_resolutions`. This runs
-     inside the existing nightly pass on purpose: a second scheduler over the same
-     corpus is the specific failure #584 names. It is also FAIL-SOFT: a raise or a
-     pool exit inside it is recorded in the audit event and never aborts the run
-     (see `consolidate/2`).
-  4. **Surfaces all findings** via an immutable audit event
-     (`knowledge.lint_completed`) carrying the full lint summary, so
-     contradictions / coverage gaps / broken sources / stale counts are
-     observable in the change feed even though they are not auto-repaired
-     (those require human judgment).
+  3. **Promotes, judges and executes conflicts**, in that order and in one pass
+     (#601, #606). `promote_conflicts/1` flags high-similarity pairs;
+     `judge_redundant_conflicts/1` then records a verdict on them —
+     `classification: :redundant, disposition: :dismiss`, because cosine
+     similarity measures REDUNDANCY and cannot see contradiction, so recording
+     what was actually measured is the only honest verdict available;
+     `Knowledge.execute_conflict_resolutions/2` carries out the recorded
+     dispositions. The judge is deliberately capped ABOVE the promoter, so the
+     pile shrinks by arithmetic rather than by hoping the inflow stops. The judge
+     runs after the promoter within the same night so a pair flagged tonight
+     never spends a night suppressing both its articles from curated answers.
+  4. **Consolidates the corpus** (#584, #605) — runs
+     `Loopctl.Knowledge.Consolidation.run/2`, which emits numbered,
+     evidence-carrying proposals for the two live defect classes and persists them
+     as the tenant's report for the day. It scans the corpus itself and takes no
+     input from the lint report above. It writes nothing to `article_links` or
+     `conflict_resolutions`; the ONLY article write it can make is the reversible
+     confirmed-duplicate unpublish in step 5. This runs inside the existing
+     nightly pass on purpose: a second scheduler over the same corpus is the
+     specific failure #584 names. It is also FAIL-SOFT: a raise or a pool exit
+     inside it is recorded in the audit event and never aborts the run
+     (see `consolidate/1`).
+  5. **Applies the confirmed duplicates** — `apply_confirmed_duplicates/2`
+     unpublishes the losers of each `:duplicate_capture` group that TONIGHT's
+     report and the PREVIOUS one both propose. It runs after step 4 on purpose,
+     so the two-run comparison is tonight-against-last-night. Unpublish, never
+     archive: `:archived` is terminal for an article and nothing unattended may
+     take a one-way door.
+  6. **Surfaces all findings** via an immutable audit event
+     (`knowledge.lint_completed`) carrying the full lint summary, so coverage
+     gaps / broken sources / stale counts are observable in the change feed even
+     though nothing repairs them — each would need a correctness signal this
+     pass does not have.
 
   ## Scale safety
 
@@ -136,7 +161,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # cap, so the same pass also eats into the backlog.
     judged = judge_redundant_conflicts(tenant_id)
     resolutions_applied = Knowledge.execute_conflict_resolutions(tenant_id)
-    consolidation = consolidate(tenant_id, report)
+    consolidation = consolidate(tenant_id)
     # Apply AFTER consolidate/2 wrote tonight's report, so the two-run confirmation compares
     # tonight against last night rather than last night against the night before.
     applied = apply_consolidation(tenant_id)
@@ -508,7 +533,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       %{applied: 0, skipped: 0}
   end
 
-  defp consolidate(tenant_id, report) do
+  defp consolidate(tenant_id) do
     max_per_class =
       Application.get_env(
         :loopctl,
@@ -516,7 +541,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         Consolidation.default_max_per_class()
       )
 
-    {:ok, consolidation} = Consolidation.run(tenant_id, report, max_per_class: max_per_class)
+    {:ok, consolidation} = Consolidation.run(tenant_id, max_per_class: max_per_class)
     {:ok, consolidation}
   rescue
     error -> consolidation_failed(tenant_id, ExitTag.tag(error))

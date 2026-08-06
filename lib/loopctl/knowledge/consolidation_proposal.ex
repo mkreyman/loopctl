@@ -17,15 +17,13 @@ defmodule Loopctl.Knowledge.ConsolidationProposal do
     paths). It is deliberately NOT a `(source_type, source_id)` match: `source_id` is not
     per-article unique (#137 — that is why `idempotency_key` exists as its own column), so
     a shared source is not evidence of a duplicate capture.
-  - `:contradiction_candidate` — a SYSTEM-flagged (`auto_generated`) `potential_conflict`
-    link between two PUBLISHED articles with NO `conflict_resolutions` verdict yet. This
-    class deliberately reports INTO the existing conflict machinery rather than replacing
-    it; the proposal is a pointer to a pair an agent still has to judge. The predicates
-    mirror that surface's own (`Knowledge.validate_potential_conflict_exists/3`) so a
-    proposal never names a pair the surface would refuse with `422 no_potential_conflict`.
   - `:generic_title` — a placeholder title ("Untitled Document", "New Article", …).
     These collide on the per-tenant active-title uniqueness and block hub creation.
-  - `:stale_entry` — an article past the lint staleness threshold, never reconciled.
+  - `:contradiction_candidate` — RETIRED (#605), historical rows only. Was a SYSTEM-flagged
+    (`auto_generated`) `potential_conflict` link between two PUBLISHED articles with no
+    `conflict_resolutions` verdict yet.
+  - `:stale_entry` — RETIRED (#605), historical rows only. Was an article past the lint
+    staleness threshold, never reconciled.
 
   ## Review state resets on every machine re-run
 
@@ -43,12 +41,18 @@ defmodule Loopctl.Knowledge.ConsolidationProposal do
 
   @type t :: %__MODULE__{}
 
-  # `:contradiction_candidate` is RETIRED as of #605 — no longer produced by
-  # `Consolidation.analyze/3`, because `KnowledgeLintWorker.judge_redundant_conflicts/1`
-  # now owns that pile and resolves it automatically. The value STAYS in this enum: reports
-  # persisted before the change carry proposals with that class, and dropping the value
-  # would make `Ecto.Enum` fail to LOAD those historical rows. A retired class and a deleted
-  # one are different things, and only one of them is safe on a table with history.
+  # TWO of these four are RETIRED as of #605 — no longer produced by `Consolidation.analyze/2`:
+  #
+  # - `:contradiction_candidate`, because `KnowledgeLintWorker.judge_redundant_conflicts/1`
+  #   now owns that pile and resolves it automatically (one writer per pile).
+  # - `:stale_entry`, because age is not a defect signal, so the class could never earn an
+  #   apply path — and `Knowledge.lint/2` already publishes stale articles on its own
+  #   endpoint with a caller-chosen threshold.
+  #
+  # Both values STAY in this enum: reports persisted before each change carry proposals with
+  # that class, and dropping a value would make `Ecto.Enum` fail to LOAD those historical
+  # rows. A retired class and a deleted one are different things, and only one of them is
+  # safe on a table with history.
   @classes [:duplicate_capture, :contradiction_candidate, :generic_title, :stale_entry]
   @review_statuses [:pending, :approved, :rejected]
 

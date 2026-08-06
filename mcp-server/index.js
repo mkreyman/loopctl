@@ -5481,16 +5481,21 @@ const TOOLS = [
     description:
       "Read the nightly consolidation (\"dream\") report: NUMBERED proposals for reconciling " +
       "the corpus, each naming the articles involved and quoting an excerpt from each as " +
-      "evidence. REPORT ONLY — the pass writes no articles, links or conflict resolutions, " +
-      "every proposal is `pending`, and this tool applies nothing. Requires orchestrator role.\n\n" +
+      "evidence. THIS TOOL applies nothing and recomputes nothing — it returns persisted rows. " +
+      "The PASS it reports on does write: since #608 the nightly run UNPUBLISHES the losers of " +
+      "each `duplicate_capture` group that two consecutive reports both propose. That is its " +
+      "only write to articles, it is an unpublish and never an archive (archive is terminal for " +
+      "an article), and it still writes no links or conflict resolutions. Requires orchestrator " +
+      "role.\n\n" +
       "Classes: `duplicate_capture` (titles that collide once case/punctuation normalize away, " +
       "or idempotency keys that collide under the same normalization while differing verbatim — " +
       "capture tag-format drift, which the novelty gate does not catch because novelty scoring " +
-      "and idempotency are separate paths); `contradiction_candidate` (a SYSTEM-flagged " +
-      "potential_conflict pair of PUBLISHED articles with no recorded verdict — record one via " +
-      "knowledge_resolve_conflict, which accepts exactly these pairs; this report writes " +
-      "none); `generic_title` (a placeholder title that collides on active-title uniqueness and " +
-      "blocks hub creation); `stale_entry` (past the lint staleness threshold, never reconciled).\n\n" +
+      "and idempotency are separate paths); `generic_title` (a placeholder title that collides " +
+      "on active-title uniqueness and blocks hub creation). Two classes are RETIRED (#605) and " +
+      "no longer produced, though the `class` filter still accepts them so historical reports " +
+      "stay readable: `contradiction_candidate` (the nightly lint judges those pairs itself now) " +
+      "and `stale_entry` (age is not a defect signal — for stale articles call knowledge_lint, " +
+      "which computes them with a caller-chosen `stale_days`).\n\n" +
       "Denominators: `corpus_size` counts PUBLISHED articles owned by the tenant at scan time, " +
       "not its total article count. `proposal_count` is the TRUE pre-cap count of PROPOSALS, not " +
       "of articles — one duplicate group of three articles is ONE proposal, and one article can " +
@@ -5498,8 +5503,11 @@ const TOOLS = [
       "report carries, lower than `proposal_count` exactly when a class hit `max_per_class` " +
       "(`truncated` flags which). `meta.total_count` counts persisted proposals matching the " +
       "`class` filter, so it is bounded by `persisted_count`, never by `proposal_count`.\n\n" +
-      "Review state (`review_status`/`reviewed_by`/`reviewed_at`) RESETS to pending/null whenever " +
-      "the nightly pass re-derives a proposal: refreshed machine output never inherits an approval.",
+      "Review state (`review_status`/`reviewed_by`/`reviewed_at`) is VESTIGIAL: nothing reads it " +
+      "to decide anything, there is no approve/reject surface and there will not be one (#605 " +
+      "supersedes #594) — auto-apply is gated on reversibility and two-run agreement, not on an " +
+      "approval. It still RESETS to pending/null whenever the nightly pass re-derives a proposal, " +
+      "so refreshed machine output can never inherit an earlier verdict.",
     inputSchema: {
       type: "object",
       properties: {

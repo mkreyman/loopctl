@@ -25,7 +25,7 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
       published(tenant.id, %{title: "Untitled Document", body: "Needs a real title."})
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       body =
         conn
@@ -70,7 +70,7 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       published(tenant.id, %{title: "Untitled Document"})
       published(tenant.id, %{title: "Retry Policy"})
       published(tenant.id, %{title: "retry policy"})
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       body =
         conn
@@ -118,7 +118,7 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
 
       published(tenant_b.id, %{title: "Untitled Document", body: "B only."})
-      {:ok, _} = Consolidation.run(tenant_b.id, %{})
+      {:ok, _} = Consolidation.run(tenant_b.id)
 
       body =
         conn
@@ -136,7 +136,7 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
       published(tenant.id, %{title: "Untitled Document", body: "Needs a real title."})
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       body =
         conn
@@ -153,7 +153,7 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
       article = published(tenant.id, %{title: "Untitled Document", body: "SECRET material."})
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       AdminRepo.delete!(article)
 

@@ -2,8 +2,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   @moduledoc """
   The nightly consolidation ("dream") pass over a tenant's PUBLISHED corpus (#584, #605).
 
-  It REPORTS on three defect classes, and APPLIES exactly one of them — `:duplicate_capture`,
-  and only as `unpublish`, and only where two consecutive runs agree. Everything else is
+  It REPORTS on two defect classes, and APPLIES exactly one of them — `:duplicate_capture`,
+  and only as `unpublish`, and only where two consecutive runs agree. `:generic_title` is
   report-only. See `apply_confirmed_duplicates/2` for why those three restrictions are the
   whole safety model.
 
@@ -14,7 +14,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   `article_links` or `conflict_resolutions` (the nightly lint judge owns conflicts).
   There is no human approve/reject stage and there will not be one (#605 supersedes
   #594): a queue whose only consumer is a human nobody staffs is the failure this
-  codebase has hit three separate times. Auto-apply is gated on REVERSIBILITY instead —
+  codebase has now hit four separate times (drafts, `potential_conflict`, `:supersede`
+  below `:high`, and `:stale_entry`). Auto-apply is gated on REVERSIBILITY instead —
   a class may apply itself when its write can be undone in code, which is checkable
   without accumulating anyone's approvals.
 
@@ -30,17 +31,18 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   Inside the existing nightly `Loopctl.Workers.KnowledgeLintWorker` run (04:00 UTC,
   `all_tenants` fan-out) — deliberately NOT a second scheduler over the same corpus.
-  It reuses that run's `Knowledge.lint/2` report for the stale class rather than
-  re-scanning, and it never runs in a request path: the API endpoint reads the
-  persisted rows.
+  It never runs in a request path: the API endpoint reads the persisted rows.
 
-  ## The three defect classes
+  ## The two defect classes
 
   | Class | Signal |
   |---|---|
   | `:duplicate_capture` | two published articles whose titles collide once case/punctuation are normalized away, or whose `idempotency_key`s collide under the same normalization while differing verbatim (tag-format drift — novelty scoring and idempotency are separate paths, so the novelty gate does not catch it) |
   | `:generic_title` | a placeholder title, which collides on per-tenant active-title uniqueness and blocks hub creation |
-  | `:stale_entry` | past the lint staleness threshold and never reconciled |
+
+  `:contradiction_candidate` and `:stale_entry` are RETIRED — see the comments beside
+  `title_drift_groups/1` and the proposal-assembly section for why each was withdrawn.
+  Both values stay in the schema enum so historical rows load.
 
   ## Counts and their denominators (#582 discipline)
 
@@ -52,9 +54,9 @@ defmodule Loopctl.Knowledge.Consolidation do
   which the worker logs. `summary.corpus_size` counts PUBLISHED articles owned by
   this tenant — not its total article count.
 
-  One caveat this pass cannot remove: `:stale_entry` is derived from the lint report
-  handed in, so its TRUE total is lint's own pre-cap total, while the proposals it can
-  emit are drawn only from lint's already-capped array.
+  Both remaining classes now derive their own totals from their own scan, so every count
+  here has this pass as its denominator. (`:stale_entry` did not — it re-published lint's
+  already-capped array under lint's threshold — which is one more reason it is gone.)
 
   ## Reads never touch the heat index
 
@@ -71,9 +73,28 @@ defmodule Loopctl.Knowledge.Consolidation do
   `regexp_replace` expression) and `AdminRepo`'s pool is 3 connections shared with every
   other admin op, so an all-tenants nightly fan-out on the shared `:knowledge` queue can
   starve it. `HeavyRead` also gives each scan a `SET LOCAL statement_timeout` and the
-  per-tenant in-flight shed. `analyze/3` holds ONE gate slot across the whole set
+  per-tenant in-flight shed. `analyze/2` holds ONE gate slot across the whole set
   (`with_slot/3`). The evidence fetch stays on `AdminRepo` — it is keyed by a bounded id
   list, not an enumeration — and so do the report/proposal WRITES.
+
+  ## Why the scan is whole-corpus and stays that way
+
+  It looks like the textbook case for a delta scan — 79,276 published articles read every
+  night to surface a few hundred proposals, of which only ~20 were touched that day. It is
+  not, and the reason is measurement rather than taste. TIMED on the hosted corpus
+  2026-08-05: title drift 1,955 ms, idempotency drift 13 ms, placeholder titles 920 ms,
+  corpus count 51 ms — **~2.9 s, once a night**, on a pool that exists for exactly this.
+  There is no cost problem to solve.
+
+  A delta scan would also cost correctness twice over. `apply_confirmed_duplicates/2`
+  applies only what TWO CONSECUTIVE runs propose, so a group whose articles did not change
+  between runs would drop out of the second report and could never be confirmed — the delta
+  window would have to exceed the run interval just to keep the gate working. And a group
+  nobody has touched in a year would never be scanned again at all, stranding the standing
+  backlog that is most of what the class finds.
+
+  If this ever does get slow, the cheap fix is an expression index on the normalization
+  (the plan is a seq scan plus a 9 MB external-merge sort), NOT a narrower scan.
   """
 
   import Ecto.Query
@@ -132,14 +153,11 @@ defmodule Loopctl.Knowledge.Consolidation do
   @doc """
   Derives the proposals for a tenant. Pure read — touches nothing.
 
-  `lint_report` is a `Loopctl.Knowledge.lint/2` result, reused for the `:stale_entry`
-  class so the nightly run scans the corpus once.
-
   Opts: `:max_per_class` (default #{@default_max_per_class}, hard max
   #{@hard_max_per_class}).
   """
-  @spec analyze(Ecto.UUID.t(), map(), keyword()) :: {:ok, map()}
-  def analyze(tenant_id, lint_report, opts \\ []) do
+  @spec analyze(Ecto.UUID.t(), keyword()) :: {:ok, map()}
+  def analyze(tenant_id, opts \\ []) do
     cap =
       opts
       |> Keyword.get(:max_per_class, @default_max_per_class)
@@ -153,8 +171,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         {corpus_size(tenant_id),
          %{
            duplicate_capture: duplicate_captures(tenant_id, cap),
-           generic_title: generic_titles(tenant_id, cap),
-           stale_entry: stale_entries(tenant_id, lint_report, cap)
+           generic_title: generic_titles(tenant_id, cap)
          }}
       end)
 
@@ -164,11 +181,11 @@ defmodule Loopctl.Knowledge.Consolidation do
       Map.new(found, fn {class, {total, items}} -> {to_string(class), total > length(items)} end)
 
     # Drive the ORDER from the schema enum, but only over classes this pass still PRODUCES.
-    # The enum deliberately retains `:contradiction_candidate` so historical rows still load
-    # (see `ConsolidationProposal`), and a `Map.fetch!` over the full enum would raise on
-    # every run now that the class is retired. `Map.fetch!` is kept for the classes that ARE
-    # present, so a genuinely missing producer still fails loudly rather than silently
-    # emitting a short report.
+    # The enum deliberately retains `:contradiction_candidate` and `:stale_entry` so
+    # historical rows still load (see `ConsolidationProposal`), and a `Map.fetch!` over the
+    # full enum would raise on every run now that both are retired. `Map.fetch!` is kept for
+    # the classes that ARE present, so a genuinely missing producer still fails loudly rather
+    # than silently emitting a short report.
     proposals =
       ConsolidationProposal.classes()
       |> Enum.filter(&Map.has_key?(found, &1))
@@ -203,9 +220,9 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   Opts: `:max_per_class`, `:day` (defaults to today, UTC).
   """
-  @spec run(Ecto.UUID.t(), map(), keyword()) :: {:ok, ConsolidationReport.t()}
-  def run(tenant_id, lint_report, opts \\ []) do
-    {:ok, analysis} = analyze(tenant_id, lint_report, opts)
+  @spec run(Ecto.UUID.t(), keyword()) :: {:ok, ConsolidationReport.t()}
+  def run(tenant_id, opts \\ []) do
+    {:ok, analysis} = analyze(tenant_id, opts)
     day = Keyword.get(opts, :day) || Date.utc_today()
     log_truncation(tenant_id, analysis.summary)
 
@@ -481,9 +498,17 @@ defmodule Loopctl.Knowledge.Consolidation do
   # whatever incidental ASCII it carries — "日本語ガイド v2" and "中文指南 v2" both become
   # "v2", and "Паттерн Retry" and "Обзор Retry" both become "retry". Unrelated articles
   # then group as "the same capture under title drift", a deterministic false positive in
-  # the class #584 names as the likely first auto-apply candidate, which would poison
-  # exactly the calibration signal stage 2 exists to collect. ASCII behaviour is
-  # identical under both classes ("Retry  Pattern!!" -> "retry pattern").
+  # the ONE class that applies itself (`apply_confirmed_duplicates/2`) — so under the ASCII
+  # class this normalization is what would decide to unpublish two unrelated non-Latin
+  # articles, twice running, and the two-run agreement gate would agree with itself because
+  # the bug is deterministic. ASCII behaviour is identical under both classes
+  # ("Retry  Pattern!!" -> "retry pattern").
+  #
+  # (This comment used to call `:duplicate_capture` "the class #584 names as the likely first
+  # auto-apply candidate", and read the risk as poisoning a human calibration signal. #605
+  # retired that framing: archive is TERMINAL for an article, so the class earned auto-apply
+  # by being restricted to the REVERSIBLE unpublish, not by being ranked first. The
+  # consequence of a false positive got smaller and more immediate, not larger and deferred.)
   #
   # The EMPTY normalized key is still excluded, and that exclusion is still load-bearing:
   # a title made only of symbols or emoji ("🚀", "!!!") normalizes to the empty string
@@ -534,8 +559,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   # proposals emitted, 15,588 were `:contradiction_candidate` — 95% of the report was a
   # re-derivation of the set the judge drains, truncated at the per-class cap and
   # re-derived identically the next night. The remaining classes (390 duplicate_capture,
-  # 361 stale_entry, 1 generic_title) are consolidation's actual work and were being
-  # crowded out of the report by it.
+  # 361 stale_entry — itself since retired — and 1 generic_title) are consolidation's actual
+  # work and were being crowded out of the report by it.
   #
   # If a future change wants consolidation to own conflicts again, MOVE the judge here
   # rather than adding a second proposer: the invariant is one writer per pile, not one
@@ -577,31 +602,28 @@ defmodule Loopctl.Knowledge.Consolidation do
     {length(ids), items}
   end
 
-  # Reuses the lint report already computed by the nightly run. TRUE total is lint's
-  # own pre-cap total; the emittable set is lint's already-capped array.
-  defp stale_entries(tenant_id, lint_report, cap) do
-    stale = Map.get(lint_report, :stale_articles, [])
-
-    true_total =
-      lint_report
-      |> Map.get(:summary, %{})
-      |> Map.get(:total_per_category, %{})
-      |> Map.get(:stale_articles, length(stale))
-
-    selected = Enum.take(stale, cap)
-    evidence_by_id = evidence_map(tenant_id, Enum.map(selected, & &1.article_id))
-
-    items =
-      Enum.map(selected, fn entry ->
-        build_proposal(:stale_entry, [entry.article_id], evidence_by_id,
-          severity: "info",
-          rationale: "Not updated in #{entry.days_since_update} days and never reconciled since.",
-          suggested_action: "Re-verify against current practice, then update or archive."
-        )
-      end)
-
-    {true_total, items}
-  end
+  # `:stale_entry` WAS a class here. It is not any more, and the reason is that age is
+  # not a defect signal.
+  #
+  # #605 settled that the class can never earn an apply path: "stale" is a time threshold,
+  # and auto-archiving on age would silently delete the corpus, irreversibly. A class with
+  # no reachable consumer is the queue-with-no-consumer shape this codebase has now been
+  # bitten by four times — and #605's own rule for it is "do not create the queue", never
+  # "auto-approve unvetted writes".
+  #
+  # Nothing is lost by removing it. `Knowledge.lint/2` computes stale articles itself and
+  # publishes them on `GET /api/v1/knowledge/lint` (the `knowledge_lint` tool) with a
+  # caller-chosen `stale_days`, which is strictly MORE than this class offered: consolidation
+  # re-published lint's already-capped array under a fixed 90-day threshold. It was a second
+  # rendering of one signal, occupying a per-class cap slot in the report that carries the
+  # classes something can act on.
+  #
+  # MEASURED on the hosted corpus 2026-08-05: 361 stale entries, re-derived identically every
+  # night, against zero recorded actions taken on any of them for the corpus's whole lifetime.
+  #
+  # This is why `analyze/2` takes no lint report any more. If a future change wants staleness
+  # back in this pass, it needs a CORRECTNESS signal (contradicted by a newer article, source
+  # URL gone, superseded) — not a longer threshold.
 
   # --- Proposal assembly ---
 
