@@ -378,10 +378,11 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   Agreement filters transience, not wrongness: a title two unrelated sources share collides
   deterministically, so both runs agree. A TITLE-signal group is applied only when its live
-  members also corroborate in CONTENT — every member scored at the active embedding
-  dimension, worst pair at or above `#{@default_min_duplicate_similarity}` (tunable). One
-  that cannot is REPORTED, counted in `uncorroborated`, and has its missing vectors
-  enqueued so the withhold clears itself. The idempotency signal is exempt (`corroborated?/3`).
+  members also corroborate in CONTENT — every member scored wherever this tenant's vectors
+  live (`score_source/1`), worst pair at or above `#{@default_min_duplicate_similarity}`
+  (tunable). One that cannot is REPORTED, counted in `uncorroborated`, and has its missing
+  vectors enqueued so the withhold clears itself; a group withheld because the scoring READ
+  failed enqueues nothing. The idempotency signal is exempt (`corroborated?/3`).
   """
   @spec apply_confirmed_duplicates(Ecto.UUID.t(), keyword()) :: %{
           applied: non_neg_integer(),
@@ -449,9 +450,15 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   # The ONLY heavy read on the apply path, and it runs BEFORE the reduce — so a statement
   # timeout or a `HeavyRead` shed would escape past `tally_apply/5`'s per-group rescue and
-  # cost the whole night's drain, deterministically, every night. A failure degrades to NO
-  # evidence instead: title-drift groups are withheld one by one (fail-closed, counted in
-  # `uncorroborated`) and idempotency-drift groups still apply.
+  # cost the whole night's drain, deterministically, every night. A failure degrades to
+  # `:unavailable` instead: title-drift groups are withheld one by one (fail-closed, counted
+  # in `uncorroborated`) and idempotency-drift groups still apply.
+  #
+  # `:unavailable` is NOT an empty score map, and the distinction is the whole point: an
+  # empty map says "these members have no vectors", which routes the group into
+  # `backfill_missing_embeddings/2` — so a shed on this read would answer a DB outage by
+  # enqueueing an embedding job per member of every confirmed group, against the same
+  # degraded database, and log it as missing vectors.
   defp score_groups(tenant_id, proposals) do
     pairwise_similarity_by_group(tenant_id, Enum.flat_map(proposals, & &1.article_ids))
   rescue
@@ -466,7 +473,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         "every title-drift group is withheld this run."
     )
 
-    %{}
+    :unavailable
   end
 
   # "The gate was shut" and "the gate was open and confirmed nothing" both used to return an
@@ -638,9 +645,15 @@ defmodule Loopctl.Knowledge.Consolidation do
     ids
     |> Enum.chunk_every(Knowledge.embedding_batch_max())
     |> Enum.each(fn chunk ->
-      %{article_ids: chunk, tenant_id: tenant_id}
-      |> BatchArticleEmbeddingWorker.new()
-      |> Oban.insert()
+      # `Oban.insert/1` returns `{:error, changeset}` without raising, so throwing the result
+      # away left the ONLY failure mode that does not log — the group counted uncorroborated
+      # with an enqueue that never happened, indistinguishable from a successful one.
+      case %{article_ids: chunk, tenant_id: tenant_id}
+           |> BatchArticleEmbeddingWorker.new()
+           |> Oban.insert() do
+        {:ok, _job} -> :ok
+        {:error, reason} -> log_backfill_failed(tenant_id, "insert:" <> insert_tag(reason))
+      end
     end)
 
     :ok
@@ -649,6 +662,10 @@ defmodule Loopctl.Knowledge.Consolidation do
   catch
     :exit, reason -> log_backfill_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
   end
+
+  # Low-cardinality, like every other tag this module logs — never the whole changeset.
+  defp insert_tag(%Ecto.Changeset{errors: errors}), do: inspect(Keyword.keys(errors))
+  defp insert_tag(other), do: inspect(other, limit: 3, printable_limit: 120)
 
   defp log_backfill_failed(tenant_id, tag) do
     Logger.warning(
@@ -946,7 +963,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   # twice; a title is an accident of whatever the source file was called.
   #
   # FAILS CLOSED on missing evidence, and the withhold is SELF-CLEARING: an article with no
-  # embedding at the active dimension (the corpus has had 80 such articles since June) drops
+  # embedding where this tenant keeps them (`score_source/1`; the corpus has had 80 such
+  # un-embedded articles since June) drops
   # its whole group rather than letting it pass on a partial sample, and the missing vectors
   # are enqueued (`backfill_missing_embeddings/2`) so the next run can decide instead of
   # withholding the same group forever.
@@ -965,11 +983,14 @@ defmodule Loopctl.Knowledge.Consolidation do
       # every confirmed proposal's SCAN-time ids, so the smallest member of THIS group may
       # have been unpublished by an earlier group in the same reduce.
       ids = live |> Enum.map(& &1.id) |> Enum.sort()
-      judge_similarity(Enum.find_value(ids, &Map.get(scored, &1)), ids)
+      judge_similarity(lookup_score(scored, ids), ids)
     else
       :ok
     end
   end
+
+  defp lookup_score(:unavailable, _ids), do: :unavailable
+  defp lookup_score(scored, ids), do: Enum.find_value(ids, &Map.get(scored, &1))
 
   # FAILS CLOSED on missing evidence, checked against THIS group's scored MEMBER set — never
   # against a pair COUNT, which was counted over the whole batch while the live ids are one
@@ -979,6 +1000,13 @@ defmodule Loopctl.Knowledge.Consolidation do
   # two that genuinely match. Within one entry every embedded member is paired with every
   # other, so full member coverage IS full pair coverage; `min_sim` may span another
   # proposal's ids under the same title, which can only lower it.
+  # A FAILED scoring read is not missing evidence: it says nothing about which members carry
+  # vectors, so it withholds with an EMPTY unscored list — no backfill, and its own log line.
+  # Treating it as "no vectors" answered a DB outage with an embedding job per member of
+  # every confirmed group, against the same shedding database, under a message that pointed
+  # the operator at embeddings.
+  defp judge_similarity(:unavailable, _ids), do: {:withheld, :unavailable, []}
+
   defp judge_similarity(nil, ids), do: {:withheld, nil, ids}
 
   defp judge_similarity(%{scored: scored_ids, min_sim: min_sim} = entry, ids) do
@@ -988,13 +1016,22 @@ defmodule Loopctl.Knowledge.Consolidation do
     end
   end
 
-  # The two withholds have different remedies, so they say different things: a low cosine is
-  # a verdict, missing vectors are a gap this run just enqueued.
+  # The three withholds have different remedies, so they say different things: a low cosine is
+  # a verdict, missing vectors are a gap this run just enqueued, and a failed read is neither.
+  defp log_uncorroborated(tenant_id, proposal, _live, :unavailable, _unscored) do
+    Logger.warning(
+      "Consolidation: tenant=#{tenant_id} WITHHELD duplicate_capture proposal " <>
+        "##{proposal.number} from auto-apply — similarity scoring failed this run, so there " <>
+        "is no content evidence to judge the title collision on. Reported, not applied. No " <>
+        "backfill enqueued: the cause is a failed read, not a missing vector."
+    )
+  end
+
   defp log_uncorroborated(tenant_id, proposal, live, entry, unscored) do
     detail =
       case {entry, unscored} do
         {_entry, [_ | _] = missing} ->
-          "#{length(missing)} member(s) unscored at the active dimension; backfill enqueued"
+          "#{length(missing)} member(s) carry no embedding; backfill enqueued"
 
         {%{min_sim: sim, pairs: pairs}, []} ->
           "min cosine #{Float.round(sim, 4)} across #{pairs} scored pair(s), threshold " <>
@@ -1032,7 +1069,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   defp pairwise_similarity_by_group(tenant_id, ids) do
     tenant_id
     |> title_pairs(ids)
-    |> score_pairs(Embeddings.active_dimension(tenant_id))
+    |> score_pairs(score_source(tenant_id))
     |> heavy_all(tenant_id)
     |> index_by_member()
   end
@@ -1049,6 +1086,33 @@ defmodule Loopctl.Knowledge.Consolidation do
           shared_visibility(a2.metadata) and
           fragment(unquote(@title_key_sql <> " = " <> @title_key_sql), a1.title, a2.title),
       where: a1.id in ^ids and a2.id in ^ids
+    )
+  end
+
+  # WHERE this tenant's vectors live, branched exactly like every other embedding-presence
+  # reader in this codebase (`KnowledgeLintWorker.embedded_ids/2`,
+  # `BatchArticleEmbeddingWorker.side_table_hashes/2`) — and the branch has to agree with
+  # THEIRS, not merely exist. A legacy-1536 tenant whose reads have not cut over keeps its
+  # vector in `articles.embedding`; scoring it at the active dimension found no side-table
+  # row, withheld the group, and the backfill's own legacy-hash check then skipped the
+  # re-embed as already-done — a withhold that could never clear, which is the opposite of
+  # the self-clearing property this gate claims.
+  defp score_source(tenant_id) do
+    if Embeddings.use_side_table_hash?(tenant_id),
+      do: Embeddings.active_dimension(tenant_id),
+      else: :legacy
+  end
+
+  defp score_pairs(query, :legacy) do
+    from([a1, a2] in query,
+      where: not is_nil(a1.embedding) and not is_nil(a2.embedding),
+      group_by: fragment(unquote(@title_key_sql), a1.title),
+      select: %{
+        min_sim: min(fragment("1 - (? <=> ?)", a1.embedding, a2.embedding)),
+        pairs: count(a1.id),
+        members:
+          fragment("array_agg(DISTINCT ?::text) || array_agg(DISTINCT ?::text)", a1.id, a2.id)
+      }
     )
   end
 
@@ -1087,24 +1151,32 @@ defmodule Loopctl.Knowledge.Consolidation do
   # `clamp_cap/3` is, in the other direction: a number sorts BELOW every atom and binary in
   # Erlang term order, so a `nil` or a `"0.8"` from a hand-rolled env read makes
   # `min_sim >= threshold` false for every pair on every night — title-drift auto-apply stops
-  # permanently while the run still reports `gate: :open`. A value outside `0.0..1.0` is
-  # equally inert (cosine cannot exceed 1).
+  # permanently while the run still reports `gate: :open`.
+  #
+  # An out-of-range NUMBER falls back to the default too, and is NOT clamped, because unlike
+  # `clamp_cap/3` neither end of this range is the safe one. Clamping a `-1` (the same
+  # "disable" idiom the cap tests use) to `0.0` satisfies `min_sim >= 0.0` for every pair —
+  # it turns the only content check on the auto-applying class fully OFF. Clamping a `2.0`
+  # (an operator hard-disabling the class mid-incident) to `1.0` is reachable too: identical
+  # vectors score exactly 1.0, so the gate an operator shut re-opens for byte-identical
+  # captures. A typo may only make this pass more conservative, so both go to the default.
   defp min_duplicate_similarity do
     :loopctl
     |> Application.get_env(
       :knowledge_consolidation_min_duplicate_similarity,
       @default_min_duplicate_similarity
     )
-    |> clamp_similarity()
+    |> validate_similarity()
   end
 
-  defp clamp_similarity(value) when is_float(value) or is_integer(value),
-    do: value |> max(0.0) |> min(1.0) |> to_float()
+  defp validate_similarity(value)
+       when (is_float(value) or is_integer(value)) and value >= 0 and value <= 1,
+       do: value * 1.0
 
-  defp clamp_similarity(value) do
+  defp validate_similarity(value) do
     Logger.warning(
-      "Consolidation: ignoring non-numeric duplicate similarity threshold " <>
-        "#{inspect(value)}; using #{@default_min_duplicate_similarity}."
+      "Consolidation: ignoring duplicate similarity threshold #{inspect(value)} — not a " <>
+        "number in 0.0..1.0; using #{@default_min_duplicate_similarity}."
     )
 
     @default_min_duplicate_similarity

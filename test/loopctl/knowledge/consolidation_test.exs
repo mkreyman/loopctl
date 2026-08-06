@@ -763,9 +763,12 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
 
     test "bounds LOSER ARTICLES per run, not just duplicate groups" do
       # A group cap is not an article cap: one group can carry many members, so 25 groups is
-      # an unbounded number of unpublishes. A group that would cross the article budget is
-      # skipped WHOLE — a half-applied group has no winner, which is the one state neither
-      # the next run nor a reader can interpret.
+      # an unbounded number of unpublishes. A group is DRAINED as far as the budget goes —
+      # the winner is never a candidate, so a partly-drained group leaves winner-plus-
+      # leftovers, which the next scan re-derives. (Skipping whole made a group with more
+      # losers than the cap unappliable forever; `consolidation_apply_caps_test.exs` covers
+      # the within-group case. Each group here carries exactly one loser, so this test only
+      # measures the ACROSS-group budget.)
       tenant = fixture(:tenant)
 
       for n <- 1..4 do
@@ -990,10 +993,82 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
       {:ok, _} = Consolidation.run(tenant.id)
 
+      refute embedded?(c.id)
+
       assert %{applied: 0, uncorroborated: 1} =
                Consolidation.apply_confirmed_duplicates(tenant.id)
 
       for id <- [a.id, b.id, c.id], do: assert(status(id) == :published)
+
+      # The withhold is SELF-CLEARING, and this is what says so: the missing vector was
+      # enqueued on the batch worker (inline Oban runs it here), so the next run decides
+      # instead of withholding this same group every night forever.
+      assert embedded?(c.id)
+    end
+
+    test "enqueues NO backfill when the members already carry vectors" do
+      # A low cosine is a verdict, not a gap. Enqueuing here would re-embed the whole group
+      # every night for a verdict that will not change.
+      tenant = fixture(:tenant)
+      a = published(tenant.id, %{title: "Changelog", body: "wordpress seo plugin"})
+      b = published(tenant.id, %{title: "CHANGELOG", body: "elixir oauth2 library"})
+      embed!(tenant.id, a, unit_vector(0))
+      embed!(tenant.id, b, unit_vector(1))
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{uncorroborated: 1} = Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      # Untouched: an inline backfill would have overwritten both with the stub's vector.
+      assert Pgvector.to_list(embedding(a.id)) == unit_vector(0)
+      assert Pgvector.to_list(embedding(b.id)) == unit_vector(1)
+    end
+
+    test "corroborates a pre-cutover tenant whose vectors live ONLY in the legacy column" do
+      # Articles embedded before the US-41.1 dual-write have `articles.embedding` and no
+      # side-table row. Scoring them at the active dimension found nothing, so the group was
+      # withheld — and the backfill's own legacy-hash check then skipped the re-embed as
+      # already done, making that withhold permanent.
+      tenant = fixture(:tenant)
+      {a, b} = duplicate_pair(tenant.id)
+      corroborate_all!(tenant.id)
+      for id <- [a.id, b.id], do: drop_side_table_row!(id)
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{applied: 1, uncorroborated: 0} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert status(b.id) == :draft
+    end
+
+    defp drop_side_table_row!(article_id) do
+      AdminRepo.query!("DELETE FROM article_embeddings WHERE article_id = $1", [
+        Ecto.UUID.dump!(article_id)
+      ])
+    end
+
+    test "corroborates from the SIDE TABLE once the tenant's reads have cut over" do
+      # Every other test here exercises the LEGACY branch of `score_source/1` — the test env
+      # leaves side-table reads off, which is production for a 1536 tenant pre-cutover. A
+      # cut-over tenant must corroborate from the side table instead; if that read came back
+      # empty the group would be withheld rather than applied.
+      Mox.stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
+
+      tenant = fixture(:tenant)
+      {a, b} = duplicate_pair(tenant.id)
+      corroborate_all!(tenant.id)
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{applied: 1, uncorroborated: 0} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert status(a.id) == :published
+      assert status(b.id) == :draft
     end
 
     test "does NOT gate the idempotency-drift signal on embeddings" do
@@ -1062,6 +1137,12 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
     defp embed!(tenant_id, article, vector) do
       {:ok, _} = Knowledge.update_embedding(tenant_id, article.id, vector, nil)
     end
+
+    defp embedding(id) do
+      Article |> where([a], a.id == ^id) |> select([a], a.embedding) |> AdminRepo.one()
+    end
+
+    defp embedded?(id), do: not is_nil(embedding(id))
 
     # A 1536-dim one-hot vector. Two different indices are orthogonal (cosine 0).
     defp unit_vector(index) do
