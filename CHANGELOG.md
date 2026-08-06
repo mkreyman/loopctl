@@ -25,7 +25,7 @@ Operator-facing changes for deployments outside the hosted instance.
 
   The bounds themselves stay — a bug that mis-picks winners must be visible after one night
   rather than after the whole corpus — and unpublish being reversible by publishing is what
-  licenses a bound this size. Evidence for the new sizing: on 2026-08-06 the class unpublished
+  licenses a bound this size. Evidence for the new sizing: on 2026-08-05 the class unpublished
   112 loser articles on the hosted corpus, and **all 112 were verified to still have a
   surviving published twin**, with zero private articles touched.
 

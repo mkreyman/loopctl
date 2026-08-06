@@ -771,12 +771,17 @@ config :loopctl, :embedding_legacy_retirement,
 # "already covered elsewhere".
 config :loopctl, :hnsw_iterative_scan_default, 1
 
-# Consolidation apply caps, held DELIBERATELY LOW in test (#611). Both were unreachable from
-# `KnowledgeLintWorker` for a while — `apply_confirmed_duplicates/2` took them as opts and the
-# worker passed none, so the nightly ran on module defaults whatever an operator configured,
-# and nothing failed when that was true. A cap of 1 here makes the wiring observable: the
-# worker test creates several confirmed duplicate groups and asserts exactly ONE applies, so
-# dropping the opts again turns into a failure rather than a silent reversion to 25.
+# Consolidation apply caps, held DELIBERATELY LOW and ASYMMETRIC in test (#611). Both were
+# unreachable from `KnowledgeLintWorker` for a while — `apply_confirmed_duplicates/2` took
+# them as opts and the worker passed none, so the nightly ran on module defaults whatever an
+# operator configured, and nothing failed when that was true.
+#
+# The two values must DIFFER, and both must be below the module defaults (25 / 100), or the
+# regression test cannot see which opt was dropped: with both pinned at 1 the worker test's
+# three groups yield one applied loser whichever cap binds, so dropping EITHER opt still
+# passed. At 2/1 the group cap decides how many proposals are FETCHED (skipped=1, not 2) and
+# the article cap decides how many of those apply (applied=1, not 2), so each opt has its own
+# failing assertion.
 config :loopctl,
-  knowledge_consolidation_max_applies: 1,
+  knowledge_consolidation_max_applies: 2,
   knowledge_consolidation_max_unpublishes: 1

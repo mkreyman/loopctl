@@ -614,7 +614,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "(#{tag}); no duplicates unpublished this run."
     )
 
-    %{applied: 0, skipped: 0, failed: 0, error: tag}
+    # `:gate` is NOT optional: `lint_tenant/1` interpolates `applied.gate` in its summary
+    # line, so a map without the key raised a KeyError one line after this rescue swallowed
+    # the original error — cancelling the fail-soft it exists for and making Oban re-run
+    # every effectful step of the night.
+    %{applied: 0, skipped: 0, failed: 0, gate: :apply_failed, error: tag}
   end
 
   # Writes the consolidation report + its proposal rows and nothing else. The APPLY is a
@@ -691,7 +695,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       # WHY nothing was applied, when nothing was. `:open` with zeroes is a clean corpus;
       # `:report_gap` / `:insufficient_history` mean the agreement gate refused to run and
       # `:apply_failed` means it ran and crashed. All four used to be the same three zeroes.
-      "duplicate_apply_gate" => to_string(Map.get(applied, :gate, :open)),
+      # Read with `.gate`, never a defaulted `Map.get`: an `:open` default would record a
+      # crashed run as a clean night, which is the exact distinction this key exists for.
+      "duplicate_apply_gate" => to_string(applied.gate),
       "apply_error" => Map.get(applied, :error)
     }
   end

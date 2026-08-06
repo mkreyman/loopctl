@@ -138,6 +138,14 @@ defmodule Loopctl.Knowledge.Consolidation do
   # irreversible-adjacent — loser articles pulled out of the published set in one night.
   @default_max_unpublishes 100
 
+  # Hard ceilings for the two operator-configurable apply caps, mirroring
+  # `@hard_max_per_class`. Both knobs are clamped to `1..ceiling`: an unclamped negative
+  # `:max_applies` reached `limit: ^cap` as a Postgrex error, and an unclamped `0`/negative
+  # `:max_unpublishes` skipped every group every night while the audit event read like a
+  # quiet one. Pausing the drain is the schedule's job, not a zero here.
+  @hard_max_applies 500
+  @hard_max_unpublishes 500
+
   # The classes `analyze/2` still PRODUCES, in the order proposals are numbered in. Distinct
   # from `ConsolidationProposal.classes()`, which is the schema enum and additionally carries
   # the retired values so historical rows load. Assembly iterates THIS list.
@@ -297,8 +305,9 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   ## What bounds one night
 
-  Two caps, in different units. `:max_applies` (default `#{@default_max_applies}`) bounds how
-  many PROPOSALS are considered; `:max_unpublishes` (default `#{@default_max_unpublishes}`)
+  Two caps, in different units, each clamped to `1..500`. `:max_applies` (default
+  `#{@default_max_applies}`) bounds how many PROPOSALS are considered;
+  `:max_unpublishes` (default `#{@default_max_unpublishes}`)
   bounds how many loser ARTICLES actually leave the published set. The second is the one that
   matters — a group can carry many members, so a group cap alone is not an article cap — and
   a group that would cross it is skipped WHOLE, never applied part-way, because a group with
@@ -327,8 +336,14 @@ defmodule Loopctl.Knowledge.Consolidation do
           gate: :open | :report_gap | :insufficient_history
         }
   def apply_confirmed_duplicates(tenant_id, opts \\ []) do
-    cap = Keyword.get(opts, :max_applies, @default_max_applies)
-    unpublish_cap = Keyword.get(opts, :max_unpublishes, @default_max_unpublishes)
+    cap =
+      opts |> Keyword.get(:max_applies, @default_max_applies) |> max(1) |> min(@hard_max_applies)
+
+    unpublish_cap =
+      opts
+      |> Keyword.get(:max_unpublishes, @default_max_unpublishes)
+      |> max(1)
+      |> min(@hard_max_unpublishes)
 
     case confirmed_duplicate_proposals(tenant_id, cap) do
       {:error, reason} ->
@@ -370,7 +385,13 @@ defmodule Loopctl.Knowledge.Consolidation do
     # actually leave the published set tonight. A group is skipped WHOLE rather than applied
     # part-way, because a half-applied group has no winner and is the one state neither the
     # next run nor a reader can interpret.
-    if acc.applied + acc.failed >= unpublish_cap do
+    #
+    # The group's OWN loser count is charged against the remaining budget, not just the
+    # budget spent so far: testing only "already exhausted" let the last admitted group run
+    # unbounded, so the effective ceiling was `cap - 1 + group_size` and the operator knob
+    # was advisory rather than a bound. A group whose losers exceed the whole budget is
+    # therefore never applied — raise the cap above the largest group to drain it.
+    if acc.applied + acc.failed + losers(proposal) > unpublish_cap do
       %{acc | skipped: acc.skipped + 1}
     else
       do_tally_apply(tenant_id, proposal, acc)
@@ -396,7 +417,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   # field makes the number unreadable on exactly the night it matters: a systematic failure
   # across 25 groups of four would have reported 25 while 75 articles stayed published.
   defp group_failed(tenant_id, proposal, tag, acc) do
-    losers = max(length(proposal.article_ids) - 1, 1)
+    losers = losers(proposal)
 
     Logger.error(
       "Consolidation: tenant=#{tenant_id} duplicate_capture proposal ##{proposal.number} " <>
@@ -405,6 +426,10 @@ defmodule Loopctl.Knowledge.Consolidation do
 
     %{acc | failed: acc.failed + losers}
   end
+
+  # Every member but the winner. Floored at 1 so a malformed single-member group still
+  # charges the budget and still counts as one failure rather than as nothing.
+  defp losers(proposal), do: max(length(proposal.article_ids) - 1, 1)
 
   # Proposals present in BOTH the newest report and the one before it, matched on
   # `fingerprint` — which is derived from the class plus the sorted article-id set, so it is
@@ -603,11 +628,12 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   @doc false
-  # Excludes agent-PRIVATE articles from everything this pass does. Composed into all THREE
-  # places that build a "published article of this tenant" predicate — the scans
-  # (`published_base/1`), the evidence fetch (`evidence_map/2`) and the apply-time live
-  # re-check (`apply_duplicate_group/2`) — because a guard that lives in only one of them is
-  # a guard the next reader adds a fourth path around.
+  # Excludes agent-PRIVATE articles from everything this pass does. Composed into EVERY
+  # place that decides whether an article of this tenant is in scope — the scans
+  # (`published_base/1`), the evidence fetch (`evidence_map/2`), the apply-time live
+  # re-check (`apply_duplicate_group/2`) and the read-time redaction liveness
+  # (`live_evidence_ids/2`) — because a guard that lives in only some of them is a guard
+  # the next reader adds one more path around.
   #
   # Two distinct harms, and the quieter one is worse. The LOUD one: `:duplicate_capture`
   # auto-applies (#608), so without this the pass could unpublish one agent's private memory
@@ -959,6 +985,11 @@ defmodule Loopctl.Knowledge.Consolidation do
   # erasing the quoted excerpt that says WHY the article was unpublished on the morning an
   # operator goes looking for it. Archive and hard delete are the one-way doors this
   # redaction exists for, and they still redact.
+  #
+  # `shared_only/1` is composed here for the same reason it is composed into the three scan
+  # predicates: an article that turned private AFTER the scan is a readability change, and
+  # without it a quoted body kept being served to any orchestrator key from a prior-day
+  # report forever. Turning private redacts exactly like archiving.
   defp live_evidence_ids(_tenant_id, []), do: MapSet.new()
 
   defp live_evidence_ids(tenant_id, article_ids) do
@@ -970,6 +1001,7 @@ defmodule Loopctl.Knowledge.Consolidation do
       where: a.id in ^ids,
       select: a.id
     )
+    |> shared_only()
     |> AdminRepo.all()
     |> MapSet.new()
   end

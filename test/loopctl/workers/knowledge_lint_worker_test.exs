@@ -590,10 +590,14 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       |> AdminRepo.update!()
     end
 
-    test "honours :knowledge_consolidation_max_applies instead of the module default" do
-      # config/test.exs pins the cap at 1. Three confirmed duplicate groups exist, so the
-      # module default (25) and the configured cap (1) give visibly different answers — which
-      # is the only way this test can notice the worker dropping the opts again.
+    test "honours BOTH configured apply caps instead of the module defaults" do
+      # config/test.exs pins the caps ASYMMETRICALLY (max_applies: 2, max_unpublishes: 1)
+      # against three confirmed one-loser groups, so each opt owns its own assertion:
+      #   * both wired      -> 2 proposals fetched, 1 applies, 1 skipped
+      #   * max_applies gone (25)     -> 3 fetched  -> skipped == 2, not 1
+      #   * max_unpublishes gone (100) -> both fetched apply -> applied == 2, not 1
+      # With both caps at 1 the answer was one applied loser either way, which is how the
+      # unreachable-opts bug could have half-regressed unnoticed.
       tenant = fixture(:tenant)
 
       groups =
@@ -626,8 +630,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
         end)
 
       assert still_published == 2,
-             "cap of 1 must leave 2 of 3 losers published; the module default of 25 would " <>
-               "have applied all three"
+             "an article cap of 1 must leave 2 of 3 losers published"
+
+      assert [entry] = lint_audit_entries(tenant.id)
+      applied = entry.new_state["consolidation"]
+
+      assert applied["duplicates_unpublished"] == 1,
+             ":max_unpublishes was not honoured — a second group applied"
+
+      assert applied["duplicate_groups_skipped"] == 1,
+             ":max_applies was not honoured — a third proposal was fetched and skipped"
     end
   end
 end

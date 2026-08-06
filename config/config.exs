@@ -758,7 +758,7 @@ config :loopctl,
 
 # Consolidation drain rates (#611). All three were previously pinned to module defaults sized
 # for a class that had never applied anything in production. It has now: 112 loser articles
-# unpublished on 2026-08-06, and ALL 112 were verified to still have a surviving published
+# unpublished on 2026-08-05, and ALL 112 were verified to still have a surviving published
 # twin. The bounds stay — a bug that mis-picks winners must be visible after one night rather
 # than after the whole corpus — but they are sized to CONVERGE rather than to hold a line.
 #
