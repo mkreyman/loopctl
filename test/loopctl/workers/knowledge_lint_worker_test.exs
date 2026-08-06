@@ -578,4 +578,56 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       0 -> acc
     end
   end
+
+  describe "consolidation apply caps reach the context (#611)" do
+    # No embedding: this describe exercises the LEXICAL duplicate class only, and an embedded
+    # publish would fire the inline linking cascade these tests do not want.
+    defp published_no_embedding(tenant_id, attrs) do
+      base = %{category: :pattern, status: :draft, tags: []}
+
+      fixture(:article, Map.merge(base, Map.put(attrs, :tenant_id, tenant_id)))
+      |> Ecto.Changeset.change(%{status: :published})
+      |> AdminRepo.update!()
+    end
+
+    test "honours :knowledge_consolidation_max_applies instead of the module default" do
+      # config/test.exs pins the cap at 1. Three confirmed duplicate groups exist, so the
+      # module default (25) and the configured cap (1) give visibly different answers — which
+      # is the only way this test can notice the worker dropping the opts again.
+      tenant = fixture(:tenant)
+
+      groups =
+        for n <- 1..3 do
+          winner =
+            published_no_embedding(tenant.id, %{
+              title: "Cap Group #{n} Document",
+              body: String.duplicate("long winner body ", 20)
+            })
+
+          loser =
+            published_no_embedding(tenant.id, %{title: "cap-group-#{n}-document!", body: "s"})
+
+          {winner, loser}
+        end
+
+      # Two adjacent reports so the agreement gate is open on all three groups.
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert :ok =
+               KnowledgeLintWorker.perform(%Oban.Job{
+                 id: 0,
+                 args: %{"tenant_id" => tenant.id}
+               })
+
+      still_published =
+        Enum.count(groups, fn {_w, loser} ->
+          AdminRepo.get!(Loopctl.Knowledge.Article, loser.id).status == :published
+        end)
+
+      assert still_published == 2,
+             "cap of 1 must leave 2 of 3 losers published; the module default of 25 would " <>
+               "have applied all three"
+    end
+  end
 end

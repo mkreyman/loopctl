@@ -578,11 +578,34 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     do: %{applied: 0, skipped: 0, failed: 0, gate: :scan_failed}
 
   defp apply_consolidation(tenant_id, {:ok, _report}) do
-    Consolidation.apply_confirmed_duplicates(tenant_id)
+    Consolidation.apply_confirmed_duplicates(tenant_id,
+      max_applies: applies_cap(),
+      max_unpublishes: unpublishes_cap()
+    )
   rescue
     e -> apply_failed(tenant_id, ExitTag.tag(e))
   catch
     :exit, reason -> apply_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
+  end
+
+  # Both caps were previously unreachable from here — `apply_confirmed_duplicates/2` accepted
+  # them as opts and the worker passed none, so the nightly was pinned to the module defaults
+  # whatever an operator configured. That is why draining the standing backlog required
+  # calling the context directly, which is not a thing a self-maintaining pass should need.
+  defp applies_cap do
+    Application.get_env(
+      :loopctl,
+      :knowledge_consolidation_max_applies,
+      Consolidation.default_max_applies()
+    )
+  end
+
+  defp unpublishes_cap do
+    Application.get_env(
+      :loopctl,
+      :knowledge_consolidation_max_unpublishes,
+      Consolidation.default_max_unpublishes()
+    )
   end
 
   defp apply_failed(tenant_id, tag) do

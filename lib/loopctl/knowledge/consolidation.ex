@@ -147,6 +147,14 @@ defmodule Loopctl.Knowledge.Consolidation do
   # skipped run); anything wider is not the "two consecutive runs" the gate advertises.
   @max_confirmation_gap 2
 
+  @doc "Default cap on duplicate GROUPS one run may apply."
+  @spec default_max_applies() :: pos_integer()
+  def default_max_applies, do: @default_max_applies
+
+  @doc "Default cap on loser ARTICLES one run may unpublish."
+  @spec default_max_unpublishes() :: pos_integer()
+  def default_max_unpublishes, do: @default_max_unpublishes
+
   @doc "Default per-class proposal cap."
   @spec default_max_per_class() :: pos_integer()
   def default_max_per_class, do: @default_max_per_class

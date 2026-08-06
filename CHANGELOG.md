@@ -8,6 +8,27 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **The nightly consolidation drain rates are raised so the duplicate backlog converges to
+  zero instead of to a floor (#611).** Three settings, all previously pinned to module
+  defaults sized for a class that had never applied anything in production:
+  `knowledge_consolidation_max_per_class` (100 → **500**, the existing hard ceiling),
+  `knowledge_consolidation_max_applies` (**new**, default 500) and
+  `knowledge_consolidation_max_unpublishes` (**new**, default 500).
+
+  The per-class cap is the one that mattered. Auto-apply requires a proposal in **both** of
+  the last two reports, so a standing backlog larger than the report cap could never drain
+  however long the pass ran — the hosted corpus sat at 290 proposals with 100 visible, a
+  queue converging to a floor rather than to zero. The two apply caps were additionally
+  UNREACHABLE: `apply_confirmed_duplicates/2` accepted them as options and the worker passed
+  none, so operator configuration had no effect and draining a backlog required calling the
+  context directly.
+
+  The bounds themselves stay — a bug that mis-picks winners must be visible after one night
+  rather than after the whole corpus — and unpublish being reversible by publishing is what
+  licenses a bound this size. Evidence for the new sizing: on 2026-08-06 the class unpublished
+  112 loser articles on the hosted corpus, and **all 112 were verified to still have a
+  surviving published twin**, with zero private articles touched.
+
 - **The nightly knowledge pass now PRUNES the `relates_to` graph to a bounded degree, which
   DELETES rows (#611 stage 0).** Read this before upgrading if you run a large corpus: on
   first run the pass will delete a large number of `article_links` rows, and it is the only

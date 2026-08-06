@@ -770,3 +770,13 @@ config :loopctl, :embedding_legacy_retirement,
 # at all — a mis-cited compensating control is how the real one gets deleted later as
 # "already covered elsewhere".
 config :loopctl, :hnsw_iterative_scan_default, 1
+
+# Consolidation apply caps, held DELIBERATELY LOW in test (#611). Both were unreachable from
+# `KnowledgeLintWorker` for a while — `apply_confirmed_duplicates/2` took them as opts and the
+# worker passed none, so the nightly ran on module defaults whatever an operator configured,
+# and nothing failed when that was true. A cap of 1 here makes the wiring observable: the
+# worker test creates several confirmed duplicate groups and asserts exactly ONE applies, so
+# dropping the opts again turns into a failure rather than a silent reversion to 25.
+config :loopctl,
+  knowledge_consolidation_max_applies: 1,
+  knowledge_consolidation_max_unpublishes: 1
