@@ -756,6 +756,30 @@ config :loopctl,
   knowledge_lint_orphan_link_threshold: 0.5,
   knowledge_lint_max_orphan_relink: 500
 
+# Consolidation drain rates (#611). All three were previously pinned to module defaults sized
+# for a class that had never applied anything in production. It has now: 112 loser articles
+# unpublished on 2026-08-06 UTC, and ALL 112 were verified to still have a surviving published
+# twin. The bounds stay — a bug that mis-picks winners must be visible after one night rather
+# than after the whole corpus — but they are sized to CONVERGE rather than to hold a line.
+#
+# `max_per_class` at the hard ceiling means the report stops being permanently `truncated`,
+# which matters because the two-run agreement gate can only confirm what BOTH reports carry:
+# a standing backlog larger than the cap could never drain, however long it ran. At 100 the
+# corpus sat at 290 proposals with 100 visible, i.e. a queue that converged to a floor rather
+# than to zero.
+#
+# Unpublish is reversible by publishing, which is what licenses a bound this size at all.
+#
+# Both apply caps are clamped to 0..500 (500 is the hard ceiling — raising a value above it
+# has no effect), and a non-integer value is ignored in favour of the module default. Setting
+# either to 0 PAUSES the auto-unpublish drain for that run: nothing is applied and the audit
+# event records duplicate_apply_gate=drain_disabled, so a paused night is not mistaken for a
+# clean one. That is the supported way to halt the drain during an incident.
+config :loopctl,
+  knowledge_consolidation_max_per_class: 500,
+  knowledge_consolidation_max_applies: 500,
+  knowledge_consolidation_max_unpublishes: 500
+
 # LinkPruning (#611 stage 0): how many over-degree `relates_to` edges one nightly run may
 # DELETE, worst-first. Sized to converge in a few nights rather than a few months — the
 # standing backlog on the hosted corpus was ~903,600 edges (1,402,699 total, 499,058

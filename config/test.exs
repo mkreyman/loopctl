@@ -770,3 +770,18 @@ config :loopctl, :embedding_legacy_retirement,
 # at all — a mis-cited compensating control is how the real one gets deleted later as
 # "already covered elsewhere".
 config :loopctl, :hnsw_iterative_scan_default, 1
+
+# Consolidation apply caps, held DELIBERATELY LOW and ASYMMETRIC in test (#611). Both were
+# unreachable from `KnowledgeLintWorker` for a while — `apply_confirmed_duplicates/2` took
+# them as opts and the worker passed none, so the nightly ran on module defaults whatever an
+# operator configured, and nothing failed when that was true.
+#
+# The two values must DIFFER, and both must be below the module defaults (25 / 100), or the
+# regression test cannot see which opt was dropped: with both pinned at 1 the worker test's
+# three groups yield one applied loser whichever cap binds, so dropping EITHER opt still
+# passed. At 2/1 the group cap decides how many proposals are FETCHED (skipped=1, not 2) and
+# the article cap decides how many of those apply (applied=1, not 2), so each opt has its own
+# failing assertion.
+config :loopctl,
+  knowledge_consolidation_max_applies: 2,
+  knowledge_consolidation_max_unpublishes: 1

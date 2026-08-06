@@ -258,6 +258,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert entry.new_state["summary"]["total_articles"] == 2
       assert entry.new_state["consolidation"]["status"] == "failed"
       assert is_binary(entry.new_state["consolidation"]["error"])
+
+      # The gate key is the one an auditor parses to learn WHY nothing applied, so it is
+      # recorded on the failing nights too — absent-on-failure is the one answer it must not
+      # give. This also guards the `:apply_failed` tally: both come from the same zero-tally
+      # constructor, and it was a constructor missing `:gate` that raised a KeyError one line
+      # after the rescue swallowed the original error, making Oban re-run the whole night.
+      assert entry.new_state["consolidation"]["duplicate_apply_gate"] == "scan_failed"
     end
 
     # The apply reads the two most recent reports. If a failed scan could fall through to it,
@@ -576,6 +583,70 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       {:batch_call, n} -> drain_batch_calls([n | acc])
     after
       0 -> acc
+    end
+  end
+
+  describe "consolidation apply caps reach the context (#611)" do
+    # No embedding: this describe exercises the LEXICAL duplicate class only, and an embedded
+    # publish would fire the inline linking cascade these tests do not want.
+    defp published_no_embedding(tenant_id, attrs) do
+      base = %{category: :pattern, status: :draft, tags: []}
+
+      fixture(:article, Map.merge(base, Map.put(attrs, :tenant_id, tenant_id)))
+      |> Ecto.Changeset.change(%{status: :published})
+      |> AdminRepo.update!()
+    end
+
+    test "honours BOTH configured apply caps instead of the module defaults" do
+      # config/test.exs pins the caps ASYMMETRICALLY (max_applies: 2, max_unpublishes: 1)
+      # against three confirmed one-loser groups, so each opt owns its own assertion:
+      #   * both wired      -> 2 proposals fetched, 1 applies, 1 skipped
+      #   * max_applies gone (25)     -> 3 fetched  -> skipped == 2, not 1
+      #   * max_unpublishes gone (100) -> both fetched apply -> applied == 2, not 1
+      # With both caps at 1 the answer was one applied loser either way, which is how the
+      # unreachable-opts bug could have half-regressed unnoticed.
+      tenant = fixture(:tenant)
+
+      groups =
+        for n <- 1..3 do
+          winner =
+            published_no_embedding(tenant.id, %{
+              title: "Cap Group #{n} Document",
+              body: String.duplicate("long winner body ", 20)
+            })
+
+          loser =
+            published_no_embedding(tenant.id, %{title: "cap-group-#{n}-document!", body: "s"})
+
+          {winner, loser}
+        end
+
+      # Two adjacent reports so the agreement gate is open on all three groups.
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert :ok =
+               KnowledgeLintWorker.perform(%Oban.Job{
+                 id: 0,
+                 args: %{"tenant_id" => tenant.id}
+               })
+
+      still_published =
+        Enum.count(groups, fn {_w, loser} ->
+          AdminRepo.get!(Loopctl.Knowledge.Article, loser.id).status == :published
+        end)
+
+      assert still_published == 2,
+             "an article cap of 1 must leave 2 of 3 losers published"
+
+      assert [entry] = lint_audit_entries(tenant.id)
+      applied = entry.new_state["consolidation"]
+
+      assert applied["duplicates_unpublished"] == 1,
+             ":max_unpublishes was not honoured — a second group applied"
+
+      assert applied["duplicate_groups_skipped"] == 1,
+             ":max_applies was not honoured — a third proposal was fetched and skipped"
     end
   end
 end

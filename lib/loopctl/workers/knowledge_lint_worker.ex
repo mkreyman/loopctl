@@ -574,15 +574,37 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     %{pruned: 0, remaining: -1}
   end
 
-  defp apply_consolidation(_tenant_id, {:error, _tag}),
-    do: %{applied: 0, skipped: 0, failed: 0, gate: :scan_failed}
+  defp apply_consolidation(_tenant_id, {:error, _tag}), do: empty_tally(:scan_failed)
 
   defp apply_consolidation(tenant_id, {:ok, _report}) do
-    Consolidation.apply_confirmed_duplicates(tenant_id)
+    Consolidation.apply_confirmed_duplicates(tenant_id,
+      max_applies: applies_cap(),
+      max_unpublishes: unpublishes_cap()
+    )
   rescue
     e -> apply_failed(tenant_id, ExitTag.tag(e))
   catch
     :exit, reason -> apply_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
+  end
+
+  # Both caps were previously unreachable from here — `apply_confirmed_duplicates/2` accepted
+  # them as opts and the worker passed none, so the nightly was pinned to the module defaults
+  # whatever an operator configured. That is why draining the standing backlog required
+  # calling the context directly, which is not a thing a self-maintaining pass should need.
+  defp applies_cap do
+    Application.get_env(
+      :loopctl,
+      :knowledge_consolidation_max_applies,
+      Consolidation.default_max_applies()
+    )
+  end
+
+  defp unpublishes_cap do
+    Application.get_env(
+      :loopctl,
+      :knowledge_consolidation_max_unpublishes,
+      Consolidation.default_max_unpublishes()
+    )
   end
 
   defp apply_failed(tenant_id, tag) do
@@ -591,8 +613,18 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "(#{tag}); no duplicates unpublished this run."
     )
 
-    %{applied: 0, skipped: 0, failed: 0, error: tag}
+    empty_tally(:apply_failed, tag)
   end
+
+  # ONE constructor for every zero tally this worker synthesises, so no fail-soft path can
+  # ship a map missing `:gate`: `lint_tenant/1` interpolates `applied.gate` in its summary
+  # line, so a map without the key raised a KeyError one line after the rescue had swallowed
+  # the original error — cancelling the fail-soft it exists for and making Oban re-run every
+  # effectful step of the night. Sharing the constructor is what lets the reachable
+  # `:scan_failed` path guard the `:apply_failed` one, which needs a repo-level failure to
+  # provoke.
+  defp empty_tally(gate, error \\ nil),
+    do: %{applied: 0, skipped: 0, failed: 0, gate: gate, error: error}
 
   # Writes the consolidation report + its proposal rows and nothing else. The APPLY is a
   # separate step (`apply_consolidation/2`, above) on purpose: this one must run first so
@@ -666,17 +698,26 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       "duplicate_groups_skipped" => applied.skipped,
       "duplicates_unpublish_failed" => applied.failed,
       # WHY nothing was applied, when nothing was. `:open` with zeroes is a clean corpus;
-      # `:report_gap` / `:insufficient_history` mean the agreement gate refused to run and
-      # `:apply_failed` means it ran and crashed. All four used to be the same three zeroes.
-      "duplicate_apply_gate" => to_string(Map.get(applied, :gate, :open)),
+      # `:report_gap` / `:insufficient_history` mean the agreement gate refused to run,
+      # `:drain_disabled` means an operator set a cap to 0, and `:apply_failed` means it ran
+      # and crashed. All of them used to be the same three zeroes. Read with `.gate`, never a
+      # defaulted `Map.get`: an `:open` default would record a crashed run as a clean night,
+      # which is the exact distinction this key exists for.
+      "duplicate_apply_gate" => to_string(applied.gate),
       "apply_error" => Map.get(applied, :error)
     }
   end
 
   # No report tonight means no apply ran at all (`apply_consolidation/2` is gated on the
-  # `{:ok, _}`), so there is no tally to record here.
-  defp consolidation_state({:error, tag}, _applied),
-    do: %{"status" => "failed", "error" => tag}
+  # `{:ok, _}`), so there are no counts to record here — but `duplicate_apply_gate` is
+  # recorded anyway. It is the key an auditor parses to learn WHY nothing applied, and an
+  # absent key on exactly the nights the pass failed is the one answer it must not give.
+  defp consolidation_state({:error, tag}, applied),
+    do: %{
+      "status" => "failed",
+      "error" => tag,
+      "duplicate_apply_gate" => to_string(applied.gate)
+    }
 
   # The per-step results arrive as ONE map rather than nine positionals. That is not only
   # arity hygiene: every step this worker gains adds a parameter here, and a positional list
