@@ -258,8 +258,8 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
           :exhausted ->
             Logger.warning(
               "ArticleEmbeddingWorker: tenant=#{tenant_id} article=#{article_id} rejected as " <>
-                "too long at #{sent} bytes, the ladder's floor — not a length problem " <>
-                "(a smaller model window?); discarding."
+                "too long at #{sent} bytes, at or below the #{TextBudget.floor_bytes()}-byte " <>
+                "floor — not a length problem (a smaller model window?); discarding."
             )
 
             error

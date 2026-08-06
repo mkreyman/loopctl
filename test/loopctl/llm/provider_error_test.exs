@@ -189,17 +189,40 @@ defmodule Loopctl.Llm.ProviderErrorTest do
       assert ProviderError.sanitize(term) == term
     end
 
-    test "sanitize/2 keeps the classification when a Retry-After is attached" do
-      # sanitize/2 hardcoded :provider_error while sanitize/1 preserved the tag, so a
-      # gateway answering with both a Retry-After and a length complaint lost the
-      # classification — disabling the ladder on that path only.
+    test "sanitize/2 always tags the throttle 4-tuple :provider_error" do
+      # A Retry-After IS the provider naming the remedy: WAIT, not shorten. The tag
+      # must stay fixed because every worker's loss-free snooze clause matches
+      # {:api_error, _status, :provider_error, retry_after} LITERALLY — a classified
+      # tag there falls through to the generic branch and burns an Oban attempt on the
+      # blind attempt^4 backoff against a provider that just asked us to back off.
       body = %{"error" => %{"message" => "maximum context length is 8192 tokens"}}
 
       assert ProviderError.sanitize({:api_error, 400, body}, 30) ==
-               {:api_error, 400, :context_length_exceeded, 30}
+               {:api_error, 400, :provider_error, 30}
 
       assert ProviderError.sanitize({:api_error, 429, "slow down"}, 30) ==
                {:api_error, 429, :provider_error, 30}
+    end
+
+    test "a throttle status is never classified as a length rejection" do
+      # OpenAI-compatible gateways answer a per-minute TOKEN throttle with the same
+      # phrasings a length rejection uses. Taking those at face value ran the shrink
+      # ladder, then — once the provider's window cleared — stored an embedding of a
+      # PREFIX under the FULL text's content hash, which the idempotency guard makes
+      # permanent. The status decides the remedy; the body does not.
+      for {status, body} <- [
+            {429, %{"detail" => "Too many tokens in this request, slow down"}},
+            {429, %{"error" => "please reduce the length of your input"}},
+            {503, %{"message" => "input is too long right now, retry later"}},
+            {408, %{"error" => %{"code" => "context_length_exceeded"}}}
+          ] do
+        assert ProviderError.sanitize({:api_error, status, body}) ==
+                 {:api_error, status, :provider_error},
+               "throttle #{status} wrongly classified as context-length: #{inspect(body)}"
+
+        assert ProviderError.log_tag({:api_error, status, body}) ==
+                 "api_error status=#{status} provider_error"
+      end
     end
   end
 end

@@ -59,6 +59,16 @@ defmodule Loopctl.Llm.ProviderError do
     "input is too long"
   ]
 
+  # Statuses whose BODY is never read as a length rejection: a throttle says WAIT,
+  # not SHORTEN. OpenAI-compatible gateways answer a per-minute TOKEN throttle with
+  # exactly the phrasings above ("too many tokens", "reduce the length"), and taking
+  # them at face value sends the worker down the shrink ladder — which spends extra
+  # paid calls and then, once the provider's window clears, STORES an embedding of a
+  # prefix under the FULL text's content hash. The idempotency guard makes every
+  # later enqueue a no-op, so that truncated vector is permanent. The status is
+  # authoritative about which remedy applies; the body is not.
+  @throttle_statuses [408, 429, 503]
+
   @doc """
   Classify a provider error body as one of the value-free `t:tag/0` atoms.
 
@@ -85,6 +95,12 @@ defmodule Loopctl.Llm.ProviderError do
           else: :provider_error
     end
   end
+
+  # Status-aware classification: a throttle is a throttle whatever its body says
+  # (see `@throttle_statuses`), so only a non-throttle status may be classified as a
+  # length rejection. Every classification that reaches a caller goes through here.
+  defp classify(status, _body) when status in @throttle_statuses, do: :provider_error
+  defp classify(_status, body), do: classify(body)
 
   # The classifiable surface of a body. Vendor-agnostic in SHAPE as well as in
   # spelling: OpenAI nests the text under `{"error" => %{"message" => ...}}`, but
@@ -132,7 +148,7 @@ defmodule Loopctl.Llm.ProviderError do
   # boundary preserves `:context_length_exceeded` instead of flattening it — the
   # retry ladder in the embedding workers dispatches on exactly that atom.
   def sanitize({:api_error, status, body}) when is_integer(status),
-    do: {:api_error, status, classify(body)}
+    do: {:api_error, status, classify(status, body)}
 
   def sanitize({:api_error, status}) when is_integer(status),
     do: {:api_error, status, :provider_error}
@@ -165,13 +181,16 @@ defmodule Loopctl.Llm.ProviderError do
   @spec sanitize(term(), non_neg_integer() | nil) :: t()
   def sanitize(reason, nil), do: sanitize(reason)
 
-  # `classify(body)`, not a literal `:provider_error`: a gateway can answer a throttle
-  # with a body that still echoes the provider's length complaint, and flattening the
-  # tag on THIS path would silently disable the shrink ladder while sanitize/1 keeps
-  # it — the same downgrade the idempotency clause above exists to prevent.
-  def sanitize({:api_error, status, body}, retry_after)
+  # A literal `:provider_error`, never `classify(body)`: a Retry-After IS the
+  # provider telling us the remedy is to WAIT, so it outranks whatever its body says
+  # about length. Keeping the tag fixed is also what the throttle 4-tuple's consumers
+  # rely on — every worker's loss-free snooze clause matches
+  # `{:api_error, _status, :provider_error, retry_after}` literally, and a tag they do
+  # not match falls through to the generic branch, which burns an Oban attempt on the
+  # blind `attempt^4` backoff against a provider that just asked us to back off.
+  def sanitize({:api_error, status, _body}, retry_after)
       when is_integer(status) and is_integer(retry_after),
-      do: {:api_error, status, classify(body), retry_after}
+      do: {:api_error, status, :provider_error, retry_after}
 
   def sanitize({:api_error, status}, retry_after)
       when is_integer(status) and is_integer(retry_after),
@@ -186,8 +205,13 @@ defmodule Loopctl.Llm.ProviderError do
   """
   @spec log_tag(term()) :: String.t()
   def log_tag({:error, inner}), do: log_tag(inner)
-  def log_tag({:api_error, status, body, _}), do: "api_error status=#{status} #{classify(body)}"
-  def log_tag({:api_error, status, body}), do: "api_error status=#{status} #{classify(body)}"
+
+  def log_tag({:api_error, status, body, _}),
+    do: "api_error status=#{status} #{classify(status, body)}"
+
+  def log_tag({:api_error, status, body}),
+    do: "api_error status=#{status} #{classify(status, body)}"
+
   def log_tag({:api_error, status}), do: "api_error status=#{status}"
   def log_tag({:request_failed, _}), do: "request_failed"
   def log_tag({:embedding_crash, _}), do: "embedding_crash"

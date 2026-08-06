@@ -40,7 +40,10 @@ defmodule Loopctl.Embeddings.TextBudget do
 
   ## The ladder
 
-      <bytes actually sent> -> 32,000 -> 16,000 -> 8,000 -> :exhausted
+  Each rung is HALF the bytes the rejected attempt ACTUALLY SENT, capped at 32,000 and
+  clamped at 8,000; the floor is tried exactly once, then `:exhausted`. So a
+  59,400-byte first attempt walks 29,714 -> 14,857 -> 8,000 -> `:exhausted`, and the
+  fixed 32,000 rung is reached only from an attempt above 64,000 bytes.
 
   Every rung is derived from the bytes ACTUALLY SENT, never from a nominal budget: a
   budget above the text's own size truncates nothing, so halving the budget alone can
