@@ -36,7 +36,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   status. Nothing is destroyed and everything is audited; that is what makes single-article
   curation agent-role. When you need a retraction you can actually undo, use
   `knowledge_unpublish` / `knowledge_publish`. No behaviour change — the API always worked
-  this way, only the descriptions were wrong.
+  this way, only the descriptions were wrong. The same correction lands on
+  `knowledge_bulk_delete`'s `hard` parameter (which still advertised a "default reversible
+  archive" one screen below the corrected tool description) and on `knowledge_update`, whose
+  in-place edit overwrites the prior body and so is not reversible either.
 
 ## 2.70.0 — 2026-08-05 (the idem- tag namespace is reserved)
 

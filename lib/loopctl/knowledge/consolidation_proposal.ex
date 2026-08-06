@@ -1,11 +1,12 @@
 defmodule Loopctl.Knowledge.ConsolidationProposal do
   @moduledoc """
-  A single numbered proposal from a nightly consolidation run (#584 stage 1).
+  A single numbered proposal from a nightly consolidation run (#584, #605, #608).
 
   Each proposal names the articles involved, carries a QUOTED excerpt from each as
-  evidence, and states what it would do — but stage 1 does NOTHING. Nothing here is
-  applied; the row exists so stage 2 (calibration) has a concrete thing to approve or
-  reject, and so stage 3 can auto-apply only the class with a clean record.
+  evidence, and states what it would do. The pass REPORTS both classes below and
+  APPLIES exactly one — a `:duplicate_capture` group that two consecutive reports
+  agree on has its losers UNPUBLISHED (reversible; never archived). There is no human
+  approve/reject stage and there will not be one (#605 supersedes #594).
 
   ## Classes
 
@@ -27,7 +28,8 @@ defmodule Loopctl.Knowledge.ConsolidationProposal do
 
   ## Review state resets on every machine re-run
 
-  `review_status` / `reviewed_by` / `reviewed_at` are HUMAN judgment. The nightly pass
+  `review_status` / `reviewed_by` / `reviewed_at` are VESTIGIAL human-judgment columns —
+  nothing reads them to decide anything, and no endpoint writes them. The nightly pass
   upserts proposals by `(report_id, fingerprint)` and resets all three in the SAME
   `on_conflict` clause. A re-derived proposal is a NEW machine claim: carrying an
   earlier `approved` across it would let refreshed content inherit an approval nobody

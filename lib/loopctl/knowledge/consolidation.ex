@@ -265,10 +265,16 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   ## Why the winner is recomputed here, not read from the proposal
 
-  The corpus moves between the scan and the write. Every article in the group is re-checked
-  as still published and still colliding at apply time; a group that no longer holds is
-  skipped, not forced. Reading a winner chosen hours ago would be applying a decision to a
-  corpus that no longer matches it.
+  The corpus moves between the scan and the write, so the winner is picked from the LIVE
+  rows: every article in the group is re-fetched and re-checked as still published, and a
+  group left with fewer than two live published members is skipped, not forced. Reading a
+  winner chosen hours ago would be applying a decision to a corpus that no longer matches it.
+
+  What is NOT re-derived here is the COLLISION: the normalized title / idempotency key is
+  not recomputed at apply time. Collision freshness rests entirely on the two-run agreement
+  gate — a group broken up by a rename drops out of tonight's report and can never be
+  confirmed — which is why the worker calls this only after tonight's report was written
+  (`Loopctl.Workers.KnowledgeLintWorker`).
   """
   @spec apply_confirmed_duplicates(Ecto.UUID.t(), keyword()) :: %{
           applied: non_neg_integer(),
@@ -366,15 +372,37 @@ defmodule Loopctl.Knowledge.Consolidation do
     end
   end
 
+  # A per-article failure stays per-article, and says why. `Knowledge.unpublish_article/3`
+  # can return a THREE-element `{:error, :unprocessable_entity, msg}` — an article archived
+  # or superseded by another actor between the SELECT above and the locked fetch inside the
+  # transition — so a `case` matching only 2-tuples raised a CaseClauseError out of the whole
+  # apply, losing every remaining confirmed group for that tenant to the worker's blanket
+  # rescue. The reason is logged as a low-cardinality TAG (never the raw message), because a
+  # systematically failing apply is otherwise indistinguishable from a night with nothing to
+  # apply.
   defp unpublish_duplicate(tenant_id, loser) do
     case Knowledge.unpublish_article(tenant_id, loser.id,
            actor_type: "system",
            actor_label: "worker:consolidation"
          ) do
-      {:ok, _} -> true
-      {:error, _} -> false
+      {:ok, _} ->
+        true
+
+      other ->
+        Logger.warning(
+          "Consolidation: tenant=#{tenant_id} could not unpublish duplicate #{loser.id} " <>
+            "(#{unpublish_error_tag(other)}); left published."
+        )
+
+        false
     end
   end
+
+  defp unpublish_error_tag({:error, reason, _message}) when is_atom(reason), do: to_string(reason)
+  defp unpublish_error_tag({:error, reason}) when is_atom(reason), do: to_string(reason)
+  # Everything else the callee can return is a changeset (a rejected transition or a failed
+  # validation). Tagged, never inspected: the log stays low-cardinality either way.
+  defp unpublish_error_tag(_other), do: "invalid"
 
   @doc """
   Reads a persisted report and its proposals. Never recomputes.
@@ -513,10 +541,24 @@ defmodule Loopctl.Knowledge.Consolidation do
   # The EMPTY normalized key is still excluded, and that exclusion is still load-bearing:
   # a title made only of symbols or emoji ("🚀", "!!!") normalizes to the empty string
   # under either class, and without the guard those all land in one group.
+  #
+  # PLACEHOLDER keys are excluded for the same reason, one step up: "Untitled Document" and
+  # "untitled document!" survive the case-sensitive active-title unique index, normalize to
+  # one key, and would group as "the same capture under title drift" — so the one class that
+  # applies itself would unpublish UNRELATED articles whose only shared property is a missing
+  # title, and the two-run gate would agree with itself because the grouping is deterministic.
+  # A shared placeholder title is evidence of a missing title, not of a duplicate capture;
+  # `generic_titles/2` reports exactly this set, under the class that applies nothing.
   defp title_drift_groups(tenant_id) do
     from(a in published_base(tenant_id),
       where:
         fragment("btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g')) <> ''", a.title),
+      where:
+        fragment(
+          "btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g')) !~ ?",
+          a.title,
+          ^@generic_title_pattern
+        ),
       group_by: fragment("btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g'))", a.title),
       having: count(a.id) > 1,
       select: %{ids: fragment("array_agg(?::text ORDER BY ?)", a.id, a.inserted_at)}

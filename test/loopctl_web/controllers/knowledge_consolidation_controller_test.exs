@@ -38,8 +38,10 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       assert body["data"]["persisted_count"] == 1
       assert body["data"]["proposals_by_class"]["generic_title"] == 1
       assert body["meta"]["total_count"] == 1
-      # Stage 1 applies nothing.
-      assert body["meta"]["applied"] == false
+      # No `applied` flag: a report records what was PROPOSED. The hardcoded `false` this
+      # used to carry became a lie the moment the pass started unpublishing duplicates
+      # (#608), and it is the field a program reads instead of the description.
+      refute Map.has_key?(body["meta"], "applied")
 
       assert [proposal] = body["data"]["proposals"]
       assert proposal["number"] == 1

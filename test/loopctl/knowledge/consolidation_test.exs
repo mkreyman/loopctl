@@ -758,6 +758,33 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert status(a.id) == :published, "the survivor must never be unpublished"
     end
 
+    test "placeholder titles never become a duplicate group, so they are never applied" do
+      # "Untitled Document" and "untitled document!" both survive the case-sensitive
+      # active-title index and normalize to ONE key. Grouping them would make the one
+      # auto-applying class unpublish unrelated articles whose only shared property is a
+      # MISSING title — and the two-run gate would agree with itself, because the grouping is
+      # deterministic. They belong to `:generic_title`, which applies nothing.
+      tenant = fixture(:tenant)
+
+      a =
+        published(tenant.id, %{
+          title: "Untitled Document",
+          body: String.duplicate("long body ", 20)
+        })
+
+      b = published(tenant.id, %{title: "untitled document!", body: "unrelated, and short"})
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, analysis} = Consolidation.analyze(tenant.id)
+      assert proposals_of(analysis, :duplicate_capture) == []
+      assert length(proposals_of(analysis, :generic_title)) == 2
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{applied: 0, skipped: 0} = Consolidation.apply_confirmed_duplicates(tenant.id)
+      assert status(a.id) == :published
+      assert status(b.id) == :published
+    end
+
     test "the unpublish is REVERSIBLE, which is the whole reason this class may auto-apply" do
       tenant = fixture(:tenant)
       {_a, b} = duplicate_pair(tenant.id)

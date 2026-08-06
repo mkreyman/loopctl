@@ -10,6 +10,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.Consolidation
   alias Loopctl.MockArticleSimilaritySearch
   alias Loopctl.Workers.KnowledgeLintWorker
 
@@ -183,7 +184,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert entry.new_state["orphans_embedding_enqueued"] == 3
     end
 
-    test "#584: runs the consolidation pass inside the SAME nightly run, report-only" do
+    test "#584: runs the consolidation pass inside the SAME nightly run" do
       tenant = fixture(:tenant)
       published_article_with_embedding(tenant.id, similar_embedding(), %{title: "Retry Policy"})
       published_article_with_embedding(tenant.id, similar_embedding(), %{title: "retry-policy!"})
@@ -219,6 +220,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert entry.new_state["consolidation"]["proposal_count"] == 1
       assert entry.new_state["consolidation"]["persisted_count"] == 1
       assert entry.new_state["consolidation"]["day"] == Date.to_iso8601(Date.utc_today())
+
+      # ...and the APPLY's own tally, which the proposal counts cannot express: nothing was
+      # applied here because only one report exists, so nothing has been confirmed twice.
+      # Without these keys a systematically failing apply looks exactly like a quiet night.
+      assert entry.new_state["consolidation"]["duplicates_unpublished"] == 0
+      assert entry.new_state["consolidation"]["duplicate_groups_skipped"] == 0
     end
 
     # The consolidation stage runs AFTER the effectful steps (orphan re-link, conflict
@@ -251,6 +258,45 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert entry.new_state["summary"]["total_articles"] == 2
       assert entry.new_state["consolidation"]["status"] == "failed"
       assert is_binary(entry.new_state["consolidation"]["error"])
+    end
+
+    # The apply reads the two most recent reports. If a failed scan could fall through to it,
+    # those two rows are last night and the night before — the two-run agreement gate would
+    # silently become "two STALE reports agree" and unpublish on evidence nobody re-derived,
+    # every night the scan keeps failing.
+    test "#608: a failed consolidation scan does NOT apply against two stale reports" do
+      tenant = fixture(:tenant)
+
+      a =
+        published_article_with_embedding(tenant.id, similar_embedding(), %{
+          title: "Retry Policy",
+          body: String.duplicate("long winner body ", 20)
+        })
+
+      b =
+        published_article_with_embedding(tenant.id, similar_embedding(), %{
+          title: "retry-policy!",
+          body: "short"
+        })
+
+      # Two prior nights already agree on the duplicate group, so an ungated apply would fire.
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -2))
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+
+      cap = TenantGate.cap()
+      assert TenantGate.acquire(tenant.id, cap, cap) == :ok
+
+      try do
+        assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      after
+        TenantGate.release(tenant.id, cap)
+      end
+
+      assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["consolidation"]["status"] == "failed"
+
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, a.id).status == :published
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, b.id).status == :published
     end
 
     test "handles a tenant with no published articles" do

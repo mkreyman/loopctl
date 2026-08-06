@@ -1,9 +1,16 @@
 defmodule LoopctlWeb.KnowledgeConsolidationJSON do
   @moduledoc """
-  JSON rendering for the nightly consolidation report (#584 stage 1).
+  JSON rendering for the nightly consolidation report (#584, #608).
 
   Every count rendered here is a count of PROPOSALS, never of articles — see the
   endpoint's OpenAPI description for each denominator.
+
+  `meta` carries NO `applied` flag. It used to carry a hardcoded `applied: false`,
+  written when the pass was report-only; since #608 the pass unpublishes confirmed
+  duplicates, so that field asserted the opposite of what had happened and it is the
+  field a program reads instead of the prose. A report row records what was PROPOSED
+  and cannot say what was applied — the apply tally rides the worker's
+  `knowledge.lint_completed` audit event.
   """
 
   @doc "Renders a consolidation report with its numbered proposals."
@@ -24,7 +31,7 @@ defmodule LoopctlWeb.KnowledgeConsolidationJSON do
         max_per_class: report.max_per_class,
         proposals: Enum.map(proposals, &render_proposal/1)
       },
-      meta: %{total_count: total, report_available: true, applied: false}
+      meta: %{total_count: total, report_available: true}
     }
   end
 

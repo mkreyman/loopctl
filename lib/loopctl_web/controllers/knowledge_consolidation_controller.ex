@@ -1,14 +1,16 @@
 defmodule LoopctlWeb.KnowledgeConsolidationController do
   @moduledoc """
-  Read surface for the nightly consolidation ("dream") pass — #584 stage 1.
+  Read surface for the nightly consolidation ("dream") pass (#584, #605, #608).
 
   - `GET /api/v1/knowledge/consolidation` — the tenant's most recent consolidation
     report and its numbered proposals (orchestrator+)
 
-  This endpoint READS persisted rows only. It never runs the pass: consolidation is a
-  whole-corpus job and belongs in the nightly worker, not in a request path. Stage 1
-  applies nothing — every proposal is `pending`, and there is no endpoint here that
-  could approve or apply one.
+  THIS ENDPOINT applies nothing and reads persisted rows only. It never runs the pass:
+  consolidation is a whole-corpus job and belongs in the nightly worker, not in a
+  request path. The PASS it reports on does write: since #608 it UNPUBLISHES the losers
+  of each `duplicate_capture` group two consecutive reports both propose. `review_status`
+  is vestigial — there is no approve/reject surface and there will not be one (#605
+  supersedes #594); auto-apply is gated on reversibility and two-run agreement.
   """
 
   use LoopctlWeb, :controller
@@ -62,7 +64,10 @@ defmodule LoopctlWeb.KnowledgeConsolidationController do
         "— lower than `proposal_count` exactly when a class hit `report.max_per_class`, " <>
         "which `report.truncated` flags per class. `meta.total_count` is the number of " <>
         "persisted proposals matching the `class` filter, so it is bounded by " <>
-        "`persisted_count`, never by `proposal_count`.\n\n" <>
+        "`persisted_count`, never by `proposal_count`. `meta` carries NO `applied` " <>
+        "flag: a report records what was PROPOSED, and whether a proposal was acted on " <>
+        "depends on the previous night's report agreeing — the apply tally is in the " <>
+        "worker's `knowledge.lint_completed` audit event.\n\n" <>
         "REVIEW STATE RESET — `review_status` / `reviewed_by` / `reviewed_at` are reset " <>
         "to `pending` / null whenever the nightly pass re-derives a proposal, so refreshed " <>
         "machine output can never inherit an earlier verdict.\n\n" <>

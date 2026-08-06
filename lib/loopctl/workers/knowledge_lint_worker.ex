@@ -162,9 +162,14 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     judged = judge_redundant_conflicts(tenant_id)
     resolutions_applied = Knowledge.execute_conflict_resolutions(tenant_id)
     consolidation = consolidate(tenant_id)
-    # Apply AFTER consolidate/2 wrote tonight's report, so the two-run confirmation compares
-    # tonight against last night rather than last night against the night before.
-    applied = apply_consolidation(tenant_id)
+    # Apply AFTER consolidate/1 wrote tonight's report, so the two-run confirmation compares
+    # tonight against last night rather than last night against the night before — and ONLY
+    # when it did. `consolidate/1` is fail-soft, and on a tenant whose scans deterministically
+    # fail (statement timeout, in-flight shed, checkout exit) the two most recent reports are
+    # last night and the night before: the agreement gate would silently degrade to "two stale
+    # reports agree" and unpublish on evidence nobody re-derived, every night the scan keeps
+    # failing.
+    applied = apply_consolidation(tenant_id, consolidation)
 
     log_audit_event(
       tenant_id,
@@ -173,7 +178,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       promoted,
       judged,
       resolutions_applied,
-      consolidation
+      consolidation,
+      applied
     )
 
     Logger.info(
@@ -494,28 +500,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     |> MapSet.new()
   end
 
-  # Writes the consolidation report + its proposal rows and nothing else. The APPLY is a
-  # separate step (`apply_consolidation/1`, below) on purpose: this one must run first so
-  # the two-run agreement gate compares tonight against last night. It scans the corpus
-  # itself and takes no input from the lint report above — `:stale_entry` was the only
-  # class that needed one, and #605 retired it.
+  # Runs ONLY on a report written tonight — see the call site in `lint_tenant/1` for why a
+  # failed `consolidate/1` must not fall through to an apply against two stale reports.
   #
-  # FAIL-SOFT, and that is the whole point of the rescue/catch: by the time this runs,
-  # `lint_tenant/1` has ALREADY taken its effectful steps (orphan re-link enqueues,
-  # conflict promotions, applied resolutions) and has NOT yet written its audit event.
-  # Letting a raise out of this stage — a statement timeout on a large
-  # corpus, an in-flight shed, an AdminRepo checkout exit — would skip
-  # `log_audit_event/6` entirely, so the change feed would show NO lint for that tenant
-  # that night even though state changed, and Oban's retries would redo the effectful
-  # steps each time. A tenant whose corpus deterministically times out these scans would
-  # lose the pre-existing pass's observability permanently. The failure is recorded in
-  # the audit event instead, as a low-cardinality TAG (never the raw error, which carries
-  # backend host / database / role).
-  # FAIL-SOFT like consolidate/2 above, and for the same reason: this is the first thing in
+  # FAIL-SOFT like `consolidate/1` below, and for the same reason: this is the first thing in
   # the nightly run that WRITES to `articles`, and a raise here must not abort a pass whose
   # other steps already succeeded. A failure costs one night of duplicate cleanup, which is
   # the cheapest thing in the run to lose.
-  defp apply_consolidation(tenant_id) do
+  defp apply_consolidation(_tenant_id, {:error, _tag}), do: %{applied: 0, skipped: 0}
+
+  defp apply_consolidation(tenant_id, {:ok, _report}) do
     Consolidation.apply_confirmed_duplicates(tenant_id)
   rescue
     e ->
@@ -535,6 +529,23 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       %{applied: 0, skipped: 0}
   end
 
+  # Writes the consolidation report + its proposal rows and nothing else. The APPLY is a
+  # separate step (`apply_consolidation/2`, above) on purpose: this one must run first so
+  # the two-run agreement gate compares tonight against last night. It scans the corpus
+  # itself and takes no input from the lint report above — `:stale_entry` was the only
+  # class that needed one, and #605 retired it.
+  #
+  # FAIL-SOFT, and that is the whole point of the rescue/catch: by the time this runs,
+  # `lint_tenant/1` has ALREADY taken its effectful steps (orphan re-link enqueues,
+  # conflict promotions, applied resolutions) and has NOT yet written its audit event.
+  # Letting a raise out of this stage — a statement timeout on a large
+  # corpus, an in-flight shed, an AdminRepo checkout exit — would skip
+  # `log_audit_event/8` entirely, so the change feed would show NO lint for that tenant
+  # that night even though state changed, and Oban's retries would redo the effectful
+  # steps each time. A tenant whose corpus deterministically times out these scans would
+  # lose the pre-existing pass's observability permanently. The failure is recorded in
+  # the audit event instead, as a low-cardinality TAG (never the raw error, which carries
+  # backend host / database / role).
   defp consolidate(tenant_id) do
     max_per_class =
       Application.get_env(
@@ -569,23 +580,30 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
   # Counts of PROPOSALS (not articles): `proposal_count` is the true pre-cap total
   # across classes, `persisted_count` the rows actually written (lower only when a class
-  # hit its cap). These are PROPOSAL counts only — a proposal here may or may not have been
-  # applied tonight, since applying also requires last night's report to have agreed. The
-  # apply's own tally rides the summary log line (`duplicates_unpublished` /
-  # `duplicate_groups_skipped`), and each individual unpublish writes its own audit event
-  # through `Knowledge.unpublish_article/3` (`actor_label: "worker:consolidation"`).
-  defp consolidation_state({:ok, consolidation}) do
+  # hit its cap). A proposal counted here may or may not have been applied tonight, since
+  # applying also requires last night's report to have agreed — so the APPLY carries its own
+  # tally (`duplicates_unpublished` / `duplicate_groups_skipped`) in this same event, which
+  # is the surface an auditor reads. Without it, a systematically failing apply is
+  # indistinguishable from a night with nothing to apply. Each individual unpublish also
+  # writes its own audit event through `Knowledge.unpublish_article/3`
+  # (`actor_label: "worker:consolidation"`).
+  defp consolidation_state({:ok, consolidation}, applied) do
     %{
       "status" => "ok",
       "day" => Date.to_iso8601(consolidation.day),
       "proposal_count" => consolidation.proposal_count,
       "persisted_count" => consolidation.persisted_count,
       "by_class" => consolidation.proposals_by_class,
-      "truncated" => consolidation.truncated
+      "truncated" => consolidation.truncated,
+      "duplicates_unpublished" => applied.applied,
+      "duplicate_groups_skipped" => applied.skipped
     }
   end
 
-  defp consolidation_state({:error, tag}), do: %{"status" => "failed", "error" => tag}
+  # No report tonight means no apply ran at all (`apply_consolidation/2` is gated on the
+  # `{:ok, _}`), so there is no tally to record here.
+  defp consolidation_state({:error, tag}, _applied),
+    do: %{"status" => "failed", "error" => tag}
 
   defp log_audit_event(
          tenant_id,
@@ -594,7 +612,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
          promoted,
          judged,
          resolutions_applied,
-         consolidation
+         consolidation,
+         applied
        ) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "knowledge_lint",
@@ -614,7 +633,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         # revisiting — that is not visible from either number alone.
         "conflicts_judged_redundant" => judged,
         "resolutions_applied" => resolutions_applied,
-        "consolidation" => consolidation_state(consolidation)
+        "consolidation" => consolidation_state(consolidation, applied)
       }
     })
   end

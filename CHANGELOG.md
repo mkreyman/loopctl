@@ -35,7 +35,10 @@ Operator-facing changes for deployments outside the hosted instance.
   read. That inheritance does NOT outlive the article: evidence is re-checked against the live
   published corpus on every read, and an entry whose article has since been hard-deleted,
   archived or unpublished comes back redacted (title null, empty excerpt, `redacted: true`),
-  including in prior-day reports read via `?day=`. Per-class proposal cap is configurable via `:knowledge_consolidation_max_per_class`
+  including in prior-day reports read via `?day=`. The response `meta` carries NO `applied`
+  flag: a report records what was PROPOSED, and the apply tally rides the worker's
+  `knowledge.lint_completed` audit event as `consolidation.duplicates_unpublished` /
+  `consolidation.duplicate_groups_skipped`. Per-class proposal cap is configurable via `:knowledge_consolidation_max_per_class`
   (default 100, hard max 500); over-cap is logged with the true total, never silently dropped.
 
 ### Changed

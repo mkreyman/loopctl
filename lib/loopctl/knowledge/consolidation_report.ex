@@ -11,7 +11,8 @@ defmodule Loopctl.Knowledge.ConsolidationReport do
 
   Nothing here records the apply: the counts below are what was PROPOSED, and a proposal in
   this report may or may not have been acted on tonight depending on whether last night's
-  report agreed. The apply's own tally goes to the worker's audit event.
+  report agreed. The apply's own tally goes to the worker's `knowledge.lint_completed` audit
+  event, as `consolidation.duplicates_unpublished` / `consolidation.duplicate_groups_skipped`.
 
   ## Denominators (state them, do not infer them — #582/#1faa4808)
 
