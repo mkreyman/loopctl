@@ -197,12 +197,16 @@ articles and produces the abstraction they share. That is the actual dream, stil
 argued the opposite, and the correction is worth keeping because it is the cleanest example
 in the whole exercise of a fix that reasoned beautifully and measured to nothing.
 
-The argument was: 79,250 articles scanned nightly to find ~750 things, two of the three scans
-`GROUP BY regexp_replace(...)` and therefore unindexable, and only ~20 articles changed that
-day. Prioritised replay says scan the *delta*. Every step of that is true. Then it was timed
-on the hosted corpus: title drift 1,955 ms, idempotency drift 13 ms, placeholder titles 920
-ms — **~2.9 seconds, once a night**, on a pool provisioned for exactly this. There is no cost
-to recover.
+The argument was: ~79,000 articles scanned nightly to find a few hundred things, two of the
+three scans `GROUP BY regexp_replace(...)` and therefore unindexable, and only ~20 articles
+changed that day. Prioritised replay says scan the *delta*. Every step of that is true. Then
+it was timed on the hosted corpus, and the whole set came back in **a few seconds, once a
+night**, on a pool provisioned for exactly this. There is no cost to recover.
+
+(The live figure belongs in one place and this is not it — `Loopctl.Knowledge.Consolidation`'s
+moduledoc carries the current per-scan timings, and it has already moved once as predicates
+were folded together. A number copied into a research note is a number that will be wrong
+here while being right there.)
 
 Worse, building it would have *cost* correctness. Auto-apply requires two consecutive runs to
 propose the same group; a delta scan drops any group whose articles did not change between

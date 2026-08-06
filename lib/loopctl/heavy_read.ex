@@ -209,9 +209,10 @@ defmodule Loopctl.HeavyRead do
   streamed-export scans), and
   `:consolidation` (the #584 nightly consolidation pass's whole-corpus enumerations —
   two GROUP BYs over a `regexp_replace` normalization of every published title /
-  idempotency key, the conflict-link and judged-pair scans, and a POSIX-regex title scan;
+  idempotency key, a POSIX-regex placeholder-title scan, and the published-corpus count;
   unindexable by construction, which is why they do not belong on AdminRepo's 3-connection
-  pool), and
+  pool. The conflict-link and judged-pair scans this used to list moved to
+  `KnowledgeLintWorker` on AdminRepo with #606 and never reach this endpoint), and
   `:llm_usage` (the customer-facing LLM-usage aggregate over `llm_usage_events`, a
   bounded indexed COUNT/GROUP BY — classified LIGHT by the gate), and `:graph_lane` (the
   #470 opt-in graph-neighbor lane of `search_combined/3`: a bounded, index-backed
