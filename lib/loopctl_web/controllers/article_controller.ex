@@ -12,8 +12,9 @@ defmodule LoopctlWeb.ArticleController do
   - `DELETE /api/v1/articles/:id` -- archive article / soft delete (agent+)
 
   Role note: the whole KB *content* surface (create/update/archive/soft-delete)
-  is `agent+`. Each is a reversible, audited curation op — a soft delete only
-  sets `status: :archived` and retains the row — so agents may fully self-serve
+  is `agent+`. Each is a non-destructive, audited curation op — a soft delete only
+  sets `status: :archived` and retains the row (that status is TERMINAL: restoring
+  it takes a `user+` PATCH, so non-destructive is not reversible) — so agents may fully self-serve
   the wiki. Irreversible / custody ops stay `user`-gated elsewhere (bulk HARD
   delete, tenant/project delete). An agent editing/archiving is additionally
   scoped by article visibility (it cannot touch another agent's `private`/`owner`
@@ -53,8 +54,8 @@ defmodule LoopctlWeb.ArticleController do
   @valid_statuses Article |> Ecto.Enum.values(:status) |> Enum.map(&to_string/1)
   @valid_categories Article |> Ecto.Enum.values(:category) |> Enum.map(&to_string/1)
 
-  # KB content curation (create/update/soft-delete) is agent+ — all reversible,
-  # audited ops (#331). Visibility scoping (below) keeps an agent off another
+  # KB content curation (create/update/soft-delete) is agent+ — all non-destructive,
+  # audited ops (#331; NOT reversible — `:archived` is terminal). Visibility scoping (below) keeps an agent off another
   # agent's private memory.
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent]
@@ -338,7 +339,9 @@ defmodule LoopctlWeb.ArticleController do
     summary: "Archive article",
     description:
       "Archives an article (soft delete — sets status: archived, retains the row; " <>
-        "reversible and audited). Role: agent+ (an agent may only archive articles it " <>
+        "non-destructive and audited, but NOT reversible: archived is terminal and " <>
+        "restoring takes a user+ PATCH with an explicit status). " <>
+        "Role: agent+ (an agent may only archive articles it " <>
         "can see — another agent's private/owner memory 404s).",
     parameters: [id: [in: :path, type: :string, description: "Article UUID"]],
     responses: %{

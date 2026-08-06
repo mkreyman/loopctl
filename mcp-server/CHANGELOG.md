@@ -5,6 +5,42 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.71.0 — 2026-08-05 (consolidation: two classes retired, and the pass now writes)
+
+### Changed
+
+- **`knowledge_consolidation` no longer describes itself as report-only, and lists two
+  classes instead of four** (loopctl issues #605, #606, #608). Nothing about the tool's
+  arguments or response shape changed — the description did, because what it reports on did.
+  - **The pass writes now.** The nightly run UNPUBLISHES the losers of each
+    `duplicate_capture` group that two consecutive reports both propose. That is its only
+    write to articles; it is an unpublish and never an archive, because `archived` is
+    terminal for an article and an unattended pass may not take a one-way door. The TOOL
+    still applies nothing and recomputes nothing.
+  - **`contradiction_candidate` is retired** — the nightly lint judges those pairs itself, so
+    consolidation was reporting a pile another writer was already draining.
+  - **`stale_entry` is retired** — age is not a defect signal, so the class could never earn
+    an apply path. For stale articles call `knowledge_lint`, which computes them with a
+    caller-chosen `stale_days`.
+  - Both retired values are still accepted by the `class` filter and still load from
+    historical reports; they are simply never produced again.
+  - **`review_status` is vestigial.** Nothing reads it to decide anything, and there is no
+    approve/reject surface — auto-apply is gated on reversibility and two-run agreement, not
+    on an approval. It still resets to pending whenever the pass re-derives a proposal.
+
+- **`knowledge_delete` and `knowledge_bulk_delete` no longer call archiving "reversible"**
+  (loopctl issue #605). `knowledge_archive` was corrected in 2.70.0's tree; these two said
+  the same wrong thing and are the sentence a caller reads before archiving something it
+  cannot bring back. `:archived` is a TERMINAL article status — there is no unarchive call
+  and no outbound transition, so restoring one takes a user-role PATCH with an explicit
+  status. Nothing is destroyed and everything is audited; that is what makes single-article
+  curation agent-role. When you need a retraction you can actually undo, use
+  `knowledge_unpublish` / `knowledge_publish`. No behaviour change — the API always worked
+  this way, only the descriptions were wrong. The same correction lands on
+  `knowledge_bulk_delete`'s `hard` parameter (which still advertised a "default reversible
+  archive" one screen below the corrected tool description) and on `knowledge_update`, whose
+  in-place edit overwrites the prior body and so is not reversible either.
+
 ## 2.70.0 — 2026-08-05 (the idem- tag namespace is reserved)
 
 ### Changed

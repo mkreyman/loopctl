@@ -8,25 +8,40 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Added
 
-- **`GET /api/v1/knowledge/consolidation` — the nightly consolidation ("dream") report,
-  REPORT-ONLY (#584, stage 1 of 3).** The existing nightly knowledge pass (04:00 UTC,
+- **`GET /api/v1/knowledge/consolidation` — the nightly consolidation ("dream") report
+  (#584, #605, #606, #608).** The existing nightly knowledge pass (04:00 UTC,
   `KnowledgeLintWorker`) now also reconciles the tenant's published corpus and emits numbered
   proposals, each naming the articles involved and quoting an excerpt from each as evidence:
-  duplicate captures from title/idempotency-tag format drift, SYSTEM-flagged conflict pairs of
-  published articles with no recorded verdict (the same pairs the conflict-resolution endpoint
-  accepts, so a proposal never names one it would refuse), placeholder titles, and stale entries. **It writes nothing** to `articles`,
-  `article_links` or `conflict_resolutions` — the only writes are the report itself. Deliberately
-  NOT a second scheduler: it reuses the lint report from the same run, so there is still one
-  nightly job per tenant over the corpus. Migration
+  duplicate captures from title/idempotency-tag format drift, and placeholder titles.
+  **Operators should know the pass now writes to `articles`, in exactly one way:** it
+  UNPUBLISHES the losers of each duplicate group that two consecutive nightly reports both
+  propose (bounded at 25 groups per run, winner recomputed at apply time against the live
+  corpus). It is an unpublish and never an archive — `archived` is terminal for an article,
+  so an unattended pass may not take that one-way door, while unpublish is undone by
+  publishing. Nothing else is written: no `article_links`, no `conflict_resolutions`. There
+  is no approve/reject surface and there will not be one; `review_status` persists but
+  decides nothing. Two proposal classes were retired before ever reaching a release:
+  `contradiction_candidate` (the same nightly run's lint judges those pairs itself, so
+  consolidation was reporting a pile another writer already drains) and `stale_entry` (age is
+  not a defect signal — use `GET /api/v1/knowledge/lint`, which computes staleness with a
+  caller-chosen `stale_days`). Both values still load from stored rows and are still accepted
+  by the `class` filter. Deliberately NOT a second scheduler: it runs inside the existing
+  nightly job, so there is still one pass per tenant over the corpus. Migration
   `20260805140000_create_consolidation_reports.exs` adds `consolidation_reports` and
   `consolidation_proposals` (both RLS-enabled, tenant-scoped, cascading on tenant delete); no
   manual step. Note for operators: proposal rows persist a 240-character excerpt of each
   cited article body alongside the article ids, so the report inherits the sensitivity of the
   articles it cites — it is tenant-scoped and orchestrator-gated like every other knowledge
   read. That inheritance does NOT outlive the article: evidence is re-checked against the live
-  published corpus on every read, and an entry whose article has since been hard-deleted,
-  archived or unpublished comes back redacted (title null, empty excerpt, `redacted: true`),
-  including in prior-day reports read via `?day=`. Per-class proposal cap is configurable via `:knowledge_consolidation_max_per_class`
+  corpus on every read, and an entry whose article has since been hard-deleted or
+  archived comes back redacted (title null, empty excerpt, `redacted: true`),
+  including in prior-day reports read via `?day=`. A draft is still live — the pass's own
+  unpublish must not blank the evidence for the action it took. The response `meta` carries NO `applied`
+  flag: a report records what was PROPOSED, and the apply tally rides the worker's
+  `knowledge.lint_completed` audit event as `consolidation.duplicates_unpublished` /
+  `consolidation.duplicate_groups_skipped` / `consolidation.duplicates_unpublish_failed`
+  (plus `consolidation.apply_error` when the apply could not run at all) — the failure keys
+  are what separate a night where every write was rejected from a night with nothing to apply. Per-class proposal cap is configurable via `:knowledge_consolidation_max_per_class`
   (default 100, hard max 500); over-cap is logged with the true total, never silently dropped.
 
 ### Changed

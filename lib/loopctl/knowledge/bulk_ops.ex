@@ -215,7 +215,8 @@ defmodule Loopctl.Knowledge.BulkOps do
   `{:ok, %{would_affect: n}}` (plus a `:token`/`:oversized` for `:delete`)
   WITHOUT mutating anything.
 
-  - For `:archive`/`:unpublish` (reversible) — no token, just `would_affect`.
+  - For `:archive`/`:unpublish` (non-destructive — `:unpublish` is reversible,
+    `:archive` is NOT; see the moduledoc) — no token, just `would_affect`.
   - For `:delete` — if `n <= frozen-token max`, mints a single-use, TTL-bounded
     `BulkDeleteToken` over the frozen sorted ids and returns
     `%{would_affect: n, token: token_id, frozen_ids: ids}`. Over the bound,

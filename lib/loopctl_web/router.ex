@@ -592,7 +592,8 @@ defmodule LoopctlWeb.Router do
     # Knowledge Lint (quality analysis report)
     get "/knowledge/lint", KnowledgeLintController, :lint
 
-    # Nightly consolidation ("dream") report — report-only proposals (#584)
+    # Nightly consolidation ("dream") report (#584, #605). This ENDPOINT is read-only;
+    # the nightly pass it reports on unpublishes confirmed duplicates (#608).
     get "/knowledge/consolidation", KnowledgeConsolidationController, :show
 
     # Knowledge Pipeline (self-learning pipeline status)

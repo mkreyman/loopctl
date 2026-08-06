@@ -10,11 +10,14 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   - `GET /api/v1/knowledge/drafts` -- list draft articles (orchestrator+)
 
   Role note (#331): single-article `archive` and `resolve_conflict` (all
-  dispositions, incl. supersede/merge) are agent+ KB-content curation — reversible
-  + audited (supersede retires via a reversible link; merge produces a DRAFT). The
-  SET-BASED bulk ops (`bulk_delete`, incl. the irreversible HARD-delete path,
-  `bulk_publish`, `bulk_unpublish`) stay `user`-gated: high blast radius / not
-  reversible.
+  dispositions, incl. supersede/merge) are agent+ KB-content curation —
+  NON-DESTRUCTIVE + audited (the row survives; supersede retires via a reversible
+  link; merge produces a DRAFT). Non-destructive is not reversible: `:archived` is
+  TERMINAL (no `{:archived, _}` transition, no unarchive function), so the only way
+  back is a `user+` PATCH — an unattended writer that needs an undo must use
+  `unpublish` (#605/#606). The SET-BASED bulk ops (`bulk_delete`, incl. the
+  irreversible HARD-delete path, `bulk_publish`, `bulk_unpublish`) stay
+  `user`-gated: high blast radius AND irreversible.
   """
 
   use LoopctlWeb, :controller
@@ -39,7 +42,8 @@ defmodule LoopctlWeb.ArticleWorkflowController do
        when action in [:unpublish, :bulk_publish, :bulk_unpublish, :bulk_delete]
 
   # Single-article archive and conflict resolution are agent+ KB curation (#331):
-  # reversible + audited. archive is visibility-scoped in-action.
+  # non-destructive + audited (NOT reversible — `:archived` is terminal).
+  # archive is visibility-scoped in-action.
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent]
        when action in [:archive, :conflicts, :resolve_conflict]
@@ -81,7 +85,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   operation(:archive,
     summary: "Archive article",
     description:
-      "Transitions article to archived status (soft delete — reversible, audited). " <>
+      "Transitions article to archived status (soft delete — the row is retained and " <>
+        "the act is audited, but `archived` is TERMINAL: it has no outbound transition " <>
+        "and there is no unarchive endpoint, so restoring one takes a user+ PATCH with " <>
+        "an explicit status. Use `unpublish` when you need a retraction you can undo). " <>
         "Valid from draft or published. Returns 422 if superseded. Role: agent+ " <>
         "(an agent may only archive an article it can see — another agent's " <>
         "private/owner memory 404s).",
@@ -285,8 +292,8 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         "The KB never re-judges — it acts on your verdict. Last-write-wins per pair. Only " <>
         "pairs the system flagged (GET /knowledge/conflicts) may be resolved; an unknown pair " <>
         "returns 422. All dispositions are agent+ KB-content curation (#331): they are " <>
-        "reversible + audited, and the privileged nightly executor is what actually applies " <>
-        "supersede/merge.",
+        "non-destructive + audited, and the privileged nightly executor is what actually " <>
+        "applies supersede/merge.",
     request_body:
       {"Resolution", "application/json",
        %OpenApiSpex.Schema{
@@ -729,8 +736,8 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   @doc "POST /api/v1/knowledge/conflicts/resolve"
   def resolve_conflict(conn, params) do
     # #331: recording a verdict on a potential-conflict pair — dismiss, supersede,
-    # OR merge — is agent+ KB-content curation. All dispositions are reversible +
-    # audited: supersede retires the loser via a supersedes link (only at
+    # OR merge — is agent+ KB-content curation. All dispositions are non-destructive
+    # + audited: supersede retires the loser via a supersedes link (only at
     # confidence "high", by the privileged nightly executor), and merge produces a
     # new DRAFT (never auto-published). The fabrication guard still stands — only
     # a pair the system flagged as a `:potential_conflict` may be resolved (422

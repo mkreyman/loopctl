@@ -25,7 +25,7 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
       published(tenant.id, %{title: "Untitled Document", body: "Needs a real title."})
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       body =
         conn
@@ -38,8 +38,10 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       assert body["data"]["persisted_count"] == 1
       assert body["data"]["proposals_by_class"]["generic_title"] == 1
       assert body["meta"]["total_count"] == 1
-      # Stage 1 applies nothing.
-      assert body["meta"]["applied"] == false
+      # No `applied` flag: a report records what was PROPOSED. The hardcoded `false` this
+      # used to carry became a lie the moment the pass started unpublishing duplicates
+      # (#608), and it is the field a program reads instead of the description.
+      refute Map.has_key?(body["meta"], "applied")
 
       assert [proposal] = body["data"]["proposals"]
       assert proposal["number"] == 1
@@ -70,7 +72,7 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       published(tenant.id, %{title: "Untitled Document"})
       published(tenant.id, %{title: "Retry Policy"})
       published(tenant.id, %{title: "retry policy"})
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       body =
         conn
@@ -118,7 +120,7 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
 
       published(tenant_b.id, %{title: "Untitled Document", body: "B only."})
-      {:ok, _} = Consolidation.run(tenant_b.id, %{})
+      {:ok, _} = Consolidation.run(tenant_b.id)
 
       body =
         conn
@@ -136,7 +138,7 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
       published(tenant.id, %{title: "Untitled Document", body: "Needs a real title."})
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       body =
         conn
@@ -153,7 +155,7 @@ defmodule LoopctlWeb.KnowledgeConsolidationControllerTest do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
       article = published(tenant.id, %{title: "Untitled Document", body: "SECRET material."})
-      {:ok, _} = Consolidation.run(tenant.id, %{})
+      {:ok, _} = Consolidation.run(tenant.id)
 
       AdminRepo.delete!(article)
 

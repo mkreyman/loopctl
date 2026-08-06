@@ -1786,8 +1786,9 @@ async function knowledgeUnpublish({ article_id }) {
   return toContent(result);
 }
 
-// #331: single-article archive is agent-role KB curation (reversible soft delete,
-// audited, visibility-scoped server-side).
+// #331: single-article archive is agent-role KB curation (non-destructive soft delete,
+// audited, visibility-scoped server-side). NOT reversible in code — #606/#605: `:archived`
+// is a terminal status. The row survives; nothing automated brings it back.
 async function knowledgeArchive({ article_id }) {
   const result = await apiCall(
     "POST",
@@ -4817,7 +4818,9 @@ const TOOLS = [
       "project CLAUDE.mds and cross-links). Send only the fields you want to change; every " +
       "field is optional except article_id. `tags` REPLACES the whole array (send the full " +
       "desired set, not a delta). A changed body/tags re-triggers embedding + auto-linking. " +
-      "Agent role — this is KB-content curation (reversible + audited). Visibility-scoped: " +
+      "Agent role — this is KB-content curation (non-destructive + audited: the edit is in " +
+      "place and there is no version-restore endpoint, but the prior body is retained in the " +
+      "article.updated audit entry). Visibility-scoped: " +
       "you can only edit an article you can see, so another agent's private/owner memory " +
       "returns 404. `tenant_id` is never accepted. Returns the full updated article. To " +
       "instead retire/replace an article, use knowledge_archive or knowledge_resolve_conflict.",
@@ -5225,10 +5228,13 @@ const TOOLS = [
     name: "knowledge_delete",
     description:
       "Delete an article. Under the hood this performs the same soft-delete (archive) " +
-      "as knowledge_archive — use whichever name is clearer at the call site. The row " +
-      "is retained for audit; there is no hard delete (that is knowledge_bulk_delete " +
-      "hard:true, which stays user-gated). Agent role — KB-content curation, reversible + " +
-      "audited, visibility-scoped (another agent's private/owner memory 404s).",
+      "as knowledge_archive — use whichever name is clearer at the call site, and note " +
+      "that it inherits archive's terminality: the row is retained for audit, but " +
+      "`:archived` has no outbound transition, so NOTHING you can call restores it. " +
+      "For a retraction you can undo, use knowledge_unpublish instead. There is no hard " +
+      "delete here (that is knowledge_bulk_delete hard:true, which stays user-gated). " +
+      "Agent role — KB-content curation: non-destructive + audited, visibility-scoped " +
+      "(another agent's private/owner memory 404s).",
     inputSchema: {
       type: "object",
       properties: {
@@ -5243,7 +5249,9 @@ const TOOLS = [
   {
     name: "knowledge_bulk_delete",
     description:
-      "Bulk archive (default, reversible) or IRREVERSIBLE hard-delete of articles by selector. " +
+      "Bulk archive (default, non-destructive but NOT reversible by any call you can make — " +
+      "`:archived` is terminal; restoring needs a user-role PATCH) or IRREVERSIBLE hard-delete " +
+      "of articles by selector. " +
       "REQUIRES LOOPCTL_USER_KEY (user role — orchestrator is NOT sufficient). Provide EXACTLY ONE " +
       "selector: article_ids (explicit list), source_type + source_id (every active article from " +
       "that source), or tag + confirm:true (every active article carrying the tag — high blast " +
@@ -5289,8 +5297,9 @@ const TOOLS = [
         hard: {
           type: "boolean",
           description:
-            "IRREVERSIBLE hard delete (vs default reversible archive). Run dry_run first to get a " +
-            "token, then pass hard:true + token.",
+            "IRREVERSIBLE hard delete (vs the default soft archive, which is non-destructive but " +
+            "terminal — `:archived` has no outbound transition, so restoring one needs a user-role " +
+            "PATCH). Run dry_run first to get a token, then pass hard:true + token.",
         },
         token: {
           type: "string",
@@ -5481,16 +5490,21 @@ const TOOLS = [
     description:
       "Read the nightly consolidation (\"dream\") report: NUMBERED proposals for reconciling " +
       "the corpus, each naming the articles involved and quoting an excerpt from each as " +
-      "evidence. REPORT ONLY — the pass writes no articles, links or conflict resolutions, " +
-      "every proposal is `pending`, and this tool applies nothing. Requires orchestrator role.\n\n" +
+      "evidence. THIS TOOL applies nothing and recomputes nothing — it returns persisted rows. " +
+      "The PASS it reports on does write: since #608 the nightly run UNPUBLISHES the losers of " +
+      "each `duplicate_capture` group that two consecutive reports both propose. That is its " +
+      "only write to articles, it is an unpublish and never an archive (archive is terminal for " +
+      "an article), and it still writes no links or conflict resolutions. Requires orchestrator " +
+      "role.\n\n" +
       "Classes: `duplicate_capture` (titles that collide once case/punctuation normalize away, " +
       "or idempotency keys that collide under the same normalization while differing verbatim — " +
       "capture tag-format drift, which the novelty gate does not catch because novelty scoring " +
-      "and idempotency are separate paths); `contradiction_candidate` (a SYSTEM-flagged " +
-      "potential_conflict pair of PUBLISHED articles with no recorded verdict — record one via " +
-      "knowledge_resolve_conflict, which accepts exactly these pairs; this report writes " +
-      "none); `generic_title` (a placeholder title that collides on active-title uniqueness and " +
-      "blocks hub creation); `stale_entry` (past the lint staleness threshold, never reconciled).\n\n" +
+      "and idempotency are separate paths); `generic_title` (a placeholder title that collides " +
+      "on active-title uniqueness and blocks hub creation). Two classes are RETIRED (#605) and " +
+      "no longer produced, though the `class` filter still accepts them so historical reports " +
+      "stay readable: `contradiction_candidate` (the nightly lint judges those pairs itself now) " +
+      "and `stale_entry` (age is not a defect signal — for stale articles call knowledge_lint, " +
+      "which computes them with a caller-chosen `stale_days`).\n\n" +
       "Denominators: `corpus_size` counts PUBLISHED articles owned by the tenant at scan time, " +
       "not its total article count. `proposal_count` is the TRUE pre-cap count of PROPOSALS, not " +
       "of articles — one duplicate group of three articles is ONE proposal, and one article can " +
@@ -5498,8 +5512,11 @@ const TOOLS = [
       "report carries, lower than `proposal_count` exactly when a class hit `max_per_class` " +
       "(`truncated` flags which). `meta.total_count` counts persisted proposals matching the " +
       "`class` filter, so it is bounded by `persisted_count`, never by `proposal_count`.\n\n" +
-      "Review state (`review_status`/`reviewed_by`/`reviewed_at`) RESETS to pending/null whenever " +
-      "the nightly pass re-derives a proposal: refreshed machine output never inherits an approval.",
+      "Review state (`review_status`/`reviewed_by`/`reviewed_at`) is VESTIGIAL: nothing reads it " +
+      "to decide anything, there is no approve/reject surface and there will not be one (#605 " +
+      "supersedes #594) — auto-apply is gated on reversibility and two-run agreement, not on an " +
+      "approval. It still RESETS to pending/null whenever the nightly pass re-derives a proposal, " +
+      "so refreshed machine output can never inherit an earlier verdict.",
     inputSchema: {
       type: "object",
       properties: {

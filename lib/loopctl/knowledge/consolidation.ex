@@ -2,8 +2,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   @moduledoc """
   The nightly consolidation ("dream") pass over a tenant's PUBLISHED corpus (#584, #605).
 
-  It REPORTS on three defect classes, and APPLIES exactly one of them — `:duplicate_capture`,
-  and only as `unpublish`, and only where two consecutive runs agree. Everything else is
+  It REPORTS on two defect classes, and APPLIES exactly one of them — `:duplicate_capture`,
+  and only as `unpublish`, and only where two consecutive runs agree. `:generic_title` is
   report-only. See `apply_confirmed_duplicates/2` for why those three restrictions are the
   whole safety model.
 
@@ -14,7 +14,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   `article_links` or `conflict_resolutions` (the nightly lint judge owns conflicts).
   There is no human approve/reject stage and there will not be one (#605 supersedes
   #594): a queue whose only consumer is a human nobody staffs is the failure this
-  codebase has hit three separate times. Auto-apply is gated on REVERSIBILITY instead —
+  codebase has now hit four separate times (drafts, `potential_conflict`, `:supersede`
+  below `:high`, and `:stale_entry`). Auto-apply is gated on REVERSIBILITY instead —
   a class may apply itself when its write can be undone in code, which is checkable
   without accumulating anyone's approvals.
 
@@ -30,17 +31,18 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   Inside the existing nightly `Loopctl.Workers.KnowledgeLintWorker` run (04:00 UTC,
   `all_tenants` fan-out) — deliberately NOT a second scheduler over the same corpus.
-  It reuses that run's `Knowledge.lint/2` report for the stale class rather than
-  re-scanning, and it never runs in a request path: the API endpoint reads the
-  persisted rows.
+  It never runs in a request path: the API endpoint reads the persisted rows.
 
-  ## The three defect classes
+  ## The two defect classes
 
   | Class | Signal |
   |---|---|
   | `:duplicate_capture` | two published articles whose titles collide once case/punctuation are normalized away, or whose `idempotency_key`s collide under the same normalization while differing verbatim (tag-format drift — novelty scoring and idempotency are separate paths, so the novelty gate does not catch it) |
   | `:generic_title` | a placeholder title, which collides on per-tenant active-title uniqueness and blocks hub creation |
-  | `:stale_entry` | past the lint staleness threshold and never reconciled |
+
+  `:contradiction_candidate` and `:stale_entry` are RETIRED — see the comments beside
+  `title_drift_groups/1` and the proposal-assembly section for why each was withdrawn.
+  Both values stay in the schema enum so historical rows load.
 
   ## Counts and their denominators (#582 discipline)
 
@@ -52,9 +54,9 @@ defmodule Loopctl.Knowledge.Consolidation do
   which the worker logs. `summary.corpus_size` counts PUBLISHED articles owned by
   this tenant — not its total article count.
 
-  One caveat this pass cannot remove: `:stale_entry` is derived from the lint report
-  handed in, so its TRUE total is lint's own pre-cap total, while the proposals it can
-  emit are drawn only from lint's already-capped array.
+  Both remaining classes now derive their own totals from their own scan, so every count
+  here has this pass as its denominator. (`:stale_entry` did not — it re-published lint's
+  already-capped array under lint's threshold — which is one more reason it is gone.)
 
   ## Reads never touch the heat index
 
@@ -71,9 +73,30 @@ defmodule Loopctl.Knowledge.Consolidation do
   `regexp_replace` expression) and `AdminRepo`'s pool is 3 connections shared with every
   other admin op, so an all-tenants nightly fan-out on the shared `:knowledge` queue can
   starve it. `HeavyRead` also gives each scan a `SET LOCAL statement_timeout` and the
-  per-tenant in-flight shed. `analyze/3` holds ONE gate slot across the whole set
+  per-tenant in-flight shed. `analyze/2` holds ONE gate slot across the whole set
   (`with_slot/3`). The evidence fetch stays on `AdminRepo` — it is keyed by a bounded id
   list, not an enumeration — and so do the report/proposal WRITES.
+
+  ## Why the scan is whole-corpus and stays that way
+
+  It looks like the textbook case for a delta scan — 79,276 published articles read every
+  night to surface a few hundred proposals, of which only ~20 were touched that day. It is
+  not, and the reason is measurement rather than taste. TIMED on the hosted corpus
+  2026-08-05, BEFORE the placeholder-title predicate was folded into the title-drift scan:
+  title drift 1,955 ms, idempotency drift 13 ms, placeholder titles 920 ms,
+  corpus count 51 ms — ~2.9 s. That predicate re-does the same normalization the standalone
+  placeholder scan measures, so until it is re-timed bound the total at **~3.9 s, once a
+  night**, on a pool that exists for exactly this. There is no cost problem to solve.
+
+  A delta scan would also cost correctness twice over. `apply_confirmed_duplicates/2`
+  applies only what TWO CONSECUTIVE runs propose, so a group whose articles did not change
+  between runs would drop out of the second report and could never be confirmed — the delta
+  window would have to exceed the run interval just to keep the gate working. And a group
+  nobody has touched in a year would never be scanned again at all, stranding the standing
+  backlog that is most of what the class finds.
+
+  If this ever does get slow, the cheap fix is an expression index on the normalization
+  (the plan is a seq scan plus a 9 MB external-merge sort), NOT a narrower scan.
   """
 
   import Ecto.Query
@@ -81,6 +104,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.ExitTag
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
@@ -109,6 +133,10 @@ defmodule Loopctl.Knowledge.Consolidation do
   # should be visible after one night rather than after the whole corpus.
   @default_max_applies 25
 
+  # How far apart the two agreeing reports may be, in days. One night's gap is normal (a
+  # skipped run); anything wider is not the "two consecutive runs" the gate advertises.
+  @max_confirmation_gap 2
+
   @doc "Default per-class proposal cap."
   @spec default_max_per_class() :: pos_integer()
   def default_max_per_class, do: @default_max_per_class
@@ -132,14 +160,11 @@ defmodule Loopctl.Knowledge.Consolidation do
   @doc """
   Derives the proposals for a tenant. Pure read — touches nothing.
 
-  `lint_report` is a `Loopctl.Knowledge.lint/2` result, reused for the `:stale_entry`
-  class so the nightly run scans the corpus once.
-
   Opts: `:max_per_class` (default #{@default_max_per_class}, hard max
   #{@hard_max_per_class}).
   """
-  @spec analyze(Ecto.UUID.t(), map(), keyword()) :: {:ok, map()}
-  def analyze(tenant_id, lint_report, opts \\ []) do
+  @spec analyze(Ecto.UUID.t(), keyword()) :: {:ok, map()}
+  def analyze(tenant_id, opts \\ []) do
     cap =
       opts
       |> Keyword.get(:max_per_class, @default_max_per_class)
@@ -153,8 +178,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         {corpus_size(tenant_id),
          %{
            duplicate_capture: duplicate_captures(tenant_id, cap),
-           generic_title: generic_titles(tenant_id, cap),
-           stale_entry: stale_entries(tenant_id, lint_report, cap)
+           generic_title: generic_titles(tenant_id, cap)
          }}
       end)
 
@@ -164,11 +188,11 @@ defmodule Loopctl.Knowledge.Consolidation do
       Map.new(found, fn {class, {total, items}} -> {to_string(class), total > length(items)} end)
 
     # Drive the ORDER from the schema enum, but only over classes this pass still PRODUCES.
-    # The enum deliberately retains `:contradiction_candidate` so historical rows still load
-    # (see `ConsolidationProposal`), and a `Map.fetch!` over the full enum would raise on
-    # every run now that the class is retired. `Map.fetch!` is kept for the classes that ARE
-    # present, so a genuinely missing producer still fails loudly rather than silently
-    # emitting a short report.
+    # The enum deliberately retains `:contradiction_candidate` and `:stale_entry` so
+    # historical rows still load (see `ConsolidationProposal`), and a `Map.fetch!` over the
+    # full enum would raise on every run now that both are retired. `Map.fetch!` is kept for
+    # the classes that ARE present, so a genuinely missing producer still fails loudly rather
+    # than silently emitting a short report.
     proposals =
       ConsolidationProposal.classes()
       |> Enum.filter(&Map.has_key?(found, &1))
@@ -203,9 +227,9 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   Opts: `:max_per_class`, `:day` (defaults to today, UTC).
   """
-  @spec run(Ecto.UUID.t(), map(), keyword()) :: {:ok, ConsolidationReport.t()}
-  def run(tenant_id, lint_report, opts \\ []) do
-    {:ok, analysis} = analyze(tenant_id, lint_report, opts)
+  @spec run(Ecto.UUID.t(), keyword()) :: {:ok, ConsolidationReport.t()}
+  def run(tenant_id, opts \\ []) do
+    {:ok, analysis} = analyze(tenant_id, opts)
     day = Keyword.get(opts, :day) || Date.utc_today()
     log_truncation(tenant_id, analysis.summary)
 
@@ -248,52 +272,79 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   ## Why the winner is recomputed here, not read from the proposal
 
-  The corpus moves between the scan and the write. Every article in the group is re-checked
-  as still published and still colliding at apply time; a group that no longer holds is
-  skipped, not forced. Reading a winner chosen hours ago would be applying a decision to a
-  corpus that no longer matches it.
+  The corpus moves between the scan and the write, so the winner is picked from the LIVE
+  rows: every article in the group is re-fetched and re-checked as still published, and a
+  group left with fewer than two live published members is skipped, not forced. Reading a
+  winner chosen hours ago would be applying a decision to a corpus that no longer matches it.
+
+  What is NOT re-derived here is the COLLISION: the normalized title / idempotency key is
+  not recomputed at apply time. Collision freshness rests entirely on the two-run agreement
+  gate — a group broken up by a rename drops out of tonight's report and can never be
+  confirmed — which is why the worker calls this only after tonight's report was written
+  (`Loopctl.Workers.KnowledgeLintWorker`).
   """
   @spec apply_confirmed_duplicates(Ecto.UUID.t(), keyword()) :: %{
           applied: non_neg_integer(),
-          skipped: non_neg_integer()
+          skipped: non_neg_integer(),
+          failed: non_neg_integer()
         }
   def apply_confirmed_duplicates(tenant_id, opts \\ []) do
     cap = Keyword.get(opts, :max_applies, @default_max_applies)
 
     tenant_id
     |> confirmed_duplicate_proposals(cap)
-    |> Enum.reduce(%{applied: 0, skipped: 0}, &tally_apply(tenant_id, &1, &2))
+    |> Enum.reduce(%{applied: 0, skipped: 0, failed: 0}, &tally_apply(tenant_id, &1, &2))
   end
 
+  # `:failed` counts LOSER ARTICLES left published — the counter that separates "nothing was
+  # confirmed" from "everything was confirmed and every write was rejected". Without it both
+  # nights record applied=0/skipped=0 and the audit event, which is the surface an auditor
+  # reads, cannot tell them apart.
+  #
+  # The rescue/catch is here rather than only at the worker's blanket one because this reduce
+  # is NOT transactional: each group's unpublishes commit on their own, so a raise escaping
+  # to the worker discarded the tally of groups that had ALREADY committed and reported zero
+  # unpublishes that really happened. A crashed group applied nothing, so it counts as one
+  # failure and the reduce carries on.
   defp tally_apply(tenant_id, proposal, acc) do
     case apply_duplicate_group(tenant_id, proposal) do
-      {:ok, n} -> %{acc | applied: acc.applied + n}
-      :skip -> %{acc | skipped: acc.skipped + 1}
+      {:ok, applied, failed} ->
+        %{acc | applied: acc.applied + applied, failed: acc.failed + failed}
+
+      :skip ->
+        %{acc | skipped: acc.skipped + 1}
     end
+  rescue
+    e -> group_failed(tenant_id, proposal, ExitTag.tag(e), acc)
+  catch
+    :exit, reason -> group_failed(tenant_id, proposal, "exit:" <> ExitTag.tag(reason), acc)
+  end
+
+  defp group_failed(tenant_id, proposal, tag, acc) do
+    Logger.error(
+      "Consolidation: tenant=#{tenant_id} duplicate_capture proposal ##{proposal.number} " <>
+        "could not be applied (#{tag}); group left published."
+    )
+
+    %{acc | failed: acc.failed + 1}
   end
 
   # Proposals present in BOTH the newest report and the one before it, matched on
   # `fingerprint` — which is derived from the class plus the sorted article-id set, so it is
   # stable across runs precisely when the same group is still being found.
+  #
+  # The previous report must be ADJACENT (`@max_confirmation_gap` days): the gate the
+  # moduledoc advertises is "tonight agreed with last night", and on a tenant whose scans
+  # failed for a fortnight the two most recent reports are tonight and a report from before
+  # the outage — agreement across that gap is not the transience filter this claims to be.
   defp confirmed_duplicate_proposals(tenant_id, cap) do
-    case recent_report_ids(tenant_id) do
+    case recent_reports(tenant_id) do
       [newest, previous] ->
-        previous_fingerprints =
-          from(p in ConsolidationProposal,
-            where: p.tenant_id == ^tenant_id and p.report_id == ^previous,
-            where: p.proposal_class == :duplicate_capture,
-            select: p.fingerprint
-          )
-          |> AdminRepo.all()
-
-        from(p in ConsolidationProposal,
-          where: p.tenant_id == ^tenant_id and p.report_id == ^newest,
-          where: p.proposal_class == :duplicate_capture,
-          where: p.fingerprint in ^previous_fingerprints,
-          order_by: [asc: p.number],
-          limit: ^cap
-        )
-        |> AdminRepo.all()
+        if Date.diff(newest.day, previous.day) <= @max_confirmation_gap do
+          confirmed_against(tenant_id, newest, previous, cap)
+        else
+          []
+        end
 
       _fewer_than_two_reports ->
         # First ever run, or only one report so far: nothing has been confirmed twice, so
@@ -302,12 +353,36 @@ defmodule Loopctl.Knowledge.Consolidation do
     end
   end
 
-  defp recent_report_ids(tenant_id) do
+  defp confirmed_against(tenant_id, newest, previous, cap) do
+    previous_fingerprints =
+      from(p in ConsolidationProposal,
+        where: p.tenant_id == ^tenant_id and p.report_id == ^previous.id,
+        where: p.proposal_class == :duplicate_capture,
+        select: p.fingerprint
+      )
+      |> AdminRepo.all()
+
+    # Ordered by a per-report hash of the fingerprint, NOT by proposal number. A group whose
+    # unpublish is rejected every night keeps being re-derived and keeps its low number, so a
+    # number-ordered cap handed the same 25 losers every slot forever and no other confirmed
+    # group was ever attempted. The hash re-shuffles nightly (the report id is new each run)
+    # while staying deterministic within one run.
+    from(p in ConsolidationProposal,
+      where: p.tenant_id == ^tenant_id and p.report_id == ^newest.id,
+      where: p.proposal_class == :duplicate_capture,
+      where: p.fingerprint in ^previous_fingerprints,
+      order_by: fragment("md5(? || ?::text)", p.fingerprint, ^newest.id),
+      limit: ^cap
+    )
+    |> AdminRepo.all()
+  end
+
+  defp recent_reports(tenant_id) do
     from(r in ConsolidationReport,
       where: r.tenant_id == ^tenant_id,
       order_by: [desc: r.day],
       limit: 2,
-      select: r.id
+      select: %{id: r.id, day: r.day}
     )
     |> AdminRepo.all()
   end
@@ -345,26 +420,57 @@ defmodule Loopctl.Knowledge.Consolidation do
           "#{length(losers)} duplicate(s). Reversible via publish."
       )
 
-      {:ok, applied}
+      {:ok, applied, length(losers) - applied}
     end
   end
 
+  # A per-article failure stays per-article, and says why. `Knowledge.unpublish_article/3`
+  # can return a THREE-element `{:error, :unprocessable_entity, msg}` — an article archived
+  # or superseded by another actor between the SELECT above and the locked fetch inside the
+  # transition — so a `case` matching only 2-tuples raised a CaseClauseError out of the whole
+  # apply, losing every remaining confirmed group for that tenant to the worker's blanket
+  # rescue. The rescue/catch keeps a raise or a checkout exit equally per-article, so the
+  # losers already unpublished in this group stay counted. The reason is logged as a
+  # low-cardinality TAG (never the raw message), and every failure is also counted into the
+  # `failed` tally the audit event carries — the log alone cannot tell a systematically
+  # failing apply from a night with nothing to apply.
   defp unpublish_duplicate(tenant_id, loser) do
     case Knowledge.unpublish_article(tenant_id, loser.id,
            actor_type: "system",
            actor_label: "worker:consolidation"
          ) do
       {:ok, _} -> true
-      {:error, _} -> false
+      other -> log_unpublish_failure(tenant_id, loser, unpublish_error_tag(other))
     end
+  rescue
+    e -> log_unpublish_failure(tenant_id, loser, ExitTag.tag(e))
+  catch
+    :exit, reason -> log_unpublish_failure(tenant_id, loser, "exit:" <> ExitTag.tag(reason))
   end
+
+  defp log_unpublish_failure(tenant_id, loser, tag) do
+    Logger.warning(
+      "Consolidation: tenant=#{tenant_id} could not unpublish duplicate #{loser.id} " <>
+        "(#{tag}); left published."
+    )
+
+    false
+  end
+
+  defp unpublish_error_tag({:error, reason, _message}) when is_atom(reason), do: to_string(reason)
+  defp unpublish_error_tag({:error, reason}) when is_atom(reason), do: to_string(reason)
+  # Everything else the callee can return is a changeset (a rejected transition or a failed
+  # validation). Tagged, never inspected: the log stays low-cardinality either way.
+  defp unpublish_error_tag(_other), do: "invalid"
 
   @doc """
   Reads a persisted report and its proposals. Never recomputes.
 
-  Evidence is re-checked against the live published corpus on the way out: an entry whose
-  article has since been hard-deleted, archived or unpublished is redacted to its id
-  (`"redacted" => true`), so the stored excerpt never outlives the article it quotes.
+  Evidence is re-checked against the live corpus on the way out: an entry whose article has
+  since been hard-deleted or archived is redacted to its id (`"redacted" => true`), so the
+  stored excerpt never outlives the article it quotes. A DRAFT still counts as live — that
+  is what this pass's own unpublish leaves behind, and redacting it would erase the evidence
+  for the very action the pass took.
 
   Opts: `:day` (defaults to the tenant's most recent report), `:class`, `:limit`
   (default 50, max #{@hard_max_per_class}), `:offset` (clamped to #{@max_offset}).
@@ -481,17 +587,39 @@ defmodule Loopctl.Knowledge.Consolidation do
   # whatever incidental ASCII it carries — "日本語ガイド v2" and "中文指南 v2" both become
   # "v2", and "Паттерн Retry" and "Обзор Retry" both become "retry". Unrelated articles
   # then group as "the same capture under title drift", a deterministic false positive in
-  # the class #584 names as the likely first auto-apply candidate, which would poison
-  # exactly the calibration signal stage 2 exists to collect. ASCII behaviour is
-  # identical under both classes ("Retry  Pattern!!" -> "retry pattern").
+  # the ONE class that applies itself (`apply_confirmed_duplicates/2`) — so under the ASCII
+  # class this normalization is what would decide to unpublish two unrelated non-Latin
+  # articles, twice running, and the two-run agreement gate would agree with itself because
+  # the bug is deterministic. ASCII behaviour is identical under both classes
+  # ("Retry  Pattern!!" -> "retry pattern").
+  #
+  # (This comment used to call `:duplicate_capture` "the class #584 names as the likely first
+  # auto-apply candidate", and read the risk as poisoning a human calibration signal. #605
+  # retired that framing: archive is TERMINAL for an article, so the class earned auto-apply
+  # by being restricted to the REVERSIBLE unpublish, not by being ranked first. The
+  # consequence of a false positive got smaller and more immediate, not larger and deferred.)
   #
   # The EMPTY normalized key is still excluded, and that exclusion is still load-bearing:
   # a title made only of symbols or emoji ("🚀", "!!!") normalizes to the empty string
   # under either class, and without the guard those all land in one group.
+  #
+  # PLACEHOLDER keys are excluded for the same reason, one step up: "Untitled Document" and
+  # "untitled document!" survive the case-sensitive active-title unique index, normalize to
+  # one key, and would group as "the same capture under title drift" — so the one class that
+  # applies itself would unpublish UNRELATED articles whose only shared property is a missing
+  # title, and the two-run gate would agree with itself because the grouping is deterministic.
+  # A shared placeholder title is evidence of a missing title, not of a duplicate capture;
+  # `generic_titles/2` reports exactly this set, under the class that applies nothing.
   defp title_drift_groups(tenant_id) do
     from(a in published_base(tenant_id),
       where:
         fragment("btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g')) <> ''", a.title),
+      where:
+        fragment(
+          "btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g')) !~ ?",
+          a.title,
+          ^@generic_title_pattern
+        ),
       group_by: fragment("btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g'))", a.title),
       having: count(a.id) > 1,
       select: %{ids: fragment("array_agg(?::text ORDER BY ?)", a.id, a.inserted_at)}
@@ -534,8 +662,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   # proposals emitted, 15,588 were `:contradiction_candidate` — 95% of the report was a
   # re-derivation of the set the judge drains, truncated at the per-class cap and
   # re-derived identically the next night. The remaining classes (390 duplicate_capture,
-  # 361 stale_entry, 1 generic_title) are consolidation's actual work and were being
-  # crowded out of the report by it.
+  # 361 stale_entry — itself since retired — and 1 generic_title) are consolidation's actual
+  # work and were being crowded out of the report by it.
   #
   # If a future change wants consolidation to own conflicts again, MOVE the judge here
   # rather than adding a second proposer: the invariant is one writer per pile, not one
@@ -577,31 +705,28 @@ defmodule Loopctl.Knowledge.Consolidation do
     {length(ids), items}
   end
 
-  # Reuses the lint report already computed by the nightly run. TRUE total is lint's
-  # own pre-cap total; the emittable set is lint's already-capped array.
-  defp stale_entries(tenant_id, lint_report, cap) do
-    stale = Map.get(lint_report, :stale_articles, [])
-
-    true_total =
-      lint_report
-      |> Map.get(:summary, %{})
-      |> Map.get(:total_per_category, %{})
-      |> Map.get(:stale_articles, length(stale))
-
-    selected = Enum.take(stale, cap)
-    evidence_by_id = evidence_map(tenant_id, Enum.map(selected, & &1.article_id))
-
-    items =
-      Enum.map(selected, fn entry ->
-        build_proposal(:stale_entry, [entry.article_id], evidence_by_id,
-          severity: "info",
-          rationale: "Not updated in #{entry.days_since_update} days and never reconciled since.",
-          suggested_action: "Re-verify against current practice, then update or archive."
-        )
-      end)
-
-    {true_total, items}
-  end
+  # `:stale_entry` WAS a class here. It is not any more, and the reason is that age is
+  # not a defect signal.
+  #
+  # #605 settled that the class can never earn an apply path: "stale" is a time threshold,
+  # and auto-archiving on age would silently delete the corpus, irreversibly. A class with
+  # no reachable consumer is the queue-with-no-consumer shape this codebase has now been
+  # bitten by four times — and #605's own rule for it is "do not create the queue", never
+  # "auto-approve unvetted writes".
+  #
+  # Nothing is lost by removing it. `Knowledge.lint/2` computes stale articles itself and
+  # publishes them on `GET /api/v1/knowledge/lint` (the `knowledge_lint` tool) with a
+  # caller-chosen `stale_days`, which is strictly MORE than this class offered: consolidation
+  # re-published lint's already-capped array under a fixed 90-day threshold. It was a second
+  # rendering of one signal, occupying a per-class cap slot in the report that carries the
+  # classes something can act on.
+  #
+  # MEASURED on the hosted corpus 2026-08-05: 361 stale entries, re-derived identically every
+  # night, against zero recorded actions taken on any of them for the corpus's whole lifetime.
+  #
+  # This is why `analyze/2` takes no lint report any more. If a future change wants staleness
+  # back in this pass, it needs a CORRECTNESS signal (contradicted by a newer article, source
+  # URL gone, superseded) — not a longer threshold.
 
   # --- Proposal assembly ---
 
@@ -667,21 +792,21 @@ defmodule Loopctl.Knowledge.Consolidation do
   # Evidence is a COPY — title, idempotency key and a truncated body excerpt — taken
   # when the proposal was derived, and `article_ids` deliberately carries
   # no FK to `articles`. So nothing in the article lifecycle reaches into it: the
-  # IRREVERSIBLE hard delete (`Knowledge.BulkOps`) removes the row, and archive/unpublish
-  # removes it from every other read surface, while the excerpt sits in
+  # IRREVERSIBLE hard delete (`Knowledge.BulkOps`) removes the row, and archive removes it
+  # from every other read surface, while the excerpt sits in
   # `consolidation_proposals.evidence` — and prior-day reports are addressable forever via
   # `?day=`, so the copy outlives the article indefinitely. This module states its own
   # motivation as keeping sensitive source material off the server; a hard delete that
   # does not remove the quoted body contradicts it.
   #
-  # The copy is therefore RE-CHECKED at read time against the live published corpus, and
-  # any entry whose article no longer resolves is redacted down to its id. Read-time is
-  # the right seam: it also covers the article that was archived after the pass ran, and
-  # it needs no reaper for reports nobody reads.
+  # The copy is therefore RE-CHECKED at read time against the live corpus, and any entry
+  # whose article no longer resolves is redacted down to its id. Read-time is the right
+  # seam: it also covers the article that was archived after the pass ran, and it needs no
+  # reaper for reports nobody reads.
   defp redact_stale_evidence(_tenant_id, []), do: []
 
   defp redact_stale_evidence(tenant_id, proposals) do
-    live = live_published_ids(tenant_id, Enum.flat_map(proposals, & &1.article_ids))
+    live = live_evidence_ids(tenant_id, Enum.flat_map(proposals, & &1.article_ids))
 
     Enum.map(proposals, fn proposal ->
       %{proposal | evidence: Enum.map(proposal.evidence, &redact_entry(&1, live))}
@@ -698,14 +823,20 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   defp redact_entry(entry, _live), do: entry
 
-  defp live_published_ids(_tenant_id, []), do: MapSet.new()
+  # Liveness for redaction is "the article still exists and is recoverable" — NOT "still
+  # published". A draft counts: the only write this pass makes is the reversible unpublish,
+  # so scoping this to `:published` made the pass redact the evidence for its own decision,
+  # erasing the quoted excerpt that says WHY the article was unpublished on the morning an
+  # operator goes looking for it. Archive and hard delete are the one-way doors this
+  # redaction exists for, and they still redact.
+  defp live_evidence_ids(_tenant_id, []), do: MapSet.new()
 
-  defp live_published_ids(tenant_id, article_ids) do
+  defp live_evidence_ids(tenant_id, article_ids) do
     ids = Enum.uniq(article_ids)
 
     from(a in Article,
       where: a.tenant_id == ^tenant_id,
-      where: a.status == :published,
+      where: a.status != :archived,
       where: a.id in ^ids,
       select: a.id
     )
