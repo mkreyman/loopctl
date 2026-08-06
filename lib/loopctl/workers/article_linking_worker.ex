@@ -56,6 +56,37 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   Configurable via `Application.get_env(:loopctl, :article_link_threshold, 0.6)`.
   Only articles with cosine similarity >= threshold get linked.
 
+  ## Degree cap (#611 stage 0)
+
+  A threshold alone is not a bound. Above it, `relates_to` took EVERY candidate — up to
+  `max_comparisons` (50) outbound edges per article, and degree is bidirectional, so an
+  article also accrues one inbound edge per other article that reaches it. Measured on the
+  hosted corpus before the cap: **1,402,699 `relates_to` edges over 79,276 published
+  articles**, 59% of them between 0.60 and 0.70, and 56% of articles carrying 21+ edges.
+  A graph that dense relates nearly everything to everything and so distinguishes nothing.
+
+  `relates_to` writes are now bounded by HEADROOM: `:article_max_relates_to_links` (default 10)
+  minus the edges already incident to this article, in either direction, that
+  `LinkPruning.reclaimable_query/1` says the prune can free. The cut runs AFTER the
+  already-linked rejection, so a re-link (nightly orphan pass, a re-embed) tops the article up
+  to K rather than adding K more. `:potential_conflict` is NOT capped — it has its own
+  threshold and its own draining consumer, and a second cap there would withhold pairs from a
+  queue designed to converge.
+
+  Two things this bound is NOT, stated because both are easy to read into it:
+
+  - **Not a bound on TOTAL degree.** Only the article being linked has its headroom checked;
+    another article writing an edge INTO this one never consults this one's degree, so a hub
+    still accrues inbound edges without limit here. Total degree is bounded by the nightly
+    prune's union-kNN target, not by this cap.
+  - **Not "the best K".** A stored edge is never displaced: at headroom 0 a strictly nearer
+    candidate is discarded rather than replacing a weaker stored edge, so the set is
+    first-K-acquired until the prune frees a slot. `top_k/2`'s sort decides which of THIS run's
+    candidates win, not which of all time's.
+
+  And it cannot retract the edges written before it existed, which is why #611 stage 0 also
+  prunes the standing backlog. See `Loopctl.Knowledge.LinkPruning`.
+
   ## Retry Strategy (AC-21.2.13)
 
   Custom polynomial backoff: `attempt^4 + 15 + rand(0..30*attempt)`.
@@ -82,6 +113,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.LinkPruning
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.LocalGuc
   alias Loopctl.Oban.FairShare
@@ -180,17 +212,45 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
       candidates when is_list(candidates) ->
         conflict_threshold = conflict_threshold()
 
-        # A `relates_to` ambient link for everything >= the link threshold, PLUS a
+        # A `relates_to` ambient link for the TOP-K nearest above the link threshold, PLUS a
         # `:potential_conflict` flag (route-the-findings #4) for pairs >= the conflict
         # threshold — too similar to comfortably coexist, for the consumer to resolve.
         # Dedup is type-aware so the two link types don't crowd each other out.
+        #
+        # The top-K cut is #611 stage 0, and it replaces an unconditional keep. Admitting
+        # every candidate over the threshold made this an unbounded producer: `max_comparisons`
+        # is 50, so each article could contribute 50 outbound edges, and degree is BIDIRECTIONAL
+        # — an article also accrues an inbound edge from every other article that reaches it.
+        # MEASURED before the cap: 1,402,699 `relates_to` edges over 79,276 published articles,
+        # 59% of them in the 0.60–0.70 band (barely over the floor) and 56% of articles carrying
+        # 21+ edges. At that density any node reaches most of the corpus in two hops, so the
+        # graph asserts a relationship between nearly everything and therefore distinguishes
+        # nothing — which is what `Knowledge.progressive_index/2`'s one-hop enrichment was
+        # spending its budget on.
+        #
+        # `:potential_conflict` is deliberately NOT capped here. It has its own (much higher)
+        # threshold and its own consumer — `KnowledgeLintWorker.judge_redundant_conflicts/1`
+        # drains it, capped above the promotion rate — so a second cap would silently withhold
+        # pairs from a queue that is already designed to converge.
         relates =
-          build_links(article.id, candidates, tenant_id, :relates_to, fn _sim -> true end)
+          build_links(
+            article.id,
+            candidates,
+            tenant_id,
+            :relates_to,
+            fn _sim -> true end,
+            max_relates_to_links()
+          )
 
         conflicts =
-          build_links(article.id, candidates, tenant_id, :potential_conflict, fn sim ->
-            sim >= conflict_threshold
-          end)
+          build_links(
+            article.id,
+            candidates,
+            tenant_id,
+            :potential_conflict,
+            fn sim -> sim >= conflict_threshold end,
+            :infinity
+          )
 
         created_count = create_links(relates ++ conflicts, tenant_id)
         log_audit_event(article.id, tenant_id, created_count)
@@ -198,7 +258,52 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     end
   end
 
-  defp build_links(article_id, candidates, tenant_id, type, keep?) do
+  # The `headroom` nearest candidates, by similarity. `find_similar_articles/4` returns them
+  # in kNN order already, but that ordering is the vector index's and this cut must not depend
+  # on it: an explicit sort makes the bound a property of THIS function, so a future change to
+  # the search path cannot silently turn "the best K of this run's candidates" into "whichever
+  # K arrived first". It does NOT reorder already-STORED edges — those are never displaced, so
+  # across runs the stored set is first-K-acquired (see the moduledoc).
+  # Ties break on id so the cut is deterministic across re-runs — a re-link that kept a
+  # different arbitrary half each night would churn the graph forever.
+  defp top_k(candidates, :infinity), do: candidates
+
+  defp top_k(candidates, headroom) do
+    candidates
+    |> Enum.sort_by(fn %{similarity: sim, id: id} -> {-sim, id} end)
+    |> Enum.take(headroom)
+  end
+
+  # K minus the edges this article already holds THAT THE PRUNE CAN RECLAIM. Two halves:
+  #
+  # * STORED, not per-run: the cut runs AFTER the already-linked rejection below. It used to run
+  #   before it, so existing edges cost nothing against K and every re-link (nightly orphan
+  #   pass, a re-embed) could add K MORE — degree grew without bound between prunes.
+  # * RECLAIMABLE, not merely incident: counting EVERY incident edge counted rows `LinkPruning`
+  #   may never delete (hand-made links, and scoreless ones it cannot rank), so K of those
+  #   switched this article's auto-linking off with no pass able to free a slot again. The count
+  #   comes from `LinkPruning.reclaimable_query/1` so the writer's bound and the pruner's target
+  #   are one definition of degree rather than two that can disagree — which also means a finite
+  #   cap applies to `:relates_to` only, the sole type either of them bounds.
+  defp headroom(:infinity, _article_id, _tenant_id), do: :infinity
+
+  defp headroom(cap, article_id, tenant_id) do
+    reclaimable =
+      tenant_id
+      |> LinkPruning.reclaimable_query()
+      |> where([l], l.source_article_id == ^article_id or l.target_article_id == ^article_id)
+      |> AdminRepo.aggregate(:count)
+
+    max(cap - reclaimable, 0)
+  end
+
+  # Per-article cap for `relates_to`. Kept well under `max_comparisons` (50) —
+  # a cap at or above the candidate count is not a cap.
+  defp max_relates_to_links do
+    Application.get_env(:loopctl, :article_max_relates_to_links, 10)
+  end
+
+  defp build_links(article_id, candidates, tenant_id, type, keep?, cap) do
     existing = get_existing_link_pairs(article_id, tenant_id, type)
 
     candidates
@@ -213,6 +318,8 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
       cid == article_id or MapSet.member?(existing, {article_id, cid}) or
         MapSet.member?(existing, {cid, article_id})
     end)
+    # AFTER the rejection, so an already-linked pair does not consume a slot it already holds.
+    |> top_k(headroom(cap, article_id, tenant_id))
     |> Enum.map(fn %{id: target_id, similarity: score} ->
       %{
         source_article_id: article_id,
