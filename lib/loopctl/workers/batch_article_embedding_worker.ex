@@ -69,6 +69,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   alias Loopctl.Egress.Scope
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
+  alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -76,6 +77,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   alias Loopctl.Provider.Admission
   alias Loopctl.Provider.RetryAfter
   alias Loopctl.SystemConfig
+  alias Loopctl.Workers.ArticleEmbeddingWorker
   alias Loopctl.Workers.ArticleLinkingWorker
 
   # Task.yield budget for a batch provider call. Review (MED #3): this was a
@@ -90,7 +92,6 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   # `EmbeddingClient.batch_receive_timeout_ms/1`.
   @default_yield_base_ms 8_000
   @default_yield_per_item_ms 100
-  @max_text_length 32_000
 
   @impl Oban.Worker
   def perform(%Oban.Job{
@@ -171,8 +172,8 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
 
   # Greedy split of `to_embed` tuples into sub-batches whose cumulative text
   # `byte_size` stays at/under `max_chars`. A single input larger than the budget
-  # (already sliced to `@max_text_length`) still forms its own sub-batch rather than
-  # wedging into an empty one.
+  # (already truncated to `TextBudget.initial_bytes/0`) still forms its own sub-batch
+  # rather than wedging into an empty one.
   defp chunk_by_char_budget(to_embed, max_chars) do
     chunk_fun = fn {_article, text, _hash} = item, {acc, size} ->
       len = byte_size(text)
@@ -277,6 +278,31 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
        )
        when is_integer(retry_after),
        do: {:snooze, RetryAfter.snooze_seconds(retry_after)}
+
+  # An input-too-long rejection is about ONE member of the array, but the provider
+  # fails the whole array and never says which. Re-enqueueing the batch is useless
+  # (it would be rejected identically forever), and shrinking every text to fit the
+  # unknown offender would truncate articles that were never over the limit.
+  #
+  # So: dissolve the batch into single-article jobs. `ArticleEmbeddingWorker` walks
+  # the per-article shrink ladder, which pays the truncation cost ONLY on the
+  # article that actually overflows. The batch itself is done — `:ok`, not a
+  # discard, because its work has been handed on rather than dropped.
+  defp handle_batch_error(tenant_id, to_embed, {:api_error, _status, :context_length_exceeded}) do
+    Enum.each(to_embed, fn {article, _text, _hash} ->
+      %{tenant_id: tenant_id, article_id: article.id}
+      |> ArticleEmbeddingWorker.new()
+      |> Oban.insert()
+    end)
+
+    Logger.warning(
+      "BatchArticleEmbeddingWorker: tenant=#{tenant_id} batch=#{length(to_embed)} rejected — " <>
+        "at least one input exceeds the provider token limit. Re-enqueued as single-article " <>
+        "jobs so only the over-long article(s) get truncated."
+    )
+
+    :ok
+  end
 
   defp handle_batch_error(tenant_id, to_embed, reason) do
     # No partial writes happened (we only store after a full success), so the whole
@@ -429,7 +455,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
 
   defp build_embedding_text(article) do
     "#{article.title}\n\n#{article.body}"
-    |> String.slice(0, @max_text_length)
+    |> TextBudget.truncate(TextBudget.initial_bytes())
   end
 
   # Task.yield budget (ms) for a sub-batch provider call — live-tunable via

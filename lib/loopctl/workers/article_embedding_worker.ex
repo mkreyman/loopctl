@@ -11,7 +11,11 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
 
   1. Fetch the article (with its embedding + content-hash) by `article_id` + `tenant_id`
   2. If article was deleted, return `:ok` (no-op)
-  3. Build embedding text: `"{title}\\n\\n{body}"` truncated to 32K chars
+  3. Build embedding text: `"{title}\\n\\n{body}"`, truncated to
+     `Loopctl.Embeddings.TextBudget.initial_bytes/0` BYTES — not characters. A
+     character cap does not bound TOKENS, which is what the provider limits; see
+     that module for why bytes do and for the 80 articles the character cap left
+     permanently un-embeddable.
   4. IDEMPOTENCY (review #12): if the article already carries an embedding whose
      stored content-hash matches the current content, skip the paid provider call
      entirely (re-ensure linking, return `:ok`). This stops an Oban retry after a
@@ -26,6 +30,11 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
      `{:discard, {:embedding_permanent_error, _}}` (review #5): retrying a revoked
      key 3× is pointless. Transient errors (5xx / network / timeout) return
      `{:error, reason}` for Oban retry.
+  7b. EXCEPT `:context_length_exceeded`, which is permanent for the text SENT but
+     not for the article: `embed_with_shrink/6` re-sends it at half the byte budget,
+     down to a floor that provably fits (`TextBudget`). Only an exhausted ladder
+     falls through to the discard in 7 — so an over-long article is embedded from
+     its prefix instead of being retried hourly forever by the reconciler.
   8. On `{:error, :circuit_open}` (the tenant breaker is OPEN — a throttle/latency
      storm) the worker `{:snooze, remaining_cooldown}`s (US-37.3, AC-37.3.5): a
      loss-free reschedule that consumes NO attempt. This is deliberately NOT the
@@ -71,6 +80,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
+  alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -84,7 +94,6 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   # worker. The client itself caps a single attempt at ~4s (no client retries), so
   # this only adds slack for scheduling/DB.
   @worker_yield_ms 8_000
-  @max_text_length 32_000
 
   @impl Oban.Worker
   def perform(%Oban.Job{id: id, args: %{"article_id" => article_id, "tenant_id" => tenant_id}}) do
@@ -128,6 +137,13 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
     end
   end
 
+  # NOTE the asymmetry between `text` and `content_hash` once the ladder shrinks:
+  # the hash is always of the INITIAL-budget text, never of the shrunk text actually
+  # sent. That is deliberate. `embedding_content_hash` answers "has this article's
+  # content already been embedded?", and keying it to whichever rung succeeded would
+  # make the answer depend on a provider verdict — so every later enqueue would miss
+  # the idempotency check, walk the whole ladder again, and re-bill the tenant for
+  # an embedding it already has.
   defp generate(tenant_id, article, article_id, text, content_hash) do
     # US-41.4 (AC-41.4.2): articles carry a nullable `project_id`, so the egress scope
     # is the ARTICLE's project when it has one and the tenant-wide scope otherwise.
@@ -145,7 +161,15 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
     # timeout, a task yield timeout, a node death mid-call — with no entry AND no
     # gap, and the claim would report no-third-party-egress for a row whose body
     # did egress. AC-41.7.2 names exactly that scenario.
-    result = embed_with_custody(tenant_id, article, article_id, text, opts)
+    result =
+      embed_with_shrink(
+        tenant_id,
+        article,
+        article_id,
+        text,
+        opts,
+        TextBudget.initial_bytes()
+      )
 
     case result do
       {:ok, embedding} ->
@@ -215,6 +239,45 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
         else
           {:error, sanitized}
         end
+    end
+  end
+
+  # The shrink ladder. `text` arrives already truncated to the INITIAL budget, so the
+  # first pass sends exactly what the pre-ladder code sent; each rejection re-truncates
+  # the SAME text to half the bytes and re-sends.
+  #
+  # Terminates unconditionally: `TextBudget.shrink/1` returns `:exhausted` once the
+  # floor has been tried, and the floor is provably under the token limit for any
+  # script. On `:exhausted` the original error is returned untouched, so the caller's
+  # existing permanent-error branch discards it — a floor-sized input that is STILL
+  # rejected is a different defect (a changed model or a much smaller limit) and must
+  # be legible as one, not absorbed by more halving.
+  defp embed_with_shrink(tenant_id, article, article_id, text, opts, budget) do
+    attempt = TextBudget.truncate(text, budget)
+
+    case embed_with_custody(tenant_id, article, article_id, attempt, opts) do
+      {:error, {:api_error, _status, :context_length_exceeded}} = error ->
+        case TextBudget.shrink(budget) do
+          :exhausted ->
+            Logger.warning(
+              "ArticleEmbeddingWorker: tenant=#{tenant_id} article=#{article_id} rejected as " <>
+                "too long even at the #{budget}-byte floor — not a length problem; discarding."
+            )
+
+            error
+
+          smaller ->
+            Logger.warning(
+              "ArticleEmbeddingWorker: tenant=#{tenant_id} article=#{article_id} exceeded the " <>
+                "provider token limit at #{budget} bytes; retrying at #{smaller}. The embedding " <>
+                "will cover a prefix of the article, not all of it."
+            )
+
+            embed_with_shrink(tenant_id, article, article_id, text, opts, smaller)
+        end
+
+      result ->
+        result
     end
   end
 
@@ -354,6 +417,6 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
 
   defp build_embedding_text(article) do
     "#{article.title}\n\n#{article.body}"
-    |> String.slice(0, @max_text_length)
+    |> TextBudget.truncate(TextBudget.initial_bytes())
   end
 end

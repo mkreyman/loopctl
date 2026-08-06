@@ -20,6 +20,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Workers.BatchArticleEmbeddingWorker
 
@@ -204,6 +205,81 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
 
       assert {:discard, {:embedding_permanent_error, {:api_error, 401, _}}} =
                perform(tenant.id, ids)
+    end
+
+    test "context_length_exceeded → dissolved into single-article jobs, not discarded" do
+      # The provider fails the WHOLE array and never says which input was too long.
+      # Discarding would strand every article in the batch; shrinking every text
+      # would truncate the innocent ones. So the batch is re-enqueued per article and
+      # the per-article ladder pays the cost only where it is owed.
+      tenant = fixture(:tenant)
+      articles = for _ <- 1..3, do: create_published_article(tenant.id)
+      ids = Enum.map(articles, & &1.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _t, _texts ->
+        {:error, {:api_error, 400, :context_length_exceeded}}
+      end)
+
+      # Oban runs `testing: :inline`, so the re-enqueued single jobs execute here.
+      # Asserting the OUTCOME is stronger than asserting the enqueue anyway: it
+      # proves the dissolve actually rescues the articles rather than just moving
+      # them to another queue.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, text ->
+        {:ok, vec_for(text)}
+      end)
+
+      assert :ok = perform(tenant.id, ids)
+
+      for id <- ids do
+        {:ok, stored} = Knowledge.get_article_with_embedding(tenant.id, id)
+
+        refute is_nil(stored.embedding),
+               "article #{id} was stranded by the batch rejection instead of being re-embedded"
+      end
+    end
+
+    test "a NON-length 400 still discards — it is not dissolved into singles" do
+      # Guards the classification, not the status: dissolving a malformed-request 400
+      # would re-run every article individually against the same rejection.
+      tenant = fixture(:tenant)
+      article = create_published_article(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _t, _texts ->
+        {:error, {:api_error, 400, :provider_error}}
+      end)
+
+      # No single-article fallout: if the batch dissolved, these inline jobs would
+      # call generate_embedding/2 and this expectation would blow up on arity/count.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        flunk("a non-length 400 must NOT be dissolved into single-article jobs")
+      end)
+
+      assert {:discard, {:embedding_permanent_error, _}} = perform(tenant.id, [article.id])
+
+      {:ok, stored} = Knowledge.get_article_with_embedding(tenant.id, article.id)
+      assert is_nil(stored.embedding)
+    end
+
+    test "batch text is bounded by BYTES, not characters" do
+      # There is no ladder on the batch path — build_embedding_text/1 IS what gets
+      # sent, so its unit is the whole guard here.
+      tenant = fixture(:tenant)
+
+      article =
+        create_published_article(tenant.id, %{body: String.duplicate("я", 30_000)})
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _t, texts ->
+        for text <- texts do
+          assert byte_size(text) <= TextBudget.initial_bytes(),
+                 "sent #{byte_size(text)} bytes"
+
+          assert String.valid?(text), "truncation split a UTF-8 codepoint"
+        end
+
+        {:ok, Enum.map(texts, &vec_for/1)}
+      end)
+
+      assert :ok = perform(tenant.id, [article.id])
     end
 
     test "throttle with Retry-After → snooze ~that interval", %{tenant: tenant, ids: ids} do

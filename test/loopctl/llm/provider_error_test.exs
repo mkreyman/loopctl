@@ -62,10 +62,112 @@ defmodule Loopctl.Llm.ProviderErrorTest do
   describe "log_tag/1" do
     test "never includes a body and unwraps {:error, _}" do
       body = %{"error" => "Incorrect API key: test-openai-...ZXY9"}
-      assert ProviderError.log_tag({:api_error, 401, body}) == "api_error status=401"
-      assert ProviderError.log_tag({:error, {:api_error, 500, body}}) == "api_error status=500"
+
+      assert ProviderError.log_tag({:api_error, 401, body}) ==
+               "api_error status=401 provider_error"
+
+      assert ProviderError.log_tag({:error, {:api_error, 500, body}}) ==
+               "api_error status=500 provider_error"
+
       assert ProviderError.log_tag({:request_failed, %{secret: "x"}}) == "request_failed"
       refute ProviderError.log_tag({:api_error, 401, body}) =~ "ZXY9"
+    end
+
+    test "names the classification, so an operator can see WHY a 400 happened" do
+      # The defect this closes: 80 articles failed identically for 16 hours and every
+      # record of it — logs AND oban_jobs.errors — said only "status=400". The reason
+      # had to be recovered by bisecting against the live provider.
+      body = %{
+        "error" => %{"message" => "Invalid 'input': maximum context length is 8192 tokens."}
+      }
+
+      assert ProviderError.log_tag({:api_error, 400, body}) ==
+               "api_error status=400 context_length_exceeded"
+    end
+  end
+
+  describe "classify/1" do
+    test "recognises input-too-long across vendor spellings" do
+      for message <- [
+            "Invalid 'input': maximum context length is 8192 tokens.",
+            "This model's maximum context length is 8192 tokens, however you requested 9001.",
+            "Please reduce the length of the messages.",
+            "input is too long for the model",
+            "string too long"
+          ] do
+        body = %{"error" => %{"message" => message}}
+
+        assert ProviderError.classify(body) == :context_length_exceeded,
+               "failed to classify: #{message}"
+      end
+    end
+
+    test "reads the error code as well as the message" do
+      body = %{"error" => %{"code" => "context_length_exceeded", "message" => nil}}
+      assert ProviderError.classify(body) == :context_length_exceeded
+    end
+
+    test "is case-insensitive" do
+      body = %{"error" => %{"message" => "MAXIMUM CONTEXT LENGTH IS 8192 TOKENS"}}
+      assert ProviderError.classify(body) == :context_length_exceeded
+    end
+
+    test "does NOT claim context-length for unrelated failures" do
+      # A false :context_length_exceeded is worse than none: it would send the worker
+      # down the shrink ladder, re-billing the provider two extra times for an error
+      # that shrinking cannot fix.
+      for body <- [
+            %{"error" => %{"message" => "Incorrect API key provided: sk-...ZXY9"}},
+            %{"error" => %{"message" => "Rate limit reached for requests"}},
+            %{"error" => %{"code" => "invalid_api_key"}},
+            %{"error" => "some string body"},
+            "a bare string body",
+            %{"unexpected" => "shape"},
+            nil
+          ] do
+        assert ProviderError.classify(body) == :provider_error,
+               "wrongly classified as context-length: #{inspect(body)}"
+      end
+    end
+
+    test "is idempotent on an already-classified tag" do
+      # sanitize/1 runs again at every worker boundary. If classify/1 flattened a tag
+      # back to :provider_error the workers' retry ladder would never fire — the exact
+      # half-fix that would leave the 80 articles un-embedded while looking fixed.
+      assert ProviderError.classify(:context_length_exceeded) == :context_length_exceeded
+      assert ProviderError.classify(:provider_error) == :provider_error
+    end
+
+    test "keeps no byte of the body — the return is always a fixed atom" do
+      body = %{"error" => %{"message" => "maximum context length exceeded for sk-...ZXY9"}}
+      result = ProviderError.classify(body)
+
+      assert result in [:provider_error, :context_length_exceeded]
+      refute inspect(result) =~ "ZXY9"
+    end
+  end
+
+  describe "sanitize/1 classification round-trip" do
+    test "carries the classification into the Oban error term" do
+      body = %{"error" => %{"message" => "maximum context length is 8192 tokens"}}
+
+      assert ProviderError.sanitize({:api_error, 400, body}) ==
+               {:api_error, 400, :context_length_exceeded}
+    end
+
+    test "a second sanitize pass preserves it (worker boundaries re-sanitize)" do
+      once =
+        ProviderError.sanitize(
+          {:api_error, 400, %{"error" => %{"code" => "context_length_exceeded"}}}
+        )
+
+      assert ProviderError.sanitize(once) == once
+      assert once == {:api_error, 400, :context_length_exceeded}
+    end
+
+    test "preserves the throttle 4-tuple for a classified tag too" do
+      term = {:api_error, 429, :provider_error, 30}
+      assert ProviderError.sanitize(term) == term
     end
   end
 end
