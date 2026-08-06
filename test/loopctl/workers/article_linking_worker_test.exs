@@ -457,8 +457,101 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
 
   # --- TC-21.2.5: Links every returned candidate ---
 
+  describe "relates_to degree cap (#611 stage 0)" do
+    # A threshold is not a bound. Before this cap `relates_to` took EVERY candidate over
+    # 0.6 — up to `max_comparisons` (50) per article, bidirectionally — and the hosted
+    # corpus reached 1,402,699 edges over 79,276 articles, 56% of them carrying 21+. At
+    # that density the graph relates nearly everything to everything and distinguishes
+    # nothing. The cap is what makes the producer bounded.
+    test "keeps only the top-K nearest, and keeps the NEAREST ones" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      # 14 candidates, all comfortably over the relates threshold and all under the
+      # conflict threshold, with strictly descending similarity so "which K" is decidable.
+      scored =
+        for i <- 0..13 do
+          {create_published_article(tenant.id), 0.92 - i * 0.01}
+        end
+
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        # Returned in a deliberately WRONG order: the cut must sort, not trust arrival
+        # order, or it degrades to "whichever K the vector index happened to yield first".
+        scored |> Enum.reverse() |> Enum.map(fn {a, s} -> candidate(a, s) end)
+      end)
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      linked =
+        from(l in ArticleLink,
+          where: l.tenant_id == ^tenant.id,
+          where: l.relationship_type == :relates_to,
+          where: l.source_article_id == ^source.id,
+          select: l.target_article_id
+        )
+        |> AdminRepo.all()
+        |> MapSet.new()
+
+      cap = Application.get_env(:loopctl, :article_max_relates_to_links, 10)
+      assert MapSet.size(linked) == cap
+
+      {kept, dropped} = Enum.split(scored, cap)
+
+      for {article, sim} <- kept do
+        assert MapSet.member?(linked, article.id),
+               "candidate at similarity #{sim} is in the top #{cap} but was not linked"
+      end
+
+      for {article, sim} <- dropped do
+        refute MapSet.member?(linked, article.id),
+               "candidate at similarity #{sim} is outside the top #{cap} but was linked"
+      end
+    end
+
+    test "does NOT cap potential_conflict — that queue has its own draining consumer" do
+      # `judge_redundant_conflicts/1` drains this pile capped ABOVE the promotion rate, so
+      # it converges by arithmetic. Capping the producer here as well would silently
+      # withhold pairs from a queue designed to empty itself.
+      %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      targets = for _i <- 1..14, do: create_published_article(tenant.id)
+
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        Enum.map(targets, &candidate(&1, 0.97))
+      end)
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      conflict_count =
+        from(l in ArticleLink,
+          where: l.tenant_id == ^tenant.id,
+          where: l.relationship_type == :potential_conflict,
+          where: l.source_article_id == ^source.id
+        )
+        |> AdminRepo.aggregate(:count)
+
+      assert conflict_count == 14
+
+      # ...while relates_to for the same 14 candidates IS capped.
+      relates_count =
+        from(l in ArticleLink,
+          where: l.tenant_id == ^tenant.id,
+          where: l.relationship_type == :relates_to,
+          where: l.source_article_id == ^source.id
+        )
+        |> AdminRepo.aggregate(:count)
+
+      assert relates_count == Application.get_env(:loopctl, :article_max_relates_to_links, 10)
+    end
+  end
+
   describe "candidate fan-out" do
-    test "creates a relates_to link for each returned candidate" do
+    test "creates a relates_to link for each returned candidate under the degree cap" do
       %{tenant: tenant} = setup_tenant()
       source = create_published_article(tenant.id)
       targets = for _i <- 1..3, do: create_published_article(tenant.id)

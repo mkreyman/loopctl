@@ -79,6 +79,14 @@ config :loopctl,
   # 0.8+ is only useful for near-duplicate detection.
   article_link_threshold: 0.6,
   article_link_max_comparisons: 50,
+  # #611 stage 0: a threshold is NOT a bound. Above 0.6 the linking worker took every kNN
+  # candidate, so an article contributed up to `article_link_max_comparisons` (50) outbound
+  # edges and accrued one inbound edge per article that reached it. The hosted corpus hit
+  # 1,402,699 `relates_to` edges over 79,276 articles, 56% of them carrying 21+, at which
+  # density any node reaches most of the corpus in two hops and the graph distinguishes
+  # nothing. Keep this WELL under max_comparisons — a cap at or above the candidate count
+  # is not a cap.
+  article_max_relates_to_links: 10,
   # US-27.8 (AC-27.8.4/.6): ADVISORY end-to-end wall-clock budget (ms) for the vector
   # scale gate's timed HTTP requests (suggested_links / semantic search) at the prod
   # floor. SECONDARY to the deterministic plan assertion (index-backed, no full-corpus
@@ -747,6 +755,14 @@ config :loopctl,
 config :loopctl,
   knowledge_lint_orphan_link_threshold: 0.5,
   knowledge_lint_max_orphan_relink: 500
+
+# LinkPruning (#611 stage 0): how many over-degree `relates_to` edges one nightly run may
+# DELETE, worst-first. Sized to converge in a few nights rather than a few months — the
+# standing backlog on the hosted corpus was ~903,600 edges (1,402,699 total, 499,058
+# surviving union-kNN top-10) and the write-side cap means the producer no longer outruns
+# the drain. The remainder is reported on the audit event and logged, never dropped
+# silently. Only machine-derived, rankable `relates_to` rows are ever in scope.
+config :loopctl, :knowledge_link_prune_max_per_run, 250_000
 
 # KnowledgeMocWorker: corpus-specific tags to exclude from Map-of-Content
 # generation (on top of the worker's generic structural/format/provenance list).

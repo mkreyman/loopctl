@@ -6,6 +6,42 @@ All notable changes to loopctl are documented here.
 
 Operator-facing changes for deployments outside the hosted instance.
 
+### Changed
+
+- **The nightly knowledge pass now PRUNES the `relates_to` graph to a bounded degree, which
+  DELETES rows (#611 stage 0).** Read this before upgrading if you run a large corpus: on
+  first run the pass will delete a large number of `article_links` rows, and it is the only
+  step in that worker that deletes anything.
+
+  Why: a similarity threshold was never a bound. Above `article_link_threshold` (0.6) the
+  linking worker created a `relates_to` edge for *every* kNN candidate — up to
+  `article_link_max_comparisons` (50) outbound per article, plus one inbound from every other
+  article that reached it. On the hosted corpus that produced **1,402,699 edges over 79,276
+  published articles**, with 56% of articles carrying 21+ and 59% of edges sitting between
+  0.60 and 0.70. At that density a traversal from any article reaches most of the corpus in
+  two hops, so the graph asserts a relationship between nearly everything and distinguishes
+  nothing — which also means the one-hop enrichment in progressive disclosure was spending
+  its budget on noise.
+
+  What changes: `ArticleLinkingWorker` now writes at most `article_max_relates_to_links`
+  (**new setting, default 10**) edges per article, and `Loopctl.Knowledge.LinkPruning` drains
+  the existing backlog at up to `knowledge_link_prune_max_per_run` (**new setting, default
+  250,000**) edges per nightly run, worst-first, reporting the remainder on the
+  `knowledge.lint_completed` audit event as `links_pruned` / `links_prunable_remaining`.
+  On the hosted corpus the target state is 499,058 edges (~12.6 average degree).
+
+  What is NOT touched: `potential_conflict` edges (own threshold, own draining consumer),
+  any `relates_to` link without `auto_generated: true`, and any link without a recorded
+  `similarity_score`. A hand-made link is structurally out of reach, and an edge that cannot
+  be ranked cannot be shown to be prunable.
+
+  Why deleting is safe unattended, when every other automated step in that worker is gated on
+  reversibility: an auto-generated edge is a *derived artifact*, not a record — a pure
+  function of two embeddings and a threshold, which the linking worker recomputes from the
+  same vectors. Pruning uses **union-kNN** (an edge survives if it is in *either* endpoint's
+  top-K), which guarantees every article keeps its own K nearest and therefore **cannot create
+  an orphan**. No migration, no manual step; the pass is idempotent and converges.
+
 ### Added
 
 - **`GET /api/v1/knowledge/consolidation` — the nightly consolidation ("dream") report

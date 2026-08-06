@@ -56,6 +56,24 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   Configurable via `Application.get_env(:loopctl, :article_link_threshold, 0.6)`.
   Only articles with cosine similarity >= threshold get linked.
 
+  ## Degree cap (#611 stage 0)
+
+  A threshold alone is not a bound. Above it, `relates_to` took EVERY candidate — up to
+  `max_comparisons` (50) outbound edges per article, and degree is bidirectional, so an
+  article also accrues one inbound edge per other article that reaches it. Measured on the
+  hosted corpus before the cap: **1,402,699 `relates_to` edges over 79,276 published
+  articles**, 59% of them between 0.60 and 0.70, and 56% of articles carrying 21+ edges.
+  A graph that dense relates nearly everything to everything and so distinguishes nothing.
+
+  `relates_to` is now capped at the top `:article_max_relates_to_links` (default 10) nearest
+  candidates per article. `:potential_conflict` is NOT capped — it has its own threshold and
+  its own draining consumer, and a second cap there would withhold pairs from a queue
+  designed to converge.
+
+  The cap bounds what this worker WRITES. Total degree is still unbounded from the inbound
+  side, which is why #611 stage 0 also prunes the standing backlog; see
+  `Loopctl.Knowledge.LinkPruning`.
+
   ## Retry Strategy (AC-21.2.13)
 
   Custom polynomial backoff: `attempt^4 + 15 + rand(0..30*attempt)`.
@@ -180,12 +198,29 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
       candidates when is_list(candidates) ->
         conflict_threshold = conflict_threshold()
 
-        # A `relates_to` ambient link for everything >= the link threshold, PLUS a
+        # A `relates_to` ambient link for the TOP-K nearest above the link threshold, PLUS a
         # `:potential_conflict` flag (route-the-findings #4) for pairs >= the conflict
         # threshold — too similar to comfortably coexist, for the consumer to resolve.
         # Dedup is type-aware so the two link types don't crowd each other out.
+        #
+        # The top-K cut is #611 stage 0, and it replaces an unconditional keep. Admitting
+        # every candidate over the threshold made this an unbounded producer: `max_comparisons`
+        # is 50, so each article could contribute 50 outbound edges, and degree is BIDIRECTIONAL
+        # — an article also accrues an inbound edge from every other article that reaches it.
+        # MEASURED before the cap: 1,402,699 `relates_to` edges over 79,276 published articles,
+        # 59% of them in the 0.60–0.70 band (barely over the floor) and 56% of articles carrying
+        # 21+ edges. At that density any node reaches most of the corpus in two hops, so the
+        # graph asserts a relationship between nearly everything and therefore distinguishes
+        # nothing — which is what `Knowledge.progressive_index/2`'s one-hop enrichment was
+        # spending its budget on.
+        #
+        # `:potential_conflict` is deliberately NOT capped here. It has its own (much higher)
+        # threshold and its own consumer — `KnowledgeLintWorker.judge_redundant_conflicts/1`
+        # drains it, capped above the promotion rate — so a second cap would silently withhold
+        # pairs from a queue that is already designed to converge.
         relates =
-          build_links(article.id, candidates, tenant_id, :relates_to, fn _sim -> true end)
+          article.id
+          |> build_links(top_k(candidates), tenant_id, :relates_to, fn _sim -> true end)
 
         conflicts =
           build_links(article.id, candidates, tenant_id, :potential_conflict, fn sim ->
@@ -196,6 +231,24 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
         log_audit_event(article.id, tenant_id, created_count)
         :ok
     end
+  end
+
+  # The K nearest candidates, by similarity. `find_similar_articles/4` returns them in
+  # kNN order already, but that ordering is the vector index's and this cut must not depend
+  # on it: an explicit sort makes the bound a property of THIS function, so a future change
+  # to the search path cannot silently turn "the best K" into "whichever K arrived first".
+  # Ties break on id so the cut is deterministic across re-runs — a re-link that kept a
+  # different arbitrary half each night would churn the graph forever.
+  defp top_k(candidates) do
+    candidates
+    |> Enum.sort_by(fn %{similarity: sim, id: id} -> {-sim, id} end)
+    |> Enum.take(max_relates_to_links())
+  end
+
+  # Per-article outbound cap for `relates_to`. Kept well under `max_comparisons` (50) —
+  # a cap at or above the candidate count is not a cap.
+  defp max_relates_to_links do
+    Application.get_env(:loopctl, :article_max_relates_to_links, 10)
   end
 
   defp build_links(article_id, candidates, tenant_id, type, keep?) do

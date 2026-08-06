@@ -10,9 +10,18 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
   What makes a repair safe here is REVERSIBILITY, not confidence (#605). Every
   automated write below can be undone in code — a re-linked orphan, a conflict
-  verdict re-annotated, an unpublished duplicate re-published. Nothing on this
-  path archives, deletes, or otherwise takes a one-way door, and no step waits
-  on a human verdict that will never arrive.
+  verdict re-annotated, an unpublished duplicate re-published. No step archives
+  an article or waits on a human verdict that will never arrive.
+
+  ONE step deletes, and the exception is deliberate: link pruning (#611) removes
+  `relates_to` rows. An undo would be meaningless there and a soft-delete column
+  would be worse, because such an edge is a DERIVED ARTIFACT rather than a record
+  — a pure function of two embeddings and a threshold, which
+  `ArticleLinkingWorker` recomputes from the same vectors. `LinkPruning` will only
+  touch a row that carries its own derivation (`auto_generated` plus a
+  `similarity_score`), so a hand-made link is structurally out of reach. Read that
+  as the rule it is: *regenerable* is the property that licenses a delete, and it
+  is narrower than "we can rebuild something like it".
 
   ## Scheduling
 
@@ -35,7 +44,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      cheap, and makes **no** embedding-API calls (orphans missing an embedding
      simply no-op in the linking worker — backfilling those is a separate
      concern, out of scope here).
-  3. **Promotes, judges and executes conflicts**, in that order and in one pass
+  3. **Prunes the `relates_to` graph to top-K degree** (#611 stage 0) via
+     `Loopctl.Knowledge.LinkPruning`. A similarity threshold is not a bound: above
+     0.6 the linking worker admitted every kNN candidate, and the hosted corpus
+     reached 1,402,699 edges over 79,276 articles with 56% of articles carrying
+     21+. At that density any node reaches most of the corpus in two hops, so the
+     graph relates nearly everything to everything and distinguishes nothing.
+     Union-kNN (an edge survives if it is in EITHER endpoint's top-K) guarantees
+     every article keeps its own K nearest, which is also why the prune can never
+     create an orphan. Bounded per run, worst-first, and FAIL-SOFT.
+  4. **Promotes, judges and executes conflicts**, in that order and in one pass
      (#601, #606). `promote_conflicts/1` flags high-similarity pairs;
      `judge_redundant_conflicts/1` then records a verdict on them —
      `classification: :redundant, disposition: :dismiss`, because cosine
@@ -46,24 +64,24 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      pile shrinks by arithmetic rather than by hoping the inflow stops. The judge
      runs after the promoter within the same night so a pair flagged tonight
      never spends a night suppressing both its articles from curated answers.
-  4. **Consolidates the corpus** (#584, #605) — runs
+  5. **Consolidates the corpus** (#584, #605) — runs
      `Loopctl.Knowledge.Consolidation.run/2`, which emits numbered,
      evidence-carrying proposals for the two live defect classes and persists them
      as the tenant's report for the day. It scans the corpus itself and takes no
      input from the lint report above. It writes nothing to `article_links` or
      `conflict_resolutions`; the ONLY article write it can make is the reversible
-     confirmed-duplicate unpublish in step 5. This runs inside the existing
+     confirmed-duplicate unpublish in step 6. This runs inside the existing
      nightly pass on purpose: a second scheduler over the same corpus is the
      specific failure #584 names. It is also FAIL-SOFT: a raise or a pool exit
      inside it is recorded in the audit event and never aborts the run
      (see `consolidate/1`).
-  5. **Applies the confirmed duplicates** — `apply_confirmed_duplicates/2`
+  6. **Applies the confirmed duplicates** — `apply_confirmed_duplicates/2`
      unpublishes the losers of each `:duplicate_capture` group that TONIGHT's
-     report and the PREVIOUS one both propose. It runs after step 4 on purpose,
+     report and the PREVIOUS one both propose. It runs after step 5 on purpose,
      so the two-run comparison is tonight-against-last-night. Unpublish, never
      archive: `:archived` is terminal for an article and nothing unattended may
      take a one-way door.
-  6. **Surfaces all findings** via an immutable audit event
+  7. **Surfaces all findings** via an immutable audit event
      (`knowledge.lint_completed`) carrying the full lint summary, so coverage
      gaps / broken sources / stale counts are observable in the change feed even
      though nothing repairs them — each would need a correctness signal this
@@ -97,6 +115,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.Consolidation
+  alias Loopctl.Knowledge.LinkPruning
   alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Workers.ArticleLinkingWorker
@@ -155,6 +174,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     {:ok, report} = Knowledge.lint(tenant_id, max_per_category: @lint_max_per_category)
 
     action = act_on_orphans(tenant_id, report)
+    # Prune BEFORE the orphan count above is acted on? No — deliberately after. Union-kNN
+    # keeps every article's own top-K, so an article holding at least one edge holds it at
+    # rank 1 and the prune cannot create an orphan; ordering the two is therefore a matter
+    # of cost, not correctness, and pruning second keeps the lint report describing the
+    # graph the rest of this run reasons about.
+    pruned = prune_links(tenant_id)
     promoted = promote_conflicts(tenant_id)
     # The judge runs AFTER promotion so a pair flagged tonight is also judged tonight and
     # never spends a night suppressing its two articles. It is bounded above the promotion
@@ -171,21 +196,21 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # failing.
     applied = apply_consolidation(tenant_id, consolidation)
 
-    log_audit_event(
-      tenant_id,
-      report,
-      action,
-      promoted,
-      judged,
-      resolutions_applied,
-      consolidation,
-      applied
-    )
+    log_audit_event(tenant_id, report, %{
+      action: action,
+      pruned: pruned,
+      promoted: promoted,
+      judged: judged,
+      resolutions_applied: resolutions_applied,
+      consolidation: consolidation,
+      applied: applied
+    })
 
     Logger.info(
       "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
         "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
         "conflicts_promoted=#{promoted} conflicts_judged_redundant=#{judged} " <>
+        "links_pruned=#{pruned.pruned} links_prunable_remaining=#{pruned.remaining} " <>
         "resolutions_applied=#{resolutions_applied} " <>
         "duplicates_unpublished=#{applied.applied} duplicate_groups_skipped=#{applied.skipped} " <>
         "duplicates_unpublish_failed=#{applied.failed} " <>
@@ -514,6 +539,29 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # whose unpublishes had already committed). What reaches this rescue is a failure BEFORE
   # any write — the confirmed-set SELECT — so a zero tally here is true; it carries an
   # `:error` tag so the audit event still separates it from a night with nothing to apply.
+  # FAIL-SOFT for the same reason `consolidate/1` is: by the time this runs the pass has
+  # already taken effectful steps and has not yet written its audit event, so letting a
+  # statement timeout or a pool exit out of here would lose the whole night's record.
+  # A failed prune is reported as `remaining: -1` — distinguishable from "nothing left to
+  # prune" (0), because a zero here would read as a converged graph.
+  defp prune_links(tenant_id) do
+    {:ok, result} = LinkPruning.prune(tenant_id)
+    result
+  rescue
+    e -> prune_failed(tenant_id, ExitTag.tag(e))
+  catch
+    :exit, reason -> prune_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
+  end
+
+  defp prune_failed(tenant_id, tag) do
+    Logger.error(
+      "KnowledgeLintWorker: tenant=#{tenant_id} relates_to link pruning failed (#{tag}); " <>
+        "the graph keeps its current degree this run."
+    )
+
+    %{pruned: 0, remaining: -1}
+  end
+
   defp apply_consolidation(_tenant_id, {:error, _tag}), do: %{applied: 0, skipped: 0, failed: 0}
 
   defp apply_consolidation(tenant_id, {:ok, _report}) do
@@ -613,16 +661,18 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   defp consolidation_state({:error, tag}, _applied),
     do: %{"status" => "failed", "error" => tag}
 
-  defp log_audit_event(
-         tenant_id,
-         report,
-         action,
-         promoted,
-         judged,
-         resolutions_applied,
-         consolidation,
-         applied
-       ) do
+  # The per-step results arrive as ONE map rather than nine positionals. That is not only
+  # arity hygiene: every step this worker gains adds a parameter here, and a positional list
+  # that long silently accepts two same-typed counts swapped at the call site.
+  defp log_audit_event(tenant_id, report, %{
+         action: action,
+         pruned: pruned,
+         promoted: promoted,
+         judged: judged,
+         resolutions_applied: resolutions_applied,
+         consolidation: consolidation,
+         applied: applied
+       }) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "knowledge_lint",
       entity_id: tenant_id,
@@ -640,6 +690,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         # over several nights, the drain is merely holding the line and the caps need
         # revisiting — that is not visible from either number alone.
         "conflicts_judged_redundant" => judged,
+        # Same convergence reading as the pair above, for the graph. `links_prunable_remaining`
+        # is what a capped run could not reach; 0 means the graph is at its target degree.
+        # A -1 means the prune FAILED and is deliberately not 0 — a zero there would read as
+        # converged, which is the one wrong conclusion available.
+        "links_pruned" => pruned.pruned,
+        "links_prunable_remaining" => pruned.remaining,
         "resolutions_applied" => resolutions_applied,
         "consolidation" => consolidation_state(consolidation, applied)
       }
