@@ -59,11 +59,18 @@ defmodule Loopctl.Knowledge.LinkPruning do
   - `metadata->>'similarity_score' IS NOT NULL` — an edge with no recorded similarity cannot be
     ranked, so it cannot be shown to be outside anyone's top-K. Unrankable means unprunable.
 
-  One further class is RANKED but never DELETED: a `relates_to` edge at or above
-  `:knowledge_conflict_threshold`. `KnowledgeLintWorker.promote_conflicts/1` sources its
-  candidates EXCLUSIVELY from those rows, capped at 500/night against a much larger backlog, so
-  deleting one before the promoter reaches it makes that pair permanently invisible to conflict
-  detection. They still occupy top-K slots, so protecting them costs the degree bound nothing.
+  One further class is RANKED but SPARED WHILE IT IS STILL PROMOTER INPUT: a `relates_to` edge
+  at or above `:knowledge_conflict_threshold` whose pair carries NO `:potential_conflict` edge
+  yet. `KnowledgeLintWorker.promote_conflicts/1` sources its candidates EXCLUSIVELY from those
+  rows, capped at 500/night against a much larger backlog, so deleting one before the promoter
+  reaches it makes that pair permanently invisible to conflict detection.
+
+  The spare mirrors BOTH halves of the promoter's own candidate query — the similarity floor
+  AND its `not exists` clause — so it is RELEASED the moment the pair is flagged. Copying only
+  the similarity half left every promoted pair permanently unprunable while it was no longer
+  promoter input at all, accumulating in exactly the high-similarity region this pass exists to
+  thin. While a spare holds, that edge may sit outside both endpoints' top-K: the degree bound
+  is not reached for it, and it is NOT counted in `remaining`.
 
   ## Bounding
 
@@ -91,7 +98,11 @@ defmodule Loopctl.Knowledge.LinkPruning do
   @batch_size 50_000
   # SERVER bound on one batch. The CLIENT deadline must EXCEED it or DBConnection aborts the
   # checkout first and the server bound can never fire — the pairing that
-  # `:bulk_op_transaction_timeout_ms` exists for elsewhere.
+  # `:bulk_op_transaction_timeout_ms` exists for elsewhere. It has to be passed TWICE, on the
+  # transaction AND on the statement: Ecto stores only the CONNECTION in the process dictionary,
+  # never the transaction's opts, so a query inside the transaction otherwise falls back to the
+  # repo's DEFAULT 15 s `:timeout` — below the server bound, which is the same inversion one
+  # level down (`Knowledge.BulkOps` avoids it the other way, with a 10 s server bound).
   @statement_timeout_ms 30_000
   @transaction_timeout_ms @statement_timeout_ms + 5_000
 
@@ -111,8 +122,10 @@ defmodule Loopctl.Knowledge.LinkPruning do
   Prunes this tenant's `relates_to` edges to union-kNN top-K.
 
   Returns `{:ok, %{pruned: n, remaining: n}}`, or `{:error, reason}` when the FIRST batch
-  failed and nothing committed. `remaining` is how many prunable edges were still over the cap
-  when the run stopped — zero means the graph is at its target degree, `-1` means unmeasured.
+  failed and nothing committed. `remaining` is how many DELETABLE edges were still over the cap
+  when the run stopped — zero means nothing is left that this pass is ALLOWED to delete, which
+  is weaker than "the graph is at its target degree": an edge spared as promoter input (see the
+  moduledoc) is over-degree and uncounted. `-1` means unmeasured.
 
   Opts: `:target_degree`, `:max_per_run` (both default to the config values above).
   """
@@ -205,7 +218,14 @@ defmodule Loopctl.Knowledge.LinkPruning do
             doomed AS (
               SELECT e.id, e.sim FROM e
               LEFT JOIN keep ON keep.id = e.id
-              WHERE keep.id IS NULL AND coalesce(e.sim, 0) < #{conflict_band()}
+              WHERE keep.id IS NULL
+                AND (coalesce(e.sim, 0) < #{conflict_band()} OR EXISTS (
+                  SELECT 1 FROM article_links pc
+                  WHERE pc.tenant_id = $1
+                    AND pc.relationship_type = 'potential_conflict'
+                    AND ((pc.source_article_id = e.a AND pc.target_article_id = e.b)
+                      OR (pc.source_article_id = e.b AND pc.target_article_id = e.a))
+                ))
             ),
             deleted AS (
               DELETE FROM article_links
@@ -214,7 +234,8 @@ defmodule Loopctl.Knowledge.LinkPruning do
             )
             SELECT (SELECT count(*) FROM deleted), (SELECT count(*) FROM doomed)
             """,
-            [Ecto.UUID.dump!(tenant_id), k, limit]
+            [Ecto.UUID.dump!(tenant_id), k, limit],
+            timeout: @transaction_timeout_ms
           )
 
         {deleted, prunable}
@@ -235,7 +256,8 @@ defmodule Loopctl.Knowledge.LinkPruning do
 
   @doc """
   The SQL predicate selecting the edges this module RANKS — machine-derived, rankable
-  `relates_to` only; the delete additionally spares the conflict band (see the moduledoc).
+  `relates_to` only; the delete additionally spares a conflict-band pair the promoter has not
+  reached yet (see the moduledoc).
   Exposed so the test can assert the guard is in the STATEMENT, not in whichever prose it read.
   """
   @spec prunable_predicate() :: String.t()
@@ -246,19 +268,23 @@ defmodule Loopctl.Knowledge.LinkPruning do
   end
 
   @doc """
-  Ecto query over the edges this module may delete, for callers that need to count or
-  inspect them without hand-writing the predicate.
-  """
-  @spec prunable_query(Ecto.UUID.t()) :: Ecto.Query.t()
-  def prunable_query(tenant_id) do
-    band = conflict_threshold()
+  Ecto query over the edges this module can RECLAIM from `tenant_id` — machine-derived,
+  rankable `relates_to`. The conflict-band spare is deliberately not applied here: it is
+  transient, released as soon as the promoter flags the pair, so a band edge is reclaimable in
+  the long run.
 
+  `ArticleLinkingWorker` derives its per-article write headroom from this, so the writer's
+  bound and the pruner's target are ONE definition of degree. Where they differed, an edge this
+  module can never free (hand-made, or scoreless and so unrankable) consumed a write slot
+  forever and switched that article's auto-linking off with no path back.
+  """
+  @spec reclaimable_query(Ecto.UUID.t()) :: Ecto.Query.t()
+  def reclaimable_query(tenant_id) do
     from(l in Loopctl.Knowledge.ArticleLink,
       where: l.tenant_id == ^tenant_id,
       where: l.relationship_type == :relates_to,
       where: fragment("?->>'auto_generated' = 'true'", l.metadata),
-      where: not is_nil(fragment("?->>'similarity_score'", l.metadata)),
-      where: fragment("(?->>'similarity_score')::float < ?", l.metadata, ^band)
+      where: not is_nil(fragment("?->>'similarity_score'", l.metadata))
     )
   end
 end

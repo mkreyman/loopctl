@@ -550,6 +550,42 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       assert degree == Application.get_env(:loopctl, :article_max_relates_to_links, 10)
     end
 
+    test "an edge the prune can never free does not consume the headroom" do
+      # Headroom used to count EVERY incident relates_to edge, including hand-made ones that
+      # `LinkPruning` may never delete. K of those switched this article's auto-linking off for
+      # good: no pass could free a slot again, so the writer's bound and the pruner's target
+      # were two different definitions of degree and the article lost by the difference.
+      %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      cap = Application.get_env(:loopctl, :article_max_relates_to_links, 10)
+
+      for _i <- 1..cap do
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: source.id,
+          target_article_id: create_published_article(tenant.id).id,
+          relationship_type: :relates_to,
+          metadata: %{"note" => "curated by hand"}
+        })
+      end
+
+      candidates = for _i <- 1..3, do: create_published_article(tenant.id)
+
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        Enum.map(candidates, &candidate(&1, 0.90))
+      end)
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      for c <- candidates do
+        assert links_of_type(tenant.id, source.id, c.id, :relates_to) != [],
+               "a hand-made link the prune cannot reclaim consumed a write slot forever"
+      end
+    end
+
     test "does NOT cap potential_conflict — that queue has its own draining consumer" do
       # `judge_redundant_conflicts/1` drains this pile capped ABOVE the promotion rate, so
       # it converges by arithmetic. Capping the producer here as well would silently

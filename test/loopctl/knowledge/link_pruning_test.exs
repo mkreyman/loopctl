@@ -258,10 +258,39 @@ defmodule Loopctl.Knowledge.LinkPruningTest do
 
       in_band = link(tenant.id, hub, target, band)
 
+      # `remaining: 0` here is "nothing DELETABLE is left", not "at target degree": the hub is
+      # over K precisely because of the row this guard spared.
       assert {:ok, %{remaining: 0}} =
                LinkPruning.prune(tenant.id, target_degree: 2, max_per_run: 1000)
 
       assert MapSet.member?(edge_ids(tenant.id), in_band.id)
+    end
+
+    test "deletes a band edge once the promoter has already flagged the pair" do
+      # The spare protects PROMOTER INPUT, and `promote_conflicts/1` excludes any pair that
+      # already carries a `:potential_conflict` edge (either direction). An unconditional band
+      # exemption kept this row forever while it could never be promoted again — accumulating
+      # in exactly the high-similarity region this pass exists to thin.
+      tenant = fixture(:tenant)
+      band = Application.get_env(:loopctl, :knowledge_conflict_threshold, 0.93)
+      hub = published(tenant.id)
+      target = published(tenant.id)
+
+      link(tenant.id, hub, published(tenant.id), band + 0.05)
+      link(tenant.id, hub, published(tenant.id), band + 0.04)
+      link(tenant.id, target, published(tenant.id), band + 0.05)
+      link(tenant.id, target, published(tenant.id), band + 0.04)
+
+      in_band = link(tenant.id, hub, target, band)
+      # REVERSE direction, matching the promoter's own pair-wise `not exists`: the spare is
+      # released for the PAIR, not for one row's orientation.
+      flagged = typed_link(tenant.id, target, hub, band, :potential_conflict)
+
+      assert {:ok, %{pruned: 1, remaining: 0}} =
+               LinkPruning.prune(tenant.id, target_degree: 2, max_per_run: 1000)
+
+      refute MapSet.member?(edge_ids(tenant.id), in_band.id)
+      assert MapSet.member?(edge_ids(tenant.id, :potential_conflict), flagged.id)
     end
 
     test "the prune is ONE statement, and it carries the predicate" do
@@ -285,6 +314,17 @@ defmodule Loopctl.Knowledge.LinkPruningTest do
       assert interpolations == 1,
              "expected exactly ONE SQL statement interpolating prunable_predicate/0, found " <>
                "#{interpolations}"
+
+      # ...and it carries the client deadline TWICE. Ecto stores only the connection in the
+      # process dictionary, never the transaction's opts, so a query inside the transaction
+      # falls back to the repo's default 15 s `:timeout` — below the 30 s server bound, which
+      # is the inversion the pairing exists to prevent, one level down.
+      deadlines =
+        source |> String.split("timeout: @transaction_timeout_ms") |> length() |> Kernel.-(1)
+
+      assert deadlines == 2,
+             "expected the client deadline on BOTH the transaction and the statement, found " <>
+               "#{deadlines}"
     end
   end
 

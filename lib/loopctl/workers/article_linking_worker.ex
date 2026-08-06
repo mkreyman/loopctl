@@ -65,16 +65,27 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   articles**, 59% of them between 0.60 and 0.70, and 56% of articles carrying 21+ edges.
   A graph that dense relates nearly everything to everything and so distinguishes nothing.
 
-  `relates_to` is now capped at `:article_max_relates_to_links` (default 10) STORED edges per
-  article, counting edges INCIDENT to it in either direction: the cut runs AFTER the
+  `relates_to` writes are now bounded by HEADROOM: `:article_max_relates_to_links` (default 10)
+  minus the edges already incident to this article, in either direction, that
+  `LinkPruning.reclaimable_query/1` says the prune can free. The cut runs AFTER the
   already-linked rejection, so a re-link (nightly orphan pass, a re-embed) tops the article up
   to K rather than adding K more. `:potential_conflict` is NOT capped — it has its own
   threshold and its own draining consumer, and a second cap there would withhold pairs from a
   queue designed to converge.
 
-  The cap bounds what this worker WRITES; it cannot retract the edges written before it
-  existed, which is why #611 stage 0 also prunes the standing backlog. See
-  `Loopctl.Knowledge.LinkPruning`.
+  Two things this bound is NOT, stated because both are easy to read into it:
+
+  - **Not a bound on TOTAL degree.** Only the article being linked has its headroom checked;
+    another article writing an edge INTO this one never consults this one's degree, so a hub
+    still accrues inbound edges without limit here. Total degree is bounded by the nightly
+    prune's union-kNN target, not by this cap.
+  - **Not "the best K".** A stored edge is never displaced: at headroom 0 a strictly nearer
+    candidate is discarded rather than replacing a weaker stored edge, so the set is
+    first-K-acquired until the prune frees a slot. `top_k/2`'s sort decides which of THIS run's
+    candidates win, not which of all time's.
+
+  And it cannot retract the edges written before it existed, which is why #611 stage 0 also
+  prunes the standing backlog. See `Loopctl.Knowledge.LinkPruning`.
 
   ## Retry Strategy (AC-21.2.13)
 
@@ -102,6 +113,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.LinkPruning
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.LocalGuc
   alias Loopctl.Oban.FairShare
@@ -248,8 +260,10 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
   # The `headroom` nearest candidates, by similarity. `find_similar_articles/4` returns them
   # in kNN order already, but that ordering is the vector index's and this cut must not depend
-  # on it: an explicit sort makes the bound a property of THIS function, so a future change
-  # to the search path cannot silently turn "the best K" into "whichever K arrived first".
+  # on it: an explicit sort makes the bound a property of THIS function, so a future change to
+  # the search path cannot silently turn "the best K of this run's candidates" into "whichever
+  # K arrived first". It does NOT reorder already-STORED edges — those are never displaced, so
+  # across runs the stored set is first-K-acquired (see the moduledoc).
   # Ties break on id so the cut is deterministic across re-runs — a re-link that kept a
   # different arbitrary half each night would churn the graph forever.
   defp top_k(candidates, :infinity), do: candidates
@@ -260,13 +274,28 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     |> Enum.take(headroom)
   end
 
-  # K minus what this article ALREADY holds, which is what makes the cap a bound on STORED
-  # degree rather than on one run's writes. The cut used to run on the candidate list BEFORE
-  # the already-linked rejection below, so existing edges cost nothing against K and every
-  # re-link (nightly orphan pass, a re-embed) could add K MORE — degree grew without bound
-  # between prunes, and the write-side cap the moduledoc claims held per run only.
-  defp headroom(:infinity, _existing), do: :infinity
-  defp headroom(cap, existing), do: max(cap - existing, 0)
+  # K minus the edges this article already holds THAT THE PRUNE CAN RECLAIM. Two halves:
+  #
+  # * STORED, not per-run: the cut runs AFTER the already-linked rejection below. It used to run
+  #   before it, so existing edges cost nothing against K and every re-link (nightly orphan
+  #   pass, a re-embed) could add K MORE — degree grew without bound between prunes.
+  # * RECLAIMABLE, not merely incident: counting EVERY incident edge counted rows `LinkPruning`
+  #   may never delete (hand-made links, and scoreless ones it cannot rank), so K of those
+  #   switched this article's auto-linking off with no pass able to free a slot again. The count
+  #   comes from `LinkPruning.reclaimable_query/1` so the writer's bound and the pruner's target
+  #   are one definition of degree rather than two that can disagree — which also means a finite
+  #   cap applies to `:relates_to` only, the sole type either of them bounds.
+  defp headroom(:infinity, _article_id, _tenant_id), do: :infinity
+
+  defp headroom(cap, article_id, tenant_id) do
+    reclaimable =
+      tenant_id
+      |> LinkPruning.reclaimable_query()
+      |> where([l], l.source_article_id == ^article_id or l.target_article_id == ^article_id)
+      |> AdminRepo.aggregate(:count)
+
+    max(cap - reclaimable, 0)
+  end
 
   # Per-article cap for `relates_to`. Kept well under `max_comparisons` (50) —
   # a cap at or above the candidate count is not a cap.
@@ -290,7 +319,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
         MapSet.member?(existing, {cid, article_id})
     end)
     # AFTER the rejection, so an already-linked pair does not consume a slot it already holds.
-    |> top_k(headroom(cap, MapSet.size(existing)))
+    |> top_k(headroom(cap, article_id, tenant_id))
     |> Enum.map(fn %{id: target_id, similarity: score} ->
       %{
         source_article_id: article_id,

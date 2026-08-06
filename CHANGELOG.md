@@ -23,9 +23,12 @@ Operator-facing changes for deployments outside the hosted instance.
   nothing — which also means the one-hop enrichment in progressive disclosure was spending
   its budget on noise.
 
-  What changes: `ArticleLinkingWorker` now holds each article at `article_max_relates_to_links`
-  (**new setting, default 10**) STORED `relates_to` edges — a re-link tops it up to that number
-  rather than adding that many more — and `Loopctl.Knowledge.LinkPruning` drains
+  What changes: `ArticleLinkingWorker` now writes `relates_to` edges only up to
+  `article_max_relates_to_links` (**new setting, default 10**) minus the prunable edges an
+  article already holds — a re-link tops it up to that number rather than adding that many
+  more. That bounds what the worker writes for the article it is linking; edges other articles
+  write INTO it are bounded by the prune below, not by this setting.
+  `Loopctl.Knowledge.LinkPruning` drains
   the existing backlog at up to `knowledge_link_prune_max_per_run` (**new setting, default
   250,000**) edges per nightly run, worst-first, reporting the remainder on the
   `knowledge.lint_completed` audit event as `links_pruned` / `links_prunable_remaining`.
@@ -34,9 +37,11 @@ Operator-facing changes for deployments outside the hosted instance.
   What is NOT touched: `potential_conflict` edges (own threshold, own draining consumer),
   any `relates_to` link without `auto_generated: true`, any link without a recorded
   `similarity_score`, and any `relates_to` edge at or above `knowledge_conflict_threshold`
-  (those rows are the conflict promoter's only input, and it drains them far slower than the
-  prune would delete them). A hand-made link is structurally out of reach, and an edge that
-  cannot be ranked cannot be shown to be prunable.
+  whose pair the conflict promoter has not flagged yet (those rows are the promoter's only
+  input, and it drains them far slower than the prune would delete them; once a pair is
+  flagged it is no longer promoter input and the edge is prunable like any other). A hand-made
+  link is structurally out of reach, and an edge that cannot be ranked cannot be shown to be
+  prunable.
 
   Why deleting is safe unattended, when every other automated step in that worker is gated on
   reversibility: an auto-generated edge is a *derived artifact*, not a record — a pure

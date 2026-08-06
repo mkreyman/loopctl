@@ -52,9 +52,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      graph relates nearly everything to everything and distinguishes nothing.
      Union-kNN (an edge survives if it is in EITHER endpoint's top-K) guarantees
      every article keeps its own K nearest, which is also why the prune can never
-     create an orphan. An edge at or above the conflict threshold is ranked but never
-     deleted, so step 4's promoter keeps every candidate it has not reached yet.
-     Bounded per run, worst-first, and FAIL-SOFT.
+     create an orphan. An edge at or above the conflict threshold is ranked but spared
+     until step 4's promoter has flagged the pair, so the promoter keeps every candidate
+     it has not reached yet. Bounded per run, worst-first, and FAIL-SOFT.
   4. **Promotes, judges and executes conflicts**, in that order and in one pass
      (#601, #606). `promote_conflicts/1` flags high-similarity pairs;
      `judge_redundant_conflicts/1` then records a verdict on them —
@@ -180,9 +180,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # halves of that are structural rather than positional. Union-kNN keeps every article's own
     # top-K, so an article holding at least one edge holds it at rank 1 and the prune cannot
     # create an orphan. And a `relates_to` edge at or above the conflict threshold is RANKED but
-    # never DELETED, so the prune cannot take a candidate out from under `promote_conflicts/1`
-    # below — which is capped at 500/night against a much larger backlog, so a pair deleted
-    # before it was reached would be lost to conflict detection permanently.
+    # SPARED while the pair carries no `:potential_conflict` edge, so the prune cannot take a
+    # candidate out from under `promote_conflicts/1` below — which is capped at 500/night
+    # against a much larger backlog, so a pair deleted before it was reached would be lost to
+    # conflict detection permanently. The spare lifts once the pair is flagged: it is no longer
+    # promoter input, and an unconditional exemption would make it permanently unprunable.
     pruned = prune_links(tenant_id)
     promoted = promote_conflicts(tenant_id)
     # The judge runs AFTER promotion so a pair flagged tonight is also judged tonight and
@@ -700,9 +702,10 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         # revisiting — that is not visible from either number alone.
         "conflicts_judged_redundant" => judged,
         # Same convergence reading as the pair above, for the graph. `links_prunable_remaining`
-        # is what a capped run could not reach; 0 means the graph is at its target degree.
-        # A -1 means the prune FAILED and is deliberately not 0 — a zero there would read as
-        # converged, which is the one wrong conclusion available.
+        # is what a capped run could not reach; 0 means nothing DELETABLE is left, which is
+        # weaker than "at target degree" — an edge spared as conflict-promoter input is
+        # over-degree and uncounted. A -1 means the prune FAILED and is deliberately not 0 — a
+        # zero there would read as drained, which is the one wrong conclusion available.
         "links_pruned" => pruned.pruned,
         "links_prunable_remaining" => pruned.remaining,
         "resolutions_applied" => resolutions_applied,
