@@ -151,29 +151,50 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     # single scope would be the most restrictive one, which would block articles that
     # are not marked. Grouping keeps each decision exact.
     |> Enum.group_by(fn {article, _text, _hash} -> article.project_id end)
-    |> Enum.reduce_while(:ok, fn {project_id, group}, :ok ->
-      case generate_and_store_project_group(tenant_id, project_id, group) do
-        :ok -> {:cont, :ok}
-        other -> {:halt, other}
-      end
-    end)
+    |> Enum.to_list()
+    |> embed_groups(tenant_id)
+  end
+
+  defp embed_groups([], _tenant_id), do: :ok
+
+  defp embed_groups([{project_id, group} | rest], tenant_id) do
+    case generate_and_store_project_group(tenant_id, project_id, group) do
+      :ok ->
+        embed_groups(rest, tenant_id)
+
+      # Once ONE array has been rejected for length, this job stops sending arrays
+      # ENTIRELY: the rejected sub-batch AND everything queued behind it are handed to
+      # the per-article worker. Carrying on would let a later sub-batch's snooze/error
+      # rerun the whole job, which would re-send the rejected array (guaranteed to be
+      # rejected again) — and halting without the handoff would strand the remainder.
+      {:dissolve, remaining} ->
+        dissolve(tenant_id, remaining ++ Enum.flat_map(rest, fn {_pid, group} -> group end))
+
+      other ->
+        other
+    end
   end
 
   defp generate_and_store_project_group(tenant_id, project_id, to_embed) do
     to_embed
     |> chunk_by_char_budget(Knowledge.embedding_batch_max_chars())
-    |> Enum.reduce_while(:ok, fn sub_batch, :ok ->
-      case embed_and_store_sub_batch(tenant_id, project_id, sub_batch) do
-        :ok -> {:cont, :ok}
-        other -> {:halt, other}
-      end
-    end)
+    |> embed_sub_batches(tenant_id, project_id)
+  end
+
+  defp embed_sub_batches([], _tenant_id, _project_id), do: :ok
+
+  defp embed_sub_batches([sub_batch | rest], tenant_id, project_id) do
+    case embed_and_store_sub_batch(tenant_id, project_id, sub_batch) do
+      :ok -> embed_sub_batches(rest, tenant_id, project_id)
+      :dissolve -> {:dissolve, sub_batch ++ Enum.concat(rest)}
+      other -> other
+    end
   end
 
   # Greedy split of `to_embed` tuples into sub-batches whose cumulative text
   # `byte_size` stays at/under `max_chars`. A single input larger than the budget
-  # (already truncated to `TextBudget.initial_bytes/0`) still forms its own sub-batch
-  # rather than wedging into an empty one.
+  # (already cut by `TextBudget.initial/1`) still forms its own sub-batch rather than
+  # wedging into an empty one.
   defp chunk_by_char_budget(to_embed, max_chars) do
     chunk_fun = fn {_article, text, _hash} = item, {acc, size} ->
       len = byte_size(text)
@@ -284,25 +305,10 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   # (it would be rejected identically forever), and shrinking every text to fit the
   # unknown offender would truncate articles that were never over the limit.
   #
-  # So: dissolve the batch into single-article jobs. `ArticleEmbeddingWorker` walks
-  # the per-article shrink ladder, which pays the truncation cost ONLY on the
-  # article that actually overflows. The batch itself is done — `:ok`, not a
-  # discard, because its work has been handed on rather than dropped.
-  defp handle_batch_error(tenant_id, to_embed, {:api_error, _status, :context_length_exceeded}) do
-    Enum.each(to_embed, fn {article, _text, _hash} ->
-      %{tenant_id: tenant_id, article_id: article.id}
-      |> ArticleEmbeddingWorker.new()
-      |> Oban.insert()
-    end)
-
-    Logger.warning(
-      "BatchArticleEmbeddingWorker: tenant=#{tenant_id} batch=#{length(to_embed)} rejected — " <>
-        "at least one input exceeds the provider token limit. Re-enqueued as single-article " <>
-        "jobs so only the over-long article(s) get truncated."
-    )
-
-    :ok
-  end
+  # So: signal DISSOLVE. The enqueue happens in `dissolve/2`, at the level that also
+  # knows the sub-batches this job would still have sent as arrays.
+  defp handle_batch_error(_tenant_id, _to_embed, {:api_error, _status, :context_length_exceeded}),
+    do: :dissolve
 
   defp handle_batch_error(tenant_id, to_embed, reason) do
     # No partial writes happened (we only store after a full success), so the whole
@@ -319,6 +325,32 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     else
       {:error, sanitized}
     end
+  end
+
+  # Hand every still-unembedded article to `ArticleEmbeddingWorker`, whose per-article
+  # shrink ladder pays the truncation cost ONLY on the article that actually overflows.
+  #
+  # `:ok` here claims the work was handed on rather than dropped, so every insert is
+  # CHECKED: an unchecked `Oban.insert/1` failure (a changeset rejection, a DB blip)
+  # would report a successful batch while silently losing those articles from the
+  # pipeline. A failed handoff returns `{:error, _}` so Oban retries the batch instead.
+  defp dissolve(tenant_id, to_embed) do
+    failed =
+      to_embed
+      |> Enum.map(fn {article, _text, _hash} ->
+        %{tenant_id: tenant_id, article_id: article.id}
+        |> ArticleEmbeddingWorker.new()
+        |> Oban.insert()
+      end)
+      |> Enum.reject(&match?({:ok, _job}, &1))
+
+    Logger.warning(
+      "BatchArticleEmbeddingWorker: tenant=#{tenant_id} batch=#{length(to_embed)} rejected — " <>
+        "at least one input exceeds the provider token limit. Re-enqueued as single-article " <>
+        "jobs so only the over-long article(s) get truncated (#{length(failed)} enqueue failed)."
+    )
+
+    if failed == [], do: :ok, else: {:error, :dissolve_enqueue_failed}
   end
 
   # Store every vector against its article + enqueue linking. A store failure (other
@@ -453,9 +485,11 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     |> Oban.insert()
   end
 
+  # The initial CHARACTER cap, shared verbatim with `ArticleEmbeddingWorker` — both
+  # write `embedding_content_hash` into the same side table and read each other's back
+  # as the no-re-bill guard, so a divergent unit here makes every hash miss.
   defp build_embedding_text(article) do
-    "#{article.title}\n\n#{article.body}"
-    |> TextBudget.truncate(TextBudget.initial_bytes())
+    TextBudget.initial("#{article.title}\n\n#{article.body}")
   end
 
   # Task.yield budget (ms) for a sub-batch provider call — live-tunable via

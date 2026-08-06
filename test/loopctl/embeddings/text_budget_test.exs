@@ -15,28 +15,37 @@ defmodule Loopctl.Embeddings.TextBudgetTest do
   alias Loopctl.Embeddings.TextBudget
 
   describe "the ladder terminates" do
-    test "shrink/1 reaches the floor and then reports exhaustion" do
+    test "next_budget/1 reaches the floor and then reports exhaustion" do
       rungs =
-        Stream.unfold(TextBudget.initial_bytes(), fn
+        Stream.unfold(TextBudget.top_rung_bytes(), fn
           :exhausted -> nil
-          budget -> {budget, TextBudget.shrink(budget)}
+          budget -> {budget, TextBudget.next_budget(budget)}
         end)
         |> Enum.take(50)
 
       assert List.last(rungs) == TextBudget.floor_bytes(),
              "the ladder must END at the floor, not merely approach it"
 
-      assert TextBudget.shrink(TextBudget.floor_bytes()) == :exhausted
+      assert TextBudget.next_budget(TextBudget.floor_bytes()) == :exhausted
 
-      # The real guarantee: bounded, and small. Two retries, not fifty.
+      # The real guarantee: bounded, and small. A handful of rungs, not fifty.
       assert length(rungs) <= 4, "ladder should be a handful of rungs, got #{length(rungs)}"
     end
 
-    test "shrink/1 below the floor is exhausted, never a smaller positive budget" do
-      # A budget under the floor can only arise from a caller bug; halving it further
-      # would send ever-tinier prefixes to a paid provider instead of failing loudly.
-      assert TextBudget.shrink(1) == :exhausted
-      assert TextBudget.shrink(TextBudget.floor_bytes() - 1) == :exhausted
+    test "every rung is STRICTLY smaller than the bytes that were rejected" do
+      # Keyed to what was SENT, not to a nominal budget: a budget above the text's own
+      # size truncates nothing, so halving it would re-send a byte-identical request and
+      # pay for a guaranteed-identical rejection. Below the floor is :exhausted, never a
+      # smaller prefix; far above the top rung drops straight ONTO it, in one hop.
+      assert TextBudget.next_budget(1) == :exhausted
+      assert TextBudget.next_budget(TextBudget.floor_bytes() - 1) == :exhausted
+
+      for sent <- [10_000, 32_000, 59_428, 128_000, TextBudget.floor_bytes() + 1] do
+        assert TextBudget.next_budget(sent) < sent,
+               "next_budget(#{sent}) did not shrink what was actually sent"
+      end
+
+      assert TextBudget.next_budget(128_000) == TextBudget.top_rung_bytes()
     end
   end
 
@@ -48,10 +57,22 @@ defmodule Loopctl.Embeddings.TextBudgetTest do
       assert TextBudget.floor_bytes() < 8192
     end
 
-    test "the initial budget is generous enough not to gut ordinary articles" do
+    test "the top rung is generous enough not to gut ordinary articles" do
       # Starting AT the floor would be the trivial fix and the wrong one: it would
       # truncate every article in the corpus to fix the 0.1% that overflow.
-      assert TextBudget.initial_bytes() >= 4 * TextBudget.floor_bytes()
+      assert TextBudget.top_rung_bytes() >= 4 * TextBudget.floor_bytes()
+    end
+
+    test "initial/1 is NOT byte-capped — it keeps text the provider would accept" do
+      # Bounding the FIRST attempt in bytes shortens articles that were embedding fine:
+      # Russian prose runs ~6 bytes/token, so this is ~39,000 bytes but only ~6,500
+      # tokens, and a byte cap would drop a fifth of it silently. Chars still bound it.
+      text = String.duplicate("привет ", 3_000)
+      assert byte_size(text) > TextBudget.top_rung_bytes()
+      assert TextBudget.initial(text) == text, "truncated text the provider accepts whole"
+
+      huge = String.duplicate("a", TextBudget.initial_chars() * 2)
+      assert String.length(TextBudget.initial(huge)) == TextBudget.initial_chars()
     end
   end
 

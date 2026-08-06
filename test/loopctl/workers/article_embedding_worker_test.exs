@@ -548,21 +548,23 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       article =
         create_draft_then_publish(tenant.id, %{
           title: "Over Long Article",
-          # Cyrillic: 2 bytes/char, so this is well over the initial byte budget —
-          # the exact population the character cap mis-measured.
+          # Cyrillic: 2 bytes/char, so this is well over any byte rung — the exact
+          # population the character cap mis-measured.
           body: String.duplicate("привет ", 6_000)
         })
 
-      # First call rejected as too long; second (shorter) call succeeds.
+      # First call rejected as too long; second (shorter) call succeeds. Sizes are
+      # reported back to the test process — the client runs in its own task, so the
+      # comparison cannot be made inside the stub.
+      test_pid = self()
+
       Loopctl.MockEmbeddingClient
       |> expect(:generate_embedding, fn _tenant_id, text ->
-        assert byte_size(text) <= TextBudget.initial_bytes()
+        send(test_pid, {:attempt, byte_size(text)})
         {:error, {:api_error, 400, :context_length_exceeded}}
       end)
       |> expect(:generate_embedding, fn _tenant_id, text ->
-        assert byte_size(text) <= TextBudget.shrink(TextBudget.initial_bytes()),
-               "the retry must send STRICTLY LESS than the attempt that was rejected"
-
+        send(test_pid, {:attempt, byte_size(text)})
         {:ok, embedding}
       end)
 
@@ -570,6 +572,12 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
                ArticleEmbeddingWorker.perform(%Oban.Job{
                  args: %{"article_id" => article.id, "tenant_id" => tenant.id}
                })
+
+      assert_received {:attempt, first}
+      assert_received {:attempt, second}
+
+      assert second <= TextBudget.next_budget(first),
+             "the retry must send STRICTLY LESS than the attempt that was rejected"
 
       # The article is embedded — not left in the reconciler's hourly retry loop.
       {:ok, stored} = Knowledge.get_article_with_embedding(tenant.id, article.id)
@@ -630,24 +638,28 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
                })
     end
 
-    test "the text sent is bounded by BYTES, not characters" do
+    test "the RETRY is bounded by BYTES, not characters" do
       # The mutation that caused the outage: swap TextBudget.truncate/2 back for
-      # String.slice/3 and this assertion is what fails.
+      # String.slice/3 on the retry and this assertion is what fails — a shrunk
+      # attempt measured in characters is not a smaller number of TOKENS.
       %{tenant: tenant} = setup_tenant()
       embedding = List.duplicate(0.5, 1536)
+      test_pid = self()
 
       article =
         create_draft_then_publish(tenant.id, %{
           title: "Byte Bounded",
-          # 30,000 Cyrillic chars = 60,000 bytes. A 32,000-CHARACTER cap would send
-          # 32,000 chars (~64,000 bytes); the byte cap sends at most 32,000 bytes.
+          # 30,000 Cyrillic chars = 60,000 bytes, under the 32,000-character initial
+          # cut — so the retry, not the first attempt, is where bytes must bind.
           body: String.duplicate("я", 30_000)
         })
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
-        assert byte_size(text) <= TextBudget.initial_bytes(),
-               "sent #{byte_size(text)} bytes, budget is #{TextBudget.initial_bytes()}"
-
+      Loopctl.MockEmbeddingClient
+      |> expect(:generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 400, :context_length_exceeded}}
+      end)
+      |> expect(:generate_embedding, fn _tenant_id, text ->
+        send(test_pid, {:retry_bytes, byte_size(text)})
         assert String.valid?(text), "truncation split a UTF-8 codepoint"
         {:ok, embedding}
       end)
@@ -656,6 +668,41 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
                ArticleEmbeddingWorker.perform(%Oban.Job{
                  args: %{"article_id" => article.id, "tenant_id" => tenant.id}
                })
+
+      assert_received {:retry_bytes, retried}
+
+      assert retried <= TextBudget.top_rung_bytes(),
+             "retry sent #{retried} bytes, top rung is #{TextBudget.top_rung_bytes()}"
+    end
+
+    test "the first attempt keeps multi-byte content the provider would accept" do
+      # The regression a BYTE cap on the first attempt introduces: an article that was
+      # embedding fine loses a third of its text, with no error and no log line, and
+      # its search recall degrades silently. Nothing marks it, so nothing finds it.
+      %{tenant: tenant} = setup_tenant()
+      embedding = List.duplicate(0.5, 1536)
+      test_pid = self()
+
+      # ~45,000 bytes of Cyrillic: over every byte rung, under the token limit.
+      body = String.duplicate("привет ", 3_000)
+      article = create_draft_then_publish(tenant.id, %{title: "Fits Whole", body: body})
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
+        send(test_pid, {:sent, text})
+        {:ok, embedding}
+      end)
+
+      assert :ok =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+
+      assert_received {:sent, sent}
+      assert byte_size(body) > TextBudget.top_rung_bytes(), "fixture no longer exercises the bug"
+
+      assert sent == "#{article.title}\n\n#{body}",
+             "the first attempt dropped #{byte_size(article.title) + byte_size(body) + 2 - byte_size(sent)} " <>
+               "bytes of an article the provider accepted whole"
     end
   end
 

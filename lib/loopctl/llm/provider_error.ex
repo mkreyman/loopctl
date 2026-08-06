@@ -86,14 +86,19 @@ defmodule Loopctl.Llm.ProviderError do
     end
   end
 
-  # The classifiable surface of a body: a bare string, or the `message`/`code` of a
-  # decoded `{"error" => ...}` envelope. Anything else is unclassifiable, NOT an
-  # error — it just falls back to the generic tag.
+  # The classifiable surface of a body. Vendor-agnostic in SHAPE as well as in
+  # spelling: OpenAI nests the text under `{"error" => %{"message" => ...}}`, but
+  # OpenAI-COMPATIBLE servers a tenant may point `base_url` at answer with a bare
+  # string body, a string-valued `"error"`, or a top-level `"detail"`/`"message"`
+  # (vLLM, TEI, FastAPI gateways). Reading only the nested map left those providers
+  # classified `:provider_error`, which discards a length rejection as permanent and
+  # never runs the shrink ladder — the same hourly re-enqueue loop, one provider over.
+  # Widening what is READ cannot widen what is KEPT: the output is still a fixed atom.
   defp body_signal(body) when is_binary(body), do: String.downcase(body)
 
-  defp body_signal(%{"error" => %{} = err}) do
-    [err["message"], err["code"]]
-    |> Enum.filter(&is_binary/1)
+  defp body_signal(body) when is_map(body) and not is_struct(body) do
+    [body["error"], body["message"], body["detail"], body["code"]]
+    |> Enum.flat_map(&signal_parts/1)
     |> case do
       [] -> nil
       parts -> parts |> Enum.join(" ") |> String.downcase()
@@ -101,6 +106,13 @@ defmodule Loopctl.Llm.ProviderError do
   end
 
   defp body_signal(_other), do: nil
+
+  defp signal_parts(text) when is_binary(text), do: [text]
+
+  defp signal_parts(err) when is_map(err) and not is_struct(err),
+    do: Enum.filter([err["message"], err["code"]], &is_binary/1)
+
+  defp signal_parts(_other), do: []
 
   @doc """
   Strip any provider response body/secret. Collapses the key-bearing provider
@@ -153,9 +165,13 @@ defmodule Loopctl.Llm.ProviderError do
   @spec sanitize(term(), non_neg_integer() | nil) :: t()
   def sanitize(reason, nil), do: sanitize(reason)
 
-  def sanitize({:api_error, status, _body}, retry_after)
+  # `classify(body)`, not a literal `:provider_error`: a gateway can answer a throttle
+  # with a body that still echoes the provider's length complaint, and flattening the
+  # tag on THIS path would silently disable the shrink ladder while sanitize/1 keeps
+  # it — the same downgrade the idempotency clause above exists to prevent.
+  def sanitize({:api_error, status, body}, retry_after)
       when is_integer(status) and is_integer(retry_after),
-      do: {:api_error, status, :provider_error, retry_after}
+      do: {:api_error, status, classify(body), retry_after}
 
   def sanitize({:api_error, status}, retry_after)
       when is_integer(status) and is_integer(retry_after),

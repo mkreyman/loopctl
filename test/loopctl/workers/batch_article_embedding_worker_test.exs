@@ -260,18 +260,20 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
       assert is_nil(stored.embedding)
     end
 
-    test "batch text is bounded by BYTES, not characters" do
+    test "batch text is cut by the SAME initial rule as the single-article path" do
       # There is no ladder on the batch path — build_embedding_text/1 IS what gets
-      # sent, so its unit is the whole guard here.
+      # sent. Both workers write `embedding_content_hash` into one side table and read
+      # each other's back as the no-re-bill guard, so a divergent cut here makes every
+      # hash miss and re-bills the provider on every enqueue.
       tenant = fixture(:tenant)
+      body = String.duplicate("я", 30_000)
 
-      article =
-        create_published_article(tenant.id, %{body: String.duplicate("я", 30_000)})
+      article = create_published_article(tenant.id, %{body: body})
 
       Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _t, texts ->
         for text <- texts do
-          assert byte_size(text) <= TextBudget.initial_bytes(),
-                 "sent #{byte_size(text)} bytes"
+          assert text == TextBudget.initial("#{article.title}\n\n#{body}"),
+                 "batch text diverged from the single-article cut"
 
           assert String.valid?(text), "truncation split a UTF-8 codepoint"
         end
@@ -280,6 +282,45 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
       end)
 
       assert :ok = perform(tenant.id, [article.id])
+    end
+
+    test "a length rejection hands on the sub-batches BEHIND it too, not just its own" do
+      # Continuing after a dissolve let a later sub-batch's snooze/error rerun the whole
+      # job, which re-sent the rejected array — guaranteed to be rejected again, for a
+      # second paid round trip. Once one array is rejected for length, this job stops
+      # sending arrays: everything left goes to the per-article ladder.
+      tenant = fixture(:tenant)
+      test_pid = self()
+
+      # One article per sub-batch: a tiny cumulative byte budget forces the split.
+      pt_key = {Loopctl.SystemConfig, "embedding_batch_max_chars"}
+      :persistent_term.put(pt_key, 1)
+      on_exit(fn -> :persistent_term.erase(pt_key) end)
+
+      articles = for _ <- 1..3, do: create_published_article(tenant.id)
+      ids = Enum.map(articles, & &1.id)
+
+      # Only the FIRST array call is rejected; the rest must never be sent as arrays.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _t, texts ->
+        send(test_pid, {:batch_call, length(texts)})
+        {:error, {:api_error, 400, :context_length_exceeded}}
+      end)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, text ->
+        {:ok, vec_for(text)}
+      end)
+
+      assert :ok = perform(tenant.id, ids)
+
+      assert_received {:batch_call, 1}
+      refute_received {:batch_call, _}
+
+      for id <- ids do
+        {:ok, stored} = Knowledge.get_article_with_embedding(tenant.id, id)
+
+        refute is_nil(stored.embedding),
+               "article #{id} was stranded when the batch stopped sending arrays"
+      end
     end
 
     test "throttle with Retry-After → snooze ~that interval", %{tenant: tenant, ids: ids} do

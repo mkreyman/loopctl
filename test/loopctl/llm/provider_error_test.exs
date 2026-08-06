@@ -123,10 +123,29 @@ defmodule Loopctl.Llm.ProviderErrorTest do
             %{"error" => "some string body"},
             "a bare string body",
             %{"unexpected" => "shape"},
+            # A struct has no Access impl — reading it as a map would raise in an
+            # error path.
+            %URI{path: "/v1/embeddings"},
             nil
           ] do
         assert ProviderError.classify(body) == :provider_error,
                "wrongly classified as context-length: #{inspect(body)}"
+      end
+    end
+
+    test "reads the OpenAI-COMPATIBLE envelope shapes, not just OpenAI's own" do
+      # A tenant may point base_url at vLLM / TEI / a FastAPI gateway, which answer a
+      # length rejection with a string-valued "error" or a top-level "detail"/"message".
+      # Reading only %{"error" => %{...}} classified all of them :provider_error, which
+      # discards the 400 as permanent and never runs the ladder.
+      for body <- [
+            %{"error" => "maximum context length is 8192 tokens"},
+            %{"detail" => "Input is too long for this model"},
+            %{"message" => "please reduce the length of the input"},
+            %{"code" => "context_length_exceeded"}
+          ] do
+        assert ProviderError.classify(body) == :context_length_exceeded,
+               "failed to classify: #{inspect(body)}"
       end
     end
 
@@ -168,6 +187,19 @@ defmodule Loopctl.Llm.ProviderErrorTest do
     test "preserves the throttle 4-tuple for a classified tag too" do
       term = {:api_error, 429, :provider_error, 30}
       assert ProviderError.sanitize(term) == term
+    end
+
+    test "sanitize/2 keeps the classification when a Retry-After is attached" do
+      # sanitize/2 hardcoded :provider_error while sanitize/1 preserved the tag, so a
+      # gateway answering with both a Retry-After and a length complaint lost the
+      # classification — disabling the ladder on that path only.
+      body = %{"error" => %{"message" => "maximum context length is 8192 tokens"}}
+
+      assert ProviderError.sanitize({:api_error, 400, body}, 30) ==
+               {:api_error, 400, :context_length_exceeded, 30}
+
+      assert ProviderError.sanitize({:api_error, 429, "slow down"}, 30) ==
+               {:api_error, 429, :provider_error, 30}
     end
   end
 end
