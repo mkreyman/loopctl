@@ -725,15 +725,40 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
         })
 
       b = published(tenant_id, %{title: "AWS CodeDeploy Traffic Control", body: "short"})
+
+      # A GENUINE duplicate pair, so give it corroborating embeddings. The apply path
+      # withholds a title-drift group whose bodies do not agree, and without this every test
+      # here would measure that gate instead of the behaviour it is named for.
+      corroborate_all!(tenant_id)
+
       {a, b}
     end
 
     defp status(id), do: AdminRepo.get!(Article, id).status
 
     # Runs the pass on two adjacent days so the agreement gate is satisfied.
+    #
+    # Also corroborates: every pair in THIS describe block is a genuine duplicate, so the
+    # articles get identical embeddings and the corroboration gate passes them. Without it
+    # these tests would all measure the gate instead of the apply behaviour they are named
+    # for — a title-drift group whose members carry no embedding is withheld, by design.
+    # The gate itself is covered by its own describe block below.
     defp confirm_over_two_nights(tenant_id) do
+      corroborate_all!(tenant_id)
       {:ok, _} = Consolidation.run(tenant_id, day: Date.add(Date.utc_today(), -1))
       {:ok, _} = Consolidation.run(tenant_id)
+    end
+
+    # Identical vectors => cosine 1.0 for every pair, i.e. maximal corroboration.
+    defp corroborate_all!(tenant_id, vector \\ nil) do
+      vector = vector || List.duplicate(0.1, 1536)
+
+      Article
+      |> where([a], a.tenant_id == ^tenant_id)
+      |> AdminRepo.all()
+      |> Enum.each(fn a ->
+        {:ok, _} = Knowledge.update_embedding(tenant_id, a.id, vector, nil)
+      end)
     end
 
     test "bounds LOSER ARTICLES per run, not just duplicate groups" do
@@ -916,6 +941,99 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
 
       assert status(a.id) == :published
       assert status(b.id) == :published
+    end
+
+    # A shared title is not evidence of a duplicate capture. This is the THIRD guard on that
+    # premise in `title_drift_groups/1` (after the empty-key and placeholder-title guards),
+    # and the first that checks the CLAIM rather than patching the normalization.
+    #
+    # Measured on the hosted corpus 2026-08-06, on the 290 groups that were one night from
+    # auto-unpublishing: three were not duplicates. "Changelog"/"CHANGELOG"/"ChangeLog" were a
+    # WordPress SEO plugin, the Elixir oauth2 library and a WordPress theme (min cosine 0.56);
+    # "options"/"Options" were Bootstrap-select and the AtomJS mixin (0.64). Every GENUINE
+    # duplicate in that set sat at 0.84 or above.
+    test "WITHHOLDS a title-drift group whose bodies do not corroborate the title" do
+      tenant = fixture(:tenant)
+
+      a =
+        published(tenant.id, %{title: "Changelog", body: String.duplicate("wordpress seo ", 20)})
+
+      b = published(tenant.id, %{title: "CHANGELOG", body: "elixir oauth2 library"})
+
+      # Orthogonal vectors => cosine ~0, far under the threshold.
+      embed!(tenant.id, a, unit_vector(0))
+      embed!(tenant.id, b, unit_vector(1))
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{applied: 0, skipped: 0, uncorroborated: 1} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      # Withheld from the APPLY, not from the REPORT: an operator still sees the collision.
+      assert status(a.id) == :published
+      assert status(b.id) == :published
+      {:ok, report} = Consolidation.latest(tenant.id)
+      assert Enum.any?(report.proposals, &(&1.proposal_class == :duplicate_capture))
+    end
+
+    test "FAILS CLOSED when a member has no embedding at the active dimension" do
+      # The corpus carried 80 published-but-un-embedded articles for six weeks. Scoring only
+      # the pairs that happen to have vectors would let a 3-member group be judged on its one
+      # scorable pair — which could be exactly the two that match.
+      tenant = fixture(:tenant)
+      {a, b} = duplicate_pair(tenant.id)
+
+      c = published(tenant.id, %{title: "aws codedeploy traffic control!", body: "third"})
+      # `c` deliberately gets NO embedding.
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{applied: 0, uncorroborated: 1} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      for id <- [a.id, b.id, c.id], do: assert(status(id) == :published)
+    end
+
+    test "does NOT gate the idempotency-drift signal on embeddings" do
+      # An idempotency key is evidence the WRITER supplied to mark one capture. Gating it on
+      # vectors would make the whole class depend on embeddings, and a tenant with no
+      # embedding key (mandatory BYO) has none at all.
+      tenant = fixture(:tenant)
+
+      a =
+        published(tenant.id, %{
+          title: "Totally Distinct Alpha",
+          body: String.duplicate("winner ", 30),
+          idempotency_key: "repo#src/a.ex"
+        })
+
+      b =
+        published(tenant.id, %{
+          title: "Totally Distinct Beta",
+          body: "short",
+          idempotency_key: "repo:src/a.ex"
+        })
+
+      # No embeddings at all for either article.
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{applied: 1, uncorroborated: 0} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert status(a.id) == :published
+      assert status(b.id) == :draft
+    end
+
+    defp embed!(tenant_id, article, vector) do
+      {:ok, _} = Knowledge.update_embedding(tenant_id, article.id, vector, nil)
+    end
+
+    # A 1536-dim one-hot vector. Two different indices are orthogonal (cosine 0).
+    defp unit_vector(index) do
+      Enum.map(0..1535, fn i -> if i == index, do: 1.0, else: 0.0 end)
     end
 
     test "the unpublish is REVERSIBLE, which is the whole reason this class may auto-apply" do
