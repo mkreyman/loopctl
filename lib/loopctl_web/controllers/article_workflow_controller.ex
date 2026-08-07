@@ -18,6 +18,12 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   `unpublish` (#605/#606). The SET-BASED bulk ops (`bulk_delete`, incl. the
   irreversible HARD-delete path, `bulk_publish`, `bulk_unpublish`) stay
   `user`-gated: high blast radius AND irreversible.
+
+  Recording a verdict stays agent+; what an agent cannot do ALONE is drive the
+  unattended write that a `supersede`/`merge` at confidence "high" triggers. The
+  role gate is the plug; the confidence a verdict is recorded at is granted from
+  that same role in `Loopctl.Knowledge.annotate_conflict/3`, never taken from the
+  request body.
   """
 
   use LoopctlWeb, :controller
@@ -293,7 +299,15 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         "pairs the system flagged (GET /knowledge/conflicts) may be resolved; an unknown pair " <>
         "returns 422. All dispositions are agent+ KB-content curation (#331): they are " <>
         "non-destructive + audited, and the privileged nightly executor is what actually " <>
-        "applies supersede/merge.",
+        "applies supersede/merge. " <>
+        "**`confidence` is granted, not accepted.** The recorded value is capped by the " <>
+        "role of the key recording the verdict: only an orchestrator+ key can record " <>
+        "`high`, the value that authorizes the executor's unattended supersede/merge. An " <>
+        "agent-role request asking for `high` is recorded at `medium` and the response " <>
+        "says so in `data.requested_confidence` and `note` — the verdict stands, it is just " <>
+        "not auto-applied. A `high` supersede additionally REQUIRES `evidence` (422 " <>
+        "without it): the one verdict that retires an article unattended must carry the " <>
+        "reason it was reached.",
     request_body:
       {"Resolution", "application/json",
        %OpenApiSpex.Schema{
@@ -311,17 +325,32 @@ defmodule LoopctlWeb.ArticleWorkflowController do
              type: :string,
              enum: ["redundant", "complementary", "contradictory"]
            },
-           evidence: %OpenApiSpex.Schema{type: :string},
-           confidence: %OpenApiSpex.Schema{type: :string, enum: ["high", "medium", "low"]}
+           evidence: %OpenApiSpex.Schema{
+             type: :string,
+             description:
+               "Why this verdict was reached. REQUIRED for a supersede recorded at " <>
+                 "confidence `high` — that is the verdict the nightly executor applies " <>
+                 "with nobody in the loop."
+           },
+           confidence: %OpenApiSpex.Schema{
+             type: :string,
+             enum: ["high", "medium", "low"],
+             description:
+               "Requested confidence. Capped server-side by the recording key's role: " <>
+                 "`high` is recorded only for an orchestrator+ key. When capped, the " <>
+                 "response carries the requested value in `data.requested_confidence`."
+           }
          }
        }},
     responses: %{
       201 =>
-        {"Recorded", "application/json",
+        {"Recorded (see `data.confidence` for what was GRANTED, and " <>
+           "`data.requested_confidence` when it was capped)", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       422 =>
-        {"Validation error, or no system-flagged potential_conflict for the pair",
-         "application/json", Schemas.ErrorResponse},
+        {"Validation error (including a `high` supersede with no `evidence`), or no " <>
+           "system-flagged potential_conflict for the pair", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -750,7 +779,16 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     # Visibility scope (#331): an agent may only resolve a pair whose BOTH members
     # it can see — annotate_conflict/3 refuses an invisible member as :no_potential_conflict
     # (422), matching the update/delete/archive paths. Higher roles pass no scope.
-    opts = AuditContext.from_conn(conn) ++ Visibility.scope_opts(conn)
+    #
+    # `:actor_role` comes from the AUTHENTICATED key, never from params — it caps the
+    # confidence the verdict is recorded at, and `confidence: "high"` is what lets the
+    # nightly executor retire an article with nobody watching. `Plugs.Impersonate` already
+    # rewrites `current_api_key.role` to the effective role, so this reads the role the
+    # request actually acts with (same source `Visibility.scope_opts/1` uses).
+    opts =
+      AuditContext.from_conn(conn) ++
+        Visibility.scope_opts(conn) ++
+        [actor_role: conn.assigns.current_api_key.role]
 
     attrs = %{
       "source_article_id" => params["source_article_id"],
@@ -771,6 +809,11 @@ defmodule LoopctlWeb.ArticleWorkflowController do
             id: resolution.id,
             disposition: to_string(resolution.disposition),
             confidence: to_string(resolution.confidence),
+            # Present (non-null) only when the server granted LESS than was asked for, so
+            # a caller learns the cap from the response instead of from a verdict that
+            # never applies.
+            requested_confidence:
+              resolution.requested_confidence && to_string(resolution.requested_confidence),
             executed: not is_nil(resolution.executed_at)
           },
           note: resolution_note(resolution)
@@ -788,8 +831,20 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     end
   end
 
+  # `:dismiss` is complete on record and ignores confidence entirely, so it is answered
+  # before the cap note — a capped dismiss changed nothing about the outcome.
   defp resolution_note(%{disposition: :dismiss}),
     do: "Dismissed as a false positive — the pair is removed from the conflict queue."
+
+  # The cap is reported to the caller rather than left to be inferred from a verdict that
+  # never applies: confidence is granted from the RECORDING ROLE, not accepted from the
+  # request, because "high" is what authorizes the unattended write.
+  defp resolution_note(%{disposition: disposition, requested_confidence: asked, confidence: got})
+       when disposition in [:supersede, :merge] and not is_nil(asked),
+       do:
+         "Recorded at confidence #{got}, NOT the #{asked} requested: only an orchestrator+ " <>
+           "key may authorize the unattended #{disposition} that high confidence triggers. " <>
+           "The verdict stands and is visible; it is not auto-applied."
 
   defp resolution_note(%{disposition: :supersede, confidence: :high}),
     do:

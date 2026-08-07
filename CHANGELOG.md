@@ -8,6 +8,42 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **BREAKING (API): `idempotency_key` is no longer returned in any article payload.** It is
+  still accepted on create and still a filter on `GET /api/v1/articles?idempotency_key=…`
+  (and the `knowledge_list` / `knowledge_count` MCP tools) — the lag-free existence check
+  is unchanged, answered from `meta.total_count` on a key you already hold. What it no
+  longer does is hand every reader the capture identities of articles it merely has read
+  access to. A key is caller-chosen data that the nightly consolidation pass reads when it
+  groups duplicate captures, so it is write-side identity, not a shared attribute. The
+  create no-op response still echoes the key you SUPPLIED on an idempotency hit; nothing
+  else does. A client reading the field off a list/get response must switch to filtering by
+  the key it already holds.
+
+- **A conflict-resolution verdict's `confidence` is now granted by the server, not accepted
+  from the request** (`POST /api/v1/knowledge/conflicts/resolve`). `confidence: "high"` is
+  what authorizes the nightly executor to retire an article with nobody in the loop, so it
+  is now capped by the role of the key recording the verdict: an agent-role request asking
+  for `"high"` is recorded at `"medium"`, and the response reports the cap in
+  `data.requested_confidence` and `note`. Recording a verdict — in every disposition —
+  remains agent-role curation; only the unattended write is gated. Additionally, a
+  `"high"`-confidence `supersede` now REQUIRES `evidence` (422 without it), and the
+  executor applies only verdicts whose recorder may authorize one. Pending
+  `supersede`/`merge` rows recorded before this release carry no recorder and are closed as
+  dismissed on the next nightly run (both articles retained, `execution_result.reason:
+  "unauthorized_recorder"`) rather than applied on an authorization nothing can evidence —
+  re-record any you still want applied.
+
+- **The nightly consolidation pass now requires content corroboration before auto-
+  unpublishing an idempotency-key duplicate group,** as it already did for title-collision
+  groups. An `idempotency_key` is caller-supplied, so two unrelated writers can collide on
+  one deterministically and the two-run agreement gate — which filters transience, not
+  wrongness — would confirm it. Both signals now clear the same bar: the group's live
+  members must also be similar in CONTENT (`knowledge_consolidation_min_duplicate_similarity_pct`).
+  **Operator impact:** a tenant with no BYO embedding key can no longer auto-apply
+  idempotency-drift groups — they are REPORTED and withheld instead (nothing is
+  unpublished), and the withhold clears itself once vectors exist. This is the behaviour
+  title-drift groups have always had on such tenants.
+
 - **Ingestion now mints self-qualifying article titles (#617).** The extractor was shown only
   a coarse `source_type` ("web_article"), never which document it was reading — so a CHANGELOG
   file could only be titled "Changelog". On the hosted corpus three unrelated documents (a

@@ -10,6 +10,21 @@ defmodule Loopctl.Knowledge.ConflictResolution do
   per canonical (sorted) article pair — re-annotation upserts (last-write-wins), so the
   freshest grounded judgment governs.
 
+  ## `confidence` is a GRANT, not an assertion
+
+  The nightly executor retires an article on `disposition: :supersede, confidence: :high`
+  with nobody in the loop, so `confidence` is the field that authorizes an unattended
+  write. It is therefore resolved server-side in `Loopctl.Knowledge.annotate_conflict/3`
+  from the recorder's role — never taken verbatim from request params — and the role that
+  produced it is persisted in `annotated_by_role` so the executor can re-check the
+  authorization rather than infer it. `requested_confidence` keeps what the caller asked
+  for when the grant came out lower, so a capped verdict stays auditable.
+
+  A `:high`-confidence `:supersede` additionally requires `evidence`: the one verdict that
+  retires an article unattended must carry the reason it was reached. That validation lives
+  HERE, at the single point every writer converges on, rather than in the controller — the
+  same reason the reserved-tag rule sits on the Article changeset.
+
   `tenant_id` is set programmatically, never cast.
   """
 
@@ -31,8 +46,14 @@ defmodule Loopctl.Knowledge.ConflictResolution do
     field :classification, Ecto.Enum, values: @classification_values
     field :disposition, Ecto.Enum, values: @disposition_values
     field :confidence, Ecto.Enum, values: @confidence_values, default: :medium
+    # What the caller asked for, kept only when the server granted something lower.
+    field :requested_confidence, Ecto.Enum, values: @confidence_values
     field :evidence, :string
     field :annotated_by, :string
+    # The role of the key that recorded this verdict, derived server-side. `nil` on rows
+    # written before recorder provenance existed — an unknown recorder is not an
+    # authorized one (`Loopctl.Knowledge.execute_conflict_resolutions/2`).
+    field :annotated_by_role, :string
     field :annotated_at, :utc_datetime_usec
     field :executed_at, :utc_datetime_usec
     field :execution_result, :map, default: %{}
@@ -47,8 +68,10 @@ defmodule Loopctl.Knowledge.ConflictResolution do
     :classification,
     :disposition,
     :confidence,
+    :requested_confidence,
     :evidence,
     :annotated_by,
+    :annotated_by_role,
     :annotated_at,
     :executed_at,
     :execution_result
@@ -57,7 +80,8 @@ defmodule Loopctl.Knowledge.ConflictResolution do
   @doc """
   Changeset for an agent-recorded resolution. `tenant_id` is set on the struct, not cast.
   Requires a canonical (sorted) pair and a disposition; `:supersede`/`:merge` require the
-  `authoritative_article_id` to be one of the two pair members.
+  `authoritative_article_id` to be one of the two pair members, and a `:high`-confidence
+  `:supersede` requires `evidence`.
   """
   @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def changeset(resolution \\ %__MODULE__{}, attrs) do
@@ -67,6 +91,7 @@ defmodule Loopctl.Knowledge.ConflictResolution do
     |> validate_inclusion(:disposition, @disposition_values)
     |> validate_pair_order()
     |> validate_authoritative_in_pair()
+    |> validate_evidence_for_unattended_supersede()
     |> foreign_key_constraint(:source_article_id)
     |> foreign_key_constraint(:target_article_id)
     |> unique_constraint([:tenant_id, :source_article_id, :target_article_id],
@@ -103,6 +128,25 @@ defmodule Loopctl.Knowledge.ConflictResolution do
 
       true ->
         changeset
+    end
+  end
+
+  # The ONE verdict shape that retires a published article with nobody watching:
+  # `:supersede` at the confidence the nightly executor acts on. It must name the reason it
+  # was reached, so the retirement is reviewable after the fact from the row alone. Checked
+  # on the GRANTED confidence — a request capped down to `:medium` never reaches the
+  # executor, so it is not held to this bar.
+  #
+  # Whitespace is not evidence: `validate_required/2` already rejects `""` and a
+  # whitespace-only string trims to `""` under the default `:trim` behaviour.
+  defp validate_evidence_for_unattended_supersede(changeset) do
+    if get_field(changeset, :disposition) == :supersede and
+         get_field(changeset, :confidence) == :high do
+      validate_required(changeset, [:evidence],
+        message: "is required for a high-confidence supersede (it retires an article unattended)"
+      )
+    else
+      changeset
     end
   end
 

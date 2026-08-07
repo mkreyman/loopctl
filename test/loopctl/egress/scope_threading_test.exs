@@ -256,14 +256,21 @@ defmodule Loopctl.Egress.ScopeThreadingTest do
       })
       |> AdminRepo.insert!()
 
+      # Recorded as an orchestrator: `:high` is granted from the recording role, and it is
+      # the confidence the nightly executor acts on — an agent-recorded verdict is capped
+      # to `:medium` and never reaches the synthesizer.
       {:ok, resolution} =
-        Knowledge.annotate_conflict(tenant.id, %{
-          "source_article_id" => unmarked.id,
-          "target_article_id" => marked.id,
-          "disposition" => "merge",
-          "authoritative_article_id" => marked.id,
-          "confidence" => "high"
-        })
+        Knowledge.annotate_conflict(
+          tenant.id,
+          %{
+            "source_article_id" => unmarked.id,
+            "target_article_id" => marked.id,
+            "disposition" => "merge",
+            "authoritative_article_id" => marked.id,
+            "confidence" => "high"
+          },
+          actor_role: :orchestrator
+        )
 
       Knowledge.execute_conflict_resolutions(tenant.id, limit: 10)
 

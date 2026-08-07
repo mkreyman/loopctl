@@ -4,6 +4,17 @@ defmodule LoopctlWeb.ArticleJSON do
 
   Provides consistent serialization for articles and article links
   across all article controller actions.
+
+  ## `idempotency_key` is accepted, never echoed
+
+  An article's `idempotency_key` is a WRITE-side capture identity: a caller supplies its
+  own, and `GET /api/v1/articles?idempotency_key=…` answers "have I already captured
+  this?" from the caller's own key. Serializing the stored value did something different
+  — it handed every reader the capture identities of articles it merely has read access
+  to, and those keys are an input to grouping decisions the nightly consolidation pass
+  makes over the corpus. A key one caller chose is not another caller's to read, so it is
+  no longer rendered in any article payload. The FILTER is untouched; the existence check
+  it backs works exactly as before.
   """
 
   @doc """
@@ -51,7 +62,6 @@ defmodule LoopctlWeb.ArticleJSON do
       tags: article.tags,
       source_type: article.source_type,
       source_id: article.source_id,
-      idempotency_key: article.idempotency_key,
       metadata: article.metadata,
       inserted_at: article.inserted_at,
       updated_at: article.updated_at
@@ -71,7 +81,6 @@ defmodule LoopctlWeb.ArticleJSON do
       tags: article.tags,
       source_type: article.source_type,
       source_id: article.source_id,
-      idempotency_key: article.idempotency_key,
       metadata: article.metadata,
       inserted_at: article.inserted_at,
       updated_at: article.updated_at

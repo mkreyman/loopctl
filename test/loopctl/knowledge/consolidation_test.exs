@@ -1081,10 +1081,54 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert status(b.id) == :draft
     end
 
-    test "does NOT gate the idempotency-drift signal on embeddings" do
-      # An idempotency key is evidence the WRITER supplied to mark one capture. Gating it on
-      # vectors would make the whole class depend on embeddings, and a tenant with no
-      # embedding key (mandatory BYO) has none at all.
+    # The idempotency signal used to be EXEMPT from corroboration, on the premise that a
+    # writer-supplied key is direct evidence of one capture written twice. That premise
+    # holds for one writer. It does not hold in a tenant where any agent-role key may
+    # publish an article and choose its own `idempotency_key`: the key is caller-controlled
+    # data, the group can span two unrelated writers, and the winner is the LONGEST body —
+    # so an uncorroborated idempotency group was a way to have a published article retired
+    # by writing a longer one beside it. Both signals now clear the same content bar.
+    test "WITHHOLDS an idempotency-drift group whose bodies do not corroborate the key" do
+      tenant = fixture(:tenant)
+
+      a =
+        published(tenant.id, %{
+          title: "Totally Distinct Alpha",
+          body: "the original capture",
+          idempotency_key: "repo#src/a.ex"
+        })
+
+      b =
+        published(tenant.id, %{
+          title: "Totally Distinct Beta",
+          body: String.duplicate("unrelated longer body ", 20),
+          idempotency_key: "repo:src/a.ex"
+        })
+
+      # Orthogonal vectors: the two articles say nothing in common, so the shared key is
+      # the ONLY thing joining them.
+      embed!(tenant.id, a, unit_vector(0))
+      embed!(tenant.id, b, unit_vector(1))
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{applied: 0, skipped: 0, uncorroborated: 1} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      # Nothing retired — including the article that would have LOST to the longer body.
+      assert status(a.id) == :published
+      assert status(b.id) == :published
+
+      # Withheld from the APPLY, not from the REPORT.
+      {:ok, report} = Consolidation.latest(tenant.id)
+      assert Enum.any?(report.proposals, &(&1.proposal_class == :duplicate_capture))
+    end
+
+    # The other half: a REAL double capture still applies. The members are scored under the
+    # normalized IDEMPOTENCY key — not the title, which they do not share — so this also
+    # proves the scoring is keyed by the signal that formed the group.
+    test "APPLIES an idempotency-drift group whose bodies corroborate the key" do
       tenant = fixture(:tenant)
 
       a =
@@ -1101,7 +1145,8 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
           idempotency_key: "repo:src/a.ex"
         })
 
-      # No embeddings at all for either article.
+      corroborate_all!(tenant.id)
+
       {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
       {:ok, _} = Consolidation.run(tenant.id)
 
@@ -1112,11 +1157,11 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert status(b.id) == :draft
     end
 
-    test "keeps the idempotency exemption when BOTH signals name the same group" do
+    test "corroborates a group BOTH signals name, under whichever key labelled it" do
       # One capture written twice under two tag formats carries the SAME title too, so both
-      # signals find it. The label used to be decided by which entry the interleave met
-      # first — the title one — which then held the group to the embedding gate the
-      # idempotency signal is exempt from, forever on a tenant with no vectors.
+      # signals find it. Whichever label it carries, it is now held to the content bar —
+      # and the label decides only which normalized key the members are scored under, so a
+      # group scored under the wrong one would find no entry and withhold.
       tenant = fixture(:tenant)
 
       a =
@@ -1133,7 +1178,8 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
           idempotency_key: "repo:src/retry.ex"
         })
 
-      # No embeddings at all, so a title-labelled group could never be corroborated.
+      corroborate_all!(tenant.id)
+
       {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
       {:ok, _} = Consolidation.run(tenant.id)
 
@@ -1142,6 +1188,36 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
 
       assert status(a.id) == :published
       assert status(b.id) == :draft
+    end
+
+    # A tenant with no embeddings at all now WITHHOLDS idempotency groups too. That is the
+    # cost of the change and it is the safe direction: reported, nothing unpublished, and
+    # self-clearing once vectors exist. Title drift has always behaved this way here.
+    test "withholds rather than applies when the tenant has no vectors at all" do
+      tenant = fixture(:tenant)
+
+      a =
+        published(tenant.id, %{
+          title: "Vectorless Alpha",
+          body: String.duplicate("winner ", 30),
+          idempotency_key: "repo#src/none.ex"
+        })
+
+      b =
+        published(tenant.id, %{
+          title: "Vectorless Beta",
+          body: "short",
+          idempotency_key: "repo:src/none.ex"
+        })
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{applied: 0, uncorroborated: 1} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert status(a.id) == :published
+      assert status(b.id) == :published
     end
 
     defp embed!(tenant_id, article, vector) do

@@ -4023,7 +4023,7 @@ const TOOLS = [
     name: "knowledge_list",
     description:
       "List articles (id, title, category, status, tags, source_type, source_id, " +
-      "idempotency_key, timestamps), filtered and paginated. **Body-less summary by default** " +
+      "timestamps), filtered and paginated. **Body-less summary by default** " +
       "— the right tool to enumerate, dedup, or repair at scale (safe to page up to limit=1000). " +
       "Pass `include_body: true` to also return the full `body`, in which case the server bounds " +
       "the page by a ~5 MB serialized-body budget and returns meta.next_offset/has_more/" +
@@ -4034,7 +4034,9 @@ const TOOLS = [
       "of record (draft, published, archived, superseded visible). Use for idempotency/existence " +
       "checks: filter by `tags`, `source_type`+`source_id`, or `idempotency_key` and read " +
       "`meta.total_count` (exact) to answer \"does an article for X already exist?\" reliably " +
-      "right after a write. Paginate via offset/limit.",
+      "right after a write — `idempotency_key` is a FILTER only and is never returned in a " +
+      "row, so you check a key you already hold rather than reading back the keys other " +
+      "callers chose. Paginate via offset/limit.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4072,7 +4074,8 @@ const TOOLS = [
           type: "string",
           description:
             "Optional: filter by exact idempotency_key — the lag-free existence check for a " +
-            "prior capture.",
+            "prior capture. Filter only: it is not returned in the rows, so read " +
+            "`meta.total_count`.",
         },
         offset: {
           type: "integer",
