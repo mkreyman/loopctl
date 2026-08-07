@@ -67,6 +67,69 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     end
   end
 
+  # --- The specific source reaches the extractor (#617 ingestion root cause) ---
+
+  describe "source_ref passed to the extractor" do
+    test "the URL is handed to the extractor, so a title can be qualified by it" do
+      # The extractor mints every title. Shown only `source_type: "web_article"` it
+      # could title a CHANGELOG file nothing but "Changelog" — and three unrelated
+      # documents on the hosted corpus did exactly that, colliding into a false
+      # duplicate group. The prompt now asks for a self-qualifying title; this is the
+      # wiring that makes the ask answerable.
+      %{tenant: tenant} = setup_tenant()
+      url = "https://github.com/scrogson/oauth2/blob/master/CHANGELOG.md"
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, _c, opts ->
+        assert opts[:source_ref] == url
+
+        {:ok,
+         [
+           %{
+             title: "Changelog -- the Elixir oauth2 library",
+             body: "Release notes.",
+             category: :reference,
+             tags: ["oauth2"]
+           }
+         ]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 71,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "# Changelog",
+                   "content_hash" => "srcref1",
+                   "source_type" => "web_article",
+                   "url" => url
+                 }
+               })
+    end
+
+    test "inline content with no URL passes nil, never a placeholder" do
+      # A placeholder is worse than nothing: the model qualifies the title WITH it, so
+      # "Changelog -- unknown" looks specific while distinguishing nothing.
+      %{tenant: tenant} = setup_tenant()
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, _c, opts ->
+        assert is_nil(opts[:source_ref])
+
+        {:ok, [%{title: "Inline note", body: "b", category: :pattern, tags: []}]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 72,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "raw",
+                   "content_hash" => "srcref2",
+                   "source_type" => "newsletter"
+                 }
+               })
+    end
+  end
+
   # --- Success: extracts articles from inline content ---
 
   describe "perform/1 with inline content" do

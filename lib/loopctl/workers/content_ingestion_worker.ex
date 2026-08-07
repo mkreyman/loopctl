@@ -481,7 +481,15 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # otherwise abort the whole chunk on the `articles_tenant_title_active_idx`).
   defp extract_and_persist_chunk(ctx, chunk, chunk_index, remaining, seen_titles) do
     case @content_extractor.extract_from_content(ctx.egress_scope, chunk,
-           source_type: ctx.source_type
+           source_type: ctx.source_type,
+           # The SPECIFIC source, not just the coarse type (#617). The extractor mints
+           # every title, and without knowing WHICH document it is reading it can only
+           # title a CHANGELOG file "Changelog" — which three unrelated documents on the
+           # hosted corpus duly did, generating the collision class the nightly
+           # consolidation pass exists to mop up. `nil` for inline content with no URL;
+           # the prompt omits the line rather than saying "unknown", since a model will
+           # happily qualify a title WITH the word unknown.
+           source_ref: ctx.url
          ) do
       {:ok, extracted} ->
         {articles, seen_titles} =

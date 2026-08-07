@@ -8,6 +8,18 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **Ingestion now mints self-qualifying article titles (#617).** The extractor was shown only
+  a coarse `source_type` ("web_article"), never which document it was reading — so a CHANGELOG
+  file could only be titled "Changelog". On the hosted corpus three unrelated documents (a
+  WordPress SEO plugin, the Elixir oauth2 library, a WordPress theme) each produced exactly
+  that, and the nightly consolidation pass then proposed them for auto-unpublish as "the same
+  capture". The specific source (the ingest URL) is now passed to the extractor, and the
+  prompt asks for a title that stands alone in a shared corpus — qualified by its source when
+  the natural title is generic ("Changelog — Platinum SEO Pack WordPress plugin"), left alone
+  when it is already specific. This affects NEWLY ingested content only; existing articles are
+  untouched. It is the root cause behind the duplicate-capture class the previous entries
+  bound and gate.
+
 - **The consolidation drain caps AND the duplicate-similarity threshold are now live-tunable
   without a deploy (#617).** `knowledge_consolidation_max_applies`,
   `knowledge_consolidation_max_unpublishes`, `knowledge_consolidation_max_per_class` and
