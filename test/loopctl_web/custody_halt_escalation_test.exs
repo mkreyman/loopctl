@@ -19,8 +19,11 @@ defmodule LoopctlWeb.CustodyHaltEscalationTest do
   """
   use LoopctlWeb.ConnCase, async: true
 
+  import Ecto.Query, only: [where: 3]
+
   alias Loopctl.AdminRepo
   alias Loopctl.Capabilities
+  alias Loopctl.Custody.Violation
   alias Loopctl.Custody.ViolationMonitor
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
@@ -221,7 +224,17 @@ defmodule LoopctlWeb.CustodyHaltEscalationTest do
       end
 
       assert halted?(ctx.tenant.id)
-      assert ViolationMonitor.count_in_window(ctx.tenant.id) == threshold
+
+      # The counter is back to zero because the halt CLAIMED its evidence — the
+      # rows survive as the forensic record, but they cannot arm a second halt,
+      # which is what lets the break-glass ceremony recover the tenant.
+      assert ViolationMonitor.count_in_window(ctx.tenant.id) == 0
+
+      tenant_id = ctx.tenant.id
+
+      assert Violation
+             |> where([v], v.tenant_id == ^tenant_id)
+             |> AdminRepo.aggregate(:count) == threshold
     end
 
     test "one tenant's self-report pattern never halts another tenant", ctx do

@@ -145,10 +145,10 @@ correct behavior; do not add a workaround.
 `:missing_capability` **only for tenants that have an audit key** (`tenant_has_audit_key?/1`,
 `progress.ex:513-518`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
 proceeds with NO capability at all. So L1 strength is per-tenant. A REJECTED cap is split by
-`cap_refusal/4`: only `:invalid_signature` / `:replay` surface as `{:cap_rejected, _}`, the shape
-FallbackController answers with a tenant-wide custody halt. `:expired` and `:wrong_lineage` are
-ordinary client errors (a slow agent, a rotated dispatch) and degrade to `:missing_capability` —
-never let a timeout 503 a whole tenant. That branch now emits a
+`cap_refusal/4`: only `:invalid_signature` / `:replay` surface as `{:cap_rejected, _}`, which
+FallbackController answers with a plain 403 — it halts NOTHING and counts toward nothing (see the
+L6 section). `:expired` and `:wrong_lineage` are ordinary client errors (a slow agent, a rotated
+dispatch) and degrade to `:missing_capability` — never let a timeout 503 a whole tenant. That branch now emits a
 `pre_v2_custody_bypass` warning plus a `[:loopctl, :custody, :pre_v2_bypass]` telemetry event, so the
 degraded tenants are observable — alert on the count. Do not "simplify" the clause: removing the
 audit-key condition either breaks pre-v2 tenants or silently widens the bypass.
@@ -178,18 +178,24 @@ A halt freezes the tenant's custody surface and only a human WebAuthn break-glas
 clears it, so both its trigger and its blast radius are deliberately bounded.
 
 - **Trigger** — `Loopctl.Custody.ViolationMonitor.record/3` (`lib/loopctl/custody/violation_monitor.ex`),
-  called from the `FallbackController`'s `:self_verify_blocked` / `:self_report_blocked` clauses.
+  called from the `FallbackController`'s `:self_verify_blocked` / `:self_report_blocked` /
+  `:self_review_blocked` clauses — all three lineage-aware gates count.
   It records the violation in `custody_violations` (tenant-scoped, RLS) and halts only when
-  `threshold/0` violations land inside `window_seconds/0` (defaults 3 / 3600). **Below the
+  `threshold/0` violations land inside `window_seconds/0` (defaults 3 / 3600, each rejected back
+  to its default unless a positive integer). **Below the
   threshold the custody gate still returns its 409** — only the escalation is thresholded.
+  A halt CLAIMS the rows that armed it (`consumed_at`), so concurrent callers cannot produce two
+  onsets and the break-glass clear is not re-tripped by the next single violation.
 - **`cap_rejected` NEVER halts and NEVER counts.** A capability is single-use with a bounded
   TTL, so a client retry (`:replay`), a resumed agent (`:expired`) and an audit-key rotation
   (`:invalid_signature`) all produce one; none is a byzantine signal, and the 403 already
   refuses the operation. It emits `[:loopctl, :custody, :cap_rejected]` telemetry instead —
   alert on the RATE. Do not re-add a halt there.
 - **Scope** — `LoopctlWeb.CustodySurface` (`lib/loopctl_web/custody_surface.ex`) is THE list of
-  operations a halt suspends: story-lifecycle writes, bulk story ops + `verify-all`, dispatch
-  minting, agent-memory writes. **Reads are never blocked, on any surface** —
+  operations a halt suspends: story-lifecycle writes, bulk story ops + `verify-all`, project
+  import (`initial_agent_status` records work as done), dispatch minting, agent-memory writes
+  (recall included — it bumps the graduation hotness counters), and DELETE of a
+  story/epic/project (that row IS the custody evidence). **Reads are never blocked** —
   `custody_operation?/1` short-circuits on GET/HEAD/OPTIONS. `CheckCustodyHalt` consults it;
   `test/loopctl_web/custody_surface_test.exs` binds the declared list to
   `LoopctlWeb.Router.__routes__/0` and fails when a mutating custody route is unclassified.

@@ -69,21 +69,104 @@ defmodule Loopctl.Custody.ViolationMonitorTest do
       assert halted?(tenant.id)
     end
 
-    test "a halt has ONE onset — a further violation does not refresh halted_at" do
+    test "a halt has ONE onset — a later pattern does not refresh halted_at" do
       tenant = fixture(:tenant)
+      threshold = ViolationMonitor.threshold()
 
-      for _ <- 1..ViolationMonitor.threshold() do
+      for _ <- 1..threshold do
         ViolationMonitor.record(tenant.id, "self_report_blocked")
       end
 
       {:ok, halted} = Tenants.get_tenant(tenant.id)
       first_onset = halted.custody_halted_at
 
-      assert {:ok, :already_halted, _count} =
-               ViolationMonitor.record(tenant.id, "self_report_blocked")
+      # The evidence that armed the halt was claimed, so the counter restarts —
+      # and a whole second pattern still cannot move the onset.
+      outcomes =
+        for _ <- 1..threshold, do: ViolationMonitor.record(tenant.id, "self_report_blocked")
+
+      assert {:ok, :already_halted, _count} = List.last(outcomes)
 
       {:ok, still_halted} = Tenants.get_tenant(tenant.id)
       assert still_halted.custody_halted_at == first_onset
+    end
+
+    test "the third self-* gate counts too — self_review_blocked is not invisible" do
+      tenant = fixture(:tenant)
+      threshold = ViolationMonitor.threshold()
+
+      for _ <- 1..(threshold - 1) do
+        assert {:ok, :recorded, _} = ViolationMonitor.record(tenant.id, "self_review_blocked")
+      end
+
+      assert {:ok, :halted, ^threshold} =
+               ViolationMonitor.record(tenant.id, "self_review_blocked")
+    end
+  end
+
+  describe "recovery — the break-glass ceremony must actually clear the tenant" do
+    test "one violation after a human clears the halt does not instantly re-halt" do
+      tenant = fixture(:tenant)
+
+      for _ <- 1..ViolationMonitor.threshold() do
+        ViolationMonitor.record(tenant.id, "self_report_blocked")
+      end
+
+      assert halted?(tenant.id)
+      {:ok, _} = Tenants.clear_custody_halt(tenant.id)
+
+      # Same window, so a time-only counter would still hold the original rows and
+      # re-halt on this one event — making the hardware-anchored ceremony buy
+      # minutes of uptime.
+      assert {:ok, :recorded, 1} = ViolationMonitor.record(tenant.id, "self_verify_blocked")
+      refute halted?(tenant.id)
+    end
+
+    test "a fresh pattern after the clear halts again" do
+      tenant = fixture(:tenant)
+      threshold = ViolationMonitor.threshold()
+
+      for _ <- 1..threshold, do: ViolationMonitor.record(tenant.id, "self_report_blocked")
+      {:ok, _} = Tenants.clear_custody_halt(tenant.id)
+
+      for _ <- 1..(threshold - 1), do: ViolationMonitor.record(tenant.id, "self_report_blocked")
+      refute halted?(tenant.id)
+
+      assert {:ok, :halted, ^threshold} =
+               ViolationMonitor.record(tenant.id, "self_report_blocked")
+    end
+  end
+
+  describe "config validation — the catastrophic values are inside the naive range" do
+    test "0 (what an operator types meaning 'off') is refused, not honoured" do
+      log =
+        capture_log(fn ->
+          assert ViolationMonitor.validate_positive_integer(0, 3, :custody_halt_threshold) == 3
+        end)
+
+      assert log =~ "custody_halt_config_invalid"
+    end
+
+    test "a non-integer is refused — it would silently disable L6 forever" do
+      # `count < "3"` is ALWAYS true in Erlang term order, so a String threshold
+      # (the shape System.get_env/1 returns) halts nobody, ever, with no error.
+      for bad <- ["3", nil, 3.5, -1] do
+        assert capture_log(fn ->
+                 assert ViolationMonitor.validate_positive_integer(
+                          bad,
+                          7,
+                          :custody_halt_window_seconds
+                        ) ==
+                          7
+               end) =~ "custody_halt_config_invalid"
+      end
+    end
+
+    test "a valid positive integer passes through untouched and logs nothing" do
+      assert capture_log(fn ->
+               assert ViolationMonitor.validate_positive_integer(5, 3, :custody_halt_threshold) ==
+                        5
+             end) == ""
     end
   end
 

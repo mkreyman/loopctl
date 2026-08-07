@@ -42,9 +42,12 @@ All notable changes to loopctl are documented here.
 - **An unusable capability no longer halts the whole tenant.** Any rejected token produced
   `{:cap_rejected, _}`, which custody-halts the tenant and 503s every subsequent request from
   it — so one agent letting a token pass its 1-hour TTL took down every other agent in the
-  tenant. Only a forged signature or a double-spent token does that now; expiry and lineage
-  drift are ordinary 403s, recorded in the audit chain as `capability_refused` (with the
-  `cap_id`, api key and agent) so token MISUSE is still visible without halting anyone.
+  tenant. **No capability rejection halts a tenant any more** — not a forged signature, not a
+  double-spent token (see the 2026-07-24 entry below, which supersedes an earlier draft of
+  this line). Every one of them is an ordinary 403; expiry and lineage drift are additionally
+  recorded in the audit chain as `capability_refused` (with the `cap_id`, api key and agent).
+  Alert on the RATE of the `[:loopctl, :custody, :cap_rejected]` telemetry event — that is now
+  the only signal for a forged or replayed token, and a single occurrence is not one.
   Relatedly, **rotating a tenant's audit signing key no longer invalidates outstanding
   capability tokens**: verification now also accepts the historical key whose
   `[rotated_in, rotated_out)` window covers the token's `issued_at`. Without that, a routine

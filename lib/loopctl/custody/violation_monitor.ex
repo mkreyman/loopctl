@@ -34,9 +34,9 @@ defmodule Loopctl.Custody.ViolationMonitor do
   ## What counts, and what deliberately does not
 
   Only `Loopctl.Custody.Violation.valid_types/0` count: a caller refused by the
-  self-verify or self-report gate. Those are unambiguous — the server resolved
-  the caller's own lineage and found it closing its own loop, and no retry,
-  timeout or crash-resume produces that shape.
+  self-verify, self-report or self-review gate. All three are unambiguous — the
+  server resolved the caller's own lineage and found it closing its own loop, and
+  no retry, timeout or crash-resume produces that shape.
 
   A capability-token rejection does NOT count and no longer halts anything. Every
   rejection reason the token layer can produce has a benign cause that ordinary
@@ -55,9 +55,13 @@ defmodule Loopctl.Custody.ViolationMonitor do
   Violations live in `custody_violations`, tenant-scoped with RLS, so the counter
   is durable across restarts (an in-memory counter would let a slow drip reset
   itself on every deploy) and gives an operator the forensic record of WHY a
-  halt fired. Counting is always scoped by an explicit `tenant_id` predicate —
-  one tenant's violations can never contribute to another's threshold, and the
-  count is never exposed across a tenant boundary.
+  halt fired. Counting is always scoped by an explicit `tenant_id` predicate — one
+  tenant's violations can never contribute to another's threshold.
+
+  A halt CLAIMS the rows that armed it (`consumed_at`): a concurrent pair crossing
+  the threshold cannot both arm it (ONE onset per incident), and the break-glass
+  ceremony truly recovers the tenant instead of clearing `custody_halted_at` over
+  a still-loaded window that the next single violation re-trips.
 
   The clock is resolved through the `:clock` DI seam so the window is testable
   without sleeping or mutating global state.
@@ -82,22 +86,41 @@ defmodule Loopctl.Custody.ViolationMonitor do
           | {:ok, :already_halted, non_neg_integer()}
           | {:error, term()}
 
-  @doc """
-  Number of violations inside the window that arms a custody halt.
-
-  Configurable with `config :loopctl, :custody_halt_threshold`.
-  """
+  @doc "Violations inside the window that arm a halt (`:custody_halt_threshold`)."
   @spec threshold() :: pos_integer()
-  def threshold, do: Application.get_env(:loopctl, :custody_halt_threshold, @default_threshold)
+  def threshold do
+    Application.get_env(:loopctl, :custody_halt_threshold, @default_threshold)
+    |> validate_positive_integer(@default_threshold, :custody_halt_threshold)
+  end
+
+  @doc "Detection window in seconds (`:custody_halt_window_seconds`)."
+  @spec window_seconds() :: pos_integer()
+  def window_seconds do
+    Application.get_env(:loopctl, :custody_halt_window_seconds, @default_window_seconds)
+    |> validate_positive_integer(@default_window_seconds, :custody_halt_window_seconds)
+  end
 
   @doc """
-  Length of the detection window, in seconds.
+  Validates a configured knob, falling back to `default` with a warning.
 
-  Configurable with `config :loopctl, :custody_halt_window_seconds`.
+  Both catastrophic values sit INSIDE the naive valid range, so neither bound is
+  safe to clamp toward: `0` — what an operator types meaning "off" — halts on the
+  FIRST violation, and a non-integer (what `System.get_env/1` returns) sorts above
+  every number in Erlang term order, so `count < "3"` is always true and NO tenant
+  is ever halted. Pure and public so the bound is assertable without mutating
+  VM-global state.
   """
-  @spec window_seconds() :: pos_integer()
-  def window_seconds,
-    do: Application.get_env(:loopctl, :custody_halt_window_seconds, @default_window_seconds)
+  @spec validate_positive_integer(term(), pos_integer(), atom()) :: pos_integer()
+  def validate_positive_integer(value, _default, _key) when is_integer(value) and value > 0,
+    do: value
+
+  def validate_positive_integer(value, default, key) do
+    Logger.warning(
+      "custody_halt_config_invalid: :#{key} must be a positive integer, got #{inspect(value)} — L6 is using #{default}"
+    )
+
+    default
+  end
 
   @doc """
   Records one custody violation for `tenant_id` and halts the tenant if the
@@ -145,16 +168,23 @@ defmodule Loopctl.Custody.ViolationMonitor do
 
   Scoped by an explicit `tenant_id` predicate — this runs on `AdminRepo`
   (BYPASSRLS), so the predicate IS the isolation. Another tenant's violations
-  can never be counted here.
+  can never be counted here. Rows already claimed by a halt (`consumed_at`) are
+  excluded — evidence of an incident already escalated, not of a fresh pattern.
   """
   @spec count_in_window(Ecto.UUID.t(), DateTime.t() | nil) :: non_neg_integer()
   def count_in_window(tenant_id, now \\ nil) do
     now = now || clock().utc_now()
+    tenant_id |> unconsumed_in_window(now) |> AdminRepo.aggregate(:count)
+  end
+
+  defp unconsumed_in_window(tenant_id, now) do
     since = DateTime.add(now, -window_seconds(), :second)
 
-    Violation
-    |> where([v], v.tenant_id == ^tenant_id and v.occurred_at >= ^since)
-    |> AdminRepo.aggregate(:count)
+    where(
+      Violation,
+      [v],
+      v.tenant_id == ^tenant_id and v.occurred_at >= ^since and is_nil(v.consumed_at)
+    )
   end
 
   # --- Private ---
@@ -190,9 +220,25 @@ defmodule Loopctl.Custody.ViolationMonitor do
       already_halted?(tenant_id) ->
         {:ok, :already_halted, count}
 
+      claim_evidence(tenant_id, now) == 0 ->
+        {:ok, :already_halted, count}
+
       true ->
         do_halt(tenant_id, violation_type, count, now)
     end
+  end
+
+  # `UPDATE ... WHERE consumed_at IS NULL` row-locks the candidates, so of two
+  # concurrent callers exactly one claims rows (0 claimed => defer to its halt) and
+  # the chain keeps ONE onset. It also makes the break-glass durable: the rows that
+  # armed this halt can never arm the next.
+  defp claim_evidence(tenant_id, now) do
+    {claimed, _} =
+      tenant_id
+      |> unconsumed_in_window(now)
+      |> AdminRepo.update_all(set: [consumed_at: now, updated_at: now])
+
+    claimed
   end
 
   defp already_halted?(tenant_id) do
@@ -239,27 +285,37 @@ defmodule Loopctl.Custody.ViolationMonitor do
     end
   end
 
-  # The halt itself belongs in the tamper-evident chain, not only in the app log:
-  # it is a custody-state transition that a later audit must be able to replay.
+  # The halt belongs in the tamper-evident chain, not only in the app log: it is a
+  # custody-state transition a later audit must replay. `AuditChain.append/2`
+  # signals ordinary failures (serialization lock, Multi step) with an error TUPLE
+  # rather than by raising, so a `rescue` alone left a miss completely silent.
   defp append_halt_audit(tenant_id, violation_type, count, now) do
-    AuditChain.append(tenant_id, %{
-      action: "custody_halted",
-      actor_lineage: [],
-      entity_type: "tenant",
-      entity_id: tenant_id,
-      payload: %{
-        "reason" => violation_type,
-        "violations_in_window" => count,
-        "threshold" => threshold(),
-        "window_seconds" => window_seconds(),
-        "halted_at" => DateTime.to_iso8601(now)
-      }
-    })
+    case AuditChain.append(tenant_id, %{
+           action: "custody_halted",
+           actor_lineage: [],
+           entity_type: "tenant",
+           entity_id: tenant_id,
+           payload: %{
+             "reason" => violation_type,
+             "violations_in_window" => count,
+             "threshold" => threshold(),
+             "window_seconds" => window_seconds(),
+             "halted_at" => DateTime.to_iso8601(now)
+           }
+         }) do
+      {:ok, _entry} -> :ok
+      {:error, reason} -> log_halt_audit_failure(tenant_id, inspect(reason))
+    end
   rescue
-    e ->
-      Logger.error("custody_halt_audit_failed: #{Exception.message(e)} tenant_id=#{tenant_id}")
+    e -> log_halt_audit_failure(tenant_id, Exception.message(e))
+  end
 
-      :ok
+  defp log_halt_audit_failure(tenant_id, detail) do
+    Logger.error(
+      "custody_halt_audit_failed: halt NOT in the chain tenant_id=#{tenant_id} reason=#{detail}"
+    )
+
+    :ok
   end
 
   defp emit_violation(tenant_id, violation_type, count, opts) do

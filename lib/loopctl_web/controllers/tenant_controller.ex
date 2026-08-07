@@ -145,9 +145,9 @@ defmodule LoopctlWeb.TenantController do
   """
   def register_owner_key(conn, params) do
     with {:ok, tenant} <- require_tenant(conn),
-         :ok <- check_rotation_rate_limit(tenant.id),
          {:ok, pubkey} <- decode_owner_pubkey(params["owner_pubkey"]),
-         {:ok, rotation_proof} <- decode_rotation_proof(params["rotation_proof"]) do
+         {:ok, rotation_proof} <- decode_rotation_proof(params["rotation_proof"]),
+         :ok <- check_rotation_rate_limit(tenant.id) do
       alg = params["alg"] || "ed25519"
 
       # LCP-1 §9.2: attribute the root-key registration/rotation to the ACTING key's
@@ -205,6 +205,13 @@ defmodule LoopctlWeb.TenantController do
   # FAIL-CLOSED because unlocking an anti-abuse gate on a limiter fault defeats
   # the gate, and rotation needs the database anyway: denying while the counter
   # store is down costs no availability that the write itself would have had.
+  #
+  # Charged AFTER the hex decodes, and that order is load-bearing. `gate_ok?/3`
+  # post-increments, so with the check first a malformed body consumed the budget
+  # identically to a real attempt — ten typos, or ten garbage requests from a
+  # leaked key, and the owner cannot rotate for an hour. Rotation is precisely the
+  # remediation path for a compromised key, so only attempts that reach the
+  # expensive verification may spend it.
   defp check_rotation_rate_limit(tenant_id) do
     if RateLimiter.gate_ok?(
          "custody_owner_key:rotate:#{tenant_id}",

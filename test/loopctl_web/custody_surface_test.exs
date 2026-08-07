@@ -123,7 +123,7 @@ defmodule LoopctlWeb.CustodySurfaceTest do
       assert CustodySurface.custody_operation?(conn_for(:post, "/api/v1/dispatches"))
     end
 
-    test "memory WRITES are custody surface but memory recall (a read on a POST) is not" do
+    test "memory writes are custody surface — recall included, it is not the read its verb claims" do
       assert CustodySurface.custody_operation?(conn_for(:post, "/api/v1/memory"))
       assert CustodySurface.custody_operation?(conn_for(:post, "/api/v1/memory/promote"))
       assert CustodySurface.custody_operation?(conn_for(:post, "/api/v1/memory/graduate"))
@@ -132,8 +132,33 @@ defmodule LoopctlWeb.CustodySurfaceTest do
                conn_for(:delete, "/api/v1/memory/#{Ecto.UUID.generate()}")
              )
 
-      refute CustodySurface.custody_operation?(conn_for(:post, "/api/v1/memory/recall"))
-      refute CustodySurface.custody_operation?(conn_for(:post, "/api/v1/recall"))
+      # `Memory.recall/2` bumps recall_count / last_recalled_at on what it
+      # returns — the hotness a graduation can promote into a durable article.
+      assert CustodySurface.custody_operation?(conn_for(:post, "/api/v1/memory/recall"))
+      assert CustodySurface.custody_operation?(conn_for(:post, "/api/v1/recall"))
+
+      # The oversight read stays open.
+      refute CustodySurface.custody_operation?(conn_for(:get, "/api/v1/memory"))
+    end
+
+    test "project import is custody surface — it records work as done" do
+      assert CustodySurface.custody_operation?(
+               conn_for(:post, "/api/v1/projects/#{Ecto.UUID.generate()}/import")
+             )
+    end
+
+    test "deleting the custody evidence is custody surface" do
+      for coll <- ~w(stories epics projects) do
+        assert CustodySurface.custody_operation?(
+                 conn_for(:delete, "/api/v1/#{coll}/#{Ecto.UUID.generate()}")
+               ),
+               "DELETE /#{coll}/:id destroys the record a halt was armed over"
+      end
+
+      # Still a read, and still readable.
+      refute CustodySurface.custody_operation?(
+               conn_for(:get, "/api/v1/stories/#{Ecto.UUID.generate()}")
+             )
     end
   end
 

@@ -8,6 +8,10 @@ defmodule Loopctl.Custody.Violation do
   window and halts the tenant only once the count reaches the threshold, so a
   single event can no longer take a tenant down.
 
+  `consumed_at` is stamped on the rows that ARMED a halt. They stay readable —
+  they are the forensic answer to "why was this tenant halted" — but they no
+  longer count, so the evidence for one halt cannot arm the next one.
+
   `tenant_id` is set programmatically and is never in `cast/3` (CLAUDE.md
   Multi-Tenant Rules #4). Writes go through `AdminRepo` — the custody gates run
   outside a tenant RLS context — so the explicit `tenant_id` predicate on every
@@ -18,7 +22,7 @@ defmodule Loopctl.Custody.Violation do
 
   @type t :: %__MODULE__{}
 
-  @valid_types ~w(self_verify_blocked self_report_blocked)
+  @valid_types ~w(self_verify_blocked self_report_blocked self_review_blocked)
 
   schema "custody_violations" do
     tenant_field()
@@ -28,6 +32,7 @@ defmodule Loopctl.Custody.Violation do
     field :api_key_id, :binary_id
     field :agent_id, :binary_id
     field :occurred_at, :utc_datetime_usec
+    field :consumed_at, :utc_datetime_usec
 
     timestamps()
   end
@@ -36,8 +41,10 @@ defmodule Loopctl.Custody.Violation do
   Builds a changeset for a violation record.
 
   `violation_type` is constrained to the gate outcomes that are UNAMBIGUOUSLY
-  byzantine. A capability-token rejection is deliberately NOT one of them — see
-  `Loopctl.Custody.ViolationMonitor` for why.
+  byzantine — all three lineage-aware self-* gates. A capability-token rejection
+  is deliberately NOT one of them — see `Loopctl.Custody.ViolationMonitor` for why.
+
+  `consumed_at` is never cast: it is stamped by the monitor's claim, not supplied.
   """
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(violation, attrs) do

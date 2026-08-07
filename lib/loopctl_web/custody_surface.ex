@@ -25,13 +25,22 @@ defmodule LoopctlWeb.CustodySurface do
       custody chain.
     * **Bulk story operations** — `POST /stories/bulk/*` and
       `POST /epics/:id/verify-all`. Same transitions, wider blast radius.
+    * **Project import** — `POST /projects/:id/import`. `initial_agent_status`
+      writes `reported_done` for ANY caller role, which is the same "record work
+      as done without going through custody" shape as `POST /stories/:id/backfill`.
     * **Dispatch minting** — `POST /dispatches`. A dispatch mints an ephemeral
       key carrying custody lineage; issuing new custody authority mid-halt would
       let the chain advance around the freeze.
-    * **Agent-memory writes** — `POST /memory`, `POST /memory/{promote,graduate}`,
-      `DELETE /memory/:id` (AC-28.3.3: a custody-halted key cannot write memory).
-      `POST /memory/recall` and `POST /recall` are READS despite their verb, and
-      stay open.
+    * **Agent-memory writes** — every mutating `/memory` route plus `POST /recall`
+      (AC-28.3.3: a custody-halted key cannot write memory). Recall is NOT the
+      read its verb suggests: `Memory.recall/2` bumps `recall_count` /
+      `last_recalled_at` on the rows it returns, the hotness signal the graduation
+      sweep thresholds on, so a recall loop can promote a memory into a durable
+      article mid-halt. `GET /memory` remains the read an operator investigates with.
+    * **Destroying the evidence** — `DELETE /stories/:id`, `DELETE /epics/:id`,
+      `DELETE /projects/:id`. These rows carry the `assigned_agent_id`,
+      `implementer_dispatch_id` and lifecycle timestamps the halt was armed over;
+      a subject that can erase the case against it is not halted in any useful sense.
 
   ## What is deliberately NOT blocked
 
@@ -70,8 +79,8 @@ defmodule LoopctlWeb.CustodySurface do
     mark-complete
   )
 
-  # Memory actions whose verb is a write but whose SEMANTICS are a read.
-  @memory_read_ops ~w(recall)
+  # Work-breakdown rows whose DELETION destroys the custody record itself.
+  @evidence_collections ~w(stories epics projects)
 
   @custody_controllers %{
     LoopctlWeb.StoryStatusController => :all_mutating,
@@ -81,7 +90,8 @@ defmodule LoopctlWeb.CustodySurface do
     LoopctlWeb.CapRecoveryController => :all_mutating,
     LoopctlWeb.ArtifactReportController => :all_mutating,
     LoopctlWeb.DispatchController => :all_mutating,
-    LoopctlWeb.MemoryController => {:all_mutating_except, [:recall, :context]}
+    LoopctlWeb.ImportExportController => :all_mutating,
+    LoopctlWeb.MemoryController => :all_mutating
   }
 
   @doc """
@@ -95,6 +105,10 @@ defmodule LoopctlWeb.CustodySurface do
   """
   @spec custody_operation?(Plug.Conn.t()) :: boolean()
   def custody_operation?(%Plug.Conn{method: method}) when method in @read_methods, do: false
+
+  def custody_operation?(%Plug.Conn{method: "DELETE", path_info: ["api", "v1", coll, _id]})
+      when coll in @evidence_collections,
+      do: true
 
   def custody_operation?(%Plug.Conn{path_info: ["api", "v1" | rest]}), do: custody_path?(rest)
 
@@ -114,8 +128,9 @@ defmodule LoopctlWeb.CustodySurface do
   # `POST /stories/bulk/claim` matches with `_id = "bulk"`; that is intended.
   defp custody_path?(["stories", _id, op]) when op in @story_custody_ops, do: true
   defp custody_path?(["epics", _id, "verify-all"]), do: true
+  defp custody_path?(["projects", _id, "import"]), do: true
   defp custody_path?(["dispatches"]), do: true
-  defp custody_path?(["memory", op]) when op in @memory_read_ops, do: false
   defp custody_path?(["memory" | _rest]), do: true
+  defp custody_path?(["recall"]), do: true
   defp custody_path?(_), do: false
 end

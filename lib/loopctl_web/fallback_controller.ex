@@ -299,6 +299,11 @@ defmodule LoopctlWeb.FallbackController do
   end
 
   def call(conn, {:error, :self_review_blocked}) do
+    # The third lineage-aware self-* gate, and byzantine on exactly the same
+    # terms as the other two: the reviewer's lineage is resolved server-side and
+    # found to be the implementer's. It counts.
+    record_custody_violation(conn, "self_review_blocked")
+
     conn
     |> put_status(:conflict)
     |> json(%{
