@@ -113,6 +113,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ConsolidationProposal
   alias Loopctl.Knowledge.ConsolidationReport
+  alias Loopctl.Llm
   alias Loopctl.SystemConfig
   alias Loopctl.Workers.BatchArticleEmbeddingWorker
 
@@ -516,14 +517,29 @@ defmodule Loopctl.Knowledge.Consolidation do
   # undeduplicated list carrying both classes approaches Postgres's 65,535 bind-parameter
   # limit, where a Postgrex encode failure is rescued into `:unavailable` and withholds
   # EVERY title-drift group for that tenant, deterministically, every night.
-  defp score_groups(tenant_id, proposals) do
-    ids =
-      proposals
-      |> Enum.filter(&title_drift?/1)
-      |> Enum.flat_map(& &1.article_ids)
-      |> Enum.uniq()
+  # CHUNKED over the proposals, because neither the bind count nor the self-join width may
+  # scale with the apply cap. `title_pairs/2` binds the id list TWICE, so at `max_applies:
+  # 500` groups x 50 members that is ~50,000 bind parameters against Postgres's 65,535
+  # ceiling — and the whole thing runs inside a 10s statement timeout whose failure rescues
+  # to `:unavailable`, withholding EVERY title group for the night. Raising the cap to
+  # drain a backlog faster is exactly what would trip it, so the failure would arrive
+  # precisely when the pass was asked to do more work.
+  #
+  # Chunking by GROUP rather than by id keeps each query's pairs whole: a group split
+  # across two queries would have its members scored against different pools, and
+  # `min_sim` is a per-group minimum. The merged map is keyed by member id, and a member
+  # shared between groups resolves to the same entry either way.
+  @score_groups_per_query 25
 
-    pairwise_similarity_by_group(tenant_id, ids)
+  defp score_groups(tenant_id, proposals) do
+    proposals
+    |> Enum.filter(&title_drift?/1)
+    |> Enum.chunk_every(@score_groups_per_query)
+    |> Enum.reduce(%{}, fn chunk, acc ->
+      ids = chunk |> Enum.flat_map(& &1.article_ids) |> Enum.uniq()
+
+      Map.merge(acc, pairwise_similarity_by_group(tenant_id, ids))
+    end)
   rescue
     e -> log_scoring_failed(tenant_id, ExitTag.tag(e))
   catch
@@ -862,6 +878,78 @@ defmodule Loopctl.Knowledge.Consolidation do
   defp backfill_missing_embeddings(_tenant_id, []), do: :ok
 
   defp backfill_missing_embeddings(tenant_id, ids) do
+    # An article whose stored vector is a PREFIX is unscored on purpose — `score_pairs/2`
+    # excludes truncation-marked rows so a prefix is never compared against a whole text.
+    # It is NOT backfillable, and enqueueing it was a no-op loop I created in #617:
+    # `BatchArticleEmbeddingWorker` compares through `ShrinkLadder.whole_hash/1`, so a
+    # marked row reads as ALREADY EMBEDDED and the job returns without doing anything.
+    # The gap therefore never closed, the group withheld on every subsequent night, and
+    # the pass re-enqueued the same dead jobs forever — a producer with no consumer, the
+    # exact shape #605 named and this pass keeps re-finding.
+    #
+    # Re-embedding would not help either: the text is over the provider's limit, which is
+    # why it is a prefix. So the correct handling is to stop pretending it is a gap.
+    # A tenant with no BYO embedding key can NEVER satisfy this gate: every backfill job
+    # it enqueues is discarded `{:no_embedding_key, _}` on pickup, so the title-drift class
+    # withholds on every run forever while looking transient in the log ("backfill
+    # enqueued") — a drain converging to a floor, and nightly Oban churn to go with it.
+    # Say so once, plainly, and enqueue nothing.
+    if Llm.has_embedding_key?(tenant_id) do
+      backfill_embeddable(tenant_id, ids)
+    else
+      Logger.info(
+        "Consolidation: tenant=#{tenant_id} has no embedding key (mandatory BYO), so the " <>
+          "#{length(ids)} unscored member(s) can never be embedded and title-drift groups " <>
+          "stay withheld permanently. Not enqueued — this is a configuration state, not a " <>
+          "transient gap. Idempotency-drift groups are unaffected (they need no vectors)."
+      )
+
+      :ok
+    end
+  end
+
+  defp backfill_embeddable(tenant_id, ids) do
+    {prefix, missing} = split_prefix_embedded(tenant_id, ids)
+
+    if prefix != [] do
+      Logger.info(
+        "Consolidation: tenant=#{tenant_id} #{length(prefix)} withheld member(s) carry a " <>
+          "PREFIX embedding (input over the provider limit), which cannot corroborate a " <>
+          "title collision and cannot be backfilled. Not enqueued; the group stays withheld " <>
+          "until the article is shortened or split."
+      )
+    end
+
+    enqueue_backfill(tenant_id, missing)
+  end
+
+  # Which of `ids` already carry a truncation-MARKED hash, read the same way every
+  # idempotency guard on this surface reads it: the side table at the active dimension
+  # when the tenant writes there, the legacy column otherwise.
+  defp split_prefix_embedded(tenant_id, ids) do
+    hashes =
+      if Embeddings.use_side_table_hash?(tenant_id) do
+        Embeddings.article_embedded_hashes(tenant_id, ids, Embeddings.active_dimension(tenant_id))
+      else
+        legacy_hashes(tenant_id, ids)
+      end
+
+    Enum.split_with(ids, &ShrinkLadder.truncated_hash?(Map.get(hashes, &1)))
+  end
+
+  defp legacy_hashes(tenant_id, ids) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id,
+      where: a.id in ^ids,
+      select: {a.id, a.embedding_content_hash}
+    )
+    |> AdminRepo.all()
+    |> Map.new()
+  end
+
+  defp enqueue_backfill(_tenant_id, []), do: :ok
+
+  defp enqueue_backfill(tenant_id, ids) do
     ids
     |> Enum.chunk_every(Knowledge.embedding_batch_max())
     |> Enum.each(fn chunk ->
@@ -1490,14 +1578,38 @@ defmodule Loopctl.Knowledge.Consolidation do
     end
   end
 
-  defp validate_similarity(value)
-       when (is_float(value) or is_integer(value)) and value >= 0 and value <= 1,
-       do: value * 1.0
+  # The bounds are EXCLUSIVE at both ends, matching the DB percent path's 1..99.
+  #
+  # `0` was accepted here, and it is the one in-range value that is catastrophic: the gate
+  # is `min_sim >= threshold`, so a threshold of 0.0 is satisfied by EVERY pair — including
+  # a pair with a cosine of 0. The only content check on the only self-applying class is
+  # then fully OFF, silently, while every run still reports `gate: :open` and unpublishes.
+  # This module's own comment above already explained why clamping a NEGATIVE to 0.0 would
+  # be a disaster; it just never noticed that an explicit 0 walked straight through the
+  # in-range clause to the same place. `0` is also the exact value an operator reaches for
+  # meaning "turn this off" — on the sibling drain caps it IS a pause, so the wrong guess
+  # here is the likely one.
+  #
+  # `1.0` is excluded for the mirror-image reason: identical vectors score exactly 1.0, so
+  # an operator hard-disabling the class mid-incident with 1.0 would still auto-unpublish
+  # byte-identical captures. Neither end of this range is the safe one, which is why an
+  # out-of-band value falls back to the default rather than being clamped toward a bound.
+  # Public (`@doc false`) so the bound can be asserted as a pure function. The alternative
+  # is mutating `:loopctl`'s application env from a test, which is banned here — it is
+  # VM-global, so an `async: true` sibling would see another module's threshold. A guard on
+  # the auto-unpublish path that nothing can test is a guard nobody can trust.
+  @doc false
+  @spec validate_similarity(term()) :: float()
+  def validate_similarity(value)
+      when (is_float(value) or is_integer(value)) and value > 0 and value < 1,
+      do: value * 1.0
 
-  defp validate_similarity(value) do
+  def validate_similarity(value) do
     Logger.warning(
       "Consolidation: ignoring duplicate similarity threshold #{inspect(value)} — not a " <>
-        "number in 0.0..1.0; using #{@default_min_duplicate_similarity}."
+        "number strictly between 0.0 and 1.0 (0 would turn the corroboration gate OFF " <>
+        "rather than disable the class, and 1.0 still admits byte-identical pairs); " <>
+        "using #{@default_min_duplicate_similarity}."
     )
 
     @default_min_duplicate_similarity

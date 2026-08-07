@@ -1942,12 +1942,16 @@ async function knowledgeConsolidation({ day, class: klass, limit, offset } = {})
   return toContent(result);
 }
 
-async function knowledgeIngest({ url, content, source_type, project_id, publish }) {
+async function knowledgeIngest({ url, content, source_type, project_id, publish, metadata }) {
   const body = { source_type };
   if (url) body.url = url;
   if (content) body.content = content;
   if (project_id) body.project_id = project_id;
   if (publish) body.publish = true;
+  // Forwarded so `metadata.source_ref` is reachable at all: the server honours it as the
+  // source that article titles are qualified with, and declaring it in the schema above
+  // without forwarding it here would advertise a parameter that silently does nothing.
+  if (metadata && typeof metadata === "object") body.metadata = metadata;
   const result = await apiCall("POST", "/api/v1/knowledge/ingest", body, process.env.LOOPCTL_ORCH_KEY);
   // A keyless tenant gets a 422 (code no_api_key) carrying a remediation — surface it
   // prominently so a first-time agent knows to call set_llm_config before ingesting.
@@ -5667,6 +5671,25 @@ const TOOLS = [
           description:
             "Optional: publish extracted articles immediately instead of staging them as drafts (default false).",
         },
+        metadata: {
+          type: "object",
+          description:
+            "Optional metadata map. `source_ref` is the one key with behaviour: it names the " +
+            "SPECIFIC source (a URL, repo, or document name) and is what lets extracted article " +
+            "titles qualify themselves — without it a CHANGELOG file can only become an article " +
+            "titled \"Changelog\", which is indistinguishable from every other document's " +
+            "changelog once it is in the corpus. It overrides the name derived from `url`, and " +
+            "is the ONLY way to name the source of an inline `content` ingest. Its value is " +
+            "included in the extraction prompt POSTed to the tenant's LLM provider (reduced the " +
+            "same way a url is: userinfo and query string stripped, host and path kept). Omit it " +
+            "rather than passing a placeholder — a model will qualify a title WITH it.",
+          properties: {
+            source_ref: {
+              type: "string",
+              description: "The specific source that article titles are qualified with.",
+            },
+          },
+        },
       },
       required: ["source_type"],
     },
@@ -5712,7 +5735,19 @@ const TOOLS = [
               },
               metadata: {
                 type: "object",
-                description: "Optional metadata map.",
+                description:
+                  "Optional metadata map. Set `source_ref` to the SPECIFIC source (URL, repo, " +
+                  "or document name) so extracted titles qualify themselves — without it a " +
+                  "CHANGELOG becomes an article titled \"Changelog\", indistinguishable from " +
+                  "every other document's changelog in the corpus. Overrides the url-derived " +
+                  "name, and is the only way to name an inline `content` item. Sent to the " +
+                  "LLM provider in the extraction prompt. Omit rather than passing a placeholder.",
+                properties: {
+                  source_ref: {
+                    type: "string",
+                    description: "The specific source that article titles are qualified with.",
+                  },
+                },
               },
             },
             required: ["source_type"],

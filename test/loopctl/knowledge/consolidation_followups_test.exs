@@ -406,4 +406,121 @@ defmodule Loopctl.Knowledge.ConsolidationFollowupsTest do
       assert ids.(first) == ids.(second)
     end
   end
+
+  describe "validate_similarity/1 — the threshold cannot be set to a value that disables the gate" do
+    test "0 falls back to the default instead of admitting every pair" do
+      # The gate is `min_sim >= threshold`, so 0.0 is satisfied by EVERY pair — including a
+      # cosine of 0. The only content check on the only self-applying class would be fully
+      # OFF, silently, while every run still reported `gate: :open` and unpublished. 0 is
+      # also the exact value an operator reaches for meaning "off", because on the sibling
+      # drain caps 0 IS a pause. The DB percent path already refused it; this path did not.
+      for off <- [0, 0.0] do
+        assert Consolidation.validate_similarity(off) == 0.80
+      end
+    end
+
+    test "1.0 is refused too — identical vectors score exactly 1.0" do
+      # The mirror image: an operator hard-disabling the class with 1.0 would still
+      # auto-unpublish byte-identical captures, which is the opposite of disabling it.
+      # Neither end of this range is the safe one, which is why an out-of-band value falls
+      # back to the default rather than being clamped toward a bound.
+      assert Consolidation.validate_similarity(1) == 0.80
+      assert Consolidation.validate_similarity(1.0) == 0.80
+    end
+
+    test "a legitimate in-range threshold is honoured, as a float" do
+      # The guard has to discriminate, or it silently pins the threshold at the default and
+      # an operator's tuning does nothing.
+      assert Consolidation.validate_similarity(0.68) == 0.68
+      assert Consolidation.validate_similarity(0.95) == 0.95
+    end
+
+    test "a non-number still falls back, and never sorts its way past the bound" do
+      # A number sorts BELOW every atom and binary in Erlang term order, so a comparison
+      # guard alone would let `nil` or `"0.8"` through as "greater than 0".
+      for bad <- [nil, "0.8", :off, %{}] do
+        assert Consolidation.validate_similarity(bad) == 0.80
+      end
+    end
+  end
+
+  describe "a withhold that can never clear does not churn nightly" do
+    test "a tenant with NO embedding key enqueues no backfill at all" do
+      # Mandatory BYO: every backfill job such a tenant enqueues is discarded
+      # `{:no_embedding_key, _}` on pickup. The pass used to enqueue them every night
+      # forever while logging "backfill enqueued", so a PERMANENT withhold read as a
+      # transient gap and the drain converged to a floor.
+      tenant = fixture(:tenant)
+      a = published(tenant.id, %{title: "Keyless Doc", body: String.duplicate("long ", 40)})
+      b = published(tenant.id, %{title: "keyless doc!", body: "short"})
+
+      # `a` is embedded, `b` is not — so `b` is the unscored member that would be backfilled.
+      embed!(tenant.id, a.id, List.duplicate(0.1, 1536))
+
+      confirm_over_two_nights_no_corroborate(tenant.id)
+
+      assert %{applied: 0, uncorroborated: 1} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      # Inline Oban would have embedded `b` had a job been enqueued. Nothing was.
+      refute embedded?(tenant.id, b.id)
+      assert status(a.id) == :published
+      assert status(b.id) == :published
+    end
+
+    test "a member whose vector is a PREFIX is not enqueued for backfill" do
+      # A prefix-marked row is excluded from scoring on purpose (a prefix must never be
+      # compared against a whole text), so it lands in `unscored`. But
+      # `BatchArticleEmbeddingWorker` compares through `whole_hash/1` and reads a marked
+      # row as ALREADY EMBEDDED — so the job did nothing, the gap never closed, and the
+      # pass re-enqueued the same dead job every night. Re-embedding cannot help: the text
+      # is over the provider's limit, which is WHY it is a prefix.
+      tenant = fixture(:tenant)
+
+      {:ok, _} =
+        Loopctl.Llm.upsert_settings(tenant.id, %{"embedding_api_key" => "test-openai-embed-pfx"})
+
+      a = published(tenant.id, %{title: "Prefix Doc", body: String.duplicate("long ", 40)})
+      b = published(tenant.id, %{title: "prefix doc!", body: "short"})
+
+      embed!(tenant.id, a.id, List.duplicate(0.1, 1536))
+      # `b` carries a vector under a TRUNCATION-MARKED hash.
+      {:ok, _} =
+        Loopctl.Knowledge.update_embedding(
+          tenant.id,
+          b.id,
+          List.duplicate(0.2, 1536),
+          ShrinkLadder.truncated_hash("deadbeef")
+        )
+
+      confirm_over_two_nights_no_corroborate(tenant.id)
+
+      assert %{applied: 0, uncorroborated: 1} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      # The mark SURVIVES: nothing re-embedded it and erased the prefix marker.
+      assert ShrinkLadder.truncated_hash?(stored_hash(tenant.id, b.id))
+    end
+  end
+
+  # Confirms a group over two nights WITHOUT forcing corroboration, so the tests above
+  # measure the gate rather than a helper that pre-satisfies it.
+  defp confirm_over_two_nights_no_corroborate(tenant_id) do
+    {:ok, _} = Consolidation.run(tenant_id, day: Date.add(Date.utc_today(), -1))
+    {:ok, _} = Consolidation.run(tenant_id)
+  end
+
+  defp embed!(tenant_id, id, vector),
+    do: {:ok, _} = Loopctl.Knowledge.update_embedding(tenant_id, id, vector, nil)
+
+  defp stored_hash(tenant_id, id) do
+    Loopctl.Embeddings.article_embedded_hashes(
+      tenant_id,
+      [id],
+      Loopctl.Embeddings.active_dimension(tenant_id)
+    )
+    |> Map.get(id)
+  end
+
+  defp embedded?(tenant_id, id), do: is_binary(stored_hash(tenant_id, id))
 end

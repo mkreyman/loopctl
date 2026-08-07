@@ -985,6 +985,16 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       # the pairs that happen to have vectors would let a 3-member group be judged on its one
       # scorable pair — which could be exactly the two that match.
       tenant = fixture(:tenant)
+      # The tenant needs a BYO embedding key for this claim to hold. Mandatory BYO means a
+      # keyless tenant's backfill jobs are discarded `{:no_embedding_key, _}` on pickup, so
+      # its withhold is PERMANENT, not self-clearing — the pass now says so and enqueues
+      # nothing. The mock embedding client ignores keys, which is what let this test assert
+      # a production property while omitting its production prerequisite.
+      {:ok, _} =
+        Loopctl.Llm.upsert_settings(tenant.id, %{
+          "embedding_api_key" => "test-openai-embed-consolidation"
+        })
+
       {a, b} = duplicate_pair(tenant.id)
 
       c = published(tenant.id, %{title: "aws codedeploy traffic control!", body: "third"})

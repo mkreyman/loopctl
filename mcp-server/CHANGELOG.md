@@ -5,6 +5,39 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.72.0 — 2026-08-07 (name the source, so titles can stand alone)
+
+### Added
+
+- **`knowledge_ingest` accepts a `metadata` object, and forwards it.** It previously did
+  not, which made `metadata.source_ref` unreachable from MCP entirely — the server honours
+  it, but no agent using these tools could set it.
+
+  `source_ref` names the SPECIFIC source (a URL, repo, or document name) and is what lets an
+  extracted article title qualify itself. Without it the extractor sees only a coarse
+  `source_type` like `web_article` and a CHANGELOG file can only become an article titled
+  "Changelog" — indistinguishable from every other document's changelog once it is in the
+  corpus. Three unrelated documents did exactly that on the hosted corpus and were then
+  proposed for automatic unpublishing as "the same capture".
+
+  It overrides the name derived from `url` (which matters when a URL's identity lives in its
+  stripped query string) and is the ONLY way to name the source of an inline `content`
+  ingest. **Omit it rather than passing a placeholder** — a model will dutifully qualify a
+  title WITH the word "unknown".
+
+### Changed
+
+- **`knowledge_ingest_batch`'s per-item `metadata` documents `source_ref`.** The parameter
+  was already accepted and forwarded; its description said only "Optional metadata map", so
+  the behaviour was undiscoverable.
+
+### Note on what is sent to your LLM provider
+
+`source_ref` — or, absent it, the ingest `url` reduced to scheme+host+path — is included in
+the extraction prompt POSTed to the tenant's configured provider. Userinfo and the query
+string are stripped, so credentials and query-string signatures are not transmitted; the
+host and PATH are, so a share link carrying its token in a path segment still sends it.
+
 ## 2.71.0 — 2026-08-05 (consolidation: two classes retired, and the pass now writes)
 
 ### Changed

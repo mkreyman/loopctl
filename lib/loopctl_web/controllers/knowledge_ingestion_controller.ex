@@ -123,7 +123,16 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
         "publish them on extraction instead. Role: orchestrator+.\n\n" <>
         "**At rest:** inline `content` is encrypted (AES-256-GCM) in the job record " <>
         "and is never persisted in the clear. `url`, `source_type`, and `metadata` " <>
-        "are NOT encrypted — do not put sensitive values in `metadata`.",
+        "are NOT encrypted — do not put sensitive values in `metadata`.\n\n" <>
+        "**In transit to your LLM provider:** the extraction prompt names the source, " <>
+        "so titles can be self-qualifying (a bare \"Changelog\" from three different " <>
+        "documents is indistinguishable once it is in the corpus). What is sent is " <>
+        "`metadata.source_ref` if you supply it, otherwise the `url` reduced to " <>
+        "scheme+host+path — userinfo and the query string are stripped, so credentials " <>
+        "and query-string signatures are not transmitted, but the host and PATH are. A " <>
+        "share link carrying its token in a path segment still sends it. Omit " <>
+        "`source_ref` rather than passing a placeholder: a model will qualify a title " <>
+        "WITH it.",
     request_body:
       {"Ingestion request", "application/json",
        %OpenApiSpex.Schema{
@@ -158,7 +167,22 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
            },
            metadata: %OpenApiSpex.Schema{
              type: :object,
-             description: "Optional metadata map"
+             description:
+               "Optional metadata map. `source_ref` is the one key with behaviour: it " <>
+                 "names the SPECIFIC source (a URL, repo, or document name) and drives " <>
+                 "article-title qualification, overriding the name derived from `url` " <>
+                 "(which matters when a URL's identity lives in its stripped query " <>
+                 "string). It is the only way to name the source of an inline `content` " <>
+                 "ingest. Its value is included in the extraction prompt POSTed to your " <>
+                 "configured LLM provider, reduced the same way `url` is. Omit it rather " <>
+                 "than passing a placeholder. Nothing in `metadata` is encrypted at rest.",
+             properties: %{
+               source_ref: %OpenApiSpex.Schema{
+                 type: :string,
+                 description: "The specific source that titles are qualified with.",
+                 example: "https://github.com/scrogson/oauth2"
+               }
+             }
            }
          },
          required: ["source_type"]
@@ -289,9 +313,12 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
                "Array of ingestion items (max 50). Each item has the same shape as " <>
                  "POST /knowledge/ingest: url or content, source_type (required), " <>
                  "project_id (optional), publish (optional, default false → draft), " <>
-                 "metadata (optional). Per-item `content` obeys the same " <>
+                 "metadata (optional; `metadata.source_ref` names the specific source " <>
+                 "and drives title qualification, overriding the `url`-derived name). " <>
+                 "Per-item `content` obeys the same " <>
                  "#{@max_inline_content_bytes}-byte cap and is encrypted at rest; " <>
-                 "`metadata` is not encrypted.",
+                 "`metadata` is not encrypted, and `source_ref` (or the reduced `url`) " <>
+                 "is sent to your LLM provider in the extraction prompt.",
              maxItems: 50
            }
          },
