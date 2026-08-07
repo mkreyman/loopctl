@@ -228,10 +228,11 @@ defmodule Loopctl.Progress do
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} ->
-        # US-26.3.1 AC-5: mint a start_cap for the claiming lineage
+        # US-26.3.1 AC-5: mint a start_cap for the claiming lineage, and return it
+        # on the struct (#621) so the caller can present it to POST /start.
         lineage = Keyword.get(opts, :lineage, [])
-        mint_cap_best_effort(tenant_id, "start_cap", updated.id, lineage)
-        {:ok, updated}
+        cap = mint_cap(tenant_id, "start_cap", updated.id, lineage)
+        {:ok, %{updated | minted_capability: cap}}
 
       {:error, :lock, reason, _} ->
         {:error, reason}
@@ -247,14 +248,42 @@ defmodule Loopctl.Progress do
     end
   end
 
-  # Mints a capability token as a side-effect. Returns nil if key is
-  # unavailable (tenant has no audit key yet). The cap is retrievable
-  # via the Capabilities module; it's not returned in the function value
-  # to keep the return type backward-compatible.
-  defp mint_cap_best_effort(tenant_id, typ, story_id, lineage) do
+  # Mints a capability token and RETURNS it, so the caller can hand it to the
+  # agent that will need it for the next custody op. Returns nil when minting
+  # is impossible or fails.
+  #
+  # Issue #621: this used to discard the token "to keep the return type
+  # backward-compatible", and no other path delivered it either — so every
+  # keyed tenant's next lifecycle call hit `:missing_capability` (see
+  # maybe_consume_cap/6). The token is now returned and surfaced on the story
+  # struct's virtual :minted_capability field.
+  #
+  # A mint failure is only tolerable for a PRE-V2 (keyless) tenant, where
+  # maybe_consume_cap/6 lets a nil cap through. For a KEYED tenant the
+  # capability is MANDATORY, so a silent nil here wedges the lifecycle exactly
+  # the way #621 did — hence the loud log + telemetry rather than a bare nil.
+  defp mint_cap(tenant_id, typ, story_id, lineage) do
     case Capabilities.mint(tenant_id, typ, story_id, lineage) do
-      {:ok, cap} -> cap
-      {:error, _} -> nil
+      {:ok, cap} ->
+        cap
+
+      {:error, reason} ->
+        if tenant_has_audit_key?(tenant_id) do
+          Logger.error(
+            "capability_mint_failed: KEYED tenant could not mint a capability — the next " <>
+              "custody call for this story will fail with missing_capability until the agent " <>
+              "recovers one via POST /stories/:id/recover-cap. " <>
+              "tenant_id=#{tenant_id} story_id=#{story_id} cap_type=#{typ} reason=#{inspect(reason)}"
+          )
+
+          :telemetry.execute(
+            [:loopctl, :custody, :cap_mint_failed],
+            %{count: 1},
+            %{tenant_id: tenant_id, story_id: story_id, cap_type: typ, reason: reason}
+          )
+        end
+
+        nil
     end
   end
 
@@ -376,7 +405,7 @@ defmodule Loopctl.Progress do
              |> Ecto.Changeset.change(verifier_dispatch_id: verifier.id)
              |> AdminRepo.update() do
           {:ok, _updated} ->
-            mint_cap_best_effort(tenant_id, "verify_cap", story_id, verifier.lineage_path)
+            mint_cap(tenant_id, "verify_cap", story_id, verifier.lineage_path)
 
             Loopctl.AuditChain.append(tenant_id, %{
               action: "verifier_selected",
@@ -555,9 +584,28 @@ defmodule Loopctl.Progress do
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} ->
-        # US-26.3.1 AC-6: mint a report_cap for the implementing lineage
-        lineage = Keyword.get(opts, :lineage, [])
-        mint_cap_best_effort(tenant_id, "report_cap", updated.id, lineage)
+        # #621: NO report_cap is minted here any more, deliberately.
+        #
+        # It used to be minted bound to the STARTER's (implementer's) lineage, to
+        # be consumed by POST /report. But `report` is a chain-of-custody gate: it
+        # must be called by a DIFFERENT principal from the implementer
+        # (validate_not_self_report/3, `self_report_blocked`), and
+        # Capabilities.verify/2 requires an EXACT lineage match. So the only
+        # principal the token authorized was the one principal forbidden to use
+        # it, and every keyed tenant's report failed `cap_rejected: wrong_lineage`.
+        #
+        # The token could not be rebound: the reporter is by definition not known
+        # when the implementer starts. Binding it loosely (any separated lineage)
+        # would still require the implementer to HAND the token to the reporter,
+        # opening a channel between the two principals the model exists to keep
+        # apart — and letting the implementer decide whether review can happen.
+        #
+        # Report is therefore gated by L4 structural separation alone, which is
+        # what actually enforces "nobody reports their own work": agent-id AND
+        # dispatch-lineage comparison, fail-closed on a custody-unattributed story
+        # or an unresolvable dispatch. L1 is retained where it expresses something
+        # no other layer can — `verify_cap`, minted to a lineage LOOPCTL SELECTS,
+        # which an implementer cannot construct.
         {:ok, updated}
 
       {:error, :lock, reason, _} ->
@@ -625,7 +673,6 @@ defmodule Loopctl.Progress do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
     token_usage_params = Keyword.get(opts, :token_usage)
-    cap_id = Keyword.get(opts, :cap_id)
 
     multi =
       Multi.new()
@@ -643,13 +690,9 @@ defmodule Loopctl.Progress do
           {:ok, story}
         end
       end)
-      |> maybe_consume_cap(
-        tenant_id,
-        story_id,
-        cap_id,
-        "report_cap",
-        Keyword.get(opts, :lineage, [])
-      )
+      # #621: no capability is consumed here — see the comment in start_story/3
+      # for why a report_cap could not be bound to a legitimate holder. The
+      # custody gate above (validate_not_self_report/3) is the enforcement.
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         now = DateTime.utc_now()
 

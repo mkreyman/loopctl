@@ -75,29 +75,29 @@ compare dispatch lineage and all three fail closed on a story with no custody pr
 caller's lineage is always resolved SERVER-SIDE from the authenticating key
 (`Dispatches.lineage_for_api_key/2`, `dispatches.ex:518-528`) — never read from the request body.
 
-- **verify** — `validate_not_self_verify/2` `progress.ex:1743-1776`. `nil` orchestrator identity is
-  untrusted (`progress.ex:1743`); a custody-orphaned story fails closed with
-  `:missing_assigned_agent` (`progress.ex:1758-1760`, "nil is never permissive"); the lineage clause
+- **verify** — `validate_not_self_verify/2` `progress.ex:1786-1819`. `nil` orchestrator identity is
+  untrusted (`progress.ex:1786`); a custody-orphaned story fails closed with
+  `:missing_assigned_agent` (`progress.ex:1801-1803`, "nil is never permissive"); the lineage clause
   runs when BOTH `implementer_dispatch_id` and `verifier_dispatch_id` are set
-  (`progress.ex:1763-1767`), decided by `verify_lineage_separated/4` (`progress.ex:1786-1806`).
+  (`progress.ex:1806-1810`), decided by `verify_lineage_separated/4` (`progress.ex:1829-1849`).
   An EMPTY lineage on either side (what an unloadable dispatch yields,
-  `get_dispatch_lineage/2` `progress.ex:1808-1813`) fails **CLOSED**, and the `assigned_agent_id`
+  `get_dispatch_lineage/2` `progress.ex:1851-1856`) fails **CLOSED**, and the `assigned_agent_id`
   equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
-  `progress.ex:363-396`); that write is result-checked, and a failure flags `verifier_needed` plus a
-  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:401-425`) instead of
+  `progress.ex:392-425`); that write is result-checked, and a failure flags `verifier_needed` plus a
+  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:430-454`) instead of
   silently leaving the field nil. With no verifier dispatch the gate is agent-id equality.
-- **report** — `validate_not_self_report/3` `progress.ex:2268-2294`. `nil` caller blocked
-  (`progress.ex:2268`); a story with nil `assigned_agent_id` AND nil `implementer_dispatch_id` is
+- **report** — `validate_not_self_report/3` `progress.ex:2311-2337`. `nil` caller blocked
+  (`progress.ex:2311`); a story with nil `assigned_agent_id` AND nil `implementer_dispatch_id` is
   **custody-unattributed** and fails closed with `:missing_assigned_agent` + a
-  `custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2307-2310`) — it used to
+  `custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2350-2353`) — it used to
   pass vacuously; then the reporter's lineage vs the implementer's (`lineage_status/2`,
-  `progress.ex:2339-2357`) — tri-state `:ok | :conflict | :unresolvable`, where an unresolvable
+  `progress.ex:2382-2400`) — tri-state `:ok | :conflict | :unresolvable`, where an unresolvable
   implementer dispatch fails CLOSED with `unresolvable_dispatch_lineage` (LCP-1 §7.5); then plain
   `assigned_agent_id` equality.
-- **review-complete** — `validate_not_self_review/3` `progress.ex:2359-2389`. Custody-orphan backstop
-  first (`progress.ex:2366-2368`), then a **`nil` reviewer is deliberately PERMITTED**
-  (`progress.ex:2375-2376`) because nil means a human operator on a user-role key; then the
+- **review-complete** — `validate_not_self_review/3` `progress.ex:2402-2432`. Custody-orphan backstop
+  first (`progress.ex:2409-2411`), then a **`nil` reviewer is deliberately PERMITTED**
+  (`progress.ex:2418-2419`) because nil means a human operator on a user-role key; then the
   reviewer's lineage; then plain equality. That nil permit has THREE parts, all of which must change
   together: (a) the `exact_role: [:orchestrator, :user]` plug (`review_record_controller.ex:22-23`),
   which 403s an agent key before the controller runs — so the `:agent` branch of the controller cond
@@ -122,7 +122,7 @@ correct behavior; do not add a workaround.
 - `verify/2` (`capabilities.ex:67-84`), decided by `validate_cap/6` (`capabilities.ex:125-135`) —
   type match + story match + **lineage exact match** + not-expired + not-consumed + a valid
   **ed25519 signature** over the token fields, checked against the tenant's
-  `audit_signing_public_key` (`verify_signature/2`, `capabilities.ex:137-164`, which returns false —
+  `audit_signing_public_key` (`verify_signature/2`, `capabilities.ex:183-210`, which returns false —
   fails CLOSED — when the tenant has no pubkey). There is NO "nonce exists" check; the nonce is an
   input to the signed message. The signature is the ONLY cryptographic check — never remove it as
   ceremony.
@@ -131,9 +131,9 @@ correct behavior; do not add a workaround.
   a read-then-write.
 
 **Enforcement is conditional — this is the deprecation seam.** `Progress.maybe_consume_cap/6`
-(`progress.ex:323-346`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
+(`progress.ex:352-375`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
 `:missing_capability` **only for tenants that have an audit key** (`tenant_has_audit_key?/1`,
-`progress.ex:425-431`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
+`progress.ex:456-462`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
 proceeds with NO capability at all. So L1 strength is per-tenant. That branch now emits a
 `pre_v2_custody_bypass` warning plus a `[:loopctl, :custody, :pre_v2_bypass]` telemetry event, so the
 degraded tenants are observable — alert on the count. Do not "simplify" the clause: removing the
@@ -150,7 +150,7 @@ and again in Elixir — from a pool capped at `@verifier_pool_limit`, seeded det
 `sha256(tenant audit pubkey || story_id)` so the orchestrator cannot predict the pick.
 
 **Empty-lineage caveat, in BOTH directions.** When the implementer dispatch cannot be loaded,
-`assign_rotating_verifier/3` passes `[]` (`progress.ex:363-367`), and with `[]` the rejection is
+`assign_rotating_verifier/3` passes `[]` (`progress.ex:392-396`), and with `[]` the rejection is
 inert — selection can then pick a same-lineage (even the implementer's own) dispatch. The verify-time
 comparison is fail-closed on an empty lineage, so this is caught at verify rather than at selection;
 do not "simplify" either half.
@@ -171,8 +171,8 @@ long-lived env-var keys.
 - Taking the caller's lineage from request params instead of `Dispatches.lineage_for_api_key/2` —
   a client-supplied lineage is self-attested and defeats the gate.
 - Trusting a `nil` identity as permissive where the code blocks it — `verify`
-  (`progress.ex:1743`) and `report` (`progress.ex:2268`) fail closed on nil *caller identity*. The one
-  documented exception is `review-complete` (`progress.ex:2375-2376`, nil = human operator, paired
+  (`progress.ex:1786`) and `report` (`progress.ex:2311`) fail closed on nil *caller identity*. The one
+  documented exception is `review-complete` (`progress.ex:2418-2419`, nil = human operator, paired
   with the exact_role plug and the controller check). Do not "fix" it without reading its comment.
 
 ## Related

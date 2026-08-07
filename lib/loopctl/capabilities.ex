@@ -107,6 +107,49 @@ defmodule Loopctl.Capabilities do
   def consume(%CapabilityToken{consumed_at: _}), do: {:error, :replay}
 
   @doc """
+  Lists the live capabilities issued to `lineage` for `story_id`.
+
+  DELIVERY, NOT MINTING (#621). `verify_cap` is minted at verifier-assignment
+  time bound to the selected verifier's lineage, and unlike `start_cap` /
+  `report_cap` it cannot ride the response of the call that minted it — that
+  response goes to the REPORTER, and handing a reporter the verifier's cap is
+  precisely the self-verification the custody model exists to prevent.
+  `CapRecoveryController` cannot serve it either: recovery deliberately re-mints
+  only `start_cap`, because an agent must never mint a cap to verify its own
+  work. So the verifier had no way to obtain a cap it already held a claim to.
+
+  This grants nothing new: it returns only tokens ALREADY minted for the
+  caller's own lineage, and the lineage must still match exactly at consume time
+  (`validate_cap/6`), where the ed25519 signature is also checked. Consumed and
+  expired tokens are excluded.
+
+  ## Empty lineage fails CLOSED
+
+  An empty lineage returns `[]` rather than matching tokens issued to `[]`.
+  Every key not minted by a dispatch resolves to `[]`
+  (`Dispatches.lineage_for_api_key/2`), so matching on it would hand ONE legacy
+  caller every other legacy caller's capabilities in the tenant — a cross-agent
+  leak. Callers on such a key fall back to `recover_cap` for a `start_cap`.
+  """
+  @spec list_for_lineage(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) :: [CapabilityToken.t()]
+  def list_for_lineage(_tenant_id, _story_id, []), do: []
+
+  def list_for_lineage(tenant_id, story_id, lineage) do
+    import Ecto.Query
+
+    now = DateTime.utc_now()
+
+    from(c in CapabilityToken,
+      where:
+        c.tenant_id == ^tenant_id and c.story_id == ^story_id and
+          c.issued_to_lineage == ^lineage and is_nil(c.consumed_at) and
+          c.expires_at > ^now,
+      order_by: [desc: c.issued_at]
+    )
+    |> AdminRepo.all()
+  end
+
+  @doc """
   Returns a JSON-serializable representation of a capability token.
   """
   @spec serialize(CapabilityToken.t()) :: map()

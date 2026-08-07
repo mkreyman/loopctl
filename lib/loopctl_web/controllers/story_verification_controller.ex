@@ -17,6 +17,7 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Artifacts
+  alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias Loopctl.Verification
   alias Loopctl.Verification.VerificationRun
@@ -191,7 +192,16 @@ defmodule LoopctlWeb.StoryVerificationController do
           orchestrator_agent_id: api_key.agent_id,
           # LCP-1 §9.4: record the verified signed claim (nil under bearer) in the
           # hash-chained audit entry, atomically with the verify decision.
-          custody_claim: conn.assigns[:custody_signed_claim]
+          custody_claim: conn.assigns[:custody_signed_claim],
+          # #621: the verify_cap is minted at verifier-ASSIGNMENT time, bound to the
+          # selected verifier's lineage — so unlike start_cap/report_cap it cannot
+          # ride the response of the call that minted it (that response goes to the
+          # reporter, not the verifier). The verifier obtains it via
+          # POST /stories/:id/recover-cap and presents it here. :lineage is resolved
+          # server-side and must match the lineage the cap was minted for, so a
+          # non-assigned caller's cap check fails with :wrong_lineage.
+          cap_id: capability_param(params),
+          lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
         )
 
       case Progress.verify_story(tenant_id, story_id, params, opts) do
@@ -272,6 +282,11 @@ defmodule LoopctlWeb.StoryVerificationController do
         {:error, :unprocessable_entity, backfill_error_message(atom)}
     end
   end
+
+  # #621: accepts the capability under either key, matching the convention used by
+  # LoopctlWeb.Plugs.RequireSignedClaim (require_signed_claim.ex:54). Extracted so
+  # the `||` does not push verify/2 over credo's cyclomatic-complexity limit.
+  defp capability_param(params), do: params["capability"] || params["cap_id"]
 
   defp backfill_error_message(:reason_required) do
     "`reason` is required and cannot be blank. " <>

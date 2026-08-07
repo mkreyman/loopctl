@@ -142,44 +142,44 @@ All three gates are lineage-aware. They do NOT share one implementation, but eac
 CALLER's dispatch lineage (resolved server-side from the authenticating key, never client-supplied)
 against the implementer's, and each fails CLOSED on a story with no custody provenance.
 
-**verify** — `validate_not_self_verify/2` (`lib/loopctl/progress.ex:1743-1776`, US-26.2.2),
+**verify** — `validate_not_self_verify/2` (`lib/loopctl/progress.ex:1786-1819`, US-26.2.2),
 in order:
-1. **nil caller identity is blocked** — untrusted, never permissive (US-26.1.3, `progress.ex:1743`).
+1. **nil caller identity is blocked** — untrusted, never permissive (US-26.1.3, `progress.ex:1786`).
 2. **Custody-orphaned story is blocked** with `missing_assigned_agent` — a reported-done
    story with no assigned agent and no lineage would otherwise pass VACUOUSLY, since a
-   non-nil verifier never equals a nil implementer (`progress.ex:1758-1760`).
+   non-nil verifier never equals a nil implementer (`progress.ex:1801-1803`).
 3. **Lineage comparison (primary)** when BOTH `implementer_dispatch_id` and
-   `verifier_dispatch_id` are set (`progress.ex:1763-1767`), decided by
-   `verify_lineage_separated/4` (`progress.ex:1786-1806`): an EMPTY lineage on either side —
+   `verifier_dispatch_id` are set (`progress.ex:1806-1810`), decided by
+   `verify_lineage_separated/4` (`progress.ex:1829-1849`): an EMPTY lineage on either side —
    which is what an unloadable/deleted dispatch row yields (`get_dispatch_lineage/2`,
-   `progress.ex:1808-1813`) — fails CLOSED, a shared lineage root
+   `progress.ex:1851-1856`) — fails CLOSED, a shared lineage root
    (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:587-591`) blocks, and the
    `assigned_agent_id` equality check is evaluated IN ADDITION to the lineage comparison, never
    short-circuited by it.
 4. **`assigned_agent_id` equality** as the fallback for pre-dispatch stories
-   (`progress.ex:1770`) and for every story that lacks a verifier dispatch.
+   (`progress.ex:1813`) and for every story that lacks a verifier dispatch.
 
 `verifier_dispatch_id` is written only by the assign-verifier flow
-(`assign_rotating_verifier/3`, `progress.ex:363-396`); that write is checked, and a failure
+(`assign_rotating_verifier/3`, `progress.ex:392-425`); that write is checked, and a failure
 flags `verifier_needed` plus a `verifier_not_assigned` audit event
-(`flag_verifier_needed/5`, `progress.ex:401-425`) rather than silently leaving the field nil.
+(`flag_verifier_needed/5`, `progress.ex:430-454`) rather than silently leaving the field nil.
 Without a verifier dispatch the check degrades to plain agent-id equality.
 
-**report** — `validate_not_self_report/3` (`progress.ex:2268-2294`) — nil identity is blocked
-(`progress.ex:2268`); a **custody-unattributed** story (nil `assigned_agent_id` AND nil
+**report** — `validate_not_self_report/3` (`progress.ex:2311-2337`) — nil identity is blocked
+(`progress.ex:2311`); a **custody-unattributed** story (nil `assigned_agent_id` AND nil
 `implementer_dispatch_id`) fails CLOSED with `missing_assigned_agent` and a
-`custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2307-2310`) instead of
+`custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2350-2353`) instead of
 passing vacuously; then the reporter's dispatch lineage is compared against the implementer's
-(`lineage_status/2`, `progress.ex:2339-2357`) — a tri-state `:ok | :conflict | :unresolvable`
+(`lineage_status/2`, `progress.ex:2382-2400`) — a tri-state `:ok | :conflict | :unresolvable`
 where a DECLARED-but-unresolvable implementer dispatch fails CLOSED with
 `unresolvable_dispatch_lineage` (LCP-1 §7.5), a shared lineage root yields `self_report_blocked`,
 and `:ok` falls through to plain `assigned_agent_id == agent_id`. The DB CHECK
 `stories_reported_done_requires_agent` does NOT cover this — it is satisfied whenever
 `implementer_dispatch_id IS NULL` — so the code guard is the enforcement.
 
-**review-complete** — `validate_not_self_review/3` (`progress.ex:2359-2389`) — custody-orphan
-backstop first (`progress.ex:2366-2368`), then a **nil reviewer is deliberately PERMITTED**
-(`progress.ex:2375-2376`): nil means a human operator on a user-role key. That permit has
+**review-complete** — `validate_not_self_review/3` (`progress.ex:2402-2432`) — custody-orphan
+backstop first (`progress.ex:2409-2411`), then a **nil reviewer is deliberately PERMITTED**
+(`progress.ex:2418-2419`): nil means a human operator on a user-role key. That permit has
 THREE parts which must change together:
 1. the `exact_role: [:orchestrator, :user]` plug
    (`lib/loopctl_web/controllers/review_record_controller.ex:22-23`), which 403s an `:agent` key

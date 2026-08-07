@@ -952,6 +952,67 @@ async function contractStory({ story_id, story_title, ac_count }) {
   return toContent(result);
 }
 
+// --- L1 capability plumbing (issue #621) ---
+//
+// A tenant with an audit signing key MUST present a capability token on the
+// custody transitions that consume one, or the call fails 403 missing_capability.
+// The tokens are handed out by the server (claim returns a start_cap; a verify_cap
+// is collected from GET /stories/:id/capabilities), and callers should not have to
+// carry them by hand — so we cache what the server issues and attach it
+// automatically, while still honouring an explicit `capability` argument.
+//
+// The cache is per-process and therefore does NOT survive a session crash. That is
+// what the recovery paths below are for; never treat a cache miss as fatal.
+const capCache = new Map();
+
+const capKey = (storyId, typ) => `${storyId}:${typ}`;
+
+function rememberCap(storyId, cap) {
+  if (cap && cap.cap_id && cap.typ) {
+    capCache.set(capKey(storyId, cap.typ), cap.cap_id);
+  }
+}
+
+function takeCap(storyId, typ) {
+  const key = capKey(storyId, typ);
+  const cap = capCache.get(key);
+  // Capabilities are single-use: once handed to a call, drop it so a retry does
+  // not replay a consumed token (which the server rejects, and which trips the
+  // custody-violation path rather than a clean error).
+  capCache.delete(key);
+  return cap;
+}
+
+// Fetches a live capability of `typ` already issued to this caller's lineage.
+// Returns undefined when there is none — callers must degrade gracefully.
+async function fetchCap(storyId, typ, key) {
+  try {
+    const result = await apiCall("GET", `/api/v1/stories/${storyId}/capabilities`, null, key);
+    const caps = (result && result.data) || [];
+    const match = caps.find((c) => c.typ === typ);
+    return match && match.cap_id;
+  } catch {
+    return undefined;
+  }
+}
+
+// Re-mints a start_cap for a story this agent owns (session-crash recovery).
+// Only start_cap is recoverable by design — an agent must never be able to mint a
+// capability to verify or report its own work.
+async function recoverStartCap(storyId) {
+  try {
+    const result = await apiCall(
+      "POST",
+      `/api/v1/stories/${storyId}/recover-cap`,
+      null,
+      process.env.LOOPCTL_AGENT_KEY
+    );
+    return result && result.data && result.data.cap_id;
+  } catch {
+    return undefined;
+  }
+}
+
 async function claimStory({ story_id }) {
   const result = await apiCall(
     "POST",
@@ -959,14 +1020,19 @@ async function claimStory({ story_id }) {
     null,
     process.env.LOOPCTL_AGENT_KEY
   );
+  // The claim response carries the start_cap that POST /start will require.
+  rememberCap(story_id, result && result.capability);
   return toContent(result);
 }
 
-async function startStory({ story_id }) {
+async function startStory({ story_id, capability }) {
+  const cap =
+    capability || takeCap(story_id, "start_cap") || (await recoverStartCap(story_id));
+
   const result = await apiCall(
     "POST",
     `/api/v1/stories/${story_id}/start`,
-    null,
+    cap ? { capability: cap } : null,
     process.env.LOOPCTL_AGENT_KEY
   );
   return toContent(result);
@@ -1024,11 +1090,22 @@ async function reviewComplete({ story_id, review_type, findings_count, fixes_cou
 
 // --- Verification Tools (orch key) ---
 
-async function verifyStory({ story_id, summary, review_type, claim }) {
+async function verifyStory({ story_id, summary, review_type, claim, capability }) {
   const body = {};
   if (summary) body.summary = summary;
   if (review_type) body.review_type = review_type;
   if (claim) body.claim = claim;
+
+  // The verify_cap is minted during report, bound to the verifier lineage loopctl
+  // SELECTS — so unlike the start_cap it never rides an earlier response to this
+  // caller. Collect it from the delivery endpoint, which only ever returns tokens
+  // already issued to this caller's own lineage.
+  const cap =
+    capability ||
+    takeCap(story_id, "verify_cap") ||
+    (await fetchCap(story_id, "verify_cap", process.env.LOOPCTL_ORCH_KEY));
+
+  if (cap) body.capability = cap;
 
   const result = await apiCall(
     "POST",
@@ -3563,13 +3640,23 @@ const TOOLS = [
   {
     name: "start_story",
     description:
-      "Agent starts work on a claimed story. Transitions assigned -> implementing. Uses the AGENT key.",
+      "Agent starts work on a claimed story. Transitions assigned -> implementing. Uses the AGENT key. " +
+      "The L1 capability (start_cap) is handled for you: it is taken from the claim_story response, " +
+      "and re-minted via recover-cap if this process lost it (e.g. after a session crash). " +
+      "Pass `capability` only to override that.",
     inputSchema: {
       type: "object",
       properties: {
         story_id: {
           type: "string",
           description: "The UUID of the story.",
+        },
+        capability: {
+          type: "string",
+          description:
+            "Optional start_cap cap_id. Normally omitted — supplied automatically from the " +
+            "claim response or recovered. A tenant with an audit signing key cannot start " +
+            "without one (403 missing_capability).",
         },
       },
       required: ["story_id"],
@@ -3689,6 +3776,14 @@ const TOOLS = [
         review_type: {
           type: "string",
           description: "Optional: review type for the verification record.",
+        },
+        capability: {
+          type: "string",
+          description:
+            "Optional verify_cap cap_id. Normally omitted — collected automatically from " +
+            "GET /stories/:id/capabilities, which returns only tokens already issued to " +
+            "your own dispatch lineage. loopctl selects the verifier lineage, so an " +
+            "implementer cannot obtain one for its own work.",
         },
         claim: CLAIM_SCHEMA,
       },

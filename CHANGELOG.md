@@ -2,6 +2,40 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
+
+### Fixed
+
+- **The story lifecycle is completable again for tenants with an audit signing key (#621).**
+  Every tenant created through the current signup flow has one, and for those tenants the
+  capability layer rejected start/report/verify because NO client-facing path ever handed the
+  caller a capability token: the tokens were minted at each transition and discarded. The
+  lifecycle has been unusable over the API since 2026-04-12; it went unnoticed because recent
+  work flowed through pull requests rather than the story lifecycle, and because the test
+  suite only exercised the keyless path, where capabilities are not enforced.
+  **What changed for clients:** the `claim` response now carries a `capability` object whose
+  `cap_id` must be presented as the `capability` field on `start`. A new
+  `GET /api/v1/stories/:id/capabilities` returns the live tokens already issued to the
+  caller's own dispatch lineage — this is how a verifier collects its `verify_cap`, which is
+  minted during report and bound to the verifier loopctl selects, so it cannot ride an earlier
+  response. The endpoint only ever returns tokens already issued to the caller and never mints.
+  `loopctl-mcp-server` handles all of this automatically (it caches what the server issues and
+  re-mints a lost `start_cap` via recover-cap); upgrade it rather than plumbing tokens by hand.
+  Claiming with a dispatch-minted key now also records `implementer_dispatch_id`, without
+  which every downstream lineage check silently degraded to plain agent-id equality.
+
+- **`report` no longer requires a capability token, and no `report_cap` is minted.** It could
+  never have worked: the token was bound to the implementer's lineage while `report` is a
+  chain-of-custody gate that must be called by a DIFFERENT principal, and capability
+  verification requires an exact lineage match — so the only principal the token authorized
+  was the one forbidden to use it. The transition is gated by structural lineage separation,
+  which is what actually enforces "nobody reports their own work"; that gate is unchanged and
+  still fails closed. See `docs/chain-of-custody-v2.md` §5.2 for the reasoning.
+
+- **Capability refusals return their documented 403 instead of a 500.** The controllers had no
+  clause for the capability layer's own error shapes, so a missing or rejected token raised a
+  CaseClauseError — making a correct refusal indistinguishable from a crash in logs and alerts.
+
 ## [Unreleased] — 2026-07-24 — Self-hosting: fresh-install fixes, multilingual search, at-rest ingestion encryption
 
 Operator-facing changes for deployments outside the hosted instance.

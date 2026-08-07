@@ -299,11 +299,34 @@ The `signature` field is computed over the canonical serialization of the other 
 Capability tokens are minted at specific transition points:
 
 - **`claim_story` → `assigned`**: mints a `start_cap` issued to the claiming agent's lineage. The response body carries the `start_cap`.
-- **`start_story` → `implementing`**: consumes the `start_cap`, mints a `report_cap` issued to the same lineage. The response body carries the `report_cap`.
-- **`request_review` → `reported_done`**: consumes the `report_cap`. Loopctl selects a verifier lineage (via the rotating-verifier protocol in §6), mints a `verify_cap` issued to that lineage, and adds it to the `ready_for_verification` queue for that lineage.
+- **`start_story` → `implementing`**: consumes the `start_cap`. Mints nothing.
+- **`report_story` → `reported_done`**: consumes NO capability — see "Why report is not capability-gated" below. Loopctl selects a verifier lineage (via the rotating-verifier protocol in §6), mints a `verify_cap` issued to that lineage, and adds it to the `ready_for_verification` queue for that lineage.
 - **`verify_story` → `verified`**: consumes the `verify_cap`.
 
 Each cap is minted once and consumed once. Loopctl records every mint and every consumption in the audit chain.
+
+#### Why `report` is not capability-gated
+
+An earlier revision of this section had `start_story` mint a `report_cap` "issued to
+the same lineage", consumed by the transition to `reported_done`. That is not
+implementable alongside the chain-of-custody gate, and issue #621 is where the two
+met: `report` must be called by a principal DISTINCT from the implementer
+(`validate_not_self_report/3`, `self_report_blocked`), while `Capabilities.verify/2`
+requires an EXACT lineage match. A token minted to the implementer's lineage
+therefore authorized exactly the one principal forbidden to use it, and every keyed
+tenant's report failed with `cap_rejected: wrong_lineage`.
+
+The token could not simply be rebound: the reporter is by definition not known when
+the implementer starts work. Binding it loosely — to any lineage not sharing the
+implementer's root — would still require the implementer to HAND the token to the
+reporter, which opens a channel between the two principals this model exists to keep
+apart, and lets the implementer decide whether review happens at all.
+
+So `report` is gated by L4 structural separation alone: agent-id AND dispatch-lineage
+comparison, failing closed on a custody-unattributed story or an unresolvable
+dispatch. L1 is retained where it expresses something no other layer can — `verify_cap`
+is minted to a lineage LOOPCTL SELECTS, which is why an implementer cannot construct a
+valid verify request no matter what it holds.
 
 ### 5.3 Verification
 
