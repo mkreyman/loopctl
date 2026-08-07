@@ -281,7 +281,7 @@ Custody-critical endpoints require a capability token in the request body. The t
 
 ```json
 {
-  "typ": "verify_cap",
+  "typ": "start_cap",
   "story_id": "uuid",
   "tenant_id": "uuid",
   "issued_to_lineage": "lineage_fingerprint",
@@ -299,17 +299,56 @@ The `signature` field is computed over the canonical serialization of the other 
 Capability tokens are minted at specific transition points:
 
 - **`claim_story` → `assigned`**: mints a `start_cap` issued to the claiming agent's lineage. The response body carries the `start_cap`.
-- **`start_story` → `implementing`**: consumes the `start_cap`, mints a `report_cap` issued to the same lineage. The response body carries the `report_cap`.
-- **`request_review` → `reported_done`**: consumes the `report_cap`. Loopctl selects a verifier lineage (via the rotating-verifier protocol in §6), mints a `verify_cap` issued to that lineage, and adds it to the `ready_for_verification` queue for that lineage.
-- **`verify_story` → `verified`**: consumes the `verify_cap`.
+- **`start_story` → `implementing`**: consumes the `start_cap`. Mints nothing.
+- **`report_story` → `reported_done`**: consumes NO capability — see "Why report and verify are not capability-gated" below. Loopctl selects a verifier lineage (via the rotating-verifier protocol in §6) and records it on the story as `verifier_dispatch_id`.
+- **`verify_story` → `verified`**: consumes NO capability. The CALLER's server-resolved lineage, compared against the implementer's, is the gate — plus the recorded verifier lineage whenever `request_review` selected one.
 
-Each cap is minted once and consumed once. Loopctl records every mint and every consumption in the audit chain.
+The `start_cap` is minted once and consumed once. Loopctl records every mint and every consumption in the audit chain.
+
+#### Why `report` and `verify` are not capability-gated
+
+An earlier revision of this section had `start_story` mint a `report_cap` "issued to
+the same lineage", consumed by the transition to `reported_done`, and a `verify_cap`
+minted to the selected verifier. Neither is implementable alongside the
+chain-of-custody gate, and issue #621 is where the two met.
+
+**report.** It must be called by a principal DISTINCT from the implementer
+(`validate_not_self_report/3`, `self_report_blocked`), while `Capabilities.verify/2`
+requires an EXACT lineage match. A token minted to the implementer's lineage
+therefore authorized exactly the one principal forbidden to use it, and every keyed
+tenant's report failed with `cap_rejected: wrong_lineage`. It could not simply be
+rebound: the reporter is by definition not known when the implementer starts work.
+Binding it loosely — to any lineage not sharing the implementer's root — would still
+require the implementer to HAND the token to the reporter, which opens a channel
+between the two principals this model exists to keep apart, and lets the implementer
+decide whether review happens at all.
+
+**verify.** The `verify_cap` was minted to the lineage `Dispatches.select_verifier/3`
+picks, which is not the principal that calls `POST /stories/:id/verify`: the candidate
+pool includes `:agent`-role dispatches while the endpoint is `exact_role:
+:orchestrator`; a legacy env-var orchestrator key resolves to lineage `[]` and can
+hold no cap at all; and in a tenant whose dispatches descend from one root no
+candidate is eligible, so nothing is minted. Each case left the story permanently
+unverifiable, and the bulk path (`verify_all_in_epic/4`) carried no cap at all. A cap
+whose only reachable holder is forbidden to spend it is not a gate.
+
+Both transitions are therefore gated by L4 structural separation: agent-id AND
+dispatch-lineage comparison, failing closed on a custody-unattributed story or an
+unresolvable dispatch, plus the `exact_role` plugs. What the cap's exact-lineage
+match actually bought was a binding to the CALLER, so verify now makes that binding
+directly: it compares the caller's server-resolved lineage against the implementer's
+on EVERY path, which matters because `request_review` is optional and
+`verifier_dispatch_id` may be nil. The loopctl-SELECTED verifier lineage is compared
+in addition whenever it was recorded — it just is not carried as a bearer token the
+entitled principal cannot obtain.
 
 ### 5.3 Verification
 
-Every custody-critical endpoint extracts the cap from the request body and validates:
+`start_story`, the one transition that consumes a cap, extracts it from the request body and validates:
 
-1. Signature matches the tenant's audit public key
+1. Signature matches the tenant's audit public key — or a historical key whose
+   `[rotated_in, rotated_out)` window covers `issued_at`, so a key rotation degrades an
+   outstanding token to a normal refusal instead of a byzantine `invalid_signature` halt
 2. `typ` matches the endpoint
 3. `story_id` matches the path parameter
 4. `tenant_id` matches the authenticated caller's tenant
@@ -323,10 +362,10 @@ Any failure returns a 403 with a machine-readable reason code and a link to the 
 
 An adversary that controls the implementer cannot call `verify_story` because:
 
-- It does not hold a `verify_cap` for its story. Verify caps are minted only at `request_review` time, for a lineage chosen by loopctl.
-- Even if it reads a `verify_cap` from the database via SQL access, the cap's `issued_to_lineage` field does not match its own lineage.
-- Even if it attempts to forge a cap, it does not hold the tenant's signing key. The signing key is in a Fly secret the application can read but cannot export in a way the adversary can exfiltrate to a third-party signer.
-- Even if it compromises the signing key through some other means, the cap's mint is recorded in the audit chain — and the adversary cannot rewrite the audit chain without the agent-witness protocol detecting the divergence.
+- Its dispatch lineage shares a root with the implementer's, so `verify_lineage_separated/4` blocks it — and the verifier lineage it would have to present is CHOSEN BY LOOPCTL and recorded on the story, not supplied by the caller.
+- It cannot present a different identity: the caller's lineage is resolved server-side from the authenticating key (`Dispatches.lineage_for_api_key/2`), never read from the request body.
+- It cannot call the endpoint at all with the key it implements under: `verify` is `exact_role: :orchestrator` and `claim`/`start` are `exact_role: :agent`, and hierarchy does not apply to either.
+- Even if it forged its way past all of that, every transition is recorded in the audit chain — and the adversary cannot rewrite the chain without the agent-witness protocol detecting the divergence.
 
 The bypass requires defeating three orthogonal layers simultaneously. Each layer can be compromised in isolation without the system failing open.
 
@@ -471,7 +510,7 @@ When a story reaches `reported_done` and a verifier is selected, loopctl creates
    - `migration:...` criteria parse the migration files and check the column exists
    - `manual:...` criteria are queued for human review
 
-5. **Record results**: the verification run stores per-AC pass/fail + overall pass/fail. On full pass, loopctl issues the verifier the `verify_cap` for that story. On failure, the story is rejected and loopctl records the specific ACs that failed.
+5. **Record results**: the verification run stores per-AC pass/fail + overall pass/fail. On full pass, the story becomes verifiable by the selected verifier. On failure, the story is rejected and loopctl records the specific ACs that failed.
 
 ### 7.3 Why this closes the lazy-bastard gap
 
