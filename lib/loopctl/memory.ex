@@ -55,6 +55,7 @@ defmodule Loopctl.Memory do
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Embeddings
+  alias Loopctl.Embeddings.ShrinkLadder
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.IdempotencyTag
@@ -2205,10 +2206,25 @@ defmodule Loopctl.Memory do
     |> Keyword.merge(Keyword.take(opts, [:actor_id, :actor_label, :actor_type, :metadata]))
   end
 
+  # A PREFIX-embedded memory's vector is NOT reused: `ProposalGate` treats a supplied
+  # `:embedding` as covering the whole text (its truncation cap keys on a tag only its
+  # OWN embed produces), so a shared opening could score the graduation as a duplicate of
+  # an article it differs from after the cut — and a duplicate verdict drops the write.
+  # Let the gate embed instead; it walks its own ladder and caps its own verdict.
   defp maybe_put_embedding(propose_opts, %MemorySchema{} = memory) do
-    case fetch_memory_embedding(memory) do
-      nil -> propose_opts
-      embedding -> Keyword.put(propose_opts, :embedding, embedding)
+    with false <- ShrinkLadder.truncated_hash?(stored_embedding_hash(memory)),
+         embedding when not is_nil(embedding) <- fetch_memory_embedding(memory) do
+      Keyword.put(propose_opts, :embedding, embedding)
+    else
+      _ -> propose_opts
+    end
+  end
+
+  defp stored_embedding_hash(%MemorySchema{id: id, tenant_id: tenant_id} = memory) do
+    if Embeddings.side_table_reads_enabled?() do
+      Embeddings.memory_embedded_hash(tenant_id, id, Embeddings.active_dimension(tenant_id))
+    else
+      memory.embedding_content_hash
     end
   end
 
@@ -2625,11 +2641,17 @@ defmodule Loopctl.Memory do
         {:error, :heavy_read_overloaded} = err ->
           err
 
-        {:ok, near_dup_id, embedding} ->
-          insert_promoted(scope, candidate, hash, near_dup_id, embedding)
+        {:ok, near_dup_id, embedding, truncated?} ->
+          insert_promoted(scope, candidate, stored_hash(hash, truncated?), near_dup_id, embedding)
       end
     end
   end
+
+  # The stored hash still identifies the FULL candidate text; the mark records only that
+  # the vector beside it covers a prefix of it. `promoted_hash_exists?/3` matches either
+  # form, so exact dedupe is unaffected.
+  defp stored_hash(hash, false), do: hash
+  defp stored_hash(hash, true), do: ShrinkLadder.truncated_hash(hash)
 
   # Recall the nearest near-dup that auto-promotion is ALLOWED to supersede: a prior
   # `:promoted` memory (never a user's explicit row). Returns `{:ok, near_dup_id | nil,
@@ -2653,14 +2675,42 @@ defmodule Loopctl.Memory do
   # rather than a silent overwrite of human-authored knowledge. Results are
   # distance-ordered (nearest first), so the first ELIGIBLE promoted row above threshold
   # wins; missing one (pool dominated by explicit rows) is safe — insert fresh instead.
+  #
+  # The embed goes through `ShrinkLadder.embed_one/3` (#617): an over-long memory
+  # returned `{:api_error, 400, :context_length_exceeded}`, which fell into the
+  # `{:error, _reason}` branch below as `:embeddings_degraded` and ABORTED the whole
+  # promotion run — permanently, since the next run embeds the identical text and is
+  # rejected identically. The ladder makes a long memory promotable on a prefix
+  # instead of making it unpromotable forever.
+  #
+  # A PREFIX vector (`:truncated`) does the near-dup lookup no good and real harm: it is
+  # compared at 0.92 against prior rows embedded from their WHOLE slice, so two long
+  # memories that share an opening and diverge after it score as one — and the hit is not
+  # merely ignored, it SUPERSEDES the prior row (`insert_promoted/5`). The apples-to-apples
+  # premise above is what licenses that write, and truncation breaks it. So a truncated
+  # candidate is inserted FRESH (`near_dup_id` nil): a permitted duplicate, never a
+  # retirement decided on comparing different extents of text.
+  #
+  # Refusing the LOOKUP is only half of it. The vector computed here is PERSISTED as the
+  # new row's embedding, so an unmarked prefix would enter the promoted pool and the NEXT
+  # whole-text candidate would run the same forbidden compare from the other side — this
+  # time retiring the longer memory. The fourth element carries the truncation fact to
+  # `promote_one/2`, which marks the stored hash (`ShrinkLadder.truncated_hash/1`) so
+  # `first_promoted_near_dup/1` skips the row exactly as it skips an explicit-source one.
   defp nearest_live(scope, text) do
-    case Knowledge.generate_embedding(
-           scope.tenant_id,
-           MemorySchema.embedding_input(text),
-           egress_opts(scope)
-         ) do
+    embed =
+      ShrinkLadder.embed_one(
+        MemorySchema.embedding_input(text),
+        &Knowledge.generate_embedding(scope.tenant_id, &1, egress_opts(scope)),
+        label: "Memory.nearest_live tenant=#{scope.tenant_id}"
+      )
+
+    case embed do
       {:error, _reason} ->
         {:error, :embeddings_degraded}
+
+      {:ok, embedding, :truncated} ->
+        {:ok, nil, embedding, true}
 
       {:ok, embedding} ->
         # The near-dup HNSW recall runs on the shared HeavyRead pool behind the
@@ -2670,7 +2720,7 @@ defmodule Loopctl.Memory do
         # would burn an Oban attempt on the promotion WRITE path, US-37.5).
         case find_promoted_near_dup(scope, embedding) do
           {:error, :heavy_read_overloaded} = err -> err
-          near_dup_id -> {:ok, near_dup_id, embedding}
+          near_dup_id -> {:ok, near_dup_id, embedding, false}
         end
     end
   end
@@ -2706,11 +2756,17 @@ defmodule Loopctl.Memory do
 
   # The id of the nearest `:promoted` row at/above the near-dup threshold (rows are
   # distance-ordered, nearest first), or nil. An explicit-source near-dup is skipped —
-  # auto-promotion never supersedes a human-authored row (AC-29.2.4).
+  # auto-promotion never supersedes a human-authored row (AC-29.2.4) — and so is a
+  # PREFIX-embedded one: its vector covers part of its text, so a whole-text candidate
+  # scoring against it is the mismatched-extent compare `nearest_live/2` refuses on the
+  # candidate side, and here it would RETIRE the longer, more informative memory.
   defp first_promoted_near_dup(rows) do
     Enum.find_value(rows, fn row ->
       score = max(0.0, 1.0 - row.distance)
-      if score >= near_dup_threshold() and row.source == :promoted, do: row.id
+
+      if score >= near_dup_threshold() and row.source == :promoted and
+           not ShrinkLadder.truncated_hash?(row.embedding_content_hash),
+         do: row.id
     end)
   end
 
@@ -2925,12 +2981,16 @@ defmodule Loopctl.Memory do
       is_nil(new.superseded_by)
   end
 
+  # Either FORM of the hash is the same content: a prefix-embedded row carries the
+  # truncation mark, and missing it here would re-promote text already promoted.
   defp promoted_hash_exists?(repo, scope, hash) do
+    forms = [hash, ShrinkLadder.truncated_hash(hash)]
+
     MemorySchema
     |> where(
       [m],
       m.tenant_id == ^scope.tenant_id and m.subject_id == ^scope.subject_id and
-        m.source == :promoted and m.embedding_content_hash == ^hash
+        m.source == :promoted and m.embedding_content_hash in ^forms
     )
     |> repo.exists?()
   end

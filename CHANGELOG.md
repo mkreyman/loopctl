@@ -8,6 +8,49 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **The consolidation drain caps AND the duplicate-similarity threshold are now live-tunable
+  without a deploy (#617).** `knowledge_consolidation_max_applies`,
+  `knowledge_consolidation_max_unpublishes`, `knowledge_consolidation_max_per_class` and
+  `knowledge_consolidation_min_duplicate_similarity_pct` (an INTEGER percent — `80` means
+  0.80 — which is the threshold a title collision's members must corroborate at in content
+  before the nightly may unpublish one; only **1..99** is accepted, because `0` on this knob
+  would satisfy the corroboration check for every pair rather than disabling it, and any
+  other value falls back to the config layer) are read from `SystemConfig` DB rows first,
+  falling back to the compile-time application config and then to the built-in default. The
+  drain caps still read `0` as "halt", which this threshold deliberately does not. Setting
+  `knowledge_consolidation_max_unpublishes` to **0** halts the auto-unpublish drain, and that
+  halt now takes effect on the next nightly rather than on the next deploy — which is the
+  whole point, since the caps are the only lever an operator has while an apply is going
+  wrong. The existing config values keep working unchanged; nothing needs to be set.
+
+- **An over-long input no longer permanently strands a row un-embedded (#617).** #615 added
+  the byte budget and shrink ladder to the two article-embedding workers. The same rejection
+  on the re-embed, system-corpus, agent-memory and novelty-gate paths still mapped to a
+  permanent 4xx and DISCARDED the job — so a single over-long article could wedge a whole
+  tenant re-embed mid-run (leaving recall pinned at the old dimension), and an over-long
+  memory was permanently absent from semantic recall. All four now walk the same ladder,
+  embedding a prefix rather than nothing. Array calls bisect first, so only the member that
+  actually overflows is truncated. No configuration change; the effect is fewer rows silently
+  missing from semantic search. A vector that covers only a prefix is MARKED where it is
+  stored, and the three readers that compare vectors treat it accordingly: the novelty gate
+  will not call a proposal a duplicate on one, the nightly will not corroborate a title
+  collision on one, and agent-memory promotion will not retire a memory on one.
+
+- **The nightly re-checks that a confirmed duplicate group still COLLIDES before unpublishing
+  it (#617).** The apply path previously re-checked only that the group's members were still
+  published. Retitling the articles is the remedy for a false grouping, and a retitled group
+  passed that check — it was saved only because a fresh derivation happened to drop the group
+  first. The grouping signal (normalized title, or normalized idempotency key, whichever
+  formed the group) is now re-evaluated at apply time; a group that no longer collides as one
+  whole — dissolved, split, or any live member dropped — is skipped and re-derived. The same
+  holds when the group is SHRUNK rather than split: if a confirmed member was archived,
+  deleted or made private, the survivors are a set no report ever confirmed and the pass
+  skips them (its own part-drain, which leaves the member a shared draft, still converges). A
+  duplicate group also carries at most 50 members onto one proposal. The remainder is
+  re-derived on the next run and applies the run AFTER that: the survivors are a different id
+  set, so their fingerprint has to appear in two consecutive reports before the agreement gate
+  will confirm it. A very large group therefore drains 50 members every two nights.
+
 - **The nightly consolidation drain rates are raised so the duplicate backlog converges to
   zero instead of to a floor (#611).** Three settings, all previously pinned to module
   defaults sized for a class that had never applied anything in production:

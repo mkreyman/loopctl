@@ -35,6 +35,8 @@ defmodule Loopctl.Knowledge.ProposalGate do
 
   require Logger
 
+  alias Loopctl.Embeddings.ShrinkLadder
+  alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm
@@ -43,7 +45,6 @@ defmodule Loopctl.Knowledge.ProposalGate do
   @default_duplicate_threshold 0.97
   @default_overlap_threshold 0.88
   @neighbors_k 5
-  @max_text_length 32_000
 
   @impl true
   def assess(tenant_id, attrs, opts \\ [])
@@ -70,9 +71,10 @@ defmodule Loopctl.Knowledge.ProposalGate do
     |> Map.put(:gate_embedded, gate_embedded?)
   end
 
-  defp do_assess(tenant_id, opts, embedding) do
+  defp do_assess(tenant_id, opts, result) do
     dup = config(:knowledge_proposal_duplicate_threshold, @default_duplicate_threshold)
     overlap = config(:knowledge_proposal_overlap_threshold, @default_overlap_threshold)
+    {embedding, truncated?} = split_truncation(result)
 
     # Route through the GUARDED embedding path (review #4): tenant-scoped circuit
     # breaker + timeout, so a provider outage fast-fails here (this runs SYNCHRONOUSLY
@@ -99,7 +101,12 @@ defmodule Loopctl.Knowledge.ProposalGate do
 
           neighbors when is_list(neighbors) ->
             score = neighbors |> List.first() |> neighbor_score()
-            %{verdict: classify(score, dup, overlap), score: score, neighbors: neighbors}
+
+            %{
+              verdict: score |> classify(dup, overlap) |> cap_truncated(truncated?),
+              score: score,
+              neighbors: neighbors
+            }
         end
 
       {:error, :no_api_key} ->
@@ -133,6 +140,29 @@ defmodule Loopctl.Knowledge.ProposalGate do
   defp neighbor_score(nil), do: nil
   defp neighbor_score(%{similarity_score: s}), do: s
 
+  # The ladder (#617) can only embed an over-long proposal as a PREFIX, and it says so.
+  # That vector is scored against corpus vectors built from whole texts, so a shared
+  # opening (generated API docs, changelogs, a common frontmatter header) scores as a
+  # near-identity of a document it may differ from entirely after the cut. A prefix
+  # therefore supports NO negative verdict at all — neither band may be reached on one.
+  #
+  # `:low_novelty` is not a safe cap: under `on_low_novelty: :skip` (memory graduation,
+  # channel-post capture, ingestion `skip_low_novelty=true`) `Knowledge.gate_proposal/4`
+  # creates NOTHING for that band, so capping to it relabels the verdict and still drops
+  # the write for exactly the UNATTENDED callers that have no reviewer to recover it.
+  # `:unknown` is not safe either: those same callers pass `on_gate_unavailable: :skip`,
+  # which returns `{:error, :gate_unavailable}` so they can retry once embeddings recover
+  # — but truncation is a permanent property of the text, so the retry never clears.
+  # `:novel` creates on the requested path for EVERY caller class; `score` and `neighbors`
+  # still ride the assessment, so nothing is hidden, and the nightly consolidation pass
+  # remains the backstop for the rare over-long duplicate. The gate's job is to flag,
+  # never to lose a write.
+  defp cap_truncated(verdict, true) when verdict in [:duplicate, :low_novelty], do: :novel
+  defp cap_truncated(verdict, _truncated?), do: verdict
+
+  defp split_truncation({:ok, vector, :truncated}), do: {{:ok, vector}, true}
+  defp split_truncation(result), do: {result, false}
+
   # Reuse a caller-supplied embedding when present (avoids a second embedding round-trip
   # for text already embedded upstream — e.g. a memory's stored vector on graduation);
   # otherwise embed the proposal text through the guarded path. A non-list / empty
@@ -153,8 +183,28 @@ defmodule Loopctl.Knowledge.ProposalGate do
         # project-only `local_only` marking would not be enforced on a path that
         # runs SYNCHRONOUSLY in the `knowledge_create` write path — and because the
         # gate deliberately falls OPEN, the refusal would be silent.
-        {Knowledge.generate_embedding(tenant_id, build_text(attrs),
-           project_id: attrs["project_id"] || attrs[:project_id]
+        # Through `ShrinkLadder.embed_one/3` (#617). This gate falls OPEN on an
+        # embedding failure, so an input-too-long rejection did not surface as an
+        # error — it silently skipped novelty checking entirely, and the over-long
+        # article landed as exactly the duplicate the nightly consolidation pass then
+        # has to catch. `max_rungs` is BOUNDED because this runs SYNCHRONOUSLY in the
+        # write path — each rung is a provider round trip and an embedding admission slot
+        # that interactive search shares — but the bound must still REACH the floor, or
+        # the rung budget reproduces the silent skip it was added to close.
+        #
+        # THREE, because `build_text/1` caps at 32,000 CHARACTERS: a dense-script
+        # (Cyrillic/CJK) or code-heavy proposal arrives at up to 128,000 bytes, and
+        # `next_budget/1` caps the first rung at 32,000 bytes, then 16,000, then the 8,000
+        # floor. At one rung that whole class — exactly the articles #615 measured, and
+        # the ones most likely to be re-captured — landed back at the fall-open having had
+        # NO novelty check at all. Three rungs reach the floor from ANY first attempt.
+        project_id = attrs["project_id"] || attrs[:project_id]
+
+        {ShrinkLadder.embed_one(
+           build_text(attrs),
+           &Knowledge.generate_embedding(tenant_id, &1, project_id: project_id),
+           label: "ProposalGate tenant=#{tenant_id}",
+           max_rungs: 3
          ), true}
     end
   end
@@ -162,7 +212,7 @@ defmodule Loopctl.Knowledge.ProposalGate do
   defp build_text(attrs) do
     title = attrs["title"] || attrs[:title] || ""
     body = attrs["body"] || attrs[:body] || ""
-    String.slice("#{title}\n\n#{body}", 0, @max_text_length)
+    TextBudget.initial("#{title}\n\n#{body}")
   end
 
   defp open_verdict, do: %{verdict: :unknown, score: nil, neighbors: [], gate_embedded: false}

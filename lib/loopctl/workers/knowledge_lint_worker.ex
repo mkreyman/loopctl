@@ -119,6 +119,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.Knowledge.Consolidation
   alias Loopctl.Knowledge.LinkPruning
   alias Loopctl.Oban.FairShare
+  alias Loopctl.SystemConfig
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Workers.ArticleLinkingWorker
   alias Loopctl.Workers.BatchArticleEmbeddingWorker
@@ -213,6 +214,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     })
 
     Logger.info(
+      # The #616 content gate is the single most likely reason a night applied nothing, and
+      # without this counter that night is byte-identical to a clean corpus in both this
+      # line and the audit event.
       "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
         "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
         "conflicts_promoted=#{promoted} conflicts_judged_redundant=#{judged} " <>
@@ -221,6 +225,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "duplicates_unpublished=#{applied.applied} duplicate_groups_skipped=#{applied.skipped} " <>
         "duplicate_apply_gate=#{applied.gate} " <>
         "duplicates_unpublish_failed=#{applied.failed} " <>
+        "duplicate_groups_uncorroborated=#{applied.uncorroborated} " <>
         consolidation_log(consolidation)
     )
 
@@ -591,20 +596,78 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # them as opts and the worker passed none, so the nightly was pinned to the module defaults
   # whatever an operator configured. That is why draining the standing backlog required
   # calling the context directly, which is not a thing a self-maintaining pass should need.
-  defp applies_cap do
-    Application.get_env(
-      :loopctl,
+  #
+  # Resolved through `SystemConfig` FIRST (#617). These three caps are the only lever that
+  # slows or stops the nightly drain, and until now the only way to move one was a deploy —
+  # an operator watching an auto-unpublish go wrong had no way to halt it in the minutes
+  # that matter. `SystemConfig` is DB-backed, survives restart, propagates to the fleet, and
+  # is testable by seeding a row.
+  #
+  # Explicitly NOT `Application.put_env/3` as the live lever: that is per-NODE, does not
+  # survive a restart, and fails open and silently — and mutating VM-global state makes the
+  # code untestable in an `async: true` suite. `Application.get_env/3` REMAINS the layer
+  # beneath, so a compile-time config (including `config/test.exs`) is still honoured when
+  # no DB row exists. Resolution order: DB row -> app config -> module default.
+  # Public (`@doc false`) so the resolution ORDER can be asserted directly. It is the
+  # operator's only mid-incident lever, and a lever nothing tests is a lever nobody can
+  # trust to be there when it is needed.
+  @doc false
+  @spec applies_cap() :: integer()
+  def applies_cap do
+    tunable(
+      "knowledge_consolidation_max_applies",
       :knowledge_consolidation_max_applies,
       Consolidation.default_max_applies()
     )
   end
 
-  defp unpublishes_cap do
-    Application.get_env(
-      :loopctl,
+  @doc false
+  @spec unpublishes_cap() :: integer()
+  def unpublishes_cap do
+    tunable(
+      "knowledge_consolidation_max_unpublishes",
       :knowledge_consolidation_max_unpublishes,
       Consolidation.default_max_unpublishes()
     )
+  end
+
+  @doc false
+  @spec per_class_cap() :: integer()
+  def per_class_cap do
+    tunable(
+      "knowledge_consolidation_max_per_class",
+      :knowledge_consolidation_max_per_class,
+      Consolidation.default_max_per_class()
+    )
+  end
+
+  # `get_int/2`'s own contract is that a missing row, a non-integer row, or ANY error
+  # returns the default — so the app-config value is what a fresh install and an unprimed
+  # cache both see, exactly as before this indirection existed.
+  defp tunable(db_key, app_key, default) do
+    SystemConfig.get_int(db_key, coerce_int(Application.get_env(:loopctl, app_key), default))
+  end
+
+  # The app-config layer is type-checked rather than trusted: `SystemConfig.get_int/2`
+  # requires an INTEGER default and would raise a FunctionClauseError on a `nil` or a
+  # `"25"` from a hand-edited config. Inside the nightly's rescue that surfaces as a
+  # generic `apply_failed`, which reads as an outage rather than as the config typo it is.
+  #
+  # Takes the VALUE, not the key, so it is testable without mutating VM-global application
+  # state — `Application.put_env/3` in a test is banned here for exactly the reason this
+  # whole change routes the live lever through the DB instead.
+  @doc false
+  @spec coerce_int(term(), integer()) :: integer()
+  def coerce_int(value, _default) when is_integer(value), do: value
+  def coerce_int(nil, default), do: default
+
+  def coerce_int(other, default) do
+    Logger.warning(
+      "KnowledgeLintWorker: ignoring non-integer consolidation cap #{inspect(other)}; " <>
+        "using #{default}."
+    )
+
+    default
   end
 
   defp apply_failed(tenant_id, tag) do
@@ -624,7 +687,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # `:scan_failed` path guard the `:apply_failed` one, which needs a repo-level failure to
   # provoke.
   defp empty_tally(gate, error \\ nil),
-    do: %{applied: 0, skipped: 0, failed: 0, gate: gate, error: error}
+    do: %{applied: 0, skipped: 0, failed: 0, uncorroborated: 0, gate: gate, error: error}
 
   # Writes the consolidation report + its proposal rows and nothing else. The APPLY is a
   # separate step (`apply_consolidation/2`, above) on purpose: this one must run first so
@@ -644,14 +707,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # the audit event instead, as a low-cardinality TAG (never the raw error, which carries
   # backend host / database / role).
   defp consolidate(tenant_id) do
-    max_per_class =
-      Application.get_env(
-        :loopctl,
-        :knowledge_consolidation_max_per_class,
-        Consolidation.default_max_per_class()
-      )
-
-    {:ok, consolidation} = Consolidation.run(tenant_id, max_per_class: max_per_class)
+    {:ok, consolidation} = Consolidation.run(tenant_id, max_per_class: per_class_cap())
     {:ok, consolidation}
   rescue
     error -> consolidation_failed(tenant_id, ExitTag.tag(error))
@@ -697,6 +753,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       "duplicates_unpublished" => applied.applied,
       "duplicate_groups_skipped" => applied.skipped,
       "duplicates_unpublish_failed" => applied.failed,
+      # Groups the #616 corroboration gate WITHHELD (title collision, bodies do not agree,
+      # or the members carry no vectors yet). Without it, a tenant whose every confirmed
+      # group is withheld records applied=0 skipped=0 failed=0 gate=open — exactly what a
+      # clean corpus records — and only per-group warnings say otherwise.
+      "duplicate_groups_uncorroborated" => applied.uncorroborated,
       # WHY nothing was applied, when nothing was. `:open` with zeroes is a clean corpus;
       # `:report_gap` / `:insufficient_history` mean the agreement gate refused to run,
       # `:drain_disabled` means an operator set a cap to 0, and `:apply_failed` means it ran

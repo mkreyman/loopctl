@@ -67,13 +67,14 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   alias Loopctl.Egress
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
+  alias Loopctl.Embeddings.ShrinkLadder
+  alias Loopctl.Embeddings.TextBudget
+  alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Provider.Admission
   alias Loopctl.Provider.RetryAfter
-
-  @max_text_length 32_000
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"tenant_id" => tenant_id} = args}) when is_binary(tenant_id) do
@@ -125,21 +126,103 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
     embed_entries(tenant_id, dim, entries)
   end
 
-  defp embed_entries(tenant_id, dim, []), do: continue(tenant_id, dim)
-
+  # Through `ShrinkLadder.embed_batch/3` (#617). An input-too-long rejection used to
+  # reach `handle_error/2`, where `permanent_provider_error?/1` is `true` for any 4xx —
+  # so one over-long canonical DISCARDED the job and left that canonical keyword-only
+  # for this tenant while `system_corpus_meta/2` kept reporting "semantic". The ladder
+  # bisects to isolate the offender and truncates only it.
+  #
+  # Sub-split by the CUMULATIVE byte budget FIRST (`Knowledge.embedding_batch_max_chars/0`),
+  # exactly as `BatchArticleEmbeddingWorker` does: the count cap does not bound aggregate
+  # tokens, and an AGGREGATE rejection names no member — so without this the ladder would
+  # bisect every batch on every run, paying the whole tree as routine rather than as the
+  # one-time recovery it exists to be. Each sub-batch is stored before the next, so an
+  # error later in the batch keeps what was already paid for (`split_unchanged/3` skips it).
   defp embed_entries(tenant_id, dim, entries) do
+    entries
+    |> ShrinkLadder.chunk_by_bytes(Knowledge.embedding_batch_max_chars(), fn {_a, text} ->
+      text
+    end)
+    |> Enum.reduce_while(:ok, fn chunk, :ok ->
+      case embed_sub_batch(tenant_id, dim, chunk) do
+        :ok -> {:cont, :ok}
+        other -> {:halt, other}
+      end
+    end)
+    |> case do
+      :ok -> continue(tenant_id, dim)
+      other -> other
+    end
+  end
+
+  defp embed_sub_batch(tenant_id, dim, entries) do
     texts = Enum.map(entries, fn {_a, text} -> text end)
 
-    case Knowledge.generate_embeddings(tenant_id, texts) do
-      {:ok, vectors} when length(vectors) == length(entries) ->
-        store_all(tenant_id, dim, Enum.zip(entries, vectors))
+    result =
+      ShrinkLadder.embed_batch(
+        texts,
+        &Knowledge.generate_embeddings(tenant_id, &1),
+        label: "SystemCorpusEmbeddingWorker tenant=#{tenant_id}"
+      )
 
-      {:ok, _mismatch} ->
-        {:error, :embedding_batch_length_mismatch}
+    case result do
+      {:ok, vectors} ->
+        store_all(tenant_id, dim, zip_marked(entries, vectors, []))
+
+      # A member the ladder could only embed as a PREFIX is stored MARKED, so a reader
+      # that COMPARES vectors can tell it from a whole-text one (see `ShrinkLadder`).
+      {:ok, vectors, truncated} ->
+        store_all(tenant_id, dim, zip_marked(entries, vectors, truncated))
+
+      # PARTIAL: the bisect embedded some members before another half failed (#617 review
+      # follow-up). Those vectors are already billed, and `split_unchanged/3` skips a
+      # stored member on the retry — so storing them is what stops a deterministic failure
+      # re-paying for the same canonicals on every attempt. The error still propagates.
+      {:error, reason, partial} ->
+        store_partial(tenant_id, dim, entries, partial)
+        propagate(tenant_id, reason)
 
       {:error, reason} ->
-        handle_error(tenant_id, reason)
+        propagate(tenant_id, reason)
     end
+  end
+
+  defp propagate(_tenant_id, :embedding_batch_length_mismatch),
+    do: {:error, :embedding_batch_length_mismatch}
+
+  defp propagate(tenant_id, reason), do: handle_error(tenant_id, reason)
+
+  # Best-effort: a store failure here must not mask the provider error the Oban outcome is
+  # derived from.
+  defp store_partial(_tenant_id, _dim, _entries, []), do: :ok
+
+  defp store_partial(tenant_id, dim, entries, partial) do
+    by_index = Map.new(Enum.with_index(entries), fn {entry, i} -> {i, entry} end)
+
+    triples =
+      Enum.flat_map(partial, fn {index, vector, truncated?} ->
+        case Map.fetch(by_index, index) do
+          {:ok, {article, text}} -> [{article, vector, hash_for(text, truncated?)}]
+          :error -> []
+        end
+      end)
+
+    Logger.info(
+      "SystemCorpusEmbeddingWorker: tenant=#{tenant_id} storing #{length(triples)} " <>
+        "already-embedded canonical(s) from a partially-failed batch, so the retry does " <>
+        "not re-bill them."
+    )
+
+    store_all(tenant_id, dim, triples)
+    :ok
+  rescue
+    e ->
+      Logger.warning(
+        "SystemCorpusEmbeddingWorker: tenant=#{tenant_id} could not store the salvaged " <>
+          "partial batch (#{ExitTag.tag(e)}); those members re-embed on the retry."
+      )
+
+      :ok
   end
 
   # ONE batched hash read for the whole batch (AC-41.1.11: no per-item query).
@@ -153,7 +236,9 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
 
     Enum.split_with(entries, fn {article, text} ->
       case Map.get(hashes, article.id) do
-        stored when is_binary(stored) -> stored == content_hash(text)
+        # `whole_hash/1`: a truncation-marked hash still identifies the FULL text, so an
+        # article whose vector is a prefix is UNCHANGED and must not be re-billed.
+        stored when is_binary(stored) -> ShrinkLadder.whole_hash(stored) == content_hash(text)
         _ -> false
       end
     end)
@@ -163,31 +248,39 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   # failure means zero writes and the batch retries as a unit. The batch's vector
   # LENGTH is checked once, before the first write, so a model that does not emit
   # `dim` fails legibly instead of burning five attempts of provider spend.
-  defp store_all(tenant_id, dim, pairs) do
-    case Dimensions.check_batch_length(Enum.map(pairs, fn {_entry, v} -> v end), dim) do
-      :ok -> do_store_all(tenant_id, dim, pairs)
+  defp store_all(tenant_id, dim, triples) do
+    case Dimensions.check_batch_length(Enum.map(triples, fn {_a, v, _h} -> v end), dim) do
+      :ok -> do_store_all(tenant_id, dim, triples)
       {:error, {:dimension_mismatch, expected, actual}} -> discard_mismatch(expected, actual)
     end
   end
 
-  defp do_store_all(tenant_id, dim, pairs) do
-    result =
-      Enum.reduce_while(pairs, :ok, fn {{article, text}, vector}, :ok ->
-        case Embeddings.materialize_system_article_embedding(
-               tenant_id,
-               article,
-               vector,
-               content_hash(text),
-               dim
-             ) do
-          {:ok, _row} -> {:cont, :ok}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
-      end)
+  defp zip_marked(entries, vectors, truncated) do
+    marked = MapSet.new(truncated)
 
-    with :ok <- result do
-      continue(tenant_id, dim)
-    end
+    entries
+    |> Enum.zip(vectors)
+    |> Enum.with_index(fn {{article, text}, vector}, index ->
+      {article, vector, hash_for(text, MapSet.member?(marked, index))}
+    end)
+  end
+
+  # Returns `:ok` WITHOUT continuing: `embed_entries/3` drives the sub-batches and calls
+  # `continue/2` once, after the last one — continuing here would enqueue the next page
+  # per sub-batch.
+  defp do_store_all(tenant_id, dim, triples) do
+    Enum.reduce_while(triples, :ok, fn {article, vector, hash}, :ok ->
+      case Embeddings.materialize_system_article_embedding(
+             tenant_id,
+             article,
+             vector,
+             hash,
+             dim
+           ) do
+        {:ok, _row} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp discard_mismatch(expected, actual) do
@@ -254,9 +347,15 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
 
   defp batch_size, do: Knowledge.embedding_batch_max()
 
+  # The same 32,000-CHARACTER first attempt as before, named once (#617) so it cannot
+  # drift from the rung `ShrinkLadder` starts below. The hash in `split_unchanged/3`
+  # is computed over exactly this text, so the cut must not change silently.
   defp embedding_text(article) do
-    String.slice("#{article.title}\n\n#{article.body}", 0, @max_text_length)
+    TextBudget.initial("#{article.title}\n\n#{article.body}")
   end
 
   defp content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
+
+  defp hash_for(text, false), do: content_hash(text)
+  defp hash_for(text, true), do: text |> content_hash() |> ShrinkLadder.truncated_hash()
 end

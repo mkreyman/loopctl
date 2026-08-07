@@ -69,6 +69,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   alias Loopctl.Egress.Scope
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
+  alias Loopctl.Embeddings.ShrinkLadder
   alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Llm
@@ -177,7 +178,14 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
 
   defp generate_and_store_project_group(tenant_id, project_id, to_embed) do
     to_embed
-    |> chunk_by_char_budget(Knowledge.embedding_batch_max_chars())
+    # The SHARED greedy byte-splitter (#617 review follow-up). This worker's private
+    # `chunk_by_char_budget/2` was the original; `ShrinkLadder.chunk_by_bytes/3` is that
+    # function with the empty-input case fixed (it returned `[[]]`, a phantom sub-batch
+    # that made one no-op provider call), and the re-embed and system-corpus workers
+    # already call it. Two copies of a greedy chunker is one copy too many.
+    |> ShrinkLadder.chunk_by_bytes(Knowledge.embedding_batch_max_chars(), fn {_a, text, _h} ->
+      text
+    end)
     |> embed_sub_batches(tenant_id, project_id)
   end
 
@@ -189,29 +197,6 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
       :dissolve -> {:dissolve, sub_batch ++ Enum.concat(rest)}
       other -> other
     end
-  end
-
-  # Greedy split of `to_embed` tuples into sub-batches whose cumulative text
-  # `byte_size` stays at/under `max_chars`. A single input larger than the budget
-  # (already cut by `TextBudget.initial/1`) still forms its own sub-batch rather than
-  # wedging into an empty one.
-  defp chunk_by_char_budget(to_embed, max_chars) do
-    chunk_fun = fn {_article, text, _hash} = item, {acc, size} ->
-      len = byte_size(text)
-
-      cond do
-        acc == [] -> {:cont, {[item], len}}
-        size + len > max_chars -> {:cont, Enum.reverse(acc), {[item], len}}
-        true -> {:cont, {[item | acc], size + len}}
-      end
-    end
-
-    after_fun = fn
-      {[], _size} -> {:cont, [], {[], 0}}
-      {acc, _size} -> {:cont, Enum.reverse(acc), {[], 0}}
-    end
-
-    Enum.chunk_while(to_embed, {[], 0}, chunk_fun, after_fun)
   end
 
   defp embed_and_store_sub_batch(tenant_id, project_id, to_embed) do
@@ -461,8 +446,14 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     end
   end
 
+  # Compared through `ShrinkLadder.whole_hash/1` (#617 review follow-up), like every other
+  # idempotency guard on this surface: a truncation-marked hash still identifies the FULL
+  # text, so a row whose vector covers a prefix is already embedded for the content it
+  # has. Comparing the raw stored value would miss on every marked row and re-bill the
+  # provider for the whole batch on each enqueue — and worse, the re-embed would then
+  # store an UNMARKED hash and erase the mark the readers filter on.
   defp already_embedded?(article, content_hash, hashes) when is_map(hashes),
-    do: Map.get(hashes, article.id) == content_hash
+    do: whole_hash_matches?(Map.get(hashes, article.id), content_hash)
 
   defp already_embedded?(article, content_hash, _hashes),
     do: legacy_already_embedded?(article, content_hash)
@@ -472,9 +463,14 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
          content_hash
        )
        when is_binary(hash),
-       do: hash == content_hash
+       do: whole_hash_matches?(hash, content_hash)
 
   defp legacy_already_embedded?(_article, _content_hash), do: false
+
+  defp whole_hash_matches?(stored, content_hash) when is_binary(stored),
+    do: ShrinkLadder.whole_hash(stored) == content_hash
+
+  defp whole_hash_matches?(_stored, _content_hash), do: false
 
   defp content_hash(text) do
     :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)

@@ -7,6 +7,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
   alias Loopctl.Custody
   alias Loopctl.Egress
   alias Loopctl.Egress.PinCache
+  alias Loopctl.Embeddings.ShrinkLadder
   alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Test.AllowlistSource
@@ -582,6 +583,72 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       # The article is embedded — not left in the reconciler's hourly retry loop.
       {:ok, stored} = Knowledge.get_article_with_embedding(tenant.id, article.id)
       refute is_nil(stored.embedding)
+
+      # ...and the stored hash is MARKED, because that vector covers a PREFIX (#617
+      # review follow-up). This worker was the last writer storing an unmarked prefix,
+      # and it writes most of the corpus — so the readers that refuse to compare against
+      # a prefix (the consolidation corroboration gate, the memory near-dup supersede)
+      # filtered on a mark that nothing ever set, and could never fire.
+      assert ShrinkLadder.truncated_hash?(stored.embedding_content_hash)
+
+      # The mark must still identify the FULL text, or the idempotency guard misses and
+      # every later enqueue re-walks the whole ladder at the provider's expense.
+      assert ShrinkLadder.whole_hash(stored.embedding_content_hash) ==
+               :sha256
+               |> :crypto.hash(TextBudget.initial("#{stored.title}\n\n#{stored.body}"))
+               |> Base.encode16(case: :lower)
+    end
+
+    test "an UNtruncated embedding is not marked" do
+      # The mark has to discriminate. Marking every row would exclude the whole corpus
+      # from the corroboration gate — the same dead guard, arrived at from the other side.
+      %{tenant: tenant} = setup_tenant()
+
+      article =
+        create_draft_then_publish(tenant.id, %{title: "Short Enough", body: "a short body"})
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, List.duplicate(0.5, 1536)}
+      end)
+
+      assert :ok =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+
+      {:ok, stored} = Knowledge.get_article_with_embedding(tenant.id, article.id)
+      refute ShrinkLadder.truncated_hash?(stored.embedding_content_hash)
+    end
+
+    test "a marked row is still recognised as already embedded, and is not re-billed" do
+      # The whole reason the hash keeps identifying the full text. If the idempotency
+      # guard compared the raw stored value it would miss on every marked row, and each
+      # enqueue would re-walk the ladder — several billed calls — forever.
+      %{tenant: tenant} = setup_tenant()
+
+      article =
+        create_draft_then_publish(tenant.id, %{
+          title: "Marked Then Re-enqueued",
+          body: String.duplicate("привет ", 6_000)
+        })
+
+      Loopctl.MockEmbeddingClient
+      |> expect(:generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 400, :context_length_exceeded}}
+      end)
+      |> expect(:generate_embedding, fn _tenant_id, _text ->
+        {:ok, List.duplicate(0.5, 1536)}
+      end)
+
+      job = %Oban.Job{args: %{"article_id" => article.id, "tenant_id" => tenant.id}}
+      assert :ok = ArticleEmbeddingWorker.perform(job)
+
+      {:ok, stored} = Knowledge.get_article_with_embedding(tenant.id, article.id)
+      assert ShrinkLadder.truncated_hash?(stored.embedding_content_hash)
+
+      # A second run makes ZERO provider calls: `expect` above is exhausted, so any
+      # further call fails the test rather than silently re-billing.
+      assert :ok = ArticleEmbeddingWorker.perform(job)
     end
 
     test "gives up with a discard once the floor itself is rejected" do

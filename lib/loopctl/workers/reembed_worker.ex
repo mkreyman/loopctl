@@ -85,13 +85,14 @@ defmodule Loopctl.Workers.ReembedWorker do
   alias Loopctl.Egress
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
+  alias Loopctl.Embeddings.ShrinkLadder
+  alias Loopctl.Embeddings.TextBudget
+  alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Provider.Admission
   alias Loopctl.Provider.RetryAfter
-
-  @max_text_length 32_000
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"tenant_id" => tenant_id, "target_dim" => target_dim} = args})
@@ -213,23 +214,130 @@ defmodule Loopctl.Workers.ReembedWorker do
   # while this runs. This worker's whole job is to produce vectors at the PENDING
   # model's dimension, so it — and only it — uses the tenant's currently configured
   # model.
+  # The array call goes through `ShrinkLadder.embed_batch/3` (#617): an input-too-long
+  # rejection used to fall through `handle_error/2` to `permanent_provider_error?/1`,
+  # which is `true` for any 4xx — so ONE over-long article DISCARDED the job, the
+  # re-embed never reached `complete_reembed/3`, and the tenant's recall stayed pinned
+  # at the old dimension permanently. Dissolving to `ArticleEmbeddingWorker` (the
+  # BatchArticleEmbeddingWorker answer) is wrong here: that worker writes the ACTIVE
+  # dimension with the configured model, not this run's PENDING dimension and pinned
+  # model. Bisect-then-ladder keeps both pins and truncates only the offender.
+  #
+  # Sub-split by the CUMULATIVE byte budget first (`Knowledge.embedding_batch_max_chars/0`),
+  # exactly as `BatchArticleEmbeddingWorker` does and for the same reason: the count cap
+  # does not bound aggregate tokens, so 100 x ~32K chars is ~800k tokens against a ~300k
+  # per-request ceiling. That rejection names no member, so the ladder would bisect EVERY
+  # batch EVERY night — paying the whole tree as routine rather than as the one-time
+  # recovery it is for. Each sub-batch is embedded AND STORED before the next, so a
+  # failure later in the run keeps what has already been paid for (the next attempt's
+  # pending set no longer names those rows).
   defp embed_and_store(tenant_id, target_dim, model, entries, opts, store_fun) do
+    entries
+    |> ShrinkLadder.chunk_by_bytes(Knowledge.embedding_batch_max_chars(), fn {_s, text} ->
+      text
+    end)
+    |> Enum.reduce_while(:ok, fn chunk, :ok ->
+      case embed_sub_batch(tenant_id, target_dim, model, chunk, opts, store_fun) do
+        :ok -> {:cont, :ok}
+        other -> {:halt, other}
+      end
+    end)
+  end
+
+  defp embed_sub_batch(tenant_id, target_dim, model, entries, opts, store_fun) do
     texts = Enum.map(entries, fn {_subject, text} -> text end)
+    embed_opts = [embedding_model: reembed_model(model)] ++ opts
 
-    case Knowledge.generate_embeddings(
-           tenant_id,
-           texts,
-           [embedding_model: reembed_model(model)] ++ opts
-         ) do
-      {:ok, vectors} when length(vectors) == length(entries) ->
-        store_checked(tenant_id, target_dim, entries, vectors, store_fun)
+    result =
+      ShrinkLadder.embed_batch(
+        texts,
+        &Knowledge.generate_embeddings(tenant_id, &1, embed_opts),
+        label: "ReembedWorker tenant=#{tenant_id}"
+      )
 
-      {:ok, _mismatch} ->
-        {:error, :embedding_batch_length_mismatch}
+    case result do
+      {:ok, vectors} ->
+        store_checked(tenant_id, target_dim, entries, vectors, [], store_fun)
+
+      # The ladder could only embed these members as a PREFIX. They are stored (recall
+      # over part of an over-long text is the point of the ladder) but MARKED, so the
+      # readers that COMPARE vectors — the consolidation corroboration gate, the memory
+      # near-dup supersede — can tell a prefix from a whole text instead of judging one
+      # against the other.
+      {:ok, vectors, truncated} ->
+        store_checked(tenant_id, target_dim, entries, vectors, truncated, store_fun)
+
+      # PARTIAL: the bisect embedded some members before another half failed (#617 review
+      # follow-up). Those vectors are already billed, and this worker self-continues off
+      # `pending_reembed_*`, so storing them is what makes the retry's pending set smaller
+      # — otherwise a deterministic failure re-pays for the same members every attempt and
+      # the re-embed never advances. The error is still propagated afterwards.
+      {:error, reason, partial} ->
+        store_partial(tenant_id, target_dim, entries, partial, store_fun)
+        propagate(tenant_id, reason)
 
       {:error, reason} ->
-        handle_error(tenant_id, reason)
+        propagate(tenant_id, reason)
     end
+  end
+
+  defp propagate(_tenant_id, :embedding_batch_length_mismatch),
+    do: {:error, :embedding_batch_length_mismatch}
+
+  defp propagate(tenant_id, reason), do: handle_error(tenant_id, reason)
+
+  # Best-effort: a store failure here must not mask the provider error that caused the
+  # partial in the first place, which is the one the Oban outcome is derived from.
+  defp store_partial(_tenant_id, _target_dim, _entries, [], _store_fun), do: :ok
+
+  defp store_partial(tenant_id, target_dim, entries, partial, store_fun) do
+    by_index = Map.new(Enum.with_index(entries), fn {entry, i} -> {i, entry} end)
+
+    salvaged =
+      Enum.flat_map(partial, fn {index, vector, truncated?} ->
+        case Map.fetch(by_index, index) do
+          {:ok, entry} -> [{entry, vector, truncated?}]
+          :error -> []
+        end
+      end)
+
+    # `store_checked/6` takes truncated indexes relative to the list it is GIVEN, and the
+    # salvaged list is a compaction of the original — so the indexes are recomputed here
+    # rather than carried over. Reusing the original-array indexes would mark the wrong
+    # rows, which is worse than not marking them: a whole-text vector labelled a prefix is
+    # silently dropped from the corroboration gate that decides auto-unpublishes.
+    salvaged_entries = Enum.map(salvaged, fn {entry, _vector, _truncated?} -> entry end)
+    salvaged_vectors = Enum.map(salvaged, fn {_entry, vector, _truncated?} -> vector end)
+
+    salvaged_truncated =
+      salvaged
+      |> Enum.with_index()
+      |> Enum.filter(fn {{_entry, _vector, truncated?}, _i} -> truncated? end)
+      |> Enum.map(fn {_triple, i} -> i end)
+
+    Logger.info(
+      "ReembedWorker: tenant=#{tenant_id} storing #{length(salvaged)} already-embedded " <>
+        "member(s) from a partially-failed batch, so the retry does not re-bill them."
+    )
+
+    store_checked(
+      tenant_id,
+      target_dim,
+      salvaged_entries,
+      salvaged_vectors,
+      salvaged_truncated,
+      store_fun
+    )
+
+    :ok
+  rescue
+    e ->
+      Logger.warning(
+        "ReembedWorker: tenant=#{tenant_id} could not store the salvaged partial batch " <>
+          "(#{ExitTag.tag(e)}); those members will be re-embedded on the retry."
+      )
+
+      :ok
   end
 
   # WHICH model this re-embed generates with. The model captured at ENQUEUE (finding
@@ -240,12 +348,16 @@ defmodule Loopctl.Workers.ReembedWorker do
   defp reembed_model(nil), do: :configured
   defp reembed_model(model) when is_binary(model), do: model
 
-  defp store_checked(tenant_id, target_dim, entries, vectors, store_fun) do
+  defp store_checked(tenant_id, target_dim, entries, vectors, truncated, store_fun) do
     case Dimensions.check_batch_length(vectors, target_dim) do
       :ok ->
+        marked = MapSet.new(truncated)
+
         triples =
-          Enum.zip_with(entries, vectors, fn {subject, text}, vector ->
-            {subject, vector, content_hash(text)}
+          entries
+          |> Enum.zip(vectors)
+          |> Enum.with_index(fn {{subject, text}, vector}, index ->
+            {subject, vector, hash_for(text, MapSet.member?(marked, index))}
           end)
 
         # The side table ONLY (`legacy_write: false`, review). The target dimension
@@ -369,11 +481,18 @@ defmodule Loopctl.Workers.ReembedWorker do
     end
   end
 
+  # `TextBudget.initial/1` is the same 32,000-CHARACTER cut this worker has always
+  # applied, now named once (#617) so the first attempt cannot drift away from the
+  # rung the ladder starts below. It stays CHARACTERS on purpose: a byte cap here
+  # would silently shorten multi-byte text the provider was already accepting.
   defp article_text(article) do
-    String.slice("#{article.title}\n\n#{article.body}", 0, @max_text_length)
+    TextBudget.initial("#{article.title}\n\n#{article.body}")
   end
 
-  defp memory_text(memory), do: String.slice(memory.text || "", 0, @max_text_length)
+  defp memory_text(memory), do: TextBudget.initial(memory.text || "")
 
   defp content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
+
+  defp hash_for(text, false), do: content_hash(text)
+  defp hash_for(text, true), do: text |> content_hash() |> ShrinkLadder.truncated_hash()
 end
