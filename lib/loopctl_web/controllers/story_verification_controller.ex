@@ -38,7 +38,13 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   # LCP-1 §9.3: under the `signed` custody profile, an enrolled verifier's claim
   # must carry a valid signature. No-op under the default `bearer` profile.
-  plug LoopctlWeb.Plugs.RequireSignedClaim, [gate: "verify"] when action in [:verify]
+  #
+  # `backfill` is mounted here too: it reaches the SAME `verified_status: :verified`
+  # terminal state as `verify`, on a single named work item, so leaving it off left an
+  # unsigned route to the outcome the signed profile exists to attribute. It shares
+  # the `verify` gate name deliberately — same transition, same claim binding.
+  plug LoopctlWeb.Plugs.RequireSignedClaim,
+       [gate: "verify"] when action in [:verify, :backfill]
 
   # The aggregate verify-all path reaches the SAME `verified` transition but cannot
   # carry a per-item signature; under `signed` it refuses an enrolled caller rather
@@ -86,6 +92,11 @@ defmodule LoopctlWeb.StoryVerificationController do
       "Marks a story as verified for work completed outside loopctl (e.g. before onboarding). " <>
         "Only permitted for stories that never entered loopctl's dispatch lifecycle — " <>
         "stories with `assigned_agent_id` set, or already `:verified`/`:rejected`, are refused. " <>
+        "A story whose audit log shows it was worked inside loopctl (a `status_changed` or " <>
+        "`force_unclaimed` entry) is refused even when its dispatch markers are now clear, so " <>
+        "clearing them cannot turn backfill into a shortcut past report/review/verify. " <>
+        "Under the LCP-1 `signed` custody profile an enrolled caller must present a valid " <>
+        "`claim` signature (gate `verify`), as for POST /stories/:id/verify. " <>
         "Requires a non-empty `reason`; `evidence_url` and `pr_number` are optional but strongly recommended. " <>
         "Emits a `story.backfilled` webhook event on success.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
@@ -102,11 +113,14 @@ defmodule LoopctlWeb.StoryVerificationController do
        }},
     responses: %{
       200 => {"Story backfilled", "application/json", Schemas.StoryStatusResponse},
+      401 =>
+        {"Claim signature required/invalid (LCP-1 signed profile)", "application/json",
+         Schemas.ErrorResponse},
       403 =>
         {"Insufficient role (orchestrator+ required)", "application/json", Schemas.ErrorResponse},
       404 => {"Story not found", "application/json", Schemas.ErrorResponse},
       422 =>
-        {"Validation error: missing reason, already verified, already rejected, or has dispatch lineage",
+        {"Validation error: missing reason, already verified, already rejected, has dispatch lineage, or already entered the lifecycle",
          "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -312,6 +326,13 @@ defmodule LoopctlWeb.StoryVerificationController do
       "or verifier_dispatch_id is set). " <>
       "Backfill is only for work completed OUTSIDE the loopctl dispatch lifecycle. " <>
       "Use the normal report_story → review_complete → verify_story flow instead."
+  end
+
+  defp backfill_error_message(:story_entered_lifecycle) do
+    "Story's audit log shows it was worked inside loopctl (a status change or a force-unclaim), " <>
+      "even though its dispatch markers are now clear. Backfill is only for work completed " <>
+      "OUTSIDE the loopctl dispatch lifecycle, so it cannot certify this story. " <>
+      "Use the normal report_story -> review_complete -> verify_story flow instead."
   end
 
   defp backfill_error_message(:story_in_progress) do

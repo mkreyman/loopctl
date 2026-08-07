@@ -464,20 +464,25 @@ defmodule Loopctl.Progress do
             # No verify_cap is minted: see verify_story/4 for why L1 cannot gate
             # verify. The selection itself is the gate — it writes
             # verifier_dispatch_id, which validate_not_self_verify/2 enforces.
-            Loopctl.AuditChain.append(tenant_id, %{
+            tenant_id
+            |> Loopctl.AuditChain.append(%{
               action: "verifier_selected",
               actor_lineage: [],
               entity_type: "story",
               entity_id: story_id,
               payload: %{"verifier_dispatch_id" => verifier.id}
             })
+            # Post-commit append: the verifier_dispatch_id write above has already
+            # committed, so a discarded failure would leave the chain missing an entry
+            # for a custody decision that DID happen. See AuditChain.log_append_failure/4.
+            |> Loopctl.AuditChain.log_append_failure("verifier_selected", tenant_id, story_id)
 
           {:error, reason} ->
             flag_verifier_needed(tenant_id, story_id, story, "assign_failed", reason)
         end
 
-      {:error, :no_eligible_verifier} ->
-        flag_verifier_needed(tenant_id, story_id, story, "no_eligible_verifier", nil)
+      {:error, reason} when reason in [:no_eligible_verifier, :verifier_seed_unavailable] ->
+        flag_verifier_needed(tenant_id, story_id, story, to_string(reason), nil)
     end
   end
 
@@ -499,13 +504,15 @@ defmodule Loopctl.Progress do
       )
     end
 
-    Loopctl.AuditChain.append(tenant_id, %{
+    tenant_id
+    |> Loopctl.AuditChain.append(%{
       action: "verifier_not_assigned",
       actor_lineage: [],
       entity_type: "story",
       entity_id: story_id,
       payload: %{"reason" => reason}
     })
+    |> Loopctl.AuditChain.log_append_failure("verifier_not_assigned", tenant_id, story_id)
 
     result
   end
@@ -1299,10 +1306,10 @@ defmodule Loopctl.Progress do
   @doc """
   Structural custody guard for the bulk mark-complete (backfill) path.
 
-  Returns `:ok` only when `story` never entered the dispatch lifecycle (no
-  dispatch markers) — including a never-dispatched story already at
-  `agent_status: :reported_done` (e.g. imported with
-  `initial_agent_status: "reported_done"`), for which mark-complete is the
+  Returns `:ok` only when `story` never entered the dispatch lifecycle — no
+  dispatch markers AND no lifecycle history in the audit log — including a
+  never-dispatched story already at `agent_status: :reported_done` (e.g. imported
+  with `initial_agent_status: "reported_done"`), for which mark-complete is the
   correct remediation. Matches `backfill_story/4`. Prevents mark-complete from
   being used to self-verify dispatched work.
   """
@@ -1312,6 +1319,7 @@ defmodule Loopctl.Progress do
              :already_verified
              | :story_rejected
              | :story_has_dispatch_lineage
+             | :story_entered_lifecycle
              | :story_in_progress}
   def ensure_mark_complete_allowed(story) do
     case guard_backfillable(story) do
@@ -1353,6 +1361,9 @@ defmodule Loopctl.Progress do
     * `{:error, :story_has_dispatch_lineage}` — story has a dispatch marker
       (`assigned_agent_id`, `implementer_dispatch_id`, or `verifier_dispatch_id`);
       use the normal report/review/verify flow
+    * `{:error, :story_entered_lifecycle}` — the audit log shows the story was
+      worked inside loopctl (a `status_changed` or `force_unclaimed` entry), even
+      though its dispatch markers are now clear; use report/review/verify
     * `{:error, :story_in_progress}` — story is mid-lifecycle (e.g. `:contracted`)
       with no dispatch lineage yet; it is being worked, not pre-existing done work
     * `{:error, %Ecto.Changeset{}}` — persistence error surfaced from Multi step
@@ -1369,6 +1380,7 @@ defmodule Loopctl.Progress do
              | :already_verified
              | :story_rejected
              | :story_has_dispatch_lineage
+             | :story_entered_lifecycle
              | :story_in_progress
              | Ecto.Changeset.t()}
   def backfill_story(tenant_id, story_id, params, opts \\ []) do
@@ -1543,9 +1555,10 @@ defmodule Loopctl.Progress do
   #     force_unclaim_story does NOT clear, so relying on assigned_agent_id alone
   #     is bypassable; all three are checked.
   #   - otherwise, only :pending or :reported_done (never-dispatched) are
-  #     backfillable; a story mid-lifecycle (:contracted with no dispatch yet) is
-  #     being worked, not pre-existing done work — an ACCURATE reason, not a false
-  #     "dispatch lineage" claim.
+  #     backfillable, AND only if the story has no lifecycle history in the audit
+  #     log (see guard_no_lifecycle_history/1); a story mid-lifecycle (:contracted
+  #     with no dispatch yet) is being worked, not pre-existing done work — an
+  #     ACCURATE reason, not a false "dispatch lineage" claim.
   defp guard_backfillable(%{verified_status: :verified}), do: {:error, :already_verified}
   defp guard_backfillable(%{verified_status: :rejected}), do: {:error, :story_rejected}
 
@@ -1559,9 +1572,50 @@ defmodule Loopctl.Progress do
     do: {:error, :story_has_dispatch_lineage}
 
   # No dispatch markers from here down.
-  defp guard_backfillable(%{agent_status: :pending}), do: {:ok, :ok}
-  defp guard_backfillable(%{agent_status: :reported_done}), do: {:ok, :ok}
+  defp guard_backfillable(%{agent_status: status} = story)
+       when status in [:pending, :reported_done],
+       do: guard_no_lifecycle_history(story)
+
   defp guard_backfillable(_story), do: {:error, :story_in_progress}
+
+  # The dispatch markers above record the story's CURRENT shape, and one of them is
+  # erasable: `force_unclaim_story/3` clears `assigned_agent_id`. For a story claimed
+  # with a key that no dispatch minted, `implementer_dispatch_id` is never written
+  # either, so after a force-unclaim a genuinely worked story presents with all three
+  # markers NULL and `agent_status: :pending` — indistinguishable, by state alone,
+  # from work that predates loopctl. Backfill would then certify it with no report, no
+  # review record and no independent verifier: the entire custody chain skipped by two
+  # ordinary calls.
+  #
+  # The audit log is append-only and immutable, so it remembers what the story row no
+  # longer does. A story that ever entered the lifecycle carries a `status_changed`
+  # (contract / claim / start / report / request-review) or `force_unclaimed` entry,
+  # and is refused here regardless of its present state.
+  #
+  # Never-dispatched work is untouched: `created`, `imported` and `merge_imported` are
+  # not lifecycle actions, so a story imported with
+  # `initial_agent_status: "reported_done"` remains backfillable — which is the case
+  # backfill exists for. Indexed by `audit_log_tenant_entity_idx`.
+  @lifecycle_audit_actions ["status_changed", "force_unclaimed"]
+
+  defp guard_no_lifecycle_history(%{id: id, tenant_id: tenant_id})
+       when is_binary(id) and is_binary(tenant_id) do
+    entered? =
+      from(a in AuditLog,
+        where:
+          a.tenant_id == ^tenant_id and a.entity_type == "story" and a.entity_id == ^id and
+            a.action in ^@lifecycle_audit_actions,
+        select: 1,
+        limit: 1
+      )
+      |> AdminRepo.one()
+      |> is_integer()
+
+    if entered?, do: {:error, :story_entered_lifecycle}, else: {:ok, :ok}
+  end
+
+  # A story we cannot identify cannot be shown to be never-dispatched. Fail closed.
+  defp guard_no_lifecycle_history(_story), do: {:error, :story_entered_lifecycle}
 
   defp apply_backfill_status(story, reason, evidence_url, pr_number) do
     now = DateTime.utc_now()

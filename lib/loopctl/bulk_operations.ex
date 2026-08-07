@@ -836,6 +836,12 @@ defmodule Loopctl.BulkOperations do
       "story has dispatch lineage (an assigned agent or dispatch id); use the normal " <>
         "report → review → verify flow, not mark-complete"
 
+  defp format_reason(:story_entered_lifecycle),
+    do:
+      "story's audit log shows it was worked inside loopctl (a status change or a " <>
+        "force-unclaim), even though its dispatch markers are now clear; use the normal " <>
+        "report → review → verify flow, not mark-complete"
+
   defp format_reason(:story_in_progress),
     do:
       "story is mid-lifecycle (being worked) with no dispatch lineage yet; it is not " <>

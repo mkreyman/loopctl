@@ -79,27 +79,57 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
   @claim_max_age_seconds 300
   @claim_max_future_skew_seconds 60
 
-  @doc "The active deployment custody profile (`:bearer` | `:signed`)."
+  # Sentinel default for the config read: `SystemConfig.get_int/2` cannot report a
+  # miss, and 0 is ALSO the legitimate `bearer` value — so reading with a default of
+  # 0 makes "an operator deliberately chose bearer" and "the key is not set at all"
+  # the same observation. A value outside the valid domain separates them.
+  @profile_unset -1
+
+  @doc """
+  The active deployment custody profile (`:bearer` | `:signed`).
+
+  Emits `[:loopctl, :custody, :profile_resolved]` on EVERY resolution, with the
+  resolved `profile`, the `source` (`:unset` | `:configured` | `:invalid`) and the
+  `raw` config value. Only the `:invalid` branch used to make any noise, so the
+  most likely real-world drift — a deployment intended to run `signed` whose config
+  row never landed, silently serving `bearer` — produced no signal whatsoever and
+  looked exactly like a healthy bearer deployment. Alert on
+  `source: :unset`/`profile: :bearer` where `signed` is expected.
+  """
   @spec profile() :: :bearer | :signed
   def profile do
-    case config_get_int(@profile_key, 0) do
-      0 ->
-        :bearer
+    raw = config_get_int(@profile_key, @profile_unset)
 
-      1 ->
-        :signed
+    {profile, source} =
+      case raw do
+        @profile_unset ->
+          {:bearer, :unset}
 
-      other ->
-        # Fail SAFE to bearer, but never SILENTLY: an unrecognized value most likely
-        # means an operator who intended `signed` misconfigured the key, and would
-        # otherwise have signed-claim enforcement waived with no signal. Surface it.
-        Logger.warning(
-          "custody_signed_profile_enforcement=#{inspect(other)} is not a recognized value " <>
-            "(0=bearer, 1=signed); defaulting to bearer — signed-claim enforcement is OFF."
-        )
+        0 ->
+          {:bearer, :configured}
 
-        :bearer
-    end
+        1 ->
+          {:signed, :configured}
+
+        other ->
+          # Fail SAFE to bearer, but never SILENTLY: an unrecognized value most likely
+          # means an operator who intended `signed` misconfigured the key, and would
+          # otherwise have signed-claim enforcement waived with no signal. Surface it.
+          Logger.warning(
+            "custody_signed_profile_enforcement=#{inspect(other)} is not a recognized value " <>
+              "(0=bearer, 1=signed); defaulting to bearer — signed-claim enforcement is OFF."
+          )
+
+          {:bearer, :invalid}
+      end
+
+    :telemetry.execute(
+      [:loopctl, :custody, :profile_resolved],
+      %{count: 1},
+      %{profile: profile, source: source, raw: raw}
+    )
+
+    profile
   end
 
   @doc "The profile as the wire string advertised in `/.well-known/loopctl` (§2.1)."
@@ -190,6 +220,13 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
   epic unsigned, defeating the §9.3 attribution guarantee on the highest-volume
   path. A bearer/legacy caller is unaffected, mirroring `verify_request/7`'s
   enrolled-only gradual-rollout waiver.
+
+  "Enrolled" is decided the SAME way as on the single-story path: an enrolled
+  dispatch, OR a bearer dispatch belonging to an agent that has an enrolled key
+  elsewhere (`Dispatches.agent_has_enrolled_key?/2`). Without that second clause the
+  bulk gate is strictly WEAKER than the single-story gate it mirrors — an agent that
+  had migrated to signing could take its BEARER dispatch to verify-all and clear a
+  whole epic unsigned, which is the exact bypass this function exists to close.
   """
   @spec verify_bulk_request(:bearer | :signed, Ecto.UUID.t(), Ecto.UUID.t() | nil) ::
           :ok | {:error, :bulk_signature_unsupported}
@@ -199,6 +236,17 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
     case Dispatches.dispatch_for_api_key(tenant_id, api_key_id) do
       {:ok, %{agent_pubkey: pubkey}} when is_binary(pubkey) ->
         {:error, :bulk_signature_unsupported}
+
+      {:ok, %{agent_id: agent_id}} when is_binary(agent_id) ->
+        # A bearer dispatch for an agent that HAS opted into signing. The single-story
+        # path answers `:agent_enrollment_required` ("use your enrolled dispatch"), but
+        # here that remedy leads nowhere — the enrolled dispatch is refused too — so
+        # name the terminal remedy directly: verify each story individually.
+        if Dispatches.agent_has_enrolled_key?(tenant_id, agent_id) do
+          {:error, :bulk_signature_unsupported}
+        else
+          :ok
+        end
 
       _not_enrolled ->
         :ok

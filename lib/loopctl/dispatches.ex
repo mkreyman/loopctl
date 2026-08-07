@@ -10,6 +10,8 @@ defmodule Loopctl.Dispatches do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
@@ -17,6 +19,7 @@ defmodule Loopctl.Dispatches do
   alias Loopctl.Custody.SignedProfile
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.HeavyRead
+  alias Loopctl.TenantKeys
   alias Loopctl.Tenants
 
   @max_expires_seconds 14_400
@@ -26,6 +29,11 @@ defmodule Loopctl.Dispatches do
   # selection never degrades into an unbounded fetch as ephemeral dispatches
   # accumulate with agent fan-out.
   @verifier_pool_limit 500
+
+  # Domain-separation label for the verifier-selection PRF (see `verifier_seed/2`).
+  # Versioned so a future change to what the seed binds is a new label rather than a
+  # silent reinterpretation of the same key.
+  @verifier_seed_domain "loopctl/verifier-selection/v1|"
 
   @doc """
   Creates a new dispatch with an ephemeral API key.
@@ -647,8 +655,8 @@ defmodule Loopctl.Dispatches do
   Eligible dispatches: active, non-expired, non-revoked, in the same tenant,
   whose lineage does NOT share a prefix with the implementer's lineage.
 
-  Selection is deterministic but unpredictable to the orchestrator:
-  seeded with sha256(tenant_audit_public_key + story_id).
+  Selection is deterministic but unpredictable to the caller: the index is drawn
+  from an HMAC keyed by the tenant's audit signing PRIVATE key (`verifier_seed/2`).
 
   SCALE: the same-lineage rejection is pushed into SQL (compare lineage ROOTS,
   `lineage_path[1]`) and the candidate pool is capped at `@verifier_pool_limit`,
@@ -657,10 +665,12 @@ defmodule Loopctl.Dispatches do
   pool. The Elixir `Enum.reject` is kept as a belt-and-braces filter for the rows
   the SQL predicate cannot express (e.g. a NULL/empty lineage_path).
 
-  Returns `{:ok, dispatch}` or `{:error, :no_eligible_verifier}`.
+  Returns `{:ok, dispatch}`, `{:error, :no_eligible_verifier}`, or
+  `{:error, :verifier_seed_unavailable}` when no server-side seed secret can be
+  read (see `verifier_seed/2` — that case fails CLOSED rather than selecting).
   """
   @spec select_verifier(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
-          {:ok, Dispatch.t()} | {:error, :no_eligible_verifier}
+          {:ok, Dispatch.t()} | {:error, :no_eligible_verifier | :verifier_seed_unavailable}
   def select_verifier(tenant_id, story_id, implementer_lineage) do
     now = DateTime.utc_now()
 
@@ -683,24 +693,56 @@ defmodule Loopctl.Dispatches do
         {:error, :no_eligible_verifier}
 
       pool ->
-        # Deterministic selection: hash(tenant_pub_key || story_id) → index
-        pub_key =
-          from(t in Loopctl.Tenants.Tenant,
-            where: t.id == ^tenant_id,
-            select: t.audit_signing_public_key
-          )
-          |> AdminRepo.one()
+        case verifier_seed(tenant_id, story_id) do
+          {:ok, <<index_seed::unsigned-64, _rest::binary>>} ->
+            {:ok, Enum.at(pool, rem(index_seed, length(pool)))}
 
-        seed_data = (pub_key || "") <> story_id
-        hash = :crypto.hash(:sha256, seed_data)
-        <<index_seed::unsigned-64, _rest::binary>> = hash
-        selected = Enum.at(pool, rem(index_seed, length(pool)))
-
-        {:ok, selected}
+          :error ->
+            {:error, :verifier_seed_unavailable}
+        end
     end
   end
 
   # --- Private ---
+
+  # The selection index MUST NOT be derivable by the principals it selects between.
+  # The candidate pool is enumerable by any agent key (GET /api/v1/dispatches), so
+  # everything except the seed key is already known to a caller; the seed is the
+  # only secret standing between "deterministic" and "predictable". It is therefore
+  # keyed by the tenant's audit signing PRIVATE key — held in the secret store and
+  # reachable only server-side (`TenantKeys`, ETS-cached) — never by the audit
+  # signing PUBLIC key, which is served unauthenticated on the discovery endpoint.
+  #
+  # Domain-separated and bound to (tenant, story) so a seed can serve no other
+  # purpose and cannot be carried between stories or tenants.
+  #
+  # FAILS CLOSED. A tenant with no audit key (pre-v2) or an unreachable secret store
+  # yields no seed, and there is no public value to fall back to that would not
+  # reinstate predictability — so no verifier is selected and the caller flags the
+  # story instead (see `Progress.assign_rotating_verifier/3`). Selecting with a
+  # guessable seed would be worse than selecting nobody: the verify gate still
+  # enforces lineage separation either way.
+  defp verifier_seed(tenant_id, story_id) do
+    case TenantKeys.get_private_key(tenant_id) do
+      {:ok, key} when is_binary(key) and byte_size(key) > 0 ->
+        {:ok,
+         :crypto.mac(
+           :hmac,
+           :sha256,
+           key,
+           @verifier_seed_domain <> tenant_id <> story_id
+         )}
+
+      other ->
+        Logger.error(
+          "verifier_seed_unavailable: no server-side seed secret for tenant=#{tenant_id} " <>
+            "story=#{story_id} (#{inspect(other)}). Verifier selection fails closed; the " <>
+            "story is flagged verifier_needed. Provision the tenant's audit signing key."
+        )
+
+        :error
+    end
+  end
 
   # SQL half of the same-lineage rejection: drop every candidate whose lineage
   # ROOT equals the implementer's root. With an empty implementer lineage there

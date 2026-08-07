@@ -56,6 +56,43 @@ All notable changes to loopctl are documented here.
   CaseClauseError — making a correct refusal indistinguishable from a crash in logs and alerts.
   A non-UUID `capability` value likewise 500'd (`Ecto.Query.CastError`) instead of 403ing.
 
+- **A dispatch may now only be minted inside the caller's own lineage.** `POST
+  /api/v1/dispatches` accepted a parentless request from any orchestrator-or-above key, and
+  accepted any active dispatch in the tenant as `parent_dispatch_id`. Both let a caller place
+  itself in a lineage unrelated to its own, which is the separation the L4 custody gates read
+  as "an independent principal". Two new 403s: `root_dispatch_forbidden` when a key that was
+  itself minted by a dispatch sends no `parent_dispatch_id` (only a key no dispatch minted —
+  the tenant's operator key, rooted in the human anchor — may start a lineage tree), and
+  `parent_outside_caller_lineage` when the named parent is not the caller's own dispatch or a
+  descendant of it. **What changed for clients:** a sub-agent that used to mint a fresh root
+  must now pass its own dispatch id as `parent_dispatch_id`; anything minting on behalf of the
+  whole tenant must use the tenant's operator key. Existing lineages are unaffected, and a
+  tenant can still hold several roots — which is what keeps an independently-rooted verifier
+  available for selection.
+
+- **Verifier selection is seeded from a server-side secret.** The rotating verifier's index was
+  derived from the tenant's audit signing PUBLIC key, which `/.well-known/loopctl` serves
+  unauthenticated, while the candidate pool is listable by any agent key — so the choice was
+  reproducible by the parties it chooses between. It is now an HMAC keyed by the tenant's audit
+  signing PRIVATE key, domain-separated and bound to the tenant and story. **Operator impact:**
+  a tenant whose audit signing key is not provisioned (or an unreachable secret store) now has
+  no seed and none is invented — selection fails closed, the story is flagged `verifier_needed`,
+  and a `verifier_not_assigned` entry with reason `verifier_seed_unavailable` is written to the
+  audit chain plus an `audit_chain_append_failed`-style error log. Verification itself is
+  unaffected: the verify gate enforces lineage separation independently. Provision the tenant's
+  audit key to restore automatic selection.
+
+- **Backfill can no longer be used to certify work that ran inside loopctl.** `POST
+  /stories/:id/backfill` (and the bulk `mark-complete`) refused stories carrying dispatch
+  markers, but `force-unclaim` clears `assigned_agent_id`, and a story claimed with a key that
+  no dispatch minted never records an implementer dispatch — so a worked story could be
+  returned to a state indistinguishable from pre-loopctl work and then marked verified with no
+  report, review record or independent verifier. Both paths now also consult the append-only
+  audit log and refuse a story that ever recorded a lifecycle transition, with a new 422
+  (`story_entered_lifecycle`). Imported and never-dispatched work — the case backfill exists
+  for — is unaffected. Backfill is additionally mounted on the LCP-1 signed-claim gate, so
+  under the `signed` custody profile an enrolled caller must sign it exactly as for `verify`.
+
 ## [Unreleased] — 2026-07-24 — Self-hosting: fresh-install fixes, multilingual search, at-rest ingestion encryption
 
 Operator-facing changes for deployments outside the hosted instance.
