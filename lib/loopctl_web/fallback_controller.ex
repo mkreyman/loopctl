@@ -40,8 +40,11 @@ defmodule LoopctlWeb.FallbackController do
 
   use LoopctlWeb, :controller
 
+  require Logger
+
   alias Ecto.Changeset
   alias Loopctl.ApiSpec.Messages
+  alias Loopctl.Custody.ViolationMonitor
   alias Loopctl.Llm.Remediation
   alias LoopctlWeb.DBError
   alias LoopctlWeb.DBErrorLogger
@@ -180,8 +183,10 @@ defmodule LoopctlWeb.FallbackController do
   end
 
   def call(conn, {:error, :self_verify_blocked}) do
-    # L6: self-verify is a byzantine condition — halt the tenant
-    halt_tenant_on_violation(conn, "self_verify_blocked")
+    # L6: self-verify is a byzantine condition. It is RECORDED here; the tenant
+    # is halted only once a repeated pattern is established
+    # (Loopctl.Custody.ViolationMonitor). Either way this operation is refused.
+    record_custody_violation(conn, "self_verify_blocked")
 
     conn
     |> put_status(:conflict)
@@ -189,7 +194,7 @@ defmodule LoopctlWeb.FallbackController do
       error: %{
         status: 409,
         code: "self_verify_blocked",
-        message: "Cannot verify your own implementation. Custody operations halted.",
+        message: "Cannot verify your own implementation.",
         remediation: %{learn_more: "https://loopctl.com/wiki/self-verify-blocked"}
       }
     })
@@ -242,7 +247,7 @@ defmodule LoopctlWeb.FallbackController do
   end
 
   def call(conn, {:error, :self_report_blocked}) do
-    halt_tenant_on_violation(conn, "self_report_blocked")
+    record_custody_violation(conn, "self_report_blocked")
 
     conn
     |> put_status(:conflict)
@@ -250,7 +255,7 @@ defmodule LoopctlWeb.FallbackController do
       error: %{
         status: 409,
         code: "self_report_blocked",
-        message: "Cannot report your own implementation. Custody operations halted.",
+        message: "Cannot report your own implementation.",
         remediation: %{learn_more: "https://loopctl.com/wiki/self-report-blocked"}
       }
     })
@@ -269,8 +274,17 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # A capability token was refused. This is NOT a byzantine signal and does NOT
+  # count toward a custody halt: a capability is SINGLE-USE with a bounded TTL, so
+  # every rejection reason it can produce is reachable by ordinary operation — a
+  # retry of a request whose first attempt already consumed the token, a resumed
+  # agent presenting an expired one, an audit-key rotation invalidating signatures
+  # in flight. The operation is refused with this 403, which is the enforcement;
+  # escalating a client retry to a tenant-wide freeze is not. Genuine abuse shows
+  # up as a SPIKE, so the signal is preserved as telemetry + a warning log for an
+  # operator to alert on. See Loopctl.Custody.ViolationMonitor.
   def call(conn, {:error, {:cap_rejected, reason}}) do
-    halt_tenant_on_violation(conn, "cap_rejected")
+    report_cap_rejection(conn, reason)
 
     conn
     |> put_status(:forbidden)
@@ -278,21 +292,33 @@ defmodule LoopctlWeb.FallbackController do
       error: %{
         status: 403,
         code: "cap_rejected",
-        message: "Capability token rejected: #{reason}. Custody operations halted.",
+        message: "Capability token rejected: #{reason}.",
         remediation: %{learn_more: "https://loopctl.com/wiki/capability-tokens"}
       }
     })
   end
 
   def call(conn, {:error, :self_review_blocked}) do
+    # The third lineage-aware self-* gate, and byzantine on the same terms as the
+    # other two, so it counts. A CORRECTLY configured client never reaches here:
+    # `exact_role: [:orchestrator, :user]` means a user key passes a nil reviewer
+    # (deliberately permitted), and the documented dispatch tree puts the reviewer
+    # BESIDE the implementer, which `:chain` separation admits. The two shapes that
+    # do reach it are the implementer's own agent reviewing, and a parent
+    # rubber-stamping the sub-agent it dispatched — each named a violation by the
+    # custody spec, and neither producible by a retry, timeout or crash-resume.
+    record_custody_violation(conn, "self_review_blocked")
+
     conn
     |> put_status(:conflict)
     |> json(%{
       error: %{
         status: 409,
+        code: "self_review_blocked",
         message:
           "Cannot review your own implementation. " <>
-            "The reviewer agent must be different from the implementing agent."
+            "The reviewer agent must be different from the implementing agent.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/self-review-blocked"}
       }
     })
   end
@@ -568,26 +594,54 @@ defmodule LoopctlWeb.FallbackController do
     end)
   end
 
-  # L6: halt the tenant's custody operations on trust violations
-  defp halt_tenant_on_violation(conn, violation_type) do
+  # L6: record the violation. The halt decision (threshold over a window) and the
+  # alerting both live in Loopctl.Custody.ViolationMonitor — a single violation no
+  # longer halts a tenant, but a repeated pattern still does.
+  defp record_custody_violation(conn, violation_type) do
+    case conn.assigns do
+      %{current_api_key: %{tenant_id: tid} = key} when not is_nil(tid) ->
+        ViolationMonitor.record(tid, violation_type,
+          story_id: story_id_param(conn),
+          api_key_id: Map.get(key, :id),
+          agent_id: Map.get(key, :agent_id)
+        )
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  # Observability for a refusal that must NOT arm a halt (see the :cap_rejected
+  # clause). Alert on the RATE of this event, not on a single occurrence.
+  defp report_cap_rejection(conn, reason) do
     tenant_id =
       case conn.assigns do
         %{current_api_key: %{tenant_id: tid}} when not is_nil(tid) -> tid
         _ -> nil
       end
 
-    if tenant_id do
-      Loopctl.Tenants.halt_custody(tenant_id)
+    story_id = story_id_param(conn)
 
-      Loopctl.AuditChain.append(tenant_id, %{
-        action: "custody_halted",
-        actor_lineage: [],
-        entity_type: "tenant",
-        entity_id: tenant_id,
-        payload: %{"reason" => violation_type}
-      })
-    end
+    Logger.warning(
+      "cap_rejected: capability token refused tenant_id=#{inspect(tenant_id)} " <>
+        "reason=#{inspect(reason)} story_id=#{inspect(story_id)}"
+    )
+
+    :telemetry.execute(
+      [:loopctl, :custody, :cap_rejected],
+      %{count: 1},
+      %{tenant_id: tenant_id, reason: reason, story_id: story_id}
+    )
+
+    :ok
   rescue
     _ -> :ok
   end
+
+  # `conn.params` is `%Plug.Conn.Unfetched{}` on the direct-`call/2` paths, which
+  # is a struct and therefore matches neither clause's map pattern.
+  defp story_id_param(%Plug.Conn{params: %{"id" => id}}) when is_binary(id), do: id
+  defp story_id_param(%Plug.Conn{}), do: nil
 end
