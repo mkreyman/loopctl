@@ -717,4 +717,86 @@ defmodule Loopctl.Knowledge.OKFTest do
       assert %{conformant: true, errors: []} = OKF.validate_files(files)
     end
   end
+
+  describe "#617: a filename-derived title is qualified when it is generic" do
+    # A bundle carrying a bare CHANGELOG.md with no frontmatter title used to import as the
+    # article "Changelog". Three such documents then collided into a false duplicate group
+    # on the hosted corpus, which is the class #617 traced back to title minting. The REST
+    # ingestion path was fixed by showing its extractor the source; this importer derives
+    # titles itself, so it qualifies them itself.
+    defp bundle(files) do
+      entries =
+        Enum.map(files, fn {path, content} ->
+          {String.to_charlist(path), content}
+        end)
+
+      # `:erl_tar.create/3` with `:memory` returns a bare `:ok` on this OTP and writes to
+      # disk instead of handing back a binary, so build it in a tmp file and read it back.
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "okf-#{System.unique_integer([:positive])}.tar.gz"
+        )
+
+      on_exit(fn -> File.rm(path) end)
+      :ok = :erl_tar.create(String.to_charlist(path), entries, [:compressed])
+      File.read!(path)
+    end
+
+    defp concept(body), do: "---\ntype: pattern\n---\n\n" <> body
+
+    test "a generic name is qualified with its enclosing directory" do
+      dest = fixture(:tenant)
+
+      targz =
+        bundle([
+          {"concepts/oauth2/CHANGELOG.md", concept("Release notes for the oauth2 library.")}
+        ])
+
+      assert {:ok, report} = OKF.import_zip(dest.id, targz)
+      assert report.errors == []
+
+      %{data: articles} = Knowledge.list_articles(dest.id, category: :pattern)
+      titles = Enum.map(articles, & &1.title)
+
+      refute "Changelog" in titles,
+             "a bare generic title is exactly the collision this guard exists to prevent"
+
+      assert Enum.any?(titles, &String.starts_with?(&1, "Changelog "))
+      assert Enum.any?(titles, &(&1 =~ "oauth2"))
+    end
+
+    test "an already-specific name is NOT padded" do
+      # The guard has to discriminate. Qualifying every title would make the corpus noisier
+      # rather than more distinguishable, which is the failure mode in the other direction.
+      dest = fixture(:tenant)
+
+      targz =
+        bundle([
+          {"concepts/oauth2/retry-backoff-strategy.md", concept("Use jittered backoff.")}
+        ])
+
+      assert {:ok, report} = OKF.import_zip(dest.id, targz)
+      assert report.errors == []
+
+      %{data: articles} = Knowledge.list_articles(dest.id, category: :pattern)
+      assert Enum.any?(articles, &(&1.title == "Retry Backoff Strategy"))
+    end
+
+    test "an explicit frontmatter title always wins over both" do
+      dest = fixture(:tenant)
+
+      targz =
+        bundle([
+          {"concepts/oauth2/CHANGELOG.md",
+           "---\ntype: pattern\ntitle: Hand-written Title\n---\n\nBody."}
+        ])
+
+      assert {:ok, report} = OKF.import_zip(dest.id, targz)
+      assert report.errors == []
+
+      %{data: articles} = Knowledge.list_articles(dest.id, category: :pattern)
+      assert Enum.any?(articles, &(&1.title == "Hand-written Title"))
+    end
+  end
 end

@@ -765,20 +765,63 @@ defmodule Loopctl.Knowledge.OKF do
     end
   end
 
+  # Titles that hundreds of unrelated documents all produce. A bundle carrying a bare
+  # `CHANGELOG.md` with no frontmatter title used to import as the article "Changelog", and
+  # three such documents then collided into a false duplicate group on the hosted corpus —
+  # the class #617 traced back to title minting. The REST ingestion path was fixed by
+  # showing its extractor the source; this importer derives titles itself, so it qualifies
+  # them itself. Matched on the NORMALIZED derived title, so "change-log" and "CHANGELOG"
+  # are both caught.
+  #
+  # Deliberately NOT `Consolidation.generic_title_pattern/0`: that one matches PLACEHOLDER
+  # titles ("Untitled", "Draft") and is owned by a different proposal class. These are
+  # perfectly good document names that are merely not unique.
+  @generic_concept_titles ~w(
+    changelog readme license contributing installation configuration
+    overview index introduction usage reference api getting started
+    quickstart quick start faq notes todo roadmap security upgrading
+  )
+
   defp concept_title(fm, path) do
     case Map.get(fm, "title") do
       title when is_binary(title) and title != "" ->
         title
 
       _ ->
-        # Derive from the concept id (filename minus .md), de-slugified.
-        path
-        |> Path.basename(".md")
-        |> String.replace(["-", "_"], " ")
-        |> String.split()
-        |> Enum.map_join(" ", &String.capitalize/1)
+        path |> derived_title() |> qualify_generic(path)
     end
     |> String.slice(0, 500)
+  end
+
+  # Derive from the concept id (filename minus .md), de-slugified.
+  defp derived_title(path) do
+    path
+    |> Path.basename(".md")
+    |> String.replace(["-", "_"], " ")
+    |> String.split()
+    |> Enum.map_join(" ", &String.capitalize/1)
+  end
+
+  # Qualify with the nearest enclosing directory, which in an OKF bundle names the concept
+  # group the file belongs to. No directory (a file at the bundle root) means there is
+  # nothing honest to qualify WITH, so the bare title stands rather than being padded with
+  # an invented source — the same rule the extraction prompt follows.
+  defp qualify_generic(title, path) do
+    if String.downcase(title) in @generic_concept_titles do
+      case qualifier(path) do
+        nil -> title
+        source -> "#{title} — #{source}"
+      end
+    else
+      title
+    end
+  end
+
+  defp qualifier(path) do
+    case path |> Path.dirname() |> Path.basename() do
+      dir when dir in [".", "/", "", "concepts"] -> nil
+      dir -> dir |> String.replace(["-", "_"], " ") |> String.trim()
+    end
   end
 
   defp category_for(fm, type) do
