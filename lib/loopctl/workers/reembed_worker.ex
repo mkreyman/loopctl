@@ -87,6 +87,7 @@ defmodule Loopctl.Workers.ReembedWorker do
   alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Embeddings.ShrinkLadder
   alias Loopctl.Embeddings.TextBudget
+  alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -266,12 +267,77 @@ defmodule Loopctl.Workers.ReembedWorker do
       {:ok, vectors, truncated} ->
         store_checked(tenant_id, target_dim, entries, vectors, truncated, store_fun)
 
-      {:error, :embedding_batch_length_mismatch} = mismatch ->
-        mismatch
+      # PARTIAL: the bisect embedded some members before another half failed (#617 review
+      # follow-up). Those vectors are already billed, and this worker self-continues off
+      # `pending_reembed_*`, so storing them is what makes the retry's pending set smaller
+      # — otherwise a deterministic failure re-pays for the same members every attempt and
+      # the re-embed never advances. The error is still propagated afterwards.
+      {:error, reason, partial} ->
+        store_partial(tenant_id, target_dim, entries, partial, store_fun)
+        propagate(tenant_id, reason)
 
       {:error, reason} ->
-        handle_error(tenant_id, reason)
+        propagate(tenant_id, reason)
     end
+  end
+
+  defp propagate(_tenant_id, :embedding_batch_length_mismatch),
+    do: {:error, :embedding_batch_length_mismatch}
+
+  defp propagate(tenant_id, reason), do: handle_error(tenant_id, reason)
+
+  # Best-effort: a store failure here must not mask the provider error that caused the
+  # partial in the first place, which is the one the Oban outcome is derived from.
+  defp store_partial(_tenant_id, _target_dim, _entries, [], _store_fun), do: :ok
+
+  defp store_partial(tenant_id, target_dim, entries, partial, store_fun) do
+    by_index = Map.new(Enum.with_index(entries), fn {entry, i} -> {i, entry} end)
+
+    salvaged =
+      Enum.flat_map(partial, fn {index, vector, truncated?} ->
+        case Map.fetch(by_index, index) do
+          {:ok, entry} -> [{entry, vector, truncated?}]
+          :error -> []
+        end
+      end)
+
+    # `store_checked/6` takes truncated indexes relative to the list it is GIVEN, and the
+    # salvaged list is a compaction of the original — so the indexes are recomputed here
+    # rather than carried over. Reusing the original-array indexes would mark the wrong
+    # rows, which is worse than not marking them: a whole-text vector labelled a prefix is
+    # silently dropped from the corroboration gate that decides auto-unpublishes.
+    salvaged_entries = Enum.map(salvaged, fn {entry, _vector, _truncated?} -> entry end)
+    salvaged_vectors = Enum.map(salvaged, fn {_entry, vector, _truncated?} -> vector end)
+
+    salvaged_truncated =
+      salvaged
+      |> Enum.with_index()
+      |> Enum.filter(fn {{_entry, _vector, truncated?}, _i} -> truncated? end)
+      |> Enum.map(fn {_triple, i} -> i end)
+
+    Logger.info(
+      "ReembedWorker: tenant=#{tenant_id} storing #{length(salvaged)} already-embedded " <>
+        "member(s) from a partially-failed batch, so the retry does not re-bill them."
+    )
+
+    store_checked(
+      tenant_id,
+      target_dim,
+      salvaged_entries,
+      salvaged_vectors,
+      salvaged_truncated,
+      store_fun
+    )
+
+    :ok
+  rescue
+    e ->
+      Logger.warning(
+        "ReembedWorker: tenant=#{tenant_id} could not store the salvaged partial batch " <>
+          "(#{ExitTag.tag(e)}); those members will be re-embedded on the retry."
+      )
+
+      :ok
   end
 
   # WHICH model this re-embed generates with. The model captured at ENQUEUE (finding

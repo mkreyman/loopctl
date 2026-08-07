@@ -182,9 +182,72 @@ defmodule Loopctl.Embeddings.ShrinkLadderTest do
     end
 
     test "a batch whose offender cannot fit even at the floor surfaces the provider error" do
+      # ...and hands back the member that DID embed, so the caller's retry is not billed
+      # for it again. `"a"` fits; the 40KB member cannot fit even at the floor.
       {fun, _calls} = batch_provider(1)
 
-      assert ShrinkLadder.embed_batch(["a", String.duplicate("b", 40_000)], fun) == @too_long
+      assert {:error, {:api_error, 400, :context_length_exceeded}, [{0, _vector, false}]} =
+               ShrinkLadder.embed_batch(["a", String.duplicate("b", 40_000)], fun)
+    end
+
+    test "an already-paid-for half survives its sibling's failure" do
+      # The defect: the bisect embedded one half, the other failed, and the successful
+      # half was DISCARDED — so the caller's retry re-sent and re-paid for the whole
+      # array. Against a deterministic failure that repeats on every attempt while never
+      # making progress.
+      {:ok, calls} = Agent.start_link(fn -> 0 end)
+
+      # First call (whole array) is rejected as too long, forcing a bisect. The left half
+      # then succeeds; the right half hits a breaker.
+      fun = fn texts ->
+        n = Agent.get_and_update(calls, &{&1 + 1, &1 + 1})
+
+        cond do
+          n == 1 -> @too_long
+          Enum.any?(texts, &String.starts_with?(&1, "r")) -> {:error, :circuit_open}
+          true -> {:ok, Enum.map(texts, &vector/1)}
+        end
+      end
+
+      assert {:error, :circuit_open, partial} =
+               ShrinkLadder.embed_batch(["l1", "l2", "r1", "r2"], fun)
+
+      # Indexes are ORIGINAL-array offsets, so the caller can zip them against its entries.
+      assert Enum.map(partial, fn {index, _v, _t} -> index end) == [0, 1]
+      assert Enum.all?(partial, fn {_i, _v, truncated?} -> truncated? == false end)
+    end
+
+    test "nothing salvaged still returns the plain two-element error" do
+      # The three-element shape must mean "there is something to store". A caller that
+      # matches `{:error, reason}` for its ordinary error handling keeps working when the
+      # whole batch failed, which is the common case.
+      fun = fn _texts -> {:error, :no_api_key} end
+
+      assert ShrinkLadder.embed_batch(["a", "b"], fun) == {:error, :no_api_key}
+    end
+
+    test "a salvaged member that had to be TRUNCATED is reported as truncated" do
+      # The mark has to survive the partial path too, or the caller stores a prefix vector
+      # under an unmarked hash — exactly the invariant the rest of this change enforces.
+      {:ok, calls} = Agent.start_link(fn -> 0 end)
+      long = String.duplicate("l", 40_000)
+
+      fun = fn texts ->
+        n = Agent.get_and_update(calls, &{&1 + 1, &1 + 1})
+
+        cond do
+          n == 1 -> @too_long
+          Enum.any?(texts, &String.starts_with?(&1, "r")) -> {:error, :circuit_open}
+          Enum.any?(texts, &(byte_size(&1) > 10_000)) -> @too_long
+          true -> {:ok, Enum.map(texts, &vector/1)}
+        end
+      end
+
+      assert {:error, :circuit_open, partial} =
+               ShrinkLadder.embed_batch([long, "l2", "r1", "r2"], fun)
+
+      assert {0, _vector, true} = Enum.find(partial, fn {i, _v, _t} -> i == 0 end)
+      assert {1, _vector, false} = Enum.find(partial, fn {i, _v, _t} -> i == 1 end)
     end
 
     test "a non-length batch error is passed through without bisecting" do

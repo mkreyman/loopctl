@@ -63,8 +63,19 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
 
   @type vector :: [float()]
   @type one_result :: {:ok, vector()} | {:ok, vector(), :truncated} | {:error, term()}
+
+  # A member the bisect embedded successfully before a SIBLING half failed: its index in
+  # the ORIGINAL array, its vector, and whether the ladder had to truncate it.
+  @type partial :: {non_neg_integer(), vector(), boolean()}
+
+  # What `embed_fun` may return (the guarded client's own shape).
+  @type provider_result :: {:ok, [vector()]} | {:error, term()}
+
   @type batch_result ::
-          {:ok, [vector()]} | {:ok, [vector()], [non_neg_integer()]} | {:error, term()}
+          {:ok, [vector()]}
+          | {:ok, [vector()], [non_neg_integer()]}
+          | {:error, term()}
+          | {:error, term(), [partial()]}
 
   @doc """
   Embed ONE text through `embed_fun`, shrinking on a context-length rejection.
@@ -152,8 +163,22 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
   those rows or the corpus fills with prefixes the comparing side is told cannot exist.
   `:max_calls` bounds the provider calls one batch may spend across the whole bisect
   (default `max(#{@min_max_calls}, #{@calls_per_text} * length(texts))`).
+
+  ## A failure does not throw away what was already paid for
+
+  When the bisect has embedded one half and the other then fails, the error comes back as
+  `{:error, reason, partial}` — `partial` being `[{index, vector, truncated?}]` for the
+  members that DID succeed, at their original-array indexes. Those vectors are already
+  billed; discarding them made the caller's retry re-send and re-pay for the whole array,
+  and against a deterministic failure (an egress refusal, a revoked key) it re-paid on
+  every attempt while never making progress.
+
+  A caller should store `partial` and THEN propagate the error, so the retry's pending set
+  no longer names those rows. A caller that does not care may match `{:error, reason, _}`;
+  the plain `{:error, reason}` shape is still returned whenever nothing was salvaged.
   """
-  @spec embed_batch([String.t()], ([String.t()] -> batch_result()), keyword()) :: batch_result()
+  @spec embed_batch([String.t()], ([String.t()] -> provider_result()), keyword()) ::
+          batch_result()
   def embed_batch(texts, embed_fun, opts \\ [])
 
   def embed_batch([], _embed_fun, _opts), do: {:ok, []}
@@ -168,6 +193,8 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
     case result do
       {:ok, vectors, []} -> {:ok, vectors}
       {:ok, vectors, truncated} -> {:ok, vectors, Enum.sort(truncated)}
+      {:error, reason, []} -> {:error, reason}
+      {:error, reason, partial} -> {:error, reason, Enum.sort_by(partial, &elem(&1, 0))}
       error -> error
     end
   end
@@ -181,17 +208,20 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
         {{:ok, v, []}, budget - 1}
 
       {:ok, _mismatch} ->
-        {{:error, :embedding_batch_length_mismatch}, budget - 1}
+        {{:error, :embedding_batch_length_mismatch, []}, budget - 1}
 
       {:error, {:api_error, _s, :context_length_exceeded}} = e ->
         shrink(texts, embed_fun, opts, e, budget - 1, offset)
+
+      {:error, reason} ->
+        {{:error, reason, []}, budget - 1}
 
       other ->
         {other, budget - 1}
     end
   end
 
-  defp shrink(texts, _embed_fun, opts, error, budget, _offset) when budget <= 0 do
+  defp shrink(texts, _embed_fun, opts, {:error, reason}, budget, _offset) when budget <= 0 do
     Logger.warning(
       "#{label(opts)}: giving up on a batch of #{length(texts)} after " <>
         "#{Keyword.fetch!(opts, :max_calls)} provider calls — most of it is over-long, " <>
@@ -199,17 +229,17 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
         "(`chunk_by_bytes/3`) before sending."
     )
 
-    {error, 0}
+    {{:error, reason, []}, 0}
   end
 
   # Isolated to ONE text: this is the member the provider was rejecting, so ladder it.
-  defp shrink([text], embed_fun, opts, error, budget, offset) do
+  defp shrink([text], embed_fun, opts, {:error, reason}, budget, offset) do
     sent = byte_size(text)
 
     case TextBudget.next_budget(sent) do
       :exhausted ->
         log_exhausted(opts, sent)
-        {error, budget}
+        {{:error, reason, []}, budget}
 
       smaller ->
         log_shrink(opts, sent, smaller)
@@ -223,8 +253,17 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
 
   # More than one member: the provider named none of them, so split and let each
   # half answer for itself. `div(length, 2)` is >= 1 here (length >= 2), so both
-  # halves are strictly smaller and the recursion terminates. A `with` else-less
-  # fallthrough returns the failing `{result, budget}` pair unchanged.
+  # halves are strictly smaller and the recursion terminates.
+  #
+  # A half that SUCCEEDED is never thrown away when its sibling fails (#617 review
+  # follow-up). Those vectors are already billed; discarding them meant the caller's
+  # retry re-sent and re-paid for the whole array, and on a batch whose failure is
+  # deterministic — an egress refusal, a revoked key — it re-paid on every attempt while
+  # never making progress. The error now carries the successes as
+  # `[{index, vector, truncated?}]`, and the caller stores them before it propagates.
+  #
+  # Indexes are ORIGINAL-array offsets, so a caller can zip them against its own entries
+  # exactly as it does the success path's vectors.
   defp shrink(texts, embed_fun, opts, _error, budget, offset) do
     {left, right} = Enum.split(texts, div(length(texts), 2))
 
@@ -234,11 +273,36 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
         "isolate it. Only the over-long text will be truncated."
     )
 
-    with {{:ok, lv, lt}, left_budget} <- run_batch(left, embed_fun, opts, budget, offset),
-         {{:ok, rv, rt}, spent} <-
-           run_batch(right, embed_fun, opts, left_budget, offset + length(left)) do
-      {{:ok, lv ++ rv, lt ++ rt}, spent}
+    case run_batch(left, embed_fun, opts, budget, offset) do
+      {{:ok, lv, lt}, left_budget} ->
+        right_offset = offset + length(left)
+
+        case run_batch(right, embed_fun, opts, left_budget, right_offset) do
+          {{:ok, rv, rt}, spent} ->
+            {{:ok, lv ++ rv, lt ++ rt}, spent}
+
+          {{:error, reason, right_partial}, spent} ->
+            {{:error, reason, indexed(lv, lt, offset) ++ right_partial}, spent}
+        end
+
+      # The left half failed. Its own bisect may still have salvaged part of itself, so
+      # its partial is propagated rather than replaced with an empty one. The right half
+      # is deliberately NOT attempted: the budget is shared, and a half that failed for a
+      # non-length reason (breaker open, egress refusal) means the next call fails too.
+      {{:error, reason, left_partial}, spent} ->
+        {{:error, reason, left_partial}, spent}
     end
+  end
+
+  # A successful half, expressed in the partial-result shape so it survives its sibling's
+  # failure. `truncated` holds ORIGINAL-array indexes already, hence the membership test
+  # rather than a positional one.
+  defp indexed(vectors, truncated, offset) do
+    marked = MapSet.new(truncated)
+
+    vectors
+    |> Enum.with_index(offset)
+    |> Enum.map(fn {vector, index} -> {index, vector, MapSet.member?(marked, index)} end)
   end
 
   # Tagged ONCE per member: a deeper rung already tagged the same index, hence the uniq.

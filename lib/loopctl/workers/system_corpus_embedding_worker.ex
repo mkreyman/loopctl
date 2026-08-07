@@ -69,6 +69,7 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Embeddings.ShrinkLadder
   alias Loopctl.Embeddings.TextBudget
+  alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -173,12 +174,55 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
       {:ok, vectors, truncated} ->
         store_all(tenant_id, dim, zip_marked(entries, vectors, truncated))
 
-      {:error, :embedding_batch_length_mismatch} = mismatch ->
-        mismatch
+      # PARTIAL: the bisect embedded some members before another half failed (#617 review
+      # follow-up). Those vectors are already billed, and `split_unchanged/3` skips a
+      # stored member on the retry — so storing them is what stops a deterministic failure
+      # re-paying for the same canonicals on every attempt. The error still propagates.
+      {:error, reason, partial} ->
+        store_partial(tenant_id, dim, entries, partial)
+        propagate(tenant_id, reason)
 
       {:error, reason} ->
-        handle_error(tenant_id, reason)
+        propagate(tenant_id, reason)
     end
+  end
+
+  defp propagate(_tenant_id, :embedding_batch_length_mismatch),
+    do: {:error, :embedding_batch_length_mismatch}
+
+  defp propagate(tenant_id, reason), do: handle_error(tenant_id, reason)
+
+  # Best-effort: a store failure here must not mask the provider error the Oban outcome is
+  # derived from.
+  defp store_partial(_tenant_id, _dim, _entries, []), do: :ok
+
+  defp store_partial(tenant_id, dim, entries, partial) do
+    by_index = Map.new(Enum.with_index(entries), fn {entry, i} -> {i, entry} end)
+
+    triples =
+      Enum.flat_map(partial, fn {index, vector, truncated?} ->
+        case Map.fetch(by_index, index) do
+          {:ok, {article, text}} -> [{article, vector, hash_for(text, truncated?)}]
+          :error -> []
+        end
+      end)
+
+    Logger.info(
+      "SystemCorpusEmbeddingWorker: tenant=#{tenant_id} storing #{length(triples)} " <>
+        "already-embedded canonical(s) from a partially-failed batch, so the retry does " <>
+        "not re-bill them."
+    )
+
+    store_all(tenant_id, dim, triples)
+    :ok
+  rescue
+    e ->
+      Logger.warning(
+        "SystemCorpusEmbeddingWorker: tenant=#{tenant_id} could not store the salvaged " <>
+          "partial batch (#{ExitTag.tag(e)}); those members re-embed on the retry."
+      )
+
+      :ok
   end
 
   # ONE batched hash read for the whole batch (AC-41.1.11: no per-item query).

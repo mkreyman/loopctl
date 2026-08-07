@@ -775,10 +775,23 @@ config :loopctl,
 # either to 0 PAUSES the auto-unpublish drain for that run: nothing is applied and the audit
 # event records duplicate_apply_gate=drain_disabled, so a paused night is not mistaken for a
 # clean one. That is the supported way to halt the drain during an incident.
+#
+# knowledge_consolidation_min_duplicate_similarity is the CONTENT gate on the same class:
+# the minimum pairwise cosine a title-collision group must reach before it may auto-apply.
+# It lives here so all four levers on that pass are discoverable in one place. All four
+# also resolve through a SystemConfig DB row first (the similarity one as the integer-percent
+# key knowledge_consolidation_min_duplicate_similarity_pct, since SystemConfig stores
+# integers), so an operator can move any of them without a deploy.
+#
+# NOTE the asymmetry on 0: for the three caps 0 is an explicit PAUSE, but for the similarity
+# threshold 0 is REFUSED rather than honoured — min_sim >= 0.0 holds for every pair, so it
+# would turn the only content check on the auto-applying class fully off, which is the
+# opposite of what an operator typing 0 means.
 config :loopctl,
   knowledge_consolidation_max_per_class: 500,
   knowledge_consolidation_max_applies: 500,
-  knowledge_consolidation_max_unpublishes: 500
+  knowledge_consolidation_max_unpublishes: 500,
+  knowledge_consolidation_min_duplicate_similarity: 0.80
 
 # LinkPruning (#611 stage 0): how many over-degree `relates_to` edges one nightly run may
 # DELETE, worst-first. Sized to converge in a few nights rather than a few months — the

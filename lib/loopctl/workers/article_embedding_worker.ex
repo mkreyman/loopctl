@@ -81,6 +81,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
+  alias Loopctl.Embeddings.ShrinkLadder
   alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Llm
@@ -164,9 +165,9 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
     # did egress. AC-41.7.2 names exactly that scenario.
     result = embed_with_shrink(tenant_id, article, article_id, text, opts)
 
-    case result do
-      {:ok, embedding} ->
-        store(tenant_id, article_id, embedding, content_hash)
+    case normalize(result, content_hash) do
+      {:ok, embedding, hash} ->
+        store(tenant_id, article_id, embedding, hash)
 
       {:error, :no_api_key} ->
         skip_no_embedding_key(tenant_id, article_id)
@@ -235,55 +236,41 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
     end
   end
 
-  # The shrink ladder. `attempt` arrives as the initial (character-capped) text, so the
-  # first pass sends exactly what the pre-ladder code sent; each rejection re-truncates
-  # what was JUST SENT to half its bytes and re-sends.
+  # The shrink ladder, now the SHARED `ShrinkLadder.embed_one/3` rather than a private
+  # copy of it (#617 review follow-up). This worker had the only implementation, and
+  # every other embedding path grew one that had to agree with it by inspection. The
+  # behaviour is identical — halve what was actually SENT, floor once, then surface the
+  # provider's own error — but the `:truncated` signal now comes back with the vector.
   #
-  # The next budget is derived from `byte_size(attempt)`, never from a nominal rung:
-  # a rung larger than the text truncates nothing, so halving the rung alone would
-  # re-send byte-identical bytes and buy a guaranteed-identical rejection.
-  #
-  # Terminates unconditionally: `TextBudget.next_budget/1` returns `:exhausted` once
-  # the floor has been tried. On `:exhausted` the original error is returned untouched,
-  # so the caller's existing permanent-error branch discards it — a floor-sized input
-  # that is STILL rejected is a different defect (a much smaller model window, e.g. a
-  # self-hosted 512-token embedder) and must be legible as one, not absorbed by more
-  # halving.
+  # That signal is the point. `ArticleEmbeddingWorker` was the ONE remaining writer that
+  # stored a prefix vector under an unmarked hash, and the readers that refuse to judge
+  # on a prefix (`Consolidation.pairwise_similarity_by_group/2`, `Memory`'s near-dup
+  # scan) filter on that mark — so for the tenant's own articles, which is most of the
+  # corpus, the filter matched nothing and the guard could never fire.
   defp embed_with_shrink(tenant_id, article, article_id, attempt, opts) do
-    case embed_with_custody(tenant_id, article, article_id, attempt, opts) do
-      {:error, {:api_error, _status, :context_length_exceeded}} = error ->
-        sent = byte_size(attempt)
-
-        case TextBudget.next_budget(sent) do
-          :exhausted ->
-            Logger.warning(
-              "ArticleEmbeddingWorker: tenant=#{tenant_id} article=#{article_id} rejected as " <>
-                "too long at #{sent} bytes, at or below the #{TextBudget.floor_bytes()}-byte " <>
-                "floor — not a length problem (a smaller model window?); discarding."
-            )
-
-            error
-
-          smaller ->
-            Logger.warning(
-              "ArticleEmbeddingWorker: tenant=#{tenant_id} article=#{article_id} exceeded the " <>
-                "provider token limit at #{sent} bytes; retrying at #{smaller}. The embedding " <>
-                "will cover a prefix of the article, not all of it."
-            )
-
-            embed_with_shrink(
-              tenant_id,
-              article,
-              article_id,
-              TextBudget.truncate(attempt, smaller),
-              opts
-            )
-        end
-
-      result ->
-        result
-    end
+    ShrinkLadder.embed_one(
+      attempt,
+      &embed_with_custody(tenant_id, article, article_id, &1, opts),
+      label: "ArticleEmbeddingWorker tenant=#{tenant_id} article=#{article_id}"
+    )
   end
+
+  # Collapse the ladder's two success shapes into ONE `{:ok, embedding, hash}` so the
+  # caller's `case` keeps a single success branch (it is at credo's complexity ceiling).
+  #
+  # A TRUNCATED vector covers a PREFIX, so its hash is MARKED. The hash still identifies
+  # the FULL text — that is what keeps the idempotency guard from re-walking the ladder
+  # and re-billing on every enqueue (`already_embedded?/3` compares `whole_hash/1`) —
+  # while a reader can still tell a prefix vector from a whole-text one with no schema
+  # migration. This worker writes most of the corpus, so until it marked, the readers
+  # that filter prefixes out (`Consolidation`'s corroboration gate, `Memory`'s near-dup
+  # supersede) were filtering on something nothing ever set.
+  defp normalize({:ok, embedding}, content_hash), do: {:ok, embedding, content_hash}
+
+  defp normalize({:ok, embedding, :truncated}, content_hash),
+    do: {:ok, embedding, ShrinkLadder.truncated_hash(content_hash)}
+
+  defp normalize(other, _content_hash), do: other
 
   defp embed_with_custody(tenant_id, article, article_id, text, opts) do
     recorded = record_custody_posture(tenant_id, article, article_id)
@@ -358,16 +345,26 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   # unbounded cost loop. Behind the cutover flag the presence+hash check therefore
   # consults the side table at the tenant's active dimension, where the hash HAS been
   # recorded all along.
+  #
+  # Both branches compare through `ShrinkLadder.whole_hash/1` (#617 review follow-up): a
+  # truncation-marked hash still identifies the FULL text, so an article whose vector
+  # covers a prefix is "already embedded" for the content it has. Comparing the raw
+  # stored value instead would miss on every marked row and re-walk the whole ladder —
+  # several billed provider calls — on every single enqueue, which is precisely the
+  # unbounded cost loop this guard was added to close.
   defp already_embedded?(tenant_id, article, content_hash) do
     # Gated on the WRITE dimension (`use_side_table_hash?/1`), NOT the read flag
     # (review): a non-1536 tenant NEVER has a legacy hash, so keying this on the read
     # flag re-billed the provider on every enqueue until cutover.
     if Embeddings.use_side_table_hash?(tenant_id) do
-      Embeddings.article_embedded_hash(
-        tenant_id,
-        article.id,
-        Embeddings.active_dimension(tenant_id)
-      ) == content_hash
+      stored =
+        Embeddings.article_embedded_hash(
+          tenant_id,
+          article.id,
+          Embeddings.active_dimension(tenant_id)
+        )
+
+      is_binary(stored) and ShrinkLadder.whole_hash(stored) == content_hash
     else
       legacy_already_embedded?(article, content_hash)
     end
@@ -378,7 +375,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
          content_hash
        )
        when not is_nil(embedding) and is_binary(hash),
-       do: hash == content_hash
+       do: ShrinkLadder.whole_hash(hash) == content_hash
 
   defp legacy_already_embedded?(_article, _content_hash), do: false
 
