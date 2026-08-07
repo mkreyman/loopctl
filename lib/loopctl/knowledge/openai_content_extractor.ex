@@ -32,11 +32,12 @@ defmodule Loopctl.Knowledge.OpenAiContentExtractor do
   def extract_from_content(scope_or_tenant_id, content, opts \\ []) do
     scope = EgressScope.coerce(scope_or_tenant_id)
     source_type = Keyword.get(opts, :source_type, "unknown")
+    source_ref = Keyword.get(opts, :source_ref)
 
     # Resolve the PROVIDER + endpoint + model FIRST so a shape failure can name
     # them, and so no Anthropic credential can be handed to this client.
     with {:ok, target} <- OpenAiChat.resolve_target(scope.tenant_id, :extraction),
-         {:ok, text} <- request(scope, target, content, source_type) do
+         {:ok, text} <- request(scope, target, content, source_type, source_ref) do
       StrictArticleParser.parse(text, %{
         endpoint: target.endpoint,
         model: target.model,
@@ -46,13 +47,16 @@ defmodule Loopctl.Knowledge.OpenAiContentExtractor do
     end
   end
 
-  defp request(scope, target, content, source_type) do
+  defp request(scope, target, content, source_type, source_ref) do
     body_fun = fn _model ->
       %{
         max_tokens: 64_000,
         system: ClaudeContentExtractor.system_prompt(),
         messages: [
-          %{role: "user", content: ClaudeContentExtractor.user_content(content, source_type)}
+          %{
+            role: "user",
+            content: ClaudeContentExtractor.user_content(content, source_type, source_ref)
+          }
         ]
       }
     end

@@ -32,7 +32,22 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
   these definitions -- #{Categories.prompt_fragment()}. Extract only genuinely \
   reusable knowledge -- skip promotional content, navigation, boilerplate. Max 10 \
   articles per input. Return ONLY the JSON array, no surrounding text or markdown \
-  fences.\
+  fences.
+
+  TITLES MUST STAND ALONE. Every article joins one shared corpus alongside \
+  articles extracted from thousands of unrelated sources, and a reader sees the \
+  title with no memory of where it came from. So the title must identify its \
+  subject on its own -- never the document's own heading when that heading is \
+  generic. "Changelog", "Options", "Installation", "Getting Started", "API \
+  Reference", "Configuration" and "Overview" are titles that hundreds of unrelated \
+  sources all produce; they collide, and a corpus cannot tell the resulting \
+  articles apart. When the natural title is generic like that, QUALIFY it with the \
+  specific subject the Source line names -- prefer "Changelog — Platinum SEO Pack \
+  WordPress plugin" over "Changelog", and "Retry configuration — Oban Pro" over \
+  "Configuration"; separate title and qualifier with that em dash. When there is NO \
+  Source line, take the qualifier from the subject the CONTENT itself names, and \
+  never invent a source. A title that is already specific ("Ecto changesets validate \
+  before they cast") needs no qualifier; do not pad it.\
   """
 
   @doc """
@@ -46,21 +61,46 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
   @spec system_prompt() :: String.t()
   def system_prompt, do: @system_prompt
 
-  @doc "The user message for `content` of `source_type` — shared with the sibling impl."
-  @spec user_content(String.t(), String.t()) :: String.t()
-  def user_content(content, source_type),
-    do: "Source type: #{source_type}\n\nContent:\n#{content}"
+  @doc """
+  The user message for `content` — shared with the sibling impl.
+
+  `source_ref` names the SPECIFIC source (a URL, repo, or document name); it is what
+  lets the prompt's "titles must stand alone" rule actually be followed (#617). Without
+  it the model saw only a coarse `source_type` like `web_article`, so a CHANGELOG file
+  from any project could only be titled "Changelog" — and three unrelated documents
+  (a WordPress SEO plugin, the Elixir oauth2 library, a WordPress theme) did exactly
+  that on the hosted corpus, generating the filename-title collision class the nightly
+  consolidation pass then has to catch. An extractor cannot qualify a title with a
+  source it was never shown.
+
+  Omitted when the caller names no source at all, in which case the line is left out
+  entirely rather than sent as "unknown" — a literal "unknown" is a string the model
+  can dutifully qualify a title WITH. The prompt covers that case explicitly (qualify
+  from the content's own subject), so an absent Source line is a defined state and not
+  an unsatisfiable instruction.
+  """
+  @spec user_content(String.t(), String.t(), String.t() | nil) :: String.t()
+  def user_content(content, source_type, source_ref \\ nil) do
+    source_line =
+      case source_ref do
+        ref when is_binary(ref) and ref != "" -> "Source: #{ref}\n"
+        _ -> ""
+      end
+
+    "Source type: #{source_type}\n#{source_line}\nContent:\n#{content}"
+  end
 
   @impl true
   def extract_from_content(scope_or_tenant_id, content, opts \\ []) do
     source_type = Keyword.get(opts, :source_type, "unknown")
+    source_ref = Keyword.get(opts, :source_ref)
 
     body_fun = fn _model ->
       %{
         max_tokens: 64_000,
         system: @system_prompt,
         messages: [
-          %{role: "user", content: user_content(content, source_type)}
+          %{role: "user", content: user_content(content, source_type, source_ref)}
         ]
       }
     end

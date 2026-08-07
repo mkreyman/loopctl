@@ -31,7 +31,17 @@ defmodule Loopctl.Knowledge.ContentExtractorBehaviour do
     POSTed to the provider from here, so a project-only marking that stops at the
     caller is not enforced at all.
   - `content` -- raw text content to extract knowledge from
-  - `opts` -- keyword list of options (e.g., `source_type: "newsletter"`)
+  - `opts` -- keyword list of options:
+    - `:source_type` -- the coarse kind of source (e.g. `"newsletter"`)
+    - `:source_ref` -- the SPECIFIC source: a URL, repo, or document name. Optional,
+      but pass it whenever it is known. The extractor mints every article title, and a
+      title is only self-qualifying if the extractor knows what it is reading — without
+      this it can only title a CHANGELOG file "Changelog", which is what generated the
+      filename-title collision class on the hosted corpus (#617). Omit it rather than
+      passing a placeholder: a model will qualify a title WITH the word "unknown". This
+      value LEAVES for the provider inside the prompt, so a caller passing a fetch URL
+      strips userinfo and query string first (see `Loopctl.Workers.ContentIngestionWorker`)
+      — that is where presigned signatures and share tokens live.
 
   ## Returns
 
