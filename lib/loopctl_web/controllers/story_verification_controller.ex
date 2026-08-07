@@ -275,7 +275,16 @@ defmodule LoopctlWeb.StoryVerificationController do
   def backfill(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
-    opts = AuditContext.from_conn(conn)
+
+    opts =
+      Keyword.merge(AuditContext.from_conn(conn),
+        # LCP-1 §9.4: backfill mounts RequireSignedClaim (gate "verify") and reaches
+        # the same `verified` terminal state, so the verified claim must be recorded
+        # in the hash-chained audit entry — verifying it and dropping it leaves no
+        # durable residue and is half a control.
+        custody_claim: conn.assigns[:custody_signed_claim],
+        verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+      )
 
     case Progress.backfill_story(tenant_id, story_id, params, opts) do
       {:ok, story} ->
@@ -337,8 +346,9 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   defp backfill_error_message(:story_in_progress) do
     "Story is mid-lifecycle (e.g. contracted) with no dispatch lineage yet — it is " <>
-      "being worked, not pre-existing done work. Let the report → review → verify " <>
-      "flow run, or force_unclaim it back to pending first if it was abandoned."
+      "being worked, not pre-existing done work. Let the report_story → review_complete " <>
+      "→ verify_story flow run. force_unclaim does NOT make it backfillable: it records " <>
+      "a lifecycle entry, after which backfill refuses with `story_entered_lifecycle`."
   end
 
   @doc """
@@ -352,7 +362,14 @@ defmodule LoopctlWeb.StoryVerificationController do
 
     with :ok <- validate_orchestrator_agent_linked(api_key) do
       tenant_id = api_key.tenant_id
-      opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
+
+      opts =
+        Keyword.merge(AuditContext.from_conn(conn),
+          orchestrator_agent_id: api_key.agent_id,
+          # Reject is a custody decision (terminal `:rejected` + auto-reset), so it
+          # takes the same server-resolved caller lineage verify does.
+          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+        )
 
       case Progress.reject_story(tenant_id, story_id, params, opts) do
         {:ok, story} ->
@@ -462,7 +479,15 @@ defmodule LoopctlWeb.StoryVerificationController do
 
     with :ok <- validate_orchestrator_agent_linked(api_key) do
       tenant_id = api_key.tenant_id
-      opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
+
+      opts =
+        Keyword.merge(AuditContext.from_conn(conn),
+          orchestrator_agent_id: api_key.agent_id,
+          # verify-all forwards these opts to verify_story/4 per story, so omitting
+          # the caller's lineage skipped the whole L4 comparison on the WIDER-blast-
+          # radius path while the single-story route enforced it.
+          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+        )
 
       {:ok, result} = Progress.verify_all_in_epic(tenant_id, epic_id, params, opts)
       json(conn, result)

@@ -120,10 +120,16 @@ defmodule Loopctl.Custody.CustodyObservabilityTest do
          %{tenant: tenant, agent: agent} do
       # Same agent_id, two dispatches: one enrolled (signs), one bearer. The single-story
       # gate already refuses the bearer one; the bulk gate must not be the softer door.
+      #
+      # It answers with the SINGLE-STORY code, not the bulk one: the bulk message says
+      # "your dispatch is enrolled" (false here) and sends the caller to a single-story
+      # path that 403s the same bearer key — a dead end that also misdescribes the
+      # caller's own credential. `:agent_enrollment_required` is true of this caller and
+      # its remedy (use the enrolled dispatch) actually leads somewhere.
       CustodyEnrollment.enroll_root(tenant.id, %{agent_id: agent.id, role: :orchestrator})
       bearer = bearer_dispatch(tenant.id, agent.id)
 
-      assert {:error, :bulk_signature_unsupported} =
+      assert {:error, :agent_enrollment_required} =
                SignedProfilePolicy.verify_bulk_request(:signed, tenant.id, bearer.api_key_id)
     end
 

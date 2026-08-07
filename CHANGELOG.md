@@ -67,11 +67,16 @@ All notable changes to loopctl are documented here.
   itself minted by a dispatch sends no `parent_dispatch_id` (only a key no dispatch minted —
   the tenant's operator key, rooted in the human anchor — may start a lineage tree), and
   `parent_outside_caller_lineage` when the named parent is not the caller's own dispatch or a
-  descendant of it. **What changed for clients:** a sub-agent that used to mint a fresh root
-  must now pass its own dispatch id as `parent_dispatch_id`; anything minting on behalf of the
-  whole tenant must use the tenant's operator key. Existing lineages are unaffected, and a
-  tenant can still hold several roots — which is what keeps an independently-rooted verifier
-  available for selection.
+  descendant of it. "Operator key" is decided POSITIVELY — `role: :user` AND not minted by a
+  dispatch — because an absent lineage also describes a legacy long-lived key. **What changed
+  for clients:** a sub-agent that used to mint a fresh root must now pass its own dispatch id as
+  `parent_dispatch_id` (the 403 body returns it as `remediation.your_dispatch_id`); a legacy
+  `LOOPCTL_ORCH_KEY` can no longer mint a root at all — use the tenant's `user`-role operator
+  key. **Operators must mint at least two roots**: verification is root-separated, so a tenant
+  whose dispatches all descend from one root has no principal that can verify — selection
+  reports `no_independent_root` and the verify gate answers `self_verify_blocked`. Both refusals
+  are logged as `lineage_ceiling_refused` and emit
+  `[:loopctl, :custody, :lineage_ceiling_refused]`.
 
 - **Verifier selection is seeded from a server-side secret.** The rotating verifier's index was
   derived from the tenant's audit signing PUBLIC key, which `/.well-known/loopctl` serves
@@ -81,20 +86,37 @@ All notable changes to loopctl are documented here.
   a tenant whose audit signing key is not provisioned (or an unreachable secret store) now has
   no seed and none is invented — selection fails closed, the story is flagged `verifier_needed`,
   and a `verifier_not_assigned` entry with reason `verifier_seed_unavailable` is written to the
-  audit chain plus an `audit_chain_append_failed`-style error log. Verification itself is
-  unaffected: the verify gate enforces lineage separation independently. Provision the tenant's
-  audit key to restore automatic selection.
+  audit chain plus an `audit_chain_append_failed`-style error log and a
+  `[:loopctl, :custody, :verifier_seed_unavailable]` telemetry counter — alert on it, since a
+  secret-store outage fires it on every request-review deployment-wide. Verification itself is
+  unaffected: the verify gate enforces lineage separation independently, and now refuses an
+  unlineaged caller outright on a dispatch-minted story rather than falling back to agent-id
+  inequality. Provision the tenant's audit key to restore automatic selection.
 
 - **Backfill can no longer be used to certify work that ran inside loopctl.** `POST
   /stories/:id/backfill` (and the bulk `mark-complete`) refused stories carrying dispatch
   markers, but `force-unclaim` clears `assigned_agent_id`, and a story claimed with a key that
   no dispatch minted never records an implementer dispatch — so a worked story could be
   returned to a state indistinguishable from pre-loopctl work and then marked verified with no
-  report, review record or independent verifier. Both paths now also consult the append-only
-  audit log and refuse a story that ever recorded a lifecycle transition, with a new 422
-  (`story_entered_lifecycle`). Imported and never-dispatched work — the case backfill exists
-  for — is unaffected. Backfill is additionally mounted on the LCP-1 signed-claim gate, so
-  under the `signed` custody profile an enrolled caller must sign it exactly as for `verify`.
+  report, review record or independent verifier. Unclaim and force-unclaim now stamp a durable
+  `metadata.lifecycle_entered_at` on the story, and both paths refuse a story carrying it — or
+  a lifecycle entry in the audit log — with a new 422 (`story_entered_lifecycle`). The row stamp
+  is the durable half deliberately: `audit_log` is partitioned and pruned at
+  `AUDIT_RETENTION_DAYS` (default 90), so an audit-only guard would have reopened this path on a
+  timer. Imported and never-dispatched work — the case backfill exists for — is unaffected.
+  Backfill is additionally mounted on the LCP-1 signed-claim gate, so under the `signed` custody
+  profile an enrolled caller must sign it exactly as for `verify`, and the verified claim is
+  recorded in the hash-chained audit log (§9.4) as it is for `verify`.
+
+- **The caller's dispatch lineage is now compared on every custody path, not just single-story
+  verify.** `POST /epics/:id/verify-all`, `POST /stories/:id/reject` and the bulk verify/reject
+  endpoints reached the same terminal states while comparing only story fields, so an
+  orchestrator dispatched inside the implementer's own lineage cleared them where
+  `POST /stories/:id/verify` returned `409 self_verify_blocked`. All four now resolve the
+  caller's lineage server-side from the authenticating key. **What changed for clients:** calls
+  that were previously accepted from inside the implementer's lineage now return
+  `409 self_verify_blocked` (bulk: a per-story error entry) — use an independently-rooted
+  verifier dispatch.
 
 ## [Unreleased] — 2026-07-24 — Self-hosting: fresh-install fixes, multilingual search, at-rest ingestion encryption
 

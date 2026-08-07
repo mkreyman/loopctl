@@ -6,9 +6,13 @@ defmodule LoopctlWeb.DispatchLineageCeilingTest do
   A parentless dispatch starts a new lineage tree that shares no root with anything
   else, which is exactly the shape the L4 custody gates read as "an unrelated
   principal". A caller able to mint one on demand can hand itself separation from its
-  own work, so only a key that no dispatch minted — the tenant's operator key, rooted
-  in the human anchor — may start a tree. Naming someone else's dispatch as parent is
-  the same escape one step out, since every dispatch id is enumerable.
+  own work, so only the tenant's OPERATOR key — a `user`-role key that no dispatch
+  minted, rooted in the human anchor — may start a tree. Naming someone else's dispatch
+  as parent is the same escape one step out, since every dispatch id is enumerable.
+
+  "Operator" is a POSITIVE test, not the absence of a lineage: `lineage_for_api_key/2`
+  also returns [] for a legacy long-lived `:orchestrator` key, and treating that as the
+  operator left it able to hand itself an independently-rooted dispatch.
   """
   use LoopctlWeb.ConnCase, async: true
 
@@ -16,11 +20,12 @@ defmodule LoopctlWeb.DispatchLineageCeilingTest do
 
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
 
-  # `:create` is orchestrator-role + human-anchored. The api_key fixture is a plain
-  # tenant key — no dispatch minted it, so its lineage is [] (the operator shape).
+  # `:create` is orchestrator-role+ and human-anchored. The operator key is the
+  # `role: :user` key the signup ceremony mints — no dispatch minted it, so its
+  # lineage is [].
   defp operator_ctx do
     tenant = fixture(:tenant, %{trust_tier: :human_anchored})
-    {operator_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+    {operator_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
     agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
     %{tenant: tenant, operator_key: operator_key, agent: agent}
   end
@@ -46,7 +51,7 @@ defmodule LoopctlWeb.DispatchLineageCeilingTest do
 
     test "a dispatch-minted key may NOT start a second, independent tree" do
       ctx = operator_ctx()
-      %{"api_key" => %{"raw_key" => dispatched_key}} = mint_root(ctx)
+      %{"dispatch" => root, "api_key" => %{"raw_key" => dispatched_key}} = mint_root(ctx)
 
       conn =
         build_conn()
@@ -55,6 +60,24 @@ defmodule LoopctlWeb.DispatchLineageCeilingTest do
           "role" => "orchestrator",
           "agent_id" => ctx.agent.id
         })
+
+      error = json_response(conn, 403)["error"]
+      assert error["code"] == "root_dispatch_forbidden"
+
+      # The refusal tells the caller to mint under its OWN dispatch, so it has to be
+      # able to name it. Nothing else on this API identifies which row is the caller's.
+      assert error["remediation"]["your_dispatch_id"] == root["id"]
+    end
+
+    test "a LEGACY orchestrator key is not the operator and may NOT start a tree" do
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {legacy_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      conn =
+        build_conn()
+        |> auth(legacy_key)
+        |> post(~p"/api/v1/dispatches", %{"role" => "orchestrator", "agent_id" => agent.id})
 
       assert json_response(conn, 403)["error"]["code"] == "root_dispatch_forbidden"
     end

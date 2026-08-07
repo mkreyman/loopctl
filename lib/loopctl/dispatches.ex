@@ -653,7 +653,7 @@ defmodule Loopctl.Dispatches do
   Selects a verifier dispatch from the eligible pool for a story.
 
   Eligible dispatches: active, non-expired, non-revoked, in the same tenant,
-  whose lineage does NOT share a prefix with the implementer's lineage.
+  whose lineage does NOT share a ROOT with the implementer's lineage.
 
   Selection is deterministic but unpredictable to the caller: the index is drawn
   from an HMAC keyed by the tenant's audit signing PRIVATE key (`verifier_seed/2`).
@@ -665,34 +665,29 @@ defmodule Loopctl.Dispatches do
   pool. The Elixir `Enum.reject` is kept as a belt-and-braces filter for the rows
   the SQL predicate cannot express (e.g. a NULL/empty lineage_path).
 
-  Returns `{:ok, dispatch}`, `{:error, :no_eligible_verifier}`, or
-  `{:error, :verifier_seed_unavailable}` when no server-side seed secret can be
-  read (see `verifier_seed/2` — that case fails CLOSED rather than selecting).
+  Returns `{:ok, dispatch}` or:
+
+    * `{:error, :no_independent_root}` — the tenant HAS active dispatches, but every
+      one of them descends from the implementer's root. Only the operator key may
+      start a tree (`LoopctlWeb.DispatchController`'s lineage ceiling), so a tenant
+      that minted ONE root has no principal that can verify: `verify_story/4`
+      root-separation 409s every dispatch-minted caller. That is L4 working, not a
+      pool miss — it is reported separately so `verifier_needed` names the actual
+      remedy (have the operator mint an independently-rooted verifier tree) instead
+      of looking like a transient shortage.
+    * `{:error, :no_eligible_verifier}` — no active candidate dispatches at all.
+    * `{:error, :verifier_seed_unavailable}` — no server-side seed secret can be read
+      (see `verifier_seed/2` — that case fails CLOSED rather than selecting).
   """
   @spec select_verifier(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
-          {:ok, Dispatch.t()} | {:error, :no_eligible_verifier | :verifier_seed_unavailable}
+          {:ok, Dispatch.t()}
+          | {:error, :no_eligible_verifier | :no_independent_root | :verifier_seed_unavailable}
   def select_verifier(tenant_id, story_id, implementer_lineage) do
-    now = DateTime.utc_now()
+    case verifier_pool(tenant_id, implementer_lineage) do
+      {:error, reason} ->
+        {:error, reason}
 
-    candidates =
-      from(d in Dispatch,
-        where:
-          d.tenant_id == ^tenant_id and
-            is_nil(d.revoked_at) and
-            d.expires_at > ^now and
-            d.role in [:orchestrator, :agent],
-        order_by: [asc: d.created_at],
-        limit: @verifier_pool_limit
-      )
-      |> reject_same_root(implementer_lineage)
-      |> AdminRepo.all()
-      |> Enum.reject(fn d -> lineage_shares_prefix?(d.lineage_path, implementer_lineage) end)
-
-    case candidates do
-      [] ->
-        {:error, :no_eligible_verifier}
-
-      pool ->
+      {:ok, pool} ->
         case verifier_seed(tenant_id, story_id) do
           {:ok, <<index_seed::unsigned-64, _rest::binary>>} ->
             {:ok, Enum.at(pool, rem(index_seed, length(pool)))}
@@ -704,6 +699,45 @@ defmodule Loopctl.Dispatches do
   end
 
   # --- Private ---
+
+  # An empty pool has two causes with DIFFERENT remedies, and reporting both as
+  # `:no_eligible_verifier` hid the one an operator has to act on: "wait for a
+  # dispatch" versus "mint an independently-rooted verifier tree". Distinguish them
+  # with one extra COUNT, paid only when the pool came back empty.
+  defp verifier_pool(tenant_id, implementer_lineage) do
+    case candidate_query(tenant_id)
+         |> reject_same_root(implementer_lineage)
+         |> AdminRepo.all()
+         |> Enum.reject(&lineage_shares_prefix?(&1.lineage_path, implementer_lineage)) do
+      [] ->
+        any_candidate? =
+          candidate_query(tenant_id)
+          |> exclude(:order_by)
+          |> exclude(:limit)
+          |> AdminRepo.exists?()
+
+        if any_candidate?,
+          do: {:error, :no_independent_root},
+          else: {:error, :no_eligible_verifier}
+
+      pool ->
+        {:ok, pool}
+    end
+  end
+
+  defp candidate_query(tenant_id) do
+    now = DateTime.utc_now()
+
+    from(d in Dispatch,
+      where:
+        d.tenant_id == ^tenant_id and
+          is_nil(d.revoked_at) and
+          d.expires_at > ^now and
+          d.role in [:orchestrator, :agent],
+      order_by: [asc: d.created_at],
+      limit: @verifier_pool_limit
+    )
+  end
 
   # The selection index MUST NOT be derivable by the principals it selects between.
   # The candidate pool is enumerable by any agent key (GET /api/v1/dispatches), so
@@ -740,6 +774,15 @@ defmodule Loopctl.Dispatches do
             "story is flagged verifier_needed. Provision the tenant's audit signing key."
         )
 
+        # A secret-store outage makes this fire on EVERY request-review, deployment-wide,
+        # and the only other trace is a log line. Emit a counter so the state is alertable
+        # rather than something an operator discovers from unverifiable stories later.
+        :telemetry.execute(
+          [:loopctl, :custody, :verifier_seed_unavailable],
+          %{count: 1},
+          %{tenant_id: tenant_id, story_id: story_id}
+        )
+
         :error
     end
   end
@@ -751,8 +794,15 @@ defmodule Loopctl.Dispatches do
   defp reject_same_root(query, []), do: query
 
   defp reject_same_root(query, [root | _]) do
+    # `type(^root, Ecto.UUID)` is load-bearing: a bare `^root` inside a fragment
+    # comparison carries no type, so Postgrex received the 36-char string for a
+    # uuid[] element and raised — which meant this branch crashed for EVERY story
+    # that had an implementer dispatch (the only way to reach it with a non-empty
+    # lineage).
     from(d in query,
-      where: is_nil(fragment("?[1]", d.lineage_path)) or fragment("?[1]", d.lineage_path) != ^root
+      where:
+        is_nil(fragment("?[1]", d.lineage_path)) or
+          fragment("?[1]", d.lineage_path) != type(^root, Ecto.UUID)
     )
   end
 

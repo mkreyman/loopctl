@@ -227,9 +227,18 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
   bulk gate is strictly WEAKER than the single-story gate it mirrors — an agent that
   had migrated to signing could take its BEARER dispatch to verify-all and clear a
   whole epic unsigned, which is the exact bypass this function exists to close.
+
+  The two cases answer with DIFFERENT codes because their remedies differ, and each
+  message must be true of the caller it is sent to. An ENROLLED dispatch gets
+  `:bulk_signature_unsupported` ("verify each story individually") — its next call
+  succeeds. A BEARER dispatch gets `:agent_enrollment_required` ("use your enrolled
+  dispatch") exactly as on the single-story path; answering it
+  `:bulk_signature_unsupported` told it "your dispatch is enrolled with an agent key"
+  (false) and sent it to a single-story path that then 403s the same bearer key —
+  a dead end wrapped in a misdescription of its own credential.
   """
   @spec verify_bulk_request(:bearer | :signed, Ecto.UUID.t(), Ecto.UUID.t() | nil) ::
-          :ok | {:error, :bulk_signature_unsupported}
+          :ok | {:error, :bulk_signature_unsupported | :agent_enrollment_required}
   def verify_bulk_request(:bearer, _tenant_id, _api_key_id), do: :ok
 
   def verify_bulk_request(:signed, tenant_id, api_key_id) do
@@ -238,12 +247,8 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
         {:error, :bulk_signature_unsupported}
 
       {:ok, %{agent_id: agent_id}} when is_binary(agent_id) ->
-        # A bearer dispatch for an agent that HAS opted into signing. The single-story
-        # path answers `:agent_enrollment_required` ("use your enrolled dispatch"), but
-        # here that remedy leads nowhere — the enrolled dispatch is refused too — so
-        # name the terminal remedy directly: verify each story individually.
         if Dispatches.agent_has_enrolled_key?(tenant_id, agent_id) do
-          {:error, :bulk_signature_unsupported}
+          {:error, :agent_enrollment_required}
         else
           :ok
         end
