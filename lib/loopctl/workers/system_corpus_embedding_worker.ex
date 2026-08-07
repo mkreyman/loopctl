@@ -125,14 +125,36 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
     embed_entries(tenant_id, dim, entries)
   end
 
-  defp embed_entries(tenant_id, dim, []), do: continue(tenant_id, dim)
-
   # Through `ShrinkLadder.embed_batch/3` (#617). An input-too-long rejection used to
   # reach `handle_error/2`, where `permanent_provider_error?/1` is `true` for any 4xx —
   # so one over-long canonical DISCARDED the job and left that canonical keyword-only
   # for this tenant while `system_corpus_meta/2` kept reporting "semantic". The ladder
   # bisects to isolate the offender and truncates only it.
+  #
+  # Sub-split by the CUMULATIVE byte budget FIRST (`Knowledge.embedding_batch_max_chars/0`),
+  # exactly as `BatchArticleEmbeddingWorker` does: the count cap does not bound aggregate
+  # tokens, and an AGGREGATE rejection names no member — so without this the ladder would
+  # bisect every batch on every run, paying the whole tree as routine rather than as the
+  # one-time recovery it exists to be. Each sub-batch is stored before the next, so an
+  # error later in the batch keeps what was already paid for (`split_unchanged/3` skips it).
   defp embed_entries(tenant_id, dim, entries) do
+    entries
+    |> ShrinkLadder.chunk_by_bytes(Knowledge.embedding_batch_max_chars(), fn {_a, text} ->
+      text
+    end)
+    |> Enum.reduce_while(:ok, fn chunk, :ok ->
+      case embed_sub_batch(tenant_id, dim, chunk) do
+        :ok -> {:cont, :ok}
+        other -> {:halt, other}
+      end
+    end)
+    |> case do
+      :ok -> continue(tenant_id, dim)
+      other -> other
+    end
+  end
+
+  defp embed_sub_batch(tenant_id, dim, entries) do
     texts = Enum.map(entries, fn {_a, text} -> text end)
 
     result =
@@ -182,24 +204,22 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
     end
   end
 
+  # Returns `:ok` WITHOUT continuing: `embed_entries/3` drives the sub-batches and calls
+  # `continue/2` once, after the last one — continuing here would enqueue the next page
+  # per sub-batch.
   defp do_store_all(tenant_id, dim, pairs) do
-    result =
-      Enum.reduce_while(pairs, :ok, fn {{article, text}, vector}, :ok ->
-        case Embeddings.materialize_system_article_embedding(
-               tenant_id,
-               article,
-               vector,
-               content_hash(text),
-               dim
-             ) do
-          {:ok, _row} -> {:cont, :ok}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
-      end)
-
-    with :ok <- result do
-      continue(tenant_id, dim)
-    end
+    Enum.reduce_while(pairs, :ok, fn {{article, text}, vector}, :ok ->
+      case Embeddings.materialize_system_article_embedding(
+             tenant_id,
+             article,
+             vector,
+             content_hash(text),
+             dim
+           ) do
+        {:ok, _row} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp discard_mismatch(expected, actual) do

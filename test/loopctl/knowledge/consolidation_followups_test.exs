@@ -152,6 +152,25 @@ defmodule Loopctl.Knowledge.ConsolidationFollowupsTest do
       assert dup.fingerprint == dup2.fingerprint
       assert length(dup.evidence) == length(dup.article_ids)
     end
+
+    test "member truncation is REPORTED, not just logged" do
+      # `truncated` is the operator-facing answer to "did this class see the whole
+      # picture". Derived from group counts alone it read `false` while the proposal
+      # silently omitted 10 members and its evidence array came up short.
+      tenant = fixture(:tenant)
+
+      for i <- 1..60 do
+        published(tenant.id, %{title: "Cut Report Doc" <> String.duplicate("!", i), body: "b"})
+      end
+
+      assert {:ok, %{summary: %{truncated: %{"duplicate_capture" => true}}}} =
+               Consolidation.analyze(tenant.id)
+
+      # One group, well under the per-class cap: nothing GROUP-level was truncated, so the
+      # flag can only be coming from the member cap.
+      assert {:ok, %{summary: %{by_class: %{"duplicate_capture" => 1}}}} =
+               Consolidation.analyze(tenant.id)
+    end
   end
 
   describe "the apply-time re-check of the GROUPING signal (#617 / handoff gap)" do
@@ -195,6 +214,29 @@ defmodule Loopctl.Knowledge.ConsolidationFollowupsTest do
       assert %{applied: 0, skipped: 1} = Consolidation.apply_confirmed_duplicates(tenant.id)
 
       for a <- [a1, a2, a3, a4], do: assert(status(a.id) == :published)
+    end
+
+    test "a group PARTLY retitled is skipped whole, not applied to the remnant" do
+      # The two-run gate confirmed the FIVE-id fingerprint. Retitling three of them is a
+      # human saying "these are not one capture"; auto-unpublishing the two left over
+      # completes a partial remedy the same night it was made, on a set nothing confirmed.
+      tenant = fixture(:tenant)
+
+      keep = published(tenant.id, %{title: "Partial Doc", body: String.duplicate("long ", 40)})
+      stays = published(tenant.id, %{title: "partial doc.", body: "stays"})
+
+      moved =
+        for i <- 1..3 do
+          published(tenant.id, %{title: "Partial Doc" <> String.duplicate("!", i), body: "m"})
+        end
+
+      confirm_over_two_nights(tenant.id)
+
+      Enum.each(Enum.with_index(moved), fn {a, i} -> retitle!(a, "Unrelated Title #{i}") end)
+
+      assert %{applied: 0, skipped: 1} = Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      for a <- [keep, stays | moved], do: assert(status(a.id) == :published)
     end
 
     test "an intact title-drift group still applies — the re-check is not a blanket block" do

@@ -221,7 +221,29 @@ defmodule Loopctl.Workers.ReembedWorker do
   # BatchArticleEmbeddingWorker answer) is wrong here: that worker writes the ACTIVE
   # dimension with the configured model, not this run's PENDING dimension and pinned
   # model. Bisect-then-ladder keeps both pins and truncates only the offender.
+  #
+  # Sub-split by the CUMULATIVE byte budget first (`Knowledge.embedding_batch_max_chars/0`),
+  # exactly as `BatchArticleEmbeddingWorker` does and for the same reason: the count cap
+  # does not bound aggregate tokens, so 100 x ~32K chars is ~800k tokens against a ~300k
+  # per-request ceiling. That rejection names no member, so the ladder would bisect EVERY
+  # batch EVERY night — paying the whole tree as routine rather than as the one-time
+  # recovery it is for. Each sub-batch is embedded AND STORED before the next, so a
+  # failure later in the run keeps what has already been paid for (the next attempt's
+  # pending set no longer names those rows).
   defp embed_and_store(tenant_id, target_dim, model, entries, opts, store_fun) do
+    entries
+    |> ShrinkLadder.chunk_by_bytes(Knowledge.embedding_batch_max_chars(), fn {_s, text} ->
+      text
+    end)
+    |> Enum.reduce_while(:ok, fn chunk, :ok ->
+      case embed_sub_batch(tenant_id, target_dim, model, chunk, opts, store_fun) do
+        :ok -> {:cont, :ok}
+        other -> {:halt, other}
+      end
+    end)
+  end
+
+  defp embed_sub_batch(tenant_id, target_dim, model, entries, opts, store_fun) do
     texts = Enum.map(entries, fn {_subject, text} -> text end)
     embed_opts = [embedding_model: reembed_model(model)] ++ opts
 

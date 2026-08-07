@@ -4,55 +4,56 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
   `:context_length_exceeded` rejection, for BOTH the single-text and the array
   embedding paths.
 
-  #615 added the ladder to `ArticleEmbeddingWorker` and (via dissolve)
-  `BatchArticleEmbeddingWorker`. Every OTHER embedding write path still mapped an
-  input-too-long rejection onto `Llm.permanent_provider_error?/1`, which is `true`
-  for any 4xx — so the job DISCARDED and the row stayed permanently un-embedded.
-  That is the same shape as the outage #615 fixed, one call site over:
-
-    * `ReembedWorker` — discards mid-run, so the tenant's re-embed never reaches
-      `complete_reembed` and recall stays pinned at the old dimension forever.
-    * `SystemCorpusEmbeddingWorker` — the canonical stays keyword-only for that
-      tenant, with `system_corpus_meta/2` still reporting "semantic".
-    * `MemoryEmbeddingWorker` and the synchronous promotion near-dup read in
-      `Loopctl.Memory` — the memory is invisible to semantic recall, and the
-      near-dup check that guards against duplicate promotions silently degrades.
-    * `Knowledge.ProposalGate` — the novelty gate falls OPEN, so the over-long
-      article skips dedup entirely and lands as the duplicate the nightly
-      consolidation pass then has to catch.
+  #615 added the ladder to the two article workers. Every OTHER embedding write path —
+  `ReembedWorker`, `SystemCorpusEmbeddingWorker`, `MemoryEmbeddingWorker`,
+  `Loopctl.Memory`'s promotion near-dup read, `Knowledge.ProposalGate` — still mapped an
+  input-too-long rejection onto `Llm.permanent_provider_error?/1`, which is `true` for
+  any 4xx, so the job DISCARDED and the row stayed permanently un-embedded.
 
   ## Single text: halve what was SENT
 
   `embed_one/3` re-truncates the bytes ACTUALLY SENT and re-sends, exactly as
-  `ArticleEmbeddingWorker` does. Deriving the next rung from a nominal budget
-  instead would let a budget larger than the text truncate nothing and buy a
-  byte-identical rejection.
+  `ArticleEmbeddingWorker` does — deriving the next rung from a nominal budget would let
+  a budget larger than the text truncate nothing and buy a byte-identical rejection.
+
+  A shrunk result comes back as `{:ok, vector, :truncated}`, never as a bare
+  `{:ok, vector}`. The vector covers a PREFIX, so it is NOT comparable with corpus
+  vectors built from whole texts — `ProposalGate` may not call a proposal a duplicate
+  on one, and `Memory` may not supersede a prior memory on one. A truncation the
+  caller cannot see is a truncation it silently judges against.
 
   ## An array: BISECT, then ladder the singleton
 
   A provider rejects the whole array and never says which member was over-long.
   Shrinking every text would truncate articles that were never over the limit;
-  re-sending the array buys an identical rejection forever.
+  re-sending the array buys an identical rejection forever. So `embed_batch/3` splits
+  the array in half and embeds each half independently, recursing until the rejection
+  isolates to ONE text — which then walks the ladder. Only the offender is truncated.
+  (`BatchArticleEmbeddingWorker` DISSOLVES to per-article jobs instead, which is the
+  better answer only where such a worker shares this one's dimension and model.)
 
-  So `embed_batch/3` splits the array in half and embeds each half independently,
-  recursing until the rejection isolates to ONE text — which then walks the ladder.
-  Only the offending text is truncated; its innocent neighbours are re-sent whole.
-  This costs extra provider calls (~2·log2(n)), but ONLY on a batch that already
-  failed, and only in place of a discard.
-
-  `BatchArticleEmbeddingWorker` solves the same problem by DISSOLVING to
-  per-article jobs. That is the better answer where a per-item worker exists at the
-  same dimension and model; it does not here — `ReembedWorker` embeds at a PENDING
-  dimension with a pinned model, and re-enqueueing through `ArticleEmbeddingWorker`
-  would write the ACTIVE dimension instead.
+  That costs ~2·log2(n) extra calls only when exactly ONE member is over-long; with k
+  offenders it is ~2k·log2(n/k), degenerating towards 2n-1 when most of the batch
+  overflows — the measured #615 corpus, not a hypothetical. A batch is therefore
+  bounded twice: the caller pre-splits with `chunk_by_bytes/3` (an AGGREGATE rejection
+  must never be answered by bisecting — every half fails too, so the batch pays the
+  whole tree on every run instead of once), and `:max_calls` bounds what one
+  already-failing batch may spend.
   """
 
   require Logger
 
   alias Loopctl.Embeddings.TextBudget
 
+  # What ONE `embed_batch/3` may spend in provider calls. The bisect's own bound is ~2n
+  # with n up to `Knowledge.embedding_batch_max/0` — hundreds of sequential calls, each
+  # with its own yield budget, inside one Oban job. A batch that blows this is no longer
+  # a length problem the bisect can fix, so it surfaces the provider error exactly as an
+  # exhausted rung does.
+  @default_max_calls 64
+
   @type vector :: [float()]
-  @type one_result :: {:ok, vector()} | {:error, term()}
+  @type one_result :: {:ok, vector()} | {:ok, vector(), :truncated} | {:error, term()}
   @type batch_result :: {:ok, [vector()]} | {:error, term()}
 
   @doc """
@@ -62,6 +63,10 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
   guarded embedding client returns. Every non-`:context_length_exceeded` result —
   success, egress refusal, circuit-open, throttle — is passed through untouched, so
   the caller's existing error handling is unchanged.
+
+  A result the ladder had to shrink is `{:ok, vector, :truncated}`: the vector covers
+  a prefix, and a caller that COMPARES it against whole-text vectors must not treat it
+  as authoritative (see the moduledoc).
 
   On an exhausted ladder the ORIGINAL error is returned, so the caller discards it
   as the different defect it is (a much smaller model window, e.g. a self-hosted
@@ -79,19 +84,44 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
     end
   end
 
+  # `:max_rungs` (default unbounded) caps how many times ONE text may be halved. A
+  # SYNCHRONOUS caller pays each rung in request latency and in an embedding admission
+  # slot that interactive search shares, so `ProposalGate` spends one and then accepts
+  # its own fail-open — the background worker walks the full ladder for that row anyway.
   defp shrink_one(text, embed_fun, opts, error) do
     sent = byte_size(text)
+    rungs = Keyword.get(opts, :max_rungs, :infinity)
 
     case TextBudget.next_budget(sent) do
       :exhausted ->
         log_exhausted(opts, sent)
         error
 
+      _smaller when rungs == 0 ->
+        Logger.warning(
+          "#{label(opts)}: still too long at #{sent} bytes with the rung budget spent; " <>
+            "surfacing the provider error rather than spending another round trip."
+        )
+
+        error
+
       smaller ->
         log_shrink(opts, sent, smaller)
-        embed_one(TextBudget.truncate(text, smaller), embed_fun, opts)
+
+        text
+        |> TextBudget.truncate(smaller)
+        |> embed_one(embed_fun, spend_rung(opts, rungs))
+        |> mark_truncated()
     end
   end
+
+  defp spend_rung(opts, :infinity), do: opts
+  defp spend_rung(opts, rungs), do: Keyword.put(opts, :max_rungs, rungs - 1)
+
+  # A vector produced from a shrunk text is tagged ONCE, at the rung that shrank it; a
+  # deeper rung has already tagged its own, so the pass-through clause keeps it.
+  defp mark_truncated({:ok, vector}), do: {:ok, vector, :truncated}
+  defp mark_truncated(other), do: other
 
   @doc """
   Embed an ARRAY of texts through `embed_fun`, bisecting on a context-length
@@ -106,6 +136,9 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
   `{:error, :embedding_batch_length_mismatch}`, matching what the call sites
   already did inline, so a contract violation cannot be zipped into misattributed
   vectors.
+
+  `:max_calls` (default #{@default_max_calls}) bounds the provider calls one batch
+  may spend across the whole bisect.
   """
   @spec embed_batch([String.t()], ([String.t()] -> batch_result()), keyword()) :: batch_result()
   def embed_batch(texts, embed_fun, opts \\ [])
@@ -114,40 +147,59 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
 
   def embed_batch(texts, embed_fun, opts)
       when is_list(texts) and is_function(embed_fun, 1) do
+    budget = Keyword.get(opts, :max_calls, @default_max_calls)
+    {result, _left} = run_batch(texts, embed_fun, opts, budget)
+    result
+  end
+
+  # Every result carries the REMAINING call budget, so the two halves of a bisect share
+  # one budget: a per-branch one would multiply with the depth and bound nothing.
+  defp run_batch(texts, embed_fun, opts, budget) do
     case embed_fun.(texts) do
-      {:ok, vectors} when length(vectors) == length(texts) ->
-        {:ok, vectors}
+      {:ok, v} when length(v) == length(texts) ->
+        {{:ok, v}, budget - 1}
 
       {:ok, _mismatch} ->
-        {:error, :embedding_batch_length_mismatch}
+        {{:error, :embedding_batch_length_mismatch}, budget - 1}
 
-      {:error, {:api_error, _status, :context_length_exceeded}} = error ->
-        shrink_batch(texts, embed_fun, opts, error)
+      {:error, {:api_error, _s, :context_length_exceeded}} = e ->
+        shrink(texts, embed_fun, opts, e, budget - 1)
 
       other ->
-        other
+        {other, budget - 1}
     end
   end
 
+  defp shrink(texts, _embed_fun, opts, error, budget) when budget <= 0 do
+    Logger.warning(
+      "#{label(opts)}: giving up on a batch of #{length(texts)} after #{@default_max_calls} " <>
+        "provider calls — most of it is over-long, which no bisect can fix; surfacing the " <>
+        "provider error. Split by bytes (`chunk_by_bytes/3`) before sending."
+    )
+
+    {error, 0}
+  end
+
   # Isolated to ONE text: this is the member the provider was rejecting, so ladder it.
-  defp shrink_batch([text], embed_fun, opts, error) do
+  defp shrink([text], embed_fun, opts, error, budget) do
     sent = byte_size(text)
 
     case TextBudget.next_budget(sent) do
       :exhausted ->
         log_exhausted(opts, sent)
-        error
+        {error, budget}
 
       smaller ->
         log_shrink(opts, sent, smaller)
-        embed_batch([TextBudget.truncate(text, smaller)], embed_fun, opts)
+        run_batch([TextBudget.truncate(text, smaller)], embed_fun, opts, budget)
     end
   end
 
   # More than one member: the provider named none of them, so split and let each
   # half answer for itself. `div(length, 2)` is >= 1 here (length >= 2), so both
-  # halves are strictly smaller and the recursion terminates.
-  defp shrink_batch(texts, embed_fun, opts, _error) do
+  # halves are strictly smaller and the recursion terminates. A `with` else-less
+  # fallthrough returns the failing `{result, budget}` pair unchanged.
+  defp shrink(texts, embed_fun, opts, _error, budget) do
     {left, right} = Enum.split(texts, div(length(texts), 2))
 
     Logger.warning(
@@ -156,10 +208,35 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
         "isolate it. Only the over-long text will be truncated."
     )
 
-    with {:ok, left_vectors} <- embed_batch(left, embed_fun, opts),
-         {:ok, right_vectors} <- embed_batch(right, embed_fun, opts) do
-      {:ok, left_vectors ++ right_vectors}
+    with {{:ok, lv}, left_budget} <- run_batch(left, embed_fun, opts, budget),
+         {{:ok, rv}, spent} <- run_batch(right, embed_fun, opts, left_budget) do
+      {{:ok, lv ++ rv}, spent}
     end
+  end
+
+  @doc """
+  Split `items` into groups whose cumulative text stays at/under `max_bytes`, so the
+  ladder is reserved for a genuinely over-long MEMBER (see the moduledoc). An item
+  larger than the budget forms its own group rather than wedging into an empty one.
+  """
+  @spec chunk_by_bytes([item], pos_integer(), (item -> String.t())) :: [[item]] when item: term()
+  def chunk_by_bytes(items, max_bytes, text_fun) do
+    chunk_fun = fn item, {acc, size} ->
+      len = byte_size(text_fun.(item))
+
+      cond do
+        acc == [] -> {:cont, {[item], len}}
+        size + len > max_bytes -> {:cont, Enum.reverse(acc), {[item], len}}
+        true -> {:cont, {[item | acc], size + len}}
+      end
+    end
+
+    after_fun = fn
+      {[], _size} -> {:cont, [], {[], 0}}
+      {acc, _size} -> {:cont, Enum.reverse(acc), {[], 0}}
+    end
+
+    Enum.chunk_while(items, {[], 0}, chunk_fun, after_fun)
   end
 
   defp log_shrink(opts, sent, smaller) do

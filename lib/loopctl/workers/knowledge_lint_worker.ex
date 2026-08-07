@@ -214,6 +214,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     })
 
     Logger.info(
+      # The #616 content gate is the single most likely reason a night applied nothing, and
+      # without this counter that night is byte-identical to a clean corpus in both this
+      # line and the audit event.
       "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
         "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
         "conflicts_promoted=#{promoted} conflicts_judged_redundant=#{judged} " <>
@@ -222,6 +225,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "duplicates_unpublished=#{applied.applied} duplicate_groups_skipped=#{applied.skipped} " <>
         "duplicate_apply_gate=#{applied.gate} " <>
         "duplicates_unpublish_failed=#{applied.failed} " <>
+        "duplicate_groups_uncorroborated=#{applied.uncorroborated} " <>
         consolidation_log(consolidation)
     )
 
@@ -683,7 +687,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # `:scan_failed` path guard the `:apply_failed` one, which needs a repo-level failure to
   # provoke.
   defp empty_tally(gate, error \\ nil),
-    do: %{applied: 0, skipped: 0, failed: 0, gate: gate, error: error}
+    do: %{applied: 0, skipped: 0, failed: 0, uncorroborated: 0, gate: gate, error: error}
 
   # Writes the consolidation report + its proposal rows and nothing else. The APPLY is a
   # separate step (`apply_consolidation/2`, above) on purpose: this one must run first so
@@ -749,6 +753,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       "duplicates_unpublished" => applied.applied,
       "duplicate_groups_skipped" => applied.skipped,
       "duplicates_unpublish_failed" => applied.failed,
+      # Groups the #616 corroboration gate WITHHELD (title collision, bodies do not agree,
+      # or the members carry no vectors yet). Without it, a tenant whose every confirmed
+      # group is withheld records applied=0 skipped=0 failed=0 gate=open — exactly what a
+      # clean corpus records — and only per-group warnings say otherwise.
+      "duplicate_groups_uncorroborated" => applied.uncorroborated,
       # WHY nothing was applied, when nothing was. `:open` with zeroes is a clean corpus;
       # `:report_gap` / `:insufficient_history` mean the agreement gate refused to run,
       # `:drain_disabled` means an operator set a cap to 0, and `:apply_failed` means it ran

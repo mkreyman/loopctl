@@ -148,11 +148,12 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
     # of the FULL text, so a truncated embed still satisfies the idempotency guard
     # instead of re-billing every enqueue.
     result =
-      ShrinkLadder.embed_one(
-        text,
+      text
+      |> ShrinkLadder.embed_one(
         &embed_with_custody(tenant_id, memory_id, &1, project_id),
         label: "MemoryEmbeddingWorker tenant=#{tenant_id} memory=#{memory_id}"
       )
+      |> store_prefix_too()
 
     case result do
       {:ok, embedding} ->
@@ -228,6 +229,13 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
 
   defp custody_outcome({:ok, _}), do: :succeeded
   defp custody_outcome(_other), do: :failed
+
+  # A PREFIX vector (`:truncated`) is stored like any other: recall over part of an
+  # over-long memory is the whole point of the ladder here, and nothing on this path
+  # compares the vector against a whole-text one — unlike the promotion near-dup read,
+  # which refuses a prefix outright (`Memory.nearest_live/2`).
+  defp store_prefix_too({:ok, embedding, :truncated}), do: {:ok, embedding}
+  defp store_prefix_too(result), do: result
 
   defp store(tenant_id, memory_id, embedding, content_hash) do
     # Pre-write dimension check (review): an off-dimension model otherwise surfaced as a

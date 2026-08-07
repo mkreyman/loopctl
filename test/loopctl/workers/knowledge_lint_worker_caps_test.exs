@@ -19,6 +19,10 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.AdminRepo
+  alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.Consolidation
   alias Loopctl.SystemConfig
   alias Loopctl.Workers.KnowledgeLintWorker
 
@@ -26,6 +30,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
     knowledge_consolidation_max_applies
     knowledge_consolidation_max_unpublishes
     knowledge_consolidation_max_per_class
+    knowledge_consolidation_min_duplicate_similarity_pct
   )
 
   setup do
@@ -80,6 +85,44 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
       assert KnowledgeLintWorker.unpublishes_cap() == 0
     end
   end
+
+  describe "the duplicate-similarity threshold is the same kind of lever" do
+    test "a DB row moves the content gate live, with no redeploy" do
+      # This threshold decides whether the only self-writing class applies anything at all.
+      # Until #617 it was `Application.get_env/3` only, so an operator watching an
+      # auto-unpublish behave wrong could move it only by deploying.
+      tenant = fixture(:tenant)
+      winner = publish!(tenant.id, "Lever Doc", String.duplicate("long ", 40))
+      loser = publish!(tenant.id, "lever doc!", "short")
+
+      # Orthogonal vectors: cosine 0, so the default 0.80 threshold withholds the group.
+      embed!(tenant.id, winner, [1.0 | List.duplicate(0.0, 1535)])
+      embed!(tenant.id, loser, [0.0, 1.0 | List.duplicate(0.0, 1534)])
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      assert %{applied: 0, uncorroborated: 1} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      {:ok, _} = SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", 0)
+
+      assert %{applied: 1, uncorroborated: 0} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert AdminRepo.get!(Article, loser).status == :draft
+    end
+  end
+
+  defp publish!(tenant_id, title, body) do
+    fixture(:article, %{tenant_id: tenant_id, title: title, body: body, category: :pattern})
+    |> Ecto.Changeset.change(%{status: :published})
+    |> AdminRepo.update!()
+    |> Map.fetch!(:id)
+  end
+
+  defp embed!(tenant_id, id, vector),
+    do: {:ok, _} = Knowledge.update_embedding(tenant_id, id, vector, nil)
 
   describe "coerce_int/2 — the app-config layer is type-checked, not trusted" do
     test "a non-integer resolves to the default rather than raising" do

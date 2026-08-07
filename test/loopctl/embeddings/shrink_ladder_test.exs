@@ -58,7 +58,7 @@ defmodule Loopctl.Embeddings.ShrinkLadderTest do
       text = String.duplicate("a", 60_000)
       {fun, calls} = provider(10_000)
 
-      assert {:ok, _} = ShrinkLadder.embed_one(text, fun)
+      assert {:ok, _, :truncated} = ShrinkLadder.embed_one(text, fun)
 
       sent = calls.()
       assert length(sent) > 1, "the ladder never retried"
@@ -103,8 +103,28 @@ defmodule Loopctl.Embeddings.ShrinkLadderTest do
         if byte_size(text) <= 9_000, do: {:ok, vector(text)}, else: @too_long
       end
 
-      assert {:ok, _} = ShrinkLadder.embed_one(String.duplicate("щ", 20_000), fun)
+      assert {:ok, _, :truncated} = ShrinkLadder.embed_one(String.duplicate("щ", 20_000), fun)
       assert Enum.all?(Agent.get(seen, & &1), &String.valid?/1)
+    end
+
+    test "a shrunk vector is TAGGED :truncated and an untouched one is not" do
+      # The tag is what stops `ProposalGate` calling a prefix a duplicate (dropping the
+      # create) and `Memory` superseding a prior memory on one. An untagged prefix is a
+      # prefix the caller compares against whole-text vectors without knowing.
+      {fits, _} = provider(100_000)
+      {shrinks, _} = provider(9_000)
+
+      assert {:ok, _} = ShrinkLadder.embed_one(String.duplicate("a", 20_000), fits)
+      assert {:ok, _, :truncated} = ShrinkLadder.embed_one(String.duplicate("a", 20_000), shrinks)
+    end
+
+    test ":max_rungs bounds the ladder for a SYNCHRONOUS caller" do
+      # Every rung is a provider round trip and an embedding admission slot, paid inside an
+      # article-create request. `ProposalGate` spends one and accepts its own fail-open.
+      {fun, calls} = provider(1_000)
+
+      assert ShrinkLadder.embed_one(String.duplicate("a", 40_000), fun, max_rungs: 1) == @too_long
+      assert length(calls.()) == 2, "the rung budget was not honoured"
     end
   end
 
@@ -176,6 +196,37 @@ defmodule Loopctl.Embeddings.ShrinkLadderTest do
 
       assert {:ok, vectors} = ShrinkLadder.embed_batch(texts, fun)
       assert length(vectors) == 8
+    end
+
+    test ":max_calls bounds what one already-failing batch may spend" do
+      # With k over-long members the bisect is O(n), not the ~2*log2(n) a single offender
+      # costs — hundreds of sequential provider calls inside one Oban job. Past the budget
+      # it surfaces the provider error, exactly as an exhausted rung does.
+      texts = for _ <- 1..16, do: String.duplicate("x", 40_000)
+      {fun, calls} = batch_provider(9_000)
+
+      assert ShrinkLadder.embed_batch(texts, fun, max_calls: 5) == @too_long
+      assert length(calls.()) <= 5
+    end
+  end
+
+  describe "chunk_by_bytes/3" do
+    test "splits by CUMULATIVE bytes, so no array call is rejected on aggregate size" do
+      # An aggregate rejection names no member, so every half is rejected too and the whole
+      # batch pays the bisect tree on EVERY run. Callers pre-split instead.
+      items = for i <- 1..6, do: {i, String.duplicate("a", 400)}
+
+      chunks = ShrinkLadder.chunk_by_bytes(items, 1_000, fn {_i, text} -> text end)
+
+      assert Enum.map(chunks, &length/1) == [2, 2, 2]
+      assert Enum.concat(chunks) == items
+    end
+
+    test "an item bigger than the budget forms its own chunk rather than wedging" do
+      items = [{1, "aa"}, {2, String.duplicate("b", 5_000)}, {3, "cc"}]
+
+      assert [[{1, _}], [{2, _}], [{3, _}]] =
+               ShrinkLadder.chunk_by_bytes(items, 10, fn {_i, text} -> text end)
     end
   end
 end

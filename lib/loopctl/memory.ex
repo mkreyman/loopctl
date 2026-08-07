@@ -2661,6 +2661,14 @@ defmodule Loopctl.Memory do
   # promotion run — permanently, since the next run embeds the identical text and is
   # rejected identically. The ladder makes a long memory promotable on a prefix
   # instead of making it unpromotable forever.
+  #
+  # A PREFIX vector (`:truncated`) does the near-dup lookup no good and real harm: it is
+  # compared at 0.92 against prior rows embedded from their WHOLE slice, so two long
+  # memories that share an opening and diverge after it score as one — and the hit is not
+  # merely ignored, it SUPERSEDES the prior row (`insert_promoted/5`). The apples-to-apples
+  # premise above is what licenses that write, and truncation breaks it. So a truncated
+  # candidate is inserted FRESH (`near_dup_id` nil): a permitted duplicate, never a
+  # retirement decided on comparing different extents of text.
   defp nearest_live(scope, text) do
     embed =
       ShrinkLadder.embed_one(
@@ -2672,6 +2680,9 @@ defmodule Loopctl.Memory do
     case embed do
       {:error, _reason} ->
         {:error, :embeddings_degraded}
+
+      {:ok, embedding, :truncated} ->
+        {:ok, nil, embedding}
 
       {:ok, embedding} ->
         # The near-dup HNSW recall runs on the shared HeavyRead pool behind the
