@@ -164,13 +164,54 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
       refute is_nil(cap.consumed_at), "start must consume the start_cap it was given"
 
       # A retry is refused by the STATE MACHINE (409) before the capability layer
-      # sees the replayed token. That ordering matters: reaching `cap_rejected`
-      # would currently trip halt_tenant_on_violation and 503 the whole tenant,
-      # so an ordinary client retry must not get that far.
+      # sees the replayed token.
       conn
       |> auth(impl.raw_key)
       |> post("/api/v1/stories/#{story.id}/start", %{"capability" => start_cap["cap_id"]})
       |> response(409)
+    end
+
+    test "an EXPIRED start_cap is a 403, not a tenant-wide custody halt", %{conn: conn} do
+      %{tenant: tenant, story: story, implementer: impl} = keyed_context()
+
+      %{"capability" => start_cap} =
+        conn
+        |> auth(impl.raw_key)
+        |> post("/api/v1/stories/#{story.id}/claim")
+        |> json_response(200)
+
+      # The cap TTL is an hour; a review/planning pause longer than that is
+      # ordinary, not byzantine.
+      Loopctl.Capabilities.CapabilityToken
+      |> AdminRepo.get!(start_cap["cap_id"])
+      |> Ecto.Changeset.change(expires_at: DateTime.add(DateTime.utc_now(), -60, :second))
+      |> AdminRepo.update!()
+
+      conn
+      |> auth(impl.raw_key)
+      |> post("/api/v1/stories/#{story.id}/start", %{"capability" => start_cap["cap_id"]})
+      |> response(403)
+
+      # THE point of the test: a client-side timeout must not custody-halt the
+      # tenant, which would 503 every other agent working in it.
+      assert is_nil(AdminRepo.get!(Loopctl.Tenants.Tenant, tenant.id).custody_halted_at),
+             "an expired capability is a client error — it must never halt the tenant"
+    end
+
+    test "a malformed capability is refused, not a 500", %{conn: conn} do
+      %{story: story, implementer: impl} = keyed_context()
+
+      conn
+      |> auth(impl.raw_key)
+      |> post("/api/v1/stories/#{story.id}/claim")
+      |> json_response(200)
+
+      # Straight off the request body into an Ecto UUID column: this used to raise
+      # Ecto.Query.CastError and surface as a crash.
+      conn
+      |> auth(impl.raw_key)
+      |> post("/api/v1/stories/#{story.id}/start", %{"capability" => "not-a-uuid"})
+      |> response(403)
     end
 
     test "start without a capability is refused for a keyed tenant", %{conn: conn} do
@@ -298,6 +339,82 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
         |> json_response(409)
 
       assert body["error"]["code"] == "self_report_blocked"
+    end
+  end
+
+  describe "keyed tenant: verify closes the lifecycle (#621)" do
+    # claim -> start -> report -> review-complete, leaving the story verifiable.
+    defp reviewed(conn, ctx) do
+      ctx = implemented(conn, ctx)
+
+      conn
+      |> auth(ctx.reporter.raw_key)
+      |> post("/api/v1/stories/#{ctx.story.id}/report", %{"summary" => "review complete"})
+      |> json_response(200)
+
+      conn
+      |> auth(ctx.orchestrator.raw_key)
+      |> post("/api/v1/stories/#{ctx.story.id}/review-complete", %{
+        "review_type" => "enhanced",
+        "summary" => "reviewed"
+      })
+      |> json_response(201)
+
+      ctx
+    end
+
+    test "an orchestrator verifies with no capability at all", %{conn: conn} do
+      ctx = reviewed(conn, keyed_context())
+
+      # The leg the suite never exercised. A verify_cap could not have reached
+      # this caller — it was minted to whichever dispatch loopctl selected, which
+      # may not even be orchestrator-role — so requiring one wedged every keyed
+      # tenant's story at the last step.
+      conn
+      |> auth(ctx.orchestrator.raw_key)
+      |> post("/api/v1/stories/#{ctx.story.id}/verify", %{
+        "review_type" => "enhanced",
+        "summary" => "verified independently"
+      })
+      |> json_response(202)
+
+      story = AdminRepo.get!(Loopctl.WorkBreakdown.Story, ctx.story.id)
+      assert story.verified_status == :verified
+    end
+
+    test "the IMPLEMENTER still cannot verify its own work", %{conn: conn} do
+      ctx = reviewed(conn, keyed_context())
+
+      # L4 is the whole enforcement now that no capability gates verify. If this
+      # ever passes, dropping verify_cap regressed the core guarantee.
+      %{agent: impl_agent} = ctx.implementer
+
+      {impl_orch_key, api_key} =
+        fixture(:api_key, %{
+          tenant_id: ctx.tenant.id,
+          role: :orchestrator,
+          agent_id: impl_agent.id
+        })
+
+      insert_dispatch(
+        ctx.tenant.id,
+        impl_agent.id,
+        api_key.id,
+        ctx.implementer.lineage,
+        :orchestrator
+      )
+
+      body =
+        conn
+        |> auth(impl_orch_key)
+        |> post("/api/v1/stories/#{ctx.story.id}/verify", %{
+          "review_type" => "enhanced",
+          "summary" => "looks good to me"
+        })
+        |> json_response(409)
+
+      assert body["error"]["code"] == "self_verify_blocked" or
+               body["error"]["message"] =~ "own"
     end
   end
 end

@@ -374,18 +374,47 @@ defmodule Loopctl.Progress do
     end)
   end
 
+  # Only a FORGED signature or a double-spent token is a trust violation. Every
+  # other refusal — expired, bound to another lineage, wrong story/type, unknown
+  # id — is an ordinary client error: the caller sat on a token past its 1h TTL,
+  # or its dispatch rotated.
+  @byzantine_cap_refusals [:invalid_signature, :replay]
+
   defp maybe_consume_cap(multi, tenant_id, story_id, cap_id, typ, lineage) do
     Multi.run(multi, :consume_cap, fn _repo, _changes ->
-      case Capabilities.verify(tenant_id, %{
-             "cap_id" => cap_id,
-             "typ" => typ,
-             "story_id" => story_id,
-             "lineage" => lineage
-           }) do
-        {:ok, cap} -> Capabilities.consume(cap)
-        {:error, reason} -> {:error, {:cap_rejected, reason}}
+      with {:ok, cap} <-
+             Capabilities.verify(tenant_id, %{
+               "cap_id" => cap_id,
+               "typ" => typ,
+               "story_id" => story_id,
+               "lineage" => lineage
+             }),
+           {:ok, consumed} <- Capabilities.consume(cap) do
+        {:ok, consumed}
+      else
+        {:error, reason} -> {:error, cap_refusal(tenant_id, story_id, typ, reason)}
       end
     end)
+  end
+
+  # `{:cap_rejected, _}` is answered by FallbackController with a TENANT-WIDE
+  # custody halt (fallback_controller.ex:272), which 503s every other agent in
+  # the tenant. Reserve it for the byzantine set: an expired token must not be
+  # able to take the tenant down, and it is the routine outcome of a slow agent.
+  # Client-error refusals degrade to `:missing_capability` — the same 403, and
+  # the same remedy (obtain a fresh capability) — with the reason logged so the
+  # distinction is not lost to operators.
+  defp cap_refusal(_tenant_id, _story_id, _typ, reason)
+       when reason in @byzantine_cap_refusals,
+       do: {:cap_rejected, reason}
+
+  defp cap_refusal(tenant_id, story_id, typ, reason) do
+    Logger.warning(
+      "capability_unusable: #{reason} — caller must obtain a fresh capability from " <>
+        "GET /stories/:id/capabilities. tenant_id=#{tenant_id} story_id=#{story_id} cap_type=#{typ}"
+    )
+
+    :missing_capability
   end
 
   # US-26.2.2 AC-4: loopctl selects the verifier, not the orchestrator
@@ -405,8 +434,9 @@ defmodule Loopctl.Progress do
              |> Ecto.Changeset.change(verifier_dispatch_id: verifier.id)
              |> AdminRepo.update() do
           {:ok, _updated} ->
-            mint_cap(tenant_id, "verify_cap", story_id, verifier.lineage_path)
-
+            # No verify_cap is minted: see verify_story/4 for why L1 cannot gate
+            # verify. The selection itself is the gate — it writes
+            # verifier_dispatch_id, which validate_not_self_verify/2 enforces.
             Loopctl.AuditChain.append(tenant_id, %{
               action: "verifier_selected",
               actor_lineage: [],
@@ -603,9 +633,9 @@ defmodule Loopctl.Progress do
         # Report is therefore gated by L4 structural separation alone, which is
         # what actually enforces "nobody reports their own work": agent-id AND
         # dispatch-lineage comparison, fail-closed on a custody-unattributed story
-        # or an unresolvable dispatch. L1 is retained where it expresses something
-        # no other layer can — `verify_cap`, minted to a lineage LOOPCTL SELECTS,
-        # which an implementer cannot construct.
+        # or an unresolvable dispatch. The same argument retired `verify_cap` —
+        # see verify_story/4. `start_cap` is the one capability still in use, and
+        # the only one whose holder IS the principal permitted to spend it.
         {:ok, updated}
 
       {:error, :lock, reason, _} ->
@@ -757,9 +787,6 @@ defmodule Loopctl.Progress do
         {:error, reason}
 
       {:error, :validate, reason, _} ->
-        {:error, reason}
-
-      {:error, :consume_cap, reason, _} ->
         {:error, reason}
 
       {:error, :story, changeset, _} ->
@@ -1126,23 +1153,28 @@ defmodule Loopctl.Progress do
     orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
-    cap_id = Keyword.get(opts, :cap_id)
 
     verification_params = extract_verification_params(params)
 
+    # #621: verify consumes NO capability, for the same reason report does not
+    # (see start_story/3). A verify_cap was minted to the lineage
+    # Dispatches.select_verifier/3 picks, and Capabilities.verify/2 demands an
+    # EXACT lineage match — but that pick is not the principal who calls verify:
+    # the pool includes :agent-role dispatches while this endpoint is
+    # exact_role: :orchestrator, a legacy env-var orchestrator key resolves to
+    # lineage [] and can hold no cap at all, and in a single-root tenant no
+    # candidate is eligible so nothing is minted. Every one of those left the
+    # story permanently unverifiable, and the bulk path (verify_all_in_epic/4)
+    # never carried a cap at all. Verify is gated by L4 structural separation —
+    # validate_not_self_verify/2, which compares the loopctl-SELECTED
+    # verifier_dispatch_id's lineage against the implementer's and fails closed —
+    # plus exact_role: :orchestrator. That gate is unchanged.
     multi =
       Multi.new()
       |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
       |> Multi.run(:self_verify_check, fn _repo, %{lock: story} ->
         validate_not_self_verify(story, orchestrator_agent_id)
       end)
-      |> maybe_consume_cap(
-        tenant_id,
-        story_id,
-        cap_id,
-        "verify_cap",
-        Keyword.get(opts, :lineage, [])
-      )
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
         validate_verifiable(story)
       end)

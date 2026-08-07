@@ -956,10 +956,9 @@ async function contractStory({ story_id, story_title, ac_count }) {
 //
 // A tenant with an audit signing key MUST present a capability token on the
 // custody transitions that consume one, or the call fails 403 missing_capability.
-// The tokens are handed out by the server (claim returns a start_cap; a verify_cap
-// is collected from GET /stories/:id/capabilities), and callers should not have to
-// carry them by hand — so we cache what the server issues and attach it
-// automatically, while still honouring an explicit `capability` argument.
+// `start` is the only such transition (#621): claim returns the start_cap it mints.
+// Callers should not have to carry it by hand — so we cache what the server issues
+// and attach it automatically, while still honouring an explicit `capability`.
 //
 // The cache is per-process and therefore does NOT survive a session crash. That is
 // what the recovery paths below are for; never treat a cache miss as fatal.
@@ -1026,8 +1025,14 @@ async function claimStory({ story_id }) {
 }
 
 async function startStory({ story_id, capability }) {
+  // Cache first, then DELIVERY of the token claim already minted, then recovery
+  // (which mints a fresh one). Delivery also covers a legacy env-var key, whose
+  // lineage is [] and which recover-cap cannot serve at all.
   const cap =
-    capability || takeCap(story_id, "start_cap") || (await recoverStartCap(story_id));
+    capability ||
+    takeCap(story_id, "start_cap") ||
+    (await fetchCap(story_id, "start_cap", process.env.LOOPCTL_AGENT_KEY)) ||
+    (await recoverStartCap(story_id));
 
   const result = await apiCall(
     "POST",
@@ -1090,22 +1095,14 @@ async function reviewComplete({ story_id, review_type, findings_count, fixes_cou
 
 // --- Verification Tools (orch key) ---
 
-async function verifyStory({ story_id, summary, review_type, claim, capability }) {
+// Verify consumes NO capability (#621): no token can be bound to the principal
+// this endpoint permits to spend it. The gate is structural — loopctl selects the
+// verifier lineage and compares it against the implementer's server-side.
+async function verifyStory({ story_id, summary, review_type, claim }) {
   const body = {};
   if (summary) body.summary = summary;
   if (review_type) body.review_type = review_type;
   if (claim) body.claim = claim;
-
-  // The verify_cap is minted during report, bound to the verifier lineage loopctl
-  // SELECTS — so unlike the start_cap it never rides an earlier response to this
-  // caller. Collect it from the delivery endpoint, which only ever returns tokens
-  // already issued to this caller's own lineage.
-  const cap =
-    capability ||
-    takeCap(story_id, "verify_cap") ||
-    (await fetchCap(story_id, "verify_cap", process.env.LOOPCTL_ORCH_KEY));
-
-  if (cap) body.capability = cap;
 
   const result = await apiCall(
     "POST",
@@ -2849,9 +2846,12 @@ async function getSystemArticles({ slug, category } = {}) {
   return toContent(result);
 }
 
-// US-26: Cap recovery after session crash
-async function recoverCap({ story_id, cap_type, lineage }) {
-  const body = { cap_type: cap_type || "start_cap", lineage: lineage || [] };
+// US-26: Cap recovery after session crash. start_cap is the ONLY recoverable type
+// (#621) — the server answers any other cap_type with 422 AND records a
+// cap_recovery_forgery_attempt against the caller, so never forward one. `lineage`
+// is resolved server-side from the authenticating key and was always ignored.
+async function recoverCap({ story_id }) {
+  const body = { cap_type: "start_cap" };
   const result = await apiCall("POST", `/api/v1/stories/${story_id}/recover-cap`, body);
   return toContent(result);
 }
@@ -3776,14 +3776,6 @@ const TOOLS = [
         review_type: {
           type: "string",
           description: "Optional: review type for the verification record.",
-        },
-        capability: {
-          type: "string",
-          description:
-            "Optional verify_cap cap_id. Normally omitted — collected automatically from " +
-            "GET /stories/:id/capabilities, which returns only tokens already issued to " +
-            "your own dispatch lineage. loopctl selects the verifier lineage, so an " +
-            "implementer cannot obtain one for its own work.",
         },
         claim: CLAIM_SCHEMA,
       },
@@ -6789,13 +6781,11 @@ const TOOLS = [
   },
   {
     name: "recover_cap",
-    description: "Re-mint a capability token for a story you're assigned to. Use after a session crash when you've lost your cap.",
+    description: "Re-mint the start_cap for a story you're assigned to. Use after a session crash when you've lost it. start_cap is the only recoverable capability: asking for any other type is refused and logged as a forgery attempt.",
     inputSchema: {
       type: "object",
       properties: {
         story_id: { type: "string", description: "Story UUID." },
-        cap_type: { type: "string", enum: ["start_cap", "report_cap"], description: "Which cap to recover (default: start_cap)." },
-        lineage: { type: "array", items: { type: "string" }, description: "Your dispatch lineage path." },
       },
       required: ["story_id"],
     },

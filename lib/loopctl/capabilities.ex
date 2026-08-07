@@ -19,7 +19,8 @@ defmodule Loopctl.Capabilities do
   ## Parameters
 
   - `tenant_id` — the tenant UUID
-  - `typ` — token type (start_cap, report_cap, verify_cap, review_complete_cap)
+  - `typ` — token type. Only `start_cap` is minted today; `report_cap` and
+    `verify_cap` were retired in #621 (see `Progress.verify_story/4`).
   - `story_id` — the story UUID
   - `lineage` — the dispatch lineage path of the recipient
 
@@ -75,12 +76,14 @@ defmodule Loopctl.Capabilities do
       }) do
     now = DateTime.utc_now()
 
-    case AdminRepo.get_by(CapabilityToken, id: cap_id, tenant_id: tenant_id) do
-      nil ->
-        {:error, :invalid_capability}
-
-      cap ->
-        validate_cap(cap, tenant_id, expected_typ, expected_story_id, caller_lineage, now)
+    # cap_id is client input: a non-UUID raises Ecto.Query.CastError in the query
+    # below, which surfaced as a 500 instead of the documented refusal.
+    with {:ok, cap_id} <- Ecto.UUID.cast(cap_id),
+         cap = %CapabilityToken{} <-
+           AdminRepo.get_by(CapabilityToken, id: cap_id, tenant_id: tenant_id) do
+      validate_cap(cap, tenant_id, expected_typ, expected_story_id, caller_lineage, now)
+    else
+      _ -> {:error, :invalid_capability}
     end
   end
 
@@ -109,44 +112,41 @@ defmodule Loopctl.Capabilities do
   @doc """
   Lists the live capabilities issued to `lineage` for `story_id`.
 
-  DELIVERY, NOT MINTING (#621). `verify_cap` is minted at verifier-assignment
-  time bound to the selected verifier's lineage, and unlike `start_cap` /
-  `report_cap` it cannot ride the response of the call that minted it — that
-  response goes to the REPORTER, and handing a reporter the verifier's cap is
-  precisely the self-verification the custody model exists to prevent.
-  `CapRecoveryController` cannot serve it either: recovery deliberately re-mints
-  only `start_cap`, because an agent must never mint a cap to verify its own
-  work. So the verifier had no way to obtain a cap it already held a claim to.
+  DELIVERY, NOT MINTING (#621) — the recovery path for a client that lost the
+  `claim` response carrying its `start_cap`. Returns only tokens ALREADY minted,
+  unconsumed and unexpired; the lineage must still match exactly at consume time
+  (`validate_cap/6`), where the signature is checked.
 
-  This grants nothing new: it returns only tokens ALREADY minted for the
-  caller's own lineage, and the lineage must still match exactly at consume time
-  (`validate_cap/6`), where the ed25519 signature is also checked. Consumed and
-  expired tokens are excluded.
-
-  ## Empty lineage fails CLOSED
-
-  An empty lineage returns `[]` rather than matching tokens issued to `[]`.
-  Every key not minted by a dispatch resolves to `[]`
-  (`Dispatches.lineage_for_api_key/2`), so matching on it would hand ONE legacy
-  caller every other legacy caller's capabilities in the tenant — a cross-agent
-  leak. Callers on such a key fall back to `recover_cap` for a `start_cap`.
+  An empty lineage fails CLOSED: every key not minted by a dispatch resolves to
+  `[]`, so matching on it would hand ONE legacy caller every other legacy
+  caller's tokens. Use `list_for_assigned_agent/3` there instead.
   """
   @spec list_for_lineage(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) :: [CapabilityToken.t()]
   def list_for_lineage(_tenant_id, _story_id, []), do: []
 
-  def list_for_lineage(tenant_id, story_id, lineage) do
+  def list_for_lineage(tenant_id, story_id, lineage), do: live_caps(tenant_id, story_id, lineage)
+
+  @doc """
+  Lists the live `[]`-lineage capabilities for `story_id`, but only when
+  `agent_id` is the story's ASSIGNED agent — the discriminator lineage cannot
+  supply for a legacy key. Without it such a claimant had NO recovery path at
+  all: `recover_cap` needs an `implementer_dispatch_id` its claim never records.
+  """
+  @spec list_for_assigned_agent(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t() | nil) ::
+          [CapabilityToken.t()]
+  def list_for_assigned_agent(_tenant_id, _story_id, nil), do: []
+
+  def list_for_assigned_agent(tenant_id, story_id, agent_id) do
     import Ecto.Query
 
-    now = DateTime.utc_now()
+    assigned? =
+      from(s in Loopctl.WorkBreakdown.Story,
+        where:
+          s.id == ^story_id and s.tenant_id == ^tenant_id and s.assigned_agent_id == ^agent_id
+      )
+      |> AdminRepo.exists?()
 
-    from(c in CapabilityToken,
-      where:
-        c.tenant_id == ^tenant_id and c.story_id == ^story_id and
-          c.issued_to_lineage == ^lineage and is_nil(c.consumed_at) and
-          c.expires_at > ^now,
-      order_by: [desc: c.issued_at]
-    )
-    |> AdminRepo.all()
+    if assigned?, do: live_caps(tenant_id, story_id, []), else: []
   end
 
   @doc """
@@ -167,6 +167,21 @@ defmodule Loopctl.Capabilities do
   end
 
   # --- Private ---
+
+  defp live_caps(tenant_id, story_id, lineage) do
+    import Ecto.Query
+
+    now = DateTime.utc_now()
+
+    from(c in CapabilityToken,
+      where:
+        c.tenant_id == ^tenant_id and c.story_id == ^story_id and
+          c.issued_to_lineage == ^lineage and is_nil(c.consumed_at) and
+          c.expires_at > ^now,
+      order_by: [desc: c.issued_at]
+    )
+    |> AdminRepo.all()
+  end
 
   defp validate_cap(cap, tenant_id, expected_typ, expected_story_id, caller_lineage, now) do
     cond do

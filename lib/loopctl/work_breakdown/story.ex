@@ -85,7 +85,8 @@ defmodule Loopctl.WorkBreakdown.Story do
 
     # Issue #621: the capability minted by the lifecycle transition that returned
     # this struct — the credential the caller needs for its NEXT custody op
-    # (claim mints start_cap, start mints report_cap). Virtual and deliberately
+    # (only `claim` mints one — a start_cap; no other transition mints at all,
+    # see Progress.start_story/3 and Progress.verify_story/4). Virtual and deliberately
     # ABSENT from the @derive Jason.Encoder `only:` list above, so it is never
     # serialized as part of a story; the controller that performed the transition
     # reads it and returns it under a separate top-level `capability` key.

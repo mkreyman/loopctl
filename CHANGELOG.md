@@ -14,27 +14,37 @@ All notable changes to loopctl are documented here.
   work flowed through pull requests rather than the story lifecycle, and because the test
   suite only exercised the keyless path, where capabilities are not enforced.
   **What changed for clients:** the `claim` response now carries a `capability` object whose
-  `cap_id` must be presented as the `capability` field on `start`. A new
-  `GET /api/v1/stories/:id/capabilities` returns the live tokens already issued to the
-  caller's own dispatch lineage — this is how a verifier collects its `verify_cap`, which is
-  minted during report and bound to the verifier loopctl selects, so it cannot ride an earlier
-  response. The endpoint only ever returns tokens already issued to the caller and never mints.
-  `loopctl-mcp-server` handles all of this automatically (it caches what the server issues and
-  re-mints a lost `start_cap` via recover-cap); upgrade it rather than plumbing tokens by hand.
-  Claiming with a dispatch-minted key now also records `implementer_dispatch_id`, without
-  which every downstream lineage check silently degraded to plain agent-id equality.
+  `cap_id` must be presented as the `capability` field on `start`. That is the ONLY capability
+  a client ever has to carry. A new `GET /api/v1/stories/:id/capabilities` returns the live
+  tokens already issued to the caller for a story — the recovery path when the claim response
+  is lost to a crash or timeout; it never mints. `loopctl-mcp-server` handles all of this
+  automatically; upgrade it rather than plumbing tokens by hand. Claiming with a
+  dispatch-minted key now also records `implementer_dispatch_id`, without which every
+  downstream lineage check silently degraded to plain agent-id equality.
 
-- **`report` no longer requires a capability token, and no `report_cap` is minted.** It could
-  never have worked: the token was bound to the implementer's lineage while `report` is a
-  chain-of-custody gate that must be called by a DIFFERENT principal, and capability
-  verification requires an exact lineage match — so the only principal the token authorized
-  was the one forbidden to use it. The transition is gated by structural lineage separation,
-  which is what actually enforces "nobody reports their own work"; that gate is unchanged and
-  still fails closed. See `docs/chain-of-custody-v2.md` §5.2 for the reasoning.
+- **`report` and `verify` no longer require a capability token, and no `report_cap` or
+  `verify_cap` is minted.** Neither could have worked. A capability binds to exactly one
+  dispatch lineage, but both transitions exist precisely so that a DIFFERENT principal
+  performs them: the `report_cap` authorized the one principal forbidden to report, and the
+  `verify_cap` was bound to whichever dispatch loopctl selected as verifier — which may be an
+  `:agent`-role dispatch that the `exact_role: :orchestrator` verify endpoint rejects, or
+  nothing at all in a tenant whose dispatches share one root, and which a legacy env-var
+  orchestrator key (lineage `[]`) can never hold. The bulk `verify-all` path never sent a cap
+  at all and silently returned `verified_count: 0`. Both transitions are gated by structural
+  lineage separation plus the `exact_role` plugs — the loopctl-selected verifier is still
+  recorded and still compared, it is just no longer a bearer token the entitled principal
+  cannot obtain. See `docs/chain-of-custody-v2.md` §5.2.
+
+- **An unusable capability no longer halts the whole tenant.** Any rejected token produced
+  `{:cap_rejected, _}`, which custody-halts the tenant and 503s every subsequent request from
+  it — so one agent letting a token pass its 1-hour TTL took down every other agent in the
+  tenant. Only a forged signature or a double-spent token does that now; expiry and lineage
+  drift are ordinary 403s.
 
 - **Capability refusals return their documented 403 instead of a 500.** The controllers had no
   clause for the capability layer's own error shapes, so a missing or rejected token raised a
   CaseClauseError — making a correct refusal indistinguishable from a crash in logs and alerts.
+  A non-UUID `capability` value likewise 500'd (`Ecto.Query.CastError`) instead of 403ing.
 
 ## [Unreleased] — 2026-07-24 — Self-hosting: fresh-install fixes, multilingual search, at-rest ingestion encryption
 

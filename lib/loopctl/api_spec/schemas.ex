@@ -705,7 +705,7 @@ defmodule Loopctl.ApiSpec.Schemas do
         cap_id: %Schema{type: :string, format: :uuid},
         typ: %Schema{
           type: :string,
-          description: "start_cap | report_cap | verify_cap | review_complete_cap"
+          description: "Only `start_cap` is minted today (#621)."
         },
         story_id: %Schema{type: :string, format: :uuid},
         issued_to_lineage: %Schema{
@@ -1671,17 +1671,6 @@ defmodule Loopctl.ApiSpec.Schemas do
       type: :object,
       required: [:review_type, :summary],
       properties: %{
-        capability: %Schema{
-          type: :string,
-          format: :uuid,
-          description:
-            "The verify_cap `cap_id` issued to this caller's dispatch lineage. Accepted as " <>
-              "`cap_id` as well. Unlike start_cap/report_cap this one is not returned by an " <>
-              "earlier transition — it is minted during report and bound to the verifier " <>
-              "loopctl selects, so collect it from GET /stories/:id/capabilities. Required " <>
-              "for a tenant with an audit signing key; omitting it yields 403 " <>
-              "missing_capability."
-        },
         result: %Schema{
           type: :string,
           enum: ["pass", "partial"],
@@ -3488,7 +3477,10 @@ defmodule Loopctl.ApiSpec.Schemas do
         cap_id: %Schema{type: :string, format: :uuid},
         typ: %Schema{
           type: :string,
-          enum: ["start_cap", "report_cap", "verify_cap", "review_complete_cap"]
+          enum: ["start_cap"],
+          description:
+            "Recovery only ever re-mints a start_cap; any other value is refused with 422 " <>
+              "and recorded as a capability-forgery attempt."
         },
         story_id: %Schema{type: :string, format: :uuid},
         issued_to_lineage: %Schema{type: :array, items: %Schema{type: :string, format: :uuid}},
