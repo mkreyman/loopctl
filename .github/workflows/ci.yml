@@ -27,7 +27,8 @@ env:
   # mix.exs `~> 1.18`); only the OTP line moves forward to a working, current patch.
   OTP_VERSION: "28.5.0.2"
 
-# SELF-HOSTED SPLIT (beelink). lint / test / security / dialyzer moved; the rest
+# SELF-HOSTED SPLIT (nuc since 2026-08-07, beelink before it). lint / test /
+# security / dialyzer moved; the rest
 # stay on ubuntu-latest for specific reasons, not by omission. Measured job times
 # (2026-07-30) are recorded per entry, because the whole point of the split is
 # billed minutes and an unmeasured "it is rare" claim is how cost hides:
@@ -42,24 +43,30 @@ env:
 #                   narrowly-gated scale-NIGHTLY matrix that is rare. The mistake
 #                   understated the recurring cost, which is exactly the number
 #                   this block exists to make visible.)
-#   scale-nightly   ZERO billed hosted minutes: it moved to beelink (the port is
+#   scale-nightly   ZERO billed hosted minutes: it moved self-hosted (the port is
 #                   DONE -- see the per-matrix-file database note on the job) and
-#                   it no longer runs nightly. ~143 min of beelink wall clock per
-#                   full 14-file matrix (one outlier, streaming_export, is 40 min
-#                   on its own), now only on an explicit dispatch plus any
+#                   it no longer runs nightly. ~143 min of wall clock per full
+#                   14-file matrix (one outlier, streaming_export, is 40 min on
+#                   its own) -- MEASURED ON BEELINK, 24 cores. The host is now
+#                   nuc at 4 cores, so treat 143 as a floor, not an estimate,
+#                   until it is re-measured. Now only on an explicit dispatch plus any
 #                   manual dispatch -- so ~620 min/month (143 x 52/12) of self-hosted time in
 #                   place of the ~4,300 billed min/month it used to be, when it
 #                   was the largest hosted line item by a wide margin.
 #   deploy          Holds Fly deploy credentials and needs flyctl. Keeping release
 #   smoke           authority on GitHub-hosted runners is deliberate and should
-#                   NOT be "optimised" onto beelink: that box holds Mark's SSH
-#                   key and the Hetzner API token, so putting deploy credentials
-#                   on it widens the blast radius of any compromised dependency
-#                   far more than the ~0.8 min/month of billed time is worth.
+#                   NOT be "optimised" onto the self-hosted box. The argument
+#                   was written when that box was beelink, holding Mark's SSH
+#                   key and the Hetzner API token. It applies MORE strongly to
+#                   nuc, which holds an SSH key, the Fly API tokens and the
+#                   Tigris archive credentials for the infra-* timers. Putting
+#                   deploy credentials there widens the blast radius of any
+#                   compromised dependency far more than the ~0.8 min/month of
+#                   billed time is worth.
 jobs:
   lint:
     name: Lint
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, nuc]
     steps:
       - uses: actions/checkout@v4
 
@@ -109,9 +116,10 @@ jobs:
 
   test:
     name: Test
-    runs-on: [self-hosted, beelink]
-    # NO `services:` block on self-hosted. beelink already runs a long-lived
-    # Postgres 16 publishing 0.0.0.0:5432 — the same database local `mix test`
+    runs-on: [self-hosted, nuc]
+    # NO `services:` block on self-hosted. nuc already runs a long-lived
+    # Postgres 16 bound to 127.0.0.1:5432 — reachable because the job runs ON that
+    # host — the same database local `mix test`
     # uses — so a service container declaring 5432:5432 cannot bind and the job
     # would die before its first step. Verified that host instance has pgvector
     # 0.8.2 available, which is why the pgvector image is not needed here.
@@ -217,7 +225,7 @@ jobs:
 
   retrieval-eval:
     name: Retrieval Eval
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, nuc]
     # MIX_ENV=dev on purpose (the workflow-level default is test): `mix
     # loopctl.retrieval.eval` opens its OWN DB connections, and config/test.exs puts all
     # three repos behind Ecto.Adapters.SQL.Sandbox, where a non-checked-out process has no
@@ -225,10 +233,10 @@ jobs:
     # the task in, so CI exercises the real invocation.
     env:
       MIX_ENV: dev
-    # No services block: beelink's Postgres already publishes 5432 and has
+    # No services block: nuc's Postgres already holds 127.0.0.1:5432 and has
     # pgvector 0.8.2 available, so a service container could not bind that port
     # and is not needed. MIX_ENV=dev here resolves to loopctl_dev, which Mark
-    # confirmed is disposable on beelink.
+    # confirmed is disposable on nuc.
     steps:
       - uses: actions/checkout@v4
 
@@ -336,7 +344,7 @@ jobs:
 
   security:
     name: Security
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, nuc]
     steps:
       - uses: actions/checkout@v4
 
@@ -374,7 +382,7 @@ jobs:
 
   dialyzer:
     name: Dialyzer
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, nuc]
     steps:
       - uses: actions/checkout@v4
 
@@ -632,7 +640,7 @@ jobs:
     # in the name is kept because the tag, the job and the runbooks all use it). It was a
     # prod-scale PROOF, not a per-night regression watch, and as a NIGHTLY job it stopped
     # paying for itself: 14 matrix jobs, each seeding ~80k committed rows, serially on ONE
-    # self-hosted runner — hours of beelink every night, QUEUED AHEAD of ordinary PR checks,
+    # self-hosted runner — hours of the CI box every night, QUEUED AHEAD of ordinary PR checks,
     # so a routine PR could sit unmergeable behind a scale run nobody asked for.
     # No schedule arm is kept. The trade is stated plainly: most planner/index CHOICE
     # drift arrives with a query/index/corpus change (covered by the pre-merge dispatch),
@@ -651,7 +659,7 @@ jobs:
     #
     # This was the single largest GitHub-hosted line item: ~143 min of billed runner
     # time per night across the 14 files, roughly 4,300 min/month, dwarfing every other
-    # hosted job combined. Moved to beelink, and off the nightly cron — see above.
+    # hosted job combined. Moved self-hosted, and off the nightly cron — see above.
     #
     # The isolation used to come from a FRESH Postgres service container per matrix job.
     # On the self-hosted box there is one long-lived Postgres, so isolation comes from a
@@ -661,7 +669,7 @@ jobs:
     # other's ANALYZE results any more than two containers could. What a shared cluster
     # DOES share is CPU, shared_buffers and disk — which affects timing, not the plan
     # CHOICE these tests assert on, and the matrix runs serially on one runner anyway.
-    runs-on: [self-hosted, beelink]
+    runs-on: [self-hosted, nuc]
     # MANUAL DISPATCH, PLUS THE WEEKLY CRON ONLY. Not every-PR (the 80k seed per file is far
     # too slow for every push) and no longer every night. The enforced pre-merge step for a
     # Theme-2/3/4 (query/index) change is `gh workflow run CI --ref <branch>` or the local
@@ -713,8 +721,8 @@ jobs:
           - test/loopctl/knowledge/vector_endpoint_e2e_latency_scale_test.exs
           - test/loopctl/knowledge/remediation_matrix_scale_test.exs
           - test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs
-    # NO `services:` block on self-hosted. beelink already runs a long-lived Postgres 16
-    # publishing 0.0.0.0:5432, so a service container declaring 5432:5432 cannot bind and
+    # NO `services:` block on self-hosted. nuc already runs a long-lived Postgres 16
+    # bound to 127.0.0.1:5432, so a service container declaring 5432:5432 cannot bind and
     # the job dies at "Initialize containers" before its first step. That host instance
     # has pgvector 0.8.2 available, which is what the pgvector/pgvector:pg16 image was
     # supplying, so the image is not needed — only its port was ever in the way.
@@ -850,7 +858,7 @@ jobs:
       # The disposable service container used to make cleanup free. On a long-lived
       # Postgres it is mandatory: each of these databases holds an ~80k-article
       # prod-floor corpus with its vectors and HNSW index. Observed live during the first
-      # beelink run: 1345 MB for remediation_matrix alone (they vary widely — the
+      # beelink run (24 cores, pre-2026-08-07): 1345 MB for remediation_matrix alone (they vary widely — the
       # calibration file needs only ~14 MB). A full matrix left un-dropped is therefore
       # on the order of 10 GB added to the box PER FULL RUN until it filled.
       #
