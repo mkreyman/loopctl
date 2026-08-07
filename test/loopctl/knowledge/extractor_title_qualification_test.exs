@@ -95,9 +95,18 @@ defmodule Loopctl.Knowledge.ExtractorTitleQualificationTest do
     assert ClaudeContentExtractor.user_content("body", "newsletter") =~ "Source type: newsletter"
   end
 
-  test "the prompt still defines what to do when there is no Source line" do
-    # The ONE prose check kept: this branch has no wire signature, and without it the
-    # model is told to qualify from a line that is not in its input.
-    assert ClaudeContentExtractor.system_prompt() =~ "NO Source line"
+  test "the prompt asks for the qualification the Source line exists to enable" do
+    # The wire tests above prove the source ARRIVES; only the prompt turns it into a
+    # qualified title, and `body["system"] == system_prompt()` holds for ANY prompt —
+    # including one with this paragraph deleted. So the acceptance criterion itself
+    # (name the generic-title trap, qualify FROM the source, leave specific titles
+    # alone, and define the no-Source branch that has no wire signature) is pinned here.
+    prompt = ClaudeContentExtractor.system_prompt()
+
+    for generic <- ["Changelog", "Configuration"], do: assert(prompt =~ generic)
+
+    assert prompt =~ "Source line"
+    assert prompt =~ "do not pad it"
+    assert prompt =~ "NO Source line"
   end
 end

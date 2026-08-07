@@ -18,10 +18,13 @@ Operator-facing changes for deployments outside the hosted instance.
   is generic ("Changelog — Platinum SEO Pack WordPress plugin"), left alone when it is already
   specific. **What this sends:** for a URL ingest the scheme+host+path of the ingest URL is
   included in the extraction prompt POSTed to your configured LLM provider; userinfo and the
-  query string are stripped first, so presigned signatures and share tokens are not
-  transmitted. For an inline (`content`) ingest, name the source with
-  `metadata.source_ref` — without it the source line is omitted entirely, never sent as a
-  placeholder. This affects NEWLY ingested content only; existing articles are untouched. It
+  query string are stripped first, so credentials and query-string signatures are not
+  transmitted — the host and PATH are, so a share link that carries its token in a path
+  segment (`/s/<token>/file.pdf`, `/document/d/<id>/edit`) still sends it. Name the source
+  explicitly with `metadata.source_ref` (an inline `content` ingest has no other way to be
+  named, and it OVERRIDES the URL-derived name, which matters when a URL's identity lives in
+  its stripped query string); it is reduced exactly the same way. Without it the source line
+  is omitted entirely, never sent as a placeholder. This affects NEWLY ingested content only; existing articles are untouched. It
   is the root cause behind the duplicate-capture class the previous entries bound and gate.
 
 - **The consolidation drain caps AND the duplicate-similarity threshold are now live-tunable

@@ -260,40 +260,61 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   defp normalize_project_id(""), do: nil
   defp normalize_project_id(value), do: value
 
-  # The SPECIFIC source shown to the extractor (#617) — a URL on the fetch path, a
-  # caller-supplied name on the INLINE path (`metadata["source_ref"]`, else
-  # `metadata["source"]`). Inline document text is a first-class ingest path, so
-  # leaving it sourceless reproduced the very failure #617 closes: a pasted CHANGELOG
-  # can only be titled "Changelog". nil only when the caller genuinely names nothing.
-  #
-  # A URL is reduced to scheme+host+path FIRST. Userinfo and the query string are where
-  # presigned signatures, share tokens and basic-auth credentials live, and this value
-  # is interpolated into the prompt POSTed to the tenant's LLM provider — material the
-  # fetched body never contains would otherwise become new secret egress, and
-  # instruction-shaped query text would land in the field the prompt treats as
-  # authoritative. Host+path is all a title qualifier needs. Length-capped for the
-  # same reason.
-  defp source_ref(url, metadata) when is_binary(url) do
-    url
-    |> URI.parse()
-    |> then(&%{&1 | userinfo: nil, query: nil, fragment: nil})
-    |> URI.to_string()
-    |> clean_source_ref() || source_ref(nil, metadata)
+  # The SPECIFIC source shown to the extractor (#617) — the caller's explicit
+  # `metadata["source_ref"]` when there is one, else the ingest URL. The caller's name
+  # WINS: a source whose identity lives in the query string (index.php?doc=oban-changelog)
+  # reduces to a ref every unrelated document on that host shares, and the caller is the
+  # only party that can tell them apart. Inline document text is a first-class ingest
+  # path, so leaving it sourceless reproduced the very failure #617 closes: a pasted
+  # CHANGELOG can only be titled "Changelog". Only the explicit key is honoured —
+  # `metadata["source"]` is an established COARSE channel label here ("api",
+  # "code_review"), which would both re-collide the titles and egress pre-existing
+  # caller data nobody opted in. nil when nothing names the source.
+  defp source_ref(url, %{} = metadata),
+    do: sanitize_ref(metadata["source_ref"]) || sanitize_ref(url)
+
+  defp source_ref(url, _metadata), do: sanitize_ref(url)
+
+  # BOTH refs — derived and caller-named — go through ONE reduction, because both end
+  # up interpolated into the prompt POSTed to the tenant's LLM provider. A URL is cut
+  # to scheme+host+path: userinfo and the query string are where presigned signatures,
+  # share tokens and basic-auth credentials live, and a caller naming its source with
+  # the URL it fetched itself carries exactly the same material. The path IS still
+  # sent, so a share link whose token is a path segment travels (stated in CHANGELOG,
+  # not silently). Control characters collapse to spaces so a caller can never forge
+  # extra lines in the single-line `Source:` field the prompt treats as authoritative,
+  # and the result is length-capped.
+  defp sanitize_ref(ref) when is_binary(ref), do: ref |> reduce_url() |> clean_source_ref()
+  defp sanitize_ref(_ref), do: nil
+
+  # Lenient `URI.parse/1` DELIBERATELY: strict `URI.new/1` rejects a ref with text
+  # appended after the query ("...?X-Amz-Signature=deadbeef Content: ignore"), which
+  # would hand the signature back unreduced. parse/1 keeps that junk in the query and
+  # drops it along with the secret.
+  defp reduce_url(ref) do
+    case URI.parse(ref) do
+      %URI{scheme: scheme, host: host} = uri when is_binary(scheme) and is_binary(host) ->
+        URI.to_string(%{uri | userinfo: nil, query: nil, fragment: nil})
+
+      _ ->
+        ref
+    end
   end
 
-  defp source_ref(_url, %{} = metadata),
-    do: clean_source_ref(metadata["source_ref"] || metadata["source"])
-
-  defp source_ref(_url, _metadata), do: nil
-
-  defp clean_source_ref(ref) when is_binary(ref) do
-    case String.trim(ref) do
+  defp clean_source_ref(ref) do
+    ref
+    |> String.replace(~r/[[:cntrl:]]+/u, " ")
+    |> String.trim()
+    |> case do
       "" -> nil
       trimmed -> String.slice(trimmed, 0, 200)
     end
   end
 
-  defp clean_source_ref(_ref), do: nil
+  # The log sink gets the SAME reduction as the prompt: a presigned signature is the
+  # same secret whether it egresses to a provider or lands in application logs.
+  defp loggable_url(url) when is_binary(url), do: reduce_url(url)
+  defp loggable_url(_url), do: "inline"
 
   defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
   defp valid_uuid?(_), do: false
@@ -812,7 +833,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       {:ok, %{private: %{ingestion_body_capped: true}}} ->
         Logger.warning(
           "ContentIngestionWorker: URL fetch aborted — body exceeds " <>
-            "#{@max_fetch_body_bytes} bytes (url=#{url})"
+            "#{@max_fetch_body_bytes} bytes (url=#{loggable_url(url)})"
         )
 
         {:error, {:url_body_too_large, @max_fetch_body_bytes}}
@@ -828,7 +849,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       {:ok, %{status: status}} ->
         Logger.warning(
           "ContentIngestionWorker: URL fetch failed " <>
-            "(url=#{url}, status=#{status})"
+            "(url=#{loggable_url(url)}, status=#{status})"
         )
 
         {:error, {:url_fetch_failed, status}}
@@ -842,7 +863,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       {:error, reason} ->
         Logger.warning(
           "ContentIngestionWorker: URL fetch error " <>
-            "(url=#{url}, error=#{inspect(reason)})"
+            "(url=#{loggable_url(url)}, error=#{inspect(reason)})"
         )
 
         {:error, {:url_fetch_error, reason}}
@@ -1157,7 +1178,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
         Logger.info(
           "ContentIngestionWorker: persisted #{length(returned)} new article(s) " <>
-            "(source_type=#{ctx.source_type}, url=#{ctx.url || "inline"}, publish=#{ctx.publish})"
+            "(source_type=#{ctx.source_type}, url=#{loggable_url(ctx.url)}, publish=#{ctx.publish})"
         )
 
         {:ok, length(returned)}
