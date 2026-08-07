@@ -20,7 +20,11 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
   `{:ok, vector}`. The vector covers a PREFIX, so it is NOT comparable with corpus
   vectors built from whole texts — `ProposalGate` may not call a proposal a duplicate
   on one, and `Memory` may not supersede a prior memory on one. A truncation the
-  caller cannot see is a truncation it silently judges against.
+  caller cannot see is a truncation it silently judges against. Refusing to JUDGE on one is
+  only half of it: a prefix STORED unmarked is indistinguishable from a whole-text vector,
+  and the next comparison runs the forbidden compare from the other side — this time
+  retiring the longer text. No side table has a column for the fact, so the marker rides
+  `embedding_content_hash` (`truncated_hash/1`).
 
   ## An array: BISECT, then ladder the singleton
 
@@ -45,16 +49,22 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
 
   alias Loopctl.Embeddings.TextBudget
 
-  # What ONE `embed_batch/3` may spend in provider calls. The bisect's own bound is ~2n
-  # with n up to `Knowledge.embedding_batch_max/0` — hundreds of sequential calls, each
-  # with its own yield budget, inside one Oban job. A batch that blows this is no longer
-  # a length problem the bisect can fix, so it surfaces the provider error exactly as an
-  # exhausted rung does.
-  @default_max_calls 64
+  # What ONE `embed_batch/3` may spend: `max(@min_max_calls, @calls_per_text * n)`. A budget
+  # below the bisect's own worst case (~5n: n-1 internal nodes, plus per leaf its own call
+  # and at most 3 rungs) abandons work the bisect could have finished, and the callers read
+  # the surfaced 4xx through `permanent_provider_error?/1` — the job DISCARDS and the rows
+  # stay un-embedded, the outage this module exists to end. So it guards against runaway
+  # recursion, never caps a legitimate batch; callers bound COST via `chunk_by_bytes/3`.
+  @min_max_calls 64
+  @calls_per_text 6
+
+  # See the moduledoc: no side table has a column for "this vector is a prefix".
+  @truncated_hash_prefix "t:"
 
   @type vector :: [float()]
   @type one_result :: {:ok, vector()} | {:ok, vector(), :truncated} | {:error, term()}
-  @type batch_result :: {:ok, [vector()]} | {:error, term()}
+  @type batch_result ::
+          {:ok, [vector()]} | {:ok, [vector()], [non_neg_integer()]} | {:error, term()}
 
   @doc """
   Embed ONE text through `embed_fun`, shrinking on a context-length rejection.
@@ -137,8 +147,11 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
   already did inline, so a contract violation cannot be zipped into misattributed
   vectors.
 
-  `:max_calls` (default #{@default_max_calls}) bounds the provider calls one batch
-  may spend across the whole bisect.
+  A batch the ladder had to shrink comes back as `{:ok, vectors, truncated_indexes}` — the
+  SAME contract `embed_one/3` carries, and for the same reason: a storing caller must mark
+  those rows or the corpus fills with prefixes the comparing side is told cannot exist.
+  `:max_calls` bounds the provider calls one batch may spend across the whole bisect
+  (default `max(#{@min_max_calls}, #{@calls_per_text} * length(texts))`).
   """
   @spec embed_batch([String.t()], ([String.t()] -> batch_result()), keyword()) :: batch_result()
   def embed_batch(texts, embed_fun, opts \\ [])
@@ -147,41 +160,50 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
 
   def embed_batch(texts, embed_fun, opts)
       when is_list(texts) and is_function(embed_fun, 1) do
-    budget = Keyword.get(opts, :max_calls, @default_max_calls)
-    {result, _left} = run_batch(texts, embed_fun, opts, budget)
-    result
+    budget = Keyword.get(opts, :max_calls, max(@min_max_calls, @calls_per_text * length(texts)))
+    # Back into `opts` so the give-up log names the budget ACTUALLY in force.
+    opts = Keyword.put(opts, :max_calls, budget)
+    {result, _left} = run_batch(texts, embed_fun, opts, budget, 0)
+
+    case result do
+      {:ok, vectors, []} -> {:ok, vectors}
+      {:ok, vectors, truncated} -> {:ok, vectors, Enum.sort(truncated)}
+      error -> error
+    end
   end
 
-  # Every result carries the REMAINING call budget, so the two halves of a bisect share
-  # one budget: a per-branch one would multiply with the depth and bound nothing.
-  defp run_batch(texts, embed_fun, opts, budget) do
+  # Every result carries the REMAINING call budget, so the two halves of a bisect share one:
+  # a per-branch budget would multiply with the depth and bound nothing. `offset` is the
+  # index of `texts` in the ORIGINAL array, i.e. the index the caller zips its entries at.
+  defp run_batch(texts, embed_fun, opts, budget, offset) do
     case embed_fun.(texts) do
       {:ok, v} when length(v) == length(texts) ->
-        {{:ok, v}, budget - 1}
+        {{:ok, v, []}, budget - 1}
 
       {:ok, _mismatch} ->
         {{:error, :embedding_batch_length_mismatch}, budget - 1}
 
       {:error, {:api_error, _s, :context_length_exceeded}} = e ->
-        shrink(texts, embed_fun, opts, e, budget - 1)
+        shrink(texts, embed_fun, opts, e, budget - 1, offset)
 
       other ->
         {other, budget - 1}
     end
   end
 
-  defp shrink(texts, _embed_fun, opts, error, budget) when budget <= 0 do
+  defp shrink(texts, _embed_fun, opts, error, budget, _offset) when budget <= 0 do
     Logger.warning(
-      "#{label(opts)}: giving up on a batch of #{length(texts)} after #{@default_max_calls} " <>
-        "provider calls — most of it is over-long, which no bisect can fix; surfacing the " <>
-        "provider error. Split by bytes (`chunk_by_bytes/3`) before sending."
+      "#{label(opts)}: giving up on a batch of #{length(texts)} after " <>
+        "#{Keyword.fetch!(opts, :max_calls)} provider calls — most of it is over-long, " <>
+        "which no bisect can fix; surfacing the provider error. Split by bytes " <>
+        "(`chunk_by_bytes/3`) before sending."
     )
 
     {error, 0}
   end
 
   # Isolated to ONE text: this is the member the provider was rejecting, so ladder it.
-  defp shrink([text], embed_fun, opts, error, budget) do
+  defp shrink([text], embed_fun, opts, error, budget, offset) do
     sent = byte_size(text)
 
     case TextBudget.next_budget(sent) do
@@ -191,7 +213,11 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
 
       smaller ->
         log_shrink(opts, sent, smaller)
-        run_batch([TextBudget.truncate(text, smaller)], embed_fun, opts, budget)
+
+        {result, left} =
+          run_batch([TextBudget.truncate(text, smaller)], embed_fun, opts, budget, offset)
+
+        {mark_index(result, offset), left}
     end
   end
 
@@ -199,7 +225,7 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
   # half answer for itself. `div(length, 2)` is >= 1 here (length >= 2), so both
   # halves are strictly smaller and the recursion terminates. A `with` else-less
   # fallthrough returns the failing `{result, budget}` pair unchanged.
-  defp shrink(texts, embed_fun, opts, _error, budget) do
+  defp shrink(texts, embed_fun, opts, _error, budget, offset) do
     {left, right} = Enum.split(texts, div(length(texts), 2))
 
     Logger.warning(
@@ -208,11 +234,36 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
         "isolate it. Only the over-long text will be truncated."
     )
 
-    with {{:ok, lv}, left_budget} <- run_batch(left, embed_fun, opts, budget),
-         {{:ok, rv}, spent} <- run_batch(right, embed_fun, opts, left_budget) do
-      {{:ok, lv ++ rv}, spent}
+    with {{:ok, lv, lt}, left_budget} <- run_batch(left, embed_fun, opts, budget, offset),
+         {{:ok, rv, rt}, spent} <-
+           run_batch(right, embed_fun, opts, left_budget, offset + length(left)) do
+      {{:ok, lv ++ rv, lt ++ rt}, spent}
     end
   end
+
+  # Tagged ONCE per member: a deeper rung already tagged the same index, hence the uniq.
+  defp mark_index({:ok, v, truncated}, offset), do: {:ok, v, Enum.uniq([offset | truncated])}
+  defp mark_index(other, _offset), do: other
+
+  @doc """
+  Mark a stored `embedding_content_hash` whose vector covers only a PREFIX of the text.
+  The hash still identifies the FULL text — idempotency guards compare `whole_hash/1` —
+  so the mark records truncation without re-billing the provider on every enqueue.
+  `truncated_hash?/1` reads it back; `truncated_hash_pattern/0` is its SQL `LIKE` form.
+  """
+  @spec truncated_hash(String.t()) :: String.t()
+  def truncated_hash(hash) when is_binary(hash), do: @truncated_hash_prefix <> hash
+
+  @doc false
+  def truncated_hash?(hash),
+    do: is_binary(hash) and String.starts_with?(hash, @truncated_hash_prefix)
+
+  @doc false
+  def whole_hash(@truncated_hash_prefix <> hash), do: hash
+  def whole_hash(hash), do: hash
+
+  @doc false
+  def truncated_hash_pattern, do: @truncated_hash_prefix <> "%"
 
   @doc """
   Split `items` into groups whose cumulative text stays at/under `max_bytes`, so the
@@ -231,8 +282,9 @@ defmodule Loopctl.Embeddings.ShrinkLadder do
       end
     end
 
+    # `{:cont, acc}` — NOT `{:cont, [], acc}`, which emits an empty chunk for empty input.
     after_fun = fn
-      {[], _size} -> {:cont, [], {[], 0}}
+      {[], _size} -> {:cont, {[], 0}}
       {acc, _size} -> {:cont, Enum.reverse(acc), {[], 0}}
     end
 

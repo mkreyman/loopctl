@@ -256,7 +256,15 @@ defmodule Loopctl.Workers.ReembedWorker do
 
     case result do
       {:ok, vectors} ->
-        store_checked(tenant_id, target_dim, entries, vectors, store_fun)
+        store_checked(tenant_id, target_dim, entries, vectors, [], store_fun)
+
+      # The ladder could only embed these members as a PREFIX. They are stored (recall
+      # over part of an over-long text is the point of the ladder) but MARKED, so the
+      # readers that COMPARE vectors — the consolidation corroboration gate, the memory
+      # near-dup supersede — can tell a prefix from a whole text instead of judging one
+      # against the other.
+      {:ok, vectors, truncated} ->
+        store_checked(tenant_id, target_dim, entries, vectors, truncated, store_fun)
 
       {:error, :embedding_batch_length_mismatch} = mismatch ->
         mismatch
@@ -274,12 +282,16 @@ defmodule Loopctl.Workers.ReembedWorker do
   defp reembed_model(nil), do: :configured
   defp reembed_model(model) when is_binary(model), do: model
 
-  defp store_checked(tenant_id, target_dim, entries, vectors, store_fun) do
+  defp store_checked(tenant_id, target_dim, entries, vectors, truncated, store_fun) do
     case Dimensions.check_batch_length(vectors, target_dim) do
       :ok ->
+        marked = MapSet.new(truncated)
+
         triples =
-          Enum.zip_with(entries, vectors, fn {subject, text}, vector ->
-            {subject, vector, content_hash(text)}
+          entries
+          |> Enum.zip(vectors)
+          |> Enum.with_index(fn {{subject, text}, vector}, index ->
+            {subject, vector, hash_for(text, MapSet.member?(marked, index))}
           end)
 
         # The side table ONLY (`legacy_write: false`, review). The target dimension
@@ -414,4 +426,7 @@ defmodule Loopctl.Workers.ReembedWorker do
   defp memory_text(memory), do: TextBudget.initial(memory.text || "")
 
   defp content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
+
+  defp hash_for(text, false), do: content_hash(text)
+  defp hash_for(text, true), do: text |> content_hash() |> ShrinkLadder.truncated_hash()
 end

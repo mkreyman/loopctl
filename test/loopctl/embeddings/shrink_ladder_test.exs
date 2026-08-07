@@ -135,7 +135,7 @@ defmodule Loopctl.Embeddings.ShrinkLadderTest do
       texts = ["a", String.duplicate("b", 50_000), "c", "d"]
       {fun, _calls} = batch_provider(20_000)
 
-      assert {:ok, vectors} = ShrinkLadder.embed_batch(texts, fun)
+      assert {:ok, vectors, [1]} = ShrinkLadder.embed_batch(texts, fun)
       assert length(vectors) == 4
       assert Enum.at(vectors, 0) == vector("a")
       assert Enum.at(vectors, 2) == vector("c")
@@ -149,11 +149,22 @@ defmodule Loopctl.Embeddings.ShrinkLadderTest do
       long = String.duplicate("L", 50_000)
       {fun, _calls} = batch_provider(20_000)
 
-      assert {:ok, vectors} = ShrinkLadder.embed_batch([short, long, short], fun)
+      # The truncated INDEX is reported, not merely the vectors: a storing caller must mark
+      # that row or the corpus fills with prefix vectors indistinguishable from whole-text
+      # ones, and the next comparison judges a whole text against one of them.
+      assert {:ok, vectors, [1]} = ShrinkLadder.embed_batch([short, long, short], fun)
 
       assert Enum.at(vectors, 0) == vector(short)
       assert Enum.at(vectors, 2) == vector(short)
       assert Enum.at(vectors, 1) != vector(long), "the over-long member was not truncated"
+    end
+
+    test "an untruncated batch reports no truncation at all" do
+      # The two-tuple is the caller's licence to store the vectors unmarked, so it must
+      # never be returned for a batch the ladder actually shrank.
+      {fun, _calls} = batch_provider(20_000)
+
+      assert {:ok, [_, _]} = ShrinkLadder.embed_batch(["a", "b"], fun)
     end
 
     test "an empty batch makes no provider call" do
@@ -194,8 +205,21 @@ defmodule Loopctl.Embeddings.ShrinkLadderTest do
       texts = for _ <- 1..8, do: String.duplicate("x", 40_000)
       {fun, _calls} = batch_provider(9_000)
 
-      assert {:ok, vectors} = ShrinkLadder.embed_batch(texts, fun)
+      assert {:ok, vectors, truncated} = ShrinkLadder.embed_batch(texts, fun)
       assert length(vectors) == 8
+      assert truncated == Enum.to_list(0..7), "a truncated member went unreported"
+    end
+
+    test "the default call budget never gives up on work the bisect could have finished" do
+      # The bisect's own worst case is ~2n-1 calls. A fixed 64 abandoned a 40-member batch
+      # of over-long texts mid-bisect and surfaced the 4xx, which the callers classify as
+      # PERMANENT — the job discards and the rows stay un-embedded, the outage the ladder
+      # exists to end. The default therefore scales with the batch.
+      texts = for _ <- 1..40, do: String.duplicate("x", 40_000)
+      {fun, _calls} = batch_provider(9_000)
+
+      assert {:ok, vectors, _truncated} = ShrinkLadder.embed_batch(texts, fun)
+      assert length(vectors) == 40
     end
 
     test ":max_calls bounds what one already-failing batch may spend" do

@@ -106,6 +106,7 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Embeddings
+  alias Loopctl.Embeddings.ShrinkLadder
   alias Loopctl.ExitTag
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
@@ -196,6 +197,10 @@ defmodule Loopctl.Knowledge.Consolidation do
   # in `0.0..1.0`. Measured band on the hosted corpus 2026-08-06: collisions at/below 0.68,
   # genuine duplicates at/above 0.84.
   @default_min_duplicate_similarity 0.80
+
+  # "No DB row" sentinel for the percent knob. `SystemConfig.get_int/2` requires an
+  # INTEGER default, so absence is signalled by a value no valid percent can take.
+  @no_pct -1
 
   # The visibility guard, in ONE place, usable in a `where` AND in a join `on` — see
   # `shared_only/1` for why it must be composed into every scope decision this pass makes.
@@ -705,6 +710,18 @@ defmodule Loopctl.Knowledge.Consolidation do
   # anything less is re-derived fresh and re-confirmed over two nights, which is cheap and
   # is the only thing that produces a fingerprint matching what the group now is.
   #
+  # And the live set must itself be the whole confirmed set, MINUS only what this pass
+  # retired. Retitling SPLITS a group, so the subgroup check catches it; archiving a
+  # member, deleting it or marking it private SHRINKS the group without splitting it, and
+  # the survivors still share one title — so comparing the subgroup against `live` alone
+  # would apply a two-member fingerprint no report ever carried, on the night an operator
+  # remedied the group by hiding its members.
+  #
+  # The one shrink that is NOT that is this pass's own part-drain (#614): `unpublish` is
+  # the only write it makes, so a member it retired is a still-shared DRAFT, and the group
+  # left behind is winner-plus-leftovers — the same group converging on the outcome that
+  # WAS confirmed. `drained_by_this_pass?/2` is what tells the two apart.
+  #
   # The predicate re-checked is the one that FORMED the group — `title_drift?/1` is the
   # same classifier `corroborated?/3` branches on, so the two cannot disagree about what a
   # group is. Re-checking titles on an idempotency-drift group would reject every one of
@@ -716,14 +733,49 @@ defmodule Loopctl.Knowledge.Consolidation do
         do: {"normalized title", &title_group_key/1},
         else: {"normalized idempotency key", &idempotency_group_key/1}
 
+    confirmed = Enum.uniq(proposal.article_ids)
+
     case colliding_subgroups(live, key_fun) do
       [members] when length(members) == length(live) ->
-        corroborate(tenant_id, proposal, members, budget, scored)
+        whole_group(tenant_id, proposal, members, confirmed, {budget, scored})
 
       other ->
         log_dissolved(tenant_id, proposal, live, other, signal)
         :skip
     end
+  end
+
+  defp whole_group(tenant_id, proposal, live, confirmed, {budget, scored}) do
+    departed = confirmed -- Enum.map(live, & &1.id)
+
+    if departed == [] or drained_by_this_pass?(tenant_id, departed) do
+      corroborate(tenant_id, proposal, live, budget, scored)
+    else
+      log_shrunk(tenant_id, proposal, live, departed)
+      :skip
+    end
+  end
+
+  # Every departed member is a still-shared DRAFT, i.e. exactly what this pass's own
+  # `unpublish` leaves behind. An archived, deleted or now-private member is a shrink by a
+  # hand that never confirmed the smaller group, so the remainder is re-derived instead.
+  defp drained_by_this_pass?(tenant_id, ids) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id and a.id in ^ids and a.status == :draft
+    )
+    |> shared_only()
+    |> AdminRepo.aggregate(:count)
+    |> Kernel.==(length(ids))
+  end
+
+  defp log_shrunk(tenant_id, proposal, live, departed) do
+    Logger.info(
+      "Consolidation: tenant=#{tenant_id} skipped duplicate_capture proposal " <>
+        "##{proposal.number} — #{length(departed)} confirmed member(s) left the group by " <>
+        "something other than this pass's own unpublish (archived, deleted or made " <>
+        "private), so its #{length(live)} survivor(s) are a group nothing has confirmed. " <>
+        "The next scan re-derives what is left and the two-run gate re-confirms it."
+    )
   end
 
   # Members still sharing one normalized key, in subgroups of at least two. A member whose
@@ -1322,9 +1374,20 @@ defmodule Loopctl.Knowledge.Consolidation do
       else: :legacy
   end
 
+  # A PREFIX vector is excluded from scoring, not scored (#617). The shrink ladder embeds
+  # an over-long body as its opening only, and two unrelated captures that share a
+  # boilerplate opening (CHANGELOG/API-doc headers — the exact population this gate was
+  # added for) then score near 1.0 against each other. Corroborating a title collision on
+  # that is the auto-unpublish the gate exists to prevent, arriving through the gate
+  # itself. A marked member is therefore treated as MISSING evidence — it drops out of
+  # `scored`, so `judge_similarity/2` withholds the whole group, which fails closed.
   defp score_pairs(query, :legacy) do
     from([a1, a2] in query,
       where: not is_nil(a1.embedding) and not is_nil(a2.embedding),
+      where:
+        not like(coalesce(a1.embedding_content_hash, ""), ^ShrinkLadder.truncated_hash_pattern()),
+      where:
+        not like(coalesce(a2.embedding_content_hash, ""), ^ShrinkLadder.truncated_hash_pattern()),
       group_by: fragment(unquote(@title_key_sql), a1.title),
       select: %{
         min_sim: min(fragment("1 - (? <=> ?)", a1.embedding, a2.embedding)),
@@ -1341,6 +1404,10 @@ defmodule Loopctl.Knowledge.Consolidation do
       on: e1.article_id == a1.id and e1.dim == ^dim and e1.tenant_id == a1.tenant_id,
       join: e2 in "article_embeddings",
       on: e2.article_id == a2.id and e2.dim == ^dim and e2.tenant_id == a2.tenant_id,
+      where:
+        not like(coalesce(e1.embedding_content_hash, ""), ^ShrinkLadder.truncated_hash_pattern()),
+      where:
+        not like(coalesce(e2.embedding_content_hash, ""), ^ShrinkLadder.truncated_hash_pattern()),
       group_by: fragment(unquote(@title_key_sql), a1.title),
       select: %{
         min_sim: min(fragment("1 - (? <=> ?)", e1.embedding, e2.embedding)),
@@ -1384,10 +1451,18 @@ defmodule Loopctl.Knowledge.Consolidation do
   # `KnowledgeLintWorker` — this is the one threshold that decides whether the only
   # self-writing class applies anything at all, and an operator watching it behave wrong
   # must be able to move it without a deploy. The DB key is expressed in PERCENT
-  # (`..._pct`, `80` = 0.80) because `SystemConfig`'s cache is integer-typed; the app
-  # config stays the float layer beneath it. Resolution order: DB row -> app config ->
-  # module default, and an out-of-range value at EITHER layer falls back rather than
-  # clamping (see above).
+  # (`..._pct`, `80` = 0.80) because `SystemConfig`'s cache is integer-typed.
+  #
+  # The DB layer is read with a SENTINEL default and consulted only when a row actually
+  # exists, for two reasons. It keeps the app-config float exact — routing it through
+  # `round(x * 100)` quantized every threshold with more than two decimals (0.925 became
+  # 0.93) even for the deployments that set no DB row at all. And it lets the percent be
+  # range-checked as the INTEGER an operator types: only 1..99 is accepted, because the
+  # sibling drain caps read `0` as "disable" and here `0` does the OPPOSITE of disabling —
+  # `min_sim >= 0.0` holds for every pair, so the one content check on the auto-applying
+  # class is fully OFF and every title collision auto-unpublishes uncorroborated. `100` is
+  # rejected for the mirror-image reason given above. An out-of-range percent is treated
+  # as absent and falls through to the app layer, which is the conservative direction.
   defp min_duplicate_similarity do
     app_layer =
       :loopctl
@@ -1397,10 +1472,22 @@ defmodule Loopctl.Knowledge.Consolidation do
       )
       |> validate_similarity()
 
-    "knowledge_consolidation_min_duplicate_similarity_pct"
-    |> SystemConfig.get_int(round(app_layer * 100))
-    |> Kernel./(100)
-    |> validate_similarity()
+    case SystemConfig.get_int("knowledge_consolidation_min_duplicate_similarity_pct", @no_pct) do
+      pct when pct > 0 and pct < 100 ->
+        pct / 100
+
+      @no_pct ->
+        app_layer
+
+      other ->
+        Logger.warning(
+          "Consolidation: ignoring duplicate similarity percent #{inspect(other)} — not an " <>
+            "integer in 1..99 (0 would turn the corroboration gate OFF, not disable it); " <>
+            "using #{app_layer}."
+        )
+
+        app_layer
+    end
   end
 
   defp validate_similarity(value)

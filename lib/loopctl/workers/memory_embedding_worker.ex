@@ -147,17 +147,18 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
     # `ArticleEmbeddingWorker`'s ladder does; `content_hash` deliberately stays that
     # of the FULL text, so a truncated embed still satisfies the idempotency guard
     # instead of re-billing every enqueue.
-    result =
+    {result, stored_hash} =
       text
       |> ShrinkLadder.embed_one(
         &embed_with_custody(tenant_id, memory_id, &1, project_id),
         label: "MemoryEmbeddingWorker tenant=#{tenant_id} memory=#{memory_id}"
       )
+      |> then(&{&1, content_hash})
       |> store_prefix_too()
 
     case result do
       {:ok, embedding} ->
-        store(tenant_id, memory_id, embedding, content_hash)
+        store(tenant_id, memory_id, embedding, stored_hash)
 
       {:error, :no_api_key} ->
         skip_no_embedding_key(tenant_id, memory_id)
@@ -230,12 +231,17 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   defp custody_outcome({:ok, _}), do: :succeeded
   defp custody_outcome(_other), do: :failed
 
-  # A PREFIX vector (`:truncated`) is stored like any other: recall over part of an
-  # over-long memory is the whole point of the ladder here, and nothing on this path
-  # compares the vector against a whole-text one — unlike the promotion near-dup read,
-  # which refuses a prefix outright (`Memory.nearest_live/2`).
-  defp store_prefix_too({:ok, embedding, :truncated}), do: {:ok, embedding}
-  defp store_prefix_too(result), do: result
+  # A PREFIX vector (`:truncated`) IS stored — recall over part of an over-long memory is
+  # the whole point of the ladder — but stored MARKED. `Memory.first_promoted_near_dup/1`
+  # scans every promoted row's vector, so an unmarked prefix here would be compared at the
+  # near-dup threshold against candidates embedded from their WHOLE slice and could
+  # SUPERSEDE the longer memory: the same mismatched-extent compare `nearest_live/2`
+  # refuses on the candidate side, arriving from the other direction. The mark rides the
+  # content hash (`ShrinkLadder.truncated_hash/1`), which still identifies the full text.
+  defp store_prefix_too({{:ok, embedding, :truncated}, hash}),
+    do: {{:ok, embedding}, ShrinkLadder.truncated_hash(hash)}
+
+  defp store_prefix_too({result, hash}), do: {result, hash}
 
   defp store(tenant_id, memory_id, embedding, content_hash) do
     # Pre-write dimension check (review): an off-dimension model otherwise surfaced as a
@@ -284,11 +290,15 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
     # WRITE-dimension gated (`use_side_table_hash?/1`), not read-flag gated (review):
     # a non-1536 tenant has no legacy hash, so the read-flag gate re-billed the provider
     # on every enqueue until cutover.
+    # `whole_hash/1`: a truncation-marked hash still identifies the FULL text, so a
+    # prefix-embedded memory is already embedded and must not re-bill on every enqueue.
     if Embeddings.use_side_table_hash?(tenant_id) do
-      Embeddings.memory_embedded_hash(
-        tenant_id,
-        memory.id,
-        Embeddings.active_dimension(tenant_id)
+      ShrinkLadder.whole_hash(
+        Embeddings.memory_embedded_hash(
+          tenant_id,
+          memory.id,
+          Embeddings.active_dimension(tenant_id)
+        )
       ) == content_hash
     else
       legacy_already_embedded?(memory, content_hash)
@@ -300,7 +310,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
          content_hash
        )
        when not is_nil(embedding) and is_binary(hash),
-       do: hash == content_hash
+       do: ShrinkLadder.whole_hash(hash) == content_hash
 
   defp legacy_already_embedded?(_memory, _content_hash), do: false
 

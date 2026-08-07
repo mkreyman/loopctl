@@ -143,12 +143,21 @@ defmodule Loopctl.Knowledge.ProposalGate do
   # The ladder (#617) can only embed an over-long proposal as a PREFIX, and it says so.
   # That vector is scored against corpus vectors built from whole texts, so a shared
   # opening (generated API docs, changelogs, a common frontmatter header) scores as a
-  # near-identity of a document it may differ from entirely after the cut. `:duplicate`
-  # makes `Knowledge.gate_proposal/4` return `created: false` — the proposal is DROPPED
-  # and the caller handed a pre-existing article — so a prefix may not reach that band:
-  # it is capped at `:low_novelty`, which still drafts the article and surfaces the
-  # neighbours for the agent to judge. The gate's job is to flag, never to lose a write.
-  defp cap_truncated(:duplicate, true), do: :low_novelty
+  # near-identity of a document it may differ from entirely after the cut. A prefix
+  # therefore supports NO negative verdict at all — neither band may be reached on one.
+  #
+  # `:low_novelty` is not a safe cap: under `on_low_novelty: :skip` (memory graduation,
+  # channel-post capture, ingestion `skip_low_novelty=true`) `Knowledge.gate_proposal/4`
+  # creates NOTHING for that band, so capping to it relabels the verdict and still drops
+  # the write for exactly the UNATTENDED callers that have no reviewer to recover it.
+  # `:unknown` is not safe either: those same callers pass `on_gate_unavailable: :skip`,
+  # which returns `{:error, :gate_unavailable}` so they can retry once embeddings recover
+  # — but truncation is a permanent property of the text, so the retry never clears.
+  # `:novel` creates on the requested path for EVERY caller class; `score` and `neighbors`
+  # still ride the assessment, so nothing is hidden, and the nightly consolidation pass
+  # remains the backstop for the rare over-long duplicate. The gate's job is to flag,
+  # never to lose a write.
+  defp cap_truncated(verdict, true) when verdict in [:duplicate, :low_novelty], do: :novel
   defp cap_truncated(verdict, _truncated?), do: verdict
 
   defp split_truncation({:ok, vector, :truncated}), do: {{:ok, vector}, true}
@@ -178,18 +187,24 @@ defmodule Loopctl.Knowledge.ProposalGate do
         # embedding failure, so an input-too-long rejection did not surface as an
         # error — it silently skipped novelty checking entirely, and the over-long
         # article landed as exactly the duplicate the nightly consolidation pass then
-        # has to catch. `max_rungs: 1` because this runs SYNCHRONOUSLY in the write
-        # path: the full ladder puts up to four sequential provider round trips (and
-        # four embedding admission slots that interactive search shares) inside one
-        # article create, to buy a verdict this gate deliberately caps anyway. One
-        # rung, then the existing fall-open; `ArticleEmbeddingWorker` walks the rest.
+        # has to catch. `max_rungs` is BOUNDED because this runs SYNCHRONOUSLY in the
+        # write path — each rung is a provider round trip and an embedding admission slot
+        # that interactive search shares — but the bound must still REACH the floor, or
+        # the rung budget reproduces the silent skip it was added to close.
+        #
+        # THREE, because `build_text/1` caps at 32,000 CHARACTERS: a dense-script
+        # (Cyrillic/CJK) or code-heavy proposal arrives at up to 128,000 bytes, and
+        # `next_budget/1` caps the first rung at 32,000 bytes, then 16,000, then the 8,000
+        # floor. At one rung that whole class — exactly the articles #615 measured, and
+        # the ones most likely to be re-captured — landed back at the fall-open having had
+        # NO novelty check at all. Three rungs reach the floor from ANY first attempt.
         project_id = attrs["project_id"] || attrs[:project_id]
 
         {ShrinkLadder.embed_one(
            build_text(attrs),
            &Knowledge.generate_embedding(tenant_id, &1, project_id: project_id),
            label: "ProposalGate tenant=#{tenant_id}",
-           max_rungs: 1
+           max_rungs: 3
          ), true}
     end
   end

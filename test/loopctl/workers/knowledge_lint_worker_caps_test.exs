@@ -95,9 +95,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
       winner = publish!(tenant.id, "Lever Doc", String.duplicate("long ", 40))
       loser = publish!(tenant.id, "lever doc!", "short")
 
-      # Orthogonal vectors: cosine 0, so the default 0.80 threshold withholds the group.
+      # Cosine 0.6 — below the default 0.80, so the group is withheld until the lever moves.
       embed!(tenant.id, winner, [1.0 | List.duplicate(0.0, 1535)])
-      embed!(tenant.id, loser, [0.0, 1.0 | List.duplicate(0.0, 1534)])
+      embed!(tenant.id, loser, [0.6, 0.8 | List.duplicate(0.0, 1534)])
 
       {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
       {:ok, _} = Consolidation.run(tenant.id)
@@ -105,12 +105,34 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
       assert %{applied: 0, uncorroborated: 1} =
                Consolidation.apply_confirmed_duplicates(tenant.id)
 
-      {:ok, _} = SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", 0)
+      {:ok, _} = SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", 50)
 
       assert %{applied: 1, uncorroborated: 0} =
                Consolidation.apply_confirmed_duplicates(tenant.id)
 
       assert AdminRepo.get!(Article, loser).status == :draft
+    end
+
+    test "0 does NOT mean 'off' here — it is refused, not honoured as a pause" do
+      # The sibling drain caps read 0 as an explicit pause, so 0 is the value an operator
+      # reaches for to "turn the corroboration gate off". On THIS knob it does the
+      # opposite: `min_sim >= 0.0` holds for every pair, so every title collision would
+      # auto-unpublish with no content evidence at all. It falls back to the app layer.
+      tenant = fixture(:tenant)
+      winner = publish!(tenant.id, "Off Switch", String.duplicate("long ", 40))
+      loser = publish!(tenant.id, "off switch!", "short")
+
+      embed!(tenant.id, winner, [1.0 | List.duplicate(0.0, 1535)])
+      embed!(tenant.id, loser, [0.0, 1.0 | List.duplicate(0.0, 1534)])
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+      {:ok, _} = SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", 0)
+
+      assert %{applied: 0, uncorroborated: 1} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert AdminRepo.get!(Article, loser).status == :published
     end
   end
 

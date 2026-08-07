@@ -166,7 +166,12 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
 
     case result do
       {:ok, vectors} ->
-        store_all(tenant_id, dim, Enum.zip(entries, vectors))
+        store_all(tenant_id, dim, zip_marked(entries, vectors, []))
+
+      # A member the ladder could only embed as a PREFIX is stored MARKED, so a reader
+      # that COMPARES vectors can tell it from a whole-text one (see `ShrinkLadder`).
+      {:ok, vectors, truncated} ->
+        store_all(tenant_id, dim, zip_marked(entries, vectors, truncated))
 
       {:error, :embedding_batch_length_mismatch} = mismatch ->
         mismatch
@@ -187,7 +192,9 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
 
     Enum.split_with(entries, fn {article, text} ->
       case Map.get(hashes, article.id) do
-        stored when is_binary(stored) -> stored == content_hash(text)
+        # `whole_hash/1`: a truncation-marked hash still identifies the FULL text, so an
+        # article whose vector is a prefix is UNCHANGED and must not be re-billed.
+        stored when is_binary(stored) -> ShrinkLadder.whole_hash(stored) == content_hash(text)
         _ -> false
       end
     end)
@@ -197,23 +204,33 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   # failure means zero writes and the batch retries as a unit. The batch's vector
   # LENGTH is checked once, before the first write, so a model that does not emit
   # `dim` fails legibly instead of burning five attempts of provider spend.
-  defp store_all(tenant_id, dim, pairs) do
-    case Dimensions.check_batch_length(Enum.map(pairs, fn {_entry, v} -> v end), dim) do
-      :ok -> do_store_all(tenant_id, dim, pairs)
+  defp store_all(tenant_id, dim, triples) do
+    case Dimensions.check_batch_length(Enum.map(triples, fn {_a, v, _h} -> v end), dim) do
+      :ok -> do_store_all(tenant_id, dim, triples)
       {:error, {:dimension_mismatch, expected, actual}} -> discard_mismatch(expected, actual)
     end
+  end
+
+  defp zip_marked(entries, vectors, truncated) do
+    marked = MapSet.new(truncated)
+
+    entries
+    |> Enum.zip(vectors)
+    |> Enum.with_index(fn {{article, text}, vector}, index ->
+      {article, vector, hash_for(text, MapSet.member?(marked, index))}
+    end)
   end
 
   # Returns `:ok` WITHOUT continuing: `embed_entries/3` drives the sub-batches and calls
   # `continue/2` once, after the last one — continuing here would enqueue the next page
   # per sub-batch.
-  defp do_store_all(tenant_id, dim, pairs) do
-    Enum.reduce_while(pairs, :ok, fn {{article, text}, vector}, :ok ->
+  defp do_store_all(tenant_id, dim, triples) do
+    Enum.reduce_while(triples, :ok, fn {article, vector, hash}, :ok ->
       case Embeddings.materialize_system_article_embedding(
              tenant_id,
              article,
              vector,
-             content_hash(text),
+             hash,
              dim
            ) do
         {:ok, _row} -> {:cont, :ok}
@@ -294,4 +311,7 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   end
 
   defp content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
+
+  defp hash_for(text, false), do: content_hash(text)
+  defp hash_for(text, true), do: text |> content_hash() |> ShrinkLadder.truncated_hash()
 end

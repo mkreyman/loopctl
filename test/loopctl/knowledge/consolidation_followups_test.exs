@@ -13,6 +13,7 @@ defmodule Loopctl.Knowledge.ConsolidationFollowupsTest do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Embeddings.ShrinkLadder
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.Consolidation
   alias Loopctl.Knowledge.ConsolidationProposal
@@ -196,6 +197,33 @@ defmodule Loopctl.Knowledge.ConsolidationFollowupsTest do
       assert status(other.id) == :published
     end
 
+    test "a group ARCHIVED down to two is skipped — a shrink is a remedy too, not just a retitle" do
+      # Retitling SPLITS a group, so the subgroup check catches it. Archiving members (or
+      # making them private) SHRINKS it without splitting, and the survivors still share
+      # one title — so the pass would auto-unpublish on a two-id fingerprint no report ever
+      # carried, on the night an operator hid the rest.
+      tenant = fixture(:tenant)
+
+      keep = published(tenant.id, %{title: "Shrunk Doc", body: String.duplicate("long ", 40)})
+      stays = published(tenant.id, %{title: "shrunk doc.", body: "stays"})
+
+      hidden =
+        for i <- 1..3 do
+          published(tenant.id, %{title: "Shrunk Doc" <> String.duplicate("!", i), body: "h"})
+        end
+
+      confirm_over_two_nights(tenant.id)
+
+      Enum.each(hidden, fn a ->
+        a |> Ecto.Changeset.change(%{status: :archived}) |> AdminRepo.update!()
+      end)
+
+      assert %{applied: 0, skipped: 1} = Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert status(keep.id) == :published
+      assert status(stays.id) == :published
+    end
+
     test "a group that SPLIT into two collisions is skipped whole rather than half-applied" do
       # The persisted proposal describes ONE collision; the corpus now holds two. Applying
       # the larger half would unpublish on grounds the proposal never asserted.
@@ -307,6 +335,39 @@ defmodule Loopctl.Knowledge.ConsolidationFollowupsTest do
       assert status(a.id) == :published
       assert status(b.id) == :published
     end
+  end
+
+  describe "the corroboration gate refuses PREFIX vectors (#617 round 2)" do
+    test "a member whose vector covers only a prefix is missing evidence, not evidence" do
+      # The shrink ladder embeds an over-long body as its OPENING only. Two unrelated
+      # captures that share a boilerplate opening (CHANGELOG/API-doc headers — the exact
+      # population this gate was added for) then score near 1.0 against each other, and the
+      # content check that exists to stop unrelated same-titled articles being
+      # auto-unpublished would be satisfied by two truncations. A marked vector therefore
+      # drops out of scoring and the whole group is withheld.
+      tenant = fixture(:tenant)
+
+      keep = published(tenant.id, %{title: "Prefix Doc", body: String.duplicate("long ", 40)})
+      other = published(tenant.id, %{title: "prefix doc!", body: "short"})
+
+      confirm_over_two_nights(tenant.id)
+
+      mark_prefix_embedded!(tenant.id, other.id)
+
+      assert %{applied: 0, uncorroborated: 1} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert status(keep.id) == :published
+      assert status(other.id) == :published
+    end
+  end
+
+  # `corroborate_all!/1` stores whole-text hashes; this re-marks ONE of them the way the
+  # ladder's storing callers do when they could only embed a prefix.
+  defp mark_prefix_embedded!(tenant_id, id) do
+    Article
+    |> where([a], a.tenant_id == ^tenant_id and a.id == ^id)
+    |> AdminRepo.update_all(set: [embedding_content_hash: ShrinkLadder.truncated_hash("abc")])
   end
 
   describe "generic_titles — count and page are separate queries (#617 item 6)" do
