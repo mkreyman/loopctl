@@ -8,6 +8,34 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **The three consolidation drain caps are now live-tunable without a deploy (#617).**
+  `knowledge_consolidation_max_applies`, `knowledge_consolidation_max_unpublishes` and
+  `knowledge_consolidation_max_per_class` are read from `SystemConfig` DB rows first, falling
+  back to the compile-time application config and then to the built-in default. Setting
+  `knowledge_consolidation_max_unpublishes` to **0** halts the auto-unpublish drain, and that
+  halt now takes effect on the next nightly rather than on the next deploy — which is the
+  whole point, since the caps are the only lever an operator has while an apply is going
+  wrong. The existing config values keep working unchanged; nothing needs to be set.
+
+- **An over-long input no longer permanently strands a row un-embedded (#617).** #615 added
+  the byte budget and shrink ladder to the two article-embedding workers. The same rejection
+  on the re-embed, system-corpus, agent-memory and novelty-gate paths still mapped to a
+  permanent 4xx and DISCARDED the job — so a single over-long article could wedge a whole
+  tenant re-embed mid-run (leaving recall pinned at the old dimension), and an over-long
+  memory was permanently absent from semantic recall. All four now walk the same ladder,
+  embedding a prefix rather than nothing. Array calls bisect first, so only the member that
+  actually overflows is truncated. No configuration change; the effect is fewer rows silently
+  missing from semantic search.
+
+- **The nightly re-checks that a confirmed duplicate group still COLLIDES before unpublishing
+  it (#617).** The apply path previously re-checked only that the group's members were still
+  published. Retitling the articles is the remedy for a false grouping, and a retitled group
+  passed that check — it was saved only because a fresh derivation happened to drop the group
+  first. The grouping signal (normalized title, or normalized idempotency key, whichever
+  formed the group) is now re-evaluated at apply time; a group that has dissolved or split is
+  skipped and re-derived. A duplicate group also carries at most 50 members onto one proposal,
+  with the remainder re-derived on the next run.
+
 - **The nightly consolidation drain rates are raised so the duplicate backlog converges to
   zero instead of to a floor (#611).** Three settings, all previously pinned to module
   defaults sized for a class that had never applied anything in production:

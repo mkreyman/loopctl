@@ -67,13 +67,13 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   alias Loopctl.Egress
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
+  alias Loopctl.Embeddings.ShrinkLadder
+  alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Provider.Admission
   alias Loopctl.Provider.RetryAfter
-
-  @max_text_length 32_000
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"tenant_id" => tenant_id} = args}) when is_binary(tenant_id) do
@@ -127,15 +127,27 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
 
   defp embed_entries(tenant_id, dim, []), do: continue(tenant_id, dim)
 
+  # Through `ShrinkLadder.embed_batch/3` (#617). An input-too-long rejection used to
+  # reach `handle_error/2`, where `permanent_provider_error?/1` is `true` for any 4xx —
+  # so one over-long canonical DISCARDED the job and left that canonical keyword-only
+  # for this tenant while `system_corpus_meta/2` kept reporting "semantic". The ladder
+  # bisects to isolate the offender and truncates only it.
   defp embed_entries(tenant_id, dim, entries) do
     texts = Enum.map(entries, fn {_a, text} -> text end)
 
-    case Knowledge.generate_embeddings(tenant_id, texts) do
-      {:ok, vectors} when length(vectors) == length(entries) ->
+    result =
+      ShrinkLadder.embed_batch(
+        texts,
+        &Knowledge.generate_embeddings(tenant_id, &1),
+        label: "SystemCorpusEmbeddingWorker tenant=#{tenant_id}"
+      )
+
+    case result do
+      {:ok, vectors} ->
         store_all(tenant_id, dim, Enum.zip(entries, vectors))
 
-      {:ok, _mismatch} ->
-        {:error, :embedding_batch_length_mismatch}
+      {:error, :embedding_batch_length_mismatch} = mismatch ->
+        mismatch
 
       {:error, reason} ->
         handle_error(tenant_id, reason)
@@ -254,8 +266,11 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
 
   defp batch_size, do: Knowledge.embedding_batch_max()
 
+  # The same 32,000-CHARACTER first attempt as before, named once (#617) so it cannot
+  # drift from the rung `ShrinkLadder` starts below. The hash in `split_unchanged/3`
+  # is computed over exactly this text, so the cut must not change silently.
   defp embedding_text(article) do
-    String.slice("#{article.title}\n\n#{article.body}", 0, @max_text_length)
+    TextBudget.initial("#{article.title}\n\n#{article.body}")
   end
 
   defp content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)

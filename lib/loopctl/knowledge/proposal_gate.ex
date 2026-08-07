@@ -35,6 +35,8 @@ defmodule Loopctl.Knowledge.ProposalGate do
 
   require Logger
 
+  alias Loopctl.Embeddings.ShrinkLadder
+  alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm
@@ -43,7 +45,6 @@ defmodule Loopctl.Knowledge.ProposalGate do
   @default_duplicate_threshold 0.97
   @default_overlap_threshold 0.88
   @neighbors_k 5
-  @max_text_length 32_000
 
   @impl true
   def assess(tenant_id, attrs, opts \\ [])
@@ -153,8 +154,18 @@ defmodule Loopctl.Knowledge.ProposalGate do
         # project-only `local_only` marking would not be enforced on a path that
         # runs SYNCHRONOUSLY in the `knowledge_create` write path — and because the
         # gate deliberately falls OPEN, the refusal would be silent.
-        {Knowledge.generate_embedding(tenant_id, build_text(attrs),
-           project_id: attrs["project_id"] || attrs[:project_id]
+        # Through `ShrinkLadder.embed_one/3` (#617). This gate falls OPEN on an
+        # embedding failure, so an input-too-long rejection did not surface as an
+        # error — it silently skipped novelty checking entirely, and the over-long
+        # article landed as exactly the duplicate the nightly consolidation pass then
+        # has to catch. The ladder is paid only by an input the provider rejected, on
+        # a request that was already going to make an extra round trip and fall open.
+        project_id = attrs["project_id"] || attrs[:project_id]
+
+        {ShrinkLadder.embed_one(
+           build_text(attrs),
+           &Knowledge.generate_embedding(tenant_id, &1, project_id: project_id),
+           label: "ProposalGate tenant=#{tenant_id}"
          ), true}
     end
   end
@@ -162,7 +173,7 @@ defmodule Loopctl.Knowledge.ProposalGate do
   defp build_text(attrs) do
     title = attrs["title"] || attrs[:title] || ""
     body = attrs["body"] || attrs[:body] || ""
-    String.slice("#{title}\n\n#{body}", 0, @max_text_length)
+    TextBudget.initial("#{title}\n\n#{body}")
   end
 
   defp open_verdict, do: %{verdict: :unknown, score: nil, neighbors: [], gate_embedded: false}

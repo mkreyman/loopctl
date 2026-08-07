@@ -55,6 +55,7 @@ defmodule Loopctl.Memory do
 
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Embeddings
+  alias Loopctl.Embeddings.ShrinkLadder
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.IdempotencyTag
@@ -2653,12 +2654,22 @@ defmodule Loopctl.Memory do
   # rather than a silent overwrite of human-authored knowledge. Results are
   # distance-ordered (nearest first), so the first ELIGIBLE promoted row above threshold
   # wins; missing one (pool dominated by explicit rows) is safe — insert fresh instead.
+  #
+  # The embed goes through `ShrinkLadder.embed_one/3` (#617): an over-long memory
+  # returned `{:api_error, 400, :context_length_exceeded}`, which fell into the
+  # `{:error, _reason}` branch below as `:embeddings_degraded` and ABORTED the whole
+  # promotion run — permanently, since the next run embeds the identical text and is
+  # rejected identically. The ladder makes a long memory promotable on a prefix
+  # instead of making it unpromotable forever.
   defp nearest_live(scope, text) do
-    case Knowledge.generate_embedding(
-           scope.tenant_id,
-           MemorySchema.embedding_input(text),
-           egress_opts(scope)
-         ) do
+    embed =
+      ShrinkLadder.embed_one(
+        MemorySchema.embedding_input(text),
+        &Knowledge.generate_embedding(scope.tenant_id, &1, egress_opts(scope)),
+        label: "Memory.nearest_live tenant=#{scope.tenant_id}"
+      )
+
+    case embed do
       {:error, _reason} ->
         {:error, :embeddings_degraded}
 

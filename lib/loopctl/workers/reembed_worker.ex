@@ -85,13 +85,13 @@ defmodule Loopctl.Workers.ReembedWorker do
   alias Loopctl.Egress
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
+  alias Loopctl.Embeddings.ShrinkLadder
+  alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Provider.Admission
   alias Loopctl.Provider.RetryAfter
-
-  @max_text_length 32_000
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"tenant_id" => tenant_id, "target_dim" => target_dim} = args})
@@ -213,19 +213,31 @@ defmodule Loopctl.Workers.ReembedWorker do
   # while this runs. This worker's whole job is to produce vectors at the PENDING
   # model's dimension, so it — and only it — uses the tenant's currently configured
   # model.
+  # The array call goes through `ShrinkLadder.embed_batch/3` (#617): an input-too-long
+  # rejection used to fall through `handle_error/2` to `permanent_provider_error?/1`,
+  # which is `true` for any 4xx — so ONE over-long article DISCARDED the job, the
+  # re-embed never reached `complete_reembed/3`, and the tenant's recall stayed pinned
+  # at the old dimension permanently. Dissolving to `ArticleEmbeddingWorker` (the
+  # BatchArticleEmbeddingWorker answer) is wrong here: that worker writes the ACTIVE
+  # dimension with the configured model, not this run's PENDING dimension and pinned
+  # model. Bisect-then-ladder keeps both pins and truncates only the offender.
   defp embed_and_store(tenant_id, target_dim, model, entries, opts, store_fun) do
     texts = Enum.map(entries, fn {_subject, text} -> text end)
+    embed_opts = [embedding_model: reembed_model(model)] ++ opts
 
-    case Knowledge.generate_embeddings(
-           tenant_id,
-           texts,
-           [embedding_model: reembed_model(model)] ++ opts
-         ) do
-      {:ok, vectors} when length(vectors) == length(entries) ->
+    result =
+      ShrinkLadder.embed_batch(
+        texts,
+        &Knowledge.generate_embeddings(tenant_id, &1, embed_opts),
+        label: "ReembedWorker tenant=#{tenant_id}"
+      )
+
+    case result do
+      {:ok, vectors} ->
         store_checked(tenant_id, target_dim, entries, vectors, store_fun)
 
-      {:ok, _mismatch} ->
-        {:error, :embedding_batch_length_mismatch}
+      {:error, :embedding_batch_length_mismatch} = mismatch ->
+        mismatch
 
       {:error, reason} ->
         handle_error(tenant_id, reason)
@@ -369,11 +381,15 @@ defmodule Loopctl.Workers.ReembedWorker do
     end
   end
 
+  # `TextBudget.initial/1` is the same 32,000-CHARACTER cut this worker has always
+  # applied, now named once (#617) so the first attempt cannot drift away from the
+  # rung the ladder starts below. It stays CHARACTERS on purpose: a byte cap here
+  # would silently shorten multi-byte text the provider was already accepting.
   defp article_text(article) do
-    String.slice("#{article.title}\n\n#{article.body}", 0, @max_text_length)
+    TextBudget.initial("#{article.title}\n\n#{article.body}")
   end
 
-  defp memory_text(memory), do: String.slice(memory.text || "", 0, @max_text_length)
+  defp memory_text(memory), do: TextBudget.initial(memory.text || "")
 
   defp content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
 end

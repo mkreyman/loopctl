@@ -63,6 +63,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   import Loopctl.Egress, only: [is_egress_refusal: 1]
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
+  alias Loopctl.Embeddings.ShrinkLadder
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -137,7 +138,21 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
     # Recorded BEFORE the call so a provider failure that happens AFTER the body
     # left the process still leaves a recorded operation naming the endpoint, and
     # never a contiguous sequence that omits it.
-    result = embed_with_custody(tenant_id, memory_id, text, project_id)
+    # Through `ShrinkLadder.embed_one/3` (#617). Without it an input-too-long
+    # rejection fell to the generic branch below, where `permanent_provider_error?/1`
+    # is `true` for any 4xx, and the memory DISCARDED — permanently absent from
+    # semantic recall with no repair path, the same shape as the 80-article article
+    # outage #615 fixed. Each rung re-enters `embed_with_custody/4` so every provider
+    # call it makes is its own recorded posture entry, exactly as
+    # `ArticleEmbeddingWorker`'s ladder does; `content_hash` deliberately stays that
+    # of the FULL text, so a truncated embed still satisfies the idempotency guard
+    # instead of re-billing every enqueue.
+    result =
+      ShrinkLadder.embed_one(
+        text,
+        &embed_with_custody(tenant_id, memory_id, &1, project_id),
+        label: "MemoryEmbeddingWorker tenant=#{tenant_id} memory=#{memory_id}"
+      )
 
     case result do
       {:ok, embedding} ->

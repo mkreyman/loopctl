@@ -116,6 +116,10 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   @default_max_per_class 100
   @hard_max_per_class 500
+
+  # The most members one duplicate group may carry onto a proposal (#617). See
+  # `cap_members/1` for why truncating is safe and why it must be deterministic.
+  @max_group_members 50
   # Page-depth ceiling. A report holds at most one cap's worth of proposals per class, so
   # this is well past the end of any real page — it exists so an unbounded `offset` cannot
   # reach Postgrex as an out-of-bigint-range integer and 500 the read endpoint.
@@ -128,6 +132,12 @@ defmodule Loopctl.Knowledge.Consolidation do
   # Placeholder titles that block hub creation (the "Untitled Document" 409). ONE
   # definition, referenced by both the query and the endpoint documentation.
   @generic_title_pattern "^(untitled|untitled document|new article|new document|document|draft|no title|untitled note)( [0-9]+)?$"
+
+  # The SAME pattern, compiled once for the apply-time re-check (`title_group_key/1`),
+  # which runs in Elixir rather than in Postgres. Anchors, alternation and `[0-9]+` mean
+  # exactly the same thing in POSIX ERE and in PCRE, so the two evaluations agree; it is
+  # derived from the one string above so they cannot drift.
+  @generic_title_regex Regex.compile!(@generic_title_pattern)
   # The heavy-read endpoint every whole-corpus enumeration in this module runs under.
   @heavy_endpoint :consolidation
 
@@ -135,6 +145,13 @@ defmodule Loopctl.Knowledge.Consolidation do
   # it and `pairwise_similarity_by_group/2` re-derives the same groups to score them; if the
   # two ever disagreed the gate would score the wrong sets and silently pass collisions.
   @title_key_sql "btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g'))"
+
+  # The idempotency-key twin, referenced by `idempotency_drift_groups/1` (which DERIVES the
+  # groups) and by `still_colliding/5` (which RE-CHECKS them at apply time) so the two cannot
+  # drift apart — the same pinning `@title_key_sql` gets, for the same reason. Deliberately
+  # NOT `lower()`-ed: an `idempotency_key` is an opaque writer-chosen token where case can be
+  # the only thing separating two of them, so folding it is a collision, not a normalization.
+  @idempotency_key_sql "btrim(regexp_replace(?, '[^[:alnum:]]+', ' ', 'g'))"
 
   # How many CONFIRMED duplicate groups one nightly run may apply. Bounded because each
   # apply is a write on the shared admin pool, and because a bug that mis-picks winners
@@ -226,11 +243,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   """
   @spec analyze(Ecto.UUID.t(), keyword()) :: {:ok, map()}
   def analyze(tenant_id, opts \\ []) do
-    cap =
-      opts
-      |> Keyword.get(:max_per_class, @default_max_per_class)
-      |> max(1)
-      |> min(@hard_max_per_class)
+    cap = clamp_per_class(Keyword.get(opts, :max_per_class, @default_max_per_class))
 
     # ONE gate slot for the whole read unit: the scans below are logically one pass, and
     # acquiring per query would let the cheap halves run ungated between the expensive ones.
@@ -298,7 +311,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     {:ok, report} =
       AdminRepo.transaction(fn ->
         report = upsert_report(tenant_id, day, analysis)
-        prune_proposals(report.id, analysis.proposals)
+        prune_proposals(tenant_id, report.id, analysis.proposals)
         Enum.each(analysis.proposals, &upsert_proposal(tenant_id, report.id, &1))
         report
       end)
@@ -426,6 +439,30 @@ defmodule Loopctl.Knowledge.Consolidation do
     )
 
     default
+  end
+
+  # The READ cap's twin of `clamp_cap/3`, and it needs the same type check for the same
+  # reason (#617). `analyze/2` used to pipe the raw opt through `max(1) |> min(hard)`,
+  # but a number sorts BELOW every atom and binary in Erlang term order — so a `nil`, an
+  # `:all`, or a `"100"` from a hand-rolled config read survived `max(1)` and came out of
+  # `min/2` as `@hard_max_per_class`. A malformed value resolved to the LARGEST blast
+  # radius available; a typo silently bought five times the intended report. It now falls
+  # back to the default and says so, exactly like the apply caps.
+  #
+  # The floor is 1 rather than `clamp_cap/3`'s 0 because this is the pure-read derivation:
+  # `0` here means "emit no proposals at all", which is not a pause an operator can
+  # meaningfully want from a report, whereas `0` on an APPLY cap is a real mid-incident
+  # halt.
+  defp clamp_per_class(value) when is_integer(value),
+    do: value |> max(1) |> min(@hard_max_per_class)
+
+  defp clamp_per_class(value) do
+    Logger.warning(
+      "Consolidation: ignoring non-integer :max_per_class #{inspect(value)}; using " <>
+        "#{@default_max_per_class}."
+    )
+
+    @default_max_per_class
   end
 
   defp run_confirmed_duplicates(tenant_id, cap, unpublish_cap) do
@@ -608,7 +645,10 @@ defmodule Loopctl.Knowledge.Consolidation do
         select: %{
           id: a.id,
           body_len: fragment("length(coalesce(?, ''))", a.body),
-          updated_at: a.updated_at
+          updated_at: a.updated_at,
+          title_key: fragment(unquote(@title_key_sql), a.title),
+          idempotency_key: a.idempotency_key,
+          idempotency_key_norm: fragment(unquote(@idempotency_key_sql), a.idempotency_key)
         }
       )
       |> shared_only()
@@ -620,16 +660,115 @@ defmodule Loopctl.Knowledge.Consolidation do
     if length(live) < 2 or budget < 1 do
       :skip
     else
-      case corroborated?(proposal, live, scored) do
-        :ok ->
-          apply_live_group(tenant_id, proposal, live, budget)
-
-        {:withheld, entry, unscored} ->
-          log_uncorroborated(tenant_id, proposal, live, entry, unscored)
-          backfill_missing_embeddings(tenant_id, unscored)
-          :uncorroborated
-      end
+      still_colliding(tenant_id, proposal, live, budget, scored)
     end
+  end
+
+  # The group must still be a group ON ITS OWN GROUNDS, not merely alive (#617).
+  #
+  # The liveness re-check above proves every member is still published; it does NOT prove
+  # they still collide. A proposal persists across nights, and the ONE remedy a human has
+  # for a false grouping is to retitle the articles — which is exactly what was done to 23
+  # articles on 2026-08-06 to stop three unrelated `Changelog` documents being auto-
+  # unpublished. Those articles were all still live, so liveness alone would have applied
+  # the stale group on grounds that no longer existed. It was saved only because a fresh
+  # derivation drops the group before it reaches apply, i.e. by a step OUTSIDE this
+  # function. That is a correct outcome resting on an accident of ordering, so the
+  # premise is now re-checked where it is used.
+  #
+  # A group that has SPLIT (two or more surviving keys with >= 2 members each) is skipped
+  # whole rather than applied to the larger half: the persisted proposal describes one
+  # collision, the corpus now holds two, and re-deriving them fresh is both cheap and the
+  # only thing that produces fingerprints matching what they now are.
+  #
+  # The predicate re-checked is the one that FORMED the group — `title_drift?/1` is the
+  # same classifier `corroborated?/3` branches on, so the two cannot disagree about what a
+  # group is. Re-checking titles on an idempotency-drift group would reject every one of
+  # them: those members collide on a writer-supplied key and have no reason to share a
+  # title.
+  defp still_colliding(tenant_id, proposal, live, budget, scored) do
+    subgroups =
+      if title_drift?(proposal),
+        do: colliding_subgroups(live, &title_group_key/1, fn _members -> true end),
+        else: colliding_subgroups(live, &idempotency_group_key/1, &distinct_verbatim_keys?/1)
+
+    case subgroups do
+      [members] ->
+        corroborate(tenant_id, proposal, members, budget, scored)
+
+      other ->
+        log_dissolved(tenant_id, proposal, live, other)
+        :skip
+    end
+  end
+
+  # Members still sharing one normalized key, in subgroups of at least two, subject to the
+  # extra condition the deriving query's `having` imposed. A member whose key no longer
+  # qualifies at all (blank, or — for titles — a placeholder) is dropped BEFORE grouping,
+  # mirroring the deriving query's `where`: it is no longer a member the scan would find.
+  defp colliding_subgroups(live, key_fun, extra) do
+    live
+    |> Enum.reject(&(key_fun.(&1) == :ineligible))
+    |> Enum.group_by(key_fun)
+    |> Map.values()
+    |> Enum.filter(&(length(&1) > 1 and extra.(&1)))
+  end
+
+  # `:ineligible` for anything `title_drift_groups/1`'s `where` would have excluded — a key
+  # that normalizes to nothing, and a PLACEHOLDER title. Placeholders are excluded there
+  # because "Draft"/"Untitled" collide with each other for reasons that have nothing to do
+  # with being the same capture; `generic_titles/2` is the class that owns them. Without
+  # this, a group retitled to two placeholders would re-collide here and auto-unpublish on
+  # a signal the scan deliberately refuses to raise.
+  defp title_group_key(%{title_key: key}) when is_binary(key) do
+    cond do
+      String.trim(key) == "" -> :ineligible
+      Regex.match?(@generic_title_regex, key) -> :ineligible
+      true -> key
+    end
+  end
+
+  defp title_group_key(_member), do: :ineligible
+
+  # `idempotency_drift_groups/1` requires a non-nil key that does not normalize to the
+  # empty string. Without this, every member whose key was cleared since the scan would
+  # share the `nil` key and re-form a "group" out of articles that now have no idempotency
+  # signal at all.
+  defp idempotency_group_key(%{idempotency_key: nil}), do: :ineligible
+
+  defp idempotency_group_key(%{idempotency_key_norm: key}) when is_binary(key) do
+    if String.trim(key) == "", do: :ineligible, else: key
+  end
+
+  defp idempotency_group_key(_member), do: :ineligible
+
+  # `idempotency_drift_groups/1` requires `count(idempotency_key, :distinct) > 1` — the class
+  # is about ONE key written under two FORMATS, not about two rows carrying the byte-identical
+  # key (that is an ordinary re-capture the writer meant). The re-check carries the same
+  # condition, or it would apply to groups the derivation would never have produced.
+  defp distinct_verbatim_keys?(members) do
+    members |> Enum.map(& &1.idempotency_key) |> Enum.uniq() |> length() > 1
+  end
+
+  defp corroborate(tenant_id, proposal, live, budget, scored) do
+    case corroborated?(proposal, live, scored) do
+      :ok ->
+        apply_live_group(tenant_id, proposal, live, budget)
+
+      {:withheld, entry, unscored} ->
+        log_uncorroborated(tenant_id, proposal, live, entry, unscored)
+        backfill_missing_embeddings(tenant_id, unscored)
+        :uncorroborated
+    end
+  end
+
+  defp log_dissolved(tenant_id, proposal, live, surviving) do
+    Logger.info(
+      "Consolidation: tenant=#{tenant_id} skipped duplicate_capture proposal " <>
+        "##{proposal.number} — its #{length(live)} live member(s) no longer share one " <>
+        "normalized title (#{length(surviving)} colliding subgroup(s)). The group was " <>
+        "retitled or split since it was proposed; the next scan re-derives what is left."
+    )
   end
 
   # A group withheld for MISSING evidence would otherwise be withheld on this and every
@@ -825,6 +964,22 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   defp heavy_all(query, tenant_id), do: HeavyRead.all(tenant_id, query, heavy_opts())
 
+  defp heavy_one(tenant_id, query), do: HeavyRead.one(tenant_id, query, heavy_opts())
+
+  # The matching set for `:generic_title`, as a composable query so the COUNT and the
+  # capped PAGE are built from ONE predicate and cannot drift into disagreeing about what
+  # "matching" means.
+  defp generic_title_base(tenant_id) do
+    from(a in published_base(tenant_id),
+      where:
+        fragment(
+          unquote(@title_key_sql <> " ~ ?"),
+          a.title,
+          ^@generic_title_pattern
+        )
+    )
+  end
+
   defp corpus_size(tenant_id) do
     HeavyRead.one(
       tenant_id,
@@ -863,7 +1018,11 @@ defmodule Loopctl.Knowledge.Consolidation do
 
     groups = titles |> interleave(idempotency) |> Enum.uniq_by(by_ids)
 
-    selected = Enum.take(groups, cap)
+    selected =
+      groups
+      |> Enum.take(cap)
+      |> Enum.map(fn {reason, ids} -> {reason, cap_members(ids)} end)
+
     evidence_by_id = evidence_map(tenant_id, Enum.flat_map(selected, fn {_r, ids} -> ids end))
 
     items =
@@ -889,6 +1048,35 @@ defmodule Loopctl.Knowledge.Consolidation do
   defp interleave([], rest), do: rest
   defp interleave(rest, []), do: rest
   defp interleave([a | as], [b | bs]), do: [a, b | interleave(as, bs)]
+
+  # The number of GROUPS was capped; the number of members WITHIN one group was not
+  # (#617). Every member id is carried on the proposal row, echoed in its `evidence`
+  # array, and re-sent as an `id in ^article_ids` parameter list on the apply path — so a
+  # pathological group (one normalized title shared by thousands of captures, which is
+  # exactly what filename-derived titles produce) writes an unbounded row and builds an
+  # unbounded query out of one night's scan.
+  #
+  # Truncation is SAFE here only because it is deterministic: `fingerprint/2` hashes the
+  # SORTED id set, and the two-run agreement gate confirms a group only when the same
+  # fingerprint appears in two consecutive reports. The `array_agg` orders by
+  # `inserted_at, id` — a TOTAL order, the `id` tiebreaker added with this cap — so both
+  # runs truncate to the byte-identical set and the group stays confirmable. Ordering by
+  # `inserted_at` alone left ties resolvable either way, which under a cap would flap the
+  # fingerprint and make such a group permanently unconfirmable.
+  #
+  # The leftovers are not lost: the winner stays published, so the next scan re-derives
+  # the remaining collision as a fresh group. Same drain-don't-stall shape as the apply
+  # budget in `apply_live_group/4`.
+  defp cap_members(ids) when length(ids) <= @max_group_members, do: ids
+
+  defp cap_members(ids) do
+    Logger.info(
+      "Consolidation: duplicate group of #{length(ids)} members truncated to " <>
+        "#{@max_group_members} for this run; the remainder re-derives next run."
+    )
+
+    Enum.take(ids, @max_group_members)
+  end
 
   # Titles that collide once case and punctuation are normalized away. The exact
   # active-title uniqueness check cannot see these — that is why they got published.
@@ -927,7 +1115,7 @@ defmodule Loopctl.Knowledge.Consolidation do
       where: fragment(unquote(@title_key_sql <> " !~ ?"), a.title, ^@generic_title_pattern),
       group_by: fragment(unquote(@title_key_sql), a.title),
       having: count(a.id) > 1,
-      select: %{ids: fragment("array_agg(?::text ORDER BY ?)", a.id, a.inserted_at)}
+      select: %{ids: fragment("array_agg(?::text ORDER BY ?, ?)", a.id, a.inserted_at, a.id)}
     )
     |> heavy_all(tenant_id)
     |> Enum.map(fn %{ids: ids} -> {@title_drift, ids} end)
@@ -1197,15 +1385,10 @@ defmodule Loopctl.Knowledge.Consolidation do
   defp idempotency_drift_groups(tenant_id) do
     from(a in published_base(tenant_id),
       where: not is_nil(a.idempotency_key),
-      where:
-        fragment(
-          "btrim(regexp_replace(?, '[^[:alnum:]]+', ' ', 'g')) <> ''",
-          a.idempotency_key
-        ),
-      group_by:
-        fragment("btrim(regexp_replace(?, '[^[:alnum:]]+', ' ', 'g'))", a.idempotency_key),
+      where: fragment(unquote(@idempotency_key_sql <> " <> ''"), a.idempotency_key),
+      group_by: fragment(unquote(@idempotency_key_sql), a.idempotency_key),
       having: count(a.id) > 1 and count(a.idempotency_key, :distinct) > 1,
-      select: %{ids: fragment("array_agg(?::text ORDER BY ?)", a.id, a.inserted_at)}
+      select: %{ids: fragment("array_agg(?::text ORDER BY ?, ?)", a.id, a.inserted_at, a.id)}
     )
     |> heavy_all(tenant_id)
     |> Enum.map(fn %{ids: ids} -> {@idempotency_drift, ids} end)
@@ -1236,21 +1419,25 @@ defmodule Loopctl.Knowledge.Consolidation do
   # "設計ドキュメント Draft" normalized to "draft" and was flagged as a placeholder title.
   # The ASCII-only `@generic_title_pattern` is anchored, so it still matches exactly the
   # placeholder titles against an `[[:alnum:]]`-normalized key.
+  #
+  # The COUNT and the PAGE are separate queries (#617). This used to `heavy_all` every
+  # matching id and then `Enum.take(ids, cap)` — shipping the whole matching set across the
+  # wire and through the heavy-read gate to keep `cap` of it, purely because `total` is
+  # needed for the truncation flag. A `SELECT count(*)` answers that without materializing
+  # anything, and `limit: ^cap` fetches only what is used.
   defp generic_titles(tenant_id, cap) do
-    ids =
-      from(a in published_base(tenant_id),
-        where:
-          fragment(
-            "btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g')) ~ ?",
-            a.title,
-            ^@generic_title_pattern
-          ),
+    matching = generic_title_base(tenant_id)
+
+    total = heavy_one(tenant_id, from(a in matching, select: count(a.id)))
+
+    selected =
+      from(a in matching,
         order_by: [asc: a.inserted_at, asc: a.id],
+        limit: ^cap,
         select: a.id
       )
       |> heavy_all(tenant_id)
 
-    selected = Enum.take(ids, cap)
     evidence_by_id = evidence_map(tenant_id, selected)
 
     items =
@@ -1265,7 +1452,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         )
       end)
 
-    {length(ids), items}
+    {total, items}
   end
 
   # `:stale_entry` WAS a class here. It is not any more, and the reason is that age is
@@ -1476,10 +1663,20 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   # A proposal the machine no longer derives is withdrawn, not left standing.
-  defp prune_proposals(report_id, proposals) do
+  #
+  # The `tenant_id` predicate is EXPLICIT (#617). This is an unqualified `delete_all`
+  # on AdminRepo, which is BYPASSRLS — so RLS provides no backstop and the WHERE clause
+  # is the ENTIRE tenant boundary. `report_id` happens to imply the tenant today (a
+  # report row belongs to exactly one), so this is defence in depth rather than a live
+  # cross-tenant delete; it is written out because the failure mode if that implication
+  # ever stops holding is silent destruction of another tenant's rows, and a deletion
+  # scoped only by a value derived elsewhere is a boundary you cannot see at the call
+  # site. Every AdminRepo delete in a tenant-scoped context names its tenant.
+  defp prune_proposals(tenant_id, report_id, proposals) do
     keep = Enum.map(proposals, & &1.fingerprint)
 
     from(p in ConsolidationProposal,
+      where: p.tenant_id == ^tenant_id,
       where: p.report_id == ^report_id,
       where: p.fingerprint not in ^keep
     )
