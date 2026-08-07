@@ -158,6 +158,32 @@ do not "simplify" either half.
 Ephemeral per-dispatch keys (minted via `POST /api/v1/dispatches`, MCP `dispatch` tool) replace
 long-lived env-var keys.
 
+## Custody halt (L6) — escalation is thresholded, and the halt is SCOPED
+
+A halt freezes the tenant's custody surface and only a human WebAuthn break-glass ceremony
+clears it, so both its trigger and its blast radius are deliberately bounded.
+
+- **Trigger** — `Loopctl.Custody.ViolationMonitor.record/3` (`lib/loopctl/custody/violation_monitor.ex`),
+  called from the `FallbackController`'s `:self_verify_blocked` / `:self_report_blocked` clauses.
+  It records the violation in `custody_violations` (tenant-scoped, RLS) and halts only when
+  `threshold/0` violations land inside `window_seconds/0` (defaults 3 / 3600). **Below the
+  threshold the custody gate still returns its 409** — only the escalation is thresholded.
+- **`cap_rejected` NEVER halts and NEVER counts.** A capability is single-use with a bounded
+  TTL, so a client retry (`:replay`), a resumed agent (`:expired`) and an audit-key rotation
+  (`:invalid_signature`) all produce one; none is a byzantine signal, and the 403 already
+  refuses the operation. It emits `[:loopctl, :custody, :cap_rejected]` telemetry instead —
+  alert on the RATE. Do not re-add a halt there.
+- **Scope** — `LoopctlWeb.CustodySurface` (`lib/loopctl_web/custody_surface.ex`) is THE list of
+  operations a halt suspends: story-lifecycle writes, bulk story ops + `verify-all`, dispatch
+  minting, agent-memory writes. **Reads are never blocked, on any surface** —
+  `custody_operation?/1` short-circuits on GET/HEAD/OPTIONS. `CheckCustodyHalt` consults it;
+  `test/loopctl_web/custody_surface_test.exs` binds the declared list to
+  `LoopctlWeb.Router.__routes__/0` and fails when a mutating custody route is unclassified.
+  Add the route's shape to `CustodySurface`; never relax that test.
+- Root-of-trust rotation and the superadmin break-glass stay reachable during a halt — they are
+  the remediation paths. A standalone superadmin key has a nil `tenant_id`, so the halt check
+  never applies to it.
+
 ## Anti-patterns
 
 - Lowering a role on a destructive/custody endpoint "for convenience" — re-check the CLAUDE.md checklist.

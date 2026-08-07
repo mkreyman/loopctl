@@ -149,4 +149,79 @@ defmodule LoopctlWeb.TenantControllerTest do
       assert body["tenant"]["email"] == "fresh@example.com"
     end
   end
+
+  # #624 item 4 — the custody OWNER key is the root of the attestation chain, and
+  # registering one runs an Ed25519 verify plus a chained audit append. Its
+  # sibling ceremony (WebAuthn enroll) has had a per-tenant hourly limiter all
+  # along; this one had none. Mirrors that limiter, including its FAIL-CLOSED
+  # posture.
+  describe "POST /api/v1/tenants/me/custody-owner-key — per-tenant rate limit" do
+    # Scoped to the owner-key bucket so the pipeline's own per-key RPM limiter
+    # (which fails OPEN) is untouched and cannot be what produced the 429.
+    defp stub_owner_key_limiter(outcome) do
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "custody_owner_key:rotate:" <> _tenant_id, _window, _limit -> outcome
+        _bucket, _window, _limit -> {:allow, 1}
+      end)
+    end
+
+    defp register_owner_key(conn, raw_key) do
+      {pub, _priv} = :crypto.generate_key(:eddsa, :ed25519)
+
+      conn
+      |> put_req_header("authorization", "Bearer #{raw_key}")
+      |> post(~p"/api/v1/tenants/me/custody-owner-key", %{
+        "owner_pubkey" => Base.encode16(pub),
+        "alg" => "ed25519"
+      })
+    end
+
+    setup do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      %{tenant: tenant, raw_key: raw_key}
+    end
+
+    test "over the budget the registration is refused with 429", ctx do
+      stub_owner_key_limiter({:deny, 10})
+
+      body =
+        build_conn()
+        |> register_owner_key(ctx.raw_key)
+        |> json_response(429)
+
+      assert body["error"]["code"] == "rate_limited"
+
+      # Refused BEFORE the expensive verification path: nothing was registered.
+      {:ok, tenant} = Loopctl.Tenants.get_tenant(ctx.tenant.id)
+      assert is_nil(tenant.custody_owner_pubkey)
+    end
+
+    test "the gate FAILS CLOSED — a limiter fault denies rather than unlocks", ctx do
+      # Unlocking an anti-abuse gate when its counter store is down is the one
+      # outcome that defeats the gate entirely.
+      stub_owner_key_limiter({:error, :counter_store_down})
+
+      body =
+        build_conn()
+        |> register_owner_key(ctx.raw_key)
+        |> json_response(429)
+
+      assert body["error"]["code"] == "rate_limited"
+    end
+
+    test "within the budget the registration proceeds", ctx do
+      stub_owner_key_limiter({:allow, 1})
+
+      body =
+        build_conn()
+        |> register_owner_key(ctx.raw_key)
+        |> json_response(200)
+
+      assert body["tenant"]["id"] == ctx.tenant.id
+
+      {:ok, tenant} = Loopctl.Tenants.get_tenant(ctx.tenant.id)
+      refute is_nil(tenant.custody_owner_pubkey)
+    end
+  end
 end

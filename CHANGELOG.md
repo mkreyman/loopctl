@@ -8,6 +8,42 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **A custody halt now requires a repeated pattern, and it no longer freezes the whole API.**
+  Two behaviour changes an operator will notice.
+
+  **When a halt fires.** Previously a SINGLE chain-of-custody refusal halted the tenant, and
+  clearing a halt requires a human WebAuthn break-glass ceremony. A halt now requires
+  **3 self-report/self-verify violations within 1 hour** (tunable with
+  `config :loopctl, :custody_halt_threshold` and `:custody_halt_window_seconds`); below the
+  threshold the offending operation is refused exactly as before, with the same 409 — only the
+  escalation changed. Capability-token rejections no longer contribute to a halt at all: a
+  capability is single-use with a bounded TTL, so a plain client retry, a resumed agent or an
+  audit-key rotation all produce one, and none of those is evidence of anything. They are now
+  reported as `[:loopctl, :custody, :cap_rejected]` telemetry plus a warning log — **alert on
+  the rate**, not on single events. Halts themselves emit `[:loopctl, :custody, :halt]`
+  telemetry and a `custody_halted` **error** log carrying the tenant, the reason and the count,
+  so a halt reaches your alerting immediately; each halt is also recorded in the hash-chained
+  audit log. Violations are retained in a new `custody_violations` table (tenant-scoped, RLS)
+  as the forensic record behind a halt. New migration, no manual steps.
+
+  **What a halt blocks.** A halt used to 503 EVERY authenticated request for the tenant,
+  including all reads. It now suspends only the custody surface: story-lifecycle writes,
+  bulk story operations and epic verify-all, dispatch minting, and agent-memory writes.
+  Reads are never blocked on any surface, and knowledge-wiki and coordination writes keep
+  working — a halted tenant retains the audit log, change feed and KB access needed to
+  investigate the halt. Root-of-trust rotation (`POST /tenants/me/custody-owner-key`,
+  `POST /tenants/:id/rotate-audit-key`) also stays reachable, since it is a remediation path.
+  The 503 body now carries `scope: "custody_operations_only"` so a client can tell a scoped
+  halt from an outage. If you have monitoring that treats any 503 `tenant_halted` as
+  "tenant is down", it will now see the halt only on custody calls.
+
+- **`POST /tenants/me/custody-owner-key` is rate limited per tenant (#624).** Registering or
+  rotating the custody owner key now shares the shape of the WebAuthn enrollment ceremony's
+  limiter: an hourly per-tenant budget that **fails closed** — if the rate-limiter store is
+  unavailable the request is refused with `429 rate_limited` rather than allowed through.
+  Rotation was, and remains, additionally gated by proof of possession of the outgoing owner
+  key; this is defence in depth for an expensive verification path.
+
 - **Ingestion now mints self-qualifying article titles (#617).** The extractor was shown only
   a coarse `source_type` ("web_article"), never which document it was reading — so a CHANGELOG
   file could only be titled "Changelog". On the hosted corpus three unrelated documents (a
