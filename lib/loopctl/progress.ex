@@ -228,10 +228,11 @@ defmodule Loopctl.Progress do
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} ->
-        # US-26.3.1 AC-5: mint a start_cap for the claiming lineage
+        # US-26.3.1 AC-5: mint a start_cap for the claiming lineage, and return it
+        # on the struct (#621) so the caller can present it to POST /start.
         lineage = Keyword.get(opts, :lineage, [])
-        mint_cap_best_effort(tenant_id, "start_cap", updated.id, lineage)
-        {:ok, updated}
+        cap = mint_cap(tenant_id, "start_cap", updated.id, lineage)
+        {:ok, %{updated | minted_capability: cap}}
 
       {:error, :lock, reason, _} ->
         {:error, reason}
@@ -247,14 +248,42 @@ defmodule Loopctl.Progress do
     end
   end
 
-  # Mints a capability token as a side-effect. Returns nil if key is
-  # unavailable (tenant has no audit key yet). The cap is retrievable
-  # via the Capabilities module; it's not returned in the function value
-  # to keep the return type backward-compatible.
-  defp mint_cap_best_effort(tenant_id, typ, story_id, lineage) do
+  # Mints a capability token and RETURNS it, so the caller can hand it to the
+  # agent that will need it for the next custody op. Returns nil when minting
+  # is impossible or fails.
+  #
+  # Issue #621: this used to discard the token "to keep the return type
+  # backward-compatible", and no other path delivered it either — so every
+  # keyed tenant's next lifecycle call hit `:missing_capability` (see
+  # maybe_consume_cap/6). The token is now returned and surfaced on the story
+  # struct's virtual :minted_capability field.
+  #
+  # A mint failure is only tolerable for a PRE-V2 (keyless) tenant, where
+  # maybe_consume_cap/6 lets a nil cap through. For a KEYED tenant the
+  # capability is MANDATORY, so a silent nil here wedges the lifecycle exactly
+  # the way #621 did — hence the loud log + telemetry rather than a bare nil.
+  defp mint_cap(tenant_id, typ, story_id, lineage) do
     case Capabilities.mint(tenant_id, typ, story_id, lineage) do
-      {:ok, cap} -> cap
-      {:error, _} -> nil
+      {:ok, cap} ->
+        cap
+
+      {:error, reason} ->
+        if tenant_has_audit_key?(tenant_id) do
+          Logger.error(
+            "capability_mint_failed: KEYED tenant could not mint a capability — the next " <>
+              "custody call for this story will fail with missing_capability until the agent " <>
+              "recovers one via POST /stories/:id/recover-cap. " <>
+              "tenant_id=#{tenant_id} story_id=#{story_id} cap_type=#{typ} reason=#{inspect(reason)}"
+          )
+
+          :telemetry.execute(
+            [:loopctl, :custody, :cap_mint_failed],
+            %{count: 1},
+            %{tenant_id: tenant_id, story_id: story_id, cap_type: typ, reason: reason}
+          )
+        end
+
+        nil
     end
   end
 
@@ -345,18 +374,74 @@ defmodule Loopctl.Progress do
     end)
   end
 
+  # Only a FORGED signature or a double-spent token is a trust violation. Every
+  # other refusal — expired, bound to another lineage, wrong story/type, unknown
+  # id — is an ordinary client error: the caller sat on a token past its 1h TTL,
+  # or its dispatch rotated.
+  @byzantine_cap_refusals [:invalid_signature, :replay]
+
   defp maybe_consume_cap(multi, tenant_id, story_id, cap_id, typ, lineage) do
     Multi.run(multi, :consume_cap, fn _repo, _changes ->
-      case Capabilities.verify(tenant_id, %{
-             "cap_id" => cap_id,
-             "typ" => typ,
-             "story_id" => story_id,
-             "lineage" => lineage
-           }) do
-        {:ok, cap} -> Capabilities.consume(cap)
-        {:error, reason} -> {:error, {:cap_rejected, reason}}
+      with {:ok, cap} <-
+             Capabilities.verify(tenant_id, %{
+               "cap_id" => cap_id,
+               "typ" => typ,
+               "story_id" => story_id,
+               "lineage" => lineage
+             }),
+           {:ok, consumed} <- Capabilities.consume(cap) do
+        {:ok, consumed}
+      else
+        {:error, reason} -> {:error, cap_refusal(reason)}
       end
     end)
+  end
+
+  # `{:cap_rejected, _}` is answered by FallbackController with a TENANT-WIDE
+  # custody halt (fallback_controller.ex:272), which 503s every other agent in
+  # the tenant. Reserve it for the byzantine set: an expired token must not be
+  # able to take the tenant down, and it is the routine outcome of a slow agent.
+  # Client-error refusals degrade to `{:cap_unusable, reason}` — a plain 403 —
+  # and are RECORDED outside the transaction by record_cap_refusal/4, because a
+  # refusal written inside the multi dies with the rollback.
+  defp cap_refusal(reason) when reason in @byzantine_cap_refusals, do: {:cap_rejected, reason}
+  defp cap_refusal(reason), do: {:cap_unusable, reason}
+
+  # A non-halting refusal still needs a durable trace. `:wrong_lineage` and
+  # `:wrong_story` are token MISUSE — a principal spending a token bound to
+  # another — not a slow client, and L5/L6 detection cannot see a bare log line.
+  # Runs AFTER the transaction rolled back, so the audit entry survives.
+  defp record_cap_refusal(tenant_id, story_id, reason, ctx) do
+    Logger.warning(
+      "capability_unusable: #{reason} — the caller must re-mint via " <>
+        "POST /stories/:id/recover-cap; GET /stories/:id/capabilities delivers only LIVE " <>
+        "tokens already issued, so it cannot serve an expired or misbound one. " <>
+        "tenant_id=#{tenant_id} story_id=#{story_id} cap_type=#{ctx.cap_type} " <>
+        "cap_id=#{inspect(ctx.cap_id)} api_key_id=#{inspect(ctx.actor_id)} " <>
+        "agent_id=#{inspect(ctx.agent_id)}"
+    )
+
+    :telemetry.execute(
+      [:loopctl, :custody, :cap_refused],
+      %{count: 1},
+      %{tenant_id: tenant_id, story_id: story_id, cap_type: ctx.cap_type, reason: reason}
+    )
+
+    Loopctl.AuditChain.append(tenant_id, %{
+      action: "capability_refused",
+      actor_lineage: ctx.lineage,
+      entity_type: "story",
+      entity_id: story_id,
+      payload: %{
+        "reason" => to_string(reason),
+        "cap_type" => ctx.cap_type,
+        "cap_id" => ctx.cap_id,
+        "api_key_id" => ctx.actor_id,
+        "agent_id" => ctx.agent_id
+      }
+    })
+
+    :missing_capability
   end
 
   # US-26.2.2 AC-4: loopctl selects the verifier, not the orchestrator
@@ -376,8 +461,9 @@ defmodule Loopctl.Progress do
              |> Ecto.Changeset.change(verifier_dispatch_id: verifier.id)
              |> AdminRepo.update() do
           {:ok, _updated} ->
-            mint_cap_best_effort(tenant_id, "verify_cap", story_id, verifier.lineage_path)
-
+            # No verify_cap is minted: see verify_story/4 for why L1 cannot gate
+            # verify. The selection itself is the gate — it writes
+            # verifier_dispatch_id, which validate_not_self_verify/2 enforces.
             Loopctl.AuditChain.append(tenant_id, %{
               action: "verifier_selected",
               actor_lineage: [],
@@ -493,6 +579,7 @@ defmodule Loopctl.Progress do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
     cap_id = Keyword.get(opts, :cap_id)
+    lineage = Keyword.get(opts, :lineage, [])
 
     multi =
       Multi.new()
@@ -505,13 +592,7 @@ defmodule Loopctl.Progress do
           {:ok, story}
         end
       end)
-      |> maybe_consume_cap(
-        tenant_id,
-        story_id,
-        cap_id,
-        "start_cap",
-        Keyword.get(opts, :lineage, [])
-      )
+      |> maybe_consume_cap(tenant_id, story_id, cap_id, "start_cap", lineage)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         story
         |> Ecto.Changeset.change(%{
@@ -555,9 +636,28 @@ defmodule Loopctl.Progress do
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} ->
-        # US-26.3.1 AC-6: mint a report_cap for the implementing lineage
-        lineage = Keyword.get(opts, :lineage, [])
-        mint_cap_best_effort(tenant_id, "report_cap", updated.id, lineage)
+        # #621: NO report_cap is minted here any more, deliberately.
+        #
+        # It used to be minted bound to the STARTER's (implementer's) lineage, to
+        # be consumed by POST /report. But `report` is a chain-of-custody gate: it
+        # must be called by a DIFFERENT principal from the implementer
+        # (validate_not_self_report/3, `self_report_blocked`), and
+        # Capabilities.verify/2 requires an EXACT lineage match. So the only
+        # principal the token authorized was the one principal forbidden to use
+        # it, and every keyed tenant's report failed `cap_rejected: wrong_lineage`.
+        #
+        # The token could not be rebound: the reporter is by definition not known
+        # when the implementer starts. Binding it loosely (any separated lineage)
+        # would still require the implementer to HAND the token to the reporter,
+        # opening a channel between the two principals the model exists to keep
+        # apart — and letting the implementer decide whether review can happen.
+        #
+        # Report is therefore gated by L4 structural separation alone, which is
+        # what actually enforces "nobody reports their own work": agent-id AND
+        # dispatch-lineage comparison, fail-closed on a custody-unattributed story
+        # or an unresolvable dispatch. The same argument retired `verify_cap` —
+        # see verify_story/4. `start_cap` is the one capability still in use, and
+        # the only one whose holder IS the principal permitted to spend it.
         {:ok, updated}
 
       {:error, :lock, reason, _} ->
@@ -565,6 +665,16 @@ defmodule Loopctl.Progress do
 
       {:error, :validate, reason, _} ->
         {:error, reason}
+
+      {:error, :consume_cap, {:cap_unusable, reason}, _} ->
+        {:error,
+         record_cap_refusal(tenant_id, story_id, reason, %{
+           cap_type: "start_cap",
+           cap_id: cap_id,
+           lineage: lineage,
+           actor_id: actor_id,
+           agent_id: agent_id
+         })}
 
       {:error, :consume_cap, reason, _} ->
         {:error, reason}
@@ -625,7 +735,6 @@ defmodule Loopctl.Progress do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
     token_usage_params = Keyword.get(opts, :token_usage)
-    cap_id = Keyword.get(opts, :cap_id)
 
     multi =
       Multi.new()
@@ -643,13 +752,9 @@ defmodule Loopctl.Progress do
           {:ok, story}
         end
       end)
-      |> maybe_consume_cap(
-        tenant_id,
-        story_id,
-        cap_id,
-        "report_cap",
-        Keyword.get(opts, :lineage, [])
-      )
+      # #621: no capability is consumed here — see the comment in start_story/3
+      # for why a report_cap could not be bound to a legitimate holder. The
+      # custody gate above (validate_not_self_report/3) is the enforcement.
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         now = DateTime.utc_now()
 
@@ -714,9 +819,6 @@ defmodule Loopctl.Progress do
         {:error, reason}
 
       {:error, :validate, reason, _} ->
-        {:error, reason}
-
-      {:error, :consume_cap, reason, _} ->
         {:error, reason}
 
       {:error, :story, changeset, _} ->
@@ -1063,7 +1165,9 @@ defmodule Loopctl.Progress do
   - `tenant_id` -- the tenant UUID
   - `story_id` -- the story UUID
   - `params` -- map with `summary` (required), optional `findings`, `review_type`
-  - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`, `:actor_label`
+  - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`,
+    `:actor_label`, and `:verifier_lineage` (the CALLER's dispatch lineage,
+    resolved server-side — never client-supplied)
 
   ## Returns
 
@@ -1083,23 +1187,37 @@ defmodule Loopctl.Progress do
     orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
-    cap_id = Keyword.get(opts, :cap_id)
 
     verification_params = extract_verification_params(params)
 
+    # #621: verify consumes NO capability, for the same reason report does not
+    # (see start_story/3). A verify_cap was minted to the lineage
+    # Dispatches.select_verifier/3 picks, and Capabilities.verify/2 demands an
+    # EXACT lineage match — but that pick is not the principal who calls verify:
+    # the pool includes :agent-role dispatches while this endpoint is
+    # exact_role: :orchestrator, a legacy env-var orchestrator key resolves to
+    # lineage [] and can hold no cap at all, and in a single-root tenant no
+    # candidate is eligible so nothing is minted. Every one of those left the
+    # story permanently unverifiable, and the bulk path (verify_all_in_epic/4)
+    # never carried a cap at all. Verify is gated by L4 structural separation
+    # instead — validate_not_self_verify/3, which compares the CALLER's
+    # server-resolved lineage (`:verifier_lineage`) against the implementer's
+    # exactly as report and review-complete do, plus the loopctl-SELECTED
+    # verifier_dispatch_id when request-review recorded one — plus
+    # exact_role: :orchestrator. The cap's exact-lineage match bound only the
+    # story's recorded verifier; the caller comparison binds the principal that
+    # actually makes the call, on EVERY path including the one that skips the
+    # optional request-review.
     multi =
       Multi.new()
       |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
       |> Multi.run(:self_verify_check, fn _repo, %{lock: story} ->
-        validate_not_self_verify(story, orchestrator_agent_id)
+        validate_not_self_verify(
+          story,
+          orchestrator_agent_id,
+          Keyword.get(opts, :verifier_lineage, [])
+        )
       end)
-      |> maybe_consume_cap(
-        tenant_id,
-        story_id,
-        cap_id,
-        "verify_cap",
-        Keyword.get(opts, :lineage, [])
-      )
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
         validate_verifiable(story)
       end)
@@ -1739,26 +1857,50 @@ defmodule Loopctl.Progress do
 
   # --- Verification/Rejection helpers ---
 
+  defp validate_not_self_verify(story, orchestrator_agent_id, caller_lineage \\ [])
+
   # nil orchestrator identity: untrusted (US-26.1.3)
-  defp validate_not_self_verify(_story, nil), do: {:error, :self_verify_blocked}
+  defp validate_not_self_verify(_story, nil, _caller_lineage), do: {:error, :self_verify_blocked}
 
-  defp validate_not_self_verify(story, orchestrator_agent_id) do
-    # US-26.2.2 AC-2: use lineage comparison when dispatch IDs are available
+  defp validate_not_self_verify(story, orchestrator_agent_id, caller_lineage) do
+    # INVARIANT 1 (fail closed / §2.2 "nil is never permissive"): a story that
+    # is reported_done but not yet verified, with NO assigned agent and NO
+    # dispatch lineage, has no implementer to compare the verifier against — the
+    # checks below would pass VACUOUSLY (a non-nil verifier is never == a nil
+    # implementer). Reject rather than allow a custody-orphaned verify. (The DB
+    # CHECK stories_reported_done_requires_agent only covers the DISPATCHED
+    # case — its `implementer_dispatch_id IS NULL` disjunct leaves exactly this
+    # shape legal — so this predicate is the ONLY guard for a never-dispatched
+    # agentless story, not mere defense in depth. Backfilled stories are
+    # already verified and never reach here.)
+    if custody_orphaned?(story) do
+      log_custody_orphaned(story, orchestrator_agent_id, "verify")
+      {:error, :missing_assigned_agent}
+    else
+      # CALLER separation (LCP-1 §7.5) — the same comparison report and
+      # review-complete run, and the ONLY clause here that says anything about
+      # the principal actually making this call: the verifier's lineage is
+      # resolved SERVER-SIDE from the authenticating key, so an ancestor or a
+      # sub-agent in the implementer's chain is blocked even when its agent_id
+      # differs. The story-side clauses below compare RECORDED dispatches, which
+      # are silent about the caller — and `verifier_dispatch_id` is only written
+      # by the OPTIONAL request-review, so without this the common path degraded
+      # to a single agent-id inequality.
+      # :root — verify demands the stricter separation. select_verifier/3 will not
+      # nominate a verifier under the implementer's root, so a caller sharing it
+      # must not be able to certify either.
+      case lineage_status(story, caller_lineage, :root) do
+        :unresolvable -> {:error, :unresolvable_dispatch_lineage}
+        :conflict -> {:error, :self_verify_blocked}
+        :ok -> verify_recorded_separation(story, orchestrator_agent_id)
+      end
+    end
+  end
+
+  # The STORY-side half of the gate: loopctl's SELECTED verifier against the
+  # implementer when request-review recorded one, else agent-id equality.
+  defp verify_recorded_separation(story, orchestrator_agent_id) do
     cond do
-      # INVARIANT 1 (fail closed / §2.2 "nil is never permissive"): a story that
-      # is reported_done but not yet verified, with NO assigned agent and NO
-      # dispatch lineage, has no implementer to compare the verifier against — the
-      # checks below would pass VACUOUSLY (a non-nil verifier is never == a nil
-      # implementer). Reject rather than allow a custody-orphaned verify. (The DB
-      # CHECK stories_reported_done_requires_agent only covers the DISPATCHED
-      # case — its `implementer_dispatch_id IS NULL` disjunct leaves exactly this
-      # shape legal — so this predicate is the ONLY guard for a never-dispatched
-      # agentless story, not mere defense in depth. Backfilled stories are
-      # already verified and never reach here.)
-      custody_orphaned?(story) ->
-        log_custody_orphaned(story, orchestrator_agent_id, "verify")
-        {:error, :missing_assigned_agent}
-
       # Lineage-based check (preferred): compare dispatch lineage paths
       not is_nil(story.implementer_dispatch_id) and not is_nil(story.verifier_dispatch_id) ->
         impl = get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id)
@@ -1775,7 +1917,7 @@ defmodule Loopctl.Progress do
     end
   end
 
-  # The lineage clause of validate_not_self_verify/2, kept fail-CLOSED.
+  # The lineage clause of validate_not_self_verify/3, kept fail-CLOSED.
   #
   # `get_dispatch_lineage/2` maps an unloadable dispatch row to `[]`, and
   # `lineage_shares_prefix?([], _)` is false — so a naive "no shared prefix ⇒
@@ -2336,10 +2478,26 @@ defmodule Loopctl.Progress do
   #      a story with an unresolvable implementer dispatch is caught only by the
   #      agent-id check, not by fail-closed. The permit is scoped to legacy keys and
   #      the agent-id check still applies; the gates align for dispatch-minted keys.
-  defp lineage_status(%Story{implementer_dispatch_id: nil}, _caller_lineage), do: :ok
-  defp lineage_status(_story, []), do: :ok
+  # `separation` selects HOW MUCH lineage distance this gate demands:
+  #
+  #   :chain — the caller must not be on the implementer's root-to-leaf chain.
+  #            A SIBLING dispatch passes. Used by report and review-complete,
+  #            where the documented tree puts the reviewer beside the implementer
+  #            under one orchestrator; demanding a separate root there means no
+  #            reviewer in a normal tenant can ever act (#621).
+  #   :root  — the caller must not share the implementer's root at all. Stricter,
+  #            and used by verify, the final certification: select_verifier/3
+  #            already refuses to nominate a same-root verifier, so accepting one
+  #            at the gate would contradict the selection rule.
+  #
+  # Both fail closed on an unresolvable implementer dispatch, and both are
+  # evaluated IN ADDITION to the agent-id equality check, never instead of it.
+  defp lineage_status(story, caller_lineage, separation \\ :chain)
 
-  defp lineage_status(story, caller_lineage) do
+  defp lineage_status(%Story{implementer_dispatch_id: nil}, _caller_lineage, _separation), do: :ok
+  defp lineage_status(_story, [], _separation), do: :ok
+
+  defp lineage_status(story, caller_lineage, separation) do
     case get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id) do
       [] ->
         # Declared-but-unresolvable implementer dispatch — fail closed.
@@ -2352,7 +2510,13 @@ defmodule Loopctl.Progress do
         :unresolvable
 
       impl ->
-        if Dispatches.lineage_shares_prefix?(impl, caller_lineage), do: :conflict, else: :ok
+        overlap? =
+          case separation do
+            :root -> Dispatches.lineage_shares_prefix?(impl, caller_lineage)
+            :chain -> Dispatches.lineage_same_chain?(impl, caller_lineage)
+          end
+
+        if overlap?, do: :conflict, else: :ok
     end
   end
 

@@ -690,6 +690,55 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule Capability do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "Capability",
+      description:
+        "An L1 capability token. `cap_id` is the value presented as the `capability` " <>
+          "field on the custody call it authorizes. A token is single-use, bound to one " <>
+          "story, one type, and one dispatch lineage, and expires.",
+      type: :object,
+      properties: %{
+        cap_id: %Schema{type: :string, format: :uuid},
+        typ: %Schema{
+          type: :string,
+          description: "Only `start_cap` is minted today (#621)."
+        },
+        story_id: %Schema{type: :string, format: :uuid},
+        issued_to_lineage: %Schema{
+          type: :array,
+          items: %Schema{type: :string, format: :uuid},
+          description: "Dispatch lineage the token is bound to; must match exactly at use."
+        },
+        issued_at: %Schema{type: :string, format: :"date-time"},
+        expires_at: %Schema{type: :string, format: :"date-time"},
+        nonce: %Schema{type: :string, description: "Base64url"},
+        signature: %Schema{type: :string, description: "Base64url ed25519 signature"}
+      }
+    })
+  end
+
+  defmodule CapabilityListResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "CapabilityListResponse",
+      description:
+        "Live capability tokens already issued to the CALLER for a story. Scoped by the " <>
+          "caller's dispatch lineage, or — for an agent key not minted by a dispatch — by " <>
+          "the story's assigned agent. Empty when neither matches.",
+      type: :object,
+      required: [:data],
+      properties: %{
+        data: %Schema{type: :array, items: Capability}
+      }
+    })
+  end
+
   defmodule AuditKeyResponse do
     @moduledoc false
     require OpenApiSpex
@@ -1553,6 +1602,18 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :object,
           description: "Updated story state",
           additionalProperties: true
+        },
+        capability: %Schema{
+          allOf: [Capability],
+          nullable: true,
+          description:
+            "The capability minted by THIS transition, for the caller's NEXT custody call. " <>
+              "Currently only `claim` mints one (a start_cap, for `start`). Absent when " <>
+              "the transition mints nothing — including `report`, which is gated by " <>
+              "lineage separation rather than a capability. Also absent for a pre-v2 " <>
+              "tenant with no audit signing key, where capabilities are not enforced. " <>
+              "A keyed tenant that ignores a returned capability will receive " <>
+              "403 missing_capability on the next call."
         }
       },
       example: %{
@@ -1562,6 +1623,11 @@ defmodule Loopctl.ApiSpec.Schemas do
           title: "Implement user authentication",
           agent_status: "contracted",
           verified_status: "unverified"
+        },
+        capability: %{
+          cap_id: "9f8e7d6c-5b4a-3210-fedc-ba9876543210",
+          typ: "start_cap",
+          expires_at: "2026-08-07T18:30:00Z"
         }
       }
     })
@@ -3412,7 +3478,10 @@ defmodule Loopctl.ApiSpec.Schemas do
         cap_id: %Schema{type: :string, format: :uuid},
         typ: %Schema{
           type: :string,
-          enum: ["start_cap", "report_cap", "verify_cap", "review_complete_cap"]
+          enum: ["start_cap"],
+          description:
+            "Recovery only ever re-mints a start_cap; any other value is refused with 422 " <>
+              "and recorded as a capability-forgery attempt."
         },
         story_id: %Schema{type: :string, format: :uuid},
         issued_to_lineage: %Schema{type: :array, items: %Schema{type: :string, format: :uuid}},

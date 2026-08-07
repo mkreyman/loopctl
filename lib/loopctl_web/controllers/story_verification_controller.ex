@@ -17,6 +17,7 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Artifacts
+  alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias Loopctl.Verification
   alias Loopctl.Verification.VerificationRun
@@ -191,7 +192,14 @@ defmodule LoopctlWeb.StoryVerificationController do
           orchestrator_agent_id: api_key.agent_id,
           # LCP-1 §9.4: record the verified signed claim (nil under bearer) in the
           # hash-chained audit entry, atomically with the verify decision.
-          custody_claim: conn.assigns[:custody_signed_claim]
+          custody_claim: conn.assigns[:custody_signed_claim],
+          # #621: verify consumes NO capability — see Progress.verify_story/4 for
+          # why a verify_cap could never reach the principal this endpoint permits
+          # to spend it. The CALLER's lineage, resolved SERVER-SIDE (never from the
+          # request body), is what the L4 gate compares against the implementer's,
+          # and what the signed-custody-claim audit entry records — both read it
+          # under this exact key.
+          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
         )
 
       case Progress.verify_story(tenant_id, story_id, params, opts) do
@@ -222,9 +230,6 @@ defmodule LoopctlWeb.StoryVerificationController do
 
         {:error, :review_not_conducted} ->
           {:error, :review_not_conducted}
-
-        {:error, :missing_capability} ->
-          {:error, :missing_capability}
 
         {:error, {:invalid_transition, _ctx} = err} ->
           {:error, err}
