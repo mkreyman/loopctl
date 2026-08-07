@@ -20,8 +20,23 @@ defmodule Loopctl.Knowledge.ConsolidationApplyCapsTest do
   defp status(id), do: AdminRepo.get!(Article, id).status
 
   defp confirm_over_two_nights(tenant_id) do
+    corroborate_all!(tenant_id)
     {:ok, _} = Consolidation.run(tenant_id, day: Date.add(Date.utc_today(), -1))
     {:ok, _} = Consolidation.run(tenant_id)
+  end
+
+  # These groups are GENUINE duplicates, so give them identical embeddings (cosine 1.0). The
+  # apply path withholds a title-drift group whose bodies do not corroborate the shared title;
+  # without this every budget test here would measure that gate instead of the budget.
+  defp corroborate_all!(tenant_id) do
+    vector = List.duplicate(0.1, 1536)
+
+    Article
+    |> Ecto.Query.where([a], a.tenant_id == ^tenant_id)
+    |> AdminRepo.all()
+    |> Enum.each(fn a ->
+      {:ok, _} = Loopctl.Knowledge.update_embedding(tenant_id, a.id, vector, nil)
+    end)
   end
 
   # One confirmed group of three: a winner and two losers, so the article budget can bind

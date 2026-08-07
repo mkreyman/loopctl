@@ -437,6 +437,11 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroductionTest do
                               # recall holds NO hand-rolled cosine literal: it builds its index-ordered
                               # inner pool through the shared VectorSearch.index_safe_knn_base/4 +
                               # put_distance/2, so the cosine op lives only in VectorSearch (above).
+                              # a column-to-column self-join under a MIN aggregate, asking whether the
+                              # WORST pair in a title-collision group is still close enough to justify
+                              # auto-unpublishing its members — top-k cannot answer that, since the
+                              # outlier it must find is exactly the row top-k drops. Registered.
+                              "lib/loopctl/knowledge/consolidation.ex",
                               # registry rationale strings quote the operators (data, not query):
                               "lib/loopctl/knowledge/cosine_lint_exceptions.ex",
                               # doc-only tokens (a `<->` arrow in prose / a `<=>` inside a comment):

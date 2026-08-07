@@ -51,8 +51,9 @@ defmodule Loopctl.Knowledge.Consolidation do
   in several proposals). `summary.by_class` is the same unit per class.
   `summary.emitted` is how many proposals the capped arrays actually carry —
   lower exactly when a class hit `max_per_class`, which `summary.truncated` flags and
-  which the worker logs. `summary.corpus_size` counts PUBLISHED articles owned by
-  this tenant — not its total article count.
+  which the worker logs. `summary.corpus_size` counts PUBLISHED, SHARED-visibility
+  articles owned by this tenant — not its total article count, and not its
+  agent-`private`/`owner` ones, which `shared_only/1` keeps out of this whole pass.
 
   Both remaining classes now derive their own totals from their own scan, so every count
   here has this pass as its denominator. (`:stale_entry` did not — it re-published lint's
@@ -104,12 +105,14 @@ defmodule Loopctl.Knowledge.Consolidation do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Embeddings
   alias Loopctl.ExitTag
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ConsolidationProposal
   alias Loopctl.Knowledge.ConsolidationReport
+  alias Loopctl.Workers.BatchArticleEmbeddingWorker
 
   @default_max_per_class 100
   @hard_max_per_class 500
@@ -127,6 +130,11 @@ defmodule Loopctl.Knowledge.Consolidation do
   @generic_title_pattern "^(untitled|untitled document|new article|new document|document|draft|no title|untitled note)( [0-9]+)?$"
   # The heavy-read endpoint every whole-corpus enumeration in this module runs under.
   @heavy_endpoint :consolidation
+
+  # The normalized-title grouping key, in ONE place. `title_drift_groups/1` forms groups with
+  # it and `pairwise_similarity_by_group/2` re-derives the same groups to score them; if the
+  # two ever disagreed the gate would score the wrong sets and silently pass collisions.
+  @title_key_sql "btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g'))"
 
   # How many CONFIRMED duplicate groups one nightly run may apply. Bounded because each
   # apply is a write on the shared admin pool, and because a bug that mis-picks winners
@@ -157,6 +165,30 @@ defmodule Loopctl.Knowledge.Consolidation do
   # How far apart the two agreeing reports may be, in days. One night's gap is normal (a
   # skipped run); anything wider is not the "two consecutive runs" the gate advertises.
   @max_confirmation_gap 2
+
+  # The signal that formed a duplicate group survives onto the persisted proposal ONLY inside
+  # the rationale prose, so the sentence (`duplicate_captures/2`) and the apply-time
+  # classifier (`title_drift?/1`) both interpolate the phrase from HERE. They used to be a
+  # sentence and a substring literal that nothing pinned together — a copy edit would have
+  # turned the one content check on the auto-applying class off without failing anything.
+  @title_drift "title drift"
+  @idempotency_drift "idempotency-tag drift"
+
+  # Default corroboration threshold, and the fallback for a config value that is not a number
+  # in `0.0..1.0`. Measured band on the hosted corpus 2026-08-06: collisions at/below 0.68,
+  # genuine duplicates at/above 0.84.
+  @default_min_duplicate_similarity 0.80
+
+  # The visibility guard, in ONE place, usable in a `where` AND in a join `on` — see
+  # `shared_only/1` for why it must be composed into every scope decision this pass makes.
+  defmacrop shared_visibility(metadata) do
+    quote do
+      fragment(
+        "COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')",
+        unquote(metadata)
+      )
+    end
+  end
 
   @doc "Default cap on duplicate GROUPS one run may apply."
   @spec default_max_applies() :: pos_integer()
@@ -342,11 +374,21 @@ defmodule Loopctl.Knowledge.Consolidation do
   gate — a group broken up by a rename drops out of tonight's report and can never be
   confirmed — which is why the worker calls this only after tonight's report was written
   (`Loopctl.Workers.KnowledgeLintWorker`).
+  ## What a TITLE collision must additionally clear
+
+  Agreement filters transience, not wrongness: a title two unrelated sources share collides
+  deterministically, so both runs agree. A TITLE-signal group is applied only when its live
+  members also corroborate in CONTENT — every member scored wherever this tenant's vectors
+  live (`score_source/1`), worst pair at or above `#{@default_min_duplicate_similarity}`
+  (tunable). One that cannot is REPORTED, counted in `uncorroborated`, and has its missing
+  vectors enqueued so the withhold clears itself; a group withheld because the scoring READ
+  failed enqueues nothing. The idempotency signal is exempt (`corroborated?/3`).
   """
   @spec apply_confirmed_duplicates(Ecto.UUID.t(), keyword()) :: %{
           applied: non_neg_integer(),
           skipped: non_neg_integer(),
           failed: non_neg_integer(),
+          uncorroborated: non_neg_integer(),
           gate: :open | :report_gap | :insufficient_history | :drain_disabled
         }
   def apply_confirmed_duplicates(tenant_id, opts \\ []) do
@@ -366,7 +408,7 @@ defmodule Loopctl.Knowledge.Consolidation do
 
     if min(cap, unpublish_cap) == 0 do
       log_gate_blocked(tenant_id, :drain_disabled)
-      %{applied: 0, skipped: 0, failed: 0, gate: :drain_disabled}
+      %{applied: 0, skipped: 0, failed: 0, uncorroborated: 0, gate: :drain_disabled}
     else
       run_confirmed_duplicates(tenant_id, cap, unpublish_cap)
     end
@@ -390,15 +432,48 @@ defmodule Loopctl.Knowledge.Consolidation do
     case confirmed_duplicate_proposals(tenant_id, cap) do
       {:error, reason} ->
         log_gate_blocked(tenant_id, reason)
-        %{applied: 0, skipped: 0, failed: 0, gate: reason}
+        %{applied: 0, skipped: 0, failed: 0, uncorroborated: 0, gate: reason}
 
       {:ok, proposals} ->
+        # Scored ONCE for the whole batch, then consulted per group AFTER its liveness
+        # re-check — so a group that dissolved between the scan and now still reports
+        # `skipped` (the accurate reason) rather than being relabelled uncorroborated.
+        scored = score_groups(tenant_id, proposals)
+
         proposals
         |> Enum.reduce(
-          %{applied: 0, skipped: 0, failed: 0, gate: :open},
-          &tally_apply(tenant_id, &1, &2, unpublish_cap)
+          %{applied: 0, skipped: 0, failed: 0, uncorroborated: 0, gate: :open},
+          &tally_apply(tenant_id, &1, &2, unpublish_cap, scored)
         )
     end
+  end
+
+  # The ONLY heavy read on the apply path, and it runs BEFORE the reduce — so a statement
+  # timeout or a `HeavyRead` shed would escape past `tally_apply/5`'s per-group rescue and
+  # cost the whole night's drain, deterministically, every night. A failure degrades to
+  # `:unavailable` instead: title-drift groups are withheld one by one (fail-closed, counted
+  # in `uncorroborated`) and idempotency-drift groups still apply.
+  #
+  # `:unavailable` is NOT an empty score map, and the distinction is the whole point: an
+  # empty map says "these members have no vectors", which routes the group into
+  # `backfill_missing_embeddings/2` — so a shed on this read would answer a DB outage by
+  # enqueueing an embedding job per member of every confirmed group, against the same
+  # degraded database, and log it as missing vectors.
+  defp score_groups(tenant_id, proposals) do
+    pairwise_similarity_by_group(tenant_id, Enum.flat_map(proposals, & &1.article_ids))
+  rescue
+    e -> log_scoring_failed(tenant_id, ExitTag.tag(e))
+  catch
+    :exit, reason -> log_scoring_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
+  end
+
+  defp log_scoring_failed(tenant_id, tag) do
+    Logger.error(
+      "Consolidation: tenant=#{tenant_id} duplicate similarity scoring failed (#{tag}); " <>
+        "every title-drift group is withheld this run."
+    )
+
+    :unavailable
   end
 
   # "The gate was shut" and "the gate was open and confirmed nothing" both used to return an
@@ -429,13 +504,16 @@ defmodule Loopctl.Knowledge.Consolidation do
   # that LEAVE the published set; and the proposal's `article_ids` is a scan-time snapshot, so
   # charging its length skipped groups for budget they would never have spent (the same reason
   # the winner is recomputed from live rows).
-  defp tally_apply(tenant_id, proposal, acc, unpublish_cap) do
-    case apply_duplicate_group(tenant_id, proposal, unpublish_cap - acc.applied) do
+  defp tally_apply(tenant_id, proposal, acc, unpublish_cap, scored) do
+    case apply_duplicate_group(tenant_id, proposal, unpublish_cap - acc.applied, scored) do
       {:ok, applied, failed} ->
         %{acc | applied: acc.applied + applied, failed: acc.failed + failed}
 
       :skip ->
         %{acc | skipped: acc.skipped + 1}
+
+      :uncorroborated ->
+        %{acc | uncorroborated: acc.uncorroborated + 1}
     end
   rescue
     e -> group_failed(tenant_id, proposal, ExitTag.tag(e), acc)
@@ -521,7 +599,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     |> AdminRepo.all()
   end
 
-  defp apply_duplicate_group(tenant_id, proposal, budget) do
+  defp apply_duplicate_group(tenant_id, proposal, budget, scored) do
     live =
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
@@ -542,27 +620,83 @@ defmodule Loopctl.Knowledge.Consolidation do
     if length(live) < 2 or budget < 1 do
       :skip
     else
-      [winner | all_losers] =
-        Enum.sort_by(live, fn a ->
-          {-a.body_len, -DateTime.to_unix(a.updated_at, :microsecond), a.id}
-        end)
+      case corroborated?(proposal, live, scored) do
+        :ok ->
+          apply_live_group(tenant_id, proposal, live, budget)
 
-      # Drained as far as the budget goes, not skipped whole: the winner is never a candidate
-      # here, so what is left behind is winner-plus-leftovers — the group the next scan
-      # re-derives — never a winnerless set. Skipping whole made a group with more losers
-      # than the cap unappliable on EVERY run, with no reachable remedy once the cap itself
-      # is ceilinged.
-      losers = Enum.take(all_losers, budget)
-      applied = Enum.count(losers, &unpublish_duplicate(tenant_id, &1))
-
-      Logger.info(
-        "Consolidation: tenant=#{tenant_id} applied duplicate_capture proposal " <>
-          "##{proposal.number} — kept #{winner.id}, unpublished #{applied} of " <>
-          "#{length(all_losers)} duplicate(s) (budget #{budget}). Reversible via publish."
-      )
-
-      {:ok, applied, length(losers) - applied}
+        {:withheld, entry, unscored} ->
+          log_uncorroborated(tenant_id, proposal, live, entry, unscored)
+          backfill_missing_embeddings(tenant_id, unscored)
+          :uncorroborated
+      end
     end
+  end
+
+  # A group withheld for MISSING evidence would otherwise be withheld on this and every
+  # subsequent night: nothing else in this pass embeds an article and the lint worker's
+  # backfill covers link ORPHANS only, so an un-embedded member (the corpus has had 80 since
+  # June) is a producer with no consumer — the shape #605 exists to close. The withhold
+  # therefore enqueues the vectors it lacked, on the batched worker every other bulk path
+  # uses. Best-effort and crash-proof; a tenant with no embedding key (mandatory BYO) simply
+  # has the job discarded.
+  defp backfill_missing_embeddings(_tenant_id, []), do: :ok
+
+  defp backfill_missing_embeddings(tenant_id, ids) do
+    ids
+    |> Enum.chunk_every(Knowledge.embedding_batch_max())
+    |> Enum.each(fn chunk ->
+      # `Oban.insert/1` returns `{:error, changeset}` without raising, so throwing the result
+      # away left the ONLY failure mode that does not log — the group counted uncorroborated
+      # with an enqueue that never happened, indistinguishable from a successful one.
+      case %{article_ids: chunk, tenant_id: tenant_id}
+           |> BatchArticleEmbeddingWorker.new()
+           |> Oban.insert() do
+        {:ok, _job} -> :ok
+        {:error, reason} -> log_backfill_failed(tenant_id, "insert:" <> insert_tag(reason))
+      end
+    end)
+
+    :ok
+  rescue
+    e -> log_backfill_failed(tenant_id, ExitTag.tag(e))
+  catch
+    :exit, reason -> log_backfill_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
+  end
+
+  # Low-cardinality, like every other tag this module logs — never the whole changeset.
+  defp insert_tag(%Ecto.Changeset{errors: errors}), do: inspect(Keyword.keys(errors))
+  defp insert_tag(other), do: inspect(other, limit: 3, printable_limit: 120)
+
+  defp log_backfill_failed(tenant_id, tag) do
+    Logger.warning(
+      "Consolidation: tenant=#{tenant_id} could not enqueue the embedding backfill for a " <>
+        "withheld duplicate group (#{tag}); it will be retried next run."
+    )
+
+    :ok
+  end
+
+  defp apply_live_group(tenant_id, proposal, live, budget) do
+    [winner | all_losers] =
+      Enum.sort_by(live, fn a ->
+        {-a.body_len, -DateTime.to_unix(a.updated_at, :microsecond), a.id}
+      end)
+
+    # Drained as far as the budget goes, not skipped whole: the winner is never a candidate
+    # here, so what is left behind is winner-plus-leftovers — the group the next scan
+    # re-derives — never a winnerless set. Skipping whole made a group with more losers
+    # than the cap unappliable on EVERY run, with no reachable remedy once the cap itself
+    # is ceilinged.
+    losers = Enum.take(all_losers, budget)
+    applied = Enum.count(losers, &unpublish_duplicate(tenant_id, &1))
+
+    Logger.info(
+      "Consolidation: tenant=#{tenant_id} applied duplicate_capture proposal " <>
+        "##{proposal.number} — kept #{winner.id}, unpublished #{applied} of " <>
+        "#{length(all_losers)} duplicate(s) (budget #{budget}). Reversible via publish."
+    )
+
+    {:ok, applied, length(losers) - applied}
   end
 
   # A per-article failure stays per-article, and says why. `Knowledge.unpublish_article/3`
@@ -669,9 +803,10 @@ defmodule Loopctl.Knowledge.Consolidation do
   # Excludes agent-PRIVATE articles from everything this pass does. Composed into EVERY
   # place that decides whether an article of this tenant is in scope — the scans
   # (`published_base/1`), the evidence fetch (`evidence_map/2`), the apply-time live
-  # re-check (`apply_duplicate_group/3`) and the read-time redaction liveness
-  # (`live_evidence_ids/2`) — because a guard that lives in only some of them is a guard
-  # the next reader adds one more path around.
+  # re-check (`apply_duplicate_group/3`), BOTH sides of the corroboration self-join
+  # (`pairwise_similarity_by_group/2`, via the shared `shared_visibility/1` macro) and the
+  # read-time redaction liveness (`live_evidence_ids/2`) — because a guard that lives in
+  # only some of them is a guard the next reader adds one more path around.
   #
   # Two distinct harms, and the quieter one is worse. The LOUD one: `:duplicate_capture`
   # auto-applies (#608), so without this the pass could unpublish one agent's private memory
@@ -684,13 +819,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   # that `Knowledge`'s read paths let through; "not visible to this caller" is total here,
   # not conditional. Same `COALESCE(..., 'shared')` spelling as those paths
   # (`knowledge.ex:5902` and friends) so an article with no `visibility` key stays in scope.
-  defp shared_only(query) do
-    where(
-      query,
-      [a],
-      fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", a.metadata)
-    )
-  end
+  defp shared_only(query), do: where(query, [a], shared_visibility(a.metadata))
 
   defp heavy_opts, do: HeavyRead.opts(@heavy_endpoint)
 
@@ -714,12 +843,25 @@ defmodule Loopctl.Knowledge.Consolidation do
   # missing. Interleaving keeps both signals represented in every run and stays
   # deterministic (each side is sorted by its article-id set first).
   defp duplicate_captures(tenant_id, cap) do
-    groups =
-      interleave(
-        Enum.sort_by(title_drift_groups(tenant_id), fn {_r, ids} -> Enum.sort(ids) end),
-        Enum.sort_by(idempotency_drift_groups(tenant_id), fn {_r, ids} -> Enum.sort(ids) end)
-      )
-      |> Enum.uniq_by(fn {_reason, ids} -> Enum.sort(ids) end)
+    by_ids = fn {_reason, ids} -> Enum.sort(ids) end
+    idempotency = Enum.sort_by(idempotency_drift_groups(tenant_id), by_ids)
+    idempotency_keys = MapSet.new(idempotency, by_ids)
+
+    # A group BOTH signals name is labelled by the IDEMPOTENCY one. The dedup keeps whichever
+    # entry it meets first and the interleave meets the title entry first, so a re-import that
+    # drifted in its tag format AND (being one capture) carries the same title kept the weaker
+    # label — and was then held to the embedding gate the idempotency signal is exempt from
+    # (`corroborated?/3`), forever on a tenant with no vectors.
+    titles =
+      title_drift_groups(tenant_id)
+      |> Enum.sort_by(by_ids)
+      |> Enum.map(fn {reason, ids} ->
+        if MapSet.member?(idempotency_keys, Enum.sort(ids)),
+          do: {@idempotency_drift, ids},
+          else: {reason, ids}
+      end)
+
+    groups = titles |> interleave(idempotency) |> Enum.uniq_by(by_ids)
 
     selected = Enum.take(groups, cap)
     evidence_by_id = evidence_map(tenant_id, Enum.flat_map(selected, fn {_r, ids} -> ids end))
@@ -729,7 +871,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         build_proposal(:duplicate_capture, ids, evidence_by_id,
           severity: "warning",
           rationale:
-            "#{length(ids)} published articles are the same capture under #{reason} drift. " <>
+            "#{length(ids)} published articles are the same capture under #{reason}. " <>
               "The novelty gate does not catch this: novelty scoring and idempotency are separate paths.",
           suggested_action:
             "Keep the richest article and UNPUBLISH the rest — do not archive them. " <>
@@ -781,20 +923,263 @@ defmodule Loopctl.Knowledge.Consolidation do
   # `generic_titles/2` reports exactly this set, under the class that applies nothing.
   defp title_drift_groups(tenant_id) do
     from(a in published_base(tenant_id),
-      where:
-        fragment("btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g')) <> ''", a.title),
-      where:
-        fragment(
-          "btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g')) !~ ?",
-          a.title,
-          ^@generic_title_pattern
-        ),
-      group_by: fragment("btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g'))", a.title),
+      where: fragment(unquote(@title_key_sql <> " <> ''"), a.title),
+      where: fragment(unquote(@title_key_sql <> " !~ ?"), a.title, ^@generic_title_pattern),
+      group_by: fragment(unquote(@title_key_sql), a.title),
       having: count(a.id) > 1,
       select: %{ids: fragment("array_agg(?::text ORDER BY ?)", a.id, a.inserted_at)}
     )
     |> heavy_all(tenant_id)
-    |> Enum.map(fn %{ids: ids} -> {"title", ids} end)
+    |> Enum.map(fn %{ids: ids} -> {@title_drift, ids} end)
+  end
+
+  # A title match is not evidence of duplication, and this is the THIRD time that has bitten
+  # this one function. The empty-key guard closed it for symbol-only titles; the placeholder
+  # guard closed it for "Untitled Document"; the unicode-aware separator class closed it for
+  # non-Latin titles collapsing onto incidental ASCII. Each fix removed one way for unrelated
+  # articles to share a normalized key, and each left the underlying premise standing.
+  #
+  # Measured on the hosted corpus 2026-08-06, on the 290 groups that were one night away from
+  # auto-unpublishing: three of them were not duplicates at all.
+  #
+  #   cos 0.56  "Changelog" / "CHANGELOG" / "ChangeLog"  -> a WordPress SEO plugin, the Elixir
+  #                                                         oauth2 library, and a WordPress theme
+  #   cos 0.64  "options" / "Options"                    -> Bootstrap-select vs the AtomJS mixin
+  #   cos 0.68  "Whoever can spend the most ..."         -> two different write-ups
+  #
+  # None is a placeholder, none is empty, none is non-Latin: they are ordinary
+  # filename-derived titles that unrelated sources happen to share. Every GENUINE duplicate in
+  # that same set — all of it title-case drift — sat at 0.84 or above, so the two populations
+  # do not overlap. Without this gate the pass would have unpublished the oauth2 changelog as
+  # a duplicate of a WordPress theme's, and the two-run agreement gate would have confirmed it,
+  # because the collision is deterministic and agreement only filters TRANSIENCE.
+  #
+  # So the gate stops patching the normalization and corroborates the CLAIM instead: a
+  # title-drift group may only survive if its members are also similar in content. The
+  # threshold sits in the empty band between the two measured populations.
+  #
+  # It applies to the TITLE signal only. `idempotency_drift_groups/1` matches on a key the
+  # WRITER supplied for exactly this purpose, which is real evidence of one capture written
+  # twice; a title is an accident of whatever the source file was called.
+  #
+  # FAILS CLOSED on missing evidence, and the withhold is SELF-CLEARING: an article with no
+  # embedding where this tenant keeps them (`score_source/1`; the corpus has had 80 such
+  # un-embedded articles since June) drops
+  # its whole group rather than letting it pass on a partial sample, and the missing vectors
+  # are enqueued (`backfill_missing_embeddings/2`) so the next run can decide instead of
+  # withholding the same group forever.
+  # An IDEMPOTENCY-drift group is exempt. Its members collide on a key the WRITER supplied to
+  # mark one capture, which is direct evidence of one capture written twice; a title is an
+  # accident of whatever the source file happened to be called. Gating the idempotency signal
+  # on vectors would also make the whole class depend on embeddings, and a tenant with no
+  # embedding key (mandatory BYO) has none at all.
+  #
+  # Scored over the LIVE members, never the scan-time id set, so what is checked is the group
+  # that would actually be unpublished.
+  defp corroborated?(proposal, live, scored) do
+    if title_drift?(proposal) do
+      # Sorted so the entry a group resolves to is deterministic, and looked up by ANY live
+      # member rather than by the smallest id: the batch is scored once over the union of
+      # every confirmed proposal's SCAN-time ids, so the smallest member of THIS group may
+      # have been unpublished by an earlier group in the same reduce.
+      ids = live |> Enum.map(& &1.id) |> Enum.sort()
+      judge_similarity(lookup_score(scored, ids), ids)
+    else
+      :ok
+    end
+  end
+
+  defp lookup_score(:unavailable, _ids), do: :unavailable
+  defp lookup_score(scored, ids), do: Enum.find_value(ids, &Map.get(scored, &1))
+
+  # FAILS CLOSED on missing evidence, checked against THIS group's scored MEMBER set — never
+  # against a pair COUNT, which was counted over the whole batch while the live ids are one
+  # proposal's, so a shared article or a mid-run unpublish made the two denominators disagree
+  # and rejected a genuine group. One unscored member withholds the whole group rather than
+  # letting it be judged on the pairs that happen to carry vectors, which could be exactly the
+  # two that genuinely match. Within one entry every embedded member is paired with every
+  # other, so full member coverage IS full pair coverage; `min_sim` may span another
+  # proposal's ids under the same title, which can only lower it.
+  # A FAILED scoring read is not missing evidence: it says nothing about which members carry
+  # vectors, so it withholds with an EMPTY unscored list — no backfill, and its own log line.
+  # Treating it as "no vectors" answered a DB outage with an embedding job per member of
+  # every confirmed group, against the same shedding database, under a message that pointed
+  # the operator at embeddings.
+  defp judge_similarity(:unavailable, _ids), do: {:withheld, :unavailable, []}
+
+  defp judge_similarity(nil, ids), do: {:withheld, nil, ids}
+
+  defp judge_similarity(%{scored: scored_ids, min_sim: min_sim} = entry, ids) do
+    case Enum.reject(ids, &MapSet.member?(scored_ids, &1)) do
+      [] -> if min_sim >= min_duplicate_similarity(), do: :ok, else: {:withheld, entry, []}
+      unscored -> {:withheld, entry, unscored}
+    end
+  end
+
+  # The three withholds have different remedies, so they say different things: a low cosine is
+  # a verdict, missing vectors are a gap this run just enqueued, and a failed read is neither.
+  defp log_uncorroborated(tenant_id, proposal, _live, :unavailable, _unscored) do
+    Logger.warning(
+      "Consolidation: tenant=#{tenant_id} WITHHELD duplicate_capture proposal " <>
+        "##{proposal.number} from auto-apply — similarity scoring failed this run, so there " <>
+        "is no content evidence to judge the title collision on. Reported, not applied. No " <>
+        "backfill enqueued: the cause is a failed read, not a missing vector."
+    )
+  end
+
+  defp log_uncorroborated(tenant_id, proposal, live, entry, unscored) do
+    detail =
+      case {entry, unscored} do
+        {_entry, [_ | _] = missing} ->
+          "#{length(missing)} member(s) carry no embedding; backfill enqueued"
+
+        {%{min_sim: sim, pairs: pairs}, []} ->
+          "min cosine #{Float.round(sim, 4)} across #{pairs} scored pair(s), threshold " <>
+            "#{min_duplicate_similarity()}"
+      end
+
+    Logger.warning(
+      "Consolidation: tenant=#{tenant_id} WITHHELD duplicate_capture proposal " <>
+        "##{proposal.number} from auto-apply — #{length(live)} live members share a " <>
+        "normalized title but their bodies do not corroborate it (#{detail}). Reported, " <>
+        "not applied. A shared title is not evidence of a duplicate capture."
+    )
+  end
+
+  # The rationale is the only place the forming signal survives onto the persisted proposal
+  # row, so both sites interpolate the phrase from the same attribute and the test is for the
+  # EXEMPTION, never for the gate. A rationale this cannot classify (reworded, truncated,
+  # non-binary) is GATED: a copy edit can only make this pass more conservative, never
+  # silently turn off the one content check on the class that writes to `articles`.
+  defp title_drift?(%{rationale: rationale}) when is_binary(rationale),
+    do: not String.contains?(rationale, @idempotency_drift)
+
+  defp title_drift?(_proposal), do: true
+
+  # Restricted to the CANDIDATE ids, never the whole corpus: the self-join is over the few
+  # hundred articles that already collided on a normalized title, so this adds a small join
+  # rather than a second 79k-row scan.
+  #
+  # Keyed by EVERY scored member, so a caller can resolve its group from any live id it still
+  # has. The grouping expression is the SAME normalized title that formed the group
+  # (`@title_key_sql`, referenced from both sites so they cannot drift), and each entry
+  # carries the member set it scored so the caller can tell a low cosine from a missing one.
+  defp pairwise_similarity_by_group(_tenant_id, []), do: %{}
+
+  defp pairwise_similarity_by_group(tenant_id, ids) do
+    tenant_id
+    |> title_pairs(ids)
+    |> score_pairs(score_source(tenant_id))
+    |> heavy_all(tenant_id)
+    |> index_by_member()
+  end
+
+  defp title_pairs(tenant_id, ids) do
+    from(a1 in published_base(tenant_id),
+      # `a2` binds tenant_id to the PASSED tenant_id, not transitively to `a1`'s. HeavyRead
+      # runs on a BYPASSRLS pool and its guard requires every base-table source to carry its
+      # own conjunctive equality — a transitive one is not checkable by inspecting the query.
+      # It carries the visibility guard for the same reason `a1` does (`shared_only/1`).
+      join: a2 in Article,
+      on:
+        a2.tenant_id == ^tenant_id and a2.status == :published and a1.id < a2.id and
+          shared_visibility(a2.metadata) and
+          fragment(unquote(@title_key_sql <> " = " <> @title_key_sql), a1.title, a2.title),
+      where: a1.id in ^ids and a2.id in ^ids
+    )
+  end
+
+  # WHERE this tenant's vectors live, branched exactly like every other embedding-presence
+  # reader in this codebase (`KnowledgeLintWorker.embedded_ids/2`,
+  # `BatchArticleEmbeddingWorker.side_table_hashes/2`) — and the branch has to agree with
+  # THEIRS, not merely exist. A legacy-1536 tenant whose reads have not cut over keeps its
+  # vector in `articles.embedding`; scoring it at the active dimension found no side-table
+  # row, withheld the group, and the backfill's own legacy-hash check then skipped the
+  # re-embed as already-done — a withhold that could never clear, which is the opposite of
+  # the self-clearing property this gate claims.
+  defp score_source(tenant_id) do
+    if Embeddings.use_side_table_hash?(tenant_id),
+      do: Embeddings.active_dimension(tenant_id),
+      else: :legacy
+  end
+
+  defp score_pairs(query, :legacy) do
+    from([a1, a2] in query,
+      where: not is_nil(a1.embedding) and not is_nil(a2.embedding),
+      group_by: fragment(unquote(@title_key_sql), a1.title),
+      select: %{
+        min_sim: min(fragment("1 - (? <=> ?)", a1.embedding, a2.embedding)),
+        pairs: count(a1.id),
+        members:
+          fragment("array_agg(DISTINCT ?::text) || array_agg(DISTINCT ?::text)", a1.id, a2.id)
+      }
+    )
+  end
+
+  defp score_pairs(query, dim) do
+    from([a1, a2] in query,
+      join: e1 in "article_embeddings",
+      on: e1.article_id == a1.id and e1.dim == ^dim and e1.tenant_id == a1.tenant_id,
+      join: e2 in "article_embeddings",
+      on: e2.article_id == a2.id and e2.dim == ^dim and e2.tenant_id == a2.tenant_id,
+      group_by: fragment(unquote(@title_key_sql), a1.title),
+      select: %{
+        min_sim: min(fragment("1 - (? <=> ?)", e1.embedding, e2.embedding)),
+        pairs: count(a1.id),
+        members:
+          fragment("array_agg(DISTINCT ?::text) || array_agg(DISTINCT ?::text)", a1.id, a2.id)
+      }
+    )
+  end
+
+  defp index_by_member(rows) do
+    rows
+    |> Enum.flat_map(fn %{min_sim: sim, pairs: pairs, members: members} ->
+      entry = %{min_sim: to_float(sim), pairs: pairs, scored: MapSet.new(members)}
+      Enum.map(members, &{&1, entry})
+    end)
+    |> Map.new()
+  end
+
+  defp to_float(%Decimal{} = d), do: Decimal.to_float(d)
+  defp to_float(n) when is_float(n), do: n
+  defp to_float(n) when is_integer(n), do: n * 1.0
+  defp to_float(_other), do: -1.0
+
+  # Live-tunable, because the band between the two populations is a property of a tenant's
+  # corpus rather than of the algorithm. Clamped and type-checked for the same reason
+  # `clamp_cap/3` is, in the other direction: a number sorts BELOW every atom and binary in
+  # Erlang term order, so a `nil` or a `"0.8"` from a hand-rolled env read makes
+  # `min_sim >= threshold` false for every pair on every night — title-drift auto-apply stops
+  # permanently while the run still reports `gate: :open`.
+  #
+  # An out-of-range NUMBER falls back to the default too, and is NOT clamped, because unlike
+  # `clamp_cap/3` neither end of this range is the safe one. Clamping a `-1` (the same
+  # "disable" idiom the cap tests use) to `0.0` satisfies `min_sim >= 0.0` for every pair —
+  # it turns the only content check on the auto-applying class fully OFF. Clamping a `2.0`
+  # (an operator hard-disabling the class mid-incident) to `1.0` is reachable too: identical
+  # vectors score exactly 1.0, so the gate an operator shut re-opens for byte-identical
+  # captures. A typo may only make this pass more conservative, so both go to the default.
+  defp min_duplicate_similarity do
+    :loopctl
+    |> Application.get_env(
+      :knowledge_consolidation_min_duplicate_similarity,
+      @default_min_duplicate_similarity
+    )
+    |> validate_similarity()
+  end
+
+  defp validate_similarity(value)
+       when (is_float(value) or is_integer(value)) and value >= 0 and value <= 1,
+       do: value * 1.0
+
+  defp validate_similarity(value) do
+    Logger.warning(
+      "Consolidation: ignoring duplicate similarity threshold #{inspect(value)} — not a " <>
+        "number in 0.0..1.0; using #{@default_min_duplicate_similarity}."
+    )
+
+    @default_min_duplicate_similarity
   end
 
   # The same idempotency key written under two different tag FORMATS (#583) — the
@@ -823,7 +1208,7 @@ defmodule Loopctl.Knowledge.Consolidation do
       select: %{ids: fragment("array_agg(?::text ORDER BY ?)", a.id, a.inserted_at)}
     )
     |> heavy_all(tenant_id)
-    |> Enum.map(fn %{ids: ids} -> {"idempotency-tag", ids} end)
+    |> Enum.map(fn %{ids: ids} -> {@idempotency_drift, ids} end)
   end
 
   # `:contradiction_candidate` WAS a class here. It is not any more, and the reason is
