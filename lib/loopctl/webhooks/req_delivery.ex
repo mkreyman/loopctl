@@ -104,9 +104,8 @@ defmodule Loopctl.Webhooks.ReqDelivery do
       {:ok, %Req.Response{status: status, body: resp_body}} when status >= 200 and status < 300 ->
         {:ok, %{status: status, body: resp_body_to_string(resp_body)}}
 
-      {:ok, %Req.Response{status: status, body: resp_body}} ->
-        body_snippet = resp_body |> resp_body_to_string() |> String.slice(0, 200)
-        {:error, "HTTP #{status}: #{body_snippet}"}
+      {:ok, %Req.Response{status: status} = resp} ->
+        {:error, "HTTP #{status}#{failure_metadata(resp)}"}
 
       {:error, %Req.TransportError{reason: :timeout}} ->
         {:error, "timeout"}
@@ -116,6 +115,28 @@ defmodule Loopctl.Webhooks.ReqDelivery do
 
       {:error, exception} ->
         {:error, "delivery_error: #{inspect(exception)}"}
+    end
+  end
+
+  # What a FAILED delivery is allowed to say about the response.
+  #
+  # The error string built here is persisted on the delivery event and read back
+  # by the tenant through the deliveries API, so it must describe the FAILURE
+  # without reproducing what the destination SENT. A destination is
+  # tenant-supplied, so echoing its body would make the delivery record a
+  # general-purpose reader for whatever loopctl can reach — the response content
+  # would flow back out through an API the destination's owner does not control.
+  #
+  # Status code and `content-type` are the two facts a tenant debugging their own
+  # receiver actually needs ("it 500s", "it answered HTML, not JSON"), and neither
+  # carries response content. Everything else stays inside loopctl.
+  defp failure_metadata(%Req.Response{} = resp) do
+    case Req.Response.get_header(resp, "content-type") do
+      [content_type | _] when is_binary(content_type) ->
+        " (content-type: #{content_type |> String.split(";") |> hd() |> String.trim()})"
+
+      _ ->
+        ""
     end
   end
 

@@ -464,13 +464,18 @@ defmodule Loopctl.Egress do
 
   Purpose scoping is a SECURITY INVARIANT (AC-41.4.5 constraint 2): a host
   declared for an Ollama inference box does NOT authorize POSTing tenant content
-  to it, so webhook callers must pass `:webhook`.
+  to it, so webhook callers must pass `:webhook`. That holds for BOTH carve-out
+  mechanisms — the tenant declaration and the OPERATOR deployment allowlist — so
+  the destination PORT travels with the purpose: an operator carve-out may be
+  bound to a specific port, and a decision made about the host alone would grant
+  more than the operator wrote.
   """
   @spec endpoint_verdict(Scope.t(), String.t(), Policy.purpose()) :: atom()
   def endpoint_verdict(%Scope{} = scope, url, purpose) do
-    host = URI.parse(url).host || url
+    uri = URI.parse(url)
+    host = uri.host || url
 
-    case Policy.classify(scope, host, purpose) do
+    case Policy.classify(scope, host, purpose, Policy.uri_port(uri)) do
       {:ok, %{verdict: verdict}} -> verdict
       {:error, _} -> :unclassifiable
     end
@@ -523,16 +528,45 @@ defmodule Loopctl.Egress do
     end
   end
 
+  @doc """
+  Resolves and classifies a webhook destination OUTSIDE any transaction, so a
+  later `webhook_destination_check/2` on the same destination is a cache read.
+
+  A pure WARM: the return value is discarded and nothing depends on the entry
+  still being resident. `Loopctl.Webhooks` calls it before opening the locked
+  `AdminRepo` transaction that makes the config-time decision, so a slow resolver
+  on a tenant-supplied hostname does not hold one of that pool's three
+  connections (`config/runtime.exs:190`) while it answers.
+  """
+  @spec prewarm_webhook_destination(Scope.t(), String.t() | nil) :: :ok
+  def prewarm_webhook_destination(%Scope{} = scope, url) when is_binary(url) do
+    _verdict = endpoint_verdict(scope, url, :webhook)
+    :ok
+  end
+
+  def prewarm_webhook_destination(%Scope{}, _url), do: :ok
+
   # The legacy phrase is preserved as the PREFIX so existing API consumers that
   # string-match it keep working; the remediation names WHO can change it, which
   # a bare "must not target a private or loopback address" never did.
+  #
+  # It also names the PURPOSE, because a carve-out is purpose-scoped: an operator
+  # who allowlisted this host for the deployment's model endpoint has not thereby
+  # made it a webhook destination, and the two are fixed by different edits.
   defp denylisted_message(url) do
-    host = URI.parse(url).host || url
+    uri = URI.parse(url)
+    host = uri.host || url
 
     "must not target a private or loopback address — #{host} resolves into a private, " <>
       "loopback, CGNAT, link-local or ULA range. Only the OPERATOR deployment allowlist " <>
-      "can carve such a host out of the SSRF denylist; a tenant declaration cannot."
+      "can carve such a host out of the SSRF denylist; a tenant declaration cannot. A " <>
+      "carve-out grants the PURPOSE (and, when stated, the PORT) it names, so an entry " <>
+      "made for model inference does not cover webhook delivery — reaching this " <>
+      "destination needs an entry naming the 'webhook' purpose#{port_hint(uri)}."
   end
+
+  defp port_hint(%URI{port: port}) when is_integer(port), do: " on port #{port}"
+  defp port_hint(_uri), do: ""
 
   defp webhook_remediation(scope, url, verdict) do
     host = URI.parse(url).host || url
@@ -1265,9 +1299,10 @@ defmodule Loopctl.Egress do
   end
 
   defp classify_endpoint(scope, url, purpose) do
-    host = URI.parse(url).host || url
+    uri = URI.parse(url)
+    host = uri.host || url
 
-    case Policy.classify(scope, host, purpose) do
+    case Policy.classify(scope, host, purpose, Policy.uri_port(uri)) do
       {:ok, %{verdict: v, from_allowlist: a}} -> {v, a}
       {:error, _} -> {:unclassifiable, false}
     end

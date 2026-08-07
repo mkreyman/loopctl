@@ -178,11 +178,33 @@ defmodule Loopctl.Egress.WebhookEgressTest do
         Req.Test.json(conn, %{"ok" => true})
       end)
 
-      with_allowlist(["127.0.0.1"], fn ->
+      with_allowlist(["127.0.0.1@webhook"], fn ->
         assert :ok = deliver(event, tenant.id)
       end)
 
       assert AdminRepo.get!(WebhookEvent, event.id).status == :delivered
+    end
+
+    # The carve-out grants the purpose it names. An entry made for the
+    # deployment's own model endpoint does not also make that host a destination
+    # for tenant-authored payloads — the operator answered a different question.
+    test "an INFERENCE-only carve-out does NOT make it deliverable",
+         %{tenant: tenant} do
+      webhook = subscription(tenant.id, "https://93.184.216.34/inbound")
+      event = pending_event(tenant.id, webhook.id)
+
+      webhook
+      |> Ecto.Changeset.change(%{url: "http://127.0.0.1:9000/inbound"})
+      |> AdminRepo.update!()
+
+      :ok = mark_local_only(tenant.id)
+      forbid_http!()
+
+      with_allowlist(["127.0.0.1@inference"], fn ->
+        assert :ok = deliver(event, tenant.id)
+      end)
+
+      assert AdminRepo.get!(WebhookEvent, event.id).status == :blocked
     end
 
     # The control case: the SAME private-range host with NO allowlist entry and no
@@ -316,7 +338,7 @@ defmodule Loopctl.Egress.WebhookEgressTest do
     end
 
     test "a DELIVERABLE destination is accepted under the same marking", %{tenant: tenant} do
-      with_allowlist(["127.0.0.1"], fn ->
+      with_allowlist(["127.0.0.1@webhook"], fn ->
         assert {:ok, %{webhook: webhook}} =
                  Webhooks.create_webhook(tenant.id, %{
                    "url" => "http://127.0.0.1:9000/inbound",
@@ -324,6 +346,45 @@ defmodule Loopctl.Egress.WebhookEgressTest do
                  })
 
         assert webhook.url == "http://127.0.0.1:9000/inbound"
+      end)
+    end
+
+    # The config-time gate applies the SAME purpose scoping the delivery path
+    # does, so a destination a carve-out does not cover is refused at write time
+    # rather than accepted and silently blocked on every later delivery.
+    test "a carve-out for a DIFFERENT purpose is refused at creation", %{tenant: tenant} do
+      with_allowlist(["127.0.0.1@inference"], fn ->
+        assert {:error, changeset} =
+                 Webhooks.create_webhook(tenant.id, %{
+                   "url" => "http://127.0.0.1:9000/inbound",
+                   "events" => ["story.status_changed"]
+                 })
+
+        assert {"must not target a private or loopback address" <> rest, []} =
+                 changeset.errors[:url]
+
+        # The remediation names the fix, so an operator is not left guessing which
+        # of the two edits (purpose, port) their entry is missing.
+        assert rest =~ "'webhook' purpose"
+      end)
+    end
+
+    # Naming a port in the entry binds the carve-out to that port.
+    test "a port-bound carve-out is refused for a different port", %{tenant: tenant} do
+      with_allowlist(["127.0.0.1:9000@webhook"], fn ->
+        assert {:ok, _} =
+                 Webhooks.create_webhook(tenant.id, %{
+                   "url" => "http://127.0.0.1:9000/inbound",
+                   "events" => ["story.status_changed"]
+                 })
+
+        assert {:error, changeset} =
+                 Webhooks.create_webhook(tenant.id, %{
+                   "url" => "http://127.0.0.1:9001/inbound",
+                   "events" => ["story.status_changed"]
+                 })
+
+        assert changeset.errors[:url]
       end)
     end
 
@@ -876,6 +937,41 @@ defmodule Loopctl.Egress.WebhookEgressTest do
       assert Egress.tenant_lock_key(tenant.id) == key
       assert Egress.tenant_lock_key(fixture(:tenant).id) != key
     end
+
+    # Issue #624 item 7. The DECISION still runs inside the lock (that is what
+    # serializes it against a concurrent enable_local_only/3); what must not run
+    # there is the DNS resolve. `AdminRepo` has a 3-connection pool, and the host
+    # being resolved is tenant-supplied, so a slow answer inside the lock puts the
+    # egress guard's own marking lookups behind an attacker-influenced delay.
+    #
+    # Observed via the advisory lock itself: the resolve must happen while this
+    # backend holds NO advisory lock. Move the classification back inside the
+    # transaction and the count is 1.
+    test "the destination is resolved BEFORE the egress lock is taken", %{tenant: tenant} do
+      test_pid = self()
+
+      expect(Loopctl.MockDnsResolver, :resolve, 1, fn "hooks.example.com" ->
+        send(test_pid, {:advisory_locks_held, advisory_locks_held()})
+        {:ok, [{93, 184, 216, 34}]}
+      end)
+
+      assert {:ok, _} =
+               Webhooks.create_webhook(tenant.id, %{
+                 "url" => "https://hooks.example.com/inbound",
+                 "events" => ["story.status_changed"]
+               })
+
+      assert_receive {:advisory_locks_held, 0}
+    end
+  end
+
+  defp advisory_locks_held do
+    %{rows: [[count]]} =
+      AdminRepo.query!(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+      )
+
+    count
   end
 
   defp audit_count(tenant_id) do

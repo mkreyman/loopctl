@@ -135,6 +135,61 @@ defmodule Loopctl.Egress.PolicyTest do
     end
   end
 
+  # THE pair the purpose scoping exists for. A deployment whose model endpoint is
+  # network-local must keep working unchanged, while the SAME host stops being an
+  # acceptable destination for a tenant-authored webhook. Both halves are asserted
+  # on ONE host under ONE allowlist so neither can be satisfied by a change that
+  # simply refuses (or admits) everything.
+  describe "an operator carve-out answers for the purpose it names" do
+    test "the UNCHANGED inference deployment still resolves, and webhook does not",
+         %{tenant: t, scope: scope} do
+      :ok = mark_local_only(t.id)
+
+      # The documented, pre-existing form of the entry — a bare host, untouched by
+      # an operator upgrading past this change.
+      with_allowlist(["127.0.0.1"], fn ->
+        assert {:ok, pinned} =
+                 Policy.check(scope, "http://127.0.0.1:11434/v1/embeddings", :inference)
+
+        assert pinned.ip == {127, 0, 0, 1}
+
+        assert {:error, :egress_blocked, details} =
+                 Policy.check(scope, "http://127.0.0.1:11434/hooks", :webhook,
+                   tenant_supplied: true
+                 )
+
+        # `:denylisted`, NOT `:non_local`: an ungranted carve-out must fall back to
+        # what the ADDRESS is, or an unmarked scope would pin and connect to it.
+        assert details.verdict == :denylisted
+      end)
+    end
+
+    test "naming webhook grants it WITHOUT taking inference away", %{tenant: t, scope: scope} do
+      :ok = mark_local_only(t.id)
+
+      with_allowlist(["127.0.0.1@inference+webhook"], fn ->
+        assert {:ok, _} = Policy.check(scope, "http://127.0.0.1:11434/v1/embeddings", :inference)
+
+        assert {:ok, _} =
+                 Policy.check(scope, "http://127.0.0.1:9000/hooks", :webhook,
+                   tenant_supplied: true
+                 )
+      end)
+    end
+
+    test "a port-bound entry keeps inference working on the port it names",
+         %{tenant: t, scope: scope} do
+      :ok = mark_local_only(t.id)
+
+      with_allowlist(["127.0.0.1:11434"], fn ->
+        assert {:ok, _} = Policy.check(scope, "http://127.0.0.1:11434/v1/embeddings", :inference)
+
+        assert {:error, :egress_blocked, _} =
+                 Policy.check(scope, "http://127.0.0.1:8080/v1/embeddings", :inference)
+      end)
+    end
+  end
+
   describe "local_only refusal (AC-41.4.3, TC-41.4.1)" do
     test "a vendor endpoint is refused BEFORE any request", %{tenant: t, scope: scope} do
       :ok = mark_local_only(t.id)

@@ -19,6 +19,16 @@ defmodule Loopctl.Egress.Policy do
 
   GHSA-jh42-wf7g-f5rg therefore stays closed for every tenant-writable input.
 
+  BOTH carve-out mechanisms are PURPOSE-SCOPED, and neither may be read as a
+  blanket grant. A carve-out earned for one purpose does not answer for another:
+  `inference` reaches an endpoint the DEPLOYMENT resolves, while `webhook` and
+  `ingest` reach a destination a TENANT writes, so an inference carve-out that
+  also authorized webhook POSTs would extend the operator's private network to
+  tenant-chosen destinations. `verdict_for/3` therefore re-derives BOTH the
+  allowlist grant and the tenant declaration against the requested purpose (and,
+  for the allowlist, the requested PORT) on every read — see
+  `Loopctl.Egress.Allowlist` for the entry grammar that expresses them.
+
   ## Verdicts
 
     * `:network_local` — loopback/private-range host carved out by the operator
@@ -87,6 +97,12 @@ defmodule Loopctl.Egress.Policy do
   """
   @type base_verdict :: :network_local | :denylisted | :public
   @type purpose :: :inference | :webhook | :ingest
+  @typedoc """
+  The destination port a decision is about, or `:any` when the caller has only a
+  HOST (a report, never an admission). `:any` is not a wildcard — see
+  `Loopctl.Egress.Allowlist.allowed?/4`.
+  """
+  @type port_context :: :any | 1..65_535
   @type details :: %{
           required(:host) => String.t() | nil,
           required(:scope) => String.t(),
@@ -183,7 +199,7 @@ defmodule Loopctl.Egress.Policy do
     with true <- uri.scheme in @pinnable_schemes,
          host when is_binary(host) and host != "" <- uri.host,
          {:ok, %{ips: [ip | _], verdict: verdict}} <-
-           cached_classification(scope, host, purpose),
+           cached_classification(scope, host, purpose, uri_port(uri)),
          :ok <- denylist_gate(scope, host, verdict, tenant_supplied?),
          # A denylisted host is otherwise left UNPINNED exactly as `UrlGuard.pin/2`
          # used to leave it (`{:error, :blocked_ip}`).
@@ -289,14 +305,20 @@ defmodule Loopctl.Egress.Policy do
   end
 
   @doc """
-  Classifies `host` for `scope`/`purpose` WITHOUT deciding admission — used by
-  `Loopctl.Egress.posture/2` and by the `local_only` enable pre-flight.
+  Classifies `host` for `scope`/`purpose`/`port` WITHOUT deciding admission —
+  used by `Loopctl.Egress.posture/2` and by the `local_only` enable pre-flight.
+
+  PASS THE PORT whenever the caller has a URL. An operator carve-out may be bound
+  to a specific port (see `Loopctl.Egress.Allowlist`), and the `:any` default —
+  which means "no port in hand", not "every port" — does not match such an entry.
+  A host-granular caller therefore gets the CONSERVATIVE answer; an admission
+  decision made without the port would otherwise have to guess.
   """
-  @spec classify(Scope.t(), String.t(), purpose()) ::
+  @spec classify(Scope.t(), String.t(), purpose(), port_context()) ::
           {:ok, %{verdict: verdict(), from_allowlist: boolean(), ips: [:inet.ip_address()]}}
           | {:error, term()}
-  def classify(%Scope{} = scope, host, purpose) when is_binary(host) do
-    case cached_classification(scope, host, purpose) do
+  def classify(%Scope{} = scope, host, purpose, port \\ :any) when is_binary(host) do
+    case cached_classification(scope, host, purpose, port) do
       {:ok, entry} -> {:ok, Map.take(entry, [:verdict, :from_allowlist, :ips])}
       {:error, _} = err -> err
     end
@@ -421,7 +443,7 @@ defmodule Loopctl.Egress.Policy do
   end
 
   defp check_local_only(scope, uri, host, purpose) do
-    case cached_classification(scope, host, purpose) do
+    case cached_classification(scope, host, purpose, uri_port(uri)) do
       # `:pin_stale` is reachable ONLY for an entry that would otherwise be
       # ALLOWED. A denylisted/non-local entry that merely failed revalidation is
       # still a REFUSAL, reported with its REAL verdict — reporting the transient
@@ -470,18 +492,18 @@ defmodule Loopctl.Egress.Policy do
     Application.get_env(:loopctl, :egress_negative_classification_ttl_ms, 30_000)
   end
 
-  defp cached_classification(scope, host, purpose) do
+  defp cached_classification(scope, host, purpose, port) do
     scope_key = Scope.key(scope)
 
     case PinCache.fetch(scope.tenant_id, scope_key, host) do
-      # NEGATIVE cache hit. Short-circuited BEFORE `resolve_verdict/2`, which has
+      # NEGATIVE cache hit. Short-circuited BEFORE `resolve_verdict/3`, which has
       # no meaning for an entry that never resolved (its catch-all would report
       # `:non_local` — a verdict, and on an unmarked scope a permissive one).
       {:ok, %{base_verdict: :unresolvable} = entry} ->
         {:error, Map.get(entry, :resolve_error, :unresolvable)}
 
       {:ok, entry} ->
-        {:ok, resolve_verdict(entry, purpose)}
+        {:ok, resolve_verdict(entry, purpose, port)}
 
       :miss ->
         # Lazy initial population — no dependency on the US-41.2 probe. The
@@ -494,7 +516,7 @@ defmodule Loopctl.Egress.Policy do
             entry =
               PinCache.put(scope.tenant_id, scope_key, host, attrs, generation: generation)
 
-            {:ok, resolve_verdict(entry, purpose)}
+            {:ok, resolve_verdict(entry, purpose, port)}
 
           {:error, reason} = error ->
             cache_unresolvable(scope, scope_key, host, reason, generation)
@@ -517,36 +539,85 @@ defmodule Loopctl.Egress.Policy do
   end
 
   @doc """
-  Derives the purpose-SCOPED verdict from a cached entry.
+  Derives the purpose- and port-SCOPED verdict from a cached entry.
 
   The cache stores only purpose-INDEPENDENT facts (`base_verdict`, `ips`,
-  `from_allowlist`, the host's declared `purposes`). Collapsing the purpose into
-  a cached verdict would let the FIRST purpose to touch a host fix its verdict
-  for the whole TTL — an inference endpoint declared for `["inference"]` but
-  first classified under `:webhook` would then be refused for legitimate
-  inference calls. AC-41.4.5 constraint (2) makes purpose scoping a security
-  invariant, so it is re-derived on EVERY read.
+  `from_allowlist`, the host's declared `purposes`, and the verdict the host
+  would carry WITHOUT its operator carve-out). Collapsing the purpose into a
+  cached verdict would let the FIRST purpose to touch a host fix its verdict for
+  the whole TTL — an inference endpoint declared for `["inference"]` but first
+  classified under `:webhook` would then be refused for legitimate inference
+  calls. AC-41.4.5 constraint (2) makes purpose scoping a security invariant, so
+  it is re-derived on EVERY read.
+
+  The OPERATOR carve-out is re-derived here too, for the same reason and one
+  more: a carve-out that is REMOVED from the deployment configuration stops
+  granting immediately instead of surviving to the end of the entry's TTL. The
+  allowlist is a parsed in-memory config list, so this costs no network or DB
+  round-trip and the AC-41.4.12 hot-path bound still holds.
+
+  When the carve-out does NOT cover this `(purpose, port)`, the host falls back to
+  what it is WITHOUT the carve-out — for a private address that is `:denylisted`,
+  not `:non_local`. That distinction is load-bearing: `:non_local` passes
+  `denylist_gate/4` and would be pinned and connected to on an unmarked scope,
+  which is the whole refusal this module exists to make.
   """
-  @spec resolve_verdict(map(), purpose()) :: map()
-  def resolve_verdict(entry, purpose) do
-    Map.put(entry, :verdict, verdict_for(entry, purpose))
+  @spec resolve_verdict(map(), purpose(), port_context()) :: map()
+  def resolve_verdict(entry, purpose, port \\ :any) do
+    verdict = verdict_for(entry, purpose, port)
+
+    entry
+    |> Map.put(:verdict, verdict)
+    # Never claim allowlist provenance for a verdict the allowlist did not grant.
+    |> Map.put(
+      :from_allowlist,
+      verdict == :network_local and Map.get(entry, :from_allowlist, false)
+    )
   end
 
-  defp verdict_for(%{base_verdict: :network_local}, _purpose), do: :network_local
-  defp verdict_for(%{base_verdict: :denylisted}, _purpose), do: :denylisted
+  defp verdict_for(%{base_verdict: :network_local} = entry, purpose, port) do
+    if allowlist_grants?(entry, purpose, port) do
+      :network_local
+    else
+      entry
+      |> Map.put(:base_verdict, Map.get(entry, :ungranted_base, :denylisted))
+      |> verdict_for(purpose, port)
+    end
+  end
 
-  defp verdict_for(%{base_verdict: :public, purposes: purposes}, purpose) do
+  defp verdict_for(%{base_verdict: :denylisted}, _purpose, _port), do: :denylisted
+
+  defp verdict_for(%{base_verdict: :public, purposes: purposes}, purpose, _port) do
     if to_string(purpose) in purposes, do: :tenant_declared, else: :non_local
   end
 
-  defp verdict_for(_entry, _purpose), do: :non_local
+  defp verdict_for(_entry, _purpose, _port), do: :non_local
+
+  # A cached entry with no `:host` cannot be re-checked against the allowlist, so
+  # it does not get the carve-out — the fallback below is the address's own
+  # verdict, which for a private address is `:denylisted`. Fail closed.
+  defp allowlist_grants?(%{host: host, ips: ips}, purpose, port) when is_binary(host) do
+    Allowlist.allowed?(host, ips, purpose, port)
+  end
+
+  defp allowlist_grants?(_entry, _purpose, _port), do: false
 
   defp classify_uncached(scope, host) do
     with {:ok, ips} <- UrlGuard.resolve_host(host) do
       cond do
         # (a) OPERATOR carve-out — the only thing that may reach a private range.
+        # WHICH purposes and ports it actually grants is re-derived per read by
+        # `verdict_for/3`; what is cached here is only "a carve-out exists", plus
+        # `ungranted_base`: what this host is when the carve-out does not apply.
         Allowlist.host_allowed?(host) or Allowlist.ips_allowed?(ips) ->
-          {:ok, %{base_verdict: :network_local, from_allowlist: true, ips: ips, purposes: []}}
+          {:ok,
+           %{
+             base_verdict: :network_local,
+             ungranted_base: ungranted_base(ips),
+             from_allowlist: true,
+             ips: ips,
+             purposes: Egress.declared_purposes(scope.tenant_id, host)
+           }}
 
         # Everything else must pass the FULL SSRF denylist first.
         not UrlGuard.public_addresses?(ips) ->
@@ -564,11 +635,32 @@ defmodule Loopctl.Egress.Policy do
     end
   end
 
+  # What an allowlisted host is WITHOUT its carve-out. Usually `:denylisted` (a
+  # private address is exactly why a carve-out was needed), but an operator may
+  # allowlist a PUBLIC host too, and that host must still be able to earn
+  # `:tenant_declared` from the tenant's own declaration for purposes the
+  # carve-out does not name.
+  defp ungranted_base(ips) do
+    if UrlGuard.public_addresses?(ips), do: :public, else: :denylisted
+  end
+
   defp safe_host(url) do
     URI.parse(url).host
   rescue
     _ -> nil
   end
+
+  @doc """
+  The destination port a URI addresses, for the allowlist's port constraint.
+
+  `URI.parse/1` fills the scheme's default port, so an `https://host/x` decision
+  is made about port 443 rather than about "no port" — which is what an operator
+  writing a portless carve-out expects, and what makes `host:443` a meaningful
+  entry. A URI carrying no port and no known scheme default yields `:any`.
+  """
+  @spec uri_port(URI.t()) :: port_context()
+  def uri_port(%URI{port: port}) when is_integer(port) and port in 1..65_535, do: port
+  def uri_port(_uri), do: :any
 
   defp fail_closed(scope, url, detail) do
     Logger.warning("Loopctl.Egress.Policy: failing CLOSED for #{Scope.key(scope)}: #{detail}")
