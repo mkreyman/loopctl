@@ -7100,6 +7100,7 @@ defmodule Loopctl.Knowledge do
   end
 
   defp search_semantic_legacy(tenant_id, query_embedding, limit, offset, status, opts) do
+    heavy_opts = semantic_heavy_read_opts()
     results_query = semantic_results_query(tenant_id, query_embedding, opts)
 
     # COUNT — kept as a SEPARATE full-corpus filtered `count(*)` so `total_count` PRESERVES
@@ -7111,12 +7112,12 @@ defmodule Loopctl.Knowledge do
     # bounded tenant scan — inherently O(tenant rows) for a true `count(*)`).
     count_query = semantic_count_query(tenant_id, query_embedding, status, opts)
 
-    case HeavyRead.all(tenant_id, results_query, semantic_heavy_read_opts()) do
+    case HeavyRead.all(tenant_id, results_query, heavy_opts) do
       {:error, :heavy_read_overloaded} = err ->
         err
 
       results ->
-        case HeavyRead.one(tenant_id, count_query, semantic_heavy_read_opts()) do
+        case HeavyRead.one(tenant_id, count_query, heavy_opts) do
           {:error, :heavy_read_overloaded} = err ->
             err
 
@@ -7141,6 +7142,7 @@ defmodule Loopctl.Knowledge do
                    pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
                  }
                  |> Map.merge(legacy_system_corpus_meta())
+                 |> Map.merge(HeavyRead.iterative_scan_meta(heavy_opts))
              }}
         end
     end
@@ -7233,6 +7235,13 @@ defmodule Loopctl.Knowledge do
                    pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
                  }
                  |> Map.merge(semantic_disclosure_meta(tenant_id, dimension))
+                 # Derived from `pool_opts` — the opts the inner ANN ACTUALLY ran with —
+                 # not from a fresh probe, so the disclosure can never disagree with the
+                 # rows it accompanies. NOT memoized alongside the tenant-scoped
+                 # disclosures above: this is a per-NODE backend capability with its own
+                 # (much shorter) probe TTL, and caching it per tenant would keep
+                 # reporting a state the node has already left.
+                 |> Map.merge(HeavyRead.iterative_scan_meta(pool_opts))
              }}
         end
     end
@@ -7552,7 +7561,13 @@ defmodule Loopctl.Knowledge do
   # documented post-ANN relevance tradeoff (deep enumeration is the keyset list path's job,
   # US-27.9a, not relevance search). The floor (≥ the `max_relevance_page_size` limit) keeps
   # every in-cap page fully served under the default config.
-  defp semantic_result_pool(needed) when is_integer(needed) and needed > 0 do
+  #
+  # Public-but-`@doc false` for the same reason `semantic_side_table_pool_query/4` is: the
+  # `left: []` diagnostic (`Loopctl.VectorRecallDiagnostics`) must EXPLAIN the pool the read
+  # ACTUALLY used, and a test-side reimplementation of this formula would drift silently and
+  # then describe a query that never ran.
+  @doc false
+  def semantic_result_pool(needed) when is_integer(needed) and needed > 0 do
     floor =
       Application.get_env(
         :loopctl,

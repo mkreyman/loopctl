@@ -303,6 +303,55 @@ defmodule Loopctl.HeavyRead do
     end
   end
 
+  @doc """
+  The search-`meta` disclosure of whether a vector read ACTUALLY ran with
+  `hnsw.iterative_scan`, derived from the `opts` that read was issued with.
+
+  Pass the SAME keyword list handed to `all/3` / `one/3` — this reports what the read did,
+  not what a fresh probe would say now, so it cannot disagree with the rows it accompanies.
+
+      %{ann_iterative_scan: "off"}          # the operator has not enabled it (the default)
+      %{ann_iterative_scan: "applied"}      # enabled and in force for this read
+      %{ann_iterative_scan: "unavailable",  # enabled, but the capability probe fell closed
+        ann_iterative_scan_reason: "..."}
+
+  ## Why the third state has to be SAID
+
+  `iterative_scan_supported?/0` fails CLOSED on an inconclusive probe (a pool checkout
+  timeout, a DB restart, a sandbox blip) — correctly: emitting a GUC a pgvector < 0.8
+  backend rejects would 500 every ANN read. But the ANN applies `tenant_id` as a residual
+  filter AFTER the index returns its top-`ef_search` batch, so a read that loses iterative
+  scan can silently UNDER-RETURN rows the tenant has. Without this field the caller sees a
+  short result set and a 200, and reads it as "the corpus has nothing" — the same silent
+  absence `system_corpus_recall` and `reembed_excluded_reason` exist to prevent. This
+  state has NOT been observed in production; it is a disclosed code path, not an incident.
+
+  The fail-closed behaviour itself is unchanged. This says so; it does not fix it — and
+  it self-heals on the next conclusive probe.
+  """
+  @spec iterative_scan_meta(keyword()) :: map()
+  def iterative_scan_meta(opts) when is_list(opts) do
+    case {hnsw_iterative_scan(), Keyword.get(opts, :hnsw_iterative_scan)} do
+      {"off", _applied} ->
+        %{ann_iterative_scan: "off"}
+
+      {_mode, applied} when is_binary(applied) ->
+        %{ann_iterative_scan: "applied"}
+
+      {mode, nil} ->
+        %{
+          ann_iterative_scan: "unavailable",
+          ann_iterative_scan_reason:
+            "hnsw.iterative_scan is enabled (#{mode}) but the connected pgvector could not " <>
+              "be confirmed to support it, so this vector read ran without it. The index " <>
+              "applies the tenant filter AFTER returning its top-ef_search batch, so rows " <>
+              "this tenant has may be missing from these results. The capability probe " <>
+              "re-runs on a short window and this self-heals; results are not otherwise " <>
+              "affected."
+        }
+    end
+  end
+
   # The per-read `hnsw.ef_search` value to APPLY via `SET LOCAL`, or `nil` to leave the
   # session/role default untouched. `nil` exactly when the configured (clamped) value equals
   # pgvector's built-in default — so a role-level `ALTER ROLE ... SET hnsw.ef_search` override
