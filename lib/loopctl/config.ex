@@ -48,6 +48,31 @@ defmodule Loopctl.Config do
   # grow — and every entry is a linear probe on every decrypt.
   @cloak_max_retired_keys 16
 
+  # Positional labels for retired ciphers, written LITERALLY rather than interpolated.
+  # `cloak_ciphers!/3` already caps entries at @cloak_max_retired_keys, so zipping against
+  # this list can never truncate. The assertion below keeps the two from drifting.
+  @retired_labels [
+    :retired_0,
+    :retired_1,
+    :retired_2,
+    :retired_3,
+    :retired_4,
+    :retired_5,
+    :retired_6,
+    :retired_7,
+    :retired_8,
+    :retired_9,
+    :retired_10,
+    :retired_11,
+    :retired_12,
+    :retired_13,
+    :retired_14,
+    :retired_15
+  ]
+
+  length(@retired_labels) == @cloak_max_retired_keys ||
+    raise "@retired_labels must carry exactly @cloak_max_retired_keys entries"
+
   @doc "The cipher tag used when `CLOAK_KEY_TAG` is unset."
   @spec cloak_default_tag() :: String.t()
   def cloak_default_tag, do: @cloak_default_tag
@@ -154,12 +179,17 @@ defmodule Loopctl.Config do
               "first cipher for a tag is ever tried, so the rest are silently dead."
     end
 
-    # Labels are positional and never derived from operator input (no atom-table growth
-    # from a fat-fingered value); the label itself is inert — Cloak only looks one up for
-    # `encrypt/2` with an explicit label, which nothing here does.
+    # Labels are positional and never derived from operator input. They are taken from a
+    # LITERAL list rather than interpolated (`:"retired_#{index}"`) so that no atom is
+    # constructed at runtime at all: interpolation here was bounded in practice — the index
+    # comes from Enum.with_index/1, not from the operator's string — but "bounded because
+    # of where the number came from" is an argument a reader has to re-derive, and Sobelow's
+    # DOS.BinToAtom check cannot see it either. A literal table makes it structural.
+    # The label itself is inert: Cloak resolves one only for `encrypt/2, label`, which
+    # nothing here calls.
     entries
-    |> Enum.with_index()
-    |> Enum.map(fn {{_tag, cipher}, index} -> {:"retired_#{index}", cipher} end)
+    |> Enum.zip(@retired_labels)
+    |> Enum.map(fn {{_tag, cipher}, label} -> {label, cipher} end)
   end
 
   defp cloak_tag!(nil), do: @cloak_default_tag
