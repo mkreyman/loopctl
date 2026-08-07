@@ -582,6 +582,12 @@ defmodule Loopctl.Dispatches do
   dispatch descended from the same root dispatch shares element 0, which is what
   "same lineage" means for custody separation. An empty lineage on either side is
   never a match.
+
+  This is the STRICTER of the two comparisons and belongs to the VERIFY side —
+  `validate_not_self_verify/3` and `select_verifier/3`'s `reject_same_root/2`,
+  which deliberately declines to pick a verifier under the implementer's root.
+  For the REPORT gate, where a sibling reviewer IS acceptable separation, use
+  `lineage_same_chain?/2` instead and read the note there.
   """
   @spec lineage_shares_prefix?(list(), list()) :: boolean()
   def lineage_shares_prefix?([], _), do: false
@@ -589,6 +595,51 @@ defmodule Loopctl.Dispatches do
 
   def lineage_shares_prefix?([a | _], [b | _]) when a == b, do: true
   def lineage_shares_prefix?(_, _), do: false
+
+  @doc """
+  True when the two dispatches lie on ONE root-to-leaf chain — identical, or one
+  an ancestor of the other. Siblings are NOT a match.
+
+  ## Why report needs this and verify does not
+
+  The documented dispatch tree puts the implementer and the reviewer side by side
+  under one orchestrator, and roots everything at a single operator dispatch:
+
+      root (operator, WebAuthn)
+      └── orchestrator dispatch
+          ├── implementer dispatch
+          └── reviewer dispatch
+
+  Under `lineage_shares_prefix?/2` every pair of dispatches in such a tenant
+  matches, so the reviewer counts as the implementer and can never report. That
+  was invisible until #621 began recording `implementer_dispatch_id` on the HTTP
+  path, which is what made the comparison run at all.
+
+  This test expresses what the report gate actually needs — *you may not report
+  work done by yourself, by something you dispatched, or by something that
+  dispatched you*:
+
+    * identical lineage (the same dispatch) — blocked;
+    * `[r, o]` vs `[r, o, i]` (an orchestrator and the implementer it dispatched)
+      — blocked, so a parent cannot rubber-stamp its own sub-agent;
+    * `[r, o, i]` vs `[r, o, v]` (two siblings) — allowed: separate dispatches,
+      separate ephemeral keys, separate `agent_id`s.
+
+  VERIFY deliberately stays stricter (`lineage_shares_prefix?/2`): it is the
+  final certification, and `select_verifier/3` already refuses to nominate a
+  verifier sharing the implementer's root, so accepting one at the gate would
+  contradict the selection rule.
+
+  Self-approval is not relaxed either way — the `assigned_agent_id` equality
+  check runs IN ADDITION at every gate, and an empty lineage is never a match.
+  """
+  @spec lineage_same_chain?(list(), list()) :: boolean()
+  def lineage_same_chain?([], _), do: false
+  def lineage_same_chain?(_, []), do: false
+
+  def lineage_same_chain?(a, b) do
+    List.starts_with?(a, b) or List.starts_with?(b, a)
+  end
 
   @doc """
   Selects a verifier dispatch from the eligible pool for a story.
