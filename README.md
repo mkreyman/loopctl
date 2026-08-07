@@ -138,8 +138,10 @@ they are easy to miss. Full details in [`deploy/FLY_SECRETS.md`](deploy/FLY_SECR
 | `SECRETS_ADAPTER=local_file` (+ `SECRETS_FILE`) | Always, off Fly | Signup stores each tenant's Ed25519 audit private key via `Loopctl.Secrets`, which defaults to the **Fly** secrets API. Without this, tenant creation fails on any other host. Put `SECRETS_FILE` on a persistent volume and back it up with the DB. |
 | `FTS_REGCONFIG=<config>` | Non-English content | Keyword search defaults to the `english` stemmer. Set it **before the first `migrate`** — the value is baked into the stored `search_vector`s. |
 
-Rotating `CLOAK_KEY` has an ordering requirement (drain the `:ingestion` queue, or
-keep the outgoing cipher in `retired_ciphers`) — see the deployment guide.
+Rotating `CLOAK_KEY` is a secret update, not a code change: set `CLOAK_KEY`,
+`CLOAK_KEY_TAG` and `CLOAK_RETIRED_KEYS` together, then run
+`mix loopctl.reencrypt_secrets`. The ordering matters — see
+[`docs/runbooks/cloak-key-rotation.md`](docs/runbooks/cloak-key-rotation.md).
 
 > **Ports:** Local development runs on `http://localhost:4030`. Production is `https://loopctl.com` (Fly.io). All examples below use the local dev URL.
 

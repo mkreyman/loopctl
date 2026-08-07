@@ -42,13 +42,16 @@ defmodule Loopctl.Ingestion.ContentEnvelope do
   from a wrong/rotated key, so this same failure also fires when `CLOAK_KEY` is
   rotated and the outgoing cipher is dropped while ingestion jobs are still queued
   (they live up to the 3600s unique window, longer under snooze). That case is
-  RECOVERABLE — re-adding the prior cipher to `Loopctl.Vault`'s `retired_ciphers`
-  (see `config/config.exs`) lets the queued jobs decrypt — so a decrypt failure is
-  NOT unconditionally "a poison pill no retry can heal".
+  RECOVERABLE — putting the prior key back in `CLOAK_RETIRED_KEYS` and restarting lets
+  the queued jobs decrypt — so a decrypt failure is NOT unconditionally "a poison pill
+  no retry can heal".
 
-  OPERATIONAL RULE: when rotating `CLOAK_KEY`, keep the outgoing cipher in
-  `retired_ciphers` until the `:ingestion` queue has drained, or in-flight jobs will
-  silently discard. The worker logs a distinct `Logger.warning` on every decrypt
+  OPERATIONAL RULE: when rotating `CLOAK_KEY`, keep the outgoing key in
+  `CLOAK_RETIRED_KEYS` until the `:ingestion` queue has drained, or in-flight jobs will
+  silently discard. These envelopes live in `oban_jobs.args`, so
+  `mix loopctl.reencrypt_secrets` does NOT convert them — it walks schema columns only;
+  draining the queue is what retires them (`docs/runbooks/cloak-key-rotation.md`).
+  The worker logs a distinct `Logger.warning` on every decrypt
   failure (with tenant_id + content_hash, never the envelope) so a tampering or
   mis-sequenced-rotation incident is an alertable signal, not buried in
   `oban_jobs.errors`.

@@ -309,9 +309,32 @@ config :loopctl, :sth_enqueuer_subscribe, false
 # Initialize plugs at runtime for faster test compilation
 config :phoenix, :plug_init_mode, :runtime
 
-# Cloak Vault — static test key (32 bytes, base64-encoded)
+# Cloak Vault — static test keys (32 bytes each, base64-encoded).
+#
+# The `retired_v0` entry is the DI seam for key rotation (#622). It gives the test env a
+# post-rotation vault shape — one active cipher, one decrypt-only retired cipher on a
+# DISTINCT tag — so `Loopctl.Vault.Rotation` can be exercised against ciphertext written
+# under a superseded key WITHOUT `Application.put_env`. A test manufactures that ciphertext
+# by calling `Cloak.Ciphers.AES.GCM.encrypt/2` with the opts read back from here, so the
+# keys live in exactly one place. Nothing else writes tag AES.GCM.V0, so adding this cipher
+# changes no other test's behaviour: it only adds a decrypt path for a tag nothing produces.
+#
+# The RETIRED cipher is listed FIRST on purpose. Cloak encrypts with `hd(ciphers)`, not with
+# the entry labelled `:default`, and config order does not survive layering: `Config.__merge__/2`
+# uses `Keyword.merge/3`, which moves an OVERRIDDEN key BEHIND the untouched ones — so once
+# `config/runtime.exs` supplies `CLOAK_KEY`, `:default` lands last and the vault encrypts under
+# the retired key. `Loopctl.Vault.init/1` is what puts `:default` back in front. Writing the
+# hazardous order here makes that guard load-bearing in EVERY environment: with the order
+# "correct" the guard is inert wherever `CLOAK_KEY` is unset (CI), and deleting it would pass.
+# Do NOT "tidy" this by moving `default` first — that silently disarms the mutation test.
 config :loopctl, Loopctl.Vault,
   ciphers: [
+    retired_v0: {
+      Cloak.Ciphers.AES.GCM,
+      tag: "AES.GCM.V0",
+      key: Base.decode64!("6fT0N9v9BqiTFbT1kSK7Gz0DDaCzYPtsdPZ+ohqzB5Q="),
+      iv_length: 12
+    },
     default: {
       Cloak.Ciphers.AES.GCM,
       tag: "AES.GCM.V1",

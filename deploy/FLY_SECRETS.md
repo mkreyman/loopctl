@@ -23,15 +23,25 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `DATABASE_URL`     | Yes      | Ecto URL for `Loopctl.Repo` (loopctl_app role, RLS enforced) |
 | `ADMIN_DATABASE_URL` | Yes    | Ecto URL for `Loopctl.AdminRepo` (loopctl_admin role, BYPASSRLS) |
 | `SECRET_KEY_BASE`  | Yes      | Phoenix cookie signing/encryption key               |
-| `CLOAK_KEY`        | Yes      | AES-256-GCM key for every field encrypted at rest: API key hashing, tenant LLM keys, webhook signing secrets, and ingestion document content |
+| `CLOAK_KEY`        | Yes      | AES-256-GCM key for every field encrypted at rest: API key hashing, tenant LLM keys, webhook signing secrets, and ingestion document content. Base64 of 32 raw bytes (`:crypto.strong_rand_bytes(32) |> Base.encode64()`); any other decoded length aborts boot rather than failing at the first write |
 
-> **Rotating `CLOAK_KEY`:** keep the OUTGOING cipher in `Loopctl.Vault`'s
-> `retired_ciphers` (see `config/config.exs`) until the `:ingestion` queue has
-> drained. Ingestion jobs carry their document encrypted in `oban_jobs.args` and
-> live up to the 3600s uniqueness window (longer under snooze); a rotation that
-> drops the old cipher first makes those in-flight jobs undecryptable, and they
-> discard. The worker logs a distinct warning on every decrypt failure — alert on
-> it, since the same signal also means at-rest tampering.
+> **Rotating `CLOAK_KEY`:** follow
+> [`docs/runbooks/cloak-key-rotation.md`](../docs/runbooks/cloak-key-rotation.md). In
+> short: set `CLOAK_KEY`, `CLOAK_KEY_TAG` and `CLOAK_RETIRED_KEYS` in ONE
+> `fly secrets set` (the retired key must never land after the new active key), run
+> `mix loopctl.reencrypt_secrets`, let the `:ingestion` queue drain, and only then unset
+> `CLOAK_RETIRED_KEYS`. Ingestion jobs carry their document encrypted in `oban_jobs.args`
+> and live up to the 3600s uniqueness window (longer under snooze); a rotation that drops
+> the old key first makes those in-flight jobs undecryptable, and they discard. The worker
+> logs a distinct warning on every decrypt failure — alert on it, since the same signal
+> also means at-rest tampering.
+
+### Key-rotation variables
+
+| Variable              | Default | Description |
+|-----------------------|---------|-------------|
+| `CLOAK_KEY_TAG`       | `AES.GCM.V1` | The cipher tag stamped into the header of every value `CLOAK_KEY` encrypts. **Bump it in the same command that swaps `CLOAK_KEY`** — Cloak selects a decrypt cipher by matching this tag and takes the first hit, so leaving it unchanged during a rotation makes the new key claim the old key's rows and fail their GCM authentication check. Leaving it unset on an install that never rotates is correct; the default is what every existing row carries. A retired entry that reuses the active tag aborts boot |
+| `CLOAK_RETIRED_KEYS`  | - (none) | Comma-separated `TAG:BASE64_KEY` entries naming previous `CLOAK_KEY` values, decrypt-only, so rows written before a rotation stay readable — e.g. `AES.GCM.V1:OLD_BASE64_KEY`. Encoded exactly like `CLOAK_KEY` (base64 of 32 raw bytes) with the tag its ciphertext carries prefixed. A malformed entry, a duplicate tag, a wrong key length, or a collision with `CLOAK_KEY_TAG` **aborts boot naming the entry's position** — a silently dropped retired key means rows nobody can decrypt, which is worse than a failed start. Unset it only after `mix loopctl.reencrypt_secrets status` shows nothing left on the retired tag |
 
 ### Environment Variables (set in fly.toml, not secrets)
 
