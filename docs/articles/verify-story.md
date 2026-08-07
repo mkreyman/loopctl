@@ -10,9 +10,16 @@ This guide walks a verifier through the complete verification flow.
 
 ## Prerequisites
 
-- You hold a `verify_cap` for the story (issued by request_review)
-- Your dispatch lineage does NOT share a prefix with the implementer's
+- Your dispatch lineage does NOT share a ROOT with the implementer's. Verify is
+  the strictest of the custody gates: a sibling dispatch under the same
+  orchestrator is acceptable separation for `report`, but not here, because
+  `select_verifier/3` will not nominate a same-root verifier either.
 - The story has a review_record confirming the review passed
+
+No capability token is required. `verify_cap` was retired — it was minted to the
+lineage loopctl selected as verifier, which is routinely not the principal that
+calls this endpoint, so it was unspendable more often than not. See
+[Capability Tokens](/wiki/capability-tokens).
 
 ## Step 1: Find stories awaiting verification
 

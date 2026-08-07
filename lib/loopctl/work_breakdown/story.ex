@@ -83,6 +83,18 @@ defmodule Loopctl.WorkBreakdown.Story do
     field :verifier_dispatch_id, Ecto.UUID
     field :verifier_needed, :boolean, default: false
 
+    # Issue #621: the capability minted by the lifecycle transition that returned
+    # this struct — the credential the caller needs for its NEXT custody op
+    # (only `claim` mints one — a start_cap; no other transition mints at all,
+    # see Progress.start_story/3 and Progress.verify_story/4). Virtual and deliberately
+    # ABSENT from the @derive Jason.Encoder `only:` list above, so it is never
+    # serialized as part of a story; the controller that performed the transition
+    # reads it and returns it under a separate top-level `capability` key.
+    # nil means no cap was minted (pre-v2 keyless tenant, or a mint failure —
+    # see mint_cap/4 in Loopctl.Progress, which logs loudly when a KEYED tenant
+    # fails to mint, because that tenant's next call would 403 missing_capability).
+    field :minted_capability, :map, virtual: true
+
     timestamps()
   end
 
