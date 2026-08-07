@@ -29,12 +29,106 @@ defmodule Loopctl.Llm.ProviderError do
 
   @typedoc "A sanitized provider error term (never carries a response body)."
   @type t ::
-          {:api_error, integer(), :provider_error}
-          | {:api_error, integer(), :provider_error, non_neg_integer() | nil}
+          {:api_error, integer(), tag()}
+          | {:api_error, integer(), tag(), non_neg_integer() | nil}
           | {:request_failed, atom()}
           | {:embedding_crash, :exception}
           | atom()
           | tuple()
+
+  @typedoc """
+  The closed set of value-free classifications a provider body may collapse to.
+
+  A tag is a FIXED atom chosen by `classify/1`, never a fragment of the body — so
+  keeping one is as safe as the bare `:provider_error` it replaces, and unlike it,
+  says WHY.
+  """
+  @type tag :: :provider_error | :context_length_exceeded
+
+  @tags [:provider_error, :context_length_exceeded]
+
+  # Substrings that identify an input-too-long rejection. Matched case-insensitively
+  # against the body's `error.message` and `error.code` only. Vendor-agnostic by
+  # listing several spellings rather than by parsing a single provider's schema.
+  @context_length_signatures [
+    "maximum context length",
+    "context_length_exceeded",
+    "reduce the length",
+    "string too long",
+    "too many tokens",
+    "input is too long"
+  ]
+
+  # Statuses whose BODY is never read as a length rejection: a throttle says WAIT,
+  # not SHORTEN. OpenAI-compatible gateways answer a per-minute TOKEN throttle with
+  # exactly the phrasings above ("too many tokens", "reduce the length"), and taking
+  # them at face value sends the worker down the shrink ladder — which spends extra
+  # paid calls and then, once the provider's window clears, STORES an embedding of a
+  # prefix under the FULL text's content hash. The idempotency guard makes every
+  # later enqueue a no-op, so that truncated vector is permanent. The status is
+  # authoritative about which remedy applies; the body is not.
+  @throttle_statuses [408, 429, 503]
+
+  @doc """
+  Classify a provider error body as one of the value-free `t:tag/0` atoms.
+
+  This is the ONLY thing read out of a body and kept. It returns an atom from
+  `@tags`, so no byte of the body (and therefore no masked key fragment) can reach
+  a log line or `oban_jobs.errors` through it.
+
+  Total and idempotent: an already-classified tag is returned unchanged, which is
+  what lets `sanitize/1` run again at a worker boundary without downgrading a
+  classification back to the generic `:provider_error` (the same idempotency the
+  throttle 4-tuple needs).
+  """
+  @spec classify(term()) :: tag()
+  def classify(tag) when tag in @tags, do: tag
+
+  def classify(body) do
+    case body_signal(body) do
+      nil ->
+        :provider_error
+
+      text ->
+        if Enum.any?(@context_length_signatures, &String.contains?(text, &1)),
+          do: :context_length_exceeded,
+          else: :provider_error
+    end
+  end
+
+  # Status-aware classification: a throttle is a throttle whatever its body says
+  # (see `@throttle_statuses`), so only a non-throttle status may be classified as a
+  # length rejection. Every classification that reaches a caller goes through here.
+  defp classify(status, _body) when status in @throttle_statuses, do: :provider_error
+  defp classify(_status, body), do: classify(body)
+
+  # The classifiable surface of a body. Vendor-agnostic in SHAPE as well as in
+  # spelling: OpenAI nests the text under `{"error" => %{"message" => ...}}`, but
+  # OpenAI-COMPATIBLE servers a tenant may point `base_url` at answer with a bare
+  # string body, a string-valued `"error"`, or a top-level `"detail"`/`"message"`
+  # (vLLM, TEI, FastAPI gateways). Reading only the nested map left those providers
+  # classified `:provider_error`, which discards a length rejection as permanent and
+  # never runs the shrink ladder — the same hourly re-enqueue loop, one provider over.
+  # Widening what is READ cannot widen what is KEPT: the output is still a fixed atom.
+  defp body_signal(body) when is_binary(body), do: String.downcase(body)
+
+  defp body_signal(body) when is_map(body) and not is_struct(body) do
+    [body["error"], body["message"], body["detail"], body["code"]]
+    |> Enum.flat_map(&signal_parts/1)
+    |> case do
+      [] -> nil
+      parts -> parts |> Enum.join(" ") |> String.downcase()
+    end
+  end
+
+  defp body_signal(_other), do: nil
+
+  defp signal_parts(text) when is_binary(text), do: [text]
+
+  defp signal_parts(err) when is_map(err) and not is_struct(err),
+    do: Enum.filter([err["message"], err["code"]], &is_binary/1)
+
+  defp signal_parts(_other), do: []
 
   @doc """
   Strip any provider response body/secret. Collapses the key-bearing provider
@@ -45,12 +139,16 @@ defmodule Loopctl.Llm.ProviderError do
   # US-37.3: an already-sanitized throttle 4-tuple carries only a status + a
   # parsed Retry-After integer (both value-free) — preserve it idempotently so a
   # second sanitize pass at a worker boundary never drops the Retry-After.
-  def sanitize({:api_error, status, :provider_error, retry_after})
-      when is_integer(status) and (is_integer(retry_after) or is_nil(retry_after)),
-      do: {:api_error, status, :provider_error, retry_after}
+  def sanitize({:api_error, status, tag, retry_after})
+      when is_integer(status) and tag in @tags and
+             (is_integer(retry_after) or is_nil(retry_after)),
+      do: {:api_error, status, tag, retry_after}
 
-  def sanitize({:api_error, status, _body}) when is_integer(status),
-    do: {:api_error, status, :provider_error}
+  # `classify/1` is idempotent on a tag, so a second sanitize pass at a worker
+  # boundary preserves `:context_length_exceeded` instead of flattening it — the
+  # retry ladder in the embedding workers dispatches on exactly that atom.
+  def sanitize({:api_error, status, body}) when is_integer(status),
+    do: {:api_error, status, classify(status, body)}
 
   def sanitize({:api_error, status}) when is_integer(status),
     do: {:api_error, status, :provider_error}
@@ -83,6 +181,13 @@ defmodule Loopctl.Llm.ProviderError do
   @spec sanitize(term(), non_neg_integer() | nil) :: t()
   def sanitize(reason, nil), do: sanitize(reason)
 
+  # A literal `:provider_error`, never `classify(body)`: a Retry-After IS the
+  # provider telling us the remedy is to WAIT, so it outranks whatever its body says
+  # about length. Keeping the tag fixed is also what the throttle 4-tuple's consumers
+  # rely on — every worker's loss-free snooze clause matches
+  # `{:api_error, _status, :provider_error, retry_after}` literally, and a tag they do
+  # not match falls through to the generic branch, which burns an Oban attempt on the
+  # blind `attempt^4` backoff against a provider that just asked us to back off.
   def sanitize({:api_error, status, _body}, retry_after)
       when is_integer(status) and is_integer(retry_after),
       do: {:api_error, status, :provider_error, retry_after}
@@ -100,8 +205,13 @@ defmodule Loopctl.Llm.ProviderError do
   """
   @spec log_tag(term()) :: String.t()
   def log_tag({:error, inner}), do: log_tag(inner)
-  def log_tag({:api_error, status, _, _}), do: "api_error status=#{status}"
-  def log_tag({:api_error, status, _}), do: "api_error status=#{status}"
+
+  def log_tag({:api_error, status, body, _}),
+    do: "api_error status=#{status} #{classify(status, body)}"
+
+  def log_tag({:api_error, status, body}),
+    do: "api_error status=#{status} #{classify(status, body)}"
+
   def log_tag({:api_error, status}), do: "api_error status=#{status}"
   def log_tag({:request_failed, _}), do: "request_failed"
   def log_tag({:embedding_crash, _}), do: "embedding_crash"
