@@ -299,9 +299,14 @@ defmodule LoopctlWeb.FallbackController do
   end
 
   def call(conn, {:error, :self_review_blocked}) do
-    # The third lineage-aware self-* gate, and byzantine on exactly the same
-    # terms as the other two: the reviewer's lineage is resolved server-side and
-    # found to be the implementer's. It counts.
+    # The third lineage-aware self-* gate, and byzantine on the same terms as the
+    # other two, so it counts. A CORRECTLY configured client never reaches here:
+    # `exact_role: [:orchestrator, :user]` means a user key passes a nil reviewer
+    # (deliberately permitted), and the documented dispatch tree puts the reviewer
+    # BESIDE the implementer, which `:chain` separation admits. The two shapes that
+    # do reach it are the implementer's own agent reviewing, and a parent
+    # rubber-stamping the sub-agent it dispatched — each named a violation by the
+    # custody spec, and neither producible by a retry, timeout or crash-resume.
     record_custody_violation(conn, "self_review_blocked")
 
     conn
@@ -309,9 +314,11 @@ defmodule LoopctlWeb.FallbackController do
     |> json(%{
       error: %{
         status: 409,
+        code: "self_review_blocked",
         message:
           "Cannot review your own implementation. " <>
-            "The reviewer agent must be different from the implementing agent."
+            "The reviewer agent must be different from the implementing agent.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/self-review-blocked"}
       }
     })
   end

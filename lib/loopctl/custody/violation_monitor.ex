@@ -58,10 +58,14 @@ defmodule Loopctl.Custody.ViolationMonitor do
   halt fired. Counting is always scoped by an explicit `tenant_id` predicate — one
   tenant's violations can never contribute to another's threshold.
 
-  A halt CLAIMS the rows that armed it (`consumed_at`): a concurrent pair crossing
-  the threshold cannot both arm it (ONE onset per incident), and the break-glass
-  ceremony truly recovers the tenant instead of clearing `custody_halted_at` over
-  a still-loaded window that the next single violation re-trips.
+  A halt CLAIMS the rows that armed it (`consumed_at`), in the SAME transaction as
+  the halt itself: a concurrent pair crossing the threshold cannot both arm it (ONE
+  onset per incident), a FAILED halt rolls the claim back so the next violation
+  retries against the same evidence rather than starting from zero, and the
+  break-glass ceremony truly recovers the tenant instead of clearing
+  `custody_halted_at` over a still-loaded window that the next single violation
+  re-trips. Violations recorded WHILE a halt is active are claimed on sight, for
+  the same reason: they belong to the incident already escalated.
 
   The clock is resolved through the `:clock` DI seam so the window is testable
   without sleeping or mutating global state.
@@ -84,21 +88,35 @@ defmodule Loopctl.Custody.ViolationMonitor do
           {:ok, :recorded, non_neg_integer()}
           | {:ok, :halted, non_neg_integer()}
           | {:ok, :already_halted, non_neg_integer()}
+          | {:ok, :claim_lost, non_neg_integer()}
           | {:error, term()}
 
   @doc "Violations inside the window that arm a halt (`:custody_halt_threshold`)."
   @spec threshold() :: pos_integer()
-  def threshold do
-    Application.get_env(:loopctl, :custody_halt_threshold, @default_threshold)
-    |> validate_positive_integer(@default_threshold, :custody_halt_threshold)
-  end
+  def threshold,
+    do: threshold(Application.get_env(:loopctl, :custody_halt_threshold, @default_threshold))
+
+  @doc """
+  `threshold/0` resolved from an explicitly supplied raw value — the seam that
+  binds the guard below to the accessor that depends on it (`threshold/0` is only
+  this applied to the configured value), assertable without mutating global state.
+  """
+  @spec threshold(term()) :: pos_integer()
+  def threshold(raw),
+    do: validate_positive_integer(raw, @default_threshold, :custody_halt_threshold)
 
   @doc "Detection window in seconds (`:custody_halt_window_seconds`)."
   @spec window_seconds() :: pos_integer()
-  def window_seconds do
-    Application.get_env(:loopctl, :custody_halt_window_seconds, @default_window_seconds)
-    |> validate_positive_integer(@default_window_seconds, :custody_halt_window_seconds)
-  end
+  def window_seconds,
+    do:
+      window_seconds(
+        Application.get_env(:loopctl, :custody_halt_window_seconds, @default_window_seconds)
+      )
+
+  @doc "`window_seconds/0` resolved from an explicitly supplied raw value."
+  @spec window_seconds(term()) :: pos_integer()
+  def window_seconds(raw),
+    do: validate_positive_integer(raw, @default_window_seconds, :custody_halt_window_seconds)
 
   @doc """
   Validates a configured knob, falling back to `default` with a warning.
@@ -107,17 +125,24 @@ defmodule Loopctl.Custody.ViolationMonitor do
   safe to clamp toward: `0` — what an operator types meaning "off" — halts on the
   FIRST violation, and a non-integer (what `System.get_env/1` returns) sorts above
   every number in Erlang term order, so `count < "3"` is always true and NO tenant
-  is ever halted. Pure and public so the bound is assertable without mutating
-  VM-global state.
+  is ever halted. Public so the bound is assertable without mutating VM-global
+  state.
   """
   @spec validate_positive_integer(term(), pos_integer(), atom()) :: pos_integer()
   def validate_positive_integer(value, _default, _key) when is_integer(value) and value > 0,
     do: value
 
   def validate_positive_integer(value, default, key) do
-    Logger.warning(
-      "custody_halt_config_invalid: :#{key} must be a positive integer, got #{inspect(value)} — L6 is using #{default}"
-    )
+    # Warned once per process per distinct bad value. The knobs are read half a
+    # dozen times per recorded violation, so an unconditional warning floods the
+    # log at a MULTIPLE of the violation rate — which is how the misconfiguration
+    # it exists to surface ends up in someone's filter. `Process.put/2` returns the
+    # previous value: one word of process state, no global mutation.
+    if Process.put({__MODULE__, key}, {:invalid, value}) != {:invalid, value} do
+      Logger.warning(
+        "custody_halt_config_invalid: :#{key} must be a positive integer, got #{inspect(value)} — L6 is using #{default}"
+      )
+    end
 
     default
   end
@@ -129,7 +154,9 @@ defmodule Loopctl.Custody.ViolationMonitor do
   Returns `{:ok, :recorded, count}` below the threshold, `{:ok, :halted, count}`
   when this call armed the halt, `{:ok, :already_halted, count}` when the tenant
   was halted already (the halt timestamp is NOT refreshed — a halt has one
-  onset), and `{:error, reason}` if the violation could not be recorded.
+  onset), `{:ok, :claim_lost, count}` when a concurrent caller claimed the
+  evidence and its halt has not (yet) landed, and `{:error, reason}` if the
+  violation could not be recorded.
 
   ## Options
 
@@ -214,24 +241,61 @@ defmodule Loopctl.Custody.ViolationMonitor do
 
   defp maybe_halt(tenant_id, violation_type, count, now) do
     cond do
+      already_halted?(tenant_id) ->
+        # This row belongs to an incident already escalated, so claim it on sight.
+        # Evidence that accumulates BEHIND a halt — requests already past
+        # `CheckCustodyHalt` when it armed, or a node whose key cache has not yet
+        # been invalidated — would otherwise survive the break-glass ceremony and
+        # re-trip the halt on the next single violation.
+        claim_evidence(tenant_id, now)
+        {:ok, :already_halted, count}
+
       count < threshold() ->
         {:ok, :recorded, count}
 
-      already_halted?(tenant_id) ->
-        {:ok, :already_halted, count}
-
-      claim_evidence(tenant_id, now) == 0 ->
-        {:ok, :already_halted, count}
-
       true ->
-        do_halt(tenant_id, violation_type, count, now)
+        halt_on_claimed_evidence(tenant_id, violation_type, count, now)
     end
   end
 
+  # The claim and the halt commit TOGETHER or not at all. Claiming first is what
+  # keeps ONE onset per incident; doing it in the SAME transaction is what keeps a
+  # FAILED halt from pardoning the very window that armed it — a rolled-back claim
+  # leaves `consumed_at` NULL, so the next violation retries the halt against the
+  # same evidence instead of handing the caller a fresh full budget.
+  defp halt_on_claimed_evidence(tenant_id, violation_type, count, now) do
+    case AdminRepo.transaction(fn -> claim_then_halt(tenant_id, now) end) do
+      {:ok, :halted} -> announce_halt(tenant_id, violation_type, count, now)
+      {:ok, :claim_lost} -> claim_lost(tenant_id, count)
+      {:error, reason} -> halt_failed(tenant_id, violation_type, reason)
+    end
+  end
+
+  defp claim_then_halt(tenant_id, now) do
+    if claim_evidence(tenant_id, now) == 0 do
+      :claim_lost
+    else
+      case Tenants.halt_custody(tenant_id) do
+        {:ok, _tenant} -> :halted
+        {:error, reason} -> AdminRepo.rollback(reason)
+      end
+    end
+  end
+
+  # Losing the claim race proves only that another caller CLAIMED the rows, never
+  # that its halt landed. Re-read the tenant rather than asserting a halt that may
+  # have rolled back: reporting `:already_halted` for an incident that produced no
+  # halt is exactly the blind spot this monitor exists to remove.
+  defp claim_lost(tenant_id, count) do
+    if already_halted?(tenant_id),
+      do: {:ok, :already_halted, count},
+      else: {:ok, :claim_lost, count}
+  end
+
   # `UPDATE ... WHERE consumed_at IS NULL` row-locks the candidates, so of two
-  # concurrent callers exactly one claims rows (0 claimed => defer to its halt) and
-  # the chain keeps ONE onset. It also makes the break-glass durable: the rows that
-  # armed this halt can never arm the next.
+  # concurrent callers exactly one claims rows (0 claimed => the other is mid-halt)
+  # and the chain keeps ONE onset. It also makes the break-glass durable: the rows
+  # that armed this halt can never arm the next.
   defp claim_evidence(tenant_id, now) do
     {claimed, _} =
       tenant_id
@@ -248,41 +312,43 @@ defmodule Loopctl.Custody.ViolationMonitor do
     end
   end
 
-  defp do_halt(tenant_id, violation_type, count, now) do
-    case Tenants.halt_custody(tenant_id) do
-      {:ok, _tenant} ->
-        # An operator must learn about a halt from their alerting, not from a
-        # support ticket: the tenant's custody surface is now frozen until a
-        # human break-glass ceremony clears it.
-        Logger.error(
-          "custody_halted: tenant custody operations halted after repeated custody " <>
-            "violations tenant_id=#{tenant_id} violation_type=#{violation_type} " <>
-            "violations_in_window=#{count} threshold=#{threshold()} " <>
-            "window_seconds=#{window_seconds()}"
-        )
+  # Runs AFTER the claim+halt transaction commits: the audit append takes its own
+  # serialization lock, and nesting that inside a transaction holding the evidence
+  # row locks buys nothing but a wider window to deadlock in.
+  defp announce_halt(tenant_id, violation_type, count, now) do
+    # An operator must learn about a halt from their alerting, not from a support
+    # ticket: the tenant's custody surface is now frozen until a human break-glass
+    # ceremony clears it.
+    Logger.error(
+      "custody_halted: tenant custody operations halted after repeated custody " <>
+        "violations tenant_id=#{tenant_id} violation_type=#{violation_type} " <>
+        "violations_in_window=#{count} threshold=#{threshold()} " <>
+        "window_seconds=#{window_seconds()}"
+    )
 
-        :telemetry.execute(
-          [:loopctl, :custody, :halt],
-          %{count: 1, violations_in_window: count},
-          %{
-            tenant_id: tenant_id,
-            violation_type: violation_type,
-            threshold: threshold(),
-            window_seconds: window_seconds()
-          }
-        )
+    :telemetry.execute(
+      [:loopctl, :custody, :halt],
+      %{count: 1, violations_in_window: count},
+      %{
+        tenant_id: tenant_id,
+        violation_type: violation_type,
+        threshold: threshold(),
+        window_seconds: window_seconds()
+      }
+    )
 
-        append_halt_audit(tenant_id, violation_type, count, now)
-        {:ok, :halted, count}
+    append_halt_audit(tenant_id, violation_type, count, now)
+    {:ok, :halted, count}
+  end
 
-      {:error, reason} ->
-        Logger.error(
-          "custody_halt_failed: could not halt tenant after repeated custody violations " <>
-            "tenant_id=#{tenant_id} violation_type=#{violation_type} reason=#{inspect(reason)}"
-        )
+  defp halt_failed(tenant_id, violation_type, reason) do
+    Logger.error(
+      "custody_halt_failed: could not halt tenant after repeated custody violations " <>
+        "tenant_id=#{tenant_id} violation_type=#{violation_type} reason=#{inspect(reason)} " <>
+        "— the evidence stays unclaimed, so the next violation retries"
+    )
 
-        {:error, reason}
-    end
+    {:error, reason}
   end
 
   # The halt belongs in the tamper-evident chain, not only in the app log: it is a

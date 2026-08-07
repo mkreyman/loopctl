@@ -31,6 +31,10 @@ defmodule LoopctlWeb.TenantController do
   @owner_key_rate_window_ms 60_000 * 60
   @max_owner_key_rotations_per_window 10
 
+  # Same bound `Tenant.custody_owner_key_changeset/3` enforces; checked here so a
+  # structurally impossible key never charges the rate limiter below.
+  @ed25519_pubkey_bytes 32
+
   # Agents and orchestrators can view tenant profile but only users+ can modify settings
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:update, :register_owner_key]
 
@@ -144,12 +148,12 @@ defmodule LoopctlWeb.TenantController do
   stays with the owner. Human-anchored + `:user` role.
   """
   def register_owner_key(conn, params) do
+    alg = params["alg"] || "ed25519"
+
     with {:ok, tenant} <- require_tenant(conn),
-         {:ok, pubkey} <- decode_owner_pubkey(params["owner_pubkey"]),
+         {:ok, pubkey} <- decode_owner_pubkey(params["owner_pubkey"], alg),
          {:ok, rotation_proof} <- decode_rotation_proof(params["rotation_proof"]),
          :ok <- check_rotation_rate_limit(tenant.id) do
-      alg = params["alg"] || "ed25519"
-
       # LCP-1 §9.2: attribute the root-key registration/rotation to the ACTING key's
       # dispatch lineage in the tamper-evident chain — re-rooting trust must not be
       # recorded with an empty actor. `rotation_proof` (proof of possession of the
@@ -206,12 +210,19 @@ defmodule LoopctlWeb.TenantController do
   # the gate, and rotation needs the database anyway: denying while the counter
   # store is down costs no availability that the write itself would have had.
   #
-  # Charged AFTER the hex decodes, and that order is load-bearing. `gate_ok?/3`
-  # post-increments, so with the check first a malformed body consumed the budget
-  # identically to a real attempt — ten typos, or ten garbage requests from a
-  # leaked key, and the owner cannot rotate for an hour. Rotation is precisely the
-  # remediation path for a compromised key, so only attempts that reach the
-  # expensive verification may spend it.
+  # Charged AFTER the body decodes AND its shape validates, and that order is
+  # load-bearing. `gate_ok?/3` post-increments, so with the check first a body that
+  # could never have been a key — a typo, a truncated hex string — consumed the
+  # budget identically to a real attempt, and rotation is precisely the remediation
+  # path for a compromised key. Only attempts that reach the expensive verification
+  # may spend it.
+  #
+  # The bound of that, stated plainly: a caller sending WELL-FORMED garbage (any
+  # 32 random bytes) still charges the budget. This limiter caps the COST of the
+  # verification path; it cannot keep a leaked `:user` key from consuming the
+  # tenant's hourly budget. Revoking that key is the remedy for that — and a leaked
+  # key still cannot ROTATE an existing owner key, which needs proof of possession
+  # of the outgoing private half.
   defp check_rotation_rate_limit(tenant_id) do
     if RateLimiter.gate_ok?(
          "custody_owner_key:rotate:#{tenant_id}",
@@ -239,14 +250,27 @@ defmodule LoopctlWeb.TenantController do
       "The `rotation_proof` did not verify against the current owner key. Re-sign the " <>
         "exact owner_rotation_preimage(tenant_id, new_pubkey, new_alg) with the OUTGOING owner key."
 
-  defp decode_owner_pubkey(hex) when is_binary(hex) do
+  # Decodes AND shape-checks the key, because this runs before the limiter is
+  # charged: accepting any even-length hex there would have left the budget
+  # spendable by structurally impossible keys.
+  defp decode_owner_pubkey(hex, "ed25519") when is_binary(hex) do
     case Base.decode16(hex, case: :mixed) do
-      {:ok, raw} -> {:ok, raw}
-      :error -> {:error, :unprocessable_entity, "owner_pubkey must be hex-encoded"}
+      {:ok, raw} when byte_size(raw) == @ed25519_pubkey_bytes ->
+        {:ok, raw}
+
+      {:ok, _raw} ->
+        {:error, :unprocessable_entity, "owner_pubkey must be a 32-byte ed25519 public key"}
+
+      :error ->
+        {:error, :unprocessable_entity, "owner_pubkey must be hex-encoded"}
     end
   end
 
-  defp decode_owner_pubkey(_), do: {:error, :unprocessable_entity, "owner_pubkey is required"}
+  defp decode_owner_pubkey(hex, _alg) when is_binary(hex),
+    do: {:error, :unprocessable_entity, ~s(alg must be "ed25519")}
+
+  defp decode_owner_pubkey(_, _alg),
+    do: {:error, :unprocessable_entity, "owner_pubkey is required"}
 
   # `rotation_proof` is optional (absent on first registration). When present it must
   # decode as hex; the signature is verified server-side by the Tenants context.

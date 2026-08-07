@@ -237,6 +237,44 @@ defmodule LoopctlWeb.CustodyHaltEscalationTest do
              |> AdminRepo.aggregate(:count) == threshold
     end
 
+    # The self_review_blocked gate is the one that recorded NOTHING until #624, and
+    # it was invisible because every test drove ViolationMonitor.record/3 directly.
+    # This one drives the HTTP path, so the FallbackController wiring is bound:
+    # delete the record_custody_violation call and it fails.
+    test "a self-review 409 is recorded through the FallbackController too", ctx do
+      story =
+        ctx
+        |> assigned_story()
+        |> Ecto.Changeset.change(
+          agent_status: :reported_done,
+          reported_done_at: DateTime.utc_now()
+        )
+        |> AdminRepo.update!()
+
+      # An ORCHESTRATOR key (review-complete is exact_role [:orchestrator, :user])
+      # carrying the implementing agent's own id — the reviewer is the implementer.
+      {orch_key, _api_key} =
+        fixture(:api_key, %{
+          tenant_id: ctx.tenant.id,
+          role: :orchestrator,
+          agent_id: ctx.agent.id
+        })
+
+      body =
+        base_conn()
+        |> auth(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/review-complete", %{
+          "review_type" => "enhanced",
+          "summary" => "reviewed"
+        })
+        |> json_response(409)
+
+      assert body["error"]["code"] == "self_review_blocked"
+      assert body["error"]["remediation"]["learn_more"] =~ "self-review-blocked"
+      assert ViolationMonitor.count_in_window(ctx.tenant.id) == 1
+      refute halted?(ctx.tenant.id)
+    end
+
     test "one tenant's self-report pattern never halts another tenant", ctx do
       other = fixture(:tenant)
 

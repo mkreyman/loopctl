@@ -122,6 +122,30 @@ defmodule Loopctl.Custody.ViolationMonitorTest do
       refute halted?(tenant.id)
     end
 
+    test "violations that land BEHIND an active halt cannot re-trip it after the clear" do
+      tenant = fixture(:tenant)
+
+      for _ <- 1..ViolationMonitor.threshold() do
+        ViolationMonitor.record(tenant.id, "self_report_blocked")
+      end
+
+      assert halted?(tenant.id)
+
+      # Requests already past CheckCustodyHalt when the halt armed still reach the
+      # gate and record. Left unclaimed they survive the ceremony, and the very
+      # next violation re-halts — the failure the claim exists to close.
+      for _ <- 1..ViolationMonitor.threshold() do
+        assert {:ok, :already_halted, _} =
+                 ViolationMonitor.record(tenant.id, "self_verify_blocked")
+      end
+
+      assert ViolationMonitor.count_in_window(tenant.id) == 0
+      {:ok, _} = Tenants.clear_custody_halt(tenant.id)
+
+      assert {:ok, :recorded, 1} = ViolationMonitor.record(tenant.id, "self_report_blocked")
+      refute halted?(tenant.id)
+    end
+
     test "a fresh pattern after the clear halts again" do
       tenant = fixture(:tenant)
       threshold = ViolationMonitor.threshold()
@@ -167,6 +191,29 @@ defmodule Loopctl.Custody.ViolationMonitorTest do
                assert ViolationMonitor.validate_positive_integer(5, 3, :custody_halt_threshold) ==
                         5
              end) == ""
+    end
+
+    test "an invalid value warns ONCE per process, not once per read" do
+      # The knobs are read half a dozen times per recorded violation; an
+      # unconditional warning floods the log at a multiple of the violation rate.
+      log =
+        capture_log(fn ->
+          for _ <- 1..6, do: ViolationMonitor.threshold("3")
+        end)
+
+      assert log |> String.split("custody_halt_config_invalid") |> length() == 2
+    end
+
+    test "the ACCESSORS apply the guard — not just the guard function in isolation" do
+      # Binds the wiring the mutation test would otherwise miss: delete the
+      # validation from threshold/1 or window_seconds/1 and these fail.
+      capture_log(fn ->
+        assert ViolationMonitor.threshold(0) == 3
+        assert ViolationMonitor.window_seconds("3600") == 3_600
+      end)
+
+      assert ViolationMonitor.threshold(5) == 5
+      assert ViolationMonitor.window_seconds(60) == 60
     end
   end
 

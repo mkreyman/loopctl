@@ -156,9 +156,10 @@ audit-key condition either breaks pre-v2 tenants or silently widens the bypass.
 ## Dispatch lineage (L4) — structural verifier separation
 
 `lib/loopctl/dispatches.ex`: each dispatch carries a `lineage_path` (root → self).
-`lineage_shares_prefix?/2` (`dispatches.ex:593-597`) is the primitive the self-* checks use — note it
-compares lineage **ROOTS** (element 0) only, not arbitrary prefixes, and an empty list on either side
-is never a match. `select_verifier/3` (`dispatches.ex:664-701`) picks a verifier whose lineage does
+Two primitives serve the self-* checks and they demand DIFFERENT distance — see "The two lineage
+comparisons" below before touching either. `lineage_shares_prefix?/2` (`dispatches.ex:593-597`) is
+the stricter one (verify + verifier selection): it compares lineage **ROOTS** (element 0) only, not
+arbitrary prefixes, and an empty list on either side is never a match. `select_verifier/3` (`dispatches.ex:664-701`) picks a verifier whose lineage does
 NOT share the implementer's root — rejected in SQL (`reject_same_root/2`, `dispatches.ex:709-715`)
 and again in Elixir — from a pool capped at `@verifier_pool_limit`, seeded deterministically by
 `sha256(tenant audit pubkey || story_id)` so the orchestrator cannot predict the pick.
@@ -184,8 +185,11 @@ clears it, so both its trigger and its blast radius are deliberately bounded.
   `threshold/0` violations land inside `window_seconds/0` (defaults 3 / 3600, each rejected back
   to its default unless a positive integer). **Below the
   threshold the custody gate still returns its 409** — only the escalation is thresholded.
-  A halt CLAIMS the rows that armed it (`consumed_at`), so concurrent callers cannot produce two
-  onsets and the break-glass clear is not re-tripped by the next single violation.
+  A halt CLAIMS the rows that armed it (`consumed_at`) **in the same transaction as the halt**, so
+  concurrent callers cannot produce two onsets and a FAILED halt rolls the claim back instead of
+  pardoning the window it was armed by. Violations recorded while a halt is already active are
+  claimed on sight, so the break-glass clear is never re-tripped by evidence that piled up behind
+  the halt.
 - **`cap_rejected` NEVER halts and NEVER counts.** A capability is single-use with a bounded
   TTL, so a client retry (`:replay`), a resumed agent (`:expired`) and an audit-key rotation
   (`:invalid_signature`) all produce one; none is a byzantine signal, and the 403 already

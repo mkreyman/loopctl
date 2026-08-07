@@ -16,11 +16,6 @@ defmodule Loopctl.Repo.Migrations.CreateCustodyViolations do
       add :api_key_id, :binary_id
       add :agent_id, :binary_id
       add :occurred_at, :utc_datetime_usec, null: false
-      # Stamped when this row has been CLAIMED as the evidence for a halt. The row
-      # is retained (the forensic record is the point), but it can never arm a
-      # second halt — which is what lets the break-glass ceremony actually recover
-      # a tenant instead of leaving a loaded window behind it.
-      add :consumed_at, :utc_datetime_usec
 
       timestamps(type: :utc_datetime_usec)
     end

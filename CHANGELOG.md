@@ -70,10 +70,13 @@ Operator-facing changes for deployments outside the hosted instance.
 
   **When a halt fires.** Previously a SINGLE chain-of-custody refusal halted the tenant, and
   clearing a halt requires a human WebAuthn break-glass ceremony. A halt now requires
-  **3 self-report/self-verify violations within 1 hour** (tunable with
-  `config :loopctl, :custody_halt_threshold` and `:custody_halt_window_seconds`); below the
+  **3 self-report / self-review / self-verify violations within 1 hour** (tunable with
+  `config :loopctl, :custody_halt_threshold` and `:custody_halt_window_seconds`; a value that
+  is not a positive integer is refused back to the default with a warning, since `0` would
+  halt on the first violation and a string from an env var would halt nobody, ever); below the
   threshold the offending operation is refused exactly as before, with the same 409 — only the
-  escalation changed. Capability-token rejections no longer contribute to a halt at all: a
+  escalation changed. The `self_review_blocked` 409 body now carries `code` and
+  `remediation.learn_more` like its two sibling gates, so all three are machine-dispatchable. Capability-token rejections no longer contribute to a halt at all: a
   capability is single-use with a bounded TTL, so a plain client retry, a resumed agent or an
   audit-key rotation all produce one, and none of those is evidence of anything. They are now
   reported as `[:loopctl, :custody, :cap_rejected]` telemetry plus a warning log — **alert on
@@ -81,7 +84,7 @@ Operator-facing changes for deployments outside the hosted instance.
   telemetry and a `custody_halted` **error** log carrying the tenant, the reason and the count,
   so a halt reaches your alerting immediately; each halt is also recorded in the hash-chained
   audit log. Violations are retained in a new `custody_violations` table (tenant-scoped, RLS)
-  as the forensic record behind a halt. New migration, no manual steps.
+  as the forensic record behind a halt. New migrations, no manual steps.
 
   **What a halt blocks.** A halt used to 503 EVERY authenticated request for the tenant,
   including all reads. It now suspends only the custody surface: story-lifecycle writes,

@@ -210,6 +210,34 @@ defmodule LoopctlWeb.TenantControllerTest do
       assert body["error"]["code"] == "rate_limited"
     end
 
+    test "a structurally impossible key is refused BEFORE the budget is charged", ctx do
+      # `gate_ok?/3` post-increments, so anything that reaches the limiter spends
+      # the budget. Hex-decoding alone let any even-length string through, which
+      # made the "only real attempts spend it" ordering buy nothing.
+      test_pid = self()
+
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "custody_owner_key:rotate:" <> _tenant_id, _window, _limit ->
+          send(test_pid, :owner_key_budget_charged)
+          {:allow, 1}
+
+        _bucket, _window, _limit ->
+          {:allow, 1}
+      end)
+
+      body =
+        build_conn()
+        |> put_req_header("authorization", "Bearer #{ctx.raw_key}")
+        |> post(~p"/api/v1/tenants/me/custody-owner-key", %{
+          "owner_pubkey" => String.duplicate("00", 16),
+          "alg" => "ed25519"
+        })
+        |> json_response(422)
+
+      assert body["error"]["message"] =~ "32-byte"
+      refute_receive :owner_key_budget_charged
+    end
+
     test "within the budget the registration proceeds", ctx do
       stub_owner_key_limiter({:allow, 1})
 
