@@ -86,24 +86,31 @@ defmodule LoopctlWeb.CustodyHaltEscalationTest do
   end
 
   describe "a retried capability must not halt the tenant (the retry case)" do
-    test "a CONSUMED verify_cap is refused as a replay on the verify path" do
+    test "a REPLAYED start_cap is refused without halting the tenant" do
       tenant = tenant_with_audit_key()
-      %{story: story, lineage: lineage} = story_ready_for_verify(tenant)
-      verifier = fixture(:agent, %{tenant_id: tenant.id})
+      %{story: story, lineage: lineage, implementer: implementer} = story_ready_for_verify(tenant)
 
-      {:ok, cap} = Capabilities.mint(tenant.id, "verify_cap", story.id, lineage)
-      # Simulate the FIRST attempt having already spent the token — exactly the
-      # state a client's retry, timeout-and-resend, or crash-and-resume finds it in.
+      # #621 retired verify_cap, so `start` is now the only transition that consumes
+      # a capability — this test moved here with it. The scenario is unchanged and is
+      # the one that matters: a client retry, timeout-and-resend, or crash-and-resume
+      # presents a token the first attempt already spent.
+      {:ok, cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
       {:ok, _} = Capabilities.consume(cap)
 
-      assert {:error, {:cap_rejected, :replay}} =
-               Progress.verify_story(tenant.id, story.id, %{},
-                 orchestrator_agent_id: verifier.id,
-                 cap_id: cap.id,
-                 lineage: lineage
-               )
+      # Driven at the context layer so the replay reaches the capability check; over
+      # HTTP the state machine refuses a second start with a 409 first, which is its
+      # own (desirable) protection and would not exercise this path.
+      result =
+        Progress.start_story(tenant.id, story.id,
+          agent_id: implementer.id,
+          cap_id: cap.id,
+          lineage: lineage
+        )
 
-      # THE POINT OF THIS CHANGE: the retry was refused, and the tenant is still up.
+      assert match?({:error, _}, result), "a replayed capability must be refused"
+
+      # THE POINT: the retry was refused, and the tenant is still up. A single
+      # capability refusal must never cost the operator a WebAuthn ceremony.
       refute halted?(tenant.id)
       assert ViolationMonitor.count_in_window(tenant.id) == 0
     end

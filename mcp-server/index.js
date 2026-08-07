@@ -952,6 +952,103 @@ async function contractStory({ story_id, story_title, ac_count }) {
   return toContent(result);
 }
 
+// --- L1 capability plumbing (issue #621) ---
+//
+// A tenant with an audit signing key MUST present a capability token on the
+// custody transitions that consume one, or the call fails 403 missing_capability.
+// `start` is the only such transition (#621): claim returns the start_cap it mints.
+// Callers should not have to carry it by hand — so we cache what the server issues
+// and attach it automatically, while still honouring an explicit `capability`.
+//
+// The cache is per-process and therefore does NOT survive a session crash. That is
+// what the recovery paths below are for; never treat a cache miss as fatal.
+// Bounded so a long-lived server process cannot grow these without limit: this
+// module lives for the life of the MCP connection and sees every story the agent
+// touches. Insertion order is Map/Set iteration order in JS, so evicting the
+// first key drops the oldest entry.
+const CAP_CACHE_MAX = 256;
+const SPENT_CAPS_MAX = 1024;
+
+function boundedSet(store, max) {
+  while (store.size > max) {
+    const oldest = store.keys().next();
+    if (oldest.done) break;
+    store.delete(oldest.value);
+  }
+}
+
+const capCache = new Map();
+
+const capKey = (storyId, typ) => `${storyId}:${typ}`;
+
+function rememberCap(storyId, cap) {
+  if (cap && cap.cap_id && cap.typ) {
+    // Store the expiry alongside the id. A capability has a bounded TTL, and an
+    // agent can sit between claim and start for longer than that (a review pause,
+    // a crash-and-resume) — handing back a dead token afterwards costs a
+    // round-trip and surfaces a confusing refusal instead of the recovery path.
+    capCache.set(capKey(storyId, cap.typ), {
+      capId: cap.cap_id,
+      expiresAt: cap.expires_at ? Date.parse(cap.expires_at) : null,
+    });
+    boundedSet(capCache, CAP_CACHE_MAX);
+  }
+}
+
+function takeCap(storyId, typ) {
+  const key = capKey(storyId, typ);
+  const entry = capCache.get(key);
+  // Capabilities are single-use: once handed to a call, drop it so a retry does
+  // not present the same live token twice.
+  capCache.delete(key);
+  if (!entry) return undefined;
+  // Treat an unparseable expiry as usable — the server is the authority on
+  // expiry, and refusing here on a date we failed to parse would strand a token
+  // that is actually fine.
+  if (entry.expiresAt && Date.now() >= entry.expiresAt) return undefined;
+  return entry.capId;
+}
+
+// Cap ids this process has already handed to a call. Delivery is stateless
+// server-side and does NOT consume, so without this a retry (or a second tool
+// call) would present the same live token twice — and a double consume is
+// `:replay`, which IS byzantine and halts the whole tenant. takeCap gets the
+// same property for free by deleting on read.
+const spentCaps = new Set();
+
+// Fetches a live capability of `typ` already issued to this caller's lineage.
+// Returns undefined when there is none — callers must degrade gracefully.
+async function fetchCap(storyId, typ, key) {
+  try {
+    const result = await apiCall("GET", `/api/v1/stories/${storyId}/capabilities`, null, key);
+    const caps = (result && result.data) || [];
+    const match = caps.find((c) => c.typ === typ && !spentCaps.has(c.cap_id));
+    if (!match) return undefined;
+    spentCaps.add(match.cap_id);
+    boundedSet(spentCaps, SPENT_CAPS_MAX);
+    return match.cap_id;
+  } catch {
+    return undefined;
+  }
+}
+
+// Re-mints a start_cap for a story this agent owns (session-crash recovery).
+// Only start_cap is recoverable by design — an agent must never be able to mint a
+// capability to verify or report its own work.
+async function recoverStartCap(storyId) {
+  try {
+    const result = await apiCall(
+      "POST",
+      `/api/v1/stories/${storyId}/recover-cap`,
+      null,
+      process.env.LOOPCTL_AGENT_KEY
+    );
+    return result && result.data && result.data.cap_id;
+  } catch {
+    return undefined;
+  }
+}
+
 async function claimStory({ story_id }) {
   const result = await apiCall(
     "POST",
@@ -959,14 +1056,25 @@ async function claimStory({ story_id }) {
     null,
     process.env.LOOPCTL_AGENT_KEY
   );
+  // The claim response carries the start_cap that POST /start will require.
+  rememberCap(story_id, result && result.capability);
   return toContent(result);
 }
 
-async function startStory({ story_id }) {
+async function startStory({ story_id, capability }) {
+  // Cache first, then DELIVERY of the token claim already minted, then recovery
+  // (which mints a fresh one). Delivery also covers a legacy env-var key, whose
+  // lineage is [] and which recover-cap cannot serve at all.
+  const cap =
+    capability ||
+    takeCap(story_id, "start_cap") ||
+    (await fetchCap(story_id, "start_cap", process.env.LOOPCTL_AGENT_KEY)) ||
+    (await recoverStartCap(story_id));
+
   const result = await apiCall(
     "POST",
     `/api/v1/stories/${story_id}/start`,
-    null,
+    cap ? { capability: cap } : null,
     process.env.LOOPCTL_AGENT_KEY
   );
   return toContent(result);
@@ -1024,6 +1132,9 @@ async function reviewComplete({ story_id, review_type, findings_count, fixes_cou
 
 // --- Verification Tools (orch key) ---
 
+// Verify consumes NO capability (#621): no token can be bound to the principal
+// this endpoint permits to spend it. The gate is structural — loopctl selects the
+// verifier lineage and compares it against the implementer's server-side.
 async function verifyStory({ story_id, summary, review_type, claim }) {
   const body = {};
   if (summary) body.summary = summary;
@@ -2772,9 +2883,12 @@ async function getSystemArticles({ slug, category } = {}) {
   return toContent(result);
 }
 
-// US-26: Cap recovery after session crash
-async function recoverCap({ story_id, cap_type, lineage }) {
-  const body = { cap_type: cap_type || "start_cap", lineage: lineage || [] };
+// US-26: Cap recovery after session crash. start_cap is the ONLY recoverable type
+// (#621) — the server answers any other cap_type with 422 AND records a
+// cap_recovery_forgery_attempt against the caller, so never forward one. `lineage`
+// is resolved server-side from the authenticating key and was always ignored.
+async function recoverCap({ story_id }) {
+  const body = { cap_type: "start_cap" };
   const result = await apiCall("POST", `/api/v1/stories/${story_id}/recover-cap`, body);
   return toContent(result);
 }
@@ -3563,13 +3677,23 @@ const TOOLS = [
   {
     name: "start_story",
     description:
-      "Agent starts work on a claimed story. Transitions assigned -> implementing. Uses the AGENT key.",
+      "Agent starts work on a claimed story. Transitions assigned -> implementing. Uses the AGENT key. " +
+      "The L1 capability (start_cap) is handled for you: it is taken from the claim_story response, " +
+      "and re-minted via recover-cap if this process lost it (e.g. after a session crash). " +
+      "Pass `capability` only to override that.",
     inputSchema: {
       type: "object",
       properties: {
         story_id: {
           type: "string",
           description: "The UUID of the story.",
+        },
+        capability: {
+          type: "string",
+          description:
+            "Optional start_cap cap_id. Normally omitted — supplied automatically from the " +
+            "claim response or recovered. A tenant with an audit signing key cannot start " +
+            "without one (403 missing_capability).",
         },
       },
       required: ["story_id"],
@@ -6694,13 +6818,11 @@ const TOOLS = [
   },
   {
     name: "recover_cap",
-    description: "Re-mint a capability token for a story you're assigned to. Use after a session crash when you've lost your cap.",
+    description: "Re-mint the start_cap for a story you're assigned to. Use after a session crash when you've lost it. start_cap is the only recoverable capability: asking for any other type is refused and logged as a forgery attempt.",
     inputSchema: {
       type: "object",
       properties: {
         story_id: { type: "string", description: "Story UUID." },
-        cap_type: { type: "string", enum: ["start_cap", "report_cap"], description: "Which cap to recover (default: start_cap)." },
-        lineage: { type: "array", items: { type: "string" }, description: "Your dispatch lineage path." },
       },
       required: ["story_id"],
     },
