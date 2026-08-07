@@ -13,12 +13,16 @@ Operator-facing changes for deployments outside the hosted instance.
   file could only be titled "Changelog". On the hosted corpus three unrelated documents (a
   WordPress SEO plugin, the Elixir oauth2 library, a WordPress theme) each produced exactly
   that, and the nightly consolidation pass then proposed them for auto-unpublish as "the same
-  capture". The specific source (the ingest URL) is now passed to the extractor, and the
-  prompt asks for a title that stands alone in a shared corpus — qualified by its source when
-  the natural title is generic ("Changelog — Platinum SEO Pack WordPress plugin"), left alone
-  when it is already specific. This affects NEWLY ingested content only; existing articles are
-  untouched. It is the root cause behind the duplicate-capture class the previous entries
-  bound and gate.
+  capture". The specific source is now passed to the extractor, and the prompt asks for a
+  title that stands alone in a shared corpus — qualified by its source when the natural title
+  is generic ("Changelog — Platinum SEO Pack WordPress plugin"), left alone when it is already
+  specific. **What this sends:** for a URL ingest the scheme+host+path of the ingest URL is
+  included in the extraction prompt POSTed to your configured LLM provider; userinfo and the
+  query string are stripped first, so presigned signatures and share tokens are not
+  transmitted. For an inline (`content`) ingest, name the source with
+  `metadata.source_ref` — without it the source line is omitted entirely, never sent as a
+  placeholder. This affects NEWLY ingested content only; existing articles are untouched. It
+  is the root cause behind the duplicate-capture class the previous entries bound and gate.
 
 - **The consolidation drain caps AND the duplicate-similarity threshold are now live-tunable
   without a deploy (#617).** `knowledge_consolidation_max_applies`,

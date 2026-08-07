@@ -227,6 +227,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
         source_type: source_type,
         project_id: project_id,
         url: url,
+        source_ref: source_ref(url, args["metadata"]),
         publish: publish
       }
 
@@ -258,6 +259,41 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   defp normalize_project_id(""), do: nil
   defp normalize_project_id(value), do: value
+
+  # The SPECIFIC source shown to the extractor (#617) — a URL on the fetch path, a
+  # caller-supplied name on the INLINE path (`metadata["source_ref"]`, else
+  # `metadata["source"]`). Inline document text is a first-class ingest path, so
+  # leaving it sourceless reproduced the very failure #617 closes: a pasted CHANGELOG
+  # can only be titled "Changelog". nil only when the caller genuinely names nothing.
+  #
+  # A URL is reduced to scheme+host+path FIRST. Userinfo and the query string are where
+  # presigned signatures, share tokens and basic-auth credentials live, and this value
+  # is interpolated into the prompt POSTed to the tenant's LLM provider — material the
+  # fetched body never contains would otherwise become new secret egress, and
+  # instruction-shaped query text would land in the field the prompt treats as
+  # authoritative. Host+path is all a title qualifier needs. Length-capped for the
+  # same reason.
+  defp source_ref(url, metadata) when is_binary(url) do
+    url
+    |> URI.parse()
+    |> then(&%{&1 | userinfo: nil, query: nil, fragment: nil})
+    |> URI.to_string()
+    |> clean_source_ref() || source_ref(nil, metadata)
+  end
+
+  defp source_ref(_url, %{} = metadata),
+    do: clean_source_ref(metadata["source_ref"] || metadata["source"])
+
+  defp source_ref(_url, _metadata), do: nil
+
+  defp clean_source_ref(ref) when is_binary(ref) do
+    case String.trim(ref) do
+      "" -> nil
+      trimmed -> String.slice(trimmed, 0, 200)
+    end
+  end
+
+  defp clean_source_ref(_ref), do: nil
 
   defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
   defp valid_uuid?(_), do: false
@@ -486,10 +522,9 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
            # every title, and without knowing WHICH document it is reading it can only
            # title a CHANGELOG file "Changelog" — which three unrelated documents on the
            # hosted corpus duly did, generating the collision class the nightly
-           # consolidation pass exists to mop up. `nil` for inline content with no URL;
-           # the prompt omits the line rather than saying "unknown", since a model will
-           # happily qualify a title WITH the word unknown.
-           source_ref: ctx.url
+           # consolidation pass exists to mop up. See `source_ref/2` for where the value
+           # comes from and what is stripped from it before it leaves for the provider.
+           source_ref: ctx.source_ref
          ) do
       {:ok, extracted} ->
         {articles, seen_titles} =

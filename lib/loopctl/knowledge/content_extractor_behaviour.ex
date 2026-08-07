@@ -38,7 +38,10 @@ defmodule Loopctl.Knowledge.ContentExtractorBehaviour do
       title is only self-qualifying if the extractor knows what it is reading — without
       this it can only title a CHANGELOG file "Changelog", which is what generated the
       filename-title collision class on the hosted corpus (#617). Omit it rather than
-      passing a placeholder: a model will qualify a title WITH the word "unknown".
+      passing a placeholder: a model will qualify a title WITH the word "unknown". This
+      value LEAVES for the provider inside the prompt, so a caller passing a fetch URL
+      strips userinfo and query string first (see `Loopctl.Workers.ContentIngestionWorker`)
+      — that is where presigned signatures and share tokens live.
 
   ## Returns
 

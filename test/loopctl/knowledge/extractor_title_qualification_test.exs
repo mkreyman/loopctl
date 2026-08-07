@@ -2,85 +2,102 @@ defmodule Loopctl.Knowledge.ExtractorTitleQualificationTest do
   @moduledoc """
   The ingestion ROOT CAUSE behind the duplicate-capture class (#617).
 
-  The extractor mints every article title. It was shown only a coarse `source_type`
-  ("web_article"), never WHICH document it was reading — so a CHANGELOG file could
-  only be titled "Changelog", and on the hosted corpus three unrelated documents (a
-  WordPress SEO plugin, the Elixir oauth2 library, a WordPress theme) each produced
-  exactly that. Those three then collided on the normalized title and were proposed
-  for auto-unpublish as "the same capture", which is the false grouping 23 articles
-  were retitled by hand on 2026-08-06 to clear.
-
-  An extractor cannot qualify a title with a source it was never shown. These tests
-  pin that it IS shown one, and that the prompt asks for the qualification.
+  The extractor mints every article title, and was shown only a coarse `source_type`
+  ("web_article") — so a CHANGELOG file could only be titled "Changelog", which three
+  unrelated documents on the hosted corpus duly did, colliding into a false duplicate
+  group that 23 articles were retitled by hand to clear. These tests pin the link the
+  fix hangs on: the source reaching the OUTGOING PROVIDER REQUEST on BOTH provider
+  paths, under the one shared prompt. Asserting on prompt wording instead would pass
+  just as happily against a prompt that says the opposite.
   """
 
-  use ExUnit.Case, async: true
+  use Loopctl.DataCase, async: true
 
   alias Loopctl.Knowledge.ClaudeContentExtractor
+  alias Loopctl.Knowledge.OpenAiContentExtractor
+  alias Loopctl.Llm
 
-  describe "user_content/3 carries the SPECIFIC source" do
-    test "names the source when one is known" do
-      message =
-        ClaudeContentExtractor.user_content(
-          "# Changelog\n\n## 1.2.0",
-          "web_article",
-          "https://github.com/scrogson/oauth2/blob/master/CHANGELOG.md"
-        )
+  @ref "https://github.com/scrogson/oauth2/blob/master/CHANGELOG.md"
 
-      assert message =~ "Source: https://github.com/scrogson/oauth2"
-      assert message =~ "Source type: web_article"
-      assert message =~ "# Changelog"
-    end
+  defp articles_json,
+    do: JSON.encode!([%{title: "T", body: "B", category: "pattern", tags: []}])
 
-    test "omits the source line entirely when there is none" do
-      # Deliberately NOT a placeholder. A model handed `Source: unknown` will dutifully
-      # qualify a title with it — "Changelog -- unknown" is worse than "Changelog",
-      # because it looks specific while distinguishing nothing.
-      for missing <- [nil, ""] do
-        message = ClaudeContentExtractor.user_content("body", "inline", missing)
-
-        refute message =~ "Source:"
-        refute message =~ "unknown"
-      end
-    end
-
-    test "the two-arity form still works for callers that have no source" do
-      # `OpenAiContentExtractor` shares this function; the default keeps the behaviour
-      # of every caller that has not been taught about `:source_ref`.
-      assert ClaudeContentExtractor.user_content("body", "newsletter") =~
-               "Source type: newsletter"
-    end
+  defp capture(client, response) do
+    Req.Test.stub(client, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      send(self(), {:req_body, JSON.decode!(body)})
+      Req.Test.json(conn, response)
+    end)
   end
 
-  describe "the system prompt asks for a title that stands alone" do
-    test "names the generic-title trap and the qualification it wants instead" do
-      prompt = ClaudeContentExtractor.system_prompt()
+  defp extract(extractor, tenant_id) do
+    assert {:ok, _} =
+             extractor.extract_from_content(tenant_id, "# Changelog",
+               source_type: "web_article",
+               source_ref: @ref
+             )
 
-      # The instruction has to be concrete about WHICH titles are the problem — a vague
-      # "write good titles" changes nothing, and this exact class is what the corpus
-      # actually produced.
-      assert prompt =~ "Changelog"
-      assert prompt =~ "Configuration"
+    assert_received {:req_body, body}
+    body
+  end
 
-      # ...and it must ask for the SOURCE as the qualifier, which is only actionable
-      # because `user_content/3` now supplies one.
-      assert prompt =~ "Source line"
+  test "Anthropic: the user message names the source, under the shared prompt" do
+    tenant = fixture(:tenant)
+    {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "k-anthropic"})
+
+    capture(Loopctl.Llm.Anthropic, %{
+      "content" => [%{"type" => "text", "text" => articles_json()}],
+      "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+    })
+
+    body = extract(ClaudeContentExtractor, tenant.id)
+
+    assert body["system"] == ClaudeContentExtractor.system_prompt()
+    assert [%{"role" => "user", "content" => user}] = body["messages"]
+    assert user =~ "Source: #{@ref}"
+  end
+
+  test "OpenAI-compatible: the SAME prompt and the same source line" do
+    tenant = fixture(:tenant)
+
+    {:ok, _} =
+      Llm.upsert_settings(tenant.id, %{
+        "chat_provider" => "openai_compatible",
+        "chat_base_url" => "https://local.example.com/v1",
+        "chat_api_key" => "k-local",
+        "extraction_model" => "llama-3.1-8b-instruct"
+      })
+
+    capture(Loopctl.Llm.OpenAiChat, %{
+      "choices" => [%{"message" => %{"content" => articles_json()}}],
+      "usage" => %{"prompt_tokens" => 1, "completion_tokens" => 1}
+    })
+
+    body = extract(OpenAiContentExtractor, tenant.id)
+
+    assert [%{"role" => "system", "content" => system}, %{"role" => "user", "content" => user}] =
+             body["messages"]
+
+    assert system == ClaudeContentExtractor.system_prompt()
+    assert user =~ "Source: #{@ref}"
+  end
+
+  test "user_content/3 omits the source line rather than naming a placeholder" do
+    # A model handed `Source: unknown` dutifully qualifies WITH it: "Changelog —
+    # unknown" looks specific while distinguishing nothing.
+    for missing <- [nil, ""] do
+      message = ClaudeContentExtractor.user_content("body", "inline", missing)
+
+      refute message =~ "Source:"
+      refute message =~ "unknown"
     end
 
-    test "tells the model NOT to pad an already-specific title" do
-      # Without this the rule over-fires and every title grows a source suffix, which
-      # makes the corpus noisier rather than more distinguishable.
-      assert ClaudeContentExtractor.system_prompt() =~ "do not pad it"
-    end
+    assert ClaudeContentExtractor.user_content("body", "newsletter") =~ "Source type: newsletter"
+  end
 
-    test "both providers share ONE prompt, so the rule cannot drift" do
-      # `OpenAiContentExtractor` calls `system_prompt/0` and `user_content/3` rather
-      # than carrying copies; a copy would let one provider keep minting bare
-      # "Changelog" titles into the same corpus.
-      source = File.read!("lib/loopctl/knowledge/openai_content_extractor.ex")
-
-      assert source =~ "ClaudeContentExtractor.system_prompt()"
-      assert source =~ "ClaudeContentExtractor.user_content(content, source_type, source_ref)"
-    end
+  test "the prompt still defines what to do when there is no Source line" do
+    # The ONE prose check kept: this branch has no wire signature, and without it the
+    # model is told to qualify from a line that is not in its input.
+    assert ClaudeContentExtractor.system_prompt() =~ "NO Source line"
   end
 end

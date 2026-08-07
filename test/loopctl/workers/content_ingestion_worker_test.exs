@@ -70,17 +70,27 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
   # --- The specific source reaches the extractor (#617 ingestion root cause) ---
 
   describe "source_ref passed to the extractor" do
-    test "the URL is handed to the extractor, so a title can be qualified by it" do
+    test "the URL is handed to the extractor, stripped of credentials and query" do
       # The extractor mints every title. Shown only `source_type: "web_article"` it
       # could title a CHANGELOG file nothing but "Changelog" — and three unrelated
       # documents on the hosted corpus did exactly that, colliding into a false
       # duplicate group. The prompt now asks for a self-qualifying title; this is the
       # wiring that makes the ask answerable.
+      #
+      # Host+path is the whole qualifier. Userinfo and the query string are NOT sent:
+      # that is where presigned signatures, share tokens and basic-auth credentials
+      # live, and this value is interpolated into the prompt POSTed to the tenant's
+      # LLM provider — secrets the fetched body never contained would become new
+      # egress, and query text reads as instruction in a field the prompt trusts.
       %{tenant: tenant} = setup_tenant()
-      url = "https://github.com/scrogson/oauth2/blob/master/CHANGELOG.md"
+
+      url =
+        "https://user:pw@github.com/scrogson/oauth2/blob/master/CHANGELOG.md" <>
+          "?X-Amz-Signature=deadbeef"
 
       expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, _c, opts ->
-        assert opts[:source_ref] == url
+        assert opts[:source_ref] ==
+                 "https://github.com/scrogson/oauth2/blob/master/CHANGELOG.md"
 
         {:ok,
          [
@@ -106,13 +116,14 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
                })
     end
 
-    test "inline content with no URL passes nil, never a placeholder" do
-      # A placeholder is worse than nothing: the model qualifies the title WITH it, so
-      # "Changelog -- unknown" looks specific while distinguishing nothing.
+    test "inline content is named by caller metadata, not left sourceless" do
+      # Inline document text is a first-class ingest path (the API takes url OR
+      # content), so threading only the URL left half the surface reproducing the
+      # exact failure #617 closes: a pasted CHANGELOG can only be titled "Changelog".
       %{tenant: tenant} = setup_tenant()
 
       expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, _c, opts ->
-        assert is_nil(opts[:source_ref])
+        assert opts[:source_ref] == "Oban Pro CHANGELOG.md"
 
         {:ok, [%{title: "Inline note", body: "b", category: :pattern, tags: []}]}
       end)
@@ -124,7 +135,32 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
                    "tenant_id" => tenant.id,
                    "content" => "raw",
                    "content_hash" => "srcref2",
-                   "source_type" => "newsletter"
+                   "source_type" => "newsletter",
+                   "metadata" => %{"source_ref" => "Oban Pro CHANGELOG.md"}
+                 }
+               })
+    end
+
+    test "a caller who names nothing gets nil, never a placeholder" do
+      # A placeholder is worse than nothing: the model qualifies the title WITH it, so
+      # "Changelog — unknown" looks specific while distinguishing nothing.
+      %{tenant: tenant} = setup_tenant()
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, _c, opts ->
+        assert is_nil(opts[:source_ref])
+
+        {:ok, [%{title: "Inline note", body: "b", category: :pattern, tags: []}]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 73,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "raw",
+                   "content_hash" => "srcref3",
+                   "source_type" => "newsletter",
+                   "metadata" => %{"tag" => "x"}
                  }
                })
     end

@@ -42,9 +42,11 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
   Reference", "Configuration" and "Overview" are titles that hundreds of unrelated \
   sources all produce; they collide, and a corpus cannot tell the resulting \
   articles apart. When the natural title is generic like that, QUALIFY it with the \
-  specific subject the Source line names -- prefer "Changelog -- Platinum SEO Pack \
-  WordPress plugin" over "Changelog", and "Retry configuration -- Oban Pro" over \
-  "Configuration". A title that is already specific ("Ecto changesets validate \
+  specific subject the Source line names -- prefer "Changelog — Platinum SEO Pack \
+  WordPress plugin" over "Changelog", and "Retry configuration — Oban Pro" over \
+  "Configuration"; separate title and qualifier with that em dash. When there is NO \
+  Source line, take the qualifier from the subject the CONTENT itself names, and \
+  never invent a source. A title that is already specific ("Ecto changesets validate \
   before they cast") needs no qualifier; do not pad it.\
   """
 
@@ -71,9 +73,11 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
   consolidation pass then has to catch. An extractor cannot qualify a title with a
   source it was never shown.
 
-  Omitted when the caller has no specific source (inline content with no URL), in which
-  case the line is left out entirely rather than sent as "unknown" — a literal
-  "unknown" is a string the model can dutifully qualify a title WITH.
+  Omitted when the caller names no source at all, in which case the line is left out
+  entirely rather than sent as "unknown" — a literal "unknown" is a string the model
+  can dutifully qualify a title WITH. The prompt covers that case explicitly (qualify
+  from the content's own subject), so an absent Source line is a defined state and not
+  an unsatisfiable instruction.
   """
   @spec user_content(String.t(), String.t(), String.t() | nil) :: String.t()
   def user_content(content, source_type, source_ref \\ nil) do
