@@ -42,8 +42,13 @@ defmodule LoopctlWeb.CapabilityController do
   # non-member. Admission is not access: the list is scoped to the caller.
   plug LoopctlWeb.Plugs.RequireRole, exact_role: [:agent, :orchestrator]
 
-  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
-  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:index]
+  # DELIBERATELY NOT behind RequireHumanAnchor, unlike its mutating siblings.
+  # `TierCapabilities` advertises the tier gate as `applies_to: "mutating_actions"`
+  # with reads open on every surface (tier_capabilities.ex:287), and this action is a
+  # GET. Gating it would have made the advertised contract false for an agent-rooted
+  # tenant — and bought nothing: such a tenant cannot claim a story, so it has no
+  # capabilities to list and this returns an empty array either way. The scoping that
+  # does the work here is the caller's own lineage, not the tenant's trust tier.
 
   tags(["Progress"])
 

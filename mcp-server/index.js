@@ -962,24 +962,51 @@ async function contractStory({ story_id, story_title, ac_count }) {
 //
 // The cache is per-process and therefore does NOT survive a session crash. That is
 // what the recovery paths below are for; never treat a cache miss as fatal.
+// Bounded so a long-lived server process cannot grow these without limit: this
+// module lives for the life of the MCP connection and sees every story the agent
+// touches. Insertion order is Map/Set iteration order in JS, so evicting the
+// first key drops the oldest entry.
+const CAP_CACHE_MAX = 256;
+const SPENT_CAPS_MAX = 1024;
+
+function boundedSet(store, max) {
+  while (store.size > max) {
+    const oldest = store.keys().next();
+    if (oldest.done) break;
+    store.delete(oldest.value);
+  }
+}
+
 const capCache = new Map();
 
 const capKey = (storyId, typ) => `${storyId}:${typ}`;
 
 function rememberCap(storyId, cap) {
   if (cap && cap.cap_id && cap.typ) {
-    capCache.set(capKey(storyId, cap.typ), cap.cap_id);
+    // Store the expiry alongside the id. A capability has a bounded TTL, and an
+    // agent can sit between claim and start for longer than that (a review pause,
+    // a crash-and-resume) — handing back a dead token afterwards costs a
+    // round-trip and surfaces a confusing refusal instead of the recovery path.
+    capCache.set(capKey(storyId, cap.typ), {
+      capId: cap.cap_id,
+      expiresAt: cap.expires_at ? Date.parse(cap.expires_at) : null,
+    });
+    boundedSet(capCache, CAP_CACHE_MAX);
   }
 }
 
 function takeCap(storyId, typ) {
   const key = capKey(storyId, typ);
-  const cap = capCache.get(key);
+  const entry = capCache.get(key);
   // Capabilities are single-use: once handed to a call, drop it so a retry does
-  // not replay a consumed token (which the server rejects, and which trips the
-  // custody-violation path rather than a clean error).
+  // not present the same live token twice.
   capCache.delete(key);
-  return cap;
+  if (!entry) return undefined;
+  // Treat an unparseable expiry as usable — the server is the authority on
+  // expiry, and refusing here on a date we failed to parse would strand a token
+  // that is actually fine.
+  if (entry.expiresAt && Date.now() >= entry.expiresAt) return undefined;
+  return entry.capId;
 }
 
 // Cap ids this process has already handed to a call. Delivery is stateless
@@ -998,6 +1025,7 @@ async function fetchCap(storyId, typ, key) {
     const match = caps.find((c) => c.typ === typ && !spentCaps.has(c.cap_id));
     if (!match) return undefined;
     spentCaps.add(match.cap_id);
+    boundedSet(spentCaps, SPENT_CAPS_MAX);
     return match.cap_id;
   } catch {
     return undefined;

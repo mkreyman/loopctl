@@ -156,10 +156,10 @@ audit-key condition either breaks pre-v2 tenants or silently widens the bypass.
 ## Dispatch lineage (L4) — structural verifier separation
 
 `lib/loopctl/dispatches.ex`: each dispatch carries a `lineage_path` (root → self).
-`lineage_shares_prefix?/2` (`dispatches.ex:587-591`) is the primitive the self-* checks use — note it
+`lineage_shares_prefix?/2` (`dispatches.ex:593-597`) is the primitive the self-* checks use — note it
 compares lineage **ROOTS** (element 0) only, not arbitrary prefixes, and an empty list on either side
-is never a match. `select_verifier/3` (`dispatches.ex:613-650`) picks a verifier whose lineage does
-NOT share the implementer's root — rejected in SQL (`reject_same_root/2`, `dispatches.ex:658-664`)
+is never a match. `select_verifier/3` (`dispatches.ex:664-701`) picks a verifier whose lineage does
+NOT share the implementer's root — rejected in SQL (`reject_same_root/2`, `dispatches.ex:709-715`)
 and again in Elixir — from a pool capped at `@verifier_pool_limit`, seeded deterministically by
 `sha256(tenant audit pubkey || story_id)` so the orchestrator cannot predict the pick.
 
@@ -171,6 +171,29 @@ do not "simplify" either half.
 
 Ephemeral per-dispatch keys (minted via `POST /api/v1/dispatches`, MCP `dispatch` tool) replace
 long-lived env-var keys.
+
+## The two lineage comparisons — report and verify demand DIFFERENT distance
+
+There are two, and using the wrong one either breaks the product or weakens the gate:
+
+- `Dispatches.lineage_same_chain?/2` — ancestry: identical, or one an ancestor of the other.
+  A SIBLING passes. Used by **report** and **review-complete** (`lineage_status/3` defaults to
+  `:chain`).
+- `Dispatches.lineage_shares_prefix?/2` — shared ROOT (element 0 only). A sibling is BLOCKED.
+  Used by **verify** (`lineage_status(story, caller, :root)`) and by `select_verifier/3`'s
+  `reject_same_root/2`.
+
+Why they differ: the documented dispatch tree puts the implementer and the reviewer side by
+side under one orchestrator, and roots the whole tenant at one operator dispatch. Under a
+root test *every* pair of dispatches in a tenant matches, so the reviewer counts as the
+implementer and nothing can ever be reported — and `select_verifier` rejects its entire pool.
+This was invisible until #621 began recording `implementer_dispatch_id` on the HTTP path,
+which is what made the comparison run at all. Verify stays on the root test deliberately: it
+is the final certification, and the selector already refuses to nominate a same-root verifier,
+so accepting one at the gate would contradict the selection rule.
+
+Neither relaxes self-approval — `assigned_agent_id` equality is evaluated IN ADDITION at every
+gate, and an empty lineage is never a match.
 
 ## Anti-patterns
 

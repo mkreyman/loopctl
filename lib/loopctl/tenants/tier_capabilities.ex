@@ -148,7 +148,6 @@ defmodule Loopctl.Tenants.TierCapabilities do
       "LoopctlWeb.ArtifactReportController",
       "LoopctlWeb.BulkOperationsController",
       "LoopctlWeb.CapRecoveryController",
-      "LoopctlWeb.CapabilityController",
       # LCP-1 §9.2 — TenantController mounts RequireHumanAnchor on
       # :register_owner_key (the custody owner key is the root of trust).
       "LoopctlWeb.TenantController"

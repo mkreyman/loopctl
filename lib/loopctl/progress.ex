@@ -1886,7 +1886,10 @@ defmodule Loopctl.Progress do
       # are silent about the caller — and `verifier_dispatch_id` is only written
       # by the OPTIONAL request-review, so without this the common path degraded
       # to a single agent-id inequality.
-      case lineage_status(story, caller_lineage) do
+      # :root — verify demands the stricter separation. select_verifier/3 will not
+      # nominate a verifier under the implementer's root, so a caller sharing it
+      # must not be able to certify either.
+      case lineage_status(story, caller_lineage, :root) do
         :unresolvable -> {:error, :unresolvable_dispatch_lineage}
         :conflict -> {:error, :self_verify_blocked}
         :ok -> verify_recorded_separation(story, orchestrator_agent_id)
@@ -2475,10 +2478,26 @@ defmodule Loopctl.Progress do
   #      a story with an unresolvable implementer dispatch is caught only by the
   #      agent-id check, not by fail-closed. The permit is scoped to legacy keys and
   #      the agent-id check still applies; the gates align for dispatch-minted keys.
-  defp lineage_status(%Story{implementer_dispatch_id: nil}, _caller_lineage), do: :ok
-  defp lineage_status(_story, []), do: :ok
+  # `separation` selects HOW MUCH lineage distance this gate demands:
+  #
+  #   :chain — the caller must not be on the implementer's root-to-leaf chain.
+  #            A SIBLING dispatch passes. Used by report and review-complete,
+  #            where the documented tree puts the reviewer beside the implementer
+  #            under one orchestrator; demanding a separate root there means no
+  #            reviewer in a normal tenant can ever act (#621).
+  #   :root  — the caller must not share the implementer's root at all. Stricter,
+  #            and used by verify, the final certification: select_verifier/3
+  #            already refuses to nominate a same-root verifier, so accepting one
+  #            at the gate would contradict the selection rule.
+  #
+  # Both fail closed on an unresolvable implementer dispatch, and both are
+  # evaluated IN ADDITION to the agent-id equality check, never instead of it.
+  defp lineage_status(story, caller_lineage, separation \\ :chain)
 
-  defp lineage_status(story, caller_lineage) do
+  defp lineage_status(%Story{implementer_dispatch_id: nil}, _caller_lineage, _separation), do: :ok
+  defp lineage_status(_story, [], _separation), do: :ok
+
+  defp lineage_status(story, caller_lineage, separation) do
     case get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id) do
       [] ->
         # Declared-but-unresolvable implementer dispatch — fail closed.
@@ -2491,7 +2510,13 @@ defmodule Loopctl.Progress do
         :unresolvable
 
       impl ->
-        if Dispatches.lineage_shares_prefix?(impl, caller_lineage), do: :conflict, else: :ok
+        overlap? =
+          case separation do
+            :root -> Dispatches.lineage_shares_prefix?(impl, caller_lineage)
+            :chain -> Dispatches.lineage_same_chain?(impl, caller_lineage)
+          end
+
+        if overlap?, do: :conflict, else: :ok
     end
   end
 

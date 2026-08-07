@@ -161,7 +161,7 @@ in order:
    `verify_lineage_separated/4` (`progress.ex:1925-1945`): an EMPTY lineage on either side —
    which is what an unloadable/deleted dispatch row yields (`get_dispatch_lineage/2`,
    `progress.ex:1947-1952`) — fails CLOSED, a shared lineage root
-   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:587-591`) blocks, and the
+   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:593-597`) blocks, and the
    `assigned_agent_id` equality check is evaluated IN ADDITION to the lineage comparison, never
    short-circuited by it.
 5. **`assigned_agent_id` equality** as the fallback for pre-dispatch stories and for every
