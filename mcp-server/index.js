@@ -982,14 +982,23 @@ function takeCap(storyId, typ) {
   return cap;
 }
 
+// Cap ids this process has already handed to a call. Delivery is stateless
+// server-side and does NOT consume, so without this a retry (or a second tool
+// call) would present the same live token twice — and a double consume is
+// `:replay`, which IS byzantine and halts the whole tenant. takeCap gets the
+// same property for free by deleting on read.
+const spentCaps = new Set();
+
 // Fetches a live capability of `typ` already issued to this caller's lineage.
 // Returns undefined when there is none — callers must degrade gracefully.
 async function fetchCap(storyId, typ, key) {
   try {
     const result = await apiCall("GET", `/api/v1/stories/${storyId}/capabilities`, null, key);
     const caps = (result && result.data) || [];
-    const match = caps.find((c) => c.typ === typ);
-    return match && match.cap_id;
+    const match = caps.find((c) => c.typ === typ && !spentCaps.has(c.cap_id));
+    if (!match) return undefined;
+    spentCaps.add(match.cap_id);
+    return match.cap_id;
   } catch {
     return undefined;
   }

@@ -195,9 +195,11 @@ defmodule LoopctlWeb.StoryVerificationController do
           custody_claim: conn.assigns[:custody_signed_claim],
           # #621: verify consumes NO capability — see Progress.verify_story/4 for
           # why a verify_cap could never reach the principal this endpoint permits
-          # to spend it. :lineage is still resolved SERVER-SIDE (never from the
-          # request body) because the L4 custody gate compares it.
-          lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+          # to spend it. The CALLER's lineage, resolved SERVER-SIDE (never from the
+          # request body), is what the L4 gate compares against the implementer's,
+          # and what the signed-custody-claim audit entry records — both read it
+          # under this exact key.
+          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
         )
 
       case Progress.verify_story(tenant_id, story_id, params, opts) do

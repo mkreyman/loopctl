@@ -13,6 +13,8 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
 
   use LoopctlWeb.ConnCase, async: true
 
+  import Ecto.Query
+
   alias Loopctl.AdminRepo
   alias Loopctl.Dispatches.Dispatch
 
@@ -47,6 +49,29 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
     dispatch = insert_dispatch(tenant.id, agent.id, api_key.id, lineage, role)
 
     %{agent: agent, raw_key: raw_key, api_key: api_key, lineage: lineage, dispatch: dispatch}
+  end
+
+  # A LEGACY (env-var) actor: an api key that no dispatch ever minted, so
+  # `Dispatches.lineage_for_api_key/2` resolves it to `[]` — the class every other
+  # legacy key in the tenant also resolves to, which is why lineage cannot
+  # discriminate between them.
+  defp legacy_actor(tenant, role, agent \\ nil) do
+    agent = agent || fixture(:agent, %{tenant_id: tenant.id})
+
+    {raw_key, api_key} =
+      fixture(:api_key, %{tenant_id: tenant.id, role: role, agent_id: agent.id})
+
+    %{agent: agent, raw_key: raw_key, api_key: api_key}
+  end
+
+  defp caps_for(conn, ctx, actor) do
+    %{"data" => caps} =
+      conn
+      |> auth(actor.raw_key)
+      |> get("/api/v1/stories/#{ctx.story.id}/capabilities")
+      |> json_response(200)
+
+    caps
   end
 
   defp keyed_context do
@@ -196,6 +221,17 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
       # tenant, which would 503 every other agent working in it.
       assert is_nil(AdminRepo.get!(Loopctl.Tenants.Tenant, tenant.id).custody_halted_at),
              "an expired capability is a client error — it must never halt the tenant"
+
+      # Non-halting is not invisible: the same path carries the MISUSE refusals
+      # (wrong lineage / wrong story), and the entry must be written AFTER the
+      # rollback or it dies with the transaction that refused the token.
+      refusals =
+        Loopctl.AuditChain.Entry
+        |> where([e], e.tenant_id == ^tenant.id and e.action == "capability_refused")
+        |> AdminRepo.all()
+
+      assert [%{payload: %{"reason" => "expired", "cap_id" => cap_id}}] = refusals
+      assert cap_id == start_cap["cap_id"]
     end
 
     test "a malformed capability is refused, not a 500", %{conn: conn} do
@@ -254,40 +290,52 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
   end
 
   describe "GET /stories/:id/capabilities — delivery of already-issued caps (#621)" do
-    test "returns the caller's own live capabilities for the story", %{conn: conn} do
-      %{story: story, implementer: impl} = keyed_context()
+    test "returns the caller's own live capabilities, and no one else's", %{conn: conn} do
+      ctx = keyed_context()
 
       conn
-      |> auth(impl.raw_key)
-      |> post("/api/v1/stories/#{story.id}/claim")
+      |> auth(ctx.implementer.raw_key)
+      |> post("/api/v1/stories/#{ctx.story.id}/claim")
       |> json_response(200)
 
-      %{"data" => caps} =
-        conn
-        |> auth(impl.raw_key)
-        |> get("/api/v1/stories/#{story.id}/capabilities")
-        |> json_response(200)
-
+      caps = caps_for(conn, ctx, ctx.implementer)
       assert [%{"typ" => "start_cap"}] = caps
-      assert Enum.all?(caps, &(&1["issued_to_lineage"] == impl.lineage))
+      assert Enum.all?(caps, &(&1["issued_to_lineage"] == ctx.implementer.lineage))
+
+      assert caps_for(conn, ctx, ctx.reporter) == [],
+             "a caller must never be handed a capability minted for someone else's lineage"
     end
 
-    test "never returns capabilities issued to a DIFFERENT lineage", %{conn: conn} do
-      %{story: story, implementer: impl, reporter: other} = keyed_context()
+    # Lineage is [] for a legacy key, so list_for_lineage/3 fails closed on it and
+    # ASSIGNMENT is the only discriminator left — without it such a claimant has no
+    # recovery path at all (recover-cap needs an implementer_dispatch_id its claim
+    # never recorded). Both directions of that substitution are pinned here.
+    test "the ASSIGNMENT fallback serves the assigned agent, and only it", %{conn: conn} do
+      ctx = keyed_context()
+      legacy = legacy_actor(ctx.tenant, :agent)
+
+      conn
+      |> auth(legacy.raw_key)
+      |> post("/api/v1/stories/#{ctx.story.id}/claim")
+      |> json_response(200)
+
+      assert [%{"typ" => "start_cap", "issued_to_lineage" => []}] = caps_for(conn, ctx, legacy)
+
+      # Another legacy key resolves to the SAME [] lineage: assignment must decide.
+      assert caps_for(conn, ctx, legacy_actor(ctx.tenant, :agent)) == []
+
+      # And an orchestrator identity linked to the same agent_id must not walk this
+      # gate, which CapRecoveryController refuses for the mint path beside it.
+      assert caps_for(conn, ctx, legacy_actor(ctx.tenant, :orchestrator, legacy.agent)) == []
+    end
+
+    test "a non-UUID story id is a 404, not a 500", %{conn: conn} do
+      %{implementer: impl} = keyed_context()
 
       conn
       |> auth(impl.raw_key)
-      |> post("/api/v1/stories/#{story.id}/claim")
-      |> json_response(200)
-
-      %{"data" => caps} =
-        conn
-        |> auth(other.raw_key)
-        |> get("/api/v1/stories/#{story.id}/capabilities")
-        |> json_response(200)
-
-      assert caps == [],
-             "a caller must never be handed a capability minted for someone else's lineage"
+      |> get("/api/v1/stories/not-a-uuid/capabilities")
+      |> response(404)
     end
   end
 
@@ -382,39 +430,60 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
       assert story.verified_status == :verified
     end
 
+    # An orchestrator-role raw key for `agent_id`, minted by a dispatch on `lineage`.
+    defp orchestrator_key_on_lineage(ctx, agent_id, lineage) do
+      {raw_key, api_key} =
+        fixture(:api_key, %{
+          tenant_id: ctx.tenant.id,
+          role: :orchestrator,
+          agent_id: agent_id
+        })
+
+      insert_dispatch(ctx.tenant.id, agent_id, api_key.id, lineage, :orchestrator)
+      raw_key
+    end
+
     test "the IMPLEMENTER still cannot verify its own work", %{conn: conn} do
       ctx = reviewed(conn, keyed_context())
 
       # L4 is the whole enforcement now that no capability gates verify. If this
       # ever passes, dropping verify_cap regressed the core guarantee.
-      %{agent: impl_agent} = ctx.implementer
-
-      {impl_orch_key, api_key} =
-        fixture(:api_key, %{
-          tenant_id: ctx.tenant.id,
-          role: :orchestrator,
-          agent_id: impl_agent.id
-        })
-
-      insert_dispatch(
-        ctx.tenant.id,
-        impl_agent.id,
-        api_key.id,
-        ctx.implementer.lineage,
-        :orchestrator
-      )
+      raw_key =
+        orchestrator_key_on_lineage(ctx, ctx.implementer.agent.id, ctx.implementer.lineage)
 
       body =
         conn
-        |> auth(impl_orch_key)
+        |> auth(raw_key)
         |> post("/api/v1/stories/#{ctx.story.id}/verify", %{
           "review_type" => "enhanced",
           "summary" => "looks good to me"
         })
         |> json_response(409)
 
-      assert body["error"]["code"] == "self_verify_blocked" or
-               body["error"]["message"] =~ "own"
+      assert body["error"]["code"] == "self_verify_blocked"
+    end
+
+    test "a DIFFERENT agent in the implementer's lineage chain cannot verify", %{conn: conn} do
+      ctx = reviewed(conn, keyed_context())
+
+      # The leg agent-id equality cannot reach, and the one the retired verify_cap
+      # used to cover: a distinct agent_id whose dispatch shares the implementer's
+      # lineage ROOT. request-review was never called, so verifier_dispatch_id is
+      # nil — uncompared caller lineage means a bare agent-id inequality passes.
+      sibling = fixture(:agent, %{tenant_id: ctx.tenant.id})
+      shared_root = [hd(ctx.implementer.lineage), Ecto.UUID.generate()]
+      raw_key = orchestrator_key_on_lineage(ctx, sibling.id, shared_root)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post("/api/v1/stories/#{ctx.story.id}/verify", %{
+          "review_type" => "enhanced",
+          "summary" => "my sub-agent says it is fine"
+        })
+        |> json_response(409)
+
+      assert body["error"]["code"] == "self_verify_blocked"
     end
   end
 end

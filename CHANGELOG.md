@@ -31,15 +31,25 @@ All notable changes to loopctl are documented here.
   nothing at all in a tenant whose dispatches share one root, and which a legacy env-var
   orchestrator key (lineage `[]`) can never hold. The bulk `verify-all` path never sent a cap
   at all and silently returned `verified_count: 0`. Both transitions are gated by structural
-  lineage separation plus the `exact_role` plugs — the loopctl-selected verifier is still
-  recorded and still compared, it is just no longer a bearer token the entitled principal
-  cannot obtain. See `docs/chain-of-custody-v2.md` §5.2.
+  lineage separation plus the `exact_role` plugs: `verify` now compares the CALLER's
+  server-resolved dispatch lineage against the implementer's, exactly as `report` does, so an
+  orchestrator key inside the implementer's own dispatch chain is refused with `409
+  self_verify_blocked` even when its `agent_id` differs. That check runs on every path,
+  including the common one where the optional `request-review` was never called; the
+  loopctl-selected verifier is still recorded and compared in addition whenever it exists.
+  See `docs/chain-of-custody-v2.md` §5.2.
 
 - **An unusable capability no longer halts the whole tenant.** Any rejected token produced
   `{:cap_rejected, _}`, which custody-halts the tenant and 503s every subsequent request from
   it — so one agent letting a token pass its 1-hour TTL took down every other agent in the
   tenant. Only a forged signature or a double-spent token does that now; expiry and lineage
-  drift are ordinary 403s.
+  drift are ordinary 403s, recorded in the audit chain as `capability_refused` (with the
+  `cap_id`, api key and agent) so token MISUSE is still visible without halting anyone.
+  Relatedly, **rotating a tenant's audit signing key no longer invalidates outstanding
+  capability tokens**: verification now also accepts the historical key whose
+  `[rotated_in, rotated_out)` window covers the token's `issued_at`. Without that, a routine
+  rotation made every live token `invalid_signature` — which IS byzantine, so a documented
+  operator action custody-halted the tenant.
 
 - **Capability refusals return their documented 403 instead of a 500.** The controllers had no
   clause for the capability layer's own error shapes, so a missing or rejected token raised a

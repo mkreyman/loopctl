@@ -23,8 +23,9 @@ defmodule LoopctlWeb.CapabilityController do
       every OTHER legacy key in the tenant also resolves to — so lineage cannot
       discriminate and `Capabilities.list_for_lineage/3` fails closed on it.
       Such a caller is served by ASSIGNMENT instead
-      (`Capabilities.list_for_assigned_agent/3`): only the story's own assigned
-      agent, the principal the token was minted for, may collect it.
+      (`Capabilities.list_for_assigned_agent/3`), and only on an `:agent`-role key:
+      the principal the token was minted for is the only one that may collect it,
+      the same line `CapRecoveryController` draws for the mint path beside this one.
   """
 
   use LoopctlWeb, :controller
@@ -63,16 +64,30 @@ defmodule LoopctlWeb.CapabilityController do
   )
 
   @doc "GET /api/v1/stories/:id/capabilities"
-  def index(conn, %{"id" => story_id}) do
+  def index(conn, %{"id" => raw_story_id}) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
-    caps =
-      case Dispatches.lineage_for_api_key(tenant_id, api_key.id) do
-        [] -> Capabilities.list_for_assigned_agent(tenant_id, story_id, api_key.agent_id)
-        lineage -> Capabilities.list_for_lineage(tenant_id, story_id, lineage)
-      end
+    # story_id is client input: uncast, a non-UUID raises Ecto.Query.CastError.
+    case Ecto.UUID.cast(raw_story_id) do
+      {:ok, story_id} ->
+        caps =
+          case Dispatches.lineage_for_api_key(tenant_id, api_key.id) do
+            [] -> assigned_agent_caps(tenant_id, story_id, api_key)
+            lineage -> Capabilities.list_for_lineage(tenant_id, story_id, lineage)
+          end
 
-    json(conn, %{data: Enum.map(caps, &Capabilities.serialize/1)})
+        json(conn, %{data: Enum.map(caps, &Capabilities.serialize/1)})
+
+      :error ->
+        {:error, :not_found}
+    end
   end
+
+  # ASSIGNMENT fallback, agent-role only — see the moduledoc.
+  defp assigned_agent_caps(tenant_id, story_id, %{role: :agent} = api_key) do
+    Capabilities.list_for_assigned_agent(tenant_id, story_id, api_key.agent_id)
+  end
+
+  defp assigned_agent_caps(_tenant_id, _story_id, _api_key), do: []
 end

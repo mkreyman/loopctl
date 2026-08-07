@@ -301,7 +301,7 @@ Capability tokens are minted at specific transition points:
 - **`claim_story` → `assigned`**: mints a `start_cap` issued to the claiming agent's lineage. The response body carries the `start_cap`.
 - **`start_story` → `implementing`**: consumes the `start_cap`. Mints nothing.
 - **`report_story` → `reported_done`**: consumes NO capability — see "Why report and verify are not capability-gated" below. Loopctl selects a verifier lineage (via the rotating-verifier protocol in §6) and records it on the story as `verifier_dispatch_id`.
-- **`verify_story` → `verified`**: consumes NO capability. The recorded verifier lineage is the gate.
+- **`verify_story` → `verified`**: consumes NO capability. The CALLER's server-resolved lineage, compared against the implementer's, is the gate — plus the recorded verifier lineage whenever `request_review` selected one.
 
 The `start_cap` is minted once and consumed once. Loopctl records every mint and every consumption in the audit chain.
 
@@ -334,16 +334,21 @@ whose only reachable holder is forbidden to spend it is not a gate.
 
 Both transitions are therefore gated by L4 structural separation: agent-id AND
 dispatch-lineage comparison, failing closed on a custody-unattributed story or an
-unresolvable dispatch, plus the `exact_role` plugs. The loopctl-SELECTED verifier
-lineage still does the work the `verify_cap` was meant to do — it is written to
-`verifier_dispatch_id` and compared at verify time — it just is not carried as a
-bearer token the entitled principal cannot obtain.
+unresolvable dispatch, plus the `exact_role` plugs. What the cap's exact-lineage
+match actually bought was a binding to the CALLER, so verify now makes that binding
+directly: it compares the caller's server-resolved lineage against the implementer's
+on EVERY path, which matters because `request_review` is optional and
+`verifier_dispatch_id` may be nil. The loopctl-SELECTED verifier lineage is compared
+in addition whenever it was recorded — it just is not carried as a bearer token the
+entitled principal cannot obtain.
 
 ### 5.3 Verification
 
-Every custody-critical endpoint extracts the cap from the request body and validates:
+`start_story`, the one transition that consumes a cap, extracts it from the request body and validates:
 
-1. Signature matches the tenant's audit public key
+1. Signature matches the tenant's audit public key — or a historical key whose
+   `[rotated_in, rotated_out)` window covers `issued_at`, so a key rotation degrades an
+   outstanding token to a normal refusal instead of a byzantine `invalid_signature` halt
 2. `typ` matches the endpoint
 3. `story_id` matches the path parameter
 4. `tenant_id` matches the authenticated caller's tenant

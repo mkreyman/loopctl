@@ -728,8 +728,9 @@ defmodule Loopctl.ApiSpec.Schemas do
     OpenApiSpex.schema(%{
       title: "CapabilityListResponse",
       description:
-        "Live capability tokens already issued to the caller's own dispatch lineage for a " <>
-          "story. Empty when the caller's key was not minted by a dispatch.",
+        "Live capability tokens already issued to the CALLER for a story. Scoped by the " <>
+          "caller's dispatch lineage, or — for an agent key not minted by a dispatch — by " <>
+          "the story's assigned agent. Empty when neither matches.",
       type: :object,
       required: [:data],
       properties: %{

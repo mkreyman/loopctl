@@ -196,32 +196,49 @@ defmodule Loopctl.Capabilities do
   end
 
   defp verify_signature(tenant_id, cap) do
+    message =
+      build_message(
+        tenant_id,
+        cap.typ,
+        cap.story_id,
+        cap.issued_to_lineage,
+        cap.issued_at,
+        cap.expires_at,
+        cap.nonce
+      )
+
+    # No candidate key (tenant has none, and no history covers issued_at) means
+    # `Enum.any?/2` over `[]` — still fails CLOSED.
+    Enum.any?(signing_keys(tenant_id, cap.issued_at), fn pub_key ->
+      :crypto.verify(:eddsa, :sha512, message, cap.signature, [pub_key, :ed25519])
+    end)
+  end
+
+  # The tenant's CURRENT audit key, plus any historical key whose
+  # [rotated_in, rotated_out) window covers the token's issuance. A rotation is a
+  # documented tenant operation; without the history a benign rotation turned every
+  # outstanding token into `:invalid_signature`, which is BYZANTINE and halts the
+  # whole tenant — the same blast radius #621 removed for expiry.
+  defp signing_keys(tenant_id, issued_at) do
     import Ecto.Query
 
-    pub_key =
+    current =
       from(t in Loopctl.Tenants.Tenant,
         where: t.id == ^tenant_id,
         select: t.audit_signing_public_key
       )
       |> AdminRepo.one()
 
-    if pub_key do
-      message =
-        build_message(
-          tenant_id,
-          cap.typ,
-          cap.story_id,
-          cap.issued_to_lineage,
-          cap.issued_at,
-          cap.expires_at,
-          cap.nonce
-        )
+    historical =
+      from(h in Loopctl.Tenants.AuditKeyHistory,
+        where:
+          h.tenant_id == ^tenant_id and h.rotated_in <= ^issued_at and
+            (is_nil(h.rotated_out) or h.rotated_out > ^issued_at),
+        select: h.public_key
+      )
+      |> AdminRepo.all()
 
-      :crypto.verify(:eddsa, :sha512, message, cap.signature, [pub_key, :ed25519])
-    else
-      # No public key — can't verify, reject
-      false
-    end
+    Enum.reject([current | historical], &is_nil/1)
   end
 
   defp build_message(tenant_id, typ, story_id, lineage, issued_at, expires_at, nonce) do
