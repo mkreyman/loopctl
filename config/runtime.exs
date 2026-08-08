@@ -194,33 +194,34 @@ config :loopctl,
        :ingest_backlog_retry_after_seconds,
        Loopctl.ObanConfig.ingest_backlog_retry_after_seconds()
 
-# Cloak Vault — key from environment in all environments where CLOAK_KEY is set.
+# Cloak Vault — keys from environment in all environments where CLOAK_KEY is set.
 # In production, CLOAK_KEY is required — startup fails if it is missing.
-if config_env() == :prod do
-  cloak_key =
+#
+# CLOAK_KEY is the ACTIVE key: every new write is encrypted with it, stamped with
+# CLOAK_KEY_TAG. CLOAK_RETIRED_KEYS carries the previous keys as `TAG:BASE64_KEY` entries
+# so rows written before a rotation stay readable — a secret update, no code change. Every
+# malformed or tag-colliding entry aborts the boot (a dropped retired key is unreadable
+# data, not a degraded config); the parsing and its rationale live in `Loopctl.Config`, and
+# `docs/runbooks/cloak-key-rotation.md` is the operator procedure.
+cloak_key =
+  if config_env() == :prod do
     System.get_env("CLOAK_KEY") ||
       raise """
       environment variable CLOAK_KEY is missing.
       Generate one with: :crypto.strong_rand_bytes(32) |> Base.encode64() |> IO.puts()
       """
-
-  config :loopctl, Loopctl.Vault,
-    ciphers: [
-      default: {
-        Cloak.Ciphers.AES.GCM,
-        tag: "AES.GCM.V1", key: Base.decode64!(cloak_key), iv_length: 12
-      }
-    ]
-else
-  if cloak_key = System.get_env("CLOAK_KEY") do
-    config :loopctl, Loopctl.Vault,
-      ciphers: [
-        default: {
-          Cloak.Ciphers.AES.GCM,
-          tag: "AES.GCM.V1", key: Base.decode64!(cloak_key), iv_length: 12
-        }
-      ]
+  else
+    System.get_env("CLOAK_KEY")
   end
+
+if cloak_key do
+  config :loopctl, Loopctl.Vault,
+    ciphers:
+      Loopctl.Config.cloak_ciphers!(
+        cloak_key,
+        System.get_env("CLOAK_KEY_TAG"),
+        System.get_env("CLOAK_RETIRED_KEYS")
+      )
 end
 
 if config_env() == :prod do
