@@ -7,6 +7,8 @@ defmodule Loopctl.Capabilities do
   a specific story, lineage, and operation type.
   """
 
+  require Logger
+
   alias Loopctl.AdminRepo
   alias Loopctl.Capabilities.CapabilityToken
   alias Loopctl.TenantKeys
@@ -35,27 +37,60 @@ defmodule Loopctl.Capabilities do
     expires_at = DateTime.add(now, @cap_ttl_seconds, :second)
     nonce = :crypto.strong_rand_bytes(32)
 
-    case TenantKeys.get_private_key(tenant_id) do
-      {:ok, private_key} ->
-        message = build_message(tenant_id, typ, story_id, lineage, now, expires_at, nonce)
-        signature = :crypto.sign(:eddsa, :sha512, message, [private_key, :ed25519])
-
-        %CapabilityToken{tenant_id: tenant_id}
-        |> CapabilityToken.changeset(%{
-          typ: typ,
-          story_id: story_id,
-          issued_to_lineage: lineage,
-          issued_at: now,
-          expires_at: expires_at,
-          nonce: nonce,
-          signature: signature
-        })
-        |> AdminRepo.insert()
-
-      {:error, reason} ->
-        {:error, {:key_unavailable, reason}}
+    # The mint VERIFIES ITS OWN SIGNATURE against the key the tenant ADVERTISES
+    # before persisting anything: a rotation commits the new public key BEFORE the
+    # new secret is readable (the Fly adapter reads `System.get_env/1`, which needs
+    # a deploy), so the signer here can be the RETIRED half — and that token later
+    # lands as `capability_forged`, `byzantine: true`, about an agent that did
+    # nothing wrong. A signature that could not be PRODUCED at all is reported
+    # separately (`:signing_key_malformed`): the remedy is corrupt key material in
+    # the secret store, not a rotation an operator would go looking for.
+    with {:ok, private_key} <- TenantKeys.get_private_key(tenant_id),
+         message = build_message(tenant_id, typ, story_id, lineage, now, expires_at, nonce),
+         {:ok, signature} <- sign(message, private_key),
+         true <- verifies?(current_key(tenant_id).public_key, message, signature) do
+      %CapabilityToken{tenant_id: tenant_id}
+      |> CapabilityToken.changeset(%{
+        typ: typ,
+        story_id: story_id,
+        issued_to_lineage: lineage,
+        issued_at: now,
+        expires_at: expires_at,
+        nonce: nonce,
+        signature: signature
+      })
+      |> AdminRepo.insert()
+    else
+      false -> {:error, {:key_unavailable, :signing_key_superseded}}
+      :error -> {:error, {:key_unavailable, :signing_key_malformed}}
+      {:error, reason} -> {:error, {:key_unavailable, reason}}
     end
   end
+
+  # A secret store that is momentarily unreachable is RETRYABLE, and so is
+  # `:signing_key_superseded`: it is the window between a rotation committing the
+  # new public key and the deploy that makes the new private half readable, which
+  # closes on its own. A key that is ABSENT, CORRUPT, belongs to no tenant, or
+  # whose store is not configured at all is a persistent OPERATOR condition, and
+  # answering it as retryable made agents hot-loop a claim they cannot fix.
+  @persistent_key_faults [
+    :not_found,
+    :tenant_not_found,
+    :corrupt_secret,
+    :corrupt_secrets_file,
+    :signing_key_malformed,
+    :fly_not_configured
+  ]
+
+  @doc "Classifies a `mint/4` failure into the error its caller should answer with."
+  @spec mint_failure_class(term()) :: :capability_key_unavailable | :capability_mint_failed
+  def mint_failure_class({:key_unavailable, reason}) when reason in @persistent_key_faults,
+    do: :capability_key_unavailable
+
+  def mint_failure_class({:key_unavailable, {:secrets_file_unreadable, _reason}}),
+    do: :capability_key_unavailable
+
+  def mint_failure_class(_reason), do: :capability_mint_failed
 
   @doc """
   Verifies a capability token against the expected parameters.
@@ -63,8 +98,31 @@ defmodule Loopctl.Capabilities do
   Checks (`validate_cap/6`, in order): type match, story match, lineage exact
   match, not expired, not consumed, and a valid ed25519 SIGNATURE over the
   token's fields, verified against the tenant's `audit_signing_public_key`
-  (`verify_signature/2`). The signature check fails CLOSED when the tenant has
+  (`check_signature/2`). The signature check fails CLOSED when the tenant has
   no public key — it is the only cryptographic check here, so never drop it.
+
+  A signature that does not verify yields ONE OF TWO reasons, and they are not
+  interchangeable:
+
+    * `:invalid_signature` — the key that was in force when the token was issued
+      IS available, and the signature did not verify against it. That is a
+      forgery signal, recorded as `capability_forged` with `byzantine: true` in
+      the append-only audit chain.
+    * `:signing_key_unavailable` — there is no USABLE key to check against: the
+      audit key was cleared, was replaced without a `tenant_audit_key_history`
+      row covering the token's `issued_at`, or the advertised public key no
+      longer corresponds to the private key the tenant signs with. The token is
+      refused the same way, but it is an OPERATOR key-state fault, not evidence
+      about the caller. Branding it a forgery writes a permanent false accusation
+      into a log that by construction cannot be retracted.
+
+  The distinction is derived entirely from SERVER state (the tenant row, the key
+  history, and a keypair-coherence probe against the tenant's own signing key),
+  never from the presented token, so it cannot be steered by a caller to
+  downgrade its own forgery. A probe that could not RUN — the secret store is
+  unreachable, or its failure is negatively cached — is INCONCLUSIVE and leaves
+  the forgery classification standing: turning the detection off for as long as
+  an unrelated dependency is unhappy would hand an attacker the switch.
   """
   @spec verify(Ecto.UUID.t(), map()) ::
           {:ok, CapabilityToken.t()} | {:error, atom()}
@@ -190,12 +248,15 @@ defmodule Loopctl.Capabilities do
       cap.issued_to_lineage != caller_lineage -> {:error, :wrong_lineage}
       DateTime.compare(cap.expires_at, now) != :gt -> {:error, :expired}
       cap.consumed_at != nil -> {:error, :replay}
-      not verify_signature(tenant_id, cap) -> {:error, :invalid_signature}
-      true -> {:ok, cap}
+      true -> check_signature(tenant_id, cap)
     end
   end
 
-  defp verify_signature(tenant_id, cap) do
+  # Fails CLOSED on every path — the only question this decides is WHICH refusal,
+  # and therefore what the audit chain is made to assert about the caller.
+  defp check_signature(tenant_id, cap) do
+    %{current: current, historical: historical} = signing_context(tenant_id, cap.issued_at)
+
     message =
       build_message(
         tenant_id,
@@ -207,27 +268,113 @@ defmodule Loopctl.Capabilities do
         cap.nonce
       )
 
-    # No candidate key (tenant has none, and no history covers issued_at) means
-    # `Enum.any?/2` over `[]` — still fails CLOSED.
-    Enum.any?(signing_keys(tenant_id, cap.issued_at), fn pub_key ->
-      :crypto.verify(:eddsa, :sha512, message, cap.signature, [pub_key, :ed25519])
-    end)
+    candidates = Enum.reject([current.public_key | historical], &is_nil/1)
+
+    cond do
+      Enum.any?(candidates, &verifies?(&1, message, cap.signature)) ->
+        {:ok, cap}
+
+      issuance_key_available?(tenant_id, current, historical, cap.issued_at) ->
+        {:error, :invalid_signature}
+
+      true ->
+        {:error, :signing_key_unavailable}
+    end
   end
 
-  # The tenant's CURRENT audit key, plus any historical key whose
-  # [rotated_in, rotated_out) window covers the token's issuance. A rotation is a
-  # documented tenant operation; without the history a benign rotation turned every
-  # outstanding token into `:invalid_signature`, which is BYZANTINE and halts the
-  # whole tenant — the same blast radius #621 removed for expiry.
-  defp signing_keys(tenant_id, issued_at) do
+  # Was the key that was IN FORCE at `issued_at` available to check against?
+  #
+  #   * a history row covering `issued_at` IS that key, by definition; or
+  #   * the tenant's current key, when nothing has been rotated in since
+  #     `issued_at` AND that key is still the one the tenant signs with.
+  # None of that holds when the audit key was CLEARED, REPLACED WITHOUT HISTORY
+  # (rotated in after issuance, nothing archived), or replaced OUT OF BAND — the
+  # last is why `audit_key_rotated_at` cannot decide this alone: a direct UPDATE
+  # of the key leaves the timestamp untouched, so a stale-but-earlier `rotated_at`
+  # reads as "in force since before issuance" and every outstanding token becomes
+  # a forgery. KEYPAIR COHERENCE is the discriminator a timestamp cannot be: a
+  # public key that does not correspond to the private key we sign with could not
+  # have verified an authentic token either, so it is key state, not the caller.
+  #
+  # The current key stays a verification CANDIDATE regardless of this test: a
+  # rotation committing between `mint/4`'s timestamp and its signature would put
+  # `issued_at` before `audit_key_rotated_at` on a token it genuinely signed.
+  defp issuance_key_available?(tenant_id, current, historical, issued_at) do
+    cond do
+      historical != [] -> true
+      is_nil(current.public_key) -> false
+      rotated_after?(current.rotated_at, issued_at) -> false
+      true -> keypair_coherence(tenant_id, current.public_key) != :incoherent
+    end
+  end
+
+  defp rotated_after?(nil, _issued_at), do: false
+  defp rotated_after?(at, issued_at), do: DateTime.compare(at, issued_at) == :gt
+
+  # Does the private key we would SIGN with still correspond to the public key the
+  # tenant ADVERTISES? Only `:incoherent` — the probe RAN and disagreed — may
+  # soften a refusal, because only that is evidence about the key. `:unknown` (the
+  # probe could not run: unreachable or negatively-cached secret store, unusable
+  # key material) learns nothing, so the timestamp/history decision stands and a
+  # bad signature is still a forgery; collapsing the two suppressed every
+  # `capability_forged` entry for as long as the store stayed unhappy.
+  defp keypair_coherence(tenant_id, public_key) do
+    with {:ok, private_key} <- TenantKeys.get_private_key(tenant_id),
+         probe = "loopctl:cap-keypair-probe:" <> tenant_id,
+         {:ok, signature} <- sign(probe, private_key) do
+      if verifies?(public_key, probe, signature), do: :coherent, else: :incoherent
+    else
+      _ ->
+        Logger.warning(
+          "capability_keypair_probe_degraded: could not read the tenant's signing key, so " <>
+            "keypair coherence is unknown and the signature classification stands as-is " <>
+            "tenant_id=#{tenant_id}"
+        )
+
+        :unknown
+    end
+  end
+
+  # The tenant's CURRENT advertised key and the instant it was rotated in. ONE
+  # definition of "current key" in this module: `mint/4` checks its own signature
+  # against it and `signing_context/2` offers it as a verification candidate.
+  defp current_key(tenant_id) do
     import Ecto.Query
 
-    current =
-      from(t in Loopctl.Tenants.Tenant,
-        where: t.id == ^tenant_id,
-        select: t.audit_signing_public_key
-      )
-      |> AdminRepo.one()
+    from(t in Loopctl.Tenants.Tenant,
+      where: t.id == ^tenant_id,
+      select: %{public_key: t.audit_signing_public_key, rotated_at: t.audit_key_rotated_at}
+    )
+    |> AdminRepo.one()
+    |> Kernel.||(%{public_key: nil, rotated_at: nil})
+  end
+
+  # Malformed key material RAISES out of :crypto rather than answering false. It
+  # is reported as `:error` — NOT as an empty signature — because "no signature
+  # could be produced" and "a signature that did not verify" have different
+  # operator remedies, and the empty binary made the first read as the second.
+  defp sign(message, private_key) do
+    {:ok, :crypto.sign(:eddsa, :sha512, message, [private_key, :ed25519])}
+  rescue
+    _ -> :error
+  end
+
+  defp verifies?(nil, _message, _signature), do: false
+
+  defp verifies?(public_key, message, signature) do
+    :crypto.verify(:eddsa, :sha512, message, signature, [public_key, :ed25519])
+  rescue
+    _ -> false
+  end
+
+  # The tenant's CURRENT audit key (with the instant it was rotated in), plus any
+  # historical key whose [rotated_in, rotated_out) window covers the token's
+  # issuance. A rotation is a documented tenant operation; without the history a
+  # benign rotation turned every outstanding token into `:invalid_signature`,
+  # which is BYZANTINE and halts the whole tenant — the same blast radius #621
+  # removed for expiry.
+  defp signing_context(tenant_id, issued_at) do
+    import Ecto.Query
 
     historical =
       from(h in Loopctl.Tenants.AuditKeyHistory,
@@ -238,7 +385,7 @@ defmodule Loopctl.Capabilities do
       )
       |> AdminRepo.all()
 
-    Enum.reject([current | historical], &is_nil/1)
+    %{current: current_key(tenant_id), historical: Enum.reject(historical, &is_nil/1)}
   end
 
   defp build_message(tenant_id, typ, story_id, lineage, issued_at, expires_at, nonce) do

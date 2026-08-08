@@ -41,6 +41,79 @@ All notable changes to loopctl are documented here.
 
 ### Fixed
 
+- **A missing audit signing key is no longer recorded as a forged capability.** When a
+  presented capability's signature could not be checked AT ALL — the tenant's
+  `audit_signing_public_key` was cleared, or was replaced out of band without a
+  `tenant_audit_key_history` row covering the token's `issued_at` — the refusal was written
+  to the append-only, hash-chained audit log as `capability_forged` with
+  `payload.byzantine: true`. That is a permanent accusation against an agent that did
+  nothing wrong: an authentic token fails identically in that key state, so the reason
+  carried no information about the caller, and an append-only record cannot be retracted.
+  Such a refusal is now `capability_key_unavailable` with `payload.byzantine: false` and
+  reason `signing_key_unavailable`. A signature that fails against a key that IS available
+  is still `capability_forged` / `byzantine: true` — and the two are now told apart by
+  whether the tenant's advertised public key still CORRESPONDS to the private key it signs
+  with, not by `audit_key_rotated_at` alone (an out-of-band `UPDATE` of the key leaves that
+  timestamp untouched, so it read every outstanding token as a forgery). `mint` refuses
+  symmetrically: it verifies its own signature against the advertised key before issuing,
+  so a rotation whose new secret is not deployed yet fails the MINT instead of issuing a
+  token that will later be called forged. **New response:** the operation still fails
+  closed, but with `503 capability_key_unavailable` and NO `Retry-After` rather than `403
+  missing_capability` — the latter's documented remedy is `recover-cap`, which mints
+  through the same unusable key, so callers were sent round a loop only an operator can
+  break. **Operator action:** if you see
+  `capability_key_unavailable`, restore or re-archive the tenant's audit key; existing
+  `capability_forged` entries written before this change may be false positives for
+  tenants whose key was cleared or rotated out of band, and should be re-read against the
+  tenant's key history rather than treated as evidence.
+
+- **A claim that cannot mint its capability no longer commits.** For a tenant with an audit
+  signing key, `POST /stories/:id/claim` minted the `start_cap` AFTER its transaction
+  committed. If minting failed (an unreachable secret store), the story was claimed with no
+  capability and no way forward: `start` demands one, `GET /stories/:id/capabilities` only
+  delivers tokens already minted, and `recover-cap` needs an `implementer_dispatch_id` that
+  a legacy bearer claim never records. Minting is now part of the claim transaction, so the
+  claim either delivers a usable capability or does not happen. **New responses:** `503
+  capability_mint_failed` with a `Retry-After` when the condition clears on its own — the
+  secret store merely blipped, or a rotation's new private half is not deployed yet — and
+  `503 capability_key_unavailable` with NO `Retry-After` when the audit key is absent or
+  corrupt, which no amount of retrying can clear. A claim whose own audit or webhook step
+  fails now answers `500 claim_failed` (nothing was claimed; retry) instead of crashing the
+  request. Keyless (pre-v2) tenants are unaffected — they claim with no capability, as
+  before.
+
+- **Capability recovery binds to the CALLER's dispatch lineage, so it works after a crash.**
+  `POST /stories/:id/recover-cap` minted a `start_cap` bound to the lineage recorded on the
+  story's ORIGINAL implementer dispatch. A capability matches its lineage exactly, and the
+  situation recovery exists for is precisely the one where that session died and the agent
+  came back under a new dispatch — so the recovered token was unconsumable by the only
+  principal entitled to spend it. It now binds to the caller's server-resolved lineage,
+  which grants nothing new (the caller is already verified as the story's assigned agent,
+  and `start` re-checks that). **Behaviour changes:** an implementer dispatch that has
+  merely EXPIRED no longer blocks recovery (a revoked one still does, as `422
+  dispatch_revoked`); and a caller whose key no dispatch minted is refused with `409
+  caller_lineage_required` on dispatch-minted work. Recovery deliberately never rewrites
+  `implementer_dispatch_id`, and it does NOT require the caller to share a custody ROOT with
+  it: the crash it recovers from can take the whole tree with it, and the story's assigned
+  agent plus the `assigned_agent_id` equality every L4 gate runs is what keeps a recovered
+  agent from reporting its own work. Every refusal from this endpoint now carries a stable `error.code`, the catch-all
+  no longer renders an internal error term into the response body (it is logged instead),
+  and a mint failure answers with the same status and code as `claim` does (`503`, not the
+  previous `422 cap_mint_failed`).
+
+- **The egress pin cache is bounded per tenant, not only globally.** Every host it holds
+  arrives from tenant-writable input (a webhook destination, an ingest URL, a chat base
+  url), so one tenant registering fresh hostnames in a loop could fill the single global
+  50k-entry cap and get every OTHER tenant's next classification refused admission — a
+  shared cache turned into a cross-tenant denial. Admission is now also capped per tenant.
+  Past the cap new hosts are simply re-classified on demand (a `Logger.warning` names the
+  tenant); no verdict changes. Each SHAPE has its own per-tenant budget, because they grow
+  for different reasons: pins and the negative cache for hosts that fail to resolve are
+  capped separately (so a run of DNS misses cannot starve a tenant's real pins, and neither
+  shape can reach the global cap alone), while a scope's `local_only` marking is bounded by
+  the tenant's scope count rather than by request volume. The global cap still bounds all
+  three.
+
 - **The story lifecycle is completable again for tenants with an audit signing key (#621).**
   Every tenant created through the current signup flow has one, and for those tenants the
   capability layer rejected start/report/verify because NO client-facing path ever handed the
