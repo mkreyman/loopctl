@@ -7385,7 +7385,14 @@ defmodule Loopctl.Knowledge do
                    # without an embedding are excluded). Use knowledge_stats for the
                    # full wiki size.
                    total_count_scope: "ranked_corpus",
-                   pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
+                   pool_capped:
+                     semantic_pool_capped?(
+                       total_count,
+                       length(results),
+                       limit,
+                       offset,
+                       semantic_result_pool_cap()
+                     )
                  }
                  |> Map.merge(legacy_system_corpus_meta())
                  |> Map.merge(HeavyRead.iterative_scan_meta(heavy_opts))
@@ -7464,7 +7471,9 @@ defmodule Loopctl.Knowledge do
             err
 
           total_count ->
-            results = hydrate_semantic_pool(tenant_id, pool_rows, status, opts, limit, offset)
+            {results, survived} =
+              hydrate_semantic_pool(tenant_id, pool_rows, status, opts, limit, offset)
+
             maybe_record_search_access(tenant_id, results, nil, opts, "semantic")
 
             {:ok,
@@ -7478,7 +7487,18 @@ defmodule Loopctl.Knowledge do
                    search_mode: "semantic_only",
                    total_count_scope: "ranked_corpus",
                    embedding_dimension: dimension,
-                   pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
+                   pool_capped:
+                     semantic_pool_capped?(
+                       total_count,
+                       length(results),
+                       limit,
+                       offset,
+                       semantic_side_table_response_reach(
+                         inner_pool,
+                         length(pool_rows),
+                         survived
+                       )
+                     )
                  }
                  |> Map.merge(semantic_disclosure_meta(tenant_id, dimension))
                  # Derived from `pool_opts` — the opts the inner ANN ACTUALLY ran with —
@@ -7518,7 +7538,7 @@ defmodule Loopctl.Knowledge do
   # :system` and RETURNS them. Once a tenant materializes the system corpus
   # (AC-41.1.7), `length(results)` could therefore exceed `total_count`, breaking the
   # documented `total_count_scope: ranked_corpus` contract and making
-  # `semantic_pool_capped?/4` emit a wrong truncation signal (degenerately:
+  # `semantic_pool_capped?/5` emit a wrong truncation signal (degenerately:
   # `total_count: 0` alongside non-empty results).
   #
   # The join to `articles` is dropped entirely rather than OR-broadened: an
@@ -7564,7 +7584,10 @@ defmodule Loopctl.Knowledge do
   # is RLS-equivalently scoped to this tenant's OWN embedding rows, and the predicate
   # here re-asserts `tenant_id == ^tenant_id or scope == :system` — the same explicit
   # predicate `fetch_stub_projection/3` and the keyword path already use.
-  defp hydrate_semantic_pool(_tenant_id, [], _status, _opts, _limit, _offset), do: []
+  # Returns `{page, survived}` — the page AND how many ANN candidates survived the
+  # post-ANN trim, which is what `semantic_side_table_response_reach/3` needs to tell a
+  # complete page from one whose window was eaten by discarded rows.
+  defp hydrate_semantic_pool(_tenant_id, [], _status, _opts, _limit, _offset), do: {[], 0}
 
   defp hydrate_semantic_pool(tenant_id, pool_rows, status, opts, limit, offset) do
     scores =
@@ -7599,11 +7622,14 @@ defmodule Loopctl.Knowledge do
     # side-table design must avoid).
     emit_side_table_underfill(tenant_id, length(pool_rows), length(filtered), limit)
 
-    filtered
-    |> Enum.map(&Map.put(&1, :similarity_score, Map.fetch!(scores, &1.id)))
-    |> Enum.sort_by(& &1.similarity_score, :desc)
-    |> Enum.drop(offset)
-    |> Enum.take(limit)
+    page =
+      filtered
+      |> Enum.map(&Map.put(&1, :similarity_score, Map.fetch!(scores, &1.id)))
+      |> Enum.sort_by(& &1.similarity_score, :desc)
+      |> Enum.drop(offset)
+      |> Enum.take(limit)
+
+    {page, length(filtered)}
   end
 
   defp emit_side_table_underfill(tenant_id, pool_count, filtered_count, limit) do
@@ -7689,16 +7715,62 @@ defmodule Loopctl.Knowledge do
   # ranked+filtered set may exceed what pagination can reach. Two truncation modes, both
   # flagged (a `false` therefore means "this query's results are complete"):
   #
-  #   * CAP truncation — `total_count > cap`: the corpus is larger than the reachable pool
-  #     (true regardless of `offset`, even on a full page).
+  #   * CAP truncation — `total_count > reach`: the corpus is larger than the deepest
+  #     reachable pool (true regardless of `offset`, even on a full page).
   #   * POOL/FILTER starvation — a SHORT page (`returned < limit`) while MORE filtered
   #     results exist than were surfaced (`offset + returned < total_count`). This catches
-  #     the case a `total_count > cap`-only check MISSED: a selective filter whose matches
+  #     the case a `total_count > reach`-only check MISSED: a selective filter whose matches
   #     fall outside the top-`pool` nearest starves the page below the cap. (A genuine
   #     last page — `offset + returned == total_count` — is NOT flagged.)
-  defp semantic_pool_capped?(total_count, returned, limit, offset) do
-    total_count > semantic_result_pool_cap() or
+  #
+  # `reach` is PER-PATH and is passed in, never re-derived here: the legacy path pages
+  # within the top-`cap` pool, while the side-table path hydrates from an OVER-FETCHED ANN
+  # pool that is bounded by `hnsw.ef_search` and then trimmed by the post-ANN
+  # status/visibility filters — so its reach is `semantic_side_table_response_reach/3`,
+  # which is neither the raw cap (that claimed truncation on a complete page whenever the
+  # corpus sat between `cap` and the over-fetch) nor the raw over-fetch (that claimed
+  # completeness on a corpus the ef_search ceiling or the trim put out of reach).
+  defp semantic_pool_capped?(total_count, returned, limit, offset, reach) do
+    total_count > reach or
       (returned < limit and offset + returned < total_count)
+  end
+
+  # The reach for THIS side-table response. `semantic_side_table_reach/0` counts ANN
+  # CANDIDATE slots, while `total_count` counts rows that SURVIVE the post-ANN
+  # status/visibility trim (predicates the side-table inner index cannot carry). So when
+  # the ANN window saturated AND part of it was discarded, every ranked row past that
+  # window is unreachable at ANY offset and what survived IS the reach — otherwise a FULL
+  # page over a mostly-draft corpus reports "complete" while most of `total_count` is
+  # unreachable, and the starvation arm cannot catch it (that arm needs a SHORT page).
+  #
+  # Public-but-`@doc false`: the three branches are asserted directly, since staging a
+  # saturated-and-trimmed ANN window through the SHARED test index would take a corpus
+  # large enough to make the guard itself an approximate-recall coin flip.
+  @doc false
+  @spec semantic_side_table_response_reach(pos_integer(), non_neg_integer(), non_neg_integer()) ::
+          non_neg_integer()
+  def semantic_side_table_response_reach(inner_pool, pool_count, survived) do
+    if pool_count >= VectorSearch.side_table_ef_search(inner_pool) and survived < pool_count do
+      survived
+    else
+      semantic_side_table_reach()
+    end
+  end
+
+  # The deepest row the side-table path can surface at ANY offset: the pool is clamped to
+  # the cap and the inner ANN over-fetches `side_table_over_fetch/0` times that — but an
+  # HNSW scan only returns ~`hnsw.ef_search` nodes regardless of the LIMIT, so
+  # `side_table_ef_search/1` (the SAME clamp the read itself applies) has the last word.
+  # Without it the prod reach was overstated 4x — `4 * cap` = 4000 against a 1000-node
+  # ceiling — reporting "complete" for every corpus between the two.
+  #
+  # Public-but-`@doc false`, and takes the cap, so the guard test can drive it with a cap
+  # whose over-fetch actually blows past the ceiling — at the test cap it does not, and a
+  # guard that only reads the configured value passes with the clamp deleted.
+  @doc false
+  @spec semantic_side_table_reach(pos_integer()) :: pos_integer()
+  def semantic_side_table_reach(cap \\ semantic_result_pool_cap()) do
+    VectorSearch.side_table_ef_search(VectorSearch.side_table_inner_pool(cap))
   end
 
   # Builds `search_semantic`'s paginated RESULTS query (returned, not executed) — the
@@ -7826,11 +7898,20 @@ defmodule Loopctl.Knowledge do
     |> min(semantic_result_pool_cap())
   end
 
-  # The hard reachability ceiling for relevance-search pagination (US-27.7a): results come
-  # from the top-`cap` relevance pool, so a consumer can page through at most `cap` ranked
-  # rows regardless of `offset`. Drives both the results pool's hard cap and the
-  # `meta.pool_capped` truncation signal. Config `:semantic_result_pool_cap`.
-  defp semantic_result_pool_cap,
+  # The hard ceiling on the relevance POOL (US-27.7a): results are paged within the
+  # top-`cap` pool. It is the reachability ceiling on the LEGACY path only — the
+  # side-table path hydrates from `side_table_inner_pool(pool)`, so its reach is
+  # `semantic_side_table_reach/0`. Config `:semantic_result_pool_cap`.
+  #
+  # Public-but-`@doc false` so the `pool_capped` truncation tests can SEED RELATIVE TO the
+  # enforced value instead of hardcoding it. A hardcoded `cap + 2` silently decouples the
+  # moment the config moves — which is exactly how the wide `limit:` annotations in
+  # `embeddings_side_table_reads_test.exs` became decorative: every one of them was clamped
+  # back to the cap and nobody noticed, because nothing tied a test's numbers to this
+  # function. Read it, never re-derive it.
+  @doc false
+  @spec semantic_result_pool_cap() :: pos_integer()
+  def semantic_result_pool_cap,
     do:
       Application.get_env(:loopctl, :semantic_result_pool_cap, @default_semantic_result_pool_cap)
 

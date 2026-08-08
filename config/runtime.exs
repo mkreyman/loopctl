@@ -503,7 +503,15 @@ if config_env() == :prod do
   # declarations carve NOTHING out; they only change the locality VERDICT for
   # hosts that already pass the denylist.
   #
-  #   LOCAL_ENDPOINT_ALLOWLIST="127.0.0.1,localhost,ollama.internal,10.1.0.0/16"
+  # Each entry is `host[:port][@purpose[+purpose...]]` or `cidr[@purpose...]`.
+  # A carve-out grants the PURPOSE it names (`inference`, `webhook`, `ingest`);
+  # an UNQUALIFIED entry grants `inference` ONLY, so an entry made for the
+  # deployment's model endpoint does not also authorize tenant-authored webhook
+  # POSTs or ingest fetches to it. A stated PORT binds the entry to that port; an
+  # omitted one matches any. See `Loopctl.Egress.Allowlist`.
+  #
+  #   LOCAL_ENDPOINT_ALLOWLIST="127.0.0.1,localhost,ollama.internal:11434,10.1.0.0/16"
+  #   LOCAL_ENDPOINT_ALLOWLIST="10.0.0.5:9000@webhook,ollama.internal@inference+ingest"
   config :loopctl,
          :local_endpoint_allowlist,
          (System.get_env("LOCAL_ENDPOINT_ALLOWLIST") || "")

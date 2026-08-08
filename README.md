@@ -629,22 +629,46 @@ Every webhook delivery is a JSON POST with the following envelope. The `data` fi
 
 The `findings` field is a map (object) matching whatever the orchestrator passed in the reject request body. It defaults to `{}` if omitted.
 
-Payloads are signed with HMAC-SHA256 using the webhook's secret. Verify the `X-Loopctl-Signature` header to authenticate delivery.
+Payloads are signed with HMAC-SHA256 using the webhook's secret. Verify the
+`X-Webhook-Signature` header to authenticate delivery.
+
+#### Delivery headers
+
+| Header | Description |
+|--------|-------------|
+| `X-Webhook-Id` | Unique id of this delivery event. Stable across retries of the same delivery — key your replay cache on it |
+| `X-Webhook-Timestamp` | Unix seconds at send time. Convenience copy; the authoritative value is the `t=` inside the signature |
+| `X-Webhook-Signature` | `t=<unix>,v1=<hmac>` — the MAC covers `"<t>.<raw_body>"` |
+| `X-Signature-256` | **Deprecated.** `sha256=<hmac(raw_body)>`. Emitted during the migration window and then removed |
 
 #### Verifying Webhook Signatures
 
+The signed string is the timestamp, a literal `.`, and the **raw** request body
+bytes — verify against the bytes you received, never against a re-encoded parse.
+
 ```elixir
 # Elixir
-expected = :crypto.mac(:hmac, :sha256, signing_secret, raw_body)
-           |> Base.encode16(case: :lower)
-signature = "sha256=" <> expected
-# Compare with X-Loopctl-Signature header
+{:ok, timestamp, mac} = parse_signature(signature_header)   # "t=<unix>,v1=<hex>"
+
+# Reject outside a 5-minute window, so a captured signature is not honoured forever.
+if abs(System.system_time(:second) - timestamp) > 300, do: throw(:stale)
+
+expected =
+  :crypto.mac(:hmac, :sha256, signing_secret, "#{timestamp}." <> raw_body)
+  |> Base.encode16(case: :lower)
+
+Plug.Crypto.secure_compare(expected, mac)
 ```
 
 ```bash
-# Bash
-echo -n "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/.* /sha256=/'
+# Bash — recompute the v1 MAC for a given timestamp and body
+printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/.* /v1=/'
 ```
+
+Pair the timestamp window with a short-lived cache of `X-Webhook-Id` covering at
+least that window: the window bounds how long a signature is worth honouring, the
+id cache stops reuse inside it. loopctl retries a failed delivery under the same
+id, so cache on "already processed **successfully**", not "already seen".
 
 ### Rate Limiting
 
