@@ -576,24 +576,20 @@ config :loopctl, :sth_enqueuer_debounce_seconds, 5
 # `Loopctl.AuditChain.sth_needed?/1`, so a slower poll can only delay (never corrupt) an
 # STH, and only for a tenant the event path also missed, by up to one sweep interval.
 
-# Cloak Vault — key configured per environment
+# Cloak Vault — keys configured per environment
 # Generate a key: :crypto.strong_rand_bytes(32) |> Base.encode64()
-# The actual cipher is set in config/runtime.exs (prod) or config/test.exs (test).
-# Default is empty — prod will raise at startup if CLOAK_KEY is not set.
-config :loopctl, Loopctl.Vault,
-  ciphers: [],
-  retired_ciphers: [
-    # Add previous keys here during key rotation, e.g.:
-    # {Cloak.Ciphers.AES.GCM, tag: "AES.GCM.V0", key: Base.decode64!("OLD_KEY"), iv_length: 12}
-    #
-    # ROTATION RUNBOOK (#493): ingestion document content is encrypted into
-    # oban_jobs.args (Loopctl.Ingestion.ContentEnvelope). Queued :ingestion jobs live
-    # up to the 3600s unique window (longer under snooze). When rotating CLOAK_KEY,
-    # keep the OUTGOING cipher listed here until the :ingestion queue has drained —
-    # otherwise every in-flight ingestion job fails AES-GCM decrypt and is silently
-    # {:discard}ed. ContentIngestionWorker logs a Logger.warning on each such failure
-    # so a mis-sequenced rotation is alertable.
-  ]
+# The actual ciphers are set in config/runtime.exs (from CLOAK_KEY / CLOAK_KEY_TAG /
+# CLOAK_RETIRED_KEYS) or config/test.exs. Default is empty — prod raises at startup if
+# CLOAK_KEY is not set.
+#
+# ROTATION (#622, #493): retired keys are an ENV concern, not a compile-time one — set
+# CLOAK_RETIRED_KEYS and run `mix loopctl.reencrypt_secrets`. Full procedure and its
+# ordering constraints: docs/runbooks/cloak-key-rotation.md.
+#
+# There is deliberately no `retired_ciphers:` key here. Cloak reads ONLY `:ciphers`
+# (`Cloak.Vault.decrypt/2` scans that one list), so the `retired_ciphers:` this used to
+# carry was inert — a rotation that followed it would have produced undecryptable rows.
+config :loopctl, Loopctl.Vault, ciphers: []
 
 # DI: Content extractor for knowledge ingestion.
 # US-41.3: the module named here is the TENANT-AWARE ROUTER — it still is the one
