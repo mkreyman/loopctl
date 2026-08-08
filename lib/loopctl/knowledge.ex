@@ -971,10 +971,7 @@ defmodule Loopctl.Knowledge do
   defp visible_to_caller?(_article, nil), do: true
 
   defp visible_to_caller?(article, agent_id) when is_binary(agent_id) do
-    metadata = article.metadata || %{}
-    visibility = metadata["visibility"] || metadata[:visibility] || "shared"
-    owner = metadata["agent_id"] || metadata[:agent_id]
-    visibility not in ["private", "owner"] or owner == agent_id
+    not restricted?(article) or owner_of(article) == agent_id
   end
 
   # Drops preloaded links whose far-side article the caller can't see (#163), so a
@@ -1020,6 +1017,10 @@ defmodule Loopctl.Knowledge do
     from(r in ConflictResolution,
       where: r.tenant_id == ^tenant_id,
       where: r.source_article_id == ^article_id or r.target_article_id == ^article_id,
+      # Same "settled" definition the conflict queue uses: a verdict nothing will act on
+      # must not strip the conflict link from the article payload either, or the pair is
+      # invisible on BOTH surfaces an actor could rediscover it from.
+      where: ^settled_resolution(),
       select: {r.source_article_id, r.target_article_id}
     )
     |> AdminRepo.all()
@@ -3101,7 +3102,15 @@ defmodule Loopctl.Knowledge do
       # again. If you find yourself widening the window to mask a judge that is not
       # keeping up, fix the judge.
       where: l.inserted_at > ^cutoff,
-      where: not exists(conflict_unresolved_subquery()),
+      # SUPPRESSION releases on ROW EXISTENCE, deliberately NOT on `settled_resolution/0`.
+      # The queue and the suppression ask different questions of the same table: the queue
+      # asks "will anything act on this?", suppression asks "has anyone JUDGED this?".
+      # Withholding both articles from every curated answer is premised on the pair being
+      # UNJUDGED; once a verdict is recorded — even one the executor will not apply, such as
+      # a capped supersede — the suspicion has been ruled on and the corpus must come back.
+      # Holding suppression to the executor's bar meant an agent-only tenant could never
+      # release it at all.
+      where: not exists(judged_pair_subquery()),
       select: 1
     )
   end
@@ -3119,11 +3128,31 @@ defmodule Loopctl.Knowledge do
   end
 
   # THE single authority for "this potential_conflict link is still unresolved":
-  # correlated on the enclosing `as: :link` binding, TRUE when NO conflict_resolutions
-  # row exists for the pair in either direction. Every open-conflict query
-  # (open_conflict_subquery/0, article_in_open_conflict?/1, list_potential_conflicts/2)
-  # composes THIS so the definition can never drift between paths.
+  # correlated on the enclosing `as: :link` binding, TRUE when NO SETTLING
+  # conflict_resolutions row exists for the pair in either direction. The DISCOVERY surfaces
+  # — `list_potential_conflicts/2` (the queue) and the article payload's
+  # `potential_conflicts` links — compose THIS so the definition can never drift between
+  # them. Curated SUPPRESSION composes `judged_pair_subquery/0` instead; it is a different
+  # question and the split is deliberate.
+  #
+  # A row SETTLES the pair when it has been executed or closed (`executed_at` — which a
+  # `:dismiss` carries from the moment it is recorded), or when it is pending and the
+  # executor will act on it as recorded (`executable_resolution/0`). Row EXISTENCE is not
+  # enough, and that is the point: a verdict nothing will ever act on — a `:supersede`
+  # capped down from `:high`, or one whose recorder may not authorize an unattended
+  # retirement — would otherwise remove the pair from the only queue an orchestrator+ key
+  # can discover it in, leaving the documented remedy ("re-record it at :high") reachable
+  # only by someone who already memorised both article ids.
   defp conflict_unresolved_subquery do
+    from(r in pair_resolutions(), where: ^settled_resolution())
+  end
+
+  # The same correlation with NO predicate on the verdict: TRUE when ANY verdict exists for
+  # the pair. Only curated SUPPRESSION uses this — see the note at its call site for why the
+  # two questions must not share one predicate.
+  defp judged_pair_subquery, do: pair_resolutions()
+
+  defp pair_resolutions do
     from(r in ConflictResolution,
       where:
         r.tenant_id == parent_as(:link).tenant_id and
@@ -3131,6 +3160,41 @@ defmodule Loopctl.Knowledge do
               r.target_article_id == parent_as(:link).target_article_id) or
              (r.source_article_id == parent_as(:link).target_article_id and
                 r.target_article_id == parent_as(:link).source_article_id))
+    )
+  end
+
+  # "This verdict is the end of the pair's story." Actually disposed of, or pending and
+  # certain to be applied as recorded. Shared by every surface that hides a judged pair.
+  # The two branches are mutually exclusive ON `executed_at` on purpose. `executable_resolution/0`
+  # answers "WILL the executor act on this?", which is only a question about a row it has not
+  # reached yet — left ungated it also declared an ALREADY-executed row settled, so a merge
+  # skipped for `no_api_key` still qualified through the pending branch and the disposal check
+  # below could never be reached.
+  defp settled_resolution do
+    dynamic(
+      [r],
+      (not is_nil(r.executed_at) and ^disposing_outcome()) or
+        (is_nil(r.executed_at) and ^executable_resolution())
+    )
+  end
+
+  # `executed_at` alone is NOT disposal, and treating it as such reopens the same black hole
+  # from the other side. The executor stamps it on outcomes where nothing happened and
+  # nothing will: a merge skipped for `no_api_key`, a permanently failed synthesis, a
+  # supersede whose link create errored, a retracted flag. Settling on those would drop the
+  # pair out of the queue and out of the article payload with both articles untouched and no
+  # row anyone can act on — exactly the "not pending, not applied, not visible, forever"
+  # state `executable_resolution/0` exists to prevent.
+  #
+  # `action` is ABSENT on a `:dismiss` (recorded complete with an empty result) and on rows
+  # written before this field existed, so an unknown action DISPOSES — the default keeps a
+  # settled pair settled. `skipped` is split by reason: `insufficient_confidence` is a
+  # deliberate close (it disposes), `no_api_key` is a block that may lift (it does not).
+  defp disposing_outcome do
+    dynamic(
+      [r],
+      fragment("COALESCE(?->>'action', '') NOT IN ('noop', 'failed')", r.execution_result) and
+        fragment("COALESCE(?->>'reason', '') <> 'no_api_key'", r.execution_result)
     )
   end
 
@@ -3216,7 +3280,10 @@ defmodule Loopctl.Knowledge do
         where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
         where: l.source_article_id == ^article_id or l.target_article_id == ^article_id,
         where: l.inserted_at > ^cutoff,
-        where: not exists(conflict_unresolved_subquery())
+        # Row EXISTENCE, matching `open_conflict_subquery/1` — these two are one invariant
+        # applied to the per-article check and the list query, so they must release
+        # suppression on the same signal or the invariant is only half true.
+        where: not exists(judged_pair_subquery())
       )
 
     AdminRepo.exists?(query)
@@ -4343,6 +4410,15 @@ defmodule Loopctl.Knowledge do
   `attrs`: `source_article_id`, `target_article_id` (any order), `disposition`, and
   optionally `authoritative_article_id`, `classification`, `evidence`, `confidence`
   (default `:medium`). Returns `{:ok, %ConflictResolution{}}` or `{:error, changeset}`.
+
+  ## Confidence is GRANTED, never accepted (see `grant_confidence/3`)
+
+  `opts[:actor_role]` — the role of the key recording the verdict, resolved server-side
+  from the authenticating key and never client-supplied. On a `:supersede` it CAPS the
+  recorded confidence, because `confidence: :high` there is what authorizes the nightly
+  executor to retire an article with nobody watching; a `:merge` retires nothing and is
+  never capped. The role is persisted either way. A caller omitting it is recorded at the
+  lowest-trust cap: an unidentified recorder is not a privileged one.
   """
   @spec annotate_conflict(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, ConflictResolution.t()}
@@ -4369,6 +4445,8 @@ defmodule Loopctl.Knowledge do
          :ok <- validate_potential_conflict_exists(tenant_id, src, tgt) do
       disposition = get.(:disposition)
       now = DateTime.utc_now()
+      role = recorder_role(opts)
+      {confidence, requested} = grant_confidence(get.(:confidence), disposition, role)
 
       row_attrs = %{
         source_article_id: src,
@@ -4376,9 +4454,11 @@ defmodule Loopctl.Knowledge do
         authoritative_article_id: get.(:authoritative_article_id),
         classification: get.(:classification),
         disposition: disposition,
-        confidence: get.(:confidence) || :medium,
+        confidence: confidence,
+        requested_confidence: requested,
         evidence: get.(:evidence),
         annotated_by: Keyword.get(opts, :actor_label) || Keyword.get(opts, :actor_id),
+        annotated_by_role: role,
         annotated_at: now,
         # A dismiss is complete on record; supersede/merge defer to the executor.
         # Compare without to_string/1 so a non-scalar disposition (e.g. a JSON object)
@@ -4400,8 +4480,13 @@ defmodule Loopctl.Knowledge do
                :classification,
                :disposition,
                :confidence,
+               # Both provenance columns MUST be replaced with the rest. A re-annotation
+               # that carried the new verdict but kept the previous row's recorder would
+               # let a low-trust caller inherit a privileged recorder's authorization.
+               :requested_confidence,
                :evidence,
                :annotated_by,
+               :annotated_by_role,
                :annotated_at,
                :executed_at,
                :execution_result,
@@ -4421,6 +4506,76 @@ defmodule Loopctl.Knowledge do
       end
 
       result
+    end
+  end
+
+  # The roles whose recorded verdict may authorize an UNATTENDED RETIREMENT, and the one
+  # place that set is written down. Read by `grant_confidence/3` (which caps what a
+  # non-member may record) and re-checked by `executable_resolution/0` against the persisted
+  # `annotated_by_role`, so the authorization is evidenced on the row rather than recomputed
+  # from a value the request supplied.
+  @unattended_authorizing_roles ~w(orchestrator user superadmin)
+
+  # Confidence is the field that AUTHORIZES the nightly executor to retire a published
+  # article with nobody in the loop, so for `:supersede` it is granted by the server, not
+  # asserted by the caller.
+  #
+  # Why a cap rather than "record what they said and gate elsewhere": the conflict PAIR is
+  # manufacturable — the queue is populated by a mechanical similarity threshold, so the
+  # same party that records the verdict can arrange for the pair to exist. A party that can
+  # arrange the input cannot also certify its own output as trusted; that is the same
+  # structural separation the story lifecycle enforces between implementing and verifying.
+  #
+  # `:merge` is NOT capped, and that boundary is the whole point: it RETIRES NOTHING.
+  # `merge_source_articles/2` synthesizes a NEW DRAFT and leaves both sources published, so
+  # there is no unattended retirement to authorize — capping it bought no safety and turned
+  # the disposition off for the agent role the KB-content carve-out (#331) exists to serve.
+  # Curation stays agent-role in every disposition; what an agent cannot do alone is retire
+  # somebody else's article while nobody is watching.
+  #
+  # Uncapped is not ungated. A `:merge` the executor will act on still spends the tenant's
+  # paid model key and egresses both bodies, so it carries the same `evidence` requirement a
+  # `:high` supersede does (`ConflictResolution.changeset/2`), and the draft it produces
+  # inherits the most restrictive of its sources' visibility (`mergeable_visibility/2`) —
+  # the two bars that replace the cap rather than nothing replacing it.
+  #
+  # Returns `{granted, requested_when_capped}` — the caller's ask is kept only when it was
+  # lowered, so a capped verdict is auditable instead of silently rewritten.
+  defp grant_confidence(requested, disposition, role) do
+    asked = normalize_confidence(requested)
+    granted = if capped?(disposition, role), do: cap_confidence(asked), else: asked
+
+    if granted == asked, do: {granted, nil}, else: {granted, asked}
+  end
+
+  # Compared WITHOUT `to_string/1`, like every other disposition test on this path: a
+  # non-scalar disposition (a JSON object) must reach the changeset's enum cast as a 422,
+  # not raise a Protocol.UndefinedError out of the grant.
+  defp capped?(disposition, role),
+    do: disposition in [:supersede, "supersede"] and role not in @unattended_authorizing_roles
+
+  # `:high` is the only value that authorizes the unattended write, so it is the only one
+  # capped. An unrecognized value is left ALONE for the changeset's enum cast to reject —
+  # coercing it here would answer a malformed request with a silent default.
+  defp cap_confidence(:high), do: :medium
+  defp cap_confidence(other), do: other
+
+  defp normalize_confidence(nil), do: :medium
+  defp normalize_confidence("high"), do: :high
+  defp normalize_confidence("medium"), do: :medium
+  defp normalize_confidence("low"), do: :low
+  defp normalize_confidence(other), do: other
+
+  # Fail closed: an omitted or unrecognized role is recorded as `agent`, the lowest trust
+  # this surface grants. A caller that does not identify its recorder does not get the
+  # benefit of the doubt on the one field that authorizes an unattended retirement.
+  # Always a STRING, so the persisted column and the allowlist comparison are the same
+  # type at every site.
+  defp recorder_role(opts) do
+    case Keyword.get(opts, :actor_role) do
+      role when is_atom(role) and not is_nil(role) -> Atom.to_string(role)
+      role when is_binary(role) -> role
+      _ -> "agent"
     end
   end
 
@@ -4475,7 +4630,9 @@ defmodule Loopctl.Knowledge do
 
   @doc """
   Nightly executor for conflict resolutions (route-the-findings #4). Applies only
-  high-confidence, not-yet-executed rows — all reversible/non-destructive and audited:
+  high-confidence, not-yet-executed rows — and, for the one disposition that RETIRES an
+  article (`:supersede`), only those recorded by a role that may authorize an unattended
+  retirement. All reversible/non-destructive and audited:
 
     * `:supersede` — reuses `create_link/3` to create a `supersedes` link (winner → loser)
       and transition the loser to `:superseded` (reversible).
@@ -4505,7 +4662,7 @@ defmodule Loopctl.Knowledge do
         where: r.tenant_id == ^tenant_id,
         where: is_nil(r.executed_at),
         where: r.disposition in [:supersede, :merge],
-        where: r.confidence == :high,
+        where: ^executable_resolution(),
         # Deterministic OLDEST-first order (review round 4): without it Postgres can
         # return the same subset in the same arbitrary order every run, so a backlog
         # that exceeds the wall-clock budget would forever apply the same head rows and
@@ -4538,36 +4695,66 @@ defmodule Loopctl.Knowledge do
 
   # The SILENT BLACK HOLE, closed.
   #
-  # The executor above requires `confidence == :high`. A `:supersede` or `:merge` recorded at
-  # `:medium` or `:low` therefore never executes — and because the ROW EXISTS it also drops
-  # out of `list_potential_conflicts/2` (which excludes any pair with a resolution) and out of
-  # Consolidation's `judged_pairs/1`. So it vanishes from every surface while changing
-  # nothing: not pending, not applied, not visible, forever.
+  # WILL this pending row be applied as recorded? Composed into the executor AND into
+  # `conflict_unresolved_subquery/0`, so "the executor acts on it" and "the pair is settled"
+  # can never drift into disagreeing. The role check applies to `:supersede` ALONE — that is
+  # the only disposition that retires an article unattended; a `:merge` synthesizes a new
+  # draft and retires nothing, so an agent-recorded merge executes normally.
+  defp executable_resolution do
+    dynamic(
+      [r],
+      r.confidence == :high and
+        (r.disposition == :merge or r.annotated_by_role in ^@unattended_authorizing_roles)
+    )
+  end
+
+  # The executor requires `confidence == :high` (plus an authorizing recorder on a
+  # `:supersede`). A `:supersede`/`:merge` that clears neither bar never executes — and if
+  # the mere EXISTENCE of the row settled the pair it would also drop out of
+  # `list_potential_conflicts/2` and Consolidation's `judged_pairs/1`, vanishing from every
+  # surface while changing nothing: not pending, not applied, not visible, forever. That is
+  # why `conflict_unresolved_subquery/0` settles a pair on `^executable_resolution()` rather
+  # than on row existence: a verdict nothing will act on leaves the pair IN the queue, where
+  # an orchestrator+ key can find it and re-record it. That is the routing step the remedy
+  # ("re-annotate at :high confidence") needs in order to be actionable.
   #
-  # That was survivable when a human might one day re-annotate it at high confidence. With no
-  # human in the loop it is a permanent leak, and permanent leaks are exactly what a system
-  # expected to run unattended cannot have.
+  # What is closed here is the narrower case that visibility cannot help: a verdict the
+  # caller DELIBERATELY recorded below `:high` (`requested_confidence IS NULL` — nothing was
+  # capped). Re-surfacing that pair forever would just re-offer a question its judge already
+  # answered. A CAPPED row is excluded: the caller asked for `:high` and the server granted
+  # less, so it is left pending and its pair stays visible for an authorized re-record.
   #
-  # These are closed as DISMISSED rather than executed. The alternative — lowering the
-  # executor's bar to `:medium` — would let a low-confidence judgement RETIRE an article, and
-  # the confidence field exists precisely to say that judgement was not trusted. Dismissing
-  # keeps both articles, touches no article row, and is undone by re-annotating the pair at
-  # high confidence, which then executes normally. The reversible outcome is the only
-  # defensible default when nobody is going to adjudicate.
+  # Closed as DISMISSED rather than executed: lowering the executor's bar would let a
+  # judgement its own author distrusted retire an article. Dismissing keeps both articles and
+  # is undone by re-annotating the pair.
   #
-  # Logged at :warning, with the count: a steady stream here means something upstream is
-  # emitting judgements it does not believe, which is worth knowing about.
+  # Logged at :warning with the pair ids (bounded), not just a count — an operator who wants
+  # to re-record needs to know WHICH pairs were closed.
+  @logged_pairs 20
+
   defp close_unexecutable_resolutions(tenant_id) do
     now = DateTime.utc_now()
 
-    {closed, _} =
+    scope =
       from(r in ConflictResolution,
         where: r.tenant_id == ^tenant_id,
         where: is_nil(r.executed_at),
         where: r.disposition in [:supersede, :merge],
-        where: r.confidence != :high
+        where: r.confidence != :high,
+        where: is_nil(r.requested_confidence)
       )
-      |> AdminRepo.update_all(
+
+    # LIMITed to what the log prints. This SELECT exists only to name the pairs; without the
+    # limit a tenant with a large backlog materialises the entire unexecutable set every
+    # night to print twenty of them. The `closed` COUNT still comes from `update_all`, so
+    # the number stays exact while the sample stays bounded.
+    pairs =
+      AdminRepo.all(
+        from(r in scope, select: {r.source_article_id, r.target_article_id}, limit: @logged_pairs)
+      )
+
+    {closed, _} =
+      AdminRepo.update_all(scope,
         set: [
           executed_at: now,
           updated_at: now,
@@ -4575,9 +4762,10 @@ defmodule Loopctl.Knowledge do
             "action" => "skipped",
             "reason" => "insufficient_confidence",
             "detail" =>
-              "A supersede/merge below :high confidence is never executed by design. It was " <>
-                "closed as dismissed so it cannot sit invisible and unapplied forever; both " <>
-                "articles are retained. Re-annotate the pair at :high confidence to apply it."
+              "A supersede/merge deliberately recorded below :high confidence is never " <>
+                "executed by design. It was closed as dismissed so it cannot sit invisible " <>
+                "and unapplied forever; both articles are retained. Re-annotate the pair at " <>
+                ":high confidence to apply it."
           }
         ]
       )
@@ -4585,9 +4773,11 @@ defmodule Loopctl.Knowledge do
     if closed > 0 do
       Logger.warning(
         "ConflictExecutor: tenant=#{tenant_id} closed #{closed} unexecutable resolution(s) " <>
-          "(supersede/merge below :high confidence). Both articles retained in each case. A " <>
-          "persistent count here means something upstream is recording judgements it does " <>
-          "not believe."
+          "(supersede/merge deliberately recorded below :high confidence). Both articles " <>
+          "retained in each case; re-annotate to apply. Pairs: " <>
+          inspect(pairs) <>
+          ". A persistent count here means something upstream is recording judgements it " <>
+          "does not believe."
       )
     end
 
@@ -4695,15 +4885,65 @@ defmodule Loopctl.Knowledge do
     a = AdminRepo.get_by(Article, id: r.source_article_id, tenant_id: tenant_id)
     b = AdminRepo.get_by(Article, id: r.target_article_id, tenant_id: tenant_id)
 
-    if is_nil(a) or is_nil(b) do
-      mark_resolution_executed(r, %{"action" => "noop", "reason" => "source missing"})
-      false
-    else
-      do_merge(tenant_id, r, a, b)
+    case mergeable_visibility(a, b) do
+      :missing_source ->
+        mark_resolution_executed(r, %{"action" => "noop", "reason" => "source missing"})
+        false
+
+      # Two sources restricted to DIFFERENT agents have no visibility the merged draft could
+      # carry that discloses neither to the other. Refused BEFORE synthesis, so the bodies
+      # are never egressed for a draft that could not have been written safely.
+      :incompatible ->
+        mark_resolution_executed(r, %{
+          "action" => "noop",
+          "reason" => "sources are restricted to different agents"
+        })
+
+        false
+
+      {:ok, visibility} ->
+        do_merge(tenant_id, r, a, b, visibility)
     end
   end
 
-  defp do_merge(tenant_id, r, a, b) do
+  # The visibility the merged draft must carry: the MOST RESTRICTIVE of its two sources,
+  # with the owner that restriction belongs to. The synthesized body is derived from BOTH
+  # sources' full text, and `create_merged_draft/6` previously set no `visibility` key at
+  # all — which every read path COALESCEs to `shared`. A private/owner memory merged with a
+  # shared article therefore landed as a tenant-wide readable draft, promoting restricted
+  # content through a curation verdict. Same rule, and the same reason, as
+  # `merge_egress_scope/3`.
+  defp mergeable_visibility(nil, _b), do: :missing_source
+  defp mergeable_visibility(_a, nil), do: :missing_source
+
+  defp mergeable_visibility(a, b) do
+    restricted = Enum.filter([a, b], &restricted?/1)
+    owners = restricted |> Enum.map(&owner_of/1) |> Enum.uniq()
+
+    case {restricted, owners} do
+      {[], _} -> {:ok, %{}}
+      {_, [owner]} -> {:ok, %{"visibility" => restrictive_label(restricted), "agent_id" => owner}}
+      {_, _many} -> :incompatible
+    end
+  end
+
+  defp restrictive_label(restricted) do
+    if Enum.any?(restricted, &(visibility_of(&1) == "private")), do: "private", else: "owner"
+  end
+
+  defp restricted?(article), do: visibility_of(article) in ["private", "owner"]
+
+  defp visibility_of(%Article{metadata: metadata}) do
+    metadata = metadata || %{}
+    metadata["visibility"] || metadata[:visibility] || "shared"
+  end
+
+  defp owner_of(%Article{metadata: metadata}) do
+    metadata = metadata || %{}
+    metadata["agent_id"] || metadata[:agent_id]
+  end
+
+  defp do_merge(tenant_id, r, a, b, visibility) do
     scope = merge_egress_scope(tenant_id, a, b)
 
     # US-41.7 (AC-41.7.1): BOTH articles' full bodies are POSTed to the tenant's
@@ -4725,7 +4965,7 @@ defmodule Loopctl.Knowledge do
 
     case result do
       {:ok, %{title: title, body: body}} ->
-        create_merged_draft(tenant_id, r, a, title, body)
+        create_merged_draft(tenant_id, r, a, title, body, visibility)
 
       {:error, reason} ->
         handle_merge_error(r, reason)
@@ -4797,17 +5037,23 @@ defmodule Loopctl.Knowledge do
 
   defp permanent_merge_error?(_), do: false
 
-  defp create_merged_draft(tenant_id, r, source_a, title, body) do
+  defp create_merged_draft(tenant_id, r, source_a, title, body, visibility) do
     attrs = %{
       title: title,
       body: body,
       category: source_a.category,
       status: :draft,
       tags: ["merged"],
-      metadata: %{
-        "merged_from" => [r.source_article_id, r.target_article_id],
-        "conflict_resolution_id" => r.id
-      }
+      # `visibility` is the restrictive merge of both sources (see `mergeable_visibility/2`),
+      # empty when both are shared.
+      metadata:
+        Map.merge(
+          %{
+            "merged_from" => [r.source_article_id, r.target_article_id],
+            "conflict_resolution_id" => r.id
+          },
+          visibility
+        )
     }
 
     opts = [actor_type: "system", actor_label: "worker:conflict_executor"]
