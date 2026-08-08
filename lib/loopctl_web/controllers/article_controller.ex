@@ -175,6 +175,9 @@ defmodule LoopctlWeb.ArticleController do
         "`include_body=true` to also return `body`, which bounds the page by a ~5 MB " <>
         "serialized-body budget and adds `meta.next_offset`/`meta.has_more`/`meta.byte_truncated` " <>
         "for continuation. For a single full body use GET /articles/:id. " <>
+        "`idempotency_key` is a FILTER only — it is accepted here and never returned in a " <>
+        "row, so the existence check is `meta.total_count` on a key you already hold, not " <>
+        "an enumeration of the keys other callers chose. " <>
         "Role: agent+.",
     parameters: [
       category: [
@@ -204,7 +207,9 @@ defmodule LoopctlWeb.ArticleController do
       idempotency_key: [
         in: :query,
         type: :string,
-        description: "Filter by exact idempotency_key (lag-free existence check)"
+        description:
+          "Filter by exact idempotency_key (lag-free existence check). Not echoed back " <>
+            "in the rows — read `meta.total_count`."
       ],
       limit: [
         in: :query,

@@ -6,9 +6,20 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
   alias Loopctl.Knowledge.ArticleLink
   alias LoopctlWeb.ArticleJSON
 
-  defp published(tenant_id, title) do
-    fixture(:article, %{tenant_id: tenant_id, title: title, status: :published})
+  defp published(tenant_id, title, metadata \\ %{}) do
+    fixture(:article, %{
+      tenant_id: tenant_id,
+      title: title,
+      status: :published,
+      metadata: metadata
+    })
   end
+
+  # Confidence is GRANTED from the recording role, never accepted from the caller: only an
+  # orchestrator+ recorder can produce the `:high` the nightly executor acts on, and a
+  # `:high` supersede must carry its evidence. Every verdict below that is MEANT to execute
+  # therefore records as an orchestrator would. The agent-role cap has its own tests.
+  @orchestrator [actor_role: :orchestrator]
 
   defp conflict_link(tenant_id, src, tgt, score) do
     %ArticleLink{tenant_id: tenant_id}
@@ -172,13 +183,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       %{tenant: t, a: a, b: b} = ctx
 
       assert {:ok, res} =
-               Knowledge.annotate_conflict(t.id, %{
-                 "source_article_id" => b.id,
-                 "target_article_id" => a.id,
-                 "disposition" => "supersede",
-                 "authoritative_article_id" => a.id,
-                 "confidence" => "high"
-               })
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => b.id,
+                   "target_article_id" => a.id,
+                   "disposition" => "supersede",
+                   "authoritative_article_id" => a.id,
+                   "confidence" => "high",
+                   "evidence" => "same capture; bodies agree"
+                 },
+                 @orchestrator
+               )
 
       # Deferred — not executed on record.
       assert is_nil(res.executed_at)
@@ -226,13 +242,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
 
       # Re-annotate with the pair in the OTHER order and a different verdict.
       {:ok, res2} =
-        Knowledge.annotate_conflict(t.id, %{
-          "source_article_id" => b.id,
-          "target_article_id" => a.id,
-          "disposition" => "supersede",
-          "authoritative_article_id" => a.id,
-          "confidence" => "high"
-        })
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => b.id,
+            "target_article_id" => a.id,
+            "disposition" => "supersede",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
 
       assert res2.disposition == :supersede
       # Exactly one row for the pair.
@@ -284,13 +305,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       y = published(t.id, "Y")
 
       assert {:error, :no_potential_conflict} =
-               Knowledge.annotate_conflict(t.id, %{
-                 "source_article_id" => x.id,
-                 "target_article_id" => y.id,
-                 "disposition" => "supersede",
-                 "authoritative_article_id" => x.id,
-                 "confidence" => "high"
-               })
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => x.id,
+                   "target_article_id" => y.id,
+                   "disposition" => "supersede",
+                   "authoritative_article_id" => x.id,
+                   "confidence" => "high",
+                   "evidence" => "same capture; bodies agree"
+                 },
+                 @orchestrator
+               )
 
       # Nothing persisted for the fabricated pair, so the executor retires nothing.
       assert 0 == Knowledge.execute_conflict_resolutions(t.id)
@@ -304,13 +330,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       %{tenant: t, a: a, b: b} = ctx
 
       {:ok, _} =
-        Knowledge.annotate_conflict(t.id, %{
-          "source_article_id" => a.id,
-          "target_article_id" => b.id,
-          "disposition" => "supersede",
-          "authoritative_article_id" => a.id,
-          "confidence" => "high"
-        })
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "supersede",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
 
       # A :user retracts the mistaken flag (DELETE link) before the nightly run.
       link =
@@ -345,13 +376,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       |> AdminRepo.insert!()
 
       assert {:error, :no_potential_conflict} =
-               Knowledge.annotate_conflict(t.id, %{
-                 "source_article_id" => x.id,
-                 "target_article_id" => y.id,
-                 "disposition" => "supersede",
-                 "authoritative_article_id" => x.id,
-                 "confidence" => "high"
-               })
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => x.id,
+                   "target_article_id" => y.id,
+                   "disposition" => "supersede",
+                   "authoritative_article_id" => x.id,
+                   "confidence" => "high",
+                   "evidence" => "same capture; bodies agree"
+                 },
+                 @orchestrator
+               )
     end
 
     # A dismiss verdict is likewise only accepted for a real flagged pair.
@@ -376,13 +412,423 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       # The real flag lives in the setup tenant. Resolving the SAME article ids under a
       # different tenant must not find it.
       assert {:error, :no_potential_conflict} =
-               Knowledge.annotate_conflict(other.id, %{
+               Knowledge.annotate_conflict(
+                 other.id,
+                 %{
+                   "source_article_id" => a.id,
+                   "target_article_id" => b.id,
+                   "disposition" => "supersede",
+                   "authoritative_article_id" => a.id,
+                   "confidence" => "high",
+                   "evidence" => "same capture; bodies agree"
+                 },
+                 @orchestrator
+               )
+    end
+  end
+
+  # The conflict PAIR is manufacturable: the queue is fed by a mechanical similarity
+  # threshold, so the party recording a verdict can arrange for the pair to be flagged. The
+  # invariant these tests hold is that nothing an agent can record ON ITS OWN drives the
+  # unattended retirement — while every disposition stays recordable at agent role (#331).
+  describe "confidence is granted from the recording role, not accepted from the caller" do
+    setup do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, "Winner")
+      b = published(tenant.id, "Loser")
+      conflict_link(tenant.id, a, b, 0.95)
+      %{tenant: tenant, a: a, b: b}
+    end
+
+    test "an agent asking for :high is recorded at :medium, and the ask is kept", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      assert {:ok, res} =
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => a.id,
+                   "target_article_id" => b.id,
+                   "disposition" => "supersede",
+                   "authoritative_article_id" => a.id,
+                   "confidence" => "high",
+                   "evidence" => "looks the same to me"
+                 },
+                 actor_role: :agent
+               )
+
+      assert res.confidence == :medium
+      assert res.requested_confidence == :high
+      assert res.annotated_by_role == "agent"
+
+      # Asserted on the PERSISTED row, not the returned struct: an upsert returns what the
+      # changeset said, so a column missing from the `on_conflict` replace list would look
+      # correct here and be wrong in the database the executor reads.
+      stored = AdminRepo.get!(Loopctl.Knowledge.ConflictResolution, res.id)
+      assert stored.confidence == :medium
+      assert stored.requested_confidence == :high
+      assert stored.annotated_by_role == "agent"
+    end
+
+    test "the capped verdict never retires the loser; both articles survive the executor",
+         ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "supersede",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "looks the same to me"
+          },
+          actor_role: :agent
+        )
+
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, a.id).status == :published
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, b.id).status == :published
+
+      refute AdminRepo.get_by(ArticleLink, tenant_id: t.id, relationship_type: :supersedes)
+    end
+
+    # The cap is only defensible if the verdict remains actionable. A capped row is neither
+    # applied nor auto-dismissed, and its pair stays on BOTH surfaces an orchestrator could
+    # rediscover it from — otherwise the remedy the response note names does not exist.
+    test "a capped verdict is left pending and its pair stays in the conflict queue", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      {:ok, res} =
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "supersede",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "looks the same to me"
+          },
+          actor_role: :agent
+        )
+
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+      assert is_nil(AdminRepo.get!(Loopctl.Knowledge.ConflictResolution, res.id).executed_at)
+
+      assert %{data: [_ | _]} = Knowledge.list_potential_conflicts(t.id)
+
+      {:ok, fetched} = Knowledge.get_article(t.id, a.id)
+      assert Enum.any?(fetched.outgoing_links, &(&1.relationship_type == :potential_conflict))
+
+      # And an orchestrator re-recording it at :high then applies normally.
+      {:ok, _} =
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "supersede",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
+
+      assert 1 == Knowledge.execute_conflict_resolutions(t.id)
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, b.id).status == :superseded
+    end
+
+    # `:merge` retires NOTHING — it synthesizes a new draft and leaves both sources
+    # published — so the retirement gate does not apply to it. Capping it turned the
+    # disposition off for the agent role the KB-content carve-out (#331) exists to serve.
+    test "a merge is NOT capped: an agent's :high is granted verbatim", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      assert {:ok, res} =
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => a.id,
+                   "target_article_id" => b.id,
+                   "disposition" => "merge",
+                   "authoritative_article_id" => a.id,
+                   "confidence" => "high",
+                   "evidence" => "same topic, complementary halves"
+                 },
+                 actor_role: :agent
+               )
+
+      assert res.confidence == :high
+      assert is_nil(res.requested_confidence)
+      assert res.annotated_by_role == "agent"
+
+      stored = AdminRepo.get!(Loopctl.Knowledge.ConflictResolution, res.id)
+      assert stored.confidence == :high
+    end
+
+    test "an OMITTED actor_role is capped like an agent, not trusted", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      assert {:ok, res} =
+               Knowledge.annotate_conflict(t.id, %{
                  "source_article_id" => a.id,
                  "target_article_id" => b.id,
                  "disposition" => "supersede",
                  "authoritative_article_id" => a.id,
-                 "confidence" => "high"
+                 "confidence" => "high",
+                 "evidence" => "unattributed"
                })
+
+      assert res.confidence == :medium
+      assert res.annotated_by_role == "agent"
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+    end
+
+    test "an orchestrator's :high is granted verbatim and applies", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      assert {:ok, res} =
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => a.id,
+                   "target_article_id" => b.id,
+                   "disposition" => "supersede",
+                   "authoritative_article_id" => a.id,
+                   "confidence" => "high",
+                   "evidence" => "same capture; bodies agree"
+                 },
+                 @orchestrator
+               )
+
+      assert res.confidence == :high
+      assert is_nil(res.requested_confidence)
+      assert res.annotated_by_role == "orchestrator"
+
+      assert 1 == Knowledge.execute_conflict_resolutions(t.id)
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, b.id).status == :superseded
+    end
+
+    test "an agent re-annotating an orchestrator's applied-pending verdict does not inherit it",
+         ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "supersede",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
+
+      # Last-write-wins upserts the SAME row. Both provenance columns must be replaced with
+      # the verdict — otherwise the agent's write keeps the orchestrator's authorization.
+      {:ok, res} =
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => b.id,
+            "target_article_id" => a.id,
+            "disposition" => "supersede",
+            "authoritative_article_id" => b.id,
+            "confidence" => "high",
+            "evidence" => "actually the other one wins"
+          },
+          actor_role: :agent
+        )
+
+      assert res.confidence == :medium
+
+      # The PERSISTED provenance is what the executor reads, and an upsert returns the
+      # changeset rather than the row — so both columns must be in the replace list or the
+      # agent's write silently inherits the orchestrator's authorization. Fetched by tenant
+      # (there is exactly one row for the pair): on the conflict path the returned struct
+      # carries a freshly generated id, not the surviving row's.
+      stored = AdminRepo.get_by!(Loopctl.Knowledge.ConflictResolution, tenant_id: t.id)
+      assert stored.annotated_by_role == "agent"
+      assert stored.requested_confidence == :high
+
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, a.id).status == :published
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, b.id).status == :published
+    end
+
+    test "a :high supersede with no evidence is rejected — the unattended write must say why",
+         ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      assert {:error, changeset} =
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => a.id,
+                   "target_article_id" => b.id,
+                   "disposition" => "supersede",
+                   "authoritative_article_id" => a.id,
+                   "confidence" => "high"
+                 },
+                 @orchestrator
+               )
+
+      assert %{evidence: _} = errors_on(changeset)
+
+      # Whitespace is not evidence.
+      assert {:error, blank} =
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => a.id,
+                   "target_article_id" => b.id,
+                   "disposition" => "supersede",
+                   "authoritative_article_id" => a.id,
+                   "confidence" => "high",
+                   "evidence" => "   "
+                 },
+                 @orchestrator
+               )
+
+      assert %{evidence: _} = errors_on(blank)
+    end
+
+    # The cap must not COERCE an unrecognized value — that would answer a malformed request
+    # with a silent default. It is passed through for the changeset's enum cast to reject,
+    # and a non-scalar must not raise on the way there (the 422-not-500 rule the disposition
+    # field already follows).
+    test "an unrecognized or non-scalar confidence is a changeset error, not a coercion", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      for bad <- ["HIGH", %{"nested" => "object"}] do
+        assert {:error, %Ecto.Changeset{} = cs} =
+                 Knowledge.annotate_conflict(
+                   t.id,
+                   %{
+                     "source_article_id" => a.id,
+                     "target_article_id" => b.id,
+                     "disposition" => "supersede",
+                     "authoritative_article_id" => a.id,
+                     "confidence" => bad
+                   },
+                   @orchestrator
+                 )
+
+        assert %{confidence: _} = errors_on(cs)
+      end
+    end
+
+    test "evidence is NOT required below :high, for EITHER disposition", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      for disposition <- ["supersede", "merge"] do
+        assert {:ok, _} =
+                 Knowledge.annotate_conflict(
+                   t.id,
+                   %{
+                     "source_article_id" => a.id,
+                     "target_article_id" => b.id,
+                     "disposition" => disposition,
+                     "authoritative_article_id" => a.id,
+                     "confidence" => "medium"
+                   },
+                   @orchestrator
+                 )
+      end
+    end
+
+    # Uncapping `:merge` made it the one unattended executor action an agent-role key can
+    # drive alone — and it spends the tenant's paid model key and POSTs both full bodies to
+    # the provider. Evidence is what remains between "an agent may curate" and "an agent may
+    # queue unbounded billed egress it never has to justify", so the bar covers BOTH
+    # dispositions the executor applies, not just the one that retires an article.
+    test "a :high merge requires evidence, exactly like a :high supersede", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      assert {:error, cs} =
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => a.id,
+                   "target_article_id" => b.id,
+                   "disposition" => "merge",
+                   "authoritative_article_id" => a.id,
+                   "confidence" => "high"
+                 },
+                 actor_role: :agent
+               )
+
+      assert %{evidence: _} = errors_on(cs)
+    end
+
+    # The executor re-checks the persisted authorization rather than trusting the grant that
+    # produced it. An unattributed or unrecognized recorder is not an authorization — and the
+    # pair must NOT disappear behind a verdict nothing will act on, or the documented remedy
+    # ("re-record it at :high") is reachable only by someone who memorised both ids.
+    for {label, role} <- [{"no recorder", nil}, {"an unrecognized role", "not-a-role"}] do
+      test "a :high supersede with #{label} is not applied, and its pair stays discoverable",
+           ctx do
+        %{tenant: t, a: a, b: b} = ctx
+
+        {:ok, res} =
+          Knowledge.annotate_conflict(
+            t.id,
+            %{
+              "source_article_id" => a.id,
+              "target_article_id" => b.id,
+              "disposition" => "supersede",
+              "authoritative_article_id" => a.id,
+              "confidence" => "high",
+              "evidence" => "same capture; bodies agree"
+            },
+            @orchestrator
+          )
+
+        {1, _} =
+          AdminRepo.update_all(
+            from(r in Loopctl.Knowledge.ConflictResolution, where: r.id == ^res.id),
+            set: [annotated_by_role: unquote(role)]
+          )
+
+        assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+        assert AdminRepo.get!(Loopctl.Knowledge.Article, b.id).status == :published
+
+        # Left PENDING, not stamped as dismissed: an authorized re-record still applies it.
+        assert is_nil(AdminRepo.get!(Loopctl.Knowledge.ConflictResolution, res.id).executed_at)
+
+        assert %{data: [_ | _]} = Knowledge.list_potential_conflicts(t.id)
+      end
+    end
+
+    # Tenant isolation: one tenant's executor never reaches another tenant's verdict, even
+    # a fully authorized one.
+    test "the executor does not apply another tenant's authorized verdict", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+      other = fixture(:tenant)
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "supersede",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
+
+      assert 0 == Knowledge.execute_conflict_resolutions(other.id)
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, b.id).status == :published
     end
   end
 
@@ -410,13 +856,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       end)
 
       {:ok, _} =
-        Knowledge.annotate_conflict(t.id, %{
-          "source_article_id" => a.id,
-          "target_article_id" => b.id,
-          "disposition" => "merge",
-          "authoritative_article_id" => a.id,
-          "confidence" => "high"
-        })
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "merge",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
 
       assert 1 == Knowledge.execute_conflict_resolutions(t.id)
 
@@ -451,13 +902,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       # Default stub returns {:error, :not_configured}.
 
       {:ok, _} =
-        Knowledge.annotate_conflict(t.id, %{
-          "source_article_id" => a.id,
-          "target_article_id" => b.id,
-          "disposition" => "merge",
-          "authoritative_article_id" => a.id,
-          "confidence" => "high"
-        })
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "merge",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
 
       assert 0 == Knowledge.execute_conflict_resolutions(t.id)
 
@@ -470,13 +926,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       %{tenant: t, a: a, b: b} = ctx
 
       {:ok, _} =
-        Knowledge.annotate_conflict(t.id, %{
-          "source_article_id" => a.id,
-          "target_article_id" => b.id,
-          "disposition" => "merge",
-          "authoritative_article_id" => a.id,
-          "confidence" => "high"
-        })
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "merge",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
 
       # With a zero budget, the executor halts BEFORE applying the first row, so
       # nothing is executed and the (high-confidence) resolution stays for the next
@@ -499,13 +960,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
           conflict_link(tenant.id, a, b, 0.95)
 
           {:ok, r} =
-            Knowledge.annotate_conflict(tenant.id, %{
-              "source_article_id" => a.id,
-              "target_article_id" => b.id,
-              "disposition" => "supersede",
-              "authoritative_article_id" => a.id,
-              "confidence" => "high"
-            })
+            Knowledge.annotate_conflict(
+              tenant.id,
+              %{
+                "source_article_id" => a.id,
+                "target_article_id" => b.id,
+                "disposition" => "supersede",
+                "authoritative_article_id" => a.id,
+                "confidence" => "high",
+                "evidence" => "same capture; bodies agree"
+              },
+              @orchestrator
+            )
 
           # Distinct inserted_at (the `asc: r.id` tiebreaker also makes the order total).
           Process.sleep(5)
@@ -545,13 +1011,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       end)
 
       {:ok, _} =
-        Knowledge.annotate_conflict(tenant.id, %{
-          "source_article_id" => a.id,
-          "target_article_id" => b.id,
-          "disposition" => "merge",
-          "authoritative_article_id" => a.id,
-          "confidence" => "high"
-        })
+        Knowledge.annotate_conflict(
+          tenant.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "merge",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
 
       assert 0 == Knowledge.execute_conflict_resolutions(tenant.id)
 
@@ -561,7 +1032,91 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       refute is_nil(row.executed_at)
       assert row.execution_result["action"] == "skipped"
       assert row.execution_result["reason"] == "no_api_key"
+
+      # ...and the pair STAYS discoverable. `executed_at` alone is not disposal: nothing was
+      # merged and the block lifts the moment the tenant adds a key, so settling on the
+      # timestamp would drop the pair out of the queue with both articles untouched and no
+      # row anyone can act on — the same black hole the confidence bar closes from the other
+      # side.
+      assert %{data: [_ | _]} = Knowledge.list_potential_conflicts(tenant.id)
     end
+
+    test "a merged draft inherits the MORE RESTRICTIVE of its two sources' visibility", ctx do
+      %{tenant: t, a: a} = ctx
+      agent_id = Ecto.UUID.generate()
+
+      private =
+        published(t.id, "Private notes on parsing XML", %{
+          "visibility" => "private",
+          "agent_id" => agent_id
+        })
+
+      conflict_link(t.id, a, private, 0.98)
+
+      stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _scope, _a, _b ->
+        {:ok, %{title: "XML parsing, merged", body: "Body derived from BOTH sources."}}
+      end)
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => private.id,
+            "disposition" => "merge",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
+
+      assert 1 == Knowledge.execute_conflict_resolutions(t.id)
+
+      draft =
+        AdminRepo.get_by(Loopctl.Knowledge.Article, tenant_id: t.id, title: "XML parsing, merged")
+
+      # The synthesized body is derived from BOTH sources, so a draft carrying no visibility
+      # key at all — which every read path COALESCEs to "shared" — would promote a private
+      # memory's content to tenant-wide readable by way of a curation verdict.
+      assert draft.metadata["visibility"] == "private"
+      assert draft.metadata["agent_id"] == agent_id
+    end
+
+    test "refuses to merge two sources restricted to DIFFERENT agents, before any egress", ctx do
+      %{tenant: t} = ctx
+
+      one = published(t.id, "Agent one notes on xmerl", vis(Ecto.UUID.generate()))
+      two = published(t.id, "Agent two notes on xmerl", vis(Ecto.UUID.generate()))
+      conflict_link(t.id, one, two, 0.98)
+
+      # No visibility could protect both, so the synthesizer must never be called at all.
+      stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _scope, _a, _b ->
+        flunk("synthesis must not run for sources restricted to different agents")
+      end)
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => min(one.id, two.id),
+            "target_article_id" => max(one.id, two.id),
+            "disposition" => "merge",
+            "authoritative_article_id" => one.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
+
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+
+      row = AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: t.id)
+      assert row.execution_result["action"] == "noop"
+      assert row.execution_result["reason"] =~ "different agents"
+    end
+
+    defp vis(agent_id), do: %{"visibility" => "private", "agent_id" => agent_id}
 
     # REGRESSION (review, US-41.4 AC-41.4.3): `permanent_merge_error?/1`'s catch-all
     # bucketed `{:egress_blocked, details}` as TRANSIENT, so the row was left
@@ -577,13 +1132,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       end)
 
       {:ok, _} =
-        Knowledge.annotate_conflict(t.id, %{
-          "source_article_id" => a.id,
-          "target_article_id" => b.id,
-          "disposition" => "merge",
-          "authoritative_article_id" => a.id,
-          "confidence" => "high"
-        })
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "merge",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
 
       assert 0 == Knowledge.execute_conflict_resolutions(t.id)
 
@@ -602,13 +1162,18 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       end)
 
       {:ok, _} =
-        Knowledge.annotate_conflict(t.id, %{
-          "source_article_id" => a.id,
-          "target_article_id" => b.id,
-          "disposition" => "merge",
-          "authoritative_article_id" => a.id,
-          "confidence" => "high"
-        })
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "merge",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "same capture; bodies agree"
+          },
+          @orchestrator
+        )
 
       assert 0 == Knowledge.execute_conflict_resolutions(t.id)
 

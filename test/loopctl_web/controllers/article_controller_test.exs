@@ -593,7 +593,10 @@ defmodule LoopctlWeb.ArticleControllerTest do
         |> json_response(201)
 
       first_id = first["data"]["id"]
-      assert first["data"]["idempotency_key"] == "book:42:note:1"
+
+      # The stored key is NEVER echoed in an article payload — it is a write-side capture
+      # identity, not a readable attribute of the article.
+      refute Map.has_key?(first["data"], "idempotency_key")
 
       # Same key, DIFFERENT title + body → still a no-op (the key is the identity),
       # so no partial duplicate is created.
@@ -870,8 +873,11 @@ defmodule LoopctlWeb.ArticleControllerTest do
         |> get(~p"/api/v1/articles?idempotency_key=ik-1")
         |> json_response(200)
 
+      # The existence check is answered by `meta.total_count` on a key the caller already
+      # holds; the rows do not carry the key back, so the endpoint cannot be used to
+      # enumerate the capture identities other callers chose.
       assert body3["meta"]["total_count"] == 1
-      assert hd(body3["data"])["idempotency_key"] == "ik-1"
+      refute Map.has_key?(hd(body3["data"]), "idempotency_key")
     end
 
     test "a malformed source_id matches nothing (no 500)", %{conn: conn} do
