@@ -198,6 +198,37 @@ All notable changes to loopctl are documented here.
 
 Operator-facing changes for deployments outside the hosted instance.
 
+### Added
+
+- **`CLOAK_KEY` rotation is now an operable secret update (#622).** Two new variables,
+  `CLOAK_KEY_TAG` (default `AES.GCM.V1`) and `CLOAK_RETIRED_KEYS` (comma-separated
+  `TAG:BASE64_KEY` entries, decrypt-only), replace the compile-time retired-cipher list that
+  previously made a key rotation require a code change and a redeploy. That list was also
+  inert: it was configured under a `retired_ciphers:` key Cloak never reads, so following it
+  would have produced undecryptable rows. **Deploy ordering matters, in TWO commands:**
+  first publish the new key decrypt-only (`CLOAK_RETIRED_KEYS="NEWTAG:NEW_KEY"`), then in a
+  second `fly secrets set` promote it to `CLOAK_KEY`/`CLOAK_KEY_TAG` and retire the outgoing
+  key. One command would leave a rolling-restart window in which a not-yet-restarted machine
+  has no cipher for the new tag; and the retired key must never land after the new active
+  key. Bump the tag in the promotion command, because Cloak selects a decrypt cipher by tag
+  and a reused tag hands the old key's rows to the new key. A malformed entry, a duplicate
+  tag, a wrong key length, a value that is set but names no entries, or a tag colliding with
+  `CLOAK_KEY_TAG` aborts boot naming the entry's position, rather than silently dropping a
+  key. Full procedure, including when it is safe to unset `CLOAK_RETIRED_KEYS`:
+  [`docs/runbooks/cloak-key-rotation.md`](docs/runbooks/cloak-key-rotation.md).
+
+- **`mix loopctl.reencrypt_secrets` re-encrypts stored rows onto the active key (#622).**
+  It replaces a same-named placeholder that printed a message and did nothing while the
+  operational docs pointed at it as the rotation mechanism. The pass is batched, idempotent
+  and resumable (it skips rows already on the active cipher), has a `--dry-run`, and a
+  `status` subcommand that counts stored ciphertext by cipher tag so a rotation can be
+  verified against the database rather than against the run's own summary. Every examined
+  row is accounted for in the counts, and a row whose plaintext cannot be recovered is a
+  reported failure with a non-zero exit — never a silent skip. Encrypted values inside
+  `oban_jobs.args` are NOT covered and the `status` census cannot see them; draining BOTH
+  the `:ingestion` and `:cleanup` queues is what retires those before the old key is
+  dropped.
+
 ### Changed
 
 - **Webhook deliveries now carry a timestamped signature; receivers must migrate (#623).**
