@@ -27,12 +27,19 @@ defmodule Loopctl.Repo.Migrations.AddRecorderProvenanceToConflictResolutions do
   not dismissed either: `Knowledge.conflict_unresolved_subquery/0` settles a pair
   only on a verdict the executor will act on, so such a pair stays in
   `GET /knowledge/conflicts` for an orchestrator+ key to re-record.
+
+  This migration was renumbered from `20260807120000` while the branch was unmerged, so a
+  database that migrated the earlier version already carries both columns and has no record
+  of THIS version — a plain `add` would run again and raise `duplicate_column`.
+  `add_if_not_exists` converges those boxes here instead, the same way
+  `20260807140000_add_consumed_at_to_custody_violations` does. The backfill is idempotent
+  (it only rewrites `annotated_by_role` from a value already on the row).
   """
 
   def change do
     alter table(:conflict_resolutions) do
-      add :annotated_by_role, :string
-      add :requested_confidence, :string
+      add_if_not_exists :annotated_by_role, :string
+      add_if_not_exists :requested_confidence, :string
     end
 
     execute(

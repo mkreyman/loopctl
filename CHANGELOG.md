@@ -151,13 +151,25 @@ Operator-facing changes for deployments outside the hosted instance.
   `supersede` is what authorizes the nightly executor to RETIRE an article with nobody in
   the loop, so it is now capped by the role of the key recording the verdict: an agent-role
   request asking for `"high"` is recorded at `"medium"`, and the response reports the cap in
-  `data.requested_confidence` and `note`. A `"high"` supersede additionally REQUIRES
-  `evidence` (422 without it). `merge` is NOT capped — it synthesizes a new draft and
-  retires nothing — so it still executes at agent role. Recording a verdict remains
+  `data.requested_confidence` and `note`. `merge` is NOT capped — it synthesizes a new draft
+  and retires nothing — so it still executes at agent role. Recording a verdict remains
   agent-role curation in every disposition; only the unattended retirement is gated.
+  **Both `supersede` AND `merge` recorded at `"high"` now REQUIRE `evidence` (422 without
+  it)** — the merge is uncapped but not free: the executor synthesizes on the tenant's own
+  paid model key and POSTs both article bodies to the provider, so every verdict it applies
+  unattended must carry its reason. A merged draft now also inherits the more restrictive of
+  its two sources' visibility instead of defaulting to tenant-shared, and two sources
+  restricted to DIFFERENT agents are refused before any synthesis.
   **A capped verdict is neither applied nor auto-dismissed:** a pair whose only verdict the
   executor will never apply stays listed in `GET /api/v1/knowledge/conflicts` (and keeps its
-  link on `GET /articles/:id`), so an orchestrator+ key can find it and re-record it. The
+  link on `GET /articles/:id`), so an orchestrator+ key can find it and re-record it. A
+  supersede/merge DELIBERATELY recorded below `"high"` is different — the next nightly run
+  closes it as dismissed (both articles retained) and the pair leaves the queue; it is not
+  held for review, so re-record at `"high"` if you mean it to apply. An execution that
+  disposed of NOTHING (a merge skipped for a missing API key, a permanently failed
+  synthesis, a retracted flag) no longer settles the pair either — it stays discoverable
+  instead of vanishing unapplied. Recording ANY verdict, capped or not, releases the pair's
+  articles from curated-retrieval suppression. The
   migration backfills `annotated_by_role` from the existing `annotated_by` value, so a
   pending `supersede` an orchestrator recorded before this release still executes.
 

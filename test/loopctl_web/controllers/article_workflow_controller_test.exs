@@ -1477,11 +1477,16 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
           "target_article_id" => b.id,
           "disposition" => "merge",
           "authoritative_article_id" => a.id,
-          "confidence" => "high"
+          "confidence" => "high",
+          "evidence" => "both cover the same rollout, from different halves"
         })
 
       body = json_response(conn, 201)
       assert body["data"]["disposition"] == "merge"
+
+      # The note must describe what the executor will ACTUALLY do that night — this is the
+      # only feedback an agent gets, and it used to say the merge was not applied yet.
+      assert body["note"] =~ "MERGED DRAFT"
 
       resolution =
         Loopctl.AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: tenant.id)

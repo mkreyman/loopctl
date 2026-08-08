@@ -5534,8 +5534,9 @@ const TOOLS = [
       "'merge' is never capped and executes normally at agent role. " +
       "Last-write-wins per pair, so re-recording with fresher ground truth overrides. " +
       "Resolve only conflicts material to your current task; adjudicate against the actual " +
-      "system, and if you can't tell which is right, leave it (or record low confidence) " +
-      "rather than guessing.",
+      "system, and if you can't tell which is right, LEAVE IT UNRECORDED rather than " +
+      "guessing — recording low confidence is not a way to park it, it closes the verdict " +
+      "as dismissed on the next nightly run.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5573,17 +5574,20 @@ const TOOLS = [
           description:
             "Why you're sure — ideally a ground-truth reference (commit, file:line, URL, or the " +
             "observed behavior). Recorded for audit and for a human reviewing low-confidence " +
-            "calls. REQUIRED for a supersede recorded at confidence 'high' (422 without it) — " +
-            "the one verdict that retires an article unattended must say why.",
+            "calls. REQUIRED for a supersede OR merge recorded at confidence 'high' (422 " +
+            "without it) — every verdict the executor applies unattended must say why.",
         },
         confidence: {
           type: "string",
           enum: ["high", "medium", "low"],
           description:
             "high, medium, or low. Default medium. supersede/merge auto-execute only at 'high'; " +
-            "lower confidence is recorded but left for review. On a supersede the value is a " +
-            "REQUEST: it is capped to 'medium' unless the calling key is orchestrator+, and the " +
-            "response reports the cap. merge is not capped.",
+            "recorded LOWER, the next nightly run closes the verdict as dismissed (both " +
+            "articles retained) and the pair leaves the conflict queue — it is NOT left for " +
+            "review, so re-record at 'high' if you mean it to apply. On a supersede the value " +
+            "is a REQUEST: it is capped to 'medium' unless the calling key is orchestrator+, " +
+            "and a CAPPED verdict is the exception — it stays in the queue for an " +
+            "orchestrator+ key. merge is not capped.",
         },
       },
       required: ["source_article_id", "target_article_id", "disposition"],

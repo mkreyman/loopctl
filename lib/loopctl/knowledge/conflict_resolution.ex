@@ -23,10 +23,12 @@ defmodule Loopctl.Knowledge.ConflictResolution do
   authorized key re-records it. A `:merge` retires nothing (it synthesizes a new draft and
   leaves both sources published), so it is never capped and executes at agent role.
 
-  A `:high`-confidence `:supersede` additionally requires `evidence`: the one verdict that
-  retires an article unattended must carry the reason it was reached. That validation lives
-  HERE, at the single point every writer converges on, rather than in the controller — the
-  same reason the reserved-tag rule sits on the Article changeset.
+  A `:high`-confidence `:supersede` OR `:merge` additionally requires `evidence`: every
+  verdict the executor applies unattended must carry the reason it was reached — the
+  supersede because it retires an article, the merge because it spends the tenant's paid
+  model key and egresses both bodies. That validation lives HERE, at the single point every
+  writer converges on, rather than in the controller — the same reason the reserved-tag rule
+  sits on the Article changeset.
 
   `tenant_id` is set programmatically, never cast.
   """
@@ -84,8 +86,8 @@ defmodule Loopctl.Knowledge.ConflictResolution do
   @doc """
   Changeset for an agent-recorded resolution. `tenant_id` is set on the struct, not cast.
   Requires a canonical (sorted) pair and a disposition; `:supersede`/`:merge` require the
-  `authoritative_article_id` to be one of the two pair members, and a `:high`-confidence
-  `:supersede` requires `evidence`.
+  `authoritative_article_id` to be one of the two pair members, and either of them at
+  `:high` confidence requires `evidence`.
   """
   @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def changeset(resolution \\ %__MODULE__{}, attrs) do
@@ -95,7 +97,7 @@ defmodule Loopctl.Knowledge.ConflictResolution do
     |> validate_inclusion(:disposition, @disposition_values)
     |> validate_pair_order()
     |> validate_authoritative_in_pair()
-    |> validate_evidence_for_unattended_supersede()
+    |> validate_evidence_for_unattended_apply()
     |> foreign_key_constraint(:source_article_id)
     |> foreign_key_constraint(:target_article_id)
     |> unique_constraint([:tenant_id, :source_article_id, :target_article_id],
@@ -135,19 +137,27 @@ defmodule Loopctl.Knowledge.ConflictResolution do
     end
   end
 
-  # The ONE verdict shape that retires a published article with nobody watching:
-  # `:supersede` at the confidence the nightly executor acts on. It must name the reason it
-  # was reached, so the retirement is reviewable after the fact from the row alone. Checked
-  # on the GRANTED confidence — a request capped down to `:medium` never reaches the
+  # Every verdict shape the nightly executor ACTS ON with nobody watching must name the
+  # reason it was reached, so the write is reviewable after the fact from the row alone.
+  # That is both dispositions at the confidence the executor acts on, not just `:supersede`:
+  # a `:merge` retires nothing, but it still spends the tenant's own paid Anthropic key and
+  # POSTs BOTH articles' full bodies to the model provider. Uncapping `:merge` made that the
+  # one unattended executor action an agent-role key can drive alone, so the evidence bar is
+  # what remains between "an agent may curate" and "an agent may queue unbounded billed
+  # egress on flagged pairs it never has to justify".
+  #
+  # Checked on the GRANTED confidence — a request capped down to `:medium` never reaches the
   # executor, so it is not held to this bar.
   #
   # Whitespace is not evidence: `validate_required/2` already rejects `""` and a
   # whitespace-only string trims to `""` under the default `:trim` behaviour.
-  defp validate_evidence_for_unattended_supersede(changeset) do
-    if get_field(changeset, :disposition) == :supersede and
-         get_field(changeset, :confidence) == :high do
+  defp validate_evidence_for_unattended_apply(changeset) do
+    disposition = get_field(changeset, :disposition)
+
+    if disposition in [:supersede, :merge] and get_field(changeset, :confidence) == :high do
       validate_required(changeset, [:evidence],
-        message: "is required for a high-confidence supersede (it retires an article unattended)"
+        message:
+          "is required for a high-confidence #{disposition} (the executor applies it unattended)"
       )
     else
       changeset

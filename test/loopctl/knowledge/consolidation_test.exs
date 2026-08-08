@@ -871,7 +871,7 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert status(b.id) == :published
     end
 
-    test "applies once TWO consecutive runs agree, unpublishing the losers and keeping the richest" do
+    test "applies once TWO consecutive runs agree, unpublishing the losers and keeping the oldest" do
       tenant = fixture(:tenant)
       {a, b} = duplicate_pair(tenant.id)
 
@@ -881,11 +881,42 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert %{applied: 1, skipped: 0, failed: 0} =
                Consolidation.apply_confirmed_duplicates(tenant.id)
 
-      # The richest (longest body) survives; the duplicate is UNPUBLISHED, never archived —
+      # The earliest capture survives; the duplicate is UNPUBLISHED, never archived —
       # :archived is terminal for an article, so it is the one retraction that cannot be
       # undone in code.
       assert status(a.id) == :published
       assert status(b.id) == :draft
+    end
+
+    test "keeps the OLDEST capture even when a later one is longer" do
+      # The winner rule is age, not body length, and this is the only test that can tell the
+      # two apart: `duplicate_pair/1` makes its oldest member also its longest, so both
+      # orderings pick it and a revert to longest-wins passes every other test here.
+      #
+      # What longest-wins costs is the point. Every input to a duplicate group is writable by
+      # any agent-role key — the colliding title AND the body — so under longest-wins an
+      # agent retires an established published article by publishing a longer near-copy
+      # beside it and waiting two nights. Age is the one input a later writer cannot
+      # manufacture.
+      tenant = fixture(:tenant)
+
+      established = published(tenant.id, %{title: "Retry Policy", body: "the original stub"})
+
+      longer_newcomer =
+        published(tenant.id, %{
+          title: "retry-policy!",
+          body: String.duplicate("a much longer near-copy ", 20)
+        })
+
+      confirm_over_two_nights(tenant.id)
+
+      assert %{applied: 1, skipped: 0, failed: 0} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert status(established.id) == :published,
+             "the earliest capture must survive a longer article written after it"
+
+      assert status(longer_newcomer.id) == :draft
     end
 
     test "SKIPS a group that no longer holds at apply time" do

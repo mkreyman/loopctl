@@ -306,9 +306,12 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         "`medium`, the response says so in `data.requested_confidence` and `note`, and the " <>
         "pair stays in GET /knowledge/conflicts so an orchestrator+ key can re-record it. " <>
         "`merge` retires nothing (it synthesizes a new draft, sources preserved) and is " <>
-        "never capped. A `high` supersede additionally REQUIRES `evidence` (422 without " <>
-        "it): the one verdict that retires an article unattended must carry the reason it " <>
-        "was reached.",
+        "never capped, but a `high` merge is NOT unattended-free: the executor synthesizes on " <>
+        "the tenant's own paid model key and POSTs both bodies to the provider. A `high` " <>
+        "supersede OR merge therefore REQUIRES `evidence` (422 without it) — every verdict " <>
+        "the executor applies with nobody in the loop must carry the reason it was reached. " <>
+        "A supersede/merge recorded BELOW `high` is closed as dismissed by the next nightly " <>
+        "run (both articles retained); it is not held for review.",
     request_body:
       {"Resolution", "application/json",
        %OpenApiSpex.Schema{
@@ -329,9 +332,9 @@ defmodule LoopctlWeb.ArticleWorkflowController do
            evidence: %OpenApiSpex.Schema{
              type: :string,
              description:
-               "Why this verdict was reached. REQUIRED for a supersede recorded at " <>
-                 "confidence `high` — that is the verdict the nightly executor applies " <>
-                 "with nobody in the loop."
+               "Why this verdict was reached. REQUIRED for a supersede OR merge recorded " <>
+                 "at confidence `high` — those are the verdicts the nightly executor " <>
+                 "applies with nobody in the loop."
            },
            confidence: %OpenApiSpex.Schema{
              type: :string,
@@ -350,7 +353,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
            "`data.requested_confidence` when it was capped)", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       422 =>
-        {"Validation error (including a `high` supersede with no `evidence`), or no " <>
+        {"Validation error (including a `high` supersede/merge with no `evidence`), or no " <>
            "system-flagged potential_conflict for the pair", "application/json",
          Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -856,13 +859,22 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       "Recorded. The nightly executor will supersede the loser (create a supersedes link " <>
         "and retire it) — reversible and audited."
 
-  defp resolution_note(%{disposition: :supersede}),
+  defp resolution_note(%{disposition: :merge, confidence: :high}),
     do:
-      "Recorded, but NOT auto-applied: supersede executes only at confidence \"high\". " <>
-        "Left for review at the current confidence."
+      "Recorded. The nightly executor will synthesize a MERGED DRAFT from both articles " <>
+        "using this tenant's own model key — both sources stay published, the draft is " <>
+        "never auto-published, and it inherits the more restrictive of the two sources' " <>
+        "visibility."
 
-  defp resolution_note(%{disposition: :merge}),
-    do: "Recorded for the merge (LLM-synthesis) step — not applied by the nightly executor yet."
+  # The twins below. NOT "left for review": a supersede/merge deliberately recorded below
+  # high is closed as DISMISSED by the next nightly run and the pair leaves the queue, so a
+  # note promising review would send the caller back to a surface the verdict is no longer
+  # on. Re-recording at high confidence is the only route to applying it.
+  defp resolution_note(%{disposition: disposition}) when disposition in [:supersede, :merge],
+    do:
+      "Recorded, but NOT auto-applied: #{disposition} executes only at confidence \"high\". " <>
+        "The next nightly run CLOSES it as dismissed (both articles retained) and the pair " <>
+        "leaves GET /knowledge/conflicts — re-annotate at high confidence to apply it."
 
   # --- Private helpers ---
 

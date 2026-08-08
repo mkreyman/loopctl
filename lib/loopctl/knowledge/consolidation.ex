@@ -336,7 +336,9 @@ defmodule Loopctl.Knowledge.Consolidation do
   Applies the `:duplicate_capture` proposals that TWO consecutive runs agree on.
 
   The only class this pass applies by itself, and the only action it will take: keep the
-  richest article of a duplicate group and UNPUBLISH the rest.
+  OLDEST article of a duplicate group and UNPUBLISH every later one. Age, not length, is
+  the winner rule — see `apply_live_group/4` for why (age is the one input a later writer
+  cannot manufacture).
 
   ## Why unpublish and never archive
 
@@ -964,27 +966,39 @@ defmodule Loopctl.Knowledge.Consolidation do
   defp enqueue_backfill(_tenant_id, []), do: :ok
 
   defp enqueue_backfill(tenant_id, ids) do
-    # The positive half of the statement `log_uncorroborated/5` used to make on this path's
-    # behalf, said HERE where the enqueue actually happens — so "enqueued" is only ever
-    # printed by the branch that enqueues.
-    Logger.info(
-      "Consolidation: tenant=#{tenant_id} enqueued an embedding backfill for " <>
-        "#{length(ids)} withheld member(s); the withhold clears once the vectors land."
-    )
+    enqueued =
+      ids
+      |> Enum.chunk_every(Knowledge.embedding_batch_max())
+      |> Enum.map(fn chunk ->
+        # `Oban.insert/1` returns `{:error, changeset}` without raising, so throwing the
+        # result away left the ONLY failure mode that does not log — the group counted
+        # uncorroborated with an enqueue that never happened, indistinguishable from a
+        # successful one.
+        case %{article_ids: chunk, tenant_id: tenant_id}
+             |> BatchArticleEmbeddingWorker.new()
+             |> Oban.insert() do
+          {:ok, _job} ->
+            length(chunk)
 
-    ids
-    |> Enum.chunk_every(Knowledge.embedding_batch_max())
-    |> Enum.each(fn chunk ->
-      # `Oban.insert/1` returns `{:error, changeset}` without raising, so throwing the result
-      # away left the ONLY failure mode that does not log — the group counted uncorroborated
-      # with an enqueue that never happened, indistinguishable from a successful one.
-      case %{article_ids: chunk, tenant_id: tenant_id}
-           |> BatchArticleEmbeddingWorker.new()
-           |> Oban.insert() do
-        {:ok, _job} -> :ok
-        {:error, reason} -> log_backfill_failed(tenant_id, "insert:" <> insert_tag(reason))
-      end
-    end)
+          {:error, reason} ->
+            log_backfill_failed(tenant_id, "insert:" <> insert_tag(reason))
+            0
+        end
+      end)
+      |> Enum.sum()
+
+    # AFTER the inserts, counting what actually landed. Printed at the top it was the same
+    # before-the-fact claim this path was fixed to stop making: a run where every insert
+    # failed still asserted "enqueued", and the operator scanning for the positive line read
+    # a total failure as a transient gap. Zero enqueued prints nothing — the failures
+    # already logged themselves.
+    if enqueued > 0 do
+      Logger.info(
+        "Consolidation: tenant=#{tenant_id} enqueued an embedding backfill for " <>
+          "#{enqueued} of #{length(ids)} withheld member(s); the withhold clears once the " <>
+          "vectors land."
+      )
+    end
 
     :ok
   rescue
@@ -1235,7 +1249,12 @@ defmodule Loopctl.Knowledge.Consolidation do
             "#{length(ids)} published articles are the same capture under #{reason}. " <>
               "The novelty gate does not catch this: novelty scoring and idempotency are separate paths.",
           suggested_action:
-            "Keep the richest article and UNPUBLISH the rest — do not archive them. " <>
+            "Keep the EARLIEST capture and UNPUBLISH every later one — not the richest, and " <>
+              "do not archive them. Age is the one input a later writer cannot manufacture, " <>
+              "so keeping the oldest is what stops a longer near-copy written beside an " <>
+              "established article from retiring it. This is the rule the nightly pass " <>
+              "applies, so a hand-applied remedy that keeps a different member will be " <>
+              "re-fought by it. " <>
               "`:archived` is TERMINAL for an article: `Article`'s transition table has no " <>
               "`{:archived, _}` and there is no unarchive function, so the only way back is a " <>
               "`user+` PATCH carrying an explicit status. `{:published, :draft}` and " <>
@@ -1941,6 +1960,10 @@ defmodule Loopctl.Knowledge.Consolidation do
     end
   end
 
+  # Catch-all for an entry shape that carries no `article_id` (only a legacy/persisted one
+  # can). It cannot be liveness-checked, but it must not be the one path that serves an
+  # `idempotency_key` back: read-time redaction is unconditional or it is not a rule.
+  defp redact_entry(entry, _live) when is_map(entry), do: Map.delete(entry, "idempotency_key")
   defp redact_entry(entry, _live), do: entry
 
   # Liveness for redaction is "the article still exists and is recoverable" — NOT "still

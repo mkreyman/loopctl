@@ -267,7 +267,9 @@ defmodule Loopctl.Egress.ScopeThreadingTest do
             "target_article_id" => marked.id,
             "disposition" => "merge",
             "authoritative_article_id" => marked.id,
-            "confidence" => "high"
+            "confidence" => "high",
+            # Required on every verdict the executor applies unattended, merge included.
+            "evidence" => "same capture; bodies agree"
           },
           actor_role: :orchestrator
         )

@@ -13,13 +13,14 @@ defmodule LoopctlWeb.ArticleJSON do
   it ENUMERATED the capture identities of every article a reader merely has read access
   to, in bulk, unprompted. It is therefore no longer rendered in any article payload.
 
-  What this does NOT claim is secrecy for the key. The FILTER is untouched and is not
-  scoped to keys the caller wrote, so a caller that GUESSES a key still learns from
-  `meta.total_count` whether a visible article carries it — and the ingestion worker's keys
-  (`ingest:<hash>:<chunk>:<idx>`) are derivable. Visibility scoping still applies, so
-  another agent's `private`/`owner` article never answers. This change removes the bulk
-  disclosure; it does not turn the key into a secret, and nothing should be built as if it
-  had.
+  What this does NOT claim is secrecy for the key. The FILTER is deliberately kept — it is
+  the "have I already captured this?" check — and it is an EXACT match on a key the caller
+  must already hold or guess, answered only by articles the caller can read in full
+  (visibility scoping applies to the filter exactly as to any other list query, so another
+  agent's `private`/`owner` article never answers). What remains is therefore bounded to
+  "an article you can already read also tells you its capture key", not an enumeration and
+  not a probe of anything you cannot see. Nothing should be built as if the key were a
+  secret, and nothing needs to be.
   """
 
   @doc """
