@@ -96,8 +96,8 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
   `get_dispatch_lineage/2`) fails **CLOSED**, and the `assigned_agent_id`
   equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
-  `progress.ex:569-608`); that write is result-checked, and a failure flags `verifier_needed` plus a
-  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:621`) instead of
+  `progress.ex:584-631`); that write is result-checked, and a failure flags `verifier_needed` plus a
+  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:636`) instead of
   silently leaving the field nil. `request-review` is OPTIONAL, so most stories reach verify with no
   verifier dispatch — the CALLER-lineage step is what keeps that path lineage-gated.
 - **report** — `validate_not_self_report/3`. `nil` caller blocked
@@ -158,21 +158,32 @@ correct behavior; do not add a workaround.
   pool includes `:agent` dispatches, the endpoint is `exact_role: :orchestrator`, and a legacy
   env-var key has lineage `[]`). Those transitions are gated by L4 instead. Do not "restore"
   them without first making the entitled principal able to obtain the token.
-- `verify/2` (`capabilities.ex:90-107`), decided by `validate_cap/6` (`capabilities.ex:205-213`) —
+- `verify/2` (`capabilities.ex:112-131`), decided by `validate_cap/6` (`capabilities.ex:227-236`) —
   type match + story match + **lineage exact match** + not-expired + not-consumed + a valid
   **ed25519 signature** over the token fields, checked against the tenant's
-  `audit_signing_public_key` (`check_signature/2`, `capabilities.ex:218-246`, which fails CLOSED on
+  `audit_signing_public_key` (`check_signature/2`, `capabilities.ex:240-266`, which fails CLOSED on
   every path, including when the tenant has no pubkey). There is NO "nonce exists" check; the nonce
   is an input to the signed message. The signature is the ONLY cryptographic check — never remove it
   as ceremony.
 
   **A signature failure splits by KEY STATE, and the split is what the audit chain asserts about
-  the caller.** `issuance_key_available?/3` (`capabilities.ex:262-269`) asks whether the key that
+  the caller.** `issuance_key_available?/4` (`capabilities.ex:285-292`) asks whether the key that
   was IN FORCE at the token's `issued_at` could be consulted at all — a `tenant_audit_key_history`
-  row covering `issued_at`, or the current key when `audit_key_rotated_at` is nil or not after it.
+  row covering `issued_at`, or the current key when it was not rotated in after issuance AND it
+  still CORRESPONDS to the private key the tenant signs with (`keypair_coherent?/2`). That last
+  test is not optional: an out-of-band `UPDATE` of `audit_signing_public_key` leaves
+  `audit_key_rotated_at` untouched, so a timestamp comparison alone reads the replacement as "in
+  force since before issuance" and brands every outstanding token a forgery.
   Yes and the signature still failed ⇒ `:invalid_signature`, recorded as `capability_forged` with
-  `byzantine: true`. No — the key was CLEARED, or replaced out of band with nothing archived ⇒
-  `:signing_key_unavailable`, recorded as `capability_key_unavailable` with `byzantine: false`.
+  `byzantine: true`. No — the key was CLEARED, replaced out of band, or rotated with nothing
+  archived ⇒ `:signing_key_unavailable`, recorded as `capability_key_unavailable` with
+  `byzantine: false`, and answered to the CLIENT as 503 `capability_key_unavailable` with NO
+  `retry-after` (it used to share `missing_capability`'s 403, whose remediation is recover-cap —
+  which mints through the same unusable key, so the caller was sent round a loop it cannot exit).
+  `mint/4` refuses symmetrically: it verifies its OWN signature against the advertised public key
+  before inserting, so a rotation whose new secret is not deployed yet fails the MINT
+  (`{:key_unavailable, :signing_key_superseded}`) instead of issuing a token that will later be
+  called forged.
   An authentic token fails identically in that key state, so the reason carries no information
   about the caller, and `capability_forged` is a PERMANENT accusation in an append-only log.
   `:signing_key_unavailable` is deliberately OUTSIDE `@cap_rejected_refusals`
@@ -181,14 +192,14 @@ correct behavior; do not add a workaround.
   token, so a caller cannot steer its own forgery into the softer label. The current key stays a
   verification CANDIDATE regardless of that test — excluding it would refuse a token a rotation
   racing `mint/4` genuinely signed.
-- `consume/1` (`capabilities.ex:116-129`) — **atomic** `update_all ... where consumed_at IS NULL`; the
+- `consume/1` (`capabilities.ex:138-151`) — **atomic** `update_all ... where consumed_at IS NULL`; the
   `{0, _}` branch returns `:replay`. This is the TOCTOU-safe single-use guard — never replace it with
   a read-then-write.
 
 **Enforcement is conditional — this is the deprecation seam.** `Progress.maybe_consume_cap/6`
-(`progress.ex:352-398`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
+(`progress.ex:392-415`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
 `:missing_capability` **only for tenants that have an audit key** (`tenant_has_audit_key?/1`,
-`progress.ex:649-654`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
+`progress.ex:664-669`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
 proceeds with NO capability at all. So L1 strength is per-tenant. A REJECTED cap is split by
 `cap_refusal/4`: only `:invalid_signature` / `:replay` surface as `{:cap_rejected, _}`, which
 FallbackController answers with a plain 403 — it halts NOTHING and counts toward nothing (see the
@@ -232,7 +243,7 @@ exist, but every one descends from the implementer's root — the single-root te
 not a shortage; its remedy is the operator minting an independently-rooted verifier tree.
 
 **Empty-lineage caveat, in BOTH directions.** When the implementer dispatch cannot be loaded,
-`assign_rotating_verifier/3` passes `[]` (`progress.ex:569-573`), and with `[]` the rejection is
+`assign_rotating_verifier/3` passes `[]` (`progress.ex:584-588`), and with `[]` the rejection is
 inert — selection can then pick a same-lineage (even the implementer's own) dispatch. The verify-time
 comparison is fail-closed on an empty lineage, so this is caught at verify rather than at selection;
 do not "simplify" either half.
@@ -381,7 +392,7 @@ gate, and an empty lineage is never a match.
 
 - **`tenancy-rls`** — custody writes/consume run on `AdminRepo` (BYPASSRLS: an explicit `tenant_id`
   predicate is the ONLY isolation). Custody READS fetch by `(id, tenant_id)`; `Capabilities.consume/1`
-  (`capabilities.ex:116-129`) is **id-only** — its `update_all` filters on `c.id` alone (`:97-98`) and
+  (`capabilities.ex:138-151`) is **id-only** — its `update_all` filters on `c.id` alone (`:97-98`) and
   inherits its tenant scoping from the `verify/2` that fetched the row. Never call it on a row you did
   not fetch tenant-scoped.
 - **`knowledge-wiki`** — the KB-content carve-out (#331) is the one agent-role exception to archive/delete⇒:user.

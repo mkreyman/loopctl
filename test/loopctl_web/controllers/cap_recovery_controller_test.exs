@@ -77,6 +77,11 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
   #     recovered cap must bind to, because `Capabilities.validate_cap/6` demands
   #     an exact match against the lineage the CALLER presents at `POST /start`.
   #
+  # They are DIFFERENT dispatches under the SAME custody root, which is what a
+  # re-dispatch is. `caller_root: :other` makes the caller's root unrelated —
+  # recovery must refuse there, because the story keeps naming the old dispatch as
+  # its implementer and the L4 gates compare against that.
+  #
   # `caller_dispatch: false` drops the caller's dispatch, leaving the key
   # unlineaged (a legacy env-var key).
   defp setup_ctx(opts \\ %{}) do
@@ -94,6 +99,9 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
       :unavailable ->
         Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:error, :secret_store_unavailable} end)
 
+      :absent ->
+        Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:error, :not_found} end)
+
       :ok ->
         Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:ok, priv} end)
     end
@@ -110,8 +118,16 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
       fixture(:api_key, %{tenant_id: tenant.id, role: role, agent_id: agent.id})
 
     story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
-    impl_lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
-    caller_lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+    root = Ecto.UUID.generate()
+    impl_lineage = [root, Ecto.UUID.generate()]
+
+    caller_root =
+      case Map.get(opts, :caller_root, :same) do
+        :same -> root
+        :other -> Ecto.UUID.generate()
+      end
+
+    caller_lineage = [caller_root, Ecto.UUID.generate()]
 
     if Map.get(opts, :caller_dispatch, true) do
       insert_dispatch(tenant.id, agent.id, nil, caller_lineage, %{api_key_id: api_key.id})
@@ -274,6 +290,24 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
       assert caps_for(story.id) == []
     end
 
+    test "an agent key with NO agent_id gets the documented 404, not a 500", %{conn: conn} do
+      # A legacy env-var agent key owns nothing. The ownership query interpolated
+      # that nil into `s.assigned_agent_id == ^agent_id`, which Ecto REFUSES with
+      # an ArgumentError, so the refusal surfaced as a 500.
+      %{tenant: tenant, story: story} = setup_ctx()
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: nil})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
+
+      assert %{"error" => %{"status" => 404}} = json_response(conn, 404)
+      assert caps_for(story.id) == []
+    end
+
     test "returns 404 for a same-tenant story assigned to another agent", %{conn: conn} do
       %{raw_key: raw_key, tenant: tenant} = setup_ctx()
 
@@ -417,17 +451,61 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
       # cannot be read. The body used to be "Cannot mint cap: #{inspect(reason)}",
       # which handed an agent-role caller internal error structure and gave it no
       # stable string to branch on.
+      #
+      # It answers through FallbackController, exactly as `POST /claim` answers
+      # this IDENTICAL condition: a 422 here (where claim says 503) told a client
+      # branching on status class that a transient secret-store fault was
+      # permanent, and gave the same condition two different codes.
       %{raw_key: raw_key, story: story} = setup_ctx(%{secrets: :unavailable})
 
       body =
         conn
         |> auth_conn(raw_key)
         |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
-        |> json_response(422)
+        |> json_response(503)
 
-      assert body["error"]["code"] == "cap_mint_failed"
+      assert body["error"]["code"] == "capability_mint_failed"
       refute body["error"]["message"] =~ "key_unavailable"
       refute body["error"]["message"] =~ "secret_store_unavailable"
+      assert caps_for(story.id) == []
+    end
+
+    test "a key that is ABSENT, not merely unreachable, is answered as non-retryable",
+         %{conn: conn} do
+      # `:not_found` is an operator condition: retrying cannot clear it, and
+      # `retry-after` on it is what turned agents into hot-loops against a state
+      # only a human can fix.
+      %{raw_key: raw_key, story: story} = setup_ctx(%{secrets: :absent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
+
+      assert %{"error" => %{"code" => "capability_key_unavailable"}} = json_response(conn, 503)
+      assert get_resp_header(conn, "retry-after") == []
+      assert caps_for(story.id) == []
+    end
+  end
+
+  describe "POST /api/v1/stories/:id/recover-cap — custody tree" do
+    test "refuses a caller whose lineage shares no root with the implementer dispatch",
+         %{conn: conn} do
+      # Recovery never rewrites `implementer_dispatch_id`, so the story keeps
+      # naming the OLD dispatch as its implementer. Minting for an unrelated tree
+      # would leave that provenance pointing at a tree that did no work — and a
+      # sibling dispatch of the tree that DID would then share no prefix with it,
+      # carry its own agent_id, and pass `validate_not_self_report/3`.
+      %{raw_key: raw_key, story: story} = setup_ctx(%{caller_root: :other})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
+
+      assert %{"error" => %{"status" => 409, "code" => "caller_lineage_unrelated"}} =
+               json_response(conn, 409)
+
       assert caps_for(story.id) == []
     end
   end

@@ -33,7 +33,11 @@ defmodule LoopctlWeb.CapRecoveryController do
       story's custody provenance — what report/review-complete/verify
       compare a caller's lineage against — and letting an agent re-anchor
       it by re-minting would hand it the separation the L4 gates exist to
-      demand of it.
+      demand of it. Because it is not rewritten, the caller's lineage must
+      still SHARE A ROOT with it (`same_custody_tree/2`): a recovery from an
+      unrelated tree would leave the story naming a custody tree that did no
+      work, and a sibling of the tree that DID would then pass those gates.
+      Crossing dispatches is the point; crossing trees is the hole.
     * A caller with NO lineage of its own is refused
       (`caller_lineage_required`) on a story whose work WAS dispatch-minted.
       Minting an `[]`-lineage cap there would let an unlineaged legacy key
@@ -74,8 +78,9 @@ defmodule LoopctlWeb.CapRecoveryController do
 
     with :ok <- validate_start_cap(params),
          {:ok, story} <- fetch_owned_story(tenant_id, agent_id, story_id),
-         :ok <- implementer_dispatch_usable(tenant_id, story),
+         {:ok, impl_lineage} <- implementer_dispatch_lineage(tenant_id, story),
          {:ok, lineage} <- caller_lineage(tenant_id, api_key.id),
+         :ok <- same_custody_tree(lineage, impl_lineage),
          {:ok, cap} <- Capabilities.mint(tenant_id, "start_cap", story.id, lineage) do
       conn
       |> put_status(:created)
@@ -117,11 +122,28 @@ defmodule LoopctlWeb.CapRecoveryController do
             "none. Call again with an ephemeral key from POST /api/v1/dispatches."
         )
 
+      {:error, :caller_lineage_unrelated} ->
+        error(
+          conn,
+          409,
+          "caller_lineage_unrelated",
+          "Your dispatch lineage shares no root with the dispatch that claimed this story, " <>
+            "so recovering a capability here would leave the story's recorded implementer " <>
+            "provenance naming a custody tree that did no work — and the L4 separation " <>
+            "checks on report/review-complete/verify would compare against it. Have the " <>
+            "orchestrator force_unclaim the story and claim it again."
+        )
+
       # The remaining shapes are internal failures of the mint itself (an
-      # unreachable secret store, a changeset). `inspect`ing the term into the
-      # response body leaked internal error structure to an agent-role caller and
-      # gave it no stable string to branch on. The term goes to the log; the
-      # caller gets the code.
+      # unreachable secret store, a superseded key, a changeset). `inspect`ing the
+      # term into the response body leaked internal error structure to an
+      # agent-role caller and gave it no stable string to branch on. The term goes
+      # to the log; the caller gets the code — and it gets it from
+      # `FallbackController`, the same way `POST /claim` answers the IDENTICAL
+      # condition, so status, code and retry semantics cannot drift between the
+      # two paths (this used to answer 422 `cap_mint_failed` where claim answers
+      # 503 `capability_mint_failed`, so a client branching on status class read a
+      # transient fault as permanent).
       {:error, reason} ->
         Logger.error(
           "cap_recovery_mint_failed: could not mint a start_cap — " <>
@@ -129,13 +151,9 @@ defmodule LoopctlWeb.CapRecoveryController do
             "caller_agent_id=#{inspect(agent_id)} reason=#{inspect(reason)}"
         )
 
-        error(
+        LoopctlWeb.FallbackController.call(
           conn,
-          422,
-          "cap_mint_failed",
-          "Could not mint a capability for this story. This is a server-side condition, " <>
-            "not something the request can fix — retry shortly, and ask an operator to " <>
-            "check the tenant's audit signing key if it persists."
+          {:error, Capabilities.mint_failure_class(reason)}
         )
     end
   end
@@ -152,6 +170,12 @@ defmodule LoopctlWeb.CapRecoveryController do
       _other -> {:error, :invalid_cap_type}
     end
   end
+
+  # A key with NO agent_id (a legacy env-var agent key) can own nothing: the
+  # comparison below is an interpolated `== nil`, which Ecto REFUSES with an
+  # ArgumentError, so the documented 404 surfaced as a 500. Mirrors the explicit
+  # nil clause on `Capabilities.list_for_assigned_agent/3`.
+  defp fetch_owned_story(_tenant_id, nil, _story_id), do: {:error, :not_found}
 
   defp fetch_owned_story(tenant_id, agent_id, story_id) do
     story =
@@ -174,16 +198,32 @@ defmodule LoopctlWeb.CapRecoveryController do
   # and an agent that lost its session has almost always outlived its original
   # dispatch, so refusing there closed the recovery path in exactly the situation
   # it exists for.
-  defp implementer_dispatch_usable(_tenant_id, %Story{implementer_dispatch_id: nil}),
+  defp implementer_dispatch_lineage(_tenant_id, %Story{implementer_dispatch_id: nil}),
     do: {:error, :no_dispatch_lineage}
 
-  defp implementer_dispatch_usable(tenant_id, %Story{implementer_dispatch_id: dispatch_id}) do
+  defp implementer_dispatch_lineage(tenant_id, %Story{implementer_dispatch_id: dispatch_id}) do
     case Dispatches.get_dispatch(tenant_id, dispatch_id) do
       {:ok, %{revoked_at: revoked}} when not is_nil(revoked) -> {:error, :dispatch_revoked}
       {:ok, %{lineage_path: []}} -> {:error, :no_dispatch_lineage}
-      {:ok, _dispatch} -> :ok
+      {:ok, dispatch} -> {:ok, dispatch.lineage_path}
       _ -> {:error, :no_dispatch_lineage}
     end
+  end
+
+  # Recovery may cross DISPATCHES but not custody TREES. Recovery deliberately
+  # never rewrites `implementer_dispatch_id`, so the story keeps naming the dead
+  # dispatch as its implementer — and that is what `validate_not_self_report/3`,
+  # `validate_not_self_review/3` and `validate_not_self_verify/2` compare a
+  # caller's lineage against. Let the recovering caller come from an UNRELATED
+  # root and the recorded provenance names a tree that did no work: a sibling or
+  # child dispatch of the one that actually implemented then shares no prefix with
+  # it, carries its own agent_id, and can report its own work. Requiring a shared
+  # root (`lineage_shares_prefix?/2`) keeps the recorded implementer a truthful
+  # stand-in for whoever recovered, which is exactly what those gates assume.
+  defp same_custody_tree(caller_lineage, impl_lineage) do
+    if Dispatches.lineage_shares_prefix?(caller_lineage, impl_lineage),
+      do: :ok,
+      else: {:error, :caller_lineage_unrelated}
   end
 
   # The CALLER's lineage, resolved from the key the request authenticated with —

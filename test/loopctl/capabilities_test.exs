@@ -139,6 +139,35 @@ defmodule Loopctl.CapabilitiesTest do
     end
   end
 
+  describe "mint/4 — never issue a token the tenant's advertised key cannot check" do
+    test "refuses to mint when the signing key no longer matches the advertised one" do
+      # A rotation commits the new public key to the tenant row BEFORE the new
+      # secret is readable, so the signer is the RETIRED half. Minting there
+      # produces a token that verifies against nothing and is refused later as
+      # `capability_forged`/`byzantine: true` — a permanent false accusation about
+      # an agent that did nothing. The mint fails instead, as an operator fault.
+      %{tenant: tenant, story: story, lineage: lineage} = setup_cap_context()
+      assert {:ok, _cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
+
+      {new_pub, _new_priv} = :crypto.generate_key(:eddsa, :ed25519)
+
+      tenant
+      |> Ecto.Changeset.change(audit_signing_public_key: new_pub)
+      |> Loopctl.AdminRepo.update!()
+
+      assert {:error, {:key_unavailable, :signing_key_superseded}} =
+               Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
+
+      # And it is classified as the PERSISTENT condition it is: retrying cannot
+      # clear it, so it must not be answered with a retry-after.
+      assert Capabilities.mint_failure_class({:key_unavailable, :signing_key_superseded}) ==
+               :capability_key_unavailable
+
+      assert Capabilities.mint_failure_class({:key_unavailable, :secret_store_unavailable}) ==
+               :capability_mint_failed
+    end
+  end
+
   describe "verify/2 — signature failure is split by KEY STATE, not lumped as forgery" do
     # `:invalid_signature` is recorded as `capability_forged` with
     # `byzantine: true` in the APPEND-ONLY audit chain. Returning it when the
@@ -219,6 +248,25 @@ defmodule Loopctl.CapabilitiesTest do
       |> Loopctl.AdminRepo.update!()
 
       assert {:error, :invalid_signature} = verify_start_cap(tenant, cap, story, lineage)
+    end
+
+    test "an OUT-OF-BAND key replacement is :signing_key_unavailable, not a forgery" do
+      # The replacement leaves `audit_key_rotated_at` exactly as it was, so a
+      # timestamp comparison reads the new key as "in force since before
+      # issuance" and brands every outstanding token a forgery. Only the keypair
+      # coherence check can tell this from a tampered signature: the tenant still
+      # SIGNS with the old private half, so the advertised key is not the one that
+      # was in force and no authentic token could verify against it either.
+      %{tenant: tenant, story: story, lineage: lineage} = setup_cap_context()
+      {:ok, cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
+
+      {new_pub, _new_priv} = :crypto.generate_key(:eddsa, :ed25519)
+
+      tenant
+      |> Ecto.Changeset.change(audit_signing_public_key: new_pub)
+      |> Loopctl.AdminRepo.update!()
+
+      assert {:error, :signing_key_unavailable} = verify_start_cap(tenant, cap, story, lineage)
     end
 
     test "a TAMPERED signature under the CURRENT, unrotated key is :invalid_signature" do

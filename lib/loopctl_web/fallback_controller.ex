@@ -310,6 +310,32 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # The tenant's audit signing key cannot be USED: absent from the secret store,
+  # superseded by a rotation whose private half is not readable yet, or replaced
+  # out of band. Every capability path is blocked by it and NONE of them is the
+  # caller's to fix — `recover-cap` in particular mints through the same key, so
+  # the `missing_capability` remediation this used to share sent the caller round
+  # a loop that cannot terminate. Deliberately NO `retry-after`: unlike
+  # `capability_mint_failed` this does not clear on its own, and advertising it as
+  # transient is what turned agents into hot-loops against an operator condition.
+  def call(conn, {:error, :capability_key_unavailable}) do
+    conn
+    |> put_status(:service_unavailable)
+    |> json(%{
+      error: %{
+        status: 503,
+        code: "capability_key_unavailable",
+        message:
+          "This tenant's audit signing key is unavailable, so no capability token can be " <>
+            "minted or checked. Nothing about your request is wrong, and re-minting via " <>
+            "POST /stories/:id/recover-cap will fail the same way. An operator must restore " <>
+            "the tenant's audit signing key (or archive the rotated-out one) before this " <>
+            "operation can succeed.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/capability-tokens"}
+      }
+    })
+  end
+
   def call(conn, {:error, :missing_capability}) do
     conn
     |> put_status(:forbidden)

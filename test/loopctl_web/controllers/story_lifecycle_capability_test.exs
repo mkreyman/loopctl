@@ -432,10 +432,18 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
       )
       |> AdminRepo.update!()
 
-      conn
-      |> auth(impl.raw_key)
-      |> post("/api/v1/stories/#{story.id}/start", %{"capability" => start_cap["cap_id"]})
-      |> response(403)
+      # 503 `capability_key_unavailable`, not 403 `missing_capability`: the
+      # documented remedy for the latter is recover-cap, which mints through the
+      # SAME unusable key, so the caller was sent round a loop it cannot exit.
+      start_conn =
+        conn
+        |> auth(impl.raw_key)
+        |> post("/api/v1/stories/#{story.id}/start", %{"capability" => start_cap["cap_id"]})
+
+      assert %{"error" => %{"code" => "capability_key_unavailable"}} =
+               json_response(start_conn, 503)
+
+      assert get_resp_header(start_conn, "retry-after") == []
 
       assert [] ==
                Loopctl.AuditChain.Entry
@@ -467,10 +475,18 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
       |> Ecto.Changeset.change(audit_signing_public_key: nil)
       |> AdminRepo.update!()
 
-      conn
-      |> auth(impl.raw_key)
-      |> post("/api/v1/stories/#{story.id}/start", %{"capability" => start_cap["cap_id"]})
-      |> response(403)
+      # 503 `capability_key_unavailable`, not 403 `missing_capability`: the
+      # documented remedy for the latter is recover-cap, which mints through the
+      # SAME unusable key, so the caller was sent round a loop it cannot exit.
+      start_conn =
+        conn
+        |> auth(impl.raw_key)
+        |> post("/api/v1/stories/#{story.id}/start", %{"capability" => start_cap["cap_id"]})
+
+      assert %{"error" => %{"code" => "capability_key_unavailable"}} =
+               json_response(start_conn, 503)
+
+      assert get_resp_header(start_conn, "retry-after") == []
 
       assert [] ==
                Loopctl.AuditChain.Entry

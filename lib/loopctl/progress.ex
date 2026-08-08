@@ -253,15 +253,20 @@ defmodule Loopctl.Progress do
   end
 
   # Already logged with the underlying reason in mint_cap/4. The story is
-  # untouched — nothing was claimed — so the client's remedy is to retry.
+  # untouched — nothing was claimed. A transient mint failure is retryable; a key
+  # that is absent or superseded is not, and answering that one as retryable made
+  # agents hot-loop a claim only an operator can unblock.
+  defp claim_result({:error, :mint_cap, {:capability_key_unavailable, _reason}, _changes}),
+    do: {:error, :capability_key_unavailable}
+
   defp claim_result({:error, :mint_cap, {:capability_mint_failed, _reason}, _changes}),
     do: {:error, :capability_mint_failed}
 
-  defp claim_result({:error, :story, changeset, _changes}), do: {:error, changeset}
-
-  defp claim_result({:error, step, reason, _changes})
-       when step in [:lock, :validate, :check_deps],
-       do: {:error, reason}
+  # Every OTHER failing step surfaces its own reason. A catch-all, not an
+  # enumerated list of steps: an unlisted one (`:audit`, `:webhook_events`, and
+  # whatever the multi grows next) raised FunctionClauseError, i.e. a 500, for a
+  # failure the transaction had already handled correctly by rolling back.
+  defp claim_result({:error, _step, reason, _changes}), do: {:error, reason}
 
   # An `Ecto.Multi` step: mints a capability token so the caller can hand it to
   # the agent that will need it for the next custody op.
@@ -292,11 +297,14 @@ defmodule Loopctl.Progress do
 
       {:error, reason} ->
         if tenant_has_audit_key?(tenant_id) do
+          class = Capabilities.mint_failure_class(reason)
+
           Logger.error(
-            "capability_mint_failed: KEYED tenant could not mint a capability, so the " <>
-              "enclosing custody transaction was ROLLED BACK — nothing was claimed and the " <>
-              "agent should retry. " <>
-              "tenant_id=#{tenant_id} story_id=#{story_id} cap_type=#{typ} reason=#{inspect(reason)}"
+            "#{class}: KEYED tenant could not mint a capability, so the enclosing custody " <>
+              "transaction was ROLLED BACK — nothing was claimed. " <>
+              mint_failure_remedy(class) <>
+              " tenant_id=#{tenant_id} story_id=#{story_id} cap_type=#{typ} " <>
+              "reason=#{inspect(reason)}"
           )
 
           :telemetry.execute(
@@ -305,12 +313,19 @@ defmodule Loopctl.Progress do
             %{tenant_id: tenant_id, story_id: story_id, cap_type: typ, reason: reason}
           )
 
-          {:error, {:capability_mint_failed, reason}}
+          {:error, {class, reason}}
         else
           {:ok, nil}
         end
     end
   end
+
+  defp mint_failure_remedy(:capability_key_unavailable),
+    do:
+      "The tenant's audit signing key is ABSENT or SUPERSEDED — retrying cannot clear it; " <>
+        "an operator must restore it."
+
+  defp mint_failure_remedy(_class), do: "The agent should retry."
 
   # US-26.6.2: Computes the lazy-bastard score from token usage reports
   # and stores it in the story's metadata. Non-blocking — failures are logged.
@@ -801,6 +816,21 @@ defmodule Loopctl.Progress do
 
       {:error, :validate, reason, _} ->
         {:error, reason}
+
+      # There is no USABLE key to check the token against. Answering it as
+      # `missing_capability` told the caller to go get a capability, whose
+      # documented remedy is `POST /stories/:id/recover-cap` — which mints through
+      # the SAME unusable key and fails identically. That is a loop no client can
+      # exit, so the key state gets its own code naming the OPERATOR action.
+      {:error, :consume_cap, {:cap_unusable, :signing_key_unavailable}, _} ->
+        record_cap_refusal(
+          tenant_id,
+          story_id,
+          :signing_key_unavailable,
+          cap_ctx(cap_id, lineage, actor_id, agent_id)
+        )
+
+        {:error, :capability_key_unavailable}
 
       {:error, :consume_cap, {:cap_unusable, reason}, _} ->
         record_cap_refusal(

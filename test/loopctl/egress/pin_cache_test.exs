@@ -118,6 +118,46 @@ defmodule Loopctl.Egress.PinCacheTest do
       assert PinCache.resident(t.id) == 0
     end
 
+    test "the cap bounds PINS, never the marking or the DNS-miss protection",
+         %{tenant: t, scope: scope} do
+      # Past the cap a new PIN is refused — but a scope's marking and a NEGATIVE
+      # entry are protections, not growth: refusing them makes a large tenant
+      # re-read the marking from the database and repay a full DNS resolve on
+      # EVERY classification, which is the exact cost they exist to collapse.
+      key = Scope.key(scope)
+      cap = PinCache.max_entries_per_tenant()
+      attrs = %{base_verdict: :public, from_allowlist: false, ips: [], purposes: []}
+
+      for i <- 1..cap, do: PinCache.put(t.id, key, "p#{i}.example.com", attrs)
+
+      PinCache.put(t.id, key, "refused.example.com", attrs)
+      assert PinCache.fetch(t.id, key, "refused.example.com") == :miss
+
+      PinCache.put(t.id, key, :__marking__, %{local_only: true})
+      assert {:ok, %{local_only: true}} = PinCache.fetch(t.id, key, :__marking__)
+
+      negative = %{base_verdict: :unresolvable, resolve_error: :nxdomain, ips: [], purposes: []}
+      PinCache.put(t.id, key, "gone.example.com", negative)
+      assert {:ok, %{base_verdict: :unresolvable}} = PinCache.fetch(t.id, key, "gone.example.com")
+    end
+
+    test "a tenant holding NO live entry is re-anchored to zero", %{tenant: t, scope: scope} do
+      # A counter that drifted ABOVE the true count is the direction that locks a
+      # tenant out of its own share, and a tenant holding nothing is where it
+      # would otherwise stick: the reconcile now counts the TABLE and applies the
+      # difference, so a tenant absent from the live rows is still corrected.
+      key = Scope.key(scope)
+      attrs = %{base_verdict: :public, from_allowlist: false, ips: [], purposes: []}
+
+      PinCache.put(t.id, key, "drift.example.com", attrs)
+      # Drop the ROW behind the counter's back, exactly as an owner restart does.
+      :ets.delete(PinCache.table_name(), {t.id, key, "drift.example.com"})
+      assert PinCache.resident(t.id) == 1
+
+      PinCache.refresh_now(t.id)
+      assert PinCache.resident(t.id) == 0
+    end
+
     test "the sweep reconciles the counter to the true resident count",
          %{tenant: t, scope: scope} do
       key = Scope.key(scope)

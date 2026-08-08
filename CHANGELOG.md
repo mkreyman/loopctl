@@ -36,9 +36,18 @@ All notable changes to loopctl are documented here.
   nothing wrong: an authentic token fails identically in that key state, so the reason
   carried no information about the caller, and an append-only record cannot be retracted.
   Such a refusal is now `capability_key_unavailable` with `payload.byzantine: false` and
-  reason `signing_key_unavailable`. **The refusal itself is unchanged** — the operation
-  still fails closed with a 403, and a signature that fails against a key that IS available
-  is still `capability_forged` / `byzantine: true`. **Operator action:** if you see
+  reason `signing_key_unavailable`. A signature that fails against a key that IS available
+  is still `capability_forged` / `byzantine: true` — and the two are now told apart by
+  whether the tenant's advertised public key still CORRESPONDS to the private key it signs
+  with, not by `audit_key_rotated_at` alone (an out-of-band `UPDATE` of the key leaves that
+  timestamp untouched, so it read every outstanding token as a forgery). `mint` refuses
+  symmetrically: it verifies its own signature against the advertised key before issuing,
+  so a rotation whose new secret is not deployed yet fails the MINT instead of issuing a
+  token that will later be called forged. **New response:** the operation still fails
+  closed, but with `503 capability_key_unavailable` and NO `Retry-After` rather than `403
+  missing_capability` — the latter's documented remedy is `recover-cap`, which mints
+  through the same unusable key, so callers were sent round a loop only an operator can
+  break. **Operator action:** if you see
   `capability_key_unavailable`, restore or re-archive the tenant's audit key; existing
   `capability_forged` entries written before this change may be false positives for
   tenants whose key was cleared or rotated out of band, and should be re-read against the
@@ -50,9 +59,11 @@ All notable changes to loopctl are documented here.
   capability and no way forward: `start` demands one, `GET /stories/:id/capabilities` only
   delivers tokens already minted, and `recover-cap` needs an `implementer_dispatch_id` that
   a legacy bearer claim never records. Minting is now part of the claim transaction, so the
-  claim either delivers a usable capability or does not happen. **New response:** `503
-  capability_mint_failed` with a `Retry-After`; nothing was claimed and retrying is the
-  whole remedy. Keyless (pre-v2) tenants are unaffected — they claim with no capability, as
+  claim either delivers a usable capability or does not happen. **New responses:** `503
+  capability_mint_failed` with a `Retry-After` when the secret store merely blipped —
+  nothing was claimed and retrying is the whole remedy — and `503
+  capability_key_unavailable` with NO `Retry-After` when the audit key is absent or
+  superseded, which no amount of retrying can clear. Keyless (pre-v2) tenants are unaffected — they claim with no capability, as
   before.
 
 - **Capability recovery binds to the CALLER's dispatch lineage, so it works after a crash.**
@@ -65,9 +76,15 @@ All notable changes to loopctl are documented here.
   and `start` re-checks that). **Behaviour changes:** an implementer dispatch that has
   merely EXPIRED no longer blocks recovery (a revoked one still does, as `422
   dispatch_revoked`); a caller whose key no dispatch minted is refused with `409
-  caller_lineage_required` on dispatch-minted work. Every refusal from this endpoint now
-  carries a stable `error.code`, and the catch-all no longer renders an internal error term
-  into the response body (it is logged instead).
+  caller_lineage_required` on dispatch-minted work; and a caller whose lineage shares no
+  ROOT with the story's implementer dispatch is refused with `409 caller_lineage_unrelated`
+  (recovery deliberately never rewrites `implementer_dispatch_id`, so recovering across
+  custody trees would leave the story's provenance naming a tree that did no work, and the
+  L4 separation checks compare against it — have the orchestrator force-unclaim and claim
+  again). Every refusal from this endpoint now carries a stable `error.code`, the catch-all
+  no longer renders an internal error term into the response body (it is logged instead),
+  and a mint failure answers with the same status and code as `claim` does (`503`, not the
+  previous `422 cap_mint_failed`).
 
 - **The egress pin cache is bounded per tenant, not only globally.** Every host it holds
   arrives from tenant-writable input (a webhook destination, an ingest URL, a chat base
@@ -75,7 +92,11 @@ All notable changes to loopctl are documented here.
   50k-entry cap and get every OTHER tenant's next classification refused admission — a
   shared cache turned into a cross-tenant denial. Admission is now also capped per tenant.
   Past the cap new hosts are simply re-classified on demand (a `Logger.warning` names the
-  tenant); no verdict changes.
+  tenant); no verdict changes. The per-tenant cap bounds PINS only — a scope's `local_only`
+  marking and the negative cache for hosts that fail to resolve are exempt, since capping
+  those would make a large tenant repay a database read and a full DNS resolve on every
+  classification, which is the cost they exist to collapse. The global cap still bounds all
+  three.
 
 - **The story lifecycle is completable again for tenants with an audit signing key (#621).**
   Every tenant created through the current signup flow has one, and for those tenants the
