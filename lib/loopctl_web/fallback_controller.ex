@@ -283,6 +283,60 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # A custody transition that MINTS a capability could not mint one for a keyed
+  # tenant (an unreachable secret store, a cleared audit key), so the whole
+  # transition rolled back rather than committing a state the agent cannot act on
+  # — a claimed story whose `start` demands a capability that was never issued and
+  # whose recovery path needs a dispatch a legacy bearer claim never records.
+  # Nothing changed server-side, so retrying is both safe and the entire remedy;
+  # 503 (not 4xx) because the fault is ours.
+  def call(conn, {:error, :capability_mint_failed}) do
+    conn
+    |> put_resp_header("retry-after", "5")
+    |> put_status(:service_unavailable)
+    |> json(%{
+      error: %{
+        status: 503,
+        code: "capability_mint_failed",
+        message:
+          "The capability token this operation must issue could not be minted, so nothing " <>
+            "was changed — the story is exactly as it was. This is a server-side condition " <>
+            "(the tenant's audit signing key could not be read), not something your request " <>
+            "can fix. Retry shortly; if it persists an operator must check the tenant's " <>
+            "audit key.",
+        retry_after_seconds: 5,
+        remediation: %{learn_more: "https://loopctl.com/wiki/capability-tokens"}
+      }
+    })
+  end
+
+  # The tenant's audit signing key cannot be USED: absent from the secret store,
+  # corrupt in it, or replaced out of band. A rotation whose new private half is
+  # merely not DEPLOYED yet is NOT this — that closes on its own and answers
+  # `capability_mint_failed`. Every capability path is blocked by it and NONE is the
+  # caller's to fix — `recover-cap` in particular mints through the same key, so
+  # the `missing_capability` remediation this used to share sent the caller round
+  # a loop that cannot terminate. Deliberately NO `retry-after`: unlike
+  # `capability_mint_failed` this does not clear on its own, and advertising it as
+  # transient is what turned agents into hot-loops against an operator condition.
+  def call(conn, {:error, :capability_key_unavailable}) do
+    conn
+    |> put_status(:service_unavailable)
+    |> json(%{
+      error: %{
+        status: 503,
+        code: "capability_key_unavailable",
+        message:
+          "This tenant's audit signing key is unavailable, so no capability token can be " <>
+            "minted or checked. Nothing about your request is wrong, and re-minting via " <>
+            "POST /stories/:id/recover-cap will fail the same way. An operator must restore " <>
+            "the tenant's audit signing key (or archive the rotated-out one) before this " <>
+            "operation can succeed.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/capability-tokens"}
+      }
+    })
+  end
+
   def call(conn, {:error, :missing_capability}) do
     conn
     |> put_status(:forbidden)
@@ -479,6 +533,26 @@ defmodule LoopctlWeb.FallbackController do
         message:
           "The delete could not be recorded in the audit trail and was rolled back; " <>
             "the post still exists. Retry the request."
+      }
+    })
+  end
+
+  # A claim's transaction failed in a step that is not the caller's to fix (the
+  # custody audit entry, the webhook events) and rolled back, so the story is
+  # exactly as it was. ONE stable code rather than the failing step's own term:
+  # an audit-log changeset rendered as 422 asserted the request body was invalid
+  # using fields the caller never sent, and an unrenderable term crashed the
+  # controller that was supposed to answer it.
+  def call(conn, {:error, :claim_failed}) do
+    conn
+    |> put_status(:internal_server_error)
+    |> json(%{
+      error: %{
+        status: 500,
+        code: "claim_failed",
+        message:
+          "The claim could not be recorded and was rolled back; the story is unclaimed. " <>
+            "Nothing about your request is wrong — retry it."
       }
     })
   end
