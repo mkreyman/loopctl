@@ -1395,7 +1395,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       # ...and the CAP arm of the signal specifically, isolated from the pool/filter
       # starvation arm. Both assertions above are ALSO satisfied by starvation (a short
       # page with more filtered results behind it), so neither one alone proves
-      # `total_count > cap` is live: deleting that clause from `semantic_pool_capped?/4`
+      # `total_count > cap` is live: deleting that clause from `semantic_pool_capped?/5`
       # left the whole suite green. A page NARROWER than the cap comes back FULL
       # (`returned == limit`, so the starvation arm is false by construction) while the
       # corpus still exceeds the reachable pool — which is exactly the "true regardless of

@@ -482,7 +482,11 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       # resurfacing as an intermittent `left: []` in a sibling suite.
       candidates = length(system_rows) + 1
       limit = 50
-      reach = VectorSearch.side_table_inner_pool(min(limit, Knowledge.semantic_result_pool_cap()))
+
+      reach =
+        VectorSearch.side_table_ef_search(
+          VectorSearch.side_table_inner_pool(min(limit, Knowledge.semantic_result_pool_cap()))
+        )
 
       assert reach > candidates,
              "the side-table hydration pool (#{reach}) must exceed the #{candidates}-row " <>
@@ -497,22 +501,78 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
                Knowledge.search_semantic(tenant.id, vec(1536, :query), limit: limit)
 
       assert own.id in Enum.map(results, & &1.id)
-      # ...and it really is the WORST-ranked candidate, so its presence is pool capacity
+      # The WHOLE candidate set is served, not just `own` — that is what "pool > candidates"
+      # claims, and without it a pool regression that evicted most of the system rows would
+      # still pass on the score check alone. One ANN recall miss is tolerated so the
+      # approximate index cannot fail the run.
+      assert length(results) >= candidates - 1
+
+      # ...and `own` really is the WORST-ranked candidate, so its presence is pool capacity
       # doing its job, not a lucky tie. Compared by SCORE rather than by list position, so
       # a single ANN miss among the system rows cannot turn this into a false alarm.
       assert Enum.min_by(results, & &1.similarity_score).id == own.id
     end
 
+    # The reach the flag is compared against is the ANN's REAL return bound. The inner
+    # LIMIT is `pool * side_table_over_fetch()`, but an HNSW scan returns only
+    # ~`hnsw.ef_search` nodes regardless of the LIMIT, so the smaller of the two binds.
+    # Comparing against the unclamped over-fetch overstated the PROD reach 4x (4000 against
+    # the 1000-node ceiling) and reported "complete" for every corpus in between.
+    #
+    # Driven with the PROD-shaped cap, not the shrunk test one: at cap 30 the over-fetch
+    # (120) never reaches the ceiling, so a guard reading only the configured value would
+    # pass with the clamp deleted.
+    test "the side-table reach is clamped by the hnsw ef_search ceiling, not by the over-fetch" do
+      ceiling = VectorSearch.max_side_table_ef_search()
+      cap = ceiling
+
+      assert VectorSearch.side_table_inner_pool(cap) > ceiling,
+             "this guard is vacuous unless the over-fetch blows past the ef_search ceiling"
+
+      assert Knowledge.semantic_side_table_reach(cap) == ceiling
+
+      assert Knowledge.semantic_side_table_reach() ==
+               Knowledge.semantic_side_table_reach(Knowledge.semantic_result_pool_cap())
+    end
+
+    # `total_count` counts rows that SURVIVE the post-ANN status/visibility trim; the reach
+    # counts ANN candidate SLOTS, which the side-table inner index cannot filter. So when
+    # the window saturates and part of it is discarded, the ranked rows behind it are
+    # unreachable at any offset — and the starvation arm cannot say so, because it needs a
+    # SHORT page and this case delivers a full one.
+    test "a saturated ANN window that was trimmed reaches only what survived" do
+      inner_pool = VectorSearch.side_table_inner_pool(Knowledge.semantic_result_pool_cap())
+      ceiling = VectorSearch.side_table_ef_search(inner_pool)
+
+      assert Knowledge.semantic_side_table_response_reach(inner_pool, ceiling, 7) == 7
+
+      # Not saturated: the ANN already returned every candidate it could find, so nothing
+      # is behind the window and the corpus-level reach stands.
+      assert Knowledge.semantic_side_table_response_reach(inner_pool, ceiling - 1, 7) ==
+               Knowledge.semantic_side_table_reach()
+
+      # Saturated but nothing trimmed: the over-fetch bought exactly what it promised.
+      assert Knowledge.semantic_side_table_response_reach(inner_pool, ceiling, ceiling) ==
+               Knowledge.semantic_side_table_reach()
+    end
+
     # `meta.pool_capped == false` is documented to mean "this query's results are complete".
     # It used to compare `total_count` against the RAW cap on BOTH paths — but this path
-    # hydrates from `side_table_inner_pool(pool)`, so a corpus between the cap and that
-    # over-fetched reach is fully served and was still flagged truncated, telling the
-    # consumer to switch to list mode for nothing.
+    # hydrates from an over-fetched ANN pool, so a corpus between the cap and
+    # `semantic_side_table_reach/0` is fully served and was still flagged truncated, telling
+    # the consumer to switch to list mode for nothing.
+    #
+    # The page is deliberately NARROWER than the corpus: at `limit: corpus` a single ANN
+    # recall miss makes the page SHORT, which legitimately trips the starvation arm and
+    # would fail this test for a reason it is not about (the sibling crowding test carries
+    # the same margin).
     test "a corpus above the cap but within the side-table reach is not flagged truncated" do
       tenant = fixture(:tenant)
       cap = Knowledge.semantic_result_pool_cap()
       corpus = cap + 2
-      assert VectorSearch.side_table_inner_pool(cap) >= corpus
+      page = 10
+      assert Knowledge.semantic_side_table_reach() >= corpus
+      assert page < corpus
 
       for i <- 1..corpus do
         article =
@@ -525,10 +585,10 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       enable_side_table_reads()
 
       assert {:ok, %{results: results, meta: meta}} =
-               Knowledge.search_semantic(tenant.id, vec(1536, :query), limit: corpus)
+               Knowledge.search_semantic(tenant.id, vec(1536, :query), limit: page)
 
       assert meta.total_count == corpus
-      assert length(results) == corpus
+      assert length(results) == page
       refute meta.pool_capped
     end
 

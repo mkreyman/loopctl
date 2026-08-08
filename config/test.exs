@@ -208,14 +208,15 @@ unless System.get_env("SCALE_NIGHTLY") || System.get_env("SCALE_TESTS") do
   # DEAD, and records that rare recurrences remain and clear on rerun. Do not read this
   # comment as superseding it.
   #
-  # The cap must exceed the count of published system articles: a tenant that materializes
-  # the shared system corpus (AC-41.1.7) carries one embedding row per such article, and
-  # those crowd the page. That relationship is ASSERTED, not tallied here — see
-  # `embeddings_side_table_reads_test.exs`, which fails naming this knob if it stops
-  # holding. The side-table inner ANN then over-fetches `pool * side_table_over_fetch()`
-  # rows with `hnsw.ef_search` raised to match; that over-fetch offsets candidates a
-  # post-ANN status/visibility filter DISCARDS — it does not rescue a worst-ranked row from
-  # a page too narrow to hold it, so a ranking assertion still needs its own wide `limit:`.
+  # What must exceed the count of published system articles is the side-table REACH —
+  # `side_table_ef_search(side_table_inner_pool(pool))`, i.e. the over-fetched inner ANN
+  # clamped by `hnsw.ef_search` — not the raw cap: a tenant that materializes the shared
+  # system corpus (AC-41.1.7) carries one embedding row per such article, and those crowd
+  # the ANN pool. That is the relationship `embeddings_side_table_reads_test.exs` ASSERTS
+  # (it is not tallied here), naming this knob when it stops holding. The over-fetch
+  # offsets candidates a post-ANN status/visibility filter DISCARDS — it does not rescue a
+  # worst-ranked row from a page too narrow to hold it, so a ranking assertion still needs
+  # its own wide `limit:`.
   #
   # The `pool_capped` tests seed relative to `Knowledge.semantic_result_pool_cap/0` rather
   # than to a literal, so they cannot decouple from this value again. Raising it is bounded
