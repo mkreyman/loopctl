@@ -38,7 +38,13 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   # LCP-1 §9.3: under the `signed` custody profile, an enrolled verifier's claim
   # must carry a valid signature. No-op under the default `bearer` profile.
-  plug LoopctlWeb.Plugs.RequireSignedClaim, [gate: "verify"] when action in [:verify]
+  #
+  # `backfill` is mounted here too: it reaches the SAME `verified_status: :verified`
+  # terminal state as `verify`, on a single named work item, so leaving it off left an
+  # unsigned route to the outcome the signed profile exists to attribute. It shares
+  # the `verify` gate name deliberately — same transition, same claim binding.
+  plug LoopctlWeb.Plugs.RequireSignedClaim,
+       [gate: "verify"] when action in [:verify, :backfill]
 
   # The aggregate verify-all path reaches the SAME `verified` transition but cannot
   # carry a per-item signature; under `signed` it refuses an enrolled caller rather
@@ -86,6 +92,11 @@ defmodule LoopctlWeb.StoryVerificationController do
       "Marks a story as verified for work completed outside loopctl (e.g. before onboarding). " <>
         "Only permitted for stories that never entered loopctl's dispatch lifecycle — " <>
         "stories with `assigned_agent_id` set, or already `:verified`/`:rejected`, are refused. " <>
+        "A story whose audit log shows it was worked inside loopctl (a `status_changed` or " <>
+        "`force_unclaimed` entry) is refused even when its dispatch markers are now clear, so " <>
+        "clearing them cannot turn backfill into a shortcut past report/review/verify. " <>
+        "Under the LCP-1 `signed` custody profile an enrolled caller must present a valid " <>
+        "`claim` signature (gate `verify`), as for POST /stories/:id/verify. " <>
         "Requires a non-empty `reason`; `evidence_url` and `pr_number` are optional but strongly recommended. " <>
         "Emits a `story.backfilled` webhook event on success.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
@@ -102,11 +113,14 @@ defmodule LoopctlWeb.StoryVerificationController do
        }},
     responses: %{
       200 => {"Story backfilled", "application/json", Schemas.StoryStatusResponse},
+      401 =>
+        {"Claim signature required/invalid (LCP-1 signed profile)", "application/json",
+         Schemas.ErrorResponse},
       403 =>
         {"Insufficient role (orchestrator+ required)", "application/json", Schemas.ErrorResponse},
       404 => {"Story not found", "application/json", Schemas.ErrorResponse},
       422 =>
-        {"Validation error: missing reason, already verified, already rejected, or has dispatch lineage",
+        {"Validation error: missing reason, already verified, already rejected, has dispatch lineage, or already entered the lifecycle",
          "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -261,7 +275,16 @@ defmodule LoopctlWeb.StoryVerificationController do
   def backfill(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
-    opts = AuditContext.from_conn(conn)
+
+    opts =
+      Keyword.merge(AuditContext.from_conn(conn),
+        # LCP-1 §9.4: backfill mounts RequireSignedClaim (gate "verify") and reaches
+        # the same `verified` terminal state, so the verified claim must be recorded
+        # in the hash-chained audit entry — verifying it and dropping it leaves no
+        # durable residue and is half a control.
+        custody_claim: conn.assigns[:custody_signed_claim],
+        verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+      )
 
     case Progress.backfill_story(tenant_id, story_id, params, opts) do
       {:ok, story} ->
@@ -314,10 +337,20 @@ defmodule LoopctlWeb.StoryVerificationController do
       "Use the normal report_story → review_complete → verify_story flow instead."
   end
 
+  defp backfill_error_message(:story_entered_lifecycle) do
+    "Story is recorded as having entered the dispatch lifecycle (a status change, a force-unclaim " <>
+      "or an auto-reset) — by its own lifecycle stamp, the audit log, or both; the audit log is " <>
+      "pruned at AUDIT_RETENTION_DAYS, so an empty GET /stories/:id/history does not contradict " <>
+      "this. Its dispatch markers are now clear. Backfill is only for work completed " <>
+      "OUTSIDE the loopctl dispatch lifecycle, so it cannot certify this story. " <>
+      "Use the normal report_story -> review_complete -> verify_story flow instead."
+  end
+
   defp backfill_error_message(:story_in_progress) do
     "Story is mid-lifecycle (e.g. contracted) with no dispatch lineage yet — it is " <>
-      "being worked, not pre-existing done work. Let the report → review → verify " <>
-      "flow run, or force_unclaim it back to pending first if it was abandoned."
+      "being worked, not pre-existing done work. Let the report_story → review_complete " <>
+      "→ verify_story flow run. force_unclaim does NOT make it backfillable: it records " <>
+      "a lifecycle entry, after which backfill refuses with `story_entered_lifecycle`."
   end
 
   @doc """
@@ -331,7 +364,14 @@ defmodule LoopctlWeb.StoryVerificationController do
 
     with :ok <- validate_orchestrator_agent_linked(api_key) do
       tenant_id = api_key.tenant_id
-      opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
+
+      opts =
+        Keyword.merge(AuditContext.from_conn(conn),
+          orchestrator_agent_id: api_key.agent_id,
+          # Reject is a custody decision (terminal `:rejected` + auto-reset), so it
+          # takes the same server-resolved caller lineage verify does.
+          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+        )
 
       case Progress.reject_story(tenant_id, story_id, params, opts) do
         {:ok, story} ->
@@ -441,7 +481,15 @@ defmodule LoopctlWeb.StoryVerificationController do
 
     with :ok <- validate_orchestrator_agent_linked(api_key) do
       tenant_id = api_key.tenant_id
-      opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
+
+      opts =
+        Keyword.merge(AuditContext.from_conn(conn),
+          orchestrator_agent_id: api_key.agent_id,
+          # verify-all forwards these opts to verify_story/4 per story, so omitting
+          # the caller's lineage skipped the whole L4 comparison on the WIDER-blast-
+          # radius path while the single-story route enforced it.
+          verifier_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+        )
 
       {:ok, result} = Progress.verify_all_in_epic(tenant_id, epic_id, params, opts)
       json(conn, result)

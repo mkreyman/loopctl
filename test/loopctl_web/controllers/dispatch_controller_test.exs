@@ -14,10 +14,12 @@ defmodule LoopctlWeb.DispatchControllerTest do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
   end
 
-  # The :create action is orchestrator-role + human-anchored.
+  # The :create action is orchestrator-role+ and human-anchored. These cases mint a
+  # ROOT dispatch (no parent), which the lineage ceiling reserves for the tenant's
+  # OPERATOR key — a `user`-role key that no dispatch minted.
   defp orchestrator_ctx do
     tenant = fixture(:tenant, %{trust_tier: :human_anchored})
-    {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+    {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
     agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
     %{tenant: tenant, raw_key: raw_key, agent: agent}
   end

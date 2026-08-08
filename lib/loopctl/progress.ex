@@ -464,20 +464,33 @@ defmodule Loopctl.Progress do
             # No verify_cap is minted: see verify_story/4 for why L1 cannot gate
             # verify. The selection itself is the gate — it writes
             # verifier_dispatch_id, which validate_not_self_verify/2 enforces.
-            Loopctl.AuditChain.append(tenant_id, %{
+            tenant_id
+            |> Loopctl.AuditChain.append(%{
               action: "verifier_selected",
               actor_lineage: [],
               entity_type: "story",
               entity_id: story_id,
               payload: %{"verifier_dispatch_id" => verifier.id}
             })
+            # Post-commit append: the verifier_dispatch_id write above has already
+            # committed, so a discarded failure would leave the chain missing an entry
+            # for a custody decision that DID happen. See AuditChain.log_append_failure/4.
+            |> Loopctl.AuditChain.log_append_failure("verifier_selected", tenant_id, story_id)
 
           {:error, reason} ->
             flag_verifier_needed(tenant_id, story_id, story, "assign_failed", reason)
         end
 
-      {:error, :no_eligible_verifier} ->
-        flag_verifier_needed(tenant_id, story_id, story, "no_eligible_verifier", nil)
+      # `:no_independent_root` is reported distinctly on purpose: it is not a shortage
+      # but the single-root tenant shape, and its remedy is an operator action (mint an
+      # independently-rooted verifier tree), not waiting.
+      {:error, reason}
+      when reason in [
+             :no_eligible_verifier,
+             :no_independent_root,
+             :verifier_seed_unavailable
+           ] ->
+        flag_verifier_needed(tenant_id, story_id, story, to_string(reason), nil)
     end
   end
 
@@ -499,13 +512,15 @@ defmodule Loopctl.Progress do
       )
     end
 
-    Loopctl.AuditChain.append(tenant_id, %{
+    tenant_id
+    |> Loopctl.AuditChain.append(%{
       action: "verifier_not_assigned",
       actor_lineage: [],
       entity_type: "story",
       entity_id: story_id,
       payload: %{"reason" => reason}
     })
+    |> Loopctl.AuditChain.log_append_failure("verifier_not_assigned", tenant_id, story_id)
 
     result
   end
@@ -705,8 +720,10 @@ defmodule Loopctl.Progress do
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in implementing state
   - `{:error, :self_report_blocked}` if calling agent is the same as the assigned agent,
-    or shares a dispatch lineage root with the implementer (pass the caller's
+    or lies on the implementer's dispatch lineage chain (pass the caller's
     server-resolved lineage as `:reporter_lineage`)
+  - `{:error, :caller_lineage_required}` if a key no dispatch minted reports
+    dispatch-minted work — its separation cannot be shown (fails closed)
   - `{:error, :missing_assigned_agent}` if the story has neither an assigned agent
     nor an implementer dispatch (custody-unattributed — fails closed)
   - `{:error, :unresolvable_dispatch_lineage}` if the story's declared implementer
@@ -955,7 +972,11 @@ defmodule Loopctl.Progress do
           assigned_agent_id: nil,
           assigned_at: nil,
           reported_done_at: nil,
-          reported_by_agent_id: nil
+          reported_by_agent_id: nil,
+          # Durable record that this story WAS worked — the dispatch markers being
+          # cleared right here is exactly what backfill would otherwise read as
+          # "never dispatched". See guard_no_lifecycle_history/1.
+          metadata: lifecycle_marked_metadata(story)
         })
         |> AdminRepo.update()
       end)
@@ -1025,8 +1046,11 @@ defmodule Loopctl.Progress do
   - `{:ok, %ReviewRecord{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :story_not_reported_done}` if story is not in reported_done status
-  - `{:error, :self_review_blocked}` if the reviewer is the assigned agent or shares
-    the implementer's dispatch lineage root
+  - `{:error, :self_review_blocked}` if the reviewer is the assigned agent or lies on
+    the implementer's dispatch lineage chain
+  - `{:error, :caller_lineage_required}` if a key no dispatch minted reviews
+    dispatch-minted work (the nil-reviewer human-operator permit requires BOTH a nil
+    `:reviewer_agent_id` and an empty `:reviewer_lineage`)
   - `{:error, :missing_assigned_agent}` on a custody-orphaned story (fails closed)
   - `{:error, :unresolvable_dispatch_lineage}` if the story's declared implementer
     dispatch cannot be resolved (lineage-integrity failure, fails closed — LCP-1 §7.5)
@@ -1174,8 +1198,10 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if story is not reported_done
-  - `{:error, :self_verify_blocked}` if the verifier is the assigned agent or shares
-    the implementer's dispatch lineage root
+  - `{:error, :self_verify_blocked}` if the verifier is the assigned agent or lies on
+    the implementer's dispatch lineage chain
+  - `{:error, :caller_lineage_required}` if a key no dispatch minted tries to certify
+    dispatch-minted work (fails closed; an ordinary refusal, not a byzantine signal)
   - `{:error, :missing_assigned_agent}` on a custody-orphaned story (fails closed)
   - `{:error, :unresolvable_dispatch_lineage}` if a dispatch the story references
     (implementer or verifier) cannot be resolved (lineage-integrity failure, fails
@@ -1215,7 +1241,8 @@ defmodule Loopctl.Progress do
         validate_not_self_verify(
           story,
           orchestrator_agent_id,
-          Keyword.get(opts, :verifier_lineage, [])
+          Keyword.get(opts, :verifier_lineage, []),
+          :verify
         )
       end)
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
@@ -1268,15 +1295,27 @@ defmodule Loopctl.Progress do
   `{:error, :unresolvable_dispatch_lineage}` (passed through from
   `verify_lineage_separated/4`).
 
+  `caller_lineage` is the CALLER's dispatch lineage, resolved SERVER-SIDE from the
+  authenticating key — never client-supplied. It is REQUIRED: passing `[]` because a
+  path did not bother to resolve it used to silence the entire L4 caller comparison and
+  leave only agent-id inequality, which an orchestrator key satisfies trivially. On
+  dispatch-minted work `[]` now returns `{:error, :caller_lineage_required}` instead.
+
+  `gate` is `:verify` (default) or `:reject`; reject exempts the unlineaged caller so
+  bad work can always be sent back (see `unlineaged_caller/3`).
+
   Exposed so `Loopctl.BulkOperations` enforces the SAME self-verify invariant as
   the single-story `verify_story/4` path — otherwise bulk verify is a chain-of-custody bypass.
   """
-  @spec ensure_verify_allowed(Story.t(), Ecto.UUID.t() | nil) ::
+  @spec ensure_verify_allowed(Story.t(), Ecto.UUID.t() | nil, [Ecto.UUID.t()], :verify | :reject) ::
           :ok
           | {:error,
-             :self_verify_blocked | :missing_assigned_agent | :unresolvable_dispatch_lineage}
-  def ensure_verify_allowed(story, orchestrator_agent_id) do
-    case validate_not_self_verify(story, orchestrator_agent_id) do
+             :self_verify_blocked
+             | :missing_assigned_agent
+             | :unresolvable_dispatch_lineage
+             | :caller_lineage_required}
+  def ensure_verify_allowed(story, orchestrator_agent_id, caller_lineage, gate \\ :verify) do
+    case validate_not_self_verify(story, orchestrator_agent_id, caller_lineage, gate) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
     end
@@ -1299,22 +1338,27 @@ defmodule Loopctl.Progress do
   @doc """
   Structural custody guard for the bulk mark-complete (backfill) path.
 
-  Returns `:ok` only when `story` never entered the dispatch lifecycle (no
-  dispatch markers) — including a never-dispatched story already at
-  `agent_status: :reported_done` (e.g. imported with
-  `initial_agent_status: "reported_done"`), for which mark-complete is the
+  Returns `:ok` only when `story` never entered the dispatch lifecycle — no
+  dispatch markers AND no lifecycle history in the audit log — including a
+  never-dispatched story already at `agent_status: :reported_done` (e.g. imported
+  with `initial_agent_status: "reported_done"`), for which mark-complete is the
   correct remediation. Matches `backfill_story/4`. Prevents mark-complete from
   being used to self-verify dispatched work.
+
+  `lifecycle_ids` is the batch's precomputed lifecycle-history set (see
+  `stories_with_lifecycle_history/2`), so a 50-story batch costs one audit query
+  rather than 50 inside the locking transaction.
   """
-  @spec ensure_mark_complete_allowed(Story.t()) ::
+  @spec ensure_mark_complete_allowed(Story.t(), MapSet.t()) ::
           :ok
           | {:error,
              :already_verified
              | :story_rejected
              | :story_has_dispatch_lineage
+             | :story_entered_lifecycle
              | :story_in_progress}
-  def ensure_mark_complete_allowed(story) do
-    case guard_backfillable(story) do
+  def ensure_mark_complete_allowed(story, lifecycle_ids) do
+    case guard_backfillable(story, lifecycle_ids) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
     end
@@ -1353,6 +1397,9 @@ defmodule Loopctl.Progress do
     * `{:error, :story_has_dispatch_lineage}` — story has a dispatch marker
       (`assigned_agent_id`, `implementer_dispatch_id`, or `verifier_dispatch_id`);
       use the normal report/review/verify flow
+    * `{:error, :story_entered_lifecycle}` — the story's own lifecycle stamp or the
+      audit log records that it was worked inside loopctl, even though its dispatch
+      markers are now clear; use report/review/verify
     * `{:error, :story_in_progress}` — story is mid-lifecycle (e.g. `:contracted`)
       with no dispatch lineage yet; it is being worked, not pre-existing done work
     * `{:error, %Ecto.Changeset{}}` — persistence error surfaced from Multi step
@@ -1369,18 +1416,17 @@ defmodule Loopctl.Progress do
              | :already_verified
              | :story_rejected
              | :story_has_dispatch_lineage
+             | :story_entered_lifecycle
              | :story_in_progress
              | Ecto.Changeset.t()}
   def backfill_story(tenant_id, story_id, params, opts \\ []) do
-    actor_id = Keyword.get(opts, :actor_id)
-    actor_label = Keyword.get(opts, :actor_label)
     reason = params |> Map.get("reason") |> normalize_string()
 
     with :ok <- validate_backfill_reason(reason),
          {:ok, pr_number} <- cast_pr_number(Map.get(params, "pr_number")),
          {:ok, evidence_url} <-
            validate_evidence_url(params |> Map.get("evidence_url") |> normalize_string()) do
-      do_backfill(tenant_id, story_id, reason, evidence_url, pr_number, actor_id, actor_label)
+      do_backfill(tenant_id, story_id, reason, evidence_url, pr_number, opts)
     end
   end
 
@@ -1422,7 +1468,10 @@ defmodule Loopctl.Progress do
     end
   end
 
-  defp do_backfill(tenant_id, story_id, reason, evidence_url, pr_number, actor_id, actor_label) do
+  defp do_backfill(tenant_id, story_id, reason, evidence_url, pr_number, opts) do
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+
     multi =
       Multi.new()
       |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
@@ -1453,6 +1502,12 @@ defmodule Loopctl.Progress do
           }
         }
       end)
+      # LCP-1 §9.4: backfill reaches the same `verified_status: :verified` terminal
+      # state as verify and mounts the same RequireSignedClaim gate, so it records the
+      # same durable cryptographic residue. Verifying a signature and then dropping it
+      # is half a control: the signature evaporates at request end and the record it
+      # authorized becomes indistinguishable from one an operator fabricated.
+      |> maybe_chain_signed_claim(tenant_id, story_id, opts)
       |> EventGenerator.generate_events(:webhook_events, fn %{story: updated} ->
         %{
           tenant_id: tenant_id,
@@ -1543,25 +1598,119 @@ defmodule Loopctl.Progress do
   #     force_unclaim_story does NOT clear, so relying on assigned_agent_id alone
   #     is bypassable; all three are checked.
   #   - otherwise, only :pending or :reported_done (never-dispatched) are
-  #     backfillable; a story mid-lifecycle (:contracted with no dispatch yet) is
-  #     being worked, not pre-existing done work — an ACCURATE reason, not a false
-  #     "dispatch lineage" claim.
-  defp guard_backfillable(%{verified_status: :verified}), do: {:error, :already_verified}
-  defp guard_backfillable(%{verified_status: :rejected}), do: {:error, :story_rejected}
+  #     backfillable, AND only if the story has no lifecycle history (see
+  #     guard_no_lifecycle_history/2); a story mid-lifecycle (:contracted
+  #     with no dispatch yet) is being worked, not pre-existing done work — an
+  #     ACCURATE reason, not a false "dispatch lineage" claim.
+  #
+  # `lookup` is `:query` on the single-story path and a precomputed MapSet on the
+  # batch path.
+  defp guard_backfillable(story), do: guard_backfillable(story, :query)
 
-  defp guard_backfillable(%{assigned_agent_id: agent_id}) when not is_nil(agent_id),
+  defp guard_backfillable(%{verified_status: :verified}, _lookup),
+    do: {:error, :already_verified}
+
+  defp guard_backfillable(%{verified_status: :rejected}, _lookup), do: {:error, :story_rejected}
+
+  defp guard_backfillable(%{assigned_agent_id: agent_id}, _lookup) when not is_nil(agent_id),
     do: {:error, :story_has_dispatch_lineage}
 
-  defp guard_backfillable(%{implementer_dispatch_id: id}) when not is_nil(id),
+  defp guard_backfillable(%{implementer_dispatch_id: id}, _lookup) when not is_nil(id),
     do: {:error, :story_has_dispatch_lineage}
 
-  defp guard_backfillable(%{verifier_dispatch_id: id}) when not is_nil(id),
+  defp guard_backfillable(%{verifier_dispatch_id: id}, _lookup) when not is_nil(id),
     do: {:error, :story_has_dispatch_lineage}
 
   # No dispatch markers from here down.
-  defp guard_backfillable(%{agent_status: :pending}), do: {:ok, :ok}
-  defp guard_backfillable(%{agent_status: :reported_done}), do: {:ok, :ok}
-  defp guard_backfillable(_story), do: {:error, :story_in_progress}
+  defp guard_backfillable(%{agent_status: status} = story, lookup)
+       when status in [:pending, :reported_done],
+       do: guard_no_lifecycle_history(story, lookup)
+
+  defp guard_backfillable(_story, _lookup), do: {:error, :story_in_progress}
+
+  # The dispatch markers above record the story's CURRENT shape, and one of them is
+  # erasable: `force_unclaim_story/3` clears `assigned_agent_id`. For a story claimed
+  # with a key that no dispatch minted, `implementer_dispatch_id` is never written
+  # either, so after a force-unclaim a genuinely worked story presents with all three
+  # markers NULL and `agent_status: :pending` — indistinguishable, by state alone,
+  # from work that predates loopctl. Backfill would then certify it with no report, no
+  # review record and no independent verifier: the entire custody chain skipped by two
+  # ordinary calls.
+  #
+  # Two sources answer "did this story ever enter the lifecycle", and the longer-lived
+  # one is the story row itself. `metadata["lifecycle_entered_at"]` is stamped by every
+  # call that can clear `assigned_agent_id` on a worked story — `unclaim_story/3`,
+  # `force_unclaim_story/3` and `perform_auto_reset/4` — and no lifecycle path clears
+  # it, so unlike the audit log it is not on a retention timer.
+  #
+  # It is NOT tamper-proof: `:metadata` is castable by `Story.update_changeset/2` and
+  # `PATCH /api/v1/stories/:id` REPLACES the whole map, so an orchestrator-role key can
+  # still erase the marker. Closing that needs a non-castable column (or a merging
+  # update); until then the audit-log query below is the second, independent source and
+  # BOTH are consulted.
+  #
+  # The `audit_log` query is the SECOND source, and it is retention-BOUNDED, not
+  # permanent: `Loopctl.Workers.AuditPartitionWorker` DROPs monthly partitions older
+  # than `:audit_retention_days` (default 90). Relying on it alone reopened the launder
+  # path on a timer — after the window the lifecycle rows are gone and a
+  # force-unclaimed story reads as never-dispatched again. It is kept because it also
+  # covers stories force-unclaimed BEFORE the marker existed, within the window.
+  #
+  # Never-dispatched work is untouched: `created`, `imported` and `merge_imported` are
+  # not lifecycle actions, so a story imported with
+  # `initial_agent_status: "reported_done"` remains backfillable — which is the case
+  # backfill exists for. Indexed by `audit_log_tenant_entity_idx`.
+  @lifecycle_audit_actions ["status_changed", "force_unclaimed", "auto_reset"]
+  @lifecycle_marker "lifecycle_entered_at"
+
+  defp guard_no_lifecycle_history(%{metadata: %{@lifecycle_marker => stamp}}, _lookup)
+       when not is_nil(stamp),
+       do: {:error, :story_entered_lifecycle}
+
+  defp guard_no_lifecycle_history(%{id: id}, lookup)
+       when is_binary(id) and is_struct(lookup, MapSet) do
+    if MapSet.member?(lookup, id), do: {:error, :story_entered_lifecycle}, else: {:ok, :ok}
+  end
+
+  defp guard_no_lifecycle_history(%{id: id, tenant_id: tenant_id}, :query)
+       when is_binary(id) and is_binary(tenant_id) do
+    if MapSet.member?(stories_with_lifecycle_history(tenant_id, [id]), id) do
+      {:error, :story_entered_lifecycle}
+    else
+      {:ok, :ok}
+    end
+  end
+
+  # A story we cannot identify cannot be shown to be never-dispatched. Fail closed.
+  defp guard_no_lifecycle_history(_story, _lookup), do: {:error, :story_entered_lifecycle}
+
+  @doc """
+  The subset of `ids` whose audit log shows lifecycle history — the set
+  `backfill_story/4` and `ensure_mark_complete_allowed/2` refuse.
+
+  Hoisted out of the per-story guard so the bulk mark-complete path pays ONE query
+  per batch instead of one per story while holding `FOR UPDATE` locks on all of them
+  and one of AdminRepo's deliberately tiny (3-connection) pool.
+  """
+  @spec stories_with_lifecycle_history(Ecto.UUID.t(), [Ecto.UUID.t()]) :: MapSet.t()
+  def stories_with_lifecycle_history(tenant_id, ids) do
+    from(a in AuditLog,
+      where:
+        a.tenant_id == ^tenant_id and a.entity_type == "story" and a.entity_id in ^ids and
+          a.action in ^@lifecycle_audit_actions,
+      select: a.entity_id,
+      distinct: true
+    )
+    |> AdminRepo.all()
+    |> MapSet.new()
+  end
+
+  # Proof that a story entered the dispatch lifecycle, stamped where the erasure
+  # happens. `metadata` is not cleared by any unclaim/reset path, so unlike the dispatch
+  # markers (and unlike the retention-bounded audit log) this survives them.
+  defp lifecycle_marked_metadata(%{metadata: metadata}) do
+    Map.put(metadata || %{}, @lifecycle_marker, DateTime.to_iso8601(DateTime.utc_now()))
+  end
 
   defp apply_backfill_status(story, reason, evidence_url, pr_number) do
     now = DateTime.utc_now()
@@ -1612,7 +1761,8 @@ defmodule Loopctl.Progress do
   - `tenant_id` -- the tenant UUID
   - `story_id` -- the story UUID
   - `params` -- map with `reason` (required), optional `findings`, `review_type`
-  - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`, `:actor_label`
+  - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`, `:actor_label`,
+    and `:verifier_lineage` (the CALLER's dispatch lineage, resolved server-side)
 
   ## Returns
 
@@ -1636,7 +1786,16 @@ defmodule Loopctl.Progress do
         Multi.new()
         |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
         |> Multi.run(:self_verify_check, fn _repo, %{lock: story} ->
-          validate_not_self_verify(story, orchestrator_agent_id)
+          # Reject reaches the TERMINAL `verified_status: :rejected` and auto-resets
+          # the agent status, so it takes the same caller-lineage comparison verify
+          # does — minus the unlineaged refusal, which would strand bad work with no
+          # way back (see unlineaged_caller/3).
+          validate_not_self_verify(
+            story,
+            orchestrator_agent_id,
+            Keyword.get(opts, :verifier_lineage, []),
+            :reject
+          )
         end)
         |> Multi.run(:validate, fn _repo, %{lock: story} ->
           validate_rejectable(story)
@@ -1806,7 +1965,10 @@ defmodule Loopctl.Progress do
             assigned_agent_id: nil,
             assigned_at: nil,
             reported_done_at: nil,
-            reported_by_agent_id: nil
+            reported_by_agent_id: nil,
+            # See unclaim_story/3: the durable half of the anti-launder guard, stamped
+            # at the moment the erasable dispatch markers are erased.
+            metadata: lifecycle_marked_metadata(story)
           })
           |> AdminRepo.update()
         end
@@ -1857,12 +2019,20 @@ defmodule Loopctl.Progress do
 
   # --- Verification/Rejection helpers ---
 
-  defp validate_not_self_verify(story, orchestrator_agent_id, caller_lineage \\ [])
-
+  # NO default for `caller_lineage` HERE. A defaulted [] made "this path resolved the
+  # caller's lineage and it is empty" indistinguishable from "this path forgot to
+  # resolve it", and lineage_status/2 used to treat [] as :ok — so every forgetful call
+  # site (verify-all, bulk verify/reject, reject) silently skipped the whole L4 caller
+  # comparison. The public `verify_story/4` / `reject_story/4` opts boundary still
+  # DEFAULTS `:verifier_lineage` to [] (every current call site passes it), so the
+  # guarantee is not "omission is a compile error" — it is that [] no longer DEGRADES:
+  # on dispatch-minted work it is now `:unlineaged`, which verify refuses.
+  #
   # nil orchestrator identity: untrusted (US-26.1.3)
-  defp validate_not_self_verify(_story, nil, _caller_lineage), do: {:error, :self_verify_blocked}
+  defp validate_not_self_verify(_story, nil, _caller_lineage, _gate),
+    do: {:error, :self_verify_blocked}
 
-  defp validate_not_self_verify(story, orchestrator_agent_id, caller_lineage) do
+  defp validate_not_self_verify(story, orchestrator_agent_id, caller_lineage, gate) do
     # INVARIANT 1 (fail closed / §2.2 "nil is never permissive"): a story that
     # is reported_done but not yet verified, with NO assigned agent and NO
     # dispatch lineage, has no implementer to compare the verifier against — the
@@ -1877,25 +2047,53 @@ defmodule Loopctl.Progress do
       log_custody_orphaned(story, orchestrator_agent_id, "verify")
       {:error, :missing_assigned_agent}
     else
-      # CALLER separation (LCP-1 §7.5) — the same comparison report and
-      # review-complete run, and the ONLY clause here that says anything about
-      # the principal actually making this call: the verifier's lineage is
-      # resolved SERVER-SIDE from the authenticating key, so an ancestor or a
-      # sub-agent in the implementer's chain is blocked even when its agent_id
-      # differs. The story-side clauses below compare RECORDED dispatches, which
-      # are silent about the caller — and `verifier_dispatch_id` is only written
-      # by the OPTIONAL request-review, so without this the common path degraded
-      # to a single agent-id inequality.
-      # :root — verify demands the stricter separation. select_verifier/3 will not
-      # nominate a verifier under the implementer's root, so a caller sharing it
-      # must not be able to certify either.
-      case lineage_status(story, caller_lineage, :root) do
-        :unresolvable -> {:error, :unresolvable_dispatch_lineage}
-        :conflict -> {:error, :self_verify_blocked}
-        :ok -> verify_recorded_separation(story, orchestrator_agent_id)
-      end
+      verify_caller_separation(story, orchestrator_agent_id, caller_lineage, gate)
     end
   end
+
+  # CALLER separation (LCP-1 §7.5) — the same comparison report and review-complete
+  # run, and the ONLY clause here that says anything about the principal actually
+  # making this call: the verifier's lineage is resolved SERVER-SIDE from the
+  # authenticating key, so an ancestor or a sub-agent in the implementer's chain is
+  # blocked even when its agent_id differs. The story-side clauses compare RECORDED
+  # dispatches, which are silent about the caller — and `verifier_dispatch_id` is only
+  # written by the OPTIONAL request-review, so without this the common path degraded
+  # to a single agent-id inequality.
+  #
+  # The CALLER comparison is `lineage_same_chain?/2`, the SAME distance report and
+  # review-complete demand — an ancestor or a descendant of the implementer is blocked,
+  # a SIBLING is not. Demanding a separate ROOT here made verify unreachable in the
+  # documented single-root tenant (operator root -> orchestrator -> implementer): every
+  # dispatch-minted key shares the one root, so no principal could certify anything,
+  # while report and review-complete were relaxed to `:chain` for that exact reason.
+  # The stricter ROOT separation is still enforced where it can be satisfied by
+  # construction — `select_verifier/3` will not NOMINATE a same-root verifier, and
+  # `verify_recorded_separation/2` compares the RECORDED verifier at root distance.
+  defp verify_caller_separation(story, orchestrator_agent_id, caller_lineage, gate) do
+    case lineage_status(story, caller_lineage) do
+      :unresolvable -> {:error, :unresolvable_dispatch_lineage}
+      :conflict -> {:error, :self_verify_blocked}
+      :unlineaged -> unlineaged_caller(story, orchestrator_agent_id, gate)
+      :ok -> verify_recorded_separation(story, orchestrator_agent_id)
+    end
+  end
+
+  # An EMPTY caller lineage is a key no dispatch minted (a legacy env-var key, OQ2
+  # deprecation window). On dispatch-minted work it cannot be SHOWN separate from the
+  # implementer, leaving verify nothing but `assigned_agent_id` inequality — which two
+  # env-var keys with distinct agent_ids in one process satisfy trivially. So verify
+  # refuses it, under its OWN code: `:caller_lineage_required` is an ordinary
+  # configuration refusal (409, no violation recorded), NOT `self_verify_blocked`,
+  # which is an L6 byzantine signal that escalates to a tenant-wide custody halt.
+  #
+  # REJECT is exempt. Sending work back is the remediation path, not a certification —
+  # refusing it strands a bad story at reported_done with no way out — and the recorded
+  # and agent-id comparisons below still apply.
+  defp unlineaged_caller(story, orchestrator_agent_id, :reject),
+    do: verify_recorded_separation(story, orchestrator_agent_id)
+
+  defp unlineaged_caller(_story, _orchestrator_agent_id, :verify),
+    do: {:error, :caller_lineage_required}
 
   # The STORY-side half of the gate: loopctl's SELECTED verifier against the
   # implementer when request-review recorded one, else agent-id equality.
@@ -2244,7 +2442,11 @@ defmodule Loopctl.Progress do
         agent_status: :pending,
         assigned_agent_id: nil,
         assigned_at: nil,
-        reported_done_at: nil
+        reported_done_at: nil,
+        # The THIRD site that clears assigned_agent_id on a worked story. Only
+        # `:story_rejected` in guard_backfillable/2 masks it today; stamp the durable
+        # marker here too so the backfill guard never depends on that coincidence.
+        metadata: lifecycle_marked_metadata(story)
       })
 
     with {:ok, reset_story} <- AdminRepo.update(changeset),
@@ -2429,6 +2631,7 @@ defmodule Loopctl.Progress do
       # closed under its own error code (see lineage_status/2).
       case lineage_status(story, reporter_lineage) do
         :unresolvable -> {:error, :unresolvable_dispatch_lineage}
+        :unlineaged -> {:error, :caller_lineage_required}
         :conflict -> {:error, :self_report_blocked}
         :ok -> validate_report_not_same_agent(story, agent_id)
       end
@@ -2464,40 +2667,33 @@ defmodule Loopctl.Progress do
   #                       leaning on `lineage_shares_prefix?([], _) = false` would
   #                       read an unloadable dispatch as INDEPENDENT lineage, the
   #                       exact inverse of its meaning.
+  #   * `:unlineaged`   — the CALLER's credential was not minted by a dispatch (legacy
+  #                       env-var key; OQ2 deprecation window) while the WORK was. Its
+  #                       separation cannot be SHOWN, so each gate decides: report,
+  #                       review-complete and verify refuse it with
+  #                       `:caller_lineage_required`; reject (the remediation path)
+  #                       falls through to the agent-id check. Ranked AFTER
+  #                       `:unresolvable` deliberately — an empty caller lineage used to
+  #                       match first and mask a broken implementer dispatch as an
+  #                       ordinary permit.
   #   * `:ok`           — no lineage conflict; the agent-id equality check decides.
   #
-  # Two absences yield `:ok` deliberately — they are NOT integrity failures:
+  # One absence yields `:ok` deliberately and is NOT an integrity failure:
+  # `implementer_dispatch_id` is nil — no delegation ever recorded (pre-dispatch
+  # story) — and there the agent-id equality check is the whole gate by design.
   #
-  #   1. `implementer_dispatch_id` is nil — no delegation ever recorded (pre-dispatch
-  #      story); the agent-id equality check is the whole gate.
-  #   2. `caller_lineage` is [] — the caller used a credential not minted by a
-  #      dispatch (legacy env-var key; OQ2 deprecation window). NOTE the intentional
-  #      asymmetry with verify: verify_lineage_separated/4 fails closed when EITHER
-  #      side's lineage is empty, but this clause matches an empty CALLER lineage
-  #      BEFORE the `:unresolvable` check runs, so a legacy-key reporter/reviewer on
-  #      a story with an unresolvable implementer dispatch is caught only by the
-  #      agent-id check, not by fail-closed. The permit is scoped to legacy keys and
-  #      the agent-id check still applies; the gates align for dispatch-minted keys.
-  # `separation` selects HOW MUCH lineage distance this gate demands:
+  # The distance demanded is `lineage_same_chain?/2` at EVERY gate: the caller must not
+  # be on the implementer's root-to-leaf chain, but a SIBLING dispatch passes. The
+  # documented tree puts implementer and reviewer/verifier side by side under one
+  # orchestrator, so demanding a separate ROOT means no principal in a normal tenant can
+  # ever act (#621). Root separation is still enforced where selection can guarantee it
+  # — `select_verifier/3` and `verify_lineage_separated/4` on the RECORDED verifier.
   #
-  #   :chain — the caller must not be on the implementer's root-to-leaf chain.
-  #            A SIBLING dispatch passes. Used by report and review-complete,
-  #            where the documented tree puts the reviewer beside the implementer
-  #            under one orchestrator; demanding a separate root there means no
-  #            reviewer in a normal tenant can ever act (#621).
-  #   :root  — the caller must not share the implementer's root at all. Stricter,
-  #            and used by verify, the final certification: select_verifier/3
-  #            already refuses to nominate a same-root verifier, so accepting one
-  #            at the gate would contradict the selection rule.
-  #
-  # Both fail closed on an unresolvable implementer dispatch, and both are
-  # evaluated IN ADDITION to the agent-id equality check, never instead of it.
-  defp lineage_status(story, caller_lineage, separation \\ :chain)
+  # Every state is evaluated IN ADDITION to the agent-id equality check, never instead
+  # of it.
+  defp lineage_status(%Story{implementer_dispatch_id: nil}, _caller_lineage), do: :ok
 
-  defp lineage_status(%Story{implementer_dispatch_id: nil}, _caller_lineage, _separation), do: :ok
-  defp lineage_status(_story, [], _separation), do: :ok
-
-  defp lineage_status(story, caller_lineage, separation) do
+  defp lineage_status(story, caller_lineage) do
     case get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id) do
       [] ->
         # Declared-but-unresolvable implementer dispatch — fail closed.
@@ -2509,14 +2705,11 @@ defmodule Loopctl.Progress do
 
         :unresolvable
 
-      impl ->
-        overlap? =
-          case separation do
-            :root -> Dispatches.lineage_shares_prefix?(impl, caller_lineage)
-            :chain -> Dispatches.lineage_same_chain?(impl, caller_lineage)
-          end
+      _impl when caller_lineage == [] ->
+        :unlineaged
 
-        if overlap?, do: :conflict, else: :ok
+      impl ->
+        if Dispatches.lineage_same_chain?(impl, caller_lineage), do: :conflict, else: :ok
     end
   end
 
@@ -2531,12 +2724,15 @@ defmodule Loopctl.Progress do
         log_custody_orphaned(story, reviewer_agent_id, "review")
         {:error, :missing_assigned_agent}
 
-      # nil reviewer_agent_id: this is a human operator (user-role key with no
-      # agent). Humans are structurally different from the assigned implementing
-      # agent, so nil cannot equal any agent_id — pass through. The controller
-      # enforces that agent/orchestrator-role keys must provide a real
-      # reviewer_agent_id.
-      is_nil(reviewer_agent_id) ->
+      # nil reviewer_agent_id AND no lineage: this is a human operator (user-role key
+      # that no dispatch minted). Humans are structurally different from the assigned
+      # implementing agent, so nil cannot equal any agent_id — pass through. The
+      # controller enforces that agent/orchestrator-role keys must provide a real
+      # reviewer_agent_id. The `reviewer_lineage == []` half is load-bearing: a
+      # DISPATCH-minted user-role key also carries no agent_id, and permitting it on nil
+      # alone let an ANCESTOR of the implementer rubber-stamp its own subtree — the
+      # lineage this function is handed was never read on that path.
+      is_nil(reviewer_agent_id) and reviewer_lineage == [] ->
         :ok
 
       # US-26.2.2 AC-2: lineage comparison (primary), from the caller's dispatch
@@ -2546,6 +2742,7 @@ defmodule Loopctl.Progress do
       true ->
         case lineage_status(story, reviewer_lineage) do
           :unresolvable -> {:error, :unresolvable_dispatch_lineage}
+          :unlineaged -> {:error, :caller_lineage_required}
           :conflict -> {:error, :self_review_blocked}
           :ok -> validate_review_not_same_agent(story, reviewer_agent_id)
         end

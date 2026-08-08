@@ -467,12 +467,15 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
       ctx = reviewed(conn, keyed_context())
 
       # The leg agent-id equality cannot reach, and the one the retired verify_cap
-      # used to cover: a distinct agent_id whose dispatch shares the implementer's
-      # lineage ROOT. request-review was never called, so verifier_dispatch_id is
-      # nil — uncompared caller lineage means a bare agent-id inequality passes.
-      sibling = fixture(:agent, %{tenant_id: ctx.tenant.id})
-      shared_root = [hd(ctx.implementer.lineage), Ecto.UUID.generate()]
-      raw_key = orchestrator_key_on_lineage(ctx, sibling.id, shared_root)
+      # used to cover: a distinct agent_id on the implementer's own root-to-leaf
+      # CHAIN — here a sub-agent the implementer dispatched. request-review was never
+      # called, so verifier_dispatch_id is nil — uncompared caller lineage means a
+      # bare agent-id inequality passes. (A SIBLING under the same root is separation
+      # and is allowed: demanding a separate root of the caller left a single-root
+      # tenant with no principal able to verify at all.)
+      sub_agent = fixture(:agent, %{tenant_id: ctx.tenant.id})
+      under_implementer = ctx.implementer.lineage ++ [Ecto.UUID.generate()]
+      raw_key = orchestrator_key_on_lineage(ctx, sub_agent.id, under_implementer)
 
       body =
         conn
