@@ -196,6 +196,20 @@ unless System.get_env("SCALE_NIGHTLY") || System.get_env("SCALE_TESTS") do
   # `pool_capped` truncation signal is exercisable with a handful of seeded rows (prod
   # floor/cap are 200/1000). Existing semantic tests seed ≤ cap rows, so they are
   # unaffected. The SCALE gate keeps the prod defaults. Config-based DI — no put_env.
+  #
+  # TWO consequences worth knowing before touching the CAP, both measured:
+  #
+  #   * The pool is `min(max(offset + limit, floor), cap)`, so the cap is the LAST clamp
+  #     and a test passing `limit: 50` gets a pool of 5, exactly as if it had passed
+  #     nothing. A `limit:` in a test is therefore INERT unless it is below the cap — do
+  #     not read one as a recall fix (see the moduledoc of
+  #     `test/loopctl/embeddings_side_table_reads_test.exs`, where that misreading cost
+  #     four rounds).
+  #   * Three tests in `knowledge_semantic_search_test.exs` seed `cap + 2` rows precisely
+  #     to trip the truncation signal cheaply ("corpus larger than the relevance-pool
+  #     cap", "selective filter whose matches fall outside the pool", "combined carries
+  #     the semantic half's pool_capped"). Raising the cap to 60 fails all three. Raise it
+  #     only together with their seed counts.
   config :loopctl, :semantic_result_pool_floor, 2
   config :loopctl, :semantic_result_pool_cap, 5
 
