@@ -194,24 +194,37 @@ unless System.get_env("SCALE_NIGHTLY") || System.get_env("SCALE_TESTS") do
 
   # US-27.7a `search_semantic` relevance-pool knobs, shrunk so the deep-offset /
   # `pool_capped` truncation signal is exercisable with a handful of seeded rows (prod
-  # floor/cap are 200/1000). Existing semantic tests seed ≤ cap rows, so they are
-  # unaffected. The SCALE gate keeps the prod defaults. Config-based DI — no put_env.
+  # floor/cap are 200/1000). The SCALE gate keeps the prod defaults. Config-based DI — no
+  # put_env.
   #
-  # TWO consequences worth knowing before touching the CAP, both measured:
+  # THE CAP IS THE LAST CLAMP, SO IT BOUNDS EVERY TEST, not just the truncation ones:
+  # `semantic_result_pool/1` is `min(max(offset + limit, floor), cap)`. At the old cap of 5
+  # a page of `limit: 50` and a page of `limit: 10` both resolved to a pool of 5, so every
+  # "widen the page past the candidate set" annotation in
+  # `embeddings_side_table_reads_test.exs` (and its siblings) was INERT — clamped back to
+  # the cap, buying nothing. That is all this value fixes. It is NOT a root cause for the
+  # `left: []` flake: that is settled in KB c6fd1e5d (a `SET LOCAL` savepoint leak plus a
+  # cross-tenant residual filter, #535) — which also lists four recall-targeted theories as
+  # DEAD, and records that rare recurrences remain and clear on rerun. Do not read this
+  # comment as superseding it.
   #
-  #   * The pool is `min(max(offset + limit, floor), cap)`, so the cap is the LAST clamp
-  #     and a test passing `limit: 50` gets a pool of 5, exactly as if it had passed
-  #     nothing. A `limit:` in a test is therefore INERT unless it is below the cap — do
-  #     not read one as a recall fix (see the moduledoc of
-  #     `test/loopctl/embeddings_side_table_reads_test.exs`, where that misreading cost
-  #     four rounds).
-  #   * Three tests in `knowledge_semantic_search_test.exs` seed `cap + 2` rows precisely
-  #     to trip the truncation signal cheaply ("corpus larger than the relevance-pool
-  #     cap", "selective filter whose matches fall outside the pool", "combined carries
-  #     the semantic half's pool_capped"). Raising the cap to 60 fails all three. Raise it
-  #     only together with their seed counts.
+  # What must exceed the count of published system articles is the side-table REACH —
+  # `side_table_ef_search(side_table_inner_pool(pool))`, i.e. the over-fetched inner ANN
+  # clamped by `hnsw.ef_search` — not the raw cap: a tenant that materializes the shared
+  # system corpus (AC-41.1.7) carries one embedding row per such article, and those crowd
+  # the ANN pool. That is the relationship `embeddings_side_table_reads_test.exs` ASSERTS
+  # (it is not tallied here), naming this knob when it stops holding. The over-fetch
+  # offsets candidates a post-ANN status/visibility filter DISCARDS — it does not rescue a
+  # worst-ranked row from a page too narrow to hold it, so a ranking assertion still needs
+  # its own wide `limit:`.
+  #
+  # The `pool_capped` tests seed relative to `Knowledge.semantic_result_pool_cap/0` rather
+  # than to a literal, so they cannot decouple from this value again. Raising it is bounded
+  # BOTH ways: it must stay <= `Knowledge.max_relevance_page_size/0` (100) or those tests
+  # cannot request a page as wide as the cap, and their seed cost is linear in it — that is
+  # why it is 30 and not 300.
   config :loopctl, :semantic_result_pool_floor, 2
-  config :loopctl, :semantic_result_pool_cap, 5
+  config :loopctl, :semantic_result_pool_cap, 30
 
   # US-27.16: the streaming-export concurrency cap (`Loopctl.Knowledge.ExportConcurrency`).
   # The GLOBAL cap (`:export_max_concurrent_global`, prod default 2 — sized to the heavy-read
