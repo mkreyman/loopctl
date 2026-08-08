@@ -517,6 +517,22 @@ defmodule Loopctl.Memory do
   the healthy path returns `results: []` with `meta.fallback: false, reason: nil`
   (the two zero-result cases are distinguishable).
 
+  ## Degraded ANN disclosure (#634, the memory half of #631)
+
+  A HEALTHY (semantic) recall also states `meta.ann_iterative_scan` — `"off"` |
+  `"applied"` | `"unavailable"` — whether the vector read ran with pgvector's
+  `hnsw.iterative_scan`, with a `meta.ann_iterative_scan_reason` alongside the
+  `"unavailable"` state ONLY. Identical field names, values and rule to
+  `Loopctl.Knowledge`'s semantic/combined search meta, so an agent reading both
+  surfaces learns ONE vocabulary; `Loopctl.HeavyRead.iterative_scan_meta/1` is the
+  single derivation. `"unavailable"` matters here because the ANN applies the
+  `(tenant_id, subject_id)` scope as a POST-index residual filter: a read that lost
+  iterative scan may under-return rows this subject HAS, and `underfilled` alone
+  cannot separate that from a genuinely sparse scope. The value is derived from the
+  opts the read was ISSUED with, never a fresh probe, so it cannot disagree with the
+  rows it accompanies. The ILIKE FALLBACK path deliberately carries NO such field —
+  it runs no vector read to describe.
+
   Options:
 
     * `:query` — the query text to embed / ILIKE against (default `""`).
@@ -525,7 +541,8 @@ defmodule Loopctl.Memory do
     * `:include_superseded` — include superseded rows (default `false`).
 
   Returns `%{results: [{memory, score} | ...], meta: %{total_count, fallback, reason,
-  underfilled}}`.
+  underfilled}}`, plus `ann_iterative_scan` (+ `ann_iterative_scan_reason`) on the
+  semantic path — see the disclosure section above.
   """
   @spec recall(Scope.t(), keyword() | map()) :: result_envelope()
   def recall(%Scope{} = scope, opts \\ []) do
@@ -755,12 +772,15 @@ defmodule Loopctl.Memory do
 
   defp do_recall_semantic(scope, embedding, k, include_superseded?, on_overload, side_table?) do
     query = memory_candidate_query(scope, embedding, k, include_superseded?, side_table?)
+    # Resolved ONCE and threaded into BOTH the read and its disclosure below, so the two
+    # cannot describe different executions (#631, #634).
+    heavy_opts = memory_recall_opts(on_overload)
 
     case HeavyRead.all_memory(
            scope.tenant_id,
            scope.subject_id,
            query,
-           memory_recall_opts(on_overload)
+           heavy_opts
          ) do
       {:error, :heavy_read_overloaded} ->
         overloaded_memory_env(scope.tenant_id, k)
@@ -778,12 +798,25 @@ defmodule Loopctl.Memory do
 
         %{
           results: results,
-          meta: %{
-            total_count: length(results),
-            fallback: false,
-            reason: nil,
-            underfilled: length(results) < k
-          }
+          meta:
+            %{
+              total_count: length(results),
+              fallback: false,
+              reason: nil,
+              underfilled: length(results) < k
+            }
+            # #634: the SAME disclosure `Loopctl.Knowledge`'s semantic/combined search
+            # carries (#631), on the same field names and the same three values, because
+            # this recall runs the same `:memory_recall` ANN through the same
+            # `HeavyRead` — and applies `(tenant_id, subject_id)` as a POST-index residual
+            # filter, so a read that lost `hnsw.iterative_scan` can silently under-return.
+            # Agent memory is where a short recall is LEAST likely to be noticed: nothing
+            # downstream cross-checks it, and `underfilled` alone cannot tell a sparse
+            # scope from a starved scan. Derived from `heavy_opts` — the opts this read
+            # ACTUALLY ran with — never a fresh probe or a fresh config read, so it can
+            # never disagree with the rows it accompanies. NOT stored in any per-tenant
+            # memo: it is a per-NODE backend capability with its own short probe TTL.
+            |> Map.merge(HeavyRead.iterative_scan_meta(heavy_opts))
         }
     end
   end
@@ -1080,6 +1113,14 @@ defmodule Loopctl.Memory do
             # as `Loopctl.Knowledge` search — an agent must never get a generic
             # "embedding_error" for what is actually a local_only refusal.
             |> Map.merge(Egress.degraded_contract_meta(scope.tenant_id, reason_tag))
+          # DELIBERATELY no `ann_iterative_scan` here (#634), even though these opts
+          # carry the stamp — `:memory_recall` is an ANN endpoint, so `HeavyRead.opts/1`
+          # resolves the state for every read on it, including this one. But this query
+          # is a recency-ordered ILIKE with NO vector term: it never touches the HNSW
+          # index, so an iterative-scan verdict describes nothing that happened and
+          # would read as a degradation of a scan that was never attempted. Same rule
+          # `Knowledge.search_combined/3` applies when its semantic half fell back to
+          # keyword-only: state it about a vector read, or not at all.
         }
     end
   end

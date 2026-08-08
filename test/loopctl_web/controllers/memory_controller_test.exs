@@ -95,6 +95,28 @@ defmodule LoopctlWeb.MemoryControllerTest do
       assert Map.has_key?(meta, "total_count")
       assert meta["fallback"] == false
     end
+
+    test "the vector read's iterative-scan state REACHES the caller (#634)", %{conn: conn} do
+      # The disclosure is worth nothing if it stops at the context boundary — the memory
+      # meta is passed through today, but a future whitelist (the shape
+      # `KnowledgeSearchJSON.render_meta/1` already has) would drop it silently. `applied`
+      # is the value for this env: `config/test.exs` pins iterative scan ON and the test
+      # backend is pgvector >= 0.8. The `unavailable` state, which is the one that
+      # matters, needs a primed probe verdict and is covered in the sync
+      # `Loopctl.HeavyReadHnswEfSearchTest`.
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      body =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/recall", %{"query" => "anything"})
+        |> json_response(200)
+
+      assert body["meta"]["fallback"] == false, "precondition: the SEMANTIC path"
+      assert body["meta"]["ann_iterative_scan"] == "applied"
+    end
   end
 
   # --- Review finding (US-28.4): metadata must persist for the DEFAULT tier ---

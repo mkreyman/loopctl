@@ -121,7 +121,13 @@ defmodule LoopctlWeb.MemoryController do
         "`meta.fallback: true` and a stable `meta.reason` (score is null on that " <>
         "path) — never a silent empty result. No silent hard cap: `limit` is " <>
         "clamped to the vector-search max and `meta.underfilled` flags a short page " <>
-        "(a small live scope, or a cross-subject/cross-project pool under-fill).",
+        "(a small live scope, or a cross-subject/cross-project pool under-fill). " <>
+        "On the semantic path `meta.ann_iterative_scan` (`off`|`applied`|" <>
+        "`unavailable`) discloses whether the vector read ran with pgvector's " <>
+        "`hnsw.iterative_scan`; `unavailable` means the scope filter was applied " <>
+        "after a single index batch, so the page may be INCOMPLETE for a reason " <>
+        "`meta.underfilled` cannot distinguish from a sparse scope. Identical field " <>
+        "and semantics to `/knowledge/search`.",
     request_body: {"Recall params", "application/json", Schemas.MemoryRecallRequest},
     responses: %{
       200 => {"Recall results", "application/json", Schemas.MemoryRecallResponse},

@@ -68,10 +68,15 @@ defmodule LoopctlWeb.RecallControllerTest do
       assert scores == Enum.sort(scores, :desc)
 
       # Per-source envelopes present and shaped.
-      assert %{"data" => mem_data, "meta" => _} = memory
+      assert %{"data" => mem_data, "meta" => mem_meta} = memory
       assert Enum.any?(mem_data, &(&1["memory"]["text"] == "prefers reshipments"))
 
-      assert %{"data" => know_data, "meta" => _} = knowledge
+      # BOTH halves disclose the vector read's iterative-scan state, under the SAME field
+      # name and value vocabulary (#631 for knowledge, #634 for memory) — an agent reading
+      # this one envelope must not have to learn two. `applied` is the value for this env.
+      assert %{"data" => know_data, "meta" => know_meta} = knowledge
+      assert mem_meta["ann_iterative_scan"] == "applied"
+      assert know_meta["ann_iterative_scan"] == "applied"
       assert Enum.any?(know_data, &(&1["id"] == article.id))
 
       assert meta["query"] == "reshipments"

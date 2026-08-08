@@ -30,6 +30,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Memory
 
   import Ecto.Query
 
@@ -411,6 +412,82 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
       assert {:ok, %{meta: meta}} = Knowledge.search_semantic(tenant.id, test_vec(1536))
       assert meta.ann_iterative_scan == "unavailable"
+    end
+  end
+
+  describe "iterative-scan DISCLOSURE on AGENT MEMORY recall (#634)" do
+    # `Memory.recall/2` runs the SAME `:memory_recall` ANN through the same `HeavyRead`,
+    # with the same post-index residual filter — and disclosed nothing, so an
+    # under-returning recall was indistinguishable from a complete one. That is the
+    # condition #631 removed from knowledge search, on the surface where a short recall is
+    # LEAST likely to be noticed: nothing downstream cross-checks it, and `underfilled`
+    # is already true for a genuinely sparse scope.
+    test "the semantic recall meta carries the disclosure, both states" do
+      scope = fixture(:memory_scope)
+      Knowledge.reset_circuit_breaker(scope.tenant_id)
+      {:ok, _} = Memory.remember(scope, %{tier: :long_term, text: "ecto multi is atomic"})
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      degraded = Memory.recall(scope, query: "ecto", limit: 5).meta
+
+      assert degraded.ann_iterative_scan == "unavailable"
+      assert degraded.ann_iterative_scan_reason =~ "may be missing from these results"
+      assert degraded.fallback == false, "precondition: the SEMANTIC path, not the ILIKE one"
+
+      prime_iterative_scan_supported(true)
+
+      healthy = Memory.recall(scope, query: "ecto", limit: 5).meta
+
+      assert healthy.ann_iterative_scan == "applied"
+
+      refute Map.has_key?(healthy, :ann_iterative_scan_reason),
+             "a healthy read states the state and adds no degradation prose"
+    end
+
+    test "the field names and values MATCH knowledge search exactly" do
+      # One vocabulary across both surfaces, not two for the same fact. Asserted by
+      # comparing the two metas' disclosure slices under one primed verdict rather than
+      # by re-listing the strings, so a rename on either side fails here.
+      scope = fixture(:memory_scope)
+      Knowledge.reset_circuit_breaker(scope.tenant_id)
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      disclosure_keys = [:ann_iterative_scan, :ann_iterative_scan_reason]
+
+      assert {:ok, %{meta: knowledge_meta}} =
+               Knowledge.search_semantic(scope.tenant_id, test_vec(1536))
+
+      memory_meta = Memory.recall(scope, query: "anything", limit: 5).meta
+
+      assert Map.take(memory_meta, disclosure_keys) ==
+               Map.take(knowledge_meta, disclosure_keys)
+    end
+
+    test "the ILIKE FALLBACK path discloses NOTHING — it runs no vector read" do
+      # These opts DO carry the resolved state (`:memory_recall` is an ANN endpoint, so
+      # `opts/1` stamps every read on it), so disclosing here is one `Map.merge` away and
+      # would be WRONG: the fallback query is a recency-ordered ILIKE that never touches
+      # the HNSW index, and an "unavailable" verdict about a scan that was never attempted
+      # is a degradation report for nothing. Same rule combined search applies when its
+      # semantic half fell back to keyword-only.
+      scope = fixture(:memory_scope)
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _scope, _text ->
+        {:error, :provider_unavailable}
+      end)
+
+      meta = Memory.recall(scope, query: "ecto", limit: 5).meta
+
+      assert meta.fallback == true, "precondition: the ILIKE fallback path"
+      refute Map.has_key?(meta, :ann_iterative_scan)
+      refute Map.has_key?(meta, :ann_iterative_scan_reason)
     end
   end
 
