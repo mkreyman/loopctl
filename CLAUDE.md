@@ -174,9 +174,9 @@ in order:
    story that lacks a verifier dispatch.
 
 `verifier_dispatch_id` is written only by the assign-verifier flow
-(`assign_rotating_verifier/3`, `progress.ex:520-559`); that write is checked, and a failure
+(`assign_rotating_verifier/3`, `progress.ex:569-608`); that write is checked, and a failure
 flags `verifier_needed` plus a `verifier_not_assigned` audit event
-(`flag_verifier_needed/5`, `progress.ex:572`) rather than silently leaving the field nil.
+(`flag_verifier_needed/5`, `progress.ex:621`) rather than silently leaving the field nil.
 Because `request-review` is OPTIONAL, a story often reaches verify with no verifier dispatch
 at all — step 3 is what keeps that path lineage-gated instead of a bare agent-id inequality.
 
@@ -272,6 +272,18 @@ and an ephemeral API key with a bounded TTL. The MCP server v2 tool
 
 Legacy env-var keys (`LOOPCTL_AGENT_KEY`, `LOOPCTL_ORCH_KEY`, etc.) continue to
 work during the deprecation window but will be removed at the epic merge.
+
+**A capability is delivered ATOMICALLY with the transition that mints it, and recovery
+binds to the CALLER.** `claim` mints the `start_cap` INSIDE its transaction: for a keyed
+tenant a mint failure rolls the claim back (`503 capability_mint_failed`) rather than
+committing a story the agent can neither start nor recover. `POST /stories/:id/recover-cap`
+mints to the caller's server-resolved lineage (`Dispatches.lineage_for_api_key/2`), NOT the
+story's recorded implementer lineage — a capability matches its lineage exactly, and the
+crash it recovers from is precisely what gives the agent a new one. It refuses an unlineaged
+caller (`409 caller_lineage_required`) and a REVOKED implementer dispatch (`422
+dispatch_revoked`); a merely EXPIRED one is fine. Recovery never rewrites
+`implementer_dispatch_id` — that is the custody provenance the L4 gates compare, and an agent
+must not be able to re-anchor it.
 
 **The lineage ceiling binds every way of obtaining a credential.** A dispatch may
 only be minted INSIDE the caller's own subtree: a parentless create is

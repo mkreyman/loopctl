@@ -109,6 +109,102 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
     }
   end
 
+  describe "keyed tenant: the claim is ATOMIC with its start_cap" do
+    # A keyed tenant whose PUBLIC key is present (so the capability layer
+    # ENFORCES) but whose private half cannot be read (an unreachable secret
+    # store). Minting is impossible; claiming must therefore not happen.
+    defp unmintable_context do
+      tenant = fixture(:tenant)
+      {pub, _priv} = :crypto.generate_key(:eddsa, :ed25519)
+
+      tenant =
+        tenant
+        |> Ecto.Changeset.change(audit_signing_public_key: pub)
+        |> AdminRepo.update!()
+
+      Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:error, :secret_store_unavailable} end)
+      Loopctl.TenantKeys.init_cache()
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          project_id: project.id,
+          agent_status: :contracted
+        })
+
+      %{tenant: tenant, story: story, implementer: actor(tenant, :agent)}
+    end
+
+    test "a claim whose start_cap cannot be minted does NOT commit", %{conn: conn} do
+      # The mint used to run AFTER the transaction committed, so this left a
+      # CLAIMED story with no capability: `start` demands one, GET /capabilities
+      # only delivers tokens already minted, and recover-cap needs an
+      # implementer dispatch a legacy bearer claim never records. The agent held a
+      # story it could neither start nor recover. Rolling back leaves the one
+      # remedy it can always reach — claim again.
+      %{story: story, implementer: impl} = unmintable_context()
+
+      conn
+      |> auth(impl.raw_key)
+      |> post("/api/v1/stories/#{story.id}/claim")
+      |> json_response(503)
+
+      reloaded = AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id)
+      assert reloaded.agent_status == :contracted
+      assert is_nil(reloaded.assigned_agent_id)
+      assert is_nil(reloaded.implementer_dispatch_id)
+    end
+
+    test "the 503 names a stable code and nothing was claimed", %{conn: conn} do
+      %{story: story, implementer: impl} = unmintable_context()
+
+      body =
+        conn
+        |> auth(impl.raw_key)
+        |> post("/api/v1/stories/#{story.id}/claim")
+        |> json_response(503)
+
+      assert body["error"]["code"] == "capability_mint_failed"
+
+      assert [] ==
+               Loopctl.Capabilities.CapabilityToken
+               |> where([c], c.story_id == ^story.id)
+               |> AdminRepo.all()
+    end
+
+    test "a KEYLESS tenant still claims with no capability at all", %{conn: conn} do
+      # The pre-v2 path: `maybe_consume_cap/6` lets a nil capability through, so a
+      # nil mint is the correct COMPLETE outcome there, not a failure. The rollback
+      # must not spread to it.
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          project_id: project.id,
+          agent_status: :contracted
+        })
+
+      impl = actor(tenant, :agent)
+
+      body =
+        conn
+        |> auth(impl.raw_key)
+        |> post("/api/v1/stories/#{story.id}/claim")
+        |> json_response(200)
+
+      refute Map.has_key?(body, "capability")
+      assert AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id).agent_status == :assigned
+    end
+  end
+
   describe "keyed tenant: claim delivers the start_cap (#621)" do
     test "claim response carries a start_cap bound to the caller's lineage", %{conn: conn} do
       %{story: story, implementer: impl} = keyed_context()
@@ -311,6 +407,85 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
       # Recorded, but still not a halt: #629 took cap_rejected off the escalation
       # path precisely because an audit-key rotation in flight produces this too.
       assert is_nil(AdminRepo.get!(Loopctl.Tenants.Tenant, tenant.id).custody_halted_at)
+    end
+
+    test "a key ROTATED WITHOUT HISTORY is NOT branded a forgery", %{conn: conn} do
+      # The refusal is identical either way — nothing is admitted. What differs is
+      # what the APPEND-ONLY chain is made to assert about an agent that did
+      # nothing wrong: `capability_forged` + `byzantine: true` is a permanent
+      # accusation that cannot be retracted, and here the agent's token was
+      # perfectly authentic. The tenant's key state is the fault.
+      %{tenant: tenant, story: story, implementer: impl} = keyed_context()
+
+      %{"capability" => start_cap} =
+        conn
+        |> auth(impl.raw_key)
+        |> post("/api/v1/stories/#{story.id}/claim")
+        |> json_response(200)
+
+      {new_pub, _priv} = :crypto.generate_key(:eddsa, :ed25519)
+
+      tenant
+      |> Ecto.Changeset.change(
+        audit_signing_public_key: new_pub,
+        audit_key_rotated_at: DateTime.utc_now()
+      )
+      |> AdminRepo.update!()
+
+      conn
+      |> auth(impl.raw_key)
+      |> post("/api/v1/stories/#{story.id}/start", %{"capability" => start_cap["cap_id"]})
+      |> response(403)
+
+      assert [] ==
+               Loopctl.AuditChain.Entry
+               |> where([e], e.tenant_id == ^tenant.id and e.action == "capability_forged")
+               |> AdminRepo.all()
+
+      assert [%{payload: payload}] =
+               Loopctl.AuditChain.Entry
+               |> where(
+                 [e],
+                 e.tenant_id == ^tenant.id and e.action == "capability_key_unavailable"
+               )
+               |> AdminRepo.all()
+
+      assert payload["reason"] == "signing_key_unavailable"
+      assert payload["byzantine"] == false
+    end
+
+    test "a CLEARED audit key is NOT branded a forgery either", %{conn: conn} do
+      %{tenant: tenant, story: story, implementer: impl} = keyed_context()
+
+      %{"capability" => start_cap} =
+        conn
+        |> auth(impl.raw_key)
+        |> post("/api/v1/stories/#{story.id}/claim")
+        |> json_response(200)
+
+      tenant
+      |> Ecto.Changeset.change(audit_signing_public_key: nil)
+      |> AdminRepo.update!()
+
+      conn
+      |> auth(impl.raw_key)
+      |> post("/api/v1/stories/#{story.id}/start", %{"capability" => start_cap["cap_id"]})
+      |> response(403)
+
+      assert [] ==
+               Loopctl.AuditChain.Entry
+               |> where([e], e.tenant_id == ^tenant.id and e.action == "capability_forged")
+               |> AdminRepo.all()
+
+      assert [%{payload: payload}] =
+               Loopctl.AuditChain.Entry
+               |> where(
+                 [e],
+                 e.tenant_id == ^tenant.id and e.action == "capability_key_unavailable"
+               )
+               |> AdminRepo.all()
+
+      assert payload["byzantine"] == false
     end
 
     test "a malformed capability is refused, not a 500", %{conn: conn} do

@@ -15,13 +15,34 @@ defmodule LoopctlWeb.CapRecoveryController do
       (`cap_recovery_forgery_attempt`) so operators and L5/L6 detection
       can see it.
     * The lineage the cap is bound to is DERIVED SERVER-SIDE from the
-      story's recorded implementer dispatch (`implementer_dispatch_id` ->
-      `Dispatch.lineage_path`). A client-supplied `lineage` param is
-      ignored entirely — the cap is always scoped to the lineage that was
-      actually dispatched to work the story.
-    * The recorded dispatch must still be ACTIVE (not revoked, not
-      expired). A revoked dispatch is an L6 custody-halt stop signal;
-      recovery must not mint a fresh cap off a halted/expired lineage.
+      CALLER's own dispatch (`Dispatches.lineage_for_api_key/2`). A
+      client-supplied `lineage` param is ignored entirely.
+
+      It is deliberately NOT the story's recorded implementer lineage.
+      `Capabilities.validate_cap/6` demands an EXACT lineage match at
+      consume time, and the whole point of recovery is that the original
+      session DIED — the agent comes back under a NEW dispatch with a new
+      lineage, so a cap minted to the old one is unconsumable by the only
+      principal entitled to spend it. The documented crash-recovery path
+      failed precisely in the case it exists for. Binding to the caller
+      grants nothing new: the caller has already been proven to be the
+      story's `assigned_agent_id`, and `start_cap` gates only
+      `POST /start`, which re-checks that same assignment
+      (`Progress.validate_assigned_agent/2`).
+    * Recovery NEVER rewrites `implementer_dispatch_id`. That field is the
+      story's custody provenance — what report/review-complete/verify
+      compare a caller's lineage against — and letting an agent re-anchor
+      it by re-minting would hand it the separation the L4 gates exist to
+      demand of it.
+    * A caller with NO lineage of its own is refused
+      (`caller_lineage_required`) on a story whose work WAS dispatch-minted.
+      Minting an `[]`-lineage cap there would let an unlineaged legacy key
+      start work that only a dispatch-minted principal could start.
+    * The recorded implementer dispatch must not be REVOKED — that is an L6
+      custody stop signal and recovery must not mint past it. An EXPIRED
+      one is allowed: dispatch TTLs are bounded, so by the time an agent
+      needs recovery its original dispatch has usually lapsed on its own,
+      and refusing there re-created the same dead end from the other side.
     * The caller must own the story (`assigned_agent_id`). The role gate
       is `exact_role: :agent` (no hierarchy) to match the sibling
       agent-exclusive custody endpoints (claim/start/request_review/
@@ -47,12 +68,14 @@ defmodule LoopctlWeb.CapRecoveryController do
 
   @doc "POST /api/v1/stories/:id/recover-cap"
   def recover(conn, %{"id" => story_id} = params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
-    agent_id = conn.assigns.current_api_key.agent_id
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+    agent_id = api_key.agent_id
 
     with :ok <- validate_start_cap(params),
          {:ok, story} <- fetch_owned_story(tenant_id, agent_id, story_id),
-         {:ok, lineage} <- recorded_lineage(tenant_id, story),
+         :ok <- implementer_dispatch_usable(tenant_id, story),
+         {:ok, lineage} <- caller_lineage(tenant_id, api_key.id),
          {:ok, cap} <- Capabilities.mint(tenant_id, "start_cap", story.id, lineage) do
       conn
       |> put_status(:created)
@@ -60,29 +83,60 @@ defmodule LoopctlWeb.CapRecoveryController do
     else
       {:error, :invalid_cap_type} ->
         log_forgery_attempt(conn, tenant_id, agent_id, story_id, Map.get(params, "cap_type"))
-        error(conn, 422, "cap recovery only re-mints start_cap")
+        error(conn, 422, "cap_type_not_recoverable", "cap recovery only re-mints start_cap")
 
       {:error, :not_found} ->
-        error(conn, 404, "Story not found or not assigned to you")
+        error(conn, 404, "story_not_found", "Story not found or not assigned to you")
 
       {:error, :no_dispatch_lineage} ->
         error(
           conn,
           422,
+          "no_dispatch_lineage",
           "No recorded dispatch lineage for this story — cannot recover a cap " <>
             "for a story you weren't dispatched to"
         )
 
-      {:error, :dispatch_inactive} ->
+      {:error, :dispatch_revoked} ->
         error(
           conn,
           422,
-          "The story's implementer dispatch has been revoked or has expired — " <>
-            "cannot recover a cap off a halted lineage"
+          "dispatch_revoked",
+          "The story's implementer dispatch has been REVOKED — cannot recover a cap " <>
+            "off a halted lineage. An expired dispatch is fine; a revoked one is a " <>
+            "custody stop signal and needs an operator."
         )
 
+      {:error, :caller_lineage_required} ->
+        error(
+          conn,
+          409,
+          "caller_lineage_required",
+          "This story's work was dispatch-minted, so a recovered capability must bind to " <>
+            "YOUR dispatch lineage — and your key was not minted by a dispatch, so it has " <>
+            "none. Call again with an ephemeral key from POST /api/v1/dispatches."
+        )
+
+      # The remaining shapes are internal failures of the mint itself (an
+      # unreachable secret store, a changeset). `inspect`ing the term into the
+      # response body leaked internal error structure to an agent-role caller and
+      # gave it no stable string to branch on. The term goes to the log; the
+      # caller gets the code.
       {:error, reason} ->
-        error(conn, 422, "Cannot mint cap: #{inspect(reason)}")
+        Logger.error(
+          "cap_recovery_mint_failed: could not mint a start_cap — " <>
+            "story_id=#{story_id} tenant_id=#{tenant_id} " <>
+            "caller_agent_id=#{inspect(agent_id)} reason=#{inspect(reason)}"
+        )
+
+        error(
+          conn,
+          422,
+          "cap_mint_failed",
+          "Could not mint a capability for this story. This is a server-side condition, " <>
+            "not something the request can fix — retry shortly, and ask an operator to " <>
+            "check the tenant's audit signing key if it persists."
+        )
     end
   end
 
@@ -110,31 +164,36 @@ defmodule LoopctlWeb.CapRecoveryController do
     if story, do: {:ok, story}, else: {:error, :not_found}
   end
 
-  # The canonical lineage is the implementer dispatch's lineage_path,
-  # recorded on the story at claim time. Never trust a client-supplied
-  # lineage — resolve it from the dispatch record server-side, and only
-  # if that dispatch is still active.
-  defp recorded_lineage(_tenant_id, %Story{implementer_dispatch_id: nil}),
+  # Recovery is confined to DISPATCH-MINTED work: the story must carry a
+  # resolvable implementer dispatch with a real lineage. That dispatch's lineage
+  # is NOT what the cap binds to (see the moduledoc) — this is a gate on the
+  # STORY, not the source of the token's scope.
+  #
+  # REVOKED is refused: revocation is a deliberate custody stop signal and
+  # minting past it would undo it. EXPIRED is allowed: dispatch TTLs are bounded
+  # and an agent that lost its session has almost always outlived its original
+  # dispatch, so refusing there closed the recovery path in exactly the situation
+  # it exists for.
+  defp implementer_dispatch_usable(_tenant_id, %Story{implementer_dispatch_id: nil}),
     do: {:error, :no_dispatch_lineage}
 
-  defp recorded_lineage(tenant_id, %Story{implementer_dispatch_id: dispatch_id}) do
+  defp implementer_dispatch_usable(tenant_id, %Story{implementer_dispatch_id: dispatch_id}) do
     case Dispatches.get_dispatch(tenant_id, dispatch_id) do
-      {:ok, dispatch} -> active_lineage(dispatch)
+      {:ok, %{revoked_at: revoked}} when not is_nil(revoked) -> {:error, :dispatch_revoked}
+      {:ok, %{lineage_path: []}} -> {:error, :no_dispatch_lineage}
+      {:ok, _dispatch} -> :ok
       _ -> {:error, :no_dispatch_lineage}
     end
   end
 
-  # Mirror DispatchController.validate_parent_and_create/4: a dispatch is
-  # only usable if it is neither revoked nor expired. A revoked dispatch is
-  # a custody-halt stop signal — recovery must not mint off it.
-  defp active_lineage(dispatch) do
-    now = DateTime.utc_now()
-
-    cond do
-      not is_nil(dispatch.revoked_at) -> {:error, :dispatch_inactive}
-      DateTime.compare(dispatch.expires_at, now) != :gt -> {:error, :dispatch_inactive}
-      dispatch.lineage_path == [] -> {:error, :no_dispatch_lineage}
-      true -> {:ok, dispatch.lineage_path}
+  # The CALLER's lineage, resolved from the key the request authenticated with —
+  # never from the request body. `lineage_for_api_key/2` answers `[]` for a key no
+  # live dispatch minted; binding a cap to `[]` here would let an unlineaged
+  # legacy key start work that was claimed under a dispatch, so it is refused.
+  defp caller_lineage(tenant_id, api_key_id) do
+    case Dispatches.lineage_for_api_key(tenant_id, api_key_id) do
+      [] -> {:error, :caller_lineage_required}
+      lineage -> {:ok, lineage}
     end
   end
 
@@ -169,9 +228,13 @@ defmodule LoopctlWeb.CapRecoveryController do
     :ok
   end
 
-  defp error(conn, status, message) do
+  # Every refusal carries a STABLE `code` a client can branch on, matching the
+  # convention `LoopctlWeb.FallbackController` uses everywhere else. Previously
+  # the only discriminator was the prose message, and the catch-all's was built by
+  # `inspect`ing an internal error term into the body.
+  defp error(conn, status, code, message) do
     conn
     |> put_status(status)
-    |> json(%{error: %{message: message, status: status}})
+    |> json(%{error: %{code: code, message: message, status: status}})
   end
 end

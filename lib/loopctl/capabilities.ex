@@ -63,8 +63,27 @@ defmodule Loopctl.Capabilities do
   Checks (`validate_cap/6`, in order): type match, story match, lineage exact
   match, not expired, not consumed, and a valid ed25519 SIGNATURE over the
   token's fields, verified against the tenant's `audit_signing_public_key`
-  (`verify_signature/2`). The signature check fails CLOSED when the tenant has
+  (`check_signature/2`). The signature check fails CLOSED when the tenant has
   no public key — it is the only cryptographic check here, so never drop it.
+
+  A signature that does not verify yields ONE OF TWO reasons, and they are not
+  interchangeable:
+
+    * `:invalid_signature` — the key that was in force when the token was issued
+      IS available, and the signature did not verify against it. That is a
+      forgery signal, recorded as `capability_forged` with `byzantine: true` in
+      the append-only audit chain.
+    * `:signing_key_unavailable` — there is no key to check against: the tenant's
+      audit key was cleared, or was replaced without a `tenant_audit_key_history`
+      row covering the token's `issued_at`. The token is refused exactly the
+      same way, but it is an OPERATOR key-state fault, not evidence about the
+      caller. Branding it a forgery writes a permanent false accusation about an
+      agent that did nothing wrong into a log that by construction cannot be
+      retracted.
+
+  The distinction is derived entirely from SERVER state (the tenant row and the
+  key history), never from the presented token, so it cannot be steered by a
+  caller to downgrade its own forgery.
   """
   @spec verify(Ecto.UUID.t(), map()) ::
           {:ok, CapabilityToken.t()} | {:error, atom()}
@@ -190,12 +209,15 @@ defmodule Loopctl.Capabilities do
       cap.issued_to_lineage != caller_lineage -> {:error, :wrong_lineage}
       DateTime.compare(cap.expires_at, now) != :gt -> {:error, :expired}
       cap.consumed_at != nil -> {:error, :replay}
-      not verify_signature(tenant_id, cap) -> {:error, :invalid_signature}
-      true -> {:ok, cap}
+      true -> check_signature(tenant_id, cap)
     end
   end
 
-  defp verify_signature(tenant_id, cap) do
+  # Fails CLOSED on every path — the only question this decides is WHICH refusal,
+  # and therefore what the audit chain is made to assert about the caller.
+  defp check_signature(tenant_id, cap) do
+    %{current: current, historical: historical} = signing_context(tenant_id, cap.issued_at)
+
     message =
       build_message(
         tenant_id,
@@ -207,25 +229,61 @@ defmodule Loopctl.Capabilities do
         cap.nonce
       )
 
-    # No candidate key (tenant has none, and no history covers issued_at) means
-    # `Enum.any?/2` over `[]` — still fails CLOSED.
-    Enum.any?(signing_keys(tenant_id, cap.issued_at), fn pub_key ->
-      :crypto.verify(:eddsa, :sha512, message, cap.signature, [pub_key, :ed25519])
-    end)
+    candidates = Enum.reject([current.public_key | historical], &is_nil/1)
+
+    cond do
+      Enum.any?(
+        candidates,
+        &:crypto.verify(:eddsa, :sha512, message, cap.signature, [&1, :ed25519])
+      ) ->
+        {:ok, cap}
+
+      issuance_key_available?(current, historical, cap.issued_at) ->
+        {:error, :invalid_signature}
+
+      true ->
+        {:error, :signing_key_unavailable}
+    end
   end
 
-  # The tenant's CURRENT audit key, plus any historical key whose
-  # [rotated_in, rotated_out) window covers the token's issuance. A rotation is a
-  # documented tenant operation; without the history a benign rotation turned every
-  # outstanding token into `:invalid_signature`, which is BYZANTINE and halts the
-  # whole tenant — the same blast radius #621 removed for expiry.
-  defp signing_keys(tenant_id, issued_at) do
+  # Was the key that was IN FORCE at `issued_at` available to check against?
+  #
+  #   * a history row covering `issued_at` IS that key, by definition; or
+  #   * the tenant's current key, when nothing has been rotated in since
+  #     `issued_at` (`audit_key_rotated_at` nil or not after it).
+  #
+  # Neither holds when the audit key was CLEARED (no current key, no history) or
+  # REPLACED WITHOUT HISTORY (rotated in after issuance, nothing archived). In
+  # both cases an authentic token could not have verified either, so calling the
+  # failure a forged signature accuses the caller of an operator's key-state
+  # problem — permanently, in an append-only record.
+  #
+  # The current key stays a verification CANDIDATE regardless of this test: a
+  # rotation committing between `mint/4`'s timestamp and its signature would put
+  # `issued_at` microseconds before `audit_key_rotated_at` on a token the current
+  # key genuinely signed, and excluding it would refuse a valid token.
+  defp issuance_key_available?(current, historical, issued_at) do
+    cond do
+      historical != [] -> true
+      is_nil(current.public_key) -> false
+      is_nil(current.rotated_at) -> true
+      true -> DateTime.compare(current.rotated_at, issued_at) != :gt
+    end
+  end
+
+  # The tenant's CURRENT audit key (with the instant it was rotated in), plus any
+  # historical key whose [rotated_in, rotated_out) window covers the token's
+  # issuance. A rotation is a documented tenant operation; without the history a
+  # benign rotation turned every outstanding token into `:invalid_signature`,
+  # which is BYZANTINE and halts the whole tenant — the same blast radius #621
+  # removed for expiry.
+  defp signing_context(tenant_id, issued_at) do
     import Ecto.Query
 
     current =
       from(t in Loopctl.Tenants.Tenant,
         where: t.id == ^tenant_id,
-        select: t.audit_signing_public_key
+        select: %{public_key: t.audit_signing_public_key, rotated_at: t.audit_key_rotated_at}
       )
       |> AdminRepo.one()
 
@@ -238,7 +296,10 @@ defmodule Loopctl.Capabilities do
       )
       |> AdminRepo.all()
 
-    Enum.reject([current | historical], &is_nil/1)
+    %{
+      current: current || %{public_key: nil, rotated_at: nil},
+      historical: Enum.reject(historical, &is_nil/1)
+    }
   end
 
   defp build_message(tenant_id, typ, story_id, lineage, issued_at, expires_at, nonce) do

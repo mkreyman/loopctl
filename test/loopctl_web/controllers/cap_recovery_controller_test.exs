@@ -1,8 +1,9 @@
 defmodule LoopctlWeb.CapRecoveryControllerTest do
   @moduledoc """
   Chain-of-custody v2 (L1): capability recovery must only ever re-mint a
-  `start_cap`, bound to the lineage recorded on the story's implementer
-  dispatch — never a client-chosen cap type or lineage.
+  `start_cap`, bound to the CALLER's server-resolved dispatch lineage — never a
+  client-chosen cap type or lineage, and never the story's OLD implementer
+  lineage (which a re-dispatched agent could not consume).
 
   Refs advisory GHSA-w3j2-2w3r-hjcf.
   """
@@ -64,9 +65,20 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
   end
 
   # Builds a tenant whose audit signing key is available, an agent + agent-role
-  # API key, and a story assigned to that agent. When `with_dispatch: true`
-  # (default) the story also carries a recorded implementer dispatch whose
-  # lineage_path is the canonical, server-side lineage.
+  # API key, and a story assigned to that agent.
+  #
+  # Two DISTINCT lineages, which is the whole point of the recovery contract:
+  #
+  #   * `impl_lineage` — recorded on the story via `implementer_dispatch_id`. It
+  #     is the dispatch that CLAIMED the story, and by the time recovery is
+  #     needed that session is gone.
+  #   * `caller_lineage` — the lineage of the dispatch that minted the API key
+  #     making the request. This is the RE-DISPATCHED agent, and it is what a
+  #     recovered cap must bind to, because `Capabilities.validate_cap/6` demands
+  #     an exact match against the lineage the CALLER presents at `POST /start`.
+  #
+  # `caller_dispatch: false` drops the caller's dispatch, leaving the key
+  # unlineaged (a legacy env-var key).
   defp setup_ctx(opts \\ %{}) do
     tenant = fixture(:tenant)
 
@@ -78,7 +90,14 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
       |> Ecto.Changeset.change(audit_signing_public_key: pub)
       |> AdminRepo.update!()
 
-    Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:ok, priv} end)
+    case Map.get(opts, :secrets, :ok) do
+      :unavailable ->
+        Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:error, :secret_store_unavailable} end)
+
+      :ok ->
+        Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:ok, priv} end)
+    end
+
     Loopctl.TenantKeys.init_cache()
 
     project = fixture(:project, %{tenant_id: tenant.id})
@@ -87,11 +106,16 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
 
     role = Map.get(opts, :role, :agent)
 
-    {raw_key, _api_key} =
+    {raw_key, api_key} =
       fixture(:api_key, %{tenant_id: tenant.id, role: role, agent_id: agent.id})
 
     story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
-    lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+    impl_lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+    caller_lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+
+    if Map.get(opts, :caller_dispatch, true) do
+      insert_dispatch(tenant.id, agent.id, nil, caller_lineage, %{api_key_id: api_key.id})
+    end
 
     {story, recorded_lineage} =
       if Map.get(opts, :with_dispatch, true) do
@@ -100,7 +124,7 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
             tenant.id,
             agent.id,
             story.id,
-            lineage,
+            impl_lineage,
             Map.get(opts, :dispatch_attrs, %{})
           )
 
@@ -112,7 +136,7 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
           )
           |> AdminRepo.update!()
 
-        {story, lineage}
+        {story, impl_lineage}
       else
         story =
           story
@@ -127,7 +151,8 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
       agent: agent,
       raw_key: raw_key,
       story: story,
-      lineage: recorded_lineage
+      impl_lineage: recorded_lineage,
+      caller_lineage: caller_lineage
     }
   end
 
@@ -149,8 +174,9 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
   end
 
   describe "POST /api/v1/stories/:id/recover-cap — start_cap recovery" do
-    test "with no cap_type mints a start_cap bound to the server-derived lineage", %{conn: conn} do
-      %{raw_key: raw_key, story: story, lineage: lineage} = setup_ctx()
+    test "with no cap_type mints a start_cap bound to the CALLER's lineage", %{conn: conn} do
+      %{raw_key: raw_key, story: story, caller_lineage: caller_lineage, impl_lineage: impl} =
+        setup_ctx()
 
       conn =
         conn
@@ -160,11 +186,15 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
       assert %{"data" => data} = json_response(conn, 201)
       assert data["typ"] == "start_cap"
       assert data["story_id"] == story.id
-      assert data["issued_to_lineage"] == lineage
+      # THE regression this endpoint exists to avoid: a cap bound to the story's
+      # OLD implementer lineage is unconsumable by the re-dispatched agent, whose
+      # lineage is by definition different. `validate_cap/6` matches exactly.
+      assert data["issued_to_lineage"] == caller_lineage
+      refute data["issued_to_lineage"] == impl
     end
 
     test "with explicit cap_type start_cap mints a start_cap", %{conn: conn} do
-      %{raw_key: raw_key, story: story, lineage: lineage} = setup_ctx()
+      %{raw_key: raw_key, story: story, caller_lineage: caller_lineage} = setup_ctx()
 
       conn =
         conn
@@ -173,11 +203,11 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
 
       assert %{"data" => data} = json_response(conn, 201)
       assert data["typ"] == "start_cap"
-      assert data["issued_to_lineage"] == lineage
+      assert data["issued_to_lineage"] == caller_lineage
     end
 
-    test "ignores a client-supplied lineage and uses the recorded dispatch lineage", %{conn: conn} do
-      %{raw_key: raw_key, story: story, lineage: lineage} = setup_ctx()
+    test "ignores a client-supplied lineage and uses the caller's resolved lineage", %{conn: conn} do
+      %{raw_key: raw_key, story: story, caller_lineage: caller_lineage} = setup_ctx()
       attacker_lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
 
       conn =
@@ -187,8 +217,47 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
 
       assert %{"data" => data} = json_response(conn, 201)
       assert data["typ"] == "start_cap"
-      assert data["issued_to_lineage"] == lineage
+      assert data["issued_to_lineage"] == caller_lineage
       refute data["issued_to_lineage"] == attacker_lineage
+    end
+
+    test "the recovered cap actually verifies for the caller at consume time", %{conn: conn} do
+      # The end-to-end property the old binding broke: what recovery hands back
+      # must be spendable by the principal that asked for it.
+      %{raw_key: raw_key, story: story, tenant: tenant, caller_lineage: caller_lineage} =
+        setup_ctx()
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
+
+      assert %{"data" => %{"cap_id" => cap_id}} = json_response(conn, 201)
+
+      assert {:ok, _cap} =
+               Loopctl.Capabilities.verify(tenant.id, %{
+                 "cap_id" => cap_id,
+                 "typ" => "start_cap",
+                 "story_id" => story.id,
+                 "lineage" => caller_lineage
+               })
+    end
+
+    test "recovery never re-anchors the story's implementer_dispatch_id", %{conn: conn} do
+      # The custody provenance report/review-complete/verify compare against must
+      # not be rewritable by the agent whose separation they measure.
+      %{raw_key: raw_key, story: story} = setup_ctx()
+      before = AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id).implementer_dispatch_id
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
+
+      assert %{"data" => _} = json_response(conn, 201)
+
+      assert AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id).implementer_dispatch_id ==
+               before
     end
   end
 
@@ -291,7 +360,7 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
     end
   end
 
-  describe "POST /api/v1/stories/:id/recover-cap — dispatch activeness" do
+  describe "POST /api/v1/stories/:id/recover-cap — implementer dispatch state" do
     test "rejects recovery when the implementer dispatch is revoked", %{conn: conn} do
       %{raw_key: raw_key, story: story} =
         setup_ctx(%{dispatch_attrs: %{revoked_at: DateTime.utc_now()}})
@@ -301,13 +370,19 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
         |> auth_conn(raw_key)
         |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
 
-      assert %{"error" => %{"status" => 422, "message" => message}} = json_response(conn, 422)
-      assert message =~ "revoked"
+      assert %{"error" => %{"status" => 422, "code" => code, "message" => message}} =
+               json_response(conn, 422)
+
+      assert code == "dispatch_revoked"
+      assert message =~ "REVOKED"
       assert caps_for(story.id) == []
     end
 
-    test "rejects recovery when the implementer dispatch is expired", %{conn: conn} do
-      %{raw_key: raw_key, story: story} =
+    test "ALLOWS recovery when the implementer dispatch has merely expired", %{conn: conn} do
+      # Dispatch TTLs are bounded, so an agent that lost its session has almost
+      # always outlived its original dispatch. Refusing here closed the recovery
+      # path in the exact situation it exists for.
+      %{raw_key: raw_key, story: story, caller_lineage: caller_lineage} =
         setup_ctx(%{
           dispatch_attrs: %{expires_at: DateTime.add(DateTime.utc_now(), -60, :second)}
         })
@@ -317,12 +392,12 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
         |> auth_conn(raw_key)
         |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
 
-      assert %{"error" => %{"status" => 422}} = json_response(conn, 422)
-      assert caps_for(story.id) == []
+      assert %{"data" => data} = json_response(conn, 201)
+      assert data["issued_to_lineage"] == caller_lineage
     end
 
     test "mints as usual when the implementer dispatch is active", %{conn: conn} do
-      %{raw_key: raw_key, story: story, lineage: lineage} = setup_ctx()
+      %{raw_key: raw_key, story: story, caller_lineage: caller_lineage} = setup_ctx()
 
       conn =
         conn
@@ -331,7 +406,47 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
 
       assert %{"data" => data} = json_response(conn, 201)
       assert data["typ"] == "start_cap"
-      assert data["issued_to_lineage"] == lineage
+      assert data["issued_to_lineage"] == caller_lineage
+    end
+  end
+
+  describe "POST /api/v1/stories/:id/recover-cap — mint failure" do
+    test "answers a stable code and never inspects the internal term into the body",
+         %{conn: conn} do
+      # Every guard passes; the MINT itself fails because the tenant's private key
+      # cannot be read. The body used to be "Cannot mint cap: #{inspect(reason)}",
+      # which handed an agent-role caller internal error structure and gave it no
+      # stable string to branch on.
+      %{raw_key: raw_key, story: story} = setup_ctx(%{secrets: :unavailable})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "cap_mint_failed"
+      refute body["error"]["message"] =~ "key_unavailable"
+      refute body["error"]["message"] =~ "secret_store_unavailable"
+      assert caps_for(story.id) == []
+    end
+  end
+
+  describe "POST /api/v1/stories/:id/recover-cap — unlineaged caller" do
+    test "refuses a caller whose key no dispatch minted, on dispatch-minted work", %{conn: conn} do
+      # An `[]`-lineage cap would let an unlineaged legacy key start work that was
+      # claimed under a dispatch — the separation the caller cannot demonstrate.
+      %{raw_key: raw_key, story: story} = setup_ctx(%{caller_dispatch: false})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
+
+      assert %{"error" => %{"status" => 409, "code" => "caller_lineage_required"}} =
+               json_response(conn, 409)
+
+      assert caps_for(story.id) == []
     end
   end
 end

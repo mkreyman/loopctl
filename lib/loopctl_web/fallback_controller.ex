@@ -283,6 +283,33 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # A custody transition that MINTS a capability could not mint one for a keyed
+  # tenant (an unreachable secret store, a cleared audit key), so the whole
+  # transition rolled back rather than committing a state the agent cannot act on
+  # — a claimed story whose `start` demands a capability that was never issued and
+  # whose recovery path needs a dispatch a legacy bearer claim never records.
+  # Nothing changed server-side, so retrying is both safe and the entire remedy;
+  # 503 (not 4xx) because the fault is ours.
+  def call(conn, {:error, :capability_mint_failed}) do
+    conn
+    |> put_resp_header("retry-after", "5")
+    |> put_status(:service_unavailable)
+    |> json(%{
+      error: %{
+        status: 503,
+        code: "capability_mint_failed",
+        message:
+          "The capability token this operation must issue could not be minted, so nothing " <>
+            "was changed — the story is exactly as it was. This is a server-side condition " <>
+            "(the tenant's audit signing key could not be read), not something your request " <>
+            "can fix. Retry shortly; if it persists an operator must check the tenant's " <>
+            "audit key.",
+        retry_after_seconds: 5,
+        remediation: %{learn_more: "https://loopctl.com/wiki/capability-tokens"}
+      }
+    })
+  end
+
   def call(conn, {:error, :missing_capability}) do
     conn
     |> put_status(:forbidden)

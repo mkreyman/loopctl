@@ -8,6 +8,7 @@ defmodule Loopctl.CapabilitiesTest do
   import Loopctl.Fixtures
 
   alias Loopctl.Capabilities
+  alias Loopctl.Tenants.AuditKeyHistory
 
   setup :verify_on_exit!
 
@@ -31,6 +32,25 @@ defmodule Loopctl.CapabilitiesTest do
     lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
 
     %{tenant: tenant, story: story, lineage: lineage, pub: pub, priv: priv}
+  end
+
+  defp verify_start_cap(tenant, cap, story, lineage) do
+    Capabilities.verify(tenant.id, %{
+      "cap_id" => cap.id,
+      "typ" => "start_cap",
+      "story_id" => story.id,
+      "lineage" => lineage
+    })
+  end
+
+  defp archive_key(tenant_id, public_key, rotated_in, rotated_out) do
+    %AuditKeyHistory{tenant_id: tenant_id}
+    |> AuditKeyHistory.changeset(%{
+      public_key: public_key,
+      rotated_in: rotated_in,
+      rotated_out: rotated_out
+    })
+    |> Loopctl.AdminRepo.insert!()
   end
 
   describe "mint/4" do
@@ -116,6 +136,100 @@ defmodule Loopctl.CapabilitiesTest do
 
       {:ok, consumed} = Capabilities.consume(cap)
       assert {:error, :replay} = Capabilities.consume(consumed)
+    end
+  end
+
+  describe "verify/2 — signature failure is split by KEY STATE, not lumped as forgery" do
+    # `:invalid_signature` is recorded as `capability_forged` with
+    # `byzantine: true` in the APPEND-ONLY audit chain. Returning it when the
+    # tenant simply has no key to check against writes a permanent false
+    # accusation about an agent that did nothing wrong — and an authentic token
+    # fails identically in that state, so the reason carries no information about
+    # the caller at all.
+
+    test "a CLEARED audit key yields :signing_key_unavailable, never :invalid_signature" do
+      %{tenant: tenant, story: story, lineage: lineage} = setup_cap_context()
+      {:ok, cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
+
+      tenant
+      |> Ecto.Changeset.change(audit_signing_public_key: nil)
+      |> Loopctl.AdminRepo.update!()
+
+      assert {:error, :signing_key_unavailable} = verify_start_cap(tenant, cap, story, lineage)
+    end
+
+    test "a key ROTATED WITHOUT HISTORY yields :signing_key_unavailable" do
+      %{tenant: tenant, story: story, lineage: lineage} = setup_cap_context()
+      {:ok, cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
+
+      # An out-of-band replacement: the tenant row carries a new key rotated in
+      # AFTER this token was issued, and nothing archived the key that signed it.
+      {new_pub, _new_priv} = :crypto.generate_key(:eddsa, :ed25519)
+
+      tenant
+      |> Ecto.Changeset.change(
+        audit_signing_public_key: new_pub,
+        audit_key_rotated_at: DateTime.add(cap.issued_at, 1, :second)
+      )
+      |> Loopctl.AdminRepo.update!()
+
+      assert {:error, :signing_key_unavailable} = verify_start_cap(tenant, cap, story, lineage)
+    end
+
+    test "a rotation WITH history covering issuance still VERIFIES (#630 stays fixed)" do
+      %{tenant: tenant, story: story, lineage: lineage, pub: pub} = setup_cap_context()
+      {:ok, cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
+
+      {new_pub, _new_priv} = :crypto.generate_key(:eddsa, :ed25519)
+      rotated_at = DateTime.add(cap.issued_at, 1, :second)
+
+      archive_key(tenant.id, pub, DateTime.add(cap.issued_at, -60, :second), rotated_at)
+
+      tenant
+      |> Ecto.Changeset.change(
+        audit_signing_public_key: new_pub,
+        audit_key_rotated_at: rotated_at
+      )
+      |> Loopctl.AdminRepo.update!()
+
+      assert {:ok, _verified} = verify_start_cap(tenant, cap, story, lineage)
+    end
+
+    test "a rotation WITH history but a TAMPERED signature is still :invalid_signature" do
+      # The forgery signal must survive the split: when the issuance-time key IS
+      # available and the signature does not verify against it, that is evidence
+      # about the caller and keeps its byzantine label.
+      %{tenant: tenant, story: story, lineage: lineage, pub: pub} = setup_cap_context()
+      {:ok, cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
+
+      {new_pub, _new_priv} = :crypto.generate_key(:eddsa, :ed25519)
+      rotated_at = DateTime.add(cap.issued_at, 1, :second)
+
+      archive_key(tenant.id, pub, DateTime.add(cap.issued_at, -60, :second), rotated_at)
+
+      tenant
+      |> Ecto.Changeset.change(
+        audit_signing_public_key: new_pub,
+        audit_key_rotated_at: rotated_at
+      )
+      |> Loopctl.AdminRepo.update!()
+
+      cap
+      |> Ecto.Changeset.change(signature: :crypto.strong_rand_bytes(64))
+      |> Loopctl.AdminRepo.update!()
+
+      assert {:error, :invalid_signature} = verify_start_cap(tenant, cap, story, lineage)
+    end
+
+    test "a TAMPERED signature under the CURRENT, unrotated key is :invalid_signature" do
+      %{tenant: tenant, story: story, lineage: lineage} = setup_cap_context()
+      {:ok, cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
+
+      cap
+      |> Ecto.Changeset.change(signature: :crypto.strong_rand_bytes(64))
+      |> Loopctl.AdminRepo.update!()
+
+      assert {:error, :invalid_signature} = verify_start_cap(tenant, cap, story, lineage)
     end
   end
 

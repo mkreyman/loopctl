@@ -191,6 +191,23 @@ defmodule Loopctl.Progress do
         |> Ecto.Changeset.change(changes)
         |> AdminRepo.update()
       end)
+      # US-26.3.1 AC-5: mint the start_cap the claimer needs for POST /start.
+      #
+      # INSIDE the transaction, deliberately. It used to run after the commit, so
+      # a mint failure on a KEYED tenant left a CLAIMED story with no capability
+      # and no way back: `start` demands one, `GET /capabilities` only delivers
+      # tokens that were already minted, and `recover-cap` needs an
+      # `implementer_dispatch_id` a legacy bearer claim never writes. The agent
+      # held a story it could not start and could not recover.
+      #
+      # Rolling the claim back instead leaves the story exactly where it was, so
+      # the remedy is the one thing the agent can always do: claim again. The cost
+      # is that a secret-store blip fails the claim rather than half-completing it
+      # — which is the correct trade for an operation whose whole output is a
+      # credential.
+      |> Multi.run(:mint_cap, fn _repo, %{story: updated} ->
+        mint_cap(tenant_id, "start_cap", updated.id, Keyword.get(opts, :lineage, []))
+      end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
         %{
           tenant_id: tenant_id,
@@ -226,31 +243,28 @@ defmodule Loopctl.Progress do
         }
       end)
 
-    case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} ->
-        # US-26.3.1 AC-5: mint a start_cap for the claiming lineage, and return it
-        # on the struct (#621) so the caller can present it to POST /start.
-        lineage = Keyword.get(opts, :lineage, [])
-        cap = mint_cap(tenant_id, "start_cap", updated.id, lineage)
-        {:ok, %{updated | minted_capability: cap}}
-
-      {:error, :lock, reason, _} ->
-        {:error, reason}
-
-      {:error, :validate, reason, _} ->
-        {:error, reason}
-
-      {:error, :check_deps, reason, _} ->
-        {:error, reason}
-
-      {:error, :story, changeset, _} ->
-        {:error, changeset}
-    end
+    multi |> AdminRepo.transaction() |> claim_result()
   end
 
-  # Mints a capability token and RETURNS it, so the caller can hand it to the
-  # agent that will need it for the next custody op. Returns nil when minting
-  # is impossible or fails.
+  defp claim_result({:ok, %{story: updated, mint_cap: cap}}) do
+    # #621: the token is returned on the struct's virtual :minted_capability
+    # field so the caller can present it to POST /start.
+    {:ok, %{updated | minted_capability: cap}}
+  end
+
+  # Already logged with the underlying reason in mint_cap/4. The story is
+  # untouched — nothing was claimed — so the client's remedy is to retry.
+  defp claim_result({:error, :mint_cap, {:capability_mint_failed, _reason}, _changes}),
+    do: {:error, :capability_mint_failed}
+
+  defp claim_result({:error, :story, changeset, _changes}), do: {:error, changeset}
+
+  defp claim_result({:error, step, reason, _changes})
+       when step in [:lock, :validate, :check_deps],
+       do: {:error, reason}
+
+  # An `Ecto.Multi` step: mints a capability token so the caller can hand it to
+  # the agent that will need it for the next custody op.
   #
   # Issue #621: this used to discard the token "to keep the return type
   # backward-compatible", and no other path delivered it either — so every
@@ -259,20 +273,29 @@ defmodule Loopctl.Progress do
   # struct's virtual :minted_capability field.
   #
   # A mint failure is only tolerable for a PRE-V2 (keyless) tenant, where
-  # maybe_consume_cap/6 lets a nil cap through. For a KEYED tenant the
-  # capability is MANDATORY, so a silent nil here wedges the lifecycle exactly
-  # the way #621 did — hence the loud log + telemetry rather than a bare nil.
+  # maybe_consume_cap/6 lets a nil cap through — that tenant is not GOING to
+  # present a capability, so a nil is the correct, complete outcome. For a KEYED
+  # tenant the capability is MANDATORY, so the failure ABORTS the enclosing
+  # transaction rather than committing a claim the agent cannot act on. It is
+  # loud on the way out either way: an operator needs to see a secret store that
+  # stopped answering, and a rolled-back claim on its own looks like a transient
+  # conflict.
+  #
+  # It runs inside the caller's transaction, which means the (ETS-cached)
+  # `TenantKeys` lookup happens while the story row lock is held. That is one
+  # cached read on the common path and at worst one secret-store round trip on a
+  # miss, against a per-story lock on an infrequent operation.
   defp mint_cap(tenant_id, typ, story_id, lineage) do
     case Capabilities.mint(tenant_id, typ, story_id, lineage) do
       {:ok, cap} ->
-        cap
+        {:ok, cap}
 
       {:error, reason} ->
         if tenant_has_audit_key?(tenant_id) do
           Logger.error(
-            "capability_mint_failed: KEYED tenant could not mint a capability — the next " <>
-              "custody call for this story will fail with missing_capability until the agent " <>
-              "recovers one via POST /stories/:id/recover-cap. " <>
+            "capability_mint_failed: KEYED tenant could not mint a capability, so the " <>
+              "enclosing custody transaction was ROLLED BACK — nothing was claimed and the " <>
+              "agent should retry. " <>
               "tenant_id=#{tenant_id} story_id=#{story_id} cap_type=#{typ} reason=#{inspect(reason)}"
           )
 
@@ -281,9 +304,11 @@ defmodule Loopctl.Progress do
             %{count: 1},
             %{tenant_id: tenant_id, story_id: story_id, cap_type: typ, reason: reason}
           )
-        end
 
-        nil
+          {:error, {:capability_mint_failed, reason}}
+        else
+          {:ok, nil}
+        end
     end
   end
 
@@ -380,6 +405,11 @@ defmodule Loopctl.Progress do
   # 1h TTL, or its dispatch rotated. Only the first pair is answered as `:cap_rejected`.
   # NOTE: this set is NOT the byzantine set — see `record_cap_refusal/4`, where a replay is
   # explicitly not one.
+  #
+  # `:signing_key_unavailable` is deliberately OUTSIDE this set. It is what
+  # `Capabilities.check_signature/2` returns when there is no key to check against at all,
+  # which is the tenant's key state and not a property of the presented token — the caller
+  # could not have avoided it and an authentic token fails the same way.
   @cap_rejected_refusals [:invalid_signature, :replay]
 
   defp maybe_consume_cap(multi, tenant_id, story_id, cap_id, typ, lineage) do
@@ -475,6 +505,15 @@ defmodule Loopctl.Progress do
   # would put a double-spend back on log retention.
   defp cap_refusal_action(:replay), do: "capability_replayed"
 
+  # The tenant had NO key to check the signature against — cleared, or replaced
+  # without a history row covering the token's issuance. An authentic token would
+  # have failed identically, so this says nothing whatsoever about the caller. It
+  # is the operator's key state, and it takes an operator-shaped action instead of
+  # the permanent forgery accusation `capability_forged` writes into a log that
+  # cannot be retracted. `Capabilities.check_signature/2` decides which of the two
+  # applies, from server state only.
+  defp cap_refusal_action(:signing_key_unavailable), do: "capability_key_unavailable"
+
   defp cap_refusal_action(reason) when reason in @cap_rejected_refusals,
     do: "capability_forged"
 
@@ -483,6 +522,16 @@ defmodule Loopctl.Progress do
   defp cap_refusal_log("capability_forged", tenant_id, story_id, reason, ctx) do
     "capability_forged: #{reason} — the presented token did not verify against the " <>
       "tenant's audit signing key. This is not a stale token; investigate the caller. " <>
+      cap_refusal_fields(tenant_id, story_id, ctx)
+  end
+
+  defp cap_refusal_log("capability_key_unavailable", tenant_id, story_id, reason, ctx) do
+    "capability_key_unavailable: #{reason} — the tenant's audit signing key for this " <>
+      "token's issuance instant is not available (cleared, or rotated without a " <>
+      "tenant_audit_key_history row covering it), so the signature could not be checked " <>
+      "at all. This is an OPERATOR key-state fault, NOT a claim about the caller: do not " <>
+      "read it as a forgery. Remediation: restore or re-archive the audit key, then have " <>
+      "the agent re-mint via POST /stories/:id/recover-cap. " <>
       cap_refusal_fields(tenant_id, story_id, ctx)
   end
 

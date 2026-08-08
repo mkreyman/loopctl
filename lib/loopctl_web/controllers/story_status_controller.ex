@@ -76,14 +76,20 @@ defmodule LoopctlWeb.StoryStatusController do
         "`capability` (a start_cap) which the caller must present to POST /start; it is " <>
         "bound to the caller's dispatch lineage and expires. Claiming with a " <>
         "dispatch-minted key also records the implementer's dispatch on the story, which " <>
-        "is what the downstream custody gates compare.",
+        "is what the downstream custody gates compare. Minting is ATOMIC with the claim: " <>
+        "for a tenant with an audit signing key, a claim whose capability cannot be minted " <>
+        "does not commit at all (503 `capability_mint_failed`), so there is no state in " <>
+        "which the story is claimed but unstartable.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 => {"Story claimed", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
         {"Invalid transition or dependencies not met", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 =>
+        {"The claim's capability could not be minted; nothing was claimed, retry",
+         "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -287,6 +293,12 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :must_contract_first} ->
         {:error, :must_contract_first}
+
+      # The claim rolled back because its start_cap could not be minted: for a
+      # keyed tenant a claim that cannot deliver a capability would leave a story
+      # the agent can neither start nor recover, so it does not commit at all.
+      {:error, :capability_mint_failed} ->
+        {:error, :capability_mint_failed}
 
       {:error, {:invalid_transition, _ctx} = err} ->
         {:error, err}
