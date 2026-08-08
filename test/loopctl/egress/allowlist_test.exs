@@ -206,6 +206,31 @@ defmodule Loopctl.Egress.AllowlistTest do
       assert Allowlist.ips_allowed?([{0xFDAA, 0, 0, 0, 0, 0, 0, 2}])
     end
 
+    # REGRESSION (review): both IPv6 branches validated the literal and then
+    # stored the string AS WRITTEN. Every match is string equality against
+    # `:inet.ntoa/1` output (always the compressed form), so an expanded literal
+    # parsed, reported clean from `defects/0`, and granted nothing.
+    test "an expanded IPv6 literal is canonicalized, not stored as written" do
+      AllowlistSource.put(["[fdaa:0:0:0:0:0:0:1]:8080@webhook", "fdaa:0:0:0:0:0:0:2"])
+
+      assert Allowlist.defects() == []
+      assert Allowlist.allowed?("fdaa::1", [], :webhook, 8080)
+      assert Allowlist.host_allowed?("fdaa::2")
+      assert Allowlist.ips_allowed?([{0xFDAA, 0, 0, 0, 0, 0, 0, 2}])
+    end
+
+    # REGRESSION (review): `fdaa::1:8080` is a VALID address AND is `fdaa::1` with
+    # the brackets left off. Accepting it carved out an address the operator never
+    # wrote, left the one they meant ungranted, and — since the entry parsed — said
+    # nothing about either.
+    test "a bare IPv6 literal that also reads as host:port is a defect" do
+      AllowlistSource.put(["fdaa::1:8080@webhook"])
+
+      assert Allowlist.defects() == ["fdaa::1:8080@webhook"]
+      assert Allowlist.entries() == []
+      refute Allowlist.host_allowed?("fdaa::1")
+    end
+
     test "any other multi-colon entry is a defect, never an unmatchable host" do
       AllowlistSource.put(["10.0.0.5:11434:", "[fdaa::1]:8080:x"])
 

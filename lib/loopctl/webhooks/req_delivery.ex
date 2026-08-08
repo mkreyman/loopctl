@@ -116,7 +116,22 @@ defmodule Loopctl.Webhooks.ReqDelivery do
       {:error, exception} ->
         {:error, "delivery_error: #{inspect(exception)}"}
     end
+    |> bound_error()
   end
+
+  # EVERY failure string this module returns is persisted verbatim on the delivery
+  # event and read back by the tenant through the deliveries API, and the
+  # transport reason and the exception are shaped by the DESTINATION exactly as
+  # the `content-type` header is (a TLS alert description, a peer-chosen error
+  # term). Bounding only the header fragment would leave the same column
+  # inflatable through the sibling branch, so the bound is applied to the WHOLE
+  # string, once, where every branch passes through.
+  @max_error_chars 300
+
+  defp bound_error({:error, message}) when is_binary(message),
+    do: {:error, String.slice(message, 0, @max_error_chars)}
+
+  defp bound_error(result), do: result
 
   # What a FAILED delivery is allowed to say about the response.
   #

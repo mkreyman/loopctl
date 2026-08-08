@@ -632,6 +632,44 @@ defmodule Loopctl.Egress.PolicyTest do
                  Policy.repin(scope, "ollama.internal", :inference)
       end)
     end
+
+    # REGRESSION (review): the port came from the FIRST resolved endpoint on the
+    # host (always `:embedding`), so a scope whose embedding and chat endpoints
+    # share a host on different ports re-pinned against the wrong one — answering
+    # `network_local` while the call the agent was recovering stays refused.
+    test "a re-pin over a host reached on two ports reports the LEAST permissive",
+         %{tenant: t, scope: scope} do
+      # The embedding endpoint is `https://api.openai.com/v1` (port 443) under
+      # test config, so pointing chat at the same host on another port is what
+      # makes the two resolved endpoints collide.
+      fixture(:tenant_llm_settings,
+        tenant_id: t.id,
+        chat_provider: "openai_compatible",
+        chat_base_url: "http://api.openai.com:8080/v1",
+        extraction_model: "llama3.1"
+      )
+
+      with_allowlist(["api.openai.com:443"], fn ->
+        stub(Loopctl.MockDnsResolver, :resolve, fn _ -> {:ok, [{10, 0, 0, 5}]} end)
+
+        # 443 is carved out; 8080 — the port the chat call actually uses — is not.
+        assert {:ok, %{verdict: :denylisted}} =
+                 Policy.repin(scope, "api.openai.com", :inference)
+      end)
+    end
+
+    # REGRESSION (review): a host the tenant only DECLARED is not a resolved
+    # endpoint, so the port fell back to `:any`, which by design matches no
+    # port-bound entry — the same wrong verdict the port fix was written to remove.
+    test "a re-pin over a non-endpoint host uses the port the carve-out states",
+         %{scope: scope} do
+      with_allowlist(["declared.internal:11434@inference"], fn ->
+        stub(Loopctl.MockDnsResolver, :resolve, fn _ -> {:ok, [{10, 0, 0, 7}]} end)
+
+        assert {:ok, %{verdict: :network_local}} =
+                 Policy.repin(scope, "declared.internal", :inference)
+      end)
+    end
   end
 
   # The allowlist is DEPLOYMENT configuration, so a test that exercises an

@@ -993,6 +993,13 @@ defmodule Loopctl.Egress do
         # purpose mismatch, so `denylisted` alone is not diagnosable. It rides in
         # the metadata rather than in `reason`, which is the deduplication key of
         # the aggregated row.
+        #
+        # RAW EVENT ONLY, today: neither the shipped counter's `tag_values`
+        # (`Loopctl.Telemetry.ScaleMetrics.egress_blocked_tags/1`) nor the
+        # aggregated `egress_blocked_decisions` row carries it, so an operator
+        # reads the purpose from the refusal's details map and the warning log —
+        # not from the metric. Do not cite the metric as the diagnostic path
+        # until that tag exists.
         purpose: Map.get(details, :purpose)
       }
     )

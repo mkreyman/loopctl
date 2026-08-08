@@ -236,6 +236,22 @@ defmodule Loopctl.Webhooks.ReqDeliveryTest do
       assert String.length(message) < 200
     end
 
+    # REGRESSION (review): the bound was applied to the content-type fragment
+    # only, while the sibling transport/exception branches build their string from
+    # `inspect/1` of a peer-influenced term and write the SAME persisted column
+    # through the same deliveries API.
+    test "a destination-shaped transport failure is bounded too", %{scope: scope} do
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
+        Req.Test.transport_error(conn, {:bad_alpn_protocol, String.duplicate("z", 4_000)})
+      end)
+
+      assert {:error, message} =
+               ReqDelivery.deliver("https://93.184.216.34/hooks", "{}", [], scope)
+
+      assert message =~ "connection_error"
+      assert String.length(message) < 400
+    end
+
     test "a body-less failure still reports the status", %{scope: scope} do
       Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
         Plug.Conn.send_resp(conn, 500, "")

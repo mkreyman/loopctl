@@ -85,9 +85,16 @@ defmodule Loopctl.Egress.Allowlist do
   hosts that run nothing else.
 
   An IPv6 literal is BRACKETED when it carries a port (`[fdaa::1]:8080`) and may
-  be written bare when it does not (`fdaa::1`). Anything else with several colons
-  is a typo and is rejected rather than accepted as a host name that can never
-  match.
+  be written bare when it does not (`fdaa::1`). It is stored CANONICALIZED
+  (`:inet.ntoa/1` form), because matching is string equality against that form —
+  an expanded `fdaa:0:0:0:0:0:0:1` would otherwise parse, report clean from
+  `defects/0`, and match nothing.
+
+  A bare literal that reads BOTH ways is rejected, not guessed: `fdaa::1:8080` is
+  a valid address AND is `fdaa::1` with the brackets left off, and the two
+  readings carve out different hosts. Bracket it (`[fdaa::1]:8080`) to say which
+  one you meant. Anything else with several colons is a typo and is rejected
+  rather than accepted as a host name that can never match.
 
   CIDR entries carry no port syntax and are port-independent. There is no
   ambiguity to resolve there (nothing was ever written and dropped), and
@@ -382,10 +389,10 @@ defmodule Loopctl.Egress.Allowlist do
 
   defp parse_bracketed(entry, rest, purposes) do
     with [literal, tail] <- String.split(rest, "]", parts: 2),
-         {:ok, _ip} <- :inet.parse_address(String.to_charlist(literal)) do
+         {:ok, ip} <- :inet.parse_address(String.to_charlist(literal)) do
       case tail do
-        "" -> [{:host, literal, :any, purposes}]
-        ":" <> port -> parse_host_port(entry, literal, port, purposes)
+        "" -> [{:host, canonical(ip), :any, purposes}]
+        ":" <> port -> parse_host_port(entry, canonical(ip), port, purposes)
         _ -> reject(entry)
       end
     else
@@ -395,23 +402,38 @@ defmodule Loopctl.Egress.Allowlist do
 
   defp parse_bare_host(entry, host, purposes) do
     case String.split(host, ":") do
-      [h] ->
-        [{:host, h, :any, purposes}]
-
-      [h, port] ->
-        parse_host_port(entry, h, port, purposes)
-
-      _ ->
-        # An UNBRACKETED IPv6 literal (`fdaa::1`) is a legal portless entry — it
-        # is what `:inet.ntoa/1` produces, so it matches a resolved address.
-        # Anything else carrying several colons is a typo, and a typo is loud.
-        if match?({:ok, _}, :inet.parse_address(String.to_charlist(host))) do
-          [{:host, host, :any, purposes}]
-        else
-          reject(entry)
-        end
+      [h] -> [{:host, h, :any, purposes}]
+      [h, port] -> parse_host_port(entry, h, port, purposes)
+      _ -> parse_bare_v6(entry, host, purposes)
     end
   end
+
+  # An UNBRACKETED IPv6 literal (`fdaa::1`) is a legal portless entry. It is
+  # stored CANONICALIZED: every match is string equality against `:inet.ntoa/1`
+  # output (or against a URL host, which is written the same way), so an expanded
+  # literal would parse, be invisible to `defects/0`, and grant nothing.
+  #
+  # `fdaa::1:8080` is REJECTED even though it parses: it is equally `fdaa::1` with
+  # the brackets left off, and honouring either reading silently carves out an
+  # address the operator did not write. Anything else carrying several colons is a
+  # typo, and a typo is loud.
+  defp parse_bare_v6(entry, host, purposes) do
+    with false <- bracketless_port?(host),
+         {:ok, ip} <- :inet.parse_address(String.to_charlist(host)) do
+      [{:host, canonical(ip), :any, purposes}]
+    else
+      _ -> reject(entry)
+    end
+  end
+
+  defp bracketless_port?(host) do
+    {head, [tail]} = host |> String.split(":") |> Enum.split(-1)
+
+    match?({p, ""} when p in 1..65_535, Integer.parse(tail)) and
+      match?({:ok, _}, :inet.parse_address(String.to_charlist(Enum.join(head, ":"))))
+  end
+
+  defp canonical(ip), do: ip |> :inet.ntoa() |> List.to_string()
 
   defp parse_host_port(entry, host, port, purposes) do
     case Integer.parse(port) do
@@ -438,7 +460,9 @@ defmodule Loopctl.Egress.Allowlist do
         "Loopctl.Egress.Allowlist: ignoring unparseable LOCAL_ENDPOINT_ALLOWLIST entry " <>
           "#{inspect(entry)} — it grants NO carve-out. Expected host[:port][@purpose], " <>
           "or an IPv4/IPv6 CIDR[@purpose], where purpose is one of " <>
-          "#{Enum.map_join(@purposes, "/", &to_string/1)} (`+`-separated for several)."
+          "#{Enum.map_join(@purposes, "/", &to_string/1)} (`+`-separated for several). " <>
+          "BRACKET an IPv6 literal that could also be read as host:port — " <>
+          "[fdaa::1]:8080 for port 8080, [fdaa::1:8080] for the address itself."
       )
     end
 

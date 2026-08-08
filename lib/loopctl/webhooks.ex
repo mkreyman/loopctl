@@ -555,6 +555,14 @@ defmodule Loopctl.Webhooks do
   # ever use. Those entries count against the cache's single global cap, so an
   # authenticated tenant could pressure every other tenant's classification cache
   # with requests that never succeed.
+  #
+  # For an OWNED scope the warm adds no residency of its own: the in-transaction
+  # `validate_destination_locality/2` classifies the same destination under the
+  # same key, so the entry exists either way. The remaining pressure — one entry
+  # per distinct hostname a tenant PATCHes, which `check_webhook_limit/2` does not
+  # bound because no subscription is created — is a property of that check, not of
+  # the warm, and its bound belongs in `Loopctl.Egress.PinCache` (a per-tenant
+  # residency cap), not here.
   defp prewarm_destination(tenant_id, changeset) do
     if changeset.valid? and egress_decision_changed?(changeset) and
          owned_scope?(tenant_id, changeset) do

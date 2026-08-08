@@ -329,10 +329,22 @@ defmodule Loopctl.Egress.Policy do
           {:ok, %{verdict: verdict(), from_allowlist: boolean(), ips: [:inet.ip_address()]}}
           | {:error, term()}
   def classify(%Scope{} = scope, host, purpose, port \\ :any) when is_binary(host) do
-    case cached_classification(scope, host, purpose, port) do
-      {:ok, entry} -> {:ok, Map.take(entry, [:verdict, :from_allowlist, :ips])}
-      {:error, _} = err -> err
-    end
+    guarded(fn ->
+      case cached_classification(scope, host, purpose, port) do
+        {:ok, entry} -> {:ok, Map.take(entry, [:verdict, :from_allowlist, :ips])}
+        {:error, _} = err -> err
+      end
+    end)
+  end
+
+  # A classification never raises at its callers: they are admission decisions and
+  # API handlers that must produce a refusal, not a 500. Shared rather than
+  # inlined into `classify/4` so a step the CALLER runs first — resolving the port
+  # a re-pin classifies on, which reads endpoint config off the 3-connection
+  # AdminRepo pool — is covered by the same net. An argument is evaluated before
+  # the callee's body, so a DB blip there would otherwise escape as an exception.
+  defp guarded(fun) do
+    fun.()
   rescue
     e -> {:error, {:classifier_error, Exception.message(e)}}
   catch
@@ -352,25 +364,69 @@ defmodule Loopctl.Egress.Policy do
   @spec repin(Scope.t(), String.t(), purpose()) :: {:ok, map()} | {:error, term()}
   def repin(%Scope{} = scope, host, purpose \\ :inference) do
     PinCache.delete(scope.tenant_id, Scope.key(scope), host)
-    classify(scope, host, purpose, endpoint_port(scope, host))
-  end
 
-  # The port the SCOPE actually reaches this host on. A re-pin is host-granular,
-  # and `:any` means "no port in hand" — it matches only a PORTLESS entry — so
-  # classifying without it would report `:denylisted` for a host that a
-  # port-bound operator carve-out grants and that inference calls reach without a
-  # problem. The caller reached this host through one of the scope's resolved
-  # endpoints, which is where the port comes from.
-  defp endpoint_port(scope, host) do
-    normalized = String.downcase(host)
-
-    scope
-    |> Egress.resolved_endpoints()
-    |> Enum.find_value(:any, fn {_kind, url} ->
-      uri = URI.parse(url)
-      if is_binary(uri.host) and String.downcase(uri.host) == normalized, do: uri_port(uri)
+    guarded(fn ->
+      scope
+      |> endpoint_ports(host, purpose)
+      |> Enum.map(&classify(scope, host, purpose, &1))
+      |> Enum.min_by(&permissiveness/1)
     end)
   end
+
+  # Every port the SCOPE reaches this host on. `:any` means "no port in hand" and
+  # matches only a PORTLESS entry, so classifying without one reports
+  # `:denylisted` for a host a port-bound carve-out grants and that inference
+  # calls reach fine.
+  #
+  # There can be SEVERAL — the embedding and chat endpoints may share a host on
+  # different ports, and a carve-out may grant one and not the other — so all are
+  # classified and the LEAST permissive answer is reported. Taking the first would
+  # answer `network_local` for a port the caller does not use while the call it
+  # was recovering stays refused, the same unactionable remediation one case over.
+  # A host the tenant only DECLARED is no resolved endpoint and carries no port of
+  # its own; there the operator's own entries state it.
+  defp endpoint_ports(scope, host, purpose) do
+    normalized = String.downcase(host)
+
+    case resolved_ports(scope, normalized) do
+      [] -> allowlist_ports(normalized, purpose)
+      ports -> ports
+    end
+  end
+
+  defp resolved_ports(scope, normalized) do
+    scope
+    |> Egress.resolved_endpoints()
+    |> Enum.flat_map(fn {_kind, url} ->
+      uri = URI.parse(url)
+
+      if is_binary(uri.host) and String.downcase(uri.host) == normalized,
+        do: [uri_port(uri)],
+        else: []
+    end)
+    |> Enum.uniq()
+  end
+
+  # Only entries that grant the REQUESTED purpose: an entry made for `webhook`
+  # states nothing about the port an inference call reaches this host on, and
+  # borrowing it would report a verdict for a port nobody uses.
+  defp allowlist_ports(normalized, purpose) do
+    stated =
+      for {:host, ^normalized, p, purposes} <- Allowlist.entries(),
+          p != :any and purpose in purposes,
+          do: p
+
+    case Enum.uniq(stated) do
+      [] -> [:any]
+      ports -> ports
+    end
+  end
+
+  # Error < non-local < local: `Enum.min_by/2` then reports the most conservative
+  # of the candidate ports.
+  defp permissiveness({:error, _}), do: 0
+  defp permissiveness({:ok, %{verdict: v}}) when v in [:network_local, :tenant_declared], do: 2
+  defp permissiveness({:ok, _}), do: 1
 
   @doc false
   # Called by the supervised refresher. Re-resolves an entry's host with the SAME
