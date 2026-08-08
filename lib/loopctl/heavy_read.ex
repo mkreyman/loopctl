@@ -292,16 +292,91 @@ defmodule Loopctl.HeavyRead do
   # under-returned. Default OFF so this is a NO-OP (and pgvector < 0.8, which lacks the GUC,
   # never sees the `SET LOCAL`) until an operator enables it after verifying the deployed
   # pgvector is >= 0.8 — a single `SystemConfig` UPDATE, no redeploy.
+  #
+  # The RESOLVED state is stamped alongside it under `:hnsw_iterative_scan_state` — for every
+  # ANN endpoint, including the `:off` and degraded ones that carry no mode. That is what makes
+  # `iterative_scan_meta/1` a pure function of the opts the read ran with: without it the
+  # disclosure had to re-read the live config afterwards and could contradict the rows it
+  # accompanies across a `SystemConfig` refresh, and it could not tell a non-ANN endpoint's opts
+  # (which never carry the key) from an ANN read whose probe fell closed.
   defp maybe_put_iterative_scan(opts, endpoint) do
     if endpoint in @ann_endpoints do
-      case iterative_scan_override() do
-        nil -> opts
-        mode -> Keyword.put(opts, :hnsw_iterative_scan, mode)
+      case iterative_scan_state() do
+        {:applied, mode} ->
+          opts
+          |> Keyword.put(:hnsw_iterative_scan, mode)
+          |> Keyword.put(:hnsw_iterative_scan_state, :applied)
+
+        state ->
+          Keyword.put(opts, :hnsw_iterative_scan_state, state)
       end
     else
       opts
     end
   end
+
+  # The consequence is the same for both causes and is the part the caller acts on, so it is
+  # worded once.
+  @residual_filter_note "The index applies the tenant filter AFTER returning its " <>
+                          "top-ef_search batch, so rows this tenant has may be missing " <>
+                          "from these results."
+
+  @unsupported_reason "hnsw.iterative_scan is enabled but the connected pgvector does " <>
+                        "NOT support it (older than 0.8, or the extension is not " <>
+                        "installed), so this vector read ran without it. " <>
+                        @residual_filter_note <>
+                        " This does not self-heal: it stands until the extension is upgraded."
+
+  @inconclusive_reason "hnsw.iterative_scan is enabled but the backend capability probe " <>
+                         "was inconclusive, so this vector read ran without it. " <>
+                         @residual_filter_note <>
+                         " The probe re-runs on a short window and this self-heals; " <>
+                         "results are not otherwise affected."
+
+  @doc """
+  The search-`meta` disclosure of whether a vector read ACTUALLY ran with
+  `hnsw.iterative_scan`, derived from the `opts` that read was issued with.
+
+  Pass the SAME keyword list handed to `all/3` / `one/3`. It reads ONLY the
+  `:hnsw_iterative_scan_state` `opts/1` stamped at build time — never a fresh probe or a
+  fresh config read — so it cannot disagree with the rows it accompanies, and opts from a
+  NON-ANN endpoint (which carry no state) disclose nothing rather than a false degradation.
+
+      %{ann_iterative_scan: "off"}          # the operator has not enabled it (the default)
+      %{ann_iterative_scan: "applied"}      # enabled and in force for this read
+      %{ann_iterative_scan: "unavailable",  # enabled, but the read ran without it
+        ann_iterative_scan_reason: "..."}   # ... and WHICH cause, because they differ
+      %{}                                   # not an ANN read — nothing to say
+
+  ## Why the third state has to be SAID
+
+  `iterative_scan_supported?/0` fails CLOSED — correctly: emitting a GUC a pgvector < 0.8
+  backend rejects would 500 every ANN read. But the ANN applies `tenant_id` as a residual
+  filter AFTER the index returns its top-`ef_search` batch, so a read that loses iterative
+  scan can silently UNDER-RETURN rows the tenant has. Without this field the caller sees a
+  short result set and a 200, and reads it as "the corpus has nothing" — the same silent
+  absence `system_corpus_recall` and `reembed_excluded_reason` exist to prevent. This
+  state has NOT been observed in production; it is a disclosed code path, not an incident.
+
+  The two causes carry DIFFERENT prose because the operator's next action differs: an
+  inconclusive probe self-heals on the next window, while a conclusive < 0.8 / absent
+  extension stands until the extension is upgraded and never heals on its own (the same
+  line `maybe_warn_unsupported/2` draws in the log). The fail-closed behaviour itself is
+  unchanged — this says so, it does not fix it.
+  """
+  @spec iterative_scan_meta(keyword()) :: map()
+  def iterative_scan_meta(opts) when is_list(opts) do
+    case Keyword.get(opts, :hnsw_iterative_scan_state) do
+      nil -> %{}
+      :off -> %{ann_iterative_scan: "off"}
+      :applied -> %{ann_iterative_scan: "applied"}
+      :unsupported -> degraded_meta(@unsupported_reason)
+      :unavailable -> degraded_meta(@inconclusive_reason)
+    end
+  end
+
+  defp degraded_meta(reason),
+    do: %{ann_iterative_scan: "unavailable", ann_iterative_scan_reason: reason}
 
   # The per-read `hnsw.ef_search` value to APPLY via `SET LOCAL`, or `nil` to leave the
   # session/role default untouched. `nil` exactly when the configured (clamped) value equals
@@ -490,18 +565,37 @@ defmodule Loopctl.HeavyRead do
     |> min(1_000_000)
   end
 
-  # The per-read `hnsw.iterative_scan` mode to APPLY via `SET LOCAL`, or `nil` when OFF
-  # (the default) — so the common path issues NO iterative-scan GUC round-trip and pgvector
-  # versions without the GUC are never touched. When an operator HAS enabled it, the
-  # capability probe (`iterative_scan_supported?/0`) is the second gate: on a pgvector < 0.8
-  # backend (no such GUC) it returns `nil` too, so enabling the config there is a NO-OP
-  # rather than a fleet-wide ANN outage. The `"off"` clause short-circuits BEFORE the probe,
-  # so the default path never pays for it.
-  @spec iterative_scan_override() :: String.t() | nil
-  defp iterative_scan_override do
+  # The per-read `hnsw.iterative_scan` DECISION for an ANN endpoint. `{:applied, mode}` is the
+  # only shape that emits a `SET LOCAL`; `:off` (the default) short-circuits BEFORE the probe,
+  # so the common path issues NO iterative-scan GUC round-trip and pgvector versions without
+  # the GUC are never touched. When an operator HAS enabled it, the capability probe
+  # (`iterative_scan_supported?/0`) is the second gate, so enabling the config on a backend
+  # that cannot do it is a NO-OP rather than a fleet-wide ANN outage.
+  #
+  # The two NOT-applied-but-enabled shapes are kept APART for the disclosure only (the read
+  # behaves identically): `:unsupported` is a CONCLUSIVE "this backend cannot", which stands
+  # until the extension is upgraded, while `:unavailable` is "we could not ask", which the
+  # next conclusive probe clears. Reporting the first as the second promises a self-heal that
+  # will never come — and reporting the second as the first sends the operator to upgrade an
+  # extension when the real cause was pool saturation.
+  #
+  # Which one it is comes from the PROVENANCE the verdict carries out of the probe that
+  # produced it (`iterative_scan_verdict/0`), never from a second read of
+  # `last_conclusive_verdict/0`: a `false` an inconclusive probe merely REUSED from that
+  # record is indistinguishable there from a `false` the backend just gave, so classifying on
+  # it labelled a transient degradation permanent.
+  @spec iterative_scan_state() :: :off | :unsupported | :unavailable | {:applied, String.t()}
+  defp iterative_scan_state do
     case hnsw_iterative_scan() do
-      "off" -> nil
-      mode -> if iterative_scan_supported?(), do: mode, else: nil
+      "off" ->
+        :off
+
+      mode ->
+        case iterative_scan_verdict() do
+          {true, _provenance} -> {:applied, mode}
+          {false, :conclusive} -> :unsupported
+          {false, _reused_or_guess} -> :unavailable
+        end
     end
   end
 
@@ -577,9 +671,22 @@ defmodule Loopctl.HeavyRead do
   """
   @spec iterative_scan_supported?() :: boolean()
   def iterative_scan_supported? do
+    {verdict, _provenance} = iterative_scan_verdict()
+    verdict
+  end
+
+  # The verdict PLUS how it was reached, cached together so the two can never be resolved from
+  # separate reads: `:conclusive` (the backend answered), `:reused` (an inconclusive probe fell
+  # back on a recent conclusive record) or `:guess` (inconclusive with nothing to reuse — fail
+  # closed). `iterative_scan_state/0` is the consumer; only `:conclusive` may be disclosed as a
+  # backend incapability.
+  @spec iterative_scan_verdict() :: {boolean(), :conclusive | :reused | :guess}
+  defp iterative_scan_verdict do
     case :persistent_term.get({__MODULE__, :iterative_scan_supported}, :unknown) do
-      {verdict, expires_at} when is_boolean(verdict) ->
-        if now_ms() < expires_at, do: verdict, else: reprobe(verdict)
+      {verdict, expires_at, provenance} when is_boolean(verdict) ->
+        if now_ms() < expires_at,
+          do: {verdict, provenance},
+          else: reprobe(verdict, provenance)
 
       _unknown ->
         probe_and_cache()
@@ -601,21 +708,21 @@ defmodule Loopctl.HeavyRead do
   # probe is a sub-millisecond `pg_extension` lookup there.
   #
   # A cold VM (no entry at all) still probes concurrently; that is once per boot.
-  defp reprobe(false) do
-    cache_iterative_scan_verdict(false, @probe_timeout_ms)
+  defp reprobe(false, provenance) do
+    cache_iterative_scan_verdict(false, @probe_timeout_ms, provenance)
     probe_and_cache()
   end
 
-  defp reprobe(true), do: probe_and_cache()
+  defp reprobe(true, _provenance), do: probe_and_cache()
 
   defp probe_and_cache do
     case probe_iterative_scan_support() do
       {:ok, supported, version} ->
         maybe_warn_unsupported(supported, version)
-        cache_iterative_scan_verdict(supported, @iterative_scan_cache_ttl_ms)
+        cache_iterative_scan_verdict(supported, @iterative_scan_cache_ttl_ms, :conclusive)
         :persistent_term.put({__MODULE__, :iterative_scan_last_conclusive}, {supported, now_ms()})
         reset_guess_ttl()
-        supported
+        {supported, :conclusive}
 
       {:inconclusive, reason, class} ->
         inconclusive_verdict(reason, class)
@@ -642,10 +749,10 @@ defmodule Loopctl.HeavyRead do
         )
 
         if cacheable_inconclusive?(class) do
-          cache_iterative_scan_verdict(verdict, @iterative_scan_negative_ttl_ms)
+          cache_iterative_scan_verdict(verdict, @iterative_scan_negative_ttl_ms, :reused)
         end
 
-        verdict
+        {verdict, :reused}
 
       :none ->
         maybe_log_inconclusive(
@@ -655,10 +762,10 @@ defmodule Loopctl.HeavyRead do
         )
 
         if cacheable_inconclusive?(class) do
-          cache_iterative_scan_verdict(false, next_guess_ttl_ms())
+          cache_iterative_scan_verdict(false, next_guess_ttl_ms(), :guess)
         end
 
-        false
+        {false, :guess}
     end
   end
 
@@ -752,8 +859,11 @@ defmodule Loopctl.HeavyRead do
     Application.get_env(:loopctl, repo(), [])[:pool] == Ecto.Adapters.SQL.Sandbox
   end
 
-  defp cache_iterative_scan_verdict(verdict, ttl_ms) do
-    :persistent_term.put({__MODULE__, :iterative_scan_supported}, {verdict, now_ms() + ttl_ms})
+  defp cache_iterative_scan_verdict(verdict, ttl_ms, provenance) do
+    :persistent_term.put(
+      {__MODULE__, :iterative_scan_supported},
+      {verdict, now_ms() + ttl_ms, provenance}
+    )
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)
@@ -990,6 +1100,8 @@ defmodule Loopctl.HeavyRead do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     {ef, opts} = Keyword.pop(opts, :hnsw_ef_search, nil)
     {iter, opts} = Keyword.pop(opts, :hnsw_iterative_scan, nil)
+    # DISCLOSURE-ONLY (`iterative_scan_meta/1`) — dropped here so it never reaches the repo.
+    {_iter_state, opts} = Keyword.pop(opts, :hnsw_iterative_scan_state)
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard!(tenant_id, queryable)
     read_repo = repo_for(endpoint(opts))
@@ -1006,6 +1118,7 @@ defmodule Loopctl.HeavyRead do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     {ef, opts} = Keyword.pop(opts, :hnsw_ef_search, nil)
     {iter, opts} = Keyword.pop(opts, :hnsw_iterative_scan, nil)
+    {_iter_state, opts} = Keyword.pop(opts, :hnsw_iterative_scan_state)
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard!(tenant_id, queryable)
     read_repo = repo_for(endpoint(opts))
@@ -1042,6 +1155,7 @@ defmodule Loopctl.HeavyRead do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     {ef, opts} = Keyword.pop(opts, :hnsw_ef_search, nil)
     {iter, opts} = Keyword.pop(opts, :hnsw_iterative_scan, nil)
+    {_iter_state, opts} = Keyword.pop(opts, :hnsw_iterative_scan_state)
     {on_overload, opts} = Keyword.pop(opts, :on_overload, :raise)
     query = guard_memory!(tenant_id, subject_id, queryable)
     read_repo = repo_for(endpoint(opts))

@@ -182,6 +182,15 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     # exceeds the relevance pool cap, so the tail is unreachable by deeper `offset` —
     # the consumer should switch to list mode for full enumeration.
     |> maybe_put(:pool_capped, meta[:pool_capped])
+    # `ann_iterative_scan` (relevance modes): whether the vector read ran with
+    # `hnsw.iterative_scan`. `"unavailable"` means the operator enabled it but the read ran
+    # without it, so the cross-tenant residual filter may have under-returned — disclosed
+    # rather than left as a short result set the caller reads as an empty corpus. It covers
+    # TWO causes with DIFFERENT operator actions (an inconclusive probe, which self-heals,
+    # vs a pgvector that conclusively lacks the GUC, which stands until the extension is
+    # upgraded); `ann_iterative_scan_reason` accompanies that state only and names which.
+    |> maybe_put(:ann_iterative_scan, meta[:ann_iterative_scan])
+    |> maybe_put(:ann_iterative_scan_reason, meta[:ann_iterative_scan_reason])
     # `fallback_reason` (#297): a stable, non-sensitive tag naming WHY combined/semantic
     # degraded to keyword_only (present only alongside `fallback: true`).
     |> maybe_put(:fallback_reason, meta[:fallback_reason])
