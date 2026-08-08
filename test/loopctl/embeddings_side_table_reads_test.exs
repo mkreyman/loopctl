@@ -10,7 +10,7 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   threaded into the search response `meta` (AC-41.1.7), and the re-embed
   coexistence + pending-dimension exclusion reporting (AC-41.1.10).
 
-  ## The `left: []` flake — UNEXPLAINED. Read this before "fixing" it.
+  ## The `left: []` flake — MECHANISM ESTABLISHED, fix not yet landed. Read before touching.
 
   This file (and its siblings `system_config_read_path_test.exs`,
   `embeddings_review_fixes_test.exs`) intermittently fails with `left: []` — an
@@ -36,11 +36,25 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       `hnsw.iterative_scan` OFF the HNSW branch returned `rows=0` and `rows=3` where 23
       rows were visible; with `relaxed_order` — which is what `HeavyRead` actually
       applies, and what prod runs — it returned the full `rows=20` every time.
-    * **Do not read that as the answer.** `HeavyRead` applies `relaxed_order` on this
-      path today, so the protected case is the normal case, and nothing here shows a
-      real failure ever ran without it. It is a HYPOTHESIS with a mechanism and a
-      falsifiable prediction (a recurrence should show an HNSW plan with iterative scan
-      absent), not an established cause.
+    * **That hypothesis is now DEAD, and the diagnostic below is what killed it.** It
+      predicted a recurrence would show an HNSW plan with iterative scan ABSENT. A real
+      recurrence was captured (`tenant isolation holds on the side-table read path`) and
+      showed the opposite: `iterative_scan="relaxed_order" (supported?=true)` — applied,
+      not absent — and it under-returned anyway. Do not go looking for a failed
+      capability probe.
+    * **What that capture DOES show is candidate starvation, on the numbers.** The plan
+      was the shared `article_embeddings_hnsw_dim_1536_idx` with `tenant_id` as a
+      post-ANN `Filter`, so the ANN picks its nearest N across EVERY tenant's rows and
+      discards the non-matching ones afterwards. The tenant had 24 embedding rows — 23
+      materialized system articles and exactly ONE `scope: :tenant` article, the row the
+      assertion wanted. The inner pool produced 20; the outer pool truncates to
+      `pool=5`. A single own-article competing against 23 system articles for 5 slots
+      does not reliably survive, and when it doesn't the assertion sees `[]`.
+    * **So the page size IS the right lever — and config disables it.** `limit:` is
+      clamped by `semantic_result_pool_cap` (5 in `config/test.exs`), so widening a page
+      buys NOTHING while that cap stands. This is why four fixes and fourteen wide
+      `limit:` annotations did not stop it: the diagnosis was right and the remedy was
+      inert. Adding a fifteenth `limit:` is not the fix; the cap is.
     * The one CI failure captured in detail asserted on a raw `HeavyRead.all/2` and
       never called `search_semantic/3` at all.
     * Every failure mode seen UNDER-returns. Nothing has ever returned another tenant's
@@ -49,7 +63,16 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
   So: do NOT ship a fifth speculative recall fix. `hnsw.ef_search`, exact-scan forcing,
   `hnsw.iterative_scan` and retry-on-empty have each been tried and each regressed
-  something else. Collect the diagnostic below FIRST and let it name the branch.
+  something else — and none of them was ever the lever, because the lever is the pool
+  cap. Collect the diagnostic below FIRST and let it name the branch.
+
+  The remaining work is to raise `semantic_result_pool_cap` for this suite WITHOUT
+  breaking the three tests that depend on the current value —
+  `knowledge_semantic_search_test.exs:1348`, `:1376` and `:1432` each seed exactly
+  `cap + 2` rows to trip the truncation signal cheaply, so a naive raise fails all
+  three. That is a real constraint, not a reason to leave the cap alone; this repo
+  forbids `Application.put_env` in tests, so it needs either a reseed or a per-call
+  override on those three.
 
   ### What to do on the next recurrence
 
