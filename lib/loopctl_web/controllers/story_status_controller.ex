@@ -30,7 +30,7 @@ defmodule LoopctlWeb.StoryStatusController do
   # surfaced as 500s. Expressed as a guard so each action forwards them in ONE
   # branch — the controller actions sit at credo's cyclomatic-complexity limit.
   defguardp is_capability_error(reason)
-            when reason == :missing_capability or
+            when reason in [:missing_capability, :capability_key_unavailable] or
                    (is_tuple(reason) and tuple_size(reason) == 2 and
                       elem(reason, 0) == :cap_rejected)
 
@@ -76,14 +76,24 @@ defmodule LoopctlWeb.StoryStatusController do
         "`capability` (a start_cap) which the caller must present to POST /start; it is " <>
         "bound to the caller's dispatch lineage and expires. Claiming with a " <>
         "dispatch-minted key also records the implementer's dispatch on the story, which " <>
-        "is what the downstream custody gates compare.",
+        "is what the downstream custody gates compare. Minting is ATOMIC with the claim: " <>
+        "for a tenant with an audit signing key, a claim whose capability cannot be minted " <>
+        "does not commit at all, so there is no state in which the story is claimed but " <>
+        "unstartable. A mint failure that clears on its own — an unreachable secret store, " <>
+        "or a rotation whose new private half is not deployed yet — is 503 " <>
+        "`capability_mint_failed` with `retry-after`; an audit key that is ABSENT or " <>
+        "CORRUPT is 503 `capability_key_unavailable` with none, because only an operator " <>
+        "can clear it.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 => {"Story claimed", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
         {"Invalid transition or dependencies not met", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 =>
+        {"The claim's capability could not be minted; nothing was claimed. Retryable only " <>
+           "for `capability_mint_failed`", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -93,7 +103,12 @@ defmodule LoopctlWeb.StoryStatusController do
       "Agent starts work on an assigned story. A tenant with an audit signing key must " <>
         "present the `start_cap` returned by the claim response (or recovered via " <>
         "POST /stories/:id/recover-cap) as `capability`; omitting it yields " <>
-        "403 missing_capability. A pre-v2 tenant with no audit key needs no capability.",
+        "403 missing_capability. When a capability IS presented and there is no usable key " <>
+        "to check it against (replaced without an archived history row, or advertised " <>
+        "without a readable private half), the answer is 503 `capability_key_unavailable` " <>
+        "— recovery cannot fix that one, only an operator can. A tenant with NO audit key " <>
+        "at all — pre-v2, or one whose key was CLEARED — needs no capability and starts " <>
+        "without one, dropping to pre-v2 custody strength.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
       {"Start params", "application/json",
@@ -116,7 +131,10 @@ defmodule LoopctlWeb.StoryStatusController do
          Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 =>
+        {"The tenant's audit signing key is unavailable, so the capability could not be " <>
+           "checked", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -288,6 +306,15 @@ defmodule LoopctlWeb.StoryStatusController do
       {:error, :must_contract_first} ->
         {:error, :must_contract_first}
 
+      # The claim rolled back because its start_cap could not be minted: for a
+      # keyed tenant a claim that cannot deliver a capability would leave a story
+      # the agent can neither start nor recover, so it does not commit at all.
+      # The two reasons answer differently on purpose — a secret-store blip is
+      # retryable, an absent or superseded key is an operator condition and
+      # advertising it as retryable turned agents into hot-loops.
+      {:error, reason} when reason in [:capability_mint_failed, :capability_key_unavailable] ->
+        {:error, reason}
+
       {:error, {:invalid_transition, _ctx} = err} ->
         {:error, err}
 
@@ -299,6 +326,13 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :not_found} ->
         {:error, :not_found}
+
+      # Anything else is a server-side failure of the claim's own transaction,
+      # already logged with its step and rolled back. Without this clause an
+      # enumerated `case` turned every such reason into a CaseClauseError — the
+      # same 500 the multi had already handled correctly.
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

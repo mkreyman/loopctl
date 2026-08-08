@@ -27,6 +27,203 @@ defmodule Loopctl.Egress.PinCacheTest do
     {:ok, tenant: tenant, scope: Scope.new(tenant.id)}
   end
 
+  describe "a cache that cannot store must degrade to a MISS, not to a different answer" do
+    test "put returns a FULLY SHAPED entry even when the write is dropped",
+         %{tenant: t, scope: scope} do
+      # A dropped write is the only outcome a caller may observe from a storage
+      # failure. The entry itself must be identical either way: `put/5` used to
+      # rescue around its whole body and hand back a map missing :host,
+      # :tenant_id, :scope_key and :expires_at, so what a caller got depended on
+      # whether the ETS table happened to exist — and reading a dropped key off it
+      # raises KeyError, turning a cache outage into a classification failure.
+      key = Scope.key(scope)
+      attrs = %{base_verdict: :public, from_allowlist: false, ips: [], purposes: []}
+
+      stored = PinCache.put(t.id, key, "shape.example.com", attrs, generation: nil)
+
+      # Same call, but with a generation an invalidation has already superseded:
+      # admission is refused and nothing lands.
+      generation = PinCache.generation(t.id)
+      :ok = PinCache.invalidate_tenant(t.id)
+      dropped = PinCache.put(t.id, key, "shape.example.com", attrs, generation: generation)
+
+      assert PinCache.fetch(t.id, key, "shape.example.com") == :miss
+
+      assert Map.keys(dropped) |> Enum.sort() == Map.keys(stored) |> Enum.sort()
+      assert dropped.host == "shape.example.com"
+      assert dropped.tenant_id == t.id
+      assert dropped.scope_key == key
+      assert is_integer(dropped.expires_at)
+      assert dropped.base_verdict == :public
+    end
+  end
+
+  describe "per-tenant resident bound" do
+    test "one tenant cannot crowd the shared table; a neighbour still gets admitted",
+         %{tenant: t, scope: scope} do
+      neighbour = fixture(:tenant)
+      on_exit(fn -> PinCache.invalidate_tenant(neighbour.id) end)
+
+      key = Scope.key(scope)
+      cap = PinCache.max_entries_per_tenant()
+      attrs = %{base_verdict: :public, from_allowlist: false, ips: [], purposes: []}
+
+      for i <- 1..cap, do: PinCache.put(t.id, key, "h#{i}.example.com", attrs)
+
+      assert PinCache.resident(t.id) == cap
+
+      # Past the cap a NEW key is refused admission...
+      PinCache.put(t.id, key, "overflow.example.com", attrs)
+      assert PinCache.fetch(t.id, key, "overflow.example.com") == :miss
+
+      # ...while an EXISTING key still refreshes (the documented behaviour of the
+      # global cap, applied per tenant).
+      assert {:ok, entry} = PinCache.fetch(t.id, key, "h1.example.com")
+      assert entry.base_verdict == :public
+      PinCache.put(t.id, key, "h1.example.com", %{attrs | base_verdict: :denylisted})
+      assert {:ok, %{base_verdict: :denylisted}} = PinCache.fetch(t.id, key, "h1.example.com")
+
+      # And the whole point: the neighbour is untouched by it.
+      neighbour_key = Scope.key(Scope.new(neighbour.id))
+      PinCache.put(neighbour.id, neighbour_key, "n1.example.com", attrs)
+      assert {:ok, _} = PinCache.fetch(neighbour.id, neighbour_key, "n1.example.com")
+    end
+
+    test "invalidation frees the tenant's headroom immediately", %{tenant: t, scope: scope} do
+      key = Scope.key(scope)
+      cap = PinCache.max_entries_per_tenant()
+      attrs = %{base_verdict: :public, from_allowlist: false, ips: [], purposes: []}
+
+      for i <- 1..cap, do: PinCache.put(t.id, key, "h#{i}.example.com", attrs)
+      :ok = PinCache.invalidate_tenant(t.id)
+
+      assert PinCache.resident(t.id) == 0
+      PinCache.put(t.id, key, "after.example.com", attrs)
+      assert {:ok, _} = PinCache.fetch(t.id, key, "after.example.com")
+    end
+
+    test "deleting an entry returns its slot", %{tenant: t, scope: scope} do
+      key = Scope.key(scope)
+      attrs = %{base_verdict: :public, from_allowlist: false, ips: [], purposes: []}
+
+      PinCache.put(t.id, key, "one.example.com", attrs)
+      assert PinCache.resident(t.id) == 1
+
+      :ok = PinCache.delete(t.id, key, "one.example.com")
+      assert PinCache.resident(t.id) == 0
+
+      # A delete of an absent key must not drive the counter negative and hand the
+      # tenant headroom it did not earn.
+      :ok = PinCache.delete(t.id, key, "one.example.com")
+      assert PinCache.resident(t.id) == 0
+    end
+
+    test "the cap bounds PINS, never the marking or the DNS-miss protection",
+         %{tenant: t, scope: scope} do
+      # Past the cap a new PIN is refused — but a scope's marking and a NEGATIVE
+      # entry are protections, not growth: refusing them makes a large tenant
+      # re-read the marking from the database and repay a full DNS resolve on
+      # EVERY classification, which is the exact cost they exist to collapse.
+      key = Scope.key(scope)
+      cap = PinCache.max_entries_per_tenant()
+      attrs = %{base_verdict: :public, from_allowlist: false, ips: [], purposes: []}
+
+      for i <- 1..cap, do: PinCache.put(t.id, key, "p#{i}.example.com", attrs)
+
+      PinCache.put(t.id, key, "refused.example.com", attrs)
+      assert PinCache.fetch(t.id, key, "refused.example.com") == :miss
+
+      PinCache.put(t.id, key, :__marking__, %{local_only: true})
+      assert {:ok, %{local_only: true}} = PinCache.fetch(t.id, key, :__marking__)
+
+      negative = %{base_verdict: :unresolvable, resolve_error: :nxdomain, ips: [], purposes: []}
+      PinCache.put(t.id, key, "gone.example.com", negative)
+      assert {:ok, %{base_verdict: :unresolvable}} = PinCache.fetch(t.id, key, "gone.example.com")
+    end
+
+    test "DNS misses spend their OWN budget, and are bounded by it", %{tenant: t, scope: scope} do
+      # A negative entry is the cheapest row a tenant can produce — no working host
+      # required — so it must neither starve the tenant's real PINS (which counting
+      # it into the pin budget did) nor be unbounded (which exempting it from every
+      # per-tenant bound did, leaving the shared 50k global cap reachable by one
+      # tenant).
+      key = Scope.key(scope)
+      cap = PinCache.max_entries_per_tenant()
+      negative = %{base_verdict: :unresolvable, resolve_error: :nxdomain, ips: [], purposes: []}
+
+      for i <- 1..cap, do: PinCache.put(t.id, key, "miss#{i}.example.com", negative)
+
+      assert PinCache.negative_resident(t.id) == cap
+      assert PinCache.resident(t.id) == 0
+
+      # Bounded: one more negative entry is refused...
+      PinCache.put(t.id, key, "overflow-miss.example.com", negative)
+      assert PinCache.fetch(t.id, key, "overflow-miss.example.com") == :miss
+
+      # ...and a real pin still has its full share.
+      attrs = %{base_verdict: :public, from_allowlist: false, ips: [], purposes: []}
+      PinCache.put(t.id, key, "real.example.com", attrs)
+      assert {:ok, %{base_verdict: :public}} = PinCache.fetch(t.id, key, "real.example.com")
+      assert PinCache.resident(t.id) == 1
+
+      # A scope's marking is not bounded per tenant at all — it is one row per
+      # `:user`-gated scope, and refusing it costs a DB read on every
+      # classification. The sweep's reconcile classifies rows the same way the
+      # admission check does, so no budget is re-anchored to another's rows.
+      PinCache.put(t.id, key, :__marking__, %{local_only: true})
+      assert {:ok, %{local_only: true}} = PinCache.fetch(t.id, key, :__marking__)
+
+      PinCache.refresh_now(t.id)
+      assert PinCache.resident(t.id) == 1
+      assert PinCache.negative_resident(t.id) == cap
+      assert PinCache.marking_resident(t.id) == 1
+    end
+
+    test "a tenant holding NO live entry is re-anchored to zero", %{tenant: t, scope: scope} do
+      # A counter that drifted ABOVE the true count is the direction that locks a
+      # tenant out of its own share, and a tenant holding nothing is where it
+      # would otherwise stick: the reconcile now counts the TABLE and applies the
+      # difference, so a tenant absent from the live rows is still corrected.
+      key = Scope.key(scope)
+      attrs = %{base_verdict: :public, from_allowlist: false, ips: [], purposes: []}
+
+      PinCache.put(t.id, key, "drift.example.com", attrs)
+      # Drop the ROW behind the counter's back, exactly as an owner restart does.
+      :ets.delete(PinCache.table_name(), {t.id, key, "drift.example.com"})
+      assert PinCache.resident(t.id) == 1
+
+      PinCache.refresh_now(t.id)
+      assert PinCache.resident(t.id) == 0
+    end
+
+    test "the sweep reconciles the counter to the true resident count",
+         %{tenant: t, scope: scope} do
+      key = Scope.key(scope)
+      attrs = %{base_verdict: :public, from_allowlist: false, ips: [], purposes: []}
+
+      PinCache.put(t.id, key, "live.example.com", attrs)
+
+      # `expires_at` is a MONOTONIC stamp, typically NEGATIVE on Linux — a literal
+      # 0 is in the FUTURE and would never be swept.
+      already_expired = System.monotonic_time(:millisecond) - 1_000
+
+      PinCache.put(
+        t.id,
+        key,
+        "reconcile.example.com",
+        Map.put(attrs, :expires_at, already_expired)
+      )
+
+      assert PinCache.resident(t.id) == 2
+
+      PinCache.refresh_now(t.id)
+
+      # The expired one was swept; the counter says so.
+      assert PinCache.fetch(t.id, key, "reconcile.example.com") == :miss
+      assert PinCache.resident(t.id) == 1
+    end
+  end
+
   describe "invalidation beats a concurrent write (generation counter)" do
     test "a put whose captured generation was invalidated is DROPPED", %{tenant: t, scope: scope} do
       key = Scope.key(scope)
