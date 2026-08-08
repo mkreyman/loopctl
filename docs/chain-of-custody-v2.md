@@ -66,7 +66,9 @@ A per-tenant audit chain is tamper-evident not because a single trusted third pa
 
 ### 2.7 Halt on byzantine conditions
 
-When the system detects a chain-of-custody violation, a capability violation, or a witness divergence, it halts the offending tenant's custody operations pending human review. Liveness is sacrificed to preserve safety. This mirrors the FLP impossibility result: you cannot have safety, liveness, and asynchrony; when byzantine conditions appear, liveness is the one you give up.
+When the system detects a PATTERN of chain-of-custody violations, or a witness divergence, it halts the offending tenant's custody operations pending human review. Liveness is sacrificed to preserve safety. This mirrors the FLP impossibility result: you cannot have safety, liveness, and asynchrony; when byzantine conditions appear, liveness is the one you give up.
+
+Both halves of that sentence are load-bearing. "Pattern" — because a refusal a correct client can produce (a retried capability token, a resumed agent) is not evidence of byzantium, and escalating one to a tenant-wide freeze hands any single agent a denial-of-service lever over its whole tenant. "Custody operations" — because the halt suspends the surface where work is certified, not the tenant's ability to read its own state. See §L6 for the threshold, the window, and the declared surface.
 
 ### 2.8 Honest work is the path of least resistance
 
@@ -147,16 +149,19 @@ Every invariant in loopctl is enforced at the lowest possible layer. Layers are 
 
 ### L6 — Halt on byzantine conditions
 
-**What**: a circuit breaker that stops the tenant's custody operations when the system detects an unrecoverable trust violation.
+**What**: a circuit breaker that suspends the tenant's custody operations on a PATTERN of trust violations. Only a human WebAuthn break-glass ceremony clears it, so both its trigger and its blast radius are bounded.
 
-**Enforces**:
-- Self-verify / self-review detection halts the session
-- Capability token mismatch halts
-- Audit chain witness divergence halts the tenant's operations for operator review
-- Missing required evidence halts
-- Rate-limited break-glass overrides
+**Trigger — a threshold over a window, not a single event.** `Loopctl.Custody.ViolationMonitor.record/3` is called from the `FallbackController` clauses for `self_verify_blocked`, `self_report_blocked` and `self_review_blocked` — the three lineage-aware custody gates. Each violation is written to `custody_violations` (tenant-scoped, RLS), and the halt fires only when `threshold/0` violations land inside `window_seconds/0` (defaults 3 / 3600; a non-positive or non-integer override falls back to the default). **Below the threshold the gate still returns its 409** — the thresholding governs escalation, never enforcement.
 
-**Adversary reach**: none for the halt itself; the adversary can potentially trigger false halts (denial of service on its own operations), which is detectable and preferable to silent bypass.
+A halt CLAIMS the violation rows that armed it (`consumed_at`) in the SAME transaction that records the halt, so two concurrent callers cannot produce two onsets, and a failed halt rolls the claim back rather than pardoning the window it was armed by. Violations recorded while a halt is already active are claimed on sight, so a break-glass clear is not immediately re-tripped by evidence that piled up behind the halt.
+
+**A rejected capability token neither halts nor counts.** A capability is single-use with a bounded TTL, so `:replay` (a client retry), `:expired` (a resumed agent) and `:invalid_signature` (an audit-key rotation in flight) are all reachable by ordinary operation. The 403 is the enforcement; escalating a retry to a tenant-wide freeze is not. The signal is preserved as a `[:loopctl, :custody, :cap_rejected]` telemetry event plus a hash-chained audit entry — `capability_forged` for a signature that failed to verify, `capability_replayed` for a double-spend (a retry produces one, so it is recorded as a replay and not as a forgery), `capability_refused` for the rest — alert on the RATE.
+
+**Scope — the halt suspends custody operations, not the tenant.** `LoopctlWeb.CustodySurface` is the declared list: story-lifecycle writes, bulk story ops and `verify-all`, project import (`initial_agent_status` records work as done), dispatch minting, agent-memory writes (recall included, since it bumps the graduation counters), and DELETE of a story/epic/project (that row IS the custody evidence). **Reads are never blocked** — `custody_operation?/1` short-circuits on GET/HEAD/OPTIONS. `test/loopctl_web/custody_surface_test.exs` binds the declared list to `LoopctlWeb.Router.__routes__/0` and fails when a mutating custody route is unclassified; add the route's shape to `CustodySurface` rather than relaxing the test.
+
+Audit-chain witness divergence halts the tenant's custody operations for operator review (§4). Root-of-trust rotation and the superadmin break-glass stay reachable during a halt — they are the remediation paths, and a standalone superadmin key has a nil `tenant_id`, so the check never applies to it. Break-glass overrides are rate-limited.
+
+**Adversary reach**: none for the halt itself; the adversary can potentially trigger false halts (denial of service on its own operations), which is detectable and preferable to silent bypass. The threshold raises the cost of arming one deliberately without lowering the cost of the underlying refusal.
 
 ## 4. Per-tenant audit chain
 

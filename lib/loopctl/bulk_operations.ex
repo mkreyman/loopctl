@@ -316,12 +316,19 @@ defmodule Loopctl.BulkOperations do
   end
 
   # The CALLER's dispatch lineage, resolved SERVER-SIDE from the authenticating key —
-  # never client-supplied. `AuditContext.from_conn/1` puts that key's id in `:actor_id`
-  # (the superadmin's, under impersonation — still the principal that authenticated),
-  # so the bulk path can run the SAME L4 caller comparison the single-story path does.
-  # Without it `ensure_verify_allowed/3` saw an empty lineage, `lineage_status/3` read
-  # that as "no conflict", and bulk verify/reject degraded to agent-id inequality — a
-  # condition any orchestrator key satisfies trivially.
+  # never client-supplied. Without it `ensure_verify_allowed/4` saw an empty lineage,
+  # `lineage_status/2` read that as "no conflict", and bulk verify/reject degraded to
+  # agent-id inequality — a condition any orchestrator key satisfies trivially.
+  #
+  # `LoopctlWeb.BulkOperationsController` passes `:verifier_lineage` explicitly, from
+  # `Dispatches.lineage_for_api_key(tenant_id, conn.assigns.current_api_key.id)` — the
+  # SAME expression `LoopctlWeb.StoryVerificationController` uses on the single-story
+  # path, so the two gates cannot disagree about which principal is calling. The
+  # `:actor_id` fallback below serves DIRECT context callers only. It resolves to the
+  # same key today (`AuditContext.from_conn/1` carries the authenticating key's id),
+  # but `:actor_id` is an audit-ATTRIBUTION field, not a security identity: a future
+  # change to what gets attributed would silently move the L4 gate with it. Do not make
+  # the HTTP path depend on it again.
   defp caller_lineage(tenant_id, opts) do
     Keyword.get_lazy(opts, :verifier_lineage, fn ->
       Dispatches.lineage_for_api_key(tenant_id, Keyword.get(opts, :actor_id))
@@ -563,12 +570,23 @@ defmodule Loopctl.BulkOperations do
 
   defp auto_reset_agent_status(story) do
     story
-    |> Ecto.Changeset.change(%{
-      agent_status: :pending,
-      assigned_agent_id: nil,
-      assigned_at: nil,
-      reported_done_at: nil
-    })
+    |> Ecto.Changeset.change(
+      # The FOURTH site that clears assigned_agent_id on a worked story, and the twin
+      # of Progress.perform_auto_reset/4. Without the stamp the backfill guard here
+      # rests on `verified_status: :rejected` alone — the coincidence the single-story
+      # path was stamped to stop depending on. See Progress.guard_no_lifecycle_history/2.
+      # WORKED is checked, not assumed: bulk-rejecting a never-dispatched imported story
+      # erases no marker, so it earns none (Progress.lifecycle_stamp_change/1).
+      Map.merge(
+        %{
+          agent_status: :pending,
+          assigned_agent_id: nil,
+          assigned_at: nil,
+          reported_done_at: nil
+        },
+        Progress.lifecycle_stamp_change(story)
+      )
+    )
     |> AdminRepo.update()
   end
 

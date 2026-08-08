@@ -14,6 +14,7 @@ defmodule LoopctlWeb.BulkOperationsController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.BulkOperations
+  alias Loopctl.Dispatches
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
@@ -158,7 +159,7 @@ defmodule LoopctlWeb.BulkOperationsController do
     with :ok <- validate_orchestrator_agent_linked(api_key) do
       tenant_id = api_key.tenant_id
       orchestrator_agent_id = api_key.agent_id
-      audit_opts = AuditContext.from_conn(conn)
+      audit_opts = custody_opts(conn, api_key)
 
       case BulkOperations.bulk_verify(tenant_id, stories, orchestrator_agent_id, audit_opts) do
         {:ok, results} ->
@@ -188,7 +189,7 @@ defmodule LoopctlWeb.BulkOperationsController do
     with :ok <- validate_orchestrator_agent_linked(api_key) do
       tenant_id = api_key.tenant_id
       orchestrator_agent_id = api_key.agent_id
-      audit_opts = AuditContext.from_conn(conn)
+      audit_opts = custody_opts(conn, api_key)
 
       case BulkOperations.bulk_reject(tenant_id, stories, orchestrator_agent_id, audit_opts) do
         {:ok, results} ->
@@ -244,6 +245,21 @@ defmodule LoopctlWeb.BulkOperationsController do
   end
 
   # --- Private helpers ---
+
+  # Bulk verify/reject reach the same terminal `verified`/`rejected` states the
+  # single-story path does, so they must run the L4 caller comparison against the SAME
+  # principal. `LoopctlWeb.StoryVerificationController` resolves it from
+  # `conn.assigns.current_api_key.id`; resolve it from the identical expression here
+  # rather than leaving `BulkOperations` to fall back on `:actor_id`, which is an
+  # audit-ATTRIBUTION field. The two carry the same key id today, and that is exactly
+  # what makes the coupling easy to break unnoticed: a change to what gets attributed
+  # would move the custody gate with it. The lineage is never read from the request
+  # body.
+  defp custody_opts(conn, api_key) do
+    Keyword.merge(AuditContext.from_conn(conn),
+      verifier_lineage: Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id)
+    )
+  end
 
   defp respond_with_results(conn, results) do
     has_success = Enum.any?(results, &(&1.status == "success"))
