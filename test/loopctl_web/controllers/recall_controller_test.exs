@@ -68,10 +68,20 @@ defmodule LoopctlWeb.RecallControllerTest do
       assert scores == Enum.sort(scores, :desc)
 
       # Per-source envelopes present and shaped.
-      assert %{"data" => mem_data, "meta" => _} = memory
+      assert %{"data" => mem_data, "meta" => mem_meta} = memory
       assert Enum.any?(mem_data, &(&1["memory"]["text"] == "prefers reshipments"))
 
-      assert %{"data" => know_data, "meta" => _} = knowledge
+      # BOTH halves disclose the vector read's iterative-scan state, under the SAME field
+      # name and value vocabulary (#631 for knowledge, #634 for memory) — an agent reading
+      # this one envelope must not have to learn two. Each half resolves the backend
+      # capability independently, so they are asserted independently against the valid
+      # set rather than against `applied`: iterative scan is pinned ON in `config/test.exs`
+      # but the live probe fails closed to `unavailable` on a pool-checkout timeout, and an
+      # async file cannot prime the VM-global verdict. The exact states live in the sync
+      # `Loopctl.HeavyReadHnswEfSearchTest`.
+      assert %{"data" => know_data, "meta" => know_meta} = knowledge
+      assert mem_meta["ann_iterative_scan"] in ["applied", "unavailable"]
+      assert know_meta["ann_iterative_scan"] in ["applied", "unavailable"]
       assert Enum.any?(know_data, &(&1["id"] == article.id))
 
       assert meta["query"] == "reshipments"

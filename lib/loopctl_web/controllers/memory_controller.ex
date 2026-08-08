@@ -121,7 +121,18 @@ defmodule LoopctlWeb.MemoryController do
         "`meta.fallback: true` and a stable `meta.reason` (score is null on that " <>
         "path) — never a silent empty result. No silent hard cap: `limit` is " <>
         "clamped to the vector-search max and `meta.underfilled` flags a short page " <>
-        "(a small live scope, or a cross-subject/cross-project pool under-fill).",
+        "(a small live scope, or a cross-subject/cross-project pool under-fill). " <>
+        "On a semantic path that scans the HNSW index `meta.ann_iterative_scan` " <>
+        "(`off`|`applied`|`unavailable`) discloses whether the vector read ran with " <>
+        "pgvector's `hnsw.iterative_scan` — it is absent on the ILIKE fallback AND on " <>
+        "an `include_superseded: true` side-table recall (a bounded top-k sort, no " <>
+        "index scan), so absence is not evidence of the fallback path. " <>
+        "`unavailable` means the TENANT filter was applied " <>
+        "after a single index batch, so the page may be INCOMPLETE for a reason " <>
+        "`meta.underfilled` cannot distinguish from a sparse scope. It says nothing " <>
+        "about SUBJECT-level under-return, which is filtered outside the index scan " <>
+        "and unaffected by this field. Identical field and semantics to " <>
+        "`/knowledge/search`.",
     request_body: {"Recall params", "application/json", Schemas.MemoryRecallRequest},
     responses: %{
       200 => {"Recall results", "application/json", Schemas.MemoryRecallResponse},

@@ -293,7 +293,22 @@ defmodule Loopctl.Knowledge.VectorSearch do
           Keyword.put_new_lazy(opts, :reads_side_table, &Embeddings.side_table_reads_enabled?/0)
 
         query = candidate_query(tenant_id, target_embedding, k, opts)
-        HeavyRead.all(tenant_id, query, nearest_heavy_read_opts(k, opts))
+        read_opts = nearest_heavy_read_opts(k, opts)
+
+        case HeavyRead.all(tenant_id, query, read_opts) do
+          {:error, :heavy_read_overloaded} = shed ->
+            shed
+
+          neighbors when is_list(neighbors) ->
+            # Both callers of `nearest/4` take a WRITE decision on this result and neither
+            # has a response envelope to disclose a degraded scan in — `ProposalGate`
+            # verdicts a missed near-dup as novel (publishing a duplicate) and
+            # `ArticleLinkingWorker` writes no link for a neighbour the batch never
+            # returned. Warned here, once, from the opts the read ACTUALLY ran with, so
+            # the two cannot describe different executions (#634 round-2).
+            HeavyRead.warn_if_ann_degraded("knowledge.vector_search", read_opts)
+            neighbors
+        end
 
       {:error, _mismatch} ->
         []
@@ -732,6 +747,20 @@ defmodule Loopctl.Knowledge.VectorSearch do
 
   defp maybe_live_denorm_only(query, false), do: query
   defp maybe_live_denorm_only(query, _true), do: where(query, [x], x.live_denorm)
+
+  @doc """
+  Whether `index_safe_dimension_knn_base/6` with these `opts` builds a shape a
+  per-dimension HNSW index can actually serve.
+
+  Callers that DISCLOSE whether their read was an index scan (see
+  `Loopctl.HeavyRead.iterative_scan_meta/1`) must ask HERE rather than re-deriving the
+  index set from their own flags: this function and `maybe_live_denorm_only/2` sit on the
+  one predicate that decides it, so a migration adding a full (non-partial) per-dimension
+  index changes both together and the disclosure cannot outlive the plan it describes.
+  """
+  @spec dimension_knn_index_scanned?(keyword()) :: boolean()
+  def dimension_knn_index_scanned?(opts \\ []) when is_list(opts),
+    do: Keyword.get(opts, :live_only, true)
 
   # ONE clause per SUPPORTED dimension, generated at COMPILE TIME.
   #

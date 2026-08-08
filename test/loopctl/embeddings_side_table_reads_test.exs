@@ -282,17 +282,18 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       refute Embeddings.side_table_reads_enabled?()
     end
 
-    # `limit: 50` here is INERT in the test environment, and saying so is the point.
+    # `limit: 50` here BINDS since #634, and saying so is the point.
     # `Knowledge.semantic_result_pool/1` is `min(max(offset + limit, floor), cap)`, and
-    # `config/test.exs` pins the cap at 5 — so `limit: 50` and the default `limit: 10`
-    # both yield a pool of 5. It is kept because it is the PROD-correct shape (there the
-    # cap is 1000, and a page wider than the candidate set keeps this assertion about
-    # ORDER rather than about pool capacity), NOT because it does anything here.
+    # `config/test.exs` now pins the cap at 30 — so `limit: 50` yields a pool of 30 where
+    # the default `limit: 10` yields 10. It is the PROD-correct shape (there the cap is
+    # 1000, and a page wider than the candidate set keeps this assertion about ORDER
+    # rather than about pool capacity) AND it now does something here.
     #
-    # An earlier comment claimed "PAGE SIZE IS LOAD-BEARING, do not simplify it back to
-    # the default". That was false in the very environment where the flake happens, and
-    # it sent investigators after a page-size theory the plan does not support. What is
-    # actually load-bearing is the pool CAP, which no `limit:` can raise.
+    # While the cap stood at 5 both limits produced the identical pool of 5, so every
+    # "PAGE SIZE IS LOAD-BEARING" note in this file bought nothing and sent investigators
+    # after a page-size theory the plan did not support. The CAP is what has the last
+    # word — no `limit:` can raise it — which is why #634 raised the cap rather than the
+    # annotations.
     test "ranks by similarity over the side table at the tenant's dimension" do
       tenant = fixture(:tenant)
       close = embedded_article(tenant.id, %{title: "Close"}, :close, 1536)
@@ -422,9 +423,9 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
       # `limit: 50` is the PROD-correct shape for a post-pool filter — the `category`
       # filter is applied AFTER the pool is taken, so a page narrower than the candidate
-      # set can starve it. In THIS environment it is inert for the reason given on "ranks
-      # by similarity ..." above (the pool cap of 5 binds first), so do not read it as a
-      # fix for the `left: []` flake.
+      # set can starve it. Since #634 it binds here too, clamped to the test cap of 30
+      # (see "ranks by similarity ..." above); still do not read it as a fix for the
+      # `left: []` flake.
       assert {:ok, %{results: results}} =
                Knowledge.search_semantic(tenant.id, vec(1536, :query),
                  category: :pattern,
@@ -583,13 +584,13 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
       # `limit: 50` is the PROD-correct shape (AC-41.1.7 promises the system article is
       # RECALLABLE, not that it wins a narrow page against the rest of the system corpus),
-      # but it is INERT here: the test pool cap of 5 binds before any `limit:` does.
+      # and since #634 it binds here too — clamped to the test pool cap of 30.
       #
       # The candidate set really can be large — a migration seeds ~two dozen COMMITTED
       # system-scoped articles, and `search_semantic/3` materializes them for the calling
       # tenant as a side effect of building its disclosure meta. But that materialization
       # runs AFTER the pool query, so it is not a load-dependent race between tests: it is
-      # deterministic within a test, and no `limit:` can widen a pool the cap holds at 5.
+      # deterministic within a test, and the CAP (30) is the ceiling no `limit:` can raise.
       assert {:ok, %{results: results}} =
                Knowledge.search_semantic(tenant.id, vec(1536, :query), limit: 50)
 

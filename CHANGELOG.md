@@ -6,9 +6,18 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
-- **Semantic and combined search responses now disclose whether the vector read ran with
-  `hnsw.iterative_scan`,** on a new `meta.ann_iterative_scan` (`off` | `applied` |
-  `unavailable`) plus an `ann_iterative_scan_reason` alongside `unavailable` only. This
+- **Vector-read responses now disclose whether the read ran with `hnsw.iterative_scan`,**
+  on a new `meta.ann_iterative_scan` (`off` | `applied` |
+  `unavailable`) plus an `ann_iterative_scan_reason` alongside `unavailable` only.
+  It is returned by `GET /api/v1/knowledge/search` in the semantic and combined
+  modes, by `GET /api/v1/knowledge/articles/:id/suggested_links`, and by
+  `POST /api/v1/memory/recall` (and the `memory` half of
+  `POST /api/v1/recall`) on any semantic path that scans the HNSW index — absent on the
+  ILIKE fallback and on an `include_superseded` recall, neither of which scans it, so
+  absence never means the fallback ran. One field name, one vocabulary, one derivation
+  across every surface. The vector reads that have NO response envelope because their
+  consequence is a write — the novelty gate, the memory near-dup dedup scan — instead log
+  one throttled warning per path when they run degraded. This
   matters when an operator has enabled iterative scan (SystemConfig `hnsw_iterative_scan`)
   and the read nonetheless runs without it — either because the backend capability probe was
   inconclusive (a pool-checkout timeout, a DB restart) and FAILED CLOSED, or because the
@@ -16,7 +25,12 @@ All notable changes to loopctl are documented here.
   extension is absent). Because the ANN applies
   `tenant_id` as a residual filter after the index returns its batch, such a read may
   under-return, and until now nothing in the response said so; a short result set was
-  indistinguishable from an empty corpus. The read behaviour is UNCHANGED and failing closed
+  indistinguishable from an empty corpus. On memory recall that is the harder miss to
+  catch — `meta.underfilled` was already true for a genuinely sparse scope, so it could
+  not distinguish the two, and nothing downstream cross-checks a recall. The field speaks
+  only to the tenant residual: memory's `subject_id` is filtered outside the index scan,
+  so subject-level under-return is unaffected by it and stays `meta.underfilled`'s job.
+  The read behaviour is UNCHANGED and failing closed
   remains correct — this only tells the caller. The `reason` names WHICH cause, because the
   response differs: an inconclusive probe self-heals on the next conclusive one (worst case
   roughly a minute per node), an unsupported pgvector stands until the extension is

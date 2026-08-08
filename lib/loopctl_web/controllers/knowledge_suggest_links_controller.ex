@@ -43,7 +43,10 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
         "(nearest pool was full but filters cut it below `limit`) apart from a " <>
         "genuinely-empty one (no eligible neighbors). Recall is bounded by " <>
         "`hnsw.ef_search` (pgvector default ~40) plus the over-fetch pool; " <>
-        "under-fill is expected for densely-linked hubs. Role: agent+.",
+        "under-fill is expected for densely-linked hubs. `meta.ann_iterative_scan` " <>
+        "separately discloses whether the vector read ran with pgvector's " <>
+        "`hnsw.iterative_scan`: `unavailable` means results may be incomplete for a " <>
+        "reason `recall_truncated` does NOT cover. Role: agent+.",
     parameters: [
       id: [in: :path, type: :string, description: "Article UUID"],
       limit: [in: :query, type: :integer, description: "Max candidates (default 5)"],
@@ -78,7 +81,24 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
                    description: "How many candidates were returned"
                  },
                  recall_truncated: %OpenApiSpex.Schema{type: :boolean},
-                 pool_exhausted: %OpenApiSpex.Schema{type: :boolean}
+                 pool_exhausted: %OpenApiSpex.Schema{type: :boolean},
+                 ann_iterative_scan: %OpenApiSpex.Schema{
+                   type: :string,
+                   enum: ["off", "applied", "unavailable"],
+                   description:
+                     "Whether this ANN read ran with pgvector's `hnsw.iterative_scan` " <>
+                       "(absent when the article has no embedding — no vector read). " <>
+                       "`unavailable` ⇒ the tenant filter was applied after a single " <>
+                       "index batch, so a short list is NOT evidence the article has no " <>
+                       "neighbours and `recall_truncated: false` cannot tell the two " <>
+                       "apart. Same field and semantics as `/knowledge/search`."
+                 },
+                 ann_iterative_scan_reason: %OpenApiSpex.Schema{
+                   type: :string,
+                   description:
+                     "Present ONLY alongside `ann_iterative_scan: \"unavailable\"`: a " <>
+                       "non-sensitive explanation of the degraded vector read."
+                 }
                }
              }
            }
@@ -193,6 +213,10 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
   # Render the recall-completeness meta (US-27.6b AC-27.6b.6). Both
   # `recall_truncated` (the consumer-facing name) and `pool_exhausted` (the
   # operator/telemetry name) carry the SAME flag so a caller can key on either.
+  # `ann_iterative_scan` (#634) rides along when present: the whitelist is what would
+  # otherwise silently drop a disclosure the context computed. Absent on the
+  # no-embedding short-circuit (no vector read), and the `_reason` key only alongside
+  # `unavailable` — so take, never fetch.
   defp render_meta(meta) do
     %{
       requested: meta.requested,
@@ -200,6 +224,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
       recall_truncated: meta.recall_truncated,
       pool_exhausted: meta.pool_exhausted
     }
+    |> Map.merge(Map.take(meta, [:ann_iterative_scan, :ann_iterative_scan_reason]))
   end
 
   # Absent → nil (context applies the default). A present value must parse to a

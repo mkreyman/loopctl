@@ -157,6 +157,23 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       end
     end
 
+    test "meta.ann_iterative_scan reaches the caller through the meta whitelist", %{conn: conn} do
+      # `render_meta/1` is an explicit whitelist, so a disclosure the context computes is
+      # invisible over HTTP until it is listed — and dropping it again (a rename, a
+      # whitelist tidy-up) would fail nothing without this. Pins the PASS-THROUGH, not the
+      # backend: `config/test.exs` pins iterative scan ON, so the value is `applied` on a
+      # healthy probe and `unavailable` when a live probe times out on a pool checkout and
+      # fails closed — an async file cannot prime the VM-global verdict. The exact states
+      # (and the no-embedding absence) are pinned in `Loopctl.HeavyReadHnswEfSearchTest`.
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "TargetDisclosure", [1.0])
+      _cand = embedded(tenant.id, "CandDisclosure", [1.0])
+
+      body = suggest(conn, key, target.id)
+
+      assert body["meta"]["ann_iterative_scan"] in ["applied", "unavailable"]
+    end
+
     test "returns candidates ranked by similarity, highest first, excluding below-threshold",
          %{conn: conn} do
       {tenant, key} = setup_tenant_key()

@@ -5264,7 +5264,12 @@ defmodule Loopctl.Knowledge do
             recall_truncated: boolean # alias of pool_exhausted (consumer-facing name)
           }
 
-    * `{:ok, [], meta}` when the article has no embedding yet (`pool_exhausted: false`)
+      plus `ann_iterative_scan` (and `ann_iterative_scan_reason` alongside
+      `"unavailable"` only) — the same vector-read disclosure semantic search and memory
+      recall carry, from the one derivation `Loopctl.HeavyRead.iterative_scan_meta/1`.
+
+    * `{:ok, [], meta}` when the article has no embedding yet (`pool_exhausted: false`,
+      and no `ann_iterative_scan` — that short-circuit runs no vector read)
     * `{:error, :not_found}` / `{:error, :invalid_threshold}` as `suggest_links/3`
   """
   @impl Loopctl.Knowledge.SuggestLinksBehaviour
@@ -5378,12 +5383,11 @@ defmodule Loopctl.Knowledge do
     query =
       suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis, opts)
 
-    suggestions =
-      HeavyRead.all(
-        tenant_id,
-        query,
-        suggested_links_read_opts(suggestion_candidate_pool(limit), opts)
-      )
+    # Bound ONCE and threaded into BOTH the read and its disclosure below, so the two can
+    # never describe different executions (#631/#634).
+    read_opts = suggested_links_read_opts(suggestion_candidate_pool(limit), opts)
+
+    suggestions = HeavyRead.all(tenant_id, query, read_opts)
 
     returned = length(suggestions)
 
@@ -5398,6 +5402,13 @@ defmodule Loopctl.Knowledge do
         returned,
         opts
       )
+      # #634: `:suggested_links` is an ANN endpoint too, and this is a CALLER-facing read
+      # with a meta envelope — so it discloses in the same words as semantic search and
+      # memory recall. `recall_truncated` cannot stand in for it: it flags the anti-join
+      # cutting a FULL pool, not an index batch that never reached this tenant's rows, so
+      # a starved scan reads as `recall_truncated: false` plus a short list, i.e. "this
+      # article has no neighbours".
+      |> Map.merge(HeavyRead.iterative_scan_meta(read_opts))
 
     {suggestions, meta}
   end
@@ -6553,8 +6564,17 @@ defmodule Loopctl.Knowledge do
     opts = Keyword.put(heavy_read_opts(:novelty), :on_overload, :tag)
 
     case HeavyRead.one(tenant_id, query, opts) do
-      {:error, :heavy_read_overloaded} -> nil
-      distance -> distance
+      {:error, :heavy_read_overloaded} ->
+        nil
+
+      distance ->
+        # `:novelty` is an ANN endpoint with NO response envelope to disclose a degraded
+        # scan in, and its consequence is a WRITE: a starved batch under-states the
+        # nearest prior, the gate scores the idea novel, and a duplicate article is
+        # written into the corpus the gate exists to dedupe. Same helper (and same
+        # throttle) as every other envelope-less ANN write path (#634 round-2).
+        HeavyRead.warn_if_ann_degraded("knowledge.novelty_scan", opts)
+        distance
     end
   end
 
