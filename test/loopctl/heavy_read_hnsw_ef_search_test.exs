@@ -449,7 +449,10 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     test "the field names and values MATCH knowledge search exactly" do
       # One vocabulary across both surfaces, not two for the same fact. Asserted by
       # comparing the two metas' disclosure slices under one primed verdict rather than
-      # by re-listing the strings, so a rename on either side fails here.
+      # by re-listing the strings. Both slices are asserted NON-EMPTY first: they derive
+      # from ONE function, so a rename propagates to both and the equality alone would
+      # degenerate to `%{} == %{}` and pass vacuously (the sibling tests above pin the
+      # literal key names).
       scope = fixture(:memory_scope)
       Knowledge.reset_circuit_breaker(scope.tenant_id)
 
@@ -463,8 +466,34 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
       memory_meta = Memory.recall(scope, query: "anything", limit: 5).meta
 
-      assert Map.take(memory_meta, disclosure_keys) ==
-               Map.take(knowledge_meta, disclosure_keys)
+      memory_slice = Map.take(memory_meta, disclosure_keys)
+
+      assert map_size(memory_slice) == length(disclosure_keys),
+             "both disclosure keys must be present, or this comparison is vacuous"
+
+      assert memory_slice == Map.take(knowledge_meta, disclosure_keys)
+    end
+
+    test "the include_superseded SIDE-TABLE recall discloses NOTHING — it runs no HNSW scan" do
+      # `include_superseded: true` drops the `live_denorm` predicate, so no per-dimension
+      # PARTIAL index matches and the read plans as a bounded top-k SORT — an exact top-k
+      # that cannot under-return. A verdict there describes a scan that never ran, the same
+      # rule the ILIKE fallback follows. The LIVE read in the same shape still discloses,
+      # which is what keeps this exclusion narrow rather than a blanket opt-out.
+      scope = fixture(:memory_scope)
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
+      Knowledge.reset_circuit_breaker(scope.tenant_id)
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      meta = Memory.recall(scope, query: "ecto", limit: 5, include_superseded: true).meta
+
+      assert meta.fallback == false, "precondition: the SEMANTIC path"
+      refute Map.has_key?(meta, :ann_iterative_scan)
+
+      live = Memory.recall(scope, query: "ecto", limit: 5).meta
+      assert live.ann_iterative_scan == "unavailable"
     end
 
     test "the ILIKE FALLBACK path discloses NOTHING — it runs no vector read" do

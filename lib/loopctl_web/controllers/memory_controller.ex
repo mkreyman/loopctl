@@ -124,10 +124,12 @@ defmodule LoopctlWeb.MemoryController do
         "(a small live scope, or a cross-subject/cross-project pool under-fill). " <>
         "On the semantic path `meta.ann_iterative_scan` (`off`|`applied`|" <>
         "`unavailable`) discloses whether the vector read ran with pgvector's " <>
-        "`hnsw.iterative_scan`; `unavailable` means the scope filter was applied " <>
+        "`hnsw.iterative_scan`; `unavailable` means the TENANT filter was applied " <>
         "after a single index batch, so the page may be INCOMPLETE for a reason " <>
-        "`meta.underfilled` cannot distinguish from a sparse scope. Identical field " <>
-        "and semantics to `/knowledge/search`.",
+        "`meta.underfilled` cannot distinguish from a sparse scope. It says nothing " <>
+        "about SUBJECT-level under-return, which is filtered outside the index scan " <>
+        "and unaffected by this field. Identical field and semantics to " <>
+        "`/knowledge/search`.",
     request_body: {"Recall params", "application/json", Schemas.MemoryRecallRequest},
     responses: %{
       200 => {"Recall results", "application/json", Schemas.MemoryRecallResponse},

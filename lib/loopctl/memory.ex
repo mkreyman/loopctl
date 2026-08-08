@@ -525,13 +525,18 @@ defmodule Loopctl.Memory do
   `"unavailable"` state ONLY. Identical field names, values and rule to
   `Loopctl.Knowledge`'s semantic/combined search meta, so an agent reading both
   surfaces learns ONE vocabulary; `Loopctl.HeavyRead.iterative_scan_meta/1` is the
-  single derivation. `"unavailable"` matters here because the ANN applies the
-  `(tenant_id, subject_id)` scope as a POST-index residual filter: a read that lost
-  iterative scan may under-return rows this subject HAS, and `underfilled` alone
-  cannot separate that from a genuinely sparse scope. The value is derived from the
-  opts the read was ISSUED with, never a fresh probe, so it cannot disagree with the
-  rows it accompanies. The ILIKE FALLBACK path deliberately carries NO such field —
-  it runs no vector read to describe.
+  single derivation. `"unavailable"` matters here because the ANN applies `tenant_id`
+  as a POST-index residual filter — the only scope filter iterative scan governs, since
+  `subject_id` is deliberately kept OUT of the inner ANN so it cannot flip the planner
+  off HNSW — so a read that lost it may under-return rows this subject HAS, and
+  `underfilled` alone cannot separate that from a genuinely sparse scope. SUBJECT-level
+  dilution is a DIFFERENT cause, bounded by the over-fetch pool and identical under
+  `"applied"` and `"unavailable"`; `underfilled` is its only signal. The value is
+  derived from the opts the read was ISSUED with, never a fresh probe, so it cannot
+  disagree with the rows it accompanies. Two paths deliberately carry NO such field
+  because neither scans the HNSW index: the ILIKE FALLBACK, and the
+  `include_superseded` side-table read (an exact bounded top-k sort — see
+  `memory_side_table_candidate_query/4`).
 
   Options:
 
@@ -808,18 +813,31 @@ defmodule Loopctl.Memory do
             # #634: the SAME disclosure `Loopctl.Knowledge`'s semantic/combined search
             # carries (#631), on the same field names and the same three values, because
             # this recall runs the same `:memory_recall` ANN through the same
-            # `HeavyRead` — and applies `(tenant_id, subject_id)` as a POST-index residual
-            # filter, so a read that lost `hnsw.iterative_scan` can silently under-return.
-            # Agent memory is where a short recall is LEAST likely to be noticed: nothing
+            # `HeavyRead` — and applies `tenant_id` as a POST-index residual filter, so a
+            # read that lost `hnsw.iterative_scan` can silently under-return. (SUBJECT
+            # scope is filtered on the OUTER query over the pool, so it is NOT what this
+            # field speaks to — `underfilled` is the signal for subject dilution.) Agent
+            # memory is where a short recall is LEAST likely to be noticed: nothing
             # downstream cross-checks it, and `underfilled` alone cannot tell a sparse
             # scope from a starved scan. Derived from `heavy_opts` — the opts this read
             # ACTUALLY ran with — never a fresh probe or a fresh config read, so it can
             # never disagree with the rows it accompanies. NOT stored in any per-tenant
             # memo: it is a per-NODE backend capability with its own short probe TTL.
-            |> Map.merge(HeavyRead.iterative_scan_meta(heavy_opts))
+            |> Map.merge(ann_scan_meta(heavy_opts, include_superseded?, side_table?))
         }
     end
   end
+
+  # `include_superseded: true` on the side table drops the `live_denorm` predicate, so no
+  # per-dimension PARTIAL index matches and the read plans as a bounded top-k SORT (see
+  # `memory_side_table_candidate_query/4`) — an exact top-k that cannot under-return.
+  # Disclosing an iterative-scan verdict there would describe a scan that was never
+  # attempted, the same reason the ILIKE fallback carries no field: state it about a
+  # vector read, or not at all. Every other shape here IS an HNSW scan and discloses.
+  defp ann_scan_meta(_opts, true = _include_superseded?, true = _side_table?), do: %{}
+
+  defp ann_scan_meta(opts, _include_superseded?, _side_table?),
+    do: HeavyRead.iterative_scan_meta(opts)
 
   # HeavyRead opts for a memory recall, with the caller's shed policy layered on. `:raise`
   # is `all_memory`'s own default, so it is only threaded explicitly for `:tag`.
@@ -2788,10 +2806,30 @@ defmodule Loopctl.Memory do
     # `{:error, :heavy_read_overloaded}` (mapped to a loss-free snooze upstream)
     # instead of RAISING an OverloadedError on the promotion write path (US-37.5).
     opts = Keyword.put(HeavyRead.opts(:memory_recall), :on_overload, :tag)
+    warn_near_dup_scan_degraded(scope.tenant_id, opts)
 
     case HeavyRead.all_memory(scope.tenant_id, scope.subject_id, query, opts) do
       {:error, :heavy_read_overloaded} = err -> err
       rows when is_list(rows) -> first_promoted_near_dup(rows)
+    end
+  end
+
+  # This ANN degrades exactly like recall's when `hnsw.iterative_scan` is enabled but
+  # unavailable — except the consequence here is a WRITE, not a short read: a near-dup
+  # outside the single index batch is not found, so `promote_one/2` inserts a SECOND live
+  # `:promoted` row instead of superseding the first (AC-29.2.4), permanently forking the
+  # memory. There is no response envelope on this path to disclose it in, so a dedup
+  # decision taken under a starved scan is at least visible to operators in the log.
+  defp warn_near_dup_scan_degraded(tenant_id, opts) do
+    case HeavyRead.iterative_scan_meta(opts) do
+      %{ann_iterative_scan: "unavailable", ann_iterative_scan_reason: reason} ->
+        Logger.warning(
+          "memory.near_dup_scan degraded tenant_id=#{tenant_id} " <>
+            "ann_iterative_scan=unavailable reason=#{reason}"
+        )
+
+      _ ->
+        :ok
     end
   end
 

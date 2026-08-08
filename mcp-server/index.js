@@ -5071,7 +5071,11 @@ const TOOLS = [
       "match with `meta.fallback: true` and a stable `meta.reason` (score is null on that " +
       "path) — check meta.fallback before treating a short/empty result as a genuinely " +
       "empty scope. `meta.total_count` and `meta.underfilled` are also returned so you can " +
-      "distinguish a short page from a hard cap.",
+      "distinguish a short page from a hard cap. On the semantic path check " +
+      "`meta.ann_iterative_scan` too: `unavailable` (with `meta.ann_iterative_scan_reason`) " +
+      "means the vector read ran without pgvector's iterative scan and may be INCOMPLETE — " +
+      "a short page then is not evidence of a sparse scope, and meta.fallback/underfilled " +
+      "cannot tell you that.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5106,7 +5110,10 @@ const TOOLS = [
       "untouched per-source `memory` and `knowledge` envelopes so you can re-rank. " +
       "Cross-source scores are heuristic, not calibrated. If the knowledge search " +
       "degrades (embedding unavailable) or errors, the memory side is still returned and " +
-      "meta.degraded is true — never a hard failure.",
+      "meta.degraded is true — never a hard failure. Each envelope's " +
+      "`meta.ann_iterative_scan` discloses whether THAT half's vector read ran with " +
+      "pgvector's iterative scan (`unavailable` ⇒ possibly incomplete); the two halves " +
+      "are resolved independently and may differ.",
     inputSchema: {
       type: "object",
       properties: {

@@ -4124,11 +4124,14 @@ defmodule Loopctl.ApiSpec.Schemas do
                   "read): whether this recall's vector read ran with pgvector's " <>
                   "`hnsw.iterative_scan`. `off` = not enabled on this instance (the " <>
                   "default). `applied` = enabled and in force. `unavailable` = enabled, " <>
-                  "but the read fell back to a single index batch — your " <>
-                  "`(tenant_id, subject_id)` scope is applied AFTER that batch, so " <>
-                  "results may be INCOMPLETE and a short page is NOT evidence your " <>
-                  "memory scope is sparse (`meta.underfilled` cannot tell the two " <>
-                  "apart). Read `ann_iterative_scan_reason` for WHICH cause: an " <>
+                  "but the read fell back to a single index batch — your `tenant_id` is " <>
+                  "applied AFTER that batch, so results may be INCOMPLETE and a short " <>
+                  "page is NOT evidence your memory scope is sparse (`meta.underfilled` " <>
+                  "cannot tell the two apart). It says nothing about SUBJECT-level " <>
+                  "under-return: `subject_id` is filtered outside the index scan, " <>
+                  "bounded by the over-fetch pool and identical under `applied` — " <>
+                  "`meta.underfilled` is the only signal for that. Read " <>
+                  "`ann_iterative_scan_reason` for WHICH cause: an " <>
                   "inconclusive capability probe self-heals on the next conclusive one, " <>
                   "while a pgvector that does not support the setting stands until the " <>
                   "extension is upgraded. Same values and meaning as the " <>
@@ -4227,7 +4230,11 @@ defmodule Loopctl.ApiSpec.Schemas do
         },
         memory: %Schema{
           type: :object,
-          description: "The unchanged /memory/recall envelope (data + meta).",
+          description:
+            "The unchanged /memory/recall envelope (data + meta). Its " <>
+              "`meta.ann_iterative_scan` describes THIS half's vector read only — the " <>
+              "two halves run sequentially and each resolves the backend capability " <>
+              "independently, so they may legitimately differ within one response.",
           properties: %{
             data: %Schema{
               type: :array,
