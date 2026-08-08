@@ -9,12 +9,17 @@ defmodule LoopctlWeb.ArticleJSON do
 
   An article's `idempotency_key` is a WRITE-side capture identity: a caller supplies its
   own, and `GET /api/v1/articles?idempotency_key=…` answers "have I already captured
-  this?" from the caller's own key. Serializing the stored value did something different
-  — it handed every reader the capture identities of articles it merely has read access
-  to, and those keys are an input to grouping decisions the nightly consolidation pass
-  makes over the corpus. A key one caller chose is not another caller's to read, so it is
-  no longer rendered in any article payload. The FILTER is untouched; the existence check
-  it backs works exactly as before.
+  this?" from the caller's own key. Serializing the stored value did something different —
+  it ENUMERATED the capture identities of every article a reader merely has read access
+  to, in bulk, unprompted. It is therefore no longer rendered in any article payload.
+
+  What this does NOT claim is secrecy for the key. The FILTER is untouched and is not
+  scoped to keys the caller wrote, so a caller that GUESSES a key still learns from
+  `meta.total_count` whether a visible article carries it — and the ingestion worker's keys
+  (`ingest:<hash>:<chunk>:<idx>`) are derivable. Visibility scoping still applies, so
+  another agent's `private`/`owner` article never answers. This change removes the bulk
+  disclosure; it does not turn the key into a secret, and nothing should be built as if it
+  had.
   """
 
   @doc """

@@ -5527,6 +5527,11 @@ const TOOLS = [
       "synthesize the two into ONE new DRAFT — both sources preserved, never auto-published, " +
       "for you/a human to review and publish). Non-destructive " +
       "at agent role — you record intent; the privileged nightly job executes it. " +
+      "NOTE for an agent-role key: 'supersede' is the one disposition that RETIRES an " +
+      "article unattended, so its confidence is capped server-side — your \"high\" is " +
+      "recorded as \"medium\" (see data.requested_confidence and note in the response) and " +
+      "the pair STAYS in knowledge_conflicts until an orchestrator+ key records it at high. " +
+      "'merge' is never capped and executes normally at agent role. " +
       "Last-write-wins per pair, so re-recording with fresher ground truth overrides. " +
       "Resolve only conflicts material to your current task; adjudicate against the actual " +
       "system, and if you can't tell which is right, leave it (or record low confidence) " +
@@ -5567,14 +5572,18 @@ const TOOLS = [
           type: "string",
           description:
             "Why you're sure — ideally a ground-truth reference (commit, file:line, URL, or the " +
-            "observed behavior). Recorded for audit and for a human reviewing low-confidence calls.",
+            "observed behavior). Recorded for audit and for a human reviewing low-confidence " +
+            "calls. REQUIRED for a supersede recorded at confidence 'high' (422 without it) — " +
+            "the one verdict that retires an article unattended must say why.",
         },
         confidence: {
           type: "string",
           enum: ["high", "medium", "low"],
           description:
-            "high, medium, or low. supersede auto-executes only at 'high'; lower confidence is " +
-            "recorded but left for review. Default medium.",
+            "high, medium, or low. Default medium. supersede/merge auto-execute only at 'high'; " +
+            "lower confidence is recorded but left for review. On a supersede the value is a " +
+            "REQUEST: it is capped to 'medium' unless the calling key is orchestrator+, and the " +
+            "response reports the cap. merge is not capped.",
         },
       },
       required: ["source_article_id", "target_article_id", "disposition"],

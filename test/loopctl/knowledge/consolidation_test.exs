@@ -643,10 +643,12 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       assert redacted["excerpt"] == ""
       assert redacted["title"] == nil
       assert redacted["redacted"] == true
-      # Uniform key set across every evidence branch — a redacted entry carries the key with
-      # a nil value rather than omitting it, so a caller never has to ask which branch it got.
-      assert Map.has_key?(redacted, "idempotency_key")
-      assert redacted["idempotency_key"] == nil
+      # `idempotency_key` is write-side capture identity a caller chose for itself, so it is
+      # in NO evidence branch — not the full one, not the blank, not the redaction. Asserted
+      # on both a fresh entry and a redacted one, because the report is served to any
+      # orchestrator+ key and prior-day reports stay addressable via `?day=`.
+      refute Map.has_key?(entry, "idempotency_key")
+      refute Map.has_key?(redacted, "idempotency_key")
     end
 
     test "redacts the excerpt of an article archived after the pass ran" do

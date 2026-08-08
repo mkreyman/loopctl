@@ -13,12 +13,15 @@ defmodule Loopctl.Knowledge.ConflictResolution do
   ## `confidence` is a GRANT, not an assertion
 
   The nightly executor retires an article on `disposition: :supersede, confidence: :high`
-  with nobody in the loop, so `confidence` is the field that authorizes an unattended
-  write. It is therefore resolved server-side in `Loopctl.Knowledge.annotate_conflict/3`
-  from the recorder's role — never taken verbatim from request params — and the role that
-  produced it is persisted in `annotated_by_role` so the executor can re-check the
-  authorization rather than infer it. `requested_confidence` keeps what the caller asked
-  for when the grant came out lower, so a capped verdict stays auditable.
+  with nobody in the loop, so on a `:supersede` `confidence` is the field that authorizes
+  an unattended retirement. It is therefore resolved server-side in
+  `Loopctl.Knowledge.annotate_conflict/3` from the recorder's role — never taken verbatim
+  from request params — and the role that produced it is persisted in `annotated_by_role`
+  so the executor can re-check the authorization rather than infer it.
+  `requested_confidence` keeps what the caller asked for when the grant came out lower, so
+  a capped verdict stays auditable, and its pair stays in the conflict queue until an
+  authorized key re-records it. A `:merge` retires nothing (it synthesizes a new draft and
+  leaves both sources published), so it is never capped and executes at agent role.
 
   A `:high`-confidence `:supersede` additionally requires `evidence`: the one verdict that
   retires an article unattended must carry the reason it was reached. That validation lives
@@ -50,9 +53,10 @@ defmodule Loopctl.Knowledge.ConflictResolution do
     field :requested_confidence, Ecto.Enum, values: @confidence_values
     field :evidence, :string
     field :annotated_by, :string
-    # The role of the key that recorded this verdict, derived server-side. `nil` on rows
-    # written before recorder provenance existed — an unknown recorder is not an
-    # authorized one (`Loopctl.Knowledge.execute_conflict_resolutions/2`).
+    # The role of the key that recorded this verdict, derived server-side. Backfilled from
+    # `annotated_by` for pre-migration rows; still `nil` where that could not be parsed —
+    # an unknown recorder is not an authorized one
+    # (`Loopctl.Knowledge.execute_conflict_resolutions/2`).
     field :annotated_by_role, :string
     field :annotated_at, :utc_datetime_usec
     field :executed_at, :utc_datetime_usec

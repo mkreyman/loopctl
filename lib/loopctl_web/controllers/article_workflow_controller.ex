@@ -19,11 +19,11 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   irreversible HARD-delete path, `bulk_publish`, `bulk_unpublish`) stay
   `user`-gated: high blast radius AND irreversible.
 
-  Recording a verdict stays agent+; what an agent cannot do ALONE is drive the
-  unattended write that a `supersede`/`merge` at confidence "high" triggers. The
-  role gate is the plug; the confidence a verdict is recorded at is granted from
-  that same role in `Loopctl.Knowledge.annotate_conflict/3`, never taken from the
-  request body.
+  Recording a verdict stays agent+ in every disposition; what an agent cannot do
+  ALONE is drive the unattended RETIREMENT that a `supersede` at confidence "high"
+  triggers. The role gate is the plug; the confidence a `supersede` is recorded at
+  is granted from that same role in `Loopctl.Knowledge.annotate_conflict/3`, never
+  taken from the request body. A `merge` retires nothing, so it is not capped.
   """
 
   use LoopctlWeb, :controller
@@ -300,14 +300,15 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         "returns 422. All dispositions are agent+ KB-content curation (#331): they are " <>
         "non-destructive + audited, and the privileged nightly executor is what actually " <>
         "applies supersede/merge. " <>
-        "**`confidence` is granted, not accepted.** The recorded value is capped by the " <>
-        "role of the key recording the verdict: only an orchestrator+ key can record " <>
-        "`high`, the value that authorizes the executor's unattended supersede/merge. An " <>
-        "agent-role request asking for `high` is recorded at `medium` and the response " <>
-        "says so in `data.requested_confidence` and `note` — the verdict stands, it is just " <>
-        "not auto-applied. A `high` supersede additionally REQUIRES `evidence` (422 " <>
-        "without it): the one verdict that retires an article unattended must carry the " <>
-        "reason it was reached.",
+        "**On a `supersede`, `confidence` is granted, not accepted.** Only an orchestrator+ " <>
+        "key can record `high` there, the value that authorizes the executor to RETIRE an " <>
+        "article unattended; an agent-role request asking for `high` is recorded at " <>
+        "`medium`, the response says so in `data.requested_confidence` and `note`, and the " <>
+        "pair stays in GET /knowledge/conflicts so an orchestrator+ key can re-record it. " <>
+        "`merge` retires nothing (it synthesizes a new draft, sources preserved) and is " <>
+        "never capped. A `high` supersede additionally REQUIRES `evidence` (422 without " <>
+        "it): the one verdict that retires an article unattended must carry the reason it " <>
+        "was reached.",
     request_body:
       {"Resolution", "application/json",
        %OpenApiSpex.Schema{
@@ -336,9 +337,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
              type: :string,
              enum: ["high", "medium", "low"],
              description:
-               "Requested confidence. Capped server-side by the recording key's role: " <>
-                 "`high` is recorded only for an orchestrator+ key. When capped, the " <>
-                 "response carries the requested value in `data.requested_confidence`."
+               "Requested confidence. On a `supersede` it is capped server-side by the " <>
+                 "recording key's role: `high` is recorded only for an orchestrator+ key. " <>
+                 "When capped, the response carries the requested value in " <>
+                 "`data.requested_confidence`. `merge` is never capped."
            }
          }
        }},
@@ -838,13 +840,16 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
   # The cap is reported to the caller rather than left to be inferred from a verdict that
   # never applies: confidence is granted from the RECORDING ROLE, not accepted from the
-  # request, because "high" is what authorizes the unattended write.
-  defp resolution_note(%{disposition: disposition, requested_confidence: asked, confidence: got})
-       when disposition in [:supersede, :merge] and not is_nil(asked),
+  # request, because "high" is what authorizes the unattended retirement. The note states
+  # where the pair goes next — a capped verdict is NOT auto-applied and NOT auto-dismissed,
+  # and its pair stays in GET /knowledge/conflicts precisely so it can be re-recorded.
+  defp resolution_note(%{disposition: :supersede, requested_confidence: asked, confidence: got})
+       when not is_nil(asked),
        do:
          "Recorded at confidence #{got}, NOT the #{asked} requested: only an orchestrator+ " <>
-           "key may authorize the unattended #{disposition} that high confidence triggers. " <>
-           "The verdict stands and is visible; it is not auto-applied."
+           "key may authorize the unattended supersede that high confidence triggers. " <>
+           "Nothing is auto-applied and nothing is auto-dismissed — the pair stays in " <>
+           "GET /knowledge/conflicts until an orchestrator+ key records it at high confidence."
 
   defp resolution_note(%{disposition: :supersede, confidence: :high}),
     do:

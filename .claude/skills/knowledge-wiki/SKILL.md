@@ -44,11 +44,11 @@ never pass `tenant_id`/`subject_id`.
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
    created (`:509-515`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:463-466`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8714`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:8724`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
-   (`absolute_score/1`, `:8841-8846`) clears a scale-matched threshold AND beats the best retrieved
-   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8892-8902`; the pure decision is
-   `resolve_provenance/4`, `:8949-8957`) AND is authoritative (not superseded/conflicted — the caller
+   (`absolute_score/1`, `:8851-8856`) clears a scale-matched threshold AND beats the best retrieved
+   candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:8902-8912`; the pure decision is
+   `resolve_provenance/4`, `:8959-8967`) AND is authoritative (not superseded/conflicted — the caller
    passes only `list_curated_sources/2`-filtered scores). Otherwise `:retrieved`. Both branches return identical `results`/`meta`
    key sets — callers branch on `meta.provenance` alone. A sparse pool must never let a near-but-wrong
    curated doc win.
@@ -72,23 +72,26 @@ never pass `tenant_id`/`subject_id`.
    never drop that property when reasoning about a new op.
    `drafts`/`publish` are `:orchestrator` (`:33`).
    Agent edits are visibility-scoped: an agent can only touch an article it can see. (See `chain-of-custody`.)
-   **Recording a verdict is agent-role; AUTHORIZING the unattended write is not.** The conflict
-   PAIR is manufacturable — the queue is fed by a mechanical similarity threshold — so
-   `annotate_conflict/3` GRANTS `confidence` from the recorder's role (`grant_confidence/2`,
-   `:actor_role` resolved server-side from the key) instead of accepting it from params: an
-   agent asking for `:high` is recorded at `:medium` with the ask kept in
-   `requested_confidence`. Only `@unattended_authorizing_roles` produce the `:high` the nightly
-   executor acts on, the executor re-checks the persisted `annotated_by_role` (a NULL/unknown
-   recorder is closed as dismissed, never applied), and a `:high` supersede must carry
-   `evidence`. Never re-derive confidence at read time or accept it verbatim — one column, one
-   meaning: the trust the SERVER grants.
-   **Corroboration covers BOTH duplicate signals** (`Consolidation.corroborated?/3`). The
-   idempotency-drift exemption is gone: an `idempotency_key` is caller-controlled, so a group
-   can span two writers and the winner is the longest body. Scoring is keyed by
+   **Recording a verdict is agent-role; AUTHORIZING the unattended RETIREMENT is not.** The
+   conflict PAIR is manufacturable — the queue is fed by a mechanical similarity threshold — so
+   `annotate_conflict/3` GRANTS a `:supersede`'s `confidence` from the recorder's role
+   (`grant_confidence/3`, `:actor_role` resolved server-side from the key) instead of accepting
+   it from params: an agent asking for `:high` is recorded at `:medium` with the ask kept in
+   `requested_confidence`, and a `:high` supersede must carry `evidence`. `:merge` is NEVER
+   capped — it synthesizes a new DRAFT and retires nothing, so capping it disabled the
+   disposition and bought no safety. Scope any new gate to what it actually protects.
+   A verdict nothing will act on does NOT settle the pair: `conflict_unresolved_subquery/0`
+   settles on `executable_resolution/0`, so a capped or unattributed row leaves its pair in
+   `GET /knowledge/conflicts` to be re-recorded. Hiding a pair behind a row that will never
+   apply is the black hole to avoid.
+   **Corroboration covers BOTH duplicate signals** (`Consolidation.corroborated?/3`), and the
+   winner is the OLDEST member, not the longest. An `idempotency_key` AND a normalized title
+   are both caller-controlled, so corroborating content the same party wrote proves nothing —
+   age is the one input a later writer cannot manufacture. Scoring is keyed by
    `{drift_signal, member_id}` — a group scored under the other signal's normalized key finds
    nothing and withholds (fail-closed).
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:9355`; the counted set is `@heat_read_access_types`, `:9225`). The heat index is the one retrieval route that
+   (`knowledge.ex:9365`; the counted set is `@heat_read_access_types`, `:9235`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to

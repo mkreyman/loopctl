@@ -700,7 +700,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         select: %{
           id: a.id,
           body_len: fragment("length(coalesce(?, ''))", a.body),
-          updated_at: a.updated_at,
+          inserted_at: a.inserted_at,
           title_key: fragment(unquote(@title_key_sql), a.title),
           idempotency_key: a.idempotency_key,
           idempotency_key_norm: fragment(unquote(@idempotency_key_sql), a.idempotency_key)
@@ -964,6 +964,14 @@ defmodule Loopctl.Knowledge.Consolidation do
   defp enqueue_backfill(_tenant_id, []), do: :ok
 
   defp enqueue_backfill(tenant_id, ids) do
+    # The positive half of the statement `log_uncorroborated/5` used to make on this path's
+    # behalf, said HERE where the enqueue actually happens — so "enqueued" is only ever
+    # printed by the branch that enqueues.
+    Logger.info(
+      "Consolidation: tenant=#{tenant_id} enqueued an embedding backfill for " <>
+        "#{length(ids)} withheld member(s); the withhold clears once the vectors land."
+    )
+
     ids
     |> Enum.chunk_every(Knowledge.embedding_batch_max())
     |> Enum.each(fn chunk ->
@@ -998,10 +1006,24 @@ defmodule Loopctl.Knowledge.Consolidation do
     :ok
   end
 
+  # The winner is the OLDEST live member, NOT the longest one, and that is a security
+  # property rather than an editorial preference. Every input to a duplicate group is
+  # writable by any agent-role key: it can pick a title that collides under `@title_key_sql`
+  # (or an `idempotency_key` that does), and it can pick a body — so with longest-wins it
+  # could retire an established published article simply by publishing a longer near-copy
+  # beside it and waiting two nights. Content corroboration does not stop that; the
+  # corroborating content is the attacker's own. Age is the one input a later writer cannot
+  # manufacture, so keeping the earliest capture makes "write beside it" a way to unpublish
+  # YOUR OWN article and nobody else's.
+  #
+  # It also matches what the class means: `duplicate_capture` is one thing captured twice,
+  # and the duplicate is the second capture. The cost is that a fuller re-capture loses to
+  # the stub it duplicates — bounded, because the unpublish is reversible and the fuller
+  # text survives as a draft.
   defp apply_live_group(tenant_id, proposal, live, budget) do
     [winner | all_losers] =
       Enum.sort_by(live, fn a ->
-        {-a.body_len, -DateTime.to_unix(a.updated_at, :microsecond), a.id}
+        {DateTime.to_unix(a.inserted_at, :microsecond), -a.body_len, a.id}
       end)
 
     # Drained as far as the budget goes, not skipped whole: the winner is never a candidate
@@ -1336,13 +1358,15 @@ defmodule Loopctl.Knowledge.Consolidation do
   # evidence of one capture written twice, unlike a title, which is an accident of whatever
   # the source file was called. The premise holds for ONE writer. It does not hold in a
   # tenant where any agent-role key may publish an article and choose its own
-  # `idempotency_key`: the key is then caller-controlled data, the group can span two
-  # unrelated writers, and `apply_live_group/4` keeps the LONGEST body — so an
-  # uncorroborated idempotency group is a way to have a published article retired by
-  # writing a longer one beside it. Requiring content evidence for both signals means an
-  # auto-unpublish always rests on what the articles SAY, never only on a key one of them
-  # declared. "Confirmed" then means one thing for the whole class, rather than two things
-  # depending on which query formed the group.
+  # `idempotency_key`: the key is then caller-controlled data and the group can span two
+  # unrelated writers, so an uncorroborated idempotency group is a way to have a published
+  # article retired by writing one beside it. Requiring content evidence for both signals
+  # means an auto-unpublish always rests on what the articles SAY, never only on a key one
+  # of them declared. "Confirmed" then means one thing for the whole class, rather than two
+  # things depending on which query formed the group.
+  #
+  # Corroboration alone does NOT close that shape, because the corroborating content is the
+  # same party's to write — `apply_live_group/4` deciding the winner by AGE is what does.
   #
   # The cost is real and was the exemption's second argument: a tenant with no embeddings
   # (mandatory BYO) now has its idempotency groups WITHHELD rather than applied. That is
@@ -1401,7 +1425,13 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   # The three withholds have different remedies, so they say different things: a low cosine is
-  # a verdict, missing vectors are a gap this run just enqueued, and a failed read is neither.
+  # a verdict, missing vectors are a gap, and a failed read is neither. What this line does
+  # NOT claim any more is that a backfill was enqueued — it runs BEFORE
+  # `backfill_missing_embeddings/2` decides, and on a tenant with no BYO embedding key (or
+  # whose members carry a truncation-marked PREFIX hash) nothing is enqueued at all. Saying
+  # "backfill enqueued" there made a PERMANENT configuration state read as a transient gap,
+  # which is the exact misreading that module comment exists to prevent. The enqueue owns
+  # its own statement, in all three of its outcomes.
   defp log_uncorroborated(tenant_id, proposal, _live, :unavailable, _unscored) do
     Logger.warning(
       "Consolidation: tenant=#{tenant_id} WITHHELD duplicate_capture proposal " <>
@@ -1415,7 +1445,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     detail =
       case {entry, unscored} do
         {_entry, [_ | _] = missing} ->
-          "#{length(missing)} member(s) carry no embedding; backfill enqueued"
+          "#{length(missing)} member(s) carry no embedding"
 
         {%{min_sim: sim, pairs: pairs}, []} ->
           "min cosine #{Float.round(sim, 4)} across #{pairs} scored pair(s), threshold " <>
@@ -1817,14 +1847,20 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   # Every evidence entry carries the SAME key set, whichever branch produced it — the full
-  # one from `evidence_map/2`, this blank, or a redaction. A caller reading
-  # `entry["idempotency_key"]` should get `nil` for an unresolvable article, not a
-  # KeyError-shaped absence that varies by which article in one response it asked about.
+  # one from `evidence_map/2`, this blank, or a redaction. A caller reading `entry["title"]`
+  # should get `nil` for an unresolvable article, not a KeyError-shaped absence that varies
+  # by which article in one response it asked about.
+  #
+  # `idempotency_key` is NOT among those keys. It is write-side capture identity a caller
+  # chose for itself, which is why it was removed from every article payload — and the
+  # consolidation report is a payload like any other: it is served to any orchestrator+ key
+  # for the exact article groups this pass grouped BY that key, and prior-day reports stay
+  # addressable forever via `?day=`. Nothing on the apply path reads it; the grouping is
+  # re-derived in SQL (`pair_candidates/3`).
   defp blank_evidence(article_id) do
     %{
       "article_id" => article_id,
       "title" => nil,
-      "idempotency_key" => nil,
       "excerpt" => ""
     }
   end
@@ -1849,7 +1885,6 @@ defmodule Loopctl.Knowledge.Consolidation do
       select: %{
         id: a.id,
         title: a.title,
-        idempotency_key: a.idempotency_key,
         body: fragment("left(?, ?)", a.body, ^@excerpt_source_chars)
       }
     )
@@ -1860,7 +1895,6 @@ defmodule Loopctl.Knowledge.Consolidation do
        %{
          "article_id" => row.id,
          "title" => row.title,
-         "idempotency_key" => row.idempotency_key,
          "excerpt" => excerpt(row.body)
        }}
     end)
@@ -1890,14 +1924,17 @@ defmodule Loopctl.Knowledge.Consolidation do
     end)
   end
 
+  # The live branch also DROPS `idempotency_key`, which reaches this function only from a
+  # report persisted before the key stopped being copied into evidence. Read-time is where
+  # those rows are served from, so it is the only seam that covers them — a report from
+  # `?day=` two weeks ago goes out under today's rule, not the rule in force when it ran.
   defp redact_entry(%{"article_id" => id} = entry, live) do
     if MapSet.member?(live, id) do
-      entry
+      Map.delete(entry, "idempotency_key")
     else
       %{
         "article_id" => id,
         "title" => nil,
-        "idempotency_key" => nil,
         "excerpt" => "",
         "redacted" => true
       }
