@@ -27,6 +27,30 @@ All notable changes to loopctl are documented here.
 
 ### Fixed
 
+- **A tenant audit-key rotation now takes effect FLEET-WIDE, not just on the machine that
+  performed it.** The per-tenant Ed25519 signing key is cached in ETS, which is node-local, so
+  on a multi-machine deployment every OTHER node kept signing capability tokens and Signed Tree
+  Heads with the retired key until its own 5-minute entry expired. Those signatures do not
+  verify — a capability signed by a superseded key is recorded as `capability_forged`
+  (`byzantine: true`) — so a routine, documented operation manufactured forgery evidence
+  across the fleet for minutes. Rotation now broadcasts the invalidation over the existing
+  cluster PubSub (the same mechanism the API-key and LLM-settings caches already used), and
+  as a second line of defence a mint verifies its own signature against the public key the
+  tenant advertises, busting its cache and re-signing once if they disagree. **No operator
+  action, no configuration change**; a single-machine deployment was never affected.
+
+- **The duplicate-consolidation similarity threshold now honours a deliberate hard-disable
+  instead of silently re-enabling auto-unpublish.** Setting the knob to an impossible value —
+  `knowledge_consolidation_min_duplicate_similarity_pct` at 100 or more, or the app-config
+  float at 1.0 or more — is how an operator stops the nightly auto-unpublish mid-incident
+  without a deploy. It was treated as out-of-range and replaced by the 0.80 default, i.e. the
+  class the operator had just switched off carried on running at its normal threshold. Such a
+  value is now honoured: no similarity can reach it, so nothing auto-applies, and each
+  withheld group says so by name in the log. Values at or below 0 still fall back to the
+  default (0 would turn the corroboration check OFF rather than disable the class) and now say
+  so — including a stored `-1`, which previously collided with the "no row configured"
+  sentinel and vanished without a word.
+
 - **The story lifecycle is completable again for tenants with an audit signing key (#621).**
   Every tenant created through the current signup flow has one, and for those tenants the
   capability layer rejected start/report/verify because NO client-facing path ever handed the

@@ -83,6 +83,27 @@ defmodule Loopctl.SystemConfig do
   end
 
   @doc """
+  Reads an integer config value, distinguishing "no value" from any STORED value.
+
+  Returns `{:ok, integer}` when the cache holds an integer for `key`, `:error` on
+  a miss, a non-integer cached value, or any error. Never raises.
+
+  Use this — not `get_int/2` with an out-of-band default — wherever the caller
+  must know whether a row EXISTS. A sentinel default makes a stored value that
+  happens to equal it indistinguishable from unset, so an operator who deliberately
+  stores that value silently gets the caller's fallback instead.
+  """
+  @spec fetch_int(String.t()) :: {:ok, integer()} | :error
+  def fetch_int(key) when is_binary(key) do
+    case :persistent_term.get(pt_key(key), :__miss__) do
+      value when is_integer(value) -> {:ok, value}
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  @doc """
   Loads ALL settings from the DB (via `AdminRepo`) into `:persistent_term`.
 
   Guarded by `rescue` AND `catch`: a DB error logs and returns `{:error, reason}`

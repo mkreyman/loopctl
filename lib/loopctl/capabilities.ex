@@ -7,6 +7,8 @@ defmodule Loopctl.Capabilities do
   a specific story, lineage, and operation type.
   """
 
+  require Logger
+
   alias Loopctl.AdminRepo
   alias Loopctl.Capabilities.CapabilityToken
   alias Loopctl.TenantKeys
@@ -27,10 +29,27 @@ defmodule Loopctl.Capabilities do
   ## Returns
 
   `{:ok, %CapabilityToken{}}` or `{:error, reason}`
+
+  ## The mint checks its own signature
+
+  The private key comes from `TenantKeys`, a node-LOCAL ETS cache. A rotation
+  reaches peer nodes over PubSub (`TenantKeys.invalidate_cluster/1`), but a
+  dropped broadcast would leave this node signing with the SUPERSEDED key — and a
+  token signed by a retired key verifies as `:invalid_signature`, which
+  `Progress.record_cap_refusal/4` chains as `capability_forged`, `byzantine:
+  true`. So the signature is verified against the key the tenant ADVERTISES
+  before the token is persisted: a mismatch busts the cache entry and re-signs
+  ONCE off the freshly fetched key, and only a second mismatch is refused with
+  `{:error, {:key_unavailable, :signing_key_mismatch}}`. A mint failure is
+  already handled (`Progress` logs it and the operation proceeds capability-less),
+  which is strictly better than issuing a token that reads as a forgery.
   """
   @spec mint(Ecto.UUID.t(), String.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
           {:ok, CapabilityToken.t()} | {:error, term()}
-  def mint(tenant_id, typ, story_id, lineage) do
+  def mint(tenant_id, typ, story_id, lineage),
+    do: mint_signed(tenant_id, typ, story_id, lineage, :retry_stale_key)
+
+  defp mint_signed(tenant_id, typ, story_id, lineage, on_mismatch) do
     now = DateTime.utc_now()
     expires_at = DateTime.add(now, @cap_ttl_seconds, :second)
     nonce = :crypto.strong_rand_bytes(32)
@@ -40,20 +59,60 @@ defmodule Loopctl.Capabilities do
         message = build_message(tenant_id, typ, story_id, lineage, now, expires_at, nonce)
         signature = :crypto.sign(:eddsa, :sha512, message, [private_key, :ed25519])
 
-        %CapabilityToken{tenant_id: tenant_id}
-        |> CapabilityToken.changeset(%{
-          typ: typ,
-          story_id: story_id,
-          issued_to_lineage: lineage,
-          issued_at: now,
-          expires_at: expires_at,
-          nonce: nonce,
-          signature: signature
-        })
-        |> AdminRepo.insert()
+        if advertised_signature?(tenant_id, message, signature) do
+          insert_cap(tenant_id, typ, story_id, lineage, now, expires_at, nonce, signature)
+        else
+          mismatched_signing_key(tenant_id, typ, story_id, lineage, on_mismatch)
+        end
 
       {:error, reason} ->
         {:error, {:key_unavailable, reason}}
+    end
+  end
+
+  defp insert_cap(tenant_id, typ, story_id, lineage, now, expires_at, nonce, signature) do
+    %CapabilityToken{tenant_id: tenant_id}
+    |> CapabilityToken.changeset(%{
+      typ: typ,
+      story_id: story_id,
+      issued_to_lineage: lineage,
+      issued_at: now,
+      expires_at: expires_at,
+      nonce: nonce,
+      signature: signature
+    })
+    |> AdminRepo.insert()
+  end
+
+  defp mismatched_signing_key(tenant_id, typ, story_id, lineage, :retry_stale_key) do
+    Logger.warning(
+      "capability_mint_stale_key: the cached audit private key does not match the key " <>
+        "tenant_id=#{tenant_id} advertises (a rotation this node had not yet observed); " <>
+        "busting the cache entry and re-signing once."
+    )
+
+    TenantKeys.invalidate(tenant_id)
+    mint_signed(tenant_id, typ, story_id, lineage, :refuse)
+  end
+
+  defp mismatched_signing_key(tenant_id, _typ, _story_id, _lineage, :refuse) do
+    Logger.error(
+      "capability_mint_key_mismatch: the audit private key for tenant_id=#{tenant_id} does " <>
+        "not match its advertised public key even after a fresh fetch. Refusing to mint — a " <>
+        "token signed by a superseded key is recorded as capability_forged."
+    )
+
+    {:error, {:key_unavailable, :signing_key_mismatch}}
+  end
+
+  # A tenant with NO advertised public key contradicts nothing, so the check is skipped
+  # there rather than refusing the mint: `verify_signature/2` already fails CLOSED for such
+  # a tenant, so nothing is admitted by minting as before. Only the CURRENT key can be
+  # valid for a token issued now — a historical key's window ended when it was rotated out.
+  defp advertised_signature?(tenant_id, message, signature) do
+    case current_public_key(tenant_id) do
+      nil -> true
+      pub_key -> :crypto.verify(:eddsa, :sha512, message, signature, [pub_key, :ed25519])
     end
   end
 
@@ -222,12 +281,7 @@ defmodule Loopctl.Capabilities do
   defp signing_keys(tenant_id, issued_at) do
     import Ecto.Query
 
-    current =
-      from(t in Loopctl.Tenants.Tenant,
-        where: t.id == ^tenant_id,
-        select: t.audit_signing_public_key
-      )
-      |> AdminRepo.one()
+    current = current_public_key(tenant_id)
 
     historical =
       from(h in Loopctl.Tenants.AuditKeyHistory,
@@ -239,6 +293,19 @@ defmodule Loopctl.Capabilities do
       |> AdminRepo.all()
 
     Enum.reject([current | historical], &is_nil/1)
+  end
+
+  # ONE derivation of "the key this tenant advertises", used by the mint-time self-check
+  # and by the verify-time candidate set, so the two can never disagree about which key
+  # is current.
+  defp current_public_key(tenant_id) do
+    import Ecto.Query
+
+    from(t in Loopctl.Tenants.Tenant,
+      where: t.id == ^tenant_id,
+      select: t.audit_signing_public_key
+    )
+    |> AdminRepo.one()
   end
 
   defp build_message(tenant_id, typ, story_id, lineage, issued_at, expires_at, nonce) do

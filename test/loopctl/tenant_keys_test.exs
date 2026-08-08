@@ -131,6 +131,43 @@ defmodule Loopctl.TenantKeysTest do
     end
   end
 
+  describe "cross-node invalidation" do
+    # ETS is node-local and this app runs several Fly machines, so a rotation performed on
+    # ONE node used to leave every peer signing with the retired private key for the rest
+    # of its 5-minute TTL. That is not a stale read: a capability signed by a superseded
+    # key verifies as `:invalid_signature`, which is chained as `capability_forged`
+    # (`byzantine: true`) — a routine operation manufacturing forgery evidence fleet-wide.
+
+    test "invalidate_cluster/1 broadcasts, so a peer node hears about the rotation" do
+      tenant = fixture(:tenant)
+      :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, "tenant_keys:invalidate")
+
+      :ok = TenantKeys.invalidate_cluster(tenant.id)
+
+      tenant_id = tenant.id
+      assert_receive {:invalidate, ^tenant_id}
+    end
+
+    test "a peer's broadcast busts THIS node's cached key" do
+      tenant = fixture(:tenant)
+      secret_name = Loopctl.Secrets.audit_key_secret_name(tenant.slug)
+      retired = :crypto.strong_rand_bytes(32)
+      rotated_in = :crypto.strong_rand_bytes(32)
+
+      Mox.stub(Loopctl.MockSecrets, :get, fn ^secret_name -> {:ok, Base.encode64(retired)} end)
+      assert {:ok, ^retired} = TenantKeys.get_private_key(tenant.id)
+
+      # The rotation ran on ANOTHER node: nothing local invalidated anything, and the only
+      # thing that reaches this node is the broadcast.
+      Mox.stub(Loopctl.MockSecrets, :get, fn ^secret_name -> {:ok, Base.encode64(rotated_in)} end)
+      send(TenantKeys, {:invalidate, tenant.id})
+      # Synchronizes on the owner having handled the message; never a sleep.
+      _ = :sys.get_state(TenantKeys)
+
+      assert {:ok, ^rotated_in} = TenantKeys.get_private_key(tenant.id)
+    end
+  end
+
   describe "tenant isolation" do
     test "a cached failure for tenant A does not answer for tenant B" do
       a = fixture(:tenant)

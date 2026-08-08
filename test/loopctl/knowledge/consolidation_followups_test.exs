@@ -11,6 +11,7 @@ defmodule Loopctl.Knowledge.ConsolidationFollowupsTest do
   setup :verify_on_exit!
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
   alias Loopctl.Embeddings.ShrinkLadder
@@ -419,13 +420,15 @@ defmodule Loopctl.Knowledge.ConsolidationFollowupsTest do
       end
     end
 
-    test "1.0 is refused too — identical vectors score exactly 1.0" do
-      # The mirror image: an operator hard-disabling the class with 1.0 would still
-      # auto-unpublish byte-identical captures, which is the opposite of disabling it.
-      # Neither end of this range is the safe one, which is why an out-of-band value falls
-      # back to the default rather than being clamped toward a bound.
-      assert Consolidation.validate_similarity(1) == 0.80
-      assert Consolidation.validate_similarity(1.0) == 0.80
+    test "1.0 and above DISABLE the class instead of quietly re-enabling it at 0.80" do
+      # An impossible threshold has exactly one reading: an operator shutting the
+      # auto-applying class down without a deploy. Falling back to the default did the
+      # OPPOSITE of what was asked — it re-enabled auto-unpublish at 0.80 on the knob just
+      # set to stop it. 1.0 itself lands here rather than being honoured verbatim, because
+      # identical vectors score exactly 1.0 and would still be unpublished.
+      for disable <- [1, 1.0, 2.0, 100] do
+        assert Consolidation.validate_similarity(disable) > 1.0
+      end
     end
 
     test "a legitimate in-range threshold is honoured, as a float" do
@@ -501,6 +504,73 @@ defmodule Loopctl.Knowledge.ConsolidationFollowupsTest do
       # The mark SURVIVES: nothing re-embedded it and erased the prefix marker.
       assert ShrinkLadder.truncated_hash?(stored_hash(tenant.id, b.id))
     end
+
+    test "the keyless notice is logged once per RUN, not once per withheld proposal" do
+      # A keyless tenant has no vectors AT ALL, so EVERY confirmed group withholds. Emitted
+      # from the per-group backfill path, this one permanent-configuration sentence was
+      # repeated per proposal, and a tenant with a standing backlog buried its own nightly
+      # log under it.
+      tenant = fixture(:tenant)
+
+      for pair <- ["Alpha", "Beta"] do
+        published(tenant.id, %{title: pair <> " Doc", body: String.duplicate("long ", 40)})
+        published(tenant.id, %{title: String.downcase(pair) <> " doc!", body: "short"})
+      end
+
+      confirm_over_two_nights_no_corroborate(tenant.id)
+
+      log =
+        capture_log(fn ->
+          assert %{applied: 0, uncorroborated: 2} =
+                   Consolidation.apply_confirmed_duplicates(tenant.id)
+        end)
+
+      assert notices(log, "has no embedding key (mandatory BYO)") == 1
+    end
+
+    test "a repo fault while reading backfill evidence is a WITHHOLD, not a phantom failure" do
+      # By the time the backfill runs, the group has ALREADY been decided uncorroborated —
+      # a normal, correct outcome. An unguarded read there escaped into `tally_apply/5`'s
+      # rescue, which reports the group as `failed`: a WRITE that could not be made,
+      # counted in loser articles, on a night when no write was ever going to be attempted.
+      tenant = fixture(:tenant)
+
+      {:ok, _} =
+        Loopctl.Llm.upsert_settings(tenant.id, %{"embedding_api_key" => "test-openai-embed-flt"})
+
+      a = published(tenant.id, %{title: "Faulty Doc", body: String.duplicate("long ", 40)})
+      b = published(tenant.id, %{title: "faulty doc!", body: "short"})
+
+      # `a` is scored, `b` is the unscored member whose evidence the backfill goes to read.
+      embed!(tenant.id, a.id, List.duplicate(0.1, 1536))
+      confirm_over_two_nights_no_corroborate(tenant.id)
+
+      # First read is the scoring pass; the second is the backfill's stored-hash lookup,
+      # which faults. Ordered `expect`s, so a change in call order fails loudly here rather
+      # than turning the assertions below vacuous — and the log assertions discriminate
+      # which of the two reads actually broke.
+      Mox.expect(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> false end)
+
+      Mox.expect(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn ->
+        raise "embedding read path unavailable"
+      end)
+
+      log =
+        capture_log(fn ->
+          assert %{applied: 0, failed: 0, uncorroborated: 1} =
+                   Consolidation.apply_confirmed_duplicates(tenant.id)
+        end)
+
+      assert log =~ "could not enqueue the embedding backfill"
+      refute log =~ "could not be applied"
+      refute log =~ "similarity scoring failed"
+      assert status(a.id) == :published
+      assert status(b.id) == :published
+    end
+  end
+
+  defp notices(log, phrase) do
+    log |> String.split(phrase) |> length() |> Kernel.-(1)
   end
 
   # Confirms a group over two nights WITHOUT forcing corroboration, so the tests above
