@@ -29,22 +29,55 @@ defmodule Loopctl.Capabilities do
   ## Returns
 
   `{:ok, %CapabilityToken{}}` or `{:error, reason}`
+
+  ## The mint checks its own signature
+
+  The private key comes from `TenantKeys`, a node-LOCAL ETS cache. A rotation
+  reaches peer nodes over PubSub (`TenantKeys.invalidate_cluster/1`), but a
+  dropped broadcast would leave this node signing with the SUPERSEDED key — and a
+  token signed by a retired key verifies as `:invalid_signature`, which
+  `Progress.record_cap_refusal/4` chains as `capability_forged`, `byzantine:
+  true`. So the signature is verified against the key the tenant ADVERTISES
+  before the token is persisted: a mismatch busts the cache entry and re-signs
+  ONCE off the freshly fetched key, and only a second mismatch is refused with
+  `{:error, {:key_unavailable, :signing_key_superseded}}` — a second mismatch
+  means the cache was never the cause, leaving the deploy window in which the
+  new private half is not readable yet, which closes on its own. A mint failure is
+  already handled (`Progress` logs it and the operation proceeds capability-less),
+  which is strictly better than issuing a token that reads as a forgery.
   """
   @spec mint(Ecto.UUID.t(), String.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
           {:ok, CapabilityToken.t()} | {:error, term()}
-  def mint(tenant_id, typ, story_id, lineage) do
+  def mint(tenant_id, typ, story_id, lineage),
+    do: mint_signed(tenant_id, typ, story_id, lineage, :retry_stale_key)
+
+  defp mint_signed(tenant_id, typ, story_id, lineage, on_mismatch) do
     now = DateTime.utc_now()
     expires_at = DateTime.add(now, @cap_ttl_seconds, :second)
     nonce = :crypto.strong_rand_bytes(32)
 
     # The mint VERIFIES ITS OWN SIGNATURE against the key the tenant ADVERTISES
-    # before persisting anything: a rotation commits the new public key BEFORE the
-    # new secret is readable (the Fly adapter reads `System.get_env/1`, which needs
-    # a deploy), so the signer here can be the RETIRED half — and that token later
-    # lands as `capability_forged`, `byzantine: true`, about an agent that did
-    # nothing wrong. A signature that could not be PRODUCED at all is reported
-    # separately (`:signing_key_malformed`): the remedy is corrupt key material in
-    # the secret store, not a rotation an operator would go looking for.
+    # before persisting anything: the signer here can be the RETIRED half, and that
+    # token later lands as `capability_forged`, `byzantine: true`, about an agent
+    # that did nothing wrong. A signature that could not be PRODUCED at all is
+    # reported separately (`:signing_key_malformed`): the remedy is corrupt key
+    # material in the secret store, not a rotation an operator would go looking for.
+    #
+    # TWO different causes put a retired key in the signer's hand, and they take
+    # different remedies:
+    #
+    #   * this node's ETS entry is STALE — the rotation's PubSub invalidation was
+    #     dropped (delivery is best-effort). Busting the entry and re-signing fixes
+    #     it immediately, which is why `on_mismatch` exists at all.
+    #   * the new private half is not READABLE yet — a rotation commits the new
+    #     public key before the secret is deployed (the Fly adapter reads
+    #     `System.get_env/1`). No cache bust helps; the window closes on its own,
+    #     so it answers `:signing_key_superseded`, which `mint_failure_class/1`
+    #     leaves retryable.
+    #
+    # Trying the bust FIRST costs one wasted signature in the second case and
+    # distinguishes them for free: if a fresh fetch still mismatches, the cache was
+    # never the problem.
     with {:ok, private_key} <- TenantKeys.get_private_key(tenant_id),
          message = build_message(tenant_id, typ, story_id, lineage, now, expires_at, nonce),
          {:ok, signature} <- sign(message, private_key),
@@ -61,10 +94,32 @@ defmodule Loopctl.Capabilities do
       })
       |> AdminRepo.insert()
     else
-      false -> {:error, {:key_unavailable, :signing_key_superseded}}
+      false -> mismatched_signing_key(tenant_id, typ, story_id, lineage, on_mismatch)
       :error -> {:error, {:key_unavailable, :signing_key_malformed}}
       {:error, reason} -> {:error, {:key_unavailable, reason}}
     end
+  end
+
+  defp mismatched_signing_key(tenant_id, typ, story_id, lineage, :retry_stale_key) do
+    Logger.warning(
+      "capability_mint_stale_key: the cached audit private key does not match the key " <>
+        "tenant_id=#{tenant_id} advertises (a rotation this node may not have observed); " <>
+        "busting the cache entry and re-signing once."
+    )
+
+    TenantKeys.invalidate(tenant_id)
+    mint_signed(tenant_id, typ, story_id, lineage, :refuse)
+  end
+
+  defp mismatched_signing_key(tenant_id, _typ, _story_id, _lineage, :refuse) do
+    Logger.error(
+      "capability_mint_key_superseded: the audit private key for tenant_id=#{tenant_id} " <>
+        "does not match its advertised public key even after a fresh fetch, so the cache " <>
+        "was not the cause — the new secret is most likely not deployed yet. Refusing to " <>
+        "mint: a token signed by a superseded key is recorded as capability_forged."
+    )
+
+    {:error, {:key_unavailable, :signing_key_superseded}}
   end
 
   # A secret store that is momentarily unreachable is RETRYABLE, and so is

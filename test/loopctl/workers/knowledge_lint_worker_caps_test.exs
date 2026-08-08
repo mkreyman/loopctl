@@ -19,6 +19,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
 
   setup :verify_on_exit!
 
+  import ExUnit.CaptureLog
+
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
@@ -133,6 +135,56 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
                Consolidation.apply_confirmed_duplicates(tenant.id)
 
       assert AdminRepo.get!(Article, loser).status == :published
+    end
+
+    test "100 or more DISABLES the class instead of quietly re-enabling it at the default" do
+      # An impossible threshold has one reading: an operator shutting the auto-applying
+      # class down mid-incident, without a deploy. Treating it as out-of-range and falling
+      # back did the OPPOSITE of what was asked — it re-enabled auto-unpublish at 0.80 on
+      # the very knob just set to stop it. So it is honoured: no cosine can reach it.
+      tenant = fixture(:tenant)
+      winner = publish!(tenant.id, "Hard Stop", String.duplicate("long ", 40))
+      loser = publish!(tenant.id, "hard stop!", "short")
+
+      # Byte-identical vectors: cosine 1.0, which corroborates at every honourable
+      # threshold. Only a genuine disable withholds this pair.
+      embed!(tenant.id, winner, [1.0 | List.duplicate(0.0, 1535)])
+      embed!(tenant.id, loser, [1.0 | List.duplicate(0.0, 1535)])
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+      {:ok, _} = SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", 100)
+
+      assert %{applied: 0, uncorroborated: 1} =
+               Consolidation.apply_confirmed_duplicates(tenant.id)
+
+      assert AdminRepo.get!(Article, loser).status == :published
+    end
+
+    test "a STORED value is never mistaken for an unset one, even at the old sentinel" do
+      # The percent was read with a `-1` sentinel default, so a row STORING -1 was
+      # indistinguishable from no row: the operator's value was dropped in silence and the
+      # app layer answered as if nothing had been configured. Presence is now answered on
+      # its own terms, so an out-of-range STORED value is refused OUT LOUD (and still falls
+      # back — below the range is the conservative direction) rather than vanishing.
+      {:ok, _} = SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", -1)
+
+      tenant = fixture(:tenant)
+      winner = publish!(tenant.id, "Sentinel Doc", String.duplicate("long ", 40))
+      loser = publish!(tenant.id, "sentinel doc!", "short")
+
+      embed!(tenant.id, winner, [1.0 | List.duplicate(0.0, 1535)])
+      embed!(tenant.id, loser, [1.0 | List.duplicate(0.0, 1535)])
+
+      {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
+      {:ok, _} = Consolidation.run(tenant.id)
+
+      log =
+        capture_log(fn ->
+          assert %{applied: 1} = Consolidation.apply_confirmed_duplicates(tenant.id)
+        end)
+
+      assert log =~ "ignoring duplicate similarity percent -1"
     end
   end
 

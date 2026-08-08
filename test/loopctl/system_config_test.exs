@@ -28,6 +28,22 @@ defmodule Loopctl.SystemConfigTest do
     end
   end
 
+  describe "fetch_int/1 — presence is answerable without a sentinel" do
+    test "a missing key is :error, never a value a caller could have stored" do
+      assert SystemConfig.fetch_int(unique_key()) == :error
+    end
+
+    test "a stored value is returned even when it equals a caller's would-be sentinel" do
+      # This is the whole point. `get_int(key, -1)` cannot tell "no row" from "a row
+      # holding -1", so a caller using -1 as its absence sentinel silently DROPPED an
+      # operator's stored -1 and answered from its own fallback with nothing in the log.
+      key = unique_key()
+      {:ok, _} = SystemConfig.put(key, -1)
+
+      assert SystemConfig.fetch_int(key) == {:ok, -1}
+    end
+  end
+
   describe "put/2" do
     test "upserts the row AND updates the persistent_term cache immediately" do
       key = unique_key()

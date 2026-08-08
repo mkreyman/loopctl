@@ -76,6 +76,13 @@ defmodule Loopctl.Application do
       Loopctl.SystemConfig.CachePrimer,
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
+      # Bridges tenant audit-key cache invalidations BETWEEN nodes. The ETS table
+      # itself is created above by `TenantKeys.init_cache/0`; this child only
+      # subscribes to the invalidate topic, so it needs PubSub and nothing else.
+      # Without it a key rotation performed on one machine left every peer signing
+      # with the retired key until its own 5-minute entry expired — and a
+      # capability signed by a superseded key is chained as `capability_forged`.
+      Loopctl.TenantKeys,
       {Task.Supervisor, name: Loopctl.TaskSupervisor},
       # PR B2: BOUNDED supervisor for the fire-and-forget `ingestion_write_stats`
       # rollup upserts spawned by `Loopctl.Telemetry.IngestionWriteStats`. The

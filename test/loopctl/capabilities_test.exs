@@ -68,6 +68,73 @@ defmodule Loopctl.CapabilitiesTest do
     end
   end
 
+  describe "mint/4 checks its own signature against the advertised key" do
+    # The private key comes from a node-LOCAL ETS cache. A rotation reaches peers over
+    # PubSub, but a DROPPED broadcast would leave this node signing with the superseded
+    # key — and a token signed by a retired key is chained as `capability_forged`
+    # (`byzantine: true`) when it is spent. The mint refuses to be the source of that.
+
+    defp mint_context do
+      tenant = fixture(:tenant, %{audit_signing_public_key: :crypto.strong_rand_bytes(32)})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      {advertised_pub, live_priv} = :crypto.generate_key(:eddsa, :ed25519)
+      {_retired_pub, retired_priv} = :crypto.generate_key(:eddsa, :ed25519)
+
+      tenant =
+        tenant
+        |> Ecto.Changeset.change(audit_signing_public_key: advertised_pub)
+        |> Loopctl.AdminRepo.update!()
+
+      Loopctl.TenantKeys.init_cache()
+
+      %{
+        tenant: tenant,
+        story: story,
+        lineage: [Ecto.UUID.generate()],
+        live_priv: live_priv,
+        retired_priv: retired_priv
+      }
+    end
+
+    test "a stale cached key busts the entry and re-signs off the rotated-in key" do
+      %{tenant: tenant, story: story, lineage: lineage} =
+        ctx = mint_context()
+
+      # First fetch answers with the key the rotation RETIRED (this node's cache had not
+      # observed the rotation); the second, after the self-check busts it, is current.
+      Mox.expect(Loopctl.MockSecrets, :get, fn _name -> {:ok, ctx.retired_priv} end)
+      Mox.expect(Loopctl.MockSecrets, :get, fn _name -> {:ok, ctx.live_priv} end)
+
+      assert {:ok, cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
+
+      # And the token it did persist is one the tenant's advertised key verifies — i.e. the
+      # recovery re-signed rather than merely retrying the insert.
+      assert {:ok, _} =
+               Capabilities.verify(tenant.id, %{
+                 "cap_id" => cap.id,
+                 "typ" => "start_cap",
+                 "story_id" => story.id,
+                 "lineage" => lineage
+               })
+    end
+
+    test "a key that still mismatches after a fresh fetch refuses to mint" do
+      %{tenant: tenant, story: story, lineage: lineage} = ctx = mint_context()
+
+      Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:ok, ctx.retired_priv} end)
+
+      # Refusing is strictly better than persisting a token that reads as a forgery: a mint
+      # failure is already handled (the custody op proceeds capability-less and says so).
+      assert {:error, {:key_unavailable, :signing_key_superseded}} =
+               Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
+
+      assert Capabilities.list_for_lineage(tenant.id, story.id, lineage) == []
+    end
+  end
+
   describe "verify/2" do
     test "accepts a valid token" do
       %{tenant: tenant, story: story, lineage: lineage} = setup_cap_context()
@@ -146,7 +213,7 @@ defmodule Loopctl.CapabilitiesTest do
       # produces a token that verifies against nothing and is refused later as
       # `capability_forged`/`byzantine: true` — a permanent false accusation about
       # an agent that did nothing. The mint fails instead, as an operator fault.
-      %{tenant: tenant, story: story, lineage: lineage} = setup_cap_context()
+      %{tenant: tenant, story: story, lineage: lineage, priv: priv} = setup_cap_context()
       assert {:ok, _cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
 
       {new_pub, _new_priv} = :crypto.generate_key(:eddsa, :ed25519)
@@ -154,6 +221,14 @@ defmodule Loopctl.CapabilitiesTest do
       tenant
       |> Ecto.Changeset.change(audit_signing_public_key: new_pub)
       |> Loopctl.AdminRepo.update!()
+
+      # A mismatch busts the cache and re-signs ONCE, because the other cause of a
+      # mismatch is a stale cached key that a fresh fetch would fix. The secret store
+      # still holds the retired half here — nothing is deployed yet — so the refetch
+      # returns the same key and the second mismatch is what refuses. Distinguishing
+      # the two causes is the whole point of the retry, so the extra fetch is the
+      # behaviour under test, not an artifact.
+      Mox.expect(Loopctl.MockSecrets, :get, fn _name -> {:ok, priv} end)
 
       assert {:error, {:key_unavailable, :signing_key_superseded}} =
                Capabilities.mint(tenant.id, "start_cap", story.id, lineage)

@@ -726,7 +726,10 @@ defmodule Loopctl.Tenants do
 
     case result do
       {:ok, %{update_tenant: updated_tenant}} ->
-        TenantKeys.invalidate(tenant.id)
+        # CLUSTER-wide: ETS is node-local, so a node-local bust left every peer
+        # machine signing capabilities and STHs with the key this rotation just
+        # retired — evidence a verifier reads as forgery/divergence.
+        TenantKeys.invalidate_cluster(tenant.id)
         # US-33.3: the cached api_key snapshots carry the tenant's
         # audit_signing_public_key — bust them so a rotation is reflected at once.
         Auth.invalidate_tenant_key_cache(tenant.id)

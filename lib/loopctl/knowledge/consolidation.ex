@@ -199,9 +199,17 @@ defmodule Loopctl.Knowledge.Consolidation do
   # genuine duplicates at/above 0.84.
   @default_min_duplicate_similarity 0.80
 
-  # "No DB row" sentinel for the percent knob. `SystemConfig.get_int/2` requires an
-  # INTEGER default, so absence is signalled by a value no valid percent can take.
-  @no_pct -1
+  # The percent knob's DB key, named once because both the read and its documentation
+  # refer to it. Absence is answered by `SystemConfig.fetch_int/1` (`:error`), NOT by a
+  # sentinel default: a sentinel makes a row STORING that value indistinguishable from no
+  # row at all, so an operator who set `-1` silently got the app-layer threshold while the
+  # log said nothing.
+  @min_similarity_pct_key "knowledge_consolidation_min_duplicate_similarity_pct"
+
+  # What a threshold at or above 1.0 resolves to. Cosine similarity cannot exceed 1.0, so
+  # this is "no pair may ever corroborate" — an operator hard-disabling the auto-applying
+  # class, honoured as written instead of quietly replaced by the default.
+  @disabled_similarity 2.0
 
   # The visibility guard, in ONE place, usable in a `where` AND in a join `on` — see
   # `shared_only/1` for why it must be composed into every scope decision this pass makes.
@@ -496,13 +504,51 @@ defmodule Loopctl.Knowledge.Consolidation do
         # `skipped` (the accurate reason) rather than being relabelled uncorroborated.
         scored = score_groups(tenant_id, proposals)
 
-        proposals
-        |> Enum.reduce(
-          %{applied: 0, skipped: 0, failed: 0, uncorroborated: 0, gate: :open},
-          &tally_apply(tenant_id, &1, &2, unpublish_cap, scored)
-        )
+        result =
+          proposals
+          |> Enum.reduce(
+            %{applied: 0, skipped: 0, failed: 0, uncorroborated: 0, gate: :open},
+            &tally_apply(tenant_id, &1, &2, unpublish_cap, scored)
+          )
+
+        log_permanent_withhold(tenant_id, result)
+        result
     end
   end
+
+  # ONCE PER RUN, not once per withheld proposal. A tenant with no BYO embedding key has
+  # no vectors AT ALL, so every confirmed group withholds for missing evidence — emitting
+  # this from the per-group backfill path meant one identical sentence per proposal, and a
+  # tenant with a standing backlog buried its own nightly log under a message that says
+  # the same thing every time. The trigger is unchanged: something must actually have been
+  # withheld. Self-guarded for the same reason the backfill path is — this runs AFTER the
+  # per-group rescue, so a repo blip while reading the tenant's LLM settings must not
+  # discard a completed run's tally.
+  defp log_permanent_withhold(tenant_id, %{uncorroborated: withheld}) when withheld > 0 do
+    if Llm.has_embedding_key?(tenant_id) do
+      :ok
+    else
+      # WARNING, not info: once per run this is not noise, and it is the one line that
+      # explains why a tenant's auto-apply drain reports `gate: :open` and never moves. At
+      # info it sat below the level a deployment actually reads.
+      Logger.warning(
+        "Consolidation: tenant=#{tenant_id} has no embedding key (mandatory BYO), so its " <>
+          "#{withheld} withheld duplicate_capture group(s) can never be corroborated and " <>
+          "stay withheld permanently — BOTH signals, since an idempotency_key is " <>
+          "caller-supplied and corroborates nothing on its own. No backfill was enqueued: " <>
+          "this is a configuration state, not a transient gap. Nothing is unpublished " <>
+          "while withheld."
+      )
+    end
+
+    :ok
+  rescue
+    _e -> :ok
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp log_permanent_withhold(_tenant_id, _result), do: :ok
 
   # The ONLY heavy read on the apply path, and it runs BEFORE the reduce — so a statement
   # timeout or a `HeavyRead` shed would escape past `tally_apply/5`'s per-group rescue and
@@ -908,20 +954,23 @@ defmodule Loopctl.Knowledge.Consolidation do
     # it enqueues is discarded `{:no_embedding_key, _}` on pickup, so the duplicate class
     # withholds on every run forever while looking transient in the log ("backfill
     # enqueued") — a drain converging to a floor, and nightly Oban churn to go with it.
-    # Say so once, plainly, and enqueue nothing.
+    # Enqueue nothing; `log_permanent_withhold/2` says so once per RUN.
     if Llm.has_embedding_key?(tenant_id) do
       backfill_embeddable(tenant_id, ids)
     else
-      Logger.info(
-        "Consolidation: tenant=#{tenant_id} has no embedding key (mandatory BYO), so the " <>
-          "#{length(ids)} unscored member(s) can never be embedded and duplicate_capture " <>
-          "groups stay withheld permanently — BOTH signals, since an idempotency_key is " <>
-          "caller-supplied and corroborates nothing on its own. Not enqueued: this is a " <>
-          "configuration state, not a transient gap. Nothing is unpublished while withheld."
-      )
-
       :ok
     end
+  rescue
+    # EVERY read on this path is guarded, not just the enqueue. The group has ALREADY been
+    # decided uncorroborated when we get here — a withhold is a normal, correct outcome —
+    # so a repo fault while looking up the tenant's embedding key or its stored hashes must
+    # not escape into `tally_apply/5`'s rescue, which would report the group as `failed`:
+    # a WRITE that could not be made, counted in loser articles, for a night on which no
+    # write was ever going to be attempted. The withhold stands and the backfill is retried
+    # next run.
+    e -> log_backfill_failed(tenant_id, ExitTag.tag(e))
+  catch
+    :exit, reason -> log_backfill_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
   end
 
   defp backfill_embeddable(tenant_id, ids) do
@@ -1467,8 +1516,8 @@ defmodule Loopctl.Knowledge.Consolidation do
           "#{length(missing)} member(s) carry no embedding"
 
         {%{min_sim: sim, pairs: pairs}, []} ->
-          "min cosine #{Float.round(sim, 4)} across #{pairs} scored pair(s), threshold " <>
-            "#{min_duplicate_similarity()}"
+          "min cosine #{Float.round(sim, 4)} across #{pairs} scored pair(s), " <>
+            threshold_detail()
       end
 
     key =
@@ -1483,6 +1532,21 @@ defmodule Loopctl.Knowledge.Consolidation do
         "#{key} but their bodies do not corroborate it (#{detail}). Reported, not applied. " <>
         "A shared key is not evidence of a duplicate capture."
     )
+  end
+
+  # A threshold no cosine can reach is a deliberate hard disable, so the withhold says that
+  # rather than printing an impossible number and leaving the operator to work out that
+  # "threshold 2.0" is their own setting rather than a bug. This is where the disable is
+  # visible: it is intentional configuration, so it earns no repeated warning of its own.
+  defp threshold_detail do
+    case min_duplicate_similarity() do
+      threshold when threshold >= 1.0 ->
+        "auto-apply DISABLED by configuration — the threshold is set above any reachable " <>
+          "cosine, so no group can corroborate"
+
+      threshold ->
+        "threshold #{threshold}"
+    end
   end
 
   # The rationale is the only place the forming signal survives onto the persisted proposal
@@ -1646,13 +1710,22 @@ defmodule Loopctl.Knowledge.Consolidation do
   # `min_sim >= threshold` false for every pair on every night — title-drift auto-apply stops
   # permanently while the run still reports `gate: :open`.
   #
-  # An out-of-range NUMBER falls back to the default too, and is NOT clamped, because unlike
-  # `clamp_cap/3` neither end of this range is the safe one. Clamping a `-1` (the same
-  # "disable" idiom the cap tests use) to `0.0` satisfies `min_sim >= 0.0` for every pair —
-  # it turns the only content check on the auto-applying class fully OFF. Clamping a `2.0`
-  # (an operator hard-disabling the class mid-incident) to `1.0` is reachable too: identical
-  # vectors score exactly 1.0, so the gate an operator shut re-opens for byte-identical
-  # captures. A typo may only make this pass more conservative, so both go to the default.
+  # The two out-of-range directions are NOT symmetric, and neither is clamped.
+  #
+  # BELOW the range (`0`, a negative) falls back to the default. Clamping toward the near
+  # bound would put the threshold at `0.0`, which satisfies `min_sim >= 0.0` for every pair
+  # — the only content check on the auto-applying class fully OFF — and `0` is also the
+  # exact value an operator reaches for meaning "disable", because on the sibling drain caps
+  # it IS a pause. A typo there may only make this pass more conservative.
+  #
+  # AT OR ABOVE 1.0 is HONOURED as a hard disable (`@disabled_similarity`), because that is
+  # the one reading of an impossible threshold: cosine cannot exceed 1.0, so an operator
+  # typing `2.0` (or `100`) is shutting the class down, mid-incident, without a deploy.
+  # Falling back to the default there did the opposite of what was asked — it silently
+  # RE-ENABLED auto-unpublish at 0.80 on a knob the operator had just set to stop it. `1.0`
+  # itself lands here too rather than being accepted verbatim: identical vectors score
+  # exactly 1.0, so honouring it literally would still auto-unpublish byte-identical
+  # captures out of a setting meant to disable the class.
   #
   # Resolved through `SystemConfig` FIRST, like the three drain caps in
   # `KnowledgeLintWorker` — this is the one threshold that decides whether the only
@@ -1660,41 +1733,48 @@ defmodule Loopctl.Knowledge.Consolidation do
   # must be able to move it without a deploy. The DB key is expressed in PERCENT
   # (`..._pct`, `80` = 0.80) because `SystemConfig`'s cache is integer-typed.
   #
-  # The DB layer is read with a SENTINEL default and consulted only when a row actually
-  # exists, for two reasons. It keeps the app-config float exact — routing it through
-  # `round(x * 100)` quantized every threshold with more than two decimals (0.925 became
-  # 0.93) even for the deployments that set no DB row at all. And it lets the percent be
-  # range-checked as the INTEGER an operator types: only 1..99 is accepted, because the
-  # sibling drain caps read `0` as "disable" and here `0` does the OPPOSITE of disabling —
-  # `min_sim >= 0.0` holds for every pair, so the one content check on the auto-applying
-  # class is fully OFF and every title collision auto-unpublishes uncorroborated. `100` is
-  # rejected for the mirror-image reason given above. An out-of-range percent is treated
-  # as absent and falls through to the app layer, which is the conservative direction.
+  # The DB layer is consulted only when a row actually EXISTS, which is why the read is
+  # `fetch_int/1` rather than `get_int/2` with an out-of-band default. Presence has to be
+  # answerable on its own terms: a `-1` sentinel default made a row STORING `-1`
+  # indistinguishable from no row, so that setting silently resolved to the app layer with
+  # nothing in the log to say the operator's value had been dropped.
+  #
+  # Reading the app-config float directly (rather than through the percent) keeps it exact —
+  # routing it through `round(x * 100)` quantized every threshold with more than two decimals
+  # (0.925 became 0.93) even for deployments that set no DB row at all. And it lets the
+  # percent be range-checked as the INTEGER an operator types: 1..99 is a threshold, `>= 100`
+  # is the hard disable, and anything at or below `0` falls through to the app layer — the
+  # conservative direction, per the asymmetry explained above.
   defp min_duplicate_similarity do
-    app_layer =
-      :loopctl
-      |> Application.get_env(
-        :knowledge_consolidation_min_duplicate_similarity,
-        @default_min_duplicate_similarity
-      )
-      |> validate_similarity()
-
-    case SystemConfig.get_int("knowledge_consolidation_min_duplicate_similarity_pct", @no_pct) do
-      pct when pct > 0 and pct < 100 ->
-        pct / 100
-
-      @no_pct ->
-        app_layer
-
-      other ->
-        Logger.warning(
-          "Consolidation: ignoring duplicate similarity percent #{inspect(other)} — not an " <>
-            "integer in 1..99 (0 would turn the corroboration gate OFF, not disable it); " <>
-            "using #{app_layer}."
-        )
-
-        app_layer
+    case SystemConfig.fetch_int(@min_similarity_pct_key) do
+      {:ok, pct} -> stored_pct_threshold(pct)
+      :error -> app_layer_similarity()
     end
+  end
+
+  defp app_layer_similarity do
+    :loopctl
+    |> Application.get_env(
+      :knowledge_consolidation_min_duplicate_similarity,
+      @default_min_duplicate_similarity
+    )
+    |> validate_similarity()
+  end
+
+  defp stored_pct_threshold(pct) when pct > 0 and pct < 100, do: pct / 100
+
+  defp stored_pct_threshold(pct) when pct >= 100, do: @disabled_similarity
+
+  defp stored_pct_threshold(other) do
+    app_layer = app_layer_similarity()
+
+    Logger.warning(
+      "Consolidation: ignoring duplicate similarity percent #{inspect(other)} — not an " <>
+        "integer in 1..99 (0 would turn the corroboration gate OFF, not disable it; use " <>
+        "100 or more to disable the class); using #{app_layer}."
+    )
+
+    app_layer
   end
 
   # The bounds are EXCLUSIVE at both ends, matching the DB percent path's 1..99.
@@ -1709,10 +1789,12 @@ defmodule Loopctl.Knowledge.Consolidation do
   # meaning "turn this off" — on the sibling drain caps it IS a pause, so the wrong guess
   # here is the likely one.
   #
-  # `1.0` is excluded for the mirror-image reason: identical vectors score exactly 1.0, so
-  # an operator hard-disabling the class mid-incident with 1.0 would still auto-unpublish
-  # byte-identical captures. Neither end of this range is the safe one, which is why an
-  # out-of-band value falls back to the default rather than being clamped toward a bound.
+  # `1.0` and above is NOT accepted verbatim and NOT sent to the default either — it
+  # resolves to `@disabled_similarity`. Accepting 1.0 literally would still auto-unpublish
+  # byte-identical captures (identical vectors score exactly 1.0) out of a setting that
+  # means "stop"; sending it to the default RE-ENABLED the class at 0.80, which is the
+  # behaviour the operator was disabling. Honouring an impossible threshold as a disable is
+  # the only reading that is both what was asked for and the safe direction.
   # Public (`@doc false`) so the bound can be asserted as a pure function. The alternative
   # is mutating `:loopctl`'s application env from a test, which is banned here — it is
   # VM-global, so an `async: true` sibling would see another module's threshold. A guard on
@@ -1723,11 +1805,14 @@ defmodule Loopctl.Knowledge.Consolidation do
       when (is_float(value) or is_integer(value)) and value > 0 and value < 1,
       do: value * 1.0
 
+  def validate_similarity(value) when (is_float(value) or is_integer(value)) and value >= 1,
+    do: @disabled_similarity
+
   def validate_similarity(value) do
     Logger.warning(
       "Consolidation: ignoring duplicate similarity threshold #{inspect(value)} — not a " <>
         "number strictly between 0.0 and 1.0 (0 would turn the corroboration gate OFF " <>
-        "rather than disable the class, and 1.0 still admits byte-identical pairs); " <>
+        "rather than disable the class; set 1.0 or more to disable it); " <>
         "using #{@default_min_duplicate_similarity}."
     )
 

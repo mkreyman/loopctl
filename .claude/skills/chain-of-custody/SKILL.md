@@ -150,7 +150,7 @@ correct behavior; do not add a workaround.
 ## Capability tokens (L1) — signed, scoped, single-use
 
 `lib/loopctl/capabilities.ex`:
-- `mint/4` (`capabilities.ex:33-58`) — per-`(typ, story_id, lineage)` token, signed, nonce'd,
+- `mint/4` (`capabilities.ex:49-78`) — per-`(typ, story_id, lineage)` token, signed, nonce'd,
   bounded TTL. **Only `start_cap` is minted (#621).** `report_cap` and `verify_cap` were retired
   because a capability cannot gate a transition whose whole point is that a DIFFERENT principal
   performs it: the token binds to one lineage exactly, and that lineage is either the principal
@@ -158,20 +158,20 @@ correct behavior; do not add a workaround.
   pool includes `:agent` dispatches, the endpoint is `exact_role: :orchestrator`, and a legacy
   env-var key has lineage `[]`). Those transitions are gated by L4 instead. Do not "restore"
   them without first making the entitled principal able to obtain the token.
-- `verify/2` (`capabilities.ex:129-148`), decided by `validate_cap/6` (`capabilities.ex:244-253`) —
+- `verify/2` (`capabilities.ex:184-203`), decided by `validate_cap/6` (`capabilities.ex:299-311`) —
   type match + story match + **lineage exact match** + not-expired + not-consumed + a valid
   **ed25519 signature** over the token fields, checked against the tenant's
-  `audit_signing_public_key` (`check_signature/2`, `capabilities.ex:257-283`, which fails CLOSED on
+  `audit_signing_public_key` (`check_signature/2`, `capabilities.ex:312-340`, which fails CLOSED on
   every path, including when the tenant has no pubkey). There is NO "nonce exists" check; the nonce
   is an input to the signed message. The signature is the ONLY cryptographic check — never remove it
   as ceremony.
 
   **A signature failure splits by KEY STATE, and the split is what the audit chain asserts about
-  the caller.** `issuance_key_available?/4` (`capabilities.ex:302-309`) asks whether the key that
+  the caller.** `issuance_key_available?/4` (`capabilities.ex:357-370`) asks whether the key that
   was IN FORCE at the token's `issued_at` could be consulted at all — a `tenant_audit_key_history`
   row covering `issued_at`, or the current key when it was not rotated in after issuance AND it
   still CORRESPONDS to the private key the tenant signs with (`keypair_coherence/2`,
-  `capabilities.ex:321`). That last test is not optional: an out-of-band `UPDATE` of
+  `capabilities.ex:376`). That last test is not optional: an out-of-band `UPDATE` of
   `audit_signing_public_key` leaves `audit_key_rotated_at` untouched, so a timestamp comparison
   alone reads the replacement as "in force since before issuance" and brands every outstanding
   token a forgery. It is THREE-valued on purpose: only `:incoherent` (the probe RAN and
@@ -185,9 +185,13 @@ correct behavior; do not add a workaround.
   `retry-after` (it used to share `missing_capability`'s 403, whose remediation is recover-cap —
   which mints through the same unusable key, so the caller was sent round a loop it cannot exit).
   `mint/4` refuses symmetrically: it verifies its OWN signature against the advertised public key
-  before inserting, so a rotation whose new secret is not deployed yet fails the MINT
-  (`{:key_unavailable, :signing_key_superseded}`) instead of issuing a token that will later be
-  called forged. That one is RETRYABLE (`mint_failure_class/1`, `capabilities.ex:87`) — the
+  before inserting, instead of issuing a token that will later be called forged. TWO causes put a
+  retired key in the signer's hand and they take different remedies, so a mismatch first busts the
+  `TenantKeys` ETS entry and re-signs ONCE (`mismatched_signing_key/5`): the cache is node-LOCAL
+  and its cross-node invalidation is a best-effort PubSub broadcast, so a dropped broadcast is
+  fixed by a fresh fetch. Only a SECOND mismatch — proving the cache was not the cause — refuses
+  with `{:key_unavailable, :signing_key_superseded}`, which is the rotation whose new secret is
+  not deployed yet. That one is RETRYABLE (`mint_failure_class/1`, `capabilities.ex:142-148`) — the
   window closes when the pending deploy lands — while `:not_found`, `:corrupt_secret`,
   `:corrupt_secrets_file`, `:signing_key_malformed` (unusable key MATERIAL) and
   `:fly_not_configured` are operator conditions answered with no `retry-after`.
@@ -199,7 +203,7 @@ correct behavior; do not add a workaround.
   token, so a caller cannot steer its own forgery into the softer label. The current key stays a
   verification CANDIDATE regardless of that test — excluding it would refuse a token a rotation
   racing `mint/4` genuinely signed.
-- `consume/1` (`capabilities.ex:155-168`) — **atomic** `update_all ... where consumed_at IS NULL`; the
+- `consume/1` (`capabilities.ex:210-221`) — **atomic** `update_all ... where consumed_at IS NULL`; the
   `{0, _}` branch returns `:replay`. This is the TOCTOU-safe single-use guard — never replace it with
   a read-then-write.
 
@@ -233,7 +237,10 @@ a pool capped at `@verifier_pool_limit`.
 enumerable by any agent key (`GET /api/v1/dispatches`) and the story id is known, so the seed
 is the only thing standing between "deterministic" and "predictable". `verifier_seed/2`
 keys an HMAC with the tenant's audit signing **private** key (`TenantKeys`, secret store + ETS),
-domain-separated and bound to `(tenant, story)`. It used to hash the **public** key, which is
+domain-separated and bound to `(tenant, story)`. That ETS cache is node-LOCAL, so every writer
+uses `TenantKeys.invalidate_cluster/1` (PubSub `"tenant_keys:invalidate"`, mirroring
+`Auth.ApiKeyCache`) — a node-local bust left peer machines signing capabilities and STHs with
+the retired key for the rest of their TTL. It used to hash the **public** key, which is
 served unauthenticated on the discovery endpoint — every candidate could precompute its own
 selection. No public value is an acceptable fallback, so the no-secret case (pre-v2 tenant,
 unreachable secret store) returns `{:error, :verifier_seed_unavailable}` and the story is flagged
@@ -399,7 +406,7 @@ gate, and an empty lineage is never a match.
 
 - **`tenancy-rls`** — custody writes/consume run on `AdminRepo` (BYPASSRLS: an explicit `tenant_id`
   predicate is the ONLY isolation). Custody READS fetch by `(id, tenant_id)`; `Capabilities.consume/1`
-  (`capabilities.ex:155-168`) is **id-only** — its `update_all` filters on `c.id` alone (`:161-162`) and
+  (`capabilities.ex:210-221`) is **id-only** — its `update_all` filters on `c.id` alone (`:216-217`) and
   inherits its tenant scoping from the `verify/2` that fetched the row. Never call it on a row you did
   not fetch tenant-scoped.
 - **`knowledge-wiki`** — the KB-content carve-out (#331) is the one agent-role exception to archive/delete⇒:user.
