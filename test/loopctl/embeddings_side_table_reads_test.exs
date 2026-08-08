@@ -40,14 +40,16 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   read that set it. Closed in `Loopctl.LocalGuc`, which `HeavyRead` now routes every
   per-read `SET LOCAL` through.
 
-  That leak was real but was NOT the whole story: a 30-run loop on the post-fix tree
-  still reproduced `left: []` here once. The residual mechanism is candidate-slot
-  starvation — at the default `limit: 10` the index-ordered ANN can spend its slots on
-  rows a post-ANN filter then discards — which is why every ranking assertion in this
-  file passes a page wider than its candidate set. Treat a recurrence as a MISSING
-  `limit:`, not as an invitation to a fifth pgvector-recall fix: `hnsw.ef_search`,
-  exact scan, `hnsw.iterative_scan` and retry-on-empty have each been tried and each
-  regressed something else.
+  That leak was real but was NOT the whole story: rare recurrences remain and have never
+  been individually explained — KB c6fd1e5d carries the standing protocol (does your diff
+  touch the read path, run the file 5x, then rerun) and the list of four recall-targeted
+  theories that are DEAD (`hnsw.ef_search`, exact scan, `hnsw.iterative_scan`,
+  retry-on-empty). Follow it there; do not open a fifth.
+
+  What IS demonstrable, and is why every ranking assertion in this file passes a page
+  wider than its candidate set: at the default `limit: 10` the index-ordered ANN can
+  spend its slots on rows a post-ANN filter then discards. A missing `limit:` is the
+  first thing to check on a NEW ranking assertion — it is not a diagnosis of the flake.
 
   The cross-tenant residual filter (the ANN applies `tenant_id` AFTER the index returns
   its top-`ef_search` batch) is a real, SEPARATE production concern, and `hnsw.iterative_scan`
@@ -71,6 +73,7 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleEmbedding
+  alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Memory
   alias Loopctl.Memory.MemoryEmbedding
   alias Loopctl.Memory.Scope
@@ -93,6 +96,23 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   defp vec(dim, :close), do: test_vec(dim, :primary)
   defp vec(dim, :query), do: test_vec(dim, :primary)
   defp vec(dim, :far), do: test_vec(dim, :near)
+
+  # A DISTINCT near-neighbour per index, for the tests that seed a WHOLE crowd of near
+  # rows at once. Handing every one of them `vec(dim, :close)` would rebuild the very
+  # all-ties clique the note above forbids — dozens of byte-identical vectors in the shared
+  # HNSW graph. One extra hot dimension taken from the cold tail keeps cosine at ~0.94
+  # (still far above `:far`'s ~0.71) while making every vector unique.
+  defp near_vec(dim, index) do
+    base = vec(dim, :close)
+
+    cold =
+      base
+      |> Enum.with_index()
+      |> Enum.filter(fn {v, _i} -> v == 0.0 end)
+      |> Enum.map(&elem(&1, 1))
+
+    List.replace_at(base, Enum.at(cold, index), 1.0)
+  end
 
   defp embedded_article(tenant_id, attrs, kind, dim) do
     article = fixture(:article, Map.merge(%{tenant_id: tenant_id, status: :published}, attrs))
@@ -424,26 +444,28 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
     # candidate set — but a `limit:` is only a REQUEST. `Knowledge.semantic_result_pool/1`
     # is `min(max(offset + limit, floor), cap)`, so the cap has the last word: while
     # `config/test.exs` pinned it at 5, `limit: 50` and `limit: 10` produced the IDENTICAL
-    # pool of 5 and every one of those annotations bought exactly nothing. That is why the
-    # remedy kept "not working" — right diagnosis, disconnected lever.
+    # pool of 5 and every one of those annotations bought exactly nothing. That — an inert
+    # annotation — is ALL this guard is about. It does NOT explain the `left: []` flake,
+    # whose root cause is settled in KB c6fd1e5d (a `SET LOCAL` savepoint leak plus a
+    # cross-tenant residual filter, #535, with rare unexplained recurrences that clear on
+    # rerun); follow that article's protocol on the next sighting, not this comment.
     #
-    # This reconstructs the recorded failure geometry rather than describing it: the whole
-    # committed system corpus materialized at the query vector (cosine 1.0) so it outranks
-    # the tenant's own row (`:far`, ~0.71), which lands LAST among the candidates. A pool
-    # smaller than that set evicts it and the assertion sees `left: []` — the exact recorded
-    # signature. A pool larger than it cannot.
+    # The geometry is the crowding one: the whole committed system corpus materialized
+    # NEAREST the query vector so it outranks the tenant's own row (`:far`, ~0.71), which
+    # lands LAST among the candidates. A page smaller than that set evicts it; a larger
+    # one cannot.
     test "the tenant's own row survives a fully materialized system corpus (pool > candidates)" do
       tenant = fixture(:tenant)
 
       system_rows = Embeddings.unmaterialized_system_articles(tenant.id, 1536, limit: 1000)
       assert system_rows != [], "the committed system corpus is what crowds the ANN pool"
 
-      for article <- system_rows do
+      for {article, i} <- Enum.with_index(system_rows) do
         {:ok, _} =
           Embeddings.materialize_system_article_embedding(
             tenant.id,
             article,
-            vec(1536, :close),
+            near_vec(1536, i),
             "sys",
             1536
           )
@@ -451,29 +473,63 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
       own = embedded_article(tenant.id, %{title: "Own, ranked last"}, :far, 1536)
 
-      # Assert the MARGIN, not a comment about it: the page below is only as wide as the
-      # cap allows, and the cap must clear the candidate set for the ranking assertion to
-      # be about ranking. Lower the cap (or grow the system corpus past it) and this fails
-      # HERE, naming the knob — instead of resurfacing as an intermittent `left: []` in a
-      # sibling suite.
+      # Assert the MARGIN, not a comment about it. The binding ceiling on THIS path is not
+      # the raw cap: `search_semantic_side_table/7` hydrates from
+      # `side_table_inner_pool(pool)` ANN rows, so that is what must clear the candidate
+      # set (the raw cap binds on the LEGACY path). The requested page must clear it too,
+      # since the page is what the ranking assertion reads. Shrink either (or grow the
+      # system corpus past them) and this fails HERE, naming the knob — instead of
+      # resurfacing as an intermittent `left: []` in a sibling suite.
       candidates = length(system_rows) + 1
-      cap = Knowledge.semantic_result_pool_cap()
+      limit = 50
+      reach = VectorSearch.side_table_inner_pool(min(limit, Knowledge.semantic_result_pool_cap()))
 
-      assert cap > candidates,
-             "semantic_result_pool_cap (#{cap}) must exceed the #{candidates}-row candidate " <>
-               "set, or every wide `limit:` in this file is clamped back to it"
+      assert reach > candidates,
+             "the side-table hydration pool (#{reach}) must exceed the #{candidates}-row " <>
+               "candidate set, or wide `limit:` annotations are clamped back below it"
+
+      assert limit > candidates,
+             "the requested page (#{limit}) must exceed the #{candidates}-row candidate set"
 
       enable_side_table_reads()
 
       assert {:ok, %{results: results}} =
-               Knowledge.search_semantic(tenant.id, vec(1536, :query), limit: 50)
+               Knowledge.search_semantic(tenant.id, vec(1536, :query), limit: limit)
 
-      ids = Enum.map(results, & &1.id)
-      assert own.id in ids
+      assert own.id in Enum.map(results, & &1.id)
       # ...and it really is the WORST-ranked candidate, so its presence is pool capacity
-      # doing its job, not a lucky tie.
-      assert List.last(ids) == own.id
-      assert length(ids) == candidates
+      # doing its job, not a lucky tie. Compared by SCORE rather than by list position, so
+      # a single ANN miss among the system rows cannot turn this into a false alarm.
+      assert Enum.min_by(results, & &1.similarity_score).id == own.id
+    end
+
+    # `meta.pool_capped == false` is documented to mean "this query's results are complete".
+    # It used to compare `total_count` against the RAW cap on BOTH paths — but this path
+    # hydrates from `side_table_inner_pool(pool)`, so a corpus between the cap and that
+    # over-fetched reach is fully served and was still flagged truncated, telling the
+    # consumer to switch to list mode for nothing.
+    test "a corpus above the cap but within the side-table reach is not flagged truncated" do
+      tenant = fixture(:tenant)
+      cap = Knowledge.semantic_result_pool_cap()
+      corpus = cap + 2
+      assert VectorSearch.side_table_inner_pool(cap) >= corpus
+
+      for i <- 1..corpus do
+        article =
+          fixture(:article, %{tenant_id: tenant.id, status: :published, title: "Hub #{i}"})
+
+        {:ok, _} =
+          Embeddings.upsert_article_embedding(tenant.id, article, near_vec(1536, i), nil, 1536)
+      end
+
+      enable_side_table_reads()
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.search_semantic(tenant.id, vec(1536, :query), limit: corpus)
+
+      assert meta.total_count == corpus
+      assert length(results) == corpus
+      refute meta.pool_capped
     end
 
     # Review, finding 3: AC-41.1.7 requires the system-corpus recall state be stated

@@ -1353,10 +1353,20 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       # and nothing pointed at it, so the wide-page remedy elsewhere in the suite was
       # silently clamped for months. `semantic_result_pool/1` is
       # `min(max(offset + limit, floor), cap)`, so ANY page at least as wide as the cap
-      # resolves to a pool of exactly `cap` — that is the one relationship this test needs,
-      # and it holds for every floor <= cap without restating the formula.
+      # resolves to a pool of exactly `cap` — that is the relationship the two assertions
+      # below need, and it holds for every floor <= cap without restating the formula.
       cap = Knowledge.semantic_result_pool_cap()
       wide = cap + 5
+
+      # The derivation has ONE precondition, asserted BEFORE the seed loop so it fails in a
+      # line instead of after seeding a thousand embedded articles: a page can never be
+      # requested wider than `max_relevance_page_size`, so a cap above it can never be
+      # reached and `length(results) == cap` becomes unsatisfiable. That is the state under
+      # the SCALE gate (`SCALE_NIGHTLY`/`SCALE_TESTS`), where `config/test.exs` deliberately
+      # keeps the PROD cap — these pool_capped tests only mean anything under the shrunk one.
+      assert cap <= Knowledge.max_relevance_page_size(),
+             "semantic_result_pool_cap (#{cap}) exceeds max_relevance_page_size " <>
+               "(#{Knowledge.max_relevance_page_size()}); the shrunk test cap is required here"
 
       # Seed cap+2 near-identical embedded articles: the smallest corpus that exceeds the
       # reachable pool, so this stays linear in the cap and no more expensive than it must be.
@@ -1389,7 +1399,9 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       # left the whole suite green. A page NARROWER than the cap comes back FULL
       # (`returned == limit`, so the starvation arm is false by construction) while the
       # corpus still exceeds the reachable pool — which is exactly the "true regardless of
-      # offset, even on a full page" case the signal documents.
+      # offset, even on a full page" case the signal documents. This narrow page carries a
+      # precondition the wide ones do not: `floor <= cap - 1`, or `semantic_result_pool/1`
+      # floors it back up to the cap and returns `cap` rows.
       {:ok, %{results: full, meta: full_meta}} =
         Knowledge.search_semantic(tenant.id, make_embedding(:query), limit: cap - 1)
 
@@ -1408,12 +1420,15 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       # the top-`pool` nearest. A category:pattern search then starves the page. The honest
       # signal must flag this — `total_count > cap` ALONE would miss it.
       #
-      # Both numbers derive from the enforced cap (see the sibling test above): a page at
-      # least as wide as the cap pins the pool to exactly `cap`, so seeding `cap` filler
-      # rows fills it precisely — no literal to drift.
+      # Both numbers derive from the enforced cap (see the sibling test above, which also
+      # carries the `cap <= max_relevance_page_size` precondition): a page at least as wide
+      # as the cap pins the pool to exactly `cap`. Seed `cap + 3` filler rows, not exactly
+      # `cap`: at zero margin one ANN recall miss among a clique of identical vectors frees
+      # a pool slot, the orthogonal row lands in it, and this fails as `1 < 1`.
       cap = Knowledge.semantic_result_pool_cap()
+      assert cap <= Knowledge.max_relevance_page_size()
 
-      for i <- 1..cap,
+      for i <- 1..(cap + 3),
           do:
             create_article_with_embedding(
               tenant.id,
@@ -1467,8 +1482,10 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
 
       # cap+2 embedded articles → the semantic sub-search is pool-capped; combined must
       # surface that, not drop it (combined is the DEFAULT search mode). Derived from the
-      # enforced cap, never hardcoded — see the truncation test above for why.
+      # enforced cap, never hardcoded — see the truncation test above for why, and for the
+      # `cap <= max_relevance_page_size` precondition this shares with it.
       cap = Knowledge.semantic_result_pool_cap()
+      assert cap <= Knowledge.max_relevance_page_size()
 
       for i <- 1..(cap + 2),
           do: create_article_with_embedding(tenant.id, %{title: "Hub #{i}"}, :query)

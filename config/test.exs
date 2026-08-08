@@ -199,25 +199,29 @@ unless System.get_env("SCALE_NIGHTLY") || System.get_env("SCALE_TESTS") do
   #
   # THE CAP IS THE LAST CLAMP, SO IT BOUNDS EVERY TEST, not just the truncation ones:
   # `semantic_result_pool/1` is `min(max(offset + limit, floor), cap)`. At the old cap of 5
-  # a page of `limit: 50` and a page of `limit: 10` both resolved to a pool of 5, which made
-  # every "widen the page past the candidate set" annotation in
-  # `embeddings_side_table_reads_test.exs` (and its siblings) a NO-OP — the documented
-  # remedy for the `left: []` starvation flake was disconnected from the knob that decides
-  # it. That cost four fixes aimed at pgvector recall.
+  # a page of `limit: 50` and a page of `limit: 10` both resolved to a pool of 5, so every
+  # "widen the page past the candidate set" annotation in
+  # `embeddings_side_table_reads_test.exs` (and its siblings) was INERT — clamped back to
+  # the cap, buying nothing. That is all this value fixes. It is NOT a root cause for the
+  # `left: []` flake: that is settled in KB c6fd1e5d (a `SET LOCAL` savepoint leak plus a
+  # cross-tenant residual filter, #535) — which also lists four recall-targeted theories as
+  # DEAD, and records that rare recurrences remain and clear on rerun. Do not read this
+  # comment as superseding it.
   #
-  # 30 is sized off the REAL candidate set, not off a round number. A tenant that has
-  # materialized the shared system corpus (AC-41.1.7) carries one embedding row per
-  # published system article — 23 of them are committed in the test DB — plus its own rows,
-  # so ~25 candidates compete for the page. The side-table inner ANN fetches
-  # `pool * side_table_over_fetch()` (4) rows with `hnsw.ef_search` raised to match, so:
-  #   * default `limit: 10` -> pool 10  -> inner 40  (covers ~25 with margin)
-  #   * wide    `limit: 50` -> pool 30  -> inner 120 (the annotated ranking assertions)
-  # An assertion can no longer be starved by candidates a post-ANN filter then discards.
+  # The cap must exceed the count of published system articles: a tenant that materializes
+  # the shared system corpus (AC-41.1.7) carries one embedding row per such article, and
+  # those crowd the page. That relationship is ASSERTED, not tallied here — see
+  # `embeddings_side_table_reads_test.exs`, which fails naming this knob if it stops
+  # holding. The side-table inner ANN then over-fetches `pool * side_table_over_fetch()`
+  # rows with `hnsw.ef_search` raised to match; that over-fetch offsets candidates a
+  # post-ANN status/visibility filter DISCARDS — it does not rescue a worst-ranked row from
+  # a page too narrow to hold it, so a ranking assertion still needs its own wide `limit:`.
   #
-  # The `pool_capped` tests still trip cap truncation cheaply: they seed relative to
-  # `Knowledge.semantic_result_pool_cap/0` rather than to a literal, so they cannot decouple
-  # from this value again. Raising it further is free EXCEPT for their seed cost, which is
-  # linear in the cap — that is the only reason it is 30 and not 300.
+  # The `pool_capped` tests seed relative to `Knowledge.semantic_result_pool_cap/0` rather
+  # than to a literal, so they cannot decouple from this value again. Raising it is bounded
+  # BOTH ways: it must stay <= `Knowledge.max_relevance_page_size/0` (100) or those tests
+  # cannot request a page as wide as the cap, and their seed cost is linear in it — that is
+  # why it is 30 and not 300.
   config :loopctl, :semantic_result_pool_floor, 2
   config :loopctl, :semantic_result_pool_cap, 30
 
