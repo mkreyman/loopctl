@@ -262,11 +262,30 @@ defmodule Loopctl.Progress do
   defp claim_result({:error, :mint_cap, {:capability_mint_failed, _reason}, _changes}),
     do: {:error, :capability_mint_failed}
 
-  # Every OTHER failing step surfaces its own reason. A catch-all, not an
-  # enumerated list of steps: an unlisted one (`:audit`, `:webhook_events`, and
-  # whatever the multi grows next) raised FunctionClauseError, i.e. a 500, for a
-  # failure the transaction had already handled correctly by rolling back.
-  defp claim_result({:error, _step, reason, _changes}), do: {:error, reason}
+  # The steps whose failure IS the caller's answer: the story is not there
+  # (`:lock`), the transition is illegal (`:validate`), its dependencies are unmet
+  # (`:check_deps`), or its own changeset did not validate (`:story`).
+  defp claim_result({:error, step, reason, _changes})
+       when step in [:lock, :validate, :check_deps],
+       do: {:error, reason}
+
+  defp claim_result({:error, :story, changeset, _changes}), do: {:error, changeset}
+
+  # Every OTHER failing step (`:audit`, `:webhook_events`, whatever the multi grows
+  # next) failed SERVER-side and rolled the claim back, so it answers ONE stable
+  # reason instead of its own. Forwarding the raw term only MOVED the 500: the
+  # caller's `case` enumerates reasons, so a FunctionClauseError here came back as
+  # a CaseClauseError one frame later — and an audit-log changeset forwarded to the
+  # fallback told the caller its request body was invalid, naming columns it never
+  # sent. The term goes to the log; the caller gets the code.
+  defp claim_result({:error, step, reason, _changes}) do
+    Logger.error(
+      "claim_step_failed: the claim rolled back and nothing was changed — " <>
+        "step=#{inspect(step)} reason=#{inspect(reason)}"
+    )
+
+    {:error, :claim_failed}
+  end
 
   # An `Ecto.Multi` step: mints a capability token so the caller can hand it to
   # the agent that will need it for the next custody op.

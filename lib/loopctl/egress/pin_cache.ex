@@ -66,15 +66,18 @@ defmodule Loopctl.Egress.PinCache do
   entries actually USED since the previous pass (`fetch/3` flags them). An entry
   nothing looks up any more is therefore never re-resolved: it simply ages out and
   is swept, instead of costing two DNS lookups per cycle for the life of the node.
-  `put/5` also refuses to grow the table past `@max_entries` — and past
-  `@max_entries_per_tenant` for any ONE tenant. Both bounds matter and they bound
-  different things: the global one bounds MEMORY, the per-tenant one bounds BLAST
-  RADIUS. Every host in this table arrives from tenant-writable input, so without
-  the per-tenant share a single tenant PATCHing fresh webhook hostnames in a loop
-  fills the global cap and every other tenant's next classification is refused
-  admission — a shared cache turned into a cross-tenant denial. Admission is
-  gated on a `{:resident, tenant_id}` COUNTER (`resident/1`), not on a scan of
-  the pin table: `admit?/3` is on the classification hot path.
+  `put/5` also refuses to grow the table past `@max_entries` — and past a
+  per-tenant share of it. Both bounds matter and they bound different things: the
+  global one bounds MEMORY, the per-tenant one bounds BLAST RADIUS. Every host in
+  this table arrives from tenant-writable input, so without the per-tenant share a
+  single tenant PATCHing fresh webhook hostnames in a loop fills the global cap and
+  every other tenant's next classification is refused admission — a shared cache
+  turned into a cross-tenant denial. The share is PER SHAPE, because the shapes
+  grow for different reasons: PINS and NEGATIVE (`:unresolvable`) entries each get
+  their own per-tenant budget, and a scope's `:__marking__` is bounded by the
+  tenant's `:user`-gated SCOPE count rather than by request volume. Admission is
+  gated on `{kind, tenant_id}` COUNTERS (`resident/1`), not on a scan of the pin
+  table: `admit?/3` is on the classification hot path.
 
   ## The periodic pass runs OFF the owner process
 
@@ -119,10 +122,18 @@ defmodule Loopctl.Egress.PinCache do
   # PATCHing fresh hostnames in a loop could hold 50k entries and every OTHER
   # tenant's next classification would be refused admission — a shared cache
   # turned into a cross-tenant denial. The per-tenant share is what keeps the
-  # global cap unreachable by any single tenant. Mirrors
+  # global cap out of reach of any single tenant's REQUEST VOLUME. Mirrors
   # `Loopctl.Egress.BlockedBuffer`'s `@max_hosts_per_window`, the sibling bound on
   # the same tenant-supplied-host cardinality problem.
   @max_entries_per_tenant 1_000
+
+  # The SAME bound for NEGATIVE (`:unresolvable`) entries, counted in their OWN
+  # budget. They must not spend the pin budget — a run of DNS misses would starve
+  # a tenant's real pins — but they must not be UNBOUNDED either: an unresolvable
+  # host is the cheapest row a tenant can produce (no working host required), so
+  # leaving the shape uncapped puts the shared global cap back within one tenant's
+  # reach, which is the cross-tenant denial the per-tenant share exists to prevent.
+  @max_negative_entries_per_tenant 1_000
 
   # Hard expiry. An entry past this is discarded and re-classified lazily.
   @ttl_ms :timer.minutes(10)
@@ -320,7 +331,7 @@ defmodule Loopctl.Egress.PinCache do
 
     if admit?(key, entry, existing?, generation, tenant_id) do
       if :ets.insert_new(@table, {key, entry}) do
-        bump_resident(tenant_id, 1)
+        bump_count(counter_kind(key, entry), tenant_id, 1)
       else
         :ets.insert(@table, {key, entry})
       end
@@ -338,25 +349,44 @@ defmodule Loopctl.Egress.PinCache do
     cond do
       stale_generation?(tenant_id, generation) -> false
       existing? -> true
-      tenant_capped?(key, entry, tenant_id) -> log_tenant_capacity_drop(key, tenant_id)
+      tenant_capped?(key, entry, tenant_id) -> log_tenant_capacity_drop(key, entry, tenant_id)
       :ets.info(@table, :size) < @max_entries -> true
       true -> log_capacity_drop(key)
     end
   end
 
-  # The per-tenant share bounds the one thing a tenant grows without limit: PIN
-  # cardinality from its own declared and ingest hosts. The other two shapes in
-  # this table are exempt from it — a scope's `:__marking__` (one per scope, and
-  # the alternative is a DB read per classification) and a NEGATIVE
-  # `:unresolvable` entry, whose whole job is to stop an unresolvable host
-  # repaying a multi-second DNS resolve on EVERY posture call. Capping those made
-  # a large tenant pay both costs on the hot path, i.e. the per-tenant bound
-  # disabled the protections rather than the growth. The GLOBAL cap still bounds
-  # all three, and a negative entry's TTL is a fraction of a success's.
-  defp tenant_capped?({_tenant_id, _scope_key, host}, entry, tenant_id) do
-    is_binary(host) and Map.get(entry, :base_verdict) != :unresolvable and
-      resident(tenant_id) >= @max_entries_per_tenant
+  # The three shapes in this table grow for different reasons, so each spends its
+  # OWN budget. Counting them against one shared counter let a run of DNS misses
+  # starve a tenant's real pins; exempting them from the CHECK while still counting
+  # them did BOTH — the exempt rows spent the pin budget AND no per-tenant bound
+  # held them, so one tenant could reach the shared global cap with the cheapest
+  # row it can produce.
+  defp tenant_capped?(key, entry, tenant_id) do
+    kind = counter_kind(key, entry)
+
+    case tenant_cap(kind) do
+      :unbounded -> false
+      cap -> count(kind, tenant_id) >= cap
+    end
   end
+
+  defp counter_kind({_tenant_id, _scope_key, host}, entry) do
+    cond do
+      not is_binary(host) -> :marking_resident
+      Map.get(entry, :base_verdict) == :unresolvable -> :negative_resident
+      true -> :resident
+    end
+  end
+
+  defp tenant_cap(:resident), do: @max_entries_per_tenant
+  defp tenant_cap(:negative_resident), do: @max_negative_entries_per_tenant
+
+  # A scope's `:__marking__` is ONE row per scope, and a scope is a `role: :user`
+  # gated record — a tenant cannot inflate markings by request volume the way it
+  # inflates hosts, so a per-tenant bound would only ever fire on a legitimately
+  # large tenant and cost it a DB read on EVERY classification. The GLOBAL cap
+  # still bounds them.
+  defp tenant_cap(:marking_resident), do: :unbounded
 
   defp log_capacity_drop(key) do
     Logger.warning(
@@ -367,9 +397,11 @@ defmodule Loopctl.Egress.PinCache do
     false
   end
 
-  defp log_tenant_capacity_drop(key, tenant_id) do
+  defp log_tenant_capacity_drop(key, entry, tenant_id) do
+    kind = counter_kind(key, entry)
+
     Logger.warning(
-      "Loopctl.Egress.PinCache: tenant at capacity (#{@max_entries_per_tenant} entries) " <>
+      "Loopctl.Egress.PinCache: tenant at capacity (#{tenant_cap(kind)} #{kind} entries) " <>
         "tenant_id=#{tenant_id}; not admitting #{inspect(elem(key, 2))} — it will be " <>
         "re-classified on demand"
     )
@@ -410,24 +442,37 @@ defmodule Loopctl.Egress.PinCache do
   end
 
   @doc """
-  How many entries this tenant currently holds — the value `@max_entries_per_tenant`
-  bounds.
+  How many PINS this tenant currently holds — the value `@max_entries_per_tenant`
+  bounds. Markings and negative entries are counted separately
+  (`aux_resident/1`), because they are bounded separately.
 
   A COUNTER rather than a `match`/`select_count` over the pin table: `admit?/3`
   runs on the classification hot path, and scanning a 50k-entry table per put is
-  exactly the cost this cache exists to avoid. It lives in the generations table
-  under a `{:resident, tenant_id}` key, which cannot collide with the bare-binary
-  generation keys.
+  exactly the cost this cache exists to avoid. Both counters live in the
+  generations table under `{kind, tenant_id}` keys, which cannot collide with the
+  bare-binary generation keys.
 
-  It is maintained incrementally (admit +1, `delete/3` -1 clamped at 0,
+  They are maintained incrementally (admit +1, `delete/3` -1 clamped at 0,
   `invalidate_local/1` resets to 0) AND reconciled to the true count at the end of
   every refresh pass, so a counter that drifts — an owner restart takes the pin
   table with it but not the counters — self-corrects within one tick instead of
   wedging the tenant's admissions permanently.
   """
   @spec resident(Ecto.UUID.t()) :: non_neg_integer()
-  def resident(tenant_id) do
-    case :ets.lookup(@gen_table, {:resident, tenant_id}) do
+  def resident(tenant_id), do: count(:resident, tenant_id)
+
+  @doc "How many NEGATIVE (`:unresolvable`) entries this tenant holds — its own budget."
+  @spec negative_resident(Ecto.UUID.t()) :: non_neg_integer()
+  def negative_resident(tenant_id), do: count(:negative_resident, tenant_id)
+
+  @doc "How many scope MARKINGS this tenant holds (bounded globally, not per tenant)."
+  @spec marking_resident(Ecto.UUID.t()) :: non_neg_integer()
+  def marking_resident(tenant_id), do: count(:marking_resident, tenant_id)
+
+  @counter_kinds [:resident, :negative_resident, :marking_resident]
+
+  defp count(kind, tenant_id) do
+    case :ets.lookup(@gen_table, {kind, tenant_id}) do
       [{_key, count}] -> count
       [] -> 0
     end
@@ -435,18 +480,18 @@ defmodule Loopctl.Egress.PinCache do
     ArgumentError -> 0
   end
 
-  defp bump_resident(_tenant_id, 0), do: :ok
+  defp bump_count(_kind, _tenant_id, 0), do: :ok
 
-  defp bump_resident(tenant_id, delta) when delta > 0 do
-    key = {:resident, tenant_id}
+  defp bump_count(kind, tenant_id, delta) when delta > 0 do
+    key = {kind, tenant_id}
     _ = :ets.update_counter(@gen_table, key, {2, delta}, {key, 0})
     :ok
   rescue
     ArgumentError -> :ok
   end
 
-  defp bump_resident(tenant_id, delta) do
-    key = {:resident, tenant_id}
+  defp bump_count(kind, tenant_id, delta) do
+    key = {kind, tenant_id}
     # `{Pos, Incr, Threshold, SetValue}` clamps at 0: a delete of an already-absent
     # key must never drive the counter negative and hand the tenant free headroom.
     _ = :ets.update_counter(@gen_table, key, {2, delta, 0, 0}, {key, 0})
@@ -455,8 +500,8 @@ defmodule Loopctl.Egress.PinCache do
     ArgumentError -> :ok
   end
 
-  defp set_resident(tenant_id, count) do
-    :ets.insert(@gen_table, {{:resident, tenant_id}, count})
+  defp reset_counts(tenant_id) do
+    Enum.each(@counter_kinds, &:ets.insert(@gen_table, {{&1, tenant_id}, 0}))
     :ok
   rescue
     ArgumentError -> :ok
@@ -469,8 +514,8 @@ defmodule Loopctl.Egress.PinCache do
     # decremented when a row actually went away — a delete of an absent key must
     # not hand the tenant headroom it never used.
     case :ets.take(@table, {tenant_id, scope_key, host}) do
-      [] -> :ok
-      _deleted -> bump_resident(tenant_id, -1)
+      [{key, entry}] -> bump_count(counter_kind(key, entry), tenant_id, -1)
+      _ -> :ok
     end
   rescue
     ArgumentError -> :ok
@@ -504,10 +549,10 @@ defmodule Loopctl.Egress.PinCache do
   def invalidate_local(tenant_id) when is_binary(tenant_id) do
     bump_generation(tenant_id)
     :ets.match_delete(@table, {{tenant_id, :_, :_}, :_})
-    # Every one of the tenant's rows just went away, so the resident counter is
-    # exactly 0. Leaving it at its pre-invalidation value would keep the tenant
-    # locked out of its own (now empty) share until the next refresh reconcile.
-    set_resident(tenant_id, 0)
+    # Every one of the tenant's rows just went away, so both counters are exactly
+    # 0. Leaving them at their pre-invalidation value would keep the tenant locked
+    # out of its own (now empty) share until the next refresh reconcile.
+    reset_counts(tenant_id)
     :ok
   rescue
     ArgumentError -> :ok
@@ -694,41 +739,59 @@ defmodule Loopctl.Egress.PinCache do
   # the delete phase runs in between, and every concurrent `store/4` that bumped
   # the counter inside that window had its increment discarded — so a tenant
   # writing during a sweep could hold more rows than the share this counter
-  # bounds. Tenants with a counter but NO live entry are re-anchored too: an
-  # absolute set derived from the live rows never mentioned them, so a
+  # bounds. The COUNTERS are read BEFORE the table, so a store landing between the
+  # two reads appears in both and its increment survives the delta; a store
+  # landing outside that ordering is corrected on the next pass rather than
+  # silently discarded. Tenants with a counter but NO live entry are re-anchored
+  # too: an absolute set derived from the live rows never mentioned them, so a
   # drifted-high counter on an empty table deducted their headroom forever.
   defp reconcile_resident(:all) do
-    counts = Enum.frequencies(all_tenant_ids())
+    apply_deltas(counter_snapshot(counted_keys()), Enum.frequencies(counter_keys(:all)))
+  end
 
-    (Map.keys(counts) ++ counted_tenant_ids())
+  defp reconcile_resident(tenant_id) do
+    keys = Enum.map(@counter_kinds, &{&1, tenant_id})
+    apply_deltas(counter_snapshot(keys), Enum.frequencies(counter_keys(tenant_id)))
+  end
+
+  defp counter_snapshot(keys), do: Map.new(keys, fn {kind, t} = key -> {key, count(kind, t)} end)
+
+  defp apply_deltas(before, counts) do
+    (Map.keys(counts) ++ Map.keys(before))
     |> Enum.uniq()
-    |> Enum.each(&reanchor_resident(&1, Map.get(counts, &1, 0)))
+    |> Enum.each(fn {kind, tenant_id} = key ->
+      bump_count(kind, tenant_id, Map.get(counts, key, 0) - Map.get(before, key, 0))
+    end)
   end
 
-  defp reconcile_resident(tenant_id), do: reanchor_resident(tenant_id, count_resident(tenant_id))
+  # ONE pass that classifies every row into the counter key it spends, selecting
+  # only what it needs so a reconcile never materialises 50k entry maps the way
+  # `all/0` does. Clauses are tried in order, mirroring `counter_kind/2`: PINS
+  # first (binary host, verdict not `:unresolvable`), then NEGATIVE entries, then
+  # everything else — a marking, whose atom host fails `is_binary/1`.
+  defp counter_keys(:all), do: select_counter_keys({:"$1", :_, :"$2"}, :"$1")
+  defp counter_keys(tenant_id), do: select_counter_keys({tenant_id, :_, :"$2"}, tenant_id)
 
-  defp reanchor_resident(tenant_id, true_count) do
-    bump_resident(tenant_id, true_count - resident(tenant_id))
-  end
-
-  # Selects only the KEY components it needs, so a reconcile never materialises
-  # 50k entry maps the way `all/0` does.
-  defp all_tenant_ids do
-    :ets.select(@table, [{{{:"$1", :_, :_}, :_}, [], [:"$1"]}])
+  defp select_counter_keys(key_pattern, tenant) do
+    :ets.select(@table, [
+      {{key_pattern, :"$3"},
+       [{:is_binary, :"$2"}, {:"/=", {:map_get, :base_verdict, :"$3"}, :unresolvable}],
+       [{{:resident, tenant}}]},
+      {{key_pattern, :"$3"},
+       [{:is_binary, :"$2"}, {:==, {:map_get, :base_verdict, :"$3"}, :unresolvable}],
+       [{{:negative_resident, tenant}}]},
+      {{key_pattern, :_}, [], [{{:marking_resident, tenant}}]}
+    ])
   rescue
     ArgumentError -> []
   end
 
-  defp counted_tenant_ids do
-    :ets.select(@gen_table, [{{{:resident, :"$1"}, :_}, [], [:"$1"]}])
+  defp counted_keys do
+    :ets.select(@gen_table, [
+      {{{:"$1", :"$2"}, :_}, [{:is_atom, :"$1"}], [{{:"$1", :"$2"}}]}
+    ])
   rescue
     ArgumentError -> []
-  end
-
-  defp count_resident(tenant_id) do
-    :ets.select_count(@table, [{{{tenant_id, :_, :_}, :_}, [], [true]}])
-  rescue
-    ArgumentError -> 0
   end
 
   # `update_element/3` for the same reason `mark_used/2` uses it: a row swept or

@@ -141,6 +141,44 @@ defmodule Loopctl.Egress.PinCacheTest do
       assert {:ok, %{base_verdict: :unresolvable}} = PinCache.fetch(t.id, key, "gone.example.com")
     end
 
+    test "DNS misses spend their OWN budget, and are bounded by it", %{tenant: t, scope: scope} do
+      # A negative entry is the cheapest row a tenant can produce — no working host
+      # required — so it must neither starve the tenant's real PINS (which counting
+      # it into the pin budget did) nor be unbounded (which exempting it from every
+      # per-tenant bound did, leaving the shared 50k global cap reachable by one
+      # tenant).
+      key = Scope.key(scope)
+      cap = PinCache.max_entries_per_tenant()
+      negative = %{base_verdict: :unresolvable, resolve_error: :nxdomain, ips: [], purposes: []}
+
+      for i <- 1..cap, do: PinCache.put(t.id, key, "miss#{i}.example.com", negative)
+
+      assert PinCache.negative_resident(t.id) == cap
+      assert PinCache.resident(t.id) == 0
+
+      # Bounded: one more negative entry is refused...
+      PinCache.put(t.id, key, "overflow-miss.example.com", negative)
+      assert PinCache.fetch(t.id, key, "overflow-miss.example.com") == :miss
+
+      # ...and a real pin still has its full share.
+      attrs = %{base_verdict: :public, from_allowlist: false, ips: [], purposes: []}
+      PinCache.put(t.id, key, "real.example.com", attrs)
+      assert {:ok, %{base_verdict: :public}} = PinCache.fetch(t.id, key, "real.example.com")
+      assert PinCache.resident(t.id) == 1
+
+      # A scope's marking is not bounded per tenant at all — it is one row per
+      # `:user`-gated scope, and refusing it costs a DB read on every
+      # classification. The sweep's reconcile classifies rows the same way the
+      # admission check does, so no budget is re-anchored to another's rows.
+      PinCache.put(t.id, key, :__marking__, %{local_only: true})
+      assert {:ok, %{local_only: true}} = PinCache.fetch(t.id, key, :__marking__)
+
+      PinCache.refresh_now(t.id)
+      assert PinCache.resident(t.id) == 1
+      assert PinCache.negative_resident(t.id) == cap
+      assert PinCache.marking_resident(t.id) == 1
+    end
+
     test "a tenant holding NO live entry is re-anchored to zero", %{tenant: t, scope: scope} do
       # A counter that drifted ABOVE the true count is the direction that locks a
       # tenant out of its own share, and a tenant holding nothing is where it

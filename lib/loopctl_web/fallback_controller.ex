@@ -311,8 +311,9 @@ defmodule LoopctlWeb.FallbackController do
   end
 
   # The tenant's audit signing key cannot be USED: absent from the secret store,
-  # superseded by a rotation whose private half is not readable yet, or replaced
-  # out of band. Every capability path is blocked by it and NONE of them is the
+  # corrupt in it, or replaced out of band. A rotation whose new private half is
+  # merely not DEPLOYED yet is NOT this — that closes on its own and answers
+  # `capability_mint_failed`. Every capability path is blocked by it and NONE is the
   # caller's to fix — `recover-cap` in particular mints through the same key, so
   # the `missing_capability` remediation this used to share sent the caller round
   # a loop that cannot terminate. Deliberately NO `retry-after`: unlike
@@ -532,6 +533,26 @@ defmodule LoopctlWeb.FallbackController do
         message:
           "The delete could not be recorded in the audit trail and was rolled back; " <>
             "the post still exists. Retry the request."
+      }
+    })
+  end
+
+  # A claim's transaction failed in a step that is not the caller's to fix (the
+  # custody audit entry, the webhook events) and rolled back, so the story is
+  # exactly as it was. ONE stable code rather than the failing step's own term:
+  # an audit-log changeset rendered as 422 asserted the request body was invalid
+  # using fields the caller never sent, and an unrenderable term crashed the
+  # controller that was supposed to answer it.
+  def call(conn, {:error, :claim_failed}) do
+    conn
+    |> put_status(:internal_server_error)
+    |> json(%{
+      error: %{
+        status: 500,
+        code: "claim_failed",
+        message:
+          "The claim could not be recorded and was rolled back; the story is unclaimed. " <>
+            "Nothing about your request is wrong — retry it."
       }
     })
   end

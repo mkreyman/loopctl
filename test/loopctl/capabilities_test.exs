@@ -158,13 +158,49 @@ defmodule Loopctl.CapabilitiesTest do
       assert {:error, {:key_unavailable, :signing_key_superseded}} =
                Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
 
-      # And it is classified as the PERSISTENT condition it is: retrying cannot
-      # clear it, so it must not be answered with a retry-after.
+      # It is classified as RETRYABLE: this is the window between a rotation
+      # committing the new public key and the deploy that makes its private half
+      # readable, and that window closes on its own.
       assert Capabilities.mint_failure_class({:key_unavailable, :signing_key_superseded}) ==
-               :capability_key_unavailable
+               :capability_mint_failed
 
       assert Capabilities.mint_failure_class({:key_unavailable, :secret_store_unavailable}) ==
                :capability_mint_failed
+    end
+
+    test "every PERSISTENT secret-store fault is classified without a retry-after" do
+      # Each of these is an operator condition no amount of retrying clears, and
+      # answering them as retryable is what turned agents into hot-loops. The
+      # adapters produce all of them (Loopctl.Secrets.LocalFileAdapter,
+      # Loopctl.Secrets.FlyAdapter).
+      for reason <- [
+            :not_found,
+            :tenant_not_found,
+            :corrupt_secret,
+            :corrupt_secrets_file,
+            :signing_key_malformed,
+            :fly_not_configured,
+            {:secrets_file_unreadable, :eacces}
+          ] do
+        assert Capabilities.mint_failure_class({:key_unavailable, reason}) ==
+                 :capability_key_unavailable
+      end
+    end
+
+    test "unusable key MATERIAL is reported as malformed, not as a superseded key" do
+      # `:crypto.sign` RAISES on a wrong-length key. Reporting that as
+      # `:signing_key_superseded` pointed the operator at rotation state for a
+      # condition whose actual remedy is corrupt key material in the secret store.
+      tenant = fixture(:tenant, %{audit_signing_public_key: :crypto.strong_rand_bytes(32)})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:ok, "not-a-key"} end)
+      Loopctl.TenantKeys.init_cache()
+
+      assert {:error, {:key_unavailable, :signing_key_malformed}} =
+               Capabilities.mint(tenant.id, "start_cap", story.id, [Ecto.UUID.generate()])
     end
   end
 
@@ -276,6 +312,25 @@ defmodule Loopctl.CapabilitiesTest do
       cap
       |> Ecto.Changeset.change(signature: :crypto.strong_rand_bytes(64))
       |> Loopctl.AdminRepo.update!()
+
+      assert {:error, :invalid_signature} = verify_start_cap(tenant, cap, story, lineage)
+    end
+
+    test "a TAMPERED signature stays a forgery while the SECRET STORE is unreadable" do
+      # The coherence probe consults the secret store, so an outage (or its
+      # negatively-cached failure) could not run it. That is not evidence about
+      # the key, and downgrading to :signing_key_unavailable would suppress the
+      # `capability_forged`/`byzantine: true` entry for the whole window an
+      # unrelated dependency is unhappy — handing an attacker the detection switch.
+      %{tenant: tenant, story: story, lineage: lineage} = setup_cap_context()
+      {:ok, cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
+
+      cap
+      |> Ecto.Changeset.change(signature: :crypto.strong_rand_bytes(64))
+      |> Loopctl.AdminRepo.update!()
+
+      Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:error, :secret_store_unavailable} end)
+      Loopctl.TenantKeys.invalidate(tenant.id)
 
       assert {:error, :invalid_signature} = verify_start_cap(tenant, cap, story, lineage)
     end

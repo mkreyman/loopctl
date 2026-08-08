@@ -33,11 +33,17 @@ defmodule LoopctlWeb.CapRecoveryController do
       story's custody provenance — what report/review-complete/verify
       compare a caller's lineage against — and letting an agent re-anchor
       it by re-minting would hand it the separation the L4 gates exist to
-      demand of it. Because it is not rewritten, the caller's lineage must
-      still SHARE A ROOT with it (`same_custody_tree/2`): a recovery from an
-      unrelated tree would leave the story naming a custody tree that did no
-      work, and a sibling of the tree that DID would then pass those gates.
-      Crossing dispatches is the point; crossing trees is the hole.
+      demand of it. Recovery therefore crosses dispatches AND TREES: the
+      session that died may have taken the whole lineage with it, and the
+      agent comes back rooted somewhere new. Demanding a shared ROOT of the
+      caller (`Dispatches.lineage_shares_prefix?/2`) closed the path in
+      exactly that case, while blocking nothing in the documented single-root
+      tenant, where every dispatch shares element 0. What holds separation
+      here is not the root: the caller is already proven to be the story's
+      `assigned_agent_id`, the `start_cap` gates only `POST /start` (which
+      re-checks that same assignment), and every L4 gate runs
+      `assigned_agent_id` equality IN ADDITION to its lineage comparison, so
+      a recovered agent still cannot report, review or verify its own work.
     * A caller with NO lineage of its own is refused
       (`caller_lineage_required`) on a story whose work WAS dispatch-minted.
       Minting an `[]`-lineage cap there would let an unlineaged legacy key
@@ -78,9 +84,8 @@ defmodule LoopctlWeb.CapRecoveryController do
 
     with :ok <- validate_start_cap(params),
          {:ok, story} <- fetch_owned_story(tenant_id, agent_id, story_id),
-         {:ok, impl_lineage} <- implementer_dispatch_lineage(tenant_id, story),
+         :ok <- implementer_dispatched?(tenant_id, story),
          {:ok, lineage} <- caller_lineage(tenant_id, api_key.id),
-         :ok <- same_custody_tree(lineage, impl_lineage),
          {:ok, cap} <- Capabilities.mint(tenant_id, "start_cap", story.id, lineage) do
       conn
       |> put_status(:created)
@@ -120,18 +125,6 @@ defmodule LoopctlWeb.CapRecoveryController do
           "This story's work was dispatch-minted, so a recovered capability must bind to " <>
             "YOUR dispatch lineage — and your key was not minted by a dispatch, so it has " <>
             "none. Call again with an ephemeral key from POST /api/v1/dispatches."
-        )
-
-      {:error, :caller_lineage_unrelated} ->
-        error(
-          conn,
-          409,
-          "caller_lineage_unrelated",
-          "Your dispatch lineage shares no root with the dispatch that claimed this story, " <>
-            "so recovering a capability here would leave the story's recorded implementer " <>
-            "provenance naming a custody tree that did no work — and the L4 separation " <>
-            "checks on report/review-complete/verify would compare against it. Have the " <>
-            "orchestrator force_unclaim the story and claim it again."
         )
 
       # The remaining shapes are internal failures of the mint itself (an
@@ -198,32 +191,16 @@ defmodule LoopctlWeb.CapRecoveryController do
   # and an agent that lost its session has almost always outlived its original
   # dispatch, so refusing there closed the recovery path in exactly the situation
   # it exists for.
-  defp implementer_dispatch_lineage(_tenant_id, %Story{implementer_dispatch_id: nil}),
+  defp implementer_dispatched?(_tenant_id, %Story{implementer_dispatch_id: nil}),
     do: {:error, :no_dispatch_lineage}
 
-  defp implementer_dispatch_lineage(tenant_id, %Story{implementer_dispatch_id: dispatch_id}) do
+  defp implementer_dispatched?(tenant_id, %Story{implementer_dispatch_id: dispatch_id}) do
     case Dispatches.get_dispatch(tenant_id, dispatch_id) do
       {:ok, %{revoked_at: revoked}} when not is_nil(revoked) -> {:error, :dispatch_revoked}
       {:ok, %{lineage_path: []}} -> {:error, :no_dispatch_lineage}
-      {:ok, dispatch} -> {:ok, dispatch.lineage_path}
+      {:ok, _dispatch} -> :ok
       _ -> {:error, :no_dispatch_lineage}
     end
-  end
-
-  # Recovery may cross DISPATCHES but not custody TREES. Recovery deliberately
-  # never rewrites `implementer_dispatch_id`, so the story keeps naming the dead
-  # dispatch as its implementer — and that is what `validate_not_self_report/3`,
-  # `validate_not_self_review/3` and `validate_not_self_verify/2` compare a
-  # caller's lineage against. Let the recovering caller come from an UNRELATED
-  # root and the recorded provenance names a tree that did no work: a sibling or
-  # child dispatch of the one that actually implemented then shares no prefix with
-  # it, carries its own agent_id, and can report its own work. Requiring a shared
-  # root (`lineage_shares_prefix?/2`) keeps the recorded implementer a truthful
-  # stand-in for whoever recovered, which is exactly what those gates assume.
-  defp same_custody_tree(caller_lineage, impl_lineage) do
-    if Dispatches.lineage_shares_prefix?(caller_lineage, impl_lineage),
-      do: :ok,
-      else: {:error, :caller_lineage_unrelated}
   end
 
   # The CALLER's lineage, resolved from the key the request authenticated with —

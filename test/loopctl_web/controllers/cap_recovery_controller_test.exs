@@ -77,10 +77,9 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
   #     recovered cap must bind to, because `Capabilities.validate_cap/6` demands
   #     an exact match against the lineage the CALLER presents at `POST /start`.
   #
-  # They are DIFFERENT dispatches under the SAME custody root, which is what a
-  # re-dispatch is. `caller_root: :other` makes the caller's root unrelated —
-  # recovery must refuse there, because the story keeps naming the old dispatch as
-  # its implementer and the L4 gates compare against that.
+  # They are DIFFERENT dispatches under the SAME custody root, which is the usual
+  # re-dispatch. `caller_root: :other` is the harder one: the whole tree died and
+  # the agent returns under a NEW root, which recovery must still serve.
   #
   # `caller_dispatch: false` drops the caller's dispatch, leaving the key
   # unlineaged (a legacy env-var key).
@@ -489,24 +488,23 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
   end
 
   describe "POST /api/v1/stories/:id/recover-cap — custody tree" do
-    test "refuses a caller whose lineage shares no root with the implementer dispatch",
-         %{conn: conn} do
-      # Recovery never rewrites `implementer_dispatch_id`, so the story keeps
-      # naming the OLD dispatch as its implementer. Minting for an unrelated tree
-      # would leave that provenance pointing at a tree that did no work — and a
-      # sibling dispatch of the tree that DID would then share no prefix with it,
-      # carry its own agent_id, and pass `validate_not_self_report/3`.
-      %{raw_key: raw_key, story: story} = setup_ctx(%{caller_root: :other})
+    test "recovers for a caller re-dispatched under a NEW root", %{conn: conn} do
+      # The crash this endpoint exists for can take the whole tree with it: the
+      # orchestration session dies and the agent returns under a new ROOT dispatch.
+      # Demanding a shared root refused exactly that, leaving force_unclaim (an
+      # operator) as the only way out. Separation is still held by the caller being
+      # the story's assigned agent, and by the `assigned_agent_id` equality every
+      # L4 gate runs alongside its lineage comparison.
+      %{raw_key: raw_key, story: story, caller_lineage: caller_lineage} =
+        setup_ctx(%{caller_root: :other})
 
       conn =
         conn
         |> auth_conn(raw_key)
         |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
 
-      assert %{"error" => %{"status" => 409, "code" => "caller_lineage_unrelated"}} =
-               json_response(conn, 409)
-
-      assert caps_for(story.id) == []
+      assert %{"data" => %{"issued_to_lineage" => ^caller_lineage, "typ" => "start_cap"}} =
+               json_response(conn, 201)
     end
   end
 

@@ -60,10 +60,12 @@ All notable changes to loopctl are documented here.
   delivers tokens already minted, and `recover-cap` needs an `implementer_dispatch_id` that
   a legacy bearer claim never records. Minting is now part of the claim transaction, so the
   claim either delivers a usable capability or does not happen. **New responses:** `503
-  capability_mint_failed` with a `Retry-After` when the secret store merely blipped —
-  nothing was claimed and retrying is the whole remedy — and `503
-  capability_key_unavailable` with NO `Retry-After` when the audit key is absent or
-  superseded, which no amount of retrying can clear. Keyless (pre-v2) tenants are unaffected — they claim with no capability, as
+  capability_mint_failed` with a `Retry-After` when the condition clears on its own — the
+  secret store merely blipped, or a rotation's new private half is not deployed yet — and
+  `503 capability_key_unavailable` with NO `Retry-After` when the audit key is absent or
+  corrupt, which no amount of retrying can clear. A claim whose own audit or webhook step
+  fails now answers `500 claim_failed` (nothing was claimed; retry) instead of crashing the
+  request. Keyless (pre-v2) tenants are unaffected — they claim with no capability, as
   before.
 
 - **Capability recovery binds to the CALLER's dispatch lineage, so it works after a crash.**
@@ -75,13 +77,12 @@ All notable changes to loopctl are documented here.
   which grants nothing new (the caller is already verified as the story's assigned agent,
   and `start` re-checks that). **Behaviour changes:** an implementer dispatch that has
   merely EXPIRED no longer blocks recovery (a revoked one still does, as `422
-  dispatch_revoked`); a caller whose key no dispatch minted is refused with `409
-  caller_lineage_required` on dispatch-minted work; and a caller whose lineage shares no
-  ROOT with the story's implementer dispatch is refused with `409 caller_lineage_unrelated`
-  (recovery deliberately never rewrites `implementer_dispatch_id`, so recovering across
-  custody trees would leave the story's provenance naming a tree that did no work, and the
-  L4 separation checks compare against it — have the orchestrator force-unclaim and claim
-  again). Every refusal from this endpoint now carries a stable `error.code`, the catch-all
+  dispatch_revoked`); and a caller whose key no dispatch minted is refused with `409
+  caller_lineage_required` on dispatch-minted work. Recovery deliberately never rewrites
+  `implementer_dispatch_id`, and it does NOT require the caller to share a custody ROOT with
+  it: the crash it recovers from can take the whole tree with it, and the story's assigned
+  agent plus the `assigned_agent_id` equality every L4 gate runs is what keeps a recovered
+  agent from reporting its own work. Every refusal from this endpoint now carries a stable `error.code`, the catch-all
   no longer renders an internal error term into the response body (it is logged instead),
   and a mint failure answers with the same status and code as `claim` does (`503`, not the
   previous `422 cap_mint_failed`).
@@ -92,10 +93,11 @@ All notable changes to loopctl are documented here.
   50k-entry cap and get every OTHER tenant's next classification refused admission — a
   shared cache turned into a cross-tenant denial. Admission is now also capped per tenant.
   Past the cap new hosts are simply re-classified on demand (a `Logger.warning` names the
-  tenant); no verdict changes. The per-tenant cap bounds PINS only — a scope's `local_only`
-  marking and the negative cache for hosts that fail to resolve are exempt, since capping
-  those would make a large tenant repay a database read and a full DNS resolve on every
-  classification, which is the cost they exist to collapse. The global cap still bounds all
+  tenant); no verdict changes. Each SHAPE has its own per-tenant budget, because they grow
+  for different reasons: pins and the negative cache for hosts that fail to resolve are
+  capped separately (so a run of DNS misses cannot starve a tenant's real pins, and neither
+  shape can reach the global cap alone), while a scope's `local_only` marking is bounded by
+  the tenant's scope count rather than by request volume. The global cap still bounds all
   three.
 
 - **The story lifecycle is completable again for tenants with an audit signing key (#621).**

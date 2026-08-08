@@ -79,9 +79,11 @@ defmodule LoopctlWeb.StoryStatusController do
         "is what the downstream custody gates compare. Minting is ATOMIC with the claim: " <>
         "for a tenant with an audit signing key, a claim whose capability cannot be minted " <>
         "does not commit at all, so there is no state in which the story is claimed but " <>
-        "unstartable. A transient mint failure is 503 `capability_mint_failed` with " <>
-        "`retry-after`; an audit key that is ABSENT or SUPERSEDED is 503 " <>
-        "`capability_key_unavailable` with none, because only an operator can clear it.",
+        "unstartable. A mint failure that clears on its own — an unreachable secret store, " <>
+        "or a rotation whose new private half is not deployed yet — is 503 " <>
+        "`capability_mint_failed` with `retry-after`; an audit key that is ABSENT or " <>
+        "CORRUPT is 503 `capability_key_unavailable` with none, because only an operator " <>
+        "can clear it.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 => {"Story claimed", "application/json", Schemas.StoryStatusResponse},
@@ -101,10 +103,12 @@ defmodule LoopctlWeb.StoryStatusController do
       "Agent starts work on an assigned story. A tenant with an audit signing key must " <>
         "present the `start_cap` returned by the claim response (or recovered via " <>
         "POST /stories/:id/recover-cap) as `capability`; omitting it yields " <>
-        "403 missing_capability. A tenant whose audit key cannot be USED at all (cleared, " <>
-        "or replaced without an archived history row) yields 503 " <>
-        "`capability_key_unavailable` instead — recovery cannot fix that one, only an " <>
-        "operator can. A pre-v2 tenant with no audit key needs no capability.",
+        "403 missing_capability. When a capability IS presented and there is no usable key " <>
+        "to check it against (replaced without an archived history row, or advertised " <>
+        "without a readable private half), the answer is 503 `capability_key_unavailable` " <>
+        "— recovery cannot fix that one, only an operator can. A tenant with NO audit key " <>
+        "at all — pre-v2, or one whose key was CLEARED — needs no capability and starts " <>
+        "without one, dropping to pre-v2 custody strength.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
       {"Start params", "application/json",
@@ -322,6 +326,13 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :not_found} ->
         {:error, :not_found}
+
+      # Anything else is a server-side failure of the claim's own transaction,
+      # already logged with its step and rolled back. Without this clause an
+      # enumerated `case` turned every such reason into a CaseClauseError — the
+      # same 500 the multi had already handled correctly.
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
