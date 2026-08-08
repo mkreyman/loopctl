@@ -355,6 +355,14 @@ defmodule Loopctl.Knowledge.ConsolidationTest do
       # `analyze/2` used to accept the nightly lint report purely to source this class.
       # Dropping the parameter is what makes the retirement structural rather than a
       # promise: there is no longer an input that could carry stale articles in.
+      #
+      # `function_exported?/3` answers for a LOADED module and returns false for one that
+      # merely has not been loaded yet — so without this line the assertions below depend
+      # on whether some earlier test happened to touch `Consolidation`, and the whole
+      # describe can fail (or, worse, a `refute` can pass) for a reason that has nothing
+      # to do with the arities it names.
+      assert Code.ensure_loaded?(Consolidation)
+
       assert function_exported?(Consolidation, :analyze, 1)
       assert function_exported?(Consolidation, :analyze, 2)
       refute function_exported?(Consolidation, :analyze, 3)

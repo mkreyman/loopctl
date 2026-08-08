@@ -57,7 +57,8 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       clamped by `semantic_result_pool_cap` (5 in `config/test.exs`), so widening a page
       buys NOTHING while that cap stands. This is why four fixes and fourteen wide
       `limit:` annotations did not stop it: the diagnosis was right and the remedy was
-      inert. Adding a fifteenth `limit:` is not the fix; the cap is.
+      inert. Adding a fifteenth `limit:` is not the fix; the cap was — for the STARVATION
+      mode only. See the second capture below: the recall-loss mode survives the raised cap.
     * The one CI failure captured in detail asserted on a raw `HeavyRead.all/2` and
       never called `search_semantic/3` at all.
     * Every failure mode seen UNDER-returns. Nothing has ever returned another tenant's
@@ -133,11 +134,38 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   cap so the annotations bind, and added a deterministic reproduction of the starvation
   geometry that fails loudly at the knob.
 
-  Do NOT read that as "the flake is solved". It explains one captured recurrence. The
-  earlier savepoint-leak and residual-filter causes were different and are separately fixed;
-  rare recurrences may remain and have never been individually explained — KB c6fd1e5d
-  carries the standing protocol (does your diff touch the read path, run the file 5x, then
-  rerun) and the list of four recall-targeted
+  **#634 DID NOT SOLVE THE FLAKE, and a second capture proves it.** Taken on master WITH the
+  raised cap already merged, on this same test:
+
+      tenant rows: 24 (COUNT — authoritative)
+      at dim=1536 AND live_denorm AND published: 24 (COUNT — authoritative)
+      pool=10 inner_pool=40          <- the raised cap IS in effect
+      Index Scan using article_embeddings_hnsw_dim_1536_idx  (actual rows=23)
+            Filter: (tenant_id = '...'::uuid)
+            [no `Rows Removed by Filter` line at all]
+
+  Read that carefully, because it rules out the explanation above for THIS failure:
+
+    * `inner_pool=40` against 24 candidates — there was room for every row, so truncation
+      cannot be the cause;
+    * the filter removed NOTHING (no `Rows Removed by Filter` line is emitted);
+    * the scan returned **23 of 24** rows an authoritative COUNT can see, and the one it
+      missed is exactly the `scope: :tenant` row the assertion wanted;
+    * `iterative_scan="relaxed_order" (supported?=true)` — applied.
+
+  So the HNSW walk did not reach a row that exists, is visible, and had a slot waiting.
+  That is RECALL LOSS, and it is a DIFFERENT failure mode from the starvation above.
+  There are at least two, and #634 closes only the first.
+
+  **No cause is offered for the recall-loss mode, deliberately.** Every previous wrong turn
+  on this file — including two in the same investigation that produced the capture above —
+  came from promoting "fits the numbers" to "is the mechanism". The numbers above are what
+  is established; anything about WHY the walk missed that row is not. Do not write one into
+  this moduledoc until a capture supports it.
+
+  The earlier savepoint-leak and residual-filter causes were different again and are
+  separately fixed — KB c6fd1e5d carries the standing protocol (does your diff touch the
+  read path, run the file 5x, then rerun) and the list of four recall-targeted
   theories that are DEAD (`hnsw.ef_search`, exact scan, `hnsw.iterative_scan`,
   retry-on-empty). Follow it there; do not open a fifth.
 
