@@ -17,19 +17,28 @@ defmodule Loopctl.Repo.Migrations.AddLifecycleEnteredAtToStories do
   markers already stamped, then every story whose `audit_log` still SHOWS lifecycle
   history — those rows are dropped at `:audit_retention_days`, so without this a story
   force-unclaimed before the column existed reads as never-dispatched once its
-  partition goes. A false stamp only makes backfill refuse MORE, so trusting both
-  sources loses nothing. Only PRESENCE is read, so the instant comes from `updated_at`
+  partition goes. Only PRESENCE is read, so the instant comes from `updated_at`
   rather than a client-written JSON string a cast could raise on.
+
+  `@actions` is `Progress.@worked_audit_actions`, NOT the guard's wider
+  `@lifecycle_audit_actions`: "force_unclaimed" is excluded because force-unclaiming a
+  never-dispatched pending story writes one, and this stamp is PERMANENT where the audit
+  row expires. Stamping on it would convert a refusal that lapses with the partition into
+  one that never lifts, for exactly the imported/pre-loopctl stories backfill exists for.
 
   `down/0` copies the column back into `metadata` (still honoured on read) before
   dropping it — a plain drop would destroy every marker stamped since deploy.
   """
 
   @batch 5_000
-  @actions "'status_changed','force_unclaimed','auto_reset'"
+  @actions "'status_changed','auto_reset'"
 
   def up do
-    execute("ALTER TABLE stories ADD COLUMN IF NOT EXISTS lifecycle_entered_at timestamptz")
+    # `timestamp(6)` is what Ecto's `:utc_datetime_usec` produces, and what every other
+    # timestamp column on this table is. A `timestamptz` here would leave fresh databases
+    # holding a different physical type from already-migrated ones, and make the backfill's
+    # `= updated_at` an implicit cast resolved against the session TimeZone.
+    execute("ALTER TABLE stories ADD COLUMN IF NOT EXISTS lifecycle_entered_at timestamp(6)")
     # `execute/1` is queued by the runner; the batches use repo().query! and run NOW.
     flush()
 

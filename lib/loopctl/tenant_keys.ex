@@ -8,11 +8,9 @@ defmodule Loopctl.TenantKeys do
 
   ## ETS table
 
-  Created at application start (see `Loopctl.Application`). Table name
-  is `:tenant_key_cache`. Entries are `{tenant_id, result, expires_at}`, where
-  `result` is the `{:ok, key}` / `{:error, reason}` this module returns — OUTAGE-shaped
-  failures are cached too, on a shorter TTL, but a definitively absent key
-  (`:not_found`) never is. See `@negative_ttl_seconds`.
+  Created at application start (see `Loopctl.Application`). Table name is
+  `:tenant_key_cache`. Entries are `{tenant_id, result, expires_at, epoch}` — the
+  `{:ok, key}` / `{:error, reason}` returned, failures included on a short TTL.
   """
 
   require Logger
@@ -24,17 +22,12 @@ defmodule Loopctl.TenantKeys do
   @cache_table :tenant_key_cache
   @ttl_seconds 300
 
-  # A failure is cached, because the caller that hurts most is the one that repeats:
-  # `Dispatches.verifier_seed/2` asks for this key on EVERY request-review, and with
-  # misses uncached a secret-store outage cost one round trip per call, deployment-wide
-  # — the outage's own load amplified against the store that is already failing.
-  #
-  # The negative TTL is deliberately much shorter than the positive one. A cached
-  # SUCCESS is stale only if the key rotated, and rotation calls `invalidate/1`; a
-  # cached FAILURE would extend a resolved outage by its own TTL, turning a 10-second
-  # blip into 5 minutes of `verifier_seed_unavailable` and stories flagged
-  # `verifier_needed` that did not need to be. Short enough to recover promptly, long
-  # enough to collapse a request storm.
+  # Failures are cached because the caller that hurts most repeats: `verifier_seed/2` asks on
+  # EVERY request-review, so an uncached miss costs an AdminRepo query (a deliberately
+  # 3-connection pool) plus a secret-store trip, per call — `:not_found` most of all, since a
+  # tenant with no audit key yet answers it for as long as it has none, a PERMANENT storm.
+  # The TTL is short so a resolved outage, or a key just written, is not extended into
+  # spurious `verifier_needed`; a path that WRITES a key calls `invalidate/1`, not the TTL.
   @negative_ttl_seconds 15
 
   @doc """
@@ -60,33 +53,37 @@ defmodule Loopctl.TenantKeys do
   @spec get_private_key(Ecto.UUID.t()) :: {:ok, binary()} | {:error, term()}
   def get_private_key(tenant_id) when is_binary(tenant_id) do
     now = System.system_time(:second)
+    epoch = epoch(tenant_id)
 
     case :ets.lookup(@cache_table, tenant_id) do
-      [{^tenant_id, result, expires_at}] when expires_at > now ->
-        result
-
-      _ ->
-        fetch_and_cache(tenant_id, now)
+      [{^tenant_id, result, expires_at, ^epoch}] when expires_at > now -> result
+      _ -> fetch_and_cache(tenant_id, now, epoch)
     end
   end
 
   @doc """
-  Invalidate the cached key for a tenant (e.g., after key rotation).
+  Invalidate the cached key for a tenant (after key rotation or provisioning).
   """
   @spec invalidate(Ecto.UUID.t()) :: :ok
   def invalidate(tenant_id) do
+    key = {:epoch, tenant_id}
+    :ets.update_counter(@cache_table, key, {2, 1}, {key, 0})
     :ets.delete(@cache_table, tenant_id)
     :ok
   end
 
-  defp fetch_and_cache(tenant_id, now) do
+  # Invalidation must cover a fetch already IN FLIGHT: deleting the row is not enough, because
+  # a slow fetch that began before a rotation and fails after it lands on the empty table and
+  # poisons the freshly rotated key for the negative TTL. An entry carries the epoch it was
+  # fetched under and a read takes only its own, so one bump orphans them all.
+  defp epoch(tenant_id), do: :ets.lookup_element(@cache_table, {:epoch, tenant_id}, 2, 0)
+
+  defp fetch_and_cache(tenant_id, now, epoch) do
     import Ecto.Query
 
     case AdminRepo.one(from(t in Tenant, where: t.id == ^tenant_id, select: t.slug)) do
       nil ->
-        # A pre-v2 / deleted tenant asks again on every request just as an outage
-        # does, and the answer is just as stable over the negative window.
-        cache_negative(tenant_id, {:error, :tenant_not_found}, now)
+        cache_negative(tenant_id, {:error, :tenant_not_found}, now, epoch)
 
       slug ->
         secret_name = Secrets.audit_key_secret_name(slug)
@@ -96,7 +93,7 @@ defmodule Loopctl.TenantKeys do
             # Fly secrets store keys as base64 (set via FlyAdapter.set/2).
             # Decode to raw bytes for :crypto.sign/5.
             key = decode_key(encoded)
-            :ets.insert(@cache_table, {tenant_id, {:ok, key}, now + @ttl_seconds})
+            :ets.insert(@cache_table, {tenant_id, {:ok, key}, now + @ttl_seconds, epoch})
             {:ok, key}
 
           {:error, reason} ->
@@ -104,40 +101,21 @@ defmodule Loopctl.TenantKeys do
               "Failed to fetch audit key for tenant #{tenant_id}: #{inspect(reason)}"
             )
 
-            cache_negative(tenant_id, {:error, reason}, now)
+            cache_negative(tenant_id, {:error, reason}, now, epoch)
         end
     end
   end
 
-  # A DEFINITIVELY ABSENT key is never cached, and the distinction is the whole safety
-  # of the negative half. `:not_found` means "this tenant has no audit key yet", and
-  # that answer stops being true the instant `Tenants.bootstrap_audit_key/1` writes
-  # one — a write that clears no cache (only rotation calls `invalidate/1`). Caching it
-  # would leave a freshly-keyed tenant failing `Capabilities.mint/4` and
-  # `Dispatches.verifier_seed/2` for the negative TTL, flagging `verifier_needed` on
-  # stories whose tenant DOES have a key. Only outage-shaped failures — unreachable,
-  # timeout, a 5xx from the store — are cached, which is the storm this exists to stop.
-  defp cache_negative(_tenant_id, {:error, :not_found} = result, _now), do: result
+  # A failure must never overwrite a LIVE positive entry — a slow error can land after a
+  # concurrent success. `select_replace` tests "non-positive or already expired" and writes in
+  # ONE atomic op (lookup-then-insert leaves a window); it matches nothing when the row is
+  # absent, so `insert_new` covers that without clobbering a racing writer.
+  defp cache_negative(tenant_id, result, now, epoch) do
+    entry = {tenant_id, result, now + @negative_ttl_seconds, epoch}
+    stale = {:orelse, {:"/=", {:element, 1, :"$1"}, :ok}, {:"=<", :"$2", now}}
+    ms = [{{tenant_id, :"$1", :"$2", :_}, [stale], [{:const, entry}]}]
 
-  # Negative entries live in the SAME table under the same key, so `invalidate/1`
-  # clears a cached failure.
-  #
-  # `insert_new` because a failure must never overwrite a live positive entry: a slow
-  # fetch that errors can land after a concurrent success (or after a rotation's
-  # `invalidate/1`) and would otherwise poison a good key for the negative TTL.
-  defp cache_negative(tenant_id, result, now) do
-    if :ets.insert_new(@cache_table, {tenant_id, result, now + @negative_ttl_seconds}) do
-      result
-    else
-      overwrite_stale_negative(tenant_id, result, now)
-    end
-  end
-
-  defp overwrite_stale_negative(tenant_id, result, now) do
-    case :ets.lookup(@cache_table, tenant_id) do
-      [{^tenant_id, {:ok, _}, expires_at}] when expires_at > now -> :ok
-      _ -> :ets.insert(@cache_table, {tenant_id, result, now + @negative_ttl_seconds})
-    end
+    if :ets.select_replace(@cache_table, ms) == 0, do: :ets.insert_new(@cache_table, entry)
 
     result
   end

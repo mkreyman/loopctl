@@ -570,17 +570,23 @@ defmodule Loopctl.BulkOperations do
 
   defp auto_reset_agent_status(story) do
     story
-    |> Ecto.Changeset.change(%{
-      agent_status: :pending,
-      assigned_agent_id: nil,
-      assigned_at: nil,
-      reported_done_at: nil,
+    |> Ecto.Changeset.change(
       # The FOURTH site that clears assigned_agent_id on a worked story, and the twin
       # of Progress.perform_auto_reset/4. Without the stamp the backfill guard here
       # rests on `verified_status: :rejected` alone — the coincidence the single-story
       # path was stamped to stop depending on. See Progress.guard_no_lifecycle_history/2.
-      lifecycle_entered_at: Progress.lifecycle_stamp(story)
-    })
+      # WORKED is checked, not assumed: bulk-rejecting a never-dispatched imported story
+      # erases no marker, so it earns none (Progress.lifecycle_stamp_change/1).
+      Map.merge(
+        %{
+          agent_status: :pending,
+          assigned_agent_id: nil,
+          assigned_at: nil,
+          reported_done_at: nil
+        },
+        Progress.lifecycle_stamp_change(story)
+      )
+    )
     |> AdminRepo.update()
   end
 

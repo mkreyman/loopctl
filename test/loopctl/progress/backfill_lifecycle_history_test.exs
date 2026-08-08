@@ -133,6 +133,21 @@ defmodule Loopctl.Progress.BackfillLifecycleHistoryTest do
       assert %DateTime{} = reset.lifecycle_entered_at
     end
 
+    test "neither reject auto-reset stamps a story with no marker to ERASE" do
+      # Both auto-resets stamp through Progress.lifecycle_stamp_change/1. Rejecting an
+      # imported story erases no dispatch marker, so it earns none: the marker is permanent
+      # and uncleanable, and stamping it would refuse that story the backfill it is entitled
+      # to the moment a rejection is reversed. Asserted here rather than through
+      # bulk_reject/3, which cannot reach such a story at all — the custody-orphan guard
+      # refuses a reported_done story with no agent and no lineage before the reset runs.
+      assert Progress.lifecycle_stamp_change(imported_reported_done_story()) == %{}
+
+      # And the worked shape the reject paths actually see still earns the stamp.
+      worked = fixture(:story, %{agent_status: :reported_done})
+      refute is_nil(worked.assigned_agent_id)
+      assert %{lifecycle_entered_at: %DateTime{}} = Progress.lifecycle_stamp_change(worked)
+    end
+
     test "re-running force-unclaim retro-stamps a worked story already at pending" do
       # The remedy for a story reset before the column existed: its only remaining
       # evidence is an audit entry that expires with its partition, and the idempotent

@@ -96,8 +96,8 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
   `get_dispatch_lineage/2`) fails **CLOSED**, and the `assigned_agent_id`
   equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
-  `progress.ex:514-553`); that write is result-checked, and a failure flags `verifier_needed` plus a
-  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:566`) instead of
+  `progress.ex:520-559`); that write is result-checked, and a failure flags `verifier_needed` plus a
+  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:572`) instead of
   silently leaving the field nil. `request-review` is OPTIONAL, so most stories reach verify with no
   verifier dispatch — the CALLER-lineage step is what keeps that path lineage-gated.
 - **report** — `validate_not_self_report/3`. `nil` caller blocked
@@ -172,7 +172,7 @@ correct behavior; do not add a workaround.
 **Enforcement is conditional — this is the deprecation seam.** `Progress.maybe_consume_cap/6`
 (`progress.ex:352-398`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
 `:missing_capability` **only for tenants that have an audit key** (`tenant_has_audit_key?/1`,
-`progress.ex:594-599`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
+`progress.ex:600-605`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
 proceeds with NO capability at all. So L1 strength is per-tenant. A REJECTED cap is split by
 `cap_refusal/4`: only `:invalid_signature` / `:replay` surface as `{:cap_rejected, _}`, which
 FallbackController answers with a plain 403 — it halts NOTHING and counts toward nothing (see the
@@ -216,7 +216,7 @@ exist, but every one descends from the implementer's root — the single-root te
 not a shortage; its remedy is the operator minting an independently-rooted verifier tree.
 
 **Empty-lineage caveat, in BOTH directions.** When the implementer dispatch cannot be loaded,
-`assign_rotating_verifier/3` passes `[]` (`progress.ex:514-518`), and with `[]` the rejection is
+`assign_rotating_verifier/3` passes `[]` (`progress.ex:520-524`), and with `[]` the rejection is
 inert — selection can then pick a same-lineage (even the implementer's own) dispatch. The verify-time
 comparison is fail-closed on an empty lineage, so this is caught at verify rather than at selection;
 do not "simplify" either half.
@@ -299,9 +299,9 @@ clears it, so both its trigger and its blast radius are deliberately bounded.
   alert on the RATE. Do not re-add a halt there. **Not halting is not the same as not
   recording**: EVERY cap refusal is hash-chained by `record_cap_refusal/4`, and the append is
   piped through `AuditChain.log_append_failure/4` so a lost entry is loud — `:invalid_signature`
-  as `capability_forged`, `:replay` as `capability_replayed` (both `byzantine: true`; a retry
-  produces a replay, so recording it as a forgery was a permanent accusation), the rest as
-  `capability_refused`. That used
+  as `capability_forged` (the only one carrying `byzantine: true` — the flag is derived from
+  the ACTION, since a retry produces a replay and neither the name nor the flag may call that
+  a forgery), `:replay` as `capability_replayed`, the rest as `capability_refused`. That used
   to run the wrong way round, with `:wrong_lineage` chained and a FORGED signature left with
   only a log line; since the refusal no longer halts, the audit entry IS its durable record.
 - **Scope** — `LoopctlWeb.CustodySurface` (`lib/loopctl_web/custody_surface.ex`) is THE list of

@@ -47,9 +47,10 @@ All notable changes to loopctl are documented here.
   this line). Every one of them is an ordinary 403, and every one is recorded in the
   hash-chained audit log with the `cap_id`, api key and agent: expiry and lineage drift as
   `capability_refused`, a signature that failed to verify as `capability_forged`, a
-  double-spent token as `capability_replayed` (both carry `payload.byzantine: true`).
-  Replay gets its own action because an ordinary retry produces it — recording a stale
-  token as a forgery wrote a permanent accusation into an append-only log. That recording
+  double-spent token as `capability_replayed`. Replay gets its own action, and
+  `payload.byzantine: false`, because an ordinary retry produces it — recording a stale token
+  as a forgery wrote a permanent accusation into an append-only log, and a consumer keying
+  off the flag rather than the action read it that way too. That recording
   used to run the wrong way round — the benign refusals were chained and the forged ones
   left only a log line — so a forged signature is now durable rather than dependent on log
   retention. Alert on the RATE of the
@@ -133,13 +134,19 @@ All notable changes to loopctl are documented here.
   auto-resets (single-story and bulk) now stamp a durable marker on the story, and both paths
   refuse a story carrying it — or a lifecycle entry in the audit log — with a new 422
   (`story_entered_lifecycle`). Re-running force-unclaim on an already-pending story stamps it
-  too, which is the remedy for a story reset before the column existed. The row stamp is the
-  longer-lived half deliberately: `audit_log`
+  too, which is the remedy for a story reset before the column existed — but only while some
+  evidence of the work SURVIVES (a row marker, or a `status_changed`/`auto_reset` audit row
+  still inside `AUDIT_RETENTION_DAYS`). A story reset with a non-dispatch-minted key longer ago
+  than that has none left: the re-run returns 200, stamps nothing (it logs
+  `lifecycle_retro_stamp_skipped`), and the story stays backfillable. **Reject it** rather than
+  rely on the remedy there. The row stamp is the longer-lived half deliberately: `audit_log`
   is partitioned and pruned at `AUDIT_RETENTION_DAYS` (default 90), so an audit-only guard would
   have reopened this path on a timer. **The marker is a dedicated
   `stories.lifecycle_entered_at` column** (migration `20260807153000`, which carries forward
-  any marker already written AND stamps every story whose audit log still shows lifecycle
-  history, so the evidence surviving at deploy time becomes permanent; its `down` copies the
+  any marker already written AND stamps every story whose audit log still shows it was WORKED
+  — `status_changed`/`auto_reset`, never `force_unclaimed`, which an operator writes on a
+  never-dispatched story too — so the evidence surviving at deploy time becomes permanent
+  without making the guard's expiring half permanent; its `down` copies the
   column back into `metadata` before dropping it, so a rollback does not destroy the markers):
   it first shipped inside `metadata`, which
   `PATCH /api/v1/stories/:id` replaces wholesale, so a single orchestrator-role request erased

@@ -263,6 +263,11 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
 
       assert payload["reason"] == "replay"
 
+      # Renaming the action was half the correction: a consumer keying off the FLAG still
+      # read an ordinary retry as forgery-grade. Only a signature that failed to verify is
+      # byzantine, and the telemetry metadata carries the same value.
+      assert payload["byzantine"] == false
+
       assert [] ==
                Loopctl.AuditChain.Entry
                |> where([e], e.tenant_id == ^tenant.id and e.action == "capability_forged")

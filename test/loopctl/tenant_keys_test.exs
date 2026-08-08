@@ -67,19 +67,49 @@ defmodule Loopctl.TenantKeysTest do
       assert {:ok, ^key} = TenantKeys.get_private_key(tenant.id)
     end
 
-    test "a definitively absent key is NOT cached, so provisioning takes effect at once" do
+    test "an absent key is cached too — the miss that repeats forever — and invalidate/1 busts it" do
+      tenant = fixture(:tenant)
+      secret_name = Loopctl.Secrets.audit_key_secret_name(tenant.slug)
+      key = :crypto.strong_rand_bytes(32)
+      parent = self()
+
+      Mox.stub(Loopctl.MockSecrets, :get, fn ^secret_name ->
+        send(parent, :secret_get)
+        {:error, :not_found}
+      end)
+
+      # A tenant with no audit key answers :not_found on EVERY request-review for as long
+      # as it has none. Leaving that uncached puts an AdminRepo query on the 3-connection
+      # pool per call, permanently — the storm this cache exists to collapse.
+      assert {:error, :not_found} = TenantKeys.get_private_key(tenant.id)
+      assert {:error, :not_found} = TenantKeys.get_private_key(tenant.id)
+      assert drain() == 1
+
+      Mox.stub(Loopctl.MockSecrets, :get, fn ^secret_name -> {:ok, Base.encode64(key)} end)
+      :ok = TenantKeys.invalidate(tenant.id)
+
+      assert {:ok, ^key} = TenantKeys.get_private_key(tenant.id)
+    end
+
+    test "a failure from a fetch that a rotation overtook does not poison the new key" do
       tenant = fixture(:tenant)
       secret_name = Loopctl.Secrets.audit_key_secret_name(tenant.slug)
       key = :crypto.strong_rand_bytes(32)
 
-      Mox.stub(Loopctl.MockSecrets, :get, fn ^secret_name -> {:error, :not_found} end)
-      assert {:error, :not_found} = TenantKeys.get_private_key(tenant.id)
+      # The rotation lands while this fetch is IN FLIGHT: `invalidate/1` deletes the row,
+      # then the slow failure writes its negative entry onto the now-empty table — so
+      # `insert_new` succeeds and, without the epoch, the entry stands for the full TTL.
+      Mox.stub(Loopctl.MockSecrets, :get, fn ^secret_name ->
+        :ok = TenantKeys.invalidate(tenant.id)
+        {:error, :unreachable}
+      end)
 
-      # `Tenants.bootstrap_audit_key/1` writes the secret and invalidates nothing —
-      # only rotation calls `invalidate/1`. A cached :not_found would leave capability
-      # minting and verifier selection failing on a key that now exists.
+      assert {:error, :unreachable} = TenantKeys.get_private_key(tenant.id)
+
       Mox.stub(Loopctl.MockSecrets, :get, fn ^secret_name -> {:ok, Base.encode64(key)} end)
 
+      # Capability minting and verifier selection would otherwise fail for 15s on a
+      # tenant whose key is perfectly valid and freshly rotated.
       assert {:ok, ^key} = TenantKeys.get_private_key(tenant.id)
     end
 

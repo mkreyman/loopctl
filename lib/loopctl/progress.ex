@@ -374,11 +374,13 @@ defmodule Loopctl.Progress do
     end)
   end
 
-  # Only a FORGED signature or a double-spent token is a trust violation. Every
-  # other refusal — expired, bound to another lineage, wrong story/type, unknown
-  # id — is an ordinary client error: the caller sat on a token past its 1h TTL,
-  # or its dispatch rotated.
-  @byzantine_cap_refusals [:invalid_signature, :replay]
+  # A forged signature and a double-spent token are refusals of the TOKEN ITSELF, not of a
+  # token gone stale. Every other refusal — expired, bound to another lineage, wrong
+  # story/type, unknown id — is an ordinary client error: the caller sat on a token past its
+  # 1h TTL, or its dispatch rotated. Only the first pair is answered as `:cap_rejected`.
+  # NOTE: this set is NOT the byzantine set — see `record_cap_refusal/4`, where a replay is
+  # explicitly not one.
+  @cap_rejected_refusals [:invalid_signature, :replay]
 
   defp maybe_consume_cap(multi, tenant_id, story_id, cap_id, typ, lineage) do
     Multi.run(multi, :consume_cap, fn _repo, _changes ->
@@ -404,7 +406,7 @@ defmodule Loopctl.Progress do
   # The split still matters, because the two classes mean different things and are
   # recorded under different actions: the byzantine set is a FORGED signature or a
   # double-spend, everything else is the caller's own token going stale.
-  defp cap_refusal(reason) when reason in @byzantine_cap_refusals, do: {:cap_rejected, reason}
+  defp cap_refusal(reason) when reason in @cap_rejected_refusals, do: {:cap_rejected, reason}
   defp cap_refusal(reason), do: {:cap_unusable, reason}
 
   # Every capability refusal gets a durable trace, and the BYZANTINE ones get at least
@@ -417,8 +419,12 @@ defmodule Loopctl.Progress do
   # Runs AFTER the transaction rolled back, so the entry survives; a refusal appended
   # inside the multi dies with it.
   defp record_cap_refusal(tenant_id, story_id, reason, ctx) do
-    byzantine? = reason in @byzantine_cap_refusals
     action = cap_refusal_action(reason)
+    # Derived from the ACTION, not from the rejected set: a replay is reachable by an
+    # ordinary retry, so it is recorded under its own action and is NOT byzantine. Naming
+    # it one and then flagging it `byzantine: true` renamed the accusation, it did not
+    # withdraw it — a consumer keying off the flag still read a retry as a forgery.
+    byzantine? = action == "capability_forged"
 
     Logger.warning(cap_refusal_log(action, tenant_id, story_id, reason, ctx))
 
@@ -457,11 +463,11 @@ defmodule Loopctl.Progress do
     :ok
   end
 
-  # `:replay` is byzantine for TELEMETRY — a double-spend is worth counting — but it is
-  # not a forgery, and `capability_forged` is a permanent accusation in an append-only
-  # log. FallbackController states the opposite of that accusation: a replayed
-  # single-use token is reachable by an ordinary retry. So a double-spend takes its own
-  # action, and only a signature that failed to verify is recorded as forged.
+  # `:replay` is worth COUNTING — the double-spend signal is a spike — but it is not a
+  # forgery, and `capability_forged` is a permanent accusation in an append-only log.
+  # FallbackController states the opposite of that accusation: a replayed single-use token
+  # is reachable by an ordinary retry. So a double-spend takes its own action, and only a
+  # signature that failed to verify is recorded as forged (and flagged byzantine).
   #
   # Cost accepted: a retry loop appends one chained entry per attempt, each taking the
   # tenant's chain-head lock. That is the shape the benign refusals (`:wrong_story`,
@@ -469,7 +475,7 @@ defmodule Loopctl.Progress do
   # would put a double-spend back on log retention.
   defp cap_refusal_action(:replay), do: "capability_replayed"
 
-  defp cap_refusal_action(reason) when reason in @byzantine_cap_refusals,
+  defp cap_refusal_action(reason) when reason in @cap_rejected_refusals,
     do: "capability_forged"
 
   defp cap_refusal_action(_reason), do: "capability_refused"
@@ -1821,6 +1827,18 @@ defmodule Loopctl.Progress do
       |> Ecto.Changeset.change(%{lifecycle_entered_at: DateTime.utc_now()})
       |> AdminRepo.update()
     else
+      # The remedy CANNOT close what it has no evidence of, and a 200 must not be read as
+      # if it had. A story force-unclaimed with a non-dispatch-minted key before the column
+      # existed keeps no evidence at all once its audit partition is dropped at
+      # `:audit_retention_days`: the row markers were cleared, "force_unclaimed" is not read
+      # here (see above), and the lifecycle rows are gone. That story stays backfillable,
+      # and the operator learns it here rather than from a silent no-op.
+      Logger.warning(
+        "lifecycle_retro_stamp_skipped: nothing showed this story was ever worked, so it " <>
+          "remains backfillable. If it WAS worked, its lifecycle audit rows have expired — " <>
+          "reject it (verified_status: :rejected) instead. story_id=#{story.id}"
+      )
+
       {:ok, story}
     end
   end
@@ -1849,6 +1867,20 @@ defmodule Loopctl.Progress do
   @spec lifecycle_stamp(Story.t() | map()) :: DateTime.t()
   def lifecycle_stamp(%{lifecycle_entered_at: %DateTime{} = existing}), do: existing
   def lifecycle_stamp(_story), do: DateTime.utc_now()
+
+  @doc """
+  The marker change for a reject auto-reset — EMPTY when there was no dispatch marker to
+  erase.
+
+  The stamp records that markers existed and were cleared. A story imported with
+  `initial_agent_status: "reported_done"` carries none, so rejecting it erases nothing,
+  and the marker is permanent and uncleanable: stamping it would refuse that story the
+  backfill it is entitled to for good, the moment a rejection is reversed. Same evidence
+  `retro_stamp_lifecycle/1` reads, on the PRE-reset struct.
+  """
+  @spec lifecycle_stamp_change(Story.t() | map()) :: map()
+  def lifecycle_stamp_change(%{assigned_agent_id: nil, implementer_dispatch_id: nil}), do: %{}
+  def lifecycle_stamp_change(story), do: %{lifecycle_entered_at: lifecycle_stamp(story)}
 
   defp apply_backfill_status(story, reason, evidence_url, pr_number) do
     now = DateTime.utc_now()
@@ -2579,16 +2611,22 @@ defmodule Loopctl.Progress do
 
   defp perform_auto_reset(story, old_story, tenant_id, orchestrator_agent_id) do
     changeset =
-      Ecto.Changeset.change(story, %{
-        agent_status: :pending,
-        assigned_agent_id: nil,
-        assigned_at: nil,
-        reported_done_at: nil,
+      Ecto.Changeset.change(
+        story,
         # The THIRD site that clears assigned_agent_id on a worked story. Only
         # `:story_rejected` in guard_backfillable/2 masks it today; stamp the durable
-        # marker here too so the backfill guard never depends on that coincidence.
-        lifecycle_entered_at: lifecycle_stamp(story)
-      })
+        # marker here too so the backfill guard never depends on that coincidence — but
+        # only when there was a marker to clear (see lifecycle_stamp_change/1).
+        Map.merge(
+          %{
+            agent_status: :pending,
+            assigned_agent_id: nil,
+            assigned_at: nil,
+            reported_done_at: nil
+          },
+          lifecycle_stamp_change(story)
+        )
+      )
 
     with {:ok, reset_story} <- AdminRepo.update(changeset),
          {:ok, _audit} <-
