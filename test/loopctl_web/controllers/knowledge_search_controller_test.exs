@@ -199,6 +199,28 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert body["meta"]["ann_iterative_scan"] == "applied"
     end
 
+    test "COMBINED mode carries the semantic half's iterative-scan disclosure", %{conn: conn} do
+      # Combined is the DEFAULT mode, and its meta is an explicit literal map — a field the
+      # semantic sub-search computes is dropped unless it is carried forward (the same
+      # reason `pool_capped` is). Undisclosed here means undisclosed on the path almost
+      # every caller uses.
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, [1.0 | List.duplicate(0.0, 1535)]}
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "anything", mode: "combined"})
+
+      body = json_response(conn, 200)
+      assert body["meta"]["search_mode"] == "combined"
+      assert body["meta"]["ann_iterative_scan"] == "applied"
+    end
+
     test "combined mode degrades to keyword-only when embedding fails, with real scores", %{
       conn: conn
     } do

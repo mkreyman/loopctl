@@ -25,11 +25,12 @@ defmodule Loopctl.VectorRecallDiagnostics do
 
   ## Reading the output
 
-  If section (a) lists rows for the tenant at the read's dimension with
-  `live_denorm=true` and a `published` status, hypothesis (a) is dead and the plan in
-  section (b) is where the row was lost. If section (a) is empty or the rows carry a
-  different `dim`/status, the read never had a candidate and no amount of ANN tuning is
-  relevant.
+  Read section (a)'s `at dim=` COUNT first — it is an unlimited `count()`, unlike the row
+  sample under it. Non-zero, with the sampled rows carrying `live_denorm=true` and a
+  `published` status, means hypothesis (a) is dead and the plan in section (b) is where the
+  row was lost. Zero means the read never had a candidate and no amount of ANN tuning is
+  relevant. Never make that call from the SAMPLE: it is capped, so an absent row there is
+  not an absent row.
 
   Two caveats that are part of the reading, not footnotes:
 
@@ -43,7 +44,8 @@ defmodule Loopctl.VectorRecallDiagnostics do
       / `hnsw.iterative_scan` with `SET LOCAL` inside its own transaction, which this
       diagnostic cannot see. The "session" line is the value OUTSIDE that transaction (a
       non-default there means a `SET LOCAL` leaked — the #535 mechanism); the "HeavyRead
-      would apply" line is what the read itself used.
+      would apply" line is what an ANN read issued with `HeavyRead.opts/1` uses — a bare
+      `HeavyRead.all/2` (the `:query` branch) uses none of it and is EXPLAINed accordingly.
   """
 
   import Ecto.Query
@@ -58,8 +60,12 @@ defmodule Loopctl.VectorRecallDiagnostics do
   alias Loopctl.LocalGuc
 
   # Enough rows to characterise a test tenant's corpus without turning a failure into a
-  # wall of text. These tests seed single digits of rows; a sample this size that is
-  # FULL is itself the signal that something seeded far more than expected.
+  # wall of text. It is a SAMPLE and routinely full — the ~two dozen materialized system
+  # rows alone reach it — so the counts printed beside it come from unlimited `count()`
+  # queries, never from `length(rows)`. (They once came from the sample, which made a
+  # tenant row that sorted past the cap read as "never visible" — the wrong branch of the
+  # (a)-vs-(b) split this module exists to decide.) The sample is ordered with the read's
+  # own `dim` FIRST for the same reason.
   @sample_limit 25
 
   # The diagnostic runs after a read already returned, so re-executing the same read-only
@@ -69,8 +75,11 @@ defmodule Loopctl.VectorRecallDiagnostics do
   @explain_timeout_ms 15_000
 
   # The GUCs `HeavyRead` sets per ANN read, re-applied around the EXPLAIN so the plan
-  # describes the read's execution rather than the session default's.
-  @read_gucs ["hnsw.ef_search", "hnsw.iterative_scan"]
+  # describes the read's execution rather than the session default's. `hnsw.max_scan_tuples`
+  # is here because `HeavyRead` sets it in the SAME breath as `hnsw.iterative_scan` — it is
+  # the ceiling that bounds the iterative walk, and leaving it at the session value would
+  # let the EXPLAIN walk further than the read could.
+  @read_gucs ["hnsw.ef_search", "hnsw.iterative_scan", "hnsw.max_scan_tuples"]
 
   @doc """
   Prints the (a)-visibility / (b)-plan diagnostic when `observed` is empty, and returns
@@ -163,13 +172,15 @@ defmodule Loopctl.VectorRecallDiagnostics do
   # AdminRepo (BYPASSRLS), no vector predicate, no dimension predicate, no join
   # condition that can drop a row. Anything absent here was never visible.
   defp visibility(tenant_id, dim) do
+    {total, at_dim} = tenant_counts(tenant_id, dim)
+
     rows =
       AdminRepo.all(
         from(ae in ArticleEmbedding,
           left_join: a in Article,
           on: a.id == ae.article_id,
           where: ae.tenant_id == ^tenant_id,
-          order_by: [asc: ae.dim, asc: ae.article_id],
+          order_by: [desc: fragment("? = ?", ae.dim, ^dim), asc: ae.dim, asc: ae.article_id],
           limit: @sample_limit,
           select: %{
             article_id: ae.article_id,
@@ -183,13 +194,24 @@ defmodule Loopctl.VectorRecallDiagnostics do
       )
 
     [
-      "  tenant rows: #{length(rows)} (sample capped at #{@sample_limit})",
-      "  at dim=#{dim}: #{Enum.count(rows, &(&1.dim == dim))}",
+      "  tenant rows: #{total} (COUNT — authoritative)",
+      "  at dim=#{dim}: #{at_dim} (COUNT — authoritative; ZERO here is hypothesis (a))",
       "  corpus-wide rows at dim=#{dim} (ALL tenants — how crowded the shared index is): " <>
-        "#{global_count(dim)}"
+        "#{global_count(dim)}",
+      "  sample below: #{length(rows)} of them, dim=#{dim} first, capped at #{@sample_limit}"
     ]
     |> Enum.map(&[&1, "\n"])
     |> Kernel.++(Enum.map(rows, &["    ", format_row(&1), "\n"]))
+  end
+
+  # Unlimited counts, so the (a)-vs-(b) call is never made on a truncated sample.
+  defp tenant_counts(tenant_id, dim) do
+    AdminRepo.one(
+      from(ae in ArticleEmbedding,
+        where: ae.tenant_id == ^tenant_id,
+        select: {count(), filter(count(), ae.dim == ^dim)}
+      )
+    )
   end
 
   defp format_row(row) do
@@ -228,7 +250,8 @@ defmodule Loopctl.VectorRecallDiagnostics do
   # state them next to the plan rather than leaving the reader to recompute them.
   defp pool_note(opts) do
     if Keyword.has_key?(opts, :query) do
-      "  (caller-supplied query)\n"
+      "  (caller-supplied query — EXPLAINed at SESSION defaults, no hnsw.* SET LOCAL, " <>
+        "because a bare HeavyRead.all/2 sets none either)\n"
     else
       limit = Keyword.get(opts, :limit, 10)
       offset = Keyword.get(opts, :offset, 0)
@@ -274,6 +297,17 @@ defmodule Loopctl.VectorRecallDiagnostics do
   # Routed through `Loopctl.LocalGuc` because a `SET LOCAL` leaks out of a committed
   # SAVEPOINT under the Sandbox (#535): without its capture/restore, a diagnostic would arm
   # these GUCs over the REST of the test it was added to explain.
+  # `:session_defaults` is NOT "no opinion" — it is the faithful reproduction of a read that
+  # set no GUC at all. A caller-supplied `:query` comes from an assertion on a bare
+  # `HeavyRead.all/2`, which carries no `hnsw_*` opts and therefore emits no `SET LOCAL`;
+  # arming ef_search/iterative_scan here would print a healthy plan for a read that ran
+  # without them, and iterative-scan-on-vs-off is exactly the difference between an ANN that
+  # under-returns past its first batch and one that does not.
+  defp with_read_gucs(:session_defaults, fun) do
+    {:ok, result} = AdminRepo.transaction(fn -> fun.() end)
+    result
+  end
+
   defp with_read_gucs(ef_search, fun) do
     {:ok, result} =
       AdminRepo.transaction(fn ->
@@ -295,6 +329,11 @@ defmodule Loopctl.VectorRecallDiagnostics do
       mode ->
         if HeavyRead.iterative_scan_supported?() do
           AdminRepo.query!("SET LOCAL hnsw.iterative_scan = #{mode}", [])
+
+          AdminRepo.query!(
+            "SET LOCAL hnsw.max_scan_tuples = #{HeavyRead.hnsw_max_scan_tuples()}",
+            []
+          )
         end
     end
 
@@ -304,7 +343,7 @@ defmodule Loopctl.VectorRecallDiagnostics do
   defp explain_query(tenant_id, opts) do
     case Keyword.get(opts, :query) do
       nil -> rebuilt_pool_query(tenant_id, opts)
-      query -> {query, HeavyRead.hnsw_ef_search()}
+      query -> {query, :session_defaults}
     end
   end
 

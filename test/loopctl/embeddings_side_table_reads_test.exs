@@ -10,13 +10,13 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   threaded into the search response `meta` (AC-41.1.7), and the re-embed
   coexistence + pending-dimension exclusion reporting (AC-41.1.10).
 
-  ## The `left: []` flake — MECHANISM ESTABLISHED, fix not yet landed. Read before touching.
+  ## The `left: []` flake — LEADING HYPOTHESIS, not proven, no fix landed. Read before touching.
 
   This file (and its siblings `system_config_read_path_test.exs`,
   `embeddings_review_fixes_test.exs`) intermittently fails with `left: []` — an
   assertion expecting article ids gets an empty list. It clears on re-run every time,
-  it moves between files and between tests within a file, and **no mechanism has been
-  established**. Four fixes have been aimed at it. It is still here.
+  it moves between files and between tests within a file, and four fixes have been aimed
+  at it. It is still here.
 
   What is actually known:
 
@@ -42,15 +42,18 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       showed the opposite: `iterative_scan="relaxed_order" (supported?=true)` — applied,
       not absent — and it under-returned anyway. Do not go looking for a failed
       capability probe.
-    * **What that capture DOES show is candidate starvation, on the numbers.** The plan
-      was the shared `article_embeddings_hnsw_dim_1536_idx` with `tenant_id` as a
-      post-ANN `Filter`, so the ANN picks its nearest N across EVERY tenant's rows and
-      discards the non-matching ones afterwards. The tenant had 24 embedding rows — 23
-      materialized system articles and exactly ONE `scope: :tenant` article, the row the
-      assertion wanted. The inner pool produced 20; the outer pool truncates to
-      `pool=5`. A single own-article competing against 23 system articles for 5 slots
-      does not reliably survive, and when it doesn't the assertion sees `[]`.
-    * **So the page size IS the right lever — and config disables it.** `limit:` is
+    * **What that capture DOES show is an HNSW plan with a post-ANN tenant `Filter` that
+      under-returned.** The plan was the shared `article_embeddings_hnsw_dim_1536_idx`, so
+      the ANN picks its nearest N across EVERY tenant's rows and discards the non-matching
+      ones afterwards; the inner pool produced 20 and the outer pool truncates to `pool=5`.
+      CANDIDATE STARVATION — the tenant's one `scope: :tenant` row losing all 5 slots to its
+      materialized system rows — fits those numbers and is the leading hypothesis, but is
+      NOT proven by them: the ~24-row corpus the diagnostic printed was captured AFTER the
+      read, and `search_semantic/3` materializes the system corpus as a side effect of
+      building its disclosure `meta`, so that count can be strictly larger than the set the
+      ANN actually scanned (the diagnostic says so itself). Let the next capture's
+      `Rows Removed by Filter` decide it.
+    * **So the page size is the lever that diagnosis points at — and config disables it.** `limit:` is
       clamped by `semantic_result_pool_cap` (5 in `config/test.exs`), so widening a page
       buys NOTHING while that cap stands. This is why four fixes and fourteen wide
       `limit:` annotations did not stop it: the diagnosis was right and the remedy was
@@ -63,8 +66,8 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
   So: do NOT ship a fifth speculative recall fix. `hnsw.ef_search`, exact-scan forcing,
   `hnsw.iterative_scan` and retry-on-empty have each been tried and each regressed
-  something else — and none of them was ever the lever, because the lever is the pool
-  cap. Collect the diagnostic below FIRST and let it name the branch.
+  something else — and none of them can be the lever while the pool cap clamps the page.
+  Collect the diagnostic below FIRST and let it name the branch.
 
   The remaining work is to raise `semantic_result_pool_cap` for this suite WITHOUT
   breaking the three tests that depend on the current value —
@@ -81,10 +84,12 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   result and dumps the two facts that a bare `left: []` cannot separate:
 
     * **(a) the row was not VISIBLE** to the read (tenant, `dim`, `live_denorm`, status),
-      printed as a direct `AdminRepo` sample of the tenant's candidate rows; versus
+      printed as unlimited `count()`s (decide on those, not on the capped row sample
+      beside them); versus
     * **(b) the row was visible and the PLAN did not return it**, printed as
       `EXPLAIN (ANALYZE, BUFFERS)` of the exact query that just came back empty, run
-      with the same `hnsw.*` GUCs `HeavyRead` applies.
+      with the `hnsw.*` GUCs that read itself ran with — which for an assertion on a bare
+      `HeavyRead.all/2` means none.
 
   Paste that output into the next investigation instead of another theory. The two
   numbers that decide it are the scan node's `actual ... rows=` and, on an HNSW plan,

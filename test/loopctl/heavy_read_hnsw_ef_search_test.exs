@@ -338,8 +338,30 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       degraded = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search))
 
       assert degraded.ann_iterative_scan == "unavailable"
-      assert degraded.ann_iterative_scan_reason =~ "hnsw.iterative_scan is enabled"
+      assert degraded.ann_iterative_scan_reason =~ "capability probe"
       assert degraded.ann_iterative_scan_reason =~ "may be missing from these results"
+      assert degraded.ann_iterative_scan_reason =~ "self-heals"
+
+      # A NON-ANN endpoint's opts never carry the state, and a read that cannot touch the
+      # HNSW index must not emit a degradation warning about it.
+      assert HeavyRead.iterative_scan_meta(HeavyRead.opts(:enumeration)) == %{}
+    end
+
+    test "a CONCLUSIVELY unsupported backend is not reported as a self-healing blip" do
+      # `false` from an inconclusive probe clears on the next window; `false` from a probe
+      # that ASKED and got pgvector < 0.8 (or no extension) stands until the extension is
+      # upgraded — the line `maybe_warn_unsupported/2` already draws in the log. Telling the
+      # caller to wait for a self-heal that will never come is a wrong operational answer.
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+      prime_last_conclusive(false)
+
+      unsupported = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search))
+
+      assert unsupported.ann_iterative_scan == "unavailable"
+      assert unsupported.ann_iterative_scan_reason =~ "does NOT support it"
+      assert unsupported.ann_iterative_scan_reason =~ "until the extension is upgraded"
+      refute unsupported.ann_iterative_scan_reason =~ "self-heals"
     end
 
     test "the LEGACY semantic response meta carries the disclosure, both states" do
@@ -397,6 +419,11 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     )
 
     on_exit(fn -> :persistent_term.erase(@probe_cache_key) end)
+  end
+
+  defp prime_last_conclusive(verdict) do
+    :persistent_term.put(@last_conclusive_key, {verdict, System.monotonic_time(:millisecond)})
+    on_exit(fn -> :persistent_term.erase(@last_conclusive_key) end)
   end
 
   defp prime_expired_iterative_scan_supported(verdict) do

@@ -8228,41 +8228,49 @@ defmodule Loopctl.Knowledge do
     {:ok,
      %{
        results: paginated.results,
-       meta: %{
-         # `total_count` = size of the full fused/deduplicated candidate set
-         # pre-pagination. When the (opt-in) graph lane is enabled it also counts the
-         # one-hop neighbors it contributed; with the lane OFF (the default) this is
-         # exactly the keyword ∪ semantic union, byte-for-byte as before.
-         total_count: length(sorted),
-         limit: paginated.limit,
-         offset: paginated.offset,
-         search_mode: "combined",
-         # Names what `total_count` counts so a client can size/interpret the pool.
-         # Default `merged_candidates`: the deduplicated UNION of a keyword and a
-         # semantic sub-search (each capped at 100, so up to ~200 with no overlap),
-         # NOT a corpus total or full match count. When the opt-in graph lane
-         # actually contributes one-hop neighbors, the count folds them in, so the
-         # scope becomes `merged_candidates_with_graph` — the documented
-         # `merged_candidates` invariant (keyword ∪ semantic only) still holds for
-         # its literal value (#470 review). Use list mode or knowledge_stats to size
-         # the corpus.
-         total_count_scope:
-           if(graph_results == [],
-             do: "merged_candidates",
-             else: "merged_candidates_with_graph"
-           ),
-         # Carry the semantic sub-search's relevance-pool truncation forward (US-27.7a)
-         # — combined is the DEFAULT mode, so silently dropping the flag would hide
-         # truncation on the most-used path. `maybe_put` keeps the key absent unless the
-         # semantic half was actually pool-capped.
-         pool_capped: Map.get(semantic_result.meta, :pool_capped, false),
-         # Observability for #297: how many rows the semantic half contributed. A
-         # `0` here with `fallback: false` is the "embed worked but recall is broken"
-         # signal (distinct from an embed-failure keyword_only fallback), so operators
-         # and clients can tell the two silent-degradation causes apart. The graph
-         # lane NEVER inflates this — it stays the semantic lane's own row count.
-         semantic_result_count: length(semantic_result.results)
-       }
+       meta:
+         %{
+           # `total_count` = size of the full fused/deduplicated candidate set
+           # pre-pagination. When the (opt-in) graph lane is enabled it also counts the
+           # one-hop neighbors it contributed; with the lane OFF (the default) this is
+           # exactly the keyword ∪ semantic union, byte-for-byte as before.
+           total_count: length(sorted),
+           limit: paginated.limit,
+           offset: paginated.offset,
+           search_mode: "combined",
+           # Names what `total_count` counts so a client can size/interpret the pool.
+           # Default `merged_candidates`: the deduplicated UNION of a keyword and a
+           # semantic sub-search (each capped at 100, so up to ~200 with no overlap),
+           # NOT a corpus total or full match count. When the opt-in graph lane
+           # actually contributes one-hop neighbors, the count folds them in, so the
+           # scope becomes `merged_candidates_with_graph` — the documented
+           # `merged_candidates` invariant (keyword ∪ semantic only) still holds for
+           # its literal value (#470 review). Use list mode or knowledge_stats to size
+           # the corpus.
+           total_count_scope:
+             if(graph_results == [],
+               do: "merged_candidates",
+               else: "merged_candidates_with_graph"
+             ),
+           # Carry the semantic sub-search's relevance-pool truncation forward (US-27.7a)
+           # — combined is the DEFAULT mode, so silently dropping the flag would hide
+           # truncation on the most-used path. `maybe_put` keeps the key absent unless the
+           # semantic half was actually pool-capped.
+           pool_capped: Map.get(semantic_result.meta, :pool_capped, false),
+           # Observability for #297: how many rows the semantic half contributed. A
+           # `0` here with `fallback: false` is the "embed worked but recall is broken"
+           # signal (distinct from an embed-failure keyword_only fallback), so operators
+           # and clients can tell the two silent-degradation causes apart. The graph
+           # lane NEVER inflates this — it stays the semantic lane's own row count.
+           semantic_result_count: length(semantic_result.results)
+         }
+         # Carried forward for the SAME reason as `pool_capped` above: combined is the
+         # DEFAULT mode, so a degraded vector read that is disclosed only on `mode=semantic`
+         # is undisclosed on the path almost every caller uses. Absent unless the semantic
+         # half emitted it (a keyword-only degrade has no vector read to describe).
+         |> Map.merge(
+           Map.take(semantic_result.meta, [:ann_iterative_scan, :ann_iterative_scan_reason])
+         )
      }}
   end
 

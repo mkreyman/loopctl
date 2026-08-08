@@ -9,14 +9,18 @@ All notable changes to loopctl are documented here.
 - **Semantic and combined search responses now disclose whether the vector read ran with
   `hnsw.iterative_scan`,** on a new `meta.ann_iterative_scan` (`off` | `applied` |
   `unavailable`) plus an `ann_iterative_scan_reason` alongside `unavailable` only. This
-  matters when an operator has enabled iterative scan (SystemConfig `hnsw_iterative_scan`):
-  the backend capability probe FAILS CLOSED on an inconclusive result — a pool-checkout
-  timeout, a DB restart — and the read then runs without it. Because the ANN applies
+  matters when an operator has enabled iterative scan (SystemConfig `hnsw_iterative_scan`)
+  and the read nonetheless runs without it — either because the backend capability probe was
+  inconclusive (a pool-checkout timeout, a DB restart) and FAILED CLOSED, or because the
+  connected pgvector conclusively does not support the setting (older than 0.8, or the
+  extension is absent). Because the ANN applies
   `tenant_id` as a residual filter after the index returns its batch, such a read may
   under-return, and until now nothing in the response said so; a short result set was
   indistinguishable from an empty corpus. The read behaviour is UNCHANGED and failing closed
-  remains correct — this only tells the caller, and the state self-heals on the next
-  conclusive probe (worst case roughly a minute per node). Treat `unavailable` like
+  remains correct — this only tells the caller. The `reason` names WHICH cause, because the
+  response differs: an inconclusive probe self-heals on the next conclusive one (worst case
+  roughly a minute per node), an unsupported pgvector stands until the extension is
+  upgraded. Treat `unavailable` like
   `pool_capped: true`. **This state has not been observed in production;** it is a disclosed
   code path, not a reported incident. Instances at the shipped default (`off`) see
   `ann_iterative_scan: "off"` and are otherwise unaffected.
