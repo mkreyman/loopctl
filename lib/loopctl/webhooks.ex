@@ -67,12 +67,15 @@ defmodule Loopctl.Webhooks do
       raw_secret = generate_signing_secret()
 
       base = %Webhook{tenant_id: tenant_id, signing_secret_encrypted: raw_secret}
+      changeset = Webhook.create_changeset(base, attrs)
+
+      prewarm_destination(tenant_id, changeset)
 
       multi =
         Multi.new()
         |> lock_egress_config(tenant_id)
         |> Multi.run(:changeset, fn _repo, _changes ->
-          validated_changeset(Webhook.create_changeset(base, attrs), tenant_id)
+          validated_changeset(changeset, tenant_id)
         end)
         |> Multi.insert(:webhook, & &1.changeset)
         |> Audit.log_in_multi(:audit, fn %{webhook: webhook} ->
@@ -236,11 +239,15 @@ defmodule Loopctl.Webhooks do
         "active" => webhook.active
       }
 
+      changeset = Webhook.update_changeset(webhook, attrs)
+
+      prewarm_destination(tenant_id, changeset)
+
       multi =
         Multi.new()
         |> lock_egress_config(tenant_id)
         |> Multi.run(:changeset, fn _repo, _changes ->
-          validated_changeset(Webhook.update_changeset(webhook, attrs), tenant_id)
+          validated_changeset(changeset, tenant_id)
         end)
         |> Multi.update(:webhook, & &1.changeset)
         |> Audit.log_in_multi(:audit, fn %{webhook: updated} ->
@@ -517,16 +524,73 @@ defmodule Loopctl.Webhooks do
     end)
   end
 
+  # Resolves and classifies the destination BEFORE the transaction opens, so the
+  # config-time check inside the lock reads the pin cache instead of waiting on a
+  # resolver (issue #624).
+  #
+  # WHAT THE IN-TRANSACTION PLACEMENT PROTECTS IS UNCHANGED. The race
+  # `lock_egress_config/2` closes is between this write and a concurrent
+  # `Egress.enable_local_only/3`: the thing that must be read inside the lock is
+  # the tenant's MARKING, so that one of the two writers always observes the
+  # other's committed state. The DESTINATION's address classification races
+  # nothing — it is a property of the host, not of tenant configuration — so
+  # hoisting it out costs no correctness. `validate_destination_locality/2` still
+  # runs inside the lock and still makes the whole decision there; this only
+  # arranges for its expensive half to be already done.
+  #
+  # It is a WARM, not a precondition: nothing depends on the entry still being
+  # cached. An invalidation between the two points simply means the resolve
+  # happens inside the lock as before.
+  #
+  # Why it matters: `AdminRepo` runs on a 3-connection pool
+  # (`config/runtime.exs:190`), and `UrlGuard`'s resolver spends up to 3s per
+  # family on a host that does not answer. Holding one of three BYPASSRLS
+  # connections for that long — on a tenant-supplied hostname — puts the egress
+  # guard's own marking lookups behind an attacker-influenced delay.
+  #
+  # The SCOPE is checked first. `validate_project_ownership/2` rejects a foreign
+  # (or nonexistent) `project_id` inside the transaction, and warming ahead of it
+  # would let every such rejected request spend a resolver round-trip — up to 3s
+  # per family — and leave a PinCache entry under a scope key no later read can
+  # ever use. Those entries count against the cache's single global cap, so an
+  # authenticated tenant could pressure every other tenant's classification cache
+  # with requests that never succeed.
+  #
+  # For an OWNED scope the warm adds no residency of its own: the in-transaction
+  # `validate_destination_locality/2` classifies the same destination under the
+  # same key, so the entry exists either way. The remaining pressure — one entry
+  # per distinct hostname a tenant PATCHes, which `check_webhook_limit/2` does not
+  # bound because no subscription is created — is a property of that check, not of
+  # the warm, and its bound belongs in `Loopctl.Egress.PinCache` (a per-tenant
+  # residency cap), not here.
+  defp prewarm_destination(tenant_id, changeset) do
+    if changeset.valid? and egress_decision_changed?(changeset) and
+         owned_scope?(tenant_id, changeset) do
+      url = Ecto.Changeset.get_field(changeset, :url)
+      project_id = Ecto.Changeset.get_field(changeset, :project_id)
+
+      Egress.prewarm_webhook_destination(Scope.new(tenant_id, project_id), url)
+    end
+
+    :ok
+  end
+
+  defp owned_scope?(tenant_id, changeset) do
+    case Ecto.Changeset.get_field(changeset, :project_id) do
+      nil -> true
+      project_id -> project_of_tenant?(tenant_id, project_id)
+    end
+  end
+
   # The two DB-dependent validations, in the order their errors should surface:
   # a `project_id` that is not this tenant's makes the egress SCOPE meaningless,
   # so it is settled before the destination is classified under that scope.
   #
   # Returns an `{:ok, changeset}` / `{:error, changeset}` pair because it runs as
-  # a `Multi.run/3` step INSIDE the locked transaction (the classification would
-  # otherwise race the marking write). The DNS cost of a cache-missing
-  # classification is therefore paid while an `AdminRepo` connection is held —
-  # accepted deliberately: webhook writes are rare and capped by `max_webhooks`,
-  # and correctness of the config-time gate is the point of the story.
+  # a `Multi.run/3` step INSIDE the locked transaction — the DECISION must see the
+  # marking under the lock. Its expensive half (resolve + classify) is warmed
+  # before the transaction opens by `prewarm_destination/2`, so the connection is
+  # normally held only for the cache read.
   defp validated_changeset(changeset, tenant_id) do
     validated =
       changeset

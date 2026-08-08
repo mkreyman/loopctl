@@ -4,6 +4,7 @@ defmodule Loopctl.Workers.WebhookDeliveryWorkerTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Webhooks.Signing
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.Workers.WebhookDeliveryWorker
@@ -169,9 +170,44 @@ defmodule Loopctl.Workers.WebhookDeliveryWorkerTest do
 
       assert header_map["x-webhook-id"] == event.id
       assert is_binary(header_map["x-webhook-timestamp"])
+      assert String.starts_with?(header_map["x-webhook-signature"], "t=")
+      # The legacy header keeps going out for the deprecation window.
       assert String.starts_with?(header_map["x-signature-256"], "sha256=")
       assert header_map["user-agent"] == "Loopctl-Webhook/1.0"
       assert header_map["content-type"] == "application/json"
+    end
+
+    # A receiver's replay defence needs BOTH: the `t=` inside the MAC bounds how
+    # long the signature is worth honouring, and `x-webhook-id` keys the cache
+    # that stops reuse inside that window.
+    test "the v1 signature verifies against the delivered body and dates it" do
+      %{tenant: tenant, webhook: webhook, event: event} = create_test_event()
+      test_pid = self()
+
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_data, conn.req_headers, body})
+        Req.Test.json(conn, %{"ok" => true})
+      end)
+
+      assert :ok = WebhookDeliveryWorker.perform(build_job(event, tenant))
+
+      assert_receive {:request_data, headers, body}
+      header_map = Map.new(headers)
+      secret = AdminRepo.get!(Webhook, webhook.id).signing_secret_encrypted
+      signature = header_map["x-webhook-signature"]
+
+      assert :ok = Signing.verify(signature, body, secret)
+
+      # The signed timestamp is the one the convenience header carries.
+      assert {:ok, timestamp, _mac} = Signing.parse(signature)
+      assert to_string(timestamp) == header_map["x-webhook-timestamp"]
+
+      # Replayed past the tolerance window, the same genuine pair is refused.
+      stale_at = timestamp + Signing.tolerance_seconds() + 1
+
+      assert {:error, :timestamp_out_of_tolerance} =
+               Signing.verify(signature, body, secret, now: stale_at)
     end
 
     test "signature is valid HMAC-SHA256" do

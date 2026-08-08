@@ -141,13 +141,13 @@ defmodule Loopctl.Webhooks.ReqDeliveryTest do
   end
 
   describe "the operator allowlist is the ONLY carve-out for a private destination" do
-    test "an allowlisted loopback destination becomes deliverable — it was not before",
+    test "a WEBHOOK-granting allowlist entry makes a loopback destination deliverable",
          %{scope: scope} do
       Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
         Req.Test.json(conn, %{"ok" => true})
       end)
 
-      with_allowlist(["127.0.0.1"], fn ->
+      with_allowlist(["127.0.0.1@webhook"], fn ->
         assert {:ok, %{status: 200}} =
                  ReqDelivery.deliver("http://127.0.0.1:9000/hooks", "{}", [], scope)
       end)
@@ -156,6 +156,111 @@ defmodule Loopctl.Webhooks.ReqDeliveryTest do
     test "the SAME private host WITHOUT an allowlist entry is still refused", %{scope: scope} do
       assert {:refused, {:egress_blocked, %{verdict: :denylisted}}} =
                ReqDelivery.deliver("http://127.0.0.1:9000/hooks", "{}", [], scope)
+    end
+
+    # A carve-out is the operator saying WHAT the deployment reaches this host FOR.
+    # An entry made for the deployment's model endpoint must not also make that
+    # host a destination for tenant-authored payloads: the URL here is written by
+    # a tenant, the entry was written by the operator, and they were answering
+    # different questions.
+    test "an INFERENCE-only entry does not make the host a webhook destination",
+         %{scope: scope} do
+      with_allowlist(["127.0.0.1@inference"], fn ->
+        assert {:refused, {:egress_blocked, %{verdict: :denylisted}}} =
+                 ReqDelivery.deliver("http://127.0.0.1:9000/hooks", "{}", [], scope)
+      end)
+    end
+
+    # An UNQUALIFIED entry is inference-only, so it behaves like the case above.
+    test "an UNQUALIFIED entry does not make the host a webhook destination",
+         %{scope: scope} do
+      with_allowlist(["127.0.0.1"], fn ->
+        assert {:refused, {:egress_blocked, %{verdict: :denylisted}}} =
+                 ReqDelivery.deliver("http://127.0.0.1:9000/hooks", "{}", [], scope)
+      end)
+    end
+
+    # The carve-out is bound to what the operator wrote: naming a port grants
+    # THAT port, not the host.
+    test "a port-bound entry does not deliver to a different port on the same host",
+         %{scope: scope} do
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
+        Req.Test.json(conn, %{"ok" => true})
+      end)
+
+      with_allowlist(["127.0.0.1:9000@webhook"], fn ->
+        assert {:ok, %{status: 200}} =
+                 ReqDelivery.deliver("http://127.0.0.1:9000/hooks", "{}", [], scope)
+
+        assert {:refused, {:egress_blocked, %{verdict: :denylisted}}} =
+                 ReqDelivery.deliver("http://127.0.0.1:9001/hooks", "{}", [], scope)
+      end)
+    end
+  end
+
+  describe "a failed delivery describes the failure, not the response" do
+    test "the stored error carries the status and content-type, never the body",
+         %{scope: scope} do
+      secret = "s3cr3t-token-from-an-internal-service"
+
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/plain")
+        |> Plug.Conn.send_resp(403, secret)
+      end)
+
+      assert {:error, message} =
+               ReqDelivery.deliver("https://93.184.216.34/hooks", "{}", [], scope)
+
+      assert message =~ "403"
+      assert message =~ "text/plain"
+      refute message =~ secret
+    end
+
+    # The header VALUE is chosen by the destination too. The error string is
+    # persisted and read back through the deliveries API, so an unbounded copy
+    # would let a hostile receiver inflate that column at will.
+    test "a hostile content-type is TRUNCATED, not stored whole", %{scope: scope} do
+      padding = String.duplicate("a", 4_000)
+
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("content-type", "application/#{padding}")
+        |> Plug.Conn.send_resp(500, "")
+      end)
+
+      assert {:error, message} =
+               ReqDelivery.deliver("https://93.184.216.34/hooks", "{}", [], scope)
+
+      assert message =~ "500"
+      assert String.length(message) < 200
+    end
+
+    # REGRESSION (review): the bound was applied to the content-type fragment
+    # only, while the sibling transport/exception branches build their string from
+    # `inspect/1` of a peer-influenced term and write the SAME persisted column
+    # through the same deliveries API.
+    test "a destination-shaped transport failure is bounded too", %{scope: scope} do
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
+        Req.Test.transport_error(conn, {:bad_alpn_protocol, String.duplicate("z", 4_000)})
+      end)
+
+      assert {:error, message} =
+               ReqDelivery.deliver("https://93.184.216.34/hooks", "{}", [], scope)
+
+      assert message =~ "connection_error"
+      assert String.length(message) < 400
+    end
+
+    test "a body-less failure still reports the status", %{scope: scope} do
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
+        Plug.Conn.send_resp(conn, 500, "")
+      end)
+
+      assert {:error, message} =
+               ReqDelivery.deliver("https://93.184.216.34/hooks", "{}", [], scope)
+
+      assert message =~ "500"
     end
   end
 end

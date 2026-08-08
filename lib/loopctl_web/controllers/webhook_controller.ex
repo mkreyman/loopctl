@@ -23,7 +23,25 @@ defmodule LoopctlWeb.WebhookController do
 
   operation(:create,
     summary: "Create webhook",
-    description: "Creates a new webhook subscription. Returns the signing secret once.",
+    description: """
+    Creates a new webhook subscription. Returns the signing secret once.
+
+    The destination is vetted here rather than only at delivery time, so a URL
+    that could not be delivered to is a `422` on this call instead of a
+    subscription that silently never fires. A private, loopback, CGNAT,
+    link-local or ULA destination is refused unless the OPERATOR deployment
+    allowlist carves it out FOR WEBHOOK DELIVERY specifically (and, when the
+    carve-out states a port, on that port) — a carve-out made for the
+    deployment's model endpoint does not cover webhook delivery, and a tenant
+    declaration cannot carve anything out of the denylist at all. The `422`
+    message names which of those the destination is missing.
+
+    Deliveries are signed with `X-Webhook-Signature: t=<unix>,v1=<hmac_sha256>`
+    over `"<t>.<raw_body>"`; reject a delivery whose `t` is more than 5 minutes
+    from your clock, and key a replay cache on `X-Webhook-Id`. The legacy
+    body-only `X-Signature-256` header is still sent during its deprecation
+    window.
+    """,
     request_body: {"Webhook params", "application/json", Schemas.WebhookCreateRequest},
     responses: %{
       201 => {"Webhook created", "application/json", Schemas.WebhookResponse},
@@ -55,7 +73,15 @@ defmodule LoopctlWeb.WebhookController do
 
   operation(:update,
     summary: "Update webhook",
-    description: "Updates a webhook subscription.",
+    description: """
+    Updates a webhook subscription.
+
+    An edit that changes the effective egress decision — the `url`, the
+    `project_id` it is delivered under, or a re-activation — is re-vetted exactly
+    as `create` is, and can therefore return `422`. An edit that touches neither
+    (e.g. `events`, or deactivating) is not, so a subscription that predates a
+    configuration change stays editable.
+    """,
     parameters: [id: [in: :path, type: :string, description: "Webhook UUID"]],
     request_body:
       {"Update params", "application/json",
@@ -83,7 +109,15 @@ defmodule LoopctlWeb.WebhookController do
 
   operation(:deliveries,
     summary: "List webhook deliveries",
-    description: "Lists recent delivery attempts for a webhook.",
+    description: """
+    Lists recent delivery attempts for a webhook.
+
+    A failed attempt's `error` describes the FAILURE, not the response: for an
+    HTTP failure it carries the status code and the response `content-type`, and
+    it never reproduces the destination's response body. Debug a failing receiver
+    from the receiver's own logs; the status and content-type identify which
+    attempt to look for.
+    """,
     parameters: [
       id: [in: :path, type: :string, description: "Webhook UUID"],
       page: [in: :query, type: :integer, description: "Page number"],
