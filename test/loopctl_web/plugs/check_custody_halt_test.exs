@@ -4,11 +4,17 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
   ResolveApiKey (`current_tenant` assign) instead of issuing a redundant
   AdminRepo SELECT via `Tenants.get_tenant/1`.
 
-  Covers: a custody-halted tenant is still blocked (503 tenant_halted), a
-  non-halted tenant still passes, per-tenant isolation drives the decision from
-  each request's own loaded tenant, and (telemetry proof) the redundant
-  `tenants` SELECT is gone — a halted request issues exactly ONE query against
-  the `tenants` source (the ResolveApiKey preload), not two.
+  Covers: a custody-halted tenant is blocked on the CUSTODY SURFACE (503
+  tenant_halted), a non-halted tenant still passes, per-tenant isolation drives
+  the decision from each request's own loaded tenant, and (telemetry proof) the
+  redundant `tenants` SELECT is gone — a halted request issues exactly ONE query
+  against the `tenants` source (the ResolveApiKey preload), not two.
+
+  Also covers the SCOPE of the halt: a halted tenant keeps its reads and its
+  non-custody writes. The halt exists to stop custody progress, not to deny a
+  tenant the surfaces it needs to investigate the halt.
+  `LoopctlWeb.CustodySurface` is the authoritative classification and
+  `test/loopctl_web/custody_surface_test.exs` binds it to the router.
 
   Async: every path routes through `Loopctl.AdminRepo`, so all queries share the
   one sandbox connection the fixtures insert through.
@@ -19,6 +25,20 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
   alias LoopctlWeb.Plugs.CheckCustodyHalt
 
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
+
+  # A custody-surface request: this is the class a halt suspends. The plug runs in
+  # the router pipeline, so it answers before the controller (and before any role
+  # gate), which is why an arbitrary story id is enough.
+  defp custody_path, do: "/api/v1/stories/#{Ecto.UUID.generate()}/report"
+
+  # Shapes a bare conn as a custody-surface request for the direct `call/2` tests.
+  defp as_custody_request(conn) do
+    %{
+      conn
+      | method: "POST",
+        path_info: custody_path() |> String.trim_leading("/") |> String.split("/")
+    }
+  end
 
   # Attaches a `tenants`-SELECT probe SCOPED to one tenant_id so it never catches
   # parallel async tests' queries (the handler is attached VM-globally). Sends
@@ -53,7 +73,7 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
   end
 
   describe "custody halt enforcement (US-33.2)" do
-    test "TC-33.2.1: a custody-halted tenant's request is blocked (503 tenant_halted)", %{
+    test "TC-33.2.1: a custody-halted tenant's CUSTODY request is blocked (503 tenant_halted)", %{
       conn: conn
     } do
       tenant = fixture(:tenant)
@@ -63,20 +83,23 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
       body =
         conn
         |> auth(raw)
-        |> get(~p"/api/v1/memory")
+        |> post(custody_path(), %{})
         |> json_response(503)
 
       assert body["error"]["code"] == "tenant_halted"
+      assert body["error"]["scope"] == "custody_operations_only"
     end
 
     test "TC-33.2.2: a non-halted tenant's request proceeds normally (non-503)", %{conn: conn} do
       tenant = fixture(:tenant)
       raw = agent_key(tenant.id)
 
-      conn
-      |> auth(raw)
-      |> get(~p"/api/v1/memory")
-      |> json_response(200)
+      result =
+        conn
+        |> auth(raw)
+        |> post(custody_path(), %{})
+
+      refute result.status == 503
     end
 
     test "TC-33.2.3: tenant isolation — tenant A halted is blocked, tenant B passes", %{
@@ -91,15 +114,17 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
       blocked =
         conn
         |> auth(raw_a)
-        |> get(~p"/api/v1/memory")
+        |> post(custody_path(), %{})
         |> json_response(503)
 
       assert blocked["error"]["code"] == "tenant_halted"
 
-      base_conn()
-      |> auth(raw_b)
-      |> get(~p"/api/v1/memory")
-      |> json_response(200)
+      result =
+        base_conn()
+        |> auth(raw_b)
+        |> post(custody_path(), %{})
+
+      refute result.status == 503
     end
 
     test "TC-33.2.4: no redundant tenants SELECT — halted request queries tenants exactly once",
@@ -133,7 +158,7 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
         body =
           conn
           |> auth(raw)
-          |> get(~p"/api/v1/memory")
+          |> post(custody_path(), %{})
           |> json_response(503)
 
         assert body["error"]["code"] == "tenant_halted"
@@ -168,6 +193,7 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
 
       result =
         conn
+        |> as_custody_request()
         |> assign(:current_api_key, api_key)
         |> CheckCustodyHalt.call([])
 
@@ -188,6 +214,7 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
 
       result =
         conn
+        |> as_custody_request()
         |> assign(:current_api_key, api_key)
         |> CheckCustodyHalt.call([])
 
@@ -205,6 +232,7 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
 
       result =
         conn
+        |> as_custody_request()
         |> assign(:current_api_key, api_key)
         |> assign(:current_tenant, nil)
         |> CheckCustodyHalt.call([])
@@ -213,6 +241,62 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
       refute result.halted
       assert is_nil(result.status)
       assert is_nil(result.resp_body)
+    end
+  end
+
+  # The halt SCOPE. A halted tenant is not offline — it loses custody progress and
+  # keeps everything it needs to work out why it was halted.
+  describe "halt scope — a halt suspends custody operations, not the whole API" do
+    test "a halted tenant keeps its reads", %{conn: conn} do
+      tenant = fixture(:tenant)
+      raw = agent_key(tenant.id)
+      {:ok, _} = Loopctl.Tenants.halt_custody(tenant.id)
+
+      # A halted tenant that cannot read its own memory, audit log or change feed
+      # has lost the surfaces an operator investigates a halt with, for no
+      # security gain — a read advances no custody chain.
+      conn
+      |> auth(raw)
+      |> get(~p"/api/v1/memory")
+      |> json_response(200)
+
+      for path <- ["/api/v1/audit", "/api/v1/changes"] do
+        result = base_conn() |> auth(raw) |> get(path)
+
+        refute result.status == 503,
+               "#{path} must stay readable during a custody halt"
+      end
+    end
+
+    test "a halted tenant keeps NON-custody writes (knowledge-wiki curation)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      raw = agent_key(tenant.id)
+      {:ok, _} = Loopctl.Tenants.halt_custody(tenant.id)
+
+      result =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          "title" => "halted tenant note",
+          "content" => "curation is not custody progress",
+          "category" => "finding"
+        })
+
+      refute result.status == 503
+    end
+
+    test "a halted tenant STILL loses its memory writes (AC-28.3.3)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      raw = agent_key(tenant.id)
+      {:ok, _} = Loopctl.Tenants.halt_custody(tenant.id)
+
+      body =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory", %{"tier" => "long_term", "text" => "should not persist"})
+        |> json_response(503)
+
+      assert body["error"]["code"] == "tenant_halted"
     end
   end
 

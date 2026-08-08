@@ -10,6 +10,8 @@ defmodule Loopctl.Dispatches do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
@@ -17,6 +19,7 @@ defmodule Loopctl.Dispatches do
   alias Loopctl.Custody.SignedProfile
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.HeavyRead
+  alias Loopctl.TenantKeys
   alias Loopctl.Tenants
 
   @max_expires_seconds 14_400
@@ -26,6 +29,11 @@ defmodule Loopctl.Dispatches do
   # selection never degrades into an unbounded fetch as ephemeral dispatches
   # accumulate with agent fan-out.
   @verifier_pool_limit 500
+
+  # Domain-separation label for the verifier-selection PRF (see `verifier_seed/2`).
+  # Versioned so a future change to what the seed binds is a new label rather than a
+  # silent reinterpretation of the same key.
+  @verifier_seed_domain "loopctl/verifier-selection/v1|"
 
   @doc """
   Creates a new dispatch with an ephemeral API key.
@@ -582,6 +590,14 @@ defmodule Loopctl.Dispatches do
   dispatch descended from the same root dispatch shares element 0, which is what
   "same lineage" means for custody separation. An empty lineage on either side is
   never a match.
+
+  This is the STRICTER of the two comparisons, and it applies where separation can be
+  guaranteed BY CONSTRUCTION rather than demanded of an arbitrary caller:
+  `select_verifier/3`'s `reject_same_root/2`, which declines to pick a verifier under
+  the implementer's root, and `Progress.verify_lineage_separated/4`, which compares the
+  verifier dispatch that selection RECORDED. Every CALLER comparison — report,
+  review-complete and verify alike — uses `lineage_same_chain?/2`; read the note there
+  for why demanding a separate root of the caller locks a single-root tenant out.
   """
   @spec lineage_shares_prefix?(list(), list()) :: boolean()
   def lineage_shares_prefix?([], _), do: false
@@ -591,13 +607,60 @@ defmodule Loopctl.Dispatches do
   def lineage_shares_prefix?(_, _), do: false
 
   @doc """
+  True when the two dispatches lie on ONE root-to-leaf chain — identical, or one
+  an ancestor of the other. Siblings are NOT a match.
+
+  ## Why every CALLER comparison needs this
+
+  The documented dispatch tree puts the implementer and the reviewer side by side
+  under one orchestrator, and roots everything at a single operator dispatch:
+
+      root (operator, WebAuthn)
+      └── orchestrator dispatch
+          ├── implementer dispatch
+          └── reviewer dispatch
+
+  Under `lineage_shares_prefix?/2` every pair of dispatches in such a tenant
+  matches, so the reviewer counts as the implementer and can never report. That
+  was invisible until #621 began recording `implementer_dispatch_id` on the HTTP
+  path, which is what made the comparison run at all.
+
+  This test expresses what the report gate actually needs — *you may not report
+  work done by yourself, by something you dispatched, or by something that
+  dispatched you*:
+
+    * identical lineage (the same dispatch) — blocked;
+    * `[r, o]` vs `[r, o, i]` (an orchestrator and the implementer it dispatched)
+      — blocked, so a parent cannot rubber-stamp its own sub-agent;
+    * `[r, o, i]` vs `[r, o, v]` (two siblings) — allowed: separate dispatches,
+      separate ephemeral keys, separate `agent_id`s.
+
+  VERIFY's CALLER comparison uses this too. Demanding a separate ROOT of the
+  caller made verify unreachable in the tree drawn above — every dispatch-minted
+  key shares the one root, so a single-root tenant had no principal that could
+  certify anything. The stricter `lineage_shares_prefix?/2` still governs where
+  selection can satisfy it by construction: `select_verifier/3` will not nominate
+  a same-root verifier, and the RECORDED verifier is compared at root distance.
+
+  Self-approval is not relaxed either way — the `assigned_agent_id` equality
+  check runs IN ADDITION at every gate, and an empty lineage is never a match.
+  """
+  @spec lineage_same_chain?(list(), list()) :: boolean()
+  def lineage_same_chain?([], _), do: false
+  def lineage_same_chain?(_, []), do: false
+
+  def lineage_same_chain?(a, b) do
+    List.starts_with?(a, b) or List.starts_with?(b, a)
+  end
+
+  @doc """
   Selects a verifier dispatch from the eligible pool for a story.
 
   Eligible dispatches: active, non-expired, non-revoked, in the same tenant,
-  whose lineage does NOT share a prefix with the implementer's lineage.
+  whose lineage does NOT share a ROOT with the implementer's lineage.
 
-  Selection is deterministic but unpredictable to the orchestrator:
-  seeded with sha256(tenant_audit_public_key + story_id).
+  Selection is deterministic but unpredictable to the caller: the index is drawn
+  from an HMAC keyed by the tenant's audit signing PRIVATE key (`verifier_seed/2`).
 
   SCALE: the same-lineage rejection is pushed into SQL (compare lineage ROOTS,
   `lineage_path[1]`) and the candidate pool is capped at `@verifier_pool_limit`,
@@ -606,50 +669,127 @@ defmodule Loopctl.Dispatches do
   pool. The Elixir `Enum.reject` is kept as a belt-and-braces filter for the rows
   the SQL predicate cannot express (e.g. a NULL/empty lineage_path).
 
-  Returns `{:ok, dispatch}` or `{:error, :no_eligible_verifier}`.
+  Returns `{:ok, dispatch}` or:
+
+    * `{:error, :no_independent_root}` — the tenant HAS active dispatches, but every
+      one of them descends from the implementer's root. Only the operator key may
+      start a tree (`LoopctlWeb.DispatchController`'s lineage ceiling), so a tenant
+      that minted ONE root has no principal that can verify: `verify_story/4`
+      root-separation 409s every dispatch-minted caller. That is L4 working, not a
+      pool miss — it is reported separately so `verifier_needed` names the actual
+      remedy (have the operator mint an independently-rooted verifier tree) instead
+      of looking like a transient shortage.
+    * `{:error, :no_eligible_verifier}` — no active candidate dispatches at all.
+    * `{:error, :verifier_seed_unavailable}` — no server-side seed secret can be read
+      (see `verifier_seed/2` — that case fails CLOSED rather than selecting).
   """
   @spec select_verifier(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
-          {:ok, Dispatch.t()} | {:error, :no_eligible_verifier}
+          {:ok, Dispatch.t()}
+          | {:error, :no_eligible_verifier | :no_independent_root | :verifier_seed_unavailable}
   def select_verifier(tenant_id, story_id, implementer_lineage) do
-    now = DateTime.utc_now()
+    case verifier_pool(tenant_id, implementer_lineage) do
+      {:error, reason} ->
+        {:error, reason}
 
-    candidates =
-      from(d in Dispatch,
-        where:
-          d.tenant_id == ^tenant_id and
-            is_nil(d.revoked_at) and
-            d.expires_at > ^now and
-            d.role in [:orchestrator, :agent],
-        order_by: [asc: d.created_at],
-        limit: @verifier_pool_limit
-      )
-      |> reject_same_root(implementer_lineage)
-      |> AdminRepo.all()
-      |> Enum.reject(fn d -> lineage_shares_prefix?(d.lineage_path, implementer_lineage) end)
+      {:ok, pool} ->
+        case verifier_seed(tenant_id, story_id) do
+          {:ok, <<index_seed::unsigned-64, _rest::binary>>} ->
+            {:ok, Enum.at(pool, rem(index_seed, length(pool)))}
 
-    case candidates do
-      [] ->
-        {:error, :no_eligible_verifier}
-
-      pool ->
-        # Deterministic selection: hash(tenant_pub_key || story_id) → index
-        pub_key =
-          from(t in Loopctl.Tenants.Tenant,
-            where: t.id == ^tenant_id,
-            select: t.audit_signing_public_key
-          )
-          |> AdminRepo.one()
-
-        seed_data = (pub_key || "") <> story_id
-        hash = :crypto.hash(:sha256, seed_data)
-        <<index_seed::unsigned-64, _rest::binary>> = hash
-        selected = Enum.at(pool, rem(index_seed, length(pool)))
-
-        {:ok, selected}
+          :error ->
+            {:error, :verifier_seed_unavailable}
+        end
     end
   end
 
   # --- Private ---
+
+  # An empty pool has two causes with DIFFERENT remedies, and reporting both as
+  # `:no_eligible_verifier` hid the one an operator has to act on: "wait for a
+  # dispatch" versus "mint an independently-rooted verifier tree". Distinguish them
+  # with one extra COUNT, paid only when the pool came back empty.
+  defp verifier_pool(tenant_id, implementer_lineage) do
+    case candidate_query(tenant_id)
+         |> reject_same_root(implementer_lineage)
+         |> AdminRepo.all()
+         |> Enum.reject(&lineage_shares_prefix?(&1.lineage_path, implementer_lineage)) do
+      [] ->
+        any_candidate? =
+          candidate_query(tenant_id)
+          |> exclude(:order_by)
+          |> exclude(:limit)
+          |> AdminRepo.exists?()
+
+        if any_candidate?,
+          do: {:error, :no_independent_root},
+          else: {:error, :no_eligible_verifier}
+
+      pool ->
+        {:ok, pool}
+    end
+  end
+
+  defp candidate_query(tenant_id) do
+    now = DateTime.utc_now()
+
+    from(d in Dispatch,
+      where:
+        d.tenant_id == ^tenant_id and
+          is_nil(d.revoked_at) and
+          d.expires_at > ^now and
+          d.role in [:orchestrator, :agent],
+      order_by: [asc: d.created_at],
+      limit: @verifier_pool_limit
+    )
+  end
+
+  # The selection index MUST NOT be derivable by the principals it selects between.
+  # The candidate pool is enumerable by any agent key (GET /api/v1/dispatches), so
+  # everything except the seed key is already known to a caller; the seed is the
+  # only secret standing between "deterministic" and "predictable". It is therefore
+  # keyed by the tenant's audit signing PRIVATE key — held in the secret store and
+  # reachable only server-side (`TenantKeys`, ETS-cached) — never by the audit
+  # signing PUBLIC key, which is served unauthenticated on the discovery endpoint.
+  #
+  # Domain-separated and bound to (tenant, story) so a seed can serve no other
+  # purpose and cannot be carried between stories or tenants.
+  #
+  # FAILS CLOSED. A tenant with no audit key (pre-v2) or an unreachable secret store
+  # yields no seed, and there is no public value to fall back to that would not
+  # reinstate predictability — so no verifier is selected and the caller flags the
+  # story instead (see `Progress.assign_rotating_verifier/3`). Selecting with a
+  # guessable seed would be worse than selecting nobody: the verify gate still
+  # enforces lineage separation either way.
+  defp verifier_seed(tenant_id, story_id) do
+    case TenantKeys.get_private_key(tenant_id) do
+      {:ok, key} when is_binary(key) and byte_size(key) > 0 ->
+        {:ok,
+         :crypto.mac(
+           :hmac,
+           :sha256,
+           key,
+           @verifier_seed_domain <> tenant_id <> story_id
+         )}
+
+      other ->
+        Logger.error(
+          "verifier_seed_unavailable: no server-side seed secret for tenant=#{tenant_id} " <>
+            "story=#{story_id} (#{inspect(other)}). Verifier selection fails closed; the " <>
+            "story is flagged verifier_needed. Provision the tenant's audit signing key."
+        )
+
+        # A secret-store outage makes this fire on EVERY request-review, deployment-wide,
+        # and the only other trace is a log line. Emit a counter so the state is alertable
+        # rather than something an operator discovers from unverifiable stories later.
+        :telemetry.execute(
+          [:loopctl, :custody, :verifier_seed_unavailable],
+          %{count: 1},
+          %{tenant_id: tenant_id, story_id: story_id}
+        )
+
+        :error
+    end
+  end
 
   # SQL half of the same-lineage rejection: drop every candidate whose lineage
   # ROOT equals the implementer's root. With an empty implementer lineage there
@@ -658,8 +798,15 @@ defmodule Loopctl.Dispatches do
   defp reject_same_root(query, []), do: query
 
   defp reject_same_root(query, [root | _]) do
+    # `type(^root, Ecto.UUID)` is load-bearing: a bare `^root` inside a fragment
+    # comparison carries no type, so Postgrex received the 36-char string for a
+    # uuid[] element and raised — which meant this branch crashed for EVERY story
+    # that had an implementer dispatch (the only way to reach it with a non-empty
+    # lineage).
     from(d in query,
-      where: is_nil(fragment("?[1]", d.lineage_path)) or fragment("?[1]", d.lineage_path) != ^root
+      where:
+        is_nil(fragment("?[1]", d.lineage_path)) or
+          fragment("?[1]", d.lineage_path) != type(^root, Ecto.UUID)
     )
   end
 
