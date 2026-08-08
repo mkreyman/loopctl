@@ -294,7 +294,7 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
   describe "LCP-1 §7.4 verify" do
     test "clause 1 — nil caller identity is REJECTED" do
       ctx = reported_story()
-      assert {:error, :self_verify_blocked} = Progress.ensure_verify_allowed(ctx.story, nil)
+      assert {:error, :self_verify_blocked} = Progress.ensure_verify_allowed(ctx.story, nil, [])
     end
 
     test "clause 2 — ORPHANED story rejects with :missing_assigned_agent" do
@@ -302,25 +302,28 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
       verifier = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
 
       assert {:error, :missing_assigned_agent} =
-               Progress.ensure_verify_allowed(ctx.story, verifier.id)
+               Progress.ensure_verify_allowed(ctx.story, verifier.id, [])
     end
 
     test "clause 4 — verifier equal to the assigned agent is REJECTED (no dispatches)" do
       ctx = reported_story()
 
       assert {:error, :self_verify_blocked} =
-               Progress.ensure_verify_allowed(ctx.story, ctx.agent.id)
+               Progress.ensure_verify_allowed(ctx.story, ctx.agent.id, [])
     end
 
     test "clause 5 — an independent verifier is PERMITTED (no dispatches)" do
       ctx = reported_story()
       verifier = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
-      assert :ok = Progress.ensure_verify_allowed(ctx.story, verifier.id)
+      assert :ok = Progress.ensure_verify_allowed(ctx.story, verifier.id, [])
     end
 
     test "§7.4.1 clause 1 — an unresolvable dispatch FAILS CLOSED" do
       # Both ids declared, neither resolvable. SHARES_ROOT([], []) is false, so a
-      # naive implementation would read this as separated lineage and PERMIT.
+      # naive implementation would read this as separated lineage and PERMIT. The
+      # caller carries a real (dispatch-minted) lineage: a story with a declared
+      # implementer dispatch refuses an unlineaged caller outright, which would mask
+      # the clause under test.
       ctx =
         reported_story(%{
           implementer_dispatch_id: foreign_dispatch_id(),
@@ -330,7 +333,7 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
       verifier = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
 
       assert {:error, :unresolvable_dispatch_lineage} =
-               Progress.ensure_verify_allowed(ctx.story, verifier.id)
+               Progress.ensure_verify_allowed(ctx.story, verifier.id, [Ecto.UUID.generate()])
     end
 
     test "§7.4.1 clause 2 — shared lineage root is REJECTED" do
@@ -354,7 +357,7 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
         |> AdminRepo.update!()
 
       assert {:error, :self_verify_blocked} =
-               Progress.ensure_verify_allowed(story, verifier_agent.id)
+               Progress.ensure_verify_allowed(story, verifier_agent.id, child.lineage_path)
     end
 
     test "§7.4.1 clause 3 — separated lineage does NOT short-circuit the agent-id check" do
@@ -380,7 +383,11 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
         |> AdminRepo.update!()
 
       assert {:error, :self_verify_blocked} =
-               Progress.ensure_verify_allowed(story, ctx.agent.id)
+               Progress.ensure_verify_allowed(
+                 story,
+                 ctx.agent.id,
+                 verifier_dispatch.lineage_path
+               )
     end
 
     test "§7.4.1 clause 4 — separated lineage and a distinct verifier is PERMITTED" do
@@ -397,7 +404,12 @@ defmodule Loopctl.Spec.LCP1ConformanceTest do
         })
         |> AdminRepo.update!()
 
-      assert :ok = Progress.ensure_verify_allowed(story, verifier_agent.id)
+      assert :ok =
+               Progress.ensure_verify_allowed(
+                 story,
+                 verifier_agent.id,
+                 verifier_dispatch.lineage_path
+               )
     end
   end
 

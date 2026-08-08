@@ -165,7 +165,10 @@ defmodule LoopctlWeb.Plugs.RequireSignedClaim do
     do:
       "This agent has an enrolled signing key (LCP-1 §9), but you are calling on a " <>
         "BEARER dispatch that carries none. Use the agent's ENROLLED dispatch (which can " <>
-        "sign the claim); an unsigned bearer dispatch may not act in an enrolled agent's name."
+        "sign the claim); an unsigned bearer dispatch may not act in an enrolled agent's " <>
+        "name. On a BULK/aggregate custody action the enrolled dispatch is refused too " <>
+        "(`bulk_signature_unsupported` — no per-item signature is possible), so there the " <>
+        "terminal remedy is to verify each story individually on the single-story signed path."
 
   defp message_for(:self_signed_claim),
     do:

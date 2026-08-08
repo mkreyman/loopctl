@@ -4,6 +4,23 @@ defmodule LoopctlWeb.ArticleJSON do
 
   Provides consistent serialization for articles and article links
   across all article controller actions.
+
+  ## `idempotency_key` is accepted, never echoed
+
+  An article's `idempotency_key` is a WRITE-side capture identity: a caller supplies its
+  own, and `GET /api/v1/articles?idempotency_key=…` answers "have I already captured
+  this?" from the caller's own key. Serializing the stored value did something different —
+  it ENUMERATED the capture identities of every article a reader merely has read access
+  to, in bulk, unprompted. It is therefore no longer rendered in any article payload.
+
+  What this does NOT claim is secrecy for the key. The FILTER is deliberately kept — it is
+  the "have I already captured this?" check — and it is an EXACT match on a key the caller
+  must already hold or guess, answered only by articles the caller can read in full
+  (visibility scoping applies to the filter exactly as to any other list query, so another
+  agent's `private`/`owner` article never answers). What remains is therefore bounded to
+  "an article you can already read also tells you its capture key", not an enumeration and
+  not a probe of anything you cannot see. Nothing should be built as if the key were a
+  secret, and nothing needs to be.
   """
 
   @doc """
@@ -51,7 +68,6 @@ defmodule LoopctlWeb.ArticleJSON do
       tags: article.tags,
       source_type: article.source_type,
       source_id: article.source_id,
-      idempotency_key: article.idempotency_key,
       metadata: article.metadata,
       inserted_at: article.inserted_at,
       updated_at: article.updated_at
@@ -71,7 +87,6 @@ defmodule LoopctlWeb.ArticleJSON do
       tags: article.tags,
       source_type: article.source_type,
       source_id: article.source_id,
-      idempotency_key: article.idempotency_key,
       metadata: article.metadata,
       inserted_at: article.inserted_at,
       updated_at: article.updated_at

@@ -142,53 +142,63 @@ All three gates are lineage-aware. They do NOT share one implementation, but eac
 CALLER's dispatch lineage (resolved server-side from the authenticating key, never client-supplied)
 against the implementer's, and each fails CLOSED on a story with no custody provenance.
 
-**verify** — `validate_not_self_verify/3` (`lib/loopctl/progress.ex:1865-1897`, US-26.2.2),
+**verify** — `validate_not_self_verify/4` (`lib/loopctl/progress.ex`, US-26.2.2),
 in order:
-1. **nil caller identity is blocked** — untrusted, never permissive (US-26.1.3, `progress.ex:1863`).
+1. **nil caller identity is blocked** — untrusted, never permissive (US-26.1.3).
 2. **Custody-orphaned story is blocked** with `missing_assigned_agent` — a reported-done
    story with no assigned agent and no lineage would otherwise pass VACUOUSLY, since a
    non-nil verifier never equals a nil implementer.
-3. **CALLER lineage vs the implementer's** (`lineage_status/2`, `progress.ex:2478-2495`) — the
-   SAME tri-state comparison report and review-complete run, and the only clause that binds
-   the principal actually making the call: a shared lineage root is `self_verify_blocked`, a
-   declared-but-unresolvable implementer dispatch is `unresolvable_dispatch_lineage` (fails
-   CLOSED). The caller's lineage arrives as `:verifier_lineage`, resolved server-side from
-   the authenticating key. Without it verify compared only STORY fields, so any orchestrator
-   key with a different `agent_id` — including one inside the implementer's own chain — could
-   verify the implementer's work.
-4. **RECORDED verifier vs implementer** (`verify_recorded_separation/2`, `progress.ex:1899`)
+3. **CALLER lineage vs the implementer's** (`lineage_status/2`) — the SAME comparison report and
+   review-complete run, at the SAME `lineage_same_chain?/2` distance, and the only clause that
+   binds the principal actually making the call: an ancestor or descendant of the implementer is
+   `self_verify_blocked` (a SIBLING is separation — demanding a separate ROOT of the caller made
+   verify unreachable in the documented single-root tenant), a declared-but-unresolvable
+   implementer dispatch is `unresolvable_dispatch_lineage` (fails CLOSED), and an EMPTY caller
+   lineage on a story that HAS an `implementer_dispatch_id` is `caller_lineage_required` — a key
+   no dispatch minted cannot be shown separate from dispatch-minted work, and permitting it left
+   two legacy env-var keys in one process able to report, review AND verify. That refusal has
+   its OWN code deliberately: `self_verify_blocked` is an L6 byzantine signal that escalates to
+   a tenant-wide halt, and an unmigrated legacy key is a configuration state, not byzantium.
+   REJECT is exempt from the empty-lineage refusal only — sending work back is remediation, and
+   refusing it strands the story. The caller's lineage arrives as `:verifier_lineage`, resolved
+   server-side, on EVERY path that reaches a terminal custody state: `verify`, `verify-all`,
+   `reject`, and bulk verify/reject (`ensure_verify_allowed/4`).
+4. **RECORDED verifier vs implementer** (`verify_recorded_separation/2`)
    when BOTH `implementer_dispatch_id` and `verifier_dispatch_id` are set, decided by
-   `verify_lineage_separated/4` (`progress.ex:1925-1945`): an EMPTY lineage on either side —
-   which is what an unloadable/deleted dispatch row yields (`get_dispatch_lineage/2`,
-   `progress.ex:1947-1952`) — fails CLOSED, a shared lineage root
-   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:593-597`) blocks, and the
+   `verify_lineage_separated/4`: an EMPTY lineage on either side —
+   which is what an unloadable/deleted dispatch row yields (`get_dispatch_lineage/2`) — fails CLOSED, a shared lineage root
+   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:601-605`) blocks, and the
    `assigned_agent_id` equality check is evaluated IN ADDITION to the lineage comparison, never
    short-circuited by it.
 5. **`assigned_agent_id` equality** as the fallback for pre-dispatch stories and for every
    story that lacks a verifier dispatch.
 
 `verifier_dispatch_id` is written only by the assign-verifier flow
-(`assign_rotating_verifier/3`, `progress.ex:448-486`); that write is checked, and a failure
+(`assign_rotating_verifier/3`, `progress.ex:448-487`); that write is checked, and a failure
 flags `verifier_needed` plus a `verifier_not_assigned` audit event
-(`flag_verifier_needed/5`, `progress.ex:487`) rather than silently leaving the field nil.
+(`flag_verifier_needed/5`, `progress.ex:500`) rather than silently leaving the field nil.
 Because `request-review` is OPTIONAL, a story often reaches verify with no verifier dispatch
 at all — step 3 is what keeps that path lineage-gated instead of a bare agent-id inequality.
 
-**report** — `validate_not_self_report/3` (`progress.ex:2407-2433`) — nil identity is blocked
-(`progress.ex:2407`); a **custody-unattributed** story (nil `assigned_agent_id` AND nil
+**report** — `validate_not_self_report/3` — nil identity is blocked
+; a **custody-unattributed** story (nil `assigned_agent_id` AND nil
 `implementer_dispatch_id`) fails CLOSED with `missing_assigned_agent` and a
-`custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2446-2449`) instead of
+`custody_orphaned_blocked` log (`custody_unattributed?/1`) instead of
 passing vacuously; then the reporter's dispatch lineage is compared against the implementer's
-(`lineage_status/2`, `progress.ex:2478-2495`) — a tri-state `:ok | :conflict | :unresolvable`
-where a DECLARED-but-unresolvable implementer dispatch fails CLOSED with
-`unresolvable_dispatch_lineage` (LCP-1 §7.5), a shared lineage root yields `self_report_blocked`,
-and `:ok` falls through to plain `assigned_agent_id == agent_id`. The DB CHECK
+(`lineage_status/2`) — `:ok | :conflict | :unresolvable | :unlineaged`, where a
+DECLARED-but-unresolvable implementer dispatch fails CLOSED with
+`unresolvable_dispatch_lineage` (LCP-1 §7.5), a caller on the implementer's root-to-leaf CHAIN
+(ancestor or descendant; siblings pass) yields `self_report_blocked`, an EMPTY caller lineage on
+dispatch-minted work yields `caller_lineage_required`, and `:ok` falls through to plain
+`assigned_agent_id == agent_id`. The DB CHECK
 `stories_reported_done_requires_agent` does NOT cover this — it is satisfied whenever
 `implementer_dispatch_id IS NULL` — so the code guard is the enforcement.
 
-**review-complete** — `validate_not_self_review/3` (`progress.ex:2498-2528`) — custody-orphan
-backstop first (`progress.ex:2441-2443`), then a **nil reviewer is deliberately PERMITTED**
-(`progress.ex:2450-2451`): nil means a human operator on a user-role key. That permit has
+**review-complete** — `validate_not_self_review/3` — custody-orphan backstop first, then a
+**nil reviewer WITH AN EMPTY LINEAGE is deliberately PERMITTED**: that pair means a human
+operator on a user-role key. The empty-lineage half is load-bearing — a DISPATCH-minted
+user-role key also carries no `agent_id`, and permitting on nil alone let an ANCESTOR of the
+implementer rubber-stamp its own subtree without the lineage ever being read. That permit has
 THREE parts which must change together:
 1. the `exact_role: [:orchestrator, :user]` plug
    (`lib/loopctl_web/controllers/review_record_controller.ex:22-23`), which 403s an `:agent` key
@@ -201,10 +211,10 @@ THREE parts which must change together:
 3. the `Progress` permit itself.
 Then the reviewer's dispatch lineage comparison, then plain `assigned_agent_id` equality.
 
-The reporter/reviewer lineage both come from `Dispatches.lineage_for_api_key/2`
-(`lib/loopctl/dispatches.ex:518-528`) — the dispatch that minted the calling key. A key not
-minted by a dispatch yields `[]`, which is inert (the agent-id checks still apply); it never
-short-circuits a gate.
+The reporter/reviewer lineage both come from `Dispatches.lineage_for_api_key/2` — the dispatch
+that minted the calling key. A key not minted by a dispatch yields `[]`. On a PRE-DISPATCH story
+that is inert (the agent-id checks are the whole gate, by design); on DISPATCH-MINTED work it is
+refused with `caller_lineage_required` rather than silently short-circuiting the comparison.
 
 **The MCP server must NEVER hold both implementer and reviewer keys in the same process.** The 409 errors are the system working correctly — do not add workarounds.
 
@@ -215,7 +225,7 @@ Ask these questions:
 1. **Does this weaken chain-of-custody?** If a single session could now both implement and verify/report, the change is WRONG.
 2. **Does this give agents destructive capabilities?** Tenant-destructive and custody-critical operations must stay at `role: :user` (or WebAuthn): tenant/project delete, budget/token corrections, cost anomaly resolution, tenant audit-key rotation, break-glass override, single-article `unpublish` and the SET-BASED bulk KB ops (`knowledge_bulk_delete` — the WHOLE action, soft path included, and it also carries an irreversible HARD-delete path — `bulk_publish`, `bulk_unpublish`), and anything in the work-breakdown / chain-of-custody surface. Constructive and metadata work-breakdown operations (create/update epics, stories, dependencies, imports, backfills for pre-loopctl work) are at `role: :orchestrator` so an autonomous orchestrator can compose a project and record state without human intervention. Agents (`role: :agent`) can never write work-breakdown data — only read it. The rule of thumb: if the operation IRREVERSIBLY removes data, or serves as a custody gate, it requires `:user`.
 
-   **KB-content carve-out (#331).** The knowledge-wiki **content** surface is agent-role curation — `knowledge_create`, `knowledge_update` (in-place edit, ID-preserving), `knowledge_archive`/`knowledge_delete` (soft delete → `status: :archived`, row retained), and `knowledge_resolve_conflict` in ALL dispositions (`dismiss`, `supersede`, `merge`). These are the exception to "archive/DELETE ⇒ `:user`" precisely because each is **non-destructive + audited**: a soft delete retains the row, supersede retires the loser via a reversible `supersedes` link applied only by the privileged nightly executor, and merge produces a new DRAFT (never auto-published). Every mutation is recorded in the append-only, hash-chained audit log (and the per-tenant `kb_curation_log` when enabled). Agent edits/archives are additionally visibility-scoped: an agent can only touch an article it can see, so another agent's `private`/`owner` memory 404s. The human gate bought nothing here (nothing DESTROYS data or is self-approval-shaped) while blocking the intended agent-native curation workflow.
+   **KB-content carve-out (#331).** The knowledge-wiki **content** surface is agent-role curation — `knowledge_create`, `knowledge_update` (in-place edit, ID-preserving), `knowledge_archive`/`knowledge_delete` (soft delete → `status: :archived`, row retained), and `knowledge_resolve_conflict` in ALL dispositions (`dismiss`, `supersede`, `merge`). These are the exception to "archive/DELETE ⇒ `:user`" precisely because each is **non-destructive + audited**: a soft delete retains the row, supersede retires the loser via a reversible `supersedes` link applied only by the privileged nightly executor, and merge produces a new DRAFT (never auto-published). **RECORDING a verdict is agent-role; AUTHORIZING the unattended RETIREMENT is not.** The conflict pair is manufacturable (the queue is fed by a mechanical similarity threshold), so `Knowledge.annotate_conflict/3` GRANTS a `supersede`'s `confidence` from the recorder's server-derived role rather than accepting it from params: an agent asking for `:high` is recorded at `:medium`, only orchestrator+ produces the `:high` the nightly executor acts on, the executor re-checks the persisted `annotated_by_role`, and a `:high` supersede must carry `evidence`. Do not restore caller-supplied confidence — that hands one key both the ability to arrange a conflict and to certify its own verdict as trusted. The cap is scoped to `supersede` for a reason: `merge` retires nothing, so capping it only disabled agent-role merge curation. And a capped verdict does NOT hide its pair — `conflict_unresolved_subquery/0` settles a pair only on a verdict the executor will act on, so the pair stays in `GET /knowledge/conflicts` for an orchestrator+ key to re-record. Every mutation is recorded in the append-only, hash-chained audit log (and the per-tenant `kb_curation_log` when enabled). Agent edits/archives are additionally visibility-scoped: an agent can only touch an article it can see, so another agent's `private`/`owner` memory 404s. The human gate bought nothing here (nothing DESTROYS data or is self-approval-shaped) while blocking the intended agent-native curation workflow.
 
    **Non-destructive is not reversible, and archive is where they part (#605/#606).** This carve-out used to say "reversible + audited", and that word was wrong for `archive`/`delete`: `:archived` is a TERMINAL status — `Article`'s `@valid_transitions` has no `{:archived, _}` entry and there is no unarchive function, so the only way back is a `user+` PATCH carrying an explicit status. The row survives and the act is audited, which is what earns agent role; nothing automated restores it, which is a separate property and the one an UNATTENDED writer depends on. That is why the nightly consolidation pass retracts a confirmed duplicate with `unpublish` (`{:published, :draft}`, undone by `publish`) and never with `archive` (#608), and why `:stale_entry` could never earn an apply path at all: auto-archiving on age would delete the corpus through a one-way door. When adding an automated writer, ask which property you actually need — "nothing is destroyed" or "I can undo this" — because archive gives only the first.
 

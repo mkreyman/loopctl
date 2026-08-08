@@ -59,12 +59,138 @@ All notable changes to loopctl are documented here.
   CaseClauseError — making a correct refusal indistinguishable from a crash in logs and alerts.
   A non-UUID `capability` value likewise 500'd (`Ecto.Query.CastError`) instead of 403ing.
 
+- **A dispatch may now only be minted inside the caller's own lineage.** `POST
+  /api/v1/dispatches` accepted a parentless request from any orchestrator-or-above key, and
+  accepted any active dispatch in the tenant as `parent_dispatch_id`. Both let a caller place
+  itself in a lineage unrelated to its own, which is the separation the L4 custody gates read
+  as "an independent principal". Two new 403s: `root_dispatch_forbidden` when a key that was
+  itself minted by a dispatch sends no `parent_dispatch_id` (only a key no dispatch minted —
+  the tenant's operator key, rooted in the human anchor — may start a lineage tree), and
+  `parent_outside_caller_lineage` when the named parent is not the caller's own dispatch or a
+  descendant of it. "Operator key" is decided POSITIVELY — `role: :user` AND not minted by a
+  dispatch — because an absent lineage also describes a legacy long-lived key. **What changed
+  for clients:** a sub-agent that used to mint a fresh root must now pass its own dispatch id as
+  `parent_dispatch_id` (the 403 body returns it as `remediation.your_dispatch_id`); a legacy
+  `LOOPCTL_ORCH_KEY` can no longer mint a ROOT — use the tenant's `user`-role operator key —
+  but it may still mint BENEATH any active dispatch, which is how it obtains a lineage during
+  the deprecation window. Minting a second, independently-rooted tree remains worthwhile
+  (`select_verifier/3` prefers a different-root candidate and reports `no_independent_root`
+  without one), but it is not required for liveness: the verify gate compares the caller at
+  chain distance, so a sibling verifier under the same root certifies fine. Both refusals
+  are logged as `lineage_ceiling_refused` and emit
+  `[:loopctl, :custody, :lineage_ceiling_refused]`.
+
+- **Verifier selection is seeded from a server-side secret.** The rotating verifier's index was
+  derived from the tenant's audit signing PUBLIC key, which `/.well-known/loopctl` serves
+  unauthenticated, while the candidate pool is listable by any agent key — so the choice was
+  reproducible by the parties it chooses between. It is now an HMAC keyed by the tenant's audit
+  signing PRIVATE key, domain-separated and bound to the tenant and story. **Operator impact:**
+  a tenant whose audit signing key is not provisioned (or an unreachable secret store) now has
+  no seed and none is invented — selection fails closed, the story is flagged `verifier_needed`,
+  and a `verifier_not_assigned` entry with reason `verifier_seed_unavailable` is written to the
+  audit chain plus an `audit_chain_append_failed`-style error log and a
+  `[:loopctl, :custody, :verifier_seed_unavailable]` telemetry counter — alert on it, since a
+  secret-store outage fires it on every request-review deployment-wide. Verification itself is
+  unaffected: the verify gate enforces lineage separation independently, and now refuses an
+  unlineaged caller outright on a dispatch-minted story rather than falling back to agent-id
+  inequality. Provision the tenant's audit key to restore automatic selection.
+
+- **Backfill can no longer be used to certify work that ran inside loopctl.** `POST
+  /stories/:id/backfill` (and the bulk `mark-complete`) refused stories carrying dispatch
+  markers, but `force-unclaim` clears `assigned_agent_id`, and a story claimed with a key that
+  no dispatch minted never records an implementer dispatch — so a worked story could be
+  returned to a state indistinguishable from pre-loopctl work and then marked verified with no
+  report, review record or independent verifier. Unclaim, force-unclaim and the reject
+  auto-reset now stamp `metadata.lifecycle_entered_at` on the story, and both paths refuse a
+  story carrying it — or a lifecycle entry in the audit log — with a new 422
+  (`story_entered_lifecycle`). The row stamp is the longer-lived half deliberately: `audit_log`
+  is partitioned and pruned at `AUDIT_RETENTION_DAYS` (default 90), so an audit-only guard would
+  have reopened this path on a timer. The stamp is not tamper-proof — `PATCH /stories/:id`
+  replaces `metadata` wholesale, so an orchestrator key can still erase it; both sources are
+  consulted. Imported and never-dispatched work — the case backfill exists for — is unaffected.
+  Backfill is additionally mounted on the LCP-1 signed-claim gate, so under the `signed` custody
+  profile an enrolled caller must sign it exactly as for `verify`, and the verified claim is
+  recorded in the hash-chained audit log (§9.4) as it is for `verify`.
+
+- **The caller's dispatch lineage is now compared on every custody path, not just single-story
+  verify.** `POST /epics/:id/verify-all`, `POST /stories/:id/reject` and the bulk verify/reject
+  endpoints reached the same terminal states while comparing only story fields, so an
+  orchestrator dispatched inside the implementer's own lineage cleared them where
+  `POST /stories/:id/verify` returned `409 self_verify_blocked`. All four now resolve the
+  caller's lineage server-side from the authenticating key. **What changed for clients:** calls
+  that were previously accepted from ON the implementer's lineage chain (an ancestor or a
+  sub-agent; siblings are fine) now return `409 self_verify_blocked` (bulk: a per-story error
+  entry) — use a sibling or independently-rooted verifier dispatch. A key that no dispatch
+  minted (a legacy env-var key) gets `409 caller_lineage_required` on report, review-complete
+  and verify of DISPATCH-MINTED work, because its separation cannot be shown; mint an ephemeral
+  key with `POST /api/v1/dispatches`. That is a plain refusal and records no custody violation,
+  so it never arms a tenant halt. Stories that predate dispatches are unaffected, and `reject`
+  is deliberately exempt so bad work can always be sent back.
+
 ## [Unreleased] — 2026-07-24 — Self-hosting: fresh-install fixes, multilingual search, at-rest ingestion encryption
 
 Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **BREAKING (API): `idempotency_key` is no longer returned in any article payload.** It is
+  still accepted on create and still a filter on `GET /api/v1/articles?idempotency_key=…`
+  (and the `knowledge_list` / `knowledge_count` MCP tools) — the lag-free existence check
+  is unchanged, answered from `meta.total_count` on a key you already hold. What it no
+  longer does is hand every reader the capture identities of articles it merely has read
+  access to. A key is caller-chosen data that the nightly consolidation pass reads when it
+  groups duplicate captures, so it is write-side identity, not a shared attribute. The
+  same removal applies to the `evidence` entries of `GET /api/v1/knowledge/consolidation`,
+  prior-day reports included. The create no-op response still echoes the key you SUPPLIED on
+  an idempotency hit; nothing else does. A client reading the field off a list/get response
+  must switch to filtering by the key it already holds. The filter is not scoped to keys you
+  wrote, so this removes a bulk disclosure — it does not make the key a secret.
+
+- **A `supersede` verdict's `confidence` is now granted by the server, not accepted
+  from the request** (`POST /api/v1/knowledge/conflicts/resolve`). `confidence: "high"` on a
+  `supersede` is what authorizes the nightly executor to RETIRE an article with nobody in
+  the loop, so it is now capped by the role of the key recording the verdict: an agent-role
+  request asking for `"high"` is recorded at `"medium"`, and the response reports the cap in
+  `data.requested_confidence` and `note`. `merge` is NOT capped — it synthesizes a new draft
+  and retires nothing — so it still executes at agent role. Recording a verdict remains
+  agent-role curation in every disposition; only the unattended retirement is gated.
+  **Both `supersede` AND `merge` recorded at `"high"` now REQUIRE `evidence` (422 without
+  it)** — the merge is uncapped but not free: the executor synthesizes on the tenant's own
+  paid model key and POSTs both article bodies to the provider, so every verdict it applies
+  unattended must carry its reason. A merged draft now also inherits the more restrictive of
+  its two sources' visibility instead of defaulting to tenant-shared, and two sources
+  restricted to DIFFERENT agents are refused before any synthesis.
+  **A capped verdict is neither applied nor auto-dismissed:** a pair whose only verdict the
+  executor will never apply stays listed in `GET /api/v1/knowledge/conflicts` (and keeps its
+  link on `GET /articles/:id`), so an orchestrator+ key can find it and re-record it. A
+  supersede/merge DELIBERATELY recorded below `"high"` is different — the next nightly run
+  closes it as dismissed (both articles retained) and the pair leaves the queue; it is not
+  held for review, so re-record at `"high"` if you mean it to apply. An execution that
+  disposed of NOTHING (a merge skipped for a missing API key, a permanently failed
+  synthesis, a retracted flag) no longer settles the pair either — it stays discoverable
+  instead of vanishing unapplied. Recording ANY verdict, capped or not, releases the pair's
+  articles from curated-retrieval suppression. The
+  migration backfills `annotated_by_role` from the existing `annotated_by` value, so a
+  pending `supersede` an orchestrator recorded before this release still executes.
+
+- **The nightly consolidation pass now keeps the OLDEST member of a duplicate group, not the
+  longest.** Both signals that form a group — the normalized title and the
+  `idempotency_key` — are caller-chosen, and so is the body, so under longest-wins an agent
+  could retire an established published article by publishing a longer near-copy beside it.
+  Age is the one input a later writer cannot manufacture. **Operator impact:** where a
+  fuller re-capture used to win, the earlier capture now survives and the fuller one is
+  unpublished (reversible via publish; its text is retained as a draft).
+
+- **The nightly consolidation pass now requires content corroboration before auto-
+  unpublishing an idempotency-key duplicate group,** as it already did for title-collision
+  groups. An `idempotency_key` is caller-supplied, so two unrelated writers can collide on
+  one deterministically and the two-run agreement gate — which filters transience, not
+  wrongness — would confirm it. Both signals now clear the same bar: the group's live
+  members must also be similar in CONTENT (`knowledge_consolidation_min_duplicate_similarity_pct`).
+  **Operator impact:** a tenant with no BYO embedding key can no longer auto-apply
+  idempotency-drift groups — they are REPORTED and withheld instead (nothing is
+  unpublished), and the withhold clears itself once vectors exist. This is the behaviour
+  title-drift groups have always had on such tenants.
 - **A custody halt now requires a repeated pattern, and it no longer freezes the whole API.**
   Two behaviour changes an operator will notice.
 
