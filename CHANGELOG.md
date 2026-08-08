@@ -59,6 +59,74 @@ All notable changes to loopctl are documented here.
   CaseClauseError — making a correct refusal indistinguishable from a crash in logs and alerts.
   A non-UUID `capability` value likewise 500'd (`Ecto.Query.CastError`) instead of 403ing.
 
+- **A dispatch may now only be minted inside the caller's own lineage.** `POST
+  /api/v1/dispatches` accepted a parentless request from any orchestrator-or-above key, and
+  accepted any active dispatch in the tenant as `parent_dispatch_id`. Both let a caller place
+  itself in a lineage unrelated to its own, which is the separation the L4 custody gates read
+  as "an independent principal". Two new 403s: `root_dispatch_forbidden` when a key that was
+  itself minted by a dispatch sends no `parent_dispatch_id` (only a key no dispatch minted —
+  the tenant's operator key, rooted in the human anchor — may start a lineage tree), and
+  `parent_outside_caller_lineage` when the named parent is not the caller's own dispatch or a
+  descendant of it. "Operator key" is decided POSITIVELY — `role: :user` AND not minted by a
+  dispatch — because an absent lineage also describes a legacy long-lived key. **What changed
+  for clients:** a sub-agent that used to mint a fresh root must now pass its own dispatch id as
+  `parent_dispatch_id` (the 403 body returns it as `remediation.your_dispatch_id`); a legacy
+  `LOOPCTL_ORCH_KEY` can no longer mint a ROOT — use the tenant's `user`-role operator key —
+  but it may still mint BENEATH any active dispatch, which is how it obtains a lineage during
+  the deprecation window. Minting a second, independently-rooted tree remains worthwhile
+  (`select_verifier/3` prefers a different-root candidate and reports `no_independent_root`
+  without one), but it is not required for liveness: the verify gate compares the caller at
+  chain distance, so a sibling verifier under the same root certifies fine. Both refusals
+  are logged as `lineage_ceiling_refused` and emit
+  `[:loopctl, :custody, :lineage_ceiling_refused]`.
+
+- **Verifier selection is seeded from a server-side secret.** The rotating verifier's index was
+  derived from the tenant's audit signing PUBLIC key, which `/.well-known/loopctl` serves
+  unauthenticated, while the candidate pool is listable by any agent key — so the choice was
+  reproducible by the parties it chooses between. It is now an HMAC keyed by the tenant's audit
+  signing PRIVATE key, domain-separated and bound to the tenant and story. **Operator impact:**
+  a tenant whose audit signing key is not provisioned (or an unreachable secret store) now has
+  no seed and none is invented — selection fails closed, the story is flagged `verifier_needed`,
+  and a `verifier_not_assigned` entry with reason `verifier_seed_unavailable` is written to the
+  audit chain plus an `audit_chain_append_failed`-style error log and a
+  `[:loopctl, :custody, :verifier_seed_unavailable]` telemetry counter — alert on it, since a
+  secret-store outage fires it on every request-review deployment-wide. Verification itself is
+  unaffected: the verify gate enforces lineage separation independently, and now refuses an
+  unlineaged caller outright on a dispatch-minted story rather than falling back to agent-id
+  inequality. Provision the tenant's audit key to restore automatic selection.
+
+- **Backfill can no longer be used to certify work that ran inside loopctl.** `POST
+  /stories/:id/backfill` (and the bulk `mark-complete`) refused stories carrying dispatch
+  markers, but `force-unclaim` clears `assigned_agent_id`, and a story claimed with a key that
+  no dispatch minted never records an implementer dispatch — so a worked story could be
+  returned to a state indistinguishable from pre-loopctl work and then marked verified with no
+  report, review record or independent verifier. Unclaim, force-unclaim and the reject
+  auto-reset now stamp `metadata.lifecycle_entered_at` on the story, and both paths refuse a
+  story carrying it — or a lifecycle entry in the audit log — with a new 422
+  (`story_entered_lifecycle`). The row stamp is the longer-lived half deliberately: `audit_log`
+  is partitioned and pruned at `AUDIT_RETENTION_DAYS` (default 90), so an audit-only guard would
+  have reopened this path on a timer. The stamp is not tamper-proof — `PATCH /stories/:id`
+  replaces `metadata` wholesale, so an orchestrator key can still erase it; both sources are
+  consulted. Imported and never-dispatched work — the case backfill exists for — is unaffected.
+  Backfill is additionally mounted on the LCP-1 signed-claim gate, so under the `signed` custody
+  profile an enrolled caller must sign it exactly as for `verify`, and the verified claim is
+  recorded in the hash-chained audit log (§9.4) as it is for `verify`.
+
+- **The caller's dispatch lineage is now compared on every custody path, not just single-story
+  verify.** `POST /epics/:id/verify-all`, `POST /stories/:id/reject` and the bulk verify/reject
+  endpoints reached the same terminal states while comparing only story fields, so an
+  orchestrator dispatched inside the implementer's own lineage cleared them where
+  `POST /stories/:id/verify` returned `409 self_verify_blocked`. All four now resolve the
+  caller's lineage server-side from the authenticating key. **What changed for clients:** calls
+  that were previously accepted from ON the implementer's lineage chain (an ancestor or a
+  sub-agent; siblings are fine) now return `409 self_verify_blocked` (bulk: a per-story error
+  entry) — use a sibling or independently-rooted verifier dispatch. A key that no dispatch
+  minted (a legacy env-var key) gets `409 caller_lineage_required` on report, review-complete
+  and verify of DISPATCH-MINTED work, because its separation cannot be shown; mint an ephemeral
+  key with `POST /api/v1/dispatches`. That is a plain refusal and records no custody violation,
+  so it never arms a tenant halt. Stories that predate dispatches are unaffected, and `reject`
+  is deliberately exempt so bad work can always be sent back.
+
 ## [Unreleased] — 2026-07-24 — Self-hosting: fresh-install fixes, multilingual search, at-rest ingestion encryption
 
 Operator-facing changes for deployments outside the hosted instance.

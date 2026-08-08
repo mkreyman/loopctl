@@ -21,6 +21,7 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.AdminRepo
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
+  alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
@@ -108,7 +109,8 @@ defmodule Loopctl.BulkOperations do
         tenant_id: tenant_id,
         orch_id: orchestrator_agent_id,
         actor_id: actor_id,
-        actor_label: actor_label
+        actor_label: actor_label,
+        caller_lineage: caller_lineage(tenant_id, opts)
       }
 
       AdminRepo.transaction(fn ->
@@ -159,7 +161,8 @@ defmodule Loopctl.BulkOperations do
         tenant_id: tenant_id,
         orch_id: orchestrator_agent_id,
         actor_id: actor_id,
-        actor_label: actor_label
+        actor_label: actor_label,
+        caller_lineage: caller_lineage(tenant_id, opts)
       }
 
       AdminRepo.transaction(fn ->
@@ -219,6 +222,10 @@ defmodule Loopctl.BulkOperations do
 
       AdminRepo.transaction(fn ->
         locked_stories = lock_stories_by_ids(tenant_id, sorted_ids)
+        # ONE audit query for the batch, taken before the per-story loop: the guard
+        # used to run it per story while holding FOR UPDATE locks on all of them.
+        lifecycle_ids = Progress.stories_with_lifecycle_history(tenant_id, sorted_ids)
+        ctx = Map.put(ctx, :lifecycle_ids, lifecycle_ids)
         process_mark_completes(sorted_ids, locked_stories, story_params, ctx)
       end)
     end
@@ -237,27 +244,20 @@ defmodule Loopctl.BulkOperations do
           %{story_id: story_id, status: "error", reason: "Story not found"}
 
         story ->
-          process_mark_complete(
-            story,
-            params,
-            ctx.tenant_id,
-            ctx.orch_id,
-            ctx.actor_id,
-            ctx.actor_label
-          )
+          process_mark_complete(story, params, ctx)
       end
     end)
   end
 
-  defp process_mark_complete(
-         story,
-         params,
-         tenant_id,
-         orchestrator_agent_id,
-         actor_id,
-         actor_label
-       ) do
-    with :ok <- Progress.ensure_mark_complete_allowed(story),
+  defp process_mark_complete(story, params, ctx) do
+    %{
+      tenant_id: tenant_id,
+      orch_id: orchestrator_agent_id,
+      actor_id: actor_id,
+      actor_label: actor_label
+    } = ctx
+
+    with :ok <- Progress.ensure_mark_complete_allowed(story, ctx.lifecycle_ids),
          {:ok, updated} <- apply_mark_complete(story) do
       create_mark_complete_result(tenant_id, story, orchestrator_agent_id, params)
 
@@ -296,7 +296,7 @@ defmodule Loopctl.BulkOperations do
           %{story_id: story_id, status: "error", reason: "Story not found"}
 
         story ->
-          process_verify(story, params, ctx.tenant_id, ctx.orch_id, ctx.actor_id, ctx.actor_label)
+          process_verify(story, params, ctx)
       end
     end)
   end
@@ -310,8 +310,21 @@ defmodule Loopctl.BulkOperations do
           %{story_id: story_id, status: "error", reason: "Story not found"}
 
         story ->
-          process_reject(story, params, ctx.tenant_id, ctx.orch_id, ctx.actor_id, ctx.actor_label)
+          process_reject(story, params, ctx)
       end
+    end)
+  end
+
+  # The CALLER's dispatch lineage, resolved SERVER-SIDE from the authenticating key —
+  # never client-supplied. `AuditContext.from_conn/1` puts that key's id in `:actor_id`
+  # (the superadmin's, under impersonation — still the principal that authenticated),
+  # so the bulk path can run the SAME L4 caller comparison the single-story path does.
+  # Without it `ensure_verify_allowed/3` saw an empty lineage, `lineage_status/3` read
+  # that as "no conflict", and bulk verify/reject degraded to agent-id inequality — a
+  # condition any orchestrator key satisfies trivially.
+  defp caller_lineage(tenant_id, opts) do
+    Keyword.get_lazy(opts, :verifier_lineage, fn ->
+      Dispatches.lineage_for_api_key(tenant_id, Keyword.get(opts, :actor_id))
     end)
   end
 
@@ -331,9 +344,16 @@ defmodule Loopctl.BulkOperations do
     end
   end
 
-  defp process_verify(story, params, tenant_id, orchestrator_agent_id, actor_id, actor_label) do
+  defp process_verify(story, params, ctx) do
+    %{
+      tenant_id: tenant_id,
+      orch_id: orchestrator_agent_id,
+      actor_id: actor_id,
+      actor_label: actor_label
+    } = ctx
+
     with :ok <- validate_verify_preconditions(story),
-         :ok <- Progress.ensure_verify_allowed(story, orchestrator_agent_id),
+         :ok <- Progress.ensure_verify_allowed(story, orchestrator_agent_id, ctx.caller_lineage),
          :ok <- Progress.ensure_review_conducted(tenant_id, story.id, story),
          {:ok, updated} <- apply_verification(story) do
       create_verification_result(tenant_id, story, orchestrator_agent_id, params)
@@ -346,13 +366,27 @@ defmodule Loopctl.BulkOperations do
     end
   end
 
-  defp process_reject(story, params, tenant_id, orchestrator_agent_id, actor_id, actor_label) do
+  defp process_reject(story, params, ctx) do
     require Logger
+
+    %{
+      tenant_id: tenant_id,
+      orch_id: orchestrator_agent_id,
+      actor_id: actor_id,
+      actor_label: actor_label
+    } = ctx
+
     reason = params["reason"] || params[:reason]
 
     with :ok <- validate_reason(reason),
          :ok <- validate_reject_preconditions(story),
-         :ok <- Progress.ensure_verify_allowed(story, orchestrator_agent_id),
+         :ok <-
+           Progress.ensure_verify_allowed(
+             story,
+             orchestrator_agent_id,
+             ctx.caller_lineage,
+             :reject
+           ),
          {:ok, updated} <- apply_rejection(story, reason) do
       create_rejection_result(tenant_id, story, orchestrator_agent_id, params)
       audit_rejection(tenant_id, story, updated, actor_id, actor_label, orchestrator_agent_id)
@@ -835,6 +869,14 @@ defmodule Loopctl.BulkOperations do
     do:
       "story has dispatch lineage (an assigned agent or dispatch id); use the normal " <>
         "report → review → verify flow, not mark-complete"
+
+  defp format_reason(:story_entered_lifecycle),
+    do:
+      "story is recorded as having entered the dispatch lifecycle (a status change, a " <>
+        "force-unclaim or an auto-reset), even though its dispatch markers are now clear; " <>
+        "use the normal report → review → verify flow, not mark-complete. The record is " <>
+        "the story's own lifecycle stamp, the audit log, or both — the audit log is pruned " <>
+        "at AUDIT_RETENTION_DAYS, so an empty story history does not contradict this"
 
   defp format_reason(:story_in_progress),
     do:
