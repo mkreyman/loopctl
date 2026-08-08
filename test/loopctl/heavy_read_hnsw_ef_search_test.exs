@@ -353,8 +353,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       # upgraded — the line `maybe_warn_unsupported/2` already draws in the log. Telling the
       # caller to wait for a self-heal that will never come is a wrong operational answer.
       prime_iterative_scan(1)
-      prime_iterative_scan_supported(false)
-      prime_last_conclusive(false)
+      prime_iterative_scan_supported(false, :conclusive)
 
       unsupported = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search))
 
@@ -362,6 +361,24 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       assert unsupported.ann_iterative_scan_reason =~ "does NOT support it"
       assert unsupported.ann_iterative_scan_reason =~ "until the extension is upgraded"
       refute unsupported.ann_iterative_scan_reason =~ "self-heals"
+    end
+
+    test "a REUSED stale `false` is not reported as a backend incapability" do
+      # The other side of the split, and the one a second `last_conclusive_verdict/0` read got
+      # wrong: an inconclusive probe (HeavyReadRepo saturation) that falls back on a recent
+      # conclusive `false` produces the same boolean as a fresh conclusive `false`. Classifying
+      # on the record rather than on the probe's provenance sent the operator to upgrade an
+      # extension — possibly one already upgraded — over a capacity incident that WILL clear.
+      prime_iterative_scan(1)
+      prime_last_conclusive(false)
+      prime_iterative_scan_supported(false, :reused)
+
+      reused = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search))
+
+      assert reused.ann_iterative_scan == "unavailable"
+      assert reused.ann_iterative_scan_reason =~ "capability probe"
+      assert reused.ann_iterative_scan_reason =~ "self-heals"
+      refute reused.ann_iterative_scan_reason =~ "does NOT support it"
     end
 
     test "the LEGACY semantic response meta carries the disclosure, both states" do
@@ -412,10 +429,13 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     end)
   end
 
-  defp prime_iterative_scan_supported(verdict) do
+  # `provenance` is HOW the cached verdict was reached (`:conclusive` | `:reused` | `:guess`),
+  # which is what the disclosure classifies on. Defaults to the non-committal `:reused` so a
+  # test that only cares about the boolean cannot accidentally assert backend incapability.
+  defp prime_iterative_scan_supported(verdict, provenance \\ :reused) do
     :persistent_term.put(
       @probe_cache_key,
-      {verdict, System.monotonic_time(:millisecond) + 60_000}
+      {verdict, System.monotonic_time(:millisecond) + 60_000, provenance}
     )
 
     on_exit(fn -> :persistent_term.erase(@probe_cache_key) end)
@@ -427,7 +447,11 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
   end
 
   defp prime_expired_iterative_scan_supported(verdict) do
-    :persistent_term.put(@probe_cache_key, {verdict, System.monotonic_time(:millisecond) - 1})
+    :persistent_term.put(
+      @probe_cache_key,
+      {verdict, System.monotonic_time(:millisecond) - 1, :conclusive}
+    )
+
     on_exit(fn -> :persistent_term.erase(@probe_cache_key) end)
   end
 

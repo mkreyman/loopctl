@@ -576,7 +576,14 @@ defmodule Loopctl.HeavyRead do
   # behaves identically): `:unsupported` is a CONCLUSIVE "this backend cannot", which stands
   # until the extension is upgraded, while `:unavailable` is "we could not ask", which the
   # next conclusive probe clears. Reporting the first as the second promises a self-heal that
-  # will never come.
+  # will never come — and reporting the second as the first sends the operator to upgrade an
+  # extension when the real cause was pool saturation.
+  #
+  # Which one it is comes from the PROVENANCE the verdict carries out of the probe that
+  # produced it (`iterative_scan_verdict/0`), never from a second read of
+  # `last_conclusive_verdict/0`: a `false` an inconclusive probe merely REUSED from that
+  # record is indistinguishable there from a `false` the backend just gave, so classifying on
+  # it labelled a transient degradation permanent.
   @spec iterative_scan_state() :: :off | :unsupported | :unavailable | {:applied, String.t()}
   defp iterative_scan_state do
     case hnsw_iterative_scan() do
@@ -584,10 +591,10 @@ defmodule Loopctl.HeavyRead do
         :off
 
       mode ->
-        cond do
-          iterative_scan_supported?() -> {:applied, mode}
-          last_conclusive_verdict() == {:ok, false} -> :unsupported
-          true -> :unavailable
+        case iterative_scan_verdict() do
+          {true, _provenance} -> {:applied, mode}
+          {false, :conclusive} -> :unsupported
+          {false, _reused_or_guess} -> :unavailable
         end
     end
   end
@@ -664,9 +671,22 @@ defmodule Loopctl.HeavyRead do
   """
   @spec iterative_scan_supported?() :: boolean()
   def iterative_scan_supported? do
+    {verdict, _provenance} = iterative_scan_verdict()
+    verdict
+  end
+
+  # The verdict PLUS how it was reached, cached together so the two can never be resolved from
+  # separate reads: `:conclusive` (the backend answered), `:reused` (an inconclusive probe fell
+  # back on a recent conclusive record) or `:guess` (inconclusive with nothing to reuse — fail
+  # closed). `iterative_scan_state/0` is the consumer; only `:conclusive` may be disclosed as a
+  # backend incapability.
+  @spec iterative_scan_verdict() :: {boolean(), :conclusive | :reused | :guess}
+  defp iterative_scan_verdict do
     case :persistent_term.get({__MODULE__, :iterative_scan_supported}, :unknown) do
-      {verdict, expires_at} when is_boolean(verdict) ->
-        if now_ms() < expires_at, do: verdict, else: reprobe(verdict)
+      {verdict, expires_at, provenance} when is_boolean(verdict) ->
+        if now_ms() < expires_at,
+          do: {verdict, provenance},
+          else: reprobe(verdict, provenance)
 
       _unknown ->
         probe_and_cache()
@@ -688,21 +708,21 @@ defmodule Loopctl.HeavyRead do
   # probe is a sub-millisecond `pg_extension` lookup there.
   #
   # A cold VM (no entry at all) still probes concurrently; that is once per boot.
-  defp reprobe(false) do
-    cache_iterative_scan_verdict(false, @probe_timeout_ms)
+  defp reprobe(false, provenance) do
+    cache_iterative_scan_verdict(false, @probe_timeout_ms, provenance)
     probe_and_cache()
   end
 
-  defp reprobe(true), do: probe_and_cache()
+  defp reprobe(true, _provenance), do: probe_and_cache()
 
   defp probe_and_cache do
     case probe_iterative_scan_support() do
       {:ok, supported, version} ->
         maybe_warn_unsupported(supported, version)
-        cache_iterative_scan_verdict(supported, @iterative_scan_cache_ttl_ms)
+        cache_iterative_scan_verdict(supported, @iterative_scan_cache_ttl_ms, :conclusive)
         :persistent_term.put({__MODULE__, :iterative_scan_last_conclusive}, {supported, now_ms()})
         reset_guess_ttl()
-        supported
+        {supported, :conclusive}
 
       {:inconclusive, reason, class} ->
         inconclusive_verdict(reason, class)
@@ -729,10 +749,10 @@ defmodule Loopctl.HeavyRead do
         )
 
         if cacheable_inconclusive?(class) do
-          cache_iterative_scan_verdict(verdict, @iterative_scan_negative_ttl_ms)
+          cache_iterative_scan_verdict(verdict, @iterative_scan_negative_ttl_ms, :reused)
         end
 
-        verdict
+        {verdict, :reused}
 
       :none ->
         maybe_log_inconclusive(
@@ -742,10 +762,10 @@ defmodule Loopctl.HeavyRead do
         )
 
         if cacheable_inconclusive?(class) do
-          cache_iterative_scan_verdict(false, next_guess_ttl_ms())
+          cache_iterative_scan_verdict(false, next_guess_ttl_ms(), :guess)
         end
 
-        false
+        {false, :guess}
     end
   end
 
@@ -839,8 +859,11 @@ defmodule Loopctl.HeavyRead do
     Application.get_env(:loopctl, repo(), [])[:pool] == Ecto.Adapters.SQL.Sandbox
   end
 
-  defp cache_iterative_scan_verdict(verdict, ttl_ms) do
-    :persistent_term.put({__MODULE__, :iterative_scan_supported}, {verdict, now_ms() + ttl_ms})
+  defp cache_iterative_scan_verdict(verdict, ttl_ms, provenance) do
+    :persistent_term.put(
+      {__MODULE__, :iterative_scan_supported},
+      {verdict, now_ms() + ttl_ms, provenance}
+    )
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)

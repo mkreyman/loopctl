@@ -25,12 +25,12 @@ defmodule Loopctl.VectorRecallDiagnostics do
 
   ## Reading the output
 
-  Read section (a)'s `at dim=` COUNT first — it is an unlimited `count()`, unlike the row
-  sample under it. Non-zero, with the sampled rows carrying `live_denorm=true` and a
-  `published` status, means hypothesis (a) is dead and the plan in section (b) is where the
-  row was lost. Zero means the read never had a candidate and no amount of ANN tuning is
-  relevant. Never make that call from the SAMPLE: it is capped, so an absent row there is
-  not an absent row.
+  Read section (a)'s `at dim=... AND live_denorm AND published` COUNT first — it is an
+  unlimited `count()` carrying the read's own visibility predicates, unlike the row sample
+  under it. Non-zero means hypothesis (a) is dead and the plan in section (b) is where the row
+  was lost. Zero means the read never had a candidate and no amount of ANN tuning is relevant.
+  Never make that call from the SAMPLE: it is capped, so an absent row there is not an absent
+  row — the sample is for seeing WHICH predicate a row failed, once the counts disagree.
 
   Two caveats that are part of the reading, not footnotes:
 
@@ -172,7 +172,7 @@ defmodule Loopctl.VectorRecallDiagnostics do
   # AdminRepo (BYPASSRLS), no vector predicate, no dimension predicate, no join
   # condition that can drop a row. Anything absent here was never visible.
   defp visibility(tenant_id, dim) do
-    {total, at_dim} = tenant_counts(tenant_id, dim)
+    {total, at_dim, visible} = tenant_counts(tenant_id, dim)
 
     rows =
       AdminRepo.all(
@@ -195,7 +195,9 @@ defmodule Loopctl.VectorRecallDiagnostics do
 
     [
       "  tenant rows: #{total} (COUNT — authoritative)",
-      "  at dim=#{dim}: #{at_dim} (COUNT — authoritative; ZERO here is hypothesis (a))",
+      "  at dim=#{dim}: #{at_dim} (COUNT — authoritative)",
+      "  at dim=#{dim} AND live_denorm AND published: #{visible} " <>
+        "(COUNT — authoritative; ZERO here is hypothesis (a))",
       "  corpus-wide rows at dim=#{dim} (ALL tenants — how crowded the shared index is): " <>
         "#{global_count(dim)}",
       "  sample below: #{length(rows)} of them, dim=#{dim} first, capped at #{@sample_limit}"
@@ -204,12 +206,21 @@ defmodule Loopctl.VectorRecallDiagnostics do
     |> Kernel.++(Enum.map(rows, &["    ", format_row(&1), "\n"]))
   end
 
-  # Unlimited counts, so the (a)-vs-(b) call is never made on a truncated sample.
+  # Unlimited counts, so the (a)-vs-(b) call is never made on a truncated sample. The third
+  # one carries the read's OWN visibility predicates (`dim` + `live_denorm` + a published
+  # article): counting only `(tenant_id, dim)` still left the live/status half of hypothesis
+  # (a) readable nowhere but the capped sample, which is the truncation this exists to remove.
   defp tenant_counts(tenant_id, dim) do
     AdminRepo.one(
       from(ae in ArticleEmbedding,
+        left_join: a in Article,
+        on: a.id == ae.article_id,
         where: ae.tenant_id == ^tenant_id,
-        select: {count(), filter(count(), ae.dim == ^dim)}
+        select: {
+          count(),
+          filter(count(), ae.dim == ^dim),
+          filter(count(), ae.dim == ^dim and ae.live_denorm and a.status == :published)
+        }
       )
     )
   end
