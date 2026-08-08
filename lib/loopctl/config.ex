@@ -43,6 +43,13 @@ defmodule Loopctl.Config do
   # the FIRST encrypt/decrypt rather than at boot. Checked here so it fails at boot.
   @cloak_key_bytes 32
 
+  # A cipher tag is stamped into every ciphertext header and read back OFF the stored bytes
+  # (`Loopctl.Vault.Rotation.tag_of/1`, which bounds what it will accept as a tag). Bounding
+  # it here, where the value is admitted, is what stops a boot that succeeded from producing
+  # rows the rotation tooling reads as `:untagged` — and from breaking `active_tag/0`, which
+  # reads the active tag back through the same decoder.
+  @cloak_max_tag_bytes 32
+
   # A retired key exists to be re-encrypted AWAY from. More than a handful means the
   # re-encryption pass is not being run, which is a backlog to work off, not a config to
   # grow — and every entry is a linear probe on every decrypt.
@@ -76,6 +83,10 @@ defmodule Loopctl.Config do
   @doc "The cipher tag used when `CLOAK_KEY_TAG` is unset."
   @spec cloak_default_tag() :: String.t()
   def cloak_default_tag, do: @cloak_default_tag
+
+  @doc "The longest a cipher tag may be. `Loopctl.Vault.Rotation` reads the same bound."
+  @spec cloak_max_tag_bytes() :: pos_integer()
+  def cloak_max_tag_bytes, do: @cloak_max_tag_bytes
 
   @doc """
   Builds the vault's `:ciphers` list from the CLOAK_* env VALUES (never the names —
@@ -117,8 +128,10 @@ defmodule Loopctl.Config do
   `cloak_ciphers!/3` at a call site, which is what pins the active cipher to position 0.
   """
   @spec cloak_retired_ciphers!(String.t() | nil, String.t()) :: keyword()
+  # Only an UNSET variable means "no retired keys". An empty string is what a deploy that
+  # built the value from an empty list actually renders, so it goes through the same
+  # names-no-entries raise below rather than being exempted here.
   def cloak_retired_ciphers!(nil, _active_tag), do: []
-  def cloak_retired_ciphers!("", _active_tag), do: []
 
   def cloak_retired_ciphers!(retired, active_tag) when is_binary(retired) do
     # Indexed BEFORE blanks are dropped, so the position every error message names is the
@@ -178,7 +191,10 @@ defmodule Loopctl.Config do
             "the older key's rows unreadable. Bump CLOAK_KEY_TAG when you rotate CLOAK_KEY."
   end
 
-  defp validate_retired_tag!(_tag, _position, _active_tag), do: :ok
+  defp validate_retired_tag!(tag, position, _active_tag) do
+    validate_tag_shape!(tag, "CLOAK_RETIRED_KEYS entry #{position}'s tag")
+    :ok
+  end
 
   defp reject_duplicate_tags!(entries) do
     duplicates =
@@ -212,7 +228,28 @@ defmodule Loopctl.Config do
   defp cloak_tag!(tag) when is_binary(tag) do
     case String.trim(tag) do
       "" -> @cloak_default_tag
-      trimmed -> trimmed
+      trimmed -> validate_tag_shape!(trimmed, "CLOAK_KEY_TAG")
+    end
+  end
+
+  # A tag is a short printable label. An over-long or non-printable one is accepted by Cloak
+  # (its framing encodes up to 127 bytes) and then read back as garbage or not at all, which
+  # breaks `Loopctl.Vault.Rotation.active_tag/0` and buckets healthy rows as `:untagged`.
+  defp validate_tag_shape!(tag, source) do
+    cond do
+      byte_size(tag) > @cloak_max_tag_bytes ->
+        raise ArgumentError,
+              "#{source} is #{byte_size(tag)} bytes, over the #{@cloak_max_tag_bytes} allowed. " <>
+                "The tag is stamped into every ciphertext header and read back off the stored " <>
+                "bytes; an over-long one makes mix loopctl.reencrypt_secrets unusable."
+
+      not Regex.match?(~r/\A[\x20-\x7E]+\z/, tag) ->
+        raise ArgumentError,
+              "#{source} holds a byte outside printable ASCII. A cipher tag is a short " <>
+                "printable label such as #{@cloak_default_tag}."
+
+      true ->
+        tag
     end
   end
 

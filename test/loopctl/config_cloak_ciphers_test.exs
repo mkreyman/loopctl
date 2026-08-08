@@ -27,6 +27,37 @@ defmodule Loopctl.ConfigCloakCiphersTest do
       end
     end
 
+    # Cloak's framing encodes a tag of up to 127 bytes, so an over-long or non-printable one
+    # boots and is stamped into every header — and then Rotation.active_tag/0, which reads
+    # the tag back off a probe, raises "the vault is misconfigured" and the whole rotation
+    # tooling is unusable during a rotation. The bound belongs where the value is admitted.
+    test "a tag over the bound, or holding a non-printable byte, raises at boot" do
+      long = String.duplicate("A", Config.cloak_max_tag_bytes() + 1)
+
+      assert_raise ArgumentError, ~r/CLOAK_KEY_TAG is #{byte_size(long)} bytes/, fn ->
+        Config.cloak_ciphers!(@active, long)
+      end
+
+      assert_raise ArgumentError, ~r/CLOAK_KEY_TAG holds a byte outside printable ASCII/, fn ->
+        Config.cloak_ciphers!(@active, "AES.GCM.\x01")
+      end
+
+      assert [default: {_module, opts}] =
+               Config.cloak_ciphers!(@active, String.duplicate("A", Config.cloak_max_tag_bytes()))
+
+      assert byte_size(opts[:tag]) == Config.cloak_max_tag_bytes()
+    end
+
+    # A retired tag is matched against the tag READ OFF stored bytes, so the same bound
+    # applies: one Rotation cannot decode buckets those rows as :untagged and fails them.
+    test "a retired entry's tag is bounded the same way, named by position" do
+      long = String.duplicate("B", Config.cloak_max_tag_bytes() + 1)
+
+      assert_raise ArgumentError, ~r/CLOAK_RETIRED_KEYS entry 1's tag is/, fn ->
+        Config.cloak_ciphers!(@active, "AES.GCM.V2", "#{long}:#{@retired}")
+      end
+    end
+
     # Cloak.Vault.encrypt/2 takes hd(ciphers) — NOT the entry labelled :default. If a
     # retired key ever sorted first, every new write would go out under a dead key.
     test "the active cipher is FIRST, ahead of every retired key" do
@@ -53,17 +84,16 @@ defmodule Loopctl.ConfigCloakCiphersTest do
       assert second[:key] == :binary.copy(<<3>>, 32)
     end
 
-    test "an unset or empty CLOAK_RETIRED_KEYS adds nothing" do
-      for value <- [nil, ""] do
-        assert [{:default, _cipher}] = Config.cloak_ciphers!(@active, nil, value)
-      end
+    test "an UNSET CLOAK_RETIRED_KEYS adds nothing" do
+      assert [{:default, _cipher}] = Config.cloak_ciphers!(@active, nil, nil)
     end
 
-    # A deploy script that builds the value from an empty list produces "," or " " — not
-    # the same statement as "unset". Accepting it yields zero retired ciphers on a boot the
-    # operator believes carries them, which is the silent drop this guard exists to stop.
+    # A deploy script that builds the value from an empty list produces "" (the likeliest
+    # shape by far), "," or " " — none of them the same statement as "unset". Accepting one
+    # yields zero retired ciphers on a boot the operator believes carries them, which is the
+    # silent drop this guard exists to stop.
     test "a value the operator SET that names no entries raises rather than meaning none" do
-      for value <- ["  ", ",", ",,", " , "] do
+      for value <- ["", "  ", ",", ",,", " , "] do
         assert_raise ArgumentError, ~r/is set but names no entries/, fn ->
           Config.cloak_ciphers!(@active, nil, value)
         end

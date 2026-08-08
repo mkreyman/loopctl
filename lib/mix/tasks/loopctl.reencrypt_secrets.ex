@@ -33,6 +33,9 @@ defmodule Mix.Tasks.Loopctl.ReencryptSecrets do
     * `skipped_null` — the row's encrypted columns are all empty
     * `skipped_concurrent` — the application rewrote the row mid-pass and a re-read
       confirms it is on the active cipher; nothing was clobbered
+    * `skipped_unsettled` — the row was rewritten under the pass TWICE, so the retry lost
+      the race too and nothing re-read it. It may still be on the retired key: the task
+      exits non-zero, and a re-run settles it.
     * `skipped_gone` — the row was deleted mid-pass (routine on the TTL-pruned
       `idempotency_cache`); there is nothing left to re-encrypt
     * `failed` — the plaintext could NOT be recovered, almost always a retired key missing
@@ -85,6 +88,14 @@ defmodule Mix.Tasks.Loopctl.ReencryptSecrets do
         print_report(report)
         Mix.raise("the pass aborted before completing (see above); re-running it resumes")
 
+      {:error, %{totals: %{failed: 0}} = report} ->
+        print_report(report)
+
+        Mix.raise(
+          "#{report.totals.skipped_unsettled} row(s) could not be settled and may still be " <>
+            "on the retired key; re-run before dropping it"
+        )
+
       {:error, report} ->
         print_report(report)
         Mix.raise("#{report.totals.failed} row(s) could not be re-encrypted (see above)")
@@ -126,7 +137,8 @@ defmodule Mix.Tasks.Loopctl.ReencryptSecrets do
   end
 
   defp format_counts(counts) do
-    ~w(examined reencrypted skipped_active skipped_null skipped_concurrent skipped_gone failed)a
+    ~w(examined reencrypted skipped_active skipped_null skipped_concurrent skipped_unsettled
+       skipped_gone failed)a
     |> Enum.map_join(" ", fn key -> "#{key}=#{Map.fetch!(counts, key)}" end)
   end
 

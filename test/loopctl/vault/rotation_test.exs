@@ -173,7 +173,8 @@ defmodule Loopctl.Vault.RotationTest do
 
       assert counts.examined ==
                counts.reencrypted + counts.skipped_active + counts.skipped_null +
-                 counts.skipped_concurrent + counts.skipped_gone + counts.failed
+                 counts.skipped_concurrent + counts.skipped_unsettled + counts.skipped_gone +
+                 counts.failed
 
       assert Rotation.tag_of(webhook_raw(retired_row.id)) == {:ok, Rotation.active_tag()}
       assert Rotation.tag_of(webhook_raw(already_active.id)) == {:ok, Rotation.active_tag()}

@@ -40,8 +40,8 @@ defmodule Loopctl.Vault.Rotation do
   tag is skipped, which makes a second run a no-op and an interrupted run cheap to resume.
 
   Every row is accounted for under exactly one of `reencrypted`, `skipped_active`,
-  `skipped_null`, `skipped_concurrent`, `skipped_gone` or `failed` — the counts sum to
-  `examined`. A row whose plaintext cannot be recovered (its cipher is not
+  `skipped_null`, `skipped_concurrent`, `skipped_unsettled`, `skipped_gone` or `failed` —
+  the counts sum to `examined`. A row whose plaintext cannot be recovered (its cipher is not
   configured, or the GCM auth check fails) is a FAILURE, never a skip: that is the one
   outcome a half-configured `CLOAK_RETIRED_KEYS` produces, and reporting it as success
   would hide the data loss this task exists to prevent.
@@ -52,7 +52,9 @@ defmodule Loopctl.Vault.Rotation do
   row is on the active cipher": the guard spans every column, so a write to ONE voids it
   while the rest sit on the retired key, and a DELETE looks identical. The row is re-read
   and re-decided once — `skipped_gone` if it vanished, a retry if anything is still stale,
-  `skipped_concurrent` only once the re-read shows it converted.
+  `skipped_concurrent` only once the re-read shows it converted. A retry that ALSO loses the
+  race is `skipped_unsettled`, never `skipped_concurrent`: nothing re-read it, so it may
+  still be on the retired key, and a non-zero count fails the run.
 
   ## Repo choice
 
@@ -80,8 +82,10 @@ defmodule Loopctl.Vault.Rotation do
   # Cap on the failure detail carried back for printing. `failed` still counts them all.
   @max_reported_failures 50
 
-  # A cipher tag is a short printable label ("AES.GCM.V1"). See `tag_of/1`.
-  @max_tag_bytes 32
+  # A cipher tag is a short printable label ("AES.GCM.V1"). See `tag_of/1`. The bound is
+  # `Loopctl.Config`'s, so the tags an operator can SET and the tags this can READ BACK are
+  # one rule: a tag Config admits at boot is a tag this module accepts off the stored bytes.
+  @max_tag_bytes Loopctl.Config.cloak_max_tag_bytes()
   @type column :: %{field: atom(), column: String.t()}
   @type target :: %{
           schema: module(),
@@ -95,6 +99,7 @@ defmodule Loopctl.Vault.Rotation do
           skipped_active: non_neg_integer(),
           skipped_null: non_neg_integer(),
           skipped_concurrent: non_neg_integer(),
+          skipped_unsettled: non_neg_integer(),
           skipped_gone: non_neg_integer(),
           failed: non_neg_integer()
         }
@@ -114,6 +119,7 @@ defmodule Loopctl.Vault.Rotation do
     skipped_active: 0,
     skipped_null: 0,
     skipped_concurrent: 0,
+    skipped_unsettled: 0,
     skipped_gone: 0,
     failed: 0
   }
@@ -197,7 +203,7 @@ defmodule Loopctl.Vault.Rotation do
       |> selected_targets()
       |> Enum.reduce(%{}, fn target, acc ->
         columns = census_table(target, batch_size(opts))
-        Map.update(acc, target.table, columns, &Map.merge(&1, columns))
+        Map.update(acc, target.table, columns, &merge_columns(&1, columns))
       end)
 
     %{active_tag: tag, tables: tables}
@@ -213,7 +219,8 @@ defmodule Loopctl.Vault.Rotation do
     * `:dry_run` — read, decrypt and classify, but write nothing. `reencrypted` then
       counts the rows a real run WOULD rewrite.
 
-  Returns `{:ok, report}`, or `{:error, report}` when any row failed to decrypt.
+  Returns `{:ok, report}`, or `{:error, report}` when any row failed to decrypt or could not
+  be settled.
   """
   @spec reencrypt(keyword()) :: {:ok, report()} | {:error, report()}
   def reencrypt(opts \\ []) do
@@ -230,7 +237,9 @@ defmodule Loopctl.Vault.Rotation do
 
     Logger.info("cloak rotation: finished #{inspect(report.totals)}")
 
-    if report.aborted or report.totals.failed > 0, do: {:error, report}, else: {:ok, report}
+    if report.aborted or report.totals.failed > 0 or report.totals.skipped_unsettled > 0,
+      do: {:error, report},
+      else: {:ok, report}
   end
 
   ## Target enumeration
@@ -349,23 +358,43 @@ defmodule Loopctl.Vault.Rotation do
     |> walk(target, context, nil)
   end
 
-  # The rescue is per BATCH frame, so a mid-pass DB error (dropped connection, statement
-  # timeout) returns the counts gathered so far instead of raising them away.
+  # A mid-pass DB error (dropped connection, statement timeout, a pool process exiting)
+  # returns the counts gathered so far instead of raising them away. The frame below only
+  # covers the fetch: a rescue there closes over the `report` bound at ENTRY, so rows this
+  # batch already tallied would be discarded — `walk_rows/4` catches per ROW instead.
   defp walk(report, target, context, after_pk) do
     case fetch_batch(target, after_pk, context.batch_size) do
       [] ->
         report
 
       rows ->
-        report = Enum.reduce(rows, report, &apply_row(&1, target, context, &2))
-        walk(report, target, context, rows |> List.last() |> hd())
+        case walk_rows(rows, target, context, report) do
+          {:ok, report} -> walk(report, target, context, rows |> List.last() |> hd())
+          {:aborted, report} -> report
+        end
     end
   rescue
     error -> abort(report, target, error)
+  catch
+    :exit, reason -> abort(report, target, {:exit, reason})
+  end
+
+  defp walk_rows(rows, target, context, report) do
+    Enum.reduce_while(rows, {:ok, report}, fn row, {:ok, acc} ->
+      try do
+        {:cont, {:ok, apply_row(row, target, context, acc)}}
+      rescue
+        error -> {:halt, {:aborted, abort(acc, target, error)}}
+      catch
+        # `rescue` alone misses an exit — a pool or connection process dying under the pass
+        # is not a raised exception, and it would take the partial report with it.
+        :exit, reason -> {:halt, {:aborted, abort(acc, target, {:exit, reason})}}
+      end
+    end)
   end
 
   defp abort(report, target, error) do
-    reason = "aborted before completing: #{Exception.message(error)}"
+    reason = "aborted before completing: #{describe_abort(error)}"
     Logger.error("cloak rotation: #{target.table}: #{reason}")
     failure = %{table: target.table, id: "(pass)", reason: reason}
 
@@ -373,6 +402,9 @@ defmodule Loopctl.Vault.Rotation do
     |> Map.put(:aborted, true)
     |> Map.put(:failures, report.failures ++ [failure])
   end
+
+  defp describe_abort({:exit, reason}), do: "exited: #{Exception.format_exit(reason)}"
+  defp describe_abort(error), do: Exception.message(error)
 
   defp apply_row([pk | values], target, context, report) do
     case classify(values, target, context.active_tag) do
@@ -467,9 +499,13 @@ defmodule Loopctl.Vault.Rotation do
     end
   end
 
+  # The retry can lose the race too, and its 0-row result carries NO re-read — so it may not
+  # claim `skipped_concurrent`, which is defined as "a re-read showed it converted". It gets
+  # its own bucket, and that bucket fails the run: the row may still be on the retired key,
+  # and this count is what the runbook has the operator weigh before dropping it.
   defp retry_write(report, target, pk, rewrites) do
     case cas(target, pk, rewrites) do
-      0 -> tally(report, target.table, :skipped_concurrent)
+      0 -> tally(report, target.table, :skipped_unsettled)
       _rows -> tally(report, target.table, :reencrypted)
     end
   end
@@ -531,6 +567,15 @@ defmodule Loopctl.Vault.Rotation do
       Map.update!(inner, column.column, fn tally ->
         Map.update(tally, census_key(value), 1, &(&1 + 1))
       end)
+    end)
+  end
+
+  # Summed per tag, not last-write-wins: two schemas sharing a table may declare the SAME
+  # column name, and overwriting one tally under-reports how much ciphertext is still on the
+  # retired tag — the one number step 7 of the runbook uses to authorise dropping the key.
+  defp merge_columns(existing, added) do
+    Map.merge(existing, added, fn _column, left, right ->
+      Map.merge(left, right, fn _tag, a, b -> a + b end)
     end)
   end
 

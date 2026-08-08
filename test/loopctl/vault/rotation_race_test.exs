@@ -65,6 +65,26 @@ defmodule Loopctl.Vault.RotationRaceTest do
     assert report.totals.failed == 0
   end
 
+  # The rescue used to sit on the BATCH frame, closing over the report bound at entry — so
+  # the rows already converted in the failing batch were dropped from the printed counts.
+  test "an abort keeps the counts the failing batch had already accrued" do
+    last =
+      two_rows_on_retired_key()
+      |> Enum.sort_by(&Ecto.UUID.dump!(&1.id))
+      |> List.last()
+
+    race_trigger(
+      ~s|IF NEW.id = '#{last.id}' THEN RAISE EXCEPTION 'connection went away'; | <>
+        "END IF;"
+    )
+
+    assert {:error, report} = Rotation.reencrypt(table: @table, batch_size: 2)
+
+    assert report.aborted
+    assert report.totals.reencrypted == 1
+    assert report.totals.examined == 1
+  end
+
   defp retired_opts do
     {GCM, opts} = Keyword.fetch!(Application.get_env(:loopctl, Vault)[:ciphers], :retired_v0)
     opts

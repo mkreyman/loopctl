@@ -63,6 +63,14 @@ Mix, so use the running node: `bin/loopctl rpc 'Loopctl.Vault.Rotation.reencrypt
 
    The app restarts. Nothing writes the new key yet; every machine can now read it.
 
+   `CLOAK_RETIRED_KEYS` is a LIST and `fly secrets set` REPLACES it — it does not append.
+   If a previous rotation has not reached step 7, its key is still in there and still
+   needed: read the current value first (`fly secrets list` shows only the digest, so take
+   it from wherever you keep the key material) and list every entry you must keep alongside
+   the new one, comma-separated — `"AES.GCM.V2:NEW_KEY,AES.GCM.V1:OLDER_KEY"`. Dropping an
+   entry this way is well-formed config, so no boot guard fires; the rows it wrote simply
+   stop decrypting. The same applies to phase 2 below.
+
 4. **Phase 2 — promote it**, retiring the outgoing key under the tag it wrote:
 
        fly secrets set \
@@ -91,10 +99,12 @@ Mix, so use the running node: `bin/loopctl rpc 'Loopctl.Vault.Rotation.reencrypt
    a quiet window, and `--table` if you want to spread it out.
 
    Read the counts. `reencrypted` + `skipped_active` + `skipped_null` +
-   `skipped_concurrent` + `skipped_gone` + `failed` equals `examined` — every row is
-   accounted for. A non-zero `failed` exits non-zero and names the rows; the overwhelmingly
-   likely cause is a retired key missing from `CLOAK_RETIRED_KEYS`. Fix the secret and
-   re-run; the rows already converted are skipped.
+   `skipped_concurrent` + `skipped_unsettled` + `skipped_gone` + `failed` equals `examined`
+   — every row is accounted for. A non-zero `failed` exits non-zero and names the rows; the
+   overwhelmingly likely cause is a retired key missing from `CLOAK_RETIRED_KEYS`. Fix the
+   secret and re-run; the rows already converted are skipped. A non-zero `skipped_unsettled`
+   also exits non-zero: those rows were rewritten by the application twice under the pass and
+   may still carry the retired tag, so re-run until the count is zero.
 
 6. **Drain the `:ingestion` AND `:cleanup` queues.** Both carry Cloak-encrypted values
    inside `oban_jobs.args`, which the pass does not touch — it walks schema columns — and
