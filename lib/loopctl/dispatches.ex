@@ -536,6 +536,29 @@ defmodule Loopctl.Dispatches do
   end
 
   @doc """
+  The lineage path of the dispatch that minted `api_key_id`, REVOKED OR NOT.
+
+  For the lineage CEILING, where the question is "was this principal ever inside a
+  lineage", not "is its dispatch live". `lineage_for_api_key/2` answers `[]` for a
+  revoked dispatch — inert, which is right for the custody gates but exactly the
+  shape the ceiling admits as "may start a root". Returns `[]` only when no dispatch
+  minted the key.
+  """
+  @spec minting_lineage_for_api_key(Ecto.UUID.t(), Ecto.UUID.t() | nil) :: [Ecto.UUID.t()]
+  def minting_lineage_for_api_key(_tenant_id, nil), do: []
+
+  def minting_lineage_for_api_key(tenant_id, api_key_id) do
+    from(d in Dispatch,
+      where: d.tenant_id == ^tenant_id and d.api_key_id == ^api_key_id,
+      select: d.lineage_path,
+      order_by: [desc: d.created_at],
+      limit: 1
+    )
+    |> AdminRepo.one()
+    |> Kernel.||([])
+  end
+
+  @doc """
   Resolves the active (non-revoked) dispatch that minted an API key, tenant-scoped.
 
   Server-side identity resolution for LCP-1 §9.3 signed-profile enforcement: the
