@@ -18,6 +18,12 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   `unpublish` (#605/#606). The SET-BASED bulk ops (`bulk_delete`, incl. the
   irreversible HARD-delete path, `bulk_publish`, `bulk_unpublish`) stay
   `user`-gated: high blast radius AND irreversible.
+
+  Recording a verdict stays agent+ in every disposition; what an agent cannot do
+  ALONE is drive the unattended RETIREMENT that a `supersede` at confidence "high"
+  triggers. The role gate is the plug; the confidence a `supersede` is recorded at
+  is granted from that same role in `Loopctl.Knowledge.annotate_conflict/3`, never
+  taken from the request body. A `merge` retires nothing, so it is not capped.
   """
 
   use LoopctlWeb, :controller
@@ -293,7 +299,19 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         "pairs the system flagged (GET /knowledge/conflicts) may be resolved; an unknown pair " <>
         "returns 422. All dispositions are agent+ KB-content curation (#331): they are " <>
         "non-destructive + audited, and the privileged nightly executor is what actually " <>
-        "applies supersede/merge.",
+        "applies supersede/merge. " <>
+        "**On a `supersede`, `confidence` is granted, not accepted.** Only an orchestrator+ " <>
+        "key can record `high` there, the value that authorizes the executor to RETIRE an " <>
+        "article unattended; an agent-role request asking for `high` is recorded at " <>
+        "`medium`, the response says so in `data.requested_confidence` and `note`, and the " <>
+        "pair stays in GET /knowledge/conflicts so an orchestrator+ key can re-record it. " <>
+        "`merge` retires nothing (it synthesizes a new draft, sources preserved) and is " <>
+        "never capped, but a `high` merge is NOT unattended-free: the executor synthesizes on " <>
+        "the tenant's own paid model key and POSTs both bodies to the provider. A `high` " <>
+        "supersede OR merge therefore REQUIRES `evidence` (422 without it) — every verdict " <>
+        "the executor applies with nobody in the loop must carry the reason it was reached. " <>
+        "A supersede/merge recorded BELOW `high` is closed as dismissed by the next nightly " <>
+        "run (both articles retained); it is not held for review.",
     request_body:
       {"Resolution", "application/json",
        %OpenApiSpex.Schema{
@@ -311,17 +329,33 @@ defmodule LoopctlWeb.ArticleWorkflowController do
              type: :string,
              enum: ["redundant", "complementary", "contradictory"]
            },
-           evidence: %OpenApiSpex.Schema{type: :string},
-           confidence: %OpenApiSpex.Schema{type: :string, enum: ["high", "medium", "low"]}
+           evidence: %OpenApiSpex.Schema{
+             type: :string,
+             description:
+               "Why this verdict was reached. REQUIRED for a supersede OR merge recorded " <>
+                 "at confidence `high` — those are the verdicts the nightly executor " <>
+                 "applies with nobody in the loop."
+           },
+           confidence: %OpenApiSpex.Schema{
+             type: :string,
+             enum: ["high", "medium", "low"],
+             description:
+               "Requested confidence. On a `supersede` it is capped server-side by the " <>
+                 "recording key's role: `high` is recorded only for an orchestrator+ key. " <>
+                 "When capped, the response carries the requested value in " <>
+                 "`data.requested_confidence`. `merge` is never capped."
+           }
          }
        }},
     responses: %{
       201 =>
-        {"Recorded", "application/json",
+        {"Recorded (see `data.confidence` for what was GRANTED, and " <>
+           "`data.requested_confidence` when it was capped)", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       422 =>
-        {"Validation error, or no system-flagged potential_conflict for the pair",
-         "application/json", Schemas.ErrorResponse},
+        {"Validation error (including a `high` supersede/merge with no `evidence`), or no " <>
+           "system-flagged potential_conflict for the pair", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -750,7 +784,16 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     # Visibility scope (#331): an agent may only resolve a pair whose BOTH members
     # it can see — annotate_conflict/3 refuses an invisible member as :no_potential_conflict
     # (422), matching the update/delete/archive paths. Higher roles pass no scope.
-    opts = AuditContext.from_conn(conn) ++ Visibility.scope_opts(conn)
+    #
+    # `:actor_role` comes from the AUTHENTICATED key, never from params — it caps the
+    # confidence the verdict is recorded at, and `confidence: "high"` is what lets the
+    # nightly executor retire an article with nobody watching. `Plugs.Impersonate` already
+    # rewrites `current_api_key.role` to the effective role, so this reads the role the
+    # request actually acts with (same source `Visibility.scope_opts/1` uses).
+    opts =
+      AuditContext.from_conn(conn) ++
+        Visibility.scope_opts(conn) ++
+        [actor_role: conn.assigns.current_api_key.role]
 
     attrs = %{
       "source_article_id" => params["source_article_id"],
@@ -771,6 +814,11 @@ defmodule LoopctlWeb.ArticleWorkflowController do
             id: resolution.id,
             disposition: to_string(resolution.disposition),
             confidence: to_string(resolution.confidence),
+            # Present (non-null) only when the server granted LESS than was asked for, so
+            # a caller learns the cap from the response instead of from a verdict that
+            # never applies.
+            requested_confidence:
+              resolution.requested_confidence && to_string(resolution.requested_confidence),
             executed: not is_nil(resolution.executed_at)
           },
           note: resolution_note(resolution)
@@ -788,21 +836,45 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     end
   end
 
+  # `:dismiss` is complete on record and ignores confidence entirely, so it is answered
+  # before the cap note — a capped dismiss changed nothing about the outcome.
   defp resolution_note(%{disposition: :dismiss}),
     do: "Dismissed as a false positive — the pair is removed from the conflict queue."
+
+  # The cap is reported to the caller rather than left to be inferred from a verdict that
+  # never applies: confidence is granted from the RECORDING ROLE, not accepted from the
+  # request, because "high" is what authorizes the unattended retirement. The note states
+  # where the pair goes next — a capped verdict is NOT auto-applied and NOT auto-dismissed,
+  # and its pair stays in GET /knowledge/conflicts precisely so it can be re-recorded.
+  defp resolution_note(%{disposition: :supersede, requested_confidence: asked, confidence: got})
+       when not is_nil(asked),
+       do:
+         "Recorded at confidence #{got}, NOT the #{asked} requested: only an orchestrator+ " <>
+           "key may authorize the unattended supersede that high confidence triggers. " <>
+           "Nothing is auto-applied and nothing is auto-dismissed — the pair stays in " <>
+           "GET /knowledge/conflicts until an orchestrator+ key records it at high confidence."
 
   defp resolution_note(%{disposition: :supersede, confidence: :high}),
     do:
       "Recorded. The nightly executor will supersede the loser (create a supersedes link " <>
         "and retire it) — reversible and audited."
 
-  defp resolution_note(%{disposition: :supersede}),
+  defp resolution_note(%{disposition: :merge, confidence: :high}),
     do:
-      "Recorded, but NOT auto-applied: supersede executes only at confidence \"high\". " <>
-        "Left for review at the current confidence."
+      "Recorded. The nightly executor will synthesize a MERGED DRAFT from both articles " <>
+        "using this tenant's own model key — both sources stay published, the draft is " <>
+        "never auto-published, and it inherits the more restrictive of the two sources' " <>
+        "visibility."
 
-  defp resolution_note(%{disposition: :merge}),
-    do: "Recorded for the merge (LLM-synthesis) step — not applied by the nightly executor yet."
+  # The twins below. NOT "left for review": a supersede/merge deliberately recorded below
+  # high is closed as DISMISSED by the next nightly run and the pair leaves the queue, so a
+  # note promising review would send the caller back to a surface the verdict is no longer
+  # on. Re-recording at high confidence is the only route to applying it.
+  defp resolution_note(%{disposition: disposition}) when disposition in [:supersede, :merge],
+    do:
+      "Recorded, but NOT auto-applied: #{disposition} executes only at confidence \"high\". " <>
+        "The next nightly run CLOSES it as dismissed (both articles retained) and the pair " <>
+        "leaves GET /knowledge/conflicts — re-annotate at high confidence to apply it."
 
   # --- Private helpers ---
 
