@@ -177,6 +177,59 @@ defmodule Loopctl.Tenants.AuditKeyTest do
   end
 
   describe "rotate_audit_key/2" do
+    test "broadcasts the cluster invalidation, so peers stop signing with the retired key" do
+      # #638 gave `TenantKeys` a cross-node bridge, and both halves were covered:
+      # `invalidate_cluster/1` broadcasts, and the supervised owner busts on
+      # receipt. NOTHING covered the WIRING — deleting this call site from
+      # `rotate_audit_key/2` left the full suite green, so the fix could have been
+      # refactored away silently. That is the whole failure it exists to prevent:
+      # a peer keeps signing with the RETIRED key, and `signing_keys/2` admits a
+      # historical key only for the window it was live, so the token verifies as
+      # `:invalid_signature` and is chained as `capability_forged`,
+      # `byzantine: true` — a benign rotation manufacturing forgery evidence.
+      tenant = fixture(:tenant)
+
+      tenant =
+        tenant
+        |> Ecto.Changeset.change(audit_signing_public_key: :crypto.strong_rand_bytes(32))
+        |> AdminRepo.update!()
+
+      Mox.expect(Loopctl.MockSecrets, :set, fn _name, _value -> :ok end)
+      :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, "tenant_keys:invalidate")
+
+      assert {:ok, _updated} =
+               Tenants.rotate_audit_key(tenant.id, :crypto.strong_rand_bytes(64))
+
+      tenant_id = tenant.id
+      assert_receive {:invalidate, ^tenant_id}
+    end
+
+    test "busts the api_key cache, whose snapshots carry the tenant's audit public key" do
+      # The SECOND untested wiring on this path (US-33.3). Cached api_key
+      # snapshots embed `audit_signing_public_key`, so a rotation leaves every
+      # cached key advertising the RETIRED public half — which is what the
+      # capability verifier checks a signature against. Deleting this call site
+      # also left the full suite green.
+      tenant = fixture(:tenant)
+
+      tenant =
+        tenant
+        |> Ecto.Changeset.change(audit_signing_public_key: :crypto.strong_rand_bytes(32))
+        |> AdminRepo.update!()
+
+      {_raw, api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :user, name: "rotate-cache"})
+
+      Mox.expect(Loopctl.MockSecrets, :set, fn _name, _value -> :ok end)
+      :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, "auth:api_key_cache:invalidate")
+
+      assert {:ok, _updated} =
+               Tenants.rotate_audit_key(tenant.id, :crypto.strong_rand_bytes(64))
+
+      key_hash = api_key.key_hash
+      assert_receive {:invalidate, ^key_hash}
+    end
+
     test "rotates the key, archives the old one, and writes audit entry" do
       # Create tenant with an initial audit key
       tenant = fixture(:tenant, %{slug: "rotate-me"})
@@ -296,6 +349,33 @@ defmodule Loopctl.Tenants.AuditKeyTest do
 
       secret_name = Secrets.audit_key_secret_name(slug)
       assert_received {:deleted, ^secret_name}
+    end
+
+    test "busts the cached miss, so a peer stops refusing a tenant that now HAS a key" do
+      tenant = fixture(:tenant)
+      secret_name = Secrets.audit_key_secret_name(tenant.slug)
+      test_pid = self()
+
+      # A keyless tenant answers `:not_found`, and that failure is cached ON
+      # PURPOSE: `Dispatches.verifier_seed/2` asks on every request-review, so an
+      # uncached miss is a permanent storm against a 3-connection pool.
+      Mox.stub(Loopctl.MockSecrets, :get, fn ^secret_name -> {:error, :not_found} end)
+      assert {:error, :not_found} = TenantKeys.get_private_key(tenant.id)
+
+      Mox.expect(Loopctl.MockSecrets, :set, fn ^secret_name, priv ->
+        send(test_pid, {:stored, priv})
+        :ok
+      end)
+
+      assert {:ok, _tenant} = Tenants.bootstrap_audit_key(tenant.id)
+      assert_received {:stored, priv}
+
+      # The store now HAS the key. Without the bust, the cached `:not_found`
+      # keeps answering until the negative TTL lapses — and `verifier_seed/2`
+      # fails CLOSED on it, so a story is flagged `verifier_needed` on the very
+      # tenant that was just made able to verify.
+      Mox.stub(Loopctl.MockSecrets, :get, fn ^secret_name -> {:ok, Base.encode64(priv)} end)
+      assert {:ok, ^priv} = TenantKeys.get_private_key(tenant.id)
     end
   end
 end
