@@ -41,8 +41,14 @@ defmodule LoopctlWeb.Plugs.RequireUnlineagedCaller do
 
   def init(opts), do: opts
 
+  # `minting_lineage_for_api_key/2`, not `lineage_for_api_key/2`: the latter filters
+  # `revoked_at IS NULL` and so reads a revoked-dispatch caller as unlineaged — the
+  # ceiling would then rest on cascade revocation staying perfectly coupled to key
+  # revocation, a property of a different function's WHERE clause. The question here
+  # is whether the principal was EVER inside a lineage, and revocation does not
+  # un-ask it.
   def call(%Plug.Conn{assigns: %{current_api_key: %{} = api_key}} = conn, _opts) do
-    case Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id) do
+    case Dispatches.minting_lineage_for_api_key(api_key.tenant_id, api_key.id) do
       [] -> conn
       [_ | _] = lineage -> refuse(conn, api_key, lineage)
     end

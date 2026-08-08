@@ -10,8 +10,9 @@ defmodule Loopctl.TenantKeys do
 
   Created at application start (see `Loopctl.Application`). Table name
   is `:tenant_key_cache`. Entries are `{tenant_id, result, expires_at}`, where
-  `result` is the `{:ok, key}` / `{:error, reason}` this module returns — FAILURES
-  are cached too, on a shorter TTL. See `@negative_ttl_seconds`.
+  `result` is the `{:ok, key}` / `{:error, reason}` this module returns — OUTAGE-shaped
+  failures are cached too, on a shorter TTL, but a definitively absent key
+  (`:not_found`) never is. See `@negative_ttl_seconds`.
   """
 
   require Logger
@@ -108,12 +109,36 @@ defmodule Loopctl.TenantKeys do
     end
   end
 
+  # A DEFINITIVELY ABSENT key is never cached, and the distinction is the whole safety
+  # of the negative half. `:not_found` means "this tenant has no audit key yet", and
+  # that answer stops being true the instant `Tenants.bootstrap_audit_key/1` writes
+  # one — a write that clears no cache (only rotation calls `invalidate/1`). Caching it
+  # would leave a freshly-keyed tenant failing `Capabilities.mint/4` and
+  # `Dispatches.verifier_seed/2` for the negative TTL, flagging `verifier_needed` on
+  # stories whose tenant DOES have a key. Only outage-shaped failures — unreachable,
+  # timeout, a 5xx from the store — are cached, which is the storm this exists to stop.
+  defp cache_negative(_tenant_id, {:error, :not_found} = result, _now), do: result
+
   # Negative entries live in the SAME table under the same key, so `invalidate/1`
-  # (called by rotation and by the enrollment upgrade that provisions a key in the
-  # first place) clears a cached failure the moment the key exists — a tenant that
-  # just earned an audit key never has to wait out the negative TTL.
+  # clears a cached failure.
+  #
+  # `insert_new` because a failure must never overwrite a live positive entry: a slow
+  # fetch that errors can land after a concurrent success (or after a rotation's
+  # `invalidate/1`) and would otherwise poison a good key for the negative TTL.
   defp cache_negative(tenant_id, result, now) do
-    :ets.insert(@cache_table, {tenant_id, result, now + @negative_ttl_seconds})
+    if :ets.insert_new(@cache_table, {tenant_id, result, now + @negative_ttl_seconds}) do
+      result
+    else
+      overwrite_stale_negative(tenant_id, result, now)
+    end
+  end
+
+  defp overwrite_stale_negative(tenant_id, result, now) do
+    case :ets.lookup(@cache_table, tenant_id) do
+      [{^tenant_id, {:ok, _}, expires_at}] when expires_at > now -> :ok
+      _ -> :ets.insert(@cache_table, {tenant_id, result, now + @negative_ttl_seconds})
+    end
+
     result
   end
 

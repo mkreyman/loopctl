@@ -234,6 +234,41 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
       assert cap_id == start_cap["cap_id"]
     end
 
+    test "a DOUBLE-SPENT token is recorded as a replay, not as a forgery", %{conn: conn} do
+      %{tenant: tenant, story: story, implementer: impl} = keyed_context()
+
+      %{"capability" => start_cap} =
+        conn
+        |> auth(impl.raw_key)
+        |> post("/api/v1/stories/#{story.id}/claim")
+        |> json_response(200)
+
+      # Spend it out of band, then present it again — the shape an ordinary retry of a
+      # request whose first attempt already succeeded produces. `capability_forged` is a
+      # permanent accusation in an append-only log; this caller forged nothing.
+      Loopctl.Capabilities.CapabilityToken
+      |> AdminRepo.get!(start_cap["cap_id"])
+      |> Ecto.Changeset.change(consumed_at: DateTime.utc_now())
+      |> AdminRepo.update!()
+
+      conn
+      |> auth(impl.raw_key)
+      |> post("/api/v1/stories/#{story.id}/start", %{"capability" => start_cap["cap_id"]})
+      |> response(403)
+
+      assert [%{payload: payload}] =
+               Loopctl.AuditChain.Entry
+               |> where([e], e.tenant_id == ^tenant.id and e.action == "capability_replayed")
+               |> AdminRepo.all()
+
+      assert payload["reason"] == "replay"
+
+      assert [] ==
+               Loopctl.AuditChain.Entry
+               |> where([e], e.tenant_id == ^tenant.id and e.action == "capability_forged")
+               |> AdminRepo.all()
+    end
+
     test "a FORGED signature is recorded at least as durably as a stale token",
          %{conn: conn} do
       %{tenant: tenant, story: story, implementer: impl} = keyed_context()

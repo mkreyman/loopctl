@@ -67,6 +67,27 @@ defmodule LoopctlWeb.ApiKeyLineageCeilingTest do
       assert error["message"] =~ "parent_dispatch_id"
     end
 
+    test "revoking the dispatch does not un-ask the lineage question" do
+      ctx = operator_ctx()
+      %{"dispatch" => dispatch, "api_key" => %{"raw_key" => raw_key}} = dispatched_user_key(ctx)
+
+      # Revoke the DISPATCH row alone. Cascade revocation normally revokes the key it
+      # minted along with it, but the ceiling must not rest on that coupling: read
+      # through `lineage_for_api_key/2`'s `revoked_at IS NULL` filter, this caller
+      # answered `[]` — the very shape the ceiling admits as "may start a root".
+      Loopctl.Dispatches.Dispatch
+      |> Loopctl.AdminRepo.get!(dispatch["id"])
+      |> Ecto.Changeset.change(revoked_at: DateTime.utc_now())
+      |> Loopctl.AdminRepo.update!()
+
+      conn =
+        build_conn()
+        |> auth(raw_key)
+        |> post(~p"/api/v1/api_keys", %{"name" => "escape-hatch", "role" => "user"})
+
+      assert json_response(conn, 403)["error"]["code"] == "api_key_mint_forbidden"
+    end
+
     test "the escape is closed end to end: no plain key, so no independent root" do
       ctx = operator_ctx()
       %{"api_key" => %{"raw_key" => raw_key}} = dispatched_user_key(ctx)

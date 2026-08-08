@@ -96,8 +96,8 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
   `get_dispatch_lineage/2`) fails **CLOSED**, and the `assigned_agent_id`
   equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
-  `progress.ex:484-523`); that write is result-checked, and a failure flags `verifier_needed` plus a
-  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:536`) instead of
+  `progress.ex:514-553`); that write is result-checked, and a failure flags `verifier_needed` plus a
+  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:566`) instead of
   silently leaving the field nil. `request-review` is OPTIONAL, so most stories reach verify with no
   verifier dispatch — the CALLER-lineage step is what keeps that path lineage-gated.
 - **report** — `validate_not_self_report/3`. `nil` caller blocked
@@ -135,8 +135,11 @@ that: `force_unclaim_story/3` CLEARS `assigned_agent_id`, and a legacy bearer cl
 pre-loopctl work. `guard_no_lifecycle_history/2` (`progress.ex`) consults three sources: the
 `lifecycle_entered_at` COLUMN, a legacy `metadata["lifecycle_entered_at"]` key, and the `audit_log`
 (retention-bounded — `AuditPartitionWorker` DROPs partitions past `:audit_retention_days`, so it
-expires). The column is stamped by all three paths that clear `assigned_agent_id` on a worked story
-(`unclaim_story/3`, `force_unclaim_story/3`, `perform_auto_reset/4`) and never cleared. **It is a
+expires). The column is stamped by all FOUR paths that clear `assigned_agent_id` on a worked story
+(`unclaim_story/3`, `force_unclaim_story/3`, `perform_auto_reset/4` and
+`BulkOperations.auto_reset_agent_status/1`) and never cleared. Re-running `force_unclaim_story/3` on
+a story already at `:pending` stamps it too — the remedy for a story reset before the column
+existed — but only when the row or the audit log still shows it was worked. **It is a
 column and not a `metadata` key on purpose**: `metadata` is cast by `Story.update_changeset/2` and
 REPLACED wholesale by `PATCH /api/v1/stories/:id`, so one ordinary orchestrator request erased the
 marker and handed the launder path back. Never add `:lifecycle_entered_at` to a `cast` list.
@@ -169,7 +172,7 @@ correct behavior; do not add a workaround.
 **Enforcement is conditional — this is the deprecation seam.** `Progress.maybe_consume_cap/6`
 (`progress.ex:352-398`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
 `:missing_capability` **only for tenants that have an audit key** (`tenant_has_audit_key?/1`,
-`progress.ex:564-569`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
+`progress.ex:594-599`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
 proceeds with NO capability at all. So L1 strength is per-tenant. A REJECTED cap is split by
 `cap_refusal/4`: only `:invalid_signature` / `:replay` surface as `{:cap_rejected, _}`, which
 FallbackController answers with a plain 403 — it halts NOTHING and counts toward nothing (see the
@@ -213,7 +216,7 @@ exist, but every one descends from the implementer's root — the single-root te
 not a shortage; its remedy is the operator minting an independently-rooted verifier tree.
 
 **Empty-lineage caveat, in BOTH directions.** When the implementer dispatch cannot be loaded,
-`assign_rotating_verifier/3` passes `[]` (`progress.ex:484-488`), and with `[]` the rejection is
+`assign_rotating_verifier/3` passes `[]` (`progress.ex:514-518`), and with `[]` the rejection is
 inert — selection can then pick a same-lineage (even the implementer's own) dispatch. The verify-time
 comparison is fail-closed on an empty lineage, so this is caught at verify rather than at selection;
 do not "simplify" either half.
@@ -294,8 +297,11 @@ clears it, so both its trigger and its blast radius are deliberately bounded.
   (`:invalid_signature`) all produce one; none is a byzantine signal, and the 403 already
   refuses the operation. It emits `[:loopctl, :custody, :cap_rejected]` telemetry instead —
   alert on the RATE. Do not re-add a halt there. **Not halting is not the same as not
-  recording**: EVERY cap refusal is hash-chained by `record_cap_refusal/4` — the byzantine
-  set as `capability_forged` (`byzantine: true`), the rest as `capability_refused`. That used
+  recording**: EVERY cap refusal is hash-chained by `record_cap_refusal/4`, and the append is
+  piped through `AuditChain.log_append_failure/4` so a lost entry is loud — `:invalid_signature`
+  as `capability_forged`, `:replay` as `capability_replayed` (both `byzantine: true`; a retry
+  produces a replay, so recording it as a forgery was a permanent accusation), the rest as
+  `capability_refused`. That used
   to run the wrong way round, with `:wrong_lineage` chained and a FORGED signature left with
   only a log line; since the refusal no longer halts, the audit entry IS its durable record.
 - **Scope** — `LoopctlWeb.CustodySurface` (`lib/loopctl_web/custody_surface.ex`) is THE list of

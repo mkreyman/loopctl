@@ -46,10 +46,13 @@ All notable changes to loopctl are documented here.
   double-spent token (see the 2026-07-24 entry below, which supersedes an earlier draft of
   this line). Every one of them is an ordinary 403, and every one is recorded in the
   hash-chained audit log with the `cap_id`, api key and agent: expiry and lineage drift as
-  `capability_refused`, a forged signature or a double-spend as `capability_forged`
-  (`payload.byzantine: true`). That recording used to run the wrong way round — the benign
-  refusals were chained and the forged ones left only a log line — so a forged signature is
-  now durable rather than dependent on log retention. Alert on the RATE of the
+  `capability_refused`, a signature that failed to verify as `capability_forged`, a
+  double-spent token as `capability_replayed` (both carry `payload.byzantine: true`).
+  Replay gets its own action because an ordinary retry produces it — recording a stale
+  token as a forgery wrote a permanent accusation into an append-only log. That recording
+  used to run the wrong way round — the benign refusals were chained and the forged ones
+  left only a log line — so a forged signature is now durable rather than dependent on log
+  retention. Alert on the RATE of the
   `[:loopctl, :custody, :cap_rejected]` telemetry event; a single occurrence is not a signal.
   Relatedly, **rotating a tenant's audit signing key no longer invalidates outstanding
   capability tokens**: verification now also accepts the historical key whose
@@ -98,6 +101,13 @@ All notable changes to loopctl are documented here.
   dispatch minted — are unaffected, as are `GET /api/v1/api_keys` and key revocation.
   `loopctl-mcp-server`'s `dispatch` tool documentation has been corrected accordingly: it
   still said to omit `parent_dispatch_id` for a root dispatch, which is now a 403.
+  A revoked dispatch no longer reads as "no lineage" for this check — the ceiling asks whether
+  the principal was EVER inside a lineage, not whether its dispatch is still live.
+  **Operator action required:** this closes the mint going forward but retires nothing the
+  open window already produced. `api_keys` records no minter, so a plain key created by a
+  dispatch-minted caller before this release is indistinguishable from the tenant's operator
+  key and still holds an independent root. Review `GET /api/v1/api_keys` for every tenant, and
+  revoke any `:user`-role key you cannot account for as the human-anchored operator key.
 
 - **Verifier selection is seeded from a server-side secret.** The rotating verifier's index was
   derived from the tenant's audit signing PUBLIC key, which `/.well-known/loopctl` serves
@@ -119,14 +129,19 @@ All notable changes to loopctl are documented here.
   markers, but `force-unclaim` clears `assigned_agent_id`, and a story claimed with a key that
   no dispatch minted never records an implementer dispatch — so a worked story could be
   returned to a state indistinguishable from pre-loopctl work and then marked verified with no
-  report, review record or independent verifier. Unclaim, force-unclaim and the reject
-  auto-reset now stamp a durable marker on the story, and both paths refuse a
-  story carrying it — or a lifecycle entry in the audit log — with a new 422
-  (`story_entered_lifecycle`). The row stamp is the longer-lived half deliberately: `audit_log`
+  report, review record or independent verifier. Unclaim, force-unclaim and both reject
+  auto-resets (single-story and bulk) now stamp a durable marker on the story, and both paths
+  refuse a story carrying it — or a lifecycle entry in the audit log — with a new 422
+  (`story_entered_lifecycle`). Re-running force-unclaim on an already-pending story stamps it
+  too, which is the remedy for a story reset before the column existed. The row stamp is the
+  longer-lived half deliberately: `audit_log`
   is partitioned and pruned at `AUDIT_RETENTION_DAYS` (default 90), so an audit-only guard would
   have reopened this path on a timer. **The marker is a dedicated
-  `stories.lifecycle_entered_at` column** (migration `20260807153000`, which also carries
-  forward any marker already written): it first shipped inside `metadata`, which
+  `stories.lifecycle_entered_at` column** (migration `20260807153000`, which carries forward
+  any marker already written AND stamps every story whose audit log still shows lifecycle
+  history, so the evidence surviving at deploy time becomes permanent; its `down` copies the
+  column back into `metadata` before dropping it, so a rollback does not destroy the markers):
+  it first shipped inside `metadata`, which
   `PATCH /api/v1/stories/:id` replaces wholesale, so a single orchestrator-role request erased
   it and restored the launder path. The column appears in no changeset `cast`, so no request
   body can reach it; the legacy `metadata` key is still honoured on read. The column is

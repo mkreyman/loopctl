@@ -418,8 +418,9 @@ defmodule Loopctl.Progress do
   # inside the multi dies with it.
   defp record_cap_refusal(tenant_id, story_id, reason, ctx) do
     byzantine? = reason in @byzantine_cap_refusals
+    action = cap_refusal_action(reason)
 
-    Logger.warning(cap_refusal_log(byzantine?, tenant_id, story_id, reason, ctx))
+    Logger.warning(cap_refusal_log(action, tenant_id, story_id, reason, ctx))
 
     :telemetry.execute(
       [:loopctl, :custody, :cap_refused],
@@ -433,8 +434,9 @@ defmodule Loopctl.Progress do
       }
     )
 
-    Loopctl.AuditChain.append(tenant_id, %{
-      action: if(byzantine?, do: "capability_forged", else: "capability_refused"),
+    tenant_id
+    |> Loopctl.AuditChain.append(%{
+      action: action,
       actor_lineage: ctx.lineage,
       entity_type: "story",
       entity_id: story_id,
@@ -447,17 +449,45 @@ defmodule Loopctl.Progress do
         "agent_id" => ctx.agent_id
       }
     })
+    # Post-commit (post-rollback) append, and this entry IS the durable record the
+    # log line was supposed to stop being. A discarded failure would lose the
+    # highest-signal event in the subsystem silently. See AuditChain.log_append_failure/4.
+    |> Loopctl.AuditChain.log_append_failure(action, tenant_id, story_id)
 
     :ok
   end
 
-  defp cap_refusal_log(true, tenant_id, story_id, reason, ctx) do
+  # `:replay` is byzantine for TELEMETRY — a double-spend is worth counting — but it is
+  # not a forgery, and `capability_forged` is a permanent accusation in an append-only
+  # log. FallbackController states the opposite of that accusation: a replayed
+  # single-use token is reachable by an ordinary retry. So a double-spend takes its own
+  # action, and only a signature that failed to verify is recorded as forged.
+  #
+  # Cost accepted: a retry loop appends one chained entry per attempt, each taking the
+  # tenant's chain-head lock. That is the shape the benign refusals (`:wrong_story`,
+  # `:wrong_lineage`) already had; the spike is the signal, and dropping the entry
+  # would put a double-spend back on log retention.
+  defp cap_refusal_action(:replay), do: "capability_replayed"
+
+  defp cap_refusal_action(reason) when reason in @byzantine_cap_refusals,
+    do: "capability_forged"
+
+  defp cap_refusal_action(_reason), do: "capability_refused"
+
+  defp cap_refusal_log("capability_forged", tenant_id, story_id, reason, ctx) do
     "capability_forged: #{reason} — the presented token did not verify against the " <>
-      "tenant's audit signing key, or had already been consumed. This is not a stale " <>
-      "token; investigate the caller. " <> cap_refusal_fields(tenant_id, story_id, ctx)
+      "tenant's audit signing key. This is not a stale token; investigate the caller. " <>
+      cap_refusal_fields(tenant_id, story_id, ctx)
   end
 
-  defp cap_refusal_log(false, tenant_id, story_id, reason, ctx) do
+  defp cap_refusal_log("capability_replayed", tenant_id, story_id, reason, ctx) do
+    "capability_replayed: #{reason} — a single-use token was presented twice. A retry " <>
+      "of a request whose first attempt already consumed it produces this; the " <>
+      "double-spend signal is a SPIKE, not one occurrence. " <>
+      cap_refusal_fields(tenant_id, story_id, ctx)
+  end
+
+  defp cap_refusal_log(_action, tenant_id, story_id, reason, ctx) do
     "capability_unusable: #{reason} — the caller must re-mint via " <>
       "POST /stories/:id/recover-cap; GET /stories/:id/capabilities delivers only LIVE " <>
       "tokens already issued, so it cannot serve an expired or misbound one. " <>
@@ -1691,8 +1721,9 @@ defmodule Loopctl.Progress do
   # Three sources answer "did this story ever enter the lifecycle", and the longer-lived
   # one is the story row itself. `stories.lifecycle_entered_at` is stamped by every
   # call that can clear `assigned_agent_id` on a worked story — `unclaim_story/3`,
-  # `force_unclaim_story/3` and `perform_auto_reset/4` — and no lifecycle path clears
-  # it, so unlike the audit log it is not on a retention timer.
+  # `force_unclaim_story/3`, `perform_auto_reset/4` and
+  # `BulkOperations.auto_reset_agent_status/1` (bulk reject) — and no lifecycle path
+  # clears it, so unlike the audit log it is not on a retention timer.
   #
   # It is a COLUMN, not a `metadata` key, and that is the whole point. The marker first
   # shipped inside `metadata`, which `Story.update_changeset/2` casts and
@@ -1711,7 +1742,9 @@ defmodule Loopctl.Progress do
   # than `:audit_retention_days` (default 90). Relying on it alone reopened the launder
   # path on a timer — after the window the lifecycle rows are gone and a
   # force-unclaimed story reads as never-dispatched again. It is kept because it also
-  # covers stories force-unclaimed BEFORE the marker existed, within the window.
+  # covers stories force-unclaimed BEFORE the marker existed, within the window — and
+  # the column migration converts that window's evidence into a permanent stamp, so a
+  # story evidenced at deploy time stays refused after its partitions are dropped.
   #
   # Never-dispatched work is untouched: `created`, `imported` and `merge_imported` are
   # not lifecycle actions, so a story imported with
@@ -1765,11 +1798,57 @@ defmodule Loopctl.Progress do
     |> MapSet.new()
   end
 
-  # Proof that a story entered the dispatch lifecycle, stamped where the erasure
-  # happens. Idempotent in the sense that matters: the FIRST entry is the one worth
-  # keeping, so a story that already carries the marker is not re-stamped.
-  defp lifecycle_stamp(%{lifecycle_entered_at: %DateTime{} = existing}), do: existing
-  defp lifecycle_stamp(_story), do: DateTime.utc_now()
+  # Evidence that a story already at :pending was WORKED. Row markers first, then the
+  # audit log — which is what a story force-unclaimed before the column existed has,
+  # and only until its partition is dropped. Converting that expiring evidence into
+  # the permanent stamp is the whole point of re-running force-unclaim.
+  #
+  # "force_unclaimed" is deliberately absent from the actions consulted: force-unclaiming
+  # a never-dispatched pending story writes one, so reading it here would let the remedy
+  # permanently refuse the backfill it exists to permit. Only actions a story reaches by
+  # MOVING through the lifecycle count.
+  @worked_markers [
+    :reported_done_at,
+    :implementer_dispatch_id,
+    :verifier_dispatch_id,
+    :rejected_at
+  ]
+  @worked_audit_actions ["status_changed", "auto_reset"]
+
+  defp retro_stamp_lifecycle(%{lifecycle_entered_at: nil} = story) do
+    if worked_before?(story) do
+      story
+      |> Ecto.Changeset.change(%{lifecycle_entered_at: DateTime.utc_now()})
+      |> AdminRepo.update()
+    else
+      {:ok, story}
+    end
+  end
+
+  defp retro_stamp_lifecycle(story), do: {:ok, story}
+
+  defp worked_before?(story) do
+    Enum.any?(@worked_markers, &(not is_nil(Map.get(story, &1)))) or
+      AdminRepo.exists?(
+        from(a in AuditLog,
+          where:
+            a.tenant_id == ^story.tenant_id and a.entity_type == "story" and
+              a.entity_id == ^story.id and a.action in ^@worked_audit_actions
+        )
+      )
+  end
+
+  @doc """
+  Proof that a story entered the dispatch lifecycle, stamped where the erasure
+  happens. Idempotent in the sense that matters: the FIRST entry is the one worth
+  keeping, so a story that already carries the marker is not re-stamped.
+
+  Public because `Loopctl.BulkOperations` clears `assigned_agent_id` too
+  (bulk reject's auto-reset) and must leave the identical durable proof.
+  """
+  @spec lifecycle_stamp(Story.t() | map()) :: DateTime.t()
+  def lifecycle_stamp(%{lifecycle_entered_at: %DateTime{} = existing}), do: existing
+  def lifecycle_stamp(_story), do: DateTime.utc_now()
 
   defp apply_backfill_status(story, reason, evidence_url, pr_number) do
     now = DateTime.utc_now()
@@ -2014,9 +2093,12 @@ defmodule Loopctl.Progress do
         lock_story(tenant_id, story_id)
       end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
-        # Idempotent: if already pending, return as-is without updating
+        # Idempotent on STATE, not on the marker. A worked story can already sit at
+        # :pending with no stamp (reset before the column existed), and re-running
+        # force-unclaim is the operator's remedy for exactly that — returning the
+        # struct untouched made the remedy a no-op.
         if story.agent_status == :pending do
-          {:ok, story}
+          retro_stamp_lifecycle(story)
         else
           story
           |> Ecto.Changeset.change(%{

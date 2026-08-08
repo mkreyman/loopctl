@@ -67,6 +67,22 @@ defmodule Loopctl.TenantKeysTest do
       assert {:ok, ^key} = TenantKeys.get_private_key(tenant.id)
     end
 
+    test "a definitively absent key is NOT cached, so provisioning takes effect at once" do
+      tenant = fixture(:tenant)
+      secret_name = Loopctl.Secrets.audit_key_secret_name(tenant.slug)
+      key = :crypto.strong_rand_bytes(32)
+
+      Mox.stub(Loopctl.MockSecrets, :get, fn ^secret_name -> {:error, :not_found} end)
+      assert {:error, :not_found} = TenantKeys.get_private_key(tenant.id)
+
+      # `Tenants.bootstrap_audit_key/1` writes the secret and invalidates nothing —
+      # only rotation calls `invalidate/1`. A cached :not_found would leave capability
+      # minting and verifier selection failing on a key that now exists.
+      Mox.stub(Loopctl.MockSecrets, :get, fn ^secret_name -> {:ok, Base.encode64(key)} end)
+
+      assert {:ok, ^key} = TenantKeys.get_private_key(tenant.id)
+    end
+
     test "a cached SUCCESS is still returned as {:ok, key}" do
       tenant = fixture(:tenant)
       secret_name = Loopctl.Secrets.audit_key_secret_name(tenant.slug)

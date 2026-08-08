@@ -167,16 +167,16 @@ in order:
    when BOTH `implementer_dispatch_id` and `verifier_dispatch_id` are set, decided by
    `verify_lineage_separated/4`: an EMPTY lineage on either side —
    which is what an unloadable/deleted dispatch row yields (`get_dispatch_lineage/2`) — fails CLOSED, a shared lineage root
-   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:601-605`) blocks, and the
+   (`Dispatches.lineage_shares_prefix?/2`, `lib/loopctl/dispatches.ex:626-630`) blocks, and the
    `assigned_agent_id` equality check is evaluated IN ADDITION to the lineage comparison, never
    short-circuited by it.
 5. **`assigned_agent_id` equality** as the fallback for pre-dispatch stories and for every
    story that lacks a verifier dispatch.
 
 `verifier_dispatch_id` is written only by the assign-verifier flow
-(`assign_rotating_verifier/3`, `progress.ex:484-523`); that write is checked, and a failure
+(`assign_rotating_verifier/3`, `progress.ex:514-553`); that write is checked, and a failure
 flags `verifier_needed` plus a `verifier_not_assigned` audit event
-(`flag_verifier_needed/5`, `progress.ex:536`) rather than silently leaving the field nil.
+(`flag_verifier_needed/5`, `progress.ex:566`) rather than silently leaving the field nil.
 Because `request-review` is OPTIONAL, a story often reaches verify with no verifier dispatch
 at all — step 3 is what keeps that path lineage-gated instead of a bare agent-id inequality.
 
@@ -223,7 +223,8 @@ lifecycle. State alone cannot establish that (`force_unclaim_story/3` clears
 `guard_no_lifecycle_history/2` reads three sources: the `stories.lifecycle_entered_at`
 COLUMN, a legacy `metadata["lifecycle_entered_at"]` key, and the retention-bounded
 `audit_log`. The column is stamped by every path that clears `assigned_agent_id` on a worked
-story and never cleared. **It is a column, not a `metadata` key, because `metadata` is cast
+story — including `BulkOperations.auto_reset_agent_status/1` on bulk reject — and never
+cleared. **It is a column, not a `metadata` key, because `metadata` is cast
 and whole-map-replaced by `PATCH /api/v1/stories/:id`** — one ordinary request erased the
 marker and restored the claim → force-unclaim → backfill-to-verified launder. Never add
 `:lifecycle_entered_at` to a changeset `cast` list.

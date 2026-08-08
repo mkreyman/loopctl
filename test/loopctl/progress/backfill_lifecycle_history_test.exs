@@ -115,6 +115,49 @@ defmodule Loopctl.Progress.BackfillLifecycleHistoryTest do
       assert {:error, :story_entered_lifecycle} = backfill(story)
     end
 
+    test "the BULK reject auto-reset stamps it too" do
+      # The fourth site that clears assigned_agent_id on a worked story. Without the
+      # stamp the guard here rests on `verified_status: :rejected` alone.
+      story = fixture(:story, %{agent_status: :reported_done})
+      orch = fixture(:agent, %{tenant_id: story.tenant_id, agent_type: :orchestrator})
+
+      {:ok, [%{status: "success"}]} =
+        Loopctl.BulkOperations.bulk_reject(
+          story.tenant_id,
+          [%{"story_id" => story.id, "reason" => "not done"}],
+          orch.id
+        )
+
+      reset = reload(story)
+      assert is_nil(reset.assigned_agent_id)
+      assert %DateTime{} = reset.lifecycle_entered_at
+    end
+
+    test "re-running force-unclaim retro-stamps a worked story already at pending" do
+      # The remedy for a story reset before the column existed: its only remaining
+      # evidence is an audit entry that expires with its partition, and the idempotent
+      # early return made the remedy a no-op. Now it makes that evidence permanent.
+      story = fixture(:story, %{agent_status: :pending})
+      lifecycle_entry(story, "status_changed")
+
+      {:ok, unclaimed} = Progress.force_unclaim_story(story.tenant_id, story.id)
+
+      assert %DateTime{} = unclaimed.lifecycle_entered_at
+    end
+
+    test "re-running force-unclaim does NOT stamp never-dispatched work" do
+      # Force-unclaiming a pending story writes its own audit entry; reading that back
+      # would let the remedy permanently refuse the backfill it exists to permit.
+      story = fixture(:story, %{agent_status: :pending})
+
+      {:ok, _} = Progress.force_unclaim_story(story.tenant_id, story.id)
+      {:ok, twice} = Progress.force_unclaim_story(story.tenant_id, story.id)
+
+      # Still refused while the audit entry lives, but NOT stamped — so the refusal
+      # expires with the partition instead of becoming permanent.
+      assert is_nil(twice.lifecycle_entered_at)
+    end
+
     test "the marker records the FIRST entry, not the latest erasure" do
       agent = fixture(:agent, %{agent_type: :implementer})
       original = ~U[2020-01-01 00:00:00.000000Z]

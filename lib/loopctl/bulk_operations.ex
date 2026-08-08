@@ -574,7 +574,12 @@ defmodule Loopctl.BulkOperations do
       agent_status: :pending,
       assigned_agent_id: nil,
       assigned_at: nil,
-      reported_done_at: nil
+      reported_done_at: nil,
+      # The FOURTH site that clears assigned_agent_id on a worked story, and the twin
+      # of Progress.perform_auto_reset/4. Without the stamp the backfill guard here
+      # rests on `verified_status: :rejected` alone — the coincidence the single-story
+      # path was stamped to stop depending on. See Progress.guard_no_lifecycle_history/2.
+      lifecycle_entered_at: Progress.lifecycle_stamp(story)
     })
     |> AdminRepo.update()
   end
